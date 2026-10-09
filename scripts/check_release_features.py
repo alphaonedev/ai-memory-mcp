@@ -197,6 +197,11 @@ HERE = Path(__file__).resolve().parent
 
 ALLOWED_FEATURES = 'FEATURES="$(bash scripts/release-features.sh)"'
 ALLOWED_REQUIRE = 'REQUIRE_FLAGS="$(bash scripts/release-features.sh --require-flags)"'
+# #4768: before the build reads the declaration and before the assert runs the
+# asserter, both files must be the checked-out commit's (an earlier step, an
+# action or a restored cache could have rewritten either; `git diff --quiet`
+# exits 1 on any difference or deletion, which aborts the step under `set -e`).
+BIND_INPUTS = "git diff --quiet HEAD -- scripts/release-features.sh scripts/assert-compiled-features.sh"
 ALLOWED_BIN = 'bin="target/${{ matrix.target }}/release/${{ matrix.artifact }}"'
 ASSERT_WORKFLOW = 'bash scripts/assert-compiled-features.sh "$bin" --strict $REQUIRE_FLAGS'
 ASSERT_DOCKER = "bash scripts/assert-compiled-features.sh target/release/ai-memory --strict $REQUIRE_FLAGS"
@@ -557,6 +562,9 @@ SHAPE_JOB: Dict[str, Spec] = {
 SHAPE_ADVISORY = False
 DOCKER_SYNTAX = "# syntax=docker/dockerfile:1"
 DOCKER_DECL_COPY = "COPY scripts/release-features.sh scripts/release-features.sh"
+# #4768: the asserter COPY sits immediately before the declaration COPY, so no
+# instruction can rewrite the asserter between its COPY and the build RUN.
+DOCKER_ASSERTER_COPY = "COPY scripts/assert-compiled-features.sh scripts/assert-compiled-features.sh"
 DOCKER_LOCK_COPY = "COPY Cargo.toml Cargo.lock ./"
 DOCKER_INSTRUCTIONS = frozenset((
     "FROM", "RUN", "CMD", "LABEL", "EXPOSE", "ENV", "ADD", "COPY", "ENTRYPOINT",
@@ -1708,6 +1716,7 @@ DECOY_WF = WORKFLOWS + "/decoy.yml"
 DOCKER = "Dockerfile"
 INSTALL = "docs/INSTALL.md"
 DECL = "scripts/release-features.sh"
+ASSERTER = "scripts/assert-compiled-features.sh"
 INPUT_FILES = (REL, SHAPE, DOCKER, INSTALL, DECL)
 
 
@@ -1762,10 +1771,32 @@ DOCKER_ASSERT = "    " + ASSERT_DOCKER
 DOCKER_RUN_HEAD = "RUN set -eu; \\\n"
 SHAPE_HDR = "      - name: Build release binary (exactly as release.yml)\n"
 SHAPE_LINE = IND + SHAPE_BUILD_CMD
+BIND_LINE = IND + BIND_INPUTS + "\n"
 
 
 def _rel(old: str, new: Union[str, Transform], every: bool = False) -> Edit:
     return (REL, old, new, every)
+
+
+def _drop_nth_line(line: str, n: int) -> Transform:
+    """Remove the ``n``-th (1-based) occurrence of the indented statement
+    ``line`` when the text has one; unchanged when it has fewer, so a case
+    built on it is red until the statement lands (#4768)."""
+    def go(text: str) -> str:
+        needle = IND + line + "\n"
+        at = -1
+        for _ in range(n):
+            at = text.find(needle, at + 1)
+            if at < 0:
+                return text
+        return text[:at] + text[at + len(needle):]
+    return go
+
+
+def _edit_all(old: str, new: str) -> Transform:
+    """Replace every ``old`` when present; unchanged when absent (red until the
+    anchor lands, the #4768 / #4720 / #4935 shape)."""
+    return lambda text: text.replace(old, new)
 
 
 def _hdr_key(hdr: str, key: str) -> List[Edit]:
@@ -2093,6 +2124,18 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
         IND + "sed -i.bak s/sal-postgres/sal/ scripts/release-features.sh")),
     "build step restores an old declaration": ("fail", _before_build(IND + "git checkout HEAD~50 -- scripts/release-features.sh")),
     "build step overwrites the asserter script": ("fail", _before_build(IND + "printf 'exit 0' > scripts/assert-compiled-features.sh")),
+    # --- #4768: the build and assert units bind the declaration and the asserter
+    # to the checked-out commit (an earlier step, an action or a restored cache
+    # cannot feed them a rewritten file unseen)
+    "4768 build step does not bind the declaration and asserter to HEAD": ("fail", [_rel(BUILD_HDR, _drop_nth_line(BIND_INPUTS, 1))]),
+    "4768 assert step does not bind the declaration and asserter to HEAD": ("fail", [_rel(BUILD_HDR, _drop_nth_line(BIND_INPUTS, 2))]),
+    "4768 bind made non-fatal": ("fail", [_rel(BUILD_HDR, _edit_all(BIND_LINE, IND + BIND_INPUTS + " || true\n"))]),
+    "4768 bind covers the declaration only": ("fail", [_rel(
+        BUILD_HDR, _edit_all(BIND_LINE, IND + "git diff --quiet HEAD -- scripts/release-features.sh\n"))]),
+    "4768 bind against another commit": ("fail", [_rel(BUILD_HDR, _edit_all(BIND_LINE, BIND_LINE.replace("HEAD", "HEAD~1")))]),
+    "4768 Dockerfile a RUN between the asserter COPY and the declaration COPY": ("fail", [_docker(
+        DOCKER_DECL_COPY + "\n", "RUN sed -i s/exit/true/ scripts/assert-compiled-features.sh\n" + DOCKER_DECL_COPY + "\n")]),
+    "4768 Dockerfile asserter COPY missing": ("fail", [_docker(DOCKER_ASSERTER_COPY + "\n", "")]),
     "build step exports BASH_ENV through GITHUB_ENV": ("fail", _before_build(IND + 'echo "BASH_ENV=decoy/noop.sh" >> "$GITHUB_ENV"')),
     "build step adds a fake dir to GITHUB_PATH": ("fail", _before_build(IND + 'echo "$PWD/decoy" >> "$GITHUB_PATH"')),
     "build step cd before the build": ("fail", _before_build(IND + "cd decoy")),
@@ -2776,6 +2819,40 @@ def self_test(root: Path) -> int:
                 print(f"self-test FAIL: the package unit packaged a file whose hash is not the asserted one ({wrong[:12]!r}): "
                       "fail-open", file=sys.stderr)
                 failures += 1
+
+        # --- #4768 runtime: in a checkout whose declaration and asserter are the
+        # committed ones the build and assert units pass; once either file is
+        # rewritten after checkout (an earlier step, an action, a restored cache)
+        # both units must refuse to read it.
+        bound = tmp / "bound"
+        shutil.rmtree(bound, ignore_errors=True)
+        (bound / "scripts").mkdir(parents=True)
+        for rel in (DECL, ASSERTER):
+            shutil.copy2(root / rel, bound / rel)
+        git = ["git", "-c", "user.name=self-test", "-c", "user.email=self-test@localhost", "-c", "commit.gpgsign=false"]
+        for cmd in (["init", "-q"], ["add", DECL, ASSERTER], ["commit", "-q", "-m", "pin the inputs"]):
+            subprocess.run(git + cmd, cwd=bound, capture_output=True, check=True)
+        (bound / "target" / "x" / "release").mkdir(parents=True)
+        (bound / "target" / "x" / "release" / "ai-memory").write_bytes(payload)
+        bound_env = dict(os.environ, GITHUB_OUTPUT=str(bound / "output.txt"))
+        bound_build = "\n".join(WF_BUILD).replace("${{ matrix.target }}", "x").replace("cargo build", "echo cargo-build")
+        bound_assert = ("\n".join(WF_ASSERT).replace("${{ matrix.target }}", "x").replace("${{ matrix.artifact }}", "ai-memory")
+                        .replace("bash scripts/assert-compiled-features.sh", "echo assert"))
+
+        def run_bound(body: str) -> int:
+            return subprocess.run(["bash", "-c", "set -e; " + body], cwd=bound, env=bound_env, capture_output=True).returncode
+
+        for label, body in (("build unit", bound_build), ("assert unit", bound_assert)):
+            if run_bound(body) != 0:
+                print(f"self-test FAIL: the {label} does not pass with the committed declaration and asserter", file=sys.stderr)
+                failures += 1
+            for rel in (DECL, ASSERTER):
+                with open(bound / rel, "a", encoding="utf-8") as fh:
+                    fh.write("# rewritten after checkout\n")
+                if run_bound(body) == 0:
+                    print(f"self-test FAIL: the {label} PASSED with {rel} rewritten after checkout (#4768): fail-open", file=sys.stderr)
+                    failures += 1
+                subprocess.run(git + ["checkout", "--", rel], cwd=bound, capture_output=True, check=True)
 
         # --- the guard itself: positive controls and every bypass form.
         for name, (want, edits) in CASES.items():
