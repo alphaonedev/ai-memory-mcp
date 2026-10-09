@@ -41,10 +41,31 @@ pub const MAX_PAYLOAD_BYTES: usize = 65_536;
 /// empty, whitespace, backslash / null bytes, control chars, path-traversal
 /// (`.` / `..`) segments, and over-depth / over-length hierarchical paths.
 ///
+/// #4389 — additionally refuses the quota SENTINEL namespaces
+/// ([`crate::quotas::NOTIFY_AGGREGATE_NAMESPACE`], the per-sender notify
+/// aggregate row the namespace-omitted rollup EXCLUDES, and
+/// [`crate::quotas::GLOBAL_NAMESPACE`], the v50 backfill sentinel). The
+/// coordination creates charge `check_and_record_storage_only(agent, ns,
+/// bytes)`, so a create into a sentinel booked its bytes on the sentinel row
+/// and hid them from the agent's rollup. Memory writes already refuse every
+/// `_`-prefixed namespace (`validate::reject_reserved_write_namespace`); the
+/// coordination plane keeps its `_act` / `_sig` convention and refuses only
+/// the two accounting sentinels.
+///
 /// # Errors
-/// A stringified [`crate::validate::validate_namespace`] failure.
+/// A stringified [`crate::validate::validate_namespace`] failure, or the
+/// reserved-sentinel refusal.
 pub fn require_namespace(ns: &str) -> Result<(), String> {
-    crate::validate::validate_namespace(ns).map_err(|e| e.to_string())
+    crate::validate::validate_namespace(ns).map_err(|e| e.to_string())?;
+    let trimmed = ns.trim();
+    if trimmed == crate::quotas::NOTIFY_AGGREGATE_NAMESPACE
+        || trimmed == crate::quotas::GLOBAL_NAMESPACE
+    {
+        return Err(format!(
+            "namespace '{trimmed}' is a reserved quota sentinel and cannot hold coordination objects"
+        ));
+    }
+    Ok(())
 }
 
 /// Require a non-empty text field within `max` bytes, free of control
