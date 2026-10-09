@@ -101,7 +101,14 @@ the pull request's own copy of this script and of its workflow job. The
 `pull_request_target` workflow .github/workflows/cert-expiry-trusted.yml checks
 out only the BASE commit and runs this (base) copy with
   --trusted --base-ref NAME --head-sha SHA --merge-ref REF [--base-sha SHA]
-after fetching the head and merge commit as objects. Trusted mode:
+          [--pr-number N]
+after fetching the head as objects. Trusted mode:
+  * with --pr-number, fetches refs/pull/N/merge into --merge-ref (a
+    refs/remotes/ ref) itself and, while that merge ref is missing or its
+    second parent is not the head, fetches it again after each of the fixed
+    MERGE_REF_SLEEPS; after the last attempt it fails closed with an
+    `::error` annotation (GitHub builds the test merge asynchronously and
+    never for a conflicted pull request, #6176);
   * reads git objects only (ls-tree / cat-file / diff / grep / log between
     shas); nothing from the head is checked out or executed;
   * takes the range only from its arguments (the process environment,
@@ -142,6 +149,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -948,7 +956,61 @@ def resolve_merge_ref(repo, ref):
     return proc.stdout.decode().strip()
 
 
-def run_trusted(repo, base_ref, head, merge_ref, base_sha=""):
+# #6176: pull_request_target does not wait for GitHub to (re)build the test
+# merge, and a conflicted pull request has none. With --pr-number the gate
+# fetches refs/pull/<N>/merge itself and re-fetches a stale or missing one a
+# FIXED number of times with FIXED sleeps (len + 1 attempts, 65 s at most),
+# then fails closed with an ::error annotation. A stale merge commit is never
+# judged: it could only produce a false RED, never a false GREEN.
+MERGE_REF_SLEEPS = (5, 10, 20, 30)
+PR_NUMBER_RE = re.compile(r"[1-9][0-9]{0,9}")
+_sleep = time.sleep  # self-test seam: the cells record the backoff instead of sleeping
+
+
+class MergeRefError(GateError):
+    """#6176: the test merge never became current; reported as an ::error."""
+
+
+def _merge_ref_state(repo, merge_ref, head):
+    """None when MERGE_REF names a two-parent commit whose second parent is
+    HEAD; otherwise a short reason (missing or stale)."""
+    proc = run_git(repo, "rev-list", "--parents", "-n", "1", "--end-of-options", merge_ref + "^{commit}")
+    if proc.returncode != 0:
+        return "missing (no merge commit was fetched)"
+    shas = proc.stdout.decode("utf-8", "replace").split()
+    if len(shas) != 3 or shas[2].lower() != head.lower():
+        return f"stale (merge commit {shas[0][:12] if shas else '?'} does not have the head as its second parent)"
+    return None
+
+
+def fetch_merge_ref(repo, pr_number, merge_ref, head):
+    """Fetch refs/pull/<PR>/merge into MERGE_REF until it is current for HEAD,
+    with the fixed MERGE_REF_SLEEPS backoff. Raises GateError after the last
+    attempt (fail-closed)."""
+    if not PR_NUMBER_RE.fullmatch(pr_number):
+        raise GateError(f"--pr-number {pr_number!r} is not a decimal pull request number (fail-closed)")
+    if not (MERGE_REF_RE.fullmatch(merge_ref) and ".." not in merge_ref):
+        raise GateError(f"--merge-ref {merge_ref!r} must be a refs/remotes/ ref when --pr-number is given "
+                        "(the gate fetches into it; fail-closed)")
+    attempts = len(MERGE_REF_SLEEPS) + 1
+    reason = "missing"
+    for attempt in range(attempts):
+        run_git(repo, "fetch", "--no-tags", "--no-recurse-submodules", "--quiet", "--end-of-options",
+                "origin", f"+refs/pull/{pr_number}/merge:{merge_ref}")
+        reason = _merge_ref_state(repo, merge_ref, head)
+        if reason is None:
+            return
+        if attempt < len(MERGE_REF_SLEEPS):
+            _sleep(MERGE_REF_SLEEPS[attempt])
+    raise MergeRefError(
+        f"refs/pull/{pr_number}/merge is {reason} after {attempts} fetch attempts "
+        f"(sleeps {', '.join(str(n) for n in MERGE_REF_SLEEPS)} s). GitHub had not built a current test merge "
+        "for this head; a pull request with a merge conflict has none. Resolve any conflict, or push or sync "
+        "the branch, then re-run this job (fail-closed)"
+    )
+
+
+def run_trusted(repo, base_ref, head, merge_ref, base_sha="", pr_number=None):
     """--trusted: judge the pull_request merge commit with THIS (base) copy of
     the gate, reading git objects only, and require the approval trailer when
     a trusted path changed. The range comes only from the arguments: the
@@ -960,7 +1022,11 @@ def run_trusted(repo, base_ref, head, merge_ref, base_sha=""):
             raise GateError(f"--head-sha {head!r} is not exactly 40 or 64 hex characters (fail-closed)")
         if base_sha and not ENV_SHA_RE.fullmatch(base_sha):
             raise GateError(f"--base-sha {base_sha!r} is not exactly 40 or 64 hex characters (fail-closed)")
+        if pr_number is not None:
+            fetch_merge_ref(repo, pr_number, merge_ref, head)
         merge = resolve_merge_ref(repo, merge_ref)
+    except MergeRefError as exc:
+        return 1, "", "\n".join((annotation("error", "cert-expiry trusted", str(exc)), f"{PREFIX}: ERROR — {exc}"))
     except GateError as exc:
         return 1, "", f"{PREFIX}: ERROR — {exc}"
     env = {"GITHUB_EVENT_NAME": "pull_request", "PR_HEAD_SHA": head,
@@ -2797,7 +2863,10 @@ SELF_TEST_OK = (
     "trailer and GREEN with it plus a ::warning annotation, a git ls-tree read error fail-closed "
     "(entry, banner, guard, end to end), a cert doc above the blob cap refused, and a shadow job "
     "producing the required check name (c8, new file, copied workflow, YAML escapes, folded scalar) "
-    "RED even with the trailer while an unrelated new workflow stays GREEN."
+    "RED even with the trailer while an unrelated new workflow stays GREEN; "
+    "(tr #6176) --pr-number fetches the merge ref itself: current GREEN with no sleep, current on the "
+    "second fetch GREEN after one fixed sleep, stale or missing (conflicted) RED with an ::error after "
+    "the fixed backoff, malformed numbers and a sha --merge-ref refused."
 )
 
 
@@ -2814,6 +2883,8 @@ def main(argv=None):
     parser.add_argument("--base-sha", default="", help="--trusted: payload base sha (report-only)")
     parser.add_argument("--head-sha", help="--trusted: the pull request head sha")
     parser.add_argument("--merge-ref", help="--trusted: the merge commit (sha or refs/remotes/ ref)")
+    parser.add_argument("--pr-number", help="--trusted: fetch refs/pull/<N>/merge into --merge-ref with "
+                                            "bounded re-fetch (#6176)")
     args = parser.parse_args(argv)
     if args.trusted and args.self_test:
         parser.error("--trusted and --self-test are exclusive")
@@ -2822,8 +2893,9 @@ def main(argv=None):
                    if getattr(args, n) is None]
         if missing:
             parser.error(f"--trusted requires {', '.join(missing)}")
-    elif any(v is not None for v in (args.base_ref, args.head_sha, args.merge_ref)) or args.base_sha:
-        parser.error("--base-ref/--base-sha/--head-sha/--merge-ref are only valid with --trusted")
+    elif args.base_sha or any(v is not None for v in (args.base_ref, args.head_sha, args.merge_ref,
+                                                      args.pr_number)):
+        parser.error("--base-ref/--base-sha/--head-sha/--merge-ref/--pr-number are only valid with --trusted")
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
@@ -2833,7 +2905,7 @@ def main(argv=None):
         return self_test()
     if args.trusted:
         rc, out, err = run_trusted(Path(args.repo), args.base_ref, args.head_sha,
-                                   args.merge_ref, args.base_sha)
+                                   args.merge_ref, args.base_sha, args.pr_number)
     else:
         rc, out, err = run_gate(REPO_ROOT, dict(os.environ))
     if out:
