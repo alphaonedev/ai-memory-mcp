@@ -236,7 +236,10 @@ class LibPrefixTests(Base):
         (src / 'newmod.rs').write_text('std::env::var( "AI_MEMORY_TEST_POSTGRES_URL" )')
         (src / 'commentonly.rs').write_text('// reads `AI_MEMORY_TEST_POSTGRES_URL` in docs')
         self.assertEqual(pt.uncovered_lib_pg_modules(src, ['store::postgres']), ['newmod'])
-        self.assertEqual(pt.uncovered_lib_pg_modules(src, ['store::postgres', 'newmod::t']), [])
+        # r1 B2: a prefix naming one test inside newmod does not cover a
+        # module-level read (a helper any test in newmod may call).
+        self.assertEqual(pt.uncovered_lib_pg_modules(src, ['store::postgres', 'newmod::t']), ['newmod'])
+        self.assertEqual(pt.uncovered_lib_pg_modules(src, ['store::postgres', 'newmod']), [])
 
     def test_module_path(self):
         root = Path('/r/src')
@@ -255,6 +258,175 @@ class LibPrefixTests(Base):
         rc = pt.main(['--build-json', str(SCRATCH / 'b.jsonl'), '--out-dir', str(SCRATCH / 'out'),
                       '--repo-root', str(SCRATCH), '--lib-pg-prefixes', str(SCRATCH / 'empty.txt')])
         self.assertEqual(rc, 2)
+
+
+def fx(rel, text):
+    """Write a fixture file under SCRATCH (parents created) and return its path."""
+    p = SCRATCH / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text)
+    return p
+
+
+def exe_for(rel):
+    name = Path(rel).stem if Path(rel).name != 'main.rs' else Path(rel).parent.name
+    return pt.Exe('test', name, str(SCRATCH / rel), '/x/' + name)
+
+
+PG_TEST = ('#[cfg(feature = "sal-postgres")]\n#[tokio::test]\nasync fn native_pg() {\n'
+           '    let url = std::env::var("AI_MEMORY_TEST_POSTGRES_URL").unwrap();\n    let _ = url;\n}\n')
+
+
+class ModGraphTests6344B1(Base):
+    """r1 B1: classify on the union of every file the target compiles."""
+
+    def test_path_mod_pulls_a_postgres_submodule_skill_promote_shape_6344(self):
+        # Mirrors tests/skill_promote_test.rs:580 -> skill_promote_visibility_3551/
+        # {mod.rs, http.rs}, whose http.rs holds a sal-postgres test.
+        fx('tests/skill_promote_test.rs',
+           'fn plain() {}\n#[path = "skill_promote_visibility_3551/mod.rs"]\nmod visibility_3551;\n')
+        fx('tests/skill_promote_visibility_3551/mod.rs',
+           '#[cfg(feature = "sal")]\nmod http;\n#[path = "../common/mcp_wait.rs"]\nmod mcp_wait;\n')
+        fx('tests/skill_promote_visibility_3551/http.rs', PG_TEST)
+        fx('tests/common/mcp_wait.rs', 'pub fn wait() {}\n')
+        e = exe_for('tests/skill_promote_test.rs')
+        pt.classify(e)
+        self.assertEqual(e.cls, 'a', e.reasons)
+        # The same through the partition (shared-helper index) path.
+        exes = pt.parse_build_json([artifact(['test'], 'skill_promote_test', SCRATCH / 'tests/skill_promote_test.rs')])
+        serial, h1, h2, _, _, _ = pt.partition(exes, {}, [])
+        self.assertEqual(([x.name for x in serial], h1, h2), (['skill_promote_test'], [], []))
+
+    def test_name_rs_and_name_mod_rs_and_nested_forms_6344(self):
+        cases = {
+            'flat': ('tests/flat.rs', 'mod a;', {'tests/flat/a.rs': PG_TEST}),
+            'dirmod': ('tests/dirmod.rs', 'mod a;', {'tests/dirmod/a/mod.rs': 'mod b;',
+                                                      'tests/dirmod/a/b.rs': PG_TEST}),
+            'inline': ('tests/inline.rs', 'mod outer {\n    mod deep;\n}\n',
+                       {'tests/inline/outer/deep.rs': PG_TEST}),
+            'up': ('tests/up.rs', '#[path = "../shared_pg/x.rs"]\nmod x;\n', {'shared_pg/x.rs': PG_TEST}),
+            'inc': ('tests/inc.rs', 'include!("frag/inc_body.rs");\n', {'tests/frag/inc_body.rs': PG_TEST}),
+        }
+        for name, (root, text, extra) in cases.items():
+            fx(root, text)
+            for rel, body in extra.items():
+                fx(rel, body)
+            e = exe_for(root)
+            pt.classify(e)
+            self.assertEqual(e.cls, 'a', '%s: %s' % (name, e.reasons))
+
+    def test_unresolved_mod_fails_closed_6344(self):
+        fx('tests/ghostly.rs', 'mod missing_helper;\nfn t() {}\n')
+        e = exe_for('tests/ghostly.rs')
+        pt.classify(e)
+        self.assertEqual(e.cls, 'a')
+        self.assertIn('unresolved-mod', e.reasons)
+
+    def test_masked_mod_text_is_not_followed_6344(self):
+        fx('tests/masked.rs', '// mod ghost_a;\n/* mod ghost_b; /* nested */ */\n'
+           'const S: &str = "mod ghost_c;";\nconst R: &str = r#"mod ghost_d; "quoted""#;\n'
+           "fn f<'a>(x: &'a str) -> char { let _ = x; '{' }\nfn g() {}\n")
+        units, unresolved = pt.walk_crate(SCRATCH / 'tests/masked.rs')
+        self.assertEqual(unresolved, [])
+        self.assertEqual(len(units), 1)
+
+    def test_mod_inside_fn_body_is_not_a_file_6344(self):
+        fx('tests/fnbody.rs', 'fn t() {\n    mod local { pub fn x() {} }\n    local::x();\n}\n')
+        self.assertEqual(pt.walk_crate(SCRATCH / 'tests/fnbody.rs')[1], [])
+
+
+class SharedHelperTests6344B1(Base):
+    """Files two binaries compile (tests/common) count per referenced item."""
+
+    def setUp(self):
+        super().setUp()
+        fx('tests/common/mod.rs',
+           'pub mod pgkit;\n'
+           'pub fn plain_helper() -> u8 { 1 }\n'
+           'pub fn pg_url() -> String { std::env::var("AI_MEMORY_TEST_POSTGRES_URL").unwrap() }\n'
+           'pub fn connect_like() -> String { pg_url() }\n'
+           'pub use self::pgkit::Guard as PgGuard;\n')
+        fx('tests/common/pgkit.rs',
+           'pub struct Guard;\nimpl Guard { pub fn new() -> Self { let _ = sqlx::query("SELECT 1"); Guard } }\n'
+           '#[test]\nfn url_predicate_is_pure() { assert!(is_pg("postgres://u@h/db")); }\n'
+           'fn is_pg(u: &str) -> bool { u.starts_with("postgres") }\n')
+
+    def run_part(self, bins):
+        lines = [artifact(['test'], n, fx('tests/%s.rs' % n, body)) for n, body in bins.items()]
+        exes = pt.parse_build_json(lines)
+        pt.partition(exes, {}, [])
+        return {e.name: e for e in exes}
+
+    def test_binary_calling_a_postgres_helper_is_serial_6344(self):
+        got = self.run_part({
+            'uses_pg': 'mod common;\n#[test]\nfn t() { let _ = common::connect_like(); }\n',
+            'uses_plain': 'mod common;\n#[test]\nfn t() { assert_eq!(common::plain_helper(), 1); }\n',
+            'uses_alias': 'mod common;\n#[test]\nfn t() { let _g = common::PgGuard::new(); }\n',
+        })
+        self.assertEqual(got['uses_pg'].cls, 'a', got['uses_pg'].reasons)
+        self.assertTrue(any(r.startswith('pg-helper:') for r in got['uses_pg'].reasons), got['uses_pg'].reasons)
+        self.assertEqual(got['uses_alias'].cls, 'a', got['uses_alias'].reasons)
+        self.assertEqual(got['uses_plain'].cls, 'b', got['uses_plain'].reasons)
+
+    def test_postgres_test_declared_in_a_shared_file_moves_every_includer_6344(self):
+        fx('tests/common/live.rs', '#[tokio::test]\nasync fn live_pg_roundtrip() { let _ = super::pg_url(); }\n')
+        mod = (SCRATCH / 'tests/common/mod.rs').read_text()
+        (SCRATCH / 'tests/common/mod.rs').write_text(mod + 'mod live;\n')
+        got = self.run_part({'one': 'mod common;\nfn t() {}\n', 'two': 'mod common;\nfn t() {}\n'})
+        self.assertEqual((got['one'].cls, got['two'].cls), ('a', 'a'), (got['one'].reasons, got['two'].reasons))
+
+    def test_pure_shared_unit_test_naming_a_postgres_url_stays_parallel_6344(self):
+        got = self.run_part({'one': 'mod common;\nfn t() {}\n', 'two': 'mod common;\nfn t() {}\n'})
+        self.assertEqual((got['one'].cls, got['two'].cls), ('b', 'b'), (got['one'].reasons, got['two'].reasons))
+
+
+class LibGateBypassTests6344B2(Base):
+    """r1 B2: the three reviewer bypass cases of uncovered_lib_pg_modules."""
+
+    def test_single_test_prefix_does_not_cover_its_whole_module_6344(self):
+        fx('src/daemon_runtime.rs',
+           'fn pg_helper() -> String { std::env::var("AI_MEMORY_TEST_POSTGRES_URL").unwrap() }\n'
+           '#[cfg(test)]\nmod cov {\n    #[test]\n    fn one_pg_test() {\n'
+           '        let _ = std::env::var("AI_MEMORY_TEST_POSTGRES_URL");\n    }\n}\n')
+        self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['daemon_runtime::cov::one_pg_test']),
+                         ['daemon_runtime'])
+        self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['daemon_runtime']), [])
+
+    def test_child_prefix_does_not_cover_the_parent_module_6344(self):
+        fx('src/store/mod.rs', 'fn t() { let _ = std::env::var("AI_MEMORY_TEST_POSTGRES_URL"); }\n')
+        fx('src/store/postgres.rs', 'fn t() { let _ = std::env::var("AI_MEMORY_TEST_POSTGRES_URL"); }\n')
+        self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['store::postgres']), ['store'])
+
+    def test_const_indirected_env_read_is_detected_6344(self):
+        fx('src/atomicity_tests.rs',
+           'const PG_URL_ENV: &str = "AI_MEMORY_TEST_POSTGRES_URL";\n'
+           '#[cfg(test)]\nmod pg {\n    #[test]\n    fn crash() { let _ = std::env::var(super::PG_URL_ENV); }\n}\n')
+        fx('src/consts.rs', 'pub static PG_VAR: &str = "AI_MEMORY_TEST_POSTGRES_URL";\n')
+        fx('src/user.rs', 'fn live() { let _ = std::env::var(crate::consts::PG_VAR); }\n')
+        self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', []),
+                         ['atomicity_tests', 'atomicity_tests::pg::crash', 'consts', 'user'])
+        self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['atomicity_tests', 'consts']), ['user'])
+
+    def test_comments_do_not_count_and_test_fn_paths_are_exact_6344(self):
+        fx('src/lib.rs', 'mod mcp;\n')
+        fx('src/mcp/mod.rs', '#[path = "tools/store_tool.rs"]\nmod store_tool;\n')
+        fx('src/mcp/tools/store_tool.rs',
+           '// AI_MEMORY_TEST_POSTGRES_URL in a comment\n'
+           '#[cfg(test)]\nmod tests {\n    #[tokio::test]\n    async fn live_store() {\n'
+           '        let _ = std::env::var("AI_MEMORY_TEST_POSTGRES_URL");\n    }\n}\n')
+        self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['mcp::tools::store_tool']),
+                         ['mcp::store_tool::tests::live_store'])
+        self.assertEqual(pt.uncovered_lib_pg_modules(SCRATCH / 'src', ['mcp::store_tool::tests::live_']), [])
+
+
+class DocEstimateTests6344B6(Base):
+    def test_doc_tests_are_in_the_serial_estimate_6344(self):
+        exes = pt.parse_build_json([artifact(['lib'], 'ai_memory', SCRATCH / 'src' / 'lib.rs', '/x/lib'),
+                                    artifact(['test'], 'a1', fx('tests/a1.rs', 'PgPool'))])
+        w = {'lib:pg': 5.0, 'lib:nonpg': 10.0, 'doc:tests': 16.0, 'test:a1': 2.0}
+        self.assertEqual(pt.partition(exes, w, ['x'], with_doc=True)[4]['serial'], 23.0)
+        self.assertEqual(pt.partition(exes, w, ['x'], with_doc=False)[4]['serial'], 7.0)
+        self.assertGreater(pt.load_weights(HERE.parent / 'test_binary_weights.json').get('doc:tests', 0), 0)
 
 
 class WeightTableTests(unittest.TestCase):
