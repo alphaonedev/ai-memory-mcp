@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """claude-md-rule-compare.py - issue #4507 (PR #4508 review R3-F3): make a CLAUDE.md rule change loud.
 
-Run by .github/workflows/claude-md-rule-compare.yml from the BASE branch (pull_request_target). The pull
-request head is DATA: with --pr-number this base script fetches `refs/pull/<N>/head` as git objects (no workflow
-step fetches or checks out the head, #6163), and its CLAUDE.md and the two docs/reference files are read out of git
-objects with `git ls-tree` and `git cat-file` into a scratch directory. Nothing from the head is executed, imported
-or checked out, and a symlink blob (mode 120000) at any of the three paths is refused. Credential-shaped head text is
-masked in the summary where it enters the report (#6163): a `name=value` / `name: value` whose name holds a password,
-passphrase, secret, token, API key, access key, private key or credential word (quoted, multi-word and JSON-quoted
-forms included, past an escaped quote and to the end of the line when the quote is never closed; a count of at most
-9 digits or a switch word is shown, and an UPPER_SNAKE value only as an environment variable name, unless the name is a
-password or passphrase), URL userinfo (an empty user name included), an Authorization Bearer/Basic value, a GitHub,
-AWS access key id, Slack or `sk-` provider token, and a PEM or PGP private key block. A diff line inside a private key
-block is masked by its index on its own side, so it is masked even when the BEGIN line lies outside its hunk. Lines
-this script writes are never masked, and the verdict is computed on the unmasked text.
+Run by .github/workflows/claude-md-rule-compare.yml from the BASE branch (pull_request_target). The pull request head is
+DATA: with --pr-number this base script fetches `refs/pull/<N>/head` as git objects (no workflow step fetches or checks
+out the head, #6163), and its CLAUDE.md and the two docs/reference files are read out of git objects with `git ls-tree`
+and `git cat-file` into a scratch directory. Nothing from the head is executed, imported or checked out, and a symlink
+blob (mode 120000) at any of the three paths is refused. Credential-shaped head text is masked in the summary where it
+enters the report (#6163): a `name=value` / `name: value` whose name holds a password, passphrase, secret, token, API
+key, access key, private key or credential word (quoted, multi-word and JSON-quoted forms included, past an escaped
+quote and to the end of the line when the quote is never closed; a count of at most 9 digits or a switch word is shown,
+and an UPPER_SNAKE value only as an environment variable name, unless the name is a password or passphrase; a later word
+that is neither plain nor short lower-case prose masks the whole value, #6209), URL userinfo (an empty user name
+included), an Authorization Bearer/Basic value, a GitHub, AWS access key id, Slack or `sk-` provider token, and a PEM or
+PGP private key block. A diff line inside a private key block is masked by its index on its own side, so it is masked
+even when the BEGIN line lies outside its hunk. Lines this script writes are never masked, and the verdict is computed
+on the unmasked text.
 
 The BASE guard (scripts/check-claude-md-size.py of the base checkout) and the BASE manifest
 (scripts/qc-allowlists/claude-md-rule-sections.sha256) then judge the head copies:
@@ -113,6 +114,10 @@ ENV_NAME_VALUE = re.compile(r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+[.,;:)\]}]*", re.ASCI
 ENV_NAME_KEY = re.compile(r"(?i)[_-](?:env|var|name)$")
 ENV_NAME_TAIL = re.compile(r"_(?:KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE|CREDENTIALS?)[.,;:)\]}]*$")
 LONG_DIGITS = re.compile(r"\d{4}")
+# #6209: an unquoted multi-word value is shown only when its first word is plain and every later word is plain too or
+# a short lower-case prose word (`max_tokens: 20000 per request`); `token: on <secret>` or `secret: yes, it is <secret>`
+# masks the whole value.
+PROSE_WORD = re.compile(r"[a-z]{1,12}[.,;:)\]}]*", re.ASCII)
 ALWAYS_MASK_NAME = re.compile(r"(?i)passw(?:or)?d|passphrase")
 # #6163 round 3 (review G2): the user name is optional (`redis://:<password>@host`).
 URL_USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]*:([^@\s/]+)@")
@@ -246,7 +251,8 @@ def plain_word(name: str, word: str) -> bool:
 
 def mask_named_values(line: str) -> tuple:
     """#6163: mask the value of every credential-named `name=value` / `name: value` in one line; returns (line, count).
-    A plain value (plain_word) is left visible unless the name is a password or passphrase."""
+    A plain value (plain_word) is left visible unless the name is a password or passphrase; an unquoted value of several
+    words only when every later word is plain or short prose (#6209)."""
     out, pos, count = [], 0, 0
     while True:
         match = CREDENTIAL_VALUE.search(line, pos)
@@ -254,9 +260,11 @@ def mask_named_values(line: str) -> tuple:
             break
         group = next(index for index in (3, 4, 5) if match.group(index) is not None)
         value = match.group(group)
-        first = value.split()[0] if value.split() else ""
+        words = value.split()
+        first = words[0] if words else ""
         plain = (group == 5 and first or value.strip())
-        if not value.strip() or plain_word(match.group(1), plain):
+        if not value.strip() or (plain_word(match.group(1), plain) and (group != 5 or all(
+                plain_word(match.group(1), word) or PROSE_WORD.fullmatch(word) for word in words[1:]))):
             stop = match.start(group) + (len(first) if group == 5 else len(value) + 1)
             out.append(line[pos:stop])
             pos = stop
