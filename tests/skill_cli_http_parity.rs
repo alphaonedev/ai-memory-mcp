@@ -413,7 +413,7 @@ async fn issue_6125_http_promote_404_body_is_unchanged() {
 /// Seed one observation and a depth-1 reflection over it in `db_path`; returns
 /// the reflection id.
 fn seed_reflection(db_path: &std::path::Path) -> String {
-    let conn = ai_memory::db::open(&db_path).unwrap();
+    let conn = ai_memory::db::open(db_path).unwrap();
     let now = chrono::Utc::now().to_rfc3339();
     let src = ai_memory::models::Memory {
         id: uuid::Uuid::new_v4().to_string(),
