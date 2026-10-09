@@ -1869,7 +1869,7 @@ DOCKER = "Dockerfile"
 INSTALL = "docs/INSTALL.md"
 DECL = "scripts/release-features.sh"
 ASSERTER = "scripts/assert-compiled-features.sh"
-INPUT_FILES = (REL, SHAPE, DOCKER, INSTALL, DECL)
+INPUT_FILES = (REL, SHAPE, DOCKER, INSTALL, DECL, ASSERTER)
 
 
 def mutate_file(path: Path, old: str, new: Union[str, None, Transform], every: bool = False) -> None:
@@ -2178,6 +2178,34 @@ def _proof_before_build(text: str) -> str:
 def _drop_proof_step(text: str) -> str:
     b = text.index(PROOF_NAME)
     return text.replace(text[b:text.index("      - name: Stop the PostgreSQL service", b)], "", 1)
+
+
+# #6277: the Dockerfile build RUN checks the copied declaration and asserter
+# against digests the guard computes from the tree. These transforms are no-ops
+# until the checksum lines land (red first).
+SUM_LINE_RE = r'^    echo "[0-9a-f]{64}  %s" \| sha256sum -c -; \\\n'
+
+
+def _drop_sum(path: str) -> Transform:
+    return lambda text: re.sub(SUM_LINE_RE % re.escape(path), "", text, flags=re.M)
+
+
+def _zero_sum(path: str) -> Transform:
+    pat = r'(?m)^(    echo ")[0-9a-f]{64}(  %s" \| sha256sum -c -)' % re.escape(path)
+    return lambda text: re.sub(pat, lambda m: m.group(1) + "0" * 64 + m.group(2), text)
+
+
+def _swap_sum_paths(text: str) -> str:
+    a, b = "  " + DECL + '" | sha256sum', "  " + ASSERTER + '" | sha256sum'
+    return text.replace(a, "\0").replace(b, a).replace("\0", b)
+
+
+def _sum_or_true(text: str) -> str:
+    return text.replace(" | sha256sum -c -; \\", " | sha256sum -c - || true; \\")
+
+
+def _append(line: str) -> Transform:
+    return lambda text: text + line
 
 
 def _d(old: str, new: str) -> Edit:
@@ -2942,6 +2970,15 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "SR11/B05 quoted cargo in the final stage": ("fail", [_final("RUN c''argo --version\n")]),
     "X11 --mount after another flag": ("fail", [_final("RUN --network=none --mount=type=cache,target=/m true\n")]),
     "X00 FROM image with an embedded $VAR": ("fail", [_d(D_FINAL, "FROM debian:bookworm-slim$SUFFIX\n")]),
+    # --- #6277: the build RUN verifies the copied declaration and asserter
+    "6277 declaration checksum line missing": ("fail", [(DOCKER, "", _drop_sum(DECL), False)]),
+    "6277 asserter checksum line missing": ("fail", [(DOCKER, "", _drop_sum(ASSERTER), False)]),
+    "6277 declaration checksum mismatched": ("fail", [(DOCKER, "", _zero_sum(DECL), False)]),
+    "6277 asserter checksum mismatched": ("fail", [(DOCKER, "", _zero_sum(ASSERTER), False)]),
+    "6277 checksum for a different path": ("fail", [(DOCKER, "", _swap_sum_paths, False)]),
+    "6277 checksum check made non-fatal": ("fail", [(DOCKER, "", _sum_or_true, False)]),
+    "6277 declaration changed, Dockerfile digest kept": ("fail", [(DECL, "", _append("# drift\n"), False)]),
+    "6277 asserter changed, Dockerfile digest kept": ("fail", [(ASSERTER, "", _append("# drift\n"), False)]),
 }
 
 # SHAPE_ADVISORY states (C-5): (advisory, want, edits).
@@ -3196,6 +3233,36 @@ def self_test(root: Path) -> int:
                 rc = subprocess.run([shell, "-c", "set -e; " + body], cwd=tmp, capture_output=True).returncode
                 if rc == 0:
                     print(f"self-test FAIL: {label} PASSED with a broken declaration ({mutant}): fail-open", file=sys.stderr)
+                    failures += 1
+
+        # --- #6277 runtime: the Dockerfile build RUN's checksum statements pass on
+        # the real declaration and asserter and fail when either one differs.
+        sums = [s for s in DOCKER_RUN[len("RUN "):].split("; ") if s.endswith("| sha256sum -c -")]
+        if len(sums) != 2:
+            print("self-test FAIL: the Dockerfile build RUN does not checksum both the declaration and the asserter "
+                  f"(#6277): {len(sums)} checksum statement(s)", file=sys.stderr)
+            failures += 1
+        else:
+            def checksum_rc(drift: Optional[str]) -> int:
+                dk = tmp / "dk"
+                shutil.rmtree(dk, ignore_errors=True)
+                (dk / "scripts").mkdir(parents=True)
+                for rel in (DECL, ASSERTER):
+                    shutil.copy2(root / rel, dk / rel)
+                if drift is not None:
+                    with open(dk / drift, "a", encoding="utf-8") as fh:
+                        fh.write("# drift\n")
+                return subprocess.run(["sh", "-c", "set -eu; " + "; ".join(sums)], cwd=dk,
+                                      capture_output=True).returncode
+
+            if checksum_rc(None) != 0:
+                print("self-test FAIL: the Dockerfile checksum statements refuse the real declaration and asserter",
+                      file=sys.stderr)
+                failures += 1
+            for drift in (DECL, ASSERTER):
+                if checksum_rc(drift) == 0:
+                    print(f"self-test FAIL: the Dockerfile checksum statements accept a changed {drift}: fail-open",
+                          file=sys.stderr)
                     failures += 1
 
         # --- #4752 runtime: the package unit packages the asserted bytes and
