@@ -41,9 +41,11 @@ PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectHostname=yes
 ProtectClock=yes
+ProtectProc=invisible
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictNamespaces=yes
 RestrictRealtime=yes
@@ -56,7 +58,9 @@ SystemCallFilter=~@mount @swap @reboot @obsolete
 CapabilityBoundingSet=
 AmbientCapabilities=
 ReadWritePaths=/var/lib/ai-memory
-ReadOnlyPaths=/etc/ai-memory
+# `-`: /etc/ai-memory is optional (EnvironmentFile above is `-` too); without
+# the prefix the unit fails to start on a host that never created it (#4401).
+ReadOnlyPaths=-/etc/ai-memory
 
 [Install]
 WantedBy=multi-user.target
