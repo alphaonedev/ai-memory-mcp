@@ -104,7 +104,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -168,13 +168,25 @@ CARGO_PROFILE_ARG_RE = re.compile(r"\bcargo\b[^|;&\n]*?--profile(?:=|\s+)([A-Za-
 # flags env value, or in a run line that sets RUSTFLAGS / calls rustc (a bare
 # `-g` elsewhere, e.g. `npm install -g`, is not a rustc flag).
 RUSTC_FLAGS_KEY_RE = re.compile(r"(CARGO_ENCODED_)?RUST(DOC)?FLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_[A-Z0-9_]+_RUSTFLAGS")
-# In a run body only the VALUE of a flags assignment (`RUSTFLAGS=...`,
-# `rustflags = [...]` in a config.toml written by a step; any case) or the
-# simple command that calls `rustc` is searched for `-g`, so `git log -g` on the
-# same line, or prose that mentions -g, is not a rustc flag.
-RUSTFLAGS_ASSIGN_RE = re.compile(
-    r"(?i)RUST(?:DOC)?FLAGS\s*=\s*(\"[^\"]*\"|'[^']*'|\[[^\]]*\]|(?:[^\s;|&]|\x1f)*)")
-RUSTFLAGS_HEREDOC_RE = re.compile(r"(?i)RUST(?:DOC)?FLAGS\s*<<-?\s*['\"]?(\w+)['\"]?")
+# A run body is read as shell: words (quotes, escapes, ``$'..'`` decoded), operators and
+# here-document bodies.  A ``KEY=value`` / ``KEY+=value`` / ``KEY<<DELIM`` inside a word or a
+# here-document line is an assignment of KEY.  Kinds of KEY that matter:
+#   debug      CARGO_PROFILE_<P>_DEBUG: the value must stay ``0``
+#   flags      a rustc / rustdoc flags variable or config key: no ``-g`` / debuginfo>0
+#   forbidden  CARGO_HOME / RUSTC / RUSTC_WRAPPER ...: each can inject a debuginfo level the
+#              CARGO_PROFILE_* pins do not cover, so setting them at all is a violation
+RUN_ASSIGN_RE = re.compile(r"(?<![A-Za-z0-9_-])([A-Za-z_][A-Za-z0-9_-]*)(\+?=|<<-?)")
+TOOL_OVERRIDE_KEYS = frozenset({
+    "CARGO_HOME", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC",
+    "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
+    "rustc", "rustc-wrapper", "rustc-workspace-wrapper"})
+FLAGS_CONFIG_KEYS = frozenset({"rustflags", "rustdocflags"})
+# Actions whose behaviour is pinned and known not to raise a debuginfo level.  A `with:` input of
+# ANY step is still read; a step that `uses:` anything else (a local composite action, a reusable
+# workflow reference, a docker image, a third-party action) can run cargo with any setting.
+USES_ALLOWLIST = ("actions/checkout@", "dtolnay/rust-toolchain@", "Swatinem/rust-cache@",
+                  "actions/setup-python@", "actions/setup-node@", "actions/upload-artifact@")
+SHELL_CMD_WORDS = frozenset({"echo", "printf", "cat", "-n", "-e", "-E", "-ne", "-en", "--"})
 RUSTC_SEGMENT_RE = re.compile(r"\brustc\b([^|;&]*)")
 YAML_HEX_ESCAPE_RE = re.compile(r"\\x([0-9A-Fa-f]{2})|\\u([0-9A-Fa-f]{4})")
 DASH_G_RE = re.compile(r"(?:^|[\s\"'=\x1f\[,])-g(?=$|[\s\"'\x1f\],])")
@@ -200,6 +212,8 @@ class Step:
         self.uses = ""
         self.step_id = ""
         self.env: Dict[str, str] = {}
+        self.with_: Dict[str, str] = {}
+        self.workdir = ""
         self.run: List[str] = []
 
     def run_text(self) -> str:
@@ -217,6 +231,7 @@ class Job:
         self.env: Dict[str, str] = {}
         self.matrix: Dict[str, List[str]] = {}  # every literal value of every matrix key
         self.legs: List[List[str]] = []  # one label list per possible runner
+        self.workdir = False  # `defaults.run.working-directory` is set
         self.steps: List[Step] = []
 
     def self_hosted(self) -> bool:
@@ -229,6 +244,7 @@ class Job:
 
 class Workflow:
     def __init__(self) -> None:
+        self.workdir = False  # top-level `defaults.run.working-directory` is set
         self.env: Dict[str, str] = {}
         self.jobs: Dict[str, Job] = {}
 
@@ -392,6 +408,37 @@ def _env_block(lines: List[Tuple[int, str, str]], start: int, indent: int) -> Tu
     return env, i
 
 
+def _with_block(lines: List[Tuple[int, str, int]], start: int, indent: int) -> Tuple[Dict[str, str], int]:
+    """Read a step's ``with:`` inputs; block-scalar bodies and continuations join the preceding input."""
+    inputs: Dict[str, str] = {}
+    i = start
+    own: Optional[int] = None
+    last = ""
+    while i < len(lines) and lines[i][0] > indent:
+        ind, content, _n = lines[i]
+        if own is None:
+            own = ind
+        _dash, key, value = _split_key(content)
+        if ind == own and key:
+            header = _strip_comment(value)
+            inputs[key] = "" if header in ("|", "|-", "|+", ">", ">-", ">+") else _unquote(header)
+            last = key
+        elif last:
+            inputs[last] += "\n" + content
+        i += 1
+    return inputs, i
+
+
+def _defaults_workdir(rows: List[Tuple[int, str, int]], start: int, indent: int) -> Tuple[bool, int]:
+    found = False
+    i = start
+    while i < len(rows) and rows[i][0] > indent:
+        if _split_key(rows[i][1])[1] == "working-directory":
+            found = True
+        i += 1
+    return found, i
+
+
 def read_workflow(text: str) -> Workflow:
     """Read the top-level env and every job's runs-on / env / matrix runners / steps.
 
@@ -419,6 +466,9 @@ def read_workflow(text: str) -> Workflow:
         _dash, key, value = _split_key(content)
         if key == "env" and not value.strip():
             wf.env, i = _env_block(rows, i + 1, 0)
+            continue
+        if key == "defaults":
+            wf.workdir, i = _defaults_workdir(rows, i + 1, 0)
             continue
         if key == "jobs":
             i = _read_jobs(wf, rows, raw, i + 1)
@@ -472,6 +522,8 @@ def _read_jobs(wf: Workflow, rows: List[Tuple[int, str, int]], raw: List[str], s
                 job.env, i = _env_block(rows, i + 1, kind)
             elif key == "strategy":
                 i = _read_matrix(rows, i + 1, kind, job)
+            elif key == "defaults":
+                job.workdir, i = _defaults_workdir(rows, i + 1, kind)
             elif key == "steps":
                 i = _read_steps(job, rows, raw, i + 1, kind)
             else:
@@ -511,8 +563,24 @@ def _read_steps(job: Job, rows: List[Tuple[int, str, int]], raw: List[str], star
                 raise Unparsed("inline step env at line %d is not read: %r" % (n, content))
             step.env, i = _env_block(rows, i + 1, key_col)
             continue
+        if key == "with":
+            flow = _strip_comment(value).strip()
+            if flow.startswith("{") and flow.endswith("}"):
+                # `with: { a: 1, b: x }`: every entry is read like a block input.
+                for part in flow[1:-1].split(","):
+                    k, _sep, v = part.partition(":")
+                    if k.strip():
+                        step.with_[_unquote(k.strip())] = _unquote(v.strip())
+                i += 1
+                continue
+            if flow:
+                raise Unparsed("inline step with at line %d is not read: %r" % (n, content))
+            step.with_, i = _with_block(rows, i + 1, key_col)
+            continue
         if key == "name":
             step.name = _unquote(_strip_comment(value))
+        elif key == "working-directory":
+            step.workdir = _unquote(_strip_comment(value))
         elif key == "if":
             step.cond = _strip_comment(value)
         elif key == "uses":
@@ -548,17 +616,38 @@ def load_all() -> Dict[str, str]:
 REPO_CONFIG_FILES = ("Cargo.toml", ".cargo/config.toml", ".cargo/config")
 
 
-def load_repo_files() -> Dict[str, str]:
-    """The cargo manifest and config files a self-hosted build reads (#6255)."""
-    return {name: (ROOT / name).read_text(encoding="utf-8") for name in REPO_CONFIG_FILES if (ROOT / name).is_file()}
+def load_repo_files(root: Path = ROOT) -> Dict[str, str]:
+    """The cargo manifest and every ``.cargo/config[.toml]`` a self-hosted build can read (#6255 #6297).
+
+    A step that changes directory (or sets ``working-directory``) makes cargo read the nearest
+    ``.cargo/config.toml`` above that directory, so every one below ``root`` is checked, build
+    output trees (``target``) and VCS / scratch directories excluded.
+    """
+    found = {name: (root / name).read_text(encoding="utf-8") for name in REPO_CONFIG_FILES if (root / name).is_file()}
+    for dirpath, dirnames, _files in os.walk(str(root)):
+        dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
+        for cfg in CONFIG_NAMES:
+            path = Path(dirpath) / cfg
+            if path.is_file():
+                found.setdefault(path.relative_to(root).as_posix(), path.read_text(encoding="utf-8"))
+    return found
 
 
 # Cargo profile tables whose `package.<spec>` / `build-override` sub-tables beat the
 # CARGO_PROFILE_<P>_DEBUG env pin (cargo 1.98.0), unlike a plain `[profile.dev] debug`.
 OVERRIDE_PROFILES = frozenset({"dev", "test"})
 OVERRIDE_TABLES = frozenset({"package", "build-override"})
+DEV_TEST_RE = re.compile(r"\b(?:dev|test)\b")
+TOML_UNICODE_RE = re.compile(r"\\u([0-9A-Fa-f]{4})|\\U([0-9A-Fa-f]{8})")
+TOML_ML_RE = re.compile(r"=\s*(\"\"\"|\'\'\')")
+CONFIG_NAMES = (".cargo/config.toml", ".cargo/config")
+SKIP_DIRS = frozenset({"target", ".git", ".local-runs", "node_modules", ".codegraph"})
 SHELL_ECHO_PREFIX_RE = re.compile(r"^(?:printf|echo)\s+(?:-[A-Za-z]+\s+)*[\"']")
 TOML_DEBUG_RE = re.compile(r"\bdebug\s*=\s*[\"']?([A-Za-z0-9_-]*)")
+
+
+def _toml_char(code: int) -> str:
+    return chr(code) if code < 0x110000 else ""
 
 
 def _toml_split(text: str, sep: str) -> List[str]:
@@ -566,7 +655,8 @@ def _toml_split(text: str, sep: str) -> List[str]:
     parts: List[str] = []
     cur: List[str] = []
     quote: Optional[str] = None
-    for ch in text.replace("\\", ""):
+    decoded = TOML_UNICODE_RE.sub(lambda m: _toml_char(int(m.group(1) or m.group(2), 16)), text)
+    for ch in decoded.replace("\\", ""):
         if quote:
             if ch == quote:
                 quote = None
@@ -611,8 +701,20 @@ def _toml_entries(text: str) -> List[Tuple[Tuple[str, ...], str]]:
     A value opened with ``[`` or ``{`` runs to its closing bracket, across lines.
     """
     rows: List[str] = []
-    for raw in text.replace("\\n", "\n").split("\n"):
-        line = _strip_comment(SHELL_ECHO_PREFIX_RE.sub("", raw.strip(), count=1)).strip()
+    raw_lines = text.replace("\\n", "\n").split("\n")
+    k = 0
+    while k < len(raw_lines):
+        line = _strip_comment(SHELL_ECHO_PREFIX_RE.sub("", raw_lines[k].strip(), count=1)).strip()
+        k += 1
+        opener = TOML_ML_RE.search(line)
+        if opener and line.count(opener.group(1)) % 2 == 1:
+            # A multi-line string (#6296): its body, up to the closing triple quote, is one value.
+            while k < len(raw_lines):
+                piece = raw_lines[k].strip()
+                k += 1
+                line += " " + piece
+                if opener.group(1) in piece:
+                    break
         if line:
             rows.append(line)
     out: List[Tuple[Tuple[str, ...], str]] = []
@@ -640,8 +742,11 @@ def toml_debug_findings(text: str) -> List[str]:
     """Debuginfo overrides cargo would honour over the ``CARGO_PROFILE_*_DEBUG=0`` pin (#6255)."""
     found: List[str] = []
     for path, value in _toml_entries(text):
+        if not path:
+            continue
         dotted = ".".join(path)
-        if (len(path) >= 3 and path[0] == "profile" and path[1] in OVERRIDE_PROFILES
+        if (path[0] == "profile" and (len(path) == 1 or path[1] in OVERRIDE_PROFILES)
+                and (len(path) > 1 or DEV_TEST_RE.search(value))
                 and (OVERRIDE_TABLES & set(path[2:]) or any(t in value for t in OVERRIDE_TABLES))):
             levels = [value.strip("\"' ")] if path[-1] == "debug" else []
             levels.extend(m.group(1) for m in TOML_DEBUG_RE.finditer(value))
@@ -649,9 +754,12 @@ def toml_debug_findings(text: str) -> List[str]:
                 if level and level not in LEVEL_OFF:
                     found.append("%s = %r (a profile package / build-override table beats the CARGO_PROFILE_* env)"
                                  % (dotted, level))
-        if path[-1] in ("rustflags", "rustdocflags"):  # cargo keys are case-sensitive
+        # cargo keys are case-sensitive and `[env]` values never reach rustc's flags (#6316)
+        if path[-1] in FLAGS_CONFIG_KEYS and (path[0] in ("build", "target") or len(path) == 1):
             for spelled in _level_spellings(value, True):
                 found.append("%s carries %s" % (dotted, spelled))
+        if path[0] == "build" and len(path) == 2 and path[1] in ("rustc", "rustc-wrapper", "rustc-workspace-wrapper"):
+            found.append("%s = %s (a compiler wrapper can add any debuginfo flag)" % (dotted, value.strip()))
     return found
 
 
@@ -679,10 +787,11 @@ def _yaml_unescape(value: str) -> str:
     return YAML_HEX_ESCAPE_RE.sub(lambda m: chr(int(m.group(1) or m.group(2), 16)), value)
 
 
-ANSI_C_RE = re.compile(r"\$'((?:[^'\\]|\\.)*)'", re.S)
 ANSI_C_ESCAPE_RE = re.compile(r"\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|c.|.)", re.S)
 ANSI_C_SIMPLE = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
                  "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+SHELL_OPS = ";&|()"
+EXPANSION_START_RE = re.compile(r"[A-Za-z_0-9@*#?!$-]")
 
 
 def _ansi_c_one(m: "re.Match[str]") -> str:
@@ -696,26 +805,346 @@ def _ansi_c_one(m: "re.Match[str]") -> str:
     return ANSI_C_SIMPLE.get(body, "\\" + body)
 
 
-def _ansi_c_decode(text: str) -> str:
-    """Replace each bash ANSI-C ``$'..'`` string in ``text`` by the characters bash would pass on (#6256)."""
-    def decode(m: "re.Match[str]") -> str:
-        inner = ANSI_C_ESCAPE_RE.sub(_ansi_c_one, m.group(1))
-        # A decoded blank or newline is still one word of the value bash assigned,
-        # so it becomes the unit separator the flag regexes already split on.
-        return "".join("\x1f" if ch.isspace() else ch for ch in inner)
-    return ANSI_C_RE.sub(decode, text)
+def _escapes(text: str) -> str:
+    """Decode ``\\xHH`` / ``\\NNN`` / ``\\n`` ... the way ``printf`` and ``$'..'`` do (#6295)."""
+    return ANSI_C_ESCAPE_RE.sub(_ansi_c_one, text) if "\\" in text else text
 
 
-def _heredoc_ends(line: str, delimiter: str) -> bool:
-    return re.search(r"(?:^|[\s'\"])" + re.escape(delimiter) + r"(?:$|[\s'\"])", line) is not None
+class Unit(NamedTuple):
+    kind: str  # "word" | "line" (here-document body) | "op"
+    text: str
+    dynamic: bool  # the text depends on a variable / command substitution the guard cannot evaluate
+    file_data: bool = False  # a here-document body that is written to a file (read by the TOML rules)
+
+
+def _skip_balanced(text: str, i: int, open_ch: str, close_ch: str) -> int:
+    """``text[i]`` follows an opener; return the index after its matching closer (quotes honoured)."""
+    depth = 1
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c == "'":
+            j = text.find("'", i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        if c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            i = j + 1
+            continue
+        if c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def _read_word(text: str, i: int) -> Tuple[str, bool, bool, int]:
+    """One shell word from ``text[i]``: (value, dynamic, quoted, next index)."""
+    n = len(text)
+    out: List[str] = []
+    seg: List[str] = []
+    dynamic = False
+    quoted = False
+
+    def flush() -> None:
+        if seg:
+            out.append(_escapes("".join(seg)))
+            del seg[:]
+
+    def expansion(j: int) -> int:
+        """``text[j] == '$'``: skip a substitution / parameter expansion; note it was dynamic."""
+        nonlocal dynamic
+        nxt = text[j + 1:j + 2]
+        if nxt == "(":
+            dynamic = True
+            return _skip_balanced(text, j + 2, "(", ")")
+        if nxt == "{":
+            dynamic = True
+            return _skip_balanced(text, j + 2, "{", "}")
+        if nxt and EXPANSION_START_RE.match(nxt):
+            dynamic = True
+            j += 1
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            return j + 1 if j == i + 1 else j
+        seg.append("$")
+        return j + 1
+
+    while i < n:
+        c = text[i]
+        if c in " \t\n" or c in SHELL_OPS or c in "<>":
+            break
+        if c == "\\":
+            nxt = text[i + 1:i + 2]
+            if nxt == "\n":
+                i += 2
+            elif nxt and nxt in " \t\"'$;&|<>()#`":
+                seg.append(nxt)
+                i += 2
+            else:
+                seg.append(c + nxt)
+                i += 2
+            continue
+        if c == "'":
+            quoted = True
+            j = text.find("'", i + 1)
+            end = n if j < 0 else j
+            seg.append(text[i + 1:end])
+            i = end + 1
+            continue
+        if c == "$" and text[i + 1:i + 2] == "'":
+            quoted = True
+            j = i + 2
+            while j < n and text[j] != "'":
+                j += 2 if text[j] == "\\" else 1
+            flush()
+            inner = ANSI_C_ESCAPE_RE.sub(_ansi_c_one, text[i + 2:j])
+            # A decoded blank or newline is still one word of the value bash assigned, so it
+            # becomes the unit separator the flag matchers already split on.
+            out.append("".join("\x1f" if ch.isspace() else ch for ch in inner))
+            i = j + 1
+            continue
+        if c == '"' or (c == "$" and text[i + 1:i + 2] == '"'):
+            quoted = True
+            i += 2 if c == "$" else 1
+            while i < n and text[i] != '"':
+                d = text[i]
+                if d == "\\":
+                    nxt = text[i + 1:i + 2]
+                    if nxt == "\n":
+                        pass
+                    elif nxt and nxt in '$"\\`':
+                        seg.append(nxt)
+                    else:
+                        seg.append(d + nxt)
+                    i += 2
+                elif d == "$":
+                    i = expansion(i)
+                elif d == "`":
+                    dynamic = True
+                    j = text.find("`", i + 1)
+                    i = n if j < 0 else j + 1
+                else:
+                    seg.append(d)
+                    i += 1
+            i += 1
+            continue
+        if c == "$":
+            i = expansion(i)
+            continue
+        if c == "`":
+            dynamic = True
+            j = text.find("`", i + 1)
+            i = n if j < 0 else j + 1
+            continue
+        seg.append(c)
+        i += 1
+    flush()
+    return "".join(out), dynamic, quoted, i
+
+
+def _redirects_to_file(units: List[Unit], raw: str) -> bool:
+    """True when a command line writes to a file other than ``$GITHUB_ENV`` (stdout of ``tee`` included).
+
+    ``raw`` is the source text of the line: ``$GITHUB_ENV`` is a variable, so the tokenised word is empty.
+    """
+    if "GITHUB_ENV" in raw:
+        return False
+    words = [u.text for u in units if u.kind == "word"]
+    if "tee" in words:
+        return True
+    for idx, u in enumerate(units[:-1]):
+        if u.kind == "op" and u.text in (">", ">>") and units[idx + 1].kind == "word":
+            return True
+    return False
+
+
+def _shell_units(text: str) -> List[Unit]:
+    """Tokenise a run body into words, operators and here-document body lines (#6312)."""
+    units: List[Unit] = []
+    pending: List[Tuple[str, bool, bool]] = []
+    line_start = 0
+    line_char = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "\n":
+            units.append(Unit("op", "\n", False))
+            file_data = _redirects_to_file(units[line_start:], text[line_char:i])
+            i += 1
+            for delim, strip, quoted in pending:
+                while i < n:
+                    j = text.find("\n", i)
+                    body = text[i:n if j < 0 else j]
+                    i = n if j < 0 else j + 1
+                    if (body.lstrip("\t") if strip else body).strip() == delim:
+                        break
+                    expands = not quoted and ("$" in body or "`" in body)
+                    units.append(Unit("line", body, expands, file_data))
+                    units.append(Unit("op", "\n", False))
+            pending = []
+            line_start = len(units)
+            line_char = i
+            continue
+        if c in " \t":
+            i += 1
+            continue
+        if c == "\\" and text[i + 1:i + 2] == "\n":
+            i += 2
+            continue
+        if c == "#":
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c in SHELL_OPS:
+            units.append(Unit("op", c, False))
+            i += 1
+            continue
+        if c in "{}" and (i + 1 >= n or text[i + 1] in " \t\n;&|)"):
+            units.append(Unit("op", c, False))
+            i += 1
+            continue
+        if c == "<":
+            if text.startswith("<<<", i):
+                units.append(Unit("op", "<<<", False))
+                i += 3
+            elif text.startswith("<<", i):
+                j = i + 2
+                strip = text[j:j + 1] == "-"
+                j += 1 if strip else 0
+                while j < n and text[j] in " \t":
+                    j += 1
+                delim, _dyn, quoted, j = _read_word(text, j)
+                pending.append((delim, strip, quoted))
+                units.append(Unit("op", "<<", False))
+                i = j
+            else:
+                units.append(Unit("op", "<", False))
+                i += 1
+            continue
+        if c == ">":
+            op = ">>" if text.startswith(">>", i) else ">"
+            units.append(Unit("op", op, False))
+            i += len(op)
+            continue
+        word, dynamic, _quoted, i = _read_word(text, i)
+        units.append(Unit("word", word, dynamic))
+    return units
+
+
+def _key_kind(key: str) -> str:
+    if DEBUG_ENV_KEY_RE.fullmatch(key):
+        return "debug"
+    if RUSTC_FLAGS_KEY_RE.fullmatch(key) or key in FLAGS_CONFIG_KEYS:
+        return "flags"
+    if key in TOOL_OVERRIDE_KEYS:
+        return "forbidden"
+    return ""
+
+
+def _judge(key: str, kind: str, value: str, dynamic: bool) -> List[str]:
+    if kind == "forbidden":
+        return ["%s is set (it changes which cargo config or compiler is used, so the debuginfo pins no longer "
+                "decide the level)" % key]
+    if dynamic:
+        return ["%s is assigned a value computed at run time (variable, command substitution or here-string); "
+                "the guard cannot read it" % key]
+    if kind == "debug":
+        level = value.strip().strip("\"'")
+        return [] if level == DEBUG_LEVEL else ["%s is %r (a $GITHUB_ENV write overrides every later step)" % (key, level)]
+    return _level_spellings(value, True)
+
+
+def _command_strings(units: List[Unit]) -> List[str]:
+    """Each simple command (and each here-document line) as one blank-separated string."""
+    cmds: List[str] = []
+    cur: List[str] = []
+    for u in units:
+        if u.kind == "word":
+            cur.append(u.text)
+            continue
+        if u.kind == "line":
+            cmds.append(u.text)
+            continue
+        if u.text in (";", "&", "|", "(", ")", "{", "}", "\n"):
+            if cur:
+                cmds.append(" ".join(cur))
+            cur = []
+    if cur:
+        cmds.append(" ".join(cur))
+    return cmds
+
+
+def _run_findings(run_text: str) -> List[str]:
+    """Every way a run body raises a debuginfo level, or hides that it might (#6295 #6296 #6297 #6298 #6312)."""
+    units = _shell_units(run_text)
+    found: List[str] = []
+    for cmd in _command_strings(units):
+        found.extend(_level_spellings(cmd, False))
+    multi: Optional[List[object]] = None  # [key, kind, delimiter, pieces, dynamic] of an open NAME<<DELIM
+    words: List[str] = []  # the words of the current simple command
+    skip_target = False
+    for u in units:
+        if u.kind == "op":
+            if u.text in (">", ">>", "<"):
+                skip_target = True
+            elif u.text in (";", "&", "|", "(", ")", "{", "}", "\n"):
+                words = []
+            continue
+        if skip_target:
+            skip_target = False
+            continue
+        if multi is not None:
+            if u.text.strip() == multi[2]:
+                pieces = [p for p in multi[3] if p not in SHELL_CMD_WORDS]  # type: ignore[union-attr]
+                value = "\x1f".join(pieces)
+                kind = str(multi[1])
+                if kind == "debug" and not pieces:
+                    value = ""
+                found.extend(_judge(str(multi[0]), kind, value, bool(multi[4])))
+                multi = None
+            else:
+                multi[3].append(u.text)  # type: ignore[union-attr]
+                multi[4] = bool(multi[4]) or u.dynamic
+            continue
+        if u.kind == "word":
+            words.append(u.text)
+            if words[0] in ("cd", "pushd") and len(words) == 1:
+                found.append("%s changes the directory cargo reads .cargo/config from" % words[0])
+            if len(words) >= 3 and words[0] == "printf" and words[-2] == "-v" and _key_kind(words[-1]):
+                found.append("printf -v %s computes the value at run time; the guard cannot read it" % words[-1])
+            if words[0] in ("read", "mapfile", "readarray") and len(words) > 1 and _key_kind(u.text):
+                found.append("%s %s fills the variable from input; the guard cannot read it" % (words[0], u.text))
+        if u.kind == "line" and u.file_data:
+            continue
+        for m in RUN_ASSIGN_RE.finditer(u.text):
+            kind = _key_kind(m.group(1))
+            if not kind:
+                continue
+            rest = u.text[m.end():]
+            if m.group(2).startswith("<<"):
+                multi = [m.group(1), kind, rest.strip("'\" \t"), [], False]
+                break
+            found.extend(_judge(m.group(1), kind, rest, u.dynamic))
+    return found
 
 
 def _level_spellings(text: str, flags_value: bool) -> List[str]:
     """Every debuginfo level other than off spelled in ``text`` as a rustc flag or cargo --config.
 
     ``flags_value``: ``text`` IS a rustc flags value (an env row of a RUSTFLAGS
-    key), so a standalone ``-g`` anywhere in it counts; otherwise ``text`` is a
-    run line and ``-g`` counts only in a flags assignment's value or after ``rustc``.
+    key, a flags assignment found by ``_run_findings``), so a standalone ``-g``
+    anywhere in it counts; otherwise ``text`` is a command and ``-g`` counts only
+    after ``rustc`` (a bare ``-g``, e.g. ``npm install -g``, is not a rustc flag).
     """
     found: List[str] = []
     for m in DEBUGINFO_FLAG_RE.finditer(text):
@@ -730,8 +1159,7 @@ def _level_spellings(text: str, flags_value: bool) -> List[str]:
     if flags_value:
         scanned = [text]
     else:
-        scanned = [m.group(1) for m in RUSTFLAGS_ASSIGN_RE.finditer(text)]
-        scanned.extend(m.group(1) for m in RUSTC_SEGMENT_RE.finditer(text))
+        scanned = [m.group(1) for m in RUSTC_SEGMENT_RE.finditer(text)]
     if any(DASH_G_RE.search(piece) for piece in scanned):
         found.append("rustc -g (= -C debuginfo=2)")
     if not flags_value:
@@ -746,39 +1174,47 @@ def _level_spellings(text: str, flags_value: bool) -> List[str]:
     return found
 
 
+def _value_findings(key: str, value: str) -> List[str]:
+    """Findings for one env row or ``with:`` input named ``key``."""
+    text = _yaml_unescape(value)
+    found: List[str] = []
+    if key in TOOL_OVERRIDE_KEYS:
+        found.extend(_judge(key, "forbidden", text, False))
+    flags = bool(RUSTC_FLAGS_KEY_RE.fullmatch(key)) or key.lower().replace("-", "") in FLAGS_CONFIG_KEYS
+    found.extend(_level_spellings(text, flags))
+    found.extend(_run_findings(text))
+    return found
+
+
 def _debug_overrides(where: str, effective: Dict[str, str], job: Job) -> List[str]:
     """Every place a self-hosted job sets a debuginfo level other than ``0``."""
     found: List[str] = []
     for key, value in sorted(effective.items()):
         if DEBUG_ENV_KEY_RE.fullmatch(key) and key not in DEBUG_KEYS and value != DEBUG_LEVEL:
             found.append("%s: R-DEBUG env %s is %r, want %r" % (where, key, value, DEBUG_LEVEL))
-        for spelled in _level_spellings(_yaml_unescape(value), bool(RUSTC_FLAGS_KEY_RE.fullmatch(key))):
+        for spelled in _value_findings(key, value):
             found.append("%s: R-DEBUG env %s carries %s, want %r" % (where, key, spelled, DEBUG_LEVEL))
+    if job.workdir:
+        found.append("%s: R-DEBUG defaults.run.working-directory moves cargo to another .cargo/config, want %r"
+                     % (where, DEBUG_LEVEL))
     for step in job.steps:
         label = step.name or step.uses or "<unnamed step>"
+        if step.uses and not step.uses.startswith(USES_ALLOWLIST):
+            found.append("%s: R-DEBUG step %r uses %r, which is not on the allowlist of actions known not to raise a "
+                         "debuginfo level (%s)" % (where, label, step.uses, ", ".join(USES_ALLOWLIST)))
+        if step.workdir:
+            found.append("%s: R-DEBUG step %r sets working-directory %r, which moves cargo to another .cargo/config"
+                         % (where, label, step.workdir))
         for key, value in sorted(step.env.items()):
             if DEBUG_ENV_KEY_RE.fullmatch(key) and value != DEBUG_LEVEL:
                 found.append("%s: R-DEBUG step %r env %s is %r, want %r" % (where, label, key, value, DEBUG_LEVEL))
-            for spelled in _level_spellings(_yaml_unescape(value), bool(RUSTC_FLAGS_KEY_RE.fullmatch(key))):
+            for spelled in _value_findings(key, value):
                 found.append("%s: R-DEBUG step %r env %s carries %s, want %r" % (where, label, key, spelled, DEBUG_LEVEL))
-        heredoc = ""  # delimiter of an open `RUSTFLAGS<<DELIM` ($GITHUB_ENV multi-line value)
-        for line in step.run:
-            if heredoc:
-                if _heredoc_ends(line, heredoc):
-                    heredoc = ""
-                elif DASH_G_RE.search(line):
-                    found.append("%s: R-DEBUG step %r run sets rustc -g in a RUSTFLAGS heredoc, want %r"
-                                 % (where, label, DEBUG_LEVEL))
-            else:
-                opened = RUSTFLAGS_HEREDOC_RE.search(line)
-                if opened:
-                    heredoc = opened.group(1)
-            for m in RUN_DEBUG_ASSIGN_RE.finditer(line):
-                if m.group(2) != DEBUG_LEVEL:
-                    found.append("%s: R-DEBUG step %r run sets %s to %r (a $GITHUB_ENV write overrides every later "
-                                 "step), want %r" % (where, label, m.group(1), m.group(2), DEBUG_LEVEL))
-            for spelled in _level_spellings(_ansi_c_decode(line), False):
-                found.append("%s: R-DEBUG step %r run sets %s, want %r" % (where, label, spelled, DEBUG_LEVEL))
+        for key, value in sorted(step.with_.items()):
+            for spelled in _value_findings(key, value):
+                found.append("%s: R-DEBUG step %r input %s carries %s, want %r" % (where, label, key, spelled, DEBUG_LEVEL))
+        for spelled in _run_findings(step.run_text()):
+            found.append("%s: R-DEBUG step %r run sets %s, want %r" % (where, label, spelled, DEBUG_LEVEL))
         for spelled in toml_debug_findings(step.run_text()):
             found.append("%s: R-DEBUG step %r writes a cargo config with %s, want %r" % (where, label, spelled, DEBUG_LEVEL))
     return found
@@ -795,6 +1231,8 @@ def violations(name: str, wf: Workflow, job: Job) -> List[str]:
         if got != DEBUG_LEVEL:
             found.append("%s: R-DEBUG %s is %r, want %r" % (where, key, got, DEBUG_LEVEL))
     found.extend(_debug_overrides(where, effective, job))
+    if wf.workdir:
+        found.append("%s: R-DEBUG workflow defaults.run.working-directory moves cargo to another .cargo/config" % where)
     if not job.steps:
         found.append("%s: R-PRUNE job has no steps" % where)
         return found
