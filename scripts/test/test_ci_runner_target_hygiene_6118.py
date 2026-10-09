@@ -156,7 +156,7 @@ RUSTC_FLAGS_KEY_RE = re.compile(r"(CARGO_ENCODED_)?RUST(DOC)?FLAGS|CARGO_BUILD_R
 # simple command that calls `rustc` is searched for `-g`, so `git log -g` on the
 # same line, or prose that mentions -g, is not a rustc flag.
 RUSTFLAGS_ASSIGN_RE = re.compile(
-    r"(?i)RUST(?:DOC)?FLAGS\s*=\s*(\"[^\"]*\"|'[^']*'|\[[^\]]*\]|[^\s;|&]*)")
+    r"(?i)RUST(?:DOC)?FLAGS\s*=\s*(\"[^\"]*\"|'[^']*'|\[[^\]]*\]|(?:[^\s;|&]|\x1f)*)")
 RUSTFLAGS_HEREDOC_RE = re.compile(r"(?i)RUST(?:DOC)?FLAGS\s*<<-?\s*['\"]?(\w+)['\"]?")
 RUSTC_SEGMENT_RE = re.compile(r"\brustc\b([^|;&]*)")
 YAML_HEX_ESCAPE_RE = re.compile(r"\\x([0-9A-Fa-f]{2})|\\u([0-9A-Fa-f]{4})")
@@ -546,6 +546,33 @@ def _yaml_unescape(value: str) -> str:
     return YAML_HEX_ESCAPE_RE.sub(lambda m: chr(int(m.group(1) or m.group(2), 16)), value)
 
 
+ANSI_C_RE = re.compile(r"\$'((?:[^'\\]|\\.)*)'", re.S)
+ANSI_C_ESCAPE_RE = re.compile(r"\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[0-7]{1,3}|c.|.)", re.S)
+ANSI_C_SIMPLE = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+                 "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+
+
+def _ansi_c_one(m: "re.Match[str]") -> str:
+    body = m.group(1)
+    if body[0] in "xuU":
+        return chr(int(body[1:], 16)) if int(body[1:], 16) < 0x110000 else ""
+    if body[0] in "01234567":
+        return chr(int(body, 8) & 0xFF)
+    if body[0] == "c" and len(body) == 2:
+        return chr(ord(body[1]) & 0x1F)
+    return ANSI_C_SIMPLE.get(body, "\\" + body)
+
+
+def _ansi_c_decode(text: str) -> str:
+    """Replace each bash ANSI-C ``$'..'`` string in ``text`` by the characters bash would pass on (#6256)."""
+    def decode(m: "re.Match[str]") -> str:
+        inner = ANSI_C_ESCAPE_RE.sub(_ansi_c_one, m.group(1))
+        # A decoded blank or newline is still one word of the value bash assigned,
+        # so it becomes the unit separator the flag regexes already split on.
+        return "".join("\x1f" if ch.isspace() else ch for ch in inner)
+    return ANSI_C_RE.sub(decode, text)
+
+
 def _heredoc_ends(line: str, delimiter: str) -> bool:
     return re.search(r"(?:^|[\s'\"])" + re.escape(delimiter) + r"(?:$|[\s'\"])", line) is not None
 
@@ -617,7 +644,7 @@ def _debug_overrides(where: str, effective: Dict[str, str], job: Job) -> List[st
                 if m.group(2) != DEBUG_LEVEL:
                     found.append("%s: R-DEBUG step %r run sets %s to %r (a $GITHUB_ENV write overrides every later "
                                  "step), want %r" % (where, label, m.group(1), m.group(2), DEBUG_LEVEL))
-            for spelled in _level_spellings(line, False):
+            for spelled in _level_spellings(_ansi_c_decode(line), False):
                 found.append("%s: R-DEBUG step %r run sets %s, want %r" % (where, label, spelled, DEBUG_LEVEL))
     return found
 
