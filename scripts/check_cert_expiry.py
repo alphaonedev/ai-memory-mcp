@@ -1076,6 +1076,7 @@ def path_max_fallback_violation(tmp):
 
 
 PATH_MAX_LEAK_PREFIX = "path_max_fallback_violation leaked"
+PATH_MAX_FALLBACK_PLANT = "planted fallback failure 6145"
 
 
 def path_max_restore_violation(tmp, fallback=path_max_fallback_violation):
@@ -1105,25 +1106,31 @@ def path_max_restore_violation(tmp, fallback=path_max_fallback_violation):
 def path_max_restore_diagnostic_violation(tmp):
     """None when the path-max-restore cell, handed a fallback check that leaks its
     patches (what a dropped `finally` does), fails with a leak message naming the REAL
-    host platform and puts os.pathconf and sys.platform back, else a description
-    (#6145 R7-F1, R8-F1, R8-F2). Only that one cell runs, through the same run_cells
-    loop as _self_test, with the leaking check passed as its `fallback` argument: no
-    global is patched, no other cell re-runs and no scratch dir is created, so the
-    diagnostic adds no checkout depth (the 184-byte limit holds)."""
+    host platform and puts os.pathconf and sys.platform back, and, handed a fallback
+    check that fails without leaking, fails as `(path-max-fallback, #6145)`, else a
+    description (#6145 R7-F1, R8-F1, R8-F2, R9-F3). Only that one cell runs (once per
+    planted check), through the same run_cells loop as _self_test, with the planted
+    check passed as its `fallback` argument: no global is patched, no other cell
+    re-runs and no scratch dir is created, so the diagnostic adds no checkout depth
+    (the 184-byte limit holds)."""
     host, real_pathconf = sys.platform, os.pathconf
 
     def leaking(_tmp):
         for plat, _want in sorted(FALLBACK_PLATFORMS, key=lambda entry: entry[0] != sys.platform):
             os.pathconf, sys.platform = (lambda _p, _n: 0), plat
         return None
-    err = io.StringIO()
+    def planted(_tmp):
+        return PATH_MAX_FALLBACK_PLANT
+    err, fb_err = io.StringIO(), io.StringIO()
     try:
         with contextlib.redirect_stderr(err):
             rc = run_cells(SelfTest(), (("path-max-restore", path_max_restore_violation, (tmp, leaking)),))
         put_back = os.pathconf is real_pathconf and sys.platform == host
+        with contextlib.redirect_stderr(fb_err):
+            fb_rc = run_cells(SelfTest(), (("path-max-restore", path_max_restore_violation, (tmp, planted)),))
     finally:
         os.pathconf, sys.platform = real_pathconf, host
-    out = err.getvalue().strip()
+    out, fb_out = err.getvalue().strip(), fb_err.getvalue().strip()
     if not put_back:
         return ("the path-max-restore cell did not put os.pathconf and sys.platform back "
                 "after a leaking fallback check")
@@ -1134,6 +1141,9 @@ def path_max_restore_diagnostic_violation(tmp):
     if f"not {host!r}" not in out:
         return (f"the leak message does not name the real host platform {host!r}: "
                 f"{out[-300:]!r}")
+    if fb_rc != 2 or f"(path-max-fallback, #6145): {PATH_MAX_FALLBACK_PLANT}" not in fb_out:
+        return (f"a failing (not leaking) fallback check was not reported as path-max-fallback "
+                f"(rc {fb_rc}): {fb_out[-300:]!r}")
     return None
 
 
