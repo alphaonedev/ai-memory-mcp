@@ -3670,5 +3670,109 @@ class RoundTwoDocTruth6117(unittest.TestCase):
         self.assertNotIn("push events do not gate merges", " ".join(ci.replace("#", " ").split()))
 
 
+# ---- Round 4, item 1 (#6259): bot authors, and every F4 validator pinned ----
+
+def _exec_approval_src(src: str):
+    """The approval evaluator compiled from ``src`` (a mutant), as an attribute namespace."""
+    import types
+    ns: dict = {"__name__": "approval_mutant_6259"}
+    exec(compile(src, "approval_mutant_6259", "exec"), ns)
+    mod = types.SimpleNamespace()
+    for key, value in ns.items():
+        setattr(mod, key, value)
+    return mod
+
+
+def _pr_event_with(login: str = "someone", assoc: str = "NONE",
+                   head_repo: Optional[str] = "fork/ai-memory-mcp") -> dict:
+    pr = _pr(5, SHA_A, assoc, head_repo)
+    pr["user"] = {"login": login}
+    return {"pull_request": pr}
+
+
+def _gate_text(mod, event: dict, reviews: Optional[List[dict]] = None, repo: str = REPO_6117) -> Tuple[int, str]:
+    api = _fake_api([], {5: reviews or []})
+    rc, lines = mod.run_gate("pull_request", event, repo, "", OPERATOR_6117, api)
+    return rc, "\n".join(lines)
+
+
+class ApprovalValidators6259(unittest.TestCase):
+    """#6259 (code 1, 4): bot authors are judged, and each F4 validator is load-bearing."""
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+        self.src = APPROVAL_PY.read_text(encoding="utf-8")
+
+    def test_6259_bot_authors_are_judged_not_refused(self) -> None:
+        for login in ("dependabot[bot]", "github-actions[bot]"):
+            with self.subTest(login=login):
+                rc, out = _gate_text(self.mod, _pr_event_with(login))
+                self.assertEqual(1, rc, out)  # external and unapproved
+                self.assertIn("operator-approval gate FAILED for PR #5", out)
+                self.assertNotIn("invalid author login", out)
+                rc, out = _gate_text(self.mod, _pr_event_with(login), [_review(SHA_A)])
+                self.assertEqual(0, rc, out)  # the operator approval cures a bot PR
+
+    def test_6259_malformed_bot_suffixes_fail_closed(self) -> None:
+        for login in ("evil[bot]x", "[bot]", "a[bot][bot]", "a[bot", "a]bot[", "a[BOT]", "a[bot]\n"):
+            with self.subTest(login=login):
+                rc, out = _gate_text(self.mod, _pr_event_with(login), [_review(SHA_A)])
+                self.assertEqual(1, rc, out)
+                self.assertIn("invalid author login", out)
+
+    def test_6259_replays_the_real_dependabot_payload_shape(self) -> None:
+        # PR #4127 (dependabot[bot], NONE, same-repo head): external by association, so it
+        # needs the approval and never the login refusal.
+        event = _pr_event_with("dependabot[bot]", "NONE", REPO_6117)
+        rc, out = _gate_text(self.mod, event)
+        self.assertEqual(1, rc, out)
+        self.assertNotIn("invalid", out)
+
+    HOSTILE = (
+        ("login", lambda: _pr_event_with("x\n::error::forged"), "invalid author login"),
+        ("association", lambda: _pr_event_with(assoc="NONE\n::set-output x"), "invalid author_association"),
+        ("head-repo-name", lambda: _pr_event_with(head_repo="f/r\n::error::forged"), "invalid head repository name"),
+        ("head-repo-name-101-chars", lambda: _pr_event_with(head_repo="o/" + "r" * 101),
+         "invalid head repository name"),
+    )
+
+    def hostile_misses(self, mod) -> List[str]:
+        missed: List[str] = []
+        for name, make, text in self.HOSTILE:
+            rc, out = _gate_text(mod, make())
+            if rc != 1 or text not in out:
+                missed.append(name)
+        return missed
+
+    def test_6259_live_validators_refuse_every_hostile_field(self) -> None:
+        self.assertEqual([], self.hostile_misses(self.mod))
+
+    def test_6259_repo_name_length_cap_is_100(self) -> None:
+        ok = "o/" + "r" * 100
+        rc, out = _gate_text(self.mod, _pr_event_with(head_repo=ok))
+        self.assertNotIn("invalid head repository name", out)
+        rc, out = _gate_text(self.mod, _pr_event_with(), repo="o/" + "r" * 101)
+        self.assertEqual(1, rc, out)
+        self.assertIn("is not owner/name", out)
+
+    MUTANTS = (
+        ("login validation removed", "not isinstance(author, str) or not LOGIN_RE.fullmatch(author)", "False",
+         "login"),
+        ("association validation removed",
+         'assoc is not None and (not isinstance(assoc, str) or not ASSOC_RE.fullmatch(assoc))', "False",
+         "association"),
+        ("head-repo-name validation removed",
+         "full_name is not None and (not isinstance(full_name, str) or not REPO_RE.fullmatch(full_name))",
+         "False", "head-repo-name"),
+    )
+
+    def test_6259_m01_each_validator_removal_is_killed(self) -> None:
+        for label, old, new, hostile in self.MUTANTS:
+            with self.subTest(mutant=label):
+                self.assertEqual(1, self.src.count(old), f"mutation anchor {old!r}")
+                missed = self.hostile_misses(_exec_approval_src(self.src.replace(old, new, 1)))
+                self.assertIn(hostile, missed)
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
