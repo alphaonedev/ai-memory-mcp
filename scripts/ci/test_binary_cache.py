@@ -502,8 +502,10 @@ def _read_lines(path):
 def shared_depinfo_files(lines):
     """Dep-info paths of every local non-test unit and every test-profile lib/bin.
 
-    Local = path source (not registry/git). Build scripts are included. Every
-    candidate that exists on disk is returned; zero results means the shared
+    Local = path source (not registry/git). Build scripts are included. Only
+    the exact dep-info next to a file this build reported counts (no glob over
+    deps/, whose old ``<name>-<hash>.d`` files outlive their builds; r1 L2).
+    Every candidate that exists on disk is returned; zero results means the shared
     closure is unknown (CacheError from the caller).
     """
     found = set()
@@ -524,7 +526,6 @@ def shared_depinfo_files(lines):
         kinds = set(target.get('kind') or [])
         if not (kinds & {'lib', 'rlib', 'cdylib', 'staticlib', 'dylib', 'bin', 'custom-build', 'proc-macro'}):
             continue
-        name = (target.get('name') or '').replace('-', '_')
         paths = list(msg.get('filenames') or [])
         if msg.get('executable'):
             paths.append(msg['executable'])
@@ -537,8 +538,6 @@ def shared_depinfo_files(lines):
             if 'custom-build' in kinds and '-' in p.parent.name:
                 # <build>/<pkg>-<hash>/build_script_build-<hash>.d (r1 L1).
                 cands.add(p.parent / ('build_script_build-%s.d' % p.parent.name.rsplit('-', 1)[1]))
-            if p.parent.name != 'deps' and name:
-                cands.update(sorted((p.parent / 'deps').glob(name + '-*.d')))
             found.update(c for c in cands if c.is_file())
     return sorted(found)
 
