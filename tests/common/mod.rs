@@ -77,6 +77,12 @@ pub mod lane_db;
 pub mod tls;
 pub mod tls_receiver;
 
+// #4079 / #4153 — a Postgres-arm origin (`StorageBackend::Postgres` over the
+// SAL `SqliteStore`) federated to a recording peer, for the delete fan-out
+// suites.
+#[cfg(feature = "sal")]
+pub mod pg_arm_origin;
+
 use std::path::PathBuf;
 use std::sync::Mutex;
 
