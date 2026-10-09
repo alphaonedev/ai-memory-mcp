@@ -9,9 +9,11 @@ are otherwise identical.
 
 from __future__ import annotations
 
+import os
+import ssl
 from types import TracebackType
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Union
 
 # #3840 — see ai_memory/client.py: the `list` method shadows the builtin in
 # annotations inside the class body.
@@ -66,7 +68,7 @@ class AsyncAiMemoryClient:
         api_key: str | None = None,
         agent_id: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
-        verify: bool | str | None = None,
+        verify: Union[bool, str, os.PathLike[str], ssl.SSLContext, None] = None,
         cert: str | tuple[str, str] | None = None,
         headers: dict[str, str] | None = None,
     ) -> None:

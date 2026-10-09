@@ -10,12 +10,44 @@ from pathlib import Path
 import shlex
 import subprocess
 import tarfile
-import re
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 
+
+
+def _executable_lines(text):
+    """Yield the non-blank, non-comment lines of a README as token lists."""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        try:
+            yield shlex.split(line)
+        except ValueError:
+            continue
+
+
+def key_store_recipe_problem(readme, owner, state_dir):
+    """Return why the README lacks the #6230 key-store recipe, else None.
+
+    #6271: the recipe is matched as a whole executable line (never a
+    substring), so a commented-out line, a line moved into prose and a longer
+    path such as `.configx` cannot satisfy it; it must precede the line that
+    enables the backup timer.
+    """
+    recipe = ['sudo', 'install', '-d', '-o', owner, '-g', owner, '-m', '0700',
+              state_dir + '/.config']
+    timer = ['sudo', 'systemctl', 'enable', '--now', 'ai-memory-backup.timer']
+    lines = list(_executable_lines(readme))
+    if recipe not in lines:
+        return 'no executable line creates the key-store parent as the service user'
+    if timer not in lines:
+        return 'no executable line enables the backup timer'
+    if lines.index(recipe) > lines.index(timer):
+        return 'the key-store parent is created after the backup timer is enabled'
+    return None
 
 class PackagingContract(unittest.TestCase):
     def test_plan_c_upgrade_keeps_volumes(self):
