@@ -767,7 +767,10 @@ default_pool_size = 16           ; server conns per (user,db): the sum of the da
 reserve_pool_size = 4            ; burst headroom above default_pool_size
 server_tls_sslmode = verify-full ; the pooler verifies the Postgres certificate and host name
 server_tls_ca_file = /etc/pgbouncer/tls/ca.crt
-client_tls_sslmode = verify-full ; mTLS from the daemons (§14)
+client_tls_sslmode = verify-full ; the pooler requires and verifies a daemon client certificate (mTLS, §14)
+client_tls_ca_file = /etc/pgbouncer/tls/ca.crt
+client_tls_key_file = /etc/pgbouncer/tls/server.key
+client_tls_cert_file = /etc/pgbouncer/tls/server.crt
 ```
 
 Keep PgBouncer's default `server_reset_query = DISCARD ALL` (with
@@ -788,6 +791,18 @@ the server offers no TLS), which would end the daemon's `verify-full`
 guarantee at the pooler and expose the credential exchange and memory content
 on the second hop to an on-path attacker. Do not lower it to `require` or
 `prefer`.
+
+On the daemon-to-pooler hop, `client_tls_sslmode = verify-full` (with
+`client_tls_ca_file`, and `client_tls_key_file` / `client_tls_cert_file` for
+the pooler's own certificate) makes the pooler **require and verify a client
+certificate** from every daemon, which is the mTLS posture the §14 checklist
+prescribes for this tier; the daemon presents it through `sslcert=` and
+`sslkey=` in its store URL (§5.6.5; both keys are accepted by the adapter's
+DSN parser in `src/store/postgres/dsn.rs`). `client_tls_sslmode = require`
+is acceptable only where client certificates cannot be issued, and the
+residual risk must be stated in the deployment record: any host that can
+reach the pooler port and holds (or guesses) the role password can open
+sessions, so the role password becomes the only authentication on that hop.
 
 #### 5.6.4 `userlist.txt` (SCRAM, no plaintext)
 
@@ -814,10 +829,14 @@ Point each daemon at PgBouncer instead of the primary. Put the URL in the
 
 ```
 # /etc/ai-memory/store-url   (mode 0600, owned by the service user, one line)
-postgres://aimemory:PWD@pgbouncer.rackA.internal:6432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pooler-ca.crt
+postgres://aimemory:PWD@pgbouncer.rackA.internal:6432/aimemory?sslmode=verify-full&sslrootcert=/etc/ai-memory/pooler-ca.crt&sslcert=/etc/ai-memory/daemon.crt&sslkey=/etc/ai-memory/daemon.key
 
 # unit:  Environment=AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url
 ```
+
+`sslcert=` / `sslkey=` are the daemon's client certificate for the pooler's
+`client_tls_sslmode = verify-full` (§5.6.3); the key file is mode `0600`,
+owned by the service user, like the store-url file itself.
 
 **Sizing rule (applies with or without a pooler):**
 
@@ -922,6 +941,12 @@ evidence for it. The probe script and the TLS/SCRAM smoke test that ran it
 ship with PR #4710; `infra/pgbouncer/smoke-test.sh` on this tree checks the
 AGE cypher round trip and the role-default timeouts through the pooler and
 prints the pooler's reported `pool_mode`.
+
+The TLS posture of §5.6.3 was exercised in the same lane: the PR #4710 smoke
+test ran both hops at `verify-full` with a daemon client certificate
+(`client_tls_sslmode = verify-full`) and SCRAM, confirmed that a plaintext
+client is refused by the pooler, and read `pg_stat_ssl.ssl = t` on the
+pooler-to-Postgres hop.
 
 What the evidence does not cover: it does not say how often the hazards
 trigger in production (that depends on how often two clients land on one

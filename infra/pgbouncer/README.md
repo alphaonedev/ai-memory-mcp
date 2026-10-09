@@ -59,7 +59,10 @@ the sizing rule: `docs/enterprise-deployment.md` §5.6.
 There are two hops, and each needs its own verification. **Daemon → pooler:**
 the adapter refuses a store URL that does not pin `sslmode=verify-full`
 (#3705), so the pooler must serve TLS to its clients and the daemon's URL
-carries `sslrootcert=` for the CA that signed the pooler's certificate.
+carries `sslrootcert=` for the CA that signed the pooler's certificate; with
+`client_tls_sslmode = verify-full` (#4730, the commented client block in
+`pgbouncer.ini`) the pooler also requires a daemon client certificate, which
+the daemon presents via `sslcert=` / `sslkey=` in the same URL.
 **Pooler → Postgres:** PgBouncer's default `server_tls_sslmode` is `prefer`
 (unverified, plaintext if the server offers no TLS), so production must set
 `server_tls_sslmode = verify-full` with `server_tls_ca_file` (#4729; the
