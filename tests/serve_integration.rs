@@ -581,3 +581,66 @@ fn serve_graceful_shutdown_on_sigterm() {
         "unexpected exit: {exit_status:?} signal={signal:?}"
     );
 }
+
+/// #4072 — the outcome of one graceful shutdown: how the daemon exited and
+/// how many bytes its WAL still held afterwards (0 once the final
+/// `wal_checkpoint(TRUNCATE)` has run).
+#[cfg(unix)]
+fn shutdown_outcome_4072(signal: libc::c_int) -> (std::process::ExitStatus, u64) {
+    let tmp = TempDir::new().unwrap();
+    let db = tmp.path().join("ai-memory.db");
+    let mut serve = spawn_serve(&db, &[], &[]);
+    let pid = serve.child.as_ref().unwrap().id();
+    // SAFETY: a plain signal to a pid this test spawned and still owns.
+    unsafe {
+        libc::kill(i32::try_from(pid).expect("pid fits in i32"), signal);
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let exit_status = loop {
+        if Instant::now() > deadline {
+            let _ = serve.child.as_mut().unwrap().kill();
+            panic!("daemon did not exit within 30s of signal {signal}");
+        }
+        match serve.child.as_mut().unwrap().try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+            Err(e) => panic!("try_wait failed: {e}"),
+        }
+    };
+    serve.child = None;
+    let wal_len = std::fs::metadata(tmp.path().join("ai-memory.db-wal")).map_or(0, |m| m.len());
+    (exit_status, wal_len)
+}
+
+/// #4072 — SIGTERM (the container image's default stop signal, and what
+/// `docker stop` / Kubernetes / most supervisors send) must take the SAME
+/// graceful path as SIGINT: the daemon exits on its own terms instead of
+/// dying by signal, and the final WAL checkpoint has run. Pinned against the
+/// SIGINT control in the same process image, so the two signals can never
+/// drift apart again.
+#[cfg(unix)]
+#[test]
+fn serve_sigterm_takes_the_same_graceful_path_as_sigint_4072() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let (term_status, term_wal) = shutdown_outcome_4072(libc::SIGTERM);
+    assert!(
+        term_status.signal().is_none(),
+        "SIGTERM must enter the graceful drain, not kill the daemon: {term_status:?}"
+    );
+    let (int_status, int_wal) = shutdown_outcome_4072(libc::SIGINT);
+    assert!(
+        int_status.signal().is_none(),
+        "SIGINT control did not shut down gracefully: {int_status:?}"
+    );
+    assert_eq!(
+        term_status.code(),
+        int_status.code(),
+        "SIGTERM and SIGINT must exit through the same certification path"
+    );
+    assert_eq!(
+        (term_wal, int_wal),
+        (0, 0),
+        "the final WAL checkpoint (TRUNCATE) must run on both signals"
+    );
+}
