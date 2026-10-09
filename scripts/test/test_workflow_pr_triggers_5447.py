@@ -3342,6 +3342,16 @@ class ExternalPrApprovalEntrypoint6226(_Scratch6117):
         "def pr(n, sha, assoc, repo):\n"
         "    return {{'number': n, 'author_association': assoc, 'user': {{'login': 'x'}},\n"
         "            'head': {{'sha': sha, 'repo': {{'full_name': repo}}}}}}\n"
+        "mode = os.environ.get('FAKE_GH_MODE', '')\n"
+        "if mode == 'rate-limit-403':\n"
+        "    sys.stderr.write('gh: API rate limit exceeded (HTTP 403) ghp_' + 'A1' * 18 + '\\nsecond line\\n')\n"
+        "    sys.exit(1)\n"
+        "def pr_meta(n, sha):\n"
+        "    return {{'number': n, 'author_association': 'NONE\\n::set-output x', 'user': {{'login': 'x\\n::error::forged'}},\n"
+        "            'head': {{'sha': sha, 'repo': {{'full_name': 'f/r\\n::error::forged2'}}}}}}\n"
+        "if mode == 'metachar-names':\n"
+        "    print(json.dumps([pr_meta(3, '{a}')]))\n"
+        "    sys.exit(0)\n"
         "page1 = [pr(1, '{b}', 'MEMBER', '{repo}')]\n"
         "page2 = [pr(2, '{a}', 'NONE', 'fork/ai-memory-mcp')]\n"
         "if '/reviews' in sys.argv[-1]:\n"
@@ -3361,12 +3371,12 @@ class ExternalPrApprovalEntrypoint6226(_Scratch6117):
                       encoding="utf-8")
         gh.chmod(0o755)
 
-    def run_script(self, event: str, payload_path: str = "", sha: str = SHA_A):
+    def run_script(self, event: str, payload_path: str = "", sha: str = SHA_A, mode: str = ""):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "OPERATOR_"))}
         env.update({"PATH": str(self.bin) + os.pathsep + env.get("PATH", ""),
                     "FAKE_GH_LOG": str(self.log), "GITHUB_EVENT_NAME": event,
                     "GITHUB_EVENT_PATH": payload_path, "GITHUB_REPOSITORY": REPO_6117,
-                    "GITHUB_SHA": sha, "OPERATOR_LOGIN": OPERATOR_6117})
+                    "GITHUB_SHA": sha, "OPERATOR_LOGIN": OPERATOR_6117, "FAKE_GH_MODE": mode})
         out = subprocess.run([sys.executable, "-I", str(APPROVAL_PY)], capture_output=True,
                              text=True, env=env, timeout=60, check=False)
         return out.returncode, out.stdout + out.stderr
@@ -3393,6 +3403,20 @@ class ExternalPrApprovalEntrypoint6226(_Scratch6117):
             rc, out = self.run_script("pull_request", str(bad))
             self.assertEqual(1, rc, out)
             self.assertIn("::error::cannot read the pull_request event payload", out)
+
+    def test_6117_r3_f4_rate_limit_stderr_is_not_relayed_with_a_token(self) -> None:
+        rc, out = self.run_script("push", mode="rate-limit-403")
+        self.assertEqual(1, rc, out)
+        self.assertNotIn("ghp_", out)
+        self.assertIn("rate limit exceeded", out)
+        self.assertNotIn("second line", out)
+
+    def test_6117_r3_f4_metachar_names_cannot_forge_annotations(self) -> None:
+        rc, out = self.run_script("push", mode="metachar-names")
+        self.assertEqual(1, rc, out)
+        for line in out.splitlines():
+            self.assertFalse(line.startswith(("::error::forged", "::set-output")), line)
+        self.assertNotIn("forged", out.replace("::error::External-PR", ""))
 
     def test_6227_merge_group_payload_unreadable_fails_closed(self) -> None:
         rc, out = self.run_script("merge_group", str(self.td / "no-such-event.json"), sha=SHA_C)
