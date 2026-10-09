@@ -1577,7 +1577,7 @@ def _self_test_cases() -> int:
         reseal(root)
 
     case("#6163 a private key block in changed rule text is masked in the report", pem_reword, True,
-         "RULE TEXT CHANGED", absent=canary)
+         "RULE TEXT CHANGED", absent=canary, needles=("credential-shaped value(s) masked",))
 
     # #6163 round 2 (review F1): masking applies to head text where it enters the report, one diff block or one span
     # at a time. A private key BEGIN line with no END line masks the rest of ITS block only; the lines this script
@@ -1638,7 +1638,7 @@ def _self_test_cases() -> int:
         reseal(root)
 
     case("#6163 a PGP private key block is masked and the text after its END stays visible", pgp_block, True,
-         "+after-the-key-6163", absent=pgp_canary)
+         "+after-the-key-6163", absent=pgp_canary, needles=("credential-shaped value(s) masked",))
 
     # #6163 round 2 (review F4): a count, a switch word or an environment variable name is not a credential, so a
     # ceiling change in rule text stays readable in the summary.
@@ -1665,6 +1665,68 @@ def _self_test_cases() -> int:
              absent=hidden, needles=("credential-shaped value(s) masked",))
     for visible in ("max_tokens: 20000 per request", "api_key: OPENAI_API_KEY", "token_count = 1,500"):
         case(f"#6163 {visible!r} is not masked (round 3)", head_line(visible), True, visible)
+
+    # #6209 #6210 #6211 (security review round 2): a leading count or switch word does not exempt the words after
+    # it; Markdown forms (a backtick-quoted value, an emphasised name, a table row) and unlabelled token shapes (a
+    # JWT, GitLab, Google API and npm tokens, a value on the line after its name, a PuTTY private key) are masked.
+    sec_canaries = ("gl" + "pat-" + "6163canaryGLPATqqqqqq", "AI" + "za" + "6163CanaryGoogleKeyQQQQQQQQQQQQQQQQ",
+                    "np" + "m_" + "6163canaryNPMqqqqqqqqqqqqqqqqqqqqqqqq",
+                    "gith" + "ub_pat_" + "6163canaryFINEGRAINED" + "q" * 19)
+    security_shapes = (
+        ("a switch word then a token (#6209)", "token: on 6163-Canary-SW", "6163-Canary-SW"),
+        ("a count then a secret (#6209)", "secret_key: 20000 6163CanaryCT", "6163CanaryCT"),
+        ("a yes then prose then a secret (#6209)", "secret: yes, it is hunter6163", "hunter6163"),
+        ("a backtick-quoted password (#6210)", "password: `6163-canary-bt`", "6163-canary-bt"),
+        ("an emphasised password name (#6210)", "**password**: 6163-canary-em", "6163-canary-em"),
+        ("a Markdown table row (#6210)", "| password | 6163-canary-table |", "6163-canary-table"),
+        ("a JWT (#6211)", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI2MTYzIn0.c2lnbmF0dXJlNjE2M2NhbmFyeQ",
+         "eyJzdWIiOiI2MTYzIn0"),
+        ("a GitLab token (#6211)", f"use {sec_canaries[0]} here", sec_canaries[0]),
+        ("a Google API key (#6211)", f"use {sec_canaries[1]} here", sec_canaries[1]),
+        ("an npm token (#6211)", f"use {sec_canaries[2]} here", sec_canaries[2]),
+        ("a value on the line after its name (#6211)", "api_key:\n  c2VjcmV0LTYxNjMtbmV4dGxpbmU=",
+         "c2VjcmV0LTYxNjMtbmV4dGxpbmU"),
+        ("a PuTTY private key (#6211)", "\nPuTTY-User-Key-File-3: ssh-ed25519\nEncryption: none\nPublic-Lines: 1\n"
+         "AAAAC3pub\nPrivate-Lines: 1\nAAAA6163canaryputty\nPrivate-MAC: 6163abcdef\nafter-putty-6163",
+         "6163canaryputty"),
+        ("a lowercase snake api_key value (security R3)", "api_key: my_real_key_6163", "my_real_key_6163"),
+        ("a quoted secret starting with a count (security R4)", 'secret="20000 6163-canary-q4"', "6163-canary-q4"),
+        ("a numeric passphrase (security R5)", "passphrase: 86753096163", "86753096163"),
+        ("percent-encoded URL userinfo (security R7)", "postgres://u%40x:6163%40canary@db.example.invalid/x",
+         "6163%40canary"),
+        ("a fine-grained GitHub token (security R8)", f"use {sec_canaries[3]} here", sec_canaries[3]),
+    )
+    for label, extra, hidden in security_shapes:
+        case(f"#6163 {label} in changed rule text is masked", head_line(extra), True, "RULE TEXT CHANGED",
+             absent=hidden, needles=("credential-shaped value(s) masked",))
+    case("#6211 the line after a PuTTY key's Private-MAC stays visible", head_line(security_shapes[11][1]), True,
+         "+after-putty-6163", absent="6163canaryputty")
+    for visible in ("token_budget = 3500 tokens per call", "secret_scanning: enabled for every repository"):
+        case(f"#6209 {visible!r} is not masked", head_line(visible), True, visible)
+
+    def named_heading(root):
+        target = root / "CLAUDE.md"
+        target.write_text(target.read_text(encoding="utf-8") + "\n## password: 6163-canary-heading2\n\nbody\n",
+                          encoding="utf-8")
+
+    case("#6163 a password in an added heading is masked (security R11)", named_heading, True,
+         "RULE TEXT CHANGED (added)", absent="6163-canary-heading2")
+    case("#6163 a password approval trailer is masked and RESULT: PASS stays (security R9)", reword, False,
+         "RESULT: PASS - rule text changed", trailer="password=6163-canary-trailer9", absent="6163-canary-trailer9",
+         needles=("credential-shaped value(s) masked",))
+
+    # #6212: a control character in head text or a trailer value is shown escaped, never raw, in the summary.
+    case("#6212 an ESC in an approval trailer is shown escaped", reword, False, "approval trailer(s): ` Justin\\x1b[2K",
+         trailer="Justin\x1b[2K", absent="\x1b")
+
+    def control_text(root):
+        edit("tool limit is 103 tools", "tool limit is 103 tools \x1b[31mred6212 \x9b2J \x07bell")(root)
+        reseal(root)
+
+    case("#6212 control characters in changed rule text are shown escaped", control_text, True,
+         "\\x1b[31mred6212", needles=("\\x9b2J", "\\x07bell"), absent="\x1b")
+    case("#6212 no C1 or BEL control character reaches the summary", control_text, True, "RULE TEXT CHANGED",
+         absent="\x9b")
 
     # #6163 round 3 (review G1): a key line is masked by its position inside a BEGIN..END range of its own side, so a
     # changed body line whose BEGIN line is outside the hunk (or on the other side only) never prints.
