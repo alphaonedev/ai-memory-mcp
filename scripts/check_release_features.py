@@ -628,6 +628,24 @@ KEYS_PACKAGE = ("name", "shell", "env", "run")
 KEYS_PLAIN = ("name", "run")
 TOP_KEYS = ("name", "on", "permissions", "concurrency", "jobs")
 RELEASE_JOBS = tuple(RELEASE_JOB_PERMISSIONS)
+# Every job's `needs:` edges, pinned (#6289): a publish job that dropped its
+# supply-chain / release / reproducible gate would run before (or without) it.
+# preflight is the root and carries no `needs:`.
+_PQS = Flow("preflight, qualify, supply-chain")
+_PQR = Flow("preflight, qualify, release")
+RELEASE_JOB_NEEDS: Dict[str, Spec] = {
+    "qualify": "preflight",
+    "supply-chain": Flow("preflight, qualify"),
+    "release": _PQS,
+    "reproducible": REPRO_JOB["needs"],
+    "sbom": _PQS,
+    "mobile-ios": _PQS,
+    "mobile-android": _PQS,
+    "crates-io": _PQR,
+    "homebrew": _PQR,
+    "docker": DOCKER_JOB["needs"],
+    "copr": _PQR,
+}
 JOB_KEYS = ("name", "needs", "runs-on", "permissions", "strategy", "steps")
 SBOM_JOB_KEYS = ("name", "needs", "runs-on", "permissions", "steps")
 RELEASE_RUNS_ON = "${{ matrix.os }}"
@@ -1396,6 +1414,16 @@ def check_release_permissions(doc: Node, jobs: Node, rep: Report) -> None:
         if why:
             rep.bad(pin_message("release.yml", why + " (a job with no block inherits the top-level `contents: write`, "
                                 "#4937)", "RELEASE_JOB_PERMISSIONS"))
+        needs = RELEASE_JOB_NEEDS.get(name)
+        if needs is None:
+            if job.get("needs") is not None:
+                rep.bad(pin_message("release.yml", f"`jobs.{name}` carries a `needs:` and is pinned to have none "
+                                    "(#6289)", "RELEASE_JOB_NEEDS"))
+            continue
+        why = pin_problem(job.get("needs"), needs, f"jobs.{name}.needs")
+        if why:
+            rep.bad(pin_message("release.yml", why + " (a dropped edge lets the job run before its gate, #6289)",
+                                "RELEASE_JOB_NEEDS"))
 
 
 def node_lines(node: Node) -> Iterator[Tuple[int, str]]:
