@@ -245,6 +245,8 @@ Each gate binds to `daemon_binary_sha256` as defined in §0.
 | G7 | **Integrity guards proven load-bearing.** `append_only_spine_guard_g6/g7`, `record_stop_structural_b7`, `spawn_audit_gate_1937` green; `scripts/check-cert-removal-proof.sh` green; every control cited by the certificate has a mutation row and the count is published (#2912 lists the open gaps). | removal-proof log |
 | G8 | **Certificate current.** `scripts/check-cert-expiry.sh` widened to the §5 watch set with a banner-and-ancestor check (today it fires only on federation-path diffs and is green with a VOID certificate; N30), its context present in live branch protection (N27), and the certificate re-issued at the artifact SHA (VOID today, #3501). | cert document |
 
+> Erratum 2026-10-09 (#6137, #6140): the G8 and N30 references to `scripts/check-cert-expiry.sh` now mean `scripts/check_cert_expiry.py` (the Python port, #6137). Since #6140 the `pull_request_target` workflow `.github/workflows/cert-expiry-trusted.yml` also runs the base branch's copy of that gate against the pull request's merge commit from git objects only; it is not yet a required status context, so it adds evidence and does not change what G8 requires.
+
 ## 4. Review waves and independence
 
 Three waves × seven distinct reviewers per major qualification, 21 recorded ballots:
