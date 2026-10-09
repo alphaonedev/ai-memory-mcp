@@ -45,7 +45,7 @@ on:
   # together), #2523 and #2508 (push must not overlap a PR head such as
   # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
-    branches: [main, develop, "release/**", "feat/**", "rehearsal/**"]
+    branches: [main, develop, "release/**", "feat/**", "rehearsal/**", "chain/**"]
     paths:
       - 'src/governance/**'
       - 'src/cli/rules.rs'

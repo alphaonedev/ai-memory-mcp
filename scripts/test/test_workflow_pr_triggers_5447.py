@@ -900,7 +900,7 @@ def named_cells() -> List[Tuple[str, str, str]]:
     the item text and not the refusal.
     """
     jobs = "jobs:\n  a:\n    runs-on: x\n"
-    ci = _replace_once(load_all()["ci.yml"], '    branches: [main, develop, "release/**", "rehearsal/**"]\n',
+    ci = _replace_once(load_all()["ci.yml"], '    branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]\n',
                        '    branches:\n      - main\n      - develop\n      - "release/**"\n'
                        '      - release/v1.0.0\n        - rehearsal/**\n')
     escape = "double-quoted scalar holds a backslash"
@@ -1814,7 +1814,7 @@ class BlockStructure5730(unittest.TestCase):
     def test_5730_deeper_dash_row_continues_a_plain_entry(self) -> None:
         # The round-3 reproducer. PyYAML: [..., 'release/v1.0.0 - rehearsal/**'].
         ci = load_all()["ci.yml"]
-        old = '    branches: [main, develop, "release/**", "rehearsal/**"]\n'
+        old = '    branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]\n'
         new = ('    branches:\n      - main\n      - develop\n      - "release/**"\n'
                '      - release/v1.0.0\n        - rehearsal/**\n')
         self._shape(_replace_once(ci, old, new), "continues the scalar")
