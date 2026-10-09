@@ -18,6 +18,8 @@ real AGE build).  ``test_real_script_*`` run the unmodified script.  Scratch
 lives under the repo's ``.local-runs`` (never /tmp).
 """
 
+import argparse
+import errno
 import hashlib
 import importlib.util
 import json
@@ -365,18 +367,67 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assert_restored()
 
-    def test_share_failure_rolls_back_created_lib_file(self):
+    def test_share_failure_keeps_pinned_lib_file(self):
         self.ext.chmod(0o555)
         self.addCleanup(self.ext.chmod, 0o755)
         r = self.run_script()
         self.assert_fails(r, 1, "age restore failed: ")
-        self.assertFalse((self.lib / "age.dylib").exists(), "files created by a failed run are rolled back")
+        # Every written file carries the pinned bytes, so a failed run leaves it in place.
+        self.assertEqual((self.lib / "age.dylib").read_bytes(), DYLIB)
+        self.assertFalse((self.ext / "age.control").exists(), "control must never precede its module")
         self.ext.chmod(0o755)
         self.assert_no_temp_files()
         again = self.run_script()
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertIn("restored", again.stdout)
         self.assert_restored()
+
+    def test_failed_run_never_removes_a_concurrently_verified_file(self):
+        # R2-F1: runner B fails on a share file after replacing the dylib runner A wrote;
+        # A then completes and verifies the tier. B's failure must not undo A's restore.
+        dests = {"lib": self.lib, "share": self.ext}
+        manifest = tuple(tuple(row) for row in self.manifest())
+
+        def load():
+            mod = load_module()
+            mod.MANIFEST = manifest
+            mod.dest_dirs = lambda pg_config: dests
+            mod.read_url = lambda url_file: "postgres://u@h/db"
+            mod.probe_lists_age = lambda psql, url: (self.ext / "age.control").is_file()
+            return mod
+
+        a, b = load(), load()
+        sources = a.load_sources(self.age)
+        real_b_write = b.write_atomic
+
+        def b_write(data, mode, dest):
+            if dest.name == "age.dylib":
+                a.write_atomic(data, mode, dest)  # A writes after B's existence check ...
+                return real_b_write(data, mode, dest)  # ... and B replaces it
+            raise OSError(errno.ENOSPC, "No space left on device (injected for B)")
+
+        b.write_atomic = b_write
+        real_b_healthy = b.healthy
+        checks, a_verified = [], []
+
+        def b_healthy(args, d, url):
+            result = real_b_healthy(args, d, url)
+            checks.append(result)
+            if len(checks) == 2:  # B's post-failure re-check: A finishes and verifies now
+                for sub, name, data, mode in sources[1:]:
+                    a.write_atomic(data, mode, dests[sub] / name)
+                a_verified.append(a.healthy(args, dests, url))
+            return result
+
+        b.healthy = b_healthy
+        args = argparse.Namespace(url_file=None, pg_config=None, psql=None, age_dir=self.age)
+        with self.assertRaises(b.HelperError) as ctx:
+            b.run(args)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(a_verified, [True], "runner A must have verified the tier")
+        self.assertTrue(a.installed_ok(dests), "B's failure removed a file A had verified")
+        self.assert_restored()
+        self.assert_no_temp_files()
 
     # ---- the unmodified script -------------------------------------------
     def real_script(self, extra_env=None, age_dir=True):
