@@ -1240,13 +1240,18 @@ jobs:
             # to-run variance, and the suite grew ~40 % since c1a0ca59a).
             # 8100 s = ~1.3x the worst case. Splitting the tier into two legs
             # (#3973) is the durable fix; this keeps Promotion 4 moving.
-            # 2026-10-09 (#6202): RE-DERIVED again. Uncontended the serial
-            # 371-binary suite takes 88-92 min of job wall time, but both
-            # linux-fed slots share one 14-core host, and two suites in flight
-            # take 143-150 min; run 37944916554 (exit 124) was a healthy run
-            # killed at 8100 s while still progressing. 14400 s (240 min) is
-            # >1.5x the measured contended worst case. The watchdog is a
-            # hang-detector, not a cap on total suite length.
+            # 2026-10-09 (#6202): RE-DERIVED again, from live job logs. The
+            # suite is 1,005 test executables run serially. Uncontended it
+            # measured 4007 s and 4750 s (lib through
+            # federation_write_ns_scope_2447 at 2303 s / 2767 s). Both
+            # linux-fed slots share one 14-core host; in run 37944916554
+            # (PR #6160, both slots busy) the same point came only at ~8100 s
+            # (~3.5x), where the 8100 s watchdog killed a healthy run (exit
+            # 124). Extrapolated, a contended serial suite needs ~13,900-
+            # 14,100 s. 14400 s (240 min) leaves only ~300-500 s (2-4 %) of
+            # margin over that: this is the SERIAL budget until the #6344
+            # shards land (critical path ~3,900 s), not a comfortable one.
+            # The watchdog is a hang-detector, not a cap on total suite length.
             WATCHDOG_SECS=14400
             echo "::notice::[enterprise-fed] cargo test $FEAT ... $TAIL (watchdog ${WATCHDOG_SECS}s)"
           else

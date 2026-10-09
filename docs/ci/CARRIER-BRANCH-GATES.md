@@ -13,20 +13,30 @@ job-level cancel, is what fires. Compile runs outside the watchdog (`cargo test
 |---|---|---|---|---|
 | `ubuntu-latest,sqlite` | 2100 s (35 min) | 95 | see #3538 | see #3538 |
 | `macos-fed,sqlite` | 2400 s (40 min) | 80 | about 27 min (#3461) | n/a |
-| `linux-fed,enterprise-fed` | 14400 s (240 min) | 270 | 88-92 min | 143-150 min |
+| `linux-fed,enterprise-fed` | 14400 s (240 min) | 270 | suite 4007-4750 s (67-79 min) | ~13,900-14,100 s extrapolated (232-235 min) |
 | `macos-fed,enterprise-fed` | 14400 s (240 min) | 270 | n/a | n/a |
 
 Ratio rule: job `timeout-minutes` >= watchdog minutes + 15. All four rows meet it.
 
 ## Why enterprise-fed moved from 8100 s to 14400 s (#6202)
 
-The serial 371-binary suite takes 88-92 min of job wall time on an idle host.
-The `linux-fed` label is served by two runners (`f2-linux-fed`,
-`f2-linux-fed-2`) on one 14-core host, so two suites routinely run at once and
-take 143-150 min. Run 37944916554 (PR #6160, 2026-10-09) was killed with exit
-124 at 8100 s while still progressing. 14400 s is more than 1.5x the contended
-worst case. The job limit is 270 min: watchdog (240) plus about 30 min for
-compile (6-12 min) and ephemeral-database setup/teardown (about 970 s measured).
+The suite is 1,005 test executables run serially (`--test-threads=1`). From
+live job logs, the uncontended suite took 4007 s and 4750 s, and it reached the
+`federation_write_ns_scope_2447` binary at 2303 s and 2767 s. (The 88-92 min
+figures earlier quoted were job wall time including compile and setup, not the
+suite.) The `linux-fed` label is served by two runners (`f2-linux-fed`,
+`f2-linux-fed-2`) on one 14-core host. In run 37944916554 (PR #6160,
+2026-10-09) both slots were busy and the same point was reached only at about
+8100 s, about 3.5x slower, where the 8100 s watchdog killed a healthy,
+still-progressing run (exit 124). The 143-150 min figure earlier quoted was the
+wall time of that killed run, not what the suite needs.
+
+Extrapolated, a contended serial suite needs about 13,900-14,100 s. 14400 s
+leaves about 300-500 s (2-4 %) of margin over that. This is the serial budget
+until the #6344 shards land (expected critical path about 3,900 s); it is not a
+comfortable margin, and a contended serial run can still reach it. The job
+limit is 270 min: watchdog (240) plus about 30 min for compile (6-12 min) and
+ephemeral-database setup/teardown (about 970 s measured).
 
 ## Reading the margin
 
