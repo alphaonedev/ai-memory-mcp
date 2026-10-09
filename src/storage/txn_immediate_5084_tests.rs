@@ -147,10 +147,14 @@ fn run_race<S, T>(
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("race-5084.db");
     let fixture = {
-        let conn = open(&path).expect("seed open");
+        let Ok(conn) = open(&path) else {
+            panic!("#5084: seed open failed");
+        };
         seed(&conn)
     };
-    let mut a = open(&path).expect("open A");
+    let Ok(mut a) = open(&path) else {
+        panic!("#5084: open A failed");
+    };
     let committed = arm_interleaved_writer_5084(&mut a, &path);
     let out = f(&mut a, &fixture);
     assert!(
@@ -397,7 +401,10 @@ fn run_repair_schema_version_is_immediate_5084() {
     let (out, b_committed) = run_path_race(
         None,
         |path| {
-            drop(open(path).expect("seed open"));
+            let Ok(conn) = open(path) else {
+                panic!("#5084: seed open failed");
+            };
+            drop(conn);
         },
         |path| {
             let mut so: Vec<u8> = Vec::new();
@@ -415,8 +422,7 @@ fn run_repair_schema_version_is_immediate_5084() {
     );
     assert!(
         matches!(out.0, Ok(0)) && !b_committed,
-        "#5084 run_repair_schema_version: {:?} stderr={} b_committed={b_committed}",
-        out.0,
+        "#5084 run_repair_schema_version: stderr={} b_committed={b_committed}",
         out.1
     );
 }
@@ -476,10 +482,12 @@ fn mine_race_5084(conversations: usize, skip_inserts: usize) -> (String, i64, bo
         disarm_on_open_5084(),
         "#5084: the interleaving hook never fired, so this race test proved nothing"
     );
-    assert!(result.is_ok(), "mine must succeed: {result:?}");
+    assert!(result.is_ok(), "#5084: mine must succeed");
     let stderr = env.stderr_str().to_string();
-    let stored: i64 = open(&db_path)
-        .expect("reopen")
+    let Ok(reopened) = open(&db_path) else {
+        panic!("#5084: reopen failed");
+    };
+    let stored: i64 = reopened
         .query_row(
             "SELECT COUNT(*) FROM memories WHERE namespace = 'mine-5084'",
             [],
