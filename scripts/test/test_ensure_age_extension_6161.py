@@ -355,6 +355,32 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertEqual(victim.read_text(), "ORIG")
         self.assert_restored()
 
+    def test_preplaced_dest_symlink_is_replaced_not_followed(self):
+        victim = self.base / "victim.txt"
+        victim.write_text("ORIG")
+        os.symlink(str(victim), str(self.lib / "age.dylib"))
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(victim.read_text(), "ORIG", "the install wrote through a planted symlink")
+        dest = self.lib / "age.dylib"
+        self.assertFalse(dest.is_symlink())
+        self.assertTrue(stat.S_ISREG(os.lstat(str(dest)).st_mode))
+        self.assert_restored()
+        self.assert_no_temp_files()
+
+    def test_dest_symlink_to_good_bytes_is_not_healthy(self):
+        self.install_good()
+        good_copy = self.base / "good-copy.dylib"
+        good_copy.write_bytes(DYLIB)
+        (self.lib / "age.dylib").unlink()
+        os.symlink(str(good_copy), str(self.lib / "age.dylib"))
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("restored", r.stdout, "a symlink to correct bytes must not count as healthy")
+        self.assertFalse((self.lib / "age.dylib").is_symlink())
+        self.assertEqual(good_copy.read_bytes(), DYLIB)
+        self.assert_restored()
+
     def test_unwritable_lib_dir_fails_without_partial_state(self):
         self.lib.chmod(0o555)
         self.addCleanup(self.lib.chmod, 0o755)
