@@ -3608,6 +3608,19 @@ class CarrierBeforeClosedWorld6117(unittest.TestCase):
         self.assertEqual(1, len(_bare_before_consumers(texts)))
 
 
+class ApprovalDocTruth6213(unittest.TestCase):
+    """Cloud F5 / F6: the docs and a pin comment do not overclaim against the #6213 residual."""
+
+    def test_6117_r3_f5_docs_do_not_say_never_or_cannot(self) -> None:
+        for rel in ("docs/AI_DEVELOPER_GOVERNANCE.md", "docs/contributing-external.md"):
+            with self.subTest(doc=rel):
+                text = " ".join((ROOT / rel).read_text(encoding="utf-8").split())
+                self.assertNotIn("a push run never reports a pass where the PR run would fail", text)
+                self.assertNotIn("a push run cannot report a pass beside a failing PR run", text)
+                self.assertIn("#6213", text)
+                self.assertIn("named by the queue ref", text)
+
+
 class GateScriptsRunIsolated6117(unittest.TestCase):
     """N-2 (#5163 class): the gate scripts the c8 workflow runs use ``python3 -I``.
 
