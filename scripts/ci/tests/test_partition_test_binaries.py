@@ -659,6 +659,44 @@ class LibCallerTransitive6412(Base):
         self.assertEqual(self.gate({'a.rs': a}), ['a'])
 
 
+class LibMacroCaller6425(Base):
+    """#6425 (review MEDIUM-1): a macro whose body reaches the Postgres URL records its invoking tests."""
+
+    HELPER = LibCallerResolution6412.HELPER
+    with_tests = staticmethod(LibCallerTransitive6412.with_tests)
+    gate = LibCallerTransitive6412.gate
+    EXPORTED = '#[macro_export]\nmacro_rules! mm { () => { $crate::support::live_pg_url() } }\n'
+
+    def test_exported_macro_in_another_module_records_the_invoking_test_6425(self):
+        files = {'a.rs': self.with_tests('let _ = crate::mm!();'), 're.rs': self.EXPORTED}
+        self.assertEqual(self.gate(files), ['a::tests::t', 're'])
+        self.assertEqual(self.gate(files, ['support', 'a::tests::t', 're']), [])
+
+    def test_bare_macro_name_invocation_is_recorded_6425(self):
+        files = {'a.rs': 'use crate::mm;\n' + self.with_tests('let _ = mm!();', 'use super::*;'), 're.rs': self.EXPORTED}
+        self.assertEqual(self.gate(files), ['a::tests::t', 're'])
+
+    def test_macro_that_names_the_url_directly_records_the_invoking_test_6425(self):
+        files = {'a.rs': self.with_tests('let _ = crate::raw!();'),
+                 're.rs': '#[macro_export]\nmacro_rules! raw { () => { std::env::var("AI_MEMORY_TEST_POSTGRES_URL") } }\n'}
+        self.assertEqual(self.gate(files, ['support', 're']), ['a::tests::t'])
+
+    def test_macro_calling_a_hot_macro_is_hot_6425(self):
+        files = {'a.rs': self.with_tests('let _ = crate::outer!();'),
+                 're.rs': self.EXPORTED + '#[macro_export]\nmacro_rules! outer { () => { $crate::mm!() } }\n'}
+        self.assertEqual(self.gate(files, ['support', 're']), ['a::tests::t'])
+
+    def test_macro_without_the_helper_records_nothing_6425(self):
+        files = {'a.rs': self.with_tests('let _ = crate::cold!();'),
+                 're.rs': '#[macro_export]\nmacro_rules! cold { () => { 1 } }\n'}
+        self.assertEqual(self.gate(files), [])
+
+    def test_macro_body_that_cannot_be_delimited_is_fail_closed_6425(self):
+        files = {'a.rs': self.with_tests('let _ = crate::broken!();'),
+                 're.rs': '#[macro_export]\nmacro_rules! broken { () => { 1 }\n'}
+        self.assertIn('a::tests::t', self.gate(files))
+
+
 class DocEstimateTests6344B6(Base):
     def test_doc_tests_are_in_the_serial_estimate_6344(self):
         exes = pt.parse_build_json([artifact(['lib'], 'ai_memory', SCRATCH / 'src' / 'lib.rs', '/x/lib'),

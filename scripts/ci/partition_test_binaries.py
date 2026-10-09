@@ -867,8 +867,64 @@ def helper_hit(resolver, is_method, ref, here, qual):
     return resolver.hit(ref, here, qual)
 
 
+def macro_spans(rf):
+    """[(name, start, end)] of every ``macro_rules!`` body in a file; end None when the body cannot be delimited."""
+    out = []
+    for m in MACRO_RE.finditer(rf.shape):
+        close = {'{': '}', '(': ')', '[': ']'}[m.group(2)]
+        depth, i = 0, m.end() - 1
+        while i < len(rf.shape):
+            ch = rf.shape[i]
+            depth += (ch == m.group(2)) - (ch == close)
+            if depth == 0:
+                break
+            i += 1
+        out.append((m.group(1), m.end(), i if depth == 0 else None))
+    return out
+
+
+MACRO_RE = re.compile(r'\bmacro_rules\s*!\s*([A-Za-z_][A-Za-z0-9_]*)\s*([{(\[])')
+
+
+def macro_callers(units, hit_positions, site_path):
+    """Sites that invoke a macro whose body reaches the Postgres URL (#6425).
+
+    ``hit_positions`` is [(RustFile, offset)] of every direct URL token and helper call. A
+    ``macro_rules!`` whose body holds one is a hot macro (transitively, through macros that
+    invoke a hot macro; a body that cannot be delimited counts as hot, fail closed); every
+    invocation of a hot macro by name, by any path (``m!``, ``crate::m!``, ``$crate::m!``), is a
+    site at the invoking test, so the macro's defining module is not the only place recorded.
+    """
+    spans = {rf.path: macro_spans(rf) for rf, _m in units}
+    hot, changed = set(), True
+    for rf, _m in units:
+        for name, lo, hi in spans[rf.path]:
+            if hi is None or any(h is rf and lo <= at < hi for h, at in hit_positions):
+                hot.add(name)
+    inv_re = lambda names: re.compile(r'\b(%s)\s*!(?!\s*=)' % '|'.join(map(re.escape, sorted(names))))
+    while changed and hot:
+        changed = False
+        pat = inv_re(hot)
+        for rf, _m in units:
+            for name, lo, hi in spans[rf.path]:
+                if name not in hot and hi is not None and pat.search(rf.shape, lo, hi):
+                    hot.add(name)
+                    changed = True
+    out = []
+    if not hot:
+        return out
+    pat = inv_re(hot)
+    for rf, modp in units:
+        found = [m for m in pat.finditer(rf.shape)
+                 if not re.search(r'macro_rules\s*!\s*$', rf.shape[max(0, m.start() - 32):m.start()])]
+        for m, ctx in zip(found, rf.contexts([m.start() for m in found])):
+            path, _ = site_path(modp, ctx)
+            out.append((path, '%s:%d (invokes macro %s)' % (rf.path, rf.code.count('\n', 0, m.start()) + 1, m.group(1))))
+    return out
+
+
 def helper_callers(units, helpers, site_path):
-    """Sites that call of a Postgres helper, resolved by module path, `use` and globs.
+    """(sites, hit positions) of callers of a Postgres helper, resolved by module path, `use` and globs.
 
     Strings and comments are blanked (``shape`` view). A free-fn helper matches a name only when
     the name is defined, imported (plain, aliased, group), glob-imported or re-exported (``pub
@@ -891,7 +947,7 @@ def helper_callers(units, helpers, site_path):
                     grew = True
     resolvers = {key: HelperResolver(key[0], key[1], facts) for key in helpers}
     pat = re.compile(r'\b(%s)\b' % '|'.join(map(re.escape, sorted(names))))
-    out = []
+    out, hits = [], []
     for rf, modp in units:
         refs = []
         for m in pat.finditer(rf.shape):
@@ -915,7 +971,8 @@ def helper_callers(units, helpers, site_path):
                     continue  # `x.name()` is a method call, never the free fn
                 if path not in def_paths and helper_hit(resolvers[key], is_method, m.group(1), here, qual):
                     out.append((path, '%s:%d (calls %s)' % (rf.path, rf.code.count('\n', 0, m.start()) + 1, key[1])))
-    return out
+                    hits.append((rf, m.start()))
+    return out, hits
 
 
 def lib_pg_sites(src_root):
@@ -933,7 +990,7 @@ def lib_pg_sites(src_root):
     for rf, _ in units:
         consts.update(m.group(1) for m in PG_CONST_RE.finditer(rf.code))
     const_re = re.compile(r'\b(%s)\b' % '|'.join(map(re.escape, sorted(consts)))) if consts else None
-    out = []
+    out, direct = [], []
     helpers = {}  # (module tuple, fn name) -> [is method, def paths]: a non-test fn that names the URL (r2 F2; resolved by path, #6412)
 
     def site_path(modp, ctx):
@@ -954,6 +1011,7 @@ def lib_pg_sites(src_root):
             pos += [m.start() for m in const_re.finditer(rf.code)]
         if not pos:
             continue
+        direct.extend((rf, at) for at in pos)
         for at, ctx in zip(pos, rf.contexts(pos)):
             path, test_fn = site_path(modp, ctx)
             if test_fn is None:
@@ -965,8 +1023,12 @@ def lib_pg_sites(src_root):
                     entry[1].add(path)
             line = rf.code.count('\n', 0, at) + 1
             out.append((path, '%s:%d' % (rf.path, line)))
+    hits = [(rf, at) for rf, at in direct]
     if helpers:
-        out.extend(helper_callers(units, helpers, site_path))
+        found, more = helper_callers(units, helpers, site_path)
+        out.extend(found)
+        hits.extend(more)
+    out.extend(macro_callers(units, hits, site_path))
     return out
 
 
