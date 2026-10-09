@@ -20,9 +20,17 @@ unless BOTH hold:
 2. the ``<relative-doc-path>:<stale-name>`` pair is listed in
    ``scripts/qc-allowlists/compliance-script-names-allow.txt``. The allowlist
    is a burn-down ledger of the documents that carry a historical mention
-   today (a stale entry that suppresses nothing, or a malformed entry, fails).
-   An erratum therefore never clears the stale name in a document written
-   later.
+   today (a stale entry that suppresses nothing, a duplicate entry, or a
+   malformed entry fails). An erratum therefore never clears the stale name in
+   a document written later.
+
+An allowlisted pair is honoured only while the document ITSELF carries an
+erratum line for that name (#6170), so deleting the erratum from one document
+fails the gate even when another document still carries one. The only
+exception is an entry marked ``<doc>:<name>:pinned``: a document that cannot
+carry an erratum (the SHA-256 pinned declaration, or a text guarded by a
+separate gate) is honoured while an erratum for the name exists in any
+``docs/compliance/`` document.
 
 Usage:
     python3 -I scripts/check_compliance_script_names.py [--root DIR]
@@ -43,7 +51,9 @@ from pathlib import Path
 TOKEN_RE = re.compile(r"`((?:scripts/)?check[-_][A-Za-z0-9_-]+\.(?:sh|py))`")
 SUCCESSOR_RE = re.compile(r"`scripts/([A-Za-z0-9_./-]+\.(?:sh|py))`")
 ALLOW_REL = "scripts/qc-allowlists/compliance-script-names-allow.txt"
-ENTRY_RE = re.compile(r"^(docs/compliance/\S+\.md):(check[-_][A-Za-z0-9_-]+\.(?:sh|py))$")
+ENTRY_RE = re.compile(
+    r"^(docs/compliance/\S+\.md):(check[-_][A-Za-z0-9_-]+\.(?:sh|py))(:pinned)?$"
+)
 
 
 class Unreadable(Exception):
@@ -87,9 +97,10 @@ def compliance_docs(root):
 
 
 def collect_errata(root, docs):
-    """Map stale bare script name -> successor path, from erratum lines."""
-    errata = {}
+    """Return (all, per_doc): stale name -> successor, globally and by doc path."""
+    errata, per_doc = {}, {}
     for doc in docs:
+        rel = doc.relative_to(root).as_posix()
         for line in read_text(root, doc).splitlines():
             if "erratum" not in line.lower():
                 continue
@@ -100,15 +111,16 @@ def collect_errata(root, docs):
                 base = tok[len("scripts/"):] if tok.startswith("scripts/") else tok
                 if base not in succ:
                     errata[base] = succ[0]
-    return errata
+                    per_doc.setdefault(rel, {})[base] = succ[0]
+    return errata, per_doc
 
 
 def load_allowlist(root):
-    """Return (set of (doc, stale-name) pairs, list of malformed-line problems)."""
+    """Return ({(doc, stale-name): pinned}, list of malformed/duplicate-line problems)."""
     path = root / ALLOW_REL
     if not path.is_file():
-        return set(), []
-    pairs, problems = set(), []
+        return {}, []
+    pairs, problems = {}, []
     for lineno, raw in enumerate(read_text(root, path).splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
@@ -117,14 +129,18 @@ def load_allowlist(root):
         if not m:
             problems.append("%s:%d: malformed allowlist entry %r" % (ALLOW_REL, lineno, line))
             continue
-        pairs.add((m.group(1), m.group(2)))
+        key = (m.group(1), m.group(2))
+        if key in pairs:
+            problems.append("%s:%d: duplicate allowlist entry %s:%s" % (ALLOW_REL, lineno, key[0], key[1]))
+            continue
+        pairs[key] = m.group(3) is not None
     return pairs, problems
 
 
 def check(root):
     """Return a list of violation strings for the tree at ``root``."""
     docs = compliance_docs(root)
-    errata = collect_errata(root, docs)
+    errata, per_doc = collect_errata(root, docs)
     allowed, problems = load_allowlist(root)
     used = set()
     for doc in docs:
@@ -134,14 +150,16 @@ def check(root):
                 if scripts_exist(root, tok):
                     continue
                 base = tok[len("scripts/"):] if tok.startswith("scripts/") else tok
-                if base in errata and (rel, base) in allowed:
+                pinned = allowed.get((rel, base))
+                covered = base in errata if pinned else base in per_doc.get(rel, {})
+                if pinned is not None and covered:
                     used.add((rel, base))
                     continue
                 problems.append(
                     "%s:%d: `%s` does not exist under scripts/ and no erratum-covered allowlist"
                     " entry (%s) names it" % (rel, lineno, tok, ALLOW_REL)
                 )
-    for rel, base in sorted(allowed - used):
+    for rel, base in sorted(set(allowed) - used):
         problems.append("%s: stale allowlist entry %s:%s suppresses nothing" % (ALLOW_REL, rel, base))
     return problems
 
