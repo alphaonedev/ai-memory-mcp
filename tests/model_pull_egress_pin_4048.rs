@@ -245,7 +245,10 @@ async fn loopback_only_pull_sends_nothing_to_env_proxy_4048() {
                 .expect("client builds");
             run_pull(&client, embed).await
         };
-        assert!(result.is_ok(), "#4048 (embed={embed}): the pull succeeds directly");
+        assert!(
+            result.is_ok(),
+            "#4048 (embed={embed}): the pull succeeds directly"
+        );
         let proxied = proxy.received_requests().await.unwrap_or_default().len();
         assert_eq!(
             proxied, 0,
@@ -272,7 +275,10 @@ async fn allow_control_routes_the_pull_through_env_proxy_4048() {
                 .expect("client builds");
             run_pull(&client, embed).await
         };
-        assert!(result.is_ok(), "control (embed={embed}): the proxy answers 200");
+        assert!(
+            result.is_ok(),
+            "control (embed={embed}): the proxy answers 200"
+        );
         let proxied = proxy.received_requests().await.unwrap_or_default().len();
         assert_eq!(
             proxied, 2,
@@ -337,7 +343,10 @@ async fn allow_control_follows_redirect_4048() {
                 .expect("client builds");
             run_pull(&client, embed).await
         };
-        assert!(result.is_ok(), "control (embed={embed}): allow follows the 307");
+        assert!(
+            result.is_ok(),
+            "control (embed={embed}): allow follows the 307"
+        );
         assert_eq!(hits(&target, "/leaked").await, 1);
     }
 }
