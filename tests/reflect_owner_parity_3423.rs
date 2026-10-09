@@ -52,13 +52,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::common::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::store::MemoryStore;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::TempDir;
 use tower::ServiceExt as _;
 
 mod common;
@@ -77,9 +78,9 @@ fn fresh_dir() -> TempDir {
 /// sweep ran against, where the #2140/#2156 body-binding block is INERT. That
 /// is precisely the posture in which the sqlite branch never learned the
 /// caller, so the regression is only reachable here.
-fn build_router() -> (axum::Router, NamedTempFile, PathBuf) {
+fn build_router() -> (axum::Router, SqliteTempFile, PathBuf) {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

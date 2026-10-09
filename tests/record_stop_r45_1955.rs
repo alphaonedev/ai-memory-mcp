@@ -31,10 +31,14 @@
 //! - Federation-receive IS stopped (the "atomic write-fence" — inbound
 //!   convergence pauses under record-stop).
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::error::Error;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::models::{
     Action, ActionState, Checkpoint, CheckpointState, ConditionType, ConfidenceSource, EdgeType,
     Memory, MemoryKind, MemoryLink, MemoryLinkRelation, Routine, RoutineRun, RoutineRunState,
@@ -44,7 +48,6 @@ use ai_memory::storage::StorageError;
 use ai_memory::store::record_stop::SCOPE_RECORD_PLANE;
 use ai_memory::store::{CallerContext, Filter, MemoryStore, StoreError, sqlite::SqliteStore};
 use serde_json::json;
-use tempfile::NamedTempFile;
 
 const NS: &str = "record-stop-r45";
 
@@ -81,8 +84,8 @@ fn mk_memory(title: &str, content: &str) -> Memory {
     }
 }
 
-fn fresh_store() -> (Arc<dyn MemoryStore>, NamedTempFile) {
-    let f = NamedTempFile::new().expect("tempfile");
+fn fresh_store() -> (Arc<dyn MemoryStore>, SqliteTempFile) {
+    let f = SqliteTempFile::new().expect("tempfile");
     let store: Arc<dyn MemoryStore> =
         Arc::new(SqliteStore::open(f.path()).expect("open SqliteStore"));
     (store, f)
@@ -284,7 +287,7 @@ async fn federation_receive_is_stopped() {
 /// on the existing-row path (`insert_if_newer` already gated the no-row path).
 #[test]
 fn db_merge_inbound_same_id_refuses_under_record_stop_b2() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("open");
     let mut mem = mk_memory("same-id-b2", "local row");
     let id = ai_memory::db::insert(&conn, &mem).expect("seed local row");
@@ -537,7 +540,7 @@ async fn attestation_events_signed_and_chained() {
 
 #[tokio::test]
 async fn stop_persists_across_reopen() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     {
         let store: Arc<dyn MemoryStore> = Arc::new(SqliteStore::open(f.path()).expect("open"));
         store
@@ -619,7 +622,7 @@ fn stopped_rusqlite(err: &rusqlite::Error) -> bool {
 #[allow(clippy::too_many_lines)] // completeness table is the pin; splitting hides siblings
 #[test]
 fn mutating_ssot_funnels_refuse_under_record_stop_b6() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("open");
     assert!(
         ai_memory::storage::record_stop::actuate_sqlite(
@@ -1070,7 +1073,7 @@ fn coordination_sal_write_methods_gate_record_stop_b6() {
 /// Wave-2 B7 — the four round-4 siblings refuse under record-stop.
 #[test]
 fn b7_enumerated_funnels_refuse_under_record_stop() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("open");
     assert!(
         ai_memory::storage::record_stop::actuate_sqlite(
@@ -1119,7 +1122,7 @@ fn b7_enumerated_funnels_refuse_under_record_stop() {
 /// arm that skipped gated `insert()`).
 #[test]
 fn b7_entity_register_existing_alias_refuses_under_stop() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("open");
     ai_memory::db::entity_register(&conn, "b7-ent", NS, &[], &json!({}), Some("ai:x"))
         .expect("register while running");

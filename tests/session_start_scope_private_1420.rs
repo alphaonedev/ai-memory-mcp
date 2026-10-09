@@ -29,15 +29,18 @@
 //! - **Body/header agreement** — supplying both with mismatch returns
 //!   400 (mirrors `#910` write-surface norm).
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -208,7 +211,7 @@ async fn post_json_with_header(
 
 #[tokio::test]
 async fn http_session_start_does_not_leak_alice_private_row_to_bob() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let _alice_row = seed_memory(tmp.path(), "alice", "ns-1420-leak", "alice-private", false);
 
     let router = build_router(tmp.path());
@@ -230,7 +233,7 @@ async fn http_session_start_does_not_leak_alice_private_row_to_bob() {
 
 #[tokio::test]
 async fn http_session_start_owner_sees_own_row() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let _row = seed_memory(tmp.path(), "alice", "ns-1420-owner", "alice-private", false);
 
     let router = build_router(tmp.path());
@@ -269,7 +272,7 @@ async fn http_session_start_owner_sees_own_row() {
 
 #[tokio::test]
 async fn http_session_start_public_row_visible_to_anyone() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let _row = seed_memory(tmp.path(), "alice", "ns-1420-pub", "alice-public", true);
 
     let router = build_router(tmp.path());
@@ -292,7 +295,7 @@ async fn http_session_start_public_row_visible_to_anyone() {
 
 #[tokio::test]
 async fn http_session_start_body_header_mismatch_returns_400() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let router = build_router(tmp.path());
     let (status, resp) = post_json_with_header(
         &router,
@@ -316,7 +319,7 @@ async fn http_session_start_body_agent_id_acts_as_caller_when_no_header() {
     // Pre-#1420 contract: agent_id can come from body OR header. When
     // body is the sole source (no header), it acts as the caller for
     // the post-list visibility filter.
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let _row = seed_memory(
         tmp.path(),
         "alice",

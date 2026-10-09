@@ -80,15 +80,18 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::doc_markdown)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -302,7 +305,7 @@ fn collective() -> Value {
 
 #[tokio::test]
 async fn put_invisible_cross_owner_row_masks_as_not_found_3426() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     // No `scope` key => private (the default posture), so the row is
     // invisible to INTRUDER: the write path must answer exactly what the
     // read path answers.
@@ -334,7 +337,7 @@ async fn put_invisible_cross_owner_row_masks_as_not_found_3426() {
 
 #[tokio::test]
 async fn delete_invisible_cross_owner_row_masks_as_not_found_3426() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let id = seed_memory(tmp.path(), OWNER, "leak-3426/private-del", &json!({}));
     let router = build_router_fixture(tmp.path());
     let (status, body) = request_as(
@@ -361,7 +364,7 @@ async fn delete_invisible_cross_owner_row_masks_as_not_found_3426() {
 
 #[tokio::test]
 async fn promote_invisible_cross_owner_row_masks_as_not_found_3426() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let id = seed_memory(tmp.path(), OWNER, "leak-3426/private-promote", &json!({}));
     let router = build_router_fixture(tmp.path());
     let (status, body) = request_as(
@@ -386,7 +389,7 @@ async fn promote_invisible_cross_owner_row_masks_as_not_found_3426() {
 
 #[tokio::test]
 async fn put_visible_cross_owner_row_refuses_403_without_owner_3426() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     // `collective` is world-readable by design, so INTRUDER can already
     // GET this row: masking it as 404 would be a lie. The refusal stays
     // 403 — but it still must not be the channel that discloses the
@@ -427,7 +430,7 @@ async fn put_visible_cross_owner_row_refuses_403_without_owner_3426() {
 
 #[tokio::test]
 async fn delete_and_promote_visible_cross_owner_row_refuse_403_without_owner_3426() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let del = seed_memory(tmp.path(), OWNER, "leak-3426/collective-del", &collective());
     let pro = seed_memory(tmp.path(), OWNER, "leak-3426/collective-pro", &collective());
     let router = build_router_fixture(tmp.path());
@@ -471,7 +474,7 @@ async fn delete_and_promote_visible_cross_owner_row_refuse_403_without_owner_342
 
 #[tokio::test]
 async fn links_create_cross_owner_refusal_names_no_owner_3426() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let source = seed_memory(tmp.path(), OWNER, "leak-3426/link-src", &collective());
     let target = seed_memory(tmp.path(), OWNER, "leak-3426/link-tgt", &collective());
     let router = build_router_fixture(tmp.path());
@@ -502,7 +505,7 @@ async fn links_create_cross_owner_refusal_names_no_owner_3426() {
 
 #[tokio::test]
 async fn links_delete_cross_owner_refusal_names_neither_endpoint_owner_3426() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let source = seed_memory(tmp.path(), OWNER, "leak-3426/unlink-src", &collective());
     let target = seed_memory(tmp.path(), OWNER, "leak-3426/unlink-tgt", &collective());
     let router = build_router_fixture(tmp.path());
@@ -555,7 +558,7 @@ async fn links_delete_cross_owner_refusal_names_neither_endpoint_owner_3426() {
 
 #[tokio::test]
 async fn kg_timeline_and_invalidate_refusals_name_no_owner_3426() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let source = seed_memory(tmp.path(), OWNER, "leak-3426/kg-src", &collective());
     let target = seed_memory(tmp.path(), OWNER, "leak-3426/kg-tgt", &collective());
     let router = build_router_fixture(tmp.path());
@@ -653,7 +656,7 @@ async fn store_err_rendering_of_owner_gate_refusal_is_leak_free_3426() {
 #[tokio::test]
 async fn sqlite_sal_cross_owner_update_refusal_names_no_owner_3426() {
     use ai_memory::store::{CallerContext, MemoryStore, StoreError, UpdatePatch};
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let id = seed_memory(tmp.path(), OWNER, "leak-3426/sal-sqlite", &collective());
     let store = ai_memory::store::sqlite::SqliteStore::open(tmp.path()).expect("open");
     let err = store
@@ -686,7 +689,7 @@ async fn sqlite_sal_cross_owner_update_refusal_names_no_owner_3426() {
 
 #[tokio::test]
 async fn owner_can_still_update_own_row_3426() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let id = seed_memory(tmp.path(), OWNER, "leak-3426/own", &json!({}));
     let router = build_router_fixture(tmp.path());
     let (status, body) = request_as(
@@ -711,7 +714,7 @@ async fn owner_can_still_update_own_row_3426() {
 
 #[tokio::test]
 async fn owner_can_still_delete_and_promote_own_rows_3426() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let del = seed_memory(tmp.path(), OWNER, "leak-3426/own-del", &json!({}));
     let pro = seed_memory(tmp.path(), OWNER, "leak-3426/own-pro", &json!({}));
     let router = build_router_fixture(tmp.path());

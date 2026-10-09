@@ -21,22 +21,25 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::too_many_lines)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::{Arc, Mutex};
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::federation_wire_notes::{ENV_PREFIX, remediation, wire};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tower::ServiceExt as _;
 
 const UNENROLLED_PEER: &str = "peer-3204-unenrolled";
 
-fn build_router(storage_backend: StorageBackend) -> (axum::Router, NamedTempFile) {
+fn build_router(storage_backend: StorageBackend) -> (axum::Router, SqliteTempFile) {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    let file = NamedTempFile::new().expect("tempfile");
+    let file = SqliteTempFile::new().expect("tempfile");
     let path = file.path().to_path_buf();
     let conn = ai_memory::db::open(&path).expect("open DB");
     let db: Db = Arc::new(tokio::sync::Mutex::new((

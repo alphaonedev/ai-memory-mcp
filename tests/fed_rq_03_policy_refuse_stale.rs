@@ -23,6 +23,9 @@
 //! the pg parity test proves the refusal fires without ever touching the
 //! `PostgresStore` — the "no pg verbatim-apply" property.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
@@ -48,7 +51,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
     )));
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+        let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile for SqliteStore");
         let p = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         std::sync::Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open store"))

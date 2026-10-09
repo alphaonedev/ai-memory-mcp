@@ -216,8 +216,14 @@ async fn mock_embed_server() -> MockServer {
     server
 }
 
-fn build_router(embed_base_url: &str) -> (axum::Router, Db, tempfile::NamedTempFile) {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+fn build_router(
+    embed_base_url: &str,
+) -> (
+    axum::Router,
+    Db,
+    crate::common::sqlite_tempfile::SqliteTempFile,
+) {
+    let db_tmp = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

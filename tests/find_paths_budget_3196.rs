@@ -20,14 +20,17 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc, clippy::uninlined_format_args)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::models::{
     ConfidenceSource, LifecycleState, Memory, MemoryKind, MemoryLink, MemoryLinkRelation, Tier,
 };
 use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, MemoryStore, StoreError};
-use tempfile::NamedTempFile;
 
 fn mem(id: &str, ns: &str, title: &str) -> Memory {
     let now = chrono::Utc::now().to_rfc3339();
@@ -106,7 +109,7 @@ async fn seed_clique(store: &SqliteStore, ctx: &CallerContext, ns: &str, n: usiz
 
 #[tokio::test]
 async fn find_paths_dense_clique_refuses_with_budget_3196() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let store = SqliteStore::open(f.path()).expect("open SqliteStore");
     let ctx = CallerContext::for_agent("ai:fp3196");
     let ids = seed_clique(&store, &ctx, "budget", 14).await;
@@ -146,7 +149,7 @@ async fn find_paths_dense_clique_refuses_with_budget_3196() {
 /// deadlock, `SQLITE_BUSY`, or corruption.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn find_paths_does_not_stall_concurrent_writes_3196() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let store = Arc::new(SqliteStore::open(f.path()).expect("open SqliteStore"));
     let ctx = CallerContext::for_agent("ai:fp3196");
     let ids = seed_clique(&store, &ctx, "destall", 14).await;

@@ -16,6 +16,9 @@
 #![cfg(all(feature = "sal", feature = "sal-postgres"))]
 #![allow(clippy::needless_update)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::models::ConfidenceSource;
 use ai_memory::models::{Memory, Tier};
 use ai_memory::store::postgres::PostgresStore;
@@ -142,7 +145,7 @@ async fn recall_scoring_parity_top_10_within_2_swaps() {
     let corpus = make_corpus(&ns);
 
     // Seed both backends.
-    let src_tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let src_tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let sqlite = SqliteStore::open(src_tmp.path()).expect("open sqlite");
     let pg = PostgresStore::connect(&pg_url).await.expect("connect pg");
 

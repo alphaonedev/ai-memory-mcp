@@ -11,6 +11,10 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::too_many_lines)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 use ai_memory::models::{Memory, Tier};
@@ -19,7 +23,6 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use tempfile::NamedTempFile;
 use tower::ServiceExt as _;
 
 /// Cells mutate process env (attestation / `why_trace` postures); one at a time.
@@ -33,9 +36,9 @@ fn build_router(
     backend: StorageBackend,
     store: Arc<dyn MemoryStore>,
     sqlite_path: Option<&std::path::Path>,
-) -> (axum::Router, NamedTempFile) {
+) -> (axum::Router, SqliteTempFile) {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = sqlite_path.unwrap_or(f.path()).to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
@@ -167,7 +170,7 @@ fn enforce_mode() {
     );
 }
 
-fn sqlite_store(file: &NamedTempFile) -> Arc<dyn MemoryStore> {
+fn sqlite_store(file: &SqliteTempFile) -> Arc<dyn MemoryStore> {
     Arc::new(ai_memory::store::sqlite::SqliteStore::open(file.path()).expect("sqlite"))
 }
 
@@ -451,7 +454,7 @@ macro_rules! escape_cells {
             #[tokio::test]
             async fn issue_4285_sqlite() {
                 let _serial = SERIAL.lock().await;
-                let file = NamedTempFile::new().expect("sqlite file");
+                let file = SqliteTempFile::new().expect("sqlite file");
                 $f(sqlite_store(&file), StorageBackend::Sqlite, Some(file.path())).await;
             }
 
@@ -481,7 +484,7 @@ async fn issue_4285_sqlite_whole_metadata_corruption_parent0() {
     let _serial = SERIAL.lock().await;
     for raw in ["{not json", "[1,2]", "\"just a string\""] {
         enforce_mode();
-        let file = NamedTempFile::new().expect("sqlite file");
+        let file = SqliteTempFile::new().expect("sqlite file");
         let store = sqlite_store(&file);
         let (child, sid, src) = seed_parent0_child(&store, json!({"write": "any"})).await;
         let conn = ai_memory::db::open(file.path()).expect("raw conn");

@@ -44,6 +44,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::common::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::identity_binding::EnrolledAgentKeys;
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
@@ -51,7 +52,7 @@ use ai_memory::store::MemoryStore;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::TempDir;
 use tower::ServiceExt as _;
 
 mod common;
@@ -121,13 +122,13 @@ fn router_from(app_state: AppState, enrolled: Arc<EnrolledAgentKeys>) -> axum::R
     ai_memory::build_router(api_key_state, app_state)
 }
 
-fn sqlite_router() -> (axum::Router, NamedTempFile) {
+fn sqlite_router() -> (axum::Router, SqliteTempFile) {
     sqlite_router_with_keys(Arc::new(EnrolledAgentKeys::empty()))
 }
 
-fn sqlite_router_with_keys(enrolled: Arc<EnrolledAgentKeys>) -> (axum::Router, NamedTempFile) {
+fn sqlite_router_with_keys(enrolled: Arc<EnrolledAgentKeys>) -> (axum::Router, SqliteTempFile) {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

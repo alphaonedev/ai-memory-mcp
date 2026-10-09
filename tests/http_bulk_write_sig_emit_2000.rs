@@ -37,13 +37,16 @@
 //! PR #1999 adversarial audit found — makes the `write_signature`-present
 //! assertions here fail CI.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine as _;
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -54,8 +57,8 @@ use ai_memory::models::field_names::WRITE_SIGNATURE;
 /// Build a router over a fresh sqlite DB file, advertising `backend`. Passing
 /// `StorageBackend::Postgres` while backing it with an `SqliteStore` exercises
 /// the postgres `bulk_create` branch (the "fake-PG" pattern) deterministically.
-fn build_router(backend: StorageBackend) -> (axum::Router, NamedTempFile, std::path::PathBuf) {
-    let f = NamedTempFile::new().expect("tempfile");
+fn build_router(backend: StorageBackend) -> (axum::Router, SqliteTempFile, std::path::PathBuf) {
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

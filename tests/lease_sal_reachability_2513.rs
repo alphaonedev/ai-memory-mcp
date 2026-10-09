@@ -25,6 +25,9 @@
 // test target.
 #![cfg(feature = "sal")]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::models::{Action, ActionState};
 use ai_memory::store::{CallerContext, MemoryStore};
 
@@ -136,7 +139,7 @@ async fn exercise_lease_sal_surface(store: &dyn MemoryStore) {
 /// `crate::actions::*` free-functions the MCP stdio handler calls).
 #[tokio::test]
 async fn lease_acquire_reaches_sal_trait_sqlite_2513() {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let store = ai_memory::store::sqlite::SqliteStore::open(f.path()).expect("open SqliteStore");
     exercise_lease_sal_surface(&store).await;
 }

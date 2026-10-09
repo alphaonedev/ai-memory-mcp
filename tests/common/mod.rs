@@ -71,6 +71,7 @@ pub mod postgres_env;
 
 // #3777 — the ONE lane-database predicate every guarded postgres cell calls.
 pub mod lane_db;
+pub mod sqlite_tempfile;
 
 // #3705 — "only encrypted data in transit": the per-test TLS leaf every
 // daemon-spawning suite uses (the daemon refuses every plaintext bind).
@@ -85,7 +86,7 @@ use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
 use rusqlite::Connection;
-use tempfile::NamedTempFile;
+use sqlite_tempfile::SqliteTempFile;
 
 /// v1.0.0 #3140 — per-request ceiling for [`pg_test_client`].
 ///
@@ -460,7 +461,7 @@ pub fn describe_counts(profile: &ai_memory::profile::Profile) -> (usize, usize) 
     (count_substantive(true), count_substantive(false))
 }
 
-/// `(NamedTempFile, PathBuf)` factory: create a tempfile, open the DB
+/// `(SqliteTempFile, PathBuf)` factory: create a tempfile, open the DB
 /// once so migrations land, drop the connection so the caller can
 /// re-open the path. The returned tempfile must be kept alive for the
 /// duration of the test so its destructor doesn't unlink the DB out
@@ -468,22 +469,22 @@ pub fn describe_counts(profile: &ai_memory::profile::Profile) -> (usize, usize) 
 /// which pass the path repeatedly to `Connection::open` and MCP tool
 /// handlers that take `&Path`.
 #[must_use]
-pub fn fresh_db_tempfile_path() -> (NamedTempFile, PathBuf) {
+pub fn fresh_db_tempfile_path() -> (SqliteTempFile, PathBuf) {
     permissive_attestation_for_tests();
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let p = f.path().to_path_buf();
     let _ = ai_memory::db::open(&p).expect("db::open");
     (f, p)
 }
 
-/// `(NamedTempFile, Connection)` factory: create a tempfile and open
+/// `(SqliteTempFile, Connection)` factory: create a tempfile and open
 /// the DB through `db::open`, keeping the connection live. Used by the
 /// form-4/form-5/atomisation/wt1c suites that need both the live
 /// connection and the tempfile guard.
 #[must_use]
-pub fn fresh_db_tempfile_conn() -> (NamedTempFile, Connection) {
+pub fn fresh_db_tempfile_conn() -> (SqliteTempFile, Connection) {
     permissive_attestation_for_tests();
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(tmp.path()).expect("db::open");
     (tmp, conn)
 }

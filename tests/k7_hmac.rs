@@ -25,6 +25,7 @@
 //! The K7 wiring lives in `src/subscriptions.rs::dispatch_event_with_details`
 //! (the `signature = match secret_hash {...}` block).
 
+use crate::common::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{
     HooksConfig, HooksSubscriptionConfig, active_hooks_hmac_secret, set_active_hooks_hmac_secret,
 };
@@ -32,7 +33,6 @@ use ai_memory::subscriptions::{self, NewSubscription};
 use rusqlite::Connection;
 use std::sync::Mutex;
 use std::time::Duration;
-use tempfile::NamedTempFile;
 
 mod common;
 use common::tls_receiver::{Recorded, TlsReceiver, ack_echo};
@@ -43,7 +43,7 @@ use common::tls_receiver::{Recorded, TlsReceiver, ack_echo};
 /// them sees stale config when its dispatch thread runs.
 static K7_HMAC_GLOBAL_LOCK: Mutex<()> = Mutex::new(());
 
-fn fresh_db() -> (NamedTempFile, std::path::PathBuf) {
+fn fresh_db() -> (SqliteTempFile, std::path::PathBuf) {
     // H11 (#628 blocker): wiremock binds to 127.0.0.1; loopback
     // webhook URLs are rejected by default, so opt in here.
     ai_memory::config::set_allow_loopback_webhooks(true);
@@ -53,7 +53,7 @@ fn fresh_db() -> (NamedTempFile, std::path::PathBuf) {
     // worker's ACK_TIMEOUT retry budget. See
     // `ai_memory::subscriptions::prewarm_dispatch_tls`.
     ai_memory::subscriptions::prewarm_dispatch_tls();
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let p = f.path().to_path_buf();
     let _ = ai_memory::db::open(&p).expect("db::open");
     (f, p)

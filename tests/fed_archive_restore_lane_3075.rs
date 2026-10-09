@@ -33,6 +33,9 @@
 //! the sqlite receive loop does not reach: without a direct cell the sqlite
 //! half of the trait would ship untested while only the pg half was exercised.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
@@ -93,7 +96,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
     )));
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+        let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile for SqliteStore");
         let p = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         std::sync::Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open store"))
@@ -337,7 +340,7 @@ async fn sqlite_sal_archive_restore_methods_and_g30_gate_3075() {
     // the SAL surface, and the sqlite RECEIVE loop deliberately does not reach
     // them (it keeps its inline `db::*` path, byte-for-byte unchanged by #3075).
     let id = format!("sal-3075-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let path = tmp.path().to_path_buf();
     std::mem::forget(tmp);
     let store = ai_memory::store::sqlite::SqliteStore::open(&path).expect("open store");

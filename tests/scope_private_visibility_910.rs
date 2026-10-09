@@ -25,15 +25,18 @@
 //!    with scope=collective; bob can see it. Sanity-check that the
 //!    filter is precise (only `private` is dropped, NOT all scopes).
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -41,8 +44,8 @@ fn build_router_fixture_with_seed(
     seed_scope: &str,
     seed_owner: &str,
     seed_namespace: &str,
-) -> (axum::Router, NamedTempFile) {
-    let f = NamedTempFile::new().expect("tempfile");
+) -> (axum::Router, SqliteTempFile) {
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
     let now = chrono::Utc::now().to_rfc3339();

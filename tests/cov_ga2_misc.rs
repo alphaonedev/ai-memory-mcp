@@ -55,6 +55,9 @@
 #![allow(deprecated)]
 #![allow(clippy::doc_markdown)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::config::{AppConfig, FeatureTier};
 use ai_memory::models::{Memory, Tier};
 use ai_memory::reranker::{
@@ -430,7 +433,7 @@ async fn daemon_build_embedder_invalid_override_falls_back() {
 /// returns `None`; `true` against an empty DB returns an empty index.
 #[test]
 fn daemon_build_vector_index_present_and_absent() {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(tmp.path()).expect("open db");
 
     // No embedder → no index.
@@ -501,7 +504,7 @@ async fn schema_init_sqlite_enumerates_and_reports() {
     use ai_memory::cli::CliOutput;
     use ai_memory::cli::schema_init::{SchemaInitArgs, run};
 
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let url = sqlite_url(tmp.path());
 
     let mut stdout = Vec::<u8>::new();
@@ -548,7 +551,7 @@ async fn schema_init_sqlite_human_render() {
     use ai_memory::cli::CliOutput;
     use ai_memory::cli::schema_init::{SchemaInitArgs, run};
 
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let url = sqlite_url(tmp.path());
 
     let mut stdout = Vec::<u8>::new();
@@ -677,7 +680,7 @@ async fn curator_store_url_postgres_once_builds_store_handle() {
     };
 
     // `--db` is left at a throwaway temp path; `--store-url` takes over.
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let cfg = AppConfig::default();
 
     let args = CuratorArgs {

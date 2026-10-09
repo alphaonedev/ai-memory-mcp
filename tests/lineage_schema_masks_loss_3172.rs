@@ -21,6 +21,9 @@
 // convention for env-serialized live-PG tests (see `cov_postgres_lineage.rs`).
 #![allow(clippy::await_holding_lock)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Mutex;
 
 use rusqlite::Connection;
@@ -54,7 +57,7 @@ fn sqlite_open_refuses_when_agent_lineage_regressed_to_empty() {
     // Ensure no stale override leaks in from another test / the environment.
     unsafe { std::env::remove_var(OVERRIDE_ENV) };
 
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let path = f.path();
 
     // Open #1: fresh schema, agent_lineage empty, no mark recorded.
@@ -124,7 +127,7 @@ fn sqlite_fresh_and_upgrade_databases_are_never_bricked() {
     // A genuinely fresh DB (empty agent_lineage, no mark) must open cleanly
     // every time — the anti-brick invariant. Re-opening repeatedly must never
     // start refusing.
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let path = f.path();
     for _ in 0..3 {
         let _conn = ai_memory::db::open(path).expect("fresh empty DB always opens");

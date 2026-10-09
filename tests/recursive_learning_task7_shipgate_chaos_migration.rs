@@ -165,7 +165,7 @@ fn legacy_sqlite_forwards_migrates_to_v29_reflection_depth() {
     // legitimate "the column does not yet exist" starting state. This
     // exercises the actual v29 ALTER TABLE in `src/db.rs:973` rather
     // than a hand-rolled minimal-schema fixture.
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let path = tmp.path().to_path_buf();
 
     // Seed under the full v29 schema.
@@ -471,7 +471,7 @@ fn mid_tx_link_write_failure_rolls_back_reflection_memory() {
 // the substrate rolls back the in-flight reflection memory.
 #[test]
 fn mid_tx_target_deletion_rolls_back_reflection_atomically() {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let path = tmp.path().to_path_buf();
     let conn = db::open(&path).expect("open");
 
@@ -562,7 +562,7 @@ fn post_reflect_panic_leaves_reflection_committed_documented_gap() {
     // The reflection is committed BEFORE post_reflect fires. A panic
     // in the handler propagates upward, but the row already landed.
     // We catch the panic at the test layer to verify the row is durable.
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let path = tmp.path().to_path_buf();
 
     // Open a connection used to mint the source memory before the
@@ -639,7 +639,7 @@ fn post_reflect_panic_leaves_reflection_committed_documented_gap() {
 async fn concurrent_reflects_against_same_source_land_independently() {
     use tokio::task;
 
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let path = tmp.path().to_path_buf();
     let src_id = {
         let conn = db::open(&path).expect("open");
@@ -786,7 +786,7 @@ async fn federation_apply_remote_memory_round_trips_reflection_depth() {
     use ai_memory::store::MemoryStore;
     use ai_memory::store::sqlite::SqliteStore;
 
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let path = tmp.path().to_path_buf();
     let store = SqliteStore::open(&path).expect("open sqlite store");
     // #910 — federation catchup is operator-level (peer sync), so the
@@ -847,7 +847,7 @@ async fn federation_apply_remote_link_round_trips_reflects_on_edge() {
     use ai_memory::store::MemoryStore;
     use ai_memory::store::sqlite::SqliteStore;
 
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let path = tmp.path().to_path_buf();
     let store = SqliteStore::open(&path).expect("open sqlite store");
     let ctx = CallerContext::for_agent("test-agent-task7-fed".to_string());

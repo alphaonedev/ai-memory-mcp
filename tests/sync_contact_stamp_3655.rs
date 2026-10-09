@@ -13,6 +13,9 @@
 //! peer while `sync_state` carries nothing — the two claims are different
 //! and are stored apart.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::net::SocketAddr;
 
 use axum::Router;
@@ -69,7 +72,7 @@ async fn spawn_quiet_peer() -> String {
 
 #[tokio::test(flavor = "current_thread")]
 async fn empty_window_stamps_contact_but_not_the_data_watermark_3655() {
-    // A tempdir-scoped database, never a `NamedTempFile` path (#3669).
+    // A tempdir-scoped database, never a `SqliteTempFile` path (#3669).
     let dir = tempfile::tempdir().expect("tempdir");
     let db_path = dir.path().join("sync-3655.db");
     drop(db::open(&db_path).expect("open + migrate"));

@@ -189,7 +189,7 @@ fn sqlite_migration_is_idempotent() {
     // circuits when `MAX(version) >= CURRENT_SCHEMA_VERSION`, and even
     // a forced replay would skip the ADD COLUMN because the column
     // probe finds it already present).
-    let tmp = tempfile::NamedTempFile::new().expect("temp file");
+    let tmp = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("temp file");
     let path = tmp.path().to_path_buf();
 
     let conn1 = db::open(&path).expect("first open");

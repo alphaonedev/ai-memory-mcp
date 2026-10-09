@@ -28,6 +28,7 @@
 //!   - `webhook_fires_on_consolidate`
 //!   - `subscriber_filtered_to_store_does_not_get_delete`
 
+use crate::common::sqlite_tempfile::SqliteTempFile;
 use ai_memory::subscriptions::{
     self, ConsolidatedEventDetails, DeleteEventDetails, LinkCreatedEventDetails, NewSubscription,
     PromoteEventDetails,
@@ -35,14 +36,13 @@ use ai_memory::subscriptions::{
 use rusqlite::Connection;
 use std::path::PathBuf;
 use std::time::Duration;
-use tempfile::NamedTempFile;
 
 mod common;
 use common::tls_receiver::{Recorded, Respond, TlsReceiver};
 
 /// Stand up a fresh on-disk `SQLite` at a tempfile path with the
 /// production schema applied (incl. P5 migration v17).
-fn fresh_db() -> (NamedTempFile, PathBuf) {
+fn fresh_db() -> (SqliteTempFile, PathBuf) {
     // H11 (#628 blocker): loopback webhook URLs are rejected by
     // default. These tests use a loopback receiver, so opt in explicitly
     // for the duration of the test process (an SSRF control — #3705's
@@ -54,7 +54,7 @@ fn fresh_db() -> (NamedTempFile, PathBuf) {
     // retry budget. See
     // `ai_memory::subscriptions::prewarm_dispatch_tls`.
     ai_memory::subscriptions::prewarm_dispatch_tls();
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let p = f.path().to_path_buf();
     let _ = ai_memory::db::open(&p).expect("db::open");
     (f, p)

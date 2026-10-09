@@ -42,6 +42,9 @@
 //! `#[ignore]` twin would be invisible to the PR gate — and this bug
 //! reproduces on plain pgvector (no AGE needed), so the PR gate CAN catch it.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
@@ -197,7 +200,7 @@ fn sqlite_link_valid_until(db_path: &std::path::Path, src: &str, tgt: &str) -> O
 
 #[tokio::test]
 async fn sqlite_owner_invalidates_own_link_2793() {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     let conn = ai_memory::db::open(db_path).expect("open");
     let src = uuid::Uuid::new_v4().to_string();
@@ -219,7 +222,7 @@ async fn sqlite_owner_invalidates_own_link_2793() {
 
 #[tokio::test]
 async fn sqlite_non_owner_refused_2793() {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     let conn = ai_memory::db::open(db_path).expect("open");
     let src = uuid::Uuid::new_v4().to_string();

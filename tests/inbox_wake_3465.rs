@@ -33,6 +33,9 @@
 )]
 #![cfg(feature = "sal")]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -51,7 +54,7 @@ fn uid(prefix: &str) -> String {
 }
 
 fn temp_db() -> std::path::PathBuf {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     std::mem::forget(f);

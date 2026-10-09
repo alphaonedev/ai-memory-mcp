@@ -26,12 +26,15 @@
 #![allow(clippy::redundant_closure_for_method_calls)]
 #![allow(clippy::doc_markdown)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -52,7 +55,7 @@ fn permissive_attestation_for_tests() {
 /// Build a router with `storage_backend = Postgres` but backed by an
 /// `SqliteStore`. This drives every `if matches!(Postgres)` branch
 /// without requiring an actual postgres connection.
-fn build_fake_pg_router() -> (axum::Router, NamedTempFile) {
+fn build_fake_pg_router() -> (axum::Router, SqliteTempFile) {
     build_fake_pg_router_with_admins(Vec::new())
 }
 
@@ -60,16 +63,16 @@ fn build_fake_pg_router() -> (axum::Router, NamedTempFile) {
 /// allowlist, for exercising the admin-bypass branch of a pg-lane authz gate
 /// (e.g. `get_lineage`). Every other wiring detail is identical to
 /// [`build_fake_pg_router`].
-fn build_fake_pg_router_with_admins(admins: Vec<String>) -> (axum::Router, NamedTempFile) {
+fn build_fake_pg_router_with_admins(admins: Vec<String>) -> (axum::Router, SqliteTempFile) {
     build_router_for_backend(StorageBackend::Postgres, admins)
 }
 
 fn build_router_for_backend(
     backend: StorageBackend,
     admins: Vec<String>,
-) -> (axum::Router, NamedTempFile) {
+) -> (axum::Router, SqliteTempFile) {
     permissive_attestation_for_tests();
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
@@ -135,7 +138,7 @@ fn build_router_for_backend(
 }
 
 fn seed_memory_3400(
-    file: &NamedTempFile,
+    file: &SqliteTempFile,
     id: &str,
     namespace: &str,
     tags: &[&str],
@@ -161,7 +164,7 @@ fn seed_memory_3400(
     ai_memory::db::insert(&conn, &memory).expect("insert seed memory");
 }
 
-fn seed_archived_memory_3400(file: &NamedTempFile, id: &str, namespace: &str, tags: &[&str]) {
+fn seed_archived_memory_3400(file: &SqliteTempFile, id: &str, namespace: &str, tags: &[&str]) {
     seed_memory_3400(
         file,
         id,
@@ -173,7 +176,7 @@ fn seed_archived_memory_3400(file: &NamedTempFile, id: &str, namespace: &str, ta
     ai_memory::db::archive_memory(&conn, id, Some("issue-3400")).expect("archive seed memory");
 }
 
-fn seed_namespace_standard_3400(file: &NamedTempFile) {
+fn seed_namespace_standard_3400(file: &SqliteTempFile) {
     let namespace = "policy-3400";
     let id = "standard-3400";
     seed_memory_3400(

@@ -11,9 +11,13 @@
     clippy::cast_possible_wrap
 )]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 use ai_memory::models::{
@@ -26,7 +30,6 @@ use ai_memory::store::{
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -171,12 +174,12 @@ impl MemoryStore for ProbeStore {
     }
 }
 
-fn build_pg_router(store: Arc<dyn MemoryStore>) -> (axum::Router, NamedTempFile) {
+fn build_pg_router(store: Arc<dyn MemoryStore>) -> (axum::Router, SqliteTempFile) {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     // SAFETY: Once-gated process-global env write for unsigned test stores.
     REQUIRE_ATTESTATION_OFF
         .call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen");

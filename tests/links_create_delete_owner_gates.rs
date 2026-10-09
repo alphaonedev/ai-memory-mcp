@@ -9,15 +9,18 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::doc_markdown)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -181,7 +184,7 @@ async fn delete_link_as(
 
 #[tokio::test]
 async fn bob_cannot_create_link_rooted_at_alice_memory_941() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let alice_src = seed_memory(tmp.path(), "ai:alice", "link-gate/test", &json!({}));
     let target = seed_memory(tmp.path(), "ai:alice", "link-gate/test", &json!({}));
     let router = build_router_fixture(tmp.path());
@@ -195,7 +198,7 @@ async fn bob_cannot_create_link_rooted_at_alice_memory_941() {
 
 #[tokio::test]
 async fn owner_can_create_own_link_941() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let alice_src = seed_memory(tmp.path(), "ai:alice", "link-gate/own", &json!({}));
     let target = seed_memory(tmp.path(), "ai:alice", "link-gate/own", &json!({}));
     let router = build_router_fixture(tmp.path());
@@ -209,7 +212,7 @@ async fn owner_can_create_own_link_941() {
 
 #[tokio::test]
 async fn bob_cannot_delete_alice_link_939() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let alice_src = seed_memory(tmp.path(), "ai:alice", "link-gate/del", &json!({}));
     let alice_tgt = seed_memory(tmp.path(), "ai:alice", "link-gate/del", &json!({}));
     let router = build_router_fixture(tmp.path());
@@ -225,7 +228,7 @@ async fn bob_cannot_delete_alice_link_939() {
 
 #[tokio::test]
 async fn either_endpoint_owner_can_delete_link_939() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let alice_src = seed_memory(tmp.path(), "ai:alice", "link-gate/del2", &json!({}));
     let bob_tgt = seed_memory(tmp.path(), "ai:bob", "link-gate/del2", &json!({}));
     let router = build_router_fixture(tmp.path());

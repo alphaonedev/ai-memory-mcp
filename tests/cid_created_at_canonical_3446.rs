@@ -31,6 +31,9 @@
 //!   --test cid_created_at_canonical_3446                                 # + live pg
 //! ```
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::identity::cid;
 use ai_memory::models::{Memory, Tier};
 
@@ -76,7 +79,7 @@ fn legacy_preimage_commits_raw_text(a: &str, b: &str) -> bool {
 /// so this arm is the control for the postgres one below.)
 #[test]
 fn sqlite_remint_from_the_persisted_row_reproduces_the_cid_3446() {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("db::open");
 
     let mem = cid_memory("m-3446-sqlite", "cid3446", NANOS_STAMP);
@@ -142,7 +145,7 @@ fn a_different_instant_still_changes_the_cid_3446() {
 /// `verify_cid` recomputes from the stored BLOB, never from the row's fields.
 #[test]
 fn stored_genesis_stays_authoritative_3446() {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("db::open");
     let mem = cid_memory("m-3446-genesis", "cid3446", NANOS_STAMP);
     ai_memory::db::insert(&conn, &mem).expect("insert");

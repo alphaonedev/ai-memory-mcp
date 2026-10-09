@@ -26,12 +26,15 @@
 
 #![cfg(feature = "sal")]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -96,7 +99,7 @@ fn fixture_link() -> MemoryLink {
     }
 }
 
-fn build_router(backend: StorageBackend) -> (axum::Router, NamedTempFile) {
+fn build_router(backend: StorageBackend) -> (axum::Router, SqliteTempFile) {
     router_with(backend, None, None)
 }
 
@@ -104,8 +107,8 @@ fn router_with(
     backend: StorageBackend,
     store_override: Option<Arc<dyn ai_memory::store::MemoryStore>>,
     embedder: Option<ai_memory::embeddings::Embedder>,
-) -> (axum::Router, NamedTempFile) {
-    let f = NamedTempFile::new().expect("tempfile");
+) -> (axum::Router, SqliteTempFile) {
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = db::open(&db_path).expect("db::open");
     seed(&db_path);
@@ -407,7 +410,7 @@ mod live_pg {
             .connect(&url)
             .await
             .expect("fixture pool");
-        let f = NamedTempFile::new().unwrap();
+        let f = SqliteTempFile::new().unwrap();
         seed(f.path());
         let conn = db::open(f.path()).unwrap();
         let ctx = CallerContext::for_agent(CALLER);

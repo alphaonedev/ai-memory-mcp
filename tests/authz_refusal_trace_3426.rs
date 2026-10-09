@@ -18,11 +18,14 @@
 
 #![cfg(feature = "sal")]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::{Arc, Mutex};
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::models::{Memory, MemoryScope, Tier};
 use ai_memory::store::{CallerContext, MemoryStore, StoreError, UpdatePatch};
-use tempfile::NamedTempFile;
 
 const OWNER: &str = "ai:alice-3426-trace";
 const INTRUDER: &str = "ai:bob-3426-trace";
@@ -47,7 +50,7 @@ impl std::io::Write for Capture {
 
 #[tokio::test]
 async fn cross_owner_refusal_reaches_authz_trace_with_owner_3426() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let id = {
         let conn = ai_memory::db::open(tmp.path()).expect("db::open");
         let now = chrono::Utc::now().to_rfc3339();

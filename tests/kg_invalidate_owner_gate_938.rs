@@ -51,15 +51,18 @@
 //!    recipient can invalidate edges anchored to it (same semantic
 //!    as `store::is_visible_to_caller`).
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -236,7 +239,7 @@ async fn invalidate_as(
 
 #[tokio::test]
 async fn bob_cannot_invalidate_alice_link_938() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     let alice_src = seed_memory(db_path, "alice", "shared-938/a", &json!({}));
     let alice_tgt = seed_memory(db_path, "alice", "shared-938/a", &json!({}));
@@ -285,7 +288,7 @@ async fn bob_cannot_invalidate_alice_link_938() {
 
 #[tokio::test]
 async fn owner_can_invalidate_own_link_938() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     let alice_src = seed_memory(db_path, "alice", "shared-938/b", &json!({}));
     let alice_tgt = seed_memory(db_path, "alice", "shared-938/b", &json!({}));
@@ -312,7 +315,7 @@ async fn owner_can_invalidate_own_link_938() {
 
 #[tokio::test]
 async fn missing_source_returns_404_938() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     // Seed only the target; the source is never created so the owner
     // gate's pre-check hits the "source not found" branch.
@@ -335,7 +338,7 @@ async fn missing_source_returns_404_938() {
 
 #[tokio::test]
 async fn inbox_target_can_invalidate_938() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     // Carol sent alice an inbox-style memory: sender = carol,
     // target_agent_id = alice. Alice is the legitimate

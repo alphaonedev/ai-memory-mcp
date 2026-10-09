@@ -16,14 +16,18 @@
     clippy::doc_markdown
 )]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::TempDir;
 use tower::ServiceExt as _;
 
 const ADMIN_CALLER: &str = "ai:ops-admin";
@@ -42,11 +46,11 @@ fn fresh_dir() -> TempDir {
     tempfile::tempdir_in(&root).expect("tempdir under .local-runs")
 }
 
-fn build_app_fixture() -> (AppState, NamedTempFile) {
+fn build_app_fixture() -> (AppState, SqliteTempFile) {
     // Authenticated-deployment posture so admin header role-claims
     // resolve (#1570) — same as tests/share_http_route_1095.rs.
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
@@ -114,7 +118,7 @@ fn router_for_state(app_state: AppState) -> axum::Router {
     ai_memory::build_router(api_key_state, app_state)
 }
 
-fn build_router_fixture() -> (axum::Router, NamedTempFile) {
+fn build_router_fixture() -> (axum::Router, SqliteTempFile) {
     let (state, f) = build_app_fixture();
     (router_for_state(state), f)
 }

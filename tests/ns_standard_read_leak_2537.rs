@@ -51,15 +51,18 @@
 //!   caller's own same-namespace standard is injected verbatim.
 //! - `caller = None` (single-tenant MCP stdio) is byte-identical to pre-fix.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -479,7 +482,7 @@ async fn session_start_as(router: &axum::Router, ns: &str, agent: &str) -> (Stat
 
 #[tokio::test]
 async fn http_session_start_withholds_cross_namespace_private_standard_2537() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     {
         let conn = ai_memory::db::open(tmp.path()).expect("open");
         seed_cross_namespace_bind(&conn, None);
@@ -500,7 +503,7 @@ async fn http_session_start_withholds_cross_namespace_private_standard_2537() {
 
 #[tokio::test]
 async fn http_session_start_still_injects_visible_shared_standard_2537() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     {
         let conn = ai_memory::db::open(tmp.path()).expect("open");
         seed_cross_namespace_bind(&conn, Some("shared"));

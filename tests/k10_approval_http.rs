@@ -66,7 +66,8 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
     // backing file is harmless.
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+        let tmp = crate::common::sqlite_tempfile::SqliteTempFile::new()
+            .expect("tempfile for SqliteStore");
         let p = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         std::sync::Arc::new(

@@ -22,9 +22,13 @@
     clippy::similar_names
 )]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 use ai_memory::models::Action;
@@ -32,7 +36,6 @@ use ai_memory::store::MemoryStore;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
-use tempfile::NamedTempFile;
 use tokio::sync::{Mutex, RwLock};
 use tower::ServiceExt as _;
 
@@ -137,7 +140,7 @@ async fn post_json(router: axum::Router, uri: &str, body: serde_json::Value) -> 
 /// HTTP transition with `claimed_by` that is not the live lease holder is 403.
 #[tokio::test]
 async fn http_transition_claimed_by_not_holder() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("init schema");
     seed_action_with_lease(&db_path, "act-3226", "ai:w1");
@@ -184,7 +187,7 @@ async fn http_transition_claimed_by_not_holder() {
 /// intact. Pre-fix it was 200 with `claimed_by: null`.
 #[tokio::test]
 async fn http_transition_without_claimed_by_on_leased_action_is_refused_3360() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("init schema");
     seed_action_with_lease(&db_path, "act-3360", "ai:alice");
@@ -251,7 +254,7 @@ async fn http_transition_without_claimed_by_on_leased_action_is_refused_3360() {
 /// HTTP `POST /signals` rejects an unknown `signal_type` (MCP A6-13 parity).
 #[tokio::test]
 async fn http_send_signal_rejects_unknown_signal_type() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("init schema");
     let router = build_sqlite_router(&db_path);

@@ -42,15 +42,18 @@
 //!    a live inbox row whose `metadata.target_agent_id == "alice"`
 //!    (mirrors the `is_visible_to_caller` carve-out).
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -217,7 +220,7 @@ async fn archive_as(
 
 #[tokio::test]
 async fn bob_cannot_archive_alice_live_row_940() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     let id = seed_live(db_path, "alice", "shared-940/a", &json!({}));
     assert_eq!(live_row_count(db_path), 1);
@@ -257,7 +260,7 @@ async fn bob_cannot_archive_alice_live_row_940() {
 
 #[tokio::test]
 async fn owner_can_archive_own_live_row_940() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     let id = seed_live(db_path, "alice", "shared-940/b", &json!({}));
     assert_eq!(live_row_count(db_path), 1);
@@ -284,7 +287,7 @@ async fn owner_can_archive_own_live_row_940() {
 
 #[tokio::test]
 async fn mixed_batch_only_archives_owner_rows_940() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     let alice_id = seed_live(db_path, "alice", "shared-940/a", &json!({}));
     let bob_id = seed_live(db_path, "bob", "shared-940/b", &json!({}));
@@ -342,7 +345,7 @@ async fn mixed_batch_only_archives_owner_rows_940() {
 
 #[tokio::test]
 async fn inbox_target_can_archive_inbox_row_940() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     // Carol sent alice an inbox message; the live row carries
     // `metadata.agent_id = "carol"` (sender) and

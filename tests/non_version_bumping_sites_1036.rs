@@ -41,11 +41,14 @@
 
 #![allow(clippy::similar_names)] // `conn` + `conf` flagged; intentional in this short test.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use ai_memory::db;
 use ai_memory::models::Memory;
 
 fn fresh_db_conn() -> rusqlite::Connection {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let path = tmp.path().to_path_buf();
     std::mem::forget(tmp);
     db::open(&path).expect("open fresh DB")

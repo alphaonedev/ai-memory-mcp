@@ -32,6 +32,9 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::doc_markdown)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -99,8 +102,8 @@ impl Drop for NamespaceScopeGuard {
 // Router scaffolding (sqlite) — mirrors tests/cov3_handlers_sqlite.rs.
 // ---------------------------------------------------------------------------
 
-fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile) {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+fn sqlite_router() -> (axum::Router, crate::sqlite_tempfile::SqliteTempFile) {
+    let db_tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

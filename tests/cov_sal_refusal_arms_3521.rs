@@ -29,6 +29,9 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::too_many_lines)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
@@ -142,8 +145,8 @@ impl MemoryStore for RefusingStore {
     }
 }
 
-fn build_sal_router(stop: StopProbe) -> (axum::Router, tempfile::NamedTempFile) {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+fn build_sal_router(stop: StopProbe) -> (axum::Router, crate::sqlite_tempfile::SqliteTempFile) {
+    let f = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
     let db: Db = Arc::new(Mutex::new((conn, db_path, ResolvedTtl::default(), true)));

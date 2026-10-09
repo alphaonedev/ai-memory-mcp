@@ -60,12 +60,15 @@
     clippy::doc_markdown
 )]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier, namespace::MemoryScope};
 use ai_memory::store::{CallerContext, Filter, MemoryStore, sqlite::SqliteStore};
 use serde_json::json;
-use tempfile::NamedTempFile;
 
 /// `as_agent` doubles as the namespace prefix for the
 /// `visibility_clause` placeholder binds — the row lives in this exact
@@ -114,8 +117,8 @@ fn make_private(id: &str, owner: &str) -> Memory {
 
 /// Seed alice's `scope=private` row in `NS`, returning a live store and
 /// its backing tempfile (kept alive for the test duration).
-async fn fixture() -> (Arc<dyn MemoryStore>, NamedTempFile, String) {
-    let f = NamedTempFile::new().expect("tempfile");
+async fn fixture() -> (Arc<dyn MemoryStore>, SqliteTempFile, String) {
+    let f = SqliteTempFile::new().expect("tempfile");
     let store: Arc<dyn MemoryStore> =
         Arc::new(SqliteStore::open(f.path()).expect("open SqliteStore"));
     // The seeding ctx is irrelevant to visibility — SqliteStore::store

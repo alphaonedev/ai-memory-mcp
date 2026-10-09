@@ -29,6 +29,9 @@
 //! the strict/permissive knob, and the peer-enrollment posture from the
 //! process-global environment, so every case runs under one async mutex.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -145,7 +148,7 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
         true,
     )));
     let store: Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+        let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile for SqliteStore");
         let p = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"))
@@ -427,7 +430,7 @@ async fn divergent_resolution_conflicts_first_wins() {
 /// sequence lands against one substrate).
 fn router_sharing_db(db: &ai_memory::handlers::Db) -> axum::Router {
     let store: Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("tempfile");
         let p = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         Arc::new(ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"))

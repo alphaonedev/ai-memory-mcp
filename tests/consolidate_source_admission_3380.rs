@@ -1,6 +1,10 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 //! #3380: source admission before summaries and destructive consolidation.
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 use ai_memory::models::{Memory, Tier};
@@ -10,19 +14,18 @@ use axum::{
 };
 use serde_json::{Value, json};
 use std::sync::Arc;
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 const CALLER: &str = "ai:consolidator3380";
 struct Fixture {
     router: axum::Router,
-    file: NamedTempFile,
+    file: SqliteTempFile,
     #[cfg(feature = "sal-postgres")]
     pg: Option<Arc<ai_memory::store::postgres::PostgresStore>>,
 }
 #[cfg_attr(not(feature = "sal-postgres"), allow(clippy::unused_async))]
 async fn fixture(pg_url: Option<&str>) -> Fixture {
-    let file = NamedTempFile::new().expect("tempfile");
+    let file = SqliteTempFile::new().expect("tempfile");
     let db_path = file.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("open SQLite");
     let db: Db = Arc::new(Mutex::new((
@@ -66,7 +69,7 @@ async fn fixture(pg_url: Option<&str>) -> Fixture {
     )
 }
 fn build(
-    file: NamedTempFile,
+    file: SqliteTempFile,
     db: Db,
     storage_backend: StorageBackend,
     #[cfg(feature = "sal")] store: Arc<dyn ai_memory::store::MemoryStore>,

@@ -137,9 +137,9 @@ fn permissive_attestation_for_tests() {
 /// Production router over a fresh on-disk sqlite DB. The legacy `app.db`
 /// connection and the SAL `SqliteStore` open the SAME path so a seed via
 /// either surface is visible through the other.
-fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile) {
+fn sqlite_router() -> (axum::Router, crate::common::sqlite_tempfile::SqliteTempFile) {
     permissive_attestation_for_tests();
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+    let db_tmp = crate::common::sqlite_tempfile::SqliteTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
     let db: Db = Arc::new(AsyncMutex::new((
@@ -177,7 +177,8 @@ fn fake_pg_router() -> (axum::Router, std::path::PathBuf) {
         ResolvedTtl::default(),
         true,
     )));
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+    let tmp =
+        crate::common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile for SqliteStore");
     let store_path = tmp.path().to_path_buf();
     std::mem::forget(tmp);
     let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(

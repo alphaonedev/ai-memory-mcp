@@ -24,6 +24,9 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::await_holding_lock)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -43,7 +46,7 @@ use ai_memory::identity::keypair as kp_mod;
 struct Fixture {
     router: axum::Router,
     alice: kp_mod::AgentKeypair,
-    _db_tmp: tempfile::NamedTempFile,
+    _db_tmp: crate::sqlite_tempfile::SqliteTempFile,
     _key_tmp: TempDir,
 }
 
@@ -56,7 +59,7 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 fn setup() -> Fixture {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+    let db_tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
@@ -337,7 +340,7 @@ async fn sync_since_mtls_bypass_still_requires_signature_under_require_sig_1040(
     }
     // Custom setup that sets mtls_enforced=true to exercise the
     // bypass path. Same shape as `setup()` otherwise.
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+    let db_tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

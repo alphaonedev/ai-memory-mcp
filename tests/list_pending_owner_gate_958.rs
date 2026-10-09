@@ -52,15 +52,18 @@
 //!    table row count, so a non-admin caller cannot probe the
 //!    queue depth of other tenants.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use rusqlite::params;
 use serde_json::Value;
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -191,7 +194,7 @@ fn requested_by_set(body: &Value) -> Vec<String> {
 
 #[tokio::test]
 async fn non_admin_caller_sees_only_own_pending_958() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     seed_pending(db_path, "p-alice-1", "alice", "ns-a");
     seed_pending(db_path, "p-bob-1", "bob", "ns-b");
@@ -235,7 +238,7 @@ async fn non_admin_caller_sees_only_own_pending_958() {
 
 #[tokio::test]
 async fn admin_caller_sees_every_pending_958() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     seed_pending(db_path, "p-alice-1", "alice", "ns-a");
     seed_pending(db_path, "p-bob-1", "bob", "ns-b");
@@ -270,7 +273,7 @@ async fn admin_caller_sees_every_pending_958() {
 
 #[tokio::test]
 async fn missing_agent_id_header_sees_no_pending_958() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     seed_pending(db_path, "p-alice-1", "alice", "ns-a");
     seed_pending(db_path, "p-bob-1", "bob", "ns-b");
@@ -297,7 +300,7 @@ async fn missing_agent_id_header_sees_no_pending_958() {
 
 #[tokio::test]
 async fn owner_scope_field_present_958() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     seed_pending(db_path, "p-alice-1", "alice", "ns-a");
 
@@ -322,7 +325,7 @@ async fn owner_scope_field_present_958() {
 
 #[tokio::test]
 async fn count_matches_filtered_payload_958() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     // Seed 1 row for alice + 5 rows for bob.
     seed_pending(db_path, "p-alice-1", "alice", "ns-a");
@@ -397,7 +400,7 @@ async fn count_matches_filtered_payload_958() {
 
 #[tokio::test]
 async fn legacy_response_shape_preserved_958() {
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path();
     seed_pending(db_path, "p-alice-1", "alice", "ns-a");
 

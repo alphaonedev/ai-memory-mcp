@@ -28,13 +28,16 @@
 //! `--features sal` — mirrors `tests/cov_handlers_llm_wired_1660.rs`.
 #![cfg(feature = "sal")]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::{Mutex, RwLock};
 use tower::ServiceExt as _;
 use wiremock::matchers::{method, path};
@@ -63,9 +66,9 @@ fn permissive_attestation_for_tests() {
 fn build_autotag_router(
     llm_url: &str,
     autonomous_hooks: bool,
-) -> (axum::Router, NamedTempFile, Db) {
+) -> (axum::Router, SqliteTempFile, Db) {
     permissive_attestation_for_tests();
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SqliteTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
     let db: Db = Arc::new(Mutex::new((

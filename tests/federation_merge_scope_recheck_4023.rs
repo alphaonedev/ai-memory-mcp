@@ -27,6 +27,9 @@
 #![allow(clippy::too_many_lines)]
 #![allow(clippy::doc_markdown)]
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -220,7 +223,7 @@ async fn stale_scope_verdict_refused_after_concurrent_move_sqlite_4023() {
     let secure_ns = uniq("secure/ops");
     set_scoped_posture(&peer, &public_root);
 
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+    let db_tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     std::mem::forget(db_tmp);
     let conn = ai_memory::db::open(&db_path).expect("db::open");
@@ -554,7 +557,7 @@ async fn assert_typed_refusal(backend: &str, store: &dyn MemoryStore) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn merge_refusal_is_permission_denied_variant_sqlite_4023() {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+    let db_tmp = crate::sqlite_tempfile::SqliteTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     std::mem::forget(db_tmp);
     drop(ai_memory::db::open(&db_path).expect("db::open"));
