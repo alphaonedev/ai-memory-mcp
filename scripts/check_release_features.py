@@ -380,7 +380,7 @@ INLINE_USE_RE = re.compile(r"\$\(\s*bash [^)]*release-features\.sh|`\s*bash [^`]
 # space other than U+0020 (NBSP, ogham, en/em..., narrow NBSP, math space,
 # ideographic), zero-width characters and the BOM, line/paragraph separators.
 CONTROL_RE = re.compile(
-    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u00a0\u1680\u180e\u2000-\u200f\u2028-\u202f\u205f-\u2064\u3000\ufeff]"
+    r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u00a0\u1680\u180e\u2000-\u200f\u2028-\u202f\u205f-\u2064\u3000\ufeff]"
 )
 KEY_RE = re.compile(r"(?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?: +(?P<val>.*))?")
 ITEM_RE = re.compile(r"-(?P<sp> *)(?P<rest>.*)")
