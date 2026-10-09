@@ -599,6 +599,20 @@ class PruneScript6118(unittest.TestCase):
                    and not rel.startswith("debug/.fingerprint/"))
         self.assertEqual(sum(s for _r, s, _e, _d in self.LAYOUT) - kept, self._freed(proc.stdout))
 
+    def test_6118_hardlinked_uplift_copy_is_kept_and_not_counted(self) -> None:
+        # cargo "uplifts" a bin by hard-linking debug/deps/<bin>-<hash> to
+        # debug/<bin>. Deleting the deps side frees nothing while the uplift
+        # exists, so the script keeps it and does not count it as freed.
+        src = self.target / "debug" / "deps" / "ai_memory-bin-1111"
+        _write(src, 4096, True)
+        os.link(src, self.target / "debug" / "ai-memory-bin")
+        proc = self._run("--target-dir", str(self.target))
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertEqual(self._expected_freed(), self._freed(proc.stdout))
+        self.assertTrue(src.exists())
+        self.assertTrue((self.target / "debug" / "ai-memory-bin").exists())
+        self.assertIn("hard-linked", proc.stdout)
+
     def test_6118_missing_profile_subdirs_are_not_an_error(self) -> None:
         import shutil
         shutil.rmtree(self.target / "debug" / "incremental")
