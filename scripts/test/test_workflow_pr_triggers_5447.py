@@ -3553,33 +3553,54 @@ class CarrierRangeConsumed6117(unittest.TestCase):
         self.assertEqual(4, len(problems), problems)
 
 
-REQUIRED_SET_WORKFLOWS_6117 = ("ci.yml", "c8-precheck.yml", "coverage.yml", "cert-postgres-age.yml",
-                               "postgres-ignored.yml", "release-shape.yml")
 BEFORE_EXPR_OK = (
     "${{ steps.carrier.outputs.before || github.event.before }}",
     "${{ github.event.pull_request.base.sha || steps.carrier.outputs.before || github.event.before }}",
 )
 # The two classify steps read the bare push `before` only AFTER their carrier arm has
 # exited with docs_only=false (pinned by CarrierRangeConsumed6117), so they never see a
-# carrier push.  Any other bare consumer is a gate that narrows a carrier push.
+# carrier push.  Any other bare consumer is a gate that narrows a carrier push.  The
+# exemption is by POSITION (#6260): an occurrence is exempt only when it lies inside the
+# classify job of the file that names it, not when the file merely contains one.
 BEFORE_CLASSIFY_OK = {
     "ci.yml": ("${{ github.event.before }}",),
     "coverage.yml": ("${{ github.event.before }}",),
 }
+# `${{ github.event.before }}` and its bracket spellings.
+BEFORE_ANY_RE = re.compile(
+    r"\$\{\{[^}]*github\.event(?:\.before|\[\s*['\"]before['\"]\s*\])[^}]*\}\}")
+# Any other way to reach the push `before` sha: the raw event payload file or a whole-event dump.
+# The one reader below is the geometry verdict step, which has its own carrier arm (pinned
+# by CarrierPushGeometry6117).
+EVENT_PAYLOAD_RE = re.compile(r"GITHUB_EVENT_PATH|github\.event_path|toJSON\(\s*github\.event\s*\)")
+EVENT_PAYLOAD_OK = ('bash scripts/check-promotion-geometry.sh --github-event "$GITHUB_EVENT_PATH"',)
+
+
+def _classify_span(text: str) -> Tuple[int, int]:
+    """The (start, end) character offsets of the classify job in ``text`` ((0, 0) when absent)."""
+    if "\n  classify:\n" not in text:
+        return 0, 0
+    body = _job_text(text, "classify")
+    start = text.index(body)
+    return start, start + len(body)
 
 
 def _bare_before_consumers(texts: Dict[str, str]) -> List[str]:
-    """Every ``${{ ... github.event.before ... }}`` expression that has no carrier fallback."""
+    """Every read of the push ``before`` sha that has no carrier fallback, in any workflow."""
     bad: List[str] = []
     for name, text in texts.items():
-        for m in re.finditer(r"\$\{\{[^}]*github\.event\.before[^}]*\}\}", text):
+        lo, hi = _classify_span(text)
+        for m in BEFORE_ANY_RE.finditer(text):
             expr = m.group(0)
             if expr in BEFORE_EXPR_OK:
                 continue
-            if expr in BEFORE_CLASSIFY_OK.get(name, ()) and _job_text(text, "classify").find(expr) >= 0:
+            if expr in BEFORE_CLASSIFY_OK.get(name, ()) and lo <= m.start() < hi:
                 continue
             line = text.count("\n", 0, m.start()) + 1
             bad.append(f"{name}:{line}: {expr}")
+        for lineno, row in enumerate(text.splitlines(), 1):
+            if EVENT_PAYLOAD_RE.search(row) and not any(ok in row for ok in EVENT_PAYLOAD_OK):
+                bad.append(f"{name}:{lineno}: reads the raw event payload: {row.strip()}")
     return bad
 
 
@@ -3587,7 +3608,7 @@ class CarrierBeforeClosedWorld6117(unittest.TestCase):
     """Cloud F1 / vote 4d3ea1c5 testability lens: a fifth range consumer needs the carrier fallback."""
 
     def texts(self) -> Dict[str, str]:
-        return {n: (WORKFLOWS / n).read_text(encoding="utf-8") for n in REQUIRED_SET_WORKFLOWS_6117}
+        return _all_workflow_texts()
 
     def test_6117_r3_f1_every_github_event_before_has_the_carrier_fallback(self) -> None:
         self.assertEqual([], _bare_before_consumers(self.texts()))
