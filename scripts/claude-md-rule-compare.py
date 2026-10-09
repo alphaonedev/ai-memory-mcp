@@ -5,8 +5,13 @@ Run by .github/workflows/claude-md-rule-compare.yml from the BASE branch (pull_r
 request head is DATA: with --pr-number this base script fetches `refs/pull/<N>/head` as git objects (no workflow
 step fetches or checks out the head, #6163), and its CLAUDE.md and the two docs/reference files are read out of git
 objects with `git ls-tree` and `git cat-file` into a scratch directory. Nothing from the head is executed, imported
-or checked out, and a symlink blob (mode 120000) at any of the three paths is refused. A credential-shaped value in
-the head text is masked in the summary (#6163); the verdict is computed on the unmasked text.
+or checked out, and a symlink blob (mode 120000) at any of the three paths is refused. Credential-shaped head text is
+masked in the summary where it enters the report (#6163): a `name=value` / `name: value` whose name holds a password,
+passphrase, secret, token, API key, access key, private key or credential word (quoted, multi-word and JSON-quoted
+forms included; a count, a switch word or an UPPER_SNAKE environment variable name is shown unless the name is a
+password or passphrase), URL userinfo, an Authorization Bearer/Basic value, a GitHub, AWS access key id, Slack or
+`sk-` provider token, and a PEM or PGP private key block. Lines this script writes are never masked, and the verdict
+is computed on the unmasked text.
 
 The BASE guard (scripts/check-claude-md-size.py of the base checkout) and the BASE manifest
 (scripts/qc-allowlists/claude-md-rule-sections.sha256) then judge the head copies:
@@ -84,13 +89,24 @@ DIFF_LINE_CAP = 200
 # #6163: the pull request number that names the head refspec; a decimal with no leading zero, ASCII only, at most ten
 # digits, so nothing but `refs/pull/<N>/head` can reach the fetch.
 PR_NUMBER = re.compile(r"[1-9][0-9]{0,9}", re.ASCII)
-# #6163: a credential-shaped `name=value` / `name: value` in head text, and a PEM private key block. The summary is a
-# public job log; the masked value is still a rule change (the verdict is computed before masking).
+# #6163: credential-shaped head text. The summary is a public job log; the masked value is still a rule change (the
+# verdict is computed before masking). Groups: 1 the name, 2 its separator (an optional closing quote or backtick,
+# then `:` or `=`), 3/4 a double/single-quoted value, 5 an unquoted run of words up to a quote, a backtick or the end of
+# the line, so `password = a b` masks both words.
 CREDENTIAL_VALUE = re.compile(
     r"(?i)(?<![\w-])([\w-]*(?:passw(?:or)?d|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|"
-    r"credential)[\w-]*\s*[:=]\s*[\"']?)([^\s\"'`]+)")
-PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
-PRIVATE_KEY_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY-----")
+    r"credential)[\w-]*)([\"'`]?\s*[:=]\s*)(?:\"([^\"\n]*)\"|'([^'\n]*)'|([^\s\"'`]+(?:[ \t]+[^\s\"'`]+)*))")
+# #6163 round 2: a value that is a count, a switch word or an UPPER_SNAKE environment variable name is configuration,
+# not a credential (a ceiling change in rule text must stay readable). A password or passphrase is masked regardless.
+PLAIN_VALUE = re.compile(r"(?:\d+(?:[.,_]\d+)*|true|false|yes|no|on|off|enabled|disabled|none|null|"
+                         r"[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)[.,;:)\]}]*", re.ASCII)
+ALWAYS_MASK_NAME = re.compile(r"(?i)passw(?:or)?d|passphrase")
+URL_USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]+:([^@\s/]+)@")
+BEARER_VALUE = re.compile(r"(?i)\b(?:bearer|basic)\s+([A-Za-z0-9._~+/-]{8,}=*)")
+PROVIDER_KEY_SHAPE = re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,}|(?:AKIA|ASIA)[0-9A-Z]{16}|"
+                                r"xox[abposr]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{20,})\b")
+PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----")
+PRIVATE_KEY_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----")
 MASK = "[MASKED]"
 MAX_BLOB_BYTES = 2 * 1024 * 1024  # far above any legitimate file; refuses a memory-exhaustion blob
 # Messages of the base guard that the section comparison already reports in its own words.
@@ -203,33 +219,77 @@ def head_fetch_args(pr_number: str) -> tuple:
     return ("fetch", "--no-tags", "origin", f"+refs/pull/{pr_number}/head:refs/remotes/pull/head")
 
 
-def redact_credentials(report: str) -> str:
-    """#6163: mask credential-shaped values and private key blocks in the summary text. When anything is masked the
-    report says so, so a masked rule change stays loud; the pull request diff shows the raw text."""
-    out = []
-    masked = 0
-    in_key = False
-    for line in report.split("\n"):
-        if in_key or PRIVATE_KEY_BEGIN.search(line):
-            in_key = not PRIVATE_KEY_END.search(line)
-            masked += 1
-            out.append(line[:1] + MASK if line[:1] in "+- " else MASK)
+def mask_named_values(line: str) -> tuple:
+    """#6163: mask the value of every credential-named `name=value` / `name: value` in one line; returns (line, count).
+    A plain value (PLAIN_VALUE) is left visible unless the name is a password or passphrase."""
+    out, pos, count = [], 0, 0
+    while True:
+        match = CREDENTIAL_VALUE.search(line, pos)
+        if match is None:
+            break
+        group = next(index for index in (3, 4, 5) if match.group(index) is not None)
+        value = match.group(group)
+        first = value.split()[0] if value.split() else ""
+        plain = (group == 5 and first or value.strip())
+        if not value.strip() or (not ALWAYS_MASK_NAME.search(match.group(1)) and PLAIN_VALUE.fullmatch(plain)):
+            stop = match.start(group) + (len(first) if group == 5 else len(value) + 1)
+            out.append(line[pos:stop])
+            pos = stop
             continue
-        line, count = CREDENTIAL_VALUE.subn(lambda match: match.group(1) + MASK, line)
-        masked += count
-        out.append(line)
-    if masked:
-        out.insert(-1 if out and out[-1] == "" else len(out),
-                   f"NOTE: {masked} credential-shaped value(s) masked in this summary (#6163); the pull request "
-                   "diff shows the raw text and the verdict was computed on it.")
-    return "\n".join(out)
+        out.append(line[pos:match.start(group)] + MASK)
+        pos = match.end(group)
+        count += 1
+    out.append(line[pos:])
+    return "".join(out), count
 
 
-def unified(old: str, new: str, key: str) -> str:
+def mask_group(pattern, line: str) -> tuple:
+    """Replace group 1 of every `pattern` match in `line` with MASK; returns (line, count)."""
+    def replace(match):
+        start, stop = match.span(1)
+        return match.group(0)[:start - match.start()] + MASK + match.group(0)[stop - match.start():]
+    return pattern.subn(replace, line)
+
+
+class Redactor:
+    """#6163: masks credential-shaped HEAD text at the point it enters the report (one diff block or one inline span
+    per call) and counts what it masked. The private key state never outlives one call, so an unterminated BEGIN line
+    masks the rest of its own block only; lines the script writes itself never pass through here."""
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def mask(self, text: str, in_key: bool = False) -> str:
+        """Mask `text`; `in_key` starts the block inside a private key (a section whose heading is a BEGIN line)."""
+        out = []
+        for line in text.split("\n"):
+            if in_key or PRIVATE_KEY_BEGIN.search(line):
+                in_key = not PRIVATE_KEY_END.search(line)
+                self.count += 1
+                out.append(line[:1] + MASK if line[:1] in "+- " else MASK)
+                continue
+            line, found = mask_named_values(line)
+            self.count += found
+            for pattern in (URL_USERINFO, BEARER_VALUE, PROVIDER_KEY_SHAPE):
+                line, found = mask_group(pattern, line)
+                self.count += found
+            out.append(line)
+        return "\n".join(out)
+
+    def note(self) -> list:
+        if not self.count:
+            return []
+        return [f"NOTE: {self.count} credential-shaped value(s) masked in this summary (#6163); the pull request "
+                "diff shows the raw text and the verdict was computed on it."]
+
+
+def unified(old: str, new: str, key: str, redactor=None) -> str:
     diff = list(difflib.unified_diff(old.split("\n"), new.split("\n"), "base", "head", lineterm="", n=2))
-    if len(diff) > DIFF_LINE_CAP:
-        diff = diff[:DIFF_LINE_CAP] + [f"... diff truncated at {DIFF_LINE_CAP} lines"]
-    return "\n".join(diff)
+    truncated = len(diff) > DIFF_LINE_CAP
+    body = "\n".join(diff[:DIFF_LINE_CAP])
+    if redactor is not None:
+        body = redactor.mask(body, bool(PRIVATE_KEY_BEGIN.search(key)) and not PRIVATE_KEY_END.search(key))
+    return body + (f"\n... diff truncated at {DIFF_LINE_CAP} lines" if truncated else "")
 
 
 def approvals(repo: Path, base_sha: str, head_sha: str) -> list:
@@ -266,6 +326,7 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
     base_bodies = section_texts(guard, base_text)
 
     lines = ["## CLAUDE.md rule-change comparison (base manifest vs pull request head)", ""]
+    redactor = Redactor()
     rule_changed = False
     count_changed = False
     for key in sorted(set(pinned) | set(head_hashes)):
@@ -278,20 +339,20 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
         if old is not None and new is not None and key.startswith(CENSUS_SECTION) and (
                 CENSUS_DIGITS.split(old) == CENSUS_DIGITS.split(new)):
             count_changed = True
-            lines += [f"### COUNT CHANGED: {span(key)}", "", "Only census counts differ.", ""] + fenced(
-                unified(old, new, key)) + [""]
+            lines += [f"### COUNT CHANGED: {span(redactor.mask(key))}", "", "Only census counts differ.", ""] + fenced(
+                unified(old, new, key, redactor)) + [""]
         else:
             rule_changed = True
             state = "removed" if new is None else ("added" if old is None else "changed")
-            lines += [f"### RULE TEXT CHANGED ({state}): {span(key)}", ""] + fenced(
-                unified(old or "", new or "", key)) + [""]
+            lines += [f"### RULE TEXT CHANGED ({state}): {span(redactor.mask(key))}", ""] + fenced(
+                unified(old or "", new or "", key, redactor)) + [""]
     for key in duplicates:
         rule_changed = True
-        lines += [f"### RULE TEXT CHANGED (duplicated heading): {span(key)}", ""]
+        lines += [f"### RULE TEXT CHANGED (duplicated heading): {span(redactor.mask(key))}", ""]
     residual = [error for error in guard.check(head_root, index_pins) if not any(marker in error for marker in DRIFT_MARKERS)]
     for error in residual:
         rule_changed = True
-        lines.append(f"- BASE GUARD REFUSES THE HEAD: {span(error)}")
+        lines.append(f"- BASE GUARD REFUSES THE HEAD: {span(redactor.mask(error))}")
     if residual:
         lines.append("")
     for rel in guard_path_changes(repo, base_sha, head_sha):
@@ -305,13 +366,13 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
                      "`Rule-Change-Approved-By: <who>` trailer.")
     elif rule_changed:
         lines.append("RESULT: PASS - rule text changed; approval trailer(s): "
-                     + "; ".join(span(value) for value in approved)
+                     + "; ".join(span(redactor.mask(value)) for value in approved)
                      + ". This is tamper-evidence: the trailer is data, and review plus the sole merger enforce.")
     elif count_changed:
         lines.append("RESULT: PASS - only counts changed (printed above for review).")
     else:
         lines.append("RESULT: PASS - no rule section differs from the base manifest.")
-    return redact_credentials("\n".join(lines) + "\n"), failed
+    return "\n".join(lines + redactor.note()) + "\n", failed
 
 
 def run(args) -> int:
