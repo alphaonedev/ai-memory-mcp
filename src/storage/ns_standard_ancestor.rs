@@ -16,8 +16,9 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::ns_standard_ancestor::{
-    AncestorLevel, GoverningAncestor, SetRefusal, classify_standard_metadata_text,
-    select_governing_ancestor, set_admission,
+    AncestorLevel, DescendantLevel, GoverningAncestor, SetRefusal,
+    classify_standard_metadata_text, descendant_admission, select_governing_ancestor,
+    select_governing_descendant, set_admission,
 };
 
 /// The RAW level row: `namespace_meta.standard_id` and the bound memory's RAW
@@ -69,10 +70,69 @@ pub fn governing_ancestor_binding(conn: &Connection, namespace: &str) -> Result<
     )
 }
 
-/// The #3758 rebind gate + the #4356 ancestor gate for a SET on sqlite, from
-/// the connection (MCP / HTTP-sqlite / SAL-sqlite funnels). Every read fault
-/// maps to [`SetRefusal::Unverifiable`] (fail-closed). Callers that write run
-/// it INSIDE their `BEGIN IMMEDIATE` transaction (race-safe re-check).
+/// #4713 — the RAW descendant rows: every `namespace_meta` row strictly below
+/// `?1` (the `LIKE` pattern `<escaped target>/%`), `LEFT JOIN`ed so a severed
+/// / dangling binding stays visible.
+const SQL_DESCENDANT_LEVELS: &str = "SELECT nm.standard_id, m.id IS NOT NULL, m.metadata \
+     FROM namespace_meta nm LEFT JOIN memories m ON m.id = nm.standard_id \
+     WHERE nm.namespace LIKE ?1 ESCAPE '\\' ORDER BY nm.namespace";
+
+/// The `LIKE` pattern matching every namespace strictly below `namespace`,
+/// with the pattern metacharacters of the target escaped so a `_` or `%` in
+/// a namespace matches literally.
+fn descendants_like_pattern(namespace: &str) -> String {
+    let mut pattern = String::with_capacity(namespace.len() + 2);
+    for c in namespace.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    pattern.push_str("/%");
+    pattern
+}
+
+/// #4713 — the descendant-side verdict for a bind at `namespace` by
+/// `caller`: every standard bound strictly below the target, classified
+/// Rust-side from the RAW column exactly as [`read_level`] classifies an
+/// ancestor (a NULL pointer, a reaped memory and a corrupt blob are all
+/// Severed).
+///
+/// # Errors
+///
+/// Any SQLite error (the caller refuses — fail-closed).
+pub fn governing_descendants_binding(
+    conn: &Connection,
+    namespace: &str,
+    caller: &str,
+) -> Result<DescendantLevel> {
+    type LevelRow = (Option<String>, bool, Option<String>);
+    let mut stmt = conn
+        .prepare(SQL_DESCENDANT_LEVELS)
+        .context("#4713 descendant levels prepare")?;
+    let rows = stmt
+        .query_map(params![descendants_like_pattern(namespace)], |r| {
+            Ok::<LevelRow, rusqlite::Error>((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, i64>(1)? != 0,
+                r.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .context("#4713 descendant levels read")?;
+    let levels = rows.map(|row| {
+        row.context("#4713 descendant level row").map(|row| match row {
+            (None, _, _) | (Some(_), false, _) => AncestorLevel::Severed,
+            (Some(_), true, raw) => classify_standard_metadata_text(raw.as_deref().unwrap_or("null")),
+        })
+    });
+    select_governing_descendant(caller, levels)
+}
+
+/// The #3758 rebind gate + the #4356 ancestor gate + the #4713 descendant
+/// gate for a SET on sqlite, from the connection (MCP / HTTP-sqlite /
+/// SAL-sqlite funnels). Every read fault maps to
+/// [`SetRefusal::Unverifiable`] (fail-closed). Callers that write run it
+/// INSIDE their `BEGIN IMMEDIATE` transaction (race-safe re-check).
 ///
 /// # Errors
 ///
@@ -91,7 +151,8 @@ pub fn set_admission_conn(
             "namespace_set_standard: cannot read the current standard binding; refusing");
         SetRefusal::Unverifiable
     })?;
-    let ancestor = if crate::ns_standard_ancestor::needs_ancestor(&binding) {
+    let needs_chain = crate::ns_standard_ancestor::needs_ancestor(&binding);
+    let ancestor = if needs_chain {
         governing_ancestor_binding(conn, namespace).map_err(|e| {
             tracing::error!(target: crate::mcp::error_text::TRACE_TARGET, error = %e,
                 "namespace_set_standard: cannot resolve the governing ancestor; refusing");
@@ -100,13 +161,28 @@ pub fn set_admission_conn(
     } else {
         GoverningAncestor::None
     };
-    set_admission(caller, false, namespace, &binding, &ancestor)
+    set_admission(caller, false, namespace, &binding, &ancestor)?;
+    if !needs_chain {
+        return Ok(());
+    }
+    // #4713 — the descendant-side twin, for exactly the binds that consulted
+    // the ancestor.
+    let descendants = governing_descendants_binding(conn, namespace, caller).map_err(|e| {
+        tracing::error!(target: crate::mcp::error_text::TRACE_TARGET, error = %e,
+            "namespace_set_standard: cannot resolve the governed descendants; refusing");
+        SetRefusal::Unverifiable
+    })?;
+    descendant_admission(&binding, &descendants).inspect_err(|_| {
+        tracing::warn!(
+            target: crate::handlers::AUTHZ_TRACE_TARGET,
+            "namespace-standard descendant refusal: first bind or unowned rebind on {namespace}: a standard bound below it is governed by another principal or unresolvable (#4713)"
+        );
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ns_standard_ancestor::DescendantLevel;
 
     fn conn() -> Connection {
         crate::storage::open(std::path::Path::new(":memory:")).expect("open")

@@ -43,6 +43,16 @@
 //! bind anywhere depend on the `*` owner, breaking the allow-on-silence
 //! cutline); the federated `namespace_meta` lanes (own #2479 peer-scope gate);
 //! pending-queue delegation (no precedent; a follow-up).
+//!
+//! #4713 — the DESCENDANT-side twin: the gate above looks upward only, so a
+//! first bind at an unbound root segment was admitted even when another
+//! principal already owned a bound `root/proj` below it, placing links and a
+//! policy above that governed subtree. [`select_governing_descendant`] folds
+//! the standards bound under the target (each backend reads them with its own
+//! reader: sqlite `namespace LIKE target || '/%'`, escaped) into a
+//! [`DescendantLevel`], and [`descendant_admission`] refuses a first bind /
+//! unowned rebind over a foreign-owned (or severed) governed descendant. Same
+//! race discipline as above: read inside the bind's own write transaction.
 
 use crate::visibility::{
     NamespaceStandardBinding, NamespaceStandardOp, NamespaceStandardRefusal,
@@ -82,14 +92,35 @@ pub enum GoverningAncestor {
     Severed,
 }
 
+/// #4713 — the descendant-side verdict, the twin of [`GoverningAncestor`]:
+/// what the bound standards BELOW a target (`target/...`) say about a first
+/// bind (or unowned rebind) AT the target. A bind there places links and a
+/// policy ABOVE every governed subtree beneath it, so it needs the same
+/// authority the #4356 gate demands downward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DescendantLevel {
+    /// No descendant is governed by another principal (none bound, or only
+    /// unowned / policy-less / caller-owned standards): allow-on-silence.
+    Ungoverned,
+    /// At least one descendant's governing standard is owned by a principal
+    /// other than the caller.
+    ForeignOwned,
+    /// At least one descendant's binding is severed / dangling / corrupt —
+    /// somebody governed that subtree and the policy is gone: fail closed.
+    Severed,
+}
+
 /// Why [`set_admission`] refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetRefusal {
     /// The caller does not own the standard currently bound, or does not own
-    /// the governing ancestor's standard.
+    /// the governing ancestor's standard, or (#4713) another principal owns
+    /// a governing standard bound below the target.
     NotOwner,
     /// The governing ancestor's standard is severed / dangling.
     AncestorUnresolvable,
+    /// #4713 — a standard bound below the target is severed / dangling.
+    DescendantUnresolvable,
     /// A read fault while resolving the binding or the ancestor (fail-closed).
     Unverifiable,
 }
@@ -97,6 +128,10 @@ pub enum SetRefusal {
 /// Wire-pinned refusal text for [`SetRefusal::AncestorUnresolvable`].
 pub const REASON_ANCESTOR_STANDARD_UNRESOLVABLE: &str = "cannot bind a namespace standard under a governed ancestor whose standard is \
      unresolvable (severed or dangling). Ask the ancestor's owner or an operator.";
+
+/// Wire-pinned refusal text for [`SetRefusal::DescendantUnresolvable`] (#4713).
+pub const REASON_DESCENDANT_STANDARD_UNRESOLVABLE: &str = "cannot bind a namespace standard above a governed descendant whose standard is \
+     unresolvable (severed or dangling). Ask the descendant's owner or an operator.";
 
 /// Wire-pinned refusal text for [`SetRefusal::Unverifiable`].
 pub const REASON_STANDARD_UNVERIFIABLE: &str = "cannot verify the namespace-standard owner chain; refusing the bind rather than \
@@ -178,6 +213,61 @@ pub fn select_governing_ancestor<E>(
     Ok(GoverningAncestor::None)
 }
 
+/// #4713 — fold the bound standards BELOW the target (each classified like an
+/// ancestor level by the shared classifier) into the descendant verdict for
+/// `caller`. Every level is consulted: a fault anywhere propagates
+/// (fail-closed); `Severed` outranks `ForeignOwned`; `Absent`, `NoPolicy`, an
+/// unowned standard and one the caller owns contribute nothing.
+///
+/// # Errors
+///
+/// The first reader error encountered.
+pub fn select_governing_descendant<E>(
+    caller: &str,
+    levels: impl IntoIterator<Item = Result<AncestorLevel, E>>,
+) -> Result<DescendantLevel, E> {
+    let mut verdict = DescendantLevel::Ungoverned;
+    for level in levels {
+        match level? {
+            AncestorLevel::Absent | AncestorLevel::NoPolicy => {}
+            AncestorLevel::Severed => verdict = DescendantLevel::Severed,
+            AncestorLevel::Governing { owner } => {
+                if verdict == DescendantLevel::Ungoverned
+                    && owner.as_deref().is_some_and(|o| o != caller)
+                {
+                    verdict = DescendantLevel::ForeignOwned;
+                }
+            }
+        }
+    }
+    Ok(verdict)
+}
+
+/// #4713 — the descendant-side admission for a SET, run AFTER
+/// [`set_admission`] passed: it applies to exactly the binds that consult the
+/// ancestor ([`needs_ancestor`] — a first bind, a severed repair, an unowned
+/// rebind) and refuses one that would place a policy above a subtree another
+/// principal governs. The operator bypass is decided by the caller, as for
+/// [`set_admission`].
+///
+/// # Errors
+///
+/// [`SetRefusal::NotOwner`] for a foreign-owned descendant,
+/// [`SetRefusal::DescendantUnresolvable`] for a severed one.
+pub fn descendant_admission(
+    binding: &NamespaceStandardBinding,
+    descendants: &DescendantLevel,
+) -> Result<(), SetRefusal> {
+    if !needs_ancestor(binding) {
+        return Ok(());
+    }
+    match descendants {
+        DescendantLevel::Ungoverned => Ok(()),
+        DescendantLevel::ForeignOwned => Err(SetRefusal::NotOwner),
+        DescendantLevel::Severed => Err(SetRefusal::DescendantUnresolvable),
+    }
+}
+
 /// Whether the ancestor must be consulted: a bind that creates (or repairs)
 /// the target's OWN binding, AND (#4499, GOD ruling) a rebind of an UNOWNED
 /// standard (owner absent, empty or `system`). #3758 lets anyone rebind an
@@ -244,6 +334,7 @@ pub fn refusal_reason(refusal: SetRefusal) -> &'static str {
     match refusal {
         SetRefusal::NotOwner => crate::errors::msg::CALLER_DOES_NOT_OWN_NAMESPACE_STANDARD,
         SetRefusal::AncestorUnresolvable => REASON_ANCESTOR_STANDARD_UNRESOLVABLE,
+        SetRefusal::DescendantUnresolvable => REASON_DESCENDANT_STANDARD_UNRESOLVABLE,
         SetRefusal::Unverifiable => REASON_STANDARD_UNVERIFIABLE,
     }
 }
