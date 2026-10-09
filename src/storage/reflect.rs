@@ -411,7 +411,7 @@ pub fn reflect_with_hooks_for_caller_versions(
     use crate::validate;
     if expected_versions.is_some_and(|v| v.len() != input.source_ids.len()) {
         return Err(ReflectError::Validation(
-            "source version count must match source ids".into(),
+            crate::storage::SOURCE_VERSION_COUNT_MISMATCH.into(),
         ));
     }
     // ─── 1. Validate inputs ──────────────────────────────────────────
@@ -707,7 +707,7 @@ pub fn reflect_with_hooks_for_caller_versions(
         if let Some(versions) = expected_versions {
             for (index, id) in input.source_ids.iter().enumerate() {
                 let current: i64 = conn
-                    .query_row("SELECT version FROM memories WHERE id = ?1", [id], |row| {
+                    .query_row(crate::storage::SQL_SELECT_MEMORY_VERSION, [id], |row| {
                         row.get(0)
                     })
                     .map_err(|e| match e {

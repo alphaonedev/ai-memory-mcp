@@ -3917,6 +3917,15 @@ pub fn fold_recall_accesses(
 /// unbounded write burst on the sqlite writer mutex (vote condition 4).
 pub const FOLD_CHUNK_MEMORIES: usize = 1000;
 
+/// #4289 / #4045 — the ONE refusal text for an expected-versions slice whose
+/// length differs from the source-id list (consolidate + reflect, both
+/// backends).
+pub const SOURCE_VERSION_COUNT_MISMATCH: &str = "source version count must match source ids";
+
+/// The ONE `version`-by-id probe (archive snapshot, append-only leaf, the
+/// #4289 reflect in-transaction re-check).
+pub(crate) const SQL_SELECT_MEMORY_VERSION: &str = "SELECT version FROM memories WHERE id = ?1";
+
 #[allow(clippy::too_many_arguments)]
 /// Update a memory by ID. Returns (found, `content_changed`) so callers can
 /// re-generate embeddings when the searchable text has changed.
@@ -4545,11 +4554,7 @@ pub fn update_with_expected_version(
                 // version-conflict snapshots nothing.
                 if let Some(expected) = expected_version {
                     let current_version: Option<i64> = conn
-                        .query_row(
-                            "SELECT version FROM memories WHERE id = ?1",
-                            params![id],
-                            |r| r.get(0),
-                        )
+                        .query_row(SQL_SELECT_MEMORY_VERSION, params![id], |r| r.get(0))
                         .ok();
                     if let Some(current) = current_version {
                         return Err(VersionConflict {
@@ -10685,7 +10690,7 @@ pub fn consolidate_with_expected_versions(
     if let Some(versions) = expected_versions {
         anyhow::ensure!(
             versions.len() == ids.len(),
-            "source version count must match source ids"
+            "{SOURCE_VERSION_COUNT_MISMATCH}"
         );
     }
     // #1955 R45 — record-stop fence for the consolidate funnel.
@@ -16784,11 +16789,9 @@ pub fn size_gc(
                 // Gated → flag-OFF unchanged.
                 if crate::config::append_only_enabled()
                     && let Some(ver) = conn
-                        .query_row(
-                            "SELECT version FROM memories WHERE id = ?1",
-                            params![id],
-                            |r| r.get::<_, i64>(0),
-                        )
+                        .query_row(SQL_SELECT_MEMORY_VERSION, params![id], |r| {
+                            r.get::<_, i64>(0)
+                        })
                         .optional()?
                 {
                     crate::revisions::emit_revision_leaf_if_enabled(

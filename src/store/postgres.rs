@@ -14361,7 +14361,7 @@ impl PostgresStore {
 
         if expected_versions.is_some_and(|v| v.len() != input.source_ids.len()) {
             return Err(ReflectError::Validation(
-                "source version count must match source ids".into(),
+                crate::storage::SOURCE_VERSION_COUNT_MISMATCH.into(),
             ));
         }
         // ─── 1. Validate inputs ─────────────────────────────────────

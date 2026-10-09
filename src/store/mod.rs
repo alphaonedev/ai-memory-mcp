@@ -620,7 +620,7 @@ pub(crate) fn validate_consolidation_input(
     })?;
     if expected_versions.is_some_and(|versions| versions.len() != ids.len()) {
         return Err(StoreError::InvalidInput {
-            detail: "source version count must match source ids".to_string(),
+            detail: crate::storage::SOURCE_VERSION_COUNT_MISMATCH.to_string(),
         });
     }
     Ok(())
