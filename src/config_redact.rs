@@ -146,6 +146,12 @@ fn redact_in(value: &mut toml::Value, under_secret_key: bool) {
         toml::Value::Table(table) => {
             for (key, child) in table.iter_mut() {
                 let secret = under_secret_key || is_secret_value_key(key);
+                if !secret && is_db_path_key(key) {
+                    if let toml::Value::String(s) = child {
+                        *s = display_db_value(s);
+                        continue;
+                    }
+                }
                 redact_in(child, secret);
             }
         }
@@ -174,6 +180,27 @@ fn redact_in(value: &mut toml::Value, under_secret_key: bool) {
             }
         }
     }
+}
+
+/// Config keys whose value is a SQLite database path that may hold a
+/// mistyped store DSN (#6102).
+const DB_PATH_KEYS: &[&str] = &["db"];
+
+/// Does `key` name a database-path setting? See [`DB_PATH_KEYS`].
+fn is_db_path_key(key: &str) -> bool {
+    DB_PATH_KEYS
+        .iter()
+        .any(|k| key.trim().eq_ignore_ascii_case(k))
+}
+
+/// The display form of a `db` value (#6102): rendered through
+/// [`crate::url_display::db_path_display`] whether or not it holds `://`.
+/// Before, a value with no `://` (`postgres:/svc:<pw>@host/db`, a libpq
+/// `host=db password=<pw>` DSN) was printed exactly as written. The
+/// value-shape screen still runs on the result.
+fn display_db_value(value: &str) -> String {
+    let rendered = crate::url_display::db_path_display(std::path::Path::new(value.trim()));
+    crate::secret_screen::redact_for_storage(&rendered).unwrap_or(rendered)
 }
 
 /// The display form of a string setting that is a URL, or `None` when the
