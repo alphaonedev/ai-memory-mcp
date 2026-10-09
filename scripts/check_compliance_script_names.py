@@ -54,8 +54,9 @@ Scan set (#6169, #6197): every ``*.md`` file under ``docs/compliance/``, extensi
 matched in any case. A directory that cannot be listed, an unreadable document or
 allowlist, or a missing ``docs/compliance/`` exits 2; nothing is skipped silently.
 Symlinked directories (``docs/compliance/`` itself included) are refused, never
-followed, and a document symlink that resolves outside the repository is refused;
-both are violations. A document symlink inside the repository is scanned.
+followed, and a document symlink that resolves outside the repository, forms a loop
+(#6217) or cannot be resolved is refused; each is a violation reported as what it is.
+A document symlink inside the repository is scanned.
 
 Usage:
     python3 -I scripts/check_compliance_script_names.py [--root DIR]
@@ -69,6 +70,7 @@ allowlist.
 
 import argparse
 import contextlib
+import errno
 import html
 import io
 import os
@@ -291,10 +293,22 @@ def compliance_docs(root):
             path = Path(dirpath) / name
             if path.is_symlink():
                 try:
+                    os.stat(str(path))
+                except OSError as err:
+                    if err.errno == errno.ELOOP:
+                        problems.append("%s: document symlink loop (refused)" % rel_path(root, path))
+                        continue
+                try:
                     path.resolve().relative_to(real_root)
-                except (OSError, RuntimeError, ValueError):
+                except ValueError:
                     problems.append(
                         "%s: document symlink resolves outside the repository (refused)" % rel_path(root, path)
+                    )
+                    continue
+                except (OSError, RuntimeError):
+                    problems.append(
+                        "%s: document symlink cannot be resolved (symlink loop or I/O error; refused)"
+                        % rel_path(root, path)
                     )
                     continue
             docs.append(path)
