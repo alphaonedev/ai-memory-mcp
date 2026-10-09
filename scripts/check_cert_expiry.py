@@ -1969,6 +1969,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
          dict(pr_base_env, GITHUB_SHA=pr_merge + "\n"), hex_msg),
         ("non-hex GITHUB_SHA", dict(pr_base_env, GITHUB_SHA="zz" + pr_merge[2:]), hex_msg),
         ("non-hex PR_BASE_SHA", dict(pr_base_env, PR_BASE_SHA="--oops"), hex_msg),
+        # 40 Arabic-Indic digits: `str.isdigit` / `\d` accept them, git does not.
+        ("non-ASCII-digit PR_HEAD_SHA", dict(pr_base_env, PR_HEAD_SHA="\u0661" * 40), hex_msg),
         ("option-shaped push GITHUB_EVENT_BEFORE",
          {"GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_BEFORE": "--upload-pack=x",
           "GITHUB_SHA": base, "PATH": os.environ.get("PATH", "")}, hex_msg),
@@ -2024,10 +2026,11 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     # holds exactly that one call (argv tail `--version`): a silent is_commit (`rev-parse`) or
     # `fetch origin <value>` ahead of the validator is recorded even when the
     # failure it causes is swallowed by run_git, so it turns this cell red.
-    # The loop covers the pull_request lane (PR_HEAD_SHA, GITHUB_SHA) and the push
+    # The loop covers the pull_request lane (PR_HEAD_SHA, GITHUB_SHA, PR_BASE_SHA) and the push
     # lane (GITHUB_EVENT_BEFORE, GITHUB_SHA), each validated at its own site.
     sha_len_cells = (
-        [("pull_request", k, pr_base_env) for k in ("PR_HEAD_SHA", "GITHUB_SHA")]
+        [("pull_request", k, pr_base_env)
+         for k in ("PR_HEAD_SHA", "GITHUB_SHA", "PR_BASE_SHA")]
         + [("push", k, push_sha_env) for k in ("GITHUB_EVENT_BEFORE", "GITHUB_SHA")]
     )
     for n in (63, 65):
@@ -2044,7 +2047,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
             # run_git prefixes every call with `-c core.quotePath=false -C <repo>`, so
             # the verb and its operands are the tail of argv: the probe ends in
             # `--version`, a rev-parse / fetch does not.
-            if len(calls) != 1 or calls[0][-1:] != ["--version"]:
+            if calls != [["-c", "core.quotePath=false", "-C", str(repo), "--version"]]:
                 t.fail(f"(pr4-sha-len): a {lane} {n}-hex {key} ran git calls other than the "
                        f"`--version` probe before the validator refused it: {calls!r}", text)
 
@@ -2188,7 +2191,8 @@ SELF_TEST_OK = (
     "the gate-run fixtures build one gitshim.* level under the scratch dir and fit within it; "
     "(pr4-sha256, #6144) a 64-hex PR_HEAD_SHA / GITHUB_SHA (pull_request) and GITHUB_EVENT_BEFORE / GITHUB_SHA (push) pass the validator and fail cleanly at the later lookup; "
     "(pr4-sha-case, #6144) upper-case 40/64-hex shas pass the validator on every validated key; "
-    "(pr4-sha-len) 63/65-hex refused on both lanes with only the `git --version` probe traced before the validator."
+    "(pr4-sha-len) 63/65-hex refused on every validated sha site (PR_HEAD_SHA, GITHUB_SHA and PR_BASE_SHA on pull_request; "
+    "GITHUB_EVENT_BEFORE and GITHUB_SHA on push) with only the `git --version` probe traced before the validator."
 )
 
 
