@@ -626,7 +626,7 @@ d_scan() {
             continue
         fi
         prebuild="$(awk -v a="$opener" -v b="$w" '
-            NR > a && NR < b && /cargo test --no-run "\$@" \|\| return "\$\?"/ { n = NR }
+            NR > a && NR < b && /cargo test --no-run "\$@"( "\$\{sel\[@\]\}")? \|\| return "\$\?"/ { n = NR }
             END { print n + 0 }' "$file")"
         if [ "$prebuild" -eq 0 ]; then
             bad=$((bad + 1))
@@ -657,7 +657,7 @@ fi
 # the repo (never system /tmp), trap-cleaned by the SCRATCH dir above.
 if [ "$d_total" -gt 0 ]; then
     D_MUT="$SCRATCH/ci-2657-mutant.yml"
-    grep -v 'cargo test --no-run "\$@" || return "\$?"' "$CI_YML" > "$D_MUT"
+    grep -vE 'cargo test --no-run "\$@"( "\$\{sel\[@\]\}")? \|\| return "\$\?"' "$CI_YML" > "$D_MUT"
     d_mut_result="$(d_scan "$D_MUT" 2>/dev/null)"
     d_mut_bad="${d_mut_result%%/*}"
     if [ "$d_mut_bad" -eq "$d_total" ]; then
@@ -802,91 +802,11 @@ else
 fi
 
 # ===========================================================================
-# SECTION G — #6383 / #6386: per-binary Postgres isolation stays paired,
-# bounded and watchdogged.
-#
-# Every place that mints a database `CREATE DATABASE ... TEMPLATE` must live
-# next to the sweep that reclaims what a killed run leaks, the flag must be
-# exported only by the enterprise-fed configure step, the isolated lane must
-# keep the #1492 watchdog / #2500 --no-fail-fast / #2657 prebuild shapes, and
-# the wrapper must invoke `cargo test --no-fail-fast` per binary. Named G
-# because E (#3496) and F (#5447) are taken.
+# SECTION G — #6383 / #6386: the opt-in per-binary Postgres isolation lane.
+# The checks live in Python (review r1 L1): scripts/ci/check_pg_isolate_invariants.py,
+# unit-tested with one mutant per check in scripts/ci/tests/.
 # ===========================================================================
-echo "  --- Section G: #6383 per-binary Postgres isolation ---"
-
-PG_WRAPPER="$ROOT/scripts/test/pg_isolated_binary.py"
-PG_HELPER="$ROOT/tests/common/pg_isolate.rs"
-
-# g_paired <file> <create-pattern> <sweep-pattern> — 0 only when the file mints
-# from a template AND carries the sweep. Factored out so the R-203 leg below
-# runs the IDENTICAL logic against a mutated copy.
-g_paired() {
-    local file="$1" create="$2" sweep="$3"
-    grep -qE "$create" "$file" && grep -qE "$sweep" "$file"
-}
-
-if g_paired "$PG_WRAPPER" 'CREATE DATABASE %s TEMPLATE' 'def sweep\(' \
-    && g_paired "$PG_WRAPPER" 'CREATE DATABASE %s TEMPLATE' 'pg_stat_activity'; then
-    ok "G: the wrapper pairs CREATE DATABASE ... TEMPLATE with an idle-only stale sweep"
-else
-    bad "G: the wrapper mints from a template without an idle-only sweep" \
-        "a killed run would leak databases forever (#6383)"
-fi
-if g_paired "$PG_HELPER" 'CREATE DATABASE \{\} TEMPLATE' 'async fn sweep_idle_stale' \
-    && g_paired "$PG_HELPER" 'CREATE DATABASE \{\} TEMPLATE' 'pg_stat_activity'; then
-    ok "G: tests/common/pg_isolate.rs pairs CREATE DATABASE ... TEMPLATE with an idle-only stale sweep"
-else
-    bad "G: the Rust helper mints from a template without an idle-only sweep" \
-        "a killed run would leak databases forever (#6383)"
-fi
-
-G_MUT="$SCRATCH/pg-isolate-6383-mutant.py"
-grep -v 'pg_stat_activity' "$PG_WRAPPER" > "$G_MUT"
-if g_paired "$G_MUT" 'CREATE DATABASE %s TEMPLATE' 'pg_stat_activity'; then
-    bad "G regression: the sweep-stripped mutant passed the pairing scan" \
-        "the scan has gone blind — every G assertion is vacuous"
-else
-    ok "G regression: stripping the idle guard from the wrapper is caught"
-fi
-
-# The flag is exported exactly once, by the enterprise-fed configure step.
-g_exports="$(grep -c 'AI_MEMORY_TEST_PG_ISOLATE=1" >> "\$GITHUB_ENV"' "$CI_YML" || true)"
-g_in_cfg="$(awk '/- name: Configure enterprise-fed tier/ {f=1} /- name: Run tests \(impact-aware\)/ {f=0} f && /AI_MEMORY_TEST_PG_ISOLATE=1" >> "\$GITHUB_ENV"/ {n++} END {print n+0}' "$CI_YML")"
-if [ "$g_exports" -eq 1 ] && [ "$g_in_cfg" -eq 1 ]; then
-    ok "G: AI_MEMORY_TEST_PG_ISOLATE=1 is exported once, in the enterprise-fed configure step only"
-else
-    bad "G: the isolation flag export moved (total=$g_exports, in configure=$g_in_cfg)" \
-        "the sqlite legs must never see the flag; default-on needs a 5-agent vote (4d3ea1c5)"
-fi
-
-# Configure sweeps before it builds the template; cleanup tears down.
-g_sweep_ln="$(grep -n 'pg_isolated_binary.py sweep' "$CI_YML" | head -1 | cut -d: -f1)"
-g_setup_ln="$(grep -n 'pg_isolated_binary.py setup' "$CI_YML" | head -1 | cut -d: -f1)"
-if [ -n "$g_sweep_ln" ] && [ -n "$g_setup_ln" ] && [ "$g_sweep_ln" -lt "$g_setup_ln" ] \
-    && grep -q 'pg_isolated_binary.py teardown' "$CI_YML"; then
-    ok "G: ci.yml sweeps before setup and tears the template down in cleanup"
-else
-    bad "G: ci.yml lost the sweep-before-setup or the teardown step" \
-        "sweep line=${g_sweep_ln:-none} setup line=${g_setup_ln:-none}"
-fi
-
-# The wrapper hands cargo one --test selector per binary, never fail-fast.
-if grep -q 'cargo test --no-fail-fast --test' "$PG_WRAPPER" \
-    && grep -q 'argv = list(cargo) + list(target)' "$PG_WRAPPER"; then
-    ok "G: the wrapper runs cargo test --no-fail-fast --test <bin> per binary"
-else
-    bad "G: the wrapper no longer documents/builds the per-binary --no-fail-fast invocation" \
-        "$PG_WRAPPER"
-fi
-
-# The isolated lane is one of the watchdog lines B and D already scan: require
-# it is present so those scans cannot silently skip it.
-if grep -nE '(TIMEOUT_BIN|--kill-after=60)[^|]*cargo test' "$CI_YML" | grep -q 'pg_isolated_binary.py run'; then
-    ok "G: the isolated lane is a watchdog-wrapped cargo test line covered by B and D"
-else
-    bad "G: the isolated lane's watchdog line is missing or no longer matches the B/D scan" \
-        'run_isolated_lane must keep the $TIMEOUT_BIN ... cargo test --no-fail-fast shape'
-fi
+if python3 "$ROOT/scripts/ci/check_pg_isolate_invariants.py" --root "$ROOT" --ci-yml "$CI_YML"; then ok "G: #6383 pg-isolation invariants (opt-in, run-scoped, no URL argv, selected prebuild, watchdog, logs)"; else bad "G: #6383 pg-isolation invariants failed" "see output above"; fi
 
 echo ""
 if [ "$FAIL" -eq 0 ]; then
