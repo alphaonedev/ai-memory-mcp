@@ -10,6 +10,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import tarfile
+import re
 import tempfile
 import unittest
 
@@ -108,10 +109,32 @@ class PackagingContract(unittest.TestCase):
         # (never root) before the backup timer is enabled.
         owner = next(line for line in backup if line.startswith('User=')).split('=', 1)[1]
         readme = (ROOT / 'packaging/systemd/README.md').read_text()
-        recipe = f'sudo install -d -o {owner} -g {owner} -m 0700 {state_dir}/.config'
-        self.assertIn(recipe, readme, 'README must create the key-store parent as the service user')
-        self.assertLess(readme.index(recipe), readme.index('systemctl enable --now ai-memory-backup.timer'),
-                        'the key-store parent must exist before the backup timer is enabled')
+        self.assertIsNone(key_store_recipe_problem(readme, owner, state_dir))
+
+    def test_key_store_recipe_check_rejects_the_surviving_mutations_6271(self):
+        # #6271 — the recipe must be an executable line, not a substring: a
+        # commented-out line (M5), a line moved into prose (M6) and a longer
+        # path (`.configx`, M7) must each be refused; the shipped README passes.
+        good = (
+            'sudo install -d -o ai-memory -g ai-memory -m 0700 /var/lib/ai-memory/.config\n'
+            'sudo systemctl enable --now ai-memory-backup.timer\n'
+        )
+        args = ('ai-memory', '/var/lib/ai-memory')
+        self.assertIsNone(key_store_recipe_problem(good, *args))
+        mutations = {
+            'M5 commented out': good.replace('sudo install', '# sudo install', 1),
+            'M6 moved into prose': 'Run sudo install -d -o ai-memory -g ai-memory -m 0700 '
+                                   '/var/lib/ai-memory/.config first.\n'
+                                   'sudo systemctl enable --now ai-memory-backup.timer\n',
+            'M7 .configx': good.replace('.config', '.configx', 1),
+            'M8 after the timer': good.splitlines(True)[1] + good.splitlines(True)[0],
+            'M9 wrong owner': good.replace('-o ai-memory', '-o root', 1),
+            'M10 wrong mode': good.replace('0700', '0755', 1),
+            'M11 absent': good.splitlines(True)[1],
+        }
+        for label, text in mutations.items():
+            with self.subTest(mutation=label):
+                self.assertIsNotNone(key_store_recipe_problem(text, *args))
 
     def test_companions_restart_with_the_primary(self):
         # #4326 — curator and sync open the live database through the
