@@ -9668,7 +9668,7 @@ mod tests {
     fn a_latched_audit_trail_refuses_mcp_writes_but_not_reads_4400() {
         let _sink = crate::audit::sink_test_lock();
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
-        crate::audit::fail_closed_latch_for_test();
+        let _latch = crate::audit::fail_closed_latch_for_test();
         let store = invoke_handle_request(
             &conn,
             &make_tools_call(
@@ -9677,7 +9677,6 @@ mod tests {
             ),
         );
         let list = invoke_handle_request(&conn, &make_tools_call("memory_list", json!({})));
-        crate::audit::fail_closed_force_on_for_test(false);
         let err = store
             .error
             .expect("the write tool is refused while latched");

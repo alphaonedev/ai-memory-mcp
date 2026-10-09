@@ -17445,7 +17445,7 @@ fn a_latched_audit_trail_refuses_sync_push_on_both_backends_4400() {
             #[cfg(not(feature = "sal"))]
             let backends = [StorageBackend::Sqlite];
             for backend in backends {
-                crate::audit::fail_closed_latch_for_test();
+                let _latch = crate::audit::fail_closed_latch_for_test();
                 let mut app_state = test_app_state(test_state());
                 app_state.storage_backend = backend;
                 let app = Router::new()
@@ -17491,7 +17491,6 @@ fn a_latched_audit_trail_refuses_sync_push_on_both_backends_4400() {
                     .await
                     .unwrap();
                 let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-                crate::audit::fail_closed_force_on_for_test(false);
                 assert_eq!(
                     status,
                     StatusCode::SERVICE_UNAVAILABLE,
