@@ -1784,6 +1784,16 @@ DOCKER_RUN_HEAD = "RUN set -eu; \\\n"
 SHAPE_HDR = "      - name: Build release binary (exactly as release.yml)\n"
 SHAPE_LINE = IND + SHAPE_BUILD_CMD
 BIND_LINE = IND + BIND_INPUTS + "\n"
+# #3613: the reproducible-build proof job and the deterministic inputs of the
+# release build (SOURCE_DATE_EPOCH, remapped paths).
+REPRO_SCRIPT = "scripts/release/reproducible_build.py"
+REPRO_HDR = "\n  reproducible:\n"
+PROOF_STEP_NAME = "      - name: Build twice from two workspaces and compare (#3613)\n"
+PROOF_CMD = ('python3 scripts/release/reproducible_build.py --target x86_64-unknown-linux-gnu --features "$FEATURES" '
+             '--workspace-b "$RUNNER_TEMP/reproducible-b"')
+EPOCH_LINES = IND + 'SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"\n' + IND + "export SOURCE_DATE_EPOCH\n"
+REMAP_LINES = (IND + 'RUSTFLAGS="--remap-path-prefix=$PWD=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"\n'
+               + IND + "export RUSTFLAGS\n")
 
 
 def _rel(old: str, new: Union[str, Transform], every: bool = False) -> Edit:
@@ -1809,6 +1819,31 @@ def _edit_all(old: str, new: str) -> Transform:
     """Replace every ``old`` when present; unchanged when absent (red until the
     anchor lands, the #4768 / #4720 / #4935 shape)."""
     return lambda text: text.replace(old, new)
+
+
+def _in_build_step(fn: Transform) -> Transform:
+    """Apply ``fn`` to the release job's build step only (the SBOM step carries
+    some of the same statements)."""
+    def go(text: str) -> str:
+        a = text.index(BUILD_HDR)
+        b = text.index(ASSERT_NAME, a)
+        return text[:a] + fn(text[a:b]) + text[b:]
+    return go
+
+
+def _drop_job(job: str) -> Transform:
+    """Remove release.yml job ``job`` when present; unchanged when absent (#3613:
+    red until the job lands)."""
+    def go(text: str) -> str:
+        m = re.search(JOB_RE_TMPL % re.escape(job), text)
+        return text if m is None else text[: m.start()] + text[m.end():]
+    return go
+
+
+def _job_key(job: str, line: str) -> Transform:
+    """Add a job-level line right under ``job:`` when the job exists."""
+    hdr = "\n  " + job + ":\n"
+    return lambda text: text.replace(hdr, hdr + line, 1)
 
 
 def _hdr_key(hdr: str, key: str) -> List[Edit]:
@@ -2148,6 +2183,23 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "4768 Dockerfile a RUN between the asserter COPY and the declaration COPY": ("fail", [_docker(
         DOCKER_DECL_COPY + "\n", "RUN sed -i s/exit/true/ scripts/assert-compiled-features.sh\n" + DOCKER_DECL_COPY + "\n")]),
     "4768 Dockerfile asserter COPY missing": ("fail", [_docker(DOCKER_ASSERTER_COPY + "\n", "")]),
+    # --- #3613: the two-build reproducibility proof job and the deterministic inputs of the release build
+    "3613 no reproducible-build proof job": ("fail", [_rel(BUILD_HDR, _drop_job("reproducible"))]),
+    "3613 proof job skipped by an if": ("fail", [_rel(BUILD_HDR, _job_key("reproducible", "    if: false\n"))]),
+    "3613 proof job continue-on-error": ("fail", [_rel(BUILD_HDR, _job_key("reproducible", "    continue-on-error: true\n"))]),
+    "3613 proof job env": ("fail", [_rel(BUILD_HDR, _job_key("reproducible", "    env:\n      RUSTFLAGS: -C opt-level=0\n"))]),
+    "3613 proof made non-fatal": ("fail", [_rel(BUILD_HDR, _edit_all(IND + PROOF_CMD + "\n", IND + PROOF_CMD + " || true\n"))]),
+    "3613 proof compares a different target": ("fail", [_rel(
+        BUILD_HDR, _edit_all(IND + PROOF_CMD + "\n", IND + PROOF_CMD.replace("x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu") + "\n"))]),
+    "3613 proof step deleted": ("fail", [_rel(BUILD_HDR, _edit_all(IND + PROOF_CMD + "\n", IND + "true\n"))]),
+    "3613 proof job restores a build cache": ("fail", [_rel(
+        BUILD_HDR, _edit_all(PROOF_STEP_NAME, "      - uses: " + RUST_CACHE_USES + " # v2\n\n" + PROOF_STEP_NAME))]),
+    "3613 proof step does not bind the proof script to HEAD": ("fail", [_rel(
+        BUILD_HDR, _edit_all(IND + "git diff --quiet HEAD -- scripts/release-features.sh scripts/release/reproducible_build.py\n", ""))]),
+    "3613 release build without SOURCE_DATE_EPOCH": ("fail", [_rel(BUILD_HDR, _in_build_step(_edit_all(EPOCH_LINES, "")))]),
+    "3613 release build without remapped paths": ("fail", [_rel(BUILD_HDR, _in_build_step(_edit_all(REMAP_LINES, "")))]),
+    "3613 release build remaps the workspace only": ("fail", [_rel(BUILD_HDR, _in_build_step(_edit_all(
+        REMAP_LINES, IND + 'RUSTFLAGS="--remap-path-prefix=$PWD=/src"\n' + IND + "export RUSTFLAGS\n")))]),
     "build step exports BASH_ENV through GITHUB_ENV": ("fail", _before_build(IND + 'echo "BASH_ENV=decoy/noop.sh" >> "$GITHUB_ENV"')),
     "build step adds a fake dir to GITHUB_PATH": ("fail", _before_build(IND + 'echo "$PWD/decoy" >> "$GITHUB_PATH"')),
     "build step cd before the build": ("fail", _before_build(IND + "cd decoy")),
@@ -2868,6 +2920,15 @@ def self_test(root: Path) -> int:
                     print(f"self-test FAIL: the {label} PASSED with {rel} rewritten after checkout (#4768): fail-open", file=sys.stderr)
                     failures += 1
                 subprocess.run(git + ["checkout", "--", rel], cwd=bound, capture_output=True, check=True)
+
+        # --- #3613: the two-build proof script proves itself (two identical
+        # builds pass; a perturbed SOURCE_DATE_EPOCH and an unremapped workspace
+        # path each fail the comparison).
+        proof = subprocess.run([sys.executable, str(root / REPRO_SCRIPT), "--self-test"], cwd=root, capture_output=True, text=True)
+        if proof.returncode != 0:
+            print(f"self-test FAIL: {REPRO_SCRIPT} --self-test exited {proof.returncode}: {proof.stderr.strip()[-300:]}",
+                  file=sys.stderr)
+            failures += 1
 
         # --- the guard itself: positive controls and every bypass form.
         for name, (want, edits) in CASES.items():
