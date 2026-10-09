@@ -1256,12 +1256,15 @@ CHECKOUT_DEPTH_PREFIX = "cert-expiry-depth."
 
 
 def checkout_depth_violation(tmp):
-    """None when every scratch-dir cell passes in a scratch dir exactly
+    """None when every #6145 shim and scratch cell passes in a scratch dir exactly
     SCRATCH_PATH_LIMIT (226) bytes long, the scratch a 184-byte checkout gets, else a
-    description (#6145 R8-F1). No cell may need more depth than shim-interpreter
+    description (#6145 R8-F1, R9-F2). No cell may need more depth than shim-interpreter
     itself, so a cell that nests the self-test (or any of its cells) deeper than its
-    own scratch dir fails here. The dir is a sibling of tmp (tmp itself is 226 bytes
-    at a 184-byte checkout) and is removed afterwards."""
+    own scratch dir fails here. path_max_restore_violation builds no path and is not
+    re-run, so the fallback check runs once per self-test (R9-F1); the gate-run
+    fixtures build one `gitshim.*` level under the scratch dir and fit within it. The
+    dir is a sibling of tmp (tmp itself is 226 bytes at a 184-byte checkout) and is
+    removed afterwards."""
     parent = tmp.parent
     pad = SCRATCH_PATH_LIMIT - len(os.fsencode(str(parent))) - 1 - len(CHECKOUT_DEPTH_PREFIX) - 8
     if pad < 0:
@@ -1272,8 +1275,8 @@ def checkout_depth_violation(tmp):
         got = len(os.fsencode(str(deep)))
         if got != SCRATCH_PATH_LIMIT:
             return f"the depth scratch dir is {got} bytes, not {SCRATCH_PATH_LIMIT}"
-        for cell in (shim_interpreter_violation, shim_boundary_robustness_violation,
-                     deep_scratch_violation, path_max_restore_violation,
+        for cell in (shim_isolation_violation, shim_interpreter_violation,
+                     shim_boundary_robustness_violation, deep_scratch_violation,
                      path_max_restore_diagnostic_violation, deep_scratch_cap_violation,
                      scratch_limit_message_violation, deep_scratch_relative_violation):
             res = guarded(cell, deep)
@@ -2015,9 +2018,11 @@ SELF_TEST_OK = (
     "(shim-deep-cap, #6145) they stay inside [deep_scratch base, PATH_MAX-1] and a scratch 24 bytes under "
     "PATH_MAX gets the 'needs room' message; (path-max-restore, #6145) os.pathconf and sys.platform are "
     "restored and the fallback check runs once, first; (path-max-diagnostic, #6145) a dropped restore "
-    "names the real host platform and is put back, running only that cell in the same scratch dir; "
-    "(checkout-depth, #6145) every scratch-dir cell passes in a 226-byte scratch dir, the one a "
-    "184-byte checkout gets."
+    "names the real host platform and is put back, and a failing (not leaking) fallback check is "
+    "reported as path-max-fallback, running only that cell in the same scratch dir; "
+    "(checkout-depth, #6145) every #6145 shim and scratch cell passes in a 226-byte scratch dir, the "
+    "one a 184-byte checkout gets; the gate-run fixtures build one gitshim.* level under the scratch "
+    "dir and fit within it."
 )
 
 
