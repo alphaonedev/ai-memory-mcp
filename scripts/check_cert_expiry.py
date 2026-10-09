@@ -2028,11 +2028,249 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         print("self-test NOTE (o): skipped own-PR check (no origin/release/v1.0.0 "
               "and no @{upstream})", file=sys.stderr)
 
+    _trusted_cells(tmp, t, sentence)
+
     if t.failed:
         print("check-cert-expiry self-test: FAIL", file=sys.stderr)
         return 2
     print(SELF_TEST_OK)
     return 0
+
+
+# ---------------------------------------------------------------------------
+# #6140: --trusted mode cells (the pull_request_target companion job)
+# ---------------------------------------------------------------------------
+
+# Pinned literals (R5 precedent, #5164): dropping a trusted path, or drifting the
+# trailer from scripts/claude-md-rule-compare.py, fails here instead of silently.
+PINNED_TRUSTED_PATHS = ("scripts/check_cert_expiry.py", ".github/workflows/cert-expiry-trusted.yml",
+                        "scripts/check-claude-md-size.py")
+PINNED_TRUSTED_JOB = (".github/workflows/c8-precheck.yml", "cert-expiry-gate")
+PINNED_TRAILER_LINE = 'TRAILER = re.compile(r"^Rule-Change-Approved-By: (\\S.*)$", re.MULTILINE)'
+
+STUB_GATE = "import sys\nsys.exit(0)  # a gate copy that always passes\n"
+C8_FIXTURE = (
+    "name: c8\non: [pull_request]\njobs:\n"
+    "  other-job:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo other\n"
+    "  cert-expiry-gate:\n    name: Enterprise-federation cert-expiry gate (cert §7 / F7)\n"
+    "    runs-on: ubuntu-latest\n    steps:\n      - run: python3 -I scripts/check_cert_expiry.py\n"
+    "  # a comment at job indent belongs to the next job\n"
+    "  later-job:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo later\n"
+)
+
+
+def trusted_cli(repo, *args):
+    """Run main() in --trusted mode against `repo`; (rc, combined output). An
+    argparse refusal (an unknown flag on a gate without the mode) is rc 2."""
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = main(["--trusted", "--repo", str(repo), *args])
+    except SystemExit as exc:
+        rc = exc.code if isinstance(exc.code, int) else 2
+    return rc, out.getvalue() + err.getvalue()
+
+
+def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
+    """Build a fixture, mirror it to a BARE repository (no working tree at all,
+    so nothing can be checked out or executed from the head) and judge each
+    pull request shape the way cert-expiry-trusted.yml does."""
+    trusted = globals().get("TRUSTED_PATHS")
+    if trusted != PINNED_TRUSTED_PATHS:
+        t.fail(f"(tr-pin): TRUSTED_PATHS {trusted!r} differs from the pinned set {PINNED_TRUSTED_PATHS!r}")
+    if globals().get("TRUSTED_JOB") != PINNED_TRUSTED_JOB:
+        t.fail(f"(tr-pin): TRUSTED_JOB {globals().get('TRUSTED_JOB')!r} differs from {PINNED_TRUSTED_JOB!r}")
+    trailer = globals().get("TRAILER")
+    compare_src = REPO_ROOT / "scripts" / "claude-md-rule-compare.py"
+    try:
+        compare_text = compare_src.read_text(encoding="utf-8")
+    except OSError as exc:
+        compare_text = ""
+        t.fail(f"(tr-trailer): cannot read {compare_src}: {exc}")
+    if PINNED_TRAILER_LINE not in compare_text:
+        t.fail("(tr-trailer): scripts/claude-md-rule-compare.py no longer defines the pinned approval trailer")
+    if trailer is None or trailer.pattern != r"^Rule-Change-Approved-By: (\S.*)$":
+        t.fail("(tr-trailer): the cert gate's TRAILER is not the claude-md-rule-compare approval trailer")
+
+    repo = tmp / "trusted-repo"
+    repo.mkdir()
+    fx = Fixture(repo)
+    fx.g("init", "-q", "-b", "main")
+    fx.g("config", "user.name", "Cert Expiry Selftest")
+    fx.g("config", "user.email", "selftest@invalid.example")
+    fx.g("config", "commit.gpgsign", "false")
+    mod_rs = "src/federation/mod.rs"
+    gate_rel, wf_rel, pin_rel = PINNED_TRUSTED_PATHS
+    c8_rel = PINNED_TRUSTED_JOB[0]
+    fx.write(mod_rs, "fn federation_mod() {}\n")
+    fx.write("src/unrelated.rs", "fn other() {}\n")
+    fx.write(gate_rel, "# the base copy of the gate (fixture)\n")
+    fx.write(wf_rel, "name: trusted (fixture)\n")
+    fx.write(pin_rel, "# the canonical-form pin (fixture)\n")
+    fx.write(c8_rel, C8_FIXTURE)
+    genesis = fx.commit(["src", "scripts", ".github"], "genesis")
+    fx.banner("LIVE", genesis)
+    base = fx.commit([CERT_DOC], "base: certification LIVE bound to genesis")
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+    approve = "\n\nRule-Change-Approved-By: Selftest Approver"
+
+    def pr(name, edits, trailer_msg=""):
+        """A PR branch off `base` with `edits` {rel: text | callable}, merged
+        into main with --no-ff; returns (head, merge). main is reset to base."""
+        fx.g("checkout", "-q", "-b", name, base)
+        for rel, text in edits.items():
+            if callable(text):
+                text(rel)
+            else:
+                fx.write(rel, text)
+        fx.g("add", "-A")
+        fx.g("commit", "-q", "-m", f"{name}: PR change{trailer_msg}")
+        head = fx.g("rev-parse", "HEAD")
+        fx.g("checkout", "-q", "main")
+        merge = fx.merge(name, f"Merge {name} into main")
+        fx.reset(base)
+        return head, merge
+
+    def symlink_doc(rel):
+        (repo / rel).unlink()
+        (repo / rel).symlink_to("../../src/unrelated.rs")
+
+    wire = "fn federation_mod() {}\n// PR wire change\n"
+    shapes = {
+        "clean": pr("clean", {"src/unrelated.rs": "fn other() {}\n// unrelated\n"}),
+        "stub": pr("stub", {mod_rs: wire, gate_rel: STUB_GATE}),
+        "stubok": pr("stubok", {mod_rs: wire, gate_rel: STUB_GATE}, approve),
+        "wire": pr("wire", {mod_rs: wire}),
+        "wf": pr("wf", {wf_rel: "name: weakened (fixture)\n"}),
+        "wfok": pr("wfok", {wf_rel: "name: weakened (fixture)\n"}, approve),
+        "pin": pr("pin", {pin_rel: "# weakened pin\n"}),
+        "gate": pr("gate", {gate_rel: STUB_GATE}),
+        "job": pr("job", {c8_rel: C8_FIXTURE.replace("check_cert_expiry.py\n", "check_cert_expiry.py --self-test\n")}),
+        "jobgone": pr("jobgone", {c8_rel: C8_FIXTURE.replace("  cert-expiry-gate:\n", "  renamed-gate:\n")}),
+        "otherjob": pr("otherjob", {c8_rel: C8_FIXTURE.replace("echo other", "echo other2").replace(
+            "echo later", "echo later2")}),
+        "symlink": pr("symlink", {mod_rs: wire, CERT_DOC: symlink_doc}),
+    }
+    # Merge-structure shapes off one PR head (#6138 cells, here in --trusted mode).
+    fx.g("checkout", "-q", "-b", "h8", base)
+    fx.write("src/unrelated.rs", "// h8 PR work\n", append=True)
+    head8 = fx.commit(["src/unrelated.rs"], "h8: PR work")
+    fx.g("checkout", "-q", "-b", "o8", base)
+    fx.write("src/other8.rs", "fn other8() {}\n")
+    fx.commit(["src/other8.rs"], "o8: an unrelated branch")
+    fx.g("checkout", "-q", "main")
+    good8 = fx.merge("h8", "Merge h8 into main")
+    fx.reset(base)
+    unrel8 = fx.merge("o8", "Merge o8 into main (not the PR head)")
+    fx.reset(base)
+    fx.g("merge", "-q", "--no-ff", "-m", "octopus: h8 and o8", "h8", "o8")
+    octo8 = fx.g("rev-parse", "HEAD")
+    fx.reset(base)
+    fx.g("checkout", "-q", "h8")
+    rev8 = fx.merge("main", "Merge main into h8 (reversed parents)")
+    fx.g("checkout", "-q", "-b", "side8", genesis)
+    fx.write("src/side8.rs", "fn side8() {}\n")
+    side8 = fx.commit(["src/side8.rs"], "a side branch the merge was not built from")
+    fx.g("checkout", "-q", "main")
+    fx.write("src/main8.rs", "fn main8() {}\n")
+    moved8 = fx.commit(["src/main8.rs"], "base moves on with an unrelated commit")
+    fx.g("update-ref", "refs/remotes/pull/merge", shapes["clean"][1])
+
+    # The judged repository is a BARE mirror: there is no working tree, so the
+    # mode can only read git objects (the head is data, never checked out).
+    mirror = tmp / "trusted-mirror.git"
+    fx.g("clone", "-q", "--mirror", str(repo), str(mirror))
+    mg = Fixture(mirror)
+    mg.g("update-ref", "refs/remotes/origin/main", base)
+
+    def judge(label, why, head, merge, needles=(), absent=(), ok=False, extra=()):
+        rc, out = trusted_cli(mirror, "--base-ref", "main", "--base-sha", base,
+                              "--head-sha", head, "--merge-ref", merge, *extra)
+        if ok and rc != 0:
+            t.fail(f"({label}): {why} was REJECTED (rc {rc}):", out)
+        elif not ok and rc != 1:
+            t.fail(f"({label}): {why} did not fail closed with rc 1 (rc {rc}):", out)
+        for needle in needles:
+            if needle not in out:
+                t.fail(f"({label}): {why}: output does not say {needle!r}:", out)
+        for needle in absent:
+            if needle in out:
+                t.fail(f"({label}): {why}: output must not say {needle!r}:", out)
+        return out
+
+    guard = "GUARD CHANGED: "
+    judge("tr0", "control: an unrelated PR change", *shapes["clean"], ok=True,
+          needles=("federation-wire surface unchanged",), absent=(guard,))
+    judge("tr0-ref", "control: the merge commit named by refs/remotes/pull/merge", shapes["clean"][0],
+          "refs/remotes/pull/merge", ok=True)
+    # (tr-a) the head replaces the gate with an exit-0 stub AND changes the wire:
+    # the base copy still reds with the section 7 sentence, and names the guard edit.
+    judge("tr-a", "a head that stubs the gate to exit 0 and changes the federation wire", *shapes["stub"],
+          needles=(sentence, mod_rs, guard + gate_rel))
+    stub_file = tmp / "head-gate-copy.py"
+    stub_file.write_bytes(run_git(mirror, "show", f"{shapes['stub'][0]}:{gate_rel}").stdout)
+    stub_rc = subprocess.run([sys.executable, "-I", str(stub_file)], capture_output=True, check=False,
+                             timeout=60).returncode
+    if stub_rc != 0:
+        t.fail(f"(tr-a-control): the head's stub gate copy exited {stub_rc}, not 0; the cell proves nothing")
+    # A trailer never waives the section 7 verdict.
+    judge("tr-a2", "the same stub + wire change WITH the approval trailer", *shapes["stubok"],
+          needles=(sentence, guard + gate_rel, "Selftest Approver"))
+    # Environment overrides are not a range source in --trusted mode.
+    saved = {k: os.environ.get(k) for k in ("CERT_EXPIRY_BASE", "CERT_EXPIRY_HEAD", "GITHUB_EVENT_NAME")}
+    os.environ.update(CERT_EXPIRY_BASE=base, CERT_EXPIRY_HEAD=base, GITHUB_EVENT_NAME="workflow_dispatch")
+    try:
+        judge("tr-a3", "stub + wire change with CERT_EXPIRY_* / event overrides in the environment",
+              *shapes["stub"], needles=(sentence,))
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    judge("tr-wire", "a PR wire change without a banner flip (pr6 shape)", *shapes["wire"],
+          needles=(sentence, mod_rs), absent=(guard,))
+    # (tr-b) a trusted path edited without / with the trailer.
+    judge("tr-b", "the trusted workflow edited without the trailer", *shapes["wf"],
+          needles=(guard + wf_rel, "Rule-Change-Approved-By"))
+    judge("tr-b-ok", "the trusted workflow edited WITH the trailer", *shapes["wfok"], ok=True,
+          needles=(guard + wf_rel, "approval trailer(s)", "Selftest Approver"))
+    for label, rel in (("pin", pin_rel), ("gate", gate_rel)):
+        judge(f"tr-b-{label}", f"{rel} edited without the trailer", *shapes[label], needles=(guard + rel,))
+    job = guard + f"{c8_rel} ({PINNED_TRUSTED_JOB[1]} job)"
+    judge("tr-b-job", "the cert-expiry-gate job block edited without the trailer", *shapes["job"], needles=(job,))
+    judge("tr-b-jobgone", "the cert-expiry-gate job renamed away", *shapes["jobgone"], needles=(job,))
+    judge("tr-b-other", "other jobs of c8-precheck.yml edited (not a guard change)", *shapes["otherjob"],
+          ok=True, absent=(guard,))
+    # (tr-d) a symlinked cert doc is refused, not followed or read as text.
+    judge("tr-d", "the cert doc replaced by a symlink alongside a wire change", *shapes["symlink"],
+          needles=("symlink",))
+    # (tr-c) merge-parent structure, fail-closed with its reason.
+    judge("tr-c-ok", "control: a two-parent merge of the base and the PR head", head8, good8, ok=True)
+    judge("tr-c-second", "second parent is not the PR head", head8, unrel8, needles=("is not PR_HEAD_SHA",))
+    judge("tr-c-octopus", "an octopus merge", head8, octo8, needles=("does not have exactly two parents",))
+    judge("tr-c-reversed", "reversed parents", head8, rev8, needles=("reversed parents",))
+    judge("tr-c-notmerge", "a merge ref that is not a merge commit", head8, base,
+          needles=("does not have exactly two parents",))
+    mg.g("update-ref", "refs/remotes/origin/main", moved8)
+    judge("tr-c-moved", "base moved by an unrelated commit after the merge was built", head8, good8, ok=True,
+          needles=(f"unchanged in {base}..{good8}",))
+    mg.g("update-ref", "refs/remotes/origin/main", side8)
+    judge("tr-c-offbase", "first parent not on the live base", head8, good8, needles=("is not on the live base",))
+    mg.g("update-ref", "refs/remotes/origin/main", base)
+    # (tr-e) argument refusals, before any git call reads a head-controlled value.
+    hex_msg = "is not exactly 40 or 64 hex characters"
+    judge("tr-e-head", "an abbreviated head sha", head8[:12], good8, needles=(hex_msg,))
+    judge("tr-e-optref", "an option-shaped merge ref", head8, "--upload-pack=x", needles=("--merge-ref",))
+    judge("tr-e-missing", "a merge ref that does not resolve", head8, "refs/remotes/pull/no-such",
+          needles=("does not resolve",))
+    rc, out = trusted_cli(mirror, "--base-ref", "--upload-pack=x", "--base-sha", base,
+                          "--head-sha", head8, "--merge-ref", good8)
+    if rc != 1 or "is not a plain branch name" not in out:
+        t.fail(f"(tr-e-baseref): an option-shaped base ref did not fail closed (rc {rc}):", out)
+    rc, out = trusted_cli(mirror, "--base-ref", "main", "--merge-ref", good8)
+    if rc == 0 or "--head-sha" not in out:
+        t.fail(f"(tr-e-args): --trusted without --head-sha did not refuse (rc {rc}):", out)
 
 
 SELF_TEST_OK = (
@@ -2088,7 +2326,13 @@ SELF_TEST_OK = (
     "(checkout-depth-coverage, #6145) checkout-depth runs the shim-unexecutable cell; "
     "(checkout-depth, #6145) every #6145 shim and scratch cell (including shim-unexecutable) passes in a "
     "226-byte scratch dir, the one a 184-byte checkout gets; the gate-run fixtures build one gitshim.* level under the scratch "
-    "dir and fit within it."
+    "dir and fit within it; "
+    "(tr, #6140) --trusted mode over a BARE mirror (objects only, nothing checked out): "
+    "a head that stubs the gate to exit 0 and changes the wire RED with the §7 sentence and GUARD "
+    "CHANGED (the stub itself exits 0), a trailer never waives §7, environment overrides ignored, "
+    "each trusted path and the cert-expiry-gate job block RED without the trailer and GREEN with it, "
+    "other c8 jobs GREEN, a symlinked cert doc fail-closed, and the merge-parent cells (second "
+    "parent, octopus, reversed, not a merge, moved base GREEN, off-base) plus argument refusals."
 )
 
 

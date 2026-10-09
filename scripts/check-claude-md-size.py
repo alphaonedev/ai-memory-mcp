@@ -1835,6 +1835,96 @@ def compare_workflow_errors(path: Path, label: str = COMPARE_WORKFLOW_PATH) -> l
     return errors
 
 
+CERT_TRUSTED_WORKFLOW_PATH = ".github/workflows/cert-expiry-trusted.yml"
+# #6140: the pull_request_target companion of the required cert-expiry-gate job runs the BASE copy of
+# scripts/check_cert_expiry.py over the pull request's merge commit as git objects. It is pinned to this canonical
+# form (comments and blank lines dropped), twin of COMPARE_WORKFLOW_LINES: a changed trigger, a wider permission,
+# a head or merge-commit checkout, an extra step, a secret, a self-hosted runner or a `run:` that is not the base
+# gate fails the guard. The merge ref is FETCHED as objects (never checked out), so `/merge` is allowed on the fetch
+# line only, which the exact-line comparison enforces.
+CERT_TRUSTED_WORKFLOW_LINES = (
+    "name: Enterprise-federation cert-expiry gate (trusted base copy)",
+    "on:",
+    "pull_request_target:",
+    'branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]',
+    "types: [opened, synchronize, reopened, edited]",
+    "permissions:",
+    "contents: read",
+    "concurrency:",
+    "group: cert-expiry-trusted-${{ github.event.pull_request.number }}",
+    "cancel-in-progress: true",
+    "jobs:",
+    "cert-expiry-trusted:",
+    "name: Enterprise-federation cert-expiry gate, trusted base copy (cert §7 / F7)",
+    "runs-on: ubuntu-latest",
+    "timeout-minutes: 10",
+    "steps:",
+    "- name: Check out the BASE commit only",
+    COMPARE_CHECKOUT,
+    "with:",
+    "ref: ${{ github.event.pull_request.base.sha }}",
+    "fetch-depth: 0",
+    "persist-credentials: false",
+    "- name: Fetch the pull request head and merge commit as git objects (data, never checked out)",
+    "env:",
+    "PR_NUMBER: ${{ github.event.pull_request.number }}",
+    'run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head" '
+    '"+refs/pull/${PR_NUMBER}/merge:refs/remotes/pull/merge"',
+    "- name: Cert-expiry gate self-test (base code)",
+    "run: python3 -I scripts/check_cert_expiry.py --self-test",
+    "- name: Judge the merge commit with the base copy of the gate",
+    "env:",
+    "BASE_REF: ${{ github.event.pull_request.base.ref }}",
+    "BASE_SHA: ${{ github.event.pull_request.base.sha }}",
+    "HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
+    'run: python3 -I scripts/check_cert_expiry.py --trusted --base-ref "$BASE_REF" --base-sha "$BASE_SHA" '
+    '--head-sha "$HEAD_SHA" --merge-ref refs/remotes/pull/merge',
+)
+CERT_TRUSTED_WORKFLOW_INDENTS = (0, 0, 2, 4, 4, 0, 2, 0, 2, 2, 0, 2, 4, 4, 4, 4, 6, 8, 8, 10, 10, 10, 6, 8, 10, 8, 6, 8,
+                                 6, 8, 10, 10, 10, 8)
+CERT_TRUSTED_DANGER = tuple(item for item in COMPARE_DANGER if item[0] != "/merge") + (
+    ("self-hosted", "the job must run on a GitHub-hosted runner"),
+    ("working-directory:", "the gate must run from the base checkout root"),
+)
+
+
+def cert_trusted_workflow_errors(path: Path, label: str = CERT_TRUSTED_WORKFLOW_PATH) -> list:
+    """#6140: the pull_request_target cert-expiry companion workflow must equal its pinned canonical form."""
+    errors = []
+    if regular_size(path, label, errors) is None:
+        return errors
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return [f"FAIL: cannot read {label} as UTF-8: {exc}"]
+    lines = []
+    indents = []
+    for raw in split_lines(text):
+        stripped = re.sub(r"(^|\s)#.*$", "", raw).rstrip()
+        if stripped.strip():
+            lines.append(stripped.strip())
+            indents.append(len(stripped) - len(stripped.lstrip(" ")))
+    if tuple(indents) != CERT_TRUSTED_WORKFLOW_INDENTS:
+        errors.append(f"FAIL: {label} indentation differs from the pinned form (CERT_TRUSTED_WORKFLOW_INDENTS) (#6140)")
+    for token, why in CERT_TRUSTED_DANGER:
+        if any(token in line for line in lines):
+            errors.append(f"FAIL: {label} contains `{token}`: {why} (#6140)")
+    for line in lines:
+        if line.startswith(("- uses:", "uses:")) and not re.search(r"uses:\s*\S+@[0-9a-f]{40}$", line):
+            errors.append(f"FAIL: {label} action is not pinned to a 40-hex commit sha: {line[:100]} (#6140)")
+    expected = list(CERT_TRUSTED_WORKFLOW_LINES)
+    if len(lines) != len(expected):
+        errors.append(f"FAIL: {label} has {len(lines)} meaningful lines, the pinned form has {len(expected)} (#6140)")
+    for number, (got, want) in enumerate(zip(lines, expected), 1):
+        if want == COMPARE_CHECKOUT:
+            if got != f"uses: actions/checkout@{CHECKOUT_SHA}":
+                errors.append(f"FAIL: {label} meaningful line {number} must be the pinned checkout action, got {got[:100]} (#6140)")
+        elif got != want:
+            errors.append(f"FAIL: {label} meaningful line {number} differs from the pinned form: {got[:100]} (#6140)")
+            break
+    return errors
+
+
 def scratch_base_error(repo_root: Path):
     """Return a failure message when `<repo_root>/.local-runs` is a symlink (or not a directory), else None.
 
@@ -1999,6 +2089,7 @@ def run_workflow_cases(repo_root: Path, base: Path) -> bool:
         print("FAIL: self-test - a missing workflow file was NOT rejected", file=sys.stderr)
         ok = False
     ok &= run_compare_workflow_cases(repo_root, base)
+    ok &= run_cert_trusted_workflow_cases(repo_root, base)
     return ok
 
 
@@ -2090,6 +2181,85 @@ def run_compare_workflow_cases(repo_root: Path, base: Path) -> bool:
     return ok
 
 
+def run_cert_trusted_workflow_cases(repo_root: Path, base: Path) -> bool:
+    """#6140: the pull_request_target cert-expiry companion workflow is pinned; each unsafe edit is refused."""
+    real = repo_root / CERT_TRUSTED_WORKFLOW_PATH
+    real_errors = cert_trusted_workflow_errors(real)
+    if real_errors:
+        print(f"FAIL: self-test - the cert-expiry trusted workflow was rejected: {real_errors[0]}", file=sys.stderr)
+        return False
+    ok = True
+    good = real.read_text(encoding="utf-8")
+    wf = base / "certwf"
+    wf.mkdir()
+
+    def case(label: str, text: str, needle: str) -> bool:
+        target = wf / "w.yml"
+        target.write_text(text, encoding="utf-8")
+        if not any(needle in line for line in cert_trusted_workflow_errors(target, label)):
+            print(f"FAIL: self-test - cert-expiry trusted workflow case {label!r} was NOT rejected (wanted {needle!r})",
+                  file=sys.stderr)
+            return False
+        return True
+
+    base_ref = "ref: ${{ github.event.pull_request.base.sha }}\n"
+    gate = "python3 -I scripts/check_cert_expiry.py"
+    ok &= case("#6140 head checked out", good.replace(
+        base_ref, "ref: ${{ github.event.pull_request.head.sha }}\n", 1), "differs from the pinned form")
+    ok &= case("#6140 merge commit checked out", good.replace(
+        base_ref, "ref: refs/pull/${{ github.event.pull_request.number }}/merge\n", 1), "differs from the pinned form")
+    ok &= case("#6140 head repo checked out", good.replace(
+        "          " + base_ref, "          " + base_ref
+        + "          repository: ${{ github.event.pull_request.head.repo.full_name }}\n", 1), "head.repo")
+    ok &= case("#6140 secret exposed", good.replace(
+        "          PR_NUMBER:", "          TOKEN: ${{ secrets.GITHUB_TOKEN }}\n          PR_NUMBER:", 1), "secrets.")
+    ok &= case("#6140 self-hosted runner", good.replace(
+        "runs-on: ubuntu-latest", "runs-on: [self-hosted, linux]", 1), "self-hosted")
+    ok &= case("#6140 write permission", good.replace("  contents: read", "  contents: write", 1),
+               "differs from the pinned form")
+    ok &= case("#6140 extra permission", good.replace("  contents: read", "  contents: read\n  pull-requests: write", 1),
+               "meaningful lines")
+    ok &= case("#6140 extra step", good + "      - run: python3 scripts/check_cert_expiry.py\n", "meaningful lines")
+    ok &= case("#6140 head copy of the gate executed", good.replace(
+        "        run: " + gate + " --self-test\n",
+        "        run: " + gate + " --self-test\n      - run: git show refs/remotes/pull/head:scripts/check_cert_expiry.py\n",
+        1), "meaningful lines")
+    ok &= case("#6140 self-test step removed", good.replace(
+        "      - name: Cert-expiry gate self-test (base code)\n        run: " + gate + " --self-test\n", "", 1),
+        "meaningful lines")
+    ok &= case("#6140 gate run without -I", good.replace(
+        gate + " --trusted", "python3 scripts/check_cert_expiry.py --trusted", 1), "differs from the pinned form")
+    ok &= case("#6140 trusted mode dropped", good.replace(" --trusted --base-ref", " --base-ref", 1),
+               "differs from the pinned form")
+    ok &= case("#6140 job-level if", good.replace("    timeout-minutes: 10", "    timeout-minutes: 10\n    if: false", 1),
+               "`if:`")
+    ok &= case("#6140 paths filter", good.replace("    branches:", "    paths: [\"src/**\"]\n    branches:", 1), "`paths:`")
+    ok &= case("#6140 swallowed failure", good.replace(
+        "--self-test\n", "--self-test\n        continue-on-error: true\n", 1), "continue-on-error")
+    ok &= case("#6140 unpinned action", good.replace(
+        "@11d5960a326750d5838078e36cf38b85af677262", "@v4", 1), "action is not pinned")
+    ok &= case("#6140 checkout impostor sha", good.replace(
+        "@11d5960a326750d5838078e36cf38b85af677262", "@" + "1" * 40, 1), "pinned checkout action")
+    ok &= case("#6140 persist-credentials moved out of with:", good.replace(
+        "          persist-credentials: false", "        persist-credentials: false", 1), "indentation")
+    ok &= case("#6140 pull_request trigger instead", good.replace("  pull_request_target:\n", "  pull_request:\n", 1),
+               "differs from the pinned form")
+    ok &= case("#6140 branch removed", good.replace(', "rehearsal/**", "chain/**"]', ', "chain/**"]', 1),
+               "differs from the pinned form")
+    (wf / "bad.yml").write_bytes(good.encode("utf-8") + b"# \xff\n")
+    if not any("cannot read" in line for line in cert_trusted_workflow_errors(wf / "bad.yml", "bad")):
+        print("FAIL: self-test - a cert-expiry trusted workflow that is not UTF-8 was NOT rejected", file=sys.stderr)
+        ok = False
+    (wf / "empty.yml").write_text("", encoding="utf-8")
+    if not cert_trusted_workflow_errors(wf / "empty.yml", "empty"):
+        print("FAIL: self-test - an empty cert-expiry trusted workflow file was NOT rejected", file=sys.stderr)
+        ok = False
+    if not any("cannot stat" in line for line in cert_trusted_workflow_errors(wf / "absent.yml", "absent")):
+        print("FAIL: self-test - a missing cert-expiry trusted workflow was NOT rejected", file=sys.stderr)
+        ok = False
+    return ok
+
+
 def run_index_entries_case(repo_root: Path) -> bool:
     """R4: INDEX_ENTRIES_SHA256 is enforced. The fixture cases pass their own index pins, which skips the
     exact-lines hash, so this case runs check_index on the live tree with the real pins: it must pass as is,
@@ -2156,7 +2326,7 @@ def run_main_wiring_case(repo_root: Path, base: Path) -> bool:
     root = base / "wiring"
     root.mkdir()
     build_fixture(root)
-    for rel in (WORKFLOW_PATH, COMPARE_WORKFLOW_PATH):
+    for rel in (WORKFLOW_PATH, COMPARE_WORKFLOW_PATH, CERT_TRUSTED_WORKFLOW_PATH):
         (root / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(repo_root / rel, root / rel)
     update_manifest_quiet(root)
@@ -2169,6 +2339,7 @@ def run_main_wiring_case(repo_root: Path, base: Path) -> bool:
         (WORKFLOW_PATH, '  push:\n    branches: [main, develop, "release/**"]',
          "  push:\n    branches: [main]", "push"),
         (COMPARE_WORKFLOW_PATH, "    timeout-minutes: 10", "    timeout-minutes: 10\n    if: false", "`if:`"),
+        (CERT_TRUSTED_WORKFLOW_PATH, "runs-on: ubuntu-latest", "runs-on: [self-hosted, linux]", "self-hosted"),
     )
     for rel, old, new, needle in edits:
         target = root / rel
@@ -2179,7 +2350,8 @@ def run_main_wiring_case(repo_root: Path, base: Path) -> bool:
             ok = False
         target.write_text(good, encoding="utf-8")
     live = base / "wiring-main"
-    for rel in ("CLAUDE.md", MANIFEST_PATH, WORKFLOW_PATH, COMPARE_WORKFLOW_PATH, *REFERENCE_PATHS):
+    for rel in ("CLAUDE.md", MANIFEST_PATH, WORKFLOW_PATH, COMPARE_WORKFLOW_PATH, CERT_TRUSTED_WORKFLOW_PATH,
+                *REFERENCE_PATHS):
         (live / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(repo_root / rel, live / rel)
     runs = ((WORKFLOW_PATH, "", "", 0, "PASS: CLAUDE.md is a regular file"),)
@@ -2204,10 +2376,11 @@ def run_main_wiring_case(repo_root: Path, base: Path) -> bool:
 
 
 def all_errors(root: Path, index_pins=None) -> list:
-    """Every refusal main() reports: the tree checks plus both workflow pins."""
+    """Every refusal main() reports: the tree checks plus the three workflow pins (#6140 adds the third)."""
     errors = check(root, index_pins)
     errors += workflow_errors(root / WORKFLOW_PATH)
     errors += compare_workflow_errors(root / COMPARE_WORKFLOW_PATH)
+    errors += cert_trusted_workflow_errors(root / CERT_TRUSTED_WORKFLOW_PATH)
     return errors
 
 
