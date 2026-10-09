@@ -47,5 +47,13 @@ AmbientCapabilities=
 # database file, and the backups directory lives under it. This is wider than
 # the pre-#4080 read-only database path and is a deliberate loosening.
 ReadWritePaths=/var/lib/ai-memory
+# #4325 — under ProtectSystem=strict the service user's HOME is the state
+# dir, so the grant above also covered <HOME>/.config/ai-memory/keys: the
+# operator signing key and the local TLS CA. The backup only READS the
+# signing key (its best-effort default write tolerates a read-only config
+# dir), so the key store is read-only inside the job. The nested read-only
+# mount wins over the enclosing read-write one; `-` because the directory
+# exists only once a key has been written.
+ReadOnlyPaths=-/var/lib/ai-memory/.config
 
 TimeoutStartSec=15min
