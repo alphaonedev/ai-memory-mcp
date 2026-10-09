@@ -3864,5 +3864,66 @@ class BeforeClosedWorld6260(unittest.TestCase):
         self.assertEqual(["brand-new.yml:4: ${{ github.event.before }}"], bad)
 
 
+# ---- Round 4, item 3 (#6261): the approval job cannot be neutralised ----
+
+APPROVAL_EVALUATE_STEP = "Evaluate external-PR approval requirement"
+APPROVAL_SELFTEST_STEP = "Self-test the external-PR approval evaluator (#6193)"
+APPROVAL_STEP_NEUTRALISER = r"(?m)^\s+(?:- )?(?:if|continue-on-error):|^\s+timeout-minutes:\s*0\s*$"
+
+
+def _approval_job_problems(c8: str) -> List[str]:
+    """Ways the approval job could pass while the evaluator does not decide (empty = intact)."""
+    job = _job_text(c8, APPROVAL_JOB)
+    problems: List[str] = []
+    if re.search(r"(?m)^    (needs|if):", job):
+        problems.append("job-level needs/if")
+    for name in (APPROVAL_SELFTEST_STEP, APPROVAL_EVALUATE_STEP):
+        block = _step_block(job, name)
+        if not block:
+            problems.append(f"step {name!r} is missing")
+        elif re.search(APPROVAL_STEP_NEUTRALISER, block):
+            problems.append(f"step {name!r} is neutralised")
+    return problems
+
+
+class ApprovalJobPinned6261(unittest.TestCase):
+    """#6261 (code 3): job-level continue-on-error, `|| true` and a swapped command are killed."""
+
+    def setUp(self) -> None:
+        self.c8 = C8_WORKFLOW.read_text(encoding="utf-8")
+
+    def mutated(self, old: str, new: str, count: int = 1) -> List[str]:
+        job = _job_text(self.c8, APPROVAL_JOB)
+        self.assertEqual(count, job.count(old), f"mutation anchor {old!r}")
+        mutant_job = job.replace(old, new, 1)
+        self.assertEqual(1, self.c8.count(job))
+        return _approval_job_problems(self.c8.replace(job, mutant_job, 1))
+
+    def test_6261_live_job_is_intact(self) -> None:
+        self.assertEqual([], _approval_job_problems(self.c8))
+
+    def test_6261_m01_job_level_continue_on_error_is_killed(self) -> None:
+        self.assertTrue(self.mutated("    timeout-minutes: 5\n", "    timeout-minutes: 5\n    continue-on-error: true\n"))
+
+    def test_6261_m02_evaluate_or_true_is_killed(self) -> None:
+        self.assertTrue(self.mutated("        run: python3 -I scripts/check_external_pr_approval.py\n",
+                                     "        run: python3 -I scripts/check_external_pr_approval.py || true\n"))
+
+    def test_6261_m03_evaluate_running_the_self_test_is_killed(self) -> None:
+        self.assertTrue(self.mutated("        run: python3 -I scripts/check_external_pr_approval.py\n",
+                                     "        run: python3 -I scripts/check_external_pr_approval.py --self-test\n"))
+
+    def test_6261_m04_job_timeout_zero_is_killed(self) -> None:
+        self.assertTrue(self.mutated("    timeout-minutes: 5\n", "    timeout-minutes: 0\n"))
+
+    def test_6261_m05_evaluate_script_swapped_is_killed(self) -> None:
+        self.assertTrue(self.mutated("        run: python3 -I scripts/check_external_pr_approval.py\n",
+                                     "        run: python3 -I scripts/check_promotion_geometry.py --self-test\n"))
+
+    def test_6261_m06_evaluate_step_removed_is_killed(self) -> None:
+        self.assertTrue(self.mutated("      - name: Evaluate external-PR approval requirement\n",
+                                     "      - name: Something else\n"))
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
