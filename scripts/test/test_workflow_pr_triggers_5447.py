@@ -3275,6 +3275,89 @@ class ExternalPrApprovalOnPush6117(unittest.TestCase):
         self.assertIn("python3 scripts/check_external_pr_approval.py --self-test", job)
 
 
+class ExternalPrApprovalEntrypoint6226(_Scratch6117):
+    """#6226: the two fail-closed paths of the evaluator that the injected-api cells never reach.
+
+    ``gh_api`` builds the real ``gh`` argv and ``main`` reads the event payload; both are
+    exercised here through the script's own entry point with a fake ``gh`` on PATH.
+    """
+
+    FAKE_GH = (
+        "#!{python}\n"
+        "import json, os, sys\n"
+        "with open(os.environ['FAKE_GH_LOG'], 'a', encoding='utf-8') as fh:\n"
+        "    fh.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "def pr(n, sha, assoc, repo):\n"
+        "    return {{'number': n, 'author_association': assoc, 'user': {{'login': 'x'}},\n"
+        "            'head': {{'sha': sha, 'repo': {{'full_name': repo}}}}}}\n"
+        "page1 = [pr(1, '{b}', 'MEMBER', '{repo}')]\n"
+        "page2 = [pr(2, '{a}', 'NONE', 'fork/ai-memory-mcp')]\n"
+        "if '/reviews' in sys.argv[-1]:\n"
+        "    print('[]')\n"
+        "elif '--paginate' in sys.argv:\n"
+        "    print(json.dumps(page1)); print(json.dumps(page2))\n"
+        "else:\n"
+        "    print(json.dumps(page1))\n")
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.bin = self.td / "bin"
+        self.bin.mkdir()
+        self.log = self.td / "gh.log"
+        gh = self.bin / "gh"
+        gh.write_text(self.FAKE_GH.format(python=sys.executable, a=SHA_A, b=SHA_B, repo=REPO_6117),
+                      encoding="utf-8")
+        gh.chmod(0o755)
+
+    def run_script(self, event: str, payload_path: str = "", sha: str = SHA_A):
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "OPERATOR_"))}
+        env.update({"PATH": str(self.bin) + os.pathsep + env.get("PATH", ""),
+                    "FAKE_GH_LOG": str(self.log), "GITHUB_EVENT_NAME": event,
+                    "GITHUB_EVENT_PATH": payload_path, "GITHUB_REPOSITORY": REPO_6117,
+                    "GITHUB_SHA": sha, "OPERATOR_LOGIN": OPERATOR_6117})
+        out = subprocess.run([sys.executable, "-I", str(APPROVAL_PY)], capture_output=True,
+                             text=True, env=env, timeout=60, check=False)
+        return out.returncode, out.stdout + out.stderr
+
+    def test_6226_push_lists_open_prs_with_paginate_and_judges_page_two(self) -> None:
+        rc, out = self.run_script("push")
+        calls = [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(calls, "the evaluator never called gh")
+        for argv in calls:
+            self.assertIn("--paginate", argv, "every gh api call must paginate (#6226)")
+        # The external PR sits on page 2: without --paginate the gate would pass vacuously.
+        self.assertEqual(1, rc, out)
+        self.assertIn("PR #2", out)
+
+    def test_6226_pull_request_payload_unreadable_fails_closed(self) -> None:
+        for name, path in (("missing", str(self.td / "no-such-event.json")), ("unset", "")):
+            with self.subTest(payload=name):
+                rc, out = self.run_script("pull_request", path)
+                self.assertEqual(1, rc, out)
+                self.assertIn("::error::cannot read the pull_request event payload", out)
+        bad = self.td / "bad.json"
+        bad.write_text("{not json", encoding="utf-8")
+        with self.subTest(payload="malformed"):
+            rc, out = self.run_script("pull_request", str(bad))
+            self.assertEqual(1, rc, out)
+            self.assertIn("::error::cannot read the pull_request event payload", out)
+
+    def test_6226_m01_dropping_paginate_is_killed(self) -> None:
+        src = APPROVAL_PY.read_text(encoding="utf-8")
+        needle = '["gh", "api", "--paginate", path]'
+        self.assertIn(needle, src)
+        mutant = self.td / "check_external_pr_approval_nopaginate.py"
+        mutant.write_text(src.replace(needle, '["gh", "api", path]', 1), encoding="utf-8")
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "OPERATOR_"))}
+        env.update({"PATH": str(self.bin) + os.pathsep + env.get("PATH", ""),
+                    "FAKE_GH_LOG": str(self.log), "GITHUB_EVENT_NAME": "push",
+                    "GITHUB_REPOSITORY": REPO_6117, "GITHUB_SHA": SHA_A,
+                    "OPERATOR_LOGIN": OPERATOR_6117})
+        out = subprocess.run([sys.executable, "-I", str(mutant)], capture_output=True, text=True,
+                             env=env, timeout=60, check=False)
+        self.assertEqual(0, out.returncode, "the mutant must pass vacuously, proving the cell is load-bearing")
+
+
 class RoundTwoDocTruth6117(unittest.TestCase):
     """C-F3: the classify comment no longer says push events never gate merges."""
 
