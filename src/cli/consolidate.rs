@@ -257,11 +257,31 @@ pub fn run_auto(
                     },
                     group.len()
                 );
+                // #4277 — the merged row carries each source's FULL text. The
+                // sources are consumed below (hard-deleted under the legacy
+                // disposition), so the merged row is the only surviving copy:
+                // the former 200-byte byte slice panicked on a multi-byte
+                // boundary and, when it did not, silently dropped every byte
+                // past 200 of every source.
                 let content: String = group
                     .iter()
-                    .map(|m| format!("- {}: {}", m.title, &m.content[..m.content.len().min(200)]))
+                    .map(|m| format!("- {}: {}", m.title, m.content))
                     .collect::<Vec<_>>()
                     .join("\n");
+                // A group whose full text does not fit one memory is skipped,
+                // never truncated: its sources stay live and untouched.
+                if content.len() > models::MAX_CONTENT_SIZE {
+                    writeln!(
+                        out.stderr,
+                        "skipping group [{tag}] in {}: {} sources hold {} bytes, over the \
+                         {} byte content limit; sources left untouched",
+                        ns.namespace,
+                        group.len(),
+                        content.len(),
+                        models::MAX_CONTENT_SIZE
+                    )?;
+                    continue;
+                }
                 // #2121 — CLI caller-origin surface (see `run` above):
                 // never substrate-authored.
                 let new_id = db::consolidate(
@@ -765,6 +785,40 @@ mod tests {
             "the tail of a >200-byte source was lost: {:?}",
             merged.content
         );
+    }
+
+    /// #4277 — a group whose full text exceeds the content limit is skipped
+    /// rather than truncated: every source stays live and nothing merges.
+    #[test]
+    fn test_auto_consolidate_4277_oversize_group_is_skipped_not_truncated() {
+        let mut env = TestEnv::fresh();
+        let db = env.db_path.clone();
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let body = format!("{i}-{}", "c".repeat(30_000));
+            let id = seed_memory(&db, "auto-4277-big", &format!("big-{i}"), &body);
+            ids.push((id, body));
+        }
+        let args = AutoConsolidateArgs {
+            namespace: Some("auto-4277-big".to_string()),
+            short_only: false,
+            min_count: 3,
+            dry_run: false,
+        };
+        {
+            let mut out = env.output();
+            run_auto(&db, &args, false, Some("test-agent"), &mut out).expect("auto-consolidate");
+        }
+        assert!(
+            env.stdout_str().contains("auto-consolidated 0"),
+            "got: {}",
+            env.stdout_str()
+        );
+        let conn = db::open(&db).expect("db::open");
+        for (id, body) in &ids {
+            let mem = db::get(&conn, id).expect("get").expect("source still live");
+            assert!(mem.content == *body, "source text untouched");
+        }
     }
 
     #[test]
