@@ -3989,33 +3989,54 @@ fn section_governance(conn: &rusqlite::Connection) -> ReportSection {
         "namespaces_without_policy".into(),
         count_fact(coverage.map(|c| c.1)),
     ));
-    let without = coverage.map_or(0, |c| c.1);
-
     // v1.0.0 fail-open remediation — the OPT-IN strict admission posture
     // (`AI_MEMORY_PERMISSIONS_REQUIRE_GOVERNED_NAMESPACE`). Reported right
     // beside `namespaces_without_policy` because the two together ARE the
     // blast radius: with the posture engaged under `mode = enforce`, a
     // `store`/`delete`/`promote` into any of those namespaces is refused.
     // Default OFF; flipping that default is deferred to #3125.
+    //
+    // #5009 — `coverage` has THREE states and each gets its own arm: a
+    // readable non-zero count sizes the note, a readable zero is silent, and
+    // an UNREADABLE coverage (the fault path, already Critical above) still
+    // names the engaged posture and says the blast radius cannot be sized —
+    // the pre-#5009 `map_or(0, ..)` collapsed the fault into the silent arm,
+    // dropping the consequence exactly when the refusal posture was live.
     let strict_admission = crate::governance::require_governed_namespace();
     facts.push((
         "require_governed_namespace".into(),
         strict_admission.to_string(),
     ));
-    if strict_admission && mode == crate::config::PermissionsMode::Enforce && without > 0 {
-        if !matches!(severity, Severity::Critical) {
-            severity = Severity::Warning;
-        }
-        append_note(
-            &mut note,
-            &format!(
-                "strict admission posture is engaged under mode=enforce and {without} namespace(s) \
-                 resolve no governance policy — writes into them are refused. Declare a \
-                 substrate-wide default on the '*' namespace, or unset \
-                 {}.",
-                crate::governance::ENV_REQUIRE_GOVERNED_NAMESPACE,
+    if strict_admission && mode == crate::config::PermissionsMode::Enforce {
+        match coverage {
+            Some((_, without)) if without > 0 => {
+                if !matches!(severity, Severity::Critical) {
+                    severity = Severity::Warning;
+                }
+                append_note(
+                    &mut note,
+                    &format!(
+                        "strict admission posture is engaged under mode=enforce and {without} namespace(s) \
+                         resolve no governance policy — writes into them are refused. Declare a \
+                         substrate-wide default on the '*' namespace, or unset \
+                         {}.",
+                        crate::governance::ENV_REQUIRE_GOVERNED_NAMESPACE,
+                    ),
+                );
+            }
+            Some(_) => {}
+            None => append_note(
+                &mut note,
+                &format!(
+                    "strict admission posture is engaged under mode=enforce, but the namespace \
+                     governance coverage could not be read: writes into every namespace that \
+                     resolves no governance policy are refused and the number of affected \
+                     namespaces cannot be sized from this report (#5009). Declare a \
+                     substrate-wide default on the '*' namespace, or unset {}.",
+                    crate::governance::ENV_REQUIRE_GOVERNED_NAMESPACE,
+                ),
             ),
-        );
+        }
     }
 
     // #4715 — a read fault is a Critical finding, never an empty histogram.
