@@ -103,6 +103,106 @@ pub fn compute_policy_digest(conn: &Connection) -> Result<[u8; 32]> {
     Ok(hasher.finalize().into())
 }
 
+/// #4297 — cheap in-snapshot change detector for the `governance_rules`
+/// table: `(row count, enabled count, max rowid)`. Every in-tree mutator
+/// also invalidates the cache explicitly; this fingerprint additionally
+/// catches a rule-set change committed by ANOTHER process under the same
+/// policy sequence (the unsigned bypass path the advisory boot check
+/// exists for), so a stale digest is never served for it.
+type RulesFingerprint = (i64, i64, i64);
+
+fn rules_fingerprint(conn: &Connection) -> Result<RulesFingerprint> {
+    if !table_exists(conn, "governance_rules")? {
+        return Ok((0, 0, 0));
+    }
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(enabled), 0), COALESCE(MAX(rowid), 0) \
+         FROM governance_rules",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .context("policy_version::rules_fingerprint")
+}
+
+/// #4297 — one cached whole-ruleset digest per database file.
+struct CachedDigest {
+    seq: i64,
+    fingerprint: RulesFingerprint,
+    digest: [u8; 32],
+}
+
+/// #4297 — process-wide `(db path → cached digest)` map. Bounded: when a
+/// new path would exceed [`DIGEST_CACHE_MAX_PATHS`] the map is cleared
+/// (a cold miss, never unbounded growth across many test databases).
+fn digest_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, CachedDigest>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, CachedDigest>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+const DIGEST_CACHE_MAX_PATHS: usize = 64;
+
+/// The cache key for `conn`: its file path. An in-memory / pathless
+/// connection is never cached (its rule set is private to the connection).
+fn digest_cache_key(conn: &Connection) -> Option<String> {
+    conn.path()
+        .filter(|p| !p.is_empty() && *p != ":memory:")
+        .map(str::to_string)
+}
+
+/// #4297 — the whole-ruleset digest for the policy at `seq`, computed ONCE
+/// per `(db path, seq, rules fingerprint)` and served from the cache after
+/// that. The digest cost is O(rules) (one full-table read + per-rule
+/// canonicalisation + SHA-256); pre-#4297 every uncached governance check
+/// (the PreToolUse hook, `memory_check_agent_action`, `gate_read`) paid it
+/// per call. Both `seq` and the fingerprint are read in the caller's
+/// snapshot, so a hit names the same committed policy a recompute would.
+///
+/// # Errors
+///
+/// Propagates SQLite / canonicalisation errors.
+fn cached_policy_digest(conn: &Connection, seq: i64) -> Result<[u8; 32]> {
+    let Some(key) = digest_cache_key(conn) else {
+        return compute_policy_digest(conn);
+    };
+    let fingerprint = rules_fingerprint(conn)?;
+    if let Ok(cache) = digest_cache().lock()
+        && let Some(hit) = cache.get(&key)
+        && hit.seq == seq
+        && hit.fingerprint == fingerprint
+    {
+        return Ok(hit.digest);
+    }
+    let digest = compute_policy_digest(conn)?;
+    if let Ok(mut cache) = digest_cache().lock() {
+        if cache.len() >= DIGEST_CACHE_MAX_PATHS && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(
+            key,
+            CachedDigest {
+                seq,
+                fingerprint,
+                digest,
+            },
+        );
+    }
+    Ok(digest)
+}
+
+/// #4297 — drop the cached digest for `conn`'s database. Called by every
+/// `governance_rules` mutator in [`crate::governance::rules_store`] so an
+/// in-process change is never masked by the cache (the fingerprint is the
+/// cross-process backstop).
+pub fn invalidate_policy_digest_cache(conn: &Connection) {
+    if let Some(key) = digest_cache_key(conn)
+        && let Ok(mut cache) = digest_cache().lock()
+    {
+        cache.remove(&key);
+    }
+}
+
 /// Count the `governance.policy_version_advanced` events on the audit
 /// chain — the append-only policy sequence. `0` when the `signed_events`
 /// table is absent.
@@ -157,9 +257,12 @@ pub fn with_read_snapshot<T>(
 /// The sequence and digest read on `conn` as-is: the caller guarantees the
 /// two reads share one snapshot (see [`with_read_snapshot`]).
 fn policy_version_in_snapshot(conn: &Connection) -> Result<PolicyVersion> {
+    let seq = policy_advance_count(conn)?;
     Ok(PolicyVersion {
-        seq: policy_advance_count(conn)?,
-        digest: compute_policy_digest(conn)?,
+        seq,
+        // #4297 — cached per (path, seq, rule-set fingerprint); the seq and
+        // the fingerprint are read in THIS snapshot.
+        digest: cached_policy_digest(conn, seq)?,
     })
 }
 

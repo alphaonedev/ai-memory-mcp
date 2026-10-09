@@ -108,7 +108,7 @@ fn traced<T>(
 
 /// The whole-ruleset digest reads EVERY rule through `rules_store::list`
 /// (`FROM governance_rules ORDER BY id ASC` with no `WHERE kind`); a per-kind
-/// rule load carries `WHERE kind = ?1`.
+/// rule load carries `WHERE kind = ...` (the trace expands bound parameters).
 fn is_digest_list(sql: &str) -> bool {
     sql.contains("FROM governance_rules")
         && sql.contains("ORDER BY id ASC")
@@ -116,7 +116,7 @@ fn is_digest_list(sql: &str) -> bool {
 }
 
 fn is_kind_load(sql: &str) -> bool {
-    sql.contains("FROM governance_rules") && sql.contains("WHERE kind = ?1")
+    sql.contains("FROM governance_rules") && sql.contains("WHERE kind = ")
 }
 
 /// (1) Digest once per committed policy; recomputed on a sequence advance

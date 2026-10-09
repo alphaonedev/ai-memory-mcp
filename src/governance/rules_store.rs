@@ -80,6 +80,7 @@ pub fn insert(conn: &Connection, rule: &Rule) -> Result<()> {
         ],
     )
     .with_context(|| format!("rules_store::insert: id={}", rule.id))?;
+    crate::governance::policy_version::invalidate_policy_digest_cache(conn);
     Ok(())
 }
 
@@ -597,6 +598,7 @@ pub fn remove(conn: &Connection, id: &str) -> Result<bool> {
     let affected = conn
         .execute("DELETE FROM governance_rules WHERE id = ?1", params![id])
         .with_context(|| format!("rules_store::remove: id={id}"))?;
+    crate::governance::policy_version::invalidate_policy_digest_cache(conn);
     Ok(affected > 0)
 }
 
@@ -860,6 +862,7 @@ pub fn set_enabled(conn: &Connection, id: &str, enabled: bool) -> Result<bool> {
             params![i64::from(enabled), id],
         )
         .with_context(|| format!("rules_store::set_enabled: id={id} enabled={enabled}"))?;
+    crate::governance::policy_version::invalidate_policy_digest_cache(conn);
     Ok(affected > 0)
 }
 
@@ -885,6 +888,7 @@ pub fn update_signature(
             params![signature, attest_level, id],
         )
         .with_context(|| format!("rules_store::update_signature: id={id}"))?;
+    crate::governance::policy_version::invalidate_policy_digest_cache(conn);
     Ok(affected > 0)
 }
 

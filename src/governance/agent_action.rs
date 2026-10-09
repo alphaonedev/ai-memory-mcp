@@ -1708,20 +1708,12 @@ pub fn gate_read(
             reason: "read governance unavailable (failing closed)".to_string(),
         })
     };
-    let engine = match RuleEngine::load_for_action(conn, action) {
-        Ok(e) => e,
-        Err(e) => return load_failed(e),
-    };
-
-    // Zero-config fast-path: no read rules → allow, no eval, no audit.
-    if engine.rules().is_empty() {
-        return Ok(());
-    }
-
-    // #4044 — rules exist, so this verdict is audited and may be judge-signed
-    // with a policy version: re-load the rules TOGETHER with that version in
-    // one read snapshot and evaluate THOSE rules. (The zero-config probe above
-    // stays a single cheap read on the recall hot path.)
+    // #4044 — the rules are loaded TOGETHER with the policy version that
+    // evaluates them, in one read snapshot. #4297 — ONE load per call: the
+    // former zero-config probe (a second `WHERE kind` read) is gone, and the
+    // policy digest the attributed load carries is served from the
+    // per-sequence cache, so the recall hot path pays one rule read plus two
+    // scalar probes.
     let engine = match RuleEngine::load_for_action_attributed(conn, None, action) {
         Ok(e) => e,
         Err(e) => return load_failed(e),
@@ -1731,6 +1723,8 @@ pub fn gate_read(
             "read-gate: attributed load carried no policy version"
         ));
     };
+
+    // Zero-config fast-path: no read rules → allow, no eval, no audit.
     if engine.rules().is_empty() {
         return Ok(());
     }
