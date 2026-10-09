@@ -487,13 +487,16 @@ pub struct PinnedTarget {
 /// NOT apply on this lane). Returns `(resolved_host, addrs)`.
 fn resolve_inference_authority(url: &str) -> Result<(String, Vec<SocketAddr>), String> {
     let lower = url.to_ascii_lowercase();
-    let rest = lower.split_once("://").map_or(lower.as_str(), |(_, r)| r);
+    let (scheme, rest) = lower
+        .split_once("://")
+        .map_or(("", lower.as_str()), |(s, r)| (s, r));
     let host_port = crate::subscriptions::authority_without_userinfo(rest);
     if host_port.is_empty() {
         return Err("target URL has no authority to resolve".to_string());
     }
     // Bracket/port-stripped host (the reqwest resolve key), and a resolvable
-    // `host:port` (default 80 when the URL omits the port), mirroring the
+    // `host:port` (the SCHEME's default port when the URL omits one — #4075:
+    // 443 for https, the port the pinned connector keeps), mirroring the
     // subscriptions SSRF lane's normalization.
     let (resolved_host, resolv_target) =
         if let Some(close) = host_port.strip_prefix('[').and(host_port.find(']')) {
@@ -502,7 +505,7 @@ fn resolve_inference_authority(url: &str) -> Result<(String, Vec<SocketAddr>), S
             let tgt = if after.starts_with(':') {
                 host_port.to_string()
             } else {
-                crate::subscriptions::host_port_with_default_http_port(host_port)
+                crate::subscriptions::dns_guard::host_port_with_default_port(host_port, scheme)
             };
             (inner, tgt)
         } else if let Some(idx) = host_port.rfind(':') {
@@ -510,7 +513,7 @@ fn resolve_inference_authority(url: &str) -> Result<(String, Vec<SocketAddr>), S
         } else {
             (
                 host_port.to_string(),
-                crate::subscriptions::host_port_with_default_http_port(host_port),
+                crate::subscriptions::dns_guard::host_port_with_default_port(host_port, scheme),
             )
         };
     match resolv_target.to_socket_addrs() {
