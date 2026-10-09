@@ -962,6 +962,50 @@ namespace = "team/*"
         assert_eq!(back, FailMode::Closed);
     }
 
+    /// #4526 — a namespace pattern using a wildcard form the matcher does not
+    /// understand (anything but the whole-pattern `*` or one trailing `/*`)
+    /// loaded cleanly and was then compared as a literal, so a scoped guard
+    /// hook silently never fired. Load must refuse it.
+    #[test]
+    fn load_rejects_unsupported_wildcard_namespace_patterns_4526() {
+        let toml_for = |pat: &str| {
+            format!(
+                r#"
+[[hook]]
+event = "pre_store"
+command = "/opt/hooks/guard"
+priority = 0
+timeout_ms = 1000
+mode = "exec"
+enabled = true
+fail_mode = "closed"
+namespace = "{pat}"
+"#
+            )
+        };
+        for bad in [
+            "team/*/x", "*team", "team*", "*/eng", "team/**", "te*m/*", "**", "*/*", "/*",
+        ] {
+            let err = HookConfig::load_from_str(&toml_for(bad))
+                .expect_err(&format!("{bad:?} must be refused at load"));
+            match err {
+                HooksConfigError::Validation { field, reason } => {
+                    assert_eq!(field, "hook[0].namespace", "{bad:?}");
+                    assert!(
+                        reason.contains("unsupported wildcard"),
+                        "{bad:?}: {reason}"
+                    );
+                }
+                other => panic!("{bad:?}: expected a Validation error, got {other:?}"),
+            }
+        }
+        for ok in ["*", "team/eng", "team/*", "team/eng/*"] {
+            let hooks = HookConfig::load_from_str(&toml_for(ok))
+                .unwrap_or_else(|e| panic!("{ok:?} must load: {e}"));
+            assert_eq!(hooks.len(), 1, "{ok:?}");
+        }
+    }
+
     #[test]
     fn matches_namespace_gates_hook_firing() {
         // FBL-29 — the per-hook `namespace` pattern must actually gate firing.
