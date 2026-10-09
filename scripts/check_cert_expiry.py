@@ -157,6 +157,20 @@ EXPIRY_SENTENCE = (
 )
 
 
+# #6124 (5-agent vote 4d3ea1c5, T3): while the banner is EXPIRED/VOID at both
+# ends, a NEW dated amendment below STATUS that lists exactly the changed
+# watched paths / AI_MEMORY_FED_* identifiers and cites #6063 is a recorded,
+# non-discharging pass. Only a WP-B1 re-cert (#6063) returns the doc to LIVE.
+AMENDMENT_HEAD_RE = re.compile(
+    r"^>" + _S + r"*\*\*Amendment \(\d{4}-\d{2}-\d{2}\b.*\*\*" + _S + r"*$"
+)
+AMENDMENT_ITEM_RE = re.compile(r"^>" + _S + r"*[-*]" + _S + r"+`([^`\n]+)`" + _S + r"*$")
+AMENDMENT_BACK_RE = re.compile(r"^>" + _S + r"*Path back to LIVE:")
+FENCE_RE = re.compile(r"^>?" + _S + r"*(?:```|~~~)")
+ISSUE_REF_RE = re.compile(r"#\d+")
+RE_CERT_ISSUE = "#6063"
+
+
 class GateError(Exception):
     """Evidence is missing or ambiguous: the gate fails closed."""
 
@@ -321,6 +335,79 @@ def cert_banner(repo, tree):
 
 def fmt_banner(banner):
     return f"{banner[0]} {banner[1]}"
+
+
+def amendment_blocks(repo, tree):
+    """Amendment blocks of the cert doc at TREE that sit BELOW the STATUS line
+    and outside any code fence (#6124). A block starts at a single-line bold
+    `> **Amendment (YYYY-MM-DD, ...)**` header and runs over the following
+    `>` lines. Returns a list of dicts: header, items (exact backticked
+    bullet entries), back_ok (a `Path back to LIVE:` line that cites #6063
+    and no other issue)."""
+    proc = run_git(repo, "show", "--end-of-options", f"{tree}:{CERT_DOC}")
+    if proc.returncode != 0:
+        return []
+    lines = proc.stdout.decode("utf-8", "replace").split("\n")
+    blocks = []
+    cur = None
+    in_fence = False
+    seen_status = False
+    for ln in lines:
+        if FENCE_RE.match(ln):
+            in_fence = not in_fence
+            if not ln.startswith(">"):
+                cur = None
+            continue
+        if in_fence:
+            continue
+        if STATUS_LINE_RE.match(ln):
+            seen_status = True
+            cur = None
+            continue
+        if not ln.startswith(">"):
+            cur = None
+            continue
+        if AMENDMENT_HEAD_RE.match(ln):
+            cur = None
+            if seen_status:
+                cur = {"header": ln.strip(), "items": [], "back_ok": False}
+                blocks.append(cur)
+            continue
+        if cur is None:
+            continue
+        item = AMENDMENT_ITEM_RE.match(ln)
+        if item:
+            cur["items"].append(item.group(1))
+        elif AMENDMENT_BACK_RE.match(ln):
+            refs = ISSUE_REF_RE.findall(ln)
+            if refs and all(r == RE_CERT_ISSUE for r in refs):
+                cur["back_ok"] = True
+    return blocks
+
+
+def amendment_verdict(repo, mb, judged, required):
+    """(ok, why) for the #6124 pass path: some amendment block at JUDGED whose
+    header is absent from MB lists exactly the REQUIRED set and cites #6063."""
+    old_headers = {b["header"] for b in amendment_blocks(repo, mb)}
+    fresh = [b for b in amendment_blocks(repo, judged) if b["header"] not in old_headers]
+    if not fresh:
+        return False, "no NEW dated amendment below STATUS was added in this change"
+    why = []
+    for blk in fresh:
+        listed = set(blk["items"])
+        missing = sorted(required - listed)
+        extra = sorted(listed - required)
+        if len(listed) != len(blk["items"]):
+            why.append(f"{blk['header']}: an entry is listed more than once")
+        if missing:
+            why.append(f"{blk['header']}: not listed: {', '.join(missing)}")
+        if extra:
+            why.append(f"{blk['header']}: listed but not changed: {', '.join(extra)}")
+        if not blk["back_ok"]:
+            why.append(f"{blk['header']}: no 'Path back to LIVE:' line citing only {RE_CERT_ISSUE}")
+        if not missing and not extra and blk["back_ok"] and len(listed) == len(blk["items"]):
+            return True, blk["header"]
+    return False, "; ".join(why)
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +612,29 @@ def _judge(repo, base, head, judged, mb, tip):
         )
         return ok, "\n".join([head_line] + more)
 
+    amend_why = ""
+    if (
+        incidental
+        and not deleted
+        and not malformed
+        and banner_mb[0] in ("EXPIRED", "VOID")
+        and banner_head[0] in ("EXPIRED", "VOID")
+    ):
+        amend_ok, amend_why = amendment_verdict(
+            repo, mb, judged, set(watched) | set(added) | set(removed)
+        )
+        if amend_ok:
+            ok, more = check_banner_consistency(repo, judged)
+            head_line = (
+                f"{PREFIX}: PASS — federation-wire surface changed while the certification "
+                f"is {banner_head[0]} at both ends ({mb}..{judged}) and this change adds a "
+                f"new non-discharging amendment listing exactly its {len(watched)} watched "
+                f"path(s) and {len(added) + len(removed)} identifier(s) and citing "
+                f"{RE_CERT_ISSUE} (#6124); the certification is NOT re-issued, only the "
+                f"WP-B1 re-cert ({RE_CERT_ISSUE}) returns it to LIVE"
+            )
+            return ok, "\n".join([head_line] + more)
+
     out = [EXPIRY_SENTENCE]
     if incidental:
         out.append(
@@ -532,6 +642,13 @@ def _judge(repo, base, head, judged, mb, tip):
             f"nor its Binds-to line changed (banner {fmt_banner(banner_head)} at "
             "both ends) — an incidental edit is not a re-issue and not a voiding "
             "record (#3556)."
+        )
+    if amend_why:
+        out.append(
+            f"The certification is {banner_head[0]}; a non-discharging amendment is "
+            f"accepted only when it is new, below STATUS, outside code fences, lists "
+            f"exactly the changed watched paths and AI_MEMORY_FED_* identifiers, and "
+            f"cites {RE_CERT_ISSUE} (#6124). Not satisfied: {amend_why}."
         )
     if deleted:
         out.append(
@@ -1548,7 +1665,11 @@ SELF_TEST_OK = (
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
     "octopus merge RED; (ci1-ci7, #5970) the event payload range is authoritative under "
     "GitHub Actions and CERT_EXPIRY_BASE/HEAD overrides are refused there but honoured "
-    "outside CI."
+    "outside CI; (6124-h1..h3, f8b, #6124) EXPIRED/VOID at both ends plus a NEW amendment "
+    "below STATUS listing exactly the changed watched paths and identifiers and citing "
+    "#6063 GREEN; (6124-f1..f11) missing, extra, substring, prose-only, pre-existing, LIVE "
+    "at either end, fenced, unlisted-identifier, above-STATUS, uncited, other-issue and "
+    "outside-the-block amendments RED."
 )
 
 
