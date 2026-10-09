@@ -828,7 +828,8 @@ def write_git_shim(shim_dir, real, version="", fail="", interpreter=None):
     Self-test limit (#6145 R5-F3): the `shim-interpreter` cell builds 255/256-byte
     interpreter lines under its scratch dir, so that dir's absolute path must be at
     most SCRATCH_PATH_LIMIT (226) bytes, i.e. the checkout path at most 184 bytes
-    (CI uses 44). A deeper checkout fails the cell with a message naming both
+    (CI uses 44); the checkout-depth cell pins that no other cell needs more (R8-F1).
+    A deeper checkout fails the cell with a message naming both
     lengths; it is a property of the environment, not a defect in the gate."""
     python = sys.executable if interpreter is None else str(interpreter)
     line = f"#!{python} -I"
@@ -1077,16 +1078,18 @@ def path_max_fallback_violation(tmp):
 PATH_MAX_LEAK_PREFIX = "path_max_fallback_violation leaked"
 
 
-def path_max_restore_violation(tmp):
-    """None when path_max_fallback_violation hands os.pathconf and sys.platform back
-    exactly as it found them AND passes, else a description (#6145 R6-F3). It is the
-    only caller of path_max_fallback_violation and runs first in the cell list, so the
-    snapshot is the true entry state and a leak names the real host platform (R7-F1).
-    The patch list ends on a platform that is not the host's, so a dropped restore is
-    visible on Linux too."""
+def path_max_restore_violation(tmp, fallback=path_max_fallback_violation):
+    """None when the fallback check (path_max_fallback_violation unless a caller passes
+    another) hands os.pathconf and sys.platform back exactly as it found them AND
+    passes, else a description (#6145 R6-F3). It is the only caller of
+    path_max_fallback_violation and runs first in the cell list, so the snapshot is the
+    true entry state and a leak names the real host platform (R7-F1). The patch list
+    ends on a platform that is not the host's, so a dropped restore is visible on Linux
+    too. The check is a parameter, not a patched global, so the diagnostic can hand in
+    a leaking one without anything to put back (R8-F2)."""
     saved_pathconf, saved_platform = os.pathconf, sys.platform
     try:
-        res = path_max_fallback_violation(tmp)
+        res = fallback(tmp)
     finally:
         leaked = []
         if os.pathconf is not saved_pathconf:
@@ -1099,42 +1102,38 @@ def path_max_restore_violation(tmp):
     return res
 
 
-_IN_RESTORE_DIAGNOSTIC = []
-
-
 def path_max_restore_diagnostic_violation(tmp):
-    """None when a dropped os.pathconf/sys.platform restore is reported against the
-    REAL host platform, else a description (#6145 R7-F1). Runs _self_test in a nested
-    scratch with path_max_fallback_violation replaced by a copy that leaks its patches
-    (what a dropped `finally` does); the nested run's FAIL message must say
-    `not '<host platform>'`, i.e. the restore cell took its snapshot before anything
-    could leak. os.pathconf, sys.platform and the replaced cell are put back."""
-    if _IN_RESTORE_DIAGNOSTIC:
-        return None
+    """None when the path-max-restore cell, handed a fallback check that leaks its
+    patches (what a dropped `finally` does), fails with a leak message naming the REAL
+    host platform and puts os.pathconf and sys.platform back, else a description
+    (#6145 R7-F1, R8-F1, R8-F2). Only that one cell runs, through the same run_cells
+    loop as _self_test, with the leaking check passed as its `fallback` argument: no
+    global is patched, no other cell re-runs and no scratch dir is created, so the
+    diagnostic adds no checkout depth (the 184-byte limit holds)."""
     host, real_pathconf = sys.platform, os.pathconf
-    real_cell = globals()["path_max_fallback_violation"]
 
     def leaking(_tmp):
         for plat, _want in sorted(FALLBACK_PLATFORMS, key=lambda entry: entry[0] != sys.platform):
             os.pathconf, sys.platform = (lambda _p, _n: 0), plat
         return None
-    nested = tmp / "nested-restore-diagnostic"
-    nested.mkdir()
-    globals()["path_max_fallback_violation"] = leaking
-    _IN_RESTORE_DIAGNOSTIC.append(True)
     err = io.StringIO()
     try:
         with contextlib.redirect_stderr(err):
-            rc = _self_test(nested)
+            rc = run_cells(SelfTest(), (("path-max-restore", path_max_restore_violation, (tmp, leaking)),))
+        put_back = os.pathconf is real_pathconf and sys.platform == host
     finally:
-        _IN_RESTORE_DIAGNOSTIC.clear()
-        globals()["path_max_fallback_violation"] = real_cell
         os.pathconf, sys.platform = real_pathconf, host
-    if rc != 2 or "leaked a patched" not in err.getvalue():
-        return f"a leaked patch was not reported (rc {rc}): {err.getvalue()[-300:]!r}"
-    if f"not {host!r}" not in err.getvalue():
+    out = err.getvalue().strip()
+    if not put_back:
+        return ("the path-max-restore cell did not put os.pathconf and sys.platform back "
+                "after a leaking fallback check")
+    if rc != 2:
+        return f"a leaking fallback check was not reported (rc {rc}): {out[-300:]!r}"
+    if f"(path-max-restore, #6145): {PATH_MAX_LEAK_PREFIX}" not in out:
+        return f"a leaking fallback check was reported as another failure: {out[-300:]!r}"
+    if f"not {host!r}" not in out:
         return (f"the leak message does not name the real host platform {host!r}: "
-                f"{err.getvalue()[-300:]!r}")
+                f"{out[-300:]!r}")
     return None
 
 
@@ -1353,6 +1352,25 @@ def guarded(cell, *args, **kwargs):
         return f"{cell.__name__} raised {type(exc).__name__}: {exc}"
 
 
+def run_cells(t, cells):
+    """Run (tag, cell, args) self-test cells in order (#6145 R8-F1). The first violation
+    is reported through t.fail as `(<tag>, #6145): <violation>` and returns 2; None when
+    every cell passes. A path-max-restore violation that is not a leak is tagged
+    path-max-fallback, since the fallback check runs inside that cell."""
+    for tag, cell, cell_args in cells:
+        try:
+            res = guarded(cell, *cell_args)
+        except Exception as exc:  # noqa: BLE001 - guarded itself must never leak a crash
+            res = f"{cell.__name__} escaped guarded: {type(exc).__name__}: {exc}"
+        if res is not None:
+            if tag == "path-max-restore" and not res.startswith(PATH_MAX_LEAK_PREFIX):
+                tag = "path-max-fallback"  # the fallback check runs inside the restore cell
+            t.fail(f"({tag}, #6145): {res}")
+            print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+            return 2
+    return None
+
+
 def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     repo = tmp / "repo"
     repo.mkdir()
@@ -1382,23 +1400,15 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         t.fail(f"(shim-deep-scratch, #6145): {deepx}")
         print("check-cert-expiry self-test: FAIL", file=sys.stderr)
         return 2
-    for tag, cell, cell_args in (("path-max-restore", path_max_restore_violation, (tmp,)),
-                                 ("path-max-diagnostic", path_max_restore_diagnostic_violation, (tmp,)),
-                                 ("shim-deep-cap", deep_scratch_cap_violation, (tmp,)),
-                                 ("guarded", guarded_violation, ()),
-                                 ("shim-scratch-limit", scratch_limit_message_violation, (tmp,)),
-                                 ("shim-deep-relative", deep_scratch_relative_violation, (tmp,)),
-                                 ("checkout-depth", checkout_depth_violation, (tmp,))):
-        try:
-            res = guarded(cell, *cell_args)
-        except Exception as exc:  # noqa: BLE001 - guarded itself must never leak a crash
-            res = f"{cell.__name__} escaped guarded: {type(exc).__name__}: {exc}"
-        if res is not None:
-            if tag == "path-max-restore" and not res.startswith(PATH_MAX_LEAK_PREFIX):
-                tag = "path-max-fallback"  # the fallback check runs inside the restore cell
-            t.fail(f"({tag}, #6145): {res}")
-            print("check-cert-expiry self-test: FAIL", file=sys.stderr)
-            return 2
+    rc = run_cells(t, (("path-max-restore", path_max_restore_violation, (tmp,)),
+                       ("path-max-diagnostic", path_max_restore_diagnostic_violation, (tmp,)),
+                       ("shim-deep-cap", deep_scratch_cap_violation, (tmp,)),
+                       ("guarded", guarded_violation, ()),
+                       ("shim-scratch-limit", scratch_limit_message_violation, (tmp,)),
+                       ("shim-deep-relative", deep_scratch_relative_violation, (tmp,)),
+                       ("checkout-depth", checkout_depth_violation, (tmp,))))
+    if rc is not None:
+        return rc
     unexec = guarded(shim_isolation_violation, tmp, interpreter=tmp / "no-such-python-6145")
     if unexec is None or not unexec.startswith("the shim could not be executed"):
         t.fail(f"(shim-unexecutable, #6145): an unexecutable shim gave {unexec!r}, "
@@ -1995,7 +2005,9 @@ SELF_TEST_OK = (
     "(shim-deep-cap, #6145) they stay inside [deep_scratch base, PATH_MAX-1] and a scratch 24 bytes under "
     "PATH_MAX gets the 'needs room' message; (path-max-restore, #6145) os.pathconf and sys.platform are "
     "restored and the fallback check runs once, first; (path-max-diagnostic, #6145) a dropped restore "
-    "names the real host platform."
+    "names the real host platform and is put back, running only that cell in the same scratch dir; "
+    "(checkout-depth, #6145) every scratch-dir cell passes in a 226-byte scratch dir, the one a "
+    "184-byte checkout gets."
 )
 
 
