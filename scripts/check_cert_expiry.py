@@ -1243,6 +1243,38 @@ def deep_scratch_cap_violation(tmp):
     return None
 
 
+CHECKOUT_DEPTH_PREFIX = "cert-expiry-depth."
+
+
+def checkout_depth_violation(tmp):
+    """None when every scratch-dir cell passes in a scratch dir exactly
+    SCRATCH_PATH_LIMIT (226) bytes long, the scratch a 184-byte checkout gets, else a
+    description (#6145 R8-F1). No cell may need more depth than shim-interpreter
+    itself, so a cell that nests the self-test (or any of its cells) deeper than its
+    own scratch dir fails here. The dir is a sibling of tmp (tmp itself is 226 bytes
+    at a 184-byte checkout) and is removed afterwards."""
+    parent = tmp.parent
+    pad = SCRATCH_PATH_LIMIT - len(os.fsencode(str(parent))) - 1 - len(CHECKOUT_DEPTH_PREFIX) - 8
+    if pad < 0:
+        return (f"the scratch root {str(parent)!r} is too deep to build a "
+                f"{SCRATCH_PATH_LIMIT}-byte scratch dir")
+    deep = Path(tempfile.mkdtemp(prefix=CHECKOUT_DEPTH_PREFIX + "d" * pad, dir=str(parent)))
+    try:
+        got = len(os.fsencode(str(deep)))
+        if got != SCRATCH_PATH_LIMIT:
+            return f"the depth scratch dir is {got} bytes, not {SCRATCH_PATH_LIMIT}"
+        for cell in (shim_interpreter_violation, shim_boundary_robustness_violation,
+                     deep_scratch_violation, path_max_restore_violation,
+                     path_max_restore_diagnostic_violation, deep_scratch_cap_violation,
+                     scratch_limit_message_violation, deep_scratch_relative_violation):
+            res = guarded(cell, deep)
+            if res is not None:
+                return f"{cell.__name__} failed in a {got}-byte scratch dir: {res}"
+    finally:
+        shutil.rmtree(deep, ignore_errors=True)
+    return None
+
+
 def shim_isolation_violation(tmp, interpreter=None):
     """None when the git shim is isolated, else a description (#6145). Plants an
     empty `gitshim_canary_6145.py` beside the shim and runs the shim's own probe,
@@ -1355,7 +1387,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                                  ("shim-deep-cap", deep_scratch_cap_violation, (tmp,)),
                                  ("guarded", guarded_violation, ()),
                                  ("shim-scratch-limit", scratch_limit_message_violation, (tmp,)),
-                                 ("shim-deep-relative", deep_scratch_relative_violation, (tmp,))):
+                                 ("shim-deep-relative", deep_scratch_relative_violation, (tmp,)),
+                                 ("checkout-depth", checkout_depth_violation, (tmp,))):
         try:
             res = guarded(cell, *cell_args)
         except Exception as exc:  # noqa: BLE001 - guarded itself must never leak a crash
