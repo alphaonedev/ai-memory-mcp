@@ -726,6 +726,19 @@ def fence_closes(fence, line):
     return bool(m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence) and not m.group(2).strip(BLANK))
 
 
+def indent_of(line):
+    """The width of the leading spaces and tabs of ``line``, a tab counting four (#6415)."""
+    width = 0
+    for c in line:
+        if c == " ":
+            width += 1
+        elif c == "\t":
+            width += 4
+        else:
+            break
+    return width
+
+
 def erratum_lines(lines):
     """Return {index: text} for the erratum lines of a document (#6196, #6219).
 
@@ -747,31 +760,44 @@ def erratum_lines(lines):
     fails closed. Stale names are still found in all of this text.
     """
     found, inside, fence, html, starts, details = {}, "", None, "", True, 0
+    fence_indent, ticks = 0, False
     for i, line in enumerate(lines):
         if fence is not None:
             starts = fence_closes(fence, line)
             if starts:
                 fence = None
-            continue
+                continue
+            # A fence inside a list item or block quote ends with its container, which a line indented
+            # less than the fence ends (#6415). A top-level fence with a shallower line also ends here:
+            # that only hides more, never less.
+            if not line.strip(BLANK) or indent_of(line) >= fence_indent:
+                continue
+            fence = None
         if not inside and not html:
             m = FENCE_RE.match(line)
             if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
-                fence = m.group(1)
+                fence, fence_indent, ticks = m.group(1), indent_of(line), False
                 continue
             if line.strip(BLANK) == MATH_FENCE:
-                fence = MATH_FENCE
+                fence, fence_indent, ticks = MATH_FENCE, indent_of(line), False
                 continue
             block = HTML_BLOCK_RE.match(line)
             if block:
                 tag = block.group(2).lower()
                 html = "</%s>" % tag if not block.group(1) and tag in RAW_TEXT_TAGS else "\n"
-        opens = len(DETAILS_OPEN_RE.findall(line if html else outside_code_spans(line)))
+        # A code span can close on the next line, which leaves a ``<details`` on that line outside it
+        # (#6415): after a line with an unmatched backtick run, no code span hides an opener.
+        opens = len(DETAILS_OPEN_RE.findall(line if html or ticks else outside_code_spans(line)))
+        ticks = bool(line.strip(BLANK)) and "`" in outside_code_spans(line)
         begins = starts and not inside and not html and not details and not opens
         tags = []
         shown, inside = comment_text_removed(line, inside, not html, tags)
         if begins and ERRATUM_RE.match(line) and not any(c in "[]" for c in outside_code_spans(shown)):
             found[i] = visible(shown)
-        closes = 0 if html not in ("", "\n") or not html and INDENTED_RE.match(line) else tags.count("/details")
+        # Only an end tag inside a raw HTML block is certainly read as a tag (#6415): elsewhere it can be
+        # escaped, sit in a link destination, title or definition, or in a code span over lines, so it
+        # closes nothing here. That counts fewer closers, which only hides more, never less.
+        closes = tags.count("/details") if html == "\n" else 0
         details = max(0, details + opens - closes)
         if html == "\n" and not line.strip(BLANK) or html != "\n" and html and html in line.lower():
             html = ""
