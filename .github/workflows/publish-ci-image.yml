@@ -41,9 +41,14 @@ on:
       - ".github/workflows/publish-ci-image.yml"
       - "deploy/docker-1461/provision/lib.sh"
 
+# #4935 — `packages: write` lives on the one push job below, never at the top
+# level: a repo-scoped GITHUB_TOKEN with that scope can write ANY GHCR package
+# linked to this repository, the released ai-memory image included, so the
+# grant is bounded to the single job that needs it and
+# scripts/check_release_features.py pins this file's permission blocks and
+# refuses `packages: write` / `write-all` in every other workflow.
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   # push-only + workflow_dispatch: no push/PR event collision to guard against,
@@ -59,6 +64,9 @@ jobs:
     name: "Build + push prebuilt CI image"
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 

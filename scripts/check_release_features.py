@@ -98,6 +98,15 @@ each unit is and WHAT is substituted into it:
     ``secrets`` reference must be ``secrets.<NAME>`` with NAME in
     ``RELEASE_SECRETS`` and no key may be named ``secrets``. The registry host
     (``ghcr.io``, any case) may appear only inside the docker job.
+  * Every other workflow is swept (#4935), because the repo GITHUB_TOKEN's
+    ``packages: write`` reaches the released GHCR package from ANY workflow:
+    publish-ci-image.yml is pinned whole at its permission blocks (top level
+    ``contents: read``, one job, that job ``contents: read`` +
+    ``packages: write``; ``CI_IMAGE_*``), and in every remaining workflow a
+    ``packages: write`` / ``write-all`` grant or the release image name
+    ``ghcr.io/<owner>/ai-memory`` (any case; ``ai-memory-ci`` is not it) is
+    refused on comment-stripped lines. A name built from an expression is not
+    visible to this text match; the permission bound is the control.
   * Quoting. A double-quoted YAML scalar containing a backslash is refused (YAML
     decodes escapes such as ``\\x63`` that this parser would read raw); a
     single-quoted ``''`` is decoded to ``'`` as YAML does. The build-tool scans
@@ -344,6 +353,23 @@ RELEASE_SECRETS = ("GITHUB_TOKEN", "CARGO_REGISTRY_TOKEN", "HOMEBREW_TAP_TOKEN",
 SECRET_REF_RE = re.compile(r"(?<![\w.-])secrets(?![\w-])(?P<ref>\s*\.\s*(?P<name>[A-Za-z_][A-Za-z0-9_]*))?", re.I)
 # The image registry is named only inside the pinned docker job.
 REGISTRY = "ghcr.io"
+# #4935: GHCR publication authority is bounded across EVERY workflow. A repo
+# GITHUB_TOKEN with `packages: write` can write ANY GHCR package linked to the
+# repository, the released image included, whichever workflow holds it. Outside
+# release.yml (pinned above) the scope may exist in exactly one place: the one
+# push job of publish-ci-image.yml, whose permission blocks are pinned whole.
+# Every other workflow is swept textually (comment-stripped lines): a
+# `packages: write` grant (plain, quoted or inside a flow mapping), a
+# `permissions: write-all`, or the release image name is refused. The text
+# match cannot see a name built from an expression; the permission bound is
+# the load-bearing control.
+PACKAGES_WRITE_RE = re.compile(r"(?<![\w-])packages\s*:\s*['\"]?write(?![\w-])", re.I)
+WRITE_ALL_RE = re.compile(r"(?<![\w-])permissions\s*:\s*['\"]?write-all(?![\w-])", re.I)
+RELEASE_IMAGE_RE = re.compile(r"ghcr\.io/(?:\$\{\{[^}]*\}\}|[^/\s'\"]+)/ai-memory(?![\w-])", re.I)
+CI_IMAGE_WF = "publish-ci-image.yml"
+CI_IMAGE_JOB = "publish-ci-image"
+CI_IMAGE_TOP_PERMISSIONS: Dict[str, Spec] = {"contents": "read"}
+CI_IMAGE_JOB_PERMISSIONS: Dict[str, Spec] = {"contents": "read", "packages": "write"}
 # release-shape.yml skeleton (#4719 SR-10). The workflow name and concurrency
 # values are pinned too (#4936, #4720): once the job's context is required its
 # check name is load-bearing, and `cancel-in-progress` decides whether a
@@ -1140,6 +1166,73 @@ def check_secrets_and_registry(doc: Node, rep: Report) -> None:
                         f"address the image registry): {text.strip()[:70]}")
 
 
+def code_lines(text: str) -> Iterator[Tuple[int, str]]:
+    """(1-based line, text) with whole-line comments dropped and a trailing
+    ` #...` comment cut (a `#` after whitespace opens a YAML comment)."""
+    for n, raw in enumerate(text.split("\n"), 1):
+        if is_blank_or_comment(raw):
+            continue
+        yield n, raw.split(" #", 1)[0]
+
+
+def check_ci_image_workflow(path: Path, rep: Report) -> None:
+    """publish-ci-image.yml is the one workflow outside release.yml that may hold
+    `packages: write` (#4935): its top-level `permissions:`, its single job and
+    that job's `permissions:` are pinned whole; a file the subset parser cannot
+    read is refused (fail closed)."""
+    label = WORKFLOWS + "/" + CI_IMAGE_WF
+    text = load(path, label, rep, True)
+    if text is None:
+        return
+    doc = parse_yaml(text, label, rep)
+    if doc is None:
+        return
+    why = pin_problem(doc.get("permissions"), CI_IMAGE_TOP_PERMISSIONS, "permissions")
+    if why:
+        rep.bad(pin_message(label, why + " (#4935: `packages: write` belongs to the push job only)", "CI_IMAGE_TOP_PERMISSIONS"))
+    jobs = doc.get("jobs")
+    if jobs is None or jobs.kind != "map" or jobs.keys() != [CI_IMAGE_JOB]:
+        rep.bad(pin_message(label, f"`jobs:` must be exactly the one `{CI_IMAGE_JOB}:` job (a second job would inherit "
+                            "or declare the registry scope)", "CI_IMAGE_JOB"))
+        return
+    job = jobs.get(CI_IMAGE_JOB)
+    if job is not None:
+        why = pin_problem(job.get("permissions"), CI_IMAGE_JOB_PERMISSIONS, f"jobs.{CI_IMAGE_JOB}.permissions")
+        if why:
+            rep.bad(pin_message(label, why, "CI_IMAGE_JOB_PERMISSIONS"))
+
+
+def check_workflow_sweep(root: Path, rep: Report) -> None:
+    """Every workflow but release.yml (pinned job by job) and publish-ci-image.yml
+    (pinned by check_ci_image_workflow): no `packages: write`, no
+    `permissions: write-all`, no release image name (#4935)."""
+    wf_dir = root / WORKFLOWS
+    if not wf_dir.is_dir():
+        rep.bad(f"{WORKFLOWS} is missing")
+        return
+    for path in sorted(wf_dir.glob("*.y*ml")):
+        if path.name == CI_IMAGE_WF:
+            check_ci_image_workflow(path, rep)
+            continue
+        if path.name == "release.yml" or not path.is_file():
+            continue
+        label = WORKFLOWS + "/" + path.name
+        text = load(path, label, rep, False)
+        if text is None:
+            continue
+        for n, line in code_lines(text):
+            if PACKAGES_WRITE_RE.search(line) or WRITE_ALL_RE.search(line):
+                rep.bad(f"{label}: line {n}: a `packages: write` / `write-all` grant outside release.yml's docker job and "
+                        f"the {CI_IMAGE_WF} push job (#4935: the token could write the released GHCR image): "
+                        f"{line.strip()[:60]}")
+            if RELEASE_IMAGE_RE.search(line):
+                rep.bad(f"{label}: line {n}: names the release image `ghcr.io/<owner>/ai-memory`; only release.yml may "
+                        f"(#4935): {line.strip()[:60]}")
+    if not (wf_dir / CI_IMAGE_WF).exists():
+        rep.bad(f"{WORKFLOWS}/{CI_IMAGE_WF} is missing (the pinned holder of the CI-image `packages: write`; if the "
+                "workflow is retired on purpose, retire CI_IMAGE_WF in " + GUARD_PATH + " in the same commit)")
+
+
 def check_run_continuations(doc: Node, label: str, rep: Report) -> None:
     """No run text line may end in a backslash: every pinned unit is compared statement by
     statement, and a joined line is a second spelling the guard refuses to model."""
@@ -1401,6 +1494,7 @@ def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], s
         check_shape(shape, rep, advisory)
     if install is not None:
         check_install(install, rep)
+    check_workflow_sweep(root, rep)
     return rep.errors, declared
 
 
@@ -2194,6 +2288,13 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "4935 publish-ci-image.yml packages: write on a second job": ("fail", [(
         CI_IMAGE, "", lambda t: t.rstrip("\n") + "\n\n  other:\n    runs-on: ubuntu-latest\n    permissions:\n"
         "      packages: write\n    steps:\n      - run: echo\n", False)]),
+    "4935 publish-ci-image.yml top-level contents: write": ("fail", [(
+        CI_IMAGE, "permissions:\n  contents: read\n\nconcurrency:", "permissions:\n  contents: write\n\nconcurrency:", False)]),
+    "4935 publish-ci-image.yml push job gains id-token: write": ("fail", [(
+        CI_IMAGE, "      packages: write\n    steps:", "      packages: write\n      id-token: write\n    steps:", False)]),
+    "4935 publish-ci-image.yml outside the subset grammar": ("fail", [(
+        CI_IMAGE, "    timeout-minutes: 45\n", "    timeout-minutes: 45\n    env: {A: b}\n", False)]),
+    "4935 publish-ci-image.yml missing": ("fail", [(CI_IMAGE, "", None, False)]),
     "valid: the CI image name in another workflow": ("pass", [_decoy_wf(
         run="docker pull ghcr.io/${{ github.repository_owner }}/ai-memory-ci:latest")]),
     "valid: packages: read in another workflow": ("pass", [_decoy_wf(job="    permissions:\n      packages: read\n")]),
