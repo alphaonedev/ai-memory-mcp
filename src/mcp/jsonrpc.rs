@@ -37,9 +37,73 @@ pub const INVALID_PARAMS: i64 = -32602;
 /// record-stop write fence on `tools/call`.
 pub const INTERNAL_ERROR: i64 = -32603;
 
-/// MCP protocol revision advertised in the `initialize` result's
-/// `protocolVersion` field.
-pub const PROTOCOL_REVISION: &str = "2024-11-05";
+/// MCP protocol revisions this server implements end to end, NEWEST FIRST
+/// (#6157). `initialize` echoes the client's requested `protocolVersion`
+/// when it is a member and otherwise answers with the newest entry (the
+/// spec's "respond with another version you support" downgrade); see
+/// [`negotiate_protocol_revision`].
+///
+/// The list is deliberately truthful: a revision belongs here only after
+/// every behavioural delta of that revision is implemented and tested.
+/// `2025-03-26` is NOT listed because it makes JSON-RPC batch receipt a
+/// MUST and adds the Streamable HTTP transport; the stdio loop parses one
+/// request object per line and answers a JSON array with `-32700`, so
+/// claiming it would advertise semantics the server does not implement.
+/// `2025-06-18` and `2026-07-28` are likewise unaudited. The pin
+/// `tests/mcp_protocol_revision_ssot_6157.rs` keeps every fixture and doc
+/// that names a `protocolVersion` inside this list.
+pub const SUPPORTED_PROTOCOL_REVISIONS: &[&str] = &[NEWEST_PROTOCOL_REVISION];
+
+/// The newest entry of [`SUPPORTED_PROTOCOL_REVISIONS`]: what a client that
+/// asks for an unsupported (or no) revision is answered with. Keep this the
+/// first element of the list.
+pub const NEWEST_PROTOCOL_REVISION: &str = "2024-11-05";
+
+/// Longest slice of a client-supplied `protocolVersion` echoed into the
+/// stderr diagnostic (the value is untrusted and rendered `{:?}`-escaped).
+const DIAGNOSTIC_ECHO_MAX_CHARS: usize = 64;
+
+/// Resolve the `protocolVersion` to answer an `initialize` with.
+///
+/// Returns `(revision, downgraded)`. A string `params.protocolVersion`
+/// that is a member of [`SUPPORTED_PROTOCOL_REVISIONS`] is echoed with
+/// `downgraded == false`. An unsupported, missing or non-string value
+/// yields the newest supported revision with `downgraded == true`, so the
+/// caller can emit a diagnostic. Total: it never fails and never panics
+/// (fail closed to the newest revision the server really speaks).
+#[must_use]
+pub fn negotiate_protocol_revision(params: &serde_json::Value) -> (&'static str, bool) {
+    match params
+        .get("protocolVersion")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|asked| {
+            SUPPORTED_PROTOCOL_REVISIONS
+                .iter()
+                .copied()
+                .find(|r| *r == asked)
+        }) {
+        Some(supported) => (supported, false),
+        None => (NEWEST_PROTOCOL_REVISION, true),
+    }
+}
+
+/// The stderr line emitted when `initialize` downgrades the client
+/// (#6157). Never carries more than [`DIAGNOSTIC_ECHO_MAX_CHARS`] of the
+/// untrusted request value, `{:?}`-escaped.
+#[must_use]
+pub fn protocol_downgrade_diagnostic(params: &serde_json::Value, answered: &str) -> String {
+    let asked = match params.get("protocolVersion") {
+        None => "<missing>".to_string(),
+        Some(serde_json::Value::String(s)) => {
+            let clipped: String = s.chars().take(DIAGNOSTIC_ECHO_MAX_CHARS).collect();
+            format!("{clipped:?}")
+        }
+        Some(_) => "<non-string>".to_string(),
+    };
+    format!(
+        "ai-memory: MCP initialize downgrade: client protocolVersion {asked} is not supported; responding with {answered} (supported: {SUPPORTED_PROTOCOL_REVISIONS:?})"
+    )
+}
 
 /// `initialize` — MCP handshake; carries `clientInfo` + capabilities.
 pub const METHOD_INITIALIZE: &str = "initialize";

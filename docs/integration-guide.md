@@ -298,7 +298,10 @@ args:    ["mcp"]
 #   ["mcp", "--profile", "full"]  # advertise all 104 entries (103 tools + bootstrap)
 ```
 
-That's it. ai-memory speaks MCP 2024-11-05 protocol, advertises 8
+That's it. ai-memory speaks MCP 2024-11-05 protocol (the full supported set is
+`SUPPORTED_PROTOCOL_REVISIONS` in `src/mcp/jsonrpc.rs`; a client that asks for an
+unsupported or missing `protocolVersion` is answered with the newest supported
+revision and a stderr downgrade diagnostic, #6157), advertises 8
 entries by default (7 tools + the always-on `memory_capabilities`
 bootstrap) and 104 with `--profile full` (103 callable tools + the
 bootstrap). Per-harness
