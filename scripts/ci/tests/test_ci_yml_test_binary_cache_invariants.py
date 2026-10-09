@@ -111,5 +111,18 @@ class ManifestDir6384L5(unittest.TestCase):
         self.assertIn('--repo-root .', self.text[i:i + 300])
 
 
+class CargoVersion6384R2L1(unittest.TestCase):
+    """r2 L1: the workflow writes ``cargo -V`` next to rustc-vv.txt and passes
+    it to the plan, so a cargo upgrade moves every key."""
+
+    def setUp(self):
+        self.text = CI_YML.read_text()
+
+    def test_cargo_v_written_and_passed(self):
+        self.assertTrue('cargo -V > "$sd/cargo-v.txt"' in self.text, 'cargo -V is not written')
+        i = self.text.index('test_binary_cache.py plan')
+        self.assertTrue('--cargo-v "$sd/cargo-v.txt"' in self.text[i:i + 700], 'plan lacks --cargo-v')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -52,6 +52,8 @@ class World(unittest.TestCase):
         (self.root / 'tests' / 'b.rs').write_text('fn b() {}\n')
         self.rustc = SCRATCH / 'rustc-vv.txt'
         self.rustc.write_text('rustc 1.98.0\nhost: x86_64\n')
+        self.cargo_v = SCRATCH / 'cargo-v.txt'
+        self.cargo_v.write_text('cargo 1.98.0 (fixture)\n')
         self.write_deps()
         self.build()
         self.lists()
@@ -88,7 +90,8 @@ class World(unittest.TestCase):
         base = dict(shard_dir=str(self.sd), manifest_dir=str(self.mdir), run_id='100', sha='abc', build_json=str(self.bj),
                     repo_root=str(self.root), rustc_vv=str(self.rustc), profile='test sal-postgres', tier='enterprise-fed',
                     node='linux-fed', base_ref='release/v1.0.0', event='pull_request', ref='refs/pull/1/merge',
-                    no_runtime_tree=False, psql='psql', timeout_seconds=120)
+                    no_runtime_tree=False, psql='psql', timeout_seconds=120,
+                    cargo_v=str(self.cargo_v), cargo=str(SCRATCH / 'no-such-cargo'))
         base.update(kw)
         return argparse.Namespace(**base)
 
@@ -1230,6 +1233,78 @@ class HitCaseDocs6384R2M1(unittest.TestCase):
         text = ' '.join((REPO / 'changelog.d' / '6384.changed.md').read_text().split())
         self.assertNotIn('are hits for every binary that does not read them', text)
         self.assertIn('__SKIP__', text)
+
+
+FAKE_CARGO = """#!/usr/bin/env python3
+import os, sys
+sys.stdout.write(os.environ.get('FAKE_CARGO_OUT', ''))
+sys.exit(int(os.environ.get('FAKE_CARGO_RC', '0')))
+"""
+
+
+class CargoAndPgSettingsInKey6384R2L1(World):
+    """r2 L1: the cargo version and the Postgres settings that change test
+    behaviour are key inputs; an unknown cargo version never yields a hit."""
+
+    def reseed(self):
+        for n in tbc.SHARD_LISTS:
+            (self.sd / (n + '.txt')).write_text((self.sd / (n + '.txt.full')).read_text())
+
+    def test_cargo_version_moves_every_key(self):
+        exes = tbc.ptb.parse_build_json(self.bj.read_text().splitlines())
+        lines = self.bj.read_text().splitlines()
+        rv = self.rustc.read_text()
+        k1, _ = tbc.compute_keys(exes, lines, self.root, rv, 'p', ENV_ON, cargo_v='cargo 1.98.0')
+        k2, _ = tbc.compute_keys(exes, lines, self.root, rv, 'p', ENV_ON, cargo_v='cargo 1.99.0')
+        self.assertTrue(k1)
+        for n in k1:
+            self.assertIsNotNone(k1[n], n)
+            self.assertNotEqual(k1[n], k2[n], n)
+
+    def test_cargo_upgrade_between_runs_means_no_hits(self):
+        self.plan(event='push', ref='refs/heads/release/v1.0.0')
+        self.record(0)
+        self.reseed()
+        self.assertIn('skipped 3 of 3', self.plan(run_id='2'))
+        self.reseed()
+        self.cargo_v.write_text('cargo 1.99.0 (fixture)\n')
+        self.assertIn('skipped 0 of 3', self.plan(run_id='3'))
+
+    def test_empty_cargo_v_file_means_no_skips(self):
+        self.plan(event='push', ref='refs/heads/release/v1.0.0')
+        self.record(0)
+        self.reseed()
+        self.cargo_v.write_text('')
+        out = self.plan(run_id='2')
+        self.assertIn('::warning::', out)
+        self.assertEqual(self.list_text('serial'), '--lib\n--test a\n')
+
+    def test_without_the_file_cargo_is_asked_and_a_failure_fails_closed(self):
+        fake = SCRATCH / 'fake-cargo'
+        fake.write_text(FAKE_CARGO)
+        fake.chmod(0o755)
+        env = dict(ENV_ON, FAKE_CARGO_OUT='cargo 1.98.0 (fixture)\n')
+        self.assertEqual(tbc.cargo_version('', env, cargo=str(fake)), 'cargo 1.98.0 (fixture)\n')
+        for e, c in ((dict(env, FAKE_CARGO_RC='3'), str(fake)), (dict(env, FAKE_CARGO_OUT=''), str(fake)),
+                     (env, str(SCRATCH / 'no-such-cargo'))):
+            with self.assertRaises(tbc.CacheError):
+                tbc.cargo_version('', e, cargo=c)
+        with self.assertRaises(tbc.CacheError):
+            tbc.cargo_version(str(SCRATCH / 'missing-cargo-v.txt'), env, cargo=str(fake))
+
+    def test_cli_takes_cargo_v(self):
+        a = tbc.build_parser().parse_args(['plan', '--shard-dir', 's', '--build-json', 'b', '--rustc-vv', 'r',
+                                           '--cargo-v', 'c', '--tier', 't', '--node', 'n', '--base-ref', 'x',
+                                           '--event', 'pull_request'])
+        self.assertEqual(a.cargo_v, 'c')
+
+    def test_pg_fingerprint_reads_the_behaviour_settings(self):
+        sql = ' '.join(tbc.PG_FINGERPRINT_SQL)
+        for name in ('max_connections', 'shared_preload_libraries', 'server_version_num'):
+            self.assertIn(name, sql)
+        self.assertIn('installed_version', sql)
+        self.assertIn("'age'", sql)
+        self.assertIn("'vector'", sql)
 
 
 if __name__ == '__main__':
