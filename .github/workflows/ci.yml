@@ -658,22 +658,35 @@ jobs:
     #                                 job-level cancel, is still what fires.
     timeout-minutes: ${{ matrix.timeout }}
     env:
-      # Debuginfo budget for this job — the heaviest compile in CI (~600
+      # Debuginfo budget for this job — the heaviest compile in CI (~1000
       # integration test binaries per leg).
       #
-      # #3453/#3461 — `1` is cargo's "limited" level, NOT line tables (the
-      # comment this replaces was wrong: `line-tables-only` is a distinct,
-      # strictly smaller setting). Limited debuginfo produced 100-400 MB test
-      # binaries, which (a) filled the f2 root filesystem — 350 GB of
-      # `target/debug/deps` across two runners, until rust-lld died with
-      # `ld terminated with signal 7 [Bus error]` on a full disk (#3453) — and
-      # (b) charged the link time to the macOS full-suite job that then blew
-      # the #1492 watchdog (#3461). `line-tables-only` keeps file:line in every
-      # backtrace and panic location (the only debuginfo CI actually reads;
-      # nothing here runs a debugger) at roughly a third of the size and link
-      # cost. DECLARED HERE, in the workflow, deliberately: a runner-side
-      # `.env` is per-node operator state that no repo change can preserve or
-      # audit, so a re-imaged or added runner would silently regress.
+      # #3453/#3461 — `1` is cargo's "limited" level, NOT line tables
+      # (`line-tables-only` is a distinct, strictly smaller setting). Limited
+      # debuginfo produced 100-400 MB test binaries, which (a) filled the f2
+      # root filesystem — 350 GB of `target/debug/deps` across two runners,
+      # until rust-lld died with `ld terminated with signal 7 [Bus error]` on a
+      # full disk (#3453) — and (b) charged the link time to the macOS
+      # full-suite job that then blew the #1492 watchdog (#3461). #3461 moved
+      # this job to `line-tables-only`.
+      #
+      # #6118 — `0`. At `line-tables-only` the SAME failure came back: one full
+      # build still wrote 164 GB of test executables per runner (~170 MB each)
+      # and two runners took the f2 root from 224 GB to 78 GB free in two
+      # hours. Measured 2026-10-09 (sandbox, lib unit-test binary + one
+      # integration test binary): an integration test binary is 130 MB at
+      # `line-tables-only` and 11.6 MB at `0` (11x); the lib unit-test binary
+      # 411 MB vs 258 MB. The ~1000 integration binaries are what fill the
+      # disk, so the level that matters is `0`. Nothing in CI reads line
+      # tables: no workflow, script or test sets RUST_BACKTRACE, a panic's
+      # file:line is a compile-time string (no debuginfo involved), nothing
+      # here runs a debugger, and the hosted `Check (ubuntu-latest,sqlite)`
+      # leg (low-mem step below), cert-postgres-age.yml and
+      # postgres-ignored.yml have run their full suites at `0` since
+      # #3461 / #3274. DECLARED HERE, in the workflow, deliberately: a
+      # runner-side `.env` is per-node operator state that no repo change can
+      # preserve or audit, so a re-imaged or added runner would silently
+      # regress.
       #
       # TEST is set explicitly alongside DEV because the `test` profile only
       # INHERITS `dev` while nothing overrides it — a leg that overrides
@@ -681,7 +694,7 @@ jobs:
       # leave the test profile at this value. Both are stated at every point
       # they are set, so the pair can never drift apart.
       #
-      # #6118 — the SAME pair is declared by every other self-hosted cargo job
+      # The SAME pair is declared by every other self-hosted cargo job
       # (cert-postgres-age.yml, postgres-ignored.yml, session-boot-lifetime.yml).
       # The debuginfo level is part of cargo's artifact hash, so two jobs at two
       # levels keep TWO complete dependency + test-binary trees in the one
@@ -689,8 +702,8 @@ jobs:
       # executables themselves are pruned at job end by the
       # `Prune runner target dir (#6118)` step at the bottom of this job. Both
       # halves are pinned by scripts/test/test_ci_runner_target_hygiene_6118.py.
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     strategy:
       fail-fast: false
       matrix:

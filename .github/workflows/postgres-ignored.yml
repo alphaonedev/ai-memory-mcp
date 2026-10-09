@@ -42,14 +42,14 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # #6118 — `line-tables-only`, the SAME level as ci.yml's enterprise-fed leg
-  # and cert-postgres-age.yml, not `"0"`: the debuginfo level is part of
-  # cargo's artifact hash, so a different level here kept a second complete
-  # dependency + test-binary tree in each linux-fed runner's persistent
-  # `target/`. One level for every self-hosted cargo job = one tree. Pinned by
-  # scripts/test/test_ci_runner_target_hygiene_6118.py.
-  CARGO_PROFILE_DEV_DEBUG: line-tables-only
-  CARGO_PROFILE_TEST_DEBUG: line-tables-only
+  # #6118 — `"0"`, the SAME level as ci.yml's enterprise-fed leg (which used
+  # to run at `line-tables-only`) and cert-postgres-age.yml: the debuginfo
+  # level is part of cargo's artifact hash, so a different level per job kept
+  # one complete dependency + test-binary tree PER LEVEL in each linux-fed
+  # runner's persistent `target/`. One level for every self-hosted cargo job =
+  # one tree. Pinned by scripts/test/test_ci_runner_target_hygiene_6118.py.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   postgres-ignored:
