@@ -18,10 +18,14 @@ from document lines (#6195). Each line is also scanned as a reader sees it after
 rendering (#6214): escapes, entities, inline tags and comments, emphasis markers, dash
 variants, combining marks and look-alike letters folded, so a backslash-escaped
 hyphen, ``check&#45;x.sh`` or a Cyrillic look-alike letter cannot hide a name.
-The path is the part after the first ``scripts`` component of the written path,
-else the bare name: ``scripts/sub/check-x.sh`` names that file, never a
-same-named file elsewhere, and a symlink counts only when it resolves inside
-``scripts/`` (#6198). The allowlist is read strictly (no Cf removal).
+A bare name means ``scripts/<name>``. A written path is checked at that path
+from the repository root (#6216): leading ``/``, ``.`` and ``..`` components and a
+URL's host part are dropped only when ``scripts`` follows, so ``./scripts/x``,
+``../../scripts/x`` and a repository URL name ``scripts/x``, while
+``infra/check-x.py`` names ``infra/check-x.py`` and ``./check-x.sh`` names no
+file. ``scripts/sub/check-x.sh`` names that file, never a same-named file
+elsewhere, and a symlink counts only when it resolves inside ``scripts/`` (or,
+for a path outside ``scripts/``, inside the repository) (#6198). The allowlist is read strictly (no Cf removal).
 
 1. an erratum line somewhere in ``docs/compliance/`` names it together with an
    existing successor (``scripts/<name>``). An erratum line is a single line
@@ -199,43 +203,54 @@ def rendered(line):
 
 
 def tokens(line):
-    """Yield (cited, name, rel) for each script name on ``line`` (#6195, #6198).
+    """Yield (cited, name, target) for each script name on ``line`` (#6195, #6198, #6216).
 
     ``cited`` is the name with the path written before it, ``name`` the bare script name (the
-    allowlist and erratum key) and ``rel`` the path the citation names relative to scripts/:
-    the components after the first ``scripts`` component of the written path, else the bare
-    name (``check-x.sh``, ``bash scripts/check-x.sh`` and ``./scripts/check-x.sh`` all name
-    ``scripts/check-x.sh``; ``scripts/sub/check-x.sh`` names exactly that file).
+    allowlist and erratum key) and ``target`` the root-relative path the citation names. A bare
+    name is ``scripts/<name>`` (``check-x.sh`` and ``bash scripts/check-x.sh`` alike). A written
+    path is taken as written, except that its leading ``''``/``.``/``..`` components, or a URL's
+    host and path (a prefix starting ``//``), are dropped when a ``scripts`` component follows
+    them: ``./scripts/check-x.sh`` and ``../../scripts/check-x.sh`` name ``scripts/check-x.sh``,
+    ``tools/scripts/check-x.sh`` and ``infra/check-x.sh`` name themselves, and ``./check-x.sh``
+    keeps its ``.`` component, which names no file.
     """
     for m in TOKEN_RE.finditer(line):
         start = m.start()
         while start > 0 and line[start - 1] in PATH_CHARS:
             start -= 1
         prefix = line[start : m.start()]
-        parts = prefix.split("/")
-        rel = m.group(1)
+        parts = prefix.split("/")[:-1] if prefix else ["scripts"]
         if "scripts" in parts:
-            rel = "/".join(parts[parts.index("scripts") + 1 : -1] + [rel])
-        yield prefix + m.group(1), m.group(1), rel
+            first = parts.index("scripts")
+            if prefix.startswith("//") or all(p in ("", ".", "..") for p in parts[:first]):
+                parts = parts[first:]
+        yield prefix + m.group(1), m.group(1), "/".join(parts + [m.group(1)])
 
 
-def successor_ok(root, succ):
-    """True when ``scripts/<succ>`` is exactly a file that resolves inside scripts/.
+def path_ok(root, target):
+    """True when the root-relative ``target`` is exactly a file contained where it claims (#6216).
 
-    Used for erratum successors and, since #6198, for every cited name: no ``.``/``..``/empty
-    component, a regular file at that exact path (no basename search), and a symlink only when
-    it resolves inside scripts/.
+    No ``.``/``..``/empty component, a regular file at that exact path (no basename search), and a
+    symlink only when it resolves inside scripts/ for a ``scripts/...`` target, else inside the
+    repository.
     """
-    if any(part in ("", ".", "..") for part in succ.split("/")):
+    parts = target.split("/")
+    if any(part in ("", ".", "..") for part in parts):
         return False
-    path = root / "scripts" / succ
+    path = root.joinpath(*parts)
+    base = root / "scripts" if parts[0] == "scripts" else root
     try:
         if not path.is_file():
             return False
-        path.resolve().relative_to((root / "scripts").resolve())
-    except (OSError, ValueError):
+        path.resolve().relative_to(base.resolve())
+    except (OSError, RuntimeError, ValueError):
         return False
     return True
+
+
+def successor_ok(root, succ):
+    """True when ``scripts/<succ>`` is exactly a file that resolves inside scripts/ (#6198)."""
+    return path_ok(root, "scripts/" + succ)
 
 
 def rel_path(root, path):
@@ -386,7 +401,7 @@ def collect_errata(root, lines_by_doc):
             if not succ:
                 continue
             for _cited, name, path in tokens(line):
-                if path not in succ:
+                if path not in ["scripts/" + s for s in succ]:
                     errata[name] = succ[0]
                     per_doc.setdefault(rel, {})[name] = succ[0]
     return errata, per_doc
@@ -437,7 +452,7 @@ def check(root):
             found = list(tokens(line))
             found += [t for t in tokens(rendered(line)) if t not in found]
             for cited, base, path in found:
-                if successor_ok(root, path):
+                if path_ok(root, path):
                     continue
                 pinned = allowed.get((rel, base))
                 covered = base in errata if pinned else base in per_doc.get(rel, {})
@@ -445,8 +460,8 @@ def check(root):
                     used.add((rel, base))
                     continue
                 problems.append(
-                    "%s:%d: `%s` does not exist under scripts/ and no erratum-covered allowlist"
-                    " entry (%s) names it" % (rel, lineno, cited, ALLOW_REL)
+                    "%s:%d: `%s` does not exist (checked at %s) and no erratum-covered allowlist"
+                    " entry (%s) names it" % (rel, lineno, cited, path, ALLOW_REL)
                 )
     for (rel, base), pinned in sorted(allowed.items()):
         if pinned and base in per_doc.get(rel, {}):
