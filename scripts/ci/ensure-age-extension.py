@@ -38,7 +38,7 @@ argv: path- and name-valued keys that are allowed (``sslrootcert``, ``sslcert``,
 Because urllib and libpq split a URL differently, the URL is refused (exit 2,
 one stderr line, no value printed) when any of these hold: it does not start
 with the exact lowercase ``postgres://`` or ``postgresql://``; it holds a
-control character (TAB, CR, LF, NUL), a raw space, a ``#`` (libpq has no
+TAB, CR, LF or NUL (VT, FF, DEL and NBSP pass, as in libpq), a raw space, a ``#`` (libpq has no
 fragment), or a ``%`` not followed by two hex digits; it holds ``%00`` anywhere;
 the host part has more than one ``@`` or an ``@`` after it, or is empty
 (``postgres:///db``); the query has an empty segment (``a=1&&b=2``; a single
