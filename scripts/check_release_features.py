@@ -1713,6 +1713,8 @@ DOCKER_HEAD = ("needs: [preflight, qualify, supply-chain]\n    if: needs.preflig
 CRATES_STEPS = ("    # CARGO_REGISTRY_TOKEN is scoped to the `release` Environment (#3546 D4).\n"
                 "    environment: release\n    steps:\n")
 SUPPLY_PERMS = "    # it must not inherit the top-level `contents: write`.\n    permissions:\n      contents: read\n"
+NFPM_LS = "          ls -la dist/*.deb dist/*.rpm\n"
+CHECKSUM_DONE = '          echo "checksummed ${emitted} artifact(s)"\n'
 REL_ON = "on:\n  workflow_dispatch:\n"
 REL_GROUP = "  group: release-${{ github.event.inputs.tag }}\n"
 REL_WF_NAME = "name: Release (workflow_dispatch — operator-gated publish)\n"
@@ -2295,6 +2297,15 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "4935 publish-ci-image.yml outside the subset grammar": ("fail", [(
         CI_IMAGE, "    timeout-minutes: 45\n", "    timeout-minutes: 45\n    env: {A: b}\n", False)]),
     "4935 publish-ci-image.yml missing": ("fail", [(CI_IMAGE, "", None, False)]),
+    # --- #4752: the shipped file is the asserted file (release job pinned whole; hash-bound package step)
+    "4752 a step between the assert and the package replaces the binary": ("fail", [_rel(
+        PKG_HDR, "      - name: extra\n        run: cp /opt/known-good/ai-memory target/${{ matrix.target }}/release/${{ matrix.artifact }}\n" + PKG_HDR)]),
+    "4752 nfpm step body copies another binary into dist": ("fail", [_rel(
+        NFPM_LS, "          cp /opt/known-good/ai-memory dist/ai-memory\n" + NFPM_LS)]),
+    "4752 checksum step body replaces the tarball": ("fail", [_rel(
+        CHECKSUM_DONE, '          cp /opt/known-good/ai-memory.tar.gz "ai-memory-${{ matrix.target }}.tar.gz"\n' + CHECKSUM_DONE)]),
+    "4752 Dockerfile final stage copies over the shipped binary": ("fail", [_docker(
+        D_BIN, D_BIN + "COPY decoy/ai-memory /usr/local/bin/ai-memory\n")]),
     "valid: the CI image name in another workflow": ("pass", [_decoy_wf(
         run="docker pull ghcr.io/${{ github.repository_owner }}/ai-memory-ci:latest")]),
     "valid: packages: read in another workflow": ("pass", [_decoy_wf(job="    permissions:\n      packages: read\n")]),
