@@ -60,7 +60,13 @@ FAILURE, never a skip):
            level) and ``cargo --profile <p>`` for a ``p`` outside dev / test /
            release / bench.  ``0``, ``false`` and ``"none"`` are the level-0
            spellings of a flag; ``git log -g`` or prose that mentions ``-g`` is
-           not a rustc flag.
+           not a rustc flag.  A bash ``$'..'`` string is decoded first
+           (``\\x1f``, ``\\037``, ``\\n``).  The guard also reads cargo TOML by
+           section (``Cargo.toml``, ``.cargo/config.toml``, and any config a
+           step writes): ``[profile.dev|test.package.<spec>]`` or
+           ``build-override`` ``debug`` above 0 (it beats the env pin; a plain
+           ``[profile.dev] debug`` does not) and a ``rustflags`` array joined
+           across lines are flagged.
   R-PRUNE  the job's LAST step is named PRUNE_STEP_NAME, runs under
            ``if: always()`` (a red or cancelled test run leaves the same
            binaries behind), is skipped on GitHub-hosted runners when the job
@@ -536,9 +542,112 @@ def load_repo_files() -> Dict[str, str]:
     return {name: (ROOT / name).read_text(encoding="utf-8") for name in REPO_CONFIG_FILES if (ROOT / name).is_file()}
 
 
+# Cargo profile tables whose `package.<spec>` / `build-override` sub-tables beat the
+# CARGO_PROFILE_<P>_DEBUG env pin (cargo 1.98.0), unlike a plain `[profile.dev] debug`.
+OVERRIDE_PROFILES = frozenset({"dev", "test"})
+OVERRIDE_TABLES = frozenset({"package", "build-override"})
+SHELL_ECHO_PREFIX_RE = re.compile(r"^(?:printf|echo)\s+(?:-[A-Za-z]+\s+)*[\"']")
+TOML_DEBUG_RE = re.compile(r"\bdebug\s*=\s*[\"']?([A-Za-z0-9_-]*)")
+
+
+def _toml_split(text: str, sep: str) -> List[str]:
+    """Split ``text`` on ``sep`` outside quotes; backslashes (shell-escaped quotes) are dropped."""
+    parts: List[str] = []
+    cur: List[str] = []
+    quote: Optional[str] = None
+    for ch in text.replace("\\", ""):
+        if quote:
+            if ch == quote:
+                quote = None
+            cur.append(ch)
+        elif ch in ("'", '"'):
+            quote = ch
+            cur.append(ch)
+        elif ch == sep:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
+def _toml_depth(text: str) -> int:
+    depth = 0
+    quote: Optional[str] = None
+    for ch in text:
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+    return depth
+
+
+def _toml_path(key: str) -> Tuple[str, ...]:
+    return tuple(p.strip().strip("\"'") for p in _toml_split(key.strip(), "."))
+
+
+def _toml_entries(text: str) -> List[Tuple[Tuple[str, ...], str]]:
+    """``(full key path, value text)`` of every ``key = value`` in ``text``, tables tracked.
+
+    ``text`` may be a TOML file or a shell body that writes one (``printf '..\\n'``,
+    a heredoc): the literal ``\\n`` splits a line and a leading ``printf '`` is dropped.
+    A value opened with ``[`` or ``{`` runs to its closing bracket, across lines.
+    """
+    rows: List[str] = []
+    for raw in text.replace("\\n", "\n").split("\n"):
+        line = _strip_comment(SHELL_ECHO_PREFIX_RE.sub("", raw.strip(), count=1)).strip()
+        if line:
+            rows.append(line)
+    out: List[Tuple[Tuple[str, ...], str]] = []
+    table: Tuple[str, ...] = ()
+    i = 0
+    while i < len(rows):
+        line = rows[i]
+        i += 1
+        head = re.match(r"\[\[?(.*?)\]\]?(?:[\s\"'#>]|$)", line)
+        if head and "=" not in _toml_split(line, "]")[0]:
+            table = _toml_path(head.group(1))
+            continue
+        pair = _toml_split(line, "=")
+        if len(pair) < 2:
+            continue
+        value = "=".join(pair[1:]).strip()
+        while _toml_depth(value) > 0 and i < len(rows):
+            value += " " + rows[i]
+            i += 1
+        out.append((table + _toml_path(pair[0]), value))
+    return out
+
+
+def toml_debug_findings(text: str) -> List[str]:
+    """Debuginfo overrides cargo would honour over the ``CARGO_PROFILE_*_DEBUG=0`` pin (#6255)."""
+    found: List[str] = []
+    for path, value in _toml_entries(text):
+        dotted = ".".join(path)
+        if (len(path) >= 3 and path[0] == "profile" and path[1] in OVERRIDE_PROFILES
+                and (OVERRIDE_TABLES & set(path[2:]) or any(t in value for t in OVERRIDE_TABLES))):
+            levels = [value.strip("\"' ")] if path[-1] == "debug" else []
+            levels.extend(m.group(1) for m in TOML_DEBUG_RE.finditer(value))
+            for level in levels:
+                if level and level not in LEVEL_OFF:
+                    found.append("%s = %r (a profile package / build-override table beats the CARGO_PROFILE_* env)"
+                                 % (dotted, level))
+        if path[-1] in ("rustflags", "rustdocflags"):  # cargo keys are case-sensitive
+            for spelled in _level_spellings(value, True):
+                found.append("%s carries %s" % (dotted, spelled))
+    return found
+
+
 def repo_file_violations(repo_files: Dict[str, str]) -> List[str]:
     """R-DEBUG findings in Cargo.toml and .cargo/config.toml."""
-    return []
+    return ["%s: R-DEBUG %s, want %r" % (name, spelled, DEBUG_LEVEL)
+            for name, text in sorted(repo_files.items()) for spelled in toml_debug_findings(text)]
 
 
 def self_hosted_jobs(workflows: Dict[str, str]) -> Dict[Tuple[str, str], Tuple[Workflow, Job]]:
@@ -659,6 +768,8 @@ def _debug_overrides(where: str, effective: Dict[str, str], job: Job) -> List[st
                                  "step), want %r" % (where, label, m.group(1), m.group(2), DEBUG_LEVEL))
             for spelled in _level_spellings(_ansi_c_decode(line), False):
                 found.append("%s: R-DEBUG step %r run sets %s, want %r" % (where, label, spelled, DEBUG_LEVEL))
+        for spelled in toml_debug_findings(step.run_text()):
+            found.append("%s: R-DEBUG step %r writes a cargo config with %s, want %r" % (where, label, spelled, DEBUG_LEVEL))
     return found
 
 
