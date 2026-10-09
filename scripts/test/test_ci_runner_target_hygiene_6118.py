@@ -93,6 +93,7 @@ Run:  python3 scripts/test/test_ci_runner_target_hygiene_6118.py
 from __future__ import annotations
 
 import contextlib
+import inspect
 import io
 import json
 import os
@@ -109,6 +110,16 @@ ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
 PRUNE_SCRIPT = ROOT / "scripts" / "ci" / "prune-runner-target.py"
 LOCAL_RUNS = ROOT / ".local-runs"
+# chmod-based EACCES tests cannot fail for root (and APFS refuses some modes): skip them (#6303).
+UID0 = hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def restore_mode(path: Path, mode: int) -> None:
+    """addCleanup helper: put a mode back, tolerating a path the test (or a prune) already removed (#6303)."""
+    try:
+        os.chmod(str(path), mode)
+    except FileNotFoundError:
+        pass
 
 PRUNE_STEP_NAME = "Prune runner target dir (#6118)"
 PRUNE_INVOCATION = "python3 scripts/ci/prune-runner-target.py"
@@ -851,8 +862,8 @@ class LiveWorkflows6118(unittest.TestCase):
         self.assertFalse(jobs[("cert-postgres-age.yml", "cert-postgres-age")][1].can_be_hosted())
 
 
-class Mutants6118(unittest.TestCase):
-    """Each mutant of the LIVE ci.yml must be rejected (the rules are not vacuous)."""
+class _GuardHelpers6118:
+    """Workflow / repo-file mutation helpers shared by the guard test classes."""
 
     def setUp(self) -> None:
         self.live = load_all()
@@ -862,6 +873,23 @@ class Mutants6118(unittest.TestCase):
         files = dict(self.live)
         files["ci.yml"] = text
         return all_violations(files)
+
+    def _before_prune(self, step_yaml: str) -> List[str]:
+        anchor = "      - name: " + PRUNE_STEP_NAME + "\n"
+        self.assertEqual(1, self.ci.count(anchor), anchor)
+        return self._mutated(_replace_once(self.ci, anchor, step_yaml + anchor))
+
+    def _debug_flagged(self, found: List[str]) -> bool:
+        return any("R-DEBUG" in v for v in found)
+
+    def _repo_mutated(self, name: str, text: str) -> List[str]:
+        repo = load_repo_files()
+        repo[name] = text
+        return all_violations(self.live, repo)
+
+
+class Mutants6118(_GuardHelpers6118, unittest.TestCase):
+    """Each mutant of the LIVE ci.yml must be rejected (the rules are not vacuous)."""
 
     def test_6118_control_unmutated_is_clean(self) -> None:
         self.assertEqual([], self._mutated(self.ci))
@@ -928,11 +956,6 @@ class Mutants6118(unittest.TestCase):
 
     def _appended(self, job_yaml: str) -> List[str]:
         return self._mutated(self.ci.rstrip("\n") + "\n" + job_yaml)
-
-    def _before_prune(self, step_yaml: str) -> List[str]:
-        anchor = "      - name: " + PRUNE_STEP_NAME + "\n"
-        self.assertEqual(1, self.ci.count(anchor), anchor)
-        return self._mutated(_replace_once(self.ci, anchor, step_yaml + anchor))
 
     def _assert_unpinned(self, found: List[str], job_id: str) -> None:
         self.assertTrue(any(v.startswith("R-CENSUS unpinned self-hosted") and ("ci.yml/" + job_id) in v
@@ -1077,9 +1100,6 @@ class Mutants6118(unittest.TestCase):
 
     # ---- round 4 (R3-F2, SR3-3): more debuginfo spellings, fewer false alarms ----
 
-    def _debug_flagged(self, found: List[str]) -> bool:
-        return any("R-DEBUG" in v for v in found)
-
     def test_6118_m25_inline_table_profile_debug(self) -> None:
         found = self._before_prune(
             "      - name: Inline table\n"
@@ -1183,11 +1203,6 @@ class Mutants6118(unittest.TestCase):
 
     # ---- round 5 (#6255): section-aware cargo TOML, multi-line arrays ----
 
-    def _repo_mutated(self, name: str, text: str) -> List[str]:
-        repo = load_repo_files()
-        repo[name] = text
-        return all_violations(self.live, repo)
-
     PKG_OVERRIDES = (
         '[profile.dev.package."*"]\ndebug = 2\n',
         '[profile.test.package."*"]\ndebug = "line-tables-only"\n',
@@ -1253,6 +1268,223 @@ class Mutants6118(unittest.TestCase):
                 "      - name: Write config\n        run: |\n          cat >> .cargo/config.toml <<'EOF'\n"
                 + lines + "          EOF\n")
             self.assertEqual([], found, body)
+
+
+class Evasions6118(_GuardHelpers6118, unittest.TestCase):
+    """R-DEBUG evasions confirmed effective under cargo 1.98 with both pins at 0 (#6295 #6296 #6297 #6298).
+
+    Every form below sets a debuginfo level on a self-hosted runner while the
+    CARGO_PROFILE_{DEV,TEST}_DEBUG=0 pins stay in place.  Each has its own test.
+    """
+
+    @staticmethod
+    def _step(name: str, run: Optional[str] = None, env: Optional[List[Tuple[str, str]]] = None,
+              uses: Optional[str] = None, with_: Optional[List[Tuple[str, str]]] = None,
+              workdir: Optional[str] = None) -> str:
+        y = "      - name: %s\n" % name
+        if uses:
+            y += "        uses: %s\n" % uses
+        if workdir:
+            y += "        working-directory: %s\n" % workdir
+        if with_:
+            y += "        with:\n" + "".join("          %s: %s\n" % kv for kv in with_)
+        if env:
+            y += "        env:\n" + "".join("          %s: %s\n" % kv for kv in env)
+        if run is not None:
+            y += "        run: |\n" + "".join("          %s\n" % ln for ln in run.split("\n"))
+        return y
+
+    def _caught(self, step_yaml: str) -> None:
+        found = self._before_prune(step_yaml)
+        self.assertTrue(self._debug_flagged(found), (step_yaml, found))
+
+    def _clean(self, step_yaml: str) -> None:
+        self.assertEqual([], self._before_prune(step_yaml), step_yaml)
+
+    # ---- #6295: $GITHUB_ENV multi-line form and printf escapes ----
+
+    def test_6118_r6_6295_printf_octal_escape_in_command_substitution(self) -> None:
+        self._caught(self._step(
+            "a", "export CARGO_ENCODED_RUSTFLAGS=\"$(printf -- '-Copt-level=0\\037-g')\"\ncargo test --no-run"))
+
+    def test_6118_r6_6295_printf_escape_written_to_github_env(self) -> None:
+        self._caught(self._step(
+            "a", "printf 'CARGO_ENCODED_RUSTFLAGS=-Copt-level=0\\037-g\\n' >> \"$GITHUB_ENV\""))
+
+    def test_6118_r6_6295_printf_hex_escape_written_to_github_env(self) -> None:
+        self._caught(self._step(
+            "a", "printf 'CARGO_ENCODED_RUSTFLAGS=-Copt-level=0\\x1f-g\\n' >> \"$GITHUB_ENV\""))
+
+    def test_6118_r6_6295_github_env_multiline_debug_one_line_echo(self) -> None:
+        self._caught(self._step(
+            "a", "{ echo 'CARGO_PROFILE_TEST_DEBUG<<EOF'; echo 2; echo EOF; } >> \"$GITHUB_ENV\""))
+
+    def test_6118_r6_6295_github_env_multiline_debug_separate_lines(self) -> None:
+        self._caught(self._step(
+            "a", "echo 'CARGO_PROFILE_DEV_DEBUG<<EOF' >> \"$GITHUB_ENV\"\necho full >> \"$GITHUB_ENV\"\n"
+                 "echo EOF >> \"$GITHUB_ENV\""))
+
+    def test_6118_r6_6295_github_env_multiline_debug_heredoc(self) -> None:
+        self._caught(self._step(
+            "a", "cat >> \"$GITHUB_ENV\" <<'X'\nCARGO_PROFILE_TEST_DEBUG<<EOF\nlimited\nEOF\nX"))
+
+    def test_6118_r6_6295_github_env_multiline_rustflags_one_line_echo(self) -> None:
+        self._caught(self._step(
+            "a", "{ echo 'RUSTFLAGS<<EOF'; echo '-g'; echo EOF; } >> \"$GITHUB_ENV\""))
+
+    def test_6118_r6_6295_github_env_multiline_rustflags_heredoc_debuginfo(self) -> None:
+        self._caught(self._step(
+            "a", "cat >> \"$GITHUB_ENV\" <<'X'\nRUSTFLAGS<<EOF\n-C debuginfo=2\nEOF\nX"))
+
+    def test_6118_r6_6295_github_env_multiline_off_value_is_clean(self) -> None:
+        self._clean(self._step(
+            "a", "{ echo 'CARGO_PROFILE_TEST_DEBUG<<EOF'; echo 0; echo EOF; } >> \"$GITHUB_ENV\"\n"
+                 "{ echo 'RUSTFLAGS<<EOF'; echo '-Dwarnings'; echo EOF; } >> \"$GITHUB_ENV\""))
+
+    # ---- #6296: TOML multi-line strings and escaped quoted keys ----
+
+    ML_BASIC = '[build]\nrustflags = """\n-g\n"""\n'
+    ML_LITERAL = "[build]\nrustflags = '''\n-C\ndebuginfo=2\n'''\n"
+    ESCAPED_KEY = '[build]\n"rust\\u0066lags" = ["-g"]\n'
+    ESCAPED_KEY_UPPER = '[build]\n"rustfl\\U00000061gs" = ["-g"]\n'
+    ENV_FLAGS = '[env]\nRUSTFLAGS = { value = "-g", force = true }\n'
+    ENV_ENCODED = '[env]\nCARGO_ENCODED_RUSTFLAGS = { value = "-g", force = true }\n'
+
+    def _config_in_file(self, body: str) -> None:
+        found = self._repo_mutated(".cargo/config.toml", body)
+        self.assertTrue(self._debug_flagged(found), (body, found))
+
+    def _config_in_step(self, body: str) -> None:
+        self._caught(self._step("Write config", "cat >> .cargo/config.toml <<'EOF'\n" + body + "EOF"))
+
+    def test_6118_r6_6296_multiline_basic_string_rustflags_in_config_file(self) -> None:
+        self._config_in_file(self.ML_BASIC)
+
+    def test_6118_r6_6296_multiline_basic_string_rustflags_in_step(self) -> None:
+        self._config_in_step(self.ML_BASIC)
+
+    def test_6118_r6_6296_multiline_literal_string_rustflags_in_config_file(self) -> None:
+        self._config_in_file(self.ML_LITERAL)
+
+    def test_6118_r6_6296_multiline_literal_string_rustflags_in_step(self) -> None:
+        self._config_in_step(self.ML_LITERAL)
+
+    def test_6118_r6_6296_escaped_quoted_key_in_config_file(self) -> None:
+        self._config_in_file(self.ESCAPED_KEY)
+        self._config_in_file(self.ESCAPED_KEY_UPPER)
+
+    def test_6118_r6_6296_escaped_quoted_key_in_step(self) -> None:
+        self._config_in_step(self.ESCAPED_KEY)
+
+    def test_6118_r6_6296_env_table_rustflags_in_config_file(self) -> None:
+        self._config_in_file(self.ENV_FLAGS)
+        self._config_in_file(self.ENV_ENCODED)
+
+    def test_6118_r6_6296_env_table_rustflags_in_step(self) -> None:
+        self._config_in_step(self.ENV_FLAGS)
+
+    def test_6118_r6_6296_benign_multiline_string_is_clean(self) -> None:
+        body = '[build]\nrustflags = """\n-Dwarnings\n"""\n[term]\nquiet = false\n'
+        self.assertEqual([], self._repo_mutated(".cargo/config.toml", body))
+        self._clean(self._step("Write config", "cat >> .cargo/config.toml <<'EOF'\n" + body + "EOF"))
+
+    # ---- #6297: CARGO_HOME and nested .cargo/config.toml ----
+
+    def test_6118_r6_6297_cargo_home_in_run_line(self) -> None:
+        self._caught(self._step("a", "CARGO_HOME=$PWD/ci/cargo-home cargo test --no-run"))
+
+    def test_6118_r6_6297_cargo_home_exported(self) -> None:
+        self._caught(self._step("a", "export CARGO_HOME=\"$GITHUB_WORKSPACE/ci/home\"\ncargo test --no-run"))
+
+    def test_6118_r6_6297_cargo_home_in_step_env(self) -> None:
+        self._caught(self._step("a", "cargo test --no-run", env=[("CARGO_HOME", "ci/cargo-home")]))
+
+    def test_6118_r6_6297_cargo_home_written_to_github_env(self) -> None:
+        self._caught(self._step("a", "echo \"CARGO_HOME=$PWD/ci/cargo-home\" >> \"$GITHUB_ENV\""))
+
+    def test_6118_r6_6297_cargo_home_in_job_env(self) -> None:
+        anchor = '      CARGO_PROFILE_TEST_DEBUG: "0"\n'
+        found = self._mutated(_replace_once(self.ci, anchor, anchor + "      CARGO_HOME: ci/cargo-home\n"))
+        self.assertTrue(self._debug_flagged(found), found)
+
+    def test_6118_r6_6297_cd_into_subdirectory_before_cargo(self) -> None:
+        self._caught(self._step("a", "cd crates/sub && cargo test --no-run"))
+
+    def test_6118_r6_6297_pushd_before_cargo(self) -> None:
+        self._caught(self._step("a", "pushd crates/sub\ncargo test --no-run\npopd"))
+
+    def test_6118_r6_6297_working_directory_before_cargo(self) -> None:
+        self._caught(self._step("a", "cargo test --no-run", workdir="crates/sub"))
+
+    def test_6118_r6_6297_nested_config_file_is_loaded_and_checked(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="nested-6297-", dir=str(LOCAL_RUNS)) as tmp:
+            root = Path(tmp)
+            (root / "Cargo.toml").write_text("[package]\nname = \"x\"\n", encoding="utf-8")
+            (root / ".cargo").mkdir()
+            (root / ".cargo" / "config.toml").write_text("[term]\nquiet = false\n", encoding="utf-8")
+            (root / "crates" / "sub" / ".cargo").mkdir(parents=True)
+            (root / "crates" / "sub" / ".cargo" / "config.toml").write_text(self.ML_BASIC, encoding="utf-8")
+            (root / "target" / ".cargo").mkdir(parents=True)  # a build output tree is not source
+            (root / "target" / ".cargo" / "config.toml").write_text(self.ML_BASIC, encoding="utf-8")
+            repo = load_repo_files(root)
+            self.assertIn("crates/sub/.cargo/config.toml", repo, sorted(repo))
+            self.assertNotIn("target/.cargo/config.toml", repo, sorted(repo))
+            found = all_violations(self.live, repo)
+            self.assertTrue(any("crates/sub/.cargo/config.toml" in v and "R-DEBUG" in v for v in found), found)
+
+    # ---- #6298: uses: steps, composite actions, RUSTC_WRAPPER ----
+
+    def test_6118_r6_6298_uses_with_input_cargo_config_override(self) -> None:
+        self._caught(self._step("a", uses="actions-rs/cargo@v1",
+                                with_=[("command", "test"), ("args", "--config profile.dev.debug=2")]))
+
+    def test_6118_r6_6298_uses_allowlisted_action_with_rustflags_input(self) -> None:
+        self._caught(self._step("a", uses="dtolnay/rust-toolchain@stable",
+                                with_=[("toolchain", "stable"), ("rustflags", "$'-Copt-level=0\\x1f-g'")]))
+
+    def test_6118_r6_6298_uses_allowlisted_action_with_debuginfo_input(self) -> None:
+        self._caught(self._step("a", uses="Swatinem/rust-cache@v2",
+                                with_=[("env-vars", "RUSTFLAGS=-C debuginfo=2")]))
+
+    def test_6118_r6_6298_uses_local_composite_action(self) -> None:
+        self._caught(self._step("a", uses="./.github/actions/build-debug"))
+
+    def test_6118_r6_6298_uses_reusable_workflow_reference_in_a_step(self) -> None:
+        self._caught(self._step("a", uses="alphaonedev/ai-memory-mcp/.github/workflows/build.yml@main"))
+
+    def test_6118_r6_6298_uses_docker_image(self) -> None:
+        self._caught(self._step("a", uses="docker://rust:1.98"))
+
+    def test_6118_r6_6298_uses_unlisted_third_party_action(self) -> None:
+        self._caught(self._step("a", uses="someone/build-action@v1", with_=[("command", "test")]))
+
+    def test_6118_r6_6298_allowlisted_uses_with_benign_inputs_is_clean(self) -> None:
+        self._clean(self._step("a", uses="actions/checkout@v4", with_=[("fetch-depth", "0")]))
+        self._clean(self._step("b", uses="dtolnay/rust-toolchain@stable",
+                               with_=[("toolchain", "1.98.0"), ("components", "clippy, rustfmt")]))
+
+    def test_6118_r6_6298_rustc_wrapper_in_run_line(self) -> None:
+        self._caught(self._step("a", "RUSTC_WRAPPER=scripts/ci/wrap-g.sh cargo test --no-run"))
+
+    def test_6118_r6_6298_rustc_workspace_wrapper_exported(self) -> None:
+        self._caught(self._step("a", "export RUSTC_WORKSPACE_WRAPPER=scripts/ci/wrap-g.sh\ncargo test --no-run"))
+
+    def test_6118_r6_6298_rustc_wrapper_in_step_env(self) -> None:
+        self._caught(self._step("a", "cargo test --no-run", env=[("RUSTC_WRAPPER", "scripts/ci/wrap-g.sh")]))
+
+    def test_6118_r6_6298_rustc_override_in_step_env(self) -> None:
+        self._caught(self._step("a", "cargo test --no-run", env=[("RUSTC", "scripts/ci/fake-rustc.sh")]))
+
+    def test_6118_r6_6298_rustc_wrapper_written_to_github_env(self) -> None:
+        self._caught(self._step("a", "echo \"RUSTC_WRAPPER=$PWD/wrap-g.sh\" >> \"$GITHUB_ENV\""))
+
+    def test_6118_r6_6298_rustc_wrapper_in_config_file(self) -> None:
+        for body in ('[build]\nrustc-wrapper = "scripts/ci/wrap-g.sh"\n',
+                     '[build]\nrustc-workspace-wrapper = "scripts/ci/wrap-g.sh"\n',
+                     '[build]\nrustc = "scripts/ci/fake-rustc.sh"\n'):
+            self._config_in_file(body)
+            self._config_in_step(body)
+
 
 
 def _write(path: Path, size: int, executable: bool = False) -> None:
@@ -1553,14 +1785,16 @@ class PruneScript6118(unittest.TestCase):
         self.assertEqual([], tally.errors)
         self.assertEqual(self._expected_freed() - 120000, tally.freed)
 
-    def test_6118_unremovable_entry_warns_continues_and_exits_1(self) -> None:
+    def test_6118_unremovable_entry_warns_continues_and_exits_0(self) -> None:
         # S-F3: any other OSError is a warning; the rest is still pruned, the
         # totals are still printed, and the exit code is 1 at the end.
         dwarf = self.target / "debug" / "deps" / "mcp_input_schema-7c7c.dSYM" / "Contents" / "Resources" / "DWARF"
+        if UID0:
+            self.skipTest("root ignores directory permission bits")
         dwarf.chmod(0o500)
-        self.addCleanup(dwarf.chmod, 0o700)
+        self.addCleanup(restore_mode, dwarf, 0o700)
         proc = self._run("--target-dir", str(self.target))
-        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
         self.assertIn("::warning::prune-runner-target:", proc.stdout)
         self.assertEqual(self._expected_freed() - 2000, self._freed(proc.stdout))
         self.assertFalse((self.target / "debug" / "deps" / "ai_memory-0a1b").exists())
@@ -1602,11 +1836,11 @@ class PruneScript6118(unittest.TestCase):
         # CF6: the totals are also a ::notice:: annotation, so the first fleet
         # run's evidence is on the job summary, not deep in the step log.
         dry = self._run("--target-dir", str(self.target), "--dry-run")
-        self.assertRegex(dry.stdout, r"(?m)^::notice::prune-runner-target freed_bytes=%d deleted=10 mode=dry-run$"
+        self.assertRegex(dry.stdout, r"(?m)^::notice::prune-runner-target freed_bytes=%d deleted=10 mode=dry-run warnings=0$"
                          % self._expected_freed())
         real = self._run("--target-dir", str(self.target))
         self.assertEqual(0, real.returncode, real.stdout + real.stderr)
-        self.assertRegex(real.stdout, r"(?m)^::notice::prune-runner-target freed_bytes=%d deleted=10 mode=pruned$"
+        self.assertRegex(real.stdout, r"(?m)^::notice::prune-runner-target freed_bytes=%d deleted=10 mode=pruned warnings=0$"
                          % self._expected_freed())
 
     def test_6118_outside_workspace_real_run_needs_the_flag(self) -> None:
@@ -1637,16 +1871,18 @@ class PruneScript6118(unittest.TestCase):
         # traceback; examples/ and incremental/ are still pruned, the totals are
         # printed, and the exit code is 1.
         deps = self.target / "debug" / "deps"
+        if UID0:
+            self.skipTest("root ignores directory permission bits")
         deps.chmod(0)
-        self.addCleanup(deps.chmod, 0o755)
+        self.addCleanup(restore_mode, deps, 0o755)
         proc = self._run("--target-dir", str(self.target))
-        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
         self.assertNotIn("Traceback", proc.stderr)
         self.assertIn("::warning::prune-runner-target: debug/deps:", proc.stdout)
         self.assertEqual(EXAMPLES_AND_INCREMENTAL, self._freed(proc.stdout))
         self.assertFalse((self.target / EXAMPLE_HASHED).exists())
         self.assertEqual([], os.listdir(str(self.target / "debug" / "incremental")))
-        self.assertIn("1 entry could not be read or removed (warnings above); exit 1", proc.stdout)
+        self.assertIn("1 entry could not be read or removed (warnings above); exit 0", proc.stdout)
 
     def test_6118_scan_entry_vanishing_or_failing_lstat_is_handled(self) -> None:
         # F2 / SR2-1: an entry that vanishes between scandir and lstat is skipped
@@ -1663,7 +1899,7 @@ class PruneScript6118(unittest.TestCase):
 
         mod._lstat = flaky
         rc, out = self._main_in_process(mod, "--target-dir", str(self.target), "--dry-run")
-        self.assertEqual(1, rc, out)
+        self.assertEqual(0, rc, out)
         self.assertIn("::warning::prune-runner-target: debug/deps/mcp_input_schema-7c7c: Input/output error", out)
         self.assertNotIn("ai_memory-0a1b", out.split("freed_bytes=")[0].replace("libai_memory-0a1b", ""))
         self.assertEqual(EXAMPLES_AND_INCREMENTAL, self._freed(out))
@@ -1677,14 +1913,16 @@ class PruneScript6118(unittest.TestCase):
         _write(deps / name, 5, True)
         inner = deps / (name + ".dSYM") / "inner"
         _write(inner / "f", 3)
+        if UID0:
+            self.skipTest("root ignores directory permission bits")
         inner.chmod(0o500)
-        self.addCleanup(inner.chmod, 0o700)
+        self.addCleanup(restore_mode, inner, 0o700)
         for args in (("--dry-run",), ()):
             proc = self._run("--target-dir", str(self.target), *args)
             lines = (proc.stdout + proc.stderr).splitlines()
             self.assertFalse([x for x in lines if x.lstrip().startswith("::error::")], proc.stdout + proc.stderr)
             self.assertIn("pwn%0A::error::forged-6118", proc.stdout, args)
-        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
         self.assertIn("::warning::prune-runner-target: debug/deps/pwn%0A::error::forged-6118.dSYM/inner/f:",
                       proc.stdout)
         mod = _load_prune()
@@ -1816,7 +2054,7 @@ class PruneScript6118(unittest.TestCase):
             os.chdir(here)
         proc = self._run("--target-dir", str(self.target))
         self.assertNotIn("Traceback", proc.stderr, proc.stdout + proc.stderr)
-        self.assertEqual(1, proc.returncode, proc.stdout + proc.stderr)
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
         self.assertRegex(proc.stdout, r"::warning::prune-runner-target: debug/incremental/deep/d/d")
         self.assertIn("::notice::prune-runner-target freed_bytes=", proc.stdout)
         self.assertFalse((self.target / "debug" / "deps" / "ai_memory-0a1b").exists())
@@ -1995,7 +2233,7 @@ class PruneScript6118(unittest.TestCase):
                 unittest.mock.patch.object(mod.os, "supports_dir_fd", dir_fd_ok), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
             rc = mod.main(["--target-dir", str(self.target)])
-        self.assertEqual(1, rc, out.getvalue())
+        self.assertEqual(0, rc, out.getvalue())
         self.assertRegex(out.getvalue(), r"(?m)^  failed\s+deps executable\s+1$")
         self.assertNotRegex(out.getvalue(), r"(?m)^  deps executable\s+2\b")
 
@@ -2044,6 +2282,105 @@ class PruneScript6118(unittest.TestCase):
         self.assertNotIn("imp_bin-bbbbbbbbbbbbbbbb", proc.stdout)
         self.assertIn("kept deps/imp_bin-aaaaaaaaaaaaaaaa", proc.stdout)
         self.assertEqual(self._expected_freed() + 4096, self._freed(proc.stdout))
+
+    # ---- round 6 (#6300, #6299, #6301, #6303) ----
+
+    def test_6118_r6_6300_partial_failure_exits_0_on_every_consecutive_run(self) -> None:
+        # #6300: the step is `if: always()`; a nonzero exit after a partial
+        # failure turned every later job red.  Warnings are annotations, the
+        # run completed: rc 0, each time (the unremovable entry persists).
+        if UID0:
+            self.skipTest("root ignores directory permission bits")
+        dwarf = self.target / "debug" / "deps" / "mcp_input_schema-7c7c.dSYM" / "Contents" / "Resources" / "DWARF"
+        dwarf.chmod(0o500)
+        self.addCleanup(restore_mode, dwarf, 0o700)
+        for attempt in range(3):
+            proc = self._run("--target-dir", str(self.target))
+            self.assertEqual(0, proc.returncode, (attempt, proc.stdout, proc.stderr))
+            self.assertRegex(proc.stdout, r"(?m)^::notice::prune-runner-target freed_bytes=\d+ deleted=\d+ "
+                                          r"mode=pruned warnings=1$")
+            self.assertIn("::warning::prune-runner-target:", proc.stdout)
+
+    def test_6118_r6_6300_refusals_still_exit_2(self) -> None:
+        # rc 2 stays for refusals: nothing was touched and the step is misconfigured.
+        bad_profile = self._run("--target-dir", str(self.target), "--profile", "..")
+        self.assertEqual(2, bad_profile.returncode, bad_profile.stdout + bad_profile.stderr)
+        (self.target / "CACHEDIR.TAG").unlink()
+        (self.target / "debug" / ".cargo-lock").unlink()
+        no_marker = self._run("--target-dir", str(self.target))
+        self.assertEqual(2, no_marker.returncode, no_marker.stdout + no_marker.stderr)
+        self.assertTrue((self.target / "debug" / "deps" / "ai_memory-0a1b").exists())
+
+    def test_6118_r6_6300_completed_without_warnings_reports_warnings_0(self) -> None:
+        proc = self._run("--target-dir", str(self.target))
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertRegex(proc.stdout, r"(?m)^::notice::prune-runner-target freed_bytes=\d+ deleted=10 "
+                                      r"mode=pruned warnings=0$")
+
+    # Characters that render invisibly or reorder / split a log line (#6299): Zl, Zp,
+    # bidi controls, zero-width and format characters, a private-use and a noncharacter.
+    INVISIBLE = (0x2028, 0x2029, 0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D,
+                 0x202E, 0x2060, 0x2061, 0x2066, 0x2067, 0x2068, 0x2069, 0xFEFF, 0x00AD, 0x061C, 0x180E,
+                 0xE000, 0xFFFF, 0xE0001, 0xE007F)
+
+    def test_6118_r6_6299_line_and_paragraph_separators_are_escaped(self) -> None:
+        mod = _load_prune()
+        self.assertEqual("a\\u{2028}b", mod._escape("a\u2028b"))
+        self.assertEqual("a\\u{2029}b", mod._escape("a\u2029b"))
+
+    def test_6118_r6_6299_every_invisible_code_point_is_escaped(self) -> None:
+        mod = _load_prune()
+        for cp in self.INVISIBLE:
+            with self.subTest(code_point="U+%04X" % cp):
+                self.assertEqual("x\\u{%x}y" % cp, mod._escape("x%sy" % chr(cp)))
+
+    def test_6118_r6_6299_visible_non_ascii_names_are_untouched(self) -> None:
+        mod = _load_prune()
+        for text in ("caf\u00e9", "\u65e5\u672c\u8a9e", "\U0001f980-rust", "tab-free name.rlib"):
+            self.assertEqual(text, mod._escape(text))
+
+    def test_6118_r6_6299_bidi_name_never_reaches_the_log_raw(self) -> None:
+        name = "tst\u202e\u2028-0123456789abcdef"
+        _write(self.target / "debug" / "deps" / name, 5, True)
+        for args in (("--dry-run",), ()):
+            proc = self._run("--target-dir", str(self.target), *args)
+            self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+            for ch in ("\u202e", "\u2028"):
+                self.assertNotIn(ch, proc.stdout + proc.stderr, args)
+            if args:
+                self.assertIn("tst\\u{202e}\\u{2028}-0123456789abcdef", proc.stdout)
+
+    def test_6118_r6_6301_unreadable_uplift_candidate_is_kept_and_named_unverified(self) -> None:
+        # #6301 (vote 5-agent 4d3ea1c5, r6): a same-name same-size candidate whose bytes
+        # cannot be read stays (fail closed) and says so, instead of claiming "same content".
+        if UID0:
+            self.skipTest("root reads any file")
+        deps = self.target / "debug" / "deps"
+        _write(self.target / "debug" / "unrd-bin", 4096, True)
+        cand = deps / "unrd_bin-aaaaaaaaaaaaaaaa"
+        _write(cand, 4096, True)
+        cand.chmod(0o111)
+        self.addCleanup(restore_mode, cand, 0o755)
+        proc = self._run("--target-dir", str(self.target))
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertTrue(cand.exists(), proc.stdout)
+        kept = [ln for ln in proc.stdout.splitlines() if "kept deps/unrd_bin-aaaaaaaaaaaaaaaa" in ln]
+        self.assertEqual(1, len(kept), proc.stdout)
+        self.assertIn("unreadable, not verified", kept[0])
+        self.assertNotIn("same name, size and content", kept[0])
+
+    def test_6118_r6_6303_restore_mode_tolerates_a_removed_path(self) -> None:
+        gone = Path(self.scratch.name) / "removed-by-the-prune"
+        restore_mode(gone, 0o700)  # must not raise FileNotFoundError
+
+    def test_6118_r6_6303_chmod_tests_skip_under_root(self) -> None:
+        for name in ("test_6118_unremovable_entry_warns_continues_and_exits_0",
+                     "test_6118_scan_unreadable_subdir_warns_and_prunes_the_rest",
+                     "test_6118_newline_in_entry_name_cannot_inject_a_workflow_command"):
+            src = inspect.getsource(getattr(PruneScript6118, name))
+            self.assertIn("if UID0:", src, name)
+            self.assertIn("self.skipTest(", src, name)
+            self.assertIn("restore_mode", src, name)
 
 
 EXAMPLE_HASHED = "debug/examples/demo-0123456789abcdef"
