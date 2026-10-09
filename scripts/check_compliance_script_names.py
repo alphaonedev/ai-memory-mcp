@@ -1718,6 +1718,9 @@ def self_test():
             ("F6 '</details>' inside a comment",
              stale_line + "\n<details>\n\n<!-- </details> -->\n" + erratum + "\n</details>\n"),
             ("F6 '</details>' in an indented code block", stale_line + "\n<details>\n\n    </details>\n" + erratum),
+            ("F6 '</details>' in a <pre> block",
+             stale_line + "\n<details>\n\n<pre>\n</details>\n</pre>\n\n" + erratum + "\n</details>\n"),
+            ("F6 upper-case <DETAILS>", stale_line + "\n<DETAILS>\n\n" + erratum + "\n</DETAILS>\n"),
             ("F6 <details> on the erratum line",
              stale_line + "\nErratum (#1): <details>`check-old.sh`</details> is `scripts/check_new.py`.\n"),
             ("C4 CDATA section over lines", stale_line + "\n<![CDATA[\n" + erratum + "\n]]>\n"),
@@ -1735,6 +1738,7 @@ def self_test():
             ("CR line endings", (stale_line + erratum).replace("\n", "\r")),
             ("byte order mark before a first-line erratum", "﻿" + line + stale_line),
             ("after a closed <details>", stale_line + "\n<details>\n\nx\n\n</details>\n" + erratum),
+            ("after '<details>' in a code span", stale_line + "\nText `<details>` here.\n" + erratum),
             ("invisible character inside the erratum's stale name",
              stale_line + "\nErratum (#1): `check-o​ld.sh` is `scripts/check_new.py`.\n"),
         ):
@@ -1751,6 +1755,7 @@ def self_test():
             ("F3 parenthesised title", "Run [check-](a (t))old.sh daily.\n"),
             ("F3 angle-bracket destination", "Run [check-](<a(b>)old.sh daily.\n"),
             ("F3 escaped parenthesis in a destination", "Run [check-](a\\)b)old.sh daily.\n"),
+            ("F3 escaped quote in a title", 'Run [check-](a "x\\" y")old.sh daily.\n'),
             ("C4 entity and code span", "Run &#99;heck-`old.sh`.\n"),
         ):
             doc.write_bytes(text.encode("utf-8"))
@@ -1774,6 +1779,7 @@ def self_test():
             ("F5 isolate on a line without a name", "Text ⁧x⁩.\n"),
             ("F5 right-to-left mark", "Run check-old‏.sh.\n"),
             ("F5 Arabic letter mark", "Text ؜x.\n"),
+            ("F5 left-to-right override", "Text \u202dx.\n"),
         ):
             doc.write_bytes(text.encode("utf-8"))
             expect(any(":1: bidirectional control character" in p for p in check(root)),
@@ -1790,6 +1796,47 @@ def self_test():
             skeleton(text.split("\n"))
             took = time.monotonic() - started
             expect(took < 3.0, "R9-#6352 %s: the skeleton scan took %.1fs" % (label, took))
+        # #6352: the work is counted too, so the bound holds whatever the speed of the host: the
+        # closer searches read each character at most twice, and each destination position once.
+
+        class CountedText(str):
+            scanned = 0
+
+            def find(self, sub, start=0, *rest):
+                found = str.find(self, sub, start, *rest)
+                CountedText.scanned += (len(self) if found < 0 else found) - start
+                return found
+
+        class CountedRe:
+            def __init__(self, pattern):
+                self.pattern, self.searches = pattern, 0
+
+            def search(self, *args):
+                self.searches += 1
+                return self.pattern.search(*args)
+
+        dest_re = globals()["DEST_STOP_RE"]
+        for label, unit in (
+            ("unclosed '<!--'", "<!-- x\n"),
+            ("unclosed '(' titles", "[x](a ("),
+            ("unclosed '\"' titles", '[x](a "'),
+            ("destinations with an unclosed '('", "[x](a("),
+        ):
+            counted, text = CountedRe(dest_re), CountedText(unit * 2000)
+            globals()["DEST_STOP_RE"], CountedText.scanned = counted, 0
+            try:
+                list(skeleton_spans(text))
+            finally:
+                globals()["DEST_STOP_RE"] = dest_re
+            expect(CountedText.scanned <= 2 * len(text) and counted.searches <= 2 * len(text) // len(unit) + 1,
+                   "R9-#6352 %s: %d characters read and %d destination searches for %d characters"
+                   % (label, CountedText.scanned, counted.searches, len(text)))
+        # #6238 (round 9): the word "erratum" is matched in the visible text, so an invisible
+        # character inside it still names the line in the violation.
+        doc.write_bytes((stale_line + "\n- Err\u00adatum (#1): `check-old.sh` is `scripts/check_new.py`.\n").encode("utf-8"))
+        probs = check(root)
+        expect(any("line 3 is not an erratum" in p for p in probs),
+               "R9-#6238: a non-canonical erratum with a soft hyphen was not named (%r)" % (probs,))
         # #6353: an allowlist that exists but cannot be stat'ed is unreadable (exit 2), never absent.
         r = fresh("u-allow-loop")
         (r / ALLOW_REL).unlink()
@@ -1797,6 +1844,16 @@ def self_test():
             rc, err = run_main(r)
             expect(rc == 2 and ALLOW_REL + ": unreadable" in err,
                    "#6353-loop: allowlist symlink loop: expected exit 2, got %r (stderr=%r)" % (rc, err))
+        # A path that exists but is not a regular file holds no entries: it suppresses nothing and the
+        # stale name is still reported (exit 1), as before #6353.
+        r = fresh("u-allow-dir")
+        (r / ALLOW_REL).unlink()
+        (r / ALLOW_REL).mkdir()
+        (r / "docs" / "compliance" / "A.md").write_text(stale_line)
+        rc, err = run_main(r)
+        expect(rc == 1 and "check-old.sh" in err,
+               "#6353-dir: a directory at the allowlist path: expected exit 1 naming the stale name, got %r"
+               " (stderr=%r)" % (rc, err))
 
         # #6199: a fixture setup failure exits 2 with 'SELF-TEST FAIL: fixture setup', never a traceback.
         gate_src = Path(__file__).read_text(encoding="utf-8")
