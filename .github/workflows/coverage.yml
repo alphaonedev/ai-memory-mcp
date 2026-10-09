@@ -76,7 +76,7 @@ permissions:
 # rationale + the prior unsafe-key incident that motivated this shape.
 concurrency:
   group: cov-${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
