@@ -1862,7 +1862,7 @@ CERT_TRUSTED_WORKFLOW_LINES = (
     "- name: Check out the BASE commit only",
     COMPARE_CHECKOUT,
     "with:",
-    "ref: ${{ github.event.pull_request.base.sha }}",
+    "ref: ${{ github.sha }}",
     "fetch-depth: 0",
     "persist-credentials: false",
     "- name: Fetch the pull request head and merge commit as git objects (data, never checked out)",
@@ -2202,10 +2202,14 @@ def run_cert_trusted_workflow_cases(repo_root: Path, base: Path) -> bool:
             return False
         return True
 
-    base_ref = "ref: ${{ github.event.pull_request.base.sha }}\n"
+    base_ref = "ref: ${{ github.sha }}\n"
     gate = "python3 -I scripts/check_cert_expiry.py"
     ok &= case("#6140 head checked out", good.replace(
         base_ref, "ref: ${{ github.event.pull_request.head.sha }}\n", 1), "differs from the pinned form")
+    # #6140 round 2 (F6): the gate script must come from the same commit as this workflow file (github.sha,
+    # the base branch tip), not the payload base.sha, which can be older for an unsynced pull request.
+    ok &= case("#6140 payload base.sha checked out", good.replace(
+        base_ref, "ref: ${{ github.event.pull_request.base.sha }}\n", 1), "differs from the pinned form")
     ok &= case("#6140 merge commit checked out", good.replace(
         base_ref, "ref: refs/pull/${{ github.event.pull_request.number }}/merge\n", 1), "differs from the pinned form")
     ok &= case("#6140 head repo checked out", good.replace(

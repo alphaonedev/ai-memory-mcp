@@ -2334,6 +2334,37 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
             "echo later", "echo later2")}),
         "symlink": pr("symlink", {mod_rs: wire, CERT_DOC: symlink_doc}),
     }
+    # Round 2 (#6140 security review F1): each c8-precheck.yml header key is guarded.
+    headers = {
+        "env": C8_FIXTURE.replace("jobs:\n", "env:\n  X: y\njobs:\n", 1),
+        "on": C8_FIXTURE.replace("on: [pull_request]", "on: [pull_request, push]", 1),
+        "permissions": C8_FIXTURE.replace("jobs:\n", "permissions:\n  contents: write\njobs:\n", 1),
+        "defaults": C8_FIXTURE.replace("jobs:\n", "defaults:\n  run:\n    shell: bash\njobs:\n", 1),
+    }
+    for key, text in headers.items():
+        shapes["hdr-" + key] = pr("hdr-" + key, {c8_rel: text})
+    shapes["hdr-ok"] = pr("hdr-ok", {c8_rel: headers["env"]}, approve)
+    # Round 2 (F3): a second producer of the required check name, anywhere in
+    # .github/workflows at the merge commit, fails closed; a trailer does not waive it.
+    shadow_job = ("  shadow:\n    name: Enterprise-federation cert-expiry gate (cert §7 / F7)\n"
+                  "    runs-on: ubuntu-latest\n    steps:\n      - run: echo always-green\n")
+    shadows = {
+        "c8": {c8_rel: C8_FIXTURE + shadow_job},
+        "new": {".github/workflows/shadow.yml": "name: s\non: [pull_request]\njobs:\n" + shadow_job},
+        "copy": {".github/workflows/copy.yml": C8_FIXTURE},
+        "escaped": {".github/workflows/esc.yaml": "name: e\non: [pull_request]\njobs:\n  esc:\n"
+                    '    name: "Enterprise-federation cert\\x2Dexpiry gate (cert \\u00a7 / F7)"\n'
+                    "    runs-on: ubuntu-latest\n    steps:\n      - run: echo always-green\n"},
+        "folded": {".github/workflows/fold.yml": "name: f\non: [pull_request]\njobs:\n  fold:\n"
+                   "    name: Enterprise-federation cert-expiry\n      gate (cert §7 / F7)\n"
+                   "    runs-on: ubuntu-latest\n    steps:\n      - run: echo always-green\n"},
+    }
+    for key, edits in shadows.items():
+        shapes["shadow-" + key] = pr("shadow-" + key, edits)
+    shapes["shadow-ok"] = pr("shadow-ok", shadows["new"], approve)
+    shapes["newwf"] = pr("newwf", {".github/workflows/lint.yml": "name: lint\non: [pull_request]\njobs:\n"
+                                   "  lint:\n    name: Lint\n    runs-on: ubuntu-latest\n"
+                                   "    steps:\n      - run: echo lint\n"})
     # Merge-structure shapes off one PR head (#6138 cells, here in --trusted mode).
     fx.g("checkout", "-q", "-b", "h8", base)
     fx.write("src/unrelated.rs", "// h8 PR work\n", append=True)
@@ -2456,6 +2487,78 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     rc, out = trusted_cli(mirror, "--base-ref", "main", "--merge-ref", good8)
     if rc == 0 or "--head-sha" not in out:
         t.fail(f"(tr-e-args): --trusted without --head-sha did not refuse (rc {rc}):", out)
+    _trusted_round2_cells(tmp, t, judge, shapes, mirror, job)
+
+
+def _trusted_round2_cells(tmp, t, judge, shapes, mirror, job):
+    """#6140 round 2 (security review F1-F4): header keys, git read errors,
+    check-name shadowing, the blob cap and the approval annotation."""
+    gate_rel = PINNED_TRUSTED_PATHS[0]
+    guard = "GUARD CHANGED: "
+    # (F1) every guarded c8-precheck.yml header key: RED without the trailer, GREEN with it.
+    for key in ("env", "on", "permissions", "defaults"):
+        judge(f"tr-h-{key}", f"a c8-precheck.yml `{key}:` header edit without the trailer", *shapes["hdr-" + key],
+              needles=(job, "Rule-Change-Approved-By"))
+    judge("tr-h-ok", "a c8-precheck.yml header edit WITH the trailer", *shapes["hdr-ok"], ok=True,
+          needles=(job, "Selftest Approver"))
+    # (F4) a trailer-approved guard change is surfaced as a workflow annotation.
+    judge("tr-h-warn", "an approved guard change", *shapes["hdr-ok"], ok=True,
+          needles=("::warning title=GUARD CHANGED::", "Selftest Approver"))
+    # (F2) a git read error (missing object) is fail-closed, never read as "absent".
+    missing = "0" * 40
+    for label, call in (("tr-g-entry", lambda: tree_entry(mirror, missing, CERT_DOC)),
+                        ("tr-g-banner", lambda: cert_banner(mirror, missing)),
+                        ("tr-g-guard", lambda: guarded_state(mirror, missing, gate_rel))):
+        try:
+            got = call()
+        except GateError as exc:
+            if "ls-tree" not in str(exc):
+                t.fail(f"({label}): a missing tree failed for the wrong reason: {exc}")
+        else:
+            t.fail(f"({label}): a git ls-tree error on a missing object read as {got!r} (fail-open)")
+    rc, out = trusted_cli_shimmed(tmp, mirror, "ls-tree", shapes["clean"])
+    if rc != 1 or "ls-tree" not in out:
+        t.fail(f"(tr-g-e2e): --trusted with every git ls-tree failing did not fail closed (rc {rc}):", out)
+    # (F4) the 2 MiB blob cap: an oversized cert doc is refused, not read.
+    saved_cap = globals()["MAX_BLOB_BYTES"]
+    globals()["MAX_BLOB_BYTES"] = 10
+    try:
+        judge("tr-cap", "a cert doc above the blob cap", *shapes["clean"], needles=("exceeds 10 bytes",))
+    finally:
+        globals()["MAX_BLOB_BYTES"] = saved_cap
+    # (F3) a second producer of the required check name fails closed, trailer or not.
+    shadow = "GUARD SHADOW: "
+    for key, where in (("c8", ".github/workflows/c8-precheck.yml"), ("new", ".github/workflows/shadow.yml"),
+                       ("copy", ".github/workflows/copy.yml"), ("escaped", ".github/workflows/esc.yaml"),
+                       ("folded", ".github/workflows/fold.yml")):
+        judge(f"tr-s-{key}", f"a shadow job named like the required context ({key})", *shapes["shadow-" + key],
+              needles=(shadow + where,))
+    judge("tr-s-ok", "a shadow job WITH the approval trailer (not waivable)", *shapes["shadow-ok"],
+          needles=(shadow + ".github/workflows/shadow.yml",))
+    judge("tr-s-control", "a new unrelated workflow file", *shapes["newwf"], ok=True, absent=(shadow, guard))
+    judge("tr-s-other", "other c8 jobs edited", *shapes["otherjob"], ok=True, absent=(shadow, guard))
+
+
+def trusted_cli_shimmed(tmp, repo, fail, shape):
+    """trusted_cli on SHAPE (head, merge) with a PATH shim git that exits 128
+    on any call whose argv contains FAIL (a read error on a missing object)."""
+    real = shutil.which("git")
+    if real is None:
+        return 2, "git is not on PATH"
+    shim_dir = Path(tempfile.mkdtemp(prefix="gitshim.", dir=str(tmp)))
+    shim = shim_dir / "git"
+    shim.write_text(GIT_SHIM.format(python=sys.executable, real=real, version="", fail=fail), encoding="utf-8")
+    shim.chmod(0o755)
+    saved = os.environ.get("PATH")
+    os.environ["PATH"] = f"{shim_dir}{os.pathsep}{saved or ''}"
+    try:
+        return trusted_cli(repo, "--base-ref=main", f"--head-sha={shape[0]}", f"--merge-ref={shape[1]}")
+    finally:
+        if saved is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = saved
+        shutil.rmtree(shim_dir, ignore_errors=True)
 
 
 SELF_TEST_OK = (
