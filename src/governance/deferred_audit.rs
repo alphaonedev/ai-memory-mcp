@@ -3745,6 +3745,46 @@ mod tests {
         assert_eq!(metrics.appended_count(), 0);
     }
 
+    /// #3856 — a sender clone that outlives `drop(queue)` (a hook installed
+    /// into a process-global chain by an EARLIER test, or a producer thread
+    /// that has not returned) keeps the receiver's `recv().await` from ever
+    /// returning `None`. Pre-fix the test-facing `close_and_flush` awaited the
+    /// supervisor UNBOUNDED, so the leak was a 0-CPU hang that ate a landing
+    /// chain's whole budget (chain 9g: ~6 h; chain 9h: 21 min under a kill
+    /// timeout). It must instead be a FAILING call that names the leak: a
+    /// typed [`DrainFlushError::Timeout`] inside the production drain bound.
+    ///
+    /// The outer deadline is the red-side detector: on the unbounded helper
+    /// it fires first and the `expect` below fails, instead of the test
+    /// hanging the whole `cargo test --lib` run.
+    #[tokio::test]
+    async fn close_and_flush_fails_typed_when_a_sender_clone_outlives_the_queue_3856() {
+        let (queue, rx) = DeferredAuditQueue::new();
+        let metrics = queue.metrics();
+        // The retained clone: nothing ever drops it before the drain.
+        let leaked_sender = queue.clone();
+        let supervisor =
+            spawn_supervised_drainer(rx, move || MockSink::default(), metrics.clone(), u32::MAX);
+        assert!(queue.submit_refusal("agent:leak-3856", &refusal_action(), &refusal_decision()));
+
+        let outer_deadline = DEFAULT_SHUTDOWN_DRAIN_TIMEOUT * 3;
+        let outcome = tokio::time::timeout(outer_deadline, close_and_flush(queue, supervisor))
+            .await
+            .expect(
+                "#3856: close_and_flush must return within the drain bound when a sender clone \
+                 is leaked, never park forever on the supervisor",
+            );
+        let err = outcome.expect_err("a leaked sender clone must be a FAILING drain, not Ok");
+        assert!(
+            err.to_string().contains("timed out"),
+            "the error must name the drain timeout: {err}"
+        );
+        // The admitted prefix still drained before the bound expired: the
+        // timeout names the LEAK, not a lost event.
+        assert_eq!(metrics.appended_count(), 1);
+        drop(leaked_sender);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn persistent_sink_panic_yields_to_runtime_between_retries() {
         let (queue, rx) = DeferredAuditQueue::new();
