@@ -12,11 +12,25 @@ mid-job.  The persistent ``target/`` IS the fleet's warm cache (#3128), but the
 test executables are not cache: cargo relinks every one of them whenever the lib
 crate changes, i.e. on every commit, so keeping them past the job buys nothing.
 
-RULES ENFORCED, for every job that runs cargo on a self-hosted label (closed
-world: a workflow file the reader cannot read is a FAILURE, never a skip):
-  R-CENSUS the set of (workflow, job) pairs that run ``cargo`` on a
-           ``self-hosted`` label is exactly EXPECTED_SELF_HOSTED_CARGO_JOBS, so
-           a new self-hosted cargo job cannot appear without being pinned here.
+RULES ENFORCED, for EVERY job that can land on a self-hosted runner (closed
+world: a workflow file, or a ``runs-on`` form, the reader cannot read is a
+FAILURE, never a skip):
+  R-CENSUS the set of (workflow, job) pairs whose ``runs-on`` can resolve to a
+           self-hosted runner is exactly EXPECTED_SELF_HOSTED_JOBS, so a new
+           self-hosted job cannot appear without being pinned here.  Every
+           self-hosted job is censused, cargo or not: cargo can run through a
+           script (``scripts/coverage.sh``), an action or a Makefile, and a
+           guard that guesses which commands compile fails open.  ``runs-on``
+           is read in every form Actions accepts that a job here could use: an
+           inline label, a flow list ``[a, b]``, a block sequence, and
+           ``${{ matrix.<key> }}`` / ``${{ fromJSON(matrix.<key>) }}`` resolved
+           against EVERY value of that matrix key (dimension lists and
+           ``include:`` rows).  Any other form (a ``group:``/``labels:``
+           mapping, another expression, a matrix key with no literal values)
+           raises Unparsed.  A leg is GitHub-hosted only when every label is a
+           GitHub-hosted image label (HOSTED_LABEL_RE) and none is
+           ``self-hosted``; a bare fleet label such as ``linux-fed`` counts as
+           self-hosted.
   R-DEBUG  the effective env (workflow ``env:`` overlaid by job ``env:``) sets
            BOTH ``CARGO_PROFILE_DEV_DEBUG`` and ``CARGO_PROFILE_TEST_DEBUG`` to
            ``0`` (the pair rule of #3461: ``test`` only inherits ``dev`` while
@@ -31,6 +45,11 @@ world: a workflow file the reader cannot read is a FAILURE, never a skip):
            line tables: no workflow, script or test sets RUST_BACKTRACE, panic
            locations are compile-time strings, and the hosted sqlite leg and
            both pg jobs have run the full suites at ``0`` since #3461 / #3274.
+           No step may set any ``CARGO_PROFILE_*_DEBUG`` (or a rustc
+           ``debuginfo=`` flag) to anything but ``0``: a step-level ``env:``
+           row, or an assignment in a ``run:`` body (``export``, or an
+           ``echo ... >> "$GITHUB_ENV"`` that overrides the job env for every
+           later step) is flagged.
   R-PRUNE  the job's LAST step is named PRUNE_STEP_NAME, runs under
            ``if: always()`` (a red or cancelled test run leaves the same
            binaries behind), is skipped on GitHub-hosted runners when the job
@@ -55,6 +74,7 @@ Run:  python3 scripts/test/test_ci_runner_target_hygiene_6118.py
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import stat
@@ -84,11 +104,21 @@ DOCS_ONLY_GUARD = "docs_only"
 # persistent workspace would otherwise hand it the previous job's copy.
 CHECKOUT_STEP_ID = "checkout"
 CHECKOUT_GUARD = "steps.checkout.outcome == 'success'"
-CARGO_RE = re.compile(r"(^|[\s;&|(])cargo\s+(test|build|llvm-cov|bench|nextest)\b")
+# GitHub-hosted image labels (ubuntu-latest, ubuntu-24.04-arm, macos-15-intel,
+# windows-2022, ...).  Anything else (``self-hosted``, ``linux-fed``,
+# ``macos-fed``, a typo) is treated as a fleet label: fail closed.
+HOSTED_LABEL_RE = re.compile(r"(ubuntu|macos|windows)-(latest|[0-9]+(\.[0-9]+)?)(-(arm|arm64|intel|large|xlarge))?")
+RUNS_ON_EXPR_RE = re.compile(
+    r"\$\{\{\s*(?:fromJSON\(\s*matrix\.([A-Za-z0-9_-]+)\s*\)|matrix\.([A-Za-z0-9_-]+))\s*\}\}")
+DEBUG_ENV_KEY_RE = re.compile(r"CARGO_PROFILE_[A-Z0-9_]+_DEBUG")
+# `CARGO_PROFILE_X_DEBUG=value` anywhere in a run body (export, env prefix,
+# `echo ... >> "$GITHUB_ENV"`), with the value bare or quoted.
+RUN_DEBUG_ASSIGN_RE = re.compile(r"(CARGO_PROFILE_[A-Z0-9_]+_DEBUG)\s*=\s*[\"']?([^\s\"';|&)}]*)")
+DEBUGINFO_FLAG_RE = re.compile(r"debuginfo\s*=\s*[\"']?([A-Za-z0-9_-]*)")
 
-# Every (workflow, job) that runs cargo on a self-hosted label, pinned.  A new
-# self-hosted cargo job must be added here AND given the two rules above.
-EXPECTED_SELF_HOSTED_CARGO_JOBS = frozenset({
+# Every (workflow, job) that can land on a self-hosted runner, pinned.  A new
+# self-hosted job must be added here AND given the rules above.
+EXPECTED_SELF_HOSTED_JOBS = frozenset({
     ("cert-postgres-age.yml", "cert-postgres-age"),
     ("ci.yml", "check"),
     ("postgres-ignored.yml", "postgres-ignored"),
@@ -106,31 +136,32 @@ class Step:
         self.cond = ""
         self.uses = ""
         self.step_id = ""
+        self.env: Dict[str, str] = {}
         self.run: List[str] = []
 
     def run_text(self) -> str:
         return "\n".join(self.run)
 
 
+def _leg_is_hosted(labels: List[str]) -> bool:
+    return bool(labels) and "self-hosted" not in labels and all(HOSTED_LABEL_RE.fullmatch(x) for x in labels)
+
+
 class Job:
     def __init__(self, job_id: str) -> None:
         self.job_id = job_id
-        self.runs_on = ""
+        self.runs_on = ""  # the raw inline spec ("" for the block forms)
         self.env: Dict[str, str] = {}
-        self.matrix_runners: List[str] = []
+        self.matrix: Dict[str, List[str]] = {}  # every literal value of every matrix key
+        self.legs: List[List[str]] = []  # one label list per possible runner
         self.steps: List[Step] = []
 
     def self_hosted(self) -> bool:
-        if "self-hosted" in self.runs_on:
-            return True
-        return any("self-hosted" in r for r in self.matrix_runners)
-
-    def runs_cargo(self) -> bool:
-        return any(CARGO_RE.search(line) for s in self.steps for line in s.run)
+        return any(not _leg_is_hosted(leg) for leg in self.legs)
 
     def can_be_hosted(self) -> bool:
-        """True when the job's runs-on is matrix-driven (some legs may be GitHub-hosted)."""
-        return "fromJSON" in self.runs_on or "matrix." in self.runs_on
+        """True when at least one leg lands on a GitHub-hosted image."""
+        return any(_leg_is_hosted(leg) for leg in self.legs)
 
 
 class Workflow:
@@ -175,6 +206,114 @@ def _split_key(content: str) -> Tuple[bool, str, str]:
     if not m:
         return content.startswith("- "), "", content
     return m.group(1) is not None, m.group(2), (m.group(3) or "")
+
+
+def _flow_items(text: str, line: int) -> List[str]:
+    """Items of a one-line flow sequence ``[a, 'b, c', "d"]`` (quote-aware)."""
+    inner = text.strip()
+    if not (inner.startswith("[") and inner.endswith("]")):
+        raise Unparsed("not a flow sequence at line %d: %r" % (line, text))
+    items: List[str] = []
+    cur: List[str] = []
+    quote: Optional[str] = None
+    for ch in inner[1:-1]:
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch in "[]{}":
+            raise Unparsed("nested flow collection at line %d: %r" % (line, text))
+        elif ch == ",":
+            items.append(_unquote("".join(cur)))
+            cur = []
+            continue
+        cur.append(ch)
+    if quote:
+        raise Unparsed("unterminated quote at line %d: %r" % (line, text))
+    tail = "".join(cur).strip()
+    if tail or items:
+        items.append(_unquote(tail))
+    return [x for x in items if x != ""]
+
+
+def _labels(value: str, via_json: bool, line: int) -> List[str]:
+    """Runner labels of one resolved matrix value (or one inline label)."""
+    if "${{" in value:
+        raise Unparsed("runs-on value is itself an expression at line %d: %r" % (line, value))
+    if not via_json:
+        return [value]
+    try:
+        data = json.loads(value)
+    except ValueError as exc:
+        raise Unparsed("fromJSON value is not JSON at line %d: %r (%s)" % (line, value, exc))
+    if isinstance(data, str):
+        return [data]
+    if isinstance(data, list) and data and all(isinstance(x, str) for x in data):
+        return list(data)
+    raise Unparsed("fromJSON value is not a label or label list at line %d: %r" % (line, value))
+
+
+def _read_matrix(rows: List[Tuple[int, str, int]], start: int, indent: int, job: Job) -> int:
+    """Collect every literal value of every key under ``strategy:`` (dims and include rows)."""
+    i = start
+    pending: Optional[Tuple[str, int]] = None  # a `key:` with an empty value, awaiting `- item` rows
+    while i < len(rows) and rows[i][0] > indent:
+        ind, content, n = rows[i]
+        dash, key, value = _split_key(content)
+        if not key:
+            if dash and pending is not None and ind > pending[1]:
+                job.matrix.setdefault(pending[0], []).append(_unquote(_strip_comment(content[2:])))
+            i += 1
+            continue
+        value = _strip_comment(value).strip()
+        key_col = ind + 2 if dash else ind
+        if value == "":
+            pending = (key, key_col)
+        else:
+            pending = None
+            if value.startswith("["):
+                job.matrix.setdefault(key, []).extend(_flow_items(value, n))
+            else:
+                job.matrix.setdefault(key, []).append(_unquote(value))
+        i += 1
+    return i
+
+
+def _resolve_runs_on(job: Job, spec: str, block: List[Tuple[int, str, int]], line: int) -> None:
+    """Fill ``job.legs`` from the runs-on spec (inline) or its block rows; Unparsed otherwise."""
+    if block:
+        labels: List[str] = []
+        for _ind, content, n in block:
+            dash, key, _v = _split_key(content)
+            if not dash or key:
+                raise Unparsed("runs-on mapping form (group:/labels:) is not read, line %d: %r" % (n, content))
+            labels.append(_unquote(_strip_comment(content[2:])))
+        job.legs = [labels]
+        return
+    spec = spec.strip()
+    if spec == "":
+        raise Unparsed("job %s has an empty runs-on at line %d" % (job.job_id, line))
+    if spec.startswith("{"):
+        raise Unparsed("runs-on mapping form is not read, line %d: %r" % (line, spec))
+    if spec.startswith("["):
+        labels = _flow_items(spec, line)
+        for x in labels:
+            _labels(x, False, line)
+        job.legs = [labels]
+        return
+    if "${{" in spec:
+        m = RUNS_ON_EXPR_RE.fullmatch(spec)
+        if not m:
+            raise Unparsed("runs-on expression is not matrix.<key> / fromJSON(matrix.<key>), line %d: %r" % (line, spec))
+        via_json = m.group(1) is not None
+        key = m.group(1) or m.group(2)
+        values = job.matrix.get(key, [])
+        if not values:
+            raise Unparsed("runs-on uses matrix.%s but the matrix has no literal values for it, line %d" % (key, line))
+        job.legs = [_labels(v, via_json, line) for v in values]
+        return
+    job.legs = [[_unquote(spec)]]
 
 
 def _env_block(lines: List[Tuple[int, str, str]], start: int, indent: int) -> Tuple[Dict[str, str], int]:
@@ -240,7 +379,12 @@ def _read_jobs(wf: Workflow, rows: List[Tuple[int, str, int]], raw: List[str], s
         if dash or not job_id or value.strip():
             raise Unparsed("job row at line %d is not `<id>:`: %r" % (n, content))
         job = Job(job_id)
+        job_line = n
         i += 1
+        runs_on_line = 0
+        runs_on_block: List[Tuple[int, str, int]] = []
+        seen_runs_on = False
+        calls_workflow = False
         while i < len(rows) and rows[i][0] > job_indent:
             kind, kcontent, kn = rows[i]
             if kind != job_indent + 2:
@@ -248,21 +392,33 @@ def _read_jobs(wf: Workflow, rows: List[Tuple[int, str, int]], raw: List[str], s
                 continue
             _d, key, val = _split_key(kcontent)
             if key == "runs-on":
+                seen_runs_on = True
+                runs_on_line = kn
                 job.runs_on = _strip_comment(val)
                 i += 1
-            elif key == "env" and not val.strip():
+                if job.runs_on.strip() == "":
+                    while i < len(rows) and rows[i][0] > kind:
+                        runs_on_block.append(rows[i])
+                        i += 1
+            elif key == "uses":
+                calls_workflow = True
+                i += 1
+            elif key == "env":
+                if val.strip():
+                    raise Unparsed("inline job env at line %d is not read: %r" % (kn, kcontent))
                 job.env, i = _env_block(rows, i + 1, kind)
             elif key == "strategy":
-                i += 1
-                while i < len(rows) and rows[i][0] > kind:
-                    _sd, skey, sval = _split_key(rows[i][1])
-                    if skey == "runner":
-                        job.matrix_runners.append(_unquote(_strip_comment(sval)))
-                    i += 1
+                i = _read_matrix(rows, i + 1, kind, job)
             elif key == "steps":
                 i = _read_steps(job, rows, raw, i + 1, kind)
             else:
                 i += 1
+        if seen_runs_on:
+            _resolve_runs_on(job, job.runs_on, runs_on_block, runs_on_line)
+        elif not calls_workflow:
+            # A reusable-workflow call (`uses:`) runs where the CALLED file says,
+            # and that file is read on its own; anything else must name a runner.
+            raise Unparsed("job %s at line %d has no runs-on" % (job_id, job_line))
         wf.jobs[job_id] = job
     return i
 
@@ -287,6 +443,11 @@ def _read_steps(job: Job, rows: List[Tuple[int, str, int]], raw: List[str], star
             continue
         if step is None:
             raise Unparsed("step key before the first `- ` at line %d" % n)
+        if key == "env":
+            if value.strip():
+                raise Unparsed("inline step env at line %d is not read: %r" % (n, content))
+            step.env, i = _env_block(rows, i + 1, key_col)
+            continue
         if key == "name":
             step.name = _unquote(_strip_comment(value))
         elif key == "if":
@@ -321,18 +482,49 @@ def load_all() -> Dict[str, str]:
     return {p.name: p.read_text(encoding="utf-8") for p in files}
 
 
-def self_hosted_cargo_jobs(workflows: Dict[str, str]) -> Dict[Tuple[str, str], Tuple[Workflow, Job]]:
+def self_hosted_jobs(workflows: Dict[str, str]) -> Dict[Tuple[str, str], Tuple[Workflow, Job]]:
     found: Dict[Tuple[str, str], Tuple[Workflow, Job]] = {}
     for name, text in workflows.items():
-        wf = read_workflow(text)
+        try:
+            wf = read_workflow(text)
+        except Unparsed as exc:
+            raise Unparsed("%s: %s" % (name, exc))
         for job_id, job in wf.jobs.items():
-            if job.self_hosted() and job.runs_cargo():
+            if job.self_hosted():
                 found[(name, job_id)] = (wf, job)
     return found
 
 
+def _debug_overrides(where: str, effective: Dict[str, str], job: Job) -> List[str]:
+    """Every place a self-hosted job sets a debuginfo level other than ``0``."""
+    found: List[str] = []
+    for key, value in sorted(effective.items()):
+        if DEBUG_ENV_KEY_RE.fullmatch(key) and key not in DEBUG_KEYS and value != DEBUG_LEVEL:
+            found.append("%s: R-DEBUG env %s is %r, want %r" % (where, key, value, DEBUG_LEVEL))
+        for m in DEBUGINFO_FLAG_RE.finditer(value):
+            if m.group(1) != DEBUG_LEVEL:
+                found.append("%s: R-DEBUG env %s carries debuginfo=%r, want %r" % (where, key, m.group(1), DEBUG_LEVEL))
+    for step in job.steps:
+        label = step.name or step.uses or "<unnamed step>"
+        for key, value in sorted(step.env.items()):
+            if DEBUG_ENV_KEY_RE.fullmatch(key) and value != DEBUG_LEVEL:
+                found.append("%s: R-DEBUG step %r env %s is %r, want %r" % (where, label, key, value, DEBUG_LEVEL))
+            for m in DEBUGINFO_FLAG_RE.finditer(value):
+                if m.group(1) != DEBUG_LEVEL:
+                    found.append("%s: R-DEBUG step %r env %s carries debuginfo=%r" % (where, label, key, m.group(1)))
+        for line in step.run:
+            for m in RUN_DEBUG_ASSIGN_RE.finditer(line):
+                if m.group(2) != DEBUG_LEVEL:
+                    found.append("%s: R-DEBUG step %r run sets %s to %r (a $GITHUB_ENV write overrides every later "
+                                 "step), want %r" % (where, label, m.group(1), m.group(2), DEBUG_LEVEL))
+            for m in DEBUGINFO_FLAG_RE.finditer(line):
+                if m.group(1) != DEBUG_LEVEL:
+                    found.append("%s: R-DEBUG step %r run sets debuginfo=%r, want %r" % (where, label, m.group(1), DEBUG_LEVEL))
+    return found
+
+
 def violations(name: str, wf: Workflow, job: Job) -> List[str]:
-    """Every R-DEBUG / R-PRUNE violation for one self-hosted cargo job."""
+    """Every R-DEBUG / R-PRUNE violation for one self-hosted job."""
     found: List[str] = []
     where = "%s job %s" % (name, job.job_id)
     effective = dict(wf.env)
@@ -341,6 +533,7 @@ def violations(name: str, wf: Workflow, job: Job) -> List[str]:
         got = effective.get(key)
         if got != DEBUG_LEVEL:
             found.append("%s: R-DEBUG %s is %r, want %r" % (where, key, got, DEBUG_LEVEL))
+    found.extend(_debug_overrides(where, effective, job))
     if not job.steps:
         found.append("%s: R-PRUNE job has no steps" % where)
         return found
@@ -368,14 +561,14 @@ def violations(name: str, wf: Workflow, job: Job) -> List[str]:
 def all_violations(workflows: Dict[str, str]) -> List[str]:
     found: List[str] = []
     try:
-        jobs = self_hosted_cargo_jobs(workflows)
+        jobs = self_hosted_jobs(workflows)
     except Unparsed as exc:
         return ["R-SHAPE cannot read a workflow (%s)" % exc]
     census = frozenset(jobs)
-    for missing in sorted(EXPECTED_SELF_HOSTED_CARGO_JOBS - census):
-        found.append("R-CENSUS expected self-hosted cargo job %s/%s not found" % missing)
-    for extra in sorted(census - EXPECTED_SELF_HOSTED_CARGO_JOBS):
-        found.append("R-CENSUS unpinned self-hosted cargo job %s/%s (add it to EXPECTED_SELF_HOSTED_CARGO_JOBS)" % extra)
+    for missing in sorted(EXPECTED_SELF_HOSTED_JOBS - census):
+        found.append("R-CENSUS expected self-hosted job %s/%s not found" % missing)
+    for extra in sorted(census - EXPECTED_SELF_HOSTED_JOBS):
+        found.append("R-CENSUS unpinned self-hosted job %s/%s (add it to EXPECTED_SELF_HOSTED_JOBS)" % extra)
     for (name, _job_id), (wf, job) in sorted(jobs.items()):
         found.extend(violations(name, wf, job))
     return found
@@ -395,11 +588,13 @@ class LiveWorkflows6118(unittest.TestCase):
     def test_6118_census_matches_live_runs_on(self) -> None:
         # The census is derived from the live files, so a job moving on or off
         # the fleet shows up here before the rules are even applied.
-        jobs = self_hosted_cargo_jobs(load_all())
-        self.assertEqual(EXPECTED_SELF_HOSTED_CARGO_JOBS, frozenset(jobs))
+        jobs = self_hosted_jobs(load_all())
+        self.assertEqual(EXPECTED_SELF_HOSTED_JOBS, frozenset(jobs))
         check = jobs[("ci.yml", "check")][1]
-        self.assertTrue(check.can_be_hosted(), check.runs_on)
-        self.assertIn('["self-hosted","linux-fed"]', check.matrix_runners)
+        self.assertTrue(check.can_be_hosted(), check.legs)
+        self.assertIn(["self-hosted", "linux-fed"], check.legs)
+        self.assertIn(["ubuntu-latest"], check.legs)
+        self.assertFalse(jobs[("cert-postgres-age.yml", "cert-postgres-age")][1].can_be_hosted())
 
 
 class Mutants6118(unittest.TestCase):
@@ -469,7 +664,7 @@ class Mutants6118(unittest.TestCase):
             "      - run: cargo test --lib\n"
         )
         found = self._mutated(mutant)
-        self.assertTrue(any("R-CENSUS unpinned self-hosted cargo job ci.yml/extra_fleet_job" in v for v in found), found)
+        self.assertTrue(any("R-CENSUS unpinned self-hosted job ci.yml/extra_fleet_job" in v for v in found), found)
 
     def test_6118_m07_unreadable_file_is_a_failure(self) -> None:
         found = self._mutated("name: x\n\ton: push\n")
