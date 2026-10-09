@@ -1899,6 +1899,27 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                      frm=mb_h1b)
     t.expect_green("6124-h1c", "new record closing the STATUS blockquote", repo, mb_h1b, h1c,
                    green6124)
+    # (6124-h7) GREEN (#6356, X6) - the new record opens a blockquote directly
+    # above an existing header: its one separator is the blank '>' AFTER it.
+    mb_h7 = doc_only("\n" + old_a, label="h7-mb")
+    h7 = edit_range("\n" + rec6124 + ">\n" + old_a, label="h7", frm=mb_h7)
+    t.expect_green("6124-h7", "new record opening the blockquote of an existing record", repo,
+                   mb_h7, h7, green6124)
+    # (6124-h8) GREEN (#6356, S15/X11) - a quoted code fence left open at the
+    # end of the STATUS blockquote ends with that blockquote; a record in a
+    # later blockquote is rendered and counts.
+    mb_h8 = doc_only("\n" + old_a, quoted=">\n> ```\n> open fence\n", label="h8-mb")
+    h8 = edit_range("\n" + old_a + ">\n" + rec6124, quoted=">\n> ```\n> open fence\n",
+                    label="h8", frm=mb_h8)
+    t.expect_green("6124-h8", "record after a blockquote that ended inside a code fence", repo,
+                   mb_h8, h8, green6124)
+    # (6124-h9) GREEN (#6356, S02) - a backtick run whose info string holds a
+    # backtick is inline text, not a fence opener; the record after it counts.
+    mb_h9 = doc_only(quoted=">\n> ```x`y\n>\n" + old_a, label="h9-mb")
+    h9 = edit_range("", quoted=">\n> ```x`y\n>\n" + rec6124 + ">\n" + old_a, label="h9",
+                    frm=mb_h9)
+    t.expect_green("6124-h9", "record after a backtick line that is not a fence", repo, mb_h9,
+                   h9, green6124)
     # (6124-h2) GREEN - two watched paths + a new identifier, all listed.
     h2 = edit_range("\n" + amend("#6162", [mod_rs, recv_rs, new_id]), touch=(mod_rs, recv_rs),
                     ids=True, label="h2")
@@ -2095,6 +2116,16 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
              + "> ## STATUS — **EXPIRED as of 2026-01-01** (fixture)\n\nBody prose.\n")
     f9a = fx.commit([mod_rs, CERT_DOC], "6124 cell f9a")
     t.expect_red("6124-f9a", "record running into the STATUS line", repo, exp6124, f9a, red6124)
+    # (6124-f9e) RED (#6356, S16) - an unquoted record header is read as a
+    # record and refused for its shape, not missed as "no new record".
+    f9e = edit_range("\n" + "\n".join(ln[2:] for ln in rec6124.splitlines()) + "\n",
+                     label="f9e")
+    t.expect_red("6124-f9e", "unquoted record header", repo, exp6124, f9e,
+                 red6124 + [("inside the blockquote", "did not name the header's blockquote")])
+    # (6124-f9f) RED (#6356, N28) - a commit sha in the header (a GitHub
+    # autolink) is refused like one in the body.
+    f9f = edit_range("\n" + amend("#6162 see 02eddc6c6", [mod_rs]), label="f9f")
+    t.expect_red("6124-f9f", "commit sha in the header", repo, exp6124, f9f, red6124)
     # (6124-f9b) RED - the header must open its own paragraph; glued under a
     # prose line that already exists it renders inside that paragraph.
     mb_f9b = doc_only("\n> Preceding prose line.\n", label="f9b-mb")
@@ -2157,10 +2188,19 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         cell = edit_range("\n" + amend("#6162", [mod_rs], back=(
             f"> Path back to LIVE: WP-B1 re-cert ({cite6063}) only, {tail}.")), label=lab)
         t.expect_red(f"6124-{lab}", f"back line carrying {tail!r}", repo, exp6124, cell, red6124)
-    # (6124-f10q) RED (#6356, X8) - a reference-style link on the back line.
+    # (6124-f10q) RED - a reference-style link to #6063 on the back line.
     f10q = edit_range("\n" + amend("#6162", [mod_rs], back=(
         "> Path back to LIVE: WP-B1 re-cert ([#6063][c]) only.")), label="f10q")
     t.expect_red("6124-f10q", "reference-style link on the back line", repo, exp6124, f10q,
+                 red6124)
+    # (6124-f10r) RED (#6356, X8/S08) - a shortcut reference link whose
+    # definition already sits in the doc: only its brackets show in the record.
+    def_6064 = "\n[x]: https://github.com/alphaonedev/ai-memory-mcp/issues/6064\n"
+    mb_f10r = doc_only(def_6064, label="f10r-mb")
+    f10r = edit_range(def_6064 + "\n" + amend("#6162", [mod_rs], back=(
+        f"> Path back to LIVE: WP-B1 re-cert ({cite6063}) only, see [x].")), label="f10r",
+        frm=mb_f10r)
+    t.expect_red("6124-f10r", "shortcut reference link in the record", repo, mb_f10r, f10r,
                  red6124)
     # (6124-f11) RED - list lines after the block ended (a new blockquote
     # after a blank line) do not count.
@@ -2255,6 +2295,34 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
             globals().pop("CERT_DOC_MAX_BYTES", None)
         else:
             globals()["CERT_DOC_MAX_BYTES"] = saved_cap
+    # (6124-f12e) RED (#6356, S13; the production reader, called directly) -
+    # a tree without the cert doc is refused, never read as an empty ledger.
+    fx.reset(exp6124)
+    fx.g("rm", "-q", "--", CERT_DOC)
+    fx.g("commit", "-q", "-m", "6124 cell f12e: cert doc absent")
+    gone6124 = fx.g("rev-parse", "HEAD")
+    try:
+        read_cert_doc(repo, gone6124)
+        t.fail("(6124-f12e): a tree without the cert doc was read as an empty ledger")
+    except GateError as exc:
+        if "is absent" not in str(exc):
+            t.fail("(6124-f12e): the absent cert doc was refused for another reason", str(exc))
+    # (6124-f12f) RED (#6356, S14) - git failing to read the blob fails closed.
+    def catfile_fails(repo_, *args, **kw):
+        if "cat-file" in args and "blob" in args:
+            return subprocess.CompletedProcess(list(args), 128, b"",
+                                               b"injected cat-file failure (self-test)")
+        return real_run_git(repo_, *args, **kw)
+
+    globals()["run_git"] = catfile_fails
+    try:
+        read_cert_doc(repo, exp6124)
+        t.fail("(6124-f12f): a failed blob read was taken as the cert doc")
+    except GateError as exc:
+        if "cat-file blob" not in str(exc):
+            t.fail("(6124-f12f): the failed blob read was refused for another reason", str(exc))
+    finally:
+        globals()["run_git"] = real_run_git
     # (6124-f12d) RED (#6368) - invalid UTF-8 in the cert doc fails closed: a
     # U+FFFD in an old record swapped for an invalid byte beside a valid new
     # record is not "byte-identical" text.
@@ -2403,21 +2471,26 @@ SELF_TEST_OK = (
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
     "octopus merge RED; (ci1-ci7, #5970) the event payload range is authoritative under "
     "GitHub Actions and CERT_EXPIRY_BASE/HEAD overrides are refused there but honoured "
-    "outside CI; (6124-h1..h6, #6124) EXPIRED/VOID at both ends plus exactly ONE inserted "
+    "outside CI; (6124-h1..h9, #6124) EXPIRED/VOID at both ends plus exactly ONE inserted "
     "amendment record (and one blank separator) below STATUS, directly above an existing "
-    "record or closing its blockquote, after HTML blocks that already ended, dated from the "
+    "record (also opening its blockquote) or closing its blockquote, after HTML blocks, "
+    "code fences and blockquotes that already ended and after a backtick line that is not "
+    "a fence, dated from the "
     "merge-base day - 1 to today + 1, listing exactly the changed watched paths and "
     "identifiers and citing only #6063 by its issue URL GREEN; (6124-f1..f15d) missing, "
     "extra, substring, prose-only, reused, re-dated, split, deleted, edited or moved prior "
     "records, a copy of an existing header, LIVE at the merge-base, EXPIRED flipped to a "
     "stale LIVE (rule C), fenced (CommonMark), HTML-commented, inside an HTML block of "
     "each kind (#6365) or behind an inserted opener, indented-code, unlisted-identifier, "
-    "above or glued to STATUS, mid-paragraph, header with body text or a link, uncited, "
-    "other-issue, bare-URL, foreign-link, URL-less, reference-link, GitHub autolink and "
+    "above or glued to STATUS, mid-paragraph, header with body text, a link or a commit "
+    "sha, unquoted header, uncited, "
+    "other-issue, bare-URL, foreign-link, URL-less, reference-link, shortcut-reference, "
+    "GitHub autolink and "
     "lookalike citations (#6367), a taken-over later paragraph, a lazy line (#6354), a "
     "splice inside an old record (#6366), non-grammar, control or bidi lines, a duplicate "
     "entry, two new records, and invalid, future or back-dated dates (#6358) RED; an "
-    "unreadable, symlinked, oversized or non-UTF-8 (#6368) cert doc fail-closed; the "
+    "absent, unreadable, symlinked, oversized or non-UTF-8 (#6368) cert doc and a failed "
+    "blob read fail-closed; the "
     "EXPIRED headline names the non-discharging amendment, not re-issue (#6369), and the "
     "remedy names the record, its legal spots and #3899; (6124-r1..r4, #6355) the "
     "committed cert doc with a record at each legal spot GREEN and behind an opener or "
