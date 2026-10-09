@@ -88,13 +88,16 @@ unit, test-profile units excluded (a test target's dep-info lists only its own
 sources, but it links the lib, so a `src/` edit must invalidate every
 dependent; the lib and bin unittests have their own keys); the cfgs, env and
 `output` file of every local build-script run; `Cargo.lock`; the
-`rustc -Vv` text the workflow writes; the feature/profile string; the
+`rustc -Vv` and `cargo -V` texts the workflow writes (an empty or unreadable
+cargo version disables the cache for the run); the feature/profile string; the
 behaviour-affecting environment (every `AI_MEMORY_*`, `RUST_TEST_*`,
 `CARGO_PROFILE_*`, `CARGO_BUILD_*` and `PROPTEST_*` variable plus `CI`,
 `RUSTFLAGS`, `RUST_LOG`, `TZ` and a few more: the value's sha256 for a plain
 setting, only set or empty for a name containing `URL`, `PASSWORD`, `SECRET`,
-`TOKEN`, `KEY` and similar); the Postgres server identity (`SELECT version()`
-and the installed `age` and `vector` extension versions, or `none` when no
+`TOKEN`, `KEY` and similar); the Postgres server identity (`SELECT version()`,
+the installed `age` and `vector` extension versions and the
+`max_connections`, `server_version_num` and `shared_preload_libraries`
+settings, or `none` when no
 `AI_MEMORY_TEST_POSTGRES_URL` is set; a failed query disables the cache for
 the run); and a digest of every file in the repository a test could read at
 run time. That digest leaves out `.git`, `target` and `.local-runs`, and only

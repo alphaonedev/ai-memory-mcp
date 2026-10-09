@@ -21,9 +21,11 @@ same for the SHARED closure (dep-info of every local lib / bin / build-script
 unit, because an integration test links the lib and may run the bin, and a
 dep-info for a test target lists only that target's own sources); the cfgs,
 env and ``output`` file of every local build-script run; Cargo.lock;
-the ``rustc -Vv`` text; the feature/profile string; the behaviour-affecting
-environment; the Postgres server identity (``SELECT version()`` and the
-age / vector extension versions, or ``none`` without a test database URL);
+the ``rustc -Vv`` and ``cargo -V`` texts; the feature/profile string; the
+behaviour-affecting environment; the Postgres server identity (``SELECT
+version()``, the age / vector extension versions and the max_connections,
+server_version_num and shared_preload_libraries settings, or ``none``
+without a test database URL);
 and a digest of every file in the repo a test could read at run time that
 rustc never saw. That digest leaves out build/VCS dirs and the ``.rs`` files
 a build-independent rule marks compiled (r2 M1: an impact build compiles a
@@ -593,15 +595,45 @@ PG_FINGERPRINT_SQL = (
     'SELECT version()',
     "SELECT name || ' ' || coalesce(default_version, '-') || ' ' || coalesce(installed_version, '-') "
     "FROM pg_available_extensions WHERE name IN ('age', 'vector') ORDER BY 1",
+    # r2 L1: server settings that change test behaviour (pool limits,
+    # preloaded libraries, the exact server build).
+    "SELECT name || '=' || setting FROM pg_settings "
+    "WHERE name IN ('max_connections', 'server_version_num', 'shared_preload_libraries') ORDER BY 1",
 )
+CARGO_TIMEOUT_SECONDS = 30
+
+
+def cargo_version(path, env, cargo='cargo', timeout=CARGO_TIMEOUT_SECONDS):
+    """The ``cargo -V`` text (r2 L1): read from ``path`` when one is given
+    (the workflow writes it next to rustc-vv.txt), else asked of ``cargo``.
+    An unreadable file, a failing or missing cargo, or an empty answer raises
+    CacheError, so an unknown cargo never yields a hit."""
+    if path:
+        try:
+            text = Path(path).read_text()
+        except (OSError, UnicodeDecodeError) as exc:
+            raise CacheError('cannot read the cargo version file: %s' % type(exc).__name__)
+    else:
+        try:
+            res = subprocess.run([cargo, '-V'], env=dict(env), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                 stdin=subprocess.DEVNULL, timeout=timeout, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise CacheError('cannot run cargo -V: %s' % type(exc).__name__)
+        if res.returncode != 0:
+            raise CacheError('cargo -V failed (exit %d)' % res.returncode)
+        text = res.stdout.decode('utf-8', 'replace')
+    if not text.strip():
+        raise CacheError('cargo version is empty')
+    return text
 
 
 def pg_fingerprint(env, psql='psql', timeout=PG_TIMEOUT_SECONDS):
     """Identity of the Postgres server the tests talk to (r1 M1).
 
     ``none`` when no test database URL is set. Otherwise ``SELECT version()``
-    plus the default and installed versions of the age and vector extensions,
-    read through ``psql``. Any failure, timeout or empty answer raises
+    plus the default and installed versions of the age and vector extensions
+    and the ``max_connections``, ``server_version_num`` and
+    ``shared_preload_libraries`` settings (r2 L1), read through ``psql``. Any failure, timeout or empty answer raises
     CacheError, so an unknown server never yields a hit. The URL is passed to
     psql only; it is never part of the returned text.
     """
@@ -622,7 +654,8 @@ def pg_fingerprint(env, psql='psql', timeout=PG_TIMEOUT_SECONDS):
     return text.replace(url, '<URL>')
 
 
-def build_key(own_files, shared_files, lock_sha, rustc_vv, profile, env_fp, runtime_files=(), server_fp='none'):
+def build_key(own_files, shared_files, lock_sha, rustc_vv, profile, env_fp, runtime_files=(), server_fp='none',
+              cargo_v=''):
     """Pure key function: every input is a plain value. Returns a hex digest."""
     h = hashlib.sha256()
 
@@ -635,6 +668,7 @@ def build_key(own_files, shared_files, lock_sha, rustc_vv, profile, env_fp, runt
     feed('schema', str(SCHEMA))
     feed('lock', lock_sha)
     feed('rustc', rustc_vv)
+    feed('cargo', cargo_v)
     feed('profile', profile)
     feed('env', env_fp)
     feed('pg', server_fp)
@@ -755,7 +789,7 @@ def exe_depinfo_path(executable):
     return None
 
 
-def compute_keys(exes, build_lines, repo_root, rustc_vv, profile, env, runtime=True, server_fp='none'):
+def compute_keys(exes, build_lines, repo_root, rustc_vv, profile, env, runtime=True, server_fp='none', cargo_v=''):
     """Return ({exe.key: hex or None}, {exe.key: reason}). Never raises per exe."""
     keys, why = {}, {}
     try:
@@ -827,7 +861,7 @@ def compute_keys(exes, build_lines, repo_root, rustc_vv, profile, env, runtime=T
         try:
             tr = binary_traits(dep, repo_root, e.kind) if runtime else {}
             rt = view(tr['tree'], tr['docs'], tr['changelog']) if runtime else []
-            keys[e.key] = build_key(own, shared, lock_sha, rustc_vv, profile, env_fp, rt, server_fp)
+            keys[e.key] = build_key(own, shared, lock_sha, rustc_vv, profile, env_fp, rt, server_fp, cargo_v)
         except (CacheError, OSError) as exc:
             keys[e.key], why[e.key] = None, str(exc)
     return keys, why
@@ -1050,9 +1084,10 @@ def _plan_compute(args, env, now, sd, lookup):
     rustc_vv = Path(args.rustc_vv).read_text()
     if not rustc_vv.strip():
         raise CacheError('rustc -Vv file is empty')
+    cargo_v = cargo_version(args.cargo_v, env, cargo=args.cargo)
     server_fp = pg_fingerprint(env, psql=args.psql)
     keys, why = compute_keys(exes, build_lines, args.repo_root, rustc_vv, args.profile, env,
-                             runtime=not args.no_runtime_tree, server_fp=server_fp)
+                             runtime=not args.no_runtime_tree, server_fp=server_fp, cargo_v=cargo_v)
     mdir = check_manifest_dir(resolve_manifest_dir(args.manifest_dir, env, args.repo_root), args.repo_root)
     mpath = manifest_path(mdir, args.node, args.tier, args.base_ref)
     if lookup:
@@ -1309,6 +1344,9 @@ def build_parser():
     pl.add_argument('--build-json', required=True)
     pl.add_argument('--repo-root', default='.')
     pl.add_argument('--rustc-vv', required=True, help='file holding `rustc -Vv` output (written by the workflow)')
+    pl.add_argument('--cargo-v', default='',
+                    help='file holding `cargo -V` output (written by the workflow); without it cargo is asked')
+    pl.add_argument('--cargo', default='cargo', help='cargo asked for its version when --cargo-v is not given')
     pl.add_argument('--profile', default='', help='feature/profile string, e.g. "test sal-postgres"')
     pl.add_argument('--tier', required=True)
     pl.add_argument('--node', required=True)

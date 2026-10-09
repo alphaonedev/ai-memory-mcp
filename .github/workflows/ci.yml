@@ -1580,6 +1580,8 @@ jobs:
             fi
             cache_base="${GITHUB_BASE_REF:-${GITHUB_REF_NAME:-unknown}}"
             rustc -Vv > "$sd/rustc-vv.txt" 2>&1 || : > "$sd/rustc-vv.txt"
+            # An empty cargo-v.txt fails the plan closed (no skips), review r2 L1.
+            cargo -V > "$sd/cargo-v.txt" 2>/dev/null || : > "$sd/cargo-v.txt"
             # The plan has its own 120 s deadline (review r1 M3) and runs under
             # the outer watchdog when one exists; if it fails or is killed, the
             # full lists are restored, and a failed restore fails the step.
@@ -1588,7 +1590,7 @@ jobs:
             if ! ${cache_plan_to[@]+"${cache_plan_to[@]}"} python3 scripts/ci/test_binary_cache.py plan \
               --build-json "$sd/build.jsonl" --shard-dir "$sd" --timeout-seconds 120 \
               --manifest-dir "$cache_dir" --repo-root . --rustc-vv "$sd/rustc-vv.txt" \
-              --profile "test ${FEAT:-default}" --tier "${TIER:-sqlite}" --node "${CI_NODE:-unknown}" \
+              --cargo-v "$sd/cargo-v.txt" --profile "test ${FEAT:-default}" --tier "${TIER:-sqlite}" --node "${CI_NODE:-unknown}" \
               --base-ref "$cache_base" --event "${GITHUB_EVENT_NAME:-}" --ref "${GITHUB_REF:-}" \
               --run-id "${GITHUB_RUN_ID:-}" --sha "${GITHUB_SHA:-}"; then
               echo "::warning::[#6384] test-binary cache plan failed; restoring the full lists"
