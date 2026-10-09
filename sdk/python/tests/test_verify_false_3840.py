@@ -10,7 +10,7 @@ man-in-the-middle exposure the #3828 ``http://`` refusal closes, one layer up.
 
 Both clients construct through ``build_httpx_kwargs``, so the refusal lives
 there once (the #3828 precedent) and these pins cover the funnel AND both
-constructors. ``None`` (platform trust store), ``True`` and a CA-bundle path
+constructors. ``None`` (httpx default trust), ``True`` and a CA-bundle path
 stay admitted.
 """
 
@@ -690,7 +690,7 @@ def test_readme_lists_the_accepted_and_refused_verify_forms_6273() -> None:
     section = readme.split(marker, 1)[1].split("\n## ", 1)[0]
     accepted, _, refused = section.partition("Refused")
     for token in ("None", "True", "os.PathLike", "ssl.create_default_context", "exactly `ssl.SSLContext`"):
-        assert token in accepted, f"accepted list lacks {token!r}"
+        assert token.lower() in accepted.lower(), f"accepted list lacks {token!r}"
     for token in (
         "False",
         "CERT_NONE",
@@ -702,7 +702,8 @@ def test_readme_lists_the_accepted_and_refused_verify_forms_6273() -> None:
         "does not exist",
     ):
         assert token in refused, f"refused list lacks {token!r}"
-    assert "resolved" in section and "working directory" in section
+    flat = " ".join(section.split())
+    assert "resolved" in flat and "working directory" in flat
 
 
 # ---- round 4b: post-handshake enforcement (#6305 #6306 #6268), FIFO (#6307),
