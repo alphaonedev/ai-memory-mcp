@@ -23,6 +23,8 @@ Exit codes: 0 green, 1 violation(s) found, 2 usage or self-test failure.
 """
 
 import argparse
+import contextlib
+import io
 import re
 import sys
 import tempfile
@@ -80,28 +82,87 @@ def check(root):
     return problems
 
 
+ALLOW_REL = "scripts/qc-allowlists/compliance-script-names-allow.txt"
+
+
+def run_main(root):
+    """Run main() against ``root``; return (exit code or 'traceback', stderr)."""
+    err = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = main(["--root", str(root)])
+    except Exception as exc:  # a traceback is itself the failure being probed
+        return "traceback:" + type(exc).__name__, err.getvalue()
+    return rc, err.getvalue()
+
+
 def self_test():
     scratch = Path(__file__).resolve().parent.parent / ".local-runs"
     scratch.mkdir(exist_ok=True)
+    fails = []
+
+    def expect(cond, msg):
+        if not cond:
+            fails.append(msg)
+
     with tempfile.TemporaryDirectory(dir=str(scratch)) as d:
         root = Path(d)
-        (root / "scripts").mkdir()
+        (root / "scripts" / "qc-allowlists").mkdir(parents=True)
         (root / "docs" / "compliance").mkdir(parents=True)
         (root / "scripts" / "check_new.py").write_text("")
+        (root / "outside.py").write_text("not a script under scripts/\n")
+        allow = root / ALLOW_REL
         doc = root / "docs" / "compliance" / "A.md"
+        other = root / "docs" / "compliance" / "B.md"
+        erratum = "Erratum: `check-old.sh` is `scripts/check_new.py`.\n"
+
+        allow.write_text("")
         doc.write_text("N30 enforcer is `check-old.sh`.\n")
-        if not check(root):
-            return "stale name without erratum was accepted"
-        doc.write_text("N30 enforcer is `check-old.sh`.\nErratum: `check-old.sh` is `scripts/check_new.py`.\n")
-        if check(root):
-            return "stale name with erratum was rejected"
+        expect(check(root), "stale name without erratum was accepted")
+
+        allow.write_text("docs/compliance/A.md:check-old.sh\n")
+        doc.write_text("N30 enforcer is `check-old.sh`.\n" + erratum)
+        expect(not check(root), "allowlisted stale name with erratum was rejected")
+
+        # S-F3: an erratum must not clear the stale name in a doc that is not allowlisted.
+        other.write_text("New text cites `check-old.sh` as the enforcer.\n")
+        expect(check(root), "new doc citing the stale name was accepted despite an erratum")
+        other.unlink()
+
+        # S-F3: an allowlist entry that suppresses nothing is a violation (burn-down ledger).
+        allow.write_text("docs/compliance/A.md:check-old.sh\ndocs/compliance/A.md:check-gone.sh\n")
+        expect(check(root), "stale allowlist entry was accepted")
+        allow.write_text("docs/compliance/A.md:check-old.sh\nnot-an-entry\n")
+        expect(check(root), "malformed allowlist entry was accepted")
+        allow.write_text("docs/compliance/A.md:check-old.sh\n")
+
         doc.write_text("Erratum: `check-old.sh` is `scripts/check_missing.py`.\n")
-        if not check(root):
-            return "erratum naming a missing successor was accepted"
+        expect(check(root), "erratum naming a missing successor was accepted")
+
+        # S-F1: the successor must resolve inside scripts/.
+        doc.write_text("N30 is `check-old.sh`.\nErratum: `check-old.sh` is `scripts/../outside.py`.\n")
+        expect(check(root), "erratum naming scripts/../outside.py was accepted")
+        doc.write_text("N30 is `check-old.sh`.\nErratum: `check-old.sh` is `scripts/./check_new.py`.\n")
+        expect(check(root), "erratum naming a dot component was accepted")
+        link = root / "scripts" / "check_link.py"
+        try:
+            link.symlink_to(root / "outside.py")
+        except OSError:
+            link = None
+        if link is not None:
+            doc.write_text("N30 is `check-old.sh`.\nErratum: `check-old.sh` is `scripts/check_link.py`.\n")
+            expect(check(root), "erratum naming an escaping symlink was accepted")
+            link.unlink()
+
         doc.write_text("See `check_new.py` and `scripts/check_new.py`.\n")
-        if check(root):
-            return "resolving names were rejected"
-    return None
+        expect(not check(root), "resolving names were rejected")
+
+        # C-F2: an unreadable doc is exit 2 with an 'unreadable' line, never a traceback.
+        doc.write_bytes(b"\xff\xfe")
+        rc, err = run_main(root)
+        expect(rc == 2, "non-UTF-8 doc: expected exit 2, got %r" % (rc,))
+        expect("A.md: unreadable" in err, "non-UTF-8 doc: missing 'unreadable' line (stderr=%r)" % err)
+    return "; ".join(fails) if fails else None
 
 
 def main(argv):
