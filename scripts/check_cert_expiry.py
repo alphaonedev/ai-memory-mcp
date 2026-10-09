@@ -1442,6 +1442,63 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     fx.reset(base)
     fx.g("update-ref", "refs/remotes/origin/main", base)
 
+    # (mask-offset, #6427) the comparison is keyed on (identifier, trimmed line
+    #       text), so a change cannot offset the lost definition line with a
+    #       mention added elsewhere. Five offsets, each a removal of the live
+    #       definition from mk0 that must stay RED, then the controls.
+    kid = "AI_MEMORY_FED_MASK_KNOB"
+    def_line = f'pub const M: &str = "{kid}";\n'
+    offsets = [
+        ("mask-xfile", "definition removed + a mention added in another file",
+         {"src/mask_def.rs": 'pub const M: &str = "";\n', "src/mask_new.rs": f"// see {kid}\n"}),
+        ("mask-incomment", "definition replaced in place by a comment naming it",
+         {"src/mask_def.rs": f"// {kid} was read here\npub const M: &str = \"\";\n"}),
+        ("mask-longer", "definition removed + a longer token that contains the name",
+         {"src/mask_def.rs": 'pub const M: &str = "";\n', "src/mask_new.rs": f"// NOT{kid}\n"}),
+        ("mask-blockcomment", "defining line wrapped in a block comment",
+         {"src/mask_def.rs": "/* " + def_line.rstrip("\n") + " */\npub const M: &str = \"\";\n"}),
+        ("mask-annot", "definition removed + a mention carrying the drift annotation text",
+         {"src/mask_def.rs": 'pub const M: &str = "";\n',
+          "src/mask_new.rs": f"// -{kid} (occurrences in src/ fell 2 -> 1)\n"}),
+        # Base cases measured on e2c96191e that already went RED; pinned so the
+        # keyed comparison cannot lose them.
+        ("mask-confusable", "definition reads a confusable name (Cyrillic V)",
+         {"src/mask_def.rs": def_line.replace("KNOB", "KNO\u0412")}),
+        ("mask-confusable-note", "confusable name + one new mention of the original",
+         {"src/mask_def.rs": def_line.replace("KNOB", "KNO\u0412"),
+          "src/mask_new.rs": f"// {kid}\n"}),
+        ("mask-zwsp", "definition reads the name with a zero-width space inside it",
+         {"src/mask_def.rs": def_line.replace("MASK_KNOB", "MASK_\u200bKNOB")}),
+        ("mask-crsplit", "definition reads the name split by a carriage return",
+         {"src/mask_def.rs": def_line.replace("MASK_KNOB", "MASK_\rKNOB")}),
+        ("mask-note-removed", "only the comment mention removed, definition kept",
+         {"src/mask_note.rs": "// nothing here\n"}),
+    ]
+    # The name the report must carry: the removed identifier, or for the
+    # look-alike spellings the new truncated name they introduce.
+    reported = {"mask-confusable": "+ AI_MEMORY_FED_MASK_KNO",
+                "mask-confusable-note": "+ AI_MEMORY_FED_MASK_KNO",
+                "mask-zwsp": "+ AI_MEMORY_FED_MASK_", "mask-crsplit": "+ AI_MEMORY_FED_MASK_"}
+    for label, desc, edits in offsets:
+        fx.g("checkout", "-q", "-B", f"mo-{label}", mk0)
+        for rel, text in edits.items():
+            fx.write(rel, text)
+        head_mo = fx.commit(sorted(edits), f"{label}: {desc}")
+        out_mo = t.expect_red(label, desc, repo, mk0, head_mo,
+                              [(reported.get(label, f"- {kid}"), "did not name the drifted identifier"),
+                               (sentence, "did not carry the required section 7 expiry sentence")])
+        if label == "mask-xfile" and "occurrences in src/ fell" in out_mo:
+            t.fail(f"(mask-xfile): an offset removal was annotated as a count fall: {out_mo!r}")
+    # Controls: the defining line moved to another file (re-indented) and an extra
+    # mention stay GREEN, so the keyed comparison does not turn refactors red.
+    fx.g("checkout", "-q", "-B", "mo-moved", mk0)
+    fx.write("src/mask_def.rs", 'pub const M: &str = "";\n')
+    fx.write("src/mask_moved.rs", "    " + def_line)
+    head_mv = fx.commit(["src/mask_def.rs", "src/mask_moved.rs"], "mask-moved: defining line moved")
+    t.expect_green("mask-moved", "the defining line moved to another file", repo, mk0, head_mv)
+    fx.reset(base)
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+
     # ---- #6138: merge-commit structure cells ------------------------------
     # main is at `base`; h7 is the PR head, o7 an unrelated branch.
     fx.reset(base)
