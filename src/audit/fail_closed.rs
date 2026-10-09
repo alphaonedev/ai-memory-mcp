@@ -227,15 +227,18 @@ fn probe_trail() -> bool {
     super::try_emit(event).is_ok()
 }
 
-/// Test-only: latch this process now (mode forced on), with the retry not
-/// due for [`PROBE_INTERVAL_MS`], so a surface test sees the refusal without
-/// installing a failing sink. Callers hold `audit::sink_test_lock` and call
-/// [`force_on_for_test`]`(false)` afterwards.
+/// Test-only: latch this process (mode forced on) with the retry never due
+/// (#6150), so a surface test sees the refusal without installing a failing
+/// sink however long its setup takes. Stamping "now" instead made the retry
+/// come due after [`PROBE_INTERVAL_MS`] of wall clock, and a sink-less child
+/// then cleared the latch. A test that needs an immediate retry calls
+/// [`reset_probe_clock_for_test`]. Callers hold `audit::sink_test_lock` and
+/// call [`force_on_for_test`]`(false)` afterwards.
 #[cfg(test)]
 pub(crate) fn latch_for_test() {
     FORCE_ON_FOR_TEST.store(true, Ordering::SeqCst);
     LATCHED.store(true, Ordering::SeqCst);
-    LAST_PROBE_MS.store(super::now_unix_ms().max(1), Ordering::SeqCst);
+    LAST_PROBE_MS.store(u64::MAX, Ordering::SeqCst);
 }
 
 /// Test-only: let the next latched gate retry at once.
@@ -309,6 +312,23 @@ mod tests {
             "a successful retry clears the latch"
         );
         reset_for_test();
+    }
+
+    /// #6150 — `latch_for_test` must never come due for a retry on its own: an
+    /// isolated child that installs no sink would otherwise clear the latch
+    /// once [`PROBE_INTERVAL_MS`] of wall clock passed (slow setup under runner
+    /// load) and let the push through. Red before the fix: it stamped "now".
+    #[test]
+    fn latch_for_test_stays_refusing_past_the_probe_interval_6150() {
+        let _g = lock();
+        latch_for_test();
+        std::thread::sleep(std::time::Duration::from_millis(PROBE_INTERVAL_MS + 100));
+        let r = audit_trail_gate();
+        let still_latched = audit_trail_latched();
+        force_on_for_test(false);
+        reset_for_test();
+        assert!(r.is_err(), "the gate must still refuse after the interval");
+        assert!(still_latched, "no retry may have cleared the latch");
     }
 
     /// #4464 — a failure that lands while the retry is appending (another
