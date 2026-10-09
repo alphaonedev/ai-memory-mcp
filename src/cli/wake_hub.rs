@@ -88,6 +88,22 @@ pub struct WakeHubArgs {
     /// carries; it only decides the exit code, never the output.
     #[arg(long)]
     pub require_admits: bool,
+    /// Publish the refresher's staged snapshot at PATH into `--allowlist`,
+    /// then exit WITHOUT binding. The privileged hand-off the packaged
+    /// refresher runs as root (#3637 M4): no symlink on either path is
+    /// followed, the source must be a single-link 0600 file owned by its
+    /// directory's owner, the snapshot is fully validated, and the new inode
+    /// is handed to the destination directory's owner at 0600 and renamed
+    /// into place atomically. A refusal publishes nothing; a directory fsync
+    /// failure after the rename exits non-zero saying the snapshot WAS
+    /// published but its durability is unconfirmed.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "allowlist",
+        conflicts_with_all = ["posture", "health", "require_admits"]
+    )]
+    pub publish_snapshot: Option<PathBuf>,
     /// Emit machine-readable JSON instead of a human-readable report.
     #[arg(long)]
     pub json: bool,
@@ -480,6 +496,33 @@ impl IdentityPosture {
 /// is structurally blind to.
 pub const EXIT_ADMITS_NOBODY: i32 = 3;
 
+/// `wake-hub --publish-snapshot SRC --allowlist DEST` — the privileged hand-off
+/// of the refreshed snapshot into the hub runtime directory (#3637 M4).
+///
+/// `main` calls this straight after argv parsing, BEFORE config, logging,
+/// audit or key initialisation, so the root step reads and writes nothing but
+/// the two paths it was given. [`dispatch`] routes to it too, for library
+/// callers.
+///
+/// # Errors
+///
+/// Every refusal of [`crate::wake_hub::snapshot_publish::publish_snapshot`],
+/// and a failed write of the one-line report.
+pub fn run_publish_snapshot(source: &std::path::Path, dest: &std::path::Path) -> Result<()> {
+    use std::io::Write as _;
+    let report = crate::wake_hub::snapshot_publish::publish_snapshot(source, dest)?;
+    let stdout = std::io::stdout();
+    let mut so = stdout.lock();
+    writeln!(
+        so,
+        "wake-hub: published {} agent(s) to {} (owner uid {}, mode 0600)",
+        report.agents,
+        dest.display(),
+        report.owner_uid
+    )?;
+    Ok(())
+}
+
 /// Bind and serve until SIGINT / SIGTERM, or run one of the non-binding
 /// reporting modes.
 ///
@@ -491,6 +534,13 @@ pub const EXIT_ADMITS_NOBODY: i32 = 3;
 /// Propagates every start-up refusal from [`WakeHub::bind`], and write failures
 /// from the reporting modes.
 pub async fn dispatch(args: &WakeHubArgs, app_config: &AppConfig) -> Result<i32> {
+    // #3637 M4 — the root hand-off runs BEFORE any config resolution: it
+    // needs nothing but the two explicit paths, and a root step should read
+    // no more than it must.
+    if let (Some(source), Some(dest)) = (&args.publish_snapshot, &args.allowlist) {
+        run_publish_snapshot(source, dest)?;
+        return Ok(0);
+    }
     let cfg = resolve_config(args, app_config)?;
     if args.posture || args.health {
         let stdout = std::io::stdout();
@@ -599,6 +649,7 @@ mod tests {
             posture: false,
             health: false,
             require_admits: false,
+            publish_snapshot: None,
             json: false,
         }
     }

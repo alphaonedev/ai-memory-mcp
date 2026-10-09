@@ -2060,6 +2060,20 @@ budget actually in force, the drain deadline, the slow-consumer watermark, and
 can be written against a documented contract rather than against whatever a
 running hub happened to emit.
 
+**Publishing the snapshot across the uid boundary**
+([#3637](https://github.com/alphaonedev/ai-memory-mcp/issues/3637)).
+`ai-memory wake-hub --publish-snapshot SRC --allowlist DEST` binds nothing: it
+is the root hand-off the packaged refresher runs as `ExecStartPost=+`. It
+follows no symlink on either (absolute) path, accepts only a single-link `0600`
+source owned by its directory's owner, fully validates the snapshot, and
+renames a `0600` inode owned by the destination directory's owner into place
+atomically. A refusal publishes nothing and exits non-zero. A directory
+`fsync` failure after the rename also exits non-zero, and its error states
+that the validated snapshot WAS published and only its durability is
+unconfirmed. It replaces the
+earlier `install(1)` step, which followed a symlinked source as root (CWE-59)
+and was not atomic.
+
 On `SIGTERM` / `SIGINT` the hub stops accepting, asks every session to flush
 what it already holds, waits at most **5 s**
 (`wake_hub::limits::DRAIN_DEADLINE_MS`), unlinks the socket **only if it is

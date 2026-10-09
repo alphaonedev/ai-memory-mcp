@@ -103,6 +103,10 @@ pub mod metrics;
 pub mod pending;
 pub mod routing;
 pub mod server;
+/// v1.0.0 #3637 (M4) — the root hand-off of the refreshed snapshot into the
+/// hub runtime directory: symlink-free, validated, `O_EXCL` temp + atomic
+/// `renameat`. Replaces the packaged `ExecStartPost=+/usr/bin/install`.
+pub mod snapshot_publish;
 pub mod startup;
 
 pub use server::WakeHub;
