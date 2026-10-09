@@ -156,8 +156,9 @@ pub(crate) fn store_url_is_ambiguous(url: &str) -> bool {
 /// human- and machine-readable sink: the boot `info!` line, doctor,
 /// `schema-init --json`, `migrate --json`, refusals.
 ///
-/// - `sqlite://<path>` renders verbatim: the path IS the database file and
-///   carries no credential channel.
+/// - `sqlite://<path>` (scheme matched case-insensitively, #6107) renders
+///   as `sqlite://<path>` without its query or fragment; a value holding an
+///   `@` renders `sqlite://<redacted-authority>` (see [`sqlite_store_display`]).
 /// - Any other scheme (`postgres://`, `postgresql://`, a typo) renders
 ///   `scheme://host[:port]/<database>` — the database name is the last
 ///   thing an operator needs to tell two stores apart and is not a
@@ -169,8 +170,8 @@ pub(crate) fn store_url_is_ambiguous(url: &str) -> bool {
 #[must_use]
 pub fn store_url_display(url: &str) -> String {
     let trimmed = url.trim();
-    if trimmed.starts_with(crate::store_url::SQLITE_URL_SCHEME) {
-        return trimmed.to_string();
+    if let Some(rest) = strip_sqlite_scheme(trimmed) {
+        return sqlite_store_display(rest);
     }
     match reqwest::Url::parse(trimmed) {
         Ok(parsed) => {
@@ -191,6 +192,55 @@ pub fn store_url_display(url: &str) -> String {
             out
         }
         Err(_) => unparseable(trimmed),
+    }
+}
+
+/// The text after a `sqlite://` prefix matched CASE-INSENSITIVELY (#6107,
+/// RFC 3986 section 3.1), or `None`. The ONE sqlite scheme sniff of the
+/// display path: before it, `sqlite://` rendered verbatim while `SQLITE://`
+/// fell through to the URL parser, so the output depended on the case.
+#[must_use]
+pub fn strip_sqlite_scheme(url: &str) -> Option<&str> {
+    let scheme = crate::store_url::SQLITE_URL_SCHEME;
+    url.get(..scheme.len())
+        .filter(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        .and_then(|_| url.get(scheme.len()..))
+}
+
+/// The display form of the part of a sqlite store URL after `sqlite://`
+/// (#6107).
+///
+/// The text is a filesystem path, but `sqlite://svc:<pw>@host/db` is also a
+/// URL with userinfo, and a mistyped store URL is exactly where a credential
+/// lands. Any `@` therefore renders `sqlite://<redacted-authority>` (fail
+/// closed: a real path holding `@` loses only display detail). Otherwise the
+/// path renders up to its first `?` or `#`: the query and fragment are not
+/// part of the file name an operator needs to see.
+fn sqlite_store_display(rest: &str) -> String {
+    let scheme = crate::store_url::SQLITE_URL_SCHEME;
+    if rest.contains('@') {
+        return format!("{scheme}{REDACTED_AUTHORITY}");
+    }
+    let path = rest.split(['?', '#']).next().unwrap_or_default();
+    format!("{scheme}{path}")
+}
+
+/// A SQLite database PATH for a refusal, a log line or a report (#6107).
+///
+/// `migrate --from sqlite://svc:<pw>@x/db` hands the path `svc:<pw>@x/db` to
+/// the missing-database refusal, which printed it raw. A path holding `://`
+/// renders through [`store_url_display`]; a path holding `@` renders
+/// [`UNPARSEABLE_STORE_URL`] (fail closed, the same `@` rule as
+/// [`sqlite_store_display`]); any other path renders as itself.
+#[must_use]
+pub fn db_path_display(path: &std::path::Path) -> String {
+    let text = path.to_string_lossy();
+    if text.contains("://") {
+        store_url_display(&text)
+    } else if text.contains('@') {
+        UNPARSEABLE_STORE_URL.to_string()
+    } else {
+        text.into_owned()
     }
 }
 

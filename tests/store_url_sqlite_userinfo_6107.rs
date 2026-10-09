@@ -203,6 +203,9 @@ fn config_show_effective_carries_no_sqlite_credential_6107() {
             String::from_utf8_lossy(&out.stderr)
         );
         assert_clean(&text, "config show --effective", &url);
-        assert!(text.contains("sqlite://<redacted-authority>"), "{s}: {text}");
+        assert!(
+            text.contains("sqlite://<redacted-authority>"),
+            "{s}: {text}"
+        );
     }
 }
