@@ -87,28 +87,70 @@ _UNVERIFIED_MESSAGE = (
 )
 
 
-def _refuse_unverified_tls(verify: object) -> None:
-    """Raise ``ValueError`` unless ``verify`` keeps TLS verification on (#3840).
+def _context_verifies(context: ssl.SSLContext) -> bool:
+    """Whether ``context`` requires a certificate AND checks the hostname.
 
-    Admitted: ``None`` (platform trust store), ``True``, a non-blank CA-bundle
-    path (``str`` or ``os.PathLike``) and an ``ssl.SSLContext`` that requires a
-    certificate and checks the hostname. Everything else is refused, fail
-    closed: ``False``, any other falsy value (``0``, ``0.0``, ``""``), a
-    blank or whitespace-only path, an ``SSLContext`` with ``CERT_NONE`` or
-    ``check_hostname=False``, and any type this SDK does not document.
+    Read through the ``ssl.SSLContext`` base-class descriptors: a subclass can
+    override ``verify_mode``/``check_hostname`` as Python properties and report
+    a secure state over a context OpenSSL runs unverified (#6248).
+    """
+    return bool(
+        ssl.SSLContext.verify_mode.__get__(context) == ssl.CERT_REQUIRED  # type: ignore[attr-defined]
+        and ssl.SSLContext.check_hostname.__get__(context)  # type: ignore[attr-defined]
+    )
+
+
+def _checked_verify(verify: object) -> bool | ssl.SSLContext | None:
+    """Return the ONLY value ``build_httpx_kwargs`` may forward, or raise (#3840).
+
+    Forwarded to httpx: ``None`` (platform trust store, kwarg omitted), ``True``,
+    a caller ``ssl.SSLContext`` that is ``CERT_REQUIRED`` with ``check_hostname``
+    on (read via the base-class descriptors), or a context this SDK builds
+    itself from the exact ``str`` of a non-blank CA path (``str`` or
+    ``os.PathLike``). Never the caller's own str/path object: httpx 0.27 decides
+    on its truthiness and 0.28 mishandles ``os.PathLike`` (#6248, #6245).
+    Refused, fail closed: ``False`` and every other falsy or blank value, a
+    non-verifying context, and any type this SDK does not document.
     """
     if verify is None or verify is True:
-        return
+        return verify
     if isinstance(verify, ssl.SSLContext):
-        if verify.verify_mode == ssl.CERT_NONE or not verify.check_hostname:
-            raise ValueError(_UNVERIFIED_MESSAGE)
-        return
-    if isinstance(verify, os.PathLike):
-        verify = os.fspath(verify)
-    # `str.strip(verify)` bypasses a str subclass that overrides `strip`.
-    if isinstance(verify, str) and str.strip(verify):
-        return
+        if _context_verifies(verify):
+            return verify
+        raise ValueError(_UNVERIFIED_MESSAGE)
+    if isinstance(verify, (str, os.PathLike)):
+        raw = os.fspath(verify)
+        # `str.__str__` yields an exact `str`: no overridden `strip`/`__bool__`.
+        path = str.__str__(raw) if isinstance(raw, str) else ""
+        if path.strip():
+            if os.path.isdir(path):
+                return ssl.create_default_context(capath=path)
+            return ssl.create_default_context(cafile=path)
     raise ValueError(_UNVERIFIED_MESSAGE)
+
+
+def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> list[Any]:
+    """An httpx ``request`` hook that re-checks a caller-held context (#6249).
+
+    The caller keeps a reference to the context they passed in and may weaken it
+    after construction; the check therefore runs on every request.
+    """
+
+    def _recheck() -> None:
+        if not _context_verifies(context):
+            raise ValueError(_UNVERIFIED_MESSAGE)
+
+    if is_async:
+
+        async def _arequest(_request: httpx.Request) -> None:
+            _recheck()
+
+        return [_arequest]
+
+    def _request(_request: httpx.Request) -> None:
+        _recheck()
+
+    return [_request]
 
 
 def build_httpx_kwargs(
@@ -120,6 +162,7 @@ def build_httpx_kwargs(
     verify: bool | str | None,
     cert: str | tuple[str, str] | None,
     extra_headers: dict[str, str] | None,
+    is_async: bool = False,
 ) -> dict[str, Any]:
     """Build the ``httpx.Client`` / ``httpx.AsyncClient`` kwargs.
 
@@ -139,11 +182,16 @@ def build_httpx_kwargs(
         ValueError: on ``verify=False`` (#3840). Under the transit-encryption
             standard (#3824) an unverified TLS channel is an encrypted pipe to
             whoever answers — the man-in-the-middle exposure the #3828
-            ``http://`` refusal closes, one layer up. The refusal also covers
-            every other way to switch verification off: a falsy or blank
-            ``verify`` and an ``ssl.SSLContext`` whose ``verify_mode`` is
-            ``CERT_NONE`` or whose ``check_hostname`` is False. Both clients
-            construct through this one funnel, so the refusal lives here once.
+            ``http://`` refusal closes, one layer up. Accepted forms are exactly
+            ``None``, ``True``, a non-blank CA path (``str`` or ``os.PathLike``)
+            and an ``ssl.SSLContext`` that is ``CERT_REQUIRED`` with
+            ``check_hostname`` on. Every other value is refused. Only a checked
+            value reaches httpx: a CA path becomes a context this SDK builds
+            from the exact path string (#6248, #6245), and a caller-supplied
+            context is re-checked before every request (#6249; the client does
+            not own it, so a later weakening is refused, not honoured). Both
+            clients construct through this one funnel, so the refusal lives
+            here once.
     """
     headers: dict[str, str] = {
         "User-Agent": f"ai-memory-python/{SDK_VERSION}",
@@ -163,11 +211,14 @@ def build_httpx_kwargs(
     }
     # #3840 — `False` was documented as "never pass" and forwarded untouched.
     # httpx reads ANY falsy `verify` as "do not verify" (httpx 0.27.x does so
-    # for `""` too), and a caller-supplied `ssl.SSLContext` is used as given,
-    # so the refusal is decided by `_refuse_unverified_tls`, not by `is False`.
-    _refuse_unverified_tls(verify)
-    if verify is not None:
-        kwargs["verify"] = verify
+    # for `""` too), and a caller-supplied `ssl.SSLContext` is used as given.
+    # Only the value `_checked_verify` returns is forwarded (#6248), and a
+    # caller-held context is re-checked on every request (#6249).
+    checked = _checked_verify(verify)
+    if checked is not None:
+        kwargs["verify"] = checked
+    if isinstance(checked, ssl.SSLContext) and checked is verify:
+        kwargs["event_hooks"] = {"request": _request_hooks(checked, is_async=is_async)}
     if cert is not None:
         kwargs["cert"] = cert
     return kwargs
