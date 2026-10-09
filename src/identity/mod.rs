@@ -626,11 +626,11 @@ pub fn resolve_governance_subject(
 #[cfg(test)]
 #[must_use]
 pub(crate) fn agent_id_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    // #6123 — one mutex for the whole process environment: a second lock for
+    // the agent-id surface did not exclude tests that write other variables
+    // under `crate::config::test_env_lock()`. Not re-entrant: never hold both
+    // wrappers in one test (std `Mutex` self-deadlocks).
+    crate::config::test_env_lock()
 }
 
 /// #1874 — RAII fixture for lib tests that DEPEND on `AI_MEMORY_AGENT_ID`

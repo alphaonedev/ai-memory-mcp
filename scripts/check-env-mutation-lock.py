@@ -56,12 +56,14 @@ Exit codes: 0 clean, 1 violations, 2 usage / internal error.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 # The two process-wide env locks (lock A and lock B). Keyed by the file
 # that defines them so a same-named module-local fn elsewhere never counts.
@@ -84,7 +86,14 @@ SET_ONCE_EXEMPT = {
     ("src/cli/test_utils.rs", "ensure_no_config_env"): "Once-gated, monotonic",
 }
 ISOLATED_CHILD_FN = "run_env_isolated_child_or_spawn"
-SITE_RE = re.compile(r"(?<![\w.])(?:(?:std::)?env::)?(set_var|remove_var|set_current_dir)\s*\(")
+TURBOFISH = r"(?:::\s*<[^;{}()]*>\s*)?"
+SITE_RE = re.compile(r"(?<![\w.])(?:(?:std::)?env::)?(set_var|remove_var|set_current_dir)\s*" + TURBOFISH + r"\(")
+# Any other mention (use-alias, fn pointer, macro argument) is a way to write the env
+# without a call the lexical gate can attribute to a lock: refuse it.
+REF_RE = re.compile(r"(?<![\w.])(set_var|remove_var|set_current_dir)\b(?!\s*" + TURBOFISH + r"\()")
+SPAWN_RE = re.compile(r"\bspawn(?:_blocking|_local|_scoped)?\s*$")
+AGENT_ID_KEY = "AI_MEMORY_AGENT_ID"
+POISON_RE = re.compile(r"[\w:\s<>,]*\(\s*\)\s*\.\s*lock\s*\(\s*\)\s*\.\s*(?:unwrap|expect)\s*\(")
 CALL_RE = re.compile(r"(?<![\w.])((?:\w+\s*::\s*)*)(\w+)\s*(?:::\s*<[^;{}()]*>\s*)?\(")
 FN_RE = re.compile(r"\bfn\s+(\w+)")
 MOD_RE = re.compile(r"\bmod\s+(\w+)\s*$")
@@ -164,10 +173,10 @@ class Fn:
     end: int  # body '}'
     header: str
     test: bool
-    impl_type: str | None
-    impl_trait: str | None
+    impl_type: Optional[str]
+    impl_trait: Optional[str]
     module_tail: str  # last module path segment of the file
-    inner_mod: str | None = None  # nearest enclosing inline `mod x { }`
+    inner_mod: Optional[str] = None  # nearest enclosing inline `mod x { }`
 
 
 @dataclass
@@ -177,6 +186,9 @@ class FileInfo:
     san: str
     fns: list[Fn] = field(default_factory=list)
     test_mods: list[str] = field(default_factory=list)  # `#[cfg(test)] mod x;`
+    test_paths: list[str] = field(default_factory=list)  # `#[cfg(test)] #[path = ".."] mod x;`
+    test_ranges: list[list[int]] = field(default_factory=list)  # [start, end] of test scopes
+    file_is_test: bool = False
 
 
 def is_test_attr(attrs: list[str]) -> bool:
@@ -199,6 +211,8 @@ def module_tail(rel: str) -> str:
 def parse_file(rel: str, src: str, file_is_test: bool) -> FileInfo:
     san = sanitize(src)
     info = FileInfo(rel, src, san)
+    info.file_is_test = file_is_test
+    rstack: list[Optional[int]] = []
     # scope stack entries: (kind, test, impl_type, impl_trait, fn_obj)
     stack: list[tuple] = [("file", file_is_test, None, None, None)]
     header_start = 0
@@ -215,6 +229,9 @@ def parse_file(rel: str, src: str, file_is_test: bool) -> FileInfo:
             m = re.search(r"\bmod\s+(\w+)$", stripped)
             if m and (is_test_attr(attrs) or stack[-1][1]):
                 info.test_mods.append(m.group(1))
+                pm = re.search(r"#\s*\[\s*path\s*=\s*\"([^\"]+)\"\s*\]", src[header_start:i])
+                if pm:
+                    info.test_paths.append(pm.group(1))
             header_start = i + 1
         elif c == "{" and paren == 0:
             header = san[header_start:i]
@@ -247,10 +264,18 @@ def parse_file(rel: str, src: str, file_is_test: bool) -> FileInfo:
                               if trait else None, None))
             else:
                 stack.append(("block", test, None, None, None))
+            if stack[-1][1] and not parent[1]:
+                info.test_ranges.append([i, -1])
+                rstack.append(len(info.test_ranges) - 1)
+            else:
+                rstack.append(None)
             header_start = i + 1
         elif c == "}" and paren == 0:
             if len(stack) > 1:
                 kind, _t, _a, _b, fn = stack.pop()
+                ri = rstack.pop() if rstack else None
+                if ri is not None:
+                    info.test_ranges[ri][1] = i
                 if kind == "fn" and fn is not None:
                     fn.end = i
             header_start = i + 1
@@ -280,13 +305,19 @@ def parse_imports(san: str) -> dict[str, tuple[str, str]]:
     return out
 
 
-def innermost_fn(info: FileInfo, off: int) -> Fn | None:
+def innermost_fn(info: FileInfo, off: int) -> Optional[Fn]:
     best = None
     for fn in info.fns:
         if fn.start < off < (fn.end if fn.end >= 0 else len(info.san)):
             if best is None or fn.start > best.start:
                 best = fn
     return best
+
+
+def in_test_scope(info: FileInfo, off: int) -> bool:
+    if info.file_is_test:
+        return True
+    return any(a < off < (b if b >= 0 else len(info.san)) for a, b in info.test_ranges)
 
 
 def line_of(src: str, off: int) -> int:
@@ -302,6 +333,7 @@ class Index:
                 self.by_name.setdefault(fn.name, []).append(fn)
         self.info_of = {f.rel: f for f in files}
         self.imports = {f.rel: parse_imports(f.san) for f in files}
+        self.acq_kinds: dict[int, set] = {}
         self.acquirers = self._acquirers()
         self.calls = self._calls()
 
@@ -338,23 +370,36 @@ class Index:
                 continue
             yield fn.start + m.start(), m.group(1), name
 
+    def _delegates_to_a(self, fn: Fn) -> bool:
+        """True when the identity lock is just the crate-wide env mutex."""
+        return any(name in ("test_env_lock", "test_env_mutex")
+                   for _o, _q, name in self.body_calls(fn))
+
     def _acquirers(self) -> set[int]:
         acq: set[int] = set()
         for f in self.files:
             for fn in f.fns:
                 if (fn.file, fn.name) in BASE_ACQUIRERS:
                     acq.add(id(fn))
+                    self.acq_kinds[id(fn)] = {"A"}
+                    if fn.name == "agent_id_env_test_lock" and not self._delegates_to_a(fn):
+                        # A separate mutex: excludes only other lock-B holders.
+                        self.acq_kinds[id(fn)] = {"B"}
         changed = True
         while changed:
             changed = False
             for f in self.files:
                 for fn in f.fns:
-                    if id(fn) in acq or not re.search(r"->[^{]*\bMutex", fn.header):
+                    if not re.search(r"->[^{]*\bMutex", fn.header) or (fn.file, fn.name) in BASE_ACQUIRERS:
                         continue
                     for _off, q, name in self.body_calls(fn):
-                        if any(id(t) in acq for t in self.resolve(fn.file, q, name)):
-                            acq.add(id(fn))
-                            changed = True
+                        tg = [t for t in self.resolve(fn.file, q, name) if id(t) in acq]
+                        if tg:
+                            kinds = set().union(*(self.acq_kinds.get(id(t), set()) for t in tg))
+                            if id(fn) not in acq or not kinds <= self.acq_kinds.get(id(fn), set()):
+                                acq.add(id(fn))
+                                self.acq_kinds.setdefault(id(fn), set()).update(kinds)
+                                changed = True
                             break
         return acq
 
@@ -390,31 +435,101 @@ class Index:
     def by_name_type(self, typ: str, file: str) -> list[Fn]:
         return [fn for fn in self.info_of[file].fns if fn.impl_type == typ]
 
-    @staticmethod
-    def type_holds_guard(info: FileInfo, typ: str) -> bool:
+    def type_holds_guard(self, info: FileInfo, typ: str) -> bool:
         m = re.search(r"\bstruct\s+" + re.escape(typ) + r"\b[^;{(]*([{(])", info.san)
         if not m:
             return False
         close = "}" if m.group(1) == "{" else ")"
         end = info.san.find(close, m.end())
-        return "MutexGuard" in info.san[m.end():end if end != -1 else len(info.san)]
+        if "MutexGuard" not in info.san[m.end():end if end != -1 else len(info.san)]:
+            return False
+        # A MutexGuard field only proves a lock when every construction of the
+        # type is in a fn that reaches a base acquirer (a foreign `Mutex` guard
+        # field would otherwise count). No construction found => unproven.
+        pat = re.compile(r"(?<![\w:])(?:" + re.escape(typ) + r"|Self)\s*[{(]")
+        built = False
+        for fn in info.fns:
+            body = info.san[fn.start:fn.end if fn.end >= 0 else len(info.san)]
+            for mm in pat.finditer(body):
+                if mm.group(0).startswith("Self") and fn.impl_type != typ:
+                    continue
+                before = body[max(0, mm.start() - 40):mm.start()]
+                if re.search(r"(?:->|:|<|&|\bstruct|\bimpl|\bfor|\benum|\bas)\s*(?:mut\s+)?$", before):
+                    continue
+                built = True
+                if not any(id(t) in self.acquirers
+                           for _o, q, n in self.body_calls(fn) for t in self.resolve(fn.file, q, n)):
+                    return False
+        return built
 
-    def lock_before(self, fn: Fn, off: int) -> bool:
+    def spawn_floor(self, fn: Fn, off: int) -> Optional[int]:
+        """Offset of the `(` of the innermost enclosing `spawn(..)` call, if any:
+        a closure handed to a thread outlives the guard its parent holds."""
+        san = self.info_of[fn.file].san
+        depth, k = 0, off
+        while k > fn.start:
+            k -= 1
+            c = san[k]
+            if c == ")":
+                depth += 1
+            elif c == "(":
+                if depth:
+                    depth -= 1
+                elif SPAWN_RE.search(san[max(0, k - 30):k]):
+                    return k
+        return None
+
+    def guard_live(self, info: FileInfo, coff: int, off: int) -> bool:
+        """The acquirer call at `coff` yields a guard that is still held at `off`."""
+        san = info.san
+        start = max(san.rfind(";", 0, coff), san.rfind("{", 0, coff), san.rfind("}", 0, coff)) + 1
+        prefix = san[start:coff]
+        if re.search(r"\blet\s+_\s*[=:]", prefix):
+            return False  # `let _ = lock()` drops on the spot
+        named = re.search(r"\blet\s+(?:mut\s+)?([A-Za-z]\w*)\b", prefix)
+        held = bool(named) or bool(re.search(r"\b(?:let|match|while|for)\b", prefix)) \
+            or bool(re.match(r"^\s*\w+\s*:\s*$", prefix)) \
+            or bool(re.search(r"\b[A-Z]\w*\s*\(\s*$", prefix))
+        if not held:
+            return False
+        between = san[coff:off]
+        depth = 0
+        for ch in between:
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth < 0:
+                    return False  # the block that owned the guard closed
+        if named and re.search(r"\b(?:mem\s*::\s*)?drop\s*\(\s*" + re.escape(named.group(1)) + r"\s*\)", between):
+            return False
+        return True
+
+    def lock_before(self, fn: Fn, off: int, lo: int = -1) -> set:
+        """Kinds of lock held at `off` ({'A','B','ISO'}); empty set = none."""
         info = self.info_of[fn.file]
+        kinds: set = set()
         for coff, q, name in self.body_calls(fn):
-            if coff >= off:
+            if coff >= off or coff < lo:
                 continue
             if name == ISOLATED_CHILD_FN:
-                return True
-            if any(id(t) in self.acquirers for t in self.resolve(fn.file, q, name)):
-                line_start = info.san.rfind("\n", 0, coff) + 1
-                if re.search(r"let\s+_\s*=\s*[\w:\s]*$", info.san[line_start:coff]):
-                    continue
-                return True
-        return False
+                kinds.add("ISO")
+                continue
+            tg = [t for t in self.resolve(fn.file, q, name) if id(t) in self.acquirers]
+            if tg and self.guard_live(info, coff, off):
+                for t in tg:
+                    kinds |= self.acq_kinds.get(id(t), {"A"})
+        return kinds
 
-    def covered(self, fn: Fn, off: int, seen: frozenset = frozenset()) -> bool:
-        if self.lock_before(fn, off):
+    @staticmethod
+    def sufficient(kinds: set, key: Optional[str]) -> bool:
+        return "A" in kinds or "ISO" in kinds or ("B" in kinds and key == AGENT_ID_KEY)
+
+    def covered(self, fn: Fn, off: int, key: Optional[str] = None, seen: frozenset = frozenset()) -> bool:
+        floor = self.spawn_floor(fn, off)
+        if floor is not None:
+            return self.sufficient(self.lock_before(fn, off, floor), key)
+        if self.sufficient(self.lock_before(fn, off), key):
             return True
         if id(fn) in seen:
             return False
@@ -429,22 +544,35 @@ class Index:
             ctors = [g for g in self.by_name_type(fn.impl_type, fn.file)
                      if g.impl_trait is None and not RECEIVER_RE.search(g.header)]
             sites = [(g, g.end) for g in ctors] + self.literal_sites(fn.impl_type, fn.file)
-            return bool(sites) and all(self.covered(g, o, seen) for g, o in sites)
+            return bool(sites) and all(self.covered(g, o, key, seen) for g, o in sites)
         callers = [c for c in self.calls.get(id(fn), []) if c[0].test]
         if not callers:
             return False
-        return all(self.covered(c, o, seen) for c, o in callers)
+        return all(self.covered(c, o, key, seen) for c, o in callers)
 
 
-def load(root: Path) -> list[FileInfo]:
+def load(root: Path) -> tuple:
     srcdir = root / "src"
     if not srcdir.is_dir():
         raise SystemExit(f"error: {srcdir} is not a directory")
     raw = {}
-    for p in sorted(srcdir.rglob("*.rs")):
-        if p == srcdir / "main.rs":
-            continue  # bin target: its tests run in their own process, not the lib binary
-        raw[p.relative_to(root).as_posix()] = p.read_text(encoding="utf-8", errors="replace")
+    symlinks: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(srcdir, followlinks=False):
+        dirnames.sort()
+        for dn in list(dirnames):
+            if os.path.islink(os.path.join(dirpath, dn)):
+                symlinks.append((Path(dirpath) / dn).relative_to(root).as_posix())
+                dirnames.remove(dn)
+        for fnm in sorted(filenames):
+            full = Path(dirpath) / fnm
+            if not fnm.endswith(".rs"):
+                continue
+            if full.is_symlink():
+                symlinks.append(full.relative_to(root).as_posix())
+                continue
+            if full == srcdir / "main.rs":
+                continue  # bin target: its tests run in their own process, not the lib binary
+            raw[full.relative_to(root).as_posix()] = full.read_text(encoding="utf-8", errors="replace")
     infos = {rel: parse_file(rel, s, False) for rel, s in raw.items()}
     test_files: set[str] = set()
     for rel, info in infos.items():
@@ -454,6 +582,10 @@ def load(root: Path) -> list[FileInfo]:
             for cand in (d / f"{m}.rs", d / m / "mod.rs"):
                 if cand.as_posix() in raw:
                     test_files.add(cand.as_posix())
+        for pth in info.test_paths:
+            cand = Path(os.path.normpath((base.parent / pth).as_posix()))
+            if cand.as_posix() in raw:
+                test_files.add(cand.as_posix())
     # propagate into sub-files of test files
     changed = True
     while changed:
@@ -469,27 +601,54 @@ def load(root: Path) -> list[FileInfo]:
                     test_files.add(rel)
                     changed = True
                     break
-    return [parse_file(rel, s, True) if rel in test_files else infos[rel] for rel, s in raw.items()]
+    return [parse_file(rel, s, True) if rel in test_files else infos[rel] for rel, s in raw.items()], symlinks
 
 
 def scan(root: Path) -> list[str]:
-    files = load(root)
+    files, symlinks = load(root)
     idx = Index(files)
     violations = []
+    for rel in symlinks:
+        violations.append(f"{rel}:0: symlink in fn `{Path(rel).stem}` "
+                          "is a symlink under src/ (not scanned; refused)")
     for f in files:
-        for m in SITE_RE.finditer(f.san):
+        for m in list(SITE_RE.finditer(f.san)) + list(REF_RE.finditer(f.san)):
             pre = f.san[max(0, m.start() - 4):m.start()]
             if re.search(r"fn\s*$", pre):
                 continue
+            is_call = SITE_RE.match(f.san, m.start()) is not None
             fn = innermost_fn(f, m.start())
-            if fn is None or not fn.test:
+            ln = line_of(f.src, m.start())
+            if fn is None:
+                if in_test_scope(f, m.start()):
+                    violations.append(f"{f.rel}:{ln}: {m.group(1)} in fn `item_scope` is outside any fn "
+                                      "in test code (macro body / import / alias)")
+                continue
+            if not fn.test:
                 continue
             if (f.rel, fn.name) in SET_ONCE_EXEMPT:
                 continue
-            if not idx.covered(fn, m.start()):
-                ln = line_of(f.src, m.start())
+            if not is_call:
+                violations.append(f"{f.rel}:{ln}: {m.group(1)} in fn `{fn.name}` "
+                                  "is referenced without a direct call (alias / fn pointer)")
+                continue
+            km = re.match(r"\s*(?:::\s*<[^;{}()]*>\s*)?\(\s*\"([^\"]*)\"", f.src[m.end() - 1:] if False else f.src[m.start():][len(m.group(0)) - 1:])
+            key = km.group(1) if km else None
+            if m.group(1) == "set_current_dir":
+                key = None
+            if not idx.covered(fn, m.start(), key):
                 violations.append(f"{f.rel}:{ln}: {m.group(1)} in fn `{fn.name}` "
                                   "is not under the process-env lock")
+        for fn in f.fns:
+            if not fn.test:
+                continue
+            for coff, q, name in idx.body_calls(fn):
+                tg = [t for t in idx.resolve(fn.file, q, name) if id(t) in idx.acquirers
+                      and re.search(r"->[^{]*&[^{]*\bMutex", t.header)]
+                if tg and POISON_RE.match(f.san[coff:]):
+                    violations.append(f"{f.rel}:{line_of(f.src, coff)}: poison in fn `{fn.name}` "
+                                      "locks the shared env mutex with .lock().unwrap()/.expect(); "
+                                      "use unwrap_or_else(PoisonError::into_inner) or test_env_lock()")
     return violations
 
 
@@ -531,7 +690,7 @@ mod tests {
     #[test]
     fn identity_lock() {
         let _g = crate::identity::agent_id_env_test_lock();
-        unsafe { std::env::remove_var("C") };
+        unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
     }
     #[test]
     fn isolated() {
@@ -539,9 +698,14 @@ mod tests {
         unsafe { std::env::set_var("D", "1") };
     }
     struct Held { _g: std::sync::MutexGuard<'static, ()> }
+    impl Held {
+        fn new() -> Self { Held { _g: lock() } }
+    }
     impl Drop for Held {
         fn drop(&mut self) { unsafe { std::env::remove_var("G") }; }
     }
+    #[test]
+    fn holds_via_ctor() { let _h = Held::new(); }
     #[test]
     fn agent_id_under_lock_b() {
         let _g = crate::identity::agent_id_env_test_lock();
@@ -759,6 +923,8 @@ def self_test() -> int:
             p = root / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(body, encoding="utf-8")
+        # a symlinked directory under src/ is not scanned: the gate refuses it
+        os.symlink(root / "src" / "m", root / "src" / "linked")
         got = set()
         for v in scan(root):
             m = re.match(r"(\S+?):\d+: \w+ in fn `(\w+)`", v)
@@ -776,7 +942,7 @@ def self_test() -> int:
             print(f"  subprocess exit: {proc.returncode}")
             return 1
     print(f"SELF-TEST PASS ({len(SELF_TEST_EXPECTED)} planted violations caught, "
-          "8 covered shapes accepted, comments/strings/production ignored)")
+          "covered shapes accepted (wrapper, raw mutex, guard-holding type, isolated child, identity lock for AI_MEMORY_AGENT_ID), comments/strings/production ignored)")
     return 0
 
 
