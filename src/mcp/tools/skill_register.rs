@@ -204,6 +204,49 @@ pub(super) struct RegisterResult {
     pub version: i64,
 }
 
+/// #6146 - why [`register_core`] failed. The retired-lineage refusal is a
+/// typed variant so callers recognise it by type, never by its text: a
+/// reworded refusal still reaches the caller, and a foreign string that merely
+/// shares its shape stays foreign.
+#[derive(Debug)]
+pub(super) enum RegisterCoreError {
+    /// #2024 - the (namespace, name) lineage is retired (own text).
+    RetiredLineage { namespace: String, name: String },
+    /// Already-sanitized `mcp_foreign_err` output or foreign serialization /
+    /// compression text; never lifted to a caller-visible refusal.
+    Foreign(String),
+}
+
+impl std::fmt::Display for RegisterCoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RetiredLineage { namespace, name } => write!(
+                f,
+                "skill lineage '{namespace}/{name}' is retired; unretire before re-registering"
+            ),
+            Self::Foreign(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl From<String> for RegisterCoreError {
+    fn from(msg: String) -> Self {
+        Self::Foreign(msg)
+    }
+}
+
+impl From<&str> for RegisterCoreError {
+    fn from(msg: &str) -> Self {
+        Self::Foreign(msg.to_owned())
+    }
+}
+
+impl From<RegisterCoreError> for String {
+    fn from(e: RegisterCoreError) -> Self {
+        e.to_string()
+    }
+}
+
 /// Core registration logic shared by the folder and inline paths.
 ///
 /// `canonical_fm_json` is the sorted JSON encoding of the frontmatter
@@ -221,7 +264,7 @@ pub(super) fn register_core(
     resource_digests: Vec<Vec<u8>>,
     resources: &[(String, String, Vec<u8>)], // (path, kind, content)
     active_keypair: Option<&AgentKeypair>,
-) -> Result<RegisterResult, String> {
+) -> Result<RegisterResult, RegisterCoreError> {
     // Build canonical frontmatter JSON for digest computation.
     let canonical_fm = serde_json::to_vec(&json!({
         "namespace": namespace,
@@ -302,9 +345,10 @@ pub(super) fn register_core(
     // rolls back on this early return. Unretire the lineage before
     // re-registering.
     if matches!(prev, Some((_, Some(_)))) {
-        return Err(format!(
-            "skill lineage '{namespace}/{name}' is retired; unretire before re-registering"
-        ));
+        return Err(RegisterCoreError::RetiredLineage {
+            namespace: namespace.to_owned(),
+            name: name.to_owned(),
+        });
     }
     let prev_id: Option<String> = prev.map(|(id, _)| id);
 
