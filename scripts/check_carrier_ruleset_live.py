@@ -52,6 +52,9 @@ exactly, does not exclude it, and shows bypass_actors == [] (so run it with an
 admin token). The ruleset requires the freshness context on every carrier
 base; a carrier whose tip lacks the job could never merge a pull request.
 
+Every unfrozen carrier tip must also trigger on pull_request for its own base
+(trigger_covers), or its required contexts would never report.
+
 bypass_actors is omitted by GitHub for low-privilege readers (the Actions
 GITHUB_TOKEN). An omitted field is UNVERIFIED, never treated as []: a WARN by
 default, a FAIL under --require-full-view (run that with an admin token after
@@ -210,6 +213,11 @@ def candidates(rulesets, payload):
     return out
 
 
+def ruleset_label(rs):
+    """`carrier ruleset <id> ('<name>')`: the id the promotion PUT targets (code R3-F2)."""
+    return "carrier ruleset"
+
+
 def judge_one(rs, payload, require_full_view):
     """Compare one live ruleset to the payload. Returns (reasons, warnings)."""
     rid = f"ruleset {rs.get('id')} ({rs.get('name')!r})"
@@ -269,7 +277,7 @@ def verify(payload, carrier_decl, release_decl, ledger, state, rulesets, issue_s
     if reasons:
         return 1, [f"FAIL: {r}" for r in reasons]
     cands = candidates(rulesets, payload)
-    matched = False
+    matched = []
     drift = []
     for rs in cands:
         rs_reasons, rs_warn = judge_one(rs, payload, require_full_view)
@@ -277,7 +285,7 @@ def verify(payload, carrier_decl, release_decl, ledger, state, rulesets, issue_s
         if rs_reasons:
             drift.extend(rs_reasons)
         else:
-            matched = True
+            matched.append(rs)
     if st == "applied":
         if matched:
             lines.append("OK")
@@ -288,11 +296,11 @@ def verify(payload, carrier_decl, release_decl, ledger, state, rulesets, issue_s
     # pending-apply
     if cands:
         if matched and not drift:
-            return 1, lines + [f"FAIL: carrier ruleset is live and matches; flip {STATE_FILE.name} to "
-                               f"\"applied\" and promote the verifier (#{issue})"]
+            return 1, lines + [f"FAIL: {ruleset_label(matched[0])} is live and matches; flip "
+                               f"{STATE_FILE.name} to \"applied\" and promote the verifier (#{issue})"]
         if matched:
             return 1, lines + [f"FAIL: {r}" for r in drift] + [
-                f"FAIL: carrier ruleset is live and matches, but other candidates drift; "
+                f"FAIL: {ruleset_label(matched[0])} is live and matches, but other candidates drift; "
                 f"flip {STATE_FILE.name} to \"applied\" (#{issue})"]
         return 1, lines + [f"FAIL: {r}" for r in drift]
     try:
@@ -408,11 +416,128 @@ def job_defined(workflow_text, job_id, name):
     return False
 
 
+RELEASE_REF = "release/v1.0.0"
+
+
+def _glob(pattern):
+    """GitHub branch filter glob: `**` crosses `/`, `*` does not."""
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    return re.compile("".join(out) + r"\Z")
+
+
+def _indent(line):
+    return len(line) - len(line.lstrip(" "))
+
+
+def _code_lines(text):
+    """Lines without comments or blanks (a quoted `#` does not occur in a branch filter)."""
+    out = []
+    for raw in text.splitlines():
+        line = re.sub(r"(^|\s)#.*$", "", raw).rstrip()
+        if line.strip():
+            out.append(line)
+    return out
+
+
+def _items(block, start):
+    """Values of the list whose key is block[start]: a flow list (maybe multi-line) or `- x` lines."""
+    key_indent = _indent(block[start])
+    rest = block[start].split(":", 1)[1].strip()
+    values = []
+    if rest.startswith("["):
+        joined, j = rest, start
+        while "]" not in joined and j + 1 < len(block):
+            j += 1
+            joined += " " + block[j].strip()
+        values = joined[1:joined.index("]")].split(",") if "]" in joined else []
+    elif not rest:
+        for line in block[start + 1:]:
+            if _indent(line) <= key_indent and not line.lstrip().startswith("- "):
+                break
+            if line.lstrip().startswith("- "):
+                values.append(line.lstrip()[2:])
+    else:
+        values = [rest]
+    return [v.strip().strip("\"'") for v in values if v.strip()]
+
+
+def trigger_covers(workflow_text, branch):
+    """True when the workflow's `on.pull_request` fires for a PR whose BASE is `branch` (#6232)."""
+    lines = _code_lines(workflow_text)
+    for i, line in enumerate(lines):
+        if _indent(line) == 0 and line.startswith("on:"):
+            inline = line[3:].strip()
+            if inline:
+                return "pull_request" in re.findall(r"[\w-]+", inline)
+            block = []
+            for body in lines[i + 1:]:
+                if _indent(body) == 0:
+                    break
+                block.append(body)
+            break
+    else:
+        return False
+    if not block:
+        return False
+    event_indent = _indent(block[0])
+    for j, body in enumerate(block):
+        if _indent(body) == event_indent and re.match(r"pull_request\s*:", body.strip()):
+            sub = []
+            for deeper in block[j + 1:]:
+                if _indent(deeper) <= event_indent:
+                    break
+                sub.append(deeper)
+            keys = {}
+            for k, deeper in enumerate(sub):
+                m = re.match(r"(branches(?:-ignore)?)\s*:", deeper.strip())
+                if m and _indent(deeper) == _indent(sub[0]):
+                    keys[m.group(1)] = _items(sub, k)
+            if "branches" in keys:
+                hit = False
+                for pat in keys["branches"]:
+                    if pat.startswith("!"):
+                        hit = hit and not _glob(pat[1:]).match(branch)
+                    elif _glob(pat).match(branch):
+                        hit = True
+                return hit
+            if "branches-ignore" in keys:
+                return not any(_glob(pat).match(branch) for pat in keys["branches-ignore"])
+            return True
+    return False
+
+
+def branch_name(ref):
+    return ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
+
+
+def check_tip(label, text, branch, jobs):
+    """Reasons a workflow at `label` cannot report the required #6143 contexts for PRs into `branch`."""
+    reasons = []
+    lacking = [name for job_id, name in jobs if not job_defined(text, job_id, name)]
+    if lacking:
+        reasons.append(f"{label} lacks {lacking}: land this change on it before applying the ruleset")
+    if not trigger_covers(text, branch):
+        reasons.append(f"{label}: {WORKFLOW_PATH} does not trigger on pull_request for {branch}: "
+                       "the required context would never report")
+    return reasons
+
+
 def pre_apply(payload, carrier_decl, release_decl, rulesets, carriers, fetch_workflow):
     """R2-F4: refuse the POST/PUT while an unfrozen carrier tip lacks a #6143 job.
 
     carriers: list of (ref, sha); fetch_workflow(sha) returns the c8-precheck.yml
-    text at that commit or raises VerifyError."""
+    text at that commit or raises VerifyError. Each unfrozen tip must define the jobs
+    AND trigger on pull_request for its own base (#6232)."""
     reasons = check_payload(payload, carrier_decl, release_decl)
     lines = []
     unfrozen = 0
@@ -429,11 +554,11 @@ def pre_apply(payload, carrier_decl, release_decl, rulesets, carriers, fetch_wor
         except VerifyError as exc:
             reasons.append(f"{ref} @ {sha}: {WORKFLOW_PATH} unreadable ({exc})")
             continue
-        lacking = [name for job_id, name in CARRIER_JOBS if not job_defined(text, job_id, name)]
-        if lacking:
-            reasons.append(f"{ref} @ {sha} lacks {lacking}: land this change on it before applying the ruleset")
+        problems = check_tip(f"{ref} @ {sha}", text, branch_name(ref), CARRIER_JOBS)
+        if problems:
+            reasons.extend(problems)
         else:
-            lines.append(f"PRE-APPLY: {ref} @ {sha} carries both #6143 jobs")
+            lines.append(f"PRE-APPLY: {ref} @ {sha} carries both #6143 jobs and triggers on its base")
     if carriers and not unfrozen:
         reasons.append("every carrier is frozen; nothing to protect, refusing to apply blind")
     if reasons:
