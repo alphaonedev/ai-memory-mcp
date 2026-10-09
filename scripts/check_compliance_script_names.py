@@ -8,9 +8,16 @@ of a reviewed source and cannot be edited in place, so a script rename leaves
 the normative text naming a file that no longer exists (#6137 ported
 ``check-cert-expiry.sh`` to ``check_cert_expiry.py``; #6141).
 
-Rule: every backticked ``check-*.sh`` / ``check_*.py`` script name in a
-``docs/compliance/*.md`` file must resolve to a file under ``scripts/``,
-unless BOTH hold:
+Rule: every ``check-*.sh`` / ``check_*.py`` script name in a
+``docs/compliance/*.md`` file must resolve to the exact file it names under
+``scripts/``, unless BOTH hold (below). A name is found anywhere on a line,
+bounded by non-name characters: in or out of backticks, in a fenced block, after
+a command (``bash scripts/...``) or a path (``./scripts/...``, a URL), after
+Unicode format characters (category Cf) are removed from document lines (#6195).
+The path is the part after the first ``scripts`` component of the written path,
+else the bare name: ``scripts/sub/check-x.sh`` names that file, never a
+same-named file elsewhere, and a symlink counts only when it resolves inside
+``scripts/`` (#6198). The allowlist is read strictly (no Cf removal).
 
 1. an erratum line somewhere in ``docs/compliance/`` names it together with an
    existing successor (``scripts/<name>``). An erratum line is a single line
@@ -56,12 +63,17 @@ import contextlib
 import io
 import os
 import re
+import string
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 
-TOKEN_RE = re.compile(r"`((?:scripts/)?check[-_][A-Za-z0-9_-]+\.(?:sh|py))`")
+# A script name anywhere on a line, bounded by non-name characters (#6195): inside or outside
+# backticks, in a fenced block, after a command or a path prefix.
+TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_.-])(check[-_][A-Za-z0-9_-]+\.(?:sh|py))(?![A-Za-z0-9_])")
+PATH_CHARS = frozenset(string.ascii_letters + string.digits + "_./-")
 SUCCESSOR_RE = re.compile(r"`scripts/([A-Za-z0-9_./-]+\.(?:sh|py))`")
 ALLOW_REL = "scripts/qc-allowlists/compliance-script-names-allow.txt"
 ENTRY_RE = re.compile(
@@ -93,14 +105,44 @@ def read_text(root, path):
         raise Unreadable(path.relative_to(root))
 
 
-def scripts_exist(root, name):
-    """True when ``name`` (bare or ``scripts/``-prefixed) is a file in scripts/."""
-    base = name[len("scripts/"):] if name.startswith("scripts/") else name
-    return any(p.is_file() and p.name == base for p in (root / "scripts").rglob(base))
+def doc_lines(root, path):
+    """A document's lines with Unicode format characters (category Cf) removed (#6195).
+
+    A reader does not see a soft hyphen, a zero-width space or joiner, or a BOM, so the gate
+    must not either. Only documents are normalised; the allowlist stays strict.
+    """
+    text = read_text(root, path)
+    return "".join(c for c in text if unicodedata.category(c) != "Cf").splitlines()
+
+
+def tokens(line):
+    """Yield (cited, name, rel) for each script name on ``line`` (#6195, #6198).
+
+    ``cited`` is the name with the path written before it, ``name`` the bare script name (the
+    allowlist and erratum key) and ``rel`` the path the citation names relative to scripts/:
+    the components after the first ``scripts`` component of the written path, else the bare
+    name (``check-x.sh``, ``bash scripts/check-x.sh`` and ``./scripts/check-x.sh`` all name
+    ``scripts/check-x.sh``; ``scripts/sub/check-x.sh`` names exactly that file).
+    """
+    for m in TOKEN_RE.finditer(line):
+        start = m.start()
+        while start > 0 and line[start - 1] in PATH_CHARS:
+            start -= 1
+        prefix = line[start : m.start()]
+        parts = prefix.split("/")
+        rel = m.group(1)
+        if "scripts" in parts:
+            rel = "/".join(parts[parts.index("scripts") + 1 : -1] + [rel])
+        yield prefix + m.group(1), m.group(1), rel
 
 
 def successor_ok(root, succ):
-    """True when ``scripts/<succ>`` is a file that resolves inside scripts/."""
+    """True when ``scripts/<succ>`` is exactly a file that resolves inside scripts/.
+
+    Used for erratum successors and, since #6198, for every cited name: no ``.``/``..``/empty
+    component, a regular file at that exact path (no basename search), and a symlink only when
+    it resolves inside scripts/.
+    """
     if any(part in ("", ".", "..") for part in succ.split("/")):
         return False
     path = root / "scripts" / succ
@@ -161,22 +203,21 @@ def compliance_docs(root):
     return sorted(docs), problems
 
 
-def collect_errata(root, docs):
+def collect_errata(root, lines_by_doc):
     """Return (all, per_doc): stale name -> successor, globally and by doc path."""
     errata, per_doc = {}, {}
-    for doc in docs:
+    for doc, lines in lines_by_doc:
         rel = doc.relative_to(root).as_posix()
-        for line in read_text(root, doc).splitlines():
+        for line in lines:
             if "erratum" not in line.lower():
                 continue
             succ = [s for s in SUCCESSOR_RE.findall(line) if successor_ok(root, s)]
             if not succ:
                 continue
-            for tok in TOKEN_RE.findall(line):
-                base = tok[len("scripts/"):] if tok.startswith("scripts/") else tok
-                if base not in succ:
-                    errata[base] = succ[0]
-                    per_doc.setdefault(rel, {})[base] = succ[0]
+            for _cited, name, path in tokens(line):
+                if path not in succ:
+                    errata[name] = succ[0]
+                    per_doc.setdefault(rel, {})[name] = succ[0]
     return errata, per_doc
 
 
@@ -214,17 +255,17 @@ def load_allowlist(root):
 def check(root):
     """Return a list of violation strings for the tree at ``root``."""
     docs, problems = compliance_docs(root)
-    errata, per_doc = collect_errata(root, docs)
+    lines_by_doc = [(doc, doc_lines(root, doc)) for doc in docs]
+    errata, per_doc = collect_errata(root, lines_by_doc)
     allowed, ledger_problems = load_allowlist(root)
     problems.extend(ledger_problems)
     used = set()
-    for doc in docs:
+    for doc, lines in lines_by_doc:
         rel = doc.relative_to(root).as_posix()
-        for lineno, line in enumerate(read_text(root, doc).splitlines(), 1):
-            for tok in TOKEN_RE.findall(line):
-                if scripts_exist(root, tok):
+        for lineno, line in enumerate(lines, 1):
+            for cited, base, path in tokens(line):
+                if successor_ok(root, path):
                     continue
-                base = tok[len("scripts/"):] if tok.startswith("scripts/") else tok
                 pinned = allowed.get((rel, base))
                 covered = base in errata if pinned else base in per_doc.get(rel, {})
                 if pinned is not None and covered:
@@ -232,7 +273,7 @@ def check(root):
                     continue
                 problems.append(
                     "%s:%d: `%s` does not exist under scripts/ and no erratum-covered allowlist"
-                    " entry (%s) names it" % (rel, lineno, tok, ALLOW_REL)
+                    " entry (%s) names it" % (rel, lineno, cited, ALLOW_REL)
                 )
     for (rel, base), pinned in sorted(allowed.items()):
         if pinned and base in per_doc.get(rel, {}):
