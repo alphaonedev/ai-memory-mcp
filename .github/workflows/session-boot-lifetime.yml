@@ -41,9 +41,14 @@ env:
   # #6118 — the SAME debuginfo pair as ci.yml's `check` job (`"0"`, see the
   # measurement recorded on that job's env). The macos-fed leg shares that
   # job's persistent `target/` on the f1 node, and the debuginfo level is part
-  # of cargo's artifact hash: left at cargo's default (full debuginfo) this
-  # suite kept its own complete dependency tree there, at the largest size.
-  # One level for every self-hosted cargo job = one tree. TEST is set alongside
+  # of cargo's artifact hash. Before #6118 this file set no level, so the
+  # macos-fed leg built at whatever the runner's `.env` exported
+  # (`line-tables-only`, the level `check` used then); a re-imaged or added
+  # runner without that `.env` would have built at cargo's default (full
+  # debuginfo) and kept a second complete tree. This workflow `env:` now
+  # takes precedence over any runner-side value (runbook §3.3 of
+  # docs/DEV-CI-ENVIRONMENT.md). One level for every self-hosted cargo job =
+  # one tree. TEST is set alongside
   # DEV per the #3461 pair rule. Harmless on the hosted ubuntu leg (smaller
   # binaries, shorter link; the ephemeral VM keeps nothing). Pinned by
   # scripts/test/test_ci_runner_target_hygiene_6118.py.

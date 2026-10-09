@@ -684,11 +684,16 @@ jobs:
       # #6118 — `0`. At `line-tables-only` the SAME failure came back: one full
       # build still wrote 164 GB of test executables per runner (~170 MB each)
       # and two runners took the f2 root from 224 GB to 78 GB free in two
-      # hours. Measured 2026-10-09 (sandbox, lib unit-test binary + one
-      # integration test binary): an integration test binary is 130 MB at
-      # `line-tables-only` and 11.6 MB at `0` (11x); the lib unit-test binary
-      # 411 MB vs 258 MB. The ~1000 integration binaries are what fill the
-      # disk, so the level that matters is `0`. Nothing in CI reads line
+      # hours. Measured 2026-10-09 on Linux x86_64 (packed debuginfo; sandbox,
+      # lib unit-test binary + one integration test binary): an integration
+      # test binary is 130 MB at `line-tables-only` and 11.6 MB at `0` (11x);
+      # the lib unit-test binary 411 MB vs 258 MB. The ~1000 integration
+      # binaries are what fill the disk, so the level that matters is `0`. On
+      # macOS (macos-fed, `split-debuginfo=unpacked`) the binaries shrink only
+      # 1.11x (lib unit-test binary 267 MB vs 239 MB), but `debug/deps` falls
+      # from 3.7 GB to 2.0 GB (1.85x): at `line-tables-only` it also holds
+      # ~1076 `.o` files (1.1 GiB) of unpacked debuginfo, which the prune keeps
+      # (see its docstring); at `0` there are none. Nothing in CI reads line
       # tables: no workflow, script or test sets RUST_BACKTRACE, a panic's
       # file:line is a compile-time string (no debuginfo involved), nothing
       # here runs a debugger, and the hosted `Check (ubuntu-latest,sqlite)`

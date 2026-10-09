@@ -104,23 +104,42 @@ controls, both pinned by `scripts/test/test_ci_runner_target_hygiene_6118.py`
   `session-boot-lifetime.yml`): `CARGO_PROFILE_DEV_DEBUG` and
   `CARGO_PROFILE_TEST_DEBUG` are both `"0"`. The level is part of cargo's
   artifact hash, so jobs at different levels keep separate complete artifact
-  trees in one persistent `target/`; one level means one tree. Measured
-  2026-10-09 (sandbox, 4 cores, `cargo test --no-run -p ai-memory --lib --test
-  mcp_input_schema_no_false_strict_1052`, one `CARGO_TARGET_DIR` per level):
+  trees in one persistent `target/`; one level means one tree. Before #6118
+  the linux-fed runners held two levels (`check` at `line-tables-only`, the
+  two Postgres jobs at `0`). Measured 2026-10-09 with `cargo test --no-run -p
+  ai-memory --lib --test mcp_input_schema_no_false_strict_1052`, one
+  `CARGO_TARGET_DIR` per level:
 
-  | debuginfo level            | integration test binary | lib unit-test binary | `debug/deps` |
-  |----------------------------|------------------------:|---------------------:|-------------:|
-  | cargo default (full, `2`)  | 484 MB                  | 889 MB               | 6.2 GB       |
-  | `line-tables-only`         | 130 MB                  | 411 MB               | 3.4 GB       |
-  | `0`                        | 11.6 MB                 | 258 MB               | 2.4 GB       |
+  | platform                          | debuginfo level           | integration test binary | lib unit-test binary | `debug/deps` |
+  |-----------------------------------|---------------------------|------------------------:|---------------------:|-------------:|
+  | Linux x86_64 (packed debuginfo)   | cargo default (full, `2`) | 484 MB                  | 889 MB               | 6.2 GB       |
+  | Linux x86_64 (packed debuginfo)   | `line-tables-only`        | 130 MB                  | 411 MB               | 3.4 GB       |
+  | Linux x86_64 (packed debuginfo)   | `0`                       | 11.6 MB                 | 258 MB               | 2.4 GB       |
+  | macOS (`split-debuginfo=unpacked`)| `line-tables-only`        | 4.3 MB                  | 267 MB               | 3.7 GB       |
+  | macOS (`split-debuginfo=unpacked`)| `0`                       | 3.9 MB                  | 239 MB               | 2.0 GB       |
 
-  The ~1000 integration binaries are what fill the disk: 11x smaller at `0`
-  than at `line-tables-only` (which the `check` job already ran at when it
-  wrote the 164 GB), so a full build's peak is ~12 GB instead of ~130-164 GB.
+  On Linux the ~1000 integration binaries are what fill the disk: 11x smaller
+  at `0` than at `line-tables-only` (which the `check` job already ran at when
+  it wrote the 164 GB), so a full build's peak is ~12 GB instead of
+  ~130-164 GB. On macOS the binaries shrink only 1.11x; the 1.85x on
+  `debug/deps` comes from ~1076 loose `.o` files (1.1 GiB) of unpacked
+  debuginfo that exist at `line-tables-only` and not at `0`. The prune keeps
+  `.o` files (they are the debug map of every artifact linked from those
+  crates, the kept bins included), so on macOS the level is what removes them.
   Nothing in CI reads line tables (no workflow, script or test sets
   `RUST_BACKTRACE`; a panic's `file:line` is a compile-time string).
+
+  The workflow `env:` takes precedence over a runner's own environment, so a
+  `CARGO_PROFILE_*_DEBUG` line in a runner's `.env` no longer has any effect
+  on these jobs. Set such a line to `0` or remove it, so the runner and the
+  workflow can never disagree for a job that is added later without the pair.
+  The hygiene test fails any self-hosted job that sets another level in a
+  workflow, job or step `env:`, in a `run:` body (`export`, or a write to
+  `$GITHUB_ENV`) or through a rustc `debuginfo=` flag, and it censuses every
+  job whose `runs-on` can resolve to a self-hosted runner.
 - **`Prune runner target dir (#6118)` is the LAST step of each such job**,
-  under `if: always()`, running
+  under `if: always() && ... && steps.checkout.outcome == 'success'` (it never
+  runs a script the job's own checkout did not produce), running
   `python3 scripts/ci/prune-runner-target.py --target-dir "${CARGO_TARGET_DIR:-target}"`.
   The default `--scope test-bins` deletes the test/example executables (plus
   their `.d` and `.dSYM` companions) and `incremental/`; the rlib / rmeta /
@@ -128,8 +147,17 @@ controls, both pinned by `scripts/test/test_ci_runner_target_hygiene_6118.py`
   still warm. `--dry-run` lists what would go and prints `freed_bytes=<n>`;
   `--scope all` wipes `debug/{deps,build,incremental,examples,.fingerprint}`
   wholesale (the disk-emergency prune, no toolchain needed). The script fails
-  closed (exit 2) on anything that is not a cargo target dir and never follows
-  a symlink. By hand on a node:
+  closed (exit 2, nothing touched) on a `--profile` that is not one path
+  component, a symlinked target dir or profile dir, a dir outside
+  `GITHUB_WORKSPACE` that is not the exported `CARGO_TARGET_DIR`, and a dir
+  without cargo's marker (a `CACHEDIR.TAG` carrying the cachedir signature, or
+  `<profile>/.cargo-lock`). A target dir that does not exist yet is "nothing to
+  prune" (exit 0). It deletes through directory fds opened with `O_NOFOLLOW`,
+  so it never follows a symlink, even one swapped in mid-run. An entry it
+  cannot remove prints a `::warning::` line; the rest is still pruned and the
+  exit code is 1. `freed_bytes` is exact: a hard-linked file counts once, and
+  only when all of its links go. Loose `deps/*.o` files are kept. By hand on a
+  node:
 
   ```bash
   python3 scripts/ci/prune-runner-target.py \

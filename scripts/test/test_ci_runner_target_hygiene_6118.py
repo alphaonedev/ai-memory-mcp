@@ -38,10 +38,13 @@ FAILURE, never a skip):
            shared persistent ``target/`` holds ONE artifact tree, not one per
            debuginfo level).  ``0``, not ``line-tables-only``: the check job
            ALREADY ran at ``line-tables-only`` when it wrote the 164 GB, and a
-           sandbox measurement (2026-10-09, lib unit-test binary + one
-           integration test binary) put the integration test binary at 130 MB
-           at ``line-tables-only`` and 11.6 MB at ``0`` (11x); the ~1000
-           integration binaries are what fill the disk.  Nothing in CI reads
+           Linux x86_64 measurement (packed debuginfo, 2026-10-09, lib
+           unit-test binary + one integration test binary) put the integration
+           test binary at 130 MB at ``line-tables-only`` and 11.6 MB at ``0``
+           (11x); the ~1000 integration binaries are what fill the disk.  On
+           macOS (unpacked debuginfo) the binaries shrink only 1.11x, and
+           ``debug/deps`` 3.7 GB -> 2.0 GB, from the loose ``.o`` files that
+           ``0`` no longer writes.  Nothing in CI reads
            line tables: no workflow, script or test sets RUST_BACKTRACE, panic
            locations are compile-time strings, and the hosted sqlite leg and
            both pg jobs have run the full suites at ``0`` since #3461 / #3274.
