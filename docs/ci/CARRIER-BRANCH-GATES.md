@@ -76,9 +76,9 @@ weights when it does.
 
 `scripts/ci/test_binary_cache.py` skips a test executable when it provably
 would run the same code against the same inputs as a binary that already
-passed. It sits between the partitioner and the three shards, inside the
-existing `Run tests (impact-aware)` step (tier `enterprise-fed` only; no job,
-leg or step name changed).
+passed. It sits between the partitioner and the three shards (and before the
+Postgres isolation split), inside the existing `Run tests (impact-aware)` step
+(tier `enterprise-fed` only; no job, leg or step name changed).
 
 **Key.** sha256 over: the sorted (repo-relative path, content sha256) of every
 file in the executable's own cargo dep-info (`target/<profile>/deps/<name>-<hash>.d`,
@@ -86,65 +86,89 @@ including its `# env-dep:` lines with the checkout path normalised); the same
 for the shared closure, the dep-info of every local lib, bin and build-script
 unit (a test target's dep-info lists only its own sources, but it links the
 lib, so a `src/` edit must invalidate every dependent); `Cargo.lock`; the
-`rustc -Vv` text the workflow writes; the feature/profile string;
-`AI_MEMORY_NO_CONFIG`, `RUSTFLAGS` and the presence (not the value) of
-`AI_MEMORY_TEST_POSTGRES_URL`; and a digest of every file in the repository a
-test could read at run time (everything except `.git`, `target`, `.local-runs`
-and the compiled `.rs` under `src/` and `tests/`). An integration test whose
-own sources look like a tree scanner (`read_dir`, `walkdir`, `glob`, a
-`tests` path) is keyed on the whole tree including `.rs`, so a source-scanning
-test is never skipped because some other file changed.
+`rustc -Vv` text the workflow writes; the feature/profile string; the
+behaviour-affecting environment (every `AI_MEMORY_*`, `RUST_TEST_*`,
+`CARGO_PROFILE_*`, `CARGO_BUILD_*` and `PROPTEST_*` variable plus `CI`,
+`RUSTFLAGS`, `RUST_LOG`, `TZ` and a few more: the value's sha256 for a plain
+setting, only set or empty for a name containing `URL`, `PASSWORD`, `SECRET`,
+`TOKEN`, `KEY` and similar); the Postgres server identity (`SELECT version()`
+and the installed `age` and `vector` extension versions, or `none` when no
+`AI_MEMORY_TEST_POSTGRES_URL` is set; a failed query disables the cache for
+the run); and a digest of every file in the repository a test could read at
+run time. That digest leaves out `.git`, `target`, `.local-runs`, the `.rs`
+files under `src/` and `tests/` that some dep-info of the build names (an
+orphan or cfg-off `.rs` file stays in), and `changelog.d/`, `docs/` and every
+`*.md` file. Those documentation files are in the key only of a binary whose
+own code (not a `//` comment) names `changelog`, `docs` or `.md`. An
+integration test whose own sources look like a tree scanner (`read_dir`,
+`walkdir`, `glob`, a `tests` path) is keyed on the whole tree, so a
+source-scanning test is never skipped because some other file changed. The
+walk never opens a FIFO, socket or device, and the whole plan has a 120 s
+deadline; on expiry, or on any other failure, the full lists run.
 
-**Decision.** A binary is skipped only if its key equals the prior key AND the
-prior result is `pass` AND the entry is for the same tier and base ref AND it
-is less than 7 days old. `plan` rewrites the three shard lists (originals kept
-as `*.txt.full`), prints `::notice::[#6384] skipped N of M binaries (cache hits),
-running K`, and prints every hit with the prior `run_id`, `sha` and recorded
-time inside a `::group::` so a reviewer can audit it. The lib counts as one
-binary and leaves both lib invocations when it hits. Doc tests always run.
+**Who reads and who writes.**
 
-**Record.** After all three shards exit 0, `record` merges the new keys with
-result `pass`. A skipped binary is carried forward unchanged (original
-`run_id`, `sha`, `recorded_at`), so provenance stays traceable and a chain of
-cache hits cannot extend a pass beyond 7 days. A binary without a computable
-key loses its old entry. A failed or partial run records nothing.
+* `pull_request`: lookup only, under `github.base_ref`. A pull request
+  never writes the manifest: its test code is unmerged.
+* `push` to `release/**`: the seeding run. Lookup is off (every binary runs)
+  and the results of a fully green step are recorded under the branch name.
+* Every other event, `chain/**` pushes included: no lookup, no record.
+
+Lookup needs two flags: `CI_TEST_BINARY_CACHE=1` and
+`CI_TEST_BINARY_CACHE_LOOKUP=1`. `ci.yml` sets the second one for
+`pull_request` only, so it is `0` on every push to `release/**`, and the
+script itself grants lookup on `pull_request` only.
+
+**Decision.** A binary is skipped only if its key equals the recorded key AND
+the recorded result is `pass` AND the entry is for the same tier and base ref
+AND it is less than 7 days old. `plan` rewrites the three shard lists
+(originals kept as `*.txt.full`), prints `::notice::[#6384] skipped N of M
+binaries (cache hits), running K`, and prints every hit with the recorded
+`run_id`, `sha` and time inside a `::group::` so a reviewer can audit it. The
+lib counts as one binary and leaves both lib invocations when it hits. Doc
+tests always run. If `plan` fails or is killed, `restore` puts the
+`*.txt.full` lists back; a failed restore fails the step.
+
+**Record.** After all three shards of a `release/**` push exit 0, `record`
+writes every computed key with result `pass` and that run's `run_id` and
+`sha`. A binary without a computable key loses its old entry. A failed or
+partial run records nothing.
 
 **Safety rules (enforced in the script).**
 
-1. The cache is consulted only when `CI_TEST_BINARY_CACHE=1`.
-2. A `push` to `release/**` is the seeding run: lookup is OFF (every binary
-   runs, no skips, fail closed) but RECORD is ON under the branch name (for
-   example `release/v1.0.0`). Lookup plus record applies to `pull_request` (under
-   `github.base_ref`) and `push` to `chain/**`. Any other event runs everything.
+1. The cache is consulted only when `CI_TEST_BINARY_CACHE=1`; lookup also
+   needs `CI_TEST_BINARY_CACHE_LOOKUP=1` and a `pull_request` event.
+2. No run both looks up and records, so a recorded `pass` always comes from a
+   run that executed that binary.
 3. A binary whose key cannot be computed (missing or unparsable `.d`, unreadable
    input) always runs; if the shared inputs cannot be computed, everything runs.
    Any internal error leaves the full lists untouched.
 4. A manifest or entry older than 7 days, from another tier or base ref, or
    dated in the future is ignored.
-5. Every hit is printed with its prior run and sha.
+5. Every hit is printed with its recorded run and sha.
 6. `record` refuses unless the step exit code is exactly 0.
 
 **Storage.** A per-runner directory (`$CI_TEST_MANIFEST_DIR`, default
 `$HOME/.cache/ai-memory-ci/test-manifest`), one JSON file per node, tier and
 base ref, written atomically under an advisory lock. `ci.yml` has no
 `actions/cache` precedent (only `Swatinem/rust-cache`, hosted legs only), the
-enterprise-fed legs are self-hosted, and GitHub's cache scoping would hide an
-entry saved by a push to `chain/x` from a pull request on another base. The
-repository already documents why archive restores onto self-hosted trees are
-unsafe (#3128). Linux and macOS never share a manifest (different hosts, and
-the node is part of the file name).
+enterprise-fed legs are self-hosted, and GitHub's cache scoping rules differ
+per base. The repository already documents why archive restores onto
+self-hosted trees are unsafe (#3128). Linux and macOS never share a manifest
+(different hosts, and the node is part of the file name).
 
-**Expected effect.** A carrier PR whose merge tree equals a green chain tip
-(same base ref manifest) skips nearly every binary and runs only the doc tests
-and binaries without a computable key. A PR that edits `src/` invalidates every
-key and runs the full suite. A PR that edits one `tests/*.rs` file reruns that
-binary plus any tree-scanning binary. A carrier PR into `release/v1.0.0` reads
-the manifest written by the previous push to that branch, the authoritative full
-run of the tree it is stacked on. The base ref is `github.base_ref` for a
-pull request and the branch name for a push, so a chain push and a PR only
-share a manifest when they name the same base.
+**Expected effect.** Hits happen only for a pull request into a `release/**`
+branch, and only for binaries whose inputs equal those of the last green push
+to that branch on the same node and tier within 7 days. A pull request that
+changes only `changelog.d/`, `docs/` or `*.md` files skips every binary whose
+code does not name them. A pull request that edits one `tests/*.rs` file
+reruns that binary plus every tree-scanning binary. A pull request that edits
+`src/`, `Cargo.lock`, the toolchain, the environment or the Postgres server
+reruns everything. Pull requests into `chain/**` and pushes never skip.
 
 **Known limit.** A test that reads, at run time, a `.rs` file under `tests/`
 or `src/` through a path the scanner heuristic does not recognise would not be
 re-run when only that file changes. Add the marker string to its source (or
-extend `TREE_SENSITIVE_RE`) when one is found.
+extend `TREE_SENSITIVE_RE`) when one is found. The same applies to a test that
+reads documentation through a path that names none of `changelog`, `docs` or
+`.md` (extend `DOC_READER_RE`).

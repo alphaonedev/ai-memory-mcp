@@ -26,9 +26,14 @@ age / vector extension versions, or ``none`` without a test database URL);
 and a digest of every file in the repo a test could read at run time that
 rustc never saw (everything but build/VCS dirs and the ``.rs`` files under
 src/ and tests/ that some dep-info of THIS build names; a ``.rs`` file no
-dep-info names, such as a cfg-off module or an orphan, stays in). A binary
-whose own sources look like a tree scanner (read_dir, walkdir, glob, a
-"tests" path; integration test targets only) is keyed on the whole tree
+dep-info names, such as a cfg-off module or an orphan, stays in).
+changelog.d/, docs/ and *.md are in the key only of a binary whose OWN
+sources name them (``changelog``, ``docs`` or ``.md`` outside a ``//``
+comment; r1 M4). The lib code reads no documentation at run time (an
+``include_str!`` of a doc is in dep-info), so a docs-only change is a hit for
+every other binary. A binary whose own sources look like a tree scanner
+(read_dir, walkdir, glob, a "tests" path; integration test targets only) is
+keyed on the whole tree
 including those ``.rs`` files, so a source-scanning test is never skipped
 because some OTHER file changed.
 
@@ -237,7 +242,21 @@ COMPILED_RS_ROOTS = ('src', 'tests')
 TREE_SENSITIVE_RE = re.compile(r'read_dir|walkdir|WalkDir|\bglob\b|"tests"|tests/|include_dir')
 
 
-def digest_runtime_tree(root, include_compiled_rs, compiled_labels=None):
+# Documentation a test binary only reads when its code names it (r1 M4).
+DOC_ROOTS = ('changelog.d', 'docs')
+DOC_SUFFIXES = ('.md',)
+# A binary whose code (``//`` line comments ignored) matches this is keyed on
+# the documentation as well.
+DOC_READER_RE = re.compile(r'changelog|\bdocs\b|\.md\b', re.I)
+
+
+def is_doc_label(rel):
+    """True for a repo-relative path under changelog.d/ or docs/, or a *.md file."""
+    rel = Path(rel)
+    return bool(rel.parts) and (rel.parts[0] in DOC_ROOTS or rel.suffix.lower() in DOC_SUFFIXES)
+
+
+def digest_runtime_tree(root, include_compiled_rs, compiled_labels=None, include_docs=None):
     """sha256 pairs of every file a test could read at run time.
 
     Everything under the repo except build/VCS dirs. A ``.rs`` file under src/
@@ -247,7 +266,12 @@ def digest_runtime_tree(root, include_compiled_rs, compiled_labels=None):
     dep-info names (a cfg-off module, an orphan file) stays in: the lib's own
     tests scan src/ at run time (r1 H1). ``compiled_labels=None`` means "no
     dep-info known", so every ``.rs`` file stays in.
+
+    ``include_docs`` (default: same as ``include_compiled_rs``) keeps the
+    documentation (``is_doc_label``) in; the base digest leaves it out (r1 M4).
     """
+    if include_docs is None:
+        include_docs = include_compiled_rs
     root = Path(root)
     compiled = frozenset(compiled_labels or ())
     out = []
@@ -262,6 +286,8 @@ def digest_runtime_tree(root, include_compiled_rs, compiled_labels=None):
             rel = p.relative_to(root)
             if (not include_compiled_rs and p.suffix == '.rs' and rel.parts[0] in COMPILED_RS_ROOTS
                     and str(rel) in compiled):
+                continue
+            if not include_docs and is_doc_label(rel):
                 continue
             out.append(('rt:' + str(rel), runtime_entry_digest(p)))
     return out
@@ -353,6 +379,33 @@ def tree_sensitive(depinfo_path, repo_root):
                 return True
         except OSError:
             return True
+    return False
+
+
+def reads_docs(depinfo_path, repo_root):
+    """True when any own source of the binary names the documentation (r1 M4).
+
+    Lines whose first non-blank characters are ``//`` are ignored; every other
+    line counts, block comments included (the conservative direction). An
+    unreadable source counts as a reader.
+    """
+    deps, _ = parse_depinfo(Path(depinfo_path).read_text(errors='replace'))
+    root = Path(repo_root).resolve()
+    for d in deps:
+        p = Path(d)
+        p = p if p.is_absolute() else root / p
+        if _is_registry(p) or not p.is_file():
+            continue
+        try:
+            text = p.read_text(errors='replace')
+        except OSError:
+            return True
+        for line in text.splitlines():
+            s = line.lstrip()
+            if s.startswith('//'):
+                continue
+            if DOC_READER_RE.search(s):
+                return True
     return False
 
 
@@ -529,7 +582,8 @@ def compute_keys(exes, build_lines, repo_root, rustc_vv, profile, env, runtime=T
     for _dep, own in own_by_exe.values():
         compiled.update(label for label, _ in own)
     try:
-        rt_base = digest_runtime_tree(repo_root, False, compiled) if runtime else []
+        rt_docs = digest_runtime_tree(repo_root, False, compiled, include_docs=True) if runtime else []
+        rt_base = [e for e in rt_docs if not is_doc_label(e[0][len('rt:'):])]
         rt_full = digest_runtime_tree(repo_root, True) if runtime else []
     except CacheError as exc:
         for e in exes:
@@ -541,7 +595,12 @@ def compute_keys(exes, build_lines, repo_root, rustc_vv, profile, env, runtime=T
             continue
         dep, own = own_by_exe[e.key]
         try:
-            rt = rt_full if (runtime and e.kind not in ('lib', 'bin') and tree_sensitive(dep, repo_root)) else rt_base
+            if runtime and e.kind not in ('lib', 'bin') and tree_sensitive(dep, repo_root):
+                rt = rt_full
+            elif runtime and reads_docs(dep, repo_root):
+                rt = rt_docs
+            else:
+                rt = rt_base
             keys[e.key] = build_key(own, shared, lock_sha, rustc_vv, profile, env_fp, rt, server_fp)
         except CacheError as exc:
             keys[e.key], why[e.key] = None, str(exc)

@@ -604,7 +604,8 @@ class DocsMatchHitCases6384M4(unittest.TestCase):
         self.assertNotIn('chain push', text)
         self.assertIn('pull request', text)
         self.assertIn('release/**', text)
-        self.assertIn('never on release pushes', text.replace('\n', ' '))
+        self.assertIn('never skips', text)
+        self.assertIn('pull requests never write', text)
 
     def test_carrier_doc_has_no_chain_lookup_claim(self):
         text = (REPO / 'docs' / 'ci' / 'CARRIER-BRANCH-GATES.md').read_text()
@@ -616,7 +617,7 @@ class DocsMatchHitCases6384M4(unittest.TestCase):
         self.assertNotIn('green chain tip', sec)
         self.assertNotIn('carried forward', sec)
         self.assertIn('CI_TEST_BINARY_CACHE_LOOKUP', sec)
-        self.assertIn('never writes the manifest', sec.replace('\n', ' '))
+        self.assertIn('never writes the manifest', ' '.join(sec.split()))
 
 
 class Policy(unittest.TestCase):
