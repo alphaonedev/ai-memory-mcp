@@ -97,9 +97,9 @@ DIFF_LINE_CAP = 200
 # digits, so nothing but `refs/pull/<N>/head` can reach the fetch.
 PR_NUMBER = re.compile(r"[1-9][0-9]{0,9}", re.ASCII)
 # #6163: credential-shaped head text. The summary is a public job log; the masked value is still a rule change (the
-# verdict is computed before masking). Groups: 1 the name, 2 its separator (an optional closing quote or backtick,
-# then `:` or `=`), 3/4 a double/single-quoted value, 5 an unquoted run of words up to a quote, a backtick or the end of
-# the line, so `password = a b` masks both words.
+# verdict is computed before masking). The separator is an optional closing quote, backtick or emphasis, then `:` or
+# `=`; an unquoted value is the run of words up to a quote, a backtick or the end of the line, so `password = a b`
+# masks both words.
 CREDENTIAL_NAME = (r"[\w-]*(?:passw(?:or)?d|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|"
                    r"credential)[\w-]*")
 # #6210: the name may be emphasised or code-quoted (`**password**: v`, `password:** v`, `` `token`: v ``) and the
@@ -129,7 +129,7 @@ ENV_NAME_KEY = re.compile(r"(?i)[_-](?:env|var|name)$")
 ENV_NAME_TAIL = re.compile(r"_(?:KEY|TOKEN|SECRET|PASSWORD|PASSPHRASE|CREDENTIALS?)[.,;:)\]}]*$")
 LONG_DIGITS = re.compile(r"\d{4}")
 # #6209: an unquoted multi-word value is shown only when its first word is plain and every later word is plain too or
-# a short lower-case prose word (`max_tokens: 20000 per request`); `token: on <secret>` or `secret: yes, it is <secret>`
+# a short prose word (`max_tokens: 20000 per request`); `token: on <secret>` or `secret: yes, it is <secret>`
 # masks the whole value. A prose word may start with a capital (a table cell `The budget for one call`) or be an
 # acronym of 2-5 capitals (`CLI`, `HTTP`).
 PROSE_WORD = re.compile(r"(?:[A-Za-z][a-z]{0,11}|[A-Z]{2,5})[.,;:)\]}]*", re.ASCII)
