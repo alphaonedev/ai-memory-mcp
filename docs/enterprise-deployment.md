@@ -765,7 +765,8 @@ max_prepared_statements = 256    ; PgBouncer >= 1.21
 max_client_conn = 1000           ; client-facing admission ceiling
 default_pool_size = 16           ; server conns per (user,db): the sum of the daemons' AI_MEMORY_PG_POOL_MAX
 reserve_pool_size = 4            ; burst headroom above default_pool_size
-server_tls_sslmode = verify-full ; mTLS to the primary (§14)
+server_tls_sslmode = verify-full ; the pooler verifies the Postgres certificate and host name
+server_tls_ca_file = /etc/pgbouncer/tls/ca.crt
 client_tls_sslmode = verify-full ; mTLS from the daemons (§14)
 ```
 
@@ -779,7 +780,14 @@ TLS: the adapter refuses a `postgres://` store URL that does not pin
 `src/transit_encryption.rs`, #3705), so the pooler must serve TLS to its
 clients and the daemon's URL must carry `sslmode=verify-full` plus the CA
 that signed the pooler's certificate (`sslrootcert=`, accepted by the
-adapter's DSN parser in `src/store/postgres/dsn.rs`).
+adapter's DSN parser in `src/store/postgres/dsn.rs`). The pooler must verify
+the Postgres side the same way: `server_tls_sslmode = verify-full` with
+`server_tls_ca_file` is **required**, because PgBouncer's own default for
+that hop is `prefer` (opportunistic, unverified, and silently plaintext when
+the server offers no TLS), which would end the daemon's `verify-full`
+guarantee at the pooler and expose the credential exchange and memory content
+on the second hop to an on-path attacker. Do not lower it to `require` or
+`prefer`.
 
 #### 5.6.4 `userlist.txt` (SCRAM, no plaintext)
 

@@ -54,6 +54,19 @@ which the AGE cypher path (`LOAD 'age'` + `SET LOCAL search_path` + `cypher()`
 in one transaction) needs. Full results, the daemon run through the pooler and
 the sizing rule: `docs/enterprise-deployment.md` §5.6.
 
+## TLS on both hops
+
+There are two hops, and each needs its own verification. **Daemon → pooler:**
+the adapter refuses a store URL that does not pin `sslmode=verify-full`
+(#3705), so the pooler must serve TLS to its clients and the daemon's URL
+carries `sslrootcert=` for the CA that signed the pooler's certificate.
+**Pooler → Postgres:** PgBouncer's default `server_tls_sslmode` is `prefer`
+(unverified, plaintext if the server offers no TLS), so production must set
+`server_tls_sslmode = verify-full` with `server_tls_ca_file` (#4729; the
+commented block in `pgbouncer.ini`). The smoke stack ships no certificates, so
+those lines are commented out in the template; uncomment them for a real
+deployment. Guide §5.6.3 and §14 carry the full checklist.
+
 ## Validate
 
 ```bash
