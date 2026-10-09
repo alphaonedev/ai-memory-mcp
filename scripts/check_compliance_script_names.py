@@ -17,7 +17,13 @@ invisible characters (category Cf and every Default_Ignorable_Code_Point) are re
 from document lines (#6195). Each line is also scanned as a reader sees it after
 rendering (#6214): escapes, entities, inline tags and comments, emphasis markers, dash
 variants, combining marks and look-alike letters folded, so a backslash-escaped
-hyphen, ``check&#45;x.sh`` or a Cyrillic look-alike letter cannot hide a name.
+hyphen, ``check&#45;x.sh`` or a Cyrillic look-alike letter cannot hide a name. The
+document is also scanned as one text with code-span backticks, link and image brackets
+and destinations, comments and tags removed across lines (``skeleton``), so a name split
+by ``check-`old.sh```, ``[check-](a)[old.sh](b)`` or a comment over a line break is
+found on the line it starts on. A script name with any non-ASCII letter (or combining
+mark) where it has a letter (``LOOSE_RE``) is reported as a look-alike, even of an
+existing script.
 Names match in any ASCII letter case, and existence is decided by exact names from
 directory listings, the same on case-insensitive filesystems (#6220).
 A bare name means ``scripts/<name>``. A written path is checked at that path
@@ -75,6 +81,7 @@ allowlist.
 """
 
 import argparse
+import bisect
 import contextlib
 import errno
 import html
@@ -136,6 +143,24 @@ HTML_BLOCK_RE = re.compile(r"^ {0,3}<(/?)([A-Za-z][A-Za-z0-9-]*)")
 RAW_TEXT_TAGS = frozenset({"pre", "script", "style", "textarea"})
 # A line that is only ``$$`` opens or closes a display-math block, rendered as math (#6196).
 MATH_FENCE = "$$"
+# The document skeleton (#6214): what a renderer drops between the letters of a name. A
+# comment (``<!-->``, ``<!--->`` included), a tag, a code-span backtick, a link or image
+# opener and a link closer with its inline destination.
+SKELETON_RE = re.compile(r"<!--(?:-?>|.*?-->)|<[A-Za-z/][^<>]*>|`|!?\[|\](?:\([^()]*\))?", re.DOTALL)
+# A script name in any letters (#6214): each letter of ``check``, ``sh`` and ``py`` is that ASCII
+# letter or any non-ASCII letter. A match that is not all ASCII is a look-alike.
+MARKED = "\u01c2"
+
+
+def _loose(word):
+    return "".join("(?:%s|[^\\W\\d_A-Za-z])" % c for c in word)
+
+
+LOOSE_RE = re.compile(
+    r"(?<![A-Za-z0-9_.-])" + _loose("check") + r"[-_][\w-]+\.(?:" + _loose("sh") + "|" + _loose("py")
+    + r")(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
 # Appended to a violation when a line names the stale name and a successor with the word
 # "erratum" but is not in the erratum form (#6238).
 NEAR_HINT = (
@@ -213,21 +238,70 @@ def doc_lines(root, path):
     return "".join(c for c in text if not invisible(c)).splitlines()
 
 
-def rendered(line):
+def rendered(line, fold_letters=True):
     """``line`` as a reader sees it, folded for stale-name detection only (#6214).
 
     Inline tags and comments removed, entities decoded, backslash escapes dropped, NFKC
     (fullwidth and other compatibility forms), every dash folded to ``-``, combining and
     invisible marks removed, look-alike letters mapped to ASCII, emphasis and strikethrough
     markers (``*``, ``~``) dropped. Its tokens are scanned in addition to the line's own, so
-    this can only add findings; errata are still read from the unfolded visible text.
+    this can only add findings; errata are still read from the unfolded visible text. With
+    ``fold_letters`` false, letters are kept and a letter carrying a combining mark becomes
+    ``MARKED``, a non-ASCII letter, for the look-alike scan (``LOOSE_RE``); a mark on any
+    other character is dropped.
     """
     s = ESCAPE_RE.sub(r"\1", html.unescape(INLINE_TAG_RE.sub("", line)))
     s = unicodedata.normalize("NFKC", s)
     s = "".join("-" if c in DASHES or unicodedata.category(c) == "Pd" else c for c in s)
-    s = "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) not in ("Mn", "Me"))
-    s = "".join(c for c in s if not invisible(c)).translate(LOOKALIKES)
+    out = []
+    for c in unicodedata.normalize("NFD", s) if fold_letters else s:
+        if invisible(c):
+            continue
+        if unicodedata.category(c) in ("Mn", "Me"):
+            if not fold_letters and out and out[-1].isalpha():
+                out[-1] = MARKED
+            continue
+        out.append(c)
+    s = "".join(out)
+    if fold_letters:
+        s = s.translate(LOOKALIKES)
     return s.replace("*", "").replace("~", "")
+
+
+def skeleton(lines):
+    """Return {1-based line number: [text]}: the document as one text, split names joined (#6214).
+
+    Code-span backticks, link and image brackets and inline destinations, comments and tags
+    are removed from the joined lines (``SKELETON_RE``), line breaks inside them included, so
+    a name split across them reads as the reader sees it. Each skeleton line is filed under
+    the line its first character comes from; a name found there is reported on that line.
+    """
+    text = "\n".join(lines)
+    starts, n = [], 0
+    for line in lines:
+        starts.append(n)
+        n += len(line) + 1
+    out, origin, pos = [], [], 0
+    for m in list(SKELETON_RE.finditer(text)) + [None]:
+        end = len(text) if m is None else m.start()
+        out.append(text[pos:end])
+        origin.extend(range(pos, end))
+        if m is not None:
+            pos = m.end()
+    joined, found, i = "".join(out), {}, 0
+    for part in joined.split("\n"):
+        if part:
+            lineno = bisect.bisect_right(starts, origin[i])
+            found.setdefault(lineno, []).append(part)
+        i += len(part) + 1
+    return found
+
+
+def lookalikes(line):
+    """Yield each script name on ``line`` with a non-ASCII letter where it has a letter (#6214)."""
+    for m in LOOSE_RE.finditer(rendered(line, fold_letters=False)):
+        if not m.group().isascii():
+            yield m.group()
 
 
 def tokens(line):
@@ -594,9 +668,18 @@ def check(root):
     used = set()
     for doc, lines in lines_by_doc:
         rel = doc.relative_to(root).as_posix()
+        joined = skeleton(lines)
         for lineno, line in enumerate(lines, 1):
-            found = list(tokens(line))
-            found += [t for t in tokens(rendered(line)) if t not in found]
+            views = [line] + joined.get(lineno, [])
+            for name in sorted({n for v in views for n in lookalikes(v)}):
+                problems.append(
+                    "%s:%d: look-alike script name `%s` (a non-ASCII letter or mark where a script"
+                    " name has an ASCII letter)" % (rel, lineno, name)
+                )
+            found = []
+            for view in views:
+                found += [t for t in tokens(view) if t not in found]
+                found += [t for t in tokens(rendered(view)) if t not in found]
             for cited, base, path in found:
                 if path_ok(root, path):
                     continue
