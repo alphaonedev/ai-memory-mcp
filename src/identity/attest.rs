@@ -1864,6 +1864,38 @@ mod tests {
         }
     }
 
+    /// #3618 — the asi-hard floor for `AI_MEMORY_REQUIRE_AGENT_ATTESTATION`
+    /// and the live store-path reader must be ONE grammar: every token the
+    /// floor accepts as compliant (boot reports `AlreadyCompliant` and does
+    /// not overwrite it) must engage attestation on EVERY surface, MCP and
+    /// CLI included. No token may yield compliant-but-off. Value-level only
+    /// (no process-env mutation in the parallel lib binary).
+    #[test]
+    fn asi_hard_floor_tokens_engage_attestation_on_every_surface_3618() {
+        use WriteSurface::{Cli, HttpDirect, Mcp};
+        let mut compliant = 0_usize;
+        for token in [
+            "1", "true", "TRUE", "True", "yes", "YES", "Yes", "on", "ON", " 1", "true ", "\ton\n",
+            "  yes  ", "banana", "", "0", "false", "no", "off", "2",
+        ] {
+            let meets_floor =
+                crate::security_profile::knob_meets_floor(ENV_REQUIRE_AGENT_ATTESTATION, token)
+                    .expect("REQUIRE_AGENT_ATTESTATION is an asi-hard pinned knob");
+            if meets_floor {
+                compliant += 1;
+                for surface in [HttpDirect, Mcp, Cli] {
+                    assert!(
+                        resolve_require_agent_attestation(Some(token), surface),
+                        "{token:?} meets the asi-hard floor, so it must require attestation \
+                         on {surface:?} (compliant-but-off)"
+                    );
+                }
+            }
+        }
+        // Every truthy spelling above (13) meets the floor; the cell is not vacuous.
+        assert_eq!(compliant, 13, "floor-compliant token count");
+    }
+
     #[test]
     fn prepare_signed_store_accepts_fresh_envelope() {
         use base64::Engine as _;

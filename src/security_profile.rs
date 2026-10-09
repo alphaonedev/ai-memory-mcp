@@ -788,6 +788,18 @@ pub fn runtime_boot_report() -> Result<(SecurityPosture, Vec<PinReport>)> {
     Ok((posture, reports))
 }
 
+/// Test-only lookup of a pinned knob's hard-floor predicate, so a reader's
+/// own test module can pin "floor == live reader" against the REAL `KNOBS`
+/// row rather than a re-derived grammar (#3618/#3619). `None` when `env` is
+/// not a pinned knob.
+#[cfg(test)]
+pub(crate) fn knob_meets_floor(env: &str, value: &str) -> Option<bool> {
+    KNOBS
+        .iter()
+        .find(|k| k.env == env)
+        .map(|k| (k.meets_floor)(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
