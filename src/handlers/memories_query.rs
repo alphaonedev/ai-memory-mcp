@@ -764,6 +764,24 @@ pub async fn forget_memories(
     )
     .map(|rows| rows.into_iter().map(|m| m.id).collect())
     .unwrap_or_default();
+    // #4281 (WP-ERASURE #6048, the #2446 residual) — the FULL matched id set
+    // for the federated erasure outbox, collected BEFORE the delete commits on
+    // the SAME connection under the SAME mutex (so the set cannot drift). The
+    // MCP `memory_forget` and CLI `forget` funnels already queue every
+    // forgotten id this way; the HTTP bulk verb erased locally and queued
+    // NOTHING, so a bulk GDPR erasure was honoured on this node only while
+    // every peer kept the rows. Resolved only when the deployment is
+    // drainable (one `stat`), so an unfederated daemon pays nothing. The
+    // `victim_ids` above ride the uncapped HNSW-eviction preview and are
+    // deliberately NOT reused: the outbox has its own cap + loud truncation
+    // report (`MAX_ERASURE_IDS_PER_CALL`).
+    let outbox_ids = crate::federation::erasure_outbox::collect_forget_ids(
+        &lock.0,
+        body.namespace.as_deref(),
+        body.pattern.as_deref(),
+        body.tier.as_ref(),
+        None,
+    );
     let forget_result = db::forget(
         &lock.0,
         body.namespace.as_deref(),
@@ -771,6 +789,16 @@ pub async fn forget_memories(
         body.tier.as_ref(),
         lock.3, // archive_on_gc
     );
+    // #4281 — queue the erasures for federated fan-out AFTER the local
+    // erasure committed (best-effort; never fails the forget, writes nothing
+    // when undrainable). Same connection, still under the DB mutex.
+    if forget_result.is_ok() {
+        crate::federation::erasure_outbox::enqueue_erasures(
+            &lock.0,
+            &outbox_ids,
+            crate::federation::erasure_outbox::surfaces::HTTP_FORGET,
+        );
+    }
     // Drop the DB lock BEFORE taking the vector-index lock (the locking
     // discipline pinned at handlers/memories.rs — never hold both).
     drop(lock);

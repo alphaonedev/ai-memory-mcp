@@ -168,6 +168,10 @@ pub mod surfaces {
     pub const CLI_DELETE: &str = "cli:delete";
     /// CLI `ai-memory forget`.
     pub const CLI_FORGET: &str = "cli:forget";
+    /// HTTP `POST /api/v1/forget` (#4281 — the bulk verb joins the outbox
+    /// the MCP / CLI forgets already use; the single-id HTTP delete fans
+    /// out synchronously via `broadcast_delete_quorum` instead).
+    pub const HTTP_FORGET: &str = "http:forget";
 }
 
 /// Build the canonical federated-deletion body for `memory_id`.
