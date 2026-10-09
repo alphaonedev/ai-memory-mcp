@@ -24,8 +24,10 @@
 
 use std::fs;
 use std::io;
+use std::os::fd::{FromRawFd as _, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -350,24 +352,25 @@ pub fn prepare_socket_path(path: &Path) -> Result<()> {
             path.display()
         );
     }
-    // A BLOCKING connect, deliberately: this runs once at start-up, before the
-    // listener exists, and the alternative — unlinking whatever is at the path —
-    // is how a mistyped socket path becomes data loss. The probe targets a local
-    // AF_UNIX socket, so it resolves immediately in both outcomes.
-    match std::os::unix::net::UnixStream::connect(path) {
-        Ok(_) => bail!(
+    match probe_socket_liveness(path) {
+        SocketLiveness::Live => bail!(
             "wake-hub: another wake-hub is already listening on {}. Refusing to \
              take over a live socket.",
             path.display()
         ),
-        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => fs::remove_file(path)
-            .with_context(|| {
-                format!(
-                    "wake-hub: could not remove the stale socket {}",
-                    path.display()
-                )
-            }),
-        Err(e) => Err(e).with_context(|| {
+        SocketLiveness::Busy => bail!(
+            "wake-hub: {} is held by a live listener whose accept queue is FULL (a \
+             wedged or paused hub). Refusing to take over a live socket; stop that \
+             process first.",
+            path.display()
+        ),
+        SocketLiveness::Stale => fs::remove_file(path).with_context(|| {
+            format!(
+                "wake-hub: could not remove the stale socket {}",
+                path.display()
+            )
+        }),
+        SocketLiveness::Unknown(e) => Err(e).with_context(|| {
             format!(
                 "wake-hub: {} is a socket but could not be probed; refusing to \
                  unlink a socket whose state is unknown",
@@ -375,6 +378,137 @@ pub fn prepare_socket_path(path: &Path) -> Result<()> {
             )
         }),
     }
+}
+
+/// What a single NON-BLOCKING connect says about the socket at a path.
+#[derive(Debug)]
+pub enum SocketLiveness {
+    /// A listener accepted the connection: a live hub owns the path.
+    Live,
+    /// A listener exists but its accept queue is full (`EAGAIN`): live, and
+    /// wedged or paused. Never takeover material.
+    Busy,
+    /// Nothing is bound to the path (`ECONNREFUSED`): the one DEFINITE-stale
+    /// outcome, and the only one that licenses an unlink.
+    Stale,
+    /// Anything else. Ambiguous, so it is treated as "do not unlink".
+    Unknown(io::Error),
+}
+
+/// Probe the socket at `path` with ONE non-blocking connect (#4057).
+///
+/// The probe used to be a BLOCKING `UnixStream::connect` on the premise that an
+/// `AF_UNIX` connect "resolves immediately in both outcomes". That is false on
+/// Linux: when the target is a live listener whose accept backlog is full, a
+/// blocking connect sleeps in `unix_wait_for_peer` until queue space appears —
+/// for a wedged hub, never — and this runs inside `WakeHub::bind`, before any
+/// serve loop or shutdown future exists, so `wake-hub` start-up hung with no
+/// program-level bound. A non-blocking socket cannot sleep there: the same
+/// condition returns `EAGAIN` at once. (Wrapping the blocking connect in an
+/// async timeout would not have helped — it cannot be cancelled.)
+///
+/// Only `ECONNREFUSED` is definite-stale. Every other outcome — accepted,
+/// queue-full, or any error — is live-or-unknown, and refuses takeover.
+///
+/// Known residual, tracked as #4120: on macOS/BSD a live listener with a FULL
+/// accept queue also answers `ECONNREFUSED`, so there a wedged hub is still
+/// indistinguishable from a stale socket by this probe alone.
+#[must_use]
+pub fn probe_socket_liveness(path: &Path) -> SocketLiveness {
+    // The connected stream drops at the end of the match arm: a probe that
+    // connected closes at once, exactly as the blocking probe did.
+    match connect_nonblocking(path) {
+        Ok(_connected) => SocketLiveness::Live,
+        Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => SocketLiveness::Stale,
+        // Linux reports a full accept queue on a non-blocking AF_UNIX connect
+        // as EAGAIN. EINPROGRESS cannot occur for AF_UNIX on Linux, but if a
+        // platform ever returns it, a connect in flight is a listener.
+        Err(e)
+            if e.kind() == io::ErrorKind::WouldBlock
+                || e.raw_os_error() == Some(libc::EINPROGRESS) =>
+        {
+            SocketLiveness::Busy
+        }
+        Err(e) => SocketLiveness::Unknown(e),
+    }
+}
+
+/// Connect to the `AF_UNIX` stream socket at `path` WITHOUT ever blocking.
+///
+/// `std`'s `UnixStream::connect` cannot be made non-blocking before the
+/// connect, so the socket is created raw and the connect issued on it after
+/// `set_nonblocking(true)` — the same raw-`libc` shape this file already uses
+/// for `getsockopt(SO_PEERCRED)` and `src/identity/key_inventory.rs` uses for
+/// `openat(O_NOFOLLOW)`. No new dependency. The returned stream is a
+/// connected, non-blocking socket the caller owns; it closes on drop.
+///
+/// # Errors
+///
+/// The `connect(2)` error, untouched, so the caller can classify it; or
+/// `InvalidInput` for a path `sockaddr_un` cannot carry.
+pub fn connect_nonblocking(path: &Path) -> io::Result<UnixStream> {
+    let (addr, len) = unix_sockaddr(path)?;
+    // SAFETY: a plain syscall with constant arguments; the descriptor it
+    // returns is checked below and then owned by `OwnedFd`, which closes it on
+    // every return path.
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | SOCK_CLOEXEC_FLAG, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `raw` is a freshly created descriptor nothing else owns.
+    let stream = UnixStream::from(unsafe { OwnedFd::from_raw_fd(raw) });
+    stream.set_nonblocking(true)?;
+    // SAFETY: `addr` is a fully initialised `sockaddr_un` that outlives the
+    // call, and `len` is the number of its bytes in use.
+    let rc = unsafe {
+        libc::connect(
+            stream.as_raw_fd(),
+            (&raw const addr).cast::<libc::sockaddr>(),
+            len,
+        )
+    };
+    if rc == 0 {
+        Ok(stream)
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// `SOCK_CLOEXEC` where the platform offers it on `socket(2)`; the probe
+/// socket lives for microseconds, so elsewhere a plain socket is fine.
+#[cfg(target_os = "linux")]
+const SOCK_CLOEXEC_FLAG: libc::c_int = libc::SOCK_CLOEXEC;
+#[cfg(not(target_os = "linux"))]
+const SOCK_CLOEXEC_FLAG: libc::c_int = 0;
+
+/// A `sockaddr_un` for `path`, plus the number of its bytes in use.
+fn unix_sockaddr(path: &Path) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: `sockaddr_un` is a plain C struct; all-zero bytes is a valid
+    // value for every field.
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::sa_family_t::try_from(libc::AF_UNIX)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "AF_UNIX out of range"))?;
+    if bytes.is_empty() || bytes.len() >= addr.sun_path.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path is empty or too long for sockaddr_un",
+        ));
+    }
+    if bytes.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path contains a NUL byte",
+        ));
+    }
+    for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+        *dst = libc::c_char::from_ne_bytes([*src]);
+    }
+    let used = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
+    let len = libc::socklen_t::try_from(used)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "socket path too long"))?;
+    Ok((addr, len))
 }
 
 /// Create the parent directory 0700, or verify an existing one.
