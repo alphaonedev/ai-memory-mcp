@@ -217,7 +217,7 @@ before `CREATE EXTENSION`:
 - **Secrets.** The tier password goes to psql through `PGPASSWORD`; the URL on
   psql's argv carries no password, and neither form is printed. Only the
   password is moved off argv: allowed path- and name-valued keys (`sslrootcert`,
-  `sslcert`, `sslkey`, `sslcrl`, `sslcrldir`, `passfile`, `service`,
+  `sslcert`, `sslkey`, `sslcrl`, `sslcrldir`, `passfile`,
   `krbsrvname`, `requirepeer`) stay in the URL on psql's argv. The URL is refused
   with exit 2 and one stderr line (no value printed) when it does not start with
   the exact lowercase `postgres://` or `postgresql://`; holds a control
@@ -239,7 +239,9 @@ before `CREATE EXTENSION`:
   `scram_client_key`, `scram_server_key`, which libpq cannot take from the
   environment) and keys that change the auth mechanism or session mode
   (`gsslib`, `gssdelegation`, `replication`, `oauth_issuer`, `oauth_client_id`,
-  `oauth_scope`) are refused by name; `ssl=true` is a JDBC alias, use `sslmode`.
+  `oauth_scope`) are refused by name, as is `service` (#6345: libpq reads a
+  `pg_service.conf` entry before `PGPASSWORD`, so its password would beat the
+  moved one; psql also runs without `PGSERVICE`/`PGSERVICEFILE`); `ssl=true` is a JDBC alias, use `sslmode`.
   A refusal names a key only when it is a known libpq keyword (an unlisted key
   can be the tail of a password that held a raw `&`), never a value. psql runs
   with `PGCONNECT_TIMEOUT=15` and a 60 s limit; SIGTERM/SIGINT stop the psql
