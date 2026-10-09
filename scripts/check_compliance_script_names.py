@@ -80,6 +80,9 @@ SUCCESSOR_RE = re.compile(r"`scripts/([A-Za-z0-9_./-]+\.(?:sh|py))`")
 ALLOW_REL = "scripts/qc-allowlists/compliance-script-names-allow.txt"
 # A CommonMark fence line: up to three spaces, then three or more backticks or tildes (#6215).
 FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
+# Fence info strings GitHub renders as a diagram or figure, never as text: the body (mermaid
+# '%%' comments included) is not reader-visible (#6196).
+DIAGRAM_FENCES = frozenset({"mermaid", "math", "geojson", "topojson", "stl"})
 ENTRY_RE = re.compile(
     r"^(docs/compliance/\S+\.md):(check[-_][A-Za-z0-9_-]+\.(?:sh|py))(:pinned)?$"
 )
@@ -293,8 +296,10 @@ def visible_lines(lines):
 
     An erratum exists to tell a reader the text names a removed script, so only text a
     rendered document shows can carry one. Removed: HTML comment text (``<!-- ... -->``, also
-    across lines) and fence marker lines. Inside a fenced block or a code span ``<!--`` is
-    literal and opens nothing (#6215). Stale names are still found in all of this text.
+    across lines), fence marker lines, and the body of a diagram fence (``mermaid`` with its
+    ``%%`` comments, ``math``, ``geojson``, ``topojson``, ``stl``). Inside a fenced block or a
+    code span ``<!--`` is literal and opens nothing (#6215). Stale names are still found in all
+    of this text.
     """
     out, inside, fence = [], False, None
     for line in lines:
@@ -304,10 +309,11 @@ def visible_lines(lines):
                 fence = None
                 out.append("")
             else:
-                out.append(line)
+                out.append("" if fence[2] else line)
             continue
         if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
-            fence = (m.group(1)[0], len(m.group(1)))
+            info = (m.group(2).split() or [""])[0].lower()
+            fence = (m.group(1)[0], len(m.group(1)), info in DIAGRAM_FENCES)
             out.append("")
             continue
         shown, inside = comment_text_removed(line, inside)
