@@ -32,9 +32,10 @@ Fail closed (exit 2, ``::error::`` on stderr) when:
 * the three sets are not disjoint, or their union is not every executable
   (re-read from the files that were written, so a writer bug is caught too);
 * the build output has no test executable at all;
-* the lib is present but ``lib_pg_prefixes.txt`` is empty or a src file reads
-  ``AI_MEMORY_TEST_POSTGRES_URL`` from a module no prefix covers (a new lib
-  Postgres test would otherwise run in a parallel shard against the shared
+* the lib is present but ``lib_pg_prefixes.txt`` is empty or a lib code site
+  names ``AI_MEMORY_TEST_POSTGRES_URL`` (directly, in a string, or through a
+  const/static whose value holds it) at a test path no prefix occurs in (a new
+  lib Postgres test would otherwise run in a parallel shard against the shared
   database);
 * a target name contains a character outside ``[A-Za-z0-9_.-]`` (the shell
   consumer word-splits the lines).
@@ -640,22 +641,81 @@ def module_path_of(src_file, src_root):
     return '::'.join(parts)
 
 
+def lib_units(src_root):
+    """(RustFile, module path) for every lib source file.
+
+    Files reached from ``src/lib.rs`` carry their real module path, including
+    ``#[path]`` and ``include!`` targets. Any other ``.rs`` under ``src/`` that
+    the ``src/main.rs`` tree does not claim falls back to its file path
+    (``store/postgres.rs`` -> ``store::postgres``), so nothing is unscanned.
+    """
+    root = Path(src_root)
+    cache, units, claimed = {}, [], set()
+    if (root / 'lib.rs').is_file():
+        units, _ = walk_crate(root / 'lib.rs', cache=cache)
+        claimed = {os.path.normpath(str(rf.path)) for rf, _ in units}
+    if (root / 'main.rs').is_file():
+        claimed |= {os.path.normpath(str(rf.path)) for rf, _ in walk_crate(root / 'main.rs', cache=cache)[0]}
+    for f in sorted(root.rglob('*.rs')):
+        if f.name in ('lib.rs', 'main.rs') or os.path.normpath(str(f)) in claimed:
+            continue
+        rf = _read(f, cache)
+        if rf is not None:
+            units.append((rf, module_path_of(f, root)))
+    return units
+
+
+def lib_pg_sites(src_root):
+    """Every lib code site that names the Postgres test URL.
+
+    A site is an ``AI_MEMORY_TEST_POSTGRES_URL`` token in code or a string
+    literal (comments do not count: they cannot read the environment), or any
+    use of a const/static whose value contains it (``env::var(PG_URL_ENV)``).
+    Yields (test path, file:line): the path of the enclosing ``#[test]`` fn
+    when there is one, else the enclosing module (a helper fn can be called by
+    any test in that module, so the whole module must be covered).
+    """
+    units = lib_units(src_root)
+    consts = set()
+    for rf, _ in units:
+        consts.update(m.group(1) for m in PG_CONST_RE.finditer(rf.code))
+    const_re = re.compile(r'\b(%s)\b' % '|'.join(map(re.escape, sorted(consts)))) if consts else None
+    out = []
+    for rf, modp in units:
+        pos = [m.start() for m in PG_TOKEN_RE.finditer(rf.code)]
+        if const_re is not None:
+            pos += [m.start() for m in const_re.finditer(rf.code)]
+        if not pos:
+            continue
+        for at, ctx in zip(pos, rf.contexts(pos)):
+            parts = [modp] if modp else []
+            test_fn = None
+            for kind, name, is_test in ctx:
+                if kind == 'mod' and test_fn is None:
+                    parts.append(name)
+                elif kind == 'fn' and is_test and test_fn is None:
+                    test_fn = name
+            if test_fn:
+                parts.append(test_fn)
+            line = rf.code.count('\n', 0, at) + 1
+            out.append(('::'.join(parts), '%s:%d' % (rf.path, line)))
+    return out
+
+
 def uncovered_lib_pg_modules(src_root, prefixes):
-    """Lib modules that read the Postgres test URL but match no prefix."""
-    missing = []
-    for f in sorted(Path(src_root).rglob('*.rs')):
-        if f.name in ('lib.rs', 'main.rs'):
-            continue
-        try:
-            text = f.read_text(errors='replace')
-        except OSError:
-            continue
-        if not PG_ENV_READ_RE.search(text):
-            continue
-        mod = module_path_of(f, Path(src_root))
-        if not any(p in mod or p.startswith(mod) for p in prefixes):
-            missing.append(mod)
-    return missing
+    """Lib test paths that name the Postgres test URL but that no prefix selects.
+
+    libtest's filter is a substring match on the full test path, and the same
+    prefixes are a positional filter in the serial shard and ``--skip`` in the
+    parallel one, so a site at path T is covered iff some prefix p occurs in T.
+    (r0 also accepted ``p.startswith(T)``: one test's prefix "covered" its whole
+    module, and ``store::postgres`` "covered" ``store``. #6344 review r1 B2.)
+    """
+    missing = set()
+    for path, _where in lib_pg_sites(src_root):
+        if not any(p in path for p in prefixes):
+            missing.add(path or '<crate root>')
+    return sorted(missing)
 
 
 def load_prefixes(path):
