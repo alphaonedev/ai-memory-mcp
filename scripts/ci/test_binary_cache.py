@@ -14,6 +14,8 @@ Stacked on scripts/ci/partition_test_binaries.py (#6344). Three sub-commands:
 ``record``  After a FULLY green test step (exit code 0) of a run whose policy
             allows recording (a push to ``release/**``, which never skips),
             write the plan's keys with result ``pass`` into the manifest.
+            After a red step of such a run (r2 L3), remove every entry whose
+            key equals one of the plan's keys instead.
 
 The key (see ``build_key``) is sha256 over: the sorted (repo-relative path,
 sha256) of every file in the executable's own cargo dep-info ``<exe>.d``; the
@@ -1275,10 +1277,12 @@ def sweep_manifest_dir(manifest_dir, keep, wall_now=None):
 
 
 def run_record(args, now=None):
+    """Write the plan's keys after a green step; after a red step of a run
+    that may write (r2 L3), remove every entry whose key equals one of the
+    plan's keys instead, since any of those binaries may be the one that
+    failed. A run that may not write never touches the manifest."""
     now = time.time() if now is None else now
-    if args.rc != 0:
-        print('::notice::[%s] test-binary cache not recorded: step exit code %s is not 0' % (ISSUE, args.rc))
-        return 0
+    red = args.rc != 0
     try:
         plan = json.loads((Path(args.shard_dir) / 'cache_plan.json').read_text())
     except (OSError, ValueError) as exc:
@@ -1293,6 +1297,8 @@ def run_record(args, now=None):
         print('::notice::[%s] test-binary cache not recorded: this run may not write the manifest (%s)'
               % (ISSUE, plan.get('reason')))
         return 0
+    if red:
+        return _invalidate(args, plan, now)
     tier, base, node = plan['tier'], plan['base'], plan['node']
     repo_root = getattr(args, 'repo_root', '.') or '.'
     try:
@@ -1329,6 +1335,35 @@ def run_record(args, now=None):
     return 0
 
 
+def _invalidate(args, plan, now):
+    """r2 L3: drop the manifest entries whose key is one of this red run's
+    plan keys. Entries with other keys stay (they were green for other
+    inputs). Writes nothing when nothing matches."""
+    tier, base, node = plan['tier'], plan['base'], plan['node']
+    repo_root = getattr(args, 'repo_root', '.') or '.'
+    keys = {k for k in plan['keys'].values() if k}
+    try:
+        mdir = check_manifest_dir(resolve_manifest_dir(args.manifest_dir, dict(os.environ), repo_root), repo_root)
+        mpath = manifest_path(mdir, node, tier, base)
+        lock = _Lock(str(mpath) + '.lock').__enter__()
+    except CacheError as exc:
+        print('::warning::[%s] test-binary cache not invalidated after exit code %s: %s' % (ISSUE, args.rc, exc))
+        return 0
+    try:
+        prior, _ = load_manifest(mpath, tier, base, now)
+        entries = {n: e for n, e in prior.items() if e.get('key') not in keys}
+        removed = len(prior) - len(entries)
+        if removed:
+            doc = {'schema': SCHEMA, 'tier': tier, 'base': base, 'node': node, 'updated_at': now,
+                   'updated_run_id': args.run_id, 'entries': entries}
+            atomic_write(mpath, json.dumps(doc, indent=1, sort_keys=True) + '\n')
+    finally:
+        lock.__exit__(None, None, None)
+    print('::notice::[%s] test-binary cache not recorded: step exit code %s is not 0; invalidated %d entries '
+          'with this run\'s keys (%d left in %s)' % (ISSUE, args.rc, removed, len(entries), mpath.name))
+    return 0
+
+
 # ------------------------------------------------------------------- cli ----
 
 def build_parser():
@@ -1361,7 +1396,7 @@ def build_parser():
     rs = sub.add_parser('restore', help='put the full shard lists back after a failed plan')
     rs.add_argument('--shard-dir', required=True)
     rc = sub.add_parser('record', parents=[common])
-    rc.add_argument('--rc', type=int, required=True, help='exit code of the test step; must be 0')
+    rc.add_argument('--rc', type=int, required=True, help='exit code of the test step: 0 records, anything else invalidates (r2 L3)')
     rc.add_argument('--repo-root', default='.')
     return ap
 

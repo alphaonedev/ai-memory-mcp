@@ -147,8 +147,11 @@ tests always run. If `plan` fails or is killed, `restore` puts the
 
 **Record.** After all three shards of a `release/**` push exit 0, `record`
 writes every computed key with result `pass` and that run's `run_id` and
-`sha`. A binary without a computable key loses its old entry. A failed or
-partial run records nothing.
+`sha`. A binary without a computable key loses its old entry. A red
+`release/**` push records nothing and removes every entry whose key equals
+one of its own plan keys, because the step exit code does not say which of
+those binaries failed; entries with other keys stay. A pull request, red or
+green, never changes the manifest.
 
 **Safety rules (enforced in the script).**
 
