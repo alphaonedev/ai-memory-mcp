@@ -4151,5 +4151,54 @@ class WorkflowCommandEscaping6243(unittest.TestCase):
         self.assertIn("\n", "".join(lines))  # the mutant leaks the raw newline; the live module does not
 
 
+# ---- Round 4: cloud round-2 F3 (operator pin), F6 (key-shape), F7 (carrier id), F8 (header comment) ----
+
+
+class CloudR2ApprovalPins(unittest.TestCase):
+    def setUp(self) -> None:
+        self.c8 = C8_WORKFLOW.read_text(encoding="utf-8")
+
+    def mutated_job(self, old: str, new: str) -> List[str]:
+        job = _job_text(self.c8, APPROVAL_JOB)
+        self.assertEqual(1, job.count(old), f"mutation anchor {old!r}")
+        return _approval_job_problems(self.c8.replace(job, job.replace(old, new, 1), 1))
+
+    def test_cloud_r2_f3_operator_login_is_pinned(self) -> None:
+        self.assertEqual([], _approval_job_problems(self.c8))
+        self.assertTrue(self.mutated_job("OPERATOR_LOGIN: alphaonedev\n", "OPERATOR_LOGIN: mallory\n"))
+        self.assertTrue(self.mutated_job("          OPERATOR_LOGIN: alphaonedev\n", ""))
+
+    def test_cloud_r2_f6_spaced_and_quoted_step_keys_are_neutralisers(self) -> None:
+        anchor = "      - name: Evaluate external-PR approval requirement\n"
+        for extra in ("        if : github.event_name == 'pull_request'\n",
+                      '        "if": github.event_name == \'pull_request\'\n',
+                      "        'continue-on-error' : true\n",
+                      "        continue-on-error : true\n"):
+            with self.subTest(extra=extra):
+                self.assertTrue(self.mutated_job(anchor, anchor + extra), extra)
+
+    def test_cloud_r2_f8_header_comment_matches_the_per_event_behaviour(self) -> None:
+        job_start = self.c8.index(f"\n  {APPROVAL_JOB}:\n")
+        header = self.c8[self.c8.rindex("\n\n", 0, job_start):job_start]
+        self.assertNotIn("A push or merge_group run", header)
+        self.assertIn("named by the queue ref", header)
+        self.assertIn("head_sha", header)
+
+
+class CarrierIdPinned6117(unittest.TestCase):
+    """Cloud r2 F7: every carrier step keeps ``id: carrier`` so ``steps.carrier.outputs`` resolves."""
+
+    def test_cloud_r2_f7_renamed_carrier_id_is_killed(self) -> None:
+        ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+        cov = (WORKFLOWS / "coverage.yml").read_text(encoding="utf-8")
+        c8 = C8_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual([], _carrier_consumption_problems(ci, cov, c8))
+        self.assertEqual(4, c8.count("        id: carrier\n"))
+        mutant = c8.replace("        id: carrier\n", "        id: carrier0\n")
+        self.assertTrue(_carrier_consumption_problems(ci, cov, mutant))
+        one = c8.replace("        id: carrier\n", "        id: carrier0\n", 1)
+        self.assertTrue(_carrier_consumption_problems(ci, cov, one))
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
