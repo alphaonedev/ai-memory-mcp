@@ -141,13 +141,20 @@ PROVIDER_KEY_SHAPE = re.compile(r"\b(gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za
                                 r"xox[abposr]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{20,}|"
                                 # #6211: GitLab personal access, Google API and npm tokens carry no name either.
                                 r"glpat-[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{35,}|npm_[A-Za-z0-9]{36,})\b")
-# #6211: a JSON Web Token (header.payload.signature, both JSON parts base64url `{"` = `eyJ`).
-JWT_SHAPE = re.compile(r"\b(eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})")
+# #6211: a JSON Web Token (header.payload.signature); round 4 (code F4): only the header is known to be base64url JSON
+# (`{"` = `eyJ`), so the payload and signature are any base64url runs of 8 or more characters.
+JWT_SHAPE = re.compile(r"\b(eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b")
 # A PEM or PGP private key block; #6211: a PuTTY private key file runs from its header to its Private-MAC line.
 PRIVATE_KEY_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|PuTTY-User-Key-File-\d+:")
 PRIVATE_KEY_END = re.compile(r"-----END [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----|Private-MAC:")
 # #6211: a credential name with no value on its line (`api_key:`); the value is on the next line that is not blank.
 NAME_ONLY = re.compile(r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")(?:[*_]{1,2}|[\"'`])?\s*[:=]\s*(?:[*_]{1,2})?\s*$")
+# #6211 round 4 (security F1): a YAML block scalar under a credential name (`private_key: |`, `secret: >-`); every
+# following line more indented than the name line is the value. BLOCK_INDICATOR is the indicator alone, which
+# mask_named_values leaves visible.
+BLOCK_INDICATOR = re.compile(r"[|>][+-]?[1-9]?[+-]?")
+BLOCK_NAME = re.compile(r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")(?:[*_]{1,2}|[\"'`])?\s*:\s*"
+                        + BLOCK_INDICATOR.pattern + r"\s*$")
 # A next line that is a heading, a table row or a nested `key:` of its own is structure, not the value.
 STRUCTURE_LINE = re.compile(r"(?:#|\||[\w-]+:(?:\s|$))")
 MASK = "[MASKED]"
@@ -339,8 +346,11 @@ def mask_named_values(line: str) -> tuple:
         group = next(index for index in (3, 4, 5, 6) if match.group(index) is not None)
         value = match.group(group)
         first = value.split()[0] if value.split() else ""
-        if plain_text(match.group(1), value) if group == 6 else not value.strip() or plain_word(match.group(1),
-                                                                                              value.strip()):
+        if group == 6:
+            plain = plain_text(match.group(1), value) or BLOCK_INDICATOR.fullmatch(value) is not None
+        else:
+            plain = not value.strip() or plain_word(match.group(1), value.strip())
+        if plain:
             stop = match.start(group) + (len(first) if group == 6 else len(value) + 1)
             out.append(line[pos:stop])
             pos = stop
@@ -358,6 +368,45 @@ def mask_group(pattern, line: str) -> tuple:
         start, stop = match.span(1)
         return match.group(0)[:start - match.start()] + MASK + match.group(0)[stop - match.start():]
     return pattern.subn(replace, line)
+
+
+def indent_width(line: str) -> int:
+    """The number of leading spaces and tabs of `line`."""
+    return len(line) - len(line.lstrip(" \t"))
+
+
+def value_line_indexes(lines: list, key_indexes=frozenset()) -> set:
+    """#6211 round 4 (security F1, code F1): the indexes of `lines`, ONE side of a diff, that hold the value of a
+    credential name with no value on its own line: the first non-blank line after a bare `name:` unless it is
+    structure (STRUCTURE_LINE) or a prose_cell, and every line of a YAML block scalar under
+    `name: |` / `name: >-` that is more indented than the name line (blank lines inside the block are skipped). A line
+    in `key_indexes` (a private key block, masked anyway) ends the wait. Computed per side, so a value changed under
+    an unchanged name line is found on the old side for its `-` row and on the head side for its `+` row."""
+    inside, pending, block = set(), None, None
+    for index, line in enumerate(lines):
+        content = line.strip()
+        if index in key_indexes:
+            pending = block = None
+            continue
+        if block is not None:
+            if not content:
+                continue
+            if indent_width(line) > block:
+                inside.add(index)
+                continue
+            block = None
+        if pending is not None and content:
+            name, pending = pending, None
+            if not (STRUCTURE_LINE.match(content) or prose_cell(name, content)):
+                inside.add(index)
+                continue
+        if BLOCK_NAME.search(line):
+            pending, block = None, indent_width(line)
+            continue
+        name_only = NAME_ONLY.search(line)
+        if name_only is not None:
+            pending = name_only.group(1)
+    return inside
 
 
 def key_line_indexes(lines: list, in_key: bool = False) -> set:
@@ -381,33 +430,23 @@ class Redactor:
 
     def mask_rows(self, rows: list, prefixed: bool = False) -> list:
         """Mask `rows` of (text, kind): kind "meta" is a diff header line the script writes (shown as is), "key" is a
-        line inside a private key block (masked whole, its diff prefix kept), "text" is masked shape by shape.
-        `prefixed`: every non-meta row starts with a one-character diff prefix. #6211: the first non-blank text row
-        after a credential name with no value (`api_key:`) is masked unless it is structure (STRUCTURE_LINE) or a
-        prose_cell; a meta or key row ends the wait."""
-        out, pending = [], None
+        line inside a private key block (masked whole, its diff prefix kept), "value" is the value of a bare credential
+        name on its own side (value_line_indexes; masked whole, its diff prefix and indentation kept), "text" is
+        masked shape by shape. `prefixed`: every non-meta row starts with a one-character diff prefix."""
+        out = []
         for line, kind in rows:
             if kind == "meta":
                 out.append(line)
-                pending = None
                 continue
             if kind == "key":
                 self.count += 1
                 out.append(line[:1] + MASK if line[:1] in "+- " else MASK)
-                pending = None
                 continue
-            body = line[1:] if prefixed else line
-            content = body.strip()
-            if pending is not None and content:
-                if not (STRUCTURE_LINE.match(content) or prose_cell(pending, content)):
-                    self.count += 1
-                    out.append(line[:len(line) - len(body.lstrip())] + MASK)
-                    pending = None
-                    continue
-                pending = None
-            name_only = NAME_ONLY.search(line)
-            if name_only is not None:
-                pending = name_only.group(1)
+            if kind == "value":
+                body = line[1:] if prefixed else line
+                self.count += 1
+                out.append(line[:len(line) - len(body.lstrip())] + MASK)
+                continue
             line, found = mask_named_values(line)
             self.count += found
             line, found = mask_table_cells(line)
@@ -422,7 +461,8 @@ class Redactor:
         """Mask `text`; `in_key` starts the block inside a private key (a section whose heading is a BEGIN line)."""
         lines = text.split("\n")
         inside = key_line_indexes(lines, in_key)
-        return "\n".join(self.mask_rows([(line, "key" if index in inside else "text")
+        values = value_line_indexes(lines, inside)
+        return "\n".join(self.mask_rows([(line, "key" if index in inside else "value" if index in values else "text")
                                          for index, line in enumerate(lines)]))
 
     def note(self) -> list:
@@ -448,6 +488,15 @@ def unified(old: str, new: str, key: str, redactor=None) -> str:
     old_lines, new_lines = old.split("\n"), new.split("\n")
     heading_key = bool(PRIVATE_KEY_BEGIN.search(key)) and not PRIVATE_KEY_END.search(key)
     old_key, new_key = key_line_indexes(old_lines, heading_key), key_line_indexes(new_lines, heading_key)
+    old_value, new_value = value_line_indexes(old_lines, old_key), value_line_indexes(new_lines, new_key)
+
+    def kind(old_index, new_index):
+        """The row kind of a line at `old_index` on the base side and/or `new_index` on the head side (None when the
+        row is not on that side); a context line counts as a key or value line when it is one on either side."""
+        if old_index in old_key or new_index in new_key:
+            return "key"
+        return "value" if old_index in old_value or new_index in new_value else "text"
+
     rows = []
     for group in difflib.SequenceMatcher(None, old_lines, new_lines).get_grouped_opcodes(2):
         if not rows:
@@ -456,13 +505,11 @@ def unified(old: str, new: str, key: str, redactor=None) -> str:
                      f"+{unified_range(group[0][3], group[-1][4])} @@", "meta"))
         for tag, old_start, old_stop, new_start, new_stop in group:
             if tag == "equal":
-                rows += [(" " + old_lines[index], "key" if index in old_key or new_index in new_key else "text")
+                rows += [(" " + old_lines[index], kind(index, new_index))
                          for index, new_index in zip(range(old_start, old_stop), range(new_start, new_stop))]
                 continue
-            rows += [("-" + old_lines[index], "key" if index in old_key else "text")
-                     for index in range(old_start, old_stop)]
-            rows += [("+" + new_lines[index], "key" if index in new_key else "text")
-                     for index in range(new_start, new_stop)]
+            rows += [("-" + old_lines[index], kind(index, None)) for index in range(old_start, old_stop)]
+            rows += [("+" + new_lines[index], kind(None, index)) for index in range(new_start, new_stop)]
     truncated = len(rows) > DIFF_LINE_CAP
     rows = rows[:DIFF_LINE_CAP]
     lines = redactor.mask_rows(rows, True) if redactor is not None else [line for line, _kind in rows]
