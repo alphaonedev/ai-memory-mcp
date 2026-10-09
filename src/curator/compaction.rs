@@ -183,6 +183,12 @@ pub(crate) struct ConsolidationPass<'a> {
     /// (the process-global enforce gate); tests override it via
     /// [`Self::with_pre_compaction_gate`].
     pub(crate) pre_compaction_gate: PreCompactionGate,
+    /// #3170 — the cycle's REMAINING share of `max_ops_per_cycle`. One
+    /// `summarize_memories` LLM call is one op; clusters past the budget are
+    /// deferred (counted in [`ConsolidationRunReport::operations_skipped_cap`]),
+    /// never dropped. Defaults to unbounded; the curator threads the real
+    /// remainder via [`Self::with_llm_op_budget`].
+    pub(crate) llm_op_budget: usize,
 }
 
 /// Structured outcome of one [`ConsolidationPass::run`] sweep.
@@ -217,6 +223,14 @@ pub(crate) struct ConsolidationRunReport {
     /// hook (or declared it a `required_event` with none configured) and the
     /// curator boot installed the process-global enforce gate.
     pub(crate) clusters_denied_by_hook: usize,
+    /// #3170 — LLM-invoking operations (`summarize_memories` calls) this sweep
+    /// spent; the curator charges them against the cycle budget.
+    pub(crate) operations_attempted: usize,
+    /// #3170 — eligible clusters deferred because the op budget was spent.
+    pub(crate) operations_skipped_cap: usize,
+    /// #3170 — a rollback write-ahead failed this sweep. The curator folds it
+    /// into the cycle's `rollback_log_degraded` flag (the #3116 contract).
+    pub(crate) rollback_write_ahead_failed: bool,
     /// Per-cluster errors (summarise / persist / verify). Best-effort: one
     /// cluster failing does not abort the sweep.
     pub(crate) errors: Vec<String>,
@@ -238,7 +252,15 @@ impl<'a> ConsolidationPass<'a> {
             dry_run,
             cosine_threshold: super::cluster::DEFAULT_COSINE_THRESHOLD,
             pre_compaction_gate: production_pre_compaction_gate(),
+            llm_op_budget: usize::MAX,
         }
+    }
+
+    /// #3170 — cap the sweep's LLM calls at the cycle's remaining budget.
+    #[must_use]
+    pub(crate) fn with_llm_op_budget(mut self, llm_op_budget: usize) -> Self {
+        self.llm_op_budget = llm_op_budget;
+        self
     }
 
     /// #2637 — override the `PreCompaction` gate (test-only). Lets a unit test
@@ -645,6 +667,13 @@ impl<'a> ConsolidationPass<'a> {
                 continue;
             }
 
+            // #3170 — op-budget gate: one `summarize_memories` call per
+            // cluster. A cluster past the budget resurfaces next cycle.
+            if report.operations_attempted >= self.llm_op_budget {
+                report.operations_skipped_cap = report.operations_skipped_cap.saturating_add(1);
+                continue;
+            }
+            report.operations_attempted = report.operations_attempted.saturating_add(1);
             let summary = match self.summarize(&members) {
                 Ok(s) => s,
                 Err(e) => {
@@ -663,6 +692,7 @@ impl<'a> ConsolidationPass<'a> {
                     id
                 }
                 Err(e) => {
+                    report.rollback_write_ahead_failed = true;
                     report.errors.push(format!(
                         "{}: {}: {e}",
                         self.name(),
