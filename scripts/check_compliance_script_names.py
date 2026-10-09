@@ -35,12 +35,20 @@ cannot carry an erratum, ``v1.0.0-DECLARATION.md`` (SHA-256 pinned) and
 entry for any other document is a violation, and so is a ``:pinned`` entry for
 a document that carries its own erratum for that name ("unnecessary :pinned").
 
+Scan set (#6169, #6197): every ``*.md`` file under ``docs/compliance/``, extension
+matched in any case. A directory that cannot be listed, an unreadable document or
+allowlist, or a missing ``docs/compliance/`` exits 2; nothing is skipped silently.
+Symlinked directories (``docs/compliance/`` itself included) are refused, never
+followed, and a document symlink that resolves outside the repository is refused;
+both are violations. A document symlink inside the repository is scanned.
+
 Usage:
     python3 -I scripts/check_compliance_script_names.py [--root DIR]
     python3 -I scripts/check_compliance_script_names.py --self-test
 
 Exit codes: 0 green, 1 violation(s) found, 2 usage error, self-test failure,
-or an unreadable (non-UTF-8 / I/O error) compliance document or allowlist.
+or an unreadable (non-UTF-8 / I/O error) compliance document, directory or
+allowlist.
 """
 
 import argparse
@@ -105,8 +113,52 @@ def successor_ok(root, succ):
     return True
 
 
+def rel_path(root, path):
+    """``path`` relative to ``root`` for messages; the raw path when it is not under ``root``."""
+    try:
+        return Path(path).relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
+
+
 def compliance_docs(root):
-    return sorted((root / "docs" / "compliance").rglob("*.md"))
+    """Return (docs, problems) for the scan set: every ``*.md`` (any case) under docs/compliance/.
+
+    The walk never skips silently (#6169, #6197). A directory that cannot be listed, or a missing
+    docs/compliance/, raises Unreadable (exit 2). Symlinked directories, docs/compliance/ itself
+    included, are refused and never followed: following one would scan documents outside the
+    reviewed tree and admit cycles, and a git checkout of this tree contains none. A symlinked
+    document is read only when it resolves inside the repository; one that leaves it is refused.
+    """
+    top = root / "docs" / "compliance"
+    if os.path.islink(str(top)):
+        return [], ["%s: symlinked directory refused (not scanned)" % rel_path(root, top)]
+
+    def unlistable(err):
+        raise Unreadable(rel_path(root, err.filename if err.filename else top))
+
+    docs, problems = [], []
+    real_root = root.resolve()
+    for dirpath, dirnames, filenames in os.walk(str(top), onerror=unlistable):
+        for name in dirnames:
+            if os.path.islink(os.path.join(dirpath, name)):
+                problems.append(
+                    "%s: symlinked directory refused (not scanned)" % rel_path(root, Path(dirpath) / name)
+                )
+        for name in filenames:
+            if not name.lower().endswith(".md"):
+                continue
+            path = Path(dirpath) / name
+            if path.is_symlink():
+                try:
+                    path.resolve().relative_to(real_root)
+                except (OSError, RuntimeError, ValueError):
+                    problems.append(
+                        "%s: document symlink resolves outside the repository (refused)" % rel_path(root, path)
+                    )
+                    continue
+            docs.append(path)
+    return sorted(docs), problems
 
 
 def collect_errata(root, docs):
@@ -131,7 +183,11 @@ def collect_errata(root, docs):
 def load_allowlist(root):
     """Return ({(doc, stale-name): pinned}, list of malformed/duplicate-line problems)."""
     path = root / ALLOW_REL
-    if not path.is_file():
+    try:
+        present = path.is_file()
+    except OSError:
+        raise Unreadable(ALLOW_REL)
+    if not present:
         return {}, []
     pairs, problems = {}, []
     for lineno, raw in enumerate(read_text(root, path).splitlines(), 1):
@@ -157,9 +213,10 @@ def load_allowlist(root):
 
 def check(root):
     """Return a list of violation strings for the tree at ``root``."""
-    docs = compliance_docs(root)
+    docs, problems = compliance_docs(root)
     errata, per_doc = collect_errata(root, docs)
-    allowed, problems = load_allowlist(root)
+    allowed, ledger_problems = load_allowlist(root)
+    problems.extend(ledger_problems)
     used = set()
     for doc in docs:
         rel = doc.relative_to(root).as_posix()
