@@ -26,14 +26,19 @@ Rules (each has a mutant in ``--self-test``):
       DEFERRED transaction when no transaction is open.
 
 SQL text rules (R3 literals, R6 literals) match string-literal contents in any
-case and in batches ("BEGIN; ...") and format strings ("BEGIN {m}"); they skip
-the Postgres adapter files (sqlx has its own transaction model).
+case and in batches ("BEGIN; ...") and format strings ("BEGIN {m}"), only where
+the literal can reach SQLite: an argument of execute / execute_batch / prepare /
+prepare_cached / query / query_row / batch (through format! / concat!), or the
+value of a const / static / let.  A message such as .expect("begin") is not SQL
+(#6152).  They skip the Postgres adapter files (sqlx has its own transaction
+model).
 
 Closed world: only sites in ``ALLOWLIST`` (file, enclosing fn) pass, and each
 carries a written reason.  A stale allowlist entry (no matching site) also
 fails, so the list cannot rot.  Test code is skipped only by cfg: ``tests/`` is
 not scanned; in ``src/`` a ``#[cfg(test)]`` / ``#[cfg(all(test, ..))]`` module
-block, an external ``mod x;`` under such a cfg (``#[path]`` honoured), and a
+block, an external ``mod x;`` under such a cfg or declared anywhere inside such a
+block (``#[path]`` honoured; #6152), and a
 file with ``#![cfg(test)]``.  No file is skipped by name and no file is cut
 short, so production code after a test module is scanned.
 
@@ -94,6 +99,60 @@ BEGIN_SQL = re.compile(
 SAVEPOINT_SQL = re.compile(r"(?:^|;)\s*SAVEPOINT\b", re.IGNORECASE)
 LIT_RULES = [("R3", BEGIN_SQL), ("R6", SAVEPOINT_SQL)]
 STRING_LIT = re.compile(r'r#*"(?:[^"]|"(?!#))*"#*|"(?:[^"\\]|\\.)*"')
+
+# #6152: the literal rules read a string only where it can reach SQLite: an
+# argument of one of these calls (possibly wrapped in format!/concat!/&), or
+# the value of a const / static / let item that is passed on by name.  A plain
+# message such as .expect("begin") is not SQL.
+SQL_CALLS = {"execute", "execute_batch", "prepare", "prepare_cached", "query", "query_row", "batch"}
+SQL_WRAPPERS = {"format", "concat"}
+SQL_ITEM = re.compile(
+    r"^\s*(?:(?:pub(?:\([a-z]+\))?\s+)?(?:const|static)\b|let\b[^=]*=\s*&?\s*$)"
+)
+
+
+def _mask(text):
+    """``text`` with every string/char literal body blanked (same length)."""
+    out, last = list(text), 0
+    for m in STRING_LIT.finditer(text):
+        for k in range(m.start() + 1, m.end() - 1):
+            out[k] = " "
+        last = m.end()
+    for m in CHAR_LIT.finditer(text):
+        for k in range(m.start(), m.end()):
+            out[k] = " "
+    return "".join(out), last
+
+
+def sql_item(masked, off, pos):
+    """True when the literal at ``pos`` initialises a const / static / let on
+    its own line (``masked[off:]`` is that line)."""
+    return bool(SQL_ITEM.match(masked[off:pos]))
+
+
+def sql_position(masked, pos):
+    """True when the literal that starts at ``masked[pos]`` is an argument of an
+    SQL call: walk the enclosing parentheses outwards through format!/concat!
+    wrappers until a call name is found."""
+    depth, k = 0, pos - 1
+    while k >= 0:
+        c = masked[k]
+        if c == ")":
+            depth += 1
+        elif c == "[" and not depth and masked[k - 1 : k] == "!":
+            return False  # a macro array such as params![..] holds values
+        elif c == "(":
+            if depth:
+                depth -= 1
+            else:
+                name = re.search(r"([A-Za-z_]\w*)\s*!?\s*$", masked[:k])
+                ident = name.group(1) if name else ""
+                if ident in SQL_CALLS:
+                    return True
+                if ident not in SQL_WRAPPERS:
+                    return False
+        k -= 1
+    return False
 NONLITERAL_EXEC = re.compile(r"\.execute(?:_batch)?\s*\(\s*(?!\"|r#*\"|if\b)\S")
 WRITE_SQL = re.compile(r"\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER)\b", re.IGNORECASE)
 # A test-only cfg: cfg(test) or cfg(all(test, ...)).  cfg(any(test, ...)) also
@@ -154,6 +213,44 @@ def _child_dir(rel):
     return p.parent / p.stem
 
 
+def _nested_ext(rel, lines, j, k, name):
+    """External files of ``mod x;`` declared inside the cfg(test) block
+    ``lines[j..k]`` (#6152).  A module nested in ``mod a { mod b; }`` lives at
+    ``<child dir of rel>/a/b.rs`` or ``.../a/b/mod.rs``; ``#[path]`` is relative
+    to that directory.  Blocks are tracked by rustfmt indent."""
+    found = set()
+    stack = [(len(lines[j]) - len(lines[j].lstrip(" ")), name)]
+    for idx in range(j + 1, k + 1):
+        line = lines[idx]
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        m = MOD_DECL.match(line)
+        if not m:
+            continue
+        base = _child_dir(rel).joinpath(*[n for _, n in stack])
+        if m.group(2) == "{":
+            code = strip_comment(line)
+            if code.count("{") != code.count("}"):
+                stack.append((indent, m.group(1)))
+            continue
+        path_attr = None
+        back = idx - 1
+        while back > j and lines[back].lstrip().startswith("#["):
+            pm = PATH_ATTR.search(lines[back])
+            if pm:
+                path_attr = pm.group(1)
+            back -= 1
+        if path_attr:
+            found.add((base / path_attr).as_posix())
+        else:
+            found.add((base / (m.group(1) + ".rs")).as_posix())
+            found.add((base / m.group(1) / "mod.rs").as_posix())
+    return found
+
+
 def test_regions(rel, lines):
     """(skip_line_numbers, external_test_files, unterminated_lines) for one file.
 
@@ -202,6 +299,8 @@ def test_regions(rel, lines):
                 break
             k += 1
         skip.add(j + 1)
+        if closed and k > j:
+            ext |= _nested_ext(rel, lines, j, k, name)
         if not closed:
             # Fail closed: never swallow the rest of the file silently.
             unterminated.append(j + 1)
@@ -253,13 +352,24 @@ def scan(files):
                     rule_hit = rule
                     break
             if rule_hit is None and sqlite_file:
-                bodies = [re.sub(r'^r#*"|"#*$|^"|"$', "", lit) for lit in STRING_LIT.findall(code)]
+                ctx = " ".join(strip_comment(l).strip() for l in lines[max(0, n - 4) : n - 1])
+                full = (ctx + " " + code) if ctx else code
+                masked, _ = _mask(full)
+                off = len(full) - len(code)
+                bodies = [
+                    re.sub(r'^r#*"|"#*$|^"|"$', "", m.group(0))
+                    for m in STRING_LIT.finditer(code)
+                    if sql_item(masked, off, off + m.start()) or sql_position(masked, off + m.start())
+                ]
                 # A literal that opens here and closes on a later line (a
                 # multi-line SQL string): its first line is checked as text.
                 rest = STRING_LIT.sub("", code)
                 opened = re.search(r'r#*"|"', rest)
                 if opened:
-                    bodies.append(rest[opened.end():])
+                    lits_end = max([m.end() for m in STRING_LIT.finditer(code)] + [0])
+                    start = code.find(opened.group(0), lits_end)
+                    if sql_item(masked, off, off + max(start, 0)) or sql_position(masked, off + max(start, 0)):
+                        bodies.append(rest[opened.end():])
                 for body in bodies:
                     rule_hit = next((r for r, rx in LIT_RULES if rx.search(body)), None)
                     if rule_hit:
