@@ -182,6 +182,16 @@ jobs:
         env:
           AI_MEMORY_NO_CONFIG: "1"
         run: python -m pytest -q
+      # #3840 — pyproject.toml declared ruff + mypy as dev tools and nothing
+      # ran them (one unused import and 15 mypy errors sat on the tip). The
+      # declared toolchain is now the enforced one: the rule set is pinned in
+      # `[tool.ruff.lint]` so a newer ruff cannot move the gate.
+      - name: ruff
+        working-directory: sdk/python
+        run: python -m ruff check .
+      - name: mypy
+        working-directory: sdk/python
+        run: python -m mypy ai_memory
 
   sdk-typescript:
     name: jest + tsc (sdk/typescript)

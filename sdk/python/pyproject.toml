@@ -83,3 +83,10 @@ asyncio_mode = "auto"
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+
+[tool.ruff.lint]
+# #3840 — ruff + mypy were declared dev tools but nothing ran them. The rule
+# set is pinned explicitly so the gate does not drift with the ruff release
+# (`pip install -e ".[dev]"` takes the newest ruff): the pyflakes + pycodestyle
+# error families, the same set the #3840 finding was measured against.
+select = ["E4", "E7", "E9", "F"]
