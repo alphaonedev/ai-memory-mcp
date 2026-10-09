@@ -1945,6 +1945,25 @@ def self_test():
             probs = check(root)
             expect(not probs, "R10-#6415-control %s: a visible erratum was rejected (%r)" % (label, probs))
         allow.write_text("")
+        # #6416 (round 10): the label of a full or collapsed reference link is not reader text. The
+        # renderer shows the link text only, so the two halves of a name on either side of the label read
+        # as one name; the label may hold spaces, punctuation, a line break and any case.
+        for label, text in (
+            ("label with a space", "Run [check-][a b]old.sh daily.\n\n[a b]: https://x\n"),
+            ("label with punctuation", "Run [check-][r!]old.sh daily.\n\n[r!]: https://x\n"),
+            ("one-letter label", "Run [check-][a]old.sh daily.\n\n[a]: https://x\n"),
+            ("label over lines", "Run [check-][a\nb]old.sh daily.\n\n[a b]: https://x\n"),
+            ("label in another case", "Run [check-][A  B]old.sh daily.\n\n[a b]: https://x\n"),
+            ("collapsed label", "Run [check-][]old.sh daily.\n\n[check-]: https://x\n"),
+            ("image reference", "Run [check-][a b]old.sh and ![i][a b].\n\n[a b]: https://x\n"),
+            ("escaped bracket in the label", "Run [check-][a\\]b]old.sh daily.\n\n[a\\]b]: https://x\n"),
+        ):
+            doc.write_bytes(text.encode("utf-8"))
+            expect(any("check-old.sh" in p for p in check(root)),
+                   "R10-#6416-%s: a stale name split by a reference label was accepted" % label)
+        doc.write_bytes(b"Runs [a][b] and [check_][x]new.py and check_new.py [c][] daily.\n\n[a]: https://x\n[b]: https://x\n[x]: https://x\n[c]: https://x\n")
+        probs = check(root)
+        expect(not probs, "R10-#6416-control: an existing name split by a reference label was rejected (%r)" % (probs,))
         # #6353: an allowlist that exists but cannot be stat'ed is unreadable (exit 2), never absent.
         r = fresh("u-allow-loop")
         (r / ALLOW_REL).unlink()
