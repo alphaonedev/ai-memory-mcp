@@ -19,7 +19,8 @@ The key (see ``build_key``) is sha256 over: the sorted (repo-relative path,
 sha256) of every file in the executable's own cargo dep-info ``<exe>.d``; the
 same for the SHARED closure (dep-info of every local lib / bin / build-script
 unit, because an integration test links the lib and may run the bin, and a
-dep-info for a test target lists only that target's own sources); Cargo.lock;
+dep-info for a test target lists only that target's own sources); the cfgs,
+env and ``output`` file of every local build-script run; Cargo.lock;
 the ``rustc -Vv`` text; the feature/profile string; the behaviour-affecting
 environment; the Postgres server identity (``SELECT version()`` and the
 age / vector extension versions, or ``none`` without a test database URL);
@@ -533,10 +534,58 @@ def shared_depinfo_files(lines):
             cands = {p.parent / (stem + '.d')}
             if stem.startswith('lib'):
                 cands.add(p.parent / (stem[3:] + '.d'))
+            if 'custom-build' in kinds and '-' in p.parent.name:
+                # <build>/<pkg>-<hash>/build_script_build-<hash>.d (r1 L1).
+                cands.add(p.parent / ('build_script_build-%s.d' % p.parent.name.rsplit('-', 1)[1]))
             if p.parent.name != 'deps' and name:
                 cands.update(sorted((p.parent / 'deps').glob(name + '-*.d')))
             found.update(c for c in cands if c.is_file())
     return sorted(found)
+
+
+def build_script_outputs(lines, repo_root):
+    """Key pairs for every local build-script RUN (r1 L1).
+
+    One pair per ``build-script-executed`` message of a path package: the
+    sha256 of its cfgs, env, linked libs and paths, plus the content of the
+    run's ``output`` file (``<out_dir>/../output``) when it exists. The
+    checkout and the target profile dir are normalised so equal runs on two
+    work dirs give equal pairs. A listed but unreadable ``output`` file raises
+    CacheError (the shared inputs are then unknown and everything runs).
+    """
+    root_s = str(Path(repo_root).resolve())
+    out = []
+    for raw in lines:
+        raw = raw.strip()
+        if not raw.startswith('{'):
+            continue
+        try:
+            msg = json.loads(raw)
+        except ValueError:
+            continue
+        if msg.get('reason') != 'build-script-executed':
+            continue
+        pid = msg.get('package_id') or ''
+        if 'path+file://' not in pid:
+            continue
+        out_dir = Path(msg.get('out_dir') or '')
+        run_dir = out_dir.parent
+        prof = str(run_dir.parent.parent) if len(run_dir.parts) > 2 else ''
+
+        def norm(text):
+            text = text.replace(prof, '<TARGET>') if prof else text
+            return text.replace(root_s, '<ROOT>')
+        meta = {k: msg.get(k) for k in ('cfgs', 'env', 'linked_libs', 'linked_paths')}
+        label = 'build-run:%s:%s' % (pid.rsplit('#', 1)[-1], run_dir.name)
+        out.append((label + ':meta', sha256_bytes(norm(json.dumps(meta, sort_keys=True)).encode())))
+        output = run_dir / 'output'
+        if output.exists():
+            try:
+                text = output.read_text(errors='replace')
+            except OSError as exc:
+                raise CacheError('cannot read %s: %s' % (output, exc))
+            out.append((label + ':output', sha256_bytes(norm(text).encode())))
+    return sorted(out)
 
 
 def exe_depinfo_path(executable):
@@ -560,6 +609,7 @@ def compute_keys(exes, build_lines, repo_root, rustc_vv, profile, env, runtime=T
             raise CacheError('no dep-info found for the local lib/bin/build-script units')
         for sf in sfiles:
             shared.extend(digest_depinfo(sf, repo_root))
+        shared.extend(build_script_outputs(build_lines, repo_root))
     except CacheError as exc:
         for e in exes:
             keys[e.key], why[e.key] = None, 'shared inputs unavailable: %s' % exc

@@ -85,7 +85,8 @@ file in the executable's own cargo dep-info (`target/<profile>/deps/<name>-<hash
 including its `# env-dep:` lines with the checkout path normalised); the same
 for the shared closure, the dep-info of every local lib, bin and build-script
 unit (a test target's dep-info lists only its own sources, but it links the
-lib, so a `src/` edit must invalidate every dependent); `Cargo.lock`; the
+lib, so a `src/` edit must invalidate every dependent); the cfgs, env and
+`output` file of every local build-script run; `Cargo.lock`; the
 `rustc -Vv` text the workflow writes; the feature/profile string; the
 behaviour-affecting environment (every `AI_MEMORY_*`, `RUST_TEST_*`,
 `CARGO_PROFILE_*`, `CARGO_BUILD_*` and `PROPTEST_*` variable plus `CI`,
