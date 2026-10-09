@@ -1614,6 +1614,23 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+      # #6344 r1 B5: each shard writes its own log under $RUNNER_TEMP/ci-shard
+      # and prints it only after every shard exits, so a cancel or the job cap
+      # would otherwise leave no per-shard output (the 5-min heartbeat keeps
+      # only 90 chars). always(): uploaded on success, failure, cancel and
+      # timeout. build.jsonl (the compile JSON, large) is not uploaded.
+      - name: Upload shard logs (#6344)
+        if: always() && needs.classify.outputs.docs_only != 'true' && matrix.tier == 'enterprise-fed'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: shard-logs-${{ matrix.node }}-${{ matrix.tier }}
+          path: |
+            ${{ runner.temp }}/ci-shard/*.log
+            ${{ runner.temp }}/ci-shard/*.txt
+            ${{ runner.temp }}/ci-shard/manifest.json
+          if-no-files-found: ignore
+          retention-days: 30
+
       # cargo-audit runs once (the advisory DB is platform-independent) — on
       # the `once` leg so it does not multiply across the 2x2.
       - name: Security audit
