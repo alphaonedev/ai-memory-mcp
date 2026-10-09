@@ -19,7 +19,8 @@ same for the SHARED closure (dep-info of every local lib / bin / build-script
 unit, because an integration test links the lib and may run the bin, and a
 dep-info for a test target lists only that target's own sources); Cargo.lock;
 the ``rustc -Vv`` text; the feature/profile string; the behaviour-affecting
-environment; and a digest of every file in the repo a test could read at run
+environment; the Postgres server identity (``SELECT version()`` and the age /
+vector extension versions, or ``none`` without a test database URL); and a digest of every file in the repo a test could read at run
 time that rustc never saw (everything but build/VCS dirs and the ``.rs``
 files under src/ and tests/ that some dep-info of THIS build names; a ``.rs``
 file no dep-info names, such as a cfg-off module or an orphan, stays in). A binary whose own sources look like a tree
@@ -51,6 +52,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -291,7 +293,42 @@ def env_fingerprint(env):
     return '\n'.join(parts)
 
 
-def build_key(own_files, shared_files, lock_sha, rustc_vv, profile, env_fp, runtime_files=()):
+PG_URL_ENV = 'AI_MEMORY_TEST_POSTGRES_URL'
+PG_TIMEOUT_SECONDS = 30
+PG_FINGERPRINT_SQL = (
+    'SELECT version()',
+    "SELECT name || ' ' || coalesce(default_version, '-') || ' ' || coalesce(installed_version, '-') "
+    "FROM pg_available_extensions WHERE name IN ('age', 'vector') ORDER BY 1",
+)
+
+
+def pg_fingerprint(env, psql='psql', timeout=PG_TIMEOUT_SECONDS):
+    """Identity of the Postgres server the tests talk to (r1 M1).
+
+    ``none`` when no test database URL is set. Otherwise ``SELECT version()``
+    plus the default and installed versions of the age and vector extensions,
+    read through ``psql``. Any failure, timeout or empty answer raises
+    CacheError, so an unknown server never yields a hit. The URL is passed to
+    psql only; it is never part of the returned text.
+    """
+    url = env.get(PG_URL_ENV) or ''
+    if not url:
+        return 'none'
+    cmd = [psql, '-X', '-A', '-t', '-q', '-v', 'ON_ERROR_STOP=1', '-d', url]
+    for sql in PG_FINGERPRINT_SQL:
+        cmd += ['-c', sql]
+    try:
+        res = subprocess.run(cmd, env=dict(env), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             stdin=subprocess.DEVNULL, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CacheError('cannot read the Postgres server fingerprint: %s' % type(exc).__name__)
+    text = res.stdout.decode('utf-8', 'replace').strip()
+    if res.returncode != 0 or not text:
+        raise CacheError('cannot read the Postgres server fingerprint (psql exit %d)' % res.returncode)
+    return text.replace(url, '<URL>')
+
+
+def build_key(own_files, shared_files, lock_sha, rustc_vv, profile, env_fp, runtime_files=(), server_fp='none'):
     """Pure key function: every input is a plain value. Returns a hex digest."""
     h = hashlib.sha256()
 
@@ -306,6 +343,7 @@ def build_key(own_files, shared_files, lock_sha, rustc_vv, profile, env_fp, runt
     feed('rustc', rustc_vv)
     feed('profile', profile)
     feed('env', env_fp)
+    feed('pg', server_fp)
     for tag, files in (('own', own_files), ('shared', shared_files), ('runtime', runtime_files)):
         for label, digest in sorted(set(files)):
             feed(tag, '%s\t%s' % (label, digest))
@@ -371,7 +409,7 @@ def exe_depinfo_path(executable):
     return None
 
 
-def compute_keys(exes, build_lines, repo_root, rustc_vv, profile, env, runtime=True):
+def compute_keys(exes, build_lines, repo_root, rustc_vv, profile, env, runtime=True, server_fp='none'):
     """Return ({exe.key: hex or None}, {exe.key: reason}). Never raises per exe."""
     keys, why = {}, {}
     try:
@@ -417,7 +455,7 @@ def compute_keys(exes, build_lines, repo_root, rustc_vv, profile, env, runtime=T
         dep, own = own_by_exe[e.key]
         try:
             rt = rt_full if (runtime and e.kind not in ('lib', 'bin') and tree_sensitive(dep, repo_root)) else rt_base
-            keys[e.key] = build_key(own, shared, lock_sha, rustc_vv, profile, env_fp, rt)
+            keys[e.key] = build_key(own, shared, lock_sha, rustc_vv, profile, env_fp, rt, server_fp)
         except CacheError as exc:
             keys[e.key], why[e.key] = None, str(exc)
     return keys, why
@@ -547,8 +585,9 @@ def run_plan(args, env=None, now=None):
         rustc_vv = Path(args.rustc_vv).read_text()
         if not rustc_vv.strip():
             raise CacheError('rustc -Vv file is empty')
+        server_fp = pg_fingerprint(env, psql=args.psql)
         keys, why = compute_keys(exes, build_lines, args.repo_root, rustc_vv, args.profile, env,
-                                 runtime=not args.no_runtime_tree)
+                                 runtime=not args.no_runtime_tree, server_fp=server_fp)
         mpath = manifest_path(args.manifest_dir, args.node, args.tier, args.base_ref)
         if lookup:
             prior, prior_note = load_manifest(mpath, args.tier, args.base_ref, now)
@@ -677,6 +716,7 @@ def build_parser():
     pl.add_argument('--base-ref', required=True)
     pl.add_argument('--event', required=True)
     pl.add_argument('--ref', default='')
+    pl.add_argument('--psql', default='psql', help='psql used for the Postgres server fingerprint')
     pl.add_argument('--no-runtime-tree', action='store_true',
                     help='TESTS ONLY: skip the run-time file tree digest (never set by the workflow)')
     rc = sub.add_parser('record', parents=[common])
