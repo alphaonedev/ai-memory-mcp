@@ -1906,6 +1906,22 @@ def _job_key(job: str, line: str) -> Transform:
     return lambda text: text.replace(hdr, hdr + line, 1)
 
 
+def _job_needs(job: str, new: str) -> Transform:
+    """Replace (``new`` a line) or drop (``new`` empty) the first ``    needs:``
+    line of release.yml job ``job`` (#6289)."""
+    def go(text: str) -> str:
+        m = re.search(JOB_RE_TMPL % re.escape(job), text)
+        if m is None:
+            return text
+        body = m.group("body")
+        n = re.search(r"(?m)^    needs:.*\n", body)
+        if n is None:
+            return text
+        body = body[: n.start()] + new + body[n.end():]
+        return text[: m.start("body")] + body + text[m.end("body"):]
+    return go
+
+
 def _hdr_key(hdr: str, key: str) -> List[Edit]:
     """Add a step-level YAML key to a release.yml step header."""
     return [_rel(hdr, hdr + "        " + key + "\n")]
@@ -2624,6 +2640,22 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "SR9 docker job if changed": ("fail", [_rel(DOCKER_HEAD, DOCKER_HEAD.replace("== 'false'", "== 'true'"))]),
     "SR9 docker job missing": ("fail", [_rel(DOCKER_HDR, _docker_job_scalar)]),
     "SR9 docker steps not a sequence": ("fail", [_rel(DOCKER_HDR, _docker_steps_scalar)]),
+    # --- #6289: every job's `needs:` is pinned; a dropped edge would let a job run before its gate
+    "6289 qualify needs dropped": ("fail", [_rel(BUILD_HDR, _job_needs("qualify", ""))]),
+    "6289 supply-chain needs narrowed": ("fail", [_rel(BUILD_HDR, _job_needs("supply-chain", "    needs: [preflight]\n"))]),
+    "6289 release needs drops supply-chain": ("fail", [_rel(BUILD_HDR, _job_needs("release", "    needs: [preflight, qualify]\n"))]),
+    "6289 reproducible needs drops supply-chain": ("fail", [_rel(
+        BUILD_HDR, _job_needs("reproducible", "    needs: [preflight, qualify]\n"))]),
+    "6289 sbom needs drops supply-chain": ("fail", [_rel(BUILD_HDR, _job_needs("sbom", "    needs: [preflight, qualify]\n"))]),
+    "6289 mobile-ios needs drops supply-chain": ("fail", [_rel(
+        BUILD_HDR, _job_needs("mobile-ios", "    needs: [preflight, qualify]\n"))]),
+    "6289 mobile-android needs drops supply-chain": ("fail", [_rel(
+        BUILD_HDR, _job_needs("mobile-android", "    needs: [preflight, qualify]\n"))]),
+    "6289 crates-io needs drops release": ("fail", [_rel(BUILD_HDR, _job_needs("crates-io", "    needs: [preflight, qualify]\n"))]),
+    "6289 homebrew needs drops release": ("fail", [_rel(BUILD_HDR, _job_needs("homebrew", "    needs: [preflight, qualify]\n"))]),
+    "6289 docker needs drops supply-chain": ("fail", [_rel(BUILD_HDR, _job_needs("docker", "    needs: [preflight, qualify]\n"))]),
+    "6289 copr needs dropped": ("fail", [_rel(BUILD_HDR, _job_needs("copr", ""))]),
+    "6289 preflight gains a needs": ("fail", [_rel(BUILD_HDR, _job_key("preflight", "    needs: qualify\n"))]),
     "X05 docker step id quoted": ("fail", [_rel("        id: build\n", "        id: 'build'\n")]),
     "X09 registry login carries another with key": ("fail", [_rel(LOGIN_PW, LOGIN_PW + "          logout: false\n")]),
     "X04 image tags as a folded block": ("fail", [_rel(PUSH_TAGS, "          tags: >\n")]),
