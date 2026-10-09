@@ -674,12 +674,17 @@ def _self_test_cases() -> int:
     case("a patch divider line after the trailer does not hide prose from the trailer read (#6396)", reword, True,
          "RESULT: FAIL", message="head change\n\nRule-Change-Approved-By: Justin\n---\nprose after the line")
 
-    def host_environment(name, entries, message):
-        """Export git config through the HOST environment around one comparison (#6396): it must not reach the parser."""
+    def host_environment(name, entries, message, approved=False, where="trailer parser"):
+        """Export git config through the HOST environment around one comparison (#6396): it must not reach the
+        trailer parser (#6396) or the log read (#6431, `approved`: a real approval must still be counted)."""
         saved = {key: os.environ.get(key) for key in entries}
         os.environ.update(entries)
         try:
-            case(f"{name} does not reach the trailer parser (#6396)", reword, True, "RESULT: FAIL", message=message)
+            if approved:
+                case(f"{name} does not hide an approval from the {where} (#6431)", reword, False,
+                     "approval trailer(s): ` Justin `", message=message)
+            else:
+                case(f"{name} does not reach the trailer parser (#6396)", reword, True, "RESULT: FAIL", message=message)
         finally:
             for key, value in saved.items():
                 if value is None:
@@ -694,6 +699,15 @@ def _self_test_cases() -> int:
         "head change\n\napprove: Justin")
     host_environment("a host GIT_CONFIG_GLOBAL trailer alias", {"GIT_CONFIG_GLOBAL": str(host_config)},
                      "head change\n\napprove: Justin")
+    # #6431: the log read honours host config too; an output encoding other than UTF-8 turns a real approval into
+    # unreadable bytes (a lockout), and a signature verifier line is injected in front of a signed message.
+    approved_message = "head change\n\nRule-Change-Approved-By: Justin"
+    host_environment("a host i18n.logOutputEncoding=UTF-16", {
+        "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "i18n.logOutputEncoding", "GIT_CONFIG_VALUE_0": "UTF-16"},
+        approved_message, approved=True, where="log read")
+    host_environment("a host log.showSignature=true", {
+        "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "log.showSignature", "GIT_CONFIG_VALUE_0": "true"},
+        approved_message, approved=True, where="log read")
     env_pins = config_free_env()
     if (env_pins.get("GIT_CONFIG_NOSYSTEM") != "1" or env_pins.get("GIT_CONFIG_GLOBAL") != os.devnull
             or env_pins.get("HOME") != os.devnull or env_pins.get("GIT_CEILING_DIRECTORIES") != os.sep
