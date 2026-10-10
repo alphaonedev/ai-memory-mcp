@@ -65,6 +65,11 @@ AGE_URL_VAR = 'AI_MEMORY_TEST_AGE_URL'
 FLAG_VAR = 'AI_MEMORY_TEST_PG_ISOLATE'
 TEMPLATE_VAR = 'AI_MEMORY_TEST_PG_TEMPLATE'
 RUN_ID_VAR = 'AI_MEMORY_TEST_PG_RUN_ID'
+BASE_VAR = 'AI_MEMORY_TEST_PG_BASE'
+SHARED_BASE_DB = 'ai_memory_test'
+MINTED_BASE_PREFIX = 'ci_base_'
+EPHEMERAL_BASE_PREFIXES = ('ai_memory_test_ci_', MINTED_BASE_PREFIX)
+MAINTENANCE_DB = 'postgres'
 KILL_VAR = 'CI_PG_ISOLATE_OFF'
 ISOLATED_PREFIX = 'ai_memory_t'
 TEMPLATE_SUFFIX = '_tpl'
@@ -367,6 +372,47 @@ def close_hold(hold: Optional['subprocess.Popen[str]']) -> None:
         hold.wait()
 
 
+# --- ephemeral base (#7031 H1) --------------------------------------------
+
+def is_ephemeral_base(db: str) -> bool:
+    """True for a per-run base (``ai_memory_test_ci_*`` / ``ci_base_*``); the
+    shared ``ai_memory_test`` and anything else is not."""
+    return db != SHARED_BASE_DB and db.startswith(EPHEMERAL_BASE_PREFIXES)
+
+
+def mint_base_name(now: Optional[int] = None) -> str:
+    stamp = int(time.time()) if now is None else int(now)
+    return '%s%d_%d_%s' % (MINTED_BASE_PREFIX, os.getpid(), stamp, uuid.uuid4().hex[:8])
+
+
+def mint_base(url: str) -> str:
+    """CREATE an ephemeral base (the ci.yml recipe: database, then age + vector)
+    and return its URL. ``url`` is only the maintenance connection."""
+    name = _checked_ident(mint_base_name())
+    psql(url, 'CREATE DATABASE %s' % quote_ident(name))
+    new_url = with_database(url, name)
+    psql(new_url, 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')
+    log('minted ephemeral base %s' % name)
+    return new_url
+
+
+def resolve_base(url: str, db_arg: Optional[str], allow_reason: Optional[str]) -> Tuple[str, str]:
+    """Pick the base for ``setup``; refuse a shared one (#7031). Returns ``(url, db)``."""
+    if allow_reason is not None and not allow_reason.strip():
+        raise WrapperError('--allow-shared-base needs a non-empty REASON')
+    db = db_arg or database_name(url)
+    if is_ephemeral_base(db):
+        return with_database(url, db), db
+    if allow_reason:
+        log('WARN shared base %s allowed: %s' % (db, allow_reason.strip()))
+        return with_database(url, db), db
+    if db_arg:
+        raise WrapperError('refusing shared base %r (#7031): use an ephemeral base matching %s, '
+                           'or pass --allow-shared-base REASON' % (db, '|'.join(EPHEMERAL_BASE_PREFIXES)))
+    new_url = mint_base(url)
+    return new_url, database_name(new_url)
+
+
 # --- tier steps -----------------------------------------------------------
 
 def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
@@ -625,8 +671,11 @@ def build_parser() -> argparse.ArgumentParser:
     setup_p.add_argument('--db', help='base database (default: the URL database)')
     setup_p.add_argument('--jobs', type=int, default=MAX_JOBS)
     setup_p.add_argument('--run-id', help='run id for the clone names (default: generated)')
+    setup_p.add_argument('--allow-shared-base', metavar='REASON',
+                         help='permit a non-ephemeral base database (non-empty reason, logged)')
     setup_p.add_argument('--emit-env', action='store_true',
-                         help='print %s= and %s= lines for $GITHUB_ENV' % (TEMPLATE_VAR, RUN_ID_VAR))
+                         help='print %s=, %s=, %s= and %s= lines for $GITHUB_ENV'
+                         % (TEMPLATE_VAR, RUN_ID_VAR, BASE_VAR, URL_VAR))
 
     down = sub.add_parser('teardown', help="drop this run's clones and the template")
     down.add_argument('--url', help=url_help)
@@ -688,16 +737,22 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         url = _url(args)
         if args.cmd == 'setup':
-            db = args.db or database_name(url)
+            url, db = resolve_base(url, args.db, args.allow_shared_base)
             run_id = checked_run_id(args.run_id or new_run_id())
             tpl = setup(url, db, args.jobs)
             if args.emit_env:
                 _emit('%s=%s' % (TEMPLATE_VAR, tpl))
                 _emit('%s=%s' % (RUN_ID_VAR, run_id))
+                _emit('%s=%s' % (BASE_VAR, db))
+                _emit('%s=%s' % (URL_VAR, url))
             return 0
         if args.cmd == 'teardown':
             db = args.db or database_name(url)
             teardown(url, db, checked_run_id(args.run_id or os.environ.get(RUN_ID_VAR)))
+            base = os.environ.get(BASE_VAR)
+            if base and base == db and base.startswith(MINTED_BASE_PREFIX):
+                # Plain drop (no force option): a live session fails it, loudly.
+                psql(with_database(url, MAINTENANCE_DB), 'DROP DATABASE IF EXISTS %s' % quote_ident(_checked_ident(base)))
             return 0
         if args.cmd == 'sweep':
             sweep(url, args.older_than)

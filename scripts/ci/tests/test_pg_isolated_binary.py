@@ -367,7 +367,9 @@ class TierSteps(unittest.TestCase):
             rc = pib.main(['setup', '--db', 'ai_memory_test_ci_9_1_x', '--jobs', '8', '--run-id', RUN,
                            '--emit-env'])
         self.assertEqual(rc, 0)
-        self.assertEqual(out, ['%s=%s' % (pib.TEMPLATE_VAR, TPL), '%s=%s' % (pib.RUN_ID_VAR, RUN)])
+        self.assertEqual(out, ['%s=%s' % (pib.TEMPLATE_VAR, TPL), '%s=%s' % (pib.RUN_ID_VAR, RUN),
+                               '%s=ai_memory_test_ci_9_1_x' % pib.BASE_VAR,
+                               '%s=%s' % (pib.URL_VAR, BASE)])
 
     def test_teardown_drops_only_this_runs_clones_without_force(self):
         def answer(argv, kw):
@@ -643,6 +645,85 @@ class MainRun(unittest.TestCase):
             clean[pib.FLAG_VAR] = '1'
             with Patched(), mock.patch.dict(os.environ, clean, clear=True):
                 self.assertEqual(pib.main(argv), pib.EXIT_USAGE, missing)
+
+
+class SharedBaseRefusal7031(unittest.TestCase):
+    """#7031 H1: setup refuses a shared base; mints an ephemeral one by default."""
+
+    SHARED = 'postgres://u:pw@127.0.0.1:5445/ai_memory_test'
+
+    def run_main(self, argv, env=None):
+        import io
+        import contextlib
+        out, err = io.StringIO(), io.StringIO()
+        clean = {k: v for k, v in os.environ.items() if not k.startswith('AI_MEMORY_TEST_')}
+        clean.update(env or {})
+        with Patched() as rec, mock.patch.dict(os.environ, clean, clear=True), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = pib.main(argv)
+        return rc, rec, out.getvalue(), err.getvalue()
+
+    def test_7031_shared_db_flag_is_refused(self):
+        rc, rec, _, err = self.run_main(['setup', '--url', self.SHARED, '--db', 'ai_memory_test'])
+        self.assertEqual(rc, pib.EXIT_USAGE, err)
+        self.assertEqual(rec.sql(), [], 'no SQL may run against a refused base')
+
+    def test_7031_non_ephemeral_db_flag_is_refused(self):
+        rc, rec, _, _ = self.run_main(['setup', '--url', self.SHARED, '--db', 'some_other_db'])
+        self.assertEqual(rc, pib.EXIT_USAGE)
+        self.assertEqual(rec.sql(), [])
+
+    def test_7031_empty_reason_is_refused(self):
+        for reason in ('', '   '):
+            rc, rec, _, _ = self.run_main(['setup', '--url', self.SHARED, '--db', 'ai_memory_test',
+                                           '--allow-shared-base', reason])
+            self.assertEqual(rc, pib.EXIT_USAGE, repr(reason))
+            self.assertEqual(rec.sql(), [])
+
+    def test_7031_reason_is_accepted_and_logged(self):
+        rc, rec, _, err = self.run_main(['setup', '--url', self.SHARED, '--db', 'ai_memory_test',
+                                         '--allow-shared-base', 'local repro of #6983'])
+        self.assertEqual(rc, 0, err)
+        self.assertIn('local repro of #6983', err)
+        self.assertTrue(any(s.startswith('CREATE DATABASE "ai_memory_test_tpl"') for s in rec.sql()))
+
+    def test_7031_default_mints_ci_base_with_extensions(self):
+        rc, rec, out, err = self.run_main(['setup', '--url', self.SHARED, '--emit-env'])
+        self.assertEqual(rc, 0, err)
+        creates = [s for s in rec.sql() if re.fullmatch(r'CREATE DATABASE "ci_base_\w+"', s) and not s.endswith('_tpl"')]
+        self.assertEqual(len(creates), 1, rec.sql())
+        name = re.search(r'"(ci_base_[^"]+)"', creates[0]).group(1)
+        self.assertRegex(name, r'^ci_base_\d+_')
+        ext = [(a, k) for a, k in rec.calls
+               if any('CREATE EXTENSION IF NOT EXISTS age' in x and 'vector' in x for x in a)]
+        self.assertTrue(ext, 'age + vector installed in the minted base')
+        self.assertTrue(any(k['env']['PGDATABASE'] == name for _, k in ext))
+        lines = out.splitlines()
+        self.assertIn('%s=%s' % (pib.BASE_VAR, name), lines)
+        self.assertIn('%s=postgres://u:pw@127.0.0.1:5445/%s' % (pib.URL_VAR, name), lines)
+
+    def test_7031_ephemeral_urls_pass_without_minting(self):
+        for db in ('ai_memory_test_ci_9_1_x', 'ci_base_1_2_abc'):
+            url = 'postgres://u:pw@127.0.0.1:5445/' + db
+            rc, rec, out, err = self.run_main(['setup', '--url', url, '--emit-env'])
+            self.assertEqual(rc, 0, err)
+            self.assertFalse([s for s in rec.sql() if s.startswith('CREATE DATABASE') and not s.endswith('_tpl"')], db)
+            self.assertIn('%s=%s' % (pib.BASE_VAR, db), out.splitlines())
+
+    def test_7031_teardown_drops_minted_base_without_force(self):
+        url = 'postgres://u:pw@127.0.0.1:5445/ci_base_1_2_abc'
+        rc, rec, _, err = self.run_main(['teardown', '--url', url, '--run-id', RUN],
+                                        {pib.BASE_VAR: 'ci_base_1_2_abc'})
+        self.assertEqual(rc, 0, err)
+        drops = [s for s in rec.sql() if s == 'DROP DATABASE IF EXISTS "ci_base_1_2_abc"']
+        self.assertEqual(len(drops), 1, rec.sql())
+        self.assertFalse([s for s in rec.sql() if 'FORCE' in s.upper()])
+
+    def test_7031_teardown_never_drops_a_shared_base(self):
+        rc, rec, _, _ = self.run_main(['teardown', '--url', self.SHARED, '--db', 'ai_memory_test',
+                                       '--run-id', RUN], {pib.BASE_VAR: 'ai_memory_test'})
+        self.assertEqual(rc, 0)
+        self.assertNotIn('DROP DATABASE IF EXISTS "ai_memory_test"', rec.sql())
 
 
 class NoShell(unittest.TestCase):
