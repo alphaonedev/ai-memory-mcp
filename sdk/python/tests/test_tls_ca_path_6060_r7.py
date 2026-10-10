@@ -309,3 +309,47 @@ def test_ca_input_owned_by_root_is_accepted_6815(
         entry = _add_anchor(directory, lab.ca_path)
         _foreign(monkeypatch, directory, entry, uid=0)
         _built(client_cls, str(directory))
+
+
+# ---- #6816: the inode re-check after the load is load-bearing ---------------
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_file_swapped_during_the_load_is_refused_6816(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+) -> None:
+    """A file renamed over the CA while it loads is caught by the #6377 re-check.
+
+    The walk and the open both see the caller's file; the swap happens inside
+    ``load_verify_locations``, so only the inode re-check after the load can
+    see it (Q3 of the 3-agent vote (6def5ab6)).
+    """
+    bundle = _bundle(lab, _ca_dir(tmp_path))
+    evil = _evil_dir(tmp_path) / "ca.pem"
+
+    def swap_during_load(load: Callable[[], None]) -> None:
+        os.replace(evil, bundle)
+        load()
+
+    monkeypatch.setattr(_common, "_pinned_base_context", _racy_base(swap_during_load))
+    with pytest.raises(ValueError, match="changed while it was being read"):
+        _built(client_cls, str(bundle))
+
+
+# ---- #6835: a CA directory loads only the names OpenSSL's capath reads ------
+
+
+@_POSIX_ONLY
+def test_ca_directory_loads_only_hashed_entry_names_6835(
+    lab: Lab, tmp_path: pathlib.Path
+) -> None:
+    unhashed = _ca_dir(tmp_path, "unhashed")
+    _bundle(lab, unhashed, "extra-ca.pem")
+    assert _common._context_from_path(str(unhashed)).get_ca_certs() == []
+    hashed = _ca_dir(tmp_path, "hashed")
+    _add_anchor(hashed, lab.ca_path)
+    assert len(_common._context_from_path(str(hashed)).get_ca_certs()) == 1

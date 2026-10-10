@@ -394,6 +394,21 @@ def test_only_the_tunnel_connect_crosses_a_pending_proxy_leg_6349(
     assert leg.closed
 
 
+def test_verified_direct_leg_leaves_a_pending_proxy_leg_pending_6836(
+    driver: tuple[_Driver, ssl.SSLContext],
+) -> None:
+    # Only the session of the tunnel through the pending proxy leg clears it:
+    # a verified handshake on a direct leg of the same request does not.
+    drive, context = driver
+    fire = drive.new_request()
+    leg = _Stream(_Session(ssl.create_default_context()))
+    fire("connection.start_tls.complete", {"return_value": leg})
+    fire("connection.start_tls.complete", {"return_value": _Stream(_Session(context))})
+    with pytest.raises(ValueError, match="verify=False"):
+        fire("http11.send_request_headers.started", {"request": _get_request()})
+    assert leg.closed
+
+
 def test_pending_state_is_per_request_6349(driver: tuple[_Driver, ssl.SSLContext]) -> None:
     # Request B's verified tunnel must not clear request A's pending proxy leg.
     drive, context = driver
