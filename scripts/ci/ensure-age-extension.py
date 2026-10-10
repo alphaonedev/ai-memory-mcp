@@ -96,6 +96,9 @@ records the signal and the probe polls that flag every 0.2 s (#6337); raising fr
 handler instead could land between the fork and the guard around ``communicate`` and
 orphan psql with PGPASSWORD.
 
+Only a ``0`` or ``1`` answer from the probe counts: a psql that exits non-zero or prints anything else fails the run
+with no restore (#6677).
+
 Exit codes: 0 healthy, 1 still unhealthy / probe or install failed,
 2 bad input (URL file, pg_config, source validation).
 """
@@ -490,7 +493,11 @@ def probe_lists_age(psql, url):
     if proc.returncode != 0:
         # psql stderr is deliberately not echoed (it can carry connection detail).
         raise HelperError(f"age probe failed: psql exited {proc.returncode}", EXIT_UNAVAILABLE)
-    return stdout.strip() == "1"
+    answer = stdout.strip()
+    if answer not in ("0", "1"):
+        # #6677: only a count is an answer; anything else must not read as "age missing" and trigger a restore
+        raise HelperError("age probe failed: psql printed no 0/1 answer", EXIT_UNAVAILABLE)
+    return answer == "1"
 
 
 def pg_config_value(pg_config, flag):
