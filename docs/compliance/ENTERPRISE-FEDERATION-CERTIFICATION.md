@@ -1528,8 +1528,8 @@ breaks and pipe tables only; single-backtick code spans that close in
 their paragraph; plain link destinations. It has no code fence, HTML tag,
 block or comment, autolink, collapsible section, link definition, setext underline,
 lazy line, tab, CR, control, zero-width or bidi character, and no fence,
-comment or HTML block is left open anywhere in the document; it is dated from the merge-base commit day less one to today
-plus one; every line is plain printable text, a list entry or the
+comment or HTML block is left open anywhere in the document; it is dated from the day of its own commit less one (at most 14 days
+below the merge-base day) to today plus one; every line is plain printable text, a list entry or the
 `Path back to LIVE:` line; it lists exactly the changed watched paths and
 identifiers and cites only #6063, by its issue URL, with no other issue,
 commit, link or autolink anywhere in it. The failure text names that record

@@ -957,8 +957,8 @@ def amendment_verdict(repo, mb, judged, required):
     must be below STATUS, open its own paragraph with its header alone on its
     line, sit directly above an existing amendment header or close its
     blockquote, be followed by no lazy line (#6354), carry a valid ISO date
-    from the merge-base commit day - 1 (#6358) to the judged commit's day (or
-    today) + 1, list exactly REQUIRED, keep to the record grammar and cite
+    dated from the day of its own commit less one (at most 14 days below the
+    merge-base day; #6358, #6421 F4-A) to today plus one (#6733), list exactly REQUIRED, keep to the record grammar and cite
     only #6063 by its issue URL (#6367). Doc read failures raise GateError."""
     old_lines = read_cert_doc(repo, mb).split("\n")
     new_text = read_cert_doc(repo, judged)
@@ -1333,9 +1333,9 @@ def _judge(repo, base, head, judged, mb, tip):
             "accepted only as exactly ONE new record inserted below STATUS, with at most "
             "one blank separator line and no other line of the doc changed (header alone "
             "on its line, opening its own paragraph, directly above an existing amendment "
-            "header or closing its blockquote, outside code fences and HTML blocks, dated "
-            "from the merge-base commit day less one to today plus one, plain printable "
-            "text) that lists exactly the changed watched paths and AI_MEMORY_FED_* "
+            "header or closing its blockquote, in the canonical ledger subset, dated from "
+            "the day of its own commit less one (at most 14 days below the merge-base day) "
+            "to today plus one, plain printable text) that lists exactly the changed watched paths and AI_MEMORY_FED_* "
             f"identifiers and cites only {RE_CERT_ISSUE} by its issue URL (#6124). "
             f"Not satisfied: {amend_why}."
         )
@@ -3268,7 +3268,8 @@ SELF_TEST_OK = (
     "outside CI; (6124-h1..h9, #6124) EXPIRED/VOID at both ends plus exactly ONE inserted "
     "amendment record (and one blank separator) below STATUS, directly above an existing "
     "record (also opening its blockquote) or closing its blockquote, dated from the "
-    "merge-base day - 1 to today + 1, listing exactly the changed watched paths and "
+    "day of its own commit less one (at most 14 days below the merge-base day) to today "
+    "plus one, listing exactly the changed watched paths and "
     "identifiers and citing only #6063 by its issue URL GREEN; (6124-f1..f15d) missing, "
     "extra, substring, prose-only, reused, re-dated, split, deleted, edited or moved prior "
     "records, a copy of an existing header, LIVE at the merge-base, EXPIRED flipped to a "
