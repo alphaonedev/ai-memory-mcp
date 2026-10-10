@@ -584,11 +584,13 @@ class Round11EchoMask(unittest.TestCase):
 
     def test_an_echoed_row_keeps_only_its_key_6783(self):
         self.assertEqual(SUBSET.echo("      PASSWORD: hunter2"), repr("      PASSWORD: <withheld 7 chars>"))
-        self.assertEqual(SUBSET.echo("curl --password=hunter2"), repr("curl --password=<withheld 7 chars>"))
+        self.assertEqual(SUBSET.echo("--password=hunter2"), repr("--password=<withheld 7 chars>"))
+        self.assertEqual(SUBSET.echo("curl --password=hunter2"), repr("<withheld 23 chars>"))
         self.assertEqual(SUBSET.echo("T\u041eKEN: " + self.TAIL), repr("T\u041eKEN: <withheld 11 chars>"))
-        self.assertEqual(SUBSET.echo("short row"), repr("short row"))
+        self.assertEqual(SUBSET.echo("short row"), repr("<withheld 9 chars>"))
+        self.assertEqual(SUBSET.echo("  short row"), repr("  <withheld 9 chars>"))
         long_row = "--password " + self.TAIL + " and more text to run past the prefix"
-        self.assertEqual(SUBSET.echo(long_row), repr(long_row[:24] + "..."))
+        self.assertEqual(SUBSET.echo(long_row), repr("<withheld %d chars>" % len(long_row)))
         self.assertNotIn(self.TAIL, SUBSET.echo("A: " + "x" * 600 + self.TAIL))
         # #6891: a colon followed by a tab is a separator.
         self.assertEqual(SUBSET.echo("NOTE:\t" + self.TAIL + " and more text past col 24"), repr("NOTE:\t<withheld 37 chars>"))

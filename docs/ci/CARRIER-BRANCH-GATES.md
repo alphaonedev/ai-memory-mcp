@@ -373,8 +373,11 @@ verifier fails otherwise), and the live carrier ruleset updated with the
   characters. A secret or needs problem names the owning key, the line and
   `<withheld N chars>` and never reprints value text; a credential-named key
   owns every value nested below it (#6780, #6781, #6783). A refusal row keeps
-  what precedes its first `: ` or `=` and withholds the rest with its length;
-  a row with no separator keeps its first 24 characters (#6783). Other message
+  its indentation, an optional `- ` and one key word directly before its
+  first `: `, `:` plus a tab, `:` at the end of the row or `=`, and withholds
+  the rest with its length; any other text before the first separator, and a
+  whole row with no separator, is withheld the same way (#6783, #6880,
+  #6881). Other message
   text masks GitHub-token-shaped strings (also when glued after a letter,
   digit or `_`, #6736, or cut by the mask window, #6791) and withholds the
   whole value of a credential-named key (names containing token, secret,

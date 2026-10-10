@@ -101,10 +101,11 @@ def clip(text: str) -> str:
     return text[:ECHO_LIMIT] + "..." if len(raw) > 4 * ECHO_LIMIT or len(text) > ECHO_LIMIT else text
 
 
-# #6783: a refusal row keeps what precedes its first ``: `` or ``=`` and withholds the rest, so no value is
-# reprinted whatever its key is spelled like; a row with no separator keeps its first ROW_KEEP characters.
-_ROW_SEPARATOR = re.compile(r": |:\t|=")
-ROW_KEEP = 24
+# #6783 #6881: a refusal row keeps its indentation, an optional ``- `` and one key word directly before its first
+# ``: ``, ``:<tab>``, ``:<end>`` or ``=``, and withholds the rest with its length.  Text before the first
+# separator that is not one key word, or the whole of a row with no separator, is value text and is withheld.
+_ROW_KEY = re.compile(r"[ \t]*(?:-[ \t]+)?['\"]?[\w.-]+['\"]?(?:: |:\t|:\Z|=)")
+_INDENT = re.compile(r"[ \t]*")
 
 
 def withhold_value(owner: str, text: str) -> str:
@@ -119,14 +120,12 @@ def echo_name(text: str) -> str:
 
 
 def echo(text: str) -> str:
-    """The quoted key part of a row for a refusal message; the value part is withheld (#6681, #6783)."""
+    """The quoted key part of a row for a refusal message; everything else is withheld (#6681, #6783, #6880, #6881)."""
     raw = str(text)
-    sep = _ROW_SEPARATOR.search(raw)
-    if sep is None:
-        # #6880: mask the kept prefix while it still ends the text, so a token cut at ROW_KEEP is masked.
-        return repr(clip(raw[:ROW_KEEP]) + "..." if len(raw) > ROW_KEEP else clip(raw))
-    rest = len(raw) - sep.end()
-    return repr(clip(raw[:sep.end()] + ("<withheld %d chars>" % rest if rest else "")))
+    key = _ROW_KEY.match(raw)
+    kept = key.end() if key else _INDENT.match(raw).end()
+    rest = len(raw) - kept
+    return repr(clip(raw[:kept] + ("<withheld %d chars>" % rest if rest else "")))
 
 
 def _strip_comment(line: str) -> str:
