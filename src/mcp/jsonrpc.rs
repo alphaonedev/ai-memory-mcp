@@ -161,4 +161,61 @@ mod tests_6157 {
         assert_eq!(PROTOCOL_REVISION, answered);
         assert_eq!(PROTOCOL_REVISION, NEWEST_PROTOCOL_REVISION);
     }
+
+    fn params_asking(asked: &str) -> serde_json::Value {
+        let mut map = serde_json::Map::new();
+        map.insert(
+            PROTOCOL_VERSION_FIELD.to_string(),
+            serde_json::Value::String(asked.to_string()),
+        );
+        serde_json::Value::Object(map)
+    }
+
+    /// #6157 round 2: a 5000-char `protocolVersion` is clipped to exactly
+    /// the first `DIAGNOSTIC_ECHO_MAX_CHARS` chars; nothing past the clip
+    /// reaches stderr.
+    #[test]
+    fn issue_6157_downgrade_diagnostic_clips_long_value_to_first_64_chars() {
+        const TOTAL_CHARS: usize = 5000;
+        const TAIL_MARKER: &str = "TAIL6157";
+        let head = "A".repeat(DIAGNOSTIC_ECHO_MAX_CHARS);
+        let filler = "~".repeat(TOTAL_CHARS - DIAGNOSTIC_ECHO_MAX_CHARS - TAIL_MARKER.len());
+        let asked = format!("{head}{TAIL_MARKER}{filler}");
+        assert_eq!(asked.chars().count(), TOTAL_CHARS);
+
+        let line = protocol_downgrade_diagnostic(&params_asking(&asked), NEWEST_PROTOCOL_REVISION);
+
+        assert!(
+            line.contains(&format!("protocolVersion \"{head}\" is not supported")),
+            "the echo must be exactly the first {DIAGNOSTIC_ECHO_MAX_CHARS} chars: {line}"
+        );
+        assert!(
+            !line.contains(TAIL_MARKER),
+            "text past the clip leaked: {line}"
+        );
+        assert!(!line.contains('~'), "filler past the clip leaked: {line}");
+    }
+
+    /// #6157 round 2: terminal and bidi control characters in the untrusted
+    /// value are escaped, so the diagnostic is one inert line.
+    #[test]
+    fn issue_6157_downgrade_diagnostic_escapes_control_and_bidi_chars() {
+        let asked = "a\u{1b}[31mb\nc\rd\u{202e}e\0f";
+        let line = protocol_downgrade_diagnostic(&params_asking(asked), NEWEST_PROTOCOL_REVISION);
+
+        for raw in ['\u{1b}', '\n', '\r', '\u{202e}', '\0'] {
+            assert!(
+                !line.contains(raw),
+                "raw {raw:?} reached the diagnostic: {line:?}"
+            );
+        }
+        assert_eq!(
+            line.lines().count(),
+            1,
+            "diagnostic must be one line: {line:?}"
+        );
+        for escaped in [r"\u{1b}", r"\n", r"\r", r"\u{202e}", r"\0"] {
+            assert!(line.contains(escaped), "missing escape {escaped}: {line}");
+        }
+    }
 }
