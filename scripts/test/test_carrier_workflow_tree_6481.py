@@ -301,6 +301,29 @@ class TokenPins(unittest.TestCase):
             self.assertTrue([p for p in GATE.workflow_pin_problems(forbidden) if "forbidden trigger" in p])
 
 
+class BranchItems(unittest.TestCase):
+    """`_items` reads a branch list for trigger_covers (flow, multi-line flow, block)."""
+
+    def test_flow_multi_line(self):
+        self.assertEqual(GATE._items(["  branches: [a,", "    b]", "  other: x"], 0), ["a", "b"])
+
+    def test_flow_unclosed_ends_at_block_end(self):
+        self.assertEqual(GATE._items(["  branches: [a,"], 0), [])
+
+    def test_flow_trailing_comma_drops_empty(self):
+        self.assertEqual(GATE._items(["  branches: [a, ]"], 0), ["a"])
+
+    def test_block_list_at_key_indent_and_stop(self):
+        block = ["  branches:", "  - a", "  - b", "  other:", "    - z"]
+        self.assertEqual(GATE._items(block, 0), ["a", "b"])
+
+    def test_block_list_indented(self):
+        self.assertEqual(GATE._items(["  branches:", "    - a", "  other: x"], 0), ["a"])
+
+    def test_scalar(self):
+        self.assertEqual(GATE._items(["  branches: main"], 0), ["main"])
+
+
 class HostileText(unittest.TestCase):
     def test_hostile_text_never_covers_or_defines(self):
         job, ctx = GATE.VERIFIER_JOB_ID, GATE.VERIFIER_CONTEXT
