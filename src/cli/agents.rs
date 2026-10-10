@@ -1627,7 +1627,7 @@ mod tests {
         };
         assert!(
             res.is_ok(),
-            "a met signed quorum must approve on the CLI: {res:?}"
+            "a met signed quorum must approve on the CLI (run_pending returned Err)"
         );
         assert!(
             env.stdout_str().contains("approved + executed"),
