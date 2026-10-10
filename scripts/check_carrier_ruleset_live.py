@@ -523,9 +523,9 @@ def _event_key(node):
     """The event name of a key under `on:`; anything the reader does not model is Unparsed (#6481)."""
     name = node.name
     if not EVENT_NAME.fullmatch(name):
-        raise Unparsed(f"line {node.line}: trigger name {SUBSET.echo(name)} is not a plain ASCII word")
+        raise Unparsed(f"line {node.line}: trigger name {SUBSET.echo_name(name)} is not a plain ASCII word")
     if name.lower() in SUBSET.YAML11_BOOLEANS + ("null",):
-        raise Unparsed(f"line {node.line}: trigger name {SUBSET.echo(name)} reads as a boolean or null in YAML 1.1")
+        raise Unparsed(f"line {node.line}: trigger name {SUBSET.echo_name(name)} reads as a boolean or null in YAML 1.1")
     return name
 
 
@@ -622,8 +622,9 @@ def _scope_problems(label, node, is_job):
     lines) through the accessor, so a comment never hides text and a quote never shifts it."""
     problems = []
     for number, owner, text in SUBSET.owned_strings(node):
-        # #6735: a value under a credential-named key is echoed with its key, so mask() withholds it whole.
-        shown = SUBSET.clip((owner + ": " if SUBSET.is_credential_key(owner) else "") + text.strip())
+        # #6781 #6783: a problem names the owning key and the length of the value, never the value text; a key
+        # (owner "") is a name, not a value, and is shown masked.
+        shown = SUBSET.withhold_value(owner, text) if owner else SUBSET.clip(text.strip())
         if SECRETS_REF.search(text):
             problems.append(f"{label} references a repository secret (line {number}): {shown}")
         if is_job and NEEDS_REF.search(text):

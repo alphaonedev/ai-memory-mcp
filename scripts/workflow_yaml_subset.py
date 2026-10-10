@@ -64,7 +64,7 @@ _EXPRESSION_VALUE = re.compile(
     r"['\"]?\$\{\{[ \t]*" + _OPERAND + r"(?:[ \t]*(?:\|\||&&|==|!=)[ \t]*" + _OPERAND + r")*[ \t]*\}\}['\"]*[ \t]*(?=\n|\Z)")
 # #6792: ``mask`` keeps a value only when it is exactly one marker that ``mask`` itself wrote, which always runs
 # to the end of its row, so a committed value that merely starts with that text is withheld like any other.
-_WITHHELD_MARK = re.compile(r"<withheld \d+ chars>[ \t]*(?=\n|\Z)")
+_WITHHELD_MARK = re.compile(r"<withheld \d+ chars>['\"]?[ \t]*(?=\n|\Z)")
 
 
 def is_credential_key(name: str) -> bool:
@@ -101,9 +101,31 @@ def clip(text: str) -> str:
     return text[:ECHO_LIMIT] + "..." if len(raw) > 4 * ECHO_LIMIT or len(text) > ECHO_LIMIT else text
 
 
-def echo(text: str) -> str:
-    """The quoted ``clip`` of a row for a refusal message (#6681)."""
+# #6783: a refusal row keeps what precedes its first ``: `` or ``=`` and withholds the rest, so no value is
+# reprinted whatever its key is spelled like; a row with no separator keeps its first ROW_KEEP characters.
+_ROW_SEPARATOR = re.compile(r": |:\t|=")
+ROW_KEEP = 24
+
+
+def withhold_value(owner: str, text: str) -> str:
+    """``owner: <withheld N chars>`` for a parsed value, never the value text itself (#6781, #6783)."""
+    marker = "<withheld %d chars>" % len(text.strip())
+    return clip(owner) + ": " + marker if owner else marker
+
+
+def echo_name(text: str) -> str:
+    """The quoted ``clip`` of a key or trigger name, which holds no value (#6681, #6783)."""
     return repr(clip(text))
+
+
+def echo(text: str) -> str:
+    """The quoted key part of a row for a refusal message; the value part is withheld (#6681, #6783)."""
+    raw = str(text)
+    sep = _ROW_SEPARATOR.search(raw)
+    if sep is None:
+        return repr(clip(raw[:ROW_KEEP] + "..." if len(raw) > ROW_KEEP else raw))
+    rest = len(raw) - sep.end()
+    return repr(clip(raw[:sep.end()] + ("<withheld %d chars>" % rest if rest else "")))
 
 
 def _strip_comment(line: str) -> str:
@@ -309,7 +331,7 @@ def _flow(s: str, i: int, depth: int = 1) -> Tuple[int, object]:
             if s[j] in ",}":
                 raise Unparsed("flow mapping entry with no value (#5733): " + echo(s))
             if key.casefold() in folded:
-                raise Unparsed("repeated flow mapping key %s (#6680): %s" % (echo(key), echo(s)))
+                raise Unparsed("repeated flow mapping key %s (#6680): %s" % (echo_name(key), echo(s)))
             folded.add(key.casefold())
             j, value = _flow_node(s, j, depth)
             pairs[key] = value
@@ -687,12 +709,12 @@ def parse_workflow(text: str) -> Node:
                 # YAML reads a quote inside a plain key as text; a lexical reader that toggles a quote
                 # state on it misreads the rest of the row (#6617), so the tree refuses such keys.
                 raise Unparsed("line %d: quote character inside a plain mapping key %s (#6617)"
-                               % (node.line, echo(node.name)))
+                               % (node.line, echo_name(node.name)))
             folded = key_name(node.name).casefold()
             known = seen.setdefault(id(parent), {})
             if folded in known:
                 raise Unparsed("line %d: repeated mapping key %s (first on line %d)"
-                               % (node.line, echo(node.name), known[folded]))
+                               % (node.line, echo_name(node.name), known[folded]))
             known[folded] = node.line
         parent.children.append(node)
         stack.append(node)
