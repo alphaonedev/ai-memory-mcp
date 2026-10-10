@@ -863,6 +863,7 @@ class LeakAndLineage7031(unittest.TestCase):
             with self.assertRaises(pib.WrapperError) as ctx:
                 pib.lineage_precheck(BASE, 'ai_memory_test_ci_9_1_x')
         self.assertIn('second_rel', str(ctx.exception))
+        self.assertIn('#6983', str(ctx.exception))
 
     def test_7031_n3_watermarked_relations_ssot_is_pinned(self):
         src = (REPO / 'src' / 'storage' / 'schema_integrity.rs').read_text()
