@@ -1085,10 +1085,14 @@ jobs:
           new_url="${head%/*}/${CI_FED_DB}${q}"
           # #6161 — the macos-fed AGE install is hand-built; a Homebrew upgrade
           # relinks the postgresql@18 trees and drops its files. Self-heal from
-          # the node-local, brew-independent copy BEFORE CREATE EXTENSION.
+          # the node-local, brew-independent copy BEFORE CREATE EXTENSION
+          # (five sha256-pinned files only; its one-line reason is on stderr).
           # macos-fed only: the linux-fed path is unchanged.
           if [ "${CI_NODE:-}" = "macos-fed" ]; then
-            python3 scripts/ci/ensure-age-extension.py --url-file "$url_file"
+            if ! python3 scripts/ci/ensure-age-extension.py --url-file "$url_file"; then
+              echo "::error::enterprise-fed leg on $RUNNER_NAME: AGE self-heal failed (#6161), see the ensure-age-extension line above"
+              exit 1
+            fi
           fi
           # Provision the ephemeral db's extensions (the tier role is SUPERUSER).
           if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then
