@@ -505,6 +505,59 @@ class Index:
             return False
         return True
 
+    def takes_lock(self) -> set:
+        """Ids of fns that (transitively) call a base acquirer: calling one while
+        a guard is held re-locks the non-reentrant mutex."""
+        if hasattr(self, "_takes"):
+            return self._takes
+        # `-> &Mutex<..>` accessors hand out the mutex without locking it.
+        accessor = {id(fn) for f in self.files for fn in f.fns
+                    if re.search(r"->\s*&[^{]*\bMutex\b(?!Guard)", fn.header)}
+        takes = {i for i in self.acquirers if i not in accessor}
+        changed = True
+        while changed:
+            changed = False
+            for f in self.files:
+                for fn in f.fns:
+                    if id(fn) in takes or id(fn) in accessor or fn.name == ISOLATED_CHILD_FN:
+                        continue
+                    for _o, q, n in self.body_calls(fn):
+                        if any(id(t) in takes for t in self.resolve(fn.file, q, n)):
+                            takes.add(id(fn))
+                            changed = True
+                            break
+        self._takes = takes
+        return takes
+
+    def yields_guard(self, fn: Fn) -> bool:
+        if id(fn) in self.acquirers:
+            return True
+        m = re.search(r"->\s*([A-Za-z_][\w:]*)", fn.header)
+        if not m or id(fn) not in self.takes_lock():
+            return False
+        typ = m.group(1).split("::")[-1]
+        if typ == "Self":
+            typ = fn.impl_type or ""
+        info = self.info_of[fn.file]
+        return bool(typ) and self.type_holds_guard(info, typ)
+
+    def relocks(self, fn: Fn) -> list:
+        """Offsets where `fn` calls a lock-taking fn while a guard it took is live."""
+        info = self.info_of[fn.file]
+        takes = self.takes_lock()
+        calls = [(o, q, n) for o, q, n in self.body_calls(fn) if innermost_fn(info, o) is fn]
+        out = []
+        for o1, q1, n1 in calls:
+            if not any(self.yields_guard(t) for t in self.resolve(fn.file, q1, n1)):
+                continue
+            for o2, q2, n2 in calls:
+                if o2 <= o1 or n2 == ISOLATED_CHILD_FN:
+                    continue
+                if any(id(t) in takes for t in self.resolve(fn.file, q2, n2)) \
+                        and self.guard_live(info, o1, o2) and self.spawn_floor(fn, o2) is None:
+                    out.append(o2)
+        return sorted(set(out))
+
     def lock_before(self, fn: Fn, off: int, lo: int = -1) -> set:
         """Kinds of lock held at `off` ({'A','B','ISO'}); empty set = none."""
         info = self.info_of[fn.file]
@@ -642,6 +695,10 @@ def scan(root: Path) -> list[str]:
         for fn in f.fns:
             if not fn.test:
                 continue
+            for o2 in idx.relocks(fn):
+                violations.append(f"{f.rel}:{line_of(f.src, o2)}: relock in fn `{fn.name}` "
+                                  "takes the process-env mutex while a guard from it is still held "
+                                  "(std Mutex is not re-entrant: self-deadlock)")
             for coff, q, name in idx.body_calls(fn):
                 tg = [t for t in idx.resolve(fn.file, q, name) if id(t) in idx.acquirers
                       and re.search(r"->[^{]*&[^{]*\bMutex", t.header)]
@@ -706,6 +763,13 @@ mod tests {
     }
     #[test]
     fn holds_via_ctor() { let _h = Held::new(); }
+    #[test]
+    fn sequential_not_relock() {
+        { let _a = lock(); unsafe { std::env::set_var("SQ", "1") }; }
+        let _b = lock();
+        let m = crate::config::test_env_mutex();
+        let _same = (m, raw());
+    }
     #[test]
     fn agent_id_under_lock_b() {
         let _g = crate::identity::agent_id_env_test_lock();
@@ -776,6 +840,11 @@ mod tests {
         { let _g = crate::config::test_env_lock(); }
         unsafe { std::env::set_var("BAD7", "1") };
     }
+    #[test]
+    fn relock_direct() { let _a = lock(); let _b = lock(); unsafe { std::env::set_var("RL", "1") }; }
+    fn takes_inside() { let _t = lock(); }
+    #[test]
+    fn relock_via_helper() { let _a = lock(); takes_inside(); unsafe { std::env::set_var("RH", "1") }; }
     #[test]
     fn drop_released() {
         let g = crate::config::test_env_lock();
@@ -899,7 +968,7 @@ mod tests {
 SELF_TEST_EXPECTED = {
     ("src/bad.rs", "helper"), ("src/bad.rs", "no_lock"),
     ("src/bad.rs", "module_local_lock"), ("src/bad.rs", "dropped_guard"),
-    ("src/bad.rs", "lock_after"), ("src/bad.rs", "poke"),
+    ("src/bad.rs", "lock_after"), ("src/bad.rs", "poke"), ("src/bad.rs", "relock_direct"), ("src/bad.rs", "relock_via_helper"),
     ("src/bad.rs", "unlocked_chdir"),
     ("src/bad.rs", "turbofish_site"), ("src/bad.rs", "fn_pointer"),
     ("src/bad.rs", "block_released"), ("src/bad.rs", "drop_released"),
