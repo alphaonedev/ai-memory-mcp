@@ -662,3 +662,267 @@ fn issue_6522_walk_reads_every_trackable_text_file_type() {
         "the walk skipped a trackable text file type (false green)"
     );
 }
+
+/// Every tracked `.gitignore` outside the skipped root `vendor/`. The #6524
+/// test pins that the real walk finds exactly these, so a new ignore file
+/// cannot join the tree without joining the plant test below.
+const TRACKED_GITIGNORES: [&str; 15] = [
+    ".gitignore",
+    "clients/anthropic-shim-py/.gitignore",
+    "clients/anthropic-shim-ts/.gitignore",
+    "clients/host-adapter-shim/python/.gitignore",
+    "clients/openai-shim-py/.gitignore",
+    "clients/openai-shim-ts/.gitignore",
+    "deploy/do-1461/terraform/.gitignore",
+    "deploy/hive-1461/terraform/.gitignore",
+    "infra/do-hive/.gitignore",
+    "infra/do-hive/crypto/.gitignore",
+    "infra/federation-lab/.gitignore",
+    "infra/pgbouncer/.gitignore",
+    "infra/pillar4-envelope/.gitignore",
+    "sdk/python/.gitignore",
+    "sdk/typescript/.gitignore",
+];
+
+/// A concrete path, relative to the `.gitignore`'s directory, that the
+/// pattern on `line` matches, and whether the line re-includes (`!`).
+/// `*` and `**` become `zz`, `?` becomes `z`, a `[...]` class its first
+/// member; a pattern without a slash is planted one directory deeper to
+/// exercise any-depth matching, and a dir-only pattern gets a file inside.
+fn concrete_path(line: &str) -> Option<(String, bool)> {
+    let line = line.trim_end();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let (negate, rest) = line
+        .strip_prefix('!')
+        .map_or((false, line), |rest| (true, rest));
+    let (dir_only, rest) = rest
+        .strip_suffix('/')
+        .map_or((false, rest), |rest| (true, rest));
+    let anchored = rest.contains('/');
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    let mut path = String::new();
+    let rest = rest.replace("**", "zz");
+    let mut chars = rest.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => path.push_str("zz"),
+            '?' => path.push('z'),
+            '[' => {
+                let first = chars.next().expect("class member");
+                assert!(first != '!' && first != '^', "negated class in {line:?}");
+                path.push(first);
+                for c in chars.by_ref() {
+                    if c == ']' {
+                        break;
+                    }
+                }
+            }
+            c => path.push(c),
+        }
+    }
+    if !anchored {
+        path = format!("nest/{path}");
+    }
+    if dir_only {
+        path.push_str("/plant.txt");
+    }
+    Some((path, negate))
+}
+
+/// The last path component of a relative path.
+fn base_name(rel: &str) -> &str {
+    rel.rsplit('/').next().unwrap_or(rel)
+}
+
+/// #6524: every exclusion the walk applies is pinned, derived from the
+/// rules themselves rather than a second hand-written list.
+///
+/// 1. The real walk finds exactly [`TRACKED_GITIGNORES`].
+/// 2. Tree `lines`: for every line of every tracked `.gitignore` a path that
+///    line matches is planted. An ignore line's plant must be skipped, a `!`
+///    line's plant must be read. The exact skips (`.git` entries, the root
+///    `vendor/`) and `$GIT_DIR/info/exclude` are exercised too, and a
+///    `vendor/` below the root must be read.
+/// 3. Tree `files`: every dir-only line gets a plain FILE of that name,
+///    which must be read (a dir-only pattern never matches a file).
+/// 4. Tree `controls`, carrying only the nested `.gitignore` files: every
+///    nested ignore line's plant is repeated OUTSIDE that file's directory
+///    (`ctl/...`), where it must be read (a rule never reaches above its
+///    own `.gitignore`).
+///
+/// Every expected set was cross-checked against `git ls-files -o
+/// --exclude-standard` on the same plants (lines: 134 plants, 4 read;
+/// files: 49, 49 read; controls: 94, 94 read). A plant whose name the walk
+/// treats as binary (`.DS_Store`, #6522) is expected unread.
+#[test]
+fn issue_6524_walk_skips_every_exclusion_its_rules_name() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    let mut unreadable = Vec::new();
+    walk(root, &mut files, &mut unreadable);
+    let mut found: Vec<String> = files
+        .iter()
+        .filter_map(|f| f.strip_prefix(root).ok())
+        .map(|p| p.display().to_string())
+        .filter(|p| base_name(p) == ".gitignore")
+        .collect();
+    found.sort();
+    let mut want: Vec<String> = TRACKED_GITIGNORES.iter().map(ToString::to_string).collect();
+    want.sort();
+    assert_eq!(found, want, "a .gitignore joined or left the tree");
+
+    let lines = scratch_tree("6524-lines");
+    let dir_files = scratch_tree("6524-files");
+    let controls = scratch_tree("6524-ctl");
+    let mut want_lines = Vec::new();
+    let mut want_files = Vec::new();
+    let mut want_controls = Vec::new();
+    let mut negations = 0_usize;
+    for rel in TRACKED_GITIGNORES {
+        copy_gitignore(&lines, rel);
+        copy_gitignore(&dir_files, rel);
+        let base = rel.strip_suffix(".gitignore").unwrap_or_default();
+        if !base.is_empty() {
+            copy_gitignore(&controls, rel);
+        }
+        let body = fs::read_to_string(root.join(rel)).expect("read tracked .gitignore");
+        for line in body.lines() {
+            let Some((path, negate)) = concrete_path(line) else {
+                continue;
+            };
+            let planted = format!("{base}{path}");
+            plant(&lines, &planted, PLANT);
+            if negate {
+                negations += 1;
+                if !is_binary(base_name(&planted)) {
+                    want_lines.push(planted);
+                }
+                continue;
+            }
+            if let Some(file) = planted.strip_suffix("/plant.txt") {
+                plant(&dir_files, file, PLANT);
+                if !is_binary(base_name(file)) {
+                    want_files.push(file.to_string());
+                }
+            }
+            if !base.is_empty() {
+                let control = format!("ctl/{}{path}", base.replace('/', "-"));
+                plant(&controls, &control, PLANT);
+                if !is_binary(base_name(&control)) {
+                    want_controls.push(control);
+                }
+            }
+        }
+    }
+    for rel in [".git/config.json", "docs/.git", "vendor/paste/src/lib.rs"] {
+        plant(&lines, rel, PLANT);
+    }
+    plant(&lines, ".git/info/exclude", "zz-excluded.md\n");
+    plant(&lines, "zz-excluded.md", PLANT);
+    plant(&lines, "docs/vendor/kept.md", PLANT);
+    want_lines.push("docs/vendor/kept.md".to_string());
+
+    let mut results = Vec::new();
+    for (tree, mut want) in [
+        (&lines, want_lines),
+        (&dir_files, want_files),
+        (&controls, want_controls),
+    ] {
+        let (seen, unreadable) = walked(tree);
+        want.sort();
+        want.dedup();
+        results.push((tree.display().to_string(), seen, want, unreadable));
+    }
+    for tree in [&lines, &dir_files, &controls] {
+        let _ = fs::remove_dir_all(tree);
+    }
+
+    assert!(
+        negations >= 4,
+        "the tracked rules carry at least four `!` lines"
+    );
+    for (tree, seen, want, unreadable) in results {
+        assert!(unreadable.is_empty(), "{tree}: unreadable: {unreadable:?}");
+        assert!(want.len() >= 4, "{tree}: too few expected plants: {want:?}");
+        assert_eq!(
+            seen, want,
+            "{tree}: the walk read a path its rules exclude, or skipped a path no rule excludes"
+        );
+    }
+}
+
+/// #6524: a linked worktree's `.git` is a file (`gitdir: ...`) whose
+/// `commondir` leads to the shared `info/exclude`; the walk follows both.
+#[test]
+fn issue_6524_walk_honours_a_worktree_info_exclude() {
+    let tree = scratch_tree("6524-wt");
+    let common = scratch_tree("6524-wt-common");
+    let gitdir = common.join("worktrees").join("wt");
+    plant(&common, "worktrees/wt/commondir", "../..\n");
+    plant(&common, "info/exclude", "# local\nzz-wt-excluded.md\n");
+    plant(&tree, ".git", &format!("gitdir: {}\n", gitdir.display()));
+    plant(&tree, "zz-wt-excluded.md", PLANT);
+    plant(&tree, "kept.md", PLANT);
+    let (seen, unreadable) = walked(&tree);
+    let _ = fs::remove_dir_all(&tree);
+    let _ = fs::remove_dir_all(&common);
+    assert!(unreadable.is_empty(), "unreadable: {unreadable:?}");
+    assert_eq!(seen, vec!["kept.md".to_string()]);
+}
+
+/// #6524: the gitignore(5) matcher, case by case. Every row was
+/// cross-checked with `git check-ignore` (22 rows, 0 disagreements).
+#[test]
+fn issue_6524_glob_and_parse_follow_gitignore5() {
+    let cases: [(&[&str], &str, bool, bool); 22] = [
+        (&["docs/*.md"], "docs/a/b.md", false, false),
+        (&["docs/*.md"], "docs/b.md", false, true),
+        (&["x/a?b"], "x/a/b", false, false),
+        (&["x/a?b"], "x/acb", false, true),
+        (&["[!a]bc"], "xbc", false, true),
+        (&["[!a]bc"], "abc", false, false),
+        (&["[^a]bc"], "abc", false, false),
+        (&["[a-c]x"], "bx", false, true),
+        (&["[a-c]x"], "dx", false, false),
+        (&["**/foo"], "foo", false, true),
+        (&["**/foo"], "a/b/foo", false, true),
+        (&["a/**/b"], "a/b", false, true),
+        (&["a/**/b"], "a/x/y/b", false, true),
+        (&["a/**"], "a/x/y", false, true),
+        (&["foo "], "foo", false, true),
+        (&["build/"], "build", false, false),
+        (&["build/"], "build", true, true),
+        (&["*.log", "!keep.log"], "keep.log", false, false),
+        (&["*.log", "!keep.log"], "x.log", false, true),
+        (&["/root.md"], "sub/root.md", false, false),
+        (&["/root.md"], "root.md", false, true),
+        (&["name.md"], "a/b/name.md", false, true),
+    ];
+    for (lines, rel, is_dir, want) in cases {
+        let rules: Vec<IgnoreRule> = lines
+            .iter()
+            .filter_map(|line| parse_ignore_line(line, "").expect("parse"))
+            .collect();
+        assert_eq!(
+            is_ignored(rel, is_dir, &rules),
+            Ok(want),
+            "{lines:?} vs {rel:?} (dir: {is_dir})"
+        );
+    }
+    // Fail closed on what the walk does not implement or cannot evaluate.
+    assert!(parse_ignore_line("fo\\o", "").is_err(), "escape accepted");
+    assert!(
+        parse_ignore_line("/", "").is_err(),
+        "empty pattern accepted"
+    );
+    let malformed: Vec<IgnoreRule> = parse_ignore_line("[abc", "")
+        .into_iter()
+        .flatten()
+        .collect();
+    assert!(
+        is_ignored("abc", false, &malformed).is_err(),
+        "malformed class matched"
+    );
+}
