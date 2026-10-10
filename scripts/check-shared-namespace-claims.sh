@@ -281,9 +281,18 @@ SH
   out=$(run_check "$B" "$A1" "$A3"); rc=$?
   if [ $rc -ne 0 ]; then echo "self-test FAIL (1b): different versions flagged: $out"; ok=0; fi
   # (2) ceiling: identical pair on one file + a third different value -> FAIL naming the pair and both verdicts
-  C1=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", 7_440)/" tests/qual_10_module_size_ceiling.rs; for i in $(seq 69); do echo "// pad $i" >> src/storage/migrations.rs; done\n' | mk c1 "$B")
-  C2=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", 7_440)/" tests/qual_10_module_size_ceiling.rs\n' | mk c2 "$B")
-  C3=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", 7_400)/" tests/qual_10_module_size_ceiling.rs; for i in $(seq 25); do echo "// pad $i" >> src/storage/migrations.rs; done\n' | mk c3 "$B")
+  # #6826: derive the ceiling fixture from the tree at self-test time (the
+  # hardcoded 7_440 / 7_400 went stale as src/storage/migrations.rs grew).
+  # The gate projects base + every pad in the triple: L + 50 + 25 = L + 75,
+  # under the pair's L + 100 (PASSES) and over the third's L + 60 (WOULD RED).
+  _ML=$(git show "$B:src/storage/migrations.rs" | wc -l | tr -d ' ')
+  if ! printf '%s' "$_ML" | grep -qE '^[0-9]+$'; then
+    echo "self-test ABORT: could not count src/storage/migrations.rs lines at $B" >&2; exit 1
+  fi
+  CE12=$((_ML + 100)); CE3=$((_ML + 60))
+  C1=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", %s)/" tests/qual_10_module_size_ceiling.rs; for i in $(seq 50); do echo "// pad $i" >> src/storage/migrations.rs; done\n' "$CE12" | mk c1 "$B")
+  C2=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", %s)/" tests/qual_10_module_size_ceiling.rs\n' "$CE12" | mk c2 "$B")
+  C3=$(printf 'sed_i "s/(\\"src\\/storage\\/migrations.rs\\", *[0-9_]*)/(\\"src\\/storage\\/migrations.rs\\", %s)/" tests/qual_10_module_size_ceiling.rs; for i in $(seq 25); do echo "// pad $i" >> src/storage/migrations.rs; done\n' "$CE3" | mk c3 "$B")
   out=$(run_check "$B" "$C1" "$C2" "$C3"); rc=$?
   if [ $rc -ne 1 ] || ! printf '%s' "$out" | grep -q 'IDENTICAL PAIR' || ! printf '%s' "$out" | grep -q 'PASSES'; then echo "self-test FAIL (2): ceiling triple not reported with verdicts: $out"; ok=0; fi
   # (2b) negative control: two branches bumping DIFFERENT ceiling entries -> pass
