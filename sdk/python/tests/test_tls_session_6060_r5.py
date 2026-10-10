@@ -1916,3 +1916,21 @@ def test_closing_the_client_closes_the_gated_inner_transport_6694(is_async: bool
     else:
         client.close()
     assert inner.closed
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_gated_send_leaves_the_request_extensions_untouched_6659(is_async: bool) -> None:
+    """The SDK trace lives in a per-send copy; the caller's dict never sees it."""
+    context = ssl.create_default_context()
+    request = httpx.Request("GET", _ORIGIN, extensions={"timeout": {"connect": 1.0}})
+    before = request.extensions
+    snapshot = dict(before)
+    if is_async:
+        inner: Any = _AsyncRecordingTransport()
+        asyncio.run(_common._AsyncGatedTransport(inner, context).handle_async_request(request))
+    else:
+        inner = _RecordingTransport()
+        _common._GatedTransport(inner, context).handle_request(request)
+    assert "trace" in inner.seen[0]  # the inner transport did see the SDK trace
+    assert request.extensions is before  # restored (#6537)
+    assert request.extensions == snapshot  # and never written through
