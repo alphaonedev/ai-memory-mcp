@@ -559,9 +559,11 @@ class Round11EchoMask(unittest.TestCase):
 
     def test_owned_strings_carry_the_credential_owner_down_6780(self):
         root = SUBSET.parse_workflow(
-            "PASSWORD:\n  inner: x\n  list:\n    - k: y\nNAME:\n  inner: p\nflow: {PASSWORD: {inner: z}}\n")
-        owners = {text: owner for _line, owner, text in SUBSET.owned_strings(root) if text in ("x", "y", "z", "p")}
-        self.assertEqual(owners, {"x": "PASSWORD", "y": "PASSWORD", "z": "PASSWORD", "p": "inner"})
+            "PASSWORD:\n  inner: x\n  list:\n    - k: y\nNAME:\n  inner: p\nflow: {PASSWORD: {inner: z}}\n"
+            "other: {a: {b: w}}\n")
+        owners = {text: owner for _line, owner, text in SUBSET.owned_strings(root) if text in ("x", "y", "z", "p", "w")}
+        # #6893: below a non-credential flow key the nearest key, not the outer one, owns the value.
+        self.assertEqual(owners, {"x": "PASSWORD", "y": "PASSWORD", "z": "PASSWORD", "p": "inner", "w": "b"})
 
     def test_withhold_value_names_the_owner_and_never_the_text_6781(self):
         for owner in ("TOKEN+X", "PASSWORD", "inner", ""):
