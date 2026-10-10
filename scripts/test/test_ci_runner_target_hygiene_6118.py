@@ -774,7 +774,8 @@ def load_repo_files(root: Path = ROOT) -> Dict[str, str]:
 OVERRIDE_PROFILES = frozenset({"dev", "test"})
 OVERRIDE_TABLES = frozenset({"package", "build-override"})
 DEV_TEST_RE = re.compile(r"\b(?:dev|test)\b")
-TOML_UNICODE_RE = re.compile(r"\\u([0-9A-Fa-f]{4})|\\U([0-9A-Fa-f]{8})")
+# TOML basic-string escapes in a quoted key: \uXXXX, \UXXXXXXXX and TOML 1.1 \xHH (cargo 1.98.0, #6296)
+TOML_UNICODE_RE = re.compile(r"\\u([0-9A-Fa-f]{4})|\\U([0-9A-Fa-f]{8})|\\x([0-9A-Fa-f]{2})")
 BOM = "\ufeff"
 TOML_ML_RE = re.compile(r"=\s*(\"\"\"|\'\'\')")
 CONFIG_NAMES = (".cargo/config.toml", ".cargo/config")
@@ -792,7 +793,7 @@ def _toml_split(text: str, sep: str) -> List[str]:
     parts: List[str] = []
     cur: List[str] = []
     quote: Optional[str] = None
-    decoded = TOML_UNICODE_RE.sub(lambda m: _toml_char(int(m.group(1) or m.group(2), 16)), text)
+    decoded = TOML_UNICODE_RE.sub(lambda m: _toml_char(int(m.group(1) or m.group(2) or m.group(3), 16)), text)
     for ch in decoded.replace("\\", ""):
         if quote:
             if ch == quote:
