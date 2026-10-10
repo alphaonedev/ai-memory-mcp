@@ -89,7 +89,9 @@ _UNVERIFIED_MESSAGE = (
     "CA bundle file or CA directory (str or os.PathLike), or exactly an "
     "ssl.SSLContext (not a subclass, such as truststore.SSLContext) that is "
     "CERT_REQUIRED with check_hostname on, has no verify_flags that relax "
-    "chain validation and has no patched wrap_socket or "
+    "chain validation, offers no cipher suite without server authentication "
+    "(remove them with set_ciphers('<your list>:!PSK:!SRP:!aNULL:!eNULL')) "
+    "and has no patched wrap_socket or "
     "wrap_bio. Build one with ssl.create_default_context(cafile=<CA path>) "
     "or pass verify=<CA path>, e.g. <key_dir>/tls/local-ca.pem for a "
     "zero-config daemon (#3840, #6267, #6268)."
@@ -107,6 +109,7 @@ _HANDSHAKE_ATTRIBUTES = (
     "sslobject_class",
     "verify_flags",
     "hostname_checks_common_name",
+    "get_ciphers",
 )
 _STOCK_HANDSHAKE = {name: ssl.SSLContext.__dict__.get(name) for name in _HANDSHAKE_ATTRIBUTES}
 
@@ -149,7 +152,9 @@ def _context_verifies(context: object) -> bool:
     * the handshake-deciding class attributes are still the objects captured
       at import (#6268);
     * ``verify_flags`` (base descriptor) carries only bits in
-      :data:`_ALLOWED_VERIFY_FLAGS` (#6375).
+      :data:`_ALLOWED_VERIFY_FLAGS` (#6375);
+    * every cipher suite it offers authenticates the server and encrypts
+      (:func:`_suites_authenticate_server`, #6305).
     """
     if type(context) is not ssl.SSLContext:
         return False
@@ -160,10 +165,39 @@ def _context_verifies(context: object) -> bool:
     flags = int(ssl.SSLContext.verify_flags.__get__(context))  # type: ignore[attr-defined]
     if flags & ~_ALLOWED_VERIFY_FLAGS:
         return False
+    if not _suites_authenticate_server(context):
+        return False
     return bool(
         ssl.SSLContext.verify_mode.__get__(context) == ssl.CERT_REQUIRED  # type: ignore[attr-defined]
         and ssl.SSLContext.check_hostname.__get__(context)  # type: ignore[attr-defined]
     )
+
+
+#: ``get_ciphers()`` ``auth`` values of suites that authenticate no server
+#: certificate: anonymous, pre-shared key and SRP (#6305). TLS 1.3 suites
+#: report ``auth-any``; their authentication is the certificate exchange.
+_UNAUTHENTICATED_SUITE_AUTH = frozenset({"auth-null", "auth-psk", "auth-srp"})
+
+
+def _suites_authenticate_server(context: ssl.SSLContext) -> bool:
+    """Whether every suite ``context`` offers authenticates the server and encrypts (#6305).
+
+    An entry without an ``auth`` value, with an unauthenticated one, or with
+    no ``symmetric`` cipher (eNULL) refuses the whole context, and so does an
+    empty list.
+    """
+    suites = ssl.SSLContext.get_ciphers(context)
+    if not suites:
+        return False
+    for suite in suites:
+        if not isinstance(suite, dict):
+            return False
+        auth = suite.get("auth")
+        if not isinstance(auth, str) or auth in _UNAUTHENTICATED_SUITE_AUTH:
+            return False
+        if not isinstance(suite.get("symmetric"), str):
+            return False
+    return True
 
 
 def _context_from_path(path: str) -> ssl.SSLContext:
@@ -240,7 +274,8 @@ def _assert_negotiated_session(session: object, context: ssl.SSLContext, host: s
     ``getpeercert()`` is empty when the chain was not verified (``CERT_NONE``,
     ``CERT_OPTIONAL`` without a certificate, anonymous suites). The certificate
     must also name ``host``, the host the request is addressed to, whatever
-    the context's ``check_hostname`` was at handshake time (#6350). Unlike the
+    the context's ``check_hostname`` was at handshake time (#6350), and the
+    negotiated suite must carry secret bits (no eNULL, #6305). Unlike the
     pre-handshake predicate this inspects what actually happened on the wire,
     so it also closes the check/use race (#6306) and auth-null suites (#6305).
     """
@@ -251,6 +286,15 @@ def _assert_negotiated_session(session: object, context: ssl.SSLContext, host: s
     if not isinstance(peer, dict) or not peer:
         raise ValueError(_SESSION_MESSAGE)
     if not _peer_matches_host(peer, host, context):
+        raise ValueError(_SESSION_MESSAGE)
+    cipher = getattr(session, "cipher", None)
+    negotiated = None if cipher is None else cipher()
+    if (
+        not isinstance(negotiated, tuple)
+        or len(negotiated) != 3
+        or not isinstance(negotiated[2], int)
+        or negotiated[2] <= 0
+    ):
         raise ValueError(_SESSION_MESSAGE)
 
 
