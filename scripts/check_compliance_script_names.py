@@ -28,7 +28,7 @@ A line violates the gate when:
    written (a name hidden behind a character reference, an invisible character,
    a look-alike letter or emphasis), whether or not the script exists;
 3. a script name has a non-ASCII letter or mark where it has a letter
-   (``LOOSE_RE``, look-alike);
+   (``LOOSE_RE``, look-alike); a name glued to a run of dots or dashes is a name (#6632);
 4. a fragment of a script name (``c`` .. ``check-x.s``, ``HEAD_RE``) is followed by
    markup (``MARKUP``: ``< > \\ ` [ ] ( ) & ! $ { }``, #6622), or continues on the next line into
    markup or into the rest of a name: a renderer can join such pieces into a name;
@@ -99,14 +99,15 @@ import unicodedata
 from pathlib import Path
 
 # A script name anywhere on a line, bounded by non-name characters (#6195), in any ASCII letter case
-# (#6220). re.ASCII keeps IGNORECASE from folding the Kelvin sign or long s into ASCII letters.
+# (#6220). re.ASCII keeps IGNORECASE from folding the Kelvin sign or long s into ASCII letters. A
+# name after a run of dots or dashes (``Then...check-x.sh``, ``--check-x.sh``) is a name (#6632).
 TOKEN_RE = re.compile(
-    r"(?<![A-Za-z0-9_.-])(check[-_][A-Za-z0-9_-]+\.(?:sh|py))(?![A-Za-z0-9_])", re.IGNORECASE | re.ASCII
+    r"(?<![A-Za-z0-9_])(check[-_][A-Za-z0-9_-]+\.(?:sh|py))(?![A-Za-z0-9_])", re.IGNORECASE | re.ASCII
 )
 FULL_NAME_RE = re.compile(r"check[-_][A-Za-z0-9_-]+\.(?:sh|py)", re.IGNORECASE | re.ASCII)
 # A name fragment: any non-empty prefix of a script name, bounded on the left like TOKEN_RE.
 HEAD_RE = re.compile(
-    r"(?<![A-Za-z0-9_.-])(?:check[-_][A-Za-z0-9_.-]*|check|chec|che|ch|c)", re.IGNORECASE | re.ASCII
+    r"(?<![A-Za-z0-9_])(?:check[-_][A-Za-z0-9_.-]*|check|chec|che|ch|c)", re.IGNORECASE | re.ASCII
 )
 # The characters a renderer can drop or reinterpret between the pieces of a name.
 MARKUP = frozenset("<>\\`[]()&!${}")
@@ -277,7 +278,7 @@ def _loose(word):
 # letter or any non-ASCII letter, and a separator may be any non-ASCII, non-space character.
 NON_ASCII = r"[^\x00-\x7f\s]"
 LOOSE_RE = re.compile(
-    r"(?<![A-Za-z0-9_.-])" + _loose("check") + r"(?:[-_]|" + NON_ASCII + r")[\w-]+(?:\.|" + NON_ASCII
+    r"(?<![A-Za-z0-9_])" + _loose("check") + r"(?:[-_]|" + NON_ASCII + r")[\w-]+(?:\.|" + NON_ASCII
     + r")(?:" + _loose("sh") + "|" + _loose("py") + r")(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
@@ -297,19 +298,26 @@ def tokens(line):
     allowlist and erratum key) and ``target`` the root-relative path the citation names. A bare
     name is ``scripts/<name>``. A written path is taken as written, except that its leading
     ``''``/``.``/``..`` components, or a URL's host and path (a prefix starting ``//``), are
-    dropped when a ``scripts`` component follows them.
+    dropped when a ``scripts`` component follows them. A name glued to a run of dots or dashes
+    (#6632) is the last component's tail: with a ``/`` before it the whole written component is
+    checked, without one the name is bare.
     """
     for m in TOKEN_RE.finditer(line):
         start = m.start()
         while start > 0 and line[start - 1] in PATH_CHARS:
             start -= 1
         prefix = line[start : m.start()]
+        cut = prefix.rfind("/") + 1
+        if not cut:
+            prefix = ""
+        last = prefix[cut:] + m.group(1)
+        prefix = prefix[:cut]
         parts = prefix.split("/")[:-1] if prefix else ["scripts"]
         if "scripts" in parts:
             first = parts.index("scripts")
             if prefix.startswith("//") or all(p in ("", ".", "..") for p in parts[:first]):
                 parts = parts[first:]
-        yield prefix + m.group(1), m.group(1), "/".join(parts + [m.group(1)])
+        yield prefix + last, m.group(1), "/".join(parts + [last])
 
 
 def fragments(line, nxt, budget):
@@ -319,7 +327,9 @@ def fragments(line, nxt, budget):
     not a fragment. A fragment followed by a ``MARKUP`` character is reported; one that ends the
     line is reported when the next line, leading spaces and tabs removed, starts with markup or
     with characters that complete it into a script name. ``join`` is ``join_walk``'s verdict on
-    what follows the fragment (``budget`` is the line's walk budget).
+    what follows the fragment (``budget`` is the line's walk budget). A fragment glued to a run of
+    dots or dashes (``-c``, ``--check``: command-line flags, #6632) is reported only when it joins
+    or is unresolved; ``why`` is then None and it counts toward no allowlist entry.
     """
     for m in HEAD_RE.finditer(line):
         frag = m.group()
@@ -347,7 +357,12 @@ def fragments(line, nxt, budget):
             room = JOIN_WINDOW - len(text) - 1
             text += "\n" + nxt[: max(room, 0)]
             more = room < len(nxt)
-        yield frag, why, join_walk(frag, text, more, budget)
+        join = join_walk(frag, text, more, budget)
+        if m.start() and line[m.start() - 1] in ".-":
+            if join[0]:
+                yield frag, None, join
+            continue
+        yield frag, why, join
 
 
 def join_walk(frag, text, truncated, budget):
@@ -711,10 +726,12 @@ def scan_line(root, rel, lineno, line, nxt):
     for v, w in zip(shown, views(nxt) if nxt is not None else (None, None, None)):
         per = {}
         for frag, reason, (kind, name) in fragments(v, w, budget):
-            per[frag] = per.get(frag, 0) + 1
-            why.setdefault(frag, reason)
             if kind:
                 joins.add((frag, kind, name))
+            if reason is None:
+                continue
+            per[frag] = per.get(frag, 0) + 1
+            why.setdefault(frag, reason)
         for frag, n in per.items():
             frags[frag] = max(frags.get(frag, 0), n)
     # #6621, #6631: a join is red whatever the allowlist holds; a fragment entry only counts prose.
@@ -1089,6 +1106,8 @@ R12_CELLS = (
     ("M-left-word", "Run xcheck-a.sh daily.\n", "", 0, None),
     ("M-left-digit", "Run 1check-old.sh daily.\n", "", 0, None),
     ("M-left-existing", "Then...check_new.py daily.\n", "", 0, None),
+    ("M-left-flags", "Run `sha256sum -c` and `cargo fmt --check` here.\n", "", 0, None),
+    ("M-left-flag-join", "Run -c`heck-old.sh` daily.\n", "", 1, "joins into script name `check-old.sh`"),
 )
 
 
