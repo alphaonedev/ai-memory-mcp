@@ -235,7 +235,9 @@ def _refuse_shared_writable(what: str, path: str, mode: int) -> None:
 _PATH_SEPARATORS = tuple(sep for sep in (os.sep, os.altsep) if sep)
 
 
-def _refuse_untrusted_holder(path: str, directory: str, entry: str, info: os.stat_result) -> None:
+def _refuse_untrusted_holder(
+    path: str, directory: str, entry: str, info: os.stat_result | None
+) -> None:
     """Refuse ``directory`` when anyone but this user or root can change ``entry`` in it.
 
     The #6377 rule for a CA file's directory, applied to every directory the
@@ -243,7 +245,9 @@ def _refuse_untrusted_holder(path: str, directory: str, entry: str, info: os.sta
     the directory must be owned by this user or root (OpenSSH StrictModes),
     and must not let the group or others write, unless it is sticky and
     ``entry`` (``info`` is its ``lstat``) belongs to this user or root, since
-    nobody else can then replace it.
+    nobody else can then replace it. ``info`` is ``None`` for an entry that
+    does not exist: no sticky exception then, since anyone who can write the
+    directory can create it after this check (#6828).
     """
     held = os.stat(directory)
     trusted = (0, os.geteuid())
@@ -255,9 +259,14 @@ def _refuse_untrusted_holder(path: str, directory: str, entry: str, info: os.sta
             "Give the directory to this user or root (chown), or pass a CA path whose "
             "directories only you or root own (#6653)."
         )
-    sticky_and_owned = bool(held.st_mode & stat.S_ISVTX) and info.st_uid in trusted
+    sticky_and_owned = (
+        info is not None and bool(held.st_mode & stat.S_ISVTX) and info.st_uid in trusted
+    )
     if _shared_writable(held.st_mode) and not sticky_and_owned:
-        what = "the symlink" if stat.S_ISLNK(info.st_mode) else "the entry"
+        if info is None:
+            what = "the missing entry"
+        else:
+            what = "the symlink" if stat.S_ISLNK(info.st_mode) else "the entry"
         raise ValueError(
             f"verify= CA path {path!r} passes through {what} {entry!r}, whose directory "
             f"{directory!r} (owner uid {held.st_uid}, mode {stat.S_IMODE(held.st_mode):o}) "
@@ -282,7 +291,9 @@ def _checked_realpath(path: str) -> str:
     re-point a link or replace the file is refused (3-agent vote (6def5ab6),
     #6559, #6653). A missing component ends the walk with the remainder
     appended unchanged (a later ``..`` is NOT collapsed lexically; the kernel
-    returns ENOENT for it too), so the caller refuses the path.
+    returns ENOENT for it too), so the caller refuses the path; the directory
+    that would hold it is held to the same rule first, so nobody else can
+    create it between this walk and the open (#6828).
     """
     if os.name == "nt":
         return os.path.realpath(path)
@@ -300,6 +311,7 @@ def _checked_realpath(path: str) -> str:
         try:
             info = os.lstat(candidate)
         except OSError:
+            _refuse_untrusted_holder(path, resolved, candidate, None)
             return os.path.join(candidate, *parts)
         _refuse_untrusted_holder(path, resolved, candidate, info)
         if not stat.S_ISLNK(info.st_mode):
@@ -350,8 +362,14 @@ def _load_trust_file(context: ssl.SSLContext, shown: str, entry: str) -> None:
     would otherwise hang), and must be a regular file that neither it nor its
     directory lets the group or others rewrite; a sticky directory is
     admitted when the file belongs to this user or root, since nobody else
-    can then replace it. The file is loaded by path and re-checked to be the
-    same inode afterwards, so a swap during the load is refused (#6377).
+    can then replace it. The directory's owner must be this user or root.
+
+    The opened file is then bound to the rule: ``entry`` is walked again
+    AFTER the open, and the entry that walk ends at must be the inode the
+    descriptor holds, so the checks above describe a file every directory on
+    the way still vouches for (#6828). The file is loaded by path and
+    re-checked to be the same inode afterwards, so a swap during the load is
+    refused (#6377).
     """
     real = _checked_realpath(entry)
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -371,11 +389,17 @@ def _load_trust_file(context: ssl.SSLContext, shown: str, entry: str) -> None:
             "directory may hold only certificate and CRL files (#6307, #6377)."
         )
     _refuse_shared_writable("CA file", real, opened.st_mode)
-    parent = os.path.dirname(real)
-    held = os.stat(parent)
-    sticky_and_owned = bool(held.st_mode & stat.S_ISVTX) and opened.st_uid in (0, os.geteuid())
-    if not sticky_and_owned:
-        _refuse_shared_writable("CA file directory", parent, held.st_mode)
+    _refuse_untrusted_holder(shown, os.path.dirname(real), real, opened)
+    walked = _checked_realpath(entry)
+    try:
+        found = os.lstat(walked)
+    except OSError:
+        found = None
+    if found is None or (found.st_dev, found.st_ino) != (opened.st_dev, opened.st_ino):
+        raise ValueError(
+            f"verify= CA file {shown!r} changed while it was being checked: the file "
+            "opened is not the one its path names now (#6828)."
+        )
     try:
         context.load_verify_locations(cafile=real)
     except (ssl.SSLError, OSError) as exc:
