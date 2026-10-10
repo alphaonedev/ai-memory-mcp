@@ -2508,6 +2508,10 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                              ("#3899", "did not warn that a re-bind without re-measurement is forbidden"),
                              ("directly above an existing amendment header",
                               "did not name where the record may be placed"),
+                             ("ONE record may list every changed path",
+                              "did not say one record may list all changed paths (#6422)"),
+                             ("holds no record yet, anywhere below STATUS",
+                              "did not name the first-record placement"),
                          ])
     head13 = out13.split("\n", 1)[0]
     if "re-issue or void" in head13 or "non-discharging amendment" not in head13:
@@ -2517,7 +2521,9 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     f14 = edit_range("\n" + rec6124 + "\n" + amend("#6199", ["src/unrelated.rs"], cite=False),
                      label="f14")
     t.expect_red("6124-f14", "a second, unrelated new amendment", repo, exp6124, f14,
-                 red6124 + [("exactly one new amendment", "did not name the one-record rule")])
+                 red6124 + [("exactly one new amendment", "did not name the one-record rule"),
+                            ("one record may list every changed path",
+                             "did not say one record may list all changed paths (#6422)")])
     # (6124-f15a..d) RED - the header date is a real ISO date, not in the
     # future (#6356, X9: two days past the commit day), not back-dated before
     # the merge-base commit day (#6358).
