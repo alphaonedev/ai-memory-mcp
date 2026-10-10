@@ -5104,5 +5104,65 @@ class ChangelogRounds45_6334(unittest.TestCase):
         self.assertIn("merge_group.head_ref", self.text)
         self.assertIn("merge_group.base_sha", self.text)
 
+# #6188: the ci.yml classify carrier arm writes its five outputs through ONE grouped
+# redirect. Five separate `>> "$GITHUB_OUTPUT"` lines are shellcheck SC2129, the one
+# finding this branch added over the carrier base.
+CARRIER_OUTPUTS_6188 = ("docs_only=false", "test_impact=__ALL__", "test_impact_count=ALL",
+                        "test_impact_total=ALL", "test_impact_reason=carrier-push-full-pipeline")
+GITHUB_OUTPUT_REDIRECT = '>> "$GITHUB_OUTPUT"'
+
+
+def _carrier_output_problems(ci: str) -> List[str]:
+    """How the ci.yml carrier arm's output writes depart from one grouped redirect."""
+    arm = _carrier_arm(ci, "classify", CARRIER_ARM_IF)
+    if not arm:
+        return ["ci.yml classify carrier arm is missing"]
+    problems: List[str] = []
+    redirects = [ln.strip() for ln in arm.splitlines() if GITHUB_OUTPUT_REDIRECT in ln]
+    if redirects != ["} " + GITHUB_OUTPUT_REDIRECT]:
+        problems.append(f"carrier arm redirects to $GITHUB_OUTPUT {len(redirects)} time(s), "
+                        f"not once from a closing brace: {redirects}")
+    rows = [ln.strip() for ln in arm.splitlines()]
+    try:
+        start, end = rows.index("{"), rows.index("} " + GITHUB_OUTPUT_REDIRECT)
+    except ValueError:
+        return problems + ["carrier arm has no `{ ... } >> \"$GITHUB_OUTPUT\"` group"]
+    group = rows[start + 1:end]
+    want = [f'echo "{kv}"' for kv in CARRIER_OUTPUTS_6188]
+    if group != want:
+        problems.append(f"carrier output group is {group}, expected {want}")
+    return problems
+
+
+class CarrierOutputGrouped6188(unittest.TestCase):
+    """#6188: one grouped `$GITHUB_OUTPUT` redirect in the ci.yml carrier arm (SC2129)."""
+
+    def setUp(self) -> None:
+        self.ci = (WORKFLOWS / "ci.yml").read_text(encoding="utf-8")
+
+    def test_6188_live_carrier_arm_writes_through_one_group(self) -> None:
+        self.assertEqual([], _carrier_output_problems(self.ci))
+
+    def test_6188_m01_per_line_redirects_are_killed(self) -> None:
+        live = _carrier_arm(self.ci, "classify", CARRIER_ARM_IF)
+        self.assertTrue(live, "carrier arm anchor")
+        ungrouped = "".join(f'            echo "{kv}" >> "$GITHUB_OUTPUT"\n' for kv in CARRIER_OUTPUTS_6188)
+        start = live.index("\n") + 1
+        end = live.index("            echo \"::notice::")
+        mutant = self.ci.replace(live, live[:start] + ungrouped + live[end:], 1)
+        self.assertTrue(mutant != self.ci, "mutant must differ from the live ci.yml")
+        self.assertTrue(_carrier_output_problems(mutant))
+
+    def test_6188_m02_an_output_dropped_from_the_group_is_killed(self) -> None:
+        old = '              echo "test_impact_total=ALL"\n'
+        self.assertEqual(1, self.ci.count(old), "mutation anchor")
+        self.assertTrue(_carrier_output_problems(self.ci.replace(old, "", 1)))
+
+    def test_6188_m03_a_second_redirect_in_the_arm_is_killed(self) -> None:
+        old = '            echo "::notice::push to a chain carrier'
+        self.assertEqual(1, self.ci.count(old), "mutation anchor")
+        extra = '            echo "x=y" >> "$GITHUB_OUTPUT"\n' + old
+        self.assertTrue(_carrier_output_problems(self.ci.replace(old, extra, 1)))
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
