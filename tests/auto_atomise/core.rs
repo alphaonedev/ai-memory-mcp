@@ -715,6 +715,12 @@ fn test_auto_atomise_does_not_block_store_response() {
         let t0 = std::time::Instant::now();
         let _ = maybe_enqueue_auto_atomise(&conn, shared_db_path(), &m, &m.id, "ai:test", wiring());
         samples_on.push(t0.elapsed());
+        // #6865: the worker spawned by THIS sample keeps running (its 100 ms
+        // sleep plus the curator call) and would contend with the NEXT timed
+        // sample on a loaded host, turning a load spike into a false "hook
+        // blocks" failure. Let it finish OUTSIDE the timer; the assertion
+        // below is unchanged.
+        drain_workers(Duration::from_millis(150), Duration::from_secs(5));
     }
 
     fn median(xs: &mut [Duration]) -> Duration {
