@@ -3895,6 +3895,7 @@ APPROVAL_OPERATOR = "alphaonedev"
 
 APPROVAL_JOB_PERMISSIONS = {"contents": "read", "pull-requests": "read"}
 WORKFLOW_PERMISSIONS = {"contents": "read"}
+APPROVAL_EVALUATE_ENV = {"GH_TOKEN": "${{ github.token }}", "OPERATOR_LOGIN": APPROVAL_OPERATOR}
 
 
 def _row_scalar(body: str) -> str:
@@ -3989,6 +3990,13 @@ def _approval_job_problems(c8: str) -> List[str]:
                         f"not exactly {APPROVAL_JOB_PERMISSIONS!r}")
     if shape["top_permissions_row"] != "permissions:" or shape["top_permissions"] != WORKFLOW_PERMISSIONS:
         problems.append(f"workflow permissions are {shape['top_permissions']!r}, not exactly {WORKFLOW_PERMISSIONS!r}")
+    # #6341: the only env in the job is the Evaluate step's, and its token is the job-scoped
+    # github.token (bounded by the permissions above), never a repository secret.
+    envs = [step["env"] for step in shape["steps"] if "env" in step["keys"]]  # type: ignore[union-attr,index,operator]
+    if envs != [APPROVAL_EVALUATE_ENV]:
+        problems.append(f"step env mappings are {envs!r}, not exactly [{APPROVAL_EVALUATE_ENV!r}]")
+    if any("secrets." in body for _, body, _ in _meaningful(job)):
+        problems.append("the approval job references `secrets.`; it may use only github.token")
     return problems
 
 
