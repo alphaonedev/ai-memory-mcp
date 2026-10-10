@@ -32,9 +32,10 @@ A line violates the gate when:
 4. a fragment of a script name (``c`` .. ``check-x.s``, ``HEAD_RE``) is followed by
    markup (``MARKUP``: ``< > \\ ` [ ] ( ) & ! $ { }``, #6622), or continues on the next line into
    markup or into the rest of a name: a renderer can join such pieces into a name;
-   when the pieces after such a fragment join into a script name once markup or the
-   line break is dropped (``join_walk``), or the markup cannot be resolved, the line
-   violates the gate whatever the allowlist holds (#6621, #6631);
+   when the pieces after such a fragment join into a script name once markup or line
+   breaks are dropped (``join_walk``, which reads the rest of the paragraph and tracks each
+   comment, tag or link from its opener to its close, #6753, #6757), or the markup cannot be
+   resolved, the line violates the gate whatever the allowlist holds (#6621, #6631);
 5. it holds a bidirectional control character, raw or as a character reference;
 6. it holds a character whose line structure is ambiguous: a C0 control other
    than tab (CR, VT, FF and NUL included), DEL, a C1 control (NEL included),
@@ -130,8 +131,9 @@ NAME_WORD = frozenset(string.ascii_letters + string.digits + "_")
 PATH_LIMIT = 4096
 # The longest line the gate decides; a longer one is undecidable (exit 2, #6635).
 LINE_CEILING = 65536
-# The join walk (#6621, #6631): how many characters after a fragment it reads, and how many walk
-# states one line may spend before the line is undecidable (red).
+# The join walk (#6621, #6631): how many characters after a fragment it reads (the rest of the
+# line and of its paragraph, #6753, #6757), and how many walk states one line may spend before the
+# line is undecidable (red). Markup whose close may lie past JOIN_WINDOW is undecidable (red).
 JOIN_WINDOW = 512
 JOIN_BUDGET = 4096
 NAME_CHARS = frozenset(string.ascii_letters + string.digits + "_.-")
@@ -391,14 +393,16 @@ def tokens(line):
             yield prefix + last, name, prefix + last
 
 
-def fragments(line, nxt, budget):
+def fragments(line, nxt, follow, budget):
     """Yield (fragment, why, join) for each name fragment on ``line`` that markup or a line break can join.
 
     ``nxt`` is the following line or None. A whole script name (trailing dots aside) is a name,
     not a fragment. A fragment followed by a ``MARKUP`` character is reported; one that ends the
     line is reported when the next line, leading spaces and tabs removed, starts with markup or
     with characters that complete it into a script name. ``join`` is ``join_walk``'s verdict on
-    what follows the fragment (``budget`` is the line's walk budget). A fragment glued to a run of
+    what follows the fragment: the rest of the line, then ``follow()`` (``paragraph_rest``: the
+    rest of the paragraph, #6753, #6757), at most ``JOIN_WINDOW`` characters in all (``budget``
+    is the line's walk budget). A fragment glued to a run of
     dots or dashes (``-c``, ``--check``: command-line flags, #6632) is reported only when it joins
     or is unresolved; ``why`` is then None and it counts toward no allowlist entry.
     """
@@ -425,9 +429,10 @@ def fragments(line, nxt, budget):
         text = line[end : end + JOIN_WINDOW]
         more = end + JOIN_WINDOW < len(line)
         if nxt is not None and not more:
-            room = JOIN_WINDOW - len(text) - 1
-            text += "\n" + nxt[: max(room, 0)]
-            more = room < len(nxt)
+            rest = follow()
+            room = JOIN_WINDOW - len(text)
+            text += rest[:room]
+            more = room < len(rest)
         join = join_walk(frag, text, more, budget)
         if m.start() and line[m.start() - 1] in ".-":
             if join[0]:
@@ -436,19 +441,76 @@ def fragments(line, nxt, budget):
         yield frag, why, join
 
 
+def paragraph_rest(doc, start, stop, k):
+    """View ``k`` of lines ``start`` .. ``stop - 1`` (the rest of a paragraph), each after a ``\\n``.
+
+    ``doc`` holds each line's ``views``; ``stop`` is the paragraph's next blank line (or the line
+    count). With no line left the result is ``"\\n"``. It is cut after ``JOIN_WINDOW + 1``
+    characters, enough for ``fragments`` to tell whether the paragraph runs past the window.
+    """
+    out, size = [], 0
+    for j in range(start, stop):
+        if size > JOIN_WINDOW:
+            break
+        piece = "\n" + doc[j][k][:JOIN_WINDOW]
+        out.append(piece)
+        size += len(piece)
+    return "".join(out)[: JOIN_WINDOW + 1] if out else "\n"
+
+
+def html_end(text, pos):
+    """Index just past the HTML construct the ``<`` at ``pos`` opens; None when it does not close in ``text``.
+
+    A comment (``<!--``) ends at its first ``-->`` (``<!-->`` and ``<!--->`` at once), a CDATA
+    section at ``]]>``, a processing instruction at ``?>``, and a tag or declaration (``<`` then a
+    letter, ``/`` or ``!``) at the first ``>`` outside a quoted run, where any ``"`` or ``'`` opens a
+    run closed by the same quote. Each end is never before the end the renderer or a browser finds
+    (#6753, #6757), so a construct this finds closed inside ``text`` closes inside it. A ``<`` that
+    opens no construct ends at ``pos + 1``.
+    """
+    if text.startswith("<!-->", pos):
+        return pos + 5
+    if text.startswith("<!--->", pos):
+        return pos + 6
+    for opener, closer in (("<!--", "-->"), ("<![CDATA[", "]]>"), ("<?", "?>")):
+        if text.startswith(opener, pos):
+            i = text.find(closer, pos + len(opener))
+            return None if i < 0 else i + len(closer)
+    after = text[pos + 1 : pos + 2]
+    if not after or not (after in "/!" or after.isascii() and after.isalpha()):
+        return pos + 1
+    quote = None
+    for i in range(pos + 1, len(text)):
+        c = text[i]
+        if quote:
+            if c == quote:
+                quote = None
+        elif c in "\"'":
+            quote = c
+        elif c == ">":
+            return i + 1
+    return None
+
+
 def join_walk(frag, text, truncated, budget):
     """Return ('join', name), ('unresolved', None) or (None, None) for the markup after ``frag``.
 
-    ``text`` is what follows the fragment (at most ``JOIN_WINDOW`` characters, the next line after
-    a ``\\n``), ``truncated`` tells whether more follows, and ``budget`` is the line's remaining walk
-    states (a one-item list). The walk over-approximates a renderer: it drops single markup
-    characters (``JOIN_DROP``), may skip from ``<`` past ANY later ``>`` (a tag, a comment, or a
-    hidden element's content), from ``[`` past any later ``]`` and from ``(`` past any later ``)``
-    (a label or a link destination), decodes a character reference, and joins across the line
-    break. A path that spells a script name is a join; an unclosed ``<``, a walk that reaches the
-    window end, or an exhausted budget is unresolved. Either is red whatever the allowlist holds.
+    ``text`` is what follows the fragment: the rest of its line and of its paragraph, each later
+    line after a ``\\n`` (at most ``JOIN_WINDOW`` characters); ``truncated`` tells whether the
+    paragraph runs past it, and ``budget`` is the line's remaining walk states (a one-item list).
+    The walk over-approximates a renderer: it drops single markup characters (``JOIN_DROP``), may
+    skip from ``<`` past ANY later ``>`` (a tag, a comment, or a hidden element's content), from
+    ``[`` past any later ``]`` and from ``(`` past any later ``)`` (a label or a link destination),
+    decodes a character reference, and joins across line breaks. Each construct is tracked from
+    its opener to its close across the whole window (#6753, #6757): a path that spells a script
+    name is a join; a ``<`` whose construct does not close in ``text`` (``html_end``), a ``[`` or
+    ``(`` in a truncated window (its close may lie past it), a walk that reaches the end of a
+    truncated window, or an exhausted budget is unresolved. Either is red whatever the allowlist
+    holds.
     """
     unresolved = False
+    closers = {ch: [i for i, c in enumerate(text) if c == ch] for ch in ">])"}
+    ends_at = {}
     stack, seen = [(0, "")], set()
     while stack:
         pos, acc = stack.pop()
@@ -485,14 +547,19 @@ def join_walk(frag, text, truncated, budget):
                 nxt += 1
             stack.append((nxt, acc))
         elif c == "<":
-            ends = [i + 1 for i in range(pos + 1, len(text)) if text[i] == ">"]
-            if not ends:
+            if pos not in ends_at:
+                ends_at[pos] = html_end(text, pos)
+            gts = closers[">"]
+            ends = gts[bisect.bisect_right(gts, pos) :]
+            if not ends or ends_at[pos] is None:
                 unresolved = True
-            stack.extend((i, acc) for i in ends)
+            stack.extend((i + 1, acc) for i in ends)
         elif c in "[(":
-            close = "]" if c == "[" else ")"
+            if truncated:
+                unresolved = True
+            close = closers["]" if c == "[" else ")"]
             stack.append((nxt, acc))
-            stack.extend((i + 1, acc) for i in range(pos + 1, len(text)) if text[i] == close)
+            stack.extend((i + 1, acc) for i in close[bisect.bisect_right(close, pos) :])
         elif c in JOIN_DROP:
             stack.append((nxt, acc))
     return ("unresolved", None) if unresolved else (None, None)
@@ -804,8 +871,13 @@ def load_allowlist(root):
     return entries, problems
 
 
-def scan_line(root, rel, lineno, line, nxt):
-    """Return (problems, stale, frags) for one line: stale and frags map a token to its count."""
+def scan_line(root, rel, doc, i, stop):
+    """Return (problems, stale, cited_at, frags, why) for line ``i`` of ``doc`` (each line's ``views``).
+
+    ``stop`` is the index of the paragraph's next blank line (or the line count); stale and frags
+    map a token to its count.
+    """
+    lineno, shown, line = i + 1, doc[i], doc[i][0]
     problems = []
     for c in sorted({c for c in line if odd(c)}):
         problems.append(
@@ -816,7 +888,6 @@ def scan_line(root, rel, lineno, line, nxt):
         problems.append(
             "%s:%d: bidirectional control character U+%04X (it reorders what a reader sees)" % (rel, lineno, ord(c))
         )
-    shown = views(line)
     for name in sorted({n for n in lookalikes(line)}):
         problems.append(
             "%s:%d: look-alike script name %s (a non-ASCII letter or mark where a script name has an ASCII letter)"
@@ -845,9 +916,15 @@ def scan_line(root, rel, lineno, line, nxt):
             stale[name] = max(stale.get(name, 0), n)
     frags, why, joins = {}, {}, set()
     budget = [JOIN_BUDGET]
-    for v, w in zip(shown, views(nxt) if nxt is not None else (None, None, None)):
-        per = {}
-        for frag, reason, (kind, name) in fragments(v, w, budget):
+    for k, (v, w) in enumerate(zip(shown, doc[i + 1] if i + 1 < len(doc) else (None, None, None))):
+        per, rest = {}, []
+
+        def follow(k=k, rest=rest):
+            if not rest:
+                rest.append(paragraph_rest(doc, i + 1, stop, k))
+            return rest[0]
+
+        for frag, reason, (kind, name) in fragments(v, w, follow, budget):
             if kind:
                 joins.add((frag, kind, name))
             if reason is None:
@@ -865,8 +942,9 @@ def scan_line(root, rel, lineno, line, nxt):
             )
         else:
             problems.append(
-                "%s:%d: name fragment `%s` is followed by markup the gate cannot resolve (an unclosed `<`,"
-                " or more than %d characters or %d steps; no allowlist entry suppresses this)"
+                "%s:%d: name fragment `%s` is followed by markup the gate cannot resolve (a comment, tag or"
+                " link that does not close within its paragraph, or more than %d characters or %d steps; no"
+                " allowlist entry suppresses this)"
                 % (rel, lineno, frag, JOIN_WINDOW, JOIN_BUDGET)
             )
     return problems, stale, cited_at, frags, why
@@ -899,9 +977,15 @@ def check(root):
                 per_doc.setdefault(rel, {})[name] = succ
     seen = {}
     for rel, raw in lines_by_doc:
-        for i, line in enumerate(raw):
-            nxt = raw[i + 1] if i + 1 < len(raw) else None
-            found, stale, cited_at, frags, why = scan_line(root, rel, i + 1, line, nxt)
+        doc = [views(line) for line in raw]
+        # stops[i]: the paragraph of line i ends before the next blank line (#6753, #6757).
+        stops, stop = [0] * len(raw), len(raw)
+        for i in range(len(raw) - 1, -1, -1):
+            stops[i] = stop
+            if not raw[i].strip(" \t"):
+                stop = i
+        for i in range(len(raw)):
+            found, stale, cited_at, frags, why = scan_line(root, rel, doc, i, stops[i])
             problems.extend(found)
             for name, n in sorted(stale.items()):
                 seen[(rel, name)] = seen.get((rel, name), 0) + n
@@ -1209,7 +1293,8 @@ R12_CELLS = (
     ("L-frag-swap-quoted", r12_swap('(c<b title="a>b">heck-gone.sh)'), R12_FRAG, 1, R12_JOIN),
     ("L-frag-swap-reflink", r12_swap("([c][r]heck-gone.sh)"), R12_FRAG, 1, R12_JOIN),
     ("L-frag-swap-break", r12_swap("c\nheck-gone.sh"), R12_FRAG, 1, R12_JOIN),
-    ("L-frag-swap-unclosed", r12_swap("(c<b\nclass=x\ntitle=y>heck-gone.sh)"), R12_FRAG, 1, "cannot resolve"),
+    # #6753: the tag closes on the third line of the paragraph, so the join is resolved and named.
+    ("L-frag-swap-unclosed", r12_swap("(c<b\nclass=x\ntitle=y>heck-gone.sh)"), R12_FRAG, 1, R12_JOIN),
     ("L-frag-swap-check", "Use check<!-- -->_gone.py now.\n", "docs/compliance/A.md:check:1\n", 1,
      "joins into script name `check_gone.py`"),
     ("L-frag-swap-escape", "Use (check\\-gone.sh) now.\n", "docs/compliance/A.md:check:1\n", 1, R12_JOIN),
