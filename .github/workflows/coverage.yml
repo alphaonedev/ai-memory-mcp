@@ -593,7 +593,7 @@ jobs:
         # sal-postgres suite at `--test-threads=1` for the same per-DDL
         # serialisation + llvm-cov-memory reasons. Coverage line/region
         # counts are thread-count-independent, so the per-module thresholds
-        # are unaffected; the 75-minute job timeout absorbs the serial run.
+        # are unaffected; the 110-minute job timeout (#7070) absorbs the serial run.
 
       - name: Enforce per-module thresholds
         id: thresholds
