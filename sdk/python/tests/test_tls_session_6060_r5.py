@@ -1180,5 +1180,61 @@ def test_class_level_replacement_of_any_handshake_attribute_is_refused_6363(
         client_cls(base_url=_ORIGIN, verify=context)
 
 
+# ---- #6378: the per-request re-check refuses on its own ---------------------
+
+
+def _weakened_then_get(client_cls: type, url: str, context: ssl.SSLContext, weaken: Hook) -> None:
+    """Build a client on ``context``, weaken the context, then send one GET."""
+    if client_cls is AiMemoryClient:
+        with AiMemoryClient(base_url=url, verify=context, api_key=_API_KEY, timeout=5) as client:
+            weaken(context)
+            client._client.get("/x")  # noqa: SLF001
+        return
+
+    async def run() -> None:
+        async with AsyncAiMemoryClient(
+            base_url=url, verify=context, api_key=_API_KEY, timeout=5
+        ) as client:
+            weaken(context)
+            await client._client.get("/x")  # noqa: SLF001
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_hostname_check_turned_off_after_construction_is_refused_by_the_recheck_6378(
+    origin: RecordingServer, lab: Lab, monkeypatch: pytest.MonkeyPatch, client_cls: type
+) -> None:
+    # The server's certificate names the request host, so the session check
+    # admits the session: only the per-request re-check sees the change.
+    _clear_proxy_env(monkeypatch)
+    with pytest.raises(ValueError, match="verify=False is refused"):
+        _weakened_then_get(client_cls, origin.url, lab.client_context(), _no_hostname_check)
+    assert origin.hits == []
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_class_level_patch_after_construction_is_refused_by_the_recheck_6378(
+    origin: RecordingServer, lab: Lab, monkeypatch: pytest.MonkeyPatch, client_cls: type
+) -> None:
+    _clear_proxy_env(monkeypatch)
+
+    def patch_class(_context: ssl.SSLContext) -> None:
+        monkeypatch.setattr(ssl.SSLContext, "wrap_bio", _equivalent_replacement("wrap_bio"))
+
+    with pytest.raises(ValueError, match="verify=False is refused"):
+        _weakened_then_get(client_cls, origin.url, lab.client_context(), patch_class)
+    assert origin.hits == []
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_unweakened_context_reaches_the_right_name_origin_6378(
+    origin: RecordingServer, lab: Lab, monkeypatch: pytest.MonkeyPatch, client_cls: type
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    _weakened_then_get(client_cls, origin.url, lab.client_context(), lambda _context: None)
+    assert len(origin.hits) == 1
+
+
 def test_lab_temp_root_is_project_local_6309(lab: Lab) -> None:
     assert ".local-runs" in pathlib.Path(lab.ca_path).resolve().parts
