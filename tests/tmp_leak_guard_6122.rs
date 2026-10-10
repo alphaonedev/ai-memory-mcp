@@ -222,22 +222,78 @@ const KNOWN_MEM_FORGET_SITES: &[(&str, usize)] = &[
     ("tests/wake_sink_3469.rs", 2),
 ];
 
-#[test]
-fn no_new_mem_forget_of_temp_handle_6122() {
+/// Violations of the `mem::forget(` ceiling for `sources` against `table`.
+fn forget_violations(table: &[(&str, usize)], sources: &[(String, String)]) -> Vec<String> {
     let mut over = Vec::new();
-    for (name, src) in suite_sources() {
+    for (name, src) in sources {
         let found = src.matches("mem::forget(").count();
-        let allowed = KNOWN_MEM_FORGET_SITES
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map_or(0, |(_, c)| *c);
+        let allowed = table.iter().find(|(n, _)| n == name).map_or(0, |(_, c)| *c);
         if found > allowed {
             over.push(format!("{name}: {found} site(s), ceiling {allowed}"));
         }
     }
+    over
+}
+
+#[test]
+fn no_new_mem_forget_of_temp_handle_6122() {
+    let over = forget_violations(KNOWN_MEM_FORGET_SITES, &suite_sources());
     assert!(
         over.is_empty(),
         "#6122: std::mem::forget of a temp handle leaks the scratch file every run; \
          keep the handle bound for the test lifetime instead: {over:?}"
+    );
+}
+
+fn fixture(name: &str, forgets: usize) -> (String, String) {
+    let body = "std::mem::forget(handle);\n".repeat(forgets);
+    (name.to_owned(), format!("fn t() {{\n{body}}}\n"))
+}
+
+/// #6787: a listed file whose count FELL below its pin is a stale entry; the
+/// pin must be lowered in the same commit, or a later forget re-spends it.
+#[test]
+fn forget_pin_rejects_stale_lowered_count_6787() {
+    let sources = [fixture("tests/a.rs", 1)];
+    let over = forget_violations(&[("tests/a.rs", 2)], &sources);
+    assert!(
+        over.iter().any(|v| v.contains("tests/a.rs")),
+        "#6787: a pin of 2 over 1 real site must fail (lower the entry): {over:?}"
+    );
+}
+
+/// #6787: a listed file that no longer exists or has zero sites is stale.
+#[test]
+fn forget_pin_rejects_missing_or_zero_listed_file_6787() {
+    let sources = [fixture("tests/zero.rs", 0)];
+    let over = forget_violations(&[("tests/gone.rs", 1), ("tests/zero.rs", 1)], &sources);
+    assert!(
+        over.iter().any(|v| v.contains("tests/gone.rs")),
+        "#6787: a listed file that no longer exists must fail: {over:?}"
+    );
+    assert!(
+        over.iter().any(|v| v.contains("tests/zero.rs")),
+        "#6787: a listed file at 0 sites must fail: {over:?}"
+    );
+}
+
+/// #6804 (mutant M4): raising one real pin by one, with the source unchanged,
+/// must be caught.
+#[test]
+fn forget_pin_rejects_raised_real_entry_6804() {
+    let raised: Vec<(&str, usize)> = KNOWN_MEM_FORGET_SITES
+        .iter()
+        .map(|&(n, c)| {
+            if n == "tests/wake_client_3470.rs" {
+                (n, c + 1)
+            } else {
+                (n, c)
+            }
+        })
+        .collect();
+    let over = forget_violations(&raised, &suite_sources());
+    assert!(
+        over.iter().any(|v| v.contains("tests/wake_client_3470.rs")),
+        "#6804: raising a pin without a new site must fail: {over:?}"
     );
 }
