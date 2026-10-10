@@ -1108,6 +1108,16 @@ R12_CELLS = (
     ("M-left-existing", "Then...check_new.py daily.\n", "", 0, None),
     ("M-left-flags", "Run `sha256sum -c` and `cargo fmt --check` here.\n", "", 0, None),
     ("M-left-flag-join", "Run -c`heck-old.sh` daily.\n", "", 1, "joins into script name `check-old.sh`"),
+) + tuple(
+    # #6633: a dash or dot look-alike inside a name, or a space mark as its separator.
+    ("E-dash-mid-%04X" % cp, "Run check-old%sx.sh daily.\n" % chr(cp), "", 1, "look-alike script name")
+    for cp in (0x2500, 0x2501, 0x23AF, 0x23BA, 0x2E0F, 0x00AF, 0x00B7, 0x2027, 0x10191, 0x1680)
+) + (
+    ("E-dash-sep-1680", "Run check\u1680old.sh daily.\n", "", 1, "look-alike script name"),
+) + tuple(
+    # #6633: each new DASHES member folds to ``-``, so the folded view shows the name.
+    ("E-dash-fold-%04X" % cp, "Run check-old%sx.sh daily.\n" % chr(cp), "", 1, "`check-old-x.sh` is shown only after")
+    for cp in (0x2500, 0x2501, 0x23AF, 0x23BA, 0x2E0F, 0x00AF, 0x1680)
 )
 
 
