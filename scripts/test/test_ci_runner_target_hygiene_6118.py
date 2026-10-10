@@ -2889,6 +2889,26 @@ class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
         shell_only = "    defaults:\n      run:\n        shell: bash\n"
         self.assertEqual([], self._mutated(_replace_once(self.ci, CHECK_RUNS_ON, CHECK_RUNS_ON + shell_only)))
 
+    # ---- #6531: the rustflags table restriction, in both TOML readers ----
+
+    def test_6118_r7_6531_env_table_lowercase_rustflags_stays_clean_when_step_written(self) -> None:
+        body = '[env]\nrustflags = "-g"\nrustdocflags = "-g"\n'
+        self.assertEqual([], self._repo_mutated(".cargo/config.toml", body))
+        self.assertEqual([], self._before_prune(
+            R7_PRE + "        run: |\n          cat >> .cargo/config.toml <<'EOF'\n"
+            + "".join("          %s\n" % line for line in body.splitlines()) + "          EOF\n"))
+
+    def test_6118_r7_6531_profile_table_rustflags_is_flagged(self) -> None:
+        # decision: flag [profile.<name>] rustflags over treating it as inert, because cargo
+        # applies it under -Z profile-rustflags and the guard fails closed on a debuginfo source.
+        body = '[profile.dev]\nrustflags = ["-g"]\n'
+        found = self._repo_mutated(".cargo/config.toml", body)
+        self.assertTrue(self._flagged(found), found)
+        found = self._before_prune(
+            R7_PRE + "        run: |\n          cat >> .cargo/config.toml <<'EOF'\n"
+            + "".join("          %s\n" % line for line in body.splitlines()) + "          EOF\n")
+        self.assertTrue(self._flagged(found), found)
+
 class PruneScript6118(unittest.TestCase):
     """scripts/ci/prune-runner-target.py against a fake cargo target tree."""
 
