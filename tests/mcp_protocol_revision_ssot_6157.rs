@@ -663,6 +663,44 @@ fn issue_6522_walk_reads_every_trackable_text_file_type() {
     );
 }
 
+/// #6533: a directory NAME is never a reason to skip. Round 3 skipped
+/// `build`, `dist`, `venv`, `target`, `worktrees` and five cache names at
+/// any depth, so a tracked file under `infra/build/` or `src/target/` was
+/// never read (false green). Under the repository's real root `.gitignore`
+/// every path in `KEPT` is trackable (`git check-ignore` exit 1) and must be
+/// read; `__pycache__`, which that file ignores at any depth, must not be.
+#[test]
+fn issue_6533_walk_reads_tracked_files_under_formerly_excluded_names() {
+    const KEPT: [&str; 10] = [
+        "deploy/worktrees/zz_plant.md",
+        "docs/.mypy_cache/zz_plant.md",
+        "docs/.pytest_cache/zz_plant.md",
+        "docs/.ruff_cache/zz_plant.md",
+        "docs/.venv/zz_plant.md",
+        "docs/dist/zz_plant.md",
+        "docs/node_modules/zz_plant.md",
+        "infra/build/zz_plant.json",
+        "scripts/venv/zz_plant.py",
+        "src/target/zz_plant.rs",
+    ];
+    let scratch = scratch_tree("6533");
+    copy_gitignore(&scratch, ".gitignore");
+    for rel in KEPT {
+        plant(&scratch, rel, PLANT);
+    }
+    plant(&scratch, "tools/__pycache__/zz_plant.md", PLANT);
+    let (seen, unreadable) = walked(&scratch);
+    let _ = fs::remove_dir_all(&scratch);
+
+    assert!(unreadable.is_empty(), "unreadable: {unreadable:?}");
+    let want: Vec<String> = KEPT.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        seen, want,
+        "the walk skipped a trackable file by directory name (false green) \
+         or read a path the root .gitignore ignores"
+    );
+}
+
 /// Every tracked `.gitignore` outside the skipped root `vendor/`. The #6524
 /// test pins that the real walk finds exactly these, so a new ignore file
 /// cannot join the tree without joining the plant test below.
