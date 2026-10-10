@@ -33,6 +33,8 @@ use crate::models::field_names;
 
 // #3659 — delivery-audit bookkeeping evidence (counters, /metrics, /health).
 pub mod audit_status;
+#[cfg(test)]
+mod dns_guard_4165_tests;
 // #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
 mod unstarted;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
@@ -2828,7 +2830,11 @@ mod tests {
     /// `Ok` (legacy permissive) and panicking. Poison-tolerant via
     /// `into_inner` so one panicking test doesn't cascade-fail the
     /// other.
-    static SSRF_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // `pub(super)` (#4165) — the sibling child module `dns_guard_4165_tests`
+    // drives the real ladder and must hold the same guard the fail-open env
+    // cell below holds, or a concurrent `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL=1`
+    // window would turn its deterministic refusal into a resolver pass.
+    pub(super) static SSRF_ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn shutdown_budget_covers_one_full_webhook_retry_ladder() {
