@@ -685,6 +685,31 @@ fn aliased_and_imported_sqlite_opens_are_recognised_6788() {
     )));
 }
 
+/// #6804: every literal open needle is pinned on its own. A fixture that holds
+/// ONLY that spelling must be an offender, so deleting a needle from
+/// `OPEN_NEEDLES` (whatever else still matches in the real tree) fails here.
+/// The list is written out on purpose: it must not be derived from the const
+/// it checks.
+#[test]
+fn each_literal_open_needle_is_load_bearing_6804() {
+    let raw = "let f = tempfile::NamedTempFile::new().unwrap();";
+    for call in [
+        "x::db::open(f.path())",
+        "SqliteStore::open(f.path())",
+        "x::open_db(f.path())",
+        "Connection::open(f.path())",
+        "storage::open(f.path())",
+        "x::open_read_only(f.path())",
+        "x::open_with_flags(f.path(), fl)",
+    ] {
+        let src = format!("fn t() {{ {call}; }}\n{raw}");
+        assert!(
+            offender(&src),
+            "#6804: open spelling not recognised: {call}"
+        );
+    }
+}
+
 /// #6805: `SqliteTempFile` backs ~200 suites, so its creation properties are
 /// pinned: owner-only mode (0600) for the database AND its `-wal` / `-shm`, a
 /// random name that differs per call, and the process temp dir (`new`) / the
