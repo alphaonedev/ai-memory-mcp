@@ -3090,6 +3090,21 @@ def _once(old: str, new: str) -> Transform:
     return lambda s: s.replace(old, new, 1)
 
 
+def _changed(fn: Transform) -> Transform:
+    """``fn``, refusing to be a silent no-op (a case built on it must really edit the file)."""
+    def go(text: str) -> str:
+        out = fn(text)
+        if out == text:
+            raise RuntimeError("mutation transform changed nothing")
+        return out
+    return go
+
+
+def _uses(job: str, old: str, new: str) -> Edit:
+    """#6904 / #7010: repoint the first ``uses: old`` of release.yml job ``job``."""
+    return _rel("uses: " + old, _changed(_in_job(job, _once("uses: " + old, "uses: " + new))))
+
+
 # #6282 / #3613 anchors: one epoch per artifact job (a pinned step output), the
 # deterministic packer, the docker build-arg (red until they land).
 EPOCH_YAML = ("      - name: Source date epoch (#3613)\n        id: epoch\n        shell: bash\n        run: |\n"
@@ -3261,6 +3276,27 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "3613 proof compares a different target": ("fail", [_rel(
         BUILD_HDR, _edit_all(IND + PROOF_CMD + "\n", IND + PROOF_CMD.replace("x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu") + "\n"))]),
     "3613 proof step deleted": ("fail", [_rel(BUILD_HDR, _edit_all(IND + PROOF_CMD + "\n", IND + "true\n"))]),
+    # --- #6904 / #7010: every `uses:` of the release workflows is a full 40-hex commit sha
+    "7010 supply-chain toolchain repointed to @stable": ("fail", [_uses(
+        "supply-chain", SHAPE_TOOLCHAIN_USES, "dtolnay/rust-toolchain@stable")]),
+    "7010 crates-io toolchain repointed to @stable": ("fail", [_uses(
+        "crates-io", SHAPE_TOOLCHAIN_USES, "dtolnay/rust-toolchain@stable")]),
+    "6904 preflight checkout repointed to a tag": ("fail", [_uses("preflight", CHECKOUT_USES, "actions/checkout@v4")]),
+    "6904 qualify checkout repointed to a branch": ("fail", [_uses("qualify", CHECKOUT_USES, "actions/checkout@main")]),
+    "6904 homebrew checkout pinned to a 39-hex ref": ("fail", [_uses("homebrew", CHECKOUT_USES, CHECKOUT_USES[:-1])]),
+    "6904 copr checkout pinned to an upper-case sha": ("fail", [_uses(
+        "copr", CHECKOUT_USES, CHECKOUT_USES.split("@")[0] + "@" + CHECKOUT_USES.split("@")[1].upper())]),
+    "6904 mobile-android ndk action repointed to a tag": ("fail", [_uses(
+        "mobile-android", "nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779", "nttld/setup-ndk@v1")]),
+    "6904 mobile-ios cache action repointed to a tag": ("fail", [_uses(
+        "mobile-ios", RUST_CACHE_USES, "Swatinem/rust-cache@v2")]),
+    "6904 crates-io checkout replaced by a docker image tag": ("fail", [_uses(
+        "crates-io", CHECKOUT_USES, "docker://alpine:3")]),
+    "6904 sbom cache action repointed to a tag": ("fail", [_uses("sbom", RUST_CACHE_USES, "Swatinem/rust-cache@v2")]),
+    # --- #6905: the final stage runs as the pinned non-root user
+    "6905 final stage without USER aimem": ("fail", [_docker("USER aimem\n", "")]),
+    "6905 final stage USER aimem twice": ("fail", [_docker("USER aimem\n", "USER aimem\nUSER aimem\n")]),
+    "6905 final stage USER root": ("fail", [_docker("USER aimem\n", "USER root\n")]),
     "6909 proof runs without -I": ("fail", [_rel(PROOF_CMD, PROOF_CMD.replace("/usr/bin/python3 -I ", "/usr/bin/python3 "))]),
     "6909 proof runs outside env -i": ("fail", [_rel(PROOF_CMD, PROOF_CMD.replace("/usr/bin/env -i ", "/usr/bin/env "))]),
     "6909 proof passes PYTHONPATH through": ("fail", [_rel(PROOF_CMD, PROOF_CMD.replace(
