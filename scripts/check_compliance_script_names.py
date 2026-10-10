@@ -30,7 +30,7 @@ A line violates the gate when:
 3. a script name has a non-ASCII letter or mark where it has a letter
    (``LOOSE_RE``, look-alike);
 4. a fragment of a script name (``c`` .. ``check-x.s``, ``HEAD_RE``) is followed by
-   markup (``MARKUP``: ``< > \\ ` [ ] ( ) &``), or continues on the next line into
+   markup (``MARKUP``: ``< > \\ ` [ ] ( ) & ! $ { }``, #6622), or continues on the next line into
    markup or into the rest of a name: a renderer can join such pieces into a name;
 5. it holds a bidirectional control character, raw or as a character reference;
 6. it holds a character whose line structure is ambiguous: a C0 control other
@@ -105,7 +105,7 @@ HEAD_RE = re.compile(
     r"(?<![A-Za-z0-9_.-])(?:check[-_][A-Za-z0-9_.-]*|check|chec|che|ch|c)", re.IGNORECASE | re.ASCII
 )
 # The characters a renderer can drop or reinterpret between the pieces of a name.
-MARKUP = frozenset("<>\\`[]()&")
+MARKUP = frozenset("<>\\`[]()&!${}")
 # The name characters that may continue a fragment at the start of the next line.
 NAME_RUN_RE = re.compile(r"[A-Za-z0-9_.-]*", re.ASCII)
 PATH_CHARS = frozenset(string.ascii_letters + string.digits + "_./-")
