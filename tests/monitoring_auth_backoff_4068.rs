@@ -93,6 +93,13 @@ fn sqlite_app_state(path: &std::path::Path) -> AppState {
 /// The production router: TLS-enabled monitoring, one health-only enrolled
 /// principal, and (when `shared`) a distinct shared transport key.
 fn router(dir: &tempfile::TempDir, shared: bool) -> axum::Router {
+    router_with(dir, shared, true, false)
+}
+
+/// [`router`] with the listener facts spelled out: `tls` is whether the
+/// monitoring routes are served on a TLS listener, `mtls` whether the mTLS
+/// federation lane (`/api/v1/sync/*`) is enforced.
+fn router_with(dir: &tempfile::TempDir, shared: bool, tls: bool, mtls: bool) -> axum::Router {
     let mut app = sqlite_app_state(&dir.path().join("monitoring-4068.db"));
     let registry = Arc::new(
         EnrolledAgentKeys::from_map(
@@ -105,13 +112,13 @@ fn router(dir: &tempfile::TempDir, shared: bool) -> axum::Router {
                 agent_ids: vec![MONITOR.to_owned()],
                 peer_ids: Vec::new(),
             },
-            true,
+            tls,
         ),
     );
     app.enrolled_agent_keys = Arc::clone(&registry);
     let auth = ApiKeyState {
         key: shared.then(|| SHARED_KEY.to_owned()),
-        mtls_enforced: false,
+        mtls_enforced: mtls,
         enrolled_agent_keys: registry,
         identity_mode: ai_memory::config::HttpIdentityMode::Off,
         ..Default::default()
@@ -126,6 +133,18 @@ struct Outcome {
 }
 
 async fn send(router: &axum::Router, ip: IpAddr, path: &str, key: Option<&str>) -> Outcome {
+    send_as(router, ip, path, key, None).await
+}
+
+/// [`send`] with an optional mTLS certificate peer binding in the request
+/// extensions, exactly where the peer-binding acceptor puts it.
+async fn send_as(
+    router: &axum::Router,
+    ip: IpAddr,
+    path: &str,
+    key: Option<&str>,
+    peer: Option<&str>,
+) -> Outcome {
     let mut builder = Request::builder()
         .uri(path)
         .method("GET")
@@ -136,6 +155,10 @@ async fn send(router: &axum::Router, ip: IpAddr, path: &str, key: Option<&str>) 
     let mut req = builder.body(Body::empty()).expect("request");
     req.extensions_mut()
         .insert(ConnectInfo(SocketAddr::new(ip, 40_068)));
+    if let Some(id) = peer {
+        req.extensions_mut()
+            .insert(ai_memory::tls::ClientCertPeerId(Some(id.to_owned())));
+    }
     let resp = router.clone().oneshot(req).await.expect("oneshot");
     let status = resp.status();
     let retry_after = resp
@@ -299,4 +322,117 @@ async fn success_resets_and_liveness_stays_exempt_4068() {
         "the public liveness probe stays exempt for a backed-off source; body={}",
         live.body
     );
+}
+
+/// Review F1 (#6052) — the mTLS federation lane is left out of the gate's
+/// backoff (as `api_key_auth` leaves it out), so its `401
+/// unresolved_transport_principal` answers must not be RECORDED either.
+/// Before the fix every such 401 counted, and `FREE_FAILURES + 1` of them
+/// locked the peer address out of every route, a correct shared key and a
+/// correct monitoring token included.
+#[tokio::test]
+async fn mtls_sync_lane_failures_do_not_earn_backoff_4068() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let router = router_with(&dir, true, true, true);
+    let source = ip(9);
+    for i in 0..=FREE_FAILURES {
+        let out = send(
+            &router,
+            source,
+            ai_memory::handlers::routes::SYNC_SINCE,
+            None,
+        )
+        .await;
+        assert_eq!(
+            out.status,
+            StatusCode::UNAUTHORIZED,
+            "sync-lane attempt {i} without a principal is a plain 401, never a backoff 429; body={}",
+            out.body
+        );
+    }
+    let out = send(
+        &router,
+        source,
+        ai_memory::handlers::routes::MEMORIES,
+        Some(SHARED_KEY),
+    )
+    .await;
+    assert_eq!(
+        out.status,
+        StatusCode::OK,
+        "a correct shared key after sync-lane 401s is admitted; body={}",
+        out.body
+    );
+    let out = send(&router, source, STATUS_PATH, Some(MONITOR_TOKEN)).await;
+    assert_eq!(
+        out.status,
+        StatusCode::OK,
+        "a correct monitoring token after sync-lane 401s is admitted; body={}",
+        out.body
+    );
+}
+
+/// Review F7/M4 (#6052) — a request whose principal resolves from the mTLS
+/// certificate binding but presents NO key on an ordinary route, with a
+/// shared key configured, is a transport-gate failure. The monitoring gate
+/// must not reset the source on the way through (it is not the
+/// authenticator there), so the budget still exhausts.
+#[tokio::test]
+async fn cert_resolved_keyless_ordinary_route_still_exhausts_budget_4068() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let router = router_with(&dir, true, true, true);
+    let source = ip(10);
+    let path = ai_memory::handlers::routes::MEMORIES;
+    for i in 0..FREE_FAILURES {
+        let out = send_as(&router, source, path, None, Some("peer-4068")).await;
+        assert_eq!(
+            out.status,
+            StatusCode::UNAUTHORIZED,
+            "keyless attempt {i} with a cert peer binding is a 401; body={}",
+            out.body
+        );
+    }
+    let out = send_as(&router, source, path, None, Some("peer-4068")).await;
+    assert_backoff(&out, "a cert-resolved keyless request past the budget");
+}
+
+/// Review F7/M7 (#6052) — the plaintext-listener refusal of the monitoring
+/// routes is not a credential check: a source already backed off on an
+/// ordinary route still gets `403 monitoring_requires_tls`, not a 429.
+#[tokio::test]
+async fn plaintext_monitoring_refusal_is_not_a_backoff_site_4068() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let router = router_with(&dir, true, false, false);
+    let source = ip(11);
+    for _ in 0..=FREE_FAILURES {
+        send(
+            &router,
+            source,
+            ai_memory::handlers::routes::MEMORIES,
+            Some(WRONG_KEY),
+        )
+        .await;
+    }
+    let out = send(
+        &router,
+        source,
+        ai_memory::handlers::routes::MEMORIES,
+        Some(SHARED_KEY),
+    )
+    .await;
+    assert_backoff(&out, "the source is backed off on an ordinary route");
+    for path in [STATUS_PATH, METRICS_PATH] {
+        let out = send(&router, source, path, Some(SHARED_KEY)).await;
+        assert_eq!(
+            out.status,
+            StatusCode::FORBIDDEN,
+            "plaintext {path} from a backed-off source stays 403; body={}",
+            out.body
+        );
+        assert!(
+            out.body.contains("monitoring_requires_tls"),
+            "plaintext {path} refusal reason; body={}",
+            out.body
+        );
+    }
 }
