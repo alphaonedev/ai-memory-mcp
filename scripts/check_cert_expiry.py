@@ -2619,6 +2619,24 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     m3 = edit_range("\n" + amend("#6162", [mod_rs]), label="m3")
     t.expect_green("6124-m3", "the canonical #6063 link", repo, exp6124, m3, green6124)
 
+    # (6124-e1/e2) RED (R3-F7, #3899) - an EXPIRED certification whose doc is
+    # deleted (e1) or whose banner is duplicated (e2) beside a wire change is
+    # refused WITHOUT the word "re-issue" as an instruction: only the WP-B1
+    # re-cert (#6063) re-issues it, and a re-issue by edit is forbidden.
+    fx.reset(exp6124)
+    fx.write(mod_rs, "// e1\n", append=True)
+    fx.g("rm", "-q", CERT_DOC)
+    e1 = fx.commit([mod_rs], "6124 cell e1: EXPIRED cert doc deleted + wire change")
+    dup_status = "> ## STATUS \u2014 **EXPIRED as of 2026-01-01** (decoy)\n"
+    e2 = edit_range("\n" + dup_status, label="e2")
+    for tag, label, cell_e in (("e1", "EXPIRED + deleted doc", e1),
+                               ("e2", "EXPIRED + duplicated banner", e2)):
+        out_e = t.expect_red(f"6124-{tag}", label, repo, exp6124, cell_e,
+                             [("#6063", "did not name the WP-B1 re-cert (#6063)")])
+        for banned in ("re-issue or void", "re-issue against the new SHA"):
+            if banned in out_e:
+                t.fail(f"(6124-{tag}): {label} was told to '{banned}' (#3899):", out_e)
+
     # (6124-r1..r4) #6355: the COMMITTED cert doc of this checkout, as the
     # merge-base, with a record inserted at each legal spot (GREEN), behind an
     # inserted HTML opener (RED), and above non-record prose that would then
