@@ -63,7 +63,10 @@ with open(base + "/psql.log", "a") as fh:
                          "connect_timeout_env": os.environ.get("PGCONNECT_TIMEOUT"),
                          "pgdatabase": os.environ.get("PGDATABASE"),
                          "pgservice": os.environ.get("PGSERVICE"),
-                         "pgservicefile": os.environ.get("PGSERVICEFILE")}}) + "\\n")
+                         "pgservicefile": os.environ.get("PGSERVICEFILE"),
+                         "env_keys": sorted(os.environ),
+                         "pg_env": {{k: v for k, v in os.environ.items() if k.startswith("PG") and k != "PGPASSWORD"}}}})
+             + "\\n")
 print(1 if os.path.isfile(base + "/share/extension/age.control") else 0)
 """
 
@@ -799,23 +802,73 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertEqual(mod.ALLOWED_QUERY_KEYS & mod.REFUSED_KNOWN_KEYS, set())
 
     # ---- #6345: a pg_service.conf password must never beat the moved PGPASSWORD ----------
-    def test_caller_pgdatabase_is_left_alone_when_the_url_names_no_database_m13(self):
-        # M13 (mutant: re-adding env.pop("PGDATABASE")): libpq reads PGDATABASE for a URL with no database,
-        # so the helper must not drop the caller's value; a URL database still wins (#6181).
+    # ---- #6676: psql's environment is an allowlist; a URL must name its database -------------
+    def psql_calls(self):
+        log = self.base / "psql.log"
+        return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def test_psql_env_is_an_allowlist_6676(self):
+        # 3-agent vote (6def5ab6) on #6676, option B: no caller PG* variable reaches psql, only the three the
+        # helper sets; every other caller variable outside PSQL_ENV_KEEP is dropped too.
         self.install_good()
-        cases = (("postgres://ciuser@127.0.0.1:5445?sslmode=disable\n", "callerdb"),
-                 ("postgres://ciuser@127.0.0.1:5445/\n", "callerdb"),
-                 ("postgres://ciuser@127.0.0.1:5445/urldb?sslmode=disable\n", "urldb"))
+        caller = dict(os.environ, PGSSLMODE="disable", PGHOSTADDR="127.0.0.1", PGREQUIREAUTH="none",
+                      PGPASSFILE=str(self.base / "pgpass"), PGOPTIONS="-c search_path=decoy",
+                      PGTARGETSESSIONATTRS="any", PGHOST="decoy.invalid", PGPORT="1", PGUSER="decoyuser",
+                      PGDATABASE="callerdb", PGCHANNELBINDING="disable", PGGSSENCMODE="disable",
+                      PGSSLROOTCERT=str(self.base / "decoy.crt"), PGLOADBALANCEHOSTS="random",
+                      PGMINPROTOCOLVERSION="3.0", PGSSLNEGOTIATION="postgres", CALLER_SECRET_6676="caller",
+                      LANG="C", LC_ALL="C", TZ="UTC")
+        cases = ((f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/urldb?sslmode=disable", "urldb"),
+                 (f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445?dbname=qdb&sslmode=disable", None))
         for text, want in cases:
-            with self.subTest(url=text.split("@", 1)[1].strip()):
+            with self.subTest(url=text.split("@", 1)[1]):
                 (self.base / "psql.log").unlink(missing_ok=True)
-                self.url_file.write_text(text)
-                r = self.run_script(env=dict(os.environ, PGDATABASE="callerdb"))
+                self.url_file.write_text(text + "\n")
+                r = self.run_script(env=caller)
                 self.assertEqual(r.returncode, 0, r.stderr)
-                calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+                calls = self.psql_calls()
                 self.assertTrue(calls)
                 for call in calls:
+                    self.assertTrue(call["env_marker_ok"])
                     self.assertEqual(call["pgdatabase"], want)
+                    self.assertEqual(call["connect_timeout_env"], "15")
+                    self.assertEqual(sorted(call["pg_env"]), sorted(["PGCONNECT_TIMEOUT"] + (["PGDATABASE"] if want else [])))
+                    self.assertFalse("CALLER_SECRET_6676" in call["env_keys"], "a caller variable reached psql")
+                    for key in ("LANG", "LC_ALL", "TZ", "PATH", "HOME"):
+                        self.assertTrue(key in call["env_keys"], f"{key} did not reach psql")
+
+    def test_psql_never_receives_pghostaddr_6676(self):
+        # The decoy that decided #6676: libpq connects to PGHOSTADDR instead of the URL's host and sends the
+        # URL's password there (probe_hostaddr.py, real psql 18.6 against throwaway listeners).
+        self.install_good()
+        r = self.run_script(env=dict(os.environ, PGHOSTADDR="127.0.0.1"))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = self.psql_calls()
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertFalse("PGHOSTADDR" in call["env_keys"], "the caller's PGHOSTADDR reached psql")
+
+    def test_a_url_without_a_database_is_refused_6676(self):
+        # 3-agent vote (6def5ab6) on #6676, option C (supersedes the #6577 M13 pin): with no database libpq
+        # falls back to the user name or a caller's PGDATABASE, so the URL is refused before any restore or psql.
+        for good in (True, False):
+            for text in ("postgres://ciuser:pw-6676@127.0.0.1:5445?sslmode=disable", "postgres://ciuser@127.0.0.1:5445/",
+                         "postgres://ciuser@127.0.0.1:5445", "postgresql://ciuser@127.0.0.1:5445/?dbname=",
+                         "postgres://ciuser@127.0.0.1:5445?sslmode=disable&%64bname="):
+                with self.subTest(installed=good, url=text.split("@", 1)[1]):
+                    for d in (self.lib, self.ext):
+                        for f in d.iterdir():
+                            f.unlink()
+                    if good:
+                        self.install_good()
+                    (self.base / "psql.log").unlink(missing_ok=True)
+                    self.url_file.write_text(text + "\n")
+                    r = self.run_script(env=dict(os.environ, PGDATABASE="callerdb"))
+                    self.assert_fails(r, 2, "tier URL file names no database")
+                    self.assertNotIn("pw-6676", r.stderr)
+                    self.assertFalse((self.base / "psql.log").exists())
+                    if not good:
+                        self.assert_nothing_installed()
 
     def test_service_key_in_url_is_refused_by_name(self):
         # libpq fills unset options from the service file BEFORE it reads PGPASSWORD, so a service
