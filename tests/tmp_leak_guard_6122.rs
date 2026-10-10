@@ -89,11 +89,28 @@ fn side_files_names_cover_wal_shm_journal_6122() {
 /// binaries compile `tests/curator/*.rs` / `tests/forensic/*.rs` through
 /// `#[path]`), minus the helper that owns the raw handle and this guard.
 fn suite_sources_in(root: &std::path::Path) -> Result<Vec<(String, String)>, String> {
+    // `DirEntry::file_type` does not follow links, so a symlink is seen as a
+    // symlink. Any link under the tree fails the scan with that one path: a
+    // followed link is a loop (phantom duplicate offenders) or reads files
+    // outside the repository. A `file_type` error fails the scan as well.
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
-        let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))? {
+            entries.push(entry.map_err(|e| format!("{}: {e}", dir.display()))?);
+        }
+        entries.sort_by_key(std::fs::DirEntry::file_name);
         for entry in entries {
-            let path = entry.map_err(|e| format!("{}: {e}", dir.display()))?.path();
-            if path.is_dir() {
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|e| format!("{}: file_type: {e}", path.display()))?;
+            if kind.is_symlink() {
+                return Err(format!(
+                    "{}: symlink under the scanned tree (not followed; remove it)",
+                    path.display()
+                ));
+            }
+            if kind.is_dir() {
                 walk(&path, out)?;
             } else if path.extension().is_some_and(|e| e == "rs") {
                 out.push(path);
