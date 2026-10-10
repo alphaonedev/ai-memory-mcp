@@ -1057,6 +1057,7 @@ R11_CELLS = (
 
 
 # Round 12: one table, cells named for the issue they pin.
+R12_STALE = "Run check-old.sh daily.\n"
 R12_BASE = "Clause (c) applies.\nOther (c) item.\n"
 R12_FRAG = "docs/compliance/A.md:c:2\n"
 R12_JOIN = "joins into script name `check-gone.sh`"
@@ -1124,6 +1125,23 @@ R12_CELLS = (
     # #6633: each new DASHES member folds to ``-``, so the folded view shows the name.
     ("E-dash-fold-%04X" % cp, "Run check-old%sx.sh daily.\n" % chr(cp), "", 1, "`check-old-x.sh` is shown only after")
     for cp in (0x2500, 0x2501, 0x23AF, 0x23BA, 0x2E0F, 0x00AF, 0x1680)
+) + tuple(
+    # #6634: every GitHub Markdown extension, and a ``.md.`` name, is scanned.
+    ("L-glob-%s" % ext, {"A.md": "", "B" + ext: R12_STALE}, "", 1, "`check-old.sh` does not exist")
+    for ext in (".markdown", ".mdown", ".mkdn", ".mkd", ".mdwn", ".mdx", ".mkdown", ".livemd", ".ronn", ".scd",
+                ".workbook", ".MarkDown", ".md.txt")
+) + tuple(
+    # #6634: a name that only looks like a Markdown document is refused.
+    ("L-glob-refused-%d" % i, {"A.md": "", name: R12_STALE}, "", 1, "only looks like a Markdown document")
+    for i, name in enumerate(("B.md ", "B.md\u200b", "B\u2024md", "B.\uff4d\uff44", "B.m\u200bd"))
+) + (
+    # #6634: a docs/ directory that folds to ``compliance`` is scanned as well.
+    ("L-glob-Compliance", {"A.md": "", "../Compliance/B.md": R12_STALE}, "", 1, "`check-old.sh` does not exist"),
+    ("L-glob-COMPLIANCE-zw", {"A.md": "", "../compli\u200bance/B.md": R12_STALE}, "", 1, "`check-old.sh` does not exist"),
+    ("L-glob-compliance-fw", {"A.md": "", "../\uff43ompliance/B.md": R12_STALE}, "", 1, "`check-old.sh` does not exist"),
+    # Controls: HTML and text evidence files stay unscanned.
+    ("L-glob-control", {"A.md": "", "index.html": R12_STALE, "B.txt": R12_STALE, "C.log": R12_STALE},
+     "", 0, None),
 )
 
 
