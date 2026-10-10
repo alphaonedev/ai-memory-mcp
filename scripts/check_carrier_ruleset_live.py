@@ -1048,6 +1048,31 @@ def self_test():
             *verify(*committed, pending, [mut(lambda rs: rs.update(name="other-ruleset"), base=good_c)],
                     is_open, False)))
 
+    # #6429: a flow-mapping pull_request trigger is not parsed, so it fails closed (never "covers").
+    def trigger_cells(cells):
+        for label, text, branch, want in cells:
+            check(label, lambda t=text, b=branch, w=want: None if trigger_covers(t, b) is w
+                  else f"trigger_covers({b!r}) is not {w}")
+
+    def pre_tip(label_text, want_rc, needle):
+        return pre_case(payload, [], live_two, {sha_a: label_text, sha_b: wf_text}, want_rc, needle)
+
+    trigger_cells((
+        ("trigger inline flow mapping", "on: {pull_request: {branches: [main]}}\n", "chain/a", False),
+        ("trigger inline flow mapping covering", "on: {pull_request: {branches: ['chain/**']}}\n", "chain/a",
+         False),
+        ("trigger flow mapping value", "on:\n  pull_request: {branches: [main]}\n", "chain/a", False),
+        ("trigger flow mapping empty", "on:\n  pull_request: {}\n", "chain/a", False),
+        ("trigger null value", "on:\n  pull_request: null\n", "chain/a", True),
+        ("trigger tilde value", "on:\n  pull_request: ~\n", "chain/a", True),
+        ("trigger inline scalar", "on: pull_request\n", "chain/a", True),
+        ("trigger inline flow list", "on: [push, pull_request]\n", "chain/a", True),
+        ("trigger inline flow list without it", "on: [push]\n", "chain/a", False)))
+    flow_tip = wf_text.replace("\n  pull_request:\n    branches: [", "\n  pull_request: {branches: [", 1)
+    flow_tip = flow_tip.replace('"chain/**"]\n', '"chain/**"]}\n', 1) if flow_tip != wf_text else flow_tip
+    check("pre-apply tip with a flow-mapping trigger", lambda: pre_tip(
+        flow_tip, 1, "does not trigger on pull_request for chain/promo6-ssh"))
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"
