@@ -103,6 +103,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -2535,7 +2536,7 @@ class PruneScript6118(unittest.TestCase):
         # SR3-2(a): os.scandir dups the fd, so EMFILE (EIO, ENOMEM) escapes
         # _remove; it must warn, leave the directory and report False.
         import errno
-        from unittest import mock
+        mock = unittest.mock
         mod = _load_prune()
         sub = self.target / "debug" / "incremental" / "s1"
         _write(sub / "f", 3)
@@ -2732,7 +2733,6 @@ class PruneScript6118(unittest.TestCase):
         # `deleted=2`.  An injected EACCES on one executable: the row counts the
         # removals only, the failure is reported on its own, and the row counts
         # sum to the `deleted` figure.
-        import unittest.mock
         mod = _load_prune()
         real_unlink = os.unlink
 
