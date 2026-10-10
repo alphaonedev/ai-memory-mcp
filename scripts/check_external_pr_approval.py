@@ -239,8 +239,12 @@ def run_gate(event_name, event, repo, sha, operator, api):
             number = merge_group_pr_number(event)
             open_prs = api(f"repos/{repo}/pulls?state=open&per_page=100")
             prs = [pr for pr in open_prs if _head(pr)[0] == number]
-            if len(prs) != 1:
+            if not prs:
                 raise GateError(f"merge_group names PR #{number}, which is not an open pull request")
+            if len(prs) > 1:
+                # #6637: a paginated listing that names one PR twice raced; its head sha is untrusted.
+                raise GateError(f"the open-PR listing lists PR #{number} {len(prs)} times, "
+                                "so its head sha cannot be trusted")
             lines.append(f"event=merge_group: judging PR #{number} named by the queue ref")
         else:
             if not isinstance(sha, str) or not SHA_RE.fullmatch(sha):
@@ -301,6 +305,7 @@ def self_test():
         ("merge-group-ref-sha-is-head-sha-not-base-sha", 1, "merge_group", c,
          api_for([pr(1, a)], {1: [approved]})),
         ("merge-group-missing-base-sha", 1, "merge_group", c, api_for([pr(1, a)], {1: [approved]})),
+        ("merge-group-duplicate-listing", 1, "merge_group", c, api_for([pr(1, a), pr(1, a)], {1: [approved]})),
     ]
     failures = 0
 
