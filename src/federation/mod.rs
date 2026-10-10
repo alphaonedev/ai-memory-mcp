@@ -1599,16 +1599,17 @@ mod tests {
         // federation_push_dlq row) into a one-line test edit instead of the
         // migration it actually is. The frozen-wire-format contract is pinned
         // deliberately, once, in tests/federation_stable_peer_id_2442.rs.
-        for peer in &cfg.peers {
+        // Messages name the peer by its configured position only: the id is
+        // derived from certificate material, so it stays out of the log (#6587).
+        for (peer_idx, peer) in cfg.peers.iter().enumerate() {
             assert!(
                 peer.id.starts_with("peer-h"),
-                "peer id must carry the #2442 stable-identity prefix, got {}",
-                peer.id
+                "peer id must carry the #2442 stable-identity prefix (peer #{peer_idx})"
             );
             assert!(
                 !crate::federation::peer::is_legacy_positional_peer_id(&peer.id),
-                "a minted peer id must never impersonate the legacy positional shape, got {}",
-                peer.id
+                "a minted peer id must never impersonate the legacy positional shape \
+                 (peer #{peer_idx})"
             );
         }
         assert_ne!(
@@ -2425,8 +2426,9 @@ mod tests {
         let key = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/tls/valid_key_pkcs8.pem");
         // Sanity: fixtures exist on disk.
-        assert!(cert.exists(), "missing test fixture: {cert:?}");
-        assert!(key.exists(), "missing test fixture: {key:?}");
+        // Name the fixture by label, not by path (#6587).
+        assert!(cert.exists(), "missing test fixture: tls client cert");
+        assert!(key.exists(), "missing test fixture: tls client key");
 
         let result = FederationConfig::build(
             2,
@@ -2458,7 +2460,7 @@ mod tests {
         let cert = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/tls/valid_cert.pem");
         let bogus_key = std::path::PathBuf::from("/definitely/missing/key.pem");
-        assert!(cert.exists(), "missing test fixture: {cert:?}");
+        assert!(cert.exists(), "missing test fixture: tls client cert");
 
         let result = FederationConfig::build(
             2,
