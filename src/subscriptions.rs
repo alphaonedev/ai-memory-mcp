@@ -35,6 +35,8 @@ use crate::models::field_names;
 pub mod audit_status;
 mod dns_guard;
 #[cfg(test)]
+mod dns_guard_4075_tests;
+#[cfg(test)]
 mod dns_guard_4165_tests;
 // #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
 mod unstarted;
