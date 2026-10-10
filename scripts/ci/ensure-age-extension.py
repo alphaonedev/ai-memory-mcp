@@ -22,8 +22,10 @@ Behaviour:
      its bytes must match the pinned sha256.  Any failure -> exit 2, no writes.
   3. Install the validated bytes, lib before share, each through a per-process
      ``mkstemp`` temp file + fsync + ``os.replace`` (safe under concurrent
-     runners).  On a write error remove the temp file and, unless another runner
-     has meanwhile made the tier healthy, the files this run created.
+     runners).  On a write error remove the temp file and exit 1 unless another
+     runner has meanwhile made the tier healthy.  Files already written stay:
+     each carries its pinned bytes, so removing one could only undo a restore
+     another runner has verified.
   4. Re-check health; exit 0 when healthy, else one stderr line and non-zero.
 
 The tier URL is read from a file.  Its password is passed to psql through the
@@ -77,15 +79,6 @@ class HelperError(Exception):
     def __init__(self, message, code):
         super().__init__(message)
         self.code = code
-
-
-class InstallError(Exception):
-    """A write into a destination dir failed; carries the files created so far."""
-
-    def __init__(self, exc, created):
-        super().__init__(str(exc))
-        self.exc = exc
-        self.created = created
 
 
 def running_uid():
@@ -252,7 +245,7 @@ def load_sources(age_dir):
 
 
 def write_atomic(data, mode, dest):
-    """Write data to dest via a per-process temp file + fsync + rename; return the new inode."""
+    """Write data to dest via a per-process temp file + fsync + rename."""
     fd, tmp = tempfile.mkstemp(dir=str(dest.parent), prefix=f".{dest.name}.", suffix=TEMP_SUFFIX)
     try:
         with os.fdopen(fd, "wb") as fh:
@@ -267,33 +260,18 @@ def write_atomic(data, mode, dest):
         except OSError:
             pass
         raise
-    return os.lstat(str(dest)).st_ino
 
 
 def install(sources, dests):
-    """Install every source; return [(dest, inode)] of files this run created (did not exist before)."""
-    created = []
-    try:
-        for sub, name, data, mode in sources:
-            dest = dests[sub] / name
-            existed = os.path.lexists(str(dest))
-            dests[sub].mkdir(parents=True, exist_ok=True)
-            inode = write_atomic(data, mode, dest)
-            if not existed:
-                created.append((dest, inode))
-    except OSError as exc:
-        raise InstallError(exc, created)
-    return created
+    """Install every source in MANIFEST order (lib before share); raises OSError on a write error.
 
-
-def roll_back(created):
-    """Remove files this run created, unless another writer has replaced them since."""
-    for dest, inode in created:
-        try:
-            if os.lstat(str(dest)).st_ino == inode:
-                os.unlink(str(dest))
-        except OSError:
-            pass
+    A file written before a later failure is left in place: it carries the pinned
+    bytes any runner would write, so it is always safe, and removing it could undo
+    a restore that a concurrent runner has already verified (#6161 R2-F1).
+    """
+    for sub, name, data, mode in sources:
+        dests[sub].mkdir(parents=True, exist_ok=True)
+        write_atomic(data, mode, dests[sub] / name)
 
 
 def parse_args(argv):
@@ -326,13 +304,12 @@ def run(args):
     sources = load_sources(args.age_dir)
     try:
         install(sources, dests)
-    except InstallError as err:
+    except OSError as exc:
         # Another runner may have completed the same restore concurrently.
         if healthy(args, dests, url):
             print("age extension available (restored concurrently by another run)")
             return
-        roll_back(err.created)
-        raise HelperError(f"age restore failed: {err.exc.strerror or err.exc}", EXIT_UNAVAILABLE)
+        raise HelperError(f"age restore failed: {exc.strerror or exc}", EXIT_UNAVAILABLE)
     if not healthy(args, dests, url):
         raise HelperError("age extension still unavailable after restore from " + str(args.age_dir), EXIT_UNAVAILABLE)
     print(f"age extension restored from {args.age_dir} and available")
