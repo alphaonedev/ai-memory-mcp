@@ -79,6 +79,15 @@ def test_the_final_decoder_flush_is_redacted():  # R41 (#7065)
     assert "\ufffd" not in out
 
 
+def test_the_upper_case_hex_form_of_a_key_is_redacted():  # W4 (#7066)
+    h = _h()
+    upper = KEY.hex().upper()
+    assert upper != KEY.hex()
+    out = h.redact("err: " + upper + "\n", h.secret_forms(KEY))
+    assert not any(upper[i : i + 6] in out for i in range(len(upper) - 5))
+    assert upper in h.secret_forms(KEY)
+
+
 SHORT = b"Zk3!pQ9x"  # 8 bytes: long enough to be a secret, too short for a 12-character window
 STACK_KEYS = (b"signing-key-bytes-0123456789", b"tls-key-bytes-abcdefghijklmnop")
 
