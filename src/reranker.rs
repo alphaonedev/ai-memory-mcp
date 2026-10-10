@@ -1119,18 +1119,6 @@ impl CrossEncoder {
         ))
     }
 
-    /// #2086 — pure offline (cache-dir-only) assembly of the three
-    /// cross-encoder file paths under the hf-hub repo cache dir. Bails LOUD
-    /// naming the repo dir + the model id when no complete snapshot leaf is
-    /// found — never a silent network attempt, never a silent lexical fallback
-    /// (the caller, [`Self::resolve_cross_encoder_files`], only reaches this
-    /// function when the offline knob is already set).
-    ///
-    /// #2114: resolves BOTH the hand-staged air-gap layout (`snapshots/main`)
-    /// AND a cache populated by an earlier online `hf-hub` fetch
-    /// (`snapshots/<commit-hash>`) by scanning every `snapshots/*` leaf under
-    /// the repo dir, so the documented "ran online once, now offline" path no
-    /// longer silently degrades to lexical.
     /// The hf-hub repo cache dir the offline resolver scans.
     /// [`CROSS_ENCODER_FALLBACK_MODEL_SUBDIR`] is the `<repo>/snapshots/main`
     /// hand-staged leaf; its grandparent is the hf-hub repo cache dir
@@ -1159,6 +1147,18 @@ impl CrossEncoder {
             .map_or_else(|| repo_dir.clone(), std::path::Path::to_path_buf)
     }
 
+    /// #2086 — pure offline (cache-dir-only) assembly of the three
+    /// cross-encoder file paths under the hf-hub repo cache dir. Bails LOUD
+    /// naming the repo dir + the model id when no complete snapshot leaf is
+    /// found — never a silent network attempt, never a silent lexical fallback
+    /// (the caller, [`Self::resolve_cross_encoder_files`], only reaches this
+    /// function when the offline knob is already set).
+    ///
+    /// #2114: resolves BOTH the hand-staged air-gap layout (`snapshots/main`)
+    /// AND a cache populated by an earlier online `hf-hub` fetch
+    /// (`snapshots/<commit-hash>`) by scanning every `snapshots/*` leaf under
+    /// the repo dir, so the documented "ran online once, now offline" path no
+    /// longer silently degrades to lexical.
     fn load_cross_encoder_from_fallback()
     -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
         let repo_dir = Self::cross_encoder_repo_dir();
