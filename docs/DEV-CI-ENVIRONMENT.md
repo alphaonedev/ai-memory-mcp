@@ -244,8 +244,11 @@ before `CREATE EXTENSION`:
   moved one; psql also runs without `PGSERVICE`/`PGSERVICEFILE`); `ssl=true` is a JDBC alias, use `sslmode`.
   A refusal names a key only when it is a known libpq keyword (an unlisted key
   can be the tail of a password that held a raw `&`), never a value. psql runs
-  with `PGCONNECT_TIMEOUT=15` and a 60 s limit; SIGTERM/SIGINT stop the psql
-  child and exit 1 with one `ensure-age-extension: interrupted` line.
+  with `PGCONNECT_TIMEOUT=15` and a 60 s limit; a URL `connect_timeout` must be an
+  integer in 1..60 (libpq reads 0 as no limit, which would leave an orphan after a
+  SIGKILL unbounded, #6338). SIGTERM, SIGINT and SIGHUP stop the psql child, also when
+  they arrive while it is being spawned (#6337), and exit 1 with one
+  `ensure-age-extension: interrupted` line.
 
 It is a no-op when AGE is healthy. `--age-dir` exists for the unit tests only;
 CI always uses the default node path, and there is no environment override.
