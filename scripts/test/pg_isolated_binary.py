@@ -391,14 +391,25 @@ def mint_base(url: str) -> str:
     and return its URL. ``url`` is only the maintenance connection."""
     name = _checked_ident(mint_base_name())
     psql(url, 'CREATE DATABASE %s' % quote_ident(name))
-    new_url = with_database(url, name)
+    initialized = False
     try:
+        new_url = with_database(url, name)
         psql(new_url, 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')
-    except (WrapperError, OSError):
-        drop_base(url, name)
-        raise
-    log('minted ephemeral base %s' % name)
-    return new_url
+        log('minted ephemeral base %s' % name)
+        initialized = True
+        return new_url
+    finally:
+        if not initialized:
+            primary = sys.exc_info()[1]
+            try:
+                if not drop_base(url, name):
+                    raise WrapperError('owned minted base cleanup failed')
+            except BaseException:
+                # Keep the original failure/interrupt, never a cleanup success.
+                # No raw exception text: libpq failures may contain credentials.
+                if primary is None:
+                    raise
+                log('WARN owned minted base cleanup also failed; manual cleanup required')
 
 
 def drop_base(url: str, name: str) -> bool:
