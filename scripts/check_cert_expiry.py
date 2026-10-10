@@ -2010,6 +2010,11 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     if check_change(repo, "0" * 40, base)[0]:
         t.fail("(n): unresolvable base SHA did not fail closed")
 
+    # (wrap, #6560) a guarded line disabled by its CONTEXT with its own text untouched.
+    fx.g("checkout", "-q", "main")
+    fx.reset(base)
+    _wrap_cells(t, fx, repo, base)
+
     # (o) GREEN - this PR itself (scripts / workflow / allowlist / CHANGELOG
     #     only; must not trip the gate). Runs against the REAL worktree so a
     #     future edit that accidentally touches the watched surface turns the
@@ -2033,6 +2038,146 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         return 2
     print(SELF_TEST_OK)
     return 0
+
+
+def _wrap_cells(t, fx, repo, base):
+    """(wrap, #6560) a guarded line left byte-identical but DISABLED by its
+    context. Every red cell here edits only lines AROUND the identifier-bearing
+    line (an attribute, an `if false` block, a comment opened far above, an
+    early return ...), so the per-line comparison alone sees nothing. The
+    controls pin what must stay GREEN; the gap cells pin what is NOT closed
+    (stated in each cell's text, no overclaim)."""
+    kid = "AI_MEMORY_FED_WRAP_KNOB"
+    sentence = "federation-wire surface changed"
+    fx.g("checkout", "-q", "-B", "w0", base)
+    filler = "".join(f"    n += {i};\n" for i in range(1, 36))
+    files = {
+        "src/wrap_a.rs": f'pub const WRAP_A: &str = "{kid}";\n',
+        "src/wrap_b.rs": ("pub fn alpha() -> u32 {\n    let mut n = 0;\n" + filler + "    n\n}\n"
+                          f'pub const WRAP_B: &str = "{kid}";\n'
+                          "pub fn omega() -> u32 {\n    2\n}\n"),
+        "src/wrap_c.rs": f'pub mod inner {{\n    pub const WRAP_C: &str = "{kid}";\n}}\n',
+        "src/wrap_d.rs": ("pub fn read_d() -> &'static str {\n    let mut k = \"\";\n"
+                          f'    k = "{kid}";\n    k\n}}\n'),
+        "src/wrapmod/mod.rs": "pub mod child;\n",
+        "src/wrapmod/child.rs": f'pub const WRAP_CHILD: &str = "{kid}";\n',
+        "src/wrap_g.rs": f'#[cfg(feature = "wrap-live")]\npub const WRAP_G: &str = "{kid}";\n',
+        "src/wrap_h.rs": f'pub fn read_h() -> &\'static str {{\n    "{kid}"\n}}\n',
+        "src/wrap_caller.rs": "pub fn call() -> &'static str {\n    crate::wrap_h::read_h()\n}\n",
+        "src/wrap_i.rs": f'pub const DISABLED: bool = false;\npub fn read_i() -> &\'static str {{\n    let mut k = "";\n    k = "{kid}";\n    k\n}}\n',
+    }
+    for rel, text in files.items():
+        fx.write(rel, text)
+    fx.banner("EXPIRED", base)
+    w0 = fx.commit(sorted(files) + [CERT_DOC], "w0: wrapper corpus, the identifier line sits clean in every file")
+    d_lines = files["src/wrap_d.rs"].split("\n")
+    d_set = f'    k = "{kid}";\n'
+    b_text = files["src/wrap_b.rs"]
+
+    def around(text, target, before="", after=""):
+        return text.replace(target, before + target + after, 1)
+
+    reds = [
+        ("wrap-cfg-item", "cfg(any())", "an attribute on the item that compiles it out",
+         {"src/wrap_a.rs": '#[cfg(any())]\n' + files["src/wrap_a.rs"]}),
+        ("wrap-cfg-feature", "cfg(feature", "any cfg attribute that is not already on the item",
+         {"src/wrap_a.rs": '#[cfg(feature = "wrap-never")]\n' + files["src/wrap_a.rs"]}),
+        ("wrap-cfg-mod", "cfg(any())", "cfg(any()) on the ENCLOSING mod",
+         {"src/wrap_c.rs": '#[cfg(any())]\n' + files["src/wrap_c.rs"]}),
+        ("wrap-cfg-fn", "cfg(any())", "cfg(any()) on the enclosing fn",
+         {"src/wrap_d.rs": '#[cfg(any())]\n' + files["src/wrap_d.rs"]}),
+        ("wrap-inner", "#![cfg(any())]", "an inner attribute at the top of the file",
+         {"src/wrap_a.rs": '#![cfg(any())]\n' + files["src/wrap_a.rs"]}),
+        ("wrap-attr-test", "attribute", "#[test] on the enclosing fn",
+         {"src/wrap_d.rs": '#[test]\n' + files["src/wrap_d.rs"]}),
+        ("wrap-iffalse", "if false", "the line inside an if false block",
+         {"src/wrap_d.rs": around(files["src/wrap_d.rs"], d_set, "    if false {\n", "    }\n")}),
+        ("wrap-ifcfg", "if cfg!(", "the line inside an if cfg!(..) block",
+         {"src/wrap_d.rs": around(files["src/wrap_d.rs"], d_set, "    if cfg!(any()) {\n", "    }\n")}),
+        ("wrap-else", "else branch of an if true", "the line in the else branch of if true",
+         {"src/wrap_d.rs": around(files["src/wrap_d.rs"], d_set, "    if true {\n    } else {\n", "    }\n")}),
+        ("wrap-blockcomment", "block comment", "a block comment opened 36 lines above and closed after",
+         {"src/wrap_b.rs": "/*\n" + b_text.replace(
+             f'pub const WRAP_B: &str = "{kid}";\n', f'pub const WRAP_B: &str = "{kid}";\n*/\n', 1)}),
+        ("wrap-rawstring", "string literal", "a raw string opened above the line",
+         {"src/wrap_d.rs": around(files["src/wrap_d.rs"], d_set, '    let _s = r#"\n', '"#;\n')}),
+        ("wrap-return", "early exit", "an unconditional return before the line",
+         {"src/wrap_d.rs": around(files["src/wrap_d.rs"], d_set, "    return \"\";\n")}),
+        ("wrap-todo", "early exit", "todo!() before the line",
+         {"src/wrap_d.rs": around(files["src/wrap_d.rs"], d_set, "    todo!();\n")}),
+        ("wrap-loop", "loop", "a loop with no break before the line",
+         {"src/wrap_d.rs": around(files["src/wrap_d.rs"], d_set, "    loop {\n    }\n")}),
+        ("wrap-macro", "macro_rules", "the line inside a macro that nothing invokes",
+         {"src/wrap_d.rs": "macro_rules! never_called {\n    () => {\n" + files["src/wrap_d.rs"] + "    };\n}\n"}),
+        ("wrap-decl", "cfg(any())", "cfg(any()) on the parent's `mod child;` declaration",
+         {"src/wrapmod/mod.rs": "#[cfg(any())]\npub mod child;\n"}),
+    ]
+    for label, reason, desc, edits in reds:
+        fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
+        for rel, text in edits.items():
+            fx.write(rel, text)
+        head_w = fx.commit(sorted(edits), f"{label}: {desc}")
+        t.expect_red(label, desc, repo, w0, head_w, [
+            (f"- {kid}", "did not name the disabled identifier"),
+            ("guarded line newly disabled", "did not say the guarded line was newly disabled"),
+            (reason, f"did not name the disabling construct ({reason})"),
+            (sentence, "did not carry the section 7 expiry sentence"),
+        ])
+        fx.g("checkout", "-q", "main")
+        fx.g("reset", "-q", "--hard", w0)
+        fx.g("update-ref", "refs/remotes/origin/main", w0)
+        merge_w = fx.merge(f"wv-{label}", f"Merge wv-{label} into main")
+        t.gate(f"{label}-gate", f"pull_request: {desc}", repo,
+               _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=head_w,
+                         GITHUB_BASE_REF="main", GITHUB_SHA=merge_w,
+                         PATH=os.environ.get("PATH", "")), f"- {kid}")
+    # (wrap-unbalanced) a parse the gate cannot trust is a named fail-closed
+    # error, never a silent pass.
+    fx.g("checkout", "-q", "-B", "wv-unbalanced", w0)
+    fx.write("src/wrap_d.rs", files["src/wrap_d.rs"] + "}\n")
+    head_ub = fx.commit(["src/wrap_d.rs"], "wrap-unbalanced: an extra closing brace")
+    t.expect_red("wrap-unbalanced", "a file whose braces do not balance", repo, w0, head_ub, [
+        ("ERROR", "did not fail closed with ERROR"),
+        ("unbalanced", "did not name the parse uncertainty"),
+        ("src/wrap_d.rs", "did not name the file"),
+    ])
+
+    controls = [
+        ("wrap-ctl-condreturn", "a conditional early return (inside an if) before the line is not an exit",
+         {"src/wrap_d.rs": around(files["src/wrap_d.rs"], d_set, "    if k.is_empty() {\n        return \"\";\n    }\n")}),
+        ("wrap-ctl-inline", "an allow-listed attribute (#[inline]) on the enclosing fn",
+         {"src/wrap_d.rs": "#[inline]\n" + files["src/wrap_d.rs"]}),
+        ("wrap-ctl-comment", "comments closed before the line, and a line comment",
+         {"src/wrap_d.rs": around(files["src/wrap_d.rs"], d_set,
+                                  "    /* a note\n       on two lines */\n    // another note\n")}),
+        ("wrap-ctl-samewrap", "an unrelated edit next to a definition already behind #[cfg(feature = ...)] at the base",
+         {"src/wrap_g.rs": files["src/wrap_g.rs"] + "pub const OTHER_G: u32 = 1;\n"}),
+    ]
+    for label, desc, edits in controls:
+        fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
+        for rel, text in edits.items():
+            fx.write(rel, text)
+        head_c = fx.commit(sorted(edits), f"{label}: {desc}")
+        t.expect_green(label, desc, repo, w0, head_c)
+    # (wrap-gap-*) the documented residual gap: a call graph or a constant is not
+    # lexical. These cells assert GREEN on purpose; the gap is stated in the cell
+    # text and the docstring (LEXICAL BOUND), not claimed closed.
+    gaps = [
+        ("wrap-gap-uncalled", "GAP (not closed): the only caller of a function holding the line is deleted",
+         {"src/wrap_caller.rs": "pub fn call() -> &'static str {\n    \"\"\n}\n"}),
+        ("wrap-gap-constflag", "GAP (not closed): the line sits behind `if DISABLED` where the constant is false",
+         {"src/wrap_i.rs": files["src/wrap_i.rs"].replace(
+             '    k = "' + kid + '";\n', '    if DISABLED {\n    k = "' + kid + '";\n    }\n', 1)}),
+    ]
+    for label, desc, edits in gaps:
+        fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
+        for rel, text in edits.items():
+            fx.write(rel, text)
+        head_g = fx.commit(sorted(edits), f"{label}: {desc}")
+        t.expect_green(label, desc, repo, w0, head_g)
+    fx.g("checkout", "-q", "main")
+    fx.reset(base)
+    fx.g("update-ref", "refs/remotes/origin/main", base)
 
 
 SELF_TEST_OK = (
