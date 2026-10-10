@@ -2228,6 +2228,30 @@ class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
         ])
 
 
+    def test_6118_r7_6487_custom_shell_and_container_are_flagged(self) -> None:
+        self._step_cases([
+            ("step shell env prefix", R7_PRE + "        shell: env CARGO_PROFILE_DEV_DEBUG=2 bash -e {0}\n"
+             "        run: cargo test --no-run\n"),
+            ("step shell RUSTFLAGS prefix", R7_PRE + "        shell: env RUSTFLAGS=-g bash -e {0}\n"
+             "        run: cargo test --no-run\n"),
+            ("step shell wrapper script", R7_PRE + "        shell: ./wrap.sh {0}\n        run: cargo test --no-run\n"),
+            ("step shell python", R7_PRE + "        shell: python\n        run: import os\n"),
+        ])
+        self._job_cases([
+            ("job defaults shell", "    defaults:\n      run:\n        shell: env RUSTFLAGS=-g bash -e {0}\n"),
+            ("job container", "    container: rust:1.98\n"),
+        ])
+        self._top_cases([
+            ("workflow defaults shell", "defaults:\n  run:\n    shell: env CARGO_PROFILE_TEST_DEBUG=2 bash {0}\n"),
+        ])
+
+    def test_6118_r7_6487_plain_bash_shell_is_clean(self) -> None:
+        for shell in ("bash", "sh", "bash -e {0}", "bash --noprofile --norc -eo pipefail {0}"):
+            with self.subTest(shell):
+                found = self._before_prune(R7_PRE + "        shell: %s\n        run: cargo test --no-run\n" % shell)
+                self.assertEqual([], found)
+
+
 class PruneScript6118(unittest.TestCase):
     """scripts/ci/prune-runner-target.py against a fake cargo target tree."""
 
