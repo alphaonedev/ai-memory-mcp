@@ -623,9 +623,12 @@ class Round11EchoMask(unittest.TestCase):
                     "user:" + self.TAIL + "@host=1", "https://u:" + self.TAIL + "@h: x",
                     "https://u:" + self.TAIL + "@h=1", "a,b," + self.TAIL + ": x",
                     # #6951: a bare colon is not a separator.
-                    self.TAIL + ":rest"):
+                    self.TAIL + ":rest",
+                    # #6953: a zero-width or bidi format character keeps a row from being one key word.
+                    "\u202e" + self.TAIL + ": x", self.TAIL + "\u200b: x"):
             self.assertNotIn(self.TAIL, SUBSET.echo(row), row)
         self.assertEqual(SUBSET.echo("  " + self.TAIL + ":x y"), repr("  <withheld 15 chars>"))
+        self.assertEqual(SUBSET.echo("PASS\u200bWORD: x"), repr("<withheld 12 chars>"))
         self.assertEqual(SUBSET.echo("      PASSWORD: hunter2"), repr("      PASSWORD: <withheld 7 chars>"))
         self.assertEqual(SUBSET.echo("  - name: q"), repr("  - name: <withheld 1 chars>"))
         self.assertEqual(SUBSET.echo("PASSWORD:"), repr("PASSWORD:"))
