@@ -320,11 +320,13 @@ jobs:
           # Check rows beside the PR run's real verdicts). Full pipeline,
           # like merge_group. $GITHUB_REF is the runner's default env var.
           if [ "$EVENT_NAME" = "push" ] && [ "${GITHUB_REF#refs/heads/chain/}" != "$GITHUB_REF" ]; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-            echo "test_impact=__ALL__" >> "$GITHUB_OUTPUT"
-            echo "test_impact_count=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_total=ALL" >> "$GITHUB_OUTPUT"
-            echo "test_impact_reason=carrier-push-full-pipeline" >> "$GITHUB_OUTPUT"
+            {
+              echo "docs_only=false"
+              echo "test_impact=__ALL__"
+              echo "test_impact_count=ALL"
+              echo "test_impact_total=ALL"
+              echo "test_impact_reason=carrier-push-full-pipeline"
+            } >> "$GITHUB_OUTPUT"
             echo "::notice::push to a chain carrier (#6117) — running the full pipeline (not docs-only)"
             exit 0
           fi
