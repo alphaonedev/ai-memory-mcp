@@ -31,8 +31,10 @@ collected; 2 the daemon or hub could not be started; 128+N stopped by signal N.
 
 import argparse
 import base64
+import binascii
 import codecs
 import datetime
+import functools
 import os
 import signal
 import socket
@@ -175,12 +177,16 @@ REDACTED = "<redacted>"
 _MIN_SECRET_LEN = 8  # a shorter value would turn the filter into a wildcard
 
 
-def secret_forms(data):
+def secret_forms(data, _der=True):
     """Every text form of ``data`` that a traceback or an assertion could print (#6964).
 
     Raw (UTF-8 and Latin-1), the ``bytes`` ``repr`` with and without its
     ``b'...'`` wrapper, hex, and both base64 alphabets with and without
-    padding. A multi-line value (a PEM) also yields each of its body lines.
+    padding, upper-case and colon-separated hex, the decimal byte list, and both
+    base32 spellings. A multi-line value (a PEM) also yields each of its body
+    lines and the forms of its decoded DER body. :func:`redact` additionally
+    removes every ``_WINDOW``-character fragment of any form, so a truncated
+    or split form is not a way around the list (#6964, security review F1).
     Longest first, so a form that contains another is replaced whole.
     """
     data = bytes(data)
@@ -192,28 +198,64 @@ def secret_forms(data):
         forms.add(repr(blob))
         forms.add(repr(blob)[2:-1])
         forms.add(blob.hex())
+        forms.add(blob.hex().upper())
+        forms.add(blob.hex(":"))
+        forms.add(blob.hex(":").upper())
+        forms.add(str(list(blob)))
+        forms.add(",".join(str(b) for b in blob))
         forms.add(blob.decode("latin-1"))
         try:
             forms.add(blob.decode("utf-8"))
         except UnicodeDecodeError:
             pass
-        for encode in (base64.b64encode, base64.urlsafe_b64encode):
+        for encode in (base64.b64encode, base64.urlsafe_b64encode, base64.b32encode):
             text = encode(blob).decode("ascii")
             forms.add(text)
             forms.add(text.rstrip("="))
     if b"\n" in stripped:
         for line in stripped.splitlines():
             if len(line.strip()) >= _MIN_SECRET_LEN and not line.startswith(b"-----"):
-                forms.update(secret_forms(line))
+                forms.update(secret_forms(line, _der=False))
+        if _der:
+            try:
+                body = b"".join(ln for ln in stripped.splitlines() if not ln.startswith(b"-----"))
+                forms.update(secret_forms(base64.b64decode(body, validate=True), _der=False))
+            except (binascii.Error, ValueError):
+                pass  # not a base64 body: the other forms still apply
     forms.discard("")
     return sorted((f for f in forms if len(f) >= _MIN_SECRET_LEN), key=len, reverse=True)
 
 
+_WINDOW = 12  # a fragment this long of any secret form is treated as the secret
+
+
+@functools.lru_cache(maxsize=8)
+def _windows(forms):
+    return frozenset(form[i : i + _WINDOW] for form in forms for i in range(len(form) - _WINDOW + 1))
+
+
 def redact(text, forms):
-    """``text`` with every one of ``forms`` replaced by ``<redacted>``."""
+    """``text`` with every one of ``forms`` and every ``_WINDOW``-character fragment of one replaced by ``<redacted>``."""
+    forms = tuple(forms)
     for form in forms:
         text = text.replace(form, REDACTED)
-    return text
+    windows = _windows(forms)
+    if not windows or len(text) < _WINDOW:
+        return text
+    covered = [False] * len(text)
+    for i in range(len(text) - _WINDOW + 1):
+        if text[i : i + _WINDOW] in windows:
+            covered[i : i + _WINDOW] = [True] * _WINDOW
+    out, i = [], 0
+    while i < len(text):
+        if covered[i]:
+            while i < len(text) and covered[i]:
+                i += 1
+            out.append(REDACTED)
+        else:
+            out.append(text[i])
+            i += 1
+    return "".join(out)
 
 
 def run_redacted(argv, *, cwd, env, secrets):
