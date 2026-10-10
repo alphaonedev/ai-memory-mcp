@@ -3893,6 +3893,70 @@ APPROVAL_EVALUATE_RUN = "python3 -I scripts/check_external_pr_approval.py"
 APPROVAL_OPERATOR = "alphaonedev"
 
 
+APPROVAL_JOB_PERMISSIONS = {"contents": "read", "pull-requests": "read"}
+WORKFLOW_PERMISSIONS = {"contents": "read"}
+
+
+def _row_scalar(body: str) -> str:
+    """The scalar after the first ``:`` of a mapping row (empty for a block owner)."""
+    return body.split(":", 1)[1].strip() if ":" in body else ""
+
+
+def _approval_job_shape(c8: str) -> Dict[str, object]:
+    """The approval job and workflow top level as parsed by the closed-world scanner (#6335).
+
+    ``job_keys``: the job's own keys in order; ``permissions_row``/``permissions``: the job's
+    permissions row and its children; ``steps``: per step, its keys in order and its env
+    mapping; ``top_keys``, ``top_permissions_row``, ``top_permissions``: the same for the
+    workflow.  Raises Unparsed when the scanner refuses a row.
+    """
+    job_rows = _meaningful(_job_text(c8, APPROVAL_JOB))
+    shape: Dict[str, object] = {"job_keys": [], "permissions_row": None, "permissions": {}, "steps": []}
+    job_keys: List[str] = shape["job_keys"]  # type: ignore[assignment]
+    permissions: Dict[str, str] = shape["permissions"]  # type: ignore[assignment]
+    steps: List[Dict[str, object]] = shape["steps"]  # type: ignore[assignment]
+    section = ""
+    step: Optional[Dict[str, object]] = None
+    sub = ""
+    for indent, body, key in job_rows[1:]:
+        if indent <= 4:
+            job_keys.append(key if indent == 4 else body)
+            section = key
+            if key == "permissions":
+                shape["permissions_row"] = body
+            continue
+        if section == "permissions":
+            if indent == 6:
+                permissions[key] = _row_scalar(body)
+            else:
+                permissions["<nested>"] = body
+        elif section == "steps":
+            if indent == 6 and body.startswith("- "):
+                step = {"keys": [key], "env": {}}
+                steps.append(step)
+                sub = key
+            elif indent == 8 and step is not None:
+                step["keys"].append(key)  # type: ignore[union-attr]
+                sub = key
+            elif indent == 10 and step is not None and sub == "env":
+                step["env"][key] = _row_scalar(body)  # type: ignore[index]
+    top_keys: List[str] = []
+    top_permissions: Dict[str, str] = {}
+    shape["top_permissions_row"] = None
+    owner = ""
+    for indent, body, key in _meaningful(c8):
+        if indent == 0:
+            top_keys.append(key)
+            owner = key
+            if key == "permissions":
+                shape["top_permissions_row"] = body
+        elif owner == "permissions":
+            top_permissions[key if indent == 2 else "<nested>"] = _row_scalar(body)
+    shape["top_keys"] = top_keys
+    shape["top_permissions"] = top_permissions
+    return shape
+
+
 def _approval_job_problems(c8: str) -> List[str]:
     """Ways the approval job could pass while the evaluator does not decide (empty = intact)."""
     job = _job_text(c8, APPROVAL_JOB)
@@ -3915,6 +3979,16 @@ def _approval_job_problems(c8: str) -> List[str]:
     evaluate = _step_block(job, APPROVAL_EVALUATE_STEP)
     if f"          OPERATOR_LOGIN: {APPROVAL_OPERATOR}\n" not in evaluate:
         problems.append(f"the Evaluate step no longer sets OPERATOR_LOGIN: {APPROVAL_OPERATOR}")
+    try:
+        shape = _approval_job_shape(c8)
+    except Unparsed as exc:
+        return problems + [f"c8-precheck.yml does not parse: {exc}"]
+    # #6335: the token scopes are exact, for the job and for the workflow default.
+    if shape["permissions_row"] != "permissions:" or shape["permissions"] != APPROVAL_JOB_PERMISSIONS:
+        problems.append(f"job permissions are {shape['permissions_row']!r} {shape['permissions']!r}, "
+                        f"not exactly {APPROVAL_JOB_PERMISSIONS!r}")
+    if shape["top_permissions_row"] != "permissions:" or shape["top_permissions"] != WORKFLOW_PERMISSIONS:
+        problems.append(f"workflow permissions are {shape['top_permissions']!r}, not exactly {WORKFLOW_PERMISSIONS!r}")
     return problems
 
 
