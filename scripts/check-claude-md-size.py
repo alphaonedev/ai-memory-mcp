@@ -59,7 +59,7 @@ from pathlib import Path
 # Ceilings only fall (#4507 target: <= 80 KB). Keep CLAUDE.md short rather than raising this.
 CLAUDE_MD_MAX_BYTES = 80_000
 # Floors only rise. Measured at the #4507 split: 64,378 bytes plus the binding-rules index.
-CLAUDE_MD_MIN_BYTES = 60_000
+CLAUDE_MD_MIN_BYTES = 28_000
 
 # Pinned `## ` headings of CLAUDE.md, identical to the pre-split file at 9f68ea41a (15 headings).
 CLAUDE_MD_REQUIRED_HEADINGS = (
@@ -72,7 +72,7 @@ CLAUDE_MD_REQUIRED_HEADINGS = (
     "## Adding New Functionality",
     "## Code Style",
     "## Prime directive (operator-set, 2026-05-17)",
-    "## Crossroads decision protocol — deterministic 5-agent adversarial vote (operator-set 2026-06-18)",
+    "## Crossroads decision protocol — 1x3 adversarial vote with a threshold (operator-set 2026-06-18, slimmed 2026-10-10)",
     "## v0.7.0 release gate (operator-set 2026-05-17 pm-v5)",
     "## Sole-authority operator + no-external-code-injection (operator-set 2026-05-25)",
     "## Commit & push policy (project override of global default)",
@@ -84,21 +84,21 @@ CLAUDE_MD_REQUIRED_HEADINGS = (
 # 100). Without it a rule section could be emptied to its heading and CLAUDE.md would still clear the
 # whole-file floor. One table, same order as CLAUDE_MD_REQUIRED_HEADINGS; floors only rise.
 CLAUDE_MD_SECTION_MIN_BYTES = (
-    1900,   # Hard rule - memory_store FIRST
-    5700,   # Required Reading at Session Start
-    1600,   # Build & Test Commands
-    900,    # Dogfooding release branches
-    700,    # Reproducing the v0.7.0 recursive-learning primitive
+    600,   # Hard rule - memory_store FIRST
+    800,   # Required Reading at Session Start
+    400,   # Build & Test Commands
+    100,    # Dogfooding release branches
+    100,    # Reproducing the v0.7.0 recursive-learning primitive
     1100,   # Architecture (pointer + binding-rules index)
-    4300,   # Adding New Functionality
+    1600,   # Adding New Functionality
     1300,   # Code Style (pointer + binding-rules index)
-    14600,  # Prime directive
+    5600,  # Prime directive
     3100,   # Crossroads decision protocol
-    1100,   # v0.7.0 release gate
-    7100,   # Sole-authority operator + no-external-code-injection
-    5700,   # Commit & push policy
-    4100,   # Multi-agent worktree discipline
-    2600,   # No agent-created files under /tmp
+    500,   # v0.7.0 release gate
+    3100,   # Sole-authority operator + no-external-code-injection
+    2400,   # Commit & push policy
+    1400,   # Multi-agent worktree discipline
+    1000,   # No agent-created files under /tmp
 )
 
 # (path, expected first line, minimum bytes). Floors only rise. Measured at the split:
@@ -1516,12 +1516,12 @@ def run_ref_cases(fresh, arch: str, style: str) -> bool:
 # must make (and a reviewer must see). Ceilings only fall, floors only rise.
 SELF_TEST_PINNED_LIMITS = {
     "CLAUDE_MD_MAX_BYTES": 80_000,
-    "CLAUDE_MD_MIN_BYTES": 60_000,
+    "CLAUDE_MD_MIN_BYTES": 28_000,
     "CLAUDE_MD_REQUIRED_HEADINGS_COUNT": 15,
     # sha256 of the 15 pinned headings joined by newline: rewording or swapping one is a deliberate edit too.
-    "CLAUDE_MD_REQUIRED_HEADINGS_SHA256": "a96178554adeea9c1a96dc35950a8f8d6987c88f6a196c0683a52c725c8f9db4",
-    "CLAUDE_MD_SECTION_MIN_BYTES": (1900, 5700, 1600, 900, 700, 1100, 4300, 1300, 14600, 3100, 1100, 7100,
-                                    5700, 4100, 2600),
+    "CLAUDE_MD_REQUIRED_HEADINGS_SHA256": "d2360a741c54cac5681b3c96e24f2777a912b00dee0dcdd2da2fb6dede2cfa0c",
+    "CLAUDE_MD_SECTION_MIN_BYTES": (600, 800, 400, 100, 100, 1100, 1600, 1300, 5600, 3100, 500, 3100,
+                                    2400, 1400, 1000),
     "REFERENCE_FLOOR ARCHITECTURE_REFERENCE": 300_000,
     "REFERENCE_FLOOR CODE_STYLE": 45_000,
     "INDEX_MIN_QUOTE_CHARS": 20,

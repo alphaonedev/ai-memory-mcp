@@ -96,7 +96,7 @@ These bind you even if you never open `docs/reference/CODE_STYLE.md`. Quoted ver
 
 > Overrides any framing of "non-blocking", "trend-line" or "surface-level". Applies to every agent touching this repository.
 
-**The rule.** If you find an issue, OPEN AN ISSUE, TRACK THE ISSUE, FIX THE ISSUE. Every issue gets fixed; there is no "surface-level" issue, every gap is a defect. World-class only (103 MCP tools at `--profile full`, 103 production HTTP route registrations / 89 unique URL paths, 99 CLI subcommands (97 in the default build) at v1.0.0).
+**The rule.** If you find an issue, OPEN AN ISSUE, TRACK THE ISSUE, FIX THE ISSUE. Every issue gets fixed; there is no "surface-level" issue, every gap is a defect. World-class only (104 MCP tools at `--profile full`, 103 production HTTP route registrations / 89 unique URL paths, 99 CLI subcommands (97 in the default build) at v1.0.0).
 
 **Mechanics.** Discovery → tracker entry → fix → close is one non-divisible workflow (the discoverer does all three or hands each to a named queue/PR with a tracker reference). Every `auto-filed-by-agent` issue MUST have a "Proposed fix" section (paths + line counts). Per test-campaign phase a "findings" memory lists EVERY anomaly; all reach the tracker before the next phase. Docs-vs-code drift is a defect: file AND fix it. BANNED in writeups and agent reports: "non-blocking", "trend-line gap", "surface-level", "P2/P3 follow-up", "vN+1 polish", "DEFER-TO-V080", "WONTFIX", "operator-decision-pending", "address with rationale", "no network access from this worktree", "out of scope for this session" (when you just haven't done it), "operator should close/commit…", "I lack capability X" (without verification).
 
