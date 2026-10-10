@@ -51,3 +51,45 @@ fn doctor_on_a_fifo_db_exits_2_without_hanging_6374() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// #6374 acceptance: "doctor AND one write subcommand must exit non-zero
+/// within 10 s". `stats` and `list` open the path read-write; SQLite's open
+/// of a FIFO must not hang the CLI there either.
+#[test]
+fn write_subcommands_on_a_fifo_db_exit_non_zero_without_hanging_6374() {
+    let dir = TempDir::new().expect("tempdir");
+    let fifo = dir.path().join("pipe.db");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .expect("run mkfifo");
+    assert!(made.success(), "fixture: mkfifo");
+    let keys = dir.path().join("keys-6374w");
+    std::fs::create_dir_all(&keys).expect("key sandbox");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+    for verb in [
+        vec!["stats"],
+        vec!["list"],
+        vec!["store", "-T", "fifo-6374", "-c", "x"],
+    ] {
+        let mut args = vec!["--db", fifo.to_str().expect("utf8 path")];
+        args.extend(verb.iter().copied());
+        let out = Command::cargo_bin("ai-memory")
+            .expect("ai-memory binary")
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .env("AI_MEMORY_KEY_DIR", &keys)
+            .args(&args)
+            .timeout(Duration::from_secs(10))
+            .output()
+            .unwrap_or_else(|e| panic!("#6374: {verb:?} must return, not hang on a FIFO --db: {e}"));
+        assert!(
+            !out.status.success(),
+            "#6374: {verb:?} on a FIFO --db must exit non-zero.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
