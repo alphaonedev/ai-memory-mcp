@@ -110,6 +110,14 @@ sys.stdout.write("{out}")
 sys.exit({code})
 """
 
+# Fake psql that writes connection detail to stderr and exits 2, as a real authentication failure does (#6897).
+STDERR_PSQL = """#!{py}
+import sys
+sys.stderr.write('psql: error: connection to server at "leakhost6897" (10.68.97.1), port 5445 failed: FATAL:  '
+                 'password authentication failed for user "leakuser6897" database "leakdb6897" marker-6897-stderr\\n')
+sys.exit(2)
+"""
+
 # Fake psql that closes its output pipes, SIGKILLs its parent (the supervisor) and keeps running (#6642).
 PARENT_KILLING_PSQL = """#!{py}
 import os, signal, time
@@ -422,6 +430,17 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         # #6896: the probe is the helper's only SQL, a read of pg_available_extensions under the tier role.
         self.assertEqual(load_module().PROBE_SQL, PROBE_SQL_6896)
         self.assertEqual(PROBE_SQL_6896, "SELECT count(*) FROM pg_available_extensions WHERE name = 'age'")
+
+    def test_psql_stderr_is_never_relayed_6897(self):
+        # #6897: real psql error text names the host, address, user and database; the helper keeps all of it
+        # out of the CI log and prints only psql's exit code.
+        write_exe(self.psql, STDERR_PSQL.format(py=sys.executable))
+        self.url_file.write_text(f"postgres://leakuser6897:{PW_MARKER}@leakhost6897:5445/leakdb6897?sslmode=disable\n")
+        r = self.run_script()
+        self.assert_fails(r, load_module().EXIT_UNAVAILABLE, "age probe failed: psql exited 2")
+        for needle in ("leakhost6897", "10.68.97.1", "leakuser6897", "leakdb6897", "marker-6897-stderr", "FATAL",
+                       "authentication", "5445"):
+            self.assertNotIn(needle, r.stdout + r.stderr, "psql's stderr must not reach the helper's output")
 
     def test_database_name_moves_to_pgdatabase_6181(self):
         # #6181: a database name equal to a secret would show on every psql argv; the name travels in PGDATABASE.
