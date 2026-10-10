@@ -433,3 +433,80 @@ fn publish_env_times_out_fail_closed_6571() {
         "a failed publish must not touch the environment"
     );
 }
+
+/// Marker the parent sets so the re-executed child knows it is the #6889 child.
+const CHILD_MARKER_6889: &str = "AI_MEMORY_PG_ISOLATE_6889_CHILD";
+
+/// Child half of `mint_fails_closed_and_drops_clone_on_env_lock_timeout_6889`:
+/// a no-op unless re-executed with the marker. It holds the shared env lock
+/// (like a test that sits inside an `EnvVarGuard`) while the helper mints, so
+/// the helper's publish cannot take the lock inside the shortened wait.
+#[test]
+fn child_publish_blocked_6889() {
+    if std::env::var(CHILD_MARKER_6889).ok().as_deref() != Some("1") {
+        return;
+    }
+    let _held = common::EnvVarGuard::set("AI_MEMORY_PG_ISOLATE_6889_HOLD", "1".to_string());
+    // Must panic (the caller side of #6571); reaching the next line is the bug.
+    let url = pg_isolate::isolated_url();
+    println!("PG_ISOLATE_6889_UNEXPECTED_URL={url:?}");
+}
+
+#[test]
+fn mint_fails_closed_and_drops_clone_on_env_lock_timeout_6889() {
+    // #6889: pin the CALLER side of #6571. When the publish cannot take the env
+    // lock, `mint_for_process` must fail the mint (so `isolated_url()` panics
+    // with the reason) and drop the clone it just made, never warn and go on.
+    let Some((base, template)) =
+        live_inputs("mint_fails_closed_and_drops_clone_on_env_lock_timeout_6889")
+    else {
+        return;
+    };
+    let base = if pg_isolate::is_isolated_url(&base) {
+        pg_isolate::with_database(&base, "postgres")
+    } else {
+        base
+    };
+    let run = test_run_id();
+    let exe = std::env::current_exe().expect("current exe");
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "child_publish_blocked_6889",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_MARKER_6889, "1")
+        .env(pg_isolate::FLAG_VAR, "1")
+        .env(pg_isolate::URL_VAR, &base)
+        .env(pg_isolate::TEMPLATE_VAR, &template)
+        .env(pg_isolate::RUN_ID_VAR, &run)
+        .env(pg_isolate::ENV_LOCK_WAIT_MS_VAR, "200")
+        .env_remove(pg_isolate::KILL_VAR)
+        .output()
+        .expect("re-execute this test binary");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Reclaim anything the child leaked before asserting, so a red run is clean.
+    let leaked = pg_isolate::run_clones_blocking(&base, &run).expect("list the run's clones");
+    for name in &leaked {
+        if let Err(e) = pg_isolate::drop_database_blocking(&base, &run, name) {
+            eprintln!("WARN: could not reclaim the leaked clone {name}: {e}");
+        }
+    }
+    assert!(
+        !out.status.success() && !text.contains("PG_ISOLATE_6889_UNEXPECTED_URL"),
+        "#6571/#6889: a publish failure must fail the mint, but the child went on: {text}"
+    );
+    assert!(
+        text.contains("env lock") && text.contains("refusing to run against it"),
+        "the panic must carry the #6571 reason: {text}"
+    );
+    assert!(
+        leaked.is_empty(),
+        "#6889: the clone minted before the failed publish must be dropped, found {leaked:?}"
+    );
+}
