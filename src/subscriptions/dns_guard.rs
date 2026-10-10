@@ -24,36 +24,14 @@
 
 use std::fmt;
 
-/// The port an `https://` URL without an explicit port connects to.
-const HTTPS_DEFAULT_PORT: u16 = 443;
-/// The port an `http://` (or scheme-less) URL without an explicit port
-/// connects to.
-const HTTP_DEFAULT_PORT: u16 = 80;
-
-/// #4075 — append the SCHEME's default port to a bracket/colon-normalized
-/// `host_port` that omits one, so `ToSocketAddrs` resolves it on the port
-/// the connector will actually open. The webhook SSRF lane
-/// (`validate_url_dns_with`) resolves through this; the egress inference
-/// lane (`egress::resolve_inference_authority`) reads the same rule off its
-/// `reqwest::Url` parse (`port_or_known_default`, #4018), so the two lanes
-/// agree on the port without sharing a string helper.
-///
-/// Before #4075 this appended `:80` for every scheme. reqwest's per-host
-/// override (`Client::builder().resolve(host, addr)`) is installed with that
-/// port, and the locked connector (reqwest 0.12.28 / hyper-util 0.1.20)
-/// replaces an override's port only when the URI port is explicit or the
-/// override port is 0 — so an implicit-port `https://` target had its TLS
-/// connection opened to TCP 80 and every delivery to a normal :443 receiver
-/// failed into the DLQ.
-#[must_use]
-pub(crate) fn host_port_with_default_port(host_port: &str, scheme: &str) -> String {
-    let port = if scheme.eq_ignore_ascii_case("https") {
-        HTTPS_DEFAULT_PORT
-    } else {
-        HTTP_DEFAULT_PORT
-    };
-    format!("{host_port}:{port}")
-}
+// #4075 / #6371 — the pinned port is read off the shared `reqwest::Url` parse
+// (`ParsedWebhookUrl::port`, `port_or_known_default`): the explicit port, else
+// the scheme default (443 for https). The webhook lane and the egress
+// inference lane (`egress::resolve_inference_authority`) therefore agree on
+// the port the connector opens without sharing a string helper. Before #4075
+// the webhook lane appended `:80` for every scheme, and reqwest's per-host
+// override keeps its own port unless the URI port is explicit, so an
+// implicit-port `https://` target had its TLS connection opened to TCP 80.
 
 /// Why the DNS-resolved SSRF guard refused a webhook target.
 #[derive(Debug, Clone, PartialEq, Eq)]
