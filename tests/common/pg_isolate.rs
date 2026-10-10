@@ -52,10 +52,9 @@ use std::time::{Duration, Instant};
 use sqlx::Connection as _;
 use sqlx::postgres::PgPoolOptions;
 
-#[path = "pg_barrier.rs"]
-mod pg_barrier;
+use super::pg_barrier;
 
-pub use pg_barrier::with_database;
+pub use super::pg_barrier::with_database;
 
 /// Opt-in switch; only the exact value `1` enables isolation.
 pub const FLAG_VAR: &str = "AI_MEMORY_TEST_PG_ISOLATE";
