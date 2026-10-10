@@ -98,6 +98,7 @@ import io
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -3942,6 +3943,70 @@ class PruneScript6118(unittest.TestCase):
             with self.subTest(text=ascii(text)):
                 self.assertEqual(want, mod._escape(text))
         self.assertNotEqual(mod._escape(chr(0xD83D) + chr(0xDE00)), mod._escape("\U0001f600"))
+
+    # ---- #6512: an artifact dir that is ALREADY a symlink when the plan is made ----
+
+    def _victim_tree(self, name: str) -> Path:
+        """An out-of-tree directory holding names the prune would delete in a real tree."""
+        victim = Path(self.scratch.name) / name
+        _write(victim / "ai_memory-0a1b", 170000, True)
+        _write(victim / "ai_memory-0a1b.d", 50, False)
+        _write(victim / "demo-0123456789abcdef", 50000, True)
+        _write(victim / "ai_memory-xyz" / "s-abc-def-working" / "dep-graph.bin", 6000, False)
+        _write(victim / "sub" / "keep.bin", 64, False)
+        return victim
+
+    @staticmethod
+    def _snapshot(root: Path) -> List[Tuple[str, int]]:
+        return sorted((str(p.relative_to(root)), p.lstat().st_size) for p in root.rglob("*"))
+
+    def _link_in(self, rel: str, victim: Path) -> None:
+        here = self.target / rel
+        if here.is_dir() and not here.is_symlink():
+            shutil.rmtree(str(here))
+        else:
+            here.unlink()
+        here.symlink_to(victim, target_is_directory=True)
+
+    def test_6118_r7_6512_symlinked_artifact_dir_is_never_followed(self) -> None:
+        reached = {"test-bins": ("deps", "incremental", "examples"), "all": self.FIVE_DIRS}
+        for sub in self.FIVE_DIRS:
+            for scope in ("test-bins", "all"):
+                for dry in (False, True):
+                    with self.subTest(sub=sub, scope=scope, dry_run=dry):
+                        self.setUp()
+                        victim = self._victim_tree("victim-%s" % sub.strip("."))
+                        before = self._snapshot(victim)
+                        self._link_in("debug/" + sub, victim)
+                        args = ["--target-dir", str(self.target), "--scope", scope] + (["--dry-run"] if dry else [])
+                        proc = self._run(*args)
+                        out = proc.stdout + proc.stderr
+                        self.assertEqual(0, proc.returncode, out)
+                        self.assertNotIn("Traceback", out)
+                        self.assertEqual(before, self._snapshot(victim), out)
+                        self.assertTrue((self.target / "debug" / sub).is_symlink(), out)
+                        if sub in reached[scope]:
+                            self.assertIn("skipped debug/%s: a symlink or not a directory (never followed)" % sub, out)
+
+    def test_6118_r7_6512_symlinked_nested_dir_inside_a_candidate_is_never_followed(self) -> None:
+        nested = (
+            "debug/deps/mcp_input_schema-7c7c.dSYM/Contents",
+            "debug/incremental/ai_memory-xyz/s-abc-def-working",
+        )
+        for rel in nested:
+            for scope in ("test-bins", "all"):
+                for dry in (False, True):
+                    with self.subTest(rel=rel, scope=scope, dry_run=dry):
+                        self.setUp()
+                        victim = self._victim_tree("victim-nested")
+                        before = self._snapshot(victim)
+                        self._link_in(rel, victim)
+                        args = ["--target-dir", str(self.target), "--scope", scope] + (["--dry-run"] if dry else [])
+                        proc = self._run(*args)
+                        out = proc.stdout + proc.stderr
+                        self.assertEqual(0, proc.returncode, out)
+                        self.assertNotIn("Traceback", out)
+                        self.assertEqual(before, self._snapshot(victim), out)
 
 EXAMPLE_HASHED = "debug/examples/demo-0123456789abcdef"
 EXAMPLE_UPLIFT = "debug/examples/demo"
