@@ -73,8 +73,10 @@ keyword (an unlisted key can be the tail of a password that held a raw ``&``),
 never a value, and neither form of the URL is printed.
 
 The database name is not left on psql's argv: ``split_database`` moves it to ``PGDATABASE`` (#6181).  A URL
-that names no database (no path, an empty path, an empty ``dbname``) is refused with exit 2 before any restore or
-psql call (#6676): libpq would fall back to the user name or to a caller's ``PGDATABASE``.
+that names no database is refused with exit 2 before any restore or psql call (#6676): libpq would fall back to
+the user name or to a caller's ``PGDATABASE``.  The database is read the way libpq reads it (#6871): the LAST
+``dbname`` query value wins and beats the path, so no path, an empty path, or an empty last ``dbname`` (also
+``/db?dbname=`` and ``?dbname=x&dbname=``) names no database.
 
 psql's environment is an allowlist (#6676, 3-agent vote 6def5ab6): ``PSQL_ENV_KEEP`` (``PATH``, ``HOME``,
 ``TMPDIR``, ``LANG``, ``TZ``) and every ``LC_*`` variable are copied from the caller, then the helper sets
@@ -338,14 +340,18 @@ def split_database(target):
 def probe_target(url):
     """Return (psql target, password or None, database) for ``url``; refuse a URL that names no database (#6676).
 
-    The database is the URL path (moved to ``PGDATABASE`` by ``split_database``) or a non-empty ``dbname`` query
-    value.  With neither, libpq would fall back to the user name or a caller's ``PGDATABASE``.
+    The database is the one libpq uses (#6871): the LAST ``dbname`` query value when the query has a ``dbname``
+    key (it beats the URL path), else the URL path (moved to ``PGDATABASE`` by ``split_database``).  When that is
+    empty libpq falls back to the user name or a caller's ``PGDATABASE``, so the URL is refused.
     """
     target, password = psql_target(url)
     target, database = split_database(target)
     query = target.split("?", 1)[1] if "?" in target else ""
-    named = any(unquote(key, errors="surrogateescape") == "dbname" and value
-                for key, _, value in (seg.partition("=") for seg in query.split("&") if seg))
+    dbnames = [value for key, _, value in (seg.partition("=") for seg in query.split("&") if seg)
+               if unquote(key, errors="surrogateescape") == "dbname"]
+    named = bool(dbnames) and bool(dbnames[-1])
+    if dbnames and not named:
+        database = None  # #6871: an empty last dbname beats the path, so libpq's effective database is empty
     if database is None and not named:
         raise HelperError("tier URL file names no database; add /<dbname> to the URL", EXIT_BAD_INPUT)
     return target, password, database
