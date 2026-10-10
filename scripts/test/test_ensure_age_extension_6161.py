@@ -1695,6 +1695,28 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                          "8ecfc082a55b667ed2773d622d726bbc4ca299c0b44248a8ec7d27b1460ed927")
 
 
+    def test_a_stop_recorded_during_handler_install_spawns_no_psql_6846(self):
+        # #6846 (mutant S18): a signal recorded while supervise() installs its handlers must end it before psql,
+        # which would hold PGPASSWORD, is ever spawned; killing psql on the first loop pass is too late.
+        mod = load_module()
+        spawned = []
+
+        def record_popen(*args, **kwargs):
+            spawned.append(args)
+            raise AssertionError("supervise() spawned psql after a recorded stop")
+
+        def install(handler=None):
+            handler(signal.SIGTERM, None)  # the signal lands while the handlers are being installed
+
+        mod.install_interrupt_handlers = install
+        mod.subprocess = type("SubprocessShim", (), {"Popen": staticmethod(record_popen),
+                                                     "SubprocessError": subprocess.SubprocessError})
+        read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        self.assertEqual(mod.supervise(read_fd, 30, [str(self.psql)]), mod.EXIT_UNAVAILABLE)
+        self.assertEqual(spawned, [], "psql was spawned after the stop was recorded")
+
 # ---- #6347: the libpq oracle behind the docstring claim "a URL the helper accepts is read the same way by libpq" --
 LIBPQ_CANDIDATES = (
     "/opt/homebrew/opt/libpq/lib/libpq.5.dylib",
