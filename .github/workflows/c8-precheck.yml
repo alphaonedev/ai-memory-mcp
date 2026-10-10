@@ -101,6 +101,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run C8 precheck
         run: bash scripts/qc-codegraph-precheck.sh
 
@@ -110,6 +112,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run vendor-literal gate
         run: bash scripts/check-vendor-literals.sh
       - name: Self-test the gate (regression evidence)
@@ -130,6 +134,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run truthy-grammar gate
         # #3200 — HARD-BLOCK the narrow 2-term truthy/falsy env grammar
         # (`== "1" || eq_ignore_ascii_case("true")` and the falsy twin) that
@@ -169,6 +175,8 @@ jobs:
     # is the record of what renaming it costs.
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run L3-boundary perma-ban gate
         run: bash scripts/check-l3-boundary.sh
       - name: Self-test the gate (regression evidence)
@@ -213,6 +221,8 @@ jobs:
     # shrinks). See ai-memory `no-hardcoded-literals-enforcement`.
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run hardcoded-literal gate
         run: bash scripts/check-hardcoded-literals.sh
       - name: Self-test the gate (regression evidence)
@@ -230,6 +240,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run const-name-literal gate
         run: bash scripts/check-const-name-literals.sh
       - name: Self-test the gate (regression evidence)
@@ -250,6 +262,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run docs-vs-SSOT drift gate
         run: bash scripts/check-docs-vs-ssot.sh
       - name: Self-test the gate (regression evidence)
@@ -281,6 +295,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run doc symbol-anchor gate
         run: bash scripts/check-doc-symbol-anchors.sh
       - name: Self-test the gate (regression evidence)
@@ -312,6 +328,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run SDK-route-path gate
         run: bash scripts/check-sdk-route-paths.sh
       - name: Self-test the gate (regression evidence)
@@ -342,6 +360,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run SDK TLS-scheme gate
         run: bash scripts/check-sdk-tls-scheme.sh
       - name: Self-test the gate (regression evidence)
@@ -372,6 +392,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run MCP transport-isolation gate
         run: python3 scripts/check-mcp-transport-isolation.py
       - name: Self-test the gate (regression evidence)
@@ -405,6 +427,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run CI-job-claims gate
         run: bash scripts/check-ci-job-claims.sh
       - name: Release feature-set guard (#4480)
@@ -447,6 +471,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run doc-surface-completeness gate
         run: bash scripts/check-doc-surface-completeness.sh
       - name: Self-test the gate (regression evidence)
@@ -479,6 +505,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run capacity-claim gate
         run: bash scripts/check-capacity-claims.sh
       - name: Self-test the gate (regression evidence)
@@ -511,6 +539,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run benchmark-claim gate
         run: bash scripts/check-benchmark-claims.sh
       - name: Self-test the gate (regression evidence)
@@ -536,6 +566,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run cloud-init ASCII gate
         run: bash scripts/check-cloud-init-ascii.sh
       - name: Self-test the gate (regression evidence)
@@ -559,6 +591,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           fetch-depth: 0
       - name: Run declaration hash gate
         env:
@@ -590,6 +623,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run test-stdin gate
         run: bash scripts/check-test-stdin-reads.sh
       - name: Self-test the gate (regression evidence)
@@ -610,6 +645,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run key-dir mode gate
         run: bash scripts/check-test-keydir-mode.sh
       - name: Key-dir mode gate self-test (#4502)
@@ -655,6 +692,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run migration-ladder gate
         run: bash scripts/check-migration-ladder.sh
       - name: Self-test the gate (regression evidence)
@@ -678,6 +717,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run installer checksum gate
         run: bash scripts/check-install-checksum.sh
       - name: Self-test the gate (regression evidence)
@@ -709,6 +750,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       # The interpreters are PROVISIONED, not assumed. The gate fails closed
       # when they are missing, so relying on whatever the runner image
       # happens to ship would make a controlled proof depend on an accident.
@@ -763,6 +806,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run test-env-lock gate
         run: bash scripts/check-test-env-lock.sh
       - name: Self-test the gate (regression evidence)
@@ -829,6 +874,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           fetch-depth: 0  # #3872 requires complete ancestry, not the merge checkout alone.
       # #3872: the original PR head must contain the pinned release base.
       # The synthetic merge checkout would always hide BEHIND geometry.
@@ -960,6 +1006,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run git-dependency-source gate
         run: bash scripts/check-git-dependency-sources.sh
       - name: Self-test the gate (regression evidence)
@@ -988,6 +1036,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run CREATE EXTENSION allowlist gate
         run: bash scripts/check-create-extension-allowlist.sh
       - name: Self-test the gate (regression evidence)
@@ -1055,6 +1105,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           fetch-depth: 0
       - name: Run commit-signing posture gate
         env:
@@ -1124,6 +1175,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           fetch-depth: 0
       - name: Run enterprise-federation cert-expiry gate
         env:
@@ -1202,6 +1254,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run foreign-text-to-caller gate
         run: bash scripts/check-foreign-text-to-caller.sh
       - name: Self-test the gate (regression evidence)
@@ -1308,6 +1362,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run URL-sink redaction gate
         run: bash scripts/check-url-sink-redaction.sh
       - name: Self-test the gate (regression evidence)
@@ -1324,6 +1380,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           fetch-depth: 0
       - name: Run stale contract-assertion gate over the change range
         env:
@@ -1358,6 +1415,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           fetch-depth: 0
       - name: Run count-assertion declaration gate over the change range
         env:
@@ -1388,6 +1446,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run Claude plugin manifest gate
         run: bash scripts/check-claude-plugin.sh
       - name: Self-test the gate (regression evidence)
@@ -1404,6 +1464,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run no-credentials-on-argv gate
         run: python3 scripts/check-docs-no-argv-secrets.py
       - name: Self-test the gate (regression evidence)
@@ -1422,6 +1484,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run SQLite write-transaction IMMEDIATE gate
         run: python3 scripts/check-sqlite-write-txn-immediate.py
       - name: Self-test the gate (regression evidence)
@@ -1438,6 +1502,8 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run inline mod tests cfg(test) gate (+ scanner self-tests)
         run: python3 scripts/test/test_inline_mod_tests_cfg_4755.py
 
@@ -1454,5 +1520,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Run packaging contract + installer upgrade tests
         run: python3 scripts/test-install-upgrade.py
