@@ -344,9 +344,7 @@ def test_file_swapped_during_the_load_is_refused_6816(
 
 
 @_POSIX_ONLY
-def test_ca_directory_loads_only_hashed_entry_names_6835(
-    lab: Lab, tmp_path: pathlib.Path
-) -> None:
+def test_ca_directory_loads_only_hashed_entry_names_6835(lab: Lab, tmp_path: pathlib.Path) -> None:
     unhashed = _ca_dir(tmp_path, "unhashed")
     _bundle(lab, unhashed, "extra-ca.pem")
     assert _common._context_from_path(str(unhashed)).get_ca_certs() == []
