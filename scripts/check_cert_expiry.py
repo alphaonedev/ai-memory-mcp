@@ -3472,6 +3472,38 @@ def _log_safe_cells(t):
     for plain in ("plain ascii-name_1.yml", "\xa77 / F7", "a\u00a0b", "caf\u00e9"):
         if log_safe(plain) != plain:
             t.fail(f"(log-safe-plain): log_safe changed {plain!r} to {log_safe(plain)!r}")
+    _log_safe_table_cell(t)
+
+
+# Every Cf code point of Unicode 15.0 as the cell's own oracle for LOG_CF_RANGES (#6683); the nine code
+# points Python 3.9 (Unicode 13) does not know as Cf are U+0890, U+0891 and U+13439-U+1343F.
+LOG_CF_ORACLE = ((0x00AD, 0x00AD), (0x0600, 0x0605), (0x061C, 0x061C), (0x06DD, 0x06DD), (0x070F, 0x070F),
+                 (0x0890, 0x0891), (0x08E2, 0x08E2), (0x180E, 0x180E), (0x200B, 0x200F), (0x202A, 0x202E),
+                 (0x2060, 0x2064), (0x2066, 0x206F), (0xFEFF, 0xFEFF), (0xFFF9, 0xFFFB), (0x110BD, 0x110BD),
+                 (0x110CD, 0x110CD), (0x13430, 0x1343F), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A),
+                 (0xE0001, 0xE0001), (0xE0020, 0xE007F))
+
+
+def _log_safe_table_cell(t):
+    """#6683: the escaping of a format character comes from an explicit
+    code-point table, not from the running interpreter's Unicode tables, so
+    Python 3.9 (Unicode 13) and 3.12 (Unicode 15) print the same text. The
+    cell makes unicodedata.category report a letter for every code point and
+    requires the escape of every code point of LOG_CF_ORACLE all the same.
+    Cell `log-safe-cf-table`."""
+    saved = unicodedata.category
+    unicodedata.category = lambda _ch: "Lo"
+    try:
+        for first, last in LOG_CF_ORACLE:
+            for code in range(first, last + 1):
+                want = f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
+                got = log_safe(chr(code))
+                if got != want:
+                    t.fail(f"(log-safe-cf-table): log_safe printed U+{code:04X} as {got!r}, not {want!r}, when the "
+                           f"interpreter does not report it as a format character")
+                    return
+    finally:
+        unicodedata.category = saved
 
 
 def _round7_shapes(shapes, pr, wf_rel):
@@ -3504,6 +3536,7 @@ SUMMARY_CELL_SOURCES = (
     ("_ws_format_cells", ""),
     ("_ws_wording_cells", ""),
     ("_log_safe_cells", ""),
+    ("_log_safe_table_cell", ""),
     ("_trusted_round7_cells", ""),
     ("_summary_cells", ""),
 )
