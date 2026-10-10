@@ -5322,5 +5322,67 @@ class ReviewOrderingTimeFirst6608(unittest.TestCase):
                           _review(SHA_A, state="DISMISSED", submitted_at=self.T1, review_id=9)], 1)
 
 
+# ---- Round 6 (#6578): encoded and line-split token fragments are redacted ----
+
+
+class EncodedTokenRedaction6578(unittest.TestCase):
+    """A percent-encoded, double-encoded or line-split token never reaches the ``::error::`` line.
+
+    The runner masks ``github.token`` only in its raw form; a credential echoed upstream in an
+    encoded or wrapped form must not survive the evaluator's own redaction.  No 8-character
+    window of the secret part may appear in the relayed line.
+    """
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+
+    def relayed(self, stderr: str) -> str:
+        import types
+
+        def fake_run(*_a, **_k):
+            return types.SimpleNamespace(returncode=1, stdout="", stderr=stderr)
+        with unittest.mock.patch.object(self.mod.subprocess, "run", fake_run):
+            rc, lines = self.mod.run_gate("push", {}, REPO_6117, SHA_A, OPERATOR_6117, self.mod.gh_api)
+        self.assertEqual(1, rc, lines)
+        self.assertEqual(1, len(lines), lines)
+        return lines[0]
+
+    def cases(self) -> List[Tuple[str, str, str]]:
+        body = _token_body(36, 3)
+        pat = _token_body(22, 5) + "_" + _token_body(59, 11)
+        return [
+            ("percent-encoded underscore", body, f"url ghs%5F{body}\n"),
+            ("lowercase percent-encoded", body, f"url gho%5f{body}\n"),
+            ("double-encoded", body, f"url ghp%255F{body}\n"),
+            ("encoded fine-grained pat", pat, "url github%5Fpat%5F" + pat.replace("_", "%5F") + "\n"),
+            ("encoded token in a JSON error body", body,
+             '{"message":"Bad credentials","token":"ghu%5F' + body + '"}\n'),
+            ("split across lines", body[:12], f"prefix ghs_{body[:12]}\n{body[12:]}\n"),
+            ("short prefixed fragment", body[:9], f"prefix ghr_{body[:9]}\n"),
+        ]
+
+    def test_6578_relayed_stderr_holds_no_window_of_the_secret(self) -> None:
+        for name, secret, stderr in self.cases():
+            with self.subTest(case=name):
+                line = self.relayed(stderr)
+                self.assertIn("[redacted]", line)
+                self.assertEqual([], _leaked_windows(secret, line), line)
+                self.assertEqual([], _leaked_windows(secret.replace("_", "%5F"), line), line)
+
+    def test_6578_escaper_redacts_encoded_tokens_too(self) -> None:
+        for name, secret, stderr in self.cases():
+            with self.subTest(case=name):
+                line = self.mod.workflow_error(stderr.splitlines()[0])
+                self.assertIn("[redacted]", line)
+                self.assertEqual([], _leaked_windows(secret, line), line)
+
+    def test_6578_ordinary_percent_text_survives(self) -> None:
+        for text in ("rate limit 50% used", "path a%2Fb not found (HTTP 404)", "Bad credentials (HTTP 401)"):
+            with self.subTest(text=text):
+                line = self.mod.workflow_error(text)
+                self.assertNotIn("[redacted]", line)
+                self.assertIn(text.replace("%", "%25"), line)
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
