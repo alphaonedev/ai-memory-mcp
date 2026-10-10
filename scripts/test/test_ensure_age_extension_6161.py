@@ -270,6 +270,8 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         (self.base / "psql.log").unlink(missing_ok=True)  # each subTest starts without a psql call
         self.url_file.write_text(url + "\n")
         r = self.run_script()
+        log = self.base / "psql.log"
+        self.assertNotIn(PW_MARKER, log.read_text() if log.exists() else "", "marker reached psql's argv")
         self.assert_fails(r, 2, "tier URL file ")
         for name in names:
             self.assertIn(name, r.stderr)
@@ -297,6 +299,13 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         for sep in ("#", "?"):
             with self.subTest(sep=sep):
                 self.assert_url_refused(f"postgres://ciuser:{PW_MARKER}{sep}z@127.0.0.1:5445/cidb")
+        # R4-F3: only the '@'-after-host guard refuses these two (no '#', one '=').
+        for url in (
+            f"postgres://ciuser:{PW_MARKER}/z@127.0.0.1:5445/cidb",
+            f"postgres://ciuser:{PW_MARKER}?sslmode=require@127.0.0.1/cidb",
+        ):
+            with self.subTest(url=url.replace(PW_MARKER, "<M>")):
+                self.assert_url_refused(url)
 
     def test_libpq_secret_keys_without_env_var_are_rejected(self):
         for key in ("oauth_client_secret", "scram_client_key", "scram_server_key"):
@@ -326,6 +335,72 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertTrue(calls)
         for call in calls:
             self.assertIn(url, call["argv"])
+
+    # ---- round 5 (R4-F1..R4-F3, F-R4-2, F-R4-3) ---------------------------
+    def test_query_segment_with_second_equals_is_rejected(self):
+        # R4-F2: parse_qsl reads the remainder as the value of an allowlisted key, so the
+        # password would stay on argv; libpq refuses these only after psql has started.
+        for url in (
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require;password={PW_MARKER}",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require?password={PW_MARKER}",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?application_name=ci=password={PW_MARKER}",
+        ):
+            with self.subTest(url=url.replace(PW_MARKER, "<M>")):
+                self.assert_url_refused(url)
+
+    def test_control_characters_in_url_are_rejected(self):
+        # R4-F2 / F-R4-2: urlsplit silently drops TAB/CR/LF (joining a two-line URL file),
+        # and a NUL makes subprocess raise; both are refused before parsing.
+        for label, url in (
+            ("two-line file", f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require\npassword={PW_MARKER}"),
+            ("CR", f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require\rpassword={PW_MARKER}"),
+            ("TAB", f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb?application_name=c\ti"),
+            ("NUL in password", f"postgres://ciuser:{PW_MARKER}\x00@127.0.0.1:5445/cidb"),
+            ("NUL in host", f"postgres://ciuser:{PW_MARKER}@127.0.0.1\x00:5445/cidb"),
+        ):
+            with self.subTest(shape=label):
+                self.assert_url_refused(url)
+
+    def test_percent_encoded_nul_in_password_is_rejected(self):
+        # F-R4-2: unquote/parse_qsl decode %00 into PGPASSWORD, which subprocess refuses.
+        for url in (
+            f"postgres://ciuser:{PW_MARKER}%00@127.0.0.1:5445/cidb",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?password={PW_MARKER}%00",
+        ):
+            with self.subTest(url=url.replace(PW_MARKER, "<M>")):
+                self.assert_url_refused(url)
+
+    def test_psql_value_error_is_a_one_line_refusal(self):
+        # F-R4-2 belt and braces: a ValueError from subprocess becomes HelperError exit 2.
+        mod = load_module()
+        with self.assertRaises(mod.HelperError) as cm:
+            mod.probe_lists_age(str(self.psql) + "\x00", f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb")
+        self.assertEqual(cm.exception.code, mod.EXIT_BAD_INPUT)
+        self.assertNotIn(PW_MARKER, str(cm.exception))
+        self.assertEqual(len(str(cm.exception).splitlines()), 1)
+        self.assertFalse((self.base / "psql.log").exists())
+
+    def test_more_than_one_at_in_authority_is_rejected(self):
+        # R4-F1: urllib splits the userinfo at the last '@', libpq at the first.
+        for url in (
+            f"postgres://ciuser:{PW_MARKER}@x@127.0.0.1:5445/cidb",
+            f"postgres://ci@user:{PW_MARKER}@127.0.0.1/cidb",
+            f"postgres://a:{PW_MARKER}@b:c@127.0.0.1/cidb",
+        ):
+            with self.subTest(url=url.replace(PW_MARKER, "<M>")):
+                self.assert_url_refused(url, ("percent-encode",))
+
+    def test_socket_directory_url_gets_a_clear_refusal(self):
+        # F-R4-3: an empty authority is the libpq socket form; say so instead of "not a URL".
+        self.assert_url_refused(
+            f"postgres:///cidb?host=/var/run/postgresql&password={PW_MARKER}", ("socket-directory",))
+
+    def test_allowlist_excludes_every_libpq_secret_key(self):
+        # R4-F3: adding any of these to ALLOWED_QUERY_KEYS would put a secret on argv.
+        mod = load_module()
+        secrets = {"password", "sslpassword", "oauth_client_secret", "scram_client_key",
+                   "scram_server_key", "sslkeylogfile", "require_auth"}
+        self.assertEqual(set(mod.ALLOWED_QUERY_KEYS) & secrets, set())
 
     # ---- bad input -------------------------------------------------------
     def test_missing_source_dir_fails_closed(self):
