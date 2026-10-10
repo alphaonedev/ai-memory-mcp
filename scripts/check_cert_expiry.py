@@ -2510,6 +2510,33 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     t.expect_red("6124-p5", "record above a record across a plain blank line", repo, mb_p5, p5,
                  red6124 + placed6124)
 
+    # (6124-d1..d5) RED (R3-F6, #6423) - append-only holds for EVERY change
+    # that touches the cert doc while it is EXPIRED/VOID, not only for the
+    # wire-change pass path: a doc-only change may not delete, re-date, edit,
+    # reorder or remove the records. d6 is the GREEN control (prose outside
+    # the ledger; a new record on its own).
+    append6124 = [("append-only", "did not say the ledger is append-only")]
+    led_ab = ">\n" + old_a + ">\n" + old_b
+    mb_d = doc_only(quoted=led_ab, label="d-mb")
+    for tag, label, doc in (
+            ("d1", "a record deleted by a doc-only change", ">\n" + old_b),
+            ("d2", "a record re-dated by a doc-only change",
+             ">\n" + old_a.replace("2026-10-07", "2026-10-09") + ">\n" + old_b),
+            ("d3", "a record's citation edited by a doc-only change",
+             ">\n" + old_a.replace("#6063", "#6064") + ">\n" + old_b),
+            ("d4", "records reordered by a doc-only change", ">\n" + old_b + ">\n" + old_a)):
+        cell_d = edit_range("", touch=(), label=tag, frm=mb_d, quoted=doc)
+        t.expect_red(f"6124-{tag}", label, repo, mb_d, cell_d, append6124)
+    fx.reset(mb_d)
+    fx.g("rm", "-q", CERT_DOC)
+    d5 = fx.commit([], "6124 cell d5: cert doc deleted, no wire change")
+    t.expect_red("6124-d5", "the cert doc deleted by a doc-only change", repo, mb_d, d5,
+                 append6124)
+    d6 = edit_range("\nOther prose.\n", touch=(), label="d6", frm=mb_d, quoted=led_ab)
+    t.expect_green("6124-d6", "doc-only prose edit beside an untouched ledger", repo, mb_d, d6)
+    d7 = edit_range("", touch=(), label="d7", frm=mb_d, quoted=led_ab + ">\n" + rec6124)
+    t.expect_green("6124-d7", "doc-only change that only appends a record", repo, mb_d, d7)
+
     # (6124-r1..r4) #6355: the COMMITTED cert doc of this checkout, as the
     # merge-base, with a record inserted at each legal spot (GREEN), behind an
     # inserted HTML opener (RED), and above non-record prose that would then
