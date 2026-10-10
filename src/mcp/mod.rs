@@ -3562,7 +3562,11 @@ fn handle_request(
             // so on stderr; stdout stays response-only).
             let (protocol_revision, downgraded) = jsonrpc::negotiate_protocol_revision(&req.params);
             if downgraded {
-                eprintln!(
+                // A closed or broken stderr must not panic the stdio loop
+                // (`eprintln!` panics on a write error); the diagnostic is
+                // advisory and the response still goes out (ERRORS-19).
+                let _ = writeln!(
+                    io::stderr(),
                     "{}",
                     jsonrpc::protocol_downgrade_diagnostic(&req.params, protocol_revision)
                 );
