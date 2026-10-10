@@ -976,6 +976,22 @@ def self_test():
                 ("/issues/", '{"number": 1, "number": 6182, "state": "open"}'),)))(pinned))):
         check(label, lambda f=fn: rejects(f))
 
+    # #6440: id and number checks are type-strict (True == 1 and 6182.0 == 6182 in Python).
+    def detail_of(rid_json):
+        return '{"id": %s, "target": "branch", "enforcement": "active"}' % rid_json
+
+    for label, routes in (
+            ("detail id bool for listing id 1", (("/rulesets/1", detail_of("true")), ("/rulesets?", '[{"id": 1}]'))),
+            ("detail id float for listing id 7", (("/rulesets/7", detail_of("7.0")), ("/rulesets?", listing))),
+            # Only is_int_id can stop this one: the fake route DOES return a valid detail for id True.
+            ("listing id bool with a valid detail", (("/rulesets/True", detail_of("1")),
+                                                     ("/rulesets?", '[{"id": true}]')))):
+        check(label, lambda r=routes: read_raises(lambda: live_rulesets("o/r", run=fake_run(r))))
+    check("issue number float", lambda: read_raises(lambda: live_issue_state("o/r", run=fake_run((
+        ("/issues/", '{"number": 6182.0, "state": "open"}'),)))(pinned)))
+    check("issue number bool", lambda: read_raises(lambda: live_issue_state("o/r", run=fake_run((
+        ("/issues/", '{"number": true, "state": "open"}'),)))(1)))
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"
