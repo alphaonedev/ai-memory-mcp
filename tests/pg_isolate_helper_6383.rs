@@ -325,3 +325,78 @@ fn sweep_is_run_scoped_and_spares_held_clones_6383() {
         std::panic::resume_unwind(panic);
     }
 }
+
+/// Marker the parent sets so the re-executed child test knows it is the child.
+const CHILD_MARKER_6570: &str = "AI_MEMORY_PG_ISOLATE_6570_CHILD";
+/// Line the child prints so the parent can read the clone name.
+const CHILD_PRINT_6570: &str = "PG_ISOLATE_6570_MINTED=";
+
+/// Child half of `process_clone_is_dropped_at_exit_6570`: a no-op unless the
+/// parent re-executed this binary with the marker, then it mints this process's
+/// clone through the public helper and exits without dropping anything itself.
+#[test]
+fn child_mints_process_clone_6570() {
+    if std::env::var(CHILD_MARKER_6570).ok().as_deref() != Some("1") {
+        return;
+    }
+    let url = pg_isolate::isolated_url().expect("flag on: the helper must hand back a URL");
+    println!("{CHILD_PRINT_6570}{}", lane_db::database_name(&url));
+}
+
+#[test]
+fn process_clone_is_dropped_at_exit_6570() {
+    // Review r2 L2: with the flag on and no wrapper, the clone the helper mints
+    // for the process must be gone once the test binary exits.
+    let Some((base, template)) = live_inputs("process_clone_is_dropped_at_exit_6570") else {
+        return;
+    };
+    if pg_isolate::is_isolated_url(&base) {
+        eprintln!(
+            "SKIP process_clone_is_dropped_at_exit_6570: base URL is already an isolated clone"
+        );
+        return;
+    }
+    let run = test_run_id();
+    let exe = std::env::current_exe().expect("current exe");
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "child_mints_process_clone_6570",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_MARKER_6570, "1")
+        .env(pg_isolate::FLAG_VAR, "1")
+        .env(pg_isolate::URL_VAR, &base)
+        .env(pg_isolate::TEMPLATE_VAR, &template)
+        .env(pg_isolate::RUN_ID_VAR, &run)
+        .env_remove(pg_isolate::KILL_VAR)
+        .output()
+        .expect("re-execute this test binary");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let name = stdout
+        .lines()
+        .find_map(|l| l.strip_prefix(CHILD_PRINT_6570))
+        .map(str::to_string);
+    // Reclaim a leaked clone before asserting so a red run leaves nothing behind.
+    let leaked = name
+        .as_deref()
+        .map(|n| pg_isolate::database_exists_blocking(&base, n))
+        .transpose();
+    if let (Some(n), Ok(Some(true))) = (name.as_deref(), &leaked)
+        && let Err(e) = pg_isolate::drop_database_blocking(&base, &run, n)
+    {
+        eprintln!("WARN: could not reclaim the leaked clone {n}: {e}");
+    }
+    assert!(out.status.success(), "child failed: {stdout}");
+    let name = name.expect("the child must print the clone it minted");
+    assert!(
+        pg_isolate::parse_isolated_name(&run, &name).is_some(),
+        "child minted an unexpected name {name}"
+    );
+    assert_eq!(
+        leaked.expect("exists query"),
+        Some(false),
+        "#6570: the clone {name} survived the exit of the binary that minted it"
+    );
+}
