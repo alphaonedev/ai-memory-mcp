@@ -38,4 +38,21 @@ fn non_utf8_inference_egress_value_fails_closed_to_deny_6373() {
         InferenceEgressMode::Deny,
         "#6373: a set-but-non-UTF-8 value must fail closed to Deny"
     );
+
+    // Mutant N13: a non-UTF-8 value whose LOSSY decoding reads `allow` must
+    // still fail closed. `deny\xff\xfe` cannot separate fail-closed from a
+    // lossy parse (both give Deny); `allow\xff` can.
+    let lossy_allow = OsString::from_vec(vec![0x61, 0x6c, 0x6c, 0x6f, 0x77, 0xff]);
+    assert!(lossy_allow.to_str().is_none(), "fixture: not valid UTF-8");
+    assert!(
+        lossy_allow.to_string_lossy().starts_with("allow"),
+        "fixture: the lossy decoding reads allow"
+    );
+    // SAFETY: as above.
+    unsafe { std::env::set_var(ENV_INFERENCE_EGRESS, &lossy_allow) };
+    assert_eq!(
+        resolve_inference_egress_mode(),
+        InferenceEgressMode::Deny,
+        "#6373: a non-UTF-8 value that lossily reads allow must fail closed"
+    );
 }
