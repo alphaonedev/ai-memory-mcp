@@ -400,3 +400,34 @@ fn process_clone_is_dropped_at_exit_6570() {
         "#6570: the clone {name} survived the exit of the binary that minted it"
     );
 }
+
+#[test]
+fn publish_env_times_out_fail_closed_6571() {
+    // Review r2 L3: when the shared env lock cannot be taken in time, the
+    // helper must report an error (the caller panics) instead of leaving the
+    // raw env var and the AGE URL on the shared database with only a warning.
+    let _held = common::EnvVarGuard::set("AI_MEMORY_PG_ISOLATE_6571_HOLD", "1".to_string());
+    let before = (
+        std::env::var(pg_isolate::URL_VAR).ok(),
+        std::env::var(pg_isolate::AGE_URL_VAR).ok(),
+    );
+    let verdict = pg_isolate::publish_env_within(
+        "postgres://u:pw@127.0.0.1:5445/ai_memory_test",
+        "ai_memory_t_r6571_1700000000_0123abcd",
+        "postgres://u:pw@127.0.0.1:5445/ai_memory_t_r6571_1700000000_0123abcd",
+        std::time::Duration::from_millis(100),
+    );
+    let why = verdict.expect_err("#6571: a lock timeout must be an error, not a warning");
+    assert!(
+        why.contains("env lock") && why.contains(pg_isolate::URL_VAR),
+        "the error must name the lock and the variable left on the shared database: {why}"
+    );
+    let after = (
+        std::env::var(pg_isolate::URL_VAR).ok(),
+        std::env::var(pg_isolate::AGE_URL_VAR).ok(),
+    );
+    assert_eq!(
+        before, after,
+        "a failed publish must not touch the environment"
+    );
+}
