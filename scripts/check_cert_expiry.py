@@ -106,6 +106,7 @@ Exit codes: 0 clean / N/A-skip, 1 violation, 2 usage / self-test failure.
 
 import argparse
 import contextlib
+import errno
 import io
 import os
 import re
@@ -787,9 +788,17 @@ class SelfTest:
         return text
 
 
-GIT_SHIM = """#!{python}
+GIT_SHIM = """#!{python} -I
 import os, sys
 real, argv = {real!r}, sys.argv[1:]
+if argv == ["--shim-isolation-probe"]:
+    try:
+        import gitshim_canary_6145
+        planted = True
+    except ImportError:
+        planted = False
+    print(sys.flags.isolated, planted)
+    sys.exit(0)
 if "--version" in argv and {version!r}:
     print({version!r})
     sys.exit(0)
@@ -800,6 +809,538 @@ os.execv(real, [real] + argv)
 """
 
 
+SHEBANG_MAX = 255  # Linux truncates the interpreter line at 256 bytes (newline included)
+MKDTEMP_NAME_LEN = len("gitshim-long.") + 8  # tempfile.mkdtemp appends 8 random characters
+# Longest absolute scratch path under which the 255-byte boundary cell still fits:
+# 255 - '#!' - ' -I' - '/gitshim-long.XXXXXXXX' - the pad's 1 byte - a 1-byte file name.
+SCRATCH_PATH_LIMIT = 255 - len("#!") - len(" -I") - (1 + MKDTEMP_NAME_LEN) - 2
+
+
+def write_git_shim(shim_dir, real, version="", fail="", interpreter=None):
+    """Write the executable `git` PATH shim into shim_dir (#6145: its interpreter
+    line is `python3 -I`, like the gate itself in c8-precheck.yml, so the shim's
+    own directory is never on its sys.path). Fails closed with GateError when the
+    interpreter line cannot carry `-I` intact: whitespace or a NUL byte in the
+    interpreter path splits it, a path that is not valid UTF-8 cannot be written, and
+    a line over SHEBANG_MAX (255) bytes is truncated by the kernel, which silently
+    drops `-I` (a 255-byte line is accepted, a 256-byte line refused).
+
+    Self-test limit (#6145 R5-F3): the `shim-interpreter` cell builds 255/256-byte
+    interpreter lines under its scratch dir, so that dir's absolute path must be at
+    most SCRATCH_PATH_LIMIT (226) bytes, i.e. the checkout path at most 184 bytes
+    (CI uses 44); the checkout-depth cell pins that no other cell needs more (R8-F1).
+    A deeper checkout fails the cell with a message naming both
+    lengths; it is a property of the environment, not a defect in the gate."""
+    python = sys.executable if interpreter is None else str(interpreter)
+    line = f"#!{python} -I"
+    if not python or "\x00" in python or any(ch.isspace() for ch in python):
+        raise GateError(f"the shim interpreter path {python!r} is empty or contains "
+                        "whitespace or a NUL byte; its '-I' flag would not survive the shebang")
+    try:
+        line_bytes = len(line.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise GateError(f"the shim interpreter path {python!r} is not valid UTF-8 ({exc.reason}); "
+                        "the shim is written as UTF-8, so its '-I' flag cannot be guaranteed") from exc
+    if line_bytes > SHEBANG_MAX:
+        raise GateError(f"the shim interpreter line is {line_bytes} bytes, over "
+                        f"{SHEBANG_MAX}; the kernel would truncate it and drop '-I'")
+    shim = shim_dir / "git"
+    shim.write_text(GIT_SHIM.format(python=python, real=real, version=version,
+                                    fail=fail), encoding="utf-8")
+    shim.chmod(0o755)
+    return shim
+
+
+def shim_interpreter_violation(tmp):
+    """None when write_git_shim refuses every unsafe interpreter path and accepts
+    the longest safe one (#6145 S-F1), else a description. The boundary is sized to
+    the LITERAL 255/256 byte lines the kernel allows/truncates, never to SHEBANG_MAX,
+    so changing that constant to 256 fails here (#6145 R3-F1). Needs the scratch dir's
+    absolute path to be at most SCRATCH_PATH_LIMIT (226) bytes, i.e. a checkout path
+    of at most 184 bytes; deeper, it reports the lengths instead of building (R5-F3)."""
+    fixed = len("#!") + len(" -I")
+    deep = None
+    try:
+        deep = Path(tempfile.mkdtemp(prefix="gitshim-long.", dir=str(tmp)))
+        pad = 255 - fixed - len(os.fsencode(str(deep))) - 1
+        if pad < 1:
+            have = len(os.fsencode(str(tmp)))
+            return (f"the scratch path is too deep to build the boundary cases (pad {pad}): "
+                    f"the scratch path is {have} bytes but the 255-byte shebang boundary cell "
+                    f"needs it at most {SCRATCH_PATH_LIMIT} bytes (checkout path at most "
+                    f"{SCRATCH_PATH_LIMIT - have + len(os.fsencode(str(REPO_ROOT)))} bytes); "
+                    "run the self-test from a shallower checkout")
+        long_dir = deep / ("d" * 200)
+        long_dir.mkdir()
+        too_long = long_dir / ("p" * 60)
+        too_long.symlink_to(sys.executable)
+        spaced = deep / "with space" / "python3"
+        longest_ok = deep / ("q" * pad)
+        one_over = deep / ("q" * (pad + 1))
+        for want, interp in ((255, longest_ok), (256, one_over)):
+            got = len(os.fsencode(f"#!{interp} -I"))
+            if got != want:
+                return f"the {want}-byte boundary case is {got} bytes"
+        non_utf8 = deep / "py\udcff"
+        cases = [("an over-long interpreter path", too_long, True),
+                 ("an interpreter path with whitespace", spaced, True),
+                 ("the longest in-limit interpreter path", longest_ok, False),
+                 ("a 256-byte interpreter line", one_over, True),
+                 ("a non-UTF-8 (surrogate-escaped) interpreter path", non_utf8, True),
+                 ("an interpreter path with a NUL byte", deep / "py\x00x", True)]
+        for label, interp, must_raise in cases:
+            try:
+                write_git_shim(deep, "git", interpreter=interp)
+            except GateError:
+                if not must_raise:
+                    return f"{label} was refused"
+                continue
+            except Exception as exc:  # noqa: BLE001 - report any non-GateError as a violation
+                return f"{label} raised {type(exc).__name__}, not GateError: {exc}"
+            if must_raise:
+                return f"{label} was accepted (the kernel would drop '-I')"
+        return None
+    except OSError as exc:
+        return f"could not build the boundary cases: {exc}"
+    finally:
+        if deep is not None:
+            shutil.rmtree(deep, ignore_errors=True)
+
+
+
+def platform_path_max():
+    """The platform's PATH_MAX: 1024 on macOS and the BSDs, 4096 elsewhere (R5-F1)."""
+    bsd = ("darwin", "freebsd", "openbsd", "netbsd")
+    return 1024 if sys.platform.startswith(bsd) else 4096
+
+
+def path_max(path):
+    """The PATH_MAX of the filesystem holding path (Linux 4096, macOS 1024),
+    falling back to the platform's value when os.pathconf cannot say (#6145 R4-F1,
+    R5-F1), so the fallback never exceeds the real limit."""
+    try:
+        limit = os.pathconf(str(path), "PC_PATH_MAX")
+    except (OSError, ValueError, AttributeError):
+        return platform_path_max()
+    return limit if isinstance(limit, int) and limit > 0 else platform_path_max()
+
+
+def deep_scratch(tmp, target_len):
+    """A scratch directory whose absolute path is EXACTLY target_len bytes, built
+    with dir_fd so no single syscall sees a path over PATH_MAX (#6145 R3-F2, R4-F2).
+    Returns (base, deepest); on any failure removes base and raises OSError (R4-F3)."""
+    base = Path(tempfile.mkdtemp(prefix="gitshim-deep.", dir=str(tmp)))
+    fds = []
+    try:
+        cur, cur_len = base, len(os.fsencode(str(base)))
+        fds.append(os.open(str(base), os.O_RDONLY))
+        while cur_len < target_len:
+            room = target_len - cur_len
+            step = min(200, room - 1)
+            if room - step - 1 == 1:
+                step -= 1  # a final component needs 2 bytes ('/' + 1 char)
+            if step < 1:
+                raise OSError(errno.ENAMETOOLONG,
+                              f"cannot land on exactly {target_len} bytes from {cur_len}")
+            name = "d" * step
+            os.mkdir(name, dir_fd=fds[-1])
+            fds.append(os.open(name, os.O_RDONLY, dir_fd=fds[-1]))
+            cur, cur_len = cur / name, cur_len + 1 + step
+        if cur_len != target_len:
+            raise OSError(errno.ENAMETOOLONG,
+                          f"the scratch base is {cur_len} bytes, over the {target_len}-byte target")
+        return base, cur
+    except BaseException:
+        shutil.rmtree(base, ignore_errors=True)
+        raise
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def shim_boundary_robustness_violation(tmp):
+    """None when shim_interpreter_violation reports (never raises) on a scratch dir
+    that is missing or sits just under PATH_MAX (#6145 R3-F2), else a description.
+    The near-PATH_MAX path is sized from the platform's PATH_MAX (R4-F1) and the cell
+    asserts the 200-byte directory build would overflow it (R4-F2), so moving the
+    'too deep' check after the build turns this cell red."""
+    missing = shim_interpreter_violation(tmp / "no-such-scratch-6145")
+    if missing is None or not missing.startswith("could not build the boundary cases"):
+        return f"a missing scratch dir gave {missing!r}, not a 'could not build' violation"
+    limit = path_max(tmp)
+    target = limit - 1 - (MKDTEMP_NAME_LEN + 1) - 1
+    try:
+        base, near_max = deep_scratch(tmp, target)
+    except OSError as exc:
+        return f"could not build the near-PATH_MAX scratch: {exc}"
+    try:
+        if len(os.fsencode(str(near_max))) + MKDTEMP_NAME_LEN + 1 + 201 < limit:
+            return (f"the near-PATH_MAX scratch ({target} bytes) is too short for the 200-byte "
+                    f"build to overflow PATH_MAX {limit}")
+        try:
+            deep = shim_interpreter_violation(near_max)
+        except OSError as exc:
+            return f"a near-PATH_MAX scratch dir raised {type(exc).__name__}: {exc}"
+        if deep is None or not deep.startswith("the scratch path is too deep"):
+            return f"a near-PATH_MAX scratch dir gave {deep!r}, not a 'too deep' violation"
+        left = [p.name for p in near_max.iterdir()] if near_max.is_dir() else []
+        if left:
+            return f"a near-PATH_MAX scratch dir was left with {left!r}"
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    return None
+
+
+def deep_scratch_base_len(tmp):
+    """Length of the shortest path deep_scratch(tmp, ...) can return: the scratch dir,
+    a separator, the `gitshim-deep.` prefix and the 8-byte mkdtemp suffix (#6145 R7-F2)."""
+    return len(os.fsencode(str(tmp))) + 1 + len("gitshim-deep.") + 8
+
+
+def deep_scratch_violation(tmp):
+    """None when deep_scratch lands on the exact length, cleans up after itself on
+    failure and the robustness cell turns a build failure into a named violation
+    (#6145 R4-F1/F2/F3), else a description. The two targets are relative to the scratch
+    path length (+300 and +600 bytes past the deep_scratch base) and capped below
+    PATH_MAX, so they stay valid on a deep checkout (R5-F3)."""
+    cap = path_max(tmp) - 1
+    base_len = deep_scratch_base_len(tmp)
+    if base_len + 2 > cap:  # deep_scratch cannot extend a path by one byte (R6-F2)
+        return (f"the scratch path is {len(os.fsencode(str(tmp)))} bytes; deep_scratch needs "
+                f"room below the {cap + 1}-byte PATH_MAX")
+    for want in (min(base_len + 300, cap), min(base_len + 600, cap)):
+        base = None
+        try:
+            base, cur = deep_scratch(tmp, want)
+            got = len(os.fsencode(str(cur)))
+            if got != want:
+                return f"deep_scratch({want}) built a {got}-byte path, not the exact length"
+        except OSError as exc:
+            return f"deep_scratch({want}) raised {type(exc).__name__}: {exc}"
+        finally:
+            if base is not None:
+                shutil.rmtree(base, ignore_errors=True)
+    try:
+        deep_scratch(tmp, 10)
+    except OSError:
+        pass
+    else:
+        return "deep_scratch with a target shorter than its base did not fail"
+    left = sorted(p.name for p in tmp.glob("gitshim-deep.*"))
+    if left:
+        return f"a failed deep_scratch left {left!r} behind"
+    real, boom = globals()["deep_scratch"], OSError(28, "No space left on device")
+
+    def failing(_tmp, _target):
+        raise boom
+    globals()["deep_scratch"] = failing
+    try:
+        res = shim_boundary_robustness_violation(tmp)
+    except Exception as exc:  # noqa: BLE001 - the cell must report, never raise
+        return f"a deep_scratch build failure raised {type(exc).__name__}: {exc}"
+    finally:
+        globals()["deep_scratch"] = real
+    if res is None or not res.startswith("could not build the near-PATH_MAX scratch"):
+        return f"a deep_scratch build failure gave {res!r}, not a named violation"
+    return None
+
+
+FALLBACK_PLATFORMS = (("darwin", 1024), ("freebsd14", 1024), ("openbsd7", 1024),
+                      ("netbsd10", 1024), ("linux", 4096))
+
+
+def path_max_fallback_violation(tmp):
+    """None when path_max falls back to the platform's PATH_MAX (1024 on darwin and the
+    BSDs, 4096 elsewhere) when os.pathconf raises or answers nonsense, else a
+    description (#6145 R5-F1). os.pathconf and sys.platform are patched in place and
+    restored."""
+    real_pathconf, real_platform = os.pathconf, sys.platform
+
+    def raising(_path, _name):
+        raise OSError(errno.EINVAL, "PC_PATH_MAX unavailable")
+    # the host's own platform first (False sorts first), so the last patch applied is never the host's and
+    # a leaked sys.platform patch is visible on every host (R6-F3)
+    plans = sorted(FALLBACK_PLATFORMS, key=lambda entry: entry[0] != real_platform)
+    try:
+        for plat, want in plans:
+            for label, patch in (("raises", raising), ("answers 0", lambda _p, _n: 0),
+                                 ("answers None", lambda _p, _n: None)):
+                os.pathconf, sys.platform = patch, plat
+                got = path_max(tmp)
+                if got != want:
+                    return (f"path_max fell back to {got} on {plat} when os.pathconf {label}, "
+                            f"not the platform limit {want}")
+    finally:
+        os.pathconf, sys.platform = real_pathconf, real_platform
+    return None
+
+
+PATH_MAX_LEAK_PREFIX = "path_max_fallback_violation leaked"
+PATH_MAX_FALLBACK_PLANT = "planted fallback failure 6145"
+
+
+def path_max_restore_violation(tmp, fallback=path_max_fallback_violation):
+    """None when the fallback check (path_max_fallback_violation unless a caller passes
+    another) hands os.pathconf and sys.platform back exactly as it found them AND
+    passes, else a description (#6145 R6-F3). It is the only caller of
+    path_max_fallback_violation and runs first in the cell list, so the snapshot is the
+    true entry state and a leak names the real host platform (R7-F1). The patch list
+    ends on a platform that is not the host's, so a dropped restore is visible on Linux
+    too. The check is a parameter, not a patched global, so the diagnostic can hand in
+    a leaking one without anything to put back (R8-F2)."""
+    saved_pathconf, saved_platform = os.pathconf, sys.platform
+    try:
+        res = fallback(tmp)
+    finally:
+        leaked = []
+        if os.pathconf is not saved_pathconf:
+            leaked.append("os.pathconf")
+        if sys.platform != saved_platform:
+            leaked.append(f"sys.platform ({sys.platform!r}, not {saved_platform!r})")
+        os.pathconf, sys.platform = saved_pathconf, saved_platform
+    if leaked:
+        return f"{PATH_MAX_LEAK_PREFIX} a patched {', '.join(leaked)}"
+    return res
+
+
+def path_max_restore_diagnostic_violation(tmp):
+    """None when the path-max-restore cell, handed a fallback check that leaks its
+    patches (what a dropped `finally` does), fails with a leak message naming the REAL
+    host platform and puts os.pathconf and sys.platform back, and, handed a fallback
+    check that fails without leaking, fails as `(path-max-fallback, #6145)`, else a
+    description (#6145 R7-F1, R8-F1, R8-F2, R9-F3). Only that one cell runs (once per
+    planted check), through the same run_cells loop as _self_test, with the planted
+    check passed as its `fallback` argument: no global is patched, no other cell
+    re-runs and no scratch dir is created, so the diagnostic adds no checkout depth
+    (the 184-byte limit holds)."""
+    host, real_pathconf = sys.platform, os.pathconf
+
+    def leaking(_tmp):
+        for plat, _want in sorted(FALLBACK_PLATFORMS, key=lambda entry: entry[0] != sys.platform):
+            os.pathconf, sys.platform = (lambda _p, _n: 0), plat
+        return None
+    def planted(_tmp):
+        return PATH_MAX_FALLBACK_PLANT
+    err, fb_err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            rc = run_cells(SelfTest(), (("path-max-restore", path_max_restore_violation, (tmp, leaking)),))
+        put_back = os.pathconf is real_pathconf and sys.platform == host
+        with contextlib.redirect_stderr(fb_err):
+            fb_rc = run_cells(SelfTest(), (("path-max-restore", path_max_restore_violation, (tmp, planted)),))
+    finally:
+        os.pathconf, sys.platform = real_pathconf, host
+    out, fb_out = err.getvalue().strip(), fb_err.getvalue().strip()
+    if not put_back:
+        return ("the path-max-restore cell did not put os.pathconf and sys.platform back "
+                "after a leaking fallback check")
+    if rc != 2:
+        return f"a leaking fallback check was not reported (rc {rc}): {out[-300:]!r}"
+    if f"(path-max-restore, #6145): {PATH_MAX_LEAK_PREFIX}" not in out:
+        return f"a leaking fallback check was reported as another failure: {out[-300:]!r}"
+    if f"not {host!r}" not in out:
+        return (f"the leak message does not name the real host platform {host!r}: "
+                f"{out[-300:]!r}")
+    if fb_rc != 2 or f"(path-max-fallback, #6145): {PATH_MAX_FALLBACK_PLANT}" not in fb_out:
+        return (f"a failing (not leaking) fallback check was not reported as path-max-fallback "
+                f"(rc {fb_rc}): {fb_out[-300:]!r}")
+    return None
+
+
+def guarded_violation():
+    """None when guarded() turns an Exception into '<cell> raised <Type>: <msg>',
+    returns None for a passing cell and lets KeyboardInterrupt propagate, else a
+    description (#6145 R5-F2)."""
+    def boom():
+        raise RuntimeError("x")
+
+    def fine():
+        return None
+
+    def interrupted():
+        raise KeyboardInterrupt
+    try:
+        got = guarded(boom)
+    except Exception as exc:  # noqa: BLE001 - an unguarded crash is the defect under test
+        return f"guarded let a RuntimeError escape: {exc}"
+    if got != "boom raised RuntimeError: x":
+        return f"guarded gave {got!r} for a raising cell, not 'boom raised RuntimeError: x'"
+    if guarded(fine) is not None:
+        return "guarded changed the result of a passing cell"
+    try:
+        guarded(interrupted)
+    except KeyboardInterrupt:
+        return None
+    return "guarded swallowed a KeyboardInterrupt"
+
+
+def scratch_limit_message_violation(tmp):
+    """None when the 'scratch path is too deep' violation names the actual scratch path
+    length and the limit, else a description (#6145 R5-F3). The limit is derived here
+    independently of the code under test: 255 - '#!' - ' -I' - '/gitshim-long.XXXXXXXX'
+    - the pad's 1 byte and the 1-byte file name."""
+    limit = 255 - len("#!") - len(" -I") - (1 + MKDTEMP_NAME_LEN) - 2
+    base, deepest = deep_scratch(tmp, limit + 40)
+    try:
+        msg = shim_interpreter_violation(deepest)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    if msg is None or not msg.startswith("the scratch path is too deep"):
+        return f"a {limit + 40}-byte scratch gave {msg!r}, not a 'too deep' violation"
+    for need in (f"{limit + 40} bytes", f"{limit} bytes"):
+        if need not in msg:
+            return f"the 'too deep' message {msg!r} does not state {need!r}"
+    return None
+
+
+def deep_scratch_relative_violation(tmp):
+    """None when deep_scratch_violation stays valid on a deep scratch dir (its targets
+    are relative to the scratch path length and capped below PATH_MAX), else a
+    description (#6145 R5-F3)."""
+    limit = path_max(tmp)
+    base, deepest = deep_scratch(tmp, max(limit - 700, len(os.fsencode(str(tmp))) + 100))
+    try:
+        res = deep_scratch_violation(deepest)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    return res
+
+
+def deep_scratch_cap_violation(tmp):
+    """None when deep_scratch_violation keeps its two targets inside
+    [deep_scratch_base_len, PATH_MAX-1] on a scratch dir 400 bytes under PATH_MAX (where
+    the +600 target hits the cap) and reports a named 'needs room' violation at 24 bytes
+    under PATH_MAX (base 2 bytes under it) but not at 25 (R6-F1, R6-F2, R7-F2), else a
+    description (#6145)."""
+    limit = path_max(tmp)
+    cap = limit - 1
+    seen = []
+    real = globals()["deep_scratch"]
+
+    def spy(spy_tmp, target):
+        seen.append(target)
+        return real(spy_tmp, target)
+    base, deepest = deep_scratch(tmp, limit - 400)
+    globals()["deep_scratch"] = spy
+    try:
+        res = deep_scratch_violation(deepest)
+    finally:
+        globals()["deep_scratch"] = real
+        shutil.rmtree(base, ignore_errors=True)
+    if res is not None:
+        return f"deep_scratch_violation failed on a scratch {limit - 400} bytes long: {res}"
+    low = deep_scratch_base_len(deepest)
+    targets = seen[:2]  # the two build targets come before the too-short probe
+    if len(targets) != 2 or cap not in targets:
+        return f"the deep_scratch targets {seen!r} never reached the cap {cap}"
+    if any(t > cap or t < low for t in targets):
+        return f"the deep_scratch targets {targets!r} leave [{low}, {cap}]"
+    if targets != [min(low + 300, cap), min(low + 600, cap)]:
+        return f"the deep_scratch targets {targets!r} are not base+300 and base+600 capped at {cap}"
+    for room, want_room in ((limit - 24, True), (limit - 25, False)):
+        base, deepest = deep_scratch(tmp, room)
+        try:
+            res = deep_scratch_violation(deepest)
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+        if want_room:
+            need = f"the scratch path is {room} bytes; deep_scratch needs room"
+            if res is None or not res.startswith(need):
+                return f"a {room}-byte scratch gave {res!r}, not a violation starting {need!r}"
+        elif res is not None:
+            return f"a {room}-byte scratch gave {res!r}, not None"
+    return None
+
+
+CHECKOUT_DEPTH_PREFIX = "cert-expiry-depth."
+
+
+def checkout_depth_cells():
+    """The cells checkout_depth_violation runs in its 226-byte scratch dir (#6145 R10-F1)."""
+    return (shim_isolation_violation, shim_interpreter_violation,
+            shim_boundary_robustness_violation, deep_scratch_violation,
+            path_max_restore_diagnostic_violation, deep_scratch_cap_violation,
+            scratch_limit_message_violation, deep_scratch_relative_violation,
+            shim_unexecutable_violation)
+
+
+# Cells whose scratch path or shim interpreter line grows with the scratch depth; each
+# must run in checkout_depth_violation's 226-byte scratch dir (#6145 R10-F1).
+CHECKOUT_DEPTH_REQUIRED = ("shim_unexecutable_violation",)
+
+
+def checkout_depth_coverage_violation():
+    """None when checkout_depth_cells() names every cell in CHECKOUT_DEPTH_REQUIRED, else
+    a description (#6145 R10-F1): the shim-unexecutable cell's interpreter line is 251
+    bytes at a 226-byte scratch dir, so a cell left out of checkout-depth lets a deeper
+    one pass from a shallow checkout."""
+    have = {cell.__name__ for cell in checkout_depth_cells()}
+    missing = [name for name in CHECKOUT_DEPTH_REQUIRED if name not in have]
+    if missing:
+        return f"checkout-depth does not run {', '.join(missing)}"
+    return None
+
+
+def checkout_depth_violation(tmp):
+    """None when every #6145 shim and scratch cell passes in a scratch dir exactly
+    SCRATCH_PATH_LIMIT (226) bytes long, the scratch a 184-byte checkout gets, else a
+    description (#6145 R8-F1, R9-F2). No cell may need more depth than shim-interpreter
+    itself, so a cell that nests the self-test (or any of its cells) deeper than its
+    own scratch dir fails here (checkout_depth_cells lists them; the checkout-depth-coverage
+    cell pins shim_unexecutable_violation in it). path_max_restore_violation builds no
+    path and is not in the list; the diagnostic still runs it, but only with planted
+    fallbacks, so the real fallback check runs once per self-test (R9-F1); the gate-run
+    fixtures build one `gitshim.*` level under the scratch dir and fit within it. The
+    dir is a sibling of tmp (tmp itself is 226 bytes at a 184-byte checkout) and is
+    removed afterwards."""
+    parent = tmp.parent
+    pad = SCRATCH_PATH_LIMIT - len(os.fsencode(str(parent))) - 1 - len(CHECKOUT_DEPTH_PREFIX) - 8
+    if pad < 0:
+        return (f"the scratch root {str(parent)!r} is too deep to build a "
+                f"{SCRATCH_PATH_LIMIT}-byte scratch dir")
+    deep = Path(tempfile.mkdtemp(prefix=CHECKOUT_DEPTH_PREFIX + "d" * pad, dir=str(parent)))
+    try:
+        got = len(os.fsencode(str(deep)))
+        if got != SCRATCH_PATH_LIMIT:
+            return f"the depth scratch dir is {got} bytes, not {SCRATCH_PATH_LIMIT}"
+        for cell in checkout_depth_cells():
+            res = guarded(cell, deep)
+            if res is not None:
+                return f"{cell.__name__} failed in a {got}-byte scratch dir: {res}"
+    finally:
+        shutil.rmtree(deep, ignore_errors=True)
+    return None
+
+
+def shim_isolation_violation(tmp, interpreter=None):
+    """None when the git shim is isolated, else a description (#6145). Plants an
+    empty `gitshim_canary_6145.py` beside the shim and runs the shim's own probe,
+    which reports `sys.flags.isolated` and whether the canary imported (without
+    -I the script directory is sys.path[0], so a planted module imports). The
+    real import system decides, so a symlinked scratch path cannot fool it."""
+    real = shutil.which("git")
+    if real is None:
+        raise GateError("git is not on PATH")
+    shim_dir = Path(tempfile.mkdtemp(prefix="gitshim-iso.", dir=str(tmp)))
+    try:
+        shim = write_git_shim(shim_dir, real, interpreter=interpreter)
+        (shim_dir / "gitshim_canary_6145.py").write_text("", encoding="utf-8")
+        first = shim.read_text(encoding="utf-8").splitlines()[0]
+        if not first.startswith("#!") or first.split()[1:] != ["-I"]:
+            return f"shim interpreter line {first!r} is not '<python> -I'"
+        try:
+            res = subprocess.run([str(shim), "--shim-isolation-probe"], capture_output=True,
+                                 text=True, cwd=str(shim_dir), check=False)
+        except OSError as exc:
+            return f"the shim could not be executed: {exc}"
+        if res.returncode != 0 or res.stdout.split() != ["1", "False"]:
+            return ("the shim is not isolated: probe printed "
+                    f"{res.stdout.strip()!r} (want '1 False'), rc {res.returncode}: {res.stderr}")
+        return None
+    finally:
+        shutil.rmtree(shim_dir, ignore_errors=True)
+
+
 def run_gate_shimmed(tmp, repo, env, version="", fail=""):
     """run_gate with a PATH shim `git` that reports `version` for --version
     and exits 128 on any call whose argv contains `fail`, and otherwise
@@ -808,10 +1349,7 @@ def run_gate_shimmed(tmp, repo, env, version="", fail=""):
     if real is None:
         raise GateError("git is not on PATH")
     shim_dir = Path(tempfile.mkdtemp(prefix="gitshim.", dir=str(tmp)))
-    shim = shim_dir / "git"
-    shim.write_text(GIT_SHIM.format(python=sys.executable, real=real, version=version,
-                                    fail=fail), encoding="utf-8")
-    shim.chmod(0o755)
+    write_git_shim(shim_dir, real, version, fail)
     saved = os.environ.get("PATH")
     os.environ["PATH"] = f"{shim_dir}{os.pathsep}{saved or ''}"
     try:
@@ -843,10 +1381,117 @@ def self_test():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def guarded(cell, *args, **kwargs):
+    """Run a self-test cell; a crash becomes a named violation string, not a traceback
+    (#6145 security O1)."""
+    try:
+        return cell(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - report any crash as a named failure
+        return f"{cell.__name__} raised {type(exc).__name__}: {exc}"
+
+
+def run_cells(t, cells):
+    """Run (tag, cell, args) self-test cells in order (#6145 R8-F1). The first violation
+    is reported through t.fail as `(<tag>, #6145): <violation>` and returns 2; None when
+    every cell passes. A path-max-restore violation that is not a leak is tagged
+    path-max-fallback, since the fallback check runs inside that cell."""
+    for tag, cell, cell_args in cells:
+        try:
+            res = guarded(cell, *cell_args)
+        except Exception as exc:  # noqa: BLE001 - guarded itself must never leak a crash
+            res = f"{cell.__name__} escaped guarded: {type(exc).__name__}: {exc}"
+        if res is not None:
+            if tag == "path-max-restore" and not res.startswith(PATH_MAX_LEAK_PREFIX):
+                tag = "path-max-fallback"  # the fallback check runs inside the restore cell
+            t.fail(f"({tag}, #6145): {res}")
+            print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+            return 2
+    return None
+
+
+def shim_unexecutable_violation(tmp):
+    """None when a shim whose interpreter does not exist is reported as 'the shim could
+    not be executed', else a description (#6145 R10-F1). The interpreter line is 251
+    bytes at a 226-byte scratch dir, so checkout-depth runs this cell too."""
+    unexec = guarded(shim_isolation_violation, tmp, interpreter=tmp / "no-such-python-6145")
+    if unexec is None or not unexec.startswith("the shim could not be executed"):
+        return (f"an unexecutable shim gave {unexec!r}, "
+                "not a 'the shim could not be executed' violation")
+    return None
+
+
+def shim_isolation_result(tmp, check=shim_isolation_violation):
+    """The shim-isolation verdict for _self_test: None when `check(tmp)` passes, else a
+    description. A GateError is the description itself; any other crash becomes the
+    `guarded` form, so a crash is a named failure and not a traceback (#6145 R10-F2)."""
+    try:
+        return check(tmp)
+    except GateError as exc:
+        return str(exc)
+    except Exception as exc:  # noqa: BLE001 - report any crash as a named failure
+        return f"shim_isolation_violation raised {type(exc).__name__}: {exc}"
+
+
+def shim_isolation_crash_violation():
+    """None when shim_isolation_result turns an OSError, a ValueError and a class defined
+    here raised by the check into `shim_isolation_violation raised <Type>: ...`, else a
+    description. The private class derives from Exception only, so no narrower tuple of
+    builtin types catches it: the three plants pin the handler at Exception. Decoding the
+    probe output of non-UTF-8 bytes raises UnicodeDecodeError, a ValueError (#6145 R10-F2,
+    R11-F1, R12-F1)."""
+    class _Planted6145(Exception):
+        pass
+
+    for exc_type in (OSError, ValueError, _Planted6145):
+        def crashing(_tmp, exc_type=exc_type):
+            raise exc_type("planted 6145")
+        got = shim_isolation_result(None, crashing)
+        want = f"shim_isolation_violation raised {exc_type.__name__}: planted 6145"
+        if got != want:
+            return f"{exc_type.__name__} raised in the isolation cell gave {got!r}, not {want!r}"
+    return None
+
+
 def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     repo = tmp / "repo"
     repo.mkdir()
     t = SelfTest()
+    # #6145: prove the git PATH shim is isolated before any gate run uses it; an
+    # unisolated shim aborts the self-test here.
+    iso = shim_isolation_result(tmp)
+    if iso is not None:
+        t.fail(f"(shim-isolation, #6145): {iso}")
+        print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+        return 2
+    iface = guarded(shim_interpreter_violation, tmp)
+    if iface is not None:
+        t.fail(f"(shim-interpreter, #6145): {iface}")
+        print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+        return 2
+    robust = guarded(shim_boundary_robustness_violation, tmp)
+    if robust is not None:
+        t.fail(f"(shim-interpreter-robust, #6145): {robust}")
+        print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+        return 2
+    deepx = guarded(deep_scratch_violation, tmp)
+    if deepx is not None:
+        t.fail(f"(shim-deep-scratch, #6145): {deepx}")
+        print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+        return 2
+    rc = run_cells(t, (("path-max-restore", path_max_restore_violation, (tmp,)),
+                       ("path-max-diagnostic", path_max_restore_diagnostic_violation, (tmp,)),
+                       ("shim-deep-cap", deep_scratch_cap_violation, (tmp,)),
+                       ("guarded", guarded_violation, ()),
+                       ("shim-isolation-crash", shim_isolation_crash_violation, ()),
+                       ("checkout-depth-coverage", checkout_depth_coverage_violation, ()),
+                       ("shim-scratch-limit", scratch_limit_message_violation, (tmp,)),
+                       ("shim-deep-relative", deep_scratch_relative_violation, (tmp,)),
+                       ("checkout-depth", checkout_depth_violation, (tmp,))))
+    if rc is not None:
+        return rc
+    rc = run_cells(t, (("shim-unexecutable", shim_unexecutable_violation, (tmp,)),))
+    if rc is not None:
+        return rc
     fx = Fixture(repo)
     fx.g("init", "-q", "-b", "main")
     fx.g("config", "user.name", "Cert Expiry Selftest")
@@ -1423,7 +2068,27 @@ SELF_TEST_OK = (
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
     "octopus merge RED; (ci1-ci7, #5970) the event payload range is authoritative under "
     "GitHub Actions and CERT_EXPIRY_BASE/HEAD overrides are refused there but honoured "
-    "outside CI."
+    "outside CI; (shim-isolation, #6145) the git PATH shim runs under python3 -I: isolated flag set and "
+    "a module planted beside it not importable, checked before any shimmed gate run; "
+    "(shim-interpreter, #6145) a whitespace, NUL, over-long (>255 byte) or non-UTF-8 interpreter line is "
+    "refused and a 255-byte line is accepted; (shim-interpreter-robust, #6145) a missing or near-PATH_MAX "
+    "scratch dir, sized from the platform PATH_MAX, yields a named violation, not a traceback; "
+    "(shim-deep-scratch, #6145) the deep scratch builder lands on the exact length, removes itself on failure and "
+    "a build failure is a named violation; (shim-unexecutable, #6145) an unexecutable shim "
+    "is reported as a violation; (path-max-fallback, #6145) PATH_MAX falls back to 1024 on macOS/BSD and "
+    "4096 elsewhere when os.pathconf fails; (guarded, #6145) a crashing cell becomes a named failure and "
+    "KeyboardInterrupt propagates; (shim-scratch-limit, #6145) a too-deep scratch path is reported with its "
+    "length and the limit; (shim-deep-relative, #6145) the deep-scratch targets stay valid on a deep checkout; "
+    "(shim-deep-cap, #6145) they stay inside [deep_scratch base, PATH_MAX-1] and a scratch 24 bytes under "
+    "PATH_MAX gets the 'needs room' message; (path-max-restore, #6145) os.pathconf and sys.platform are "
+    "restored and the fallback check runs once, first; (path-max-diagnostic, #6145) a dropped restore "
+    "names the real host platform and is put back, and a failing (not leaking) fallback check is "
+    "reported as path-max-fallback, running only that cell in the same scratch dir; "
+    "(shim-isolation-crash, #6145) a crash in the isolation cell is a named failure; "
+    "(checkout-depth-coverage, #6145) checkout-depth runs the shim-unexecutable cell; "
+    "(checkout-depth, #6145) every #6145 shim and scratch cell (including shim-unexecutable) passes in a "
+    "226-byte scratch dir, the one a 184-byte checkout gets; the gate-run fixtures build one gitshim.* level under the scratch "
+    "dir and fit within it."
 )
 
 
