@@ -132,7 +132,10 @@ SUCCESSOR_RE = re.compile(r"`scripts/([A-Za-z0-9_./-]+\.(?:sh|py))`")
 ALLOW_REL = "scripts/qc-allowlists/compliance-script-names-allow.txt"
 # The allowlist only shrinks: more entries than this fail the gate.
 ALLOW_CEILING = 10
-DASHES = frozenset("\u02d7\u2043\u2212\u2796\ufe63\uff0d")
+# Dash look-alikes outside category Pd (#6633): box-drawing and horizontal-line marks, the
+# macron (which NFKC decomposes to a space and a combining mark, so it is mapped first) and
+# the Ogham space mark, which renders as a dash.
+DASHES = frozenset("\u02d7\u2043\u2212\u2796\ufe63\uff0d\u2500\u2501\u23af\u23ba\u2e0f\u00af\u1680")
 LOOKALIKES = str.maketrans(
     {
         "\u0430": "a", "\u0410": "A", "\u0412": "B", "\u0441": "c", "\u0421": "C", "\u0501": "d",
@@ -256,7 +259,8 @@ def decoded(line):
 
 def folded(line):
     """``decoded(line)`` folded: NFKC, dashes to ``-``, marks and look-alikes dropped, emphasis removed."""
-    s = unicodedata.normalize("NFKC", decoded(line))
+    s = "".join("-" if c in DASHES else c for c in decoded(line))
+    s = unicodedata.normalize("NFKC", s)
     s = "".join("-" if c in DASHES or unicodedata.category(c) == "Pd" else c for c in s)
     s = "".join(
         c for c in unicodedata.normalize("NFD", s) if not invisible(c) and unicodedata.category(c) not in ("Mn", "Me")
@@ -275,11 +279,13 @@ def _loose(word):
 
 
 # A script name in any letters (#6214): each letter of ``check``, ``sh`` and ``py`` is that ASCII
-# letter or any non-ASCII letter, and a separator may be any non-ASCII, non-space character.
-NON_ASCII = r"[^\x00-\x7f\s]"
+# letter or any non-ASCII letter, and a separator may be any non-ASCII, non-space character or
+# the Ogham space mark, which renders as a dash (#6633). The middle of a name may hold the same
+# characters (#6633), at most 256 of them (#6635).
+NON_ASCII = r"(?:[^\x00-\x7f\s]|\u1680)"
 LOOSE_RE = re.compile(
-    r"(?<![A-Za-z0-9_])" + _loose("check") + r"(?:[-_]|" + NON_ASCII + r")[\w-]+(?:\.|" + NON_ASCII
-    + r")(?:" + _loose("sh") + "|" + _loose("py") + r")(?![A-Za-z0-9_])",
+    r"(?<![A-Za-z0-9_])" + _loose("check") + r"(?:[-_]|" + NON_ASCII + r")(?:[\w-]|" + NON_ASCII
+    + r"){1,256}(?:\.|" + NON_ASCII + r")(?:" + _loose("sh") + "|" + _loose("py") + r")(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
 
