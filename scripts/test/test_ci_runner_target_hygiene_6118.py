@@ -978,6 +978,7 @@ class Unit(NamedTuple):
     text: str
     dynamic: bool  # the text depends on a variable / command substitution the guard cannot evaluate
     file_data: bool = False  # a here-document body that is written to a file (read by the TOML rules)
+    name_dynamic: bool = False  # an expansion sits in the variable-name part of the word (#6490)
 
 
 def _skip_balanced(text: str, i: int, open_ch: str, close_ch: str) -> int:
@@ -1009,13 +1010,23 @@ def _skip_balanced(text: str, i: int, open_ch: str, close_ch: str) -> int:
     return n
 
 
-def _read_word(text: str, i: int) -> Tuple[str, bool, bool, int]:
-    """One shell word from ``text[i]``: (value, dynamic, quoted, next index)."""
+def _read_word(text: str, i: int) -> Tuple[str, bool, bool, int, bool]:
+    """One shell word from ``text[i]``: (value, dynamic, quoted, next index, name_dynamic).
+
+    ``name_dynamic`` (#6490) is True when an expansion sits in the NAME part of the word: before any
+    ``=`` and with only name characters ahead of it (``"$K=2"``, ``CARGO_${P}_DEBUG=2``, ``"$K"``).
+    """
     n = len(text)
     out: List[str] = []
     seg: List[str] = []
     dynamic = False
     quoted = False
+    name_dynamic = False
+
+    def note_name() -> None:
+        nonlocal name_dynamic
+        if NAME_CHARS_RE.fullmatch("".join(out) + "".join(seg)):
+            name_dynamic = True
 
     def flush() -> None:
         if seg:
@@ -1026,6 +1037,8 @@ def _read_word(text: str, i: int) -> Tuple[str, bool, bool, int]:
         """``text[j] == '$'``: skip a substitution / parameter expansion; note it was dynamic."""
         nonlocal dynamic
         nxt = text[j + 1:j + 2]
+        if nxt in ("(", "{") or (nxt and EXPANSION_START_RE.match(nxt)):
+            note_name()
         if nxt == "(":
             dynamic = True
             return _skip_balanced(text, j + 2, "(", ")")
@@ -1092,6 +1105,7 @@ def _read_word(text: str, i: int) -> Tuple[str, bool, bool, int]:
                 elif d == "$":
                     i = expansion(i)
                 elif d == "`":
+                    note_name()
                     dynamic = True
                     j = text.find("`", i + 1)
                     i = n if j < 0 else j + 1
@@ -1104,6 +1118,7 @@ def _read_word(text: str, i: int) -> Tuple[str, bool, bool, int]:
             i = expansion(i)
             continue
         if c == "`":
+            note_name()
             dynamic = True
             j = text.find("`", i + 1)
             i = n if j < 0 else j + 1
@@ -1111,7 +1126,7 @@ def _read_word(text: str, i: int) -> Tuple[str, bool, bool, int]:
         seg.append(c)
         i += 1
     flush()
-    return "".join(out), dynamic, quoted, i
+    return "".join(out), dynamic, quoted, i, name_dynamic
 
 
 def _redirects_to_file(units: List[Unit], raw: str) -> bool:
@@ -1186,7 +1201,7 @@ def _shell_units(text: str) -> List[Unit]:
                 j += 1 if strip else 0
                 while j < n and text[j] in " \t":
                     j += 1
-                delim, _dyn, quoted, j = _read_word(text, j)
+                delim, _dyn, quoted, j, _name_dyn = _read_word(text, j)
                 pending.append((delim, strip, quoted))
                 units.append(Unit("op", "<<", False))
                 i = j
@@ -1199,8 +1214,8 @@ def _shell_units(text: str) -> List[Unit]:
             units.append(Unit("op", op, False))
             i += len(op)
             continue
-        word, dynamic, _quoted, i = _read_word(text, i)
-        units.append(Unit("word", word, dynamic))
+        word, dynamic, _quoted, i, name_dynamic = _read_word(text, i)
+        units.append(Unit("word", word, dynamic, False, name_dynamic))
     return units
 
 
@@ -1273,6 +1288,33 @@ def _command_strings(units: List[Unit]) -> List[str]:
     return cmds
 
 
+# #6490: a variable whose NAME is computed at run time cannot be judged, so writing one is a finding.
+NAME_CHARS_RE = re.compile(r"[A-Za-z0-9_]*")
+DYNAMIC_NAME_SETTERS = frozenset({"export", "declare", "typeset", "readonly", "local", "echo", "printf"})
+READ_NAME_COMMANDS = frozenset({"read", "mapfile", "readarray"})
+READ_VALUE_OPTIONS = frozenset({"-d", "-i", "-n", "-N", "-p", "-t", "-u", "-C", "-c", "-O", "-s"})
+# a printf conversion in the name position of a line of the format: `printf '%s=\n' "$name"`
+PRINTF_NAME_FORMAT_RE = re.compile(r"(?:^|\n)[A-Za-z0-9_]*%[-#0 +]*[0-9*]*(?:\.[0-9*]+)?[a-zA-Z][A-Za-z0-9_]*(?:=|<<)")
+DYNAMIC_NAME_LINE_RE = re.compile(r"\s*[A-Za-z0-9_]*(?:\$|`)[^\s=]*?(?:=|<<)")
+
+
+def _dynamic_name_findings(words: List[str], u: "Unit", before: str) -> List[str]:
+    """One word of a simple command that names a variable through an expansion (#6490)."""
+    head = words[0]
+    if len(words) < 2:
+        return []
+    if head in DYNAMIC_NAME_SETTERS and u.name_dynamic and re.match(r"[A-Za-z0-9_]*(?:=|<<)", u.text):
+        return ["%s %r computes the variable name at run time; the guard cannot read it" % (head, u.text)]
+    if head == "printf" and not u.dynamic and PRINTF_NAME_FORMAT_RE.search(u.text):
+        return ["printf format %r computes the variable name at run time; the guard cannot read it" % u.text]
+    names_var = (head == "printf" and before == "-v") or (
+        head in READ_NAME_COMMANDS and before not in READ_VALUE_OPTIONS and before != "<<<")
+    if names_var and u.name_dynamic and NAME_CHARS_RE.fullmatch(u.text):
+        return ["%s fills a variable name computed at run time (variable name at run time); the guard cannot "
+                "read it" % head]
+    return []
+
+
 def _run_findings(run_text: str) -> List[str]:
     """Every way a run body raises a debuginfo level, or hides that it might (#6295 #6296 #6297 #6298 #6312)."""
     units = _shell_units(run_text)
@@ -1282,7 +1324,9 @@ def _run_findings(run_text: str) -> List[str]:
     multi: Optional[List[object]] = None  # [key, kind, delimiter, pieces, dynamic] of an open NAME<<DELIM
     words: List[str] = []  # the words of the current simple command
     skip_target = False
+    prev = ""  # the unit before this one (an operator text or a word)
     for u in units:
+        before, prev = prev, u.text
         if u.kind == "op":
             if u.text in (">", ">>", "<"):
                 skip_target = True
@@ -1313,8 +1357,12 @@ def _run_findings(run_text: str) -> List[str]:
                 found.append("printf -v %s computes the value at run time; the guard cannot read it" % words[-1])
             if words[0] in ("read", "mapfile", "readarray") and len(words) > 1 and _key_kind(u.text):
                 found.append("%s %s fills the variable from input; the guard cannot read it" % (words[0], u.text))
+            found.extend(_dynamic_name_findings(words, u, before))
         if u.kind == "line" and u.file_data:
             continue
+        if u.kind == "line" and u.dynamic and DYNAMIC_NAME_LINE_RE.match(u.text):
+            found.append("a here-document line %r computes the variable name at run time; the guard cannot "
+                         "read it" % u.text.strip())
         for m in RUN_ASSIGN_RE.finditer(u.text):
             kind = _key_kind(m.group(1))
             if not kind:

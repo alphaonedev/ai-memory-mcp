@@ -1193,8 +1193,13 @@ jobs:
             if [ -n "${!name-}" ]; then
               echo "::warning::[#3539] $name was present in this self-hosted runner's environment; neutralising it for this job (value never printed)"
             fi
-            printf '%s=\n' "$name" >> "$GITHUB_ENV"
           done
+          # Literal names (#6490): the #6118 guard fails closed on a $GITHUB_ENV write whose
+          # variable name is computed at run time, so each scrubbed name is spelled out.
+          {
+            echo "AI_MEMORY_DB_PASSPHRASE="
+            echo "AI_MEMORY_DB_PASSPHRASE_FILE="
+          } >> "$GITHUB_ENV"
           echo "::notice::[#3539] passphrase env scrubbed for this job (AI_MEMORY_NO_CONFIG kept)"
 
       - name: Run tests (impact-aware)
