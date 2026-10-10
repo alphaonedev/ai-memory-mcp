@@ -15,6 +15,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "check-npm-audit-sdk.py"
+SCRATCH_ROOT = Path(os.environ.get("TMPDIR") or ROOT / ".local-runs")
 
 
 def run(argv, env=None):
@@ -26,9 +27,14 @@ def run(argv, env=None):
 
 
 class NpmAuditGate(unittest.TestCase):
+    def directory(self):
+        SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
+        directory = tempfile.TemporaryDirectory(dir=SCRATCH_ROOT)
+        self.addCleanup(directory.cleanup)
+        return Path(directory.name)
+
     def write(self, text):
-        d = tempfile.mkdtemp(dir=os.environ.get("TMPDIR") or None)
-        p = Path(d) / "audit.json"
+        p = self.directory() / "audit.json"
         p.write_text(text, encoding="utf-8")
         return str(p)
 
@@ -66,8 +72,7 @@ class NpmAuditGate(unittest.TestCase):
         self.assertNotIn("Traceback", out)
 
     def test_npm_absent_exits_0_with_notice(self):
-        empty = tempfile.mkdtemp(dir=os.environ.get("TMPDIR") or None)
-        env = {"PATH": empty}
+        env = dict(os.environ, PATH=str(self.directory()))
         rc, out = run([], env=env)
         self.assertEqual(rc, 0, out)
         self.assertIn("::notice::", out)

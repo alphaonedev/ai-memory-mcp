@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
 """npm audit gate for the TypeScript SDK lockfile (#7084).
 
 `cargo audit` gates the Rust tree; this is the equivalent for
@@ -12,75 +14,114 @@ test, no network).
 """
 import argparse
 import json
+from pathlib import Path
 import shutil
 import subprocess
 import sys
 
 LEVELS = ("info", "low", "moderate", "high", "critical")
+DEFAULT_SDK_DIR = "sdk/typescript"
+DEFAULT_LEVEL = "high"
+NPM_BINARY = "npm"
+REPORT_UNAVAILABLE = object()
+KEY_METADATA = "metadata"
+KEY_VULNERABILITIES = "vulnerabilities"
+KEY_SEVERITY = "severity"
+KEY_TOTAL = "total"
+KEY_ERROR = "error"
+EXIT_CLEAN = 0
+EXIT_FINDINGS = 1
+EXIT_ERROR = 2
 
 
 def load_report(args):
-    """Return the parsed audit report, or None when npm is absent."""
+    """Return report and process status, or the distinct announced-skip marker."""
     if args.json_file:
-        with open(args.json_file, "r", encoding="utf-8") as fh:
-            return json.load(fh)
-    if shutil.which("npm") is None:
+        return json.loads(Path(args.json_file).read_text(encoding="utf-8")), None
+    if shutil.which(NPM_BINARY) is None:
         print("::notice::npm not found on PATH; skipping npm audit gate for "
               "%s (gate NOT evaluated)" % args.dir)
-        return None
-    cmd = ["npm", "audit", "--audit-level=%s" % args.level, "--json"]
+        return REPORT_UNAVAILABLE
+    cmd = [NPM_BINARY, "audit", "--audit-level=%s" % args.level, "--json"]
     if args.omit_dev:
         cmd.append("--omit=dev")
     proc = subprocess.run(
         cmd,
         cwd=args.dir, capture_output=True, text=True, check=False,
     )
-    try:
-        return json.loads(proc.stdout)
-    except ValueError:
-        sys.stderr.write("npm audit produced non-JSON output (rc=%d): %s\n"
-                         % (proc.returncode, proc.stderr.strip()[:500]))
-        raise
+    if proc.returncode not in (EXIT_CLEAN, EXIT_FINDINGS):
+        raise ValueError("npm audit operational failure (rc=%d)" % proc.returncode)
+    # Raw subprocess stderr may contain credentials; status and parser location
+    # provide diagnostics without copying an untrusted operational payload.
+    return json.loads(proc.stdout), proc.returncode
+
+
+def validate_report(report):
+    """Validate complete, nonnegative counts against the reported packages."""
+    if not isinstance(report, dict) or KEY_ERROR in report:
+        raise ValueError("expected an audit report without an error payload")
+    metadata = report.get(KEY_METADATA)
+    if not isinstance(metadata, dict):
+        raise ValueError("missing audit metadata")
+    counts = metadata.get(KEY_VULNERABILITIES)
+    vulnerabilities = report.get(KEY_VULNERABILITIES)
+    if not isinstance(counts, dict) or not isinstance(vulnerabilities, dict):
+        raise ValueError("missing vulnerability counts or package entries")
+    for field in (*LEVELS, KEY_TOTAL):
+        value = counts.get(field)
+        if type(value) is not int or value < 0:
+            raise ValueError("vulnerability counts must be nonnegative integers")
+    observed = dict.fromkeys(LEVELS, 0)
+    for entry in vulnerabilities.values():
+        if not isinstance(entry, dict) or entry.get(KEY_SEVERITY) not in LEVELS:
+            raise ValueError("invalid vulnerability entry severity")
+        observed[entry[KEY_SEVERITY]] += 1
+    if any(counts[level] != observed[level] for level in LEVELS):
+        raise ValueError("vulnerability counts disagree with package entries")
+    if counts[KEY_TOTAL] != sum(observed.values()):
+        raise ValueError("vulnerability total disagrees with severity counts")
+    return counts, vulnerabilities
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--dir", default="sdk/typescript")
-    ap.add_argument("--level", default="high", choices=LEVELS)
+    ap.add_argument("--dir", default=DEFAULT_SDK_DIR)
+    ap.add_argument("--level", default=DEFAULT_LEVEL, choices=LEVELS)
     ap.add_argument("--json-file", default=None,
                     help="read a canned npm audit JSON instead of running npm")
     ap.add_argument("--omit-dev", action="store_true",
                     help="pass --omit=dev: gate the shipped runtime tree only")
     args = ap.parse_args(argv)
     try:
-        report = load_report(args)
+        result = load_report(args)
     except (OSError, ValueError) as exc:
         sys.stderr.write("check-npm-audit-sdk: cannot obtain report: %s\n" % exc)
-        return 2
-    if report is None:
-        return 0
+        return EXIT_ERROR
+    if result is REPORT_UNAVAILABLE:
+        return EXIT_CLEAN
     try:
-        counts = report["metadata"]["vulnerabilities"]
-        vulns = report.get("vulnerabilities", {})
-        if not isinstance(counts, dict) or not isinstance(vulns, dict):
-            raise TypeError("unexpected report shape")
+        report, process_status = result
+        counts, vulns = validate_report(report)
         floor = LEVELS.index(args.level)
-        failing = sum(int(counts.get(lv, 0)) for lv in LEVELS[floor:])
+        failing = sum(counts[level] for level in LEVELS[floor:])
+        expected_status = EXIT_FINDINGS if failing else EXIT_CLEAN
+        if process_status is not None and process_status != expected_status:
+            raise ValueError("npm audit process status disagrees with report")
     except (KeyError, TypeError, ValueError) as exc:
         sys.stderr.write("check-npm-audit-sdk: malformed report: %r\n" % (exc,))
-        return 2
+        return EXIT_ERROR
     print("npm audit (%s): %s" % (args.dir, ", ".join(
-        "%s=%s" % (lv, counts.get(lv, 0)) for lv in LEVELS)))
+        "%s=%s" % (lv, counts[lv]) for lv in LEVELS)))
     if failing > 0:
         for name, info in sorted(vulns.items()):
-            sev = info.get("severity", "?") if isinstance(info, dict) else "?"
+            sev = info[KEY_SEVERITY]
             if sev in LEVELS and LEVELS.index(sev) >= floor:
                 rng = info.get("range", "?")
                 print("FAIL: %s severity=%s range=%s" % (name, sev, rng))
         print("FAIL: %d finding(s) at or above %s" % (failing, args.level))
-        return 1
+        return EXIT_FINDINGS
     print("OK: no findings at or above %s" % args.level)
-    return 0
+    return EXIT_CLEAN
 
 
 if __name__ == "__main__":
