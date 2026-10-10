@@ -147,6 +147,7 @@ def build_once(workspace: Path, target: str, features: str, epoch: str, cargo: s
     #6291: the build sees an allowlisted environment only, its own target
     directory and no compiler wrapper (an empty RUSTC_WRAPPER also overrides a
     ``build.rustc-wrapper`` from a cargo config file)."""
+    workspace = workspace.resolve()
     wrapped = [k for k in WRAPPER_VARS if os.environ.get(k)]
     if wrapped:
         raise ProofError(f"{', '.join(wrapped)} is set: a compiler wrapper can serve the second build from the first "
@@ -351,7 +352,16 @@ RPM_TAGS = frozenset((63, 100, 1000, 1001, 1002, 1004, 1005, 1006, 1007, 1009, 1
                       1116, 1117, 1118, 1124, 1125, 1126, 5011, 5092, 5093))
 RPM_REQUIRED_TAGS = (1028, 1030, 1035, 1036, 1037, 1039, 1040, 1116, 1117, 1118, 1124, 1125, 5011, 5092, 5093)
 RPM_MAX_HEADER = 1 << 24
-PAYLOAD_MAGIC = ((b"\x1f\x8b", "gzip"), (b"\xfd7zXZ\x00", "xz"), (b"BZh", "bzip2"))
+# #7032: every compressed member is gzip, the one compressor nfpm writes for
+# nfpm.yaml (deb members and rpm tag 1125, probed); no sibling takes another.
+PAYLOAD_MAGIC = ((b"\x1f\x8b", "gzip"),)
+# #7032: the rpm lead and signature header nfpm 2.41.1 writes (probed): lead
+# version 3.0, binary package, header-style signature; signature tags 62
+# (region), 273 (SHA-256 of the main header), 1000 (header + payload size) and
+# 1007 (payload file size).
+RPM_LEAD = struct.Struct(">4sBBhh66shh16s")
+RPM_SIG_TAGS = (62, 273, 1000, 1007)
+DEB_ARCH_OF_RPM = {"x86_64": "amd64", "aarch64": "arm64"}
 SHA256_ALGO = 8
 Entry = Tuple[str, str, int, bytes]
 
@@ -409,9 +419,9 @@ def _strict_tar(gz: bytes, what: str) -> List[Entry]:
         if _octal(hdr[148:156], what, "chksum") != sum(hdr[:148]) + 8 * 32 + sum(hdr[156:]):
             raise ProofError(f"{what}: tar header at {off} has a bad checksum")
         kind = {b"0": "f", b"5": "d"}.get(hdr[156:157])
-        if kind is None or hdr[157:257].strip(b"\x00"):
+        if kind is None or hdr[157:257].strip(b"\x00") or (kind == "f" and hdr[:100].rstrip(b"\x00").endswith(b"/")):
             raise ProofError(f"{what}: tar entry at {off} (type {hdr[156:157]!r}) is not a regular file or directory "
-                             "(links, devices and extension headers are refused)")
+                             "(links, devices, extension headers and file names ending in '/' are refused)")
         name = _cstr(hdr[:100], what, "name")
         mode, uid, gid = (_octal(hdr[i:i + 8], what, lbl) for i, lbl in ((100, "mode"), (108, "uid"), (116, "gid")))
         size = _octal(hdr[124:136], what, "size")
@@ -472,7 +482,7 @@ def _ar_members(blob: bytes, what: str) -> List[Tuple[str, bytes]]:
     return out
 
 
-def _deb_control(text: bytes, what: str) -> None:
+def _deb_control(text: bytes, what: str) -> Dict[str, str]:
     """#7018: the control file holds only DEB_CONTROL_FIELDS (no dependency,
     Essential or other field), once each, for the package ai-memory."""
     fields: Dict[str, str] = {}
@@ -493,9 +503,10 @@ def _deb_control(text: bytes, what: str) -> None:
         last = key
     if fields.get("Package") != "ai-memory":
         raise ProofError(f"{what}: control names package {fields.get('Package')!r}, not 'ai-memory'")
+    return fields
 
 
-def _deb_payload(blob: bytes, what: str) -> Dict[str, Tuple[bytes, int, int]]:
+def _deb_payload(blob: bytes, what: str) -> Tuple[Dict[str, Tuple[bytes, int, int]], Dict[str, str]]:
     """#7018: a deb is exactly debian-binary 2.0, control.tar.gz and data.tar.gz;
     control.tar holds exactly control (DEB_CONTROL_FIELDS), md5sums of the
     payload and an empty conffiles, and no maintainer script."""
@@ -514,14 +525,14 @@ def _deb_payload(blob: bytes, what: str) -> Dict[str, Tuple[bytes, int, int]]:
         control[name] = data
     if tuple(sorted(control)) != DEB_CONTROL_MEMBERS:
         raise ProofError(f"{what}: control.tar holds {sorted(control)}, not {list(DEB_CONTROL_MEMBERS)}")
-    _deb_control(control["control"], what)
+    fields = _deb_control(control["control"], what)
     if control["conffiles"].strip():
         raise ProofError(f"{what}: conffiles is not empty")
     sums = b"".join(hashlib.md5(d, usedforsecurity=False).hexdigest().encode() + b"  ./" + n.encode() + b"\n"
                     for n, (d, _, _) in sorted(files.items()))
     if control["md5sums"] != sums:
         raise ProofError(f"{what}: md5sums does not list exactly the payload files")
-    return files
+    return files, {"version": fields.get("Version", ""), "arch": fields.get("Architecture", "")}
 
 
 def _rpm_header_end(blob: bytes, off: int, what: str, pad: bool) -> int:
@@ -579,16 +590,13 @@ def _rpm_header(blob: bytes, off: int, what: str) -> Tuple[Dict[int, list], int]
 
 
 def _decompress(blob: bytes, what: str) -> bytes:
+    if not blob.startswith(b"\x1f\x8b"):
+        raise ProofError(f"{what}: compression is not gzip, the one nfpm writes for nfpm.yaml (#7032: refused "
+                         "rather than read with a second decompressor)")
     try:
-        if blob.startswith(b"\x1f\x8b"):
-            return gzip.decompress(blob)
-        if blob.startswith(b"\xfd7zXZ\x00"):
-            return lzma.decompress(blob)
-        if blob.startswith(b"BZh"):
-            return bz2.decompress(blob)
-    except (OSError, EOFError, lzma.LZMAError, ValueError) as exc:
+        return gzip.decompress(blob)
+    except (OSError, EOFError, ValueError) as exc:
         raise ProofError(f"{what}: payload does not decompress ({exc})") from exc
-    raise ProofError(f"{what}: payload compression is not gzip, xz or bzip2 (refused rather than guessed)")
 
 
 def _cpio_payload(blob: bytes, what: str) -> Dict[str, Tuple[bytes, int, int]]:
@@ -608,7 +616,8 @@ def _cpio_payload(blob: bytes, what: str) -> Dict[str, Tuple[bytes, int, int]]:
         mode, uid, gid, nlink, size, namesize = f[1], f[2], f[3], f[4], f[6], f[11]
         nstart = off + 110
         raw_name = blob[nstart:nstart + namesize]
-        if len(raw_name) != namesize or namesize < 2 or raw_name.index(b"\x00") != namesize - 1:
+        if len(raw_name) != namesize or namesize < 2 or raw_name.index(b"\x00") != namesize - 1 \
+                or (stat.S_ISREG(mode) and raw_name[:-1].endswith(b"/")):
             raise ProofError(f"{what}: cpio name at {off} is not one NUL-terminated name")
         try:
             name = raw_name[:-1].decode("utf-8")
@@ -637,14 +646,21 @@ def _cpio_payload(blob: bytes, what: str) -> Dict[str, Tuple[bytes, int, int]]:
         entries.append((clean, "d" if stat.S_ISDIR(mode) else "f", mode & 0o7777, data))
 
 
-def _rpm_payload(blob: bytes, what: str) -> Dict[str, Tuple[bytes, int, int]]:
+def _rpm_payload(blob: bytes, what: str) -> Tuple[Dict[str, Tuple[bytes, int, int]], Dict[str, str]]:
     """#7018 / #7019: the main header (what rpm installs from) carries only the
     tags nfpm writes (RPM_TAGS: no scriptlet, trigger, dependency or capability),
     its payload digest is that of the payload, and its file list, modes, owners,
     sizes and digests agree with the cpio entries."""
-    if not blob.startswith(b"\xed\xab\xee\xdb"):
-        raise ProofError(f"{what}: no rpm lead magic")
-    sig_end = _rpm_header_end(blob, 96, what, pad=True)
+    if len(blob) < RPM_LEAD.size:
+        raise ProofError(f"{what}: no rpm lead")
+    magic, major, minor, rpm_type, _, lead_name, _, sig_type, reserved = RPM_LEAD.unpack_from(blob)
+    if (magic, major, minor, rpm_type, sig_type, reserved) != (b"\xed\xab\xee\xdb", 3, 0, 0, 5, bytes(16)):
+        raise ProofError(f"{what}: rpm lead is not a version 3.0 binary package with a header signature (#7032)")
+    # #7032: the signature header is read as strictly as the main header.
+    sig, sig_end = _rpm_header(blob, RPM_LEAD.size, what + " signature")
+    if sorted(sig) != list(RPM_SIG_TAGS) or len(sig[62][0]) != 16:
+        raise ProofError(f"{what}: rpm signature header carries tags {sorted(sig)}, not {list(RPM_SIG_TAGS)}")
+    sig_end += (-sig_end) % 8
     tags, main_end = _rpm_header(blob, sig_end, what)
     extra = sorted(set(tags) - RPM_TAGS)
     if extra:
@@ -665,12 +681,22 @@ def _rpm_payload(blob: bytes, what: str) -> Dict[str, Tuple[bytes, int, int]]:
         raise ProofError(f"{what}: rpm header file list is malformed")
     listed = [dirs[i] + b for i, b in zip(index, bases)]
     data = files[PACKAGED_PATH][0]
+    if sig[273] != [hashlib.sha256(blob[sig_end:main_end]).hexdigest()] or sig[1000] != [len(blob) - sig_end] \
+            or sig[1007] != [len(data)]:
+        raise ProofError(f"{what}: rpm signature header digest / sizes do not describe this main header and payload "
+                         "(#7032)")
+    meta = {"name": "".join(tags.get(1000, [])), "version": "".join(tags.get(1001, [])),
+            "release": "".join(tags.get(1002, [])), "arch": "".join(tags.get(1022, []))}
+    if meta["name"] != "ai-memory" or lead_name.rstrip(b"\x00") != \
+            f"{meta['name']}-{meta['version']}-{meta['release']}".encode("utf-8", "surrogateescape"):
+        raise ProofError(f"{what}: rpm NAME {meta['name']!r} / lead name {lead_name.rstrip(bytes(1))!r} is not "
+                         "ai-memory-<version>-<release> (#7032)")
     want = {1030: [stat.S_IFREG | 0o755], 1036: [""], 1037: [0], 1039: ["root"], 1040: ["root"],
             5011: [SHA256_ALGO], 1028: [len(data)], 1035: [hashlib.sha256(data).hexdigest()]}
     if listed != ["/" + PACKAGED_PATH] or any(tags[t] != v for t, v in want.items()):
         raise ProofError(f"{what}: rpm header file list {listed} / modes / owners / sizes / digests do not "
                          f"describe the one checked file /{PACKAGED_PATH} at 0100755")
-    return files
+    return files, meta
 
 
 def _only_binary(files: Dict[str, Tuple[bytes, int, int]], what: str) -> None:
@@ -681,17 +707,19 @@ def _only_binary(files: Dict[str, Tuple[bytes, int, int]], what: str) -> None:
         raise ProofError(f"{what}: {PACKAGED_PATH} has mode {oct(mode)} and {nlink} links, not 0o755 and 1")
 
 
-def _verify_package(name: str, blob: bytes, expect: str, what: str) -> None:
+def _verify_package(name: str, blob: bytes, expect: str, what: str) -> Dict[str, str]:
+    """The payload check of one package; returns its version / release / architecture."""
     if name.endswith(".deb"):
-        files = _deb_payload(blob, what)
+        files, meta = _deb_payload(blob, what)
     elif name.endswith(".rpm"):
-        files = _rpm_payload(blob, what)
+        files, meta = _rpm_payload(blob, what)
     else:
         raise ProofError(f"{what}: not a .deb or .rpm")
     _only_binary(files, what)
     got = hashlib.sha256(files[PACKAGED_PATH][0]).hexdigest()
     if got != expect:
         raise ProofError(f"{what}: {PACKAGED_PATH} ({got}) is not the binary the strict assert checked ({expect})")
+    return meta
 
 
 def verify_payload(packages: List[Path], expect: str) -> None:
@@ -705,8 +733,8 @@ def verify_payload(packages: List[Path], expect: str) -> None:
         _verify_package(pkg.name, read_once(pkg), expect, str(pkg))
 
 
-DIST_DEB_RE = re.compile(r"ai-memory_[0-9A-Za-z.+~]+_(?:amd64|arm64)\.deb")
-DIST_RPM_RE = re.compile(r"ai-memory-[0-9A-Za-z.+~]+-1\.(?:x86_64|aarch64)\.rpm")
+DIST_DEB_RE = re.compile(r"ai-memory_(?P<version>[0-9A-Za-z.+~]+)_(?P<arch>amd64|arm64)\.deb")
+DIST_RPM_RE = re.compile(r"ai-memory-(?P<version>[0-9A-Za-z.+~]+)-(?P<release>1)\.(?P<arch>x86_64|aarch64)\.rpm")
 
 
 def verify_dist(dist: Path, tarball: str, expect: str) -> List[str]:
@@ -731,6 +759,7 @@ def verify_dist(dist: Path, tarball: str, expect: str) -> List[str]:
     sidecars = [n for n in names if n.endswith(".sha256")]
     if sidecars != sorted(n + ".sha256" for n in artifacts):
         raise ProofError(f"{dist} sidecars {sidecars} are not exactly one .sha256 per artifact")
+    named: Dict[str, Dict[str, str]] = {}
     for name in artifacts:
         what = str(dist / name)
         blob = read_once(dist / name)
@@ -740,10 +769,20 @@ def verify_dist(dist: Path, tarball: str, expect: str) -> List[str]:
                     or hashlib.sha256(entries[0][3]).hexdigest() != expect:
                 raise ProofError(f"{what}: is not one 0755 member 'ai-memory' holding the asserted binary ({expect})")
         else:
-            _verify_package(name, blob, expect, what)
+            meta = _verify_package(name, blob, expect, what)
+            match = (DIST_DEB_RE if name.endswith(".deb") else DIST_RPM_RE).fullmatch(name)
+            claimed = match.groupdict() if match else {}
+            # #7032: the metadata the package manager installs from is the one the file name publishes.
+            if {k: meta.get(k, "") for k in claimed} != claimed:
+                raise ProofError(f"{what}: package metadata {meta} is not what its file name says {claimed} (#7032)")
+            named[name[-3:]] = meta
         line = f"{hashlib.sha256(blob).hexdigest()}  {name}\n".encode()
         if read_once(dist / (name + ".sha256")) != line:
             raise ProofError(f"{what}.sha256 does not name the SHA-256 of the checked {name}")
+    if len(named) == 2 and (named["deb"]["version"] != named["rpm"]["version"]
+                            or named["deb"]["arch"] != DEB_ARCH_OF_RPM[named["rpm"]["arch"]]):
+        raise ProofError(f"{dist}: the deb ({named['deb']}) and the rpm ({named['rpm']}) are not one version for one "
+                         "architecture (#7032)")
     return artifacts
 
 
@@ -1177,6 +1216,10 @@ def two_builds(workspace_a: Path, workspace_b: Path, target: str, features: str,
         raise ProofError("--features is empty (the release feature declaration came back empty: fail closed)")
     if nfpm is not None and (not version or not nfpm_arch):
         raise ProofError("--nfpm needs a non-empty --version and --nfpm-arch (fail closed)")
+    # #7032 / #6955: cargo runs in the canonical path, so the remap prefix and
+    # every compare use the canonical path of BOTH workspaces (a symlinked B
+    # would otherwise leave its path unremapped: a false MISMATCH).
+    workspace_a, workspace_b = workspace_a.resolve(), workspace_b.resolve()
     epoch_a = epoch if epoch is not None else epoch_of(workspace_a)
     ensure_workspace_b(workspace_a, workspace_b)
     bin_a = build_once(workspace_a, target, features, epoch_a, cargo, remap, bin_name)
