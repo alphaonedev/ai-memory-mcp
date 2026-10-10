@@ -219,7 +219,7 @@ async fn push_signed_is_accepted_2297() {
     assert!(
         res.is_ok(),
         "#2297 fix: the signed push MUST be accepted (200) by the enrolled \
-         receiver, so sync_cycle_once returns Ok; got {res:?}"
+         receiver, so sync_cycle_once returns Ok; got Err"
     );
     assert_eq!(
         recv.push_hits.load(Ordering::Relaxed),
@@ -279,7 +279,7 @@ async fn push_unsigned_is_refused_2297() {
     assert!(
         res.is_err(),
         "pre-#2297 baseline: the enrolled strict receiver refuses the unsigned \
-         push (401), so sync_cycle_once MUST return Err; got {res:?}"
+         push (401), so sync_cycle_once MUST return Err; got Ok"
     );
     assert_eq!(
         recv.push_hits.load(Ordering::Relaxed),
