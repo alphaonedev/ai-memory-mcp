@@ -949,14 +949,14 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             [sys.executable, "-I", str(SCRIPT), mod.SUPERVISE_FLAG, str(r), str(deadline), "--", str(self.psql)],
             pass_fds=(r,), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         os.close(r)
-        if not keep_pipe:
-            os.close(w)
-            w = None
         pid_file = self.base / "sleep.pid"
         end = time.monotonic() + 15
         while time.monotonic() < end and not (pid_file.exists() and pid_file.read_text()):
             time.sleep(0.05)
         child = int(pid_file.read_text())
+        if not keep_pipe:  # closed only once psql is running, or the supervisor would stop it before it starts
+            os.close(w)
+            w = None
 
         def reap():
             for pid in (child, proc.pid):
