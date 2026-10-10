@@ -14,7 +14,7 @@ import pytest
 
 HARNESS = pathlib.Path(__file__).resolve().parents[3] / "scripts" / "sdk-python-live.py"
 KEY = bytes(b for i in range(16) for b in (0x01 + i, ord("&")))  # 32 bytes, '&' on every 2nd byte
-QUOTED = b'k"1<2>3\'4&5-secret-material-xyz'
+QUOTED = b"k\"1<2>3'4&5-secret-material-xyz"
 
 
 def _h():
@@ -43,7 +43,9 @@ def _report(tmp_path, message, body):
 def _readable(path):
     """Everything an XML consumer reads out of the report."""
     root = ET.parse(str(path)).getroot()
-    return "".join(e.text or "" for e in root.iter()) + "".join(v for e in root.iter() for v in e.attrib.values())
+    return "".join(e.text or "" for e in root.iter()) + "".join(
+        v for e in root.iter() for v in e.attrib.values()
+    )
 
 
 def test_7063_scrubbed_junit_is_still_parseable_by_the_harness(tmp_path):
@@ -57,7 +59,9 @@ def test_7063_scrubbed_junit_is_still_parseable_by_the_harness(tmp_path):
 def test_7064_xml_escaped_renderings_of_a_secret_are_redacted(tmp_path, secret):
     h = _h()
     inner = repr(secret)[2:-1]
-    escaped = inner.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    escaped = (
+        inner.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    )
     path = _report(tmp_path, escaped, escaped)
     h.scrub_file(path, [secret])
     seen = _readable(path)
@@ -108,7 +112,16 @@ def test_7063_end_to_end_the_scrubbed_report_is_parseable_and_clean(tmp_path):
     sys.stdout = sink
     try:
         h.run_redacted(
-            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", f"--junitxml={report}", "test_leak.py"],
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                f"--junitxml={report}",
+                "test_leak.py",
+            ],
             cwd=str(tmp_path),
             env=dict(os.environ, CI="true"),
             secrets=[KEY],

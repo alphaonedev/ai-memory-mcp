@@ -74,7 +74,9 @@ def test_the_final_decoder_flush_is_redacted():  # R41 (#7065)
     """The final decode can add U+FFFD; a form that ends in it matches only after that flush."""
     h = _h()
     secret = b"0123456789A\xef\xbf\xbd"  # 14 bytes, valid UTF-8, ends in U+FFFD
-    out = _run(h, "import sys; sys.stdout.buffer.write(b'0123456789A\\xef'); sys.stdout.flush()", [secret])
+    out = _run(
+        h, "import sys; sys.stdout.buffer.write(b'0123456789A\\xef'); sys.stdout.flush()", [secret]
+    )
     assert secret.decode("utf-8") not in out
     assert "\ufffd" not in out
 

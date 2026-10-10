@@ -14,7 +14,9 @@ WORKFLOWS = pathlib.Path(__file__).resolve().parents[3] / ".github" / "workflows
 @pytest.mark.parametrize("name", ["clients-ci.yml", "c8-precheck.yml"])
 def test_7057_every_checkout_step_sets_persist_credentials_false(name):
     text = (WORKFLOWS / name).read_text(encoding="utf-8")
-    steps = list(re.finditer(r"^( *)- uses: actions/checkout@[^\n]*\n((?:\1 {2,}[^\n]*\n)*)", text, re.M))
+    steps = list(
+        re.finditer(r"^( *)- uses: actions/checkout@[^\n]*\n((?:\1 {2,}[^\n]*\n)*)", text, re.M)
+    )
     uses = len(re.findall(r"^ *- uses: actions/checkout@", text, re.M))
     assert len(steps) == uses >= 6
     for step in steps:

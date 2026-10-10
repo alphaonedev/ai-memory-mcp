@@ -18,7 +18,11 @@ HARNESS = pathlib.Path(__file__).resolve().parents[3] / "scripts" / "sdk-python-
 KEY = bytes(range(130, 162))  # 32 bytes, all >= 0x80: invalid UTF-8
 # An EC private-key DER shape: the 32-byte scalar sits behind 04 20.
 SCALAR = bytes((i * 7 + 3) % 256 for i in range(32))
-DER = b"\x30\x41\x02\x01\x00\x30\x13\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x04\x20" + SCALAR + b"\xa1\x44"
+DER = (
+    b"\x30\x41\x02\x01\x00\x30\x13\x06\x07\x2a\x86\x48\xce\x3d\x02\x01\x04\x20"
+    + SCALAR
+    + b"\xa1\x44"
+)
 PEM = b"-----BEGIN PRIVATE KEY-----\n" + base64.encodebytes(DER) + b"-----END PRIVATE KEY-----\n"
 
 RENDERINGS = {
@@ -62,15 +66,21 @@ def test_7056_every_rendering_of_a_key_is_redacted(name):
     h = _h()
     form = RENDERINGS[name](KEY)
     out = h.redact("err: " + form + " :end", h.secret_forms(KEY))
-    assert _longest_run(form, out) < 12, f"{name}: a run of {_longest_run(form, out)} characters survived"
+    assert _longest_run(form, out) < 12, (
+        f"{name}: a run of {_longest_run(form, out)} characters survived"
+    )
 
 
-@pytest.mark.parametrize("name", ["decimal-big", "decimal-little", "utf8-replace", "hex-space", "base64-shift-1"])
+@pytest.mark.parametrize(
+    "name", ["decimal-big", "decimal-little", "utf8-replace", "hex-space", "base64-shift-1"]
+)
 def test_7056_the_ec_scalar_inside_a_pem_is_redacted(name):
     h = _h()
     form = RENDERINGS[name](SCALAR)
     out = h.redact("err: " + form + " :end", h.secret_forms(PEM))
-    assert _longest_run(form, out) < 12, f"{name}: a run of {_longest_run(form, out)} characters survived"
+    assert _longest_run(form, out) < 12, (
+        f"{name}: a run of {_longest_run(form, out)} characters survived"
+    )
 
 
 def test_7056_raw_key_bytes_on_the_childs_stdout_leave_no_replace_decoded_run():
@@ -88,7 +98,11 @@ def test_7056_raw_key_bytes_on_the_childs_stdout_leave_no_replace_decoded_run():
 
 def test_7056_the_daemon_key_is_a_run_secret(tmp_path):
     h = _h()
-    files = {"signing": b"signing-key-bytes-0123456789", "tls": b"tls-key-bytes-abcdefghijklmnop", "daemon": b"daemon-key-bytes-QRSTUVWXYZ012"}
+    files = {
+        "signing": b"signing-key-bytes-0123456789",
+        "tls": b"tls-key-bytes-abcdefghijklmnop",
+        "daemon": b"daemon-key-bytes-QRSTUVWXYZ012",
+    }
     paths = {}
     for name, data in files.items():
         paths[name] = tmp_path / f"{name}.key"

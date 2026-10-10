@@ -62,4 +62,6 @@ def test_7062_hex_key_split_at_every_offset_leaks_nothing(cut):
 @pytest.mark.parametrize("cut", range(1, len(PEM_LINE)))
 def test_7062_pem_body_line_split_at_every_offset_leaks_nothing(cut):
     out = _split_run(_h(), PEM_LINE, cut, PEM)
-    assert _no_fragment_of(PEM_LINE, out), f"a fragment of the PEM line survived a read boundary at {cut}"
+    assert _no_fragment_of(PEM_LINE, out), (
+        f"a fragment of the PEM line survived a read boundary at {cut}"
+    )
