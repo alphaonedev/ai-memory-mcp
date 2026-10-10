@@ -3054,6 +3054,11 @@ def _wrap_cells(t, fx, repo, base):
         ("wrap-tool-rustfmt-crate-self", "#[rustfmt::t]", "`extern crate self as rustfmt;` makes #[rustfmt::t] a crate path",
          {"src/lib.rs": files["src/lib.rs"] + "extern crate self as rustfmt;\npub use test as t;\n",
           "src/wrap_d.rs": "#[rustfmt::t]\n" + d_text}),
+        # #6841: `r#name` is the same name as `name` to rustc
+        ("wrap-adv-raw-ident-macro-swallow", "macro invocation", "the item inside `r#gone! { .. }`, a macro that expands to nothing",
+         {"src/wrap_a.rs": "macro_rules! gone {\n    ($($t:tt)*) => {};\n}\nr#gone! {\n" + a_line + "}\n"}),
+        ("wrap-raw-panic", "early exit", "`r#panic!()` before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    r#panic!();\n")}),
     ]
     for label, reason, desc, edits in reds:
         fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
@@ -3169,6 +3174,8 @@ def _wrap_cells(t, fx, repo, base):
          {"src/wrap_d.rs": '#[deprecated(note = "cfg")]\n#[doc = "cfg_attr"]\n' + d_text}),
         ("wrap-ctl-serde-path-import", "`use serde::X;` does not rebind serde, so #[serde(..)] stays inert",
          {"src/wrap_d.rs": 'use serde::Serialize;\n#[serde(rename = "k")]\n' + d_text}),
+        ("wrap-ctl-raw-mod-decl", "`pub mod r#wrapmod;` declares the same module as `pub mod wrapmod;`",
+         {"src/lib.rs": "pub mod r#wrapmod;\npub mod wrappc;\n"}),
     ]
     for label, desc, edits in controls:
         fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
@@ -3347,6 +3354,7 @@ SELF_TEST_OK = (
     "Pattern_White_Space code point there is RED; "
     "(wrap-adv-shebang-string, wrap-adv-shebang-block, wrap-bom-shebang, wrap-shebang-root-decl, wrap-shebang-comment-then-inner, each with -gate, #6839) a first line rustc strips as a shebang (after an optional BOM, in any file) cannot hide the attribute below it, and `#!`, a comment, then `[` stays an inner attribute; (wrap-ctl-shebang, wrap-ctl-shebang-quote) a shebang line, one ending in a quote included, is GREEN; "
     "(wrap-adv-alias-test-as-serde, wrap-adv-alias-test-as-async_trait, wrap-adv-alias-test-as-schemars, wrap-adv-alias-mod-tokio-main, wrap-adv-m02-alias-serde-cfg-arg, wrap-alias-derive, wrap-glob-alias-serde, wrap-alias-braced-schemars, wrap-tool-clippy-mod, wrap-tool-rustfmt-crate-self, each with -gate, #6840) an attribute name a `use`, a glob, a local `mod` or `extern crate self as` can rebind is a finding, and only names rustc refuses to rebind are inert; (wrap-ctl-attr-string-cfg, wrap-ctl-serde-path-import) `cfg` inside the string of an inert attribute and `use serde::X;` are GREEN; "
+    "(wrap-adv-raw-ident-macro-swallow, wrap-raw-panic, each with -gate, #6841) the raw identifier form `r#name!` of a swallowing macro or an exit macro is the same construct; (wrap-ctl-raw-mod-decl) `mod r#name;` declares the module and is GREEN; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
