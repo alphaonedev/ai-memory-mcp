@@ -715,8 +715,11 @@ async fn store_backed_consolidation_sweep(
     };
 
     // Gather candidates across non-reserved namespaces, applying the SAME
-    // `needs_curation` filter the sqlite path uses, capped at max_ops_per_cycle.
-    let cap = cfg.max_ops_per_cycle.max(1);
+    // `needs_curation` filter and the SAME candidate cap the sqlite path
+    // uses. #3170 review F1 — the cap is wider than `max_ops_per_cycle`
+    // (a cluster needs two or more candidates), so the op budget below is
+    // what bounds the LLM calls, not the candidate list.
+    let cap = curator::candidates::candidate_cap(cfg).max(1);
     let mut candidates: Vec<crate::models::Memory> = Vec::new();
     'ns: for nsc in &namespaces {
         if nsc.namespace.starts_with('_') {
@@ -753,7 +756,8 @@ async fn store_backed_consolidation_sweep(
     let pass = curator::compaction::ConsolidationPass::new(store, llm, cfg.dry_run)
         .with_cosine_threshold(cfg.compaction.cosine_threshold)
         // #3170 — the sweep's LLM calls are capped by `max_ops_per_cycle`
-        // (no autonomy passes run before this one on the store-backed path).
+        // (no autonomy passes run before this one on the store-backed path);
+        // clusters past it are deferred to the next cycle and counted.
         .with_llm_op_budget(cfg.max_ops_per_cycle);
     match pass.run(&candidates).await {
         Ok(out) => {

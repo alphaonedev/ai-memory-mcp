@@ -34,15 +34,26 @@ pub(super) fn record_truncation(report: &mut CuratorReport, truncated: bool, cfg
     if truncated {
         report.errors.push(format!(
             "collect_candidates truncated at cap={} per tier; consider raising max_ops_per_cycle or paginating across cycles",
-            cfg.max_ops_per_cycle.saturating_mul(4)
+            candidate_cap(cfg)
         ));
     }
+}
+
+/// Candidates gathered per cycle for every `max_ops_per_cycle` op.
+const CANDIDATES_PER_OP: usize = 4;
+
+/// The per-cycle candidate cap, shared by the sqlite collector (per tier)
+/// and the store-backed SAL sweep (#3170). It is deliberately WIDER than
+/// the op budget: a cluster holds at least two candidates, so a cap equal
+/// to the budget could never form enough clusters for the budget to bind.
+pub(crate) fn candidate_cap(cfg: &CuratorConfig) -> usize {
+    cfg.max_ops_per_cycle.saturating_mul(CANDIDATES_PER_OP)
 }
 
 pub(super) fn collect_candidates(conn: &Connection, cfg: &CuratorConfig) -> Result<CandidateBatch> {
     // We sweep mid + long tier only. Short tier is too volatile — it'll
     // likely be GC'd before the next curator cycle anyway.
-    let cap = cfg.max_ops_per_cycle.saturating_mul(4);
+    let cap = candidate_cap(cfg);
     let mut out = Vec::new();
     let mut truncated = false;
     for tier in [Tier::Mid, Tier::Long] {
