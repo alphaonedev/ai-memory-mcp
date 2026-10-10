@@ -74,13 +74,25 @@ never a value, and neither form of the URL is printed.
 
 psql runs with ``PGCONNECT_TIMEOUT=15`` and a 60 second overall limit.  A
 ``connect_timeout`` in the URL overrides the default but must be an integer in
-1..60 (#6338): libpq reads 0 as "wait forever", which would leave a psql that
-outlives a SIGKILLed helper (SIGKILL cannot be caught) holding PGPASSWORD without
-bound.  SIGTERM, SIGINT and SIGHUP stop the psql child, print
-``ensure-age-extension: interrupted`` and exit 1.  While the child is being
-spawned or awaited the handler only records the signal and the probe polls that
-flag every 0.2 s (#6337); raising from the handler instead could land between the
-fork and the guard around ``communicate`` and orphan psql with PGPASSWORD.
+1..60 (#6338).  That timeout bounds only the connect phase of ONE host, and psql 18.6
+catches SIGALRM, so it cannot bound a psql that stalls after authentication or one that
+tries several hosts.  The bound that holds is a supervisor (#6517, #6505): psql runs as
+the child of a small stdlib process (this file in ``--supervise`` mode, own session) that
+holds the read end of a pipe whose only write end the helper holds.  When the helper dies
+for ANY reason, SIGKILL included, the pipe reaches EOF and the supervisor kills psql
+within 0.2 s, whatever the host count.  The supervisor also kills psql at its own
+deadline (the 60 s limit plus 5 s), which covers a helper that is SIGSTOPped (SIGSTOP
+cannot be caught) and keeps the pipe open.  If only the supervisor is killed the helper
+kills its process group.  Only the loss of the helper AND the supervisor together leaves
+psql bounded by the connect timeout alone.
+
+Every signal that is valid on the platform and can be caught ends the probe like SIGINT
+(#6504), except the default-ignored, job-control and synchronous-fault signals in
+``NOT_INTERRUPT_SIGNALS``: the probe stops psql, prints ``ensure-age-extension:
+interrupted`` and exits 1.  While the child is being spawned or awaited the handler only
+records the signal and the probe polls that flag every 0.2 s (#6337); raising from the
+handler instead could land between the fork and the guard around ``communicate`` and
+orphan psql with PGPASSWORD.
 
 Exit codes: 0 healthy, 1 still unhealthy / probe or install failed,
 2 bad input (URL file, pg_config, source validation).
@@ -93,11 +105,13 @@ import hashlib
 import os
 from pathlib import Path
 import re
+import select
 import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from urllib.parse import unquote, urlsplit
 
@@ -112,7 +126,15 @@ DEFAULT_PSQL = "/opt/homebrew/opt/postgresql@18/bin/psql"
 PROBE_TIMEOUT_SECONDS = 60
 PROBE_POLL_SECONDS = 0.2  # how often the probe looks at the interrupt flag (#6337)
 MAX_CONNECT_TIMEOUT_SECONDS = PROBE_TIMEOUT_SECONDS  # URL connect_timeout range 1..60 (#6338)
-INTERRUPT_SIGNALS = ("SIGTERM", "SIGINT", "SIGHUP")
+SUPERVISE_FLAG = "--supervise"  # internal: `python3 -I <this file> --supervise <fd> <seconds> -- psql ...`
+SUPERVISOR_GRACE_SECONDS = 5  # the supervisor's own deadline is PROBE_TIMEOUT_SECONDS + this (a SIGSTOPped helper)
+# Signals that are NOT turned into an interrupt: default-ignored ones (a handler would fire on every child exit or
+# resize), terminal job control, SIGPIPE (Python ignores it), the synchronous faults (a handler returns into the
+# fault), and the two nothing can catch.  Every other signal valid on the platform ends the probe cleanly (#6504).
+NOT_INTERRUPT_SIGNALS = (
+    "SIGKILL", "SIGSTOP", "SIGCHLD", "SIGCLD", "SIGURG", "SIGWINCH", "SIGINFO", "SIGCONT", "SIGTSTP", "SIGTTIN",
+    "SIGTTOU", "SIGPIPE", "SIGSEGV", "SIGBUS", "SIGILL", "SIGFPE",
+)
 CONNECT_TIMEOUT_SECONDS = "15"  # PGCONNECT_TIMEOUT for psql; a connect_timeout in the URL overrides it
 PROBE_SQL = "SELECT count(*) FROM pg_available_extensions WHERE name = 'age'"
 URL_SCHEMES = ("postgres", "postgresql")
@@ -273,6 +295,23 @@ def psql_target(url):
 _interrupt = {"defer": False, "pending": False}
 
 
+def interrupt_signals():
+    """Every signal valid on this platform except NOT_INTERRUPT_SIGNALS."""
+    skip = {getattr(signal, name) for name in NOT_INTERRUPT_SIGNALS if hasattr(signal, name)}
+    return sorted((s for s in signal.valid_signals() if s not in skip), key=int)
+
+
+def install_interrupt_handlers(handler=None):
+    """Route every interrupt signal to ``handler`` (default ``note_interrupt``); no-op off the main thread."""
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for signum in interrupt_signals():
+        try:
+            signal.signal(signum, handler or note_interrupt)
+        except (OSError, RuntimeError, ValueError):
+            continue  # a signal this runtime refuses to handle keeps its action; the supervisor still covers it
+
+
 def note_interrupt(signum, frame):
     """Signal handler: raise, except while a psql child is live, then only record it (#6337).
 
@@ -312,16 +351,72 @@ def wait_for_probe(proc):
             stdout, _ = proc.communicate(timeout=min(PROBE_POLL_SECONDS, remaining))
             return stdout
         except subprocess.TimeoutExpired:
+            if proc.poll() is not None:
+                # the supervisor died before psql (e.g. SIGKILL) and psql still holds the output pipes open
+                kill_group(proc)
             continue
 
 
-def stop_child(proc):
-    """Kill and reap a psql child; it holds PGPASSWORD in its environment."""
+def kill_group(proc):
+    """SIGKILL the supervisor's session and process group: the supervisor and psql, which holds PGPASSWORD."""
     try:
-        proc.kill()
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass  # already gone
+
+
+def stop_child(proc):
+    """Kill the supervisor and psql and reap the supervisor."""
+    kill_group(proc)
+    try:
         proc.communicate()
     except OSError:
         pass  # already gone
+
+
+def supervise(fd, deadline_seconds, argv):
+    """Run psql and kill it when the helper dies, a signal arrives or the deadline passes (#6517, #6505).
+
+    ``fd`` is the read end of a pipe whose only write end the helper holds: it reaches EOF when the helper
+    exits for ANY reason, SIGKILL included, which no handler can observe.  This process is the only thing
+    that outlives the helper, so it is small, ignores nothing and polls every PROBE_POLL_SECONDS.
+    """
+    stopped = []
+    install_interrupt_handlers(lambda signum, frame: stopped.append(signum))
+    if stopped:
+        return EXIT_UNAVAILABLE
+    deadline = time.monotonic() + deadline_seconds
+    try:
+        proc = subprocess.Popen(argv)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 127
+    while True:
+        returned = proc.poll()
+        if returned is not None:
+            return returned if returned >= 0 else 128 - returned
+        if stopped or time.monotonic() >= deadline:
+            break
+        try:
+            if select.select([fd], [], [], PROBE_POLL_SECONDS)[0] and os.read(fd, 1) == b"":
+                break  # the helper is gone
+        except (OSError, ValueError):
+            break
+    proc.kill()
+    proc.wait()
+    return EXIT_UNAVAILABLE
+
+
+def supervise_main(argv):
+    """Entry for ``--supervise <fd> <seconds> -- psql ...``."""
+    try:
+        sep = argv.index("--")
+        fd, seconds = int(argv[0]), float(argv[1])
+    except (ValueError, IndexError):
+        return EXIT_BAD_INPUT
+    return supervise(fd, seconds, argv[sep + 1:])
 
 
 def probe_lists_age(psql, url):
@@ -333,25 +428,40 @@ def probe_lists_age(psql, url):
     env["PGCONNECT_TIMEOUT"] = CONNECT_TIMEOUT_SECONDS  # a connect_timeout in the URL overrides it
     for name in SERVICE_ENV:
         env.pop(name, None)  # #6345: a service-file password would beat the moved PGPASSWORD
+    psql_argv = [psql, target, "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", PROBE_SQL]
     with deferred_interrupts():
+        # The supervisor holds the read end; the helper keeps the write end until psql is reaped.  The helper
+        # dying for ANY reason closes it, and the supervisor then kills psql (#6517).
+        read_fd, write_fd = os.pipe()
         try:
             proc = subprocess.Popen(
-                [psql, target, "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", PROBE_SQL],
+                [sys.executable, "-I", os.path.abspath(__file__), SUPERVISE_FLAG, str(read_fd),
+                 str(PROBE_TIMEOUT_SECONDS + SUPERVISOR_GRACE_SECONDS), "--"] + psql_argv,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", env=env,
+                pass_fds=(read_fd,), start_new_session=True,
             )
         except ValueError as exc:
+            os.close(write_fd)
             # subprocess refuses a NUL in argv or env before spawning anything.
             raise HelperError(f"age probe refused its psql arguments ({type(exc).__name__})", EXIT_BAD_INPUT)
         except (OSError, subprocess.SubprocessError) as exc:
+            os.close(write_fd)
             raise HelperError(f"age probe could not run psql ({type(exc).__name__})", EXIT_UNAVAILABLE)
+        finally:
+            os.close(read_fd)
         try:
-            stdout = wait_for_probe(proc)
-        except subprocess.TimeoutExpired:
-            stop_child(proc)
-            raise HelperError("age probe could not run psql (TimeoutExpired)", EXIT_UNAVAILABLE)
-        except BaseException:
-            stop_child(proc)  # a recorded signal or error: never leave psql (and its PGPASSWORD) behind
-            raise
+            try:
+                stdout = wait_for_probe(proc)
+            except subprocess.TimeoutExpired:
+                stop_child(proc)
+                raise HelperError("age probe could not run psql (TimeoutExpired)", EXIT_UNAVAILABLE)
+            except BaseException:
+                stop_child(proc)  # a recorded signal or error: never leave psql (and its PGPASSWORD) behind
+                raise
+            if proc.returncode < 0:
+                kill_group(proc)  # the supervisor itself was killed: psql may still be in its group
+        finally:
+            os.close(write_fd)
     if proc.returncode != 0:
         # psql stderr is deliberately not echoed (it can carry connection detail).
         raise HelperError(f"age probe failed: psql exited {proc.returncode}", EXIT_UNAVAILABLE)
@@ -534,12 +644,7 @@ def run(args):
 
 
 def main(argv=None):
-    try:
-        # SIGTERM and SIGHUP end like SIGINT: the probe stops the psql child first.
-        for name in INTERRUPT_SIGNALS:
-            signal.signal(getattr(signal, name), note_interrupt)
-    except ValueError:
-        pass  # not the main thread (in-process callers); the default handlers stay
+    install_interrupt_handlers()  # every catchable signal ends like SIGINT; the probe stops psql first
     try:
         run(parse_args(argv))
     except HelperError as exc:
@@ -552,4 +657,6 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == SUPERVISE_FLAG:
+        sys.exit(supervise_main(sys.argv[2:]))
     sys.exit(main())
