@@ -214,7 +214,9 @@ before `CREATE EXTENSION`:
   if another runner has meanwhile made AGE healthy the run passes, otherwise the
   files this run created are removed and it exits 1.
 - **Secrets.** The tier password goes to psql through `PGPASSWORD`; the URL on
-  psql's argv carries no password, and neither form is printed.
+  psql's argv carries no password, and neither form is printed. A URL carrying
+  `sslpassword` (the client-key passphrase, which libpq cannot take from the
+  environment) is refused with exit 2 before psql runs.
 
 It is a no-op when AGE is healthy. `--age-dir` exists for the unit tests only;
 CI always uses the default node path, and there is no environment override.
