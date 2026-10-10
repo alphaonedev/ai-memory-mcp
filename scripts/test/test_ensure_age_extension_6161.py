@@ -1325,6 +1325,21 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertIn("SIGKILL", texts["docstring"])
         self.assertIn("SIGSTOP", texts["docstring"])
 
+    def test_docs_state_that_losing_helper_and_supervisor_leaves_psql_unbounded_6673(self):
+        # The connect timeout bounds only the connect phase: after authentication nothing bounds a psql whose
+        # helper and supervisor were both SIGKILLed (macOS has no parent-death signal; psql catches SIGALRM).
+        mod = load_module()
+        claim = ("the loss of the helper AND the supervisor together leaves psql unbounded after authentication: "
+                 "the connect timeout ends only the connect phase")
+        for where, text in {
+            "docstring": " ".join(mod.__doc__.split()),
+            "docs": " ".join((ROOT / "docs/DEV-CI-ENVIRONMENT.md").read_text().split()),
+            "changelog": " ".join((ROOT / "changelog.d/6161.fixed.md").read_text().split()),
+        }.items():
+            with self.subTest(where=where):
+                self.assertNotIn("bounded by the connect timeout alone", text)
+                self.assertIn(claim, text)
+
     def test_connect_timeout_width_and_decoded_value_6509(self):
         # #6509: two digits at most, and the rule applies to the percent-DECODED value.
         for value in ("060", "015", "001", "0015", "%30%36%30"):
