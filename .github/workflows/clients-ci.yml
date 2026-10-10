@@ -41,6 +41,7 @@ on:
     paths:
       - "clients/**"
       - "sdk/**"
+      - "scripts/test/check_sdk_install_integrity.py"
       - ".github/workflows/clients-ci.yml"
   # #5447: rehearsal/** is a PR BASE here (the batch landing line). It is added to
   # pull_request.branches ONLY, never to push.branches: #2506 (both lists edited
@@ -51,6 +52,7 @@ on:
     paths:
       - "clients/**"
       - "sdk/**"
+      - "scripts/test/check_sdk_install_integrity.py"
       - ".github/workflows/clients-ci.yml"
 
 permissions:
