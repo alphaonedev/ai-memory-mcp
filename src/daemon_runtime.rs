@@ -8112,8 +8112,10 @@ enum InterruptWait {
 
 /// Classify the `io::Result` of `tokio::signal::ctrl_c()`.
 fn classify_interrupt(result: &std::io::Result<()>) -> InterruptWait {
-    let _ = result; // #6385 red: every outcome counts as a received interrupt.
-    InterruptWait::Received
+    match result {
+        Ok(()) => InterruptWait::Received,
+        Err(_) => InterruptWait::HandlerUnavailable,
+    }
 }
 
 /// Resolve when the process is interrupted. A failure to register the handler
@@ -8123,7 +8125,10 @@ async fn interrupt_signal() {
     let result = tokio::signal::ctrl_c().await;
     if classify_interrupt(&result) == InterruptWait::HandlerUnavailable {
         if let Err(error) = &result {
-            tracing::error!(%error, "could not register the Ctrl-C handler; SIGINT will not trigger shutdown");
+            tracing::error!(
+                %error,
+                "could not register the Ctrl-C handler; SIGINT will not trigger shutdown"
+            );
         }
         std::future::pending::<()>().await;
     }
