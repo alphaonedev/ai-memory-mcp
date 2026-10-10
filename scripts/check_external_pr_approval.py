@@ -288,6 +288,7 @@ def self_test():
         ("push-approved-external", 0, "push", a, api_for([pr(1, a)], {1: [approved]})),
         ("push-approved-then-changes-requested", 1, "push", a, api_for([pr(1, a)], {1: [revoked, approved]})),
         ("push-team-same-repo", 0, "push", a, api_for([pr(2, a, "MEMBER", repo)])),
+        ("push-contributor-same-repo-unapproved", 1, "push", a, api_for([pr(2, a, "CONTRIBUTOR", repo)])),
         ("push-no-pr-heads-sha", 0, "push", a, api_for([pr(1, b)])),
         ("push-api-error", 1, "push", a, api_for([], fail=True)),
         ("merge-group-unapproved", 1, "merge_group", c, api_for([pr(1, a)])),
