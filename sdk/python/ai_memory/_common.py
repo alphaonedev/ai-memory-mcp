@@ -18,8 +18,10 @@ import inspect
 import ipaddress
 import json
 import os
+import re
 import ssl
 import stat
+import sys
 import time
 from typing import TYPE_CHECKING, Any, Union
 from urllib.parse import quote
@@ -200,27 +202,134 @@ def _suites_authenticate_server(context: ssl.SSLContext) -> bool:
     return True
 
 
-def _context_from_path(path: str) -> ssl.SSLContext:
-    """A verifying context for the CA file or directory ``path`` (#6269).
+#: OpenSSL ``capath`` entry names: ``<subject hash>.<n>`` for a certificate,
+#: ``<subject hash>.r<n>`` for a CRL. Only these are trust input in a hashed
+#: CA directory, exactly as OpenSSL's own directory lookup reads it (#6377).
+_HASHED_CA_ENTRY = re.compile(r"[0-9a-f]{8}\.r?[0-9]+")
 
-    The path is resolved with ``os.path.realpath`` NOW and the context is
-    built from the absolute result: OpenSSL resolves a relative CA directory
-    lazily, at handshake time, against whatever the working directory is then.
-    A path that is neither an existing regular file nor an existing directory
-    (missing, FIFO, socket, device) is a ``ValueError`` rather than a late
-    ``FileNotFoundError`` or a hang.
+#: Write bits that let someone other than the owner change trust input.
+_SHARED_WRITE_BITS = stat.S_IWGRP | stat.S_IWOTH
+
+
+def _shared_writable(mode: int) -> bool:
+    """Whether ``mode`` lets the group or others write (POSIX only, #6377)."""
+    return os.name != "nt" and bool(mode & _SHARED_WRITE_BITS)
+
+
+def _refuse_shared_writable(what: str, path: str, mode: int) -> None:
+    """Raise when a trust input ``path`` is group- or world-writable (#6377)."""
+    if _shared_writable(mode):
+        raise ValueError(
+            f"verify= {what} {path!r} is group- or world-writable (mode "
+            f"{stat.S_IMODE(mode):o}): anyone with that write access could change "
+            "which servers this client trusts. Remove the write bits "
+            "(chmod go-w) or pass a CA path only its owner can change (#6377)."
+        )
+
+
+def _pinned_base_context() -> ssl.SSLContext:
+    """``ssl.create_default_context()`` with NO trust anchors loaded (#6377).
+
+    The same steps the standard library takes for ``Purpose.SERVER_AUTH``
+    (``PROTOCOL_TLS_CLIENT``, ``CERT_REQUIRED``, ``check_hostname``, the
+    3.13+ strict and partial-chain flags, ``SSLKEYLOGFILE``), minus its
+    fallback to the system store: an empty CA directory must mean no anchor
+    at all, and ``create_default_context`` loads the system store whenever it
+    is given no CA input.
+    """
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True
+    if sys.version_info >= (3, 13):
+        context.verify_flags |= ssl.VERIFY_X509_PARTIAL_CHAIN | ssl.VERIFY_X509_STRICT
+    keylog = os.environ.get("SSLKEYLOGFILE")
+    if keylog and not sys.flags.ignore_environment:
+        context.keylog_filename = keylog
+    return context
+
+
+def _load_trust_file(context: ssl.SSLContext, shown: str, entry: str) -> None:
+    """Load one CA file into ``context`` NOW, after checking who can change it.
+
+    ``entry`` is resolved through symlinks, opened without blocking (a FIFO
+    would otherwise hang), and must be a regular file that neither it nor its
+    directory lets the group or others rewrite; a sticky directory is
+    admitted when the file belongs to this user or root, since nobody else
+    can then replace it. The file is loaded by path and re-checked to be the
+    same inode afterwards, so a swap during the load is refused (#6377).
+    """
+    real = os.path.realpath(entry)
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(real, flags)
+    except OSError as exc:
+        raise ValueError(
+            f"verify= CA file {shown!r} cannot be opened: {exc.strerror} (#6377)."
+        ) from None
+    try:
+        opened = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if not stat.S_ISREG(opened.st_mode):
+        raise ValueError(
+            f"verify= CA entry {shown!r} is not a regular file; a hashed CA "
+            "directory may hold only certificate and CRL files (#6307, #6377)."
+        )
+    _refuse_shared_writable("CA file", real, opened.st_mode)
+    parent = os.path.dirname(real)
+    held = os.stat(parent)
+    sticky_and_owned = bool(held.st_mode & stat.S_ISVTX) and opened.st_uid in (0, os.geteuid())
+    if not sticky_and_owned:
+        _refuse_shared_writable("CA file directory", parent, held.st_mode)
+    try:
+        context.load_verify_locations(cafile=real)
+    except (ssl.SSLError, OSError) as exc:
+        raise ValueError(
+            f"verify= CA file {shown!r} holds no usable certificate: {exc} (#6377)."
+        ) from None
+    after = os.stat(real)
+    if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
+        raise ValueError(f"verify= CA file {shown!r} changed while it was being read (#6377).")
+
+
+def _context_from_path(path: str) -> ssl.SSLContext:
+    """A verifying context for the CA file or directory ``path`` (#6269, #6377).
+
+    The path is resolved with ``os.path.realpath`` NOW. A path that is neither
+    an existing regular file nor an existing directory (missing, FIFO, socket,
+    device) is a ``ValueError`` rather than a late ``FileNotFoundError`` or a
+    hang (#6307).
+
+    Trust is read ONCE, here. For a directory every hashed entry
+    (``<hash>.<n>``, ``<hash>.r<n>``) is loaded eagerly, so a certificate
+    added to the directory after construction is never trusted (OpenSSL's own
+    ``capath`` lookup reads the directory again on every handshake). A
+    directory, file, symlink target or target directory that the group or
+    others can write is refused (POSIX; #6377). An empty directory gives a
+    context with no anchor at all, which fails every handshake (#6269).
     """
     resolved = os.path.realpath(path)
     try:
         mode = os.stat(resolved).st_mode
     except OSError:
         mode = 0
-    # `S_ISREG`/`S_ISDIR` only: a FIFO, socket or device would block or misbehave
-    # when opened (#6307), so it is refused before anything opens it.
     if stat.S_ISDIR(mode):
-        return ssl.create_default_context(capath=resolved)
+        _refuse_shared_writable("CA directory", path, mode)
+        context = _pinned_base_context()
+        try:
+            names = sorted(os.listdir(resolved))
+        except OSError as exc:
+            raise ValueError(
+                f"verify= CA directory {path!r} cannot be listed: {exc.strerror} (#6377)."
+            ) from None
+        for name in names:
+            if _HASHED_CA_ENTRY.fullmatch(name):
+                _load_trust_file(context, os.path.join(path, name), os.path.join(resolved, name))
+        return context
     if stat.S_ISREG(mode):
-        return ssl.create_default_context(cafile=resolved)
+        context = _pinned_base_context()
+        _load_trust_file(context, path, resolved)
+        return context
     raise ValueError(
         "verify= names a CA path that is not an existing regular file or "
         f"directory: {path!r}. Pass the CA bundle file or hashed CA directory "
