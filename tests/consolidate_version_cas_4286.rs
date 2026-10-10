@@ -218,6 +218,21 @@ fn consolidate_body(ids: &[String]) -> Value {
     json!({"ids": ids, "title": MERGED_TITLE, "namespace": NS})
 }
 
+/// #4286 review F2 — the common minimal 409 body BOTH backends emit on a
+/// stale source: `status`, the conflicting source `id`, and an `error`
+/// string. sqlite additionally carries the expected/current version pair.
+fn assert_conflict_shape(v: &Value, conflicting_id: &str) {
+    assert_eq!(v["status"], "conflict", "409 body names the conflict: {v}");
+    assert_eq!(
+        v["id"], conflicting_id,
+        "409 body names the source that changed: {v}"
+    );
+    assert!(
+        v["error"].as_str().is_some_and(|s| !s.is_empty()),
+        "409 body carries an error string: {v}"
+    );
+}
+
 /// Build a sqlite router whose LLM edits `target` (once) mid-summary.
 /// Returns the router, the keep-alive temp file, and the id cell the edit
 /// reads (filled after seeding).
@@ -287,6 +302,7 @@ async fn http_consolidate_llm_summary_refuses_source_edited_mid_summary_4286() {
         StatusCode::CONFLICT,
         "a source edited during summarisation must not be consumed: {v}"
     );
+    assert_conflict_shape(&v, &b);
 
     let conn = ai_memory::db::open(f.path()).expect("db::open");
     let edited = ai_memory::db::get(&conn, &b)
@@ -421,6 +437,7 @@ async fn http_consolidate_llm_summary_refuses_source_edited_mid_summary_pg_4286(
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{v}");
+    assert_conflict_shape(&v, &b);
     let ctx = CallerContext::for_agent(CALLER);
     let edited = store.get(&ctx, &b).await.expect("edited source still live");
     assert_eq!(edited.content, EDITED);
