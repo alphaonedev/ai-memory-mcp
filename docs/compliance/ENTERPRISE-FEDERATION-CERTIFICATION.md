@@ -38,17 +38,28 @@ certification and triggers re-cert** (see §7).
 > run after code freeze. Re-binding to a newer SHA without that re-measurement is
 > forbidden (#3899).
 >
-> **Amendment (2026-10-08, #6116 - second §7 record for the #4507 comment-only retargets).**
+> **Amendment (2026-10-08, #6116 - second §7 record for the #4507 doc-comment retargets).**
 > Two §7-watched federation-wire files changed again after the 2026-10-07
 > expiry record above, through the #4507 citation-retarget chain
 > (`6c6634d66`, `015b44777`, `2a18bffe2`, merged at `cd3cb6140`):
 > `src/federation/mod.rs` and `src/handlers/federation_receive.rs`, +1/-1
-> lines each. Both edits are comment-only path retargets (a `///` doc comment in
-> `src/federation/mod.rs`, a plain `//` comment in
-> `src/handlers/federation_receive.rs`, #6127); no code,
+> lines each. Both edits are Rust doc-comment path retargets only; no code,
 > no `AI_MEMORY_FED_*` identifier and no wire behaviour changed. This record
 > does **not** re-measure anything and does **not** re-bind. The certification
 > stays EXPIRED, and the re-measurement and re-issue stay under WP-B1
+> ([#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063)); re-binding
+> without that re-measurement is forbidden (#3899).
+>
+> **Amendment (2026-10-10, #6127 - correction to the comment kinds named by the 2026-10-08 record above).**
+> The 2026-10-08 record (#6116) above is kept exactly as written: this ledger
+> is append-only, so a mistake is corrected by a new dated record, never by
+> editing an old one. That record labels both #4507 retarget edits by one comment
+> kind, which is wrong for one of them. Per file, the two edits are a `///` doc
+> comment in `src/federation/mod.rs` and a plain `//` comment in
+> `src/handlers/federation_receive.rs`. Both edits remain comment-only
+> path retargets, +1/-1 lines each; no code, no `AI_MEMORY_FED_*` identifier
+> and no wire behaviour changed. This correction does **not** re-measure anything and does **not** re-bind. The certification stays EXPIRED,
+> and the re-measurement and re-issue stay under WP-B1
 > ([#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063)); re-binding
 > without that re-measurement is forbidden (#3899).
 >
