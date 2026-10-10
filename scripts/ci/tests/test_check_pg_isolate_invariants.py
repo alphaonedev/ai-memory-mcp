@@ -106,6 +106,64 @@ class Mutants(unittest.TestCase):
                            'G9-template-guard')
 
 
+SPLIT_LINE = ('              python3 -I scripts/ci/pg_isolate_split.py --build-json "$sd/build.jsonl" '
+              '--serial-file "$sd/serial.txt" --out-dir "$sd" || return "$?"\n')
+SPLIT_BLOCK = '            if [ "$PG_ISO_LANE" = "1" ]; then\n' + SPLIT_LINE + '            fi\n'
+PARTITION_LINE_START = '            python3 scripts/ci/partition_test_binaries.py --build-json'
+SERIAL_LAUNCH_END = '            pid_s=$!\n'
+
+
+class SplitWiring(unittest.TestCase):
+    """#7052: the PG_ISO_LANE split block is pinned (G10-split-wired)."""
+
+    def assert_caught(self, mutant):
+        self.assertNotEqual(mutant, CI_YML, 'the mutation must change the text')
+        self.assertIn('G10-split-wired', failed_ids(mutant))
+
+    def moved(self, anchor, before):
+        """The block removed from its place and re-inserted before/after ``anchor``."""
+        self.assertEqual(CI_YML.count(anchor), 1, anchor)
+        without = CI_YML.replace(SPLIT_BLOCK, '', 1)
+        return without.replace(anchor, (SPLIT_BLOCK + anchor) if before else (anchor + SPLIT_BLOCK), 1)
+
+    def test_real_block_is_present_once_and_passes(self):
+        self.assertEqual(CI_YML.count(SPLIT_BLOCK), 1)
+        self.assertIsNone(chk.split_failure(CI_YML))
+
+    def test_dropped_block_is_caught(self):
+        self.assert_caught(CI_YML.replace(SPLIT_BLOCK, '', 1))
+
+    def test_disabled_condition_is_caught(self):
+        self.assert_caught(CI_YML.replace(SPLIT_BLOCK, SPLIT_BLOCK.replace(
+            'if [ "$PG_ISO_LANE" = "1" ]; then', 'if false; then', 1), 1))
+
+    def test_lost_isolated_mode_flag_is_caught(self):
+        # #6956 posture: every python3 run in the step uses -I.
+        self.assert_caught(CI_YML.replace('python3 -I scripts/ci/pg_isolate_split.py',
+                                          'python3 scripts/ci/pg_isolate_split.py', 1))
+
+    def test_lost_fail_closed_return_is_caught(self):
+        self.assert_caught(CI_YML.replace(SPLIT_LINE, SPLIT_LINE.replace(' || return "$?"', '', 1), 1))
+
+    def test_moved_after_first_shard_launch_is_caught(self):
+        # After `( run_shard serial ... ) &` the serial shard has already read
+        # iso_other.txt / iso_targets.txt: the split ran too late.
+        self.assert_caught(self.moved(SERIAL_LAUNCH_END, before=False))
+
+    def test_moved_before_partition_is_caught(self):
+        # Before partition_test_binaries.py there is no serial.txt to split.
+        self.assert_caught(self.moved(PARTITION_LINE_START, before=True))
+
+    def test_moved_out_of_run_sharded_is_caught(self):
+        self.assert_caught(self.moved('          run_sharded() {\n', before=True))
+
+    def test_duplicate_call_is_caught(self):
+        self.assert_caught(CI_YML.replace(SPLIT_BLOCK, SPLIT_BLOCK + SPLIT_BLOCK, 1))
+
+    def test_unguarded_call_is_caught(self):
+        self.assert_caught(CI_YML.replace(SPLIT_BLOCK, SPLIT_LINE, 1))
+
+
 class SourceChecks(unittest.TestCase):
     def test_force_drop_in_the_wrapper_is_caught(self):
         wrapper = (REPO / 'scripts' / 'test' / 'pg_isolated_binary.py').read_text()

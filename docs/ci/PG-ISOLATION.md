@@ -44,7 +44,10 @@ after another. With the lane on (flag `1`, kill switch not `1`, tier
    that bind a fixed loopback port or use a shared path, and binaries with no
    readable source (`scripts/ci/pg_isolate_split.py`) run last, one at a time,
    on the shared database. The flag is stripped from their environment, so the
-   Rust helper does not mint for them.
+   Rust helper does not mint for them. The split call in `run_sharded()` is
+   pinned verbatim (`python3 -I`, its three files, `|| return`, guarded by
+   `PG_ISO_LANE`, after the partition and before the first shard launch) by
+   invariant `G10-split-wired` (#7052).
 3. **Cleanup** runs `pg_isolated_binary.py teardown --run-id <this run>`, which
    drops this run's leftover clones and the template.
 

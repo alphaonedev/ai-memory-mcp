@@ -14,6 +14,10 @@ G6-watchdog            the isolated lane keeps the #1492 watchdog line.
 G7-log-upload          an ``if: always()`` upload step ships the per-binary logs. M3.
 G8-kill-switch         the CI_PG_ISOLATE_OFF repo variable is wired.
 G9-template-guard      the lane fails closed without the template. M1/M6.
+G10-split-wired        run_sharded() calls ``python3 -I pg_isolate_split.py``
+                       exactly once, as the sole body of the PG_ISO_LANE
+                       guard, after the partition and before the first
+                       run_shard launch, failing closed. #7052.
 run-help               ``pg_isolated_binary.py run --help`` EXECUTES and
                        lists its flags (C1, L2: not a docstring grep).
 source                 neither the wrapper nor the Rust helper drops WITH
@@ -40,6 +44,15 @@ TEMPLATE_GUARD = '${AI_MEMORY_TEST_PG_TEMPLATE:-}'
 RUN_FLAGS = ('--url', '--run-id', '--template', '--log-dir', '--targets-file', '--jobs',
              '--residual-file', '--test-arg')
 FORCE = 'WITH (FORCE)'
+# #7052: the split that moves the --test/--bin binaries into the isolated lane.
+# Pinned verbatim: ``-I`` (#6956 posture), the three files, and ``|| return``
+# (fail closed) are all part of the contract.
+SPLIT_SCRIPT = 'scripts/ci/pg_isolate_split.py'
+SPLIT = ('python3 -I %s --build-json "$sd/build.jsonl" --serial-file "$sd/serial.txt" '
+         '--out-dir "$sd" || return "$?"' % SPLIT_SCRIPT)
+SPLIT_GUARD = 'if [ "$PG_ISO_LANE" = "1" ]; then'
+PARTITION = 'scripts/ci/partition_test_binaries.py --build-json'
+SHARD_LAUNCH = '( run_shard '
 
 _ASSIGN_RE = re.compile(r'\b%s=(?!0\b)' % FLAG)
 _YAML_KEY_RE = re.compile(r'^\s*%s\s*:' % FLAG, re.M)
@@ -55,6 +68,44 @@ def _code_lines(text: str) -> List[str]:
 def _steps(text: str) -> List[str]:
     starts = [m.start() for m in _STEP_RE.finditer(text)] + [len(text)]
     return [text[a:b] for a, b in zip(starts, starts[1:])]
+
+
+def _function_body(text: str, name: str) -> Optional[str]:
+    """Body of the shell function ``name() {`` ... ``}`` at the same indent."""
+    m = re.search(r'^(\s*)%s\(\) \{\n' % re.escape(name), text, re.M)
+    if not m:
+        return None
+    end = text.find('\n%s}\n' % m.group(1), m.end())
+    return None if end < 0 else text[m.end():end]
+
+
+def split_failure(ci_text: str) -> Optional[str]:
+    """G10 (#7052): ``None`` when the PG_ISO_LANE split is wired as pinned.
+
+    The split must be called exactly once in ci.yml, inside ``run_sharded()``,
+    verbatim (``-I``, the three files, ``|| return "$?"``), as the sole body of
+    the ``PG_ISO_LANE`` guard, after the single partition call and before the
+    first ``run_shard`` launch (the first step that runs tests).
+    """
+    if sum(SPLIT_SCRIPT in ln for ln in _code_lines(ci_text)) != 1:
+        return 'ci.yml must call %s exactly once, inside run_sharded()' % SPLIT_SCRIPT
+    body = _function_body(ci_text, 'run_sharded')
+    if body is None:
+        return 'run_sharded() not found in ci.yml'
+    lines = [ln.strip() for ln in _code_lines(body) if ln.strip()]
+    hits = [i for i, ln in enumerate(lines) if ln == SPLIT]
+    if len(hits) != 1:
+        return 'run_sharded() must contain exactly once the line: ' + SPLIT
+    i = hits[0]
+    if i == 0 or lines[i - 1] != SPLIT_GUARD or i + 1 >= len(lines) or lines[i + 1] != 'fi':
+        return 'the split call must be the sole body of `%s` ... `fi`' % SPLIT_GUARD
+    partitions = [j for j, ln in enumerate(lines) if PARTITION in ln]
+    if len(partitions) != 1 or partitions[0] > i:
+        return 'the split must follow the single partition call (%s)' % PARTITION
+    launches = [j for j, ln in enumerate(lines) if ln.startswith(SHARD_LAUNCH)]
+    if not launches or min(launches) < i:
+        return 'the split must precede the first run_shard launch'
+    return None
 
 
 def static_failures(ci_text: str, repo: Path) -> List[Failure]:
@@ -86,6 +137,9 @@ def static_failures(ci_text: str, repo: Path) -> List[Failure]:
         out.append(('G8-kill-switch', 'the %s kill switch is not wired' % KILL_VAR))
     if TEMPLATE_GUARD not in ci_text:
         out.append(('G9-template-guard', 'the lane does not fail closed without the template'))
+    split = split_failure(ci_text)
+    if split:
+        out.append(('G10-split-wired', split))
     return out
 
 
@@ -138,7 +192,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print('FAIL %s: %s' % (cid, msg))
     if failures:
         return 1
-    print('ok: pg-isolation invariants hold (G1-G9, run-help, source)')
+    print('ok: pg-isolation invariants hold (G1-G10, run-help, source)')
     return 0
 
 
