@@ -2375,6 +2375,53 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     t.expect_red("6124-f15d", "header back-dated before the merge-base day", repo, exp6124,
                  f15d, red6124 + [("before the merge-base", "did not name the date floor")])
 
+    # (6124-l*) RED (R3-F1 #6365 residual, #6443): an HTML block or a fence
+    # opened inside a LIST ITEM of the ledger blockquote (`> - ` and `> 1. `
+    # items, the record indented into the item) hides the record from the
+    # rendered doc, and an opener behind an indented `>` or a `>` + tab does
+    # the same. The opener is already in the merge-base so only the record is
+    # inserted; the container model is the only guard that can refuse it.
+    # Offline cells only, one per HTML block kind 1-7 and per fence kind.
+    def indented(rec, n):
+        return "".join("> " + " " * n + ln[2:] + "\n" for ln in rec.rstrip("\n").split("\n"))
+
+    gone6124 = [("no NEW amendment record", "did not report the hidden record as not added")]
+    for oname, op in (("script", "<script>"), ("style", "<style>"), ("pre", "<pre>"),
+                      ("textarea", "<textarea>"), ("comment", "<!-- x"), ("pi", "<?x"),
+                      ("decl", "<!X"), ("cdata", "<![CDATA["), ("div", "<div>"),
+                      ("custom", "<x-y>"), ("fence", "```"), ("tilde", "~~~")):
+        for lname, mark, ind in (("ul", "- ", 2), ("ol", "1. ", 3)):
+            tag = f"l-{oname}-{lname}"
+            pre = f">\n> {mark}{op}\n"
+            mb_l = doc_only(quoted=pre + ">\n" + old_b, label=f"{tag}-mb")
+            cell_l = edit_range("", quoted=pre + indented(rec6124, ind) + ">\n" + old_b,
+                                label=tag, frm=mb_l)
+            t.expect_red(f"6124-{tag}", f"record behind a {oname} opener in a {lname} item", repo,
+                         mb_l, cell_l, red6124 + gone6124)
+    # (6124-l-ctl) GREEN - a list item whose HTML block ended before the record
+    # (types 6/7 end at a blank line) and a plain list item hide nothing.
+    pre_l = ">\n> - <div>\n>\n"
+    mb_lc = doc_only(quoted=pre_l + ">\n" + old_b, label="l-ctl-mb")
+    l_ctl = edit_range("", quoted=pre_l + indented(rec6124, 2) + ">\n" + old_b, label="l-ctl",
+                       frm=mb_lc)
+    t.expect_green("6124-l-ctl", "record after a list item HTML block that already ended",
+                   repo, mb_lc, l_ctl, green6124)
+    # (6124-q1..q5) RED (#6443, T1/T2/T3/T11/T12): the opener behind a tab
+    # after '>' or behind an indented '>' (up to three columns) is an opener.
+    for tag, opener in (("q1", ">\t<pre>"), ("q2", "  > <pre>"), ("q3", "  > ```"),
+                        ("q4", ">\t<![CDATA["), ("q5", "   > <?x")):
+        pre = f">\n{opener}\n"
+        mb_q = doc_only(quoted=pre + ">\n" + old_b, label=f"{tag}-mb")
+        cell_q = edit_range("", quoted=pre + rec6124 + ">\n" + old_b, label=tag, frm=mb_q)
+        t.expect_red(f"6124-{tag}", f"record behind the opener {opener!r}", repo, mb_q, cell_q,
+                     red6124 + gone6124)
+    # (6124-q-ctl) GREEN - a tab-indented plain line is not an opener.
+    mb_qc = doc_only(quoted=">\n>\tplain\n>\n" + old_b, label="q-ctl-mb")
+    q_ctl = edit_range("", quoted=">\n>\tplain\n>\n" + rec6124 + ">\n" + old_b, label="q-ctl",
+                       frm=mb_qc)
+    t.expect_green("6124-q-ctl", "record after a tab-indented plain line", repo, mb_qc, q_ctl,
+                   green6124)
+
     # (6124-r1..r4) #6355: the COMMITTED cert doc of this checkout, as the
     # merge-base, with a record inserted at each legal spot (GREEN), behind an
     # inserted HTML opener (RED), and above non-record prose that would then
