@@ -66,13 +66,35 @@ with open(base + "/psql.log", "a") as fh:
 print(1 if os.path.isfile(base + "/share/extension/age.control") else 0)
 """
 
-# Fake psql that never answers a connect: records its pid, then sleeps.
+# Fake psql that never answers a connect: records its pid and its parent pid, then sleeps.
 SLEEPING_PSQL = """#!{py}
 import os, time
+with open({base!r} + "/sleep.ppid", "w") as fh:
+    fh.write(str(os.getppid()))
 with open({base!r} + "/sleep.pid", "w") as fh:
     fh.write(str(os.getpid()))
 time.sleep(120)
 """
+
+# Like psql 18.6 after authentication: it catches the signals a naive timeout would use (#6517).
+STUBBORN_PSQL = """#!{py}
+import os, signal, time
+for name in ("SIGTERM", "SIGHUP", "SIGINT", "SIGALRM", "SIGQUIT", "SIGUSR1", "SIGUSR2"):
+    signal.signal(getattr(signal, name), signal.SIG_IGN)
+with open({base!r} + "/sleep.ppid", "w") as fh:
+    fh.write(str(os.getppid()))
+with open({base!r} + "/sleep.pid", "w") as fh:
+    fh.write(str(os.getpid()))
+time.sleep(120)
+"""
+
+# Signals the helper does not turn into an interrupt: default-ignored (CHLD, URG, WINCH, INFO, CONT),
+# job control (TSTP, TTIN, TTOU), PIPE (Python ignores it), the synchronous faults (SEGV, BUS, ILL, FPE) and the
+# two nothing can catch (KILL, STOP).  Every other signal valid on this platform must end in `interrupted` (#6504).
+NOT_INTERRUPT_SIGNALS = (
+    "SIGKILL", "SIGSTOP", "SIGCHLD", "SIGCLD", "SIGURG", "SIGWINCH", "SIGINFO", "SIGCONT", "SIGTSTP", "SIGTTIN",
+    "SIGTTOU", "SIGPIPE", "SIGSEGV", "SIGBUS", "SIGILL", "SIGFPE",
+)
 
 # Every libpq 18.6 connection keyword (PQconndefaults, 50 entries).
 LIBPQ_18_KEYWORDS = (
@@ -735,10 +757,13 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                 self.assertTrue("TAB, CR, LF or NUL" in text, "does not list TAB, CR, LF or NUL")
 
     # ---- #6252 / cloud F6: signals and the connect timeout --------------------
-    def start_sleeping_helper(self):
-        write_exe(self.psql, SLEEPING_PSQL.format(py=sys.executable, base=str(self.base)))
+    def start_sleeping_helper(self, psql_template=SLEEPING_PSQL, hosts="127.0.0.1:5445"):
+        write_exe(self.psql, psql_template.format(py=sys.executable, base=str(self.base)))
         self.install_good()
-        self.url_file.write_text(f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb\n")
+        for stale in ("sleep.pid", "sleep.ppid"):  # a previous subTest's pid must not be read as this one's
+            if (self.base / stale).exists():
+                (self.base / stale).unlink()
+        self.url_file.write_text(f"postgres://ciuser:{PW_MARKER}@{hosts}/cidb\n")
         proc = subprocess.Popen(self.cmd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         pid_file = self.base / "sleep.pid"
         deadline = time.monotonic() + 15
@@ -813,7 +838,190 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                "--url-file", str(self.url_file), "--age-dir", str(self.age),
                "--pg-config", str(self.pg_config), "--psql", str(self.psql)]
         r = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=60)
+        # The Popen child is the supervisor; psql is the process that wrote sleep.pid (when it got that far).
+        children = [int(pid_file.read_text())]
+        psql_pid = self.base / "sleep.pid"
+        if psql_pid.exists() and psql_pid.read_text():
+            children.append(int(psql_pid.read_text()))
+
+        def reap():
+            for pid in children:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+        self.addCleanup(reap)
+        return r, children
+
+    def test_signal_in_the_psql_spawn_window_terminates_the_psql_child(self):
+        # #6337: a handled signal between Popen() and the communicate() guard escaped the guard.
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(signal=signum.name):
+                r, children = self.run_signal_in_spawn_window(signum)
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertEqual(r.stderr.strip(), PREFIX + "interrupted")
+                self.assertNotIn(PW_MARKER, r.stdout + r.stderr)
+                for child in children:
+                    self.assert_gone(child)
+
+    # ---- #6504 / #6517 / #6505 / #6506 / #6518 / #6507: containment of the psql child ---------------
+    def interrupt_signals(self):
+        skip = {getattr(signal, name) for name in NOT_INTERRUPT_SIGNALS if hasattr(signal, name)}
+        return sorted((s for s in signal.valid_signals() if s not in skip), key=int)
+
+    def test_every_catchable_signal_mid_connect_terminates_the_psql_child(self):
+        # #6504: SIGQUIT, SIGUSR1, SIGUSR2, SIGALRM and every other signal kept the default action, so the helper
+        # died and psql was re-parented with PGPASSWORD.  Each signal is sent to a real helper process.
+        signums = self.interrupt_signals()
+        self.assertGreaterEqual(len(signums), 15, signums)
+        for name in ("SIGQUIT", "SIGUSR1", "SIGUSR2", "SIGALRM", "SIGTERM", "SIGINT", "SIGHUP"):
+            self.assertIn(getattr(signal, name), signums)
+        for signum in signums:
+            with self.subTest(signal=int(signum)):
+                proc, child = self.start_sleeping_helper()
+                proc.send_signal(signum)
+                out, err = proc.communicate(timeout=15)
+                self.assertEqual(proc.returncode, 1, out + err)
+                self.assertEqual(err.strip(), PREFIX + "interrupted")
+                self.assertNotIn(PW_MARKER, out + err)
+                self.assert_gone(child)
+
+    def assert_gone_within(self, pid, seconds, why):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.02)
+        self.fail(f"psql {pid} still alive {seconds} s after {why} (orphan holding PGPASSWORD)")
+
+    def test_psql_does_not_outlive_a_sigkilled_helper_after_authentication(self):
+        # #6517: SIGKILL cannot be caught.  connect_timeout bounds only the connect phase, and psql 18.6 catches
+        # SIGALRM, so a psql that stalls after authentication lived on without bound.  The stand-in ignores
+        # every catchable signal, as a stalled authenticated session does.
+        proc, child = self.start_sleeping_helper(STUBBORN_PSQL)
+        proc.send_signal(signal.SIGKILL)
+        proc.communicate(timeout=15)
+        self.assert_gone_within(child, 3, "the helper was SIGKILLed")
+
+    def test_orphan_bound_does_not_scale_with_the_host_count(self):
+        # #6505: libpq tries every host in turn, each for connect_timeout; the bound was hosts x timeout.
+        four = ",".join(f"127.0.0.{n}:5445" for n in (1, 2, 3, 4))
+        for hosts in ("127.0.0.1:5445", four):
+            with self.subTest(hosts=hosts.count(",") + 1):
+                proc, child = self.start_sleeping_helper(STUBBORN_PSQL, hosts=hosts)
+                proc.send_signal(signal.SIGKILL)
+                proc.communicate(timeout=15)
+                self.assert_gone_within(child, 3, "the helper was SIGKILLed")
+
+    def test_uncatchable_and_fault_signals_leave_no_psql_child(self):
+        # Signals the helper cannot or does not turn into an interrupt still end psql: the supervisor sees
+        # the helper's pipe close.
+        for name in ("SIGKILL", "SIGSEGV", "SIGBUS", "SIGILL", "SIGFPE"):
+            with self.subTest(signal=name):
+                proc, child = self.start_sleeping_helper(STUBBORN_PSQL)
+                proc.send_signal(getattr(signal, name))
+                proc.communicate(timeout=15)
+                self.assert_gone_within(child, 3, f"the helper got {name}")
+
+    def test_psql_is_killed_when_the_supervisor_itself_is_sigkilled(self):
+        # The supervisor is a process too: killing it must not leave psql behind while the helper lives.
+        proc, child = self.start_sleeping_helper(STUBBORN_PSQL)
+        supervisor = int((self.base / "sleep.ppid").read_text())
+        os.kill(supervisor, signal.SIGKILL)
+        out, err = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 1, out + err)
+        self.assertEqual(len(err.strip().splitlines()), 1, err)
+        self.assertNotIn(PW_MARKER, out + err)
+        self.assert_gone_within(child, 3, "the supervisor was SIGKILLed")
+
+    def run_supervisor(self, deadline, psql_template=STUBBORN_PSQL, keep_pipe=True):
+        """Run the supervisor mode directly; returns (process, write end of the pipe or None, psql pid)."""
+        write_exe(self.psql, psql_template.format(py=sys.executable, base=str(self.base)))
+        for stale in ("sleep.pid", "sleep.ppid"):
+            if (self.base / stale).exists():
+                (self.base / stale).unlink()
+        mod = load_module()
+        r, w = os.pipe()
+        proc = subprocess.Popen(
+            [sys.executable, "-I", str(SCRIPT), mod.SUPERVISE_FLAG, str(r), str(deadline), "--", str(self.psql)],
+            pass_fds=(r,), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        os.close(r)
+        if not keep_pipe:
+            os.close(w)
+            w = None
+        pid_file = self.base / "sleep.pid"
+        end = time.monotonic() + 15
+        while time.monotonic() < end and not (pid_file.exists() and pid_file.read_text()):
+            time.sleep(0.05)
         child = int(pid_file.read_text())
+
+        def reap():
+            for pid in (child, proc.pid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            if w is not None:
+                os.close(w)
+            proc.communicate()
+
+        self.addCleanup(reap)
+        return proc, child
+
+    def test_supervisor_kills_psql_when_the_helper_pipe_closes(self):
+        proc, child = self.run_supervisor(600, keep_pipe=False)
+        proc.communicate(timeout=15)
+        self.assert_gone_within(child, 3, "the pipe closed")
+
+    def test_supervisor_enforces_its_own_deadline(self):
+        # A helper that is SIGSTOPped keeps the pipe open and cannot enforce the probe limit.
+        proc, child = self.run_supervisor(1)
+        t0 = time.monotonic()
+        proc.communicate(timeout=15)
+        self.assertLess(time.monotonic() - t0, 6)
+        self.assert_gone_within(child, 3, "the supervisor deadline passed")
+
+    def test_supervisor_kills_psql_on_a_signal_sent_to_itself(self):
+        for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGUSR1):
+            with self.subTest(signal=int(signum)):
+                proc, child = self.run_supervisor(600)
+                proc.send_signal(signum)
+                proc.communicate(timeout=15)
+                self.assert_gone_within(child, 3, f"the supervisor got signal {int(signum)}")
+
+    def test_supervisor_passes_psql_output_and_exit_code_through(self):
+        write_exe(self.psql, FAKE_PSQL.format(py=sys.executable, base=str(self.base), marker=PW_MARKER))
+        self.install_good()
+        mod = load_module()
+        r, w = os.pipe()
+        try:
+            done = subprocess.run(
+                [sys.executable, "-I", str(SCRIPT), mod.SUPERVISE_FLAG, str(r), "30", "--", str(self.psql)],
+                pass_fds=(r,), capture_output=True, text=True, timeout=30)
+        finally:
+            os.close(r)
+            os.close(w)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout.strip(), "1")
+
+    def test_overall_deadline_stops_a_stalled_psql_6506(self):
+        # #6506: the 60 s limit is the only bound on a psql that connects and then stalls.  The supervisor
+        # deadline is held far away so only the helper's own limit and stop_child can end psql here (#6518).
+        write_exe(self.psql, STUBBORN_PSQL.format(py=sys.executable, base=str(self.base)))
+        mod = load_module()
+        mod.PROBE_TIMEOUT_SECONDS = 1
+        mod.SUPERVISOR_GRACE_SECONDS = 600
+        t0 = time.monotonic()
+        with self.assertRaises(mod.HelperError) as ctx:
+            mod.probe_lists_age(str(self.psql), f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb")
+        self.assertLess(time.monotonic() - t0, 8)
+        self.assertEqual(ctx.exception.code, mod.EXIT_UNAVAILABLE)
+        self.assertEqual(str(ctx.exception), "age probe could not run psql (TimeoutExpired)")
+        self.assertNotIn(PW_MARKER, str(ctx.exception))
+        child = int((self.base / "sleep.pid").read_text())
 
         def reap():
             try:
@@ -822,17 +1030,65 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                 pass
 
         self.addCleanup(reap)
-        return r, child
+        self.assert_gone_within(child, 3, "the overall deadline passed (stop_child)")
 
-    def test_signal_in_the_psql_spawn_window_terminates_the_psql_child(self):
-        # #6337: a handled signal between Popen() and the communicate() guard escaped the guard.
-        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-            with self.subTest(signal=signum.name):
-                r, child = self.run_signal_in_spawn_window(signum)
-                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
-                self.assertEqual(r.stderr.strip(), PREFIX + "interrupted")
-                self.assertNotIn(PW_MARKER, r.stdout + r.stderr)
-                self.assert_gone(child)
+    def test_a_signal_recorded_while_psql_runs_is_raised_when_the_guard_exits(self):
+        # #6507: the interrupt is held as a flag inside the guard and must surface when the guard ends.
+        mod = load_module()
+        with self.assertRaises(KeyboardInterrupt):
+            with mod.deferred_interrupts():
+                mod.note_interrupt(signal.SIGTERM, None)
+        with mod.deferred_interrupts():  # the flag does not leak into the next guard
+            pass
+        with self.assertRaises(KeyboardInterrupt):
+            mod.note_interrupt(signal.SIGTERM, None)  # outside the guard it raises at once
+
+    def test_main_installs_a_handler_for_every_interrupt_signal(self):
+        mod = load_module()
+        saved = {s: signal.getsignal(s) for s in signal.valid_signals() if s not in (signal.SIGKILL, signal.SIGSTOP)}
+        self.addCleanup(lambda: [signal.signal(s, h) for s, h in saved.items() if h is not None])
+        mod.install_interrupt_handlers()
+        handled = {s for s in saved if signal.getsignal(s) == mod.note_interrupt}
+        wanted = set(self.interrupt_signals())
+        self.assertTrue(wanted <= handled, sorted(int(s) for s in wanted - handled))
+        for name in NOT_INTERRUPT_SIGNALS:
+            if hasattr(signal, name) and getattr(signal, name) in saved:
+                self.assertNotEqual(signal.getsignal(getattr(signal, name)), mod.note_interrupt, name)
+
+    def test_docs_state_the_true_orphan_bound(self):
+        # #6504/#6517/#6505/#6520: no document claims a bound that only holds while psql connects.
+        mod = load_module()
+        texts = {
+            "docstring": " ".join(mod.__doc__.split()),
+            "docs": " ".join((ROOT / "docs/DEV-CI-ENVIRONMENT.md").read_text().split()),
+            "changelog": " ".join((ROOT / "changelog.d/6161.fixed.md").read_text().split()),
+        }
+        for where, text in texts.items():
+            with self.subTest(where=where):
+                self.assertIn("supervisor", text.lower())
+                self.assertNotIn("15 s per host", text)
+                self.assertNotIn("Every catchable signal", text)
+        self.assertIn("SIGKILL", texts["docstring"])
+        self.assertIn("SIGSTOP", texts["docstring"])
+
+    def test_connect_timeout_width_and_decoded_value_6509(self):
+        # #6509: two digits at most, and the rule applies to the percent-DECODED value.
+        for value in ("060", "015", "001", "0015", "%30%36%30"):
+            with self.subTest(refused=value):
+                self.assert_url_refused(
+                    f"postgres://ciuser:pw@127.0.0.1:5445/cidb?connect_timeout={value}", ("connect_timeout",))
+        mod = load_module()
+        for value in ("%31%35", "%36%30", "%35"):
+            with self.subTest(accepted=value):
+                url = f"postgres://ciuser@127.0.0.1:5445/cidb?connect_timeout={value}"
+                self.assertEqual(mod.psql_target(url), (url, None))
+        self.assert_url_refused(
+            "postgres://ciuser@127.0.0.1:5445/cidb?connect_timeout=%36%31", ("connect_timeout",))
+
+    def test_docstring_names_the_oracle_that_pins_the_claim(self):
+        # #6519: a docstring check needs no libpq, so it lives outside LibpqOracleTests (which skips without one).
+        doc = " ".join(load_module().__doc__.split())
+        self.assertIn("LibpqOracleTests", doc, "the parity claim must name the test class that pins it")
 
     def test_connect_timeout_must_be_a_bounded_positive_integer(self):
         # #6338: libpq reads connect_timeout=0 as "wait forever", which removes the orphan bound.
@@ -1149,6 +1405,20 @@ def load_libpq():
     return None
 
 
+def libpq_keywords(lib):
+    """Every connection keyword the installed libpq defines (PQconndefaults)."""
+    lib.PQconndefaults.restype = ctypes.POINTER(_ConninfoOption)
+    lib.PQconndefaults.argtypes = []
+    res = lib.PQconndefaults()
+    out, i = [], 0
+    while res and res[i].keyword:
+        out.append(res[i].keyword.decode())
+        i += 1
+    if res:
+        lib.PQconninfoFree(res)
+    return out
+
+
 def libpq_options(lib, url):
     """PQconninfoParse(url) -> {keyword: value bytes}, or None when libpq refuses the URL."""
     err = ctypes.c_char_p()
@@ -1282,9 +1552,20 @@ class LibpqOracleTests(unittest.TestCase):
                 continue
         self.assertGreaterEqual(accepted, 100, "the fuzz must reach accepted URLs, not only refusals")
 
-    def test_docstring_names_the_oracle_that_pins_the_claim(self):
-        doc = " ".join(self.mod.__doc__.split())
-        self.assertTrue("LibpqOracleTests" in doc, "the parity claim must name the test class that pins it")
+    def test_keyword_table_covers_the_installed_libpq(self):
+        # #6347 (a): every keyword the installed libpq defines is in LIBPQ_18_KEYWORDS (subset, since an older
+        # libpq on a runner defines fewer).  Dropping a keyword from the table, or a newer libpq adding one the
+        # helper has not classified, fails here.
+        real = libpq_keywords(self.lib)
+        self.assertGreaterEqual(len(real), 30, sorted(real))
+        self.assertEqual(sorted(set(real) - set(LIBPQ_18_KEYWORDS)), [])
+        self.assertTrue(set(real) & set(self.mod.ALLOWED_QUERY_KEYS), "the allowlist must overlap libpq")
+
+    def test_keyword_table_check_detects_a_dropped_keyword(self):
+        real = libpq_keywords(self.lib)
+        dropped = [k for k in LIBPQ_18_KEYWORDS if k != "user"]
+        self.assertIn("user", real)
+        self.assertEqual(sorted(set(real) - set(dropped)), ["user"])
 
     def test_oracle_detects_a_password_left_on_argv(self):
         def leaky(url):
