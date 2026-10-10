@@ -1859,3 +1859,203 @@ Status `in_progress`, conclusion `-`, created 2026-10-10T17:26:18Z, updated 2026
 | job id | job | runner | created | queue wait | started | ended | duration | conclusion |
 |---|---|---|---|---|---|---|---|---|
 | 114270335344 | CLAUDE.md rule-section guard | GitHub Actions 1000125687 | 17:26:18Z | 0.4 min | 17:26:40Z | 17:27:01 | 0.3 min | success |
+
+## Update 17:37Z: run 38071010718 Batman Mode acceptance gate (chain/promo6-ssh-r2 @ e60080e02) changed to queued/
+
+Status `queued`, conclusion `-`, created 2026-10-10T17:15:43Z, updated 2026-10-10T17:36:57Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071010718
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114268237377 | Surface stability (load-bearing symbols) | GitHub Actions 1000125583 | 17:15:44Z | 0.3 min | 17:16:02Z | 17:16:11 | 0.1 min | success |
+| 114268237601 | Rust integration (issue_800_batman_mode) | GitHub Actions 1000125587 | 17:15:44Z | 0.4 min | 17:16:06Z | 17:36:57 | 20.9 min | success |
+| 114272518032 | Bash integration (test-batman-mode-suite.sh) | - | 17:36:57Z | 0.0 min | 17:36:57Z |  | - | queued |
+
+## Update 17:37Z: run 38071010734 Release-shaped build + PostgreSQL TLS proof (#4480) (chain/promo6-ssh-r2 @ e60080e02) reached terminal state
+
+Status `completed`, conclusion `success`, created 2026-10-10T17:15:43Z, updated 2026-10-10T17:33:04Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071010734
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114268237630 | Release-shaped build + PG TLS proof | GitHub Actions 1000125597 | 17:15:44Z | 1.0 min | 17:16:42Z | 17:33:03 | 16.4 min | success |
+
+## Update 17:37Z: run 38071010776 Bench (chain/promo6-ssh-r2 @ e60080e02) reached terminal state
+
+Status `completed`, conclusion `success`, created 2026-10-10T17:15:43Z, updated 2026-10-10T17:31:31Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071010776
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114268237689 | ai-memory bench (ubuntu-latest) | GitHub Actions 1000125584 | 17:15:44Z | 0.3 min | 17:16:03Z | 17:31:30 | 15.4 min | success |
+| 114268239201 | Regenerate bench baseline (ubuntu-latest, median-of-3) | - | 17:15:44Z | 0.0 min | 17:15:44Z | 17:15:44 | 0.0 min | skipped |
+
+## Update 17:37Z: run 38071010834 token-budget (chain/promo6-ssh-r2 @ e60080e02) reached terminal state
+
+Status `completed`, conclusion `success`, created 2026-10-10T17:15:43Z, updated 2026-10-10T17:33:27Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071010834
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114268238090 | token-budget gates | GitHub Actions 1000125595 | 17:15:44Z | 0.8 min | 17:16:32Z | 17:33:26 | 16.9 min | success |
+
+## Update 17:37Z: run 38071731938 Per-Module Coverage Thresholds (fix/6174-promo6-ssh-ci3 @ 11adfbf2d) changed to in_progress/
+
+Status `in_progress`, conclusion `-`, created 2026-10-10T17:26:17Z, updated 2026-10-10T17:33:20Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071731938
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114270334659 | Coverage classify (docs-only short-circuit) | GitHub Actions 1000125691 | 17:26:18Z | 0.8 min | 17:27:09Z | 17:27:18 | 0.1 min | success |
+| 114270530793 | Per-Module Coverage Thresholds | GitHub Actions 1000125758 | 17:27:18Z | 6.0 min | 17:33:19Z |  | - | in_progress |
+
+## Update 17:37Z: run 38071731978 CodeQL (fix/6174-promo6-ssh-ci3 @ 11adfbf2d) changed to in_progress/
+
+Status `in_progress`, conclusion `-`, created 2026-10-10T17:26:17Z, updated 2026-10-10T17:29:45Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071731978
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114270334810 | CodeQL analysis (rust) | GitHub Actions 1000125701 | 17:26:18Z | 1.8 min | 17:28:07Z |  | - | in_progress |
+| 114270334927 | CodeQL analysis (javascript-typescript) | GitHub Actions 1000125704 | 17:26:18Z | 2.1 min | 17:28:22Z | 17:29:24 | 1.0 min | success |
+| 114270334932 | CodeQL analysis (actions) | GitHub Actions 1000125703 | 17:26:18Z | 2.0 min | 17:28:16Z | 17:29:05 | 0.8 min | success |
+| 114270334958 | CodeQL analysis (python) | GitHub Actions 1000125712 | 17:26:18Z | 3.5 min | 17:29:45Z | 17:31:22 | 1.6 min | success |
+
+## Update 17:37Z: run 38071732014 token-budget (fix/6174-promo6-ssh-ci3 @ 11adfbf2d) changed to in_progress/
+
+Status `in_progress`, conclusion `-`, created 2026-10-10T17:26:17Z, updated 2026-10-10T17:27:07Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071732014
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114270335050 | token-budget gates | GitHub Actions 1000125690 | 17:26:18Z | 0.8 min | 17:27:06Z |  | - | in_progress |
+
+## Update 17:37Z: run 38071732070 tool-count-drift (fix/6174-promo6-ssh-ci3 @ 11adfbf2d) reached terminal state
+
+Status `completed`, conclusion `success`, created 2026-10-10T17:26:17Z, updated 2026-10-10T17:27:12Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071732070
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114270335142 | tool-count grep gate | GitHub Actions 1000125689 | 17:26:18Z | 0.8 min | 17:27:03Z | 17:27:11 | 0.1 min | success |
+
+## Update 17:37Z: run 38071732185 CLAUDE.md guard (fix/6174-promo6-ssh-ci3 @ 11adfbf2d) reached terminal state
+
+Status `completed`, conclusion `success`, created 2026-10-10T17:26:18Z, updated 2026-10-10T17:27:02Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071732185
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114270335344 | CLAUDE.md rule-section guard | GitHub Actions 1000125687 | 17:26:18Z | 0.4 min | 17:26:40Z | 17:27:01 | 0.3 min | success |
+
+## Update 17:37Z: run 38071909608 Bench (fix/6161-promo6-ssh @ 47545e143) appeared
+
+Status `in_progress`, conclusion `-`, created 2026-10-10T17:28:55Z, updated 2026-10-10T17:35:34Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071909608
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114270870364 | ai-memory bench (ubuntu-latest) | GitHub Actions 1000125807 | 17:28:56Z | 6.6 min | 17:35:33Z |  | - | in_progress |
+| 114270871401 | Regenerate bench baseline (ubuntu-latest, median-of-3) | - | 17:28:56Z | 0.0 min | 17:28:56Z | 17:28:55 | -0.0 min | skipped |
+
+## Update 17:37Z: run 38071909617 CodeQL (fix/6161-promo6-ssh @ 47545e143) appeared
+
+Status `queued`, conclusion `-`, created 2026-10-10T17:28:55Z, updated 2026-10-10T17:28:55Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071909617
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114270870345 | CodeQL analysis (javascript-typescript) | GitHub Actions 1000125811 | 17:28:56Z | 6.8 min | 17:35:47Z | 17:36:47 | 1.0 min | success |
+| 114270870502 | CodeQL analysis (actions) | GitHub Actions 1000125823 | 17:28:56Z | 8.1 min | 17:37:02Z |  | - | in_progress |
+| 114270870546 | CodeQL analysis (rust) | GitHub Actions 1000125826 | 17:28:56Z | 8.4 min | 17:37:22Z |  | - | in_progress |
+| 114270870617 | CodeQL analysis (python) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+
+## Update 17:37Z: run 38071909640 CI (fix/6161-promo6-ssh @ 47545e143) appeared
+
+Status `queued`, conclusion `-`, created 2026-10-10T17:28:55Z, updated 2026-10-10T17:28:55Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071909640
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114270870563 | Build-script custom-build ledger gate (#2635) | GitHub Actions 1000125824 | 17:28:56Z | 8.2 min | 17:37:06Z |  | - | in_progress |
+| 114270871117 | Classify changes | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+
+## Update 17:37Z: run 38071909650 Certified Postgres + AGE + pgvector tier (#2548) (fix/6161-promo6-ssh @ 47545e143) appeared
+
+Status `queued`, conclusion `-`, created 2026-10-10T17:28:55Z, updated 2026-10-10T17:28:55Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071909650
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114270870160 | Certified pg+AGE cells (live PG 18.6 + AGE 1.8.0 + pgvector 0.8.6) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+
+## Update 17:37Z: run 38071909651 Per-Module Coverage Thresholds (fix/6161-promo6-ssh @ 47545e143) appeared
+
+Status `queued`, conclusion `-`, created 2026-10-10T17:28:55Z, updated 2026-10-10T17:35:34Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071909651
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114270870341 | Coverage classify (docs-only short-circuit) | GitHub Actions 1000125804 | 17:28:56Z | 6.5 min | 17:35:24Z | 17:35:34 | 0.2 min | success |
+| 114272241534 | Per-Module Coverage Thresholds | - | 17:35:34Z | 0.0 min | 17:35:34Z |  | - | queued |
+
+## Update 17:37Z: run 38071909662 Postgres ignored tests (#3274) (fix/6161-promo6-ssh @ 47545e143) appeared
+
+Status `queued`, conclusion `-`, created 2026-10-10T17:28:55Z, updated 2026-10-10T17:28:55Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071909662
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114270870701 | Postgres ignored tests (sal-postgres --ignored) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+
+## Update 17:37Z: run 38071909666 c8-precheck (fix/6161-promo6-ssh @ 47545e143) appeared
+
+Status `queued`, conclusion `-`, created 2026-10-10T17:28:55Z, updated 2026-10-10T17:28:55Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071909666
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114270870764 | C8 caller-context allowlist check | GitHub Actions 1000125812 | 17:28:56Z | 7.0 min | 17:35:57Z | 17:36:26 | 0.5 min | success |
+| 114270870904 | Capacity-claim ceiling gate (#2869) | GitHub Actions 1000125817 | 17:28:56Z | 7.5 min | 17:36:27Z | 17:36:41 | 0.2 min | success |
+| 114270870936 | SQLite write-transaction IMMEDIATE gate (#5084) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270870951 | Required-context + classify-base soundness gate (#2494/#2496/#2508) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270870953 | Non-Rust conformance-reader proof gate (#2452) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270870961 | Hardcoded-literal duplication ratchet (pm-v3.1) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270870969 | Cloud-init ASCII gate | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270870970 | Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270870975 | Benchmark-claim canon gate (#2879) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270870988 | Git-dependency-source supply-chain gate (#2050/#2512) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270870989 | Doc symbol/path anchor gate (#2629) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871002 | Test key-dir mode gate (#3733) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871004 | CREATE EXTENSION allowlist gate (#2648) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871005 | Truthy-grammar consolidation gate (#3200) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871006 | Enterprise-federation cert-expiry gate (cert §7 / F7) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871019 | Foreign-text-to-caller gate (#3688 gate 7) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871028 | Migration-ladder-uniqueness gate (guardrail-D) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871043 | SDK-path vs routes.rs membership gate (#2629) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871049 | L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871057 | Docs vs SSOT drift gate | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871058 | Const-name-literal identifier gate (#3121) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871059 | MCP transport-isolation gate (#3829) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871063 | Test-reachable stdin-read gate (#1989) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871089 | Named-CI-job existence + enforcement-truthfulness gate (#2629) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871103 | SDK TLS-scheme + CA-trust gate (#3782) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871107 | Declaration hash gate (#3557) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871116 | External-PR operator-approval gate (author outside team => @alphaonedev review) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871144 | Installer checksum fail-closed gate (#2449) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871159 | Commit-signing posture gate (#2486) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871176 | URL-sink redaction gate (#3688 / #3967) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871177 | Count-assertion declaration gate (#5499) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871189 | Test-env $HOME-lock gate (#2146) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871207 | Stale contract-assertion gate (#3688 / #3967) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871215 | Claude plugin manifest gate (#3967) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871223 | No-credentials-on-argv gate (#4577) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+| 114270871242 | Doc surface completeness gate (#2839) | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
+
+## Update 17:37Z: run 38071909669 CLAUDE.md guard (fix/6161-promo6-ssh @ 47545e143) appeared and finished
+
+Status `completed`, conclusion `success`, created 2026-10-10T17:28:55Z, updated 2026-10-10T17:36:26Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071909669
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114270870681 | CLAUDE.md rule-section guard | GitHub Actions 1000125813 | 17:28:56Z | 7.0 min | 17:35:59Z | 17:36:25 | 0.4 min | success |
+
+## Update 17:37Z: run 38071909688 token-budget (fix/6161-promo6-ssh @ 47545e143) appeared
+
+Status `in_progress`, conclusion `-`, created 2026-10-10T17:28:55Z, updated 2026-10-10T17:37:00Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071909688
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114270870948 | token-budget gates | GitHub Actions 1000125822 | 17:28:56Z | 8.1 min | 17:36:59Z |  | - | in_progress |
+
+## Update 17:37Z: run 38071909767 tool-count-drift (fix/6161-promo6-ssh @ 47545e143) appeared
+
+Status `queued`, conclusion `-`, created 2026-10-10T17:28:55Z, updated 2026-10-10T17:28:55Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071909767
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114270870968 | tool-count grep gate | - | 17:28:56Z | 0.0 min | 17:28:56Z |  | - | queued |
