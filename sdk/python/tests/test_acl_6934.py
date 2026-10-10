@@ -156,6 +156,35 @@ def test_group_acl_write_is_refused_6934(acl_fs: pathlib.Path, client_cls: type)
         _built(client_cls, str(bundle))
 
 
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_group_zero_acl_write_is_refused_not_mistaken_for_root_6934(
+    acl_fs: pathlib.Path, client_cls: type
+) -> None:
+    """``group:wheel`` is gid 0: an id-only comparison would take it for the user root."""
+    directory = _ca_dir(acl_fs)
+    bundle = _ca(directory)
+    try:
+        _chmod_acl(bundle, "group:wheel allow write")
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("this host has no group named wheel")
+    with pytest.raises(ValueError, match="ACL"):
+        _built(client_cls, str(bundle))
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_root_user_acl_write_is_not_a_foreign_principal_6934(
+    acl_fs: pathlib.Path, client_cls: type
+) -> None:
+    """Control for the group-zero test: the USER root may hold the right (it can change any file)."""
+    directory = _ca_dir(acl_fs)
+    bundle = _ca(directory)
+    try:
+        _chmod_acl(bundle, "user:root allow write")
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("this host has no user named root")
+    _built(client_cls, str(bundle))
+
+
 @pytest.mark.parametrize(
     "entry",
     [
@@ -415,3 +444,17 @@ def test_unreadable_acl_refuses_the_key_fail_closed_6934(
     assert descriptors, "the key reader must consult the ACL layer"
     with pytest.raises(WakeError, match="cannot be read"):
         DelegationBundle.load(key)
+
+
+@_POSIX_ONLY
+def test_acl_is_read_from_the_directory_the_mode_rules_judged_6934(
+    tmp_path: pathlib.Path, stub_acl: SimpleNamespace
+) -> None:
+    """The directory opened for its ACL must be the inode ``held`` describes (swap between stat and open)."""
+    judged = _ca_dir(tmp_path, "judged")
+    swapped_in = _ca_dir(tmp_path, "swapped-in")
+    _common._refuse_foreign_acl_on_directory("CA path", str(judged), str(judged), os.stat(judged))
+    with pytest.raises(ValueError, match="changed while its ACL was being read"):
+        _common._refuse_foreign_acl_on_directory(
+            "CA path", str(judged), str(swapped_in), os.stat(judged)
+        )
