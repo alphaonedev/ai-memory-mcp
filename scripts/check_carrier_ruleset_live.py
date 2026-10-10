@@ -384,7 +384,7 @@ def live_rulesets(repo, run=gh_run):
                 detail = loads_strict(run([f"repos/{repo}/rulesets/{rid}"]))
             except ValueError as exc:
                 raise VerifyError(f"ruleset {rid} detail unreadable: {exc}") from exc
-            if not (isinstance(detail, dict) and detail.get("id") == rid
+            if not (isinstance(detail, dict) and is_int_id(detail.get("id")) and detail["id"] == rid
                     and isinstance(detail.get("target"), str) and isinstance(detail.get("enforcement"), str)):
                 raise VerifyError(f"ruleset {rid} detail unreadable: not the requested ruleset")
             out.append(detail)
@@ -399,7 +399,7 @@ def live_issue_state(repo, run=gh_run):
             data = loads_strict(run([f"repos/{repo}/issues/{int(number)}"]))
         except ValueError as exc:
             raise VerifyError(f"issue response unparseable: {exc}") from exc
-        if not (isinstance(data, dict) and data.get("number") == number
+        if not (isinstance(data, dict) and is_int_id(data.get("number")) and data["number"] == number
                 and data.get("state") in ("open", "closed")):
             raise VerifyError(f"issue #{number} response is not that issue")
         if "pull_request" in data:
