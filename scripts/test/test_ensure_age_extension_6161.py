@@ -365,6 +365,19 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assert_restored()
         self.assert_dest_modes_match_sources()
 
+    def test_a_writable_destination_with_the_right_bytes_is_restored_7016(self):
+        # #7016: right bytes are not enough; a group- or world-writable library in pkglibdir is not healthy.
+        for mode in (0o666, 0o620, 0o646):
+            with self.subTest(mode=oct(mode)):
+                self.install_good()
+                (self.lib / "age.dylib").chmod(mode)
+                (self.ext / "age.control").chmod(mode)
+                r = self.run_script()
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("restored", r.stdout)
+                self.assert_restored()
+                self.assert_dest_modes_match_sources()
+
     def test_present_extension_is_a_noop(self):
         self.install_good()
         before = {p: p.stat().st_ino for p in list(self.lib.iterdir()) + list(self.ext.iterdir())}
