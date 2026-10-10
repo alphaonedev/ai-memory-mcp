@@ -93,6 +93,7 @@ Run:  python3 scripts/test/test_ci_runner_target_hygiene_6118.py
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import inspect
 import io
 import json
@@ -2798,6 +2799,27 @@ class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
                                                 '    runs-on: [self-hosted, "${{ inputs.extra }}"]\n'))
             self.assertTrue(any(v.startswith("R-SHAPE") and "runs-on value is itself an expression" in v
                                 for v in found), found)
+
+
+    def test_6118_r7_6729_reviewed_program_is_accepted_only_at_its_pinned_bytes(self) -> None:
+        # CI v2 (#6344) runs python3 scripts/ci/partition_test_binaries.py in the self-hosted check job; its
+        # output lines become cargo arguments, so it is accepted only while its text is the reviewed text.
+        path = "scripts/ci/partition_test_binaries.py"
+        reviewed = (ROOT / path).read_text(encoding="utf-8-sig")
+        with self.subTest("live repository at the reviewed bytes is clean"):
+            self.assertEqual([], all_violations(self.live), path)
+        with self.subTest("one edited byte re-raises the finding and names both hashes"):
+            edited = reviewed + "# edited\n"
+            found = all_violations(self.live, None, {path: edited})
+            want = hashlib.sha256(edited.encode("utf-8")).hexdigest()
+            self.assertTrue(any("R-DEBUG" in v and path in v and "re-review" in v and want in v
+                                and REVIEWED_PROGRAMS[path] in v for v in found), found)
+        with self.subTest("an unpinned python program is still a finding"):
+            ci = self.ci.replace("python3 " + path, "python3 scripts/ci/unreviewed_6729.py", 1)
+            self.assertNotEqual(self.ci, ci)
+            found = self._mutated(ci)
+            self.assertTrue(any("R-DEBUG" in v and "scripts/ci/unreviewed_6729.py" in v
+                                and "a program the guard cannot read" in v for v in found), found)
 
 
     def _prune_flagged(self, cases: List[Tuple[str, List[str]]], want: bool) -> None:
