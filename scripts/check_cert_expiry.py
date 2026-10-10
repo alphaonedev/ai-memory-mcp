@@ -1678,6 +1678,34 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     tc = fx.commit(["src/mask_def.rs"], "trailing-comment-added: a trailing comment added to the definition")
     t.expect_red("trailing-comment-added", "a trailing comment added to the defining line",
                  repo, mk0, tc, [(f"- {kid}", "did not name the drifted identifier")])
+    # (value-edit-ws / value-edit-case / value-trim-nbsp, #6720) the line key is
+    #       the line text trimmed of leading and trailing Unicode blanks and
+    #       nothing else: an interior-whitespace-only edit and a case-only edit of
+    #       the value ON the identifier line are RED, and a trailing U+00A0 is
+    #       trimmed like any other blank (GREEN, the re-indent rule). Each pins one
+    #       normalisation a refactor of the key must not add (whitespace collapse,
+    #       case folding) or drop (Unicode-aware trim).
+    ws_line = f'let s = env_or("{kid}", "a  b");\n'
+    case_line = f'let c = env_or("{kid}", "on");\n'
+    fx.g("checkout", "-q", "-B", "mo-norm-base", mk0)
+    fx.write("src/mask_ws.rs", ws_line)
+    fx.write("src/mask_case.rs", case_line)
+    nb = fx.commit(["src/mask_ws.rs", "src/mask_case.rs"], "norm base: values on the identifier line")
+    fx.g("checkout", "-q", "-B", "mo-value-ws", nb)
+    fx.write("src/mask_ws.rs", ws_line.replace("a  b", "a b"))
+    hw = fx.commit(["src/mask_ws.rs"], "value-edit-ws: two spaces to one inside the value")
+    t.expect_red("value-edit-ws", "an interior-whitespace-only edit of the value on the identifier line",
+                 repo, nb, hw, [(f"- {kid}", "did not name the drifted identifier")])
+    fx.g("checkout", "-q", "-B", "mo-value-case", nb)
+    fx.write("src/mask_case.rs", case_line.replace('"on"', '"On"'))
+    hc = fx.commit(["src/mask_case.rs"], "value-edit-case: one letter's case changed in the value")
+    t.expect_red("value-edit-case", "a case-only edit of the value on the identifier line",
+                 repo, nb, hc, [(f"- {kid}", "did not name the drifted identifier")])
+    fx.g("checkout", "-q", "-B", "mo-value-nbsp", nb)
+    fx.write("src/mask_case.rs", case_line.replace(";\n", ";\u00a0\n"))
+    hn = fx.commit(["src/mask_case.rs"], "value-trim-nbsp: a trailing U+00A0 on the identifier line")
+    t.expect_green("value-trim-nbsp", "a trailing U+00A0 added to the identifier line (trimmed blank)",
+                   repo, nb, hn)
     fx.reset(base)
     fx.g("update-ref", "refs/remotes/origin/main", base)
     # (doc-bound, #6563 / #6561) the docstring, the OK banner and the #6427
@@ -1696,7 +1724,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         t.fail("(doc-bound): the module docstring still says a value-only edit outside the "
                "path watches is never seen; a value edited on the identifier line is drift")
     # (#6626) the banner may claim a value edit only if a cell edits one.
-    for needle in ("(trailing-comment-added)", "(value-edit-5-to-6)"):
+    for needle in ("(trailing-comment-added)", "(value-edit-5-to-6)", "(value-edit-ws)",
+                   "(value-edit-case)", "(value-trim-nbsp)"):
         if needle not in SELF_TEST_OK:
             t.fail(f"(doc-bound): the OK banner does not name {needle}; the value-edit claim "
                    "must be pinned by a cell that changes a value (#6626)")
