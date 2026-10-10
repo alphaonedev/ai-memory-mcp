@@ -45,7 +45,10 @@ _TOKEN_SHAPE = re.compile(r"(gh[pousr]_|github_pat_)[A-Za-z0-9_]{8,}")
 # A key (a word, optionally quoted) and its ``:`` or ``=``; the lookbehind starts a match only at the
 # start of a word, so the scan is linear in the text (no nested backtracking).
 _PAIR_KEY = re.compile(r"(?<![\w.-])([\w.-]+)['\"]?[ \t]*[:=][ \t]*")
-_CREDENTIAL_WORD = re.compile(r"token|secret|password|passwd|credential|api[_-]?key|private[_-]?key", re.IGNORECASE)
+# #6739: the credential vocabulary (substring match on the key name, any letter case).
+_CREDENTIAL_WORD = re.compile(
+    r"token|secret|pass|pwd|credential|api[_-]?key|private[_-]?key|access[_-]?key|auth|bearer|session|cookie|signing",
+    re.IGNORECASE)
 _PAIR_VALUE = re.compile(r"[^\s,\]}#][^,\]}#]*")
 _KEPT_VALUES = ("${{", "'${{", '"${{', "<withheld ")
 
