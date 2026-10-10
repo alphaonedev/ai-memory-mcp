@@ -41,6 +41,8 @@ mod dns_guard_4165_tests;
 #[cfg(test)]
 mod webhook_proxy_6372_tests;
 #[cfg(test)]
+mod webhook_tls_default_port_6401_tests;
+#[cfg(test)]
 mod webhook_url_6371_tests;
 // #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
 mod unstarted;
