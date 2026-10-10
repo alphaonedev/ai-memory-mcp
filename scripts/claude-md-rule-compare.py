@@ -269,8 +269,8 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
     # option echoes it back) is refused.
     if git(repo, "rev-parse", "--is-shallow-repository").decode().strip() != "false":
         raise RuntimeError("the repository is shallow (or git cannot say); the comparison needs full history (#6573)")
-    # #6712: a legacy graft file (old git still honours it, new git ignores it) rewrites parents the same way a replace
-    # object does and cannot be switched off per call, so a repository that has one, or a GIT_GRAFT_FILE override, is refused.
+    # #6712, #6817: current git (2.43, 2.54) still honours a graft file and GIT_NO_REPLACE_OBJECTS does not disable it;
+    # nothing switches it off per call, so this refusal (info/grafts or GIT_GRAFT_FILE) is the only control against it.
     graft_path = git(repo, "rev-parse", "--git-path", "info/grafts").decode().strip()
     if "GIT_GRAFT_FILE" in os.environ or os.path.lexists(repo / graft_path):
         raise RuntimeError("the repository has a graft file (info/grafts or GIT_GRAFT_FILE); the comparison needs the "
