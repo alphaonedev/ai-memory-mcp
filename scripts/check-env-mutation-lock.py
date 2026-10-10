@@ -568,7 +568,8 @@ class Index:
             if name == ISOLATED_CHILD_FN:
                 kinds.add("ISO")
                 continue
-            tg = [t for t in self.resolve(fn.file, q, name) if id(t) in self.acquirers]
+            tg = [t for t in self.resolve(fn.file, q, name)
+                  if id(t) in self.acquirers or self.yields_guard(t)]
             if tg and self.guard_live(info, coff, off):
                 for t in tg:
                     kinds |= self.acq_kinds.get(id(t), {"A"})

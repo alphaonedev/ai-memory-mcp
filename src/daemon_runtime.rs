@@ -10388,10 +10388,10 @@ mod tests {
     /// #2127) and #3517 reports for the caller principal.
     ///
     /// It now DELEGATES to the one canonical lock, so the critical section is
-    /// genuinely process-wide. LOCK ORDER (CONCURRENCY-04): the two tests that
-    /// also hold `crate::test_support::env_lock()` take THAT first and this
-    /// one second; no site anywhere takes them in the opposite order, so the
-    /// pair cannot cycle. Nothing here may acquire
+    /// genuinely process-wide. The mutex is NOT re-entrant (CONCURRENCY-04):
+    /// a test holds exactly one of this wrapper, `test_support::env_lock()`
+    /// and `no_passphrase_guard()`, never two (#6123; the gate rejects it).
+    /// Nothing here may acquire
     /// `identity::agent_id_env_test_lock()` (or `agent_id_env_unset_guard()`)
     /// directly as well — `std::sync::Mutex` is not reentrant.
     fn env_var_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -12590,7 +12590,8 @@ mod tests {
         // (CONCURRENCY-04): the env mutex FIRST, the caller-identity lock
         // second — the order every other site here uses.
         let iso = crate::test_support::PassphraseEnvIsolation::enter();
-        let _g = env_var_lock();
+        // #6123 — `iso` already holds the one env mutex; `env_var_lock()` is
+        // the same mutex, so taking it here would self-deadlock.
         let _pass = crate::storage::connection::DbPassphraseGuard::enter(&iso);
         let env = TestEnv::fresh();
         let pass_path = env.db_path.with_file_name("pass");
@@ -13354,7 +13355,8 @@ decision = "allow"
         // below forces `resolve_operator_pubkey()` to return None
         // for the test scope, matching the CI posture deterministically.
         let _no_pubkey_guard = crate::governance::rules_store::force_no_operator_pubkey_for_test();
-        let _gate = env_var_lock();
+        // #6123 — `_no_pass` (above) already holds the one env mutex; taking
+        // `env_var_lock()` as well would self-deadlock.
         let env = TestEnv::fresh();
         let conn = db::open(&env.db_path).unwrap();
         // Create the governance_rules table + insert one enabled row.
