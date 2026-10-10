@@ -1168,6 +1168,18 @@ pub fn open_existing_read_only(path: &Path) -> Result<Connection> {
         Ok(true) => {}
         Err(e) => anyhow::bail!("cannot stat {}: {e}", path.display()),
     }
+    // #6374 — only a regular file is a database. SQLite's open(2) of a FIFO
+    // with no writer blocks forever, so refuse every non-regular file type
+    // (FIFO, socket, device, directory) BEFORE the open (fail closed, per
+    // ERRORS-19). `metadata` follows symlinks and never blocks.
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => {}
+        Ok(_) => anyhow::bail!(
+            "{}: not a regular file; refusing to open as a database",
+            path.display()
+        ),
+        Err(e) => anyhow::bail!("cannot stat {}: {e}", path.display()),
+    }
     let conn = open_read_only(path)?;
     let target = path.display().to_string();
     // Diagnose schema-ahead / poisoned / zeroed WITHOUT migrating so
