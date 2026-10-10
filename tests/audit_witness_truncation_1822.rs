@@ -38,6 +38,8 @@
 
 #![allow(clippy::missing_panics_doc)]
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -741,23 +743,18 @@ mod postgres_parity {
     #[tokio::test]
     #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — live postgres"]
     async fn pg_head_hash_clean_chain_not_detected_and_rewrite_mismatch() {
-        let Some(pg) = live_pg().await else {
+        // #7031 H3: run in a private schema. The old `DELETE FROM agent_lineage`
+        // on the shared base removed every row but left the durable
+        // `lineage_integrity_watermark` high-water mark standing, so every later
+        // clone failed IntegrityFailed (#6983). A fresh schema starts with an
+        // empty lineage table (the #2843 residue concern) and shares nothing.
+        let Some(env) = super::common::postgres_env::PostgresTestEnv::new("pg_hh_1822").await
+        else {
             return;
         };
-        // #2843 test-isolation: the lan-parity Pass-2 suite serializes every
-        // live-pg test binary against the SHARED `ai_memory_test` DB. Sibling
-        // #1831 G17 M-of-N recovery tests seed `agent_lineage` rows for
-        // `ai:rec-*` agents with no matching signed_events witness, so a stale
-        // residue makes `verify_audit_trail` correctly return
-        // `lineage: Forged` — which is NOT what this head-hash test exercises.
-        // Clear the lineage table so the clean-chain precondition is
-        // order-independent (agent_lineage is NOT part of the signed_events
-        // hash chain, so this never perturbs the head-hash / truncation /
-        // chain-intact axes under test). Fresh-DB runs start empty → no-op.
-        sqlx::query("DELETE FROM agent_lineage")
-            .execute(pg.pool())
+        let pg = PostgresStore::connect(env.url())
             .await
-            .ok();
+            .expect("connect scoped schema");
         let fdir = fresh_dir("pg-hh-forensic");
         // Live forensic sink so `maybe_record_audit_watermark` writes and
         // `last_audit_watermark` reads (process-global; torn down at the end).

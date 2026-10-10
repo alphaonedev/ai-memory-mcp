@@ -367,7 +367,20 @@ class TierSteps(unittest.TestCase):
             rc = pib.main(['setup', '--db', 'ai_memory_test_ci_9_1_x', '--jobs', '8', '--run-id', RUN,
                            '--emit-env'])
         self.assertEqual(rc, 0)
-        self.assertEqual(out, ['%s=%s' % (pib.TEMPLATE_VAR, TPL), '%s=%s' % (pib.RUN_ID_VAR, RUN)])
+        self.assertEqual(out, ['%s=%s' % (pib.TEMPLATE_VAR, TPL), '%s=%s' % (pib.RUN_ID_VAR, RUN),
+                               '%s=ai_memory_test_ci_9_1_x' % pib.BASE_VAR,
+                               '%s=%s' % (pib.URL_VAR, pib.mask_url_password(BASE))])
+        self.assertNotIn('pw@', ''.join(out))
+
+    def test_setup_emit_env_unmasked_prints_the_real_url(self):
+        out = []
+        with mock.patch.object(pib.subprocess, 'run', Recorder()), \
+                mock.patch.dict(os.environ, {pib.URL_VAR: BASE}, clear=False), \
+                mock.patch.object(pib, '_emit', out.append):
+            rc = pib.main(['setup', '--db', 'ai_memory_test_ci_9_1_x', '--run-id', RUN,
+                           '--emit-env', '--emit-env-unmasked'])
+        self.assertEqual(rc, 0)
+        self.assertIn('%s=%s' % (pib.URL_VAR, BASE), out)
 
     def test_teardown_drops_only_this_runs_clones_without_force(self):
         def answer(argv, kw):
@@ -645,6 +658,266 @@ class MainRun(unittest.TestCase):
                 self.assertEqual(pib.main(argv), pib.EXIT_USAGE, missing)
 
 
+class SharedBaseRefusal7031(unittest.TestCase):
+    """#7031 H1: setup refuses a shared base; mints an ephemeral one by default."""
+
+    SHARED = 'postgres://u:pw@127.0.0.1:5445/ai_memory_test'
+
+    def run_main(self, argv, env=None):
+        import io
+        import contextlib
+        out, err = io.StringIO(), io.StringIO()
+        clean = {k: v for k, v in os.environ.items() if not k.startswith('AI_MEMORY_TEST_')}
+        clean.update(env or {})
+        with Patched() as rec, mock.patch.dict(os.environ, clean, clear=True), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = pib.main(argv)
+        return rc, rec, out.getvalue(), err.getvalue()
+
+    def test_7031_shared_db_flag_is_refused(self):
+        rc, rec, _, err = self.run_main(['setup', '--url', self.SHARED, '--db', 'ai_memory_test'])
+        self.assertEqual(rc, pib.EXIT_USAGE, err)
+        self.assertEqual(rec.sql(), [], 'no SQL may run against a refused base')
+
+    def test_7031_non_ephemeral_db_flag_is_refused(self):
+        rc, rec, _, _ = self.run_main(['setup', '--url', self.SHARED, '--db', 'some_other_db'])
+        self.assertEqual(rc, pib.EXIT_USAGE)
+        self.assertEqual(rec.sql(), [])
+
+    def test_7031_empty_reason_is_refused(self):
+        for reason in ('', '   '):
+            rc, rec, _, err = self.run_main(['setup', '--url', self.SHARED, '--db', 'ai_memory_test',
+                                             '--allow-shared-base', reason])
+            self.assertEqual(rc, pib.EXIT_USAGE, repr(reason))
+            self.assertIn('needs a non-empty REASON', err, repr(reason))
+            self.assertEqual(rec.sql(), [])
+
+    def test_7031_zero_width_reason_is_refused(self):
+        rc, rec, _, err = self.run_main(['setup', '--url', self.SHARED, '--db', 'ai_memory_test',
+                                         '--allow-shared-base', '\u200b'])
+        self.assertEqual(rc, pib.EXIT_USAGE)
+        self.assertIn('needs a non-empty REASON', err)
+        self.assertEqual(rec.sql(), [])
+
+    def test_7031_reason_is_accepted_and_logged(self):
+        rc, rec, _, err = self.run_main(['setup', '--url', self.SHARED, '--db', 'ai_memory_test',
+                                         '--allow-shared-base', 'local repro of #6983'])
+        self.assertEqual(rc, 0, err)
+        self.assertIn('local repro of #6983', err)
+        self.assertTrue(any(s.startswith('CREATE DATABASE "ai_memory_test_tpl"') for s in rec.sql()))
+
+    def test_7031_default_mints_ci_base_with_extensions(self):
+        rc, rec, out, err = self.run_main(['setup', '--url', self.SHARED, '--emit-env'])
+        self.assertEqual(rc, 0, err)
+        creates = [s for s in rec.sql() if re.fullmatch(r'CREATE DATABASE "ci_base_\w+"', s) and not s.endswith('_tpl"')]
+        self.assertEqual(len(creates), 1, rec.sql())
+        name = re.search(r'"(ci_base_[^"]+)"', creates[0]).group(1)
+        self.assertRegex(name, r'^ci_base_\d+_')
+        ext = [(a, k) for a, k in rec.calls
+               if any('CREATE EXTENSION IF NOT EXISTS age' in x and 'vector' in x for x in a)]
+        self.assertTrue(ext, 'age + vector installed in the minted base')
+        self.assertTrue(any(k['env']['PGDATABASE'] == name for _, k in ext))
+        lines = out.splitlines()
+        self.assertIn('%s=%s' % (pib.BASE_VAR, name), lines)
+        self.assertIn('%s=postgres://u:***@127.0.0.1:5445/%s' % (pib.URL_VAR, name), lines)
+        self.assertNotIn('pw@', out)
+
+    def test_7031_ephemeral_urls_pass_without_minting(self):
+        for db in ('ai_memory_test_ci_9_1_x', 'ci_base_1_2_abc'):
+            url = 'postgres://u:pw@127.0.0.1:5445/' + db
+            rc, rec, out, err = self.run_main(['setup', '--url', url, '--emit-env'])
+            self.assertEqual(rc, 0, err)
+            self.assertFalse([s for s in rec.sql() if s.startswith('CREATE DATABASE') and not s.endswith('_tpl"')], db)
+            self.assertIn('%s=%s' % (pib.BASE_VAR, db), out.splitlines())
+
+    def test_7031_teardown_drops_minted_base_without_force(self):
+        url = 'postgres://u:pw@127.0.0.1:5445/ci_base_1_2_abc'
+        rc, rec, _, err = self.run_main(['teardown', '--url', url, '--run-id', RUN],
+                                        {pib.BASE_VAR: 'ci_base_1_2_abc'})
+        self.assertEqual(rc, 0, err)
+        drops = [s for s in rec.sql() if s == 'DROP DATABASE IF EXISTS "ci_base_1_2_abc"']
+        self.assertEqual(len(drops), 1, rec.sql())
+        self.assertFalse([s for s in rec.sql() if 'FORCE' in s.upper()])
+
+    def test_7031_teardown_never_drops_a_shared_base(self):
+        rc, rec, _, _ = self.run_main(['teardown', '--url', self.SHARED, '--db', 'ai_memory_test',
+                                       '--run-id', RUN], {pib.BASE_VAR: 'ai_memory_test'})
+        self.assertEqual(rc, 0)
+        self.assertNotIn('DROP DATABASE IF EXISTS "ai_memory_test"', rec.sql())
+
+
+class LeakAndLineage7031(unittest.TestCase):
+    """#7031 H1 review F2 (no leaked base) and H2 (lineage watermark precheck)."""
+
+    SHARED = SharedBaseRefusal7031.SHARED
+    run_main = SharedBaseRefusal7031.run_main
+
+    def test_7031_budget_probe_runs_before_any_create(self):
+        def answer(argv, kw):
+            sql = argv[argv.index('-c') + 1]
+            return Result(0, '100|3|0|5\n') if 'max_connections' in sql else Result()
+        with Patched(Recorder(answer)) as rec:
+            rc = pib.main(['setup', '--url', self.SHARED])
+        self.assertEqual(rc, pib.EXIT_USAGE)
+        self.assertEqual([s for s in rec.sql() if s.startswith(('CREATE', 'DROP'))], [],
+                         'a refused budget must not mint anything')
+
+    def test_7031_failure_after_mint_drops_the_minted_base(self):
+        def answer(argv, kw):
+            sql = argv[argv.index('-c') + 1]
+            if sql.startswith('CREATE DATABASE') and sql.endswith('_tpl"'):
+                return Result(1, '', 'template create failed')
+            return default_answer(argv, kw)
+        import io
+        import contextlib
+        errs = io.StringIO()
+        with Patched(Recorder(answer)) as rec, contextlib.redirect_stderr(errs):
+            rc = pib.main(['setup', '--url', self.SHARED])
+        self.assertEqual(rc, pib.EXIT_USAGE)
+        minted = re.search(r'CREATE DATABASE "(ci_base_\w+?)"', ' '.join(rec.sql())).group(1)
+        self.assertIn('DROP DATABASE IF EXISTS "%s"' % minted, rec.sql())
+        self.assertIn(minted, errs.getvalue())
+
+    def test_7031_extension_failure_in_mint_drops_the_base(self):
+        def answer(argv, kw):
+            sql = argv[argv.index('-c') + 1]
+            if sql.startswith('CREATE EXTENSION'):
+                return Result(1, '', 'no age')
+            return default_answer(argv, kw)
+        with Patched(Recorder(answer)) as rec:
+            rc = pib.main(['setup', '--url', self.SHARED])
+        self.assertEqual(rc, pib.EXIT_USAGE)
+        self.assertTrue([s for s in rec.sql() if s.startswith('DROP DATABASE IF EXISTS "ci_base_')])
+
+    def test_7031_sweep_removes_aged_idle_ci_base(self):
+        def answer(argv, kw):
+            sql = argv[argv.index('-c') + 1]
+            if 'extract(epoch' in sql:
+                return Result(0, '1700005000\n')
+            if sql.startswith('SELECT') and "'ci_base_'" in sql:
+                return Result(0, 'ci_base_11_1700000000_0123abcd\nci_base_11_1700000000_0123abcd_tpl\n'
+                                 'ci_base_12_1700004900_0123abcd\nci_base_manual\n')
+            return Result()
+        rec = Recorder(answer)
+        with mock.patch.object(pib.subprocess, 'run', rec):
+            dropped = pib.sweep(BASE, 3600)
+        self.assertEqual(sorted(dropped), ['ci_base_11_1700000000_0123abcd',
+                                           'ci_base_11_1700000000_0123abcd_tpl'])
+        self.assertFalse([s for s in rec.sql() if 'FORCE' in s.upper()])
+
+    def test_7031_teardown_warns_when_url_db_is_not_the_minted_base(self):
+        rc, rec, _, err = self.run_main(['teardown', '--url', self.SHARED, '--run-id', RUN],
+                                        {pib.BASE_VAR: 'ci_base_1_2_abc'})
+        self.assertEqual(rc, 0)
+        self.assertIn('warning:', err)
+        self.assertNotIn('DROP DATABASE IF EXISTS "ci_base_1_2_abc"', rec.sql())
+
+    def lineage_answer(self, present, hwm, rows, table=None):
+        """``present``: watermark table exists; ``hwm`` None = no watermark row;
+        ``table``: agent_lineage exists (default: same as ``present``)."""
+        table = present if table is None else table
+
+        def answer(argv, kw):
+            sql = argv[argv.index('-c') + 1]
+            if "to_regclass('lineage_integrity_watermark')" in sql:
+                return Result(0, 't\n' if present else 'f\n')
+            if 'FROM lineage_integrity_watermark' in sql:
+                return Result(0, '' if hwm is None else 'agent_lineage|%d\n' % hwm)
+            if "to_regclass('agent_lineage')" in sql:
+                return Result(0, 't\n' if table else 'f\n')
+            if 'count(*) FROM "agent_lineage"' in sql:
+                return Result(0, '%d\n' % rows)
+            return default_answer(argv, kw)
+        return answer
+
+    def run_setup(self, present, hwm, rows, table=None):
+        with Patched(Recorder(self.lineage_answer(present, hwm, rows, table))) as rec:
+            rc = pib.main(['setup', '--url', BASE, '--db', 'ai_memory_test_ci_9_1_x'])
+        return rc, rec
+
+    def test_7031_n2_missing_lineage_table_with_watermark_is_refused(self):
+        rc, rec = self.run_setup(True, 6, 0, table=False)
+        self.assertEqual(rc, pib.EXIT_USAGE)
+        self.assertEqual([s for s in rec.sql() if s.startswith(('CREATE', 'DROP', 'ALTER'))], [])
+        with Patched(Recorder(self.lineage_answer(True, 6, 0, table=False))):
+            with self.assertRaises(pib.WrapperError) as ctx:
+                pib.lineage_precheck(BASE, 'ai_memory_test_ci_9_1_x')
+        self.assertIn('high_water=6', str(ctx.exception))
+        self.assertIn('0 rows', str(ctx.exception))
+
+    def test_7031_n3_precheck_follows_the_watermark_table_not_a_hardcoded_name(self):
+        def answer(argv, kw):
+            sql = argv[argv.index('-c') + 1]
+            if "to_regclass('lineage_integrity_watermark')" in sql:
+                return Result(0, 't\n')
+            if 'FROM lineage_integrity_watermark' in sql:
+                return Result(0, 'agent_lineage|1\nsecond_rel|4\n')
+            if "to_regclass('" in sql:
+                return Result(0, 't\n')
+            if 'count(*) FROM "second_rel"' in sql:
+                return Result(0, '2\n')
+            if 'count(*) FROM' in sql:
+                return Result(0, '9\n')
+            return default_answer(argv, kw)
+        with Patched(Recorder(answer)):
+            with self.assertRaises(pib.WrapperError) as ctx:
+                pib.lineage_precheck(BASE, 'ai_memory_test_ci_9_1_x')
+        self.assertIn('second_rel', str(ctx.exception))
+        self.assertIn('#6983', str(ctx.exception))
+
+    def test_7031_n3_watermarked_relations_ssot_is_pinned(self):
+        src = (REPO / 'src' / 'storage' / 'schema_integrity.rs').read_text()
+        body = src[src.index('pub const WATERMARKED_RELATIONS'):]
+        body = body[:body.index('];')]
+        self.assertEqual(body.count('WatermarkedRelation {'), 1,
+                         'WATERMARKED_RELATIONS changed: re-check lineage_precheck against the new list')
+        self.assertIn('TABLE_AGENT_LINEAGE', body)
+
+    def test_7031_n4_mask_keeps_userless_url_with_at_in_query(self):
+        url = 'postgres://h:5445/db?application_name=a@b'
+        self.assertEqual(pib.mask_url_password(url), url)
+        self.assertEqual(pib.mask_url_password('postgres://u:pw@h:5445/db?x=a@b'),
+                         'postgres://u:***@h:5445/db?x=a@b')
+        self.assertEqual(pib.mask_url_password('postgres://u@h/db'), 'postgres://u@h/db')
+
+    def test_7031_n1_invalid_run_id_mints_nothing(self):
+        rc, rec, _, _ = self.run_main(['setup', '--url', self.SHARED, '--run-id', 'BAD-ID'])
+        self.assertEqual(rc, pib.EXIT_USAGE)
+        self.assertEqual([s for s in rec.sql() if s.startswith('CREATE')], [])
+
+    def test_7031_n1_non_wrapper_error_after_mint_drops_the_base(self):
+        def answer(argv, kw):
+            sql = argv[argv.index('-c') + 1]
+            if sql.startswith('CREATE DATABASE') and sql.endswith('_tpl"'):
+                raise OSError('psql vanished')
+            return default_answer(argv, kw)
+        with Patched(Recorder(answer)) as rec:
+            with self.assertRaises(OSError):
+                pib.main(['setup', '--url', self.SHARED])
+        minted = re.search(r'CREATE DATABASE "(ci_base_\w+?)"', ' '.join(rec.sql())).group(1)
+        self.assertIn('DROP DATABASE IF EXISTS "%s"' % minted, rec.sql())
+
+    def test_7031_h2_precheck_refuses_watermark_above_rows(self):
+        rc, rec = self.run_setup(True, 6, 0)
+        self.assertEqual(rc, pib.EXIT_USAGE)
+        self.assertEqual([s for s in rec.sql() if s.startswith(('CREATE', 'DROP', 'ALTER'))], [])
+
+    def test_7031_h2_precheck_passes_when_equal(self):
+        rc, _ = self.run_setup(True, 6, 6)
+        self.assertEqual(rc, 0)
+
+    def test_7031_h2_precheck_passes_when_table_absent(self):
+        rc, _ = self.run_setup(False, 0, 0)
+        self.assertEqual(rc, 0)
+
+    def test_7031_h2_refusal_names_the_diagnostic(self):
+        with Patched(Recorder(self.lineage_answer(True, 6, 0))):
+            with self.assertRaises(pib.WrapperError) as ctx:
+                pib.setup(BASE, 'ai_memory_test_ci_9_1_x')
+        self.assertIn('high_water=6', str(ctx.exception))
+        self.assertIn('0 rows', str(ctx.exception))
+
+
 class NoShell(unittest.TestCase):
     def test_source_never_uses_shell_true_or_tmp(self):
         src = SCRIPT.read_text()
@@ -664,7 +937,7 @@ class LiveEndToEnd(unittest.TestCase):
     def test_setup_run_teardown_creates_and_drops_a_clone(self):
         url = _live_url()
         d = Path(scratch_dir())
-        db = 'ai_memory_e2e_%s' % uuid.uuid4().hex[:8]
+        db = 'ai_memory_test_ci_e2e_%s' % uuid.uuid4().hex[:8]  # ephemeral base (#7031)
         run_id = 'e' + uuid.uuid4().hex[:10]
         probe = d / 'probe.py'
         probe.write_text(
@@ -677,8 +950,11 @@ class LiveEndToEnd(unittest.TestCase):
         env = {k: v for k, v in os.environ.items() if not k.startswith('PG')}
         env.update({pib.URL_VAR: url, pib.FLAG_VAR: '1'})
         env.pop(pib.KILL_VAR, None)
+        pib.psql(url, 'CREATE DATABASE "%s"' % db)  # an explicit ephemeral base must already exist
+        self.addCleanup(pib.psql, pib.with_database(url, pib.MAINTENANCE_DB),
+                        'DROP DATABASE IF EXISTS "%s"' % db)
         setup = subprocess.run([sys.executable, str(SCRIPT), 'setup', '--db', db, '--jobs', '1',
-                                '--run-id', run_id, '--emit-env'], env=env, capture_output=True, text=True)
+                                '--run-id', run_id, '--emit-env', '--emit-env-unmasked'], env=env, capture_output=True, text=True)
         self.assertEqual(setup.returncode, 0, setup.stderr)
         emitted = dict(ln.split('=', 1) for ln in setup.stdout.split())
         self.assertEqual(emitted[pib.RUN_ID_VAR], run_id)
@@ -710,6 +986,31 @@ class LiveEndToEnd(unittest.TestCase):
         tpl_left = pib.psql(url, "SELECT count(*) FROM pg_database WHERE datname = '%s_tpl'" % db,
                             tuples=True).strip()
         self.assertEqual(tpl_left, '0', 'teardown dropped the template')
+
+
+
+
+@unittest.skipUnless(_live_url() and shutil.which('psql'), 'AI_MEMORY_TEST_POSTGRES_URL unset (live e2e)')
+class LiveLineagePrecheck7031(unittest.TestCase):
+    """#7031 H2/H3 on a real server: the #6983 state (watermark above rows) is refused."""
+
+    def test_7031_poisoned_watermark_is_refused_and_equal_passes(self):
+        admin = _live_url()
+        name = 'ci_base_%d_%d_%s' % (os.getpid(), 1700000000, uuid.uuid4().hex[:8])
+        pib.psql(admin, 'CREATE DATABASE "%s"' % name)
+        base = pib.with_database(admin, name)
+        try:
+            pib.psql(base, 'CREATE TABLE agent_lineage (agent_id text, epoch int); '
+                           'CREATE TABLE lineage_integrity_watermark (relation text PRIMARY KEY, high_water bigint)')
+            pib.lineage_precheck(base, name)  # no watermark row: passes
+            pib.psql(base, "INSERT INTO lineage_integrity_watermark VALUES ('agent_lineage', 6)")
+            with self.assertRaises(pib.WrapperError) as ctx:
+                pib.lineage_precheck(base, name)  # hwm 6, 0 rows: the #6983 state
+            self.assertIn('high_water=6', str(ctx.exception))
+            pib.psql(base, "INSERT INTO agent_lineage SELECT 'a', g FROM generate_series(1, 6) g")
+            pib.lineage_precheck(base, name)  # equal: passes
+        finally:
+            pib.psql(pib.with_database(admin, pib.MAINTENANCE_DB), 'DROP DATABASE IF EXISTS "%s"' % name)
 
 
 if __name__ == '__main__':

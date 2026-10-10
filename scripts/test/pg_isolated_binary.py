@@ -65,6 +65,11 @@ AGE_URL_VAR = 'AI_MEMORY_TEST_AGE_URL'
 FLAG_VAR = 'AI_MEMORY_TEST_PG_ISOLATE'
 TEMPLATE_VAR = 'AI_MEMORY_TEST_PG_TEMPLATE'
 RUN_ID_VAR = 'AI_MEMORY_TEST_PG_RUN_ID'
+BASE_VAR = 'AI_MEMORY_TEST_PG_BASE'
+SHARED_BASE_DB = 'ai_memory_test'
+MINTED_BASE_PREFIX = 'ci_base_'
+EPHEMERAL_BASE_PREFIXES = ('ai_memory_test_ci_', MINTED_BASE_PREFIX)
+MAINTENANCE_DB = 'postgres'
 KILL_VAR = 'CI_PG_ISOLATE_OFF'
 ISOLATED_PREFIX = 'ai_memory_t'
 TEMPLATE_SUFFIX = '_tpl'
@@ -104,6 +109,7 @@ _QUERY_TO_ENV = {
 }
 _RUN_ID_RE = re.compile(r'^[a-z0-9]{1,%d}$' % RUN_ID_MAX_LEN)
 _ANY_NAME_RE = re.compile(r'^%s_([a-z0-9]{1,%d})_([0-9]{10})_([0-9a-f]{8})$' % (ISOLATED_PREFIX, RUN_ID_MAX_LEN))
+_MINTED_BASE_RE = re.compile(r'^%s[0-9]+_([0-9]{10})_[0-9a-f]{8}(?:%s)?$' % (MINTED_BASE_PREFIX, TEMPLATE_SUFFIX))
 _IDENT_RE = re.compile(r'^[A-Za-z0-9_]{1,%d}$' % IDENT_MAX)
 _TARGET_RE = re.compile(r'^--(test|bin) ([A-Za-z0-9_-]+)$')
 _PRINT_LOCK = threading.Lock()
@@ -367,17 +373,132 @@ def close_hold(hold: Optional['subprocess.Popen[str]']) -> None:
         hold.wait()
 
 
+# --- ephemeral base (#7031 H1) --------------------------------------------
+
+def is_ephemeral_base(db: str) -> bool:
+    """True for a per-run base (``ai_memory_test_ci_*`` / ``ci_base_*``); the
+    shared ``ai_memory_test`` and anything else is not."""
+    return db != SHARED_BASE_DB and db.startswith(EPHEMERAL_BASE_PREFIXES)
+
+
+def mint_base_name(now: Optional[int] = None) -> str:
+    stamp = int(time.time()) if now is None else int(now)
+    return '%s%d_%d_%s' % (MINTED_BASE_PREFIX, os.getpid(), stamp, uuid.uuid4().hex[:8])
+
+
+def mint_base(url: str) -> str:
+    """CREATE an ephemeral base (the ci.yml recipe: database, then age + vector)
+    and return its URL. ``url`` is only the maintenance connection."""
+    name = _checked_ident(mint_base_name())
+    psql(url, 'CREATE DATABASE %s' % quote_ident(name))
+    new_url = with_database(url, name)
+    try:
+        psql(new_url, 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')
+    except (WrapperError, OSError):
+        drop_base(url, name)
+        raise
+    log('minted ephemeral base %s' % name)
+    return new_url
+
+
+def drop_base(url: str, name: str) -> bool:
+    """Plain-drop a minted base through the maintenance db; never raises."""
+    if not name.startswith(MINTED_BASE_PREFIX):
+        log('WARN refusing to drop %r: not a minted ci_base_ database' % name)
+        return False
+    try:
+        psql(with_database(url, MAINTENANCE_DB), 'DROP DATABASE IF EXISTS %s' % quote_ident(_checked_ident(name)))
+        return True
+    except (WrapperError, OSError) as exc:
+        log('WARN could not drop minted base %s (drop it by hand): %s' % (name, exc))
+        return False
+
+
+def mask_url_password(url: str) -> str:
+    """``postgres://u:pw@h/db`` -> ``postgres://u:***@h/db``. A URL without a
+    password (including one with an ``@`` only in its query) is unchanged."""
+    try:
+        netloc = urlsplit(url).netloc
+    except ValueError:
+        return url
+    userinfo, at, hostport = netloc.rpartition('@')
+    if not at or ':' not in userinfo:
+        return url
+    user = userinfo.partition(':')[0]
+    return url.replace(netloc, '%s:***@%s' % (user, hostport), 1)
+
+
+def resolve_base(url: str, db_arg: Optional[str], allow_reason: Optional[str],
+                 jobs: int = MAX_JOBS) -> Tuple[str, str, bool]:
+    """Pick the base for ``setup``; refuse a shared one (#7031). Returns
+    ``(url, db, minted)``. The budget probe runs before any CREATE DATABASE."""
+    if allow_reason is not None and not (allow_reason.strip() and any(ch.isalnum() for ch in allow_reason)):
+        raise WrapperError('--allow-shared-base needs a non-empty REASON')
+    db = db_arg or database_name(url)
+    if is_ephemeral_base(db):
+        return with_database(url, db), db, False
+    if allow_reason:
+        log('WARN shared base %s allowed: %s' % (db, allow_reason.strip()))
+        return with_database(url, db), db, False
+    if db_arg:
+        raise WrapperError('refusing shared base %r (#7031): use an ephemeral base matching %s, '
+                           'or pass --allow-shared-base REASON' % (db, '|'.join(EPHEMERAL_BASE_PREFIXES)))
+    require_budget(url, jobs)
+    new_url = mint_base(url)
+    return new_url, database_name(new_url), True
+
+
 # --- tier steps -----------------------------------------------------------
 
-def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
-    """Check the live budget, then create the locked template. Returns its name."""
-    _checked_ident(db_name)
-    tpl = _checked_ident(template_name(db_name))
+def require_budget(url: str, jobs: int) -> Tuple[int, int]:
+    """Refuse when the server lacks the slots; returns ``(available, need)``."""
     need = required_connections(clamp_jobs(jobs))
     most, reserved, now, available = connection_budget(url)
     if available < need:
         raise WrapperError('only %d free connection slots (max_connections=%d, reserved=%d, open now=%d); '
                            '%d needed for %d parallel binaries' % (available, most, reserved, now, need, jobs))
+    return available, need
+
+
+_RELATION_RE = re.compile(r'^[a-z_][a-z0-9_]*$')
+
+
+def lineage_precheck(url: str, db_name: str) -> None:
+    """#6983 / #7031 H2: refuse to clone a base where any watermarked relation
+    holds fewer rows than its recorded high-water mark (every clone would fail
+    IntegrityFailed). Follows the watermark table itself, so it covers every
+    relation in ``WATERMARKED_RELATIONS``; a relation that is missing counts as
+    0 rows. A base without the watermark table passes."""
+    present = psql(url, "SELECT to_regclass('lineage_integrity_watermark') IS NOT NULL", tuples=True).strip()
+    if present != 't':
+        return
+    listing = psql(url, "SELECT relation || '|' || high_water FROM lineage_integrity_watermark "
+                        "ORDER BY relation", tuples=True)
+    for line in (ln.strip() for ln in listing.splitlines()):
+        if not line:
+            continue
+        relation, _, mark = line.partition('|')
+        if not _RELATION_RE.match(relation) or not mark.isdigit():
+            raise WrapperError('could not read the lineage watermark (got %r)' % line)
+        exists = psql(url, "SELECT to_regclass('%s') IS NOT NULL" % relation, tuples=True).strip()
+        rows = 0
+        if exists == 't':
+            count = psql(url, 'SELECT count(*) FROM %s' % quote_ident(relation), tuples=True).strip()
+            if not count.isdigit():
+                raise WrapperError('could not count %s (got %r)' % (relation, count))
+            rows = int(count)
+        if int(mark) > rows:
+            raise WrapperError('#6983: base %s records %s high_water=%s but holds %d rows; every clone '
+                               'would fail IntegrityFailed. Use an ephemeral base.'
+                               % (db_name, relation, mark, rows))
+
+
+def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
+    """Check the live budget, then create the locked template. Returns its name."""
+    _checked_ident(db_name)
+    tpl = _checked_ident(template_name(db_name))
+    available, need = require_budget(url, jobs)
+    lineage_precheck(url, db_name)
     q = quote_ident(tpl)
     try:
         psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE false' % q)
@@ -423,6 +544,27 @@ def teardown(url: str, db_name: str, run_id: str) -> int:
     return failed
 
 
+def _sweep_minted_bases(url: str, now: int, older_than: int) -> List[str]:
+    """Drop idle, aged ``ci_base_*`` bases (and their templates) left by a failed run."""
+    listing = ("SELECT d.datname FROM pg_database d WHERE starts_with(d.datname, '%s') "
+               "AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)"
+               % MINTED_BASE_PREFIX)
+    dropped = []
+    for name in sorted(_names(url, listing), key=lambda n: not n.endswith(TEMPLATE_SUFFIX)):
+        found = _MINTED_BASE_RE.match(name)
+        if not found or now - int(found.group(1)) < older_than:
+            continue
+        q = quote_ident(name)
+        try:
+            if name.endswith(TEMPLATE_SUFFIX):
+                psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE false' % q)
+            psql(url, 'DROP DATABASE IF EXISTS %s' % q)
+            dropped.append(name)
+        except WrapperError as exc:
+            log('WARN could not sweep %s: %s' % (name, exc))
+    return dropped
+
+
 def sweep(url: str, older_than: int) -> List[str]:
     """ADMIN ONLY: drop idle clones of any run older than ``older_than`` s."""
     if older_than < MIN_SWEEP_AGE_SECS:
@@ -444,7 +586,8 @@ def sweep(url: str, older_than: int) -> List[str]:
             dropped.append(name)
         except WrapperError as exc:
             log('WARN could not sweep %s: %s' % (name, exc))
-    log('admin sweep dropped %d clone(s) older than %ds' % (len(dropped), older_than))
+    dropped += _sweep_minted_bases(url, now, older_than)
+    log('admin sweep dropped %d clone(s)/base(s) older than %ds' % (len(dropped), older_than))
     return dropped
 
 
@@ -625,8 +768,13 @@ def build_parser() -> argparse.ArgumentParser:
     setup_p.add_argument('--db', help='base database (default: the URL database)')
     setup_p.add_argument('--jobs', type=int, default=MAX_JOBS)
     setup_p.add_argument('--run-id', help='run id for the clone names (default: generated)')
+    setup_p.add_argument('--allow-shared-base', metavar='REASON',
+                         help='permit a non-ephemeral base database (non-empty reason, logged)')
+    setup_p.add_argument('--emit-env-unmasked', action='store_true',
+                         help='with --emit-env, print the URL with its real password (CI -> $GITHUB_ENV only)')
     setup_p.add_argument('--emit-env', action='store_true',
-                         help='print %s= and %s= lines for $GITHUB_ENV' % (TEMPLATE_VAR, RUN_ID_VAR))
+                         help='print %s=, %s=, %s= and %s= lines for $GITHUB_ENV'
+                         % (TEMPLATE_VAR, RUN_ID_VAR, BASE_VAR, URL_VAR))
 
     down = sub.add_parser('teardown', help="drop this run's clones and the template")
     down.add_argument('--url', help=url_help)
@@ -688,16 +836,33 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         url = _url(args)
         if args.cmd == 'setup':
-            db = args.db or database_name(url)
-            run_id = checked_run_id(args.run_id or new_run_id())
-            tpl = setup(url, db, args.jobs)
+            admin = url
+            run_id = checked_run_id(args.run_id or new_run_id())  # before any CREATE (N1)
+            url, db, minted = resolve_base(url, args.db, args.allow_shared_base, args.jobs)
+            done = False
+            try:
+                tpl = setup(url, db, args.jobs)
+                done = True
+            finally:
+                if minted and not done:  # any failure, not only WrapperError
+                    log('setup failed after minting %s; dropping it' % db)
+                    drop_base(admin, db)
             if args.emit_env:
                 _emit('%s=%s' % (TEMPLATE_VAR, tpl))
                 _emit('%s=%s' % (RUN_ID_VAR, run_id))
+                _emit('%s=%s' % (BASE_VAR, db))
+                _emit('%s=%s' % (URL_VAR, url if args.emit_env_unmasked else mask_url_password(url)))
             return 0
         if args.cmd == 'teardown':
             db = args.db or database_name(url)
             teardown(url, db, checked_run_id(args.run_id or os.environ.get(RUN_ID_VAR)))
+            base = os.environ.get(BASE_VAR)
+            if base and base.startswith(MINTED_BASE_PREFIX) and base != db:
+                log('warning: %s names minted base %s but the URL database is %s; the base was not dropped'
+                    % (BASE_VAR, base, db))
+            elif base and base == db and base.startswith(MINTED_BASE_PREFIX):
+                # Plain drop (no force option): a live session fails it, loudly.
+                psql(with_database(url, MAINTENANCE_DB), 'DROP DATABASE IF EXISTS %s' % quote_ident(_checked_ident(base)))
             return 0
         if args.cmd == 'sweep':
             sweep(url, args.older_than)
