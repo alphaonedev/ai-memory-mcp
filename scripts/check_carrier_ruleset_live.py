@@ -572,6 +572,48 @@ def forbidden_triggers(workflow_text):
     return sorted(set(FORBIDDEN_TRIGGERS) & on_events(workflow_text))
 
 
+C8_JOBS = ("carrier-base-fresh-gate", "carrier-ruleset-live-gate")
+VERIFIER_JOB = "carrier-ruleset-live-gate"
+GITHUB_TOKEN_EXPR = "${{ github.token }}"
+
+
+def job_lines(workflow_text, job_id):
+    """Code lines of the top-level job `job_id` (indent-2 key under `jobs:`), or None when absent."""
+    lines = _code_lines(workflow_text)
+    start = None
+    for i, line in enumerate(lines):
+        if start is None:
+            if line.rstrip() == f"  {job_id}:":
+                start = i + 1
+        elif _indent(line) <= 2:
+            return lines[start:i]
+    return lines[start:] if start is not None else None
+
+
+def job_token_problems(workflow_text):
+    """Problems with the token source of the two #6143 jobs (#6452); an empty list is clean.
+
+    A job that reads a repository secret, or a GH_TOKEN/GITHUB_TOKEN that is not exactly
+    `${{ github.token }}`, would hand a write-capable credential to code a pull request controls.
+    The verifier job must also set GH_TOKEN, or `gh` has no credential and every read fails."""
+    problems = []
+    for job in C8_JOBS:
+        body = job_lines(workflow_text, job)
+        if body is None:
+            problems.append(f"job {job} not found")
+            continue
+        for line in body:
+            if re.search(r"\bsecrets\b", line, re.I):
+                problems.append(f"job {job} references a repository secret: {line.strip()}")
+            m = re.match(r"\s*(GH_TOKEN|GITHUB_TOKEN)\s*:\s*(.*?)\s*$", line)
+            if m and m.group(2) != GITHUB_TOKEN_EXPR:
+                problems.append(f"job {job} {m.group(1)} is not {GITHUB_TOKEN_EXPR}: {m.group(2)}")
+        if job == VERIFIER_JOB and not any(
+                re.match(rf"\s*GH_TOKEN\s*:\s*{re.escape(GITHUB_TOKEN_EXPR)}\s*$", ln) for ln in body):
+            problems.append(f"job {job} does not set GH_TOKEN: {GITHUB_TOKEN_EXPR}")
+    return problems
+
+
 def trigger_covers(workflow_text, branch):
     """True when the workflow's `on.pull_request` fires for EVERY PR whose BASE is `branch` (#6232).
 
