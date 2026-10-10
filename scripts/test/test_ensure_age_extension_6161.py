@@ -252,6 +252,15 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assert_fails(self.run_script(), 2, "tier URL file does not hold a postgres:// URL")
         self.assertFalse((self.base / "psql.log").exists())
 
+    def test_sslpassword_is_rejected(self):
+        # libpq has no env var for sslpassword, so it cannot be moved off argv: refuse it.
+        self.install_good()  # a healthy tier would reach psql if the URL were accepted
+        self.url_file.write_text(
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslpassword={SECRET}\n")
+        self.assert_fails(self.run_script(), 2,
+                          "tier URL file carries sslpassword; use a key without a passphrase")
+        self.assertFalse((self.base / "psql.log").exists(), "psql must never be called")
+
     # ---- bad input -------------------------------------------------------
     def test_missing_source_dir_fails_closed(self):
         r = self.run_script(age_dir=self.base / "nope")
