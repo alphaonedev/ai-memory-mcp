@@ -9,6 +9,8 @@ Reads the tier URL from ``--url-file`` and refuses (exit 1, one ``::error::`` li
 * is shorter than 16 characters once percent-decoded, or
 * is equal to, or contained in, the user, a host or the database name (from the URL or from the ``user=``,
   ``host=``, ``hostaddr=`` and ``dbname=`` query keys) or any other query value (#6640), or
+* (for the two rules above and below) every entry of a comma-separated host list counts as a host, in the
+  authority (``h1:5445,h2:5446``, IPv6 in brackets) and in ``host=`` / ``hostaddr=`` (#6872), or
 * contains one of those components when it is at least 8 characters long (a shorter component can occur in a
   random password by chance).
 
@@ -21,7 +23,7 @@ is exposed with them.  Messages name the rule and the component KIND, never a va
 import argparse
 from pathlib import Path
 import sys
-from urllib.parse import unquote, urlsplit
+from urllib.parse import SplitResult, unquote
 
 EXIT_OK = 0
 EXIT_WEAK = 1
@@ -42,13 +44,13 @@ def components(url):
     if any(ch in url for ch in "\t\r\n\x00") or not url.startswith(tuple(f"{s}://" for s in URL_SCHEMES)):
         raise BadInput("the tier URL file does not hold one postgres:// URL")
     try:
-        parts = urlsplit(url)
+        parts = split_url(url)
         netloc = parts.netloc
         userinfo, _, hostport = netloc.rpartition("@")
         user, _, raw_password = userinfo.partition(":")
-        host = hostport.rsplit(":", 1)[0] if not hostport.startswith("[") else hostport.split("]")[0].lstrip("[")
+        hosts = [unquote(host) for host in [hostport] + [netloc_host(entry) for entry in hostport.split(",")]]
         password = unquote(raw_password, errors="surrogateescape")
-        named = {"user": [unquote(user)], "host": [unquote(host)],
+        named = {"user": [unquote(user)], "host": hosts,
                  "database": [unquote(parts.path[1:]) if parts.path.startswith("/") else ""], "query": []}
         for segment in parts.query.split("&"):
             key, _, value = segment.partition("=")
@@ -59,7 +61,32 @@ def components(url):
                 named[QUERY_KINDS.get(key, "query")].append(unquote(value))
     except ValueError:
         raise BadInput("the tier URL file does not hold a valid postgres:// URL")
+    # #6872: libpq takes a comma-separated host list in the authority and in host=/hostaddr=; each entry is a host.
+    named["host"] += [entry for value in named["host"] for entry in value.split(",")]
     return password, named
+
+
+def split_url(url):
+    """Split a URL as RFC 3986 does, without urlsplit's host validation (#6872).
+
+    Python 3.14's urlsplit refuses a bracketed IPv6 entry that is not the first entry of a libpq host list
+    (``h1:5445,[::1]:5446``) while 3.9 accepts it; this split reads every supported Python the same way.
+    Unbalanced brackets stay refused, as urlsplit refuses them.
+    """
+    scheme, _, rest = url.partition("://")
+    ends = [index for index in (rest.find(mark) for mark in "/?#") if index >= 0]
+    end = min(ends) if ends else len(rest)
+    netloc, tail = rest[:end], rest[end:]
+    if netloc.count("[") != netloc.count("]"):
+        raise ValueError("unbalanced brackets in the URL authority")
+    tail, _, fragment = tail.partition("#")
+    path, _, query = tail.partition("?")
+    return SplitResult(scheme, netloc, path, query, fragment)
+
+
+def netloc_host(entry):
+    """The host of one authority entry: ``h``, ``h:port``, ``[v6]`` or ``[v6]:port``."""
+    return entry.split("]")[0].lstrip("[") if entry.startswith("[") else entry.rsplit(":", 1)[0]
 
 
 def problems(password, named):
