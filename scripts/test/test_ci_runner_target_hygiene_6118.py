@@ -3911,9 +3911,37 @@ class PruneScript6118(unittest.TestCase):
 
     def test_6118_r7_6299_space_and_visible_letters_stay_raw(self) -> None:
         mod = _load_prune()
-        for text in ("a b", "café", "日本", "naïve-ß"):
+        for text in ("a b", "caf\xe9", "\u65e5\u672c", "na\xefve-\xdf"):
             with self.subTest(text=text):
                 self.assertEqual(text, mod._escape(text))
+
+    # ---- #6532: _escape is total over str, every surrogate included ----
+
+    def test_6118_r7_6532_escape_is_total_over_every_surrogate(self) -> None:
+        mod = _load_prune()
+        bad = []
+        for cp in range(0xD800, 0xE000):
+            try:
+                out = mod._escape("a%sb" % chr(cp))
+            except UnicodeError as exc:  # the defect: os.fsencode raises outside U+DC80-U+DCFF
+                bad.append("U+%04X raised %s" % (cp, type(exc).__name__))
+                continue
+            want = "a\\x%02xb" % (cp - 0xDC00) if 0xDC80 <= cp <= 0xDCFF else "a\\u{%x}b" % cp
+            if out != want or not (out.isascii() and out.isprintable()):
+                bad.append("U+%04X -> %r" % (cp, out))
+        self.assertEqual([], bad)
+
+    def test_6118_r7_6532_surrogate_halves_never_print_as_the_paired_character(self) -> None:
+        mod = _load_prune()
+        cases = {
+            chr(0xD83D) + chr(0xDE00): "\\u{d83d}\\u{de00}",  # two halves, not U+1F600
+            "%\ud800#\udc80\\": "%25\\u{d800}%23\\x80\\\\",  # mixed with every other escape
+            "\udfff\u0085": "\\u{dfff}\\u{85}",
+        }
+        for text, want in cases.items():
+            with self.subTest(text=ascii(text)):
+                self.assertEqual(want, mod._escape(text))
+        self.assertNotEqual(mod._escape(chr(0xD83D) + chr(0xDE00)), mod._escape("\U0001f600"))
 
 EXAMPLE_HASHED = "debug/examples/demo-0123456789abcdef"
 EXAMPLE_UPLIFT = "debug/examples/demo"
