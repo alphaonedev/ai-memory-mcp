@@ -133,9 +133,10 @@ fn issue_6157_non_string_protocol_version_gets_newest_supported_with_diagnostic(
     }
 }
 
-/// Send `count` downgrade `initialize` requests down ONE child and return
-/// the number of replies plus everything the child wrote to stderr.
-fn initialize_repeated(count: u64) -> (u64, String) {
+/// Send one `initialize` per entry of `versions` (the requested
+/// `protocolVersion`, in order) down ONE child and return the number of
+/// replies plus everything the child wrote to stderr.
+fn initialize_repeated(versions: &[&str]) -> (u64, String) {
     let fixture = mcp_stdio_child::Fixture::new();
     let mut child = fixture
         .command()
@@ -154,14 +155,15 @@ fn initialize_repeated(count: u64) -> (u64, String) {
             let _ = tx.send(line);
         }
     });
-    for id in 1..=count {
+    for (id, version) in (1_u64..).zip(versions) {
         let request = json!({
             "jsonrpc":"2.0","id":id,"method":"initialize",
-            "params":{"protocolVersion": UNSUPPORTED}
+            "params":{"protocolVersion": version}
         });
         writeln!(stdin, "{request}").expect("write initialize");
     }
     stdin.flush().expect("flush");
+    let count = u64::try_from(versions.len()).expect("request count fits u64");
     let mut replies = 0;
     while replies < count {
         let line = rx.recv_timeout(WAIT).expect("initialize response");
@@ -182,11 +184,26 @@ fn initialize_repeated(count: u64) -> (u64, String) {
 /// review). One line per process is enough for an operator to see why.
 #[test]
 fn issue_6157_downgrade_diagnostic_is_emitted_once_per_process() {
-    let (replies, diag) = initialize_repeated(5);
+    let (replies, diag) = initialize_repeated(&[UNSUPPORTED; 5]);
     assert_eq!(replies, 5);
     let lines = diag.lines().filter(|l| l.contains("downgrade")).count();
     assert_eq!(
         lines, 1,
         "five downgraded initialize requests must produce exactly one diagnostic line, got: {diag}"
+    );
+}
+
+/// #6523: a supported `initialize` must not consume the once-per-process
+/// downgrade diagnostic. The guard evaluates `downgraded` BEFORE swapping the
+/// flag; with the operands reversed the first (supported) request would set
+/// the flag and every later downgrade in the process would be silent.
+#[test]
+fn issue_6523_supported_initialize_does_not_consume_the_downgrade_diagnostic() {
+    let (replies, diag) = initialize_repeated(&[SHIPPED, UNSUPPORTED, UNSUPPORTED]);
+    assert_eq!(replies, 3);
+    let lines = diag.lines().filter(|l| l.contains("downgrade")).count();
+    assert_eq!(
+        lines, 1,
+        "a supported then two downgraded initialize requests must produce exactly one diagnostic line, got: {diag}"
     );
 }
