@@ -170,6 +170,9 @@ def _escape(text: str) -> str:
     return "".join("\\u{%x}" % ord(ch) if unicodedata.category(ch) in INVISIBLE_CATEGORIES else ch for ch in text)
 
 
+OTHER_FS = "on an other file system (a mount inside the target dir); never descended, left in place"
+
+
 def _warn(errors: List[str], rel: str, exc: OSError) -> None:
     msg = "%s: %s" % (rel, exc.strerror or exc)
     errors.append(msg)
@@ -225,6 +228,7 @@ class Plan:
         self.kept: List[Tuple[str, str]] = []  # (name under the profile, why it stays)
         self.notes: List[str] = []
         self.errors: List[str] = []  # scan-phase warnings, carried into the exit code
+        self.dev: Optional[int] = None  # st_dev of the target dir; nothing on another file system is touched (#6479)
 
     def warn(self, rel: str, exc: OSError) -> None:
         _warn(self.errors, rel, exc)
@@ -252,6 +256,7 @@ class Tally:
         self.lines: List[str] = []
         self.per_category: Dict[str, Tuple[int, int]] = {}  # category -> (removed, bytes freed)
         self.failed: Dict[str, int] = {}  # category -> candidates that could not be fully removed (#6258)
+        self.dev: Optional[int] = None  # the target dir's st_dev, from the plan (#6479)
         self._links: Dict[Tuple[int, int], List[int]] = {}
 
     def account(self, st: os.stat_result) -> None:
@@ -287,6 +292,10 @@ def _remove(dir_fd: int, name: str, rel: str, tally: Tally, dry_run: bool, depth
         return True
     except OSError as exc:
         tally.warn(rel, exc)
+        return False
+    if tally.dev is not None and st.st_dev != tally.dev:
+        # a volume mounted inside the target tree (#6479): never descended, never unlinked
+        tally.warn(rel, OSError(errno.EXDEV, OTHER_FS))
         return False
     if stat.S_ISDIR(st.st_mode):
         if depth >= MAX_REMOVE_DEPTH:
@@ -343,9 +352,14 @@ def _is_test_executable(name: str, st: os.stat_result) -> bool:
 
 
 def _open_sub(plan: Plan, profile_fd: int, sub: str) -> Optional[int]:
-    """Open ``<profile>/<sub>`` O_NOFOLLOW; None when absent, not a real directory or unreadable (warned)."""
+    """Open ``<profile>/<sub>`` O_NOFOLLOW; None when absent, not a real directory, on another file system
+    or unreadable (warned)."""
     try:
-        return plan.hold(_open_dir(sub, profile_fd))
+        fd = plan.hold(_open_dir(sub, profile_fd))
+        if plan.dev is not None and os.fstat(fd).st_dev != plan.dev:
+            plan.warn("%s/%s" % (plan.profile, sub), OSError(errno.EXDEV, OTHER_FS))
+            return None
+        return fd
     except FileNotFoundError:
         return None
     except OSError as exc:
@@ -626,6 +640,7 @@ def plan_target(target_dir: str, profile: str, scope: str, env: Mapping[str, str
         got = os.fstat(root_fd)
         if (got.st_dev, got.st_ino) != (raw_st.st_dev, raw_st.st_ino):
             raise Refused("%s changed while it was being checked" % raw)
+        plan.dev = got.st_dev
         profile_fd: Optional[int] = None
         profile_problem = ""
         try:
@@ -662,6 +677,7 @@ def plan_target(target_dir: str, profile: str, scope: str, env: Mapping[str, str
 def execute(plan: Plan, dry_run: bool) -> Tally:
     """Remove (or, dry-run, only total) every candidate through the plan's fds."""
     tally = Tally()
+    tally.dev = plan.dev
     tally.errors.extend(plan.errors)  # scan-phase warnings (already printed) count toward warnings=<n>
     verb = "would delete" if dry_run else "deleted"
     for cand in plan.candidates:
