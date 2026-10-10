@@ -872,8 +872,10 @@ curl -X POST https://127.0.0.1:9077/api/v1/subscriptions \
 (subscribe to it to feed a human-in-the-loop UI; the paired
 `approval_decided` event rides the K10 SSE stream), and the v1.0.0
 addition `agent_notified` (one per committed `memory_notify`; its
-details block carries the recipient, a correlation id and a `sha256:`
-digest of the body, never the body itself). `agent_notified` also fires
+details block carries the recipient, the notification's own correlation
+id as `notification_correlation_id` (#4076; the top-level `correlation_id`
+is always the delivery id to ACK) and a `sha256:` digest of the body, never
+the body itself). `agent_notified` also fires
 on a separate in-process wake bus that backs
 `GET /api/v1/inbox/stream` — an agent that wants a low-latency push
 should hold that SSE stream rather than subscribe a webhook, which is

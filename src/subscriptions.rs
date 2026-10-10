@@ -826,7 +826,10 @@ pub struct AgentNotifiedEventDetails {
     /// Inbox owner the notification was delivered to.
     pub recipient_agent_id: String,
     /// Correlates this webhook delivery with the in-process wake frame
-    /// published for the same notify (see [`crate::inbox_wake`]).
+    /// published for the same notify (see [`crate::inbox_wake`]). #4076 —
+    /// on the wire as `notification_correlation_id`: the flattened envelope's
+    /// `correlation_id` is the delivery UUID the receiver must ACK.
+    #[serde(rename = "notification_correlation_id")]
     pub correlation_id: String,
     /// `sha256:<hex>` over the notification body — never the body.
     pub content_digest: String,
