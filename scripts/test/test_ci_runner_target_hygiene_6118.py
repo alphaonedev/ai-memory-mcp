@@ -2378,6 +2378,42 @@ class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
         self.assertEqual([], found)
 
 
+    JOB_ENV = "    timeout-minutes: ${{ matrix.timeout }}\n    env:\n"
+    WF_ENV = '  CARGO_INCREMENTAL: "0"\n\njobs:\n'
+
+    def _env_rows(self, rows: List[Tuple[str, str]]) -> List[Tuple[str, List[str]]]:
+        out: List[Tuple[str, List[str]]] = []
+        for label, row in rows:
+            out.append(("step " + label, self._before_prune(
+                R7_PRE + "        env:\n          %s\n        run: cargo test --no-run\n" % row)))
+            out.append(("job " + label, self._mutated(_replace_once(self.ci, self.JOB_ENV, self.JOB_ENV + "      %s\n" % row))))
+            out.append(("workflow " + label, self._mutated(
+                _replace_once(self.ci, self.WF_ENV, '  CARGO_INCREMENTAL: "0"\n  %s\n\njobs:\n' % row))))
+        return out
+
+    def test_6118_r7_6476_expression_valued_env_and_with_rows_are_flagged(self) -> None:
+        cases = self._env_rows([
+            ("RUSTFLAGS vars", "RUSTFLAGS: ${{ vars.EXTRA_RUSTFLAGS }}"),
+            ("RUSTFLAGS event data", "RUSTFLAGS: ${{ github.event.pull_request.title }}"),
+            ("CARGO_ENCODED_RUSTFLAGS matrix", "CARGO_ENCODED_RUSTFLAGS: ${{ matrix.flags }}"),
+            ("RUSTDOCFLAGS quoted", "RUSTDOCFLAGS: \"-C opt-level=0 ${{ vars.X }}\""),
+            ("profile rustflags", "CARGO_PROFILE_DEV_RUSTFLAGS: ${{ vars.X }}"),
+            ("target rustflags", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: ${{ vars.X }}"),
+            ("debug key", "CARGO_PROFILE_DEV_BUILD_OVERRIDE_DEBUG: ${{ vars.DBG }}"),
+        ])
+        cases.append(("with rustflags input", self._before_prune(
+            R7_PRE + "        uses: dtolnay/rust-toolchain@stable\n        with:\n"
+            "          rustflags: ${{ vars.EXTRA_RUSTFLAGS }}\n")))
+        for label, found in cases:
+            with self.subTest(label):
+                self.assertTrue(any("R-DEBUG" in v for v in found), (label, found))
+
+    def test_6118_r7_6476_expression_valued_unrelated_env_stays_clean(self) -> None:
+        for label, found in self._env_rows([("unrelated key", "SCCACHE_GHA_ENABLED: ${{ vars.X }}")]):
+            with self.subTest(label):
+                self.assertEqual([], found)
+
+
 class PruneScript6118(unittest.TestCase):
     """scripts/ci/prune-runner-target.py against a fake cargo target tree."""
 
