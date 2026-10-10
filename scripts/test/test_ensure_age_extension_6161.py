@@ -723,6 +723,14 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertFalse("libpq does not know" in doc, "docstring still says libpq does not know ssl=true")
         self.assertTrue("maps to ``sslmode=require``" in doc, "docstring does not say ssl=true maps to sslmode=require")
 
+    def test_docs_state_the_exact_control_character_refusal(self):
+        # #6348: only TAB, CR, LF and NUL are refused; VT, FF, SOH, DEL and NBSP pass (libpq accepts them too).
+        for path in ("docs/DEV-CI-ENVIRONMENT.md", "changelog.d/6161.fixed.md"):
+            with self.subTest(path=path):
+                text = self.collapsed(ROOT / path)
+                self.assertFalse("control character" in text, "overstates the refusal as any control character")
+                self.assertTrue("TAB, CR, LF or NUL" in text, "does not list TAB, CR, LF or NUL")
+
     # ---- #6252 / cloud F6: signals and the connect timeout --------------------
     def start_sleeping_helper(self):
         write_exe(self.psql, SLEEPING_PSQL.format(py=sys.executable, base=str(self.base)))
