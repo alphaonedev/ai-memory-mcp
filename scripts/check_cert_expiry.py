@@ -151,6 +151,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest.mock
 from pathlib import Path
 
@@ -2565,7 +2566,14 @@ def _wrap_cells(t, fx, repo, base):
                           f'        pub const WRAP_C: &str = "{kid}";\n    }}\n}}\n'),
         "src/wrap_d.rs": ("pub fn read_d() -> &'static str {\n    let mut k = \"\";\n"
                           f'    k = "{kid}";\n    k\n}}\n'),
-        "src/lib.rs": "pub mod wrapmod;\n",
+        "src/lib.rs": "pub mod wrapmod;\npub mod wrappc;\n",
+        "src/wrappc/mod.rs": "pub(crate) mod child;\n",
+        "src/wrappc/child.rs": f'pub const WRAP_PC: &str = "{kid}";\n',
+        "src/wrap_s.rs": f'pub fn read_s() -> u32 {{\n    env_or("{kid}", 5)\n}}\n',
+        "src/wrap_t.rs": ("pub struct K;\nimpl K {\n    pub fn read(&self) -> &'static str {\n"
+                          f'        "{kid}"\n    }}\n}}\n'),
+        "src/wrap_k.rs": 'include!("wrap_frag.rs");\n',
+        "src/wrap_frag.rs": f'pub const WRAP_FRAG: &str = "{kid}";\n',
         "src/wrapmod/mod.rs": "pub mod child;\n",
         "src/wrapmod/child.rs": f'pub const WRAP_CHILD: &str = "{kid}";\n',
         "src/wrap_j.rs": f'pub fn first() {{}}\npub const WRAP_J: &str = "{kid}";\n',
@@ -2579,6 +2587,8 @@ def _wrap_cells(t, fx, repo, base):
     fx.banner("EXPIRED", base)
     w0 = fx.commit(sorted(files) + [CERT_DOC], "w0: wrapper corpus, the identifier line sits clean in every file")
     d_lines = files["src/wrap_d.rs"].split("\n")
+    d_text = files["src/wrap_d.rs"]
+    a_line = files["src/wrap_a.rs"]
     d_set = f'    k = "{kid}";\n'
     b_text = files["src/wrap_b.rs"]
 
@@ -2626,6 +2636,66 @@ def _wrap_cells(t, fx, repo, base):
          {"src/wrap_d.rs": "macro_rules! never_called {\n    () => {\n" + files["src/wrap_d.rs"] + "    };\n}\n"}),
         ("wrap-decl", "cfg(any())", "cfg(any()) on the parent's `mod child;` declaration",
          {"src/wrapmod/mod.rs": "#[cfg(any())]\npub mod child;\n"}),
+        # #6704: whitespace or a newline between `#`, `!` and `[` is still an attribute
+        ("wrap-attr-spaced", "cfg(any())", "an attribute written `# [cfg(any())]` on the item",
+         {"src/wrap_a.rs": "# [cfg(any())]\n" + a_line}),
+        ("wrap-attr-newline", "cfg(any())", "an attribute whose `#` and `[` are on two lines",
+         {"src/wrap_a.rs": "#\n[cfg(any())]\n" + a_line}),
+        ("wrap-inner-spaced", "#![cfg(any())]", "an inner attribute written `# ! [cfg(any())]` at the top of the file",
+         {"src/wrap_a.rs": "# ! [cfg(any())]\n" + a_line}),
+        # #6705: a raw string or a comment inside an attribute keeps the lexer in step
+        ("wrap-attr-rawstr-desync", "cfg(any())", "a raw string with a backslash in an attribute before a cfg",
+         {"src/wrap_d.rs": '#[doc = r"\\"]\n#[cfg(any())]\n' + d_text[:-2] + '} // "]\n'}),
+        ("wrap-attr-comment-desync", "cfg(any())", "a block comment with a bracket in an attribute before a cfg",
+         {"src/wrap_d.rs": "#[allow(dead_code) /* [ */]\n#[cfg(any())]\n" + d_text[:-2] + "} // ]\n"}),
+        # #6706: diverging statements earlier in the same block
+        ("wrap-exit-abort", "early exit", "std::process::abort() before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    std::process::abort();\n")}),
+        ("wrap-exit-rooted", "early exit", "::std::process::exit(0) before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    ::std::process::exit(0);\n")}),
+        ("wrap-exit-imported", "early exit", "an imported exit(0) before the line",
+         {"src/wrap_d.rs": "use std::process::exit;\n" + around(d_text, d_set, "    exit(0);\n")}),
+        ("wrap-exit-std-panic", "early exit", "std::panic!() before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, '    std::panic!("x");\n')}),
+        ("wrap-exit-assert-false", "early exit", "assert!(false) before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    assert!(false);\n")}),
+        ("wrap-exit-bare-block", "early exit", "a bare block that returns, before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, '    {\n        return "";\n    }\n')}),
+        ("wrap-exit-let-return", "early exit", "a let whose initialiser is return, before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, '    let _: () = return "";\n')}),
+        ("wrap-exit-if-true", "early exit", "an if true block that returns, before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, '    if true {\n        return "";\n    }\n')}),
+        # #6707: never-taken conditions in other literal forms
+        ("wrap-if-paren-false", "if false", "the line inside `if (false)`",
+         {"src/wrap_d.rs": around(d_text, d_set, "    if (false) {\n", "    }\n")}),
+        ("wrap-if-not-cfg", "cfg!", "the line inside `if !cfg!(all())`",
+         {"src/wrap_d.rs": around(d_text, d_set, "    if !cfg!(all()) {\n", "    }\n")}),
+        ("wrap-if-not-not-false", "if false", "the line inside `if !!false`",
+         {"src/wrap_d.rs": around(d_text, d_set, "    if !!false {\n", "    }\n")}),
+        ("wrap-for-empty-range", "empty range", "the line inside `for _ in 0..0`",
+         {"src/wrap_d.rs": around(d_text, d_set, "    for _ in 0..0 {\n", "    }\n")}),
+        ("wrap-match-never-arm", "never matches", "the line in a match arm that never matches the literal",
+         {"src/wrap_d.rs": around(d_text, d_set, "    match 0 {\n        1 => {\n",
+                                  "        }\n        _ => {}\n    }\n")}),
+        # #6708: a macro invocation that discards its input
+        ("wrap-macro-stringify", "macro invocation", "the line inside the input of stringify!",
+         {"src/wrap_d.rs": around(d_text, d_set, "    let _ = stringify! {\n", "    };\n")}),
+        ("wrap-macro-local", "macro invocation", "the item inside a local macro that expands to nothing",
+         {"src/wrap_a.rs": "macro_rules! gone {\n    ($($t:tt)*) => {};\n}\ngone! {\n" + a_line + "}\n"}),
+        # #6709: a cfg on the original plus a clean dead copy of the line
+        ("wrap-mask-copy", "cfg(any())", "cfg(any()) on the item plus a clean copy of the line in a dead fn",
+         {"src/wrap_a.rs": "#[cfg(any())]\n" + a_line + "fn dead() {\n    " + a_line + "}\n"}),
+        # #6715: a `mod NAME;` inside an inline mod reaches <dir>/<inline>/NAME.rs
+        ("wrap-decl-inline-mod", "module file that no", "the `mod child;` declaration moved into an inline mod",
+         {"src/wrapmod/mod.rs": "pub mod inner {\n    pub mod child;\n}\n",
+          "src/wrapmod/inner/child.rs": "pub const WRAP_CHILD: u8 = 1;\n"}),
+        # #6719: the parent's inner attribute, a pub(crate) declaration, a nested undeclared dir
+        ("wrap-parent-inner", "#![cfg(any())]", "an inner cfg at the top of the parent mod.rs",
+         {"src/wrapmod/mod.rs": "#![cfg(any())]\npub mod child;\n"}),
+        ("wrap-decl-pubcrate", "cfg(any())", "cfg(any()) on a `pub(crate) mod child;` declaration",
+         {"src/wrappc/mod.rs": "#[cfg(any())]\npub(crate) mod child;\n"}),
+        ("wrap-undeclared-nested", "module file that no", "the directory module's `mod` line removed from lib.rs",
+         {"src/lib.rs": "pub mod wrappc;\n"}),
     ]
     for label, reason, desc, edits in reds:
         fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
@@ -2657,7 +2727,51 @@ def _wrap_cells(t, fx, repo, base):
         ("src/wrap_d.rs", "did not name the file"),
     ])
 
+    # (wrap-eof-*, #6705) a string, raw string or block comment still open at
+    # end of file is a named fail-closed error.
+    for label, tail, needle in (
+            ("wrap-eof-comment", "/* never closed\n", "unterminated block comment"),
+            ("wrap-eof-string", 'const OPEN: &str = "never closed\n', "unterminated string"),
+            ("wrap-eof-rawstring", 'const RAW: &str = r#"never closed\n', "unterminated raw string")):
+        fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
+        fx.write("src/wrap_d.rs", d_text + tail)
+        head_e = fx.commit(["src/wrap_d.rs"], f"{label}: open at end of file")
+        t.expect_red(label, f"a file that ends inside an open construct ({needle})", repo, w0, head_e, [
+            ("ERROR", "did not fail closed with ERROR"),
+            (needle, f"did not name the open construct ({needle})"),
+            ("src/wrap_d.rs", "did not name the file"),
+        ])
+    # (wrap-lstree-error, #6719) a tree git cannot list fails closed by name.
+    t.labels.add("wrap-lstree-error")
+    try:
+        _TreeScan(repo, "f" * 40)
+        t.fail("(wrap-lstree-error): an unreadable tree did not fail closed")
+    except GateError as exc:
+        if "ls-tree" not in str(exc):
+            t.fail(f"(wrap-lstree-error): failed closed without naming git ls-tree: {exc}")
+    # (wrap-scale, #6710) the scan is linear in the identifier occurrences of
+    # one statement: 8,000 then 50,000 occurrences in one array literal.
+    t.labels.add("wrap-scale")
+    for count, budget in ((8_000, 4.0), (50_000, 20.0)):
+        big = "pub const L: [&str; N] = [" + f'"{kid}", ' * count + "];\n"
+        offs = [m.start() for m in FED_ID_RE.finditer(big)]
+        started = time.monotonic()
+        _scan_rust("src/wrap_big.rs", big, offs)
+        took = time.monotonic() - started
+        if took > budget:
+            t.fail(f"(wrap-scale): {count} occurrences in one statement took {took:.2f} s "
+                   f"(budget {budget} s); the scan is not linear")
+            break
+
     controls = [
+        ("wrap-ctl-charlit", "an unbalanced '{' char literal before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    let _c = '{';\n")}),
+        ("wrap-ctl-samefinding", "the line moved from one #[cfg(feature = ..)] item to another",
+         {"src/wrap_g.rs": "pub const OTHER_G: u32 = 1;\n",
+          "src/wrapmod/child.rs": files["src/wrapmod/child.rs"] + files["src/wrap_g.rs"]}),
+        ("wrap-ctl-labelled-break", "a labelled break that leaves an outer loop before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    'outer: loop {\n        loop {\n"
+                                  "            break 'outer;\n        }\n    }\n")}),
         ("wrap-ctl-condreturn", "a conditional early return (inside an if) before the line is not an exit",
          {"src/wrap_d.rs": around(files["src/wrap_d.rs"], d_set, "    if k.is_empty() {\n        return \"\";\n    }\n")}),
         ("wrap-ctl-lexer", "char literals, a lifetime and an escaped quote in a string never unbalance the scan",
@@ -2688,6 +2802,18 @@ def _wrap_cells(t, fx, repo, base):
         ("wrap-gap-constflag", "GAP (not closed): the line sits behind `if DISABLED` where the constant is false",
          {"src/wrap_i.rs": files["src/wrap_i.rs"].replace(
              '    k = "' + kid + '";\n', '    if DISABLED {\n    k = "' + kid + '";\n    }\n', 1)}),
+        ("wrap-gap-shadow", "GAP (not closed): a local fn shadows the callee named on the line",
+         {"src/wrap_s.rs": files["src/wrap_s.rs"].replace(
+             "    env_or(", "    fn env_or(_k: &str, d: u32) -> u32 {\n        d\n    }\n    env_or(", 1)}),
+        ("wrap-gap-impl-target", "GAP (not closed): the enclosing impl moves to a type nothing uses",
+         {"src/wrap_t.rs": files["src/wrap_t.rs"].replace("pub struct K;\nimpl K {",
+                                                          "pub struct K;\npub struct Unused;\nimpl Unused {", 1)
+          + "impl K {\n    pub fn read(&self) -> &'static str {\n        \"\"\n    }\n}\n"}),
+        ("wrap-gap-include", "GAP (not closed): include! switched to a fragment without the line",
+         {"src/wrap_k.rs": 'include!("wrap_frag2.rs");\n', "src/wrap_frag2.rs": "pub const WRAP_FRAG: u8 = 0;\n"}),
+        ("wrap-gap-uncalled-move", "GAP (not closed): the line moved into a function nothing calls",
+         {"src/wrap_d.rs": d_text.replace(d_set, "", 1)
+          + "fn never_called() -> &'static str {\n    let mut k = \"\";\n" + d_set + "    k\n}\n"}),
     ]
     for label, desc, edits in gaps:
         fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
@@ -2698,6 +2824,32 @@ def _wrap_cells(t, fx, repo, base):
     fx.g("checkout", "-q", "main")
     fx.reset(base)
     fx.g("update-ref", "refs/remotes/origin/main", base)
+    # (doc-bound, #6716 / #6711 / #6717) every wrap-* cell is named in the OK
+    #       banner, the docstring names each pinned gap cell, the #6560 changelog
+    #       states the M02 equivalence for the disabling property only, and the
+    #       #6427 fragment no longer says the context shapes are not seen.
+    for label in sorted(x for x in t.labels if x.startswith("wrap-") and not x.endswith("-gate")):
+        if not re.search(r"(?<![\w-])" + re.escape(label) + r"(?![\w-])", SELF_TEST_OK):
+            t.fail(f"(doc-bound): the OK banner does not name the cell {label} (#6716)")
+    for needle in ("(wrap-gap-shadow)", "(wrap-gap-impl-target)", "(wrap-gap-include)",
+                   "(wrap-gap-uncalled-move)", "documented only"):
+        if needle not in (__doc__ or ""):
+            t.fail(f"(doc-bound): the module docstring does not name {needle} in the LEXICAL "
+                   "BOUND (#6711, #6716)")
+    sec = REPO_ROOT / "changelog.d" / "6560.security.md"
+    if sec.is_file() and "equivalent for the disabling property only" not in " ".join(
+            sec.read_text(encoding="utf-8").split()):
+        t.fail("(doc-bound): changelog.d/6560.security.md does not state the M02 equivalence "
+               "as 'equivalent for the disabling property only' (#6711)")
+    frag = REPO_ROOT / "changelog.d" / "6427.fixed.md"
+    if frag.is_file():
+        frag_text = " ".join(frag.read_text(encoding="utf-8").split())
+        if "is not seen" in frag_text:
+            t.fail("(doc-bound): changelog.d/6427.fixed.md still says a context shape "
+                   "'is not seen' although the #6560 context check handles it (#6717)")
+        if "is handled by the #6560 context check" not in frag_text:
+            t.fail("(doc-bound): changelog.d/6427.fixed.md does not say a context-disabled "
+                   "unchanged line 'is handled by the #6560 context check' (#6717)")
 
 
 SELF_TEST_OK = (
