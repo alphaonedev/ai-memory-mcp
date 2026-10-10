@@ -1162,14 +1162,23 @@ jobs:
         # (#6124) While the certification is EXPIRED/VOID at both ends a
         # watched-file change passes only with exactly ONE new
         # non-discharging amendment record inside the ledger blockquote
-        # (cells 6124-h*, f*); the self-test asserts the record is refused
-        # when an HTML block or fence opened anywhere in the ledger
-        # (including list items, indented '>' and '>' + tab) would hide it
-        # (6124-l*, q*), when it sits away from the ledger (p*), when the
-        # header cites other issues (i*) or the #6063 cite is an image (m*),
-        # and when any change that touches the doc edits, removes or
-        # reorders an existing record (d*). The cert is never re-issued by
-        # an edit (#3899); only the WP-B1 re-cert (#6063) re-issues it.
+        # (cells 6124-h*, f*), dated from its own commit day less one (at
+        # most 14 days below the merge-base day) to today plus one (t*,
+        # #6733); two records refuse and name step-wise promotion (#6422).
+        # The ledger region must stay in a canonical Markdown subset
+        # (design B, 6124-b*): a fence, HTML, comment, tab, CR, nested or
+        # indented '>', setext, link definition, lazy line, invisible or
+        # bidi character or STATUS decoy there is refused, and a construct
+        # left open anywhere in the doc is refused. The ledger is
+        # append-only on every path unless the judged banner is LIVE
+        # (d*, #6726), a doc-only change may not add a record (#6731), the
+        # header cites exactly one issue (i*), the #6063 cite is a link
+        # (m*), and a Binds-to edit that sets a bound SHA while STATUS
+        # stays EXPIRED/VOID is not a re-issue (6124-b1..b5, #6774). A
+        # crash in one cell family fails a named cell and the rest still
+        # run (#6445). The cert is never
+        # re-issued by an edit (#3899); only the WP-B1 re-cert (#6063)
+        # re-issues it. SELF_TEST_OK in the script lists every cell.
         run: python3 -I scripts/check_cert_expiry.py --self-test
 
   foreign-text-to-caller-gate:
