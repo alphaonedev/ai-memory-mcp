@@ -9820,3 +9820,156 @@ mod cov_doctor_identity_posture_3521 {
         assert_eq!(still, behind, "doctor must not migrate a behind stamp");
     }
 }
+
+/// v1.0.0 #3656 — `doctor --remote` against a live HTTP fixture: the daemon's
+/// own `/health` verdict, its freshness, and the fleet counters on its scrape
+/// must reach the report (audit #3645 F10).
+#[cfg(test)]
+mod remote_health_3656_tests {
+    use super::{RemoteAuth, Report, ReportSection, Severity, run_remote};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn section<'a>(report: &'a Report, name: &str) -> &'a ReportSection {
+        report
+            .sections
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("section {name} not found in {:?}", report.sections))
+    }
+
+    fn fact<'a>(s: &'a ReportSection, key: &str) -> Option<&'a str> {
+        s.facts
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    async fn mount_json(server: &MockServer, route: &str, status: u16, body: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(status).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    async fn healthy_capabilities_and_stats(server: &MockServer) {
+        mount_json(
+            server,
+            crate::handlers::routes::CAPABILITIES,
+            200,
+            serde_json::json!({"schema_version": "2", "feature_tier": "keyword", "features": {}}),
+        )
+        .await;
+        mount_json(
+            server,
+            crate::handlers::routes::STATS,
+            200,
+            serde_json::json!({"total": 42, "links_count": 3}),
+        )
+        .await;
+    }
+
+    async fn report_for(server: &MockServer) -> Report {
+        let url = server.uri();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("ref.db");
+        tokio::task::spawn_blocking(move || {
+            let mut r = run_remote(&url, &db, &RemoteAuth::default());
+            r.compute_overall();
+            r
+        })
+        .await
+        .expect("join")
+    }
+
+    /// The audit's fixture: healthy `/stats`, but the daemon answers `/health`
+    /// with its fail-closed 503 because its cached FTS verdict is `failed`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_failed_health_is_critical_despite_healthy_stats_3656() {
+        let server = MockServer::start().await;
+        healthy_capabilities_and_stats(&server).await;
+        mount_json(
+            &server,
+            crate::handlers::routes::HEALTH,
+            503,
+            serde_json::json!({
+                "status": "error",
+                "version": "1.0.0",
+                "checks": {"connection": "ok", "fts_index": "reachable"},
+                "fts_integrity": {
+                    "status": "failed",
+                    "checked_at": chrono::Utc::now().to_rfc3339(),
+                    "interval_secs": 900
+                },
+                "embedder_ready": false,
+                "federation_enabled": false
+            }),
+        )
+        .await;
+        let report = report_for(&server).await;
+        let health = section(&report, "Health");
+        assert_eq!(health.severity, Severity::Critical, "{health:?}");
+        assert_eq!(fact(health, "http_status"), Some("503"), "{health:?}");
+        assert_eq!(fact(health, "fts_integrity_status"), Some("failed"));
+        assert_eq!(report.overall, Severity::Critical);
+        let storage = section(&report, "Storage");
+        assert_eq!(fact(storage, "total_memories"), Some("42"), "{storage:?}");
+    }
+
+    /// A daemon still SAYING `ok` about a verdict older than its own staleness
+    /// ceiling is re-aged by the doctor's clock: Warning, never a clean pass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_aged_ok_verdict_is_a_warning_3656() {
+        let server = MockServer::start().await;
+        healthy_capabilities_and_stats(&server).await;
+        let old = chrono::Utc::now() - chrono::Duration::seconds(10_000);
+        mount_json(
+            &server,
+            crate::handlers::routes::HEALTH,
+            200,
+            serde_json::json!({
+                "status": "ok",
+                "version": "1.0.0",
+                "checks": {"connection": "ok", "fts_index": "reachable"},
+                "fts_integrity": {
+                    "status": "ok",
+                    "checked_at": old.to_rfc3339(),
+                    "interval_secs": 900
+                },
+                "embedder_ready": false,
+                "federation_enabled": false
+            }),
+        )
+        .await;
+        let report = report_for(&server).await;
+        let health = section(&report, "Health");
+        assert_eq!(health.severity, Severity::Warning, "{health:?}");
+    }
+
+    /// Webhook and Index read the daemon's scrape instead of a raw-SQL stub.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_webhook_and_index_read_the_daemon_scrape_3656() {
+        let server = MockServer::start().await;
+        healthy_capabilities_and_stats(&server).await;
+        Mock::given(method("GET"))
+            .and(path(crate::handlers::routes::METRICS))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "# TYPE ai_memory_webhook_dispatched_total counter\n\
+                 ai_memory_webhook_dispatched_total 5\n\
+                 ai_memory_webhook_failed_total 1\n\
+                 ai_memory_subscriptions_active 2\n\
+                 ai_memory_hnsw_size 1234\n",
+            ))
+            .mount(&server)
+            .await;
+        let report = report_for(&server).await;
+        let webhook = section(&report, "Webhook");
+        assert_eq!(fact(webhook, "dispatched_total"), Some("5"), "{webhook:?}");
+        assert_eq!(fact(webhook, "failed_total"), Some("1"));
+        assert_eq!(fact(webhook, "success_rate_pct"), Some("80.00"));
+        assert_eq!(webhook.severity, Severity::Warning, "80% < 95%");
+        let index = section(&report, "Index");
+        assert_eq!(fact(index, "hnsw_size"), Some("1234"), "{index:?}");
+    }
+}
