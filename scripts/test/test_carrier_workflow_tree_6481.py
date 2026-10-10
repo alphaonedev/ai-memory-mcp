@@ -551,6 +551,8 @@ class Round11EchoMask(unittest.TestCase):
     def test_mask_keeps_only_its_own_marker_6792(self):
         self.assertNotIn("X", SUBSET.mask("PASSWORD: <withheld 9 chars> X"))
         self.assertNotIn(self.TAIL, SUBSET.mask("PASSWORD: <withheld ${{ secrets.P }} " + self.TAIL))
+        # #6890: a marker later in the value does not keep the value text before it.
+        self.assertNotIn(self.TAIL, SUBSET.mask("PASSWORD: " + self.TAIL + " <withheld 3 chars>"))
         once = SUBSET.mask("A_TOKEN: abc,d")
         self.assertEqual(SUBSET.mask(once), once)
         self.assertEqual(SUBSET.mask("A_TOKEN: <withheld 5 chars>"), "A_TOKEN: <withheld 5 chars>")
