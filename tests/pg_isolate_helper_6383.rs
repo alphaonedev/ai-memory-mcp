@@ -350,12 +350,14 @@ fn process_clone_is_dropped_at_exit_6570() {
     let Some((base, template)) = live_inputs("process_clone_is_dropped_at_exit_6570") else {
         return;
     };
-    if pg_isolate::is_isolated_url(&base) {
-        eprintln!(
-            "SKIP process_clone_is_dropped_at_exit_6570: base URL is already an isolated clone"
-        );
-        return;
-    }
+    // Earlier cells in a flag-on run may already have published a clone; the
+    // child must mint from a non-isolated base, so go through the maintenance
+    // database of the same server then.
+    let base = if pg_isolate::is_isolated_url(&base) {
+        pg_isolate::with_database(&base, "postgres")
+    } else {
+        base
+    };
     let run = test_run_id();
     let exe = std::env::current_exe().expect("current exe");
     let out = std::process::Command::new(exe)

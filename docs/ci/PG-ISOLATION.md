@@ -66,6 +66,12 @@ unset.
 * Flag off (or the kill switch on) is today's behaviour, byte for byte.
 * Fail closed: with the flag on, a clone that cannot be made, held or named is
   a failure. Nothing silently falls back to the shared database.
+  That includes the Rust helper's in-process publish: if the shared env lock
+  stays busy past its bound, the mint fails (the test panics with the reason)
+  instead of running with the URL still naming the shared database (#6571).
+* **Own clone, own cleanup.** A clone the Rust helper mints for its own process
+  (no wrapper) is released and dropped by an exit hook, best effort, never a
+  panic (#6570). A clone the wrapper minted is dropped by the wrapper.
 * **Run-scoped.** Every clone name carries its run id (`[a-z0-9]{1,20}`).
   Teardown, and the Rust helper's sweep of its own stale clones, only ever
   touch clones of their own run.
