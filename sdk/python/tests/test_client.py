@@ -8,7 +8,13 @@ The suite is split in two:
   serialization, webhook HMAC, error mapping.
 * **Daemon tests** (opt-in) — run only when ``AI_MEMORY_TEST_DAEMON=1`` is
   set and a daemon is reachable at ``https://localhost:9077``. Every daemon
-  test writes and deletes its own namespace to avoid polluting shared state.
+  test writes into its own namespace and deletes what it wrote by id.
+  A stock daemon refuses an unsigned HTTP write (403 ``ATTESTATION_FAILED``,
+  #1985), so the write tests sign as ``AI_MEMORY_TEST_AGENT_ID`` with the
+  32-byte key at ``AI_MEMORY_TEST_SIGNING_KEY`` (#6777). That agent must be
+  registered with its public key bound on the daemon DB. It needs no admin
+  role: the cleanup deletes by id, which the owner may do.
+  ``scripts/sdk-python-live.py`` sets all of this up and runs the tests (#6746).
 """
 
 from __future__ import annotations
@@ -28,6 +34,7 @@ from ai_memory import (
     Tier,
     ValidationError,
 )
+from ai_memory.attestation import AgentSigningKey
 from ai_memory.errors import raise_for_status
 from ai_memory.models import Memory
 
@@ -49,6 +56,23 @@ skip_without_daemon = pytest.mark.skipif(
     not _daemon_reachable(),
     reason="AI_MEMORY_TEST_DAEMON!=1 or daemon not reachable at localhost:9077",
 )
+
+
+def _test_writer() -> tuple[str, AgentSigningKey]:
+    """The agent id and signing key the live write tests sign with (#6777).
+
+    Fails (never skips) when the daemon tests are enabled but the identity is
+    missing: an unsigned write would only fail later with a less useful 403.
+    """
+    agent = os.environ.get("AI_MEMORY_TEST_AGENT_ID", "")
+    key_path = os.environ.get("AI_MEMORY_TEST_SIGNING_KEY", "")
+    if not agent or not key_path:
+        pytest.fail(
+            "AI_MEMORY_TEST_AGENT_ID and AI_MEMORY_TEST_SIGNING_KEY must be set for the live write "
+            "tests: a stock daemon refuses unsigned writes (ATTESTATION_FAILED). Run them through "
+            "scripts/sdk-python-live.py, which registers the agent and binds its key (#6777)."
+        )
+    return agent, AgentSigningKey.from_file(key_path)
 
 
 # ---------------------------------------------------------------------------
@@ -541,28 +565,38 @@ def test_health_ok() -> None:
 @skip_without_daemon
 def test_store_and_get_roundtrip() -> None:
     ns = f"sdk-test-{uuid.uuid4().hex[:8]}"
-    with AiMemoryClient(base_url=TEST_BASE_URL) as c:
-        created = c.store(title="hello", content="world", namespace=ns)
+    agent, key = _test_writer()
+    with AiMemoryClient(base_url=TEST_BASE_URL, agent_id=agent) as c:
+        created = c.store(
+            title="hello", content="world", namespace=ns, agent_id=agent, signing_key=key
+        )
         memory_id = created["id"]
         try:
             fetched = c.get(memory_id)
             assert fetched.namespace == ns
             assert fetched.title == "hello"
         finally:
-            c.forget(namespace=ns)
+            c.delete(memory_id)
 
 
 @skip_without_daemon
 def test_recall_returns_wrapper() -> None:
     ns = f"sdk-test-{uuid.uuid4().hex[:8]}"
-    with AiMemoryClient(base_url=TEST_BASE_URL) as c:
-        c.store(title="recall subject", content="body text", namespace=ns)
+    agent, key = _test_writer()
+    with AiMemoryClient(base_url=TEST_BASE_URL, agent_id=agent) as c:
+        created = c.store(
+            title="recall subject",
+            content="body text",
+            namespace=ns,
+            agent_id=agent,
+            signing_key=key,
+        )
         try:
             resp = c.recall(context="recall subject", namespace=ns)
             assert resp.count >= 0
             assert isinstance(resp.memories, list)
         finally:
-            c.forget(namespace=ns)
+            c.delete(created["id"])
 
 
 @skip_without_daemon
