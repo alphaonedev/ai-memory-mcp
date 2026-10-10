@@ -2762,6 +2762,43 @@ class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
         # only the top-level `include` key is cargo's config include; [env] include is an env var
         self.assertEqual([], self._repo_mutated(".cargo/config.toml", '[env]\ninclude = "x"\n'))
 
+    # ---- #6490: a variable NAME computed at run time ----
+
+    def test_6118_r7_6490_dynamic_variable_names_are_flagged(self) -> None:
+        want = "variable name at run time"
+        k = "K=CARGO_PROFILE_DEV_DEBUG\n          "
+        cases = [
+            ("export quoted", k + 'export "$K=2"'),
+            ("export braced", k + "export ${K}=2"),
+            ("declare -x", k + 'declare -x "$K=2"'),
+            ("typeset -x", k + 'typeset -x "${K}=2"'),
+            ("GITHUB_ENV echo", k + 'echo "${K}=2" >> "$GITHUB_ENV"'),
+            ("GITHUB_ENV echo partial name", 'P=DEV\n          echo "CARGO_PROFILE_${P}_DEBUG=2" >> "$GITHUB_ENV"'),
+            ("GITHUB_ENV echo command substitution", 'echo "$(echo CARGO_PROFILE_DEV_DEBUG)=2" >> "$GITHUB_ENV"'),
+            ("GITHUB_ENV printf format", k + "printf '%s=2\\n' \"$K\" >> \"$GITHUB_ENV\""),
+            ("GITHUB_ENV multi-line form", k + '{ echo "${K}<<EOF"; echo 2; echo EOF; } >> "$GITHUB_ENV"'),
+            ("GITHUB_ENV here-document", k + 'cat >> "$GITHUB_ENV" <<EOF\n          ${K}=2\n          EOF'),
+            ("printf -v", k + "printf -v \"$K\" '%s' 2\n          export \"$K\""),
+            ("read", k + 'read -r "$K" <<< 2\n          export "$K"'),
+        ]
+        for label, body in cases:
+            with self.subTest(label):
+                found = self._before_prune(R7_PRE + "        run: |\n          %s\n          cargo test --no-run\n" % body)
+                self.assertTrue(any(want in v and "R-DEBUG" in v for v in found), (label, found))
+
+    def test_6118_r7_6490_literal_names_with_dynamic_values_stay_clean(self) -> None:
+        for label, body in [
+            ("value expansion", 'echo "EXTRA_PATH=${X}" >> "$GITHUB_ENV"'),
+            ("export value", 'export FOO="$BAR"'),
+            ("printf without a name", "printf '%s\\n' \"$x\""),
+            ("read a plain name", "read -r line <<< x"),
+            ("notice", 'echo "::notice::$name kept"'),
+            ("literal scrub", '{ echo "AI_MEMORY_DB_PASSPHRASE="; echo "AI_MEMORY_DB_PASSPHRASE_FILE="; } >> "$GITHUB_ENV"'),
+        ]:
+            with self.subTest(label):
+                self.assertEqual([], self._before_prune(
+                    R7_PRE + "        run: |\n          %s\n          cargo test --no-run\n" % body), label)
+
 class PruneScript6118(unittest.TestCase):
     """scripts/ci/prune-runner-target.py against a fake cargo target tree."""
 
