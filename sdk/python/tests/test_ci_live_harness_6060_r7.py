@@ -68,7 +68,9 @@ class Run:
         self.marks.mkdir()
         stub = work / "stub-ai-memory"
         stub.write_text(
-            _STUB.format(python=sys.executable, marks=str(self.marks), write_allowlist=write_allowlist)
+            _STUB.format(
+                python=sys.executable, marks=str(self.marks), write_allowlist=write_allowlist
+            )
         )
         stub.chmod(0o755)
         self.stub = stub
@@ -77,15 +79,30 @@ class Run:
 
     def start(self, *extra: str) -> subprocess.Popen[bytes]:
         self.proc = subprocess.Popen(
-            [sys.executable, "-I", str(_HARNESS), "--binary", str(self.stub), "--sdk", ".",
-             "--run-dir", str(self.work / "run"), *extra],
+            [
+                sys.executable,
+                "-I",
+                str(_HARNESS),
+                "--binary",
+                str(self.stub),
+                "--sdk",
+                ".",
+                "--run-dir",
+                str(self.work / "run"),
+                *extra,
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            # Its own group, so close() reaps a child whose marker is not written yet.
+            start_new_session=True,
         )
         return self.proc
 
     def children(self) -> dict[str, int]:
-        return {mark.name.split("-")[0]: int(mark.name.rsplit("-", 1)[1]) for mark in self.marks.iterdir()}
+        return {
+            mark.name.split("-")[0]: int(mark.name.rsplit("-", 1)[1])
+            for mark in self.marks.iterdir()
+        }
 
     def wait_for(self, *names: str, timeout: float = 60) -> None:
         end = time.monotonic() + timeout
@@ -118,8 +135,11 @@ class Run:
         return left
 
     def close(self) -> None:
-        if self.proc is not None and self.proc.poll() is None:
-            self.proc.kill()
+        if self.proc is not None:
+            try:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
             self.proc.wait()
         for pid in self.alive().values():
             os.kill(pid, signal.SIGKILL)
@@ -134,12 +154,18 @@ def run(tmp_path: pathlib.Path) -> Iterator[Run]:
         harness_run.close()
 
 
-def _group_alive(pgid: int) -> bool:
-    try:
-        os.killpg(pgid, 0)
-    except ProcessLookupError:
-        return False
-    return True
+def _group_alive(pgid: int) -> list[str]:
+    """Live (non-zombie) members of a process group; killpg(pgid, 0) says EPERM for zombies on macOS."""
+    table = subprocess.run(
+        ["ps", "-axo", "pid=,pgid=,stat=,command="], capture_output=True, text=True, check=True
+    ).stdout
+    return [
+        line.strip()
+        for line in table.splitlines()
+        if len(line.split()) >= 3
+        and line.split()[1] == str(pgid)
+        and not line.split()[2].startswith("Z")
+    ]
 
 
 def _gone(run: Run, timeout: float = 10) -> dict[str, int]:
@@ -210,7 +236,7 @@ def test_teardown_reaps_every_child_of_the_harness_6812(run: Run) -> None:
     end = time.monotonic() + 10
     while _group_alive(pgid) and time.monotonic() < end:
         time.sleep(0.1)
-    assert not _group_alive(pgid), f"left running: {run.alive()}"
+    assert _group_alive(pgid) == [], f"left running: {run.alive()}"
 
 
 def test_free_port_is_bindable_on_loopback_6831() -> None:
