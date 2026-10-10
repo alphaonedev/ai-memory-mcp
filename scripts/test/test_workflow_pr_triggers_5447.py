@@ -5535,14 +5535,287 @@ def _self_hosted_6727(body: str) -> bool:
     return False
 
 
-def _fork_refusal_problems_6727(body: str) -> List[str]:
-    """Why a self-hosted job body would run fork pull_request code (empty: it refuses)."""
-    if SelfHostedMergeGroupGuard6727.JOB_IF in body:
+# ---- #6849: a small evaluator for the GitHub expression subset the refusals use ----
+
+EXPR_TOKEN_RE_6849 = re.compile(r"\s*(?:(?P<str>'(?:[^']|'')*')|(?P<num>[0-9]+(?:\.[0-9]+)?)"
+                                r"|(?P<op>&&|\|\||==|!=|!|\(|\)|,)"
+                                r"|(?P<name>[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)*))")
+FORK_REPO_6849 = "alphaonedev/ai-memory-mcp"
+
+
+def _expr_tokens_6849(expr: str) -> List[Tuple[str, str]]:
+    text = expr.strip()
+    if text.startswith("${{") and text.endswith("}}"):
+        text = text[3:-2]
+    out: List[Tuple[str, str]] = []
+    pos = 0
+    text = text.rstrip()
+    while pos < len(text):
+        m = EXPR_TOKEN_RE_6849.match(text, pos)
+        if not m or m.end() == pos:
+            raise Unparsed(f"expression not understood at {text[pos:pos + 20]!r}")
+        kind = m.lastgroup or ""
+        out.append((kind, m.group(kind)))
+        pos = m.end()
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+    return out
+
+
+def _expr_truthy_6849(value: object) -> bool:
+    return value not in (None, False, 0, "")
+
+
+def _expr_equal_6849(left: object, right: object) -> bool:
+    if isinstance(left, str) and isinstance(right, str):
+        return left.lower() == right.lower()
+    return left == right
+
+
+def eval_expr_6849(expr: str, context: Dict[str, object]) -> object:
+    """Evaluate ``expr`` (``!``, ``==``, ``!=``, ``&&``, ``||``, parentheses, string literals,
+    dotted context names and contains/startsWith/endsWith) the way the runner does.  Any other
+    construct raises Unparsed, so the caller reports it (fail closed)."""
+    tokens = _expr_tokens_6849(expr)
+    pos = [0]
+
+    def peek() -> Tuple[str, str]:
+        return tokens[pos[0]] if pos[0] < len(tokens) else ("end", "")
+
+    def take(want: str = "") -> Tuple[str, str]:
+        tok = peek()
+        if tok[0] == "end" or (want and tok[1] != want):
+            raise Unparsed(f"expected {want or 'a token'} in {expr!r}")
+        pos[0] += 1
+        return tok
+
+    def primary() -> object:
+        kind, text = take()
+        if kind == "str":
+            return text[1:-1].replace("''", "'")
+        if kind == "num":
+            return float(text)
+        if text == "(":
+            value = disjunction()
+            take(")")
+            return value
+        if text == "!":
+            return not _expr_truthy_6849(primary())
+        if kind != "name":
+            raise Unparsed(f"unexpected {text!r} in {expr!r}")
+        if text in ("true", "false", "null"):
+            return {"true": True, "false": False, "null": None}[text]
+        if peek()[1] == "(":
+            take("(")
+            args = [disjunction()]
+            while peek()[1] == ",":
+                take(",")
+                args.append(disjunction())
+            take(")")
+            return call(text, args)
+        return context.get(text)
+
+    def call(name: str, args: List[object]) -> object:
+        if len(args) != 2 or name.lower() not in ("contains", "startswith", "endswith"):
+            raise Unparsed(f"function {name} not modelled in {expr!r}")
+        hay, needle = args
+        if isinstance(hay, list):
+            return any(_expr_equal_6849(item, needle) for item in hay)
+        hay_s, needle_s = str("" if hay is None else hay).lower(), str("" if needle is None else needle).lower()
+        if name.lower() == "contains":
+            return needle_s in hay_s
+        return hay_s.startswith(needle_s) if name.lower() == "startswith" else hay_s.endswith(needle_s)
+
+    def comparison() -> object:
+        left = primary()
+        while peek()[1] in ("==", "!="):
+            op = take()[1]
+            equal = _expr_equal_6849(left, primary())
+            left = equal if op == "==" else not equal
+        return left
+
+    def conjunction() -> object:
+        left = comparison()
+        while peek()[1] == "&&":
+            take("&&")
+            right = comparison()
+            left = right if _expr_truthy_6849(left) else left
+        return left
+
+    def disjunction() -> object:
+        left = conjunction()
+        while peek()[1] == "||":
+            take("||")
+            right = conjunction()
+            left = left if _expr_truthy_6849(left) else right
+        return left
+
+    value = disjunction()
+    if peek()[0] != "end":
+        raise Unparsed(f"trailing text in {expr!r}")
+    return value
+
+
+HOSTED_LABEL_RE_6849 = re.compile(r"(?:ubuntu|macos|windows)-[0-9a-z.-]+")
+
+
+def _mapping_lines_6849(body: str, indent: int) -> List[Tuple[int, str, str]]:
+    """(line index, key, inline value) for every ``key:`` line at exactly ``indent`` spaces."""
+    out = []
+    pattern = re.compile(r"^" + " " * indent + r"([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]+(.*))?$")
+    for idx, line in enumerate(body.splitlines()):
+        m = pattern.match(line)
+        if m:
+            out.append((idx, m.group(1), (m.group(2) or "").strip()))
+    return out
+
+
+def _label_sets_6849(value: str) -> Optional[List[str]]:
+    """The runner labels a runs-on value or matrix value names, or None when not a literal."""
+    text = value.strip().strip("'\"") if not value.strip().startswith("[") else value.strip()
+    if text.startswith("["):
+        try:
+            items = json.loads(text)
+        except ValueError:
+            items = [x.strip().strip("'\"") for x in text[1:-1].split(",")]
+        if not isinstance(items, list) or not all(isinstance(x, str) for x in items):
+            return None
+        return items
+    if not text or "${{" in text:
+        return None
+    return [text]
+
+
+def _is_hosted_6849(labels: Optional[List[str]]) -> bool:
+    return labels is not None and len(labels) == 1 and bool(HOSTED_LABEL_RE_6849.fullmatch(labels[0]))
+
+
+def runner_legs_6849(body: str) -> Tuple[List[Dict[str, str]], List[str]]:
+    """(self-hosted legs as matrix contexts, problems) for one job body.  A runs-on the parser
+    cannot resolve to GitHub-hosted labels counts as self-hosted (fail closed)."""
+    lines = body.splitlines()
+    keys = _mapping_lines_6849(body, 4)
+    runs_on = [(idx, val) for idx, key, val in keys if key == "runs-on"]
+    if len(runs_on) != 1:
+        return [], [f"{len(runs_on)} runs-on keys"]
+    idx, value = runs_on[0]
+    if not value:
+        block = []
+        for line in lines[idx + 1:]:
+            m = re.match(r"^      - (.+)$", line)
+            if not m:
+                break
+            block.append(m.group(1).strip().strip("'\""))
+        return ([{}] if not _is_hosted_6849(block) else []), []
+    m = re.fullmatch(r"\$\{\{\s*(?:fromJSON\(\s*)?matrix\.([A-Za-z0-9_-]+)\s*\)?\s*\}\}", value)
+    if not m:
+        return ([] if _is_hosted_6849(_label_sets_6849(value)) else [{}]), []
+    key = m.group(1)
+    values = [v for _i, k, v in sum((_mapping_lines_6849(body, n) for n in range(6, 16)), [])
+              if k == key and v]
+    values += [ln.split(f"- {key}:", 1)[1].strip() for ln in lines
+               if ln.strip().startswith(f"- {key}:")]
+    if not values:
+        return [{}], [f"matrix.{key} has no literal value"]
+    legs = []
+    for raw in values:
+        if not _is_hosted_6849(_label_sets_6849(raw)):
+            legs.append({f"matrix.{key}": raw.strip().strip("'")})
+    return legs, []
+
+
+def _steps_6849(body: str) -> List[Dict[str, List[str]]]:
+    """The job's steps as {key: value lines}; a block scalar's lines are its value."""
+    lines = body.splitlines()
+    try:
+        start = next(i for i, ln in enumerate(lines) if ln.rstrip() == "    steps:")
+    except StopIteration:
         return []
-    pre_checkout, sep, _rest = body.partition(SelfHostedMergeGroupGuard6727.CHECKOUT)
-    if sep and SelfHostedMergeGroupGuard6727.STEP_IF in pre_checkout and "exit 1" in pre_checkout:
-        return []
-    return ["no fork-PR refusal before actions/checkout"]
+    steps: List[Dict[str, List[str]]] = []
+    current: Optional[Dict[str, List[str]]] = None
+    key = ""
+    for line in lines[start + 1:]:
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent <= 4 and not line.lstrip().startswith("#"):
+            break
+        m = re.match(r"^      - ([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]+(.*))?$", line)
+        if m:
+            current = {}
+            steps.append(current)
+            key = m.group(1)
+            current[key] = [m.group(2) or ""]
+            continue
+        m = re.match(r"^        ([A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]+(.*))?$", line)
+        if m and current is not None:
+            key = m.group(1)
+            current[key] = [m.group(2) or ""]
+            continue
+        if current is not None and indent > 8 and key:
+            current[key].append(line.strip())
+    return steps
+
+
+def fork_contexts_6849(event: str, leg: Dict[str, str]) -> List[Dict[str, object]]:
+    """A fork pull_request run: a fork head repository, and one whose head repository is gone."""
+    out = []
+    for head in ("an-attacker/ai-memory-mcp", None):
+        ctx: Dict[str, object] = {"github.event_name": event, "github.repository": FORK_REPO_6849,
+                                  "github.event.pull_request.head.repo.full_name": head,
+                                  "needs.classify.outputs.docs_only": "false"}
+        ctx.update(leg)
+        out.append(ctx)
+    return out
+
+
+REFUSAL_STEP_KEYS_6849 = frozenset(("name", "if", "run"))
+
+
+def _fork_refusal_problems_6727(body: str, events: Tuple[str, ...] = ("pull_request",)) -> List[str]:
+    """Why a self-hosted job body would run fork pull_request code (empty: it refuses).
+
+    #6849: judged by effect.  A job-level ``if:`` must evaluate false for every fork context;
+    otherwise a step before ``actions/checkout`` with exactly name/if/run must evaluate true
+    for every fork context on every self-hosted leg and run ``exit 1``.
+    """
+    legs, problems = runner_legs_6849(body)
+    if problems:
+        return problems
+    keys = _mapping_lines_6849(body, 4)
+    job_ifs = [val for _i, key, val in keys if key == "if"]
+    contexts = [ctx for event in events for leg in (legs or [{}]) for ctx in fork_contexts_6849(event, leg)]
+    if job_ifs:
+        try:
+            if len(job_ifs) == 1 and not any(_expr_truthy_6849(eval_expr_6849(job_ifs[0], c)) for c in contexts):
+                return []
+        except Unparsed as err:
+            return [f"job if: {err}"]
+    steps = _steps_6849(body)
+    pre_checkout = []
+    for step in steps:
+        if any(v.startswith("actions/checkout@") for v in step.get("uses", [])):
+            break
+        pre_checkout.append(step)
+    found: List[str] = []
+    for step in pre_checkout:
+        run = [ln.strip() for ln in step.get("run", [])]
+        if "exit 1" not in run:
+            continue
+        extra = sorted(set(step) - REFUSAL_STEP_KEYS_6849)
+        if extra:
+            found.append(f"refusal step carries {extra}")
+            continue
+        try:
+            fires = all(_expr_truthy_6849(eval_expr_6849(step.get("if", ["true"])[0] or "true", c))
+                        for c in contexts)
+        except Unparsed as err:
+            found.append(f"refusal if: {err}")
+            continue
+        if fires:
+            return []
+        found.append("refusal step if: is false for a fork pull_request")
+    return found or ["no fork-PR refusal before actions/checkout"]
 
 
 class SelfHostedMergeGroupGuard6727(unittest.TestCase):
@@ -5587,7 +5860,7 @@ class SelfHostedMergeGroupGuard6727(unittest.TestCase):
     def test_6727_dropping_a_guard_is_killed(self) -> None:
         for name, job, body in self.self_hosted_jobs():
             with self.subTest(workflow=name, job=job):
-                mutant = body.replace(self.JOB_IF, "").replace(self.STEP_IF, "true")
+                mutant = body.replace(self.JOB_IF, "").replace(self.STEP_IF, "false")
                 self.assertFalse(self.guarded(mutant))
 
 
