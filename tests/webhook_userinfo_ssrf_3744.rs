@@ -19,13 +19,17 @@
 //! cells pin the REGISTRATION surface the tenant reaches: `insert` refuses
 //! each shape, names the real host, and never echoes the userinfo.
 //! RED on `1ec64196b` (every `insert` below succeeded), GREEN on the fix.
-
-#![cfg(feature = "sal")]
+//!
+//! #6685 — nothing here needs the `sal` feature (`subscriptions` and
+//! `rusqlite` compile on every build), so the binary runs on every leg: the
+//! former crate-level `cfg(feature = "sal")` made the default `cargo test`
+//! run 0 of these pins.
 
 use ai_memory::subscriptions::{NewSubscription, insert, list};
 use rusqlite::Connection;
 
 fn fresh_db() -> (tempfile::TempDir, std::path::PathBuf) {
+    std::fs::create_dir_all(".local-runs").expect("create the .local-runs scratch root");
     let dir = tempfile::tempdir_in(".local-runs").expect("scratch under .local-runs");
     let db = dir.path().join("hooks.db");
     let _ = ai_memory::db::open(&db).expect("seed db");
