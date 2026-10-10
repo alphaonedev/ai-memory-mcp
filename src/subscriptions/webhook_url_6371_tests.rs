@@ -141,3 +141,41 @@ fn ipv4_compatible_ipv6_literals_are_unwrapped_by_both_guards_6687() {
         "::".parse::<IpAddr>().expect("ip")
     );
 }
+
+/// Strings the reqwest parser rejects although they carry a `://`.
+const MALFORMED_WITH_SCHEME_6906: &[&str] = &[
+    "https://",
+    "https://[::1/hook",
+    "https://example.com:99999/hook",
+    "http://exa mple.com/hook",
+    "https://example.com:port/hook",
+];
+
+#[test]
+fn parse_refuses_malformed_and_schemeless_urls_6906() {
+    // N18: all three guards and `send()` share this parser, so a parser that
+    // accepted garbage would open every one of them at once.
+    for raw in MALFORMED_WITH_SCHEME_6906 {
+        assert_eq!(
+            webhook_url::ParsedWebhookUrl::parse(raw).map(|_| ()),
+            Err(webhook_url::WebhookUrlError::Malformed),
+            "#6906: {raw:?} has a scheme separator but is not a URL the client can send to"
+        );
+        assert!(
+            validate_url_with(raw, true).is_err(),
+            "#6906: the syntactic guard must refuse {raw:?} even with the loopback opt-in"
+        );
+        assert!(
+            validate_url_dns_with(raw, true).is_err(),
+            "#6906: the DNS guard must refuse {raw:?} even with the loopback opt-in"
+        );
+    }
+    for raw in ["example.com/hook", "//example.com/hook", ""] {
+        assert_eq!(
+            webhook_url::ParsedWebhookUrl::parse(raw).map(|_| ()),
+            Err(webhook_url::WebhookUrlError::MissingScheme),
+            "#6906: {raw:?} has no scheme separator"
+        );
+    }
+    assert!(webhook_url::ParsedWebhookUrl::parse("https://example.com/hook").is_ok());
+}
