@@ -1148,6 +1148,20 @@ jobs:
           done
           echo "::notice::[#3539] passphrase env scrubbed for this job (AI_MEMORY_NO_CONFIG kept)"
 
+      - name: Allow unprivileged binds to port 443 (Linux, #6401 TLS default-port test)
+        if: needs.classify.outputs.docs_only != 'true' && runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          # #6401 - the webhook TLS default-port test binds the wildcard port
+          # 443 and FAILS when it cannot (it no longer skips silently). Linux
+          # reserves ports below 1024 for root, so lower the floor for this
+          # job. A failure here is a red step, never a silent skip.
+          if [ "$(id -u)" = "0" ]; then
+            sysctl -w net.ipv4.ip_unprivileged_port_start=0
+          else
+            sudo -n sysctl -w net.ipv4.ip_unprivileged_port_start=0
+          fi
+
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.docs_only != 'true'
         env:
@@ -1756,6 +1770,20 @@ jobs:
 
       - name: Build release (sal feature)
         run: cargo build --release --features sal
+
+      - name: Allow unprivileged binds to port 443 (Linux, #6401 TLS default-port test)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          # #6401 - the webhook TLS default-port test binds the wildcard port
+          # 443 and FAILS when it cannot (it no longer skips silently). Linux
+          # reserves ports below 1024 for root, so lower the floor for this
+          # job. A failure here is a red step, never a silent skip.
+          if [ "$(id -u)" = "0" ]; then
+            sysctl -w net.ipv4.ip_unprivileged_port_start=0
+          else
+            sudo -n sysctl -w net.ipv4.ip_unprivileged_port_start=0
+          fi
 
       - name: Run lib tests (sal feature)
         env:
