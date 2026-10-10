@@ -77,6 +77,24 @@ class TreeShape(unittest.TestCase):
         self.assertEqual(b.block, (11, 11))
         self.assertEqual(b.block_lines, [(11, "  x")])
 
+    def test_depth_cap_named_refusal_6612(self):
+        self.assertIsNotNone(SUBSET.parse_workflow("".join(" " * i + "k%d:\n" % i for i in range(64))))
+        with self.assertRaises(Unparsed) as ctx:
+            SUBSET.parse_workflow("".join(" " * i + "k%d:\n" % i for i in range(200)))
+        self.assertIn("line 65: nesting deeper than 64 levels", str(ctx.exception))
+        with self.assertRaises(Unparsed) as ctx:
+            SUBSET.parse_workflow("a:\n  " + "- " * 200 + "x\n")
+        self.assertIn("nesting deeper than 64 levels", str(ctx.exception))
+        self.assertIsNotNone(SUBSET.parse_workflow("a: " + "[" * 64 + "]" * 64 + "\n"))
+        with self.assertRaises(Unparsed) as ctx:
+            SUBSET.parse_workflow("a: " + "[" * 2000 + "]" * 2000 + "\n")
+        self.assertIn("line 1: flow collection nested deeper than 64 levels", str(ctx.exception))
+
+    def test_walk_is_iterative_document_order_6612(self):
+        root = SUBSET.parse_workflow("".join(" " * i + "k%d:\n" % i for i in range(64)) + "z: 1\n")
+        names = [n.name for n in root.walk() if n.kind == "key"]
+        self.assertEqual(names, ["k%d" % i for i in range(64)] + ["z"])
+
     def test_8000_block_scalars_parse_in_linear_time_6611(self):
         import time
         for doc in ("a:\n" + "".join("  k%d: |\n    x\n" % i for i in range(8000)),

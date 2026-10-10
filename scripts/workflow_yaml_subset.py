@@ -181,11 +181,17 @@ def _flow_plain(s: str, j: int, key: bool) -> Tuple[int, str]:
     return k, _Plain(text)
 
 
-def _flow_node(s: str, j: int) -> Tuple[int, object]:
+# #6612: deepest block (indentation) or flow (bracket) nesting the reader models.  GitHub's own
+# workflow parser rejects far shallower documents; deeper input is a named refusal, never a
+# RecursionError.
+MAX_DEPTH = 64
+
+
+def _flow_node(s: str, j: int, depth: int = 1) -> Tuple[int, object]:
     """(index past, value) of one flow entry: a flow collection, quoted or plain scalar."""
     ch = s[j]
     if ch in "[{":
-        return _flow(s, j)
+        return _flow(s, j, depth + 1)
     if ch in "'\"":
         end = _quoted_end(s, j)
         if "," in s[j:end]:
@@ -194,7 +200,7 @@ def _flow_node(s: str, j: int) -> Tuple[int, object]:
     return _flow_plain(s, j, False)
 
 
-def _flow(s: str, i: int) -> Tuple[int, object]:
+def _flow(s: str, i: int, depth: int = 1) -> Tuple[int, object]:
     """(index past, value) of the flow collection that opens at s[i] (#5733).
 
     It must close on its row. A sequence holds entries; a mapping holds
@@ -202,6 +208,8 @@ def _flow(s: str, i: int) -> Tuple[int, object]:
     only ASCII spaces may stand around them; an empty entry, a trailing comma and
     any other text are refused.
     """
+    if depth > MAX_DEPTH:
+        raise Unparsed("flow collection nested deeper than %d levels (#6612): %r" % (MAX_DEPTH, s[:80]))
     close = "]" if s[i] == "[" else "}"
     items: List[object] = []
     pairs: Dict[str, object] = {}
@@ -210,7 +218,7 @@ def _flow(s: str, i: int) -> Tuple[int, object]:
         return j + 1, (items if close == "]" else pairs)
     while True:
         if close == "]":
-            j, value = _flow_node(s, j)
+            j, value = _flow_node(s, j, depth)
             items.append(value)
         else:
             if s[j] in "'\"":
@@ -221,7 +229,7 @@ def _flow(s: str, i: int) -> Tuple[int, object]:
             j = _flow_space(s, j + 1)
             if s[j] in ",}":
                 raise Unparsed("flow mapping entry with no value (#5733): " + repr(s))
-            j, value = _flow_node(s, j)
+            j, value = _flow_node(s, j, depth)
             pairs[key] = value
         j = _flow_space(s, j)
         if s[j] == close:
@@ -512,10 +520,12 @@ class Node:
         return None
 
     def walk(self):
-        """This node and every descendant, in document order."""
-        yield self
-        for child in self.children:
-            yield from child.walk()
+        """This node and every descendant, in document order (iterative: no recursion limit, #6612)."""
+        todo = [self]
+        while todo:
+            node = todo.pop()
+            yield node
+            todo.extend(reversed(node.children))
 
 
 def _text_failure_line(text: str) -> Optional[int]:
@@ -587,6 +597,8 @@ def parse_workflow(text: str) -> Node:
         while stack[-1].col >= node.col:
             done = stack.pop()
             done.end = max(done.line, node.line - 1)
+        if len(stack) > MAX_DEPTH:
+            raise Unparsed("line %d: nesting deeper than %d levels (#6612)" % (node.line, MAX_DEPTH))
         parent = stack[-1]
         if node.kind == "key":
             if node.col > 0 and ("'" in node.name or '"' in node.name):

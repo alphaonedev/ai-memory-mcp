@@ -1686,6 +1686,15 @@ def self_test():
                 "    name: ${{ 'Carrier-ruleset live verifier (#6143)' }}\n"))):
         check(label, lambda t=text: None if workflow_pin_problems(t) else "workflow_pin_problems is empty")
 
+    # round8 #6612: nesting past SUBSET.MAX_DEPTH is a named refusal with a line, never a RecursionError.
+    for label, text, needle in (
+            ("round8 #6612: 1500-level block nesting is a named refusal",
+             wf_text + "".join(" " * i + f"k{i}:\n" for i in range(1500)), "nesting deeper than 64 levels"),
+            ("round8 #6612: 2000-level flow nesting is a named refusal",
+             wf_text + "deep: " + "[" * 2000 + "]" * 2000 + "\n", "flow collection nested deeper than 64 levels")):
+        check(label, lambda t=text, n=needle: None if any(n in p and "line " in p for p in workflow_pin_problems(t))
+              else f"workflow_pin_problems does not name {n!r} with a line")
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"
