@@ -98,12 +98,10 @@ def _open_checked(
     *,
     error: Callable[[str], Exception],
     mode_advice: str,
-) -> int | None:
+) -> int:
     """Open ``p`` once and prove the standard on THAT descriptor.
 
-    Returns the open descriptor — the caller owns it and must close it — or
-    ``None`` on a platform with no ``O_NOFOLLOW``, in which case the
-    path-based check has ALREADY been applied and the caller reads by path.
+    Returns the open descriptor, which the caller owns and must close.
 
     ``p.lstat()`` followed by ``p.read_bytes()`` resolves the path TWICE, and
     the bytes that are read are not the bytes that were checked. A local user
@@ -123,21 +121,29 @@ def _open_checked(
     (#3504).
 
     **Platform caveat:** Windows has no ``O_NOFOLLOW`` and no ``O_NONBLOCK``,
-    so there is no way to bind the check to the descriptor there. That leg
-    keeps the historical path-based check-then-read, unchanged and still racy
-    (and, as before #3780, still requiring a POSIX ``os.geteuid``), and says so
-    rather than pretending otherwise. The hub socket and the key directory this
-    loader serves are POSIX-only surfaces today.
+    so a symlink can only be refused by a path-based ``lstat`` pre-check, which
+    stays racy for the link itself. The mode and owner checks, and the read,
+    are bound to ONE descriptor on that leg too (#6317). (Still requiring a
+    POSIX ``os.geteuid``, as before #3780.) The hub socket and the key
+    directory this loader serves are POSIX-only surfaces today.
     """
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     non_block = getattr(os, "O_NONBLOCK", 0)
     if not no_follow:
-        # Windows. Documented above: the pre-#3780 shape, verbatim.
-        st = p.lstat()
-        if stat.S_ISLNK(st.st_mode):
+        # Windows: no O_NOFOLLOW, so the symlink pre-check stays path-based, but
+        # the mode and owner checks are bound to the descriptor that is read
+        # (#6317, the twin of the TypeScript #3812): open once, fstat THAT
+        # descriptor, read THAT descriptor. A file swapped in after the
+        # pre-check is the file that gets checked.
+        if stat.S_ISLNK(p.lstat().st_mode):
             raise error(f"{p} {_SYMLINK_REFUSAL}")
-        check_owned_stat(p, st, error=error, mode_advice=mode_advice)
-        return None
+        fd = os.open(p, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0))
+        try:
+            check_owned_stat(p, os.fstat(fd), error=error, mode_advice=mode_advice)
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
 
     flags = os.O_RDONLY | no_follow | non_block | getattr(os, "O_CLOEXEC", 0)
     try:
@@ -179,8 +185,6 @@ def read_owner_only_bytes(
     because a 32-byte Ed25519 seed is not text.
     """
     fd = _open_checked(p, error=error, mode_advice=mode_advice)
-    if fd is None:
-        return p.read_bytes()
     try:
         return _drain(fd)
     finally:
@@ -195,8 +199,6 @@ def read_owner_only_text(
 ) -> str:
     """:func:`read_owner_only_bytes`, decoded as UTF-8, for JSON credentials."""
     fd = _open_checked(p, error=error, mode_advice=mode_advice)
-    if fd is None:
-        return p.read_text(encoding="utf-8")
     try:
         return _drain(fd).decode("utf-8")
     finally:
