@@ -153,7 +153,7 @@ STATUS_LINE_RE = re.compile(
 )
 BINDS_LINE_RE = re.compile(
     r"^>?" + _S + r"*\*\*" + _S + r"*Binds" + _S + r"+to" + _S + r"*:?" + _S
-    + r"*\*\*" + _S + r"*:?" + _S + r"*`?([0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?)(?![0-9a-fA-F])`?",
+    + r"*\*\*" + _S + r"*:?" + _S + r"*`?([0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?)(?!\w)`?",
     re.IGNORECASE,
 )
 
@@ -1836,13 +1836,23 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     ])
     fx.reset(base)
 
-    # (x3, #6624) the Binds-to sha has a right boundary: exactly 40 or 64 hex is captured whole, a
-    # 41-, 63- or 65-hex run is refused ("no parseable Binds-to line"), never cut to its first 40.
-    for n, want in ((41, "-"), (63, "-"), (65, "-"), (64, "b" * 64), (40, "b" * 40)):
-        fx.banner("LIVE", "b" * n)
-        bound = cert_banner(repo, fx.commit([CERT_DOC], f"binds {n} hex"))[1]
+    # (x3, #6624, #6862) the Binds-to sha has a right boundary: exactly 40 or 64 hex is captured
+    # whole, a 41-, 63- or 65-hex run, or a 40/64-hex run followed by any word character (a
+    # non-hex letter, `_`, a Unicode digit), is refused ("no parseable Binds-to line"), never
+    # cut to its 40- or 64-hex prefix. A closing backtick or punctuation still ends the value.
+    for label, value, want in (
+        ("41-hex", "b" * 41, "-"), ("63-hex", "b" * 63, "-"), ("65-hex", "b" * 65, "-"),
+        ("64-hex", "b" * 64, "b" * 64), ("40-hex", "b" * 40, "b" * 40),
+        ("40-hex plus g", "b" * 40 + "g", "-"), ("40-hex plus z", "b" * 40 + "z", "-"),
+        ("40-hex plus underscore", "b" * 40 + "_", "-"), ("64-hex plus g", "b" * 64 + "g", "-"),
+        ("40-hex plus U+0661", "b" * 40 + "\u0661", "-"), ("40-hex plus U+FF11", "b" * 40 + "\uff11", "-"),
+        ("64-hex plus U+0661", "b" * 64 + "\u0661", "-"),
+        ("40-hex plus period", "b" * 40 + ".", "b" * 40), ("40-hex plus comma", "b" * 40 + ",", "b" * 40),
+    ):
+        fx.banner("LIVE", value)
+        bound = cert_banner(repo, fx.commit([CERT_DOC], f"binds {label}"))[1]
         if bound != want:
-            t.fail(f"(x3): a {n}-hex Binds-to parsed as {bound!r}, expected {want!r}")
+            t.fail(f"(x3): a {label} Binds-to parsed as {bound!r}, expected {want!r}")
         fx.reset(base)
     fx.banner("LIVE", "b" * 41)
     bind41 = fx.commit([CERT_DOC], "violate: 41-hex Binds-to")
@@ -2385,7 +2395,7 @@ SELF_TEST_OK = (
     "GREEN (squash-merge shape, tree diff); (v2) LIVE bound to a non-ancestor whose watched "
     "tree differs RED (the ancestry hatch would have silenced it); (w) unparseable STATUS line "
     "fail-closed; (x1) decoy STATUS line above the banner RED (exactly-one rule); (x2) decoy "
-    "Binds-to line RED; (x3, #6624) a 41-, 63- or 65-hex Binds-to is refused with no parseable Binds-to line and a 64-hex one is parsed whole; "
+    "Binds-to line RED; (x3, #6624, #6862) a 41-, 63- or 65-hex Binds-to, or a 40/64-hex one followed by a word character (g, z, _, a Unicode digit), is refused with no parseable Binds-to line, a 64-hex one is parsed whole and a following period or comma ends the value; "
     "(y) cert doc deleted alongside a wire change RED (ABSENT fails closed); "
     "(z) pure banner reformat on a docs-only change GREEN (tolerant parse); (z2) reformat + "
     "wire change RED as incidental, not unparseable; (pr1) #6137 stale-LIVE head banner with "
