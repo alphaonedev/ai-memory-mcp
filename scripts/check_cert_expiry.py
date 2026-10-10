@@ -116,7 +116,11 @@ first line rustc strips as a shebang in any file, #6839), a newline or a
 comment between `#`, `!` and `[` of an attribute; an end-of-file string, raw string or
 block comment is a named ERROR) and the constructs that enclose it are
 recorded: an attribute on it or on any enclosing item or `mod` (cfg, cfg_attr,
-path, #[test], any attribute outside a short allow-list), an inner
+path, #[test], any attribute outside a short allow-list of built-in names rustc
+refuses to rebind, with derive / serde / schemars inert only in a module scope
+that binds no such name by `use`, glob, `extern crate` or `macro_rules!`;
+every multi-segment path such as clippy:: or rustfmt:: is a finding, #6840;
+`cfg` inside a string argument does not count), an inner
 `#![cfg(..)]`, an `if false` / `if (false)` / `if !!false` / `if cfg!(..)` /
 `if !cfg!(..)` / `while false` block, the else branch of an `if true`, a `for`
 over an empty literal range, a match arm whose literal never matches a literal
@@ -405,13 +409,21 @@ def fed_id_delta(base_counts, head_counts):
 # RELATIVE: a finding on a line that the base did not already carry is drift.
 # Anything the scan cannot parse raises GateError (fail closed).
 
-# Attributes that cannot remove an item from the build. Everything else on an
-# enclosing item is a finding, cfg/cfg_attr/path/unreachable_code always.
-_ATTR_BENIGN = frozenset({
-    "derive", "doc", "allow", "warn", "deny", "forbid", "expect", "must_use", "inline",
-    "cold", "track_caller", "deprecated", "non_exhaustive", "repr", "serde", "schemars",
-    "automatically_derived", "async_trait", "tokio::main", "recursion_limit", "feature",
+# Attributes that cannot remove an item from the build (#6840). _ATTR_INERT
+# are built-in attributes rustc refuses to let a `use`, glob or `extern crate`
+# rebind (verified with rustc 1.98: the rebinding is an error, the item is not
+# compiled out). _ATTR_REBINDABLE are prelude names (derive, and the serde /
+# schemars derive helpers) that ARE rebindable: they are inert only in a scope
+# where the file binds no such name (see _attr_rebinds). Everything else on an
+# enclosing item is a finding (every multi-segment path included: a local
+# `mod clippy` or `extern crate self as rustfmt` makes a tool path resolve to
+# a macro), and cfg/cfg_attr/path/unreachable_code always.
+_ATTR_INERT = frozenset({
+    "doc", "allow", "warn", "deny", "forbid", "expect", "must_use", "inline", "cold",
+    "track_caller", "deprecated", "non_exhaustive", "repr", "automatically_derived",
+    "recursion_limit", "feature",
 })
+_ATTR_REBINDABLE = frozenset({"derive", "serde", "schemars"})
 _ATTR_NAME_RE = re.compile(r"^#!?\[\s*([A-Za-z_][\w:]*)")
 _ATTR_ALWAYS_RE = re.compile(r"\bcfg(?:_attr)?\b|\bunreachable_code\b|^#!?\[\s*path\b")
 # One Rust token per match (#6704, #6705): the scan runs on tokens, so a
@@ -460,13 +472,61 @@ _MOD_DEPTH_CAP = 64
 _HEADER_TAIL = 16  # tokens of a paren/bracket header kept for the rules (#6710)
 
 
-def _attr_findings(attr, out):
-    name = _ATTR_NAME_RE.match(attr)
+def _attr_findings(attr, out, rebound):
+    """`attr` is (text, code): code has every string and char literal blanked,
+    so `cfg` inside `#[doc = ".."]` is not a cfg, while the finding keeps the
+    full text (a changed feature name is still drift). `rebound` is the set of
+    _ATTR_REBINDABLE names the enclosing scope rebinds (#6840)."""
+    text, code = attr
+    name = _ATTR_NAME_RE.match(code)
     name = name.group(1) if name else ""
-    if _ATTR_ALWAYS_RE.search(attr):
-        out.add(f"attribute {attr}")
-    elif name not in _ATTR_BENIGN and not name.startswith(("clippy::", "rustfmt::")):
-        out.add(f"attribute {attr}")
+    inert = name in _ATTR_INERT or (name in _ATTR_REBINDABLE and name not in rebound)
+    if _ATTR_ALWAYS_RE.search(code) or not inert:
+        out.add(f"attribute {text}")
+
+
+def _use_binds(body, out):
+    """Names of _ATTR_REBINDABLE a `use` tree or `extern crate` clause binds: a
+    name not followed by `::` or `as`, and every name for a glob."""
+    for k, v in enumerate(body):
+        if v == "*":
+            out.update(_ATTR_REBINDABLE)
+        name = v[2:] if v.startswith("r#") else v
+        if name in _ATTR_REBINDABLE and (k + 1 == len(body) or body[k + 1] not in ("::", "as")):
+            out.add(name)
+
+
+def _attr_rebinds(toks):
+    """{scope: names} for the _ATTR_REBINDABLE names each module scope binds
+    (#6840). A scope is the token index of the `{` of an inline `mod NAME {`,
+    -1 for the file; a binding anywhere in a scope (a fn body included) counts
+    for the whole scope, and nested scopes inherit (an over-approximation)."""
+    code = [(k, t[0], t[3]) for k, t in enumerate(toks) if t[0] not in ("line", "block")]
+    out = collections.defaultdict(set)
+    scopes = [-1]
+    j, n = 0, len(code)
+    while j < n:
+        k, kind, v = code[j]
+        if kind == "ident" and (v == "use" and not (j + 1 < n and code[j + 1][2] == "<")
+                                or v == "extern" and j + 1 < n and code[j + 1][2] == "crate"):
+            e = j + 1
+            while e < n and code[e][2] != ";":
+                e += 1
+            _use_binds([c[2] for c in code[j + 1:e]], out[scopes[-1]])
+            j = e + 1
+            continue
+        if kind == "ident" and v == "macro_rules" and j + 2 < n and code[j + 1][2] == "!":
+            name = code[j + 2][2]
+            name = name[2:] if name.startswith("r#") else name
+            if name in _ATTR_REBINDABLE:
+                out[scopes[-1]].add(name)
+        if kind == "punct" and v == "{":
+            is_mod = j >= 2 and code[j - 2][2] == "mod" and code[j - 1][1] == "ident"
+            scopes.append(k if is_mod else scopes[-1])
+        elif kind == "punct" and v == "}" and len(scopes) > 1:
+            scopes.pop()
+        j += 1
+    return out
 
 
 def _norm(vals):
@@ -511,7 +571,7 @@ def _header_findings(norm, vals):
 
 class _Frame:
     __slots__ = ("kind", "norm", "attrs", "cum", "exit", "has_break", "is_loop", "stops_break",
-                 "mod", "scrut", "cur", "line", "pend", "pend_found")
+                 "mod", "scrut", "cur", "line", "pend", "pend_found", "rebound")
 
     def __init__(self, kind, toks, attrs, parent, line):
         vals = [v for _, v in toks]
@@ -528,9 +588,12 @@ class _Frame:
         self.scrut = toks[1] if kind == "{" and len(toks) == 2 and toks[0][1] == "match" \
             and _is_lit(toks[1]) else None
         self.cur = []
+        # outer attributes resolve in the parent's scope; the caller adds this
+        # frame's own bindings once it is an inline mod (#6840)
+        self.rebound = frozenset(parent.rebound) if parent is not None else frozenset()
         own = _header_findings(self.norm, vals) if parent is not None else set()
         for attr in self.attrs:
-            _attr_findings(attr, own)
+            _attr_findings(attr, own, self.rebound)
         if parent is not None and parent.scrut is not None and len(toks) >= 2 \
                 and toks[1][1] == "=>" and _is_lit(toks[0]) and toks[0][1] != parent.scrut[1]:
             own.add(f"in a match arm `{toks[0][1]}` that never matches the scrutinee "
@@ -548,7 +611,7 @@ class _Frame:
         that is the single path that carries it (#6719)."""
         self.attrs.append(attr)
         if self.kind != "root":
-            _attr_findings(attr, self.cum)
+            _attr_findings(attr, self.cum, self.rebound)
 
     def reset(self):
         self.cur, self.pend, self.pend_found = [], [], set()
@@ -680,7 +743,9 @@ def _scan_rust(path, text, offsets):
     starts = [0] + [m.end() for m in re.finditer("\n", text)]
     line_of = lambda pos: bisect.bisect_right(starts, pos)  # noqa: E731
     toks = _rust_tokens(path, text, line_of)
+    rebinds = _attr_rebinds(toks)
     root = _Frame("root", [], [], None, 0)
+    root.rebound = frozenset(rebinds.get(-1, ()))
     stack = [root]
     last_closed = ""
     snaps, mods = {}, collections.defaultdict(set)
@@ -746,7 +811,7 @@ def _scan_rust(path, text, offsets):
             if inner:
                 j = code(j + 1)
             if j < n and toks[j][3] == "[":
-                depth, k, body = 0, j, []
+                depth, k, body, bcode = 0, j, [], []
                 while True:
                     if k >= n:
                         raise GateError(f"{path}: unbalanced attribute bracket at line {line_of(lo)} "
@@ -760,15 +825,17 @@ def _scan_rust(path, text, offsets):
                         elif t2[3] == "]":
                             depth -= 1
                         body.append(t2[3])
+                        bcode.append('""' if t2[0] in ("str", "char") else t2[3])
                     k += 1
                     if depth == 0:
                         break
-                attr = ("#!" if inner else "#") + _compact(body)
+                mark = "#!" if inner else "#"
+                attr = (mark + _compact(body), mark + _compact(bcode))
                 if inner:
                     top.add_inner(attr)
                 else:
                     top.pend.append(attr)
-                    _attr_findings(attr, top.pend_found)
+                    _attr_findings(attr, top.pend_found, top.rebound)
                 i = k
                 continue
         if kind == "ident" and val == "break":
@@ -784,6 +851,7 @@ def _scan_rust(path, text, offsets):
                 if hdr and hdr[0][1] == "else":
                     hdr = [("ident", w) for w in last_closed.split()] + hdr
                 fr = _Frame("{", hdr, top.pend, top, line_of(lo))
+                fr.rebound = fr.rebound | rebinds.get(i, frozenset())
                 top.reset()
             else:
                 fr = _Frame(val, top.cur[-_HEADER_TAIL:], (), top, line_of(lo))
@@ -843,7 +911,7 @@ def _scan_rust(path, text, offsets):
                         "of file (cannot parse; fail-closed)")
     inner = set()
     for attr in root.attrs:
-        _attr_findings(attr, inner)
+        _attr_findings(attr, inner, root.rebound)
     return snaps, inner, mods
 
 
