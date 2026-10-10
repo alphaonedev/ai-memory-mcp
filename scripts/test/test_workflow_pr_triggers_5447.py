@@ -3147,8 +3147,11 @@ def _pr(number: int, sha: str, assoc: str = "NONE", head_repo: Optional[str] = "
     return {"number": number, "author_association": assoc, "user": {"login": "someone"}, "head": head}
 
 
-def _review(sha: str, login: str = OPERATOR_6117, state: str = "APPROVED") -> dict:
-    return {"user": {"login": login}, "state": state, "commit_id": sha}
+def _review(sha: str, login: str = OPERATOR_6117, state: str = "APPROVED",
+            submitted_at: object = "2026-10-01T00:00:00Z", review_id: object = 1) -> dict:
+    # #6329: the gate orders the operator's deciding reviews by (submitted_at, id).
+    return {"id": review_id, "user": {"login": login}, "state": state, "commit_id": sha,
+            "submitted_at": submitted_at}
 
 
 # #6325: the real merge_group payload.  GITHUB_SHA and merge_group.head_sha are the queue
@@ -4438,6 +4441,97 @@ class AuthorizationRedaction6328(unittest.TestCase):
     def test_6328_ordinary_words_survive(self) -> None:
         line = self.mod.workflow_error("Bad credentials (HTTP 401)")
         self.assertIn("Bad credentials (HTTP 401)", line)
+
+
+
+# ---- Round 5 (#6329): the operator's LATEST deciding review of the head decides ----
+
+
+class OperatorLatestReview6329(unittest.TestCase):
+    """3-agent vote (6def5ab6) Q2 option D.
+
+    Only the operator's reviews whose commit_id is the PR head count.  APPROVED,
+    CHANGES_REQUESTED and DISMISSED decide; COMMENTED and PENDING are ignored; any other state
+    fails closed.  Deciding reviews are ordered by (submitted_at, id) and the gate passes iff
+    the last one is APPROVED.  A deciding review without a ``YYYY-MM-DDTHH:MM:SSZ``
+    submitted_at or an integer id fails closed.
+    """
+
+    T1, T2, T3 = "2026-10-01T00:00:00Z", "2026-10-02T00:00:00Z", "2026-10-03T00:00:00Z"
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+
+    def gate(self, reviews: List[dict]) -> Tuple[int, str]:
+        api = _fake_api([_pr(7, SHA_A)], {7: reviews})
+        rc, lines = self.mod.run_gate("push", {}, REPO_6117, SHA_A, OPERATOR_6117, api)
+        return rc, "\n".join(lines)
+
+    def both_orders(self, reviews: List[dict], want: int) -> None:
+        for order in (reviews, list(reversed(reviews))):
+            rc, out = self.gate(order)
+            self.assertEqual(want, rc, out)
+
+    def test_6329_changes_requested_after_approval_fails(self) -> None:
+        self.both_orders([_review(SHA_A, submitted_at=self.T1, review_id=1),
+                          _review(SHA_A, state="CHANGES_REQUESTED", submitted_at=self.T2, review_id=2)], 1)
+
+    def test_6329_approval_after_changes_requested_passes(self) -> None:
+        self.both_orders([_review(SHA_A, state="CHANGES_REQUESTED", submitted_at=self.T1, review_id=1),
+                          _review(SHA_A, submitted_at=self.T2, review_id=2)], 0)
+
+    def test_6329_dismissed_after_approval_fails(self) -> None:
+        self.both_orders([_review(SHA_A, submitted_at=self.T1, review_id=1),
+                          _review(SHA_A, state="DISMISSED", submitted_at=self.T2, review_id=2)], 1)
+
+    def test_6329_comment_or_pending_after_approval_does_not_revoke(self) -> None:
+        for state in ("COMMENTED", "PENDING"):
+            with self.subTest(state=state):
+                self.both_orders([_review(SHA_A, submitted_at=self.T1, review_id=1),
+                                  _review(SHA_A, state=state, submitted_at=self.T3, review_id=3)], 0)
+
+    def test_6329_equal_timestamps_are_ordered_by_id(self) -> None:
+        self.both_orders([_review(SHA_A, submitted_at=self.T2, review_id=5),
+                          _review(SHA_A, state="CHANGES_REQUESTED", submitted_at=self.T2, review_id=9)], 1)
+        self.both_orders([_review(SHA_A, state="CHANGES_REQUESTED", submitted_at=self.T2, review_id=5),
+                          _review(SHA_A, submitted_at=self.T2, review_id=9)], 0)
+
+    def test_6329_reviews_of_other_commits_or_users_do_not_decide(self) -> None:
+        self.both_orders([_review(SHA_A, submitted_at=self.T1, review_id=1),
+                          _review(SHA_B, state="CHANGES_REQUESTED", submitted_at=self.T3, review_id=3),
+                          _review(SHA_A, login="someone-else", state="CHANGES_REQUESTED",
+                                  submitted_at=self.T3, review_id=4)], 0)
+
+    def test_6329_unknown_operator_state_fails_closed(self) -> None:
+        rc, out = self.gate([_review(SHA_A, submitted_at=self.T1, review_id=1),
+                             _review(SHA_A, state="REVOKED", submitted_at=self.T2, review_id=2)])
+        self.assertEqual(1, rc, out)
+        self.assertIn("cannot establish its verdict", out)
+
+    def test_6329_malformed_order_fields_fail_closed(self) -> None:
+        for submitted_at, review_id in ((None, 1), ("", 1), ("2026-10-01 00:00:00", 1),
+                                        ("2026-10-01T00:00:00+00:00", 1), ("2026-10-01T00:00:00.5Z", 1),
+                                        (20261001, 1), (self.T1, None), (self.T1, "1"), (self.T1, True),
+                                        (self.T1, 1.0)):
+            with self.subTest(submitted_at=submitted_at, review_id=review_id):
+                rc, out = self.gate([_review(SHA_A, submitted_at=submitted_at, review_id=review_id)])
+                self.assertEqual(1, rc, out)
+                self.assertIn("cannot establish its verdict", out)
+
+    def test_6329_self_test_covers_the_revocation(self) -> None:
+        out = subprocess.run([sys.executable, "-I", str(APPROVAL_PY), "--self-test"],
+                             capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        self.assertIn("self-test PASS: push-approved-then-changes-requested (exit 1, want 1)", out.stdout)
+
+    def test_6329_docs_and_header_say_latest_review(self) -> None:
+        header = " ".join(_job_text(C8_WORKFLOW.read_text(encoding="utf-8"), APPROVAL_JOB)
+                          .replace("#", " ").split())
+        self.assertIn("latest review", header)
+        for rel in ("docs/AI_DEVELOPER_GOVERNANCE.md", "docs/contributing-external.md"):
+            with self.subTest(doc=rel):
+                text = " ".join((ROOT / rel).read_text(encoding="utf-8").split())
+                self.assertIn("latest review", text)
 
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
