@@ -237,7 +237,7 @@ pub mod pg {
     /// not an ambient name/prefix, establishes isolation even with an unsafe URL.
     pub async fn create() -> (sqlx::PgPool, String, PostgresStore) {
         let supplied = std::env::var(PG_ENV).expect("native private PG URL required");
-        let mut url = url::Url::parse(&supplied).expect("valid PG URL");
+        let mut url = reqwest::Url::parse(&supplied).expect("valid PG URL");
         url.set_path("/postgres");
         let admin = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
@@ -315,6 +315,31 @@ pub mod pg {
             .await
             .expect("drop only owned database without FORCE");
         admin.close().await;
+    }
+
+    /// Join catches assertion panics so the parent can close the pool and drop
+    /// the database before propagating a red result (OWNERSHIP-25).
+    pub async fn isolated_clock(offset: i64) {
+        let (admin, name, store) = create().await;
+        let child_store = store.clone();
+        let result = tokio::spawn(async move { clock(&child_store, offset).await }).await;
+        cleanup(admin, name, store).await;
+        result.expect("clock scenario must pass after cleanup");
+    }
+
+    pub async fn isolated_capture() {
+        let (admin, name, store) = create().await;
+        let child_store = store.clone();
+        let result = tokio::spawn(async move {
+            capture(&child_store, TARGET_ID)
+                .await
+                .expect("ordinary PG capture");
+            assert_eq!(counts(&child_store).await, (1, 1, 1));
+            stamps(&child_store, TARGET_ID).await;
+        })
+        .await;
+        cleanup(admin, name, store).await;
+        result.expect("capture scenario must pass after cleanup");
     }
 
     pub async fn counts(store: &PostgresStore) -> (i64, i64, i64) {
