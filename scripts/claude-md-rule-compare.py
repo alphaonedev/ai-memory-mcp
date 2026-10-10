@@ -2052,6 +2052,29 @@ def _self_test_cases() -> int:
 
     guarded("a faulted #6744 pin lets the later checks run (#6818) fixture", pin_fault_cell)
 
+    # #6884: the failure record in the loose-fixture branch of the #6744 pin is itself pinned. A script that builds a
+    # round-4 fixture directly in the body of _self_test_cases must be one recorded, named FAIL (so the run exits 1),
+    # not a printed line that leaves the failure list empty.
+    def unguarded_fixture_pin_cell():
+        source = base_dir / "unguarded-fixtures.py"
+        source.write_text("def _self_test_cases():\n    fresh_pair('showsigverifier')\n"
+                          "    fresh_pair('nonasciiapprover')\n    fresh_pair('shallow')\n", encoding="utf-8")
+        before, captured = len(failures), io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            fixtures_pin(source)
+        recorded = failures[before:]
+        failures[before:] = []  # the proof must not fail the real run
+        text = captured.getvalue()
+        named = all(repr(fixture) in text for fixture in ("showsigverifier", "nonasciiapprover", "shallow"))
+        if recorded != ["round-4 fixtures outside guarded"] or not text.startswith("FAIL:") or not named:
+            failures.append("the #6744 pin loose-fixture record")
+            print(f"FAIL: self-test - a round-4 fixture built outside guarded() must be one recorded, named FAIL: "
+                  f"recorded {recorded!r}, stderr {text!r} (#6884)", file=sys.stderr)
+        else:
+            print("PASS: self-test - the #6744 pin records a failure for a fixture built outside guarded() (#6884)")
+
+    guarded("the #6744 pin records an unguarded fixture (#6884) fixture", unguarded_fixture_pin_cell)
+
     # #5180: the COUNT CHANGED branch uses the same dynamic fence as the rule branch; no other census diff carries
     # a backtick run, so a static fence there was never caught.
     work, _, _ = fresh_pair("countfence")
