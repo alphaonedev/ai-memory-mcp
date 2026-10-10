@@ -4921,5 +4921,54 @@ class WorkflowPythonOptionIsolation6389(unittest.TestCase):
                 texts = {"new.yml": f"jobs:\n  x:\n    steps:\n      - run: {run}\n"}
                 self.assertEqual([], _bare_python_script_runs(texts))
 
+
+
+# ---- Round 5 (#6390, #6392, #6393, #6394, #6395): the evaluator's guards are pinned ----
+
+# Synthetic, non-repeating token bodies (never real credentials).
+_TOKEN_ALPHABET = string.ascii_letters + string.digits
+
+
+def _token_body(length: int, offset: int = 0) -> str:
+    return "".join(_TOKEN_ALPHABET[(offset + 7 * i) % len(_TOKEN_ALPHABET)] for i in range(length))
+
+
+def _leaked_windows(secret: str, text: str, width: int = 8) -> List[str]:
+    """Every ``width``-character window of ``secret`` that appears in ``text``."""
+    return [secret[i:i + width] for i in range(len(secret) - width + 1) if secret[i:i + width] in text]
+
+
+class TokenRedactionAlphabet6390(unittest.TestCase):
+    """Every GitHub token prefix is redacted whole: no 8-character window of its secret part survives."""
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+
+    def relayed(self, token: str) -> str:
+        def api(path: str):
+            raise self.mod.GateError("HTTP 401 for " + token + " (end)")
+        _rc, lines = self.mod.run_gate("push", {}, REPO_6117, SHA_A, OPERATOR_6117, api)
+        return "\n".join(lines)
+
+    def test_6390_every_classic_prefix_is_redacted(self) -> None:
+        for n, prefix in enumerate(("ghp_", "gho_", "ghu_", "ghs_", "ghr_")):
+            body = _token_body(36, n)
+            with self.subTest(prefix=prefix):
+                text = self.relayed(prefix + body)
+                self.assertEqual([], _leaked_windows(body, text), text)
+                self.assertIn("[redacted]", text)
+
+    def test_6390_fine_grained_pat_tail_is_redacted(self) -> None:
+        secret = _token_body(22, 3) + "_" + _token_body(59, 11)
+        text = self.relayed("github_pat_" + secret)
+        self.assertEqual([], _leaked_windows(secret, text), text)
+        self.assertEqual([], _leaked_windows(secret[23:], text), text)  # the 59-character tail on its own
+
+    def test_6390_twenty_character_body_is_the_lower_bound(self) -> None:
+        for prefix in ("ghp_", "ghs_"):
+            body = _token_body(20, 5)
+            with self.subTest(prefix=prefix):
+                self.assertEqual([], _leaked_windows(body, self.relayed(prefix + body)))
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
