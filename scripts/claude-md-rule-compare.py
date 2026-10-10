@@ -65,6 +65,8 @@ from typing import NamedTuple
 GUARD_REL = "scripts/check-claude-md-size.py"
 MANIFEST_REL = "scripts/qc-allowlists/claude-md-rule-sections.sha256"
 DATA_PATHS = ("CLAUDE.md", "docs/reference/ARCHITECTURE_REFERENCE.md", "docs/reference/CODE_STYLE.md")
+# #6714: the leading `\S` is load-bearing. git trims only ASCII blanks, so a value led by a non-ASCII space (no-break,
+# ideographic, em space) reaches this pattern with it; refusing such a value is the fail-closed direction.
 TRAILER = re.compile(r"^Rule-Change-Approved-By: (\S.*)$", re.MULTILINE)
 SHA = re.compile(r"^[0-9a-f]{40}$")
 # #6572: an approval value must name somebody. These Unicode categories (control, format, unassigned, private use,
@@ -696,6 +698,10 @@ def _self_test_cases() -> int:
     for label, lead in (("a form feed", "\x0c"), ("a vertical tab", "\x0b"), ("a no-break space", "\u00a0"),
                         ("an ideographic space", "\u3000")):
         case(f"an approval value led by {label} does not count (#6743)", reword, True, "no commit in the range carries",
+             message=f"head change\n\nRule-Change-Approved-By: {lead}Justin")
+    # #6714: the same refusal for further Unicode spaces, and for a value that is only such a space then a name.
+    for label, lead in (("an em space", "\u2003"), ("an ogham space mark", "\u1680"), ("a thin space", "\u2009")):
+        case(f"an approval value led by {label} does not count (#6714)", reword, True, "no commit in the range carries",
              message=f"head change\n\nRule-Change-Approved-By: {lead}Justin")
     case("an empty trailer value followed by another trailer does not count (#6576)", reword, True, "RESULT: FAIL",
          message="head change\n\nRule-Change-Approved-By:\nCo-Authored-By: Placeholder <noreply@example.invalid>")
