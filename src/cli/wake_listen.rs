@@ -439,7 +439,9 @@ async fn wait_on(stream: &mut WakeStream, timeout: Option<Duration>) -> Option<W
 /// Fold one catch-up read result into the wake stream's backstop clock.
 ///
 /// `Some(envelope)` after a read that completed; `None` after one that
-/// failed. (#6233 red: the failed arm still acknowledges a read.)
+/// failed. Only a completed read restarts the backstop clock: a failed one
+/// proved nothing about the inbox, so the retry stays on the original
+/// deadline (#6233, per ERRORS-19: the failure is logged, not swallowed).
 fn settle_catch_up(stream: &mut WakeStream, result: anyhow::Result<Value>) -> Option<Value> {
     match result {
         Ok(v) => {
@@ -450,7 +452,6 @@ fn settle_catch_up(stream: &mut WakeStream, result: anyhow::Result<Value>) -> Op
             // Degrade, never corrupt: the row is committed and the next
             // signal (at worst the backstop) reads it again.
             tracing::error!("wake listener: catch-up inbox read failed ({e:#}); will retry");
-            stream.note_read();
             None
         }
     }
