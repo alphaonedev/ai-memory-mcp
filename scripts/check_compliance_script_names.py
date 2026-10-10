@@ -1488,6 +1488,10 @@ R13_CELLS = (
     # #6754: a fragment that ends its line, followed by a next line longer than the window whose
     # markup only reaches the name past the cut, is unresolved (the next line is truncated too).
     ("next-trunc2", "Run c\n" + "<b></b>" * 90 + "heck-old.sh daily.\n", R13_FRAG1, 1, R12_UNRESOLVED),
+    # #6755: a line of exactly LINE_CEILING characters is scanned; one character more is undecidable.
+    ("ceiling-exact", "x" * LINE_CEILING + "\n", "", 0, None),
+    ("ceiling-exact-name", "x" * (LINE_CEILING - 13) + " check-old.sh\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("ceiling-plus-one", "x" * (LINE_CEILING + 1) + "\n", "", 2, "line too long"),
 )
 
 # #6753, #6757: in-place edits of the real tree (a copy of docs/compliance and scripts next to the
