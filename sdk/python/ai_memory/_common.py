@@ -498,6 +498,11 @@ def _load_trust_file(context: ssl.SSLContext, shown: str, entry: str) -> None:
         opened = os.fstat(fd)
         if stat.S_ISREG(opened.st_mode):
             _refuse_foreign_acl("CA file", shown, fd)
+    except OSError as exc:
+        raise ValueError(
+            f"verify= CA file {shown!r} cannot be checked ({exc.strerror}); it changed "
+            "while it was being opened (#6829)."
+        ) from None
     finally:
         os.close(fd)
     if not stat.S_ISREG(opened.st_mode):
