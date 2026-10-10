@@ -4548,26 +4548,37 @@ fn admit_probe_target(
     base_url: &str,
     facts: &mut Vec<(String, String)>,
 ) -> Result<Option<crate::egress::PinnedTarget>, ReportSection> {
-    match crate::egress::admit_inference_target(
-        crate::egress::resolve_inference_egress_mode(),
-        class,
-        base_url,
-    ) {
+    let mode = crate::egress::resolve_inference_egress_mode();
+    match crate::egress::admit_inference_target(mode, class, base_url) {
         Ok(pin) => Ok(pin),
         Err(decision) => {
-            if let crate::egress::EgressDecision::Refuse { reason, .. } = decision {
-                facts.push(("inference_egress".into(), reason));
-            }
+            let reason = match decision {
+                crate::egress::EgressDecision::Refuse { reason, .. } => reason,
+                crate::egress::EgressDecision::Allow => {
+                    "the inference-egress gate refused this target".to_owned()
+                }
+            };
+            // Review F3 (#6052) — the note carries the ACTUAL refusal reason
+            // (an off-host plaintext `http://` target is refused under every
+            // posture, #3823, so naming the posture env var would point the
+            // operator at the wrong knob). Under the default `allow` posture
+            // a refusal is a misconfiguration, not a chosen posture, so it is
+            // a Warning: `--fail-on-warn` must not pass a daemon that will
+            // build no client for this endpoint.
+            let note = format!(
+                "probe skipped: {reason}. The daemon builds no client for this target, so \
+                 doctor sends it no request and no credential (#4121)"
+            );
+            facts.push(("inference_egress".into(), reason));
             Err(ReportSection {
                 name: name.into(),
-                severity: Severity::Info,
+                severity: if matches!(mode, crate::egress::InferenceEgressMode::Allow) {
+                    Severity::Warning
+                } else {
+                    Severity::Info
+                },
                 facts: std::mem::take(facts),
-                note: Some(
-                    "probe skipped: the inference-egress posture (AI_MEMORY_INFERENCE_EGRESS) \
-                     refuses this target, so the daemon builds no client for it and doctor \
-                     sends it no request and no credential (#4121)"
-                        .into(),
-                ),
+                note: Some(note),
             })
         }
     }
