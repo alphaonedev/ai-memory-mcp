@@ -52,20 +52,28 @@ fn key_then_prose_then_cert_then_prose_masks_only_the_key_2387() {
     assert_eq!(
         r.matches(REDACTION_PLACEHOLDER).count(),
         1,
-        "exactly the one key block is masked: {r}"
+        "exactly the one key block is masked ({} redacted bytes withheld)",
+        r.len()
     );
-    assert!(!r.contains(KEY_BODY), "key bytes must be gone: {r}");
+    assert!(
+        !r.contains(KEY_BODY),
+        "key bytes must be gone ({} redacted bytes withheld)",
+        r.len()
+    );
     assert!(
         r.contains("prose-between-blocks stays"),
-        "prose between the key and the cert must survive: {r}"
+        "prose between the key and the cert must survive ({} redacted bytes withheld)",
+        r.len()
     );
     assert!(
         r.contains("trailing prose also stays"),
-        "prose after the cert must survive (pre-fix the whole remainder was wiped): {r}"
+        "prose after the cert must survive, pre-fix the remainder was wiped ({} redacted bytes withheld)",
+        r.len()
     );
     assert!(
         r.contains(CERT_BLOCK_PREFIX) && r.contains(CERT_BODY) && r.contains(CERT_BLOCK_SUFFIX),
-        "the non-key certificate block must survive intact: {r}"
+        "the non-key certificate block must survive intact ({} redacted bytes withheld)",
+        r.len()
     );
 }
 
@@ -84,18 +92,25 @@ fn cert_then_key_do_not_fold_into_one_span_2387() {
     assert_eq!(
         r.matches(REDACTION_PLACEHOLDER).count(),
         1,
-        "exactly the one key block is masked: {r}"
+        "exactly the one key block is masked ({} redacted bytes withheld)",
+        r.len()
     );
-    assert!(!r.contains(KEY_BODY), "key bytes must be gone: {r}");
+    assert!(
+        !r.contains(KEY_BODY),
+        "key bytes must be gone ({} redacted bytes withheld)",
+        r.len()
+    );
     assert!(
         r.contains(CERT_BLOCK_PREFIX) && r.contains(CERT_BODY) && r.contains(CERT_BLOCK_SUFFIX),
-        "the certificate must NOT be folded into the key's span: {r}"
+        "the certificate must NOT be folded into the key's span ({} redacted bytes withheld)",
+        r.len()
     );
     assert!(
         r.contains("leading prose")
             && r.contains("middle prose survives")
             && r.contains("tail prose"),
-        "all prose must survive: {r}"
+        "all prose must survive ({} redacted bytes withheld)",
+        r.len()
     );
 }
 
@@ -110,14 +125,17 @@ fn truncated_key_block_never_swallows_a_later_block_2387() {
     let r = redacted_of(&content);
     assert!(
         !r.contains(KEY_BODY),
-        "truncated key bytes must be gone: {r}"
+        "truncated key bytes must be gone ({} redacted bytes withheld)",
+        r.len()
     );
     assert!(
         r.contains(CERT_BLOCK_PREFIX) && r.contains(CERT_BODY) && r.contains(CERT_BLOCK_SUFFIX),
-        "the certificate after a truncated key must survive: {r}"
+        "the certificate after a truncated key must survive ({} redacted bytes withheld)",
+        r.len()
     );
     assert!(
         r.contains("after-cert prose"),
-        "the tail must survive the truncated-paste fallback: {r}"
+        "the tail must survive the truncated-paste fallback ({} redacted bytes withheld)",
+        r.len()
     );
 }
