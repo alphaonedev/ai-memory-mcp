@@ -64,8 +64,10 @@ fn the_mod_rs_retarget_is_a_doc_comment_6127() {
         .unwrap_or_else(|| {
             panic!("#6127: the #4507 retargeted line is present in {FEDERATION_MOD_RS}")
         });
+    // `////` is a plain comment in Rust, so a doc comment starts with exactly three slashes.
+    let trimmed = line.trim_start();
     assert!(
-        line.trim_start().starts_with("///"),
+        trimmed.starts_with("///") && !trimmed.starts_with("////"),
         "#6127: the premise holds — the retargeted line is a `///` doc comment: {line}"
     );
 }
@@ -101,9 +103,22 @@ fn the_amendment_names_each_files_comment_kind_6127() {
 fn doc_comment_appears_only_for_the_mod_rs_retarget_6127() {
     let text = amendment(&read(CERT_DOC));
     let rest = text.replace(MOD_PHRASE, "");
+    // `///` is the doc-comment sigil: only the mod.rs phrase may carry it.
+    assert!(
+        !rest.contains("///"),
+        "#6127: a `///` sigil appears outside the {FEDERATION_MOD_RS} phrase: {text}"
+    );
+    // Fold whitespace around hyphens so "doc-" ending a line and "comment" starting the
+    // next (joined as "doc- comment") is still caught.
+    let folded = rest
+        .to_lowercase()
+        .split('-')
+        .map(|part| part.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join("-");
     for spelling in ["doc-comment", "doc comment"] {
         assert!(
-            !rest.to_lowercase().contains(spelling),
+            !folded.contains(spelling),
             "#6127: `{spelling}` appears outside the {FEDERATION_MOD_RS} phrase: {text}"
         );
     }
