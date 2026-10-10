@@ -6083,5 +6083,54 @@ class ModuleRunsIsolated6799(unittest.TestCase):
         self.assertIn("-m unittest", found[0])
 
 
+# ---- Round 7 (#6845): the #6578 percent-encoded underscore and the decode bound are pinned ----
+
+UNDERSCORE_FORMS_6845 = ("_", "%5F", "%5f", "%255F", "%255f", "%25255F", "%2525255f")
+
+
+class EncodedUnderscoreAndDecodeBound6845(unittest.TestCase):
+    """#6845: a token whose underscores arrive percent-encoded (once, nested, either case) is
+    redacted in place, not by the whole-message fallback; benign text nested up to
+    REDACT_DECODE_ROUNDS (4) encodings is relayed unchanged and one more round redacts it."""
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+
+    def test_6845_the_decode_bound_is_four(self) -> None:
+        self.assertEqual(4, self.mod.REDACT_DECODE_ROUNDS)
+
+    def test_6845_prefix_underscore_forms_redact_in_place(self) -> None:
+        body = _token_body(36, 4)
+        for us in UNDERSCORE_FORMS_6845:
+            for prefix in ("ghp", "gho", "ghu", "ghs", "ghr"):
+                with self.subTest(prefix=prefix, underscore=us):
+                    self.assertEqual("url [redacted] tail", self.mod.redact(f"url {prefix}{us}{body} tail"))
+
+    def test_6845_pat_underscore_forms_redact_in_place_at_each_position(self) -> None:
+        head, rest = _token_body(22, 6), _token_body(59, 13)
+        for us in UNDERSCORE_FORMS_6845:
+            for pos in range(3):
+                seps = ["_", "_", "_"]
+                seps[pos] = us
+                token = f"github{seps[0]}pat{seps[1]}{head}{seps[2]}{rest}"
+                with self.subTest(underscore=us, position=pos):
+                    self.assertEqual("url [redacted] tail", self.mod.redact(f"url {token} tail"))
+
+    def test_6845_benign_text_nested_up_to_four_encodings_is_unchanged(self) -> None:
+        for rounds in range(1, 5):
+            text = "path a%" + "25" * (rounds - 1) + "41 not found (HTTP 404)"
+            with self.subTest(rounds=rounds):
+                self.assertEqual(text, self.mod.redact(text))
+
+    def test_6845_benign_text_nested_five_encodings_redacts_the_whole(self) -> None:
+        self.assertEqual(self.mod.REDACTED_WHOLE, self.mod.redact("path a%" + "25" * 4 + "41 not found"))
+
+    def test_6845_a_token_prefix_nested_four_encodings_redacts_the_whole(self) -> None:
+        body = _token_body(30, 8)
+        text = "x %" + "25" * 3 + "67hs_" + body
+        self.assertNotIn("[redacted]", self.mod.TOKEN_RE.sub("[redacted]", text))
+        self.assertEqual(self.mod.REDACTED_WHOLE, self.mod.redact(text))
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
