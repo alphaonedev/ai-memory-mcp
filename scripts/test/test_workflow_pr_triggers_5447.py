@@ -4817,5 +4817,26 @@ class ApprovalJobShellOverride6388(unittest.TestCase):
         mutant = 'defaults:\n  run:\n    shell: "true {0}"\n\njobs:\n'
         self.assertTrue(_c8_mutant_problems(self.c8, "\njobs:\n", "\n" + mutant))
 
+
+
+class ApprovalJobSpacedKeys6387(unittest.TestCase):
+    """The approval job's own keys are exactly name, runs-on, timeout-minutes, permissions, steps."""
+
+    ANCHOR = "    runs-on: ubuntu-latest\n    timeout-minutes: 5\n    # #3591"
+
+    def setUp(self) -> None:
+        self.c8 = C8_WORKFLOW.read_text(encoding="utf-8")
+
+    def test_6387_live_job_is_intact(self) -> None:
+        self.assertEqual([], _approval_job_problems(self.c8))
+
+    def test_6387_spaced_and_extra_job_keys_are_killed(self) -> None:
+        for row in ("    if : github.event_name == 'workflow_dispatch'\n",
+                    "    needs : [c8-precheck]\n",
+                    "    continue-on-error : true\n",
+                    "    environment : release\n"):
+            with self.subTest(row=row):
+                self.assertTrue(_c8_mutant_problems(self.c8, self.ANCHOR, row + self.ANCHOR))
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
