@@ -292,6 +292,10 @@ STEP_KEYS = frozenset({"id", "if", "name", "uses", "run", "shell", "with", "env"
                        "timeout-minutes", "working-directory"})
 DEFAULTS_RUN_KEYS = frozenset({"shell", "working-directory"})
 BLOCK_HEADER_RE = re.compile(r"[|>][+-]?")
+# Shells whose run body the guard reads as shell text with nothing run before it (#6487).  A
+# custom shell string runs its own words first (`env KEY=V bash {0}`, a wrapper script), and
+# pwsh / python / cmd bodies are not shell, so anything else is a finding.
+SHELL_ALLOWLIST = frozenset({"bash", "sh", "bash -e {0}", "bash --noprofile --norc -eo pipefail {0}", "sh -e {0}"})
 
 
 def _split_key(content: str) -> Tuple[bool, str, str]:
@@ -1321,11 +1325,20 @@ def _debug_overrides(where: str, effective: Dict[str, str], job: Job) -> List[st
     if job.workdir:
         found.append("%s: R-DEBUG defaults.run.working-directory moves cargo to another .cargo/config, want %r"
                      % (where, DEBUG_LEVEL))
+    if job.shell and job.shell not in SHELL_ALLOWLIST:
+        found.append("%s: R-DEBUG defaults.run.shell %r is not on the shell allowlist (a custom shell runs its own "
+                     "words before every run body), want one of %s" % (where, job.shell, sorted(SHELL_ALLOWLIST)))
+    if job.container:
+        found.append("%s: R-DEBUG job runs its steps in a container, whose image sets its own environment and "
+                     "cargo config" % where)
     for step in job.steps:
         label = step.name or step.uses or "<unnamed step>"
         if step.uses and not step.uses.startswith(USES_ALLOWLIST):
             found.append("%s: R-DEBUG step %r uses %r, which is not on the allowlist of actions known not to raise a "
                          "debuginfo level (%s)" % (where, label, step.uses, ", ".join(USES_ALLOWLIST)))
+        if step.shell and step.shell not in SHELL_ALLOWLIST:
+            found.append("%s: R-DEBUG step %r shell %r is not on the shell allowlist (a custom shell runs its own "
+                         "words before the run body), want one of %s" % (where, label, step.shell, sorted(SHELL_ALLOWLIST)))
         if step.workdir:
             found.append("%s: R-DEBUG step %r sets working-directory %r, which moves cargo to another .cargo/config"
                          % (where, label, step.workdir))
@@ -1357,6 +1370,9 @@ def violations(name: str, wf: Workflow, job: Job) -> List[str]:
     found.extend(_debug_overrides(where, effective, job))
     if wf.workdir:
         found.append("%s: R-DEBUG workflow defaults.run.working-directory moves cargo to another .cargo/config" % where)
+    if wf.shell and wf.shell not in SHELL_ALLOWLIST:
+        found.append("%s: R-DEBUG workflow defaults.run.shell %r is not on the shell allowlist, want one of %s"
+                     % (where, wf.shell, sorted(SHELL_ALLOWLIST)))
     if not job.steps:
         found.append("%s: R-PRUNE job has no steps" % where)
         return found
