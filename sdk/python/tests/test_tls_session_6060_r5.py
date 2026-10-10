@@ -904,5 +904,73 @@ def test_fifo_entry_in_a_ca_directory_is_refused_without_blocking_6377(
         client_cls(base_url=_ORIGIN, verify=str(directory))
 
 
+# ---- #6360: the response backstop refuses on its own -----------------------
+
+
+def _backstop(context: ssl.SSLContext, *, is_async: bool) -> Callable[[object], None]:
+    """The SDK's response hook for ``context``, driven synchronously."""
+    hook = _Driver(context, is_async=is_async).hooks["response"][0]
+
+    def check(session: object) -> None:
+        request = httpx.Request("GET", _ORIGIN + "/x")
+        response = httpx.Response(
+            200, request=request, extensions={"network_stream": _Stream(session)}
+        )
+        if is_async:
+            asyncio.run(hook(response))
+        else:
+            hook(response)
+
+    return check
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+@pytest.mark.parametrize(
+    "session",
+    [
+        pytest.param(lambda _context: None, id="no-session"),
+        pytest.param(lambda _context: _Session(ssl.create_default_context()), id="other-context"),
+        pytest.param(lambda context: _Session(context, host="elsewhere.lab"), id="wrong-name"),
+        pytest.param(lambda context: _Session(context, bits=0), id="no-secret-bits"),
+    ],
+)
+def test_backstop_refuses_an_unverified_response_session_6360(
+    is_async: bool, session: Callable[[ssl.SSLContext], object]
+) -> None:
+    context = ssl.create_default_context()
+    with pytest.raises(ValueError, match="verify=False"):
+        _backstop(context, is_async=is_async)(session(context))
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_backstop_refuses_an_empty_peer_certificate_6360(is_async: bool) -> None:
+    context = ssl.create_default_context()
+    session = _Session(context)
+    session._peer = {}  # noqa: SLF001
+    with pytest.raises(ValueError, match="verify=False"):
+        _backstop(context, is_async=is_async)(session)
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_backstop_admits_a_verified_response_session_6360(is_async: bool) -> None:
+    context = ssl.create_default_context()
+    _backstop(context, is_async=is_async)(_Session(context))
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_backstop_refuses_when_the_session_trace_never_ran_6360(
+    wrong_name_origin: RecordingServer,
+    lab: Lab,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+) -> None:
+    # No trace is installed, so only the response hook stands between the
+    # weakened context and a response from a server named for another host.
+    _clear_proxy_env(monkeypatch)
+    monkeypatch.setattr("ai_memory._common._with_trace", lambda _request, _trace: None)
+    with pytest.raises(ValueError, match="verify=False"):
+        _fetch(client_cls, wrong_name_origin.url, lab.client_context(), hook=_no_hostname_check)
+
+
 def test_lab_temp_root_is_project_local_6309(lab: Lab) -> None:
     assert ".local-runs" in pathlib.Path(lab.ca_path).resolve().parts
