@@ -65,3 +65,14 @@ def test_7062_pem_body_line_split_at_every_offset_leaks_nothing(cut):
     assert _no_fragment_of(PEM_LINE, out), (
         f"a fragment of the PEM line survived a read boundary at {cut}"
     )
+
+
+def test_7062_a_span_crossing_the_cut_moves_the_cut_back_to_its_start():
+    """The tail is returned raw from the start of the crossing span (mutants N2, N4)."""
+    h = _h()
+    forms = sorted(h.secret_forms(KEY), key=len, reverse=True)
+    buffer = "x" * 10 + HEX + "y" * 3
+    hold = len(HEX) - 1
+    prefix, tail = h.redact_stream(buffer, forms, hold)
+    assert prefix == "x" * 10, "a part of the key was emitted before the form was complete"
+    assert tail == HEX + "y" * 3

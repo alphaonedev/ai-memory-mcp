@@ -130,3 +130,18 @@ def test_7063_end_to_end_the_scrubbed_report_is_parseable_and_clean(tmp_path):
         sys.stdout = old
     assert list(h.junit_outcomes(report).values()) == ["failed"]
     assert repr(KEY)[2:-1] not in _readable(report)
+
+
+def test_7063_a_secret_in_element_tail_text_is_redacted(tmp_path):
+    """Text that follows a child element (its ``tail``) is filtered too (mutant N6)."""
+    h = _h()
+    secret = b"tail-secret-material-0123456789"
+    path = tmp_path / "junit.xml"
+    path.write_text(
+        '<?xml version="1.0" encoding="utf-8"?><testsuites><testsuite name="s">'
+        f"<system-out><b>x</b>{secret.decode()}</system-out></testsuite></testsuites>",
+        encoding="utf-8",
+    )
+    h.scrub_file(path, [secret])
+    tail = ET.parse(str(path)).getroot().find(".//b").tail
+    assert tail == "<redacted>"
