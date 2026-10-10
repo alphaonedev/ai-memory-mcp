@@ -1597,6 +1597,21 @@ def _self_test_cases() -> int:
         else:
             print(f"PASS: self-test - {name}")
 
+    def cli_cell(name, work, base_root, repo, base_sha, head_sha, want_rc, needles):
+        """#6741: run the comparison as the CI job does (`python3 -I <script>`, a child process) and check the exit
+        code, the only thing the job reads, together with the words the report must carry."""
+        result = subprocess.run([sys.executable, "-I", str(Path(__file__).resolve()), "--base-root", str(base_root),
+                                 "--repo", str(repo), "--base-sha", base_sha, "--head-sha", head_sha,
+                                 "--scratch", str(work / "cli-scratch")],
+                                capture_output=True, text=True, check=False, env=child_env(), stdin=subprocess.DEVNULL)
+        missing = [needle for needle in needles if needle not in result.stdout]
+        if result.returncode != want_rc or missing:
+            failures.append(name)
+            print(f"FAIL: self-test - {name}: exit {result.returncode} (wanted {want_rc}), missing {missing!r}\n"
+                  f"{result.stdout}{result.stderr}", file=sys.stderr)
+        else:
+            print(f"PASS: self-test - {name}")
+
     # #6434: every commit message is read on its own (git log -z). A subject line that is the approval key is never a
     # trailer; read as one blob, the older commit's subject would become the last paragraph of the combined output
     # and count as an approval for the newer commit that follows it.
@@ -1740,8 +1755,30 @@ def _self_test_cases() -> int:
                    clones["full"], shallow_base, merge_sha, True, "no commit in the range carries")
         range_cell("a shallow repository is refused instead of counting an old approval (#6573)", work, base_root,
                    clones["shallow"], shallow_base, merge_sha, True, "the repository is shallow")
+        cli_cell("the program exits 1 with RESULT: FAIL (closed) on a shallow repository (#6741)", work, base_root,
+                 clones["shallow"], shallow_base, merge_sha, 1,
+                 ("RESULT: FAIL (closed) - the repository is shallow",))
 
     guarded("a shallow repository is refused instead of counting an old approval (#6573) fixture", shallow_cell)
+
+    # #6741: the exit code of the program is what the CI job reads. An unapproved rule change must exit 1 and say
+    # FAIL, an approved one must exit 0 and say PASS, and a fail-closed refusal must exit 1; a run() whose exit map
+    # returned 0 for a failed comparison would print FAIL and still pass the job.
+    def cli_exit_cell():
+        work, fork_sha, base_root = fresh_pair("cliexitfail")
+        repo = work / "repo"
+        reword(repo)
+        head_sha = commit_all(repo, "head change")
+        cli_cell("the program exits 1 and reports FAIL for an unapproved rule change (#6741)", work, base_root, repo,
+                 fork_sha, head_sha, 1, ("RESULT: FAIL - the rule text changed",))
+        work, fork_sha, base_root = fresh_pair("cliexitpass")
+        repo = work / "repo"
+        reword(repo)
+        head_sha = commit_all(repo, "head change\n\nRule-Change-Approved-By: Justin")
+        cli_cell("the program exits 0 and reports PASS for an approved rule change (#6741)", work, base_root, repo,
+                 fork_sha, head_sha, 0, ("RESULT: PASS - rule text changed; approval trailer(s): ` Justin `",))
+
+    guarded("the program exit code for an unapproved and an approved rule change (#6741) fixture", cli_exit_cell)
 
     # #6744: the fixtures of the #6575, #6609 and #6573 cells run inside guarded(), so a fault while building one
     # (a git that refuses `clone --depth`, a full disk) is that cell's named FAIL and the cells after it still run.
