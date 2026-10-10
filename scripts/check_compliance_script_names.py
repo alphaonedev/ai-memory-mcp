@@ -89,6 +89,7 @@ import argparse
 import bisect
 import contextlib
 import errno
+import functools
 import html
 import io
 import os
@@ -259,8 +260,12 @@ def read_text(root, path):
         raise Unreadable(path.relative_to(root))
 
 
+@functools.lru_cache(maxsize=None)
 def invisible(c):
-    """True for a character a reader does not see: category Cf or Default_Ignorable_Code_Point."""
+    """True for a character a reader does not see: category Cf or Default_Ignorable_Code_Point.
+
+    Cached per character (#6756): the answer depends on the character alone, and a line repeats few.
+    """
     if unicodedata.category(c) == "Cf":
         return True
     cp = ord(c)
@@ -360,7 +365,9 @@ def tokens(line):
     ``''``/``.``/``..`` components, or a URL's host and path (a prefix starting ``//``), are
     dropped when a ``scripts`` component follows them. A name glued to a run of dots or dashes
     (#6632) is the last component's tail: with a ``/`` before it the whole written component is
-    checked, without one the name is bare.
+    checked, without one the name is bare. A citation whose path would pass
+    ``PATH_LIMIT`` bytes names no file: its ``target`` is None and ``cited`` is shortened, so no
+    prefix is copied per name and the scan stays linear in the line (#6756).
     """
     runs = [(r.start(), r.end()) for r in PATH_RUN_RE.finditer(line)]
     starts = [r[0] for r in runs]
@@ -383,14 +390,16 @@ def tokens(line):
         if not cut:
             yield name, name, "scripts/" + name
             continue
-        prefix = line[run_start:cut]
-        last = line[cut:token_start] + name
-        # ``prefix`` holds the components before ``cut``: those whose offset is below it.
+        end = token_start + len(name)
+        # The components before ``cut`` are those whose offset is below it.
         held = bisect.bisect_left(offsets, cut)
-        if first is not None and first < held and (prefix.startswith("//") or dots):
-            yield prefix + last, name, line[offsets[first] : cut] + last
+        rooted = first is not None and first < held and (line.startswith("//", run_start, cut) or dots)
+        begin = offsets[first] if rooted else run_start
+        if end - begin > PATH_LIMIT:
+            # No file has this path (#6635); copying it per name made the scan quadratic (#6756).
+            yield "%s...%s" % (line[run_start : run_start + 32], line[end - 64 : end]), name, None
         else:
-            yield prefix + last, name, prefix + last
+            yield line[run_start:end], name, line[begin:end]
 
 
 def fragments(line, nxt, follow, budget):
@@ -509,7 +518,19 @@ def join_walk(frag, text, truncated, budget):
     holds.
     """
     unresolved = False
-    closers = {ch: [i for i, c in enumerate(text) if c == ch] for ch in ">])"}
+    closers = {}
+
+    def after(ch, pos):
+        """Indices of ``ch`` in ``text`` after ``pos``; each list is built once, on first use."""
+        found = closers.get(ch)
+        if found is None:
+            found, i = [], text.find(ch)
+            while i >= 0:
+                found.append(i)
+                i = text.find(ch, i + 1)
+            closers[ch] = found
+        return found[bisect.bisect_right(found, pos) :]
+
     ends_at = {}
     stack, seen = [(0, "")], set()
     while stack:
@@ -549,17 +570,15 @@ def join_walk(frag, text, truncated, budget):
         elif c == "<":
             if pos not in ends_at:
                 ends_at[pos] = html_end(text, pos)
-            gts = closers[">"]
-            ends = gts[bisect.bisect_right(gts, pos) :]
+            ends = after(">", pos)
             if not ends or ends_at[pos] is None:
                 unresolved = True
             stack.extend((i + 1, acc) for i in ends)
         elif c in "[(":
             if truncated:
                 unresolved = True
-            close = closers["]" if c == "[" else ")"]
             stack.append((nxt, acc))
-            stack.extend((i + 1, acc) for i in close[bisect.bisect_right(close, pos) :])
+            stack.extend((i + 1, acc) for i in after("]" if c == "[" else ")", pos))
         elif c in JOIN_DROP:
             stack.append((nxt, acc))
     return ("unresolved", None) if unresolved else (None, None)
@@ -574,7 +593,7 @@ def path_ok(root, target):
     search), and a symlink only when it resolves inside scripts/ for a ``scripts/...`` target,
     else inside the repository. A target longer than ``PATH_LIMIT`` bytes is no file (#6635).
     """
-    if len(target.encode("utf-8")) > PATH_LIMIT:
+    if target is None or len(target.encode("utf-8")) > PATH_LIMIT:
         return False
     parts = target.split("/")
     if any(part in ("", ".", "..") for part in parts):
@@ -994,6 +1013,8 @@ def check(root):
                 if covered:
                     continue
                 cited, path = cited_at[name]
+                if path is None:
+                    path = "a path longer than %d bytes" % PATH_LIMIT
                 problems.append(
                     "%s:%d: `%s` does not exist (checked at %s) and no erratum-covered allowlist"
                     " entry (%s) names it" % (rel, i + 1, cited, path, ALLOW_REL)
