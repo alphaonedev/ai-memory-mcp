@@ -17,6 +17,7 @@ session before any non-CONNECT request is sent.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import os
 import pathlib
@@ -24,6 +25,7 @@ import shutil
 import ssl
 import subprocess
 import sys
+import threading
 from collections.abc import Iterator
 from typing import Any, Callable
 
@@ -940,9 +942,31 @@ def test_fifo_entry_in_a_ca_directory_is_refused_without_blocking_6377(
     lab: Lab, tmp_path: pathlib.Path, client_cls: type
 ) -> None:
     directory = _ca_dir(tmp_path)
-    os.mkfifo(directory / f"{_subject_hash(lab.ca_path)}.0", 0o644)
-    with pytest.raises(ValueError, match="regular file"):
-        client_cls(base_url=_ORIGIN, verify=str(directory))
+    fifo = directory / f"{_subject_hash(lab.ca_path)}.0"
+    os.mkfifo(fifo, 0o644)
+    outcome: list[BaseException | None] = []
+
+    def build() -> None:
+        try:
+            client_cls(base_url=_ORIGIN, verify=str(directory))
+            outcome.append(None)
+        except BaseException as exc:  # noqa: BLE001 - recorded for the assertion
+            outcome.append(exc)
+
+    # A blocking open of the FIFO never returns, so the build runs on a daemon
+    # thread with a deadline: a regression FAILS here instead of hanging the
+    # run (#6958).
+    worker = threading.Thread(target=build, daemon=True)
+    worker.start()
+    worker.join(10)
+    if worker.is_alive():
+        # Release the blocked reader so the thread ends, then fail.
+        with contextlib.suppress(OSError):
+            os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        pytest.fail("a FIFO in a CA directory blocked the client build (#6377, #6958)")
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], ValueError)
+    assert "regular file" in str(outcome[0])
 
 
 @_POSIX_ONLY
