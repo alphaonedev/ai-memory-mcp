@@ -381,5 +381,164 @@ def test_pending_state_is_per_request_6349(driver: tuple[_Driver, ssl.SSLContext
     assert leg.closed
 
 
+# ---- #6350: the session must authenticate the host the request goes to ----
+
+
+@pytest.fixture
+def wrong_name_origin(lab: Lab) -> Iterator[RecordingServer]:
+    """An origin whose CA-valid certificate names another host."""
+    server = RecordingServer(
+        lab.server_context("wrong-name", dns=("wrong.lab",), ips=(), common_name="wrong.lab")
+    )
+    try:
+        yield server
+    finally:
+        server.close()
+
+
+def _no_hostname_check(context: ssl.SSLContext) -> None:
+    """Weaken the caller's context AFTER the SDK's per-request check ran."""
+    context.check_hostname = False
+
+
+def _refused_then_reconnects(client_cls: type, url: str, context: ssl.SSLContext) -> object:
+    """First request: hostname check off after the SDK check, must be refused.
+
+    Second request on the SAME client with the check restored: must handshake
+    again (and fail on the name), never reuse the refused connection.
+    Returns what the second request produced: a status code or exception type.
+    """
+    weakened = [True]
+
+    def weaken(_request: httpx.Request) -> None:
+        if weakened[0]:
+            _no_hostname_check(context)
+
+    async def aweaken(_request: httpx.Request) -> None:
+        weaken(_request)
+
+    def restore() -> None:
+        weakened[0] = False
+        context.check_hostname = True
+
+    if client_cls is AiMemoryClient:
+        with AiMemoryClient(base_url=url, verify=context, api_key=_API_KEY, timeout=5) as client:
+            client._client.event_hooks["request"].append(weaken)  # noqa: SLF001
+            with pytest.raises(ValueError, match="verify=False"):
+                client._client.get("/first")  # noqa: SLF001
+            restore()
+            try:
+                return client._client.get("/second").status_code  # noqa: SLF001
+            except httpx.ConnectError as exc:
+                return type(exc)
+
+    async def run() -> object:
+        async with AsyncAiMemoryClient(
+            base_url=url, verify=context, api_key=_API_KEY, timeout=5
+        ) as client:
+            client._client.event_hooks["request"].append(aweaken)  # noqa: SLF001
+            with pytest.raises(ValueError, match="verify=False"):
+                await client._client.get("/first")  # noqa: SLF001
+            restore()
+            try:
+                return (await client._client.get("/second")).status_code  # noqa: SLF001
+            except httpx.ConnectError as exc:
+                return type(exc)
+
+    return asyncio.run(run())
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_wrong_name_session_is_refused_and_evicted_6350(
+    wrong_name_origin: RecordingServer,
+    lab: Lab,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    second = _refused_then_reconnects(client_cls, wrong_name_origin.url, lab.client_context())
+    assert second is httpx.ConnectError  # a fresh handshake, not the pooled session
+    assert wrong_name_origin.hits == []
+    assert wrong_name_origin.api_keys == []
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_wrong_name_tunnelled_session_is_refused_6350(
+    proxy: TunnelProxy, wrong_name_origin: RecordingServer, lab: Lab, client_cls: type
+) -> None:
+    with pytest.raises(ValueError, match="verify=False"):
+        _fetch(client_cls, wrong_name_origin.url, lab.client_context(), hook=_no_hostname_check)
+    assert wrong_name_origin.hits == []
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_dns_only_certificate_does_not_cover_an_ip_host_6350(
+    lab: Lab, monkeypatch: pytest.MonkeyPatch, client_cls: type
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    server = RecordingServer(lab.server_context("dns-only", dns=("localhost",), ips=()))
+    try:
+        url = f"https://127.0.0.1:{server.port}"
+        with pytest.raises(ValueError, match="verify=False"):
+            _fetch(client_cls, url, lab.client_context(), hook=_no_hostname_check)
+        assert server.hits == []
+    finally:
+        server.close()
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_ip_san_covers_an_ip_host_6350(
+    origin: RecordingServer, lab: Lab, monkeypatch: pytest.MonkeyPatch, client_cls: type
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    assert _fetch(client_cls, f"https://127.0.0.1:{origin.port}", lab.client_context()) == [200]
+
+
+def _peer(dns: tuple[str, ...] = (), ips: tuple[str, ...] = (), cn: str | None = None) -> Any:
+    peer: dict[str, Any] = {}
+    sans = tuple(("DNS", name) for name in dns) + tuple(("IP Address", ip) for ip in ips)
+    if sans:
+        peer["subjectAltName"] = sans
+    if cn is not None:
+        peer["subject"] = ((("commonName", cn),),)
+    return peer
+
+
+@pytest.mark.parametrize(
+    ("peer", "host", "matches"),
+    [
+        (_peer(dns=("api.lab.example",)), "API.lab.example.", True),
+        (_peer(dns=("*.lab.example",)), "api.lab.example", True),
+        (_peer(dns=("*.lab.example",)), "lab.example", False),
+        (_peer(dns=("*.lab.example",)), "a.b.lab.example", False),
+        (_peer(dns=("*.example",)), "lab.example", False),
+        (_peer(dns=("a*.lab.example",)), "api.lab.example", False),
+        (_peer(dns=("api.*.example",)), "api.lab.example", False),
+        (_peer(dns=("localhost",)), "127.0.0.1", False),
+        (_peer(ips=("127.0.0.1",)), "127.0.0.1", True),
+        (_peer(ips=("::1",)), "0:0::1", True),
+        (_peer(ips=("127.0.0.1",)), "localhost", False),
+        (_peer(dns=("127.0.0.1",)), "127.0.0.1", False),
+        (_peer(cn="api.lab.example"), "api.lab.example", True),
+        (_peer(dns=("other.example",), cn="api.lab.example"), "api.lab.example", False),
+        (_peer(cn="127.0.0.1"), "127.0.0.1", False),
+        (_peer(), "api.lab.example", False),
+    ],
+)
+def test_peer_name_matching_6350(peer: Any, host: str, matches: bool) -> None:
+    from ai_memory._common import _peer_matches_host
+
+    context = ssl.create_default_context()
+    assert _peer_matches_host(peer, host, context) is matches
+
+
+def test_common_name_fallback_follows_the_context_6350() -> None:
+    from ai_memory._common import _peer_matches_host
+
+    context = ssl.create_default_context()
+    context.hostname_checks_common_name = False
+    assert not _peer_matches_host(_peer(cn="api.lab.example"), "api.lab.example", context)
+
+
 def test_lab_temp_root_is_project_local_6309(lab: Lab) -> None:
     assert ".local-runs" in pathlib.Path(lab.ca_path).resolve().parts
