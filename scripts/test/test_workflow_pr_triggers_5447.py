@@ -3151,9 +3151,19 @@ def _review(sha: str, login: str = OPERATOR_6117, state: str = "APPROVED") -> di
     return {"user": {"login": login}, "state": state, "commit_id": sha}
 
 
-def _merge_group_event(number: int, base: str = "main", sha: str = SHA_C) -> dict:
+# #6325: the real merge_group payload.  GITHUB_SHA and merge_group.head_sha are the queue
+# commit (SHA_C); the <sha> in head_ref is merge_group.base_sha, the queue commit's PARENT
+# (SHA_E), never head_sha (10 of 10 recorded runs, QueueRefBaseSha6325.REAL_RUNS).
+SHA_E = "e" * 40
+
+
+def _merge_group_event(number: int, base: str = "main", sha: str = SHA_E, base_sha: Optional[str] = SHA_E,
+                       head_sha: str = SHA_C) -> dict:
     ref = f"refs/heads/gh-readonly-queue/{base}/pr-{number}-{sha}"
-    return {"action": "checks_requested", "merge_group": {"head_sha": SHA_C, "head_ref": ref}}
+    group = {"head_sha": head_sha, "head_ref": ref, "base_ref": f"refs/heads/{base}"}
+    if base_sha is not None:
+        group["base_sha"] = base_sha
+    return {"action": "checks_requested", "merge_group": group}
 
 
 def _fake_api(pulls: List[dict], reviews: Optional[Dict[int, List[dict]]] = None, fail: bool = False):
@@ -4206,6 +4216,131 @@ class CarrierIdPinned6117(unittest.TestCase):
         one = c8.replace("        id: carrier\n", "        id: carrier0\n", 1)
         self.assertTrue(_carrier_consumption_problems(ci, cov, one))
 
+
+# ---- Round 5 (#6325, #6391): the queue-ref sha is merge_group.base_sha; real payload shapes ----
+
+
+class QueueRefBaseSha6325(unittest.TestCase):
+    """The ``<sha>`` in ``gh-readonly-queue/<base>/pr-<N>-<sha>`` is the queue commit's parent.
+
+    GitHub builds the queue commit on top of ``merge_group.base_sha`` and names the ref after
+    that parent; ``merge_group.head_sha`` is the queue commit itself.  REAL_RUNS are the three
+    distinct payload shapes of the ten runs cited by the round-4 review (run id, PR, head_ref,
+    the queue commit's only parent = base_sha, head_sha), read from the public Actions API.
+    """
+
+    REAL_RUNS = (
+        ("bevyengine/bevy run 37836253771", 26056,
+         "refs/heads/gh-readonly-queue/main/pr-26056-f0391870df745bd4904218c3270e09808eabd9b9",
+         "f0391870df745bd4904218c3270e09808eabd9b9", "59fed6a181902d40ccd739dd8f7c97d6d5714f42"),
+        ("bevyengine/bevy run 37832290092", 26060,
+         "refs/heads/gh-readonly-queue/main/pr-26060-383d525c841dd6d1c087b3b1b3b3c4b3248c5345",
+         "383d525c841dd6d1c087b3b1b3b3c4b3248c5345", "f0391870df745bd4904218c3270e09808eabd9b9"),
+        ("github/docs run 37797829023", 46236,
+         "refs/heads/gh-readonly-queue/main/pr-46236-be8d52465d374661778ab1b5bc493f4403805221",
+         "be8d52465d374661778ab1b5bc493f4403805221", "ca64eb3491bce1212c3d3dddbbb8af2d494b6df3"),
+    )
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+
+    def gate(self, event: dict, number: int = 7, approved: bool = True, assoc: str = "NONE",
+             head_repo: Optional[str] = "fork/ai-memory-mcp", mod=None) -> Tuple[int, str]:
+        pr = _pr(number, SHA_A, assoc, head_repo)
+        api = _fake_api([pr], {number: [_review(SHA_A)] if approved else []})
+        head = event.get("merge_group", {}).get("head_sha", SHA_C)
+        rc, lines = (mod or self.mod).run_gate("merge_group", event, REPO_6117, head, OPERATOR_6117, api)
+        return rc, "\n".join(lines)
+
+    def test_6325_real_shape_approved_external_pr_passes(self) -> None:
+        rc, out = self.gate(_merge_group_event(7))
+        self.assertEqual(0, rc, out)
+        self.assertIn("judging PR #7 named by the queue ref", out)
+
+    def test_6325_real_shape_team_pr_passes(self) -> None:
+        rc, out = self.gate(_merge_group_event(8), number=8, approved=False, assoc="MEMBER", head_repo=REPO_6117)
+        self.assertEqual(0, rc, out)
+
+    def test_6325_real_shape_unapproved_external_pr_fails(self) -> None:
+        rc, out = self.gate(_merge_group_event(7), approved=False)
+        self.assertEqual(1, rc, out)
+        self.assertIn("gate FAILED for PR #7", out)
+
+    def test_6325_ref_sha_equal_to_head_sha_not_base_sha_fails_closed(self) -> None:
+        # The round-4 binding: a ref naming the queue commit itself.  GitHub never emits it.
+        rc, out = self.gate(_merge_group_event(7, sha=SHA_C))
+        self.assertEqual(1, rc, out)
+        self.assertIn("cannot establish its verdict", out)
+        self.assertIn("base_sha", out)
+
+    def test_6325_missing_or_malformed_base_sha_fails_closed(self) -> None:
+        for base_sha in (None, "", 7, SHA_E[:39], SHA_E.upper(), SHA_E + "e", ["e" * 40]):
+            with self.subTest(base_sha=base_sha):
+                event = _merge_group_event(7)
+                if base_sha is None:
+                    del event["merge_group"]["base_sha"]
+                else:
+                    event["merge_group"]["base_sha"] = base_sha
+                rc, out = self.gate(event)
+                self.assertEqual(1, rc, out)
+                self.assertIn("cannot establish its verdict", out)
+
+    def test_6325_short_or_non_hex_ref_sha_fails_closed_even_when_base_sha_matches(self) -> None:
+        for sha in ("abc", "e" * 39, "E" * 40, "g" * 40):
+            with self.subTest(sha=sha):
+                rc, out = self.gate(_merge_group_event(7, sha=sha, base_sha=sha))
+                self.assertEqual(1, rc, out)
+
+    def test_6325_real_payload_replay(self) -> None:
+        for label, number, ref, base_sha, head_sha in self.REAL_RUNS:
+            event = {"action": "checks_requested",
+                     "merge_group": {"head_ref": ref, "base_sha": base_sha, "head_sha": head_sha,
+                                     "base_ref": "refs/heads/main"}}
+            with self.subTest(run=label):
+                self.assertNotEqual(base_sha, head_sha)
+                self.assertEqual(number, self.mod.merge_group_pr_number(event))
+                self.assertEqual(0, self.gate(event, number=number)[0])
+                self.assertEqual(1, self.gate(event, number=number, approved=False)[0])
+
+    def test_6391_slashed_release_base_parses_and_is_judged(self) -> None:
+        event = _merge_group_event(7, base="release/v1.0.0")
+        self.assertIn("gh-readonly-queue/release/v1.0.0/pr-7-", event["merge_group"]["head_ref"])
+        self.assertEqual(7, self.mod.merge_group_pr_number(event))
+        self.assertEqual(0, self.gate(event)[0])
+        self.assertEqual(1, self.gate(event, approved=False)[0])
+
+    def test_6391_m01_single_segment_base_mutant_is_killed(self) -> None:
+        src = APPROVAL_PY.read_text(encoding="utf-8")
+        needle = "gh-readonly-queue/.+/pr-"
+        self.assertEqual(1, src.count(needle))
+        mutant = _exec_approval_src(src.replace(needle, "gh-readonly-queue/[^/]+/pr-"))
+        event = _merge_group_event(7, base="release/v1.0.0")
+        self.assertEqual(1, self.gate(event, mod=mutant)[0])  # the mutant fails every real queue run here
+        self.assertEqual(0, self.gate(event)[0])
+
+    def test_6325_m01_head_sha_binding_mutant_is_killed(self) -> None:
+        src = APPROVAL_PY.read_text(encoding="utf-8")
+        needle = 'group.get("base_sha")'
+        self.assertEqual(1, src.count(needle))
+        mutant = _exec_approval_src(src.replace(needle, 'group.get("head_sha")'))
+        self.assertEqual(1, self.gate(_merge_group_event(7), mod=mutant)[0])  # wedges every real run
+        self.assertEqual(0, self.gate(_merge_group_event(7, sha=SHA_C), mod=mutant)[0])  # passes a forged one
+
+    def test_6325_self_test_uses_the_real_shape(self) -> None:
+        out = subprocess.run([sys.executable, "-I", str(APPROVAL_PY), "--self-test"],
+                             capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        for case in ("merge-group-approved", "merge-group-release-base-approved",
+                     "merge-group-ref-sha-is-head-sha-not-base-sha", "merge-group-missing-base-sha"):
+            self.assertIn(f"self-test PASS: {case} ", out.stdout)
+
+    def test_6325_workflow_comment_and_docstring_name_base_sha(self) -> None:
+        header = _job_text(C8_WORKFLOW.read_text(encoding="utf-8"), APPROVAL_JOB)
+        flat = " ".join(header.replace("#", " ").split())
+        self.assertNotIn("must equal merge_group.head_sha", flat)
+        self.assertIn("merge_group.base_sha", flat)
+        doc = " ".join(APPROVAL_PY.read_text(encoding="utf-8").split('"""')[1].split())
+        self.assertIn("merge_group.base_sha", doc)
 
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
