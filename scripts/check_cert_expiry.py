@@ -3126,6 +3126,13 @@ def _wrap_cells(t, fx, repo, base):
          {"src/wrap_d.rs": around(d_text, d_set, "    loop {\n        drop(break);\n", "    }\n")}),
         ("wrap-panic-in-call", "early exit", "`drop(panic!());` before the line",
          {"src/wrap_d.rs": around(d_text, d_set, "    drop(panic!());\n")}),
+        # #6843: the diverging std functions besides exit and abort
+        ("wrap-adv-panic-any", "early exit", "`std::panic::panic_any(0);` before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    std::panic::panic_any(0);\n")}),
+        ("wrap-adv-resume-unwind", "early exit", "`std::panic::resume_unwind(..);` before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    std::panic::resume_unwind(Box::new(0));\n")}),
+        ("wrap-adv-unreachable-unchecked", "early exit", "an unsafe block calling unreachable_unchecked before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    unsafe { std::hint::unreachable_unchecked() }\n")}),
     ]
     for label, reason, desc, edits in reds:
         fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
@@ -3430,6 +3437,7 @@ SELF_TEST_OK = (
     "(wrap-adv-alias-test-as-serde, wrap-adv-alias-test-as-async_trait, wrap-adv-alias-test-as-schemars, wrap-adv-alias-mod-tokio-main, wrap-adv-m02-alias-serde-cfg-arg, wrap-alias-derive, wrap-glob-alias-serde, wrap-alias-braced-schemars, wrap-tool-clippy-mod, wrap-tool-rustfmt-crate-self, each with -gate, #6840) an attribute name a `use`, a glob, a local `mod` or `extern crate self as` can rebind is a finding, and only names rustc refuses to rebind are inert; (wrap-ctl-attr-string-cfg, wrap-ctl-serde-path-import) `cfg` inside the string of an inert attribute and `use serde::X;` are GREEN; "
     "(wrap-adv-raw-ident-macro-swallow, wrap-raw-panic, each with -gate, #6841) the raw identifier form `r#name!` of a swallowing macro or an exit macro is the same construct; (wrap-ctl-raw-mod-decl) `mod r#name;` declares the module and is GREEN; "
     "(wrap-adv-underscore-assign-return, wrap-adv-paren-return, wrap-adv-return-in-call, wrap-return-first-arg, wrap-break-in-loop-call, wrap-panic-in-call, each with -gate, #6842) a return, break, continue or exit macro anywhere a statement always evaluates is an early exit; (wrap-ctl-closure-return, wrap-ctl-shortcircuit-return, wrap-ctl-match-arm-return) one inside a closure, after `||` or in one match arm is GREEN; "
+    "(wrap-adv-panic-any, wrap-adv-resume-unwind, wrap-adv-unreachable-unchecked, each with -gate, #6843) panic_any, resume_unwind and unreachable_unchecked under any path are exits; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
