@@ -30,6 +30,9 @@
 //! never skipped. Beyond the ignore rules it skips only `.git` entries and
 //! the root [`VENDOR_DIR`]. It does not consult `core.excludesFile` (a
 //! per-user setting outside the repository).
+//! The matcher follows git where the two could differ (#7017): a run of
+//! asterisks is `**` only as a whole path segment, a POSIX bracket class
+//! fails closed, and `core.ignorecase` folds ASCII case.
 //! It never follows a symlink, and a directory or file it cannot read, or a
 //! file that is not UTF-8, FAILS the pin instead of being skipped: a pin that
 //! cannot see a file must not report it clean.
@@ -82,9 +85,10 @@ struct Env {
 }
 
 /// One parsed `.gitignore` line (#6521). Only the syntax the repository's
-/// tracked `.gitignore` files use is supported; anything else (a backslash
-/// escape) is reported as unreadable so the pin fails closed instead of
-/// guessing what git would ignore.
+/// tracked `.gitignore` files use is supported; what is not (a backslash
+/// escape, an empty pattern, a POSIX bracket class, an unterminated class)
+/// is reported as unreadable so the pin fails closed instead of guessing
+/// what git would ignore.
 struct IgnoreRule {
     /// Directory of the `.gitignore` relative to the walk root, `""` at the
     /// root, otherwise ending in `/`.
@@ -130,38 +134,44 @@ fn parse_ignore_line(line: &str, base: &str) -> Result<Option<IgnoreRule>, Strin
 }
 
 /// gitignore(5) glob: `*` and `?` never match `/`, `[...]` is a class (with
-/// `!`/`^` negation and `a-z` ranges), a `**/` segment matches zero or more
-/// directories and any other `**` matches everything. `None` on a malformed
-/// class (fail closed).
+/// `!`/`^` negation and `a-z` ranges, a `]` first being a member). A run of
+/// two or more asterisks is special only as a whole path segment: a leading
+/// `**/` and an inner `/**/` match zero or more directories, a trailing
+/// `/**` (or a bare `**`) matches everything below; anywhere else (#7017) the
+/// run is one regular `*`, which never crosses `/`. `None` (fail closed) on
+/// a malformed class and on a POSIX bracket class (`[:`, `[.`, `[=`), which
+/// is not implemented.
 fn glob(pat: &[u8], text: &[u8]) -> Option<bool> {
+    glob_at(pat, text, true)
+}
+
+/// [`glob`], where `segment_start` says the pattern byte under `pat` opens
+/// a path segment (the start of the pattern, or right after a `/`).
+fn glob_at(pat: &[u8], text: &[u8], segment_start: bool) -> Option<bool> {
     let Some(&head) = pat.first() else {
         return Some(text.is_empty());
     };
     match head {
-        b'*' if pat.get(1) == Some(&b'*') => {
-            let rest = &pat[2..];
-            if let Some(after) = rest.strip_prefix(b"/") {
-                if glob(after, text)? {
+        b'*' => {
+            let run = pat.iter().take_while(|byte| **byte == b'*').count();
+            let rest = &pat[run..];
+            let whole_segment = run >= 2 && segment_start && matches!(rest.first(), None | Some(b'/'));
+            if whole_segment {
+                let Some(after) = rest.strip_prefix(b"/") else {
+                    return Some(true);
+                };
+                if glob_at(after, text, true)? {
                     return Some(true);
                 }
                 for (at, byte) in text.iter().enumerate() {
-                    if *byte == b'/' && glob(after, &text[at + 1..])? {
+                    if *byte == b'/' && glob_at(after, &text[at + 1..], true)? {
                         return Some(true);
                     }
                 }
-                Some(false)
-            } else {
-                for at in 0..=text.len() {
-                    if glob(rest, &text[at..])? {
-                        return Some(true);
-                    }
-                }
-                Some(false)
+                return Some(false);
             }
-        }
-        b'*' => {
             for at in 0..=text.len() {
-                if glob(&pat[1..], &text[at..])? {
+                if glob_at(rest, &text[at..], false)? {
                     return Some(true);
                 }
                 if text.get(at) == Some(&b'/') {
@@ -171,7 +181,7 @@ fn glob(pat: &[u8], text: &[u8]) -> Option<bool> {
             Some(false)
         }
         b'?' => match text.first() {
-            Some(&byte) if byte != b'/' => glob(&pat[1..], &text[1..]),
+            Some(&byte) if byte != b'/' => glob_at(&pat[1..], &text[1..], false),
             _ => Some(false),
         },
         b'[' => {
@@ -190,6 +200,9 @@ fn glob(pat: &[u8], text: &[u8]) -> Option<bool> {
                 if cur == b']' && at > start {
                     break;
                 }
+                if cur == b'[' && matches!(pat.get(at + 1), Some(b':' | b'.' | b'=')) {
+                    return None;
+                }
                 if pat.get(at + 1) == Some(&b'-') && pat.get(at + 2).is_some_and(|e| *e != b']') {
                     let &hi = pat.get(at + 2)?;
                     hit |= (cur..=hi).contains(&byte);
@@ -200,13 +213,13 @@ fn glob(pat: &[u8], text: &[u8]) -> Option<bool> {
                 }
             }
             if hit != negated && byte != b'/' {
-                glob(&pat[at + 1..], &text[1..])
+                glob_at(&pat[at + 1..], &text[1..], false)
             } else {
                 Some(false)
             }
         }
         _ => match text.first() {
-            Some(&byte) if byte == head => glob(&pat[1..], &text[1..]),
+            Some(&byte) if byte == head => glob_at(&pat[1..], &text[1..], head == b'/'),
             _ => Some(false),
         },
     }
@@ -219,7 +232,7 @@ fn is_ignored(
     rel: &str,
     is_dir: bool,
     rules: &[IgnoreRule],
-    _ignore_case: bool,
+    ignore_case: bool,
 ) -> Result<bool, String> {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     let mut ignored = false;
@@ -231,8 +244,15 @@ fn is_ignored(
             continue;
         };
         let subject = if rule.anchored { below } else { name };
-        let matched = glob(rule.pattern.as_bytes(), subject.as_bytes())
-            .ok_or_else(|| format!("malformed .gitignore class in {:?}", rule.pattern))?;
+        let matched = if ignore_case {
+            glob(
+                rule.pattern.to_ascii_lowercase().as_bytes(),
+                subject.to_ascii_lowercase().as_bytes(),
+            )
+        } else {
+            glob(rule.pattern.as_bytes(), subject.as_bytes())
+        }
+        .ok_or_else(|| format!("unsupported .gitignore class in {:?}", rule.pattern))?;
         if matched {
             ignored = !rule.negate;
         }
