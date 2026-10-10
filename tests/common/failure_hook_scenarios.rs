@@ -288,7 +288,7 @@ fn sqlite_gc_stamps(conn: &rusqlite::Connection, archived: usize) {
 #[cfg(feature = "sal-postgres")]
 pub mod pg {
     use super::*;
-    use ai_memory::store::{CallerContext, Filter, MemoryStore, postgres::PostgresStore};
+    use super::ai_memory::store::{CallerContext, Filter, MemoryStore, postgres::PostgresStore};
 
     /// CREATE succeeds before any tested operation. The owned random database,
     /// not an ambient name/prefix, establishes isolation even with an unsafe URL.
