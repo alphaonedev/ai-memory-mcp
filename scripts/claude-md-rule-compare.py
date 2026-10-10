@@ -458,13 +458,14 @@ def value_line_indexes(lines: list, key_indexes=frozenset()) -> set:
     structure (STRUCTURE_LINE, a nested `key:` that passes the wait on) or a prose_cell (a nested `key: value` is
     judged by its value), and every line of a YAML block scalar under `name: |` / `name: >-` that is more indented
     than the name line (blank lines inside the block are skipped). A line in `key_indexes` (a private key block,
-    masked anyway) ends the wait. Computed per side, so a value changed under
-    an unchanged name line is found on the old side for its `-` row and on the head side for its `+` row."""
+    masked anyway) ends the wait for a value but not a block scalar it sits in (#6665). Computed per side, so a value
+    changed under an unchanged name line is found on the old side for its `-` row and on the head side for its `+`
+    row."""
     inside, pending, block = set(), None, None
     for index, line in enumerate(lines):
         content = line.strip()
         if index in key_indexes:
-            pending = block = None
+            pending = None  # round 5 (#6665): the block state stays, a later more-indented line is still a block line
             continue
         if block is not None:
             if not content:
