@@ -103,3 +103,41 @@ fn plain_listener_gets_no_connection_from_send_6371() {
         "#6371: no connection may reach the loopback listener"
     );
 }
+
+/// #6687 — the deprecated IPv4-compatible `::/96` form wraps an IPv4 address
+/// exactly like `::ffff:`; both guards must read the wrapped address.
+#[test]
+fn ipv4_compatible_ipv6_literals_are_unwrapped_by_both_guards_6687() {
+    for url in [
+        "https://[::127.0.0.1]/hook",
+        "https://[::7f00:1]/hook",
+        "https://[::10.0.0.1]/hook",
+        "https://[::169.254.169.254]/latest",
+        "https://[::192.168.1.1]/hook",
+    ] {
+        assert!(
+            validate_url_with(url, false).is_err(),
+            "#6687: the syntactic guard must refuse {url}"
+        );
+        assert!(
+            validate_url_dns_with(url, false).is_err(),
+            "#6687: the DNS guard must refuse {url}"
+        );
+    }
+    // The wrapped loopback is loopback: allowed only with the opt-in.
+    assert!(validate_url_with("https://[::127.0.0.1]/hook", true).is_ok());
+    assert!(is_loopback_normalized("::127.0.0.1".parse().expect("ip")));
+    assert_eq!(
+        normalize_ip("::10.0.0.1".parse().expect("ip")),
+        "10.0.0.1".parse::<IpAddr>().expect("ip")
+    );
+    // `::` and `::1` keep their IPv6 identity (no wrap to 0.0.0.0 / 0.0.0.1).
+    assert_eq!(
+        normalize_ip("::1".parse().expect("ip")),
+        "::1".parse::<IpAddr>().expect("ip")
+    );
+    assert_eq!(
+        normalize_ip("::".parse().expect("ip")),
+        "::".parse::<IpAddr>().expect("ip")
+    );
+}
