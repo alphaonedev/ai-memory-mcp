@@ -367,10 +367,16 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Unit-test the npm audit gate (canned JSON, no network)
+      - name: Test npm audit reports and real npm coverage (inert local registry)
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
         run: >-
           python3 -m unittest scripts/test/test_check_npm_audit_sdk.py
           scripts/test/test_npm_audit_report_integrity_7108.py
+          scripts/test/test_npm_audit_coverage_7118.py
+          scripts/test/test_npm_audit_duplicate_members_7119.py
       - name: Run npm audit gate over sdk/typescript (runtime and development dependencies)
         run: python3 scripts/check-npm-audit-sdk.py --dir sdk/typescript
 

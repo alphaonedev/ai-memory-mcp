@@ -32,17 +32,37 @@ KEY_ERROR = "error"
 EXIT_CLEAN = 0
 EXIT_FINDINGS = 1
 EXIT_ERROR = 2
+FULL_INCLUDE_CLASSES = ("dev", "optional", "peer")
+RUNTIME_INCLUDE_CLASSES = ("optional", "peer")
+
+
+def decode_report(raw):
+    """Reject duplicate decoded member names before any report data is lost."""
+    def unique_members(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                # Keys and values can contain credentials: never echo them.
+                raise ValueError("duplicate audit report member")
+            result[key] = value
+        return result
+
+    return json.loads(raw, object_pairs_hook=unique_members)
 
 
 def load_report(args):
     """Return report and process status, or the distinct announced-skip marker."""
     if args.json_file:
-        return json.loads(Path(args.json_file).read_text(encoding="utf-8")), None
+        return decode_report(Path(args.json_file).read_text(encoding="utf-8")), None
     if shutil.which(NPM_BINARY) is None:
         print("::notice::npm not found on PATH; skipping npm audit gate for "
               "%s (gate NOT evaluated)" % args.dir)
         return REPORT_UNAVAILABLE
     cmd = [NPM_BINARY, "audit", "--audit-level=%s" % args.level, "--json"]
+    # CLI include policy overrides NODE_ENV, aliases and inherited .npmrc lists.
+    # Supplying the runtime list also replaces inherited include=dev.
+    classes = RUNTIME_INCLUDE_CLASSES if args.omit_dev else FULL_INCLUDE_CLASSES
+    cmd.extend("--include=" + kind for kind in classes)
     if args.omit_dev:
         cmd.append("--omit=dev")
     proc = subprocess.run(
@@ -53,7 +73,7 @@ def load_report(args):
         raise ValueError("npm audit operational failure (rc=%d)" % proc.returncode)
     # Raw subprocess stderr may contain credentials; status and parser location
     # provide diagnostics without copying an untrusted operational payload.
-    return json.loads(proc.stdout), proc.returncode
+    return decode_report(proc.stdout), proc.returncode
 
 
 def validate_report(report):
