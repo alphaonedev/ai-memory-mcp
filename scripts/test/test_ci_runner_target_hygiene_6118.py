@@ -2419,6 +2419,14 @@ class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
                 self.assertEqual([], found)
 
 
+    def test_6118_r7_6296_toml_hex_escape_in_quoted_key_is_decoded(self) -> None:
+        self._repo_cases([
+            ("config rustflags key", ".cargo/config.toml", '[build]\n"rust\\x66lags" = ["-g"]\n'),
+            ("manifest package debug key", "Cargo.toml", '[profile.dev.package."*"]\n"deb\\x75g" = 2\n'),
+            ("nested config dotted key", "crates/sub/.cargo/config.toml", 'build."rust\\x66lags" = "-g"\n'),
+        ])
+
+
 class PruneScript6118(unittest.TestCase):
     """scripts/ci/prune-runner-target.py against a fake cargo target tree."""
 
