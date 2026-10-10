@@ -75,34 +75,73 @@ Accepted (anything else raises `ValueError` from the constructor):
 - A `str` or `os.PathLike` naming an existing CA bundle file or hashed CA
   directory. The path is resolved with `os.path.realpath` when the client is
   built (symlinks followed, a relative path fixed against the working
-  directory at that moment) and the SDK loads it into a context it builds with
-  `ssl.create_default_context`. A later `chdir` cannot change what is trusted.
+  directory at that moment). The SDK reads the trust ONCE, at construction,
+  into a context it builds the way `ssl.create_default_context` does but
+  without the system store: for a directory, every hashed entry
+  (`<hash>.0`, `<hash>.r0`, ..., as `c_rehash` / `openssl rehash` name them)
+  is loaded then, so a certificate added to the directory afterwards is never
+  trusted, and a later `chdir` cannot change what is trusted. An empty
+  directory trusts nothing, so every connection fails. The path must not be
+  writable by its group or by others (#6377).
 - Exactly `ssl.SSLContext` (not a subclass): the object returned by
   `ssl.create_default_context(cafile=...)`, with `verify_mode` left at
-  `CERT_REQUIRED`, `check_hostname` on, and `wrap_socket`/`wrap_bio` unpatched.
-  The check runs again before every request, so weakening the context after
-  construction is refused, not honoured.
+  `CERT_REQUIRED`, `check_hostname` on, no verify flag that relaxes chain
+  validation, no cipher suite without server authentication, and no handshake
+  attribute replaced. The SDK keeps using the caller's object, so the same
+  checks run again before every request: turning verification, the hostname
+  check or date checking off, or adding unauthenticated suites, after
+  construction is refused. A CA the caller loads into its own context later
+  is trusted, because the context is the caller's trust decision.
 
 Refused with `ValueError` (#3840, #6267, #6268, #6269):
 
 - `False`, and every other falsy or blank value (`""`, `0`, a falsy
   `str`/path subclass).
-- A path that does not exist, or is neither a file nor a directory.
+- A path that does not exist, or is neither a file nor a directory; a CA
+  file, CA directory, symlink target or target directory that its group or
+  others can write (POSIX, #6377); a directory entry that is not a regular
+  file.
 - A context with `verify_mode` of `CERT_NONE` or `CERT_OPTIONAL`, or with
   `check_hostname` off.
+- A context with a verify flag that relaxes chain validation, such as
+  `VERIFY_X509_NO_CHECK_TIME` or `VERIFY_ALLOW_PROXY_CERTS` (#6375).
+  `VERIFY_X509_PARTIAL_CHAIN` and the CRL and strict flags are accepted.
+- A context that offers any cipher suite without server authentication
+  (anonymous, PSK, SRP or NULL-encryption suites, #6305). The plain OpenSSL
+  `"DEFAULT"` string includes PSK and SRP suites; remove them with
+  `set_ciphers("<your list>:!PSK:!SRP:!aNULL:!eNULL")`.
 - Any `ssl.SSLContext` subclass, including `truststore.SSLContext`: such an
   object keeps its real verification state elsewhere, so the SDK cannot prove
   it verifies. Use `ssl.create_default_context(cafile=...)` or pass the CA path.
-- A context whose `wrap_socket` or `wrap_bio` was replaced (on the instance or
-  on the class), or that shadows any other `ssl.SSLContext` attribute on the
-  instance.
+- A context whose `wrap_socket`, `wrap_bio`, `verify_mode`, `check_hostname`,
+  `verify_flags`, `hostname_checks_common_name`, `get_ciphers`,
+  `sslsocket_class` or `sslobject_class` was replaced on the class, or that
+  shadows any `ssl.SSLContext` attribute on the instance.
 - Any other type.
+
+After every TLS handshake, the SDK checks the session before the request's
+first byte is written. This covers a direct connection, a tunnel through an
+`http://` or `https://` proxy, and SOCKS. The session must:
+
+- belong to the caller's context
+- present a certificate that names the request host and is within its
+  validity dates
+- use a cipher with secret bits
+
+Otherwise the connection is closed and the request raises `ValueError`
+(#6349, #6350, #6375). The `https://` proxy's own certificate is checked by
+httpx's default trust (`SSL_CERT_FILE` / `SSL_CERT_DIR` / certifi). No SDK
+header crosses that leg; the origin session inside the tunnel is held to your
+context. Decision record: `docs/adr/ADR-003-sdk-python-tls-verify-enforcement.md`.
 
 Two ways to avoid passing `verify=` per client:
 
 - point `SSL_CERT_FILE` (or `SSL_CERT_DIR`) at `local-ca.pem` and leave
   `verify=` unset: httpx reads those variables for its default trust, whereas
-  installing the CA into the operating-system store does not affect it;
+  installing the CA into the operating-system store does not affect it. httpx
+  reads an `SSL_CERT_DIR` directory again on each handshake and does not check
+  its permissions (#6538); pass `verify=<path>` to have it read once and
+  checked;
 - run the daemon with an operator-supplied `--tls-cert`/`--tls-key` pair from
   a CA your hosts already trust, in which case no pinning is needed at all.
 

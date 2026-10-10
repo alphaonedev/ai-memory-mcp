@@ -639,11 +639,15 @@ def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> dict[str, list
     * ``request``: re-check the context before every request (early, clear
       error) and install a per-request httpcore ``trace`` (:class:`_SessionGate`)
       that inspects every TLS session of the request, direct, tunnelled or
-      over SOCKS, right after its handshake and before any request byte is
-      sent; an unverified session is closed and refused.
+      over SOCKS, right after its handshake and before the request's first
+      byte is written on that connection; an unverified session is closed and
+      refused. This holds while this trace is the one httpcore calls: a
+      later caller hook that replaces ``request.extensions["trace"]``
+      bypasses it (#6537).
     * ``response``: a backstop that inspects the connection the response came
       over, which also covers a pooled connection and a trace event that never
-      fired, so a missing check fails closed.
+      fired. It runs after the request was written, so it refuses the result
+      but cannot un-send the request.
 
     The caller keeps a reference to the context and may weaken it after
     construction or between the check and the handshake; the session check
@@ -734,14 +738,18 @@ def build_httpx_kwargs(
             whoever answers — the man-in-the-middle exposure the #3828
             ``http://`` refusal closes, one layer up. Accepted forms are exactly
             ``None``, ``True``, the path of an existing CA file or directory (``str``
-            or ``os.PathLike``, resolved with ``os.path.realpath`` at
-            construction) and exactly ``ssl.SSLContext`` (never a subclass) that
-            is ``CERT_REQUIRED`` with ``check_hostname`` on and no patched
-            ``wrap_socket``/``wrap_bio``. Every other value is refused. Only a checked
+            or ``os.PathLike``, resolved with ``os.path.realpath`` and read
+            once at construction, never group- or world-writable, #6377) and
+            exactly ``ssl.SSLContext`` (never a subclass) that is
+            ``CERT_REQUIRED`` with ``check_hostname`` on, no relaxing verify
+            flag, no suite without server authentication and no replaced
+            handshake attribute. Every other value is refused. Only a checked
             value reaches httpx: a CA path becomes a context this SDK builds
             from the exact path string (#6248, #6245), and a caller-supplied
-            context is re-checked before every request (#6249; the client does
-            not own it, so a later weakening is refused, not honoured). Both
+            context is re-checked before every request (#6249, #6375, #6305;
+            the client does not own it, so turning verification off after
+            construction is refused) and every TLS session is checked after
+            its handshake (#6349, #6350). Both
             clients construct through this one funnel, so the refusal lives
             here once.
     """
