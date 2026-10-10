@@ -207,7 +207,7 @@ fn initialize(stdin: &mut ChildStdin, rx: &mpsc::Receiver<String>, client_name: 
             "id": 1,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-03-26",
+                "protocolVersion": ai_memory::mcp::jsonrpc::NEWEST_PROTOCOL_REVISION,
                 "capabilities": {},
                 "clientInfo": {"name": client_name, "version": "bench"}
             }
