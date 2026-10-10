@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (#7112 — event-listener thread-safety advisory)
+
+- Update the locked `event-listener` dependency from 5.4.1 to 5.4.2 to
+  address RUSTSEC-2026-0221 (`StackSlot` could send a non-Send tag across
+  threads). Remove its now-unused `concurrent-queue` dependency.
+
 ### Security (#3901 — attested cross-id title merge no longer dequarantines a different local row)
 
 - **Route-OUT dequarantine-on-attest (#1948) is gated on the applied row being
