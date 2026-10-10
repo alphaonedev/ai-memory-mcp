@@ -310,6 +310,17 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.sha }}
 
+      # #6282 — one SOURCE_DATE_EPOCH per artifact job: the verified commit's
+      # committer time. Every later step reads it from this output.
+      - name: Source date epoch (#3613)
+        id: epoch
+        shell: bash
+        run: |
+          set -euo pipefail
+          epoch="$(/usr/bin/git log -1 --format=%ct)"
+          test -n "$epoch"
+          echo "epoch=$epoch" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust 1.98.0 + target std
         # Pin to the rust-toolchain.toml channel (1.98.0). The build below
         # resolves the toolchain from rust-toolchain.toml, so the cross
@@ -404,12 +415,19 @@ jobs:
         # the hash the assert step recorded, or nothing is packaged. Every step
         # of this job is pinned whole by scripts/check_release_features.py
         # (RELEASE_STEPS), so no later step can write dist/ unseen.
-        shell: bash
+        # #6282 — the tarball is written by the deterministic packer (sorted
+        # members, mtime = the job's SOURCE_DATE_EPOCH, owner 0/0, normalized
+        # modes, no gzip timestamp), bound to the verified commit first.
+        shell: /bin/bash --posix --noprofile --norc -eo pipefail {0}
         env:
           ASSERTED_SHA256: ${{ steps.assert.outputs.sha256 }}
           REPRO_SHA256: ${{ needs.reproducible.outputs.sha256 }}
+          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}
+          SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
         run: |
           set -euo pipefail
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in scripts/release/reproducible_build.py; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; test -n "$a"; test "$a" = "$b"; done'
+          test -n "$SOURCE_DATE_EPOCH"
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "dist/${{ matrix.artifact }}"
           packaged_sha256="$(shasum -a 256 "dist/${{ matrix.artifact }}" | cut -d' ' -f1)"
@@ -420,12 +438,15 @@ jobs:
           # covered by the proof (see the job's banner).
           case "${{ matrix.target }}" in x86_64-unknown-linux-gnu) test -n "$REPRO_SHA256"; test "$REPRO_SHA256" = "$ASSERTED_SHA256" || { echo "::error::the shipped x86_64-unknown-linux-gnu binary ($ASSERTED_SHA256) is not the one the reproducible job built twice ($REPRO_SHA256)"; exit 1; } ;; esac
           cd dist
-          tar czf "ai-memory-${{ matrix.target }}.tar.gz" "${{ matrix.artifact }}"
+          /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -I ../scripts/release/reproducible_build.py --pack "ai-memory-${{ matrix.target }}.tar.gz" --epoch "$SOURCE_DATE_EPOCH" "${{ matrix.artifact }}"
 
       - name: Build deb and rpm packages
         if: matrix.nfpm_arch
         run: |
           set -euo pipefail
+          # #6282 — nfpm reads SOURCE_DATE_EPOCH (the job's epoch) for every
+          # timestamp it writes into the deb and the rpm.
+          test -n "$SOURCE_DATE_EPOCH"
           # #3546 — download to a file and check a PINNED digest before
           # extracting; never `curl | tar`. Digests from goreleaser's
           # v2.41.1 checksums.txt, cross-checked on 2026-09-11 by hashing
@@ -449,6 +470,7 @@ jobs:
           ls -la dist/*.deb dist/*.rpm
         env:
           TAG: ${{ needs.preflight.outputs.tag }}
+          SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
 
       # ------------------------------------------------------------------
       # #2449 - publish a SHA-256 for every artifact an installer verifies.
@@ -577,6 +599,9 @@ jobs:
   # would make the second build a copy of the first, not an independent
   # proof. scripts/release/reproducible_build.py --self-test carries the
   # negative fixtures (a perturbed SOURCE_DATE_EPOCH, an unremapped path).
+  # #6283 — the proof also packs each build's binary with the release job's
+  # deterministic packer and compares the two tarballs, and builds the deb and
+  # rpm of each build with the pinned nfpm 2.41.1 and compares them.
   #
   # #6274 — the proof is a GATE, not a report: release, sbom, mobile-ios,
   # mobile-android and docker all `needs:` this job (crates-io, homebrew and
@@ -584,11 +609,15 @@ jobs:
   # the `sha256` output, and the release job's x86_64-unknown-linux-gnu leg
   # refuses to package a binary whose asserted hash differs from it.
   #
-  # Scope: this proves the x86_64-unknown-linux-gnu binary only. Not yet
-  # proven (each a tracked #3613 item): aarch64-unknown-linux-gnu, the two
-  # macOS binaries (ad-hoc code signing), the deb/rpm payloads, the
-  # xcframework and the Docker image layers. Nothing is claimed reproducible
-  # without this job's proof on a real release run.
+  # Scope: this proves the x86_64-unknown-linux-gnu binary, its tarball and
+  # its deb/rpm. #6282: every artifact job reads one SOURCE_DATE_EPOCH (a
+  # pinned step output) and packs with the deterministic packer, so the
+  # epoch reaches every tarball, the deb/rpm, the mobile builds and the
+  # Docker builder stage. Not yet proven, each a tracked item:
+  # aarch64-unknown-linux-gnu (#3613), the macOS binary's ad-hoc code
+  # signature (#6407), the iOS xcframework contents (#6408) and the Docker
+  # image layer timestamps (#6409). Nothing is claimed reproducible without
+  # this job's proof on a real release run.
   # scripts/check_release_features.py pins this job whole (REPRO_JOB /
   # REPRO_STEPS: no cache step, no `if:`, no job `env:`).
   # --------------------------------------------------------------------
@@ -611,18 +640,31 @@ jobs:
         with:
           toolchain: 1.98.0
 
+      - name: Install nfpm 2.41.1 (pinned digest)
+        # #6283 — the deb/rpm of each build are compared too. Same pinned
+        # digest as the release job's deb/rpm step; never `curl | tar`.
+        shell: bash
+        run: |
+          set -euo pipefail
+          NFPM_TGZ="$RUNNER_TEMP/nfpm_2.41.1_Linux_x86_64.tar.gz"
+          curl -fsSL -o "$NFPM_TGZ" "https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_Linux_x86_64.tar.gz"
+          echo "b3cf95aa6dabed836d09ad7f0c190a13c74c5b1304db60846f0f702ee407f430  ${NFPM_TGZ}" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/nfpm"
+          tar xzf "$NFPM_TGZ" -C "$RUNNER_TEMP/nfpm" nfpm
+
       - name: Build twice from two workspaces and compare (#3613)
         id: proof
         shell: /bin/bash --posix --noprofile --norc -eo pipefail {0}
         env:
           PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}
+          TAG: ${{ needs.preflight.outputs.tag }}
         run: |
           set -euo pipefail
           # #4768 / #6275 — the declaration and the proof script are the verified commit's.
           /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in scripts/release-features.sh scripts/release/reproducible_build.py; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; test -n "$a"; test "$a" = "$b"; done'
           FEATURES="$(/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc scripts/release-features.sh)"
           test -n "$FEATURES"
-          /usr/bin/python3 scripts/release/reproducible_build.py --target x86_64-unknown-linux-gnu --features "$FEATURES" --workspace-b "$RUNNER_TEMP/reproducible-b" --sha256-output "$GITHUB_OUTPUT"
+          /usr/bin/python3 scripts/release/reproducible_build.py --target x86_64-unknown-linux-gnu --features "$FEATURES" --workspace-b "$RUNNER_TEMP/reproducible-b" --sha256-output "$GITHUB_OUTPUT" --nfpm "$RUNNER_TEMP/nfpm/nfpm" --nfpm-arch amd64 --version "${TAG#v}"
 
   # --------------------------------------------------------------------
   # #1973 (v1.0 supply-chain, epic #1940) - CycloneDX SBOM per release.
@@ -782,6 +824,17 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.sha }}
 
+      # #6282 — one SOURCE_DATE_EPOCH per artifact job: the verified commit's
+      # committer time. Every later step reads it from this output.
+      - name: Source date epoch (#3613)
+        id: epoch
+        shell: bash
+        run: |
+          set -euo pipefail
+          epoch="$(/usr/bin/git log -1 --format=%ct)"
+          test -n "$epoch"
+          echo "epoch=$epoch" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust 1.98.0 + iOS targets
         # Pin to rust-toolchain.toml (1.98.0) so the iOS cross-target std
         # lands on the build toolchain (see release-matrix note above).
@@ -800,8 +853,13 @@ jobs:
         run: cargo install --locked cbindgen --version 0.29.4
 
       - name: Build static libraries (release, --features sqlite-bundled)
+        # #6282 — the same deterministic inputs as the release build.
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
         run: |
           set -euo pipefail
+          RUSTFLAGS="--remap-path-prefix=$PWD=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+          export RUSTFLAGS
           for TARGET in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; do
             echo "::group::cargo build --target $TARGET"
             cargo build --locked --release --target "$TARGET" --no-default-features --features sqlite-bundled --lib
@@ -845,10 +903,17 @@ jobs:
           ls -la dist/AiMemory.xcframework/
 
       - name: Tar + sha256 the xcframework
+        # #6282 — packed by the deterministic packer, bound to the verified commit.
+        shell: /bin/bash --posix --noprofile --norc -eo pipefail {0}
+        env:
+          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}
+          SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
         run: |
           set -euo pipefail
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in scripts/release/reproducible_build.py; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; test -n "$a"; test "$a" = "$b"; done'
+          test -n "$SOURCE_DATE_EPOCH"
           cd dist
-          tar czf ai-memory-ios.xcframework.tar.gz AiMemory.xcframework
+          /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -I ../scripts/release/reproducible_build.py --pack ai-memory-ios.xcframework.tar.gz --epoch "$SOURCE_DATE_EPOCH" AiMemory.xcframework
           shasum -a 256 ai-memory-ios.xcframework.tar.gz > ai-memory-ios.xcframework.tar.gz.sha256
           ls -la ai-memory-ios.xcframework.tar.gz*
 
@@ -926,6 +991,17 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.sha }}
 
+      # #6282 — one SOURCE_DATE_EPOCH per artifact job: the verified commit's
+      # committer time. Every later step reads it from this output.
+      - name: Source date epoch (#3613)
+        id: epoch
+        shell: bash
+        run: |
+          set -euo pipefail
+          epoch="$(/usr/bin/git log -1 --format=%ct)"
+          test -n "$epoch"
+          echo "epoch=$epoch" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust 1.98.0 + Android targets
         # Pin to rust-toolchain.toml (1.98.0) so the Android cross-target
         # std lands on the build toolchain (see release-matrix note above).
@@ -973,8 +1049,13 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Build .so for each ABI
+        # #6282 — the same deterministic inputs as the release build.
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
         run: |
           set -euo pipefail
+          RUSTFLAGS="--remap-path-prefix=$PWD=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
+          export RUSTFLAGS
           declare -A ABI_OF=(
             [aarch64-linux-android]=arm64-v8a
             [armv7-linux-androideabi]=armeabi-v7a
@@ -993,8 +1074,15 @@ jobs:
           ls -la dist/aar/jniLibs/*/
 
       - name: Tar + sha256 the AAR-compatible bundle
+        # #6282 — packed by the deterministic packer, bound to the verified commit.
+        shell: /bin/bash --posix --noprofile --norc -eo pipefail {0}
+        env:
+          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}
+          SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
         run: |
           set -euo pipefail
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in scripts/release/reproducible_build.py; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; test -n "$a"; test "$a" = "$b"; done'
+          test -n "$SOURCE_DATE_EPOCH"
           # Drop a minimal AndroidManifest.xml stub alongside the jniLibs
           # tree so the archive maps 1:1 onto AGP's expected layout.
           # The real manifest is supplied by the consuming app; this is
@@ -1020,7 +1108,7 @@ jobs:
           .so into a JNI wrapper that calls a stub `Java_*` entry point.
           README
           cd dist
-          tar czf ai-memory-android.tar.gz aar/
+          /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -I ../scripts/release/reproducible_build.py --pack ai-memory-android.tar.gz --epoch "$SOURCE_DATE_EPOCH" aar
           shasum -a 256 ai-memory-android.tar.gz > ai-memory-android.tar.gz.sha256
           ls -la ai-memory-android.tar.gz*
 
@@ -1288,6 +1376,17 @@ jobs:
         with:
           ref: ${{ needs.preflight.outputs.sha }}
 
+      # #6282 — one SOURCE_DATE_EPOCH per artifact job: the verified commit's
+      # committer time. Every later step reads it from this output.
+      - name: Source date epoch (#3613)
+        id: epoch
+        shell: bash
+        run: |
+          set -euo pipefail
+          epoch="$(/usr/bin/git log -1 --format=%ct)"
+          test -n "$epoch"
+          echo "epoch=$epoch" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
@@ -1309,6 +1408,8 @@ jobs:
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
+          # #6282 — the builder stage declares `ARG SOURCE_DATE_EPOCH` (no default).
+          build-args: SOURCE_DATE_EPOCH=${{ steps.epoch.outputs.epoch }}
           # #3546 D6 — a dry run builds the image and pushes nothing.
           push: ${{ github.event.inputs.dry_run == 'false' }}
           tags: |

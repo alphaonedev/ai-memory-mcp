@@ -296,6 +296,32 @@ EPOCH_STATEMENTS = ('SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"', "export SO
 REMAP_STATEMENTS = ('RUSTFLAGS="--remap-path-prefix=$PWD=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"',
                     "export RUSTFLAGS")
 
+# #6282: every artifact job reads ONE SOURCE_DATE_EPOCH, the output of its pinned
+# `epoch` step (EPOCH_STEP: the verified commit's committer time), and writes every
+# archive with the deterministic packer (sorted members, mtime = the epoch, owner
+# 0/0 with empty names, normalized modes, a gzip header with no timestamp or
+# name), bound to the verified commit first. No step may write an archive with
+# tar, zip, cpio, pax, 7z or ditto (check_archive_writers).
+EPOCH_REF = "${{ steps.epoch.outputs.epoch }}"
+EPOCH_RUN = ("set -euo pipefail", 'epoch="$(/usr/bin/git log -1 --format=%ct)"', 'test -n "$epoch"',
+             'echo "epoch=$epoch" >> "$GITHUB_OUTPUT"')
+PACK_SCRIPT = "scripts/release/reproducible_build.py"
+PACK_BIND = sane_bind((PACK_SCRIPT,))
+PACK_EPOCH_CHECK = 'test -n "$SOURCE_DATE_EPOCH"'
+PACK_CMD = SANE_ENV + " /usr/bin/python3 -I ../" + PACK_SCRIPT + " --pack "
+PACK_RELEASE = PACK_CMD + '"ai-memory-${{ matrix.target }}.tar.gz" --epoch "$SOURCE_DATE_EPOCH" "${{ matrix.artifact }}"'
+PACK_IOS = PACK_CMD + 'ai-memory-ios.xcframework.tar.gz --epoch "$SOURCE_DATE_EPOCH" AiMemory.xcframework'
+PACK_ANDROID = PACK_CMD + 'ai-memory-android.tar.gz --epoch "$SOURCE_DATE_EPOCH" aar'
+PACK_ENV: Dict[str, "Spec"] = {"PREFLIGHT_SHA": "${{ needs.preflight.outputs.sha }}", "SOURCE_DATE_EPOCH": EPOCH_REF}
+PACKAGE_STEP_ENV: Dict[str, "Spec"] = dict(PACKAGE_ENV, **PACK_ENV)
+# The mobile jobs: the epoch step, the build steps' env and remapped paths, and
+# the one pack statement of each.
+MOBILE_PACKS = {"mobile-ios": PACK_IOS, "mobile-android": PACK_ANDROID}
+MOBILE_BUILD_ENV: Dict[str, "Spec"] = {"SOURCE_DATE_EPOCH": EPOCH_REF}
+MOBILE_BUILD_RE = re.compile(r"\bcargo\b.*\bbuild\b|\brustc\b")
+# The Dockerfile builder stage reads the epoch the docker job passes (no default).
+DOCKER_EPOCH_ARG_INS = "ARG SOURCE_DATE_EPOCH"
+
 # The exact statements (after normalisation) of each unit that decides what ships.
 WF_BUILD = (("set -euo pipefail", BIND_INPUTS) + EPOCH_STATEMENTS + REMAP_STATEMENTS
             + (SANE_FEATURES, 'test -n "$FEATURES"', BUILD_CMD))
@@ -303,6 +329,8 @@ WF_ASSERT = ("set -euo pipefail", BIND_INPUTS, ALLOWED_BIN, SANE_REQUIRE, 'test 
              ASSERT_WORKFLOW) + ASSERT_RECORD
 WF_PACKAGE = (
     "set -euo pipefail",
+    PACK_BIND,
+    PACK_EPOCH_CHECK,
     "mkdir -p dist",
     'cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "' + PACKAGE_DIST + '"',
     'packaged_sha256="$(shasum -a 256 "' + PACKAGE_DIST + '" | cut -d\' \' -f1)"',
@@ -310,7 +338,7 @@ WF_PACKAGE = (
     PACKAGE_CHECK,
     REPRO_CHECK,
     "cd dist",
-    'tar czf "ai-memory-${{ matrix.target }}.tar.gz" "${{ matrix.artifact }}"',
+    PACK_RELEASE,
 )
 WF_SBOM = ("set -euo pipefail",) + EPOCH_STATEMENTS + (
     ALLOWED_FEATURES,
@@ -468,15 +496,24 @@ USES_CONSTANTS = {
 # values and the exact `run:` block lines. Nothing can be added, removed,
 # reordered or changed without updating RELEASE_STEPS in the same commit.
 _TAG_ENV = {"TAG": "${{ needs.preflight.outputs.tag }}"}
+# #6282: the epoch step, second in every artifact job (release, mobile-ios,
+# mobile-android, docker), right after the checkout of the verified commit.
+EPOCH_STEP: Dict[str, Spec] = {"name": "Source date epoch (#3613)", "id": "epoch", "shell": "bash",
+                               "run": Block(EPOCH_RUN)}
 RELEASE_STEPS: List[Spec] = [
     {"uses": CHECKOUT_USES, "with": {"ref": "${{ needs.preflight.outputs.sha }}"}},
+    dict(EPOCH_STEP),
     {"name": "Install Rust 1.98.0 + target std", "uses": RUST_TOOLCHAIN_USES,
      "with": {"toolchain": "1.98.0", "targets": "${{ matrix.target }}"}},
     Unit("build"),
     Unit("assert"),
     Unit("package"),
-    {"name": "Build deb and rpm packages", "if": "matrix.nfpm_arch", "env": dict(_TAG_ENV), "run": Block((
+    {"name": "Build deb and rpm packages", "if": "matrix.nfpm_arch",
+     "env": dict(_TAG_ENV, SOURCE_DATE_EPOCH=EPOCH_REF), "run": Block((
         "set -euo pipefail",
+        "# #6282 — nfpm reads SOURCE_DATE_EPOCH (the job's epoch) for every",
+        "# timestamp it writes into the deb and the rpm.",
+        PACK_EPOCH_CHECK,
         "# #3546 — download to a file and check a PINNED digest before",
         "# extracting; never `curl | tar`. Digests from goreleaser's",
         "# v2.41.1 checksums.txt, cross-checked on 2026-09-11 by hashing",
@@ -555,7 +592,7 @@ RELEASE_STEPS: List[Spec] = [
               "prerelease": "${{ needs.preflight.outputs.is_prerelease == 'true' }}"},
      "env": {"GITHUB_TOKEN": "${{ secrets.GITHUB_TOKEN }}"}},
 ]
-RELEASE_STEP_ROLES = ("checkout", "toolchain", "build", "strict assert", "package", "deb/rpm", "checksum sweep",
+RELEASE_STEP_ROLES = ("checkout", "epoch", "toolchain", "build", "strict assert", "package", "deb/rpm", "checksum sweep",
                       "artifact upload", "provenance attestation", "release body", "tag re-assert", "GitHub release")
 DOCKER_JOB: Dict[str, Spec] = {
     "name": "Docker (GHCR)",
@@ -566,6 +603,7 @@ DOCKER_JOB: Dict[str, Spec] = {
 }
 DOCKER_STEPS: List[Spec] = [
     {"uses": CHECKOUT_USES, "with": {"ref": "${{ needs.preflight.outputs.sha }}"}},
+    dict(EPOCH_STEP),
     {"name": "Set up Docker Buildx", "uses": BUILDX_USES},
     {"name": "Log in to GitHub Container Registry", "uses": LOGIN_USES,
      "with": {"registry": "ghcr.io", "username": "${{ github.actor }}", "password": "${{ secrets.GITHUB_TOKEN }}"}},
@@ -573,6 +611,8 @@ DOCKER_STEPS: List[Spec] = [
      "env": {"TAG": "${{ needs.preflight.outputs.tag }}"}},
     {"name": "Build and push Docker image", "id": "build", "uses": IMAGE_BUILD_USES, "with": {
         "context": ".",
+        # #6282: the builder stage's `ARG SOURCE_DATE_EPOCH` (DOCKER_EPOCH_ARG_INS).
+        "build-args": "SOURCE_DATE_EPOCH=" + EPOCH_REF,
         "push": "${{ github.event.inputs.dry_run == 'false' }}",
         "tags": Block((
             "ghcr.io/${{ github.repository_owner }}/ai-memory:${{ steps.version.outputs.version }}",
@@ -591,7 +631,7 @@ DOCKER_STEPS: List[Spec] = [
      }},
 ]
 # What each pinned docker step is, for the messages.
-DOCKER_STEP_ROLES = ("checkout", "Buildx setup", "registry login", "version", "image build", "provenance attestation")
+DOCKER_STEP_ROLES = ("checkout", "epoch", "Buildx setup", "registry login", "version", "image build", "provenance attestation")
 # release.yml permissions, pinned per job (#4719 SR-8): `packages: write` exists in
 # the docker job only. Every job declares its own block (#4937): a job that
 # declared none would inherit the top-level `contents: write`, so the guard
@@ -616,11 +656,24 @@ REPRO_TARGET = "x86_64-unknown-linux-gnu"
 REPRO_BIND = SANE_REPRO_BIND
 REPRO_PROOF = ('/usr/bin/python3 scripts/release/reproducible_build.py --target ' + REPRO_TARGET
                + ' --features "$FEATURES" --workspace-b "$RUNNER_TEMP/reproducible-b"'
-               + ' --sha256-output "$GITHUB_OUTPUT"')
+               + ' --sha256-output "$GITHUB_OUTPUT"'
+               # #6283: each build's tarball (the deterministic packer) and deb/rpm
+               # (the pinned nfpm) are compared too.
+               + ' --nfpm "$RUNNER_TEMP/nfpm/nfpm" --nfpm-arch amd64 --version "${TAG#v}"')
+REPRO_NFPM_INSTALL = Block((
+    "set -euo pipefail",
+    'NFPM_TGZ="$RUNNER_TEMP/nfpm_2.41.1_Linux_x86_64.tar.gz"',
+    'curl -fsSL -o "$NFPM_TGZ" "https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_Linux_x86_64.tar.gz"',
+    'echo "b3cf95aa6dabed836d09ad7f0c190a13c74c5b1304db60846f0f702ee407f430  ${NFPM_TGZ}" | sha256sum -c -',
+    'mkdir -p "$RUNNER_TEMP/nfpm"',
+    'tar xzf "$NFPM_TGZ" -C "$RUNNER_TEMP/nfpm" nfpm',
+))
 REPRO_STEPS: List[Spec] = [
     {"uses": CHECKOUT_USES, "with": {"ref": "${{ needs.preflight.outputs.sha }}"}},
     {"name": "Install Rust 1.98.0", "uses": RUST_TOOLCHAIN_USES, "with": {"toolchain": "1.98.0"}},
-    {"name": "Build twice from two workspaces and compare (#3613)", "id": "proof", "shell": SANE_SHELL, "env": dict(BIND_ENV),
+    {"name": "Install nfpm 2.41.1 (pinned digest)", "shell": "bash", "run": REPRO_NFPM_INSTALL},
+    {"name": "Build twice from two workspaces and compare (#3613)", "id": "proof", "shell": SANE_SHELL,
+     "env": dict(BIND_ENV, TAG="${{ needs.preflight.outputs.tag }}"),
      "run": Block((
         "set -euo pipefail",
         "# #4768 / #6275 — the declaration and the proof script are the verified commit's.",
@@ -630,7 +683,7 @@ REPRO_STEPS: List[Spec] = [
         REPRO_PROOF,
     ))},
 ]
-REPRO_STEP_ROLES = ("checkout", "toolchain", "two-build proof")
+REPRO_STEP_ROLES = ("checkout", "toolchain", "nfpm install", "two-build proof")
 RELEASE_JOB_PERMISSIONS: Dict[str, Dict[str, Spec]] = {
     "preflight": dict(_READ),
     "qualify": {"contents": "read", "checks": "read", "actions": "read"},
@@ -799,8 +852,10 @@ DOCKER_RUNTIME_IMAGE = "debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e2
 DOCKER_ENTRYPOINT = 'ENTRYPOINT ["/usr/local/bin/ai-memory"]'
 DOCKER_CMD = 'CMD ["serve", "--host", "0.0.0.0"]'
 # #6280 / cloud F6: everything the builder stage may do before the asserter COPY, the
-# declaration COPY and the build RUN (pinned separately). No ARG, no ENV, no other COPY or ADD.
+# declaration COPY and the build RUN (pinned separately). No ENV, no other COPY or ADD, and
+# no ARG but the epoch (#6282: DOCKER_EPOCH_ARG_INS, exactly once, no default).
 DOCKER_BUILDER_ALLOWED = frozenset((
+    DOCKER_EPOCH_ARG_INS,
     "RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential "
     "&& rm -rf /var/lib/apt/lists/*",
     "WORKDIR /build",
@@ -1478,7 +1533,7 @@ def check_release_job(job: Node, rep: Report) -> None:
         "assert": one_unit(steps, KEYS_ASSERT, WF_ASSERT, "release.yml: the release job strict assert", rep, "WF_ASSERT",
                            pins={"id": ASSERT_ID, "shell": SANE_SHELL, "env": BIND_ENV}),
         "package": one_unit(steps, KEYS_PACKAGE, WF_PACKAGE, "release.yml: the release job hash-bound package", rep,
-                            "WF_PACKAGE", pins={"env": PACKAGE_ENV}),
+                            "WF_PACKAGE", pins={"shell": SANE_SHELL, "env": PACKAGE_STEP_ENV}),
     }
     # #4752: the whole ordered step list is pinned, like the docker job's. The
     # three units must sit in their slots (build, then assert, then package);
@@ -1636,6 +1691,93 @@ def check_repro_job(jobs: Node, rep: Report) -> None:
         "the two-build byte-identity proof runs only in the pinned `reproducible:` job, #3613",
         "a job `env:`, `if:`, `continue-on-error:`, `container:` or `strategy:` can skip or alter the proof",
         "an extra step can restore a cache into, or replace, a build the proof compares"), rep)
+
+
+def check_mobile_epoch(jobs: Node, rep: Report) -> None:
+    """#6282: each mobile job reads the pinned epoch step, builds with it and the
+    remapped paths, and packs its archive with the bound deterministic packer."""
+    for name, pack in MOBILE_PACKS.items():
+        job = jobs.get(name)
+        if job is None or job.kind != "map":
+            rep.bad(f"release.yml: the `{name}:` job is missing or not a mapping (#6282)")
+            continue
+        steps = [st for _, st in job_steps(job, f"release.yml {name} job", rep)]
+        msg = "the job has fewer than two steps" if len(steps) < 2 else pinned_step_message(
+            steps[1], EPOCH_STEP, f"jobs.{name}.steps.2", f"release.yml ({name} epoch step)", "EPOCH_STEP")
+        if msg:
+            rep.bad(pin_message("release.yml", f"{name}: the second step must be the pinned epoch step ({msg})",
+                                "EPOCH_STEP"))
+        builds = [(n, st) for n, st in enumerate(steps) if any(MOBILE_BUILD_RE.search(ln) for ln in run_lines(st))]
+        if not builds:
+            rep.bad(f"release.yml: the `{name}:` job has no cargo build step (#6282)")
+        for n, st in builds:
+            lines = run_lines(st)
+            why = pin_problem(st.get("env"), MOBILE_BUILD_ENV, f"jobs.{name}.steps.{n + 1}.env")
+            if not why and (lines[:1] != ("set -euo pipefail",) or lines[1:3] != REMAP_STATEMENTS):
+                why = "the run must start with `set -euo pipefail` and then the remapped paths (REMAP_STATEMENTS)"
+            if why:
+                rep.bad(pin_message("release.yml", f"{name} build step {n + 1}: {why} (#6282: the build reads the "
+                                    "job's epoch and remaps its paths)", "MOBILE_BUILD_ENV"))
+        packs = [(n, st, ln) for n, st in enumerate(steps) for ln in run_lines(st)
+                 if PACK_SCRIPT in ln and "--pack" in ln]
+        if len(packs) != 1 or packs[0][2] != pack:
+            rep.bad(pin_message("release.yml", f"{name}: the job must pack exactly once, with `{pack}` "
+                                f"(found {len(packs)})", "MOBILE_PACKS"))
+            continue
+        n, st, _ = packs[0]
+        lines = run_lines(st)
+        at = lines.index(pack)
+        why = ""
+        if set(st.keys()) != set(KEYS_PACKAGE):
+            why = f"keys {st.keys()} differ from {list(KEYS_PACKAGE)}"
+        why = why or pin_problem(st.get("shell"), SANE_SHELL, f"jobs.{name}.steps.{n + 1}.shell")
+        why = why or pin_problem(st.get("env"), PACK_ENV, f"jobs.{name}.steps.{n + 1}.env")
+        if not why and (lines[:3] != ("set -euo pipefail", PACK_BIND, PACK_EPOCH_CHECK)
+                        or at < 1 or lines[at - 1] != "cd dist"):
+            why = "the run must start with `set -euo pipefail`, the packer bind and the epoch check, and `cd dist` " \
+                  "must precede the pack"
+        if why:
+            rep.bad(pin_message("release.yml", f"{name} pack step {n + 1}: {why} (#6282: the packer is the verified "
+                                "commit's and reads the job's epoch)", "PACK_ENV"))
+
+
+ARCHIVE_WRITE_LONG = ("create", "append", "update", "catenate", "concatenate")
+ARCHIVE_TAR_RE = re.compile(r"(?:^|[;&|(]|\$\()\s*(?:\S*/)?(?:gnu|bsd)?tar\s+([^;&|)]*)")
+ARCHIVE_OTHER_RE = re.compile(r"(?:^|[;&|(]|\$\()\s*(?:\S*/)?(?:zip|cpio|pax|7z|7za|ditto)(?:\s|$)"
+                              r"|-m\s+(?:tarfile|zipfile)\b|\bmake_archive\b")
+
+
+def archive_write(line: str) -> bool:
+    """True when ``line`` writes an archive by a tool other than the packer: a tar
+    in create / append / update / catenate mode, or zip, cpio, pax, 7z, ditto,
+    `python -m tarfile|zipfile`, `shutil.make_archive`."""
+    if ARCHIVE_OTHER_RE.search(line):
+        return True
+    for m in ARCHIVE_TAR_RE.finditer(line):
+        args = m.group(1).split()
+        for k, arg in enumerate(args):
+            if arg.startswith("--"):
+                word = arg[2:].split("=", 1)[0]
+                if len(word) >= 2 and any(w.startswith(word) for w in ARCHIVE_WRITE_LONG):
+                    return True
+            elif arg.startswith("-") or k == 0:
+                if set(arg.lstrip("-")) & set("cruA") and re.fullmatch(r"-?[A-Za-z]+", arg):
+                    return True
+    return False
+
+
+def check_archive_writers(jobs: Node, rep: Report) -> None:
+    """#6282: every release archive is written by the deterministic packer."""
+    for name in jobs.keys():
+        job = jobs.get(name)
+        if job is None or job.kind != "map":
+            continue
+        for i, st in job_steps(job, f"release.yml {name} job", rep):
+            for ln in run_lines(st):
+                if archive_write(ln):
+                    rep.bad(f"release.yml: jobs.{name}.steps.{i + 1} writes an archive with `{ln[:80]}`; every "
+                            "release archive is written by the deterministic packer (#6282: "
+                            f"{PACK_SCRIPT} --pack, sorted members, the job's epoch)")
 
 
 def check_release_permissions(doc: Node, jobs: Node, rep: Report) -> None:
@@ -1806,6 +1948,8 @@ def check_release_yml(text: str, rep: Report) -> None:
         check_sbom_job(sbom, rep)
     check_docker_job(jobs, rep)
     check_repro_job(jobs, rep)
+    check_mobile_epoch(jobs, rep)
+    check_archive_writers(jobs, rep)
     check_homebrew(text, rep)
 
 
@@ -1952,8 +2096,11 @@ def check_dockerfile(text: str, rep: Report, digests: Tuple[str, ...] = DOCKER_D
     # #6280 / cloud F6: before the pinned last three, the builder holds DOCKER_BUILDER_ALLOWED only.
     for ins in builder[:-3]:
         if not _docker_owned(ins, None) and ins not in DOCKER_BUILDER_ALLOWED:
-            rep.bad(f"Dockerfile: builder `{ins[:70]}` is not in the builder allowlist (#6280: no ARG, no ENV, no other "
-                    "COPY or ADD may feed the build)" + pin_hint("DOCKER_BUILDER_ALLOWED"))
+            rep.bad(f"Dockerfile: builder `{ins[:70]}` is not in the builder allowlist (#6280: no ENV, no other "
+                    "COPY or ADD, and no ARG but the epoch may feed the build)" + pin_hint("DOCKER_BUILDER_ALLOWED"))
+    if builder[:-3].count(DOCKER_EPOCH_ARG_INS) != 1:
+        rep.bad(f"Dockerfile: the builder stage must declare `{DOCKER_EPOCH_ARG_INS}` exactly once, with no default "
+                "(#6282: the docker job passes the verified commit's time)" + pin_hint("DOCKER_EPOCH_ARG_INS"))
     if DOCKER_LOCK_COPY not in builder[:-2]:
         rep.bad(f"Dockerfile: the builder stage does not `{DOCKER_LOCK_COPY}` before the build" + pin_hint("DOCKER_LOCK_COPY"))
     if builder[-2:-1] != [DOCKER_DECL_COPY]:
@@ -2245,7 +2392,8 @@ REPRO_SCRIPT = "scripts/release/reproducible_build.py"
 REPRO_HDR = "\n  reproducible:\n"
 PROOF_STEP_NAME = "      - name: Build twice from two workspaces and compare (#3613)\n"
 PROOF_CMD = ('/usr/bin/python3 scripts/release/reproducible_build.py --target x86_64-unknown-linux-gnu --features "$FEATURES" '
-             '--workspace-b "$RUNNER_TEMP/reproducible-b" --sha256-output "$GITHUB_OUTPUT"')
+             '--workspace-b "$RUNNER_TEMP/reproducible-b" --sha256-output "$GITHUB_OUTPUT"'
+             ' --nfpm "$RUNNER_TEMP/nfpm/nfpm" --nfpm-arch amd64 --version "${TAG#v}"')
 EPOCH_LINES = IND + 'SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"\n' + IND + "export SOURCE_DATE_EPOCH\n"
 REMAP_LINES = (IND + 'RUSTFLAGS="--remap-path-prefix=$PWD=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"\n'
                + IND + "export RUSTFLAGS\n")
@@ -2854,8 +3002,10 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "6275 proof step shell is PATH bash": ("fail", [_rel(BUILD_HDR, _edit_all(
         PROOF_STEP_NAME + "        id: proof\n" + SANE_SHELL_LINE, PROOF_STEP_NAME + "        id: proof\n        shell: bash\n"))]),
     "6275 proof step without PREFLIGHT_SHA": ("fail", [_rel(BUILD_HDR, _edit_all(
-        SANE_SHELL_LINE + BIND_ENV_LINES + "        run: |\n          set -euo pipefail\n          # #4768 / #6275 — the declaration and the proof",
-        SANE_SHELL_LINE + "        run: |\n          set -euo pipefail\n          # #4768 / #6275 — the declaration and the proof"))]),
+        SANE_SHELL_LINE + BIND_ENV_LINES + "          TAG: ${{ needs.preflight.outputs.tag }}\n        run: |\n"
+        "          set -euo pipefail\n          # #4768 / #6275 — the declaration and the proof",
+        SANE_SHELL_LINE + "        env:\n          TAG: ${{ needs.preflight.outputs.tag }}\n        run: |\n"
+        "          set -euo pipefail\n          # #4768 / #6275 — the declaration and the proof"))]),
     "4768 Dockerfile a RUN between the asserter COPY and the declaration COPY": ("fail", [_docker(
         DOCKER_DECL_COPY + "\n", "RUN sed -i s/exit/true/ scripts/assert-compiled-features.sh\n" + DOCKER_DECL_COPY + "\n")]),
     "4768 Dockerfile asserter COPY missing": ("fail", [_docker(DOCKER_ASSERTER_COPY + "\n", "")]),
@@ -3568,7 +3718,7 @@ ADVISORY_CASES: Dict[str, Tuple[bool, str, List[Edit]]] = {
 # C-6: (edits, exact error count, substring of the first message).
 MESSAGE_CASES: Dict[str, Tuple[List[Edit], int, str]] = {
     "message: LOGIN_USES SHA bump": ([_rel(LOGIN_USES, LOGIN_USES[:-1] + "0")], 1,
-                                     "registry login step): `jobs.docker.steps.3.uses` is"),
+                                     "registry login step): `jobs.docker.steps.4.uses` is"),
     "message: LOGIN_USES SHA bump names the constant": ([_rel(LOGIN_USES, LOGIN_USES[:-1] + "0")], 1,
                                                         "update LOGIN_USES in scripts/check_release_features.py"),
     "message: IMAGE_BUILD_USES SHA bump": ([_rel(IMAGE_BUILD_USES, IMAGE_BUILD_USES[:-1] + "0")], 1,
@@ -3867,21 +4017,42 @@ def self_test(root: Path) -> int:
                           file=sys.stderr)
                     failures += 1
 
-        # --- #4752 runtime: the package unit packages the asserted bytes and
-        # refuses any other hash (empty, wrong, or the right digest in another
-        # case: `shasum` prints lower-case hex and the comparison is exact).
-        pkg_body = "\n".join(WF_PACKAGE).replace("${{ matrix.target }}", "x").replace("${{ matrix.artifact }}", "ai-memory")
+        # --- #4752 / #6282 runtime: the package unit packages the asserted bytes
+        # and refuses any other hash (empty, wrong, or the right digest in another
+        # case: `shasum` prints lower-case hex and the comparison is exact). It runs
+        # under the pinned step shell in a checkout whose packer is the verified
+        # commit's, and the archive it writes depends on the epoch alone.
         payload = b"the asserted bytes\n"
         good = hashlib.sha256(payload).hexdigest()
+        pgit = ["git", "-c", "user.name=self-test", "-c", "user.email=self-test@localhost", "-c", "commit.gpgsign=false"]
+        epoch = "1700000000"
+
+        def package_leg(target: str, repro: Optional[str], asserted: str = good, pack_epoch: Optional[str] = epoch,
+                        tamper: bool = False, name: str = "pkg") -> Tuple[int, bool]:
+            pkg = tmp / name
+            shutil.rmtree(pkg, ignore_errors=True)
+            (pkg / "scripts" / "release").mkdir(parents=True)
+            shutil.copy2(root / PACK_SCRIPT, pkg / PACK_SCRIPT)
+            for cmd in (["init", "-q"], ["add", PACK_SCRIPT], ["commit", "-q", "-m", "pin the packer"]):
+                subprocess.run(pgit + cmd, cwd=pkg, capture_output=True, check=True)
+            sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=pkg, capture_output=True, text=True,
+                                 check=True).stdout.strip()
+            if tamper:
+                with open(pkg / PACK_SCRIPT, "a", encoding="utf-8") as fh:
+                    fh.write("# rewritten after checkout\n")
+            (pkg / "target" / target / "release").mkdir(parents=True)
+            (pkg / "target" / target / "release" / "ai-memory").write_bytes(payload)
+            body = "\n".join(WF_PACKAGE).replace("${{ matrix.target }}", target).replace("${{ matrix.artifact }}", "ai-memory")
+            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "ASSERTED_SHA256": asserted, "PREFLIGHT_SHA": sha}
+            if pack_epoch is not None:
+                env["SOURCE_DATE_EPOCH"] = pack_epoch
+            if repro is not None:
+                env["REPRO_SHA256"] = repro
+            rc = subprocess.run(shell_argv(SANE_SHELL) + [body], cwd=pkg, env=env, capture_output=True).returncode
+            return rc, (pkg / "dist" / f"ai-memory-{target}.tar.gz").is_file()
 
         def package(asserted: str) -> Tuple[int, bool]:
-            pkg = tmp / "pkg"
-            shutil.rmtree(pkg, ignore_errors=True)
-            (pkg / "target" / "x" / "release").mkdir(parents=True)
-            (pkg / "target" / "x" / "release" / "ai-memory").write_bytes(payload)
-            env = dict(os.environ, ASSERTED_SHA256=asserted)
-            rc = subprocess.run(["bash", "-c", pkg_body], cwd=pkg, env=env, capture_output=True).returncode
-            return rc, (pkg / "dist" / "ai-memory-x.tar.gz").is_file()
+            return package_leg("x", None, asserted)
 
         if package(good) != (0, True):
             print("self-test FAIL: the package unit does not package the asserted binary", file=sys.stderr)
@@ -3892,23 +4063,27 @@ def self_test(root: Path) -> int:
                 print(f"self-test FAIL: the package unit packaged a file whose hash is not the asserted one ({wrong[:12]!r}): "
                       "fail-open", file=sys.stderr)
                 failures += 1
+        # #6282: the same bytes and epoch give the same archive in another checkout;
+        # another epoch gives another archive; no epoch and a rewritten packer are refused.
+        arch = [tmp / n / "dist" / "ai-memory-x.tar.gz" for n in ("pkg-a", "pkg-b", "pkg-c")]
+        runs = [package_leg("x", None, name="pkg-a"), package_leg("x", None, name="pkg-b"),
+                package_leg("x", None, pack_epoch="1700000001", name="pkg-c")]
+        if runs != [(0, True)] * 3 or arch[0].read_bytes() != arch[1].read_bytes():
+            print("self-test FAIL: the package unit is not deterministic for one epoch (#6282)", file=sys.stderr)
+            failures += 1
+        elif arch[0].read_bytes() == arch[2].read_bytes():
+            print("self-test FAIL: the package unit ignores the epoch (#6282)", file=sys.stderr)
+            failures += 1
+        for label, kw in (("no epoch", {"pack_epoch": None}), ("an empty epoch", {"pack_epoch": ""}),
+                          ("a rewritten packer", {"tamper": True})):
+            rc, packaged = package_leg("x", None, **kw)
+            if rc == 0 or packaged:
+                print(f"self-test FAIL: the package unit packaged with {label}: fail-open (#6282)", file=sys.stderr)
+                failures += 1
 
         # --- #6274 runtime: on the x86_64-unknown-linux-gnu leg the package unit
         # also refuses unless the asserted hash equals the reproducible job's
         # digest; the other legs package without it.
-        def package_leg(target: str, repro: Optional[str]) -> Tuple[int, bool]:
-            pkg = tmp / "pkg"
-            shutil.rmtree(pkg, ignore_errors=True)
-            (pkg / "target" / target / "release").mkdir(parents=True)
-            (pkg / "target" / target / "release" / "ai-memory").write_bytes(payload)
-            body = "\n".join(WF_PACKAGE).replace("${{ matrix.target }}", target).replace("${{ matrix.artifact }}", "ai-memory")
-            env = dict(os.environ, ASSERTED_SHA256=good)
-            env.pop("REPRO_SHA256", None)
-            if repro is not None:
-                env["REPRO_SHA256"] = repro
-            rc = subprocess.run(["bash", "-c", body], cwd=pkg, env=env, capture_output=True).returncode
-            return rc, (pkg / "dist" / f"ai-memory-{target}.tar.gz").is_file()
-
         if package_leg(REPRO_TARGET, good) != (0, True):
             print("self-test FAIL: the x86_64 linux package unit refuses the binary the proof built (#6274)", file=sys.stderr)
             failures += 1
