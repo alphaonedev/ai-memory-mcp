@@ -211,10 +211,14 @@ class TokenPins(unittest.TestCase):
         self.assertEqual(self.problems("\n".join(lines)), [])
 
     def test_secret_last_line_of_final_section(self):
-        text = WF.rstrip("\n") + "\nzz:\n  k: ${{ secrets.X }}"
+        text = WF.rstrip("\n") + "\nenv:\n  K: ${{ secrets.X }}"
         self.assertTrue(self.has(text, "workflow references a repository secret"))
-        text2 = WF.rstrip("\n") + "\nzz:\n  k: v # ${{ secrets.X }}"
+        text2 = WF.rstrip("\n") + "\nenv:\n  K: v # ${{ secrets.X }}"
         self.assertEqual(self.problems(text2), [])
+        # #6610: a top-level key outside the closed workflow shape is refused with its line
+        text3 = WF.rstrip("\n") + "\nzz:\n  k: v\n"
+        n = len(WF.rstrip("\n").split("\n")) + 1
+        self.assertTrue(self.has(text3, f"line {n}: zz is not an allowed key here"))
 
     def test_hash_secret_hidden_in_block_scalar_first_and_last(self):
         for body in ("        run: |\n          echo a #${{ secrets.P }}\n          echo b\n          echo c\n",
@@ -246,16 +250,22 @@ class TokenPins(unittest.TestCase):
                           ("    env:\n      Github_Token: abc\n", True),
                           ("    env: {GH_TOKEN: abc}\n", True),
                           ("    env: {gh_token: abc}\n", True),
-                          ("    env: {OTHER: abc}\n", False),
-                          ("    env: {GH_TOKEN: \"${{ github.token }}\"}\n", False),
-                          ("    env: plain\n", True)):
+                          ("    env: {OTHER: abc}\n", True),
+                          ("    env: {GH_TOKEN: \"${{ github.token }}\"}\n", True),
+                          ("    env: plain\n", True),
+                          ("    env:\n      OTHER: |\n        abc\n", True)):
             text = with_verifier(body)
-            got = [p for p in self.problems(text) if "TOKEN" in p.upper() or "env is not a mapping" in p]
+            got = [p for p in self.problems(text) if "TOKEN" in p.upper() or "allowed-shape accessor" in p]
             self.assertEqual(bool(got), bad, body)
+        # 3-agent vote (6def5ab6): an env value is read as a scalar through the accessor, so the refusal
+        # names the shape and the line instead of comparing raw text
+        flow = with_verifier("    env: {OTHER: abc}\n")
+        n = flow.split("\n").index("    env: {OTHER: abc}") + 1
+        self.assertTrue(self.has(flow, f"line {n}: env has the shape flow mapping"))
 
     def test_permissions(self):
         for grant, bad in (("write", True), ("Write-All", True), ("WRITE", True), (" write ", True),
-                           ("read", False), ("read-all", False)):
+                           ("read", False), ("read-all", True), ("none", False), ("Read", True)):
             text = with_verifier(f"    permissions:\n      contents: {grant}\n").replace(
                 "    permissions:\n      contents: read\n      issues: read\n    permissions", "    permissions", 1)
             text = with_verifier("").replace("      issues: read\n    steps:", f"      issues: {grant}\n    steps:", 1)
@@ -301,39 +311,63 @@ class TokenPins(unittest.TestCase):
             self.assertTrue([p for p in GATE.workflow_pin_problems(forbidden) if "forbidden trigger" in p])
 
 
-class BranchItems(unittest.TestCase):
-    """`_items` reads a branch list for trigger_covers (flow, multi-line flow, block)."""
+def pr_on(block):
+    """A workflow whose `on:` is `block` (indented two spaces under `on:`)."""
+    return "on:\n" + block + "jobs: {}\n"
 
-    def test_flow_multi_line(self):
-        self.assertEqual(GATE._items(["  branches: [a,", "    b]", "  other: x"], 0), ["a", "b"])
 
-    def test_flow_unclosed_ends_at_block_end(self):
-        self.assertEqual(GATE._items(["  branches: [a,"], 0), [])
+class TriggerFilters(unittest.TestCase):
+    """trigger_covers reads `on.pull_request` filters through the allowed-shape accessor (#6610)."""
 
-    def test_flow_trailing_comma_drops_empty(self):
-        self.assertEqual(GATE._items(["  branches: [a, ]"], 0), ["a"])
+    def test_flow_list_filter(self):
+        self.assertTrue(GATE.trigger_covers(pr_on("  pull_request:\n    branches: [a, rel/*]\n"), "rel/x"))
+        self.assertFalse(GATE.trigger_covers(pr_on("  pull_request:\n    branches: [a, b]\n"), "rel/x"))
 
-    def test_block_list_at_key_indent_and_stop(self):
-        block = ["  branches:", "  - a", "  - b", "  other:", "    - z"]
-        self.assertEqual(GATE._items(block, 0), ["a", "b"])
+    def test_block_list_filter(self):
+        self.assertTrue(GATE.trigger_covers(pr_on("  pull_request:\n    branches:\n      - a\n      - b\n"), "b"))
+        self.assertFalse(GATE.trigger_covers(pr_on("  pull_request:\n    branches:\n      - a\n"), "b"))
 
-    def test_block_list_indented(self):
-        self.assertEqual(GATE._items(["  branches:", "    - a", "  other: x"], 0), ["a"])
+    def test_scalar_filter(self):
+        self.assertTrue(GATE.trigger_covers(pr_on("  pull_request:\n    branches: main\n"), "main"))
 
-    def test_scalar(self):
-        self.assertEqual(GATE._items(["  branches: main"], 0), ["main"])
+    def test_negation_and_ignore(self):
+        self.assertFalse(GATE.trigger_covers(pr_on("  pull_request:\n    branches: ['**', '!rel/x']\n"), "rel/x"))
+        self.assertFalse(GATE.trigger_covers(pr_on("  pull_request:\n    branches-ignore: [rel/*]\n"), "rel/x"))
+        self.assertTrue(GATE.trigger_covers(pr_on("  pull_request:\n    branches-ignore: [other]\n"), "rel/x"))
+
+    def test_shapes_not_read_fail_closed(self):
+        for block in ("  pull_request: {branches: [x]}\n",           # flow mapping event
+                      "  pull_request:\n    branches: |\n      x\n",  # block scalar filter
+                      "  pull_request:\n    branches:\n      - [x]\n",  # nested flow entry
+                      "  pull_request:\n    labels: [x]\n",          # key outside the five filters
+                      "  pull_request:\n    paths: [src/**]\n",
+                      "  pull_request:\n    types: [opened]\n",
+                      "  pull_request:\n    branches: [x]\n    branches-ignore: [y]\n",
+                      "  pull_request:\n    branches: ['x?']\n"):
+            self.assertFalse(GATE.trigger_covers(pr_on(block), "x"), block)
+
+    def test_empty_and_null_event(self):
+        for block in ("  pull_request:\n", "  pull_request: null\n", "  pull_request: ~\n"):
+            self.assertTrue(GATE.trigger_covers(pr_on(block), "x"), block)
+
+    def test_list_forms(self):
+        self.assertTrue(GATE.trigger_covers("on: [push, pull_request]\n", "x"))
+        self.assertTrue(GATE.trigger_covers("on:\n  - push\n  - pull_request\n", "x"))
+        self.assertTrue(GATE.trigger_covers("on: pull_request\n", "x"))
+        self.assertFalse(GATE.trigger_covers("on:\n  - push\n", "x"))
+        self.assertFalse(GATE.trigger_covers("on: {pull_request: null}\n", "x"))
 
 
 class HostileText(unittest.TestCase):
     def test_hostile_text_never_covers_or_defines(self):
         job, ctx = GATE.VERIFIER_JOB_ID, GATE.VERIFIER_CONTEXT
         self.assertTrue(GATE.job_defined(WF, job, ctx))
-        self.assertTrue(GATE.trigger_covers(WF, "chain/promo6-ssh") or True)
+        self.assertTrue(GATE.trigger_covers(WF, "rehearsal/audit-wip"))
         for bad in ("\ufeff" + WF, WF + "\n# \u2028x\n", WF.replace("\n", "\n\u0085", 1)):
-            self.assertTrue(GATE._hostile(bad))
+            with self.assertRaises(Unparsed):
+                SUBSET.parse_workflow(bad)
             self.assertFalse(GATE.job_defined(bad, job, ctx))
-            self.assertFalse(GATE.trigger_covers(bad, "chain/promo6-ssh"))
-        self.assertFalse(GATE._hostile(WF))
+            self.assertFalse(GATE.trigger_covers(bad, "rehearsal/audit-wip"))
 
 
 if __name__ == "__main__":

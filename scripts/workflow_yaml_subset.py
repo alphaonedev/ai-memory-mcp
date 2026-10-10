@@ -480,7 +480,7 @@ def _check_top_level(rows: List[Tuple[int, str, str]]) -> None:
 class Node:
     """One mapping key (kind ``key``), sequence entry (``item``) or the document (``root``)."""
 
-    __slots__ = ("kind", "name", "value", "line", "end", "col", "children", "block")
+    __slots__ = ("kind", "name", "value", "line", "end", "col", "children", "block", "block_lines")
 
     def __init__(self, kind: str, name: str, value: str, line: int, col: int) -> None:
         self.kind = kind
@@ -494,6 +494,8 @@ class Node:
         # such a line is text, not a comment, so a scan must not strip it (a ``${{ }}`` there is
         # expanded before the shell runs).
         self.block: Optional[Tuple[int, int]] = None
+        # (line, text) of each block-scalar content line, CR removed (#6617: the accessor reads these).
+        self.block_lines: List[Tuple[int, str]] = []
 
     def keys(self) -> List["Node"]:
         return [c for c in self.children if c.kind == "key"]
@@ -583,6 +585,11 @@ def parse_workflow(text: str) -> Node:
             done.end = max(done.line, node.line - 1)
         parent = stack[-1]
         if node.kind == "key":
+            if node.col > 0 and ("'" in node.name or '"' in node.name):
+                # YAML reads a quote inside a plain key as text; a lexical reader that toggles a quote
+                # state on it misreads the rest of the row (#6617), so the tree refuses such keys.
+                raise Unparsed("line %d: quote character inside a plain mapping key %r (#6617)"
+                               % (node.line, node.name))
             for sibling in parent.children:
                 if sibling.kind == "key" and key_name(sibling.name).casefold() == key_name(node.name).casefold():
                     raise Unparsed("line %d: repeated mapping key %r (first on line %d)"
@@ -611,6 +618,8 @@ def parse_workflow(text: str) -> Node:
                                     or len(lines[last - 1]) - len(lines[last - 1].lstrip(" ")) <= node.col):
             last -= 1  # trailing blank or less-indented comment lines are not content
         node.block = (node.line + 1, last) if last > node.line else None
+        if node.block:
+            node.block_lines = [(n, lines[n - 1].rstrip("\r")) for n in range(node.block[0], node.block[1] + 1)]
     return root
 
 
@@ -622,3 +631,154 @@ def flow_of(value: str):
 def scalar_of(value: str) -> str:
     """The string of a plain or quoted one-row scalar value."""
     return _unquote(value)
+
+
+# ---------------------------------------------------------------------------------------------
+# Allowed-shape accessor (#6610, #6617, #6618; 3-agent vote (6def5ab6), option C).  Every pin in
+# scripts/check_carrier_ruleset_live.py reads a node through ``read``/``value``/``strings``: the
+# caller names the shapes it accepts, and any other shape is ``Unparsed("line N: ...")``.  Values
+# are the parsed scalars (quotes removed, comments gone, flow collections read), never row text.
+# ---------------------------------------------------------------------------------------------
+
+EMPTY = "empty"  # a key with no value and no children (YAML null)
+PLAIN = "plain scalar"
+QUOTED = "quoted scalar"
+BLOCK_SCALAR = "block scalar"
+FLOW_SEQ = "flow sequence"
+FLOW_MAP = "flow mapping"
+MAP = "block mapping"
+SEQ = "block sequence"
+SCALAR = (PLAIN, QUOTED)
+
+
+def shape(node: Node) -> str:
+    """The shape of a key or item node's value (the reader guarantees exactly one applies)."""
+    if node.children:
+        return MAP if node.children[0].kind == "key" else SEQ
+    value = node.value
+    if not value:
+        return EMPTY
+    if value[0] in "|>":
+        return BLOCK_SCALAR
+    if value[0] == "[":
+        return FLOW_SEQ
+    if value[0] == "{":
+        return FLOW_MAP
+    if value[0] in "'\"":
+        return QUOTED
+    return PLAIN
+
+
+def where(node: Node) -> str:
+    """``line N: <key>`` (or ``line N: sequence entry``) for a refusal message."""
+    label = key_name(node.name) if node.kind == "key" else "sequence entry"
+    return "line %d: %s" % (node.line, label)
+
+
+def value(node: Node, allowed: Tuple[str, ...]):
+    """The parsed value of ``node`` when its shape is in ``allowed``; any other shape is Unparsed.
+
+    plain / quoted scalar: the string (quotes removed); flow sequence / mapping: the list / dict;
+    block scalar: [(line, text)] of its content lines; block mapping / sequence: the node; empty:
+    None.
+    """
+    got = shape(node)
+    if got not in allowed:
+        raise Unparsed("%s has the shape %s; allowed: %s" % (where(node), got, ", ".join(allowed)))
+    if got in SCALAR:
+        return _unquote(node.value)
+    if got in (FLOW_SEQ, FLOW_MAP):
+        return _flow(node.value, 0)[1]
+    if got == BLOCK_SCALAR:
+        return list(node.block_lines)
+    if got == EMPTY:
+        return None
+    return node
+
+
+def child(node: Node, name: str) -> Optional[Node]:
+    """The child key spelled exactly ``name``; a sibling that differs only in letter case is Unparsed.
+
+    GitHub reads workflow keys case-sensitively, so ``Permissions:`` is not ``permissions:``; a pin
+    that looked only for the exact spelling would miss what the variant does on another reader.
+    """
+    for sub in node.children:
+        if sub.kind == "key" and key_name(sub.name).casefold() == name.casefold():
+            if key_name(sub.name) != name:
+                raise Unparsed("%s is not spelled %s" % (where(sub), name))
+            return sub
+    return None
+
+
+def read(node: Node, path: Tuple[str, ...], allowed: Tuple[str, ...]):
+    """(node, parsed value) at ``path`` below ``node``; (None, None) when a key on the path is absent.
+
+    Every node on the way must be a block mapping; the last must have a shape in ``allowed``.
+    """
+    here = node
+    for name in path:
+        if here is not node:
+            value(here, (MAP,))
+        found = child(here, name)
+        if found is None:
+            return None, None
+        here = found
+    return here, value(here, allowed)
+
+
+def read_map(node: Node, spec: Dict[str, Tuple[str, ...]]) -> Dict[str, Node]:
+    """The keys of a block mapping checked against a closed ``spec`` of key -> allowed shapes.
+
+    A key not in ``spec`` (in any letter case) or a value of a shape ``spec`` does not allow is
+    Unparsed.  Returns key -> node.
+    """
+    value(node, (MAP,))
+    out: Dict[str, Node] = {}
+    for sub in node.keys():
+        name = key_name(sub.name)
+        allowed = spec.get(name)
+        if allowed is None:
+            raise Unparsed("%s is not an allowed key here (allowed: %s)" % (where(sub), ", ".join(sorted(spec))))
+        value(sub, allowed)
+        out[name] = sub
+    return out
+
+
+def _flow_strings(obj) -> List[str]:
+    """Every key and scalar string of a parsed flow collection, depth first."""
+    out: List[str] = []
+    todo = [obj]
+    while todo:
+        item = todo.pop()
+        if isinstance(item, str):
+            out.append(str(item))
+        elif isinstance(item, dict):
+            for k, v in item.items():
+                out.append(str(k))
+                todo.append(v)
+        else:
+            todo.extend(item)
+    return out
+
+
+def strings(node: Node) -> List[Tuple[int, str]]:
+    """(line, text) for every parsed string a node and its descendants hold, in document order.
+
+    A key contributes ``name:``; a scalar its parsed text; a flow collection every key and scalar;
+    a block scalar each content line whole (a ``#`` there is text).  Comments are never included
+    and quoting never shifts what is read (#6617).
+    """
+    out: List[Tuple[int, str]] = []
+    for sub in node.walk():
+        if sub.kind == "key":
+            out.append((sub.line, key_name(sub.name) + ":"))
+        if sub.kind == "root":
+            continue
+        got = shape(sub)
+        if got in SCALAR:
+            out.append((sub.line, _unquote(sub.value)))
+        elif got in (FLOW_SEQ, FLOW_MAP):
+            out.extend((sub.line, s) for s in _flow_strings(_flow(sub.value, 0)[1]))
+        elif got == BLOCK_SCALAR:
+            out.extend(sub.block_lines)
+    return out

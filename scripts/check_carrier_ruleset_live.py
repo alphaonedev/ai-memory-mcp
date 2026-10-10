@@ -460,22 +460,18 @@ def frozen_by(ref, rulesets):
     return None
 
 
+def _on_node(root):
+    """The top-level `on:` key (plain or quoted), or None."""
+    return next((k for k in root.keys() if k.name in SUBSET.ON_KEYS), None)
+
+
 def job_defined(workflow_text, job_id, name):
-    """True when `jobs.<job_id>` in the workflow text carries `name: <name>`."""
-    if _hostile(workflow_text):
+    """True when `jobs.<job_id>.name` is the scalar `name`, read through the accessor; False on a refusal."""
+    try:
+        _node, value = SUBSET.read(SUBSET.parse_workflow(workflow_text), ("jobs", job_id, "name"), SUBSET.SCALAR)
+    except Unparsed:
         return False
-    lines = workflow_text.split("\n")
-    for i, line in enumerate(lines):
-        if line.rstrip() != f"  {job_id}:":
-            continue
-        for body in lines[i + 1:]:
-            if body.strip() and not body.startswith("   "):
-                break
-            if body.startswith("    name:"):
-                value = body[len("    name:"):].strip()
-                return value in (name, f'"{name}"', f"'{name}'")
-        return False
-    return False
+    return value == name
 
 
 RELEASE_REF = "release/v1.0.0"
@@ -499,66 +495,25 @@ def _glob(pattern):
 
 
 UNSUPPORTED_GLOB = re.compile(r"[?+\[\]]")
+PR_FILTER_KEYS = ("branches", "branches-ignore", "paths", "paths-ignore", "types")
 
 
-def _unsupported_glob(sub, keys):
-    """True when a branch filter uses `?`, `+` or `[...]`, which this verifier does not translate (#6437).
-
-    Checked on the extracted patterns and, because a bracket also opens a flow list, on the raw
-    lines: `?` or `+` anywhere, more than one `[` or `]` on a line, or a bracket in a `- ` item."""
-    for name in ("branches", "branches-ignore"):
-        if any(UNSUPPORTED_GLOB.search(pat) for pat in keys.get(name, ())):
-            return True
-    for line in sub:
-        if "?" in line or "+" in line or line.count("[") > 1 or line.count("]") > 1:
-            return True
-        if line.lstrip().startswith("- ") and ("[" in line or "]" in line):
-            return True
-    return False
+def _unsupported_glob(keys):
+    """True when a parsed branch pattern uses `?`, `+` or `[...]`, which this verifier does not translate (#6437)."""
+    return any(UNSUPPORTED_GLOB.search(pat) for name in ("branches", "branches-ignore") for pat in keys.get(name, ()))
 
 
-def _indent(line):
-    return len(line) - len(line.lstrip(" "))
-
-
-def _code_lines(text):
-    """Lines without comments or blanks (a quoted `#` does not occur in a branch filter)."""
-    out = []
-    for raw in text.split("\n"):
-        line = re.sub(r"(^|[ \t])#.*$", "", raw).rstrip(" \t\r")
-        if line.strip():
-            out.append(line)
-    return out
-
-
-def _items(block, start):
-    """Values of the list whose key is block[start]: a flow list (maybe multi-line) or `- x` lines."""
-    key_indent = _indent(block[start])
-    rest = block[start].split(":", 1)[1].strip()
-    values = []
-    if rest.startswith("["):
-        joined, j = rest, start
-        while "]" not in joined and j + 1 < len(block):
-            j += 1
-            joined += " " + block[j].strip()
-        values = joined[1:joined.index("]")].split(",") if "]" in joined else []
-    elif not rest:
-        for line in block[start + 1:]:
-            if _indent(line) <= key_indent and not line.lstrip().startswith("- "):
-                break
-            if line.lstrip().startswith("- "):
-                values.append(line.lstrip()[2:])
-    else:
-        values = [rest]
-    return [v.strip().strip("\"'") for v in values if v.strip()]
-
-
-def _hostile(text):
-    """True when the stream holds a character the workflow reader refuses (BOM, NEL, U+2028, controls).
-
-    Such a character can split or hide a line for one reader and not for another (#6543), so the
-    regex helpers below that still read lines treat the workflow as unreadable and fail closed."""
-    return SUBSET._text_failure_line(text) is not None
+def _filter_list(node):
+    """The parsed entries of one `pull_request` filter: a scalar, a flow sequence or a block sequence of scalars."""
+    got = SUBSET.value(node, SUBSET.SCALAR + (SUBSET.FLOW_SEQ, SUBSET.SEQ))
+    form = SUBSET.shape(node)
+    if form in SUBSET.SCALAR:
+        return [got]
+    if form == SUBSET.FLOW_SEQ:
+        if not all(isinstance(item, str) for item in got):
+            raise Unparsed(f"{SUBSET.where(node)} holds an entry that is not a scalar")
+        return [str(item) for item in got]
+    return [SUBSET.value(item, SUBSET.SCALAR) for item in node.items()]
 
 
 EVENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
@@ -574,44 +529,39 @@ def _event_key(node):
     return name
 
 
+ON_SHAPES = SUBSET.SCALAR + (SUBSET.FLOW_SEQ, SUBSET.FLOW_MAP, SUBSET.MAP, SUBSET.SEQ)
+
+
 def on_events(workflow_text):
-    """Event names of the workflow's `on:`, read through the fail-closed YAML-subset reader.
+    """Event names of the workflow's `on:`, read through the allowed-shape accessor (#6481, #6545, #6610).
 
     The block keys, the entries of a block sequence, the words of a flow list, the keys of a flow
-    mapping or a scalar are all names; a quoted, escaped, fullwidth, aliased or merged key, a second
-    document, a duplicate `on:` or any other construct the reader does not model raises Unparsed
-    ("line N: ...") so the caller fails closed (#6481, #6545). A scalar yields its words too: a
-    superset, which only ever adds names."""
-    root = SUBSET.parse_workflow(workflow_text)
-    on = next((k for k in root.keys() if k.name in SUBSET.ON_KEYS), None)
+    mapping or a scalar are all names; a block scalar or an empty `on:`, a quoted, escaped, fullwidth,
+    aliased or merged key, a second document, a duplicate `on:` or any other construct the reader does
+    not model raises Unparsed ("line N: ...") so the caller fails closed. A scalar yields its words
+    too: a superset, which only ever adds names."""
+    on = _on_node(SUBSET.parse_workflow(workflow_text))
     if on is None:
         return set()
+    got = SUBSET.value(on, ON_SHAPES)
+    form = SUBSET.shape(on)
     names = []
-    value = on.value
-    if value:
-        if value[0] in "|>":
-            raise Unparsed(f"line {on.line}: on: is a block scalar")
-        if value[0] in "[{":
-            flow = SUBSET.flow_of(value)
-            if isinstance(flow, dict):
-                names.extend(flow)
-            else:
-                for item in flow:
-                    if not isinstance(item, str):
-                        raise Unparsed(f"line {on.line}: on: list entry is not a scalar")
-                    names.append(str(item))
-        else:
-            word = SUBSET.scalar_of(value)
-            names.extend([word] + re.findall(r"[\w-]+", word))
-    elif not on.children:
-        raise Unparsed(f"line {on.line}: on: is empty")
-    for child in on.children:
-        if child.kind == "key":
-            names.append(_event_key(child))
-        elif child.keys() or child.items() or not child.value or child.value[0] in "[{|>":
-            raise Unparsed(f"line {child.line}: on: sequence entry is not a scalar")
-        else:
-            names.append(SUBSET.scalar_of(child.value))
+    if form in SUBSET.SCALAR:
+        names.extend([got] + re.findall(r"[\w-]+", got))
+    elif form == SUBSET.FLOW_MAP:
+        names.extend(got)
+    elif form == SUBSET.FLOW_SEQ:
+        for item in got:
+            if not isinstance(item, str):
+                raise Unparsed(f"line {on.line}: on: list entry is not a scalar")
+            names.append(str(item))
+    elif form == SUBSET.MAP:
+        names.extend(_event_key(child) for child in on.keys())
+    else:
+        for item in on.items():
+            if SUBSET.shape(item) not in SUBSET.SCALAR:
+                raise Unparsed(f"line {item.line}: on: sequence entry is not a scalar ({SUBSET.shape(item)})")
+            names.append(SUBSET.value(item, SUBSET.SCALAR))
     return set(names)
 
 
@@ -631,79 +581,166 @@ GITHUB_TOKEN_EXPR = "${{ github.token }}"
 TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN")
 SECRETS_REF = re.compile(r"\bsecrets\b", re.I)
 NEEDS_REF = re.compile(r"\bneeds\s*(?:[.\[:])", re.I)
-WRITE_PERMISSIONS = ("write", "write-all")
+EXPRESSION_OPEN = "${{"
+# #6610: the only token permission levels a workflow carrying the #6143 jobs may grant.
+PERMISSION_LEVELS = ("read", "none")
+PERMISSION_SCOPE = re.compile(r"[a-z][a-z-]*\Z")
+PERMISSIONS_PROBLEM = "permissions grant write or are not read/none in a block mapping"
+# Closed shape specs (3-agent vote (6def5ab6), option C): a key outside a spec, or a value of a
+# shape the spec does not list, is a refusal naming its line.
+WORKFLOW_SPEC = {
+    "name": SUBSET.SCALAR, "run-name": SUBSET.SCALAR, "on": ON_SHAPES, "permissions": (SUBSET.MAP,),
+    "env": (SUBSET.MAP,), "defaults": (SUBSET.MAP,), "concurrency": SUBSET.SCALAR + (SUBSET.MAP,),
+    "jobs": (SUBSET.MAP,),
+}
+CONCURRENCY_SPEC = {"group": SUBSET.SCALAR, "cancel-in-progress": SUBSET.SCALAR}
+DEFAULTS_SPEC = {"run": (SUBSET.MAP,)}
+DEFAULTS_RUN_SPEC = {"shell": SUBSET.SCALAR, "working-directory": SUBSET.SCALAR}
+CARRIER_JOB_SPEC = {
+    "name": SUBSET.SCALAR, "runs-on": (SUBSET.PLAIN,), "timeout-minutes": (SUBSET.PLAIN,),
+    "permissions": (SUBSET.MAP,), "env": (SUBSET.MAP,), "steps": (SUBSET.SEQ,),
+}
+STEP_SPEC = {
+    "name": SUBSET.SCALAR, "id": (SUBSET.PLAIN,), "uses": (SUBSET.PLAIN,), "with": (SUBSET.MAP,),
+    "env": (SUBSET.MAP,), "run": SUBSET.SCALAR + (SUBSET.BLOCK_SCALAR,),
+}
+PINNED_ACTION = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@[0-9a-f]{40}\Z")
+TIMEOUT_MINUTES = re.compile(r"[1-9][0-9]{0,2}\Z")
 
 
-def _scan_lines(lines, node, block_lines):
-    """(line number, text) for every line of `node`: comments stripped, except in a block scalar.
-
-    A `#` in a block scalar is text and a `${{ }}` there is expanded before the shell runs, so a
-    block-scalar line is kept whole. Elsewhere only an ASCII space or tab before `#` opens a
-    comment (#6543): a no-break space or U+3000 does not."""
-    out = []
-    for number in range(node.line, node.end + 1):
-        raw = lines[number - 1]
-        out.append((number, raw if number in block_lines else SUBSET._strip_comment(raw)))
-    return out
+def _scalar_map(node):
+    """Check that an env / with block mapping holds one scalar per key (Unparsed otherwise)."""
+    SUBSET.value(node, (SUBSET.MAP,))
+    for sub in node.keys():
+        SUBSET.value(sub, SUBSET.SCALAR)
 
 
-def _scope_problems(label, node, lines, block_lines, is_job):
-    """Token-source problems inside one workflow section or job (#6452, #6482, #6542)."""
+def _scope_problems(label, node, is_job):
+    """Token-source problems inside one workflow section or job (#6452, #6482, #6542, #6617).
+
+    The scan reads the parsed strings of the section (keys, scalars, flow entries, block-scalar
+    lines) through the accessor, so a comment never hides text and a quote never shifts it."""
     problems = []
-    for number, text in _scan_lines(lines, node, block_lines):
+    for number, text in SUBSET.strings(node):
         if SECRETS_REF.search(text):
             problems.append(f"{label} references a repository secret (line {number}): {text.strip()}")
         if is_job and NEEDS_REF.search(text):
             problems.append(f"{label} reads a needs output or declares needs (line {number}): {text.strip()}")
     for sub in node.walk():
-        if sub.kind != "key":
-            continue
-        field = sub.name.upper()
-        if field in TOKEN_ENV_NAMES and SUBSET.scalar_of(sub.value) != GITHUB_TOKEN_EXPR:
-            problems.append(f"{label} {sub.name} is not {GITHUB_TOKEN_EXPR} (line {sub.line}): {sub.value}")
-        if sub.name == "env" and sub.value:
-            if sub.value[0] != "{":
-                problems.append(f"{label} env is not a mapping (line {sub.line}): {sub.value}")
-            else:
-                for key, val in SUBSET.flow_of(sub.value).items():
-                    if key.upper() in TOKEN_ENV_NAMES and val != GITHUB_TOKEN_EXPR:
-                        problems.append(f"{label} {key} is not {GITHUB_TOKEN_EXPR} (line {sub.line}): {val}")
-        if sub.name == "permissions":
-            grants = [sub.value] + [c.value for c in sub.keys()]
-            if any(SUBSET.scalar_of(g).strip().lower() in WRITE_PERMISSIONS for g in grants if g):
-                problems.append(f"{label} permissions grant write (line {sub.line})")
+        if sub.kind == "key" and SUBSET.key_name(sub.name).upper() in TOKEN_ENV_NAMES:
+            got = SUBSET.value(sub, SUBSET.SCALAR)
+            if got != GITHUB_TOKEN_EXPR:
+                problems.append(f"{label} {sub.name} is not {GITHUB_TOKEN_EXPR} (line {sub.line}): {got}")
     return problems
 
 
-def _job_nodes(root):
-    jobs = root.get("jobs")
-    return list(jobs.keys()) if jobs is not None else []
+def _permissions_problems(label, holder, required):
+    """#6610: `permissions` of `holder` must be a block mapping of lowercase scopes to read or none."""
+    try:
+        node = SUBSET.child(holder, "permissions")
+        if node is None:
+            if required:
+                return [f"{label} {PERMISSIONS_PROBLEM}: no permissions block, so the repository default applies"]
+            return []
+        SUBSET.value(node, (SUBSET.MAP,))
+        bad = []
+        for sub in node.keys():
+            scope, level = SUBSET.key_name(sub.name), SUBSET.value(sub, (SUBSET.PLAIN,))
+            if not PERMISSION_SCOPE.match(scope) or level not in PERMISSION_LEVELS:
+                bad.append(f"{scope}: {level} (line {sub.line})")
+    except Unparsed as exc:
+        return [f"{label} {PERMISSIONS_PROBLEM} ({exc})"]
+    return [f"{label} {PERMISSIONS_PROBLEM}: " + "; ".join(bad)] if bad else []
+
+
+def _guarded(problems, label, fn, *args):
+    """Run one pin; a refusal from the accessor becomes a problem naming its line."""
+    try:
+        problems.extend(fn(*args) or [])
+    except Unparsed as exc:
+        problems.append(f"{label} is refused by the allowed-shape accessor: {exc}")
+
+
+def _workflow_shape(root):
+    """The top level and its sections are in WORKFLOW_SPEC and its nested specs (Unparsed otherwise)."""
+    top = SUBSET.read_map(root, WORKFLOW_SPEC)
+    if "concurrency" in top and SUBSET.shape(top["concurrency"]) == SUBSET.MAP:
+        SUBSET.read_map(top["concurrency"], CONCURRENCY_SPEC)
+    if "defaults" in top:
+        for sub in SUBSET.read_map(top["defaults"], DEFAULTS_SPEC).values():
+            SUBSET.read_map(sub, DEFAULTS_RUN_SPEC)
+    if "env" in top:
+        _scalar_map(top["env"])
+
+
+def _carrier_job_shape(label, job, context):
+    """A #6143 job is a closed shape: CARRIER_JOB_SPEC keys, pinned actions, a plain runner, a timeout."""
+    problems = []
+    keys = SUBSET.read_map(job, CARRIER_JOB_SPEC)
+    name = SUBSET.value(keys["name"], SUBSET.SCALAR) if "name" in keys else None
+    if name != context:
+        problems.append(f"{label} does not carry name: {context}")
+    runner = SUBSET.value(keys["runs-on"], (SUBSET.PLAIN,)) if "runs-on" in keys else None
+    if runner is None or EXPRESSION_OPEN in runner:
+        problems.append(f"{label} runs-on is not one plain runner label (line {job.line})")
+    timeout = SUBSET.value(keys["timeout-minutes"], (SUBSET.PLAIN,)) if "timeout-minutes" in keys else None
+    if timeout is None or not TIMEOUT_MINUTES.match(timeout):
+        problems.append(f"{label} timeout-minutes is not a plain whole number of minutes (line {job.line})")
+    if "env" in keys:
+        _scalar_map(keys["env"])
+    steps = keys.get("steps")
+    for step in steps.items() if steps is not None else []:
+        fields = SUBSET.read_map(step, STEP_SPEC)
+        for part in ("with", "env"):
+            if part in fields:
+                _scalar_map(fields[part])
+        if "uses" in fields and not PINNED_ACTION.match(SUBSET.value(fields["uses"], (SUBSET.PLAIN,))):
+            problems.append(f"{label} step uses an action not pinned to a full commit sha (line {step.line})")
+    return problems
 
 
 def job_token_problems(workflow_text):
     """Problems with the token source of the workflow and of the two #6143 jobs; empty is clean.
 
-    Read through the fail-closed reader (Unparsed on anything it does not model, #6482, #6542).
-    Everything outside `jobs:` (workflow `env:`, `defaults:`, `permissions:`) is inherited by every
-    job, so it is held to the same rule as the jobs: no repository secret, no GH_TOKEN/GITHUB_TOKEN
-    that is not exactly `${{ github.token }}`, no write permission. A #6143 job also takes no
-    `needs:` (an output can carry a credential) and its check name is claimed by it alone: another
-    job id that differs only in case or space, or another job carrying the same `name:`, is a
-    problem (#6542). The verifier job must set GH_TOKEN, or `gh` has no credential."""
+    Every value is read through the allowed-shape accessor in scripts/workflow_yaml_subset.py
+    (3-agent vote (6def5ab6), option C): a shape the pin does not allow is a problem naming its line,
+    and nothing is compared as raw text. Everything outside `jobs:` (workflow `env:`, `defaults:`,
+    `permissions:`) is inherited by every job, so it is held to the same rule as the jobs: no
+    repository secret, no GH_TOKEN/GITHUB_TOKEN that is not exactly `${{ github.token }}`. The
+    workflow `permissions:` block must exist and every job's `permissions:` must be a block mapping
+    of read/none (#6610). No job name may be an expression (#6618). A #6143 job also takes no
+    `needs:` (an output can carry a credential), has the closed CARRIER_JOB_SPEC shape, and its check
+    name is claimed by it alone: another job id that differs only in case or space, or another job
+    whose parsed `name:` is the same, is a problem (#6542). The verifier job must set GH_TOKEN, or
+    `gh` has no credential."""
     root = SUBSET.parse_workflow(workflow_text)
-    lines = workflow_text.split("\n")
-    block_lines = {n for node in root.walk() if node.block for n in range(node.block[0], node.block[1] + 1)}
     problems = []
+    _guarded(problems, "workflow", _workflow_shape, root)
+    problems.extend(_permissions_problems("workflow", root, True))
     for top in root.keys():
         if top.name != "jobs":
-            problems.extend(_scope_problems("workflow", top, lines, block_lines, False))
-    jobs = _job_nodes(root)
-    for job_id, context in ((FRESHNESS_JOB_ID, FRESHNESS_CONTEXT), (VERIFIER_JOB_ID, VERIFIER_CONTEXT)):
+            _guarded(problems, "workflow", _scope_problems, "workflow", top, False)
+    jobs_node = root.get("jobs")
+    jobs = jobs_node.keys() if jobs_node is not None else []
+    names = {}
+    for node in jobs:
+        label = f"job {node.name}"
+        problems.extend(_permissions_problems(label, node, False))
+        try:
+            name_node = SUBSET.child(node, "name")
+            names[node.name] = SUBSET.value(name_node, SUBSET.SCALAR) if name_node is not None else None
+        except Unparsed as exc:
+            problems.append(f"{label} name is refused by the allowed-shape accessor: {exc}")
+            continue
+        if names[node.name] is not None and EXPRESSION_OPEN in names[node.name]:
+            problems.append(f"{label} name is an expression (line {name_node.line}); GitHub evaluates it, so it"
+                            f" can report a #6143 check name (#6618)")
+    for job_id, context in CARRIER_JOBS:
         wanted = None
         for node in jobs:
             same_id = node.name.strip().casefold() == job_id.casefold()
-            name_node = node.get("name")
-            claims = name_node is not None and SUBSET.scalar_of(name_node.value).strip().casefold() == context.casefold()
+            parsed = names.get(node.name)
+            claims = parsed is not None and parsed.strip().casefold() == context.casefold()
             if node.name == job_id:
                 wanted = node
             elif same_id or claims:
@@ -712,15 +749,13 @@ def job_token_problems(workflow_text):
             problems.append(f"job {job_id} not found")
             continue
         label = f"job {job_id}"
-        problems.extend(_scope_problems(label, wanted, lines, block_lines, True))
+        _guarded(problems, label, _scope_problems, label, wanted, True)
         if wanted.get("needs") is not None:
             problems.append(f"{label} declares needs (line {wanted.get('needs').line})")
-        name_node = wanted.get("name")
-        if name_node is None or SUBSET.scalar_of(name_node.value) != context:
-            problems.append(f"{label} does not carry name: {context}")
+        _guarded(problems, label, _carrier_job_shape, label, wanted, context)
         if job_id == VERIFIER_JOB_ID and not any(
-                n.kind == "key" and n.name == "GH_TOKEN" and SUBSET.scalar_of(n.value) == GITHUB_TOKEN_EXPR
-                for n in wanted.walk()):
+                n.kind == "key" and n.name == "GH_TOKEN" and SUBSET.shape(n) in SUBSET.SCALAR
+                and SUBSET.value(n, SUBSET.SCALAR) == GITHUB_TOKEN_EXPR for n in wanted.walk()):
             problems.append(f"{label} does not set GH_TOKEN: {GITHUB_TOKEN_EXPR}")
     return problems
 
@@ -737,67 +772,67 @@ def workflow_pin_problems(workflow_text):
 def trigger_covers(workflow_text, branch):
     """True when the workflow's `on.pull_request` fires for EVERY PR whose BASE is `branch` (#6232).
 
-    Fail closed: a flow mapping, a `paths`/`paths-ignore` filter, or a `types` list without
-    opened/synchronize/reopened is False, because the workflow would be skipped for some pull
-    requests and a required context would never report (#6429, #6430). Also False for `branches`
-    together with `branches-ignore` (invalid on GitHub, #6438) and for a pattern using `?`, `+`
-    or `[...]` (not translated, #6437)."""
-    if _hostile(workflow_text):
-        return False  # a BOM, NEL, U+2028 or control character: the lines cannot be trusted (#6543)
-    lines = _code_lines(workflow_text)
-    for i, line in enumerate(lines):
-        if _indent(line) == 0 and line.startswith("on:"):
-            inline = line[3:].strip()
-            if inline:
-                if inline.startswith("{"):
-                    return False  # flow mapping: not parsed, so it never "covers" (#6429)
-                return "pull_request" in re.findall(r"[\w-]+", inline)
-            block = []
-            for body in lines[i + 1:]:
-                if _indent(body) == 0:
-                    break
-                block.append(body)
-            break
-    else:
+    Read through the allowed-shape accessor; a refusal is False (fail closed). Also False for a flow
+    mapping `on:` or `pull_request:`, a `paths`/`paths-ignore` filter, or a `types` list without
+    opened/synchronize/reopened, because the workflow would be skipped for some pull requests and a
+    required context would never report (#6429, #6430); for `branches` together with
+    `branches-ignore` (invalid on GitHub, #6438); for a pattern using `?`, `+` or `[...]` (not
+    translated, #6437); and for a `pull_request` key other than the five filters."""
+    try:
+        return _covers(SUBSET.parse_workflow(workflow_text), branch)
+    except Unparsed:
         return False
-    if not block:
+
+
+def _covers(root, branch):
+    on = _on_node(root)
+    if on is None:
         return False
-    event_indent = _indent(block[0])
-    for j, body in enumerate(block):
-        head = re.match(r"pull_request\s*:\s*(.*)$", body.strip()) if _indent(body) == event_indent else None
-        if head:
-            if head.group(1) not in ("", "null", "~"):
-                return False  # a flow mapping or any inline value after the colon is not parsed (#6429)
-            sub = []
-            for deeper in block[j + 1:]:
-                if _indent(deeper) <= event_indent:
-                    break
-                sub.append(deeper)
-            keys = {}
-            for k, deeper in enumerate(sub):
-                m = re.match(r"(branches(?:-ignore)?|paths(?:-ignore)?|types)\s*:", deeper.strip())
-                if m and _indent(deeper) == _indent(sub[0]):
-                    keys[m.group(1)] = _items(sub, k)
-            if _unsupported_glob(sub, keys):
-                return False  # ?, + and [...] are glob syntax this verifier does not translate (#6437)
-            if "branches" in keys and "branches-ignore" in keys:
-                return False  # GitHub rejects both filters on one event: the workflow is invalid (#6438)
-            if "paths" in keys or "paths-ignore" in keys:
-                return False  # a path filter skips the workflow for some pull requests (#6430)
-            if "types" in keys and not set(RUN_TYPES) <= set(keys["types"]):
-                return False  # the default activity types are what a required context needs (#6430)
-            if "branches" in keys:
-                hit = False
-                for pat in keys["branches"]:
-                    if pat.startswith("!"):
-                        hit = hit and not _glob(pat[1:]).match(branch)
-                    elif _glob(pat).match(branch):
-                        hit = True
-                return hit
-            if "branches-ignore" in keys:
-                return not any(_glob(pat).match(branch) for pat in keys["branches-ignore"])
-            return True
-    return False
+    form = SUBSET.shape(on)
+    if form in SUBSET.SCALAR:
+        return "pull_request" in re.findall(r"[\w-]+", SUBSET.value(on, SUBSET.SCALAR))
+    if form == SUBSET.FLOW_SEQ:
+        return "pull_request" in [str(item) for item in SUBSET.value(on, (SUBSET.FLOW_SEQ,)) if isinstance(item, str)]
+    if form == SUBSET.SEQ:
+        return any(SUBSET.shape(item) in SUBSET.SCALAR and SUBSET.value(item, SUBSET.SCALAR) == "pull_request"
+                   for item in on.items())
+    if form != SUBSET.MAP:
+        return False  # a flow mapping is not read as a trigger list (#6429)
+    pr = SUBSET.child(on, "pull_request")
+    if pr is None:
+        return False
+    pr_form = SUBSET.shape(pr)
+    if pr_form == SUBSET.PLAIN and SUBSET.value(pr, (SUBSET.PLAIN,)) in ("null", "~"):
+        return True
+    if pr_form == SUBSET.EMPTY:
+        return True
+    if pr_form != SUBSET.MAP:
+        return False  # a flow mapping or any other inline value is not read (#6429)
+    keys = {}
+    for sub in pr.keys():
+        name = SUBSET.key_name(sub.name)
+        if name not in PR_FILTER_KEYS:
+            return False
+        keys[name] = _filter_list(sub)
+    if _unsupported_glob(keys):
+        return False  # ?, + and [...] are glob syntax this verifier does not translate (#6437)
+    if "branches" in keys and "branches-ignore" in keys:
+        return False  # GitHub rejects both filters on one event: the workflow is invalid (#6438)
+    if "paths" in keys or "paths-ignore" in keys:
+        return False  # a path filter skips the workflow for some pull requests (#6430)
+    if "types" in keys and not set(RUN_TYPES) <= set(keys["types"]):
+        return False  # the default activity types are what a required context needs (#6430)
+    if "branches" in keys:
+        hit = False
+        for pat in keys["branches"]:
+            if pat.startswith("!"):
+                hit = hit and not _glob(pat[1:]).match(branch)
+            elif _glob(pat).match(branch):
+                hit = True
+        return hit
+    if "branches-ignore" in keys:
+        return not any(_glob(pat).match(branch) for pat in keys["branches-ignore"])
+    return True
 
 
 def branch_name(ref):
