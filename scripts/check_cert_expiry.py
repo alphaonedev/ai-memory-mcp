@@ -261,12 +261,15 @@ def _git_env():
     return env
 
 
-def run_git(repo, *args, timeout=120):
-    """Run git in `repo`; returns CompletedProcess with bytes output."""
+def run_git(repo, *args, timeout=120, env_extra=None):
+    """Run git in `repo`; returns CompletedProcess with bytes output.
+    ENV_EXTRA is for the self-test fixture only (commit dates)."""
+    env = _git_env()
+    env.update(env_extra or {})
     try:
         return subprocess.run(
             ["git", "-c", "core.quotePath=false", "-C", str(repo), *args],
-            capture_output=True, env=_git_env(), timeout=timeout, check=False,
+            capture_output=True, env=env, timeout=timeout, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise GateError(f"git {args[0] if args else ''} could not complete: {exc}") from exc
@@ -1249,9 +1252,10 @@ class Fixture:
 
     def __init__(self, repo):
         self.repo = repo
+        self.env_extra = {}
 
     def g(self, *args):
-        proc = run_git(self.repo, *args)
+        proc = run_git(self.repo, *args, env_extra=self.env_extra)
         if proc.returncode != 0:
             err = proc.stderr.decode("utf-8", "replace").strip()
             raise GateError(f"fixture git {args} failed: {err}")
@@ -2684,6 +2688,36 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         cell_k = edit_range("\n" + amend(ref, [mod_rs]), label=tag)
         t.expect_red(f"6124-{tag}", label, repo, exp6124, cell_k, red6124 +
                      [("its header carries a link", "did not refuse the header")])
+
+    # (6124-t1..t3) #6421 (R3-F4; 5-agent vote 4d3ea1c5, F4-A) - the date
+    # floor follows the RECORD's own commit day (less one), not the moving
+    # merge-base: t1 GREEN - an honest record written 6 days before the base
+    # moved on (queue latency); t2 RED - dated before its own commit day less
+    # one; t3 RED - a forged old commit date reaches no further than 14 days
+    # below the merge-base day.
+    def at_day(days_ago, fn):
+        stamp = f"{(day6124 - datetime.timedelta(days=days_ago)).isoformat()}T12:00:00+0000"
+        fx.env_extra = {"GIT_COMMITTER_DATE": stamp, "GIT_AUTHOR_DATE": stamp}
+        try:
+            return fn()
+        finally:
+            fx.env_extra = {}
+
+    def dated(days_ago):
+        return (day6124 - datetime.timedelta(days=days_ago)).isoformat()
+
+    mb_t = doc_only("\nBase prose.\n", label="t-mb")
+    for tag, label, ago, rec_ago, green in (
+            ("t1", "record written 6 days before the base moved on", 6, 6, True),
+            ("t2", "record dated 2 days before its own commit day", 6, 8, False),
+            ("t3", "forged commit date 30 days back", 30, 30, False)):
+        cell_t = at_day(ago, lambda: edit_range(
+            "\n" + amend("#6162", [mod_rs], date=dated(rec_ago)), label=tag, frm=mb_t))
+        if green:
+            t.expect_green(f"6124-{tag}", label, repo, mb_t, cell_t, green6124)
+        else:
+            t.expect_red(f"6124-{tag}", label, repo, mb_t, cell_t, red6124 +
+                         [("is before", "did not refuse the back-dated record")])
 
     # (6124-r1..r4) #6355: the COMMITTED cert doc of this checkout, as the
     # merge-base, with a record inserted at each legal spot (GREEN), behind an
