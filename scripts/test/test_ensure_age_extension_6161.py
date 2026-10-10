@@ -25,6 +25,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import shutil
 import signal
@@ -695,6 +696,32 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             self.assertIsNone(call["pgservice"], "PGSERVICE reached psql (service-file password would win)")
             self.assertIsNone(call["pgservicefile"], "PGSERVICEFILE reached psql")
             self.assertTrue(call["env_marker_ok"], "the moved password must still reach psql")
+
+    # ---- #6346 / #6348: the docs say what the code does ------------------------------
+    @staticmethod
+    def collapsed(path):
+        return " ".join(Path(path).read_text(encoding="utf-8").split())
+
+    def test_docs_name_every_refused_by_name_key(self):
+        # #6346: sslkeylogfile and require_auth were refused by name but missing from the docstring and docs.
+        mod = load_module()
+        docstring = " ".join(mod.__doc__.split())
+        docs = self.collapsed(ROOT / "docs/DEV-CI-ENVIRONMENT.md")
+        changelog = self.collapsed(ROOT / "changelog.d/6161.fixed.md")
+        for key in sorted(mod.REFUSED_KNOWN_KEYS):
+            pattern = r"(?<![A-Za-z0-9_])" + key + r"(?![A-Za-z0-9_])"
+            with self.subTest(key=key):
+                self.assertTrue(re.search(pattern, docstring), f"{key} missing from the module docstring")
+                self.assertTrue(re.search(pattern, docs), f"{key} missing from docs/DEV-CI-ENVIRONMENT.md")
+        for key in ("sslkeylogfile", "require_auth"):
+            with self.subTest(changelog_key=key):
+                self.assertTrue(key in changelog, f"{key} missing from changelog.d/6161.fixed.md")
+
+    def test_docstring_states_the_real_reason_ssl_true_is_refused(self):
+        # #6346: libpq 18.6 DOES know ssl=true (it maps it to sslmode=require); the helper refuses it on purpose.
+        doc = " ".join(load_module().__doc__.split())
+        self.assertFalse("libpq does not know" in doc, "docstring still says libpq does not know ssl=true")
+        self.assertTrue("maps to ``sslmode=require``" in doc, "docstring does not say ssl=true maps to sslmode=require")
 
     # ---- #6252 / cloud F6: signals and the connect timeout --------------------
     def start_sleeping_helper(self):
