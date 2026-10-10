@@ -2177,3 +2177,40 @@ Status `completed`, conclusion `success`, created 2026-10-10T17:28:55Z, updated 
 | job id | job | runner | created | queue wait | started | ended | duration | conclusion |
 |---|---|---|---|---|---|---|---|---|
 | 114270870968 | tool-count grep gate | GitHub Actions 1000125843 | 17:28:56Z | 10.1 min | 17:39:04Z | 17:39:13 | 0.1 min | success |
+
+## Update 17:58Z: run 38069459606 Per-Module Coverage Thresholds (fix/6157-promo6-ssh @ 41b051b3c) reached terminal state
+
+Status `completed`, conclusion `success`, created 2026-10-10T16:53:03Z, updated 2026-10-10T17:50:50Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38069459606
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114263725022 | Coverage classify (docs-only short-circuit) | GitHub Actions 1000125307 | 16:53:03Z | 0.4 min | 16:53:29Z | 16:53:38 | 0.1 min | success |
+| 114263839664 | Per-Module Coverage Thresholds | GitHub Actions 1000125405 | 16:53:38Z | 1.6 min | 16:55:15Z | 17:50:49 | 55.6 min (over 45) | success |
+
+## Update 17:58Z: run 38069469447 Per-Module Coverage Thresholds (fix/6165-promo6-ssh @ 3722bf72b) reached terminal state
+
+Status `completed`, conclusion `success`, created 2026-10-10T16:53:11Z, updated 2026-10-10T17:50:59Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38069469447
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114263753171 | Coverage classify (docs-only short-circuit) | GitHub Actions 1000125303 | 16:53:12Z | 0.2 min | 16:53:24Z | 16:53:33 | 0.1 min | success |
+| 114263825262 | Per-Module Coverage Thresholds | GitHub Actions 1000125409 | 16:53:34Z | 1.7 min | 16:55:18Z | 17:50:58 | 55.7 min (over 45) | success |
+
+## Update 17:58Z: run 38071731978 CodeQL (fix/6174-promo6-ssh-ci3 @ 11adfbf2d) reached terminal state
+
+Status `completed`, conclusion `success`, created 2026-10-10T17:26:17Z, updated 2026-10-10T17:51:08Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071731978
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114270334810 | CodeQL analysis (rust) | GitHub Actions 1000125701 | 17:26:18Z | 1.8 min | 17:28:07Z | 17:51:08 | 23.0 min | success |
+| 114270334927 | CodeQL analysis (javascript-typescript) | GitHub Actions 1000125704 | 17:26:18Z | 2.1 min | 17:28:22Z | 17:29:24 | 1.0 min | success |
+| 114270334932 | CodeQL analysis (actions) | GitHub Actions 1000125703 | 17:26:18Z | 2.0 min | 17:28:16Z | 17:29:05 | 0.8 min | success |
+| 114270334958 | CodeQL analysis (python) | GitHub Actions 1000125712 | 17:26:18Z | 3.5 min | 17:29:45Z | 17:31:22 | 1.6 min | success |
+
+## Update 17:58Z: run 38071909688 token-budget (fix/6161-promo6-ssh @ 47545e143) reached terminal state
+
+Status `completed`, conclusion `success`, created 2026-10-10T17:28:55Z, updated 2026-10-10T17:57:44Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071909688
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114270870948 | token-budget gates | GitHub Actions 1000125822 | 17:28:56Z | 8.1 min | 17:36:59Z | 17:57:44 | 20.8 min | success |
