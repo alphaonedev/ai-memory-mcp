@@ -121,7 +121,7 @@ fn r1_unowned_parent_graft_allowed() {
     );
     assert!(
         res.is_ok(),
-        "#2542 Route 1: a parent with no standard is unowned and must be allowed; got {res:?}"
+        "#2542 Route 1: a parent with no standard is unowned and must be allowed; got Err"
     );
 }
 
@@ -143,7 +143,7 @@ fn r1_same_principal_parent_allowed() {
     );
     assert!(
         res.is_ok(),
-        "#2542 Route 1: same-principal parent graft must be allowed; got {res:?}"
+        "#2542 Route 1: same-principal parent graft must be allowed; got Err"
     );
 }
 
