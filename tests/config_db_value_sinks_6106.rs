@@ -180,10 +180,9 @@ fn doctor_never_echoes_a_scheme_less_db_flag_credential_6106() {
 fn serve_deferred_audit_failure_never_echoes_a_config_db_credential_6106() {
     use std::os::unix::fs::PermissionsExt as _;
     for (dir, value) in [
-        (
-            "open",
-            format!("open/host=db.example password={MARKER} dbname=mem"),
-        ),
+        // A key/value DSN is refused before boot since #6699, so the `=`
+        // shape that still reaches the spool is a path segment holding `=`.
+        ("open/opt={MARKER}", format!("open/opt={MARKER}/mem")),
         (
             "open/postgres:/svc:{MARKER}@db.example",
             format!("open/postgres:/svc:{MARKER}@db.example/mem"),

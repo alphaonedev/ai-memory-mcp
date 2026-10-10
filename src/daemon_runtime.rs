@@ -157,17 +157,31 @@ const AGENT_QUOTA_RESET_INTERVAL_SECS: u64 = 60;
 /// the whole message here lets us redact the password (#1579 A3) while
 /// still refusing before `effective_db` / any `db::open`. A non-UTF-8
 /// path (`to_str() == None`) cannot be a URL, so it passes through.
+///
+/// #6699 — the ONE predicate `url_display::db_value_is_dsn_shaped` also
+/// refuses a libpq key/value DSN, and [`run`] applies it to the RESOLVED
+/// value, so config `db` is covered too. A file an older release created
+/// under the DSN-shaped name is named (redacted) with the rename step; it
+/// is never opened or deleted.
 fn reject_url_shaped_db_path(db: &Path) -> Result<()> {
-    if let Some(raw) = db.to_str() {
-        if raw.contains("://") {
-            anyhow::bail!(
-                "--db expects a filesystem path, not a URL (got `{}`). To use \
-                 Postgres, pass it via --store-url (or AI_MEMORY_STORE_URL / \
-                 AI_MEMORY_STORE_URL_FILE); --db / AI_MEMORY_DB is a SQLite file \
-                 path only.",
-                crate::url_display::store_url_display(raw)
-            );
-        }
+    if db
+        .to_str()
+        .is_some_and(crate::url_display::db_value_is_dsn_shaped)
+    {
+        let shown = crate::url_display::db_path_display(db);
+        let existing = if db.exists() {
+            format!(
+                " A file already exists at `{shown}`: nothing was opened or deleted; rename it to a plain file name and point the database path at the new name (#6699)."
+            )
+        } else {
+            String::new()
+        };
+        anyhow::bail!(
+            "--db / AI_MEMORY_DB / config `db` expects a filesystem path, not a URL or a \
+             key=value connection string (got `{shown}`). To use Postgres, pass it via \
+             --store-url (or AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE); the database \
+             path is a SQLite file path only.{existing}"
+        );
     }
     Ok(())
 }
@@ -1410,10 +1424,12 @@ pub async fn run(
     // BEFORE the dispatch match so the `--db` / `--store-url` mutual-exclusion
     // guard can no longer mistake a config-resolved path for a typed flag.
     let db_was_explicit = cli.db.is_some();
-    if let Some(db) = cli.db.as_deref() {
-        reject_url_shaped_db_path(db)?;
-    }
     let db_path = app_config.effective_db_explicit(cli.db.as_deref());
+    // #6699 — on the RESOLVED value (flag, env AND config `db`); `config`
+    // never opens the store and must stay usable to repair a config `db`.
+    if db_was_explicit || !matches!(cli.command, Command::Config(_)) {
+        reject_url_shaped_db_path(&db_path)?;
+    }
     // #3431 — bind the ONE store this process runs on, before anything opens
     // or creates a file. On a `--store-url` command this both enforces the
     // #3142 mutual exclusion (with the corrected explicitness signal) and

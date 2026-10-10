@@ -261,17 +261,67 @@ pub fn strip_sqlite_scheme(url: &str) -> Option<&str> {
 ///
 /// The text is a filesystem path, but `sqlite://svc:<pw>@host/db` is also a
 /// URL with userinfo, and a mistyped store URL is exactly where a credential
-/// lands. Any `@` therefore renders `sqlite://<redacted-authority>` (fail
-/// closed: a real path holding `@` loses only display detail). Otherwise the
+/// lands. Any `@`, or a `=` in the rendered path part (a key/value DSN
+/// `host=db password=<pw>`, #6702; a `?mode=ro` query is never rendered),
+/// therefore renders `sqlite://<redacted-authority>` (fail closed: a real
+/// path holding `@` or `=` loses only display detail). Otherwise the
 /// path renders up to its first `?` or `#`: the query and fragment are not
 /// part of the file name an operator needs to see.
 fn sqlite_store_display(rest: &str) -> String {
     let scheme = crate::store_url::SQLITE_URL_SCHEME;
-    if rest.contains('@') {
+    let path = rest.split(['?', '#']).next().unwrap_or_default();
+    if rest.contains('@') || path.contains('=') {
         return format!("{scheme}{REDACTED_AUTHORITY}");
     }
-    let path = rest.split(['?', '#']).next().unwrap_or_default();
     format!("{scheme}{path}")
+}
+
+/// The libpq connection keywords (PostgreSQL 18 `libpq` "Parameter Key
+/// Words"), space-separated: a `<keyword>=` word marks a key/value DSN
+/// (#6699). One list, so the literal ratchet sees one string.
+const LIBPQ_DSN_KEYWORDS: &str = "host hostaddr port dbname user password passfile \
+    channel_binding connect_timeout client_encoding options application_name \
+    fallback_application_name keepalives keepalives_idle keepalives_interval \
+    keepalives_count tcp_user_timeout replication gssencmode sslmode requiressl \
+    sslcompression sslcert sslkey sslpassword sslcertmode sslrootcert sslcrl sslcrldir \
+    sslsni requirepeer ssl_min_protocol_version ssl_max_protocol_version krbsrvname \
+    gsslib gssdelegation service target_session_attrs load_balance_hosts require_auth \
+    sslnegotiation";
+
+/// `true` when a database-path value (`--db`, `AI_MEMORY_DB`, config `db`)
+/// is a store DSN rather than a SQLite file path (#3142, #6699): it holds
+/// `://` (a URL), or a whitespace-separated word is a libpq keyword followed
+/// by `=` (optionally with whitespace around the `=`, as libpq allows), the
+/// key/value DSN `host=db password=<pw> dbname=mem`.
+///
+/// A bare `@` or `=` is never enough: `/home/user@corp/ai-memory.db` and
+/// `/data/run=3/x.db` are real paths. A keyword only counts at the start of
+/// a word, so `/srv/host=a/mem.db` (the `=` follows `/srv/host`) is a path.
+/// Keywords match case-insensitively (fail closed).
+#[must_use]
+pub fn db_value_is_dsn_shaped(text: &str) -> bool {
+    if text.contains("://") {
+        return true;
+    }
+    let is_keyword = |key: &str| {
+        !key.is_empty()
+            && LIBPQ_DSN_KEYWORDS
+                .split_whitespace()
+                .any(|k| k.eq_ignore_ascii_case(key))
+    };
+    let words: Vec<&str> = text.split_whitespace().collect();
+    words
+        .iter()
+        .enumerate()
+        .any(|(i, word)| match word.split_once('=') {
+            Some((key, _)) => is_keyword(key),
+            None => {
+                is_keyword(word)
+                    && words
+                        .get(i.saturating_add(1))
+                        .is_some_and(|next| next.starts_with('='))
+            }
+        })
 }
 
 /// A SQLite database PATH for a refusal, a log line or a report (#6107).
@@ -736,5 +786,37 @@ mod tests {
             "{:?}",
             TransportFailure::classify(&err)
         );
+    }
+
+    /// #6699 - the ONE database-path predicate: URLs and libpq key/value
+    /// DSNs are refused, a bare `@` or `=` in a real path never is.
+    #[test]
+    fn db_value_dsn_shapes_are_detected_and_paths_are_not_6699() {
+        for dsn in [
+            "postgres://u:pw@h/db",
+            "sqlite:///var/x.db",
+            "host=db.example password=pw dbname=mem",
+            "dbname=mem",
+            "  HOST=db.example  ",
+            "host = db.example password = pw",
+            "user=svc sslmode=require",
+            "/srv/x.db password=pw",
+        ] {
+            assert!(db_value_is_dsn_shaped(dsn), "{dsn:?} must be refused");
+        }
+        for path in [
+            "/home/user@corp/ai-memory.db",
+            "/data/run=3/x.db",
+            "/srv/host=a/mem.db",
+            "open/opt=SECRET/mem",
+            "ai-memory.db",
+            ":memory:",
+            "/var/lib/ai-memory/mem.db",
+            "C:\\Users\\a=b\\mem.db",
+            "hosting=1.db",
+            "my host.db",
+        ] {
+            assert!(!db_value_is_dsn_shaped(path), "{path:?} is a path");
+        }
     }
 }
