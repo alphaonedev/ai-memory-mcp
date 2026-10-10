@@ -2646,6 +2646,39 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
             if banned in out_e:
                 t.fail(f"(6124-{tag}): {label} was told to '{banned}' (#3899):", out_e)
 
+    # (6124-k1..k8) #6444 - cells that kill six mutants the round-3 review
+    # found alive (G08 end-text never ends a block, G40 the CDATA end matches
+    # a lone ']', G21/G22 the body ban loses its '<>' / backslash+backtick,
+    # G24/G25 the header ban loses 'GH-N' / 'www.').
+    # k1 GREEN: a multi-line <pre> block that ENDS at '</pre>' before the record.
+    pre_k1 = ">\n> <pre>\n> text\n> </pre>\n>\n"
+    mb_k1 = doc_only(quoted=pre_k1 + old_b, label="k1-mb")
+    k1 = edit_range("", quoted=pre_k1 + rec6124 + ">\n" + old_b, label="k1", frm=mb_k1)
+    t.expect_green("6124-k1", "record after a multi-line HTML block that ended", repo, mb_k1, k1,
+                   green6124)
+    # k2 RED: a CDATA block holding a lone ']' does not end there; the record
+    # inside it stays hidden.
+    pre_k2 = ">\n> <![CDATA[\n> a ] b\n>\n"
+    mb_k2 = doc_only(quoted=pre_k2 + "> ]]>\n>\n" + old_b, label="k2-mb")
+    k2 = edit_range("", quoted=pre_k2 + rec6124 + "> ]]>\n>\n" + old_b, label="k2", frm=mb_k2)
+    t.expect_red("6124-k2", "record inside a CDATA block after a lone ']'", repo, mb_k2, k2,
+                 red6124 + [("no NEW amendment record", "did not report the hidden record")])
+    # k3..k6 RED: one banned character in the plain-prose line of the record.
+    for tag, label, prose in (
+            ("k3", "a '<' in the record prose", "> Changed in <this range:"),
+            ("k4", "a '>' in the record prose", "> Changed in this> range:"),
+            ("k5", "a backslash in the record prose", "> Changed in this\\ range:"),
+            ("k6", "a backtick in the record prose", "> Changed in `this` range:")):
+        cell_k = edit_range("\n" + amend("#6162", [mod_rs], prose=prose), label=tag)
+        t.expect_red(f"6124-{tag}", label, repo, exp6124, cell_k, red6124 +
+                     [("cites or links something other than", "did not refuse the prose line")])
+    # k7/k8 RED: a 'GH-7' form and a 'www.' form in the header.
+    for tag, label, ref in (("k7", "a GH-N form in the record header", "#6162 GH-7"),
+                            ("k8", "a www. form in the record header", "#6162 www.example")):
+        cell_k = edit_range("\n" + amend(ref, [mod_rs]), label=tag)
+        t.expect_red(f"6124-{tag}", label, repo, exp6124, cell_k, red6124 +
+                     [("its header carries a link", "did not refuse the header")])
+
     # (6124-r1..r4) #6355: the COMMITTED cert doc of this checkout, as the
     # merge-base, with a record inserted at each legal spot (GREEN), behind an
     # inserted HTML opener (RED), and above non-record prose that would then
