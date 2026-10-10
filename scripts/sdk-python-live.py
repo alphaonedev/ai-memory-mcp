@@ -19,14 +19,19 @@ This harness, run by the clients-ci job ``sdk-python-live``:
    and FAILS unless every one of them ran and passed: a skip is a failure here,
    because a skipped live test is the defect #6746 closes.
 
-Usage: sdk-python-live.py --binary PATH --sdk sdk/python --run-dir DIR [--port 9077]
+The daemon listens on a free loopback port the harness picks, unless
+``--port`` names one (#6831). The daemon and the hub are stopped on every
+exit: normal, a startup error of any kind, SIGINT, SIGTERM or SIGHUP (#6812).
+
+Usage: sdk-python-live.py --binary PATH --sdk sdk/python --run-dir DIR [--port N]
 Exit codes: 0 all live tests passed; 1 a live test failed, skipped or was not
-collected; 2 the daemon or hub could not be started.
+collected; 2 the daemon or hub could not be started; 128+N stopped by signal N.
 """
 
 import argparse
 import datetime
 import os
+import signal
 import socket
 import ssl
 import subprocess
@@ -75,6 +80,32 @@ def verdict(outcomes, expected=LIVE_TESTS):
         elif got != "passed":
             problems.append(f"{node}: {got}")
     return problems
+
+
+def free_port():
+    """A TCP port free on 127.0.0.1 now, chosen by the kernel (#6831)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+class Stopped(BaseException):
+    """A termination signal arrived; ``main`` tears the stack down and exits 128+N.
+
+    A ``BaseException``, so the startup ``except Exception`` cannot swallow it.
+    """
+
+    def __init__(self, signum):
+        super().__init__(f"stopped by signal {signum}")
+        self.signum = signum
+
+
+def _stop(signum, _frame):
+    raise Stopped(signum)
+
+
+#: Signals that end the run with the stack torn down (#6812).
+STOP_SIGNALS = tuple(getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, name))
 
 
 def mint_tls(tls_dir):
@@ -304,6 +335,19 @@ class Stack:
                 raise RuntimeError(f"{name} exited with {proc.returncode}:\n{tail}")
 
     def close(self):
+        """Stop every child, newest first: terminate, wait up to 20 s, then kill.
+
+        Idempotent. Termination signals are ignored meanwhile, so a second
+        Ctrl-C cannot cut the teardown short and leave a child running (#6812).
+        """
+        previous = {sig: signal.signal(sig, signal.SIG_IGN) for sig in STOP_SIGNALS}
+        try:
+            self._close()
+        finally:
+            for sig, handler in previous.items():
+                signal.signal(sig, handler)
+
+    def _close(self):
         self.stop_refresh.set()
         for _, proc, log in reversed(self.procs):
             if proc.poll() is None:
@@ -314,6 +358,7 @@ class Stack:
                     proc.kill()
                     proc.wait()
             log.close()
+        self.procs = []
 
 
 def main(argv=None):
@@ -321,13 +366,35 @@ def main(argv=None):
     ap.add_argument("--binary", required=True, type=Path)
     ap.add_argument("--sdk", required=True, type=Path)
     ap.add_argument("--run-dir", required=True, type=Path)
-    ap.add_argument("--port", type=int, default=9077)
+    ap.add_argument("--port", type=int, default=0, help="daemon port (default: a free loopback port, #6831)")
     a = ap.parse_args(argv)
 
+    previous = {sig: signal.signal(sig, _stop) for sig in STOP_SIGNALS}
+    try:
+        return run_live(a)
+    except Stopped as stopped:
+        print(f"sdk-python-live: stopped by signal {stopped.signum}; the stack was torn down", file=sys.stderr)
+        return 128 + stopped.signum
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+
+
+def run_live(a):
+    """Start the stack, run the live tests, and tear the stack down on every exit (#6812)."""
     run = a.run_dir.resolve()
     run.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(run, 0o700)
-    stack = Stack(a.binary.resolve(), run, a.port)
+    port = a.port or free_port()
+    stack = Stack(a.binary.resolve(), run, port)
+    try:
+        return run_stack(stack, a.sdk, port)
+    finally:
+        stack.close()
+
+
+def run_stack(stack, sdk, port):
+    run = stack.run
     try:
         ca, cert, key = mint_tls(run / "tls")
         stack.home.mkdir(parents=True, exist_ok=True)
@@ -335,9 +402,8 @@ def main(argv=None):
         stack.start_daemon(cert, key)
         stack.start_hub()
         stack.wait_daemon(ca)
-    except RuntimeError as exc:
-        stack.close()
-        print(f"sdk-python-live: could not start the stack: {exc}", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - any startup error is exit 2; the caller tears down
+        print(f"sdk-python-live: could not start the stack: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
 
     report = run / "live-junit.xml"
@@ -346,32 +412,30 @@ def main(argv=None):
         SSL_CERT_FILE=str(ca),
         AI_MEMORY_NO_CONFIG="1",
         AI_MEMORY_TEST_DAEMON="1",
-        AI_MEMORY_TEST_BASE_URL=f"https://localhost:{a.port}",
+        AI_MEMORY_TEST_BASE_URL=f"https://localhost:{port}",
         AI_MEMORY_TEST_AGENT_ID=AGENT_ID,
         AI_MEMORY_TEST_SIGNING_KEY=str(stack.signing_key),
         AI_MEMORY_TEST_WAKE_HUB_SOCKET=str(stack.socket),
         AI_MEMORY_TEST_WAKE_HUB_BUNDLE=str(stack.bundle),
         AI_MEMORY_TEST_WAKE_HUB_ID=HUB_ID,
     )
-    try:
-        res = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "pytest",
-                "-q",
-                "-rs",
-                "-p",
-                "no:cacheprovider",
-                f"--junitxml={report}",
-                *LIVE_TESTS,
-            ],
-            cwd=str(a.sdk.resolve()),
-            env=env,
-            check=False,
-        )
-    finally:
-        stack.close()
+    res = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            "-rs",
+            "-p",
+            "no:cacheprovider",
+            f"--junitxml={report}",
+            *LIVE_TESTS,
+        ],
+        cwd=str(sdk.resolve()),
+        env=env,
+        check=False,
+    )
+    stack.close()
     if stack.refresh_error:
         print(f"sdk-python-live: allowlist refresh failed: {stack.refresh_error}", file=sys.stderr)
     problems = verdict(junit_outcomes(report)) if report.exists() else ["no junit report was written"]
