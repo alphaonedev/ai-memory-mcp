@@ -2058,7 +2058,11 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                       ("40-hex plus CR", "b" * 40 + "\r"),
                       ("space plus 40-hex", " " + "b" * 40),
                       ("40 superscript digit", "\u00b9" * 40),
-                      ("40 non-hex ASCII letter", "g" * 40))
+                      ("40 non-hex ASCII letter", "g" * 40),
+                      ("BOM plus 40-hex", "\ufeff" + "b" * 40),
+                      ("RLO plus 40-hex", "\u202e" + "b" * 40),
+                      ("40-hex plus combining acute", "b" * 40 + "\u0301"),
+                      ("64-hex with one Cyrillic a", "b" * 10 + "\u0430" + "b" * 53))
     # decision: exhaustive whitespace corpus over per-char cells (E6, same class as #6414).
     # Every `str.isspace()` character is tested as a prefix and as a suffix of a 40-hex value, so a
     # sha read site loosened to trim a tab, VT, FF, NBSP or any other space is killed (#6464).
@@ -2230,7 +2234,7 @@ SELF_TEST_OK = (
     "the gate-run fixtures build one gitshim.* level under the scratch dir and fit within it; "
     "(pr4-sha256, #6144) a 64-hex PR_HEAD_SHA / GITHUB_SHA (pull_request) and GITHUB_EVENT_BEFORE / GITHUB_SHA (push) pass the validator and fail cleanly at the later lookup; "
     "(pr4-sha-case, #6144) upper-case 40/64-hex shas pass the validator on every validated key; "
-    "(pr4-sha-len) 63/65-hex, 40 non-ASCII-digit (Arabic-Indic, fullwidth, superscript), 40 non-hex ASCII, newline- or CR-suffixed and space-prefixed 40-hex values, and every str.isspace() character as a prefix and as a suffix of a 40-hex value, refused on every validated sha site (PR_HEAD_SHA, GITHUB_SHA and PR_BASE_SHA on pull_request; "
+    "(pr4-sha-len) 63/65-hex, 40 non-ASCII-digit (Arabic-Indic, fullwidth, superscript), 40 non-hex ASCII, newline- or CR-suffixed and space-prefixed 40-hex values, BOM-, bidi-override-, combining-mark- and Cyrillic-look-alike 40/64-hex values (#6463), and every str.isspace() character as a prefix and as a suffix of a 40-hex value, refused on every validated sha site (PR_HEAD_SHA, GITHUB_SHA and PR_BASE_SHA on pull_request; "
     "GITHUB_EVENT_BEFORE and GITHUB_SHA on push) with only the `git --version` probe traced before the validator."
 )
 
