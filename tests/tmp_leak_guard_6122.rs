@@ -148,9 +148,18 @@ fn no_suite_binds_sqlite_to_raw_named_tempfile_6122() {
 
 /// `std::mem::forget(<temp handle>)` leaks the scratch file (and its sidecars)
 /// on every run by design. Sites that already existed when the guard landed are
-/// listed here with their count; the list only shrinks. A new site, or one in a
-/// file that is not listed, fails. Migration of the listed
-/// files is tracked in #6458.
+/// listed here with their EXACT count, and the table is pinned in total below.
+/// A new site, a site in an unlisted file, a count that fell without its entry
+/// being lowered, or an entry for a file that is gone or at zero all fail. The
+/// ceiling therefore only falls: every migration in #6458 lowers its entry,
+/// `KNOWN_MEM_FORGET_TOTAL` and (when a file reaches 0 and is removed from the
+/// table) `KNOWN_MEM_FORGET_FILES` in the same commit. Raising any of the three
+/// needs coordinated edits that are visible in review.
+/// Pinned sum of `KNOWN_MEM_FORGET_SITES` counts (#6804).
+const KNOWN_MEM_FORGET_TOTAL: usize = 78;
+/// Pinned number of files in `KNOWN_MEM_FORGET_SITES` (#6804).
+const KNOWN_MEM_FORGET_FILES: usize = 68;
+
 const KNOWN_MEM_FORGET_SITES: &[(&str, usize)] = &[
     ("tests/authority_boundary_3549.rs", 1),
     ("tests/conformance_export_roundtrip_2030.rs", 1),
@@ -222,17 +231,34 @@ const KNOWN_MEM_FORGET_SITES: &[(&str, usize)] = &[
     ("tests/wake_sink_3469.rs", 2),
 ];
 
-/// Violations of the `mem::forget(` ceiling for `sources` against `table`.
+/// Violations of the exact `mem::forget(` pin for `sources` against `table`.
 fn forget_violations(table: &[(&str, usize)], sources: &[(String, String)]) -> Vec<String> {
-    let mut over = Vec::new();
+    let mut bad = Vec::new();
     for (name, src) in sources {
         let found = src.matches("mem::forget(").count();
-        let allowed = table.iter().find(|(n, _)| n == name).map_or(0, |(_, c)| *c);
-        if found > allowed {
-            over.push(format!("{name}: {found} site(s), ceiling {allowed}"));
+        let pinned = table.iter().find(|(n, _)| n == name).map_or(0, |(_, c)| *c);
+        match found.cmp(&pinned) {
+            std::cmp::Ordering::Equal => {}
+            std::cmp::Ordering::Greater => {
+                bad.push(format!(
+                    "{name}: {found} site(s), pinned {pinned} (new site)"
+                ));
+            }
+            std::cmp::Ordering::Less => {
+                bad.push(format!(
+                    "{name}: {found} site(s), pinned {pinned} (stale: lower the entry)"
+                ));
+            }
         }
     }
-    over
+    for (name, pinned) in table {
+        if !sources.iter().any(|(n, _)| n == name) {
+            bad.push(format!(
+                "{name}: pinned {pinned} but the file no longer exists (stale: remove the entry)"
+            ));
+        }
+    }
+    bad
 }
 
 #[test]
@@ -242,6 +268,34 @@ fn no_new_mem_forget_of_temp_handle_6122() {
         over.is_empty(),
         "#6122: std::mem::forget of a temp handle leaks the scratch file every run; \
          keep the handle bound for the test lifetime instead: {over:?}"
+    );
+}
+
+/// #6804: the table cannot be raised without also raising the pinned totals.
+#[test]
+fn known_forget_table_matches_pinned_totals_6804() {
+    let total: usize = KNOWN_MEM_FORGET_SITES.iter().map(|(_, c)| *c).sum();
+    assert_eq!(
+        total, KNOWN_MEM_FORGET_TOTAL,
+        "#6804: KNOWN_MEM_FORGET_SITES sums to {total}, pinned {KNOWN_MEM_FORGET_TOTAL}"
+    );
+    assert_eq!(
+        KNOWN_MEM_FORGET_SITES.len(),
+        KNOWN_MEM_FORGET_FILES,
+        "#6804: KNOWN_MEM_FORGET_SITES lists {} files, pinned {KNOWN_MEM_FORGET_FILES}",
+        KNOWN_MEM_FORGET_SITES.len()
+    );
+    let mut names: Vec<&str> = KNOWN_MEM_FORGET_SITES.iter().map(|(n, _)| *n).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(
+        names.len(),
+        KNOWN_MEM_FORGET_SITES.len(),
+        "#6804: KNOWN_MEM_FORGET_SITES has a duplicate file entry"
+    );
+    assert!(
+        KNOWN_MEM_FORGET_SITES.iter().all(|(_, c)| *c > 0),
+        "#6804: KNOWN_MEM_FORGET_SITES has a zero entry; remove the file"
     );
 }
 
