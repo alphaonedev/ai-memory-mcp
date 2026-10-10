@@ -72,7 +72,20 @@ TLS session secrets to a file) and ``require_auth`` (it changes the accepted aut
 keyword (an unlisted key can be the tail of a password that held a raw ``&``),
 never a value, and neither form of the URL is printed.
 
-The database name is not left on psql's argv: ``split_database`` moves it to ``PGDATABASE`` (#6181).
+The database name is not left on psql's argv: ``split_database`` moves it to ``PGDATABASE`` (#6181).  A URL
+that names no database (no path, an empty path, an empty ``dbname``) is refused with exit 2 before any restore or
+psql call (#6676): libpq would fall back to the user name or to a caller's ``PGDATABASE``.
+
+psql's environment is an allowlist (#6676, 3-agent vote 6def5ab6): ``PSQL_ENV_KEEP`` (``PATH``, ``HOME``,
+``TMPDIR``, ``LANG``, ``TZ``) and every ``LC_*`` variable are copied from the caller, then the helper sets
+``PGPASSWORD``, ``PGDATABASE`` and ``PGCONNECT_TIMEOUT``.  Every other variable is dropped, so no caller ``PG*``
+variable reaches the process that holds the password.  The libpq variables this closes are: redirect
+(``PGHOST``, ``PGHOSTADDR``, ``PGPORT``, ``PGLOADBALANCEHOSTS``: libpq connects to ``PGHOSTADDR`` instead of the
+URL host and sends the URL password there), transport (``PGSSLMODE``, ``PGREQUIRESSL``, ``PGGSSENCMODE``,
+``PGCHANNELBINDING``, ``PGSSLROOTCERT``, ``PGSSLCRL``, ``PGSSLNEGOTIATION``, ``PGREQUIREAUTH``,
+``PGMINPROTOCOLVERSION``, ``PGMAXPROTOCOLVERSION``: they weaken the TLS and authentication the password is sent
+under), credentials (``PGUSER``, ``PGPASSWORD``, ``PGPASSFILE``, ``PGSSLCERT``, ``PGSSLKEY``) and target
+(``PGDATABASE``, ``PGOPTIONS``, ``PGTARGETSESSIONATTRS``), plus ``PGSERVICE``/``PGSERVICEFILE`` (#6345).
 
 psql runs with ``PGCONNECT_TIMEOUT=15`` and a 60 second overall limit.  A
 ``connect_timeout`` in the URL overrides the default but must be an integer in
@@ -169,8 +182,10 @@ REFUSED_KNOWN_KEYS = frozenset((
     "oauth_client_id", "oauth_scope", "ssl",
 ))
 KNOWN_KEY_NAMES = ALLOWED_QUERY_KEYS | REFUSED_KNOWN_KEYS
-# libpq applies a pg_service.conf entry before PGPASSWORD (#6345), so neither reaches the psql child.
-SERVICE_ENV = ("PGSERVICE", "PGSERVICEFILE")
+# #6676: the only caller variables copied into psql's environment (plus every LC_* variable).  Everything else,
+# every PG* variable included (PGSERVICE/PGSERVICEFILE, #6345), is dropped; the helper then sets PGPASSWORD,
+# PGDATABASE and PGCONNECT_TIMEOUT itself.
+PSQL_ENV_KEEP = ("PATH", "HOME", "TMPDIR", "LANG", "TZ")
 TEMP_SUFFIX = ".age-restore"
 
 # (source subdir, file name, sha256) for AGE 1.8.0 built against postgresql@18.
@@ -319,6 +334,33 @@ def split_database(target):
     return target[:cut] + target[path_end:], (database or None)
 
 
+def probe_target(url):
+    """Return (psql target, password or None, database) for ``url``; refuse a URL that names no database (#6676).
+
+    The database is the URL path (moved to ``PGDATABASE`` by ``split_database``) or a non-empty ``dbname`` query
+    value.  With neither, libpq would fall back to the user name or a caller's ``PGDATABASE``.
+    """
+    target, password = psql_target(url)
+    target, database = split_database(target)
+    query = target.split("?", 1)[1] if "?" in target else ""
+    named = any(unquote(key, errors="surrogateescape") == "dbname" and value
+                for key, _, value in (seg.partition("=") for seg in query.split("&") if seg))
+    if database is None and not named:
+        raise HelperError("tier URL file names no database; add /<dbname> to the URL", EXIT_BAD_INPUT)
+    return target, password, database
+
+
+def psql_env(password, database):
+    """psql's environment: PSQL_ENV_KEEP and LC_* from the caller, then the helper's own PG* values (#6676)."""
+    env = {key: value for key, value in os.environ.items() if key in PSQL_ENV_KEEP or key.startswith("LC_")}
+    if password is not None:
+        env["PGPASSWORD"] = password
+    if database is not None:
+        env["PGDATABASE"] = database  # #6181: the name is not on argv
+    env["PGCONNECT_TIMEOUT"] = CONNECT_TIMEOUT_SECONDS  # a connect_timeout in the URL overrides it
+    return env
+
+
 _interrupt = {"defer": False, "pending": False}
 
 
@@ -448,16 +490,8 @@ def supervise_main(argv):
 
 def probe_lists_age(psql, url):
     """Return True when the tier lists ``age`` in pg_available_extensions."""
-    target, password = psql_target(url)
-    target, database = split_database(target)
-    env = dict(os.environ)
-    if password is not None:
-        env["PGPASSWORD"] = password
-    if database is not None:
-        env["PGDATABASE"] = database  # #6181: the name is not on argv
-    env["PGCONNECT_TIMEOUT"] = CONNECT_TIMEOUT_SECONDS  # a connect_timeout in the URL overrides it
-    for name in SERVICE_ENV:
-        env.pop(name, None)  # #6345: a service-file password would beat the moved PGPASSWORD
+    target, password, database = probe_target(url)  # #6676: refuses a URL that names no database
+    env = psql_env(password, database)  # #6676: an allowlist; no caller PG* variable reaches psql
     psql_argv = [psql, target, "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", PROBE_SQL]
     with deferred_interrupts():
         # The supervisor holds the read end; the helper keeps the write end until psql is reaped.  The helper
@@ -653,7 +687,7 @@ def read_url(url_file):
         raise HelperError(f"tier URL file {url_file} is unreadable", EXIT_BAD_INPUT)
     if not url:
         raise HelperError(f"tier URL file {url_file} is empty", EXIT_BAD_INPUT)
-    psql_target(url)  # validate the shape before any psql call
+    probe_target(url)  # validate the shape, and that it names a database, before any restore or psql call
     return url
 
 
