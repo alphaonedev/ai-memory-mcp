@@ -1398,6 +1398,8 @@ def self_test():
             ("tilde fence", stale_line + "~~~~\n<!--\n~~~~\n" + erratum),
             ("code span", stale_line + "Write `<!--` to open a comment.\n" + erratum),
             ("double code span", stale_line + "Write ``a `<!--` b`` here.\n" + erratum),
+            ("double code span holding a single backtick and the opener",
+             stale_line + "Write ``a ` <!-- b`` here.\n" + erratum),
             ("code span on the erratum line",
              stale_line + "\nErratum (#1): `<!--` `check-old.sh` is `scripts/check_new.py`.\n"),
         ):
@@ -1977,6 +1979,8 @@ def self_test():
              stale_line + "\nP `\n` <details> `\n" + erratum),
             ("B7 '<details>' after a list-item fence", stale_line + "\n- a\n  ```\n<details>\n```\n" + erratum),
             ("B8 '<!--' after a list-item fence", stale_line + "\n- a\n  ```\n<!--\n```\n" + erratum + "-->\n"),
+            ("B19 '</details>' in a quoted attribute of a raw HTML block",
+             stale_line + '\n<details>\n\n<div title="</details>">\n\n' + erratum),
             ("B18 '<details>' after a numbered-item fence",
              stale_line + "\n1. a\n   ```\n<details>\n```\n" + erratum),
         ):
