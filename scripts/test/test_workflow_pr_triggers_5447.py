@@ -4843,5 +4843,38 @@ class ApprovalJobSpacedKeys6387(unittest.TestCase):
             with self.subTest(row=row):
                 self.assertTrue(_c8_mutant_problems(self.c8, self.ANCHOR, row + self.ANCHOR))
 
+
+
+class WorkflowPythonOptionIsolation6389(unittest.TestCase):
+    """Every `python3 <options> <x>.py` in a workflow has -I among its options, quoted paths included."""
+
+    SITE = re.compile(r"python3 -I (scripts/[^\s\"']+\.py)")
+
+    def ci_findings(self, ci: str) -> List[str]:
+        texts = _all_workflow_texts()
+        texts["ci.yml"] = ci
+        return [f for f in _bare_python_script_runs(texts) if f.startswith("ci.yml:")]
+
+    def test_6389_single_site_non_isolating_option_is_killed(self) -> None:
+        ci = _all_workflow_texts()["ci.yml"]
+        self.assertTrue(self.SITE.search(ci))
+        for option in ("-u", "-B", "-O", "-X dev", "-W error"):
+            with self.subTest(option=option):
+                self.assertTrue(self.ci_findings(self.SITE.sub(rf"python3 {option} \1", ci, count=1)))
+
+    def test_6389_single_site_quoted_path_is_killed(self) -> None:
+        ci = _all_workflow_texts()["ci.yml"]
+        for replacement in (r'python3 "\1"', r"python3 '\1'", r'python3 -u "\1"'):
+            with self.subTest(replacement=replacement):
+                self.assertTrue(self.ci_findings(self.SITE.sub(replacement, ci, count=1)))
+
+    def test_6389_isolated_or_non_script_forms_are_not_flagged(self) -> None:
+        for run in ('python3 -u -I "scripts/x.py"', "python3 -IB scripts/x.py", "python3 -I 'scripts/x.py' --self-test",
+                    'python3 -c "import sys"', "python3 -m pip install x", "python3 --version",
+                    'echo "$(python3 --version)"', "command -v python3 >/dev/null"):
+            with self.subTest(run=run):
+                texts = {"new.yml": f"jobs:\n  x:\n    steps:\n      - run: {run}\n"}
+                self.assertEqual([], _bare_python_script_runs(texts))
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
