@@ -5917,5 +5917,67 @@ class ForkRefusalEffect6849(unittest.TestCase):
         self.assert_killed(body, REFUSAL_EXIT_6849, REFUSAL_EXIT_6849.replace("exit 1", "# exit 1"))
 
 
+# ---- Round 7 (#6850): the merge_group pin and the fork-refusal guard are closed-world ----
+
+
+def _self_hosted_fork_problems_6850(texts: Dict[str, str]) -> List[str]:
+    """``workflow:job: why`` for every self-hosted job a fork can reach without a refusal."""
+    out: List[str] = []
+    for name in MergeGroupTriggerPinned6682.PINNED:
+        for job, body in _jobs_6727(texts[name]).items():
+            if _self_hosted_6727(body):
+                out.extend(f"{name}:{job}: {why}" for why in _fork_refusal_problems_6727(body))
+    return out
+
+
+def _pinned_merge_group_problems_6850(pinned: Tuple[str, ...], texts: Dict[str, str],
+                                      covered: List[str]) -> List[str]:
+    """How ``pinned`` departs from the workflows that carry ``merge_group``."""
+    row = MergeGroupTriggerPinned6682.ROW
+    out = [f"{name} is covered but not pinned" for name in covered if name not in pinned]
+    out += [f"{name} is pinned but has no merge_group row" for name in pinned
+            if "merge_group" not in parse_triggers(texts[name]) or row not in texts[name]]
+    return out
+
+
+N28_ANCHOR_6850 = "  workflow_dispatch:\n  push:\n    branches: [release/v0.6.3.1, main]\n"
+
+
+class ClosedWorldMergeGroupGuard6850(unittest.TestCase):
+    """#6850: the guard and the pin were scoped to a hard-coded six-workflow list, so a
+    self-hosted workflow given ``merge_group`` (or ``pull_request``) later, or a pinned workflow
+    dropped from the list, passed every gate."""
+
+    def setUp(self) -> None:
+        self.texts = _all_workflow_texts()
+        self.covered = MergeGroupTriggerPinned6682().covered_workflows()
+
+    def test_6850_the_tree_is_clean(self) -> None:
+        self.assertEqual([], _self_hosted_fork_problems_6850(self.texts))
+        self.assertEqual([], _pinned_merge_group_problems_6850(MergeGroupTriggerPinned6682.PINNED,
+                                                               self.texts, self.covered))
+
+    def test_6850_n28_merge_group_on_an_unpinned_self_hosted_workflow_is_killed(self) -> None:
+        name = "session-boot-lifetime.yml"
+        self.assertEqual(1, self.texts[name].count(N28_ANCHOR_6850))
+        self.texts[name] = self.texts[name].replace(N28_ANCHOR_6850, N28_ANCHOR_6850.replace(
+            "  push:\n", "  merge_group:\n    types: [checks_requested]\n  push:\n"), 1)
+        self.assertIn("merge_group", parse_triggers(self.texts[name]))
+        self.assertTrue([p for p in _self_hosted_fork_problems_6850(self.texts) if p.startswith(name)])
+        self.assertTrue([p for p in _pinned_merge_group_problems_6850(MergeGroupTriggerPinned6682.PINNED,
+                                                                      self.texts, self.covered) if name in p])
+
+    def test_6850_a_new_fork_reachable_self_hosted_workflow_is_killed(self) -> None:
+        self.texts["planted.yml"] = ("on:\n  pull_request:\njobs:\n  build:\n"
+                                     "    runs-on: [self-hosted, linux-fed]\n    steps:\n"
+                                     "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n")
+        self.assertTrue([p for p in _self_hosted_fork_problems_6850(self.texts) if p.startswith("planted.yml")])
+
+    def test_6850_n26_dropping_claude_md_guard_from_the_pin_is_killed(self) -> None:
+        pinned = tuple(n for n in MergeGroupTriggerPinned6682.PINNED if n != "claude-md-guard.yml")
+        self.assertEqual(len(MergeGroupTriggerPinned6682.PINNED) - 1, len(pinned))
+        self.assertTrue(_pinned_merge_group_problems_6850(pinned, self.texts, self.covered))
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
