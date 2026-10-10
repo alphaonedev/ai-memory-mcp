@@ -10,8 +10,10 @@
 //! silently. This walk closes that: a new fixture or doc that names a
 //! revision the server does not honour fails here.
 //!
-//! A "protocolVersion use" is a line that names `protocolVersion`,
-//! `Protocol version`, or `speaks MCP` AND carries a date-shaped token.
+//! A "protocolVersion use" is a date-shaped token on a line that names
+//! `protocolVersion`, `Protocol version`, or `speaks MCP`, or (#6535), when
+//! that line carries no date, on the next line holding a letter or digit
+//! (a value split from its key by pretty-printing).
 //! Prose that merely cites a spec revision for its tool-result convention
 //! (for example "MCP 2025-03-26 puts malformed request STRUCTURE ...")
 //! names none of those markers and is deliberately out of the pin.
@@ -426,15 +428,34 @@ fn dates(line: &str) -> Vec<&str> {
 }
 
 /// Every `(1-based line number, date)` that `text` uses as a
-/// `protocolVersion`: each date on a line that names one of [`MARKERS`].
+/// `protocolVersion`: each date on a line that names one of [`MARKERS`],
+/// and (#6535) when such a line carries no date, each date on the next line
+/// that holds an ASCII letter or digit, unless that line names a marker
+/// itself (it is then a use of its own). Only whitespace and punctuation
+/// such as `:` or `=` can sit between a key and its value, so this follows a
+/// value that JSON, YAML, TOML, Rust or TS put on a later line.
 fn protocol_version_uses(text: &str) -> Vec<(usize, &str)> {
+    let has_marker = |line: &str| MARKERS.iter().any(|m| line.contains(m));
+    let lines: Vec<&str> = text.lines().collect();
     let mut uses = Vec::new();
-    for (n, line) in text.lines().enumerate() {
-        if !MARKERS.iter().any(|m| line.contains(m)) {
+    for (n, line) in lines.iter().enumerate() {
+        if !has_marker(line) {
             continue;
         }
-        for date in dates(line) {
-            uses.push((n + 1, date));
+        let here = dates(line);
+        if !here.is_empty() {
+            uses.extend(here.into_iter().map(|date| (n + 1, date)));
+            continue;
+        }
+        let value_line = lines
+            .iter()
+            .enumerate()
+            .skip(n + 1)
+            .find(|(_, next)| next.bytes().any(|b| b.is_ascii_alphanumeric()));
+        if let Some((m, next)) = value_line
+            && !has_marker(next)
+        {
+            uses.extend(dates(next).into_iter().map(|date| (m + 1, date)));
         }
     }
     uses
