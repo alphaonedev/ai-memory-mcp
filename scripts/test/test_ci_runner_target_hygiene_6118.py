@@ -911,6 +911,8 @@ def toml_debug_findings(text: str) -> List[str]:
         if path == ("cargo-features",) or path[0] == "unstable":
             found.append("%s (a cargo nightly feature switch; with RUSTC_BOOTSTRAP it enables profile rustflags)"
                          % dotted)
+        if path in (("build", "target-dir"), ("build", "target")):
+            found.append("%s = %s %s" % (dotted, value.strip(), PRUNE_MARK))
         if path[0] == "alias" and len(path) == 2:
             # an alias value is a cargo command line (#6475 #6489): judge it as a run line would be judged
             command = "cargo " + _toml_alias_command(value)
@@ -923,7 +925,7 @@ def toml_debug_findings(text: str) -> List[str]:
 
 def repo_file_violations(repo_files: Dict[str, str]) -> List[str]:
     """R-DEBUG findings in Cargo.toml and .cargo/config.toml."""
-    return ["%s: R-DEBUG %s, want %r" % (name, spelled, DEBUG_LEVEL)
+    return [_relabel("%s: R-DEBUG %s, want %r" % (name, spelled, DEBUG_LEVEL))
             for name, text in sorted(repo_files.items()) for spelled in toml_debug_findings(text)]
 
 
@@ -1199,6 +1201,28 @@ def _shell_units(text: str) -> List[Unit]:
     return units
 
 
+# R-PRUNE (#6478): the prune step reads only ${CARGO_TARGET_DIR:-target}/<profile>, so a build that moves its
+# output (another target dir, a --target triple's target/<triple>/<profile>) grows a tree it never prunes.
+PRUNE_MARK = "(cargo then writes a tree the prune step never reads)"
+PRUNE_ENV_KEYS = frozenset({"CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_TARGET"})
+TARGET_ARG_RE = re.compile(r"\bcargo\b[^|;&\n]*?\s--target(-dir)?(?:=|\s+)(\S+)")
+TARGET_CONFIG_RE = re.compile(r"\bcargo\b[^|;&\n]*?\s--config(?:=|\s+)[\"']?build\.(target(?:-dir)?)\s*=")
+# Exact spellings of the live self-hosted target dirs. Each lies inside the checked-out workspace and is
+# git-ignored (`/target`, `/.local-runs/*`), so actions/checkout (clean: true, the default on every
+# self-hosted job) removes it with `git clean -ffdx` at the start of the next run. The shell reader drops
+# the unresolved `$REPO_ROOT` prefix, so scripts/check-bootstrap-cert-gate.sh's
+# "$REPO_ROOT/target/cert-gate-pg" is read as "/target/cert-gate-pg".
+TARGET_DIR_ALLOWLIST = frozenset({
+    ".local-runs/ci-prebuilt-t0",
+    "/target/cert-gate-pg",
+    "/target/cert-gate-driverless",
+})
+
+
+def _relabel(finding: str) -> str:
+    return finding.replace("R-DEBUG", "R-PRUNE", 1) if PRUNE_MARK in finding else finding
+
+
 def _key_kind(key: str) -> str:
     if DEBUG_ENV_KEY_RE.fullmatch(key):
         return "debug"
@@ -1206,10 +1230,14 @@ def _key_kind(key: str) -> str:
         return "flags"
     if key in TOOL_OVERRIDE_KEYS or UNSTABLE_ENV_KEY_RE.fullmatch(key):
         return "forbidden"
+    if key in PRUNE_ENV_KEYS:
+        return "prune"
     return ""
 
 
 def _judge(key: str, kind: str, value: str, dynamic: bool) -> List[str]:
+    if kind == "prune":
+        return ["%s is set %s" % (key, PRUNE_MARK)]
     if kind == "forbidden":
         return ["%s is set (it changes which cargo config or compiler is used, so the debuginfo pins no longer "
                 "decide the level)" % key]
@@ -1477,6 +1505,11 @@ def _level_spellings(text: str, flags_value: bool) -> List[str]:
     if any(DASH_G_RE.search(piece) for piece in scanned):
         found.append("rustc -g (= -C debuginfo=2)")
     if not flags_value:
+        for m in TARGET_ARG_RE.finditer(text):
+            if not (m.group(1) and m.group(2).strip("\"'") in TARGET_DIR_ALLOWLIST):
+                found.append("cargo --target%s %s %s" % (m.group(1) or "", m.group(2), PRUNE_MARK))
+        for m in TARGET_CONFIG_RE.finditer(text):
+            found.append("cargo --config build.%s %s" % (m.group(1), PRUNE_MARK))
         if CARGO_UNSTABLE_ARG_RE.search(text):
             found.append("cargo -Z (an unstable flag can enable profile rustflags or any other nightly setting)")
         for m in CARGO_CONFIG_ARG_RE.finditer(text):
@@ -1494,8 +1527,8 @@ def _value_findings(key: str, value: str) -> List[str]:
     """Findings for one env row or ``with:`` input named ``key``."""
     text = _yaml_unescape(value)
     found: List[str] = []
-    if _key_kind(key) == "forbidden":
-        found.extend(_judge(key, "forbidden", text, False))
+    if _key_kind(key) in ("forbidden", "prune"):
+        found.extend(_judge(key, _key_kind(key), text, False))
     flags = bool(RUSTC_FLAGS_KEY_RE.fullmatch(key)) or key.lower().replace("-", "") in FLAGS_CONFIG_KEYS
     kind = _key_kind(key) or ("flags" if flags else "")
     if kind in ("debug", "flags") and "${{" in text:
@@ -1512,6 +1545,8 @@ def _debug_overrides(where: str, effective: Dict[str, str], job: Job,
     """Every place a self-hosted job sets a debuginfo level other than ``0``."""
     found: List[str] = []
     for key, value in sorted(effective.items()):
+        if key == "CARGO_TARGET_DIR":
+            continue  # job- or workflow-wide, so the prune step reads ${CARGO_TARGET_DIR:-target} too
         if DEBUG_ENV_KEY_RE.fullmatch(key) and key not in DEBUG_KEYS and value != DEBUG_LEVEL:
             found.append("%s: R-DEBUG env %s is %r, want %r" % (where, key, value, DEBUG_LEVEL))
         for spelled in _value_findings(key, value):
@@ -1550,7 +1585,7 @@ def _debug_overrides(where: str, effective: Dict[str, str], job: Job,
             found.append("%s: R-DEBUG step %r writes a cargo config with %s, want %r" % (where, label, spelled, DEBUG_LEVEL))
         for spelled in _script_findings(step.run_text(), scripts):
             found.append("%s: R-DEBUG step %r runs %s, want %r" % (where, label, spelled, DEBUG_LEVEL))
-    return found
+    return [_relabel(v) for v in found]
 
 
 def violations(name: str, wf: Workflow, job: Job, scripts: Optional[Dict[str, str]] = None) -> List[str]:
@@ -2693,7 +2728,7 @@ class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
             ("config [build] target", self._repo_mutated(cfg, '[build]\ntarget = "x86_64-unknown-linux-gnu"\n')),
             ("nested config dotted build.target-dir", self._repo_mutated("crates/sub/.cargo/config.toml",
                                                                          'build.target-dir = "elsewhere"\n')),
-            ("step writes build.target-dir", run("printf '[build]\\\\ntarget-dir = \"elsewhere\"\\\\n' > .cargo/config.toml")),
+            ("step writes build.target-dir", run("printf '[build]\\ntarget-dir = \"elsewhere\"\\n' > .cargo/config.toml")),
         ], True)
 
     def test_6118_r7_6478_job_level_cargo_target_dir_stays_clean(self) -> None:
