@@ -215,9 +215,15 @@ before `CREATE EXTENSION`:
   exits 1. Files already written stay in place: each carries its pinned bytes,
   and removing one could undo a restore another runner has already verified.
 - **Secrets.** The tier password goes to psql through `PGPASSWORD`; the URL on
-  psql's argv carries no password, and neither form is printed. A URL carrying
-  `sslpassword` (the client-key passphrase, which libpq cannot take from the
-  environment) is refused with exit 2 before psql runs.
+  psql's argv carries no password, and neither form is printed. Because urllib
+  and libpq split a URL differently, a URL holding a `#` (libpq has no fragment)
+  or an `@` after the host part is refused with exit 2 before psql runs. Every
+  query key other than `password` must be on `ALLOWED_QUERY_KEYS`, a
+  case-sensitive allowlist of non-secret libpq parameters (`sslmode`,
+  `application_name`, `connect_timeout`, ...); any other key, including
+  `sslpassword`, `oauth_client_secret`, `scram_client_key` and
+  `scram_server_key` (which libpq cannot take from the environment), is refused
+  the same way. The message names the key, never its value.
 
 It is a no-op when AGE is healthy. `--age-dir` exists for the unit tests only;
 CI always uses the default node path, and there is no environment override.
