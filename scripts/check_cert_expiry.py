@@ -3192,6 +3192,10 @@ def _wrap_cells(t, fx, repo, base):
          {"src/wrap_d.rs": around(d_text, d_set, "    drop(assert!(false));\n")}),
         ("wrap-assert-not-true", "early exit", "`assert!(!true);` before the line",
          {"src/wrap_d.rs": around(d_text, d_set, "    assert!(!true);\n")}),
+        ("wrap-assert-false-fmt-args", "early exit", "`assert!(false, \"{}\", 1);` before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, '    assert!(false, "{}", 1);\n')}),
+        ("wrap-closure-first-arg-return", "early exit", "`drop((|| 0, return));` before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    drop((|| 0, return));\n")}),
     ]
     for label, reason, desc, edits in reds:
         fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
@@ -3503,7 +3507,7 @@ SELF_TEST_OK = (
     "(wrap-adv-panic-any, wrap-adv-resume-unwind, wrap-adv-unreachable-unchecked, each with -gate, #6843) panic_any, resume_unwind and unreachable_unchecked under any path are exits; "
     "(wrap-adv-match-guard-false, wrap-adv-if-false-or-false, wrap-while-false-or, wrap-if-false-and, each with -gate, #6844) `if false` or `while false` anywhere in a header, a match guard included, is RED, and (wrap-if-cfg-test, wrap-while-false, wrap-else-if-false, wrap-loop-empty-before, each with -gate) stay RED; (wrap-ctl-if-false-else) the else branch of `if false` is GREEN; "
     "(wrap-inline-mod-inner, wrap-inner-second, wrap-inner-allow-unreach, each with -gate, #6823/#6824/#6825) an inner attribute of an inline mod, a second file-level inner attribute and a file-level non-cfg inner attribute are RED; "
-    "(wrap-adv-raw-assert-false, wrap-assert-false-msg, wrap-assert-false-in-call, wrap-assert-not-true, each with -gate, #6944) `assert!(false)` or `assert!(!true)`, raw, with a message or anywhere a statement always evaluates, is an early exit; (wrap-ctl-assert-true-msg) `assert!(true, ..)` is GREEN; "
+    "(wrap-adv-raw-assert-false, wrap-assert-false-msg, wrap-assert-false-in-call, wrap-assert-not-true, wrap-assert-false-fmt-args, wrap-closure-first-arg-return, each with -gate, #6944) `assert!(false)` or `assert!(!true)`, raw, with message arguments or anywhere a statement always evaluates, is an early exit, and a closure first argument does not hide a later `return`; (wrap-ctl-assert-true-msg) `assert!(true, ..)` is GREEN; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
