@@ -608,4 +608,104 @@ mod tests {
         .join()
         .expect("leaking thread must not abort or panic");
     }
+
+    fn leak_one_intent(a: &rusqlite::Connection, pending_id: &str) {
+        let leaked = super::super::connection::WriteTxn::begin(a).expect("begin a");
+        let intent = super::DeferredEscalation {
+            pending_id: pending_id.to_string(),
+            action: crate::models::GovernedAction::Store,
+            namespace: "gov6540/leak".to_string(),
+            memory_id: None,
+            requested_by: "ai:worker".to_string(),
+            rule_id: "R-leak".to_string(),
+            payload: serde_json::json!({}),
+        };
+        assert!(super::defer_to_open_txn(a.path(), intent).is_ok());
+        std::mem::forget(leaked);
+    }
+
+    /// #6540 — with NO tracing subscriber installed (the default on most CLI
+    /// paths), a genuinely lost escalated write must still produce at least
+    /// one `ERROR #4116` line on stderr. The open-time report may not be
+    /// credited as delivered when it only went to `tracing::error!`.
+    #[test]
+    fn issue_6540_untraced_loss_still_reported() {
+        const ROLE: &str = "AI_MEMORY_TEST_6540_UNTRACED_LOSS";
+        const PATH: &str = "storage::escalation_deferral::tests::issue_6540_untraced_loss_still_reported";
+        if std::env::var(ROLE).as_deref() != Ok("child") {
+            let out = crate::spawn_audit::audited_command(
+                std::env::current_exe().expect("current_exe"),
+                "escalation_deferral::issue_6540_untraced_loss_still_reported",
+            )
+            .args(["--exact", PATH, "--nocapture", "--test-threads=1"])
+            .env(ROLE, "child")
+            .output()
+            .expect("spawn child");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "child must exit 0, got {:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                out.status
+            );
+            assert!(
+                stdout.contains("1 passed") && !stdout.contains("0 passed"),
+                "child did not run:\n{stdout}"
+            );
+            let reports = stderr
+                .lines()
+                .filter(|l| l.contains("ERROR") && l.contains("#4116"))
+                .count();
+            assert_eq!(
+                reports, 1,
+                "a lost intent with no subscriber must be reported exactly once on \
+                 stderr:\n{stderr}"
+            );
+            return;
+        }
+        std::thread::spawn(|| {
+            let dir = tempfile::Builder::new()
+                .prefix("issue-6540-")
+                .tempdir()
+                .expect("tempdir");
+            let path = dir.path().join("ai-memory.db");
+            let a = crate::db::open(&path).expect("open a");
+            let b = crate::db::open(&path).expect("open b");
+            leak_one_intent(&a, "untraced-6540");
+            drop(a);
+            let next = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::super::connection::WriteTxn::begin(&b)
+            }));
+            drop(next);
+        })
+        .join()
+        .expect("leaking thread must not abort or panic");
+    }
+
+    /// #6541 — a stale-frame report that panics (debug builds) must not leave
+    /// the connection inside an open `BEGIN IMMEDIATE` holding the write lock.
+    #[test]
+    fn issue_6541_stale_frame_panic_leaves_no_open_transaction() {
+        std::thread::spawn(|| {
+            let dir = tempfile::Builder::new()
+                .prefix("issue-6541-")
+                .tempdir()
+                .expect("tempdir");
+            let path = dir.path().join("ai-memory.db");
+            let a = crate::db::open(&path).expect("open a");
+            let b = crate::db::open(&path).expect("open b");
+            leak_one_intent(&a, "begin-6541");
+            drop(a);
+            let next = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::super::connection::WriteTxn::begin(&b).map(drop)
+            }));
+            drop(next);
+            assert!(
+                b.is_autocommit(),
+                "the connection must not stay inside an open write transaction"
+            );
+        })
+        .join()
+        .expect("test thread must not abort or panic");
+    }
 }
