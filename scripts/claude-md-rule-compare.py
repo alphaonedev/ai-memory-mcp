@@ -2414,6 +2414,19 @@ def _self_test_cases() -> int:
           "secret: |\n  -----BEGIN PRIVATE KEY-----\n  6163CanaryJKey\n  -----END PRIVATE KEY-----\n  6163CanaryJTail\n"
           "next: shown-6163", hidden=("6163CanaryJKey", "6163CanaryJTail"), shown=("secret: |", "next: shown-6163"))
 
+    # #6163 round 5 (#6666): a triple-quoted multi-line value (TOML, Python) is masked to its closing triple quote;
+    # one that is never closed runs to the end of its side.
+    masks("#6666 R5 F a triple-double-quoted multi-line value is masked past its first line",
+          'secret = """\n6163CanaryF1\n6163CanaryF2\n"""\nafter: shown-6163', hidden=("6163CanaryF1", "6163CanaryF2"),
+          shown=("after: shown-6163",))
+    masks("#6666 R5 F a triple-single-quoted multi-line value is masked past its first line",
+          "secret = '''\n6163CanaryF3\n6163CanaryF4'''\nafter: shown-6163", hidden=("6163CanaryF3", "6163CanaryF4"),
+          shown=("after: shown-6163",))
+    masks("#6666 R5 F an unterminated triple-quoted value is masked to the end", 'secret = """\n6163CanaryF5\nend',
+          hidden=("6163CanaryF5", "end"))
+    masks("#6666 R5 F a triple-quoted value closed on its own line leaves the next line visible",
+          'secret = """6163CanaryF6"""\nafter: shown-6163', hidden=("6163CanaryF6",), shown=("after: shown-6163",))
+
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
     fetch_root = base_dir / "pr-fetch"
