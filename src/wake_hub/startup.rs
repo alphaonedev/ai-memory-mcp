@@ -352,7 +352,14 @@ pub fn prepare_socket_path(path: &Path) -> Result<()> {
             path.display()
         );
     }
-    match probe_socket_liveness(path) {
+    act_on_liveness(path, probe_socket_liveness(path))
+}
+
+/// Decide what start-up does with the socket at `path` given its probed
+/// `liveness`. Split from [`prepare_socket_path`] so every outcome is testable
+/// without racing a real listener.
+fn act_on_liveness(path: &Path, liveness: SocketLiveness) -> Result<()> {
+    match liveness {
         SocketLiveness::Live => bail!(
             "wake-hub: another wake-hub is already listening on {}. Refusing to \
              take over a live socket.",
@@ -707,6 +714,32 @@ mod tests {
         assert!(b.connection_ceiling <= 8);
         assert!(b.connection_ceiling >= MIN_CONNECTION_CEILING);
         assert!(b.soft > 0);
+    }
+
+    /// #6322 — a socket that vanishes between the stat and the probe is a
+    /// path nobody holds any more: start-up must proceed, not refuse.
+    #[test]
+    fn a_socket_that_vanishes_before_the_probe_is_not_a_startup_refusal_6322() {
+        let tmp = socket_test_dir();
+        let gone = tmp.path().join("gone.sock");
+        let liveness = probe_socket_liveness(&gone);
+        act_on_liveness(&gone, liveness)
+            .expect("a vanished socket must not refuse start-up (ENOENT is not Unknown)");
+    }
+
+    /// #6234 — the probe socket must be close-on-exec on every platform, not
+    /// only where `SOCK_CLOEXEC` exists on `socket(2)`.
+    #[test]
+    fn the_probe_socket_is_close_on_exec_on_every_platform_6234() {
+        use std::os::fd::AsRawFd as _;
+        let tmp = socket_test_dir();
+        let path = tmp.path().join("cx.sock");
+        let _listener = StdUnixListener::bind(&path).expect("bind");
+        let probe = connect_nonblocking(&path).expect("connect");
+        // SAFETY: a read-only fcntl on a descriptor this test owns.
+        let flags = unsafe { libc::fcntl(probe.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0, "F_GETFD failed");
+        assert_ne!(flags & libc::FD_CLOEXEC, 0, "probe socket must be FD_CLOEXEC");
     }
 
     #[test]
