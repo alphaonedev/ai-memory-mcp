@@ -105,9 +105,11 @@ Exit codes: 0 clean / N/A-skip, 1 violation, 2 usage / self-test failure.
 """
 
 import argparse
+import ast
 import contextlib
 import errno
 import io
+import json
 import os
 import re
 import shutil
@@ -121,7 +123,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CERT_DOC = "docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
 FED_ID_PATTERN = "AI_MEMORY_FED_[A-Z0-9_]+"
 FED_ID_RE = re.compile(FED_ID_PATTERN)
-ZERO_SHA_RE = re.compile(r"^0+$")
+# The only skip-worthy before-sha: exactly 40 (SHA-1) or 64 (SHA-256) zeros, matched
+# with `fullmatch`; a zero value of any other length is malformed and reaches the
+# hex validator (#6201).
+ZERO_SHA_RE = re.compile(r"0{40}(?:0{24})?")
 PREFIX = "check-cert-expiry"
 # Every sha taken from the environment is exactly 40 (SHA-1) or 64 (SHA-256)
 # hex chars (#6138 S-F2, R2-1), matched with `fullmatch` so a trailing newline
@@ -148,7 +153,7 @@ STATUS_LINE_RE = re.compile(
 )
 BINDS_LINE_RE = re.compile(
     r"^>?" + _S + r"*\*\*" + _S + r"*Binds" + _S + r"+to" + _S + r"*:?" + _S
-    + r"*\*\*" + _S + r"*:?" + _S + r"*`?([0-9a-fA-F]{40})`?",
+    + r"*\*\*" + _S + r"*:?" + _S + r"*`?([0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?)(?!\w)`?",
     re.IGNORECASE,
 )
 
@@ -296,7 +301,7 @@ def cert_banner(repo, tree):
     STATUS: LIVE | VOID | EXPIRED | UNPARSEABLE (doc present, no STATUS line)
     | DUPLICATE (two or more STATUS lines: a decoy above the real banner must
     not be read as the banner) | ABSENT (no doc at TREE).
-    BINDS: the lowercase 40-hex bound SHA, "-" when no Binds-to line matches,
+    BINDS: the lowercase 40- or 64-hex bound SHA, "-" when no Binds-to line matches,
     "DUPLICATE" when two or more do.
     """
     proc = run_git(repo, "show", "--end-of-options", f"{tree}:{CERT_DOC}")
@@ -362,7 +367,7 @@ def check_banner_consistency(repo, judged):
         return False, [
             f"{PREFIX}: ERROR — {CERT_DOC} at HEAD says STATUS LIVE but has no "
             "parseable Binds-to line. Expected a line shaped like "
-            "'**Binds to:** `<40-hex sha>`' (spacing, backticks and hex case are "
+            "'**Binds to:** `<40- or 64-hex sha>`' (spacing, backticks and hex case are "
             "tolerated). Fail-closed, #3556."
         ]
     if binds == "DUPLICATE":
@@ -649,7 +654,7 @@ def resolve_range(repo, env):
 
     if event == "push":
         before = env.get("GITHUB_EVENT_BEFORE", "")
-        if not before or ZERO_SHA_RE.match(before):
+        if not before or ZERO_SHA_RE.fullmatch(before):
             raise Skip("push has no previous tip (new branch / first push); skip")
         before = env_sha(env, "GITHUB_EVENT_BEFORE")
         after = env_sha(env, "GITHUB_SHA") if env.get("GITHUB_SHA") else "HEAD"
@@ -789,7 +794,7 @@ class SelfTest:
 
 
 GIT_SHIM = """#!{python} -I
-import os, sys
+import json, os, sys
 real, argv = {real!r}, sys.argv[1:]
 if argv == ["--shim-isolation-probe"]:
     try:
@@ -799,6 +804,9 @@ if argv == ["--shim-isolation-probe"]:
         planted = False
     print(sys.flags.isolated, planted)
     sys.exit(0)
+if {trace!r}:
+    with open({trace!r}, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(argv) + chr(10))
 if "--version" in argv and {version!r}:
     print({version!r})
     sys.exit(0)
@@ -816,7 +824,7 @@ MKDTEMP_NAME_LEN = len("gitshim-long.") + 8  # tempfile.mkdtemp appends 8 random
 SCRATCH_PATH_LIMIT = 255 - len("#!") - len(" -I") - (1 + MKDTEMP_NAME_LEN) - 2
 
 
-def write_git_shim(shim_dir, real, version="", fail="", interpreter=None):
+def write_git_shim(shim_dir, real, version="", fail="", interpreter=None, trace=""):
     """Write the executable `git` PATH shim into shim_dir (#6145: its interpreter
     line is `python3 -I`, like the gate itself in c8-precheck.yml, so the shim's
     own directory is never on its sys.path). Fails closed with GateError when the
@@ -846,7 +854,7 @@ def write_git_shim(shim_dir, real, version="", fail="", interpreter=None):
                         f"{SHEBANG_MAX}; the kernel would truncate it and drop '-I'")
     shim = shim_dir / "git"
     shim.write_text(GIT_SHIM.format(python=python, real=real, version=version,
-                                    fail=fail), encoding="utf-8")
+                                    fail=fail, trace=str(trace)), encoding="utf-8")
     shim.chmod(0o755)
     return shim
 
@@ -1341,15 +1349,18 @@ def shim_isolation_violation(tmp, interpreter=None):
         shutil.rmtree(shim_dir, ignore_errors=True)
 
 
-def run_gate_shimmed(tmp, repo, env, version="", fail=""):
+def run_gate_shimmed(tmp, repo, env, version="", fail="", trace=""):
     """run_gate with a PATH shim `git` that reports `version` for --version
     and exits 128 on any call whose argv contains `fail`, and otherwise
-    delegates to the real git (R2-F2: pins the guarded branches)."""
+    delegates to the real git (R2-F2: pins the guarded branches). When `trace`
+    is a path, the shim appends every invocation's argv (one JSON list per
+    line) to it before doing anything else, so a caller can assert exactly
+    which git calls ran, independent of how a failure surfaces."""
     real = shutil.which("git")
     if real is None:
         raise GateError("git is not on PATH")
     shim_dir = Path(tempfile.mkdtemp(prefix="gitshim.", dir=str(tmp)))
-    write_git_shim(shim_dir, real, version, fail)
+    write_git_shim(shim_dir, real, version, fail, trace=trace)
     saved = os.environ.get("PATH")
     os.environ["PATH"] = f"{shim_dir}{os.pathsep}{saved or ''}"
     try:
@@ -1450,6 +1461,127 @@ def shim_isolation_crash_violation():
         if got != want:
             return f"{exc_type.__name__} raised in the isolation cell gave {got!r}, not {want!r}"
     return None
+
+
+SHA_COMMENT_LABELS = ("BOM plus 40-hex", "RLO plus 40-hex", "40-hex plus combining acute",
+                      "64-hex with one Cyrillic a")
+
+
+def sha_comment_violations(block_text, labels):
+    """Violations of the pr4-sha-len comment block (#6649, #6941): each #6463 label is named
+    in SHA_COMMENT_LABELS (never picked by position in the value table), must be a row of
+    the value table `labels`, and must have its own `# <label> : <loosening>` comment row; the
+    two false "only cell" claims must be gone. Returns the list of violations."""
+    out = []
+    if not block_text:
+        return ["the sha_len_values comment block was not found"]
+    for label in SHA_COMMENT_LABELS:
+        if label not in labels:
+            out.append(f"sha_len_values has no row labelled {label!r}")
+        if not re.search(r"^\s*#\s+" + re.escape(label) + r"\s+:\s+\S", block_text, re.M):
+            out.append(f"the comment block has no row naming the loosening of {label!r}")
+    for stale_claim in ("(only this cell)", "only cells for theirs"):
+        if stale_claim in block_text:
+            out.append(f"the comment block still claims {stale_claim!r}")
+    return out
+
+
+SHA_SITE_STMTS = (
+    'head = env_sha(env, "PR_HEAD_SHA")',
+    'tip = env_sha(env, "GITHUB_SHA") if env.get("GITHUB_SHA") else "HEAD"',
+    'stale = env_sha(env, "PR_BASE_SHA") if env.get("PR_BASE_SHA") else ""',
+    'before = env_sha(env, "GITHUB_EVENT_BEFORE")',
+    'after = env_sha(env, "GITHUB_SHA") if env.get("GITHUB_SHA") else "HEAD"',
+)
+SHA_MAIN_CALL = "rc, out, err = run_gate(REPO_ROOT, dict(os.environ))"
+SHA_SITE_BINDINGS = {"head": 1, "tip": 1, "stale": 1, "before": 2, "after": 1}
+
+
+def binds_name(node, name):
+    """True when the ast node binds, rebinds, deletes or imports `name` (#6940)."""
+    if isinstance(node, ast.Name):
+        return node.id == name and not isinstance(node.ctx, ast.Load)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return node.name == name
+    if isinstance(node, ast.arg):
+        return node.arg == name
+    if isinstance(node, ast.alias):
+        return (node.asname or node.name).split(".")[0] == name
+    if isinstance(node, ast.ExceptHandler):
+        return node.name == name
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return name in node.names
+    return False
+
+
+def sha_ast_violations(src):
+    """Structural pin of every path by which a CI-supplied sha reaches the validator
+    (#6697, #6940): the five `env_sha(env, KEY)` read statements of resolve_range
+    whole (so a conditional bypass of the call is a change), no binding of `env`
+    beyond the parameter of resolve_range and run_gate, no mutation of `env` through
+    a method other than .get or a subscript store, the exact resolve_range call in
+    run_gate, the unchanged body of env_sha, the exact ENV_SHA_RE pattern, a single
+    binding of each of env_sha and ENV_SHA_RE in the module (a second one would shadow
+    the pinned one) and the unchanged production env build in main (#6882).
+    Returns the list of violations (empty when the pin holds)."""
+    tree = ast.parse(src)
+    out = []
+    dump = lambda text: ast.dump(ast.parse(text, mode="eval").body)  # noqa: E731
+    top = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    sites = sorted(c.args[1].value for c in ast.walk(tree)
+                   if isinstance(c, ast.Call) and getattr(c.func, "id", "") == "env_sha"
+                   and len(c.args) == 2 and not c.keywords and isinstance(c.args[0], ast.Name)
+                   and c.args[0].id == "env" and isinstance(c.args[1], ast.Constant))
+    n_calls = sum(isinstance(c, ast.Call) and getattr(c.func, "id", "") == "env_sha"
+                  for c in ast.walk(tree))
+    want_sites = ["GITHUB_EVENT_BEFORE", "GITHUB_SHA", "GITHUB_SHA", "PR_BASE_SHA", "PR_HEAD_SHA"]
+    if sites != want_sites or n_calls != len(want_sites):
+        out.append(f"env_sha call sites {sites!r} ({n_calls} calls) are not the five "
+                   f"`env_sha(env, KEY)` sites {want_sites!r}")
+    for name in ("ENV_SHA_RE", "env_sha"):
+        n = sum(binds_name(x, name) for x in ast.walk(tree))
+        if n != 1:
+            out.append(f"`{name}` is bound {n} times in the module, want exactly 1")
+    main_fn = top.get("main")
+    entry = ast.dump(ast.parse(SHA_MAIN_CALL).body[0])
+    if main_fn is None or [ast.dump(n) for n in ast.walk(main_fn) if isinstance(n, ast.Assign)].count(entry) != 1:
+        out.append(f"main does not hold exactly one unchanged `{SHA_MAIN_CALL}`")
+    elif sum(isinstance(n, ast.Attribute) and n.attr == "environ" and isinstance(n.value, ast.Name)
+             and n.value.id == "os" for n in ast.walk(main_fn)) != 1:
+        out.append("main touches os.environ other than in the run_gate call")
+    rr, rg = top.get("resolve_range"), top.get("run_gate")
+    if rr is None or rg is None:
+        return out + ["resolve_range or run_gate is missing"]
+    stmts = [ast.dump(n) for n in ast.walk(rr) if isinstance(n, ast.Assign)]
+    for text in SHA_SITE_STMTS:
+        if stmts.count(ast.dump(ast.parse(text).body[0])) != 1:
+            out.append(f"resolve_range does not hold exactly one unchanged `{text}`")
+    for name, count in SHA_SITE_BINDINGS.items():
+        n = sum(binds_name(x, name) for x in ast.walk(rr))
+        if n != count:
+            out.append(f"resolve_range binds `{name}` {n} times, want {count}")
+    for fn in (rr, rg):
+        if [n for n in ast.walk(fn) if binds_name(n, "env")] != [fn.args.args[-1]] or fn.args.args[-1].arg != "env":
+            out.append(f"{fn.name} binds `env` other than as its parameter")
+        for n in ast.walk(fn):
+            if (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "env"
+                    and n.attr != "get") or (isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name)
+                                             and n.value.id == "env" and not isinstance(n.ctx, ast.Load)):
+                out.append(f"{fn.name} mutates `env` (line {n.lineno})")
+    call = ast.dump(ast.parse("base, head, tip = resolve_range(repo, env)").body[0])
+    if [ast.dump(n) for n in ast.walk(rg) if isinstance(n, ast.Assign)].count(call) != 1:
+        out.append("run_gate does not call `resolve_range(repo, env)` with the unchanged env")
+    fn = top.get("env_sha")
+    st = fn.body[1:] if fn else []
+    if (len(st) != 3 or not isinstance(st[0], ast.Assign) or ast.dump(st[0].value) != dump('env.get(key, "")')
+            or not isinstance(st[1], ast.If) or ast.dump(st[1].test) != dump("not ENV_SHA_RE.fullmatch(val)")
+            or ast.dump(st[2]) != ast.dump(ast.parse("return val").body[0])):
+        out.append("env_sha does not fullmatch the value read from env.get(key, \"\") unchanged")
+    pat = next((n.value for n in tree.body if isinstance(n, ast.Assign)
+                and [getattr(x, "id", "") for x in n.targets] == ["ENV_SHA_RE"]), None)
+    if pat is None or ast.dump(pat) != dump('re.compile(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?")'):
+        out.append("ENV_SHA_RE is not the exact 40-or-64 ASCII-hex pattern compiled without flags")
+    return out
 
 
 def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
@@ -1718,6 +1850,31 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     ])
     fx.reset(base)
 
+    # (x3, #6624, #6862) the Binds-to sha has a right boundary: exactly 40 or 64 hex is captured
+    # whole, a 41-, 63- or 65-hex run, or a 40/64-hex run followed by any word character (a
+    # non-hex letter, `_`, a Unicode digit), is refused ("no parseable Binds-to line"), never
+    # cut to its 40- or 64-hex prefix. A closing backtick or punctuation still ends the value.
+    for label, value, want in (
+        ("41-hex", "b" * 41, "-"), ("63-hex", "b" * 63, "-"), ("65-hex", "b" * 65, "-"),
+        ("64-hex", "b" * 64, "b" * 64), ("40-hex", "b" * 40, "b" * 40),
+        ("40-hex plus g", "b" * 40 + "g", "-"), ("40-hex plus z", "b" * 40 + "z", "-"),
+        ("40-hex plus underscore", "b" * 40 + "_", "-"), ("64-hex plus g", "b" * 64 + "g", "-"),
+        ("40-hex plus U+0661", "b" * 40 + "\u0661", "-"), ("40-hex plus U+FF11", "b" * 40 + "\uff11", "-"),
+        ("64-hex plus U+0661", "b" * 64 + "\u0661", "-"),
+        ("40-hex plus period", "b" * 40 + ".", "b" * 40), ("40-hex plus comma", "b" * 40 + ",", "b" * 40),
+    ):
+        fx.banner("LIVE", value)
+        bound = cert_banner(repo, fx.commit([CERT_DOC], f"binds {label}"))[1]
+        if bound != want:
+            t.fail(f"(x3): a {label} Binds-to parsed as {bound!r}, expected {want!r}")
+        fx.reset(base)
+    fx.banner("LIVE", "b" * 41)
+    bind41 = fx.commit([CERT_DOC], "violate: 41-hex Binds-to")
+    t.expect_red("x3", "a 41-hex Binds-to (truncated to 40 instead of refused)", repo, base, bind41, [
+        ("no parseable Binds-to line", "did not refuse the 41-hex Binds-to"),
+    ])
+    fx.reset(base)
+
     # (y) RED - the cert doc DELETED in the same change as a wire change.
     fx.write(mod_rs, "// mutate\n", append=True)
     fx.g("rm", "-q", CERT_DOC)
@@ -1944,6 +2101,12 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
          "PR_HEAD_SHA is unset"),
         ("unresolvable PR_HEAD_SHA", dict(pr_base_env, PR_HEAD_SHA="1" * 40),
          "does not resolve to a commit"),
+        # An all-zero head or merge sha is not a skip: only the push-lane
+        # GITHUB_EVENT_BEFORE has that meaning (#6201); here it must reach the lookup.
+        ("all-zero PR_HEAD_SHA", dict(pr_base_env, PR_HEAD_SHA="0" * 40),
+         f"PR_HEAD_SHA {'0' * 40} does not resolve to a commit"),
+        ("all-zero GITHUB_SHA", dict(pr_base_env, GITHUB_SHA="0" * 40),
+         f"merge commit {'0' * 40} does not resolve to a commit"),
         ("unresolvable merge commit", dict(pr_base_env, GITHUB_SHA="2" * 40),
          "does not resolve to a commit"),
         ("a GITHUB_SHA that is not a two-parent merge", dict(pr_base_env, GITHUB_SHA=base),
@@ -1959,12 +2122,190 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
          dict(pr_base_env, GITHUB_SHA=pr_merge + "\n"), hex_msg),
         ("non-hex GITHUB_SHA", dict(pr_base_env, GITHUB_SHA="zz" + pr_merge[2:]), hex_msg),
         ("non-hex PR_BASE_SHA", dict(pr_base_env, PR_BASE_SHA="--oops"), hex_msg),
+        # 40 Arabic-Indic digits: `str.isdigit` / `\d` accept them, git does not.
+        ("non-ASCII-digit PR_HEAD_SHA", dict(pr_base_env, PR_HEAD_SHA="\u0661" * 40), hex_msg),
         ("option-shaped push GITHUB_EVENT_BEFORE",
          {"GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_BEFORE": "--upload-pack=x",
           "GITHUB_SHA": base, "PATH": os.environ.get("PATH", "")}, hex_msg),
     ]
     for why, env, needle in closed:
         t.gate("pr4", f"pull_request with {why}", repo, env, needle)
+
+    # (#6144) The 64-hex (SHA-256 object format) form is ACCEPTED by the sha
+    # validator: the run then fails cleanly at the later git lookup, never at the
+    # validator. Narrowing ENV_SHA_RE to 40 hex turns these cells red.
+    for key in ("PR_HEAD_SHA", "GITHUB_SHA"):
+        out = t.gate("pr4-sha256", f"pull_request with a 64-hex {key} (accepted by the validator)",
+                     repo, dict(pr_base_env, **{key: "a" * 64}), "does not resolve to a commit")
+        if hex_msg in out:
+            t.fail(f"(pr4-sha256): a 64-hex {key} was refused by the sha validator:", out)
+    # The push lane validates GITHUB_EVENT_BEFORE and GITHUB_SHA at their own sites
+    # in resolve_range: a 64-hex value passes the validator and the run then stops
+    # at the later range lookup, never at the validator.
+    push_sha_env = _gate_env(GITHUB_EVENT_NAME="push", GITHUB_EVENT_BEFORE=base, GITHUB_SHA=base,
+                             PATH=os.environ.get("PATH", ""))
+    for key in ("GITHUB_EVENT_BEFORE", "GITHUB_SHA"):
+        out = t.gate("pr4-sha256", f"push with a 64-hex {key} (accepted by the validator)",
+                     repo, dict(push_sha_env, **{key: "a" * 64}), "cannot resolve range")
+        if hex_msg in out:
+            t.fail(f"(pr4-sha256): a push 64-hex {key} was refused by the sha validator:", out)
+    # (#6144) The validator is case-insensitive: git accepts upper-case hex, so an
+    # upper-case 40- or 64-hex value on every validated key reaches the later
+    # lookup. Narrowing ENV_SHA_RE to lower-case hex turns these cells red.
+    for n in (40, 64):
+        for key in ("PR_HEAD_SHA", "GITHUB_SHA"):
+            out = t.gate("pr4-sha-case", f"pull_request with an upper-case {n}-hex {key}",
+                         repo, dict(pr_base_env, **{key: "A" * n}), "does not resolve to a commit")
+            if hex_msg in out:
+                t.fail(f"(pr4-sha-case): an upper-case {n}-hex {key} was refused by the sha "
+                       "validator:", out)
+        # The payload PR_BASE_SHA is validated before the merge-commit parent checks,
+        # which refuse this fixture ("is not on the live base"), never the validator.
+        out = t.gate("pr4-sha-case", f"pull_request with an upper-case {n}-hex PR_BASE_SHA",
+                     repo, dict(pr_base_env, PR_BASE_SHA="A" * n), "is not on the live base")
+        if hex_msg in out:
+            t.fail(f"(pr4-sha-case): an upper-case {n}-hex PR_BASE_SHA was refused by the sha "
+                   "validator:", out)
+        for key in ("GITHUB_EVENT_BEFORE", "GITHUB_SHA"):
+            out = t.gate("pr4-sha-case", f"push with an upper-case {n}-hex {key}",
+                         repo, dict(push_sha_env, **{key: "A" * n}), "cannot resolve range")
+            if hex_msg in out:
+                t.fail(f"(pr4-sha-case): a push upper-case {n}-hex {key} was refused by the sha "
+                       "validator:", out)
+    # Every `sha_len_values` entry is refused by the validator before any repository-touching git
+    # call. The only git call that legitimately precedes validation is the
+    # `git --version` probe in run_gate (require_git_version). The shim appends
+    # every invocation's argv to a trace file, and the cell asserts the trace
+    # holds exactly that one call (argv tail `--version`): a silent is_commit (`rev-parse`) or
+    # `fetch origin <value>` ahead of the validator is recorded even when the
+    # failure it causes is swallowed by run_git, so it turns this cell red.
+    # The loop covers the pull_request lane (PR_HEAD_SHA, GITHUB_SHA, PR_BASE_SHA) and the push
+    # lane (GITHUB_EVENT_BEFORE, GITHUB_SHA), each validated at its own site.
+    sha_len_cells = (
+        [("pull_request", k, pr_base_env)
+         for k in ("PR_HEAD_SHA", "GITHUB_SHA", "PR_BASE_SHA")]
+        + [("push", k, push_sha_env) for k in ("GITHUB_EVENT_BEFORE", "GITHUB_SHA")]
+    )
+    # Each non-length value below catches at least the loosening named on its row; only the fullwidth
+    # row is the sole killer of its loosening (the whitespace corpus below also covers the newline,
+    # CR and space rows, and the pr4 non-ASCII-digit cell also covers Arabic-Indic):
+    #   Arabic-Indic digit  : a `\d` / `str.isdigit` / any-Unicode-digit class (the pr4 non-ASCII-digit
+    #                         cell also catches these; this row is not their only killer).
+    #   fullwidth digit     : a class widened with the fullwidth digit range U+FF10-U+FF19.
+    #   40-hex plus newline : a `$`-anchored match; a `.strip()` before the match is
+    #                         also caught by the CR row and the whitespace corpus.
+    #   40-hex plus CR      : a `.rstrip('\r')` before the match.
+    #   space plus 40-hex   : a `.strip(' ')` or `.lstrip()` before the match.
+    #   superscript digit   : a translate of superscript digits to ASCII before the match.
+    #   40 non-hex letter   : a `len in (40, 64)` plus `isascii() and isalnum()` check instead of hex.
+    #   BOM plus 40-hex     : a `.strip('\ufeff')` or BOM strip before the match.
+    #   RLO plus 40-hex     : removal of bidi / format (Cf) characters such as U+202E before the match.
+    #   40-hex plus combining acute : a combining-mark drop (NFD, then filter `combining`) before the match.
+    #   64-hex with one Cyrillic a  : a confusable fold of Cyrillic letters to ASCII before the match.
+    # (#6414, #6404)
+    sha_len_values = (("63-hex", "b" * 63), ("65-hex", "b" * 65),
+                      ("40 Arabic-Indic digit", "\u0661" * 40),
+                      ("40 fullwidth digit", "\uff11" * 40),
+                      ("40-hex plus newline", "b" * 40 + "\n"),
+                      ("40-hex plus CR", "b" * 40 + "\r"),
+                      ("space plus 40-hex", " " + "b" * 40),
+                      ("40 superscript digit", "\u00b9" * 40),
+                      ("40 non-hex ASCII letter", "g" * 40),
+                      ("BOM plus 40-hex", "\ufeff" + "b" * 40),
+                      ("RLO plus 40-hex", "\u202e" + "b" * 40),
+                      ("40-hex plus combining acute", "b" * 40 + "\u0301"),
+                      ("64-hex with one Cyrillic a", "b" * 10 + "\u0430" + "b" * 53))
+    # decision: exhaustive whitespace corpus over per-char cells (E6, same class as #6414).
+    # Every `str.isspace()` character is tested as a prefix and as a suffix of a 40-hex value, so a
+    # sha read site loosened to trim a tab, VT, FF, NBSP or any other space is killed (#6464).
+    _ws = [chr(i) for i in range(0x110000) if chr(i).isspace()]
+    sha_len_values += tuple((f"40-hex plus U+{ord(c):04X}", "b" * 40 + c) for c in _ws)
+    sha_len_values += tuple((f"U+{ord(c):04X} plus 40-hex", c + "b" * 40) for c in _ws)
+    for label, sha_val in sha_len_values:
+        for lane, key, lane_env in sha_len_cells:
+            trace = Path(tmp) / f"git-trace-{lane}-{key}-{len(sha_val)}-{ord(sha_val[0])}.jsonl"
+            trace.unlink(missing_ok=True)
+            rc, out, err = run_gate_shimmed(tmp, repo, dict(lane_env, **{key: sha_val}),
+                                            fail="rev-parse", trace=trace)
+            text = out + err
+            calls = ([json.loads(ln) for ln in trace.read_text(encoding="utf-8").splitlines()]
+                     if trace.exists() else [])
+            if rc != 1 or f"{key} {sha_val!r} {hex_msg}" not in text or "shim refuses" in text:
+                t.fail(f"(pr4-sha-len): a {lane} {label} {key} was not refused by the validator naming the rejected sha:", text)
+            # run_git prefixes every call with `-c core.quotePath=false -C <repo>`, so
+            # the verb and its operands are the tail of argv: the probe ends in
+            # `--version`, a rev-parse / fetch does not.
+            if calls != [["-c", "core.quotePath=false", "-C", str(repo), "--version"]]:
+                t.fail(f"(pr4-sha-len): a {lane} {label} {key} ran git calls other than the "
+                       f"`--version` probe before the validator refused it: {calls!r}", text)
+
+    # (pr4-sha-comment, #6649): the comment block above sha_len_values names the loosening of each
+    # #6463 value and makes no false "only cell" claim for the `$` or lstrip rows (the whitespace
+    # corpus also kills both). A comment cannot be mutated, so the cell reads the block as text.
+    own_src = Path(__file__).read_text(encoding="utf-8")
+    block = re.search(r"# Each non-length value below.*?\(#6414, #6404\)", own_src, re.S)
+    block_text = block.group(0) if block else ""
+    for why in sha_comment_violations(block_text, [lb for lb, _ in sha_len_values]):
+        t.fail(f"(pr4-sha-comment): {why}")
+    # (pr4-sha-comment-position, #6941): the check is by name, so moving, adding or removing a row
+    # of the value table changes nothing, and the round-9 control that drops the fullwidth row
+    # (#6649: that row is the sole killer of the fullwidth-digit loosening) is not killed by it.
+    names = [lb for lb, _ in sha_len_values]
+    for label, shaped in (
+        ("a new first row", ["a new first row"] + names),
+        ("the fullwidth row dropped", [lb for lb in names if lb != "40 fullwidth digit"]),
+        ("the rows reversed", names[::-1]),
+    ):
+        if sha_comment_violations(block_text, shaped):
+            t.fail(f"(pr4-sha-comment-position): {label} changes the comment-block verdict: "
+                   f"{sha_comment_violations(block_text, shaped)!r}")
+    if not sha_comment_violations(block_text, [lb for lb in names if lb != "BOM plus 40-hex"]):
+        t.fail("(pr4-sha-comment-position): a missing #6463 row is not reported")
+
+    # (pr4-sha-ast, #6697, #6940, #6882): structural pin of the five env sha read statements of
+    # resolve_range, taken whole, plus the paths that feed them: `env` is bound only as the parameter
+    # of resolve_range and run_gate and is never mutated, run_gate passes it on unchanged, env_sha
+    # fullmatches the value it read, and ENV_SHA_RE is the exact 40-or-64 ASCII-hex pattern, no
+    # flags, each bound exactly once in the module, and main builds the production env with the
+    # unchanged `run_gate(REPO_ROOT, dict(os.environ))` (#6882). A loosening made AT those statements
+    # or by REBINDING their input (a stripped copy of env) fails here without a per-character-form
+    # cell; a loosening anywhere else (a different function) is outside this pin and needs its own cell.
+    for why in sha_ast_violations(own_src):
+        t.fail(f"(pr4-sha-ast): {why}")
+    # (pr4-sha-ast-mutants, #6940): the pin must reject each of these edits to a copy of this
+    # very file. Each anchor must occur exactly once, so a moved anchor fails the cell loudly.
+    zw = "\\u200b"
+    for label, edits in (
+        ("a conditional at the PR_HEAD_SHA read site that keeps the env_sha call",
+         [('        head = env_sha(env, "PR_HEAD_SHA")\n',
+           '        head = (env_sha(env, "PR_HEAD_SHA") if "' + zw + '" not in env.get("PR_HEAD_SHA", "")\n'
+           '                else ENV_SHA_RE.fullmatch(env["PR_HEAD_SHA"].replace("' + zw + '", "")).group(0))\n')]),
+        ("env rebound to a stripped copy at the top of resolve_range",
+         [('    event = env.get("GITHUB_EVENT_NAME", "")\n',
+           '    env = {k: v.replace("' + zw + '", "") for k, v in env.items()}\n'
+           '    event = env.get("GITHUB_EVENT_NAME", "")\n')]),
+        ("a second module-level ENV_SHA_RE binding after the pinned one",
+         [("\n\n\ndef env_sha(env, key):",
+           '\nENV_SHA_RE = re.compile(r"[0-9a-fA-F' + zw + ']{40}(?:[0-9a-fA-F' + zw + ']{24})?")\n\n\ndef env_sha(env, key):')]),
+        ("a second def env_sha after the pinned one",
+         [("\n\n\ndef is_commit(repo, ref):",
+           '\n\ndef env_sha(env, key):\n    return env.get(key, "").replace("' + zw + '", "")\n\n\ndef is_commit(repo, ref):')]),
+        ("a stripped production env built in main",
+         [("    rc, out, err = run_gate(REPO_ROOT, dict(os.environ))\n",
+           '    rc, out, err = run_gate(REPO_ROOT, {k: v.replace("' + zw + '", "") for k, v in os.environ.items()})\n')]),
+        ("run_gate passing a stripped env copy to resolve_range",
+         [('        base, head, tip = resolve_range(repo, env)\n',
+           '        base, head, tip = resolve_range(repo, {k: v.replace("' + zw + '", "") for k, v in env.items()})\n')]),
+    ):
+        msrc = own_src
+        for old, new in edits:
+            if own_src.count(old) != 1:
+                t.fail(f"(pr4-sha-ast-mutants): the anchor for {label} occurs {own_src.count(old)} times, want 1")
+                break
+            msrc = msrc.replace(old, new, 1)
+        else:
+            if not sha_ast_violations(msrc):
+                t.fail(f"(pr4-sha-ast-mutants): the structural pin did not reject {label}")
 
     # (k) fail-closed - pull_request with nothing set (missing PR head sha / base ref).
     t.gate("k", "pull_request with PR_HEAD_SHA and GITHUB_BASE_REF unset", repo,
@@ -2005,6 +2346,32 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                                   "GITHUB_EVENT_BEFORE": "0" * 40})
     if rc != 0:
         t.fail("(m): push with zero before-SHA did not skip")
+    # (m2, #6201) The skip is for the two well-formed all-zero shas only (40 hex for
+    # SHA-1, 64 for SHA-256). A zero value of any other length, or one with a trailing
+    # newline, is malformed input and the hex validator refuses it; a before-sha that
+    # merely starts with zeros is a real range (here unresolvable) and is judged,
+    # never skipped.
+    m2_base = {"GITHUB_EVENT_NAME": "push", "GITHUB_SHA": base}
+    rc, _o, _e = run_gate(repo, dict(m2_base, GITHUB_EVENT_BEFORE="0" * 64))
+    if rc != 0:
+        t.fail("(m2-zero64): push with a 64-zero before-SHA did not skip")
+    for why, value in [(f"{n}-zero", "0" * n) for n in (1, 5, 6, 39, 41, 63, 65)] + [
+            ("40-zero plus newline", "0" * 40 + "\n"), ("64-zero plus newline", "0" * 64 + "\n"),
+            ("40 Arabic-Indic zeros", "\u0660" * 40), ("64 fullwidth zeros", "\uff10" * 64)]:
+        rc, _o, err = run_gate(repo, dict(m2_base, GITHUB_EVENT_BEFORE=value))
+        if rc != 1 or hex_msg not in err:
+            t.fail(f"(m2-zero-len): a push {why} before-SHA was not refused by the "
+                   "sha validator:", err)
+    rc, _o, err = run_gate(repo, dict(m2_base, GITHUB_EVENT_BEFORE="0" + "a" * 39))
+    if rc != 1 or "cannot resolve range" not in err:
+        t.fail("(m2-zero-prefix): a 40-hex before-SHA starting with 0 was skipped instead "
+               "of judged:", err)
+
+    # (m2-zero-after, #6201) An all-zero GITHUB_SHA on a push is the tip, not a skip:
+    # the run is judged and stops at the range lookup.
+    rc, _o, err = run_gate(repo, dict(m2_base, GITHUB_EVENT_BEFORE=base, GITHUB_SHA="0" * 40))
+    if rc != 1 or f"cannot resolve range {base}..{'0' * 40}" not in err:
+        t.fail("(m2-zero-after): a push with an all-zero GITHUB_SHA was not judged:", err)
 
     # (n) fail-closed - unresolvable range.
     if check_change(repo, "0" * 40, base)[0]:
@@ -2042,7 +2409,7 @@ SELF_TEST_OK = (
     "(f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs "
     "RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path "
     "still named); (j) identifier-rename RED (both names listed); (k) pull_request missing "
-    "PR_HEAD_SHA / GITHUB_BASE_REF fail-closed with its reason; (l) workflow_dispatch skip naming the outside-CI-only overrides; (m) push with zero before-SHA skip; "
+    "PR_HEAD_SHA / GITHUB_BASE_REF fail-closed with its reason; (l) workflow_dispatch skip naming the outside-CI-only overrides; (m) push with zero before-SHA skip; (m2, #6201) only exactly 40 or 64 zeros skip, other zero lengths and newline-suffixed zeros are refused by the hex validator, a zero-prefixed 40-hex is judged, non-ASCII zeros (40 Arabic-Indic, 64 fullwidth) are refused, and an all-zero GITHUB_SHA / PR_HEAD_SHA is judged, never skipped (pr4 and m2-zero-after cells); "
     "(n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 GREEN; "
     "(p) non-ASCII watched path RED (core.quotePath bypass closed); (q) wire change + "
     "incidental cert-doc edit RED (#3556 B); (r) wire change + VOID record GREEN; (s) unrelated "
@@ -2052,7 +2419,8 @@ SELF_TEST_OK = (
     "GREEN (squash-merge shape, tree diff); (v2) LIVE bound to a non-ancestor whose watched "
     "tree differs RED (the ancestry hatch would have silenced it); (w) unparseable STATUS line "
     "fail-closed; (x1) decoy STATUS line above the banner RED (exactly-one rule); (x2) decoy "
-    "Binds-to line RED; (y) cert doc deleted alongside a wire change RED (ABSENT fails closed); "
+    "Binds-to line RED; (x3, #6624, #6862) a 41-, 63- or 65-hex Binds-to, or a 40/64-hex one followed by a word character (g, z, _, a Unicode digit), is refused with no parseable Binds-to line, a 64-hex one is parsed whole and a following period or comma ends the value; "
+    "(y) cert doc deleted alongside a wire change RED (ABSENT fails closed); "
     "(z) pure banner reformat on a docs-only change GREEN (tolerant parse); (z2) reformat + "
     "wire change RED as incidental, not unparseable; (pr1) #6137 stale-LIVE head banner with "
     "the base EXPIRED GREEN at the merge commit (and RED if judged at the head alone); (pr2) "
@@ -2068,27 +2436,32 @@ SELF_TEST_OK = (
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
     "octopus merge RED; (ci1-ci7, #5970) the event payload range is authoritative under "
     "GitHub Actions and CERT_EXPIRY_BASE/HEAD overrides are refused there but honoured "
-    "outside CI; (shim-isolation, #6145) the git PATH shim runs under python3 -I: isolated flag set and "
-    "a module planted beside it not importable, checked before any shimmed gate run; "
-    "(shim-interpreter, #6145) a whitespace, NUL, over-long (>255 byte) or non-UTF-8 interpreter line is "
-    "refused and a 255-byte line is accepted; (shim-interpreter-robust, #6145) a missing or near-PATH_MAX "
-    "scratch dir, sized from the platform PATH_MAX, yields a named violation, not a traceback; "
-    "(shim-deep-scratch, #6145) the deep scratch builder lands on the exact length, removes itself on failure and "
-    "a build failure is a named violation; (shim-unexecutable, #6145) an unexecutable shim "
-    "is reported as a violation; (path-max-fallback, #6145) PATH_MAX falls back to 1024 on macOS/BSD and "
-    "4096 elsewhere when os.pathconf fails; (guarded, #6145) a crashing cell becomes a named failure and "
-    "KeyboardInterrupt propagates; (shim-scratch-limit, #6145) a too-deep scratch path is reported with its "
-    "length and the limit; (shim-deep-relative, #6145) the deep-scratch targets stay valid on a deep checkout; "
-    "(shim-deep-cap, #6145) they stay inside [deep_scratch base, PATH_MAX-1] and a scratch 24 bytes under "
-    "PATH_MAX gets the 'needs room' message; (path-max-restore, #6145) os.pathconf and sys.platform are "
-    "restored and the fallback check runs once, first; (path-max-diagnostic, #6145) a dropped restore "
-    "names the real host platform and is put back, and a failing (not leaking) fallback check is "
-    "reported as path-max-fallback, running only that cell in the same scratch dir; "
+    "outside CI; "
+    "(shim-isolation, #6145) the git PATH shim runs under python3 -I: isolated flag set and a module planted beside it not importable, checked before any shimmed gate run; "
+    "(shim-interpreter, #6145) a whitespace, NUL, over-long (>255 byte) or non-UTF-8 interpreter line is refused and a 255-byte line is accepted; "
+    "(shim-interpreter-robust, #6145) a missing or near-PATH_MAX scratch dir, sized from the platform PATH_MAX, yields a named violation, not a traceback; "
+    "(shim-deep-scratch, #6145) the deep scratch builder lands on the exact length, removes itself on failure and a build failure is a named violation; "
+    "(shim-unexecutable, #6145) an unexecutable shim is reported as a violation; "
+    "(path-max-fallback, #6145) PATH_MAX falls back to 1024 on macOS/BSD and 4096 elsewhere when os.pathconf fails; "
+    "(guarded, #6145) a crashing cell becomes a named failure and KeyboardInterrupt propagates; "
+    "(shim-scratch-limit, #6145) a too-deep scratch path is reported with its length and the limit; "
+    "(shim-deep-relative, #6145) the deep-scratch targets stay valid on a deep checkout; "
+    "(shim-deep-cap, #6145) they stay inside [deep_scratch base, PATH_MAX-1] and a scratch 24 bytes under PATH_MAX gets the 'needs room' message; "
+    "(path-max-restore, #6145) os.pathconf and sys.platform are restored and the fallback check runs once, first; "
+    "(path-max-diagnostic, #6145) a dropped restore names the real host platform and is put back, and a failing (not leaking) fallback check is reported as path-max-fallback, running only that cell in the same scratch dir; "
     "(shim-isolation-crash, #6145) a crash in the isolation cell is a named failure; "
     "(checkout-depth-coverage, #6145) checkout-depth runs the shim-unexecutable cell; "
-    "(checkout-depth, #6145) every #6145 shim and scratch cell (including shim-unexecutable) passes in a "
-    "226-byte scratch dir, the one a 184-byte checkout gets; the gate-run fixtures build one gitshim.* level under the scratch "
-    "dir and fit within it."
+    "(checkout-depth, #6145) every #6145 shim and scratch cell (including shim-unexecutable) passes in a 226-byte scratch dir, the one a 184-byte checkout gets; "
+    "the gate-run fixtures build one gitshim.* level under the scratch dir and fit within it; "
+    "(pr4-sha256, #6144) a 64-hex PR_HEAD_SHA / GITHUB_SHA (pull_request) and GITHUB_EVENT_BEFORE / GITHUB_SHA (push) pass the validator and fail cleanly at the later lookup; "
+    "(pr4-sha-case, #6144) upper-case 40/64-hex shas pass the validator on every validated key; "
+    "(pr4-sha-len) 63/65-hex, 40 non-ASCII-digit (Arabic-Indic, fullwidth, superscript), 40 non-hex ASCII, newline- or CR-suffixed and space-prefixed 40-hex values, BOM-, bidi-override-, combining-mark- and Cyrillic-look-alike 40/64-hex values (#6463), and every str.isspace() character as a prefix and as a suffix of a 40-hex value, refused on every validated sha site (PR_HEAD_SHA, GITHUB_SHA and PR_BASE_SHA on pull_request; "
+    "GITHUB_EVENT_BEFORE and GITHUB_SHA on push) with only the `git --version` probe traced before the validator; "
+    "(pr4-sha-comment, #6649, #6941) the comment block above the sha values names each loosening and claims no false only-cell, the four #6463 labels chosen by name so a moved row neither shifts the check nor kills the fullwidth-row control; "
+    "(pr4-sha-ast, #6697, #6940, #6882) an ast pin of the five whole env_sha(env, KEY) read statements of resolve_range, "
+    "the bindings and mutations of env in resolve_range and run_gate, the single bindings of env_sha and ENV_SHA_RE and the env build in main; "
+    "(pr4-sha-ast-mutants, #6940, #6882) the pin rejects a conditional bypass at a read site, an env rebound in resolve_range, "
+    "a stripped env passed from run_gate, a second ENV_SHA_RE or env_sha binding and a stripped production env built in main."
 )
 
 
