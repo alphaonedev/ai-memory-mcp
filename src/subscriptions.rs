@@ -1570,6 +1570,7 @@ pub fn prewarm_dispatch_tls() {
         let _ = std::thread::spawn(|| {
             if let Err(e) = reqwest::blocking::Client::builder()
                 .timeout(ACK_TIMEOUT)
+                .no_proxy()
                 .build()
             {
                 tracing::warn!("webhook dispatch TLS warm-up failed: {e}");
@@ -1734,8 +1735,12 @@ fn send_with(
     // closes that window: a 3xx is surfaced as a non-success status
     // (`http-{status}` below) and fails the dispatch safely, exactly
     // like any other non-2xx.
+    // #6372 — never honour HTTP(S)_PROXY / ALL_PROXY: a proxy resolves the
+    // host itself and would receive the signed body, bypassing the
+    // guard-validated DNS pins below (per ERRORS-19, fail closed).
     let mut builder = reqwest::blocking::Client::builder()
         .timeout(ACK_TIMEOUT)
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none());
     // v1.0.0 #3705 — a receiver behind a private PKI: the operator-installed
     // root (`[subscriptions] ca_cert`) is trusted in addition to the public
