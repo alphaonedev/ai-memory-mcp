@@ -2899,6 +2899,13 @@ def _wrap_cells(t, fx, repo, base):
          {"src/wrappc/mod.rs": "#[cfg(any())]\npub(crate) mod child;\n"}),
         ("wrap-undeclared-nested", "module file that no", "the directory module's `mod` line removed from lib.rs",
          {"src/lib.rs": "pub mod wrappc;\n"}),
+        # #6838: U+200E / U+200F are Rust Pattern_White_Space; `#`, LRM, `[cfg(..)]` is an attribute
+        ("wrap-adv-lrm-outer", "cfg(any())", "an attribute written `#`, U+200E, `[cfg(any())]` on the item",
+         {"src/wrap_a.rs": "#\u200e[cfg(any())]\n" + a_line}),
+        ("wrap-adv-rlm-outer", "cfg(any())", "an attribute written `#`, U+200F, `[cfg(any())]` on the item",
+         {"src/wrap_a.rs": "#\u200f[cfg(any())]\n" + a_line}),
+        ("wrap-adv-lrm-inner-file", "#![cfg(any())]", "an inner attribute written `#!`, U+200E, `[cfg(any())]`",
+         {"src/wrap_a.rs": "#!\u200e[cfg(any())]\n" + a_line}),
     ]
     for label, reason, desc, edits in reds:
         fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
@@ -2919,6 +2926,21 @@ def _wrap_cells(t, fx, repo, base):
                _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=head_w,
                          GITHUB_BASE_REF="main", GITHUB_SHA=merge_w,
                          PATH=os.environ.get("PATH", "")), f"- {kid}")
+    # (wrap-ws-*, #6838) every Rust Pattern_White_Space code point between `#`,
+    # `!` and `[` keeps the attribute an attribute (outer and file-level inner).
+    for tag, ch in (("u0009", "\t"), ("u000a", "\n"), ("u000b", "\x0b"), ("u000c", "\x0c"),
+                    ("u000d", "\r"), ("u0020", " "), ("u0085", "\x85"), ("u200e", "\u200e"),
+                    ("u200f", "\u200f"), ("u2028", "\u2028"), ("u2029", "\u2029")):
+        for side, opener, reason in (("outer", "#", "cfg(any())"), ("inner", "#!", "#![cfg(any())]")):
+            label = f"wrap-ws-{side}-{tag}"
+            desc = f"an {side} attribute with U+{tag[1:].upper()} before its `[`"
+            fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
+            fx.write("src/wrap_a.rs", opener + ch + "[cfg(any())]\n" + a_line)
+            head_ws = fx.commit(["src/wrap_a.rs"], f"{label}: {desc}")
+            t.expect_red(label, desc, repo, w0, head_ws, [
+                (f"- {kid}", "did not name the disabled identifier"),
+                (reason, f"did not name the disabling construct ({reason})"),
+            ])
     # (wrap-unbalanced) a parse the gate cannot trust is a named fail-closed
     # error, never a silent pass.
     fx.g("checkout", "-q", "-B", "wv-unbalanced", w0)
@@ -3164,6 +3186,9 @@ SELF_TEST_OK = (
     "wrap-gap-shadow, wrap-gap-impl-target, wrap-gap-include, wrap-gap-uncalled-move) the residual "
     "gap (call graph, constant flag, name resolution, include target) is GREEN and pinned as NOT "
     "closed; "
+    "(wrap-adv-lrm-outer, wrap-adv-rlm-outer, wrap-adv-lrm-inner-file, each with -gate, #6838) "
+    "U+200E or U+200F between `#`, `!` and `[` keeps the attribute, and (wrap-ws-outer-u0009, wrap-ws-inner-u0009, wrap-ws-outer-u000a, wrap-ws-inner-u000a, wrap-ws-outer-u000b, wrap-ws-inner-u000b, wrap-ws-outer-u000c, wrap-ws-inner-u000c, wrap-ws-outer-u000d, wrap-ws-inner-u000d, wrap-ws-outer-u0020, wrap-ws-inner-u0020, wrap-ws-outer-u0085, wrap-ws-inner-u0085, wrap-ws-outer-u200e, wrap-ws-inner-u200e, wrap-ws-outer-u200f, wrap-ws-inner-u200f, wrap-ws-outer-u2028, wrap-ws-inner-u2028, wrap-ws-outer-u2029, wrap-ws-inner-u2029) every Rust "
+    "Pattern_White_Space code point there is RED; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
