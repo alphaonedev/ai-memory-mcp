@@ -323,11 +323,25 @@ pub fn release_process_clone() -> Result<Option<String>, String> {
 #[cfg(unix)]
 extern "C" fn exit_release_clone() {
     // `extern "C"` must not unwind: contain any panic and report best effort.
+    use std::io::Write as _;
     let outcome = std::panic::catch_unwind(release_process_clone);
+    // `eprintln!` panics when stderr is closed, which would unwind out of this
+    // `extern "C"` fn (abort); `writeln!` into a discarded result cannot.
+    let mut err = std::io::stderr();
     match outcome {
         Ok(Ok(_)) => {}
-        Ok(Err(why)) => eprintln!("WARN: [pg_isolate] exit cleanup left a clone behind: {why}"),
-        Err(_) => eprintln!("WARN: [pg_isolate] exit cleanup panicked; clone left behind"),
+        Ok(Err(why)) => {
+            let _ = writeln!(
+                err,
+                "WARN: [pg_isolate] exit cleanup left a clone behind: {why}"
+            );
+        }
+        Err(_) => {
+            let _ = writeln!(
+                err,
+                "WARN: [pg_isolate] exit cleanup panicked; clone left behind"
+            );
+        }
     }
 }
 
