@@ -235,6 +235,7 @@ AMENDMENT_BODY_BANNED_RE = re.compile(
 # The header keeps its `#N` (the issue the change is for); nothing else.
 AMENDMENT_HEAD_BANNED_RE = re.compile(
     r"[@/&\[\]<>\\`]|\bGH-\d|www\.|\b[0-9a-f]{7,}\b", re.IGNORECASE)
+AMENDMENT_HEAD_ISSUE_RE = re.compile(r"#\d+(?![\w#])")
 RE_CERT_ISSUE = "#6063"
 RE_CERT_URL = "https://github.com/alphaonedev/ai-memory-mcp/issues/6063"
 RE_CERT_LINK = f"[{RE_CERT_ISSUE}]({RE_CERT_URL})"
@@ -605,6 +606,11 @@ def _record_problems(header, body):
     if AMENDMENT_HEAD_BANNED_RE.search(AMENDMENT_MARKER_RE.sub("", header, count=1)):
         why.append("its header carries a link, an autolink, an entity, HTML, a code span, "
                    "a commit sha or a cross-repository reference")
+    # R3-F2: the header names exactly one issue, a whole number.
+    head_text = AMENDMENT_MARKER_RE.sub("", header, count=1)
+    if head_text.count("#") != 1 or not AMENDMENT_HEAD_ISSUE_RE.search(head_text):
+        why.append("a record header cites exactly one issue ('#N', a whole number) and "
+                   "nothing else with a '#'; this one does not")
     for ln in body:
         if not (AMENDMENT_ITEM_RE.match(ln) or AMENDMENT_BACK_RE.match(ln)
                 or AMENDMENT_PROSE_RE.match(ln)):
