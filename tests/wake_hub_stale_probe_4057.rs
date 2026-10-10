@@ -35,6 +35,10 @@ use ai_memory::wake_hub::startup::prepare_socket_path;
 /// only has to be comfortably longer than that and far shorter than "hung".
 const WATCHDOG: Duration = Duration::from_secs(10);
 
+/// A queue filled by a listener bound with an explicit backlog of 1 holds a
+/// handful of connections; far below any `RLIMIT_NOFILE` in use (#6323).
+const BACKLOG_BOUND: usize = 64;
+
 /// More connects than any listen backlog the kernel will grant an
 /// unprivileged listener (`somaxconn` defaults to 4096 on modern kernels).
 const BACKLOG_FILL_CEILING: usize = 8192;
@@ -134,13 +138,22 @@ fn a_full_backlog_listener_is_refused_promptly_and_its_socket_kept_4057() {
     let _live = listener(&path);
     let held = fill_backlog(&path);
     assert!(!held.is_empty(), "at least one connect must have queued");
+    // #6323: the cell must not depend on the host fd limit or somaxconn.
+    assert!(
+        held.len() < BACKLOG_BOUND,
+        "the listener must use a small explicit backlog, held {}",
+        held.len()
+    );
     let inode = std::fs::symlink_metadata(&path).expect("stat").ino();
 
     let err = probe_with_watchdog(&path).expect_err("a live listener must never be taken over");
     let msg = format!("{err:#}");
+    // #6324: `fill_backlog` returns only after EAGAIN, so the probe MUST map a
+    // full queue to `SocketLiveness::Busy` and say so; "already listening"
+    // would mean the probe connected, i.e. the queue was not actually full.
     assert!(
-        msg.contains("accept queue is FULL") || msg.contains("already listening"),
-        "the refusal must say the socket is live: {msg}"
+        msg.contains("accept queue is FULL"),
+        "the refusal must name the FULL accept queue (Busy mapping): {msg}"
     );
     assert_eq!(
         std::fs::symlink_metadata(&path)
