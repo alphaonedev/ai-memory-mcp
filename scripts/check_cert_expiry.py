@@ -3099,6 +3099,7 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     _ws_unit_cells(t)
     _ws_format_cells(t)
     _ws_wording_cells(t)
+    _source_hygiene_cell(t)
 
 
 CERT_CONTEXT_FIXTURE = "Enterprise-federation cert-expiry gate (cert §7 / F7)"
@@ -3642,6 +3643,7 @@ SUMMARY_CELL_SOURCES = (
     ("_ws_unit_cells", ""),
     ("_ws_format_cells", ""),
     ("_ws_wording_cells", ""),
+    ("_source_hygiene_cell", ""),
     ("_log_safe_cells", ""),
     ("_log_safe_table_cell", ""),
     ("_log_safe_di_cell", ""),
@@ -3740,6 +3742,20 @@ def _ws_unit_cells(t):
     for ok in (" ", "\t"):
         if _whitespace_findings(".github/workflows/u.yml", f"name: u\n# a{ok}b\n"):
             t.fail(f"(tr-s-ws-yaml): {ok!r} is YAML whitespace and must not be refused")
+
+
+def _source_hygiene_cell(t):
+    """#6922: this script holds no raw non-ASCII whitespace and no raw code
+    point that log_safe() escapes (format characters, invisible, unassigned,
+    private-use, surrogate, U+2028/U+2029): a cell that plants one writes it as
+    a \\u escape, so a reader of the source or of `git diff` sees what is
+    planted. Cell `src-no-invisible`."""
+    own = Path(__file__).read_text(encoding="utf-8")
+    for number, line in enumerate(own.split("\n"), 1):
+        for ch in line:
+            if ord(ch) > 0x7F and (ch.isspace() or log_safe(ch) != ch):
+                t.fail(f"(src-no-invisible): line {number} holds a raw U+{ord(ch):04X}; write it as an escape")
+                break
 
 
 def _ws_format_cell(t, label, text, needles, absent=()):
