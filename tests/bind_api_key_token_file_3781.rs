@@ -11,8 +11,9 @@
 //! (`cmd.env`), never the test process, so they neither race the lib tests nor
 //! trip check-test-env-lock.
 
+use std::io::Write as _;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 const AGENT_ID: &str = "ai:apikey-3781";
 
@@ -215,5 +216,91 @@ fn argv_token_with_a_file_channel_is_still_refused_3781() {
     assert!(
         err.contains("--token-file"),
         "refusal must still name the file-channel remedy: {err}"
+    );
+}
+
+/// Run `agents bind-api-key --token-file -` with `input` on the child's stdin.
+fn bind_from_stdin(sb: &Sandbox, input: &str) -> Output {
+    let mut child = command(sb)
+        .args([
+            "agents",
+            "bind-api-key",
+            "--agent-id",
+            AGENT_ID,
+            "--token-file",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    {
+        let mut pipe = child.stdin.take().expect("child stdin");
+        pipe.write_all(input.as_bytes()).expect("write child stdin");
+    }
+    child.wait_with_output().expect("wait")
+}
+
+/// #3437 (review F6, #6052) — allowed path: `--token-file -` reads the token
+/// from stdin (one line; the trailing newline is not part of the token), the
+/// non-argv channel for a token held in a secret manager rather than a file.
+#[test]
+fn token_file_dash_reads_stdin_and_binds_3437() {
+    let sb = sandbox();
+    let out = bind_from_stdin(&sb, "pw-placeholder-stdin-3437\n");
+    assert!(
+        out.status.success(),
+        "`--token-file -` with a token on stdin must bind: {}",
+        stderr_of(&out)
+    );
+    assert!(
+        stdout_of(&out).contains("bound api-key"),
+        "expected a bind confirmation: {}",
+        stdout_of(&out)
+    );
+}
+
+/// #3437 (review F6, #6052) — denied paths: an empty (or whitespace-only)
+/// stdin and a multi-line stdin are refused and bind nothing.
+#[test]
+fn token_file_dash_refuses_empty_and_multi_line_stdin_3437() {
+    for (input, what) in [
+        ("", "empty"),
+        ("  \n", "whitespace-only"),
+        ("pw-placeholder-a\npw-placeholder-b\n", "multi-line"),
+    ] {
+        let sb = sandbox();
+        let out = bind_from_stdin(&sb, input);
+        assert!(
+            !out.status.success(),
+            "#3437: a {what} stdin token must be refused; stdout={}",
+            stdout_of(&out)
+        );
+        let err = stderr_of(&out);
+        assert!(
+            err.contains("stdin"),
+            "#3437: the {what} refusal must name stdin: {err}"
+        );
+        assert!(
+            !stdout_of(&out).contains("bound api-key"),
+            "#3437: a refused {what} stdin token must bind nothing"
+        );
+    }
+}
+
+/// #3437 (review F6, #6052) — the help text documents the stdin form.
+#[test]
+fn help_names_the_stdin_form_3437() {
+    let sb = sandbox();
+    let out = command(&sb)
+        .args(["agents", "bind-api-key", "--help"])
+        .output()
+        .expect("spawn");
+    assert!(out.status.success(), "--help: {}", stderr_of(&out));
+    let help = stdout_of(&out);
+    assert!(
+        help.contains("--token-file -") && help.contains("stdin"),
+        "#3437: `bind-api-key --help` must document `--token-file -` (stdin): {help}"
     );
 }
