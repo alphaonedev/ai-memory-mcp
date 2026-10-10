@@ -70,7 +70,11 @@ Accepted (anything else raises `ValueError` from the constructor):
 - `None` (the default): httpx's own default trust, which is the `certifi`
   bundle, or the file or directory named by `SSL_CERT_FILE` / `SSL_CERT_DIR`
   when those are set. It is NOT the operating-system store, and
-  `REQUESTS_CA_BUNDLE` is ignored.
+  `REQUESTS_CA_BUNDLE` is ignored. When one of the variables is set, the SDK
+  reads the path it names exactly as it reads a `verify=<path>` below (once,
+  at construction, permissions checked); `SSL_CERT_FILE` must name a regular
+  file and `SSL_CERT_DIR` a directory, and a missing or unusable path is
+  refused rather than falling back to `certifi` (#6538).
 - `True`: the same, explicit.
 - A `str` or `os.PathLike` naming an existing CA bundle file or hashed CA
   directory. The path is resolved with `os.path.realpath` when the client is
@@ -138,10 +142,9 @@ Two ways to avoid passing `verify=` per client:
 
 - point `SSL_CERT_FILE` (or `SSL_CERT_DIR`) at `local-ca.pem` and leave
   `verify=` unset: httpx reads those variables for its default trust, whereas
-  installing the CA into the operating-system store does not affect it. httpx
-  reads an `SSL_CERT_DIR` directory again on each handshake and does not check
-  its permissions (#6538); pass `verify=<path>` to have it read once and
-  checked;
+  installing the CA into the operating-system store does not affect it. The
+  SDK reads that path once, at construction, and checks its permissions, the
+  same as `verify=<path>` (#6538);
 - run the daemon with an operator-supplied `--tls-cert`/`--tls-key` pair from
   a CA your hosts already trust, in which case no pinning is needed at all.
 
