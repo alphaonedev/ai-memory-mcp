@@ -3334,9 +3334,10 @@ class ExternalPrApprovalOnPush6117(unittest.TestCase):
                     head, _, rest = block.partition("\n")
                     self.assertRegex(head + "\n" + extra + rest, self.STEP_NEUTRALISER)
 
-    # #6392: the self-test must actually run its cases, not merely exit 0. 14 run_gate cases
-    # plus 5 parse_pages refusals; a case added to the self-test raises this floor with it.
-    SELF_TEST_PASS_LINES = 19
+    # #6392: the self-test must actually run its cases, not merely exit 0. 15 run_gate cases
+    # (#6637 added the duplicate merge_group listing) plus 5 parse_pages refusals; a case
+    # added to the self-test raises this floor with it.
+    SELF_TEST_PASS_LINES = 20
 
     def test_6117_r2_sf1_self_test_passes(self) -> None:
         out = subprocess.run([sys.executable, str(APPROVAL_PY), "--self-test"],
