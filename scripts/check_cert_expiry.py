@@ -27,7 +27,9 @@ FAILS when that diff touches ANY of:
   * src/handlers/federation_receive.rs
   * src/handlers/federation_signing_check.rs
   * added / removed / renamed `AI_MEMORY_FED_[A-Z0-9_]+` identifiers anywhere
-    in src/  (set-diff of identifiers at merge-base vs the judged commit)
+    in src/  (names new to the judged commit, and names gone from it or
+    that lost an occurrence line, keyed on (identifier, trimmed line text), at
+    merge-base vs the judged commit)
 
 UNLESS the same change also modifies
 `docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md` (a re-issue or voiding
@@ -91,9 +93,24 @@ THE TWO PREDICATES #3556 ADDS (2026-09-21).
       <commit>`), so ancestry is not required; an unparseable banner or a
       bound SHA absent from the repository is fail-closed.
 
-WHAT THIS DOES NOT CLAIM. A value-only edit of an existing AI_MEMORY_FED_*
-identifier in a file outside the three path watches does not trip the
-identifier check. This gate does not re-run 5.4(2)-(5); it only forces the
+WHAT THIS DOES NOT CLAIM. The identifier check compares, per identifier, the
+trimmed text of every line under src/ that names it (#6427). So a value edited
+on the line that carries an AI_MEMORY_FED_* identifier, a rewrap of that line,
+a trailing comment on it, or a block comment opened and closed ON it is drift
+and RED unless the old line text still occurs elsewhere under src/; a value
+that sits on a different line from the name is not seen. The base's
+identifier-bearing line texts are compared as a multiset over all of src/,
+without the path: a change that keeps every one of them, as often as before,
+somewhere under src/ (in any file, in a comment, in a string, or in code that
+is compiled out) is not seen, and the (value-copy-bound) cell pins that (a
+value edited with the old line kept in a block comment is GREEN, #6652).
+LEXICAL BOUND: the check is a text scan, so a change that leaves every
+identifier-bearing line byte-identical is not seen. Measured examples, each
+GREEN: a multi-line comment opened and closed on the neighbouring lines, an
+attribute that compiles the definition out added on the line above, a raw-string
+wrap, and a move of the line into a file that is not compiled (tracked in
+#6560). A block comment AROUND a definition is therefore caught only in the
+same-line form. This gate does not re-run 5.4(2)-(5); it only forces the
 cert-doc to be touched so a human/re-issue cannot be skipped.
 
 Usage:
@@ -105,22 +122,28 @@ Exit codes: 0 clean / N/A-skip, 1 violation, 2 usage / self-test failure.
 """
 
 import argparse
+import collections
 import contextlib
 import errno
 import io
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
 import tempfile
+import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 CERT_DOC = "docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
 FED_ID_PATTERN = "AI_MEMORY_FED_[A-Z0-9_]+"
-FED_ID_RE = re.compile(FED_ID_PATTERN)
+# Left word boundary (#6427): a longer token that merely ends in an identifier
+# (NOTAI_MEMORY_FED_X) is not a mention of it. git grep still selects lines with
+# the unanchored FED_ID_PATTERN; the match itself is taken here.
+FED_ID_RE = re.compile(r"(?<![A-Za-z0-9_])" + FED_ID_PATTERN)
 ZERO_SHA_RE = re.compile(r"^0+$")
 PREFIX = "check-cert-expiry"
 # Every sha taken from the environment is exactly 40 (SHA-1) or 64 (SHA-256)
@@ -268,25 +291,77 @@ def changed_paths(repo, frm, to):
     return [p.decode("utf-8", "replace") for p in proc.stdout.split(b"\0") if p]
 
 
-def extract_fed_ids(repo, tree):
-    """Unique AI_MEMORY_FED_* identifiers in src/ at TREE (set of str)."""
-    proc = run_git(repo, "grep", "-h", "-I", "-E", FED_ID_PATTERN, tree, "--", "src")
+def extract_fed_id_counts(repo, tree):
+    """Occurrences of each AI_MEMORY_FED_* identifier in src/ at TREE
+    (Counter: (identifier, trimmed line text) -> number of occurrences).
+
+    -a, never -I (#6174): for a tree argument git takes binary-ness from the
+    WORKING-TREE attributes, which on pull_request belong to the change under
+    test, so -I let that change hide src/ from the scan. Reading binaries adds
+    their matches to BOTH trees' counts; it does not by itself widen or narrow
+    the drift. Occurrences, not just names (#6370): a name that merely survives
+    in a comment elsewhere must not hide the removal of its definition. Keyed on
+    the trimmed line as well as the name (#6427): a single global count per name
+    could be offset by a mention added anywhere else, so a line that carried a
+    name and is gone from the head is a loss whatever else mentions the name.
+    Lines are compared without their path, so moving a line between files and
+    re-indenting it is not drift."""
+    proc = run_git(repo, "grep", "-h", "-a", "-E", FED_ID_PATTERN, tree, "--", "src")
     if proc.returncode == 1:  # no match
-        return set()
+        return collections.Counter()
     if proc.returncode != 0:
         err = proc.stderr.decode("utf-8", "replace").strip()
         raise GateError(f"git grep at {tree} exited {proc.returncode}: {err}")
-    return set(FED_ID_RE.findall(proc.stdout.decode("utf-8", "replace")))
+    counts = collections.Counter()
+    for line in proc.stdout.decode("utf-8", "replace").split("\n"):
+        text = line.strip()
+        for name in FED_ID_RE.findall(text):
+            counts[(name, text)] += 1
+    return counts
+
+
+def fed_id_delta(base_counts, head_counts):
+    """(added, removed) identifier drift between two keyed occurrence Counters.
+
+    added: names new to the head. removed: names gone from the head, and names
+    that lost an occurrence line: some (name, trimmed line) pair has fewer
+    matches at the head than at the base (the definition may have been removed,
+    replaced by a comment or wrapped in one while a mention elsewhere still
+    names it, #6370, #6427). Such a name carries the count change. An extra
+    mention of an existing name, or a line moved between files, is not drift."""
+    base_names = collections.Counter()
+    head_names = collections.Counter()
+    for (name, _), n in base_counts.items():
+        base_names[name] += n
+    for (name, _), n in head_counts.items():
+        head_names[name] += n
+    added = sorted(set(head_names) - set(base_names))
+    lost = collections.Counter()
+    for (name, text), before in base_counts.items():
+        if head_counts.get((name, text), 0) < before:
+            lost[name] += before - head_counts.get((name, text), 0)
+    removed = []
+    for name in sorted(base_names):
+        before, after = base_names[name], head_names.get(name, 0)
+        if after == 0:
+            removed.append(name)
+        elif lost[name]:
+            if after < before:
+                removed.append(f"{name} (occurrences in src/ fell {before} -> {after})")
+            else:
+                removed.append(f"{name} ({lost[name]} occurrence(s) on lines that changed or no "
+                               f"longer exist in src/; the total did not fall: {before} -> {after})")
+    return added, removed
 
 
 def wire_drift(repo, frm, to):
     """Section 7 surface that differs between two trees: watched paths, then
     +added / -removed AI_MEMORY_FED_* identifiers. Empty list = no drift."""
     out = [p for p in changed_paths(repo, frm, to) if is_watched_path(p)]
-    from_ids = extract_fed_ids(repo, frm)
-    to_ids = extract_fed_ids(repo, to)
-    out.extend("+" + i for i in sorted(to_ids - from_ids))
-    out.extend("-" + i for i in sorted(from_ids - to_ids))
+    added, removed = fed_id_delta(extract_fed_id_counts(repo, frm),
+                                  extract_fed_id_counts(repo, to))
+    out.extend("+" + i for i in added)
+    out.extend("-" + i for i in removed)
     return out
 
 
@@ -492,10 +567,8 @@ def _judge(repo, base, head, judged, mb, tip):
             cert_touched = True
         if is_watched_path(p):
             watched.append(p)
-    base_ids = extract_fed_ids(repo, mb)
-    head_ids = extract_fed_ids(repo, judged)
-    added = sorted(head_ids - base_ids)
-    removed = sorted(base_ids - head_ids)
+    added, removed = fed_id_delta(extract_fed_id_counts(repo, mb),
+                                  extract_fed_id_counts(repo, judged))
     id_changed = bool(added or removed)
 
     if not watched and not id_changed:
@@ -744,6 +817,9 @@ class Fixture:
 class SelfTest:
     def __init__(self):
         self.failed = False
+        # every cell label that ran, so (doc-bound) can require that each
+        # `(name)` the changelog fragment cites is a real cell (#6718)
+        self.labels = set()
 
     def fail(self, msg, out=None):
         print(f"self-test FAILED {msg}", file=sys.stderr)
@@ -752,6 +828,7 @@ class SelfTest:
         self.failed = True
 
     def expect_red(self, label, desc, repo, base, head, needles, tip=None):
+        self.labels.add(label)
         ok, out = check_change(repo, base, head, tip)
         if ok:
             self.fail(f"({label}): {desc} was NOT rejected", out)
@@ -762,6 +839,7 @@ class SelfTest:
         return out
 
     def expect_green(self, label, desc, repo, base, head, needles=(), tip=None):
+        self.labels.add(label)
         ok, out = check_change(repo, base, head, tip)
         if not ok:
             self.fail(f"({label}): {desc} was REJECTED:", out)
@@ -776,6 +854,7 @@ class SelfTest:
         """Run the whole gate. needle None: it must pass. Else it must fail
         closed (rc 1) AND say `needle` (a fail-closed for the wrong reason, or
         a wrong remedy, is a defect too)."""
+        self.labels.add(label)
         rc, out, err = run_gate(repo, env)
         text = out + err
         if needle is None:
@@ -786,6 +865,18 @@ class SelfTest:
         elif needle not in text:
             self.fail(f"({label}): {why} failed for the wrong reason (wanted {needle!r}):", text)
         return text
+
+
+class FailureRecorder:
+    """Stand-in for SelfTest that records failures instead of printing them,
+    so a cell can assert that a helper reports exactly one named failure
+    without polluting the real self-test output (#6380)."""
+
+    def __init__(self):
+        self.messages = []
+
+    def fail(self, msg, out=None):
+        self.messages.append(msg)
 
 
 GIT_SHIM = """#!{python} -I
@@ -799,6 +890,9 @@ if argv == ["--shim-isolation-probe"]:
         planted = False
     print(sys.flags.isolated, planted)
     sys.exit(0)
+if {probe!r} in argv:
+    print({marker!r})
+    sys.exit(0)
 if "--version" in argv and {version!r}:
     print({version!r})
     sys.exit(0)
@@ -809,6 +903,35 @@ os.execv(real, [real] + argv)
 """
 
 
+GIT_SHIM_PROBE_ARG = "--gitshim-probe"
+
+
+GIT_SHIM_PROBE_TIMEOUT = 60
+
+
+def _require_shim_reachable(path, marker, timeout=GIT_SHIM_PROBE_TIMEOUT):
+    """Positive probe (#6379): `git` looked up on `path` must be the shim, which
+    answers GIT_SHIM_PROBE_ARG with this run's `marker` (a per-run random nonce,
+    #6567/#6562) and nothing else. The answer is compared exactly (`marker` plus
+    one newline) on stdout only, byte for byte, so a decoy git that echoes a
+    constant, pads or affixes the marker (a CR before the newline included),
+    changes its case, or writes it to stderr is refused (#6651). Any cause that makes
+    the shim unreachable (not executable, an exec-refusing mount, a split PATH
+    entry) lets lookup fall through to the real git; refuse by name so the cells
+    never blame the gate for it. Output is decoded with errors="replace" so a
+    git that writes non-UTF-8 bytes is a named refusal, never a crash (#6428)."""
+    try:
+        proc = subprocess.run(["git", GIT_SHIM_PROBE_ARG], capture_output=True,
+                              env=dict(os.environ, PATH=path), timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GateError(f"the git shim is not the git on PATH (probe failed: {exc})") from exc
+    answer = proc.stdout.decode("utf-8", errors="replace")
+    if proc.returncode != 0 or answer != marker + "\n":
+        raise GateError("the git shim is not the git on PATH (the probe "
+                        f"{GIT_SHIM_PROBE_ARG!r} did not reach the shim; check that the "
+                        "scratch directory allows executing files)")
+
+
 SHEBANG_MAX = 255  # Linux truncates the interpreter line at 256 bytes (newline included)
 MKDTEMP_NAME_LEN = len("gitshim-long.") + 8  # tempfile.mkdtemp appends 8 random characters
 # Longest absolute scratch path under which the 255-byte boundary cell still fits:
@@ -816,7 +939,7 @@ MKDTEMP_NAME_LEN = len("gitshim-long.") + 8  # tempfile.mkdtemp appends 8 random
 SCRATCH_PATH_LIMIT = 255 - len("#!") - len(" -I") - (1 + MKDTEMP_NAME_LEN) - 2
 
 
-def write_git_shim(shim_dir, real, version="", fail="", interpreter=None):
+def write_git_shim(shim_dir, real, version="", fail="", interpreter=None, marker=""):
     """Write the executable `git` PATH shim into shim_dir (#6145: its interpreter
     line is `python3 -I`, like the gate itself in c8-precheck.yml, so the shim's
     own directory is never on its sys.path). Fails closed with GateError when the
@@ -846,7 +969,8 @@ def write_git_shim(shim_dir, real, version="", fail="", interpreter=None):
                         f"{SHEBANG_MAX}; the kernel would truncate it and drop '-I'")
     shim = shim_dir / "git"
     shim.write_text(GIT_SHIM.format(python=python, real=real, version=version,
-                                    fail=fail), encoding="utf-8")
+                                    fail=fail, probe=GIT_SHIM_PROBE_ARG,
+                                    marker=marker), encoding="utf-8")
     shim.chmod(0o755)
     return shim
 
@@ -1344,15 +1468,25 @@ def shim_isolation_violation(tmp, interpreter=None):
 def run_gate_shimmed(tmp, repo, env, version="", fail=""):
     """run_gate with a PATH shim `git` that reports `version` for --version
     and exits 128 on any call whose argv contains `fail`, and otherwise
-    delegates to the real git (R2-F2: pins the guarded branches)."""
+    delegates to the real git (R2-F2: pins the guarded branches). One
+    try/finally owns the shim directory from creation, so any exception
+    removes it, not only GateError (#6428)."""
     real = shutil.which("git")
     if real is None:
         raise GateError("git is not on PATH")
     shim_dir = Path(tempfile.mkdtemp(prefix="gitshim.", dir=str(tmp)))
-    write_git_shim(shim_dir, real, version, fail)
+    marker = secrets.token_hex(16)
     saved = os.environ.get("PATH")
-    os.environ["PATH"] = f"{shim_dir}{os.pathsep}{saved or ''}"
     try:
+        if os.pathsep in str(shim_dir):
+            # #6178: the PATH entry would be split and the real git would run.
+            raise GateError(f"the scratch path {str(shim_dir)!r} contains the PATH separator "
+                            f"{os.pathsep!r}; the git shim would be unreachable (run the "
+                            f"self-test from a checkout whose path has no {os.pathsep!r})")
+        write_git_shim(shim_dir, real, version, fail, marker=marker)
+        shim_path = f"{shim_dir}{os.pathsep}{saved or ''}"
+        _require_shim_reachable(shim_path, marker)
+        os.environ["PATH"] = shim_path
         return run_gate(repo, dict(env, PATH=os.environ["PATH"]))
     finally:
         if saved is None:
@@ -1360,6 +1494,39 @@ def run_gate_shimmed(tmp, repo, env, version="", fail=""):
         else:
             os.environ["PATH"] = saved
         shutil.rmtree(shim_dir, ignore_errors=True)
+
+
+def shimmed_cell(t, label, tmp, repo, env, **kw):
+    """run_gate_shimmed for a self-test cell; a shim that cannot be installed
+    is a named self-test failure recorded on `t` and returns None, never a
+    verdict on the gate (#6178, #6380)."""
+    try:
+        return run_gate_shimmed(tmp, repo, env, **kw)
+    except GateError as exc:
+        t.fail(f"({label}): the git shim could not be installed: {exc}")
+        return None
+
+
+def _shim_nonce_freshness(t, tmp, repo, env):
+    """(shim-probe-exact, #6567): two shimmed runs must hand the probe two
+    distinct 32-hex-digit markers (a module constant would repeat). Each run
+    goes through shimmed_cell, so a shim that cannot be reached is a named
+    (shim-probe-exact) failure on `t`, never an escaped exception (#6650)."""
+    seen_markers = []
+    real_probe = _require_shim_reachable
+
+    def spy_probe(path, marker, timeout=GIT_SHIM_PROBE_TIMEOUT):
+        seen_markers.append(marker)
+        return real_probe(path, marker, timeout)
+
+    with unittest.mock.patch.object(sys.modules[__name__], "_require_shim_reachable",
+                                    side_effect=spy_probe):
+        for _ in range(2):
+            shimmed_cell(t, "shim-probe-exact", tmp, repo, env, version="git version 2.29.9")
+    if (len(seen_markers) != 2 or seen_markers[0] == seen_markers[1]
+            or not all(re.fullmatch("[0-9a-f]{32}", m) for m in seen_markers)):
+        t.fail(f"(shim-probe-exact): the probe marker is not a fresh 32-hex nonce per "
+               f"run: {seen_markers!r}")
 
 
 def _gate_env(**kw):
@@ -1870,6 +2037,384 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         (f"{base}..{merge6}", "did not measure base tip..merge-commit"),
     ], tip=merge6)
 
+    # (attr, #6174) the PR adds attributes marking src/** binary plus a new
+    #       AI_MEMORY_FED_* identifier in an unwatched file. git grep takes
+    #       binary-ness from the WORKING TREE (here the merge commit, i.e.
+    #       the change under test); the identifier drift must stay RED.
+    fx.reset(base)
+    fx.g("checkout", "-q", "-b", "attr8", base)
+    fx.write(".gitattributes", "src/** binary\n")
+    fx.write("src/config.rs", 'pub const Y: &str = "AI_MEMORY_FED_ATTR_KNOB";\n', append=True)
+    attr8 = fx.commit([".gitattributes", "src/config.rs"], "attr8: src binary + new identifier")
+    fx.g("checkout", "-q", "main")
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+    merge8 = fx.merge("attr8", "Merge attr8 into main")
+    t.expect_red("attr", "identifier add hidden behind head-supplied binary attributes", repo,
+                 base, attr8, [
+                     ("+ AI_MEMORY_FED_ATTR_KNOB", "did not name the added identifier"),
+                     (sentence, "did not carry the required section 7 expiry sentence"),
+                 ], tip=merge8)
+    t.gate("attr-gate", "pull_request whose head marks src/** binary and adds an identifier",
+           repo, _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=attr8,
+                           GITHUB_BASE_REF="main", GITHUB_SHA=merge8,
+                           PATH=os.environ.get("PATH", "")), "+ AI_MEMORY_FED_ATTR_KNOB")
+    fx.reset(base)
+
+    # (attr-rm, #6174) the removal direction: the base defines an identifier
+    #       only in an unwatched file; the PR marks src/** binary and removes
+    #       the definition. The BASE-side scan runs under the head's attributes
+    #       too, so it must not regain -I either: the removal must stay RED.
+    fx.reset(base)
+    fx.g("checkout", "-q", "-b", "rm0", base)
+    fx.write("src/attr_rm.rs", 'pub const R: &str = "AI_MEMORY_FED_ATTR_RM_KNOB";\n')
+    rm0 = fx.commit(["src/attr_rm.rs"], "rm0: define an identifier in an unwatched file")
+    fx.g("checkout", "-q", "-b", "rm9", rm0)
+    fx.write(".gitattributes", "src/** binary\n")
+    fx.write("src/attr_rm.rs", 'pub const R: &str = "";\n')
+    rm9 = fx.commit([".gitattributes", "src/attr_rm.rs"], "rm9: src binary + remove the identifier")
+    fx.g("checkout", "-q", "main")
+    fx.g("reset", "-q", "--hard", rm0)
+    fx.g("update-ref", "refs/remotes/origin/main", rm0)
+    merge_rm = fx.merge("rm9", "Merge rm9 into main")
+    t.expect_red("attr-rm", "identifier removal hidden behind head-supplied binary attributes",
+                 repo, rm0, rm9, [
+                     ("- AI_MEMORY_FED_ATTR_RM_KNOB", "did not name the removed identifier"),
+                     (sentence, "did not carry the required section 7 expiry sentence"),
+                 ], tip=merge_rm)
+    t.gate("attr-rm-gate", "pull_request whose head marks src/** binary and removes an identifier",
+           repo, _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=rm9,
+                           GITHUB_BASE_REF="main", GITHUB_SHA=merge_rm,
+                           PATH=os.environ.get("PATH", "")), "- AI_MEMORY_FED_ATTR_RM_KNOB")
+    fx.reset(base)
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+
+    # (mask, #6370) drift compares identifier OCCURRENCES, not just names: the
+    #       base defines an identifier in an unwatched file and also mentions it
+    #       in a comment elsewhere; the PR removes only the definition. The name
+    #       survives in the comment, yet the removal must stay RED.
+    fx.reset(base)
+    fx.g("checkout", "-q", "-b", "mk0", base)
+    fx.write("src/mask_def.rs", 'pub const M: &str = "AI_MEMORY_FED_MASK_KNOB";\n')
+    fx.write("src/mask_note.rs", "// the knob AI_MEMORY_FED_MASK_KNOB is read at startup\n")
+    fx.banner("EXPIRED", base)  # no live claim, so the mk1 control is judged on drift alone
+    mk0 = fx.commit(["src/mask_def.rs", "src/mask_note.rs", CERT_DOC],
+                    "mk0: an identifier defined in one unwatched file and mentioned in another")
+    fx.g("checkout", "-q", "-b", "mk9", mk0)
+    fx.write("src/mask_def.rs", 'pub const M: &str = "";\n')
+    mk9 = fx.commit(["src/mask_def.rs"], "mk9: remove the definition, the comment mention stays")
+    fx.g("checkout", "-q", "-b", "mk1", mk0)
+    fx.write("src/mask_note.rs", "// AI_MEMORY_FED_MASK_KNOB is also described here\n", append=True)
+    mk1 = fx.commit(["src/mask_note.rs"], "mk1: one more mention of the same identifier")
+    fx.g("checkout", "-q", "main")
+    fx.g("reset", "-q", "--hard", mk0)
+    fx.g("update-ref", "refs/remotes/origin/main", mk0)
+    merge_mk = fx.merge("mk9", "Merge mk9 into main")
+    t.expect_red("mask", "definition removed while a comment still names the identifier",
+                 repo, mk0, mk9, [
+                     ("- AI_MEMORY_FED_MASK_KNOB", "did not name the removed identifier"),
+                     ("occurrences in src/ fell 2 -> 1", "did not carry the occurrence-count change"),
+                     (sentence, "did not carry the required section 7 expiry sentence"),
+                 ], tip=merge_mk)
+    t.gate("mask-gate", "pull_request that removes the definition of a still-mentioned identifier",
+           repo, _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=mk9,
+                           GITHUB_BASE_REF="main", GITHUB_SHA=merge_mk,
+                           PATH=os.environ.get("PATH", "")), "- AI_MEMORY_FED_MASK_KNOB")
+    mask_drift = wire_drift(repo, mk0, mk9)
+    if not any(d.startswith("-AI_MEMORY_FED_MASK_KNOB") for d in mask_drift):
+        t.fail("(mask-drift): wire_drift did not report the removed definition of a "
+               f"still-mentioned identifier: {mask_drift!r}")
+    # Control: an extra mention of an existing identifier is not drift (additions
+    # are unaffected; only a decrease in occurrences is a removal).
+    fx.g("reset", "-q", "--hard", mk0)
+    fx.g("update-ref", "refs/remotes/origin/main", mk0)
+    merge_mk1 = fx.merge("mk1", "Merge mk1 into main")
+    t.expect_green("mask-add", "one more mention of an identifier that already exists",
+                   repo, mk0, mk1, tip=merge_mk1)
+    fx.reset(base)
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+
+    # (mask-offset, #6427) the comparison is keyed on (identifier, trimmed line
+    #       text), so a change cannot offset the lost definition line with a
+    #       mention added elsewhere. Five offsets, each a removal of the live
+    #       definition from mk0 that must stay RED, then the controls.
+    kid = "AI_MEMORY_FED_MASK_KNOB"
+    def_line = f'pub const M: &str = "{kid}";\n'
+    offsets = [
+        ("mask-xfile", "definition removed + a mention added in another file",
+         {"src/mask_def.rs": 'pub const M: &str = "";\n', "src/mask_new.rs": f"// see {kid}\n"}),
+        ("mask-incomment", "definition replaced in place by a comment naming it",
+         {"src/mask_def.rs": f"// {kid} was read here\npub const M: &str = \"\";\n"}),
+        ("mask-longer", "definition removed + a longer token that contains the name",
+         {"src/mask_def.rs": 'pub const M: &str = "";\n', "src/mask_new.rs": f"// NOT{kid}\n"}),
+        ("mask-blockcomment", "defining line wrapped in a block comment opened and closed on that line",
+         {"src/mask_def.rs": "/* " + def_line.rstrip("\n") + " */\npub const M: &str = \"\";\n"}),
+        ("mask-annot", "definition removed + a mention carrying the drift annotation text",
+         {"src/mask_def.rs": 'pub const M: &str = "";\n',
+          "src/mask_new.rs": f"// -{kid} (occurrences in src/ fell 2 -> 1)\n"}),
+        # (#6564) git output is split on LF only. A definition after a `//` comment
+        # joined by U+2028 is commented out in Rust (a line comment ends at LF), yet
+        # str.splitlines() would give back the original line text.
+        ("mask-u2028", "definition behind a // comment joined by U+2028",
+         {"src/mask_def.rs": "// note\u2028" + def_line}),
+        # (#6564) the key is the whole trimmed line, not the name plus a prefix.
+        ("mask-trailing", "value emptied, name moved to a trailing comment on the same line",
+         {"src/mask_def.rs": f'pub const M: &str = ""; // {kid}\n'}),
+        # Base cases measured on e2c96191e that already went RED; pinned so the
+        # keyed comparison cannot lose them.
+        ("mask-confusable", "definition reads a confusable name (Cyrillic V)",
+         {"src/mask_def.rs": def_line.replace("KNOB", "KNO\u0412")}),
+        ("mask-confusable-note", "confusable name + one new mention of the original",
+         {"src/mask_def.rs": def_line.replace("KNOB", "KNO\u0412"),
+          "src/mask_new.rs": f"// {kid}\n"}),
+        ("mask-zwsp", "definition reads the name with a zero-width space inside it",
+         {"src/mask_def.rs": def_line.replace("MASK_KNOB", "MASK_\u200bKNOB")}),
+        ("mask-crsplit", "definition reads the name split by a carriage return",
+         {"src/mask_def.rs": def_line.replace("MASK_KNOB", "MASK_\rKNOB")}),
+        ("mask-note-removed", "only the comment mention removed, definition kept",
+         {"src/mask_note.rs": "// nothing here\n"}),
+    ]
+    # The name the report must carry: the removed identifier, or for the
+    # look-alike spellings the new truncated name they introduce.
+    reported = {"mask-confusable": "+ AI_MEMORY_FED_MASK_KNO",
+                "mask-confusable-note": "+ AI_MEMORY_FED_MASK_KNO",
+                "mask-zwsp": "+ AI_MEMORY_FED_MASK_", "mask-crsplit": "+ AI_MEMORY_FED_MASK_"}
+    gate_labels = {"mask-xfile", "mask-incomment", "mask-longer", "mask-blockcomment",
+                   "mask-annot", "mask-u2028", "mask-trailing"}
+    for label, desc, edits in offsets:
+        fx.g("checkout", "-q", "-B", f"mo-{label}", mk0)
+        for rel, text in edits.items():
+            fx.write(rel, text)
+        head_mo = fx.commit(sorted(edits), f"{label}: {desc}")
+        out_mo = t.expect_red(label, desc, repo, mk0, head_mo,
+                              [(reported.get(label, f"- {kid}"), "did not name the drifted identifier"),
+                               (sentence, "did not carry the required section 7 expiry sentence")])
+        if label == "mask-xfile" and "occurrences in src/ fell" in out_mo:
+            t.fail(f"(mask-xfile): an offset removal was annotated as a count fall: {out_mo!r}")
+        if label in gate_labels:
+            # (#6566) the same removal judged end to end on a pull_request merge commit.
+            fx.g("checkout", "-q", "main")
+            fx.g("reset", "-q", "--hard", mk0)
+            fx.g("update-ref", "refs/remotes/origin/main", mk0)
+            merge_mo = fx.merge(f"mo-{label}", f"Merge mo-{label} into main")
+            t.gate(f"{label}-gate", f"pull_request: {desc}", repo,
+                   _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=head_mo,
+                             GITHUB_BASE_REF="main", GITHUB_SHA=merge_mo,
+                             PATH=os.environ.get("PATH", "")), f"- {kid}")
+    # (mask-netzero, #6370 F7) the total never falls: the definition is removed and
+    #       a note naming the identifier is added in the same change, so the count
+    #       is unchanged. Judged on the lines, not the total, it stays RED, both
+    #       through the unit and through the pull_request gate.
+    fx.g("checkout", "-q", "-B", "mo-netzero", mk0)
+    fx.write("src/mask_def.rs", 'pub const M: &str = "";\n')
+    fx.write("src/mask_note.rs", f"// {kid} was removed from mask_def.rs\n", append=True)
+    nz = fx.commit(["src/mask_def.rs", "src/mask_note.rs"], "mask-netzero: definition out, note in")
+    fx.g("checkout", "-q", "main")
+    fx.g("reset", "-q", "--hard", mk0)
+    fx.g("update-ref", "refs/remotes/origin/main", mk0)
+    merge_nz = fx.merge("mo-netzero", "Merge mo-netzero into main")
+    t.expect_red("mask-netzero", "definition removed and a note naming it added (count unchanged)",
+                 repo, mk0, nz, [
+                     (f"- {kid}", "did not name the removed identifier"),
+                     ("the total did not fall: 2 -> 2", "did not state that the total held"),
+                     (sentence, "did not carry the required section 7 expiry sentence")],
+                 tip=merge_nz)
+    t.gate("mask-netzero-gate", "pull_request whose net identifier count is unchanged",
+           repo, _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=nz,
+                           GITHUB_BASE_REF="main", GITHUB_SHA=merge_nz,
+                           PATH=os.environ.get("PATH", "")), f"- {kid}")
+    # (mask-3to2) three occurrences become two: a halving test (after*2 <= before)
+    #       would miss it.
+    fx.g("checkout", "-q", "-B", "mo-3", mk0)
+    fx.write("src/mask_note.rs", f"// {kid} is also described here\n", append=True)
+    m3 = fx.commit(["src/mask_note.rs"], "mask-3: a third occurrence")
+    fx.g("checkout", "-q", "-B", "mo-3to2", m3)
+    fx.write("src/mask_def.rs", 'pub const M: &str = "";\n')
+    m32 = fx.commit(["src/mask_def.rs"], "mask-3to2: the definition goes")
+    fx.g("update-ref", "refs/remotes/origin/main", m3)
+    t.expect_red("mask-3to2", "three occurrences fall to two",
+                 repo, m3, m32, [
+                     (f"- {kid}", "did not name the removed identifier"),
+                     ("occurrences in src/ fell 3 -> 2", "did not carry the 3 -> 2 count change")])
+    # (mask-rise) the total goes UP (definition removed, two mentions added): still
+    #       RED, and the report must not claim a fall.
+    fx.g("update-ref", "refs/remotes/origin/main", mk0)
+    fx.g("checkout", "-q", "-B", "mo-rise", mk0)
+    fx.write("src/mask_def.rs", 'pub const M: &str = "";\n')
+    fx.write("src/mask_new.rs", f"// {kid} one\n// {kid} two\n")
+    rise = fx.commit(["src/mask_def.rs", "src/mask_new.rs"], "mask-rise: definition out, two notes in")
+    out_rise = t.expect_red("mask-rise", "definition removed while the total rises 2 -> 3",
+                            repo, mk0, rise, [
+                                (f"- {kid}", "did not name the removed identifier"),
+                                ("the total did not fall: 2 -> 3", "did not state that the total rose")])
+    if "occurrences in src/ fell" in out_rise:
+        t.fail(f"(mask-rise): a rising total was annotated as a fall: {out_rise!r}")
+    # (mask-dup) two files carry the same defining line; removing ONE of them is a
+    #       loss even though the line text survives in the other (counts are not
+    #       collapsed per line).
+    fx.g("checkout", "-q", "-B", "mo-dup0", mk0)
+    fx.write("src/mask_dup.rs", def_line)
+    dup0 = fx.commit(["src/mask_dup.rs"], "mask-dup0: the same defining line in a second file")
+    fx.g("update-ref", "refs/remotes/origin/main", dup0)
+    fx.g("checkout", "-q", "-B", "mo-dup1", dup0)
+    fx.write("src/mask_dup.rs", 'pub const M: &str = "";\n')
+    dup1 = fx.commit(["src/mask_dup.rs"], "mask-dup1: one of the two identical definitions goes")
+    t.expect_red("mask-dup", "one of two identical defining lines removed",
+                 repo, dup0, dup1, [
+                     ("occurrences in src/ fell 3 -> 2", "did not carry the 3 -> 2 count change")])
+    # (mask-lost2, #6565) two defining lines lost with the total unchanged: the
+    #       report counts BOTH lost lines.
+    fx.g("update-ref", "refs/remotes/origin/main", mk0)
+    fx.g("checkout", "-q", "-B", "mo-lost2", mk0)
+    fx.write("src/mask_def.rs", 'pub const M: &str = "";\n')
+    fx.write("src/mask_note.rs", "// nothing here\n")
+    fx.write("src/mask_new.rs", f"// {kid} one\n// {kid} two\n")
+    lost2 = fx.commit(["src/mask_def.rs", "src/mask_note.rs", "src/mask_new.rs"],
+                      "mask-lost2: both lines that named the identifier are rewritten")
+    t.expect_red("mask-lost2", "two identifier lines rewritten while the total holds",
+                 repo, mk0, lost2, [("2 occurrence(s) on lines", "did not count both lost lines")])
+    # (mask-trailing-ws) trailing whitespace is not a change to the line text.
+    fx.g("checkout", "-q", "-B", "mo-trailing-ws", mk0)
+    fx.write("src/mask_def.rs", def_line.rstrip("\n") + "   \n")
+    tws = fx.commit(["src/mask_def.rs"], "mask-trailing-ws: trailing blanks on the defining line")
+    t.expect_green("mask-trailing-ws", "trailing whitespace added to the defining line",
+                   repo, mk0, tws)
+    # (mask-dup-add) an identical defining line added in a second file is an extra
+    #       mention, not drift.
+    fx.g("checkout", "-q", "-B", "mo-dup-add", mk0)
+    fx.write("src/mask_dup.rs", def_line)
+    dad = fx.commit(["src/mask_dup.rs"], "mask-dup-add: the same defining line in a second file")
+    t.expect_green("mask-dup-add", "an identical defining line added in a second file",
+                   repo, mk0, dad)
+    # Controls: a longer token that merely CONTAINS the prefix is not an identifier,
+    # so adding one is GREEN (the left word boundary; letter and underscore prefixes).
+    fx.g("update-ref", "refs/remotes/origin/main", mk0)
+    for suffix, pre in (("letter", "NOT"), ("underscore", "X_"), ("digit", "9")):
+        fx.g("checkout", "-q", "-B", f"mo-longer-{suffix}", mk0)
+        fx.write("src/mask_new.rs", f"// {pre}AI_MEMORY_FED_MASK_OTHER_{suffix.upper()}\n")
+        lg = fx.commit(["src/mask_new.rs"], f"mask-longer-{suffix}: a longer token is added")
+        t.expect_green(f"mask-longer-{suffix}", f"a {suffix}-prefixed longer token is not a new identifier",
+                       repo, mk0, lg)
+    fx.g("checkout", "-q", "main")
+    fx.reset(base)
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+    # Controls: the defining line moved to another file (re-indented) and an extra
+    # mention stay GREEN, so the keyed comparison does not turn refactors red.
+    fx.g("checkout", "-q", "-B", "mo-moved", mk0)
+    fx.write("src/mask_def.rs", 'pub const M: &str = "";\n')
+    fx.write("src/mask_moved.rs", "    " + def_line)
+    head_mv = fx.commit(["src/mask_def.rs", "src/mask_moved.rs"], "mask-moved: defining line moved")
+    t.expect_green("mask-moved", "the defining line moved to another file", repo, mk0, head_mv)
+    fx.reset(base)
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+
+    # (value-edit-5-to-6 / value-next-line / trailing-comment-added, #6563, #6626)
+    #       the documented split of a value edit. The base reads
+    #       `let v = env_or("<id>", 5);`: changing 5 to 6 ON the identifier line
+    #       changes that line and is RED; the same change on the line AFTER the
+    #       identifier (`let w = env_or(\n "<id>",\n 5);`) leaves the identifier
+    #       line byte-identical and is GREEN (the lexical bound). A trailing
+    #       comment added to the definition is RED as well, under its own name.
+    one = f'let v = env_or("{kid}", 5);\n'
+    two = f'let w = env_or(\n    "{kid}",\n    5);\n'
+    fx.g("checkout", "-q", "-B", "mo-value-base", mk0)
+    fx.write("src/mask_val.rs", one)
+    fx.write("src/mask_val2.rs", two)
+    vb = fx.commit(["src/mask_val.rs", "src/mask_val2.rs"], "value base: a value on and after the identifier line")
+    fx.g("checkout", "-q", "-B", "mo-value-same", vb)
+    fx.write("src/mask_val.rs", one.replace("5", "6"))
+    vs = fx.commit(["src/mask_val.rs"], "value-edit-5-to-6: the value 5 edited to 6 on the identifier line")
+    t.expect_red("value-edit-5-to-6", "the value 5 edited to 6 on the line that carries the identifier",
+                 repo, vb, vs, [(f"- {kid}", "did not name the drifted identifier")])
+    fx.g("checkout", "-q", "-B", "mo-value-next", vb)
+    fx.write("src/mask_val2.rs", two.replace("5", "6"))
+    vn = fx.commit(["src/mask_val2.rs"], "value-next-line: the value 5 edited to 6 on the line after the identifier")
+    t.expect_green("value-next-line", "the value 5 edited to 6 on the line after the identifier",
+                   repo, vb, vn)
+    fx.g("checkout", "-q", "-B", "mo-trailing-added", mk0)
+    fx.write("src/mask_def.rs", f'pub const M: &str = "{kid}"; // default 6\n')
+    tc = fx.commit(["src/mask_def.rs"], "trailing-comment-added: a trailing comment added to the definition")
+    t.expect_red("trailing-comment-added", "a trailing comment added to the defining line",
+                 repo, mk0, tc, [(f"- {kid}", "did not name the drifted identifier")])
+    # (value-edit-ws / value-edit-case / value-trim-nbsp, #6720) the line key is
+    #       the line text trimmed of leading and trailing Unicode blanks and
+    #       nothing else: an interior-whitespace-only edit and a case-only edit of
+    #       the value ON the identifier line are RED, and a trailing U+00A0 is
+    #       trimmed like any other blank (GREEN, the re-indent rule). Each pins one
+    #       normalisation a refactor of the key must not add (whitespace collapse,
+    #       case folding) or drop (Unicode-aware trim).
+    ws_line = f'let s = env_or("{kid}", "a  b");\n'
+    case_line = f'let c = env_or("{kid}", "on");\n'
+    fx.g("checkout", "-q", "-B", "mo-norm-base", mk0)
+    fx.write("src/mask_ws.rs", ws_line)
+    fx.write("src/mask_case.rs", case_line)
+    nb = fx.commit(["src/mask_ws.rs", "src/mask_case.rs"], "norm base: values on the identifier line")
+    fx.g("checkout", "-q", "-B", "mo-value-ws", nb)
+    fx.write("src/mask_ws.rs", ws_line.replace("a  b", "a b"))
+    hw = fx.commit(["src/mask_ws.rs"], "value-edit-ws: two spaces to one inside the value")
+    t.expect_red("value-edit-ws", "an interior-whitespace-only edit of the value on the identifier line",
+                 repo, nb, hw, [(f"- {kid}", "did not name the drifted identifier")])
+    fx.g("checkout", "-q", "-B", "mo-value-case", nb)
+    fx.write("src/mask_case.rs", case_line.replace('"on"', '"On"'))
+    hc = fx.commit(["src/mask_case.rs"], "value-edit-case: one letter's case changed in the value")
+    t.expect_red("value-edit-case", "a case-only edit of the value on the identifier line",
+                 repo, nb, hc, [(f"- {kid}", "did not name the drifted identifier")])
+    fx.g("checkout", "-q", "-B", "mo-value-nbsp", nb)
+    fx.write("src/mask_case.rs", case_line.replace(";\n", ";\u00a0\n"))
+    hn = fx.commit(["src/mask_case.rs"], "value-trim-nbsp: a trailing U+00A0 on the identifier line")
+    t.expect_green("value-trim-nbsp", "a trailing U+00A0 added to the identifier line (trimmed blank)",
+                   repo, nb, hn)
+    # (value-copy-bound, #6652) the keyed comparison is a multiset of
+    #       (identifier, trimmed line text) over all of src/ without the path, so
+    #       a value edited on the identifier line is GREEN while the old line text
+    #       still occurs elsewhere under src/: here it survives inside a block
+    #       comment next to the edited line. This pins the documented qualifier;
+    #       the doc and the behaviour move together (#6560).
+    copy_line = f'let q = env_or("{kid}", 7);\n'
+    fx.g("checkout", "-q", "-B", "mo-copy-base", mk0)
+    fx.write("src/mask_copy.rs", copy_line)
+    cb = fx.commit(["src/mask_copy.rs"], "copy base: a value on the identifier line")
+    fx.g("checkout", "-q", "-B", "mo-value-copy", cb)
+    fx.write("src/mask_copy.rs", copy_line.replace("7", "8") + "/*\n" + copy_line + "*/\n")
+    cc = fx.commit(["src/mask_copy.rs"], "value-copy-bound: value edited, old line kept in a block comment")
+    t.expect_green("value-copy-bound", "a value edited on the identifier line while the old line "
+                   "text stays under src/ inside a block comment (the multiset bound)", repo, cb, cc)
+    fx.reset(base)
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+    # (doc-bound, #6563 / #6561) the docstring, the OK banner and the #6427
+    #       changelog fragment say what is detected and name the lexical bound:
+    #       none may claim that a block comment AROUND a definition is caught.
+    t.labels.add("doc-bound")
+    doc_texts = [("module docstring", __doc__ or ""), ("OK banner", SELF_TEST_OK)]
+    fragment = REPO_ROOT / "changelog.d" / "6427.fixed.md"
+    if fragment.is_file():
+        doc_texts.append(("changelog.d/6427.fixed.md", fragment.read_text(encoding="utf-8")))
+    for where, text in doc_texts:
+        if "block comment around" in text:
+            t.fail(f"(doc-bound): the {where} claims a block comment around a definition is "
+                   "caught; only a block comment opened and closed on the defining line is")
+    if "value-only edit of an existing AI_MEMORY_FED_* identifier in a file outside" in " ".join(
+            (__doc__ or "").split()):
+        t.fail("(doc-bound): the module docstring still says a value-only edit outside the "
+               "path watches is never seen; a value edited on the identifier line is drift")
+    # (#6626) the banner may claim a value edit only if a cell edits one.
+    for needle in ("(trailing-comment-added)", "(value-edit-5-to-6)", "(value-edit-ws)",
+                   "(value-edit-case)", "(value-trim-nbsp)", "(value-copy-bound)"):
+        if needle not in SELF_TEST_OK:
+            t.fail(f"(doc-bound): the OK banner does not name {needle}; the value-edit claim "
+                   "must be pinned by a cell that changes a value (#6626)")
+    # (#6652) the RED sentence is conditional and the bound is the multiset one.
+    qualifier = "unless the old line text still occurs elsewhere under src/"
+    for where, text in doc_texts:
+        if where != "OK banner" and qualifier not in " ".join(text.split()):
+            t.fail(f"(doc-bound): the {where} does not qualify the value-edit RED claim "
+                   f"({qualifier!r} missing, #6652)")
+    if "multiset" not in (__doc__ or ""):
+        t.fail("(doc-bound): the module docstring does not state the multiset bound "
+               "(the line texts are compared over all of src/ without the path, #6652)")
+    for needle in ("LEXICAL BOUND", "byte-identical", "#6560"):
+        if needle not in (__doc__ or ""):
+            t.fail(f"(doc-bound): the module docstring does not state the lexical bound "
+                   f"({needle!r} missing)")
     # ---- #6138: merge-commit structure cells ------------------------------
     # main is at `base`; h7 is the PR head, o7 an unrelated branch.
     fx.reset(base)
@@ -1892,15 +2437,210 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                      GITHUB_BASE_REF="main", GITHUB_SHA=good7, PATH=os.environ.get("PATH", ""))
     t.gate("pr7-ok", "control: a two-parent merge of the live tip and the PR head", repo, env7)
     # R2-F2: the version guard and the is-ancestor error branch are pinned.
-    rc, out, err = run_gate_shimmed(tmp, repo, env7, version="git version 2.29.9")
-    if rc != 1 or "git >= 2.30 is required" not in out + err:
-        t.fail("(gitver): git 2.29.9 did not fail closed with the version guard:", out + err)
-    rc, out, err = run_gate_shimmed(tmp, repo, env7, fail="--is-ancestor")
-    if rc != 1 or "merge-base --is-ancestor exited 128" not in out + err:
-        t.fail("(anc-error): an is-ancestor error did not fail closed:", out + err)
-    rc, out, err = run_gate_shimmed(tmp, repo, env7)
-    if rc != 0:
-        t.fail("(shim-control): the pass-through git shim was REJECTED:", out + err)
+    path_before = os.environ.get("PATH")  # #6381: pinned by (shim-path-restore) below
+    res = shimmed_cell(t, "gitver", tmp, repo, env7, version="git version 2.29.9")
+    if res and (res[0] != 1 or "git >= 2.30 is required" not in res[1] + res[2]):
+        t.fail("(gitver): git 2.29.9 did not fail closed with the version guard:", res[1] + res[2])
+    res = shimmed_cell(t, "anc-error", tmp, repo, env7, fail="--is-ancestor")
+    if res and (res[0] != 1 or "merge-base --is-ancestor exited 128" not in res[1] + res[2]):
+        t.fail("(anc-error): an is-ancestor error did not fail closed:", res[1] + res[2])
+    res = shimmed_cell(t, "shim-control", tmp, repo, env7)
+    if res and res[0] != 0:
+        t.fail("(shim-control): the pass-through git shim was REJECTED:", res[1] + res[2])
+    # #6178: a scratch path that contains the PATH separator splits the shim
+    # entry, so the shim is unreachable and the real git runs; refuse that.
+    sep_dir = tmp / f"sep{os.pathsep}dir"
+    sep_dir.mkdir()
+    try:
+        run_gate_shimmed(sep_dir, repo, env7, version="git version 2.29.9")
+    except GateError as exc:
+        if "PATH separator" not in str(exc):
+            t.fail(f"(shim-pathsep): refused for the wrong reason: {exc}")
+        elif f"run the self-test from a checkout whose path has no {os.pathsep!r}" not in str(exc):
+            t.fail(f"(shim-pathsep): the refusal does not tell the user the remedy: {exc}")
+    else:
+        t.fail("(shim-pathsep): a scratch path containing the PATH separator was not refused")
+    if list(sep_dir.glob("gitshim.*")):
+        t.fail("(shim-pathsep-clean): a refused separator path left its shim directory behind")
+    # #6380: the call-site wrapper turns a refused shim into exactly one named
+    # self-test failure (it must neither swallow the error nor fabricate a verdict).
+    rec = FailureRecorder()
+    res = shimmed_cell(rec, "shim-pathsep", sep_dir, repo, env7, version="git version 2.29.9")
+    if res is not None:
+        t.fail(f"(shim-pathsep): shimmed_cell returned a gate verdict for a refused shim: {res!r}")
+    if len(rec.messages) != 1:
+        t.fail(f"(shim-pathsep): shimmed_cell recorded {len(rec.messages)} failures for a "
+               f"refused shim, wanted exactly one: {rec.messages!r}")
+    elif ("(shim-pathsep): the git shim could not be installed" not in rec.messages[0]
+          or "PATH separator" not in rec.messages[0]):
+        t.fail(f"(shim-pathsep): the named failure is wrong: {rec.messages[0]!r}")
+    # #6379: a shim that is installed but unreachable for a reason other than the
+    # PATH separator (here: not executable, so PATH lookup falls through to the
+    # real git) must be refused by name, never leave the gate blamed. Under a
+    # checkout path holding the separator the cells above already fail by name.
+    if os.pathsep not in str(tmp):
+        shims_before = sorted(p.name for p in tmp.glob("gitshim.*"))
+        with unittest.mock.patch.object(Path, "chmod", lambda self, mode, *a, **k: None):
+            try:
+                run_gate_shimmed(tmp, repo, env7, version="git version 2.29.9")
+            except GateError as exc:
+                if "is not the git on PATH" not in str(exc):
+                    t.fail(f"(shim-unreach): refused for the wrong reason: {exc}")
+            else:
+                t.fail("(shim-unreach): a non-executable git shim (PATH lookup falls through "
+                       "to the real git) was not refused")
+        if sorted(p.name for p in tmp.glob("gitshim.*")) != shims_before:
+            t.fail("(shim-unreach-clean): a refused git shim left its scratch directory behind")
+    # #6379: a probe that cannot even start (no git on the probed PATH) is a
+    # refusal by name, not a silent pass.
+    try:
+        _require_shim_reachable(str(tmp / "no-such-dir"), "unused")
+    except GateError as exc:
+        if "probe failed" not in str(exc):
+            t.fail(f"(shim-probe-oserror): refused for the wrong reason: {exc}")
+    else:
+        t.fail("(shim-probe-oserror): a probe that could not start was treated as reachable")
+    # #6428: the shim directory is owned by one try/finally, so ANY exception
+    # (not only GateError) raised after it is created must remove it.
+    if os.pathsep not in str(tmp):
+        shims_before = sorted(p.name for p in tmp.glob("gitshim.*"))
+        with unittest.mock.patch.object(sys.modules[__name__], "_require_shim_reachable",
+                                        side_effect=RuntimeError("probe blew up")):
+            try:
+                run_gate_shimmed(tmp, repo, env7, version="git version 2.29.9")
+            except RuntimeError:
+                pass
+            except Exception as exc:  # noqa: BLE001 - a different exception is itself the failure
+                t.fail(f"(shim-clean-any-exc): wrong exception type escaped: {exc!r}")
+            else:
+                t.fail("(shim-clean-any-exc): a probe exception was swallowed")
+        if sorted(p.name for p in tmp.glob("gitshim.*")) != shims_before:
+            t.fail("(shim-clean-any-exc): a non-GateError exception left the shim scratch "
+                   "directory behind")
+    # #6428: the probe decodes with errors="replace", so a git that writes bytes
+    # that are not UTF-8 is a named refusal, never a UnicodeDecodeError crash.
+    if os.pathsep not in str(tmp):
+        fake_dir = Path(tempfile.mkdtemp(prefix="fakegit.", dir=str(tmp)))
+        try:
+            fake = fake_dir / "git"
+            fake.write_text(f"#!{sys.executable}\nimport sys\n"
+                            "sys.stdout.buffer.write(bytes([0xff, 0xfe, 10]))\n", encoding="utf-8")
+            fake.chmod(0o755)
+            try:
+                _require_shim_reachable(str(fake_dir), "unused")
+            except GateError as exc:
+                if "is not the git on PATH" not in str(exc):
+                    t.fail(f"(shim-probe-decode): refused for the wrong reason: {exc}")
+            except Exception as exc:  # noqa: BLE001 - the crash is the failure being pinned
+                t.fail(f"(shim-probe-decode): non-UTF-8 probe output crashed the probe: {exc!r}")
+            else:
+                t.fail("(shim-probe-decode): non-UTF-8 probe output was treated as the marker")
+            # #6428: a probe that runs past its timeout is a named refusal; the
+            # branch is reached through a real sleeping git and a 1 second budget.
+            sleeper = fake_dir / "git"
+            sleeper.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(30)\n",
+                               encoding="utf-8")
+            sleeper.chmod(0o755)
+            try:
+                _require_shim_reachable(str(fake_dir), "unused", timeout=1)
+            except GateError as exc:
+                if "probe failed" not in str(exc):
+                    t.fail(f"(shim-probe-timeout): refused for the wrong reason: {exc}")
+            except Exception as exc:  # noqa: BLE001 - an escaped timeout is the failure
+                t.fail(f"(shim-probe-timeout): the probe timeout escaped as {exc!r}")
+            else:
+                t.fail("(shim-probe-timeout): a probe that timed out was treated as reachable")
+        finally:
+            shutil.rmtree(fake_dir, ignore_errors=True)
+    # #6448: each half of the reachability probe is pinned on its own. The real git
+    # fails both halves at once (exit 129, no marker), so only stub gits tell them
+    # apart: one exits 0 and prints nothing, one prints the marker and exits 1.
+    if os.pathsep not in str(tmp):
+        for stub_label, body in (
+                ("exit0-no-marker", "pass"),
+                ("marker-exit1", "print('probe-nonce')\nsys.exit(1)")):
+            stub_dir = Path(tempfile.mkdtemp(prefix="stubgit.", dir=str(tmp)))
+            try:
+                stub = stub_dir / "git"
+                stub.write_text(f"#!{sys.executable}\nimport sys\n{body}\n", encoding="utf-8")
+                stub.chmod(0o755)
+                try:
+                    _require_shim_reachable(str(stub_dir), "probe-nonce")
+                except GateError as exc:
+                    if "is not the git on PATH" not in str(exc):
+                        t.fail(f"(shim-probe-half): {stub_label} refused for the wrong reason: {exc}")
+                else:
+                    t.fail(f"(shim-probe-half): a git that is {stub_label} was treated as the shim")
+            finally:
+                shutil.rmtree(stub_dir, ignore_errors=True)
+    # #6567 / #6562: the probe answer is a per-run nonce compared exactly, on stdout
+    # only. Stub gits that print a loosened form of the nonce (affixed, split by an
+    # invalid byte, padded with Unicode whitespace, on stderr, or a different nonce)
+    # must each be refused, and a stub that prints exactly the nonce must pass.
+    if os.pathsep not in str(tmp):
+        nonce = secrets.token_hex(16)
+        while nonce == nonce.upper():
+            # #6651: the (upper) case needs a nonce with at least one letter.
+            nonce = secrets.token_hex(16)
+        other = secrets.token_hex(16)
+        half = len(nonce) // 2
+        exact_cases = (
+            ("prefixed", f"sys.stdout.write('x{nonce}\\n')", False),
+            ("suffixed", f"sys.stdout.write('{nonce}x\\n')", False),
+            ("split-by-ff", f"sys.stdout.buffer.write(b'{nonce[:half]}' + bytes([0xff]) + "
+                            f"b'{nonce[half:]}\\n')", False),
+            ("u2028-padded", f"sys.stdout.buffer.write('\\u2028{nonce}\\u2028\\n'.encode())", False),
+            ("stderr-only", f"sys.stderr.write('{nonce}\\n')", False),
+            ("other-nonce", f"sys.stdout.write('{other}\\n')", False),
+            ("blank-line-after", f"sys.stdout.write('{nonce}\\n\\n')", False),
+            ("crlf", f"sys.stdout.buffer.write(b'{nonce}\\r\\n')", False),
+            ("upper", f"sys.stdout.write('{nonce.upper()}\\n')", False),
+            ("exact", f"sys.stdout.write('{nonce}\\n')", True))
+        for stub_label, body, ok in exact_cases:
+            stub_dir = Path(tempfile.mkdtemp(prefix="stubgit.", dir=str(tmp)))
+            try:
+                stub = stub_dir / "git"
+                stub.write_text(f"#!{sys.executable}\nimport sys\n{body}\n", encoding="utf-8")
+                stub.chmod(0o755)
+                try:
+                    _require_shim_reachable(str(stub_dir), marker=nonce)
+                except GateError as exc:
+                    if ok:
+                        t.fail(f"(shim-probe-exact): the exact nonce was refused: {exc}")
+                    elif "is not the git on PATH" not in str(exc):
+                        t.fail(f"(shim-probe-exact): {stub_label} refused for the wrong reason: {exc}")
+                except Exception as exc:  # noqa: BLE001 - an escaped error is the failure
+                    t.fail(f"(shim-probe-exact): {stub_label} raised {exc!r}")
+                else:
+                    if not ok:
+                        t.fail(f"(shim-probe-exact): a git whose answer is {stub_label} was "
+                               "treated as the shim")
+            finally:
+                shutil.rmtree(stub_dir, ignore_errors=True)
+        # The nonce is drawn per run_gate_shimmed call: two calls must hand the probe
+        # two distinct 32-hex-digit markers (a module constant would repeat).
+        _shim_nonce_freshness(t, tmp, repo, env7)
+        # #6650: the freshness loop must keep the #6380 contract. A shim that cannot
+        # be executed (modelled: chmod is a no-op, so the shim keeps its 0o644 mode)
+        # is a named (shim-probe-exact) failure, never an escaped exception.
+        rec = FailureRecorder()
+        try:
+            with unittest.mock.patch.object(Path, "chmod", lambda self, *a, **k: None):
+                _shim_nonce_freshness(rec, tmp, repo, env7)
+        except Exception as exc:  # noqa: BLE001 - an escaped error is the failure
+            t.fail(f"(shim-probe-exact-noexec): an unreachable shim escaped the nonce "
+                   f"check as {exc!r}")
+        else:
+            if not rec.messages or not all(m.startswith("(shim-probe-exact)")
+                                           for m in rec.messages):
+                t.fail(f"(shim-probe-exact-noexec): an unreachable shim was not a named "
+                       f"(shim-probe-exact) failure: {rec.messages!r}")
+    # #6381: the shim PATH entry is process-global; every shim cell above, on its
+    # success path (shim-control), its gate-verdict paths (gitver, anc-error) and
+    # its refusal paths (shim-pathsep, shim-unreach), must leave PATH as found.
+    if os.environ.get("PATH") != path_before:
+        t.fail("(shim-path-restore): PATH was not restored after the git shim cells: "
+               f"{path_before!r} -> {os.environ.get('PATH')!r}")
     # Each of the next two cells is rejected by exactly one predicate.
     t.gate("pr7-second", "a two-parent merge whose second parent is an unrelated branch, not "
            "PR_HEAD_SHA", repo, dict(env7, GITHUB_SHA=unrel7), "is not PR_HEAD_SHA")
@@ -2028,6 +2768,17 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         print("self-test NOTE (o): skipped own-PR check (no origin/release/v1.0.0 "
               "and no @{upstream})", file=sys.stderr)
 
+    # (doc-bound, #6718) every cell the #6427 changelog fragment names, as a
+    #       backticked `(name)` or as "the NAME cells", is a cell that ran.
+    fragment = REPO_ROOT / "changelog.d" / "6427.fixed.md"
+    if fragment.is_file():
+        frag = fragment.read_text(encoding="utf-8")
+        cited = set(re.findall(r"`\(([a-z0-9][a-z0-9-]*)\)`", frag))
+        cited |= set(re.findall(r"\bthe ([a-z][a-z0-9]*(?:-[a-z0-9]+)+) cells?\b", frag))
+        for name in sorted(cited - t.labels):
+            t.fail(f"(doc-bound): changelog.d/6427.fixed.md names ({name}), which is not a "
+                   "self-test cell (#6718)")
+
     if t.failed:
         print("check-cert-expiry self-test: FAIL", file=sys.stderr)
         return 2
@@ -2062,7 +2813,56 @@ SELF_TEST_OK = (
     "head or merge commit and on non-hex, abbreviated or newline-suffixed shas; (pr4-moved) base moved by an unrelated commit "
     "GREEN; (pr4-offbase) first parent not on the base RED naming origin/<base ref>, each sha once, "
     "with the push-or-sync remedy; (gitver) git below 2.30 fail-closed; (anc-error) an is-ancestor "
-    "error fail-closed; "
+    "error fail-closed; (shim-pathsep, #6178) a shim scratch path containing the PATH "
+    "separator refused with its remedy and reported as exactly one named failure by "
+    "shimmed_cell (#6380), so the shim cells never run against the real git; "
+    "(shim-unreach, #6379) a non-executable git shim refused and its scratch directory removed "
+    "((shim-unreach-clean)); (shim-probe-oserror) a probe that cannot start refused; "
+    "(shim-path-restore, #6381) "
+    "PATH restored after every shim cell; "
+    "(shim-clean-any-exc, #6428) any exception, not only GateError, removes the shim "
+    "directory; (shim-probe-decode) non-UTF-8 probe output refused by name; "
+    "(shim-probe-timeout) a probe past its timeout refused by name; "
+    "(shim-probe-half, #6448) a git that exits 0 without the marker and a git that prints "
+    "the marker but exits 1 are each refused; "
+    "(shim-probe-exact, #6567/#6562) the probe answer is a per-run nonce compared exactly on "
+    "stdout, so an affixed, split, whitespace-padded, stderr-only, wrong-nonce, "
+    "blank-line-padded, CR-padded (crlf, #6651) or upper-cased (upper, #6651) answer is "
+    "refused; "
+    "(shim-probe-exact-noexec, #6650) a shim that cannot be executed in the nonce check is a "
+    "named (shim-probe-exact) failure, never a traceback; "
+    "(shim-pathsep-clean, #6428) a refused separator path leaves no shim directory; "
+    "(attr, attr-gate, #6174) an identifier add hidden behind head-supplied attributes "
+    "marking src/** binary RED in check_change and end to end on pull_request; "
+    "(attr-rm, attr-rm-gate, #6174) the same for an identifier REMOVAL; "
+    "(mask, mask-gate, mask-drift, mask-add, #6370) removing the definition of an identifier "
+    "that a comment still names stays RED (occurrence counts, not name sets), while an extra "
+    "mention is GREEN; "
+    "(mask-xfile-gate, mask-incomment-gate, mask-longer-gate, mask-blockcomment-gate, "
+    "mask-annot-gate, mask-u2028-gate, mask-trailing-gate, #6566) the same seven removals "
+    "RED end to end on a pull_request merge commit; "
+    "(mask-lost2, mask-trailing-ws, mask-dup-add, #6565) two rewritten identifier lines are "
+    "both counted in the report, trailing blanks and an identical line added elsewhere are GREEN; "
+    "(mask-u2028, mask-trailing, #6564) a definition behind a // comment joined by U+2028 and a "
+    "definition replaced by an empty value with the name in a trailing comment stay RED; "
+    "(value-edit-5-to-6) the value 5 edited to 6 on the identifier line is RED (#6626); "
+    "(value-next-line) the same edit on the line after it is GREEN; "
+    "(trailing-comment-added) a trailing comment added to the definition is RED; "
+    "(value-edit-ws) an interior-whitespace-only edit of the value on the identifier line is "
+    "RED, (value-edit-case) a case-only edit of it is RED, (value-trim-nbsp) a trailing "
+    "U+00A0 is a trimmed blank and GREEN (#6720); "
+    "(value-copy-bound) a value edited on the identifier line while the old line text "
+    "stays under src/ (here in a block comment) is GREEN: the line texts are a multiset over "
+    "src/ without the path (#6652); "
+    "(doc-bound, #6563) the docstring states the lexical bound; "
+    "(mask-xfile, mask-incomment, mask-longer, mask-blockcomment, mask-annot, #6427) a removed "
+    "definition offset by a mention in another file, a comment in its place, a longer token, a "
+    "block comment opened and closed on the defining line or the drift annotation text stays RED "
+    "(a comment opened on a neighbouring line leaves the line unchanged and is the documented "
+    "lexical bound, #6560), as do look-alike spellings "
+    "(mask-confusable, mask-confusable-note, mask-zwsp, mask-crsplit) and a removed mention "
+    "(mask-note-removed), a removal whose total never falls (mask-netzero, mask-netzero-gate) "
+    "and a 3 -> 2 fall (mask-3to2), a rising total (mask-rise) and one of two identical definitions (mask-dup) stay RED, a longer token is GREEN (mask-longer-letter, mask-longer-underscore, mask-longer-digit), while a defining line moved to another file is GREEN (mask-moved); "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
