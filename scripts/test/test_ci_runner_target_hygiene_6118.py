@@ -1380,6 +1380,14 @@ def _run_findings(run_text: str) -> List[str]:
 # Committed files a self-hosted run step may execute without the guard reading them (#6477):
 # the prune script is pinned by its own tests (PruneScript6118) and never sets a cargo variable.
 SCRIPT_ALLOWLIST = frozenset({"scripts/ci/prune-runner-target.py"})
+# Programs from other lanes, accepted only at the text that was reviewed (#6729): sha256 of the UTF-8 text as
+# the guard reads it. partition_test_binaries.py (CI v2, #6344) is stdlib-only, runs no subprocess, sets no
+# environment, writes only under --out-dir, and its list lines are `--lib` or `--test|--bin|--example|--bench
+# NAME` (NAME ^[A-Za-z0-9_.-]+$), which ci.yml passes to cargo test. An edit re-raises the finding until the new
+# text is reviewed for anything that reaches a cargo variable or argument and this pin is updated.
+REVIEWED_PROGRAMS = {
+    "scripts/ci/partition_test_binaries.py": "292573da57b402915261d94be8cd493b0b2f5abbd3276f1d4877c7034e41cee3",
+}
 SCRIPT_DEPTH = 3  # shell scripts are followed this many levels deep; a deeper chain is a finding
 SHELL_RUNNERS = frozenset({"bash", "sh", "dash", "zsh", "ksh", "source", "."})
 OTHER_RUNNERS = frozenset({"python", "python3", "node", "perl", "ruby", "pwsh", "make", "gmake", "just", "cmake",
@@ -1481,7 +1489,8 @@ def _script_findings(text: str, scripts: Optional[Dict[str, str]] = None, depth:
 
     A shell script (run with a shell, sourced, or executed with a shell shebang) is read with the run-body
     rules, following the scripts it runs up to ``SCRIPT_DEPTH`` levels. Any other program file (python,
-    make, just, ...) can set any cargo variable, so it is a finding unless it is on ``SCRIPT_ALLOWLIST``.
+    make, just, ...) can set any cargo variable, so it is a finding unless it is on ``SCRIPT_ALLOWLIST``
+    or on ``REVIEWED_PROGRAMS`` with its text at the pinned sha256 (#6729).
     ``scripts`` overlays file contents by repository path (tests and mutation drivers); a path that is
     neither in it nor a file below the repository root is a finding.
     """
@@ -1498,6 +1507,14 @@ def _script_findings(text: str, scripts: Optional[Dict[str, str]] = None, depth:
         if kind == "other" and word.text == words[-1].text and word.text in OTHER_RUNNERS:
             path = word.text
         if path in SCRIPT_ALLOWLIST:
+            continue
+        if path in REVIEWED_PROGRAMS:
+            reviewed = _script_text(path, scripts)
+            got = hashlib.sha256(reviewed.encode("utf-8")).hexdigest() if reviewed is not None else "unreadable"
+            if got != REVIEWED_PROGRAMS[path]:
+                found.append("%s, a reviewed program whose text changed (sha256 %s, reviewed %s); re-review it for "
+                             "anything that reaches a cargo variable or argument, then update REVIEWED_PROGRAMS"
+                             % (path, got, REVIEWED_PROGRAMS[path]))
             continue
         if path.startswith("/") or path.startswith("../") or path == "..":
             found.append("%s, a file outside the repository the guard cannot read" % word.text)

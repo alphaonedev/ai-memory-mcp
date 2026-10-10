@@ -159,7 +159,11 @@ controls, both pinned by `scripts/test/test_ci_runner_target_hygiene_6118.py`
   - **Scripts.** A committed shell script that a run step executes is read up
     to three levels deep. Any other interpreter (`python`, `make`, `node`, ...)
     or a file outside the repository is a finding unless the file is on the
-    script allowlist (only `scripts/ci/prune-runner-target.py`).
+    script allowlist (only `scripts/ci/prune-runner-target.py`) or is a
+    reviewed program whose text still has its pinned sha256 (only
+    `scripts/ci/partition_test_binaries.py`, the CI v2 shard planner, #6729).
+    Any edit to a pinned program is a finding until its new text is reviewed
+    and the pin is updated.
   - **R-PRUNE: target dir.** A build that writes outside the pruned
     `target/<profile>`, through `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`,
     `CARGO_BUILD_TARGET`, `--target-dir`, `--target`, `build.target-dir` or
