@@ -353,7 +353,11 @@ async fn revoke_unless_last_atomicity_parity(store: &Arc<dyn MemoryStore>, suffi
         .list_agent_api_keys()
         .await
         .expect("list_agent_api_keys");
-    assert_eq!(snapshot.len(), 2, "the last TWO key-holders: {snapshot:?}");
+    assert_eq!(
+        snapshot.len(),
+        2,
+        "the last TWO key-holders (row count mismatch)"
+    );
     let count_of = |agent: &str| {
         snapshot
             .iter()
@@ -381,8 +385,8 @@ async fn revoke_unless_last_atomicity_parity(store: &Arc<dyn MemoryStore>, suffi
         RevokeUnlessLastOutcome::Revoked { bindings_removed } => {
             assert_eq!(bindings_removed, 1, "A held exactly one key");
         }
-        other @ RevokeUnlessLastOutcome::WouldEmptyRegistry => {
-            panic!("the first self-revoke must apply, got {other:?}")
+        RevokeUnlessLastOutcome::WouldEmptyRegistry => {
+            panic!("the first self-revoke must apply, got WouldEmptyRegistry")
         }
     }
     // …and the SECOND is refused by the atomic re-check, even though its
@@ -393,8 +397,8 @@ async fn revoke_unless_last_atomicity_parity(store: &Arc<dyn MemoryStore>, suffi
         .expect("B revoke")
     {
         RevokeUnlessLastOutcome::WouldEmptyRegistry => {}
-        other @ RevokeUnlessLastOutcome::Revoked { .. } => {
-            panic!("the second self-revoke must be refused, got {other:?}")
+        RevokeUnlessLastOutcome::Revoked { .. } => {
+            panic!("the second self-revoke must be refused, got Revoked")
         }
     }
 
@@ -406,7 +410,7 @@ async fn revoke_unless_last_atomicity_parity(store: &Arc<dyn MemoryStore>, suffi
     assert_eq!(
         after.len(),
         1,
-        "the registry must never be emptied by two concurrent self-revokes: {after:?}"
+        "the registry must never be emptied by two concurrent self-revokes (row count mismatch)"
     );
     assert_eq!(
         store
@@ -443,8 +447,8 @@ async fn revoke_unless_last_atomicity_parity(store: &Arc<dyn MemoryStore>, suffi
         RevokeUnlessLastOutcome::Revoked { bindings_removed } => {
             assert_eq!(bindings_removed, 1);
         }
-        other @ RevokeUnlessLastOutcome::WouldEmptyRegistry => {
-            panic!("a revoke that leaves C enrolled must apply, got {other:?}")
+        RevokeUnlessLastOutcome::WouldEmptyRegistry => {
+            panic!("a revoke that leaves C enrolled must apply, got WouldEmptyRegistry")
         }
     }
 
@@ -459,8 +463,8 @@ async fn revoke_unless_last_atomicity_parity(store: &Arc<dyn MemoryStore>, suffi
         RevokeUnlessLastOutcome::Revoked { bindings_removed } => {
             assert_eq!(bindings_removed, 0, "no rows to remove");
         }
-        other @ RevokeUnlessLastOutcome::WouldEmptyRegistry => {
-            panic!("a no-op revoke must not be a refusal, got {other:?}")
+        RevokeUnlessLastOutcome::WouldEmptyRegistry => {
+            panic!("a no-op revoke must not be a refusal, got WouldEmptyRegistry")
         }
     }
 
@@ -471,8 +475,8 @@ async fn revoke_unless_last_atomicity_parity(store: &Arc<dyn MemoryStore>, suffi
         .expect("C revoke")
     {
         RevokeUnlessLastOutcome::WouldEmptyRegistry => {}
-        other @ RevokeUnlessLastOutcome::Revoked { .. } => {
-            panic!("the last holder's revoke must be refused, got {other:?}")
+        RevokeUnlessLastOutcome::Revoked { .. } => {
+            panic!("the last holder's revoke must be refused, got Revoked")
         }
     }
     assert_eq!(
@@ -595,7 +599,7 @@ async fn bind_conflict_parity(store: &Arc<dyn MemoryStore>, suffix: &str) {
     assert_eq!(
         listed.len(),
         1,
-        "a refused re-bind must not add a row either: {listed:?}"
+        "a refused re-bind must not add a row either (row count mismatch)"
     );
 
     // ALLOWED — B enrols a digest of its own, so the refusal above is a
