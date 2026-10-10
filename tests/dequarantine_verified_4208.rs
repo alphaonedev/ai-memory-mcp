@@ -275,6 +275,18 @@ async fn sqlite_release_is_one_write_transaction_two_connections_6162() {
     assert_eq!(state(&fx), "quarantined");
 }
 
+/// #6162 round 3: the store upserts on `(title, namespace)`, so two cells that
+/// share a fixture title and namespace merge into one row when they run in
+/// parallel against one database. Every fixture identity must therefore be
+/// unique per id (per cell).
+#[test]
+fn fixture_identity_is_unique_per_cell_6162() {
+    let a = mem_with_id("m-4208-cell-a", "signed text", Some("agent_attested"));
+    let b = mem_with_id("m-4208-cell-b", "signed text", Some("agent_attested"));
+    assert_ne!(a.title, b.title, "cells must not share a title slot");
+    assert_ne!(a.namespace, b.namespace, "cells must not share a namespace");
+}
+
 #[cfg(feature = "sal-postgres")]
 mod pg {
     //! #6162 F6 — direct Postgres release-path cells for the unattested,
@@ -394,5 +406,34 @@ mod pg {
         assert!(!released);
         assert_eq!(st, "open");
         assert_eq!(v1, v0, "an already-open row must not be rewritten");
+    }
+
+    /// #6162 round 3: four cells seed concurrently against one database. Each
+    /// seed must land its own row (no merge into a shared `(title, namespace)`
+    /// slot), which is what makes the cells above parallel-safe.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+    async fn pg_concurrent_fixtures_do_not_collide_6162() {
+        let store = connect().await;
+        let ids: Vec<String> = ["a", "b", "c", "d"].iter().map(|t| fresh_id(t)).collect();
+        tokio::join!(
+            seed(&store, &ids[0], false),
+            seed(&store, &ids[1], false),
+            seed(&store, &ids[2], false),
+            seed(&store, &ids[3], false),
+        );
+        let landed: i64 = sqlx::query_scalar("SELECT count(*) FROM memories WHERE id = ANY($1)")
+            .bind(&ids)
+            .fetch_one(store.pool())
+            .await
+            .expect("count");
+        for id in &ids {
+            cleanup(&store, id).await;
+        }
+        assert_eq!(
+            landed,
+            i64::try_from(ids.len()).expect("len"),
+            "every concurrent seed must land its own row"
+        );
     }
 }
