@@ -1588,6 +1588,15 @@ def _self_test_cases() -> int:
             else:
                 os.environ[key] = value
 
+    # #6609: a non-ASCII approver identity is reported byte-exact (the log read is pinned to UTF-8 output); a
+    # single-byte decode of the log would print the approver as `J\ufffdrg` while the decision stays unchanged.
+    work, fork_sha, base_root = fresh_pair("nonasciiapprover")
+    repo = work / "repo"
+    reword(repo)
+    head_sha = commit_all(repo, "head change\n\nRule-Change-Approved-By: J\u00f6rg")
+    range_cell("a non-ASCII approver identity is reported intact (#6609)", work, base_root, repo, fork_sha, head_sha,
+               False, "approval trailer(s): ` J\u00f6rg `")
+
     # #5180: the COUNT CHANGED branch uses the same dynamic fence as the rule branch; no other census diff carries
     # a backtick run, so a static fence there was never caught.
     work, _, _ = fresh_pair("countfence")
