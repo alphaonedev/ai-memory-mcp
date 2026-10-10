@@ -33,7 +33,7 @@ class LoadGateStep(unittest.TestCase):
         body = m.group(1)
         self.assertIn("contains(matrix.runner, 'self-hosted')", body)
         self.assertIn("needs.classify.outputs.docs_only != 'true'", body)
-        self.assertIn('python3 scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"', body)
+        self.assertIn('python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"', body)
 
     def test_exactly_one_gate_step(self):
         self.assertEqual(CI.count('- name: Load gate (#6795)'), 1)
