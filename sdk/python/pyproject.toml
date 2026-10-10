@@ -47,6 +47,11 @@ dev = [
     "mypy>=1.8,<3",
     "ruff>=0.3",
     "cryptography>=42.0",
+    # #6688: the TLS security tests need these; without them the SOCKS legs
+    # of the session check (#6349, #6537) and the truststore pins (#6267)
+    # skip in clients-ci. `socksio` is httpx's `socks` extra.
+    "socksio>=1.0,<2",
+    "truststore>=0.9",
 ]
 # TEST-ONLY acceptance-swarm driver (`swarm/` package). NOT shipped in the
 # wheel — `[tool.setuptools.packages.find].include` is `ai_memory*` only, so
