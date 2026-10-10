@@ -117,26 +117,26 @@ fn parse_ignore_line(line: &str, base: &str) -> Result<Option<IgnoreRule>, Strin
 /// `!`/`^` negation and `a-z` ranges), a `**/` segment matches zero or more
 /// directories and any other `**` matches everything. `None` on a malformed
 /// class (fail closed).
-fn glob(p: &[u8], s: &[u8]) -> Option<bool> {
-    let Some(&c) = p.first() else {
-        return Some(s.is_empty());
+fn glob(pat: &[u8], text: &[u8]) -> Option<bool> {
+    let Some(&head) = pat.first() else {
+        return Some(text.is_empty());
     };
-    match c {
-        b'*' if p.get(1) == Some(&b'*') => {
-            let rest = &p[2..];
+    match head {
+        b'*' if pat.get(1) == Some(&b'*') => {
+            let rest = &pat[2..];
             if let Some(after) = rest.strip_prefix(b"/") {
-                if glob(after, s)? {
+                if glob(after, text)? {
                     return Some(true);
                 }
-                for (i, b) in s.iter().enumerate() {
-                    if *b == b'/' && glob(after, &s[i + 1..])? {
+                for (at, byte) in text.iter().enumerate() {
+                    if *byte == b'/' && glob(after, &text[at + 1..])? {
                         return Some(true);
                     }
                 }
                 Some(false)
             } else {
-                for i in 0..=s.len() {
-                    if glob(rest, &s[i..])? {
+                for at in 0..=text.len() {
+                    if glob(rest, &text[at..])? {
                         return Some(true);
                     }
                 }
@@ -144,53 +144,53 @@ fn glob(p: &[u8], s: &[u8]) -> Option<bool> {
             }
         }
         b'*' => {
-            for i in 0..=s.len() {
-                if glob(&p[1..], &s[i..])? {
+            for at in 0..=text.len() {
+                if glob(&pat[1..], &text[at..])? {
                     return Some(true);
                 }
-                if s.get(i) == Some(&b'/') {
+                if text.get(at) == Some(&b'/') {
                     break;
                 }
             }
             Some(false)
         }
-        b'?' => match s.first() {
-            Some(&b) if b != b'/' => glob(&p[1..], &s[1..]),
+        b'?' => match text.first() {
+            Some(&byte) if byte != b'/' => glob(&pat[1..], &text[1..]),
             _ => Some(false),
         },
         b'[' => {
-            let mut i = 1;
-            let negated = matches!(p.get(1), Some(b'!' | b'^'));
+            let mut at = 1;
+            let negated = matches!(pat.get(1), Some(b'!' | b'^'));
             if negated {
-                i += 1;
+                at += 1;
             }
-            let start = i;
+            let start = at;
             let mut hit = false;
-            let Some(&b) = s.first() else {
+            let Some(&byte) = text.first() else {
                 return Some(false);
             };
             loop {
-                let &cur = p.get(i)?;
-                if cur == b']' && i > start {
+                let &cur = pat.get(at)?;
+                if cur == b']' && at > start {
                     break;
                 }
-                if p.get(i + 1) == Some(&b'-') && p.get(i + 2).is_some_and(|e| *e != b']') {
-                    let &hi = p.get(i + 2)?;
-                    hit |= (cur..=hi).contains(&b);
-                    i += 3;
+                if pat.get(at + 1) == Some(&b'-') && pat.get(at + 2).is_some_and(|e| *e != b']') {
+                    let &hi = pat.get(at + 2)?;
+                    hit |= (cur..=hi).contains(&byte);
+                    at += 3;
                 } else {
-                    hit |= cur == b;
-                    i += 1;
+                    hit |= cur == byte;
+                    at += 1;
                 }
             }
-            if hit != negated && b != b'/' {
-                glob(&p[i + 1..], &s[1..])
+            if hit != negated && byte != b'/' {
+                glob(&pat[at + 1..], &text[1..])
             } else {
                 Some(false)
             }
         }
-        _ => match s.first() {
-            Some(&b) if b == c => glob(&p[1..], &s[1..]),
+        _ => match text.first() {
+            Some(&byte) if byte == head => glob(&pat[1..], &text[1..]),
             _ => Some(false),
         },
     }
