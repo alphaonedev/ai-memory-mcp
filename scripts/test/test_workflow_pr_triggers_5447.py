@@ -5523,16 +5523,10 @@ def _jobs_6727(text: str) -> Dict[str, str]:
 
 
 def _self_hosted_6727(body: str) -> bool:
-    """True when the job is scheduled on a self-hosted runner (fixed labels or a matrix leg)."""
-    for line in body.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            continue
-        if stripped.startswith("runs-on:") and "self-hosted" in stripped:
-            return True
-        if stripped.startswith("runner:") and "self-hosted" in stripped:
-            return True
-    return False
+    """True when the job may be scheduled on a self-hosted runner: any runs-on (fixed labels,
+    a block list or a matrix leg) that does not resolve to GitHub-hosted labels (#6850)."""
+    legs, problems = runner_legs_6849(body)
+    return bool(legs or problems)
 
 
 # ---- #6849: a small evaluator for the GitHub expression subset the refusals use ----
@@ -5840,8 +5834,9 @@ class SelfHostedMergeGroupGuard6727(unittest.TestCase):
 
     def self_hosted_jobs(self) -> List[Tuple[str, str, str]]:
         out = []
-        for name in MergeGroupTriggerPinned6682.PINNED:
-            for job, body in _jobs_6727((WORKFLOWS / name).read_text(encoding="utf-8")).items():
+        texts = _all_workflow_texts()
+        for name in _fork_reachable_workflows_6850(texts):
+            for job, body in _jobs_6727(texts[name]).items():
                 if _self_hosted_6727(body):
                     out.append((name, job, body))
         return out
@@ -5920,13 +5915,46 @@ class ForkRefusalEffect6849(unittest.TestCase):
 # ---- Round 7 (#6850): the merge_group pin and the fork-refusal guard are closed-world ----
 
 
+FORK_REACHABLE_EVENTS_6850 = ("pull_request", "pull_request_target", "merge_group", "workflow_run")
+
+
+def _fork_reachable_workflows_6850(texts: Dict[str, str]) -> List[str]:
+    """Every workflow in the directory a fork pull request can start, derived, not listed."""
+    out = []
+    for name in sorted(texts):
+        try:
+            triggers = parse_triggers(texts[name])
+        except Unparsed:
+            out.append(name)
+            continue
+        if any(event in triggers for event in FORK_REACHABLE_EVENTS_6850):
+            out.append(name)
+    return out
+
+
 def _self_hosted_fork_problems_6850(texts: Dict[str, str]) -> List[str]:
-    """``workflow:job: why`` for every self-hosted job a fork can reach without a refusal."""
+    """``workflow:job: why`` for every self-hosted job a fork can reach without a refusal.
+
+    The set is every workflow in the directory with a pull_request, pull_request_target,
+    merge_group or workflow_run trigger (#6850); a fork run is judged as ``pull_request`` and,
+    when the workflow has it, ``pull_request_target``.  ``workflow_run`` is not modelled, so a
+    self-hosted job under it is reported (fail closed).
+    """
     out: List[str] = []
-    for name in MergeGroupTriggerPinned6682.PINNED:
-        for job, body in _jobs_6727(texts[name]).items():
-            if _self_hosted_6727(body):
-                out.extend(f"{name}:{job}: {why}" for why in _fork_refusal_problems_6727(body))
+    for name in _fork_reachable_workflows_6850(texts):
+        try:
+            triggers = parse_triggers(texts[name])
+            jobs = _jobs_6727(texts[name])
+        except Unparsed as err:
+            out.append(f"{name}: {err}")
+            continue
+        events = tuple(e for e in ("pull_request", "pull_request_target") if e in triggers) or ("pull_request",)
+        for job, body in jobs.items():
+            if not _self_hosted_6727(body):
+                continue
+            if "workflow_run" in triggers:
+                out.append(f"{name}:{job}: self-hosted under workflow_run (not modelled)")
+            out.extend(f"{name}:{job}: {why}" for why in _fork_refusal_problems_6727(body, events))
     return out
 
 
@@ -5937,6 +5965,8 @@ def _pinned_merge_group_problems_6850(pinned: Tuple[str, ...], texts: Dict[str, 
     out = [f"{name} is covered but not pinned" for name in covered if name not in pinned]
     out += [f"{name} is pinned but has no merge_group row" for name in pinned
             if "merge_group" not in parse_triggers(texts[name]) or row not in texts[name]]
+    carrying = {name for name, text in texts.items() if "merge_group" in parse_triggers(text)}
+    out += [f"{name} carries merge_group but is not pinned" for name in sorted(carrying - set(pinned))]
     return out
 
 
