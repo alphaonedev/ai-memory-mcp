@@ -162,6 +162,68 @@ async fn sqlite_run() -> Run {
     run_x2(&store, &RawDb::Sqlite(path), false).await
 }
 
+/// F3: a panic in a cell must restore both process-global flags.
+#[tokio::test]
+async fn x2_flags_reset_after_panic() {
+    let failed = tokio::spawn(async {
+        let dir = tempfile::tempdir().expect("panic control tempdir");
+        let store = SqliteStore::open(&dir.path().join("flags.db")).expect("flags sqlite");
+        // The first digest fails after the run has enabled both flags.
+        let raw = RawDb::Sqlite(dir.path().join("absent.db"));
+        run_x2(&store, &raw, false).await;
+    })
+    .await;
+    assert!(
+        failed.expect_err("oracle open must panic").is_panic(),
+        "F3 panic control"
+    );
+    let _guard = FLAGS.lock().await;
+    let lineage = ai_memory::config::lineage_dag_enabled();
+    // Inspect the sub-flag while its master is on, then reset even on red.
+    ai_memory::config::set_lineage_dag(true);
+    let tombstones = ai_memory::config::consolidate_tombstone_sources_enabled();
+    ai_memory::config::set_lineage_dag(false);
+    ai_memory::config::set_consolidate_tombstone_sources(false);
+    assert_eq!(
+        (lineage, tombstones),
+        (false, false),
+        "F3: flags reset on unwind"
+    );
+}
+
+/// F1: a run owns its database and must not erase the provisioning lane.
+#[cfg(feature = "sal-postgres")]
+#[tokio::test]
+async fn x2_postgres_preserves_lane_sentinel() {
+    const SENTINEL: &str = "x2-lane-sentinel";
+    let Some(url) = common::pg_isolate::isolated_url() else {
+        eprintln!("skip: x2_postgres_preserves_lane_sentinel: AI_MEMORY_TEST_POSTGRES_URL unset");
+        return;
+    };
+    common::lane_db::assert_lane_database(&url);
+    let store = ai_memory::store::postgres::PostgresStore::connect(&url)
+        .await
+        .expect("lane sentinel");
+    let caller = CallerContext::for_agent(CALLER);
+    store
+        .store(
+            &caller,
+            &parity_fault::memory(SENTINEL, SENTINEL, NS, CALLER),
+        )
+        .await
+        .expect("seed lane sentinel");
+    let run = pg_run().await.expect("postgres configured");
+    assert_atomic(&run, "postgres sentinel run");
+    let retained = store.get(&caller, SENTINEL).await;
+    store.pool().close().await;
+    assert_eq!(
+        retained
+            .expect("F1: lane sentinel survives a sibling run")
+            .id,
+        SENTINEL
+    );
+}
+
 /// Postgres runs in the database's `public` schema, not a per-test schema:
 /// the lineage leaf path issues `SET LOCAL search_path = ag_catalog, "$user",
 /// public` (AGE), which drops a test schema from the path. The campaign tables
@@ -183,6 +245,23 @@ async fn pg_run() -> Option<Run> {
 #[tokio::test]
 async fn x2a_sqlite_consolidate_atomic() {
     assert_atomic(&sqlite_run().await, "sqlite");
+}
+
+/// F5: an audit-only partial commit must fail the atomicity assertion.
+#[tokio::test]
+async fn x2_atomicity_rejects_audit_only_change() {
+    let mut run = sqlite_run().await;
+    run.after_fault.0.insert(
+        "signed_events".to_string(),
+        vec![vec!["memory_link.created".to_string(), "1".to_string()]],
+    );
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_atomic(&run, "F5 audit-only mutation");
+    }));
+    assert!(
+        caught.is_err(),
+        "F5: signed_events must participate in atomicity"
+    );
 }
 
 /// X2b: postgres consolidation is atomic and retry-clean.
