@@ -536,10 +536,11 @@ pub async fn consolidate_memories(
         {
             Ok(new_id) => new_id,
             // #3014 — 403 ATTESTATION_FAILED under global-strict (parity with
-            // the store path); otherwise the typed StoreError mapping.
+            // the store path); otherwise the typed StoreError mapping, with
+            // the #4286 stale-source conflict in the shared 409 body shape.
             Err(e) => {
                 return crate::handlers::errors::attestation_refused_response(&e.to_string())
-                    .unwrap_or_else(|| store_err_to_response(e));
+                    .unwrap_or_else(|| consolidate_store_err_response(e));
             }
         };
         // #1552 / #2860 — federation fanout parity (shared `consolidate_fanout`
@@ -848,6 +849,29 @@ pub async fn consolidate_memories(
                 .unwrap_or_else(|| crate::handlers::errors::handler_error_500(&e))
         }
     }
+}
+
+/// #4286 review F2 — the postgres consolidate error mapping. A source that
+/// changed after the LLM summary was built surfaces from the SAL as
+/// `StoreError::Conflict { id }`; it is answered with the same minimal 409
+/// body the sqlite branch emits (`status`, the conflicting `id`, `error`) so a
+/// client reads one shape on both backends. sqlite additionally carries the
+/// expected/current version pair, which the SAL variant does not hold. Every
+/// other error keeps the shared [`store_err_to_response`] mapping.
+#[cfg(feature = "sal")]
+fn consolidate_store_err_response(e: crate::store::StoreError) -> Response {
+    if let crate::store::StoreError::Conflict { id } = &e {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "status": "conflict",
+                "id": id,
+                "error": super::sanitize_store_err_message(&e.to_string()),
+            })),
+        )
+            .into_response();
+    }
+    store_err_to_response(e)
 }
 
 /// Request body for `POST /api/v1/auto_tag`.
@@ -1434,4 +1458,36 @@ pub(crate) async fn load_family_rows_via_store(
     }
     filtered.truncate(k);
     Ok(filtered)
+}
+
+#[cfg(all(test, feature = "sal"))]
+mod consolidate_conflict_tests_4286 {
+    use super::consolidate_store_err_response;
+    use axum::http::StatusCode;
+
+    /// #4286 review F2 — the postgres stale-source refusal carries the
+    /// common 409 body (`status`, conflicting `id`, `error`).
+    #[tokio::test]
+    async fn postgres_consolidate_conflict_has_common_409_shape_4286() {
+        let resp = consolidate_store_err_response(crate::store::StoreError::Conflict {
+            id: "src-b".to_string(),
+        });
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let v: serde_json::Value = serde_json::from_slice(&bytes).expect("json body");
+        assert_eq!(v["status"], "conflict", "{v}");
+        assert_eq!(v["id"], "src-b", "{v}");
+        assert!(v["error"].as_str().is_some_and(|s| !s.is_empty()), "{v}");
+    }
+
+    /// Non-conflict errors keep the shared mapping.
+    #[tokio::test]
+    async fn postgres_consolidate_not_found_keeps_shared_mapping_4286() {
+        let resp = consolidate_store_err_response(crate::store::StoreError::NotFound {
+            id: "x".to_string(),
+        });
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
 }
