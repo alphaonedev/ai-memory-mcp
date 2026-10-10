@@ -317,3 +317,101 @@ fn issue_6157_walk_skips_gitignored_local_artefact_dirs() {
         "the walk read gitignored local artefacts (or lost a tracked dir)"
     );
 }
+
+/// A fresh scratch tree under the repo's gitignored `.local-runs/` (project
+/// rule: never `/tmp`). The walk is rooted at the scratch dir, so only the
+/// `.gitignore` files a test copies into it apply there.
+fn scratch_tree(tag: &str) -> PathBuf {
+    let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".local-runs")
+        .join(format!("ssot-6157-{tag}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    fs::create_dir_all(&scratch).expect("create scratch tree");
+    scratch
+}
+
+/// Write `body` at `scratch/rel`, creating parent directories.
+fn plant(scratch: &Path, rel: &str, body: &str) {
+    let path = scratch.join(rel);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create plant parent");
+    }
+    fs::write(&path, body).expect("write plant");
+}
+
+/// Copy the repository's real `.gitignore` at `rel` (a tracked path) into the
+/// scratch tree at the same relative path.
+fn copy_gitignore(scratch: &Path, rel: &str) {
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    let body = fs::read_to_string(&src).expect("read tracked .gitignore");
+    plant(scratch, rel, &body);
+}
+
+/// Walk `scratch` and return the relative paths it collected, sorted, minus
+/// the copied `.gitignore` files themselves.
+fn walked(scratch: &Path) -> (Vec<String>, Vec<String>) {
+    let mut files = Vec::new();
+    let mut unreadable = Vec::new();
+    walk(scratch, &mut files, &mut unreadable);
+    let mut seen: Vec<String> = files
+        .iter()
+        .filter_map(|f| f.strip_prefix(scratch).ok())
+        .map(|p| p.display().to_string())
+        .filter(|p| !p.ends_with(".gitignore"))
+        .collect();
+    seen.sort();
+    (seen, unreadable)
+}
+
+const PLANT: &str = "{\"protocolVersion\": \"2099-01-01\"}\n";
+
+/// #6521: the walk must honour the repository's `.gitignore` files, not a
+/// hand-kept list of directory names. Every path below is gitignored by a
+/// tracked `.gitignore` (round-3 code review probe `s2_plants.py`) and none
+/// sits under a name the round-3 denylist knew; a developer or agent tree
+/// can hold all of them while `git status` is clean.
+#[test]
+fn issue_6521_walk_skips_every_path_the_repository_gitignores() {
+    const GITIGNORES: [&str; 5] = [
+        ".gitignore",
+        "clients/anthropic-shim-py/.gitignore",
+        "sdk/python/.gitignore",
+        "sdk/typescript/.gitignore",
+        "infra/federation-lab/.gitignore",
+    ];
+    const IGNORED: [&str; 11] = [
+        "clients/anthropic-shim-py/probe_shim.egg-info/PKG-INFO.json",
+        "sdk/python/probe.egg-info/meta.json",
+        "coverage/html/probe.html",
+        "sdk/typescript/coverage/probe.json",
+        ".local-runs-probe6157/probe.md",
+        ".cargo-probe-target/package/probe.rs",
+        "infra/federation-lab/run/probe.json",
+        ".claude/probe6157/probe.md",
+        "benchmarks/longmemeval/results/probe.json",
+        ".agentic/probe.md",
+        "sdk/python/env/probe.py",
+    ];
+    let scratch = scratch_tree("6521");
+    for rel in GITIGNORES {
+        copy_gitignore(&scratch, rel);
+    }
+    for rel in IGNORED {
+        plant(&scratch, rel, PLANT);
+    }
+    plant(&scratch, "docs/kept.md", PLANT);
+    // Negation: `.claude/*` is ignored but `!.claude/settings.json` is not.
+    plant(&scratch, ".claude/settings.json", PLANT);
+    let (seen, unreadable) = walked(&scratch);
+    let _ = fs::remove_dir_all(&scratch);
+
+    assert!(unreadable.is_empty(), "unreadable: {unreadable:?}");
+    assert_eq!(
+        seen,
+        vec![
+            ".claude/settings.json".to_string(),
+            "docs/kept.md".to_string()
+        ],
+        "the walk read a gitignored path (false red on a clean tree) or lost a trackable one"
+    );
+}
