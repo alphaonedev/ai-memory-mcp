@@ -1862,6 +1862,15 @@ def self_test():
         ("round10 #6735: credential value in a flow mapping owned by its key", r8_after_vstep(
             "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
             '        with: {PASSWORD: "${{ secrets.P }} ' + r10_tail + '"}\n'), r10_tail),
+        ("round10 #6735: block scalar owned by a credential key", r8_after_vstep(
+            "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
+            "        with:\n          PASSWORD: |\n            ${{ secrets.P }} " + r10_tail + "\n"), r10_tail),
+        ("round10 #6735: block sequence item owned by a credential key", r8_after_vstep(
+            "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
+            "        with:\n          PASSWORD:\n            - ${{ secrets.P }} " + r10_tail + "\n"), r10_tail),
+        ("round10 #6735: flow sequence item owned by a credential key", r8_after_vstep(
+            "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
+            '        with:\n          PASSWORD: ["${{ secrets.P }} ' + r10_tail + '"]\n'), r10_tail),
         ("round10 #6738: # inside a refused credential value", r10_env(f"API_KEY: &a abc#{r10_tail}"), r10_tail),
         ("round10 #6738: } inside a refused credential value", r10_env(f"API_KEY: &a abc}}{r10_tail}"), r10_tail),
         ("round10 #6738: string literal inside an expression", r10_env('API_KEY: "${{ \'' + r10_tail + '\' }}'), r10_tail),
