@@ -2876,6 +2876,30 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     t.expect_green("6124-d6", "doc-only prose edit beside an untouched ledger", repo, mb_d, d6)
     d7 = edit_range("", touch=(), label="d7", frm=mb_d, quoted=led_ab + ">\n" + rec6124)
     t.expect_green("6124-d7", "doc-only change that only appends a record", repo, mb_d, d7)
+    # (6124-d8..d10) #6726 - append-only holds on every path unless the judged
+    # banner is LIVE: a new Binds-to value (d8) or EXPIRED -> VOID (d9, and
+    # d9w with a wire change on the hatch path) is not a re-issue, so it may
+    # not delete a record. d10 is the GREEN control (Binds-to changed, ledger
+    # untouched).
+    def banner_cell(status, binds, quoted, label, touch=()):
+        fx.reset(mb_d)
+        for tp in touch:
+            fx.write(tp, f"// {label}\n", append=True)
+        fx.banner(status, binds, "", quoted)
+        return fx.commit(list(touch) + [CERT_DOC], f"6124 cell {label}")
+
+    d8 = banner_cell("EXPIRED", mb_d, ">\n" + old_b, "d8")
+    t.expect_red("6124-d8", "Binds-to changed and a record deleted by a doc-only change", repo,
+                 mb_d, d8, append6124)
+    d9 = banner_cell("VOID", genesis, ">\n" + old_b, "d9")
+    t.expect_red("6124-d9", "EXPIRED -> VOID and a record deleted by a doc-only change", repo,
+                 mb_d, d9, append6124)
+    d9w = banner_cell("VOID", genesis, ">\n" + old_b, "d9w", touch=(mod_rs,))
+    t.expect_red("6124-d9w", "EXPIRED -> VOID with a wire change and a record deleted", repo,
+                 mb_d, d9w, append6124)
+    d10 = banner_cell("EXPIRED", mb_d, led_ab, "d10")
+    t.expect_green("6124-d10", "Binds-to changed by a doc-only change, ledger untouched", repo,
+                   mb_d, d10)
 
     # (6124-i1..i4) RED (R3-F2) - the record's citation set is exact: the
     # header names exactly ONE issue (`#N`, a whole number); extra issues,
