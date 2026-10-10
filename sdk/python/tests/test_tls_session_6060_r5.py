@@ -1382,6 +1382,134 @@ def test_trace_set_by_a_later_hook_still_receives_events_6537(
     assert origin.hits == ["/x"]
 
 
+# ---- #6538: env trust (SSL_CERT_FILE / SSL_CERT_DIR) is held to #6377 ------
+
+_ENV_VERIFY = pytest.mark.parametrize("verify", [None, True], ids=["None", "True"])
+
+
+def _env_trust(monkeypatch: pytest.MonkeyPatch, **env: str) -> None:
+    _clear_proxy_env(monkeypatch)
+    for name in ("SSL_CERT_FILE", "SSL_CERT_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+
+@_ENV_VERIFY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_env_anchor_added_after_construction_is_not_trusted_6538(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    verify: object,
+) -> None:
+    directory = _ca_dir(tmp_path)
+    _env_trust(monkeypatch, SSL_CERT_DIR=str(directory))
+    if client_cls is AiMemoryClient:
+        with AiMemoryClient(base_url=origin.url, verify=verify, timeout=5) as client:  # type: ignore[arg-type]
+            _add_anchor(directory, lab.ca_path)
+            with pytest.raises(httpx.ConnectError):
+                client._client.get("/x")  # noqa: SLF001
+    else:
+
+        async def run() -> None:
+            async with AsyncAiMemoryClient(
+                base_url=origin.url,
+                verify=verify,  # type: ignore[arg-type]
+                timeout=5,
+            ) as client:
+                _add_anchor(directory, lab.ca_path)
+                with pytest.raises(httpx.ConnectError):
+                    await client._client.get("/x")  # noqa: SLF001
+
+        asyncio.run(run())
+    assert origin.hits == []
+
+
+@_ENV_VERIFY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("variable", ["SSL_CERT_FILE", "SSL_CERT_DIR"])
+def test_env_anchor_present_at_construction_is_trusted_6538(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    verify: object,
+    variable: str,
+) -> None:
+    directory = _ca_dir(tmp_path)
+    entry = _add_anchor(directory, lab.ca_path)
+    _env_trust(monkeypatch, **{variable: str(entry if variable == "SSL_CERT_FILE" else directory)})
+    assert _get_once(client_cls, origin.url, verify) == 200
+
+
+@_POSIX_ONLY
+@_ENV_VERIFY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_shared_writable_env_ca_directory_is_refused_6538(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    verify: object,
+) -> None:
+    directory = _ca_dir(tmp_path)
+    _add_anchor(directory, lab.ca_path)
+    directory.chmod(0o777)
+    _env_trust(monkeypatch, SSL_CERT_DIR=str(directory))
+    with pytest.raises(ValueError, match="writable"):
+        client_cls(base_url=_ORIGIN, verify=verify)
+
+
+@_POSIX_ONLY
+@_ENV_VERIFY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_shared_writable_env_ca_file_is_refused_6538(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    verify: object,
+) -> None:
+    bundle = tmp_path / "bundle.pem"
+    shutil.copy(lab.ca_path, bundle)
+    bundle.chmod(0o666)
+    _env_trust(monkeypatch, SSL_CERT_FILE=str(bundle))
+    with pytest.raises(ValueError, match="writable"):
+        client_cls(base_url=_ORIGIN, verify=verify)
+
+
+@_ENV_VERIFY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize(
+    ("variable", "target"),
+    [
+        ("SSL_CERT_FILE", "missing"),
+        ("SSL_CERT_DIR", "missing"),
+        ("SSL_CERT_FILE", "directory"),
+        ("SSL_CERT_DIR", "file"),
+    ],
+)
+def test_unusable_env_trust_path_is_refused_6538(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    verify: object,
+    variable: str,
+    target: str,
+) -> None:
+    directory = _ca_dir(tmp_path)
+    entry = _add_anchor(directory, lab.ca_path)
+    path = {"missing": tmp_path / "absent", "directory": directory, "file": entry}[target]
+    _env_trust(monkeypatch, **{variable: str(path)})
+    with pytest.raises(ValueError, match=variable):
+        client_cls(base_url=_ORIGIN, verify=verify)
+
+
 @pytest.mark.parametrize("client_cls", [httpx.Client, httpx.AsyncClient], ids=["sync", "async"])
 def test_unwrappable_transport_refuses_construction_6537(client_cls: type) -> None:
     context = ssl.create_default_context()
