@@ -1219,7 +1219,7 @@ mod tests {
             &conn,
             &json!({"namespace": "ns-clear-1777", "agent_id": "ai:alice"}),
         );
-        assert!(ok.is_ok(), "owner clear must succeed: {ok:?}");
+        assert!(ok.is_ok(), "owner clear must succeed");
         assert!(
             db::get_namespace_standard(&conn, "ns-clear-1777")
                 .unwrap()
