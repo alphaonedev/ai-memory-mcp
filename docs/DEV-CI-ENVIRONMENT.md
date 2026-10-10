@@ -186,6 +186,18 @@ pg_ctl -D <pg-age-stack>/pgdata start|stop
 # rebuild: operator-local f1-tier-init.sh equivalent
 ```
 
+**AGE self-heal (#6161).** The hand-built AGE 1.8.0 files originally lived inside
+Homebrew's `postgresql@18` share/lib trees, which `brew upgrade` relinks, dropping
+them (CI then fails with `extension "age" is not available`). A brew-independent
+copy now lives in `<pg-age-stack>/age-1.8.0/{share,lib}` (the four `age*.control/sql`
+files and `age.dylib`). On the macos-fed node the "Configure enterprise-fed tier"
+step runs `scripts/ci/ensure-age-extension.py` before `CREATE EXTENSION`: if
+`pg_available_extensions` lacks `age` it copies `share/*` into
+`pg_config --sharedir`/extension and `lib/*` into `pg_config --pkglibdir`, re-checks,
+and fails with one clear message if the restore did not help. It is a no-op when AGE
+is present. The directory is overridable with `--age-dir` or `AI_MEMORY_CI_AGE_DIR`.
+Keep `postgresql@18` and `pgvector` brew-pinned on the node regardless.
+
 ### Self-hosted runners
 ```bash
 # status (names/ids are not published here)

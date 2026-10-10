@@ -220,6 +220,8 @@ jobs:
         with: { fetch-depth: 2 }
       - name: Test impact selector security fallbacks
         run: python3 scripts/test/test_ci_test_impact.py
+      - name: AGE self-heal helper unit test (#6161)
+        run: python3 scripts/test/test_ensure_age_extension_6161.py
       - id: cls
         shell: bash
         env:
@@ -1038,6 +1040,8 @@ jobs:
           # actionlint expression-injection guard stays satisfied; sanitised
           # in-shell below into a pg-identifier-safe suffix.
           LEG: ${{ matrix.leg }}
+          # #6161 — node label via env (same expression-injection rule as LEG).
+          CI_NODE: ${{ matrix.node }}
         run: |
           set -euo pipefail
           # psql lives under a platform-specific prefix. Prepend it to
@@ -1079,6 +1083,13 @@ jobs:
             *)    q=""; head="$base_url" ;;
           esac
           new_url="${head%/*}/${CI_FED_DB}${q}"
+          # #6161 — the macos-fed AGE install is hand-built; a Homebrew upgrade
+          # relinks the postgresql@18 trees and drops its files. Self-heal from
+          # the node-local, brew-independent copy BEFORE CREATE EXTENSION.
+          # macos-fed only: the linux-fed path is unchanged.
+          if [ "${CI_NODE:-}" = "macos-fed" ]; then
+            python3 scripts/ci/ensure-age-extension.py --url-file "$url_file"
+          fi
           # Provision the ephemeral db's extensions (the tier role is SUPERUSER).
           if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then
             echo "::error::enterprise-fed leg on $RUNNER_NAME failed to create age/vector extensions in $CI_FED_DB"
