@@ -227,9 +227,10 @@ def approvals(repo: Path, base_sha: str, head_sha: str) -> list:
     git configuration, so neither the host nor the repository can widen what counts as a trailer. #6431: the log
     read pins `--no-show-signature` and `--encoding=UTF-8`, so a host `log.showSignature` cannot inject verifier text
     and a host `i18n.logOutputEncoding` cannot turn a real approval into unreadable bytes."""
-    out = git(repo, "log", "-z", "--no-show-signature", "--encoding=UTF-8", "--format=%B", f"{base_sha}..{head_sha}")
+    out = git(repo, "log", "-z", "--no-merges", "--first-parent", "--no-show-signature", "--encoding=UTF-8",
+              "--format=%B", f"{base_sha}..{head_sha}")
     found = []
-    for message in out.split(b"\0"):
+    for message in out.split(b"\0")[:1]:
         if message.strip():
             found += [match.group(1).strip() for match in TRAILER.finditer(trailer_block(message))]
     return found
@@ -1481,6 +1482,47 @@ def _self_test_cases() -> int:
     head_sha = commit_all(repo, "Rule-Change-Approved-By: Justin")
     range_cell("a newest commit whose subject is the approval key does not approve the head (#6434)", work, base_root,
                repo, fork_sha, head_sha, True, "no commit in the range carries")
+
+    # #6432: an approval counts wherever it sits in base..head: on a merged side-branch commit, on the merge commit
+    # itself, on an older commit and on the newest one. A log read that skips merges (--no-merges), follows only the
+    # first parent (--first-parent) or reads one message locks out a real approval.
+    def approved_range(name, build, want_fail=False, needle="approval trailer(s): ` Justin `"):
+        work, fork_sha, base_root = fresh_pair(name)
+        repo = work / "repo"
+        head_sha = build(repo, fork_sha)
+        range_cell(f"an approval {ANYWHERE[name]} counts (#6432)", work, base_root, repo, fork_sha, head_sha, want_fail,
+                   needle)
+
+    def merged(side_message, merge_message):
+        def build(repo, fork_sha):
+            subprocess.run(["git", "-C", str(repo), "checkout", "-q", "-b", "side"], check=True)
+            reword(repo)
+            commit_all(repo, side_message)
+            subprocess.run(["git", "-C", str(repo), "checkout", "-q", fork_sha], check=True)
+            (repo / "docs").mkdir(parents=True, exist_ok=True)
+            (repo / "docs" / "main-work.md").write_text("x\n", encoding="utf-8")
+            commit_all(repo, "main work")
+            subprocess.run(["git", "-C", str(repo), *IDENT, "merge", "-q", "--no-ff", "-m", merge_message, "side"],
+                           check=True)
+            return git(repo, "rev-parse", "HEAD").decode().strip()
+        return build
+
+    def stacked(older_message, newer_message):
+        def build(repo, fork_sha):
+            reword(repo)
+            commit_all(repo, older_message)
+            (repo / "docs").mkdir(parents=True, exist_ok=True)
+            (repo / "docs" / "follow-up.md").write_text("x\n", encoding="utf-8")
+            return commit_all(repo, newer_message)
+        return build
+
+    ANYWHERE = {"onsidebranch": "on a merged side-branch commit", "onmerge": "only on the merge commit",
+                "onolder": "on an older commit followed by a plain one", "onnewest": "on the newest commit after a plain one"}
+    approval = "\n\nRule-Change-Approved-By: Justin"
+    approved_range("onsidebranch", merged("side work" + approval, "Merge side"))
+    approved_range("onmerge", merged("side work", "Merge side" + approval))
+    approved_range("onolder", stacked("older work" + approval, "plain follow-up"))
+    approved_range("onnewest", stacked("plain first", "newest work" + approval))
 
     # #5180: the COUNT CHANGED branch uses the same dynamic fence as the rule branch; no other census diff carries
     # a backtick run, so a static fence there was never caught.
