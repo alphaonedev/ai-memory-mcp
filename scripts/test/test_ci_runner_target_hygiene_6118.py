@@ -4086,6 +4086,23 @@ class PruneScript6118(unittest.TestCase):
                     self.assertTrue(notices[0].endswith(" warnings=0"), notices[0])
                     self.assertIn("mode=%s " % ("dry-run" if dry else "pruned"), notices[0])
 
+    # ---- #6529: a --profile holding a backslash is refused ----
+
+    def test_6118_r7_6529_profile_with_a_backslash_is_refused(self) -> None:
+        for profile in ("a\\b", "..\\x"):
+            with self.subTest(profile=profile):
+                # A real-looking profile dir (cargo lock + a test binary), so only the
+                # one-path-component rule can stop the prune.
+                bait = self.target / profile / "deps" / "ai_memory-0a1b"
+                _write(bait, 170000, True)
+                _write(self.target / profile / ".cargo-lock", 0, False)
+                before = self._snapshot(Path(self.scratch.name))
+                proc = self._run("--target-dir", str(self.target), "--profile", profile)
+                self.assertEqual(2, proc.returncode, proc.stdout + proc.stderr)
+                self.assertIn("refusing: --profile must be one path component", proc.stderr)
+                self.assertTrue(bait.is_file())
+                self.assertEqual(before, self._snapshot(Path(self.scratch.name)))
+
 EXAMPLE_HASHED = "debug/examples/demo-0123456789abcdef"
 EXAMPLE_UPLIFT = "debug/examples/demo"
 # Bytes the default scope frees from examples/ (the uplift pair once, two .d)
