@@ -3908,6 +3908,9 @@ WORKFLOW_PERMISSIONS = {"contents": "read"}
 APPROVAL_EVALUATE_ENV = {"GH_TOKEN": "${{ github.token }}", "OPERATOR_LOGIN": APPROVAL_OPERATOR}
 APPROVAL_STEP_KEYS = [["uses", "with"], ["name", "run"], ["name", "env", "run"]]
 APPROVAL_JOB_KEYS = ["name", "runs-on", "timeout-minutes", "permissions", "steps"]
+# #6629: the checkout that supplies the evaluator takes exactly this `with:` mapping (no ref,
+# repository, path or token: each would judge with code from another commit or repository).
+APPROVAL_CHECKOUT_WITH = {"persist-credentials": "false"}
 
 
 def _row_scalar(body: str) -> str:
@@ -3945,7 +3948,7 @@ def _approval_job_shape(c8: str) -> Dict[str, object]:
                 permissions["<nested>"] = body
         elif section == "steps":
             if indent == 6 and body.startswith("- "):
-                step = {"keys": [key], "env": {}}
+                step = {"keys": [key], "env": {}, "with": {}}
                 steps.append(step)
                 sub = key
             elif indent == 8 and step is not None:
@@ -3953,6 +3956,9 @@ def _approval_job_shape(c8: str) -> Dict[str, object]:
                 sub = key
             elif indent == 10 and step is not None and sub == "env":
                 step["env"][key] = _row_scalar(body)  # type: ignore[index]
+            elif indent >= 10 and step is not None and sub == "with":
+                # #6629: anything deeper than one child row is recorded as a refusal.
+                step["with"][key if indent == 10 else "<nested>"] = _row_scalar(body)  # type: ignore[index]
     top_keys: List[str] = []
     top_permissions: Dict[str, str] = {}
     shape["top_permissions_row"] = None
@@ -4018,6 +4024,9 @@ def _approval_job_problems(c8: str) -> List[str]:
     step_keys = [step["keys"] for step in shape["steps"]]  # type: ignore[union-attr,index]
     if step_keys != APPROVAL_STEP_KEYS:
         problems.append(f"approval step keys are {step_keys!r}, not exactly {APPROVAL_STEP_KEYS!r}")
+    withs = [step["with"] for step in shape["steps"] if "with" in step["keys"]]  # type: ignore[union-attr,index,operator]
+    if withs != [APPROVAL_CHECKOUT_WITH]:
+        problems.append(f"step with mappings are {withs!r}, not exactly [{APPROVAL_CHECKOUT_WITH!r}]")
     for where, keys in (("job", shape["job_keys"]), ("workflow", shape["top_keys"])):
         if "defaults" in keys:  # type: ignore[operator]
             problems.append(f"the {where} declares `defaults:`; an approval step's shell may not be overridden")
