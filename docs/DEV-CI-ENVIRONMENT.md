@@ -211,8 +211,9 @@ before `CREATE EXTENSION`:
   appears ahead of its module. Each file goes through a per-process `mkstemp`
   temp file, `fsync` and an atomic `os.replace`, so the three macos-fed runner
   instances can restore concurrently. On a write error the temp file is removed;
-  if another runner has meanwhile made AGE healthy the run passes, otherwise the
-  files this run created are removed and it exits 1.
+  if another runner has meanwhile made AGE healthy the run passes, otherwise it
+  exits 1. Files already written stay in place: each carries its pinned bytes,
+  and removing one could undo a restore another runner has already verified.
 - **Secrets.** The tier password goes to psql through `PGPASSWORD`; the URL on
   psql's argv carries no password, and neither form is printed. A URL carrying
   `sslpassword` (the client-key passphrase, which libpq cannot take from the
