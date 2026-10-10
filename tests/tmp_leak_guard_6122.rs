@@ -85,33 +85,39 @@ fn side_files_names_cover_wal_shm_journal_6122() {
     );
 }
 
-/// Every `tests/**/*.rs` source (recursive: the `curator` and `forensic`
+/// Every `*.rs` source under `root` (recursive: the `curator` and `forensic`
 /// binaries compile `tests/curator/*.rs` / `tests/forensic/*.rs` through
 /// `#[path]`), minus the helper that owns the raw handle and this guard.
-fn suite_sources() -> Vec<(String, String)> {
-    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("read tests dir") {
-            let path = entry.expect("dir entry").path();
+fn suite_sources_in(root: &std::path::Path) -> Result<Vec<(String, String)>, String> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
+        let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        for entry in entries {
+            let path = entry.map_err(|e| format!("{}: {e}", dir.display()))?.path();
             if path.is_dir() {
-                walk(&path, out);
+                walk(&path, out)?;
             } else if path.extension().is_some_and(|e| e == "rs") {
                 out.push(path);
             }
         }
+        Ok(())
     }
     let mut paths = Vec::new();
-    walk(std::path::Path::new("tests"), &mut paths);
+    walk(root, &mut paths)?;
     let mut sources = Vec::new();
     for path in paths {
         let name = path.to_string_lossy().replace('\\', "/");
         if name == "tests/tmp_leak_guard_6122.rs" || name == "tests/common/sqlite_tempfile.rs" {
             continue;
         }
-        let src = std::fs::read_to_string(&path).expect("read suite");
+        let src = std::fs::read_to_string(&path).map_err(|e| format!("{name}: {e}"))?;
         sources.push((name, src));
     }
     sources.sort();
-    sources
+    Ok(sources)
+}
+
+fn suite_sources() -> Vec<(String, String)> {
+    suite_sources_in(std::path::Path::new("tests")).unwrap_or_else(|e| panic!("#6806: {e}"))
 }
 
 /// Source-text classifiers used by the ceilings (#6788). Each one is a pure
@@ -735,4 +741,86 @@ fn sqlite_tempfile_is_private_random_and_in_temp_dir_6805() {
         assert_eq!(mode(side), 0o600, "#6805: {} mode", side.display());
     }
     drop(conn);
+}
+
+/// A scratch tree with `a.rs` and `sub/b.rs`.
+fn scan_tree(tag: &str) -> tempfile::TempDir {
+    let dir = scratch_dir(tag);
+    std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").expect("write a.rs");
+    std::fs::create_dir(dir.path().join("sub")).expect("mkdir sub");
+    std::fs::write(dir.path().join("sub/b.rs"), "fn b() {}\n").expect("write b.rs");
+    dir
+}
+
+/// #6806: a clean tree scans every file exactly once.
+#[test]
+fn scan_reads_each_file_once_6806() {
+    let dir = scan_tree("scan-clean");
+    let sources = suite_sources_in(dir.path()).expect("clean tree scans");
+    assert_eq!(sources.len(), 2, "#6806: {sources:?}");
+}
+
+/// #6806: a symlinked directory (a loop here) is not followed. The scan fails
+/// closed with ONE named path, not with phantom duplicates of the tree.
+#[cfg(unix)]
+#[test]
+fn scan_rejects_symlinked_directory_with_one_named_path_6806() {
+    let dir = scan_tree("scan-cycle");
+    std::os::unix::fs::symlink(".", dir.path().join("loop")).expect("symlink loop");
+    let err = suite_sources_in(dir.path()).expect_err("#6806: a symlinked dir must fail the scan");
+    assert!(
+        err.contains("loop"),
+        "#6806: the error must name the link: {err}"
+    );
+    assert_eq!(
+        err.matches("loop").count(),
+        1,
+        "#6806: exactly one path is named, no phantom paths: {err}"
+    );
+}
+
+/// #6806: a symlink to a directory OUTSIDE the tree is not followed either.
+#[cfg(unix)]
+#[test]
+fn scan_rejects_symlink_to_outside_tree_6806() {
+    let outside = scan_tree("scan-elsewhere");
+    let dir = scan_tree("scan-esc");
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("outlink")).expect("symlink out");
+    let err = suite_sources_in(dir.path()).expect_err("#6806: an outside link must fail the scan");
+    assert!(
+        err.contains("outlink"),
+        "#6806: the error must name the link: {err}"
+    );
+}
+
+/// #6806: a symlinked FILE is rejected too (its target is never read).
+#[cfg(unix)]
+#[test]
+fn scan_rejects_symlinked_file_6806() {
+    let dir = scan_tree("scan-file-link");
+    std::os::unix::fs::symlink("a.rs", dir.path().join("alias.rs")).expect("symlink file");
+    let err = suite_sources_in(dir.path()).expect_err("#6806: a symlinked file must fail the scan");
+    assert!(
+        err.contains("alias.rs"),
+        "#6806: the error must name the link: {err}"
+    );
+}
+
+/// #6806: a source that cannot be read as UTF-8 fails the scan with its path.
+#[test]
+fn scan_reports_non_utf8_source_with_its_path_6806() {
+    let dir = scan_tree("scan-nonutf8");
+    std::fs::write(dir.path().join("bad.rs"), [0xff_u8, 0xfe, 0x00]).expect("write bad.rs");
+    let err = suite_sources_in(dir.path()).expect_err("#6806: non-UTF-8 must fail the scan");
+    assert!(
+        err.contains("bad.rs"),
+        "#6806: the error must name the file: {err}"
+    );
+}
+
+/// #6806: the real `tests/` tree contains no symlink and scans cleanly.
+#[test]
+fn tests_tree_scans_cleanly_6806() {
+    let sources = suite_sources_in(std::path::Path::new("tests")).expect("tests/ scans");
+    assert!(!sources.is_empty(), "#6806: tests/ scan found no sources");
 }
