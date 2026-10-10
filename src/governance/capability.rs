@@ -2253,15 +2253,15 @@ mod tests {
     fn token_debug_redacts_bearer_bytes() {
         let (tok, _, _, _) = mint_fixture(vec![Caveat::ExpiresAt(9_999_999_999)]);
         let rendered = format!("{tok:?}");
-        assert!(rendered.contains("<redacted>"), "got: {rendered}");
+        assert!(
+            rendered.contains("<redacted>"),
+            "token Debug rendering must carry the <redacted> marker"
+        );
         assert!(
             !rendered.contains("root_sig: ["),
-            "root_sig bytes must never render: {rendered}"
+            "root_sig bytes must never render"
         );
-        assert!(
-            !rendered.contains("tag: ["),
-            "tag bytes must never render: {rendered}"
-        );
+        assert!(!rendered.contains("tag: ["), "tag bytes must never render");
     }
 
     #[test]
