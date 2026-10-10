@@ -39,6 +39,8 @@ mod dns_guard_4075_tests;
 #[cfg(test)]
 mod dns_guard_4165_tests;
 #[cfg(test)]
+mod webhook_pin_6860_tests;
+#[cfg(test)]
 mod webhook_proxy_6372_tests;
 #[cfg(test)]
 mod webhook_tls_default_port_6401_tests;
@@ -1717,36 +1719,13 @@ fn send(
             return Err(e.dlq_reason().to_string());
         }
     };
-    // v0.7.0 SR-W3 (HIGH) — redirect SSRF-pin bypass. The
-    // `builder.resolve(host, addr)` pins below shadow reqwest's DNS
-    // for the *validated* host only. reqwest's default redirect
-    // policy follows up to 10 hops and re-resolves DNS for the new
-    // Location host — a host whose addresses were never SSRF-validated
-    // — so a webhook endpoint that returns `302 Location:
-    // http://169.254.169.254/...` would let reqwest connect to an
-    // internal address the guard never cleared. Disabling redirects
-    // closes that window: a 3xx is surfaced as a non-success status
-    // (`http-{status}` below) and fails the dispatch safely, exactly
-    // like any other non-2xx.
-    // #6372 — never honour HTTP(S)_PROXY / ALL_PROXY: a proxy resolves the
-    // host itself and would receive the signed body, bypassing the
-    // guard-validated DNS pins below (per ERRORS-19, fail closed).
-    let mut builder = reqwest::blocking::Client::builder()
-        .timeout(ACK_TIMEOUT)
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none());
-    // v1.0.0 #3705 — a receiver behind a private PKI: the operator-installed
-    // root (`[subscriptions] ca_cert`) is trusted in addition to the public
-    // roots. Never a peer's certificate by inference; always an explicit act.
-    if let Some(ca) = dispatch_root_certificate() {
-        builder = builder.add_root_certificate(ca);
-    }
-    for addr in &validated_addrs {
-        // Pin reqwest's per-host override. The override SHADOWS
-        // reqwest's own DNS query for this host on this client,
-        // closing the rebind window.
-        builder = builder.resolve(&resolved_host, *addr);
-    }
+    // v0.7.0 SR-W3 (HIGH) — redirect SSRF-pin bypass: the pins shadow
+    // reqwest's DNS for the *validated* host only, and a followed redirect
+    // would re-resolve an unvalidated Location host, so redirects are
+    // disabled (a 3xx fails the dispatch as `http-{status}`). #6372 — no
+    // system proxy either. #6860 — all of it, plus the DNS pin, is built by
+    // `webhook_url::pinned_client_builder`, which a unit cell exercises.
+    let builder = webhook_url::pinned_client_builder(&resolved_host, &validated_addrs);
     // v0.7.0 #1073 + #1082 (SR-3 perf + SR-2 SSRF) — the SSRF
     // hardening at #1082 requires per-call per-host DNS pinning via
     // `builder.resolve(host, addr)`; that pin lives on the client

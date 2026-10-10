@@ -85,3 +85,33 @@ impl ParsedWebhookUrl {
         &self.url
     }
 }
+
+/// #6860 — the dispatch client builder, factored out of `send()` so a unit
+/// cell can prove the DNS-rebind pin (#1082) is applied and keyed on the host
+/// the client will look up ([`ParsedWebhookUrl::host`]). No system proxy
+/// (#6372), no redirects (SR-W3), the operator CA (#3705), and one
+/// `resolve(host, addr)` override per guard-validated address.
+pub(crate) fn pinned_client_builder(
+    host: &str,
+    addrs: &[std::net::SocketAddr],
+) -> reqwest::blocking::ClientBuilder {
+    // #6372 — never honour HTTP(S)_PROXY / ALL_PROXY: a proxy resolves the
+    // host itself and would receive the signed body, bypassing the pins below
+    // (per ERRORS-19, fail closed).
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(super::ACK_TIMEOUT)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none());
+    // v1.0.0 #3705 — a receiver behind a private PKI: the operator-installed
+    // root (`[subscriptions] ca_cert`) is trusted in addition to the public
+    // roots. Never a peer's certificate by inference; always an explicit act.
+    if let Some(ca) = super::dispatch_root_certificate() {
+        builder = builder.add_root_certificate(ca);
+    }
+    for addr in addrs {
+        // The override SHADOWS reqwest's own DNS query for this host on this
+        // client, closing the rebind window (#1082).
+        builder = builder.resolve(host, *addr);
+    }
+    builder
+}
