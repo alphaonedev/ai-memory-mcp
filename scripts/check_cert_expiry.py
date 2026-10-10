@@ -874,27 +874,28 @@ os.execv(real, [real] + argv)
 
 
 GIT_SHIM_PROBE_ARG = "--gitshim-probe"
-GIT_SHIM_PROBE_MARKER = "gitshim-probe-ok"
 
 
 GIT_SHIM_PROBE_TIMEOUT = 60
 
 
-def _require_shim_reachable(path, timeout=GIT_SHIM_PROBE_TIMEOUT):
-    """Positive probe (#6379): `git` looked up on `path` must be the shim,
-    which answers GIT_SHIM_PROBE_ARG with GIT_SHIM_PROBE_MARKER. Any cause that
-    makes the shim unreachable (not executable, an exec-refusing mount, a split
-    PATH entry) lets lookup fall through to the real git; refuse by name so the
-    cells never blame the gate for it. Output is decoded with errors="replace"
-    so a git that writes non-UTF-8 bytes is a named refusal, never a crash
-    (#6428)."""
+def _require_shim_reachable(path, marker, timeout=GIT_SHIM_PROBE_TIMEOUT):
+    """Positive probe (#6379): `git` looked up on `path` must be the shim, which
+    answers GIT_SHIM_PROBE_ARG with this run's `marker` (a per-run random nonce,
+    #6567/#6562) and nothing else. The answer is compared exactly (`marker` plus
+    one newline) on stdout only, so a decoy git that echoes a constant, pads or
+    affixes the marker, or writes it to stderr is refused. Any cause that makes
+    the shim unreachable (not executable, an exec-refusing mount, a split PATH
+    entry) lets lookup fall through to the real git; refuse by name so the cells
+    never blame the gate for it. Output is decoded with errors="replace" so a
+    git that writes non-UTF-8 bytes is a named refusal, never a crash (#6428)."""
     try:
-        proc = subprocess.run(["git", GIT_SHIM_PROBE_ARG], capture_output=True, text=True,
-                              errors="replace", env=dict(os.environ, PATH=path),
-                              timeout=timeout, check=False)
+        proc = subprocess.run(["git", GIT_SHIM_PROBE_ARG], capture_output=True,
+                              env=dict(os.environ, PATH=path), timeout=timeout, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
         raise GateError(f"the git shim is not the git on PATH (probe failed: {exc})") from exc
-    if proc.returncode != 0 or proc.stdout.strip() != GIT_SHIM_PROBE_MARKER:
+    answer = proc.stdout.decode("utf-8", errors="replace")
+    if proc.returncode != 0 or answer != marker + "\n":
         raise GateError("the git shim is not the git on PATH (the probe "
                         f"{GIT_SHIM_PROBE_ARG!r} did not reach the shim; check that the "
                         "scratch directory allows executing files)")
@@ -910,6 +911,7 @@ def run_gate_shimmed(tmp, repo, env, version="", fail=""):
     if real is None:
         raise GateError("git is not on PATH")
     shim_dir = Path(tempfile.mkdtemp(prefix="gitshim.", dir=str(tmp)))
+    marker = secrets.token_hex(16)
     saved = os.environ.get("PATH")
     try:
         if os.pathsep in str(shim_dir):
@@ -920,10 +922,10 @@ def run_gate_shimmed(tmp, repo, env, version="", fail=""):
         shim = shim_dir / "git"
         shim.write_text(GIT_SHIM.format(python=sys.executable, real=real, version=version,
                                         fail=fail, probe=GIT_SHIM_PROBE_ARG,
-                                        marker=GIT_SHIM_PROBE_MARKER), encoding="utf-8")
+                                        marker=marker), encoding="utf-8")
         shim.chmod(0o755)
         shim_path = f"{shim_dir}{os.pathsep}{saved or ''}"
-        _require_shim_reachable(shim_path)
+        _require_shim_reachable(shim_path, marker)
         os.environ["PATH"] = shim_path
         return run_gate(repo, dict(env, PATH=os.environ["PATH"]))
     finally:
@@ -1651,7 +1653,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     # #6379: a probe that cannot even start (no git on the probed PATH) is a
     # refusal by name, not a silent pass.
     try:
-        _require_shim_reachable(str(tmp / "no-such-dir"))
+        _require_shim_reachable(str(tmp / "no-such-dir"), "unused")
     except GateError as exc:
         if "probe failed" not in str(exc):
             t.fail(f"(shim-probe-oserror): refused for the wrong reason: {exc}")
@@ -1684,7 +1686,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                             "sys.stdout.buffer.write(bytes([0xff, 0xfe, 10]))\n", encoding="utf-8")
             fake.chmod(0o755)
             try:
-                _require_shim_reachable(str(fake_dir))
+                _require_shim_reachable(str(fake_dir), "unused")
             except GateError as exc:
                 if "is not the git on PATH" not in str(exc):
                     t.fail(f"(shim-probe-decode): refused for the wrong reason: {exc}")
@@ -1699,7 +1701,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                                encoding="utf-8")
             sleeper.chmod(0o755)
             try:
-                _require_shim_reachable(str(fake_dir), timeout=1)
+                _require_shim_reachable(str(fake_dir), "unused", timeout=1)
             except GateError as exc:
                 if "probe failed" not in str(exc):
                     t.fail(f"(shim-probe-timeout): refused for the wrong reason: {exc}")
@@ -1715,14 +1717,14 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     if os.pathsep not in str(tmp):
         for stub_label, body in (
                 ("exit0-no-marker", "pass"),
-                ("marker-exit1", f"print({GIT_SHIM_PROBE_MARKER!r})\nsys.exit(1)")):
+                ("marker-exit1", "print('probe-nonce')\nsys.exit(1)")):
             stub_dir = Path(tempfile.mkdtemp(prefix="stubgit.", dir=str(tmp)))
             try:
                 stub = stub_dir / "git"
                 stub.write_text(f"#!{sys.executable}\nimport sys\n{body}\n", encoding="utf-8")
                 stub.chmod(0o755)
                 try:
-                    _require_shim_reachable(str(stub_dir))
+                    _require_shim_reachable(str(stub_dir), "probe-nonce")
                 except GateError as exc:
                     if "is not the git on PATH" not in str(exc):
                         t.fail(f"(shim-probe-half): {stub_label} refused for the wrong reason: {exc}")
@@ -1769,6 +1771,23 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                                "treated as the shim")
             finally:
                 shutil.rmtree(stub_dir, ignore_errors=True)
+        # The nonce is drawn per run_gate_shimmed call: two calls must hand the probe
+        # two distinct 32-hex-digit markers (a module constant would repeat).
+        seen_markers = []
+        real_probe = _require_shim_reachable
+
+        def spy_probe(path, marker, timeout=GIT_SHIM_PROBE_TIMEOUT):
+            seen_markers.append(marker)
+            return real_probe(path, marker, timeout)
+
+        with unittest.mock.patch.object(sys.modules[__name__], "_require_shim_reachable",
+                                        side_effect=spy_probe):
+            for _ in range(2):
+                run_gate_shimmed(tmp, repo, env7, version="git version 2.29.9")
+        if (len(seen_markers) != 2 or seen_markers[0] == seen_markers[1]
+                or not all(re.fullmatch("[0-9a-f]{32}", m) for m in seen_markers)):
+            t.fail(f"(shim-probe-exact): the probe marker is not a fresh 32-hex nonce per "
+                   f"run: {seen_markers!r}")
     # #6381: the shim PATH entry is process-global; every shim cell above, on its
     # success path (shim-control), its gate-verdict paths (gitver, anc-error) and
     # its refusal paths (shim-pathsep, shim-unreach), must leave PATH as found.
@@ -1948,6 +1967,9 @@ SELF_TEST_OK = (
     "(shim-probe-timeout) a probe past its timeout refused by name; "
     "(shim-probe-half, #6448) a git that exits 0 without the marker and a git that prints "
     "the marker but exits 1 are each refused; "
+    "(shim-probe-exact, #6567/#6562) the probe answer is a per-run nonce compared exactly on "
+    "stdout, so an affixed, split, whitespace-padded, stderr-only, wrong-nonce or "
+    "blank-line-padded answer is refused; "
     "(shim-pathsep-clean, #6428) a refused separator path leaves no shim directory; "
     "(attr, attr-gate, #6174) an identifier add hidden behind head-supplied attributes "
     "marking src/** binary RED in check_change and end to end on pull_request; "
