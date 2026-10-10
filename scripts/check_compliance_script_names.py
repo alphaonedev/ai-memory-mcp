@@ -1419,11 +1419,18 @@ R12_TIMED = (
     ("I-loose-ceiling", 0, None, "check\u00e9" * 10922),
 )
 R12_TIME_BOUND = 30
+# #6756: a document of ceiling-length path-like lines and one with many name fragments per line are
+# scanned in time linear in their size (each was seconds per line before).
+R13_TIMED = (
+    ("long16", 1, "`x/check-a.sh` " + NOT_FOUND, "Intro.\n\n" + "\n".join(["x/" + "check-a.sh/" * 5900] * 16)),
+    ("frag100", 1, "is followed by '('", "Intro.\n\n" + "\n".join(["c( " * 1000] * 100)),
+)
+R13_TIME_BOUND = 10
 
 
-def r12_timed_cells(base, expect):
-    """Run each R12_TIMED line in a fresh tree in a child process that must exit within R12_TIME_BOUND seconds."""
-    for name, want, needle, line in R12_TIMED:
+def r12_timed_cells(base, expect, cells=R12_TIMED, bound=R12_TIME_BOUND, tag="R12"):
+    """Run each timed document in a fresh tree in a child process that must exit within ``bound`` seconds."""
+    for name, want, needle, line in cells:
         r = base / name
         (r / "scripts" / "qc-allowlists").mkdir(parents=True)
         (r / "docs" / "compliance").mkdir(parents=True)
@@ -1432,15 +1439,15 @@ def r12_timed_cells(base, expect):
         try:
             proc = subprocess.run(
                 [sys.executable, "-I", str(Path(__file__).resolve()), "--root", str(r)],
-                capture_output=True, text=True, timeout=R12_TIME_BOUND, check=False,
+                capture_output=True, text=True, timeout=bound, check=False,
             )
         except subprocess.TimeoutExpired:
-            expect(False, "R12-%s: no exit within %d s" % (name, R12_TIME_BOUND))
+            expect(False, "%s-%s: no exit within %d s" % (tag, name, bound))
             continue
         expect(
             proc.returncode == want and (needle is None or needle in proc.stderr) and "Traceback" not in proc.stderr,
-            "R12-%s: expected exit %d%s, got %r (stderr=%r)"
-            % (name, want, "" if needle is None else " naming %r" % needle, proc.returncode, proc.stderr[-300:]),
+            "%s-%s: expected exit %d%s, got %r (stderr=%r)"
+            % (tag, name, want, "" if needle is None else " naming %r" % needle, proc.returncode, proc.stderr[-300:]),
         )
 
 
@@ -1734,6 +1741,9 @@ def self_test():
         timed = root / "r12-timed"
         timed.mkdir()
         r12_timed_cells(timed, expect)
+        timed13 = root / "r13-timed"
+        timed13.mkdir()
+        r12_timed_cells(timed13, expect, R13_TIMED, R13_TIME_BOUND, "R13")
         cells13 = root / "r13"
         cells13.mkdir()
         r11_cells(cells13, R13_CELLS, expect, "R13")
