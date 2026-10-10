@@ -180,8 +180,11 @@ pub fn sqlite_clock(offset: i64) {
     ai_memory::config::set_append_only(true);
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("private sqlite");
     let rows = clock_rows();
+    let embedding = vec![1.0; EMBEDDING_DIM];
     for (memory, _) in &rows {
         ai_memory::storage::insert(&conn, memory).expect("seed clock row");
+        ai_memory::storage::set_embedding(&conn, &memory.id, &embedding, SPACE)
+            .expect("seed SQLite vector");
     }
     conn.execute(
         "INSERT INTO memory_links (source_id,target_id,relation,created_at,attest_level) VALUES ('clock-0','protected-long','related_to',?1,'unsigned')",
@@ -208,29 +211,34 @@ pub fn sqlite_clock(offset: i64) {
     )
     .expect("recall");
     assert_ids(results, &expected);
-    let (results, _) = ai_memory::storage::recall_hybrid(
-        &conn,
-        NEEDLE,
-        &[],
-        Some(NAMESPACE),
-        LIMIT,
-        None,
-        None,
-        None,
-        None,
-        0,
-        0,
-        None,
-        None,
-        &ai_memory::config::ResolvedScoring::default(),
-        false,
-        None,
-        Some(AGENT),
-        None,
-        None,
-    )
-    .expect("hybrid recall");
-    assert_ids(results, &expected);
+    for (query, vector, space) in [
+        (NEEDLE, &[][..], None),
+        ("nomatchingkeyword", embedding.as_slice(), Some(SPACE)),
+    ] {
+        let (results, _) = ai_memory::storage::recall_hybrid(
+            &conn,
+            query,
+            vector,
+            Some(NAMESPACE),
+            LIMIT,
+            None,
+            None,
+            None,
+            None,
+            0,
+            0,
+            None,
+            None,
+            &ai_memory::config::ResolvedScoring::default(),
+            false,
+            None,
+            Some(AGENT),
+            space,
+            None,
+        )
+        .expect("hybrid recall");
+        assert_ids(results, &expected);
+    }
     let removed = ai_memory::storage::gc(&conn, true).expect("gc");
     assert_eq!(removed, rows.len() - expected.len(), "actual GC count");
     for (memory, _) in &rows {
