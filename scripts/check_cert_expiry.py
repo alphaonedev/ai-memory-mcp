@@ -2964,6 +2964,28 @@ def _wrap_cells(t, fx, repo, base):
          {"src/lib.rs": '#!/x "\n#[cfg(any())] // "\npub mod wrapmod;\npub mod wrappc;\n'}),
         ("wrap-shebang-comment-then-inner", "#![cfg(any())]", "`#!`, a comment, then `[cfg(any())]` is an inner attribute",
          {"src/wrap_a.rs": "#! // c\n[cfg(any())]\n" + a_line}),
+        # #6840: a name a `use`, a glob or `extern crate self as` can rebind is not inert
+        ("wrap-adv-alias-test-as-serde", "#[serde]", "`use test as serde;` then #[serde] on the fn",
+         {"src/wrap_d.rs": "use test as serde;\n#[serde]\n" + d_text}),
+        ("wrap-adv-alias-test-as-async_trait", "#[async_trait]", "`use test as async_trait;` then #[async_trait]",
+         {"src/wrap_d.rs": "use test as async_trait;\n#[async_trait]\n" + d_text}),
+        ("wrap-adv-alias-test-as-schemars", "#[schemars]", "`use test as schemars;` then #[schemars]",
+         {"src/wrap_d.rs": "use test as schemars;\n#[schemars]\n" + d_text}),
+        ("wrap-adv-alias-mod-tokio-main", "#[tokio::main]", "a local `mod tokio` re-exporting test as main",
+         {"src/wrap_d.rs": "mod tokio {\n    pub use test as main;\n}\n#[tokio::main]\n" + d_text}),
+        ("wrap-adv-m02-alias-serde-cfg-arg", "#[serde(", "an aliased #[serde(..)] whose only cfg is inside a string",
+         {"src/wrap_d.rs": 'use test as serde;\n#[serde(rename = "cfg")]\n' + d_text}),
+        ("wrap-alias-derive", "#[derive]", "`use test as derive;` then #[derive] on the fn",
+         {"src/wrap_d.rs": "use test as derive;\n#[derive]\n" + d_text}),
+        ("wrap-glob-alias-serde", "#[serde]", "a glob import of a module that re-exports test as serde",
+         {"src/wrap_d.rs": "mod m {\n    pub use test as serde;\n}\nuse m::*;\n#[serde]\n" + d_text}),
+        ("wrap-alias-braced-schemars", "#[schemars]", "a braced `use m::{t as schemars};`",
+         {"src/wrap_d.rs": "mod m {\n    pub use test as t;\n}\nuse m::{t as schemars};\n#[schemars]\n" + d_text}),
+        ("wrap-tool-clippy-mod", "#[clippy::skip]", "a local `mod clippy` makes #[clippy::skip] a path to test",
+         {"src/wrap_d.rs": "mod clippy {\n    pub use test as skip;\n}\n#[clippy::skip]\n" + d_text}),
+        ("wrap-tool-rustfmt-crate-self", "#[rustfmt::t]", "`extern crate self as rustfmt;` makes #[rustfmt::t] a crate path",
+         {"src/lib.rs": files["src/lib.rs"] + "extern crate self as rustfmt;\npub use test as t;\n",
+          "src/wrap_d.rs": "#[rustfmt::t]\n" + d_text}),
     ]
     for label, reason, desc, edits in reds:
         fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
@@ -3075,6 +3097,10 @@ def _wrap_cells(t, fx, repo, base):
          {"src/wrap_a.rs": "#!/usr/bin/env run-cargo-script\n" + a_line}),
         ("wrap-ctl-shebang-quote", "a shebang line ending in a quote is stripped, not an open string",
          {"src/wrap_a.rs": '#!/x "\n' + a_line}),
+        ("wrap-ctl-attr-string-cfg", "`cfg` only inside the string of an inert attribute",
+         {"src/wrap_d.rs": '#[deprecated(note = "cfg")]\n#[doc = "cfg_attr"]\n' + d_text}),
+        ("wrap-ctl-serde-path-import", "`use serde::X;` does not rebind serde, so #[serde(..)] stays inert",
+         {"src/wrap_d.rs": 'use serde::Serialize;\n#[serde(rename = "k")]\n' + d_text}),
     ]
     for label, desc, edits in controls:
         fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
@@ -3252,6 +3278,7 @@ SELF_TEST_OK = (
     "U+200E or U+200F between `#`, `!` and `[` keeps the attribute, and (wrap-ws-outer-u0009, wrap-ws-inner-u0009, wrap-ws-outer-u000a, wrap-ws-inner-u000a, wrap-ws-outer-u000b, wrap-ws-inner-u000b, wrap-ws-outer-u000c, wrap-ws-inner-u000c, wrap-ws-outer-u000d, wrap-ws-inner-u000d, wrap-ws-outer-u0020, wrap-ws-inner-u0020, wrap-ws-outer-u0085, wrap-ws-inner-u0085, wrap-ws-outer-u200e, wrap-ws-inner-u200e, wrap-ws-outer-u200f, wrap-ws-inner-u200f, wrap-ws-outer-u2028, wrap-ws-inner-u2028, wrap-ws-outer-u2029, wrap-ws-inner-u2029) every Rust "
     "Pattern_White_Space code point there is RED; "
     "(wrap-adv-shebang-string, wrap-adv-shebang-block, wrap-bom-shebang, wrap-shebang-root-decl, wrap-shebang-comment-then-inner, each with -gate, #6839) a first line rustc strips as a shebang (after an optional BOM, in any file) cannot hide the attribute below it, and `#!`, a comment, then `[` stays an inner attribute; (wrap-ctl-shebang, wrap-ctl-shebang-quote) a shebang line, one ending in a quote included, is GREEN; "
+    "(wrap-adv-alias-test-as-serde, wrap-adv-alias-test-as-async_trait, wrap-adv-alias-test-as-schemars, wrap-adv-alias-mod-tokio-main, wrap-adv-m02-alias-serde-cfg-arg, wrap-alias-derive, wrap-glob-alias-serde, wrap-alias-braced-schemars, wrap-tool-clippy-mod, wrap-tool-rustfmt-crate-self, each with -gate, #6840) an attribute name a `use`, a glob, a local `mod` or `extern crate self as` can rebind is a finding, and only names rustc refuses to rebind are inert; (wrap-ctl-attr-string-cfg, wrap-ctl-serde-path-import) `cfg` inside the string of an inert attribute and `use serde::X;` are GREEN; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
