@@ -37,8 +37,10 @@ class Unparsed(Exception):
 
 
 # #6681: a refusal or problem reprints at most ECHO_LIMIT characters of a workflow row or value, with
-# every GitHub-token-shaped string masked and the literal value of a credential-named key withheld
-# (an expression such as ``${{ github.token }}`` is kept: it names a source, it is not a value).
+# every GitHub-token-shaped string masked and the literal value of a credential-named key withheld.
+# #6735 #6738: a credential value is withheld to the end of its row, whatever characters it holds (``,``
+# ``#`` ``]`` ``}`` and quotes are all part of it); only a value that is exactly one ``${{ ... }}``
+# expression with no quote inside is kept, because such a value names a source and is not a literal.
 ECHO_LIMIT = 120
 # #6736 #6737: no word boundary, so a token glued after a letter, digit, ``_`` or ``%3A`` is masked too.
 _TOKEN_SHAPE = re.compile(r"(gh[pousr]_|github_pat_)[A-Za-z0-9_]{8,}")
@@ -49,8 +51,14 @@ _PAIR_KEY = re.compile(r"(?<![\w.-])([\w.-]+)['\"]?[ \t]*[:=][ \t]*")
 _CREDENTIAL_WORD = re.compile(
     r"token|secret|pass|pwd|credential|api[_-]?key|private[_-]?key|access[_-]?key|auth|bearer|session|cookie|signing",
     re.IGNORECASE)
-_PAIR_VALUE = re.compile(r"[^\s,\]}#][^,\]}#]*")
-_KEPT_VALUES = ("${{", "'${{", '"${{', "<withheld ")
+_PAIR_VALUE = re.compile(r"[^\n]+")
+_EXPRESSION_VALUE = re.compile(r"""['"]?\$\{\{[^'"{}\n]*\}\}['"]*[ \t]*(?=\n|\Z)""")
+_WITHHELD = "<withheld "
+
+
+def is_credential_key(name: str) -> bool:
+    """True when ``name`` is credential-named, so the value under it is withheld (#6735, #6739)."""
+    return _CREDENTIAL_WORD.search(name) is not None
 
 
 def mask(text: str) -> str:
@@ -58,9 +66,9 @@ def mask(text: str) -> str:
     out: List[str] = []
     pos = 0
     for key in _PAIR_KEY.finditer(text):
-        if key.start() < pos or not _CREDENTIAL_WORD.search(key.group(1)):
+        if key.start() < pos or not is_credential_key(key.group(1)):
             continue
-        if any(text.startswith(kept, key.end()) for kept in _KEPT_VALUES):
+        if text.startswith(_WITHHELD, key.end()) or _EXPRESSION_VALUE.match(text, key.end()):
             continue
         val = _PAIR_VALUE.match(text, key.end())
         if val is None:
@@ -827,41 +835,55 @@ def read_map(node: Node, spec: Dict[str, Tuple[str, ...]]) -> Dict[str, Node]:
     return out
 
 
-def _flow_strings(obj) -> List[str]:
-    """Every key and scalar string of a parsed flow collection, depth first."""
-    out: List[str] = []
-    todo = [obj]
+def _flow_strings(obj, owner: str = "") -> List[Tuple[str, str]]:
+    """(owning key, string) for every key and scalar of a parsed flow collection, depth first (#6735).
+
+    The owner of a scalar is the key it is the value of (the enclosing ``owner`` for a sequence item);
+    a key has the owner ``""``."""
+    out: List[Tuple[str, str]] = []
+    todo = [(obj, owner)]
     while todo:
-        item = todo.pop()
+        item, own = todo.pop()
         if isinstance(item, str):
-            out.append(str(item))
+            out.append((own, str(item)))
         elif isinstance(item, dict):
             for k, v in item.items():
-                out.append(str(k))
-                todo.append(v)
+                out.append(("", str(k)))
+                todo.append((v, str(k)))
         else:
-            todo.extend(item)
+            todo.extend((sub, own) for sub in item)
     return out
 
 
-def strings(node: Node) -> List[Tuple[int, str]]:
-    """(line, text) for every parsed string a node and its descendants hold, in document order.
+def owned_strings(node: Node) -> List[Tuple[int, str, str]]:
+    """(line, owning key, text) for every parsed string a node and its descendants hold, in document order.
 
-    A key contributes ``name:``; a scalar its parsed text; a flow collection every key and scalar;
-    a block scalar each content line whole (a ``#`` there is text).  Comments are never included
-    and quoting never shifts what is read (#6617).
+    A key contributes ``name:`` (owner ``""``); a scalar its parsed text; a flow collection every key and
+    scalar; a block scalar each content line whole (a ``#`` there is text).  Comments are never included
+    and quoting never shifts what is read (#6617).  The owner of a value is the key it sits under, so a
+    caller that echoes the value can pass the key to ``mask`` (#6735).
     """
-    out: List[Tuple[int, str]] = []
+    out: List[Tuple[int, str, str]] = []
+    owner_of = {id(node): ""}
     for sub in node.walk():
+        own = owner_of.get(id(sub), "")
         if sub.kind == "key":
-            out.append((sub.line, key_name(sub.name) + ":"))
+            out.append((sub.line, "", key_name(sub.name) + ":"))
+            own = key_name(sub.name)
+        for child in sub.children:
+            owner_of[id(child)] = own
         if sub.kind == "root":
             continue
         got = shape(sub)
         if got in SCALAR:
-            out.append((sub.line, _unquote(sub.value)))
+            out.append((sub.line, own, _unquote(sub.value)))
         elif got in (FLOW_SEQ, FLOW_MAP):
-            out.extend((sub.line, s) for s in _flow_strings(_flow(sub.value, 0)[1]))
+            out.extend((sub.line, o, s) for o, s in _flow_strings(_flow(sub.value, 0)[1], own))
         elif got == BLOCK_SCALAR:
-            out.extend(sub.block_lines)
+            out.extend((number, own, text) for number, text in sub.block_lines)
     return out
+
+
+def strings(node: Node) -> List[Tuple[int, str]]:
+    """(line, text) for every parsed string a node and its descendants hold (``owned_strings`` without the owner)."""
+    return [(number, text) for number, _owner, text in owned_strings(node)]

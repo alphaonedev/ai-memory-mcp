@@ -370,8 +370,13 @@ verifier fails otherwise), and the live carrier ruleset updated with the
   flow mapping, a scalar or an empty value is refused with its line, and the
   accessor never reads a key of such a node as absent (#6679). No job name
   may be an expression (#6618). A problem or refusal reprints at most 120
-  characters of a row, masks GitHub-token-shaped strings and withholds the
-  literal value of a credential-named key (#6681). The secret and token
+  characters of a row, masks GitHub-token-shaped strings (also when glued
+  after a letter, digit or `_`, #6736) and withholds the whole value of a
+  credential-named key (names containing token, secret, pass, pwd,
+  credential, api key, private key, access key, auth, bearer, session,
+  cookie or signing; #6681, #6739) to the end of its row, whatever
+  characters it holds; only a value that is exactly one `${{ ... }}`
+  expression without a quote is kept (#6735, #6738). The secret and token
   scan reads parsed scalars, keys, flow entries and block-scalar lines
   (#6617); `secrets` matches in any letter case. The two #6143 jobs have a
   closed shape: `name`, one plain `runs-on` label, a `timeout-minutes` of

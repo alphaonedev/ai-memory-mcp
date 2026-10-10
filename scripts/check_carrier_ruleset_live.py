@@ -621,12 +621,13 @@ def _scope_problems(label, node, is_job):
     The scan reads the parsed strings of the section (keys, scalars, flow entries, block-scalar
     lines) through the accessor, so a comment never hides text and a quote never shifts it."""
     problems = []
-    for number, text in SUBSET.strings(node):
+    for number, owner, text in SUBSET.owned_strings(node):
+        # #6735: a value under a credential-named key is echoed with its key, so mask() withholds it whole.
+        shown = SUBSET.clip((owner + ": " if SUBSET.is_credential_key(owner) else "") + text.strip())
         if SECRETS_REF.search(text):
-            problems.append(f"{label} references a repository secret (line {number}): {SUBSET.clip(text.strip())}")
+            problems.append(f"{label} references a repository secret (line {number}): {shown}")
         if is_job and NEEDS_REF.search(text):
-            problems.append(f"{label} reads a needs output or declares needs (line {number}):"
-                            f" {SUBSET.clip(text.strip())}")
+            problems.append(f"{label} reads a needs output or declares needs (line {number}): {shown}")
     for sub in node.walk():
         if sub.kind == "key" and SUBSET.key_name(sub.name).upper() in TOKEN_ENV_NAMES:
             got = SUBSET.value(sub, SUBSET.SCALAR)
