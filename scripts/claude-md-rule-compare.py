@@ -2368,6 +2368,29 @@ def _self_test_cases() -> int:
     masks("#6667 R5 N2 a scp-style address has no userinfo", "git@github.com:a/b", shown=("git@github.com:a/b",),
           count=0)
 
+    # #6163 round 5 (#6663, #6614): a YAML comment line between a bare credential name and its value passes the wait
+    # on, and a comment after the bare name or after a block indicator does not hide the name from the mask. The
+    # comment after a bare name is masked with the value (it cannot be told from a value that starts with `#`); the
+    # comment after a block indicator is shown.
+    masks("#6663 R5 A a comment line between a bare name and its value passes the wait on",
+          "api_key:\n# note6163\n  6163CanaryAValue\nafter-6163", hidden=("6163CanaryAValue",),
+          shown=("# note6163", "after-6163"), count=1)
+    masks("#6663 R5 E a trailing comment after a bare name does not hide the value on the next line",
+          "api_key: # note6163\n  6163CanaryEValue\nafter-6163", hidden=("6163CanaryEValue",),
+          shown=("after-6163", "api_key:"))
+    masks("#6663 R5 B a trailing comment after a block indicator keeps the block masked",
+          "secret: | # note6163\n  6163CanaryBValue\nnext: shown-6163", hidden=("6163CanaryBValue",),
+          shown=("secret: | # note6163", "next: shown-6163"), count=1)
+    masks("#6614 R5 a bare name with a comment and a following block comment: the value is masked",
+          "password: # rotated monthly\n  6163CanaryPwValue", hidden=("6163CanaryPwValue",))
+    diff_masks("#6663 R5 P a rotated value after a comment context line is masked on both sides",
+               "intro\napi_key:\n# note6163\n  6163OldCanaryPValue\nend",
+               "intro\napi_key:\n# note6163\n  6163NewCanaryPValue\nend",
+               hidden=("6163OldCanaryPValue", "6163NewCanaryPValue"), shown=(" # note6163", "-  [MASKED]",
+                                                                           "+  [MASKED]"), count=2)
+    masks("#6663 R5 a table row after a bare name still ends the wait", "api_key:\n| a | b |\n  6163shown", shown=(
+        "| a | b |", "6163shown"), count=0)
+
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
     fetch_root = base_dir / "pr-fetch"
