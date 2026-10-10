@@ -108,9 +108,7 @@ fn active_clock_7029() {
         tokio::runtime::Runtime::new()
             .expect("runtime")
             .block_on(async {
-                let (admin, name, store) = scenarios::pg::create().await;
-                scenarios::pg::clock(&store, expected).await;
-                scenarios::pg::cleanup(admin, name, store).await;
+                scenarios::pg::isolated_clock(expected).await;
             });
         return;
     }
@@ -182,7 +180,7 @@ fn active_postgres_7029() {
         return;
     }
     let (admin, name, store) = runtime.block_on(scenarios::pg::create());
-    let mut url = url::Url::parse(&std::env::var(PG_ENV).expect("PG URL")).expect("valid URL");
+    let mut url = reqwest::Url::parse(&std::env::var(PG_ENV).expect("PG URL")).expect("valid URL");
     url.set_path(&format!("/{name}"));
     let armed = crate::test_support::spawn_test_child(
         PG_TEST,

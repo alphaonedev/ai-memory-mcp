@@ -70,9 +70,7 @@ fn ordinary_clock_extrema_7106() {
         tokio::runtime::Runtime::new()
             .expect("runtime")
             .block_on(async {
-                let (admin, name, store) = scenarios::pg::create().await;
-                scenarios::pg::clock(&store, 0).await;
-                scenarios::pg::cleanup(admin, name, store).await;
+                scenarios::pg::isolated_clock(0).await;
             });
         return;
     }
@@ -110,6 +108,13 @@ fn ordinary_clock_extrema_7106() {
 #[test]
 fn ordinary_artifact_inactive_7103() {
     if std::env::var_os(CHILD_ENV).is_some() {
+        #[cfg(feature = "sal-postgres")]
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async {
+                scenarios::pg::isolated_capture().await;
+                scenarios::pg::isolated_clock(0).await;
+            });
         for auto in [false, true] {
             let conn =
                 ai_memory::db::open(std::path::Path::new(":memory:")).expect("private sqlite");
@@ -119,21 +124,6 @@ fn ordinary_artifact_inactive_7103() {
             scenarios::sqlite_stamps(&conn, TARGET_ID);
         }
         scenarios::sqlite_clock(0);
-        #[cfg(feature = "sal-postgres")]
-        tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(async {
-                let (admin, name, store) = scenarios::pg::create().await;
-                scenarios::pg::capture(&store, TARGET_ID)
-                    .await
-                    .expect("ordinary PG capture");
-                assert_eq!(scenarios::pg::counts(&store).await, (1, 1, 1));
-                scenarios::pg::stamps(&store, TARGET_ID).await;
-                scenarios::pg::cleanup(admin, name, store).await;
-                let (admin, name, store) = scenarios::pg::create().await;
-                scenarios::pg::clock(&store, 0).await;
-                scenarios::pg::cleanup(admin, name, store).await;
-            });
         return;
     }
     for (fail, clock) in [
