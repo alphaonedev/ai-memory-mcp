@@ -84,6 +84,25 @@ struct Env {
     ignore_case: bool,
 }
 
+impl Env {
+    /// An [`Env`] for the tracked `paths` (relative, `/`-separated).
+    fn from_tracked<'a>(paths: impl IntoIterator<Item = &'a str>, ignore_case: bool) -> Self {
+        let mut env = Env {
+            ignore_case,
+            ..Env::default()
+        };
+        for path in paths {
+            env.tracked.insert(path.to_string());
+            let mut dir = path;
+            while let Some((parent, _)) = dir.rsplit_once('/') {
+                env.tracked_dirs.insert(parent.to_string());
+                dir = parent;
+            }
+        }
+        env
+    }
+}
+
 /// One parsed `.gitignore` line (#6521). Only the syntax the repository's
 /// tracked `.gitignore` files use is supported; what is not (a backslash
 /// escape, an empty pattern, a POSIX bracket class, an unterminated class)
@@ -1316,6 +1335,144 @@ fn issue_7017_ignore_case_folds_pattern_and_name() {
             ignored_by(&[line], rel, false, fold),
             Ok(want),
             "{line:?} vs {rel:?} (ignorecase: {fold})"
+        );
+    }
+}
+
+/// Walk `scratch` with the git facts `env` and return the relative paths
+/// collected (minus `.gitignore` files) plus what was unreadable.
+fn walked_with(scratch: &Path, env: &Env) -> (Vec<String>, Vec<String>) {
+    let mut files = Vec::new();
+    let mut unreadable = Vec::new();
+    walk_with(scratch, env, &mut files, &mut unreadable);
+    let mut seen: Vec<String> = files
+        .iter()
+        .filter_map(|f| f.strip_prefix(scratch).ok())
+        .map(|p| p.display().to_string())
+        .filter(|p| !p.ends_with(".gitignore"))
+        .collect();
+    seen.sort();
+    (seen, unreadable)
+}
+
+/// Run `git -C dir <args>` with the repository-selecting environment
+/// cleared; the command must succeed.
+fn git_ok(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+        .expect("run git")
+        .status;
+    assert!(status.success(), "git {args:?} failed in {}", dir.display());
+}
+
+/// #7008: git applies no ignore rule to a file it tracks (`git add -f`, or a
+/// file committed before its rule existed), so the pin must read it. The
+/// round-4 walk skipped every path an ignore rule matched, tracked or not
+/// (plant docs/.env.example MISSED while `git ls-files -ci` listed it).
+/// A tracked file inside an ignored directory is read too, and an untracked
+/// file the same rules ignore is still skipped.
+#[test]
+fn issue_7008_walk_reads_tracked_files_the_ignore_rules_match() {
+    let scratch = scratch_tree("7008-env");
+    plant(&scratch, ".gitignore", ".env.*\nbuild-out/\n");
+    plant(&scratch, "docs/.env.example", PLANT);
+    plant(&scratch, "docs/.env.local", PLANT);
+    plant(&scratch, "docs/plain.md", PLANT);
+    plant(&scratch, "build-out/keep/tracked.json", PLANT);
+    plant(&scratch, "build-out/other.json", PLANT);
+    let env = Env::from_tracked(
+        ["docs/.env.example", "build-out/keep/tracked.json"],
+        false,
+    );
+    let (seen, unreadable) = walked_with(&scratch, &env);
+    let _ = fs::remove_dir_all(&scratch);
+
+    assert!(unreadable.is_empty(), "unreadable: {unreadable:?}");
+    assert_eq!(
+        seen,
+        vec![
+            "build-out/keep/tracked.json".to_string(),
+            "docs/.env.example".to_string(),
+            "docs/plain.md".to_string(),
+        ],
+        "a tracked path the ignore rules match was skipped (fail-open), \
+         or an untracked ignored path was read"
+    );
+}
+
+/// A throwaway git repository at `scratch` with `core.ignorecase` set.
+fn git_scratch_repo(tag: &str, ignore_case: bool) -> PathBuf {
+    let scratch = scratch_tree(tag);
+    git_ok(&scratch, &["init", "-q"]);
+    git_ok(
+        &scratch,
+        &["config", "core.ignorecase", if ignore_case { "true" } else { "false" }],
+    );
+    scratch
+}
+
+/// #7008 end to end: in a real repository the walk asks git which paths are
+/// tracked. docs/.env.example matches `.env.*` and is force-added, so git
+/// lists it (`ls-files -ci`) and the walk must read it.
+#[test]
+fn issue_7008_walk_in_a_git_repo_reads_force_added_ignored_files() {
+    let scratch = git_scratch_repo("7008-git", false);
+    plant(&scratch, ".gitignore", ".env.*\n");
+    plant(&scratch, "docs/.env.example", PLANT);
+    plant(&scratch, "docs/.env.untracked", PLANT);
+    git_ok(&scratch, &["add", "-f", "docs/.env.example"]);
+    let (seen, unreadable) = walked(&scratch);
+    let _ = fs::remove_dir_all(&scratch);
+
+    assert!(unreadable.is_empty(), "unreadable: {unreadable:?}");
+    assert_eq!(
+        seen,
+        vec!["docs/.env.example".to_string()],
+        "the walk must read the force-added file and skip the untracked ignored one"
+    );
+}
+
+/// #7017 end to end: the walk reads `core.ignorecase` from git. With it
+/// true, `Notes.md` ignores `notes.md`; with it false it does not.
+#[test]
+fn issue_7017_walk_honours_core_ignorecase_from_git_config() {
+    for (ignore_case, want) in [(true, Vec::new()), (false, vec!["notes.md".to_string()])] {
+        let scratch = git_scratch_repo(&format!("7017-case-{ignore_case}"), ignore_case);
+        plant(&scratch, ".gitignore", "Notes.md\n");
+        plant(&scratch, "notes.md", PLANT);
+        let (seen, unreadable) = walked(&scratch);
+        let _ = fs::remove_dir_all(&scratch);
+        assert!(unreadable.is_empty(), "unreadable: {unreadable:?}");
+        assert_eq!(seen, want, "core.ignorecase={ignore_case}");
+    }
+}
+
+/// #7008: when the root has a `.git` but git cannot answer for exactly this
+/// root, the walk reports it (fail closed) instead of treating the tree as
+/// having nothing tracked. An empty `.git` directory is not a repository,
+/// so git would climb to an enclosing one; a `.git` file naming a missing
+/// gitdir makes git fail outright.
+#[test]
+fn issue_7008_walk_fails_closed_when_git_cannot_list_the_root() {
+    for (tag, dot_git_is_dir) in [("7008-dir", true), ("7008-file", false)] {
+        let scratch = scratch_tree(tag);
+        if dot_git_is_dir {
+            fs::create_dir_all(scratch.join(".git")).expect("create .git dir");
+        } else {
+            plant(&scratch, ".git", "gitdir: /nonexistent/ssot-6157\n");
+        }
+        plant(&scratch, "docs/a.md", PLANT);
+        let (_, unreadable) = walked(&scratch);
+        let _ = fs::remove_dir_all(&scratch);
+        assert!(
+            unreadable.iter().any(|u| u.contains("git")),
+            "{tag}: the walk did not report that git could not list the root: {unreadable:?}"
         );
     }
 }
