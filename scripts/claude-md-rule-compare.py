@@ -2635,6 +2635,37 @@ def _self_test_cases() -> int:
           'secret = """\n-----BEGIN PRIVATE KEY-----\n6163CanaryTk\n-----END PRIVATE KEY-----"""\nafter-shown-6163',
           hidden=("6163CanaryTk",), shown=("after-shown-6163",))
 
+    # #6163 round 6 (#6852): a line over MAX_MASK_LINE is hidden whole, and when it mentions a credential name it also
+    # keeps the wait for a value, a block scalar or a triple quote open (fail closed), so the lines after it are masked
+    # as they are after a short name line (#6663, #6614, #6666 shapes with a padded or long first line).
+    masks("#6852 R6 L1 a bare name padded past the cap still masks the value on the next line",
+          "api_key:" + " " * 2100 + "\n  6163CanaryL1\nafter-shown-6163", hidden=("6163CanaryL1",),
+          shown=("after-shown-6163",), count=2)
+    masks("#6852 R6 L2 a long comment after a bare name still masks the value on the next line",
+          "api_key: # " + "c" * 2100 + "\n  6163CanaryL2\nafter-shown-6163", hidden=("6163CanaryL2",),
+          shown=("after-shown-6163",), count=2)
+    masks("#6852 R6 L3 a long comment after a block indicator still masks the block",
+          "secret: | # " + "c" * 2100 + "\n  6163CanaryL3a\n  6163CanaryL3b\nafter-shown-6163",
+          hidden=("6163CanaryL3a", "6163CanaryL3b"), shown=("after-shown-6163",), count=3)
+    masks("#6852 R6 L4 a long first line of a triple-quoted value still masks the lines up to the closing quote",
+          'password = """' + "x" * 2100 + '\n6163CanaryL4\n"""\nafter-shown-6163', hidden=("6163CanaryL4",),
+          shown=("after-shown-6163",), count=3)
+    masks("#6852 R6 L6 a block name padded past the cap still masks the block",
+          "secret: |" + " " * 2100 + "\n  6163CanaryL6a\n  6163CanaryL6b\nafter-shown-6163",
+          hidden=("6163CanaryL6a", "6163CanaryL6b"), shown=("after-shown-6163",), count=3)
+    masks("#6852 R6 L7 a credential name beyond the first 2000 characters of a long line still waits for a value",
+          "z" * 2100 + " password =\n6163CanaryL7\nafter-shown-6163", hidden=("6163CanaryL7",),
+          shown=("after-shown-6163",), count=2)
+    masks("#6852 R6 L8 a triple quote opened beyond the first 2000 characters of a long line is closed by its mate",
+          "z" * 2100 + ' token = """x\n6163CanaryL8\n"""\nafter-shown-6163', hidden=("6163CanaryL8",),
+          shown=("after-shown-6163",), count=3)
+    masks("#6852 R6 L9 a long line with no credential word does not hold the next line",
+          "z" * 2100 + "\nvisible-6163-next\nafter-shown-6163", shown=("visible-6163-next", "after-shown-6163"),
+          count=1)
+    masks("#6852 R6 L10 a long line that closes a triple quote and names a credential does not reopen it",
+          'secret = """\nbody-6163\n' + "z" * 2100 + ' token"""\nafter-shown-6163', hidden=("body-6163",),
+          shown=("after-shown-6163",), count=3)
+
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
     fetch_root = base_dir / "pr-fetch"
