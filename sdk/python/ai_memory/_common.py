@@ -20,6 +20,7 @@ import json
 import os
 import ssl
 import stat
+import time
 from typing import TYPE_CHECKING, Any, Union
 from urllib.parse import quote
 
@@ -87,7 +88,8 @@ _UNVERIFIED_MESSAGE = (
     "Accepted verify= forms: None (httpx default trust: certifi, or SSL_CERT_FILE / SSL_CERT_DIR), True, the path of a "
     "CA bundle file or CA directory (str or os.PathLike), or exactly an "
     "ssl.SSLContext (not a subclass, such as truststore.SSLContext) that is "
-    "CERT_REQUIRED with check_hostname on and has no patched wrap_socket or "
+    "CERT_REQUIRED with check_hostname on, has no verify_flags that relax "
+    "chain validation and has no patched wrap_socket or "
     "wrap_bio. Build one with ssl.create_default_context(cafile=<CA path>) "
     "or pass verify=<CA path>, e.g. <key_dir>/tls/local-ca.pem for a "
     "zero-config daemon (#3840, #6267, #6268)."
@@ -103,8 +105,33 @@ _HANDSHAKE_ATTRIBUTES = (
     "check_hostname",
     "sslsocket_class",
     "sslobject_class",
+    "verify_flags",
+    "hostname_checks_common_name",
 )
 _STOCK_HANDSHAKE = {name: ssl.SSLContext.__dict__.get(name) for name in _HANDSHAKE_ATTRIBUTES}
+
+#: OpenSSL ``X509_V_FLAG_*`` bits a caller context may carry (#6375): each
+#: one leaves chain validation at least as strict as the default. Every other
+#: bit is refused, among them USE_CHECK_TIME (0x2), IGNORE_CRITICAL (0x10),
+#: ALLOW_PROXY_CERTS (0x40), NO_CHECK_TIME (0x200000) and any bit OpenSSL adds
+#: later. PARTIAL_CHAIN is admitted: Python 3.13+ ``create_default_context``
+#: sets it, and it only lets a CA the caller loaded as trusted anchor a chain.
+_ALLOWED_VERIFY_FLAGS = (
+    0x4  # CRL_CHECK (VERIFY_CRL_CHECK_LEAF)
+    | 0x8  # CRL_CHECK_ALL (with CRL_CHECK: VERIFY_CRL_CHECK_CHAIN)
+    | 0x20  # X509_STRICT
+    | 0x80  # POLICY_CHECK
+    | 0x100  # EXPLICIT_POLICY
+    | 0x200  # INHIBIT_ANY
+    | 0x400  # INHIBIT_MAP
+    | 0x1000  # EXTENDED_CRL_SUPPORT
+    | 0x2000  # USE_DELTAS
+    | 0x4000  # CHECK_SS_SIGNATURE
+    | 0x8000  # TRUSTED_FIRST
+    | 0x30000  # SUITEB_128_LOS_ONLY | SUITEB_192_LOS
+    | 0x80000  # PARTIAL_CHAIN
+    | 0x100000  # NO_ALT_CHAINS
+)
 
 
 def _context_verifies(context: object) -> bool:
@@ -120,13 +147,18 @@ def _context_verifies(context: object) -> bool:
     * the instance dict shadows no ``ssl.SSLContext`` attribute, so no
       ``context.wrap_socket = ...`` style patch reroutes the handshake (#6268);
     * the handshake-deciding class attributes are still the objects captured
-      at import (#6268).
+      at import (#6268);
+    * ``verify_flags`` (base descriptor) carries only bits in
+      :data:`_ALLOWED_VERIFY_FLAGS` (#6375).
     """
     if type(context) is not ssl.SSLContext:
         return False
     if any(hasattr(ssl.SSLContext, key) for key in vars(context)):
         return False
     if any(ssl.SSLContext.__dict__.get(name) is not stock for name, stock in _STOCK_HANDSHAKE.items()):
+        return False
+    flags = int(ssl.SSLContext.verify_flags.__get__(context))  # type: ignore[attr-defined]
+    if flags & ~_ALLOWED_VERIFY_FLAGS:
         return False
     return bool(
         ssl.SSLContext.verify_mode.__get__(context) == ssl.CERT_REQUIRED  # type: ignore[attr-defined]
@@ -289,6 +321,29 @@ def _peer_matches_host(peer: dict[str, Any], host: str, context: ssl.SSLContext)
     )
 
 
+def _assert_leaf_current(session: object) -> None:
+    """Raise ``ValueError`` unless the peer leaf is inside its validity period now (#6375).
+
+    A belt to the ``verify_flags`` check: a flag that skips the time check can
+    be set after the per-request check and before the handshake. Only the leaf
+    is visible here. This runs on new sessions only (in the trace), never on a
+    pooled connection, whose leaf was current when it was verified.
+    """
+    getpeercert = getattr(session, "getpeercert", None)
+    peer = None if getpeercert is None else getpeercert()
+    if not isinstance(peer, dict):
+        raise ValueError(_SESSION_MESSAGE)
+    not_before, not_after = peer.get("notBefore"), peer.get("notAfter")
+    if not isinstance(not_before, str) or not isinstance(not_after, str):
+        raise ValueError(_SESSION_MESSAGE)
+    try:
+        start, end = ssl.cert_time_to_seconds(not_before), ssl.cert_time_to_seconds(not_after)
+    except ValueError:
+        raise ValueError(_SESSION_MESSAGE) from None
+    if not start <= time.time() <= end:
+        raise ValueError(_SESSION_MESSAGE)
+
+
 def _request_host(url: httpx.URL) -> str:
     return url.raw_host.decode("ascii", "replace")
 
@@ -379,6 +434,7 @@ class _SessionGate:
                 return None
             try:
                 _assert_negotiated_session(session, self._context, self._host)
+                _assert_leaf_current(session)
             except ValueError:
                 return [*self._pending, stream]
             if leg != _DIRECT_TLS:
