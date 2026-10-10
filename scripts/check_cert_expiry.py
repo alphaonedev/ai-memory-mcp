@@ -210,11 +210,28 @@ EXPIRY_SENTENCE = (
 )
 
 
+# Every Cf code point of Unicode 15.0 (bidi controls, zero-width characters, soft hyphen, BOM, ...), written
+# out so the escaping does not depend on the interpreter's Unicode tables: Python 3.9 (Unicode 13) does not
+# know U+0890, U+0891 and U+13439-U+1343F as format characters (#6683).
+LOG_CF_RANGES = ((0x00AD, 0x00AD), (0x0600, 0x0605), (0x061C, 0x061C), (0x06DD, 0x06DD), (0x070F, 0x070F),
+                 (0x0890, 0x0891), (0x08E2, 0x08E2), (0x180E, 0x180E), (0x200B, 0x200F), (0x202A, 0x202E),
+                 (0x2060, 0x2064), (0x2066, 0x206F), (0xFEFF, 0xFEFF), (0xFFF9, 0xFFFB), (0x110BD, 0x110BD),
+                 (0x110CD, 0x110CD), (0x13430, 0x1343F), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A),
+                 (0xE0001, 0xE0001), (0xE0020, 0xE007F))
+
+
+def _in_ranges(code, ranges):
+    return any(first <= code <= last for first, last in ranges)
+
+
 def log_safe(text):
     """TEXT with every control character escaped (#6175): backslash as `\\\\`,
     C0, DEL and C1 as `\\xNN`, U+2028 / U+2029 and every Unicode format
     character (category Cf: bidi controls, zero-width characters, soft hyphen,
-    BOM; #6683) as `\\uNNNN` (`\\UNNNNNNNN` above U+FFFF). A name the change
+    BOM; #6683) as `\\uNNNN` (`\\UNNNNNNNN` above U+FFFF). The format
+    characters of Unicode 15.0 come from the explicit table LOG_CF_RANGES, so
+    Python 3.9 and 3.12 print the same text; the interpreter's own category Cf
+    is kept as a net for code points newer than the table. A name the change
     controls (a path, a workflow file name, a trailer value, git's stderr
     echoing one) therefore stays on its own step-log line and can never begin
     a line the Actions runner reads as a workflow command (`::error`, ...)."""
@@ -225,7 +242,7 @@ def log_safe(text):
             out.append("\\\\")
         elif code < 0x20 or 0x7F <= code <= 0x9F:
             out.append(f"\\x{code:02x}")
-        elif code in (0x2028, 0x2029) or unicodedata.category(ch) == "Cf":
+        elif code in (0x2028, 0x2029) or _in_ranges(code, LOG_CF_RANGES) or unicodedata.category(ch) == "Cf":
             out.append(f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}")
         else:
             out.append(ch)
@@ -4070,7 +4087,9 @@ SELF_TEST_OK = (
     "passes unchanged (log-safe-plain) and this line naming every round "
     "(summary-rounds) with no two words joined (summary-join); "
     "(tr round 8, #6765/#6919/#6920) the line names every cell of rounds 6 to 8, read from the cell "
-    "functions' source, so a new cell that is not named here is red (summary-rounds)."
+    "functions' source, so a new cell that is not named here is red (summary-rounds); (tr round 8, #6683) "
+    "every Cf code point of Unicode 15.0 escaped from an explicit table even when the interpreter does not "
+    "report it as a format character, so Python 3.9 and 3.12 agree (log-safe-cf-table)."
 )
 
 
