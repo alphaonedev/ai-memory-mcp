@@ -1180,6 +1180,8 @@ R12_ERR_LINE = "Erratum (#1): `check-old.sh` is `scripts/check_new.py`.\n"
 R12_BASE = "Clause (c) applies.\nOther (c) item.\n"
 R12_FRAG = "docs/compliance/A.md:c:2\n"
 R12_JOIN = "joins into script name `check-gone.sh`"
+R12_FRAG1 = "docs/compliance/A.md:c:1\n"
+R12_UNRESOLVED = "is followed by markup the gate cannot resolve"
 R12_LEFT = "`check-old.sh` does not exist (checked at scripts/check-old.sh)"
 
 
@@ -1280,6 +1282,26 @@ R12_CELLS = (
     # Controls: HTML and text evidence files stay unscanned.
     ("L-glob-control", {"A.md": "", "index.html": R12_STALE, "B.txt": R12_STALE, "C.log": R12_STALE},
      "", 0, None),
+    # Round-12 mutant survivors. #6622: the join walk drops ``$``, ``{`` and ``}`` (math syntax).
+    ("J-drop-dollar", "Run c$heck-gone.sh daily.\n", R12_FRAG1, 1, R12_JOIN),
+    ("J-drop-lbrace", "Run c{heck-gone.sh daily.\n", R12_FRAG1, 1, R12_JOIN),
+    ("J-drop-rbrace", "Run c}heck-gone.sh daily.\n", R12_FRAG1, 1, R12_JOIN),
+    # #6621: a walk that reaches the window end, or spends the line's state budget, is unresolved.
+    ("J-window-end", "Run c" + "`" * 600 + "heck-gone.sh daily.\n", R12_FRAG1, 1, R12_UNRESOLVED),
+    ("J-budget", "Run c<x>" + "".join(ch + "<x>" for ch in "heck-") + "a<x>" * 110 + " end.\n", R12_FRAG,
+     1, R12_UNRESOLVED),
+    # #6621: the walk also decodes a reference left in the decoded view (an over-approximation of
+    # a renderer, which decodes once: red, never green).
+    ("J-ref-twice", "Run c<b></b>&amp;#104;eck-gone.sh daily.\n", R12_FRAG1, 1, R12_JOIN),
+    # #6631: a fragment ending the line is completed by the next line to a ``check_`` or ``.py`` name.
+    ("J-break-under", "Run check_\ngone.py daily.\n", "", 1, "completes it to check_gone.py"),
+    ("J-break-py", "Run check-gone\n.py daily.\n", "", 1, "completes it to check-gone.py"),
+    # #6623: a seven-hash line is no ATX heading, so the erratum line has no heading; a non-ASCII
+    # space (category Z) is outside the plain set of an erratum block.
+    ("E-atx7-heading", R11_OK.replace("## Erratum", "####### Erratum"), R11_ALLOW, 1,
+     "erratum line without an erratum heading"),
+    ("E-block-nbsp", r11_err("Erratum (#1): `check-old.sh` is\u00a0`scripts/check_new.py`.\n"), R11_ALLOW, 1,
+     "character U+00A0 outside the plain set in the erratum block"),
 )
 
 
