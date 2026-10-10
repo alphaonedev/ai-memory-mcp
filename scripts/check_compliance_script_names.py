@@ -735,7 +735,8 @@ def erratum_block(rel, raw):
     if not block:
         problems.append("%s:%d: erratum heading with no paragraph" % (rel, head + 1))
     for i in block:
-        what = construct(raw[i], True)
+        # A heading line ends the paragraph: the block would be a heading and a paragraph (#6636).
+        what = "a heading" if ATX_RE.match(raw[i]) else construct(raw[i], True)
         if what:
             problems.append(
                 "%s:%d: %s in the erratum block (plain text and balanced code spans only)" % (rel, i + 1, what)
