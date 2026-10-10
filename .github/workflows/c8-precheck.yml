@@ -355,6 +355,23 @@ jobs:
         # empty sdk scan set both fail CLOSED.
         run: bash scripts/check-sdk-tls-scheme.sh --self-test
 
+  sdk-npm-audit-gate:
+    # #7084. `cargo audit` gates the Rust tree; nothing gated the npm
+    # lockfile under `sdk/typescript`, so a new advisory surfaced as GitHub's
+    # Dependabot banner instead of a CI signal. The gate runs
+    # `npm audit --audit-level=high` and exits 1 on any high/critical finding.
+    # If `npm` is absent it prints a `::notice::` and exits 0 (announced, never
+    # silent). The unit test feeds canned audit JSON, so it needs no network.
+    name: SDK npm audit gate (#7084)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Unit-test the npm audit gate (canned JSON, no network)
+        run: python3 -m unittest scripts/test/test_check_npm_audit_sdk.py
+      - name: Run npm audit gate over sdk/typescript
+        run: python3 scripts/check-npm-audit-sdk.py --dir sdk/typescript
+
   mcp-transport-isolation-gate:
     # #3829 — MCP transport is stdio-only. The src/mcp stdio JSON-RPC loop
     # owns stdin/stdout and MUST bind no server socket and construct no
