@@ -1785,3 +1785,22 @@ def test_ca_file_in_a_sticky_directory_needs_an_owned_file_6695(
     monkeypatch.setattr(os, "fstat", _as_foreign(os.fstat, (found.st_dev, found.st_ino)))
     with pytest.raises(ValueError, match="writable"):
         _built(client_cls, str(bundle))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("kind", ["file", "directory", "component", "entry"])
+def test_foreign_symlink_in_a_sticky_directory_is_refused_6655(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    kind: str,
+) -> None:
+    # The accepted twin is test_own_symlink_in_a_sticky_directory_is_accepted_6559.
+    verify = _linked_ca(lab, tmp_path, kind, 0o1777)
+    link = next((tmp_path / "swap").iterdir())
+    found = os.lstat(link)
+    monkeypatch.setattr(os, "lstat", _as_foreign(os.lstat, (found.st_dev, found.st_ino)))
+    with pytest.raises(ValueError, match="symlink"):
+        _built(client_cls, verify)
