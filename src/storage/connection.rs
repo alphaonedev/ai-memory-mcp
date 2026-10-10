@@ -1341,6 +1341,8 @@ mod tests {
 
     #[test]
     fn read_only_connection_registers_valid_time_projection_2266() {
+        // #6582: open() reads the process-global passphrase slot; hold the window.
+        let _iso = crate::test_support::no_passphrase_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("valid-time.sqlite3");
         let writer = open(&path).expect("create and migrate database");
@@ -1378,6 +1380,8 @@ mod tests {
 
     #[test]
     fn open_existing_read_only_opens_a_migrated_file_3411() {
+        // #6582: open() reads the process-global passphrase slot; hold the window.
+        let _iso = crate::test_support::no_passphrase_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("exists.db");
         drop(open(&path).expect("create"));
@@ -1390,6 +1394,8 @@ mod tests {
 
     #[test]
     fn open_existing_read_only_refuses_schema_behind_3411() {
+        // #6582: open() reads the process-global passphrase slot; hold the window.
+        let _iso = crate::test_support::no_passphrase_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("behind.db");
         drop(open(&path).expect("create"));
@@ -1432,6 +1438,8 @@ mod tests {
 
     #[test]
     fn open_round_trip_creates_db_and_runs_migrations() {
+        // #6582: open() reads the process-global passphrase slot; hold the window.
+        let _iso = crate::test_support::no_passphrase_guard();
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let conn = open(tmp.path()).expect("open initial");
         // schema_version table must exist and be populated.
@@ -1447,6 +1455,8 @@ mod tests {
 
     #[test]
     fn open_twice_is_idempotent_for_check_triggers() {
+        // #6582: open() reads the process-global passphrase slot; hold the window.
+        let _iso = crate::test_support::no_passphrase_guard();
         // R1-M2 doc: re-running open() is a no-op for the trigger install
         // because the sentinel `memories_ck_tier_ins` short-circuits the
         // CREATE TRIGGER batch. This test exercises both branches: first
@@ -1471,6 +1481,8 @@ mod tests {
 
     #[test]
     fn open_applies_wal_journal_mode() {
+        // #6582: open() reads the process-global passphrase slot; hold the window.
+        let _iso = crate::test_support::no_passphrase_guard();
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let conn = open(tmp.path()).expect("open");
         let mode: String = conn
@@ -1481,6 +1493,8 @@ mod tests {
 
     #[test]
     fn open_applies_default_mmap_size() {
+        // #6582: open() reads the process-global passphrase slot; hold the window.
+        let _iso = crate::test_support::no_passphrase_guard();
         // #1579 B7 — `open` must apply the compiled 256 MiB mmap
         // default when the process never seeded `set_db_mmap_size`
         // (the unit-test / library-embedder posture). The OnceLock is
@@ -1575,6 +1589,8 @@ mod tests {
     /// test process resolves `NORMAL`, so the reader must answer `1`.
     #[test]
     fn open_read_only_mirrors_resolved_synchronous_3553() {
+        // #6582: open() reads the process-global passphrase slot; hold the window.
+        let _iso = crate::test_support::no_passphrase_guard();
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("ro-sync.db");
         drop(open(&path).expect("create"));
@@ -1588,6 +1604,8 @@ mod tests {
 
     #[test]
     fn open_applies_resolved_synchronous_pragma() {
+        // #6582: open() reads the process-global passphrase slot; hold the window.
+        let _iso = crate::test_support::no_passphrase_guard();
         // `open` must apply the resolved `PRAGMA synchronous`. Unseeded /
         // no-env → NORMAL (which SQLite reports as the integer 1).
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
@@ -1601,6 +1619,8 @@ mod tests {
 
     #[test]
     fn open_enables_foreign_keys() {
+        // #6582: open() reads the process-global passphrase slot; hold the window.
+        let _iso = crate::test_support::no_passphrase_guard();
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         let conn = open(tmp.path()).expect("open");
         let fk: i32 = conn
@@ -1652,6 +1672,8 @@ mod tests {
     /// bootstrap used to crash on.
     #[test]
     fn open_succeeds_on_legacy_pre_v36_memories_shape() {
+        // #6582: open() reads the process-global passphrase slot; hold the window.
+        let _iso = crate::test_support::no_passphrase_guard();
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         {
             let conn = open(tmp.path()).expect("seed: fresh open");
@@ -1746,6 +1768,8 @@ mod tests {
     /// against the missing column.
     #[test]
     fn open_succeeds_on_legacy_pre_v41_shadow_shape() {
+        // #6582: open() reads the process-global passphrase slot; hold the window.
+        let _iso = crate::test_support::no_passphrase_guard();
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         {
             let conn = open(tmp.path()).expect("seed: fresh open");
@@ -2031,6 +2055,8 @@ mod tests {
 
     #[test]
     fn check_trigger_rejects_bad_tier_insert() {
+        // #6582: open() reads the process-global passphrase slot; hold the window.
+        let _iso = crate::test_support::no_passphrase_guard();
         // R1-M2 trigger contract: a write that violates the closed-set
         // CHECK on memories.tier must surface as an error. This test
         // exercises the trigger's actual rejection branch, not just the
