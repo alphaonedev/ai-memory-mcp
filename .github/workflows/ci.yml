@@ -1215,7 +1215,15 @@ jobs:
         run: |
           set -euo pipefail
           # #6795 — JOB_T0 is written to $GITHUB_ENV by the first step of the job.
-          : "${JOB_T0:?JOB_T0 missing: the Record job start step did not run}"
+          # Invalid or missing: warn and keep the flat watchdog values (fail
+          # toward the old behaviour, never toward a 0 s or empty watchdog).
+          case "${JOB_T0:-}" in
+            ''|*[!0-9]*)
+              echo "::warning::[#6795] JOB_T0 missing or non-numeric; watchdogs keep their flat values"
+              JOB_T0_VALID=0
+              ;;
+            *) JOB_T0_VALID=1 ;;
+          esac
           # v1.0.0 2x2 — tier-parametrised feature/thread selection. The
           # `enterprise-fed` legs add `--features sal-postgres` and serialise
           # DDL with `-- --test-threads=1` (the sal-postgres suite shares one
@@ -1413,13 +1421,14 @@ jobs:
           # cap_to_job_left <secs>: min(secs, job_left)
           cap_to_job_left() {
             local want="$1" left
+            if [ "$JOB_T0_VALID" -ne 1 ]; then echo "$want"; return 0; fi
             left=$(job_left)
             if [ "$left" -lt "$want" ]; then echo "$left"; else echo "$want"; fi
           }
           run_tests() {
             local label="$1"; shift
             local rc=0
-            local WATCHDOG_SECS; WATCHDOG_SECS="$(cap_to_job_left "$WATCHDOG_SECS")"
+            local WATCHDOG_SECS="$(cap_to_job_left "$WATCHDOG_SECS")"
             # #3461 — margin telemetry. The 1500s kill on e06961ca was a
             # surprise only because no green run had ever printed how close it
             # came: the step reported the budget and nothing else, so a suite
@@ -1500,7 +1509,7 @@ jobs:
           run_doc_tests() {
             local label="$1"; shift
             local rc=0 started elapsed
-            local WATCHDOG_SECS; WATCHDOG_SECS="$(cap_to_job_left "$WATCHDOG_SECS")"
+            local WATCHDOG_SECS="$(cap_to_job_left "$WATCHDOG_SECS")"
             # `cargo test --doc --no-run` is rejected by cargo, so the prebuild
             # is the plain `--no-run` of the same feature set (lib + doc deps).
             cargo test --no-run "$@" || return "$?"
@@ -1594,10 +1603,14 @@ jobs:
             # includes the load-gate wait, setup, compile and partition - 300 s
             # safety). Parallel shards keep the flat WATCHDOG_SECS (7800 s),
             # capped by the same job time left.
-            job_now=$(date +%s)
-            job_elapsed=$(( job_now - JOB_T0 ))
-            SERIAL_BUDGET_SECS=$(( JOB_TIMEOUT_MIN * 60 - (job_now - JOB_T0) - 300 ))
-            if [ "$SERIAL_BUDGET_SECS" -lt 60 ]; then SERIAL_BUDGET_SECS=60; fi
+            job_elapsed=0
+            SERIAL_BUDGET_SECS="$WATCHDOG_SECS"
+            if [ "$JOB_T0_VALID" -eq 1 ]; then
+              job_now=$(date +%s)
+              job_elapsed=$(( job_now - JOB_T0 ))
+              SERIAL_BUDGET_SECS=$(( JOB_TIMEOUT_MIN * 60 - (job_now - JOB_T0) - 300 ))
+              if [ "$SERIAL_BUDGET_SECS" -lt 60 ]; then SERIAL_BUDGET_SECS=60; fi
+            fi
             echo "::notice::[#6795] serial shard budget ${SERIAL_BUDGET_SECS}s (job cap ${JOB_TIMEOUT_MIN} min - ${job_elapsed}s elapsed since job start - 300s safety); parallel shards min(${WATCHDOG_SECS}s, job time left)"
             ( run_shard serial "$sd" 1 pg "$with_doc" ) > "$sd/serial.log" 2>&1 &
             pid_s=$!

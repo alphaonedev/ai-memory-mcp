@@ -69,7 +69,7 @@ class SerialBudget(unittest.TestCase):
         self.assertIn('JOB_TIMEOUT_MIN * 60', left)
 
     def test_non_sharded_watchdog_is_capped_too(self):
-        self.assertIn('local WATCHDOG_SECS; WATCHDOG_SECS="$(cap_to_job_left "$WATCHDOG_SECS")"',
+        self.assertIn('local WATCHDOG_SECS="$(cap_to_job_left "$WATCHDOG_SECS")"',
                       function_body(CI, 'run_tests'))
 
     def test_shard_left_uses_per_shard_budget(self):
