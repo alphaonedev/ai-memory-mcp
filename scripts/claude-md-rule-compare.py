@@ -723,6 +723,22 @@ def _self_test_cases() -> int:
     else:
         print("PASS: self-test - the trailer parser environment disables system and global git config (#6396)")
 
+    saved_git_dir = os.environ.get("GIT_DIR")
+    os.environ["GIT_DIR"] = str(alias_repo / ".git")
+    try:
+        exported_pin = config_free_env().get("GIT_DIR")
+    finally:
+        if saved_git_dir is None:
+            os.environ.pop("GIT_DIR", None)
+        else:
+            os.environ["GIT_DIR"] = saved_git_dir
+    if exported_pin != os.devnull:
+        print(f"FAIL: self-test - a host GIT_DIR export reaches the trailer parser environment (#6433): {exported_pin!r}",
+              file=sys.stderr)
+        failures.append("host GIT_DIR")
+    else:
+        print("PASS: self-test - a host GIT_DIR export does not reach the trailer parser environment (#6433)")
+
     def parser_failure(label, git_body):
         """A `git` earlier on PATH that exits non-zero (or is absent): the trailer read must raise, never return []."""
         fake = base_dir / f"fakegit-{label}"
