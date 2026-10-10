@@ -185,17 +185,23 @@ JWK_PRIVATE_MEMBER = re.compile(r"\"(?:d|p|q|dp|dq|qi|k)\"\s*:\s*\"([A-Za-z0-9_-
 JWK_TYPE = re.compile(r"\"kty\"\s*:")
 JWK_MEMBER_MIN = 16
 # #6211: a credential name with no value on its line (`api_key:`); the value is on the next line that is not blank.
-NAME_ONLY = re.compile(r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")(?:[*_]{1,2}|[\"'`])?\s*[:=]\s*(?:[*_]{1,2})?\s*$")
+# Round 5 (#6663, #6614): a YAML comment (`\s+#...`) may follow the bare name; the value is still on the next line.
+NAME_ONLY = re.compile(r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")(?:[*_]{1,2}|[\"'`])?\s*[:=]\s*(?:[*_]{1,2})?\s*"
+                       r"(?:\s+#.*)?$")
 # #6211 round 4 (security F1): a YAML block scalar under a credential name (`private_key: |`, `secret: >-`); every
 # following line more indented than the name line is the value. BLOCK_INDICATOR is the indicator alone, which
 # mask_named_values leaves visible.
 BLOCK_INDICATOR = re.compile(r"[|>][+-]?[1-9]?[+-]?")
+BLOCK_COMMENT = r"(?:\s+#.*)?"  # a YAML comment may follow the indicator (round 5, #6663, #6614)
+BLOCK_VALUE = re.compile(BLOCK_INDICATOR.pattern + BLOCK_COMMENT)
 BLOCK_NAME = re.compile(r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")(?:[*_]{1,2}|[\"'`])?\s*:\s*"
-                        + BLOCK_INDICATOR.pattern + r"\s*$")
-# A next line that is a heading or a table row is structure, not the value; #6163 round 4 (code F6): a nested `key:`
-# with no value of its own is structure and passes the wait on to the line after it; a nested `key: value` is judged
-# by its value (prose_cell), so `api_key:` then `  value: <secret>` masks the secret.
-STRUCTURE_LINE = re.compile(r"[#|]")
+                        + BLOCK_INDICATOR.pattern + BLOCK_COMMENT + r"\s*$")
+# A next line that is a table row is structure, not the value; #6163 round 4 (code F6): a nested `key:` with no value
+# of its own is structure and passes the wait on to the line after it; a nested `key: value` is judged by its value
+# (prose_cell), so `api_key:` then `  value: <secret>` masks the secret. Round 5 (#6663): a comment line (`#`) is
+# structure too and passes the wait on, so the value after it is still masked.
+STRUCTURE_LINE = re.compile(r"\|")
+COMMENT_LINE = re.compile(r"#")
 NESTED_NAME = re.compile(r"[\w-]+:")
 NESTED_VALUE = re.compile(r"[\w-]+:\s+(\S.*)")
 MASK = "[MASKED]"
@@ -401,7 +407,7 @@ def mask_named_values(line: str) -> tuple:
         value = match.group(group)
         first = value.split()[0] if value.split() else ""
         if group == 6:
-            plain = plain_text(match.group(1), value) or BLOCK_INDICATOR.fullmatch(value) is not None
+            plain = plain_text(match.group(1), value) or BLOCK_VALUE.fullmatch(value) is not None
         else:
             plain = not value.strip() or plain_word(match.group(1), value.strip())
         if plain:
@@ -469,7 +475,7 @@ def value_line_indexes(lines: list, key_indexes=frozenset()) -> set:
         if pending is not None and content:
             name, pending = pending, None
             nested = NESTED_VALUE.fullmatch(content)
-            if NESTED_NAME.fullmatch(content):
+            if NESTED_NAME.fullmatch(content) or COMMENT_LINE.match(content):
                 pending = name
             elif nested is not None:
                 if not prose_cell(name, nested.group(1)):
@@ -2381,7 +2387,7 @@ def _self_test_cases() -> int:
     masks("#6663 R5 B a trailing comment after a block indicator keeps the block masked",
           "secret: | # note6163\n  6163CanaryBValue\nnext: shown-6163", hidden=("6163CanaryBValue",),
           shown=("secret: | # note6163", "next: shown-6163"), count=1)
-    masks("#6614 R5 a bare name with a comment and a following block comment: the value is masked",
+    masks("#6614 R5 a password name with a trailing comment still masks the value on the next line",
           "password: # rotated monthly\n  6163CanaryPwValue", hidden=("6163CanaryPwValue",))
     diff_masks("#6663 R5 P a rotated value after a comment context line is masked on both sides",
                "intro\napi_key:\n# note6163\n  6163OldCanaryPValue\nend",
