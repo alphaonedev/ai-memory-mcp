@@ -2405,6 +2405,7 @@ Common issues, their causes, and how to fix them.
 **Solution:**
 1. Ensure you have internet access and can reach `huggingface.co`.
 2. If behind a corporate proxy, set `HTTPS_PROXY` before starting ai-memory.
+   The proxy applies to the model download only: webhook delivery ignores `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and their lower-case forms, and connects directly to the address it validated (#6372).
 3. Wait -- the first download can take a few minutes on slow connections. Subsequent runs use the cached model.
 4. If the download is corrupted, delete the cached model directory (`~/.cache/huggingface/hub/models--sentence-transformers--all-MiniLM-L6-v2/`) and retry.
 

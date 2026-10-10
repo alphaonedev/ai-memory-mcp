@@ -51,38 +51,45 @@ fn deliver_with_proxy_env() {
     );
 }
 
+/// The proxy variable spellings reqwest reads for an `https://` target. Each
+/// is exercised ALONE (a single-variable cell is what pins `.no_proxy()`
+/// unconditionally: a guard that only looked at `HTTPS_PROXY` would pass the
+/// all-four cell), and then all together.
+const PROXY_ENV_SETS: &[&[&str]] = &[
+    &["HTTPS_PROXY"],
+    &["https_proxy"],
+    &["ALL_PROXY"],
+    &["all_proxy"],
+    &["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"],
+];
+
 #[test]
 fn dispatch_ignores_proxy_env_6372() {
     if std::env::var(PROXY_PORT_ENV).is_ok() {
         deliver_with_proxy_env();
         return;
     }
-    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the proxy probe");
-    probe.set_nonblocking(true).expect("non-blocking probe");
-    let port = probe
-        .local_addr()
-        .expect("probe address")
-        .port()
-        .to_string();
-    let proxy = format!("http://127.0.0.1:{port}");
-    let out = crate::test_support::spawn_test_child(
-        CHILD_TEST,
-        &[
-            (PROXY_PORT_ENV, port.as_str()),
-            ("HTTPS_PROXY", proxy.as_str()),
-            ("https_proxy", proxy.as_str()),
-            ("ALL_PROXY", proxy.as_str()),
-            ("all_proxy", proxy.as_str()),
-        ],
-    );
-    assert!(
-        probe.accept().is_err(),
-        "#6372: the proxy probe must receive zero CONNECTs"
-    );
-    assert!(
-        out.status.success(),
-        "#6372: the child delivery must succeed.\nstdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    for names in PROXY_ENV_SETS {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the proxy probe");
+        probe.set_nonblocking(true).expect("non-blocking probe");
+        let port = probe
+            .local_addr()
+            .expect("probe address")
+            .port()
+            .to_string();
+        let proxy = format!("http://127.0.0.1:{port}");
+        let mut env: Vec<(&str, &str)> = vec![(PROXY_PORT_ENV, port.as_str())];
+        env.extend(names.iter().map(|n| (*n, proxy.as_str())));
+        let out = crate::test_support::spawn_test_child(CHILD_TEST, &env);
+        assert!(
+            probe.accept().is_err(),
+            "#6372: the proxy probe must receive zero CONNECTs with {names:?} set"
+        );
+        assert!(
+            out.status.success(),
+            "#6372: the child delivery must succeed with {names:?} set.\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
