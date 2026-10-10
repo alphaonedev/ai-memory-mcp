@@ -1,0 +1,9 @@
+{
+ "n_agents": 256,
+ "mission_completion_rate": 0.0,
+ "mission_partial": {
+  "facts_stored_total": 656,
+  "lineage_proved": 120,
+  "summary_stored": 0
+ }
+}

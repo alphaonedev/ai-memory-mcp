@@ -1,0 +1,3106 @@
+[
+ {
+  "agent_id": "ai:m2-glm-0203ac22-f947-5de5-8962-4840719f5847",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 3,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "7x FAIL-CLOSED ValidationError: tier='working' rejected (enum requires short/mid/long) across steps 1-3 before a successful retry with tier='short'"
+   ],
+   [
+    "decide",
+    "3x consecutive OpenRouter transport errors (steps 7-9) yielded no tool decisions"
+   ],
+   [
+    "search",
+    "returned [] every step even while recall consistently matched the stored memory (score 0.703) - possible FTS/index mismatch"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-ec0667b4-ff31-5a92-bd92-dbf09077faf9",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 2,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "ValidationError: tier enum rejected 'short_term' and 'working' (requires short/mid/long)"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required (fail-closed)"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error at step 7; no tools decided"
+   ],
+   [
+    "recall/list_memories",
+    "returned empty even after the successful store; written memory never visible"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-aa4714e8-4dae-5c6d-bc3e-94f8f9fc5664",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "step 1 fail-closed ValidationError: tier 'working' invalid enum; recovered by using 'short'"
+   ],
+   [
+    "search",
+    "returned [] on every step even after storing keyword-rich memories; FTS never matched"
+   ],
+   [
+    "decide",
+    "step 6 OpenRouter transport error produced empty decision, wasting a step"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-07bc52d0-b2b7-5627-9ebd-5b56ae6a6218",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "namespaces",
+    "ForbiddenError: admin role required (fail-closed; attempted twice, steps 8 & 10)"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error (empty message) x2, steps 4 & 9, ~30s stall each"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-fb6b6bb8-93e6-53a5-a8b5-c6c19daba670",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-a7781572-d8bd-50ae-a802-d0ae58407b44",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-cf9a91fc-69be-5866-ad31-bc8ab50d5f69",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (step 6, ~31s wasted)"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error (step 7, ~31s wasted)"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error (step 9, ~42s wasted)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-09fc3e78-1efb-528b-ab2f-9f08bec6f0bb",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 2,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "ValidationError: tier='working' not in enum (short/mid/long); identical error repeated at steps 2 and 3 without correction"
+   ],
+   [
+    "stats",
+    "ForbiddenError: admin role required; agent attempted admin-only tool"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-9a59f3ab-0221-5878-b17f-2e562b5962e7",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": true,
+  "failures_encountered": [
+   [
+    "link",
+    "ConflictError: link refused fail-closed, would close a reflection cycle (step 4)"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required (step 8)"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error produced empty decision (step 5)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-e43383c3-8740-5516-8499-59f2db153745",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-141d72c9-45ef-5085-880c-7dcaf00d6294",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-54156b5d-1483-5805-93ac-c93033e7e22a",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-7ed7176c-3329-5bcd-8278-fd05dd72af8f",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-89b2a3db-6318-50d8-9dac-bba3b66a2be9",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-97030a7a-4f2f-5ecc-9250-6538c0c1688c",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "stats",
+    "ForbiddenError: admin role required \u2014 correctly fail-closed at step 2"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error (empty message) on steps 5,6,7,8,10: 5/10 steps produced no tool decision"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-bf9c5aba-9e9f-58ff-9d16-cd96cbd3ab38",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-aca12b35-2531-5759-8c3c-b80efc8fbc69",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-9d9049d0-9014-583d-9c28-5f1e36fed7d9",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-2c211cd5-0747-58bf-bf50-723f77318986",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-5246e404-d9c8-5e9b-a888-fcf3448f4e51",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": true,
+  "failures_encountered": [
+   [
+    "namespaces",
+    "ForbiddenError: admin role required (fail-closed) at step 5"
+   ],
+   [
+    "get_links",
+    "returned [] in steps 5-6 despite 3 link ops reported linked=True in step 4"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error on steps 8-10 - no tools callable, loop stalled"
+   ],
+   [
+    "store",
+    "mission-summary content claims m2-shared namespace but response shows namespace m2-019 (collective scope)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-4c83eb7c-44ab-5738-8f6c-e205dcb1b98f",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-d96ed8a8-5dc3-5c5f-89a2-9eaabc682b9c",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "namespaces",
+    "ForbiddenError: admin role required (fail-closed)"
+   ],
+   [
+    "lineage",
+    "ValidationError: invalid direction 'up' (expected 'ancestors'/'descendants')"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error (steps 6 and 8)"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-01a0fbd1-876e-5a87-9bd5-4bb238bf8349",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 3,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "tier enum ValidationError x4 ('working' x3 in step 1, 'short_term' in step 2) before valid 'short' in step 3"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error (empty message) x3 at steps 7, 9, 10, ~30s each wasted"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-b589fbc9-16f1-5e69-9e1c-1b7bb0851fb3",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-1bae581e-43f0-5291-97b1-ccdce6438a35",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-dd415272-4d5c-5988-8936-0460a7b2c8c4",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-46d6561f-2b65-56d1-9e2c-e9533ca166bc",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": true,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error x3 (steps 7-9); no tools decided/executed, ~90s lost"
+   ],
+   [
+    "store",
+    "atomise skipped_backend_unsupported (graceful degradation)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-30de481c-4899-5d10-9f5c-6c75214fd35e",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-90eecca1-eb2f-5c9e-adab-36f6d44faeb4",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message), 3 consecutive failures at steps 7-9"
+   ],
+   [
+    "search",
+    "returned [] on every call despite recall matching the same stored content"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported (deferred)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-2f7c3e06-0838-5290-be9a-62c97c7e0622",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-e0315878-8bc0-58f8-8b61-209aa4941390",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error, empty decision (step 4)"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required, FAIL-CLOSED (steps 9-10, redundant retry)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-cac7f92d-6f8a-5a36-87f9-694900c7e7dd",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-d00608da-5348-5fa3-b11c-5dc4e0cbe997",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-ec4c054b-3d46-59ad-911c-b78b44ce4098",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-72fcddb6-cc61-5f23-83b3-90fd9cd5ee3d",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error with empty message, 5x (steps 3,4,6,7,9), ~30s wasted each"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required, 2x (steps 5,10); retried despite first fail-closed"
+   ],
+   [
+    "store",
+    "atomise skipped on all writes: backend_unsupported"
+   ],
+   [
+    "recall",
+    "semantic index unmeasured (semantic_withheld.measured=false), degraded to FTS-only"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-90a402ea-86d3-5664-b828-4a6a5167ae8a",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-c372a125-80a9-5a57-8701-47c7a2edcee8",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-b1346ffa-fa67-5fe3-bfab-4b27b761f669",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-688f6925-724b-5257-828c-0d7f3314952f",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-a6f39d9a-a2d4-56f2-b3cf-1d9826a1d3f4",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": true,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) 3x at steps 3/7/8, ~30s idle each"
+   ],
+   [
+    "search",
+    "returned [] every step despite recall matching the same stored content"
+   ],
+   [
+    "link",
+    "duplicate derives_from link re-created in step 9 (already linked in step 6)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-8f06ba43-72c2-595c-b182-296c67dc9d94",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-01797956-8f79-57b7-9a8f-9817fa9e2145",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-a13d6e0e-1884-5874-b1eb-5a015f35bee9",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-1745212c-1114-57c8-8492-c84f926eb853",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) at steps 3, 4, 5, 6, 10 \u2014 no decision produced, ~30s lost each"
+   ],
+   [
+    "namespaces",
+    "FAIL-CLOSED ForbiddenError: admin role required"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported (deferred)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-3ba73e0b-f07d-534a-8bf3-262da3d5f6a1",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-35a991ad-1e2c-5fe3-ab2e-944d7507cb81",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) on 6 of 10 steps (3,5,6,7,8,9), ~30s timeout each"
+   ],
+   [
+    "search",
+    "returned [] on every step despite stored memories matching keywords"
+   ],
+   [
+    "store",
+    "atomise deferred both times: skipped_backend_unsupported"
+   ],
+   [
+    "promote",
+    "never invoked; Fact 1 left in short tier, expires 05:20:59Z unpromoted"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-0e580823-f7b4-564c-814c-a74b908d3954",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-94967701-2c48-5901-aa7d-6407996feb12",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "link",
+    "ConflictError FAIL-CLOSED x2 (step 4): reflects_on would close a reflection cycle; recovered by switching to derives_from"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-b50dde89-559f-5305-a511-96345816bb64",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-56244a3b-22e5-5f99-971c-b9991f20688e",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-dd615115-fff3-5759-bf89-741de8034d1f",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-7514d831-b0da-5427-bcf8-d8f02e4f76d7",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-b0edf180-dc91-5a56-b67e-1f9601a63bad",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "link",
+    "duplicate edge re-created: step 5 re-linked 1070f718->da92ef2b (already done in step 4); step 6 re-created all 3 edges (daemon deduped, no harm)"
+   ],
+   [
+    "get_links",
+    "redundant identical verification x7 in steps 7-10 plus list_memories x3 - ~6min wasted, no new information"
+   ],
+   [
+    "search",
+    "anomaly: returned empty every step despite 3 stored memories in namespace; possible scoping or semantic-index issue"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-e2d6f16e-d892-5dc0-a72d-013649129e3b",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-95167216-fcb0-5c03-8d33-deafac0999ca",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-96a4df7b-b86f-5199-b393-fad53fe76404",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": true,
+  "failures_encountered": [
+   [
+    "store",
+    "Step 1 FAIL-CLOSED ValidationError: tier='working' rejected; enum requires short/mid/long"
+   ],
+   [
+    "stats",
+    "Step 5 ForbiddenError: admin role required"
+   ],
+   [
+    "decide",
+    "Steps 4/7/8/10 OpenRouter transport error (empty message), ~30s stall each"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-c8a7ac9a-b2b0-51eb-9126-b6340b7e0223",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-6ae12f46-2d44-5979-a21d-58aa26fb3d71",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-9a762fab-fd0b-5b77-b1fd-28546afb3a74",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 3,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "ValidationError: tier 'working' not in enum (short/mid/long); fail-closed on first attempt"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required; fail-closed"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error at steps 5 and 8, each wasting ~30s"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-89c18cd0-4399-5409-8547-c82c73e5492e",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": true,
+  "failures_encountered": [
+   [
+    "store",
+    "FAIL-CLOSED ValidationError: tier enum rejected 'short_term' (expected 'short'/'mid'/'long') (step 1)"
+   ],
+   [
+    "lineage",
+    "FAIL-CLOSED ValidationError: invalid direction 'up' (expected 'ancestors'/'descendants') (step 10)"
+   ],
+   [
+    "get_links",
+    "returned [] despite mission summary claiming derives_from edges were created; provenance chain never verifiably established"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-7c4356b7-e5a1-51e5-8a17-801e5306ba8f",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-9519e2b6-2061-5a6f-955a-87b6c8cea2a4",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-1cd2d95d-7da5-556b-ba6d-c0a88ba1cfc9",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error on 6 consecutive steps (3-8), ~3min dead time with zero progress"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required, fail-closed"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-04c5a1e8-2173-58bb-a819-210aa09847f1",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-7542ba69-88cd-5d63-901f-61440384ca28",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty) at steps 5, 6, 9, 10 \u2014 4/10 steps wasted ~30-50s each"
+   ],
+   [
+    "namespaces",
+    "FAIL-CLOSED ForbiddenError: admin role required (step 8)"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported (soft degradation on every write)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-4f1c2248-f39f-5dc7-980d-c93e8cc1b31e",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-5e8a7d17-21f9-5b71-8f5c-4ac0d170d9cb",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-14f5647e-8079-5276-9ed1-6df354cf3c3f",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-32cf487e-d8b4-5b1a-98b2-b9db98c56675",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": true,
+  "failures_encountered": [
+   [
+    "link",
+    "ConflictError: reflection-cycle refusal (fail-closed), repeated identically in steps 4 and 5"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error in step 9; no tool decision produced"
+   ],
+   [
+    "search",
+    "agent-initiated searches returned empty in steps 7/8/10 despite the consolidated memory existing (ambient search/recall found it)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-28108c98-2d50-59c5-9302-4ecc5c4bdfde",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-e107ca4d-aa3f-5d73-868b-d1f5114b17a6",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-60b5823d-760d-5a6e-b598-4d6bf760bf70",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-f16191a3-9546-5aea-b188-2762e1ed9737",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-3a0739cc-10a3-5095-a292-818a231a30f0",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-a240f4a9-4d04-5e68-9495-a6e0de26ad33",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "Step 1 ValidationError: tier enum rejected 'short_term' (expected short/mid/long) \u2014 fail-closed correctly"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error at steps 7, 8, 10 \u2014 no tool decisions made, run ended without final synthesis"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-6359ff2a-a1ee-59d3-9280-304e7b7ae46a",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-a1459c82-7369-58e3-a2ec-5ae6c3d48f8d",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) at steps 4, 5, 6, 8 \u2014 no tools decided, ~31s burned each"
+   ],
+   [
+    "namespaces",
+    "FAIL-CLOSED ForbiddenError: admin role required (step 10)"
+   ],
+   [
+    "get_links",
+    "returned [] for all 3 memories, yet final summary claims derives_from links exist \u2014 unverified overclaim"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-d9f0a216-e1d5-5093-bd9d-73ce2f3c9e0b",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) x7 consecutive, steps 3-9, ~30s each"
+   ],
+   [
+    "search",
+    "returned [] every step despite 2 stored memories that recall matched"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-36d9e318-e83f-5b5e-872c-2666e04a9f56",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-2a152ec3-d434-596c-b420-d5ca9c9293aa",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error at steps 6, 7, 8, 10 - four failed decision turns (~30s each, empty error body)"
+   ],
+   [
+    "search",
+    "search returned [] at every step even while recall returned 1-3 matching memories"
+   ],
+   [
+    "get_links",
+    "returned [] immediately after 3 derives_from links were created (links may live on source ids, not the consolidated id)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-ce536de1-96e9-5305-a6ca-b3053b25f342",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "stats",
+    "ForbiddenError: admin role required (fail-closed, step 4)"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error x3 (steps 6-8); no tool decision made, ~90s wasted"
+   ],
+   [
+    "store",
+    "atomise deferred/skipped: backend_unsupported"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-f6560676-cb77-54e9-8d05-80243f5678ca",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "stats",
+    "ForbiddenError: admin role required (fail-closed) on steps 3 and 4; retry wasted a step"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error at step 6; no tools decided that cycle"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-9152bcf4-5dba-5bdb-b045-771d7b61aa8a",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-ce4b6990-25ae-5c6b-8e5b-5d0b74c2494f",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-69f79f53-4073-52b6-92d3-b422467c2592",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-1a6432c2-a679-56be-ba09-63e8e07fb39a",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-920fa32d-b4f1-54fe-8961-f108568ad830",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-b84d5761-dc04-5a82-8da2-809d30b1f918",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-a8f3996a-97d6-5820-9f1a-1fcfa017e2c7",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-da004354-6e6d-51b0-883f-5c5be72f2d0d",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-c1c1ecea-4ee0-59ef-99a9-8cae0c9d37aa",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-a0b298fa-fe84-56d8-9e45-054eabe5ec5d",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error on 5 consecutive steps (4-8), ~2.5 min lost"
+   ],
+   [
+    "search",
+    "returned empty every step despite 2 memories existing in namespace"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported on both writes"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-f6436b72-b2ec-5809-9087-b04d06031ccd",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-09bf91a3-08b7-5532-a6e9-d4f8a5edd8fb",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "step 1 FAIL-CLOSED: missing required argument 'title'"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error x4 (steps 5-7, 10), ~30s stall each, mission ended on one"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required (unauthorized call, fail-closed)"
+   ],
+   [
+    "get_links",
+    "returned [] despite consolidated memory carrying derived_from/derived_from_cids metadata"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-66fbde91-b592-5941-b2ef-07cc3ca45f4a",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": true,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) at steps 4 and 5; ~62s wasted with no tool action before recovery"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-ef2f959e-59ca-58ea-b146-648d8c22391d",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-84bc8a40-f5ff-5408-8b48-7e6f10decda7",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-3120f256-5ccd-50cd-8605-c6b164f8d017",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "Pydantic enum rejection of tier='working' (3x, step 1; fail-closed)"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error, 5 consecutive steps (4,5,6,7,9), ~30s each"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-c36a33c1-85df-5648-af6b-2e6f956536a0",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-99cdddcb-85cd-5414-86f0-6e0d8cf612f9",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "lineage",
+    "ValidationError: invalid direction 'both' (expected 'ancestors' or 'descendants'); fail-closed"
+   ],
+   [
+    "signal_send",
+    "HTTP 400 invalid signal_type 'mission_complete'; failed twice (steps 9-10) via identical uncorrected retry"
+   ],
+   [
+    "get_links",
+    "returned [] though a derives_from link existed; possibly queried wrong memory, left unverified"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-b6979149-1b6d-54cd-ae30-fb273d94f90d",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-fad142fc-2871-5b7d-a865-94719f26217e",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-732e7086-7682-5234-8814-1ca8111ebc40",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-5e884c2b-91e0-5168-bbfd-fd95434fd4fd",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": true,
+  "failures_encountered": [
+   [
+    "decide/OpenRouter",
+    "step 4 transport error produced empty decision; recovered on next step"
+   ],
+   [
+    "lineage",
+    "step 10 fail-closed: invalid direction 'up' (expected 'ancestors'/'descendants')"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-a7ce06ca-821e-5f7b-8377-08caa5dee457",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-3ecfd1b1-708d-5f36-8e8f-6fe4d089c4a6",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-9451af3a-c528-5aff-97b7-d2dc3014f9e0",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "link",
+    "ConflictError (fail-closed): 2 reflects_on link attempts in step 9 refused because they would close a reflection cycle"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-02522316-7a6b-5ef2-93f8-016e3dfb7ffd",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-7e65d3b5-8f03-552d-8ef6-63efa6c74000",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-054ace14-ca42-52c7-a01d-fa9fe2f1ab3f",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-49addd7b-6010-5061-ac25-3cdf76d7c5fc",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "tier enum rejected 'working' (must be short/mid/long)"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required"
+   ],
+   [
+    "decide",
+    "OpenRouter transport errors (steps 4,7,9)"
+   ],
+   [
+    "recall",
+    "TransportError fail-closed at step 10"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-fdd19c7b-48a8-5edc-81ab-1dc5421cd1c2",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "stats",
+    "ForbiddenError: admin role required (step 2, fail-closed)"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error with empty message; no tools chosen (step 6), recovered next step"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required (step 9, fail-closed; repeat of step-2 permission failure)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-c16d9035-42e3-5e5c-b8a6-37b9615318ce",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-2710b265-eab2-50dd-95c4-d3699e269cee",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error x3 (steps 6, 8, 10), each ~30s, produced no decision"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported on every store (capability degraded)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-6cea1d72-23ca-5083-8bbe-6ea329ccdfdb",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "step 2 fail-closed: Pydantic ValidationError, tier enum rejected 'short_term'"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error on 4 consecutive steps (4-7), ~30s each, no tools decided"
+   ],
+   [
+    "list_memories",
+    "53s latency for a 3-memory namespace"
+   ],
+   [
+    "get_links",
+    "128s latency returning empty list"
+   ],
+   [
+    "store",
+    "final summary store took 110s"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-7c2f27ad-6b3c-5dcb-b7b3-09ff72db17c2",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-313d6f6a-7b59-53fd-a920-d87c6a9ed91e",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "stats",
+    "ForbiddenError: admin role required \u2014 fail-closed at step 3"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error (empty message) on 6 of 10 steps (4-6, 8-10), ~30s each, >3min dead time"
+   ],
+   [
+    "search",
+    "returned [] on every step despite recall hits in m2-116; never diagnosed"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-1e767033-61a7-5f75-828d-5c027b909638",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide (OpenRouter)",
+    "transport error on 5 of 10 steps (3,7,8,9,10), ~30s timeout each; run ended stalled with no decisions for final 4 steps"
+   ],
+   [
+    "agents",
+    "ForbiddenError: admin role required; correctly failed closed"
+   ],
+   [
+    "search",
+    "returned [] in every step despite stored, matching memories present in namespace m2-117"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-2ce0fd48-bb7f-5787-8fbc-c4c3a0f5863f",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": true,
+  "failures_encountered": [
+   [
+    "store",
+    "ValidationError: tier='working' not in {short,mid,long}; fail-closed; identical invalid call repeated at steps 1-2 before fix"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error (empty message) at steps 7-8; no tool decision produced"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-8840099d-adb4-55c0-8f73-855a2b01e83a",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-e6d9c7a4-c984-5b35-bf5f-87f05768ac7c",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error at step 3; no tools chosen, step wasted"
+   ],
+   [
+    "namespaces",
+    "FAIL-CLOSED ForbiddenError: admin role required"
+   ],
+   [
+    "lineage",
+    "FAIL-CLOSED ValidationError: invalid direction 'both' (expected 'ancestors' or 'descendants')"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-80158d48-81a6-5068-a5e1-845f60d071a1",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "link",
+    "ConflictError fail-closed 'reflection cycle' refusals on 3 attempts (steps 2 and 5, both directions)"
+   ],
+   [
+    "store",
+    "final mission-summary deliverable landed in private namespace m2-121 instead of the required shared namespace; its content text wrongly claims it was written to m2-shared, and the structured citations field is empty (ids only in prose)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-e5f7f2c6-31c8-5426-809b-e1ecab4f1b12",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-c49dbf0c-15db-5c41-b2b6-109255db6edf",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty) x5, steps 4-7 & 10"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported"
+   ],
+   [
+    "search",
+    "returned [] every step despite matching memories existing"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-819cb883-4a2a-521d-b3f7-8e65bcfe066a",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-0dadf190-c3e6-5d87-a285-c4ad1c4089c2",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty body) at steps 7-8; two decision rounds lost, ~63s wasted"
+   ],
+   [
+    "store",
+    "atomise skipped on every store: atomise_mode_reason=backend_unsupported"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-7cf32dd4-b050-5603-964e-c90d56406235",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 2,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "ValidationError: tier enum rejected 'short_term' (expected 'short'|'mid'|'long')"
+   ],
+   [
+    "store",
+    "ValidationError: tags.0 must be string, got bool"
+   ],
+   [
+    "store",
+    "ValidationError: tier enum rejected 'working'"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-bcda8a84-3e06-5b2c-816d-cdca26514853",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-5f7fb085-27cf-5575-9b4b-f2ea46407e5c",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-b78ac8a9-bdff-5cd5-b971-90e4a5f2911c",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "stats",
+    "FAIL-CLOSED ForbiddenError: admin role required"
+   ],
+   [
+    "lineage",
+    "ValidationError: invalid direction 'both' (expected ancestors|descendants)"
+   ],
+   [
+    "store",
+    "atomise skipped every write: backend_unsupported"
+   ],
+   [
+    "search",
+    "returned [] in all 10 steps despite existing memories"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-1a21005c-2d48-512d-be66-627cd2614c4b",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 1,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "ValidationError: tier='working' rejected (enum requires short/mid/long) \u2014 all 4 store attempts fail-closed, nothing ever persisted"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error on 5 steps (~30s timeout each), wasting ~150s of the run"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-5672db6e-7d73-5a02-9e5b-34b338f67015",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-623a636b-3ffb-542c-af37-161bb7a46497",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-52b27bbd-8816-5976-a245-faab0265706a",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-d6c12e64-dd7f-50cc-ba44-290c02e4421f",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-7c564ea7-604d-5f1c-8738-9e364f93a17c",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-fa165026-5408-5d1f-b2db-f8afa386ba50",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-0a28d6fb-53f3-5873-8d58-8f6114ad7908",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-72fc9479-1b86-5000-b919-22cdef6d546b",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-9c071164-a9e6-5d89-861c-8b84b872c460",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error at steps 3,5,6,8 (~30s wasted each)"
+   ],
+   [
+    "search",
+    "returned [] every step despite stored memories matching recall queries"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-768ea49c-810e-50a7-9586-2d60cc8b1ea0",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-e1e95302-1e26-5915-bbf3-271eefb23fbc",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-08dd86a1-2890-5c50-87c0-77534faba847",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-73f8cea7-481e-5433-bea5-28a7a296f408",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-eafbfdcb-782c-57c3-9af6-f149ada2d739",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-6ba83d3e-e84b-57a8-94da-ac465f827a79",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-6e9cccba-d4ad-5285-8192-3cca521ead22",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-69388a34-8eeb-5bac-b95e-e900fcc0e472",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-0d0f8948-c698-51aa-abd8-fa4ae875870c",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message), 3 consecutive failures at steps 4-6, ~95s lost"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required (fail-closed)"
+   ],
+   [
+    "agents",
+    "ForbiddenError: admin role required (fail-closed)"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-d7f84e9a-d686-50e5-b046-3d24009f7f2e",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-8666238a-db08-5093-8b0c-cc63b5771b68",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 3,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error on 5 steps (2,3,4,8,9); no decisions made, ~30s wasted each"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required, fail-closed"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-f860f631-9cb0-52df-bd24-6db32ed07910",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-d81b609c-2bd5-51ce-afbd-32072a72a9d6",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-ed020db9-a0df-5341-8223-51f333a3d816",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-6f77fda2-85e0-5757-9767-ddf77ba1731f",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 3,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) on steps 2-5 and 10 \u2014 no tool selection possible, ~30s wasted per step"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported"
+   ],
+   [
+    "search",
+    "returned empty results every step (sparse namespace)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-a20b7923-ffb8-5295-8844-cded3c9ca3ec",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error on 5 of 10 steps (2,6,8,9,10), each burning ~30s"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported (deferred mode)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-4b30f9da-0ce0-55dc-9239-6a3623b0ac23",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-8b1996ba-8a97-5688-92ae-9e707844e9db",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-a2293482-bfcb-5213-8937-38f5218acd0b",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-707371bc-3324-56dc-a0fd-675a9a597b6c",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-ed7b9f92-a53f-5d7d-ac52-518b34e127db",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 2,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "fail-closed ValidationError: tier='working' invalid, enum requires short/mid/long"
+   ],
+   [
+    "decide (OpenRouter LLM)",
+    "blank transport error with ~30s timeout on 6 of 10 steps"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-c97ed7c4-52ef-5ccd-89b3-ca8f9675b762",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-de4d0cd0-4f96-53f3-bfb1-8af073e2bdfa",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-37d81e5a-c034-5e24-bae2-40be82be31c0",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-39a840bc-aa8c-5a97-a0ad-00d13732a090",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-937c36b2-7c1d-5203-852f-a9c0e3c44d6f",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-42303c40-df20-550f-a8c1-828d2e85e7f3",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-e05958b3-eefd-544a-b824-d07bcf3ad05a",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-b4b7f33f-a36b-5ea7-9c6c-556c02b1e23a",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-ddc436b2-fbb6-55bc-bc97-2c7b28239d4d",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 1,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "ValidationError: tier 'working' invalid (expected short/mid/long) - fail-closed"
+   ],
+   [
+    "decide/OpenRouter",
+    "transport error ~30s timeout, occurred 4x (steps 2,3,5,10)"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required - fail-closed"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-b5029145-f265-51d7-b117-5a7c89a2b9eb",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 3,
+  "latency_acceptable": true,
+  "failures_encountered": [
+   [
+    "store",
+    "Step 1 ValidationError: tier='working' rejected, enum requires short/mid/long (fail-closed)"
+   ],
+   [
+    "namespaces",
+    "Step 7 ForbiddenError: admin role required (fail-closed)"
+   ],
+   [
+    "decide/OpenRouter",
+    "Steps 5, 8, 9 transport errors (empty), 3 decision cycles lost ~90s"
+   ],
+   [
+    "search",
+    "Returned [] every step despite 2 stored matching memories that recall surfaced"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-fbac3804-252e-59aa-96f0-ffc497f9f83b",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-bc3839b2-274d-5894-9016-f65509aa2b37",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "step 1: ValidationError - tier 'working' rejected (enum is short/mid/long); daemon fail-closed correctly"
+   ],
+   [
+    "decide",
+    "step 6: OpenRouter transport error (empty decision), step lost"
+   ],
+   [
+    "decide",
+    "step 9: OpenRouter transport error (empty decision), step lost"
+   ],
+   [
+    "search",
+    "returned [] on every call despite 3 stored memories in m2-172; suspected indexing/query-matching bug"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-a6993121-eaa3-58ae-97f2-d1f9d078d103",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-3877f514-3ba3-5d3c-93d7-045fe0646ac0",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-387c6886-3fc3-58d0-b25f-0b0e9e6291b7",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-c33e8da5-61b2-5897-8c44-ae558fe0ca06",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": true,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) on steps 3, 8, 9 \u2014 no tools executed, ~30s wasted each"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported (mode deferred)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-9e8d13b0-b097-5d86-b0ca-7349045486d6",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-a4d18442-8440-5390-bda9-6197ef2bbb77",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) on steps 6, 7, 8, 10 \u2014 repeated ~30s timeouts with no backoff"
+   ],
+   [
+    "get_links",
+    "returned [] even though consolidated memory carries derived_from/derived_from_cids lineage metadata"
+   ],
+   [
+    "search",
+    "returned [] on every call while hybrid recall matched the same stored content; FTS appears not to be indexing"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported (deferred mode)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-d1998878-73c1-5e74-a051-d24690c1ae90",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-69b93162-ad64-5666-be2c-fe7eb3ac7446",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-e2f24536-1ba8-5982-a195-3284a4f0553c",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-e39d5fe4-a7f9-51af-88d2-9b4205b2de13",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-6a5a9ca7-5dc8-5c0a-9a39-8a9aea0a8863",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-1c4a7d78-1f72-5e89-8ddd-998587a3511a",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-423b6f37-f855-5133-be89-3e690ccf1cbc",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-3eea63e3-945b-5f72-b639-54f7464b267d",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (5x: steps 4-7, 9)"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-1ddaa21d-6ff8-5f55-a996-be1c3762d695",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 3,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error on 3 consecutive decision steps (6-8); no tools chosen, ~90s lost"
+   ],
+   [
+    "link",
+    "duplicate calls re-issued already-existing derives_from edges in steps 4-5 (idempotent ok)"
+   ],
+   [
+    "recall",
+    "team-scoped short-tier memory c6784194 never surfaced in recall or list_memories results"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-dd6b262e-8681-517d-9220-34f47a9b89d9",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) at steps 2, 6, 7; each wasted ~30s before retry"
+   ],
+   [
+    "lineage",
+    "FAIL-CLOSED ValidationError: invalid direction 'up' (expected 'ancestors'/'descendants') \u2014 agent param error, but clean fail-closed"
+   ],
+   [
+    "store",
+    "atomise skipped on all 3 stores: backend_unsupported (atomise_mode deferred)"
+   ],
+   [
+    "search",
+    "returned [] at steps 9-10 for source facts post-consolidation while recall/list_memories still returned the consolidated claim"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-4f245a36-d293-5925-b3a9-2d240686d0c9",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 3,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "OpenRouter decide call",
+    "transport error (empty message) on 6 of 10 steps (2-5,9,10), ~30s each, no tools decided"
+   ],
+   [
+    "recall",
+    "semantic_withheld measured=False -> hybrid degraded to FTS-only"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-dea7a7a7-175a-53fa-828e-c1d277c1a01f",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-8fdc56fb-a378-5dc7-8970-ec72c557db60",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-ee29014e-90dd-5eb2-bdb6-59cd46667ece",
+  "assessment_invalid": true,
+  "error": "Expecting ',' delimiter: line 1 column 291 (char 290)"
+ },
+ {
+  "agent_id": "ai:m2-glm-71f86c37-84bb-535e-a236-242d002ccf49",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-17545cda-56a6-5429-9b9e-21236e0b06f9",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "Step 8 lost to OpenRouter transport error (empty message)"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported on both stores"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-2171f3a2-4050-50cc-a3d3-79efd4a38af8",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": true,
+  "failures_encountered": [
+   [
+    "namespaces",
+    "ForbiddenError: admin role required (fail-closed)"
+   ],
+   [
+    "search",
+    "returned empty results in all 10 steps despite memories existing in namespace"
+   ],
+   [
+    "store/atomise",
+    "skipped: atomise_mode backend_unsupported"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-0ac95633-774a-5d52-b19c-80470c094af7",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-1d20c724-d753-5152-bd20-8b2fd2588aac",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": true,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (step 5, empty message) \u2014 step produced no tool calls"
+   ],
+   [
+    "lineage",
+    "invalid direction 'down' (expects 'ancestors'/'descendants'); 3x fail-closed in step 7, lineage never successfully run"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-7bde9f56-1795-5b4d-a6ee-17f6de34140b",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-92264d8b-56b6-53c0-ae01-039c83583305",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-14503c7c-e9ca-5f25-8e7e-04a392379810",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-56c1c212-18ca-55f1-b54c-f6f3bf89d37e",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-64ad3ddd-b141-5bdd-a280-18fdcf201cf8",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-043f5ff3-ed9d-5c53-b912-b1ffda541907",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-e143f787-7676-5147-9861-6b17bfc4e994",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide (OpenRouter)",
+    "transport error with empty message occurred 4 times (steps 2, 4, 7, 9), ~30s wasted each, 40% of steps produced no action"
+   ],
+   [
+    "search",
+    "returned [] in step 10 despite the consolidated long-tier memory being present in recall (possible index lag or query mismatch)"
+   ],
+   [
+    "store",
+    "atomise skipped on every write: backend_unsupported; semantic_withheld measured=False so semantic channel unverified"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-1055d1cd-bc99-51f3-b142-79019476ec49",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "link",
+    "ConflictError: reflects_on link a7628d70->f1afcb67 refused (would close reflection cycle), fail-closed"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error produced empty decision steps (steps 4 and 6)"
+   ],
+   [
+    "store",
+    "atomise skipped on all 3 stores: backend_unsupported"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-9a467afb-a870-5dbc-bc0a-982a7a1c82fb",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 3,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) on 4 of 10 steps"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required (fail-closed)"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported"
+   ],
+   [
+    "recall",
+    "semantic_withheld measured=false every step; semantic scoring never actually measured"
+   ],
+   [
+    "search",
+    "returned empty every step despite recall returning stored memories"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-a82637ef-adae-5cd6-ad50-c66fb282f4d5",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 1,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "tags passed as list-of-lists (tags.0 not a string); Pydantic ValidationError, fail-closed x3 in step 1"
+   ],
+   [
+    "store",
+    "tier='working' invalid enum; must be short/mid/long (step 2)"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error x4 (steps 3,6,7,9), ~30s each, no tools decided"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-df40a3ff-d4aa-567e-92a5-b85173207ed3",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 3,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error x7 (steps 2-6, 8, 10), each burning ~30s and blocking tool selection"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-5f125d68-7322-5adf-ba8a-9891778600fa",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) on 6 of 8 decision rounds (steps 3,5,6,7,8,9), ~30s wasted each"
+   ],
+   [
+    "store",
+    "atomise deferred/skipped: backend_unsupported (store itself ok)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-7827c529-8af8-5a89-928b-1febe51105b1",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) on steps 2, 7, 9; ~30-40s lost each"
+   ],
+   [
+    "lineage",
+    "step 10 fail-closed: ValidationError invalid direction 'up' (expected 'ancestors'/'descendants'); 133s step"
+   ],
+   [
+    "consolidate",
+    "required by mission but never invoked; summary was hand-written instead"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-07c90751-2fa4-5314-a6ba-e56c22c6b0b3",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error x3 (steps 4-6), no tools decided, ~90s wasted"
+   ],
+   [
+    "search",
+    "returned [] on every step despite stored memories existing"
+   ],
+   [
+    "get_links",
+    "always [] \u2014 link() never called, so link graph/lineage/consolidate untested"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported (deferred)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-836efee6-9743-5e12-be5c-2656558d66c7",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-17693e80-6939-5836-9f3d-385d8574d1b1",
+  "assessment_invalid": true,
+  "error": "OpenRouterError: malformed OpenRouter response: missing assessment content"
+ },
+ {
+  "agent_id": "ai:m2-glm-1d270ae5-cd6e-5453-8a4b-f7722874ddc7",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-f4368566-e396-522f-a5a6-126b3ba76c7a",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "ValidationError: tier 'short-term' not in enum short/mid/long \u2014 3 fail-closed attempts (step 1)"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error (step 3)"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required, fail-closed (step 10)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-f63b231b-f0a9-5b1c-bfea-254ac392ac45",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 3,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (step 3, empty message)"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error (step 10, empty message)"
+   ],
+   [
+    "stats",
+    "ForbiddenError: admin role required (fail-closed)"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required (fail-closed)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-cac88476-f906-5ea1-931e-38bda3102165",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-b2d9c076-d26b-565f-918f-62eb57731572",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty detail) on 6 of 10 steps (3,4,5,6,8,9), ~30s each"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported"
+   ],
+   [
+    "search",
+    "returned [] on every step despite stored memories (query/index mismatch suspected)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-d1b86e8c-9bed-57c3-ae4f-c0a0459e3402",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error on steps 2, 5, 6, 8, 9 - no tool decision made, ~30s wasted each"
+   ],
+   [
+    "link",
+    "step 4: two links refused FAIL-CLOSED (ConflictError: would close reflection cycle)"
+   ],
+   [
+    "link",
+    "step 4: duplicate derives_from 795f97b4->5c65710e re-created (already linked in step 3)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-ae742aab-9be6-59d7-a818-4a12f01c0375",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-d624e577-e271-5cea-b1ed-ed77e85518ed",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 1,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) on 5 of 10 steps, each burning ~30s timeout"
+   ],
+   [
+    "store",
+    "fail-closed ValidationError: tier 'working' not in enum ('short','mid','long')"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-e9ba99ce-3c44-50dc-9b99-c3caac92c879",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-2f4be57e-bf4c-5cbe-b68e-30bad1506ab7",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-cd27e35f-989f-50b8-8e9e-edb2f03595b2",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 2,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) on 6/10 steps, each burning ~30s"
+   ],
+   [
+    "store",
+    "fail-closed ValidationError: tier='episodic' rejected; enum requires short/mid/long"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-952b4dce-3894-5e64-af8a-e82892d3c18f",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-7a7fa208-1c35-5dee-a43e-fb4de2cbd904",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 2,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "FAIL-CLOSED ValidationError: tier='working' rejected, enum requires short/mid/long; nothing ever persisted"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error (empty message) on steps 2-8 and 10, ~30s timeout each, blocking all decisions"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-8e9e4738-1315-5c35-bf33-a377c84d8385",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-12c1060b-916e-5687-965f-2baa972321cc",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": true,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error at steps 4 and 5; no tool chosen, ~30s lost each"
+   ],
+   [
+    "search",
+    "returned empty results in all 10 steps despite memories being stored"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported (deferred)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-98fa9400-0357-5baf-8f7b-b72989706d73",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "link",
+    "ConflictError: all 3 reflects_on link attempts refused (would close a reflection cycle)"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error (empty message) x5 across steps 5-9; no tools decided"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-3633edf3-9e5a-51b4-be55-03f181a862c9",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-05acf15a-35c6-5d1b-bc0d-5497c8a1b549",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-6f03031a-55e1-5611-b073-a3b2cf49271f",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-a276417f-0942-58b0-89d0-1c751bc1fea8",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error at steps 2, 4, 6 (3x, ~30s wasted each)"
+   ],
+   [
+    "search",
+    "returned [] every step despite 2 stored memories existing"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-dcf13710-f0a4-5ff8-ad87-9d1b4efa870b",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-1a16ce6b-8d1c-57c6-9149-15fef6de7320",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-816fb1d6-6967-5868-a185-1665d0487afe",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-26760cb0-4e97-5651-96cb-7f9556a5c09e",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 3,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) on 6 of 10 steps (1,3,5,7,9,10), each after ~30s timeout"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported (atomise_mode_configured='deferred')"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-3c7dc01d-7967-5ecf-a2c3-2031b28c3e5d",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error at steps 4 and 6 (~31s each, empty error message)"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required - fail-closed, namespace listing denied"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-47aef9f3-2618-5f70-b4d3-065eb176fd16",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 3,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message), 5x at steps 3,4,5,7,9"
+   ],
+   [
+    "store",
+    "atomise skipped: backend_unsupported (degraded, non-blocking)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-f05fff3e-74c1-581c-9805-87200872c8a7",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": true,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error x4 (steps 4, 5, 6, 8; ~2min dead time)"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required (correctly failed closed)"
+   ],
+   [
+    "get_links",
+    "returned only 1 of the 2 derives_from links created in step 7 (direction filter unclear)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-6a4d0bd9-1242-5735-bd7a-cb076216c0c5",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-c2f1bbc3-9297-5bb6-85f1-ec5033965e56",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) 4x \u2014 steps 1,4,7,8, ~30-40s wasted each"
+   ],
+   [
+    "search",
+    "returned [] at steps 1 and 10 despite stored content existing"
+   ],
+   [
+    "atomise",
+    "skipped_backend_unsupported on every store call"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-cca06324-bb98-5410-ac4e-f44ec32e175c",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-6dd429ca-63f9-52c4-942c-0e906e4239eb",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-2bd1b260-03e3-50c2-a7e5-c051a1db28c4",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 2,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "ValidationError: tier enum requires 'short'/'mid'/'long', got 'short-term' (3 calls, fail-closed, never retried corrected)"
+   ],
+   [
+    "stats",
+    "ForbiddenError: admin role required (attempted twice)"
+   ],
+   [
+    "namespaces",
+    "ForbiddenError: admin role required"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error, no tool chosen (steps 5, 9, 10)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-11968e61-1d2a-5f37-8958-9d499bca2cd1",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-62da174d-b5c2-519b-b62a-91d690fe2cfa",
+  "assessment_invalid": true,
+  "error": "Expecting value: line 1 column 1 (char 0)"
+ },
+ {
+  "agent_id": "ai:m2-glm-828670af-4e3a-5e75-817c-7b09cebe2f01",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 2,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide/OpenRouter",
+    "transport error with empty message on steps 1-4; each step burned ~30s and produced no decision"
+   ],
+   [
+    "agent-loop",
+    "after recovery, 6 consecutive list_memories calls (all empty) with no memory writes, outputs, or progress"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-544c251e-5123-5d71-afbd-90425561b940",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-5cf09c3f-d525-569a-8128-398a55e37c3a",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 1,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) on 7 of 10 steps; no decision produced"
+   ],
+   [
+    "recall",
+    "returned count=0 memories on every step; nothing retrievable (consistent with an empty/unseeded store)"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-ccf6bf60-4ba6-59d8-b610-edc25e679f04",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 1,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "decide",
+    "OpenRouter transport error (empty message) on steps 1-3 and 9, each stalling ~30s"
+   ],
+   [
+    "list_memories",
+    "looped 6x returning [] every time; no recovery or alternate action attempted"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": false,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-55607618-dcb7-5687-903b-5d20f6074f17",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": false,
+  "failures_encountered": [
+   [
+    "store",
+    "tier 'working' rejected by Pydantic enum validation; request correctly fail-closed (step 2)"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error x5 (steps 1,6,7,8,9), ~30s burned per failed decision"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ },
+ {
+  "agent_id": "ai:m2-glm-29c141dc-f837-5bb2-be9c-8ab0ca776a1c",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-82dba56e-64ea-5747-853c-8893e151bc36",
+  "assessment_invalid": true,
+  "error": "free_text must be a string of at most 600 characters"
+ },
+ {
+  "agent_id": "ai:m2-glm-2b44e1ee-2357-5667-848a-e37001c41011",
+  "assessment_invalid": false,
+  "error": null,
+  "recall_usefulness": 4,
+  "latency_acceptable": true,
+  "failures_encountered": [
+   [
+    "store",
+    "FAIL-CLOSED ValidationError: tags contained bool (False) instead of string (step 1), fixed on retry"
+   ],
+   [
+    "decide",
+    "OpenRouter transport error x4 (steps 5, 6, 7, 9), ~30s each wasted with no decision"
+   ],
+   [
+    "search",
+    "returned [] on every step despite 3 stored matching memories in namespace"
+   ],
+   [
+    "store",
+    "atomise deferred: backend_unsupported"
+   ]
+  ],
+  "isolation_respected": true,
+  "would_rely_on_it": true,
+  "free_text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ }
+]
