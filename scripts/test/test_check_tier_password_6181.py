@@ -134,6 +134,26 @@ class TestCheckTierPassword6181(unittest.TestCase):
         r = self.run_check(f"postgres://u:{GOOD}@h:5445/db?user=ai_memory&dbname=ai_memory_test&sslmode=disable")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
+    def test_every_host_of_a_multi_host_url_is_checked_6872(self):
+        # #6872: libpq URIs carry a comma-separated host list (`h1:5445,h2:5446`, `?host=h1,h2`), and every entry is
+        # on psql argv.  A password that contains any one host of 8+ characters is refused, as for a single host.
+        host = "replicahost27"
+        pw = "Zq8Lm" + host + "Wv3Kd9Tg"
+        for url in (f"postgres://u:{pw}@h1:5445,{host}:5446/db",
+                    f"postgres://u:{pw}@{host},h1/db",
+                    f"postgres://u:{pw}@[::1]:5445,{host}:5446/db",
+                    f"postgres://u:{pw}@h1:5445,[::1]:5446,{host}/db",
+                    f"postgres://u:{pw}@h1/db?host=h1,{host}",
+                    f"postgres://u:{pw}@/db?hostaddr=10.0.0.1,{host}"):
+            with self.subTest(url=url.split("@", 1)[1]):
+                self.assert_refused(url, "contains the host component", [pw, host])
+        # control: the same rule for a single host, and a distinct password with a host list still passes
+        self.assert_refused(f"postgres://u:{pw}@{host}:5445/db", "contains the host component", [pw, host])
+        for url in (f"postgres://u:{GOOD}@h1:5445,h2:5446/db", f"postgres://u:{GOOD}@[::1]:5445,{host}/db?host=a,b"):
+            with self.subTest(passes=url.split("@", 1)[1]):
+                r = self.run_check(url)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
     def test_no_value_is_ever_printed(self):
         user, db, pw = "tierroleXq93", "tierdbXq93zw", "tierpwXq93"
         for url in (f"postgres://{user}:{pw}@h:5445/{db}",  # short
