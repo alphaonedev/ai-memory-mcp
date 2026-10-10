@@ -660,6 +660,7 @@ SWEEP_RUN = (
     "# #7018 — the upload, attest and release steps publish dist/ai-memory*: require",
     "# dist to hold exactly the checked tarball, deb and rpm and one sidecar each.",
     "cd ..",
+    "# shellcheck disable=SC2016 # the single-quoted bind body is expanded by the cleared inner bash",
     PACK_BIND,
     DIST_CHECK,
 )

@@ -540,6 +540,7 @@ jobs:
           # #7018 — the upload, attest and release steps publish dist/ai-memory*: require
           # dist to hold exactly the checked tarball, deb and rpm and one sidecar each.
           cd ..
+          # shellcheck disable=SC2016 # the single-quoted bind body is expanded by the cleared inner bash
           /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "0d4c87e4cc9af8bba63e159eaaa402b91e43996b55ed8ee1f8e72ce7f668d8de *scripts/release/reproducible_build.py"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
           /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -I scripts/release/reproducible_build.py --verify-dist dist --tarball "ai-memory-${{ matrix.target }}.tar.gz" --expect-sha256 "$ASSERTED_SHA256"
         env:
