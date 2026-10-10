@@ -612,6 +612,10 @@ class Round11EchoMask(unittest.TestCase):
         self.assertEqual(SUBSET.echo("      PASSWORD: hunter2"), repr("      PASSWORD: <withheld 7 chars>"))
         self.assertEqual(SUBSET.echo("  - name: q"), repr("  - name: <withheld 1 chars>"))
         self.assertEqual(SUBSET.echo("PASSWORD:"), repr("PASSWORD:"))
+        # The kept key may be quoted or follow a tab; both stay a key and keep their shape.
+        self.assertEqual(SUBSET.echo("'NOTE': " + self.TAIL), repr("'NOTE': <withheld 11 chars>"))
+        self.assertEqual(SUBSET.echo('"NOTE":\t' + self.TAIL), repr('"NOTE":\t<withheld 11 chars>'))
+        self.assertEqual(SUBSET.echo("\tNOTE: " + self.TAIL), repr("\tNOTE: <withheld 11 chars>"))
 
     def test_mask_shapes_the_round11_campaign_left_unkilled(self):
         """Mutants Y3 (quote allowed in an operand), Y4 (ghs_ prefix) and V7 (= as a row separator) survived."""
