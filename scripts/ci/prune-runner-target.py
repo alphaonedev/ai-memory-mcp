@@ -149,9 +149,15 @@ CONTROL_RE = re.compile("[\x00-\x1f\x7f]")
 # Unicode categories that print as nothing or move text around (#6299): Zl / Zp
 # (U+2028 / U+2029 line and paragraph separators), Cf (bidi, zero-width and
 # other format characters), Co (private use), Cn (unassigned / noncharacter),
-# and Cc, which after CONTROL_RE is only the C1 range (#6313).
+# and Cc, which after CONTROL_RE is only the C1 range (#6313).  Also Zs
+# (space separators: no-break, em, ideographic ...; U+0020 itself is exempt
+# below), Mn (combining marks) and Me (enclosing marks), which print blank or
+# attach to the previous character so a name reads as a different one (#6299).
 # Cs only reaches here from a lone surrogate.  Written as \\u{hex}.
-INVISIBLE_CATEGORIES = frozenset({"Zl", "Zp", "Cf", "Cs", "Co", "Cn", "Cc"})
+INVISIBLE_CATEGORIES = frozenset({"Zl", "Zp", "Zs", "Mn", "Me", "Cf", "Cs", "Co", "Cn", "Cc"})
+# Letters and symbols that render as blank space: the Hangul fillers and the
+# blank braille pattern (#6299).
+INVISIBLE_CODE_POINTS = frozenset({0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800})
 WARNING_PREFIX = "::warning::prune-runner-target: "
 
 
@@ -169,13 +175,22 @@ def _escape(text: str) -> str:
     on) becomes ``\\xNN`` (#6254).  A C1 control code point becomes ``\\u{hex}``,
     never ``\\xNN``, because ``\\xNN`` is reserved for an undecodable raw byte
     (#6313), and so does every code point that prints as nothing or reorders
-    text (U+2028 / U+2029, bidi and zero-width format characters, private-use
-    and unassigned code points) (#6299).
+    text (U+2028 / U+2029, bidi and zero-width format characters, space
+    separators other than U+0020, combining and enclosing marks, the Hangul
+    fillers and the blank braille pattern, private-use and unassigned code
+    points) (#6299).
     """
     text = os.fsencode(text).replace(b"\\", b"\\\\").decode("utf-8", "backslashreplace")
     text = text.replace("%", "%25").replace("#", "%23").replace("\r", "%0D").replace("\n", "%0A")
     text = CONTROL_RE.sub(lambda m: "\\x%02x" % ord(m.group()), text)
-    return "".join("\\u{%x}" % ord(ch) if unicodedata.category(ch) in INVISIBLE_CATEGORIES else ch for ch in text)
+    return "".join("\\u{%x}" % ord(ch) if _invisible(ch) else ch for ch in text)
+
+
+def _invisible(ch: str) -> bool:
+    """True for a code point ``_escape`` writes as ``\\u{hex}`` (#6299, #6313)."""
+    if ch == " ":
+        return False
+    return ord(ch) in INVISIBLE_CODE_POINTS or unicodedata.category(ch) in INVISIBLE_CATEGORIES
 
 
 OTHER_FS = "on an other file system (a mount inside the target dir); never descended, left in place"

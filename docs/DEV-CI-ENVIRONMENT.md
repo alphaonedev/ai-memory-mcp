@@ -179,7 +179,7 @@ controls, both pinned by `scripts/test/test_ci_runner_target_hygiene_6118.py`
   the `::notice::` line carries `warnings=<n>`, and the exit code is still 0:
   the step runs under `if: always()` and a finished prune must not turn a job
   red (#6300). Only the refusals above exit 2. Names in those lines are
-  escaped (a backslash `\\`, `%` `%25`, `#` `%23`, CR `%0D`, LF `%0A`, any other C0 control character or DEL `\xNN`, a non-UTF-8 byte `\xNN`, a C1 control code point U+0080-U+009F `\u{hex}` (never `\xNN`, so it cannot print the same as the raw byte), and U+2028 / U+2029, bidi, zero-width, private-use and unassigned code points `\u{hex}`),
+  escaped (a backslash `\\`, `%` `%25`, `#` `%23`, CR `%0D`, LF `%0A`, any other C0 control character or DEL `\xNN`, a non-UTF-8 byte `\xNN`, a C1 control code point U+0080-U+009F `\u{hex}` (never `\xNN`, so it cannot print the same as the raw byte), and U+2028 / U+2029, bidi, zero-width, space separators other than U+0020, combining and enclosing marks, the Hangul fillers U+115F / U+1160 / U+3164 / U+FFA0, the blank braille pattern U+2800, private-use and unassigned code points `\u{hex}`),
   so a file name cannot start a workflow command of its own (the runner also
   parses the legacy `##[command]` form anywhere in a line). A directory nested
   more than 100 levels deep is warned about and left in place. `freed_bytes`
