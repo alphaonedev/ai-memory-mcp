@@ -2607,6 +2607,13 @@ def _self_test_cases() -> int:
               hidden=(empty_canary,), shown=(empty_shown,), count=1)
     masks("#6929 R6 a later @ with a host still ends the userinfo before an empty-host shape",
           "https://u:6163Canary29e@/x@h.co/db", hidden=("6163Canary29e",), shown=("h.co/db",), count=1)
+    # #6859 (round-6 mutant survivors): a host followed directly by a query, and the empty-host alternatives one by one.
+    masks("#6851 R6 a host followed directly by a query ends the userinfo",
+          "https://u:6163Canary51q@h.co?x=1", hidden=("6163Canary51q",), shown=("h.co?x=1",), count=1)
+    for bound_char, bound_canary in (("/", "6163Canary29f"), ("?", "6163Canary29g"), ("#", "6163Canary29h")):
+        masks(f"#6929 R6 an empty host followed by {bound_char} ends the userinfo and keeps the rest of the line",
+              f"see https://u:{bound_canary}@{bound_char}x end", hidden=(bound_canary,), shown=(f"@{bound_char}x end",),
+              count=1)
 
     # #6163 round 5 (#6663, #6614): a YAML comment line between a bare credential name and its value passes the wait
     # on, and a comment after the bare name or after a block indicator does not hide the name from the mask. The
@@ -2783,6 +2790,9 @@ def _self_test_cases() -> int:
     masks("#6852 R6 L8 a triple quote opened beyond the first 2000 characters of a long line is closed by its mate",
           "z" * 2100 + ' token = """x\n6163CanaryL8\n"""\nafter-shown-6163', hidden=("6163CanaryL8",),
           shown=("after-shown-6163",), count=3)
+    masks("#6852 R6 L11 a triple single quote opened beyond the first 2000 characters of a long line is closed by its mate",
+          "z" * 2100 + " token = '''x\n6163CanaryL11\n'''\nafter-shown-6163", hidden=("6163CanaryL11",),
+          shown=("after-shown-6163",), count=3)
     masks("#6852 R6 L9 a long line with no credential word does not hold the next line",
           "z" * 2100 + "\nvisible-6163-next\nafter-shown-6163", shown=("visible-6163-next", "after-shown-6163"),
           count=1)
@@ -2848,6 +2858,30 @@ def _self_test_cases() -> int:
          legit_report[:300])
     unit("#6853 R6 the default work budget is 262144 (literal pin)", getattr(Redactor(), "budget", None) == 262144,
          str(getattr(Redactor(), "budget", None)))
+    # #6859 (round-6 mutant survivors): the work an over-long line costs, the header rows of a hidden diff, the counts of
+    # a hidden text, the two sides of a diff block and the note of a run that masked nothing.
+    free_text = "\n".join(["y" * (MAX_MASK_LINE + 500)] * 150 + ["keep-6163"])
+    free_redactor = Redactor()
+    free_got = free_redactor.mask(free_text)
+    unit("#6853 R6 over-long lines cost no work: 150 of them leave the budget whole and the next line is shown",
+         "keep-6163" in free_got and free_redactor.over_budget == 0 and free_redactor.work == 2 * len("keep-6163")
+         and not any("masking budget" in note for note in free_redactor.note()),
+         f"work={free_redactor.work} over={free_redactor.over_budget}")
+    unit("#6853 R6 a hidden diff keeps its header rows as written",
+         hot_report.startswith("--- base\n+++ head\n@@ ") and "\n@@ -" in hot_report, hot_report[:120])
+    count_redactor = Redactor()
+    count_redactor.budget = 4
+    count_got = count_redactor.mask("abc\ndef\nghi")
+    unit("#6853 R6 a text hidden whole counts each line and the note names the count",
+         count_got == "\n".join([MASK] * 3) and count_redactor.count == 3 and count_redactor.over_budget == 3
+         and any("3 line(s)" in note for note in count_redactor.note()),
+         f"{count_got!r} count={count_redactor.count} over={count_redactor.over_budget}")
+    side_redactor = Redactor()
+    side_redactor.budget = 2 * 10
+    side_report = unified("a" * 12, "b", "## Sec", side_redactor)
+    unit("#6853 R6 both sides of a diff block are charged: an old side that alone exceeds the budget is hidden",
+         side_redactor.over_budget > 0 and "a" * 12 not in side_report, f"over={side_redactor.over_budget}\n{side_report}")
+    unit("#6853 R6 a run that masked nothing has no note", Redactor().note() == [], str(Redactor().note()))
 
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
