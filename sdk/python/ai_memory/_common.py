@@ -30,6 +30,7 @@ from urllib.parse import quote
 import httpx
 from pydantic import BaseModel
 
+from ai_memory import _acl
 from ai_memory._version import __version__ as _SDK_VERSION
 from ai_memory.errors import TransportError, raise_for_status
 from ai_memory.models import CreateMemory
@@ -247,6 +248,73 @@ def _refuse_foreign_owner(what: str, path: str, info: os.stat_result) -> None:
     )
 
 
+def _refuse_foreign_acl(what: str, path: str, fd: int) -> None:
+    """Refuse the open object ``fd`` when an extended ACL lets someone else change it (#6934).
+
+    The mode-bit rules above cannot see a macOS ACL entry such as ``everyone
+    allow add_file,delete_child``, which lets another account replace what is
+    under a ``0755`` directory or rewrite a ``0644`` file. Allow entries that
+    grant a change right (:data:`ai_memory._acl.CHANGE_RIGHTS`) to anyone but
+    this user or root are refused; an ACL that cannot be read is refused too
+    (fail closed). A no-op where the platform has no extended ACL.
+    """
+    if not _acl.reads_acls():
+        return
+    try:
+        granted = _acl.foreign_acl_rights(fd, _acl.CHANGE_RIGHTS)
+    except _acl.AclUnreadable as exc:
+        raise ValueError(
+            f"verify= {what} {path!r} carries an extended ACL that cannot be read ({exc}); "
+            "it is refused because an ACL entry could let another user change which "
+            "servers this client trusts (#6934)."
+        ) from None
+    if granted:
+        raise ValueError(
+            f"verify= {what} {path!r} carries an extended ACL granting "
+            f"{_acl.describe(granted)} to a principal other than this user or root: "
+            "that principal could change which servers this client trusts. Remove the "
+            f"entry (chmod -N {path}) or pass a CA path only its owner can change (#6934)."
+        )
+
+
+def _refuse_foreign_acl_on_directory(
+    what: str, path: str, directory: str, held: os.stat_result
+) -> None:
+    """:func:`_refuse_foreign_acl` for ``directory``, opened and bound to ``held`` (#6934).
+
+    The directory is opened once, without following a link, and must be the
+    inode ``held`` (its ``stat``) describes, so the ACL read is the ACL of the
+    directory the mode rules just judged. A directory that cannot be opened
+    cannot have its ACL read and is refused (fail closed).
+    """
+    if not _acl.reads_acls():
+        return
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(directory, flags)
+    except OSError as exc:
+        raise ValueError(
+            f"verify= {what} {path!r}: the directory {directory!r} cannot be opened to read "
+            f"its ACL ({exc.strerror}); it is refused (#6934)."
+        ) from None
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (held.st_dev, held.st_ino):
+            raise ValueError(
+                f"verify= {what} {path!r}: the directory {directory!r} changed while "
+                "its ACL was being read (#6934)."
+            )
+        _refuse_foreign_acl(what, directory, fd)
+    except OSError as exc:
+        raise ValueError(
+            f"verify= {what} {path!r}: the directory {directory!r} cannot be checked "
+            f"({exc.strerror}) (#6934)."
+        ) from None
+    finally:
+        os.close(fd)
+
+
 #: Path separators a CA path may end with; a trailing one names a directory.
 _PATH_SEPARATORS = tuple(sep for sep in (os.sep, os.altsep) if sep)
 
@@ -298,6 +366,7 @@ def _refuse_untrusted_holder(
             f"(chmod go-w {directory}) or pass a CA path whose directories only their "
             "owner can change (#6559, #6653)."
         )
+    _refuse_foreign_acl_on_directory("CA path", path, directory, held)
 
 
 #: Symlinks followed while resolving one CA path, as Linux's MAXSYMLINKS.
@@ -427,6 +496,8 @@ def _load_trust_file(context: ssl.SSLContext, shown: str, entry: str) -> None:
         ) from None
     try:
         opened = os.fstat(fd)
+        if stat.S_ISREG(opened.st_mode):
+            _refuse_foreign_acl("CA file", shown, fd)
     finally:
         os.close(fd)
     if not stat.S_ISREG(opened.st_mode):
@@ -504,6 +575,7 @@ def _context_from_path(path: str, *, kind: str | None = None) -> ssl.SSLContext:
     if stat.S_ISDIR(mode) and found is not None:
         _refuse_shared_writable("CA directory", path, mode)
         _refuse_foreign_owner("CA directory", path, found)
+        _refuse_foreign_acl_on_directory("CA directory", path, resolved, found)
         context = _pinned_base_context()
         try:
             names = sorted(os.listdir(resolved))

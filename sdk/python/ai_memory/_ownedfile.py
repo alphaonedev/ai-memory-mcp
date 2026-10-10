@@ -30,7 +30,9 @@ A file that holds a private credential must be, proven on ONE descriptor:
 * a **regular file** — not a directory, not a FIFO (a FIFO parks the reader),
   not a device;
 * mode ``& 0o077 == 0`` — no group or other bit, i.e. 0600-or-tighter;
-* owned by the **effective uid** of the caller.
+* owned by the **effective uid** of the caller;
+* on macOS, carrying **no extended ACL entry** that grants another principal
+  read access or any right to change it (mode bits cannot see one, #6934).
 
 Reached by a **symlink** it is refused at the open, so a link in the key
 directory can never have its permissions checked on the target.
@@ -50,8 +52,11 @@ import stat
 from pathlib import Path
 from typing import Callable
 
+from ai_memory import _acl
+
 __all__ = [
     "BUNDLE_MODE_ADVICE",
+    "check_owned_acl",
     "check_owned_stat",
     "read_owner_only_bytes",
     "read_owner_only_text",
@@ -91,6 +96,43 @@ def check_owned_stat(
         raise error(f"{p} is mode {st.st_mode & 0o7777:04o}; {mode_advice}")
     if st.st_uid != os.geteuid():
         raise error(f"{p} is owned by uid {st.st_uid}, not by the caller")
+
+
+#: ACL rights an owner-only credential must not grant to anyone else: reading
+#: it, and every right that lets a principal change it or give itself any
+#: right (#6934).
+_OWNER_ONLY_ACL_RIGHTS = _acl.ACL_READ_DATA | _acl.CHANGE_RIGHTS
+
+
+def check_owned_acl(
+    p: Path,
+    fd: int,
+    *,
+    error: Callable[[str], Exception],
+    mode_advice: str = BUNDLE_MODE_ADVICE,
+) -> None:
+    """Refuse the open credential ``fd`` when an extended ACL exposes it (#6934).
+
+    Mode bits cannot see a macOS ACL entry such as ``everyone allow read``, so a
+    ``0600`` key can still be readable by another account. An allow entry that
+    grants reading or changing the file to anyone but this user or root is
+    refused; an ACL that cannot be read is refused too (fail closed). The
+    message names the path, the rights and the reason, never the content.
+    """
+    if not _acl.reads_acls():
+        return
+    try:
+        granted = _acl.foreign_acl_rights(fd, _OWNER_ONLY_ACL_RIGHTS)
+    except _acl.AclUnreadable as exc:
+        raise error(
+            f"{p} carries an extended ACL that cannot be read ({exc}); it is refused "
+            "because an ACL entry could expose the credential (#6934)"
+        ) from None
+    if granted:
+        raise error(
+            f"{p} carries an extended ACL granting {_acl.describe(granted)} to another "
+            f"principal; {mode_advice} (#6934)"
+        )
 
 
 def _open_checked(
@@ -152,6 +194,7 @@ def _open_checked(
     try:
         # fstat on the descriptor just opened — never a second look at the path.
         check_owned_stat(p, os.fstat(fd), error=error, mode_advice=mode_advice)
+        check_owned_acl(p, fd, error=error, mode_advice=mode_advice)
     except BaseException:
         os.close(fd)
         raise
