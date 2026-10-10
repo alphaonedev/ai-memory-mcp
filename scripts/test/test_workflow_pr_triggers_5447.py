@@ -4628,5 +4628,45 @@ class PaginatedErrorPage6332(unittest.TestCase):
         self.assertEqual(0, out.returncode, out.stdout + out.stderr)
         self.assertIn("self-test PASS: parse_pages refuses '[1]{\"message\": \"rate limit\"}'", out.stdout)
 
+
+
+# ---- Round 5 (#6335, #6341, #6388, #6387): the approval job's structure is pinned exactly ----
+
+
+def _c8_mutant_problems(c8: str, old: str, new: str) -> List[str]:
+    """_approval_job_problems of c8-precheck.yml with ``old`` (present exactly once) replaced."""
+    if c8.count(old) != 1:
+        raise AssertionError(f"mutation anchor {old!r} occurs {c8.count(old)} times")
+    return _approval_job_problems(c8.replace(old, new, 1))
+
+
+class ApprovalJobPermissions6335(unittest.TestCase):
+    """The job's token scopes are exactly contents: read + pull-requests: read; the workflow's are contents: read."""
+
+    def setUp(self) -> None:
+        self.c8 = C8_WORKFLOW.read_text(encoding="utf-8")
+        self.block = "    permissions:\n      contents: read\n      pull-requests: read\n    steps:\n"
+        self.assertIn(self.block, _job_text(self.c8, APPROVAL_JOB))
+
+    def test_6335_live_job_is_intact(self) -> None:
+        self.assertEqual([], _approval_job_problems(self.c8))
+
+    def test_6335_added_or_widened_job_scopes_are_killed(self) -> None:
+        for mutant in ("    permissions:\n      contents: read\n      pull-requests: read\n      actions: write\n    steps:\n",
+                       "    permissions:\n      contents: write\n      pull-requests: read\n    steps:\n",
+                       "    permissions:\n      contents: read\n      pull-requests: read\n      id-token: write\n    steps:\n",
+                       "    permissions:\n      contents: read\n      pull-requests: read\n      checks: write\n    steps:\n",
+                       "    permissions: write-all\n    steps:\n",
+                       "    permissions:\n      contents: read\n    steps:\n"):
+            with self.subTest(mutant=mutant):
+                self.assertTrue(_c8_mutant_problems(self.c8, self.block, mutant))
+
+    def test_6335_widened_workflow_scopes_are_killed(self) -> None:
+        for mutant in ("permissions:\n  contents: read\n  actions: write\n\n",
+                       "permissions:\n  contents: write\n\n",
+                       "permissions: write-all\n\n"):
+            with self.subTest(mutant=mutant):
+                self.assertTrue(_c8_mutant_problems(self.c8, "permissions:\n  contents: read\n\n", mutant))
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
