@@ -401,6 +401,18 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             self.assertEqual(call["pgdatabase"], "cidb")
             self.assertTrue(call["env_marker_ok"], "PGPASSWORD must carry the password")
 
+    def test_psql_runs_with_exactly_the_reviewed_argv_6895(self):
+        # #6895: -X keeps psql from running $HOME/.psqlrc (HOME is in the psql env allowlist) with the tier
+        # credentials before the probe; the whole argv after the program is pinned, so no flag can drop or move.
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertEqual(call["argv"][1:], [
+                "postgres://ciuser@127.0.0.1:5445?sslmode=disable", "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1",
+                "-c", "SELECT count(*) FROM pg_available_extensions WHERE name = 'age'"])
+
     def test_database_name_moves_to_pgdatabase_6181(self):
         # #6181: a database name equal to a secret would show on every psql argv; the name travels in PGDATABASE.
         mod = load_module()
