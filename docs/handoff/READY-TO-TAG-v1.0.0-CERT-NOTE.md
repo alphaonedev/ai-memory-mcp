@@ -43,7 +43,7 @@
 - **#2532** via #2698 (`54203b22`) — REJECT namespace-confined same as APPROVE (closes unauthorized foreign veto)
 
 ### Packaging / release-channel residual
-5. **Release channel ships `--features sal`** (Dockerfile + `release.yml` matrix) and asserts via `scripts/assert-compiled-features.sh` (`sqlite-bundled` + `sal`). **`sal-postgres` is not** on every multi-OS release binary (native sqlx weight); PG deployments use an asserted `sal-postgres` build (Gate3 measure tip `c1c6055d` / plan-c image). Operators still verify cut artifacts with `ai-memory features` / assert script before publish.
+5. **Release channel ships `--features sal,sal-postgres`** on every leg (updated 2026-10-09, #6500): the Dockerfile and every `release.yml` leg read `scripts/release-features.sh`, and `scripts/assert-compiled-features.sh --strict` refuses a binary whose compiled set differs (#4768). Operators still verify cut artifacts with `ai-memory features` / assert script before publish.
 
 ### Capacity / follow-on (not gate-blocking for this cert claim set)
 6. **Landed capacity (inventory at tip):** #2643 (`30cc680d0b28`, authz #2538/#2633); #2689 (`fd7866120c52`, signed re-land of #2644 bulk funnel); #2662 (`44410b195331`, delete-lane DLQ #2498); #2663 (`105526746191`, /sync/since cursor #2441); #2673 (`a9d62550`, erasure outbox #2446).

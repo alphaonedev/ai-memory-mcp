@@ -23,6 +23,9 @@
 # (87 runs by 2026-10-09; the latest 25 all `success`, e.g. run 37944916557 on
 # chain/promo6-ssh), so the key is gone: a failing proof fails the run, and
 # scripts/check_release_features.py (SHAPE_ADVISORY = False) refuses the key.
+# DEVIATION (#6499): #4720 makes the proof blocking after its first green
+# run on `main`; no run on `main` has happened yet, so the green
+# pull_request runs above stand in for that written criterion.
 # The workflow is in COVERED_WORKFLOWS of scripts/check-required-contexts.sh;
 # its job is declared in the dated not-required ledger
 # (scripts/qc-allowlists/required-contexts-not-required.txt) until the #3554

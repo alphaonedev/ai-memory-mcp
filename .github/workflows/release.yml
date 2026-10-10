@@ -23,9 +23,10 @@ name: Release (workflow_dispatch — operator-gated publish)
 #   ... -f tag=vX.Y.Z -f dry_run=false
 # Rehearse a release as a dry run on the real tag (or a signed rc tag) first.
 #
-# The 5 jobs below mirror the historical release fanout: binary builds
-# (5 targets), GitHub Release page, crates.io, Homebrew tap, GHCR Docker
-# image, Fedora COPR. Pre-release tags (SemVer `-` suffix) auto-skip the
+# The jobs below: the preflight, qualify and supply-chain gates, the
+# reproducible proof, binary builds (3 targets), the SBOM, the mobile
+# builds, then the historical release fanout: GitHub Release page,
+# crates.io, Homebrew tap, GHCR Docker image, Fedora COPR. Pre-release tags (SemVer `-` suffix) auto-skip the
 # downstream stable channels (crates.io / Homebrew / Docker / COPR) so
 # `v0.7.0-rc.1` style operator dry-runs are safe.
 
@@ -599,6 +600,11 @@ jobs:
   # would make the second build a copy of the first, not an independent
   # proof. scripts/release/reproducible_build.py --self-test carries the
   # negative fixtures (a perturbed SOURCE_DATE_EPOCH, an unremapped path).
+  # #6503 — nothing in the crate reads SOURCE_DATE_EPOCH, so
+  # the epoch does not currently affect the binary (the perturbed-epoch
+  # fixture proves the comparator against a stub); it pins the tarball and
+  # deb/rpm timestamps, which the package comparison does prove, and any
+  # future build-time stamp.
   # #6283 — the proof also packs each build's binary with the release job's
   # deterministic packer and compares the two tarballs, and builds the deb and
   # rpm of each build with the pinned nfpm 2.41.1 and compares them.
