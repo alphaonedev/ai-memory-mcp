@@ -32,6 +32,9 @@ A line violates the gate when:
 4. a fragment of a script name (``c`` .. ``check-x.s``, ``HEAD_RE``) is followed by
    markup (``MARKUP``: ``< > \\ ` [ ] ( ) & ! $ { }``, #6622), or continues on the next line into
    markup or into the rest of a name: a renderer can join such pieces into a name;
+   when the pieces after such a fragment join into a script name once markup or the
+   line break is dropped (``join_walk``), or the markup cannot be resolved, the line
+   violates the gate whatever the allowlist holds (#6621, #6631);
 5. it holds a bidirectional control character, raw or as a character reference;
 6. it holds a character whose line structure is ambiguous: a C0 control other
    than tab (CR, VT, FF and NUL included), DEL, a C1 control (NEL included),
@@ -45,12 +48,13 @@ listings (#6220), and a symlink counts only when it resolves inside ``scripts/``
 
 Allowlist (``ALLOW_REL``), one entry per line: ``<doc>:<token>:<count>[:pinned]``.
 ``<token>`` is a stale script name or a name fragment, matched case-sensitively;
-``<count>`` is the exact number of occurrences the document holds (per line, the
-largest count over the three views). A count that differs in either direction,
-a duplicate, malformed or stale entry, and more entries than ``ALLOW_CEILING``
-fail. A script-name entry is honoured only while the document carries its own
-valid erratum for the name (#6170); ``:pinned`` (script names only, closed set
-``PINNABLE_DOCS``, #6173) is honoured while any document carries one.
+``<count>`` is the exact number of occurrences the document holds (per line, the largest
+count over the three views). A count that differs in either direction, a duplicate,
+malformed or stale entry, and more entries than ``ALLOW_CEILING`` fail. A fragment entry
+suppresses only the fragment report, never a join. A script-name entry is honoured only
+while the document carries its own valid erratum for the name (#6170); ``:pinned``
+(script names only, closed set ``PINNABLE_DOCS``, #6173) is honoured while any document
+carries one.
 
 Erratum (``erratum_block``): an ATX heading ``#.. Erratum ...`` followed by one
 paragraph, one of whose lines starts ``Erratum (#<issue>): `` and names the
@@ -109,6 +113,20 @@ MARKUP = frozenset("<>\\`[]()&!${}")
 # The name characters that may continue a fragment at the start of the next line.
 NAME_RUN_RE = re.compile(r"[A-Za-z0-9_.-]*", re.ASCII)
 PATH_CHARS = frozenset(string.ascii_letters + string.digits + "_./-")
+# The join walk (#6621, #6631): how many characters after a fragment it reads, and how many walk
+# states one line may spend before the line is undecidable (red).
+JOIN_WINDOW = 512
+JOIN_BUDGET = 4096
+NAME_CHARS = frozenset(string.ascii_letters + string.digits + "_.-")
+WORD_CHARS = frozenset(string.ascii_letters + string.digits + "_")
+# Every prefix of a script name, any ASCII letter case.
+NAME_PREFIX_RE = re.compile(
+    r"c(?:h(?:e(?:c(?:k(?:[-_][A-Za-z0-9_-]*(?:\.(?:s(?:h)?|p(?:y)?)?)?)?)?)?)?)?", re.IGNORECASE | re.ASCII
+)
+CHAR_REF_RE = re.compile(r"&(?:#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6}|[A-Za-z][A-Za-z0-9]{0,31});")
+# Markup the walk drops on its own: escapes, code-span backticks, emphasis, image and math syntax,
+# and closers. ``<``, ``[``, ``(``, ``&`` and the line break have their own steps.
+JOIN_DROP = frozenset("\\`*~!${}])>")
 SUCCESSOR_RE = re.compile(r"`scripts/([A-Za-z0-9_./-]+\.(?:sh|py))`")
 ALLOW_REL = "scripts/qc-allowlists/compliance-script-names-allow.txt"
 # The allowlist only shrinks: more entries than this fail the gate.
@@ -294,31 +312,104 @@ def tokens(line):
         yield prefix + m.group(1), m.group(1), "/".join(parts + [m.group(1)])
 
 
-def fragments(line, nxt):
-    """Yield (fragment, why) for each name fragment on ``line`` that markup or a line break can join.
+def fragments(line, nxt, budget):
+    """Yield (fragment, why, join) for each name fragment on ``line`` that markup or a line break can join.
 
     ``nxt`` is the following line or None. A whole script name (trailing dots aside) is a name,
     not a fragment. A fragment followed by a ``MARKUP`` character is reported; one that ends the
     line is reported when the next line, leading spaces and tabs removed, starts with markup or
-    with characters that complete it into a script name.
+    with characters that complete it into a script name. ``join`` is ``join_walk``'s verdict on
+    what follows the fragment (``budget`` is the line's walk budget).
     """
     for m in HEAD_RE.finditer(line):
         frag = m.group()
         if FULL_NAME_RE.fullmatch(frag.rstrip(".")):
             continue
-        if m.end() < len(line):
-            if line[m.end()] in MARKUP:
-                yield frag, "is followed by %r" % line[m.end()]
+        end = m.end()
+        if end < len(line):
+            if line[end] not in MARKUP:
+                continue
+            why = "is followed by %r" % line[end]
+        elif nxt is None:
             continue
-        if nxt is None:
+        else:
+            rest = nxt.lstrip(" \t")
+            run = NAME_RUN_RE.match(rest).group()
+            if rest[:1] in MARKUP:
+                why = "ends the line and the next line starts with %r" % rest[0]
+            elif run and TOKEN_RE.match(frag + run):
+                why = "ends the line and the next line completes it to %s" % (frag + run)
+            else:
+                continue
+        text = line[end : end + JOIN_WINDOW]
+        more = end + JOIN_WINDOW < len(line)
+        if nxt is not None and not more:
+            room = JOIN_WINDOW - len(text) - 1
+            text += "\n" + nxt[: max(room, 0)]
+            more = room < len(nxt)
+        yield frag, why, join_walk(frag, text, more, budget)
+
+
+def join_walk(frag, text, truncated, budget):
+    """Return ('join', name), ('unresolved', None) or (None, None) for the markup after ``frag``.
+
+    ``text`` is what follows the fragment (at most ``JOIN_WINDOW`` characters, the next line after
+    a ``\\n``), ``truncated`` tells whether more follows, and ``budget`` is the line's remaining walk
+    states (a one-item list). The walk over-approximates a renderer: it drops single markup
+    characters (``JOIN_DROP``), may skip from ``<`` past ANY later ``>`` (a tag, a comment, or a
+    hidden element's content), from ``[`` past any later ``]`` and from ``(`` past any later ``)``
+    (a label or a link destination), decodes a character reference, and joins across the line
+    break. A path that spells a script name is a join; an unclosed ``<``, a walk that reaches the
+    window end, or an exhausted budget is unresolved. Either is red whatever the allowlist holds.
+    """
+    unresolved = False
+    stack, seen = [(0, "")], set()
+    while stack:
+        pos, acc = stack.pop()
+        if (pos, acc) in seen:
             continue
-        rest = nxt.lstrip(" \t")
-        if rest[:1] in MARKUP:
-            yield frag, "ends the line and the next line starts with %r" % rest[0]
+        seen.add((pos, acc))
+        if budget[0] <= 0:
+            return "unresolved", None
+        budget[0] -= 1
+        if pos >= len(text):
+            unresolved = unresolved or truncated
             continue
-        run = NAME_RUN_RE.match(rest).group()
-        if run and TOKEN_RE.match(frag + run):
-            yield frag, "ends the line and the next line completes it to %s" % (frag + run)
+        c = text[pos]
+        if c == "&":
+            m = CHAR_REF_RE.match(text, pos)
+            if not m:
+                continue
+            shown = visible(html.unescape(m.group()))
+            if not shown:
+                stack.append((m.end(), acc))
+                continue
+            c, nxt = shown, m.end()
+        else:
+            nxt = pos + 1
+        if c in NAME_CHARS:
+            grown = acc + c
+            if not NAME_PREFIX_RE.fullmatch(frag + grown):
+                continue
+            if FULL_NAME_RE.fullmatch(frag + grown) and text[nxt : nxt + 1] not in WORD_CHARS:
+                return "join", frag + grown
+            stack.append((nxt, grown))
+        elif c == "\n":
+            while nxt < len(text) and text[nxt] in " \t":
+                nxt += 1
+            stack.append((nxt, acc))
+        elif c == "<":
+            ends = [i + 1 for i in range(pos + 1, len(text)) if text[i] == ">"]
+            if not ends:
+                unresolved = True
+            stack.extend((i, acc) for i in ends)
+        elif c in "[(":
+            close = "]" if c == "[" else ")"
+            stack.append((nxt, acc))
+            stack.extend((i + 1, acc) for i in range(pos + 1, len(text)) if text[i] == close)
+        elif c in JOIN_DROP:
+            stack.append((nxt, acc))
+    return ("unresolved", None) if unresolved else (None, None)
 
 
 def path_ok(root, target):
@@ -615,14 +706,30 @@ def scan_line(root, rel, lineno, line, nxt):
             cited_at.setdefault(name, (cited, path))
         for name, n in per.items():
             stale[name] = max(stale.get(name, 0), n)
-    frags, why = {}, {}
+    frags, why, joins = {}, {}, set()
+    budget = [JOIN_BUDGET]
     for v, w in zip(shown, views(nxt) if nxt is not None else (None, None, None)):
         per = {}
-        for frag, reason in fragments(v, w):
+        for frag, reason, (kind, name) in fragments(v, w, budget):
             per[frag] = per.get(frag, 0) + 1
             why.setdefault(frag, reason)
+            if kind:
+                joins.add((frag, kind, name))
         for frag, n in per.items():
             frags[frag] = max(frags.get(frag, 0), n)
+    # #6621, #6631: a join is red whatever the allowlist holds; a fragment entry only counts prose.
+    for frag, kind, name in sorted(joins, key=lambda j: (j[0], j[1], j[2] or "")):
+        if kind == "join":
+            problems.append(
+                "%s:%d: name fragment `%s` joins into script name `%s` once markup or the line break is"
+                " dropped (no allowlist entry suppresses a join)" % (rel, lineno, frag, name)
+            )
+        else:
+            problems.append(
+                "%s:%d: name fragment `%s` is followed by markup the gate cannot resolve (an unclosed `<`,"
+                " or more than %d characters or %d steps; no allowlist entry suppresses this)"
+                % (rel, lineno, frag, JOIN_WINDOW, JOIN_BUDGET)
+            )
     return problems, stale, cited_at, frags, why
 
 
