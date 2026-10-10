@@ -630,11 +630,29 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener as StdUnixListener;
 
-    /// A scratch directory for a socket test, rooted at `base`.
-    /// #6263 red: this is the plain `tempdir_in(base)`, so a long `base`
-    /// yields a socket path past `sun_path`.
+    /// Longest scratch base that still leaves room for `/<tmp>/run/<name>.sock`
+    /// inside the 104-byte macOS `sun_path`.
+    const SHORT_BASE_MAX: usize = 60;
+
+    /// A scratch directory for a socket test, rooted at `base` when that is
+    /// short enough, else at a short directory under `$HOME` (a disk path,
+    /// never tmpfs) so the socket path always fits `sun_path` (#6263).
     fn socket_test_dir_in(base: &Path) -> tempfile::TempDir {
-        tempfile::tempdir_in(base).expect("tmp")
+        if base.as_os_str().len() <= SHORT_BASE_MAX {
+            return tempfile::tempdir_in(base).expect("tmp");
+        }
+        let home = std::env::var_os("HOME").expect("HOME is set for a socket test");
+        let short = Path::new(&home).join(".ai-memory-sock-t");
+        fs::create_dir_all(&short).expect("mkdir short socket base");
+        tempfile::Builder::new()
+            .prefix("s")
+            .tempdir_in(short)
+            .expect("tmp")
+    }
+
+    /// The scratch directory for a socket test under the process `TMPDIR`.
+    fn socket_test_dir() -> tempfile::TempDir {
+        socket_test_dir_in(&std::env::temp_dir())
     }
 
     /// #6263 — a socket test must work whatever `TMPDIR` is, including the
@@ -736,7 +754,7 @@ mod tests {
 
     #[test]
     fn a_live_socket_is_not_taken_over() {
-        let tmp = tempfile::tempdir().expect("tmp");
+        let tmp = socket_test_dir();
         let dir = tmp.path().join("run");
         fs::create_dir_all(&dir).expect("mkdir");
         fs::set_permissions(&dir, fs::Permissions::from_mode(SOCKET_DIR_MODE)).expect("chmod");
@@ -752,7 +770,7 @@ mod tests {
 
     #[test]
     fn a_stale_socket_is_cleared() {
-        let tmp = tempfile::tempdir().expect("tmp");
+        let tmp = socket_test_dir();
         let dir = tmp.path().join("run");
         fs::create_dir_all(&dir).expect("mkdir");
         fs::set_permissions(&dir, fs::Permissions::from_mode(SOCKET_DIR_MODE)).expect("chmod");
