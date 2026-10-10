@@ -193,6 +193,12 @@ class ComparisonTests(unittest.TestCase):
         with unittest.mock.patch.dict(os.environ, overrides):
             self.assertEqual(self.compare.git(self.repo, 'rev-parse', 'HEAD').strip(), self.base.encode())
 
+    def test_selftest_git_setup_ignores_ambient_repository_override(self):
+        """The workflow self-test uses the same isolated Git environment as acquisition."""
+        with unittest.mock.patch.dict(os.environ, {'GIT_DIR': '/nonexistent/6163'}):
+            commit = self.compare.make_repo(self.guard, self.work / 'hostile-selftest')
+        self.assertRegex(commit, r'^[0-9a-f]{40}$')
+
     def test_shallow_and_alternate_history_are_refused(self):
         """No approval is accepted from a truncated or substituted comparison range."""
         for relative, payload in (('shallow', self.base + '\n'), ('objects/info/alternates', '/missing\n'),
