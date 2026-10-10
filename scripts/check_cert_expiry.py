@@ -1597,6 +1597,41 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     fx.reset(base)
     fx.g("update-ref", "refs/remotes/origin/main", base)
 
+    # (value-same-line / value-next-line, #6563) the documented split of a value
+    #       edit: a value edited on the line that carries the identifier changes
+    #       that line and is RED; a value on the NEXT line leaves the identifier
+    #       line byte-identical and is GREEN (the lexical bound).
+    fx.g("checkout", "-q", "-B", "mo-value-same", mk0)
+    fx.write("src/mask_def.rs", f'pub const M: &str = "{kid}"; // default 6\n')
+    vs = fx.commit(["src/mask_def.rs"], "value-same-line: a value edited on the identifier line")
+    t.expect_red("value-same-line", "a value edited on the line that carries the identifier",
+                 repo, mk0, vs, [(f"- {kid}", "did not name the drifted identifier")])
+    fx.g("checkout", "-q", "-B", "mo-value-next", mk0)
+    fx.write("src/mask_def.rs", def_line + "pub const V: u32 = 6;\n")
+    vn = fx.commit(["src/mask_def.rs"], "value-next-line: a value on the line after the identifier")
+    t.expect_green("value-next-line", "a value changed on the line after the identifier",
+                   repo, mk0, vn)
+    fx.reset(base)
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+    # (doc-bound, #6563 / #6561) the docstring, the OK banner and the #6427
+    #       changelog fragment say what is detected and name the lexical bound:
+    #       none may claim that a block comment AROUND a definition is caught.
+    doc_texts = [("module docstring", __doc__ or ""), ("OK banner", SELF_TEST_OK)]
+    fragment = REPO_ROOT / "changelog.d" / "6427.fixed.md"
+    if fragment.is_file():
+        doc_texts.append(("changelog.d/6427.fixed.md", fragment.read_text(encoding="utf-8")))
+    for where, text in doc_texts:
+        if "block comment around" in text:
+            t.fail(f"(doc-bound): the {where} claims a block comment around a definition is "
+                   "caught; only a block comment opened and closed on the defining line is")
+    if "value-only edit of an existing AI_MEMORY_FED_* identifier in a file outside" in " ".join(
+            (__doc__ or "").split()):
+        t.fail("(doc-bound): the module docstring still says a value-only edit outside the "
+               "path watches is never seen; a value edited on the identifier line is drift")
+    for needle in ("LEXICAL BOUND", "byte-identical", "#6560"):
+        if needle not in (__doc__ or ""):
+            t.fail(f"(doc-bound): the module docstring does not state the lexical bound "
+                   f"({needle!r} missing)")
     # ---- #6138: merge-commit structure cells ------------------------------
     # main is at `base`; h7 is the PR head, o7 an unrelated branch.
     fx.reset(base)
