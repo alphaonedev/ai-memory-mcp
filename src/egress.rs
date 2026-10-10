@@ -137,6 +137,8 @@ impl InferenceEgressMode {
 
     /// Parse a mode token (case-insensitive, trimmed). Accepts `-` / `_`
     /// separator spellings and the `local` synonym for loopback-only.
+    /// An empty or whitespace-only token is `None` (#6686: a SET-but-blank
+    /// value is not the unset default, so it never resolves to `Allow`).
     /// An unrecognised token is `None` so the caller can decide the
     /// disposition (FBL-14: a SET-but-unrecognised value fails CLOSED to
     /// [`Self::Deny`], never silently widening egress) rather than
@@ -144,7 +146,7 @@ impl InferenceEgressMode {
     #[must_use]
     pub fn parse(token: &str) -> Option<Self> {
         match token.trim().to_ascii_lowercase().as_str() {
-            "" | "allow" | "any" | "off" => Some(Self::Allow),
+            "allow" | "any" | "off" => Some(Self::Allow),
             "loopback-only" | "loopback_only" | "loopback" | "local" | "localhost" => {
                 Some(Self::LoopbackOnly)
             }
@@ -165,6 +167,9 @@ impl InferenceEgressMode {
     }
 }
 
+/// The accepted posture tokens, quoted for the fail-closed WARN hints.
+const MODE_CHOICES: &str = "\"allow\" | \"loopback-only\" | \"internal-only\" | \"deny\"";
+
 /// Resolve [`InferenceEgressMode`] from the environment.
 ///
 /// FBL-14 (v1.0.0, T3 security posture): an unrecognised token no longer
@@ -181,17 +186,29 @@ impl InferenceEgressMode {
 /// loudly and self-describes so the operator corrects it).
 ///
 /// The UNSET arm keeps the byte-identical-legacy [`InferenceEgressMode::Allow`]
-/// default so a deployment that never opted in is unchanged; only a
-/// SET-but-unrecognised value is treated as fail-closed.
+/// default so a deployment that never opted in is unchanged; every
+/// SET-but-unreadable value (unrecognised token, blank or whitespace-only
+/// (#6686), non-UTF-8 (#6373)) is treated as fail-closed.
 #[must_use]
 pub fn resolve_inference_egress_mode() -> InferenceEgressMode {
     match std::env::var(ENV_INFERENCE_EGRESS) {
         Ok(v) => InferenceEgressMode::parse(&v).unwrap_or_else(|| {
+            // #6686 (3-agent vote 6def5ab6, T3): a SET-but-blank value
+            // (`VAR=` or whitespace from a templating slip) is restriction
+            // intent we cannot read, exactly like a typo: fail CLOSED.
+            if v.trim().is_empty() {
+                tracing::warn!(
+                    "{ENV_INFERENCE_EGRESS} is set but blank — failing CLOSED to \"deny\" \
+                     (no memory content leaves the host for inference). Unset the variable \
+                     for the legacy \"allow\" default, or set an explicit {MODE_CHOICES}."
+                );
+                return InferenceEgressMode::Deny;
+            }
             tracing::warn!(
                 "unrecognised {ENV_INFERENCE_EGRESS} value {v:?} — refusing to widen \
                  inference egress on a typo; failing CLOSED to \"deny\" (no memory content \
-                 leaves the host for inference). Set an explicit \
-                 \"allow\" | \"loopback-only\" | \"deny\" to choose the posture."
+                 leaves the host for inference). Set an explicit {MODE_CHOICES} to choose \
+                 the posture."
             );
             InferenceEgressMode::Deny
         }),
@@ -200,10 +217,12 @@ pub fn resolve_inference_egress_mode() -> InferenceEgressMode {
         // restriction attempt we cannot read: fail CLOSED, never widen to
         // Allow (per ERRORS-19). decision: Deny over Allow because ERRORS-19.
         Err(std::env::VarError::NotUnicode(raw)) => {
+            // The raw bytes are never echoed (#6373: no value in the log).
             tracing::warn!(
-                "{ENV_INFERENCE_EGRESS} is set to a non-UTF-8 value {raw:?} — failing \
+                "{ENV_INFERENCE_EGRESS} is set to a non-UTF-8 value ({} bytes) — failing \
                  CLOSED to \"deny\" (no memory content leaves the host for inference). \
-                 Set an explicit \"allow\" | \"loopback-only\" | \"deny\" to choose the posture."
+                 Set an explicit {MODE_CHOICES} to choose the posture.",
+                raw.len()
             );
             InferenceEgressMode::Deny
         }
@@ -671,14 +690,24 @@ mod tests {
 
     #[test]
     fn mode_parse_accepts_synonyms_rejects_typos() {
-        assert_eq!(
-            InferenceEgressMode::parse(""),
-            Some(InferenceEgressMode::Allow)
-        );
+        // #6686: a blank or whitespace-only token is never the Allow default.
+        assert_eq!(InferenceEgressMode::parse(""), None);
+        assert_eq!(InferenceEgressMode::parse("   "), None);
+        assert_eq!(InferenceEgressMode::parse("\t\n"), None);
         assert_eq!(
             InferenceEgressMode::parse("ALLOW"),
             Some(InferenceEgressMode::Allow)
         );
+        // #6373 (N11): surrounding whitespace is trimmed, never part of the token.
+        assert_eq!(
+            InferenceEgressMode::parse("  allow \n"),
+            Some(InferenceEgressMode::Allow)
+        );
+        assert_eq!(
+            InferenceEgressMode::parse(" Deny\t"),
+            Some(InferenceEgressMode::Deny)
+        );
+
         assert_eq!(
             InferenceEgressMode::parse("loopback-only"),
             Some(InferenceEgressMode::LoopbackOnly)
