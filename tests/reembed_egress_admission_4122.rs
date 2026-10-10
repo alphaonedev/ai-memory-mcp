@@ -437,3 +437,34 @@ fn reembed_builds_through_the_admission_funnel_and_the_pinned_builder_4122() {
          bypass admission: {offenders:?}"
     );
 }
+
+/// #6400 — the admitted pin must reach the embedder builder. Mutant M15
+/// (`Ok(pin) => pin` -> `Ok(_pin) => None`) silently drops the resolve-then-pin
+/// under `internal-only` while every behavioural cell stays green (the loopback
+/// endpoint is reachable pinned or not), so the data flow is pinned by shape:
+/// the admission match returns the pin it was given, and that very binding is
+/// what `from_resolved_pinned` receives.
+#[test]
+fn reembed_threads_the_admitted_pin_into_the_pinned_builder_6400() {
+    let verb = read_src("src/cli/commands/reembed.rs");
+    let start = verb
+        .find("let egress_pin = if")
+        .expect("#6400: the admission binding `egress_pin` exists");
+    let region = &verb[start..];
+    let end = region
+        .find("Err(EgressDecision::Refuse")
+        .expect("#6400: the refusal arm follows the admit arm");
+    let admit_arm = &region[..end];
+    assert!(
+        admit_arm.contains("Ok(pin) => pin,"),
+        "#6400: the admit arm must return the pin it was handed:\n{admit_arm}"
+    );
+    assert!(
+        !admit_arm.contains("Ok(_") && !admit_arm.contains("=> None"),
+        "#6400: the admit arm must not discard the pin:\n{admit_arm}"
+    );
+    assert!(
+        verb.contains("egress_pin.as_ref(),"),
+        "#6400: the admitted pin must be passed to `from_resolved_pinned`"
+    );
+}
