@@ -21,7 +21,10 @@ its own line or every line of a YAML block scalar under one (#6211). A diff line
 the value of such a name, is masked by its index on its own side of the diff, so it is masked even when its BEGIN or
 name line lies outside its hunk or is unchanged. Lines this script writes are never masked, and the verdict is computed
 on the unmasked text. Control and format characters of head text (ESC, CSI, BEL, a bidirectional override) are written
-as escapes before they reach the summary (#6212).
+as escapes before they reach the summary (#6212). Round 5: URL passwords with a raw `#`, `?` or `/` (#6667, #6615), a
+comment or a `!tag` / `&anchor` around a name and its block indicator (#6663, #6614, #6664), a key block inside a block
+scalar (#6665), a triple-quoted multi-line value (#6666), and a bound on the cost: a line over MAX_MASK_LINE characters
+is hidden whole (#6613).
 
 The BASE guard (scripts/check-claude-md-size.py of the base checkout) and the BASE manifest
 (scripts/qc-allowlists/claude-md-rule-sections.sha256) then judge the head copies:
