@@ -19,6 +19,9 @@ The 12-character window count follows the security reviewer's probe
 from __future__ import annotations
 
 import base64
+import io
+import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -56,3 +59,46 @@ def _filtered(text: str) -> str:
 def test_ci_log_filter_removes_every_key_form_6964(label: str, form: str) -> None:
     out = _filtered(f"E   assert {form} == b''")
     assert form not in out, f"{label}: key form survives the CI-log filter"
+
+
+def test_junit_report_is_filtered_7048(tmp_path: Path) -> None:
+    h = _harness()
+    keyfile, pemfile = tmp_path / "k.bin", tmp_path / "key.pem"
+    keyfile.write_bytes(_KEY)
+    pemfile.write_bytes(_PEM)
+    (tmp_path / "test_leak.py").write_text(
+        "import pathlib\n"
+        f"def test_leak():\n    k = pathlib.Path({str(keyfile)!r}).read_bytes()\n"
+        f"    pem = pathlib.Path({str(pemfile)!r}).read_bytes()\n"
+        "    print(k.hex())\n    print(pem.decode())\n    assert pem == b''\n"
+    )
+    report = tmp_path / "junit.xml"
+    sink, old = io.StringIO(), sys.stdout
+    sys.stdout = sink
+    try:
+        code = h.run_redacted(
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "-p",
+                "no:cacheprovider",
+                f"--junitxml={report}",
+                "test_leak.py",
+            ],
+            cwd=str(tmp_path),
+            env=dict(os.environ, CI="true"),
+            secrets=[_KEY, _PEM],
+        )
+    finally:
+        sys.stdout = old
+    assert code != 0
+    body = [ln for ln in _PEM.decode().splitlines() if ln and not ln.startswith("-----")]
+    windows = {ln[i : i + 12] for ln in body for i in range(len(ln) - 11)}
+    junit, log = report.read_text(), sink.getvalue()
+    assert sum(w in junit for w in windows) == 0, "the junit report carries PEM-body windows"
+    assert sum(w in log for w in windows) == 0, "the CI log carries PEM-body windows"
+    assert _KEY.hex() not in junit
+    if sys.platform != "win32":
+        assert (report.stat().st_mode & 0o777) == 0o600

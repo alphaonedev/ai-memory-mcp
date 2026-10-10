@@ -258,6 +258,22 @@ def redact(text, forms):
     return "".join(out)
 
 
+def scrub_file(path, secrets):
+    """Rewrite ``path`` with the same filter as the CI log, mode 0600 (#7048).
+
+    Fail closed: when the file cannot be filtered it is removed.
+    """
+    forms = [form for secret in secrets for form in secret_forms(secret)]
+    forms.sort(key=len, reverse=True)
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+        path.write_text(redact(text, forms), encoding="utf-8")
+        os.chmod(path, 0o600)
+    except OSError:
+        path.unlink(missing_ok=True)
+        raise
+
+
 def run_redacted(argv, *, cwd, env, secrets):
     """Run ``argv`` with its stdout and stderr filtered through :func:`redact`; return its exit code.
 
@@ -289,6 +305,18 @@ def run_redacted(argv, *, cwd, env, secrets):
     finally:
         proc.stdout.close()
         code = proc.wait()
+        # pytest writes its own report file; filter it exactly like the log (#7048).
+        for arg in argv:
+            if isinstance(arg, str) and arg.startswith("--junitxml="):
+                try:
+                    scrub_file(Path(arg.split("=", 1)[1]), secrets)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    print(
+                        f"sdk-python-live: the junit report could not be filtered and was removed: {exc}",
+                        file=sys.stderr,
+                    )
     return code
 
 
