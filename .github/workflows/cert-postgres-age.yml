@@ -89,6 +89,16 @@ on:
   # (#2508). rehearsal/** stays off push (#5447 R-PUSH).
   push:
     branches: ["release/**", "chain/**"]
+  # Merge Queue (#3089, #6727): this workflow carries a required context, so it
+  # MUST report on the merge_group ref or the queue wedges. See ci.yml for the
+  # full rationale. The job-level `if:` below is the same fork refusal as
+  # ci.yml's `check` step "Fork-PR refusal": it refuses only a fork
+  # `pull_request`; a merge_group run is admitted, as it is in ci.yml, because a
+  # PR reaches the queue only once its required contexts are green, and the
+  # self-hosted `Check (linux-fed,enterprise-fed)` refusal plus the #6193
+  # external-PR approval gate are among them.
+  merge_group:
+    types: [checks_requested]
   workflow_dispatch:
 
 permissions:
