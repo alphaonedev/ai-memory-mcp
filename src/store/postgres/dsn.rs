@@ -298,6 +298,35 @@ mod tests {
 
     const BASE: &str = "postgres://u:pw@db.internal:5432/mem";
 
+    // #6351: the value-printing assertion forms (`assert_eq!`, `expect`,
+    // `expect_err`) print the operands, or the `Debug` of a result that
+    // carries the DSN or `PgConnectOptions` (which holds the password in
+    // cleartext). These helpers fail with a fixed text and no operand.
+
+    /// Equality check whose failure text names the check, never the operands.
+    #[track_caller]
+    fn same<T: PartialEq + ?Sized>(what: &str, left: &T, right: &T) {
+        assert!(left == right, "{what} differs (operands redacted)");
+    }
+
+    /// The `Ok` value, or a fixed-text failure that carries no error value.
+    #[track_caller]
+    fn present<T, E>(result: Result<T, E>) -> T {
+        let Ok(value) = result else {
+            panic!("a call that must succeed failed (error redacted)");
+        };
+        value
+    }
+
+    /// The `Err` value, or a fixed-text failure that carries no `Ok` value.
+    #[track_caller]
+    fn refused<T, E>(result: Result<T, E>) -> E {
+        let Err(error) = result else {
+            panic!("a call that must fail succeeded (value redacted)");
+        };
+        error
+    }
+
     #[test]
     fn recognised_only_dsn_is_returned_unchanged() {
         let dsn = format!(
@@ -322,7 +351,11 @@ mod tests {
              &sslrootcert=%2Fa%20b%2Fca.pem&tok%65n=S4#frag"
         );
         let screened = screen_dsn(&dsn);
-        assert_eq!(screened.removed_positions, vec![2, 3, 4, 6]);
+        same(
+            "removed positions",
+            screened.removed_positions.as_slice(),
+            &[2, 3, 4, 6][..],
+        );
         let out = screened.dsn.as_ref();
         for (i, secret) in ["S1", "S2", "S3", "S4"].iter().enumerate() {
             // #6098: name the fixture by index, never by value or rendering.
@@ -331,29 +364,34 @@ mod tests {
                 "#6098: fixture {i} survived the screen"
             );
         }
-        let url = reqwest::Url::parse(out).expect("screened DSN parses");
+        let url = present(reqwest::Url::parse(out));
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
-        assert_eq!(
-            pairs,
-            vec![
+        same(
+            "query pairs",
+            pairs.as_slice(),
+            &[
                 ("sslmode".to_string(), "require".to_string()),
                 ("sslrootcert".to_string(), "/a b/ca.pem".to_string()),
-            ]
+            ][..],
         );
-        assert_eq!(url.username(), "u");
-        assert_eq!(url.password(), Some("pw"));
-        assert_eq!(url.host_str(), Some("db.internal"));
-        assert_eq!(url.port(), Some(5432));
-        assert_eq!(url.path(), "/mem");
-        assert_eq!(url.fragment(), Some("frag"));
+        same("username", url.username(), "u");
+        same("password", &url.password(), &Some("pw"));
+        same("host", &url.host_str(), &Some("db.internal"));
+        same("port", &url.port(), &Some(5432));
+        same("path", url.path(), "/mem");
+        same("fragment", &url.fragment(), &Some("frag"));
     }
 
     #[test]
     fn a_query_of_only_unrecognised_keys_is_dropped_entirely() {
         let dsn = format!("{BASE}?sslpassword=S1");
         let screened = screen_dsn(&dsn);
-        assert_eq!(screened.removed_positions, vec![1]);
-        assert_eq!(screened.dsn, BASE);
+        same(
+            "removed positions",
+            screened.removed_positions.as_slice(),
+            &[1][..],
+        );
+        same("screened dsn", &*screened.dsn, BASE);
     }
 
     #[test]
@@ -375,15 +413,18 @@ mod tests {
 
     #[test]
     fn connect_options_keeps_the_honoured_parameters() {
-        let opts = connect_options(&format!(
+        let opts = present(connect_options(&format!(
             "{BASE}?sslpassword=S1&application_name=ai-memory-3674&port=6543"
-        ))
-        .expect("parses");
-        assert_eq!(opts.get_application_name(), Some("ai-memory-3674"));
-        assert_eq!(opts.get_port(), 6543);
-        assert_eq!(opts.get_host(), "db.internal");
-        assert_eq!(opts.get_username(), "u");
-        assert_eq!(opts.get_database(), Some("mem"));
+        )));
+        same(
+            "application name",
+            &opts.get_application_name(),
+            &Some("ai-memory-3674"),
+        );
+        same("port", &opts.get_port(), &6543);
+        same("host", opts.get_host(), "db.internal");
+        same("username", opts.get_username(), "u");
+        same("database", &opts.get_database(), &Some("mem"));
     }
 
     /// #4934 / #3711 — a sqlx parse failure reaches the operator as the
@@ -435,7 +476,7 @@ mod tests {
         );
         // Non-numeric port: a second parse-failure shape stays clean.
         let dsn = "postgres://u:pw4934@db.internal/mem?sslmode=verify-full&sslpassword=SECRETQ4934&port=notaport";
-        let err = evaluate(dsn).expect_err("a non-numeric port must not parse");
+        let err = refused(evaluate(dsn));
         let shown = format!("{err}");
         for (i, secret) in ["SECRETQ4934", "pw4934", "sslpassword", "notaport"]
             .iter()

@@ -54,8 +54,12 @@ const SECRETS: &[&str] = &[
 ];
 
 fn assert_clean(sink: &str, what: &str) {
-    for s in SECRETS {
-        assert!(!sink.contains(s), "#3711: {s:?} reached {what}:\n{sink}");
+    // #6351: name the planted shape by index, never print it or the sink.
+    for (i, s) in SECRETS.iter().enumerate() {
+        assert!(
+            !sink.contains(s),
+            "#3711: planted shape {i} reached {what} (sink redacted)"
+        );
     }
 }
 
@@ -462,9 +466,11 @@ async fn webhook_dlq_and_log_carry_no_path_token_and_no_receiver_text_3684_3697_
             list_dlq(&conn, None).expect("dlq")
         };
         if rows.len() != 4 {
-            eprintln!("DEBUG-LOGS:\n{}", sink.text());
+            // #6351: size only; the captured sink is what is asserted clean.
+            let captured = sink.text().len();
+            eprintln!("DEBUG-LOGS: {captured} bytes captured (content redacted)");
         }
-        assert_eq!(rows.len(), 4, "one DLQ row per failed delivery: {rows:?}");
+        assert_eq!(rows.len(), 4, "one DLQ row per failed delivery");
         for row in &rows {
             assert_clean(&row.last_error, "subscription_dlq.last_error");
             assert!(
