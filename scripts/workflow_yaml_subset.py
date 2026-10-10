@@ -689,8 +689,8 @@ def shape(node: Node) -> str:
 
 
 def where(node: Node) -> str:
-    """``line N: <key>`` (or ``line N: sequence entry``) for a refusal message."""
-    label = key_name(node.name) if node.kind == "key" else "sequence entry"
+    """``line N: <key>`` (``line N: sequence entry``, ``line N: document``) for a refusal message."""
+    label = key_name(node.name) if node.kind == "key" else ("document" if node.kind == "root" else "sequence entry")
     return "line %d: %s" % (node.line, label)
 
 

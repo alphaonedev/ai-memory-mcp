@@ -229,6 +229,10 @@ class TokenPins(unittest.TestCase):
         found = [p for p in self.problems(text) if needle in p]
         return found
 
+    def test_empty_workflow_names_the_document(self):
+        got = GATE.workflow_pin_problems("")
+        self.assertTrue([p for p in got if "line 0: document has the shape empty" in p], got)
+
     def test_committed_is_clean(self):
         self.assertEqual(self.problems(WF), [])
         self.assertEqual(GATE.workflow_pin_problems(WF), [])
