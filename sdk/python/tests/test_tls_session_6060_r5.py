@@ -1274,5 +1274,98 @@ def test_unweakened_context_reaches_the_right_name_origin_6378(
     assert len(origin.hits) == 1
 
 
+# ---- #6537: a later caller hook cannot remove the session check ------------
+
+
+def _late_trace_fetch(
+    client_cls: type, url: str, context: ssl.SSLContext, action: str, seen: list[str]
+) -> int:
+    """GET once with a caller hook, appended after the SDK's, that weakens the
+    context and then replaces (``replace``) or deletes (``remove``) the
+    httpcore trace on the request. A replacing trace records its events in
+    ``seen``. Returns the status code.
+    """
+
+    def record(event: str, _info: dict[str, Any]) -> None:
+        seen.append(event)
+
+    async def arecord(event: str, info: dict[str, Any]) -> None:
+        record(event, info)
+
+    def late(request: httpx.Request, trace: Any) -> None:
+        if action == "weaken-replace" or action == "weaken-remove":
+            _no_hostname_check(context)
+        if action.endswith("remove"):
+            request.extensions.pop("trace", None)
+        else:
+            request.extensions["trace"] = trace
+
+    if client_cls is AiMemoryClient:
+        with AiMemoryClient(base_url=url, verify=context, api_key=_API_KEY, timeout=5) as client:
+            client._client.event_hooks["request"].append(  # noqa: SLF001
+                lambda request: late(request, record)
+            )
+            return client._client.get("/x").status_code  # noqa: SLF001
+
+    async def run() -> int:
+        async with AsyncAiMemoryClient(
+            base_url=url, verify=context, api_key=_API_KEY, timeout=5
+        ) as client:
+
+            async def alate(request: httpx.Request) -> None:
+                late(request, arecord)
+
+            client._client.event_hooks["request"].append(alate)  # noqa: SLF001
+            return (await client._client.get("/x")).status_code  # noqa: SLF001
+
+    return asyncio.run(run())
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("action", ["weaken-replace", "weaken-remove"])
+def test_later_hook_cannot_remove_the_session_check_6537(
+    wrong_name_origin: RecordingServer,
+    lab: Lab,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    action: str,
+) -> None:
+    # The hook runs after the SDK's re-check, so only the session check can
+    # refuse the wrong-name server, and it must do so before any byte.
+    _clear_proxy_env(monkeypatch)
+    with pytest.raises(ValueError, match="verify=False"):
+        _late_trace_fetch(client_cls, wrong_name_origin.url, lab.client_context(), action, [])
+    assert wrong_name_origin.hits == []
+    assert wrong_name_origin.api_keys == []
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("action", ["weaken-replace", "weaken-remove"])
+def test_later_hook_cannot_remove_the_tunnelled_session_check_6537(
+    proxy: TunnelProxy,
+    wrong_name_origin: RecordingServer,
+    lab: Lab,
+    client_cls: type,
+    action: str,
+) -> None:
+    with pytest.raises(ValueError, match="verify=False"):
+        _late_trace_fetch(client_cls, wrong_name_origin.url, lab.client_context(), action, [])
+    assert len(proxy.tunnels) == 1
+    assert wrong_name_origin.hits == []
+    assert wrong_name_origin.api_keys == []
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_trace_set_by_a_later_hook_still_receives_events_6537(
+    origin: RecordingServer, lab: Lab, monkeypatch: pytest.MonkeyPatch, client_cls: type
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    seen: list[str] = []
+    assert _late_trace_fetch(client_cls, origin.url, lab.client_context(), "replace", seen) == 200
+    assert "connection.start_tls.complete" in seen
+    assert "http11.send_request_headers.started" in seen
+    assert origin.hits == ["/x"]
+
+
 def test_lab_temp_root_is_project_local_6309(lab: Lab) -> None:
     assert ".local-runs" in pathlib.Path(lab.ca_path).resolve().parts
