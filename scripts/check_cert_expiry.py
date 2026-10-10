@@ -1411,6 +1411,12 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                       ("space plus 40-hex", " " + "b" * 40),
                       ("40 superscript digit", "\u00b9" * 40),
                       ("40 non-hex ASCII letter", "g" * 40))
+    # decision: exhaustive whitespace corpus over per-char cells (E6, same class as #6414).
+    # Every `str.isspace()` character is tested as a prefix and as a suffix of a 40-hex value, so a
+    # sha read site loosened to trim a tab, VT, FF, NBSP or any other space is killed (#6464).
+    _ws = [chr(i) for i in range(0x110000) if chr(i).isspace()]
+    sha_len_values += tuple((f"40-hex plus U+{ord(c):04X}", "b" * 40 + c) for c in _ws)
+    sha_len_values += tuple((f"U+{ord(c):04X} plus 40-hex", c + "b" * 40) for c in _ws)
     for label, sha_val in sha_len_values:
         for lane, key, lane_env in sha_len_cells:
             trace = Path(tmp) / f"git-trace-{lane}-{key}-{len(sha_val)}-{ord(sha_val[0])}.jsonl"
@@ -1560,7 +1566,7 @@ SELF_TEST_OK = (
     "outside CI; (pr4-sha256, #6144) a 64-hex PR_HEAD_SHA / GITHUB_SHA (pull_request) and "
     "GITHUB_EVENT_BEFORE / GITHUB_SHA (push) pass the validator and fail cleanly at the later "
     "lookup; (pr4-sha-case, #6144) upper-case 40/64-hex shas pass the validator on every "
-    "validated key; (pr4-sha-len) 63/65-hex, 40 non-ASCII-digit (Arabic-Indic, fullwidth, superscript), 40 non-hex ASCII, newline- or CR-suffixed and space-prefixed 40-hex values refused on every validated sha site (PR_HEAD_SHA, GITHUB_SHA and PR_BASE_SHA on pull_request; GITHUB_EVENT_BEFORE and GITHUB_SHA on push) with only the "
+    "validated key; (pr4-sha-len) 63/65-hex, 40 non-ASCII-digit (Arabic-Indic, fullwidth, superscript), 40 non-hex ASCII, newline- or CR-suffixed and space-prefixed 40-hex values, and every str.isspace() character as a prefix and as a suffix of a 40-hex value, refused on every validated sha site (PR_HEAD_SHA, GITHUB_SHA and PR_BASE_SHA on pull_request; GITHUB_EVENT_BEFORE and GITHUB_SHA on push) with only the "
     "`git --version` probe traced before the validator."
 )
 
