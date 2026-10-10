@@ -275,6 +275,10 @@ The state is coupled to the promotion of the verifier's own context,
 1. This change lands on every unfrozen carrier that still takes pull
    requests: `chain/promo6-ssh` and `rehearsal/audit-wip-ssh` (2026-10-09).
    Both jobs are in `required-contexts-not-required.txt`.
+   Today the live `--pre-apply` fails for two reasons, not one: the carrier tips
+   lack the two #6143 jobs, and `rehearsal/audit-wip-ssh` does not run the
+   workflow on pull requests into itself. It needs the commits that add that
+   trigger (`9f4fc4208`, `20eadf8b1`) as well as the jobs.
 2. ai:god-f2 runs `--pre-apply` (rc 0 required), applies the payload (`POST`,
    command above) and runs the verifier with `--require-full-view`. The
    expected result is rc 1 with "flip".
