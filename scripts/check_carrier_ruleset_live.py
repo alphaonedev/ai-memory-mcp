@@ -555,6 +555,8 @@ def trigger_covers(workflow_text, branch):
                 m = re.match(r"(branches(?:-ignore)?|paths(?:-ignore)?|types)\s*:", deeper.strip())
                 if m and _indent(deeper) == _indent(sub[0]):
                     keys[m.group(1)] = _items(sub, k)
+            if "branches" in keys and "branches-ignore" in keys:
+                return False  # GitHub rejects both filters on one event: the workflow is invalid (#6438)
             if "paths" in keys or "paths-ignore" in keys:
                 return False  # a path filter skips the workflow for some pull requests (#6430)
             if "types" in keys and not set(RUN_TYPES) <= set(keys["types"]):
