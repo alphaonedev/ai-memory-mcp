@@ -5,7 +5,9 @@ RULE (unchanged from the inline gate it replaces): a pull request whose author i
 not OWNER / MEMBER / COLLABORATOR, or whose head lives in another repository (a
 fork, or a deleted head repository), may merge only after an APPROVED review by
 the accountable operator account is the operator's latest review of the PR's
-CURRENT head sha (#6329: a later CHANGES_REQUESTED or a dismissal revokes it).
+CURRENT head sha (#6329: a later CHANGES_REQUESTED or a dismissal fails the next run
+of the check; the workflow has no pull_request_review trigger, so a check that already
+passed stays green until the job runs again, tracked in #6511).
 Team PRs from a same-repository head pass.
 
 #6117 / #6193: the gate is a REQUIRED context, and a push (or merge_group) run
