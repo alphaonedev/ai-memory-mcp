@@ -329,6 +329,14 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
         self.assertNotIn(PW_MARKER, r.stdout + r.stderr)
 
+    def assert_dest_modes_match_sources(self):
+        # #6898: each restored file carries its validated source's mode, never group- or world-writable.
+        for sub, name in self.src:
+            src_mode = stat.S_IMODE((self.age / sub / name).stat().st_mode)
+            dest_mode = stat.S_IMODE(((self.lib if sub == "lib" else self.ext) / name).stat().st_mode)
+            self.assertEqual(dest_mode, src_mode, f"{sub}/{name}")
+            self.assertEqual(dest_mode & 0o022, 0, f"{sub}/{name}")
+
     def assert_nothing_installed(self):
         self.assertEqual(sorted(p.name for p in self.ext.iterdir()), [])
         self.assertEqual(sorted(p.name for p in self.lib.iterdir()), [])
@@ -341,6 +349,21 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assert_restored()
         self.assert_no_temp_files()
         self.assertNotIn(PW_MARKER, r.stdout + r.stderr)
+
+    def test_restored_files_carry_the_source_mode_6898(self):
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("restored", r.stdout)
+        self.assert_dest_modes_match_sources()
+        for (sub, name), data in self.src.items():  # stale wrong-content destinations, world-writable
+            dest = (self.lib if sub == "lib" else self.ext) / name
+            dest.write_bytes(b"stale " + data)
+            dest.chmod(0o666)
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("restored", r.stdout)
+        self.assert_restored()
+        self.assert_dest_modes_match_sources()
 
     def test_present_extension_is_a_noop(self):
         self.install_good()
