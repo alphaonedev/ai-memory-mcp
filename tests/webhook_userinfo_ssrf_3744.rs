@@ -151,7 +151,10 @@ async fn legacy_userinfo_row_is_refused_at_dispatch_as_ssrf_not_dns_3744() {
         "#3744: a legacy userinfo row to loopback is refused as an SSRF violation, \
          not as a resolver miss"
     );
-    assert_ne!(rows[0].last_error, dlq_reason::DNS_SSRF_REJECTED);
+    // #4165 split the DNS reason; the accidental pre-fix refusal was a
+    // resolver miss on the username text, i.e. today's RETRYABLE class.
+    assert_ne!(rows[0].last_error, dlq_reason::DNS_RESOLUTION_FAILED);
+    assert_ne!(rows[0].last_error, dlq_reason::DNS_SSRF_FORBIDDEN_ADDRESS);
     match listener.accept() {
         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
         other => panic!("#3744: the loopback listener must never be connected to: {other:?}"),
