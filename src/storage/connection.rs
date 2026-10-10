@@ -2195,6 +2195,8 @@ mod tests {
             !ran_inside_window,
             "the store-opening test ran while the passphrase seed was live"
         );
-        reader.join().expect("reader completes once the window is released");
+        reader
+            .join()
+            .expect("reader completes once the window is released");
     }
 }
