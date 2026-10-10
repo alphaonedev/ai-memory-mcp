@@ -1306,6 +1306,147 @@ def self_test():
         check(label, lambda t=text, w=want: None if (len(job_token_problems(t)) >= 1) is bool(w)
               else f"job_token_problems is {job_token_problems(t)!r}, want {'problems' if w else 'none'}")
 
+    # Round 7 (#6481 #6482 #6483 #6542 #6543 #6544 #6545): the pins read the workflow through the
+    # fail-closed YAML-subset reader (scripts/workflow_yaml_subset.py), not regexes. A construct the
+    # reader does not model must make the pin FAIL, naming the construct and its line.
+    def closed(fn, text, construct, line):
+        try:
+            fn(text)
+        except Exception as exc:  # noqa: BLE001 - the cell asserts what the refusal says
+            msg = str(exc)
+            if construct in msg and f"line {line}" in msg:
+                return None
+            return f"refused without naming {construct!r} at line {line}: {msg}"
+        return "did not fail closed"
+
+    def refused(fn, text):
+        try:
+            return None if fn(text) else "returned nothing"
+        except Exception:  # noqa: BLE001 - a refusal is the fail-closed answer
+            return None
+
+    for label, text, construct, line in (
+            ("round7 trigger: double-quoted key", "on:\n  \"pull_request_target\":\n    branches: [x]\n",
+             "quoted mapping key", 2),
+            ("round7 trigger: single-quoted key", "on:\n  'workflow_run':\n    workflows: [x]\n",
+             "quoted mapping key", 2),
+            ("round7 trigger: escaped quoted key", "on:\n  \"pull_request\\x5ftarget\":\n", "quoted mapping key", 2),
+            ("round7 trigger: quoted key in a flow mapping", "on: {\"pull_request_target\": {}}\n",
+             "quoted key", 1),
+            ("round7 trigger: fullwidth key", "on:\n  ｐull_request_target:\n", "trigger", 2),
+            ("round7 trigger: merge key", "env: &t\n  workflow_run: x\non:\n  <<: *t\n", "anchor", 1),
+            ("round7 trigger: alias value", "on:\n  push: *t\n", "alias", 2),
+            ("round7 trigger: multi-line flow list", "on: [push,\n  pull_request_target]\n", "flow collection", 1),
+            ("round7 trigger: second document", "on: push\n---\non: [pull_request_target]\n",
+             "top-level row", 2),
+            ("round7 trigger: duplicate on key", "on: push\njobs: {}\non: [pull_request_target]\n",
+             "repeated top-level key", 3),
+            ("round7 trigger: U+2028 in a scalar", "name: \"a b\"\non: push\n", "U+2028", 1),
+            ("round7 trigger: tab", "on:\n\tpush:\n", "tab", 2)):
+        check(label, lambda t=text, c=construct, n=line: closed(forbidden_triggers, t, c, n))
+
+    for label, text, want in (
+            ("round7 trigger: quoted on key", "\"on\": [push, pull_request_target]\n", ["pull_request_target"]),
+            ("round7 trigger: single-quoted on key", "'on':\n  workflow_run:\n", ["workflow_run"]),
+            ("round7 trigger: block sequence", "on:\n  - push\n  - pull_request_target\n", ["pull_request_target"]),
+            ("round7 trigger: quoted scalar value", "on: \"workflow_run\"\n", ["workflow_run"]),
+            ("round7 trigger: quoted item in a flow list", "on: [\"workflow_run\"]\n", ["workflow_run"]),
+            ("round7 trigger: case variant", "on:\n  Pull_Request_Target:\n", ["pull_request_target"]),
+            ("round7 trigger: workflow_call block key", "on:\n  workflow_call:\n", ["workflow_call"]),
+            ("round7 trigger: workflow_call scalar", "on: workflow_call\n", ["workflow_call"]),
+            ("round7 trigger: workflow_dispatch is allowed", "on:\n  workflow_dispatch:\n", [])):
+        check(label, lambda t=text, w=want: None if forbidden_triggers(t) == w
+              else f"forbidden_triggers is {forbidden_triggers(t)!r}, want {w!r}")
+
+    def swap(text, old, new):
+        assert old in text, old
+        return text.replace(old, new, 1)
+
+    def in_verifier(extra_step):
+        marker = "        run: python3 -I scripts/check_carrier_ruleset_live.py --self-test\n"
+        return wf_text[:live_at] + swap(wf_text[live_at:], marker, marker + extra_step)
+
+    def in_job(job_at, old, new):
+        return wf_text[:job_at] + swap(wf_text[job_at:], old, new)
+
+    mint = ("  tokmint:\n    runs-on: ubuntu-latest\n    outputs:\n      t: ${{ steps.s.outputs.t }}\n"
+            "    steps:\n      - id: s\n        env:\n          P: ${{ secrets.PAT }}\n"
+            "        run: echo t=1 >> \"$GITHUB_OUTPUT\"\n\n")
+    with_mint = swap(wf_text, "  carrier-base-fresh-gate:\n", mint + "  carrier-base-fresh-gate:\n")
+    live_m = with_mint.index("  carrier-ruleset-live-gate:\n")
+    needs_wf = with_mint[:live_m] + swap(with_mint[live_m:], "  carrier-ruleset-live-gate:\n",
+                                         "  carrier-ruleset-live-gate:\n    needs: tokmint\n")
+    leak = "      - name: leak\n        env:\n          GH_TOKEN: ${{ needs.tokmint.outputs.t }}\n        run: gh api user\n"
+    nbsp_leak = ("      - name: leak\n        env:\n          X: a #${{ secrets.PAT }}\n"
+                 "        run: GH_TOKEN=\"${X#*#}\" gh api user\n")
+    ideo_leak = nbsp_leak.replace(" ", "　")
+    decoy = ("  Carrier-Ruleset-Live-Gate:\n    name: Carrier-ruleset live verifier (#6143)\n"
+             "    runs-on: ubuntu-latest\n    steps:\n      - env:\n          GH_TOKEN: ${{ secrets.PAT }}\n"
+             "        run: gh api user\n\n")
+    decoy_named = ("  decoy:\n    name: Carrier-ruleset live verifier (#6143)\n    runs-on: ubuntu-latest\n"
+                   "    steps:\n      - run: \"true\"\n\n")
+    top_env = "\nenv:\n  GH_TOKEN: ${{ secrets.PAT }}\n"
+    for label, text in (
+            ("round7 token: workflow-level env GH_TOKEN secret", swap(wf_text, "\npermissions:\n", top_env + "\npermissions:\n")),
+            ("round7 token: workflow-level env other-name secret", swap(
+                wf_text, "\npermissions:\n", "\nenv:\n  CARRIER_PAT: ${{ secrets.PAT }}\n\npermissions:\n")),
+            ("round7 token: workflow-level env secret read by a run body", in_verifier(
+                "      - name: leak\n        run: GH_TOKEN=\"$T\" gh api user\n").replace(
+                    "\npermissions:\n", "\nenv:\n  T: ${{ secrets.PAT }}\n\npermissions:\n", 1)),
+            ("round7 token: workflow-level defaults secret", swap(
+                wf_text, "\npermissions:\n", "\ndefaults:\n  run:\n    shell: ${{ secrets.PAT }}\n\npermissions:\n")),
+            ("round7 token: workflow-level write-all permissions", swap(
+                wf_text, "\npermissions:\n  contents: read\n", "\npermissions: write-all\n")),
+            ("round7 token: job-level contents write", in_job(
+                live_at, "      contents: read\n      issues: read\n", "      contents: write\n      issues: read\n")),
+            ("round7 token: needs key on the verifier job", needs_wf),
+            ("round7 token: needs output read by the verifier", with_mint.replace(
+                "  carrier-ruleset-live-gate:\n", "  carrier-ruleset-live-gate:\n    needs: tokmint\n", 1)
+                .replace("        run: python3 -I scripts/check_carrier_ruleset_live.py --self-test\n",
+                         "        run: python3 -I scripts/check_carrier_ruleset_live.py --self-test\n" + leak, 1)),
+            ("round7 token: no-break space before # hides a secret", in_verifier(nbsp_leak)),
+            ("round7 token: ideographic space before # hides a secret", in_verifier(ideo_leak)),
+            ("round7 token: case-variant job id reports the verifier name", swap(
+                wf_text, "  carrier-base-fresh-gate:\n", decoy + "  carrier-base-fresh-gate:\n")),
+            ("round7 token: second job claims the verifier check name", swap(
+                wf_text, "  carrier-base-fresh-gate:\n", decoy_named + "  carrier-base-fresh-gate:\n")),
+            ("round7 token: #6483 freshness GITHUB_TOKEN with a suffix", in_job(
+                fresh_at, "    steps:\n", "    env:\n      GITHUB_TOKEN: ${{ github.token }}x\n    steps:\n")),
+            ("round7 token: #6483 freshness GH_TOKEN with a prefix", in_job(
+                fresh_at, "    steps:\n", "    env:\n      GH_TOKEN: x${{ github.token }}\n    steps:\n")),
+            ("round7 token: #6483 freshness GITHUB_TOKEN from secrets.GITHUB_TOKEN", in_job(
+                fresh_at, "    steps:\n", "    env:\n      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n    steps:\n"))):
+        check(label, lambda t=text: None if job_token_problems(t) else "job_token_problems is empty")
+    check("round7 token: #6483 freshness GITHUB_TOKEN github.token is clean", lambda: (
+        None if not job_token_problems(in_job(
+            fresh_at, "    steps:\n", "    env:\n      GITHUB_TOKEN: ${{ github.token }}\n    steps:\n"))
+        else "a github.token GITHUB_TOKEN must be clean"))
+
+    for label, text, construct, line_of in (
+            ("round7 token: alias env", in_verifier("      - name: leak\n        env: *x\n        run: gh api user\n"),
+             "alias", None),
+            ("round7 token: anchor env", swap(wf_text, "  carrier-base-fresh-gate:\n",
+                                              "  anchorhold:\n    env: &x\n      A: b\n    runs-on: x\n\n"
+                                              "  carrier-base-fresh-gate:\n"), "anchor", None),
+            ("round7 token: quoted env key", in_verifier(
+                "      - name: leak\n        env:\n          \"GH_TOKEN\": ${{ secrets.PAT }}\n        run: gh api user\n"),
+             "quoted mapping key", None),
+            ("round7 token: U+2028 in a quoted scalar", in_verifier(
+                "      - name: x\n        run: \"echo ok   zz:\"\n"), "U+2028", None),
+            ("round7 token: tab indentation", in_verifier("      - name: x\n\trun: x\n"), "tab", None),
+            ("round7 token: second document", wf_text + "---\non: [pull_request_target]\n", "top-level row", None),
+            ("round7 token: duplicate top-level key", wf_text + "on: push\n", "repeated top-level key", None)):
+        def expect(t=text, c=construct):
+            try:
+                job_token_problems(t)
+            except Exception as exc:  # noqa: BLE001
+                msg = str(exc)
+                return None if c in msg and re.search(r"line \d+", msg) else f"refusal lacks {c!r} or a line: {msg}"
+            return "did not fail closed"
+        check(label, expect)
+    check("round7 token: flow-mapping env GH_TOKEN is refused or flagged", lambda: refused(job_token_problems, in_verifier(
+        "      - name: leak\n        env: {GH_TOKEN: x}\n        run: gh api user\n")) or None)
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"
