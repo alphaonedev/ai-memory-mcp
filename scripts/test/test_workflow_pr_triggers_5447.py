@@ -4395,5 +4395,49 @@ class ApprovalDocResiduals6327(unittest.TestCase):
                 self.assertIn("own merge ref", para)  # #6223
                 self.assertIn("only the PR named by the queue ref", para)  # #6229
 
+
+
+# ---- Round 5 (#6328): Bearer / Basic / token authorization values are redacted ----
+
+
+class AuthorizationRedaction6328(unittest.TestCase):
+    """An authorization value in relayed gh stderr never reaches the ``::error::`` line."""
+
+    # Synthetic shapes only: a JWT-like triple and a base64 user:pass blob.
+    JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJlLXZhbHVl"
+    BASIC = "dXNlcjpwYXNzd29yZC12YWx1ZQ=="
+    OPAQUE = "v1.0123456789abcdef0123456789abcdef"
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+
+    def relayed(self, stderr: str) -> str:
+        import types
+
+        def fake_run(*_a, **_k):
+            return types.SimpleNamespace(returncode=1, stdout="", stderr=stderr)
+        with unittest.mock.patch.object(self.mod.subprocess, "run", fake_run):
+            _rc, lines = self.mod.run_gate("push", {}, REPO_6117, SHA_A, OPERATOR_6117, self.mod.gh_api)
+        self.assertEqual(1, len(lines), lines)
+        return lines[0]
+
+    def test_6328_authorization_schemes_are_redacted_in_relayed_stderr(self) -> None:
+        for scheme, secret in (("Bearer", self.JWT), ("bearer", self.JWT), ("Basic", self.BASIC),
+                               ("token", self.OPAQUE), ("TOKEN", self.OPAQUE)):
+            with self.subTest(scheme=scheme):
+                line = self.relayed(f"HTTP 401: Authorization: {scheme} {secret}\n")
+                self.assertIn("[redacted]", line)
+                for i in range(len(secret) - 7):
+                    self.assertNotIn(secret[i:i + 8], line)
+
+    def test_6328_authorization_value_is_redacted_by_the_escaper_too(self) -> None:
+        line = self.mod.workflow_error(f"header Authorization: Bearer {self.JWT}")
+        self.assertNotIn(self.JWT[:8], line)
+        self.assertIn("[redacted]", line)
+
+    def test_6328_ordinary_words_survive(self) -> None:
+        line = self.mod.workflow_error("Bad credentials (HTTP 401)")
+        self.assertIn("Bad credentials (HTTP 401)", line)
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
