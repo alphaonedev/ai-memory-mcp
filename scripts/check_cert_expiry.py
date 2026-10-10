@@ -97,7 +97,13 @@ WHAT THIS DOES NOT CLAIM. The identifier check compares, per identifier, the
 trimmed text of every line under src/ that names it (#6427). So a value edited
 on the line that carries an AI_MEMORY_FED_* identifier, a rewrap of that line,
 a trailing comment on it, or a block comment opened and closed ON it is drift
-and RED; a value that sits on a different line from the name is not seen.
+and RED unless the old line text still occurs elsewhere under src/; a value
+that sits on a different line from the name is not seen. The base's
+identifier-bearing line texts are compared as a multiset over all of src/,
+without the path: a change that keeps every one of them, as often as before,
+somewhere under src/ (in any file, in a comment, in a string, or in code that
+is compiled out) is not seen, and the (value-copy-bound) cell pins that (a
+value edited with the old line kept in a block comment is GREEN, #6652).
 LEXICAL BOUND: the check is a text scan, so a change that leaves every
 identifier-bearing line byte-identical is not seen. Measured examples, each
 GREEN: a multi-line comment opened and closed on the neighbouring lines, an
@@ -2182,6 +2188,9 @@ SELF_TEST_OK = (
     "(value-edit-ws) an interior-whitespace-only edit of the value on the identifier line is "
     "RED, (value-edit-case) a case-only edit of it is RED, (value-trim-nbsp) a trailing "
     "U+00A0 is a trimmed blank and GREEN (#6720); "
+    "(value-copy-bound) a value edited on the identifier line while the old line text "
+    "stays under src/ (here in a block comment) is GREEN: the line texts are a multiset over "
+    "src/ without the path (#6652); "
     "(doc-bound, #6563) the docstring states the lexical bound; "
     "(mask-xfile, mask-incomment, mask-longer, mask-blockcomment, mask-annot, #6427) a removed "
     "definition offset by a mention in another file, a comment in its place, a longer token, a "
