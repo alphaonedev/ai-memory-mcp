@@ -48,6 +48,12 @@ const SUBSCRIBERS: usize = 50;
 /// drains and trips this deadline (the assert then FAILs correctly).
 const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
 
+/// #6794 — a drain that has not finished by the deadline still passes when
+/// the receiver served at least one request in this final window. It exceeds
+/// the longest idle gap of a healthy retry ladder (5 s last backoff plus one
+/// 5 s `ACK_TIMEOUT` is the worst case before the next request lands).
+const STALL_WINDOW: Duration = Duration::from_secs(11);
+
 /// #1475 — poll cadence while waiting for the semaphore to drain.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -163,23 +169,96 @@ async fn dispatch_to_50_subscribers_caps_inflight_at_semaphore_bound() {
         "PERF-3 sampling did not observe ANY in-flight work — the test \
          is not actually exercising the dispatch path (peak={peak})"
     );
-    // The semaphore should be fully drained (all permits returned)
-    // by the end of the test. Under full-suite load the wiremock
-    // backends are slower (HTTP contention pushes per-delivery latency
-    // past the 5 s sampler window), so poll until drained rather than
-    // asserting immediately. A genuine permit leak never drains and
-    // trips the deadline (still FAILs correctly); a slow host just
-    // takes a few extra 50 ms iterations.
+    // #6794 — the semaphore must drain, or at least keep making progress.
+    // A delivery that hits a per-attempt failure on a saturated host holds
+    // its permit through the whole retry ladder (`ACK_TIMEOUT` x 4 plus the
+    // backoffs, ~26 s by design, see `SHUTDOWN_DRAIN_TIMEOUT`), so with 50
+    // deliveries over 8 permits a fixed deadline cannot tell "slow" from
+    // "leaked" (#1475 widened the deadline, #6794 hit it again: 0 of 8 permits
+    // free after 35 s at host load ~85). The permit snapshot cannot show
+    // progress either, because a freed permit is re-taken by the next queued
+    // delivery at once. The receiver's served-request count is monotone and
+    // moves on every attempt, so: poll until drained; if the deadline is hit
+    // with permits still held, fail ONLY when the receiver served nothing
+    // during the final `STALL_WINDOW` (a true leak holds permits with no
+    // worker left to send), and print the timeline either way.
+    let started = std::time::Instant::now();
+    let mut timeline: Vec<(u128, usize, usize)> = Vec::new();
     let mut idle_avail = dispatch_semaphore_available_permits();
-    let drain_deadline = std::time::Instant::now() + DRAIN_DEADLINE;
+    let drain_deadline = started + DRAIN_DEADLINE;
     while idle_avail != BOUND && std::time::Instant::now() < drain_deadline {
         tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
         idle_avail = dispatch_semaphore_available_permits();
+        timeline.push((
+            started.elapsed().as_millis(),
+            idle_avail,
+            server.received_count().await,
+        ));
     }
-    assert_eq!(
-        idle_avail, BOUND,
-        "PERF-3 invariant violated: semaphore did not drain fully \
-         after dispatch settled (available={idle_avail}, bound={BOUND}). \
-         A permit leak would block subsequent dispatches."
+    let timeline_text = describe_timeline(&timeline);
+    if idle_avail != BOUND {
+        let latest = timeline.last().map_or(0, |&(_, _, served)| served);
+        let elapsed_ms = started.elapsed().as_millis();
+        assert!(
+            !drain_stalled(&timeline, elapsed_ms, STALL_WINDOW.as_millis()),
+            "PERF-3 invariant violated: semaphore did not drain and the \
+             receiver served no request in the last {STALL_WINDOW:?} \
+             (available={idle_avail}, bound={BOUND}, served={latest}). \
+             A permit leak would block subsequent dispatches. \
+             Timeline (ms, available, served): {timeline_text}"
+        );
+        eprintln!(
+            "PERF-3: drain still in progress at the deadline (available={idle_avail}, \
+             bound={BOUND}, served={latest}); progress observed, not a leak. \
+             Timeline (ms, available, served): {timeline_text}"
+        );
+    }
+}
+
+/// #6794 — true when the receiver's served count did not grow during the
+/// last `window_ms` of the drain. `timeline` is `(elapsed_ms, available,
+/// served)` in time order.
+fn drain_stalled(timeline: &[(u128, usize, usize)], elapsed_ms: u128, window_ms: u128) -> bool {
+    let latest = timeline.last().map_or(0, |&(_, _, served)| served);
+    let before = timeline
+        .iter()
+        .rev()
+        .find(|&&(at_ms, _, _)| at_ms.saturating_add(window_ms) <= elapsed_ms)
+        .map_or(0, |&(_, _, served)| served);
+    latest <= before
+}
+
+#[test]
+fn drain_stall_detector_separates_slow_from_leaked_6794() {
+    // Slow host: permits stay at 0 but the receiver keeps serving requests.
+    let slow: Vec<(u128, usize, usize)> = (0..40u128)
+        .map(|i| (i * 1_000, 0, 10 + usize::try_from(i).unwrap_or(0)))
+        .collect();
+    assert!(
+        !drain_stalled(&slow, 40_000, 11_000),
+        "progressing drain flagged as a leak"
     );
+    // Leak: all 50 requests served long ago, permits still held.
+    let leaked: Vec<(u128, usize, usize)> = (0..40u128).map(|i| (i * 1_000, 0, 50)).collect();
+    assert!(
+        drain_stalled(&leaked, 40_000, 11_000),
+        "stalled drain not flagged"
+    );
+    // No samples at all is a stall, not a pass.
+    assert!(drain_stalled(&[], 40_000, 11_000));
+}
+
+/// #6794 — compress the drain timeline to at most ~24 evenly spaced points
+/// plus the last one, so the assertion message stays readable.
+fn describe_timeline(timeline: &[(u128, usize, usize)]) -> String {
+    let step = (timeline.len() / 24).max(1);
+    let mut points: Vec<String> = timeline
+        .iter()
+        .step_by(step)
+        .map(|&(at_ms, avail, served)| format!("({at_ms},{avail},{served})"))
+        .collect();
+    if let Some(&(at_ms, avail, served)) = timeline.last() {
+        points.push(format!("({at_ms},{avail},{served})"));
+    }
+    points.join(" ")
 }

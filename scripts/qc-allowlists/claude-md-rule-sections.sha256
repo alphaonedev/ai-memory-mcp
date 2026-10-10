@@ -2,18 +2,18 @@
 # Enforced by scripts/check-claude-md-size.py. Change it only with `scripts/check-claude-md-size.py --update`
 # in the same commit as the reviewed rule change. Format: <sha256>  <heading>
 879e6d2088503bcfab91609094ac8cbc9a4f9d7fe0e1ab892197b086119c0972  (preamble before the first ## heading)
-7f5482166c844cc88e4d7a43bc682bbb27ac53eda8e2a0e4dbbac5c09ee00a0d  ## Hard rule — `memory_store` FIRST on operator multi-step directives (L1 of #1389 layered-capture architecture)
-f3e2dccc61da639d734aa7ba48e339321c9ca3cab0d4fd69f9aaba93cf4210f8  ## Required Reading at Session Start (AI agents)
-db160a1df518ee79c123fe30b03edc205f87283f7114837806978e63028c4476  ## Build & Test Commands
-a95111e7c793943fe5f3a89aefb8386b1f3e7c69123ceb21746653b14c3afcae  ## Dogfooding release branches
-bc235b56670ea810db2e53bae129db629c84857d17d9137b04d2da1aeee8ad7a  ## Reproducing the v0.7.0 recursive-learning primitive
+a9fbc9ca04a04d2bdf13c4772dd56ebea116b82de18e675ff1df36ee8f8711cd  ## Hard rule — `memory_store` FIRST on operator multi-step directives (L1 of #1389 layered-capture architecture)
+63628588e0ac578fea85b6e585982bd442c7daa4420ed9c6307d9007e2d19fa3  ## Required Reading at Session Start (AI agents)
+2bdf119184bfae244ccbc9061bc1eae94d7c8ace6f5d5928ff24ccfec036af01  ## Build & Test Commands
+990a4a862fcdbc3d511b5803e51a49891ac65ae85351dcd6edd7f33732cf1ffd  ## Dogfooding release branches
+fbe2f5e766c42769e75aa182c50e982b89dd006a06a5d0dcf56b9d8b5b116b8a  ## Reproducing the v0.7.0 recursive-learning primitive
 82403f6ca9427d84ef1b56aa4c6b5ce82c646d97d09ba1048c8d3758bc8c6c05  ## Architecture
-c3f6a6827dd3c1c118fabc11386e68b0f6e65be094448581050583d93aa60aba  ## Adding New Functionality
+22e511869f7d39f3c5554333831f49faff25ab98572f34a00c384b2f9eef4d27  ## Adding New Functionality
 9b92321c53d0efe15cb34cdb952ec476058a881b6bdbd1b55582edf60a3892df  ## Code Style
-678bb5873583d9e5b81ac0e71e3c2afb74a9219219094258d6a9c89713f6b9e7  ## Prime directive (operator-set, 2026-05-17)
-e61964de435ea505e7e10463107fc3d4d33165526fc9dd11d225a42f06410ac9  ## Crossroads decision protocol — deterministic 5-agent adversarial vote (operator-set 2026-06-18)
-851baca478fe77e2eb9cf108e88dbe2c9c73cb9ef6faa2fd6af8c9ef6bd87267  ## v0.7.0 release gate (operator-set 2026-05-17 pm-v5)
-bb5de62f52e34ccfb92c120b32304042a7a09c9f0901f6a549a3ebaee40c34f9  ## Sole-authority operator + no-external-code-injection (operator-set 2026-05-25)
-8e25635eb60a7f2c334f071b23a6520555e55c20ec8f60ad1cc2c5af9f018ada  ## Commit & push policy (project override of global default)
-3bfe8150a005f5f6a452c3e82d2d1fdf6b213e69199d3d32d10523f4e0971fed  ## Multi-agent worktree discipline (issue #856)
-75a50ffc6b2b6f91cb906242fdc74e783390d4164116938a1a24f1b54800dc0a  ## No agent-created files under /tmp, /var/tmp, /private/tmp, or any tmpfs (project hard rule)
+2d6b30780058da3153b5c367f5e97bd78260662f78eda5a744309afa2f999ddd  ## Prime directive (operator-set, 2026-05-17)
+2ee348fe4f938fcc4c596dc247a62b7f1e65a0d54af96c473c7fb5fc02e9169f  ## Crossroads decision protocol — 1x3 adversarial vote with a threshold (operator-set 2026-06-18, slimmed 2026-10-10)
+b96fb1a5548a92acc32d77668f33884ecdb636e6e2bbfa0af7c0040924704cb8  ## v0.7.0 release gate (operator-set 2026-05-17 pm-v5)
+76d73d2153d0ad4235f4067a56d9e1aea9f37c173dc220c06271f101a1584477  ## Sole-authority operator + no-external-code-injection (operator-set 2026-05-25)
+64fbc0644f5a0b1dee5694f373deaf52037be787f17cc0539a65db59b910dc8d  ## Commit & push policy (project override of global default)
+93e6f2ca5c6d0a9c5e3d8a6ed09c60eedb38002659ed4f025e3fa68e3bea22f1  ## Multi-agent worktree discipline (issue #856)
+6d33b81c15a27bfbcbcb4ae9edab9be185ae82c9fd6c3dcbd28760438490444d  ## No agent-created files under /tmp, /var/tmp, /private/tmp, or any tmpfs (project hard rule)

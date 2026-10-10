@@ -626,7 +626,7 @@ d_scan() {
             continue
         fi
         prebuild="$(awk -v a="$opener" -v b="$w" '
-            NR > a && NR < b && /cargo test --no-run "\$@" \|\| return "\$\?"/ { n = NR }
+            NR > a && NR < b && /cargo test --no-run "\$@"( "\$\{sel\[@\]\}")? \|\| return "\$\?"/ { n = NR }
             END { print n + 0 }' "$file")"
         if [ "$prebuild" -eq 0 ]; then
             bad=$((bad + 1))
@@ -657,7 +657,7 @@ fi
 # the repo (never system /tmp), trap-cleaned by the SCRATCH dir above.
 if [ "$d_total" -gt 0 ]; then
     D_MUT="$SCRATCH/ci-2657-mutant.yml"
-    grep -v 'cargo test --no-run "\$@" || return "\$?"' "$CI_YML" > "$D_MUT"
+    grep -vE 'cargo test --no-run "\$@"( "\$\{sel\[@\]\}")? \|\| return "\$\?"' "$CI_YML" > "$D_MUT"
     d_mut_result="$(d_scan "$D_MUT" 2>/dev/null)"
     d_mut_bad="${d_mut_result%%/*}"
     if [ "$d_mut_bad" -eq "$d_total" ]; then
@@ -801,13 +801,20 @@ else
         "$(grep -E 'R-(PR|PUSH|SHAPE)|^FAIL|^ERROR' "$SCRATCH/f-5447.out" | head -12)"
 fi
 
-# SECTION G (#6339): the AGE self-heal helper reads the tier URL file and builds
+# ===========================================================================
+# SECTION G — #6383 / #6386: the opt-in per-binary Postgres isolation lane.
+# The checks live in Python (review r1 L1): scripts/ci/check_pg_isolate_invariants.py,
+# unit-tested with one mutant per check in scripts/ci/tests/.
+# ===========================================================================
+if python3 "$ROOT/scripts/ci/check_pg_isolate_invariants.py" --root "$ROOT" --ci-yml "$CI_YML"; then ok "G: #6383 pg-isolation invariants (opt-in, run-scoped, no URL argv, selected prebuild, watchdog, logs)"; else bad "G: #6383 pg-isolation invariants failed" "see output above"; fi
+
+# SECTION H (#6339): the AGE self-heal helper reads the tier URL file and builds
 # PGPASSWORD, so ci.yml must run it as `python3 -I` (no sys.path[0], no PYTHON* env).
-if python3 "$ROOT/scripts/test/test_ci_age_helper_isolated_6339.py" >"$SCRATCH/g-6339.out" 2>&1; then
-    ok "G: ci.yml runs the AGE self-heal helper with python3 -I (#6339)"
+if python3 "$ROOT/scripts/test/test_ci_age_helper_isolated_6339.py" >"$SCRATCH/h-6339.out" 2>&1; then
+    ok "H: ci.yml runs the AGE self-heal helper with python3 -I (#6339)"
 else
-    bad "G: AGE helper isolation pin failed (#6339)" \
-        "$(grep -E '^FAIL|^ERROR|AssertionError' "$SCRATCH/g-6339.out" | head -12)"
+    bad "H: AGE helper isolation pin failed (#6339)" \
+        "$(grep -E '^FAIL|^ERROR|AssertionError' "$SCRATCH/h-6339.out" | head -12)"
 fi
 
 echo ""

@@ -87,6 +87,7 @@ on:
   # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
     branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]
+    types: [opened, synchronize, reopened, edited]
   # Merge Queue (#3089) — GitHub runs a queued PR's REQUIRED checks against the
   # ephemeral `merge_group` ref, NOT the PR ref. A required workflow that does
   # not trigger on `merge_group` never reports on that ref, so its context stays
@@ -130,9 +131,16 @@ permissions:
 # protected-branch CI. The chained key below restricts the coalescing
 # to head.repo==github.repository (internal-PR / maintainer paths) so
 # fork PRs cannot collide with branch keys.
+#
+# #6340: cancel-in-progress is true only for pull_request runs, so a push run
+# on release/**, main or develop is not cancelled by a later push while it is
+# in progress. A queued run is still replaced by a newer queued run (GitHub
+# semantics), and because this key coalesces push + same-branch internal PR
+# events, a pull_request run on that branch can still cancel an in-progress
+# push run. Pinned by scripts/test/test_workflow_concurrency_6340.py.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -220,6 +228,10 @@ jobs:
         with: { fetch-depth: 2 }
       - name: Test impact selector security fallbacks
         run: python3 scripts/test/test_ci_test_impact.py
+      - name: Workflow concurrency invariants (#6340)
+        run: python3 scripts/test/test_workflow_concurrency_6340.py
+      - name: Shard partition and wiring unit tests (#6344)
+        run: python3 -m unittest discover -s scripts/ci/tests
       - name: AGE self-heal helper unit test (#6161)
         run: python3 scripts/test/test_ensure_age_extension_6161.py
       - id: cls
@@ -623,7 +635,7 @@ jobs:
     # single cap sized for the slowest one is a 35-minute blind spot on the
     # fastest. Values and their basis:
     #
-    #   ubuntu-latest,sqlite      55  Pre-#3109 this exact workload ran on this
+    #   ubuntu-latest,sqlite      95  (was 55: raised in #3538, see the matrix entry.) Pre-#3109 this exact workload ran on this
     #                                 exact runner class under a 45-min cap and
     #                                 passed (`Check (ubuntu-latest)`), so 45 is
     #                                 a MEASURED hosted value, not an f2 value.
@@ -631,7 +643,7 @@ jobs:
     #                                 `cargo audit` steps to the leg, so +10.
     #                                 The 1500s (25 min) sqlite watchdog stays
     #                                 well inside it.
-    #   linux-fed,enterprise-fed  80  Unchanged. Compile ~12 min (hoisted
+    #   linux-fed,enterprise-fed 160  (was 80: raised in #6411/#6344, see the matrix entry.) Compile ~12 min (hoisted
     #                                 OUTSIDE the per-invocation watchdog) plus
     #                                 the 3300s (55 min) hang-watchdog can
     #                                 legitimately approach ~67 min, so the
@@ -646,7 +658,7 @@ jobs:
     #                                 It also no longer needs the contention
     #                                 headroom #3139 measured: this is now the
     #                                 ONLY Linux `check` leg on the fleet.
-    #   macos-fed,*               80  Unchanged. With the #3140 watchdog fix
+    #   macos-fed,sqlite          80  Unchanged. With the #3140 watchdog fix
     #                                 below, a macOS hang is now cut at the
     #                                 per-invocation cap instead of burning
     #                                 this whole 80-min budget (#3140 observed
@@ -658,6 +670,13 @@ jobs:
     #                                 (40 min) still sits well inside this 80,
     #                                 so the named watchdog, not a nameless
     #                                 job-level cancel, is still what fires.
+    #   macos-fed,enterprise-fed 160  Same sharded suite and cap as the linux-fed
+    #                                 enterprise-fed leg (see its matrix entry).
+    #
+    # #6795: the Load gate step may wait up to 1200 s inside these caps; every
+    # watchdog and shard budget is capped to the job time left (JOB_T0), so a
+    # named #1492 watchdog fires before GitHub's cancel. Do not raise a cap
+    # for the gate.
     timeout-minutes: ${{ matrix.timeout }}
     env:
       # Debuginfo budget for this job — the heaviest compile in CI (~600
@@ -762,11 +781,16 @@ jobs:
             runner: '["self-hosted","linux-fed"]'
             node: linux-fed
             tier: enterprise-fed
-            # #3525/#3976: compile (~6 min) + the 8100 s full-suite watchdog +
-            # the ephemeral-db setup/teardown must fit inside this outer bound.
-            # 160 (f2r): measured non-test overhead ~970 s, so 145 min let the
-            # job cap pre-empt a near-budget watchdog (8700 - 970 < 8100); the
-            # watchdog must be what fires, NAMED.
+            # #3525/#3976/#6202/#6344: compile (~6-12 min) + the 7800 s
+            # per-shard watchdog + the ephemeral-db setup/teardown must fit
+            # inside this outer bound. 160 = 130 min watchdog + 28 min of
+            # pre-watchdog compile and database setup (measured in review r2)
+            # + 2 min teardown, so the named watchdog fires before the job
+            # cap (#6411; the #6202 rule job limit >= watchdog + 15 min is
+            # necessary but not sufficient). Raised from 120/5400 s for the
+            # first measured sharded run (#6344 review r2 F1): re-derive both
+            # from the per-shard timings after the first green run. Budget
+            # table: docs/ci/CARRIER-BRANCH-GATES.md.
             timeout: 160
           - leg: macos-fed,sqlite
             runner: '["self-hosted","macos-fed"]'
@@ -777,13 +801,26 @@ jobs:
             runner: '["self-hosted","macos-fed"]'
             node: macos-fed
             tier: enterprise-fed
-            # #3525/#3976: compile (~6 min) + the 8100 s full-suite watchdog +
-            # the ephemeral-db setup/teardown must fit inside this outer bound.
-            # 160 (f2r): measured non-test overhead ~970 s, so 145 min let the
-            # job cap pre-empt a near-budget watchdog (8700 - 970 < 8100); the
-            # watchdog must be what fires, NAMED.
+            # #3525/#3976/#6202/#6344: compile (~6-12 min) + the 7800 s
+            # per-shard watchdog + the ephemeral-db setup/teardown must fit
+            # inside this outer bound. 160 = 130 min watchdog + 28 min of
+            # pre-watchdog compile and database setup (measured in review r2)
+            # + 2 min teardown, so the named watchdog fires before the job
+            # cap (#6411; the #6202 rule job limit >= watchdog + 15 min is
+            # necessary but not sufficient). Raised from 120/5400 s for the
+            # first measured sharded run (#6344 review r2 F1): re-derive both
+            # from the per-shard timings after the first green run. Budget
+            # table: docs/ci/CARRIER-BRANCH-GATES.md.
             timeout: 160
     steps:
+      # #6795 — job start, recorded FIRST so every later budget (the serial
+      # shard, the parallel shards and the non-sharded watchdogs) is derived
+      # from the real time left under the job `timeout-minutes`, including the
+      # load-gate wait and every pre-test step.
+      - name: Record job start (#6795)
+        if: needs.classify.outputs.docs_only != 'true'
+        run: echo "JOB_T0=$(date +%s)" >> "$GITHUB_ENV"
+
       # 2026-08-26 rigid-security-controls: a fork PR must NEVER have its code
       # checked out on a self-hosted node (f2 = the operator's home gateway,
       # f1 = the macOS fed node). Primary control is the repository's Actions
@@ -1042,6 +1079,7 @@ jobs:
           LEG: ${{ matrix.leg }}
           # #6161 — node label via env (same expression-injection rule as LEG).
           CI_NODE: ${{ matrix.node }}
+          CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}
         run: |
           set -euo pipefail
           # psql lives under a platform-specific prefix. Prepend it to
@@ -1102,6 +1140,25 @@ jobs:
           fi
           echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url" >> "$GITHUB_ENV"
           echo "::notice::[enterprise-fed] created ephemeral db $CI_FED_DB on the native tier ($RUNNER_NAME) and pointed AI_MEMORY_TEST_POSTGRES_URL at it"
+          # #6383 / #6386 — per-binary Postgres isolation, OPT-IN (decided by
+          # GOD, review r1 M4): it runs only when AI_MEMORY_TEST_PG_ISOLATE is 1
+          # already in the job environment, and this workflow sets it on NO leg.
+          # Default-on (and --test-threads>1) waits for two green sharded
+          # carrier runs and a 5-agent vote (4d3ea1c5). CI_PG_ISOLATE_OFF=1
+          # (repo variable) is an extra hard kill switch. When on: assert the
+          # LIVE connection budget (fails closed), build the locked age+vector
+          # template, and export the template and this run's id (clone names
+          # carry it, so teardown touches only this run's clones). The URL
+          # reaches the wrapper through the environment, never argv.
+          if [ "${AI_MEMORY_TEST_PG_ISOLATE:-0}" != "1" ]; then
+            echo "::notice::[#6383] per-binary Postgres isolation is off (opt-in; not enabled for this leg)"
+          elif [ "${CI_PG_ISOLATE_OFF:-}" = "1" ]; then
+            echo "AI_MEMORY_TEST_PG_ISOLATE=0" >> "$GITHUB_ENV"
+            echo "::notice::[#6383] per-binary Postgres isolation disabled by CI_PG_ISOLATE_OFF=1"
+          else
+            AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB" --jobs 8 --emit-env >> "$GITHUB_ENV"
+            echo "::notice::[#6383] per-binary Postgres isolation ON: template ${CI_FED_DB}_tpl"
+          fi
 
       # Isolation shot after e380ca5d: mold + debuginfo=0 linked and RAN
       # the sqlite suite, then `hot_swap_llm_2166` SIGSEGV'd. That binary
@@ -1164,6 +1221,16 @@ jobs:
           done
           echo "::notice::[#3539] passphrase env scrubbed for this job (AI_MEMORY_NO_CONFIG kept)"
 
+      # #6795 — per-runner load gate. The 7800 s shard budgets were derived on an
+      # idle host; on f1 at load ~100 the single-threaded serial shard ran 5-6x
+      # slower and was killed by the #1492 watchdog. Wait (bounded, default 20
+      # min) while the 1-minute load average exceeds 1.5 x cores, print the
+      # measured load, then proceed. The helper NEVER fails on load alone.
+      # Self-hosted legs only: hosted runners are dedicated VMs.
+      - name: Load gate (#6795)
+        if: needs.classify.outputs.docs_only != 'true' && contains(matrix.runner, 'self-hosted')
+        run: python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
+
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.docs_only != 'true'
         env:
@@ -1179,9 +1246,39 @@ jobs:
           TEST_IMPACT_REASON: ${{ needs.classify.outputs.test_impact_reason }}
           TEST_IMPACT_COUNT: ${{ needs.classify.outputs.test_impact_count }}
           TEST_IMPACT_TOTAL: ${{ needs.classify.outputs.test_impact_total }}
+          # #6795 — the job cap (minutes) the serial shard budget is derived from.
+          JOB_TIMEOUT_MIN: ${{ matrix.timeout }}
+          CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}
         shell: bash
         run: |
           set -euo pipefail
+          # #6795 — JOB_T0 is written to $GITHUB_ENV by the first step of the job.
+          # Invalid or missing: warn and keep the flat watchdog values (fail
+          # toward the old behaviour, never toward a 0 s or empty watchdog).
+          case "${JOB_T0:-}" in
+            ''|0*|*[!0-9]*)
+              echo "::warning::[#6795] JOB_T0 missing, non-numeric or zero-prefixed (octal in bash arithmetic); watchdogs keep their flat values"
+              JOB_T0_VALID=0
+              ;;
+            *) JOB_T0_VALID=1 ;;
+          esac
+          # #6383 / #6386 — the per-binary isolated lane is OPT-IN (review r1
+          # M4): it runs only with AI_MEMORY_TEST_PG_ISOLATE at 1 (set by no leg of
+          # this workflow), never with CI_PG_ISOLATE_OFF=1, and only on the
+          # enterprise-fed tier. With it on, the template and run id exported by
+          # the configure step are REQUIRED (review r1 M6: fail, never skip),
+          # so a residual binary can never clone the shared database. With it
+          # off the flag is forced to 0 for every cargo child.
+          PG_ISO_LANE=0
+          if [ "${AI_MEMORY_TEST_PG_ISOLATE:-0}" = "1" ] && [ "${CI_PG_ISOLATE_OFF:-}" != "1" ] && [ "${TIER:-}" = "enterprise-fed" ]; then
+            if [ -z "${AI_MEMORY_TEST_PG_TEMPLATE:-}" ] || [ -z "${AI_MEMORY_TEST_PG_RUN_ID:-}" ]; then
+              echo "::error::[#6383] AI_MEMORY_TEST_PG_ISOLATE is 1 but the template or run id was not exported by the configure step"
+              exit 1
+            fi
+            PG_ISO_LANE=1
+          else
+            export AI_MEMORY_TEST_PG_ISOLATE=0
+          fi
           # v1.0.0 2x2 — tier-parametrised feature/thread selection. The
           # `enterprise-fed` legs add `--features sal-postgres` and serialise
           # DDL with `-- --test-threads=1` (the sal-postgres suite shares one
@@ -1252,7 +1349,35 @@ jobs:
             # to-run variance, and the suite grew ~40 % since c1a0ca59a).
             # 8100 s = ~1.3x the worst case. Splitting the tier into two legs
             # (#3973) is the durable fix; this keeps Promotion 4 moving.
-            WATCHDOG_SECS=8100
+            # 2026-10-09 (#6202): RE-DERIVED again, from live job logs. The
+            # suite is 1,005 test executables run serially. Uncontended it
+            # measured 4007 s and 4750 s (lib through
+            # federation_write_ns_scope_2447 at 2303 s / 2767 s). Both
+            # linux-fed slots share one 14-core host; in run 37944916554
+            # (PR #6160, both slots busy) the same point came only at ~8100 s
+            # (~3.5x), where the 8100 s watchdog killed a healthy run (exit
+            # 124). Extrapolated, a contended serial suite needs ~13,900-
+            # 14,100 s. 14400 s (240 min) leaves only ~300-500 s (2-4 %) of
+            # margin over that: this was the SERIAL budget until the #6344
+            # shards land (critical path ~3,900 s), not a comfortable one.
+            # 2026-10-09 (#6344): SUPERSEDED by the shards. This tier now runs
+            # as three concurrent shards (run_sharded below) and each shard's
+            # whole chain is bounded by this value. The longest is the serial
+            # shard: scripts/ci/partition_test_binaries.py estimates it at
+            # 3,913 s (lib Postgres prefixes 84 s + doc tests 16 s + 388
+            # class-(a) binaries, run-6160 contended weights); the parallel
+            # shards run ~1,620 s / ~1,812 s (per-binary min(tests, 3)
+            # threads; lib:nonpg is 4,859 s of serial work, the heaviest one).
+            # 56 % of the 3,913 s serial estimate is class averages (217 of
+            # 388 binaries have no measured weight), the run-6160 weights came
+            # from a 2-process run, and the contention between shards (two
+            # jobs of three shards on one 14-core host) is unmeasured. So the
+            # budget is 2x the estimate: 7800 s (130 min) for the first
+            # measured run (was 5400 s, 1.38x). Re-derive from the per-shard
+            # elapsed notices of the first green linux-fed run, and whenever a
+            # shard comes within 20 % of this value.
+            # The watchdog is a hang-detector, not a cap on total suite length.
+            WATCHDOG_SECS=7800
             echo "::notice::[enterprise-fed] cargo test $FEAT ... $TAIL (watchdog ${WATCHDOG_SECS}s)"
           else
             # #3461 — macos-fed sqlite is NODE-aware on top of the tier. On
@@ -1281,7 +1406,7 @@ jobs:
             # the hosted ubuntu leg at 92 % of the old 1500s default and raised
             # that default to 2100s, so macos-fed keeps its own 2400s here. The
             # enterprise-fed tier is untouched by both and keeps its own
-            # #3525/#3976 cap set above (8100s).
+            # #3525/#3976 cap set above (7800s per shard, #6202/#6344).
             if [ "${CI_NODE:-}" = "macos-fed" ]; then
               WATCHDOG_SECS=2400
             fi
@@ -1340,9 +1465,25 @@ jobs:
           else
             echo "::notice::[#1492] watchdog disabled on ${RUNNER_OS:-unknown} — no coreutils gtimeout/timeout found (job-level timeout-minutes still applies)"
           fi
+          # #6795 — seconds left under the job timeout-minutes, minus 300 s for
+          # teardown/upload, so a watchdog always fires (named) before GitHub's
+          # nameless job cancel. Floor 60 s: `timeout 0` would mean no limit.
+          job_left() {
+            local left=$(( JOB_TIMEOUT_MIN * 60 - ($(date +%s) - JOB_T0) - 300 ))
+            if [ "$left" -lt 60 ]; then left=60; fi
+            echo "$left"
+          }
+          # cap_to_job_left <secs>: min(secs, job_left)
+          cap_to_job_left() {
+            local want="$1" left
+            if [ "$JOB_T0_VALID" -ne 1 ]; then echo "$want"; return 0; fi
+            left=$(job_left)
+            if [ "$left" -lt "$want" ]; then echo "$left"; else echo "$want"; fi
+          }
           run_tests() {
             local label="$1"; shift
             local rc=0
+            local WATCHDOG_SECS="$(cap_to_job_left "$WATCHDOG_SECS")"
             # #3461 — margin telemetry. The 1500s kill on e06961ca was a
             # surprise only because no green run had ever printed how close it
             # came: the step reported the budget and nothing else, so a suite
@@ -1380,6 +1521,11 @@ jobs:
               cargo test --no-fail-fast "$@" || rc=$?
             fi
             elapsed=$(( $(date +%s) - started ))
+            # #6202 — make the margin visible in EVERY green run so the budget
+            # is re-tuned from data, not from the next surprise kill.
+            if [ "$rc" -eq 0 ]; then
+              echo "::notice::[#6202] '${label}' passed: suite wall ${elapsed}s of the ${WATCHDOG_SECS}s watchdog budget ($((elapsed * 100 / WATCHDOG_SECS))% used, $(( (WATCHDOG_SECS - elapsed) / 60 )) min margin; tier=${TIER:-sqlite} node=${CI_NODE:-unknown})"
+            fi
             echo "::notice::[#1492] '${label}' ran ${elapsed}s of the ${WATCHDOG_SECS}s per-invocation watchdog budget ($((elapsed * 100 / WATCHDOG_SECS))% used, $((WATCHDOG_SECS - elapsed))s margin; tier=${TIER:-sqlite} node=${CI_NODE:-unknown} watchdog=${TIMEOUT_BIN:-disabled})"
             if [ "$rc" -ne 0 ]; then
               if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
@@ -1387,6 +1533,231 @@ jobs:
               fi
               return "$rc"
             fi
+          }
+
+          # #6344 — SHARDED enterprise-fed suite. The serial 1,005-executable
+          # run (~13,900-14,100 s contended, extrapolated from run 37944916554)
+          # outgrew every watchdog raise, so on tier enterprise-fed the same
+          # test set runs as three concurrent shards, each a `run_tests` chain
+          # (so the #1492 watchdog, #2500 --no-fail-fast and #2657 prebuild
+          # shapes are unchanged):
+          #   serial      class (a): Postgres / #[serial] / federat* / unknown
+          #               source binaries + the lib Postgres test-name prefixes
+          #               + doc tests, --test-threads=1. The ONLY shard that
+          #               touches the per-job Postgres database.
+          #   parallel_1  lib unittests with --skip of those prefixes, plus a
+          #               balanced share of the self-contained binaries, -t 3.
+          #   parallel_2  the other share of the self-contained binaries, -t 3.
+          # scripts/ci/partition_test_binaries.py computes the partition from
+          # the compiled artifact list (so a new tests/*.rs can never be
+          # missed, unknown source -> serial) and asserts the three sets are
+          # disjoint and complete. Union build once, outside every watchdog
+          # (#1989); each shard bounds its whole chain by $WATCHDOG_SECS
+          # (7800 s on this tier; derivation at the WATCHDOG_SECS assignment).
+          # Every shard has its own log and PID; each PID is waited on
+          # separately and the step fails if ANY shard failed.
+          # SHARD_BUDGET is set per shard by run_shard (#6795): WATCHDOG_SECS for
+          # the parallel shards, SERIAL_BUDGET_SECS for the serial one.
+          shard_left() {
+            echo $(( SHARD_BUDGET - ($(date +%s) - $1) ))
+          }
+          run_doc_tests() {
+            local label="$1"; shift
+            local rc=0 started elapsed
+            local WATCHDOG_SECS="$(cap_to_job_left "$WATCHDOG_SECS")"
+            # `cargo test --doc --no-run` is rejected by cargo, so the prebuild
+            # is the plain `--no-run` of the same feature set (lib + doc deps).
+            cargo test --no-run "$@" || return "$?"
+            started=$(date +%s)
+            if [ -n "$TIMEOUT_BIN" ]; then
+              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" cargo test --doc --no-fail-fast "$@" || rc=$?
+            else
+              cargo test --doc --no-fail-fast "$@" || rc=$?
+            fi
+            elapsed=$(( $(date +%s) - started ))
+            echo "::notice::[#1492] '${label}' ran ${elapsed}s of the ${WATCHDOG_SECS}s per-invocation watchdog budget (tier=${TIER:-sqlite} node=${CI_NODE:-unknown})"
+            if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+              echo "::error::[#1492 watchdog] '${label}' exceeded the ${WATCHDOG_SECS}s per-invocation timeout (tier=${TIER:-sqlite}) and was terminated."
+            fi
+            return "$rc"
+          }
+          # #6383 / #6386 — class (a) binaries when the opt-in lane is on:
+          # each binary runs `cargo test --no-fail-fast --test <bin>` against its
+          # OWN database cloned from the template, 8 at a time, in-binary
+          # --test-threads=1 unchanged (raising it is a T3/T6 vote item). The
+          # residual-serial names run last on the shared database. Same
+          # #1492 watchdog, #2500 --no-fail-fast and #2657 prebuild shapes as
+          # run_tests; the wrapper exits with the worst per-binary code.
+          # run_isolated_lane <label> <shard-dir> [cargo feature args...]
+          run_isolated_lane() {
+            local label="$1" sd="$2"; shift 2
+            local rc=0 started elapsed l tflag tname
+            local -a sel
+            # Review r1 H1: prebuild ONLY the impacted isolated targets (one
+            # `--test NAME` / `--bin NAME` per line, split into two quoted words
+            # as in run_shard, SC2206).
+            sel=()
+            while IFS= read -r l; do
+              [ -n "$l" ] || continue
+              read -r tflag tname <<< "$l"
+              sel+=("$tflag" "$tname")
+            done < "$sd/iso_targets.txt"
+            if [ "${#sel[@]}" -eq 0 ]; then
+              echo "::error::[#6383] '${label}': the isolated target list is empty"
+              return 2
+            fi
+            cargo test --no-run "$@" "${sel[@]}" || return "$?"
+            started=$(date +%s)
+            if [ -n "$TIMEOUT_BIN" ]; then
+              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" python3 scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --no-fail-fast "$@" || rc=$?
+            else
+              python3 scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --no-fail-fast "$@" || rc=$?
+            fi
+            elapsed=$(( $(date +%s) - started ))
+            echo "::notice::[#6383] '${label}' ran ${elapsed}s of the ${WATCHDOG_SECS}s per-invocation watchdog budget (tier=${TIER:-sqlite} node=${CI_NODE:-unknown})"
+            if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+              echo "::error::[#1492 watchdog] '${label}' exceeded the ${WATCHDOG_SECS}s per-invocation timeout (tier=${TIER:-sqlite}) and was terminated."
+            fi
+            return "$rc"
+          }
+          # run_shard <name> <shard-dir> <threads> <lib-mode: pg|skip> <with-doc: 0|1>
+          run_shard() {
+            local name="$1" sd="$2" threads="$3" libmode="$4" with_doc="$5"
+            local list="$sd/$1.txt" t0 remaining rc=0 l tflag tname has_lib=0 n_it=0 n_lib=0 n_iso=0
+            local -a itargs libargs
+            itargs=(); libargs=()
+            t0=$(date +%s)
+            # #6795: the serial shard cannot be split further, so it gets the
+            # whole remaining job budget; the parallel shards keep 7800 s.
+            if [ "$name" = serial ]; then
+              SHARD_BUDGET="$(cap_to_job_left "$SERIAL_BUDGET_SECS")"
+            else
+              SHARD_BUDGET="$(cap_to_job_left "$WATCHDOG_SECS")"
+            fi
+            while IFS= read -r l; do
+              [ -n "$l" ] || continue
+              if [ "$l" = "--lib" ]; then
+                has_lib=1
+              else
+                # One "<--flag> <name>" selector per line; split into two
+                # quoted words (no unquoted word-split, SC2206).
+                read -r tflag tname <<< "$l"
+                itargs+=("$tflag" "$tname"); n_it=$((n_it + 1))
+              fi
+            done < "$list"
+            if [ "$name" = "serial" ] && [ "$PG_ISO_LANE" = "1" ]; then
+              # #6383: the --test/--bin binaries move to the isolated lane; only
+              # the other selectors (--example, --bench) keep the single run.
+              itargs=(); n_it=0
+              while IFS= read -r l; do
+                [ -n "$l" ] || continue
+                read -r tflag tname <<< "$l"
+                itargs+=("$tflag" "$tname"); n_it=$((n_it + 1))
+              done < "$sd/iso_other.txt"
+              n_iso=$(grep -c . "$sd/iso_targets.txt" || true)
+            fi
+            if [ "$has_lib" -eq 1 ]; then
+              # Same prefixes on both sides: positional filter in the serial
+              # shard, --skip in the parallel one. libtest substring matching
+              # makes the two exact complements.
+              while IFS= read -r l; do
+                [ -n "$l" ] || continue
+                n_lib=$((n_lib + 1))
+                if [ "$libmode" = "skip" ]; then libargs+=(--skip "$l"); else libargs+=("$l"); fi
+              done < "$sd/lib_pg_filters.txt"
+              if [ "$n_lib" -eq 0 ]; then
+                echo "::error::[#6344 shard] ${name}: lib Postgres filter list is empty (refusing to run the lib unfiltered)"
+                return 2
+              fi
+              remaining=$(shard_left "$t0")
+              if [ "$remaining" -lt 60 ]; then
+                echo "::error::[#6344 shard] ${name}: ${SHARD_BUDGET}s shard budget exhausted before the lib run"
+                return 124
+              fi
+              WATCHDOG_SECS="$remaining" run_tests "[${name}] lib unittests" $FEAT --lib -- --test-threads="$threads" ${libargs[@]+"${libargs[@]}"} || rc=$?
+            fi
+            if [ "$n_it" -gt 0 ]; then
+              remaining=$(shard_left "$t0")
+              if [ "$remaining" -lt 60 ]; then
+                echo "::error::[#6344 shard] ${name}: ${SHARD_BUDGET}s shard budget exhausted before the binaries run"
+                return 124
+              fi
+              WATCHDOG_SECS="$remaining" run_tests "[${name}] test binaries" $FEAT "${itargs[@]}" -- --test-threads="$threads" || rc=$?
+            fi
+            if [ "$n_iso" -gt 0 ]; then
+              remaining=$(shard_left "$t0")
+              if [ "$remaining" -lt 60 ]; then
+                echo "::error::[#6383 shard] ${name}: ${WATCHDOG_SECS}s shard budget exhausted before the isolated binaries"
+                return 124
+              fi
+              WATCHDOG_SECS="$remaining" run_isolated_lane "[${name}] isolated test binaries" "$sd" $FEAT || rc=$?
+            fi
+            if [ "$with_doc" = "1" ]; then
+              remaining=$(shard_left "$t0")
+              if [ "$remaining" -lt 60 ]; then
+                echo "::error::[#6344 shard] ${name}: ${SHARD_BUDGET}s shard budget exhausted before the doc tests"
+                return 124
+              fi
+              WATCHDOG_SECS="$remaining" run_doc_tests "[${name}] doc tests" $FEAT -- --test-threads="$threads" || rc=$?
+            fi
+            return "$rc"
+          }
+          # run_sharded <label> <with-doc: 0|1> [cargo selection args...]
+          run_sharded() {
+            local label="$1" with_doc="$2"; shift 2
+            local sd="${RUNNER_TEMP:-$PWD/.local-runs}/ci-shard"
+            local job_now job_elapsed pid_s pid_1 pid_2 hb rc_s=0 rc_1=0 rc_2=0 rc=0 n
+            rm -rf "$sd"; mkdir -p "$sd"
+            echo "::notice::[#6344] '${label}': compile once, partition, then run serial + 2 parallel shards"
+            cargo test --no-run --message-format=json-render-diagnostics $FEAT "$@" > "$sd/build.jsonl" || return "$?"
+            python3 scripts/ci/partition_test_binaries.py --build-json "$sd/build.jsonl" --repo-root . --out-dir "$sd" --with-doc "$with_doc" || return "$?"
+            if [ "$PG_ISO_LANE" = "1" ]; then
+              python3 scripts/ci/pg_isolate_split.py --build-json "$sd/build.jsonl" --serial-file "$sd/serial.txt" --out-dir "$sd" || return "$?"
+            fi
+            # #6795: the serial shard cannot be split further, so it gets the
+            # whole job time left (job cap - time since the job started, which
+            # includes the load-gate wait, setup, compile and partition - 300 s
+            # safety). Parallel shards keep the flat WATCHDOG_SECS (7800 s),
+            # capped by the same job time left.
+            job_elapsed=0
+            SERIAL_BUDGET_SECS="$WATCHDOG_SECS"
+            if [ "$JOB_T0_VALID" -eq 1 ]; then
+              job_now=$(date +%s)
+              job_elapsed=$(( job_now - JOB_T0 ))
+              SERIAL_BUDGET_SECS=$(( JOB_TIMEOUT_MIN * 60 - (job_now - JOB_T0) - 300 ))
+              if [ "$SERIAL_BUDGET_SECS" -lt 60 ]; then SERIAL_BUDGET_SECS=60; fi
+            fi
+            echo "::notice::[#6795] serial shard budget ${SERIAL_BUDGET_SECS}s (job cap ${JOB_TIMEOUT_MIN} min - ${job_elapsed}s elapsed since job start - 300s safety); parallel shards min(${WATCHDOG_SECS}s, job time left)"
+            ( run_shard serial "$sd" 1 pg "$with_doc" ) > "$sd/serial.log" 2>&1 &
+            pid_s=$!
+            ( run_shard parallel_1 "$sd" 3 skip 0 ) > "$sd/parallel_1.log" 2>&1 &
+            pid_1=$!
+            ( run_shard parallel_2 "$sd" 3 skip 0 ) > "$sd/parallel_2.log" 2>&1 &
+            pid_2=$!
+            ( while true; do
+                sleep 300 >/dev/null 2>&1
+                echo "::notice::[#6344] progress | serial: $(tail -n 1 "$sd/serial.log" 2>/dev/null | cut -c1-90) | parallel_1: $(tail -n 1 "$sd/parallel_1.log" 2>/dev/null | cut -c1-90) | parallel_2: $(tail -n 1 "$sd/parallel_2.log" 2>/dev/null | cut -c1-90)"
+              done ) &
+            hb=$!
+            # Wait on each PID separately: a bare `wait` discards the exit codes.
+            wait "$pid_s" || rc_s=$?
+            wait "$pid_1" || rc_1=$?
+            wait "$pid_2" || rc_2=$?
+            kill "$hb" 2>/dev/null || true
+            wait "$hb" 2>/dev/null || true
+            for n in serial parallel_1 parallel_2; do
+              echo "::group::[#6344] ${n} shard output"
+              cat "$sd/$n.log"
+              echo "::endgroup::"
+            done
+            echo "::notice::[#6344] shard exit codes: serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2}"
+            for n in "$rc_s" "$rc_1" "$rc_2"; do
+              if [ "$n" -ne 0 ]; then rc="$n"; fi
+            done
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::[#6344] sharded '${label}' FAILED (serial=${rc_s} parallel_1=${rc_1} parallel_2=${rc_2}); see the shard output groups above"
+            fi
+            return "$rc"
           }
 
           case "${TEST_IMPACT:-__ALL__}" in
@@ -1398,18 +1769,31 @@ jobs:
               # $FEAT/$TAIL are UNQUOTED on purpose: on enterprise-fed they
               # word-split into `--features sal-postgres` before and
               # `-- --test-threads=1` after "$@"; on sqlite both are empty.
-              run_tests "full suite (cargo test)" $FEAT $TAIL
+              if [ "${TIER:-sqlite}" = "enterprise-fed" ]; then
+                run_sharded "full suite (sharded cargo test)" 1
+              else
+                run_tests "full suite (cargo test)" $FEAT $TAIL
+              fi
               ;;
             *)
               # Always run --lib first (catches every inline unit test)
               echo "::notice::running cargo test --lib + impact-selected integration binaries (tier=${TIER:-sqlite})"
-              run_tests "cargo test --lib" $FEAT --lib $TAIL
-              # Dispatch each impacted tests/*.rs binary
-              ARGS=()
-              for t in $TEST_IMPACT; do
-                ARGS+=(--test "$t")
-              done
-              run_tests "impact-selected integration binaries (${TEST_IMPACT})" $FEAT "${ARGS[@]}" $TAIL
+              if [ "${TIER:-sqlite}" = "enterprise-fed" ]; then
+                # #6344: same lib + impacted-binaries set, sharded.
+                ARGS=(--lib)
+                for t in $TEST_IMPACT; do
+                  ARGS+=(--test "$t")
+                done
+                run_sharded "impact-selected (sharded: ${TEST_IMPACT})" 0 "${ARGS[@]}"
+              else
+                run_tests "cargo test --lib" $FEAT --lib $TAIL
+                # Dispatch each impacted tests/*.rs binary
+                ARGS=()
+                for t in $TEST_IMPACT; do
+                  ARGS+=(--test "$t")
+                done
+                run_tests "impact-selected integration binaries (${TEST_IMPACT})" $FEAT "${ARGS[@]}" $TAIL
+              fi
               ;;
           esac
           }
@@ -1435,6 +1819,35 @@ jobs:
         with:
           name: test-results-${{ matrix.node }}-${{ matrix.tier }}
           path: ${{ env.TEST_RESULT_LOG }}
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # #6344 r1 B5: each shard writes its own log under $RUNNER_TEMP/ci-shard
+      # and prints it only after every shard exits, so a cancel or the job cap
+      # would otherwise leave no per-shard output (the 5-min heartbeat keeps
+      # only 90 chars). always(): uploaded on success, failure, cancel and
+      # timeout. build.jsonl (the compile JSON, large) is not uploaded.
+      - name: Upload shard logs (#6344)
+        if: always() && needs.classify.outputs.docs_only != 'true' && matrix.tier == 'enterprise-fed'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: shard-logs-${{ matrix.node }}-${{ matrix.tier }}
+          path: |
+            ${{ runner.temp }}/ci-shard/*.log
+            ${{ runner.temp }}/ci-shard/*.txt
+            ${{ runner.temp }}/ci-shard/manifest.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      # #6383 / #6386 review r1 M3 — one log file per isolated binary, written
+      # by scripts/test/pg_isolated_binary.py under the shard directory. Only
+      # present when the opt-in lane ran; uploaded on success AND failure.
+      - name: Upload isolated-lane per-binary logs (#6383)
+        if: needs.classify.outputs.docs_only != 'true' && always() && matrix.tier == 'enterprise-fed'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pg-iso-logs-${{ matrix.node }}-${{ matrix.tier }}
+          path: ${{ runner.temp }}/ci-shard/iso-logs
           if-no-files-found: ignore
           retention-days: 30
 
@@ -1517,6 +1930,15 @@ jobs:
           # Connect to the base ai_memory_test to drop the ephemeral db. FORCE
           # terminates any lingering backend so the drop cannot wedge on a
           # still-connected test process.
+          # #6383: when the opt-in lane exported a run id, drop THIS run's
+          # leftover clones and the locked template first (no FORCE; another
+          # run's clones are never touched). Anything left behind is reclaimed
+          # by the admin-only `pg_isolated_binary.py sweep --older-than N`,
+          # which CI never runs. The URL travels in the environment, not argv.
+          if [ -n "${AI_MEMORY_TEST_PG_RUN_ID:-}" ]; then
+            AI_MEMORY_TEST_POSTGRES_URL="$base_url" python3 scripts/test/pg_isolated_binary.py teardown --db "$CI_FED_DB" --run-id "$AI_MEMORY_TEST_PG_RUN_ID" \
+              || echo "::warning::[#6383] isolation teardown failed on $RUNNER_NAME (admin sweep reclaims it)"
+          fi
           if psql "$base_url" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$CI_FED_DB\" WITH (FORCE);"; then
             echo "::notice::dropped ephemeral db $CI_FED_DB on $RUNNER_NAME"
           else

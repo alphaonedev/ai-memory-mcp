@@ -98,7 +98,7 @@ concurrency:
   # rule-(d) CANCELLED-DUPLICATE class scripts/check-required-contexts.sh
   # guards against. Fork-PR-safe: isolates fork PRs by number.
   group: cert-pg-age-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
