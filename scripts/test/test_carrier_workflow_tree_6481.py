@@ -77,6 +77,13 @@ class TreeShape(unittest.TestCase):
         self.assertEqual(b.block, (11, 11))
         self.assertEqual(b.block_lines, [(11, "  x")])
 
+    def test_quote_in_plain_key_refused_6617(self):
+        for doc, n in (("a:\n  b'c: 1\n", 2), ('a:\n  x: 1\n  b"c: 1\n', 3)):
+            with self.assertRaises(Unparsed) as ctx:
+                SUBSET.parse_workflow(doc)
+            self.assertIn("line %d: quote character inside a plain mapping key" % n, str(ctx.exception))
+        self.assertIsNotNone(SUBSET.parse_workflow("\"on\": push\n"))  # top level quoted on stays readable
+
     def test_depth_cap_named_refusal_6612(self):
         self.assertIsNotNone(SUBSET.parse_workflow("".join(" " * i + "k%d:\n" % i for i in range(64))))
         with self.assertRaises(Unparsed) as ctx:

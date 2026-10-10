@@ -1719,6 +1719,35 @@ def self_test():
         check(label, lambda t=text, n=needle: None if any(n in p for p in workflow_pin_problems(t))
               else f"workflow_pin_problems does not report {n!r}")
 
+    # round8 mutant campaign: each closed-shape rule and each kind of parsed string has a cell whose
+    # needle only that rule produces (#6610 #6617).
+    for label, text, needle in (
+            ("round8 #6610: a non-carrier job spells Permissions with a capital", r8_decoy(
+                "  other:\n    Permissions:\n      contents: read\n    runs-on: ubuntu-latest\n"
+                "    steps:\n      - run: echo\n\n"), "Permissions is not spelled permissions"),
+            ("round8 #6617: a secret in a flow entry under on:", swap(
+                wf_text, "\non:\n", "\non:\n  schedule: [{cron: \"${{ secrets.CRON }}\"}]\n"),
+             "workflow references a repository secret (line"),
+            ("round8 #6617: a secret in a workflow env key name", swap(
+                wf_text, top_perm, "\nenv:\n  ${{ secrets.PAT }}: x\n" + top_perm),
+             "workflow references a repository secret (line"),
+            ("round8 #6617: a quote inside a plain key is refused by name", r8_after_vstep(
+                "      - name: q\n        env:\n          a'b: x\n        run: printenv\n"),
+             "quote character inside a plain mapping key"),
+            ("round8 #6610: verifier step uses an action by tag", r8_in_live(
+                "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4\n",
+                "      - uses: actions/checkout@v4\n"), "step uses an action not pinned to a full commit sha"),
+            ("round8 #6610: verifier runs-on is an expression", r8_in_live(
+                "    runs-on: ubuntu-latest\n", "    runs-on: ${{ github.event.pull_request.title }}\n"),
+             "runs-on is not one plain runner label"),
+            ("round8 #6610: verifier has no timeout-minutes", r8_in_live("    timeout-minutes: 5\n", ""),
+             "timeout-minutes is not a plain whole number of minutes"),
+            ("round8 #6610: verifier timeout-minutes is an expression", r8_in_live(
+                "    timeout-minutes: 5\n", "    timeout-minutes: ${{ 5 }}\n"),
+             "timeout-minutes is not a plain whole number of minutes")):
+        check(label, lambda t=text, n=needle: None if any(n in p for p in workflow_pin_problems(t))
+              else f"workflow_pin_problems does not report {n!r}")
+
     # round8 #6612: nesting past SUBSET.MAX_DEPTH is a named refusal with a line, never a RecursionError.
     for label, text, needle in (
             ("round8 #6612: 1500-level block nesting is a named refusal",
