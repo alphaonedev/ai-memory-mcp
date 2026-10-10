@@ -746,6 +746,83 @@ class SharedBaseRefusal7031(unittest.TestCase):
         self.assertNotIn('DROP DATABASE IF EXISTS "ai_memory_test"', rec.sql())
 
 
+class MintOwnership7114(unittest.TestCase):
+    """A minted database stays owned until initialization returns successfully."""
+
+    NAME = 'ci_base_7114_1700000000_0123abcd'
+
+    def mint_with(self, answer):
+        return Patched(Recorder(answer))
+
+    def assert_owned_cleanup(self, recorder):
+        self.assertEqual(
+            [sql for sql in recorder.sql() if sql.startswith('DROP DATABASE')],
+            ['DROP DATABASE IF EXISTS "%s"' % self.NAME],
+            'failure after CREATE must reclaim exactly the acquired database',
+        )
+        self.assertFalse(any('FORCE' in sql.upper() for sql in recorder.sql()))
+
+    def test_extension_failures_reclaim_only_acquired_database(self):
+        for kind in (pib.WrapperError, OSError, ValueError, KeyboardInterrupt):
+            with self.subTest(exception=kind.__name__):
+                failure = kind('injected extension failure')
+
+                def answer(argv, kw):
+                    sql = argv[argv.index('-c') + 1]
+                    if sql.startswith('CREATE EXTENSION'):
+                        raise failure
+                    return default_answer(argv, kw)
+
+                with self.mint_with(answer) as rec, \
+                        mock.patch.object(pib, 'mint_base_name', return_value=self.NAME):
+                    with self.assertRaises(kind) as caught:
+                        pib.mint_base(BASE)
+                self.assertIs(caught.exception, failure)
+                self.assert_owned_cleanup(rec)
+
+    def test_create_failure_does_not_claim_or_drop_database(self):
+        failure = pib.WrapperError('injected CREATE refusal')
+
+        def answer(argv, kw):
+            if argv[argv.index('-c') + 1].startswith('CREATE DATABASE'):
+                raise failure
+            return default_answer(argv, kw)
+
+        with self.mint_with(answer) as rec, \
+                mock.patch.object(pib, 'mint_base_name', return_value=self.NAME):
+            with self.assertRaises(pib.WrapperError) as caught:
+                pib.mint_base(BASE)
+        self.assertIs(caught.exception, failure)
+        self.assertFalse(any(sql.startswith('DROP DATABASE') for sql in rec.sql()))
+
+    def test_success_transfers_owned_database_without_dropping_it(self):
+        with self.mint_with(default_answer) as rec, \
+                mock.patch.object(pib, 'mint_base_name', return_value=self.NAME):
+            url = pib.mint_base(BASE)
+        self.assertEqual(pib.database_name(url), self.NAME)
+        self.assertEqual(sum(sql.startswith('CREATE EXTENSION') for sql in rec.sql()), 1)
+        self.assertFalse(any(sql.startswith('DROP DATABASE') for sql in rec.sql()))
+
+    def test_cleanup_failure_does_not_replace_initialization_exception(self):
+        primary = ValueError('injected initialization failure')
+        cleanup = RuntimeError('injected cleanup failure')
+
+        def answer(argv, kw):
+            sql = argv[argv.index('-c') + 1]
+            if sql.startswith('CREATE EXTENSION'):
+                raise primary
+            if sql.startswith('DROP DATABASE'):
+                raise cleanup
+            return default_answer(argv, kw)
+
+        with self.mint_with(answer) as rec, \
+                mock.patch.object(pib, 'mint_base_name', return_value=self.NAME):
+            with self.assertRaises(ValueError) as caught:
+                pib.mint_base(BASE)
+        self.assertIs(caught.exception, primary)
+        self.assert_owned_cleanup(rec)
+
+
 class LeakAndLineage7031(unittest.TestCase):
     """#7031 H1 review F2 (no leaked base) and H2 (lineage watermark precheck)."""
 
