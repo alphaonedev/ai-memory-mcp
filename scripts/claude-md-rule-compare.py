@@ -97,6 +97,8 @@ GUARD_PATHS = ("scripts/check-claude-md-size.py", "scripts/claude-md-rule-compar
                ".github/workflows/claude-md-guard.yml", ".github/workflows/claude-md-rule-compare.yml",
                ".github/CODEOWNERS")
 DIFF_LINE_CAP = 200
+# Round 5 (#6613): a line longer than this is hidden whole before any pattern runs.
+MAX_MASK_LINE = 2000
 # #6163: the pull request number that names the head refspec; a decimal with no leading zero, ASCII only, at most ten
 # digits, so nothing but `refs/pull/<N>/head` can reach the fetch.
 PR_NUMBER = re.compile(r"[1-9][0-9]{0,9}", re.ASCII)
@@ -2442,6 +2444,38 @@ def _self_test_cases() -> int:
           hidden=("6163CanaryF5", "end"))
     masks("#6666 R5 F a triple-quoted value closed on its own line leaves the next line visible",
           'secret = """6163CanaryF6"""\nafter: shown-6163', hidden=("6163CanaryF6",), shown=("after: shown-6163",))
+
+    # #6163 round 5 (#6613): masking is bounded. A line longer than MAX_MASK_LINE is hidden whole (fails safe); the
+    # code-span scan is linear. Each shape finishes within a wall-clock bound and the report still carries RESULT.
+    def timed(label, text, bound=2.0):
+        started = os.times()[4]
+        redactor = Redactor()
+        got = redactor.mask(text)
+        diff = unified("", text, "## Sec", redactor)
+        elapsed = os.times()[4] - started
+        unit(label, elapsed < bound and "[MASKED]" in got and "[MASKED]" in diff,
+             f"{elapsed:.2f}s for {len(text)} characters")
+
+    timed("#6613 R5 a run of 6000 backticks is bounded and masked", "`" * 6000)
+    timed("#6613 R5 a long word of repeated credential words is bounded and masked", "x" + "token" * 2400)
+    timed("#6613 R5 a credential name, a colon and a long run of spaces is bounded and masked",
+          "token:" + " " * 32000 + "x")
+    redactor_cap = Redactor()
+    cap_out = redactor_cap.mask("keep-6163\n" + "y" * MAX_MASK_LINE + "\n" + "y" * (MAX_MASK_LINE + 1) + "\nafter-6163")
+    cap_parts = cap_out.split("\n")
+    unit("#6613 R5 a line of MAX_MASK_LINE characters is shown, one more is hidden",
+         cap_parts[1] == "y" * MAX_MASK_LINE and cap_parts[2] == MASK and cap_parts[0] == "keep-6163"
+         and cap_parts[3] == "after-6163" and redactor_cap.count == 1, f"count={redactor_cap.count}")
+    cap_diff = Redactor()
+    cap_report = unified("a\nb", "a\n" + "z" * (MAX_MASK_LINE + 1), "## Sec", cap_diff)
+    unit("#6613 R5 a long diff row is hidden with its prefix", "+[MASKED]" in cap_report and "zzzz" not in cap_report
+         and cap_diff.count == 1, cap_report)
+    codespan_row = "| a `x|y` b | `p" + "`" * 40
+    unit("#6613 R5 the code-span scan keeps a pipe inside a span out of the cells",
+         mask_table_cells("note `password|secret|token` here | rest") == ("note `password|secret|token` here | rest", 0),
+         repr(mask_table_cells("note `password|secret|token` here | rest")))
+    unit("#6613 R5 the code-span scan does not raise on an unclosed span", isinstance(mask_table_cells(codespan_row),
+                                                                                          tuple), codespan_row)
 
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
