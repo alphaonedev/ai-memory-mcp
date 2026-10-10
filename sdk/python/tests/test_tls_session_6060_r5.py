@@ -630,6 +630,11 @@ def test_relaxing_flag_set_after_construction_is_refused_per_request_6375(
 _DAY = datetime.timedelta(days=1)
 
 
+def _no_time_check(context: ssl.SSLContext) -> None:
+    """Turn validity-date checking off AFTER the SDK's per-request check ran."""
+    _with_flags(context, _RELAXING_FLAGS["NO_CHECK_TIME"])
+
+
 @pytest.mark.parametrize("client_cls", _CLIENTS)
 @pytest.mark.parametrize("window", ["expired", "not-yet-valid"])
 def test_out_of_date_leaf_is_refused_after_the_handshake_6375(
@@ -651,7 +656,7 @@ def test_out_of_date_leaf_is_refused_after_the_handshake_6375(
                 client_cls,
                 server.url,
                 lab.client_context(),
-                hook=lambda context: _with_flags(context, _RELAXING_FLAGS["NO_CHECK_TIME"]),
+                hook=_no_time_check,
             )
         assert server.hits == []
     finally:

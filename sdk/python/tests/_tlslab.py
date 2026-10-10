@@ -214,7 +214,9 @@ def _pipe(left: socket.socket, right: socket.socket) -> None:
         sock.setblocking(False)
     try:
         while True:
-            ready = [s for s in sockets if isinstance(s, ssl.SSLSocket) and s.pending()]
+            ready: list[socket.socket] = [
+                s for s in sockets if isinstance(s, ssl.SSLSocket) and s.pending()
+            ]
             if not ready:
                 ready, _, _ = select.select(sockets, [], [], _IO_TIMEOUT)
                 if not ready:
