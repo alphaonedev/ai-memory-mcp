@@ -1320,9 +1320,9 @@ jobs:
     # it mechanically.
     #
     # RULE. If the PR author is not OWNER / MEMBER / COLLABORATOR, or the head
-    # is a fork, this job HARD-FAILS unless an APPROVED review by the
-    # accountable operator account (`alphaonedev`) exists for the PR's CURRENT
-    # head SHA. That review is a native GitHub review the biological operator
+    # is a fork, this job HARD-FAILS unless the accountable operator account's
+    # (`alphaonedev`) latest review of the PR's CURRENT head SHA is APPROVED
+    # (#6329: a later CHANGES_REQUESTED or a dismissal revokes it). That review is a native GitHub review the biological operator
     # submits by hand ("Approve" on the PR); it is NOT a label, NOT a comment,
     # and NOT something an AI agent acting under the operator's token may
     # submit (docs/AI_DEVELOPER_GOVERNANCE.md §3.1 — Restricted). A new push
