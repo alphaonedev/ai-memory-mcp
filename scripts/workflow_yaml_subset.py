@@ -104,7 +104,10 @@ def clip(text: str) -> str:
 # #6783 #6881: a refusal row keeps its indentation, an optional ``- `` and one key word directly before its first
 # ``: ``, ``:<tab>``, ``:<end>`` or ``=``, and withholds the rest with its length.  Text before the first
 # separator that is not one key word, or the whole of a row with no separator, is value text and is withheld.
-_ROW_KEY = re.compile(r"[ \t]*(?:-[ \t]+)?['\"]?[\w.-]+['\"]?(?:: |:\t|:\Z|=)")
+# #6945 #6949: ``=`` keeps only an unquoted flag or variable word (no ``- ``, no opening quote) with value text
+# after it, so ``=`` padding of base64 text, a bare ``word=`` row and a quote-opened item are value text.
+_ROW_KEY = re.compile(r"[ \t]*(?:(?:-[ \t]+)?['\"]?[\w.-]+['\"]?(?:: |:\t|:\Z)"
+                      r"|(?:--?)?[A-Za-z][\w.-]*=(?!=*[ \t]*\Z))")
 _INDENT = re.compile(r"[ \t]*")
 
 

@@ -374,10 +374,12 @@ verifier fails otherwise), and the live carrier ruleset updated with the
   `<withheld N chars>` and never reprints value text; a credential-named key
   owns every value nested below it (#6780, #6781, #6783). A refusal row keeps
   its indentation, an optional `- ` and one key word directly before its
-  first `: `, `:` plus a tab, `:` at the end of the row or `=`, and withholds
-  the rest with its length; any other text before the first separator, and a
-  whole row with no separator, is withheld the same way (#6783, #6880,
-  #6881). Other message
+  first `: `, `:` plus a tab or `:` at the end of the row, or one unquoted
+  flag or variable word (no `- `) before an `=` that has value text after
+  it, and withholds the rest with its length; any other text before the
+  first separator, `=` padding of base64 text, and a whole row with no
+  separator, are withheld the same way (#6783, #6880, #6881, #6945,
+  #6949). Other message
   text masks GitHub-token-shaped strings (also when glued after a letter,
   digit or `_`, #6736, or cut by the mask window, #6791) and withholds the
   whole value of a credential-named key (names containing token, secret,
