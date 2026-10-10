@@ -2737,6 +2737,28 @@ class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
             self.ci, self.JOB_ENV, self.JOB_ENV + "      CARGO_TARGET_DIR: /srv/target\n")))], False)
 
 
+    # ---- #6488: cargo config `include` loads a file the guard never reads ----
+
+    def test_6118_r7_6488_cargo_config_include_is_flagged(self) -> None:
+        cfg = ".cargo/config.toml"
+        want = "an included config is not read"
+        cases = [
+            ("include array", self._repo_mutated(cfg, 'include = ["extra.toml"]\n')),
+            ("include string", self._repo_mutated(cfg, 'include = "extra.toml"\n')),
+            ("include array of tables", self._repo_mutated(cfg, '[[include]]\npath = "extra.toml"\n')),
+            ("include inline tables", self._repo_mutated(cfg, 'include = [{ path = "extra.toml", optional = true }]\n')),
+            ("nested config include", self._repo_mutated("crates/sub/.cargo/config.toml", 'include = ["x.toml"]\n')),
+            ("step writes include", self._before_prune(
+                R7_PRE + "        run: printf 'include = [\"extra.toml\"]\\n' >> .cargo/config.toml\n")),
+        ]
+        for label, found in cases:
+            with self.subTest(label):
+                self.assertTrue(any(want in v and "R-DEBUG" in v for v in found), (label, found))
+
+    def test_6118_r7_6488_include_named_key_inside_a_table_stays_clean(self) -> None:
+        # only the top-level `include` key is cargo's config include; [env] include is an env var
+        self.assertEqual([], self._repo_mutated(".cargo/config.toml", '[env]\ninclude = "x"\n'))
+
 class PruneScript6118(unittest.TestCase):
     """scripts/ci/prune-runner-target.py against a fake cargo target tree."""
 
