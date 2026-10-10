@@ -132,7 +132,7 @@ macro, any `name! {..}`), an open block comment or string literal, a
 (return / break / continue, `let _ = return ..`, todo! / unimplemented! /
 unreachable! / panic! under any path, any `..exit(..)` / `..abort(..)` /
 `..panic_any(..)` / `..resume_unwind(..)` / `..unreachable_unchecked(..)` (#6843),
-assert!(false), a bare / unsafe / `if true` block that exits, a loop with no
+assert!(false) and assert!(!true), raw or with a message (#6944), a bare / unsafe / `if true` block that exits, a loop with no
 break; any of these in expression position too, such as `_ = return;`,
 `drop(return);` or a first call argument, unless a closure, `=>` or a
 short-circuit `&&` / `||` comes first in its group, #6842), and the same attributes on the `mod NAME;` declarations that reach the
@@ -553,6 +553,16 @@ def _value_like(tok):
     return v in (")", "]", "?")
 
 
+def _assert_false(rest):
+    """True when `rest` (the tokens after `assert`) is `! ( false` or
+    `! ( ! true`, closed by `)` or a message comma (a ( group keeps a literal
+    first argument across its comma reset for this): an assert that always
+    fails (#6944)."""
+    t = [v for _, v in rest]
+    return t[:3] == ["!", "(", "false"] and t[3:4] in ([")"], [","]) or \
+        t[:4] == ["!", "(", "!", "true"] and t[4:5] in ([")"], [","])
+
+
 def _diverges(vals):
     """The first return, break, continue, exit macro or exit call that a
     statement always evaluates, wherever it sits in the statement (#6842), else
@@ -576,7 +586,8 @@ def _diverges(vals):
             name = v[2:] if v.startswith("r#") else v
             if kind == "div" or (kind == "ident" and (
                     v in _DIV_WORDS or (name in _EXIT_MACROS and nxt == "!")
-                    or (name in _EXIT_CALLS and nxt == "("))):
+                    or (name in _EXIT_CALLS and nxt == "(")
+                    or (name == "assert" and _assert_false(vals[k + 1:k + 6])))):
                 return v
         prev = (kind, v)
     return ""
@@ -625,7 +636,7 @@ def _header_findings(norm, vals):
 
 class _Frame:
     __slots__ = ("kind", "norm", "attrs", "cum", "exit", "has_break", "is_loop", "stops_break",
-                 "mod", "scrut", "cur", "line", "pend", "pend_found", "rebound", "div")
+                 "mod", "scrut", "cur", "line", "pend", "pend_found", "rebound", "div", "first")
 
     def __init__(self, kind, toks, attrs, parent, line):
         vals = [v for _, v in toks]
@@ -634,6 +645,7 @@ class _Frame:
         self.attrs = list(attrs)
         self.exit = ""
         self.div = ""  # a diverging argument before a comma of this ( or [ group (#6842)
+        self.first = None  # the first argument of a ( group, kept across its comma (#6944)
         self.has_break = False
         self.is_loop = kind == "{" and bool(_LOOP_HEADER_RE.search(self.norm))
         self.stops_break = kind == "{" and bool(_BREAK_TARGET_RE.search(self.norm))
@@ -940,6 +952,8 @@ def _scan_rust(path, text, offsets):
                 inside = done.cur if len(done.cur) <= 64 else [("punct", "..")]
                 if div:
                     inside = [("div", div)] + inside
+                if done.first is not None and [v for _, v in done.first] in (["false"], ["!", "true"]):
+                    inside = done.first + [("punct", ",")] + inside  # `assert!(false, "msg")` (#6944)
                 parent.cur.append(("punct", done.kind))
                 parent.cur.extend(inside)
                 parent.cur.append(("punct", val))
@@ -959,6 +973,8 @@ def _scan_rust(path, text, offsets):
         if val == "," and kind == "punct":
             if top.kind in ("(", "[") and not top.div:
                 top.div = _diverges(top.cur)
+            if top.kind == "(" and top.first is None:
+                top.first = top.cur
             top.reset()
             i += 1
             continue
