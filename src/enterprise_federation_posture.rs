@@ -1031,15 +1031,11 @@ mod tests {
         // (`run_env_isolated_child_or_spawn`), kept alive for the test in a
         // module-static tempdir (first-install-wins, like the flag-on suite).
         POSTURE_AUDIT_DIR.get_or_init(|| {
-            let dir = tempfile::Builder::new()
-                .prefix("ef-posture-audit-")
-                .tempdir()
-                .expect("audit tempdir");
+            let dir =
+                crate::test_support::exit_cleanup::tempdir_removed_at_exit("ef-posture-audit-");
             let signing = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
             crate::governance::audit::init(dir.path(), Some(signing))
                 .expect("install daemon audit key");
-            // #6266 — a static `TempDir` never drops; remove it at process exit.
-            crate::test_support::exit_cleanup::remove_dir_at_exit(dir.path());
             dir
         });
         // AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT / _SIG / _NONCE /

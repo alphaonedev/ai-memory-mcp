@@ -34,6 +34,16 @@ extern "C" fn exit_trampoline() {
     run_exit_cleanup();
 }
 
+/// Create a tempdir whose path is also removed when the process exits (for `static` dirs).
+pub(crate) fn tempdir_removed_at_exit(prefix: &str) -> tempfile::TempDir {
+    let dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .tempdir()
+        .expect("static test tempdir");
+    remove_dir_at_exit(dir.path());
+    dir
+}
+
 /// Arrange for `dir` to be removed (recursively) when the process exits.
 pub(crate) fn remove_dir_at_exit(dir: &Path) {
     EXIT_DIRS

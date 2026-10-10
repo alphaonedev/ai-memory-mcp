@@ -20,7 +20,7 @@
 //! `<name>.pre-migration-*.bak` backups the schema migrator writes beside a
 //! database it upgrades.
 
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
 use tempfile::NamedTempFile;
@@ -94,6 +94,12 @@ impl Deref for SqliteTempFile {
     type Target = NamedTempFile;
     fn deref(&self) -> &NamedTempFile {
         &self.inner
+    }
+}
+
+impl DerefMut for SqliteTempFile {
+    fn deref_mut(&mut self) -> &mut NamedTempFile {
+        &mut self.inner
     }
 }
 
