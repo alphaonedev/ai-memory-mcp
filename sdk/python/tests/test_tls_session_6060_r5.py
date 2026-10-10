@@ -1843,3 +1843,57 @@ def test_empty_ssl_cert_file_is_unset_6658(
     _add_anchor(directory, lab.ca_path)
     _env_trust(monkeypatch, SSL_CERT_FILE="", SSL_CERT_DIR=str(directory))
     assert _get_once(client_cls, origin.url, verify) == 200
+
+
+# ---- #6693 / #6694 / #6659: what the gated transports own and leave behind -
+
+
+class _RecordingTransport(httpx.BaseTransport):
+    def __init__(self) -> None:
+        self.closed = False
+        self.seen: list[dict[str, Any]] = []
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        self.seen.append(dict(request.extensions))
+        return httpx.Response(200, request=request)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _AsyncRecordingTransport(httpx.AsyncBaseTransport):
+    def __init__(self) -> None:
+        self.closed = False
+        self.seen: list[dict[str, Any]] = []
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.seen.append(dict(request.extensions))
+        return httpx.Response(200, request=request)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def _gate_kwargs(context: ssl.SSLContext, *, is_async: bool) -> dict[str, Any]:
+    return build_httpx_kwargs(
+        base_url=_ORIGIN,
+        api_key=_API_KEY,
+        agent_id=None,
+        timeout=1.0,
+        verify=context,
+        cert=None,
+        extra_headers=None,
+        is_async=is_async,
+    )
+
+
+def test_refused_gate_closes_the_sync_transports_6693() -> None:
+    context = ssl.create_default_context()
+    kwargs = _gate_kwargs(context, is_async=False)
+    client = httpx.Client(**kwargs)
+    recording = _RecordingTransport()
+    client._transport = recording  # noqa: SLF001
+    client._mounts[httpx.URL("https://other.invalid")] = object()  # type: ignore[index]  # noqa: SLF001
+    with pytest.raises(ValueError, match="#6537"):
+        _common.gate_transports(client, kwargs, context)
+    assert recording.closed
