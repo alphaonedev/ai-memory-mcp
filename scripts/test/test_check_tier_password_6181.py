@@ -92,6 +92,19 @@ class TestCheckTierPassword6181(unittest.TestCase):
         r = self.run_check(f"postgres://ai:{GOOD}ai@h:5445/db")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
+    def test_the_contained_component_boundary_is_8_characters_6645(self):
+        # MIN_CONTAINED_COMPONENT = 8: an 8-character user inside a 32-character password is refused, a 7-character
+        # one passes (it can occur in a random password by chance)
+        for user, refused in (("tierUs8x", True), ("tierU7x", False)):
+            pw = "Kq3Vb9Wm" + user + "Hz2Ld6Rp" + "Tj5Nc1Gy"[: 16 - len(user)] + "Fs4Xa8Ye"
+            self.assertGreaterEqual(len(pw), 31)
+            with self.subTest(user_length=len(user)):
+                if refused:
+                    self.assert_refused(f"postgres://{user}:{pw}@h:5445/db", "contains the user", [user, pw])
+                else:
+                    r = self.run_check(f"postgres://{user}:{pw}@h:5445/db")
+                    self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
     def test_percent_encoded_components_are_compared_decoded(self):
         pw = "ai_memory_test_ci_"
         enc = "".join(f"%{ord(c):02X}" for c in pw)
