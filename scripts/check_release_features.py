@@ -756,8 +756,11 @@ REGISTRY = "ghcr.io"
 # `permissions: write-all`, or the release image name is refused. The text
 # match cannot see a name built from an expression; the permission bound is
 # the load-bearing control.
-PACKAGES_WRITE_RE = re.compile(r"(?<![\w-])packages\s*:\s*['\"]?write(?![\w-])", re.I)
-WRITE_ALL_RE = re.compile(r"(?<![\w-])permissions\s*:\s*['\"]?write-all(?![\w-])", re.I)
+# #6496: `\s` spans newlines and an optional block indicator is skipped, so a
+# grant whose value sits on the next line (plain continuation, `>-`, `|`) is
+# matched; the regexes run over the comment-stripped text of the whole file.
+PACKAGES_WRITE_RE = re.compile(r"(?<![\w-])packages\s*:\s*(?:[>|][+-]?\s*)?['\"]?write(?![\w-])", re.I)
+WRITE_ALL_RE = re.compile(r"(?<![\w-])permissions\s*:\s*(?:[>|][+-]?\s*)?['\"]?write-all(?![\w-])", re.I)
 RELEASE_IMAGE_RE = re.compile(r"ghcr\.io/(?:\$\{\{[^}]*\}\}|[^/\s'\"]+)/ai-memory(?![\w-])", re.I)
 CI_IMAGE_WF = "publish-ci-image.yml"
 CI_IMAGE_JOB = "publish-ci-image"
@@ -1947,11 +1950,16 @@ def check_workflow_sweep(root: Path, rep: Report) -> None:
         text = load(path, label, rep, False)
         if text is None:
             continue
+        code = text.split("\n")
+        kept = {n: line for n, line in code_lines(text)}
+        stripped = "\n".join(kept.get(n, "") for n in range(1, len(code) + 1))
+        for rx in (PACKAGES_WRITE_RE, WRITE_ALL_RE):
+            for m in rx.finditer(stripped):
+                n = stripped.count("\n", 0, m.start()) + 1
+                rep.bad(f"{label}: line {n}: a `packages: write` / `write-all` grant outside release.yml's docker job "
+                        f"and the {CI_IMAGE_WF} push job (#4935, #6496: the token could write the released GHCR "
+                        f"image): {' '.join(m.group(0).split())[:60]}")
         for n, line in code_lines(text):
-            if PACKAGES_WRITE_RE.search(line) or WRITE_ALL_RE.search(line):
-                rep.bad(f"{label}: line {n}: a `packages: write` / `write-all` grant outside release.yml's docker job and "
-                        f"the {CI_IMAGE_WF} push job (#4935: the token could write the released GHCR image): "
-                        f"{line.strip()[:60]}")
             if RELEASE_IMAGE_RE.search(line):
                 rep.bad(f"{label}: line {n}: names the release image `ghcr.io/<owner>/ai-memory`; only release.yml may "
                         f"(#4935): {line.strip()[:60]}")
