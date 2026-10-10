@@ -660,10 +660,37 @@ pub fn enforce_socket_mode(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener as StdUnixListener;
+    use std::path::PathBuf;
 
     /// Longest scratch base that still leaves room for `/<tmp>/run/<name>.sock`
     /// inside the 104-byte macOS `sun_path`.
     const SHORT_BASE_MAX: usize = 60;
+
+    /// The account home directory from the passwd database, NOT `$HOME`:
+    /// other tests in the same process repoint `$HOME` at their own scratch
+    /// directory, which would put the socket back under a long path.
+    fn passwd_home() -> PathBuf {
+        use std::ffi::CStr;
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf = vec![0_u8; 4096];
+        // SAFETY: an all-zero `passwd` is a valid out-parameter for getpwuid_r.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut out: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: every pointer refers to a live local and `buf` is `buf.len()` bytes.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                libc::geteuid(),
+                &raw mut pwd,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                &raw mut out,
+            )
+        };
+        assert!(rc == 0 && !out.is_null(), "no passwd entry for this uid");
+        // SAFETY: getpwuid_r succeeded, so `pw_dir` is a NUL-terminated string in `buf`.
+        let dir = unsafe { CStr::from_ptr(pwd.pw_dir) };
+        PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes()))
+    }
 
     /// A scratch directory for a socket test, rooted at `base` when that is
     /// short enough, else at a short directory under `$HOME` (a disk path,
@@ -672,8 +699,7 @@ mod tests {
         if base.as_os_str().len() <= SHORT_BASE_MAX {
             return tempfile::tempdir_in(base).expect("tmp");
         }
-        let home = std::env::var_os("HOME").expect("HOME is set for a socket test");
-        let short = Path::new(&home).join(".ai-memory-sock-t");
+        let short = passwd_home().join(".ai-memory-sock-t");
         fs::create_dir_all(&short).expect("mkdir short socket base");
         tempfile::Builder::new()
             .prefix("s")
