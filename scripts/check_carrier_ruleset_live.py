@@ -2024,6 +2024,22 @@ def self_test():
             else None if not any(r11_tail in p for p in workflow_pin_problems(r10_env(r)))
             else f"a problem echoes {r11_tail[:16]!r}..."))
 
+    # #6945 #6949: an ``=`` keeps a key word only after an unquoted flag word with value text after it, so a
+    # padded base64 row, a bare ``word=`` row and a quote-opened sequence item reprint no value text.
+    r13_padded = "QUJD" * 9
+    for label, text, leak in (
+            ("#6945: a padded base64 row under env", r10_env(r13_padded + "="), r13_padded[:8]),
+            ("#6945: a double-padded base64 row under env", r10_env(r13_padded + "=="), r13_padded[:8]),
+            ("#6949: a bare word= row under env", r10_env(r11_tail + "="), r11_tail),
+            ("#6949: a step item that opens an unclosed quote before =",
+             r8_after_vstep('      - "' + r11_tail + "=x\n"), r11_tail),
+            ("#6949: a step item that opens an unclosed quote on padded base64",
+             r8_after_vstep("      - '" + r13_padded + "==\n"), r13_padded[:8])):
+        check(label, lambda t=text, s=leak: (
+            "workflow_pin_problems is empty" if not workflow_pin_problems(t)
+            else None if not any(s in p for p in workflow_pin_problems(t))
+            else f"a problem echoes {s[:16]!r}..."))
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"

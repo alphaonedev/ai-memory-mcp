@@ -617,6 +617,27 @@ class Round11EchoMask(unittest.TestCase):
         self.assertEqual(SUBSET.echo('"NOTE":\t' + self.TAIL), repr('"NOTE":\t<withheld 11 chars>'))
         self.assertEqual(SUBSET.echo("\tNOTE: " + self.TAIL), repr("\tNOTE: <withheld 11 chars>"))
 
+    def test_an_equals_sign_keeps_only_a_flag_word_with_a_value_6945_6949(self):
+        """An ``=`` is a separator only after an unquoted flag word with no ``- `` and with value text after it."""
+        padded = "QUJD" * 9
+        for row in (padded + "=", "  " + padded + "==", "- '" + padded + "==", self.TAIL + "==", " " + self.TAIL + "=",
+                    '"' + self.TAIL + "=rest", "- '" + self.TAIL + "==", '- "' + self.TAIL + "=x", self.TAIL + "="):
+            shown = SUBSET.echo(row)
+            self.assertNotIn(self.TAIL, shown, row)
+            self.assertNotIn(padded[:8], shown, row)
+            self.assertRegex(shown, r"^'[ \t]*<withheld \d+ chars>'$", row)
+        self.assertEqual(SUBSET.echo(padded + "="), repr("<withheld 37 chars>"))
+        self.assertEqual(SUBSET.echo("  " + padded + "=="), repr("  <withheld 38 chars>"))
+        self.assertEqual(SUBSET.echo("x= "), repr("<withheld 3 chars>"))
+        # A flag or an environment assignment with a value keeps its key word.
+        self.assertEqual(SUBSET.echo("--password=hunter2"), repr("--password=<withheld 7 chars>"))
+        self.assertEqual(SUBSET.echo("K=v"), repr("K=<withheld 1 chars>"))
+        self.assertEqual(SUBSET.echo("FOO=" + self.TAIL), repr("FOO=<withheld 11 chars>"))
+        self.assertEqual(SUBSET.echo("PASSWORD:"), repr("PASSWORD:"))
+        with self.assertRaises(Unparsed) as caught:
+            SUBSET.parse_workflow("on: push\nenv:\n  K: x\n  " + padded + "=\n")
+        self.assertNotIn(padded[:8], str(caught.exception))
+
     def test_mask_shapes_the_round11_campaign_left_unkilled(self):
         """Mutants Y3 (quote allowed in an operand), Y4 (ghs_ prefix) and V7 (= as a row separator) survived."""
         self.assertIn("<withheld", SUBSET.mask("PIN_TOKEN: ${{ 'LEAK" + "TAIL' }}"))
