@@ -2428,6 +2428,59 @@ class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
         ])
 
 
+    def _script_cases(self, files: Dict[str, str], cases: List[Tuple[str, str]], want: bool) -> None:
+        """Write ``files`` under a scratch dir below the repo root, then run each ``run:`` line ({d} = that dir)."""
+        LOCAL_RUNS.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="scripts-6477-", dir=str(LOCAL_RUNS)) as tmp:
+            rel = Path(tmp).relative_to(ROOT).as_posix()
+            for name, text in files.items():
+                (Path(tmp) / name).parent.mkdir(parents=True, exist_ok=True)
+                (Path(tmp) / name).write_text(text.replace("{d}", rel), encoding="utf-8")
+            for label, run in cases:
+                with self.subTest(label):
+                    step = R7_PRE + "        run: |\n" + "".join(
+                        "          %s\n" % line for line in run.replace("{d}", rel).split("\n"))
+                    found = self._before_prune(step)
+                    if want:
+                        self.assertTrue(any("R-DEBUG" in v for v in found), (label, found))
+                    else:
+                        self.assertEqual([], found, label)
+
+    SCRIPTS_6477 = {
+        "build.sh": "#!/usr/bin/env bash\nexport RUSTFLAGS=-g\ncargo build\n",
+        "env.sh": "export CARGO_PROFILE_DEV_DEBUG=2\n",
+        "outer.sh": "#!/bin/sh\nbash {d}/build.sh\n",
+        "d1.sh": "bash {d}/d2.sh\n", "d2.sh": "bash {d}/d3.sh\n", "d3.sh": "bash {d}/d4.sh\n",
+        "d4.sh": "bash {d}/build.sh\n",
+        "build.py": "import os\nos.environ['RUSTFLAGS'] = '-g'\n",
+        "clean.sh": "#!/usr/bin/env bash\nset -euo pipefail\necho hi\ncargo test --no-run\n",
+    }
+
+    def test_6118_r7_6477_committed_scripts_run_from_a_step_are_read(self) -> None:
+        self._script_cases(self.SCRIPTS_6477, [
+            ("bash script exports RUSTFLAGS", "bash {d}/build.sh"),
+            ("sh script", "sh {d}/build.sh"),
+            ("direct path", "./{d}/build.sh"),
+            ("env prefix then bash", "X=1 bash {d}/build.sh"),
+            ("source sets debug level", "source {d}/env.sh\ncargo test --no-run"),
+            ("dot sets debug level", ". {d}/env.sh\ncargo test --no-run"),
+            ("nested script", "bash {d}/outer.sh"),
+            ("nesting deeper than three", "bash {d}/d1.sh"),
+            ("python script", "python3 {d}/build.py"),
+            ("make", "make build"),
+            ("just", "just build"),
+            ("missing script", "bash {d}/no-such-script.sh"),
+            ("script path computed at run time", 'bash "$SCRIPT_6477"'),
+        ], True)
+
+    def test_6118_r7_6477_clean_script_and_allowlisted_tool_stay_clean(self) -> None:
+        self._script_cases(self.SCRIPTS_6477, [
+            ("clean script", "bash {d}/clean.sh"),
+            ("command -v probe", "command -v python3 >/dev/null"),
+            ("script named in an echo", "echo see {d}/build.sh"),
+        ], False)
+
+
 class PruneScript6118(unittest.TestCase):
     """scripts/ci/prune-runner-target.py against a fake cargo target tree."""
 
