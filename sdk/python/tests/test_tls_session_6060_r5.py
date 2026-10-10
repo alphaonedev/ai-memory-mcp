@@ -1595,3 +1595,68 @@ def test_unwrappable_transport_refuses_construction_6537(client_cls: type) -> No
 
 def test_lab_temp_root_is_project_local_6309(lab: Lab) -> None:
     assert ".local-runs" in pathlib.Path(lab.ca_path).resolve().parts
+
+
+# ---- #6690: one path check for verify= and the env trust variables ---------
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("source", ["verify", "SSL_CERT_FILE"])
+def test_trailing_slash_on_a_ca_file_is_refused_6690(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    source: str,
+) -> None:
+    """``ca.pem/`` names no file to the kernel (ENOTDIR); both inputs refuse it."""
+    directory = _ca_dir(tmp_path)
+    entry = _add_anchor(directory, lab.ca_path)
+    spelled = str(entry) + os.sep
+    if source == "verify":
+        _env_trust(monkeypatch)
+        with pytest.raises(ValueError, match="not an existing regular file"):
+            client_cls(base_url=_ORIGIN, verify=spelled)
+    else:
+        _env_trust(monkeypatch, SSL_CERT_FILE=spelled)
+        with pytest.raises(ValueError, match="SSL_CERT_FILE"):
+            client_cls(base_url=_ORIGIN, verify=None)
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("source", ["verify", "SSL_CERT_DIR"])
+def test_trailing_slash_on_a_ca_directory_is_accepted_6690(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    source: str,
+) -> None:
+    directory = _ca_dir(tmp_path)
+    _add_anchor(directory, lab.ca_path)
+    spelled = str(directory) + os.sep
+    if source == "verify":
+        _env_trust(monkeypatch)
+        assert _get_once(client_cls, origin.url, spelled) == 200
+    else:
+        _env_trust(monkeypatch, SSL_CERT_DIR=spelled)
+        assert _get_once(client_cls, origin.url, None) == 200
+
+
+def test_env_and_verify_share_one_path_check_6690(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The env variables are checked by the same funnel as ``verify=<path>``."""
+    seen: list[tuple[str, object]] = []
+    real = _common._context_from_path
+
+    def spy(path: str, *args: Any, **kwargs: Any) -> ssl.SSLContext:
+        seen.append((path, kwargs.get("kind")))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(_common, "_context_from_path", spy)
+    _env_trust(monkeypatch, SSL_CERT_FILE=str(tmp_path / "absent.pem"))
+    with pytest.raises(ValueError, match="SSL_CERT_FILE"):
+        AiMemoryClient(base_url=_ORIGIN, verify=None)
+    assert seen == [(str(tmp_path / "absent.pem"), "file")]
