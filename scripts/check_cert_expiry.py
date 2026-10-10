@@ -152,7 +152,7 @@ STATUS_LINE_RE = re.compile(
 )
 BINDS_LINE_RE = re.compile(
     r"^>?" + _S + r"*\*\*" + _S + r"*Binds" + _S + r"+to" + _S + r"*:?" + _S
-    + r"*\*\*" + _S + r"*:?" + _S + r"*`?([0-9a-fA-F]{40})`?",
+    + r"*\*\*" + _S + r"*:?" + _S + r"*`?([0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?)(?![0-9a-fA-F])`?",
     re.IGNORECASE,
 )
 
@@ -300,7 +300,7 @@ def cert_banner(repo, tree):
     STATUS: LIVE | VOID | EXPIRED | UNPARSEABLE (doc present, no STATUS line)
     | DUPLICATE (two or more STATUS lines: a decoy above the real banner must
     not be read as the banner) | ABSENT (no doc at TREE).
-    BINDS: the lowercase 40-hex bound SHA, "-" when no Binds-to line matches,
+    BINDS: the lowercase 40- or 64-hex bound SHA, "-" when no Binds-to line matches,
     "DUPLICATE" when two or more do.
     """
     proc = run_git(repo, "show", "--end-of-options", f"{tree}:{CERT_DOC}")
@@ -366,7 +366,7 @@ def check_banner_consistency(repo, judged):
         return False, [
             f"{PREFIX}: ERROR — {CERT_DOC} at HEAD says STATUS LIVE but has no "
             "parseable Binds-to line. Expected a line shaped like "
-            "'**Binds to:** `<40-hex sha>`' (spacing, backticks and hex case are "
+            "'**Binds to:** `<40- or 64-hex sha>`' (spacing, backticks and hex case are "
             "tolerated). Fail-closed, #3556."
         ]
     if binds == "DUPLICATE":
@@ -2234,7 +2234,8 @@ SELF_TEST_OK = (
     "GREEN (squash-merge shape, tree diff); (v2) LIVE bound to a non-ancestor whose watched "
     "tree differs RED (the ancestry hatch would have silenced it); (w) unparseable STATUS line "
     "fail-closed; (x1) decoy STATUS line above the banner RED (exactly-one rule); (x2) decoy "
-    "Binds-to line RED; (y) cert doc deleted alongside a wire change RED (ABSENT fails closed); "
+    "Binds-to line RED; (x3, #6624) a 41-, 63- or 65-hex Binds-to is refused with no parseable Binds-to line and a 64-hex one is parsed whole; "
+    "(y) cert doc deleted alongside a wire change RED (ABSENT fails closed); "
     "(z) pure banner reformat on a docs-only change GREEN (tolerant parse); (z2) reformat + "
     "wire change RED as incidental, not unparseable; (pr1) #6137 stale-LIVE head banner with "
     "the base EXPIRED GREEN at the merge commit (and RED if judged at the head alone); (pr2) "
