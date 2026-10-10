@@ -1159,6 +1159,17 @@ jobs:
         # parent that is not the PR head, an octopus merge, or a first parent
         # not on the base fail-close with their reason. (#5970) under GitHub
         # Actions CERT_EXPIRY_BASE/HEAD overrides are refused.
+        # (#6124) While the certification is EXPIRED/VOID at both ends a
+        # watched-file change passes only with exactly ONE new
+        # non-discharging amendment record inside the ledger blockquote
+        # (cells 6124-h*, f*); the self-test asserts the record is refused
+        # when an HTML block or fence opened anywhere in the ledger
+        # (including list items, indented '>' and '>' + tab) would hide it
+        # (6124-l*, q*), when it sits away from the ledger (p*), when the
+        # header cites other issues (i*) or the #6063 cite is an image (m*),
+        # and when any change that touches the doc edits, removes or
+        # reorders an existing record (d*). The cert is never re-issued by
+        # an edit (#3899); only the WP-B1 re-cert (#6063) re-issues it.
         run: python3 -I scripts/check_cert_expiry.py --self-test
 
   foreign-text-to-caller-gate:
