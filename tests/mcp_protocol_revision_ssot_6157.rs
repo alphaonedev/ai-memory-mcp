@@ -701,6 +701,36 @@ fn issue_6533_walk_reads_tracked_files_under_formerly_excluded_names() {
     );
 }
 
+/// #6534: the walk reads every trackable file whatever its extension. The
+/// round-3 allowlist (`rs md html sh py json ts tsx mjs cjs js toml yml
+/// yaml`) skipped the issue's three plants (`.jsonl`, an extension-less
+/// `Dockerfile`, `.txt`) and the tracked shapes `.github/Dockerfile.ci` and
+/// a golden `.out`; all five must be read.
+#[test]
+fn issue_6534_walk_reads_files_outside_the_round3_extension_allowlist() {
+    const KEPT: [&str; 5] = [
+        ".github/Dockerfile.ci",
+        "benchmarks/zz_plant.jsonl",
+        "deploy/zz_plant/Dockerfile",
+        "docs/zz_plant.txt",
+        "tests/golden/zz_plant.out",
+    ];
+    let scratch = scratch_tree("6534");
+    copy_gitignore(&scratch, ".gitignore");
+    for rel in KEPT {
+        plant(&scratch, rel, PLANT);
+    }
+    let (seen, unreadable) = walked(&scratch);
+    let _ = fs::remove_dir_all(&scratch);
+
+    assert!(unreadable.is_empty(), "unreadable: {unreadable:?}");
+    let want: Vec<String> = KEPT.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        seen, want,
+        "the walk skipped a trackable file by extension (false green)"
+    );
+}
+
 /// Every tracked `.gitignore` outside the skipped root `vendor/`. The #6524
 /// test pins that the real walk finds exactly these, so a new ignore file
 /// cannot join the tree without joining the plant test below.
