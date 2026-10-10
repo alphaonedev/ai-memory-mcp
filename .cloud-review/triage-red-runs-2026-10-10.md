@@ -2343,3 +2343,34 @@ Status `completed`, conclusion `success`, created 2026-10-10T16:53:19Z, updated 
 |---|---|---|---|---|---|---|---|---|
 | 114263777794 | Coverage classify (docs-only short-circuit) | GitHub Actions 1000125361 | 16:53:19Z | 1.1 min | 16:54:25Z | 16:54:33 | 0.1 min | success |
 | 114264023380 | Per-Module Coverage Thresholds | GitHub Actions 1000125443 | 16:54:34Z | 2.6 min | 16:57:13Z | 18:09:41 | 72.5 min (over 45) | success |
+
+## Update 18:38Z: run 38069459437 CI (fix/6157-promo6-ssh @ 41b051b3c) reached terminal state
+
+Status `completed`, conclusion `success`, created 2026-10-10T16:53:03Z, updated 2026-10-10T18:36:16Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38069459437
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114263724612 | Build-script custom-build ledger gate (#2635) | GitHub Actions 1000125281 | 16:53:03Z | 0.1 min | 16:53:10Z | 16:53:32 | 0.4 min | success |
+| 114263724844 | Classify changes | GitHub Actions 1000125282 | 16:53:03Z | 0.1 min | 16:53:11Z | 16:53:56 | 0.8 min | success |
+| 114263897513 | Dockerfile build (no push) | GitHub Actions 1000125412 | 16:53:56Z | 1.4 min | 16:55:23Z | 17:10:44 | 15.3 min | success |
+| 114263897529 | Lint (fmt + clippy) | GitHub Actions 1000125410 | 16:53:56Z | 1.4 min | 16:55:20Z | 17:00:44 | 5.4 min | success |
+| 114263897531 | actionlint (workflow-injection guard) | GitHub Actions 1000125418 | 16:53:56Z | 1.7 min | 16:55:37Z | 16:55:48 | 0.2 min | success |
+| 114263897532 | Cross-compile (aarch64-apple-ios) | GitHub Actions 1000125336 | 16:53:56Z | 0.1 min | 16:54:04Z | 16:57:00 | 2.9 min | success |
+| 114263897535 | MSRV (Rust 1.98) | GitHub Actions 1000125413 | 16:53:56Z | 1.4 min | 16:55:23Z | 16:58:36 | 3.2 min | success |
+| 114263897551 | vectorlite feature gate | GitHub Actions 1000125416 | 16:53:56Z | 1.6 min | 16:55:31Z | 17:02:25 | 6.9 min | success |
+| 114263897554 | Cross-compile (aarch64-linux-android) | GitHub Actions 1000125419 | 16:53:56Z | 1.7 min | 16:55:37Z | 16:58:19 | 2.7 min | success |
+| 114263897583 | Postgres feature gate | GitHub Actions 1000125420 | 16:53:56Z | 1.7 min | 16:55:40Z | 16:59:17 | 3.6 min | success |
+| 114263897594 | SAL-only feature gate | GitHub Actions 1000125422 | 16:53:56Z | 1.8 min | 16:55:42Z | 17:28:45 | 33.0 min | success |
+| 114263897601 | Check (linux-fed,enterprise-fed) | f2-linux-fed-2 | 16:53:56Z | 18.1 min | 17:12:05Z | 18:32:38 | 80.5 min (over 45) | success |
+| 114263897617 | Check (macos-fed,enterprise-fed) | f1-macos-fed-2 | 16:53:56Z | 34.4 min | 17:28:22Z | 18:15:48 | 47.4 min (over 45) | success |
+| 114263897673 | Check (ubuntu-latest,sqlite) | GitHub Actions 1000125429 | 16:53:56Z | 2.1 min | 16:56:03Z | 17:49:56 | 53.9 min (over 45) | success |
+| 114263898070 | Check (macos-fed,sqlite) | f1-macos-fed | 16:53:56Z | 71.3 min | 18:05:12Z | 18:36:15 | 31.1 min | success |
+
+## Update 18:38Z: run 38071010815 Per-Module Coverage Thresholds (chain/promo6-ssh-r2 @ e60080e02) reached terminal state
+
+Status `completed`, conclusion `success`, created 2026-10-10T17:15:43Z, updated 2026-10-10T18:30:25Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38071010815
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114268238172 | Coverage classify (docs-only short-circuit) | GitHub Actions 1000125589 | 17:15:44Z | 0.5 min | 17:16:16Z | 17:16:24 | 0.1 min | success |
+| 114268371692 | Per-Module Coverage Thresholds | GitHub Actions 1000125594 | 17:16:24Z | 0.1 min | 17:16:30Z | 18:30:24 | 73.9 min (over 45) | success |
