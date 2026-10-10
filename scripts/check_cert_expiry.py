@@ -2794,8 +2794,9 @@ def _round5_shapes(shapes, pr, approve, wf_rel, c8_rel):
 
 def _ws_unit_cells(t):
     """#6555: each of the 22 refused non-YAML whitespace code points has its
-    own cell (`tr-s-ws-U+XXXX`), planted mid-line in a comment; U+0085, U+2028
-    and U+2029 are line breaks (#6228), space and tab are YAML whitespace."""
+    own cell (`tr-s-ws-U+XXXX`), planted mid-line in a comment on line 2, and
+    its own line-1 cell (`tr-s-ws-line1-U+XXXX`, #6684); U+0085, U+2028 and
+    U+2029 are line breaks (#6228), space and tab are YAML whitespace."""
     if len(set(WS_REFUSED)) != 22:
         t.fail(f"(tr-s-ws-all): WS_REFUSED holds {len(set(WS_REFUSED))} code points, not 22")
     for code in WS_REFUSED:
@@ -2803,6 +2804,11 @@ def _ws_unit_cells(t):
         found = _whitespace_findings(".github/workflows/u.yml", f"name: u\n# a{chr(code)}b\n")
         if len(found) != 1 or f"U+{code:04X}" not in found[0]:
             t.fail(f"({label}): U+{code:04X} in a comment was not refused as that code point: {found!r}")
+    for code in WS_REFUSED:
+        label = f"tr-s-ws-line1-U+{code:04X}"
+        found = _whitespace_findings(".github/workflows/u.yml", f"#{chr(code)}\nname: u\n")
+        if len(found) != 1 or "line 1 (1 in this file)" not in found[0] or f"(U+{code:04X})" not in found[0]:
+            t.fail(f"({label}): U+{code:04X} on line 1 was not refused as exactly that code point on line 1: {found!r}")
     for ok in (" ", "\t"):
         if _whitespace_findings(".github/workflows/u.yml", f"name: u\n# a{ok}b\n"):
             t.fail(f"(tr-s-ws-yaml): {ok!r} is YAML whitespace and must not be refused")
