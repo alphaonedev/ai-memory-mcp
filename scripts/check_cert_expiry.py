@@ -1493,6 +1493,7 @@ SHA_SITE_STMTS = (
     'before = env_sha(env, "GITHUB_EVENT_BEFORE")',
     'after = env_sha(env, "GITHUB_SHA") if env.get("GITHUB_SHA") else "HEAD"',
 )
+SHA_MAIN_CALL = "rc, out, err = run_gate(REPO_ROOT, dict(os.environ))"
 SHA_SITE_BINDINGS = {"head": 1, "tip": 1, "stale": 1, "before": 2, "after": 1}
 
 
@@ -1519,7 +1520,9 @@ def sha_ast_violations(src):
     whole (so a conditional bypass of the call is a change), no binding of `env`
     beyond the parameter of resolve_range and run_gate, no mutation of `env` through
     a method other than .get or a subscript store, the exact resolve_range call in
-    run_gate, the unchanged body of env_sha and the exact ENV_SHA_RE pattern.
+    run_gate, the unchanged body of env_sha, the exact ENV_SHA_RE pattern, a single
+    binding of each of env_sha and ENV_SHA_RE in the module (a second one would shadow
+    the pinned one) and the unchanged production env build in main (#6882).
     Returns the list of violations (empty when the pin holds)."""
     tree = ast.parse(src)
     out = []
@@ -1535,6 +1538,17 @@ def sha_ast_violations(src):
     if sites != want_sites or n_calls != len(want_sites):
         out.append(f"env_sha call sites {sites!r} ({n_calls} calls) are not the five "
                    f"`env_sha(env, KEY)` sites {want_sites!r}")
+    for name in ("ENV_SHA_RE", "env_sha"):
+        n = sum(binds_name(x, name) for x in ast.walk(tree))
+        if n != 1:
+            out.append(f"`{name}` is bound {n} times in the module, want exactly 1")
+    main_fn = top.get("main")
+    entry = ast.dump(ast.parse(SHA_MAIN_CALL).body[0])
+    if main_fn is None or [ast.dump(n) for n in ast.walk(main_fn) if isinstance(n, ast.Assign)].count(entry) != 1:
+        out.append(f"main does not hold exactly one unchanged `{SHA_MAIN_CALL}`")
+    elif sum(isinstance(n, ast.Attribute) and n.attr == "environ" and isinstance(n.value, ast.Name)
+             and n.value.id == "os" for n in ast.walk(main_fn)) != 1:
+        out.append("main touches os.environ other than in the run_gate call")
     rr, rg = top.get("resolve_range"), top.get("run_gate")
     if rr is None or rg is None:
         return out + ["resolve_range or run_gate is missing"]
@@ -2248,13 +2262,14 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     if not sha_comment_violations(block_text, [lb for lb in names if lb != "BOM plus 40-hex"]):
         t.fail("(pr4-sha-comment-position): a missing #6463 row is not reported")
 
-    # (pr4-sha-ast, #6697, #6940): structural pin of the five env sha read statements of
+    # (pr4-sha-ast, #6697, #6940, #6882): structural pin of the five env sha read statements of
     # resolve_range, taken whole, plus the paths that feed them: `env` is bound only as the parameter
     # of resolve_range and run_gate and is never mutated, run_gate passes it on unchanged, env_sha
     # fullmatches the value it read, and ENV_SHA_RE is the exact 40-or-64 ASCII-hex pattern, no
-    # flags. A loosening made AT those statements or by REBINDING their input (a stripped copy of
-    # env) fails here without a per-character-form cell; a loosening anywhere else (a different
-    # function, a changed environment build in main) is outside this pin and needs its own cell.
+    # flags, each bound exactly once in the module, and main builds the production env with the
+    # unchanged `run_gate(REPO_ROOT, dict(os.environ))` (#6882). A loosening made AT those statements
+    # or by REBINDING their input (a stripped copy of env) fails here without a per-character-form
+    # cell; a loosening anywhere else (a different function) is outside this pin and needs its own cell.
     for why in sha_ast_violations(own_src):
         t.fail(f"(pr4-sha-ast): {why}")
     # (pr4-sha-ast-mutants, #6940): the pin must reject each of these edits to a copy of this
@@ -2269,6 +2284,15 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
          [('    event = env.get("GITHUB_EVENT_NAME", "")\n',
            '    env = {k: v.replace("' + zw + '", "") for k, v in env.items()}\n'
            '    event = env.get("GITHUB_EVENT_NAME", "")\n')]),
+        ("a second module-level ENV_SHA_RE binding after the pinned one",
+         [("\n\n\ndef env_sha(env, key):",
+           '\nENV_SHA_RE = re.compile(r"[0-9a-fA-F' + zw + ']{40}(?:[0-9a-fA-F' + zw + ']{24})?")\n\n\ndef env_sha(env, key):')]),
+        ("a second def env_sha after the pinned one",
+         [("\n\n\ndef is_commit(repo, ref):",
+           '\n\ndef env_sha(env, key):\n    return env.get(key, "").replace("' + zw + '", "")\n\n\ndef is_commit(repo, ref):')]),
+        ("a stripped production env built in main",
+         [("    rc, out, err = run_gate(REPO_ROOT, dict(os.environ))\n",
+           '    rc, out, err = run_gate(REPO_ROOT, {k: v.replace("' + zw + '", "") for k, v in os.environ.items()})\n')]),
         ("run_gate passing a stripped env copy to resolve_range",
          [('        base, head, tip = resolve_range(repo, env)\n',
            '        base, head, tip = resolve_range(repo, {k: v.replace("' + zw + '", "") for k, v in env.items()})\n')]),
@@ -2434,9 +2458,10 @@ SELF_TEST_OK = (
     "(pr4-sha-len) 63/65-hex, 40 non-ASCII-digit (Arabic-Indic, fullwidth, superscript), 40 non-hex ASCII, newline- or CR-suffixed and space-prefixed 40-hex values, BOM-, bidi-override-, combining-mark- and Cyrillic-look-alike 40/64-hex values (#6463), and every str.isspace() character as a prefix and as a suffix of a 40-hex value, refused on every validated sha site (PR_HEAD_SHA, GITHUB_SHA and PR_BASE_SHA on pull_request; "
     "GITHUB_EVENT_BEFORE and GITHUB_SHA on push) with only the `git --version` probe traced before the validator; "
     "(pr4-sha-comment, #6649, #6941) the comment block above the sha values names each loosening and claims no false only-cell, the four #6463 labels chosen by name so a moved row neither shifts the check nor kills the fullwidth-row control; "
-    "(pr4-sha-ast, #6697, #6940) an ast pin of the five whole env_sha(env, KEY) read statements of resolve_range, "
-    "the bindings and mutations of env in resolve_range and run_gate, env_sha and ENV_SHA_RE; (pr4-sha-ast-mutants, #6940) "
-    "the pin rejects a conditional bypass at a read site, an env rebound in resolve_range and a stripped env passed from run_gate."
+    "(pr4-sha-ast, #6697, #6940, #6882) an ast pin of the five whole env_sha(env, KEY) read statements of resolve_range, "
+    "the bindings and mutations of env in resolve_range and run_gate, the single bindings of env_sha and ENV_SHA_RE and the env build in main; "
+    "(pr4-sha-ast-mutants, #6940, #6882) the pin rejects a conditional bypass at a read site, an env rebound in resolve_range, "
+    "a stripped env passed from run_gate, a second ENV_SHA_RE or env_sha binding and a stripped production env built in main."
 )
 
 
