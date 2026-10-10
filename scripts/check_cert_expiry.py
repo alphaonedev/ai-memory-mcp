@@ -110,8 +110,8 @@ block-comment copy as RED.
 CONTEXT CHECK (#6560): a guarded line can also be disabled while it stays
 byte-identical (nothing on it is edited), so each identifier-bearing line is
 scanned with a Rust tokenizer (line, nested block and doc comments, strings,
-raw strings, byte and C strings, chars, lifetimes; whitespace or a newline
-between `#`, `!` and `[` of an attribute; an end-of-file string, raw string or
+raw strings, byte and C strings, chars, lifetimes; whitespace, a newline or a
+comment between `#`, `!` and `[` of an attribute; an end-of-file string, raw string or
 block comment is a named ERROR) and the constructs that enclose it are
 recorded: an attribute on it or on any enclosing item or `mod` (cfg, cfg_attr,
 path, #[test], any attribute outside a short allow-list), an inner
@@ -2836,6 +2836,11 @@ def _wrap_cells(t, fx, repo, base):
          {"src/wrap_a.rs": "#\n[cfg(any())]\n" + a_line}),
         ("wrap-inner-spaced", "#![cfg(any())]", "an inner attribute written `# ! [cfg(any())]` at the top of the file",
          {"src/wrap_a.rs": "# ! [cfg(any())]\n" + a_line}),
+        # #6719 (N07): a comment between `#`, `!` and `[` is trivia; rustc still reads an attribute
+        ("wrap-attr-comment-split", "cfg(any())", "an attribute written `#/* c */[cfg(any())]` on the item",
+         {"src/wrap_a.rs": "#/* c */[cfg(any())]\n" + a_line}),
+        ("wrap-inner-comment-split", "#![cfg(any())]", "an inner attribute written `#/* c */!/* d */[cfg(any())]`",
+         {"src/wrap_a.rs": "#/* c */!/* d */[cfg(any())]\n" + a_line}),
         # #6705: a raw string or a comment inside an attribute keeps the lexer in step
         ("wrap-attr-rawstr-desync", "cfg(any())", "a raw string with a backslash in an attribute before a cfg",
          {"src/wrap_d.rs": '#[doc = r"\\"]\n#[cfg(any())]\n' + d_text[:-2] + '} // "]\n'}),
@@ -3128,7 +3133,7 @@ SELF_TEST_OK = (
     "(wrap-cfg-item, wrap-cfg-feature, wrap-cfg-mod, wrap-cfg-fn, wrap-inner, wrap-inner-late, "
     "wrap-allow-unreach, wrap-attr-test, wrap-iffalse, wrap-ifcfg, wrap-else, wrap-blockcomment, "
     "wrap-rawstring, wrap-return, wrap-todo, wrap-loop, wrap-loop-inner-break, wrap-macro, wrap-decl, wrap-moved-undeclared, "
-    "wrap-attr-spaced, wrap-attr-newline, wrap-inner-spaced, wrap-attr-rawstr-desync, "
+    "wrap-attr-spaced, wrap-attr-newline, wrap-inner-spaced, wrap-attr-comment-split, wrap-inner-comment-split, wrap-attr-rawstr-desync, "
     "wrap-attr-comment-desync, wrap-exit-abort, wrap-exit-rooted, wrap-exit-imported, "
     "wrap-exit-std-panic, wrap-exit-assert-false, wrap-exit-bare-block, wrap-exit-let-return, "
     "wrap-exit-if-true, wrap-if-paren-false, wrap-if-not-cfg, wrap-if-not-not-false, "
@@ -3136,7 +3141,7 @@ SELF_TEST_OK = (
     "wrap-mask-copy, wrap-decl-inline-mod, wrap-parent-inner, wrap-decl-pubcrate, "
     "wrap-undeclared-nested, and each with -gate on a pull_request, #6560) "
     "a guarded line left byte-identical but disabled by its context (an attribute on it, its "
-    "enclosing mod or fn or the file, spaced or split across lines, after a raw string or comment "
+    "enclosing mod or fn or the file, spaced, split across lines or by a comment, after a raw string or comment "
     "inside an earlier attribute, an if false / if (false) / if !!false / if cfg! / if !cfg! block, "
     "the else of an if true, a for over an empty range, a never-matching match arm, the input of "
     "stringify! or a local macro, a block comment opened 36 lines above, a raw string, any of the "

@@ -1517,7 +1517,7 @@ set, the gate is a red check, not a merge block.)
 The gate's identifier scan also checks the CONTEXT of an unchanged
 `AI_MEMORY_FED_*` line ([**#6560**](https://github.com/alphaonedev/ai-memory-mcp/issues/6560)):
 a `cfg` or other non-benign attribute on the enclosing item or an enclosing
-`mod` (also written `# [..]` or split across lines), an inner `#![..]`
+`mod` (also written `# [..]`, split across lines or split by a comment), an inner `#![..]`
 attribute, `if false` / `if (false)` / `if !!false` / `if cfg!(..)` /
 `if !cfg!(..)`, a `for` over an empty literal range, a match arm that never
 matches a literal scrutinee, the input of a macro invocation such as
