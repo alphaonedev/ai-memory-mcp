@@ -89,6 +89,12 @@ with open({base!r} + "/sleep.pid", "w") as fh:
 time.sleep(120)
 """
 
+# Fake psql that dies by the given signal before printing anything (#6643).
+SELF_SIGNAL_PSQL = """#!{py}
+import os
+os.kill(os.getpid(), {signum})
+"""
+
 # Signals the helper does not turn into an interrupt: default-ignored (CHLD, URG, WINCH, INFO, CONT),
 # job control (TSTP, TTIN, TTOU), PIPE (Python ignores it), the synchronous faults (SEGV, BUS, ILL, FPE) and the
 # two nothing can catch (KILL, STOP).  Every other signal valid on this platform must end in `interrupted` (#6504).
@@ -1069,6 +1075,34 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             os.close(w)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout.strip(), "1")
+
+    def test_a_psql_killed_by_a_signal_is_reported_as_128_plus_the_signal_6643(self):
+        # supervise() maps a psql killed by signal N to 128+N; a 0 there would read as "age not listed" (#6643 R12)
+        mod = load_module()
+        for signum in (signal.SIGKILL, signal.SIGTERM):
+            write_exe(self.psql, SELF_SIGNAL_PSQL.format(py=sys.executable, signum=int(signum)))
+            with self.subTest(supervisor=int(signum)):
+                r, w = os.pipe()
+                try:
+                    done = subprocess.run(
+                        [sys.executable, "-I", str(SCRIPT), mod.SUPERVISE_FLAG, str(r), "30", "--", str(self.psql)],
+                        pass_fds=(r,), capture_output=True, text=True, timeout=30)
+                finally:
+                    os.close(r)
+                    os.close(w)
+                self.assertEqual(done.returncode, 128 + int(signum), done.stderr)
+            with self.subTest(helper=int(signum)):
+                before = self.install_snapshot()
+                r = self.run_script()
+                self.assert_fails(r, 1, f"age probe failed: psql exited {128 + int(signum)}")
+                self.assertEqual(self.install_snapshot(), before, "a failed probe must never trigger a restore")
+
+    def install_snapshot(self):
+        """Install the good files once and return their (inode, mtime_ns, bytes): a restore replaces the inode."""
+        if not any(self.ext.iterdir()):
+            self.install_good()
+        return {p.name: (p.stat().st_ino, p.stat().st_mtime_ns, p.read_bytes())
+                for d in (self.ext, self.lib) for p in sorted(d.iterdir())}
 
     def run_recorded(self, env=None):
         """Run the helper on a healthy install and return (result, the argv of the --supervise Popen)."""
