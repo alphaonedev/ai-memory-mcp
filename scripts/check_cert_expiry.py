@@ -824,8 +824,9 @@ YAML_BREAK_RE = re.compile("\r\n|[\r\n\x85\u2028\u2029]")
 
 
 # Round 5 (#6304): YAML s-white is a space or a tab and nothing else. Python's
-# str.strip() also removes NBSP, U+3000, FF and others that YAML keeps as
-# content, so blank and comment tests strip YAML_WHITE only.
+# str.strip() also removes NBSP, U+3000 and the other Unicode spaces that YAML
+# keeps as content (and FF and VT, which YAML refuses outright), so blank and
+# comment tests strip YAML_WHITE only.
 YAML_WHITE = " \t"
 
 
@@ -3463,7 +3464,7 @@ def _ws_wording_cells(t):
     ff_vt = r"\b(?:F" + "F|V" + r"T)\b"
     wrong = (ff_vt + r"[^.;]{0,60}\b(?:keeps?|kept) as content",
              r"U\+3000, " + ff_vt + r"[^.;]{0,30}(?:and|or) (?:others|other characters) that YAML",
-             r"second producer on an? [^.;]{0,50}" + ff_vt,
+             r"second producer on an? [^.;\"']{0,50}" + ff_vt,
              r"second producer on a \{code\}-led",
              r"U\+3000 or F" + "F is scanned")
     for pattern in wrong:
@@ -3473,13 +3474,17 @@ def _ws_wording_cells(t):
 
 def _trusted_round5_cells(judge, shapes):
     """#6140 round 5 (security review R4 SR4-1, #6304): the blank and comment
-    tests use YAML whitespace only (space, tab), so a line led by NBSP, U+3000
-    or FF is scanned, and any other whitespace character in a workflow file is
-    refused as GUARD SHADOW (RED even WITH the trailer, no waiver)."""
+    tests use YAML whitespace only (space, tab), so a line led by NBSP or U+3000
+    is scanned, and any other whitespace character in a workflow file (FF and
+    VT included, which YAML does not load at all) is refused as GUARD SHADOW
+    (RED even WITH the trailer, no waiver)."""
     shadow = "GUARD SHADOW: "
     ws = "a whitespace character other than space or tab"
-    for key, code, scanned in (("nbsp", "U+00A0", True), ("ideo", "U+3000", True), ("ff", "U+000C", True), ("vt", "U+000B", True)):
-        judge(f"tr-s-{key}", f"a second producer on a {code}-led line of a new workflow, NO trailer",
+    for key, code, why in (("nbsp", "U+00A0", "a second producer on a U+00A0-led line"),
+                           ("ideo", "U+3000", "a second producer on a U+3000-led line"),
+                           ("ff", "U+000C", "an FF-led line (not loadable YAML)"),
+                           ("vt", "U+000B", "a VT-led line (not loadable YAML)")):
+        judge(f"tr-s-{key}", f"{why} in a new workflow, NO trailer",
               *shapes["r5-" + key], needles=(shadow + f".github/workflows/ws-{key}.yml", ws, code,
                                               "(workflow header): names the required check"))
     judge("tr-s-nbsp-quoted", "U+00A0 only inside a quoted value of a workflow that is not an own file",
@@ -3811,8 +3816,8 @@ SELF_TEST_OK = (
     "quoted scalar spanning lines (value or node), complex key, second jobs: key, an own job body not indented "
     "by 4 and a merge key after a block scalar each RED with the trailer; a name fragment split after 9 "
     "characters and a section-sign-only fragment RED; a failed update-ref -d stopping before any fetch and "
-    "git's fetch stderr escaped; (tr round 5, #6304) a second producer on a NBSP, U+3000, FF or VT "
-    "led line of a new workflow, a Unicode whitespace character only inside a quoted value, and a "
+    "git's fetch stderr escaped; (tr round 5, #6304) a second producer on a NBSP or U+3000 led line, "
+    "and an FF or VT led line (not loadable YAML), of a new workflow, a Unicode whitespace character only inside a quoted value, and a "
     "NBSP-only line ending a block scalar of c8-precheck.yml RED (no trailer needed; not waivable) "
     "while a tab-indented comment and trailing spaces stay GREEN; (tr round 5, #6228) a second producer "
     "joined by LS or PS in the trusted workflow RED with the trailer, and a hostile workflow file "
