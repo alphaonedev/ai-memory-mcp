@@ -4,8 +4,8 @@
 //! Shared backend oracles for the ordinary library and the separate lib harness.
 #![allow(dead_code)]
 
-use super::library as ai_memory;
-use ai_memory::models::{CaptureTurnWrite, Memory, Tier, default_metadata};
+use super::library;
+use super::library::models::{CaptureTurnWrite, Memory, Tier, default_metadata};
 use chrono::{Duration, Utc};
 
 pub const FAIL_ENV: &str = "AI_MEMORY_TEST_FAIL_BEFORE_SIGNED_COMMIT";
@@ -44,7 +44,7 @@ pub fn capture_write(id: &str) -> CaptureTurnWrite {
         host_session_id: id.into(),
         host_turn_index: 0,
         recovered_at_ms: Utc::now().timestamp_millis(),
-        signed_event: ai_memory::signed_events::SignedEvent {
+        signed_event: library::signed_events::SignedEvent {
             id: uuid::Uuid::new_v4().to_string(),
             agent_id: AGENT.into(),
             event_type: "memory.capture_turn".into(),
@@ -52,7 +52,7 @@ pub fn capture_write(id: &str) -> CaptureTurnWrite {
             signature: None,
             attest_level: "unsigned".into(),
             timestamp: now,
-            ..ai_memory::signed_events::SignedEvent::default()
+            ..library::signed_events::SignedEvent::default()
         },
     }
 }
@@ -84,7 +84,7 @@ pub fn sqlite_snapshot(conn: &rusqlite::Connection) -> Vec<Vec<Vec<rusqlite::typ
 pub fn sqlite_capture(conn: &rusqlite::Connection, id: &str, auto: bool) -> Result<(), String> {
     let write = capture_write(id);
     if auto {
-        ai_memory::storage::capture_turn_idempotent_auto(
+        library::storage::capture_turn_idempotent_auto(
             conn,
             &write.host_session_id,
             &write.memory.content,
@@ -97,7 +97,7 @@ pub fn sqlite_capture(conn: &rusqlite::Connection, id: &str, auto: bool) -> Resu
         )
         .map(|_| ())
     } else {
-        ai_memory::storage::capture_turn_idempotent(conn, &write, false).map(|_| ())
+        library::storage::capture_turn_idempotent(conn, &write, false).map(|_| ())
     }
 }
 
@@ -124,7 +124,7 @@ fn hard_delete_row() -> Memory {
 }
 
 pub fn sqlite_stamps(conn: &rusqlite::Connection, id: &str) {
-    let memory = ai_memory::storage::get(conn, id)
+    let memory = library::storage::get(conn, id)
         .expect("get")
         .expect("stored memory");
     let signed: String = conn
@@ -138,12 +138,12 @@ pub fn sqlite_stamps(conn: &rusqlite::Connection, id: &str) {
 }
 
 pub fn clock_rows() -> Vec<(Memory, i64)> {
-    let hour = ai_memory::SECS_PER_HOUR;
+    let hour = library::SECS_PER_HOUR;
     let mut rows: Vec<_> = [
-        -2 * ai_memory::SECS_PER_DAY,
+        -2 * library::SECS_PER_DAY,
         -hour / 2,
         hour / 2,
-        2 * ai_memory::SECS_PER_DAY,
+        2 * library::SECS_PER_DAY,
     ]
     .into_iter()
     .enumerate()
@@ -177,13 +177,13 @@ pub fn assert_ids(results: Vec<(Memory, f64)>, expected: &[String]) {
 pub fn sqlite_clock(offset: i64) {
     // This oracle runs only in an exact, isolated test child. Seed the same
     // process atomic as normal boot, without changing the process environment.
-    ai_memory::config::set_append_only(true);
-    let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("private sqlite");
+    library::config::set_append_only(true);
+    let conn = library::db::open(std::path::Path::new(":memory:")).expect("private sqlite");
     let rows = clock_rows();
     let embedding = vec![1.0; EMBEDDING_DIM];
     for (memory, _) in &rows {
-        ai_memory::storage::insert(&conn, memory).expect("seed clock row");
-        ai_memory::storage::set_embedding(&conn, &memory.id, &embedding, SPACE)
+        library::storage::insert(&conn, memory).expect("seed clock row");
+        library::storage::set_embedding(&conn, &memory.id, &embedding, SPACE)
             .expect("seed SQLite vector");
     }
     conn.execute(
@@ -192,7 +192,7 @@ pub fn sqlite_clock(offset: i64) {
     )
     .expect("seed archived edge");
     let expected = expected_ids(&rows, offset);
-    let (results, _) = ai_memory::storage::recall(
+    let (results, _) = library::storage::recall(
         &conn,
         NEEDLE,
         Some(NAMESPACE),
@@ -215,7 +215,7 @@ pub fn sqlite_clock(offset: i64) {
         (NEEDLE, &[][..], None),
         ("nomatchingkeyword", embedding.as_slice(), Some(SPACE)),
     ] {
-        let (results, _) = ai_memory::storage::recall_hybrid(
+        let (results, _) = library::storage::recall_hybrid(
             &conn,
             query,
             vector,
@@ -229,7 +229,7 @@ pub fn sqlite_clock(offset: i64) {
             0,
             None,
             None,
-            &ai_memory::config::ResolvedScoring::default(),
+            &library::config::ResolvedScoring::default(),
             false,
             None,
             Some(AGENT),
@@ -239,11 +239,11 @@ pub fn sqlite_clock(offset: i64) {
         .expect("hybrid recall");
         assert_ids(results, &expected);
     }
-    let removed = ai_memory::storage::gc(&conn, true).expect("gc");
+    let removed = library::storage::gc(&conn, true).expect("gc");
     assert_eq!(removed, rows.len() - expected.len(), "actual GC count");
     for (memory, _) in &rows {
         assert_eq!(
-            ai_memory::storage::get(&conn, &memory.id)
+            library::storage::get(&conn, &memory.id)
                 .expect("post-GC get")
                 .is_some(),
             expected.contains(&memory.id),
@@ -258,8 +258,8 @@ pub fn sqlite_clock(offset: i64) {
 
 fn sqlite_gc_stamps(conn: &rusqlite::Connection, archived: usize) {
     let doomed = hard_delete_row();
-    ai_memory::storage::insert(conn, &doomed).expect("seed hard-delete row");
-    assert_eq!(ai_memory::storage::gc(conn, false).expect("hard GC"), 1);
+    library::storage::insert(conn, &doomed).expect("seed hard-delete row");
+    assert_eq!(library::storage::gc(conn, false).expect("hard GC"), 1);
     for (sql, expected) in [
         ("SELECT archived_at FROM archived_memories", archived),
         ("SELECT archived_at FROM archived_memory_links", 1),
@@ -287,8 +287,8 @@ fn sqlite_gc_stamps(conn: &rusqlite::Connection, archived: usize) {
 
 #[cfg(feature = "sal-postgres")]
 pub mod pg {
+    use super::library::store::{CallerContext, Filter, MemoryStore, postgres::PostgresStore};
     use super::*;
-    use super::ai_memory::store::{CallerContext, Filter, MemoryStore, postgres::PostgresStore};
 
     /// CREATE succeeds before any tested operation. The owned random database,
     /// not an ambient name/prefix, establishes isolation even with an unsafe URL.
@@ -426,7 +426,7 @@ pub mod pg {
     pub async fn capture(
         store: &PostgresStore,
         id: &str,
-    ) -> Result<(), ai_memory::store::StoreError> {
+    ) -> Result<(), library::store::StoreError> {
         store
             .capture_turn_idempotent(&CallerContext::for_agent(AGENT), &capture_write(id))
             .await
@@ -448,7 +448,7 @@ pub mod pg {
     }
 
     pub async fn clock(store: &PostgresStore, offset: i64) {
-        ai_memory::config::set_append_only(true);
+        library::config::set_append_only(true);
         let ctx = CallerContext::for_agent(AGENT);
         let rows = clock_rows();
         let embedding = vec![1.0; EMBEDDING_DIM];
