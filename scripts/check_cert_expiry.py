@@ -3099,6 +3099,7 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     _ws_unit_cells(t)
     _ws_format_cells(t)
     _ws_wording_cells(t)
+    _ws_wording_missing_cell(t)
     _source_hygiene_cell(t)
 
 
@@ -3643,6 +3644,7 @@ SUMMARY_CELL_SOURCES = (
     ("_ws_unit_cells", ""),
     ("_ws_format_cells", ""),
     ("_ws_wording_cells", ""),
+    ("_ws_wording_missing_cell", ""),
     ("_source_hygiene_cell", ""),
     ("_log_safe_cells", ""),
     ("_log_safe_table_cell", ""),
@@ -3799,13 +3801,13 @@ def _ws_format_cells(t):
                     ("lines 2, 3 (2 in this file)", "(U+00A0)"))
 
 
-def _ws_wording_cells(t):
+def _ws_wording_cells(t, root=None):
     """#6554: YAML refuses FF, VT and U+001C-U+001F outright (PyYAML: unacceptable
     character), so a line led by one is not a second producer and YAML does not keep it as
     content; only the other Unicode spaces are kept. The refusal stays, the
     stated reason must be true. Cell `ws-wording` fails on a sentence of this
     file or of changelog.d/6304.fixed.md that says otherwise."""
-    log = REPO_ROOT / "changelog.d" / "6304.fixed.md"
+    log = (REPO_ROOT if root is None else root) / "changelog.d" / "6304.fixed.md"
     if not log.is_file():
         t.fail("(ws-wording): changelog.d/6304.fixed.md is missing while this script carries the #6304 cells; "
                "the wording cell fails closed instead of skipping it (#6554)")
@@ -3830,6 +3832,22 @@ def _ws_wording_cells(t):
     if "U+001C-U+001F" not in fragment:
         t.fail("(ws-wording): changelog.d/6304.fixed.md does not name U+001C-U+001F among the code points YAML "
                "refuses (#6554)")
+
+
+def _ws_wording_missing_cell(t):
+    """#6957: when changelog.d/6304.fixed.md is absent the wording cell fails
+    closed with its named message instead of skipping, and a failed cell makes
+    the self-test exit 2 (`if t.failed` in `_self_test`). Cell
+    `ws-wording-missing` runs the wording cell against an empty root and pins
+    both the named failure and the failed flag."""
+    probe, seen = SelfTest(), io.StringIO()
+    with tempfile.TemporaryDirectory() as empty, contextlib.redirect_stderr(seen):
+        _ws_wording_cells(probe, Path(empty))
+    said = seen.getvalue()
+    if not probe.failed:
+        t.fail("(ws-wording-missing): a missing changelog.d/6304.fixed.md did not fail the wording cell")
+    if "(ws-wording): changelog.d/6304.fixed.md is missing" not in said or "fails closed" not in said:
+        t.fail(f"(ws-wording-missing): the missing-fragment failure is not the named one: {said!r}")
 
 
 def _trusted_round5_cells(judge, shapes):
@@ -4207,7 +4225,8 @@ SELF_TEST_OK = (
     "the text of its escape print differently and log_safe's output decodes back to the name "
     "(log-safe-backslash, log-safe-roundtrip); (tr round 8, #6922) the script's own source holds no raw "
     "non-ASCII whitespace or log_safe-escaped code point, so the dedup cells write U+00A0 and U+3000 as "
-    "escapes like their neighbours (src-no-invisible)."
+    "escapes like their neighbours (src-no-invisible); (tr round 8, #6957) a missing changelog.d/6304.fixed.md "
+    "fails the wording cell with its named message and the self-test exits 2 (ws-wording-missing)."
 )
 
 
