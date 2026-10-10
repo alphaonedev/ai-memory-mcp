@@ -110,6 +110,21 @@ fn renderer_keeps_a_plain_sqlite_path_in_every_scheme_case_6107() {
     }
 }
 
+/// #6702 - a key/value DSN behind a sqlite scheme rendered verbatim: the
+/// renderer redacted a `sqlite://` value only on `@`, and `db_path_display`
+/// sends every `://` value to that branch, so its own `=` rule never ran.
+#[test]
+fn renderer_redacts_a_kv_dsn_behind_a_sqlite_scheme_6702() {
+    for s in SCHEMES {
+        let url = format!("{s}://host=db.example password={MARKER} dbname=mem");
+        let r = ai_memory::url_display::store_url_display(&url);
+        assert_clean(&r, "store_url_display", &url);
+        assert_eq!(r, "sqlite://<redacted-authority>", "{url:?}");
+        let d = ai_memory::url_display::db_path_display(Path::new(&url));
+        assert_clean(&d, "db_path_display", &url);
+    }
+}
+
 #[test]
 fn db_flag_refusal_carries_no_sqlite_credential_6107() {
     let dir = scratch("db-flag");
