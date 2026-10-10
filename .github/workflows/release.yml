@@ -390,11 +390,14 @@ jobs:
           set -euo pipefail
           # #4768 / #6275 — same bind as the build step, re-checked here because
           # a step ran in between: the asserter and the declaration are the
-          # verified commit's, read and run by an absolute, sanitized bash.
-          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "4dcd53494e52381437e6fe13f21d06a5393a4e2ef83d02369d02278b00f5d9d6 *scripts/release-features.sh"; echo "ea836345a37906f6cf7f867533915f3b52b39a6ac273e22a590050a1d68e9a13 *scripts/assert-compiled-features.sh"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
+          # verified commit's, read and run by an absolute, sanitized bash. #6907 —
+          # the packer is bound too: it takes the digest of the asserted binary.
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "4dcd53494e52381437e6fe13f21d06a5393a4e2ef83d02369d02278b00f5d9d6 *scripts/release-features.sh"; echo "ea836345a37906f6cf7f867533915f3b52b39a6ac273e22a590050a1d68e9a13 *scripts/assert-compiled-features.sh"; echo "ecfa3032195653c5f72fa5cc1806f4e7d32acdde1e7f1ebb905b38ad2ba7133f *scripts/release/reproducible_build.py"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
           bin="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
           REQUIRE_FLAGS="$(/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc scripts/release-features.sh --require-flags)"
           test -n "$REQUIRE_FLAGS"
+          # #6907 — the digest of the binary BEFORE the assert reads it.
+          before_sha256="$(/usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -I scripts/release/reproducible_build.py --sha256 "$bin")"
           # #2728 / #4719 — EVERY release target runs the strict exact-set
           # `ai-memory features` self-report, on a runner that executes the
           # artifact natively (each of the three targets builds on a runner of
@@ -404,16 +407,17 @@ jobs:
           # scripts/check_release_features.py refuses a conditional assert.
           # shellcheck disable=SC2086 # word-splitting the --require flags is intended
           /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc scripts/assert-compiled-features.sh "$bin" --strict $REQUIRE_FLAGS
-          # #4752 — record WHICH bytes passed the assert; the package step
-          # refuses any other file (shasum: present on the Linux and macOS
-          # runners alike).
-          asserted_sha256="$(shasum -a 256 "$bin" | cut -d' ' -f1)"
+          # #4752 / #6907 — record WHICH bytes passed the assert, taken by the
+          # bound packer (one read, no PATH tool); the binary must not have
+          # changed while the assert read it. The package step refuses any other file.
+          asserted_sha256="$(/usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -I scripts/release/reproducible_build.py --sha256 "$bin")"
+          test "$asserted_sha256" = "$before_sha256" || { echo "::error::$bin changed while the strict assert read it (#6907)"; exit 1; }
           echo "sha256=$asserted_sha256" >> "$GITHUB_OUTPUT"
 
       - name: Package binary
-        # #4752 — the file that is packaged, checksummed, attested and uploaded
-        # is bound to the file the strict assert checked: its SHA-256 must equal
-        # the hash the assert step recorded, or nothing is packaged. Every step
+        # #4752 / #6907 — the file that is packaged, checksummed, attested and
+        # uploaded is bound to the file the strict assert checked: its SHA-256
+        # must equal the hash the assert step recorded, or nothing is packaged. Every step
         # of this job is pinned whole by scripts/check_release_features.py
         # (RELEASE_STEPS), so no later step can write dist/ unseen.
         # #6282 — the tarball is written by the deterministic packer (sorted
@@ -427,22 +431,22 @@ jobs:
           SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
         run: |
           set -euo pipefail
-          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "9eb082dedae45a610512bbdb827f3cf9b87f4bdc2b1ebf0a81875f6788a08408 *scripts/release/reproducible_build.py"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "ecfa3032195653c5f72fa5cc1806f4e7d32acdde1e7f1ebb905b38ad2ba7133f *scripts/release/reproducible_build.py"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
           test -n "$SOURCE_DATE_EPOCH"
-          mkdir -p dist
-          cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "dist/${{ matrix.artifact }}"
-          packaged_sha256="$(shasum -a 256 "dist/${{ matrix.artifact }}" | cut -d' ' -f1)"
           test -n "$ASSERTED_SHA256"
-          test "$packaged_sha256" = "$ASSERTED_SHA256" || { echo "::error::dist/${{ matrix.artifact }} ($packaged_sha256) is not the binary the strict assert checked ($ASSERTED_SHA256)"; exit 1; }
           # #6274 — the x86_64 Linux binary that ships must be byte-identical to
           # the one the `reproducible` job built twice; other legs are not yet
           # covered by the proof (see the job's banner).
           case "${{ matrix.target }}" in x86_64-unknown-linux-gnu) test -n "$REPRO_SHA256"; test "$REPRO_SHA256" = "$ASSERTED_SHA256" || { echo "::error::the shipped x86_64-unknown-linux-gnu binary ($ASSERTED_SHA256) is not the one the reproducible job built twice ($REPRO_SHA256)"; exit 1; } ;; esac
-          cd dist
-          /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -I ../scripts/release/reproducible_build.py --pack "ai-memory-${{ matrix.target }}.tar.gz" --epoch "$SOURCE_DATE_EPOCH" "${{ matrix.artifact }}"
+          mkdir -p dist
+          # #6907 — one read of the asserted binary: its SHA-256 must be the
+          # recorded one, and the tarball and dist/<artifact> are written from
+          # those same bytes (no PATH tool, no re-read after the check).
+          /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -I scripts/release/reproducible_build.py --pack-binary "target/${{ matrix.target }}/release/${{ matrix.artifact }}" --expect-sha256 "$ASSERTED_SHA256" --copy-to "dist/${{ matrix.artifact }}" --pack "dist/ai-memory-${{ matrix.target }}.tar.gz" --epoch "$SOURCE_DATE_EPOCH"
 
       - name: Build deb and rpm packages
         if: matrix.nfpm_arch
+        shell: /bin/bash --posix --noprofile --norc -eo pipefail {0}
         run: |
           set -euo pipefail
           # #6282 — nfpm reads SOURCE_DATE_EPOCH (the job's epoch) for every
@@ -469,9 +473,15 @@ jobs:
           ARCH=${{ matrix.nfpm_arch }} VERSION=$VERSION nfpm package -p rpm -f nfpm.yaml -t dist/
 
           ls -la dist/*.deb dist/*.rpm
+          # #6907 — nfpm read dist/ai-memory after the package step checked it: open
+          # both packages and require their only file to be the asserted binary.
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "ecfa3032195653c5f72fa5cc1806f4e7d32acdde1e7f1ebb905b38ad2ba7133f *scripts/release/reproducible_build.py"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
+          /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -I scripts/release/reproducible_build.py --verify-payload --expect-sha256 "$ASSERTED_SHA256" dist/*.deb dist/*.rpm
         env:
           TAG: ${{ needs.preflight.outputs.tag }}
           SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
+          ASSERTED_SHA256: ${{ steps.assert.outputs.sha256 }}
+          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}
 
       # ------------------------------------------------------------------
       # #2449 - publish a SHA-256 for every artifact an installer verifies.
@@ -669,7 +679,7 @@ jobs:
         run: |
           set -euo pipefail
           # #4768 / #6275 — the declaration and the proof script are the verified commit's.
-          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "4dcd53494e52381437e6fe13f21d06a5393a4e2ef83d02369d02278b00f5d9d6 *scripts/release-features.sh"; echo "9eb082dedae45a610512bbdb827f3cf9b87f4bdc2b1ebf0a81875f6788a08408 *scripts/release/reproducible_build.py"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "4dcd53494e52381437e6fe13f21d06a5393a4e2ef83d02369d02278b00f5d9d6 *scripts/release-features.sh"; echo "ecfa3032195653c5f72fa5cc1806f4e7d32acdde1e7f1ebb905b38ad2ba7133f *scripts/release/reproducible_build.py"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
           FEATURES="$(/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc scripts/release-features.sh)"
           test -n "$FEATURES"
           /usr/bin/python3 scripts/release/reproducible_build.py --target x86_64-unknown-linux-gnu --features "$FEATURES" --workspace-b "$RUNNER_TEMP/reproducible-b" --sha256-output "$GITHUB_OUTPUT" --nfpm "$RUNNER_TEMP/nfpm/nfpm" --nfpm-arch amd64 --version "${TAG#v}"
@@ -918,7 +928,7 @@ jobs:
           SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
         run: |
           set -euo pipefail
-          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "9eb082dedae45a610512bbdb827f3cf9b87f4bdc2b1ebf0a81875f6788a08408 *scripts/release/reproducible_build.py"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "ecfa3032195653c5f72fa5cc1806f4e7d32acdde1e7f1ebb905b38ad2ba7133f *scripts/release/reproducible_build.py"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
           test -n "$SOURCE_DATE_EPOCH"
           cd dist
           /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -I ../scripts/release/reproducible_build.py --pack ai-memory-ios.xcframework.tar.gz --epoch "$SOURCE_DATE_EPOCH" AiMemory.xcframework
@@ -1091,7 +1101,7 @@ jobs:
           SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
         run: |
           set -euo pipefail
-          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "9eb082dedae45a610512bbdb827f3cf9b87f4bdc2b1ebf0a81875f6788a08408 *scripts/release/reproducible_build.py"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "ecfa3032195653c5f72fa5cc1806f4e7d32acdde1e7f1ebb905b38ad2ba7133f *scripts/release/reproducible_build.py"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
           test -n "$SOURCE_DATE_EPOCH"
           # Drop a minimal AndroidManifest.xml stub alongside the jniLibs
           # tree so the archive maps 1:1 onto AGP's expected layout.

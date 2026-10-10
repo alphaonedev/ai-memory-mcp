@@ -41,6 +41,16 @@ binary the same way and compares the tarballs; with ``--nfpm`` it also builds
 the deb and rpm of each workspace (``nfpm.yaml``, ``SOURCE_DATE_EPOCH``) and
 compares them. Any difference is a mismatch (exit 1).
 
+#6907: the release job's package units read the asserted binary through this
+script, never through a PATH tool. ``--sha256 FILE`` prints the SHA-256 of one
+read of a regular file (no symlink). ``--pack-binary`` reads SRC once, refuses
+it unless its SHA-256 is ``--expect-sha256`` (the digest the strict assert
+recorded), and writes the tarball (``--pack``) and ``--copy-to`` from those same
+bytes. ``--verify-payload`` opens each deb (ar + data.tar) and rpm (lead,
+headers, gzip / xz / bzip2 newc cpio; zstd is refused) and requires exactly one
+regular file, ``usr/bin/ai-memory``, single-linked, mode 0755, with the
+expected SHA-256.
+
 ``--self-test`` drives the comparison with a stub ``cargo`` that writes a
 binary derived from SOURCE_DATE_EPOCH, the feature set, the target and the
 REMAPPED working directory: two builds must match; a perturbed epoch on the
@@ -52,24 +62,31 @@ Usage:
       [--workspace-a DIR] [--bin NAME] [--epoch N] [--cargo PATH]
       [--nfpm PATH --nfpm-arch ARCH --version VERSION]
   scripts/release/reproducible_build.py --pack OUT --epoch N [--pack-root DIR] NAME...
+  scripts/release/reproducible_build.py --sha256 FILE
+  scripts/release/reproducible_build.py --pack-binary SRC --expect-sha256 HEX --copy-to DST --pack OUT --epoch N
+  scripts/release/reproducible_build.py --verify-payload --expect-sha256 HEX PACKAGE...
   scripts/release/reproducible_build.py --self-test
 Exit codes: 0 identical · 1 mismatch · 2 usage, build or git error.
 """
 from __future__ import annotations
 
 import argparse
+import bz2
 import hashlib
 import gzip
+import io
+import lzma
 import os
 import re
 import shutil
 import stat
+import struct
 import tarfile
 import subprocess
 import sys
 import tempfile
 from pathlib import Path, PurePosixPath
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 REMAP_SRC = "/src"
 # #6291: the only caller variables a build sees (plus the overrides build_once sets).
@@ -237,6 +254,376 @@ def pack_tarball(out: Path, root: Path, names: List[str], epoch: str) -> str:
         if partial.exists():
             partial.unlink()
     return sha256_of(out)
+
+
+# #6907: the release job's package units read the asserted binary ONCE, through
+# this module, and never through a PATH tool. ``read_once`` opens the file
+# without following a final symlink, refuses anything but a regular file, and
+# returns the bytes of that one open; every digest, archive and copy the package
+# unit writes is computed from those bytes, so a file rewritten after the check
+# cannot reach an artifact.
+HEX64_RE = re.compile(r"[0-9a-f]{64}")
+PACKAGED_PATH = "usr/bin/ai-memory"
+
+
+def read_once(path: Path) -> bytes:
+    """The bytes of the regular file ``path``, read through one descriptor."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(str(path), flags)
+    except OSError as exc:
+        raise ProofError(f"cannot open {path}: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ProofError(f"{path} is not a regular file")
+        chunks = []
+        while True:
+            chunk = os.read(fd, CHUNK)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except OSError as exc:
+        raise ProofError(f"cannot read {path}: {exc}") from exc
+    finally:
+        os.close(fd)
+    return b"".join(chunks)
+
+
+def expect_hex(value: Optional[str]) -> str:
+    if value is None or not HEX64_RE.fullmatch(value):
+        raise ProofError(f"--expect-sha256 {value!r} is not a lowercase SHA-256 hex digest")
+    return value
+
+
+def pack_binary(src: Path, expect: str, copy_to: Path, out: Path, epoch: str) -> str:
+    """#6907: read ``src`` once, require its SHA-256 to be ``expect`` (the digest
+    the strict assert recorded), then write the deterministic tarball (one member,
+    ``copy_to.name``, mode 0755) and a fresh ``copy_to`` from those same bytes.
+    Returns the tarball's SHA-256."""
+    expect = expect_hex(expect)
+    if not EPOCH_RE.fullmatch(epoch or ""):
+        raise ProofError(f"--pack epoch {epoch!r} is not a non-negative integer (SOURCE_DATE_EPOCH must be set)")
+    data = read_once(src)
+    got = hashlib.sha256(data).hexdigest()
+    if got != expect:
+        raise ProofError(f"{src} ({got}) is not the binary the strict assert checked ({expect})")
+    partial = out.with_name(out.name + ".partial")
+    try:
+        with open(partial, "wb") as raw:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=9) as gz:
+                with tarfile.open(fileobj=gz, mode="w", format=tarfile.GNU_FORMAT) as tf:
+                    info = tarfile.TarInfo(copy_to.name)
+                    info.mtime = int(epoch)
+                    info.uid = info.gid = 0
+                    info.uname = info.gname = ""
+                    info.mode = 0o755
+                    info.size = len(data)
+                    tf.addfile(info, io.BytesIO(data))
+        os.replace(partial, out)
+        if os.path.lexists(copy_to):
+            os.unlink(copy_to)
+        fd = os.open(str(copy_to), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o755)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        os.chmod(copy_to, 0o755)
+    except OSError as exc:
+        raise ProofError(f"--pack-binary cannot write {out} / {copy_to}: {exc}") from exc
+    finally:
+        if partial.exists():
+            partial.unlink()
+    return hashlib.sha256(read_once(out)).hexdigest()
+
+
+def _member(name: str, what: str) -> str:
+    """A payload path without its leading ``./`` or ``/``; ``..`` is refused."""
+    clean = name
+    while clean.startswith("./"):
+        clean = clean[2:]
+    clean = clean.lstrip("/")
+    if ".." in PurePosixPath(clean).parts:
+        raise ProofError(f"{what}: payload entry {name!r} leaves the root")
+    return PurePosixPath(clean).as_posix() if clean else "."
+
+
+def _tar_payload(blob: bytes, what: str) -> Dict[str, Tuple[bytes, int, int]]:
+    """The regular files of a (compressed) tar ``blob``; refuses links, devices,
+    duplicates and a file with more than one link."""
+    try:
+        tf = tarfile.open(fileobj=io.BytesIO(blob), mode="r:*")
+    except (tarfile.TarError, OSError, EOFError) as exc:
+        raise ProofError(f"{what}: unreadable data archive ({exc})") from exc
+    files: Dict[str, Tuple[bytes, int, int]] = {}
+    with tf:
+        for m in tf.getmembers():
+            name = _member(m.name, what)
+            if m.isdir():
+                continue
+            if not m.isreg():
+                raise ProofError(f"{what}: payload entry {m.name!r} is not a regular file or directory")
+            if name in files:
+                raise ProofError(f"{what}: payload entry {m.name!r} appears twice")
+            fh = tf.extractfile(m)
+            if fh is None:
+                raise ProofError(f"{what}: payload entry {m.name!r} has no data")
+            files[name] = (fh.read(), m.mode & 0o7777, 1)
+    return files
+
+
+def _deb_payload(blob: bytes, what: str) -> Dict[str, Tuple[bytes, int, int]]:
+    """The data.tar.* member of a deb (an ar archive), parsed as a tar."""
+    if not blob.startswith(b"!<arch>\n"):
+        raise ProofError(f"{what}: not an ar archive")
+    off, data = 8, None
+    while off < len(blob):
+        hdr = blob[off:off + 60]
+        if len(hdr) != 60 or hdr[58:60] != b"`\n":
+            raise ProofError(f"{what}: truncated or malformed ar member header at {off}")
+        name = hdr[:16].decode("ascii", "replace").strip().rstrip("/")
+        try:
+            size = int(hdr[48:58].decode("ascii").strip())
+        except ValueError as exc:
+            raise ProofError(f"{what}: ar member {name!r} has no size") from exc
+        body = blob[off + 60:off + 60 + size]
+        if len(body) != size:
+            raise ProofError(f"{what}: ar member {name!r} is truncated")
+        if name.startswith("data.tar"):
+            if data is not None:
+                raise ProofError(f"{what}: more than one data.tar member")
+            data = body
+        off += 60 + size + (size & 1)
+    if data is None:
+        raise ProofError(f"{what}: no data.tar member")
+    return _tar_payload(data, what)
+
+
+def _rpm_header_end(blob: bytes, off: int, what: str, pad: bool) -> int:
+    if blob[off:off + 3] != b"\x8e\xad\xe8":
+        raise ProofError(f"{what}: no rpm header magic at {off}")
+    if len(blob) < off + 16:
+        raise ProofError(f"{what}: truncated rpm header at {off}")
+    nindex, hsize = struct.unpack(">II", blob[off + 8:off + 16])
+    end = off + 16 + 16 * nindex + hsize
+    if end > len(blob):
+        raise ProofError(f"{what}: rpm header at {off} runs past the end of the file")
+    if pad:
+        end += (-end) % 8
+    return end
+
+
+def _decompress(blob: bytes, what: str) -> bytes:
+    try:
+        if blob.startswith(b"\x1f\x8b"):
+            return gzip.decompress(blob)
+        if blob.startswith(b"\xfd7zXZ\x00"):
+            return lzma.decompress(blob)
+        if blob.startswith(b"BZh"):
+            return bz2.decompress(blob)
+    except (OSError, EOFError, lzma.LZMAError, ValueError) as exc:
+        raise ProofError(f"{what}: payload does not decompress ({exc})") from exc
+    raise ProofError(f"{what}: payload compression is not gzip, xz or bzip2 (refused rather than guessed)")
+
+
+def _cpio_payload(blob: bytes, what: str) -> Dict[str, Tuple[bytes, int, int]]:
+    """The regular files of a newc / crc cpio archive (an rpm payload)."""
+    files: Dict[str, Tuple[bytes, int, int]] = {}
+    off = 0
+    while True:
+        hdr = blob[off:off + 110]
+        if len(hdr) != 110 or hdr[:6] not in (b"070701", b"070702"):
+            raise ProofError(f"{what}: malformed cpio header at {off}")
+        try:
+            f = [int(hdr[6 + 8 * i:14 + 8 * i], 16) for i in range(13)]
+        except ValueError as exc:
+            raise ProofError(f"{what}: malformed cpio header at {off}") from exc
+        mode, nlink, size, namesize = f[1], f[4], f[6], f[11]
+        nstart = off + 110
+        name = blob[nstart:nstart + namesize].rstrip(b"\x00").decode("utf-8", "replace")
+        dstart = nstart + namesize
+        dstart += (-dstart) % 4
+        if name == "TRAILER!!!":
+            return files
+        data = blob[dstart:dstart + size]
+        if len(data) != size:
+            raise ProofError(f"{what}: cpio entry {name!r} is truncated")
+        off = dstart + size
+        off += (-off) % 4
+        clean = _member(name, what)
+        if stat.S_ISDIR(mode):
+            continue
+        if not stat.S_ISREG(mode):
+            raise ProofError(f"{what}: payload entry {name!r} is not a regular file or directory")
+        if clean in files:
+            raise ProofError(f"{what}: payload entry {name!r} appears twice")
+        files[clean] = (data, mode & 0o7777, nlink)
+
+
+def _rpm_payload(blob: bytes, what: str) -> Dict[str, Tuple[bytes, int, int]]:
+    if not blob.startswith(b"\xed\xab\xee\xdb"):
+        raise ProofError(f"{what}: no rpm lead magic")
+    sig_end = _rpm_header_end(blob, 96, what, pad=True)
+    main_end = _rpm_header_end(blob, sig_end, what, pad=False)
+    return _cpio_payload(_decompress(blob[main_end:], what), what)
+
+
+def verify_payload(packages: List[Path], expect: str) -> None:
+    """#6907: every deb / rpm holds exactly one regular file, ``usr/bin/ai-memory``,
+    single-linked, mode 0755, whose SHA-256 is ``expect`` (the asserted digest)."""
+    expect = expect_hex(expect)
+    if not packages:
+        raise ProofError("--verify-payload needs at least one package")
+    for pkg in packages:
+        what = str(pkg)
+        blob = read_once(pkg)
+        if pkg.name.endswith(".deb"):
+            files = _deb_payload(blob, what)
+        elif pkg.name.endswith(".rpm"):
+            files = _rpm_payload(blob, what)
+        else:
+            raise ProofError(f"{what}: not a .deb or .rpm")
+        if sorted(files) != [PACKAGED_PATH]:
+            raise ProofError(f"{what}: payload files are {sorted(files)}, not exactly [{PACKAGED_PATH!r}]")
+        data, mode, nlink = files[PACKAGED_PATH]
+        if mode != 0o755 or nlink != 1:
+            raise ProofError(f"{what}: {PACKAGED_PATH} has mode {oct(mode)} and {nlink} links, not 0o755 and 1")
+        got = hashlib.sha256(data).hexdigest()
+        if got != expect:
+            raise ProofError(f"{what}: {PACKAGED_PATH} ({got}) is not the binary the strict assert checked ({expect})")
+
+
+def _synthetic_tar(entries: List[Tuple[str, bytes, int, str]]) -> bytes:
+    """A gzip tar of (name, data, mode, kind) entries; kind is 'f', 'd' or 'l'."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz", format=tarfile.GNU_FORMAT) as tf:
+        for name, data, mode, kind in entries:
+            info = tarfile.TarInfo(name)
+            info.mode = mode
+            if kind == "d":
+                info.type = tarfile.DIRTYPE
+                tf.addfile(info)
+            elif kind == "l":
+                info.type = tarfile.SYMTYPE
+                info.linkname = data.decode()
+                tf.addfile(info)
+            else:
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def _synthetic_package(fmt: str, entries: List[Tuple[str, bytes, int, str]], nlink: int = 1,
+                       compress: str = "gzip", data_members: int = 1) -> bytes:
+    """#6907 self-test fixture: a deb (ar + data.tar.gz) or an rpm (lead, empty
+    signature and main headers, compressed newc cpio) holding ``entries``. The
+    format is what nfpm writes; the self-test also runs on real nfpm output."""
+    if fmt == "deb":
+        members = [("debian-binary", b"2.0\n"), ("control.tar.gz", _synthetic_tar([("./control", b"x\n", 0o644, "f")]))]
+        members += [("data.tar.gz", _synthetic_tar(entries))] * data_members
+        out = b"!<arch>\n"
+        for name, body in members:
+            out += b"%-16s%-12s%-6s%-6s%-8s%-10d`\n" % (name.encode(), b"0", b"0", b"0", b"100644", len(body))
+            out += body + (b"\n" if len(body) & 1 else b"")
+        return out
+    cpio = b""
+    ino = 1
+    for name, data, mode, kind in entries + [("TRAILER!!!", b"", 0, "t")]:
+        ftype = {"f": stat.S_IFREG, "d": stat.S_IFDIR, "l": stat.S_IFLNK, "t": 0}[kind]
+        nm = name.encode() + b"\x00"
+        fields = [ino, ftype | mode, 0, 0, nlink if kind == "f" else 1, 0, len(data), 0, 0, 0, 0, len(nm), 0]
+        hdr = b"070701" + b"".join(b"%08X" % v for v in fields) + nm
+        cpio += hdr + b"\x00" * ((-len(hdr)) % 4) + data + b"\x00" * ((-len(data)) % 4)
+        ino += 1
+    payload = {"gzip": gzip.compress, "xz": lzma.compress, "bzip2": bz2.compress,
+               "zstd": lambda b: b"\x28\xb5\x2f\xfd" + b}[compress](cpio)
+    empty_header = b"\x8e\xad\xe8\x01" + b"\x00" * 4 + struct.pack(">II", 0, 0)
+    return b"\xed\xab\xee\xdb" + b"\x00" * 92 + empty_header + empty_header + payload
+
+
+def _self_test_6907(tmp: Path) -> List[str]:
+    """#6907 cases: the single-read pack and the deb/rpm payload check."""
+    out: List[str] = []
+    good, evil = b"the asserted bytes\n", b"bytes the assert never saw\n"
+    want = hashlib.sha256(good).hexdigest()
+    bin_entry = ("./usr/bin/ai-memory", good, 0o755, "f")
+    dirs = [("./usr/", b"", 0o755, "d"), ("./usr/bin/", b"", 0o755, "d")]
+    d = tmp / "6907"
+    d.mkdir()
+
+    def payload(name: str, ok: bool, fmt: str, entries: List[Tuple[str, bytes, int, str]], **kw: object) -> None:
+        pkg = d / f"case.{fmt}"
+        pkg.write_bytes(_synthetic_package(fmt, entries, **kw))  # type: ignore[arg-type]
+        try:
+            verify_payload([pkg], want)
+            got = True
+        except ProofError as exc:
+            got = False
+            print(f"self-test: {name}: {exc}", file=sys.stderr)
+        if got != ok:
+            out.append(f"{name}: {'accepted' if got else 'refused'}, wanted {'accepted' if ok else 'refused'}")
+
+    for fmt in ("deb", "rpm"):
+        payload(f"6907 {fmt} holding the asserted binary passes", True, fmt, dirs + [bin_entry])
+        payload(f"6907 {fmt} holding other bytes is refused", False, fmt, dirs + [(bin_entry[0], evil, 0o755, "f")])
+        payload(f"6907 {fmt} with a second file is refused", False, fmt, dirs + [bin_entry, ("./etc/x", b"", 0o644, "f")])
+        payload(f"6907 {fmt} with a symlink is refused", False, fmt, dirs + [bin_entry, ("./usr/bin/am", b"ai-memory", 0o777, "l")])
+        payload(f"6907 {fmt} binary not 0755 is refused", False, fmt, dirs + [(bin_entry[0], good, 0o4755, "f")])
+        payload(f"6907 {fmt} with no binary is refused", False, fmt, dirs)
+        payload(f"6907 {fmt} binary under another path is refused", False, fmt, [("./usr/bin/../bin/ai-memory", good, 0o755, "f")])
+    payload("6907 deb with two data members is refused", False, "deb", dirs + [bin_entry], data_members=2)
+    payload("6907 rpm binary with two links is refused", False, "rpm", dirs + [bin_entry], nlink=2)
+    payload("6907 rpm xz payload holding the binary passes", True, "rpm", dirs + [bin_entry], compress="xz")
+    payload("6907 rpm zstd payload is refused, not guessed", False, "rpm", dirs + [bin_entry], compress="zstd")
+    junk = d / "junk.rpm"
+    junk.write_bytes(b"\xed\xab\xee\xdb" + b"\x00" * 10)
+    for name, call in (("6907 a truncated rpm is refused", lambda: verify_payload([junk], want)),
+                       ("6907 a non-hex expected digest is refused", lambda: verify_payload([junk], "Z" * 64)),
+                       ("6907 no package at all is refused", lambda: verify_payload([], want))):
+        try:
+            call()
+            out.append(f"{name}: accepted")
+        except ProofError:
+            pass
+
+    src, copy, tgz = d / "bin", d / "dist-ai-memory", d / "out.tar.gz"
+    src.write_bytes(good)
+    decoy = d / "decoy"
+    decoy.write_bytes(b"decoy\n")
+    copy.symlink_to(decoy)
+    try:
+        pack_binary(src, want, copy, tgz, "1700000000")
+        with tarfile.open(tgz) as tf:
+            members = tf.getmembers()
+            fh = tf.extractfile(members[0]) if len(members) == 1 else None
+            packed = fh.read() if fh is not None else None
+        if packed != good or members[0].mode != 0o755 or members[0].name != copy.name:
+            out.append("6907 pack_binary did not pack the asserted bytes as one 0755 member")
+        if copy.is_symlink() or copy.read_bytes() != good or decoy.read_bytes() != b"decoy\n":
+            out.append("6907 pack_binary followed a planted link or did not write the asserted bytes")
+    except ProofError as exc:
+        out.append(f"6907 pack_binary refused the asserted binary: {exc}")
+    for i, (name, s) in enumerate((("6907 pack_binary refuses bytes the assert did not check", evil),
+                                   ("6907 pack_binary refuses a symlinked source", None))):
+        if tgz.exists():
+            tgz.unlink()
+        other = d / f"src-{i}"
+        if s is None:
+            other.symlink_to(src)
+        else:
+            other.write_bytes(s)
+        try:
+            pack_binary(other, want, copy, tgz, "1700000000")
+            out.append(f"{name}: accepted")
+        except ProofError:
+            if tgz.exists():
+                out.append(f"{name}: refused but still wrote {tgz.name}")
+    fifo = d / "fifo"
+    os.mkfifo(fifo)
+    try:
+        read_once(fifo)
+        out.append("6907 read_once accepted a FIFO")
+    except ProofError:
+        pass
+    return out
 
 
 def nfpm_packages(workspace: Path, binary: Path, nfpm: str, arch: str, version: str, epoch: str) -> List[Tuple[str, str]]:
@@ -523,6 +910,7 @@ def _self_test(root: Path) -> int:
         except ProofError:
             pass
         failures.extend(_self_test_6282(tmp, ws_a, ws_b, stub, g, fresh))
+        failures.extend(_self_test_6907(tmp))
     for f in failures:
         print(f"reproducible_build: self-test FAIL: {f}", file=sys.stderr)
     if failures:
@@ -530,7 +918,8 @@ def _self_test(root: Path) -> int:
     print("reproducible_build: self-test OK (identical builds pass; perturbed epoch, unremapped path, empty feature set "
           "and missing build tool are refused; a stale, dirty or prebuilt workspace B, a compiler wrapper and caller "
           "environment leaks are refused, #6291; the packed tarball and the deb/rpm are compared and a "
-          "perturbed packing epoch is refused, #6282/#6283)")
+          "perturbed packing epoch is refused, #6282/#6283; the single-read pack and the deb/rpm payload check refuse "
+          "bytes the strict assert did not check, #6907)")
     return 0
 
 
@@ -668,11 +1057,41 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--pack", help="write a deterministic tarball of NAMEs here and print its SHA-256 (#6282)")
     ap.add_argument("--pack-root", default=".", help="directory the NAMEs are relative to (with --pack; default .)")
     ap.add_argument("names", nargs="*", help="files or directories to pack (with --pack)")
+    ap.add_argument("--sha256", metavar="FILE", help="print the SHA-256 of one read of the regular file FILE (#6907)")
+    ap.add_argument("--pack-binary", metavar="SRC", help="with --pack, --expect-sha256, --copy-to and --epoch: read SRC "
+                    "once, refuse it unless its SHA-256 is the expected one, pack it and copy it (#6907)")
+    ap.add_argument("--copy-to", metavar="DST", help="where --pack-binary writes the checked bytes (#6907)")
+    ap.add_argument("--expect-sha256", metavar="HEX", help="the digest the strict assert recorded (#6907)")
+    ap.add_argument("--verify-payload", action="store_true", help="check that each PACKAGE (deb or rpm) holds only "
+                    "usr/bin/ai-memory with the --expect-sha256 digest (#6907)")
     ap.add_argument("--self-test", action="store_true", help="prove the comparison with a stub build tool")
     args = ap.parse_args(argv)
     root = Path(__file__).resolve().parent.parent.parent
     if args.self_test:
         return self_test(root)
+    try:
+        if args.sha256:
+            if args.names or args.pack or args.pack_binary or args.verify_payload:
+                ap.error("--sha256 takes exactly one FILE and no other mode")
+            print(hashlib.sha256(read_once(Path(args.sha256))).hexdigest())
+            return 0
+        if args.verify_payload:
+            if args.pack or args.pack_binary:
+                ap.error("--verify-payload takes PACKAGEs and --expect-sha256 only")
+            verify_payload([Path(n) for n in args.names], args.expect_sha256)
+            print(f"verified {len(args.names)} package(s): only {PACKAGED_PATH} with the asserted SHA-256")
+            return 0
+        if args.pack_binary:
+            if args.names or not args.pack or not args.copy_to or args.epoch is None:
+                ap.error("--pack-binary needs --pack, --copy-to, --expect-sha256 and --epoch, and no NAMEs")
+            print(pack_binary(Path(args.pack_binary), args.expect_sha256, Path(args.copy_to), Path(args.pack),
+                              args.epoch))
+            return 0
+    except ProofError as exc:
+        print(f"::error::reproducible-build: {exc}", file=sys.stderr)
+        return 2
+    if args.copy_to or args.expect_sha256:
+        ap.error("--copy-to and --expect-sha256 are only accepted with --pack-binary or --verify-payload")
     if args.pack:
         if args.epoch is None:
             ap.error("--pack needs --epoch")

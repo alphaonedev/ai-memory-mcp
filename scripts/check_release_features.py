@@ -307,17 +307,31 @@ ASSERT_DOCKER = "bash scripts/assert-compiled-features.sh target/release/ai-memo
 BUILD_CMD = 'cargo build --locked --release --target ${{ matrix.target }} --features "$FEATURES"'
 SHAPE_BUILD_CMD = 'cargo build --locked --release --features "$FEATURES"'
 SBOM_CMD = 'cargo cyclonedx --format json --features "$FEATURES"'
-# #4752: the assert step records the SHA-256 of the bytes it checked; the package
-# step refuses any other file. `shasum -a 256` exists on every matrix runner
-# (perl on the Linux images, the system tool on macOS).
-ASSERT_RECORD = ('asserted_sha256="$(shasum -a 256 "$bin" | cut -d\' \' -f1)"',
+# #4752 / #6907: the assert step records the SHA-256 of the bytes it checked; the
+# package step refuses any other file. The digest is taken by the bound packer
+# (one read of a regular file, no PATH tool) before and after the strict assert,
+# and the two must agree, so a binary rewritten while the assert read it is
+# refused rather than recorded.
+PACK_SCRIPT = "scripts/release/reproducible_build.py"
+PACK_PY = SANE_ENV + " /usr/bin/python3 -I " + PACK_SCRIPT
+SHA_OF_BIN = PACK_PY + ' --sha256 "$bin"'
+ASSERT_RECORD = ('before_sha256="$(' + SHA_OF_BIN + ')"',
+                 'asserted_sha256="$(' + SHA_OF_BIN + ')"',
+                 'test "$asserted_sha256" = "$before_sha256" || { echo "::error::$bin changed while the strict assert '
+                 'read it (#6907)"; exit 1; }',
                  'echo "sha256=$asserted_sha256" >> "$GITHUB_OUTPUT"')
 ASSERT_ID = "assert"
 PACKAGE_ENV: Dict[str, "Spec"] = {"ASSERTED_SHA256": "${{ steps.assert.outputs.sha256 }}",
                                   "REPRO_SHA256": "${{ needs.reproducible.outputs.sha256 }}"}
 PACKAGE_DIST = 'dist/${{ matrix.artifact }}'
-PACKAGE_CHECK = ('test "$packaged_sha256" = "$ASSERTED_SHA256" || { echo "::error::' + PACKAGE_DIST
-                 + ' ($packaged_sha256) is not the binary the strict assert checked ($ASSERTED_SHA256)"; exit 1; }')
+# #6907: the package unit reads the asserted binary ONCE, through the bound
+# packer, refuses it unless its SHA-256 is the recorded one, and writes the
+# tarball and dist/<artifact> from those same bytes. The deb/rpm step then
+# opens both packages and requires their only file to carry that digest.
+PACKAGE_CHECK = (PACK_PY + ' --pack-binary "target/${{ matrix.target }}/release/${{ matrix.artifact }}" '
+                 '--expect-sha256 "$ASSERTED_SHA256" --copy-to "' + PACKAGE_DIST + '" '
+                 '--pack "dist/ai-memory-${{ matrix.target }}.tar.gz" --epoch "$SOURCE_DATE_EPOCH"')
+PAYLOAD_CHECK = PACK_PY + ' --verify-payload --expect-sha256 "$ASSERTED_SHA256" dist/*.deb dist/*.rpm'
 # #6274: the x86_64 Linux leg ships only the bytes the reproducible job built
 # twice (its `sha256` output); the other legs are not covered by the proof yet.
 REPRO_CHECK = ('case "${{ matrix.target }}" in x86_64-unknown-linux-gnu) test -n "$REPRO_SHA256"; '
@@ -340,11 +354,9 @@ REMAP_STATEMENTS = ('RUSTFLAGS="--remap-path-prefix=$PWD=/src --remap-path-prefi
 EPOCH_REF = "${{ steps.epoch.outputs.epoch }}"
 EPOCH_RUN = ("set -euo pipefail", 'epoch="$(/usr/bin/git log -1 --format=%ct)"', 'test -n "$epoch"',
              'echo "epoch=$epoch" >> "$GITHUB_OUTPUT"')
-PACK_SCRIPT = "scripts/release/reproducible_build.py"
 PACK_BIND = sane_bind((PACK_SCRIPT,))
 PACK_EPOCH_CHECK = 'test -n "$SOURCE_DATE_EPOCH"'
 PACK_CMD = SANE_ENV + " /usr/bin/python3 -I ../" + PACK_SCRIPT + " --pack "
-PACK_RELEASE = PACK_CMD + '"ai-memory-${{ matrix.target }}.tar.gz" --epoch "$SOURCE_DATE_EPOCH" "${{ matrix.artifact }}"'
 PACK_IOS = PACK_CMD + 'ai-memory-ios.xcframework.tar.gz --epoch "$SOURCE_DATE_EPOCH" AiMemory.xcframework'
 PACK_ANDROID = PACK_CMD + 'ai-memory-android.tar.gz --epoch "$SOURCE_DATE_EPOCH" aar'
 PACK_ENV: Dict[str, "Spec"] = {"PREFLIGHT_SHA": "${{ needs.preflight.outputs.sha }}", "SOURCE_DATE_EPOCH": EPOCH_REF}
@@ -360,20 +372,18 @@ DOCKER_EPOCH_ARG_INS = "ARG SOURCE_DATE_EPOCH"
 # The exact statements (after normalisation) of each unit that decides what ships.
 WF_BUILD = (("set -euo pipefail", BIND_INPUTS) + EPOCH_STATEMENTS + REMAP_STATEMENTS
             + (SANE_FEATURES, 'test -n "$FEATURES"', BUILD_CMD))
-WF_ASSERT = ("set -euo pipefail", BIND_INPUTS, ALLOWED_BIN, SANE_REQUIRE, 'test -n "$REQUIRE_FLAGS"',
-             ASSERT_WORKFLOW) + ASSERT_RECORD
+# #6907: the assert unit also runs the packer (the digest), so it binds it too.
+ASSERT_BIND = sane_bind(("scripts/release-features.sh", "scripts/assert-compiled-features.sh", PACK_SCRIPT))
+WF_ASSERT = ("set -euo pipefail", ASSERT_BIND, ALLOWED_BIN, SANE_REQUIRE, 'test -n "$REQUIRE_FLAGS"',
+             ASSERT_RECORD[0], ASSERT_WORKFLOW) + ASSERT_RECORD[1:]
 WF_PACKAGE = (
     "set -euo pipefail",
     PACK_BIND,
     PACK_EPOCH_CHECK,
-    "mkdir -p dist",
-    'cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "' + PACKAGE_DIST + '"',
-    'packaged_sha256="$(shasum -a 256 "' + PACKAGE_DIST + '" | cut -d\' \' -f1)"',
     'test -n "$ASSERTED_SHA256"',
-    PACKAGE_CHECK,
     REPRO_CHECK,
-    "cd dist",
-    PACK_RELEASE,
+    "mkdir -p dist",
+    PACKAGE_CHECK,
 )
 WF_SBOM = ("set -euo pipefail",) + EPOCH_STATEMENTS + (
     ALLOWED_FEATURES,
@@ -611,6 +621,10 @@ NFPM_STEP_RUN = (
     "ARCH=${{ matrix.nfpm_arch }} VERSION=$VERSION nfpm package -p rpm -f nfpm.yaml -t dist/",
     "",
     "ls -la dist/*.deb dist/*.rpm",
+    "# #6907 — nfpm read dist/ai-memory after the package step checked it: open",
+    "# both packages and require their only file to be the asserted binary.",
+    PACK_BIND,
+    PAYLOAD_CHECK,
 )
 RELEASE_STEPS: List[Spec] = [
     {"uses": CHECKOUT_USES, "with": {"ref": "${{ needs.preflight.outputs.sha }}"}},
@@ -620,8 +634,10 @@ RELEASE_STEPS: List[Spec] = [
     Unit("build"),
     Unit("assert"),
     Unit("package"),
-    {"name": "Build deb and rpm packages", "if": "matrix.nfpm_arch",
-     "env": dict(_TAG_ENV, SOURCE_DATE_EPOCH=EPOCH_REF), "run": Block(NFPM_STEP_RUN)},
+    {"name": "Build deb and rpm packages", "if": "matrix.nfpm_arch", "shell": SANE_SHELL,
+     "env": dict(_TAG_ENV, SOURCE_DATE_EPOCH=EPOCH_REF, ASSERTED_SHA256="${{ steps.assert.outputs.sha256 }}",
+                 PREFLIGHT_SHA="${{ needs.preflight.outputs.sha }}"),
+     "run": Block(NFPM_STEP_RUN)},
     {"name": "Checksum every release artifact", "shell": "bash", "run": Block((
         "set -euo pipefail",
         "cd dist",
@@ -3075,7 +3091,8 @@ EPOCH_YAML = ("      - name: Source date epoch (#3613)\n        id: epoch\n     
 EPOCH_ENV_LINE = "          SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}\n"
 PACK_BIND_LINE = IND + sane_bind(("scripts/release/reproducible_build.py",)) + "\n"
 PACKER = SANE_ENV + " /usr/bin/python3 -I ../scripts/release/reproducible_build.py --pack "
-REL_PACK = PACKER + '"ai-memory-${{ matrix.target }}.tar.gz" --epoch "$SOURCE_DATE_EPOCH" "${{ matrix.artifact }}"'
+# #6907: the release job packs the asserted bytes in one read (--pack-binary).
+REL_PACK = PACKAGE_CHECK
 IOS_PACK = PACKER + 'ai-memory-ios.xcframework.tar.gz --epoch "$SOURCE_DATE_EPOCH" AiMemory.xcframework'
 ANDROID_PACK = PACKER + 'ai-memory-android.tar.gz --epoch "$SOURCE_DATE_EPOCH" aar'
 DOCKER_EPOCH_ARG = "          build-args: SOURCE_DATE_EPOCH=${{ steps.epoch.outputs.epoch }}\n"
@@ -3178,7 +3195,7 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     # to the checked-out commit (an earlier step, an action or a restored cache
     # cannot feed them a rewritten file unseen)
     "4768 build step does not bind the declaration and asserter to HEAD": ("fail", [_rel(BUILD_HDR, _drop_nth_line(BIND_INPUTS, 1))]),
-    "4768 assert step does not bind the declaration and asserter to HEAD": ("fail", [_rel(BUILD_HDR, _drop_nth_line(BIND_INPUTS, 2))]),
+    "4768 assert step does not bind the declaration and asserter to HEAD": ("fail", [_rel(IND + ASSERT_BIND + "\n", "")]),
     "4768 bind made non-fatal": ("fail", [_rel(BUILD_HDR, _edit_all(BIND_LINE, IND + BIND_INPUTS + " || true\n"))]),
     "4768 bind covers the declaration only": ("fail", [_rel(
         BUILD_HDR, _edit_all(BIND_LINE, IND + "git diff --quiet HEAD -- scripts/release-features.sh\n"))]),
@@ -3296,7 +3313,8 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "N17 comment line inside a continuation hides the assert": ("fail", [_rel(
         REL_ASSERT, IND + "echo hi \\\n" + IND + "# x \\\n" + REL_ASSERT)]),
     "N18 step key written as a flow mapping": ("fail", [_rel(ASSERT_HDR, ASSERT_NAME + "        {shell: bash}\n")]),
-    "N19 run block with inconsistent indentation": ("fail", [_rel(BIND_LINE + BIN_LINE, BIND_LINE + "         " + ALLOWED_BIN)]),
+    "N19 run block with inconsistent indentation": ("fail", [_rel(IND + ASSERT_BIND + "\n" + BIN_LINE,
+                                                                  IND + ASSERT_BIND + "\n" + "         " + ALLOWED_BIN)]),
     "N20 duplicate step key": ("fail", _hdr_key(ASSERT_HDR, "shell: bash")),
     "N21 extra step key": ("fail", _hdr_key(ASSERT_HDR, "timeout-minutes: 5")),
     "N22 inline run value": ("fail", [_rel(ASSERT_RUN, ASSERT_HDR + BIND_ENV_LINES + "        run: " + ASSERT_WORKFLOW + "\n" + "          true\n")]),
@@ -3645,9 +3663,10 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "valid: CF5 LABEL before the binary COPY": ("pass", [_final("LABEL org.example.y=2\n")]),
     # --- #6282 / #3613: every artifact job reads one epoch (a pinned step output) and packs deterministically
     "6282 release job epoch step removed": ("fail", [_rel(REL_PACK, _in_job("release", _once(EPOCH_YAML, "")))]),
-    "6282 package step tars with tar czf": ("fail", [_rel(REL_PACK, 'tar czf "ai-memory-${{ matrix.target }}.tar.gz" '
-                                                     '"${{ matrix.artifact }}"')]),
-    "6282 package step packs another file": ("fail", [_rel(REL_PACK, REL_PACK.replace('"${{ matrix.artifact }}"', "."))]),
+    "6282 package step tars with tar czf": ("fail", [_rel(REL_PACK, 'tar czf "dist/ai-memory-${{ matrix.target }}.tar.gz" '
+                                                     '-C dist "${{ matrix.artifact }}"')]),
+    "6282 package step packs another file": ("fail", [_rel(REL_PACK, REL_PACK.replace(
+        '"target/${{ matrix.target }}/release/${{ matrix.artifact }}"', '"Cargo.toml"'))]),
     "6282 package step epoch env removed": ("fail", [_rel(REL_PACK, _in_job("release", lambda s: s.replace(
         "          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}\n" + EPOCH_ENV_LINE,
         "          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}\n", 1)))]),
@@ -3923,16 +3942,35 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "valid: a LABEL after the runtime assert": ("pass", [_docker(D_ENV, "LABEL org.example.x=1\n" + D_ENV)]),
     "4752 assert step has no id": ("fail", [_rel("        id: assert\n", "")]),
     "4752 assert step id changed": ("fail", [_rel("        id: assert\n", "        id: check\n")]),
-    "4752 assert output not recorded": ("fail", [_rel(IND + ASSERT_RECORD[1] + "\n", "")]),
+    "4752 assert output not recorded": ("fail", [_rel(IND + ASSERT_RECORD[-1] + "\n", "")]),
     "4752 assert records the hash of another file": ("fail", [_rel(
-        IND + ASSERT_RECORD[0], IND + ASSERT_RECORD[0].replace('"$bin"', "/opt/known-good/ai-memory"))]),
+        IND + ASSERT_RECORD[1], IND + ASSERT_RECORD[1].replace('"$bin"', "/opt/known-good/ai-memory"))]),
+    "6907 assert record hashes with PATH shasum and cut": ("fail", [_rel(
+        IND + ASSERT_RECORD[1], IND + 'asserted_sha256="$(shasum -a 256 "$bin" | cut -d\' \' -f1)"')]),
+    "6907 assert record drops the before/after compare": ("fail", [_rel(IND + ASSERT_RECORD[2] + "\n", "")]),
+    "6907 assert record takes the digest after the assert only": ("fail", [_rel(IND + ASSERT_RECORD[0] + "\n", "")]),
+    "6907 assert step does not bind the packer": ("fail", [_rel(IND + ASSERT_BIND, IND + BIND_INPUTS)]),
+    "6907 package unit re-reads the binary with cp": ("fail", [_rel(IND + PACKAGE_CHECK + "\n", IND + PACKAGE_CHECK + "\n"
+        + IND + 'cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "' + PACKAGE_DIST + '"\n')]),
+    "6907 deb/rpm step drops the payload check": ("fail", [_rel(IND + PAYLOAD_CHECK + "\n", "")]),
+    "6907 deb/rpm payload check made non-fatal": ("fail", [_rel(IND + PAYLOAD_CHECK, IND + PAYLOAD_CHECK + " || true")]),
+    "6907 deb/rpm payload check expects another digest": ("fail", [_rel(
+        IND + PAYLOAD_CHECK, IND + PAYLOAD_CHECK.replace('"$ASSERTED_SHA256"', '"$REPRO_SHA256"'))]),
+    "6907 deb/rpm step shell is plain bash": ("fail", [_rel(
+        "        if: matrix.nfpm_arch\n        shell: " + SANE_SHELL + "\n", "        if: matrix.nfpm_arch\n")]),
+    "6907 deb/rpm step does not bind the packer": ("fail", [_rel(
+        IND + PACK_BIND + "\n" + IND + PAYLOAD_CHECK, IND + PAYLOAD_CHECK)]),
     "4752 package step env dropped": ("fail", [_rel(PKG_ENV, "")]),
     "4752 package step env points at another step": ("fail", [_rel(PKG_ENV, PKG_ENV.replace("steps.assert.", "steps.build."))]),
     "4752 package hash check removed": ("fail", [_rel(IND + PACKAGE_CHECK + "\n", "")]),
-    "4752 package hash check made non-fatal": ("fail", [_rel(IND + PACKAGE_CHECK, IND + PACKAGE_CHECK.replace("exit 1", "true"))]),
+    "4752 package hash check made non-fatal": ("fail", [_rel(IND + PACKAGE_CHECK, IND + PACKAGE_CHECK + " || true")]),
+    "4752 package expects another digest": ("fail", [_rel(
+        IND + PACKAGE_CHECK, IND + PACKAGE_CHECK.replace('"$ASSERTED_SHA256"', '"$REPRO_SHA256"'))]),
     "4752 package copies another binary": ("fail", [_rel(
-        IND + WF_PACKAGE[2], IND + 'cp /opt/known-good/ai-memory "' + PACKAGE_DIST + '"')]),
-    "4752 package tars another file": ("fail", [_rel(IND + WF_PACKAGE[-1], IND + WF_PACKAGE[-1].replace('"${{ matrix.artifact }}"', "*"))]),
+        IND + PACKAGE_CHECK, IND + PACKAGE_CHECK.replace('"target/${{ matrix.target }}/release/${{ matrix.artifact }}"',
+                                                         "/opt/known-good/ai-memory"))]),
+    "4752 package tars another file": ("fail", [_rel(IND + PACKAGE_CHECK, IND + PACKAGE_CHECK.replace(
+        '--pack "dist/ai-memory-${{ matrix.target }}.tar.gz"', '--pack "dist/other.tar.gz"'))]),
     "4752 upload path widened": ("fail", [_rel("          path: dist/ai-memory*\n", "          path: dist/*\n")]),
     "6502 bare binary skipped, not removed, so the upload globs publish it": ("fail", [_rel(
         'ai-memory)         rm -f -- "$f"; echo "::notice::removed the non-arch-qualified \'$f\' from dist (collides across matrix legs; the tarball and deb/rpm carry it)"; continue ;;',
@@ -4153,7 +4191,7 @@ def shell_argv(spec: str) -> List[str]:
     return [w for w in spec.split() if w != "{0}"] + ["-c"]
 
 
-BOUND_FILES = (DECL, ASSERTER, SHAPE_PROOF_SCRIPT)
+BOUND_FILES = (DECL, ASSERTER, SHAPE_PROOF_SCRIPT, PACK_SCRIPT)
 TAMPER_FORMS = ("plain rewrite", "assume-unchanged", "skip-worktree", "in-job commit", "git shim on PATH",
                 "startup file in the job env", "exported git function", "repository redirection")
 # #6908: forms that rewrite the git object store the job can write, so the
@@ -4262,8 +4300,8 @@ def bound_runtime(root: Path, base: Path, payload: bytes, build: str, assert_bod
     def fresh(name: str) -> Tuple[Path, str]:
         repo = base / name
         shutil.rmtree(repo, ignore_errors=True)
-        (repo / "scripts").mkdir(parents=True)
         for rel in BOUND_FILES:
+            (repo / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(root / rel, repo / rel)
         for cmd in (["init", "-q"], ["add", *BOUND_FILES], ["commit", "-q", "-m", "pin the inputs"]):
             subprocess.run(git + cmd, cwd=repo, capture_output=True, check=True)
@@ -4295,8 +4333,8 @@ def bound_runtime(root: Path, base: Path, payload: bytes, build: str, assert_bod
             return dict(env, **{"BASH_FUNC_git%%": "() { return 0; }"})
         elif form == "repository redirection":
             decoy = repo / "decoy"
-            (decoy / "scripts").mkdir(parents=True)
             for r in BOUND_FILES:
+                (decoy / r).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(repo / r, decoy / r)
             for cmd in (["init", "-q"], ["add", *BOUND_FILES], ["commit", "-q", "-m", "decoy"]):
                 subprocess.run(git + cmd, cwd=decoy, capture_output=True, check=True)
@@ -4304,8 +4342,9 @@ def bound_runtime(root: Path, base: Path, payload: bytes, build: str, assert_bod
         return env
 
     shape_bind = "set -euo pipefail\n" + SHAPE_PROOF_BIND  # #6278
-    for label, body, rels in (("build unit", build, (DECL, ASSERTER)), ("assert unit", assert_body, (DECL, ASSERTER)),
-                              ("release-shape proof bind", shape_bind, BOUND_FILES)):
+    for label, body, rels in (("build unit", build, (DECL, ASSERTER)),
+                              ("assert unit", assert_body, (DECL, ASSERTER, PACK_SCRIPT)),
+                              ("release-shape proof bind", shape_bind, (SHAPE_PROOF_SCRIPT, DECL, ASSERTER))):
         repo, sha = fresh("control")
         env = dict(os.environ, GITHUB_OUTPUT=str(repo / "output.txt"), PREFLIGHT_SHA=sha)
         if run(repo, body, env) != 0:
