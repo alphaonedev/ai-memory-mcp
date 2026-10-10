@@ -477,7 +477,9 @@ async fn webhook_dlq_and_log_carry_no_path_token_and_no_receiver_text_3684_3697_
             } else if row.subscription_id == sub_ssrf {
                 assert_eq!(row.last_error, dlq_reason::SSRF_REJECTED, "#3697");
             } else if row.subscription_id == sub_dns {
-                assert_eq!(row.last_error, dlq_reason::DNS_SSRF_REJECTED, "#3697");
+                // #4165 — `.invalid` never resolves: the RETRYABLE resolver
+                // class, not the terminal address-class refusal.
+                assert_eq!(row.last_error, dlq_reason::DNS_RESOLUTION_FAILED, "#3697");
             } else {
                 assert_eq!(row.subscription_id, sub_unreachable);
                 assert!(
