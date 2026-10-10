@@ -4978,5 +4978,39 @@ class TokenRedactionAlphabet6390(unittest.TestCase):
             with self.subTest(prefix=prefix):
                 self.assertEqual([], _leaked_windows(body, self.relayed(prefix + body)))
 
+
+
+class ApprovalValidatorBounds6393(unittest.TestCase):
+    """Each validator accepts its maximum and refuses maximum + 1; the sha is exactly 40 or 64 hex."""
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+
+    def check(self, regex: "re.Pattern[str]", accepted: List[str], refused: List[str]) -> None:
+        for value in accepted:
+            with self.subTest(accepted=value):
+                self.assertTrue(regex.fullmatch(value))
+        for value in refused:
+            with self.subTest(refused=value):
+                self.assertIsNone(regex.fullmatch(value))
+
+    def test_6393_login_is_at_most_39_characters(self) -> None:
+        self.check(self.mod.LOGIN_RE, ["a" * 39, "a" * 39 + "[bot]"], ["a" * 40, "a" * 40 + "[bot]", ""])
+
+    def test_6393_association_is_at_most_32_characters(self) -> None:
+        self.check(self.mod.ASSOC_RE, ["A" * 32, "FIRST_TIME_CONTRIBUTOR"], ["A" * 33, ""])
+
+    def test_6393_repository_owner_is_at_most_39_and_name_at_most_100(self) -> None:
+        self.check(self.mod.REPO_RE, ["o" * 39 + "/r", "o/" + "r" * 100],
+                   ["o" * 40 + "/r", "o/" + "r" * 101, "/r", "o/"])
+
+    def test_6393_sha_is_exactly_40_or_64_hex(self) -> None:
+        self.check(self.mod.SHA_RE, ["c" * 40, "c" * 64], ["c" * n for n in (39, 41, 63, 65)])
+
+    def test_6393_an_over_long_login_fails_the_gate_closed(self) -> None:
+        rc, out = _gate_text(self.mod, _pr_event_with("a" * 40), [_review(SHA_A)])
+        self.assertEqual(1, rc, out)
+        self.assertIn("invalid author login", out)
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
