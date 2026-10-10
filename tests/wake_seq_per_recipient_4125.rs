@@ -49,13 +49,18 @@ async fn watermark_for(rx: &mut Receiver<InboxEvent>, recipient: &str) -> u64 {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(!remaining.is_zero(), "no wake for {recipient}");
+        assert!(
+            !remaining.is_zero(),
+            "no wake for the watched recipient before the deadline"
+        );
         match tokio::time::timeout(remaining, rx.recv()).await {
             Ok(Ok(ev)) if ev.recipient_agent_id() == recipient => {
                 return wake_meta_for(&ev).seq_high_watermark;
             }
             Ok(Ok(_) | Err(RecvError::Lagged(_))) => {}
-            Ok(Err(RecvError::Closed)) | Err(_) => panic!("bus closed waiting for {recipient}"),
+            Ok(Err(RecvError::Closed)) | Err(_) => {
+                panic!("bus closed waiting for the watched recipient")
+            }
         }
     }
 }
