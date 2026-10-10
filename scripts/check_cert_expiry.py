@@ -109,6 +109,7 @@ import contextlib
 import io
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -1445,6 +1446,45 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                         t.fail(f"(shim-probe-half): {stub_label} refused for the wrong reason: {exc}")
                 else:
                     t.fail(f"(shim-probe-half): a git that is {stub_label} was treated as the shim")
+            finally:
+                shutil.rmtree(stub_dir, ignore_errors=True)
+    # #6567 / #6562: the probe answer is a per-run nonce compared exactly, on stdout
+    # only. Stub gits that print a loosened form of the nonce (affixed, split by an
+    # invalid byte, padded with Unicode whitespace, on stderr, or a different nonce)
+    # must each be refused, and a stub that prints exactly the nonce must pass.
+    if os.pathsep not in str(tmp):
+        nonce = secrets.token_hex(16)
+        other = secrets.token_hex(16)
+        half = len(nonce) // 2
+        exact_cases = (
+            ("prefixed", f"sys.stdout.write('x{nonce}\\n')", False),
+            ("suffixed", f"sys.stdout.write('{nonce}x\\n')", False),
+            ("split-by-ff", f"sys.stdout.buffer.write(b'{nonce[:half]}' + bytes([0xff]) + "
+                            f"b'{nonce[half:]}\\n')", False),
+            ("u2028-padded", f"sys.stdout.buffer.write('\\u2028{nonce}\\u2028\\n'.encode())", False),
+            ("stderr-only", f"sys.stderr.write('{nonce}\\n')", False),
+            ("other-nonce", f"sys.stdout.write('{other}\\n')", False),
+            ("blank-line-after", f"sys.stdout.write('{nonce}\\n\\n')", False),
+            ("exact", f"sys.stdout.write('{nonce}\\n')", True))
+        for stub_label, body, ok in exact_cases:
+            stub_dir = Path(tempfile.mkdtemp(prefix="stubgit.", dir=str(tmp)))
+            try:
+                stub = stub_dir / "git"
+                stub.write_text(f"#!{sys.executable}\nimport sys\n{body}\n", encoding="utf-8")
+                stub.chmod(0o755)
+                try:
+                    _require_shim_reachable(str(stub_dir), marker=nonce)
+                except GateError as exc:
+                    if ok:
+                        t.fail(f"(shim-probe-exact): the exact nonce was refused: {exc}")
+                    elif "is not the git on PATH" not in str(exc):
+                        t.fail(f"(shim-probe-exact): {stub_label} refused for the wrong reason: {exc}")
+                except Exception as exc:  # noqa: BLE001 - an escaped error is the failure
+                    t.fail(f"(shim-probe-exact): {stub_label} raised {exc!r}")
+                else:
+                    if not ok:
+                        t.fail(f"(shim-probe-exact): a git whose answer is {stub_label} was "
+                               "treated as the shim")
             finally:
                 shutil.rmtree(stub_dir, ignore_errors=True)
     # #6381: the shim PATH entry is process-global; every shim cell above, on its
