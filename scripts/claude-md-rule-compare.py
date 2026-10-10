@@ -158,7 +158,10 @@ ALWAYS_MASK_NAME = re.compile(r"(?i)passw(?:or)?d|passphrase")
 # #6163 round 3 (review G2): the user name is optional (`redis://:<password>@host`). Round 4 (security F4): the
 # password runs to the LAST `@` of the authority, so a password holding `@` is masked whole; a user-only userinfo
 # of URL_USER_MIN or more characters (a token sent as the user name) is masked too, a short one (`git@`) is shown.
-URL_USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]*:([^/?#\s]+)@")
+# Round 5 (#6667, #6615): a hand-written DSN may hold a raw `/`, `#` or `?` in the password, so the password is any
+# run up to the last `@` of the whitespace-delimited token that is followed by a host. A URL whose path holds an `@`
+# after a port (`https://host:8080/a@b.c`) reads as userinfo and is over-masked, which is the safe side.
+URL_USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]*:([^\s@]+(?:@[^\s@]*)*)@(?=[A-Za-z0-9.-]+(?:[:/?#]|\s|$))")
 URL_USER_MIN = 20
 URL_USER_ONLY = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://([^/?#\s:@]{" + str(URL_USER_MIN) + r",})@")
 BEARER_VALUE = re.compile(r"(?i)\b(?:bearer|basic)\s+([A-Za-z0-9._~+/-]{8,}=*)")
