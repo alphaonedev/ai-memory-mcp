@@ -436,6 +436,28 @@ RELEASE_FRAGMENTS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
     ("3613.added.md", ("Not yet proven", "aarch64-unknown-linux-gnu", "#6407", "#6408", "#6409",
                        "does not currently affect the binary")),
 )
+# #6497: the nfpm configuration the release deb/rpm are built from, pinned whole
+# (payload source and destination, mode, no maintainer scripts). A change is
+# refused until this constant changes in the same commit.
+NFPM_YAML = (
+    'name: ai-memory\n'
+    'arch: "${ARCH}"\n'
+    'platform: linux\n'
+    'version: "${VERSION}"\n'
+    'maintainer: "AlphaOne LLC <alphaonedev@users.noreply.github.com>"\n'
+    'description: "AI-agnostic persistent memory system — MCP server, HTTP API, and CLI"\n'
+    'vendor: "AlphaOne LLC"\n'
+    'homepage: "https://alphaonedev.github.io/ai-memory-mcp/"\n'
+    'license: Apache-2.0\n'
+    'section: utils\n'
+    'priority: optional\n'
+    '\n'
+    'contents:\n'
+    '  - src: dist/ai-memory\n'
+    '    dst: /usr/bin/ai-memory\n'
+    '    file_info:\n'
+    '      mode: 0755\n'
+)
 # #6498 #6499 #6500 #6503: release claims that must stay true of the tip. Each row is
 # (file, scope regex or None = the whole file, phrases that must appear, phrases that must not, issue).
 DOC_CLAIMS: Tuple[Tuple[str, Optional[str], Tuple[str, ...], Tuple[str, ...], str], ...] = (
@@ -2414,6 +2436,10 @@ def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], s
     check_workflow_sweep(root, rep)
     check_release_fragments(root, rep)
     check_doc_claims(root, rep)
+    nfpm = load(root / "nfpm.yaml", "nfpm.yaml", rep, False)
+    if nfpm is not None and nfpm != NFPM_YAML:
+        rep.bad("nfpm.yaml differs from NFPM_YAML (#6497: it sets the deb/rpm payload, modes and maintainer scripts); "
+                "if this change is intended, update NFPM_YAML in " + GUARD_PATH + " in the same commit")
     return rep.errors, declared
 
 
@@ -2430,11 +2456,12 @@ INSTALL = "docs/INSTALL.md"
 DECL = "scripts/release-features.sh"
 ASSERTER = "scripts/assert-compiled-features.sh"
 CARGO = "Cargo.toml"
+NFPM = "nfpm.yaml"
 LINUX_X86_LEG = "          - target: x86_64-unknown-linux-gnu\n            os: ubuntu-latest\n"
 LINUX_ARM_LEG = "          - target: aarch64-unknown-linux-gnu\n            os: ubuntu-24.04-arm\n"
 BREW_LOOP = "          for TARGET in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu "
 PASTE_DEP = 'paste = { path = "vendor/paste" }'
-INPUT_FILES = (REL, SHAPE, DOCKER, INSTALL, DECL, ASSERTER, SHAPE_PROOF_SCRIPT, CARGO)
+INPUT_FILES = (REL, SHAPE, DOCKER, INSTALL, DECL, ASSERTER, SHAPE_PROOF_SCRIPT, CARGO, NFPM)
 
 
 def mutate_file(path: Path, old: str, new: Union[str, None, Transform], every: bool = False) -> None:
