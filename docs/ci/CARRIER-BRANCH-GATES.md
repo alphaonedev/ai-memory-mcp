@@ -192,7 +192,9 @@ python3 -I scripts/check_carrier_ruleset_live.py --require-full-view
   `.github/workflows/c8-precheck.yml` at the tip and fails unless both #6143
   jobs are defined there and the workflow triggers on `pull_request` for that
   carrier's base (`on.pull_request.branches` covers `chain/**` or
-  `rehearsal/**`); a tip that defines the jobs but does not trigger would never
+  `rehearsal/**`, with no `paths`/`paths-ignore` filter and no `types` list that
+  drops `opened`, `synchronize` or `reopened`, and no flow-mapping form); a tip
+  that defines the jobs but does not trigger for every pull request would never
   report the required context. Any carrier it cannot read is RED. It checks the
   jobs, the trigger and, in the `applied` state, the release tip (step 3
   precondition); it does not compare the tip's payload or declaration files.
