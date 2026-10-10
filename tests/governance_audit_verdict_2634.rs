@@ -169,7 +169,7 @@ fn set_standard_refused_bind_records_refuse_not_allow() {
             "agent_id": "caller-alice",
         }),
     );
-    assert!(res.is_err(), "non-owner bind must be refused; got {res:?}");
+    assert!(res.is_err(), "non-owner bind must be refused; got Ok");
 
     forensic::shutdown();
     let decisions = decisions_for(
@@ -214,7 +214,7 @@ fn set_standard_allowed_bind_records_allow() {
             "agent_id": "caller-alice",
         }),
     );
-    assert!(res.is_ok(), "owner bind must be allowed; got {res:?}");
+    assert!(res.is_ok(), "owner bind must be allowed; got Err");
 
     forensic::shutdown();
     let decisions = decisions_for(
@@ -264,7 +264,7 @@ fn clear_standard_refused_now_records_refuse() {
         &conn,
         &json!({ "namespace": "ns-2634-clear-refuse", "agent_id": "caller-alice" }),
     );
-    assert!(res.is_err(), "non-owner clear must be refused; got {res:?}");
+    assert!(res.is_err(), "non-owner clear must be refused; got Ok");
 
     forensic::shutdown();
     let decisions = decisions_for(
@@ -312,7 +312,7 @@ fn clear_standard_allowed_records_allow() {
         &conn,
         &json!({ "namespace": "ns-2634-clear-allow", "agent_id": "owner-bob" }),
     );
-    assert!(res.is_ok(), "owner clear must be allowed; got {res:?}");
+    assert!(res.is_ok(), "owner clear must be allowed; got Err");
 
     forensic::shutdown();
     let decisions = decisions_for(
