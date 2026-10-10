@@ -400,7 +400,7 @@ fn architecture_row_58_scopes_hf_home_to_the_embedder_6399() {
         "#6399: row 58 must state the cross-encoder cache root:\n{row}"
     );
     assert!(
-        !row.contains("so `HF_HOME` (cache root) and `HF_ENDPOINT` (mirror) are honoured"),
+        !row.contains("are honoured. Source:"),
         "#6399: HF_HOME is honoured by the MiniLM embedder only:\n{row}"
     );
 }
