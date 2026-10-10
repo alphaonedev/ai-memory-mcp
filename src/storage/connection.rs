@@ -2149,4 +2149,26 @@ mod tests {
         let tmp = tempfile::NamedTempFile::new().expect("tempfile");
         open(tmp.path()).expect("store-open after reset must succeed on non-sqlcipher");
     }
+
+    /// #6582 — `check_trigger_rejects_bad_tier_insert` opens a store, so it
+    /// must run inside the passphrase window. While another test holds the
+    /// window with a live seed, it must BLOCK on the window (not open and trip
+    /// the sqlcipher refusal), then complete once the window is released.
+    #[cfg(not(feature = "sqlcipher"))]
+    #[test]
+    fn issue_6582_check_trigger_test_waits_for_passphrase_window() {
+        let iso = crate::test_support::PassphraseEnvIsolation::enter();
+        let pass = DbPassphraseGuard::enter(&iso);
+        set_db_passphrase("issue-6582-probe".into()).expect("seed");
+        let reader = std::thread::spawn(check_trigger_rejects_bad_tier_insert);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let ran_inside_window = reader.is_finished();
+        drop(pass);
+        drop(iso);
+        assert!(
+            !ran_inside_window,
+            "the store-opening test ran while the passphrase seed was live"
+        );
+        reader.join().expect("reader completes once the window is released");
+    }
 }
