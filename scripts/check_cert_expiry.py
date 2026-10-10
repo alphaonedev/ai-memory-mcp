@@ -111,7 +111,8 @@ CONTEXT CHECK (#6560): a guarded line can also be disabled while it stays
 byte-identical (nothing on it is edited), so each identifier-bearing line is
 scanned with a Rust tokenizer (line, nested block and doc comments, strings,
 raw strings, byte and C strings, chars, lifetimes; whitespace (the Rust
-Pattern_White_Space set, U+200E and U+200F included, #6838), a newline or a
+Pattern_White_Space set, U+200E and U+200F included, #6838; a leading BOM and a
+first line rustc strips as a shebang in any file, #6839), a newline or a
 comment between `#`, `!` and `[` of an attribute; an end-of-file string, raw string or
 block comment is a named ERROR) and the constructs that enclose it are
 recorded: an attribute on it or on any enclosing item or `mod` (cfg, cfg_attr,
@@ -579,10 +580,54 @@ def _end_block_comment(path, text, pos, line):
     return pos
 
 
+def _shebang_end(path, text, start):
+    """End of the first line when rustc strips it as a shebang (#6839), else None.
+
+    rustc (lexer `strip_shebang`, after the BOM is removed) drops the first
+    line of EVERY source file when it starts with `#!` and the next token,
+    skipping whitespace and non-doc comments, is not `[`."""
+    if not text.startswith("#!", start):
+        return None
+    pos, n = start + 2, len(text)
+    while pos < n:
+        m = _TOKEN_RE.match(text, pos)
+        kind = m.lastgroup
+        if kind == "ws":
+            pos = m.end()
+            continue
+        if kind == "line":
+            if text.startswith(("///", "//!"), pos) and not text.startswith("////", pos):
+                break  # a doc comment is a token, and it is not `[`
+            pos = m.end()
+            continue
+        if kind == "block":
+            if text.startswith("/*!", pos) or (text.startswith("/**", pos)
+                                               and not text.startswith(("/**/", "/***"), pos)):
+                break
+            try:
+                pos = _end_block_comment(path, text, m.end(), 1)
+            except GateError:
+                break  # rustc: an unterminated comment there still strips the line
+            continue
+        if m.group(0) == "[":
+            return None
+        break
+    nl = text.find("\n", start)
+    return n if nl < 0 else nl
+
+
 def _rust_tokens(path, text, line_of):
     """(kind, start, end, text) for every non-blank token of `text`; an open
-    string, raw string or block comment at end of file is a GateError (#6705)."""
+    string, raw string or block comment at end of file is a GateError (#6705).
+    A leading BOM is skipped and a rustc-stripped shebang line is one "line"
+    token (#6839), so neither can hide what rustc compiles after it."""
     toks, i, n = [], 0, len(text)
+    if text.startswith("\ufeff"):
+        i = 1
+    she = _shebang_end(path, text, i)
+    if she is not None:
+        toks.append(("line", i, she, text[i:she]))
+        i = she
     while i < n:
         m = _TOKEN_RE.match(text, i)
         kind = m.lastgroup if m.lastgroup != "hashes" else "raw"
