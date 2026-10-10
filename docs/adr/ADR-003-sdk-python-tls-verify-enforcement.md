@@ -118,10 +118,19 @@ Decisions below the vote threshold (recorded as `decision:` lines in the commits
   suites and are refused; the error message gives the remedy string.
 - #6377: `verify=<CA path>` is read once, at construction. For a directory, only the hashed entries OpenSSL's own
   `capath` lookup reads (`<hash>.<n>`, `<hash>.r<n>`) are loaded. A group- or world-writable directory, file, symlink
-  target or target directory is refused (POSIX). Every symlink met while resolving the path or an entry is held to
-  the same rule as a CA file's directory: refused when the directory holding the link is group- or world-writable,
-  unless it is sticky and the link belongs to this user or root (#6559). An empty directory gives a context with no
-  trust anchor, which fails every handshake (#6269).
+  target or target directory is refused (POSIX). An empty directory gives a context with no trust anchor, which fails
+  every handshake (#6269).
+- #6559 / #6653 / #6654 (3-agent vote (6def5ab6); Q1 3-0, Q2 2-1, Q3 2-1): every directory the path passes through,
+  an ancestor of the CA path, of a symlink met on the way, or of a link's target, is held to the rule for a CA file's
+  directory. It must be owned by this user or root (OpenSSH StrictModes), and must not be group- or world-writable
+  unless it is sticky and the entry in it belongs to this user or root (a `/tmp`-style ancestor with a private
+  subdirectory is accepted). Whoever can change such a directory can swap a subdirectory, re-point a link or replace
+  the file, and an ABA swap of an ancestor during the load is invisible to the inode re-check, so the refusal comes
+  before anything is read. The file is still loaded by path and re-checked to be the same inode afterwards (Q3).
+  Intended break: a CA path under a group-writable directory is refused, e.g. Homebrew's `/opt/homebrew/etc`
+  (`drwxrwxr-x` with group `admin`) and Intel-mac `/usr/local` trees; the error names the directory, its owner uid
+  and mode, and the fix (`chmod go-w <dir>`, or `chown` for a directory owned by another user), or copy the bundle to
+  a private directory. No parameter turns the check off.
 
 Residuals (accepted, each with its reason):
 - The validity-date check after the handshake reads the leaf only, because `getpeercert()` returns no chain.
