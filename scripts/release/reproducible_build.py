@@ -146,7 +146,8 @@ def build_once(workspace: Path, target: str, features: str, epoch: str, cargo: s
 
     #6291: the build sees an allowlisted environment only, its own target
     directory and no compiler wrapper (an empty RUSTC_WRAPPER also overrides a
-    ``build.rustc-wrapper`` from a cargo config file)."""
+    ``build.rustc-wrapper`` from a cargo config file; #6955 pins both overrides
+    with a committed ``.cargo/config.toml`` wrapper in the self-test)."""
     workspace = workspace.resolve()
     wrapped = [k for k in WRAPPER_VARS if os.environ.get(k)]
     if wrapped:
@@ -1281,12 +1282,28 @@ for flag in os.environ.get("RUSTFLAGS", "").split():
         src, dst = flag[len("--remap-path-prefix="):].split("=", 1)
         if cwd.startswith(src):
             cwd = dst + cwd[len(src):]
+# #6955: like cargo, a [build] rustc-wrapper / rustc-workspace-wrapper in the
+# workspace .cargo/config.toml applies unless the environment variable is
+# present (an empty value means no wrapper); the effective wrapper is recorded.
+config = {}
+section = ""
+cfg = pathlib.Path(".cargo") / "config.toml"
+for line in (cfg.read_text().splitlines() if cfg.is_file() else []):
+    line = line.strip()
+    if line.startswith("["):
+        section = line.strip("[]").strip()
+    elif section == "build" and "=" in line:
+        key, val = line.split("=", 1)
+        config[key.strip()] = val.strip().strip('"')
+wrap = os.environ["RUSTC_WRAPPER"] if "RUSTC_WRAPPER" in os.environ else config.get("rustc-wrapper", "")
+wswrap = (os.environ["RUSTC_WORKSPACE_WRAPPER"] if "RUSTC_WORKSPACE_WRAPPER" in os.environ
+          else config.get("rustc-workspace-wrapper", ""))
 # Like cargo: CARGO_TARGET_DIR (when set) decides where the output lands, and a
 # caller variable that reaches the build is visible in what it produces.
 out = pathlib.Path(os.environ.get("CARGO_TARGET_DIR") or "target") / target / "release" / "ai-memory"
 out.parent.mkdir(parents=True, exist_ok=True)
-out.write_text("epoch=%s features=%s target=%s cwd=%s leak=%s\\n" % (
-    os.environ.get("SOURCE_DATE_EPOCH"), features, target, cwd, os.environ.get("REPRO_SELFTEST_LEAK")))
+out.write_text("epoch=%s features=%s target=%s cwd=%s leak=%s wrap=%s wswrap=%s\\n" % (
+    os.environ.get("SOURCE_DATE_EPOCH"), features, target, cwd, os.environ.get("REPRO_SELFTEST_LEAK"), wrap, wswrap))
 '''
 
 
@@ -1379,7 +1396,7 @@ def _self_test(root: Path) -> int:
             if got != want:
                 failures.append(f"{name}: exit {got}, wanted {want}")
             elif check is not None and not check():
-                failures.append(f"{name}: the build output shows the caller environment reached it")
+                failures.append(f"{name}: the build output shows the caller environment or a wrapper reached it")
 
         def b_at_older_commit() -> None:
             g(ws_a, "worktree", "add", "-q", "--detach", str(ws_b), "HEAD")
@@ -1398,6 +1415,20 @@ def _self_test(root: Path) -> int:
         def nothing() -> None:
             pass
 
+        def config_wrapper(key: str):
+            def prepare() -> None:
+                (ws_a / ".cargo").mkdir()
+                (ws_a / ".cargo" / "config.toml").write_text(f'[build]\n{key} = "/usr/bin/true"\n',
+                                                             encoding="utf-8")
+                g(ws_a, "add", ".cargo/config.toml")
+                g(ws_a, "commit", "-q", "-m", "wrapper")
+            return prepare
+
+        def no_wrapper_ran() -> bool:
+            outs = [ws / "target" / "x86_64-unknown-linux-gnu" / "release" / "ai-memory" for ws in (ws_a, ws_b)]
+            return all(o.is_file() and o.read_text(encoding="utf-8").rstrip("\n").endswith(" wrap= wswrap=")
+                       for o in outs)
+
         def a_output_clean() -> bool:
             built = ws_a / "target" / "x86_64-unknown-linux-gnu" / "release" / "ai-memory"
             return built.is_file() and "leak=None" in built.read_text(encoding="utf-8")
@@ -1409,6 +1440,12 @@ def _self_test(root: Path) -> int:
                      {"RUSTC_WRAPPER": "/usr/bin/true"})
         run_prepared("6291 RUSTC_WORKSPACE_WRAPPER in the caller environment is refused", 2, nothing,
                      {"RUSTC_WORKSPACE_WRAPPER": "/usr/bin/true"})
+        # #6955: an empty RUSTC_WRAPPER / RUSTC_WORKSPACE_WRAPPER in the build
+        # environment overrides a wrapper from the workspace cargo config.
+        run_prepared("6955 a build.rustc-wrapper in .cargo/config.toml does not wrap the builds", 0,
+                     config_wrapper("rustc-wrapper"), check=no_wrapper_ran)
+        run_prepared("6955 a build.rustc-workspace-wrapper in .cargo/config.toml does not wrap the builds", 0,
+                     config_wrapper("rustc-workspace-wrapper"), check=no_wrapper_ran)
         run_prepared("6291 a caller CARGO_TARGET_DIR does not redirect the builds", 0, nothing,
                      {"CARGO_TARGET_DIR": str(tmp / "shared-target")})
         run_prepared("6291 a caller variable outside the allowlist does not reach the build", 0, nothing,
