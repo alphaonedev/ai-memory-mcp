@@ -1523,8 +1523,10 @@ attribute, `if false` / `if (false)` / `if !!false` / `if cfg!(..)` /
 matches a literal scrutinee, the input of a macro invocation such as
 `stringify!` or a local `macro_rules!` macro, an unclosed block comment or
 string above the line, an earlier unconditional exit (return, break,
-continue, `let _ = return`, panic-family macros under any path, any `exit(..)`
-or `abort(..)`, `assert!(false)`, a bare, `unsafe` or `if true` block that
+continue, `let _ = return`, panic-family macros under any path, any `exit(..)`,
+`abort(..)`, `panic_any(..)`, `resume_unwind(..)` or `unreachable_unchecked(..)`
+([**#6843**](https://github.com/alphaonedev/ai-memory-mcp/issues/6843)),
+`assert!(false)`, a bare, `unsafe` or `if true` block that
 exits, a loop with no break), a `macro_rules!` body, a `mod NAME;` moved into
 an inline mod, or a module file no `mod` declaration reaches goes RED when the
 change introduces it, and a clean dead copy of the line does not mask a

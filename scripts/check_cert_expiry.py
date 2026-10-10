@@ -128,7 +128,8 @@ scrutinee, the input of a macro invocation (stringify!, a local macro_rules!
 macro, any `name! {..}`), an open block comment or string literal, a
 `macro_rules!` body, an unconditional exit earlier in the same block
 (return / break / continue, `let _ = return ..`, todo! / unimplemented! /
-unreachable! / panic! under any path, any `..exit(..)` / `..abort(..)`,
+unreachable! / panic! under any path, any `..exit(..)` / `..abort(..)` /
+`..panic_any(..)` / `..resume_unwind(..)` / `..unreachable_unchecked(..)` (#6843),
 assert!(false), a bare / unsafe / `if true` block that exits, a loop with no
 break; any of these in expression position too, such as `_ = return;`,
 `drop(return);` or a first call argument, unless a closure, `=>` or a
@@ -452,7 +453,7 @@ _BREAK_TARGET_RE = re.compile(r"(?:^|: |= )(?:loop|while|for)\b")
 _PATH = r"(?::: )?(?:(?:r\#)?[^\W\d]\w* :: )*"
 # Diverging macros and calls (also matched anywhere in a statement, #6842).
 _EXIT_MACROS = ("todo", "unimplemented", "unreachable", "panic")
-_EXIT_CALLS = ("exit", "abort")
+_EXIT_CALLS = ("exit", "abort", "panic_any", "resume_unwind", "unreachable_unchecked")
 _EXIT_RE = re.compile(
     r"^(?:let\b[^=]*= )?(?:return\b|break\b|continue\b|"
     + _PATH + r"(?:r\#)?(?:" + "|".join(_EXIT_MACROS) + r") !|"
