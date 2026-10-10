@@ -72,6 +72,10 @@ unset.
 * **Own clone, own cleanup.** A clone the Rust helper mints for its own process
   (no wrapper) is released and dropped by an exit hook, best effort, never a
   panic (#6570). A clone the wrapper minted is dropped by the wrapper.
+  The hook is `libc::atexit`: it runs on a normal return and on
+  `process::exit` (the libtest failure exit) but not on `abort`, a fatal signal
+  or SIGKILL (for example a CI job-timeout kill). After those the clone is
+  dropped by the run teardown (`--run-id`) or the stale admin sweep (#6888).
 * **Run-scoped.** Every clone name carries its run id (`[a-z0-9]{1,20}`).
   Teardown, and the Rust helper's sweep of its own stale clones, only ever
   touch clones of their own run.
