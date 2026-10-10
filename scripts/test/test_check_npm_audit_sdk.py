@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
 """Unit test for scripts/check-npm-audit-sdk.py (#7084). No network."""
 import contextlib
 import importlib.util
@@ -42,7 +44,9 @@ class NpmAuditGate(unittest.TestCase):
     def test_clean_exits_0(self):
         rep = {"metadata": {"vulnerabilities": {"info": 0, "low": 1, "moderate": 2,
                                                 "high": 0, "critical": 0, "total": 3}},
-               "vulnerabilities": {}}
+               "vulnerabilities": {"low-fixture": {"severity": "low"},
+                                   "moderate-one": {"severity": "moderate"},
+                                   "moderate-two": {"severity": "moderate"}}}
         rc, out = run(["--json-file", self.write(json.dumps(rep))])
         self.assertEqual(rc, 0, out)
 
@@ -50,10 +54,16 @@ class NpmAuditGate(unittest.TestCase):
         for bad in ("not json", "{}", '{"metadata": {"vulnerabilities": 5}}'):
             rc, out = run(["--json-file", self.write(bad)])
             self.assertEqual(rc, 2, out)
+            self.assertIn("check-npm-audit-sdk:", out)
+            self.assertNotIn("can't open file", out)
+            self.assertNotIn("Traceback", out)
 
     def test_missing_file_exits_2(self):
-        rc, _ = run(["--json-file", str(ROOT / ".local-runs" / "absent.json")])
-        self.assertEqual(rc, 2)
+        rc, out = run(["--json-file", str(ROOT / ".local-runs" / "absent.json")])
+        self.assertEqual(rc, 2, out)
+        self.assertIn("check-npm-audit-sdk:", out)
+        self.assertNotIn("can't open file", out)
+        self.assertNotIn("Traceback", out)
 
     def test_npm_absent_exits_0_with_notice(self):
         empty = tempfile.mkdtemp(dir=os.environ.get("TMPDIR") or None)
@@ -66,7 +76,8 @@ class NpmAuditGate(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("gate", str(SCRIPT))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        out = json.dumps({"metadata": {"vulnerabilities": {"high": 0}},
+        out = json.dumps({"metadata": {"vulnerabilities": {"info": 0, "low": 0, "moderate": 0,
+                                                          "high": 0, "critical": 0, "total": 0}},
                           "vulnerabilities": {}})
         fake = mock.Mock(stdout=out, stderr="", returncode=0)
         with mock.patch.object(mod.shutil, "which", return_value="/x/npm"), \
