@@ -2860,7 +2860,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     # that touches the cert doc while it is EXPIRED/VOID, not only for the
     # wire-change pass path: a doc-only change may not delete, re-date, edit,
     # reorder or remove the records. d6 is the GREEN control (prose outside
-    # the ledger; a new record on its own).
+    # the ledger).
     append6124 = [("append-only", "did not say the ledger is append-only")]
     led_ab = ">\n" + old_a + ">\n" + old_b
     mb_d = doc_only(quoted=led_ab, label="d-mb")
@@ -2880,8 +2880,20 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                  append6124)
     d6 = edit_range("\nOther prose.\n", touch=(), label="d6", frm=mb_d, quoted=led_ab)
     t.expect_green("6124-d6", "doc-only prose edit beside an untouched ledger", repo, mb_d, d6)
-    d7 = edit_range("", touch=(), label="d7", frm=mb_d, quoted=led_ab + ">\n" + rec6124)
-    t.expect_green("6124-d7", "doc-only change that only appends a record", repo, mb_d, d7)
+    # (6124-d7, d11..d13) RED (#6731) - a doc-only change may not ADD a record
+    # either: a record belongs to the wire change it records, and only that
+    # path validates its grammar, citation, placement and date.
+    added6124 = [("may not add", "did not say a doc-only change may not add a record")]
+    for tag, label, doc in (
+            ("d7", "a record appended by a doc-only change", led_ab + ">\n" + rec6124),
+            ("d11", "a grammar-free record added by a doc-only change",
+             led_ab + ">\n" + amend("#6162 #7000", ["src/never/changed.rs"])),
+            ("d12", "a back-dated record inserted between old ones by a doc-only change",
+             ">\n" + old_a + ">\n" + amend("#6162", [mod_rs], date="2025-01-01") + ">\n"
+             + old_b),
+            ("d13", "an old record replayed by a doc-only change", led_ab + ">\n" + old_a)):
+        cell_d = edit_range("", touch=(), label=tag, frm=mb_d, quoted=doc)
+        t.expect_red(f"6124-{tag}", label, repo, mb_d, cell_d, added6124)
     # (6124-d8..d10) #6726 - append-only holds on every path unless the judged
     # banner is LIVE: a new Binds-to value (d8) or EXPIRED -> VOID (d9, and
     # d9w with a wire change on the hatch path) is not a re-issue, so it may
