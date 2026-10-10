@@ -394,8 +394,8 @@ def check_banner_consistency(repo, judged):
         f"re-issue it at HEAD or record VOID/EXPIRED in {CERT_DOC}.",
         "",
         f"Bound: {binds}  HEAD: {judged}",
-        "Federation-wire drift since the bind (paths; +added / -removed "
-        "AI_MEMORY_FED_* identifiers):",
+        ("Federation-wire drift since the bind (paths; +added / -removed "
+         "AI_MEMORY_FED_* identifiers):"),
     ]
     lines.extend("  " + d for d in drift)
     lines.append("")
@@ -925,16 +925,28 @@ def path_max(path):
     return limit if isinstance(limit, int) and limit > 0 else platform_path_max()
 
 
-def deep_scratch(tmp, target_len):
-    """A scratch directory whose absolute path is EXACTLY target_len bytes, built
-    with dir_fd so no single syscall sees a path over PATH_MAX (#6145 R3-F2, R4-F2).
-    Returns (base, deepest); on any failure removes base and raises OSError (R4-F3)."""
-    base = Path(tempfile.mkdtemp(prefix="gitshim-deep.", dir=str(tmp)))
-    fds = []
+@contextlib.contextmanager
+def directory_descriptor(path, parent=None):
+    """Own one directory descriptor and release it even when traversal fails."""
+    descriptor = os.open(path, os.O_RDONLY, dir_fd=parent)
     try:
-        cur, cur_len = base, len(os.fsencode(str(base)))
-        fds.append(os.open(str(base), os.O_RDONLY))
-        while cur_len < target_len:
+        yield descriptor
+    finally:
+        os.close(descriptor)
+
+
+def deep_scratch(tmp, target_len):
+    """Build an exact-length path with a lexical owner for every descriptor."""
+    base = Path(tempfile.mkdtemp(prefix="gitshim-deep.", dir=str(tmp)))
+
+    def descend(cur, cur_len, component, parent=None):
+        """Unwind every directory owner even if an inner traversal or close fails."""
+        with directory_descriptor(component, parent) as descriptor:
+            if cur_len == target_len:
+                return cur
+            if cur_len > target_len:
+                raise OSError(errno.ENAMETOOLONG,
+                              f"the scratch base is {cur_len} bytes, over the {target_len}-byte target")
             room = target_len - cur_len
             step = min(200, room - 1)
             if room - step - 1 == 1:
@@ -943,19 +955,14 @@ def deep_scratch(tmp, target_len):
                 raise OSError(errno.ENAMETOOLONG,
                               f"cannot land on exactly {target_len} bytes from {cur_len}")
             name = "d" * step
-            os.mkdir(name, dir_fd=fds[-1])
-            fds.append(os.open(name, os.O_RDONLY, dir_fd=fds[-1]))
-            cur, cur_len = cur / name, cur_len + 1 + step
-        if cur_len != target_len:
-            raise OSError(errno.ENAMETOOLONG,
-                          f"the scratch base is {cur_len} bytes, over the {target_len}-byte target")
-        return base, cur
+            os.mkdir(name, dir_fd=descriptor)
+            return descend(cur / name, cur_len + 1 + step, name, descriptor)
+
+    try:
+        return base, descend(base, len(os.fsencode(str(base))), str(base))
     except BaseException:
         shutil.rmtree(base, ignore_errors=True)
         raise
-    finally:
-        for fd in fds:
-            os.close(fd)
 
 
 def shim_boundary_robustness_violation(tmp):
@@ -2102,7 +2109,8 @@ def main(argv=None):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError):
-            pass
+            # StringIO and closed streams cannot reconfigure; keep their existing encoding.
+            continue
     if args.self_test:
         return self_test()
     rc, out, err = run_gate(REPO_ROOT, dict(os.environ))
