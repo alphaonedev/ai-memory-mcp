@@ -154,6 +154,18 @@ ITEM_RE = re.compile(
     r'|(macro_rules!)\s*([A-Za-z_][A-Za-z0-9_]*)|(impl)\b)')
 FN_BEFORE_RE = re.compile(r'\bfn\s+$')  # the name is being defined here, not called
 DEF_BEFORE_RE = re.compile(r'\b(?:fn|mod|struct|enum|union|trait|type)\s+$')  # any item definition token
+
+
+def after_method_dot(before):
+    """True when ``before`` (the code text ahead of a name) ends in a single ``.``: ``x.name(`` is a method call.
+
+    Whitespace and line breaks between the dot and the name are skipped. ``..`` is not a method
+    call: a struct-update base (``S { n: 1, ..name() }``) and a range (``0..name().len()``,
+    ``a..=name()``) call the free fn, so they stay call sites (review r3 #6460). ``..=`` already
+    ends in ``=``. The one predicate used by the by-name pass, the resolver and the test oracle.
+    """
+    ahead = before.rstrip()
+    return ahead.endswith('.') and not ahead.endswith('..')
 SHARD_THREADS = 3  # --test-threads of each parallel shard
 PG_TOKEN = 'AI_MEMORY_TEST_POSTGRES_URL'
 PG_TOKEN_RE = re.compile(r'\bAI_MEMORY_TEST_POSTGRES_URL\b')
@@ -966,7 +978,7 @@ def bare_name_callers(units, helpers, site_path):
     name denotes the helper or a same-named free fn is not decided, so a same-named free
     function is an over-match by design (fail closed; 5-agent vote (4d3ea1c5)). Only lexical
     false positives are dropped: comments and string/char literals (the ``shape`` view blanks
-    them) and ``.name(`` method calls of a free-fn helper. This matcher is never filtered by
+    them) and ``.name(`` method calls of a free-fn helper (single dot only: ``..name(`` is a call). This matcher is never filtered by
     the path resolver, so ``sites(resolver) >= sites(bare name)`` holds by construction.
     """
     by_name = {}  # fn name -> [is method, def paths]
@@ -981,7 +993,7 @@ def bare_name_callers(units, helpers, site_path):
         for m in call_re.finditer(rf.shape):
             if FN_BEFORE_RE.search(rf.shape[max(0, m.start() - 16):m.start()]):
                 continue  # the definition, not a call
-            if not by_name[m.group(1)][0] and rf.shape[max(0, m.start() - 256):m.start()].rstrip().endswith('.'):
+            if not by_name[m.group(1)][0] and after_method_dot(rf.shape[max(0, m.start() - 256):m.start()]):
                 continue  # `x.name(` is a method call, never the free fn
             calls.append(m)
         for m, ctx in zip(calls, rf.contexts([m.start() for m in calls])):
@@ -1029,7 +1041,7 @@ def helper_callers(units, helpers, site_path, external=STD_CRATES):
             q = re.search(r'((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)+)$', before)
             qual = tuple(re.findall(r'[A-Za-z_][A-Za-z0-9_]*', q.group(1))) if q else ()
             head = before[:q.start()] if q else before
-            refs.append((m, qual, head.rstrip().endswith('.')))
+            refs.append((m, qual, after_method_dot(head)))
         if not refs:
             continue
         for (m, qual, dotted), ctx in zip(refs, rf.contexts([r[0].start() for r in refs])):
@@ -1059,9 +1071,10 @@ def lib_pg_sites(src_root):
     matcher, kept as is) and :func:`helper_callers` (aliases, re-exports,
     ``pub use`` chains, globs, pass-by-name references), plus the invokers of
     macros whose body reaches either (:func:`macro_callers`). The resolver is
-    add-only: it never removes a by-name site. Misses fixed: the by-name pass, aliases,
-    re-exports, macros. Lexical false positives dropped: strings, comments, method
-    calls, field access. Same-named free functions remain an over-match by design
+    add-only over the by-name pass (sites(tip) >= sites(base) bar the lexical drops below,
+    pinned by test_partition_union_6412). Misses fixed: the by-name pass, aliases,
+    re-exports, macros. Lexical false positives dropped: strings, comments, single-dot method
+    calls, field access (``..name(`` is a call). Same-named free functions remain an over-match by design
     (fail closed). A resolver exception propagates and fails the step.
     """
     units = lib_units(src_root)

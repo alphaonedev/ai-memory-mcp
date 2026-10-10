@@ -5,7 +5,7 @@
 resolver. The resolver may add sites; it may never remove one the bare-name matcher found. The
 oracle below is that matcher, verbatim, over the same lib units. The only base hits it may
 lose are lexical false positives: a name inside a string/char literal and a ``.name(`` method
-call of a free fn (comments are already blanked by the ``code`` view).
+call of a free fn, single dot only (comments are already blanked by the ``code`` view).
 
 Run: python3 -m unittest discover -s scripts/ci/tests
 """
@@ -70,7 +70,7 @@ def reference_sites_674a(src_root):
                 path, _ = site_path(modp, ctx)
                 if path not in helpers[m.group(1)]:
                     lexical = (rf.shape[m.start():m.end()] != rf.code[m.start():m.end()]
-                               or rf.code[max(0, m.start() - 256):m.start()].rstrip().endswith('.'))
+                               or pt.after_method_dot(rf.code[max(0, m.start() - 256):m.start()]))
                     out[(path, '%s:%d (calls %s)' % (rf.path, rf.code.count('\n', 0, m.start()) + 1, m.group(1)))] = lexical
     return out
 
