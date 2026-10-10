@@ -180,6 +180,19 @@ class TestCheckTierPassword6181(unittest.TestCase):
                 r = self.run_check(url)
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
+    def test_a_bracketed_ipv6_host_is_checked_without_its_brackets_6872(self):
+        # #6872: libpq reads `[2001:db8:ab::17]:5445` as host `2001:db8:ab::17`.  A password that contains that
+        # address (8+ characters) is refused whether the entry is alone, first or later in a host list; keeping the
+        # brackets or the port on the entry would let the bare address through.
+        host = "2001:db8:ab::17"
+        pw = "Zq8Lm" + host + "Wv3Kd9Tg"
+        for url in (f"postgres://u:{pw}@[{host}]:5445/db",
+                    f"postgres://u:{pw}@[{host}]:5445,h1:5446/db",
+                    f"postgres://u:{pw}@h1:5445,[{host}]:5446/db",
+                    f"postgres://u:{pw}@h1,[{host}]/db"):
+            with self.subTest(url=url.split("@", 1)[1]):
+                self.assert_refused(url, "contains the host component", [pw, host])
+
     def test_no_value_is_ever_printed(self):
         user, db, pw = "tierroleXq93", "tierdbXq93zw", "tierpwXq93"
         for url in (f"postgres://{user}:{pw}@h:5445/{db}",  # short
