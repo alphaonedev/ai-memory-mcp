@@ -92,7 +92,7 @@ fn plain_listener_gets_no_connection_from_send_6371() {
         .expect("non-blocking listener");
     let port = listener.local_addr().expect("listener address").port();
     let url = format!("https://127.0.0.1:{port}\\@8.8.8.8/hook");
-    let res = send_with(&url, "{}", "1700000000", None, "corr-6371", false);
+    let res = send(&url, "{}", "1700000000", None, "corr-6371", false);
     assert_eq!(
         res,
         Err(dlq_reason::SSRF_REJECTED.to_string()),
