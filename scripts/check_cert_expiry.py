@@ -2394,6 +2394,7 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     _trusted_round5_cells(judge, shapes)
     _trusted_round3_fetch_cells(tmp, t, fx, mirror, head8, good8)
     _shim_trace_cells(t)
+    _ws_unit_cells(t)
 
 
 CERT_CONTEXT_FIXTURE = "Enterprise-federation cert-expiry gate (cert §7 / F7)"
@@ -2738,6 +2739,11 @@ def _round4_shapes(shapes, pr, approve, wf_rel, c8_rel):
         shapes["r4-" + key] = pr("r4-" + key, edits, trailer_msg)
 
 
+# Nine distinct whitespace code points: more kinds than the eight the message lists (#6556).
+WS_NINE = (0xA0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006)
+# Every character str.isspace() accepts that is neither space, tab nor a YAML line break (#6555).
+WS_REFUSED = (0x0B, 0x0C, 0x1C, 0x1D, 0x1E, 0x1F, 0xA0, 0x1680, *range(0x2000, 0x200B), 0x202F, 0x205F, 0x3000)
+
 NBSP_FLOW = ("name: ws\non: [push]\njobs:\n  shadow: {{runs-on: ubuntu-latest, steps: [{{run: 'echo\n"
              "{ch}#x'}}], name: Enterprise-federation cert-expiry gate (cert \xa77 / F7)}}\n")
 
@@ -2761,9 +2767,29 @@ def _round5_shapes(shapes, pr, approve, wf_rel, c8_rel):
             "ubuntu-latest\n", "ubuntu-latest   \n", 1)}, ""),
         "nbsp-block-c8": ({c8_rel: C8_FIXTURE.replace(
             C8_GATE_LAST, C8_GATE_LAST + "      - run: |\n          echo x\n\u00a0\n          ? k\n", 1)}, approve),
+        "ws-lines": ({".github/workflows/ws-lines.yml": ok_wf.replace(
+            "on: [push]\n", "on: [push] #\u00a0x\n", 1).replace("  ws:\n", "  ws: #\u3000x\n", 1)}, ""),
+        "ws-nine": ({".github/workflows/ws-nine.yml": "name: ws\n" + "".join(
+            f"#{chr(c)}\n" for c in WS_NINE) + ok_wf.split("\n", 1)[1]}, ""),
     }
     for key, (edits, trailer_msg) in r5.items():
         shapes["r5-" + key] = pr("r5-" + key, edits, trailer_msg)
+
+
+def _ws_unit_cells(t):
+    """#6555: each of the 22 refused non-YAML whitespace code points has its
+    own cell (`tr-s-ws-U+XXXX`), planted mid-line in a comment; U+0085, U+2028
+    and U+2029 are line breaks (#6228), space and tab are YAML whitespace."""
+    if len(set(WS_REFUSED)) != 22:
+        t.fail(f"(tr-s-ws-all): WS_REFUSED holds {len(set(WS_REFUSED))} code points, not 22")
+    for code in WS_REFUSED:
+        label = f"tr-s-ws-U+{code:04X}"
+        found = _whitespace_findings(".github/workflows/u.yml", f"name: u\n# a{chr(code)}b\n")
+        if len(found) != 1 or f"U+{code:04X}" not in found[0]:
+            t.fail(f"({label}): U+{code:04X} in a comment was not refused as that code point: {found!r}")
+    for ok in (" ", "\t"):
+        if _whitespace_findings(".github/workflows/u.yml", f"name: u\n# a{ok}b\n"):
+            t.fail(f"(tr-s-ws-yaml): {ok!r} is YAML whitespace and must not be refused")
 
 
 def _trusted_round5_cells(judge, shapes):
@@ -2778,7 +2804,15 @@ def _trusted_round5_cells(judge, shapes):
               *shapes["r5-" + key], needles=(shadow + f".github/workflows/ws-{key}.yml", ws, code,
                                               "(workflow header): names the required check"))
     judge("tr-s-nbsp-quoted", "U+00A0 only inside a quoted value of a workflow that is not an own file",
-          *shapes["r5-nbsp-quoted"], needles=(shadow + ".github/workflows/ws-q.yml", ws, "U+00A0"))
+          *shapes["r5-nbsp-quoted"], needles=(shadow + ".github/workflows/ws-q.yml", ws, "U+00A0",
+                                              "line 7 (1 in this file)"))
+    judge("tr-s-ws-lines", "U+00A0 on line 2 and U+3000 on line 4 of a new workflow", *shapes["r5-ws-lines"],
+          needles=(shadow + ".github/workflows/ws-lines.yml", ws, "lines 2, 4 (2 in this file)",
+                   "(U+00A0, U+3000)"))
+    judge("tr-s-ws-nine", "nine distinct whitespace code points on nine lines of a new workflow",
+          *shapes["r5-ws-nine"], needles=(
+              shadow + ".github/workflows/ws-nine.yml", ws, "lines 2, 3, 4, 5, 6, 7, 8, 9, +1 more (9 in this file)",
+              "(U+00A0, U+1680, U+2000, U+2001, U+2002, U+2003, U+2004, U+2005, +1 more)"))
     judge("tr-s-tabcomment", "control: a tab-indented comment and trailing spaces", *shapes["r5-tabcomment"],
           ok=True, absent=(shadow,))
     judge("tr-s-nbsp-block-c8", "a U+00A0-only line ends a block scalar of c8-precheck.yml, WITH the trailer",
