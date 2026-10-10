@@ -1580,6 +1580,77 @@ def self_test():
     check("round7 token: flow-mapping env GH_TOKEN is refused or flagged", lambda: refused(job_token_problems, in_verifier(
         "      - name: leak\n        env: {GH_TOKEN: x}\n        run: gh api user\n")) or None)
 
+    # Round 8 (#6610 #6617 #6618, round-6 reviews): every pin reads the parsed value through one
+    # allowed-shape accessor (3-agent vote (6def5ab6), option C). A spelling the accessor does not
+    # allow is a refusal; nothing is compared as raw text. Each cell must yield a pin problem.
+    job_perm = "    permissions:\n      contents: read\n      issues: read\n"
+    top_perm = "\npermissions:\n  contents: read\n"
+    vstep = "        run: python3 -I scripts/check_carrier_ruleset_live.py --self-test\n"
+
+    def r8_in_live(old, new):
+        return wf_text[:live_at] + swap(wf_text[live_at:], old, new)
+
+    def r8_after_vstep(extra):
+        return swap(wf_text, vstep, vstep + extra)
+
+    def r8_decoy(block):
+        return swap(wf_text, "  carrier-base-fresh-gate:\n", block + "  carrier-base-fresh-gate:\n")
+
+    first_job_at = wf_text.index("\njobs:\n") + len("\njobs:\n")
+    first_job_steps = wf_text.index("    steps:\n", first_job_at)
+    other_job_write = (wf_text[:first_job_steps] + "    permissions:\n      contents: write\n"
+                       + wf_text[first_job_steps:])
+    for label, text in (
+            ("round8 #6610: job permissions flow mapping write",
+             r8_in_live(job_perm, "    permissions: {contents: write, issues: read}\n")),
+            ("round8 #6610: job permissions flow mapping quoted write",
+             r8_in_live(job_perm, "    permissions: {contents: \"write\", issues: read}\n")),
+            ("round8 #6610: job permissions flow mapping id-token write",
+             r8_in_live(job_perm, "    permissions: {contents: read, issues: read, id-token: write}\n")),
+            ("round8 #6610: job permission folded block scalar write",
+             r8_in_live(job_perm, "    permissions:\n      contents: >-\n        write\n      issues: read\n")),
+            ("round8 #6610: job permission literal block scalar write",
+             r8_in_live(job_perm, "    permissions:\n      contents: |-\n        write\n      issues: read\n")),
+            ("round8 #6610: job permissions write-all folded",
+             r8_in_live(job_perm, "    permissions: >-\n      write-all\n")),
+            ("round8 #6610: job permissions read-all scalar",
+             r8_in_live(job_perm, "    permissions: read-all\n")),
+            ("round8 #6610: job permission key not lowercase",
+             r8_in_live(job_perm, "    permissions:\n      Contents: read\n      issues: read\n")),
+            ("round8 #6610: job Permissions key case variant",
+             r8_in_live(job_perm, "    Permissions:\n      contents: write\n")),
+            ("round8 #6610: workflow permissions flow mapping write", swap(wf_text, top_perm, "\npermissions: {contents: write}\n")),
+            ("round8 #6610: workflow permissions write-all folded", swap(wf_text, top_perm, "\npermissions: >-\n  write-all\n")),
+            ("round8 #6610: workflow permissions write-all literal", swap(wf_text, top_perm, "\npermissions: |\n  write-all\n")),
+            ("round8 #6610: workflow permissions read-all", swap(wf_text, top_perm, "\npermissions: read-all\n")),
+            ("round8 #6610: workflow permissions absent (repository default)", swap(wf_text, top_perm, "\n")),
+            ("round8 #6610: workflow Permissions key case variant", swap(wf_text, top_perm, "\nPermissions:\n  contents: read\n")),
+            ("round8 #6610: verifier inherits a flow-mapping write grant",
+             swap(r8_in_live(job_perm, ""), top_perm, "\npermissions: {contents: write, issues: read}\n")),
+            ("round8 #6610: another job grants write", other_job_write),
+            ("round8 #6617: quote in a plain key hides a secret in step env", r8_after_vstep(
+                "      - name: q\n        env:\n          a'b: 'z #${{ secrets.PAT }}'\n        run: printenv\n")),
+            ("round8 #6617: quote in a plain key hides a secret in workflow env", swap(
+                wf_text, top_perm, "\nenv:\n  a'b: 'z #${{ secrets.PAT }}'\n" + top_perm)),
+            ("round8 #6617: double quote in a plain key hides a secret in with:", r8_after_vstep(
+                "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
+                "        with:\n          a\"b: \"z #${{ secrets.PAT }}\"\n")),
+            ("round8 #6617: quote in a plain key hides a needs output", r8_after_vstep(
+                "      - name: q\n        env:\n          a'b: 'z #${{ needs.mint.outputs.t }}'\n        run: printenv\n")),
+            ("round8 #6618: decoy job name is a string-literal expression", r8_decoy(
+                "  decoy:\n    name: ${{ 'Carrier-ruleset live verifier (#6143)' }}\n    runs-on: ubuntu-latest\n"
+                "    steps:\n      - run: \"true\"\n\n")),
+            ("round8 #6618: decoy job name is built from a matrix value", r8_decoy(
+                "  decoy:\n    name: Carrier-ruleset live verifier (${{ matrix.n }})\n    strategy:\n      matrix:\n"
+                "        n: ['#6143']\n    runs-on: ubuntu-latest\n    steps:\n      - run: \"true\"\n\n")),
+            ("round8 #6618: decoy job name is a format() expression", r8_decoy(
+                "  decoy:\n    name: \"${{ format('Carrier-base freshness gate ({0})', '#6143') }}\"\n"
+                "    runs-on: ubuntu-latest\n    steps:\n      - run: \"true\"\n\n")),
+            ("round8 #6618: verifier's own name is an expression", swap(
+                wf_text, "    name: Carrier-ruleset live verifier (#6143)\n",
+                "    name: ${{ 'Carrier-ruleset live verifier (#6143)' }}\n"))):
+        check(label, lambda t=text: None if workflow_pin_problems(t) else "workflow_pin_problems is empty")
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"
