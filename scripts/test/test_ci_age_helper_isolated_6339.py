@@ -118,7 +118,7 @@ class TestAgeHelperIsolated6339(unittest.TestCase):
             "|| true": (call, call[:-6] + " || true; then"),
             "exit 0 on failure": ('see the ensure-age-extension line above"\n              exit 1',
                                   'see the ensure-age-extension line above"\n              exit 0'),
-            "URL on argv": ('--url-file "$url_file"; then', '--url-file "$url_file" "$base_url"; then'),
+            "URL on argv": (HELPER + ' --url-file "$url_file"; then', HELPER + ' --url-file "$url_file" "$base_url"; then'),
             "continue-on-error": ("        run: |\n          set -euo pipefail\n          # psql lives",
                                   "        continue-on-error: true\n        run: |\n          set -euo pipefail\n          # psql lives"),
             "echoed URL": (call, 'echo "url=$(cat "$url_file")"\n            ' + call),

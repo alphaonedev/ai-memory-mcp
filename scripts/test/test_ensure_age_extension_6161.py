@@ -61,6 +61,7 @@ with open(base + "/psql.log", "a") as fh:
                          "pgpassword": os.environ.get("PGPASSWORD"),
                          "pgpassword_hex": os.environb.get(b"PGPASSWORD", b"").hex(),
                          "connect_timeout_env": os.environ.get("PGCONNECT_TIMEOUT"),
+                         "pgdatabase": os.environ.get("PGDATABASE"),
                          "pgservice": os.environ.get("PGSERVICE"),
                          "pgservicefile": os.environ.get("PGSERVICEFILE")}}) + "\\n")
 print(1 if os.path.isfile(base + "/share/extension/age.control") else 0)
@@ -315,8 +316,27 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         for call in calls:
             argv = " ".join(call["argv"])
             self.assertNotIn(PW_MARKER, argv)
-            self.assertIn("postgres://ciuser@127.0.0.1:5445/cidb?sslmode=disable", call["argv"])
+            self.assertIn("postgres://ciuser@127.0.0.1:5445?sslmode=disable", call["argv"])
+            self.assertNotIn("cidb", argv, "#6181: the database name must not be on psql's argv")
+            self.assertEqual(call["pgdatabase"], "cidb")
             self.assertTrue(call["env_marker_ok"], "PGPASSWORD must carry the password")
+
+    def test_database_name_moves_to_pgdatabase_6181(self):
+        # #6181: a database name equal to a secret would show on every psql argv; the name travels in PGDATABASE.
+        mod = load_module()
+        cases = {
+            "postgres://u@h:5445/cidb?sslmode=require": ("postgres://u@h:5445?sslmode=require", "cidb"),
+            "postgres://u@h:5445/cidb": ("postgres://u@h:5445", "cidb"),
+            "postgres://u@h:5445/": ("postgres://u@h:5445", None),
+            "postgres://u@h:5445": ("postgres://u@h:5445", None),
+            "postgres://u@h/ci%20db?x=1&sslmode=disable": ("postgres://u@h?x=1&sslmode=disable", "ci db"),
+            "postgres://:@/d?host=%2Fdir": ("postgres://:@?host=%2Fdir", "d"),
+        }
+        for url, (want_target, want_db) in cases.items():
+            with self.subTest(url=url):
+                self.assertEqual(mod.split_database(url), (want_target, want_db))
+        with self.assertRaises(mod.HelperError):
+            mod.split_database("postgres://u@h/a%00b")
 
     def test_password_in_query_moves_to_env(self):
         self.url_file.write_text(f"postgres://ciuser@127.0.0.1:5445/cidb?password={PW_MARKER}&sslmode=disable\n")
@@ -444,7 +464,8 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
         self.assertTrue(calls)
         for call in calls:
-            self.assertIn(url, call["argv"])
+            self.assertIn(url.replace("/cidb?", "?"), call["argv"])
+            self.assertEqual(call["pgdatabase"], "cidb")
 
     # ---- round 5 (R4-F1..R4-F3, F-R4-2, F-R4-3) ---------------------------
     def test_query_segment_with_second_equals_is_rejected(self):
