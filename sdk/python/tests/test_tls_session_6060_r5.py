@@ -1934,7 +1934,7 @@ def test_refused_gate_closes_the_sync_transports_6693() -> None:
     client = httpx.Client(**kwargs)
     recording = _RecordingTransport()
     client._transport = recording  # noqa: SLF001
-    client._mounts[httpx.URL("https://other.invalid")] = object()  # type: ignore[index]  # noqa: SLF001
+    client._mounts[httpx.URL("https://other.invalid")] = object()  # type: ignore[index, assignment]  # noqa: SLF001
     with pytest.raises(ValueError, match="#6537"):
         _common.gate_transports(client, kwargs, context)
     assert recording.closed
