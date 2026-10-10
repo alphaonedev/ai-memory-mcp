@@ -1867,7 +1867,7 @@ def _self_test_cases() -> int:
         oids = [bytes(data[chunks[b"OIDL"] + 20 * i:chunks[b"OIDL"] + 20 * (i + 1)]).hex() for i in range(count)]
         entry = chunks[b"CDAT"] + 36 * oids.index(child) + 20
         data[entry:entry + 4] = oids.index(new_parent).to_bytes(4, "big")
-        graph.write_bytes(graph.read_bytes())  # red state: mutant M13, the rewrite is a no-op
+        graph.write_bytes(bytes(data))
 
     def lying_graph_fixture(name):
         """An unapproved two-commit change plus an approved side commit; returns the repo and its commits."""
@@ -1885,10 +1885,26 @@ def _self_test_cases() -> int:
         subprocess.run(["git", "-C", str(where), "-c", "core.commitGraph=true", "commit-graph", "write", "--reachable"],
                        check=True, capture_output=True)
 
+    # #6926: positive control. The cells above and below only assert that the range is refused, which also holds when
+    # the rewrite no longer takes effect (a changed chunk layout, a git that checks the graph checksum, a fixture edit).
+    # A reader that is not pinned must therefore see the lie, or the cell is vacuous and is its own named FAIL.
+    def graph_lies(name, repo, mid_sha, approved, knob=None):
+        env = {key: value for key, value in os.environ.items() if key != "GIT_TEST_COMMIT_GRAPH"}
+        if knob is not None:
+            env["GIT_TEST_COMMIT_GRAPH"] = knob
+        setting = "false" if knob is not None else "true"
+        seen = subprocess.run(["git", "-C", str(repo), "-c", f"core.commitGraph={setting}", "log", "-1", "--format=%P",
+                               mid_sha], capture_output=True, check=False, env=env).stdout.decode().strip()
+        if seen != approved:
+            failures.append(f"{name}: the fixture graph is not live")
+            print(f"FAIL: self-test - {name}: the fixture graph is not live, an unpinned reader sees parent {seen!r} "
+                  f"instead of the approved commit (#6926)", file=sys.stderr)
+
     def graph_cell():
         work, repo, base_root, fork_sha, approved, mid_sha, head_sha = lying_graph_fixture("graphrepo")
         graph_write(repo)
         rewrite_graph_parent(repo / ".git" / "objects" / "info" / "commit-graph", mid_sha, approved)
+        graph_lies("the #6798 in-repository graph", repo, mid_sha, approved)
         range_cell("a commit-graph parent entry naming an approved commit does not approve the range (#6798)", work,
                    base_root, repo, fork_sha, head_sha, True, "no commit in the range carries")
         work, repo, base_root, fork_sha, approved, mid_sha, head_sha = lying_graph_fixture("graphalt")
@@ -1898,6 +1914,7 @@ def _self_test_cases() -> int:
         graph_write(alt)
         rewrite_graph_parent(alt / "objects" / "info" / "commit-graph", mid_sha, approved)
         (repo / ".git" / "objects" / "info" / "alternates").write_text(str(alt / "objects") + "\n", encoding="utf-8")
+        graph_lies("the #6798 alternate-store graph", repo, mid_sha, approved)
         range_cell("a commit-graph served by an alternate object store does not approve the range (#6798)", work,
                    base_root, repo, fork_sha, head_sha, True, "no commit in the range carries")
 
@@ -1907,10 +1924,13 @@ def _self_test_cases() -> int:
     # sets it re-opens the #6798 bypass. git() pins GIT_TEST_COMMIT_GRAPH=0; the graph rewritten above must still not
     # approve the range when the host environment asks for it (in the repository, and served from an alternate store).
     def graph_env_cell():
-        def with_knob(name, work, base_root, repo, fork_sha, head_sha):
+        def with_knob(name, work, base_root, repo, fork_sha, head_sha, mid_sha, approved):
             saved = os.environ.get("GIT_TEST_COMMIT_GRAPH")
             os.environ["GIT_TEST_COMMIT_GRAPH"] = "1"
             try:
+                # #6926: under the knob this cell sets, a reader with core.commitGraph=false must still see the lie.
+                graph_lies(f"{name} [knob control]", repo, mid_sha, approved,
+                           knob=os.environ["GIT_TEST_COMMIT_GRAPH"])
                 range_cell(name, work, base_root, repo, fork_sha, head_sha, True, "no commit in the range carries")
             finally:
                 if saved is None:
@@ -1921,8 +1941,9 @@ def _self_test_cases() -> int:
         work, repo, base_root, fork_sha, approved, mid_sha, head_sha = lying_graph_fixture("graphenv")
         graph_write(repo)
         rewrite_graph_parent(repo / ".git" / "objects" / "info" / "commit-graph", mid_sha, approved)
+        graph_lies("the #6883 in-repository graph", repo, mid_sha, approved)
         with_knob("GIT_TEST_COMMIT_GRAPH=1 in the host environment does not load a rewritten commit-graph (#6883)",
-                  work, base_root, repo, fork_sha, head_sha)
+                  work, base_root, repo, fork_sha, head_sha, mid_sha, approved)
         work, repo, base_root, fork_sha, approved, mid_sha, head_sha = lying_graph_fixture("graphenvalt")
         alt = work / "alt.git"
         subprocess.run(["git", "clone", "-q", "--bare", "--no-local", str(repo), str(alt)], check=True,
@@ -1930,8 +1951,9 @@ def _self_test_cases() -> int:
         graph_write(alt)
         rewrite_graph_parent(alt / "objects" / "info" / "commit-graph", mid_sha, approved)
         (repo / ".git" / "objects" / "info" / "alternates").write_text(str(alt / "objects") + "\n", encoding="utf-8")
+        graph_lies("the #6883 alternate-store graph", repo, mid_sha, approved)
         with_knob("GIT_TEST_COMMIT_GRAPH=1 does not load a rewritten commit-graph from an alternate store (#6883)",
-                  work, base_root, repo, fork_sha, head_sha)
+                  work, base_root, repo, fork_sha, head_sha, mid_sha, approved)
 
     guarded("GIT_TEST_COMMIT_GRAPH in the host environment cannot approve a range (#6883) fixture", graph_env_cell)
 
