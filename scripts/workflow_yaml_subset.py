@@ -123,7 +123,8 @@ def echo(text: str) -> str:
     raw = str(text)
     sep = _ROW_SEPARATOR.search(raw)
     if sep is None:
-        return repr(clip(raw[:ROW_KEEP] + "..." if len(raw) > ROW_KEEP else raw))
+        # #6880: mask the kept prefix while it still ends the text, so a token cut at ROW_KEEP is masked.
+        return repr(clip(raw[:ROW_KEEP]) + "..." if len(raw) > ROW_KEEP else clip(raw))
     rest = len(raw) - sep.end()
     return repr(clip(raw[:sep.end()] + ("<withheld %d chars>" % rest if rest else "")))
 
