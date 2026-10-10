@@ -1569,10 +1569,34 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     t.expect_red("mask-dup", "one of two identical defining lines removed",
                  repo, dup0, dup1, [
                      ("occurrences in src/ fell 3 -> 2", "did not carry the 3 -> 2 count change")])
+    # (mask-lost2, #6565) two defining lines lost with the total unchanged: the
+    #       report counts BOTH lost lines.
+    fx.g("update-ref", "refs/remotes/origin/main", mk0)
+    fx.g("checkout", "-q", "-B", "mo-lost2", mk0)
+    fx.write("src/mask_def.rs", 'pub const M: &str = "";\n')
+    fx.write("src/mask_note.rs", "// nothing here\n")
+    fx.write("src/mask_new.rs", f"// {kid} one\n// {kid} two\n")
+    lost2 = fx.commit(["src/mask_def.rs", "src/mask_note.rs", "src/mask_new.rs"],
+                      "mask-lost2: both lines that named the identifier are rewritten")
+    t.expect_red("mask-lost2", "two identifier lines rewritten while the total holds",
+                 repo, mk0, lost2, [("2 occurrence(s) on lines", "did not count both lost lines")])
+    # (mask-trailing-ws) trailing whitespace is not a change to the line text.
+    fx.g("checkout", "-q", "-B", "mo-trailing-ws", mk0)
+    fx.write("src/mask_def.rs", def_line.rstrip("\n") + "   \n")
+    tws = fx.commit(["src/mask_def.rs"], "mask-trailing-ws: trailing blanks on the defining line")
+    t.expect_green("mask-trailing-ws", "trailing whitespace added to the defining line",
+                   repo, mk0, tws)
+    # (mask-dup-add) an identical defining line added in a second file is an extra
+    #       mention, not drift.
+    fx.g("checkout", "-q", "-B", "mo-dup-add", mk0)
+    fx.write("src/mask_dup.rs", def_line)
+    dad = fx.commit(["src/mask_dup.rs"], "mask-dup-add: the same defining line in a second file")
+    t.expect_green("mask-dup-add", "an identical defining line added in a second file",
+                   repo, mk0, dad)
     # Controls: a longer token that merely CONTAINS the prefix is not an identifier,
     # so adding one is GREEN (the left word boundary; letter and underscore prefixes).
     fx.g("update-ref", "refs/remotes/origin/main", mk0)
-    for suffix, pre in (("letter", "NOT"), ("underscore", "X_")):
+    for suffix, pre in (("letter", "NOT"), ("underscore", "X_"), ("digit", "9")):
         fx.g("checkout", "-q", "-B", f"mo-longer-{suffix}", mk0)
         fx.write("src/mask_new.rs", f"// {pre}AI_MEMORY_FED_MASK_OTHER_{suffix.upper()}\n")
         lg = fx.commit(["src/mask_new.rs"], f"mask-longer-{suffix}: a longer token is added")
@@ -2029,6 +2053,8 @@ SELF_TEST_OK = (
     "(mask, mask-gate, mask-drift, mask-add, #6370) removing the definition of an identifier "
     "that a comment still names stays RED (occurrence counts, not name sets), while an extra "
     "mention is GREEN; "
+    "(mask-lost2, mask-trailing-ws, mask-dup-add, #6565) two rewritten identifier lines are "
+    "both counted in the report, trailing blanks and an identical line added elsewhere are GREEN; "
     "(mask-u2028, mask-trailing, #6564) a definition behind a // comment joined by U+2028 and a "
     "definition replaced by an empty value with the name in a trailing comment stay RED; "
     "(value-same-line, value-next-line, doc-bound, #6563) a value edited on the identifier "
@@ -2040,7 +2066,7 @@ SELF_TEST_OK = (
     "lexical bound, #6560), as do look-alike spellings "
     "(mask-confusable, mask-confusable-note, mask-zwsp, mask-crsplit) and a removed mention "
     "(mask-note-removed), a removal whose total never falls (mask-netzero, mask-netzero-gate) "
-    "and a 3 -> 2 fall (mask-3to2), a rising total (mask-rise) and one of two identical definitions (mask-dup) stay RED, a longer token is GREEN (mask-longer-letter, mask-longer-underscore), while a defining line moved to another file is GREEN (mask-moved); "
+    "and a 3 -> 2 fall (mask-3to2), a rising total (mask-rise) and one of two identical definitions (mask-dup) stay RED, a longer token is GREEN (mask-longer-letter, mask-longer-underscore, mask-longer-digit), while a defining line moved to another file is GREEN (mask-moved); "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
