@@ -242,16 +242,118 @@ def _with_trace(request: httpx.Request, trace: Any) -> None:
     request.extensions["trace"] = chained
 
 
-_START_TLS_DONE = "connection.start_tls.complete"
+_TLS_DONE = "start_tls.complete"
+_DIRECT_TLS = "connection"
+# The events that precede the first byte a request writes on a connection:
+# HTTP/1.1 request headers, the HTTP/2 connection preface, HTTP/2 headers.
+_FIRST_WRITE_EVENTS = frozenset(
+    {
+        "http11.send_request_headers.started",
+        "http2.send_connection_init.started",
+        "http2.send_request_headers.started",
+    }
+)
+_TUNNEL_CONNECT_EVENT = "http11.send_request_headers.started"
+# httpcore's tunnel CONNECT carries Host and Accept plus the proxy's own
+# headers; anything else (the SDK's X-API-Key / X-Agent-Id, caller extras)
+# means the request is not the bare tunnel CONNECT.
+_TUNNEL_CONNECT_HEADERS = frozenset({b"host", b"accept", b"proxy-authorization"})
+
+
+def _session_of(stream: object) -> object:
+    extra = getattr(stream, "get_extra_info", None)
+    return None if extra is None else extra("ssl_object")
+
+
+class _SessionGate:
+    """Post-handshake session check for ONE request (3-agent vote 6def5ab6).
+
+    httpcore reports every TLS handshake of a request as
+    ``<leg>.start_tls.complete``: ``connection`` for the TCP connection (the
+    origin when direct, the proxy when the proxy is ``https://``), ``proxy`` for
+    the origin session inside an HTTP CONNECT tunnel and ``socks`` for the
+    origin session over SOCKS. A session on the caller's context must be a
+    verified session on every leg. A session on another context is admitted
+    only on the ``connection`` leg, as a PENDING proxy leg: the bare tunnel
+    CONNECT may cross it, and a verified tunnelled origin session clears it;
+    any other first write while it is pending is refused. The state is per
+    request so one request's tunnel never vouches for another's proxy leg.
+    """
+
+    def __init__(self, context: ssl.SSLContext, request: httpx.Request) -> None:
+        self._context = context
+        url = request.url
+        self._tunnel_target = b"%b:%d" % (url.raw_host, url.port or 443)
+        self._pending: list[object] = []
+
+    def refused(self, event: str, info: dict[str, Any]) -> list[object] | None:
+        """Return the streams to close before refusing, or ``None`` to proceed."""
+        leg, _, name = event.partition(".")
+        if name == _TLS_DONE:
+            stream = info.get("return_value")
+            session = _session_of(stream)
+            if (
+                leg == _DIRECT_TLS
+                and session is not None
+                and getattr(session, "context", None) is not self._context
+            ):
+                self._pending.append(stream)
+                return None
+            try:
+                _assert_negotiated_session(session, self._context)
+            except ValueError:
+                return [*self._pending, stream]
+            if leg != _DIRECT_TLS:
+                self._pending.clear()
+            return None
+        if event in _FIRST_WRITE_EVENTS and self._pending:
+            if event == _TUNNEL_CONNECT_EVENT and self._is_tunnel_connect(info.get("request")):
+                return None
+            return list(self._pending)
+        return None
+
+    def _is_tunnel_connect(self, request: object) -> bool:
+        if getattr(request, "method", None) != b"CONNECT":
+            return False
+        if getattr(getattr(request, "url", None), "target", None) != self._tunnel_target:
+            return False
+        headers = getattr(request, "headers", None)
+        if not isinstance(headers, list):
+            return False
+        return all(
+            isinstance(name, bytes) and name.lower() in _TUNNEL_CONNECT_HEADERS
+            for name, _value in headers
+        )
+
+
+def _close_quietly(stream: object) -> None:
+    close = getattr(stream, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except OSError:
+        pass  # the refusal below is raised either way
+
+
+async def _aclose_quietly(stream: object) -> None:
+    aclose = getattr(stream, "aclose", None)
+    if aclose is None:
+        return
+    try:
+        await aclose()
+    except OSError:
+        pass  # the refusal below is raised either way
 
 
 def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> dict[str, list[Any]]:
-    """httpx event hooks that enforce a caller-held context (#6249, #6305, #6306).
+    """httpx event hooks that enforce a caller-held context (#6249, #6305, #6306, #6349).
 
     * ``request``: re-check the context before every request (early, clear
-      error) and install an httpcore ``trace`` that inspects each NEW TLS
-      session right after its handshake and before any request byte is sent;
-      an unverified session is closed and refused.
+      error) and install a per-request httpcore ``trace`` (:class:`_SessionGate`)
+      that inspects every TLS session of the request, direct, tunnelled or
+      over SOCKS, right after its handshake and before any request byte is
+      sent; an unverified session is closed and refused.
     * ``response``: a backstop that inspects the connection the response came
       over, which also covers a pooled connection and a trace event that never
       fired, so a missing check fails closed.
@@ -265,26 +367,20 @@ def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> dict[str, list
         if not _context_verifies(context):
             raise ValueError(_UNVERIFIED_MESSAGE)
 
-    def _session_of(stream: object) -> object:
-        extra = getattr(stream, "get_extra_info", None)
-        return None if extra is None else extra("ssl_object")
-
     if is_async:
-
-        async def _atrace(event: str, info: dict[str, Any]) -> None:
-            if event != _START_TLS_DONE:
-                return
-            stream = info.get("return_value")
-            try:
-                _assert_negotiated_session(_session_of(stream), context)
-            except ValueError:
-                aclose = getattr(stream, "aclose", None)
-                if aclose is not None:
-                    await aclose()
-                raise
 
         async def _arequest(request: httpx.Request) -> None:
             _recheck()
+            gate = _SessionGate(context, request)
+
+            async def _atrace(event: str, info: dict[str, Any]) -> None:
+                streams = gate.refused(event, info)
+                if streams is None:
+                    return
+                for stream in streams:
+                    await _aclose_quietly(stream)
+                raise ValueError(_SESSION_MESSAGE)
+
             _with_trace(request, _atrace)
 
         async def _aresponse(response: httpx.Response) -> None:
@@ -292,20 +388,18 @@ def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> dict[str, list
 
         return {"request": [_arequest], "response": [_aresponse]}
 
-    def _trace(event: str, info: dict[str, Any]) -> None:
-        if event != _START_TLS_DONE:
-            return
-        stream = info.get("return_value")
-        try:
-            _assert_negotiated_session(_session_of(stream), context)
-        except ValueError:
-            close = getattr(stream, "close", None)
-            if close is not None:
-                close()
-            raise
-
     def _request(request: httpx.Request) -> None:
         _recheck()
+        gate = _SessionGate(context, request)
+
+        def _trace(event: str, info: dict[str, Any]) -> None:
+            streams = gate.refused(event, info)
+            if streams is None:
+                return
+            for stream in streams:
+                _close_quietly(stream)
+            raise ValueError(_SESSION_MESSAGE)
+
         _with_trace(request, _trace)
 
     def _response(response: httpx.Response) -> None:
