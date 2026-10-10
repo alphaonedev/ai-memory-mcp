@@ -295,17 +295,30 @@ def redact_stream(buffer, forms, hold):
 
 
 def scrub_file(path, secrets):
-    """Rewrite ``path`` with the same filter as the CI log, mode 0600 (#7048).
+    """Rewrite the junit XML at ``path`` with the same filter as the CI log, mode 0600 (#7048).
+
+    The report is parsed and every text node and attribute value is filtered after
+    XML decoding, so an escaped rendering of a secret (``&amp;``, ``&lt;``,
+    ``&quot;``, a numeric character reference) is matched like the plain one
+    (#7064), and the marker is serialised as escaped text so the file stays
+    well-formed (#7063).
 
     Fail closed: when the file cannot be filtered it is removed.
     """
     forms = [form for secret in secrets for form in secret_forms(secret)]
     forms.sort(key=len, reverse=True)
     try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-        path.write_text(redact(text, forms), encoding="utf-8")
         os.chmod(path, 0o600)
-    except OSError:
+        tree = ET.parse(str(path))
+        for element in tree.getroot().iter():
+            if element.text:
+                element.text = redact(element.text, forms)
+            if element.tail:
+                element.tail = redact(element.tail, forms)
+            for key, value in element.attrib.items():
+                element.set(key, redact(value, forms))
+        tree.write(str(path), encoding="utf-8", xml_declaration=True)
+    except (OSError, ET.ParseError):
         path.unlink(missing_ok=True)
         raise
 
@@ -368,7 +381,7 @@ def run_redacted(argv, *, cwd, env, secrets):
                     scrub_file(Path(arg.split("=", 1)[1]), secrets)
                 except FileNotFoundError:
                     pass
-                except OSError as exc:
+                except (OSError, ET.ParseError) as exc:
                     print(
                         f"sdk-python-live: the junit report could not be filtered and was removed: {exc}",
                         file=sys.stderr,
