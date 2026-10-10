@@ -529,5 +529,61 @@ class Round9AccessorShape(unittest.TestCase):
         self.assertIn("${{ github.token }}", SUBSET.clip("GH_TOKEN: ${{ github.token }}"))
 
 
+
+class Round11EchoMask(unittest.TestCase):
+    """#6791 #6792 #6780 #6781 #6782 #6783: the echo mask masks a token cut by its window, keeps only a marker it
+    produced, owns nested values by the credential key above them, withholds literal operands, and an echoed row
+    keeps only its key."""
+
+    TAIL = "LEAK" + "TAIL123"
+
+    def test_clip_masks_a_token_cut_by_the_window_6791(self):
+        for k in range(455, 490):
+            body = k - 25
+            sizes = [body // 5 + (1 if i < body % 5 else 0) for i in range(5)]
+            row = "".join("gh" + "p_" + "A" * n + " " for n in sizes) + "gh" + "p_" + "Zq7" * 40
+            self.assertNotIn("ghp_Z", SUBSET.clip(row), k)
+        self.assertEqual(SUBSET.mask("v gh" + "p_abc"), "v gh" + "p_<masked>")
+        self.assertEqual(SUBSET.mask("v gh" + "p_abc def"), "v gh" + "p_abc def")
+
+    def test_mask_keeps_only_its_own_marker_6792(self):
+        self.assertNotIn("X", SUBSET.mask("PASSWORD: <withheld 9 chars> X"))
+        self.assertNotIn(self.TAIL, SUBSET.mask("PASSWORD: <withheld ${{ secrets.P }} " + self.TAIL))
+        once = SUBSET.mask("A_TOKEN: abc,d")
+        self.assertEqual(SUBSET.mask(once), once)
+        self.assertEqual(SUBSET.mask("A_TOKEN: <withheld 5 chars>"), "A_TOKEN: <withheld 5 chars>")
+
+    def test_owned_strings_carry_the_credential_owner_down_6780(self):
+        root = SUBSET.parse_workflow(
+            "PASSWORD:\n  inner: x\n  list:\n    - k: y\nNAME:\n  inner: p\nflow: {PASSWORD: {inner: z}}\n")
+        owners = {text: owner for _line, owner, text in SUBSET.owned_strings(root) if text in ("x", "y", "z", "p")}
+        self.assertEqual(owners, {"x": "PASSWORD", "y": "PASSWORD", "z": "PASSWORD", "p": "inner"})
+
+    def test_withhold_value_names_the_owner_and_never_the_text_6781(self):
+        for owner in ("TOKEN+X", "PASSWORD", "inner", ""):
+            got = SUBSET.withhold_value(owner, " " + self.TAIL + " ")
+            self.assertNotIn(self.TAIL, got)
+            self.assertIn("<withheld %d chars>" % len(self.TAIL), got)
+            self.assertTrue(got.startswith(owner), got)
+
+    def test_numeric_and_keyword_operands_are_withheld_6782(self):
+        for expr in ("secrets.P || 31337", "0xDEADBEEF", "1.5e7", "secrets.P || true", "a == null", "a && !false",
+                     "secrets.P || NaN", "a == 3", "secrets.P || -1", "(1)"):
+            got = SUBSET.mask("PIN_TOKEN: ${{ " + expr + " }}")
+            self.assertIn("<withheld", got, expr)
+        for expr in ("github.token", "secrets.P || secrets.Q", "!(a.b && c-d.e)", "a == b", "trueish.x",
+                     "needs.build.outputs.v1"):
+            self.assertEqual(SUBSET.mask("PIN_TOKEN: ${{ " + expr + " }}"), "PIN_TOKEN: ${{ " + expr + " }}", expr)
+
+    def test_an_echoed_row_keeps_only_its_key_6783(self):
+        self.assertEqual(SUBSET.echo("      PASSWORD: hunter2"), repr("      PASSWORD: <withheld 7 chars>"))
+        self.assertEqual(SUBSET.echo("curl --password=hunter2"), repr("curl --password=<withheld 7 chars>"))
+        self.assertEqual(SUBSET.echo("T\u041eKEN: " + self.TAIL), repr("T\u041eKEN: <withheld 11 chars>"))
+        self.assertEqual(SUBSET.echo("short row"), repr("short row"))
+        long_row = "--password " + self.TAIL + " and more text to run past the prefix"
+        self.assertEqual(SUBSET.echo(long_row), repr(long_row[:24] + "..."))
+        self.assertNotIn(self.TAIL, SUBSET.echo("A: " + "x" * 600 + self.TAIL))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1899,6 +1899,88 @@ def self_test():
             else f"a problem echoes {s[:16]!r}..."))
 
 
+    # round11 #6791 #6792 #6780 #6781 #6782 #6783: the echo mask masks a token cut by its window, keeps only a
+    # marker it produced itself, owns nested values by the credential key above them, withholds a literal
+    # operand of an expression, and never reprints a value (problems) or the part of a row after its key.
+    r11_tail = "LEAK" + "TAIL123"
+    r11_ref = "${{ secrets.P }} "
+    r11_uses = "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
+
+    def r11_with(body):
+        return r8_after_vstep(r11_uses + "        with:\n" + body)
+
+    def r11_run(line):
+        return r8_after_vstep("      - name: q\n        run: " + line + "\n")
+
+    def r11_straddle(lead, k):
+        """A row of `lead`, five long tokens and a token that starts at column k, so the 480-character mask
+        window cuts it and the shrunk text puts the cut token inside the 120-character echo (#6791)."""
+        body = k - len(lead) - 25
+        sizes = [body // 5 + (1 if i < body % 5 else 0) for i in range(5)]
+        head = lead + "".join("gh" + "p_" + "A" * n + " " for n in sizes)
+        return head + "gh" + "p_" + "Zq7" * 40
+
+    def r11_straddle_leak():
+        for k in range(455, 490):
+            for lead in ("", "          X: &a "):
+                shown = SUBSET.clip(r11_straddle(lead, k))
+                if "ghp_Z" in shown:
+                    return f"clip at column {k} echoes {shown[-30:]!r}"
+        return None
+
+    def r11_straddle_refusal():
+        for k in range(455, 490):
+            text = r10_env("X: &a " + r11_straddle("", k - 16)[0:])
+            if any("ghp_Z" in p for p in workflow_pin_problems(text)):
+                return f"a refusal at column {k} echoes the start of a cut token"
+        return None
+
+    check("round11 #6791: a token cut by the mask window is masked in clip()", r11_straddle_leak)
+    check("round11 #6791: a token cut by the mask window is masked in a refusal", r11_straddle_refusal)
+    r11_cells = [
+        ("round11 #6792: a value starting with the withheld marker text (secret problem)",
+         r10_env("PASSWORD: <withheld " + r11_ref + r11_tail), r11_tail),
+        ("round11 #6792: a value starting with the withheld marker text (refusal)",
+         r10_env("API_KEY: &a <withheld 9 chars> " + r11_tail), r11_tail),
+        ("round11 #6780: a block mapping under a credential key", r11_with(
+            "          PASSWORD:\n            inner: " + r11_ref + r11_tail + "\n"), r11_tail),
+        ("round11 #6780: a sequence of mappings under a credential key", r11_with(
+            "          PASSWORD:\n            - a: " + r11_ref + r11_tail + "\n"), r11_tail),
+        ("round11 #6781: a credential key holding a character outside the key class", r11_with(
+            "          TOKEN+X: " + r11_ref + r11_tail + "\n"), r11_tail),
+        ("round11 #6782: a decimal literal operand in a secret problem",
+         r10_env("PIN_TOKEN: ${{ secrets.P || 31337" + "424242 }}"), "31337" + "424242"),
+        ("round11 #6782: a hex literal operand in a secret problem",
+         r10_env("PIN_TOKEN: ${{ secrets.P || 0x" + "DEADBEEF42 }}"), "DEADBEEF42"),
+        ("round11 #6782: an exponent literal operand in a secret problem",
+         r10_env("PIN_TOKEN: ${{ secrets.P || 1.5e" + "7777 }}"), "7777"),
+        ("round11 #6782: a numeric literal alone in a tab-led refusal row",
+         "      - name: q\n        env:\n\t  PIN_TOKEN: ${{ 31337" + "424242 }}\n", "31337" + "424242"),
+        ("round11 #6782: a numeric literal alone in an over-indented refusal row",
+         r10_env("A: b") + "               PIN_TOKEN: ${{ 31337" + "424242 }}\n", "31337" + "424242"),
+        ("round11 #6783: a --password flag value in a run line", r11_run(
+            "|\n          tool --password " + r11_ref + r11_tail), r11_tail),
+        ("round11 #6783: a -p glued flag value in a run line", r11_run(
+            "mysql -u r -p" + r11_ref.strip() + r11_tail), r11_tail),
+        ("round11 #6783: URL userinfo in a run line", r11_run(
+            "curl " + r11_ref + "https://user:" + r11_tail + "@host.example"), r11_tail),
+        ("round11 #6783: a header written without a separator in a run line", r11_run(
+            "curl " + r11_ref + "-H X-Api-Key " + r11_tail), r11_tail),
+        ("round11 #6783: a Cyrillic look-alike credential key (secret problem)",
+         r10_env("TОKEN: " + r11_ref + r11_tail), r11_tail),
+        ("round11 #6783: a fullwidth credential key (refusal)",
+         r10_env("ＴＯＫＥＮ: &a " + r11_tail), r11_tail),
+        ("round11 #6783: a token whose underscore is percent-encoded (secret problem)",
+         r10_env("X: " + r11_ref + "ghp%5F" + "Zq7" * 12), "Zq7Zq7Zq7"),
+        ("round11 #6783: a literal after the key in an over-indented refusal row",
+         r10_env("A: b") + "               NOTE: &a " + r11_tail + "\n", r11_tail),
+    ]
+    for label, text, leak in r11_cells:
+        check(label, lambda t=text, s=leak: (
+            "workflow_pin_problems is empty" if not workflow_pin_problems(t)
+            else None if not any(s in p for p in workflow_pin_problems(t))
+            else f"a problem echoes {s[:16]!r}..."))
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"
