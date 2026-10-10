@@ -38,6 +38,21 @@ certification and triggers re-cert** (see §7).
 > run after code freeze. Re-binding to a newer SHA without that re-measurement is
 > forbidden (#3899).
 >
+> **Amendment (2026-10-10, #6162 - section 7 record for the ports of #4208 and #4314, non-discharging; re-issue tracked in #6413).**
+> Two section 7 watched federation-wire files changed after the 2026-10-07 expiry record:
+> - `src/handlers/federation_receive.rs`
+> - `src/handlers/federation_signing_check.rs`
+> Receive behaviour changed in this record, unlike the doc-comment only record above it.
+> The stale-push quarantine release path now frees a quarantined row on dequarantine-on-attest
+> only when the persisted row itself carries the verified signed surface (same content, same
+> signing author), and on SQLite that release joins a caller-held transaction instead of nesting
+> its own. No AI_MEMORY_FED identifier name changed. Nothing was re-measured and nothing was
+> re-bound: this record does not re-measure and does not re-bind, and the certification stays
+> EXPIRED. The re-measurement must now also cover the changed release predicate; it and the
+> re-issue are tracked in issue 6413 under WP-B1. Re-binding without that re-measurement is
+> forbidden (the 3899 rule).
+> Path back to LIVE: WP-B1 re-cert ([#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063)) only.
+>
 > **Amendment (2026-10-08, #6116 - second §7 record for the #4507 doc-comment retargets).**
 > Two §7-watched federation-wire files changed again after the 2026-10-07
 > expiry record above, through the #4507 citation-retarget chain
