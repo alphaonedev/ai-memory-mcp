@@ -7,7 +7,8 @@ Reads the tier URL from ``--url-file`` and refuses (exit 1, one ``::error::`` li
 
 * is empty or absent,
 * is shorter than 16 characters once percent-decoded, or
-* is equal to, or contained in, the user, a host (the URL host or a ``host=`` query value) or the database name, or
+* is equal to, or contained in, the user, a host or the database name (from the URL or from the ``user=``,
+  ``host=``, ``hostaddr=`` and ``dbname=`` query keys) or any other query value (#6640), or
 * contains one of those components when it is at least 8 characters long (a shorter component can occur in a
   random password by chance).
 
@@ -28,6 +29,8 @@ EXIT_BAD_INPUT = 2
 MIN_PASSWORD_LENGTH = 16
 MIN_CONTAINED_COMPONENT = 8
 URL_SCHEMES = ("postgres", "postgresql")
+# libpq query keys that name a URL component; every other query value is checked under the kind "query" (#6640)
+QUERY_KINDS = {"user": "user", "host": "host", "hostaddr": "host", "dbname": "database"}
 
 
 class BadInput(Exception):
@@ -45,17 +48,18 @@ def components(url):
         user, _, raw_password = userinfo.partition(":")
         host = hostport.rsplit(":", 1)[0] if not hostport.startswith("[") else hostport.split("]")[0].lstrip("[")
         password = unquote(raw_password, errors="surrogateescape")
-        hosts = [unquote(host)]
+        named = {"user": [unquote(user)], "host": [unquote(host)],
+                 "database": [unquote(parts.path[1:]) if parts.path.startswith("/") else ""], "query": []}
         for segment in parts.query.split("&"):
             key, _, value = segment.partition("=")
-            if unquote(key) == "password":
+            key = unquote(key)
+            if key == "password":
                 password = unquote(value, errors="surrogateescape")
-            elif unquote(key) == "host":
-                hosts.append(unquote(value))
-        database = unquote(parts.path[1:]) if parts.path.startswith("/") else ""
+            else:
+                named[QUERY_KINDS.get(key, "query")].append(unquote(value))
     except ValueError:
         raise BadInput("the tier URL file does not hold a valid postgres:// URL")
-    return password, {"user": [unquote(user)], "host": hosts, "database": [database]}
+    return password, named
 
 
 def problems(password, named):

@@ -192,7 +192,8 @@ database). Those components are shown on psql argv and in process listings, so a
 exposed with it. The "Configure enterprise-fed tier" step enforces the floor before it uses the URL:
 `python3 -I scripts/ci/check-tier-password.py --url-file "$url_file"` fails the step with a `::error::` line (no value
 printed) when the password is empty, shorter than 16 characters, equal to or contained in the user, host or database,
-or contains such a component of 8+ characters. Rotate a failing tier password, never relax the check. The AGE
+or contains such a component of 8+ characters. The `user=`, `host=`, `hostaddr=` and `dbname=` query keys count as
+those components, and every other query value is checked the same way (#6640). Rotate a failing tier password, never relax the check. The AGE
 self-heal passes the database name to psql through `PGDATABASE`, so its argv carries no path component.
 
 **AGE self-heal (#6161).** The hand-built AGE 1.8.0 files originally lived inside
