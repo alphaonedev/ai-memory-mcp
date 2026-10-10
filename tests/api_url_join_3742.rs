@@ -6,7 +6,7 @@
 //!
 //! Every OpenAI-compatible and Ollama request URL used to be built as
 //! `format!("{base_url}/<path>")`. A base URL that carries a query string —
-//! Azure OpenAI's `?api-version=2024-02-01` is the common real case — had
+//! the Azure-style `?api-version=2024-02-01` is the common real case — had
 //! the path appended AFTER the query: `…/v1?api-version=2024-02-01/models`.
 //! The request went to the wrong resource and the query value was corrupted.
 //!
