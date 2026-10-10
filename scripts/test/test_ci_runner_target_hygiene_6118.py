@@ -3968,6 +3968,30 @@ class PruneScript6118(unittest.TestCase):
                         # the same-device artifacts around the mount still go
                         self.assertFalse((self.target / "debug" / "deps" / "ai_memory-0a1b").exists(), label)
 
+    def test_6118_r7_6479_profile_subdir_on_another_file_system_is_never_scanned(self) -> None:
+        # `deps` itself is the mount and the scope is the default: the planner must refuse to open it,
+        # not list the executable on the other volume as a candidate (mutant R20).
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run):
+                self.setUp()  # a fresh tree per subcase
+                mount = self.target / "debug" / "deps"
+                victim = mount / "victim_on_other_volume-0123456789abcdef"
+                _write(victim, 64, True)
+                mod = _load_prune()
+                stack, patches = self._other_device(mod, [mount])
+                out = io.StringIO()
+                args = ["--target-dir", str(self.target)] + (["--dry-run"] if dry_run else [])
+                with stack:
+                    for patch in patches:
+                        stack.enter_context(patch)
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                        rc = mod.main(args)
+                self.assertEqual(0, rc, out.getvalue())
+                self.assertTrue(victim.is_file(), out.getvalue())
+                self.assertNotIn("victim_on_other_volume", out.getvalue())
+                self.assertIn("debug/deps", out.getvalue())
+                self.assertIn("other file system", out.getvalue())
+
     # ---- #6313 residual: a raw byte 0x80-0x9F and the C1 code point U+0080-U+009F ----
 
     def test_6118_r7_6313_raw_byte_and_c1_code_point_print_differently(self) -> None:
