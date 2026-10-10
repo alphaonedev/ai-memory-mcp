@@ -245,3 +245,57 @@ fn issue_6157_negotiate_echoes_supported_and_downgrades_everything_else() {
         );
     }
 }
+
+/// #6157 round 3 (code F2 / cloud F2): the walk must not read gitignored local
+/// artefacts. Plants an old-revision `protocolVersion` line under every
+/// directory name that is a build output, virtualenv, tool cache or sibling
+/// agent worktree, plus one tracked-style file that must still be seen, and
+/// asserts the walk returns only the latter. The scratch tree lives under the
+/// repo's `.local-runs/` (project rule: never `/tmp`).
+#[test]
+fn issue_6157_walk_skips_gitignored_local_artefact_dirs() {
+    const LOCAL_ARTEFACT_DIRS: [&str; 10] = [
+        "dist",
+        "build",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "worktrees",
+        "node_modules",
+    ];
+    let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".local-runs")
+        .join(format!("ssot-6157-walk-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&scratch);
+    let plant = r#"{"protocolVersion": "2025-03-26"}"#;
+    for dir in LOCAL_ARTEFACT_DIRS {
+        // Nested one level down: the exclusion applies at any depth.
+        let nested = scratch.join("clients").join("shim").join(dir);
+        fs::create_dir_all(&nested).expect("create planted dir");
+        fs::write(nested.join("x.json"), plant).expect("plant json");
+        fs::write(nested.join("x.md"), plant).expect("plant md");
+    }
+    let kept = scratch.join("docs");
+    fs::create_dir_all(&kept).expect("create kept dir");
+    fs::write(kept.join("kept.md"), plant).expect("plant kept");
+
+    let mut files = Vec::new();
+    let mut unreadable = Vec::new();
+    walk(&scratch, &mut files, &mut unreadable);
+    let seen: Vec<String> = files
+        .iter()
+        .filter_map(|f| f.strip_prefix(&scratch).ok())
+        .map(|p| p.display().to_string())
+        .collect();
+    let _ = fs::remove_dir_all(&scratch);
+
+    assert!(unreadable.is_empty(), "unreadable: {unreadable:?}");
+    assert_eq!(
+        seen,
+        vec!["docs/kept.md".to_string()],
+        "the walk read gitignored local artefacts (or lost a tracked dir)"
+    );
+}
