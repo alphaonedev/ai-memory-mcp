@@ -377,6 +377,7 @@ fn act_on_liveness(path: &Path, liveness: SocketLiveness) -> Result<()> {
                 path.display()
             )
         }),
+        SocketLiveness::Gone => Ok(()),
         SocketLiveness::Unknown(e) => Err(e).with_context(|| {
             format!(
                 "wake-hub: {} is a socket but could not be probed; refusing to \
@@ -389,7 +390,7 @@ fn act_on_liveness(path: &Path, liveness: SocketLiveness) -> Result<()> {
 
 /// What a single NON-BLOCKING connect says about the socket at a path.
 #[derive(Debug)]
-pub enum SocketLiveness {
+pub(crate) enum SocketLiveness {
     /// A listener accepted the connection: a live hub owns the path.
     Live,
     /// A listener exists but its accept queue is full (`EAGAIN`): live, and
@@ -398,6 +399,9 @@ pub enum SocketLiveness {
     /// Nothing is bound to the path (`ECONNREFUSED`): the one DEFINITE-stale
     /// outcome, and the only one that licenses an unlink.
     Stale,
+    /// The path vanished between the stat and the probe (`ENOENT`): nobody
+    /// holds it any more, so there is nothing to refuse and nothing to unlink.
+    Gone,
     /// Anything else. Ambiguous, so it is treated as "do not unlink".
     Unknown(io::Error),
 }
@@ -417,16 +421,17 @@ pub enum SocketLiveness {
 /// Only `ECONNREFUSED` is definite-stale. Every other outcome — accepted,
 /// queue-full, or any error — is live-or-unknown, and refuses takeover.
 ///
-/// Known residual, tracked as #4120: on macOS/BSD a live listener with a FULL
+/// Known residual, tracked under #6056: on macOS/BSD a live listener with a FULL
 /// accept queue also answers `ECONNREFUSED`, so there a wedged hub is still
 /// indistinguishable from a stale socket by this probe alone.
 #[must_use]
-pub fn probe_socket_liveness(path: &Path) -> SocketLiveness {
+pub(crate) fn probe_socket_liveness(path: &Path) -> SocketLiveness {
     // The connected stream drops at the end of the match arm: a probe that
     // connected closes at once, exactly as the blocking probe did.
     match connect_nonblocking(path) {
         Ok(_connected) => SocketLiveness::Live,
         Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => SocketLiveness::Stale,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => SocketLiveness::Gone,
         // Linux reports a full accept queue on a non-blocking AF_UNIX connect
         // as EAGAIN. EINPROGRESS cannot occur for AF_UNIX on Linux, but if a
         // platform ever returns it, a connect in flight is a listener.
@@ -453,7 +458,7 @@ pub fn probe_socket_liveness(path: &Path) -> SocketLiveness {
 ///
 /// The `connect(2)` error, untouched, so the caller can classify it; or
 /// `InvalidInput` for a path `sockaddr_un` cannot carry.
-pub fn connect_nonblocking(path: &Path) -> io::Result<UnixStream> {
+pub(crate) fn connect_nonblocking(path: &Path) -> io::Result<UnixStream> {
     let (addr, len) = unix_sockaddr(path)?;
     // SAFETY: a plain syscall with constant arguments; the descriptor it
     // returns is checked below and then owned by `OwnedFd`, which closes it on
@@ -464,6 +469,7 @@ pub fn connect_nonblocking(path: &Path) -> io::Result<UnixStream> {
     }
     // SAFETY: `raw` is a freshly created descriptor nothing else owns.
     let stream = UnixStream::from(unsafe { OwnedFd::from_raw_fd(raw) });
+    set_cloexec(&stream)?;
     stream.set_nonblocking(true)?;
     // SAFETY: `addr` is a fully initialised `sockaddr_un` that outlives the
     // call, and `len` is the number of its bytes in use.
@@ -479,6 +485,24 @@ pub fn connect_nonblocking(path: &Path) -> io::Result<UnixStream> {
     } else {
         Err(io::Error::last_os_error())
     }
+}
+
+/// Mark `stream` close-on-exec. Where `socket(2)` accepts `SOCK_CLOEXEC` this
+/// is already set and the call is a cheap confirmation; elsewhere (macOS/BSD)
+/// it is the only way, and the window between `socket` and here is the same
+/// one `std`'s own `UnixStream` has off Linux (#6234).
+fn set_cloexec(stream: &UnixStream) -> io::Result<()> {
+    let fd = stream.as_raw_fd();
+    // SAFETY: `fd` is a descriptor `stream` owns for the whole call.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: as above; only the close-on-exec bit is added.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// `SOCK_CLOEXEC` where the platform offers it on `socket(2)`; the probe
