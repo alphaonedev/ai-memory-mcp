@@ -778,16 +778,8 @@ mod postgres_parity {
                 break;
             }
         }
-        let Some(anchored) = anchored else {
-            eprintln!("skip: no watermark fired within 300 pg appends (shared-DB throttle state)");
-            sqlx::query("DELETE FROM signed_events WHERE sequence > $1")
-                .bind(base_seq)
-                .execute(pg.pool())
-                .await
-                .ok();
-            witness::shutdown();
-            return;
-        };
+        let anchored =
+            anchored.expect("#7115: configured PostgreSQL fixture must emit an audit watermark");
 
         // CLEAN chain: the anchored row survives intact → the micros-readback
         // recompute MATCHES the anchor (also micros, post-#2203) → NotDetected.
