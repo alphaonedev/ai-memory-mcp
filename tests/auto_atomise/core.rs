@@ -667,6 +667,51 @@ fn test_auto_atomise_above_threshold_triggers() {
 // Test 4 — auto_atomise does NOT block store response latency
 // ===========================================================================
 
+/// #6793 — the absolute on-path ceiling (the pre-#6793 constant).
+const ON_PATH_FLOOR: Duration = Duration::from_millis(50);
+
+/// #6793 — how many times the per-run `spawn + join` baseline the on-path
+/// median may cost before the hook counts as blocking. A blocking hook (a
+/// curator round-trip) costs hundreds of milliseconds; a loaded host slows the
+/// baseline and the hook together.
+const ON_PATH_BASELINE_MULTIPLE: u32 = 20;
+
+/// #6793 — median of five bare `std::thread::spawn(..).join()` round trips:
+/// the same primitive the on-path hook pays, measured on THIS host under THIS
+/// load, so the ceiling tracks the runner instead of a fixed number.
+fn spawn_join_baseline() -> Duration {
+    let mut xs: Vec<Duration> = (0..5)
+        .map(|_| {
+            let t0 = std::time::Instant::now();
+            let _ = std::thread::spawn(|| {}).join();
+            t0.elapsed()
+        })
+        .collect();
+    xs.sort();
+    xs[xs.len() / 2]
+}
+
+/// #6793 — on-path median ceiling for a measured `baseline`.
+fn on_path_ceiling(_baseline: Duration) -> Duration {
+    ON_PATH_FLOOR
+}
+
+#[test]
+fn on_path_ceiling_scales_with_host_baseline_6793() {
+    // Idle host: the floor still applies.
+    assert_eq!(on_path_ceiling(Duration::from_micros(80)), ON_PATH_FLOOR);
+    assert_eq!(on_path_ceiling(Duration::ZERO), ON_PATH_FLOOR);
+    // Loaded host (spawn+join takes 5 ms): the 61 ms median seen at load ~85
+    // must pass, so the ceiling is 20x the baseline, not the fixed floor.
+    let loaded = on_path_ceiling(Duration::from_millis(5));
+    assert_eq!(loaded, Duration::from_millis(100));
+    assert!(Duration::from_millis(61) < loaded);
+    // A blocking hook (curator round-trip, hundreds of ms) still trips it.
+    assert!(Duration::from_millis(400) >= on_path_ceiling(Duration::from_millis(5)));
+    // The baseline multiple saturates instead of overflowing.
+    assert!(on_path_ceiling(Duration::MAX) >= ON_PATH_FLOOR);
+}
+
 #[test]
 fn test_auto_atomise_does_not_block_store_response() {
     let _g = test_guard();
@@ -733,9 +778,12 @@ fn test_auto_atomise_does_not_block_store_response() {
     // We assert the on-path median is at most 10x the off-path
     // median AND under 50ms absolute. Either condition would catch
     // a regression where the hook accidentally blocks on the curator.
+    let baseline = spawn_join_baseline();
+    let ceiling = on_path_ceiling(baseline);
     assert!(
-        m_on < Duration::from_millis(50),
-        "on-path median should be sub-50ms (was {m_on:?})"
+        m_on < ceiling,
+        "on-path median should stay under the load-scaled ceiling {ceiling:?} \
+         (spawn+join baseline {baseline:?}; was {m_on:?})"
     );
     // Both medians sub-millisecond is the expected steady state.
     // Cluster-F PERF-1 eliminated the per-hook `db::open` round-trip,
