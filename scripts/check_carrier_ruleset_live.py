@@ -1697,6 +1697,28 @@ def self_test():
                 "    name: ${{ 'Carrier-ruleset live verifier (#6143)' }}\n"))):
         check(label, lambda t=text: None if workflow_pin_problems(t) else "workflow_pin_problems is empty")
 
+    # round8 #6620: GitHub expression contexts are case-insensitive, so a `secrets` reference in any
+    # letter case is a repository secret (review mutant R23); `gh` reads only GH_TOKEN, so a verifier
+    # that sets just a lowercase gh_token has no credential (review mutant R16).
+    for label, text, needle in (
+            ("round8 #6620: upper-case SECRETS context in a #6143 job", r8_after_vstep(
+                "      - name: s\n        env:\n          X: ${{ SECRETS.PAT }}\n        run: printenv\n"),
+             "job carrier-ruleset-live-gate references a repository secret"),
+            ("round8 #6620: mixed-case Secrets context in a #6143 job", r8_after_vstep(
+                "      - name: s\n        env:\n          X: ${{ Secrets.PAT }}\n        run: printenv\n"),
+             "job carrier-ruleset-live-gate references a repository secret"),
+            ("round8 #6620: upper-case SECRETS context at workflow level", swap(
+                wf_text, top_perm, "\nenv:\n  X: ${{ SECRETS.PAT }}\n" + top_perm),
+             "workflow references a repository secret"),
+            ("round8 #6620: mixed-case sEcReTs context at workflow level", swap(
+                wf_text, top_perm, "\nenv:\n  X: ${{ sEcReTs.PAT }}\n" + top_perm),
+             "workflow references a repository secret"),
+            ("round8 #6620: verifier sets only a lowercase gh_token", r8_in_live(
+                "          GH_TOKEN: ${{ github.token }}\n", "          gh_token: ${{ github.token }}\n"),
+             "job carrier-ruleset-live-gate does not set GH_TOKEN")):
+        check(label, lambda t=text, n=needle: None if any(n in p for p in workflow_pin_problems(t))
+              else f"workflow_pin_problems does not report {n!r}")
+
     # round8 #6612: nesting past SUBSET.MAX_DEPTH is a named refusal with a line, never a RecursionError.
     for label, text, needle in (
             ("round8 #6612: 1500-level block nesting is a named refusal",

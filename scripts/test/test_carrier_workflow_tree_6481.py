@@ -301,11 +301,14 @@ class TokenPins(unittest.TestCase):
     def test_permissions(self):
         for grant, bad in (("write", True), ("Write-All", True), ("WRITE", True), (" write ", True),
                            ("read", False), ("read-all", True), ("none", False), ("Read", True)):
-            text = with_verifier(f"    permissions:\n      contents: {grant}\n").replace(
-                "    permissions:\n      contents: read\n      issues: read\n    permissions", "    permissions", 1)
-            text = with_verifier("").replace("      issues: read\n    steps:", f"      issues: {grant}\n    steps:", 1)
-            got = [p for p in self.problems(text) if "permissions grant write" in p]
-            self.assertEqual(bool(got), bad, grant)
+            # #6620: the contents: and the issues: grant are separate variants, each asserted
+            contents = with_verifier("").replace("      contents: read\n      issues: read\n    steps:",
+                                                 f"      contents: {grant}\n      issues: read\n    steps:", 1)
+            issues = with_verifier("").replace("      issues: read\n    steps:", f"      issues: {grant}\n    steps:", 1)
+            for text in (contents, issues):
+                self.assertTrue(grant == "read" or text != with_verifier(""), grant)
+                got = [p for p in self.problems(text) if "job carrier-ruleset-live-gate permissions grant write" in p]
+                self.assertEqual(bool(got), bad, grant)
         scalar = WF.replace("permissions:\n  contents: read\n", "permissions: write-all\n", 1)
         self.assertTrue([p for p in self.problems(scalar) if "grant write" in p])
 
@@ -329,6 +332,13 @@ class TokenPins(unittest.TestCase):
         self.assertTrue([p for p in self.problems(upper) if "does not carry name" in p])
 
     def test_verifier_must_set_gh_token(self):
+        lower = WF.replace("          GH_TOKEN: ${{ github.token }}\n        run: python3 -I scripts/check_carrier_ruleset_live.py\n",
+                           "          gh_token: ${{ github.token }}\n        run: python3 -I scripts/check_carrier_ruleset_live.py\n", 1)
+        self.assertNotEqual(lower, WF)
+        self.assertTrue([p for p in self.problems(lower) if "does not set GH_TOKEN" in p])  # #6620, mutant R16
+        for spelling in ("SECRETS", "Secrets", "sEcReTs"):  # #6620, mutant R23
+            text = with_verifier(f"    env:\n      EXTRA: ${{{{ {spelling}.PAT }}}}\n")
+            self.assertTrue(self.has(text, "references a repository secret"), spelling)
         for old, new in (("          GH_TOKEN: ${{ github.token }}\n        run: python3 -I scripts/check_carrier_ruleset_live.py\n",
                           "          GITHUB_TOKEN: ${{ github.token }}\n        run: python3 -I scripts/check_carrier_ruleset_live.py\n"),
                          ("          GH_TOKEN: ${{ github.token }}\n        run: python3 -I scripts/check_carrier_ruleset_live.py\n",
