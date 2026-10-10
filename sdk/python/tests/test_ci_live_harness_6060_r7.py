@@ -134,6 +134,14 @@ def run(tmp_path: pathlib.Path) -> Iterator[Run]:
         harness_run.close()
 
 
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
 def _gone(run: Run, timeout: float = 10) -> dict[str, int]:
     end = time.monotonic() + timeout
     while run.alive() and time.monotonic() < end:
@@ -184,6 +192,25 @@ def test_default_port_is_a_free_loopback_port_6831(run: Run) -> None:
     serve = (run.marks / f"serve-{run.children()['serve']}").read_text()
     port = int(re.search(r'"--port", "(\d+)"', serve).group(1))  # type: ignore[union-attr]
     assert port != 9077 and 0 < port < 65536, serve
+
+
+@_POSIX_ONLY
+def test_teardown_reaps_every_child_of_the_harness_6812(run: Run) -> None:
+    """A child the harness spawns just before the test kills it must not outlive the test.
+
+    The harness starts the hub right after serve; killing only the harness and the
+    children whose marker already exists left that hub running.
+    """
+    run.start()
+    assert run.proc is not None
+    pgid = run.proc.pid
+    assert os.getpgid(run.proc.pid) == pgid, "the harness must lead its own process group"
+    run.wait_for("serve")
+    run.close()
+    end = time.monotonic() + 10
+    while _group_alive(pgid) and time.monotonic() < end:
+        time.sleep(0.1)
+    assert not _group_alive(pgid), f"left running: {run.alive()}"
 
 
 def test_free_port_is_bindable_on_loopback_6831() -> None:
