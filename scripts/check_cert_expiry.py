@@ -194,7 +194,7 @@ AMENDMENT_BACK_RE = re.compile(r"^>[ ]{0,4}Path back to LIVE:")
 # tildes; a backtick fence's info string carries no backtick. Indentation is
 # deliberately NOT capped here: reading an indented code line as a fence only
 # hides more text from the ledger, which can only make the gate stricter.
-FENCE_OPEN_RE = re.compile(r"^(>?)[ \t]*(`{3,}|~{3,})(.*)$")
+FENCE_OPEN_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
 QUOTED_BLANK_RE = re.compile(r"^>[ \t\r]*$")
 BLANK_RE = re.compile(r"^[ \t\r]*$")
 HTML_COMMENT_RE = re.compile(r"<!--.*?-->")
@@ -213,7 +213,12 @@ HTML_BLOCK_KINDS = (
     (re.compile(r"^[ ]{0,3}<![A-Za-z]"), re.compile(r">")),
     (re.compile(r"^[ ]{0,3}</?[A-Za-z]"), None),
 )
-QUOTE_MARKERS_RE = re.compile(r"^(?:[ ]{0,3}>[ ]?)+")
+# #6443: one blockquote marker (up to 3 columns of indent, one optional space
+# after the '>'; the line's tabs are expanded first) and one list-item marker
+# (bullet or ordered; its content starts 1-4 columns after the marker).
+QUOTE_MARK_RE = re.compile(r"^[ ]{0,3}>[ ]?")
+QUOTE_START_RE = re.compile(r"^[ ]{0,3}>")
+LIST_MARK_RE = re.compile(r"^([ ]{0,3})(?:[-*+]|\d{1,9}[.)])(?:([ ]{1,4})(?=[^ ])|[ ]*$)")
 # #6354/#6367: the new record's grammar and character set. Every body line is
 # a list entry, the back line or plain prose (a letter first); every line
 # (header included) is printable ASCII, a tab, or one of a few typographic
@@ -458,20 +463,54 @@ def read_cert_doc(repo, tree):
         ) from exc
 
 
-def _fence_opener(ln):
-    """(quoted, char, run length) when LN opens a CommonMark code fence."""
-    m = FENCE_OPEN_RE.match(ln)
-    if not m or (m.group(2)[0] == "`" and "`" in m.group(3)):
+def _containers(ln):
+    """(quoted, quote-stripped content, fully stripped content, list pad) of
+    LN (#6443, #6365). Tabs are expanded, then every blockquote marker is
+    removed (up to 3 columns of indent, one optional space), and inside a
+    blockquote every list-item marker too, nested in any order. PAD is the
+    columns the list markers took: a fence or HTML block opened in a list
+    item ends only with the blockquote or at its own closing text, and a
+    reader that did not see the opener would accept a hidden record."""
+    text = ln.expandtabs(4)
+    quoted = QUOTE_START_RE.match(text) is not None
+    if not quoted:
+        return False, text, text, 0
+    pad = 0
+    while True:
+        m = QUOTE_MARK_RE.match(text)
+        if not m:
+            break
+        text = text[m.end():]
+    plain = text
+    while True:
+        m = QUOTE_MARK_RE.match(text) or LIST_MARK_RE.match(text)
+        if not m:
+            break
+        if QUOTE_MARK_RE.match(text):
+            text = text[m.end():]
+            continue
+        pad += m.end()
+        text = text[m.end():]
+    return True, plain, text, pad
+
+
+def _fence_opener(content, quoted, pad):
+    """(quoted, char, run length, pad) when CONTENT (a line with its
+    containers removed) opens a CommonMark code fence."""
+    m = FENCE_OPEN_RE.match(content)
+    if not m or (m.group(1)[0] == "`" and "`" in m.group(2)):
         return None
-    return (m.group(1) == ">", m.group(2)[0], len(m.group(2)))
+    return (quoted, m.group(1)[0], len(m.group(1)), pad)
 
 
-def _fence_closes(ln, fence):
-    """True iff LN closes FENCE: same container, at most 3 columns of
-    indentation, the same character, a run at least as long, nothing after."""
-    quoted, char, run = fence
-    prefix = r"^> ?[ ]{0,3}" if quoted else r"^[ ]{0,3}"
-    return re.match(prefix + re.escape(char) + "{%d,}[ \\t\\r]*$" % run, ln) is not None
+def _fence_closes(plain, fence):
+    """True iff PLAIN (a line with its blockquote markers removed) closes
+    FENCE: at most 3 columns of indentation past the list item content the
+    fence was opened in, the same character, a run at least as long, nothing
+    after."""
+    _quoted, char, run, pad = fence
+    prefix = "^[ ]{0,%d}" % (pad + 3)
+    return re.match(prefix + re.escape(char) + "{%d,}[ \\t\\r]*$" % run, plain) is not None
 
 
 def _ledger_plain(ln):
@@ -505,14 +544,13 @@ def parse_ledger(lines):
     html = None  # (quoted, end regex or None) of the open HTML block
     seen_status = False
     for idx, ln in enumerate(lines):
-        quoted = ln.startswith(">")
-        content = QUOTE_MARKERS_RE.sub("", ln, count=1) if quoted else ln
+        quoted, plain, content, pad = _containers(ln)
         if html is not None:
             if html[0] and not quoted:
                 html = None  # the blockquote ended, and its HTML block with it
             else:
                 # In an unquoted block a '>' is raw text, so the raw line is read.
-                text = content if html[0] else ln
+                text = plain if html[0] else ln
                 if html[1] is None:
                     if BLANK_RE.match(text):
                         html = None
@@ -523,7 +561,7 @@ def parse_ledger(lines):
             if fence[0] and not quoted:
                 fence = None  # the blockquote ended, and its fence with it
             else:
-                if _fence_closes(ln, fence):
+                if _fence_closes(plain, fence):
                     fence = None
                 continue
         if in_comment:
@@ -533,7 +571,7 @@ def parse_ledger(lines):
         if "<!--" in ln:
             in_comment = "<!--" in HTML_COMMENT_RE.sub("", ln)
             continue
-        opener = _fence_opener(ln)
+        opener = _fence_opener(content, quoted, pad)
         if opener is not None:
             fence = opener
             continue
