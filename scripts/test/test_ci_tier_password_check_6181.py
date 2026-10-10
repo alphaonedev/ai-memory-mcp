@@ -19,6 +19,7 @@ CHECK = "scripts/ci/check-tier-password.py"
 CALL = 'if ! python3 -I ' + CHECK + ' --url-file "$url_file"; then'
 READ = 'base_url="$(cat "$url_file")"'
 FIRST_PSQL = re.compile(r'\bpsql\s+"\$')
+STEP_IF = "if: needs.classify.outputs.docs_only != 'true' && matrix.tier == 'enterprise-fed'"
 
 
 def step_lines(text):
@@ -73,6 +74,19 @@ class TestTierPasswordWiring6181(unittest.TestCase):
             "exit 0": (CALL + "\n            exit 1", CALL + "\n            exit 0"),
             "continue-on-error": ("        shell: bash\n        env:\n          # matrix.leg via env",
                                   "        shell: bash\n        continue-on-error: true\n        env:\n          # matrix.leg via env"),
+            # #6671: edits that leave every line in place but make the check unreachable.
+            "guarded by an if": (CALL + "\n            exit 1\n          fi",
+                                 'if [ "${CI_NODE:-}" = "never" ]; then\n          ' + CALL
+                                 + "\n            exit 1\n          fi\n          fi"),
+            "inside a function": (CALL + "\n            exit 1\n          fi",
+                                  "tier_check() {\n          " + CALL + "\n            exit 1\n          fi\n          }"),
+            "inside a subshell": (CALL + "\n            exit 1\n          fi",
+                                  "(\n          " + CALL + "\n            exit 1\n          fi\n          )"),
+            "inside a case": (CALL + "\n            exit 1\n          fi",
+                              'case "${CI_NODE:-}" in never)\n          ' + CALL
+                              + "\n            exit 1\n          fi\n          ;; esac"),
+            "step if && false": (STEP_IF, STEP_IF + " && false"),
+            "step if dropped tier": (STEP_IF, STEP_IF.replace(" && matrix.tier == 'enterprise-fed'", " && false")),
         }
         block = CALL + "\n            exit 1\n          fi\n"
         self.assertEqual(text.count(block.replace("            exit 1", "            exit 1")), 1)
