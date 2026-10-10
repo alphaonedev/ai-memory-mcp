@@ -1964,7 +1964,13 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     exp6124 = fx.commit([CERT_DOC], "base: banner EXPIRED (#6124)")
     # #6358: the header date is bounded below by the merge-base commit day, so
     # the fixture dates its records from its own commit day, never a constant.
-    day6124 = _commit_day(repo, exp6124)
+    # #6445: the date comes from git itself, and every production helper the
+    # cells call is checked up front, so a base without them fails with a
+    # NAMED cell instead of a NameError.
+    for helper in ("_commit_day", "read_cert_doc", "ledger_append_only", "_in_ledger"):
+        if helper not in globals():
+            t.fail(f"(6124-helpers): production helper {helper} is missing")
+    day6124 = datetime.date.fromisoformat(fx.g("show", "-s", "--format=%cs", exp6124))
     today6124 = day6124.isoformat()
 
     def amend(ref, items, cite=True, tag="Amendment", fence=False, date=None, back=None,
@@ -2685,6 +2691,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     # read as part of it (RED). Skipped with a NOTE when this checkout has no
     # readable cert doc or its banner is not EXPIRED/VOID with a record.
     real_doc = None
+    r_ran = False
     proc_rd = real_run_git(REPO_ROOT, "show", f"HEAD:{CERT_DOC}")
     if proc_rd.returncode == 0:
         real_doc = proc_rd.stdout.decode("utf-8", "replace")
@@ -2714,6 +2721,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
             fx.write(CERT_DOC, "\n".join(doc_lines))
             return fx.commit([mod_rs, CERT_DOC], f"6124 cell {label}")
 
+        r_ran = True
         r1 = real_cell("r1", rl[:hd_i] + rec_l + [">"] + rl[hd_i:])
         t.expect_green("6124-r1", "committed doc + record above its first amendment", repo,
                        mb_r, r1, green6124)
@@ -2738,7 +2746,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     if t.failed:
         print("check-cert-expiry self-test: FAIL", file=sys.stderr)
         return 2
-    print(SELF_TEST_OK)
+    print(SELF_TEST_OK + (SELF_TEST_OK_R if r_ran else SELF_TEST_NO_R))
     return 0
 
 
@@ -2796,9 +2804,21 @@ SELF_TEST_OK = (
     "absent, unreadable, symlinked, oversized or non-UTF-8 (#6368) cert doc and a failed "
     "blob read fail-closed; the "
     "EXPIRED headline names the non-discharging amendment, not re-issue (#6369), and the "
-    "remedy names the record, its legal spots and #3899; (6124-r1..r4, #6355) the "
-    "committed cert doc with a record at each legal spot GREEN and behind an opener or "
-    "above non-record prose RED."
+    "remedy names the record, its legal spots and #3899; (6124-l*, q*, #6443) a record behind "
+    "an HTML block or fence opened in a `> - ` / `> 1. ` item, behind an indented `>` or a "
+    "`>` + tab RED; (6124-p*, #6420) a record away from the ledger RED; (6124-d*, #6423) a "
+    "doc-only delete, re-date, edit, reorder or doc deletion of the records RED; (6124-i*) a "
+    "header citing zero, two, three or a suffixed issue RED; (6124-m*) the #6063 cite as an "
+    "image RED; (6124-e*) no re-issue advice for an EXPIRED deleted or garbled doc; "
+    "(6124-k*, #6444) the six mutant-killing cells"
+)
+SELF_TEST_OK_R = (
+    "; (6124-r1..r4, #6355) the committed cert doc with a record at each legal spot GREEN "
+    "and behind an opener or above non-record prose RED."
+)
+SELF_TEST_NO_R = (
+    " (the committed-doc cells r1..r4 did not run: this checkout has no EXPIRED/VOID "
+    "cert doc with a record)."
 )
 
 
