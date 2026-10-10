@@ -5461,32 +5461,127 @@ class ApprovalCheckoutAndTopLevel6629(unittest.TestCase):
 class MergeGroupTriggerPinned6682(unittest.TestCase):
     """A required workflow without ``merge_group`` never reports on the queue ref, so a merge
     queue wedges (#3089), and the approval evaluator's merge_group arm (#6227, #6325) never
-    runs.  The four workflows that carry the trigger keep it exactly; the two self-hosted
-    required workflows that lack it are an explicit, tracked gap (#6727) that cannot grow."""
+    runs.  Every workflow rule (f) of scripts/check-required-contexts.sh trusts to carry a
+    required context, plus claude-md-guard.yml, carries the trigger exactly (#6682, #6727).
+    The set is derived from the gate's COVERED_WORKFLOWS default, so a newly covered workflow
+    without the trigger fails here; there is no known-gap list."""
 
-    PINNED = ("c8-precheck.yml", "ci.yml", "coverage.yml", "claude-md-guard.yml")
-    KNOWN_GAP_6727 = ("cert-postgres-age.yml", "postgres-ignored.yml")
+    PINNED = ("c8-precheck.yml", "ci.yml", "coverage.yml", "claude-md-guard.yml",
+              "cert-postgres-age.yml", "postgres-ignored.yml")
     ROW = "  merge_group:\n    types: [checks_requested]\n"
+    GATE = ROOT / "scripts" / "check-required-contexts.sh"
 
     def carries(self, name: str) -> bool:
         text = (WORKFLOWS / name).read_text(encoding="utf-8")
         return "merge_group" in parse_triggers(text) and self.ROW in text
+
+    def covered_workflows(self) -> List[str]:
+        found = re.findall(r'^COVERED_WORKFLOWS="\$\{RQC_COVERED_WORKFLOWS:-([^}"]+)\}"$',
+                           self.GATE.read_text(encoding="utf-8"), re.M)
+        self.assertEqual(1, len(found), "COVERED_WORKFLOWS default not found exactly once")
+        names = found[0].split()
+        self.assertTrue(names)
+        return names
 
     def test_6682_pinned_workflows_trigger_on_checks_requested(self) -> None:
         for name in self.PINNED:
             with self.subTest(workflow=name):
                 self.assertTrue(self.carries(name), name)
 
-    def test_6682_known_gap_is_exactly_6727(self) -> None:
-        for name in self.KNOWN_GAP_6727:
+    def test_6727_every_covered_workflow_is_pinned(self) -> None:
+        for name in self.covered_workflows():
             with self.subTest(workflow=name):
-                self.assertFalse(self.carries(name), f"{name} gained merge_group: move it to PINNED and close #6727")
+                self.assertIn(name, self.PINNED)
+                self.assertTrue(self.carries(name), f"{name} carries a required context but no merge_group run (#6727)")
+
+    def test_6727_self_hosted_gap_workflows_trigger_on_checks_requested(self) -> None:
+        for name in ("cert-postgres-age.yml", "postgres-ignored.yml"):
+            with self.subTest(workflow=name):
+                self.assertTrue(self.carries(name), name)
 
     def test_6682_dropping_the_c8_trigger_is_killed(self) -> None:
         text = C8_WORKFLOW.read_text(encoding="utf-8")
         self.assertEqual(1, text.count(self.ROW))
         mutant = text.replace(self.ROW, "", 1)
         self.assertNotIn("merge_group", parse_triggers(mutant))
+
+    def test_6727_dropping_a_gap_trigger_is_killed(self) -> None:
+        for name in ("cert-postgres-age.yml", "postgres-ignored.yml"):
+            with self.subTest(workflow=name):
+                text = (WORKFLOWS / name).read_text(encoding="utf-8")
+                self.assertEqual(1, text.count(self.ROW))
+                self.assertNotIn("merge_group", parse_triggers(text.replace(self.ROW, "", 1)))
+
+
+def _jobs_6727(text: str) -> Dict[str, str]:
+    """Split a workflow's top-level ``jobs:`` block into {job_id: body}."""
+    _head, sep, body = text.partition("\njobs:\n")
+    if not sep:
+        raise Unparsed("no top-level jobs: block")
+    parts = re.split(r"(?m)^  ([A-Za-z0-9_-]+):[ \t]*$", body)
+    return {parts[i]: parts[i + 1] for i in range(1, len(parts), 2)}
+
+
+def _self_hosted_6727(body: str) -> bool:
+    """True when the job is scheduled on a self-hosted runner (fixed labels or a matrix leg)."""
+    for line in body.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if stripped.startswith("runs-on:") and "self-hosted" in stripped:
+            return True
+        if stripped.startswith("runner:") and "self-hosted" in stripped:
+            return True
+    return False
+
+
+class SelfHostedMergeGroupGuard6727(unittest.TestCase):
+    """#6727: adding ``merge_group`` to a workflow with a self-hosted job must keep the fork
+    refusal the precedent uses.  ci.yml's ``check`` job (the only self-hosted job of the four
+    workflows that already carried the trigger) refuses a fork ``pull_request`` with a step
+    before ``actions/checkout`` keyed on ``github.event_name == 'pull_request'``; a
+    ``merge_group`` run is admitted because a PR reaches the queue only once its required
+    contexts, that refusal and the #6193 approval gate included, are green.  A non-matrix job
+    carries the same predicate as its job-level ``if:`` (rule (b1) forbids that only for a
+    matrix job; rule (b2) allowlists the skip)."""
+
+    JOB_IF = ("    if: github.event_name != 'pull_request' || "
+              "github.event.pull_request.head.repo.full_name == github.repository\n")
+    STEP_IF = ("github.event_name == 'pull_request' && "
+               "github.event.pull_request.head.repo.full_name != github.repository && "
+               "contains(matrix.runner, 'self-hosted')")
+    CHECKOUT = "- uses: actions/checkout@"
+
+    def guarded(self, body: str) -> bool:
+        if self.JOB_IF in body:
+            return True
+        pre_checkout, sep, _rest = body.partition(self.CHECKOUT)
+        return bool(sep) and self.STEP_IF in pre_checkout and "exit 1" in pre_checkout
+
+    def self_hosted_jobs(self) -> List[Tuple[str, str, str]]:
+        out = []
+        for name in MergeGroupTriggerPinned6682.PINNED:
+            for job, body in _jobs_6727((WORKFLOWS / name).read_text(encoding="utf-8")).items():
+                if _self_hosted_6727(body):
+                    out.append((name, job, body))
+        return out
+
+    def test_6727_self_hosted_jobs_are_found(self) -> None:
+        found = {(name, job) for name, job, _body in self.self_hosted_jobs()}
+        for want in (("ci.yml", "check"), ("cert-postgres-age.yml", "cert-postgres-age"),
+                     ("postgres-ignored.yml", "postgres-ignored")):
+            self.assertIn(want, found)
+
+    def test_6727_every_self_hosted_job_refuses_a_fork_pull_request(self) -> None:
+        for name, job, body in self.self_hosted_jobs():
+            with self.subTest(workflow=name, job=job):
+                self.assertTrue(self.guarded(body), f"{name}:{job} runs self-hosted without the fork refusal")
+
+    def test_6727_dropping_a_guard_is_killed(self) -> None:
+        for name, job, body in self.self_hosted_jobs():
+            with self.subTest(workflow=name, job=job):
+                mutant = body.replace(self.JOB_IF, "").replace(self.STEP_IF, "true")
+                self.assertFalse(self.guarded(mutant))
 
 
 if __name__ == "__main__":
