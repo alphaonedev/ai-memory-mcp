@@ -113,3 +113,26 @@ def test_7056_the_daemon_key_is_a_run_secret(tmp_path):
         daemon_key = paths["daemon"]
 
     assert sorted(h.run_secrets(Fake(), paths["tls"])) == sorted(files.values())
+
+
+# A key that mixes ASCII letters, a space, a tab and high bytes (repr() escapes the tab, backslashreplace keeps it): the backslash-escaped decode,
+# the uniform \xNN rendering and the two URL quotings all differ from one another, so no
+# other form hides a dropped one (mutants N12, N21, N22 survived the all-high-byte KEY).
+MIXED = bytes(
+    x for i in range(16) for x in (0x61 + i, 0x20 if i == 8 else 0x09 if i == 4 else 0x80 + i)
+)
+
+MIXED_RENDERINGS = {
+    "utf8-backslashreplace": lambda b: b.decode("utf-8", "backslashreplace"),
+    "uniform-backslash-x": lambda b: "".join(f"\\x{c:02x}" for c in b),
+    "url-quote": lambda b: urllib.parse.quote(b),
+    "url-quote-plus": lambda b: urllib.parse.quote_plus(b),
+}
+
+
+@pytest.mark.parametrize("name", sorted(MIXED_RENDERINGS))
+def test_7056_a_mixed_key_leaves_no_character_of_any_rendering(name):
+    h = _h()
+    form = MIXED_RENDERINGS[name](MIXED)
+    out = h.redact("err: " + form + " :end", h.secret_forms(MIXED))
+    assert out.replace(h.REDACTED, "") == "err:  :end", f"{name}: text of the key survived: {out!r}"
