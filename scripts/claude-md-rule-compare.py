@@ -1901,6 +1901,38 @@ def _self_test_cases() -> int:
 
     guarded("a rewritten commit-graph cannot approve a range (#6798) fixture", graph_cell)
 
+    # #6883: git's test-only GIT_TEST_COMMIT_GRAPH=1 loads a commit-graph whatever core.commitGraph says, so a host that
+    # sets it re-opens the #6798 bypass. git() pins GIT_TEST_COMMIT_GRAPH=0; the graph rewritten above must still not
+    # approve the range when the host environment asks for it (in the repository, and served from an alternate store).
+    def graph_env_cell():
+        def with_knob(name, work, base_root, repo, fork_sha, head_sha):
+            saved = os.environ.get("GIT_TEST_COMMIT_GRAPH")
+            os.environ["GIT_TEST_COMMIT_GRAPH"] = "1"
+            try:
+                range_cell(name, work, base_root, repo, fork_sha, head_sha, True, "no commit in the range carries")
+            finally:
+                if saved is None:
+                    os.environ.pop("GIT_TEST_COMMIT_GRAPH", None)
+                else:
+                    os.environ["GIT_TEST_COMMIT_GRAPH"] = saved
+
+        work, repo, base_root, fork_sha, approved, mid_sha, head_sha = lying_graph_fixture("graphenv")
+        graph_write(repo)
+        rewrite_graph_parent(repo / ".git" / "objects" / "info" / "commit-graph", mid_sha, approved)
+        with_knob("GIT_TEST_COMMIT_GRAPH=1 in the host environment does not load a rewritten commit-graph (#6883)",
+                  work, base_root, repo, fork_sha, head_sha)
+        work, repo, base_root, fork_sha, approved, mid_sha, head_sha = lying_graph_fixture("graphenvalt")
+        alt = work / "alt.git"
+        subprocess.run(["git", "clone", "-q", "--bare", "--no-local", str(repo), str(alt)], check=True,
+                       capture_output=True)
+        graph_write(alt)
+        rewrite_graph_parent(alt / "objects" / "info" / "commit-graph", mid_sha, approved)
+        (repo / ".git" / "objects" / "info" / "alternates").write_text(str(alt / "objects") + "\n", encoding="utf-8")
+        with_knob("GIT_TEST_COMMIT_GRAPH=1 does not load a rewritten commit-graph from an alternate store (#6883)",
+                  work, base_root, repo, fork_sha, head_sha)
+
+    guarded("GIT_TEST_COMMIT_GRAPH in the host environment cannot approve a range (#6883) fixture", graph_env_cell)
+
     # #6742: the shallow refusal is "anything but a plain `false`". A git too old to know --is-shallow-repository
     # echoes the option name back; that answer must be refused, not read as "not shallow". The stand-in git sits first
     # on PATH and answers only that query, every other call goes to the real git (reviewer mutant X5, `== "true"`).
