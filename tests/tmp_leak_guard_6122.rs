@@ -661,3 +661,78 @@ fn aliased_and_imported_sqlite_opens_are_recognised_6788() {
         "use std::fs::OpenOptions;\nfn t() {{ OpenOptions::new().open(p); }}\n{raw}"
     )));
 }
+
+/// #6805: `SqliteTempFile` backs ~200 suites, so its creation properties are
+/// pinned: owner-only mode (0600) for the database AND its `-wal` / `-shm`, a
+/// random name that differs per call, and the process temp dir (`new`) / the
+/// given dir (`new_in`) as the parent.
+#[cfg(unix)]
+#[test]
+fn sqlite_tempfile_is_private_random_and_in_temp_dir_6805() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .expect("stat scratch file")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    let dir = scratch_dir("mode");
+
+    let in_dir = SqliteTempFile::new_in(dir.path()).expect("new_in");
+    assert_eq!(mode(in_dir.path()), 0o600, "#6805: new_in() file mode");
+    assert_eq!(
+        in_dir.path().parent().map(std::path::Path::to_path_buf),
+        Some(dir.path().to_path_buf()),
+        "#6805: new_in(dir) must create inside dir"
+    );
+
+    let in_tmp = SqliteTempFile::new().expect("new");
+    assert_eq!(mode(in_tmp.path()), 0o600, "#6805: new() file mode");
+    let parent = in_tmp.path().parent().expect("parent of new()");
+    assert_eq!(
+        parent.canonicalize().expect("canonical parent"),
+        std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temp dir"),
+        "#6805: new() must create inside std::env::temp_dir()"
+    );
+
+    // Random: distinct, non-trivial names across many creations.
+    let mut names = std::collections::BTreeSet::new();
+    let batch: Vec<SqliteTempFile> = (0..16)
+        .map(|_| SqliteTempFile::new_in(dir.path()).expect("batch new_in"))
+        .collect();
+    for f in &batch {
+        let name = f
+            .path()
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name.len() >= ".tmp".len() + 6,
+            "#6805: scratch name {name:?} has no random part"
+        );
+        assert!(
+            names.insert(name.clone()),
+            "#6805: duplicate scratch name {name:?}"
+        );
+    }
+
+    // The sidecars sqlite creates inherit the owner-only mode.
+    let conn = ai_memory::db::open(in_dir.path()).expect("db::open");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS t6805 (x INTEGER); INSERT INTO t6805 VALUES (1);",
+    )
+    .expect("write forces the -wal");
+    for side in side_files(in_dir.path()).iter().take(2) {
+        assert!(
+            side.exists(),
+            "#6805: {} must exist while open",
+            side.display()
+        );
+        assert_eq!(mode(side), 0o600, "#6805: {} mode", side.display());
+    }
+    drop(conn);
+}
