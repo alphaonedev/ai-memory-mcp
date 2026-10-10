@@ -601,10 +601,15 @@ fn sqlite_mcp_http_hub_credential_and_write_authority_3578() {
     ai_memory::db::register_agent(&conn, CALLER, "nhi", &[]).expect("register root");
     ai_memory::db::bind_agent_pubkey_with_keypair(&conn, CALLER, &f.root)
         .expect("possession bind root");
-    let mut snapshot = ai_memory::identity::hub_cache::derive_sqlite(&conn, &[CALLER.to_owned()])
+    let snapshot = ai_memory::identity::hub_cache::derive_sqlite(&conn, &[CALLER.to_owned()])
         .expect("derived SQLite hub snapshot");
     assert_eq!(snapshot.agents.len(), 1);
-    f.prove_hub_admission(snapshot.agents.remove(0));
+    // #6603: move the single derived entry out by iteration, not
+    // `Vec::remove`, so no panic path carries the backend-derived entry.
+    let Some(entry) = snapshot.agents.into_iter().next() else {
+        panic!("derived SQLite hub snapshot carried no agent entry");
+    };
+    f.prove_hub_admission(entry);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
