@@ -169,7 +169,7 @@ fi
 # Per MCP spec: initialize handshake → tools/call → response → exit.
 # A single round-trip is fine because the shim spawns one ai-memory
 # subprocess per turn.
-INIT_REQUEST='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"capture-turn-shim","version":"0.1"}}}'
+INIT_REQUEST='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"capture-turn-shim","version":"0.1"}}}'
 INIT_NOTIFY='{"jsonrpc":"2.0","method":"notifications/initialized"}'
 CALL_REQUEST="$(printf '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_capture_turn","arguments":%s}}' "${REQUEST}")"
 

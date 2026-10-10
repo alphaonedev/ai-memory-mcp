@@ -133,7 +133,7 @@ reflect_step() {
   mcp_out="$RUN_DIR/mcp-reflect-${call_id}.out.jsonl"
 
   cat >"$mcp_in" <<EOF
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"repro-recursive-learning","version":"1.0"}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"repro-recursive-learning","version":"1.0"}}}
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_reflect","arguments":{"source_ids":${srcs_json},"title":"${title}","content":"${content}","namespace":"${NAMESPACE}","tier":"long"}}}
 EOF
 
