@@ -1240,6 +1240,16 @@ R12_CELLS = (
     for cp in (0x2500, 0x2501, 0x23AF, 0x23BA, 0x2E0F, 0x00AF, 0x00B7, 0x2027, 0x10191, 0x1680)
 ) + (
     ("E-dash-sep-1680", "Run check\u1680old.sh daily.\n", "", 1, "look-alike script name"),
+    # #6623: the allowlist ceiling boundary (10 entries pass, 11 fail) and an unpaired backtick in
+    # an erratum block line whose other spans are non-empty.
+    ("A-ceiling-10", {"D%02d.md" % i: "Section (c) applies.\n" for i in range(10)},
+     "".join("docs/compliance/D%02d.md:c:1\n" % i for i in range(10)), 0, None),
+    ("A-ceiling-11", {"D%02d.md" % i: "Section (c) applies.\n" for i in range(11)},
+     "".join("docs/compliance/D%02d.md:c:1\n" % i for i in range(11)), 1, "exceed the allowlist ceiling"),
+    ("E-block-single-tick", r11_err("Erratum (#1): `check-old.sh` is `scripts/check_new.py` and ` here.\n"), R11_ALLOW, 1,
+     "a code span that is not a balanced single-backtick pair"),
+    # #6426: a comment and a tag whose quoted attribute holds ``>`` between two halves of a name.
+    ("6426-comment-join", 'Run check-<<!-- -->a title="y>z">old.sh daily.\n', "", 1, "joins into script name"),
     # #6636: a heading inside the erratum paragraph ends it; the block must be one plain paragraph.
     ("K-heading-in-block", r11_err("# Inner\n" + R12_ERR_LINE), R11_ALLOW, 1, "a heading in the erratum block"),
     ("K-heading-in-block-indented", r11_err("   # Inner\n" + R12_ERR_LINE), R11_ALLOW, 1,
