@@ -153,6 +153,7 @@ Exit codes: 0 clean / N/A-skip, 1 violation, 2 usage / self-test failure.
 """
 
 import argparse
+import ast
 import contextlib
 import errno
 import io
@@ -163,6 +164,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import tokenize
 import unicodedata
 from pathlib import Path
 
@@ -3501,10 +3503,34 @@ SUMMARY_CELLS = {
 }
 
 
+def _self_test_ok_literals():
+    """The string literals SELF_TEST_OK is built from, in source order."""
+    own = Path(__file__).read_text(encoding="utf-8")
+    tokens = list(tokenize.generate_tokens(io.StringIO(own).readline))
+    for index, token in enumerate(tokens):
+        if (token.type == tokenize.NAME and token.string == "SELF_TEST_OK" and token.start[1] == 0
+                and tokens[index + 1].string == "=" and tokens[index + 2].string == "("):
+            literals = []
+            for follow in tokens[index + 3:]:
+                if follow.type == tokenize.STRING:
+                    literals.append(ast.literal_eval(follow.string))
+                elif follow.type == tokenize.OP and follow.string == ")":
+                    return literals
+            break
+    return []
+
+
 def _summary_cells(t):
     """#6765: the SELF_TEST_OK inventory line names every round from 4 on
     ("round N") and the cells of rounds 6 and 7, so a green run says what is
-    pinned. Cell `summary-rounds`."""
+    pinned. Cell `summary-rounds`. #6919: two adjacent literals of the line
+    may not run two words together (`refusing` + `FF`). Cell `summary-join`."""
+    literals = _self_test_ok_literals()
+    if len(literals) < 20:
+        t.fail(f"(summary-join): found only {len(literals)} literals in SELF_TEST_OK")
+    for left, right in zip(literals, literals[1:]):
+        if left[-1:].isalnum() and right[:1].isalnum():
+            t.fail(f"(summary-join): SELF_TEST_OK joins {left[-12:]!r} and {right[:12]!r} without a space")
     for number in (4, 5, 6, 7):
         if f"round {number}" not in SELF_TEST_OK:
             t.fail(f"(summary-rounds): SELF_TEST_OK carries no sentence for round {number}")
