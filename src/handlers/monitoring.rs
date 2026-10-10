@@ -69,13 +69,21 @@ fn refusal(code: StatusCode, reason: &'static str) -> Response {
 /// #4068 — a credential failure at THIS gate is an auth failure like any
 /// other: record it in the shared #2502 `AuthFailurePolicy` (the same table
 /// `api_key_auth` uses) and answer `429` once the source is past its budget.
+///
+/// `gated` is whether this gate owns the request's backoff (see `access`).
+/// A request it does NOT gate (the mTLS federation lane, which the transport
+/// gate also leaves out of backoff) is refused with a plain `401` and never
+/// recorded: recording there would let sync-lane failures lock the peer
+/// address out of every route (review F1, #6052).
 fn auth_failure(
     state: &AccessState,
+    gated: bool,
     source: Option<std::net::IpAddr>,
     now: std::time::Instant,
     reason: &'static str,
 ) -> Response {
-    if let Some(ip) = source
+    if gated
+        && let Some(ip) = source
         && let super::auth_backoff::AuthDecision::Refuse { retry_after_secs } =
             state.auth.auth_backoff.on_failure(ip, now)
     {
@@ -110,7 +118,13 @@ pub(crate) async fn access(State(state): State<AccessState>, req: Request, next:
         && let super::auth_backoff::AuthDecision::Refuse { .. } =
             state.auth.auth_backoff.pre_check(ip, now)
     {
-        return auth_failure(&state, source, now, "monitoring_requires_authentication");
+        return auth_failure(
+            &state,
+            gated,
+            source,
+            now,
+            "monitoring_requires_authentication",
+        );
     }
     let token = req
         .headers()
@@ -141,14 +155,20 @@ pub(crate) async fn access(State(state): State<AccessState>, req: Request, next:
     // transport principal, even when the legacy shared key is unconfigured.
     let resolved = agent.is_some() || peer.is_some() || global;
     if scoped && !health && path != super::routes::HEALTH && !resolved {
-        return auth_failure(&state, source, now, "unresolved_transport_principal");
+        return auth_failure(&state, gated, source, now, "unresolved_transport_principal");
     }
     if health {
         if !state.tls_enabled {
             return refusal(StatusCode::FORBIDDEN, "monitoring_requires_tls");
         }
         if !resolved {
-            return auth_failure(&state, source, now, "monitoring_requires_authentication");
+            return auth_failure(
+                &state,
+                gated,
+                source,
+                now,
+                "monitoring_requires_authentication",
+            );
         }
     }
     // #4068 — a success at a site this gate is the authenticator for resets
