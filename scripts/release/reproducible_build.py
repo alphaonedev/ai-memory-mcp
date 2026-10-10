@@ -803,13 +803,15 @@ def _synthetic_package(fmt: str, entries: List[Tuple[str, bytes, int, str]], nli
                        compress: str = "gzip", data_members: int = 1,
                        control: Optional[Dict[str, Optional[bytes]]] = None, uid: int = 0, uname: str = "root",
                        tags: Optional[Dict[int, Optional[Tuple[int, list]]]] = None,
-                       data_tar: Optional[bytes] = None) -> bytes:
+                       data_tar: Optional[bytes] = None, lead: Optional[bytes] = None,
+                       sig_tags: Optional[Dict[int, Optional[Tuple[int, list]]]] = None) -> bytes:
     """#6907 self-test fixture: a deb (ar of debian-binary, control.tar.gz and
     data.tar.gz) or an rpm (lead, signature header, main header with nfpm's file
     and payload tags, compressed newc cpio) holding ``entries``. ``control``
     adds / replaces (None removes) control.tar members, ``tags`` main-header
-    tags; ``data_tar`` replaces the deb data member. The layout is what nfpm
-    writes; the self-test also runs on real nfpm output."""
+    tags; ``data_tar`` replaces the deb data member; ``lead`` and ``sig_tags``
+    replace the rpm lead and signature-header tags. The layout is what nfpm
+    writes (probed on nfpm 2.41.1); the self-test also runs on real nfpm output."""
     regular = [(n, d, m) for n, d, m, k in entries if k == "f"]
     if fmt == "deb":
         sums = b"".join(hashlib.md5(d).hexdigest().encode() + b"  " + n.encode() + b"\n"  # noqa: S324 (dpkg md5sums)
@@ -857,9 +859,20 @@ def _synthetic_package(fmt: str, entries: List[Tuple[str, bytes, int, str]], nli
             main.pop(tag, None)
         else:
             main[tag] = val
-    sig = _rpm_header_bytes({1000: (4, [0])})
+    head = _rpm_header_bytes(main)
+    signature: Dict[int, Tuple[int, list]] = {
+        62: (7, [bytes(16)]), 273: (6, [hashlib.sha256(head).hexdigest()]), 1000: (4, [len(head) + len(payload)]),
+        1007: (4, [sum(len(d) for _, d, _, k in listed if k == "f")])}
+    for tag, val in (sig_tags or {}).items():
+        if val is None:
+            signature.pop(tag, None)
+        else:
+            signature[tag] = val
+    sig = _rpm_header_bytes(signature)
     sig += b"\x00" * ((-len(sig)) % 8)
-    return b"\xed\xab\xee\xdb" + b"\x00" * 92 + sig + _rpm_header_bytes(main) + payload
+    if lead is None:
+        lead = struct.pack(">4sBBhh66shh16s", b"\xed\xab\xee\xdb", 3, 0, 0, 1, b"ai-memory-1.0.0-1", 1, 5, b"")
+    return lead + sig + head + payload
 
 
 def _gz_tar(build) -> bytes:
@@ -868,6 +881,44 @@ def _gz_tar(build) -> bytes:
     with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tf:
         build(tf)
     return gzip.compress(buf.getvalue())
+
+
+def _self_test_7032_dist(d: Path, good: bytes, want: str) -> List[str]:
+    """#7032: --verify-dist ties each package's metadata (version, release,
+    architecture) to its file name, and the deb to the rpm."""
+    out: List[str] = []
+    entries = [("./usr/", b"", 0o755, "d"), ("./usr/bin/", b"", 0o755, "d"), ("./usr/bin/ai-memory", good, 0o755, "f")]
+    tarball = "ai-memory-x86_64-unknown-linux-gnu.tar.gz"
+
+    def dist(name: str, ok: bool, deb_name: str = "ai-memory_1.0.0_amd64.deb",
+             rpm_name: str = "ai-memory-1.0.0-1.x86_64.rpm", **rpm_kw: object) -> None:
+        root = d / "dist-7032"
+        shutil.rmtree(root, ignore_errors=True)
+        root.mkdir()
+        blobs = {tarball: _synthetic_tar([("ai-memory", good, 0o755, "f")], 0, ""),
+                 deb_name: _synthetic_package("deb", entries),
+                 rpm_name: _synthetic_package("rpm", entries, **rpm_kw)}  # type: ignore[arg-type]
+        for n, blob in blobs.items():
+            (root / n).write_bytes(blob)
+            (root / (n + ".sha256")).write_text(f"{hashlib.sha256(blob).hexdigest()}  {n}\n", encoding="utf-8")
+        try:
+            verify_dist(root, tarball, want)
+            got = True
+        except ProofError as exc:
+            got = False
+            print(f"self-test: {name}: {exc}", file=sys.stderr)
+        if got != ok:
+            out.append(f"{name}: {'accepted' if got else 'refused'}, wanted {'accepted' if ok else 'refused'}")
+
+    dist("7032 dist of a matching tarball, deb and rpm passes", True)
+    dist("7032 dist deb named arm64 holding an amd64 package is refused", False, deb_name="ai-memory_1.0.0_arm64.deb")
+    dist("7032 dist rpm named aarch64 holding an x86_64 package is refused", False,
+         rpm_name="ai-memory-1.0.0-1.aarch64.rpm")
+    dist("7032 dist deb named for another version is refused", False, deb_name="ai-memory_1.0.1_amd64.deb")
+    dist("7032 dist rpm whose RELEASE is not its name's is refused", False, tags={1002: (6, ["2"])})
+    dist("7032 dist deb and rpm of different versions are refused", False, rpm_name="ai-memory-1.0.1-1.x86_64.rpm",
+         tags={1001: (6, ["1.0.1"])})
+    return out
 
 
 def _self_test_6907(tmp: Path) -> List[str]:
@@ -902,7 +953,11 @@ def _self_test_6907(tmp: Path) -> List[str]:
         payload(f"6907 {fmt} binary under another path is refused", False, fmt, [("./usr/bin/../bin/ai-memory", good, 0o755, "f")])
     payload("6907 deb with two data members is refused", False, "deb", dirs + [bin_entry], data_members=2)
     payload("6907 rpm binary with two links is refused", False, "rpm", dirs + [bin_entry], nlink=2)
-    payload("6907 rpm xz payload holding the binary passes", True, "rpm", dirs + [bin_entry], compress="xz")
+    # decision: refuse xz / bzip2 rpm payloads over accepting them because nfpm writes gzip for nfpm.yaml
+    # (tag 1125 probed) and the deb sibling is read as gzip only (#7032).
+    payload("7032 rpm xz payload is refused like a deb data.tar.xz", False, "rpm", dirs + [bin_entry], compress="xz")
+    payload("7032 rpm bzip2 payload is refused like a deb data.tar.bz2", False, "rpm", dirs + [bin_entry],
+            compress="bzip2")
     payload("6907 rpm zstd payload is refused, not guessed", False, "rpm", dirs + [bin_entry], compress="zstd")
     # Class (a): an archive member or metadata the package manager acts on that
     # the payload check never looked at (maintainer scripts, dependencies,
@@ -967,6 +1022,34 @@ def _self_test_6907(tmp: Path) -> List[str]:
             data_tar=_gz_tar(pax_rename))
     payload("6907b deb member past a corrupt tar header is refused", False, "deb", dirs + [bin_entry],
             data_tar=_gz_tar(corrupt_tail))
+    # #7032: sibling-path parity. The strict check on one path of a pair holds
+    # on the other: rpm lead and signature header as strictly as the main
+    # header and debian-binary, rpm NAME as deb Package, file names as dirs.
+    def lead_with(rpm_type: int = 0, sig_type: int = 5) -> bytes:
+        return struct.pack(">4sBBhh66shh16s", b"\xed\xab\xee\xdb", 3, 0, rpm_type, 1, b"ai-memory-1.0.0-1", 1,
+                           sig_type, b"")
+
+    payload("7032 rpm real-shaped lead and signature header pass", True, "rpm", dirs + [bin_entry])
+    payload("7032 rpm lead of a source package is refused", False, "rpm", dirs + [bin_entry], lead=lead_with(1))
+    payload("7032 rpm lead with another signature type is refused", False, "rpm", dirs + [bin_entry],
+            lead=lead_with(0, 0))
+    payload("7032 rpm signature header with an unknown tag is refused", False, "rpm", dirs + [bin_entry],
+            sig_tags={5099: (6, ["x"])})
+    payload("7032 rpm signature digest of another main header is refused", False, "rpm", dirs + [bin_entry],
+            sig_tags={273: (6, [hashlib.sha256(b"another header").hexdigest()])})
+    payload("7032 rpm signature size of another package is refused", False, "rpm", dirs + [bin_entry],
+            sig_tags={1000: (4, [1])})
+    payload("7032 rpm signature payload size of other bytes is refused", False, "rpm", dirs + [bin_entry],
+            sig_tags={1007: (4, [len(evil)])})
+    payload("7032 rpm NAME of another package is refused like deb Package", False, "rpm", dirs + [bin_entry],
+            tags={1000: (6, ["libc6"])})
+    payload("7032 deb regular file named with a trailing slash is refused", False, "deb",
+            dirs + [("./usr/bin/ai-memory/", good, 0o755, "f")],
+            control={"./md5sums": hashlib.md5(good).hexdigest().encode() + b"  ./usr/bin/ai-memory\n"})  # noqa: S324
+    payload("7032 rpm regular file named with a trailing slash is refused", False, "rpm",
+            dirs + [("./usr/bin/ai-memory/", good, 0o755, "f")],
+            tags={1116: (4, [0]), 1117: (8, ["ai-memory"]), 1118: (8, ["/usr/bin/"])})
+    out.extend(_self_test_7032_dist(d, good, want))
     junk = d / "junk.rpm"
     junk.write_bytes(b"\xed\xab\xee\xdb" + b"\x00" * 10)
     for name, call in (("6907 a truncated rpm is refused", lambda: verify_payload([junk], want)),
@@ -1218,6 +1301,19 @@ def _self_test(root: Path) -> int:
                 failures.append(f"{name}: exit {got}, wanted {want}")
 
         run("two identical builds pass", 0)
+        # #7032: workspace B named through a symlink is the same build (cargo
+        # runs in the canonical path; the remap prefix must be that path too).
+        fresh()
+        link = tmp / "link-7032"
+        link.symlink_to(tmp, target_is_directory=True)
+        try:
+            got = two_builds(ws_a, link / ws_b.name, "x86_64-unknown-linux-gnu", "sal", "ai-memory", str(stub),
+                             epoch="1700000000")
+        except ProofError as exc:
+            got = 2
+            print(f"self-test: 7032 symlinked workspace B: {exc}", file=sys.stderr)
+        if got != 0:
+            failures.append(f"7032 a workspace B named through a symlink is not the same build: exit {got}, wanted 0")
 
         # --- #6291: the two builds are independent.
         def run_prepared(name: str, want: int, prepare, env: Optional[dict] = None, check=None) -> None:
