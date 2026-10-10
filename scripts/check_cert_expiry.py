@@ -303,11 +303,6 @@ def extract_fed_id_counts(repo, tree):
     return counts
 
 
-def extract_fed_ids(repo, tree):
-    """Unique AI_MEMORY_FED_* identifiers in src/ at TREE (set of str)."""
-    return {name for name, _ in extract_fed_id_counts(repo, tree)}
-
-
 def fed_id_delta(base_counts, head_counts):
     """(added, removed) identifier drift between two keyed occurrence Counters.
 
@@ -337,8 +332,8 @@ def fed_id_delta(base_counts, head_counts):
             if after < before:
                 removed.append(f"{name} (occurrences in src/ fell {before} -> {after})")
             else:
-                removed.append(f"{name} ({lost[name]} occurrence(s) on lines that no longer "
-                               f"exist in src/, offset by mentions elsewhere: {before} -> {after})")
+                removed.append(f"{name} ({lost[name]} occurrence(s) on lines that changed or no "
+                               f"longer exist in src/; the total did not fall: {before} -> {after})")
     return added, removed
 
 
@@ -1493,6 +1488,44 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                                (sentence, "did not carry the required section 7 expiry sentence")])
         if label == "mask-xfile" and "occurrences in src/ fell" in out_mo:
             t.fail(f"(mask-xfile): an offset removal was annotated as a count fall: {out_mo!r}")
+    # (mask-netzero, #6370 F7) the total never falls: the definition is removed and
+    #       a note naming the identifier is added in the same change, so the count
+    #       is unchanged. Judged on the lines, not the total, it stays RED, both
+    #       through the unit and through the pull_request gate.
+    fx.g("checkout", "-q", "-B", "mo-netzero", mk0)
+    fx.write("src/mask_def.rs", 'pub const M: &str = "";\n')
+    fx.write("src/mask_note.rs", f"// {kid} was removed from mask_def.rs\n", append=True)
+    nz = fx.commit(["src/mask_def.rs", "src/mask_note.rs"], "mask-netzero: definition out, note in")
+    fx.g("checkout", "-q", "main")
+    fx.g("reset", "-q", "--hard", mk0)
+    fx.g("update-ref", "refs/remotes/origin/main", mk0)
+    merge_nz = fx.merge("mo-netzero", "Merge mo-netzero into main")
+    t.expect_red("mask-netzero", "definition removed and a note naming it added (count unchanged)",
+                 repo, mk0, nz, [
+                     (f"- {kid}", "did not name the removed identifier"),
+                     ("the total did not fall: 2 -> 2", "did not state that the total held"),
+                     (sentence, "did not carry the required section 7 expiry sentence")],
+                 tip=merge_nz)
+    t.gate("mask-netzero-gate", "pull_request whose net identifier count is unchanged",
+           repo, _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=nz,
+                           GITHUB_BASE_REF="main", GITHUB_SHA=merge_nz,
+                           PATH=os.environ.get("PATH", "")), f"- {kid}")
+    # (mask-3to2) three occurrences become two: a halving test (after*2 <= before)
+    #       would miss it.
+    fx.g("checkout", "-q", "-B", "mo-3", mk0)
+    fx.write("src/mask_note.rs", f"// {kid} is also described here\n", append=True)
+    m3 = fx.commit(["src/mask_note.rs"], "mask-3: a third occurrence")
+    fx.g("checkout", "-q", "-B", "mo-3to2", m3)
+    fx.write("src/mask_def.rs", 'pub const M: &str = "";\n')
+    m32 = fx.commit(["src/mask_def.rs"], "mask-3to2: the definition goes")
+    fx.g("update-ref", "refs/remotes/origin/main", m3)
+    t.expect_red("mask-3to2", "three occurrences fall to two",
+                 repo, m3, m32, [
+                     (f"- {kid}", "did not name the removed identifier"),
+                     ("occurrences in src/ fell 3 -> 2", "did not carry the 3 -> 2 count change")])
+    fx.g("checkout", "-q", "main")
+    fx.reset(base)
+    fx.g("update-ref", "refs/remotes/origin/main", base)
     # Controls: the defining line moved to another file (re-indented) and an extra
     # mention stay GREEN, so the keyed comparison does not turn refactors red.
     fx.g("checkout", "-q", "-B", "mo-moved", mk0)
@@ -1851,7 +1884,8 @@ SELF_TEST_OK = (
     "definition offset by a mention in another file, a comment in its place, a longer token, a "
     "block comment around it or the drift annotation text stays RED, as do look-alike spellings "
     "(mask-confusable, mask-confusable-note, mask-zwsp, mask-crsplit) and a removed mention "
-    "(mask-note-removed), while a defining line moved to another file is GREEN (mask-moved); "
+    "(mask-note-removed), a removal whose total never falls (mask-netzero, mask-netzero-gate) "
+    "and a 3 -> 2 fall (mask-3to2) stay RED, while a defining line moved to another file is GREEN (mask-moved); "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
