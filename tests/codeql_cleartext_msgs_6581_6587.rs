@@ -34,8 +34,7 @@ struct Site {
 
 fn read_src(rel: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
-    std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("guard could not read {rel}: {e}"))
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("guard could not read {rel}: {e}"))
 }
 
 /// The text of the file from its `#[cfg(test)]` test module onward.

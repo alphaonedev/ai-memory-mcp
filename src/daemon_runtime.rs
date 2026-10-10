@@ -10035,7 +10035,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("keyless loopback {host} must warn, not bind silently"));
             assert!(
                 warning.contains("reverse proxy") && warning.contains("off-host"),
-                "warning must name the proxy hazard for {host}: {warning}"
+                "warning must name the proxy hazard for {host} ({} bytes of warning text)",
+                warning.len()
             );
         }
     }
@@ -10116,7 +10117,8 @@ mod tests {
         let w = cert_peer_binding_boot_warnings(tls::CertPeerBindingMode::Warn, false, false, true);
         assert!(
             w.iter().any(|s| s.contains("INERT") && s.contains("mTLS")),
-            "must warn mTLS-not-configured inert: {w:?}"
+            "must warn mTLS-not-configured inert ({} warning(s) emitted)",
+            w.len()
         );
         // mTLS on but no binding map ⇒ INERT warning.
         let w =
@@ -10124,7 +10126,8 @@ mod tests {
         assert!(
             w.iter()
                 .any(|s| s.contains("INERT") && s.contains("BINDING_MAP")),
-            "must warn no-binding-map inert: {w:?}"
+            "must warn no-binding-map inert ({} warning(s) emitted)",
+            w.len()
         );
     }
 
@@ -10138,7 +10141,8 @@ mod tests {
             let w = cert_peer_binding_boot_warnings(mode, true, true, false);
             assert!(
                 w.iter().any(|s| s.contains("spoof window is OPEN")),
-                "require_sig=0 + non-enforce must warn open window (mode {mode:?}): {w:?}"
+                "require_sig=0 + non-enforce must warn open window (mode {mode:?}, {} warning(s) emitted)",
+                w.len()
             );
         }
         // require_sig=0 but ENFORCE closes it ⇒ no open-window warning.
@@ -10146,7 +10150,8 @@ mod tests {
             cert_peer_binding_boot_warnings(tls::CertPeerBindingMode::Enforce, true, true, false);
         assert!(
             !w.iter().any(|s| s.contains("spoof window is OPEN")),
-            "enforce must NOT warn open window: {w:?}"
+            "enforce must NOT warn open window ({} warning(s) emitted)",
+            w.len()
         );
     }
 
