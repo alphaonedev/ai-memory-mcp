@@ -3,13 +3,14 @@
 """#3440 — bounded rubric repair and call-log mission evidence.
 
 Offline only: no OpenRouter, no daemon. The last two tests replay the real
-256-agent journal (``m2-swarm-256x10-20260901T231850Z``) when it is present on
-this machine, and SKIP everywhere else — the synthetic cases above them cover
-the same shapes deterministically.
+256-agent journal (``m2-swarm-256x10-20260901T231850Z``) from the reduced copy
+in ``swarm/tests/fixtures/m2-swarm-256x10/`` (#6721), so they run on every host
+and in CI. ``fixtures/reduce_journal.py`` rebuilds that copy from a full journal.
 """
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 from pathlib import Path
@@ -25,11 +26,12 @@ from swarm.audit import (
     render_nhi_report,
 )
 
-#: The journal this issue was raised from. Overridable for a different run.
+#: The journal this issue was raised from, reduced to the fields the replay
+#: reads (#6721). ``SWARM_JOURNAL_FIXTURE`` points at another reduced journal.
 _JOURNAL = Path(
     os.environ.get(
         "SWARM_JOURNAL_FIXTURE",
-        "/home/fate_two/v07/v09-dev/.local-runs/journals/m2-swarm-256x10-20260901T231850Z",
+        str(Path(__file__).resolve().parent / "fixtures" / "m2-swarm-256x10"),
     )
 )
 
@@ -294,9 +296,14 @@ async def test_harness_dispatches_stamps_the_call_log(tmp_path) -> None:
 # -- replay of the real 256-agent journal ------------------------------------
 
 
-@pytest.mark.skipif(
-    not (_JOURNAL / "assessments.json").exists(), reason=f"journal fixture not present: {_JOURNAL}"
-)
+def test_journal_fixture_is_in_the_tree_6721() -> None:
+    """#6721: the replay must not depend on one host's scratch directory."""
+    here = Path(__file__).resolve().parent / "fixtures" / "m2-swarm-256x10"
+    for name in ("assessments.json", "nhi-audit.json", "calls.jsonl.gz"):
+        assert (here / name).is_file(), f"missing in-tree journal fixture {name}"
+    assert (here.parent / "reduce_journal.py").is_file()
+
+
 def test_journal_invalid_rubrics_are_now_repairable() -> None:
     stored = json.loads((_JOURNAL / "assessments.json").read_text(encoding="utf-8"))
     invalid = [a for a in stored if a["assessment_invalid"]]
@@ -330,15 +337,9 @@ def test_journal_invalid_rubrics_are_now_repairable() -> None:
         assert again.recall_usefulness == item["recall_usefulness"]
 
 
-@pytest.mark.skipif(
-    not (_JOURNAL / "calls.jsonl").exists(), reason=f"journal fixture not present: {_JOURNAL}"
-)
 def test_journal_call_log_explains_the_zero_percent_completion() -> None:
-    entries = [
-        json.loads(line)
-        for line in (_JOURNAL / "calls.jsonl").read_text(encoding="utf-8").splitlines()
-        if line
-    ]
+    with gzip.open(_JOURNAL / "calls.jsonl.gz", "rt", encoding="utf-8") as handle:
+        entries = [json.loads(line) for line in handle if line.strip()]
     report = json.loads((_JOURNAL / "nhi-audit.json").read_text(encoding="utf-8"))
     found = mission_evidence(entries, shared_namespace="m2-shared")
 
