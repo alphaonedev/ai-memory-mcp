@@ -79,11 +79,13 @@ Usage:
 Exit codes: 0 green, 1 violation(s) found, 2 undecidable: an unreadable (I/O
 error or invalid UTF-8) document, directory or allowlist, a missing
 ``docs/compliance/``, a self-test failure (``SELF-TEST FAIL: ...``, including
-``fixture setup`` when ``.local-runs`` is unusable, #6199), a usage error, or an
-internal error (``FAIL internal error``). No exit prints a traceback.
+``fixture setup`` when ``.local-runs`` is unusable, #6199), a usage error, a
+document line longer than ``LINE_CEILING`` (65536) characters (``line too long,
+undecidable``, #6635), or an internal error (``FAIL internal error``). No exit prints a traceback.
 """
 
 import argparse
+import bisect
 import contextlib
 import errno
 import html
@@ -105,6 +107,10 @@ TOKEN_RE = re.compile(
     r"(?<![A-Za-z0-9_])(check[-_][A-Za-z0-9_-]+\.(?:sh|py))(?![A-Za-z0-9_])", re.IGNORECASE | re.ASCII
 )
 FULL_NAME_RE = re.compile(r"check[-_][A-Za-z0-9_-]+\.(?:sh|py)", re.IGNORECASE | re.ASCII)
+# token_spans() finds TOKEN_RE's matches in linear time (#6635): a name's start, and the runs of
+# name characters its body is one of.
+TOKEN_START_RE = re.compile(r"(?<![A-Za-z0-9_])check[-_]", re.IGNORECASE | re.ASCII)
+BODY_RUN_RE = re.compile(r"[A-Za-z0-9_-]+", re.ASCII)
 # A name fragment: any non-empty prefix of a script name, bounded on the left like TOKEN_RE.
 HEAD_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:check[-_][A-Za-z0-9_.-]*|check|chec|che|ch|c)", re.IGNORECASE | re.ASCII
@@ -114,6 +120,15 @@ MARKUP = frozenset("<>\\`[]()&!${}")
 # The name characters that may continue a fragment at the start of the next line.
 NAME_RUN_RE = re.compile(r"[A-Za-z0-9_.-]*", re.ASCII)
 PATH_CHARS = frozenset(string.ascii_letters + string.digits + "_./-")
+# A run of PATH_CHARS: tokens() finds each run once, so the scan is linear in the line (#6635).
+PATH_RUN_RE = re.compile(r"[A-Za-z0-9_./-]+")
+NAME_BODY = frozenset(string.ascii_letters + string.digits + "_-")
+NAME_WORD = frozenset(string.ascii_letters + string.digits + "_")
+# No file in a checkout has a longer root-relative path (Linux PATH_MAX); a longer target is
+# missing without a walk, so a long path line stays linear (#6635).
+PATH_LIMIT = 4096
+# The longest line the gate decides; a longer one is undecidable (exit 2, #6635).
+LINE_CEILING = 65536
 # The join walk (#6621, #6631): how many characters after a fragment it reads, and how many walk
 # states one line may spend before the line is undecidable (red).
 JOIN_WINDOW = 512
@@ -217,6 +232,14 @@ BIDI_CONTROLS = frozenset("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u206
 ODD_EXTRA = frozenset("\u2028\u2029\ufeff")
 
 
+class LineTooLong(Exception):
+    """A compliance document line is longer than LINE_CEILING characters (#6635)."""
+
+    def __init__(self, rel, lineno, length):
+        super().__init__("%s:%d" % (rel, lineno))
+        self.rel, self.lineno, self.length = rel, lineno, length
+
+
 class Unreadable(Exception):
     """A compliance document or the allowlist could not be read as UTF-8."""
 
@@ -283,9 +306,12 @@ def _loose(word):
 # the Ogham space mark, which renders as a dash (#6633). The middle of a name may hold the same
 # characters (#6633), at most 256 of them (#6635).
 NON_ASCII = r"(?:[^\x00-\x7f\s]|\u1680)"
+# One middle character: an ASCII letter, digit, ``_`` or ``-``, or a NON_ASCII character. The
+# alternatives are disjoint, so a run of non-ASCII letters cannot backtrack exponentially (#6635).
+NAME_MIDDLE = r"(?:[^\s\x00-\x2c\x2e\x2f\x3a-\x40\x5b-\x5e\x60\x7b-\x7f]|\u1680)"
 LOOSE_RE = re.compile(
-    r"(?<![A-Za-z0-9_])" + _loose("check") + r"(?:[-_]|" + NON_ASCII + r")(?:[\w-]|" + NON_ASCII
-    + r"){1,256}(?:\.|" + NON_ASCII + r")(?:" + _loose("sh") + "|" + _loose("py") + r")(?![A-Za-z0-9_])",
+    r"(?<![A-Za-z0-9_])" + _loose("check") + r"(?:[-_]|" + NON_ASCII + r")" + NAME_MIDDLE
+    + r"{1,256}(?:\.|" + NON_ASCII + r")(?:" + _loose("sh") + "|" + _loose("py") + r")(?![A-Za-z0-9_])",
     re.IGNORECASE,
 )
 
@@ -295,6 +321,31 @@ def lookalikes(line):
     for m in LOOSE_RE.finditer(decoded(line)):
         if not m.group().isascii():
             yield m.group()
+
+
+def token_spans(line):
+    """Yield (start, name) for each TOKEN_RE match on ``line``, in order, in linear time (#6635).
+
+    ``TOKEN_RE.finditer`` retries its unbounded body from every ``check-`` in a long run of name
+    characters. The body cannot hold a dot, so a match is unique: the body is the whole run of name
+    characters after ``check-``, and a dot, ``sh`` or ``py`` and a non-word character follow it.
+    """
+    runs = [(r.start(), r.end()) for r in BODY_RUN_RE.finditer(line)]
+    starts = [r[0] for r in runs]
+    resume = 0
+    for m in TOKEN_START_RE.finditer(line):
+        begin = m.start()
+        body = m.end()
+        if begin < resume or body >= len(line) or line[body] not in NAME_BODY:
+            continue
+        run_start, run_end = runs[bisect.bisect_right(starts, body) - 1]
+        ext = line[run_end + 1 : run_end + 3]
+        after = line[run_end + 3 : run_end + 4]
+        if line[run_end : run_end + 1] == "." and ext.lower() in ("sh", "py") and ext.isascii() and not (
+            after and after in NAME_WORD
+        ):
+            resume = run_end + 3
+            yield begin, line[begin:resume]
 
 
 def tokens(line):
@@ -308,22 +359,35 @@ def tokens(line):
     (#6632) is the last component's tail: with a ``/`` before it the whole written component is
     checked, without one the name is bare.
     """
-    for m in TOKEN_RE.finditer(line):
-        start = m.start()
-        while start > 0 and line[start - 1] in PATH_CHARS:
-            start -= 1
-        prefix = line[start : m.start()]
-        cut = prefix.rfind("/") + 1
+    runs = [(r.start(), r.end()) for r in PATH_RUN_RE.finditer(line)]
+    starts = [r[0] for r in runs]
+    shapes = {}
+    for token_start, name in token_spans(line):
+        # The token lies in a run of path characters; its prefix is that run up to the token. Each
+        # run's components are split once, so the scan is linear in the line (#6635).
+        run_start, run_end = runs[bisect.bisect_right(starts, token_start) - 1]
+        if run_start not in shapes:
+            comps = line[run_start:run_end].split("/")
+            offsets, at = [], run_start
+            for comp in comps:
+                offsets.append(at)
+                at += len(comp) + 1
+            first = comps.index("scripts") if "scripts" in comps else None
+            dots = first is not None and all(c in ("", ".", "..") for c in comps[:first])
+            shapes[run_start] = (offsets, first, dots)
+        offsets, first, dots = shapes[run_start]
+        cut = line.rfind("/", run_start, token_start) + 1
         if not cut:
-            prefix = ""
-        last = prefix[cut:] + m.group(1)
-        prefix = prefix[:cut]
-        parts = prefix.split("/")[:-1] if prefix else ["scripts"]
-        if "scripts" in parts:
-            first = parts.index("scripts")
-            if prefix.startswith("//") or all(p in ("", ".", "..") for p in parts[:first]):
-                parts = parts[first:]
-        yield prefix + last, m.group(1), "/".join(parts + [last])
+            yield name, name, "scripts/" + name
+            continue
+        prefix = line[run_start:cut]
+        last = line[cut:token_start] + name
+        # ``prefix`` holds the components before ``cut``: those whose offset is below it.
+        held = bisect.bisect_left(offsets, cut)
+        if first is not None and first < held and (prefix.startswith("//") or dots):
+            yield prefix + last, name, line[offsets[first] : cut] + last
+        else:
+            yield prefix + last, name, prefix + last
 
 
 def fragments(line, nxt, budget):
@@ -440,19 +504,20 @@ def path_ok(root, target):
     directory listing (#6220: a case-insensitive filesystem cannot turn ``CHECK-x.sh`` or
     ``scripts/SUB/`` into an existing file), a regular file at that exact path (no basename
     search), and a symlink only when it resolves inside scripts/ for a ``scripts/...`` target,
-    else inside the repository.
+    else inside the repository. A target longer than ``PATH_LIMIT`` bytes is no file (#6635).
     """
+    if len(target.encode("utf-8")) > PATH_LIMIT:
+        return False
     parts = target.split("/")
     if any(part in ("", ".", "..") for part in parts):
         return False
-    path = root.joinpath(*parts)
     base = root / "scripts" if parts[0] == "scripts" else root
     try:
-        parent = root
+        path = root
         for part in parts:
-            if part not in os.listdir(str(parent)):
+            if part not in os.listdir(str(path)):
                 return False
-            parent = parent / part
+            path = path / part
         if not path.is_file():
             return False
         path.resolve().relative_to(base.resolve())
@@ -820,6 +885,9 @@ def check(root):
         raw = text.split("\n")
         if raw[-1] == "":
             raw.pop()
+        for n, line in enumerate(raw):
+            if len(line) > LINE_CEILING:
+                raise LineTooLong(rel, n + 1, len(line))
         lines_by_doc.append((rel, raw))
         starts, shape = erratum_block(rel, raw)
         problems.extend(shape)
@@ -1743,6 +1811,13 @@ def main(argv):
         problems = check(Path(args.root))
     except Unreadable as exc:
         print("FAIL %s: unreadable" % exc.path, file=sys.stderr)
+        return 2
+    except LineTooLong as exc:
+        print(
+            "FAIL %s:%d: line too long, undecidable (%d characters; the ceiling is %d)"
+            % (exc.rel, exc.lineno, exc.length, LINE_CEILING),
+            file=sys.stderr,
+        )
         return 2
     except Exception as exc:  # undecidable: never a traceback, never green (design B, item 5)
         print("FAIL internal error: %s: %s" % (type(exc).__name__, exc), file=sys.stderr)
