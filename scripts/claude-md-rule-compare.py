@@ -568,9 +568,19 @@ def selftest_dir() -> Path:
     return Path(__file__).resolve().parent.parent / ".local-runs" / f"rule-compare-selftest-{os.getpid()}"
 
 
+def guarded_run(cases) -> int:
+    """#6574: run the self-test case function; an exception that no per-cell guard caught is a named FAIL and exit 1
+    (the run is over at that point, so the remaining cells cannot run), never a bare traceback."""
+    try:
+        return cases()
+    except Exception as exc:  # noqa: BLE001 - #6574: the last line of defence of the harness itself
+        print(f"FAIL: self-test - aborted in an unguarded cell: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+
 def self_test() -> int:
     try:
-        return _self_test_cases()
+        return guarded_run(_self_test_cases)
     finally:
         shutil.rmtree(selftest_dir(), ignore_errors=True)  # a case that raises must not leave scratch behind
 
@@ -593,6 +603,14 @@ def _self_test_cases() -> int:
     failures = []
 
     counter = [0]
+
+    def guarded(name, fn):
+        """#6574: run one inline cell group; any exception is that group's named FAIL and the run continues."""
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001 - #6574: an exception in an unwrapped cell is a named FAIL, never an abort
+            failures.append(name)
+            print(f"FAIL: self-test - {name}: unexpected {type(exc).__name__}: {exc}", file=sys.stderr)
 
     def case(name, mutate, want_fail, needle, trailer=None, base_mutate=None, message=None):
         counter[0] += 1
@@ -784,18 +802,21 @@ def _self_test_cases() -> int:
     # #6433: the parser must not discover a repository from ANY working directory. GIT_CEILING_DIRECTORIES stops an
     # upward walk but does not exclude the working directory itself, so a parser started inside a repository (a
     # repository at the filesystem root, or a dropped cwd) would read that repository's trailer config.
-    alias_repo = base_dir / "alias-repo"
-    subprocess.run(["git", "init", "-q", str(alias_repo)], check=True)
-    subprocess.run(["git", "-C", str(alias_repo), "config", "trailer.approve.key", "Rule-Change-Approved-By"], check=True)
-    inside = subprocess.run(["git", "interpret-trailers", "--parse", "--no-divider"], input=b"s\n\napprove: Justin\n",
-                            capture_output=True, check=False, cwd=str(alias_repo), env=config_free_env())
-    if b"Rule-Change-Approved-By" in inside.stdout:
-        print("FAIL: self-test - the trailer parser environment still finds a repository from its working directory"
-              " (#6433)", file=sys.stderr)
-        failures.append("parser environment repository")
-    else:
-        print("PASS: self-test - the trailer parser environment does not find a repository from its working directory"
-              " (#6433)")
+    def alias_repo_cell():
+        alias_repo = base_dir / "alias-repo"
+        subprocess.run(["git", "init", "-q", str(alias_repo)], check=True)
+        subprocess.run(["git", "-C", str(alias_repo), "config", "trailer.approve.key", "Rule-Change-Approved-By"], check=True)
+        inside = subprocess.run(["git", "interpret-trailers", "--parse", "--no-divider"], input=b"s\n\napprove: Justin\n",
+                                capture_output=True, check=False, cwd=str(alias_repo), env=config_free_env())
+        if b"Rule-Change-Approved-By" in inside.stdout:
+            print("FAIL: self-test - the trailer parser environment still finds a repository from its working directory"
+                  " (#6433)", file=sys.stderr)
+            failures.append("parser environment repository")
+        else:
+            print("PASS: self-test - the trailer parser environment does not find a repository from its working directory"
+                  " (#6433)")
+
+    guarded("the trailer parser environment does not find a repository from its working directory (#6433) fixture", alias_repo_cell)
 
     def recorded_parser_call(parse=trailer_block):
         """Run `parse` (trailer_block) with a recording `git` first on PATH: the working directory and GIT_DIR it was
@@ -821,7 +842,7 @@ def _self_test_cases() -> int:
     def parser_call_result(parse=trailer_block):
         try:
             return recorded_parser_call(parse)
-        except (RuntimeError, OSError, ValueError) as exc:
+        except Exception as exc:  # noqa: BLE001 - #6574: any exception is this cell's result (a FAIL), never an abort
             return repr(exc), None
 
     seen_cwd, seen_git_dir = parser_call_result()
@@ -831,14 +852,6 @@ def _self_test_cases() -> int:
         failures.append("parser cwd and GIT_DIR")
     else:
         print("PASS: self-test - the trailer parser runs from the filesystem root with GIT_DIR at the null device (#6433)")
-
-    def guarded(name, fn):
-        """#6574: run one inline cell group; any exception is that group's named FAIL and the run continues."""
-        try:
-            fn()
-        except Exception as exc:  # noqa: BLE001 - #6574: an exception in an unwrapped cell is a named FAIL, never an abort
-            failures.append(name)
-            print(f"FAIL: self-test - {name}: unexpected {type(exc).__name__}: {exc}", file=sys.stderr)
 
     def pin(label, check):
         """A cell for the harness itself: `check()` returns "" when the pinned behaviour holds, else the problem."""
@@ -1310,7 +1323,8 @@ def _self_test_cases() -> int:
 
     def crash_cleanup():
         # #5384: a self-test whose case raises still removes its scratch directory. The child loads this file as
-        # a module (so the module-top refusal does not apply), makes its first case raise, and prints its pid.
+        # a module (so the module-top refusal does not apply), makes its first case raise, and prints its pid;
+        # the top-level backstop turns the raise into exit 1 (#6574) and the scratch directory must still go.
         code = ("import importlib.util, os, sys\n"
                 "spec = importlib.util.spec_from_file_location('rc_crash', sys.argv[1])\n"
                 "module = importlib.util.module_from_spec(spec)\n"
@@ -1319,10 +1333,8 @@ def _self_test_cases() -> int:
                 "    raise RuntimeError('boom')\n"
                 "module.make_repo = boom\n"
                 "print(os.getpid(), flush=True)\n"
-                "try:\n"
-                "    module.self_test()\n"
-                "except RuntimeError:\n"
-                "    print('crashed')\n")
+                "code = module.self_test()\n"
+                "print('crashed' if code == 1 else 'unexpected')\n")
         result = subprocess.run([sys.executable, "-I", "-c", code, str(Path(__file__).resolve())],
                                 capture_output=True, text=True, check=False, env=child_env(), stdin=subprocess.DEVNULL)
         lines = result.stdout.split()
@@ -1506,42 +1518,48 @@ def _self_test_cases() -> int:
 
     # #5179: the trusted-path diff starts at the merge base, so a trusted change that landed on the base after
     # the head forked is not charged to the head (every other fixture is linear).
-    work, fork_sha, base_root = fresh_pair("mergebase")
-    repo = work / "repo"
-    (repo / GUARD_REL).write_text("# the base moved on\n", encoding="utf-8")
-    moved_sha = commit_all(repo, "base moves on")
-    subprocess.run(["git", "-C", str(repo), "checkout", "-q", fork_sha], check=True)
-    (repo / "docs").mkdir(parents=True, exist_ok=True)
-    (repo / "docs" / "untrusted-note.md").write_text("x\n", encoding="utf-8")
-    head_sha = commit_all(repo, "head change")
-    try:
-        report, failed = compare(base_root, repo, moved_sha, head_sha, work / "scratch", guard.fixture_index_pins())
-    except RuntimeError as exc:
-        report, failed = f"RESULT: FAIL (closed) - {exc}", True
-    if failed or "GUARD CHANGED" in report:
-        print(f"FAIL: self-test - R6 a base-side trusted change after the fork is charged to the head\n{report}",
-              file=sys.stderr)
-        failures.append("merge base")
-    else:
-        print("PASS: self-test - R6 a base-side trusted change after the fork is not charged to the head (#5179)")
+    def merge_base_cell():
+        work, fork_sha, base_root = fresh_pair("mergebase")
+        repo = work / "repo"
+        (repo / GUARD_REL).write_text("# the base moved on\n", encoding="utf-8")
+        moved_sha = commit_all(repo, "base moves on")
+        subprocess.run(["git", "-C", str(repo), "checkout", "-q", fork_sha], check=True)
+        (repo / "docs").mkdir(parents=True, exist_ok=True)
+        (repo / "docs" / "untrusted-note.md").write_text("x\n", encoding="utf-8")
+        head_sha = commit_all(repo, "head change")
+        try:
+            report, failed = compare(base_root, repo, moved_sha, head_sha, work / "scratch", guard.fixture_index_pins())
+        except RuntimeError as exc:
+            report, failed = f"RESULT: FAIL (closed) - {exc}", True
+        if failed or "GUARD CHANGED" in report:
+            print(f"FAIL: self-test - R6 a base-side trusted change after the fork is charged to the head\n{report}",
+                  file=sys.stderr)
+            failures.append("merge base")
+        else:
+            print("PASS: self-test - R6 a base-side trusted change after the fork is not charged to the head (#5179)")
+
+    guarded("a base-side trusted change after the fork is not charged to the head (#5179) fixture", merge_base_cell)
 
     # #6403: the approval range is base..head. A base-side commit after the fork that carries the trailer must not
     # approve a head that carries none (a symmetric base...head range would count it).
-    work, fork_sha, base_root = fresh_pair("approvalrange")
-    repo = work / "repo"
-    moved_sha = commit_all(repo, "base moves on\n\nRule-Change-Approved-By: Justin")
-    subprocess.run(["git", "-C", str(repo), "checkout", "-q", fork_sha], check=True)
-    reword(repo)
-    head_sha = commit_all(repo, "head change")
-    try:
-        report, failed = compare(base_root, repo, moved_sha, head_sha, work / "scratch", guard.fixture_index_pins())
-    except RuntimeError as exc:
-        report, failed = f"RESULT: FAIL (closed) - {exc}", True
-    if not failed or "approval trailer(s)" in report:
-        print(f"FAIL: self-test - a base-side commit after the fork approves the head\n{report}", file=sys.stderr)
-        failures.append("approval range")
-    else:
-        print("PASS: self-test - a base-side commit after the fork carrying the trailer does not approve the head (#6403)")
+    def approval_range_cell():
+        work, fork_sha, base_root = fresh_pair("approvalrange")
+        repo = work / "repo"
+        moved_sha = commit_all(repo, "base moves on\n\nRule-Change-Approved-By: Justin")
+        subprocess.run(["git", "-C", str(repo), "checkout", "-q", fork_sha], check=True)
+        reword(repo)
+        head_sha = commit_all(repo, "head change")
+        try:
+            report, failed = compare(base_root, repo, moved_sha, head_sha, work / "scratch", guard.fixture_index_pins())
+        except RuntimeError as exc:
+            report, failed = f"RESULT: FAIL (closed) - {exc}", True
+        if not failed or "approval trailer(s)" in report:
+            print(f"FAIL: self-test - a base-side commit after the fork approves the head\n{report}", file=sys.stderr)
+            failures.append("approval range")
+        else:
+            print("PASS: self-test - a base-side commit after the fork carrying the trailer does not approve the head (#6403)")
+
+    guarded("a base-side commit after the fork carrying the trailer does not approve the head (#6403) fixture", approval_range_cell)
 
     def range_cell(name, work, base_root, repo, base_sha, head_sha, want_fail, needle):
         """One base..head comparison on a fixture repo: the verdict and the report text must match."""
@@ -1585,11 +1603,13 @@ def _self_test_cases() -> int:
     # itself, on an older commit and on the newest one. A log read that skips merges (--no-merges), follows only the
     # first parent (--first-parent) or reads one message locks out a real approval.
     def approved_range(name, build, want_fail=False, needle="approval trailer(s): ` Justin `"):
-        work, fork_sha, base_root = fresh_pair(name)
-        repo = work / "repo"
-        head_sha = build(repo, fork_sha)
-        range_cell(f"an approval {ANYWHERE[name]} counts (#6432)", work, base_root, repo, fork_sha, head_sha, want_fail,
-                   needle)
+        def cell():
+            work, fork_sha, base_root = fresh_pair(name)
+            repo = work / "repo"
+            head_sha = build(repo, fork_sha)
+            range_cell(f"an approval {ANYWHERE[name]} counts (#6432)", work, base_root, repo, fork_sha, head_sha,
+                       want_fail, needle)
+        guarded(f"an approval {ANYWHERE[name]} counts (#6432) fixture", cell)
 
     def merged(side_message, merge_message):
         def build(repo, fork_sha):
