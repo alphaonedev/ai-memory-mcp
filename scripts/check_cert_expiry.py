@@ -1494,6 +1494,14 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         ("mask-annot", "definition removed + a mention carrying the drift annotation text",
          {"src/mask_def.rs": 'pub const M: &str = "";\n',
           "src/mask_new.rs": f"// -{kid} (occurrences in src/ fell 2 -> 1)\n"}),
+        # (#6564) git output is split on LF only. A definition after a `//` comment
+        # joined by U+2028 is commented out in Rust (a line comment ends at LF), yet
+        # str.splitlines() would give back the original line text.
+        ("mask-u2028", "definition behind a // comment joined by U+2028",
+         {"src/mask_def.rs": "// note\u2028" + def_line}),
+        # (#6564) the key is the whole trimmed line, not the name plus a prefix.
+        ("mask-trailing", "value emptied, name moved to a trailing comment on the same line",
+         {"src/mask_def.rs": f'pub const M: &str = ""; // {kid}\n'}),
         # Base cases measured on e2c96191e that already went RED; pinned so the
         # keyed comparison cannot lose them.
         ("mask-confusable", "definition reads a confusable name (Cyrillic V)",
@@ -2053,6 +2061,8 @@ SELF_TEST_OK = (
     "(mask, mask-gate, mask-drift, mask-add, #6370) removing the definition of an identifier "
     "that a comment still names stays RED (occurrence counts, not name sets), while an extra "
     "mention is GREEN; "
+    "(mask-u2028, mask-trailing, #6564) a definition behind a // comment joined by U+2028 and a "
+    "definition replaced by an empty value with the name in a trailing comment stay RED; "
     "(value-same-line, value-next-line, doc-bound, #6563) a value edited on the identifier "
     "line is RED, a value on the next line GREEN, and the docstring states the lexical bound; "
     "(mask-xfile, mask-incomment, mask-longer, mask-blockcomment, mask-annot, #6427) a removed "
