@@ -4008,6 +4008,36 @@ class PruneScript6118(unittest.TestCase):
                         self.assertNotIn("Traceback", out)
                         self.assertEqual(before, self._snapshot(victim), out)
 
+    # ---- #6513: the target root is swapped between the lstat and the open ----
+
+    def test_6118_r7_6513_root_swapped_between_lstat_and_open_is_refused(self) -> None:
+        for scope in ("test-bins", "all"):
+            for dry in (False, True):
+                with self.subTest(scope=scope, dry_run=dry):
+                    self.setUp()
+                    other = Path(self.scratch.name) / "other-dir"
+                    other.mkdir()
+                    before = self._snapshot(self.target)
+                    mod = _load_prune()
+                    real_lstat = os.lstat
+                    calls = []
+
+                    def swapped_lstat(path, *a, **kw):  # type: ignore[no-untyped-def]
+                        calls.append(str(path))
+                        if len(calls) == 1 and str(path) == str(self.target):
+                            return real_lstat(str(other))  # the root a racer had in place at check time
+                        return real_lstat(path, *a, **kw)
+
+                    out = io.StringIO()
+                    args = ["--target-dir", str(self.target), "--scope", scope] + (["--dry-run"] if dry else [])
+                    with unittest.mock.patch.object(mod.os, "lstat", swapped_lstat):
+                        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                            rc = mod.main(args)
+                    self.assertEqual([str(self.target)], calls[:1], out.getvalue())
+                    self.assertEqual(2, rc, out.getvalue())
+                    self.assertIn("refusing: %s changed while it was being checked" % self.target, out.getvalue())
+                    self.assertEqual(before, self._snapshot(self.target), out.getvalue())
+
 EXAMPLE_HASHED = "debug/examples/demo-0123456789abcdef"
 EXAMPLE_UPLIFT = "debug/examples/demo"
 # Bytes the default scope frees from examples/ (the uplift pair once, two .d)
