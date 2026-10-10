@@ -2,14 +2,6 @@
 # Ratchet: an entry that no longer matches a hit (or names a missing file) makes the gate exit 2,
 # so this file may only shrink (docs/reference/CODE_STYLE.md:103-105).  Line-pinned only:
 #   path:line   # citation
-.github/workflows/coverage.yml:484   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
-.github/workflows/coverage.yml:491   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
-.github/workflows/coverage.yml:505   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
-.github/workflows/coverage.yml:511   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
-.github/workflows/coverage.yml:512   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
-.github/workflows/coverage.yml:550   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
-.github/workflows/coverage.yml:551   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
-.github/workflows/coverage.yml:553   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
 tests/common/lane_db.rs:123   # refusal predicate cases (lane_database_predicate_cases_3777) name the shared database on purpose
 tests/common/lane_db.rs:127   # refusal predicate cases (lane_database_predicate_cases_3777) name the shared database on purpose
 tests/common/lane_db.rs:138   # refusal predicate cases (lane_database_predicate_cases_3777) name the shared database on purpose
@@ -26,7 +18,6 @@ infra/lan-parity-test/docker-compose.yml:87   # LAN parity dev compose container
 infra/lan-parity-test/docker-compose.yml:99   # LAN parity dev compose container database (parity Pass 1 rework burns this down)
 infra/lan-parity-test/docker-compose.yml:161   # LAN parity dev compose container database (parity Pass 1 rework burns this down)
 infra/lan-parity-test/docker-compose.yml:253   # LAN parity dev compose container database (parity Pass 1 rework burns this down)
-infra/lan-parity-test/run-parity-tests.sh:68   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
 src/store/postgres/tx_retry.rs:464   # URL-redaction fixture string
 src/store/postgres_inbox_tests.rs:126   # classify_create_failure / port_of probe URLs (negative cases)
 src/store/postgres_inbox_tests.rs:127   # classify_create_failure / port_of probe URLs (negative cases)
@@ -34,3 +25,6 @@ src/store/postgres_inbox_tests.rs:159   # classify_create_failure / port_of prob
 src/store/postgres_inbox_tests.rs:161   # classify_create_failure / port_of probe URLs (negative cases)
 packaging/docker-compose.postgres.yml:28   # dev compose fixture, not a CI lane
 packaging/docker-compose.postgres.yml:37   # dev compose fixture, not a CI lane
+scripts/test/pg_isolated_binary.py:69   # SHARED_BASE_DB: the name the wrapper itself refuses as a setup base (#7031 H1)
+scripts/ci/tests/test_pg_isolated_binary.py:664   # SHARED fixture URL: negative case proving setup refuses the shared base (#7031 H1)
+infra/lan-parity-test/run-parity-tests.sh:68   # PG_MAINT_DB: maintenance connection used only to CREATE/DROP the minted Pass-1 database (#7031 lane A)
