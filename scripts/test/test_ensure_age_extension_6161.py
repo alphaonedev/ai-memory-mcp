@@ -722,6 +722,24 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertEqual(mod.ALLOWED_QUERY_KEYS & mod.REFUSED_KNOWN_KEYS, set())
 
     # ---- #6345: a pg_service.conf password must never beat the moved PGPASSWORD ----------
+    def test_caller_pgdatabase_is_left_alone_when_the_url_names_no_database_m13(self):
+        # M13 (mutant: re-adding env.pop("PGDATABASE")): libpq reads PGDATABASE for a URL with no database,
+        # so the helper must not drop the caller's value; a URL database still wins (#6181).
+        self.install_good()
+        cases = (("postgres://ciuser@127.0.0.1:5445?sslmode=disable\n", "callerdb"),
+                 ("postgres://ciuser@127.0.0.1:5445/\n", "callerdb"),
+                 ("postgres://ciuser@127.0.0.1:5445/urldb?sslmode=disable\n", "urldb"))
+        for text, want in cases:
+            with self.subTest(url=text.split("@", 1)[1].strip()):
+                (self.base / "psql.log").unlink(missing_ok=True)
+                self.url_file.write_text(text)
+                r = self.run_script(env=dict(os.environ, PGDATABASE="callerdb"))
+                self.assertEqual(r.returncode, 0, r.stderr)
+                calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+                self.assertTrue(calls)
+                for call in calls:
+                    self.assertEqual(call["pgdatabase"], want)
+
     def test_service_key_in_url_is_refused_by_name(self):
         # libpq fills unset options from the service file BEFORE it reads PGPASSWORD, so a service
         # entry carrying a password beats the moved password (the URL password beat it originally).
