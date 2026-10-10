@@ -2692,6 +2692,59 @@ def _self_test_cases() -> int:
           'secret = """\n' + "q" * 2001 + '"""\nafter-shown-6163', hidden=("q" * 2001,),
           shown=("after-shown-6163",), count=2)
 
+    # #6163 round 6 (#6853): the cost of masking is bounded in total, not only per line. A call whose scan would take
+    # a Redactor past its work budget (2 characters of work per scanned character: the value scan and the row mask) is
+    # hidden whole, row by row, before any pattern runs, and the summary names the reason. The default budget is the
+    # literal 262144; a head of the largest accepted size (MAX_BLOB_BYTES) therefore costs no pattern time at all.
+    def clock():
+        return os.times().elapsed
+
+    hot_line = ("token" * 400)[:1990]
+    hot_new = "\n".join([hot_line] * 200)  # 398 KB of the line shape that costs about 110 microseconds per character
+    hot_redactor = Redactor()
+    hot_start = clock()
+    hot_report = unified("a\nb", hot_new, "## Sec", hot_redactor)
+    hot_seconds = clock() - hot_start
+    hot_rows = [row for row in hot_report.split("\n") if row[:1] in "+-" and not row.startswith(("+++", "---"))]
+    unit("#6853 R6 a 398 KB head of the slowest line shape is hidden whole in under 10 seconds",
+         hot_seconds < 10 and hot_rows and all(row[1:] == MASK for row in hot_rows)
+         and hot_line not in hot_report and any("masking budget" in note and "#6853" in note
+                                               for note in hot_redactor.note()),
+         f"{hot_seconds:.1f}s {len(hot_rows)} rows\n{hot_report[:300]}\n{hot_redactor.note()}")
+    blob_line = "x" * 1990
+    blob_new = "\n".join([blob_line] * (MAX_BLOB_BYTES // 1991 + 1))
+    blob_redactor = Redactor()
+    blob_start = clock()
+    blob_report = unified("a\nb", blob_new, "## Sec", blob_redactor)
+    blob_seconds = clock() - blob_start
+    unit("#6853 R6 a head of MAX_BLOB_BYTES is hidden whole in under 20 seconds and the note names the budget",
+         blob_seconds < 20 and blob_line not in blob_report and blob_redactor.count >= 200
+         and any("masking budget" in note for note in blob_redactor.note()),
+         f"{blob_seconds:.1f}s count={blob_redactor.count}\n{blob_report[:300]}\n{blob_redactor.note()}")
+    budget_redactor = Redactor()
+    budget_redactor.budget = 2 * 11
+    budget_first = budget_redactor.mask("abcde\nfghij")  # 10 scanned characters + 1 newline split: 2 * 10 <= 22
+    budget_second = budget_redactor.mask("klmno")  # 2 * 5 more would pass 22: hidden whole
+    unit("#6853 R6 the budget is spent across calls and a call that does not fit is hidden whole",
+         budget_first == "abcde\nfghij" and budget_second == MASK, f"{budget_first!r} {budget_second!r}")
+    edge_redactor = Redactor()
+    edge_redactor.budget = 2 * 10
+    edge_fit = edge_redactor.mask("abcde\nfghij")
+    edge_redactor_low = Redactor()
+    edge_redactor_low.budget = 2 * 10 - 1
+    edge_over = edge_redactor_low.mask("abcde\nfghij")
+    unit("#6853 R6 the budget limit is inclusive: 20 units fit 10 characters, 19 do not",
+         edge_fit == "abcde\nfghij" and edge_over == MASK + "\n" + MASK, f"{edge_fit!r} {edge_over!r}")
+    legit_section = "\n".join(f"Rule line {index}: keep the gate green and the tool limit at 103 tools." for index in range(400))
+    legit_redactor = Redactor()
+    legit_report = unified(legit_section, legit_section[:-len("tools.")] + "tool calls.", "## Sec",
+                          legit_redactor)
+    unit("#6853 R6 a realistic 30 KB section diff is within the default budget and is not hidden",
+         "tool calls." in legit_report and not any("masking budget" in note for note in legit_redactor.note()),
+         legit_report[:300])
+    unit("#6853 R6 the default work budget is 262144 (literal pin)", getattr(Redactor(), "budget", None) == 262144,
+         str(getattr(Redactor(), "budget", None)))
+
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
     fetch_root = base_dir / "pr-fetch"
