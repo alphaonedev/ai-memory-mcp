@@ -84,7 +84,9 @@ fn write_subcommands_on_a_fifo_db_exit_non_zero_without_hanging_6374() {
             .args(&args)
             .timeout(Duration::from_secs(10))
             .output()
-            .unwrap_or_else(|e| panic!("#6374: {verb:?} must return, not hang on a FIFO --db: {e}"));
+            .unwrap_or_else(|e| {
+                panic!("#6374: {verb:?} must return, not hang on a FIFO --db: {e}")
+            });
         assert!(
             !out.status.success(),
             "#6374: {verb:?} on a FIFO --db must exit non-zero.\nstdout: {}\nstderr: {}",

@@ -88,20 +88,26 @@ fn dns_pin_is_applied_and_keyed_on_the_clients_host_6860() {
 fn without_a_pin_the_invalid_host_is_unreachable_6860() {
     // Control: the cells above would pass vacuously if `.invalid` resolved.
     let (addr, served) = one_shot_receiver();
-    let parsed =
-        ParsedWebhookUrl::parse(&format!("http://pin-6860.invalid:{}/hook", addr.port()))
-            .expect("parse");
+    let parsed = ParsedWebhookUrl::parse(&format!("http://pin-6860.invalid:{}/hook", addr.port()))
+        .expect("parse");
     let url = parsed.url().clone();
     let res = std::thread::spawn(move || {
         let client = webhook_url::pinned_client_builder("pin-6860.invalid", &[])
             .timeout(std::time::Duration::from_secs(3))
             .build()
             .expect("client");
-        client.post(url).body("{}").send().map(|r| r.status().as_u16())
+        client
+            .post(url)
+            .body("{}")
+            .send()
+            .map(|r| r.status().as_u16())
     })
     .join()
     .expect("client thread");
-    assert!(res.is_err(), "#6860: an unpinned .invalid host must not resolve");
+    assert!(
+        res.is_err(),
+        "#6860: an unpinned .invalid host must not resolve"
+    );
     drop(served);
 }
 
