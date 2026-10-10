@@ -9,9 +9,10 @@
 //! #3675 heal (`rekey_peer`) folds both raw-keyed rows into it and each
 //! peer pulls from the other's watermark, skipping rows it never received.
 //!
-//! The cycle must refuse such a peer BEFORE it touches `sync_state`: no row
-//! is keyed by a non-unique rendering, no cursor is folded, and the refusal
-//! carries no credential byte.
+//! The cycle must refuse such a peer BEFORE it reads `sync_state`: no row
+//! is keyed by a non-unique rendering, no cursor is folded, the refusal
+//! carries no credential byte, and (#6628) a raw-keyed row holding the
+//! credential URL is deleted rather than kept at rest.
 
 use std::path::Path;
 
@@ -73,13 +74,21 @@ async fn assert_no_shared_key(tag: &str, peers: &[String; 2]) {
         errors.push(format!("{err:#}"));
     }
     let after = stored_keys(&db);
+    assert_eq!(before.len(), 2, "{tag}: both raw-keyed rows were planted");
     assert!(
         after.iter().all(|(k, _)| *k != a_key),
         "{tag}: a cursor was keyed by the shared rendering {a_key:?}: {after:?}"
     );
-    assert_eq!(
-        before, after,
-        "{tag}: sync_state changed for a refused peer (cursor folded or moved)"
+    // #6628 (3-agent vote (6def5ab6), option A): a refused peer's raw-keyed
+    // row holds the credential URL, so the refusal deletes it rather than
+    // keeping it at rest; no cursor is folded into the shared rendering.
+    assert!(
+        after.iter().all(|(k, _)| !k.contains(MARKER)),
+        "{tag}: a refused peer's raw credential key survived at rest: {after:?}"
+    );
+    assert!(
+        after.is_empty(),
+        "{tag}: sync_state gained a row for a refused peer: {after:?}"
     );
     for text in &errors {
         assert!(

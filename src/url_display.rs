@@ -662,7 +662,7 @@ mod tests {
         for url in [
             "https://peer.example:9077/mesh",
             "https://alice:s3cr3t@peer.example/mesh",
-            "https://host/a@b",
+            "https://host/a%40b",
         ] {
             assert!(origin_and_path_is_durable_key(url), "{url:?}");
         }
@@ -672,21 +672,64 @@ mod tests {
         assert!(!origin_and_path_is_durable_key("https://h:99999/a"));
     }
 
+    /// #6628 / #6700 (3-agent vote (6def5ab6), memory 67aec9a2, option A) -
+    /// a peer URL with a literal `@` left after the url-crate PARSED
+    /// authority has no durable key and renders redacted, whatever the raw
+    /// text looks like: a numeric-prefixed password (parsed as the port), a
+    /// password-less token holding `/`, the `?` / `#` variants, and the
+    /// #6700 shape (no slashes after the scheme, `://` inside the secret).
+    fn at_after_authority_peer_urls_6628() -> Vec<String> {
+        let mk = "SECRETX6628";
+        let mut out = Vec::new();
+        for d in ['/', '?', '#'] {
+            out.push(format!("https://svc:123{d}{mk}pw@peer.example/mesh"));
+            out.push(format!("https://tok{d}{mk}@peer.example/mesh"));
+        }
+        out.push(format!("https:svc:/{mk}/x://y/z@peer.example/mesh"));
+        out.push(format!("https://svc:1/{mk}/x://y/z@peer.example/mesh"));
+        out.push(format!("https://svc:123/{mk}:x@peer.example/mesh"));
+        out.push(format!("https://[::1]:9077/mesh/{mk}@b"));
+        out.push(format!("https://host/a@{mk}"));
+        out
+    }
+
     #[test]
-    fn origin_and_path_keeps_a_legitimate_at_sign_in_the_path_6101() {
-        assert_eq!(url_origin_and_path("https://host/a@b"), "https://host/a@b");
+    fn peer_key_refuses_any_at_after_the_parsed_authority_6628() {
+        for url in at_after_authority_peer_urls_6628() {
+            assert!(!origin_and_path_is_durable_key(&url), "{url:?}");
+            let r = url_origin_and_path(&url);
+            assert!(
+                !r.to_ascii_lowercase().contains("secretx6628"),
+                "#6628: url_origin_and_path rendered credential bytes of {url:?}: {r:?}"
+            );
+            assert!(r.ends_with("://<redacted-authority>"), "{url:?} -> {r:?}");
+        }
+    }
+
+    /// The operator's remedy the refusal names: a literal `@` written as
+    /// `%40` keeps a durable, unique key, and well-formed userinfo still
+    /// renders without the credential (#3675).
+    #[test]
+    fn percent_encoded_at_keeps_a_durable_key_6628() {
         assert_eq!(
-            url_origin_and_path("https://peer.example:9077/mesh/a@b?token=qpw"),
-            "https://peer.example:9077/mesh/a@b"
+            url_origin_and_path("https://host/a%40b"),
+            "https://host/a%40b"
         );
         assert_eq!(
-            url_origin_and_path("https://[::1]:9077/mesh/a@b"),
-            "https://[::1]:9077/mesh/a@b"
+            url_origin_and_path("https://peer.example:9077/mesh/a%40b?token=qpw"),
+            "https://peer.example:9077/mesh/a%40b"
+        );
+        assert_eq!(
+            url_origin_and_path("https://svc:p%40ss@peer.example/mesh"),
+            "https://peer.example/mesh"
         );
         assert_eq!(
             url_origin_and_path("https://alice:s3cr3t@peer.example/mesh"),
             "https://peer.example/mesh"
         );
+        for url in ["https://host/a%40b", "https://svc:p%40ss@peer.example/mesh"] {
+            assert!(origin_and_path_is_durable_key(url), "{url:?}");
+        }
     }
 
     #[test]
