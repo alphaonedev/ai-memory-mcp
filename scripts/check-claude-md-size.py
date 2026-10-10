@@ -58,7 +58,8 @@ from pathlib import Path
 
 # Ceilings only fall (#4507 target: <= 80 KB). Keep CLAUDE.md short rather than raising this.
 CLAUDE_MD_MAX_BYTES = 80_000
-# Floors only rise. Measured at the #4507 split: 64,378 bytes plus the binding-rules index.
+# Lowered deliberately from 60,000 when the rule sections were condensed (CLAUDE.md measured 30,346 bytes at
+# the condensation); a later change may only raise it again.
 CLAUDE_MD_MIN_BYTES = 28_000
 
 # Pinned `## ` headings of CLAUDE.md, identical to the pre-split file at 9f68ea41a (15 headings).
@@ -82,7 +83,8 @@ CLAUDE_MD_REQUIRED_HEADINGS = (
 
 # R3-8: minimum visible body bytes per pinned heading (about 90% of the size at the split, rounded down to
 # 100). Without it a rule section could be emptied to its heading and CLAUDE.md would still clear the
-# whole-file floor. One table, same order as CLAUDE_MD_REQUIRED_HEADINGS; floors only rise.
+# whole-file floor. One table, same order as CLAUDE_MD_REQUIRED_HEADINGS; these floors were lowered once, deliberately,
+# for the condensed rule sections (see CLAUDE_MD_MIN_BYTES); a later change may only raise them.
 CLAUDE_MD_SECTION_MIN_BYTES = (
     600,   # Hard rule - memory_store FIRST
     800,   # Required Reading at Session Start
