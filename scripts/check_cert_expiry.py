@@ -3134,6 +3134,25 @@ def _wrap_cells(t, fx, repo, base):
          {"src/wrap_d.rs": around(d_text, d_set, "    std::panic::resume_unwind(Box::new(0));\n")}),
         ("wrap-adv-unreachable-unchecked", "early exit", "an unsafe block calling unreachable_unchecked before the line",
          {"src/wrap_d.rs": around(d_text, d_set, "    unsafe { std::hint::unreachable_unchecked() }\n")}),
+        # #6844: `if false` / `while false` not at the end of the header
+        ("wrap-adv-match-guard-false", "if false", "the line in a match arm guarded by `if false`",
+         {"src/wrap_d.rs": around(d_text, d_set, "    match () {\n        _ if false => {\n",
+                                  "        }\n        _ => {}\n    }\n")}),
+        ("wrap-adv-if-false-or-false", "if false", "the line inside `if false || false`",
+         {"src/wrap_d.rs": around(d_text, d_set, "    if false || false {\n", "    }\n")}),
+        ("wrap-while-false-or", "while false", "the line inside `while false || false`",
+         {"src/wrap_d.rs": around(d_text, d_set, "    while false || false {\n", "    }\n")}),
+        ("wrap-if-false-and", "if false", "the line inside `if false && true`",
+         {"src/wrap_d.rs": around(d_text, d_set, "    if false && true {\n", "    }\n")}),
+        # pins: shapes already RED that the #6844 rewrite must keep RED
+        ("wrap-if-cfg-test", "if cfg!(", "the line inside `if cfg!(test)`",
+         {"src/wrap_d.rs": around(d_text, d_set, "    if cfg!(test) {\n", "    }\n")}),
+        ("wrap-while-false", "while false", "the line inside `while false`",
+         {"src/wrap_d.rs": around(d_text, d_set, "    while false {\n", "    }\n")}),
+        ("wrap-else-if-false", "if false", "the line in an `else if false` branch",
+         {"src/wrap_d.rs": around(d_text, d_set, "    if k.is_empty() {\n    } else if false {\n", "    }\n")}),
+        ("wrap-loop-empty-before", "a loop with no break", "an empty `loop {}` before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    loop {}\n")}),
     ]
     for label, reason, desc, edits in reds:
         fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
@@ -3258,6 +3277,8 @@ def _wrap_cells(t, fx, repo, base):
         ("wrap-ctl-match-arm-return", "a `return` in one match arm before the line",
          {"src/wrap_d.rs": around(d_text, d_set, '    match k.len() {\n        0 => return "",\n'
                                   "        _ => {}\n    }\n")}),
+        ("wrap-ctl-if-false-else", "the line in the else branch of `if false`",
+         {"src/wrap_d.rs": around(d_text, d_set, "    if false {\n    } else {\n", "    }\n")}),
     ]
     for label, desc, edits in controls:
         fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
@@ -3439,6 +3460,7 @@ SELF_TEST_OK = (
     "(wrap-adv-raw-ident-macro-swallow, wrap-raw-panic, each with -gate, #6841) the raw identifier form `r#name!` of a swallowing macro or an exit macro is the same construct; (wrap-ctl-raw-mod-decl) `mod r#name;` declares the module and is GREEN; "
     "(wrap-adv-underscore-assign-return, wrap-adv-paren-return, wrap-adv-return-in-call, wrap-return-first-arg, wrap-break-in-loop-call, wrap-panic-in-call, each with -gate, #6842) a return, break, continue or exit macro anywhere a statement always evaluates is an early exit; (wrap-ctl-closure-return, wrap-ctl-shortcircuit-return, wrap-ctl-match-arm-return) one inside a closure, after `||` or in one match arm is GREEN; "
     "(wrap-adv-panic-any, wrap-adv-resume-unwind, wrap-adv-unreachable-unchecked, each with -gate, #6843) panic_any, resume_unwind and unreachable_unchecked under any path are exits; "
+    "(wrap-adv-match-guard-false, wrap-adv-if-false-or-false, wrap-while-false-or, wrap-if-false-and, each with -gate, #6844) `if false` or `while false` anywhere in a header, a match guard included, is RED, and (wrap-if-cfg-test, wrap-while-false, wrap-else-if-false, wrap-loop-empty-before, each with -gate) stay RED; (wrap-ctl-if-false-else) the else branch of `if false` is GREEN; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
