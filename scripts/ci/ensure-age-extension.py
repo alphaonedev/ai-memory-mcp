@@ -32,7 +32,7 @@ The tier URL is read from a file.  Its password is passed to psql through the
 ``PGPASSWORD`` environment variable and removed from the URL psql receives, so
 the password never appears on a process argv.  ONLY the password is moved off
 argv: path- and name-valued keys that are allowed (``sslrootcert``, ``sslcert``,
-``sslkey``, ``sslcrl``, ``sslcrldir``, ``passfile``, ``service``, ``krbsrvname``,
+``sslkey``, ``sslcrl``, ``sslcrldir``, ``passfile``, ``krbsrvname``,
 ``requirepeer``) stay in the URL on psql's argv, as do host, user and database.
 
 Because urllib and libpq split a URL differently, the URL is refused (exit 2,
@@ -62,7 +62,10 @@ known libpq keywords: secrets (``sslpassword``, ``oauth_client_secret``,
 ``scram_client_key``, ``scram_server_key``, which libpq cannot take from the
 environment) and keys that change the authentication mechanism or session mode
 (``gsslib``, ``gssdelegation``, ``replication``, ``oauth_issuer``,
-``oauth_client_id``, ``oauth_scope``).  ``ssl=true`` is a JDBC alias libpq does
+``oauth_client_id``, ``oauth_scope``).  ``service`` is refused too (#6345): libpq reads a
+``pg_service.conf`` entry BEFORE ``PGPASSWORD``, so a service-file password would beat the
+password the helper moved off argv, while in the original URL the URL password wins.  For the
+same reason psql runs without ``PGSERVICE`` and ``PGSERVICEFILE`` in its environment.  ``ssl=true`` is a JDBC alias libpq does
 not know; use ``sslmode``.  A refusal names a key only when it is a known libpq
 keyword (an unlisted key can be the tail of a password that held a raw ``&``),
 never a value, and neither form of the URL is printed.
@@ -111,7 +114,7 @@ ALLOWED_QUERY_KEYS = frozenset((
     "sslmode", "sslrootcert", "sslcert", "sslkey", "sslcrl", "sslsni", "options",
     "target_session_attrs", "client_encoding", "keepalives", "keepalives_idle",
     "keepalives_interval", "keepalives_count", "tcp_user_timeout", "channel_binding",
-    "gssencmode", "krbsrvname", "service", "passfile", "requirepeer", "load_balance_hosts",
+    "gssencmode", "krbsrvname", "passfile", "requirepeer", "load_balance_hosts",
     "fallback_application_name", "sslnegotiation", "sslcompression", "sslcertmode", "sslcrldir",
     "min_protocol_version", "max_protocol_version", "ssl_min_protocol_version", "ssl_max_protocol_version",
 ))
@@ -121,10 +124,12 @@ ALLOWED_QUERY_KEYS = frozenset((
 # any other refused key stays unnamed.
 REFUSED_KNOWN_KEYS = frozenset((
     "password", "sslpassword", "oauth_client_secret", "scram_client_key", "scram_server_key",
-    "sslkeylogfile", "require_auth", "gsslib", "gssdelegation", "replication", "oauth_issuer",
+    "service", "sslkeylogfile", "require_auth", "gsslib", "gssdelegation", "replication", "oauth_issuer",
     "oauth_client_id", "oauth_scope", "ssl",
 ))
 KNOWN_KEY_NAMES = ALLOWED_QUERY_KEYS | REFUSED_KNOWN_KEYS
+# libpq applies a pg_service.conf entry before PGPASSWORD (#6345), so neither reaches the psql child.
+SERVICE_ENV = ("PGSERVICE", "PGSERVICEFILE")
 TEMP_SUFFIX = ".age-restore"
 
 # (source subdir, file name, sha256) for AGE 1.8.0 built against postgresql@18.
@@ -260,6 +265,8 @@ def probe_lists_age(psql, url):
     if password is not None:
         env["PGPASSWORD"] = password
     env["PGCONNECT_TIMEOUT"] = CONNECT_TIMEOUT_SECONDS  # a connect_timeout in the URL overrides it
+    for name in SERVICE_ENV:
+        env.pop(name, None)  # #6345: a service-file password would beat the moved PGPASSWORD
     try:
         proc = subprocess.Popen(
             [psql, target, "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", PROBE_SQL],
