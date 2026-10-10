@@ -1,3 +1,7 @@
+## Erratum (#6141)
+
+Erratum (#6141): N30's enforcer `check-cert-expiry.sh` is `scripts/check_cert_expiry.py` since #6137; its verdict and output are identical on every push payload GitHub Actions delivers, and it fails closed on malformed SHAs, CERT_EXPIRY_* overrides (#5970) or git older than 2.30. The same erratum covers the historical mentions in docs/compliance/ listed in scripts/qc-allowlists/compliance-script-names-allow.txt.
+
 <!-- #3557 (N22) — ADOPTED COPY. This is the reviewed text of
 docs/reviews/AI-MEMORY-V1.0.0-MISSION-CRITICAL-CERTIFICATION-STANDARD-2026-09-09.md
 (revision 4.2), adopted verbatim into docs/compliance/ as the normative standard for the

@@ -1,0 +1,31 @@
+# compliance-script-names-allow.txt - allowlist for
+# `scripts/check_compliance_script_names.py` (#6141, design B: 3-agent vote 6def5ab6).
+# One entry per line: `<relative-doc-path>:<token>:<count>[:pinned]`.
+#
+# <token> is a stale script name or a script-name fragment (`c` .. `check-x.s`), matched
+# case-sensitively; <count> is the exact number of occurrences the document holds (per
+# line, the largest count over the gate's three views). A count that differs in either
+# direction, a stale entry (suppresses nothing), a duplicate or malformed entry, or more
+# entries than ALLOW_CEILING in the gate FAILS the gate. The ceiling only falls.
+#
+# A stale script name is honoured only while that document itself carries a valid
+# erratum block for the name (#6170). An entry suffixed `:pinned` is for a document
+# that cannot carry one and is honoured while an erratum for the name exists in any
+# docs/compliance/ document. `:pinned` is a closed set enforced by the gate (#6173):
+# exactly v1.0.0-DECLARATION.md (SHA-256 pinned) and
+# ENTERPRISE-FEDERATION-CERTIFICATION.md (guarded by the cert section 7 gate).
+# `:pinned` on any other document, on a fragment, or on a document that carries its own
+# erratum for the name, FAILS the gate.
+#
+# A fragment entry records prose in which a fragment sits next to markup, such as the
+# enumerator `(c)`; it needs no erratum.
+docs/compliance/MISSION-CRITICAL-CERTIFICATION-STANDARD-v1.md:check-cert-expiry.sh:4
+docs/compliance/BALLOT-PROCEDURE.md:check-cert-expiry.sh:2
+docs/compliance/v1.0.0-DECLARATION.md:check-cert-expiry.sh:1:pinned
+docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md:check-cert-expiry.sh:5:pinned
+docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md:C:1
+docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md:c:3
+docs/compliance/_inventory/v0.7.x-code-changes-test-plan.md:check:1
+docs/compliance/_inventory/v0.7.x-code-changes-test-plan.md:c:1
+docs/compliance/nsa-csi-mcp-security-mapping.md:check_agent_action:1
+docs/compliance/nsa-csi-mcp-security-mapping.md:c:2
