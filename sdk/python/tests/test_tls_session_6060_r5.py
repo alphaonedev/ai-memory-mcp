@@ -1716,3 +1716,30 @@ def test_dotdot_after_an_existing_component_steps_back_one_level_6656(
     _bundle(lab, directory)
     _ca_dir(directory, "sub")
     _built(client_cls, str(directory / "sub" / ".." / "ca.pem"))
+
+
+# ---- #6660: the symlink hop cap is enforced at its bound -------------------
+
+
+def _link_chain(tmp_path: pathlib.Path, target: pathlib.Path, links: int) -> pathlib.Path:
+    """``links`` symlinks in a private directory, each pointing at the next."""
+    chain = _ca_dir(tmp_path, f"chain{links}")
+    nxt = target
+    for index in range(links, 0, -1):
+        link = chain / f"l{index}"
+        link.symlink_to(nxt)
+        nxt = link
+    return nxt
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_symlink_chain_over_the_hop_cap_is_refused_6660(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type
+) -> None:
+    bundle = _bundle(lab, _ca_dir(tmp_path))
+    at_cap = _link_chain(tmp_path, bundle, _common._MAX_SYMLINK_HOPS)
+    _built(client_cls, str(at_cap))
+    over = _link_chain(tmp_path, bundle, _common._MAX_SYMLINK_HOPS + 1)
+    with pytest.raises(ValueError, match="too many symlinks"):
+        _built(client_cls, str(over))
