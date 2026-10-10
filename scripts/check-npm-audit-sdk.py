@@ -28,8 +28,11 @@ def load_report(args):
         print("::notice::npm not found on PATH; skipping npm audit gate for "
               "%s (gate NOT evaluated)" % args.dir)
         return None
+    cmd = ["npm", "audit", "--audit-level=%s" % args.level, "--json"]
+    if args.omit_dev:
+        cmd.append("--omit=dev")
     proc = subprocess.run(
-        ["npm", "audit", "--audit-level=%s" % args.level, "--json"],
+        cmd,
         cwd=args.dir, capture_output=True, text=True, check=False,
     )
     try:
@@ -46,6 +49,8 @@ def main(argv=None):
     ap.add_argument("--level", default="high", choices=LEVELS)
     ap.add_argument("--json-file", default=None,
                     help="read a canned npm audit JSON instead of running npm")
+    ap.add_argument("--omit-dev", action="store_true",
+                    help="pass --omit=dev: gate the shipped runtime tree only")
     args = ap.parse_args(argv)
     try:
         report = load_report(args)

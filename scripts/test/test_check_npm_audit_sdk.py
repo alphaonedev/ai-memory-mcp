@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Unit test for scripts/check-npm-audit-sdk.py (#7084). No network."""
 import contextlib
+import importlib.util
 import io
 import json
 import os
@@ -60,6 +61,21 @@ class NpmAuditGate(unittest.TestCase):
         rc, out = run([], env=env)
         self.assertEqual(rc, 0, out)
         self.assertIn("::notice::", out)
+
+    def test_omit_dev_passes_flag_to_npm(self):
+        spec = importlib.util.spec_from_file_location("gate", str(SCRIPT))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        out = json.dumps({"metadata": {"vulnerabilities": {"high": 0}},
+                          "vulnerabilities": {}})
+        fake = mock.Mock(stdout=out, stderr="", returncode=0)
+        with mock.patch.object(mod.shutil, "which", return_value="/x/npm"), \
+                mock.patch.object(mod.subprocess, "run", return_value=fake) as r, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(mod.main(["--omit-dev"]), 0)
+            self.assertIn("--omit=dev", r.call_args[0][0])
+            self.assertEqual(mod.main([]), 0)
+            self.assertNotIn("--omit=dev", r.call_args[0][0])
 
 
 if __name__ == "__main__":

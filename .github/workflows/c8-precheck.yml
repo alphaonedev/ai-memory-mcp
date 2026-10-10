@@ -369,8 +369,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Unit-test the npm audit gate (canned JSON, no network)
         run: python3 -m unittest scripts/test/test_check_npm_audit_sdk.py
-      - name: Run npm audit gate over sdk/typescript
-        run: python3 scripts/check-npm-audit-sdk.py --dir sdk/typescript
+      - name: Run npm audit gate over sdk/typescript (runtime tree; dev chain tracked in #7089)
+        run: python3 scripts/check-npm-audit-sdk.py --dir sdk/typescript --omit-dev
 
   mcp-transport-isolation-gate:
     # #3829 — MCP transport is stdio-only. The src/mcp stdio JSON-RPC loop
