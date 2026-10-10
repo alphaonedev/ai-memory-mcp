@@ -2450,6 +2450,22 @@ class Evasions6118(_GuardHelpers6118, unittest.TestCase):
                                         with_=[("toolchain", "stable"), (key, "w")]))
         self._clean(self._step("a", uses="dtolnay/rust-toolchain@stable", with_=[("toolchain", "stable")]))
 
+    # ---- #6515: rustdocflags in a cargo config, on a run line and in step env ----
+
+    def test_6118_r7_6515_rustdocflags_in_a_cargo_config_is_flagged(self) -> None:
+        for body in ('[build]\nrustdocflags = ["-g"]\n', '[target.x86_64-unknown-linux-gnu]\nrustdocflags = ["-g"]\n'):
+            with self.subTest(body=body):
+                found = self._repo_mutated(".cargo/config.toml", body)
+                self.assertTrue(self._debug_flagged(found), (body, found))
+        self.assertEqual([], self._repo_mutated(".cargo/config.toml", '[build]\nrustdocflags = ["-Dwarnings"]\n'))
+
+    def test_6118_r7_6515_rustdocflags_on_a_run_line_input_and_step_env_are_flagged(self) -> None:
+        self._caught(self._step("a", "cargo test --config 'build.rustdocflags=[\"-g\"]'"))
+        self._caught(self._step("a", "cargo test --doc", env=[("RUSTDOCFLAGS", "-g")]))
+        self._caught(self._step("a", uses="dtolnay/rust-toolchain@stable",
+                                with_=[("toolchain", "stable"), ("rustdocflags", "-g")]))
+        self._clean(self._step("a", "cargo test --doc", env=[("RUSTDOCFLAGS", "-Dwarnings")]))
+
 
 
 def _write(path: Path, size: int, executable: bool = False) -> None:
