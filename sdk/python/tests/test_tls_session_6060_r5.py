@@ -1970,8 +1970,9 @@ def test_plain_path_under_a_shared_writable_ancestor_is_refused_6653(
     ancestor.chmod(mode)
     with pytest.raises(ValueError, match="writable") as refused:
         _built(client_cls, verify)
-    assert repr(str(ancestor)) in str(refused.value)  # names the directory
-    assert "chmod go-w" in str(refused.value)  # and the fix
+    # It names the directory to fix, not the one holding it, and the exact fix.
+    assert f"whose directory {str(ancestor)!r}" in str(refused.value)
+    assert f"(chmod go-w {ancestor})" in str(refused.value)
 
 
 @_POSIX_ONLY
@@ -1986,7 +1987,8 @@ def test_link_target_under_a_shared_writable_grandparent_is_refused_6653(
     ancestor.chmod(0o777)
     with pytest.raises(ValueError, match="writable") as refused:
         _built(client_cls, str(links / "ca.pem"))
-    assert repr(str(ancestor)) in str(refused.value)
+    assert f"whose directory {str(ancestor)!r}" in str(refused.value)
+    assert f"(chmod go-w {ancestor})" in str(refused.value)
 
 
 @_POSIX_ONLY
@@ -2045,8 +2047,8 @@ def test_ancestor_owned_by_another_user_is_refused_6653(
     _owned_by(monkeypatch, ancestor, _FOREIGN_UID)
     with pytest.raises(ValueError, match="owned by uid") as refused:
         _built(client_cls, verify)
-    assert repr(str(ancestor)) in str(refused.value)
-    assert str(_FOREIGN_UID) in str(refused.value)
+    # The owner named is the directory's, not the owner of what it holds.
+    assert f"the directory {str(ancestor)!r}, owned by uid {_FOREIGN_UID}" in str(refused.value)
     assert "chown" in str(refused.value)
 
 
