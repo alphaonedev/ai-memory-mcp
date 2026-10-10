@@ -236,16 +236,17 @@ _MAX_SYMLINK_HOPS = 40
 
 
 def _checked_realpath(path: str) -> str:
-    """``os.path.realpath(path)``, refusing a symlink others could re-point (#6559).
+    """Resolve ``path`` component by component, refusing a re-pointable symlink (#6559).
 
-    Every component is resolved in order. A symlink met on the way (the path
+    This is not ``os.path.realpath``: every component is resolved in order. A symlink met on the way (the path
     itself, a directory component, or a link its target leads through) is
     refused when the directory holding it lets the group or others write and
     is not sticky with the link owned by this user or root: anyone with that
     write access could replace the link and change which CA is read. This is
     the #6377 rule for a CA file's directory, applied to every link. A
-    missing component ends the walk with the remainder appended, as
-    ``realpath`` does; the caller then refuses the path.
+    missing component ends the walk with the remainder appended unchanged (a
+    later ``..`` is NOT collapsed lexically; the kernel returns ENOENT for it
+    too), so the caller refuses the path.
     """
     if os.name == "nt":
         return os.path.realpath(path)
@@ -361,8 +362,9 @@ def _load_trust_file(context: ssl.SSLContext, shown: str, entry: str) -> None:
 def _context_from_path(path: str, *, kind: str | None = None) -> ssl.SSLContext:
     """A verifying context for the CA file or directory ``path`` (#6269, #6377).
 
-    The path is resolved NOW, as ``os.path.realpath`` does, refusing a symlink
-    on the way that sits in a directory others can write (#6559). A path that is neither
+    The path is resolved NOW, component by component by ``_checked_realpath``,
+    refusing a symlink on the way that sits in a directory others can write
+    (#6559). A path that is neither
     an existing regular file nor an existing directory (missing, FIFO, socket,
     device) is a ``ValueError`` rather than a late ``FileNotFoundError`` or a
     hang (#6307).
@@ -984,8 +986,11 @@ def build_httpx_kwargs(
             whoever answers — the man-in-the-middle exposure the #3828
             ``http://`` refusal closes, one layer up. Accepted forms are exactly
             ``None``, ``True``, the path of an existing CA file or directory (``str``
-            or ``os.PathLike``, resolved with ``os.path.realpath`` and read
-            once at construction, never group- or world-writable, #6377) and
+            or ``os.PathLike``, resolved component by component at
+            construction, a missing component refused rather than normalised
+            away, read once then and never group- or world-writable, #6377,
+            #6559; ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` under ``None`` or
+            ``True`` are read the same way, #6538) and
             exactly ``ssl.SSLContext`` (never a subclass) that is
             ``CERT_REQUIRED`` with ``check_hostname`` on, no relaxing verify
             flag, no suite without server authentication and no replaced

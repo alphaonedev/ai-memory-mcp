@@ -77,9 +77,10 @@ Accepted (anything else raises `ValueError` from the constructor):
   refused rather than falling back to `certifi` (#6538).
 - `True`: the same, explicit.
 - A `str` or `os.PathLike` naming an existing CA bundle file or hashed CA
-  directory. The path is resolved with `os.path.realpath` when the client is
-  built (symlinks followed, a relative path fixed against the working
-  directory at that moment). The SDK reads the trust ONCE, at construction,
+  directory. The path is resolved component by component when the client is
+  built (symlinks followed under the #6559 rule, a relative path fixed against
+  the working directory at that moment; a missing component is refused, not
+  normalised away by a later `..` as `os.path.realpath` would). The SDK reads the trust ONCE, at construction,
   into a context it builds the way `ssl.create_default_context` does but
   without the system store: for a directory, every hashed entry
   (`<hash>.0`, `<hash>.r0`, ..., as `c_rehash` / `openssl rehash` name them)

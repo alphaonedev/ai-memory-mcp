@@ -74,11 +74,13 @@ class AiMemoryClient:
             this identity on stored memories (see docs/reference/ARCHITECTURE_REFERENCE.md §Agent Identity).
         timeout: Seconds before a request is aborted.
         verify: TLS server verification. Accepted: ``None`` (httpx default trust:
-            certifi, or ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` when set), ``True``, the path of an existing CA bundle file or hashed
-            CA directory (``str`` / ``os.PathLike``, resolved with
-            ``os.path.realpath`` and read ONCE, now, into a context the SDK
-            builds; a group- or world-writable path is refused, #6248, #6269,
-            #6377) and exactly ``ssl.SSLContext`` (not a subclass such as
+            certifi, or ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` when set, which
+            the SDK reads at construction under the path rules below, #6538),
+            ``True``, the path of an existing CA bundle file or hashed CA
+            directory (``str`` / ``os.PathLike``, resolved component by
+            component, a missing component refused rather than normalised
+            away, and read ONCE, now, into a context the SDK builds; a group-
+            or world-writable path is refused, #6248, #6269, #6377, #6559) and exactly ``ssl.SSLContext`` (not a subclass such as
             ``truststore.SSLContext``) that is ``CERT_REQUIRED`` with
             ``check_hostname`` on, no verify flag that relaxes chain
             validation, no cipher suite without server authentication and no
