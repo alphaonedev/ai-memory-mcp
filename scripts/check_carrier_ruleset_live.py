@@ -1108,6 +1108,18 @@ def self_test():
         wf_text.replace('"chain/**"]\n', '"chain/**"]\n    paths: [\'src/**\']\n', 1), 1,
         "does not trigger on pull_request for chain/promo6-ssh"))
 
+    # #6438: GitHub rejects `branches` together with `branches-ignore` (the workflow is invalid).
+    both = "on:\n  pull_request:\n    branches: ['chain/**']\n    branches-ignore: ['feature/**']\n"
+    trigger_cells((
+        ("trigger branches with branches-ignore", both, "chain/a", False),
+        ("trigger branches-ignore first, then branches",
+         "on:\n  pull_request:\n    branches-ignore: ['feature/**']\n    branches: ['chain/**']\n", "chain/a", False),
+        ("trigger branches alone is still fine", "on:\n  pull_request:\n    branches: ['chain/**']\n", "chain/a",
+         True)))
+    check("pre-apply tip with branches and branches-ignore", lambda: pre_tip(
+        wf_text.replace('"chain/**"]\n', '"chain/**"]\n    branches-ignore: [\'feature/**\']\n', 1), 1,
+        "does not trigger on pull_request for chain/promo6-ssh"))
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"
