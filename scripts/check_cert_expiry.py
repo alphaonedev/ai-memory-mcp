@@ -3310,7 +3310,7 @@ def _round3_shapes(repo, shapes, pr, approve, wf_rel, c8_rel):
         "trusted-ok": ({wf_rel: TRUSTED_WF_FIXTURE.replace("timeout-minutes: 10", "timeout-minutes: 9", 1)}, approve),
         "amp": ({c8_rel: amp}, ""),
         "split": ({".github/workflows/split.yml": split}, ""),
-        "log-sep": ({"src/federation/a b.rs": "fn a() {}\n", "src/federation/c\x85d.rs": "fn c() {}\n"}, ""),
+        "log-sep": ({"src/federation/a\u2028b.rs": "fn a() {}\n", "src/federation/c\x85d.rs": "fn c() {}\n"}, ""),
         "pct": ({wf_rel: TRUSTED_WF_FIXTURE.replace("timeout-minutes: 10", "timeout-minutes: 8", 1)},
                 "\n\nRule-Change-Approved-By: Pct%0A::error title=forged::x"),
         "symwf": ({".github/workflows/s.yml": symlink_wf}, approve),
@@ -3355,7 +3355,7 @@ def _trusted_round3_cells(tmp, t, judge, shapes):
     # #6175 (R2-3 N3/N4): U+2028 and C1 (NEL) are escaped, never printed raw.
     out = judge("tr-log-sep", "watched paths carrying U+2028 and U+0085", *shapes["r3-log-sep"],
                 needles=("a\\u2028b.rs", "c\\x85d.rs"))
-    if " " in out or "\x85" in out:
+    if "\u2028" in out or "\x85" in out:
         t.fail("(tr-log-sep): a raw U+2028 or U+0085 reached the log:", out)
     # #6175 (R2-3 N5): `%` in a trailer is escaped inside the ::warning annotation.
     out = judge("tr-log-pct", "an approval trailer carrying %0A and a forged ::error", *shapes["r3-pct"], ok=True)
@@ -3406,14 +3406,14 @@ def _round4_shapes(shapes, pr, approve, wf_rel, c8_rel):
     ok_wf = "name: lb\non: [push]\njobs:\n  lb:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo lb\n"
     r4 = {
         "cr-c8": ({c8_rel: _hidden_job(C8_FIXTURE, C8_GATE_LAST, "\r")}, approve),
-        "sep-c8": ({c8_rel: _hidden_job(C8_FIXTURE, C8_GATE_LAST, " ")}, approve),
+        "sep-c8": ({c8_rel: _hidden_job(C8_FIXTURE, C8_GATE_LAST, "\u2028")}, approve),
         "nel-c8": ({c8_rel: _hidden_job(C8_FIXTURE, C8_GATE_LAST, "\x85")}, approve),
-        "ps-c8": ({c8_rel: _hidden_job(C8_FIXTURE, C8_GATE_LAST, " ")}, approve),
+        "ps-c8": ({c8_rel: _hidden_job(C8_FIXTURE, C8_GATE_LAST, "\u2029")}, approve),
         "cr-trusted": ({wf_rel: _hidden_job(trusted_pr, TRUSTED_WF_LAST, "\r")}, approve),
         "nel-trusted": ({wf_rel: _hidden_job(trusted_pr, TRUSTED_WF_LAST, "\x85")}, approve),
         "sep-trusted": ({wf_rel: _hidden_job(trusted_pr, TRUSTED_WF_LAST, "\u2028")}, approve),
         "ps-trusted": ({wf_rel: _hidden_job(trusted_pr, TRUSTED_WF_LAST, "\u2029")}, approve),
-        "lb-other": ({".github/workflows/lb.yml": ok_wf.replace("on: [push]\n", "on: [push] ", 1)}, approve),
+        "lb-other": ({".github/workflows/lb.yml": ok_wf.replace("on: [push]\n", "on: [push]\u2029", 1)}, approve),
         "crlf-c8": ({c8_rel: C8_FIXTURE.replace("\n", "\r\n")}, approve),
         "merge": ({c8_rel: C8_FIXTURE.replace(named, named + "    <<: {timeout-minutes: 5}\n", 1)}, approve),
         "tag": ({c8_rel: C8_FIXTURE.replace(named, named + "    timeout-minutes: !!int 5\n", 1)}, approve),
@@ -3781,9 +3781,9 @@ def _ws_format_cells(t):
     _ws_format_cell(t, "tr-s-ws-oneline", "name: u\n# a\u00a0b\u3000c\n",
                     ("line 2 (1 in this file)", "(U+00A0, U+3000)"), absent=("lines ",))
     # #6761: a repeated code point is listed once, in first-seen order.
-    _ws_format_cell(t, "tr-s-ws-dedup", "name: u\n# a b c　d\n", ("(U+00A0, U+3000)",),
+    _ws_format_cell(t, "tr-s-ws-dedup", "name: u\n# a\u00a0b\u00a0c\u3000d\n", ("(U+00A0, U+3000)",),
                     absent=("U+00A0, U+00A0",))
-    _ws_format_cell(t, "tr-s-ws-dedup-order", "name: u\n# a　b c d\n#  \n",
+    _ws_format_cell(t, "tr-s-ws-dedup-order", "name: u\n# a\u3000b\u00a0c\u00a0d\n# \u00a0\n",
                     ("lines 2, 3 (2 in this file)", "(U+3000, U+00A0)"))
     # #6762: the "+K more" marker starts above eight items, never at exactly eight.
     eight = "name: u\n" + "".join(f"#{chr(c)}\n" for c in WS_NINE[:8])
@@ -3795,7 +3795,7 @@ def _ws_format_cells(t):
         "lines 2, 3, 4, 5, 6, 7, 8, 9, +1 more (9 in this file)",
         "U+2005, +1 more)"))
     # #6763: the per-file count is lines, not code points.
-    _ws_format_cell(t, "tr-s-ws-count", "name: u\n# a b\n# c d\n",
+    _ws_format_cell(t, "tr-s-ws-count", "name: u\n# a\u00a0b\n# c\u00a0d\n",
                     ("lines 2, 3 (2 in this file)", "(U+00A0)"))
 
 
@@ -4205,7 +4205,9 @@ SELF_TEST_OK = (
     "code point the interpreter cannot classify (log-safe-cn, log-safe-co, log-safe-cs); (tr round 8, #6921) "
     "a backslash printed doubled, so the escape form is one-to-one: a real control or format character and "
     "the text of its escape print differently and log_safe's output decodes back to the name "
-    "(log-safe-backslash, log-safe-roundtrip)."
+    "(log-safe-backslash, log-safe-roundtrip); (tr round 8, #6922) the script's own source holds no raw "
+    "non-ASCII whitespace or log_safe-escaped code point, so the dedup cells write U+00A0 and U+3000 as "
+    "escapes like their neighbours (src-no-invisible)."
 )
 
 
