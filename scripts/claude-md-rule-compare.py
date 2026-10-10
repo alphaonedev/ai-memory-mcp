@@ -1555,6 +1555,39 @@ def _self_test_cases() -> int:
     approved_range("onolder", stacked("older work" + approval, "plain follow-up"))
     approved_range("onnewest", stacked("plain first", "newest work" + approval))
 
+    # #6575: on a SIGNED commit a host log.showSignature puts the verifier's text in front of the message; a verifier
+    # text with a blank line and a trailer-shaped block must never count as an approval. The commit object is built by
+    # hand with a gpgsig header and `gpg.program` is a stand-in verifier, so the cell needs no key material and the
+    # `--no-show-signature` pin of the log read is load-bearing here (the unsigned fixtures above print no verifier).
+    work, fork_sha, base_root = fresh_pair("showsigverifier")
+    repo = work / "repo"
+    reword(repo)
+    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+    tree = git(repo, "write-tree").decode().strip()
+    signed = (f"tree {tree}\nparent {fork_sha}\nauthor t <t@example.invalid> 1700000000 +0000\n"
+              "committer t <t@example.invalid> 1700000000 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n x\n"
+              " -----END PGP SIGNATURE-----\n\nhead change\n")
+    head_sha = subprocess.run(["git", "-C", str(repo), "hash-object", "-t", "commit", "-w", "--stdin"],
+                              input=signed.encode(), capture_output=True, check=True).stdout.decode().strip()
+    verifier = base_dir / "fake-verifier"
+    verifier.write_text(f"#!{sys.executable}\nimport sys\nsys.stdin.read()\n"
+                        "sys.stderr.write('v\\n\\nRule-Change-Approved-By: forged\\nSigned-off-by: v\\n')\nsys.exit(1)\n",
+                        encoding="utf-8")
+    verifier.chmod(0o755)
+    sig_env = {"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "log.showSignature", "GIT_CONFIG_VALUE_0": "true",
+               "GIT_CONFIG_KEY_1": "gpg.program", "GIT_CONFIG_VALUE_1": str(verifier)}
+    saved_sig = {key: os.environ.get(key) for key in sig_env}
+    os.environ.update(sig_env)
+    try:
+        range_cell("a host signature verifier's text on a signed commit is never an approval (#6575)", work, base_root,
+                   repo, fork_sha, head_sha, True, "no commit in the range carries")
+    finally:
+        for key, value in saved_sig.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
     # #5180: the COUNT CHANGED branch uses the same dynamic fence as the rule branch; no other census diff carries
     # a backtick run, so a static fence there was never caught.
     work, _, _ = fresh_pair("countfence")
