@@ -1,9 +1,9 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! #6601 #6602 #6603 #6604 — guard for CodeQL `rust/cleartext-logging`
+//! #6601 #6602 #6603 #6604 — guard for `CodeQL` `rust/cleartext-logging`
 //! (same class as #6098; Refs #6163 #6351). Each alerted site is a test whose
-//! assertion or panic message interpolated a value CodeQL treats as sensitive:
+//! assertion or panic message interpolated a value `CodeQL` treats as sensitive:
 //! a fixture DSN secret and the captured log sink (#6601), the secret-screen
 //! output that would carry the fixture key bytes on a regression (#6602), the
 //! backend-derived hub allowlist entry handed out of the derived snapshot
