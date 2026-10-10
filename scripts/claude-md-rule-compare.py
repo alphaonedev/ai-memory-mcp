@@ -1665,74 +1665,83 @@ def _self_test_cases() -> int:
     # text with a blank line and a trailer-shaped block must never count as an approval. The commit object is built by
     # hand with a gpgsig header and `gpg.program` is a stand-in verifier, so the cell needs no key material and the
     # `--no-show-signature` pin of the log read is load-bearing here (the unsigned fixtures above print no verifier).
-    work, fork_sha, base_root = fresh_pair("showsigverifier")
-    repo = work / "repo"
-    reword(repo)
-    subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
-    tree = git(repo, "write-tree").decode().strip()
-    signed = (f"tree {tree}\nparent {fork_sha}\nauthor t <t@example.invalid> 1700000000 +0000\n"
-              "committer t <t@example.invalid> 1700000000 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n x\n"
-              " -----END PGP SIGNATURE-----\n\nhead change\n")
-    head_sha = subprocess.run(["git", "-C", str(repo), "hash-object", "-t", "commit", "-w", "--stdin"],
-                              input=signed.encode(), capture_output=True, check=True).stdout.decode().strip()
-    verifier = base_dir / "fake-verifier"
-    verifier.write_text(f"#!{sys.executable}\nimport sys\nsys.stdin.read()\n"
-                        "sys.stderr.write('v\\n\\nRule-Change-Approved-By: forged\\nSigned-off-by: v\\n')\nsys.exit(1)\n",
-                        encoding="utf-8")
-    verifier.chmod(0o755)
-    sig_env = {"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "log.showSignature", "GIT_CONFIG_VALUE_0": "true",
-               "GIT_CONFIG_KEY_1": "gpg.program", "GIT_CONFIG_VALUE_1": str(verifier)}
-    saved_sig = {key: os.environ.get(key) for key in sig_env}
-    os.environ.update(sig_env)
-    try:
-        range_cell("a host signature verifier's text on a signed commit is never an approval (#6575)", work, base_root,
-                   repo, fork_sha, head_sha, True, "no commit in the range carries")
-    finally:
-        for key, value in saved_sig.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+    def showsig_cell():
+        work, fork_sha, base_root = fresh_pair("showsigverifier")
+        repo = work / "repo"
+        reword(repo)
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True)
+        tree = git(repo, "write-tree").decode().strip()
+        signed = (f"tree {tree}\nparent {fork_sha}\nauthor t <t@example.invalid> 1700000000 +0000\n"
+                  "committer t <t@example.invalid> 1700000000 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n x\n"
+                  " -----END PGP SIGNATURE-----\n\nhead change\n")
+        head_sha = subprocess.run(["git", "-C", str(repo), "hash-object", "-t", "commit", "-w", "--stdin"],
+                                  input=signed.encode(), capture_output=True, check=True).stdout.decode().strip()
+        verifier = base_dir / "fake-verifier"
+        verifier.write_text(f"#!{sys.executable}\nimport sys\nsys.stdin.read()\n"
+                            "sys.stderr.write('v\\n\\nRule-Change-Approved-By: forged\\nSigned-off-by: v\\n')\nsys.exit(1)\n",
+                            encoding="utf-8")
+        verifier.chmod(0o755)
+        sig_env = {"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "log.showSignature", "GIT_CONFIG_VALUE_0": "true",
+                   "GIT_CONFIG_KEY_1": "gpg.program", "GIT_CONFIG_VALUE_1": str(verifier)}
+        saved_sig = {key: os.environ.get(key) for key in sig_env}
+        os.environ.update(sig_env)
+        try:
+            range_cell("a host signature verifier's text on a signed commit is never an approval (#6575)", work, base_root,
+                       repo, fork_sha, head_sha, True, "no commit in the range carries")
+        finally:
+            for key, value in saved_sig.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    guarded("a host signature verifier's text on a signed commit is never an approval (#6575) fixture", showsig_cell)
 
     # #6609: a non-ASCII approver identity is reported byte-exact (the log read is pinned to UTF-8 output); a
     # single-byte decode of the log would print the approver as `J\ufffdrg` while the decision stays unchanged.
-    work, fork_sha, base_root = fresh_pair("nonasciiapprover")
-    repo = work / "repo"
-    reword(repo)
-    head_sha = commit_all(repo, "head change\n\nRule-Change-Approved-By: J\u00f6rg")
-    range_cell("a non-ASCII approver identity is reported intact (#6609)", work, base_root, repo, fork_sha, head_sha,
-               False, "approval trailer(s): ` J\u00f6rg `")
+    def nonascii_cell():
+        work, fork_sha, base_root = fresh_pair("nonasciiapprover")
+        repo = work / "repo"
+        reword(repo)
+        head_sha = commit_all(repo, "head change\n\nRule-Change-Approved-By: J\u00f6rg")
+        range_cell("a non-ASCII approver identity is reported intact (#6609)", work, base_root, repo, fork_sha, head_sha,
+                   False, "approval trailer(s): ` J\u00f6rg `")
+
+    guarded("a non-ASCII approver identity is reported intact (#6609) fixture", nonascii_cell)
 
     # #6573: in a clone whose base was fetched with --depth 1 the shallow boundary hides that an old commit is an
     # ancestor of the base, so an earlier, real approval reaches base..head through a merge parent. The comparison
     # must refuse a shallow repository; the same fixture in a full clone must still ignore the old approval.
-    work, fork_sha, base_root = fresh_pair("shallow")
-    repo = work / "repo"
-    (repo / "docs").mkdir(parents=True, exist_ok=True)
-    (repo / "docs" / "old.md").write_text("x\n", encoding="utf-8")
-    old_sha = commit_all(repo, "old rule change\n\nRule-Change-Approved-By: old-real-approval")
-    (repo / "docs" / "base.md").write_text("x\n", encoding="utf-8")
-    shallow_base = commit_all(repo, "base moves on")
-    reword(repo)
-    side_sha = commit_all(repo, "pull request work")
-    merge_sha = git(repo, *IDENT, "commit-tree", f"{side_sha}^{{tree}}", "-p", side_sha, "-p", old_sha,
-                    "-m", "merge the old commit").decode().strip()
-    git(repo, "update-ref", "refs/pull/1/head", merge_sha)
-    git(repo, "reset", "-q", "--hard", shallow_base)
-    clones = {}
-    for kind, depth in (("full", []), ("shallow", ["--depth", "1"])):
-        clone = work / f"{kind}-clone"
-        subprocess.run(["git", "clone", "-q", *depth, f"file://{repo}", str(clone)], check=True, capture_output=True)
-        git(clone, "fetch", "-q", "origin", "+refs/pull/1/head:refs/remotes/pull/head")
-        clones[kind] = clone
-    flags = {kind: git(clone, "rev-parse", "--is-shallow-repository").decode().strip() for kind, clone in clones.items()}
-    if flags != {"full": "false", "shallow": "true"}:
-        print(f"FAIL: self-test - the #6573 fixture is not a full clone and a shallow clone: {flags!r}", file=sys.stderr)
-        failures.append("shallow fixture")
-    range_cell("a full clone ignores an old approval reached through a merge parent (#6573)", work, base_root,
-               clones["full"], shallow_base, merge_sha, True, "no commit in the range carries")
-    range_cell("a shallow repository is refused instead of counting an old approval (#6573)", work, base_root,
-               clones["shallow"], shallow_base, merge_sha, True, "the repository is shallow")
+    def shallow_cell():
+        work, fork_sha, base_root = fresh_pair("shallow")
+        repo = work / "repo"
+        (repo / "docs").mkdir(parents=True, exist_ok=True)
+        (repo / "docs" / "old.md").write_text("x\n", encoding="utf-8")
+        old_sha = commit_all(repo, "old rule change\n\nRule-Change-Approved-By: old-real-approval")
+        (repo / "docs" / "base.md").write_text("x\n", encoding="utf-8")
+        shallow_base = commit_all(repo, "base moves on")
+        reword(repo)
+        side_sha = commit_all(repo, "pull request work")
+        merge_sha = git(repo, *IDENT, "commit-tree", f"{side_sha}^{{tree}}", "-p", side_sha, "-p", old_sha,
+                        "-m", "merge the old commit").decode().strip()
+        git(repo, "update-ref", "refs/pull/1/head", merge_sha)
+        git(repo, "reset", "-q", "--hard", shallow_base)
+        clones = {}
+        for kind, depth in (("full", []), ("shallow", ["--depth", "1"])):
+            clone = work / f"{kind}-clone"
+            subprocess.run(["git", "clone", "-q", *depth, f"file://{repo}", str(clone)], check=True, capture_output=True)
+            git(clone, "fetch", "-q", "origin", "+refs/pull/1/head:refs/remotes/pull/head")
+            clones[kind] = clone
+        flags = {kind: git(clone, "rev-parse", "--is-shallow-repository").decode().strip() for kind, clone in clones.items()}
+        if flags != {"full": "false", "shallow": "true"}:
+            print(f"FAIL: self-test - the #6573 fixture is not a full clone and a shallow clone: {flags!r}", file=sys.stderr)
+            failures.append("shallow fixture")
+        range_cell("a full clone ignores an old approval reached through a merge parent (#6573)", work, base_root,
+                   clones["full"], shallow_base, merge_sha, True, "no commit in the range carries")
+        range_cell("a shallow repository is refused instead of counting an old approval (#6573)", work, base_root,
+                   clones["shallow"], shallow_base, merge_sha, True, "the repository is shallow")
+
+    guarded("a shallow repository is refused instead of counting an old approval (#6573) fixture", shallow_cell)
 
     # #6744: the fixtures of the #6575, #6609 and #6573 cells run inside guarded(), so a fault while building one
     # (a git that refuses `clone --depth`, a full disk) is that cell's named FAIL and the cells after it still run.
