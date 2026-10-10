@@ -210,7 +210,9 @@ EXPIRY_SENTENCE = (
 
 def log_safe(text):
     """TEXT with every control character escaped (#6175): backslash as `\\\\`,
-    C0, DEL and C1 as `\\xNN`, U+2028 / U+2029 as `\\uNNNN`. A name the change
+    C0, DEL and C1 as `\\xNN`, U+2028 / U+2029 and every Unicode format
+    character (category Cf: bidi controls, zero-width characters, soft hyphen,
+    BOM; #6683) as `\\uNNNN` (`\\UNNNNNNNN` above U+FFFF). A name the change
     controls (a path, a workflow file name, a trailer value, git's stderr
     echoing one) therefore stays on its own step-log line and can never begin
     a line the Actions runner reads as a workflow command (`::error`, ...)."""
@@ -221,8 +223,8 @@ def log_safe(text):
             out.append("\\\\")
         elif code < 0x20 or 0x7F <= code <= 0x9F:
             out.append(f"\\x{code:02x}")
-        elif code in (0x2028, 0x2029):
-            out.append(f"\\u{code:04x}")
+        elif code in (0x2028, 0x2029) or unicodedata.category(ch) == "Cf":
+            out.append(f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}")
         else:
             out.append(ch)
     return "".join(out)
