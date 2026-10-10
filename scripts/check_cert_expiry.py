@@ -636,6 +636,45 @@ def _is_sep(lines, i):
     return 0 <= i < len(lines) and (BLANK_RE.match(lines[i]) or QUOTED_BLANK_RE.match(lines[i]))
 
 
+def ledger_blocks(lines):
+    """Every ledger record of LINES as a tuple of its raw lines: the header
+    and the unbroken run of '>' lines that follows it (#6423)."""
+    blocks = []
+    for ent in parse_ledger(lines):
+        end = ent["start"] + 1
+        while end < len(lines) and _ledger_plain(lines[end]):
+            end += 1
+        blocks.append(tuple(lines[ent["start"]:end]))
+    return blocks
+
+
+def ledger_append_only(repo, mb, judged):
+    """The reason the change breaks the append-only ledger ('' when it keeps
+    it), for a change that touches the cert doc while the certification is
+    EXPIRED/VOID and is not a re-issue (#6423): every record of the merge-base
+    doc stays, byte-identical, in the same order, whatever else the change is.
+    A deleted doc loses every record."""
+    banner_mb = cert_banner(repo, mb)
+    banner_head = cert_banner(repo, judged)
+    if banner_mb[0] not in ("EXPIRED", "VOID"):
+        return ""
+    deleted = banner_head == ("ABSENT", "-")
+    malformed = banner_head[0] in ("DUPLICATE", "UNPARSEABLE") or banner_head[1] == "DUPLICATE"
+    if banner_mb != banner_head and not deleted and not malformed:
+        return ""  # a real re-issue or voiding keeps its own path
+    old = ledger_blocks(read_cert_doc(repo, mb).split("\n"))
+    new = [] if deleted else ledger_blocks(read_cert_doc(repo, judged).split("\n"))
+    at = 0
+    for block in new:
+        if at < len(old) and block == old[at]:
+            at += 1
+    if at < len(old):
+        return (f"{CERT_DOC} is {banner_mb[0]} and its amendment ledger is append-only: this "
+                "change removes, edits, re-dates, moves or reorders an existing record "
+                f"(or deletes the document); only a new record may be added (#6124, #6423)")
+    return ""
+
+
 def _in_ledger(lines, known, start, end):
     """True iff the record at LINES[start:end] sits in the ledger (#6420):
     LINES[end] (past at most one blank '>' line) is the header of a KNOWN
@@ -950,6 +989,10 @@ def _judge(repo, base, head, judged, mb, tip):
     id_changed = bool(added or removed)
 
     if not watched and not id_changed:
+        if cert_touched:
+            problem = ledger_append_only(repo, mb, judged)
+            if problem:
+                return False, f"{PREFIX}: FAIL — {problem}"
         ok, more = check_banner_consistency(repo, judged)
         lines = [f"{PREFIX}: PASS — federation-wire surface unchanged in {mb}..{judged}"]
         return ok, "\n".join(lines + more)
