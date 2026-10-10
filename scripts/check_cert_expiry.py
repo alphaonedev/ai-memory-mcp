@@ -1658,6 +1658,11 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
             (__doc__ or "").split()):
         t.fail("(doc-bound): the module docstring still says a value-only edit outside the "
                "path watches is never seen; a value edited on the identifier line is drift")
+    # (#6626) the banner may claim a value edit only if a cell edits one.
+    for needle in ("(trailing-comment-added)", "(value-edit-5-to-6)"):
+        if needle not in SELF_TEST_OK:
+            t.fail(f"(doc-bound): the OK banner does not name {needle}; the value-edit claim "
+                   "must be pinned by a cell that changes a value (#6626)")
     for needle in ("LEXICAL BOUND", "byte-identical", "#6560"):
         if needle not in (__doc__ or ""):
             t.fail(f"(doc-bound): the module docstring does not state the lexical bound "
