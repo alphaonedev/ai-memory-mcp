@@ -40,6 +40,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.parse
 
 TEAM_ASSOCIATIONS = frozenset(("OWNER", "MEMBER", "COLLABORATOR"))
 SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
@@ -49,8 +50,16 @@ REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,39}/[A-Za-z0-9_.-]{1,100}")
 LOGIN_RE = re.compile(r"[A-Za-z0-9-]{1,39}(?:\[bot\])?")
 ASSOC_RE = re.compile(r"[A-Z_]{1,32}")
 # GitHub token shapes, plus any HTTP authorization value after its scheme word (#6328).
-TOKEN_RE = re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,}"
+# #6578: a known token prefix is itself the signal, so any body after it is redacted (the
+# first-line fragment of a wrapped token is short), and its underscores may arrive
+# percent-encoded once or more (`%5F`, `%255F`).
+_TOKEN_US = r"(?:_|%(?:25)*5[Ff])"
+TOKEN_RE = re.compile(r"(?:gh[pousr]" + _TOKEN_US + r"[A-Za-z0-9]+"
+                      r"|github" + _TOKEN_US + r"pat" + _TOKEN_US + r"(?:[A-Za-z0-9]|" + _TOKEN_US + r")+"
                       r"|(?i:bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,})")
+# #6578: percent-decoding rounds tried before a still-changing message is redacted whole.
+REDACT_DECODE_ROUNDS = 4
+REDACTED_WHOLE = "[redacted] (the message held an encoded credential-shaped value)"
 # #6329: the operator's latest deciding review of the head decides. Fixed-width UTC timestamps
 # compare correctly as strings (no datetime parsing, identical on 3.9 and 3.14).
 DECIDING_REVIEW_STATES = frozenset(("APPROVED", "CHANGES_REQUESTED", "DISMISSED"))
@@ -63,13 +72,32 @@ class GateError(Exception):
     """The verdict cannot be established; the gate fails closed."""
 
 
+def redact(message):
+    """``message`` with every token shape replaced by ``[redacted]`` (#6243, #6328, #6578).
+
+    The raw text is redacted first. Then the text is percent-decoded up to
+    REDACT_DECODE_ROUNDS times; if any decoded form still holds a token shape, or the text
+    still decodes further after the last round, the whole message is replaced (fail closed).
+    """
+    text = TOKEN_RE.sub("[redacted]", str(message))
+    decoded = text
+    for _ in range(REDACT_DECODE_ROUNDS):
+        unquoted = urllib.parse.unquote(decoded)
+        if unquoted == decoded:
+            return text
+        decoded = unquoted
+        if TOKEN_RE.search(decoded):
+            return REDACTED_WHOLE
+    return text if urllib.parse.unquote(decoded) == decoded else REDACTED_WHOLE
+
+
 def workflow_error(message):
     """One ``::error::`` workflow command whose data cannot start another command (#6243).
 
     Tokens are redacted, other control characters are replaced, and ``%``, CR and LF are
     percent-encoded exactly as the runner decodes workflow-command data.
     """
-    text = TOKEN_RE.sub("[redacted]", str(message))
+    text = redact(message)
     text = re.sub("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x85\u2028\u2029]", "?", text)
     text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
     return "::error::" + text
@@ -110,7 +138,7 @@ def gh_api(path):
         raise GateError(f"gh api {path}: {exc}") from exc
     if proc.returncode != 0:
         first = (proc.stderr.strip().splitlines() or [""])[0]
-        first = TOKEN_RE.sub("[redacted]", first)[:300]
+        first = redact(first)[:300]
         raise GateError(f"gh api {path} exited {proc.returncode}: {first}")
     return parse_pages(proc.stdout)
 
