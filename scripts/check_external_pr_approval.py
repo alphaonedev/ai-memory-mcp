@@ -322,7 +322,7 @@ def self_test():
         ok = rc == want
         failures += 0 if ok else 1
         print(f"self-test {'PASS' if ok else 'FAIL'}: {name} (exit {rc}, want {want})")
-    for bad in ("", "x", '{"message": "Bad credentials"}', "[1] trailing"):
+    for bad in ("", "x", '{"message": "Bad credentials"}', "[1] trailing", '[1]{"message": "rate limit"}'):
         try:
             parse_pages(bad)
         except GateError:
