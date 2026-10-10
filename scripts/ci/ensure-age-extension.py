@@ -35,12 +35,16 @@ differently, the URL is refused (exit 2) when the two could disagree: it holds a
 TAB, CR, LF or NUL (urlsplit drops the first three, subprocess refuses NUL), a
 ``#`` (libpq has no fragment and reads keys after it), more than one ``@`` in
 the host part or an ``@`` after it, or a query segment without exactly one
-``=``.  A socket-directory URL (empty host part) is refused too.  Every query
-key other than ``password`` must be on ``ALLOWED_QUERY_KEYS``, a case-sensitive
-allowlist of non-secret libpq parameters, so ``sslpassword``, ``oauth_client_secret``,
+``=``.  An empty host part (``postgres:///db``) is refused too; a socket
+directory given as ``?host=%2F...`` or as a percent-encoded host is accepted.
+The query is percent-decoded only, as libpq does (``+`` stays a plus), and the
+kept segments are passed on exactly as written.  Every query key other than
+``password`` must be on ``ALLOWED_QUERY_KEYS``, a case-sensitive allowlist of
+non-secret libpq parameters, so ``sslpassword``, ``oauth_client_secret``,
 ``scram_client_key``, ``scram_server_key`` (no environment variable) and any
-other key are refused.  A refusal names the key, never its value, and neither
-form of the URL is printed.
+other key are refused.  A refusal names a key only when it is a known libpq
+keyword (an unlisted key can be the tail of a password that held a raw ``&``),
+never a value, and neither form of the URL is printed.
 
 Exit codes: 0 healthy, 1 still unhealthy / probe or install failed,
 2 bad input (URL file, pg_config, source validation).
@@ -55,7 +59,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 EXIT_OK = 0
 EXIT_UNAVAILABLE = 1
@@ -79,6 +83,13 @@ ALLOWED_QUERY_KEYS = frozenset((
     "keepalives_interval", "keepalives_count", "tcp_user_timeout", "channel_binding",
     "gssencmode", "krbsrvname", "service", "passfile", "requirepeer", "load_balance_hosts",
 ))
+# Keywords that are refused but safe to name in a message: known libpq keys that
+# are secret or alter authentication.  Any other refused key stays unnamed.
+REFUSED_KNOWN_KEYS = frozenset((
+    "password", "sslpassword", "oauth_client_secret", "scram_client_key", "scram_server_key",
+    "sslkeylogfile", "require_auth",
+))
+KNOWN_KEY_NAMES = ALLOWED_QUERY_KEYS | REFUSED_KNOWN_KEYS
 TEMP_SUFFIX = ".age-restore"
 
 # (source subdir, file name, sha256) for AGE 1.8.0 built against postgresql@18.
@@ -129,8 +140,8 @@ def psql_target(url):
     if parts.scheme not in URL_SCHEMES:
         raise HelperError("tier URL file does not hold a postgres:// URL", EXIT_BAD_INPUT)
     if not parts.netloc:
-        raise HelperError("tier URL file has no host part; socket-directory URLs (postgres:///db?host=...) "
-                          "are not supported", EXIT_BAD_INPUT)
+        raise HelperError("tier URL file has an empty host part (postgres:///db...); it is refused",
+                          EXIT_BAD_INPUT)
     if "@" in parts.path or "@" in parts.query:
         # libpq ends the userinfo at the first '@' before '/', urllib at '/', '?' or '#'.
         raise HelperError("tier URL file has an '@' after the host part; percent-encode it", EXIT_BAD_INPUT)
@@ -147,28 +158,40 @@ def psql_target(url):
             password = unquote(raw_password)
             userinfo = user
         netloc = f"{userinfo}@{hostport}" if userinfo else hostport
-    if any(seg and "=" not in seg for seg in parts.query.split("&")):
+    segments = parts.query.split("&")
+    if any(seg and "=" not in seg for seg in segments):
         # A bare segment is a value, not a key, so it is refused without being named.
         raise HelperError("tier URL file has a query parameter without '='", EXIT_BAD_INPUT)
-    if any(seg.count("=") > 1 for seg in parts.query.split("&")):
-        # parse_qsl would read the remainder (';password=...') as one value; libpq refuses it.
+    if any(seg.count("=") > 1 for seg in segments):
+        # A second '=' makes the remainder (';password=...') part of one value; libpq refuses it.
         raise HelperError("tier URL file has a query parameter with more than one '='", EXIT_BAD_INPUT)
-    query_pairs = parse_qsl(parts.query, keep_blank_values=True)
     kept = []
-    for key, value in query_pairs:
+    removed = False
+    for seg in segments:
+        if not seg:
+            continue
+        # libpq percent-decodes only: '+' is a plus, not a space (#6221).
+        raw_key, raw_value = seg.split("=", 1)
+        key = unquote(raw_key)
         if key.lower() == "sslpassword":
             raise HelperError("tier URL file carries sslpassword; use a key without a passphrase", EXIT_BAD_INPUT)
         if key == "password":
-            password = value
+            password = unquote(raw_value)
+            removed = True
         elif key in ALLOWED_QUERY_KEYS:
-            kept.append((key, value))
+            kept.append(seg)
         else:
-            name = key if key.isidentifier() and key.isascii() and len(key) <= 64 else "<unprintable>"
-            raise HelperError(f"tier URL file carries query key {name}, which is not on the allowlist of "
+            # An unlisted key can be the tail of a password that held a raw '&': name known keywords only.
+            lowered = key.lower()
+            name = lowered if lowered in KNOWN_KEY_NAMES else None
+            what = "an unlisted query key"
+            if name:
+                what = f"query key {name}" if key == name else f"query key {name} (keys are case-sensitive)"
+            raise HelperError(f"tier URL file carries {what}, which is not on the allowlist of "
                               "non-secret libpq parameters", EXIT_BAD_INPUT)
     if password is not None and "\x00" in password:
         raise HelperError("tier URL file password decodes to a NUL; it cannot be passed to psql", EXIT_BAD_INPUT)
-    query = urlencode(kept) if len(kept) != len(query_pairs) else parts.query
+    query = "&".join(kept) if removed else parts.query
     return urlunsplit((parts.scheme, netloc, parts.path, query, "")), password
 
 
