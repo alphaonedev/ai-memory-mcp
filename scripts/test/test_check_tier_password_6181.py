@@ -44,6 +44,32 @@ class TestCheckTierPassword6181(unittest.TestCase):
             self.assertNotIn(secret, out, "the diagnostic must never print a URL value")
         return out
 
+    def run_on(self, path):
+        return subprocess.run([sys.executable, "-I", str(SCRIPT), "--url-file", str(path)],
+                              capture_output=True, text=True, check=False, env={"PATH": os.environ.get("PATH", "")})
+
+    def test_a_read_error_names_only_the_exception_class_6899(self):
+        # #6899: a decode error's text names the byte value and its offset inside the credential file, and an
+        # OSError's text names the path; the diagnostic carries only the exception class.
+        head, tail = "Zq8LmReadErr6899", "Wv3Kd9TgPw8Hn3Bs"
+        self.url_file.write_bytes(b"postgres://u:" + head.encode() + b"\xff" + tail.encode() + b"@h:5445/db\n")
+        r = self.run_on(self.url_file)
+        out = r.stdout + r.stderr
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("cannot read the tier URL file (UnicodeDecodeError)", out)
+        for needle in ("0x", "xff", "position", "codec", "utf-8", "invalid", head, tail, "postgres://"):
+            self.assertNotIn(needle, out, "a read error must not print the decode detail or the file text")
+        directory = Path(self._dir.name) / "a-directory-6899"
+        directory.mkdir()
+        for path in (directory, Path(self._dir.name) / "missing-6899"):
+            with self.subTest(path=path.name):
+                r = self.run_on(path)
+                out = r.stdout + r.stderr
+                self.assertEqual(r.returncode, 2, out)
+                self.assertIn("cannot read the tier URL file (", out)
+                for needle in (path.name, self._dir.name, "Errno", "No such file", "directory"):
+                    self.assertNotIn(needle, out, "a read error must not print the path or the OS message")
+
     def test_a_random_long_distinct_password_passes(self):
         r = self.run_check(f"postgres://ai_memory:{GOOD}@127.0.0.1:5445/ai_memory_test?sslmode=disable")
         self.assertEqual((r.returncode, r.stdout.count("::error::")), (0, 0), r.stdout + r.stderr)
