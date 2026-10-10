@@ -158,7 +158,7 @@ fn mcp_initialize_handshake_succeeds() {
             "id": 1,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-03-26",
+                "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {"name": "test", "version": "1.0"}
             }
@@ -186,7 +186,7 @@ fn mcp_list_tools_returns_expected_count() {
             "id": 1,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-03-26",
+                "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {"name": "test", "version": "1.0"}
             }
@@ -238,7 +238,7 @@ fn mcp_call_memory_store_then_memory_recall_roundtrip() {
             "id": 1,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-03-26",
+                "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {"name": "test", "version": "1.0"}
             }

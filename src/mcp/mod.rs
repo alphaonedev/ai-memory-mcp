@@ -3556,10 +3556,21 @@ fn handle_request(
             // server→stdout frame + the emit contract at a GA compat freeze,
             // with zero in-tree consumer and a T1 ripple through `handle_request`,
             // is premature. Pinned by `initialize_advertises_no_streaming_capability_1868`.
+            // #6157 — negotiate `protocolVersion` against
+            // `SUPPORTED_PROTOCOL_REVISIONS` (echo a supported request,
+            // otherwise downgrade to the newest supported revision and say
+            // so on stderr; stdout stays response-only).
+            let (protocol_revision, downgraded) = jsonrpc::negotiate_protocol_revision(&req.params);
+            if downgraded {
+                eprintln!(
+                    "{}",
+                    jsonrpc::protocol_downgrade_diagnostic(&req.params, protocol_revision)
+                );
+            }
             ok_response(
                 id,
                 json!({
-                    "protocolVersion": jsonrpc::PROTOCOL_REVISION,
+                    "protocolVersion": protocol_revision,
                     (field_names::CAPABILITIES): { "tools": {}, "prompts": {} },
                     "serverInfo": server_info,
                 }),
@@ -8742,7 +8753,11 @@ mod tests {
         let resp = invoke_handle_request(&conn, &req);
         assert!(resp.error.is_none());
         let result = resp.result.unwrap();
-        assert_eq!(result["protocolVersion"], "2024-11-05");
+        // No `protocolVersion` requested: the newest supported (#6157).
+        assert_eq!(
+            result["protocolVersion"],
+            jsonrpc::SUPPORTED_PROTOCOL_REVISIONS[0]
+        );
         assert_eq!(result["serverInfo"]["name"], "ai-memory");
     }
 

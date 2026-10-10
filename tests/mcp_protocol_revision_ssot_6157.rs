@@ -19,7 +19,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ai_memory::mcp::jsonrpc::{SUPPORTED_PROTOCOL_REVISIONS, negotiate_protocol_revision};
+use ai_memory::mcp::jsonrpc::{
+    NEWEST_PROTOCOL_REVISION, SUPPORTED_PROTOCOL_REVISIONS, negotiate_protocol_revision,
+};
 use serde_json::json;
 
 const MARKERS: [&str; 3] = ["protocolVersion", "Protocol version", "speaks MCP"];
@@ -136,13 +138,14 @@ fn issue_6157_supported_list_is_well_formed_newest_first() {
             "list must be strictly newest-first: {pair:?}"
         );
     }
+    assert_eq!(SUPPORTED_PROTOCOL_REVISIONS[0], NEWEST_PROTOCOL_REVISION);
     // The revision this server has always spoken stays supported.
     assert!(SUPPORTED_PROTOCOL_REVISIONS.contains(&"2024-11-05"));
 }
 
 #[test]
 fn issue_6157_negotiate_echoes_supported_and_downgrades_everything_else() {
-    let newest = SUPPORTED_PROTOCOL_REVISIONS[0];
+    let newest = NEWEST_PROTOCOL_REVISION;
     for rev in SUPPORTED_PROTOCOL_REVISIONS {
         assert_eq!(
             negotiate_protocol_revision(&json!({"protocolVersion": rev})),
