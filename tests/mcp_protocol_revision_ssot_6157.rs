@@ -1207,3 +1207,95 @@ fn issue_6524_glob_and_parse_follow_gitignore5() {
         "malformed class matched"
     );
 }
+
+/// The verdict of the walk's matcher for `rel` under the ignore `lines`.
+fn ignored_by(
+    lines: &[&str],
+    rel: &str,
+    is_dir: bool,
+    ignore_case: bool,
+) -> Result<bool, String> {
+    let mut rules = Vec::new();
+    for line in lines {
+        rules.extend(parse_ignore_line(line, "")?);
+    }
+    is_ignored(rel, is_dir, &rules, ignore_case)
+}
+
+/// #7017: gitignore(5) gives `**` its meaning only as a whole path segment
+/// (leading `**/`, trailing `/**`, inner `/**/`); any other run of asterisks
+/// is a regular `*` that never crosses `/`. The round-4 matcher treated
+/// every `**` as match-everything, so `docs/**draft` skipped the tracked
+/// `docs/a/xdraft` (fail-open). A `]` first in a class is a literal member
+/// (mutant R09). Every row's verdict is git 2.54.0 `git check-ignore`.
+#[test]
+fn issue_7017_glob_follows_git_for_double_stars_inside_a_segment_and_leading_brackets() {
+    let rows: [(&str, &str, bool, bool); 13] = [
+        ("docs/**draft", "docs/a/xdraft", false, false),
+        ("docs/**draft", "docs/xdraft", false, true),
+        ("a**/b", "ax/y/b", false, false),
+        ("a**/b", "a/b", false, true),
+        ("a**/b", "ax/b", false, true),
+        ("x/a**", "x/abc", false, true),
+        ("x/a**", "x/ab", true, true),
+        ("x/***/y", "x/a/y", false, true),
+        ("x/***/y", "x/a/b/y", false, true),
+        ("[]a]x", "]x", false, true),
+        ("[]a]x", "bx", false, false),
+        ("[]a]x", "ax", false, true),
+        ("**", "q/r", false, true),
+    ];
+    for (line, rel, is_dir, want) in rows {
+        assert_eq!(
+            ignored_by(&[line], rel, is_dir, false),
+            Ok(want),
+            "{line:?} vs {rel:?} (dir: {is_dir})"
+        );
+    }
+}
+
+/// #7017: a POSIX bracket class (`[[:digit:]]`, `[[.a.]]`, `[[=a=]]`) is not
+/// implemented, so the matcher must fail closed instead of reading it as a
+/// plain set (git ignores `5x` under `[[:digit:]]x` and tracks `d]x`; the
+/// set reading did the reverse). A `.gitignore` that uses one is reported as
+/// unreadable and the pin goes red rather than guessing.
+#[test]
+fn issue_7017_posix_bracket_classes_fail_closed() {
+    for line in ["[[:digit:]]x", "[[.a.]]x", "[[=a=]]x", "[a[:digit:]]x"] {
+        assert!(
+            ignored_by(&[line], "5x", false, false).is_err(),
+            "{line:?} was evaluated instead of failing closed"
+        );
+    }
+    let scratch = scratch_tree("7017-posix");
+    plant(&scratch, ".gitignore", "[[:digit:]]x\n");
+    plant(&scratch, "5x", PLANT);
+    let (_, unreadable) = walked(&scratch);
+    let _ = fs::remove_dir_all(&scratch);
+    assert!(
+        unreadable.iter().any(|u| u.contains("[[:digit:]]x")),
+        "the walk did not report the POSIX class: {unreadable:?}"
+    );
+}
+
+/// #7017: with `core.ignorecase=true` (the default `git init` sets on macOS
+/// and Windows) git ignores `notes.md` under the rule `Notes.md`; the
+/// round-4 matcher was always case-sensitive (false red on such a tree).
+/// The fold is ASCII, as git's `tolower` is.
+#[test]
+fn issue_7017_ignore_case_folds_pattern_and_name() {
+    for (line, rel, fold, want) in [
+        ("Notes.md", "notes.md", true, true),
+        ("Notes.md", "notes.md", false, false),
+        ("Notes.md", "NOTES.MD", true, true),
+        ("[A-C]x", "bx", true, true),
+        ("[A-C]x", "bx", false, false),
+        ("docs/README", "DOCS/readme", true, true),
+    ] {
+        assert_eq!(
+            ignored_by(&[line], rel, false, fold),
+            Ok(want),
+            "{line:?} vs {rel:?} (ignorecase: {fold})"
+        );
+    }
+}
