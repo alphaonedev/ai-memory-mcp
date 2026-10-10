@@ -2959,6 +2959,23 @@ class PruneScript6118(unittest.TestCase):
                 self.assertIn("dir_fd support for %s" % fn.__name__, out.getvalue())
                 self.assertTrue((self.target / "debug" / "deps" / "ai_memory-0a1b").exists())
 
+    def test_6118_r7_6480_mock_tests_pass_when_run_alone(self) -> None:
+        # #6480: the #6315 test used `unittest.mock` while only `import unittest` was at
+        # module level; it passed only when another test had imported the submodule first.
+        # Run it alone in a fresh isolated interpreter.
+        code = ("import importlib.util, sys, unittest\n"
+                "spec = importlib.util.spec_from_file_location('alone_6480', sys.argv[1])\n"
+                "mod = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(mod)\n"
+                "suite = unittest.TestSuite([mod.PruneScript6118(sys.argv[2])])\n"
+                "ok = unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful()\n"
+                "sys.exit(0 if ok else 1)\n")
+        proc = subprocess.run([sys.executable, "-I", "-c", code, str(Path(__file__).resolve()),
+                               "test_6118_r6_6315_missing_dir_fd_support_is_refused_for_every_function"],
+                              capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+        self.assertIn("Ran 1 test", proc.stderr)
+
     def test_6118_r6_6303_restore_mode_tolerates_a_removed_path(self) -> None:
         gone = Path(self.scratch.name) / "removed-by-the-prune"
         restore_mode(gone, 0o700)  # must not raise FileNotFoundError
