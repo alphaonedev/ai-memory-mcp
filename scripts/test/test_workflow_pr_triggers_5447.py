@@ -5223,5 +5223,44 @@ class ApprovalRevocationTiming6579(unittest.TestCase):
                 self.assertIn("Q3", para)
 
 
+# ---- Round 6 (#6637): a duplicated open-PR listing fails closed with its own message ----
+
+
+class MergeGroupDuplicateListing6637(unittest.TestCase):
+    """The open-PR listing naming the queue PR more than once fails closed, and says so.
+
+    A listing that names PR #N twice means the paginated snapshot raced (a PR moved between
+    pages), so its head sha cannot be trusted.  The gate fails with a message naming the
+    duplicate; it must not claim the PR is not open, and it must never pass.
+    """
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+
+    def gate(self, pulls: List[dict]) -> Tuple[int, str]:
+        api = _fake_api(pulls, {7: [_review(SHA_A)]})
+        rc, lines = self.mod.run_gate("merge_group", _merge_group_event(7), REPO_6117, SHA_C,
+                                      OPERATOR_6117, api)
+        return rc, "\n".join(lines)
+
+    def test_6637_duplicate_listing_fails_closed_with_its_own_message(self) -> None:
+        for pulls in ([_pr(7, SHA_A), _pr(7, SHA_A)], [_pr(7, SHA_A), _pr(7, SHA_B)],
+                      [_pr(7, SHA_A), _pr(8, SHA_B), _pr(7, SHA_A)]):
+            with self.subTest(pulls=[(p["number"], p["head"]["sha"][:1]) for p in pulls]):
+                rc, out = self.gate(pulls)
+                self.assertEqual(1, rc, out)
+                self.assertIn("lists PR #7 2 times", out)
+                self.assertNotIn("not an open pull request", out)
+
+    def test_6637_absent_pr_keeps_the_not_open_message(self) -> None:
+        rc, out = self.gate([_pr(8, SHA_B)])
+        self.assertEqual(1, rc, out)
+        self.assertIn("merge_group names PR #7, which is not an open pull request", out)
+
+    def test_6637_single_listing_still_passes(self) -> None:
+        rc, out = self.gate([_pr(7, SHA_A), _pr(8, SHA_B)])
+        self.assertEqual(0, rc, out)
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
