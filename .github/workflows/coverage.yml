@@ -186,7 +186,7 @@ jobs:
     # download on the semantic-tier CLI recall path) fails fast instead of
     # pinning a runner for hours. Root cause fixed in
     # embeddings::Embedder::download_within; this is the backstop.
-    timeout-minutes: 75
+    timeout-minutes: 110
     # #3591 — `Post coverage to PR (sticky)` uses
     # marocchino/sticky-pull-request-comment (creates/updates a PR comment).
     # Job-level permissions replace the workflow default, so contents: read
