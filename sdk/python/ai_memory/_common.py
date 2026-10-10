@@ -871,7 +871,13 @@ def gate_transports(
     caller's own context. The default transport and every mounted proxy
     transport are wrapped, so the check runs inside the transport, after all
     request event hooks. Fails closed: if the client does not expose its
-    transports the client is closed and construction is refused.
+    transports, construction is refused.
+
+    On that refusal the sync transports are closed before the raise. The
+    async ones are not: ``aclose`` needs a running event loop, which a
+    constructor called from sync code does not have, and a just-built
+    async transport has opened no connection, so dropping it leaks no
+    socket (#6693).
     """
     context = kwargs.get("verify")
     if not (isinstance(context, ssl.SSLContext) and context is verify):
