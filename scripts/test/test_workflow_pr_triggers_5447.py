@@ -4575,5 +4575,58 @@ class TeamAssociations6331(unittest.TestCase):
         self.assertEqual(0, out.returncode, out.stdout + out.stderr)
         self.assertIn("self-test PASS: push-contributor-same-repo-unapproved (exit 1, want 1)", out.stdout)
 
+
+
+# ---- Round 5 (#6332): an error page after a valid page fails closed ----
+
+
+class PaginatedErrorPage6332(unittest.TestCase):
+    """``gh api --paginate`` output whose later page is an error object fails closed on both lists."""
+
+    ERROR_PAGE = '{"message": "API rate limit exceeded"}'
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+
+    def run_with_pages(self, mod, pulls_out: str, reviews_out: str) -> Tuple[int, str]:
+        import types
+
+        def fake_run(argv, **_k):
+            out = reviews_out if "/reviews" in argv[-1] else pulls_out
+            return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+        with unittest.mock.patch.object(mod.subprocess, "run", fake_run):
+            rc, lines = mod.run_gate("push", {}, REPO_6117, SHA_A, OPERATOR_6117, mod.gh_api)
+        return rc, "\n".join(lines)
+
+    def cells(self):
+        other = json.dumps([_pr(8, SHA_B)])
+        target = json.dumps([_pr(7, SHA_A)])
+        approved = json.dumps([_review(SHA_A)])
+        yield "pulls", other + "\n" + self.ERROR_PAGE + "\n" + target, approved
+        yield "reviews", target, approved + self.ERROR_PAGE
+
+    def test_6332_error_page_after_a_valid_page_fails_closed(self) -> None:
+        for name, pulls_out, reviews_out in self.cells():
+            with self.subTest(list=name):
+                rc, out = self.run_with_pages(self.mod, pulls_out, reviews_out)
+                self.assertEqual(1, rc, out)
+                self.assertIn("not an array", out)
+
+    def test_6332_m01_skipping_non_array_pages_is_killed(self) -> None:
+        src = APPROVAL_PY.read_text(encoding="utf-8")
+        needle = "        if not isinstance(page, list):\n"
+        self.assertEqual(1, src.count(needle))
+        mutant = _exec_approval_src(src.replace(needle, needle + "            continue\n"))
+        rc, out = self.run_with_pages(mutant, json.dumps([_pr(8, SHA_B)]) + self.ERROR_PAGE, "[]")
+        self.assertEqual(0, rc, out)  # the mutant drops page 2 and passes "no PR heads this sha"
+        rc, out = self.run_with_pages(self.mod, json.dumps([_pr(8, SHA_B)]) + self.ERROR_PAGE, "[]")
+        self.assertEqual(1, rc, out)
+
+    def test_6332_self_test_covers_an_error_page_after_a_valid_page(self) -> None:
+        out = subprocess.run([sys.executable, "-I", str(APPROVAL_PY), "--self-test"],
+                             capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        self.assertIn("self-test PASS: parse_pages refuses '[1]{\"message\": \"rate limit\"}'", out.stdout)
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
