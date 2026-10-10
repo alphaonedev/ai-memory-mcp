@@ -75,6 +75,13 @@ pub mod postgres_env;
 #[cfg(feature = "sal-postgres")]
 pub mod pg_isolate;
 
+// #6569 — the ONE declaration of `pg_barrier.rs` for every crate that has
+// `mod common;`. `pg_isolate` reaches it as `super::pg_barrier`, and a test file
+// that also needs it writes `use common::pg_barrier;`. A second `#[path]` load
+// in the same crate trips `clippy::duplicate_mod` (`-D clippy::all`).
+#[cfg(feature = "sal-postgres")]
+pub mod pg_barrier;
+
 // #3777 — the ONE lane-database predicate every guarded postgres cell calls.
 pub mod lane_db;
 
