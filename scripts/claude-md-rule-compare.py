@@ -639,12 +639,13 @@ def _self_test_cases() -> int:
 
     counter = [0]
 
-    def guarded(name, fn):
-        """#6574: run one inline cell group; any exception is that group's named FAIL and the run continues."""
+    def guarded(name, fn, sink=None):
+        """#6574: run one inline cell group; any exception is that group's named FAIL and the run continues. #6927: a
+        proof that raises a FAIL on purpose passes its own `sink`, so the run-wide list is never cleaned up after it."""
         try:
             fn()
         except Exception as exc:  # noqa: BLE001 - #6574: an exception in an unwrapped cell is a named FAIL, never an abort
-            failures.append(name)
+            (failures if sink is None else sink).append(name)
             print(f"FAIL: self-test - {name}: unexpected {type(exc).__name__}: {exc}", file=sys.stderr)
 
     def case(name, mutate, want_fail, needle, trailer=None, base_mutate=None, message=None):
@@ -923,12 +924,10 @@ def _self_test_cases() -> int:
         return ""
 
     def check_guarded():
-        before = len(failures)
-        captured = io.StringIO()
+        raised, captured = [], io.StringIO()
         with contextlib.redirect_stderr(captured):
-            guarded("injected cell", raising_cases)
-        named = failures[before:] == ["injected cell"] and "FAIL: self-test - injected cell: unexpected TypeError" in captured.getvalue()
-        del failures[before:]
+            guarded("injected cell", raising_cases, sink=raised)
+        named = raised == ["injected cell"] and "FAIL: self-test - injected cell: unexpected TypeError" in captured.getvalue()
         return "" if named else f"an exception in a guarded group was not reported by name: {captured.getvalue()!r}"
 
     def check_backstop():
@@ -2016,11 +2015,11 @@ def _self_test_cases() -> int:
         visit(outer, None)
         return {name: found.get(name) for name in ROUND4_FIXTURES}, handed
 
-    def fixtures_pin(source=None):
+    def fixtures_pin(source=None, sink=None):
         holders, handed = fixtures_guarded_cell(source)
         loose = [name for name, holder in holders.items() if holder is None or holder not in handed]
         if loose:
-            failures.append("round-4 fixtures outside guarded")
+            (failures if sink is None else sink).append("round-4 fixtures outside guarded")
             print(f"FAIL: self-test - the fixtures {loose!r} are built outside guarded() (#6744)", file=sys.stderr)
         else:
             print("PASS: self-test - the #6575, #6609 and #6573 fixtures are built inside guarded() (#6744)")
@@ -2056,17 +2055,15 @@ def _self_test_cases() -> int:
     guarded("the #6744 pin is never called outside guarded() (#6818) fixture", pin_call_guarded_cell)
 
     # #6818: the pin on a script that cannot be read (reviewer mutant R9) is that check's named FAIL, a later check still
-    # runs, and the failure list is non-empty so the final result is FAIL (closed). The entry is removed afterwards so
-    # this proof does not fail the real run.
-    def pin_fault_cell():
-        name, ran, seen = "the #6744 pin on a missing script", [], len(failures)
+    # runs, and the failure list is non-empty so the final result is FAIL (closed). #6927: the probe records into its
+    # own list, never the run-wide one, so there is nothing to remove afterwards; the verdict goes to `sink`.
+    def pin_fault_cell(sink=None):
+        name, ran, raised = "the #6744 pin on a missing script", [], []
         with contextlib.redirect_stderr(io.StringIO()):
-            guarded(name, lambda: fixtures_pin(base_dir / "no-such-script.py"))
-            guarded("a check after the faulted pin", lambda: ran.append(True))
-        raised = failures[seen:]
-        del failures[seen:]
+            guarded(name, lambda: fixtures_pin(base_dir / "no-such-script.py", sink=raised), sink=raised)
+            guarded("a check after the faulted pin", lambda: ran.append(True), sink=raised)
         if raised != [name] or ran != [True]:
-            failures.append("the #6744 pin fault")
+            (failures if sink is None else sink).append("the #6744 pin fault")
             print(f"FAIL: self-test - a faulted #6744 pin must be one named FAIL and let later checks run: {raised!r}, "
                   f"later checks ran: {ran!r} (#6818)", file=sys.stderr)
         else:
@@ -2081,11 +2078,9 @@ def _self_test_cases() -> int:
         source = base_dir / "unguarded-fixtures.py"
         source.write_text("def _self_test_cases():\n    fresh_pair('showsigverifier')\n"
                           "    fresh_pair('nonasciiapprover')\n    fresh_pair('shallow')\n", encoding="utf-8")
-        before, captured = len(failures), io.StringIO()
+        recorded, captured = [], io.StringIO()
         with contextlib.redirect_stderr(captured):
-            fixtures_pin(source)
-        recorded = failures[before:]
-        failures[before:] = []  # the proof must not fail the real run
+            fixtures_pin(source, sink=recorded)  # #6927: a local sink, so the proof never touches the real run's list
         text = captured.getvalue()
         named = all(repr(fixture) in text for fixture in ("showsigverifier", "nonasciiapprover", "shallow"))
         if recorded != ["round-4 fixtures outside guarded"] or not text.startswith("FAIL:") or not named:
@@ -2097,19 +2092,18 @@ def _self_test_cases() -> int:
 
     guarded("the #6744 pin records an unguarded fixture (#6884) fixture", unguarded_fixture_pin_cell)
 
-    # #6885: the proof above removes only the failures it raised itself. A red cell that ran before it must survive,
-    # so a seeded earlier failure has to still be in the list after the proof has cleaned up.
+    # #6885: the faulted-pin proof must keep a red cell that ran before it. #6927: the earlier failure is seeded into
+    # a local sink handed to the proof, so the real run's list is never seeded and never filtered; the sink must come
+    # back holding exactly that earlier failure (it is kept, and the proof itself passed).
     def earlier_failure_kept_cell():
         earlier = "a red cell that ran earlier (#6885)"
-        failures.append(earlier)
+        sink = [earlier]
         with contextlib.redirect_stdout(io.StringIO()):
-            pin_fault_cell()
-        kept = earlier in failures
-        failures[:] = [item for item in failures if item != earlier]  # the seeded entry must not fail the real run
-        if not kept:
+            pin_fault_cell(sink=sink)
+        if sink != [earlier]:
             failures.append("the pin-fault proof erased an earlier failure")
-            print("FAIL: self-test - the faulted-pin proof removed a failure recorded before it ran (#6885)",
-                  file=sys.stderr)
+            print(f"FAIL: self-test - the faulted-pin proof did not keep exactly the failure recorded before it ran: "
+                  f"{sink!r} (#6885)", file=sys.stderr)
         else:
             print("PASS: self-test - the faulted-pin proof keeps the failures recorded before it (#6885)")
 
