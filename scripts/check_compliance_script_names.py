@@ -751,6 +751,8 @@ R11_UNESCAPE_CELLS = (
     ("U-hidden-existing", "Run check&#95;new.py daily.\n", "", 1, "`check_new.py` is shown only after"),
     ("U-hidden-zw-existing", "Run check_\u200bnew.py daily.\n", "", 1, "`check_new.py` is shown only after"),
     ("U-lookalike", "Run \u0188heck-old.sh daily.\n", "", 1, "look-alike script name"),
+    ("U-lookalike-ref", "Run &#x188;heck-old.sh daily.\n", "", 1, "look-alike script name"),
+    ("U-lookalike-zw", "Run \u0188\u200bheck-old.sh daily.\n", "", 1, "look-alike script name"),
     ("U-lookalike-existing", "Run \u0188heck_new.py daily.\n", "", 1, "look-alike script name"),
     ("U-bidi-raw", "Run check_new.py\u202e daily.\n", "", 1, "bidirectional control character U+202E"),
     ("U-bidi-ref", "Run check_new.py&#x202E; daily.\n", "", 1, "bidirectional control character U+202E"),
@@ -829,7 +831,8 @@ R11_ERRATUM_CELLS = (
     ("E-pre-fence", r11_pre("```\n"), R11_ALLOW, 1, "a code fence " + BEFORE),
     ("E-pre-tilde-fence", r11_pre("~~~\n"), R11_ALLOW, 1, "a code fence " + BEFORE),
     ("E-pre-indented", r11_pre("    code\n"), R11_ALLOW, 1, "indented code " + BEFORE),
-    ("E-pre-quote", r11_pre("> quote\n"), R11_ALLOW, 1, "a block quote " + BEFORE),
+    ("E-pre-quote", r11_pre("> quote\n"), R11_ALLOW, 1, ": a block quote " + BEFORE),
+    ("E-shape-uncovers", r11_pre("<!-- note -->\n"), R11_ALLOW, 1, "`check-old.sh` " + NOT_FOUND),
     ("E-pre-refdef", r11_pre("[a]: https://example.com\n"), R11_ALLOW, 1, "a link reference definition " + BEFORE),
     ("E-pre-tag", r11_pre("Text <b>x</b>\n"), R11_ALLOW, 1, "raw HTML or an autolink " + BEFORE),
     ("E-pre-link", r11_pre("See [a](b).\n"), R11_ALLOW, 1, "a link or image bracket " + BEFORE),
@@ -901,6 +904,7 @@ R11_ADJACENT_CELLS = (
     ("M-prose-paren", "Section (b) applies to abc(x).\n", "", 0, None),
 )
 R11_UNDECIDABLE_CELLS = (
+    ("X-tab", "Run\tcheck_new.py\tdaily.\n", "", 0, None),
     ("X-vt", "Run check\x0bold.\n", "", 1, "character U+000B"),
     ("X-ff", "Run check\x0cold.\n", "", 1, "character U+000C"),
     ("X-nel", "Run check\x85old.\n", "", 1, "character U+0085"),
