@@ -479,6 +479,25 @@ def _glob(pattern):
     return re.compile("".join(out) + r"\Z")
 
 
+UNSUPPORTED_GLOB = re.compile(r"[?+\[\]]")
+
+
+def _unsupported_glob(sub, keys):
+    """True when a branch filter uses `?`, `+` or `[...]`, which this verifier does not translate (#6437).
+
+    Checked on the extracted patterns and, because a bracket also opens a flow list, on the raw
+    lines: `?` or `+` anywhere, more than one `[` or `]` on a line, or a bracket in a `- ` item."""
+    for name in ("branches", "branches-ignore"):
+        if any(UNSUPPORTED_GLOB.search(pat) for pat in keys.get(name, ())):
+            return True
+    for line in sub:
+        if "?" in line or "+" in line or line.count("[") > 1 or line.count("]") > 1:
+            return True
+        if line.lstrip().startswith("- ") and ("[" in line or "]" in line):
+            return True
+    return False
+
+
 def _indent(line):
     return len(line) - len(line.lstrip(" "))
 
@@ -520,7 +539,9 @@ def trigger_covers(workflow_text, branch):
 
     Fail closed: a flow mapping, a `paths`/`paths-ignore` filter, or a `types` list without
     opened/synchronize/reopened is False, because the workflow would be skipped for some pull
-    requests and a required context would never report (#6429, #6430)."""
+    requests and a required context would never report (#6429, #6430). Also False for `branches`
+    together with `branches-ignore` (invalid on GitHub, #6438) and for a pattern using `?`, `+`
+    or `[...]` (not translated, #6437)."""
     lines = _code_lines(workflow_text)
     for i, line in enumerate(lines):
         if _indent(line) == 0 and line.startswith("on:"):
@@ -555,6 +576,8 @@ def trigger_covers(workflow_text, branch):
                 m = re.match(r"(branches(?:-ignore)?|paths(?:-ignore)?|types)\s*:", deeper.strip())
                 if m and _indent(deeper) == _indent(sub[0]):
                     keys[m.group(1)] = _items(sub, k)
+            if _unsupported_glob(sub, keys):
+                return False  # ?, + and [...] are glob syntax this verifier does not translate (#6437)
             if "branches" in keys and "branches-ignore" in keys:
                 return False  # GitHub rejects both filters on one event: the workflow is invalid (#6438)
             if "paths" in keys or "paths-ignore" in keys:

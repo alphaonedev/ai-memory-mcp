@@ -69,7 +69,9 @@ python3 -I scripts/check_carrier_ruleset_live.py --require-full-view
   jobs are defined there and the workflow triggers on `pull_request` for that
   carrier's base (`on.pull_request.branches` covers `chain/**` or
   `rehearsal/**`, with no `paths`/`paths-ignore` filter and no `types` list that
-  drops `opened`, `synchronize` or `reopened`, and no flow-mapping form); a tip
+  drops `opened`, `synchronize` or `reopened`, no flow-mapping form, no
+  `branches` together with `branches-ignore`, and no `?`, `+` or `[...]` in a
+  branch pattern, which the verifier does not translate); a tip
   that defines the jobs but does not trigger for every pull request would never
   report the required context. Any carrier it cannot read is RED. It checks the
   jobs, the trigger and, in the `applied` state, the release tip (step 3
