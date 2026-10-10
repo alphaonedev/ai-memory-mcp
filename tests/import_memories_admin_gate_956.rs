@@ -211,11 +211,15 @@ async fn admin_import_restamps_agent_id_956() {
     assert_eq!(status, StatusCode::OK, "body={payload}");
     assert_eq!(payload["imported"], 1);
     let meta = read_metadata(db_path, mem_id).expect("persisted memory");
-    assert_eq!(meta["agent_id"].as_str(), Some("ops:admin"), "meta={meta}");
+    assert_eq!(
+        meta["agent_id"].as_str(),
+        Some("ops:admin"),
+        "metadata key `agent_id` must be restamped to the caller"
+    );
     assert_eq!(
         meta["imported_from_agent_id"].as_str(),
         Some("alice"),
-        "meta={meta}"
+        "metadata key `imported_from_agent_id` must carry the original claim"
     );
     assert_eq!(meta["scope"].as_str(), Some("private"));
     assert_eq!(meta["other_field"].as_str(), Some("preserved"));
@@ -233,7 +237,10 @@ async fn admin_import_preserves_when_body_matches_caller_956() {
     assert_eq!(payload["imported"], 1);
     let meta = read_metadata(db_path, mem_id).expect("persisted memory");
     assert_eq!(meta["agent_id"].as_str(), Some("ops:admin"));
-    assert!(meta.get("imported_from_agent_id").is_none(), "meta={meta}");
+    assert!(
+        meta.get("imported_from_agent_id").is_none(),
+        "metadata key `imported_from_agent_id` must be absent"
+    );
 }
 
 #[tokio::test]
@@ -249,6 +256,9 @@ async fn admin_import_metadata_absent_agent_id_stamps_caller_956() {
     assert_eq!(payload["imported"], 1);
     let meta = read_metadata(db_path, mem_id).expect("persisted memory");
     assert_eq!(meta["agent_id"].as_str(), Some("ops:admin"));
-    assert!(meta.get("imported_from_agent_id").is_none(), "meta={meta}");
+    assert!(
+        meta.get("imported_from_agent_id").is_none(),
+        "metadata key `imported_from_agent_id` must be absent"
+    );
     assert_eq!(meta["tag"].as_str(), Some("x"));
 }
