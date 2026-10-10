@@ -2449,6 +2449,38 @@ def _self_test_cases() -> int:
     masks("#6667 R5 N2 a scp-style address has no userinfo", "git@github.com:a/b", shown=("git@github.com:a/b",),
           count=0)
 
+    # #6163 round 6 (#6851): the URL password is masked whatever follows the host (a Markdown or prose terminator, an
+    # IPv6 literal, an underscore, a percent escape or a non-ASCII host). The password runs to the last `@` that is
+    # followed by at least one host character and then a path, query, fragment, space or the end of the text.
+    for shape, shape_text, shape_canary, shape_shown in (
+            ("a backtick after the host", "Use `postgres://u:6163pw01@dbhost` here", "6163pw01", "@dbhost`"),
+            ("a closing parenthesis after the host", "see (postgres://u:6163pw02@dbhost) now", "6163pw02", "@dbhost)"),
+            ("a double quote after the host", 'dsn = "postgres://u:6163pw03@dbhost"', "6163pw03", '@dbhost"'),
+            ("a single quote after the host", "dsn = 'postgres://u:6163pw04@dbhost'", "6163pw04", "@dbhost'"),
+            ("an angle bracket after the host", "<postgres://u:6163pw05@dbhost>", "6163pw05", "@dbhost>"),
+            ("a Markdown link", "[db](https://u:6163pw06@dbhost)", "6163pw06", "@dbhost)"),
+            ("a comma after the host", "postgres://u:6163pw07@dbhost, then", "6163pw07", "@dbhost,"),
+            ("an underscore in the host", "postgres://u:6163pw08@my_db/x", "6163pw08", "@my_db/x"),
+            ("an IPv6 literal host", "postgres://u:6163pw09@[::1]:5432/x", "6163pw09", "@[::1]:5432/x"),
+            ("a semicolon after the host", "postgres://u:6163pw0A@dbhost;", "6163pw0A", "@dbhost;"),
+            ("a host at the end of the text", "postgres://u:6163pw0B@dbhost", "6163pw0B", "@dbhost"),
+            ("a host followed by a path", "postgres://u:6163pw0C@dbhost/db", "6163pw0C", "@dbhost/db"),
+            ("a closing square bracket after the host", "[postgres://u:6163pw0D@dbhost]", "6163pw0D", "@dbhost]"),
+            ("emphasis after the host", "**postgres://u:6163pw0E@dbhost**", "6163pw0E", "@dbhost**"),
+            ("a percent escape in the host", "postgres://u:6163pw0F@%68ost/x", "6163pw0F", "@%68ost/x"),
+            ("a non-ASCII letter inside the host", "postgres://u:6163pw0G@höst/x", "6163pw0G", "@höst/x"),
+            ("a non-ASCII letter at the start of the host", "postgres://u:6163pw0K@östhost/x", "6163pw0K",
+             "@östhost/x"),
+            ("a non-ASCII host followed by a comma", "postgres://u:6163pw0L@ühost, z", "6163pw0L",
+             "@ühost,"),
+            ("a tilde after the host", "postgres://u:6163pw0H@dbhost~", "6163pw0H", "@dbhost~"),
+            ("a table pipe after the host", "| postgres://u:6163pw0I@dbhost |", "6163pw0I", "@dbhost |"),
+            ("an exclamation mark after the host", "postgres://u:6163pw0J@dbhost!", "6163pw0J", "@dbhost!")):
+        masks(f"#6851 R6 a URL password is masked with {shape}", shape_text, hidden=(shape_canary,),
+              shown=(shape_shown,), count=1)
+    masks("#6851 R6 an at sign followed by no host character is not the end of the userinfo",
+          "https://u:6163pw0M@h.co/p?x=@", hidden=("6163pw0M",), shown=("h.co/p?x=@",), count=1)
+
     # #6163 round 5 (#6663, #6614): a YAML comment line between a bare credential name and its value passes the wait
     # on, and a comment after the bare name or after a block indicator does not hide the name from the mask. The
     # comment after a bare name is masked with the value (it cannot be told from a value that starts with `#`); the
