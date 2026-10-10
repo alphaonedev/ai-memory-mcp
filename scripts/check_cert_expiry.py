@@ -105,6 +105,7 @@ Exit codes: 0 clean / N/A-skip, 1 violation, 2 usage / self-test failure.
 """
 
 import argparse
+import ast
 import contextlib
 import errno
 import io
@@ -2121,6 +2122,33 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     for stale_claim in ("(only this cell)", "only cells for theirs"):
         if stale_claim in block_text:
             t.fail(f"(pr4-sha-comment): the comment block still claims {stale_claim!r}")
+
+    # (pr4-sha-ast, #6697): structural pin of the five env sha read sites, so a loosening of ANY
+    # character form (ZWSP, ZWJ, LRM, DEL, ...) fails here without a per-form cell. Each production
+    # `env_sha(env, KEY)` call must pass the bare name `env`, `env_sha` must fullmatch the value it
+    # read unchanged, and ENV_SHA_RE must be the exact 40-or-64 ASCII-hex pattern, no flags.
+    tree = ast.parse(own_src)
+    dump = lambda src: ast.dump(ast.parse(src, mode="eval").body)  # noqa: E731
+    sites = sorted(c.args[1].value for c in ast.walk(tree)
+                   if isinstance(c, ast.Call) and getattr(c.func, "id", "") == "env_sha"
+                   and len(c.args) == 2 and not c.keywords and isinstance(c.args[0], ast.Name)
+                   and c.args[0].id == "env" and isinstance(c.args[1], ast.Constant))
+    n_calls = sum(isinstance(c, ast.Call) and getattr(c.func, "id", "") == "env_sha"
+                  for c in ast.walk(tree))
+    want_sites = ["GITHUB_EVENT_BEFORE", "GITHUB_SHA", "GITHUB_SHA", "PR_BASE_SHA", "PR_HEAD_SHA"]
+    if sites != want_sites or n_calls != len(want_sites):
+        t.fail(f"(pr4-sha-ast): env_sha call sites {sites!r} ({n_calls} calls) are not the five "
+               f"`env_sha(env, KEY)` sites {want_sites!r}")
+    fn = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "env_sha"), None)
+    st = fn.body[1:] if fn else []
+    if (len(st) != 3 or not isinstance(st[0], ast.Assign) or ast.dump(st[0].value) != dump('env.get(key, "")')
+            or not isinstance(st[1], ast.If) or ast.dump(st[1].test) != dump("not ENV_SHA_RE.fullmatch(val)")
+            or ast.dump(st[2]) != ast.dump(ast.parse("return val").body[0])):
+        t.fail("(pr4-sha-ast): env_sha does not fullmatch the value read from env.get(key, \"\") unchanged")
+    pat = next((n.value for n in tree.body if isinstance(n, ast.Assign)
+                and [getattr(x, "id", "") for x in n.targets] == ["ENV_SHA_RE"]), None)
+    if pat is None or ast.dump(pat) != dump('re.compile(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?")'):
+        t.fail("(pr4-sha-ast): ENV_SHA_RE is not the exact 40-or-64 ASCII-hex pattern compiled without flags")
 
     # (k) fail-closed - pull_request with nothing set (missing PR head sha / base ref).
     t.gate("k", "pull_request with PR_HEAD_SHA and GITHUB_BASE_REF unset", repo,
