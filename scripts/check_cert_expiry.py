@@ -3236,7 +3236,20 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                     ("b-wj", "a word joiner", ">\n> a⁠b\n", False),
                     ("b-bom", "a byte-order mark", ">\n> a﻿b\n", False),
                     ("b-rlo", "a bidi override", ">\n> a‮b\n", False),
-                    ("b-rli", "a bidi isolate", ">\n> a⁧b\n", False)):
+                    ("b-rli", "a bidi isolate", ">\n> a⁧b\n", False),
+                    # Round-5 pins: each guard below had no killing cell.
+                    ("b-tab2", "a tab after '> ' (a tab stop can make indented code)",
+                     ">\n> \tplain\n", True),
+                    ("b-nosp", "a '>' marker with no space after it", ">\n>plain\n", False),
+                    ("b-lsp", "a list marker followed by 5 spaces (indented code in the item)",
+                     ">\n> -     code\n", True),
+                    ("b-sp-pre", "a type-1 HTML block opener inside a multi-line code span",
+                     ">\n> a `x\n> <pre> y` z\n", True),
+                    ("b-sp-tilde", "a tilde fence opener inside a multi-line code span",
+                     ">\n> a `x\n> ~~~ y` z\n", True),
+                    ("b-esc2", "a tag between two backslash-escaped backticks",
+                     ">\n> a \\`<b>x</b>\\` c\n", False),
+                    ("b-tick", "a lone backtick", ">\n> a ` b\n", False)):
                 cell_b = edit_range("", touch=(), label=f"{tag}-doc", frm=mb_b, quoted=pre + led_b)
                 t.expect_red(f"6124-{tag}", f"doc-only: {label}", repo, mb_b, cell_b, canon6124)
                 if record:
@@ -3245,6 +3258,28 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                                          label=f"{tag}-rec", frm=mb_br)
                     t.expect_red(f"6124-{tag}-rec", f"new record after {label}", repo, mb_br,
                                  cell_br, red6124 + canon6124)
+            # (6124-b-lazy-end) RED - a lazy line directly below the last quoted
+            # line of the region joins the ledger paragraph (design B end check).
+            cell_le = edit_range("", touch=(), label="b-lazy-end-doc", frm=mb_b,
+                                 quoted=led_b + "lazy line\n")
+            t.expect_red("6124-b-lazy-end", "doc-only: a lazy line below the region", repo,
+                         mb_b, cell_le, canon6124)
+            # (6124-b-head-above) RED - a doc that keeps an amendment header above
+            # the STATUS line is outside the subset, even for an unrelated prose edit.
+            doc_ha = ("<!-- Copyright 2026 fixture / SPDX-License-Identifier: Apache-2.0 -->\n"
+                      "# Enterprise federation certification (fixture)\n\n"
+                      f"**Binds to:** `{genesis}` (fixture bind)\n\n"
+                      "> **Amendment (2026-10-07, #6063 WP-B1 - section 7 record).**\n"
+                      "> A record above the banner.\n\n"
+                      "> ## STATUS \u2014 **EXPIRED as of 2026-01-01** (fixture)\n"
+                      f"{led_b}\nBody prose.\n")
+            fx.reset(exp6124)
+            fx.write(CERT_DOC, doc_ha)
+            mb_ha = fx.commit([CERT_DOC], "6124 cell b-head-above-mb")
+            fx.write(CERT_DOC, doc_ha + "More prose.\n")
+            cell_ha = fx.commit([CERT_DOC], "6124 cell b-head-above")
+            t.expect_red("6124-b-head-above", "doc-only: an amendment header above STATUS",
+                         repo, mb_ha, cell_ha, canon6124)
             # GREEN controls: the subset keeps plain prose, lists, tables, code
             # spans (their content is exempt from the tag rule), a literal '<'
             # that opens no tag, plain links and a closed fence below the region.
@@ -3272,6 +3307,34 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                                   label="b-tail", frm=mb_tail)
             t.expect_red("6124-b-tail", "a fence below the ledger region that never closes", repo,
                          mb_tail, tail_bad, red6124 + canon6124)
+            # Round-5 pins: a comment opener and a <details> element are named as
+            # such (the tag rule alone would refuse them with a vaguer reason).
+            for tag, label, pre, why in (
+                    ("b-cm-why", "a mid-line comment opener", ">\n> a <!-- b\n",
+                     "an HTML comment opener"),
+                    ("b-det-why", "a mid-line <details> element", ">\n> a <details> b\n",
+                     "a <details>/<summary> element")):
+                cell_w = edit_range("", touch=(), label=tag, frm=mb_b, quoted=pre + led_b)
+                t.expect_red(f"6124-{tag}", f"doc-only: {label}", repo, mb_b, cell_w,
+                             canon6124 + [(why, f"did not name {why}")])
+            # Round-5 pins: each HTML construct below the region that never closes.
+            for tag, label, below in (
+                    ("b-tail-cm", "an HTML comment", "<!-- never closed\n"),
+                    ("b-tail-pre", "a <pre> block", "<pre>\nnever closed\n"),
+                    ("b-tail-pi", "a processing instruction", "<?x never closed\n"),
+                    ("b-tail-cd", "a CDATA section", "<![CDATA[ never closed\n"),
+                    ("b-tail-det", "a <details> element", "<details>\n\nnever closed\n")):
+                cell_tl = edit_range("\n" + below, quoted=led_b + ">\n" + rec6124,
+                                     label=tag, frm=mb_tail)
+                t.expect_red(f"6124-{tag}", f"{label} below the ledger region that never closes",
+                             repo, mb_tail, cell_tl, red6124 + canon6124)
+            closed = ("\n<details>\n<summary>s</summary>\n\nbody\n\n</details>\n\n"
+                      "<!-- closed -->\n")
+            mb_tc = doc_only(closed, quoted=led_b, label="b-ok-tail2-mb")
+            tail_tc = edit_range(closed, quoted=led_b + ">\n" + rec6124, label="b-ok-tail2",
+                                 frm=mb_tc)
+            t.expect_green("6124-b-ok-tail2", "a closed <details> and comment below the region",
+                           repo, mb_tc, tail_tc, green6124)
 
             # STATUS pin: one canonical STATUS line, after a blank line, above
             # every record; a decoy anywhere in the document is refused.
@@ -3435,7 +3498,9 @@ SELF_TEST_OK = (
     "(6124-k*, #6444) the six mutant-killing cells; (6124-b*, design B, vote 6def5ab6) a ledger "
     "region outside the canonical subset (fence, HTML, comment, tab, CR, nested or indented "
     "'>', indented code, setext, link definition, lazy line, invisible or bidi character, "
-    "a STATUS decoy) RED, an unclosed construct anywhere RED, and its controls GREEN"
+    "a STATUS decoy, a header above STATUS, a '>' or list marker without its one space, a lone "
+    "or escaped backtick, a fence or HTML opener inside a multi-line code span) RED, an "
+    "unclosed construct anywhere RED, and its controls GREEN"
 )
 SELF_TEST_OK_R = (
     "; (6124-r1..r4, #6355) the committed cert doc with a record at each legal spot GREEN "
