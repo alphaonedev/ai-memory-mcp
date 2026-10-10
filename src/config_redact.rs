@@ -445,6 +445,16 @@ pub fn config_label(path: &std::path::Path) -> String {
     config_path_label(path, crate::config::AppConfig::config_path().as_deref())
 }
 
+/// #6605 — the per-key deprecation WARN with the file named by
+/// [`config_label`] instead of the caller's `path` value.
+#[must_use]
+pub fn deprecated_key_warn(
+    path: &std::path::Path,
+    f: &crate::config::deprecated_keys::Finding,
+) -> String {
+    crate::config::deprecated_keys::warn_line(std::path::Path::new(&config_label(path)), f)
+}
+
 /// Replace the contents of every backtick- or double-quote-delimited span
 /// with [`CONFIG_REDACTION_MASK`].
 ///
@@ -494,6 +504,24 @@ fn is_source_echo_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #6605 — the deprecation WARN keeps the key, replacement and release
+    /// facts and never echoes a non-default caller path.
+    #[test]
+    fn deprecated_key_warn_names_key_not_caller_path_6605() {
+        let row = crate::config::deprecated_keys::DEPRECATED_KEYS[0];
+        let f = crate::config::deprecated_keys::Finding { row };
+        let line = deprecated_key_warn(
+            std::path::Path::new("/placeholder/FAKE-PLACEHOLDER-secret.toml"),
+            &f,
+        );
+        assert!(
+            !line.contains("FAKE-PLACEHOLDER"),
+            "non-default path leaked"
+        );
+        assert!(line.contains(row.key) && line.contains(row.replacement));
+        assert!(line.contains(NON_DEFAULT_CONFIG_LABEL));
+    }
 
     /// #6584 / #6605 — a non-default caller path is never echoed; the
     /// default location is named from the resolved default, not the caller.

@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::config_redact::{config_label, deprecated_key_warn};
 use crate::models::Tier;
 
 // ---------------------------------------------------------------------------
@@ -8401,7 +8402,7 @@ impl AppConfig {
                 match toml::from_str::<Self>(&contents) {
                     Ok(cfg) => match cfg.validate_secret_handling() {
                         Ok(()) => {
-                            eprintln!("ai-memory: loaded config from {}", path.display());
+                            eprintln!("ai-memory: loaded config from {}", config_label(path));
                             cfg.warn_legacy_schema_drift(path);
                             cfg
                         }
@@ -8556,7 +8557,7 @@ impl AppConfig {
         if !c.deprecated.is_empty() {
             WARN_ONCE.call_once(|| {
                 for f in &c.deprecated {
-                    eprintln!("{}", deprecated_keys::warn_line(path, f));
+                    eprintln!("{}", deprecated_key_warn(path, f));
                 }
             });
         }
@@ -8608,7 +8609,7 @@ impl AppConfig {
         };
         cfg.validate_secret_handling()
             .map_err(|reason| anyhow::anyhow!("config rejected ({}): {reason}", path.display()))?;
-        eprintln!("ai-memory: loaded config from {}", path.display());
+        eprintln!("ai-memory: loaded config from {}", config_label(path));
         cfg.warn_legacy_schema_drift(path);
         cfg.warn_ignored_auto_tag_endpoint_keys(path); // #3808
         Ok(cfg)
@@ -8675,7 +8676,7 @@ impl AppConfig {
         }
         WARN_ONCE.call_once(|| {
             eprintln!(
-                "ai-memory: WARN — schema_version = {:?} but legacy v1 fields \
+                "ai-memory: WARN — schema_version >= 2 but legacy v1 fields \
                  are still present in {} (llm_model / ollama_url / embed_url / \
                  embedding_model / cross_encoder / default_namespace / \
                  archive_on_gc / archive_max_days / max_memory_mb / \
@@ -8683,8 +8684,7 @@ impl AppConfig {
                  [reranker] / [storage] WIN, but a legacy field is still the \
                  FALLBACK for any key the sections leave unset — it is NOT \
                  inert (#3385). Run `ai-memory config migrate` to remove them.",
-                self.schema_version,
-                path.display(),
+                config_label(path),
             );
         });
     }
@@ -14267,7 +14267,7 @@ max_page_size = 1000000
         assert_eq!(resolved.api_key(), Some("alias-fallback-key"));
         match &resolved.api_key_source {
             KeySource::AliasFallback(name) => assert_eq!(name, "XAI_API_KEY"),
-            other => panic!("expected AliasFallback(XAI_API_KEY), got {other:?}"),
+            other => panic!("expected AliasFallback(XAI), got {}", other.as_str()),
         }
         scrub_llm_env();
     }
@@ -14394,7 +14394,7 @@ max_page_size = 1000000
         assert_eq!(resolved.api_key(), Some("via-config-env-var"));
         match &resolved.api_key_source {
             KeySource::ConfigEnvVar(name) => assert_eq!(name, "MY_CUSTOM_LLM_KEY"),
-            other => panic!("expected ConfigEnvVar(MY_CUSTOM_LLM_KEY), got {other:?}"),
+            other => panic!("expected ConfigEnvVar, got {}", other.as_str()),
         }
         unsafe {
             std::env::remove_var("MY_CUSTOM_LLM_KEY");
@@ -14428,10 +14428,10 @@ max_page_size = 1000000
             KeySource::Error(reason) => {
                 assert!(
                     reason.contains("lax permissions") && reason.contains("0400"),
-                    "error must name the perm policy: {reason}"
+                    "error must name the perm policy (lax permissions, 0400)"
                 );
             }
-            other => panic!("expected KeySource::Error(lax perms), got {other:?}"),
+            other => panic!("expected Error(lax perms), got {}", other.as_str()),
         }
         // Cleanup.
         let _ = std::fs::remove_file(&key_path);
@@ -14747,7 +14747,7 @@ max_page_size = 1000000
         assert_eq!(resolved.api_key(), Some("alias-fallback-embed-key"));
         match &resolved.key_source {
             KeySource::AliasFallback(name) => assert_eq!(name, "OPENROUTER_API_KEY"),
-            other => panic!("expected AliasFallback(OPENROUTER_API_KEY), got {other:?}"),
+            other => panic!("expected AliasFallback(OPENROUTER), got {}", other.as_str()),
         }
         scrub_embed_env();
     }
@@ -14770,7 +14770,7 @@ max_page_size = 1000000
         assert_eq!(resolved.api_key(), Some("via-embed-config-env-var"));
         match &resolved.key_source {
             KeySource::ConfigEnvVar(name) => assert_eq!(name, "MY_CUSTOM_EMBED_KEY"),
-            other => panic!("expected ConfigEnvVar(MY_CUSTOM_EMBED_KEY), got {other:?}"),
+            other => panic!("expected ConfigEnvVar, got {}", other.as_str()),
         }
         unsafe {
             std::env::remove_var("MY_CUSTOM_EMBED_KEY");
@@ -14804,10 +14804,10 @@ max_page_size = 1000000
             KeySource::Error(reason) => {
                 assert!(
                     reason.contains("[embeddings].api_key_file") && reason.contains("lax"),
-                    "error must attribute the embeddings field: {reason}"
+                    "error must attribute the embeddings field ([embeddings].api_key_file, lax)"
                 );
             }
-            other => panic!("expected KeySource::Error, got {other:?}"),
+            other => panic!("expected KeySource::Error, got {}", other.as_str()),
         }
 
         let _ = std::fs::remove_file(&key_path);
