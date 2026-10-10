@@ -30,6 +30,8 @@ pub mod consolidate;
 pub mod crud;
 pub mod curator;
 pub mod doctor;
+/// v1.0.0 #3656 — the daemon-served (`--remote`) doctor sections.
+pub mod doctor_remote;
 /// v1.0.0 #3471 — the `ai-memory doctor` wake-hub posture section (socket and
 /// directory mode + ownership, file-descriptor budget, supervisor unit).
 pub mod doctor_wake_hub;

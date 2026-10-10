@@ -1227,10 +1227,16 @@ a declared non-singleton shape lacks enterprise PKI;
 Warning for plaintext model-server egress or a leaf inside its renewal
 window; Info otherwise. Doctor never refuses. The doctor sections that open their own postgres session (Postgres extensions, Unstamped owners, Identity key registry) apply the same `sslmode=verify-full` floor before any socket opens: below it they report the refusal as the section's fact (Critical for the first two, a Warning note for Identity) and never connect (#4333).
 
+In `--remote` mode (v1.0.0 #3656) the report reads `/api/v1/health`,
+`/api/v1/capabilities`, `/api/v1/stats` and `/api/v1/metrics`; `/api/v1/stats`
+is admin-only, so pass the global `--agent-id` of an `[admin] agent_ids` entry
+(sent as `X-Agent-Id`) or the Storage and Index sections report the `403` by
+name. See [`docs/operations/doctor.md`](operations/doctor.md).
+
 ```bash
 ai-memory doctor
 ai-memory doctor --json | jq '.sections[] | select(.severity != "ok")'
-ai-memory doctor --remote https://memory.prod.example.com
+ai-memory --agent-id ai:operator doctor --remote https://memory.prod.example.com
 
 # Certified enterprise posture: TLS + mandatory client-cert mTLS + api-key.
 ai-memory doctor --remote https://memory.prod.example.com \

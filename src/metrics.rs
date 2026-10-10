@@ -20,6 +20,40 @@ use prometheus::{
     Registry, TextEncoder,
 };
 
+/// Wire names of the series `ai-memory doctor --remote` reads back from
+/// `GET /api/v1/metrics` (v1.0.0 #3656). ONE definition each: the registry
+/// registers the series under these names and the doctor parses the scrape
+/// for the same constants, so a rename cannot silently turn a measured value
+/// into `not_in_response` on the operator's dashboard.
+pub mod names {
+    /// Current HNSW vector index population (gauge).
+    pub const HNSW_SIZE: &str = "ai_memory_hnsw_size";
+    /// Cumulative HNSW oldest-eviction count since process start (counter).
+    pub const HNSW_EVICTIONS_TOTAL: &str = "ai_memory_hnsw_evictions_total";
+    /// Total webhook deliveries attempted since process start (counter).
+    pub const WEBHOOK_DISPATCHED_TOTAL: &str = "ai_memory_webhook_dispatched_total";
+    /// Webhook deliveries that failed after all retries (counter).
+    pub const WEBHOOK_FAILED_TOTAL: &str = "ai_memory_webhook_failed_total";
+    /// Current count of active webhook subscriptions (gauge).
+    pub const SUBSCRIPTIONS_ACTIVE: &str = "ai_memory_subscriptions_active";
+    /// Subscription DLQ inserts refused at the per-subscription depth cap (counter).
+    pub const SUBSCRIPTION_DLQ_OVERFLOW_TOTAL: &str = "ai_memory_subscription_dlq_overflow_total";
+    /// Pending `federation_push_dlq` rows (gauge, refreshed per replay tick).
+    pub const FEDERATION_PUSH_DLQ_DEPTH: &str = "ai_memory_federation_push_dlq_depth";
+    /// Post-quorum fanout tasks whose outcome could not be observed (counter, by `reason`).
+    pub const FEDERATION_FANOUT_DROPPED_TOTAL: &str = "ai_memory_federation_fanout_dropped_total";
+    /// Quorum writes where at least one configured peer missed the deadline (counter).
+    pub const FEDERATION_PARTIAL_QUORUM_TOTAL: &str = "ai_memory_federation_partial_quorum_total";
+    /// Unix seconds of the last successful exchange per peer and direction
+    /// (gauge, by `peer`/`direction`; #3654).
+    pub const FEDERATION_PEER_LAST_SUCCESS_TIMESTAMP_SECONDS: &str =
+        "ai_memory_federation_peer_last_success_timestamp_seconds";
+    /// Unix seconds of the last attempted exchange per peer and direction
+    /// (gauge, by `peer`/`direction`; #3654).
+    pub const FEDERATION_PEER_LAST_ATTEMPT_TIMESTAMP_SECONDS: &str =
+        "ai_memory_federation_peer_last_attempt_timestamp_seconds";
+}
+
 // =====================================================================
 // pm-v3.1 PR8 (issue #1174) — HNSW eviction observability.
 //
@@ -828,14 +862,14 @@ impl Metrics {
 
         let webhook_dispatched_total = int_counter(
             &registry,
-            "ai_memory_webhook_dispatched_total",
+            names::WEBHOOK_DISPATCHED_TOTAL,
             "Total webhook deliveries attempted.",
             &mut err,
         );
 
         let webhook_failed_total = int_counter(
             &registry,
-            "ai_memory_webhook_failed_total",
+            names::WEBHOOK_FAILED_TOTAL,
             "Webhook deliveries that failed after all retries.",
             &mut err,
         );
@@ -892,14 +926,14 @@ impl Metrics {
 
         let hnsw_size_gauge = int_gauge(
             &registry,
-            "ai_memory_hnsw_size",
+            names::HNSW_SIZE,
             "Current HNSW vector index population.",
             &mut err,
         );
 
         let subscriptions_active_gauge = int_gauge(
             &registry,
-            "ai_memory_subscriptions_active",
+            names::SUBSCRIPTIONS_ACTIVE,
             "Current count of active webhook subscriptions.",
             &mut err,
         );
@@ -940,7 +974,7 @@ impl Metrics {
 
         let federation_fanout_dropped_total = int_counter_vec(
             &registry,
-            "ai_memory_federation_fanout_dropped_total",
+            names::FEDERATION_FANOUT_DROPPED_TOTAL,
             "Post-quorum fanout tasks whose outcome could not be observed. \
                  reason=shutdown|panic|join_error. Non-zero indicates mesh divergence risk.",
             &["reason"],
@@ -961,7 +995,7 @@ impl Metrics {
         // H9 (v0.7.0 round-2) — partial-quorum observability.
         let federation_partial_quorum_total = int_counter(
             &registry,
-            "ai_memory_federation_partial_quorum_total",
+            names::FEDERATION_PARTIAL_QUORUM_TOTAL,
             "Quorum writes that succeeded (W met) but where at least one \
              configured peer did not ack inside the deadline.",
             &mut err,
@@ -978,7 +1012,7 @@ impl Metrics {
         );
         let federation_peer_last_attempt_timestamp_seconds = int_gauge_vec(
             &registry,
-            "ai_memory_federation_peer_last_attempt_timestamp_seconds",
+            names::FEDERATION_PEER_LAST_ATTEMPT_TIMESTAMP_SECONDS,
             "Unix seconds (local clock) of the last attempted exchange with a peer. \
                  direction=pull|push. Absent until the first attempt (#3654).",
             &["peer", "direction"],
@@ -986,7 +1020,7 @@ impl Metrics {
         );
         let federation_peer_last_success_timestamp_seconds = int_gauge_vec(
             &registry,
-            "ai_memory_federation_peer_last_success_timestamp_seconds",
+            names::FEDERATION_PEER_LAST_SUCCESS_TIMESTAMP_SECONDS,
             "Unix seconds (local clock) of the last successful exchange with a peer; \
                  a push counts only when the peer applied it. direction=pull|push. \
                  Absent until the first success (#3654).",
@@ -1069,7 +1103,7 @@ impl Metrics {
         // v0.7.0 Track D #933 — federation push DLQ depth gauge.
         let federation_push_dlq_depth = int_gauge(
             &registry,
-            "ai_memory_federation_push_dlq_depth",
+            names::FEDERATION_PUSH_DLQ_DEPTH,
             "Current count of pending federation_push_dlq rows \
              (replayed_at IS NULL). Refreshed on every replay tick. \
              Non-zero sustained depth indicates one or more peers are \
@@ -1256,7 +1290,7 @@ impl Metrics {
         // scrape-visible without going through `memory_stats`.
         let hnsw_evictions_total = int_counter(
             &registry,
-            "ai_memory_hnsw_evictions_total",
+            names::HNSW_EVICTIONS_TOTAL,
             "Cumulative HNSW oldest-eviction count since process start. \
              Non-zero indicates the in-memory vector index has hit \
              MAX_ENTRIES and dropped older embeddings; recall quality \
@@ -1277,7 +1311,7 @@ impl Metrics {
         // #1253 (MED, 2026-05-25) — subscription DLQ overflow counter.
         let subscription_dlq_overflow_total = int_counter(
             &registry,
-            "ai_memory_subscription_dlq_overflow_total",
+            names::SUBSCRIPTION_DLQ_OVERFLOW_TOTAL,
             "Monotonic counter of subscription_dlq inserts refused \
              because the per-subscription DLQ depth had already hit \
              MAX_SUBSCRIPTION_DLQ_ROWS (10_000). Non-zero indicates a \
