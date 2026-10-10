@@ -52,10 +52,15 @@ print({{"--sharedir": base + "/share", "--pkglibdir": base + "/lib"}}[sys.argv[1
 """
 
 # Fake psql with real-view semantics: only the control file decides the row.
-# It records its argv and whether PGPASSWORD carried the marker value.
+# It records its argv and whether PGPASSWORD carried the marker value, and refuses (exit 3) any SQL other than
+# the reviewed read-only probe (#6896).
+PROBE_SQL_6896 = "SELECT count(*) FROM pg_available_extensions WHERE name = 'age'"
 FAKE_PSQL = """#!{py}
 import json, os, sys
 base = {base!r}
+sql = [sys.argv[i + 1] for i, arg in enumerate(sys.argv[:-1]) if arg == "-c"]
+if sql != [""" + repr(PROBE_SQL_6896) + """]:
+    sys.exit(3)
 with open(base + "/psql.log", "a") as fh:
     fh.write(json.dumps({{"argv": sys.argv, "env_marker_ok": os.environ.get("PGPASSWORD") == {marker!r},
                          "pgpassword": os.environ.get("PGPASSWORD"),
@@ -412,6 +417,11 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             self.assertEqual(call["argv"][1:], [
                 "postgres://ciuser@127.0.0.1:5445?sslmode=disable", "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1",
                 "-c", "SELECT count(*) FROM pg_available_extensions WHERE name = 'age'"])
+
+    def test_the_probe_sql_is_the_reviewed_catalog_read_6896(self):
+        # #6896: the probe is the helper's only SQL, a read of pg_available_extensions under the tier role.
+        self.assertEqual(load_module().PROBE_SQL, PROBE_SQL_6896)
+        self.assertEqual(PROBE_SQL_6896, "SELECT count(*) FROM pg_available_extensions WHERE name = 'age'")
 
     def test_database_name_moves_to_pgdatabase_6181(self):
         # #6181: a database name equal to a secret would show on every psql argv; the name travels in PGDATABASE.
@@ -1221,7 +1231,8 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         r, w = os.pipe()
         try:
             done = subprocess.run(
-                [sys.executable, "-I", str(SCRIPT), mod.SUPERVISE_FLAG, str(r), "30", "--", str(self.psql)],
+                [sys.executable, "-I", str(SCRIPT), mod.SUPERVISE_FLAG, str(r), "30", "--", str(self.psql),
+                 "-c", PROBE_SQL_6896],
                 pass_fds=(r,), capture_output=True, text=True, timeout=30)
         finally:
             os.close(r)
