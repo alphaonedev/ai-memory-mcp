@@ -195,7 +195,18 @@ pub fn resolve_inference_egress_mode() -> InferenceEgressMode {
             );
             InferenceEgressMode::Deny
         }),
-        Err(_) => InferenceEgressMode::Allow,
+        Err(std::env::VarError::NotPresent) => InferenceEgressMode::Allow,
+        // #6373 / #6402 — a SET value that is not valid UTF-8 is an operator
+        // restriction attempt we cannot read: fail CLOSED, never widen to
+        // Allow (per ERRORS-19). decision: Deny over Allow because ERRORS-19.
+        Err(std::env::VarError::NotUnicode(raw)) => {
+            tracing::warn!(
+                "{ENV_INFERENCE_EGRESS} is set to a non-UTF-8 value {raw:?} — failing \
+                 CLOSED to \"deny\" (no memory content leaves the host for inference). \
+                 Set an explicit \"allow\" | \"loopback-only\" | \"deny\" to choose the posture."
+            );
+            InferenceEgressMode::Deny
+        }
     }
 }
 
