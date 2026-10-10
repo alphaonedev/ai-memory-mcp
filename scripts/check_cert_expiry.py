@@ -1478,6 +1478,9 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     # must each be refused, and a stub that prints exactly the nonce must pass.
     if os.pathsep not in str(tmp):
         nonce = secrets.token_hex(16)
+        while nonce == nonce.upper():
+            # #6651: the (upper) case needs a nonce with at least one letter.
+            nonce = secrets.token_hex(16)
         other = secrets.token_hex(16)
         half = len(nonce) // 2
         exact_cases = (
@@ -1489,6 +1492,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
             ("stderr-only", f"sys.stderr.write('{nonce}\\n')", False),
             ("other-nonce", f"sys.stdout.write('{other}\\n')", False),
             ("blank-line-after", f"sys.stdout.write('{nonce}\\n\\n')", False),
+            ("crlf", f"sys.stdout.buffer.write(b'{nonce}\\r\\n')", False),
+            ("upper", f"sys.stdout.write('{nonce.upper()}\\n')", False),
             ("exact", f"sys.stdout.write('{nonce}\\n')", True))
         for stub_label, body, ok in exact_cases:
             stub_dir = Path(tempfile.mkdtemp(prefix="stubgit.", dir=str(tmp)))
