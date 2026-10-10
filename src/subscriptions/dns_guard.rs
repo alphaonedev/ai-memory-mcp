@@ -32,10 +32,11 @@ const HTTP_DEFAULT_PORT: u16 = 80;
 
 /// #4075 — append the SCHEME's default port to a bracket/colon-normalized
 /// `host_port` that omits one, so `ToSocketAddrs` resolves it on the port
-/// the connector will actually open. Single home of the default-port rule,
-/// shared by the webhook SSRF lane (`validate_url_dns_with`) and the egress
-/// inference lane (`egress::resolve_inference_authority`) via the #3744
-/// one-helper rule.
+/// the connector will actually open. The webhook SSRF lane
+/// (`validate_url_dns_with`) resolves through this; the egress inference
+/// lane (`egress::resolve_inference_authority`) reads the same rule off its
+/// `reqwest::Url` parse (`port_or_known_default`, #4018), so the two lanes
+/// agree on the port without sharing a string helper.
 ///
 /// Before #4075 this appended `:80` for every scheme. reqwest's per-host
 /// override (`Client::builder().resolve(host, addr)`) is installed with that
