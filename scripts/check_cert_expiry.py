@@ -1627,20 +1627,34 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     fx.reset(base)
     fx.g("update-ref", "refs/remotes/origin/main", base)
 
-    # (value-same-line / value-next-line, #6563) the documented split of a value
-    #       edit: a value edited on the line that carries the identifier changes
-    #       that line and is RED; a value on the NEXT line leaves the identifier
-    #       line byte-identical and is GREEN (the lexical bound).
-    fx.g("checkout", "-q", "-B", "mo-value-same", mk0)
+    # (value-edit-5-to-6 / value-next-line / trailing-comment-added, #6563, #6626)
+    #       the documented split of a value edit. The base reads
+    #       `let v = env_or("<id>", 5);`: changing 5 to 6 ON the identifier line
+    #       changes that line and is RED; the same change on the line AFTER the
+    #       identifier (`let w = env_or(\n "<id>",\n 5);`) leaves the identifier
+    #       line byte-identical and is GREEN (the lexical bound). A trailing
+    #       comment added to the definition is RED as well, under its own name.
+    one = f'let v = env_or("{kid}", 5);\n'
+    two = f'let w = env_or(\n    "{kid}",\n    5);\n'
+    fx.g("checkout", "-q", "-B", "mo-value-base", mk0)
+    fx.write("src/mask_val.rs", one)
+    fx.write("src/mask_val2.rs", two)
+    vb = fx.commit(["src/mask_val.rs", "src/mask_val2.rs"], "value base: a value on and after the identifier line")
+    fx.g("checkout", "-q", "-B", "mo-value-same", vb)
+    fx.write("src/mask_val.rs", one.replace("5", "6"))
+    vs = fx.commit(["src/mask_val.rs"], "value-edit-5-to-6: the value 5 edited to 6 on the identifier line")
+    t.expect_red("value-edit-5-to-6", "the value 5 edited to 6 on the line that carries the identifier",
+                 repo, vb, vs, [(f"- {kid}", "did not name the drifted identifier")])
+    fx.g("checkout", "-q", "-B", "mo-value-next", vb)
+    fx.write("src/mask_val2.rs", two.replace("5", "6"))
+    vn = fx.commit(["src/mask_val2.rs"], "value-next-line: the value 5 edited to 6 on the line after the identifier")
+    t.expect_green("value-next-line", "the value 5 edited to 6 on the line after the identifier",
+                   repo, vb, vn)
+    fx.g("checkout", "-q", "-B", "mo-trailing-added", mk0)
     fx.write("src/mask_def.rs", f'pub const M: &str = "{kid}"; // default 6\n')
-    vs = fx.commit(["src/mask_def.rs"], "value-same-line: a value edited on the identifier line")
-    t.expect_red("value-same-line", "a value edited on the line that carries the identifier",
-                 repo, mk0, vs, [(f"- {kid}", "did not name the drifted identifier")])
-    fx.g("checkout", "-q", "-B", "mo-value-next", mk0)
-    fx.write("src/mask_def.rs", def_line + "pub const V: u32 = 6;\n")
-    vn = fx.commit(["src/mask_def.rs"], "value-next-line: a value on the line after the identifier")
-    t.expect_green("value-next-line", "a value changed on the line after the identifier",
-                   repo, mk0, vn)
+    tc = fx.commit(["src/mask_def.rs"], "trailing-comment-added: a trailing comment added to the definition")
+    t.expect_red("trailing-comment-added", "a trailing comment added to the defining line",
+                 repo, mk0, tc, [(f"- {kid}", "did not name the drifted identifier")])
     fx.reset(base)
     fx.g("update-ref", "refs/remotes/origin/main", base)
     # (doc-bound, #6563 / #6561) the docstring, the OK banner and the #6427
@@ -2077,8 +2091,10 @@ SELF_TEST_OK = (
     "both counted in the report, trailing blanks and an identical line added elsewhere are GREEN; "
     "(mask-u2028, mask-trailing, #6564) a definition behind a // comment joined by U+2028 and a "
     "definition replaced by an empty value with the name in a trailing comment stay RED; "
-    "(value-same-line, value-next-line, doc-bound, #6563) a value edited on the identifier "
-    "line is RED, a value on the next line GREEN, and the docstring states the lexical bound; "
+    "(value-edit-5-to-6) the value 5 edited to 6 on the identifier line is RED (#6626); "
+    "(value-next-line) the same edit on the line after it is GREEN; "
+    "(trailing-comment-added) a trailing comment added to the definition is RED; "
+    "(doc-bound, #6563) the docstring states the lexical bound; "
     "(mask-xfile, mask-incomment, mask-longer, mask-blockcomment, mask-annot, #6427) a removed "
     "definition offset by a mention in another file, a comment in its place, a longer token, a "
     "block comment opened and closed on the defining line or the drift annotation text stays RED "
