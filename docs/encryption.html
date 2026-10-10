@@ -9,7 +9,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ai-memory · Encryption — at-rest, in-transit, integrity</title>
-<meta name="description" content="ai-memory v1.0.0 cryptographic surface. SQLCipher at-rest (PRAGMA key) plus opt-in #228 per-memory content envelope (ChaCha20-Poly1305 / X25519 / HKDF) on both backends, mTLS federation peer auth + fingerprint allowlist, HMAC-SHA256 webhook signing, GPG-signed git tags + a CycloneDX SBOM per release (#1973), Ed25519 attested identity (shipped v0.7.0) + per-write content attestation (#1464, v0.8.0).">
+<meta name="description" content="ai-memory v1.0.0 cryptographic surface. SQLCipher at-rest (PRAGMA key) plus opt-in #228 per-memory content envelope (ChaCha20-Poly1305 / X25519 / HKDF) on both backends, mTLS federation peer auth + fingerprint allowlist, HMAC-SHA256 webhook signing, SSH-signed git tags + Sigstore build-provenance attestation + a CycloneDX SBOM per release (#1973), Ed25519 attested identity (shipped v0.7.0) + per-write content attestation (#1464, v0.8.0).">
 <link rel="canonical" href="https://alphaonedev.github.io/ai-memory-mcp/encryption.html">
 <style>
 :root{--bg:#000;--bg-raised:#0a0a0a;--bg-card:#111;--bg-elev:#161616;--bg-code:#1a1a1a;--border:#262626;--border-hl:#3d3d3d;--text:#fff;--text-muted:#999;--text-dim:#666;--p1:#6ee7ff;--p2:#ffb86b;--p3:#c8a2ff;--good:#6ee7ff;--bad:#ff6b9d;--gold:#ffd700;--font-mono:'SF Mono','Cascadia Code','Fira Code',Consolas,monospace;--font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;--max-w:1280px}
@@ -246,7 +246,7 @@ footer a{color:var(--text-muted)}
 
 <section class="hero">
   <h1>Encryption — at rest, in transit, integrity, supply chain.</h1>
-  <p class="tagline">Four crypto surfaces, every one named, every one with the algorithm and the threat model. SQLCipher AES-256 full-database at rest, plus opt-in ChaCha20-Poly1305 per-memory content encryption (#228). mTLS for peer-to-peer federation. HMAC-SHA256 for webhook integrity. GPG-signed git tags + cargo-audit (RustSec) for supply chain; a CycloneDX SBOM ships with every release (#1973). <strong>What's covered, what isn't, and what v0.8.0 added (opt-in per-memory content envelopes; Ed25519 attested identity since v0.7.0).</strong></p>
+  <p class="tagline">Four crypto surfaces, every one named, every one with the algorithm and the threat model. SQLCipher AES-256 full-database at rest, plus opt-in ChaCha20-Poly1305 per-memory content encryption (#228). mTLS for peer-to-peer federation. HMAC-SHA256 for webhook integrity. SSH-signed git tags + build-provenance attestation + cargo-audit (RustSec) for supply chain; a CycloneDX SBOM ships with every release (#1973). <strong>What's covered, what isn't, and what v0.8.0 added (opt-in per-memory content envelopes; Ed25519 attested identity since v0.7.0).</strong></p>
   <div class="pills">
     <span class="pill">SQLCipher at-rest</span>
     <span class="pill">ChaCha20 content envelopes (v0.8.0)</span>
@@ -283,8 +283,8 @@ footer a{color:var(--text-muted)}
       <div class="layer supply">
         <div class="lbl">surface 4</div>
         <h3>Supply chain</h3>
-        <div class="algo">GPG-signed git tags · cargo-audit (RustSec)</div>
-        <p>Every release tag is GPG-signed. CI runs <code>cargo audit</code> against the RustSec advisory DB. A CycloneDX SBOM ships with each release binary in v1.0. Build-provenance attestation (SLSA-style) is tracked post-v1.0; bit-for-bit reproducible builds are NOT claimed (they need an independent rebuilder).</p>
+        <div class="algo">SSH-signed git tags · build-provenance attestation · cargo-audit (RustSec)</div>
+        <p>Every release tag is SSH-signed and verified against an allowed-signers list before any build. CI runs <code>cargo audit</code> against the RustSec advisory DB. A CycloneDX SBOM ships with each release binary in v1.0. Every release artifact carries a Sigstore build-provenance attestation (<code>actions/attest-build-provenance</code>; verify with <code>gh attestation verify</code>). Bit-for-bit reproducible builds are NOT claimed yet: the release workflow builds the x86_64 Linux binary twice and fails on any byte difference (#3613), but the claim waits for that proof to pass on a real release run, and real reproducibility needs an independent rebuilder.</p>
       </div>
     </div>
   </div>
@@ -422,8 +422,8 @@ X-AI-Memory-Signature: <span class="val">sha256=a1b2c3d4…</span>
     <h2 style="font-family:var(--font-sans);font-size:1.75rem">Signed tags, cargo-audit, SBOM (v1.0).</h2>
 
     <div class="feature supply">
-      <div class="feature-head"><span class="feature-name">GPG-signed git tags</span><span class="feature-tag live">since v0.6.3</span></div>
-      <div class="feature-desc">Every release tag is signed with the alphaonedev maintainer key. <code>git tag -v v0.6.3</code> verifies. CI workflow refuses to publish releases from unsigned tags.</div>
+      <div class="feature-head"><span class="feature-name">SSH-signed git tags</span><span class="feature-tag live">live</span></div>
+      <div class="feature-desc">Every release tag carries an SSH signature by a key in <code>scripts/qc-allowlists/release-tag-signers.txt</code>; the release workflow verifies it (<code>scripts/release/verify-tag.sh</code>) and refuses to build or publish from an unsigned or unlisted tag.</div>
     </div>
 
     <div class="feature supply">
@@ -437,8 +437,8 @@ X-AI-Memory-Signature: <span class="val">sha256=a1b2c3d4…</span>
     </div>
 
     <div class="feature supply">
-      <div class="feature-head"><span class="feature-name">Build provenance</span><span class="feature-tag">v1.x</span></div>
-      <div class="feature-desc">The release pipeline pins the Rust toolchain version + the git tag SHA. Bit-for-bit reproducible builds are NOT claimed — a same-runner rebuild cannot detect a compromised runner (real reproducibility needs an independent rebuilder). SLSA-style signed build-provenance attestation is tracked for v1.x; today the trust anchor is the GPG-signed tag + the R24 dependency-free offline verifier.</div>
+      <div class="feature-head"><span class="feature-name">Build provenance</span><span class="feature-tag live">live</span></div>
+      <div class="feature-desc">The release pipeline pins the Rust toolchain version + the git tag SHA. Bit-for-bit reproducible builds are NOT claimed yet: the release workflow builds the x86_64 Linux binary twice and fails on any byte difference (#3613), the claim waits for that proof to pass on a real release run, and a same-runner rebuild cannot detect a compromised runner (real reproducibility needs an independent rebuilder). Every release artifact carries a Sigstore build-provenance attestation (<code>actions/attest-build-provenance</code>; verify with <code>gh attestation verify</code>); the trust anchors are that attestation, the SSH-signed tag and the R24 dependency-free offline verifier.</div>
     </div>
   </div>
 </section>
