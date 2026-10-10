@@ -426,14 +426,31 @@ DOCKER_RUNTIME_ASSERT = ("RUN set -eu; " + ALLOWED_REQUIRE_IMAGE + '; test -n "$
 SHAPE_PROOF_SCRIPT = "scripts/release-shape-pg-proof.sh"
 # #6285/#6286: (fragment, statements it must carry). One per child of #6062.
 RELEASE_FRAGMENTS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
-    ("4720.fixed.md", ()),
+    ("4720.fixed.md", ("no run on `main` has happened yet",)),
     ("4752.security.md", ()),
     ("4768.security.md", ("5-agent vote (4d3ea1c5)", "#6275", "#6277")),
     ("4935.security.md", ()),
     ("4936.fixed.md", ()),
     ("4937.security.md", ()),
     ("6287.removed.md", ("5-agent vote 4d3ea1c5",)),
-    ("3613.added.md", ("Not yet proven", "aarch64-unknown-linux-gnu", "#6407", "#6408", "#6409")),
+    ("3613.added.md", ("Not yet proven", "aarch64-unknown-linux-gnu", "#6407", "#6408", "#6409",
+                       "does not currently affect the binary")),
+)
+# #6498 #6499 #6500 #6503: release claims that must stay true of the tip. Each row is
+# (file, scope regex or None = the whole file, phrases that must appear, phrases that must not, issue).
+DOC_CLAIMS: Tuple[Tuple[str, Optional[str], Tuple[str, ...], Tuple[str, ...], str], ...] = (
+    ("docs/release-pipeline.html", None, ("SSH-signed",), ("GPG", "Cosign", "build-provenance attestation is tracked"),
+     "#6500"),
+    ("docs/encryption.html", None, ("SSH-signed", "#3613"),
+     ("GPG-signed", "GPG signed", "attestation (SLSA-style) is tracked", "build-provenance attestation is tracked"),
+     "#6500"),
+    ("docs/audience/decision-maker.html", None, (), ("reproducible builds are on the v1.0 roadmap",), "#6500"),
+    ("docs/handoff/READY-TO-TAG-v1.0.0-CERT-NOTE.md", None, (), ("not** on every multi-OS release binary",), "#6500"),
+    (".github/workflows/release.yml", None, ("the epoch does not currently affect the binary",),
+     ("The 5 jobs below", "(5 targets)"), "#6500/#6503"),
+    (".github/workflows/release-shape.yml", None, ("no run on `main` has happened yet",), (), "#6499"),
+    ("docs/compliance/MISSION-CRITICAL-CERTIFICATION-STANDARD-v1.md", r"^\| 11b \|.*$",
+     ("#3613", "#6407", "#6408", "#6409"), (), "#6498"),
 )
 SHAPE_BIND_ENV: Dict[str, "Spec"] = {"PREFLIGHT_SHA": "${{ github.sha }}"}
 SHAPE_PROOF_BIND = sane_bind((SHAPE_PROOF_SCRIPT, "scripts/release-features.sh", "scripts/assert-compiled-features.sh"))
@@ -2267,6 +2284,29 @@ def check_release_fragments(root: Path, rep: Report) -> None:
                 rep.bad(f"changelog.d/{name} does not state {needle!r} (#6285/#6286)")
 
 
+def check_doc_claims(root: Path, rep: Report) -> None:
+    """#6498 #6499 #6500 #6503: each DOC_CLAIMS file (or the line its scope
+    regex selects) states what the tip does and none of the stale claims."""
+    for rel, scope, must, must_not, issue in DOC_CLAIMS:
+        try:
+            text = (root / rel).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            rep.bad(f"{rel} missing or unreadable ({issue})")
+            continue
+        if scope is not None:
+            hits = re.findall(scope, text, re.M)
+            if len(hits) != 1:
+                rep.bad(f"{rel}: expected exactly one line matching {scope!r}, found {len(hits)} ({issue})")
+                continue
+            text = hits[0]
+        for phrase in must:
+            if phrase not in text:
+                rep.bad(f"{rel} does not state {phrase!r} ({issue})")
+        for phrase in must_not:
+            if phrase in text:
+                rep.bad(f"{rel} still states {phrase!r}, which the tip does not do ({issue})")
+
+
 def check_install(text: str, rep: Report) -> None:
     m = re.search(r"^## Pre-built Binaries.*?(?=^## (?!Pre-built Binaries))", text, re.M | re.S)
     section = m.group(0) if m else ""
@@ -2365,6 +2405,7 @@ def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], s
         check_install(install, rep)
     check_workflow_sweep(root, rep)
     check_release_fragments(root, rep)
+    check_doc_claims(root, rep)
     return rep.errors, declared
 
 
@@ -2425,6 +2466,10 @@ def mk_root(src: Path, dst: Path) -> None:
     for name, _ in RELEASE_FRAGMENTS:
         if (src / "changelog.d" / name).is_file():
             shutil.copy2(src / "changelog.d" / name, dst / "changelog.d" / name)
+    for rel, _scope, _must, _not, _issue in DOC_CLAIMS:
+        if (src / rel).is_file() and not (dst / rel).exists():
+            (dst / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src / rel, dst / rel)
 
 
 IND = "          "
@@ -3560,6 +3605,30 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "6286 3613 fragment drops the not-yet-proven list": ("fail", [("changelog.d/3613.added.md", "Not yet proven", "Proven", False)]),
     "6286 3613 fragment drops the Docker layer item": ("fail", [("changelog.d/3613.added.md", "#6409", "#0", True)]),
     "6286 3613 fragment is not a bold entry": ("fail", [("changelog.d/3613.added.md", "**[release]", "[release]", False)]),
+    "6499 4720 fragment drops the main-run deviation": ("fail", [("changelog.d/4720.fixed.md",
+        "no run on `main` has happened yet", "a run on `main` happened", False)]),
+    "6499 release-shape banner drops the main-run deviation": ("fail", [(SHAPE,
+        "no run on `main` has happened yet", "a run on `main` happened", False)]),
+    "6503 3613 fragment claims the epoch shapes the binary": ("fail", [("changelog.d/3613.added.md",
+        "does not currently affect the binary", "shapes the binary", False)]),
+    "6503 release.yml banner claims the epoch shapes the binary": ("fail", [_rel(
+        "the epoch does not currently affect the binary", "the epoch shapes the binary")]),
+    "6500 release.yml header back to five jobs": ("fail", [_rel("# The jobs below", "# The 5 jobs below")]),
+    "6500 release-pipeline.html back to GPG": ("fail", [("docs/release-pipeline.html", "SSH-signed", "GPG-signed", False)]),
+    "6500 release-pipeline.html names Cosign": ("fail", [("docs/release-pipeline.html", "</title>", " Cosign</title>", False)]),
+    "6500 release-pipeline.html provenance tracked for v1.x": ("fail", [("docs/release-pipeline.html", "</title>",
+        " build-provenance attestation is tracked for v1.x</title>", False)]),
+    "6500 release-pipeline.html file missing": ("fail", [("docs/release-pipeline.html", "x", None, False)]),
+    "6500 encryption.html back to GPG-signed": ("fail", [("docs/encryption.html", "SSH-signed", "GPG-signed", False)]),
+    "6500 encryption.html drops the #3613 clause": ("fail", [("docs/encryption.html", "#3613", "#0", True)]),
+    "6500 encryption.html provenance tracked post-v1.0": ("fail", [("docs/encryption.html", "</title>",
+        " Build-provenance attestation (SLSA-style) is tracked post-v1.0</title>", False)]),
+    "6500 decision-maker roadmap claim": ("fail", [("docs/audience/decision-maker.html", "</title>",
+        " reproducible builds are on the v1.0 roadmap</title>", False)]),
+    "6500 cert note says sal-postgres is not shipped": ("fail", [("docs/handoff/READY-TO-TAG-v1.0.0-CERT-NOTE.md",
+        "\n", "\n**`sal-postgres` is not** on every multi-OS release binary\n", False)]),
+    "6498 cert row 11b drops the xcframework item": ("fail", [('docs/compliance/MISSION-CRITICAL-CERTIFICATION-STANDARD-v1.md', "#6408", "#0", False)]),
+    "6498 cert row 11b duplicated": ("fail", [('docs/compliance/MISSION-CRITICAL-CERTIFICATION-STANDARD-v1.md', "| 11b |", "| 11b | x |\n| 11b |", False)]),
     "6286 4720 fragment missing": ("fail", [("changelog.d/4720.fixed.md", "", None, False)]),
     # --- #6293: no secret or step/job output is expanded inside a run: script
     "6293 secret expanded in a run script": ("fail", [_rel("          rpm --version\n", "          rpm --version\n" + '          echo "${{ secrets.COPR_CONFIG }}" > f\n')]),
