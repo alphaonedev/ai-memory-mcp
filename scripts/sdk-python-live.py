@@ -30,6 +30,8 @@ collected; 2 the daemon or hub could not be started; 128+N stopped by signal N.
 """
 
 import argparse
+import base64
+import codecs
 import datetime
 import os
 import signal
@@ -160,6 +162,85 @@ def mint_tls(tls_dir):
     key.write_bytes(leaf_key.private_bytes(pem, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
     os.chmod(key, 0o600)
     return tls_dir / "ca.pem", tls_dir / "cert.pem", key
+
+
+REDACTED = "<redacted>"
+_MIN_SECRET_LEN = 8  # a shorter value would turn the filter into a wildcard
+
+
+def secret_forms(data):
+    """Every text form of ``data`` that a traceback or an assertion could print (#6964).
+
+    Raw (UTF-8 and Latin-1), the ``bytes`` ``repr`` with and without its
+    ``b'...'`` wrapper, hex, and both base64 alphabets with and without
+    padding. A multi-line value (a PEM) also yields each of its body lines.
+    Longest first, so a form that contains another is replaced whole.
+    """
+    data = bytes(data)
+    stripped = data.strip()
+    if len(stripped) < _MIN_SECRET_LEN:
+        return []
+    forms = set()
+    for blob in {data, stripped}:
+        forms.add(repr(blob))
+        forms.add(repr(blob)[2:-1])
+        forms.add(blob.hex())
+        forms.add(blob.decode("latin-1"))
+        try:
+            forms.add(blob.decode("utf-8"))
+        except UnicodeDecodeError:
+            pass
+        for encode in (base64.b64encode, base64.urlsafe_b64encode):
+            text = encode(blob).decode("ascii")
+            forms.add(text)
+            forms.add(text.rstrip("="))
+    if b"\n" in stripped:
+        for line in stripped.splitlines():
+            if len(line.strip()) >= _MIN_SECRET_LEN and not line.startswith(b"-----"):
+                forms.update(secret_forms(line))
+    forms.discard("")
+    return sorted((f for f in forms if len(f) >= _MIN_SECRET_LEN), key=len, reverse=True)
+
+
+def redact(text, forms):
+    """``text`` with every one of ``forms`` replaced by ``<redacted>``."""
+    for form in forms:
+        text = text.replace(form, REDACTED)
+    return text
+
+
+def run_redacted(argv, *, cwd, env, secrets):
+    """Run ``argv`` with its stdout and stderr filtered through :func:`redact`; return its exit code.
+
+    The output is streamed in chunks and a tail as long as the longest secret
+    form is held back until the next chunk, so a form split across two reads or
+    spanning a newline is still matched (#6964).
+    """
+    forms = [form for secret in secrets for form in secret_forms(secret)]
+    forms.sort(key=len, reverse=True)
+    hold = max((len(f) for f in forms), default=1) - 1
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)  # noqa: S603
+    pending = ""
+    try:
+        while True:
+            chunk = os.read(proc.stdout.fileno(), 65536)
+            if not chunk:
+                break
+            pending = redact(pending + decoder.decode(chunk), forms)
+            keep = min(hold, len(pending))
+            emit, pending = pending[: len(pending) - keep], pending[len(pending) - keep :]
+            sys.stdout.write(emit)
+            sys.stdout.flush()
+        sys.stdout.write(redact(pending + decoder.decode(b"", final=True), forms))
+        sys.stdout.flush()
+    except BaseException:
+        proc.kill()  # a stop signal or an error here must not leave pytest running
+        raise
+    finally:
+        proc.stdout.close()
+        code = proc.wait()
+    return code
 
 
 class Stack:
@@ -420,7 +501,10 @@ def run_stack(stack, sdk, port):
         AI_MEMORY_TEST_WAKE_HUB_BUNDLE=str(stack.bundle),
         AI_MEMORY_TEST_WAKE_HUB_ID=HUB_ID,
     )
-    res = subprocess.run(
+    # pytest's output goes through the redaction filter: a failing live test
+    # may print the per-run signing key or the TLS key in an assertion (#6964).
+    secrets = [stack.signing_key.read_bytes(), key.read_bytes()]
+    exit_code = run_redacted(
         [
             sys.executable,
             "-m",
@@ -434,16 +518,16 @@ def run_stack(stack, sdk, port):
         ],
         cwd=str(sdk.resolve()),
         env=env,
-        check=False,
+        secrets=secrets,
     )
     stack.close()
     if stack.refresh_error:
         print(f"sdk-python-live: allowlist refresh failed: {stack.refresh_error}", file=sys.stderr)
     problems = verdict(junit_outcomes(report)) if report.exists() else ["no junit report was written"]
-    if problems or res.returncode != 0:
+    if problems or exit_code != 0:
         for p in problems:
             print(f"sdk-python-live: {p}", file=sys.stderr)
-        print(f"sdk-python-live: FAIL (pytest exit {res.returncode})", file=sys.stderr)
+        print(f"sdk-python-live: FAIL (pytest exit {exit_code})", file=sys.stderr)
         return 1
     print(f"sdk-python-live: PASS, all {len(LIVE_TESTS)} live tests ran and passed")
     return 0
