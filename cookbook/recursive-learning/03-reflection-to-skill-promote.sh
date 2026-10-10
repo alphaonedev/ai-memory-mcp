@@ -90,7 +90,7 @@ mcp_call() {
   local mcp_in="$RUN_DIR/mcp-${tag}.in.jsonl"
   local mcp_out="$RUN_DIR/mcp-${tag}.out.jsonl"
   cat >"$mcp_in" <<EOF
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"cookbook-03","version":"1.0"}}}
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"cookbook-03","version":"1.0"}}}
 {"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"${tool}","arguments":${args}}}
 EOF
   "$BIN" --db "$db" mcp --profile full <"$mcp_in" >"$mcp_out" 2>>"$LOG" || true
