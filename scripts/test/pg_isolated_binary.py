@@ -394,7 +394,7 @@ def mint_base(url: str) -> str:
     new_url = with_database(url, name)
     try:
         psql(new_url, 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')
-    except WrapperError:
+    except (WrapperError, OSError):
         drop_base(url, name)
         raise
     log('minted ephemeral base %s' % name)
@@ -409,14 +409,23 @@ def drop_base(url: str, name: str) -> bool:
     try:
         psql(with_database(url, MAINTENANCE_DB), 'DROP DATABASE IF EXISTS %s' % quote_ident(_checked_ident(name)))
         return True
-    except WrapperError as exc:
+    except (WrapperError, OSError) as exc:
         log('WARN could not drop minted base %s (drop it by hand): %s' % (name, exc))
         return False
 
 
 def mask_url_password(url: str) -> str:
-    """``postgres://u:pw@h/db`` -> ``postgres://u:***@h/db`` (no password: unchanged)."""
-    return re.sub(r'^([a-z]+://[^:/@?]*:)[^@]*(@)', r'\1***\2', url)
+    """``postgres://u:pw@h/db`` -> ``postgres://u:***@h/db``. A URL without a
+    password (including one with an ``@`` only in its query) is unchanged."""
+    try:
+        netloc = urlsplit(url).netloc
+    except ValueError:
+        return url
+    userinfo, at, hostport = netloc.rpartition('@')
+    if not at or ':' not in userinfo:
+        return url
+    user = userinfo.partition(':')[0]
+    return url.replace(netloc, '%s:***@%s' % (user, hostport), 1)
 
 
 def resolve_base(url: str, db_arg: Optional[str], allow_reason: Optional[str],
@@ -451,24 +460,37 @@ def require_budget(url: str, jobs: int) -> Tuple[int, int]:
     return available, need
 
 
+_RELATION_RE = re.compile(r'^[a-z_][a-z0-9_]*$')
+
+
 def lineage_precheck(url: str, db_name: str) -> None:
-    """#6983 / #7031 H2: refuse to clone a base whose ``agent_lineage`` high-water
-    mark exceeds its row count (every clone would fail IntegrityFailed). A base
-    without the table or the watermark row passes."""
-    present = psql(url, "SELECT to_regclass('agent_lineage') IS NOT NULL "
-                        "AND to_regclass('lineage_integrity_watermark') IS NOT NULL", tuples=True).strip()
+    """#6983 / #7031 H2: refuse to clone a base where any watermarked relation
+    holds fewer rows than its recorded high-water mark (every clone would fail
+    IntegrityFailed). Follows the watermark table itself, so it covers every
+    relation in ``WATERMARKED_RELATIONS``; a relation that is missing counts as
+    0 rows. A base without the watermark table passes."""
+    present = psql(url, "SELECT to_regclass('lineage_integrity_watermark') IS NOT NULL", tuples=True).strip()
     if present != 't':
         return
-    raw = psql(url, "SELECT coalesce((SELECT high_water FROM lineage_integrity_watermark "
-                    "WHERE relation = 'agent_lineage'), 0), (SELECT count(*) FROM agent_lineage)",
-               tuples=True).strip()
-    fields = raw.split('|')
-    if len(fields) != 2 or not all(f.strip().isdigit() for f in fields):
-        raise WrapperError('could not read the agent_lineage watermark (got %r)' % raw)
-    high_water, rows = (int(f) for f in fields)
-    if high_water > rows:
-        raise WrapperError('#6983: base %s records agent_lineage high_water=%d but holds %d rows; every clone '
-                           'would fail IntegrityFailed. Use an ephemeral base.' % (db_name, high_water, rows))
+    listing = psql(url, "SELECT relation || '|' || high_water FROM lineage_integrity_watermark "
+                        "ORDER BY relation", tuples=True)
+    for line in (ln.strip() for ln in listing.splitlines()):
+        if not line:
+            continue
+        relation, _, mark = line.partition('|')
+        if not _RELATION_RE.match(relation) or not mark.isdigit():
+            raise WrapperError('could not read the lineage watermark (got %r)' % line)
+        exists = psql(url, "SELECT to_regclass('%s') IS NOT NULL" % relation, tuples=True).strip()
+        rows = 0
+        if exists == 't':
+            count = psql(url, 'SELECT count(*) FROM %s' % quote_ident(relation), tuples=True).strip()
+            if not count.isdigit():
+                raise WrapperError('could not count %s (got %r)' % (relation, count))
+            rows = int(count)
+        if int(mark) > rows:
+            raise WrapperError('#6983: base %s records %s high_water=%s but holds %d rows; every clone '
+                               'would fail IntegrityFailed. Use an ephemeral base.'
+                               % (db_name, relation, mark, rows))
 
 
 def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
@@ -815,15 +837,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         url = _url(args)
         if args.cmd == 'setup':
             admin = url
+            run_id = checked_run_id(args.run_id or new_run_id())  # before any CREATE (N1)
             url, db, minted = resolve_base(url, args.db, args.allow_shared_base, args.jobs)
-            run_id = checked_run_id(args.run_id or new_run_id())
+            done = False
             try:
                 tpl = setup(url, db, args.jobs)
-            except WrapperError:
-                if minted:
+                done = True
+            finally:
+                if minted and not done:  # any failure, not only WrapperError
                     log('setup failed after minting %s; dropping it' % db)
                     drop_base(admin, db)
-                raise
             if args.emit_env:
                 _emit('%s=%s' % (TEMPLATE_VAR, tpl))
                 _emit('%s=%s' % (RUN_ID_VAR, run_id))

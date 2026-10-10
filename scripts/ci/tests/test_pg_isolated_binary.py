@@ -812,20 +812,89 @@ class LeakAndLineage7031(unittest.TestCase):
         self.assertIn('warning:', err)
         self.assertNotIn('DROP DATABASE IF EXISTS "ci_base_1_2_abc"', rec.sql())
 
-    def lineage_answer(self, present, hwm, rows):
+    def lineage_answer(self, present, hwm, rows, table=None):
+        """``present``: watermark table exists; ``hwm`` None = no watermark row;
+        ``table``: agent_lineage exists (default: same as ``present``)."""
+        table = present if table is None else table
+
         def answer(argv, kw):
             sql = argv[argv.index('-c') + 1]
-            if 'to_regclass' in sql:
+            if "to_regclass('lineage_integrity_watermark')" in sql:
                 return Result(0, 't\n' if present else 'f\n')
-            if 'agent_lineage' in sql and 'high_water' in sql:
-                return Result(0, '%d|%d\n' % (hwm, rows))
+            if 'FROM lineage_integrity_watermark' in sql:
+                return Result(0, '' if hwm is None else 'agent_lineage|%d\n' % hwm)
+            if "to_regclass('agent_lineage')" in sql:
+                return Result(0, 't\n' if table else 'f\n')
+            if 'count(*) FROM "agent_lineage"' in sql:
+                return Result(0, '%d\n' % rows)
             return default_answer(argv, kw)
         return answer
 
-    def run_setup(self, present, hwm, rows):
-        with Patched(Recorder(self.lineage_answer(present, hwm, rows))) as rec:
+    def run_setup(self, present, hwm, rows, table=None):
+        with Patched(Recorder(self.lineage_answer(present, hwm, rows, table))) as rec:
             rc = pib.main(['setup', '--url', BASE, '--db', 'ai_memory_test_ci_9_1_x'])
         return rc, rec
+
+    def test_7031_n2_missing_lineage_table_with_watermark_is_refused(self):
+        rc, rec = self.run_setup(True, 6, 0, table=False)
+        self.assertEqual(rc, pib.EXIT_USAGE)
+        self.assertEqual([s for s in rec.sql() if s.startswith(('CREATE', 'DROP', 'ALTER'))], [])
+        with Patched(Recorder(self.lineage_answer(True, 6, 0, table=False))):
+            with self.assertRaises(pib.WrapperError) as ctx:
+                pib.lineage_precheck(BASE, 'ai_memory_test_ci_9_1_x')
+        self.assertIn('high_water=6', str(ctx.exception))
+        self.assertIn('0 rows', str(ctx.exception))
+
+    def test_7031_n3_precheck_follows_the_watermark_table_not_a_hardcoded_name(self):
+        def answer(argv, kw):
+            sql = argv[argv.index('-c') + 1]
+            if "to_regclass('lineage_integrity_watermark')" in sql:
+                return Result(0, 't\n')
+            if 'FROM lineage_integrity_watermark' in sql:
+                return Result(0, 'agent_lineage|1\nsecond_rel|4\n')
+            if "to_regclass('" in sql:
+                return Result(0, 't\n')
+            if 'count(*) FROM "second_rel"' in sql:
+                return Result(0, '2\n')
+            if 'count(*) FROM' in sql:
+                return Result(0, '9\n')
+            return default_answer(argv, kw)
+        with Patched(Recorder(answer)):
+            with self.assertRaises(pib.WrapperError) as ctx:
+                pib.lineage_precheck(BASE, 'ai_memory_test_ci_9_1_x')
+        self.assertIn('second_rel', str(ctx.exception))
+
+    def test_7031_n3_watermarked_relations_ssot_is_pinned(self):
+        src = (REPO / 'src' / 'storage' / 'schema_integrity.rs').read_text()
+        body = src[src.index('pub const WATERMARKED_RELATIONS'):]
+        body = body[:body.index('];')]
+        self.assertEqual(body.count('WatermarkedRelation {'), 1,
+                         'WATERMARKED_RELATIONS changed: re-check lineage_precheck against the new list')
+        self.assertIn('TABLE_AGENT_LINEAGE', body)
+
+    def test_7031_n4_mask_keeps_userless_url_with_at_in_query(self):
+        url = 'postgres://h:5445/db?application_name=a@b'
+        self.assertEqual(pib.mask_url_password(url), url)
+        self.assertEqual(pib.mask_url_password('postgres://u:pw@h:5445/db?x=a@b'),
+                         'postgres://u:***@h:5445/db?x=a@b')
+        self.assertEqual(pib.mask_url_password('postgres://u@h/db'), 'postgres://u@h/db')
+
+    def test_7031_n1_invalid_run_id_mints_nothing(self):
+        rc, rec, _, _ = self.run_main(['setup', '--url', self.SHARED, '--run-id', 'BAD-ID'])
+        self.assertEqual(rc, pib.EXIT_USAGE)
+        self.assertEqual([s for s in rec.sql() if s.startswith('CREATE')], [])
+
+    def test_7031_n1_non_wrapper_error_after_mint_drops_the_base(self):
+        def answer(argv, kw):
+            sql = argv[argv.index('-c') + 1]
+            if sql.startswith('CREATE DATABASE') and sql.endswith('_tpl"'):
+                raise OSError('psql vanished')
+            return default_answer(argv, kw)
+        with Patched(Recorder(answer)) as rec:
+            with self.assertRaises(OSError):
+                pib.main(['setup', '--url', self.SHARED])
+        minted = re.search(r'CREATE DATABASE "(ci_base_\w+?)"', ' '.join(rec.sql())).group(1)
+        self.assertIn('DROP DATABASE IF EXISTS "%s"' % minted, rec.sql())
 
     def test_7031_h2_precheck_refuses_watermark_above_rows(self):
         rc, rec = self.run_setup(True, 6, 0)
