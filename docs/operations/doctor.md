@@ -126,6 +126,10 @@ sections.
   `invalid_rows` — rows whose cursors are NULL or not RFC 3339, each named
   as `peer::<agent>/<peer>::invalid = <column and reason>`. **Warning** when
   > 0: an invalid row is neither healthy nor absent (#3655).
+- `legacy_raw_peer_keys` — `sync_state` rows still keyed by a raw peer URL
+  written before #3675 (the key may hold a credential; only the count is
+  shown). **Warning** when > 0; `ai-memory sync-daemon` folds each into its
+  rendered key, or deletes it when the URL has no unique key, at boot (#6703).
 - Per peer (`peer::<agent>/<peer>::…`, #3655):
   - `reachability` — `reachable`, or `unknown:<reason>` using the SAME
     definition the live daemon's `/health` uses (#3654): a peer's last

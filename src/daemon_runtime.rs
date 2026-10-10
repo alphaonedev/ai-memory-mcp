@@ -9367,6 +9367,11 @@ pub async fn run_sync_daemon_with_shutdown_using_client(
     for peer in &peers {
         crate::tls::validate_peer_url_scheme(peer).map_err(|e| anyhow::anyhow!("{e}"))?;
     }
+    // #6703 — scrub legacy raw-URL sync_state keys once, before any cycle.
+    let scrubbed = db::sync_state_rekey::scrub_raw_peer_keys(&db::open(&db_path)?)?;
+    if scrubbed > 0 {
+        tracing::warn!("sync-daemon: scrubbed {scrubbed} legacy raw-URL sync_state key(s) (#6703)");
+    }
     let interval = interval_secs.max(1);
     let batch_size = batch_size.max(1);
     // #3655 — publish this loop's cadence (the #3654 guard: the series and

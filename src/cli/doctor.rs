@@ -105,6 +105,8 @@ const FACT_MAX_SKEW_SECS: &str = "max_skew_secs";
 const FACT_PEER_COUNT: &str = "peer_count";
 const FACT_PROBED_AT: &str = "probed_at";
 const FACT_INVALID_ROWS: &str = "invalid_rows";
+/// #6703 — `sync_state` rows still keyed by a legacy raw peer URL.
+const FACT_LEGACY_RAW_PEER_KEYS: &str = "legacy_raw_peer_keys";
 /// Peers whose last answered pull is older than the #3654 reachability window.
 const FACT_STALE_PEERS: &str = "stale_peers";
 /// Peers with no recorded contact (or no recorded cadence): reachability
@@ -4312,6 +4314,34 @@ fn section_sync_at(
             format!("{PEER_FACT_PREFIX}{label}::{PEER_FACT_INVALID}"),
             reason.clone(),
         ));
+    }
+    // #6703 — a legacy raw-URL key may hold a credential at rest; only the
+    // count is reported, never the key.
+    match db::sync_state_rekey::count_raw_peer_keys(conn) {
+        Ok(n) => {
+            facts.push((FACT_LEGACY_RAW_PEER_KEYS.into(), n.to_string()));
+            if n > 0 {
+                severity = Severity::Warning;
+                append_note(
+                    &mut note,
+                    &format!(
+                        "{n} sync_state row(s) are keyed by a legacy raw peer URL that may hold a \
+                         credential; `ai-memory sync-daemon` rewrites or deletes them at boot (#6703)"
+                    ),
+                );
+            }
+        }
+        Err(e) => {
+            facts.push((
+                FACT_LEGACY_RAW_PEER_KEYS.into(),
+                SYNC_STATE_UNREADABLE.into(),
+            ));
+            severity = Severity::Warning;
+            append_note(
+                &mut note,
+                &format!("legacy raw peer keys could not be counted: {e}"),
+            );
+        }
     }
     if !watermarks.invalid.is_empty() {
         severity = Severity::Warning;

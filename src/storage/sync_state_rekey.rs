@@ -85,6 +85,63 @@ pub fn forget_raw_peer(conn: &Connection, agent_id: &str, raw_keys: &[&str]) -> 
     Ok(deleted)
 }
 
+/// The `(agent_id, peer_id)` of every `sync_state` row keyed by a legacy
+/// RAW peer URL (#6703): a URL-shaped key that is not its own allowlist
+/// rendering, so it may carry userinfo, a query token or an ambiguous
+/// authority. A plain-named peer (no `://`) is never selected.
+fn raw_peer_keys(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt =
+        conn.prepare("SELECT agent_id, peer_id FROM sync_state WHERE instr(peer_id, '://') > 0")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (agent_id, peer_id) = row?;
+        if crate::url_display::url_origin_and_path(&peer_id) != peer_id {
+            out.push((agent_id, peer_id));
+        }
+    }
+    Ok(out)
+}
+
+/// How many `sync_state` rows are keyed by a legacy raw peer URL (#6703);
+/// `doctor` reports it.
+///
+/// # Errors
+/// Any sqlite error from the read.
+pub fn count_raw_peer_keys(conn: &Connection) -> Result<usize> {
+    Ok(raw_peer_keys(conn)?.len())
+}
+
+/// One-shot scrub of legacy raw-URL `sync_state` keys (#6703), run at
+/// sync-daemon boot. A row whose URL has a durable key is folded into the
+/// rendered key ([`rekey_peer`], cursors kept); any other row is deleted
+/// ([`forget_raw_peer`]): its cursor resets and the next cycle re-pulls,
+/// which is safe because pulls are idempotent upserts. This covers the
+/// peer that is no longer configured, or is now refused (#6101 / #6628),
+/// whose row the per-cycle heal never reaches. Nothing is logged here; the
+/// caller logs the count only.
+///
+/// Returns the number of rows scrubbed.
+///
+/// # Errors
+/// Any sqlite error; each row is handled in its own statement or
+/// transaction, so a failure leaves that row as it was.
+pub fn scrub_raw_peer_keys(conn: &Connection) -> Result<usize> {
+    let mut scrubbed = 0_usize;
+    for (agent_id, raw) in raw_peer_keys(conn)? {
+        let done = if crate::url_display::origin_and_path_is_durable_key(&raw) {
+            let key = crate::url_display::url_origin_and_path(&raw);
+            rekey_peer(conn, &agent_id, &raw, &key)?
+        } else {
+            forget_raw_peer(conn, &agent_id, &[raw.as_str()])? > 0
+        };
+        if done {
+            scrubbed = scrubbed.saturating_add(1);
+        }
+    }
+    Ok(scrubbed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +226,22 @@ mod tests {
             "another agent's row was deleted"
         );
         assert_eq!(forget_raw_peer(&conn, "me", &[refused]).unwrap(), 0);
+    }
+
+    #[test]
+    fn scrub_folds_durable_and_deletes_refused_raw_keys_6703() {
+        let conn = open();
+        let refused = "https://svc:123/SECRETK6703@peer.example/mesh";
+        super::super::sync_state_observe(&conn, "me", RAW, "2026-09-01T00:00:00Z").unwrap();
+        super::super::sync_state_observe(&conn, "me", refused, "2026-09-02T00:00:00Z").unwrap();
+        super::super::sync_state_observe(&conn, "me", "peer-1", "2026-09-03T00:00:00Z").unwrap();
+        assert_eq!(count_raw_peer_keys(&conn).unwrap(), 2);
+        assert_eq!(scrub_raw_peer_keys(&conn).unwrap(), 2);
+        assert_eq!(count_raw_peer_keys(&conn).unwrap(), 0);
+        let clock = super::super::sync_state_load(&conn, "me").unwrap();
+        let mut keys: Vec<&str> = clock.entries.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec![RENDERED, "peer-1"]);
+        assert_eq!(scrub_raw_peer_keys(&conn).unwrap(), 0, "idempotent");
     }
 }
