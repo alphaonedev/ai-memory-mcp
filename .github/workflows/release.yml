@@ -490,12 +490,14 @@ jobs:
       # matching the existing SBOM/iOS/Android assets and install.sh's
       # `awk '{ print $1 }'` extraction.
       #
-      # EXCLUDED: the bare `ai-memory` binary that the packaging step leaves
-      # in dist/. It is NOT architecture-qualified, so all four matrix legs
-      # publish an asset of that same name and overwrite each other. A
-      # checksum for it could be raced against a different leg's binary, and
-      # a WRONG checksum is worse than none. No installer path fetches it
-      # (install.sh fetches the arch-qualified archive). Tracked separately.
+      # REMOVED (#6502): the bare `ai-memory` binary that the packaging step
+      # leaves in dist/. It is NOT architecture-qualified, so every matrix leg
+      # would publish an asset of that same name and overwrite the others',
+      # and a checksum for it could be raced against a different leg's
+      # binary. The tarball and the deb/rpm are already built from it here,
+      # so the sweep deletes it and no later glob (`dist/ai-memory*` in the
+      # upload, attest and release steps) can publish it. No installer path
+      # fetches it (install.sh fetches the arch-qualified archive).
       # ------------------------------------------------------------------
       - name: Checksum every release artifact  # checksum-sweep (#2449)
         shell: bash
@@ -507,7 +509,7 @@ jobs:
             [ -f "$f" ] || continue
             case "$f" in
               *.sha256)          continue ;;
-              ai-memory)         echo "::notice::skipping checksum for non-arch-qualified '$f' (collides across matrix legs)"; continue ;;
+              ai-memory)         rm -f -- "$f"; echo "::notice::removed the non-arch-qualified '$f' from dist (collides across matrix legs; the tarball and deb/rpm carry it)"; continue ;;
             esac
             if command -v sha256sum >/dev/null 2>&1; then
               sha256sum "$f" > "$f.sha256"
