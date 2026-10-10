@@ -25,6 +25,9 @@ CANARY = 'SYNTHETIC_6163_CONFIDENTIAL_VALUE'
 PRIVATE_MODE = 0o600
 DIRECTORY_MODE = 0o700
 REPOSITORY = 'alphaonedev/ai-memory-mcp'
+DUPLICATE_COUNTS = (32, 64, 128)
+REPORT_TEST_LIMIT = 128 * 1024
+HOSTILE_HEADING = '## ' + CANARY + '\nrule\n'
 ISOLATED_FLAGS = argparse.Namespace(**{name: getattr(sys.flags, name) for name in dir(sys.flags)
                                       if isinstance(getattr(sys.flags, name), int)})
 ISOLATED_FLAGS.isolated = 1
@@ -111,6 +114,82 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertIn('RULE TEXT CHANGED', output)
         self.assertIn('/blob/' + head + '/CLAUDE.md#L', output)
+
+    def reset_report_fixture(self):
+        """Reset only disposable input/output files between real Git comparisons."""
+        shutil.copyfile(self.base_root / 'CLAUDE.md', self.repo / 'CLAUDE.md')
+        (self.work / 'summary').unlink(missing_ok=True)
+
+    def test_duplicate_report_grows_linearly_with_each_range_once(self):
+        previous_size = None
+        for count in DUPLICATE_COUNTS:
+            with self.subTest(count=count):
+                self.reset_report_fixture()
+                result, output, head = self.run_head(HOSTILE_HEADING * count)
+                report = (self.work / 'summary').read_text()
+                self.assertEqual(result, 1)
+                self.assertNotIn(CANARY, output)
+                self.assertEqual(report.count('(duplicated heading):'), 1)
+                locations = [line for line in report.splitlines() if line.startswith('- head:')]
+                self.assertEqual(len(locations), len(set(locations)))
+                self.assertGreaterEqual(len(locations), count)
+                self.assertIn('/blob/' + head + '/CLAUDE.md#L', report)
+                size = len(report.encode('utf-8'))
+                self.assertLessEqual(size, REPORT_TEST_LIMIT)
+                if previous_size is not None:
+                    self.assertLess(size, previous_size * 3)
+                previous_size = size
+
+    def test_duplicate_report_preserves_approved_verdict(self):
+        result, output, head = self.run_head(HOSTILE_HEADING * DUPLICATE_COUNTS[0], approved=True)
+        report = (self.work / 'summary').read_text()
+        self.assertEqual(result, 0)
+        self.assertEqual(report.count('(duplicated heading):'), 1)
+        self.assertIn('approval trailer(s): count=1', report)
+        self.assertIn('/compare/' + self.base + '...' + head, report)
+        self.assertNotIn(CANARY, output)
+
+    def test_section_and_range_budgets_refuse_before_diagnostics(self):
+        text = (self.base_root / 'CLAUDE.md').read_text()
+        ranges = self.compare.section_ranges(self.guard, text)
+        # These totals include base and head; a healthy unchanged pair fits exactly.
+        limits = {'MAX_REPORT_SECTIONS': len(ranges),
+                  'MAX_REPORT_RANGES': 2 * sum(len(items) for items in ranges.values())}
+        for name, limit in limits.items():
+            with self.subTest(budget=name):
+                self.reset_report_fixture()
+                with unittest.mock.patch.object(self.compare, name, limit, create=True):
+                    result, output, _ = self.run_head('The tool limit is 103 tools.')
+                self.assertEqual(result, 0)
+                self.assertIn('no rule section differs', output)
+                self.reset_report_fixture()
+                with unittest.mock.patch.object(self.compare, name, limit, create=True), \
+                        unittest.mock.patch.object(self.compare, 'section_diagnostic',
+                                                  wraps=self.compare.section_diagnostic) as diagnostic:
+                    result, output, _ = self.run_head(HOSTILE_HEADING, approved=True)
+                self.assertEqual(result, 1)
+                self.assertEqual((self.work / 'summary').read_text(), self.compare.FAIL_REPORT)
+                self.assertNotIn(CANARY, output)
+                diagnostic.assert_not_called()
+
+    def test_report_byte_budget_exact_boundary_and_closed_sinks(self):
+        payload = 'The tool limit is changed.'
+        result, _, _ = self.run_head(payload)
+        self.assertEqual(result, 1)
+        measured = len((self.work / 'summary').read_bytes())
+        for budget, closed in ((measured, False), (measured - 1, True)):
+            with self.subTest(budget=budget):
+                self.reset_report_fixture()
+                with unittest.mock.patch.object(self.compare, 'MAX_REPORT_BYTES', budget, create=True):
+                    result, output, _ = self.run_head(payload)
+                self.assertEqual(result, 1)
+                report = (self.work / 'summary').read_text()
+                if closed:
+                    self.assertEqual(report, self.compare.FAIL_REPORT)
+                    self.assertEqual(output, self.compare.FAIL_REPORT + '\n' + self.compare.FAIL_REPORT)
+                else:
+                    self.assertEqual(len(report.encode('utf-8')), measured)
+                    self.assertIn('RULE TEXT CHANGED', report)
 
     def test_head_heading_and_guard_error_do_not_escape(self):
         result, output, _ = self.run_head('## ' + CANARY + '\nrule\n## ' + CANARY)
