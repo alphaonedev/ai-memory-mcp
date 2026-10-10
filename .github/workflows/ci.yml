@@ -1212,7 +1212,7 @@ jobs:
       # Self-hosted legs only: hosted runners are dedicated VMs.
       - name: Load gate (#6795)
         if: needs.classify.outputs.docs_only != 'true' && contains(matrix.runner, 'self-hosted')
-        run: python3 scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
+        run: python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
 
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.docs_only != 'true'
