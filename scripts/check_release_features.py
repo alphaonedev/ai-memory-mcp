@@ -626,6 +626,10 @@ NFPM_STEP_RUN = (
     PACK_BIND,
     PAYLOAD_CHECK,
 )
+# #7018: after the sweep, dist/ (everything `dist/ai-memory*` publishes) must be
+# exactly the checked tarball, deb and rpm, each with the sidecar of its bytes.
+DIST_CHECK = (PACK_PY + ' --verify-dist dist --tarball "ai-memory-${{ matrix.target }}.tar.gz" '
+              '--expect-sha256 "$ASSERTED_SHA256"')
 # The checksum sweep of the release job (#2449, #6502).
 SWEEP_RUN = (
     "set -euo pipefail",
@@ -653,6 +657,11 @@ SWEEP_RUN = (
     "fi",
     'echo "checksummed ${emitted} artifact(s)"',
     "ls -la",
+    "# #7018 — the upload, attest and release steps publish dist/ai-memory*: require",
+    "# dist to hold exactly the checked tarball, deb and rpm and one sidecar each.",
+    "cd ..",
+    PACK_BIND,
+    DIST_CHECK,
 )
 RELEASE_STEPS: List[Spec] = [
     {"uses": CHECKOUT_USES, "with": {"ref": "${{ needs.preflight.outputs.sha }}"}},
@@ -666,7 +675,9 @@ RELEASE_STEPS: List[Spec] = [
      "env": dict(_TAG_ENV, SOURCE_DATE_EPOCH=EPOCH_REF, ASSERTED_SHA256="${{ steps.assert.outputs.sha256 }}",
                  PREFLIGHT_SHA="${{ needs.preflight.outputs.sha }}"),
      "run": Block(NFPM_STEP_RUN)},
-    {"name": "Checksum every release artifact", "shell": "bash", "run": Block(SWEEP_RUN)},
+    {"name": "Checksum every release artifact", "shell": "bash",
+     "env": {"ASSERTED_SHA256": "${{ steps.assert.outputs.sha256 }}", "PREFLIGHT_SHA": "${{ needs.preflight.outputs.sha }}"},
+     "run": Block(SWEEP_RUN)},
     {"name": "Upload release artifact", "uses": UPLOAD_ARTIFACT_USES,
      "with": {"name": "ai-memory-${{ matrix.target }}", "path": "dist/ai-memory*"}},
     {"name": "Attest build provenance (release binaries + packages)", "if": "github.event.inputs.dry_run == 'false'",
@@ -4034,6 +4045,17 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
         "        if: matrix.nfpm_arch\n        shell: " + SANE_SHELL + "\n", "        if: matrix.nfpm_arch\n")]),
     "6907 deb/rpm step does not bind the packer": ("fail", [_rel(
         IND + PACK_BIND + "\n" + IND + PAYLOAD_CHECK, IND + PAYLOAD_CHECK)]),
+    "7018 sweep drops the dist check": ("fail", [_rel(IND + DIST_CHECK + "\n", "")]),
+    "7018 dist check made non-fatal": ("fail", [_rel(IND + DIST_CHECK, IND + DIST_CHECK + " || true")]),
+    "7018 dist check expects another digest": ("fail", [_rel(
+        IND + DIST_CHECK, IND + DIST_CHECK.replace('"$ASSERTED_SHA256"', '"$REPRO_SHA256"'))]),
+    "7018 dist check runs before the sweep": ("fail", [_rel(IND + DIST_CHECK + "\n", ""), _rel(
+        IND + "emitted=0\n", IND + DIST_CHECK + "\n" + IND + "emitted=0\n")]),
+    "7018 sweep does not bind the packer": ("fail", [_rel(
+        IND + PACK_BIND + "\n" + IND + DIST_CHECK, IND + DIST_CHECK)]),
+    "7018 sweep env drops the asserted digest": ("fail", [_rel(
+        "          ASSERTED_SHA256: ${{ steps.assert.outputs.sha256 }}\n          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}\n\n      - name: Upload release artifact",
+        "          PREFLIGHT_SHA: ${{ needs.preflight.outputs.sha }}\n\n      - name: Upload release artifact")]),
     "4752 package step env dropped": ("fail", [_rel(PKG_ENV, "")]),
     "4752 package step env points at another step": ("fail", [_rel(PKG_ENV, PKG_ENV.replace("steps.assert.", "steps.build."))]),
     "4752 package hash check removed": ("fail", [_rel(IND + PACKAGE_CHECK + "\n", "")]),
@@ -4451,7 +4473,9 @@ spec.loader.exec_module(rb)
 make = getattr(rb, "_synthetic_package", None)
 entries = [("./usr/", b"", 0o755, "d"), ("./usr/bin/", b"", 0o755, "d"), ("./usr/bin/ai-memory", data, 0o755, "f")]
 blob = make(fmt, entries) if make else b"stub package"
-pathlib.Path("dist/ai-memory_1.0.0_amd64." + fmt).write_bytes(blob)
+# the names nfpm 2.41.1 gives the amd64 / x86_64 packages (#7018 checks them)
+name = "ai-memory_1.0.0_amd64.deb" if fmt == "deb" else "ai-memory-1.0.0-1.x86_64.rpm"
+pathlib.Path("dist/" + name).write_bytes(blob)
 '''
 # name -> (shims {tool: python body}, statement run between the record halves,
 # statement run between the package unit and the deb/rpm step)

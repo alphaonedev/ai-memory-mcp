@@ -335,6 +335,27 @@ def pack_binary(src: Path, expect: str, copy_to: Path, out: Path, epoch: str) ->
     return hashlib.sha256(read_once(out)).hexdigest()
 
 
+# #7018 / #7019: what nfpm 2.41.1 writes for the pinned nfpm.yaml, probed on its
+# real deb and rpm. Anything else in a package is refused rather than ignored:
+# the check reads every member and header the package manager acts on, with one
+# strict reader per format, so no second reader of the same bytes sees more.
+PACKAGED_DIRS = ("usr", "usr/bin")
+OWNER_NAMES = ("", "root")
+TAR_MAGICS = (b"ustar  \x00", b"ustar\x0000")
+DEB_MEMBERS = ("debian-binary", "control.tar.gz", "data.tar.gz")
+DEB_CONTROL_MEMBERS = ("conffiles", "control", "md5sums")
+DEB_CONTROL_FIELDS = ("Package", "Version", "Section", "Priority", "Architecture", "License", "Maintainer",
+                      "Installed-Size", "Homepage", "Description")
+RPM_TAGS = frozenset((63, 100, 1000, 1001, 1002, 1004, 1005, 1006, 1007, 1009, 1011, 1014, 1015, 1020, 1021, 1022,
+                      1028, 1030, 1033, 1034, 1035, 1036, 1037, 1039, 1040, 1044, 1045, 1047, 1096, 1097, 1112, 1113,
+                      1116, 1117, 1118, 1124, 1125, 1126, 5011, 5092, 5093))
+RPM_REQUIRED_TAGS = (1028, 1030, 1035, 1036, 1037, 1039, 1040, 1116, 1117, 1118, 1124, 1125, 5011, 5092, 5093)
+RPM_MAX_HEADER = 1 << 24
+PAYLOAD_MAGIC = ((b"\x1f\x8b", "gzip"), (b"\xfd7zXZ\x00", "xz"), (b"BZh", "bzip2"))
+SHA256_ALGO = 8
+Entry = Tuple[str, str, int, bytes]
+
+
 def _member(name: str, what: str) -> str:
     """A payload path without its leading ``./`` or ``/``; ``..`` is refused."""
     clean = name
@@ -346,55 +367,161 @@ def _member(name: str, what: str) -> str:
     return PurePosixPath(clean).as_posix() if clean else "."
 
 
-def _tar_payload(blob: bytes, what: str) -> Dict[str, Tuple[bytes, int, int]]:
-    """The regular files of a (compressed) tar ``blob``; refuses links, devices,
-    duplicates and a file with more than one link."""
+def _octal(field: bytes, what: str, label: str) -> int:
+    digits = field.rstrip(b"\x00 ")
+    if not digits or any(c not in b"01234567" for c in digits) or b"\x00" in digits:
+        raise ProofError(f"{what}: tar header field {label} {field!r} is not a plain octal number")
+    return int(digits, 8)
+
+
+def _cstr(field: bytes, what: str, label: str) -> str:
+    text, _, rest = field.partition(b"\x00")
+    if rest.strip(b"\x00"):
+        raise ProofError(f"{what}: tar header field {label} carries bytes after its terminator")
     try:
-        tf = tarfile.open(fileobj=io.BytesIO(blob), mode="r:*")
-    except (tarfile.TarError, OSError, EOFError) as exc:
-        raise ProofError(f"{what}: unreadable data archive ({exc})") from exc
+        return text.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProofError(f"{what}: tar header field {label} is not UTF-8") from exc
+
+
+def _strict_tar(gz: bytes, what: str) -> List[Entry]:
+    """#7019: the entries of a gzip tar, read with ONE strict reader: GNU / ustar
+    regular files and directories only (no pax or GNU extension header, link,
+    device or prefix field), every header checksum verified, root-owned by uid
+    and by name, and nothing but zeros after the end-of-archive blocks. A
+    member a more permissive reader would see differently is refused."""
+    if not gz.startswith(b"\x1f\x8b"):
+        raise ProofError(f"{what}: not a gzip stream")
+    raw = _decompress(gz, what)
+    out: List[Entry] = []
+    seen = set()
+    off = 0
+    while True:
+        hdr = raw[off:off + 512]
+        if len(hdr) != 512:
+            raise ProofError(f"{what}: tar ends at {off} without an end-of-archive block")
+        if hdr == bytes(512):
+            if len(raw) - off < 1024 or raw[off:].strip(b"\x00"):
+                raise ProofError(f"{what}: tar end-of-archive at {off} is short or followed by data")
+            return out
+        if hdr[257:265] not in TAR_MAGICS or hdr[345:500].strip(b"\x00"):
+            raise ProofError(f"{what}: tar header at {off} is not a plain GNU/ustar header")
+        if _octal(hdr[148:156], what, "chksum") != sum(hdr[:148]) + 8 * 32 + sum(hdr[156:]):
+            raise ProofError(f"{what}: tar header at {off} has a bad checksum")
+        kind = {b"0": "f", b"5": "d"}.get(hdr[156:157])
+        if kind is None or hdr[157:257].strip(b"\x00"):
+            raise ProofError(f"{what}: tar entry at {off} (type {hdr[156:157]!r}) is not a regular file or directory "
+                             "(links, devices and extension headers are refused)")
+        name = _cstr(hdr[:100], what, "name")
+        mode, uid, gid = (_octal(hdr[i:i + 8], what, lbl) for i, lbl in ((100, "mode"), (108, "uid"), (116, "gid")))
+        size = _octal(hdr[124:136], what, "size")
+        owners = (_cstr(hdr[265:297], what, "uname"), _cstr(hdr[297:329], what, "gname"))
+        if uid or gid or any(o not in OWNER_NAMES for o in owners):
+            raise ProofError(f"{what}: tar entry {name!r} is owned by {uid}:{gid} {owners}, not root")
+        if kind == "d" and size:
+            raise ProofError(f"{what}: tar directory {name!r} has data")
+        data = raw[off + 512:off + 512 + size]
+        if len(data) != size:
+            raise ProofError(f"{what}: tar entry {name!r} is truncated")
+        clean = _member(name, what)
+        if clean in seen:
+            raise ProofError(f"{what}: tar entry {name!r} appears twice")
+        seen.add(clean)
+        out.append((clean, kind, mode, data))
+        off += 512 + (size + 511) // 512 * 512
+
+
+def _payload_files(entries: List[Entry], what: str) -> Dict[str, Tuple[bytes, int, int]]:
+    """#7018: the regular files of a payload; a directory must be one of
+    PACKAGED_DIRS with mode 0755 (no other directory is created)."""
     files: Dict[str, Tuple[bytes, int, int]] = {}
-    with tf:
-        for m in tf.getmembers():
-            name = _member(m.name, what)
-            if m.isdir():
-                continue
-            if not m.isreg():
-                raise ProofError(f"{what}: payload entry {m.name!r} is not a regular file or directory")
-            if name in files:
-                raise ProofError(f"{what}: payload entry {m.name!r} appears twice")
-            fh = tf.extractfile(m)
-            if fh is None:
-                raise ProofError(f"{what}: payload entry {m.name!r} has no data")
-            files[name] = (fh.read(), m.mode & 0o7777, 1)
+    for name, kind, mode, data in entries:
+        if kind == "d":
+            if name not in PACKAGED_DIRS or mode != 0o755:
+                raise ProofError(f"{what}: payload directory {name!r} (mode {oct(mode)}) is not one of {PACKAGED_DIRS} at 0755")
+            continue
+        files[name] = (data, mode, 1)
     return files
 
 
-def _deb_payload(blob: bytes, what: str) -> Dict[str, Tuple[bytes, int, int]]:
-    """The data.tar.* member of a deb (an ar archive), parsed as a tar."""
+def _ar_members(blob: bytes, what: str) -> List[Tuple[str, bytes]]:
+    """The members of an ar archive, read strictly: plain names, decimal sizes,
+    newline padding and no byte after the last member."""
     if not blob.startswith(b"!<arch>\n"):
         raise ProofError(f"{what}: not an ar archive")
-    off, data = 8, None
+    out: List[Tuple[str, bytes]] = []
+    off = 8
     while off < len(blob):
         hdr = blob[off:off + 60]
         if len(hdr) != 60 or hdr[58:60] != b"`\n":
             raise ProofError(f"{what}: truncated or malformed ar member header at {off}")
-        name = hdr[:16].decode("ascii", "replace").strip().rstrip("/")
-        try:
-            size = int(hdr[48:58].decode("ascii").strip())
-        except ValueError as exc:
-            raise ProofError(f"{what}: ar member {name!r} has no size") from exc
+        name = hdr[:16].rstrip(b" ").decode("ascii", "replace")
+        size_field = hdr[48:58].rstrip(b" ")
+        if not size_field.isdigit():
+            raise ProofError(f"{what}: ar member {name!r} has no decimal size")
+        size = int(size_field)
         body = blob[off + 60:off + 60 + size]
         if len(body) != size:
             raise ProofError(f"{what}: ar member {name!r} is truncated")
-        if name.startswith("data.tar"):
-            if data is not None:
-                raise ProofError(f"{what}: more than one data.tar member")
-            data = body
-        off += 60 + size + (size & 1)
-    if data is None:
-        raise ProofError(f"{what}: no data.tar member")
-    return _tar_payload(data, what)
+        off += 60 + size
+        if size & 1:
+            if blob[off:off + 1] != b"\n":
+                raise ProofError(f"{what}: ar member {name!r} is not newline-padded")
+            off += 1
+        out.append((name, body))
+    return out
+
+
+def _deb_control(text: bytes, what: str) -> None:
+    """#7018: the control file holds only DEB_CONTROL_FIELDS (no dependency,
+    Essential or other field), once each, for the package ai-memory."""
+    fields: Dict[str, str] = {}
+    last = ""
+    try:
+        lines = text.decode("utf-8").split("\n")
+    except UnicodeDecodeError as exc:
+        raise ProofError(f"{what}: control is not UTF-8") from exc
+    if lines[-1] != "":
+        raise ProofError(f"{what}: control does not end with a newline")
+    for line in lines[:-1]:
+        if line[:1] in (" ", "\t") and last == "Description":
+            continue
+        key, sep, value = line.partition(":")
+        if not sep or key not in DEB_CONTROL_FIELDS or key in fields:
+            raise ProofError(f"{what}: control line {line!r} is not one of the fields nfpm writes {DEB_CONTROL_FIELDS}")
+        fields[key] = value.strip()
+        last = key
+    if fields.get("Package") != "ai-memory":
+        raise ProofError(f"{what}: control names package {fields.get('Package')!r}, not 'ai-memory'")
+
+
+def _deb_payload(blob: bytes, what: str) -> Dict[str, Tuple[bytes, int, int]]:
+    """#7018: a deb is exactly debian-binary 2.0, control.tar.gz and data.tar.gz;
+    control.tar holds exactly control (DEB_CONTROL_FIELDS), md5sums of the
+    payload and an empty conffiles, and no maintainer script."""
+    members = _ar_members(blob, what)
+    names = tuple(n for n, _ in members)
+    if names != DEB_MEMBERS:
+        raise ProofError(f"{what}: ar members are {list(names)}, not {list(DEB_MEMBERS)}")
+    if members[0][1] != b"2.0\n":
+        raise ProofError(f"{what}: debian-binary is {members[0][1]!r}, not '2.0'")
+    files = _payload_files(_strict_tar(members[2][1], what + " data.tar.gz"), what)
+    control: Dict[str, bytes] = {}
+    for name, kind, mode, data in _strict_tar(members[1][1], what + " control.tar.gz"):
+        if kind != "f" or name not in DEB_CONTROL_MEMBERS or mode != 0o644:
+            raise ProofError(f"{what}: control.tar member {name!r} is not one of {DEB_CONTROL_MEMBERS} at 0644 "
+                             "(maintainer scripts are refused)")
+        control[name] = data
+    if tuple(sorted(control)) != DEB_CONTROL_MEMBERS:
+        raise ProofError(f"{what}: control.tar holds {sorted(control)}, not {list(DEB_CONTROL_MEMBERS)}")
+    _deb_control(control["control"], what)
+    if control["conffiles"].strip():
+        raise ProofError(f"{what}: conffiles is not empty")
+    sums = b"".join(hashlib.md5(d, usedforsecurity=False).hexdigest().encode() + b"  ./" + n.encode() + b"\n"
+                    for n, (d, _, _) in sorted(files.items()))
+    if control["md5sums"] != sums:
+        raise ProofError(f"{what}: md5sums does not list exactly the payload files")
+    return files
 
 
 def _rpm_header_end(blob: bytes, off: int, what: str, pad: bool) -> int:
@@ -411,6 +538,46 @@ def _rpm_header_end(blob: bytes, off: int, what: str, pad: bool) -> int:
     return end
 
 
+def _rpm_header(blob: bytes, off: int, what: str) -> Tuple[Dict[int, list], int]:
+    """#7019: the tags of the rpm header at ``off`` (the header rpm installs
+    from) and its end. int16 / int32 / string / binary / string-array values;
+    any other type, a duplicate tag or an entry outside the store is refused."""
+    end = _rpm_header_end(blob, off, what, pad=False)
+    if blob[off:off + 8] != b"\x8e\xad\xe8\x01\x00\x00\x00\x00":
+        raise ProofError(f"{what}: rpm header at {off} is not a version 1 header")
+    nindex, hsize = struct.unpack(">II", blob[off + 8:off + 16])
+    if hsize > RPM_MAX_HEADER:
+        raise ProofError(f"{what}: rpm header at {off} is larger than {RPM_MAX_HEADER} bytes")
+    store = blob[off + 16 + 16 * nindex:end]
+    tags: Dict[int, list] = {}
+    for i in range(nindex):
+        tag, typ, at, count = struct.unpack(">iiii", blob[off + 16 + 16 * i:off + 32 + 16 * i])
+        if tag in tags or at < 0 or count < 1 or at > len(store):
+            raise ProofError(f"{what}: rpm header entry for tag {tag} is duplicated or out of range")
+        if typ in (3, 4):
+            width = 2 if typ == 3 else 4
+            raw = store[at:at + width * count]
+            if len(raw) != width * count:
+                raise ProofError(f"{what}: rpm header tag {tag} runs past the store")
+            tags[tag] = list(struct.unpack(">%d%s" % (count, "H" if typ == 3 else "i"), raw))
+        elif typ == 7:
+            if at + count > len(store):
+                raise ProofError(f"{what}: rpm header tag {tag} runs past the store")
+            tags[tag] = [store[at:at + count]]
+        elif typ in (6, 8, 9) and (typ != 6 or count == 1):
+            values, pos = [], at
+            for _ in range(count):
+                nul = store.find(b"\x00", pos)
+                if nul < 0:
+                    raise ProofError(f"{what}: rpm header tag {tag} has an unterminated string")
+                values.append(store[pos:nul].decode("utf-8", "surrogateescape"))
+                pos = nul + 1
+            tags[tag] = values
+        else:
+            raise ProofError(f"{what}: rpm header tag {tag} has type {typ} / count {count}, which nfpm does not write")
+    return tags, end
+
+
 def _decompress(blob: bytes, what: str) -> bytes:
     try:
         if blob.startswith(b"\x1f\x8b"):
@@ -425,8 +592,10 @@ def _decompress(blob: bytes, what: str) -> bytes:
 
 
 def _cpio_payload(blob: bytes, what: str) -> Dict[str, Tuple[bytes, int, int]]:
-    """The regular files of a newc / crc cpio archive (an rpm payload)."""
-    files: Dict[str, Tuple[bytes, int, int]] = {}
+    """The regular files of a newc / crc cpio archive (an rpm payload): root-owned,
+    one NUL-terminated name each, PACKAGED_DIRS only, zeros after the trailer."""
+    entries: List[Entry] = []
+    nlinks: Dict[str, int] = {}
     off = 0
     while True:
         hdr = blob[off:off + 110]
@@ -436,59 +605,146 @@ def _cpio_payload(blob: bytes, what: str) -> Dict[str, Tuple[bytes, int, int]]:
             f = [int(hdr[6 + 8 * i:14 + 8 * i], 16) for i in range(13)]
         except ValueError as exc:
             raise ProofError(f"{what}: malformed cpio header at {off}") from exc
-        mode, nlink, size, namesize = f[1], f[4], f[6], f[11]
+        mode, uid, gid, nlink, size, namesize = f[1], f[2], f[3], f[4], f[6], f[11]
         nstart = off + 110
-        name = blob[nstart:nstart + namesize].rstrip(b"\x00").decode("utf-8", "replace")
+        raw_name = blob[nstart:nstart + namesize]
+        if len(raw_name) != namesize or namesize < 2 or raw_name.index(b"\x00") != namesize - 1:
+            raise ProofError(f"{what}: cpio name at {off} is not one NUL-terminated name")
+        try:
+            name = raw_name[:-1].decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProofError(f"{what}: cpio name at {off} is not UTF-8") from exc
         dstart = nstart + namesize
         dstart += (-dstart) % 4
         if name == "TRAILER!!!":
-            return files
+            if blob[dstart:].strip(b"\x00"):
+                raise ProofError(f"{what}: data after the cpio trailer")
+            files = _payload_files(entries, what)
+            return {n: (d, m, nlinks[n]) for n, (d, m, _) in files.items()}
         data = blob[dstart:dstart + size]
         if len(data) != size:
             raise ProofError(f"{what}: cpio entry {name!r} is truncated")
         off = dstart + size
         off += (-off) % 4
         clean = _member(name, what)
-        if stat.S_ISDIR(mode):
-            continue
-        if not stat.S_ISREG(mode):
+        if uid or gid:
+            raise ProofError(f"{what}: cpio entry {name!r} is owned by {uid}:{gid}, not root")
+        if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
             raise ProofError(f"{what}: payload entry {name!r} is not a regular file or directory")
-        if clean in files:
+        if clean in nlinks:
             raise ProofError(f"{what}: payload entry {name!r} appears twice")
-        files[clean] = (data, mode & 0o7777, nlink)
+        nlinks[clean] = nlink
+        entries.append((clean, "d" if stat.S_ISDIR(mode) else "f", mode & 0o7777, data))
 
 
 def _rpm_payload(blob: bytes, what: str) -> Dict[str, Tuple[bytes, int, int]]:
+    """#7018 / #7019: the main header (what rpm installs from) carries only the
+    tags nfpm writes (RPM_TAGS: no scriptlet, trigger, dependency or capability),
+    its payload digest is that of the payload, and its file list, modes, owners,
+    sizes and digests agree with the cpio entries."""
     if not blob.startswith(b"\xed\xab\xee\xdb"):
         raise ProofError(f"{what}: no rpm lead magic")
     sig_end = _rpm_header_end(blob, 96, what, pad=True)
-    main_end = _rpm_header_end(blob, sig_end, what, pad=False)
-    return _cpio_payload(_decompress(blob[main_end:], what), what)
+    tags, main_end = _rpm_header(blob, sig_end, what)
+    extra = sorted(set(tags) - RPM_TAGS)
+    if extra:
+        raise ProofError(f"{what}: rpm header carries tag(s) {extra} that nfpm does not write for nfpm.yaml "
+                         "(scriptlets, triggers, dependencies and capabilities are refused)")
+    missing = [t for t in RPM_REQUIRED_TAGS if t not in tags]
+    if missing:
+        raise ProofError(f"{what}: rpm header lacks tag(s) {missing}")
+    body = blob[main_end:]
+    comp = next((n for m, n in PAYLOAD_MAGIC if body.startswith(m)), None)
+    if tags[1124] != ["cpio"] or tags[1125] != [comp] or tags[5093] != [SHA256_ALGO] \
+            or tags[5092] != [hashlib.sha256(body).hexdigest()]:
+        raise ProofError(f"{what}: rpm header payload format / compressor / digest does not describe the payload")
+    files = _cpio_payload(_decompress(body, what), what)
+    _only_binary(files, what)
+    dirs, bases, index = tags[1118], tags[1117], tags[1116]
+    if len(bases) != len(index) or any(not 0 <= i < len(dirs) for i in index):
+        raise ProofError(f"{what}: rpm header file list is malformed")
+    listed = [dirs[i] + b for i, b in zip(index, bases)]
+    data = files[PACKAGED_PATH][0]
+    want = {1030: [stat.S_IFREG | 0o755], 1036: [""], 1037: [0], 1039: ["root"], 1040: ["root"],
+            5011: [SHA256_ALGO], 1028: [len(data)], 1035: [hashlib.sha256(data).hexdigest()]}
+    if listed != ["/" + PACKAGED_PATH] or any(tags[t] != v for t, v in want.items()):
+        raise ProofError(f"{what}: rpm header file list {listed} / modes / owners / sizes / digests do not "
+                         f"describe the one checked file /{PACKAGED_PATH} at 0100755")
+    return files
+
+
+def _only_binary(files: Dict[str, Tuple[bytes, int, int]], what: str) -> None:
+    if sorted(files) != [PACKAGED_PATH]:
+        raise ProofError(f"{what}: payload files are {sorted(files)}, not exactly [{PACKAGED_PATH!r}]")
+    _, mode, nlink = files[PACKAGED_PATH]
+    if mode != 0o755 or nlink != 1:
+        raise ProofError(f"{what}: {PACKAGED_PATH} has mode {oct(mode)} and {nlink} links, not 0o755 and 1")
+
+
+def _verify_package(name: str, blob: bytes, expect: str, what: str) -> None:
+    if name.endswith(".deb"):
+        files = _deb_payload(blob, what)
+    elif name.endswith(".rpm"):
+        files = _rpm_payload(blob, what)
+    else:
+        raise ProofError(f"{what}: not a .deb or .rpm")
+    _only_binary(files, what)
+    got = hashlib.sha256(files[PACKAGED_PATH][0]).hexdigest()
+    if got != expect:
+        raise ProofError(f"{what}: {PACKAGED_PATH} ({got}) is not the binary the strict assert checked ({expect})")
 
 
 def verify_payload(packages: List[Path], expect: str) -> None:
-    """#6907: every deb / rpm holds exactly one regular file, ``usr/bin/ai-memory``,
-    single-linked, mode 0755, whose SHA-256 is ``expect`` (the asserted digest)."""
+    """#6907 / #7018 / #7019: every deb / rpm is exactly what nfpm writes for
+    nfpm.yaml around one regular file, ``usr/bin/ai-memory``, single-linked,
+    mode 0755, root-owned, whose SHA-256 is ``expect`` (the asserted digest)."""
     expect = expect_hex(expect)
     if not packages:
         raise ProofError("--verify-payload needs at least one package")
     for pkg in packages:
-        what = str(pkg)
-        blob = read_once(pkg)
-        if pkg.name.endswith(".deb"):
-            files = _deb_payload(blob, what)
-        elif pkg.name.endswith(".rpm"):
-            files = _rpm_payload(blob, what)
+        _verify_package(pkg.name, read_once(pkg), expect, str(pkg))
+
+
+DIST_DEB_RE = re.compile(r"ai-memory_[0-9A-Za-z.+~]+_(?:amd64|arm64)\.deb")
+DIST_RPM_RE = re.compile(r"ai-memory-[0-9A-Za-z.+~]+-1\.(?:x86_64|aarch64)\.rpm")
+
+
+def verify_dist(dist: Path, tarball: str, expect: str) -> List[str]:
+    """#7018: ``dist`` is what the checksum sweep, the provenance attestation and
+    both upload steps publish (``dist/ai-memory*``). It must hold exactly the
+    tarball (one root-owned 0755 member ``ai-memory`` with the asserted bytes),
+    at most one deb and one rpm that pass the payload check, and the ``.sha256``
+    sidecar of each, all regular files; each file is read once and its sidecar
+    must name the digest of those bytes. Returns the checked artifact names."""
+    expect = expect_hex(expect)
+    try:
+        names = sorted(os.listdir(dist))
+    except OSError as exc:
+        raise ProofError(f"cannot list {dist}: {exc}") from exc
+    artifacts = [n for n in names if not n.endswith(".sha256")]
+    debs = [n for n in artifacts if DIST_DEB_RE.fullmatch(n)]
+    rpms = [n for n in artifacts if DIST_RPM_RE.fullmatch(n)]
+    unknown = [n for n in artifacts if n != tarball and n not in debs and n not in rpms]
+    if tarball not in artifacts or unknown or len(debs) > 1 or len(rpms) > 1:
+        raise ProofError(f"{dist} holds {artifacts}: wanted {tarball!r} plus at most one deb and one rpm "
+                         f"(unchecked: {unknown})")
+    sidecars = [n for n in names if n.endswith(".sha256")]
+    if sidecars != sorted(n + ".sha256" for n in artifacts):
+        raise ProofError(f"{dist} sidecars {sidecars} are not exactly one .sha256 per artifact")
+    for name in artifacts:
+        what = str(dist / name)
+        blob = read_once(dist / name)
+        if name == tarball:
+            entries = _strict_tar(blob, what)
+            if [(n, k, m) for n, k, m, _ in entries] != [("ai-memory", "f", 0o755)] \
+                    or hashlib.sha256(entries[0][3]).hexdigest() != expect:
+                raise ProofError(f"{what}: is not one 0755 member 'ai-memory' holding the asserted binary ({expect})")
         else:
-            raise ProofError(f"{what}: not a .deb or .rpm")
-        if sorted(files) != [PACKAGED_PATH]:
-            raise ProofError(f"{what}: payload files are {sorted(files)}, not exactly [{PACKAGED_PATH!r}]")
-        data, mode, nlink = files[PACKAGED_PATH]
-        if mode != 0o755 or nlink != 1:
-            raise ProofError(f"{what}: {PACKAGED_PATH} has mode {oct(mode)} and {nlink} links, not 0o755 and 1")
-        got = hashlib.sha256(data).hexdigest()
-        if got != expect:
-            raise ProofError(f"{what}: {PACKAGED_PATH} ({got}) is not the binary the strict assert checked ({expect})")
+            _verify_package(name, blob, expect, what)
+        line = f"{hashlib.sha256(blob).hexdigest()}  {name}\n".encode()
+        if read_once(dist / (name + ".sha256")) != line:
+            raise ProofError(f"{what}.sha256 does not name the SHA-256 of the checked {name}")
+    return artifacts
 
 
 # #6907 fixtures: the control file and rpm header nfpm 2.41.1 writes for nfpm.yaml.
@@ -1202,6 +1458,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--expect-sha256", metavar="HEX", help="the digest the strict assert recorded (#6907)")
     ap.add_argument("--verify-payload", action="store_true", help="check that each PACKAGE (deb or rpm) holds only "
                     "usr/bin/ai-memory with the --expect-sha256 digest (#6907)")
+    ap.add_argument("--verify-dist", metavar="DIR", help="with --tarball and --expect-sha256: require DIR to hold "
+                    "exactly the checked tarball, deb and rpm and one .sha256 sidecar each (#7018)")
+    ap.add_argument("--tarball", metavar="NAME", help="the tarball --verify-dist expects in DIR (#7018)")
     ap.add_argument("--self-test", action="store_true", help="prove the comparison with a stub build tool")
     args = ap.parse_args(argv)
     root = Path(__file__).resolve().parent.parent.parent
@@ -1209,10 +1468,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         return self_test(root)
     try:
         if args.sha256:
-            if args.names or args.pack or args.pack_binary or args.verify_payload:
+            if args.names or args.pack or args.pack_binary or args.verify_payload or args.verify_dist:
                 ap.error("--sha256 takes exactly one FILE and no other mode")
             print(hashlib.sha256(read_once(Path(args.sha256))).hexdigest())
             return 0
+        if args.verify_dist:
+            if args.names or args.pack or args.pack_binary or args.verify_payload or not args.tarball:
+                ap.error("--verify-dist takes DIR, --tarball and --expect-sha256 only")
+            done = verify_dist(Path(args.verify_dist), args.tarball, args.expect_sha256)
+            print(f"verified {args.verify_dist}: {done}, each with its .sha256, only the asserted binary")
+            return 0
+        if args.tarball:
+            ap.error("--tarball is only accepted with --verify-dist")
         if args.verify_payload:
             if args.pack or args.pack_binary:
                 ap.error("--verify-payload takes PACKAGEs and --expect-sha256 only")
