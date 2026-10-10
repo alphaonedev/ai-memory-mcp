@@ -116,7 +116,12 @@ Refused with `ValueError` (#3840, #6267, #6268, #6269):
   that is owned by another user than you or root, or that its group or others
   can write, unless that directory is sticky and the entry in it is yours or
   root's (POSIX, #6559, #6653; a CA in your own subdirectory of `/tmp` is
-  fine); a directory entry that is not a regular file.
+  fine); a path naming a component that does not exist yet under such a
+  directory, sticky or not (#6828); a CA file or CA directory owned by another
+  user than you or root, whatever its mode (POSIX, #6815); a component after
+  a file, such as `ca.pem/.` or `ca.pem/..` (#6811); a directory entry that
+  is not a regular file. A CA file is walked again after it is opened and
+  must still be the file that was opened (#6828).
 - A context with `verify_mode` of `CERT_NONE` or `CERT_OPTIONAL`, or with
   `check_hostname` off.
 - A context with a verify flag that relaxes chain validation, such as

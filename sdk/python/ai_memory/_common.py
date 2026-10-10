@@ -231,6 +231,22 @@ def _refuse_shared_writable(what: str, path: str, mode: int) -> None:
         )
 
 
+def _refuse_foreign_owner(what: str, path: str, info: os.stat_result) -> None:
+    """Refuse a CA file or directory owned by anyone but this user or root (#6815).
+
+    Its owner can rewrite it whatever its mode, exactly as the owner of a
+    directory on the way can replace what is under it (3-agent vote
+    (6def5ab6), StrictModes). POSIX only.
+    """
+    if os.name == "nt" or info.st_uid in (0, os.geteuid()):
+        return
+    raise ValueError(
+        f"verify= {what} {path!r} is owned by uid {info.st_uid}: that user could "
+        "rewrite it and change which servers this client trusts. Give it to this "
+        "user or root (chown), or copy it to a file you own (#6815)."
+    )
+
+
 #: Path separators a CA path may end with; a trailing one names a directory.
 _PATH_SEPARATORS = tuple(sep for sep in (os.sep, os.altsep) if sep)
 
@@ -391,7 +407,8 @@ def _load_trust_file(context: ssl.SSLContext, shown: str, entry: str) -> None:
     would otherwise hang), and must be a regular file that neither it nor its
     directory lets the group or others rewrite; a sticky directory is
     admitted when the file belongs to this user or root, since nobody else
-    can then replace it. The directory's owner must be this user or root.
+    can then replace it. The file's owner and its directory's owner must be
+    this user or root (#6815, 3-agent vote (6def5ab6)).
 
     The opened file is then bound to the rule: ``entry`` is walked again
     AFTER the open, and the entry that walk ends at must be the inode the
@@ -419,6 +436,7 @@ def _load_trust_file(context: ssl.SSLContext, shown: str, entry: str) -> None:
         )
     _refuse_shared_writable("CA file", real, opened.st_mode)
     _refuse_untrusted_holder(shown, os.path.dirname(real), real, opened)
+    _refuse_foreign_owner("CA file", shown, opened)
     walked = _checked_realpath(entry)
     try:
         found = os.lstat(walked)
@@ -468,9 +486,10 @@ def _context_from_path(path: str, *, kind: str | None = None) -> ssl.SSLContext:
     """
     resolved = _checked_realpath(path)
     try:
-        mode = os.stat(resolved).st_mode
+        found: os.stat_result | None = os.stat(resolved)
     except OSError:
-        mode = 0
+        found = None
+    mode = 0 if found is None else found.st_mode
     if path.endswith(_PATH_SEPARATORS) and not stat.S_ISDIR(mode):
         # A trailing separator names a directory: the kernel refuses
         # ``ca.pem/`` (ENOTDIR) even though the walk above drops the empty
@@ -482,8 +501,9 @@ def _context_from_path(path: str, *, kind: str | None = None) -> ssl.SSLContext:
             f"CA path {path!r} is not an existing "
             f"{'regular file' if kind == 'file' else kind} (#6538, #6690)."
         )
-    if stat.S_ISDIR(mode):
+    if stat.S_ISDIR(mode) and found is not None:
         _refuse_shared_writable("CA directory", path, mode)
+        _refuse_foreign_owner("CA directory", path, found)
         context = _pinned_base_context()
         try:
             names = sorted(os.listdir(resolved))

@@ -131,6 +131,15 @@ Decisions below the vote threshold (recorded as `decision:` lines in the commits
   (`drwxrwxr-x` with group `admin`) and Intel-mac `/usr/local` trees; the error names the directory, its owner uid
   and mode, and the fix (`chmod go-w <dir>`, or `chown` for a directory owned by another user), or copy the bundle to
   a private directory. No parameter turns the check off.
+- #6815 (extends the same vote): the CA file itself, and a CA directory, must also be owned by this user or root.
+  Their owner can rewrite them whatever their mode, exactly as a directory's owner can replace what is under it, so
+  a CA file owned by another non-root user is refused where its directory would have been.
+- #6828 (extends the same vote): a component that does not exist yet is held to its directory's rule with no sticky
+  exception, since anyone who can write that directory can create it after the check. After the open the path is
+  walked again and must end at the inode that was opened (`st_dev`, `st_ino` against `fstat`), so a swap between
+  the walk and the open is refused before anything is read; the post-load inode re-check (#6377) remains. A
+  directory or file that vanishes during the check is a `ValueError` (#6829), and a component after a file
+  (`ca.pem/.`, `ca.pem/..`) is refused as ENOTDIR (#6811).
 
 Residuals (accepted, each with its reason):
 - The validity-date check after the handshake reads the leaf only, because `getpeercert()` returns no chain.
