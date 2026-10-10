@@ -86,7 +86,9 @@ within 0.2 s, whatever the host count.  The supervisor also kills psql at its ow
 deadline (the 60 s limit plus 5 s), which covers a helper that is SIGSTOPped (SIGSTOP
 cannot be caught) and keeps the pipe open.  If only the supervisor is killed the helper
 kills its process group.  Only the loss of the helper AND the supervisor together leaves
-psql bounded by the connect timeout alone.
+psql unbounded after authentication: the connect timeout ends only the connect phase,
+and nothing ends an authenticated psql until the server closes the connection (#6673;
+macOS has no parent-death signal and psql 18.6 catches SIGALRM).
 
 Every signal that is valid on the platform and can be caught ends the probe like SIGINT
 (#6504), except the default-ignored, job-control and synchronous-fault signals in

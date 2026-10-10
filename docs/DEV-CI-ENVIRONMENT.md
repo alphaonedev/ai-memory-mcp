@@ -260,7 +260,10 @@ before `CREATE EXTENSION`:
   supervisor that holds the read end of a pipe the helper holds the write end of: when
   the helper dies for any reason, SIGKILL included, the supervisor kills psql within
   0.2 s regardless of the host count (#6517, #6505); the supervisor also enforces its own
-  65 s deadline, which covers a SIGSTOPped helper. Any catchable signal valid on the
+  65 s deadline, which covers a SIGSTOPped helper. Only the loss of the helper AND the
+  supervisor together leaves psql unbounded after authentication: the connect timeout ends only
+  the connect phase, and nothing ends an authenticated psql until the server closes the
+  connection (#6673). Any catchable signal valid on the
   platform (except default-ignored, job-control and fault signals) stops the psql child,
   also when it arrives while it is being spawned (#6337, #6504), and exits 1 with one
   `ensure-age-extension: interrupted` line. Only a `0` or `1` answer counts: a psql that exits
