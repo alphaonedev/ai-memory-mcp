@@ -55,7 +55,9 @@ _CREDENTIAL_WORD = re.compile(
     re.IGNORECASE)
 _PAIR_VALUE = re.compile(r"[^\n]+")
 _EXPRESSION_VALUE = re.compile(r"""['"]?\$\{\{[^'"{}\n]*\}\}['"]*[ \t]*(?=\n|\Z)""")
-_WITHHELD = "<withheld "
+# #6792: ``mask`` keeps a value only when it is exactly one marker that ``mask`` itself wrote, which always runs
+# to the end of its row, so a committed value that merely starts with that text is withheld like any other.
+_WITHHELD_MARK = re.compile(r"<withheld \d+ chars>[ \t]*(?=\n|\Z)")
 
 
 def is_credential_key(name: str) -> bool:
@@ -70,7 +72,7 @@ def mask(text: str) -> str:
     for key in _PAIR_KEY.finditer(text):
         if key.start() < pos or not is_credential_key(key.group(1)):
             continue
-        if text.startswith(_WITHHELD, key.end()) or _EXPRESSION_VALUE.match(text, key.end()):
+        if _WITHHELD_MARK.match(text, key.end()) or _EXPRESSION_VALUE.match(text, key.end()):
             continue
         val = _PAIR_VALUE.match(text, key.end())
         if val is None:
