@@ -105,10 +105,12 @@ impl Capture {
 }
 
 fn assert_no_secret(sink: &str, filter: &str, what: &str) {
-    for secret in SECRETS {
+    for (index, secret) in SECRETS.iter().enumerate() {
         assert!(
             !sink.contains(secret),
-            "#3674: {what} leaked {secret:?} into the log sink under filter {filter:?}:\n{sink}"
+            "#3674: {what} leaked planted SECRETS[{index}] into the log sink under filter \
+             {filter:?} (sink is {} bytes; contents withheld)",
+            sink.len()
         );
     }
 }
