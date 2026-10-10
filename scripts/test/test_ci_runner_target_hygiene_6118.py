@@ -2268,6 +2268,42 @@ class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
                 self.assertEqual([], found)
 
 
+    def _repo_cases(self, cases: List[Tuple[str, str, str]]) -> None:
+        for label, name, text in cases:
+            with self.subTest(label):
+                found = self._repo_mutated(name, text)
+                self.assertTrue(any("R-DEBUG" in v for v in found), (label, found))
+
+    def test_6118_r7_6473_profile_rustflags_and_unstable_switches_are_flagged(self) -> None:
+        cfg = ".cargo/config.toml"
+        self._repo_cases([
+            ("manifest profile rustflags", "Cargo.toml",
+             'cargo-features = ["profile-rustflags"]\n[package]\nname = "x"\n[profile.dev]\nrustflags = ["-g"]\n'),
+            ("manifest package override rustflags", "Cargo.toml",
+             '[profile.dev.package."*"]\nrustflags = ["-C", "debuginfo=2"]\n'),
+            ("config [profile.dev] rustflags", cfg, '[profile.dev]\nrustflags = ["-g"]\n'),
+            ("config [unstable] table", cfg, "[unstable]\nprofile-rustflags = true\n"),
+            ("config dotted unstable key", cfg, "unstable.profile-rustflags = true\n"),
+            ("manifest cargo-features alone", "Cargo.toml", 'cargo-features = ["profile-rustflags"]\n'),
+        ])
+        self._step_cases([
+            ("env RUSTC_BOOTSTRAP", R7_PRE + "        env:\n          RUSTC_BOOTSTRAP: 1\n        run: cargo test\n"),
+            ("env channel override", R7_PRE + "        env:\n          __CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS: nightly\n"
+             "        run: cargo test\n"),
+            ("env CARGO_UNSTABLE_*", R7_PRE + "        env:\n          CARGO_UNSTABLE_PROFILE_RUSTFLAGS: true\n"
+             "        run: cargo test\n"),
+            ("env CARGO_PROFILE_DEV_RUSTFLAGS", R7_PRE + "        env:\n          CARGO_PROFILE_DEV_RUSTFLAGS: -g\n"
+             "        run: cargo test\n"),
+            ("run RUSTC_BOOTSTRAP", R7_PRE + "        run: RUSTC_BOOTSTRAP=1 cargo test\n"),
+            ("run cargo -Z", R7_PRE + "        run: cargo -Zprofile-rustflags test\n"),
+            ("run cargo -Z spaced", R7_PRE + "        run: cargo test -Z unstable-options\n"),
+        ])
+
+    def test_6118_r7_6473_env_table_rustflags_stays_clean(self) -> None:
+        found = self._repo_mutated(".cargo/config.toml", '[env]\nrustflags = "-g"\n')
+        self.assertEqual([], found)
+
+
 class PruneScript6118(unittest.TestCase):
     """scripts/ci/prune-runner-target.py against a fake cargo target tree."""
 
