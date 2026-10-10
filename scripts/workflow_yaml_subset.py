@@ -43,7 +43,9 @@ class Unparsed(Exception):
 # expression with no quote inside is kept, because such a value names a source and is not a literal.
 ECHO_LIMIT = 120
 # #6736 #6737: no word boundary, so a token glued after a letter, digit, ``_`` or ``%3A`` is masked too.
-_TOKEN_SHAPE = re.compile(r"(gh[pousr]_|github_pat_)[A-Za-z0-9_]{8,}")
+# #6791: a prefix whose body is cut short by the end of the masked text is masked too, so a token cut by the
+# mask window of ``clip`` never prints up to seven body characters.
+_TOKEN_SHAPE = re.compile(r"(gh[pousr]_|github_pat_)(?:[A-Za-z0-9_]{8,}|[A-Za-z0-9_]*\Z)")
 # A key (a word, optionally quoted) and its ``:`` or ``=``; the lookbehind starts a match only at the
 # start of a word, so the scan is linear in the text (no nested backtracking).
 _PAIR_KEY = re.compile(r"(?<![\w.-])([\w.-]+)['\"]?[ \t]*[:=][ \t]*")
