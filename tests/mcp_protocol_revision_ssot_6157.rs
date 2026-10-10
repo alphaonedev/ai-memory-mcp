@@ -469,13 +469,48 @@ fn dates(line: &str) -> Vec<&str> {
     found
 }
 
+/// A line that opens with a comment token of the languages the repository
+/// carries (`#`, `//`, `/*`, `*`, `--`, `<!--`).
+fn is_comment_line(line: &str) -> bool {
+    let line = line.trim_start();
+    ["#", "//", "/*", "*", "--", "<!--"]
+        .iter()
+        .any(|token| line.starts_with(token))
+}
+
+/// #6535 residue: the dates a value placed after comment lines carries.
+/// From line index `start` on, every line holding a letter or digit
+/// contributes its dates; the scan ends after the first line that is not a
+/// comment, or at the next marker line (a use of its own).
+fn dates_after_comments<'a>(
+    lines: &[&'a str],
+    start: usize,
+    has_marker: impl Fn(&str) -> bool,
+) -> Vec<(usize, &'a str)> {
+    let mut found = Vec::new();
+    for (m, line) in lines.iter().enumerate().skip(start) {
+        if !line.bytes().any(|b| b.is_ascii_alphanumeric()) {
+            continue;
+        }
+        if has_marker(line) {
+            break;
+        }
+        found.extend(dates(line).into_iter().map(|date| (m + 1, date)));
+        if !is_comment_line(line) {
+            break;
+        }
+    }
+    found
+}
+
 /// Every `(1-based line number, date)` that `text` uses as a
 /// `protocolVersion`: each date on a line that names one of [`MARKERS`],
 /// and (#6535) when such a line carries no date, each date on the next line
 /// that holds an ASCII letter or digit, unless that line names a marker
-/// itself (it is then a use of its own). Only whitespace and punctuation
-/// such as `:` or `=` can sit between a key and its value, so this follows a
-/// value that JSON, YAML, TOML, Rust or TS put on a later line.
+/// itself (it is then a use of its own). Only whitespace, punctuation such
+/// as `:` or `=` and comment lines can sit between a key and its value, so
+/// this follows a value that JSON, YAML, TOML, Rust or TS put on a later
+/// line, past any comment lines in between (their dates count too).
 fn protocol_version_uses(text: &str) -> Vec<(usize, &str)> {
     let has_marker = |line: &str| MARKERS.iter().any(|m| line.contains(m));
     let lines: Vec<&str> = text.lines().collect();
@@ -498,6 +533,9 @@ fn protocol_version_uses(text: &str) -> Vec<(usize, &str)> {
             && !has_marker(next)
         {
             uses.extend(dates(next).into_iter().map(|date| (m + 1, date)));
+            if is_comment_line(next) {
+                uses.extend(dates_after_comments(&lines, m + 1, has_marker));
+            }
         }
     }
     uses
