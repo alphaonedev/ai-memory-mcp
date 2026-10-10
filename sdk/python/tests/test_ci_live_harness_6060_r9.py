@@ -21,6 +21,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -102,3 +103,67 @@ def test_junit_report_is_filtered_7048(tmp_path: Path) -> None:
     assert _KEY.hex() not in junit
     if sys.platform != "win32":
         assert (report.stat().st_mode & 0o777) == 0o600
+
+
+def test_children_do_not_inherit_the_parent_secrets_7049(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    h = _harness()
+    canaries = (
+        "AI_MEMORY_CANARY_DB_URL",
+        "PGPASSWORD",
+        "GITHUB_TOKEN",
+        "ANTHROPIC_API_KEY",
+        "SSH_AUTH_SOCK",
+    )
+    for name in canaries:
+        monkeypatch.setenv(name, "canary-not-for-children")
+    monkeypatch.setenv("PATH", os.environ.get("PATH", "/usr/bin"))
+    stack = h.Stack(Path("/nonexistent/ai-memory"), tmp_path, 1)
+    for env in (stack.env(), h.child_env(SSL_CERT_FILE="x")):
+        leaked = [n for n in canaries if n in env]
+        assert leaked == [], f"children inherit {leaked}"
+        assert "PATH" in env
+    assert h.child_env(A_NAME="v")["A_NAME"] == "v"
+    assert set(h.CHILD_ENV_ALLOW) >= {"PATH"}
+    assert not {n for n in h.CHILD_ENV_ALLOW if re.search(r"TOKEN|SECRET|PASSWORD|KEY|CRED", n)}
+
+
+def test_pytest_child_env_is_the_allow_list_7049(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """run_stack hands pytest ``child_env``, not a copy of ``os.environ``."""
+    h = _harness()
+    monkeypatch.setenv("GITHUB_TOKEN", "canary-not-for-children")
+    seen: dict[str, object] = {}
+
+    class _Stack:
+        run = tmp_path
+        home = tmp_path / "home"
+        signing_key = tmp_path / "agent.priv"
+        socket = tmp_path / "s"
+        bundle = tmp_path / "b"
+        refresh_error = None
+
+        def enroll(self) -> None: ...
+        def start_daemon(self, *_a: object) -> None: ...
+        def start_hub(self) -> None: ...
+        def wait_daemon(self, *_a: object) -> None: ...
+        def close(self) -> None: ...
+
+    stack = _Stack()
+    stack.signing_key.write_bytes(_KEY)
+    key = tmp_path / "key.pem"
+    key.write_bytes(_PEM)
+    monkeypatch.setattr(h, "mint_tls", lambda _d: (tmp_path / "ca.pem", tmp_path / "cert.pem", key))
+
+    def _fake_run(argv: object, *, cwd: object, env: dict[str, str], secrets: object) -> int:
+        seen["env"] = env
+        return 0
+
+    monkeypatch.setattr(h, "run_redacted", _fake_run)
+    h.run_stack(stack, tmp_path, 1)
+    env = seen["env"]
+    assert isinstance(env, dict)
+    assert "GITHUB_TOKEN" not in env
+    assert env["AI_MEMORY_TEST_DAEMON"] == "1"

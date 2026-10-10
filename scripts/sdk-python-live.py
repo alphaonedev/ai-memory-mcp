@@ -274,6 +274,28 @@ def scrub_file(path, secrets):
         raise
 
 
+# The environment a child of this harness gets (#7049). Everything else, above all a
+# CI secret or token in the parent environment, is not inherited.
+CHILD_ENV_ALLOW = (
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "TZ",
+    "TERM",
+    "USER",
+    "LOGNAME",
+    "CI",
+)
+
+
+def child_env(**extra):
+    env = {k: os.environ[k] for k in CHILD_ENV_ALLOW if k in os.environ}
+    env.update(extra)
+    return env
+
+
 def run_redacted(argv, *, cwd, env, secrets):
     """Run ``argv`` with its stdout and stderr filtered through :func:`redact`; return its exit code.
 
@@ -339,15 +361,13 @@ class Stack:
         self.refresh_error = None
 
     def env(self):
-        env = {k: v for k, v in os.environ.items() if not k.startswith("AI_MEMORY_")}
-        env.update(
+        return child_env(
             HOME=str(self.home),
             XDG_CONFIG_HOME=str(self.home / ".config"),
             XDG_DATA_HOME=str(self.home / ".local" / "share"),
             AI_MEMORY_NO_CONFIG="1",
             AI_MEMORY_KEY_DIR=str(self.keys),
         )
-        return env
 
     def cli(self, *args):
         res = subprocess.run([self.binary, *args], env=self.env(), capture_output=True, text=True, check=False)
@@ -586,8 +606,7 @@ def run_stack(stack, sdk, port):
         return 2
 
     report = run / "live-junit.xml"
-    env = {k: v for k, v in os.environ.items() if k not in ("SSL_CERT_DIR", "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY")}
-    env.update(
+    env = child_env(
         SSL_CERT_FILE=str(ca),
         AI_MEMORY_NO_CONFIG="1",
         AI_MEMORY_TEST_DAEMON="1",
