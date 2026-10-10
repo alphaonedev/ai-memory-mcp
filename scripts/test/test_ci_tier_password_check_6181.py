@@ -5,7 +5,10 @@
 
 The "Configure enterprise-fed tier" step must run ``scripts/ci/check-tier-password.py`` as
 ``python3 -I`` on the URL file, before the first psql call, and a non-zero exit must stop the step
-(``exit 1``) with no other branch.  The check is exercised against mutants.  Stdlib only.
+(``exit 1``) with no other branch.  The call must also be reachable (#6671): it sits at the top level of the
+step script, with no ``if``/``case``/loop, function body, brace group or subshell open between
+``set -euo pipefail`` and the call, and the step's ``if:`` line is exactly ``STEP_IF``.  The check is exercised
+against mutants.  Stdlib only.
 """
 
 from pathlib import Path
@@ -20,6 +23,39 @@ CALL = 'if ! python3 -I ' + CHECK + ' --url-file "$url_file"; then'
 READ = 'base_url="$(cat "$url_file")"'
 FIRST_PSQL = re.compile(r'\bpsql\s+"\$')
 STEP_IF = "if: needs.classify.outputs.docs_only != 'true' && matrix.tier == 'enterprise-fed'"
+
+OPENERS = {"if", "case", "for", "while", "until", "select", "{"}
+CLOSERS = {"fi", "esac", "done", "}"}
+QUOTED = re.compile(r"'[^']*'|\"(?:[^\"\\]|\\.)*\"")
+INNER = re.compile(r"\$\([^()]*\)|\(\([^()]*\)\)")
+COMMANDS = re.compile(r";;|&&|\|\||[;&|]")
+
+
+def open_blocks(lines):
+    """Return the shell block depth after ``lines``.
+
+    Comments, quoted text, ``$(...)`` and ``((...))`` are dropped first.  ``if``/``case``/loops, function
+    definitions and brace groups open a block, and so does a command that starts with ``(`` (a subshell, whose
+    ``exit 1`` ends only the subshell); ``fi``/``esac``/``done``/``}`` and a command that starts with ``)`` close
+    one.  A function body is a brace group.  A ``case`` pattern such as ``never)`` starts with a word, so it does
+    not count.  Anything this cannot parse leaves a non-zero depth, so the pin fails closed.
+    """
+    depth = 0
+    for line in lines:
+        code = "" if line.lstrip().startswith("#") else line.split(" #", 1)[0]
+        code = QUOTED.sub("''", code)
+        while INNER.search(code):
+            code = INNER.sub("''", code)
+        for command in COMMANDS.split(code):
+            command = command.strip()
+            depth += command.count("(") if command.startswith("(") else 0
+            depth -= command.count(")") if command.startswith(")") else 0
+            for word in re.findall(r"[{}]|[^\s{}()]+", command):
+                if word in OPENERS:
+                    depth += 1
+                elif word in CLOSERS:
+                    depth -= 1
+    return depth
 
 
 def step_lines(text):
@@ -54,6 +90,14 @@ def wiring_problems(text):
         found.append("the step sets continue-on-error")
     if "Configure enterprise-fed tier" not in step[0]:
         found.append("the check is not in the Configure enterprise-fed tier step")
+    if not any(ln.strip() == STEP_IF for ln in step[1:3]):
+        found.append("the step `if:` must be exactly `" + STEP_IF + "`")
+    set_at = next((j for j, ln in enumerate(step) if ln.strip() == "set -euo pipefail"), None)
+    if set_at is None or set_at > i:
+        found.append("the step must run `set -euo pipefail` before the check")
+    elif open_blocks(step[set_at:i]) != 0 or step[i][:len(step[i]) - len(step[i].lstrip())] != (
+            step[set_at][:len(step[set_at]) - len(step[set_at].lstrip())]):
+        found.append("the check must sit at the top level of the step script (#6671)")
     psql_at = next((j for j, ln in enumerate(step) if FIRST_PSQL.search(ln)), None)
     read_at = next((j for j, ln in enumerate(step) if READ in ln), None)
     if psql_at is None or read_at is None or not (i < read_at < psql_at):
