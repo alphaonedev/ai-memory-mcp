@@ -1847,6 +1847,57 @@ def _self_test_cases() -> int:
 
     guarded("replace objects and grafts cannot approve a range (#6712) fixture", replace_cell)
 
+    # #6798: a commit-graph file (in the repository, or served from an alternate object store) is a third way to change
+    # the parents the base..head walk sees: git takes parent edges from it without checking its checksum. A graph whose
+    # entry for an in-range commit names an approved side commit must not approve the range (git() pins
+    # core.commitGraph=false). The graph is written by git, then one parent entry is rewritten in place.
+    def rewrite_graph_parent(graph, child, new_parent):
+        """Point parent 1 of `child` at `new_parent` inside the commit-graph file `graph` (both are in that graph)."""
+        graph.chmod(0o644)
+        data = bytearray(graph.read_bytes())
+        chunks = {}
+        for i in range(data[6] + 1):
+            chunks[bytes(data[8 + 12 * i:12 + 12 * i])] = int.from_bytes(data[12 + 12 * i:20 + 12 * i], "big")
+        count = int.from_bytes(data[chunks[b"OIDF"] + 255 * 4:chunks[b"OIDF"] + 256 * 4], "big")
+        oids = [bytes(data[chunks[b"OIDL"] + 20 * i:chunks[b"OIDL"] + 20 * (i + 1)]).hex() for i in range(count)]
+        entry = chunks[b"CDAT"] + 36 * oids.index(child) + 20
+        data[entry:entry + 4] = oids.index(new_parent).to_bytes(4, "big")
+        graph.write_bytes(bytes(data))
+
+    def lying_graph_fixture(name):
+        """An unapproved two-commit change plus an approved side commit; returns the repo and its commits."""
+        work, fork_sha, base_root = fresh_pair(name)
+        repo = work / "repo"
+        approved = git(repo, *IDENT, "commit-tree", f"{fork_sha}^{{tree}}", "-p", fork_sha, "-m",
+                       "other change\n\nRule-Change-Approved-By: Justin").decode().strip()
+        git(repo, "update-ref", "refs/heads/approved-side", approved)
+        reword(repo)
+        mid_sha = commit_all(repo, "mid change")
+        head_sha = commit_all(repo, "head change")
+        return work, repo, base_root, fork_sha, approved, mid_sha, head_sha
+
+    def graph_write(where):
+        subprocess.run(["git", "-C", str(where), "-c", "core.commitGraph=true", "commit-graph", "write", "--reachable"],
+                       check=True, capture_output=True)
+
+    def graph_cell():
+        work, repo, base_root, fork_sha, approved, mid_sha, head_sha = lying_graph_fixture("graphrepo")
+        graph_write(repo)
+        rewrite_graph_parent(repo / ".git" / "objects" / "info" / "commit-graph", mid_sha, approved)
+        range_cell("a commit-graph parent entry naming an approved commit does not approve the range (#6798)", work,
+                   base_root, repo, fork_sha, head_sha, True, "no commit in the range carries")
+        work, repo, base_root, fork_sha, approved, mid_sha, head_sha = lying_graph_fixture("graphalt")
+        alt = work / "alt.git"
+        subprocess.run(["git", "clone", "-q", "--bare", "--no-local", str(repo), str(alt)], check=True,
+                       capture_output=True)
+        graph_write(alt)
+        rewrite_graph_parent(alt / "objects" / "info" / "commit-graph", mid_sha, approved)
+        (repo / ".git" / "objects" / "info" / "alternates").write_text(str(alt / "objects") + "\n", encoding="utf-8")
+        range_cell("a commit-graph served by an alternate object store does not approve the range (#6798)", work,
+                   base_root, repo, fork_sha, head_sha, True, "no commit in the range carries")
+
+    guarded("a rewritten commit-graph cannot approve a range (#6798) fixture", graph_cell)
+
     # #6742: the shallow refusal is "anything but a plain `false`". A git too old to know --is-shallow-repository
     # echoes the option name back; that answer must be refused, not read as "not shallow". The stand-in git sits first
     # on PATH and answers only that query, every other call goes to the real git (reviewer mutant X5, `== "true"`).
