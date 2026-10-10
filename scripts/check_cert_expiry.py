@@ -1083,6 +1083,21 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     ])
     fx.reset(base)
 
+    # (x3, #6624) the Binds-to sha has a right boundary: exactly 40 or 64 hex is captured whole, a
+    # 41-, 63- or 65-hex run is refused ("no parseable Binds-to line"), never cut to its first 40.
+    for n, want in ((41, "-"), (63, "-"), (65, "-"), (64, "b" * 64), (40, "b" * 40)):
+        fx.banner("LIVE", "b" * n)
+        bound = cert_banner(repo, fx.commit([CERT_DOC], f"binds {n} hex"))[1]
+        if bound != want:
+            t.fail(f"(x3): a {n}-hex Binds-to parsed as {bound!r}, expected {want!r}")
+        fx.reset(base)
+    fx.banner("LIVE", "b" * 41)
+    bind41 = fx.commit([CERT_DOC], "violate: 41-hex Binds-to")
+    t.expect_red("x3", "a 41-hex Binds-to (truncated to 40 instead of refused)", repo, base, bind41, [
+        ("no parseable Binds-to line", "did not refuse the 41-hex Binds-to"),
+    ])
+    fx.reset(base)
+
     # (y) RED - the cert doc DELETED in the same change as a wire change.
     fx.write(mod_rs, "// mutate\n", append=True)
     fx.g("rm", "-q", CERT_DOC)
