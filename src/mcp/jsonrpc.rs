@@ -179,6 +179,9 @@ mod tests_6157 {
     fn issue_6157_downgrade_diagnostic_clips_long_value_to_first_64_chars() {
         const TOTAL_CHARS: usize = 5000;
         const TAIL_MARKER: &str = "TAIL6157";
+        // Pin the literal: the test name, doc comment and changelog all
+        // promise 64, so a changed const must fail here (round-3 code F4).
+        assert_eq!(DIAGNOSTIC_ECHO_MAX_CHARS, 64);
         let head = "A".repeat(DIAGNOSTIC_ECHO_MAX_CHARS);
         let filler = "~".repeat(TOTAL_CHARS - DIAGNOSTIC_ECHO_MAX_CHARS - TAIL_MARKER.len());
         let asked = format!("{head}{TAIL_MARKER}{filler}");
