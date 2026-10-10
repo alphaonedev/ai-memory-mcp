@@ -512,7 +512,7 @@ impl BootManifest {
                 "db unavailable at {} — proceeding without memory context. \
                  Run `ai-memory doctor` to diagnose. \
                  See https://github.com/alphaonedev/ai-memory-mcp/blob/main/docs/integrations/README.md",
-                db_path.display()
+                crate::url_display::db_path_display(db_path)
             ),
             BootStatus::WarnSchemaUnsupported { db_schema } => format!(
                 "db schema v{db_schema} unsupported by binary {bin_ver} \
@@ -555,7 +555,7 @@ impl BootManifest {
 
         Self {
             version: crate::PKG_VERSION.to_string(),
-            db_path: db_path.display().to_string(),
+            db_path: crate::url_display::db_path_display(db_path),
             schema_version,
             total_memories,
             tier: feature_tier.as_str().to_string(),
@@ -613,7 +613,7 @@ pub fn run(
             writeln!(
                 out.stderr,
                 "ai-memory boot: db unavailable at {}: {e}",
-                db_path.display()
+                crate::url_display::db_path_display(db_path)
             )?;
             if !args.no_header {
                 // v1.0.0 #2445 — a schema-AHEAD refusal is reported as the

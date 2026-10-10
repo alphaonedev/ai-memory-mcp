@@ -325,8 +325,12 @@ fn run_bootstrap_node(
         Ok(_) => {} // sqlite:// URL or no URL — proceed with local sqlite bring-up.
     }
 
-    let conn = crate::db::open(db_path)
-        .with_context(|| format!("bootstrap-node: open db at {}", db_path.display()))?;
+    let conn = crate::db::open(db_path).with_context(|| {
+        format!(
+            "bootstrap-node: open db at {}",
+            crate::url_display::db_path_display(db_path)
+        )
+    })?;
 
     let agent_id = crate::identity::resolve_agent_id(args.agent_id.as_deref(), None)
         .context("bootstrap-node: resolve agent_id")?;
@@ -434,7 +438,7 @@ fn run_bootstrap_node(
             serde_json::json!({
                 "bootstrap_node": true,
                 "backend": "sqlite",
-                "db": db_path.display().to_string(),
+                "db": crate::url_display::db_path_display(db_path),
                 "agent_id": agent_id,
                 "lineage_genesis": lineage_action,
                 "armed_require_modes": armed_modes,
@@ -449,7 +453,11 @@ fn run_bootstrap_node(
             out.stdout,
             "ai-memory audit bootstrap-node (v1.0.0 #3016/#3067 — node bring-up ceremony)"
         )?;
-        writeln!(out.stdout, "  db:              {}", db_path.display())?;
+        writeln!(
+            out.stdout,
+            "  db:              {}",
+            crate::url_display::db_path_display(db_path)
+        )?;
         writeln!(out.stdout, "  agent_id:        {agent_id}")?;
         writeln!(out.stdout, "  lineage-genesis: {lineage_action}")?;
         writeln!(
@@ -725,8 +733,12 @@ const REANCHOR_CHAIN_LABEL: &str = "sqlite:signed_events";
 fn run_re_anchor(args: &ReAnchorArgs, db_path: &Path, out: &mut CliOutput<'_>) -> Result<i32> {
     use crate::signed_events::ReAnchorOutcome;
     use anyhow::Context;
-    let conn = crate::db::open(db_path)
-        .with_context(|| format!("audit re-anchor: open db at {}", db_path.display()))?;
+    let conn = crate::db::open(db_path).with_context(|| {
+        format!(
+            "audit re-anchor: open db at {}",
+            crate::url_display::db_path_display(db_path)
+        )
+    })?;
     let outcome =
         crate::signed_events::emit_reanchor_ceremony(&conn).context("emit re-anchor ceremony")?;
     // Opt-in no-ops (nothing enrolled / nothing to anchor) exit 0; an
@@ -742,7 +754,7 @@ fn run_re_anchor(args: &ReAnchorArgs, db_path: &Path, out: &mut CliOutput<'_>) -
                 let obj = serde_json::json!({
                     "status": "skipped",
                     "reason": reason,
-                    "db": db_path.display().to_string(),
+                    "db": crate::url_display::db_path_display(db_path),
                     "chain": REANCHOR_CHAIN_LABEL,
                 });
                 writeln!(out.stdout, "{obj}")?;
@@ -757,7 +769,7 @@ fn run_re_anchor(args: &ReAnchorArgs, db_path: &Path, out: &mut CliOutput<'_>) -
                 out.stderr,
                 "re-anchor SKIPPED ({reason}) on db {} (chain {REANCHOR_CHAIN_LABEL}): \
                  {guidance}",
-                db_path.display()
+                crate::url_display::db_path_display(db_path)
             )?;
             return Ok(0);
         }
@@ -768,7 +780,7 @@ fn run_re_anchor(args: &ReAnchorArgs, db_path: &Path, out: &mut CliOutput<'_>) -
                     "status": "error",
                     "reason": reason,
                     "detail": detail,
-                    "db": db_path.display().to_string(),
+                    "db": crate::url_display::db_path_display(db_path),
                     "chain": REANCHOR_CHAIN_LABEL,
                 });
                 writeln!(out.stdout, "{obj}")?;
@@ -793,7 +805,7 @@ fn run_re_anchor(args: &ReAnchorArgs, db_path: &Path, out: &mut CliOutput<'_>) -
                     "status": "error",
                     "reason": reason,
                     "detail": detail,
-                    "db": db_path.display().to_string(),
+                    "db": crate::url_display::db_path_display(db_path),
                     "chain": REANCHOR_CHAIN_LABEL,
                 });
                 writeln!(out.stdout, "{obj}")?;
@@ -841,7 +853,7 @@ fn run_re_anchor(args: &ReAnchorArgs, db_path: &Path, out: &mut CliOutput<'_>) -
             "status": if exit == 0 { "ok" } else { "verify_failed" },
             crate::cli::JSON_KEY_CHECKPOINT_ID: cp.id,
             "namespace": cp.namespace,
-            "db": db_path.display().to_string(),
+            "db": crate::url_display::db_path_display(db_path),
             "chain": REANCHOR_CHAIN_LABEL,
             "verified": matches!(readback, ReadBack::Pass),
             "readback": readback.machine_tag(),
@@ -873,7 +885,7 @@ fn run_re_anchor(args: &ReAnchorArgs, db_path: &Path, out: &mut CliOutput<'_>) -
             if exit == 0 { "OK" } else { "WARN" },
             cp.id,
             cp.namespace,
-            db_path.display()
+            crate::url_display::db_path_display(db_path)
         )?;
     }
     Ok(exit)
@@ -923,8 +935,12 @@ fn run_restore_attest(
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
     use anyhow::{Context, bail};
-    let conn = crate::db::open(db_path)
-        .with_context(|| format!("audit restore-attest: open db at {}", db_path.display()))?;
+    let conn = crate::db::open(db_path).with_context(|| {
+        format!(
+            "audit restore-attest: open db at {}",
+            crate::url_display::db_path_display(db_path)
+        )
+    })?;
     let db_head: i64 = conn
         .query_row(crate::signed_events::CHAIN_HEAD_SQL, [], |row| row.get(0))
         .unwrap_or(0);

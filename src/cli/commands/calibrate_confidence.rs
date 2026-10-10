@@ -125,7 +125,7 @@ pub fn run(
     let conn = Connection::open(db_path)?;
     // v1.0.0 #2445 — raw-open WRITE funnel (`calibrate_from_shadow` UPDATEs
     // `confidence_shadow_observations`).
-    crate::storage::assert_schema_not_ahead(&conn, &db_path.display().to_string())?;
+    crate::storage::assert_schema_not_ahead(&conn, &crate::url_display::db_path_display(db_path))?;
     // v1.0.0 #3507 — resolve the sweep's principal BEFORE touching the
     // substrate. A resolution failure refuses the command (exit 2) rather
     // than falling back to the pre-#3507 global aggregate.

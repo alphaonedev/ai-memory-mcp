@@ -165,8 +165,12 @@ pub fn run(
     let agent_id = agent_id.as_str();
     // Open through the migrating funnel so a fresh database carries the v64
     // `lifecycle_state` column — same discipline as `cli::rules::run`.
-    let mut conn = crate::db::open(db_path)
-        .with_context(|| format!("quarantine: open db at {}", db_path.display()))?;
+    let mut conn = crate::db::open(db_path).with_context(|| {
+        format!(
+            "quarantine: open db at {}",
+            crate::url_display::db_path_display(db_path)
+        )
+    })?;
     match &args.action {
         QuarantineAction::List { namespace, limit } => {
             let rows = crate::db::list_quarantined(&conn, namespace.as_deref(), *limit)

@@ -1616,10 +1616,14 @@ pub fn gc_tick_detached(db_path: &Path) -> Result<SweepReport> {
         anyhow::bail!(
             "erasure detached sweep: {} is not a file-backed database — a dedicated \
              connection would open a different (empty) database; use the under-lock tick",
-            db_path.display()
+            crate::url_display::db_path_display(db_path)
         );
     }
-    let conn = crate::storage::open(db_path)
-        .with_context(|| format!("erasure detached sweep: open {}", db_path.display()))?;
+    let conn = crate::storage::open(db_path).with_context(|| {
+        format!(
+            "erasure detached sweep: open {}",
+            crate::url_display::db_path_display(db_path)
+        )
+    })?;
     gc_tick(&conn)
 }

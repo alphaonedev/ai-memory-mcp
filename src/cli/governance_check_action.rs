@@ -169,14 +169,18 @@ pub fn run(
         return run_from_pretool_stdin(db_path, args, out);
     }
 
-    let conn = rusqlite::Connection::open(db_path)
-        .with_context(|| format!("governance check-action: open db at {}", db_path.display()))?;
+    let conn = rusqlite::Connection::open(db_path).with_context(|| {
+        format!(
+            "governance check-action: open db at {}",
+            crate::url_display::db_path_display(db_path)
+        )
+    })?;
     // v1.0.0 #2445 — this funnel does NOT cross `db::open`, and it WRITES (the
     // rule check appends a signed `signed_events` row). Appending to the audit
     // spine of a database whose schema this binary does not understand is the
     // exact corruption the downgrade guard exists to prevent, so the guard is
     // applied directly here. One indexed read; see `schema_guard`.
-    crate::storage::assert_schema_not_ahead(&conn, &db_path.display().to_string())?;
+    crate::storage::assert_schema_not_ahead(&conn, &crate::url_display::db_path_display(db_path))?;
 
     // `--kind` is `required_unless_present = "from_pretool_stdin"`, so it is
     // always `Some` on this (non-stdin) path; the `bail!` is a belt-and-
@@ -529,8 +533,12 @@ fn run_from_pretool_stdin(
         Err(_) => return Ok(()),
     };
 
-    let conn = rusqlite::Connection::open(db_path)
-        .with_context(|| format!("governance check-action: open db at {}", db_path.display()))?;
+    let conn = rusqlite::Connection::open(db_path).with_context(|| {
+        format!(
+            "governance check-action: open db at {}",
+            crate::url_display::db_path_display(db_path)
+        )
+    })?;
     // Tolerate brief write-lock contention with the curator/MCP writers
     // (the rule check emits a signed audit row).
     let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
@@ -538,7 +546,7 @@ fn run_from_pretool_stdin(
     // surface in the product, and it never crosses `db::open`. The guard runs
     // AFTER `busy_timeout` is set so contention with the curator is retried
     // rather than misread as damage.
-    crate::storage::assert_schema_not_ahead(&conn, &db_path.display().to_string())?;
+    crate::storage::assert_schema_not_ahead(&conn, &crate::url_display::db_path_display(db_path))?;
 
     let agent_id = args
         .agent_id

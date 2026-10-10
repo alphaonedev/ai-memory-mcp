@@ -873,7 +873,7 @@ fn record_forensic_outage(
         }
         Err(e) => eprintln!(
             "ai-memory: the forensic-sink outage was NOT recorded in signed_events ({}): {e:#}",
-            db_path.display()
+            ai_memory::url_display::db_path_display(db_path)
         ),
     }
 }

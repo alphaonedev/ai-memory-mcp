@@ -324,8 +324,9 @@ pub fn run(
     // is routed by the dispatcher through [`run_store`] (#3124 R4).
     let db_path = crate::cli::backup::refuse_pg_store(db_path, "reown", out)?;
     let db_path = db_path.as_path();
-    let conn =
-        crate::db::open(db_path).with_context(|| crate::errors::msg::opening(db_path.display()))?;
+    let conn = crate::db::open(db_path).with_context(|| {
+        crate::errors::msg::opening(crate::url_display::db_path_display(db_path))
+    })?;
     if args.needs_confirmation() {
         // #3694 — plan first (a dry run writes nothing), refuse naming the
         // owners the run would take.

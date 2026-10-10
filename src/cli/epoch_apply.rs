@@ -165,8 +165,12 @@ pub fn run(
 
     // Open the sqlite substrate (checkpoints + signed_events + the
     // governance policy surface all live here).
-    let conn = crate::db::open(db_path)
-        .with_context(|| format!("epoch-apply: open db {}", db_path.display()))?;
+    let conn = crate::db::open(db_path).with_context(|| {
+        format!(
+            "epoch-apply: open db {}",
+            crate::url_display::db_path_display(db_path)
+        )
+    })?;
 
     // 4. Strict monotonic epoch advance (epoch_seq == prior + 1).
     let expected_seq = applied_epoch_count(&conn)?;

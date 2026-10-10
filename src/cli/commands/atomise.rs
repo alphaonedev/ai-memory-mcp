@@ -295,7 +295,10 @@ pub fn run_with_curator(
     let conn = match db::open(db_path) {
         Ok(c) => c,
         Err(e) => {
-            let err = AtomiseError::DbError(format!("open {}: {e}", db_path.display()));
+            let err = AtomiseError::DbError(format!(
+                "open {}: {e}",
+                crate::url_display::db_path_display(db_path)
+            ));
             return emit_error(&err, &args.memory_id, args.json, out);
         }
     };

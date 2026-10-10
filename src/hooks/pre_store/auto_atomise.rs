@@ -464,7 +464,7 @@ pub fn run_deferred_atomise(
             tracing::error!(
                 target: AUTO_ATOMISE_TRACE_TARGET,
                 "worker: failed to open db at {} for memory={}: {}",
-                db_path.display(),
+                crate::url_display::db_path_display(db_path),
                 memory_id,
                 e
             );

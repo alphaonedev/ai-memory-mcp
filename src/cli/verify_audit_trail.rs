@@ -106,8 +106,12 @@ pub fn run(
     audit_pubkey: Option<&ed25519_dalek::VerifyingKey>,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
-    let conn =
-        crate::db::open(db_path).with_context(|| format!("open db at {}", db_path.display()))?;
+    let conn = crate::db::open(db_path).with_context(|| {
+        format!(
+            "open db at {}",
+            crate::url_display::db_path_display(db_path)
+        )
+    })?;
     let report =
         crate::signed_events::verify_audit_trail(&conn, args.since.as_deref(), audit_pubkey)
             .context("verify_audit_trail over signed_events")?;

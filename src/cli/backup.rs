@@ -1158,7 +1158,7 @@ pub(crate) fn resolve_sqlite_store(
                         out.stderr,
                         "note: acting on the configured store {} (the --db path {} is not the store)",
                         resolved.display(),
-                        db_path.display()
+                        crate::url_display::db_path_display(db_path)
                     )?;
                 }
                 StoreDisagreement::Refuse => {
@@ -1172,7 +1172,7 @@ pub(crate) fn resolve_sqlite_store(
                          on the command line. Point --db at the configured store, or \
                          unset the store URL for this invocation (#2490).",
                         resolved.display(),
-                        db_path.display()
+                        crate::url_display::db_path_display(db_path)
                     );
                 }
             }

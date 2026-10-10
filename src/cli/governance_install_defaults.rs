@@ -164,13 +164,13 @@ pub fn run(
     let conn = rusqlite::Connection::open(db_path).with_context(|| {
         format!(
             "governance install-defaults: open db at {}",
-            db_path.display()
+            crate::url_display::db_path_display(db_path)
         )
     })?;
     // v1.0.0 #2445 — raw-open WRITE funnel (the `enabled` activation).
     // Enabling authz rules against a schema this binary does not
     // understand is an authz-config write on an unknown-shape table.
-    crate::storage::assert_schema_not_ahead(&conn, &db_path.display().to_string())?;
+    crate::storage::assert_schema_not_ahead(&conn, &crate::url_display::db_path_display(db_path))?;
 
     // Confirm the four rules exist + grab their current state so we
     // can render the preview block and decide what to activate.

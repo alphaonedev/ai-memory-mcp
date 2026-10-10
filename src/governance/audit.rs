@@ -2196,7 +2196,7 @@ pub fn record_forensic_sink_unavailable(
     if !db_path.exists() {
         return Ok(OutageRecord::Skipped(format!(
             "no database exists at {} yet",
-            db_path.display()
+            crate::url_display::db_path_display(db_path)
         )));
     }
     let conn = crate::storage::open_unmigrated(db_path)?;
@@ -2208,7 +2208,7 @@ pub fn record_forensic_sink_unavailable(
                 "the database at {} is not at this binary's schema version {current} \
                  ({other:?}); the recorder never migrates a store, so this boot's outage \
                  is reported only on stderr, by the metric and by `ai-memory doctor`",
-                db_path.display()
+                crate::url_display::db_path_display(db_path)
             )));
         }
     }

@@ -1076,12 +1076,13 @@ pub fn run_daemon(
                 // #2445 — this cycle-loop open is off `db::open` so the
                 // daemon does not pay bootstrap + ladder every interval.
                 // Guard schema-ahead immediately (ERRORS-01, ERRORS-19).
-                if let Err(e) =
-                    crate::storage::assert_schema_not_ahead(&conn, &db_path.display().to_string())
-                {
+                if let Err(e) = crate::storage::assert_schema_not_ahead(
+                    &conn,
+                    &crate::url_display::db_path_display(&db_path),
+                ) {
                     tracing::error!(
                         "curator refused db {} (schema-ahead): {e}",
-                        db_path.display()
+                        crate::url_display::db_path_display(&db_path)
                     );
                     // Fall through to the interval sleep; next cycle retries.
                 } else {
@@ -1129,7 +1130,10 @@ pub fn run_daemon(
                     }
                 }
             }
-            Err(e) => tracing::error!("curator could not open db {}: {e}", db_path.display()),
+            Err(e) => tracing::error!(
+                "curator could not open db {}: {e}",
+                crate::url_display::db_path_display(&db_path)
+            ),
         }
 
         let deadline = Instant::now() + Duration::from_secs(interval);

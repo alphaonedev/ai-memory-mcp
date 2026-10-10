@@ -236,8 +236,12 @@ pub fn run(
     // broke Form-7 governance bootstrap on fresh (esp. postgres-backed)
     // fleet peers where the daemon — which would otherwise have migrated the
     // local sqlite — has not yet started. Surfaced by the do-1461 A2A run.
-    let conn = crate::db::open(db_path)
-        .with_context(|| format!("rules: open db at {}", db_path.display()))?;
+    let conn = crate::db::open(db_path).with_context(|| {
+        format!(
+            "rules: open db at {}",
+            crate::url_display::db_path_display(db_path)
+        )
+    })?;
     // `List` and `Check` are documented read-only / no-key. Resolving the
     // default key dir here made `rules list` refuse on a 0o775 host
     // keystore (#3198) — a silent tightening of "no key required".
@@ -537,7 +541,10 @@ pub fn run(
                 // `--db` sign-seed override must also create the schema on a
                 // fresh path.
                 let conn2 = crate::db::open(&db_path).with_context(|| {
-                    format!("rules.sign-seed: open db at {}", db_path.display())
+                    format!(
+                        "rules.sign-seed: open db at {}",
+                        crate::url_display::db_path_display(&db_path)
+                    )
                 })?;
                 sign_seed_rules(&conn2, resolved_key.as_deref(), json, out)?;
             } else {

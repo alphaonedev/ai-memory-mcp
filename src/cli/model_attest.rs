@@ -105,8 +105,12 @@ pub fn run(
 ) -> Result<()> {
     // Open via the migrating path so the `model_attestations` table (v78)
     // exists on a fresh db — same discipline as `cli::rules::run`.
-    let conn = crate::db::open(db_path)
-        .with_context(|| format!("model-attest: open db at {}", db_path.display()))?;
+    let conn = crate::db::open(db_path).with_context(|| {
+        format!(
+            "model-attest: open db at {}",
+            crate::url_display::db_path_display(db_path)
+        )
+    })?;
 
     match args.action {
         ModelAttestAction::List => {

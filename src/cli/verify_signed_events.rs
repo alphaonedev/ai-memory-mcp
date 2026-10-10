@@ -77,8 +77,12 @@ pub fn run(
     args: &VerifySignedEventsChainArgs,
     out: &mut CliOutput<'_>,
 ) -> Result<i32> {
-    let conn =
-        crate::db::open(db_path).with_context(|| format!("open db at {}", db_path.display()))?;
+    let conn = crate::db::open(db_path).with_context(|| {
+        format!(
+            "open db at {}",
+            crate::url_display::db_path_display(db_path)
+        )
+    })?;
     let since = if args.since > 0 {
         Some(args.since)
     } else {

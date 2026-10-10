@@ -1312,6 +1312,12 @@ jobs:
         run: bash scripts/check-url-sink-redaction.sh
       - name: Self-test the gate (regression evidence)
         run: bash scripts/check-url-sink-redaction.sh --self-test
+      # #6698 — a database-path value renders only through
+      # `url_display::db_path_display` (a mistyped DSN lands in `--db`).
+      - name: Run db-path display gate (#6698)
+        run: python3 scripts/check-db-path-display.py
+      - name: Self-test the db-path display gate (regression evidence)
+        run: python3 scripts/check-db-path-display.py --self-test
 
   stale-contract-assertions-gate:
     # #3688 gate 4 — a lane that changes a string literal in src/ that some
