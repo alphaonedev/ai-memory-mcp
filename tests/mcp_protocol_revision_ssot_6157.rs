@@ -44,9 +44,18 @@ const MARKERS: [&str; 3] = ["protocolVersion", "Protocol version", "speaks MCP"]
 /// The root directory holding the vendored upstream `paste` crate. The walk
 /// skips it by exact root path, never by name at any depth.
 const VENDOR_DIR: &str = "vendor";
-const EXTENSIONS: [&str; 14] = [
-    "rs", "md", "html", "sh", "py", "json", "ts", "tsx", "mjs", "cjs", "js", "toml", "yml", "yaml",
+/// #6522: every file the walk reaches is read except these binary formats,
+/// which cannot carry a `protocolVersion` line and are not UTF-8 (matched
+/// case-insensitively, skipped without reading). Any other file that is not
+/// UTF-8 still fails the pin closed. The tracked tree holds one `.pdf` and
+/// one `.jpg`; the rest are common binary artefacts a developer tree holds.
+const BINARY_EXTENSIONS: [&str; 17] = [
+    "png", "jpg", "jpeg", "gif", "ico", "webp", "pdf", "woff", "woff2", "ttf", "otf", "db",
+    "sqlite", "gz", "tgz", "zip", "wasm",
 ];
+/// macOS Finder metadata: binary, never tracked, and not gitignored by the
+/// root `.gitignore` (only by the client shims' own files).
+const BINARY_FILE_NAMES: [&str; 1] = [".DS_Store"];
 /// This file documents the pattern and names example strings.
 const SELF: &str = "tests/mcp_protocol_revision_ssot_6157.rs";
 /// Lower bounds that prove the walk still reaches the tree (round 2 widened
@@ -366,16 +375,22 @@ fn walk_dir(
         }
         if file_type.is_dir() {
             walk_dir(root, &path, rules, out, unreadable);
-        } else if file_type.is_file()
-            && path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| EXTENSIONS.contains(&e))
-        {
+        } else if file_type.is_file() && !is_binary(name) {
             out.push(path);
         }
     }
     rules.truncate(depth);
+}
+
+/// A file the walk skips without reading (#6522): a known binary name or
+/// extension.
+fn is_binary(name: &str) -> bool {
+    BINARY_FILE_NAMES.contains(&name)
+        || name.rsplit_once('.').is_some_and(|(_, ext)| {
+            BINARY_EXTENSIONS
+                .iter()
+                .any(|b| b.eq_ignore_ascii_case(ext))
+        })
 }
 
 /// Every `20dd-dd-dd` token on `line`.
