@@ -324,8 +324,12 @@ mod tests {
         let screened = screen_dsn(&dsn);
         assert_eq!(screened.removed_positions, vec![2, 3, 4, 6]);
         let out = screened.dsn.as_ref();
-        for secret in ["S1", "S2", "S3", "S4"] {
-            assert!(!out.contains(secret), "{secret} survived: {out}");
+        for (i, secret) in ["S1", "S2", "S3", "S4"].iter().enumerate() {
+            // #6098: name the fixture by index, never by value or rendering.
+            assert!(
+                !out.contains(secret),
+                "#6098: fixture {i} survived the screen"
+            );
         }
         let url = reqwest::Url::parse(out).expect("screened DSN parses");
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -398,10 +402,6 @@ mod tests {
         let Err(err) = floored_connect_options(dsn) else {
             panic!("an unknown ssl-mode value is refused");
         };
-        assert!(
-            matches!(err, FlooredConnectError::Parse(_)),
-            "the text floor pinned the host, so sqlx's parse is what failed: {err:?}"
-        );
         for rendering in [format!("{err}"), format!("{err:?}")] {
             for (i, secret) in [
                 "pasted-s3cr3t-4934",
@@ -427,11 +427,16 @@ mod tests {
                 "the host an operator needs is still named: {rendering}"
             );
         }
+        // #6098: printed only after the absence loops above have run, so a
+        // regression that both leaks and changes the variant cannot print it.
+        assert!(
+            matches!(err, FlooredConnectError::Parse(_)),
+            "the text floor pinned the host, so sqlx's parse is what failed: {err:?}"
+        );
         // Non-numeric port: a second parse-failure shape stays clean.
         let dsn = "postgres://u:pw4934@db.internal/mem?sslmode=verify-full&sslpassword=SECRETQ4934&port=notaport";
         let err = evaluate(dsn).expect_err("a non-numeric port must not parse");
         let shown = format!("{err}");
-        assert!(shown.contains("db.internal"), "{shown}");
         for (i, secret) in ["SECRETQ4934", "pw4934", "sslpassword", "notaport"]
             .iter()
             .enumerate()
@@ -441,6 +446,9 @@ mod tests {
                 "#4934: fixture {i} leaked in the non-numeric-port shape"
             );
         }
+        // #6098: after the absence loop, so the rendering is printed only
+        // once it is known to carry no fixture.
+        assert!(shown.contains("db.internal"), "{shown}");
     }
 
     /// The test module's own source with the pin below cut out, so the pin's
