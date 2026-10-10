@@ -927,6 +927,16 @@ R11_CELLS = (
 
 
 # Round 12: one table, cells named for the issue they pin.
+R12_BASE = "Clause (c) applies.\nOther (c) item.\n"
+R12_FRAG = "docs/compliance/A.md:c:2\n"
+R12_JOIN = "joins into script name `check-gone.sh`"
+
+
+def r12_swap(join):
+    """R12_BASE with its first allowlisted ``(c)`` replaced by ``join`` (fragment count unchanged)."""
+    return R12_BASE.replace("(c)", join, 1)
+
+
 R12_CELLS = (
     # #6622: an image (``!``) or inline math (``$``, ``{``, ``}``) between the pieces of a name.
     ("M-image-adjacent", "Run check-![](x)old.sh daily.\n", "", 1, "fragment `check-` is followed by '!'"),
@@ -934,6 +944,30 @@ R12_CELLS = (
     ("M-math-text", "Run $\\text{check-old}$.sh daily.\n", "", 1, "fragment `check-old` is followed by '}'"),
     ("M-math-wrap", "Run $check$-old.sh daily.\n", "", 1, "fragment `check` is followed by '$'"),
     ("M-math-brace", "Run $check{-old}.sh$ daily.\n", "", 1, "fragment `check` is followed by '{'"),
+    # #6621, #6631: an allowlisted prose fragment re-used to join a script name, count unchanged.
+    ("L-frag-base", R12_BASE, R12_FRAG, 0, None),
+    ("L-frag-swap-comment", r12_swap("(c<!-- -->heck-gone.sh)"), R12_FRAG, 1, R12_JOIN),
+    ("L-frag-swap-tag", r12_swap("(c<b></b>heck-gone.sh)"), R12_FRAG, 1, R12_JOIN),
+    ("L-frag-swap-code", r12_swap("(`c`heck-gone.sh)"), R12_FRAG, 1, R12_JOIN),
+    ("L-frag-swap-link", r12_swap("([c](#)heck-gone.sh)"), R12_FRAG, 1, R12_JOIN),
+    ("L-frag-swap-img", r12_swap("(c![](x)heck-gone.sh)"), R12_FRAG, 1, R12_JOIN),
+    ("L-frag-swap-hidden", r12_swap("(c<s hidden>x</s>heck-gone.sh)"), R12_FRAG, 1, R12_JOIN),
+    ("L-frag-swap-quoted", r12_swap('(c<b title="a>b">heck-gone.sh)'), R12_FRAG, 1, R12_JOIN),
+    ("L-frag-swap-reflink", r12_swap("([c][r]heck-gone.sh)"), R12_FRAG, 1, R12_JOIN),
+    ("L-frag-swap-break", r12_swap("c\nheck-gone.sh"), R12_FRAG, 1, R12_JOIN),
+    ("L-frag-swap-unclosed", r12_swap("(c<b\nclass=x\ntitle=y>heck-gone.sh)"), R12_FRAG, 1, "cannot resolve"),
+    ("L-frag-swap-check", "Use check<!-- -->_gone.py now.\n", "docs/compliance/A.md:check:1\n", 1,
+     "joins into script name `check_gone.py`"),
+    ("L-frag-swap-escape", "Use (check\\-gone.sh) now.\n", "docs/compliance/A.md:check:1\n", 1, R12_JOIN),
+    ("L-frag-swap-long", "Calls `check_agent_action`<b></b>.sh here.\n", "docs/compliance/A.md:check_agent_action:1\n",
+     1, "joins into script name `check_agent_action.sh`"),
+    ("S-enterprise-c", "### Minting conditions (a)\u2013(c<!-- -->heck-gone.sh\n", "docs/compliance/A.md:c:1\n", 1,
+     R12_JOIN),
+    ("S-nsa-check_agent_action", "Calls check_agent_action<!-- -->.sh here.\n",
+     "docs/compliance/A.md:check_agent_action:1\n", 1, "joins into script name `check_agent_action.sh`"),
+    ("S-inventory-check", "| x | (cross-PR check<!-- -->-gone.sh |\n", "docs/compliance/A.md:check:1\n", 1, R12_JOIN),
+    ("S-inventory-c", "Per recommendation c<!-- -->heck-gone.sh \u2014 done.\n", "docs/compliance/A.md:c:1\n", 1,
+     R12_JOIN),
 )
 
 
