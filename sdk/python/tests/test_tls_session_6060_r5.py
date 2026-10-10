@@ -1055,5 +1055,75 @@ def test_verified_session_stream_is_left_open_6361(is_async: bool) -> None:
     assert stream.closes == 0
 
 
+# ---- #6362: a trace already on the request is chained after the SDK's ------
+
+
+def _chained(
+    context: ssl.SSLContext, *, is_async: bool, inherited_async: bool
+) -> tuple[Callable[[str, dict[str, Any]], None], list[str]]:
+    """Run the SDK request hook on a request that already carries a trace."""
+    seen: list[str] = []
+
+    def inherited(event: str, _info: dict[str, Any]) -> None:
+        seen.append(event)
+
+    async def ainherited(event: str, info: dict[str, Any]) -> None:
+        inherited(event, info)
+
+    request = httpx.Request(
+        "GET", _ORIGIN + "/x", extensions={"trace": ainherited if inherited_async else inherited}
+    )
+    hook = _Driver(context, is_async=is_async).hooks["request"][0]
+    if is_async:
+        asyncio.run(hook(request))
+    else:
+        hook(request)
+    trace = request.extensions["trace"]
+
+    def fire(event: str, info: dict[str, Any]) -> None:
+        if is_async:
+            asyncio.run(trace(event, info))
+        else:
+            trace(event, info)
+
+    return fire, seen
+
+
+_CHAIN_SHAPES = [
+    pytest.param(False, False, id="sync"),
+    pytest.param(True, True, id="async-inherits-async"),
+    pytest.param(True, False, id="async-inherits-sync"),
+]
+
+
+@pytest.mark.parametrize(("is_async", "inherited_async"), _CHAIN_SHAPES)
+def test_inherited_trace_still_receives_every_event_6362(
+    is_async: bool, inherited_async: bool
+) -> None:
+    context = ssl.create_default_context()
+    fire, seen = _chained(context, is_async=is_async, inherited_async=inherited_async)
+    fire("connection.connect_tcp.complete", {"return_value": object()})
+    fire("connection.start_tls.complete", {"return_value": _Stream(_Session(context))})
+    fire("http11.send_request_headers.started", {"request": _get_request()})
+    assert seen == [
+        "connection.connect_tcp.complete",
+        "connection.start_tls.complete",
+        "http11.send_request_headers.started",
+    ]
+
+
+@pytest.mark.parametrize(("is_async", "inherited_async"), _CHAIN_SHAPES)
+def test_sdk_check_runs_before_the_inherited_trace_6362(
+    is_async: bool, inherited_async: bool
+) -> None:
+    context = ssl.create_default_context()
+    fire, seen = _chained(context, is_async=is_async, inherited_async=inherited_async)
+    stream = _Stream(_Session(ssl.create_default_context(), host="elsewhere.lab"))
+    with pytest.raises(ValueError, match="verify=False"):
+        fire("proxy.start_tls.complete", {"return_value": stream})
+    assert seen == []  # refused before the inherited trace saw the session
+    assert stream.closed
+
+
 def test_lab_temp_root_is_project_local_6309(lab: Lab) -> None:
     assert ".local-runs" in pathlib.Path(lab.ca_path).resolve().parts
