@@ -621,8 +621,11 @@ class Round11EchoMask(unittest.TestCase):
                     "curl -u user:" + self.TAIL, "my key: " + self.TAIL, "- two words " + self.TAIL,
                     # #6948 #6950: the key word is [\w.-] only, so URL userinfo or a comma list is value text.
                     "user:" + self.TAIL + "@host=1", "https://u:" + self.TAIL + "@h: x",
-                    "https://u:" + self.TAIL + "@h=1", "a,b," + self.TAIL + ": x"):
+                    "https://u:" + self.TAIL + "@h=1", "a,b," + self.TAIL + ": x",
+                    # #6951: a bare colon is not a separator.
+                    self.TAIL + ":rest"):
             self.assertNotIn(self.TAIL, SUBSET.echo(row), row)
+        self.assertEqual(SUBSET.echo("  " + self.TAIL + ":x y"), repr("  <withheld 15 chars>"))
         self.assertEqual(SUBSET.echo("      PASSWORD: hunter2"), repr("      PASSWORD: <withheld 7 chars>"))
         self.assertEqual(SUBSET.echo("  - name: q"), repr("  - name: <withheld 1 chars>"))
         self.assertEqual(SUBSET.echo("PASSWORD:"), repr("PASSWORD:"))
