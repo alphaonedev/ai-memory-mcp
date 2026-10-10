@@ -138,3 +138,20 @@ pub const METHOD_RESOURCES_LIST: &str = "resources/list";
 /// `resources/read` — resource fetch (declared for wire-shape
 /// completeness; see [`METHOD_RESOURCES_LIST`]).
 pub const METHOD_RESOURCES_READ: &str = "resources/read";
+
+#[cfg(test)]
+mod tests_6157 {
+    use super::*;
+
+    /// #6157 round 2: `PROTOCOL_REVISION` was public at v0.9.0; the
+    /// deprecated alias must keep compiling for downstream callers and
+    /// must equal the revision `initialize` answers by default.
+    #[test]
+    #[allow(deprecated)]
+    fn issue_6157_deprecated_protocol_revision_alias_is_the_negotiated_default() {
+        let (answered, downgraded) = negotiate_protocol_revision(&serde_json::json!({}));
+        assert!(downgraded, "a missing protocolVersion is a downgrade");
+        assert_eq!(PROTOCOL_REVISION, answered);
+        assert_eq!(PROTOCOL_REVISION, NEWEST_PROTOCOL_REVISION);
+    }
+}
