@@ -1476,6 +1476,8 @@ def r12_timed_cells(base, expect, cells=R12_TIMED, bound=R12_TIME_BOUND, tag="R1
 # whole paragraph (up to the next blank line), however many lines it spans; a construct that does
 # not close within the paragraph and the JOIN_WINDOW cap is unresolved.
 R13_FRAG1 = "docs/compliance/A.md:c:1\n"
+R14_FRAG_CHECK = "docs/compliance/A.md:check:1\n"
+R14_JOIN_UNDERSCORE = "joins into script name `check_gone.sh`"
 R13_JOIN_OLD = "joins into script name `check-old.sh`"
 R13_CELLS = (
     # Code review round 12 fixtures (#6753).
@@ -1532,6 +1534,13 @@ R14_CELLS = (
     # on the third line of a comment still joins the name (a decoded-view read would miss it).
     ("J6930-3line-combining-mark", "Run c<!-- a\nx > y\n-->h\u0301eck-gone.sh now.\n", R13_FRAG1, 1, R12_JOIN),
     ("J6930-3line-en-dash", "Run c<!-- a\nx > y\n-->heck\u2013gone.sh now.\n", R13_FRAG1, 1, R12_JOIN),
+    # #6943: the decoded view reads the decoded rest of the paragraph, so an invisible character before
+    # `_gone.sh` on the closing line of a comment still joins the name (a raw-view read would miss it,
+    # and the folded view strips the edge underscore).
+    ("J6943-3line-zero-width-underscore", "Run check<!-- a\nx > y\n-->\u200b_gone.sh now.\n", R14_FRAG_CHECK, 1,
+     R14_JOIN_UNDERSCORE),
+    ("J6943-2line-word-joiner-underscore", "Run check<!-- a\n-->\u2060_gone.sh now.\n", R14_FRAG_CHECK, 1,
+     R14_JOIN_UNDERSCORE),
     # #6857: a rooted citation (a URL before `scripts/`) is measured from its `scripts` component, so a
     # run longer than PATH_LIMIT whose rooted target is short and exists stays green.
     ("P6857-rooted-long-url-existing", "See https://" + "h" * 4100 + "/scripts/check_new.py here.\n", "", 0, None),
