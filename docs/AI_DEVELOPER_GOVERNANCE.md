@@ -685,9 +685,10 @@ boundary** and at the **agent boundary**:
 2. **Merge boundary (mechanical).** The required context
    `External-PR operator-approval gate (author outside team => @alphaonedev review)`
    (`.github/workflows/c8-precheck.yml`) hard-fails for an external
-   contribution unless the accountable biological operator (`@alphaonedev`)
-   has submitted an **APPROVED GitHub review on the PR's current head SHA**.
-   A new push voids it. The gate runs on every event (#6193): a push run on a
+   contribution unless the accountable biological operator's (`@alphaonedev`)
+   **latest review of the PR's current head SHA is an APPROVED GitHub review**;
+   a later "Request changes" or a dismissal revokes it (#6329). A new push
+   voids it. The gate runs on every event (#6193): a push run on a
    sha judges every open PR whose head is that sha by the same rule, a
    merge-queue run judges the PR named by the queue ref (#6227), and any API
    error fails closed. A push run therefore reports no pass beside a failing
