@@ -87,14 +87,21 @@ pub fn mcp_error_text(e: &MemoryError) -> String {
 /// is the whole diagnosis on an MCP stdio daemon (no `/metrics` there). An
 /// own-vocabulary result (a typed `StorageError` / governance refusal that
 /// rode an `anyhow` chain) logs at `warn`, since the caller already has it.
-pub fn log_foreign<E: Into<MemoryError>>(context: &'static str, e: E) -> MemoryError {
+pub fn log_foreign<E: Into<MemoryError> + 'static>(context: &'static str, e: E) -> MemoryError {
+    // #6147 / #6457 - the operator detail is the WHOLE `anyhow` chain
+    // (`{e:#}`), captured before the typed conversion: `From<anyhow::Error>`
+    // renders only the outermost context, which dropped a context-wrapped
+    // driver root. The caller text is derived from the returned class only,
+    // so it is unchanged.
+    let chain = anyhow_chain(&e);
     let e = e.into();
+    let detail = chain.unwrap_or_else(|| e.message());
     if e.is_foreign_class() {
         tracing::error!(
             target: TRACE_TARGET,
             context,
             code = e.code(),
-            detail = %e.message(),
+            detail = %detail,
             "#3713: foreign error kept on the operator log; the caller receives the class"
         );
     } else {
@@ -102,16 +109,25 @@ pub fn log_foreign<E: Into<MemoryError>>(context: &'static str, e: E) -> MemoryE
             target: TRACE_TARGET,
             context,
             code = e.code(),
-            detail = %e.message(),
+            detail = %detail,
             "#3713: typed refusal passed through to the caller"
         );
     }
     e
 }
 
+/// The alternate render of an `anyhow` chain, or `None` for any other error
+/// type (whose own conversion already carries its full text). Operator log
+/// only; never rendered to a caller.
+fn anyhow_chain<E: 'static>(e: &E) -> Option<String> {
+    (e as &dyn std::any::Any)
+        .downcast_ref::<anyhow::Error>()
+        .map(|chain| format!("{chain:#}"))
+}
+
 /// The one-token site edit: log the foreign detail for the operator and
 /// return the caller-safe text — `.map_err(|e| mcp_foreign_err("ctx", e))?`.
-pub fn mcp_foreign_err<E: Into<MemoryError>>(context: &'static str, e: E) -> String {
+pub fn mcp_foreign_err<E: Into<MemoryError> + 'static>(context: &'static str, e: E) -> String {
     mcp_error_text(&log_foreign(context, e))
 }
 
