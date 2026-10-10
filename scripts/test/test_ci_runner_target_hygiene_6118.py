@@ -2909,6 +2909,42 @@ class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
             + "".join("          %s\n" % line for line in body.splitlines()) + "          EOF\n")
         self.assertTrue(self._flagged(found), found)
 
+    # ---- #6484: each strict-reader refusal is load-bearing on its own ----
+
+    def _refused(self, found: List[str], fragment: str) -> bool:
+        return any(v.startswith("R-SHAPE") and fragment in v for v in found)
+
+    def test_6118_r7_6484_each_refusal_names_its_construct_with_a_benign_payload(self) -> None:
+        # The payload is plain `cargo test`, so only the refusal itself can produce a finding: a reader
+        # that skipped or accepted the construct would return [] (mutants G05..G09).
+        steps = [
+            ("unknown step key", R7_PRE + "        frobnicate: yes\n        run: cargo test --no-run\n",
+             "key 'frobnicate'"),
+            ("duplicate step key", R7_PRE + "        run: cargo test --no-run\n        run: cargo test --no-run\n",
+             "duplicate step key 'run'"),
+            ("anchor on run", R7_PRE + "        run: &x cargo test --no-run\n", "anchor, alias or tag"),
+            ("tag on run", R7_PRE + "        run: !!str cargo test --no-run\n", "anchor, alias or tag"),
+            ("anchor on a with: input", R7_PRE + "        uses: actions/checkout@v4\n        with:\n"
+             "          fetch-depth: &d 0\n", "anchor, alias or tag"),
+            ("tab-indented step row", R7_PRE + "        run: cargo test --no-run\n\t       name2: x\n",
+             "tab indentation"),
+        ]
+        for label, step_yaml, fragment in steps:
+            with self.subTest(label):
+                found = self._before_prune(step_yaml)
+                self.assertTrue(self._refused(found, fragment), (label, found))
+        jobs = [
+            ("unknown job key", "    frobnicate: yes\n", "key 'frobnicate'"),
+            ("duplicate job key", "    timeout-minutes: 5\n    timeout-minutes: 6\n", "duplicate job key"),
+        ]
+        for label, job_yaml, fragment in jobs:
+            with self.subTest(label):
+                found = self._mutated(_replace_once(self.ci, CHECK_RUNS_ON, CHECK_RUNS_ON + job_yaml))
+                self.assertTrue(self._refused(found, fragment), (label, found))
+        with self.subTest("unknown workflow key"):
+            found = self._mutated(_replace_once(self.ci, "\njobs:\n", "\nfrobnicate: yes\njobs:\n"))
+            self.assertTrue(self._refused(found, "key 'frobnicate'"), found)
+
 class PruneScript6118(unittest.TestCase):
     """scripts/ci/prune-runner-target.py against a fake cargo target tree."""
 
