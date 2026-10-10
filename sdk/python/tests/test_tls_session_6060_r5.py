@@ -1743,3 +1743,45 @@ def test_symlink_chain_over_the_hop_cap_is_refused_6660(
     over = _link_chain(tmp_path, bundle, _common._MAX_SYMLINK_HOPS + 1)
     with pytest.raises(ValueError, match="too many symlinks"):
         _built(client_cls, str(over))
+
+
+# ---- #6695 / #6655: the sticky exception needs an entry owned by us or root -
+
+
+_FOREIGN_UID = os.geteuid() + 4242 if os.name != "nt" else 4242
+
+
+def _as_foreign(real: Callable[..., os.stat_result], inode: tuple[int, int]) -> Callable[..., Any]:
+    """``real`` (``os.lstat``/``os.fstat``), reporting ``inode`` as owned by another uid."""
+
+    def stat_as_foreign(target: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        result = real(target, *args, **kwargs)
+        if (result.st_dev, result.st_ino) != inode:
+            return result
+        fields = list(result[:10])
+        fields[4] = _FOREIGN_UID  # st_uid
+        return os.stat_result(fields)
+
+    return stat_as_foreign
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("owner", ["self", "foreign"])
+def test_ca_file_in_a_sticky_directory_needs_an_owned_file_6695(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    owner: str,
+) -> None:
+    sticky = _ca_dir(tmp_path, "sticky", 0o755)
+    bundle = _bundle(lab, sticky)
+    sticky.chmod(0o1777)
+    if owner == "self":
+        _built(client_cls, str(bundle))
+        return
+    found = os.stat(bundle)
+    monkeypatch.setattr(os, "fstat", _as_foreign(os.fstat, (found.st_dev, found.st_ino)))
+    with pytest.raises(ValueError, match="writable"):
+        _built(client_cls, str(bundle))
