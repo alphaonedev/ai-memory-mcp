@@ -3480,6 +3480,15 @@ def _ws_format_cells(t):
                     absent=("U+00A0, U+00A0",))
     _ws_format_cell(t, "tr-s-ws-dedup-order", "name: u\n# a　b c d\n#  \n",
                     ("lines 2, 3 (2 in this file)", "(U+3000, U+00A0)"))
+    # #6762: the "+K more" marker starts above eight items, never at exactly eight.
+    eight = "name: u\n" + "".join(f"#{chr(c)}\n" for c in WS_NINE[:8])
+    _ws_format_cell(t, "tr-s-ws-eight", eight, (
+        "lines 2, 3, 4, 5, 6, 7, 8, 9 (8 in this file)",
+        "(U+00A0, U+1680, U+2000, U+2001, U+2002, U+2003, U+2004, U+2005)"), absent=("more",))
+    nine = "name: u\n" + "".join(f"#{chr(c)}\n" for c in WS_NINE)
+    _ws_format_cell(t, "tr-s-ws-nine-unit", nine, (
+        "lines 2, 3, 4, 5, 6, 7, 8, 9, +1 more (9 in this file)",
+        "U+2005, +1 more)"))
 
 
 def _ws_wording_cells(t):
