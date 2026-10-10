@@ -1485,6 +1485,9 @@ R13_CELLS = (
     ("P-cap-paren", "Run c(x " + "y" * 600 + ")\n", R13_FRAG1, 1, R12_UNRESOLVED),
     ("P-cap-tag", 'Run c<b title="' + "y" * 600 + '"> end.\n', R13_FRAG1, 1, R12_UNRESOLVED),
     ("P-cap-tag-gt", 'Run c<b title="x>' + "y" * 600 + '">heck-gone.sh\n', R13_FRAG1, 1, R12_UNRESOLVED),
+    # #6754: a fragment that ends its line, followed by a next line longer than the window whose
+    # markup only reaches the name past the cut, is unresolved (the next line is truncated too).
+    ("next-trunc2", "Run c\n" + "<b></b>" * 90 + "heck-old.sh daily.\n", R13_FRAG1, 1, R12_UNRESOLVED),
 )
 
 # #6753, #6757: in-place edits of the real tree (a copy of docs/compliance and scripts next to the
