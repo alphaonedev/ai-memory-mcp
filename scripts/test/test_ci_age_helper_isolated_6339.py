@@ -25,6 +25,10 @@ and added to the allowlist.
 unsets or reads it, and the matrix still has the ``macos-fed`` / ``enterprise-fed`` entry, so the guard can
 neither be fed another value nor silently never match.
 
+#6886 pins the classify-job step that runs the helper's own unit suite: exactly one step names
+``test_ensure_age_extension_6161.py`` and it is exactly the two reviewed lines (no ``|| true``, no
+``continue-on-error``, no ``if:``), and the classify job itself has no ``if:`` or ``continue-on-error``.
+
 Rule: every ci.yml line that runs ``ensure-age-extension.py`` through python3 passes ``-I``
 before the script path, and at least one such invocation exists (a rename must not make
 the pin vacuous).  The check is exercised against a mutant that drops ``-I``.
@@ -178,6 +182,40 @@ def node_provenance_problems(text):
     return found
 
 
+HELPER_SUITE = "scripts/test/test_ensure_age_extension_6161.py"
+HELPER_SUITE_STEP = ["- name: AGE self-heal helper unit test (#6161)", "run: python3 " + HELPER_SUITE]
+
+
+def classify_job(text):
+    """The lines of the ``classify`` job."""
+    lines = text.splitlines()
+    start = lines.index("  classify:")
+    end = next((i for i in range(start + 1, len(lines)) if re.match(r"^  \S", lines[i])), len(lines))
+    return lines[start:end]
+
+
+def classify_problems(text):
+    """#6886: the classify job runs the helper suite in exactly one reviewed step that cannot pass on failure."""
+    job = classify_job(text)
+    found = []
+    for ln in job:
+        if re.match(r"^    (?:if|continue-on-error)\s*:", ln):
+            found.append(f"the classify job sets a job-level key that can skip or excuse it: {ln.strip()[:60]}")
+    steps, current = [], None
+    for ln in job:
+        if re.match(r"^      - ", ln):
+            current = []
+            steps.append(current)
+        if current is not None and ln.strip() and not ln.strip().startswith("#"):
+            current.append(ln.strip())
+    runs = [step for step in steps if any("test_ensure_age_extension_6161" in ln for ln in step)]
+    if len(runs) != 1:
+        found.append(f"the classify job must run the helper suite in exactly one step, found {len(runs)}")
+    elif runs[0] != HELPER_SUITE_STEP:
+        found.append("the helper-suite step must be exactly the reviewed name and run lines")
+    return found
+
+
 def helper_invocations(text):
     """Lines that run the helper through python3."""
     return [ln for ln in text.splitlines() if HELPER in ln and re.search(r"\bpython3\b", ln)]
@@ -228,6 +266,29 @@ class TestAgeHelperIsolated6339(unittest.TestCase):
             with self.subTest(mutant=name):
                 self.assertEqual(text.count(old), 1, f"ci.yml no longer holds the text mutated by {name!r}")
                 self.assertTrue(node_provenance_problems(text.replace(old, new, 1)), f"mutant not caught: {name}")
+
+    def test_the_classify_job_runs_the_helper_suite_6886(self):
+        self.assertEqual(classify_problems(CI_YML.read_text(encoding="utf-8")), [])
+
+    def test_the_classify_check_rejects_each_mutant_6886(self):
+        text = CI_YML.read_text(encoding="utf-8")
+        step = "      " + HELPER_SUITE_STEP[0] + "\n        " + HELPER_SUITE_STEP[1] + "\n"
+        job_key = "    runs-on: ubuntu-latest\n    outputs:\n      docs_only:"
+        mutants = {
+            "Y05 step removed": (step, ""),
+            "Y06 || true": (step, step[:-1] + " || true\n"),
+            "Y07 continue-on-error": (step, step + "        continue-on-error: true\n"),
+            "if: false": (step, step.replace("\n        run:", "\n        if: false\n        run:")),
+            "run changed": (step, step.replace("python3 " + HELPER_SUITE, "python3 -c pass")),
+            "suite filtered": (step, step[:-1] + " -k nothing\n"),
+            "step duplicated as a no-op": (step, step + "      - name: again\n        run: echo " + HELPER_SUITE + "\n"),
+            "job continue-on-error": (job_key, job_key.replace("    outputs:", "    continue-on-error: true\n    outputs:")),
+            "job if": (job_key, job_key.replace("    outputs:", "    if: false\n    outputs:")),
+        }
+        for name, (old, new) in mutants.items():
+            with self.subTest(mutant=name):
+                self.assertEqual(text.count(old), 1, f"ci.yml no longer holds the text mutated by {name!r}")
+                self.assertTrue(classify_problems(text.replace(old, new, 1)), f"mutant not caught: {name}")
 
     def test_every_reviewed_url_line_is_in_the_step_6672(self):
         step = {ln.strip() for ln in helper_step(CI_YML.read_text(encoding="utf-8"))}
