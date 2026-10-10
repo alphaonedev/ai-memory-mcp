@@ -152,3 +152,46 @@ not waived requirements. Measure them using only private resources. If COMMENT
 and existing process contracts cannot satisfy them, report measured incompatibility
 to conductor and continue independent red/controls/gates. Do not create a registry,
 weaken terminality, or claim the selected implementation complete.
+
+## Author measurement checkpoint
+
+The proposed format is not an accepted implementation. The literal before-CREATE
+registration condition conflicts with bootstrapping an authority stored only on
+the newly created base. Native PostgreSQL 18.6 returned warning SQLSTATE 3D000
+and exit zero for COMMENT on each of two nonexistent private database names.
+After CREATE the comment was empty. A wrapper checking only psql status would
+incorrectly regard that registration as durable. COMMENT after CREATE was the
+healthy control and round-tripped correctly.
+
+For recovery, an explicit transaction containing COMMENT and DROP refused with
+SQLSTATE 25001; a single query-message DROP/COMMENT batch also refused. The
+explicit transaction retained the database and prior COMMENT. An acknowledged
+catalog disappearance followed by killing the drop client before its progress
+record left DROP_PENDING and an absent member. A separate-session removal left
+the same observable carrier state. This establishes an acknowledgement ambiguity,
+not permission to call a missing member a confirmed deletion. Conservative
+retention is safe, but does not by itself meet full interrupted-cleanup recovery.
+
+For completion, a successfully exited parent with an empty process group left a
+detached descendant that had no database session, then created a private clone
+and queried it. A second run killed the owner with SIGKILL: its acknowledged
+shared lease released while its detached descendant remained able to clone and
+query. These are new lane measurements, not inherited conductor acceptance.
+No process/session absence predicate supplies the missing completion witness.
+
+The signed active-aged behavior regression reproduced the actual defect: the
+held clone and healthy concurrent family remained usable while sweep removed
+the aged base and template; the next clone failed. The sweep candidate listing
+was restricted to resources created by the test. Every native run confirmed zero
+remaining test-owned databases. No shared test database, FORCE, or service
+change was used. The first carrier-mechanism attempt expected an error for
+nonexistent COMMENT; it actually warned. That failed measurement attempt is
+preserved, and the corrected run checks both the warning and missing metadata.
+
+Decision: report these literal-contract proof gaps under the operator's explicit
+representation-incompatibility contingency; do not implement a guessed registry,
+weaken uncertainty, or label the remaining acceptance matrix green. Selection B
+and all voter conditions remain binding. A different permitted completion or
+recovery witness would need to be specified before lifecycle code can follow.
+The current source still has #7113. Independent exact-head reviews and CIv2
+remain conductor gates. Decision memory c178c7b2-ab97-479c-af77-824eeb488b15.
