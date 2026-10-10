@@ -126,7 +126,10 @@ async fn a_failed_catch_up_read_does_not_postpone_the_backstop_6233() {
     let (mut stream, _inject) = WakeStream::start_injectable(cfg()).expect("start");
     let started = Instant::now();
     tokio::time::sleep(Duration::from_secs(9)).await;
-    let settled = settle_catch_up(&mut stream, Err(anyhow::anyhow!("inbox: database is locked")));
+    let settled = settle_catch_up(
+        &mut stream,
+        Err(anyhow::anyhow!("inbox: database is locked")),
+    );
     assert!(settled.is_none(), "a failed read yields no envelope");
     let signal = wait_on(&mut stream, None)
         .await
@@ -153,5 +156,8 @@ async fn a_completed_catch_up_read_restarts_the_backstop_6233() {
         .await
         .expect("the backstop must fire");
     assert_eq!(signal.reason, WakeReason::Backstop);
-    assert!(started.elapsed() > POLL, "a completed read restarts the clock");
+    assert!(
+        started.elapsed() > POLL,
+        "a completed read restarts the clock"
+    );
 }

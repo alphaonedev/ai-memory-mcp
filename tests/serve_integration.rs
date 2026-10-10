@@ -797,10 +797,7 @@ fn dockerfile_delivers_sigterm_to_the_binary_and_the_guide_states_the_budget_623
         entry.starts_with("ENTRYPOINT [") && !entry.contains("sh\"") && !entry.contains("bash"),
         "ENTRYPOINT must be exec form without a shell wrapper so SIGTERM reaches the daemon: {entry}"
     );
-    let cmd = lines
-        .iter()
-        .find(|l| l.starts_with("CMD"))
-        .expect("a CMD");
+    let cmd = lines.iter().find(|l| l.starts_with("CMD")).expect("a CMD");
     assert!(
         cmd.starts_with("CMD [") && !cmd.contains("sh\""),
         "CMD must be exec form: {cmd}"

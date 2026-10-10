@@ -146,15 +146,18 @@ pub fn production_tokens(source: &str) -> Vec<&str> {
 /// in which case the attribute is left counted as production (fail closed).
 fn test_item_end(t: &[&str], item: usize) -> Option<usize> {
     let mut i = item;
-    while matches!(t.get(i), Some(&("pub" | "unsafe" | "async" | "extern" | "default"))) {
+    while matches!(
+        t.get(i),
+        Some(&("pub" | "unsafe" | "async" | "extern" | "default"))
+    ) {
         i += 1;
         if t.get(i) == Some(&"(") {
             i = group_end(t, i);
         }
     }
-    let to_semicolon = match t.get(i)? {
-        &("static" | "use" | "type") => true,
-        &"const" => !matches!(t.get(i + 1), Some(&("fn" | "unsafe" | "async" | "extern"))),
+    let to_semicolon = match *t.get(i)? {
+        "static" | "use" | "type" => true,
+        "const" => !matches!(t.get(i + 1), Some(&("fn" | "unsafe" | "async" | "extern"))),
         _ => false,
     };
     while i < t.len() {

@@ -763,7 +763,11 @@ mod tests {
         // SAFETY: a read-only fcntl on a descriptor this test owns.
         let flags = unsafe { libc::fcntl(probe.as_raw_fd(), libc::F_GETFD) };
         assert!(flags >= 0, "F_GETFD failed");
-        assert_ne!(flags & libc::FD_CLOEXEC, 0, "probe socket must be FD_CLOEXEC");
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "probe socket must be FD_CLOEXEC"
+        );
     }
 
     #[test]
