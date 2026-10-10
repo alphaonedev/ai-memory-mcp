@@ -724,7 +724,7 @@ def _self_test_cases() -> int:
         print("PASS: self-test - the trailer parser environment disables system and global git config (#6396)")
 
     saved_git_dir = os.environ.get("GIT_DIR")
-    os.environ["GIT_DIR"] = str(alias_repo / ".git")
+    os.environ["GIT_DIR"] = str(base_dir / "alias-repo" / ".git")
     try:
         exported_pin = config_free_env().get("GIT_DIR")
     finally:
