@@ -79,6 +79,7 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -926,6 +927,39 @@ def self_test():
             ("pre-apply pending does not read release", "pending-apply", no_verifier, 0, "PRE-APPLY OK")):
         check(label, lambda s=state_name, t=release_text, w=want_rc, n=needle: pre_release(s, t, w, n))
     check("pre-apply bogus state", lambda: pre_release("later", wf_text, 1, "state must be"))
+
+    # #6439: duplicate JSON keys are ambiguous input; the last value must never silently win.
+    def read_dup_file(text):
+        scratch = REPO_ROOT / ".local-runs"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch, prefix="carrier-ruleset-selftest-") as tmp:
+            path = Path(tmp) / "dup.json"
+            path.write_text(text, encoding="utf-8")
+            return read_json(path)
+
+    def rejects(fn):
+        try:
+            fn()
+        except (VerifyError, ValueError):
+            return None
+        return "accepted a duplicate JSON key"
+
+    dup_detail = '{"id": 7, "id": 7, "target": "branch", "enforcement": "active"}'
+    for label, fn in (
+            ("dup key in a state file", lambda: read_dup_file(
+                '{"state": "applied", "state": "pending-apply", "tracking_issue": 6182}')),
+            ("dup bypass_actors in a payload", lambda: read_dup_file(
+                '{"bypass_actors": [{"actor_id": 1}], "bypass_actors": []}')),
+            ("dup key in a ruleset listing", lambda: parse_pages('[{"id": 7, "id": 8}]')),
+            ("dup key in a ruleset detail", lambda: live_rulesets(
+                "o/r", run=fake_run((("/rulesets/7", dup_detail), ("/rulesets?", listing))))),
+            ("dup key nested in a ruleset detail", lambda: live_rulesets("o/r", run=fake_run((
+                ("/rulesets/7", '{"id": 7, "target": "branch", "enforcement": "active", '
+                                '"rules": [{"type": "update", "type": "deletion"}]}'),
+                ("/rulesets?", listing))))),
+            ("dup number in an issue body", lambda: live_issue_state("o/r", run=fake_run((
+                ("/issues/", '{"number": 1, "number": 6182, "state": "open"}'),)))(pinned))):
+        check(label, lambda f=fn: rejects(f))
 
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
