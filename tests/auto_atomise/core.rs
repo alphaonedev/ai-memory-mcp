@@ -692,8 +692,14 @@ fn spawn_join_baseline() -> Duration {
 }
 
 /// #6793 — on-path median ceiling for a measured `baseline`.
-fn on_path_ceiling(_baseline: Duration) -> Duration {
-    ON_PATH_FLOOR
+///
+/// `max(50 ms, 20 x baseline)`; the multiply saturates (NUMERIC-01) so a
+/// pathological baseline cannot overflow into a tiny ceiling.
+fn on_path_ceiling(baseline: Duration) -> Duration {
+    baseline
+        .checked_mul(ON_PATH_BASELINE_MULTIPLE)
+        .unwrap_or(Duration::MAX)
+        .max(ON_PATH_FLOOR)
 }
 
 #[test]
@@ -776,7 +782,8 @@ fn test_auto_atomise_does_not_block_store_response() {
     // magnitude regardless of whether it spawned a worker.
     //
     // We assert the on-path median is at most 10x the off-path
-    // median AND under 50ms absolute. Either condition would catch
+    // median AND under a load-scaled ceiling (#6793: `max(50 ms, 20 x
+    // spawn+join baseline)`). Either condition would catch
     // a regression where the hook accidentally blocks on the curator.
     let baseline = spawn_join_baseline();
     let ceiling = on_path_ceiling(baseline);
@@ -793,7 +800,7 @@ fn test_auto_atomise_does_not_block_store_response() {
     // ratio bound only makes sense when the off-path is in the same
     // order of magnitude as a worker-spawn (≥1ms); below that the
     // ratio is dominated by sub-millisecond jitter, not by the hook's
-    // own work. The 50ms absolute ceiling above remains the
+    // own work. The load-scaled ceiling above remains the
     // load-bearing "non-blocking" assertion.
     if m_off > Duration::from_millis(1) {
         let overhead_ratio_pct = m_on.as_nanos() * 100 / m_off.as_nanos().max(1);
