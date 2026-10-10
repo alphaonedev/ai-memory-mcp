@@ -1125,5 +1125,60 @@ def test_sdk_check_runs_before_the_inherited_trace_6362(
     assert stream.closed
 
 
+# ---- #6363: every handshake attribute is pinned at class level -------------
+
+_PINNED_HANDSHAKE_ATTRIBUTES = frozenset(
+    {
+        "wrap_socket",
+        "wrap_bio",
+        "verify_mode",
+        "check_hostname",
+        "sslsocket_class",
+        "sslobject_class",
+        "verify_flags",
+        "hostname_checks_common_name",
+        "get_ciphers",
+    }
+)
+
+
+def _stock_descriptor(name: str) -> Any:
+    for klass in ssl.SSLContext.__mro__:
+        if name in klass.__dict__:
+            return klass.__dict__[name]
+    raise AssertionError(name)
+
+
+def _equivalent_replacement(name: str) -> object:
+    """A class attribute that behaves exactly like the stock one for ``name``."""
+    stock = _stock_descriptor(name)
+    if isinstance(stock, type):
+        return type(stock.__name__, (stock,), {})
+    if hasattr(stock, "__set__"):
+        return property(stock.__get__, stock.__set__)
+
+    def forward(self: ssl.SSLContext, *args: Any, **kwargs: Any) -> Any:
+        return stock.__get__(self, ssl.SSLContext)(*args, **kwargs)
+
+    return forward
+
+
+def test_handshake_attribute_list_is_complete_6363() -> None:
+    from ai_memory import _common
+
+    assert frozenset(_common._HANDSHAKE_ATTRIBUTES) == _PINNED_HANDSHAKE_ATTRIBUTES  # noqa: SLF001
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("name", sorted(_PINNED_HANDSHAKE_ATTRIBUTES))
+def test_class_level_replacement_of_any_handshake_attribute_is_refused_6363(
+    monkeypatch: pytest.MonkeyPatch, client_cls: type, name: str
+) -> None:
+    context = ssl.create_default_context()
+    monkeypatch.setattr(ssl.SSLContext, name, _equivalent_replacement(name), raising=False)
+    with pytest.raises(ValueError, match="verify=False is refused"):
+        client_cls(base_url=_ORIGIN, verify=context)
+
+
 def test_lab_temp_root_is_project_local_6309(lab: Lab) -> None:
     assert ".local-runs" in pathlib.Path(lab.ca_path).resolve().parts
