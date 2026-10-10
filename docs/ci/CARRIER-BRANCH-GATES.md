@@ -197,8 +197,9 @@ python3 -I scripts/check_carrier_ruleset_live.py --require-full-view
   `branches` together with `branches-ignore`, and no `?`, `+` or `[...]` in a
   branch pattern, which the verifier does not translate); a tip
   that defines the jobs but does not trigger for every pull request would never
-  report the required context. Any carrier it cannot read is RED. It checks the
-  jobs, the trigger and, in the `applied` state, the release tip (step 3
+  report the required context. Every tip must also pass the workflow pins
+  listed under Limits below (#6619). Any carrier it cannot read is RED. It checks the
+  jobs, the trigger, the pins and, in the `applied` state, the release tip (step 3
   precondition); it does not compare the tip's payload or declaration files.
 - Expected after the `POST`: rc 1, `carrier ruleset <id> ('<name>') is live and
   matches; flip carrier-ruleset-state.json to "applied"`. The promotion (step 3
@@ -353,12 +354,23 @@ verifier fails otherwise), and the live carrier ruleset updated with the
 - The freshness gate cannot close the window between job completion and the
   merge click. Only the ruleset's strict up-to-date rule can.
 - The workflow pins are read through one fail-closed YAML-subset reader
-  (`scripts/workflow_yaml_subset.py`, shared with the #5447 trigger test), not
-  by regex (#6481, #6482, #6542, #6543, #6545). A construct the reader does not
-  model (anchor, alias, `<<:`, tab, `---`, duplicate key, BOM, U+2028, NEL)
-  makes the gate exit non-zero and name the construct and the line. The pins
-  cover workflow-level `env`, `defaults` and `permissions`, `needs`, flow-style
-  and quoted keys, trigger respellings, and the triggers `pull_request_target`,
+  (`scripts/workflow_yaml_subset.py`, shared with the #5447 trigger test) and
+  its allowed-shape accessor (#6610): every pin (triggers, jobs, job names,
+  `runs-on`, `uses`, `permissions`, `concurrency`, `timeout-minutes`, the
+  `env`/`with` token scan) names the value shapes it accepts, and any other
+  shape is refused with its line; no pin compares raw row text. A construct
+  the reader does not model (anchor, alias, `<<:`, tab, `---`, duplicate key,
+  BOM, U+2028, NEL, a quote character inside a plain key, nesting deeper than
+  64 levels) makes the gate exit non-zero and name the construct and the line.
+  The workflow must have a `permissions:` block, and it and every job's block
+  must be a block mapping of lowercase scopes to `read` or `none` (flow
+  mappings, block scalars, `read-all`/`write-all` and case variants are
+  refused). No job name may be an expression (#6618). The secret and token
+  scan reads parsed scalars, keys, flow entries and block-scalar lines
+  (#6617); `secrets` matches in any letter case. The two #6143 jobs have a
+  closed shape: `name`, one plain `runs-on` label, a `timeout-minutes` of
+  1-999, `permissions`, `env` and `steps`, whose actions are pinned to a
+  full commit sha. The forbidden triggers are `pull_request_target`,
   `workflow_run` and `workflow_call`.
 - A run with the Actions token cannot prove `bypass_actors` is empty; the
   admin verification in step 2 above is the evidence for that field.
