@@ -4779,5 +4779,34 @@ class ApprovalJobTokenSource6341(unittest.TestCase):
         mutant = self.SELF_TEST + "        env:\n          EXTRA: ${{ secrets.OPERATOR_PAT }}\n"
         self.assertTrue(_c8_mutant_problems(self.c8, self.SELF_TEST, mutant))
 
+
+
+class ApprovalJobShellOverride6388(unittest.TestCase):
+    """No `shell:` on an approval step, no `defaults:` on the job or the workflow."""
+
+    EVALUATE_RUN = "        run: python3 -I scripts/check_external_pr_approval.py\n"
+    SELF_TEST_RUN = "        run: python3 -I scripts/check_external_pr_approval.py --self-test\n"
+    JOB_PERMISSIONS = "    permissions:\n      contents: read\n      pull-requests: read\n"
+
+    def setUp(self) -> None:
+        self.c8 = C8_WORKFLOW.read_text(encoding="utf-8")
+
+    def test_6388_live_job_is_intact(self) -> None:
+        self.assertEqual([], _approval_job_problems(self.c8))
+
+    def test_6388_step_shell_overrides_are_killed(self) -> None:
+        for anchor in (self.EVALUATE_RUN, self.SELF_TEST_RUN):
+            for shell in ('        shell: "true {0}"\n', "        shell: python {0}\n", "        shell : sh\n"):
+                with self.subTest(anchor=anchor, shell=shell):
+                    self.assertTrue(_c8_mutant_problems(self.c8, anchor, anchor + shell))
+
+    def test_6388_job_defaults_shell_is_killed(self) -> None:
+        mutant = '    defaults:\n      run:\n        shell: "true {0}"\n' + self.JOB_PERMISSIONS
+        self.assertTrue(_c8_mutant_problems(self.c8, self.JOB_PERMISSIONS, mutant))
+
+    def test_6388_workflow_defaults_shell_is_killed(self) -> None:
+        mutant = 'defaults:\n  run:\n    shell: "true {0}"\n\njobs:\n'
+        self.assertTrue(_c8_mutant_problems(self.c8, "\njobs:\n", "\n" + mutant))
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
