@@ -114,35 +114,79 @@ fn suite_sources() -> Vec<(String, String)> {
     sources
 }
 
+/// Source-text classifiers used by the ceilings (#6788). Each one is a pure
+/// function so a fixture string pins every shape it must recognise.
+///
+/// Sqlite open needles (the old, literal list).
+const OPEN_NEEDLES: &[&str] = &[
+    "db::open",
+    "SqliteStore::open",
+    "open_db",
+    "Connection::open",
+    "storage::open",
+    "open_read_only",
+];
+
+/// Shapes that leak a temp handle without `mem::forget(`; zero ceiling.
+const LEAK_SHAPES: &[&str] = &[];
+
+fn opens_sqlite(src: &str) -> bool {
+    OPEN_NEEDLES.iter().any(|needle| src.contains(needle))
+}
+
+fn holds_raw_named_tempfile(src: &str) -> bool {
+    src.contains("NamedTempFile")
+}
+
+fn forget_sites(src: &str) -> usize {
+    src.matches("mem::forget(").count()
+}
+
+fn leak_shape_hits(src: &str) -> Vec<&'static str> {
+    LEAK_SHAPES
+        .iter()
+        .copied()
+        .filter(|shape| src.contains(shape))
+        .collect()
+}
+
+/// A suite that binds a sqlite database to a raw, non-`SqliteTempFile` handle.
+fn is_raw_sqlite_offender(src: &str) -> bool {
+    holds_raw_named_tempfile(src) && opens_sqlite(src)
+}
+
 /// Ceiling: ZERO integration suites (any depth under `tests/`) may bind a
-/// sqlite database, opened through `db::open`, `SqliteStore::open`,
-/// `storage::open`, `storage::open_read_only`, `open_db` or
-/// `Connection::open`, to a raw `tempfile::NamedTempFile` (the ceiling only
+/// sqlite database to a raw `tempfile::NamedTempFile` (the ceiling only
 /// falls). Use `common/sqlite_tempfile.rs::SqliteTempFile`, which owns the
 /// `-wal` / `-shm`.
 #[test]
 fn no_suite_binds_sqlite_to_raw_named_tempfile_6122() {
-    let opens_sqlite = |s: &str| {
-        [
-            "db::open",
-            "SqliteStore::open",
-            "open_db",
-            "Connection::open",
-            "storage::open",
-            "open_read_only",
-        ]
-        .iter()
-        .any(|needle| s.contains(needle))
-    };
     let offenders: Vec<String> = suite_sources()
         .into_iter()
-        .filter(|(_, src)| src.contains("NamedTempFile") && opens_sqlite(src))
+        .filter(|(_, src)| is_raw_sqlite_offender(src))
         .map(|(name, _)| name)
         .collect();
     assert!(
         offenders.is_empty(),
         "#6122: {} suite(s) bind sqlite to a raw NamedTempFile (orphans -wal/-shm): {offenders:?}",
         offenders.len()
+    );
+}
+
+/// Zero ceiling (#6788): no suite may leak a temp handle through
+/// `ManuallyDrop`, `Box::leak`, `into_path()` or `keep()` either.
+#[test]
+fn no_suite_leaks_temp_handle_by_other_means_6788() {
+    let hits: Vec<String> = suite_sources()
+        .into_iter()
+        .filter_map(|(name, src)| {
+            let shapes = leak_shape_hits(&src);
+            (!shapes.is_empty()).then(|| format!("{name}: {shapes:?}"))
+        })
+        .collect();
+    assert!(
+        hits.is_empty(),
+        "#6788: a temp handle is leaked on purpose (the scratch file outlives the run): {hits:?}"
     );
 }
 
@@ -235,7 +279,7 @@ const KNOWN_MEM_FORGET_SITES: &[(&str, usize)] = &[
 fn forget_violations(table: &[(&str, usize)], sources: &[(String, String)]) -> Vec<String> {
     let mut bad = Vec::new();
     for (name, src) in sources {
-        let found = src.matches("mem::forget(").count();
+        let found = forget_sites(src);
         let pinned = table.iter().find(|(n, _)| n == name).map_or(0, |(_, c)| *c);
         match found.cmp(&pinned) {
             std::cmp::Ordering::Equal => {}
@@ -350,4 +394,110 @@ fn forget_pin_rejects_raised_real_entry_6804() {
         over.iter().any(|v| v.contains("tests/wake_client_3470.rs")),
         "#6804: raising a pin without a new site must fail: {over:?}"
     );
+}
+
+fn offender(src: &str) -> bool {
+    is_raw_sqlite_offender(src)
+}
+
+/// #6788 (a): `use std::mem::forget; forget(h)` and the aliased forms.
+#[test]
+fn forget_sites_count_imported_and_aliased_forget_6788() {
+    let cases: &[(&str, usize)] = &[
+        ("use std::mem::forget;\nfn t() { forget(h); }", 1),
+        ("use core::mem::forget;\nfn t() { forget(h); }", 1),
+        (
+            "use std::mem::{self, forget};\nfn t() { forget(h); mem::forget(g); }",
+            2,
+        ),
+        ("use std::mem::*;\nfn t() { forget(h); }", 1),
+        ("use core::mem::forget as leak;\nfn t() { leak(h); }", 1),
+        ("use std::mem as m;\nfn t() { m::forget(h); }", 1),
+        ("use std::{mem as m, fmt};\nfn t() { m::forget(h); }", 1),
+        ("fn t() { std::mem::forget(h); }", 1),
+        // not a forget of a handle
+        ("fn forget(x: u8) {}\nfn t() { forget(1); }", 0),
+        ("use std::mem::forget;", 0),
+        ("fn t() { obj.forget(1); unforget(2); }", 0),
+        ("fn t() { other::forget(1); }", 0),
+    ];
+    for (src, want) in cases {
+        assert_eq!(forget_sites(src), *want, "#6788: forget_sites({src:?})");
+    }
+}
+
+/// #6788 (a): `ManuallyDrop`, `Box::leak`, `into_path()`, `into_temp_path()`
+/// and `keep()` on a temp handle are zero-ceiling leak shapes.
+#[test]
+fn leak_shapes_are_flagged_on_temp_handles_6788() {
+    for shape in [
+        "ManuallyDrop::new(dir)",
+        "Box::leak(Box::new(dir))",
+        "dir.into_path()",
+        "f.into_temp_path()",
+        "dir.keep()",
+    ] {
+        let src = format!("let dir = tempfile::tempdir().unwrap();\nlet _p = {shape};\n");
+        assert!(
+            !leak_shape_hits(&src).is_empty(),
+            "#6788: leak shape not flagged: {shape}"
+        );
+        let unrelated = format!("let _p = {shape};\n");
+        assert!(
+            leak_shape_hits(&unrelated).is_empty(),
+            "#6788: {shape} in a file with no temp handle must not be flagged"
+        );
+    }
+}
+
+/// #6788 (b): `tempfile::Builder::new()...tempfile()` is a raw `NamedTempFile`.
+#[test]
+fn builder_tempfile_is_a_raw_named_tempfile_6788() {
+    for build in [
+        "tempfile::Builder::new().suffix(\".db\").tempfile().unwrap()",
+        "tempfile::Builder::new()\n    .prefix(\"x\")\n    .tempfile_in(dir)\n    .unwrap()",
+        "tempfile::Builder::new().make(|p| std::fs::File::create(p)).unwrap()",
+    ] {
+        let src = format!("fn t() {{ let f = {build};\nlet c = ai_memory::db::open(f.path()); }}");
+        assert!(offender(&src), "#6788: Builder shape not flagged: {build}");
+    }
+    // not offenders
+    assert!(!offender(
+        "fn t() { let f = SqliteTempFile::new().unwrap(); let c = ai_memory::db::open(f.path()); }"
+    ));
+    assert!(!offender(
+        "fn t() { let f = tempfile::tempfile().unwrap(); let c = ai_memory::db::open(p); }"
+    ));
+    assert!(!offender(
+        "fn t() { let f = tempfile::NamedTempFile::new().unwrap(); f.as_file(); }"
+    ));
+}
+
+/// #6788 (c): aliased and bare-imported sqlite opens are recognised.
+#[test]
+fn aliased_and_imported_sqlite_opens_are_recognised_6788() {
+    let raw = "let f = tempfile::NamedTempFile::new().unwrap();";
+    for opener in [
+        "use rusqlite::Connection as Conn;\nfn t() { Conn::open(f.path()); }",
+        "use rusqlite::{params, Connection as Conn};\nfn t() { Conn::open(f.path()); }",
+        "use ai_memory::db as d;\nfn t() { d::open(f.path()); }",
+        "use ai_memory::storage as st;\nfn t() { st::open_read_only(f.path()); }",
+        "use ai_memory::store::sqlite::SqliteStore as S;\nfn t() { S::open(f.path()); }",
+        "use ai_memory::db::open as open_it;\nfn t() { open_it(f.path()); }",
+        "use ai_memory::db::open;\nfn t() { open(f.path()); }",
+        "use ai_memory::db::{open, other};\nfn t() { open(f.path()); }",
+        "use ai_memory::storage::open_read_only;\nfn t() { open_read_only(p); }",
+        "use ai_memory::db::*;\nfn t() { open(f.path()); }",
+        "fn t() { rusqlite::Connection::open_with_flags(f.path(), fl); }",
+    ] {
+        let src = format!("{opener}\n{raw}");
+        assert!(offender(&src), "#6788: open shape not recognised: {opener}");
+    }
+    // `File::open` / unrelated opens are not sqlite opens.
+    assert!(!offender(&format!(
+        "use std::fs::File;\nfn t() {{ File::open(p); }}\n{raw}"
+    )));
+    assert!(!offender(&format!(
+        "use std::fs::OpenOptions;\nfn t() {{ OpenOptions::new().open(p); }}\n{raw}"
+    )));
 }
