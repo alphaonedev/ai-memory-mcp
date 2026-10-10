@@ -821,6 +821,44 @@ mod promote_status_4622_tests {
         assert_eq!(body, crate::mcp::error_text::DB_ERROR_TEXT);
     }
 
+    /// #6149: the one operator log line records the HTTP status the caller
+    /// receives, for a foreign root (400) and the typed not-found (404).
+    #[test]
+    fn issue_6149_operator_log_records_the_http_status() {
+        // #4090: tracing capture; run alone in a child (callsite-interest cache).
+        if crate::config::run_env_isolated_child_or_spawn(
+            "handlers::skills::promote_status_4622_tests::issue_6149_operator_log_records_the_http_status",
+        ) {
+            return;
+        }
+        // #6134: a foreign storage root maps to 400 today; the status moves to
+        // a 5xx when #6134 lands. `promote_error_status` is the source of truth
+        // here, so this cell tracks the mapping instead of pinning 400.
+        let cases = [
+            (
+                anyhow::anyhow!("no such table: skills_6149").context("skill promote register"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                anyhow::Error::new(ReflectionNotFound::new("r-6149")),
+                StatusCode::NOT_FOUND,
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(promote_error_status(&err), expected);
+            let (subscriber, sink) = crate::test_support::error_debug_capture();
+            tracing::subscriber::with_default(subscriber, || promote_error_message(err));
+            let log = crate::test_support::captured_text(&sink);
+            let lines: Vec<&str> = log
+                .lines()
+                .filter(|l| l.contains(crate::mcp::error_text::TRACE_TARGET))
+                .collect();
+            assert_eq!(lines.len(), 1, "one operator log line: {log}");
+            let field = format!("status={}", expected.as_u16());
+            assert!(lines[0].contains(&field), "{field} missing: {log}");
+        }
+    }
+
     /// Pin 3: the 404 follows the type, not the Display text.
     #[test]
     fn issue_4622_reworded_display_keeps_404() {
