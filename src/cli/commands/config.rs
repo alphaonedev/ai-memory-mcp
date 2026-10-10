@@ -1102,29 +1102,38 @@ mod tests {
                 code, expected_code,
                 "{layout} dry_run={dry_run}: unexpected exit\nstderr: {stderr}"
             );
-            for secret in secrets {
+            // Failure messages name the fixture by index and report byte
+            // lengths only: printing the secret or the captured stream would
+            // write the credential into the test log (#6583).
+            for (secret_idx, secret) in secrets.into_iter().enumerate() {
                 if !body.contains(secret) {
                     continue;
                 }
                 assert!(
                     !stdout.contains(secret),
-                    "{layout} dry_run={dry_run}: {secret} leaked on STDOUT:\n{stdout}"
+                    "{layout} dry_run={dry_run}: fixture secret #{secret_idx} leaked on \
+                     STDOUT ({} bytes captured)",
+                    stdout.len()
                 );
                 assert!(
                     !stderr.contains(secret),
-                    "{layout} dry_run={dry_run}: {secret} leaked on STDERR:\n{stderr}"
+                    "{layout} dry_run={dry_run}: fixture secret #{secret_idx} leaked on \
+                     STDERR ({} bytes captured)",
+                    stderr.len()
                 );
             }
             // Data integrity: the redaction is DISPLAY-ONLY. Whatever ends
             // up on disk must still hold the real credentials — a masked
             // value written back would be silent credential destruction.
             if code == 0 {
-                for secret in secrets {
+                for (secret_idx, secret) in secrets.into_iter().enumerate() {
                     if body.contains(secret) {
                         assert!(
                             on_disk.contains(secret),
-                            "{layout}: migrate MASKED {secret} in the written file — \
-                             redaction must never touch the durable artifact\n{on_disk}"
+                            "{layout}: migrate MASKED fixture secret #{secret_idx} in the \
+                             written file — redaction must never touch the durable \
+                             artifact ({} bytes on disk)",
+                            on_disk.len()
                         );
                     }
                 }
