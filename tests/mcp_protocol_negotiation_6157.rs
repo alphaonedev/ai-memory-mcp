@@ -31,6 +31,9 @@ mod mcp_wait;
 /// `mcp_protocol_revision_ssot_6157.rs` proves this is a member of
 /// `SUPPORTED_PROTOCOL_REVISIONS`).
 const SHIPPED: &str = "2024-11-05";
+/// A revision the server does not implement (kept off the `protocolVersion`
+/// line so the SSOT pin only sees the supported literal).
+const UNSUPPORTED: &str = "2099-01-01";
 const WAIT: Duration = Duration::from_secs(60);
 
 /// Send one `initialize` whose `params` is `params`; return the result's
@@ -154,7 +157,7 @@ fn initialize_repeated(count: u64) -> (u64, String) {
     for id in 1..=count {
         let request = json!({
             "jsonrpc":"2.0","id":id,"method":"initialize",
-            "params":{"protocolVersion":"2099-01-01"}
+            "params":{"protocolVersion": UNSUPPORTED}
         });
         writeln!(stdin, "{request}").expect("write initialize");
     }
