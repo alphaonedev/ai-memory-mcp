@@ -50,7 +50,8 @@ FAKE_PSQL = """#!{py}
 import json, os, sys
 base = {base!r}
 with open(base + "/psql.log", "a") as fh:
-    fh.write(json.dumps({{"argv": sys.argv, "env_marker_ok": os.environ.get("PGPASSWORD") == {marker!r}}}) + "\\n")
+    fh.write(json.dumps({{"argv": sys.argv, "env_marker_ok": os.environ.get("PGPASSWORD") == {marker!r},
+                         "pgpassword": os.environ.get("PGPASSWORD")}}) + "\\n")
 print(1 if os.path.isfile(base + "/share/extension/age.control") else 0)
 """
 
@@ -264,8 +265,12 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertFalse((self.base / "psql.log").exists(), "psql must never be called")
 
     # ---- URL shapes libpq parses differently from urllib (R3-F1, F-R3-1) --
-    def assert_url_refused(self, url, names=()):
-        """The URL is refused with exit 2 before psql runs, and the value never prints."""
+    def assert_url_refused(self, url, names=(), absent=()):
+        """The URL is refused with exit 2 before psql runs, and the value never prints.
+
+        ``names`` must appear in stderr; ``absent`` strings (R5-F1: identifier-shaped
+        password fragments) must not.
+        """
         self.install_good()  # a healthy tier would reach psql if the URL were accepted
         (self.base / "psql.log").unlink(missing_ok=True)  # each subTest starts without a psql call
         self.url_file.write_text(url + "\n")
@@ -275,14 +280,16 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assert_fails(r, 2, "tier URL file ")
         for name in names:
             self.assertIn(name, r.stderr)
-        self.assertNotIn("marker_6161_bare", r.stderr)
+        for fragment in absent + ("marker_6161_bare",):
+            self.assertNotIn(fragment, r.stderr)
         self.assertFalse((self.base / "psql.log").exists(), "psql must never be called")
 
     def test_password_key_case_variants_are_rejected(self):
         # libpq matches query keys case-sensitively; a PASSWORD= key would stay on argv.
         for key in ("PASSWORD", "Password"):
             with self.subTest(key=key):
-                self.assert_url_refused(f"postgres://ciuser@127.0.0.1:5445/cidb?{key}={PW_MARKER}", (key,))
+                self.assert_url_refused(f"postgres://ciuser@127.0.0.1:5445/cidb?{key}={PW_MARKER}",
+                                        ("password",), (key,))
 
     def test_fragment_credentials_are_rejected(self):
         # libpq has no fragment: it reads keys after a '#' as query parameters.
@@ -314,8 +321,24 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                     f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require&{key}={PW_MARKER}", (key,))
 
     def test_unknown_query_key_is_rejected_without_its_value(self):
+        # R5-F1: an unlisted key may be a password tail, so it is never named.
         self.assert_url_refused(f"postgres://ciuser@127.0.0.1:5445/cidb?not_a_libpq_key={PW_MARKER}",
-                                ("not_a_libpq_key",))
+                                ("unlisted query key",), ("not_a_libpq_key",))
+
+    def test_unlisted_key_that_is_a_password_tail_is_not_echoed(self):
+        # R5-F1: a query-form password holding a raw '&' leaves its tail as a "key".
+        tail = "Ident6161tail"
+        for url in (
+            f"postgres://ciuser@127.0.0.1:5445/cidb?password=Tr0ub&{tail}or3=x",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require&password=Tr0ub&{tail}=x",
+        ):
+            with self.subTest(url=url.replace(tail, "<T>")):
+                self.assert_url_refused(url, ("unlisted query key",), (tail,))
+
+    def test_known_refused_key_names_still_print(self):
+        # R5-F1: only known libpq keywords are named; the message stays useful for them.
+        self.assert_url_refused(f"postgres://ciuser@127.0.0.1:5445/cidb?sslkeylogfile={PW_MARKER}",
+                                ("sslkeylogfile",))
 
     def test_query_segment_without_equals_is_rejected_unnamed(self):
         # A bare segment is a value, not a key: it must never be printed as a key name.
@@ -344,6 +367,9 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require;password={PW_MARKER}",
             f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require?password={PW_MARKER}",
             f"postgres://ciuser@127.0.0.1:5445/cidb?application_name=ci=password={PW_MARKER}",
+            # R5-F3: the extra '=' sits in a later segment (a first-segment-only check misses it).
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require&application_name=ci;password={PW_MARKER}",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require&connect_timeout=5&application_name=ci=x=y",
         ):
             with self.subTest(url=url.replace(PW_MARKER, "<M>")):
                 self.assert_url_refused(url)
@@ -390,10 +416,65 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             with self.subTest(url=url.replace(PW_MARKER, "<M>")):
                 self.assert_url_refused(url, ("percent-encode",))
 
-    def test_socket_directory_url_gets_a_clear_refusal(self):
-        # F-R4-3: an empty authority is the libpq socket form; say so instead of "not a URL".
+    def test_empty_host_part_gets_a_clear_refusal(self):
+        # F-R4-3 / R5-F4: an empty authority is refused and named as such; the message
+        # must not claim that socket-directory URLs are unsupported (host=%2F... works).
         self.assert_url_refused(
-            f"postgres:///cidb?host=/var/run/postgresql&password={PW_MARKER}", ("socket-directory",))
+            f"postgres:///cidb?host=/var/run/postgresql&password={PW_MARKER}", ("empty host part",))
+        self.assertNotIn("not supported", self.run_script().stderr)
+
+    def test_socket_directory_forms_with_a_host_part_are_accepted(self):
+        # R5-F4: the encoded-directory forms carry a host part or key and are not refused.
+        mod = load_module()
+        for url in (
+            "postgres://ciuser@%2Fvar%2Frun%2Fpostgresql/cidb",
+            "postgres://ciuser@/cidb?host=%2Fvar%2Frun%2Fpostgresql",
+        ):
+            with self.subTest(url=url):
+                try:
+                    mod.psql_target(url)
+                except mod.HelperError as exc:
+                    self.assertNotIn("socket", str(exc))
+                    self.assertNotIn("empty host", str(exc))
+
+    # ---- round 6 (R5-F2 / #6221): libpq percent-decodes only, '+' is literal --
+    def test_plus_in_query_password_is_literal(self):
+        mod = load_module()
+        for raw, want in (("ab+cd", "ab+cd"), ("ab%2Bcd", "ab+cd"), ("a%20b+c", "a b+c")):
+            with self.subTest(raw=raw):
+                target, password = mod.psql_target(f"postgres://ciuser@127.0.0.1:5445/cidb?password={raw}")
+                self.assertEqual(password, want)
+                self.assertNotIn(raw, target)
+
+    def test_plus_in_query_password_reaches_pgpassword_unchanged(self):
+        self.install_good()
+        pw = PW_MARKER + "+x"
+        self.url_file.write_text(f"postgres://ciuser@127.0.0.1:5445/cidb?password={pw}\n")
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertEqual(call["pgpassword"], pw)
+
+    def test_kept_query_segments_are_not_re_encoded(self):
+        mod = load_module()
+        url = ("postgres://ciuser@127.0.0.1:5445/cidb?options=-c%20statement_timeout%3D5"
+               "&password=pw&application_name=a+b&sslmode=require")
+        target, password = mod.psql_target(url)
+        self.assertEqual(password, "pw")
+        self.assertEqual(target, "postgres://ciuser@127.0.0.1:5445/cidb"
+                                 "?options=-c%20statement_timeout%3D5&application_name=a+b&sslmode=require")
+
+    def test_query_without_password_is_passed_through_as_written(self):
+        mod = load_module()
+        url = "postgres://ciuser:pw@127.0.0.1:5445/cidb?options=-c%20x&application_name=a+b"
+        target, password = mod.psql_target(url)
+        self.assertEqual(password, "pw")
+        self.assertEqual(target, "postgres://ciuser@127.0.0.1:5445/cidb?options=-c%20x&application_name=a+b")
+        # Segments (even an empty one) are never rebuilt when no password was removed.
+        url = "postgres://ciuser@127.0.0.1:5445/cidb?application_name=a&&sslmode=require"
+        self.assertEqual(mod.psql_target(url), (url, None))
 
     def test_allowlist_excludes_every_libpq_secret_key(self):
         # R4-F3: adding any of these to ALLOWED_QUERY_KEYS would put a secret on argv.
