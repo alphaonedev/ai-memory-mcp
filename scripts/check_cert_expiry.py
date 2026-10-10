@@ -3059,6 +3059,7 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     _trusted_round3_fetch_cells(tmp, t, fx, mirror, head8, good8)
     _shim_trace_cells(t)
     _log_safe_cells(t)
+    _summary_cells(t)
     _ws_unit_cells(t)
     _ws_format_cells(t)
     _ws_wording_cells(t)
@@ -3486,6 +3487,27 @@ def _trusted_round7_cells(t, judge, shapes):
                 needles=("GUARD SHADOW: .github/workflows/x\\u202ey.yml",))
     if "\u202e" in out:
         t.fail("(tr-log-cf-name): a raw U+202E from the file name reached the log:", out)
+
+
+# The cells each round pinned, as the SELF_TEST_OK line must name them (#6765).
+SUMMARY_CELLS = {
+    "round 6": ("shim-trace", "tr-s-ws-U+XXXX", "tr-s-ws-lines", "tr-s-ws-nine", "ws-wording"),
+    "round 7": ("tr-s-ws-oneline", "tr-s-ws-dedup", "tr-s-ws-eight", "tr-s-ws-count", "tr-s-ws-line1-U+XXXX",
+                "log-safe-cf-U+XXXX", "tr-log-cf-who", "tr-log-cf-name"),
+}
+
+
+def _summary_cells(t):
+    """#6765: the SELF_TEST_OK inventory line names every round from 4 on
+    ("round N") and the cells of rounds 6 and 7, so a green run says what is
+    pinned. Cell `summary-rounds`."""
+    for number in (4, 5, 6, 7):
+        if f"round {number}" not in SELF_TEST_OK:
+            t.fail(f"(summary-rounds): SELF_TEST_OK carries no sentence for round {number}")
+    for label, names in SUMMARY_CELLS.items():
+        for name in names:
+            if name not in SELF_TEST_OK:
+                t.fail(f"(summary-rounds): SELF_TEST_OK does not name the {label} cell {name}")
 
 
 def _ws_unit_cells(t):
