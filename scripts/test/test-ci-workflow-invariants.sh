@@ -801,6 +801,15 @@ else
         "$(grep -E 'R-(PR|PUSH|SHAPE)|^FAIL|^ERROR' "$SCRATCH/f-5447.out" | head -12)"
 fi
 
+# SECTION G (#6339): the AGE self-heal helper reads the tier URL file and builds
+# PGPASSWORD, so ci.yml must run it as `python3 -I` (no sys.path[0], no PYTHON* env).
+if python3 "$ROOT/scripts/test/test_ci_age_helper_isolated_6339.py" >"$SCRATCH/g-6339.out" 2>&1; then
+    ok "G: ci.yml runs the AGE self-heal helper with python3 -I (#6339)"
+else
+    bad "G: AGE helper isolation pin failed (#6339)" \
+        "$(grep -E '^FAIL|^ERROR|AssertionError' "$SCRATCH/g-6339.out" | head -12)"
+fi
+
 echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo "ci.yml invariants: $PASS/$PASS PASS"
