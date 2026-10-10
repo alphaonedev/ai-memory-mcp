@@ -3571,7 +3571,7 @@ def _trusted_round3_fetch_cells(tmp, t, fx, mirror, head8, good8):
             t.fail("(tr-f-head): a destination ref from an earlier fetch survived a failed fetch")
         # Code F3: the last fetch error is part of the ::error.
         fx.g("update-ref", "refs/pull/7/merge", good8)
-        with _git_shim(tmp, GIT_SHIM, version="", fail="+refs/pull/7/merge:refs/remotes/pull/m7"):
+        with _git_shim(tmp, GIT_SHIM, version="", fail="+refs/pull/7/merge:refs/remotes/pull/m7", trace=""):
             run("tr-f-error", "every merge fetch failing", False,
                 needles=("::error title=cert-expiry trusted::", "last fetch error", "shim refuses"))
         # R2-4: a hung fetch is cut at its timeout and retried, then reported as an ::error.
@@ -3584,7 +3584,7 @@ def _trusted_round3_fetch_cells(tmp, t, fx, mirror, head8, good8):
         finally:
             cut.clear()
         # Round 4 (code R3-2 X12, security R3-2 Q10): a failed `update-ref -d` stops before any fetch.
-        with _git_shim(tmp, GIT_SHIM, version="", fail="update-ref"):
+        with _git_shim(tmp, GIT_SHIM, version="", fail="update-ref", trace=""):
             run("tr-f-delete", "every destination-ref delete failing", False,
                 needles=("git update-ref -d", "shim refuses"))
         if fetches:
@@ -3644,7 +3644,8 @@ def trusted_cli_shimmed(tmp, repo, fail, shape):
         return 2, "git is not on PATH"
     shim_dir = Path(tempfile.mkdtemp(prefix="gitshim.", dir=str(tmp)))
     shim = shim_dir / "git"
-    shim.write_text(GIT_SHIM.format(python=sys.executable, real=real, version="", fail=fail), encoding="utf-8")
+    shim.write_text(GIT_SHIM.format(python=sys.executable, real=real, version="", fail=fail, trace=""),
+                    encoding="utf-8")
     shim.chmod(0o755)
     saved = os.environ.get("PATH")
     os.environ["PATH"] = f"{shim_dir}{os.pathsep}{saved or ''}"
