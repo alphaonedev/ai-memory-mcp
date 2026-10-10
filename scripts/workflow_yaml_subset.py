@@ -40,7 +40,8 @@ class Unparsed(Exception):
 # every GitHub-token-shaped string masked and the literal value of a credential-named key withheld
 # (an expression such as ``${{ github.token }}`` is kept: it names a source, it is not a value).
 ECHO_LIMIT = 120
-_TOKEN_SHAPE = re.compile(r"\b(gh[pousr]_|github_pat_)[A-Za-z0-9_]+")
+# #6736 #6737: no word boundary, so a token glued after a letter, digit, ``_`` or ``%3A`` is masked too.
+_TOKEN_SHAPE = re.compile(r"(gh[pousr]_|github_pat_)[A-Za-z0-9_]{8,}")
 # A key (a word, optionally quoted) and its ``:`` or ``=``; the lookbehind starts a match only at the
 # start of a word, so the scan is linear in the text (no nested backtracking).
 _PAIR_KEY = re.compile(r"(?<![\w.-])([\w.-]+)['\"]?[ \t]*[:=][ \t]*")
