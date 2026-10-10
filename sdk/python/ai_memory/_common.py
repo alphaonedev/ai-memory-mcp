@@ -15,6 +15,7 @@ an ``await`` lives here. In particular:
 from __future__ import annotations
 
 import inspect
+import ipaddress
 import json
 import os
 import ssl
@@ -198,22 +199,98 @@ _SESSION_MESSAGE = (
 )
 
 
-def _assert_negotiated_session(session: object, context: ssl.SSLContext) -> None:
-    """Raise ``ValueError`` unless ``session`` is a verified session of ``context``.
+def _assert_negotiated_session(session: object, context: ssl.SSLContext, host: str) -> None:
+    """Raise ``ValueError`` unless ``session`` is a verified session of ``context`` for ``host``.
 
     ``session`` is the connection's ``ssl_object`` after the handshake. It must
     exist, belong to the caller's own context object (a handshake handed to
     another context is refused) and carry a VALIDATED peer certificate:
     ``getpeercert()`` is empty when the chain was not verified (``CERT_NONE``,
-    ``CERT_OPTIONAL`` without a certificate, anonymous suites). Unlike the
+    ``CERT_OPTIONAL`` without a certificate, anonymous suites). The certificate
+    must also name ``host``, the host the request is addressed to, whatever
+    the context's ``check_hostname`` was at handshake time (#6350). Unlike the
     pre-handshake predicate this inspects what actually happened on the wire,
     so it also closes the check/use race (#6306) and auth-null suites (#6305).
     """
     if session is None or getattr(session, "context", None) is not context:
         raise ValueError(_SESSION_MESSAGE)
     getpeercert = getattr(session, "getpeercert", None)
-    if getpeercert is None or not getpeercert():
+    peer = None if getpeercert is None else getpeercert()
+    if not isinstance(peer, dict) or not peer:
         raise ValueError(_SESSION_MESSAGE)
+    if not _peer_matches_host(peer, host, context):
+        raise ValueError(_SESSION_MESSAGE)
+
+
+def _ip_or_none(value: object) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return ipaddress.ip_address(value.strip())
+    except ValueError:
+        return None
+
+
+def _dns_name_matches(pattern: object, host: str) -> bool:
+    """RFC 6125 name match: a wildcard only as the whole left-most label."""
+    if not isinstance(pattern, str):
+        return False
+    labels = pattern.rstrip(".").lower().split(".")
+    if "*" not in pattern:
+        return labels == host.split(".")
+    if labels[0] != "*" or len(labels) < 3 or any("*" in label for label in labels[1:]):
+        return False
+    host_labels = host.split(".")
+    return len(host_labels) == len(labels) and bool(host_labels[0]) and host_labels[1:] == labels[1:]
+
+
+def _peer_matches_host(peer: dict[str, Any], host: str, context: ssl.SSLContext) -> bool:
+    """Whether the validated peer certificate ``peer`` names ``host`` (#6350).
+
+    ``ssl.match_hostname`` is gone since Python 3.12, so this mirrors what
+    OpenSSL's host check does: an IP host matches only an iPAddress SAN; a DNS
+    host matches a dNSName SAN; the subject commonName is a fallback only when
+    the certificate has no dNSName SAN, the host is not an IP address and the
+    context's ``hostname_checks_common_name`` (read through the base
+    descriptor) allows it.
+    """
+    host = host.rstrip(".").lower()
+    if not host:
+        return False
+    sans = peer.get("subjectAltName", ())
+    if not isinstance(sans, tuple):
+        return False
+    entries = [entry for entry in sans if isinstance(entry, tuple) and len(entry) == 2]
+    address = _ip_or_none(host)
+    if address is not None:
+        return any(
+            kind == "IP Address" and _ip_or_none(value) == address for kind, value in entries
+        )
+    dns = [value for kind, value in entries if kind == "DNS"]
+    if dns:
+        return any(_dns_name_matches(value, host) for value in dns)
+    common_name = ssl.SSLContext.__dict__.get("hostname_checks_common_name")
+    if not isinstance(common_name, property) or common_name.fget is None:
+        return False
+    if common_name.fget(context) is not True:
+        return False
+    subject = peer.get("subject", ())
+    if not isinstance(subject, tuple):
+        return False
+    return any(
+        isinstance(attribute, tuple)
+        and len(attribute) == 2
+        and attribute[0] == "commonName"
+        and _ip_or_none(attribute[1]) is None
+        and _dns_name_matches(attribute[1], host)
+        for rdn in subject
+        if isinstance(rdn, tuple)
+        for attribute in rdn
+    )
+
+
+def _request_host(url: httpx.URL) -> str:
+    return url.raw_host.decode("ascii", "replace")
 
 
 def _with_trace(request: httpx.Request, trace: Any) -> None:
@@ -283,6 +360,7 @@ class _SessionGate:
     def __init__(self, context: ssl.SSLContext, request: httpx.Request) -> None:
         self._context = context
         url = request.url
+        self._host = _request_host(url)
         self._tunnel_target = b"%b:%d" % (url.raw_host, url.port or 443)
         self._pending: list[object] = []
 
@@ -300,7 +378,7 @@ class _SessionGate:
                 self._pending.append(stream)
                 return None
             try:
-                _assert_negotiated_session(session, self._context)
+                _assert_negotiated_session(session, self._context, self._host)
             except ValueError:
                 return [*self._pending, stream]
             if leg != _DIRECT_TLS:
@@ -384,7 +462,11 @@ def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> dict[str, list
             _with_trace(request, _atrace)
 
         async def _aresponse(response: httpx.Response) -> None:
-            _assert_negotiated_session(_session_of(response.extensions.get("network_stream")), context)
+            _assert_negotiated_session(
+                _session_of(response.extensions.get("network_stream")),
+                context,
+                _request_host(response.request.url),
+            )
 
         return {"request": [_arequest], "response": [_aresponse]}
 
@@ -403,7 +485,11 @@ def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> dict[str, list
         _with_trace(request, _trace)
 
     def _response(response: httpx.Response) -> None:
-        _assert_negotiated_session(_session_of(response.extensions.get("network_stream")), context)
+        _assert_negotiated_session(
+            _session_of(response.extensions.get("network_stream")),
+            context,
+            _request_host(response.request.url),
+        )
 
     return {"request": [_request], "response": [_response]}
 
