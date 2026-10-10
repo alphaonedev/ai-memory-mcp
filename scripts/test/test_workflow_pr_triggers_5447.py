@@ -4742,5 +4742,34 @@ class ApprovalJobPermissions6335(unittest.TestCase):
             with self.subTest(mutant=mutant):
                 self.assertTrue(_c8_mutant_problems(self.c8, "permissions:\n  contents: read\n\n", mutant))
 
+
+
+class ApprovalJobTokenSource6341(unittest.TestCase):
+    """The Evaluate step's env is exactly GH_TOKEN from github.token + OPERATOR_LOGIN; no `secrets.` in the job."""
+
+    ENV = "          GH_TOKEN: ${{ github.token }}\n          OPERATOR_LOGIN: alphaonedev\n"
+    SELF_TEST = "        run: python3 -I scripts/check_external_pr_approval.py --self-test\n"
+
+    def setUp(self) -> None:
+        self.c8 = C8_WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn(self.ENV, _job_text(self.c8, APPROVAL_JOB))
+
+    def test_6341_live_job_is_intact(self) -> None:
+        self.assertEqual([], _approval_job_problems(self.c8))
+
+    def test_6341_token_source_swaps_are_killed(self) -> None:
+        for mutant in ("          GH_TOKEN: ${{ secrets.OPERATOR_PAT }}\n          OPERATOR_LOGIN: alphaonedev\n",
+                       '          GH_TOKEN: "${{ secrets.OPERATOR_PAT }}"\n          OPERATOR_LOGIN: alphaonedev\n',
+                       "          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n          OPERATOR_LOGIN: alphaonedev\n",
+                       "          GH_TOKEN: ${{ github.token }}\n          OPERATOR_LOGIN: alphaonedev\n"
+                       "          GH_DEBUG: api\n",
+                       "          OPERATOR_LOGIN: alphaonedev\n"):
+            with self.subTest(mutant=mutant):
+                self.assertTrue(_c8_mutant_problems(self.c8, self.ENV, mutant))
+
+    def test_6341_secret_reference_anywhere_in_the_job_is_killed(self) -> None:
+        mutant = self.SELF_TEST + "        env:\n          EXTRA: ${{ secrets.OPERATOR_PAT }}\n"
+        self.assertTrue(_c8_mutant_problems(self.c8, self.SELF_TEST, mutant))
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
