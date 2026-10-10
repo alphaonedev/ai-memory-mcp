@@ -753,17 +753,19 @@ REPO_CONFIG_FILES = ("Cargo.toml", ".cargo/config.toml", ".cargo/config")
 def load_repo_files(root: Path = ROOT) -> Dict[str, str]:
     """The cargo manifest and every ``.cargo/config[.toml]`` a self-hosted build can read (#6255 #6297).
 
+    Files are read as ``utf-8-sig``: cargo strips a leading byte-order mark (#6474).
+
     A step that changes directory (or sets ``working-directory``) makes cargo read the nearest
     ``.cargo/config.toml`` above that directory, so every one below ``root`` is checked, build
     output trees (``target``) and VCS / scratch directories excluded.
     """
-    found = {name: (root / name).read_text(encoding="utf-8") for name in REPO_CONFIG_FILES if (root / name).is_file()}
+    found = {name: (root / name).read_text(encoding="utf-8-sig") for name in REPO_CONFIG_FILES if (root / name).is_file()}
     for dirpath, dirnames, _files in os.walk(str(root)):
         dirnames[:] = sorted(d for d in dirnames if d not in SKIP_DIRS)
         for cfg in CONFIG_NAMES:
             path = Path(dirpath) / cfg
             if path.is_file():
-                found.setdefault(path.relative_to(root).as_posix(), path.read_text(encoding="utf-8"))
+                found.setdefault(path.relative_to(root).as_posix(), path.read_text(encoding="utf-8-sig"))
     return found
 
 
@@ -773,6 +775,7 @@ OVERRIDE_PROFILES = frozenset({"dev", "test"})
 OVERRIDE_TABLES = frozenset({"package", "build-override"})
 DEV_TEST_RE = re.compile(r"\b(?:dev|test)\b")
 TOML_UNICODE_RE = re.compile(r"\\u([0-9A-Fa-f]{4})|\\U([0-9A-Fa-f]{8})")
+BOM = "\ufeff"
 TOML_ML_RE = re.compile(r"=\s*(\"\"\"|\'\'\')")
 CONFIG_NAMES = (".cargo/config.toml", ".cargo/config")
 SKIP_DIRS = frozenset({"target", ".git", ".local-runs", "node_modules", ".codegraph"})
@@ -838,7 +841,9 @@ def _toml_entries(text: str) -> List[Tuple[Tuple[str, ...], str]]:
     raw_lines = text.replace("\\n", "\n").split("\n")
     k = 0
     while k < len(raw_lines):
-        line = _strip_comment(SHELL_ECHO_PREFIX_RE.sub("", raw_lines[k].strip(), count=1)).strip()
+        # cargo strips a leading byte-order mark (#6474); one written by a step sits after `printf '`
+        line = SHELL_ECHO_PREFIX_RE.sub("", raw_lines[k].strip().lstrip(BOM), count=1).lstrip(BOM)
+        line = _strip_comment(line).strip()
         k += 1
         opener = TOML_ML_RE.search(line)
         if opener and line.count(opener.group(1)) % 2 == 1:
