@@ -28,10 +28,12 @@ from .test_tls_session_6060_r5 import (
     _CLIENTS,
     _FOREIGN_UID,
     _POSIX_ONLY,
+    _add_anchor,
     _as_foreign,
     _built,
     _bundle,
     _ca_dir,
+    _env_trust,
 )
 
 
@@ -48,13 +50,15 @@ def _evil_dir(parent: pathlib.Path, name: str = "stage") -> pathlib.Path:
     return directory
 
 
-def _foreign(monkeypatch: pytest.MonkeyPatch, *paths: pathlib.Path) -> None:
-    """Report ``paths`` (by inode, so across renames) as owned by another user."""
+def _foreign(
+    monkeypatch: pytest.MonkeyPatch, *paths: pathlib.Path, uid: int = _FOREIGN_UID
+) -> None:
+    """Report ``paths`` (by inode, so across renames) as owned by ``uid``."""
     for path in paths:
         found = os.lstat(path)
         inode = (found.st_dev, found.st_ino)
         for name in ("stat", "lstat", "fstat"):
-            monkeypatch.setattr(os, name, _as_foreign(getattr(os, name), inode, _FOREIGN_UID))
+            monkeypatch.setattr(os, name, _as_foreign(getattr(os, name), inode, uid))
 
 
 def _racy_base(load: Callable[[Callable[[], None]], None]) -> Callable[[], ssl.SSLContext]:
@@ -249,3 +253,59 @@ def test_component_after_a_file_is_refused_6811(
     bundle = _bundle(lab, directory)
     with pytest.raises(ValueError, match="not a directory"):
         _built(client_cls, str(bundle) + suffix)
+
+
+# ---- #6815: the owner rule holds for the CA file and directory too --------
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("kind", ["file", "hashed-entry", "empty-directory", "env-file"])
+def test_ca_input_owned_by_another_user_is_refused_6815(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    kind: str,
+) -> None:
+    """The owner of a CA file or directory can rewrite it, as the owner of a directory on the way can."""
+    directory = _ca_dir(tmp_path)
+    verify: Any = None
+    if kind == "file":
+        owned = _bundle(lab, directory)
+        verify = str(owned)
+    elif kind == "hashed-entry":
+        owned = _add_anchor(directory, lab.ca_path)
+        verify = str(directory)
+    elif kind == "empty-directory":
+        owned = directory
+        verify = str(directory)
+    else:
+        owned = _bundle(lab, directory)
+        _env_trust(monkeypatch, SSL_CERT_FILE=str(owned))
+    _foreign(monkeypatch, owned)
+    with pytest.raises(ValueError, match=f"owned by uid {_FOREIGN_UID}") as refused:
+        _built(client_cls, verify)
+    assert "#6815" in str(refused.value)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_ca_input_owned_by_root_is_accepted_6815(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    kind: str,
+) -> None:
+    """System bundles are root's: root is trusted, as for the directories on the way."""
+    directory = _ca_dir(tmp_path)
+    if kind == "file":
+        owned = _bundle(lab, directory)
+        _foreign(monkeypatch, owned, uid=0)
+        _built(client_cls, str(owned))
+    else:
+        entry = _add_anchor(directory, lab.ca_path)
+        _foreign(monkeypatch, directory, entry, uid=0)
+        _built(client_cls, str(directory))
