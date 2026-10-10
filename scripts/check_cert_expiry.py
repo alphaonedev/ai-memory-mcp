@@ -1394,10 +1394,13 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
          for k in ("PR_HEAD_SHA", "GITHUB_SHA", "PR_BASE_SHA")]
         + [("push", k, push_sha_env) for k in ("GITHUB_EVENT_BEFORE", "GITHUB_SHA")]
     )
-    # Each non-length value is the only cell that catches its own loosening of a validation site:
-    #   Arabic-Indic digit  : a `\d` / `str.isdigit` / any-Unicode-digit class.
+    # Each non-length value below catches the loosening named on its row; the `$`, fullwidth and
+    # lstrip rows are the only cells for theirs, the Arabic-Indic and newline rows are not (noted there):
+    #   Arabic-Indic digit  : a `\d` / `str.isdigit` / any-Unicode-digit class (the pr4 non-ASCII-digit
+    #                         cell also catches these; this row is not their only killer).
     #   fullwidth digit     : a class widened with the fullwidth digit range U+FF10-U+FF19.
-    #   40-hex plus newline : a `$`-anchored match, or a `.strip()` before the match.
+    #   40-hex plus newline : a `$`-anchored match (only this cell); a `.strip()` before the match is
+    #                         also caught by the CR row and the whitespace corpus.
     #   40-hex plus CR      : a `.rstrip('\r')` before the match.
     #   space plus 40-hex   : a `.strip(' ')` or `.lstrip()` before the match.
     #   superscript digit   : a translate of superscript digits to ASCII before the match.
