@@ -220,9 +220,7 @@ async fn x2_postgres_preserves_lane_sentinel() {
 /// sharing or truncating the provisioning lane's public tables.
 #[cfg(feature = "sal-postgres")]
 async fn pg_run() -> Option<Run> {
-    let Some((_scratch, store, raw)) = parity_oracle::pg_scratch(PREFIX).await else {
-        return None;
-    };
+    let (_scratch, store, raw) = parity_oracle::pg_scratch(PREFIX).await?;
     let run = run_x2(&store, &raw).await;
     store.pool().close().await;
     Some(run)

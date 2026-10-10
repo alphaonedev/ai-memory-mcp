@@ -99,9 +99,7 @@ async fn sqlite_run() -> Run {
 
 #[cfg(feature = "sal-postgres")]
 async fn pg_run() -> Option<Run> {
-    let Some((_scratch, store, raw)) = parity_oracle::pg_scratch(PREFIX).await else {
-        return None;
-    };
+    let (_scratch, store, raw) = parity_oracle::pg_scratch(PREFIX).await?;
     let run = run_x1(&store, &raw).await;
     store.pool().close().await;
     Some(run)
