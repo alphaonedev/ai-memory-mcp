@@ -234,28 +234,64 @@ def _windows(forms):
     return frozenset(form[i : i + _WINDOW] for form in forms for i in range(len(form) - _WINDOW + 1))
 
 
+def _spans(text, forms):
+    """The merged ``(start, end)`` ranges of ``text`` that belong to a secret: every
+    occurrence of a form and every ``_WINDOW``-character fragment of one."""
+    mask = bytearray(len(text))
+    for form in forms:
+        start = text.find(form)
+        while start != -1:
+            mask[start : start + len(form)] = b"\x01" * len(form)
+            start = text.find(form, start + 1)
+    windows = _windows(forms)
+    if windows:
+        for i in range(len(text) - _WINDOW + 1):
+            if text[i : i + _WINDOW] in windows:
+                mask[i : i + _WINDOW] = b"\x01" * _WINDOW
+    spans, i = [], 0
+    while i < len(text):
+        if mask[i]:
+            j = i
+            while j < len(text) and mask[j]:
+                j += 1
+            spans.append((i, j))
+            i = j
+        else:
+            i += 1
+    return spans
+
+
+def _replace_spans(text, spans, marker=REDACTED):
+    out, last = [], 0
+    for start, end in spans:
+        out.append(text[last:start])
+        out.append(marker)
+        last = end
+    out.append(text[last:])
+    return "".join(out)
+
+
 def redact(text, forms):
     """``text`` with every one of ``forms`` and every ``_WINDOW``-character fragment of one replaced by ``<redacted>``."""
     forms = tuple(forms)
-    for form in forms:
-        text = text.replace(form, REDACTED)
-    windows = _windows(forms)
-    if not windows or len(text) < _WINDOW:
-        return text
-    covered = [False] * len(text)
-    for i in range(len(text) - _WINDOW + 1):
-        if text[i : i + _WINDOW] in windows:
-            covered[i : i + _WINDOW] = [True] * _WINDOW
-    out, i = [], 0
-    while i < len(text):
-        if covered[i]:
-            while i < len(text) and covered[i]:
-                i += 1
-            out.append(REDACTED)
-        else:
-            out.append(text[i])
-            i += 1
-    return "".join(out)
+    return _replace_spans(text, _spans(text, forms))
+
+
+def redact_stream(buffer, forms, hold):
+    """Split raw ``buffer`` into ``(redacted prefix, raw tail)`` for a streaming filter (#7062).
+
+    The tail is the last ``hold`` characters, moved back to the start of any secret
+    span that crosses that boundary, and is returned UNREDACTED: it is joined with
+    the next read and matched whole, so a form split across two reads is never
+    half emitted. The prefix is redacted.
+    """
+    forms = tuple(forms)
+    cut = max(len(buffer) - hold, 0)
+    for start, end in _spans(buffer, forms):
+        if start < cut < end:
+            cut = start
+            break
+    return redact(buffer[:cut], forms), buffer[cut:]
 
 
 def scrub_file(path, secrets):
@@ -314,9 +350,7 @@ def run_redacted(argv, *, cwd, env, secrets):
             chunk = os.read(proc.stdout.fileno(), 65536)
             if not chunk:
                 break
-            pending = redact(pending + decoder.decode(chunk), forms)
-            keep = min(hold, len(pending))
-            emit, pending = pending[: len(pending) - keep], pending[len(pending) - keep :]
+            emit, pending = redact_stream(pending + decoder.decode(chunk), forms, hold)
             sys.stdout.write(emit)
             sys.stdout.flush()
         sys.stdout.write(redact(pending + decoder.decode(b"", final=True), forms))
