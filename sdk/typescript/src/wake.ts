@@ -70,19 +70,12 @@
  */
 
 import { createHash } from "node:crypto";
-import {
-  closeSync,
-  constants as fsConstants,
-  fstatSync,
-  lstatSync,
-  openSync,
-  readFileSync,
-  type Stats,
-} from "node:fs";
+import { constants as fsConstants } from "node:fs";
 import { connect as netConnect, type Socket } from "node:net";
 import { join } from "node:path";
 
 import { AgentSigningKey } from "./attestation.js";
+import { readOwnerOnlyWith } from "./ownedfile.js";
 
 /**
  * Normative maximum interval between inbox reads
@@ -477,27 +470,6 @@ export interface BundleFile {
 }
 
 /**
- * Apply the bundle's on-disk standard to an ALREADY-OBTAINED stat.
- *
- * Split out so the descriptor-bound path (`fstatSync`) and the Windows
- * path-based fallback refuse with the SAME words. `path` is only ever used to
- * word the message; nothing here resolves it again.
- */
-function checkBundleStat(path: string, st: Stats): void {
-  if (!st.isFile()) throw new WakeError(`${path} is not a regular file`);
-  if ((st.mode & 0o077) !== 0) {
-    throw new WakeError(
-      `${path} is mode ${(st.mode & 0o7777).toString(8).padStart(4, "0")}; a bundle ` +
-        "holding a private key must be 0600, or another local user can join the hub " +
-        "as this agent",
-    );
-  }
-  if (typeof process.geteuid === "function" && st.uid !== process.geteuid()) {
-    throw new WakeError(`${path} is owned by uid ${st.uid}, not by the caller`);
-  }
-}
-
-/**
  * Read a credential no other local user could read or replace, through ONE
  * descriptor (#3780).
  *
@@ -526,67 +498,11 @@ function checkBundleStat(path: string, st: Stats): void {
  * directory this loader serves are POSIX-only surfaces today.
  */
 function readOwnerOnly(path: string): string {
-  return readOwnerOnlyWith(path, {
-    noFollow: fsConstants.O_NOFOLLOW,
-    nonBlock: fsConstants.O_NONBLOCK,
-  });
-}
-
-/**
- * The flags a platform's `node:fs` offers for binding the check to the
- * descriptor. Both are `undefined` on Windows (#3812).
- */
-export interface OwnerOnlyOpenFlags {
-  noFollow?: number;
-  nonBlock?: number;
-}
-
-/**
- * {@link readOwnerOnly} with the platform flags passed in, so a POSIX test can
- * exercise the Windows leg (#3812). Not part of the SDK's public surface.
- *
- * @internal
- */
-export function readOwnerOnlyWith(path: string, flags: OwnerOnlyOpenFlags): string {
-  const { noFollow, nonBlock } = flags;
-  let openFlags = fsConstants.O_RDONLY;
-  if (typeof noFollow === "number" && typeof nonBlock === "number") {
-    openFlags |= noFollow | nonBlock;
-  } else if (lstatSync(path).isSymbolicLink()) {
-    // Windows (#3812): with no O_NOFOLLOW the link refusal is this pre-check
-    // on the path, and nothing else is: the mode/owner check and the read
-    // below run on ONE descriptor exactly as on POSIX. The residual on this
-    // leg is a link swapped in between here and the open, never a
-    // check-then-read on the path.
-    throw new WakeError(
-      `${path} is a symlink: a credential reached through a link is one whose ` +
-        "permissions were checked on the wrong file",
-    );
-  }
-
-  let fd: number;
-  try {
-    fd = openSync(path, openFlags);
-  } catch (err) {
-    // ELOOP is what O_NOFOLLOW reports for a symlink on Linux and macOS
-    // (EMLINK on the BSDs). Kept as its own refusal so the operator is told
-    // what is actually wrong rather than handed a bare errno.
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code === "ELOOP" || code === "EMLINK") {
-      throw new WakeError(
-        `${path} is a symlink: a credential reached through a link is one whose ` +
-          "permissions were checked on the wrong file",
-      );
-    }
-    throw err;
-  }
-  try {
-    // fstat on the descriptor just opened — never a second look at the path.
-    checkBundleStat(path, fstatSync(fd));
-    return readFileSync(fd, "utf8");
-  } finally {
-    closeSync(fd);
-  }
+  return readOwnerOnlyWith(
+    path,
+    { noFollow: fsConstants.O_NOFOLLOW, nonBlock: fsConstants.O_NONBLOCK },
+    (message) => new WakeError(message),
+  );
 }
 
 /**

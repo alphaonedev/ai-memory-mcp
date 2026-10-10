@@ -51,11 +51,15 @@ import {
   helloTranscript,
   isHubDriven,
   lengthPrefixed,
-  readOwnerOnlyWith,
   topicsHash,
   type BundleFile,
   type WakeSignal,
 } from "../src/wake.js";
+import { readOwnerOnlyWith as readOwnerOnlyWithRaw } from "../src/ownedfile.js";
+
+const readOwnerOnlyWith = (path: string, flags: { noFollow?: number; nonBlock?: number }): string =>
+  readOwnerOnlyWithRaw(path, flags, (message) => new WakeError(message));
+
 
 const HUB_ID = "hub-3470-ts";
 const AGENT_ID = "ai:listener-3470";
