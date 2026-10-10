@@ -145,3 +145,19 @@ def test_7063_a_secret_in_element_tail_text_is_redacted(tmp_path):
     h.scrub_file(path, [secret])
     tail = ET.parse(str(path)).getroot().find(".//b").tail
     assert tail == "<redacted>"
+
+
+def test_7063_run_redacted_reports_an_unparseable_report_and_removes_it(tmp_path, capsys):
+    """A report the parser rejects is a reported removal, not a crash (mutant N9)."""
+    h = _h()
+    report = tmp_path / "junit.xml"
+    code = f"import pathlib; pathlib.Path({str(report)!r}).write_text('<testsuites><oops')"
+    rc = h.run_redacted(
+        [sys.executable, "-c", code, f"--junitxml={report}"],
+        cwd=str(tmp_path),
+        env=None,
+        secrets=[b"unrelated-secret-0123456789"],
+    )
+    assert rc == 0
+    assert not report.exists()
+    assert "could not be filtered and was removed" in capsys.readouterr().err
