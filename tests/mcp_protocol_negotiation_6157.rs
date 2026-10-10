@@ -129,3 +129,61 @@ fn issue_6157_non_string_protocol_version_gets_newest_supported_with_diagnostic(
         );
     }
 }
+
+/// Send `count` downgrade `initialize` requests down ONE child and return
+/// the number of replies plus everything the child wrote to stderr.
+fn initialize_repeated(count: u64) -> (u64, String) {
+    let fixture = mcp_stdio_child::Fixture::new();
+    let mut child = fixture
+        .command()
+        .args(["mcp", "--profile", "full", "--tier", "keyword"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("MCP child");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    for id in 1..=count {
+        let request = json!({
+            "jsonrpc":"2.0","id":id,"method":"initialize",
+            "params":{"protocolVersion":"2099-01-01"}
+        });
+        writeln!(stdin, "{request}").expect("write initialize");
+    }
+    stdin.flush().expect("flush");
+    let mut replies = 0;
+    while replies < count {
+        let line = rx.recv_timeout(WAIT).expect("initialize response");
+        let response: Value = serde_json::from_str(&line).expect("JSON-RPC response");
+        assert_eq!(response["result"]["protocolVersion"], SHIPPED);
+        replies += 1;
+    }
+    drop(stdin);
+    let mut diag = String::new();
+    let _ = stderr.read_to_string(&mut diag);
+    let _ = child.wait();
+    (replies, diag)
+}
+
+/// The downgrade diagnostic is advisory and must not scale with request
+/// volume: a host that never drains stderr would otherwise fill the pipe
+/// buffer and stall the single-threaded stdio loop (S3 of the #6157 security
+/// review). One line per process is enough for an operator to see why.
+#[test]
+fn issue_6157_downgrade_diagnostic_is_emitted_once_per_process() {
+    let (replies, diag) = initialize_repeated(5);
+    assert_eq!(replies, 5);
+    let lines = diag.lines().filter(|l| l.contains("downgrade")).count();
+    assert_eq!(
+        lines, 1,
+        "five downgraded initialize requests must produce exactly one diagnostic line, got: {diag}"
+    );
+}
