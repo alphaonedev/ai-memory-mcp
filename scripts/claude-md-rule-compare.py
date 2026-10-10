@@ -644,6 +644,8 @@ def _self_test_cases() -> int:
          message="head change Rule-Change-Approved-By: Justin")
     case("an empty trailer value does not count", reword, True, "RESULT: FAIL",
          message="head change\n\nRule-Change-Approved-By: ")
+    case("an empty trailer value followed by another trailer does not count (#6576)", reword, True, "RESULT: FAIL",
+         message="head change\n\nRule-Change-Approved-By:\nCo-Authored-By: Placeholder <noreply@example.invalid>")
     case("a body line starting with the trailer key above a separate trailer block does not count (#6179)", reword,
          True, "RESULT: FAIL",
          message="head change\n\nThe guard documents the\nRule-Change-Approved-By: <who>. Fails closed on a missing"
