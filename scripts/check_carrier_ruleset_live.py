@@ -561,6 +561,17 @@ def on_events(workflow_text):
     return set()
 
 
+FORBIDDEN_TRIGGERS = ("pull_request_target", "workflow_run")
+
+
+def forbidden_triggers(workflow_text):
+    """Sorted names from FORBIDDEN_TRIGGERS that the workflow `on:` block names (#6453).
+
+    Both events run in the base repository context with a write-capable token, so a pull request
+    must never be able to add one of them to the workflow that carries the #6143 jobs."""
+    return sorted(set(FORBIDDEN_TRIGGERS) & on_events(workflow_text))
+
+
 def trigger_covers(workflow_text, branch):
     """True when the workflow's `on.pull_request` fires for EVERY PR whose BASE is `branch` (#6232).
 
