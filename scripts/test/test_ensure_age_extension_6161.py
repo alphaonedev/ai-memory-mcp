@@ -26,9 +26,12 @@ import json
 import os
 from pathlib import Path
 import stat
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -51,9 +54,30 @@ import json, os, sys
 base = {base!r}
 with open(base + "/psql.log", "a") as fh:
     fh.write(json.dumps({{"argv": sys.argv, "env_marker_ok": os.environ.get("PGPASSWORD") == {marker!r},
-                         "pgpassword": os.environ.get("PGPASSWORD")}}) + "\\n")
+                         "pgpassword": os.environ.get("PGPASSWORD"),
+                         "pgpassword_hex": os.environb.get(b"PGPASSWORD", b"").hex(),
+                         "connect_timeout_env": os.environ.get("PGCONNECT_TIMEOUT")}}) + "\\n")
 print(1 if os.path.isfile(base + "/share/extension/age.control") else 0)
 """
+
+# Fake psql that never answers a connect: records its pid, then sleeps.
+SLEEPING_PSQL = """#!{py}
+import os, time
+with open({base!r} + "/sleep.pid", "w") as fh:
+    fh.write(str(os.getpid()))
+time.sleep(120)
+"""
+
+# Every libpq 18.6 connection keyword (PQconndefaults, 50 entries).
+LIBPQ_18_KEYWORDS = (
+    "service user password passfile channel_binding connect_timeout dbname host hostaddr port client_encoding "
+    "options application_name fallback_application_name keepalives keepalives_idle keepalives_interval "
+    "keepalives_count tcp_user_timeout sslmode sslnegotiation sslcompression sslcert sslkey sslcertmode "
+    "sslpassword sslrootcert sslcrl sslcrldir sslsni requirepeer require_auth min_protocol_version "
+    "max_protocol_version ssl_min_protocol_version ssl_max_protocol_version gssencmode krbsrvname gsslib "
+    "gssdelegation replication target_session_attrs load_balance_hosts scram_client_key scram_server_key "
+    "oauth_issuer oauth_client_id oauth_client_secret oauth_scope sslkeylogfile"
+).split()
 
 # Loads the script as a module, swaps MANIFEST (and optionally the uid check),
 # then runs main() with the remaining argv.
@@ -431,11 +455,16 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             "postgres://ciuser@/cidb?host=%2Fvar%2Frun%2Fpostgresql",
         ):
             with self.subTest(url=url):
-                try:
-                    mod.psql_target(url)
-                except mod.HelperError as exc:
-                    self.assertNotIn("socket", str(exc))
-                    self.assertNotIn("empty host", str(exc))
+                # R6-F2: must return (no HelperError), with no password and the URL unchanged.
+                self.assertEqual(mod.psql_target(url), (url, None))
+
+    def test_password_only_userinfo_keeps_the_authority_slashes(self):
+        # Cloud F2: urlunsplit dropped '//' for an empty netloc ('postgres:/db'), which libpq rejects.
+        mod = load_module()
+        self.assertEqual(mod.psql_target("postgres://:pw@/db?host=%2Ftmp"), ("postgres:///db?host=%2Ftmp", "pw"))
+        self.assertEqual(mod.psql_target("postgres://:pw@/db?host=%2Ftmp&password=q"),
+                         ("postgres:///db?host=%2Ftmp", "q"))
+        self.assertEqual(mod.psql_target("postgresql://:pw@h/db"), ("postgresql://h/db", "pw"))
 
     # ---- round 6 (R5-F2 / #6221): libpq percent-decodes only, '+' is literal --
     def test_plus_in_query_password_is_literal(self):
@@ -457,6 +486,206 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         for call in calls:
             self.assertEqual(call["pgpassword"], pw)
 
+    # ---- round 7 (R6-F1 / #6251, R6-F2): libpq URI parity, byte-exact password -----
+    def test_invalid_percent_escape_is_refused(self):
+        # libpq: 'invalid percent-encoded token'. The helper used to accept the literal.
+        host = "127.0.0.1:5445/cidb"
+        for label, url in (
+            ("query password %zz", f"postgres://ciuser@{host}?password={PW_MARKER}%zzb"),
+            ("userinfo password %zz", f"postgres://ciuser:{PW_MARKER}%zzb@{host}"),
+            ("query password %2", f"postgres://ciuser@{host}?password={PW_MARKER}%2"),
+            ("query password lone %", f"postgres://ciuser@{host}?password={PW_MARKER}%"),
+            ("userinfo password lone %", f"postgres://ciuser:{PW_MARKER}%@{host}"),
+            ("options %zz without a password", f"postgres://ciuser@{host}?options=-c%zzx"),
+            ("options % plus a password", f"postgres://ciuser@{host}?options=%&password={PW_MARKER}"),
+            ("password plus options %", f"postgres://ciuser@{host}?password={PW_MARKER}&options=%"),
+            ("key %zz", f"postgres://ciuser@{host}?pass%zzword={PW_MARKER}"),
+            ("path %zz", f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/ci%zzdb"),
+        ):
+            with self.subTest(shape=label):
+                self.assert_url_refused(url, ("percent-encoded",))
+
+    def test_raw_space_is_refused(self):
+        # libpq: 'unexpected spaces found ... use percent-encoded spaces (%20)'.
+        host = "127.0.0.1:5445/cidb"
+        for label, url in (
+            ("query password", f"postgres://ciuser@{host}?password={PW_MARKER} b"),
+            ("userinfo password", f"postgres://ciuser:{PW_MARKER} b@{host}"),
+            ("options", f"postgres://ciuser@{host}?options=-c x"),
+            ("options plus password", f"postgres://ciuser@{host}?options=-c x&password={PW_MARKER}"),
+        ):
+            with self.subTest(shape=label):
+                self.assert_url_refused(url, ("space",))
+
+    def test_empty_query_segment_is_refused(self):
+        # libpq: 'missing key/value separator "="' for '?&&k=v', '?k=v&&' and '?&'.
+        host = "127.0.0.1:5445/cidb"
+        for label, url in (
+            ("leading &&", f"postgres://ciuser@{host}?&&password={PW_MARKER}"),
+            ("leading &", f"postgres://ciuser@{host}?&password={PW_MARKER}"),
+            ("middle &&", f"postgres://ciuser@{host}?password={PW_MARKER}&&sslmode=require"),
+            ("double trailing &&", f"postgres://ciuser@{host}?password={PW_MARKER}&sslmode=require&&"),
+            ("only &", f"postgres://ciuser:{PW_MARKER}@{host}?&"),
+            ("no password &&", f"postgres://ciuser@{host}?application_name=a&&sslmode=require"),
+        ):
+            with self.subTest(shape=label):
+                self.assert_url_refused(url, ("empty query segment",))
+
+    def test_single_trailing_ampersand_and_empty_query_are_accepted(self):
+        # libpq accepts '?k=v&' and a bare '?'; the helper keeps accepting both.
+        mod = load_module()
+        host = "127.0.0.1:5445/cidb"
+        target, password = mod.psql_target(f"postgres://ciuser@{host}?password=pw&")
+        self.assertEqual((target, password), (f"postgres://ciuser@{host}", "pw"))
+        target, password = mod.psql_target(f"postgres://ciuser@{host}?password=pw&sslmode=require&")
+        self.assertEqual((target, password), (f"postgres://ciuser@{host}?sslmode=require", "pw"))
+        url = f"postgres://ciuser@{host}?"
+        self.assertEqual(mod.psql_target(url), (url, None))
+
+    def test_percent_ff_reaches_pgpassword_byte_exact(self):
+        # R6-F1 / #6251: %FF is the single byte 0xFF in libpq, not U+FFFD (EF BF BD).
+        mod = load_module()
+        for url in (
+            "postgres://ciuser@127.0.0.1:5445/cidb?password=a%FFb",
+            "postgres://ciuser:a%FFb@127.0.0.1:5445/cidb",
+            "postgres://ciuser:a%ffb@127.0.0.1:5445/cidb",
+        ):
+            with self.subTest(url=url):
+                _, password = mod.psql_target(url)
+                self.assertEqual(os.fsencode(password), b"a\xffb")
+        self.install_good()
+        self.url_file.write_text("postgres://ciuser@127.0.0.1:5445/cidb?password=a%FFb\n")
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertEqual(call["pgpassword_hex"], b"a\xffb".hex())
+            self.assertNotIn("a%FFb", " ".join(call["argv"]))
+
+    def test_percent_encoded_query_key_is_decoded(self):
+        # R6-F2: libpq decodes keys too, so %70assword is the password key.
+        mod = load_module()
+        for key in ("%70assword", "pass%77ord", "p%61ssword"):
+            with self.subTest(key=key):
+                target, password = mod.psql_target(f"postgres://ciuser@127.0.0.1:5445/cidb?{key}=pw&sslmode=require")
+                self.assertEqual((target, password), ("postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require", "pw"))
+        # an encoded allowlisted key is kept as written
+        url = "postgres://ciuser@127.0.0.1:5445/cidb?%73slmode=require"
+        self.assertEqual(mod.psql_target(url), (url, None))
+        # an encoded key never loosens the allowlist: %68ost is host, req%75ire_auth is refused
+        self.assert_url_refused("postgres://ciuser@127.0.0.1:5445/cidb?req%75ire_auth=scram-sha-256", ("require_auth",))
+
+    def test_plus_in_userinfo_password_is_literal(self):
+        # R6-F2: the CI form is user:pass@host; '+' stays a plus there too.
+        mod = load_module()
+        target, password = mod.psql_target("postgres://ciuser:ab+cd@127.0.0.1:5445/cidb?sslmode=disable")
+        self.assertEqual(password, "ab+cd")
+        self.assertEqual(target, "postgres://ciuser@127.0.0.1:5445/cidb?sslmode=disable")
+        _, password = mod.psql_target("postgres://ciuser:a%20b+c%2Bd@127.0.0.1:5445/cidb")
+        self.assertEqual(password, "a b+c+d")
+        self.install_good()
+        self.url_file.write_text(f"postgres://ciuser:{PW_MARKER}+x@127.0.0.1:5445/cidb\n")
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertEqual(call["pgpassword"], PW_MARKER + "+x")
+
+    def test_scheme_is_matched_exactly_as_libpq_does(self):
+        # Cloud F4: urlsplit lower-cases the scheme, so 'Postgres://' (not a URI to libpq) was rewritten.
+        for url in (f"Postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb",
+                    f"POSTGRESQL://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb"):
+            with self.subTest(url=url.replace(PW_MARKER, "<M>")):
+                self.assert_url_refused(url, ("postgres://",))
+
+    def test_non_secret_libpq_keywords_are_allowed(self):
+        # Cloud F5: nine non-secret libpq 18 keywords were refused as "unlisted".
+        mod = load_module()
+        for key in ("fallback_application_name", "sslnegotiation", "sslcompression", "sslcertmode", "sslcrldir",
+                    "min_protocol_version", "max_protocol_version", "ssl_min_protocol_version",
+                    "ssl_max_protocol_version"):
+            with self.subTest(key=key):
+                url = f"postgres://ciuser@127.0.0.1:5445/cidb?{key}=x"
+                self.assertEqual(mod.psql_target(url), (url, None))
+
+    def test_remaining_libpq_keywords_are_refused_and_named(self):
+        # Cloud F5: keywords that change the auth mechanism or the session mode stay refused, by name.
+        for key in ("gsslib", "gssdelegation", "replication", "oauth_issuer", "oauth_client_id", "oauth_scope",
+                    "ssl"):
+            with self.subTest(key=key):
+                self.assert_url_refused(f"postgres://ciuser@127.0.0.1:5445/cidb?{key}=x", (f"query key {key}",))
+
+    def test_every_libpq_keyword_is_classified(self):
+        # Cloud F5: allowed, refused-by-name, or the password keyword: none falls through to "unlisted".
+        mod = load_module()
+        for key in LIBPQ_18_KEYWORDS:
+            with self.subTest(key=key):
+                self.assertIn(key, mod.ALLOWED_QUERY_KEYS | mod.REFUSED_KNOWN_KEYS)
+        self.assertEqual(mod.ALLOWED_QUERY_KEYS & mod.REFUSED_KNOWN_KEYS, set())
+
+    # ---- #6252 / cloud F6: signals and the connect timeout --------------------
+    def start_sleeping_helper(self):
+        write_exe(self.psql, SLEEPING_PSQL.format(py=sys.executable, base=str(self.base)))
+        self.install_good()
+        self.url_file.write_text(f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb\n")
+        proc = subprocess.Popen(self.cmd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        pid_file = self.base / "sleep.pid"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not (pid_file.exists() and pid_file.read_text()):
+            time.sleep(0.05)
+        child = int(pid_file.read_text())
+
+        def reap():
+            try:
+                os.kill(child, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.kill()
+            proc.communicate()
+
+        self.addCleanup(reap)
+        return proc, child
+
+    def assert_gone(self, pid):
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        self.fail(f"psql child {pid} outlived the helper (orphan holding PGPASSWORD)")
+
+    def test_sigterm_mid_connect_terminates_the_psql_child(self):
+        proc, child = self.start_sleeping_helper()
+        proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 1, out + err)
+        self.assertEqual(err.strip(), PREFIX + "interrupted")
+        self.assertNotIn(PW_MARKER, out + err)
+        self.assert_gone(child)
+
+    def test_sigint_mid_connect_is_one_line_and_terminates_the_psql_child(self):
+        proc, child = self.start_sleeping_helper()
+        proc.send_signal(signal.SIGINT)
+        out, err = proc.communicate(timeout=15)
+        self.assertEqual(proc.returncode, 1, out + err)
+        self.assertEqual(err.strip(), PREFIX + "interrupted")
+        self.assertNotIn("Traceback", err)
+        self.assertNotIn(PW_MARKER, out + err)
+        self.assert_gone(child)
+
+    def test_psql_gets_a_bounded_connect_timeout(self):
+        self.install_good()
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertEqual(call["connect_timeout_env"], "15")
+
     def test_kept_query_segments_are_not_re_encoded(self):
         mod = load_module()
         url = ("postgres://ciuser@127.0.0.1:5445/cidb?options=-c%20statement_timeout%3D5"
@@ -472,8 +701,8 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         target, password = mod.psql_target(url)
         self.assertEqual(password, "pw")
         self.assertEqual(target, "postgres://ciuser@127.0.0.1:5445/cidb?options=-c%20x&application_name=a+b")
-        # Segments (even an empty one) are never rebuilt when no password was removed.
-        url = "postgres://ciuser@127.0.0.1:5445/cidb?application_name=a&&sslmode=require"
+        # Segments (even libpq's single trailing '&') are never rebuilt when no password was removed.
+        url = "postgres://ciuser@127.0.0.1:5445/cidb?application_name=a&sslmode=require&"
         self.assertEqual(mod.psql_target(url), (url, None))
 
     def test_allowlist_excludes_every_libpq_secret_key(self):
@@ -602,26 +831,29 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assert_restored()
 
     def test_unwritable_lib_dir_fails_without_partial_state(self):
-        self.lib.chmod(0o555)
-        self.addCleanup(self.lib.chmod, 0o755)
+        # F7: a regular file where the directory belongs fails mkdir for root and non-root alike.
+        shutil.rmtree(str(self.lib))
+        self.lib.write_bytes(b"")
         r = self.run_script()
         self.assert_fails(r, 1, "age restore failed: ")
         self.assertFalse((self.ext / "age.control").exists(), "control must never precede its module")
-        self.lib.chmod(0o755)
+        self.lib.unlink()
+        self.lib.mkdir()
         self.assert_no_temp_files()
         again = self.run_script()
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assert_restored()
 
     def test_share_failure_keeps_pinned_lib_file(self):
-        self.ext.chmod(0o555)
-        self.addCleanup(self.ext.chmod, 0o755)
+        shutil.rmtree(str(self.ext))  # F7: a file where the share dir belongs, uid-independent
+        self.ext.write_bytes(b"")
         r = self.run_script()
         self.assert_fails(r, 1, "age restore failed: ")
         # Every written file carries the pinned bytes, so a failed run leaves it in place.
         self.assertEqual((self.lib / "age.dylib").read_bytes(), DYLIB)
+        self.ext.unlink()
+        self.ext.mkdir()
         self.assertFalse((self.ext / "age.control").exists(), "control must never precede its module")
-        self.ext.chmod(0o755)
         self.assert_no_temp_files()
         again = self.run_script()
         self.assertEqual(again.returncode, 0, again.stderr)
