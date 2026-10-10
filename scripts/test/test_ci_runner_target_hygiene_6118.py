@@ -2316,6 +2316,29 @@ class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
         self.assertEqual([], found)
 
 
+    BOM_PKG = '\ufeff[profile.dev.package."*"]\ndebug = 2\n'
+
+    def test_6118_r7_6474_bom_prefixed_config_first_table_is_read(self) -> None:
+        self._repo_cases([
+            ("root config BOM", ".cargo/config.toml", self.BOM_PKG),
+            ("nested config BOM", "crates/sub/.cargo/config.toml", self.BOM_PKG),
+            ("manifest BOM", "Cargo.toml", self.BOM_PKG),
+        ])
+        self._step_cases([
+            ("step writes BOM config", R7_PRE + "        run: |\n          printf '\ufeff[profile.dev.package.\"*\"]\\ndebug = 2\\n'"
+             " > .cargo/config.toml\n          cargo test --no-run\n"),
+        ])
+
+    def test_6118_r7_6474_bom_prefixed_config_on_disk_is_read(self) -> None:
+        LOCAL_RUNS.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="bom-6474-", dir=str(LOCAL_RUNS)) as tmp:
+            root = Path(tmp)
+            (root / ".cargo").mkdir()
+            (root / ".cargo" / "config.toml").write_bytes(b'\xef\xbb\xbf[profile.dev.package."*"]\ndebug = 2\n')
+            found = repo_file_violations(load_repo_files(root))
+            self.assertTrue(any(".cargo/config.toml" in v and "R-DEBUG" in v for v in found), found)
+
+
 class PruneScript6118(unittest.TestCase):
     """scripts/ci/prune-runner-target.py against a fake cargo target tree."""
 
