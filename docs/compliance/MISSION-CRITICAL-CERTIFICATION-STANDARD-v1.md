@@ -1,3 +1,7 @@
+## Erratum (#6141)
+
+Erratum (#6141): N30's enforcer `check-cert-expiry.sh` is `scripts/check_cert_expiry.py` since #6137; its verdict and output are identical on every push payload GitHub Actions delivers, and it fails closed on malformed SHAs, CERT_EXPIRY_* overrides (#5970) or git older than 2.30. The same erratum covers the historical mentions in docs/compliance/ listed in scripts/qc-allowlists/compliance-script-names-allow.txt.
+
 <!-- #3557 (N22) — ADOPTED COPY. This is the reviewed text of
 docs/reviews/AI-MEMORY-V1.0.0-MISSION-CRITICAL-CERTIFICATION-STANDARD-2026-09-09.md
 (revision 4.2), adopted verbatim into docs/compliance/ as the normative standard for the
@@ -5,8 +9,6 @@ v1.0.0 certification decision. The §0.2 declaration this standard requires is
 docs/compliance/v1.0.0-DECLARATION.md; its SHA-256 is pinned in
 scripts/qc-allowlists/declaration.sha256 and enforced by scripts/check-declaration-hash.sh.
 Edits to the standard's text go through a new revision of the reviews/ source, never here. -->
-
-Erratum (#6141): N30's enforcer `check-cert-expiry.sh` is `scripts/check_cert_expiry.py` since #6137; its verdict and output are identical on every push payload GitHub Actions delivers, and it fails closed on malformed SHAs, CERT_EXPIRY_* overrides (#5970) or git < 2.30. The same erratum covers the historical mentions in docs/compliance/ listed in scripts/qc-allowlists/compliance-script-names-allow.txt.
 
 > **Label: VENDOR SELF-CERTIFIED (3×3).** This standard and its companion audit were
 > reviewed 3×3 by one principal (§4); every certificate issued under it carries the same
