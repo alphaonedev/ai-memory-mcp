@@ -1214,6 +1214,21 @@ def self_test():
         check(label, lambda t=text, e=event, w=want: None if (e in on_events(t)) is w
               else f"{e!r} in on_events is not {w}")
 
+    # #6453 (security round 4, mutant S14): neither `pull_request_target` nor `workflow_run` may be
+    # named by the workflow `on:` block. Both run in the base repository context with a write token.
+    wr_wf = wf_text.replace("\n  pull_request:\n", "\n  workflow_run:\n    workflows: ['x']\n  pull_request:\n", 1)
+    for label, text, want in (
+            ("forbidden triggers: committed workflow has none", wf_text, []),
+            ("forbidden triggers: pull_request_target block key", target_wf, ["pull_request_target"]),
+            ("forbidden triggers: workflow_run block key", wr_wf, ["workflow_run"]),
+            ("forbidden triggers: both inline", "on: [push, workflow_run, pull_request_target]\n",
+             ["pull_request_target", "workflow_run"]),
+            ("forbidden triggers: workflow_run flow mapping", "on: {workflow_run: {}}\n", ["workflow_run"]),
+            ("forbidden triggers: plain pull_request is allowed", "on:\n  pull_request:\n", []),
+            ("forbidden triggers: no on block", "name: x\n", [])):
+        check(label, lambda t=text, w=want: None if forbidden_triggers(t) == w
+              else f"forbidden_triggers is {forbidden_triggers(t)!r}, want {w!r}")
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"
