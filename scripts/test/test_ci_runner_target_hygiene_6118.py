@@ -3870,6 +3870,31 @@ class PruneScript6118(unittest.TestCase):
                         # the same-device artifacts around the mount still go
                         self.assertFalse((self.target / "debug" / "deps" / "ai_memory-0a1b").exists(), label)
 
+    # ---- #6313 residual: a raw byte 0x80-0x9F and the C1 code point U+0080-U+009F ----
+
+    def test_6118_r7_6313_raw_byte_and_c1_code_point_print_differently(self) -> None:
+        mod = _load_prune()
+        for b in range(0x80, 0xA0):
+            with self.subTest(byte="0x%02X" % b):
+                raw = mod._escape(os.fsdecode(b"a" + bytes([b]) + b"b"))  # an undecodable byte (surrogateescape)
+                c1 = mod._escape("a%sb" % chr(b))  # the C1 control code point
+                self.assertEqual("a\\x%02xb" % b, raw)
+                self.assertEqual("a\\u{%x}b" % b, c1)
+                self.assertNotEqual(raw, c1)
+
+    def test_6118_r7_6313_escape_is_injective_on_a_byte_and_code_point_corpus(self) -> None:
+        mod = _load_prune()
+        samples = set()
+        for b in list(range(0x00, 0x20)) + list(range(0x7F, 0x100)):
+            samples.add(os.fsdecode(b"n" + bytes([b])))
+            samples.add("n" + chr(b))
+            samples.add("n\\x%02x" % b)
+            samples.add("n\\u{%x}" % b)
+        outs = {}
+        for x in sorted(samples):
+            outs.setdefault(mod._escape(x), []).append(x)
+        self.assertEqual([], [v for v in outs.values() if len(v) > 1])
+
 EXAMPLE_HASHED = "debug/examples/demo-0123456789abcdef"
 EXAMPLE_UPLIFT = "debug/examples/demo"
 # Bytes the default scope frees from examples/ (the uplift pair once, two .d)
