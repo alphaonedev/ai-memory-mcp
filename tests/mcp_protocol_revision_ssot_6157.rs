@@ -454,13 +454,17 @@ fn walk_with(root: &Path, env: &Env, out: &mut Vec<PathBuf>, unreadable: &mut Ve
     if let Some(exclude) = info_exclude(root, unreadable) {
         load_ignore_file(&exclude, "", &mut rules, unreadable);
     }
-    walk_dir(root, root, env, &mut rules, out, unreadable);
+    walk_dir(root, root, env, false, &mut rules, out, unreadable);
 }
 
+/// Walk `dir`. `inside_ignored` is true when an ancestor was entered only
+/// because it holds a tracked path: git cannot re-include below an ignored
+/// directory, so every untracked child there stays ignored (#7008).
 fn walk_dir(
     root: &Path,
     dir: &Path,
     env: &Env,
+    inside_ignored: bool,
     rules: &mut Vec<IgnoreRule>,
     out: &mut Vec<PathBuf>,
     unreadable: &mut Vec<String>,
@@ -517,27 +521,28 @@ fn walk_dir(
             continue;
         }
         let rel = format!("{base}{name}");
-        match is_ignored(&rel, file_type.is_dir(), rules, env.ignore_case) {
-            // git applies no ignore rule to a tracked path, and a directory
-            // holding one must still be entered (#7008).
-            Ok(true) => {
-                let tracked = if file_type.is_dir() {
-                    env.tracked_dirs.contains(&rel)
-                } else {
-                    env.tracked.contains(&rel)
-                };
-                if !tracked {
+        let ignored = inside_ignored
+            || match is_ignored(&rel, file_type.is_dir(), rules, env.ignore_case) {
+                Ok(ignored) => ignored,
+                Err(e) => {
+                    unreadable.push(format!("{rel}: {e}"));
                     continue;
                 }
-            }
-            Ok(false) => {}
-            Err(e) => {
-                unreadable.push(format!("{rel}: {e}"));
+            };
+        // git applies no ignore rule to a tracked path, and a directory
+        // holding one must still be entered (#7008).
+        if ignored {
+            let tracked = if file_type.is_dir() {
+                env.tracked_dirs.contains(&rel)
+            } else {
+                env.tracked.contains(&rel)
+            };
+            if !tracked {
                 continue;
             }
         }
         if file_type.is_dir() {
-            walk_dir(root, &path, env, rules, out, unreadable);
+            walk_dir(root, &path, env, ignored, rules, out, unreadable);
         } else if file_type.is_file() && !is_binary(name) {
             out.push(path);
         }
@@ -607,6 +612,25 @@ fn is_comment_line(line: &str) -> bool {
         .any(|token| line.starts_with(token))
 }
 
+/// True when `line` reads as a key awaiting its value: it is not a comment
+/// and nothing but whitespace, quotes and `:=>,{[(` follows its last marker.
+/// Prose that merely names a marker (a doc comment, a trailing comment) is
+/// not a key and must not claim the comment block below it (#6535 residue).
+fn is_dangling_key(line: &str) -> bool {
+    if is_comment_line(line) {
+        return false;
+    }
+    MARKERS
+        .iter()
+        .filter_map(|m| line.rfind(m).map(|at| at + m.len()))
+        .max()
+        .and_then(|end| line.get(end..))
+        .is_some_and(|tail| {
+            tail.chars()
+                .all(|c| c.is_whitespace() || "\"':=>,{[(".contains(c))
+        })
+}
+
 /// #6535 residue: the dates a value placed after comment lines carries.
 /// From line index `start` on, every line holding a letter or digit
 /// contributes its dates; the scan ends after the first line that is not a
@@ -662,7 +686,7 @@ fn protocol_version_uses(text: &str) -> Vec<(usize, &str)> {
             && !has_marker(next)
         {
             uses.extend(dates(next).into_iter().map(|date| (m + 1, date)));
-            if is_comment_line(next) {
+            if is_comment_line(next) && is_dangling_key(line) {
                 uses.extend(dates_after_comments(&lines, m + 1, has_marker));
             }
         }
@@ -834,6 +858,23 @@ fn walked(scratch: &Path) -> (Vec<String>, Vec<String>) {
     let mut files = Vec::new();
     let mut unreadable = Vec::new();
     walk(scratch, &mut files, &mut unreadable);
+    let mut seen: Vec<String> = files
+        .iter()
+        .filter_map(|f| f.strip_prefix(scratch).ok())
+        .map(|p| p.display().to_string())
+        .filter(|p| !p.ends_with(".gitignore"))
+        .collect();
+    seen.sort();
+    (seen, unreadable)
+}
+
+/// [`walked`] with no git facts: the ignore rules and `info/exclude` alone.
+/// The #6524 fixtures carry a hand-made `.git` that git itself would not
+/// accept as a repository, so they must not go through [`git_env`].
+fn walked_rules(scratch: &Path) -> (Vec<String>, Vec<String>) {
+    let mut files = Vec::new();
+    let mut unreadable = Vec::new();
+    walk_with(scratch, &Env::default(), &mut files, &mut unreadable);
     let mut seen: Vec<String> = files
         .iter()
         .filter_map(|f| f.strip_prefix(scratch).ok())
@@ -1089,6 +1130,39 @@ fn issue_6535_a_comment_between_key_and_value_does_not_hide_the_value() {
     }
 }
 
+/// #6535 residue: comment lines are followed only from a marker line that
+/// reads as a key (nothing but quotes, `:`, `=`, `>` and brackets after the
+/// marker) and is not itself a comment. Prose that merely names the marker,
+/// such as a doc comment, must not claim the comment block below it.
+#[test]
+fn issue_6535_prose_naming_the_marker_does_not_claim_the_comment_block_below() {
+    let cases: [SplitCase; 4] = [
+        (
+            "a doc comment ending on the marker, prose below",
+            "/// the client's `protocolVersion`\n/// prose\n/// listed 2099-02-01 once\nconst X: u8 = 1;\n",
+            vec![],
+        ),
+        (
+            "a code line ending on prose after the marker",
+            "let a = protocolVersion; // see\n// note\n// 2099-02-02\n",
+            vec![],
+        ),
+        (
+            "a key line still follows its comment block",
+            "  \"protocolVersion\" :\n  // note\n  \"2099-02-03\"\n",
+            vec![(3, "2099-02-03")],
+        ),
+        (
+            "a commented-out key does not follow a second comment",
+            "# protocolVersion:\n# note\n# 2099-02-04\n",
+            vec![],
+        ),
+    ];
+    for (what, text, want) in cases {
+        assert_eq!(protocol_version_uses(text), want, "{what}");
+    }
+}
+
 /// Every tracked `.gitignore` outside the skipped root `vendor/`. The #6524
 /// test pins that the real walk finds exactly these, so a new ignore file
 /// cannot join the tree without joining the plant test below.
@@ -1256,7 +1330,7 @@ fn issue_6524_walk_skips_every_exclusion_its_rules_name() {
         (&dir_files, want_files),
         (&controls, want_controls),
     ] {
-        let (seen, unreadable) = walked(tree);
+        let (seen, unreadable) = walked_rules(tree);
         want.sort();
         want.dedup();
         results.push((tree.display().to_string(), seen, want, unreadable));
@@ -1291,7 +1365,7 @@ fn issue_6524_walk_honours_a_worktree_info_exclude() {
     plant(&tree, ".git", &format!("gitdir: {}\n", gitdir.display()));
     plant(&tree, "zz-wt-excluded.md", PLANT);
     plant(&tree, "kept.md", PLANT);
-    let (seen, unreadable) = walked(&tree);
+    let (seen, unreadable) = walked_rules(&tree);
     let _ = fs::remove_dir_all(&tree);
     let _ = fs::remove_dir_all(&common);
     assert!(unreadable.is_empty(), "unreadable: {unreadable:?}");
