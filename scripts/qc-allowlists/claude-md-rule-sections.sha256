@@ -2,7 +2,7 @@
 # Enforced by scripts/check-claude-md-size.py. Change it only with `scripts/check-claude-md-size.py --update`
 # in the same commit as the reviewed rule change. Format: <sha256>  <heading>
 879e6d2088503bcfab91609094ac8cbc9a4f9d7fe0e1ab892197b086119c0972  (preamble before the first ## heading)
-4113651f7d7e42d129de52f9f337d1dd71147c16e2ca2efa0ea24c6725f7868f  ## Hard rule — `memory_store` FIRST on operator multi-step directives (L1 of #1389 layered-capture architecture)
+a9fbc9ca04a04d2bdf13c4772dd56ebea116b82de18e675ff1df36ee8f8711cd  ## Hard rule — `memory_store` FIRST on operator multi-step directives (L1 of #1389 layered-capture architecture)
 63628588e0ac578fea85b6e585982bd442c7daa4420ed9c6307d9007e2d19fa3  ## Required Reading at Session Start (AI agents)
 2bdf119184bfae244ccbc9061bc1eae94d7c8ace6f5d5928ff24ccfec036af01  ## Build & Test Commands
 990a4a862fcdbc3d511b5803e51a49891ac65ae85351dcd6edd7f33732cf1ffd  ## Dogfooding release branches
@@ -10,10 +10,10 @@ fbe2f5e766c42769e75aa182c50e982b89dd006a06a5d0dcf56b9d8b5b116b8a  ## Reproducing
 82403f6ca9427d84ef1b56aa4c6b5ce82c646d97d09ba1048c8d3758bc8c6c05  ## Architecture
 22e511869f7d39f3c5554333831f49faff25ab98572f34a00c384b2f9eef4d27  ## Adding New Functionality
 9b92321c53d0efe15cb34cdb952ec476058a881b6bdbd1b55582edf60a3892df  ## Code Style
-dbb4db4f3a26475f28e1567ed323ef37946c2f030280d822397c22ce9b547462  ## Prime directive (operator-set, 2026-05-17)
-6ea5f1b16c2b12f7a47b09e0931274f9324826f8eaf4f36fd9f55849c7eebecd  ## Crossroads decision protocol — 1x3 adversarial vote with a threshold (operator-set 2026-06-18, slimmed 2026-10-10)
-56f024980aa5afa2c7ad114f708c58ab5ead0953fc66c8fa0cab327a7148ebc0  ## v0.7.0 release gate (operator-set 2026-05-17 pm-v5)
-1f879a347d7af70e0048474216065c2821bb0d32e41d02c1aa549d8cb954f536  ## Sole-authority operator + no-external-code-injection (operator-set 2026-05-25)
+109ae6ca72f2f18aca0a9731c902503127cc45c20edfcb8e12129beefbd79385  ## Prime directive (operator-set, 2026-05-17)
+04577a907af3deb2b1fc680dc4c3ea5f39bea9becb03bf16ab85626672b97467  ## Crossroads decision protocol — 1x3 adversarial vote with a threshold (operator-set 2026-06-18, slimmed 2026-10-10)
+b96fb1a5548a92acc32d77668f33884ecdb636e6e2bbfa0af7c0040924704cb8  ## v0.7.0 release gate (operator-set 2026-05-17 pm-v5)
+76d73d2153d0ad4235f4067a56d9e1aea9f37c173dc220c06271f101a1584477  ## Sole-authority operator + no-external-code-injection (operator-set 2026-05-25)
 64fbc0644f5a0b1dee5694f373deaf52037be787f17cc0539a65db59b910dc8d  ## Commit & push policy (project override of global default)
 93e6f2ca5c6d0a9c5e3d8a6ed09c60eedb38002659ed4f025e3fa68e3bea22f1  ## Multi-agent worktree discipline (issue #856)
 6d33b81c15a27bfbcbcb4ae9edab9be185ae82c9fd6c3dcbd28760438490444d  ## No agent-created files under /tmp, /var/tmp, /private/tmp, or any tmpfs (project hard rule)
