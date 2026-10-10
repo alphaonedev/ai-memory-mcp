@@ -4,8 +4,9 @@
 RULE (unchanged from the inline gate it replaces): a pull request whose author is
 not OWNER / MEMBER / COLLABORATOR, or whose head lives in another repository (a
 fork, or a deleted head repository), may merge only after an APPROVED review by
-the accountable operator account exists for the PR's CURRENT head sha. Team PRs
-from a same-repository head pass.
+the accountable operator account is the operator's latest review of the PR's
+CURRENT head sha (#6329: a later CHANGES_REQUESTED or a dismissal revokes it).
+Team PRs from a same-repository head pass.
 
 #6117 / #6193: the gate is a REQUIRED context, and a push (or merge_group) run
 reports it on the same sha as the pull_request run. The old inline step answered
@@ -48,6 +49,11 @@ ASSOC_RE = re.compile(r"[A-Z_]{1,32}")
 # GitHub token shapes, plus any HTTP authorization value after its scheme word (#6328).
 TOKEN_RE = re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,}"
                       r"|(?i:bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,})")
+# #6329: the operator's latest deciding review of the head decides. Fixed-width UTC timestamps
+# compare correctly as strings (no datetime parsing, identical on 3.9 and 3.14).
+DECIDING_REVIEW_STATES = frozenset(("APPROVED", "CHANGES_REQUESTED", "DISMISSED"))
+IGNORED_REVIEW_STATES = frozenset(("COMMENTED", "PENDING"))
+REVIEW_TIME_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z")
 QUEUE_REF_RE = re.compile(r"refs/heads/gh-readonly-queue/.+/pr-([0-9]{1,9})-([^/]*)")
 
 
@@ -132,15 +138,35 @@ def is_external(pr, repo):
 
 
 def operator_approved(reviews, operator, sha):
-    """An APPROVED review by `operator` on exactly `sha`."""
+    """True iff the operator's LATEST deciding review of exactly `sha` is APPROVED (#6329).
+
+    Only `operator`'s reviews whose commit_id is `sha` count. APPROVED, CHANGES_REQUESTED and
+    DISMISSED decide; COMMENTED and PENDING do not; any other state is a GateError. Deciding
+    reviews are ordered by (submitted_at, id); a deciding review whose submitted_at is not a
+    UTC "YYYY-MM-DDTHH:MM:SSZ" string or whose id is not an integer is a GateError.
+    """
+    deciding = []
     for review in reviews:
         if not isinstance(review, dict):
             raise GateError("review entry is not an object")
         user = review.get("user")
         login = user.get("login") if isinstance(user, dict) else None
-        if login == operator and review.get("state") == "APPROVED" and review.get("commit_id") == sha:
-            return True
-    return False
+        if login != operator or review.get("commit_id") != sha:
+            continue
+        state = review.get("state")
+        if state in IGNORED_REVIEW_STATES:
+            continue
+        if state not in DECIDING_REVIEW_STATES:
+            shown = state if isinstance(state, str) and len(state) <= 40 else type(state).__name__
+            raise GateError(f"operator review on {sha} has an unknown state {shown!r}")
+        submitted_at = review.get("submitted_at")
+        review_id = review.get("id")
+        if not isinstance(submitted_at, str) or not REVIEW_TIME_RE.fullmatch(submitted_at):
+            raise GateError(f"operator review on {sha} has no valid submitted_at")
+        if not isinstance(review_id, int) or isinstance(review_id, bool):
+            raise GateError(f"operator review on {sha} has no valid id")
+        deciding.append((submitted_at, review_id, state))
+    return bool(deciding) and max(deciding)[2] == "APPROVED"
 
 
 def pr_verdict(pr, repo, operator, api):
@@ -161,7 +187,7 @@ def pr_verdict(pr, repo, operator, api):
         return True, f"PR #{number}: author={author} ({assoc}), same-repo head - team PR (pass)"
     reviews = api(f"repos/{repo}/pulls/{number}/reviews?per_page=100")
     if operator_approved(reviews, operator, sha):
-        return True, f"PR #{number}: APPROVED review by @{operator} found for head {sha} (pass)"
+        return True, f"PR #{number}: latest review by @{operator} of head {sha} is APPROVED (pass)"
     return False, (
         workflow_error(f"External-PR operator-approval gate FAILED for PR #{number}. Authored by "
         f"'{author}' ({assoc}) from '{full_name}'. Contributions from outside the team can only "
@@ -253,10 +279,14 @@ def self_test():
             return pulls
         return api
 
-    approved = {"user": {"login": op}, "state": "APPROVED", "commit_id": a}
+    approved = {"id": 1, "user": {"login": op}, "state": "APPROVED", "commit_id": a,
+                "submitted_at": "2026-10-01T00:00:00Z"}
+    revoked = {"id": 2, "user": {"login": op}, "state": "CHANGES_REQUESTED", "commit_id": a,
+               "submitted_at": "2026-10-02T00:00:00Z"}
     cases = [
         ("push-unapproved-external", 1, "push", a, api_for([pr(1, a)])),
         ("push-approved-external", 0, "push", a, api_for([pr(1, a)], {1: [approved]})),
+        ("push-approved-then-changes-requested", 1, "push", a, api_for([pr(1, a)], {1: [revoked, approved]})),
         ("push-team-same-repo", 0, "push", a, api_for([pr(2, a, "MEMBER", repo)])),
         ("push-no-pr-heads-sha", 0, "push", a, api_for([pr(1, b)])),
         ("push-api-error", 1, "push", a, api_for([], fail=True)),
