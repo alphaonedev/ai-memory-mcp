@@ -460,6 +460,7 @@ def job_defined(workflow_text, job_id, name):
 
 
 RELEASE_REF = "release/v1.0.0"
+RUN_TYPES = ("opened", "synchronize", "reopened")
 
 
 def _glob(pattern):
@@ -515,7 +516,11 @@ def _items(block, start):
 
 
 def trigger_covers(workflow_text, branch):
-    """True when the workflow's `on.pull_request` fires for a PR whose BASE is `branch` (#6232)."""
+    """True when the workflow's `on.pull_request` fires for EVERY PR whose BASE is `branch` (#6232).
+
+    Fail closed: a flow mapping, a `paths`/`paths-ignore` filter, or a `types` list without
+    opened/synchronize/reopened is False, because the workflow would be skipped for some pull
+    requests and a required context would never report (#6429, #6430)."""
     lines = _code_lines(workflow_text)
     for i, line in enumerate(lines):
         if _indent(line) == 0 and line.startswith("on:"):
@@ -547,9 +552,13 @@ def trigger_covers(workflow_text, branch):
                 sub.append(deeper)
             keys = {}
             for k, deeper in enumerate(sub):
-                m = re.match(r"(branches(?:-ignore)?)\s*:", deeper.strip())
+                m = re.match(r"(branches(?:-ignore)?|paths(?:-ignore)?|types)\s*:", deeper.strip())
                 if m and _indent(deeper) == _indent(sub[0]):
                     keys[m.group(1)] = _items(sub, k)
+            if "paths" in keys or "paths-ignore" in keys:
+                return False  # a path filter skips the workflow for some pull requests (#6430)
+            if "types" in keys and not set(RUN_TYPES) <= set(keys["types"]):
+                return False  # the default activity types are what a required context needs (#6430)
             if "branches" in keys:
                 hit = False
                 for pat in keys["branches"]:
@@ -937,7 +946,10 @@ def self_test():
             ("trigger single star stops at slash", "on:\n  pull_request:\n    branches: ['chain/*']\n",
              "chain/a/b", False),
             ("trigger block list", "on:\n  pull_request:\n    branches:\n      - 'chain/**'\n", "chain/a", True),
-            ("trigger no branch filter", "on:\n  pull_request:\n    types: [opened]\n", "chain/a", True),
+            ("trigger no branch filter", "on:\n  pull_request:\n    types: [opened, synchronize, reopened]\n",
+             "chain/a", True),
+            # #6430: `types: [opened]` alone never re-runs on a new commit, so it is not coverage.
+            ("trigger types opened only", "on:\n  pull_request:\n    types: [opened]\n", "chain/a", False),
             ("trigger branches-ignore", "on:\n  pull_request:\n    branches-ignore: ['chain/**']\n", "chain/a",
              False),
             ("trigger negated pattern", "on:\n  pull_request:\n    branches: ['chain/**', '!chain/a']\n",
