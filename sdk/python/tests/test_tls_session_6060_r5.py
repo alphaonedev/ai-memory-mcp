@@ -1825,3 +1825,21 @@ def test_ssl_cert_file_wins_over_ssl_cert_dir_6657(
     empty = _ca_dir(tmp_path, "empty")  # a valid hashed directory trusting nothing
     _env_trust(monkeypatch, SSL_CERT_FILE=str(bundle), SSL_CERT_DIR=str(empty))
     assert _get_once(client_cls, origin.url, verify) == 200
+
+
+@_POSIX_ONLY
+@_ENV_VERIFY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_empty_ssl_cert_file_is_unset_6658(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    verify: object,
+) -> None:
+    """httpx treats an empty SSL_CERT_FILE as unset and falls to SSL_CERT_DIR."""
+    directory = _ca_dir(tmp_path)
+    _add_anchor(directory, lab.ca_path)
+    _env_trust(monkeypatch, SSL_CERT_FILE="", SSL_CERT_DIR=str(directory))
+    assert _get_once(client_cls, origin.url, verify) == 200
