@@ -2350,6 +2350,21 @@ def _self_test_cases() -> int:
          meta_rows == ["--- api_key: qzxcanary6163meta"] and meta_redactor.count == 0,
          f"count={meta_redactor.count}\n{meta_rows!r}")
 
+    # #6163 round 5 (#6667, #6615): a URL password may hold a raw `/`, `#` or `?` (hand-written DSNs); it runs to the
+    # last `@` before a host. A path that holds an `@` and a scp-style address have no userinfo and stay visible.
+    masks("#6667 R5 G a URL password with a raw slash is masked", "postgres://u:ab/cd6163G@host/db",
+          hidden=("ab/cd6163G",), shown=("@host/db", "postgres://u:"), count=1)
+    masks("#6667 R5 H a URL password with a raw hash is masked", "postgres://u:ab#cd6163H@host/db",
+          hidden=("ab#cd6163H",), shown=("@host/db",), count=1)
+    masks("#6667 R5 Q a URL password with a raw question mark is masked", "postgres://u:ab?cd6163Q@host/db",
+          hidden=("ab?cd6163Q",), shown=("@host/db",), count=1)
+    masks("#6615 R5 I a URL password with an at sign and a slash is masked whole", "https://u:p@ss/x6163I@host/db",
+          hidden=("p@ss/x6163I", "ss/x6163I"), shown=("@host/db",), count=1)
+    masks("#6667 R5 N1 a path with an at sign has no userinfo", "https://host/path@x",
+          shown=("https://host/path@x",), count=0)
+    masks("#6667 R5 N2 a scp-style address has no userinfo", "git@github.com:a/b", shown=("git@github.com:a/b",),
+          count=0)
+
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
     fetch_root = base_dir / "pr-fetch"
