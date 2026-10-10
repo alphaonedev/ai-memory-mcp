@@ -2162,6 +2162,17 @@ def _self_test_cases() -> int:
     case("#6212 a bidirectional override in changed rule text is shown escaped (final mutant N30)", bidi_text, True,
          "\\u202ebidi6212\\u202c", absent="\u202e")
 
+    # #6163 round 5 (#6668): the fenced diff of a changed section is printed whatever the base guard says, so U+2028
+    # and U+2029 in changed rule text reach printable(); each separator is escaped on its own (mutants T2, V1).
+    def separator_text(root):
+        edit("tool limit is 103 tools", "tool limit is 103 tools sep\u2028six6668\u2029end")(root)
+        reseal(root)
+
+    case("#6668 R5 U+2028 in changed rule text is shown escaped (T2, V1)", separator_text, True, "sep\\u2028six6668",
+         absent="\u2028")
+    case("#6668 R5 U+2029 in changed rule text is shown escaped (T2, V1)", separator_text, True, "six6668\\u2029end",
+         absent="\u2029")
+
     # #6163 round 3 (review G1): a key line is masked by its position inside a BEGIN..END range of its own side, so a
     # changed body line whose BEGIN line is outside the hunk (or on the other side only) never prints.
     split_body = [f"6163-canary-split-b{index}" for index in range(1, 10)]
@@ -2353,7 +2364,8 @@ def _self_test_cases() -> int:
     masks("#6343 an SSH2 (RFC 4716) private key block is masked and the line after its END stays visible",
           f'{ssh2}\nComment: "6163"\nP2/56wAAA6163CanarySsh2Body\n{ssh2.replace("BEGIN", "END")}\nafter-ssh2-6163',
           hidden=("6163CanarySsh2Body",), shown=("after-ssh2-6163",))
-    age_key = "AGE-SECRET-" + "KEY-1" + "6163CANARY" + "QPZRY9X8GF" * 5
+    # #6669: the real age secret key body is 58 characters (10 + 4 * 10 + 8).
+    age_key = "AGE-SECRET-" + "KEY-1" + "6163CANARY" + "QPZRY9X8GF" * 4 + "QPZRY9X8"
     masks("#6343 an age secret key is masked", f"identity {age_key} here", hidden=(age_key[16:],), shown=("here",))
     masks("#6343 a JWK private member on a line with kty is masked",
           '{"kty":"EC","crv":"P-256","x":"6163pubx","d":"6163CanaryJwkD"}', hidden=("6163CanaryJwkD",),
@@ -2516,6 +2528,58 @@ def _self_test_cases() -> int:
          repr(mask_table_cells("note `password|secret|token` here | rest")))
     unit("#6613 R5 the code-span scan does not raise on an unclosed span", isinstance(mask_table_cells(codespan_row),
                                                                                           tuple), codespan_row)
+
+    # #6163 round 5 (#6669): each numeric limit is pinned at the limit and just inside it.
+    masks("#6669 R5 V2 a grouped number of ten digits is masked", "max_tokens: 1,234,567,890",
+          hidden=("1,234,567,890",), count=1)
+    masks("#6669 R5 V2 a grouped number of nine digits is shown", "max_tokens: 123,456,789",
+          shown=("123,456,789",), count=0)
+    masks("#6669 R5 V3 a 20-character URL user-only token is masked", "https://" + "u" * 20 + "@example.invalid/x",
+          hidden=("u" * 20,), shown=("@example.invalid/x",), count=1)
+    masks("#6669 R5 V3 a 19-character URL user name is shown", "https://" + "u" * 19 + "@example.invalid/x",
+          shown=("u" * 19,), count=0)
+    masks("#6669 R5 V4 S8 a 16-character untyped JWK private member is masked", '"d": "ABCDEFGHIJKLMNOP"',
+          hidden=("ABCDEFGHIJKLMNOP",), count=1)
+    masks("#6669 R5 V4 a 15-character untyped JWK private member is shown", '"d": "ABCDEFGHIJKLMNO"',
+          shown=("ABCDEFGHIJKLMNO",), count=0)
+    masks("#6669 R5 V5 an age identity with the real 58-character body is masked",
+          "AGE-SECRET-" + "KEY-1" + "QPZRY9X8GF2TVDW0S3JN54KHCE6MUA7LQPZRY9X8GF2TVDW0S3JN54KHCE",
+          hidden=("QPZRY9X8GF2TVDW0S3JN54KHCE",), count=1)
+    masks("#6669 R5 V5 S5 an age identity with a 50-character body is masked",
+          "AGE-SECRET-" + "KEY-1" + "QPZRY9X8GF" * 5, hidden=("QPZRY9X8GF",), count=1)
+    masks("#6669 R5 V5 S5 an age-shaped value with a 49-character body is shown",
+          "AGE-SECRET-" + "KEY-1" + "QPZRY9X8GF" * 4 + "QPZRY9X8G", shown=("QPZRY9X8G",), count=0)
+    masks("#6669 R5 V6 a later lower-case word of thirteen letters after a count is masked",
+          "max_tokens: 20000 configuration", hidden=("configuration",), count=1)
+    masks("#6669 R5 V6 a later lower-case word of twelve letters after a count is shown",
+          "max_tokens: 20000 organization", shown=("organization",), count=0)
+
+    # #6163 round 5 (#6670, #6625): one cell per regex alternative the self-test did not pin.
+    masks("#6670 R5 V7 S10 a block indicator with an indentation digit keeps the block masked",
+          "secret: |2\n  6163CanaryV7Value\nother: shown-6163", hidden=("6163CanaryV7Value",),
+          shown=("secret: |2", "other: shown-6163"), count=1)
+    masks("#6625 R5 S10 an indentation digit before a chomping sign keeps the block masked",
+          "secret: >2-\n  6163CanaryS10Value\nother: shown-6163", hidden=("6163CanaryS10Value",),
+          shown=("secret: >2-", "other: shown-6163"), count=1)
+    masks("#6670 R5 V8 an oct JWK k member on a typed line is masked", '{"kty": "oct", "k": "6163CanaryV8"}',
+          hidden=("6163CanaryV8",), shown=('"kty": "oct"',), count=1)
+    masks("#6670 R5 V8 an untyped oct JWK k member of 16 or more characters is masked",
+          '"k": "6163CanaryV8Untyped"', hidden=("6163CanaryV8Untyped",), count=1)
+    masks("#6670 R5 V13 a quote followed by punctuation inside a value does not end it",
+          'token: abc"-6163CanaryV13', hidden=("6163CanaryV13",), count=1)
+    masks("#6670 R5 V13 a single quote followed by a full stop inside a value does not end it",
+          "token: ab'.6163CanaryV13b", hidden=("6163CanaryV13b",), count=1)
+    masks("#6670 R5 V14 a block name with two spaces before the indicator keeps the block masked",
+          "secret:  |\n  6163CanaryV14a\nother: shown-6163", hidden=("6163CanaryV14a",), shown=("other: shown-6163",))
+    masks("#6670 R5 V14 a block name with a tab before the indicator keeps the block masked",
+          "secret:\t|\n  6163CanaryV14b\nother: shown-6163", hidden=("6163CanaryV14b",), shown=("other: shown-6163",))
+    masks("#6625 R5 S6 a hyphenated nested key under a credential name passes the wait on",
+          "api_key:\n  prod-eu:\n    6163CanaryS6Value", hidden=("6163CanaryS6Value",), shown=("prod-eu:",), count=1)
+    masks("#6625 R5 S9 a nested key passes the wait on to the value two levels down",
+          "api_key:\n  outer:\n    inner:\n      6163CanaryS9Value", hidden=("6163CanaryS9Value",),
+          shown=("outer:", "inner:"), count=1)
+    masks("#6625 R5 S7 a tab between unquoted value words keeps one value", "token: 20000\t6163CanaryS7Word",
+          hidden=("6163CanaryS7Word",), count=1)
 
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
