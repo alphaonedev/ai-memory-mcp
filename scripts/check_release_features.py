@@ -3766,6 +3766,10 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "4935 packages: write quoted": ("fail", [_decoy_wf(job="    permissions:\n      packages: 'write'\n")]),
     "4935 permissions: write-all in another workflow": ("fail", [_decoy_wf(top="permissions: write-all\n")]),
     "4935 permissions: write-all on a job": ("fail", [_decoy_wf(job="    permissions: write-all\n")]),
+    "6496 packages: write as a continued plain scalar": ("fail", [_decoy_wf(job="    permissions:\n      packages:\n        write\n")]),
+    "6496 permissions: write-all on the next line": ("fail", [_decoy_wf(top="permissions:\n  write-all\n")]),
+    "6496 packages: write as a folded block scalar": ("fail", [_decoy_wf(job="    permissions:\n      packages: >-\n        write\n")]),
+    "6496 packages: read on the next line stays allowed": ("pass", [_decoy_wf(job="    permissions:\n      packages:\n        read\n")]),
     "4935 release image name in another workflow": ("fail", [_decoy_wf(
         run="docker push ghcr.io/${{ github.repository_owner }}/ai-memory:latest")]),
     "4935 release image name in another case": ("fail", [_decoy_wf(run="crane copy x GHCR.IO/alphaonedev/AI-MEMORY:1.0.0")]),
