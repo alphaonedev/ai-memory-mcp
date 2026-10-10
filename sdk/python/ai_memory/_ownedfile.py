@@ -123,9 +123,11 @@ def _open_checked(
     **Platform caveat:** Windows has no ``O_NOFOLLOW`` and no ``O_NONBLOCK``,
     so a symlink can only be refused by a path-based ``lstat`` pre-check, which
     stays racy for the link itself. The mode and owner checks, and the read,
-    are bound to ONE descriptor on that leg too (#6317). (Still requiring a
-    POSIX ``os.geteuid``, as before #3780.) The hub socket and the key
-    directory this loader serves are POSIX-only surfaces today.
+    are bound to ONE descriptor on that leg too (#6317). The hub socket and the
+    key directory this loader serves are POSIX-only surfaces today, and this
+    loader does not load a credential on Windows: :func:`check_owned_stat` calls
+    ``os.geteuid``, which Windows does not have, so the load raises instead of
+    returning bytes (fail closed; #6318).
     """
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     non_block = getattr(os, "O_NONBLOCK", 0)

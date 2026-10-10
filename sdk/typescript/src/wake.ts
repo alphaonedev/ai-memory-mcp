@@ -495,7 +495,10 @@ export interface BundleFile {
  * read from that descriptor. The residual on Windows is therefore a link
  * swapped in between the pre-check and the open — never the mode/owner check,
  * which is always bound to the bytes that are read. The hub socket and the key
- * directory this loader serves are POSIX-only surfaces today.
+ * directory this loader serves are POSIX-only surfaces today, and this loader
+ * does not load a credential on Windows: `node:fs` reports a regular file's
+ * mode as `0o100666`, so the `mode & 0o077` check refuses every bundle there
+ * (fail closed; #6318).
  */
 function readOwnerOnly(path: string): string {
   return readOwnerOnlyWith(
