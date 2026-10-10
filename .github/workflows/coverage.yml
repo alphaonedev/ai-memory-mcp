@@ -46,6 +46,7 @@ on:
   # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
     branches: [main, develop, "release/**", "feat/v0.7.0-grand-slam", "rehearsal/**", "chain/**"]
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main, develop, "feat/v0.7.0-grand-slam", "release/**"]
   # Merge Queue (#3089) — `Per-Module Coverage Thresholds` (+ the sibling
