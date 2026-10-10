@@ -535,12 +535,17 @@ class DelegationBundle:
         deliberately no second resolution of ``path`` between check and read.
         """
         p = Path(path)
-        return cls.from_mapping(
-            json.loads(_read_owner_only(p)),
-            hub_id=hub_id,
-            source=str(p),
-            now=now,
-        )
+        text = _read_owner_only(p)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            # ``JSONDecodeError.doc`` holds the whole bundle, key included:
+            # keep the class name only and raise OUTSIDE the handler so the
+            # refusal has no ``__context__`` to walk to it (#6936).
+            failure = type(exc).__name__
+        else:
+            return cls.from_mapping(parsed, hub_id=hub_id, source=str(p), now=now)
+        raise WakeError(f"{p} is not a JSON delegation bundle ({failure})")
 
     @classmethod
     def from_mapping(

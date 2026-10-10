@@ -92,5 +92,5 @@ def test_no_link_of_the_refusal_chain_holds_the_bundle_bytes_6936(
     with pytest.raises(WakeError) as caught:
         DelegationBundle.load(path, hub_id=HUB_ID)
     assert caught.value.__cause__ is None
-    assert caught.value.__suppress_context__ is True
+    assert caught.value.__context__ is None
     assert not _holds_marker(caught.value)

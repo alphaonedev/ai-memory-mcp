@@ -238,9 +238,16 @@ def read_owner_only_text(
 ) -> str:
     """:func:`read_owner_only_bytes`, decoded as UTF-8, for JSON credentials."""
     fd = _open_checked(p, error=error, mode_advice=mode_advice)
-    if fd is None:
-        return p.read_text(encoding="utf-8")
     try:
-        return _drain(fd).decode("utf-8")
+        raw = p.read_bytes() if fd is None else _drain(fd)
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        # ``UnicodeDecodeError.object`` holds the whole credential: keep only
+        # the class name and raise OUTSIDE the handler so the refusal has no
+        # ``__context__`` to walk to it either (#6936).
+        failure = type(exc).__name__
+    raise error(f"{p} is not UTF-8 text ({failure})")
