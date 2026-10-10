@@ -112,7 +112,8 @@ handler instead could land between the fork and the guard around ``communicate``
 orphan psql with PGPASSWORD.
 
 Only a ``0`` or ``1`` answer from the probe counts: a psql that exits non-zero or prints anything else fails the run
-with no restore (#6677).
+with no restore (#6677).  A supervisor killed by a signal is reported as ``the psql supervisor was killed by signal N``
+(#6728); a psql killed by signal N is reported as ``psql exited`` 128+N (#6643).
 
 Exit codes: 0 healthy, 1 still unhealthy / probe or install failed,
 2 bad input (URL file, pg_config, source validation).
@@ -526,6 +527,10 @@ def probe_lists_age(psql, url):
                 kill_group(proc)  # the supervisor itself was killed: psql may still be in its group
         finally:
             os.close(write_fd)
+    if proc.returncode < 0:
+        # #6728: psql's own signals arrive as 128+N (#6643); a negative code is the supervisor's death.
+        raise HelperError(f"age probe failed: the psql supervisor was killed by signal {-proc.returncode}",
+                          EXIT_UNAVAILABLE)
     if proc.returncode != 0:
         # psql stderr is deliberately not echoed (it can carry connection detail).
         raise HelperError(f"age probe failed: psql exited {proc.returncode}", EXIT_UNAVAILABLE)

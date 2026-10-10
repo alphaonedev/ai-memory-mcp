@@ -267,7 +267,7 @@ before `CREATE EXTENSION`:
   platform (except default-ignored, job-control and fault signals) stops the psql child,
   also when it arrives while it is being spawned (#6337, #6504), and exits 1 with one
   `ensure-age-extension: interrupted` line. Only a `0` or `1` answer counts: a psql that exits
-  non-zero or prints anything else fails the run with no restore (#6677).
+  non-zero or prints anything else fails the run with no restore (#6677). A supervisor killed by a signal is reported as `the psql supervisor was killed by signal N` (#6728).
 
 It is a no-op when AGE is healthy. `--age-dir` exists for the unit tests only;
 CI always uses the default node path, and there is no environment override.
