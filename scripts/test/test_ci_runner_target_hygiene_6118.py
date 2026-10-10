@@ -3817,7 +3817,7 @@ class PruneScript6118(unittest.TestCase):
                 self.assertIn("tst\\u{202e}\\u{2028}-0123456789abcdef", proc.stdout)
 
     def test_6118_r6_6301_unreadable_uplift_candidate_is_kept_and_named_unverified(self) -> None:
-        # #6301 (vote 5-agent 4d3ea1c5, r6): a same-name same-size candidate whose bytes
+        # #6301 (round-6 vote question 2, keep as unverified 5-0; informed 3-0, 6def5ab6): a same-name same-size candidate whose bytes
         # cannot be read stays (fail closed) and says so, instead of claiming "same content".
         if UID0:
             self.skipTest("root reads any file")

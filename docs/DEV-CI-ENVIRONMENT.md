@@ -190,8 +190,10 @@ controls, both pinned by `scripts/test/test_ci_runner_target_hygiene_6118.py`
   by name and size against `debug/<bin>`, confirmed by content when both files
   can be read, not by link count (a clone has nlink 1). A file whose bytes
   cannot be read is kept (fail closed) and its `kept` line says "content
-  unreadable, not verified", never "same content" (decision record for 161a72994, a fail-closed posture choice: 5-agent vote
-  (4d3ea1c5), keep 5 / prune 0; precedent: the round-3 link-count keep rule). Pruning the source makes cargo report the bin "Dirty" and relink
+  unreadable, not verified", never "same content" (decision record for 161a72994, a fail-closed posture choice: round-6 vote
+  question 2 "unreadable partner", keep as unverified 5-0; the 3 informed voters
+  of the 5 voted 3-0, which meets the 3-agent vote (6def5ab6) threshold;
+  precedent: the round-3 link-count keep rule). Pruning the source makes cargo report the bin "Dirty" and relink
   it on the next job. On macOS an example's `.dSYM` symlink (`examples/<name>.dSYM -> <name>-<hash>.dSYM`) goes with it, so no dangling link stays behind. The category rows of the summary count only files actually deleted; a deletion that failed is listed on `failed <category>` rows. Any other hard-linked executable is kept too, since
   deleting one link frees nothing; each `kept` line names the reason. The rlib / rmeta /
   proc-macro outputs, `build/` and `.fingerprint/` stay, so the next compile is
