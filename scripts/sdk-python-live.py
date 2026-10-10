@@ -35,6 +35,7 @@ import binascii
 import codecs
 import datetime
 import functools
+import json
 import os
 import signal
 import socket
@@ -43,6 +44,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -177,6 +179,32 @@ REDACTED = "<redacted>"
 _MIN_SECRET_LEN = 8  # a shorter value would turn the filter into a wildcard
 
 
+def _more_forms(forms, blob):
+    """The renderings beyond the common ones (#7056): what the harness's own decoder
+    and a traceback print for raw bytes, other separators and byte orders, the
+    other base-N alphabets, decimal integers, JSON and URL escaping, and the
+    base64 of the value at a byte offset of one and two."""
+    forms.add(blob.decode("utf-8", "replace"))
+    forms.add(blob.decode("utf-8", "backslashreplace"))
+    for sep in (" ", "-"):
+        forms.add(blob.hex(sep))
+        forms.add(blob.hex(sep).upper())
+    forms.add(blob[::-1].hex())
+    forms.add(blob[::-1].hex().upper())
+    forms.add(str(int.from_bytes(blob, "big")))
+    forms.add(str(int.from_bytes(blob, "little")))
+    forms.add(base64.b32encode(blob).decode("ascii").lower())
+    forms.add(base64.b85encode(blob).decode("ascii"))
+    forms.add(base64.a85encode(blob).decode("ascii"))
+    forms.add(json.dumps(blob.decode("latin-1"))[1:-1])
+    forms.add(urllib.parse.quote(blob))
+    forms.add(urllib.parse.quote_plus(blob))
+    forms.add("".join(f"\\x{b:02x}" for b in blob))
+    for shift in (1, 2):
+        for encode in (base64.b64encode, base64.urlsafe_b64encode):
+            forms.add(encode(blob[shift:]).decode("ascii").rstrip("="))
+
+
 def secret_forms(data, _der=True):
     """Every text form of ``data`` that a traceback or an assertion could print (#6964).
 
@@ -212,6 +240,7 @@ def secret_forms(data, _der=True):
             text = encode(blob).decode("ascii")
             forms.add(text)
             forms.add(text.rstrip("="))
+        _more_forms(forms, blob)
     if b"\n" in stripped:
         for line in stripped.splitlines():
             if len(line.strip()) >= _MIN_SECRET_LEN and not line.startswith(b"-----"):
@@ -219,7 +248,12 @@ def secret_forms(data, _der=True):
         if _der:
             try:
                 body = b"".join(ln for ln in stripped.splitlines() if not ln.startswith(b"-----"))
-                forms.update(secret_forms(base64.b64decode(body, validate=True), _der=False))
+                der = base64.b64decode(body, validate=True)
+                forms.update(secret_forms(der, _der=False))
+                # an EC private scalar is the 32-byte OCTET STRING (04 20 ...) inside the DER
+                for at in range(len(der) - 33):
+                    if der[at : at + 2] == b"\x04\x20":
+                        forms.update(secret_forms(der[at + 2 : at + 34], _der=False))
             except (binascii.Error, ValueError):
                 pass  # not a base64 body: the other forms still apply
     forms.discard("")
@@ -454,6 +488,10 @@ class Stack:
     def signing_key(self):
         return self.keys / f"{AGENT_ID}.priv"
 
+    @property
+    def daemon_key(self):
+        return self.keys / "daemon.priv"
+
     def start_daemon(self, cert, key):
         """Start `serve` in its shipped posture: HTTP-direct writes must be signed.
 
@@ -640,8 +678,8 @@ def run_live(a):
 
 
 def run_secrets(stack, key):
-    """The secrets the filter must keep out of the CI log: the signing key and the TLS key."""
-    return [stack.signing_key.read_bytes(), key.read_bytes()]
+    """The secrets the filter must keep out of the CI log: the signing key, the daemon key and the TLS key."""
+    return [stack.signing_key.read_bytes(), stack.daemon_key.read_bytes(), key.read_bytes()]
 
 
 def run_stack(stack, sdk, port):

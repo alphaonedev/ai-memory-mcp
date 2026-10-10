@@ -120,14 +120,17 @@ def test_a_short_secret_split_across_two_writes_is_redacted():  # R35 (window ca
     assert s[:4] not in out and s[4:] not in out
 
 
-def test_the_run_secrets_are_the_signing_key_and_the_tls_key(tmp_path):  # R36 R37
+def test_the_run_secrets_are_the_signing_key_the_daemon_key_and_the_tls_key(tmp_path):  # R36 R37
     h = _h()
     signing = tmp_path / "agent.priv"
+    daemon = tmp_path / "daemon.priv"
     tls = tmp_path / "tls.key"
     signing.write_bytes(STACK_KEYS[0])
+    daemon.write_bytes(b"daemon-key-bytes-QRSTUVWXYZ012")
     tls.write_bytes(STACK_KEYS[1])
 
     class Fake:
         signing_key = signing
+        daemon_key = daemon
 
-    assert sorted(h.run_secrets(Fake(), tls)) == sorted(STACK_KEYS)
+    assert sorted(h.run_secrets(Fake(), tls)) == sorted([*STACK_KEYS, daemon.read_bytes()])

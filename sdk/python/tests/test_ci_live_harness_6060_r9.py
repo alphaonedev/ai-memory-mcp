@@ -141,6 +141,7 @@ def test_pytest_child_env_is_the_allow_list_7049(
         run = tmp_path
         home = tmp_path / "home"
         signing_key = tmp_path / "agent.priv"
+        daemon_key = tmp_path / "daemon.priv"
         socket = tmp_path / "s"
         bundle = tmp_path / "b"
         refresh_error = None
@@ -153,6 +154,7 @@ def test_pytest_child_env_is_the_allow_list_7049(
 
     stack = _Stack()
     stack.signing_key.write_bytes(_KEY)
+    stack.daemon_key.write_bytes(_KEY)
     key = tmp_path / "key.pem"
     key.write_bytes(_PEM)
     monkeypatch.setattr(h, "mint_tls", lambda _d: (tmp_path / "ca.pem", tmp_path / "cert.pem", key))
