@@ -78,7 +78,7 @@ Accepted (anything else raises `ValueError` from the constructor):
 - `True`: the same, explicit.
 - A `str` or `os.PathLike` naming an existing CA bundle file or hashed CA
   directory. The path is resolved component by component when the client is
-  built (symlinks followed under the #6559 rule, a relative path fixed against
+  built (symlinks followed under the #6653 rule below, a relative path fixed against
   the working directory at that moment; a missing component is refused, not
   normalised away by a later `..` as `os.path.realpath` would). The SDK reads the trust ONCE, at construction,
   into a context it builds the way `ssl.create_default_context` does but
@@ -88,6 +88,13 @@ Accepted (anything else raises `ValueError` from the constructor):
   trusted, and a later `chdir` cannot change what is trusted. An empty
   directory trusts nothing, so every connection fails. The path must not be
   writable by its group or by others (#6377).
+
+  This also refuses a CA bundle kept under a group-writable directory, such as
+  Homebrew's `/opt/homebrew/etc` (`drwxrwxr-x`, group `admin`) or an Intel
+  Mac's `/usr/local`: anyone in that group could swap the bundle. The error
+  names the directory, its owner and mode, and the fix: `chmod go-w <dir>`
+  (or `chown` it to yourself or root), or copy the bundle to a directory only
+  you can change (#6653).
 - Exactly `ssl.SSLContext` (not a subclass): the object returned by
   `ssl.create_default_context(cafile=...)`, with `verify_mode` left at
   `CERT_REQUIRED`, `check_hostname` on, no verify flag that relaxes chain
@@ -104,11 +111,12 @@ Refused with `ValueError` (#3840, #6267, #6268, #6269):
   `str`/path subclass).
 - A path that does not exist, or is neither a file nor a directory; a CA
   file, CA directory, symlink target or target directory that its group or
-  others can write (POSIX, #6377); a symlink anywhere on the path (the path
-  itself, a directory component, or a link a hashed entry leads through)
-  whose directory its group or others can write, unless that directory is
-  sticky and the link is yours or root's (POSIX, #6559); a directory entry
-  that is not a regular file.
+  others can write (POSIX, #6377); a path that passes through a directory
+  (an ancestor of the path, of a symlink on the way, or of a link's target)
+  that is owned by another user than you or root, or that its group or others
+  can write, unless that directory is sticky and the entry in it is yours or
+  root's (POSIX, #6559, #6653; a CA in your own subdirectory of `/tmp` is
+  fine); a directory entry that is not a regular file.
 - A context with `verify_mode` of `CERT_NONE` or `CERT_OPTIONAL`, or with
   `check_hostname` off.
 - A context with a verify flag that relaxes chain validation, such as

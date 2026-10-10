@@ -80,7 +80,8 @@ class AiMemoryClient:
             directory (``str`` / ``os.PathLike``, resolved component by
             component, a missing component refused rather than normalised
             away, and read ONCE, now, into a context the SDK builds; a group-
-            or world-writable path is refused, #6248, #6269, #6377, #6559) and exactly ``ssl.SSLContext`` (not a subclass such as
+            or world-writable path, or one under a directory another user
+            can change, is refused, #6248, #6269, #6377, #6559, #6653) and exactly ``ssl.SSLContext`` (not a subclass such as
             ``truststore.SSLContext``) that is ``CERT_REQUIRED`` with
             ``check_hostname`` on, no verify flag that relaxes chain
             validation, no cipher suite without server authentication and no
