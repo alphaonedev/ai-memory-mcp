@@ -443,43 +443,120 @@ mod tests {
         }
     }
 
-    /// #6098 — the #4934 secret-ABSENCE assertions must not put the fixture
-    /// value they check for into their own panic text. A failing run would
-    /// print exactly the cleartext #4934 forbids, and static analysis flags
-    /// the shape whether or not the fixture is a real credential. Pins the
-    /// message SHAPE: every `!<x>.contains(secret)` assertion in the #4934
-    /// test names the fixture by index and interpolates neither the value
-    /// nor the rendering that would carry it.
+    /// The test module's own source with the pin below cut out, so the pin's
+    /// literals are not scanned as if they were assertions.
+    fn tests_source_without_the_6098_pin() -> String {
+        const SOURCE: &str = include_str!("dsn.rs");
+        let module = SOURCE.find("mod tests {").map_or("", |at| &SOURCE[at..]);
+        let pin = module
+            .find("fn secret_absence_messages_never_interpolate_the_fixture_6098")
+            .unwrap_or(module.len());
+        let tail = &module[pin..];
+        let pin_end = tail
+            .find("\n    }\n")
+            .map_or(tail.len(), |at| at + "\n    }\n".len());
+        format!("{}{}", &module[..pin], &tail[pin_end..])
+    }
+
+    /// Why a secret-absence assertion message is refused, or `None` when the
+    /// message is one string literal whose only placeholder is `{i}`.
+    fn absence_message_defect(after_condition: &str) -> Option<&'static str> {
+        let Some(message) = after_condition.trim_start().strip_prefix(',') else {
+            return Some("no message");
+        };
+        let Some(body) = message.trim_start().strip_prefix('"') else {
+            return Some("message is not a string literal");
+        };
+        let Some(end) = body.find('"') else {
+            return Some("unterminated message literal");
+        };
+        let literal = &body[..end];
+        if literal.ends_with('\\') {
+            return Some("escaped quote in message literal");
+        }
+        if literal.replace("{i}", "").contains(['{', '}']) {
+            return Some("placeholder other than {i}");
+        }
+        let after = body[end + 1..].trim_start();
+        let after = after.strip_prefix(',').unwrap_or(after).trim_start();
+        if after.starts_with(')') {
+            None
+        } else {
+            Some("format arguments after the literal")
+        }
+    }
+
+    /// #6098 — a secret-ABSENCE assertion (`!<x>.contains(secret)`) must not
+    /// put the fixture value, or any rendering that carries it, into its own
+    /// panic text: a failing run would print exactly the cleartext #4934
+    /// forbids, and static analysis flags the shape whether or not the
+    /// fixture is a real credential.
+    ///
+    /// Scanning decision (test structure, no vote): the pin reads this
+    /// module's own source and parses each absence assertion's message
+    /// STRUCTURALLY (one string literal, only `{i}` allowed, no format
+    /// arguments after it) rather than blacklisting identifiers, so
+    /// `{secret:?}`, positional arguments, `{err:?}` and `{dsn}` are all
+    /// refused by one rule. It also enforces the F3 ordering: inside a test
+    /// fn, no other assertion message interpolates a rendering (`shown`,
+    /// `rendering`, `out`, `err`) before that rendering's absence assertion
+    /// has run.
     #[test]
     fn secret_absence_messages_never_interpolate_the_fixture_6098() {
-        const SOURCE: &str = include_str!("dsn.rs");
-        let start = SOURCE
-            .find("fn parse_error_never_renders_query_secrets_4934")
-            .unwrap_or(SOURCE.len());
-        let body = &SOURCE[start..];
-        let body = &body[..body.find("\n    }\n").unwrap_or(body.len())];
-        // Built at run time so this test's own text is not a match.
-        let needles = ["secret", "rendering", "shown"].map(|name| format!("{{{name}}}"));
+        let source = tests_source_without_the_6098_pin();
         let mut absence_asserts = 0_usize;
-        for chunk in body.split("assert!(").skip(1) {
-            let head = chunk.trim_start();
-            if !(head.starts_with("!rendering.contains(secret)")
-                || head.starts_with("!shown.contains(secret)"))
-            {
+        let mut defects = Vec::new();
+        for function in source.split("\n    fn ").skip(1) {
+            let mut first_absence: Vec<(String, usize)> = Vec::new();
+            let mut others: Vec<usize> = Vec::new();
+            for (at, _) in function.match_indices("assert!(") {
+                let rest = function[at + "assert!(".len()..].trim_start();
+                let guard = rest
+                    .strip_prefix('!')
+                    .and_then(|r| r.split_once(".contains(secret)"))
+                    .filter(|(g, _)| {
+                        !g.is_empty() && g.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    });
+                let Some((guard, after)) = guard else {
+                    others.push(at);
+                    continue;
+                };
+                absence_asserts += 1;
+                if let Some(why) = absence_message_defect(after) {
+                    defects.push(format!("absence assertion {absence_asserts}: {why}"));
+                }
+                if !first_absence.iter().any(|(g, _)| g == guard) {
+                    first_absence.push((guard.to_string(), at));
+                }
+            }
+            if first_absence.is_empty() {
                 continue;
             }
-            absence_asserts += 1;
-            let stmt = &chunk[..chunk.find(");").unwrap_or(chunk.len())];
-            for needle in &needles {
-                assert!(
-                    !stmt.contains(needle.as_str()),
-                    "#6098: a secret-absence assertion interpolates {needle} into its message"
-                );
+            for at in others {
+                let stmt = &function[at..];
+                let stmt = &stmt[..stmt.find(");").unwrap_or(stmt.len())];
+                for (var, guard) in [
+                    ("shown", "shown"),
+                    ("rendering", "rendering"),
+                    ("out", "out"),
+                    ("err", "rendering"),
+                ] {
+                    if !stmt.contains(&format!("{{{var}")) {
+                        continue;
+                    }
+                    let guarded = first_absence.iter().any(|(g, p)| g == guard && *p < at);
+                    if !guarded {
+                        defects.push(format!(
+                            "an assertion prints {var} before its secret-absence check"
+                        ));
+                    }
+                }
             }
         }
+        assert!(defects.is_empty(), "#6098: {defects:?}");
         assert_eq!(
-            absence_asserts, 2,
-            "#6098: both #4934 secret-absence assertions are pinned"
+            absence_asserts, 3,
+            "#6098: every secret-absence assertion in the module is pinned"
         );
     }
 }
