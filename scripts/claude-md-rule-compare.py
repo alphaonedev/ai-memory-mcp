@@ -46,9 +46,11 @@ if __name__ == "__main__" and not sys.flags.isolated:
 
 import argparse  # noqa: E402 - after the isolated-mode refusal on purpose (#5163)
 import ast
+import contextlib
 import difflib
 import importlib.machinery
 import importlib.util
+import io
 import os
 import py_compile
 import re
@@ -479,8 +481,8 @@ def plant_coverage_gap(probed: list, names: list, rounds: int) -> bool:
 # #5472: the top-level modules this script imports (except sys), pinned as a literal so the self-test has a source of
 # truth that does not come from imported_modules() itself. Adding or removing an import without updating this tuple
 # makes the self-test red.
-EXPECTED_IMPORTS = ("argparse", "ast", "difflib", "importlib", "os", "pathlib", "py_compile", "re", "shutil", "stat",
-                    "subprocess", "tokenize", "typing")
+EXPECTED_IMPORTS = ("argparse", "ast", "contextlib", "difflib", "importlib", "io", "os", "pathlib", "py_compile", "re",
+                    "shutil", "stat", "subprocess", "tokenize", "typing")
 
 
 def import_pin_gap(found: list, pinned) -> tuple:
@@ -644,6 +646,13 @@ def _self_test_cases() -> int:
          message="head change Rule-Change-Approved-By: Justin")
     case("an empty trailer value does not count", reword, True, "RESULT: FAIL",
          message="head change\n\nRule-Change-Approved-By: ")
+    for label, invisible_value in (("a zero width space", "\u200b"), ("a Hangul filler", "\u3164"),
+                                   ("a right-to-left override", "\u202e"), ("a braille blank", "\u2800"),
+                                   ("several invisible characters", "\u2060\ufeff\u00ad\u200d")):
+        case(f"an approval value made only of {label} does not count (#6572)", reword, True,
+             "no commit in the range carries", message=f"head change\n\nRule-Change-Approved-By: {invisible_value}")
+    case("an approval value with a visible name and an invisible character still counts (#6572)", reword, False,
+         "approval trailer(s):", message="head change\n\nRule-Change-Approved-By: J\u00f6rg\u200b")
     case("an empty trailer value followed by another trailer does not count (#6576)", reword, True, "RESULT: FAIL",
          message="head change\n\nRule-Change-Approved-By:\nCo-Authored-By: Placeholder <noreply@example.invalid>")
     case("a body line starting with the trailer key above a separate trailer block does not count (#6179)", reword,
@@ -788,10 +797,11 @@ def _self_test_cases() -> int:
         print("PASS: self-test - the trailer parser environment does not find a repository from its working directory"
               " (#6433)")
 
-    def recorded_parser_call():
-        """Run trailer_block with a recording `git` first on PATH: the working directory and GIT_DIR it was given."""
+    def recorded_parser_call(parse=trailer_block):
+        """Run `parse` (trailer_block) with a recording `git` first on PATH: the working directory and GIT_DIR it was
+        given."""
         fake = base_dir / "fakegit-record"
-        fake.mkdir()
+        fake.mkdir(exist_ok=True)
         record = base_dir / "fakegit-record.txt"
         (fake / "git").write_text(f"#!{sys.executable}\nimport os\n"
                                   f"open({str(record)!r}, 'w').write(os.getcwd() + '\\n' + os.environ.get('GIT_DIR', '<unset>'))\n",
@@ -800,7 +810,7 @@ def _self_test_cases() -> int:
         saved_path = os.environ.get("PATH")
         os.environ["PATH"] = str(fake)
         try:
-            trailer_block(b"subject\n")
+            parse(b"subject\n")
             return record.read_text(encoding="utf-8").split("\n")
         finally:
             if saved_path is None:
@@ -808,16 +818,71 @@ def _self_test_cases() -> int:
             else:
                 os.environ["PATH"] = saved_path
 
-    try:
-        seen_cwd, seen_git_dir = recorded_parser_call()
-    except (RuntimeError, OSError, ValueError) as exc:
-        seen_cwd, seen_git_dir = repr(exc), None
+    def parser_call_result(parse=trailer_block):
+        try:
+            return recorded_parser_call(parse)
+        except (RuntimeError, OSError, ValueError) as exc:
+            return repr(exc), None
+
+    seen_cwd, seen_git_dir = parser_call_result()
     if seen_cwd != os.path.realpath(os.sep) or seen_git_dir != os.devnull:
         print(f"FAIL: self-test - the trailer parser runs from the filesystem root with GIT_DIR at the null device"
               f" (#6433): cwd={seen_cwd!r} GIT_DIR={seen_git_dir!r}", file=sys.stderr)
         failures.append("parser cwd and GIT_DIR")
     else:
         print("PASS: self-test - the trailer parser runs from the filesystem root with GIT_DIR at the null device (#6433)")
+
+    def guarded(name, fn):
+        """#6574: run one inline cell group; any exception is that group's named FAIL and the run continues."""
+        try:
+            fn()
+        except Exception as exc:  # noqa: BLE001 - #6574: an exception in an unwrapped cell is a named FAIL, never an abort
+            failures.append(name)
+            print(f"FAIL: self-test - {name}: unexpected {type(exc).__name__}: {exc}", file=sys.stderr)
+
+    def pin(label, check):
+        """A cell for the harness itself: `check()` returns "" when the pinned behaviour holds, else the problem."""
+        def run_check():
+            problem = check()
+            if problem:
+                failures.append(label)
+                print(f"FAIL: self-test - {label}: {problem}", file=sys.stderr)
+            else:
+                print(f"PASS: self-test - {label}")
+        guarded(label, run_check)
+
+    def raising_parse(_message):
+        raise TypeError("injected by the #6574 pin")
+
+    def raising_cases():
+        raise TypeError("injected by the #6574 pin")
+
+    def check_parser_site():
+        got = parser_call_result(raising_parse)
+        if got[1] is not None or "TypeError" not in got[0]:
+            return f"a TypeError in the parser call was not reported as this cell's result: {got!r}"
+        return ""
+
+    def check_guarded():
+        before = len(failures)
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            guarded("injected cell", raising_cases)
+        named = failures[before:] == ["injected cell"] and "FAIL: self-test - injected cell: unexpected TypeError" in captured.getvalue()
+        del failures[before:]
+        return "" if named else f"an exception in a guarded group was not reported by name: {captured.getvalue()!r}"
+
+    def check_backstop():
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            code = guarded_run(raising_cases)
+        if code != 1 or "FAIL: self-test - aborted in an unguarded cell: TypeError" not in captured.getvalue():
+            return f"the top-level backstop returned {code!r} with {captured.getvalue()!r}"
+        return ""
+
+    pin("an exception in the parser-call cell is that cell's named result, not an abort (#6574)", check_parser_site)
+    pin("an exception in a guarded cell group is reported by name and the run continues (#6574)", check_guarded)
+    pin("an exception outside every cell guard is a named FAIL with exit 1 at the top level (#6574)", check_backstop)
 
     parser_failure("exits non-zero", "import sys\nsys.stderr.write('boom')\nsys.exit(3)\n")
     parser_failure("is missing", None)
@@ -1598,6 +1663,37 @@ def _self_test_cases() -> int:
     head_sha = commit_all(repo, "head change\n\nRule-Change-Approved-By: J\u00f6rg")
     range_cell("a non-ASCII approver identity is reported intact (#6609)", work, base_root, repo, fork_sha, head_sha,
                False, "approval trailer(s): ` J\u00f6rg `")
+
+    # #6573: in a clone whose base was fetched with --depth 1 the shallow boundary hides that an old commit is an
+    # ancestor of the base, so an earlier, real approval reaches base..head through a merge parent. The comparison
+    # must refuse a shallow repository; the same fixture in a full clone must still ignore the old approval.
+    work, fork_sha, base_root = fresh_pair("shallow")
+    repo = work / "repo"
+    (repo / "docs").mkdir(parents=True, exist_ok=True)
+    (repo / "docs" / "old.md").write_text("x\n", encoding="utf-8")
+    old_sha = commit_all(repo, "old rule change\n\nRule-Change-Approved-By: old-real-approval")
+    (repo / "docs" / "base.md").write_text("x\n", encoding="utf-8")
+    shallow_base = commit_all(repo, "base moves on")
+    reword(repo)
+    side_sha = commit_all(repo, "pull request work")
+    merge_sha = git(repo, *IDENT, "commit-tree", f"{side_sha}^{{tree}}", "-p", side_sha, "-p", old_sha,
+                    "-m", "merge the old commit").decode().strip()
+    git(repo, "update-ref", "refs/pull/1/head", merge_sha)
+    git(repo, "reset", "-q", "--hard", shallow_base)
+    clones = {}
+    for kind, depth in (("full", []), ("shallow", ["--depth", "1"])):
+        clone = work / f"{kind}-clone"
+        subprocess.run(["git", "clone", "-q", *depth, f"file://{repo}", str(clone)], check=True, capture_output=True)
+        git(clone, "fetch", "-q", "origin", "+refs/pull/1/head:refs/remotes/pull/head")
+        clones[kind] = clone
+    flags = {kind: git(clone, "rev-parse", "--is-shallow-repository").decode().strip() for kind, clone in clones.items()}
+    if flags != {"full": "false", "shallow": "true"}:
+        print(f"FAIL: self-test - the #6573 fixture is not a full clone and a shallow clone: {flags!r}", file=sys.stderr)
+        failures.append("shallow fixture")
+    range_cell("a full clone ignores an old approval reached through a merge parent (#6573)", work, base_root,
+               clones["full"], shallow_base, merge_sha, True, "no commit in the range carries")
+    range_cell("a shallow repository is refused instead of counting an old approval (#6573)", work, base_root,
+               clones["shallow"], shallow_base, merge_sha, True, "the repository is shallow")
 
     # #5180: the COUNT CHANGED branch uses the same dynamic fence as the rule branch; no other census diff carries
     # a backtick run, so a static fence there was never caught.
