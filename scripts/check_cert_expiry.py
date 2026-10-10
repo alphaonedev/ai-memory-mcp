@@ -2815,8 +2815,12 @@ def _log_safe_cells(t):
             t.fail(f"(log-safe-cf-U+{code:04X}): log_safe left U+{code:04X} unescaped or mangled: {got!r}")
     # Every Cf code point of this interpreter's Unicode tables, sweep (the table version differs by Python).
     for code in range(0x110000):
-        if unicodedata.category(chr(code)) == "Cf" and "\\" not in log_safe(chr(code)):
-            t.fail(f"(log-safe-cf-sweep): log_safe left the format character U+{code:04X} raw")
+        if unicodedata.category(chr(code)) != "Cf":
+            continue
+        want = f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
+        if log_safe(chr(code)) != want:
+            t.fail(f"(log-safe-cf-sweep): log_safe printed the format character U+{code:04X} as "
+                   f"{log_safe(chr(code))!r}, not {want!r}")
             break
     for plain in ("plain ascii-name_1.yml", "\xa77 / F7", "a\u00a0b", "caf\u00e9"):
         if log_safe(plain) != plain:
