@@ -534,6 +534,33 @@ def _items(block, start):
     return [v.strip().strip("\"'") for v in values if v.strip()]
 
 
+def on_events(workflow_text):
+    """Event names of the workflow's top-level `on:`: block keys, or every word of an inline value.
+
+    Used to pin that no `pull_request_target` trigger (fork code with a write token) is added
+    (mutant S14, #6440). An inline value yields all its words, a superset: it only ever adds names."""
+    lines = _code_lines(workflow_text)
+    for i, line in enumerate(lines):
+        if _indent(line) == 0 and line.startswith("on:"):
+            inline = line[3:].strip()
+            if inline:
+                return set(re.findall(r"[\w-]+", inline))
+            events = set()
+            block = []
+            for body in lines[i + 1:]:
+                if _indent(body) == 0:
+                    break
+                block.append(body)
+            if block:
+                top = _indent(block[0])
+                for body in block:
+                    m = re.match(r"([\w-]+)\s*:", body.strip()) if _indent(body) == top else None
+                    if m:
+                        events.add(m.group(1))
+            return events
+    return set()
+
+
 def trigger_covers(workflow_text, branch):
     """True when the workflow's `on.pull_request` fires for EVERY PR whose BASE is `branch` (#6232).
 
