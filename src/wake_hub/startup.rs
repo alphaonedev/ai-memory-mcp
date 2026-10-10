@@ -630,6 +630,34 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener as StdUnixListener;
 
+    /// A scratch directory for a socket test, rooted at `base`.
+    /// #6263 red: this is the plain `tempdir_in(base)`, so a long `base`
+    /// yields a socket path past `sun_path`.
+    fn socket_test_dir_in(base: &Path) -> tempfile::TempDir {
+        tempfile::tempdir_in(base).expect("tmp")
+    }
+
+    /// #6263 — a socket test must work whatever `TMPDIR` is, including the
+    /// repository-mandated scratch directory whose absolute path alone runs
+    /// past the 104-byte macOS `sun_path`.
+    #[test]
+    fn socket_test_dir_stays_bindable_under_a_long_base_6263() {
+        let root = tempfile::tempdir().expect("tmp");
+        let mut long = root.path().to_path_buf();
+        while long.as_os_str().len() < 140 {
+            long.push("a-deliberately-long-scratch-directory-name");
+        }
+        fs::create_dir_all(&long).expect("mkdir long base");
+        let dir = socket_test_dir_in(&long);
+        let path = dir.path().join("probe.sock");
+        assert!(
+            path.as_os_str().len() < 100,
+            "socket path must fit sun_path, got {} bytes",
+            path.as_os_str().len()
+        );
+        let _listener = StdUnixListener::bind(&path).expect("bind under a long TMPDIR");
+    }
+
     /// NOTE the plain `#[test]`: the probe must NOT need a Tokio runtime.
     /// It is a `getsockopt` on a raw descriptor, and `ai-memory wake-hub
     /// --posture` (plus the future synchronous `doctor` check) calls it outside
