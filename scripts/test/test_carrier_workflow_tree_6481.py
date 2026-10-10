@@ -587,6 +587,8 @@ class Round11EchoMask(unittest.TestCase):
         long_row = "--password " + self.TAIL + " and more text to run past the prefix"
         self.assertEqual(SUBSET.echo(long_row), repr(long_row[:24] + "..."))
         self.assertNotIn(self.TAIL, SUBSET.echo("A: " + "x" * 600 + self.TAIL))
+        # #6891: a colon followed by a tab is a separator.
+        self.assertEqual(SUBSET.echo("NOTE:\t" + self.TAIL + " and more text past col 24"), repr("NOTE:\t<withheld 37 chars>"))
 
     def test_mask_shapes_the_round11_campaign_left_unkilled(self):
         """Mutants Y3 (quote allowed in an operand), Y4 (ghs_ prefix) and V7 (= as a row separator) survived."""
