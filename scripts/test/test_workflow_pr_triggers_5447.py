@@ -4358,5 +4358,42 @@ class QueueRefBaseSha6325(unittest.TestCase):
         doc = " ".join(APPROVAL_PY.read_text(encoding="utf-8").split('"""')[1].split())
         self.assertIn("merge_group.base_sha", doc)
 
+
+
+# ---- Round 5 (#6327): the approval docs disclose every open residual of the gate ----
+
+
+class ApprovalDocResiduals6327(unittest.TestCase):
+    """Both pages scope the merge-boundary guarantee and name each open residual next to it.
+
+    #6213 (a PR opened later on an already-judged sha), #6223 (on pull_request the job runs the
+    workflow and the evaluator from the PR's own merge ref) and #6229 (a merge_group run judges
+    only the PR named by the queue ref).  The pin stays until those issues close.
+    """
+
+    DOCS = ("docs/AI_DEVELOPER_GOVERNANCE.md", "docs/contributing-external.md")
+
+    def paragraph(self, rel: str) -> str:
+        text = (ROOT / rel).read_text(encoding="utf-8")
+        start = text.index("External-PR operator-approval gate (author outside team => @alphaonedev review)")
+        end = text.find("\n3. " if rel.endswith("GOVERNANCE.md") else "\n4. ", start)
+        self.assertGreater(end, start, rel)
+        return " ".join(text[start:end].split())
+
+    def test_6327_each_page_names_all_open_residuals_beside_the_guarantee(self) -> None:
+        for rel in self.DOCS:
+            para = self.paragraph(rel)
+            for issue in ("#6213", "#6223", "#6229"):
+                with self.subTest(doc=rel, issue=issue):
+                    self.assertIn(issue, para)
+
+    def test_6327_the_guarantee_is_scoped(self) -> None:
+        for rel in self.DOCS:
+            with self.subTest(doc=rel):
+                para = self.paragraph(rel)
+                self.assertIn("open residuals", para)
+                self.assertIn("own merge ref", para)  # #6223
+                self.assertIn("only the PR named by the queue ref", para)  # #6229
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
