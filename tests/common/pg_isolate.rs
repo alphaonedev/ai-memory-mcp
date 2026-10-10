@@ -95,6 +95,10 @@ const IN_USE_SQLSTATE: &str = "55006";
 const IO_BOUND: Duration = Duration::from_secs(60);
 /// How long publishing to the environment waits for the shared env lock.
 const ENV_LOCK_WAIT: Duration = Duration::from_secs(30);
+/// Test-only override of [`ENV_LOCK_WAIT`], in milliseconds. A value that is
+/// not a number keeps the default, so it can only shorten a wait, never leave
+/// one unbounded (#6889).
+pub const ENV_LOCK_WAIT_MS_VAR: &str = "AI_MEMORY_TEST_PG_ENV_LOCK_WAIT_MS";
 
 /// What to do with the URL a test asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -405,7 +409,11 @@ fn same_server(a: &str, b: &str) -> bool {
 /// The shared env lock was not free within [`ENV_LOCK_WAIT`]; nothing was
 /// changed and raw readers would still see the shared database.
 fn publish_env(base: &str, name: &str, minted: &str) -> Result<(), String> {
-    publish_env_within(base, name, minted, ENV_LOCK_WAIT)
+    let wait = std::env::var(ENV_LOCK_WAIT_MS_VAR)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(ENV_LOCK_WAIT, Duration::from_millis);
+    publish_env_within(base, name, minted, wait)
 }
 
 /// [`publish_env`] with an explicit lock wait.
@@ -698,6 +706,37 @@ pub fn database_exists_blocking(base: &str, name: &str) -> Result<bool, String> 
             eprintln!("WARN: [pg_isolate] closing the catalog connection failed: {e}");
         }
         Ok(found)
+    })
+}
+
+/// Every clone of run `run` that exists on the server `base` points at, with or
+/// without a session and regardless of age (unlike the stale sweep). Names that
+/// do not match the run's exact clone shape are not returned.
+///
+/// # Errors
+///
+/// A bad run id, connecting or the catalog query failed.
+pub fn run_clones_blocking(base: &str, run: &str) -> Result<Vec<String>, String> {
+    if !is_valid_run_id(run) {
+        return Err(format!("run id {run:?} is not valid"));
+    }
+    let (url, run) = (base.to_string(), run.to_string());
+    run_blocking(async move {
+        let mut conn = connect(&url).await?;
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT datname::text FROM pg_database WHERE starts_with(datname, $1) ORDER BY 1",
+        )
+        .bind(format!("{}_", run_prefix(&run)))
+        .fetch_all(&mut conn)
+        .await
+        .map_err(|e| format!("clone listing failed: {e}"))?;
+        if let Err(e) = conn.close().await {
+            eprintln!("WARN: [pg_isolate] closing the catalog connection failed: {e}");
+        }
+        Ok(names
+            .into_iter()
+            .filter(|n| parse_isolated_name(&run, n).is_some())
+            .collect())
     })
 }
 
