@@ -992,6 +992,42 @@ def self_test():
     check("issue number bool", lambda: read_raises(lambda: live_issue_state("o/r", run=fake_run((
         ("/issues/", '{"number": true, "state": "open"}'),)))(1)))
 
+    # #6436: a live ruleset is OK only when it is exactly the payload: the exact include set, the
+    # exact rule set, no duplicate context, the payload name, and one match (the PUT target).
+    def with_include(extra):
+        return mut(lambda rs: rs["conditions"]["ref_name"].update(
+            include=list(REQUIRED_PATTERNS) + extra))
+
+    # The unpinned copy comes FIRST so the pinned copy "wins" in a dict build (the shape that passed).
+    dup_unpinned = mut(lambda rs: params(rs)["required_status_checks"].insert(
+        0, {"context": params(rs)["required_status_checks"][0]["context"]}))
+    dup_pinned = mut(lambda rs: params(rs)["required_status_checks"].append(
+        dict(params(rs)["required_status_checks"][0])))
+    other_id = mut(lambda rs: rs.update(id=2))
+    for label, rulesets, needle in (
+            ("wide include ~ALL", [mut(lambda rs: rs["conditions"]["ref_name"].update(
+                include=list(REQUIRED_PATTERNS) + ["~ALL"]))], "include must be exactly"),
+            ("wide include release/*", [with_include(["refs/heads/release/*"])], "include must be exactly"),
+            ("wide include ~DEFAULT_BRANCH", [with_include(["~DEFAULT_BRANCH"])], "include must be exactly"),
+            ("include repeats a pattern", [mut(lambda rs: rs["conditions"]["ref_name"].update(
+                include=[REQUIRED_PATTERNS[0], REQUIRED_PATTERNS[0], REQUIRED_PATTERNS[1]]))],
+             "include must be exactly"),
+            ("only ~ALL", [mut(lambda rs: rs["conditions"]["ref_name"].update(include=["~ALL"]))], "include"),
+            ("exclude null", [mut(lambda rs: rs["conditions"]["ref_name"].update(exclude=None))], "exclude"),
+            ("extra rule type", [mut(lambda rs: rs["rules"].append({"type": "pull_request", "parameters": {}}))],
+             "rule types"),
+            ("extra update rule", [mut(lambda rs: rs["rules"].append({"type": "update"}))], "rule types"),
+            ("duplicate context unpinned", [dup_unpinned], "duplicate"),
+            ("duplicate context pinned", [dup_pinned], "duplicate"),
+            ("other name, exact content", [mut(lambda rs: rs.update(name="other-ruleset"))], "name must be"),
+            ("two rulesets match", [good, other_id], "ambiguous")):
+        check(label, lambda r=rulesets, n=needle: verify_case(promoted, r, applied, is_open, False, 1, n))
+    check("renamed ruleset is never the PUT target", lambda: (lambda rc, lines: None if (
+        rc == 1 and "the PUT targets" not in "\n".join(lines)
+        and "OK:" not in "\n".join(lines)) else f"rc={rc} lines={lines!r}")(
+            *verify(*committed, pending, [mut(lambda rs: rs.update(name="other-ruleset"), base=good_c)],
+                    is_open, False)))
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"
