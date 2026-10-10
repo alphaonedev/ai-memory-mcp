@@ -84,3 +84,16 @@ async fn serve_tls_bind_failure_uses_the_same_certified_shutdown_path() {
             .is_some_and(|detail| !detail.is_empty())
     );
 }
+
+/// #6385 — a Ctrl-C handler that could not be registered must not read as a
+/// received interrupt: `serve` would otherwise begin graceful shutdown at once
+/// and log only the ordinary "shutting down" line.
+#[test]
+fn a_failed_ctrl_c_registration_is_not_a_received_interrupt_6385() {
+    let failure = Err(std::io::Error::other("cannot register SIGINT handler"));
+    assert_eq!(
+        classify_interrupt(&failure),
+        InterruptWait::HandlerUnavailable
+    );
+    assert_eq!(classify_interrupt(&Ok(())), InterruptWait::Received);
+}

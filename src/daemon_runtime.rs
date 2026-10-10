@@ -8101,6 +8101,34 @@ fn classify_server_failure(error: anyhow::Error) -> anyhow::Error {
     ))
 }
 
+/// What a `ctrl_c()` wait ended with (#6385).
+#[derive(Debug, PartialEq, Eq)]
+enum InterruptWait {
+    /// The process received SIGINT / Ctrl-C.
+    Received,
+    /// The handler could not be registered; no interrupt will ever arrive.
+    HandlerUnavailable,
+}
+
+/// Classify the `io::Result` of `tokio::signal::ctrl_c()`.
+fn classify_interrupt(result: &std::io::Result<()>) -> InterruptWait {
+    let _ = result; // #6385 red: every outcome counts as a received interrupt.
+    InterruptWait::Received
+}
+
+/// Resolve when the process is interrupted. A failure to register the handler
+/// is logged and parks the future forever, so it can never turn into an
+/// instant, unexplained shutdown (#6385; ERRORS-19).
+async fn interrupt_signal() {
+    let result = tokio::signal::ctrl_c().await;
+    if classify_interrupt(&result) == InterruptWait::HandlerUnavailable {
+        if let Err(error) = &result {
+            tracing::error!(%error, "could not register the Ctrl-C handler; SIGINT will not trigger shutdown");
+        }
+        std::future::pending::<()>().await;
+    }
+}
+
 /// Run the HTTP memory daemon. Loads TLS state, builds `AppState`, spawns
 /// lifecycle-owned workers, and binds a listener (TLS or plain HTTP). On every
 /// exit path it quiesces writers, drains deferred audit, and either completes
@@ -8279,11 +8307,11 @@ pub async fn serve(db_path: PathBuf, args: ServeArgs, app_config: &AppConfig) ->
         // `cli::wake_hub::shutdown_signal`.
         #[cfg(unix)]
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
+            () = interrupt_signal() => {}
             _ = terminate.recv() => {}
         }
         #[cfg(not(unix))]
-        let _ = tokio::signal::ctrl_c().await;
+        interrupt_signal().await;
         tracing::info!("shutting down — draining deferred-audit queue then checkpointing WAL");
     };
     let api_key_state = bootstrap.api_key_state;
