@@ -592,6 +592,11 @@ def run_live(a):
         stack.close()
 
 
+def run_secrets(stack, key):
+    """The secrets the filter must keep out of the CI log: the signing key and the TLS key."""
+    return [stack.signing_key.read_bytes(), key.read_bytes()]
+
+
 def run_stack(stack, sdk, port):
     run = stack.run
     try:
@@ -619,7 +624,7 @@ def run_stack(stack, sdk, port):
     )
     # pytest's output goes through the redaction filter: a failing live test
     # may print the per-run signing key or the TLS key in an assertion (#6964).
-    secrets = [stack.signing_key.read_bytes(), key.read_bytes()]
+    secrets = run_secrets(stack, key)
     exit_code = run_redacted(
         [
             sys.executable,

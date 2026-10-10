@@ -67,3 +67,48 @@ def test_a_key_at_the_very_end_of_the_output_is_redacted():  # R41
     hx = KEY.hex()
     out = _run(h, f"import sys; sys.stdout.write({hx!r})", [KEY])
     assert hx not in out
+
+
+SHORT = b"Zk3!pQ9x"  # 8 bytes: long enough to be a secret, too short for a 12-character window
+STACK_KEYS = (b"signing-key-bytes-0123456789", b"tls-key-bytes-abcdefghijklmnop")
+
+
+def test_a_secret_shorter_than_a_window_is_redacted_as_an_exact_form():  # R38
+    h = _h()
+    out = _run(h, f"print('x {SHORT.decode()} y')", [SHORT])
+    assert SHORT.decode() not in out
+
+
+def test_unpadded_base64_of_a_short_secret_is_redacted():  # R33 (window cannot cover it)
+    h = _h()
+    padded = base64.b64encode(SHORT).decode()
+    form = padded.rstrip("=")
+    assert form != padded and len(form) < 12
+    out = _run(h, f"print('x {form} y')", [SHORT])
+    assert form not in out
+
+
+def test_a_short_secret_split_across_two_writes_is_redacted():  # R35 (window cannot cover it)
+    h = _h()
+    s = SHORT.decode()
+    code = (
+        "import sys, time\n"
+        f"sys.stdout.write('a' * 70000 + {s[:4]!r}); sys.stdout.flush(); time.sleep(0.3)\n"
+        f"sys.stdout.write({s[4:]!r} + ' tail' * 10); sys.stdout.flush()\n"
+    )
+    out = _run(h, code, [SHORT])
+    assert s not in out
+    assert s[:4] not in out and s[4:] not in out
+
+
+def test_the_run_secrets_are_the_signing_key_and_the_tls_key(tmp_path):  # R36 R37
+    h = _h()
+    signing = tmp_path / "agent.priv"
+    tls = tmp_path / "tls.key"
+    signing.write_bytes(STACK_KEYS[0])
+    tls.write_bytes(STACK_KEYS[1])
+
+    class Fake:
+        signing_key = signing
+
+    assert sorted(h.run_secrets(Fake(), tls)) == sorted(STACK_KEYS)
