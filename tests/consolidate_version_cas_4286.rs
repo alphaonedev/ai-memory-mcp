@@ -430,10 +430,16 @@ async fn http_consolidate_llm_summary_refuses_source_edited_mid_summary_pg_4286(
     let b = seed(&router, &format!("pg source b {suffix}")).await;
     *target.lock().expect("target") = b.clone();
 
+    // A per-run summary title so a row left by an earlier host run cannot
+    // satisfy (or trip) the no-summary-row check below.
+    let merged_title = format!("{MERGED_TITLE} {suffix}");
+    // Bounded window (with clock-skew slack) keeps the list small on a host
+    // database that accumulates rows across runs.
+    let started = chrono::Utc::now() - chrono::Duration::minutes(10);
     let (status, v) = post(
         &router,
         "/api/v1/consolidate",
-        consolidate_body(&[a.clone(), b.clone()]),
+        json!({"ids": [a.clone(), b.clone()], "title": merged_title, "namespace": NS}),
     )
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{v}");
@@ -442,4 +448,15 @@ async fn http_consolidate_llm_summary_refuses_source_edited_mid_summary_pg_4286(
     let edited = store.get(&ctx, &b).await.expect("edited source still live");
     assert_eq!(edited.content, EDITED);
     assert!(store.get(&ctx, &a).await.is_ok(), "untouched source live");
+    // #4286 review F3 — parity with the sqlite cell: no summary row lands.
+    // `Filter` is `#[non_exhaustive]`: build from Default, then set fields.
+    let mut filter = ai_memory::store::Filter::default();
+    filter.namespace = Some(NS.to_string());
+    filter.since = Some(started);
+    filter.limit = 1000;
+    let rows = store.list(&ctx, &filter).await.expect("list namespace");
+    assert!(
+        rows.iter().all(|m| m.title != merged_title),
+        "no summary row may be written on a conflict"
+    );
 }
