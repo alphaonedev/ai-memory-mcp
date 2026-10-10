@@ -2772,7 +2772,12 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     t.expect_red("6124-f14", "a second, unrelated new amendment", repo, exp6124, f14,
                  red6124 + [("exactly one new amendment", "did not name the one-record rule"),
                             ("one record may list every changed path",
-                             "did not say one record may list all changed paths (#6422)")])
+                             "did not say one record may list all changed paths (#6422)"),
+                            # #6422: records already on the carrier cannot be
+                            # merged (append-only), so the remedy names the
+                            # step-wise promotion.
+                            ("promote step-wise, one landed record per promotion step",
+                             "did not name the step-wise promotion (#6422)")])
     # (6124-f15a..d) RED - the header date is a real ISO date, not in the
     # future (#6356, X9: two days past the commit day), not back-dated before
     # the merge-base commit day (#6358).
