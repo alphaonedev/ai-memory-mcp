@@ -102,14 +102,25 @@ pub fn sqlite_capture(conn: &rusqlite::Connection, id: &str, auto: bool) -> Resu
 }
 
 pub fn assert_stamps(created: &str, updated: &str, signed: &str) {
-    let bound = Duration::minutes(2);
     for stamp in [created, updated, signed] {
-        let actual = chrono::DateTime::parse_from_rfc3339(stamp).expect("timestamp");
-        assert!(
-            (Utc::now() - actual.with_timezone(&Utc)).abs() < bound,
-            "write/signature timestamp must stay on the real clock"
-        );
+        assert_real_stamp(stamp);
     }
+}
+
+pub fn assert_real_stamp(stamp: &str) {
+    let bound = Duration::minutes(2);
+    let actual = chrono::DateTime::parse_from_rfc3339(stamp).expect("timestamp");
+    assert!(
+        (Utc::now() - actual.with_timezone(&Utc)).abs() < bound,
+        "write/signature timestamp must stay on the real clock: {stamp}"
+    );
+}
+
+fn hard_delete_row() -> Memory {
+    let mut memory = capture_write("hard-delete-clock").memory;
+    memory.tier = Tier::Short;
+    memory.expires_at = Some((Utc::now() - Duration::days(2)).to_rfc3339());
+    memory
 }
 
 pub fn sqlite_stamps(conn: &rusqlite::Connection, id: &str) {
@@ -164,11 +175,19 @@ pub fn assert_ids(results: Vec<(Memory, f64)>, expected: &[String]) {
 }
 
 pub fn sqlite_clock(offset: i64) {
+    // This oracle runs only in an exact, isolated test child. Seed the same
+    // process atomic as normal boot, without changing the process environment.
+    ai_memory::config::set_append_only(true);
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("private sqlite");
     let rows = clock_rows();
     for (memory, _) in &rows {
         ai_memory::storage::insert(&conn, memory).expect("seed clock row");
     }
+    conn.execute(
+        "INSERT INTO memory_links (source_id,target_id,relation,created_at,attest_level) VALUES ('clock-0','protected-long','related_to',?1,'unsigned')",
+        [Utc::now().to_rfc3339()],
+    )
+    .expect("seed archived edge");
     let expected = expected_ids(&rows, offset);
     let (results, _) = ai_memory::storage::recall(
         &conn,
@@ -224,8 +243,38 @@ pub fn sqlite_clock(offset: i64) {
             memory.id
         );
     }
+    sqlite_gc_stamps(&conn, removed);
     sqlite_capture(&conn, "healthy-clock-write", false).expect("write under clock offset");
     sqlite_stamps(&conn, "healthy-clock-write");
+}
+
+fn sqlite_gc_stamps(conn: &rusqlite::Connection, archived: usize) {
+    let doomed = hard_delete_row();
+    ai_memory::storage::insert(conn, &doomed).expect("seed hard-delete row");
+    assert_eq!(ai_memory::storage::gc(conn, false).expect("hard GC"), 1);
+    for (sql, expected) in [
+        ("SELECT archived_at FROM archived_memories", archived),
+        ("SELECT archived_at FROM archived_memory_links", 1),
+        (
+            "SELECT forgotten_at FROM forget_tombstones WHERE memory_id='hard-delete-clock'",
+            1,
+        ),
+        (
+            "SELECT created_at FROM memory_revisions WHERE kind='EXPIRE'",
+            archived + 1,
+        ),
+    ] {
+        let mut query = conn.prepare(sql).expect("GC timestamp query");
+        let stamps: Vec<String> = query
+            .query_map([], |row| row.get(0))
+            .expect("GC timestamps")
+            .collect::<Result<_, _>>()
+            .expect("timestamp values");
+        assert_eq!(stamps.len(), expected, "nonempty GC timestamp evidence");
+        for stamp in stamps {
+            assert_real_stamp(&stamp);
+        }
+    }
 }
 
 #[cfg(feature = "sal-postgres")]
@@ -391,6 +440,7 @@ pub mod pg {
     }
 
     pub async fn clock(store: &PostgresStore, offset: i64) {
+        ai_memory::config::set_append_only(true);
         let ctx = CallerContext::for_agent(AGENT);
         let rows = clock_rows();
         let embedding = vec![1.0; EMBEDDING_DIM];
@@ -400,6 +450,11 @@ pub mod pg {
                 .await
                 .expect("seed PG clock row");
         }
+        sqlx::query("INSERT INTO memory_links (source_id,target_id,relation,created_at,attest_level) VALUES ('clock-0','protected-long','related_to',$1,'unsigned')")
+            .bind(Utc::now())
+            .execute(store.pool())
+            .await
+            .expect("seed PG archived edge");
         let expected = expected_ids(&rows, offset);
         let mut filter = Filter::new();
         filter.namespace = Some(NAMESPACE.into());
@@ -431,9 +486,42 @@ pub mod pg {
                     .expect("GC survivor");
             assert_eq!(present, expected.contains(&memory.id));
         }
+        gc_stamps(store, removed).await;
         capture(store, "healthy-clock-write")
             .await
             .expect("PG write under offset");
         stamps(store, "healthy-clock-write").await;
+    }
+
+    async fn gc_stamps(store: &PostgresStore, archived: usize) {
+        store
+            .store(&CallerContext::for_agent(AGENT), &hard_delete_row())
+            .await
+            .expect("seed PG hard-delete row");
+        assert_eq!(store.run_gc(false).await.expect("PG hard GC"), 1);
+        for (sql, expected) in [
+            (
+                "SELECT archived_at::timestamptz FROM archived_memories",
+                archived,
+            ),
+            ("SELECT archived_at::timestamptz FROM archived_memory_links", 1),
+            (
+                "SELECT forgotten_at::timestamptz FROM forget_tombstones WHERE memory_id='hard-delete-clock'",
+                1,
+            ),
+            (
+                "SELECT created_at::timestamptz FROM memory_revisions WHERE kind='EXPIRE'",
+                archived + 1,
+            ),
+        ] {
+            let stamps: Vec<chrono::DateTime<Utc>> = sqlx::query_scalar(sql)
+                .fetch_all(store.pool())
+                .await
+                .expect("PG GC timestamps");
+            assert_eq!(stamps.len(), expected, "nonempty PG GC timestamp evidence");
+            for stamp in stamps {
+                assert_real_stamp(&stamp.to_rfc3339());
+            }
+        }
     }
 }
