@@ -4004,7 +4004,8 @@ pub use lifecycle_write::set_lifecycle_state;
 /// operator who is supposed to adjudicate it. #1948 advertised "operator
 /// dequarantine" as the route OUT, but the primitive had no caller, so in
 /// practice there was neither a way to SEE what was held nor a way to release
-/// it. This is the see half; [`dequarantine`] is the release half.
+/// it. This is the see half; [`operator_dequarantine`] is the audited release
+/// half.
 ///
 /// # What it returns, and what it deliberately does not
 ///
@@ -4068,11 +4069,12 @@ pub fn list_quarantined(
 /// append a `memory.dequarantined` signed-chain row in ONE transaction.
 ///
 /// The sqlite half of the operator route-OUT that #1948 advertised and never
-/// exposed. It is deliberately SEPARATE from [`dequarantine`]:
+/// exposed. It is deliberately SEPARATE from [`dequarantine_if_verified_unit`]:
 ///
-/// * [`dequarantine`] is the SYSTEM path (dequarantine-on-attest) — the
-///   substrate re-deciding when a later write from the author's now-enrolled
-///   key verifies. Nothing is being overridden, so no operator attribution
+/// * [`dequarantine_if_verified_unit`] is the SYSTEM path
+///   (dequarantine-on-attest) — the substrate re-deciding when a later write
+///   from the author's now-enrolled key verifies and its signed content won
+///   the merge. Nothing is being overridden, so no operator attribution
 ///   exists to record.
 /// * This is a HUMAN overriding a containment decision. Under `asi-hard` the
 ///   quarantine knob is pinned on and this is the only lever that exists, so
@@ -4181,9 +4183,13 @@ pub fn operator_dequarantine(conn: &mut Connection, id: &str, agent_id: &str) ->
 /// can neither reach nor leave it. The `WHERE lifecycle_state = 'quarantined'`
 /// guard makes this idempotent and a strict no-op on any non-quarantined row.
 ///
-/// This is the shared route-OUT primitive for BOTH dequarantine-on-attest
-/// (the federation receive-attestation upgrade path) and operator
-/// dequarantine. Returns `true` when a quarantined row was cleared.
+/// This is the UNVERIFIED raw UPDATE step: it checks no signed evidence.
+/// Dequarantine-on-attest reaches it only through
+/// [`dequarantine_if_verified_unit`], which wraps it in the persisted-row
+/// evidence check, and the operator release uses [`operator_dequarantine`]
+/// (#2402, audited). Since #4208 nothing calls it directly in production
+/// (retiring the `MemoryStore::dequarantine` trait surface over it is
+/// tracked in #6224). Returns `true` when a quarantined row was cleared.
 ///
 /// # Errors
 /// Propagates the `rusqlite` update error.
