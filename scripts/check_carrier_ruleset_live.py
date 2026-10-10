@@ -1078,6 +1078,24 @@ def self_test():
     check("pre-apply tip with a flow-mapping trigger", lambda: pre_tip(
         flow_tip, 1, "does not trigger on pull_request for chain/promo6-ssh"))
 
+    # #6430: paths, paths-ignore and a types list without opened/synchronize/reopened stop the
+    # workflow from running on some pull requests, so a required context would never report.
+    pr = "on:\n  pull_request:\n    branches: ['chain/**']\n"
+    trigger_cells((
+        ("trigger paths filter", pr + "    paths: ['src/**']\n", "chain/a", False),
+        ("trigger paths-ignore filter", pr + "    paths-ignore: ['docs/**']\n", "chain/a", False),
+        ("trigger types closed only", pr + "    types: [closed]\n", "chain/a", False),
+        ("trigger types lacks synchronize", pr + "    types: [opened, reopened]\n", "chain/a", False),
+        ("trigger types lacks opened (block list)",
+         pr + "    types:\n      - synchronize\n      - reopened\n", "chain/a", False),
+        ("trigger types default set", pr + "    types: [opened, synchronize, reopened]\n", "chain/a", True),
+        ("trigger types superset", pr + "    types: [opened, synchronize, reopened, labeled]\n", "chain/a", True),
+        ("trigger types block list", pr + "    types:\n      - opened\n      - synchronize\n      - reopened\n",
+         "chain/a", True)))
+    check("pre-apply tip with a paths filter", lambda: pre_tip(
+        wf_text.replace('"chain/**"]\n', '"chain/**"]\n    paths: [\'src/**\']\n', 1), 1,
+        "does not trigger on pull_request for chain/promo6-ssh"))
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"
