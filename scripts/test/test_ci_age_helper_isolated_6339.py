@@ -36,6 +36,8 @@ XTRACE = re.compile(r"(?:\bset\s+(?:-\S*x\S*|[-+]o\s+xtrace)|\bxtrace\b|\bBASH_X
 GUARD = 'if [ "${CI_NODE:-}" = "macos-fed" ]; then'
 CALL = re.compile(r'^\s*if ! python3 -I ' + re.escape(HELPER) + r' --url-file "\$url_file"; then$')
 URL_VARS = re.compile(r"\$\{?(?:base_url|new_url)\b|\$\(cat\b")
+READ = 'base_url="$(cat "$url_file")"'
+NOTICE = 'echo "::notice::[enterprise-fed] created ephemeral db $CI_FED_DB on the native tier ($RUNNER_NAME) and pointed AI_MEMORY_TEST_POSTGRES_URL at it"'
 
 
 def helper_step(text):
@@ -122,6 +124,20 @@ class TestAgeHelperIsolated6339(unittest.TestCase):
             "continue-on-error": ("        run: |\n          set -euo pipefail\n          # psql lives",
                                   "        continue-on-error: true\n        run: |\n          set -euo pipefail\n          # psql lives"),
             "echoed URL": (call, 'echo "url=$(cat "$url_file")"\n            ' + call),
+            # #6672: every other way to write the tier URL to the job log, the job summary or the environment.
+            "printf URL": (READ, READ + "\n          printf '%s\\n' \"$base_url\""),
+            "cat URL file": (READ, READ + '\n          cat "$url_file"'),
+            "cat URL file by path": (READ, READ + "\n          cat ~/.ai-memory-ci-fed-url"),
+            "URL into the step summary": (READ, READ + '\n          echo "tier=$base_url" >> "$GITHUB_STEP_SUMMARY"'),
+            "export and env dump": (READ, READ + "\n          export base_url\n          env | sort"),
+            "export alone": (READ, READ + "\n          export base_url new_url"),
+            "printenv": (READ, READ + "\n          printenv"),
+            "declare -p": (READ, READ + "\n          declare -p"),
+            "::debug:: URL": (READ, READ + '\n          echo "::debug::${new_url:-$base_url}"'),
+            "::notice:: URL": (NOTICE, NOTICE.replace("pointed AI_MEMORY_TEST_POSTGRES_URL at it", "set $new_url")),
+            "URL copied to another name": (READ, READ + '\n          u="$base_url"'),
+            "URL head on argv": ('new_url="${head%/*}', 'logger "$head"\n          new_url="${head%/*}'),
+            "URL to stderr": (READ, READ + '\n          echo "$base_url" >&2'),
         }
         for name, (old, new) in mutants.items():
             with self.subTest(mutant=name):
