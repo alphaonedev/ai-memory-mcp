@@ -3037,7 +3037,11 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
             t.expect_green(f"6124-{tag}", label, repo, mb_t, cell_t, green6124)
         else:
             t.expect_red(f"6124-{tag}", label, repo, mb_t, cell_t, red6124 +
-                         [("is before", "did not refuse the back-dated record")])
+                         [("is before", "did not refuse the back-dated record"),
+                          # #6733: the failure sentence states the F4-A floor.
+                          ("dated from the day of its own commit less one (at most 14 days "
+                           "below the merge-base day) to today plus one",
+                           "did not state the F4-A date floor in the failure sentence")])
 
     # (6124-b*) #6124 round 5, design B (3-agent vote 6def5ab6): the ledger
     # region is held to a canonical Markdown subset and every other construct
