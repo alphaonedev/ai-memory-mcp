@@ -102,7 +102,7 @@ fn issue_1326_require_approval_above_depth_round_trips() {
     .expect("set_standard must succeed");
     assert_eq!(
         set_resp["governance"]["require_approval_above_depth"], 2,
-        "set-side echo must include the field; got: {set_resp}"
+        "set-side echo must include the field `governance.require_approval_above_depth` = 2"
     );
 
     let get_resp =
