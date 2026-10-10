@@ -2460,6 +2460,32 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     t.expect_green("6124-q-ctl", "record after a tab-indented plain line", repo, mb_qc, q_ctl,
                    green6124)
 
+    # (6124-p1..p4) RED (R3-F3, #6420) - once the doc has an amendment ledger,
+    # a new record is accepted only inside it: directly above an existing
+    # record (the only gap a '>' blank line) or as the last paragraph of the
+    # blockquote that holds one. A standalone blockquote elsewhere below
+    # STATUS (prose, end of document, a collapsible block) is refused.
+    placed6124 = [("not adjacent to the amendment ledger",
+                   "did not refuse a record placed away from the ledger")]
+    for tag, label, extra in (
+            ("p1", "standalone quote in section 8 prose",
+             "\n" + old_a + "\nSection 8 prose.\n\n" + rec6124),
+            ("p2", "standalone quote at the end of the document", "\n" + old_a + "\n" + rec6124),
+            ("p3", "standalone quote after a plain blank line below the ledger",
+             "\n" + old_a + "\n\n\n" + rec6124),
+            ("p4", "standalone quote inside a collapsible block",
+             "\n" + old_a + "\n<details>\n<summary>x</summary>\n\n" + rec6124)):
+        pre = extra[:extra.index(rec6124)]
+        mb_p = doc_only(pre, label=f"{tag}-mb")
+        cell_p = edit_range(extra, label=tag, frm=mb_p)
+        t.expect_red(f"6124-{tag}", label, repo, mb_p, cell_p, red6124 + placed6124)
+    # (6124-p5) RED - above an existing record but separated by a PLAIN blank
+    # line: two blockquotes, so not inside the ledger.
+    mb_p5 = doc_only("\n" + old_a, label="p5-mb")
+    p5 = edit_range("\n" + rec6124 + "\n" + old_a, label="p5", frm=mb_p5)
+    t.expect_red("6124-p5", "record above a record across a plain blank line", repo, mb_p5, p5,
+                 red6124 + placed6124)
+
     # (6124-r1..r4) #6355: the COMMITTED cert doc of this checkout, as the
     # merge-base, with a record inserted at each legal spot (GREEN), behind an
     # inserted HTML opener (RED), and above non-record prose that would then
