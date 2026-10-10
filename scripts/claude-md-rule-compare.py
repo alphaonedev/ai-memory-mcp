@@ -690,6 +690,13 @@ def _self_test_cases() -> int:
              "no commit in the range carries", message=f"head change\n\nRule-Change-Approved-By: {invisible_value}")
     case("an approval value with a visible name and an invisible character still counts (#6572)", reword, False,
          "approval trailer(s):", message="head change\n\nRule-Change-Approved-By: J\u00f6rg\u200b")
+    # #6743: git trims only ASCII blanks from a trailer value, so a value led by a form feed, a vertical tab, a no-break
+    # space or an ideographic space reaches the comparison with that character in front of the name. TRAILER requires
+    # a non-space first character, so such a value is refused (fail closed); a pattern that lets it through counts it.
+    for label, lead in (("a form feed", "\x0c"), ("a vertical tab", "\x0b"), ("a no-break space", "\u00a0"),
+                        ("an ideographic space", "\u3000")):
+        case(f"an approval value led by {label} does not count (#6743)", reword, True, "no commit in the range carries",
+             message=f"head change\n\nRule-Change-Approved-By: {lead}Justin")
     case("an empty trailer value followed by another trailer does not count (#6576)", reword, True, "RESULT: FAIL",
          message="head change\n\nRule-Change-Approved-By:\nCo-Authored-By: Placeholder <noreply@example.invalid>")
     case("a body line starting with the trailer key above a separate trailer block does not count (#6179)", reword,
