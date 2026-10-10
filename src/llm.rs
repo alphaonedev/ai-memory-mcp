@@ -3443,9 +3443,9 @@ mod tests {
         ];
         for (alias, expected) in cases {
             let got = alias_api_key_env_vars(alias);
-            assert_eq!(
-                got, *expected,
-                "#1067: alias `{alias}` env-var preference list must be {expected:?}; got {got:?}"
+            assert!(
+                got == *expected,
+                "#1067: alias `{alias}` env-var preference list does not match the pinned list"
             );
         }
     }
