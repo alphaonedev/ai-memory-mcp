@@ -5049,6 +5049,8 @@ CONDITION_MUTANTS: Tuple[Tuple[str, str, str], ...] = (
     ("BuildKit join strips the next line's indent", "            piece = raw\n", '            piece = raw.lstrip(" \\t")\n'),
     ("BuildKit continuation needs a bare backslash", r'BK_CONT_RE = re.compile(r"(^|[^\\])\\[ \t]*$")', r'BK_CONT_RE = re.compile(r"(^|[^\\])\\$")'),
     ("BuildKit continuation on an escaped backslash", r'(^|[^\\])\\[ \t]*$', r'\\[ \t]*$'),
+    ("#6954 duplicate condition anchor accepted", "if head.count(old) > 1:", "if head.count(old) > 2:"),
+    ("#6954 replacement containing an anchor accepted", "        if clash:\n", "        if False:\n"),
 )
 
 
