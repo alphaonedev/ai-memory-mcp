@@ -602,6 +602,15 @@ class Round11EchoMask(unittest.TestCase):
             shown = SUBSET.echo(row)
             self.assertIsNone(re.search("gh" + "p_[A-Za-z0-9]", shown), (column, shown))
 
+    def test_a_row_reprints_no_value_text_before_its_separator_6881(self):
+        """Text before the first separator, or in a row with none, is value text unless it is one key word."""
+        for row in ("--password " + self.TAIL, "tool --password " + self.TAIL + " | x=1", "      " + self.TAIL,
+                    "curl -u user:" + self.TAIL, "my key: " + self.TAIL, "- two words " + self.TAIL):
+            self.assertNotIn(self.TAIL, SUBSET.echo(row), row)
+        self.assertEqual(SUBSET.echo("      PASSWORD: hunter2"), repr("      PASSWORD: <withheld 7 chars>"))
+        self.assertEqual(SUBSET.echo("  - name: q"), repr("  - name: <withheld 1 chars>"))
+        self.assertEqual(SUBSET.echo("PASSWORD:"), repr("PASSWORD:"))
+
     def test_mask_shapes_the_round11_campaign_left_unkilled(self):
         """Mutants Y3 (quote allowed in an operand), Y4 (ghs_ prefix) and V7 (= as a row separator) survived."""
         self.assertIn("<withheld", SUBSET.mask("PIN_TOKEN: ${{ 'LEAK" + "TAIL' }}"))

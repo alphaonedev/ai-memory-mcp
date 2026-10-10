@@ -2014,6 +2014,16 @@ def self_test():
 
     check("round12 #6880: a token cut by the row limit of a separator-less refusal row is masked", r12_cut_leak)
 
+    # round12 #6881: value text before the first separator of a refusal row, or in a row without one, is not echoed.
+    for label, row in (
+            ("round12 #6881: a flag value in a separator-less refusal row", "--password " + r11_tail),
+            ("round12 #6881: a flag value before the first separator of a refusal row",
+             "tool --password " + r11_tail + " | x=1")):
+        check(label, lambda r=row: (
+            "workflow_pin_problems is empty" if not workflow_pin_problems(r10_env(r))
+            else None if not any(r11_tail in p for p in workflow_pin_problems(r10_env(r)))
+            else f"a problem echoes {r11_tail[:16]!r}..."))
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"
