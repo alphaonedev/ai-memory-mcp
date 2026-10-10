@@ -113,6 +113,10 @@ os.kill(os.getppid(), signal.SIGKILL)
 time.sleep(120)
 """
 
+# STUBBORN_PSQL that needs 1.5 s before it records its pid: a loaded host's start-up delay, made deterministic (#6646).
+SLOW_STUBBORN_PSQL = STUBBORN_PSQL.replace('with open({base!r} + "/sleep.ppid"', 'time.sleep(1.5)\nwith open({base!r} + "/sleep.ppid"', 1)
+assert SLOW_STUBBORN_PSQL != STUBBORN_PSQL
+
 # Signals the helper does not turn into an interrupt: default-ignored (CHLD, URG, WINCH, INFO, CONT),
 # job control (TSTP, TTIN, TTOU), PIPE (Python ignores it), the synchronous faults (SEGV, BUS, ILL, FPE) and the
 # two nothing can catch (KILL, STOP).  Every other signal valid on this platform must end in `interrupted` (#6504).
@@ -1064,8 +1068,13 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assert_gone_within(child, 3, "the pipe closed")
 
     def test_supervisor_enforces_its_own_deadline(self):
+        for template in (STUBBORN_PSQL, SLOW_STUBBORN_PSQL):  # #6646/#6674: also when psql starts slowly
+            with self.subTest(slow_start=template is SLOW_STUBBORN_PSQL):
+                self.check_supervisor_enforces_its_own_deadline(template)
+
+    def check_supervisor_enforces_its_own_deadline(self, template):
         # A helper that is SIGSTOPped keeps the pipe open and cannot enforce the probe limit.
-        proc, child = self.run_supervisor(1)
+        proc, child = self.run_supervisor(1, psql_template=template)
         t0 = time.monotonic()
         proc.communicate(timeout=15)
         self.assertLess(time.monotonic() - t0, 6)
@@ -1210,9 +1219,17 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                       " ".join(mod.__doc__.split()))
 
     def test_overall_deadline_stops_a_stalled_psql_6506(self):
+        for template in (STUBBORN_PSQL, SLOW_STUBBORN_PSQL):  # #6646/#6674: also when psql starts slowly
+            with self.subTest(slow_start=template is SLOW_STUBBORN_PSQL):
+                for stale in ("sleep.pid", "sleep.ppid"):
+                    if (self.base / stale).exists():
+                        (self.base / stale).unlink()
+                self.check_overall_deadline_stops_a_stalled_psql(template)
+
+    def check_overall_deadline_stops_a_stalled_psql(self, template):
         # #6506: the 60 s limit is the only bound on a psql that connects and then stalls.  The supervisor
         # deadline is held far away so only the helper's own limit and stop_child can end psql here (#6518).
-        write_exe(self.psql, STUBBORN_PSQL.format(py=sys.executable, base=str(self.base)))
+        write_exe(self.psql, template.format(py=sys.executable, base=str(self.base)))
         mod = load_module()
         mod.PROBE_TIMEOUT_SECONDS = 1
         mod.SUPERVISOR_GRACE_SECONDS = 600
