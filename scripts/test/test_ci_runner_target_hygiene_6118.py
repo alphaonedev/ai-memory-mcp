@@ -3529,7 +3529,7 @@ class PruneScript6118(unittest.TestCase):
         # SGR sequence.  Every C0 control other than CR/LF, DEL and C1 is
         # written as \xNN.
         mod = _load_prune()
-        self.assertEqual("a\\x1b[31mb\\x07c\\x7fd\\x85e\\x09f", mod._escape("a\x1b[31mb\x07c\x7fd\u0085e\tf"))
+        self.assertEqual("a\\x1b[31mb\\x07c\\x7fd\\u{85}e\\x09f", mod._escape("a\x1b[31mb\x07c\x7fd\u0085e\tf"))
         self.assertEqual("a%0Db%0Ac%25", mod._escape("a\rb\nc%"))  # the existing escapes still win for CR / LF / %
         deps = self.target / "debug" / "deps"
         for name in ("esc\x1b[31m-0123456789abcdef", "bel\x07x-0123456789abcdef", "del\x7fx-0123456789abcdef",

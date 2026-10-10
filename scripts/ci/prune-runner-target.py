@@ -82,8 +82,10 @@ would red every later job; the warnings and ``warnings=<n>`` on the notice carry
 Only a refusal exits 2.  Every name printed is escaped as GitHub escapes a workflow-command value
 (``%`` -> ``%25``, CR -> ``%0D``, LF -> ``%0A``) and ``#`` -> ``%23`` (the
 runner also parses the legacy ``##[command]`` form anywhere in a line), and a
-byte that is not UTF-8, and every other control character (C0, DEL, C1), is
-written as ``\\xNN``, so a hostile file name can never
+byte that is not UTF-8, and every other C0 control character and DEL, is
+written as ``\\xNN``; a C1 control code point (U+0080-U+009F) is written as
+``\\u{hex}`` so it never prints the same as the raw byte of the same value
+(#6313), so a hostile file name can never
 start a log line or a command of its own and printing never raises.  A
 directory tree nested deeper than MAX_REMOVE_DEPTH (far beyond anything cargo
 writes) is warned about and left in place instead of exhausting the stack or
@@ -139,13 +141,17 @@ EXIT_REFUSED = 2
 # writes it at the root of each target dir it creates.
 CACHEDIR_SIGNATURE = b"Signature: 8a477f597d28d172789f06886806bc55"
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-# C0 controls (CR and LF are already %-escaped), DEL and C1: never printed raw (#6254).
-CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f]")
+# C0 controls (CR and LF are already %-escaped) and DEL: written \\xNN (#6254).
+# A C1 code point (U+0080-U+009F) is category Cc and is written \\u{hex} by the
+# category pass below, because \\xNN is the spelling of an undecodable raw byte
+# and the two must never print the same (#6313).
+CONTROL_RE = re.compile("[\x00-\x1f\x7f]")
 # Unicode categories that print as nothing or move text around (#6299): Zl / Zp
 # (U+2028 / U+2029 line and paragraph separators), Cf (bidi, zero-width and
-# other format characters), Co (private use), Cn (unassigned / noncharacter).
+# other format characters), Co (private use), Cn (unassigned / noncharacter),
+# and Cc, which after CONTROL_RE is only the C1 range (#6313).
 # Cs only reaches here from a lone surrogate.  Written as \\u{hex}.
-INVISIBLE_CATEGORIES = frozenset({"Zl", "Zp", "Cf", "Cs", "Co", "Cn"})
+INVISIBLE_CATEGORIES = frozenset({"Zl", "Zp", "Cf", "Cs", "Co", "Cn", "Cc"})
 WARNING_PREFIX = "::warning::prune-runner-target: "
 
 
@@ -158,11 +164,13 @@ def _escape(text: str) -> str:
     so a strict UTF-8 stdout never raises (R3-F3).  Then GitHub's
     workflow-command escaping (``%``, CR, LF) so one name can never become two
     log lines, and ``#`` -> ``%23`` because the runner's legacy parser accepts
-    ``##[command]`` anywhere in a line (SR3-1).  Every other control character
-    (C0, DEL, C1: ESC starts an ANSI sequence a log viewer or terminal acts on)
-    becomes ``\\xNN`` (#6254), and so does every code point that prints as
-    nothing or reorders text (U+2028 / U+2029, bidi and zero-width format
-    characters, private-use and unassigned code points), as ``\\u{hex}`` (#6299).
+    ``##[command]`` anywhere in a line (SR3-1).  Every other C0 control
+    character and DEL (ESC starts an ANSI sequence a log viewer or terminal acts
+    on) becomes ``\\xNN`` (#6254).  A C1 control code point becomes ``\\u{hex}``,
+    never ``\\xNN``, because ``\\xNN`` is reserved for an undecodable raw byte
+    (#6313), and so does every code point that prints as nothing or reorders
+    text (U+2028 / U+2029, bidi and zero-width format characters, private-use
+    and unassigned code points) (#6299).
     """
     text = os.fsencode(text).replace(b"\\", b"\\\\").decode("utf-8", "backslashreplace")
     text = text.replace("%", "%25").replace("#", "%23").replace("\r", "%0D").replace("\n", "%0A")
