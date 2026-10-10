@@ -425,6 +425,21 @@ fn dates(line: &str) -> Vec<&str> {
     found
 }
 
+/// Every `(1-based line number, date)` that `text` uses as a
+/// `protocolVersion`: each date on a line that names one of [`MARKERS`].
+fn protocol_version_uses(text: &str) -> Vec<(usize, &str)> {
+    let mut uses = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if !MARKERS.iter().any(|m| line.contains(m)) {
+            continue;
+        }
+        for date in dates(line) {
+            uses.push((n + 1, date));
+        }
+    }
+    uses
+}
+
 #[test]
 fn issue_6157_every_protocol_version_use_is_a_supported_revision() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -454,15 +469,10 @@ fn issue_6157_every_protocol_version_use_is_a_supported_revision() {
                 continue;
             }
         };
-        for (n, line) in text.lines().enumerate() {
-            if !MARKERS.iter().any(|m| line.contains(m)) {
-                continue;
-            }
-            for date in dates(line) {
-                uses += 1;
-                if !SUPPORTED_PROTOCOL_REVISIONS.contains(&date) {
-                    offenders.push(format!("{}:{}: {date}", rel.display(), n + 1));
-                }
+        for (line_no, date) in protocol_version_uses(&text) {
+            uses += 1;
+            if !SUPPORTED_PROTOCOL_REVISIONS.contains(&date) {
+                offenders.push(format!("{}:{line_no}: {date}", rel.display()));
             }
         }
     }
@@ -729,6 +739,49 @@ fn issue_6534_walk_reads_files_outside_the_round3_extension_allowlist() {
         seen, want,
         "the walk skipped a trackable file by extension (false green)"
     );
+}
+
+/// #6535: a revision on a line after its marker is still a use. Pretty-
+/// printed JSON, YAML, TOML, Rust and TS put a key and its value on
+/// different lines; the round-3 line scan never checked such a value, so an
+/// unsupported revision passed by line placement alone (false green).
+#[test]
+fn issue_6535_a_revision_split_from_its_marker_is_still_a_use() {
+    let cases: [(&str, &str, Vec<(usize, &str)>); 6] = [
+        (
+            "pretty-printed JSON",
+            "{\n  \"protocolVersion\":\n    \"2099-01-01\"\n}\n",
+            vec![(3, "2099-01-01")],
+        ),
+        (
+            "JSON key, colon and value on three lines",
+            "{\"protocolVersion\"\n:\n\"2099-01-02\"}\n",
+            vec![(3, "2099-01-02")],
+        ),
+        (
+            "YAML key, blank line, value",
+            "protocolVersion:\n\n  2099-01-03\n",
+            vec![(3, "2099-01-03")],
+        ),
+        (
+            "same-line control",
+            "{\"protocolVersion\": \"2099-01-04\"}\n",
+            vec![(1, "2099-01-04")],
+        ),
+        (
+            "a marker line with its own date does not take the next line's",
+            "protocolVersion: 2099-01-05\nreleased 2099-01-06\n",
+            vec![(1, "2099-01-05")],
+        ),
+        (
+            "a dateless marker followed by another marker line",
+            "protocolVersion:\nprotocolVersion: 2099-01-07\n",
+            vec![(2, "2099-01-07")],
+        ),
+    ];
+    for (what, text, want) in cases {
+        assert_eq!(protocol_version_uses(text), want, "{what}");
+    }
 }
 
 /// Every tracked `.gitignore` outside the skipped root `vendor/`. The #6524
