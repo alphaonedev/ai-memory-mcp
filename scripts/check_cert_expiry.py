@@ -1706,6 +1706,21 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     hn = fx.commit(["src/mask_case.rs"], "value-trim-nbsp: a trailing U+00A0 on the identifier line")
     t.expect_green("value-trim-nbsp", "a trailing U+00A0 added to the identifier line (trimmed blank)",
                    repo, nb, hn)
+    # (value-copy-bound, #6652) the keyed comparison is a multiset of
+    #       (identifier, trimmed line text) over all of src/ without the path, so
+    #       a value edited on the identifier line is GREEN while the old line text
+    #       still occurs elsewhere under src/: here it survives inside a block
+    #       comment next to the edited line. This pins the documented qualifier;
+    #       the doc and the behaviour move together (#6560).
+    copy_line = f'let q = env_or("{kid}", 7);\n'
+    fx.g("checkout", "-q", "-B", "mo-copy-base", mk0)
+    fx.write("src/mask_copy.rs", copy_line)
+    cb = fx.commit(["src/mask_copy.rs"], "copy base: a value on the identifier line")
+    fx.g("checkout", "-q", "-B", "mo-value-copy", cb)
+    fx.write("src/mask_copy.rs", copy_line.replace("7", "8") + "/*\n" + copy_line + "*/\n")
+    cc = fx.commit(["src/mask_copy.rs"], "value-copy-bound: value edited, old line kept in a block comment")
+    t.expect_green("value-copy-bound", "a value edited on the identifier line while the old line "
+                   "text stays under src/ inside a block comment (the multiset bound)", repo, cb, cc)
     fx.reset(base)
     fx.g("update-ref", "refs/remotes/origin/main", base)
     # (doc-bound, #6563 / #6561) the docstring, the OK banner and the #6427
@@ -1725,10 +1740,19 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                "path watches is never seen; a value edited on the identifier line is drift")
     # (#6626) the banner may claim a value edit only if a cell edits one.
     for needle in ("(trailing-comment-added)", "(value-edit-5-to-6)", "(value-edit-ws)",
-                   "(value-edit-case)", "(value-trim-nbsp)"):
+                   "(value-edit-case)", "(value-trim-nbsp)", "(value-copy-bound)"):
         if needle not in SELF_TEST_OK:
             t.fail(f"(doc-bound): the OK banner does not name {needle}; the value-edit claim "
                    "must be pinned by a cell that changes a value (#6626)")
+    # (#6652) the RED sentence is conditional and the bound is the multiset one.
+    qualifier = "unless the old line text still occurs elsewhere under src/"
+    for where, text in doc_texts:
+        if where != "OK banner" and qualifier not in " ".join(text.split()):
+            t.fail(f"(doc-bound): the {where} does not qualify the value-edit RED claim "
+                   f"({qualifier!r} missing, #6652)")
+    if "multiset" not in (__doc__ or ""):
+        t.fail("(doc-bound): the module docstring does not state the multiset bound "
+               "(the line texts are compared over all of src/ without the path, #6652)")
     for needle in ("LEXICAL BOUND", "byte-identical", "#6560"):
         if needle not in (__doc__ or ""):
             t.fail(f"(doc-bound): the module docstring does not state the lexical bound "
