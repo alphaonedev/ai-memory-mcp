@@ -237,6 +237,65 @@ class CorpusUnion6412(TB.Base):
                 self.check(name, files, ['support'], expected, sup)
 
 
+# review r3 #6460: `..name(` (struct update, range) is a call site; only a single-dot receiver is a method call.
+URL_CFG = 'std::env::var("AI_MEMORY_TEST_POSTGRES_URL").unwrap()'
+SUP_6460 = SUP + 'pub(crate) fn pg_cfg() -> u8 { let _ = %s; 0 }\n' % URL_CFG + ''.join(
+    'pub(crate) fn %s() -> u8 { let _ = %s; 0 }\n' % (n, URL_CFG)
+    for n in ('failing_result', 'envelope', 'owned_by', 'fixture', 'succession_fixture'))
+PRE_6460 = 'use crate::support::*; struct S { n: i32 }'
+IDIOMS_6460 = (
+    'let _a = S { n: 1,\n            ..failing_result()\n        };\n'
+    '        let _b = S { n: 1, ..envelope("ns", "title", "body") };\n'
+    '        let _c = S { n: 1, ..envelope("ns", "title", "body") };\n'
+    '        let _d = S { n: 1, ..envelope("ns", "title", "body") };\n'
+    '        let _e = S { n: 1, ..owned_by(owner) };\n'
+    '        let _f = S { n: 1,\n            ..fixture("a1", Some("alice"))\n        };\n'
+    '        let _g = S { n: 1, ..succession_fixture(&prev) };'
+)
+CASES_6460 = [
+  ('D1 struct update ..pg_cfg()', {'a.rs': T('let _ = S { n: 1, ..pg_cfg() };', PRE_6460)}, ['a::tests::t']),
+  ('D1b struct update, space after ..', {'a.rs': T('let _ = S { n: 1, .. pg_cfg() };', PRE_6460)}, ['a::tests::t']),
+  ('D1c struct update, newline after ..', {'a.rs': T('let _ = S { n: 1,\n            ..\n            pg_cfg() };', PRE_6460)}, ['a::tests::t']),
+  ('D2 range 0..live_pg_url().len()', {'a.rs': T('for _i in 0..live_pg_url().len() {}', PRE_6460)}, ['a::tests::t']),
+  ('D2b inclusive range 0..=live_pg_url().len()', {'a.rs': T('for _i in 0..=live_pg_url().len() {}', PRE_6460)}, ['a::tests::t']),
+  ('D3 qualified ..crate::support::pg_cfg()', {'a.rs': T('let _ = S { n: 1, ..crate::support::pg_cfg() };', PRE_6460)}, ['a::tests::t']),
+  ('D5 the 7 real ..helper(..) idioms of src/', {'a.rs': T(IDIOMS_6460, PRE_6460)}, ['a::tests::t']),
+  ('D4 control: x.live_pg_url() is a method call, not the free fn', {'a.rs': T('let x = 1u8; let _ = x.live_pg_url();', 'struct S { n: i32 }')}, []),
+]
+
+
+class DottedCalls6460(TB.Base):
+    """`..helper()` is a call site in the tool AND in the oracle; `x.helper()` stays a method call."""
+
+    def test_dotdot_calls_are_reported_6460(self):
+        for name, files, expected in CASES_6460:
+            with self.subTest(name):
+                self.setUp()
+                root = write_case(files, SUP_6460)
+                self.assertEqual(lost_base_sites(root), [], name + ': a base-matcher site was dropped (fail open)')
+                got = pt.uncovered_lib_pg_modules(root, ['support'])
+                self.assertTrue(set(expected) <= set(got), '%s: expected %s, got %s' % (name, expected, got))
+                if not expected:
+                    self.assertEqual(list(got), [], name + ': a method call was reported')
+
+    def test_oracle_does_not_exempt_dotdot_hits_6460(self):
+        for name, files, expected in CASES_6460:
+            if not expected:
+                continue
+            with self.subTest(name):
+                self.setUp()
+                ref = reference_sites_674a(write_case(files, SUP_6460))
+                calls = {k: v for k, v in ref.items() if '(calls ' in k[1] and k[0] == 'a::tests::t'}
+                self.assertTrue(calls, name + ': the oracle saw no call site')
+                self.assertFalse(any(calls.values()), '%s: oracle exempted %s as lexical' % (name, calls))
+
+    def test_oracle_exempts_a_single_dot_method_call_6460(self):
+        files = dict(CASES_6460[-1][1])
+        ref = reference_sites_674a(write_case(files, SUP_6460))
+        calls = {k: v for k, v in ref.items() if '(calls ' in k[1]}
+        self.assertTrue(calls and all(calls.values()), 'x.name() must stay a lexical (method call) hit: %s' % calls)
+
+
 class RealTreeUnion6412(unittest.TestCase):
     def test_real_tree_sites_are_a_superset_of_the_bare_name_matcher_6412(self):
         self.assertEqual(lost_base_sites(REPO / 'src'), [])
