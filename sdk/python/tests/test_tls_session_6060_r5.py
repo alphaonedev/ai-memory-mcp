@@ -1751,15 +1751,17 @@ def test_symlink_chain_over_the_hop_cap_is_refused_6660(
 _FOREIGN_UID = os.geteuid() + 4242 if os.name != "nt" else 4242
 
 
-def _as_foreign(real: Callable[..., os.stat_result], inode: tuple[int, int]) -> Callable[..., Any]:
-    """``real`` (``os.lstat``/``os.fstat``), reporting ``inode`` as owned by another uid."""
+def _as_foreign(
+    real: Callable[..., os.stat_result], inode: tuple[int, int], uid: int = _FOREIGN_UID
+) -> Callable[..., Any]:
+    """``real`` (``os.stat``/``os.lstat``/``os.fstat``), reporting ``inode`` as owned by ``uid``."""
 
     def stat_as_foreign(target: Any, *args: Any, **kwargs: Any) -> os.stat_result:
         result = real(target, *args, **kwargs)
         if (result.st_dev, result.st_ino) != inode:
             return result
         fields = list(result[:10])
-        fields[4] = _FOREIGN_UID  # st_uid
+        fields[4] = uid  # st_uid
         return os.stat_result(fields)
 
     return stat_as_foreign
@@ -1934,3 +1936,204 @@ def test_gated_send_leaves_the_request_extensions_untouched_6659(is_async: bool)
     assert "trace" in inner.seen[0]  # the inner transport did see the SDK trace
     assert request.extensions is before  # restored (#6537)
     assert request.extensions == snapshot  # and never written through
+
+
+# ---- #6653 / #6559 / #6654: every directory on the way, 3-agent vote (6def5ab6)
+
+
+def _owned_by(monkeypatch: pytest.MonkeyPatch, directory: pathlib.Path, uid: int) -> None:
+    """Make ``os.stat`` and ``os.lstat`` report ``directory`` as owned by ``uid``."""
+    found = os.stat(directory)
+    inode = (found.st_dev, found.st_ino)
+    monkeypatch.setattr(os, "stat", _as_foreign(os.stat, inode, uid))
+    monkeypatch.setattr(os, "lstat", _as_foreign(os.lstat, inode, uid))
+
+
+def _under_ancestor(lab: Lab, tmp_path: pathlib.Path, kind: str) -> tuple[pathlib.Path, str]:
+    """``anc/sub/<CA>``: a CA file or hashed directory two levels under ``anc``."""
+    sub = _ca_dir(_ca_dir(tmp_path, "anc"), "sub")
+    if kind == "file":
+        return tmp_path / "anc", str(_bundle(lab, sub))
+    _add_anchor(sub, lab.ca_path)
+    return tmp_path / "anc", str(sub)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("mode", [0o777, 0o775, 0o757, 0o707], ids=oct)
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_plain_path_under_a_shared_writable_ancestor_is_refused_6653(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type, mode: int, kind: str
+) -> None:
+    """Probe P2b: whoever can write ``anc`` can swap ``sub`` for their own; no symlink needed."""
+    ancestor, verify = _under_ancestor(lab, tmp_path, kind)
+    ancestor.chmod(mode)
+    with pytest.raises(ValueError, match="writable") as refused:
+        _built(client_cls, verify)
+    assert repr(str(ancestor)) in str(refused.value)  # names the directory
+    assert "chmod go-w" in str(refused.value)  # and the fix
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_link_target_under_a_shared_writable_grandparent_is_refused_6653(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type
+) -> None:
+    """Probe P3b: the link sits in a private directory; its target's grandparent is 0777."""
+    ancestor, target = _under_ancestor(lab, tmp_path, "file")
+    links = _ca_dir(tmp_path, "links")
+    (links / "ca.pem").symlink_to(target)
+    ancestor.chmod(0o777)
+    with pytest.raises(ValueError, match="writable") as refused:
+        _built(client_cls, str(links / "ca.pem"))
+    assert repr(str(ancestor)) in str(refused.value)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_shared_ancestor_swapped_during_the_load_is_refused_6653(
+    lab: Lab, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, client_cls: type
+) -> None:
+    """Probe P4: ``anc/sub`` is swapped out and back around the load (ABA).
+
+    The inode re-check cannot see an ABA swap of an ancestor, so a directory
+    others can write is refused before anything is read.
+    """
+    import certifi
+
+    ancestor, verify = _under_ancestor(lab, tmp_path, "file")
+    evil = _ca_dir(ancestor, "evil")
+    shutil.copy(certifi.where(), evil / "ca.pem")
+    ancestor.chmod(0o777)
+
+    class Racy(ssl.SSLContext):
+        def load_verify_locations(self, *args: Any, **kwargs: Any) -> None:
+            os.rename(ancestor / "sub", ancestor / "tmp")
+            os.rename(evil, ancestor / "sub")
+            try:
+                super().load_verify_locations(*args, **kwargs)
+            finally:
+                os.rename(ancestor / "sub", evil)
+                os.rename(ancestor / "tmp", ancestor / "sub")
+
+    def racy_base() -> ssl.SSLContext:
+        context = Racy(ssl.PROTOCOL_TLS_CLIENT)
+        context.verify_mode = ssl.CERT_REQUIRED
+        context.check_hostname = True
+        return context
+
+    monkeypatch.setattr(_common, "_pinned_base_context", racy_base)
+    with pytest.raises(ValueError, match="writable"):
+        _built(client_cls, verify)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("mode", [0o755, 0o1777], ids=oct)  # #6654: a sticky one too
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_ancestor_owned_by_another_user_is_refused_6653(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    mode: int,
+    kind: str,
+) -> None:
+    """StrictModes: the owner of a directory on the way can replace what is under it."""
+    ancestor, verify = _under_ancestor(lab, tmp_path, kind)
+    ancestor.chmod(mode)
+    _owned_by(monkeypatch, ancestor, _FOREIGN_UID)
+    with pytest.raises(ValueError, match="owned by uid") as refused:
+        _built(client_cls, verify)
+    assert repr(str(ancestor)) in str(refused.value)
+    assert str(_FOREIGN_UID) in str(refused.value)
+    assert "chown" in str(refused.value)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_link_target_under_a_foreign_ancestor_is_refused_6653(
+    lab: Lab, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch, client_cls: type
+) -> None:
+    ancestor, target = _under_ancestor(lab, tmp_path, "file")
+    links = _ca_dir(tmp_path, "links")
+    (links / "ca.pem").symlink_to(target)
+    _owned_by(monkeypatch, ancestor, _FOREIGN_UID)
+    with pytest.raises(ValueError, match="owned by uid"):
+        _built(client_cls, str(links / "ca.pem"))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_root_owned_ancestor_is_accepted_6653(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    kind: str,
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    ancestor, verify = _under_ancestor(lab, tmp_path, kind)
+    _owned_by(monkeypatch, ancestor, 0)
+    assert _get_once(client_cls, origin.url, verify) == 200
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("via", ["path", "link"])
+def test_own_subdir_of_a_sticky_ancestor_is_accepted_6653(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    via: str,
+) -> None:
+    """Probes P5 / P5b: a CA under ``/tmp``-style 1777 in a subdir this user owns."""
+    _clear_proxy_env(monkeypatch)
+    sticky = _ca_dir(tmp_path, "tmpish")
+    own = _ca_dir(sticky, "me", 0o700)
+    verify = _bundle(lab, own)
+    if via == "link":
+        (sticky / "link.pem").symlink_to(verify)
+        verify = sticky / "link.pem"
+    sticky.chmod(0o1777)
+    assert _get_once(client_cls, origin.url, str(verify)) == 200
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_kubernetes_data_double_symlink_is_accepted_6653(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+) -> None:
+    """Probe P7: a projected volume's ``ca.crt -> ..data/ca.crt``, ``..data -> ..2026_x``."""
+    _clear_proxy_env(monkeypatch)
+    volume = _ca_dir(tmp_path, "volume")
+    _bundle(lab, _ca_dir(volume, "..2026_x"), "ca.crt")
+    (volume / "..data").symlink_to("..2026_x")
+    (volume / "ca.crt").symlink_to("..data/ca.crt")
+    assert _get_once(client_cls, origin.url, str(volume / "ca.crt")) == 200
+
+
+@_POSIX_ONLY
+@_ENV_VERIFY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_env_trust_under_a_shared_writable_ancestor_is_refused_6653(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    verify: object,
+) -> None:
+    """``SSL_CERT_FILE`` goes through the same walk as ``verify=`` (#6690)."""
+    ancestor, bundle = _under_ancestor(lab, tmp_path, "file")
+    ancestor.chmod(0o777)
+    _env_trust(monkeypatch, SSL_CERT_FILE=bundle)
+    with pytest.raises(ValueError, match="writable"):
+        _built(client_cls, verify)
