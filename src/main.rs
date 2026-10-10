@@ -843,6 +843,25 @@ fn report_future_dated_forensic_files(
     }
 }
 
+/// #6590 — why the outage row was skipped, from values that never pass
+/// through a store connection: an absent database, or one not at this
+/// binary's schema version (the recorder never creates or migrates a store).
+/// The observed stamp is reported by `ai-memory doctor`. Pure.
+fn forensic_outage_skipped_line(db_path: &std::path::Path, db_exists: bool) -> String {
+    let reason = if db_exists {
+        format!(
+            "the database at {} is not at this binary's schema version {}; the recorder \
+             never migrates a store, so this boot's outage is reported only on stderr, by the \
+             metric and by `ai-memory doctor`",
+            db_path.display(),
+            ai_memory::storage::migrations::current_schema_version()
+        )
+    } else {
+        format!("no database exists at {} yet", db_path.display())
+    };
+    format!("ai-memory: the forensic-sink outage was NOT recorded in signed_events: {reason}")
+}
+
 /// #4199 — append the signed `audit.forensic_sink_unavailable` row to the
 /// EXISTING database (best-effort). The library call opens without migrating,
 /// writes only on a store already at this binary's schema, and appends nothing
@@ -866,9 +885,14 @@ fn record_forensic_outage(
     }
     match record_forensic_sink_unavailable(db_path, err) {
         Ok(OutageRecord::Recorded | OutageRecord::Duplicate) => {}
-        Ok(OutageRecord::Skipped(why)) => {
+        // #6590 (CodeQL `rust/cleartext-logging`) — the library's reason text
+        // is built from the schema probe of a connection it opened with the
+        // database passphrase; the line is rendered from what this process
+        // already holds instead (the path it was given, whether it exists).
+        Ok(OutageRecord::Skipped(_)) => {
             eprintln!(
-                "ai-memory: the forensic-sink outage was NOT recorded in signed_events: {why}"
+                "{}",
+                forensic_outage_skipped_line(db_path, db_path.exists())
             );
         }
         Err(e) => eprintln!(
@@ -927,6 +951,27 @@ fn warn_if_plaintext_retention_requested(audit_cfg: &config::AuditConfig) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #6590 — the skipped-outage line names the path the process was given
+    /// and the expected schema version; it takes no probe text, so a stamp or
+    /// any connection-derived value cannot reach it.
+    #[test]
+    fn forensic_outage_skipped_line_is_built_from_held_values_6590() {
+        let path = std::path::Path::new("/placeholder/ai-memory-FAKE.db");
+        let absent = forensic_outage_skipped_line(path, false);
+        assert!(absent.contains("no database exists at /placeholder/ai-memory-FAKE.db yet"));
+        let stale = forensic_outage_skipped_line(path, true);
+        let version = ai_memory::storage::migrations::current_schema_version().to_string();
+        assert!(stale.contains("/placeholder/ai-memory-FAKE.db"));
+        assert!(stale.contains(&format!("schema version {version}")));
+        for probe_text in ["Fresh", "Known(", "Zero", "Unstamped"] {
+            assert!(
+                !stale.contains(probe_text),
+                "probe text #{} leaked",
+                probe_text.len()
+            );
+        }
+    }
 
     /// #4319 — only the long-running request servers queue forensic rows on
     /// the background writer; every other command writes inline, so a
