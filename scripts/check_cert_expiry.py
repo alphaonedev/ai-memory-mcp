@@ -3289,7 +3289,17 @@ SELF_TEST_OK = (
     "NBSP-only line ending a block scalar of c8-precheck.yml RED (no trailer needed; not waivable) "
     "while a tab-indented comment and trailing spaces stay GREEN; (tr round 5, #6228) a second producer "
     "joined by LS or PS in the trusted workflow RED with the trailer, and a hostile workflow file "
-    "name printed escaped by both the line-break and the shadow messages."
+    "name printed escaped by both the line-break and the shadow messages; (tr round 6, #6550/#6555/#6556/#6554) "
+    "the git shim's trace stripped from the fetch cells (shim-trace), each of the 22 refused whitespace code "
+    "points refused as itself (tr-s-ws-U+XXXX), the refusal listing every offending line and code point with "
+    "a +K more marker (tr-s-ws-lines, tr-s-ws-nine) and a wording cell that fails on a false reason for refusing"
+    "FF or VT (ws-wording); (tr round 7, #6760/#6761/#6762/#6763/#6684/#6554/#6683/#6765) one "
+    "line number per line (tr-s-ws-oneline), repeated code points listed once in first-seen order "
+    "(tr-s-ws-dedup), no +K more marker at exactly eight items (tr-s-ws-eight), the count in lines "
+    "(tr-s-ws-count), the refusal on line 1 (tr-s-ws-line1-U+XXXX), U+001C-U+001F named among the code points "
+    "YAML refuses and a missing changelog failing ws-wording, Unicode format characters escaped in every "
+    "printed name (log-safe-cf-U+XXXX, tr-log-cf-who, tr-log-cf-name) and this line naming every round "
+    "(summary-rounds)."
 )
 
 
