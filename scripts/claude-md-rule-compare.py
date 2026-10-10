@@ -205,6 +205,10 @@ STRUCTURE_LINE = re.compile(r"\|")
 COMMENT_LINE = re.compile(r"#")
 NESTED_NAME = re.compile(r"[\w-]+:")
 NESTED_VALUE = re.compile(r"[\w-]+:\s+(\S.*)")
+# Round 5 (#6666): a credential name whose value opens a triple quote (TOML / Python, an optional r, b, u or f prefix)
+# starts a run of value lines that ends at the line with the closing triple quote.
+TRIPLE_OPEN = re.compile(r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")(?:[*_]{1,2}|[\"'`])?\s*[:=]\s*[rbuf]{0,2}"
+                         r"(\"\"\"|''')(.*)$")
 MASK = "[MASKED]"
 # #6212: Unicode categories of head text that are escaped before they reach the summary (see printable).
 UNPRINTABLE_CATEGORIES = ("Cc", "Cf", "Cs", "Zl", "Zp")
@@ -460,12 +464,20 @@ def value_line_indexes(lines: list, key_indexes=frozenset()) -> set:
     than the name line (blank lines inside the block are skipped). A line in `key_indexes` (a private key block,
     masked anyway) ends the wait for a value but not a block scalar it sits in (#6665). Computed per side, so a value
     changed under an unchanged name line is found on the old side for its `-` row and on the head side for its `+`
-    row."""
-    inside, pending, block = set(), None, None
+    row. #6666: the lines after a credential name that opens a triple quote, up to the line with the closing triple
+    quote (to the end of the side when it never closes), are value lines too."""
+    inside, pending, block, triple = set(), None, None, None
     for index, line in enumerate(lines):
         content = line.strip()
         if index in key_indexes:
             pending = None  # round 5 (#6665): the block state stays, a later more-indented line is still a block line
+            if triple is not None and triple in line:
+                triple = None
+            continue
+        if triple is not None:
+            inside.add(index)
+            if triple in line:
+                triple = None
             continue
         if block is not None:
             if not content:
@@ -488,6 +500,10 @@ def value_line_indexes(lines: list, key_indexes=frozenset()) -> set:
                 continue
         if BLOCK_NAME.search(line):
             pending, block = None, indent_width(line)
+            continue
+        opened = TRIPLE_OPEN.search(line)
+        if opened is not None and opened.group(2) not in opened.group(3):
+            pending, triple = None, opened.group(2)
             continue
         name_only = NAME_ONLY.search(line)
         if name_only is not None:
