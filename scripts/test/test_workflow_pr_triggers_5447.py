@@ -4011,7 +4011,10 @@ SHA_D = "d" * 40
 
 
 class QueueRefShaBinding6242(unittest.TestCase):
-    """The ``<sha>`` in ``gh-readonly-queue/<base>/pr-<N>-<sha>`` must be a full sha equal to the queued head."""
+    """The ``<sha>`` in ``gh-readonly-queue/<base>/pr-<N>-<sha>`` must be a full sha equal to ``merge_group.base_sha``.
+
+    #6325 corrected the binding: the ref names the queue commit's parent (base_sha), not head_sha.
+    """
 
     def setUp(self) -> None:
         self.mod = _load_approval()
@@ -4026,11 +4029,11 @@ class QueueRefShaBinding6242(unittest.TestCase):
         rc, out = self.run_group(_merge_group_event(7))
         self.assertEqual(0, rc, out)
 
-    def test_6242_ref_sha_differing_from_the_queued_head_fails_closed(self) -> None:
+    def test_6242_ref_sha_differing_from_base_sha_fails_closed(self) -> None:
         rc, out = self.run_group(_merge_group_event(7, sha=SHA_D))
         self.assertEqual(1, rc, out)
         self.assertIn("cannot establish its verdict", out)
-        self.assertIn("queued head", out)
+        self.assertIn("is not merge_group.base_sha", out)
 
     def test_6242_short_or_non_hex_ref_sha_fails_closed(self) -> None:
         for sha in ("abc", "c" * 39, "C" * 40, "g" * 40, "c" * 41, "c" * 65):
@@ -4039,16 +4042,14 @@ class QueueRefShaBinding6242(unittest.TestCase):
                 self.assertEqual(1, rc, out)
                 self.assertIn("cannot establish its verdict", out)
 
-    def test_6242_missing_queued_head_sha_fails_closed(self) -> None:
-        event = _merge_group_event(7)
-        del event["merge_group"]["head_sha"]
-        rc, out = self.run_group(event)
+    def test_6242_missing_base_sha_fails_closed(self) -> None:
+        rc, out = self.run_group(_merge_group_event(7, base_sha=None))
         self.assertEqual(1, rc, out)
-        self.assertIn("queued head", out)
+        self.assertIn("is not merge_group.base_sha", out)
 
     def test_6242_m01_dropping_the_equality_is_killed(self) -> None:
         src = APPROVAL_PY.read_text(encoding="utf-8")
-        needle = " or ref_sha != head_sha"
+        needle = " or ref_sha != base_sha"
         self.assertIn(needle, src)
         mod = _exec_approval_src(src.replace(needle, ""))
         api = _fake_api([self.ext], {7: [_review(SHA_A)]})
@@ -4069,7 +4070,7 @@ class QueueRefDigitCap6244(unittest.TestCase):
 
     def gate(self, digits: str) -> Tuple[int, List[str]]:
         ref = f"refs/heads/gh-readonly-queue/main/pr-{digits}-{SHA_C}"
-        event = {"merge_group": {"head_sha": SHA_C, "head_ref": ref}}
+        event = {"merge_group": {"head_sha": SHA_C, "base_sha": SHA_C, "head_ref": ref}}
         return self.mod.run_gate("merge_group", event, REPO_6117, SHA_C, OPERATOR_6117, _fake_api([_pr(7, SHA_A)]))
 
     def test_6244_oversized_digit_run_fails_closed_with_one_short_line(self) -> None:
@@ -4085,7 +4086,7 @@ class QueueRefDigitCap6244(unittest.TestCase):
         for digits in ("7", "6117", "123456789"):
             with self.subTest(digits=digits):
                 ref = f"refs/heads/gh-readonly-queue/main/pr-{digits}-{SHA_C}"
-                event = {"merge_group": {"head_sha": SHA_C, "head_ref": ref}}
+                event = {"merge_group": {"head_sha": SHA_C, "base_sha": SHA_C, "head_ref": ref}}
                 self.assertEqual(int(digits), self.mod.merge_group_pr_number(event))
 
     def test_6244_m01_removing_the_cap_is_killed(self) -> None:
@@ -4094,7 +4095,7 @@ class QueueRefDigitCap6244(unittest.TestCase):
         self.assertIn(needle, src)
         mod = _exec_approval_src(src.replace(needle, "pr-([0-9]+)-"))
         ref = f"refs/heads/gh-readonly-queue/main/pr-{'9' * 5000}-{SHA_C}"
-        event = {"merge_group": {"head_sha": SHA_C, "head_ref": ref}}
+        event = {"merge_group": {"head_sha": SHA_C, "base_sha": SHA_C, "head_ref": ref}}
         with self.assertRaises(ValueError):  # the mutant dies in int(); the live gate returns 1
             mod.run_gate("merge_group", event, REPO_6117, SHA_C, OPERATOR_6117, _fake_api([_pr(7, SHA_A)]))
 
@@ -4199,7 +4200,7 @@ class CloudR2ApprovalPins(unittest.TestCase):
         header = _job_text(self.c8, APPROVAL_JOB)
         self.assertNotIn("applies the rule above to each", header)
         self.assertIn("named by the queue ref", header)
-        self.assertIn("head_sha", header)
+        self.assertIn("base_sha", header)  # #6325: the ref sha is the queue commit's parent
 
 
 class CarrierIdPinned6117(unittest.TestCase):

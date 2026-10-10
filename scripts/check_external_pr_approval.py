@@ -23,6 +23,10 @@ OPEN pull request N and judges it at its own current head sha by the same rule. 
 payload that is unreadable, a head_ref it cannot parse, or a PR that is not open:
 FAIL (fail closed). Mirrors the pull_request arm (the event names the PR).
 
+#6242 / #6325: the <sha> in that ref is merge_group.base_sha, the queue commit's
+PARENT (merge_group.head_sha is the queue commit itself). It must be a full lowercase
+commit sha equal to merge_group.base_sha, which GitHub sets; otherwise FAIL.
+
 Exit 0: pass. Exit 1: approval missing, or the verdict cannot be established.
 Standard library only; Python 3.9+.
 """
@@ -174,13 +178,16 @@ def merge_group_pr_number(event):
         shown = ref if isinstance(ref, str) and len(ref) <= 120 else f"<{type(ref).__name__} of unusable shape>"
         raise GateError(f"merge_group head_ref {shown!r} does not name a pull request "
                         "(expected refs/heads/gh-readonly-queue/<base>/pr-<N>-<sha>, N at most 9 digits)")
-    # The ref is attacker-influenced text; the queued head is GitHub's own field. The sha in the
-    # ref must be a full commit sha and equal that head, or the verdict is not about the queue (#6242).
+    # The ref is attacker-influenced text; base_sha is GitHub's own field. GitHub names the queue
+    # ref after the queue commit's PARENT, merge_group.base_sha, not after merge_group.head_sha
+    # (#6325). The ref sha must be a full commit sha equal to base_sha, or the verdict is not
+    # about this queue entry (#6242).
     ref_sha = match.group(2)
-    head_sha = group.get("head_sha")
-    if (not SHA_RE.fullmatch(ref_sha) or not isinstance(head_sha, str)
-            or not SHA_RE.fullmatch(head_sha) or ref_sha != head_sha):
-        raise GateError(f"merge_group head_ref sha {ref_sha!r} is not the queued head commit")
+    base_sha = group.get("base_sha")
+    if (not SHA_RE.fullmatch(ref_sha) or not isinstance(base_sha, str)
+            or not SHA_RE.fullmatch(base_sha) or ref_sha != base_sha):
+        raise GateError(f"merge_group head_ref sha {ref_sha[:80]!r} is not merge_group.base_sha "
+                        "(the queue commit's parent)")
     return number
 
 
@@ -227,7 +234,8 @@ def run_gate(event_name, event, repo, sha, operator, api):
 
 
 def self_test():
-    repo, op, a, b = "o/r", "op", "a" * 40, "b" * 40
+    # e is merge_group.base_sha and the sha in the queue ref; c is the queue commit (#6325).
+    repo, op, a, b, c, e = "o/r", "op", "a" * 40, "b" * 40, "c" * 40, "e" * 40
 
     def pr(n, sha, assoc="NONE", head_repo="fork/r"):
         return {"number": n, "author_association": assoc, "user": {"login": "x"},
@@ -250,21 +258,33 @@ def self_test():
         ("push-team-same-repo", 0, "push", a, api_for([pr(2, a, "MEMBER", repo)])),
         ("push-no-pr-heads-sha", 0, "push", a, api_for([pr(1, b)])),
         ("push-api-error", 1, "push", a, api_for([], fail=True)),
-        ("merge-group-unapproved", 1, "merge_group", "c" * 40, api_for([pr(1, a)])),
-        ("merge-group-approved", 0, "merge_group", "c" * 40, api_for([pr(1, a)], {1: [approved]})),
-        ("merge-group-no-pr-in-ref", 1, "merge_group", "c" * 40, api_for([pr(1, a)])),
-        ("merge-group-ref-sha-not-queued-head", 1, "merge_group", "c" * 40,
+        ("merge-group-unapproved", 1, "merge_group", c, api_for([pr(1, a)])),
+        ("merge-group-approved", 0, "merge_group", c, api_for([pr(1, a)], {1: [approved]})),
+        ("merge-group-release-base-approved", 0, "merge_group", c, api_for([pr(1, a)], {1: [approved]})),
+        ("merge-group-release-base-unapproved", 1, "merge_group", c, api_for([pr(1, a)])),
+        ("merge-group-no-pr-in-ref", 1, "merge_group", c, api_for([pr(1, a)])),
+        ("merge-group-ref-sha-is-head-sha-not-base-sha", 1, "merge_group", c,
          api_for([pr(1, a)], {1: [approved]})),
+        ("merge-group-missing-base-sha", 1, "merge_group", c, api_for([pr(1, a)], {1: [approved]})),
     ]
     failures = 0
-    queue = {"merge_group": {"head_sha": "c" * 40,
-                             "head_ref": "refs/heads/gh-readonly-queue/main/pr-1-" + "c" * 40}}
-    forged = {"merge_group": {"head_sha": "c" * 40,
-                              "head_ref": "refs/heads/gh-readonly-queue/main/pr-1-" + "d" * 40}}
+
+    def queue(base="main", ref_sha=e, base_sha=e):
+        group = {"head_sha": c, "base_ref": "refs/heads/" + base,
+                 "head_ref": f"refs/heads/gh-readonly-queue/{base}/pr-1-{ref_sha}"}
+        if base_sha is not None:
+            group["base_sha"] = base_sha
+        return {"merge_group": group}
+
+    events = {
+        "merge-group-release-base-approved": queue("release/v1.0.0"),
+        "merge-group-release-base-unapproved": queue("release/v1.0.0"),
+        "merge-group-no-pr-in-ref": {},
+        "merge-group-ref-sha-is-head-sha-not-base-sha": queue(ref_sha=c),
+        "merge-group-missing-base-sha": queue(base_sha=None),
+    }
     for name, want, event_name, sha, api in cases:
-        event = {} if name == "merge-group-no-pr-in-ref" else (queue if event_name == "merge_group" else {})
-        if name == "merge-group-ref-sha-not-queued-head":
-            event = forged
+        event = events.get(name, queue() if event_name == "merge_group" else {})
         rc, _lines = run_gate(event_name, event, repo, sha, op, api)
         ok = rc == want
         failures += 0 if ok else 1
