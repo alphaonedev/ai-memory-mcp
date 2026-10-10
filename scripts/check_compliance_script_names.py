@@ -1175,6 +1175,7 @@ R11_CELLS = (
 
 # Round 12: one table, cells named for the issue they pin.
 R12_STALE = "Run check-old.sh daily.\n"
+R12_ERR_LINE = "Erratum (#1): `check-old.sh` is `scripts/check_new.py`.\n"
 R12_BASE = "Clause (c) applies.\nOther (c) item.\n"
 R12_FRAG = "docs/compliance/A.md:c:2\n"
 R12_JOIN = "joins into script name `check-gone.sh`"
@@ -1238,6 +1239,15 @@ R12_CELLS = (
     for cp in (0x2500, 0x2501, 0x23AF, 0x23BA, 0x2E0F, 0x00AF, 0x00B7, 0x2027, 0x10191, 0x1680)
 ) + (
     ("E-dash-sep-1680", "Run check\u1680old.sh daily.\n", "", 1, "look-alike script name"),
+    # #6636: a heading inside the erratum paragraph ends it; the block must be one plain paragraph.
+    ("K-heading-in-block", r11_err("# Inner\n" + R12_ERR_LINE), R11_ALLOW, 1, "a heading in the erratum block"),
+    ("K-heading-in-block-indented", r11_err("   # Inner\n" + R12_ERR_LINE), R11_ALLOW, 1,
+     "an indented line in the erratum block"),
+    ("K-heading-in-block-last", r11_err(R12_ERR_LINE + "###### Tail\n"), R11_ALLOW, 1, "a heading in the erratum block"),
+    ("K-heading-in-block-bare", r11_err(R12_ERR_LINE + "#\n"), R11_ALLOW, 1, "a heading in the erratum block"),
+    ("K-setext-equals-in-block", r11_err(R12_ERR_LINE + "===\n"), R11_ALLOW, 1,
+     "a line that does not start with a letter or digit in the erratum block"),
+    ("K-setext-dashes-in-block", r11_err(R12_ERR_LINE + "  ---\n"), R11_ALLOW, 1, "an indented line in the erratum block"),
 ) + tuple(
     # #6633: each new DASHES member folds to ``-``, so the folded view shows the name.
     ("E-dash-fold-%04X" % cp, "Run check-old%sx.sh daily.\n" % chr(cp), "", 1, "`check-old-x.sh` is shown only after")
