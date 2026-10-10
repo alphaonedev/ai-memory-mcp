@@ -1442,6 +1442,21 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                 t.fail(f"(pr4-sha-len): a {lane} {label} {key} ran git calls other than the "
                        f"`--version` probe before the validator refused it: {calls!r}", text)
 
+    # (pr4-sha-comment, #6649): the comment block above sha_len_values names the loosening of each
+    # #6463 value and makes no false "only cell" claim for the `$` or lstrip rows (the whitespace
+    # corpus also kills both). A comment cannot be mutated, so the cell reads the block as text.
+    own_src = Path(__file__).read_text(encoding="utf-8")
+    block = re.search(r"# Each non-length value below.*?\(#6414, #6404\)", own_src, re.S)
+    block_text = block.group(0) if block else ""
+    if not block_text:
+        t.fail("(pr4-sha-comment): the sha_len_values comment block was not found")
+    for label in [lb for lb, _ in sha_len_values[9:13]]:
+        if not re.search(r"^\s*#\s+" + re.escape(label) + r"\s+:\s+\S", block_text, re.M):
+            t.fail(f"(pr4-sha-comment): the comment block has no row naming the loosening of {label!r}")
+    for stale_claim in ("(only this cell)", "only cells for theirs"):
+        if stale_claim in block_text:
+            t.fail(f"(pr4-sha-comment): the comment block still claims {stale_claim!r}")
+
     # (k) fail-closed - pull_request with nothing set (missing PR head sha / base ref).
     t.gate("k", "pull_request with PR_HEAD_SHA and GITHUB_BASE_REF unset", repo,
            {"GITHUB_EVENT_NAME": "pull_request"}, "PR_HEAD_SHA is unset")
