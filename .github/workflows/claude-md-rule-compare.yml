@@ -64,5 +64,7 @@ jobs:
           persist-credentials: false
       - name: Comparison self-test (base code)
         run: python3 -I scripts/claude-md-rule-compare.py --self-test
+      - name: Comparison security regressions (base code)
+        run: python3 -I -m unittest discover -s scripts/ci/tests -p test_codeql_6163.py
       - name: Compare the head rule sections with the base manifest
         run: python3 -I scripts/claude-md-rule-compare.py --base-root . --event "$GITHUB_EVENT_PATH" --scratch "$RUNNER_TEMP/rule-compare" --summary "$GITHUB_STEP_SUMMARY"

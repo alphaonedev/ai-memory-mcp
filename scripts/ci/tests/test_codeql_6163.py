@@ -27,6 +27,8 @@ DIRECTORY_MODE = 0o700
 REPOSITORY = 'alphaonedev/ai-memory-mcp'
 DUPLICATE_COUNTS = (32, 64, 128)
 REPORT_TEST_LIMIT = 128 * 1024
+STREAM_TEST_BYTES = 512
+REPORT_BYTE_HOSTILE_COUNT = 900  # fits 1,024 ranges, exceeds 128 KiB of navigation
 HOSTILE_HEADING = '## ' + CANARY + '\nrule\n'
 ISOLATED_FLAGS = argparse.Namespace(**{name: getattr(sys.flags, name) for name in dir(sys.flags)
                                       if isinstance(getattr(sys.flags, name), int)})
@@ -190,6 +192,42 @@ class ComparisonTests(unittest.TestCase):
                 else:
                     self.assertEqual(len(report.encode('utf-8')), measured)
                     self.assertIn('RULE TEXT CHANGED', report)
+
+    def test_default_report_budgets_close_small_hostile_inputs(self):
+        payloads = (
+            ''.join('## section ' + str(index) + '\nrule\n'
+                    for index in range(self.compare.MAX_REPORT_SECTIONS)),
+            HOSTILE_HEADING * self.compare.MAX_REPORT_RANGES,
+            HOSTILE_HEADING * REPORT_BYTE_HOSTILE_COUNT,
+        )
+        for payload in payloads:
+            with self.subTest(input_bytes=len(payload.encode('utf-8'))):
+                self.reset_report_fixture()
+                result, output, _ = self.run_head(payload, approved=True)
+                self.assertEqual(result, 1)
+                self.assertEqual((self.work / 'summary').read_text(), self.compare.FAIL_REPORT)
+                self.assertNotIn(CANARY, output)
+
+    def test_report_builder_checks_utf8_bytes_before_append(self):
+        line = '\N{SNOWMAN}'
+        budget = len((line + '\n').encode('utf-8'))
+        with unittest.mock.patch.object(self.compare, 'MAX_REPORT_BYTES', budget):
+            report = self.compare.BoundedReport()
+            report.append(line)
+            with self.assertRaises(RuntimeError):
+                report.append('')
+            self.assertEqual(report.render(), line + '\n')
+            self.assertEqual(report.byte_count, budget)
+        # Streaming must stop at refusal, without formatting the remaining ranges.
+        with unittest.mock.patch.object(self.compare, 'MAX_REPORT_BYTES', STREAM_TEST_BYTES), \
+                unittest.mock.patch.object(self.compare, 'review_location',
+                                          wraps=self.compare.review_location) as location:
+            report = self.compare.BoundedReport()
+            with self.assertRaises(RuntimeError):
+                report.extend(self.compare.section_diagnostic(
+                    'RULE TEXT CHANGED', 'added', 1, [], [(1, 1)] * DUPLICATE_COUNTS[-1],
+                    self.base, self.base))
+            self.assertLess(location.call_count, DUPLICATE_COUNTS[0])
 
     def test_head_heading_and_guard_error_do_not_escape(self):
         result, output, _ = self.run_head('## ' + CANARY + '\nrule\n## ' + CANARY)

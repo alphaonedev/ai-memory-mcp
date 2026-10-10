@@ -1772,12 +1772,14 @@ COMPARE_WORKFLOW_LINES = (
     "persist-credentials: false",
     "- name: Comparison self-test (base code)",
     "run: python3 -I scripts/claude-md-rule-compare.py --self-test",
+    "- name: Comparison security regressions (base code)",
+    "run: python3 -I -m unittest discover -s scripts/ci/tests -p test_codeql_6163.py",
     "- name: Compare the head rule sections with the base manifest",
     'run: python3 -I scripts/claude-md-rule-compare.py --base-root . --event "$GITHUB_EVENT_PATH" '
     '--scratch "$RUNNER_TEMP/rule-compare" --summary "$GITHUB_STEP_SUMMARY"',
 )
 # Every indentation level remains independently pinned.
-COMPARE_WORKFLOW_INDENTS = (0, 0, 2, 4, 4, 0, 2, 0, 2, 2, 0, 2, 4, 4, 4, 4, 6, 8, 8, 10, 10, 10, 6, 8, 6, 8)
+COMPARE_WORKFLOW_INDENTS = (0, 0, 2, 4, 4, 0, 2, 0, 2, 2, 0, 2, 4, 4, 4, 4, 6, 8, 8, 10, 10, 10, 6, 8, 6, 8, 6, 8)
 COMPARE_DANGER = (
     ("if:", "a condition can skip the comparison"),
     ("paths:", "a paths filter can skip the comparison"),

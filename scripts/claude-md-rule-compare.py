@@ -86,6 +86,11 @@ TRUSTED_PATHS = ("scripts/check-claude-md-size.py", "scripts/claude-md-rule-comp
                  ".github/CODEOWNERS")
 DIFF_LINE_CAP = 200
 MAX_BLOB_BYTES = 2 * 1024 * 1024  # far above any legitimate file; refuses a memory-exhaustion blob
+# #6163: current and healthy fixture each have 16 sections. Bound both the
+# comparison metadata and UTF-8 report before accumulation, even for malformed input.
+MAX_REPORT_SECTIONS = 256
+MAX_REPORT_RANGES = 1024  # combined base and head occurrences, including preambles
+MAX_REPORT_BYTES = 128 * 1024
 # Messages of the base guard that the section comparison already reports in its own words.
 DRIFT_MARKERS = ("changed: sha256", "is not pinned in", "is missing from CLAUDE.md")
 
@@ -323,16 +328,47 @@ def approvals(repo: Path, base_sha: str, head_sha: str) -> list:
     return found
 
 
-def section_ranges(guard, text: str) -> dict:
+def section_ranges(guard, text: str, range_budget=None) -> dict:
     """Map internal section keys to numeric source ranges; keys never enter the output schema."""
+    remaining = MAX_REPORT_RANGES if range_budget is None else range_budget
     current, start, end = guard.PREAMBLE_KEY, 1, 1
     ranges = {}
+
+    def add_range(last: int) -> None:
+        nonlocal remaining
+        if remaining <= 0 or (current not in ranges and len(ranges) >= MAX_REPORT_SECTIONS):
+            raise RuntimeError("section metadata exceeds comparison budget")
+        remaining -= 1
+        ranges.setdefault(current, []).append((start, max(start, last)))
+
     for end, (line, in_code) in enumerate(guard.fence_scan(text), 1):
         if not in_code and line.startswith("## "):
-            ranges.setdefault(current, []).append((start, max(start, end - 1)))
+            add_range(end - 1)
             current, start = line.rstrip(), end
-    ranges.setdefault(current, []).append((start, max(start, end)))
+    add_range(end)
     return ranges
+
+
+class BoundedReport:
+    """Reject before appending a line that exceeds the encoded report budget."""
+
+    def __init__(self):
+        self.lines = []
+        self.byte_count = 0
+
+    def append(self, line: str) -> None:
+        size = len(line.encode("utf-8")) + len(b"\n")
+        if size > MAX_REPORT_BYTES - self.byte_count:
+            raise RuntimeError("report exceeds comparison budget")
+        self.lines.append(line)
+        self.byte_count += size
+
+    def extend(self, lines) -> None:
+        for line in lines:
+            self.append(line)
+
+    def render(self) -> str:
+        return "\n".join(self.lines) + "\n"
 
 
 def review_location(sha: str, relative: str, start: int, end: int) -> str:
@@ -344,17 +380,17 @@ def review_location(sha: str, relative: str, start: int, end: int) -> str:
 
 
 def section_diagnostic(category: str, state: str, number: int, old: list, new: list,
-                       base_sha: str, head_sha: str) -> list:
-    """Only closed categories and validated numeric ranges cross the diagnostic boundary (R2)."""
+                       base_sha: str, head_sha: str):
+    """Stream closed categories and numeric ranges into the bounded report (R2)."""
     if category not in ("RULE TEXT CHANGED", "COUNT CHANGED") or state not in (
             "added", "removed", "changed", "duplicated heading") or type(number) is not int or not 1 <= number <= MAX_BLOB_BYTES:
         raise RuntimeError("invalid structured section")
-    lines = [f"### {category} ({state}): section={number}"]
+    yield f"### {category} ({state}): section={number}"
     for side, sha, ranges in (("base", base_sha, old), ("head", head_sha, new)):
         for start, end in ranges:
             link = review_location(sha, "CLAUDE.md", start, end)
-            lines.append(f"- {side}: lines={start}-{end}; count={end - start + 1}; [review]({link})")
-    return lines + [""]
+            yield f"- {side}: lines={start}-{end}; count={end - start + 1}; [review]({link})"
+    yield ""
 
 
 def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: Path, index_pins=None):
@@ -378,21 +414,25 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
         raise RuntimeError("the base manifest is unusable: " + "; ".join(manifest_errors))
     head_text = guard.read_utf8(head_root / "CLAUDE.md")
     base_text = guard.read_utf8(base_root / "CLAUDE.md")
+    base_ranges = section_ranges(guard, base_text)
+    head_ranges = section_ranges(guard, head_text, MAX_REPORT_RANGES - sum(map(len, base_ranges.values())))
+    if len(set(pinned) | set(base_ranges) | set(head_ranges)) > MAX_REPORT_SECTIONS:
+        raise RuntimeError("section keys exceed comparison budget")
     head_hashes, duplicates = guard.rule_section_hashes(head_text)
     head_bodies = section_texts(guard, head_text)
     base_bodies = section_texts(guard, base_text)
 
-    base_ranges = section_ranges(guard, base_text)
-    head_ranges = section_ranges(guard, head_text)
     keys = sorted(pinned) + sorted(set(head_hashes) - set(pinned))
     section_ids = {key: number for number, key in enumerate(keys, 1)}
-    lines = ["## CLAUDE.md rule-change comparison (structured schema 1)", ""]
+    lines = BoundedReport()
+    lines.extend(["## CLAUDE.md rule-change comparison (structured schema 1)", ""])
     for rel in DATA_PATHS:
         lines.append(f"- Source: {rel}; [base]({review_location(base_sha, rel, 1, 1)}); "
                      f"[head]({review_location(head_sha, rel, 1, 1)})")
-    lines += [f"- [Approval range]({REVIEW_URL}/compare/{base_sha}...{head_sha})", ""]
+    lines.extend([f"- [Approval range]({REVIEW_URL}/compare/{base_sha}...{head_sha})", ""])
     rule_changed = False
     count_changed = False
+    reported_keys = set()
     for key in keys:
         if key in pinned and head_hashes.get(key) == pinned[key]:
             continue
@@ -403,17 +443,21 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
         if old is not None and new is not None and key.startswith(CENSUS_SECTION) and (
                 CENSUS_DIGITS.split(old) == CENSUS_DIGITS.split(new)):
             count_changed = True
-            lines += section_diagnostic("COUNT CHANGED", "changed", section_ids[key],
-                                        base_ranges.get(key, []), head_ranges.get(key, []), base_sha, head_sha)
+            lines.extend(section_diagnostic("COUNT CHANGED", "changed", section_ids[key],
+                                            base_ranges.get(key, []), head_ranges.get(key, []), base_sha, head_sha))
         else:
             rule_changed = True
             state = "removed" if new is None else ("added" if old is None else "changed")
-            lines += section_diagnostic("RULE TEXT CHANGED", state, section_ids[key],
-                                        base_ranges.get(key, []), head_ranges.get(key, []), base_sha, head_sha)
-    for key in duplicates:
+            lines.extend(section_diagnostic("RULE TEXT CHANGED", state, section_ids[key],
+                                            base_ranges.get(key, []), head_ranges.get(key, []), base_sha, head_sha))
+        reported_keys.add(key)
+    for key in sorted(set(duplicates)):
         rule_changed = True
-        lines += section_diagnostic("RULE TEXT CHANGED", "duplicated heading", section_ids[key],
-                                    base_ranges.get(key, []), head_ranges.get(key, []), base_sha, head_sha)
+        # Keep both change categories, but navigate each occurrence only once.
+        old = [] if key in reported_keys else base_ranges.get(key, [])
+        new = [] if key in reported_keys else head_ranges.get(key, [])
+        lines.extend(section_diagnostic("RULE TEXT CHANGED", "duplicated heading", section_ids[key],
+                                        old, new, base_sha, head_sha))
     residual = [error for error in guard.check(head_root, index_pins) if not any(marker in error for marker in DRIFT_MARKERS)]
     if residual:
         rule_changed = True
@@ -438,7 +482,7 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
         lines.append("RESULT: PASS - only counts changed (printed above for review).")
     else:
         lines.append("RESULT: PASS - no rule section differs from the base manifest.")
-    return "\n".join(lines) + "\n", failed
+    return lines.render(), failed
 
 
 def run(args) -> int:
