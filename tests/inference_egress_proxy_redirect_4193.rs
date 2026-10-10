@@ -47,7 +47,9 @@ struct EnvScope {
 
 impl EnvScope {
     fn new(vars: &[(&'static str, Option<&str>)]) -> Self {
-        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut prior = Vec::with_capacity(vars.len());
         for (name, value) in vars {
             prior.push((*name, std::env::var(name).ok()));
@@ -94,7 +96,7 @@ const NO_PROXY_VARS: [&str; 2] = ["NO_PROXY", "no_proxy"];
 const POSTURE_VAR: &str = "AI_MEMORY_INFERENCE_EGRESS";
 
 /// Build the env table for one cell: the posture (or unset = `allow`), the
-/// proxy vars all pointed at `proxy` (or all unset), and NO_PROXY cleared so
+/// proxy vars all pointed at `proxy` (or all unset), and `NO_PROXY` cleared so
 /// a sandbox-level loopback exemption cannot mask the control.
 fn cell_env<'a>(
     posture: Option<&'a str>,
