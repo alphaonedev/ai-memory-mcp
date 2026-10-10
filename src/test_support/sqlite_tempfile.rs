@@ -76,18 +76,6 @@ impl SqliteTempFile {
             inner: NamedTempFile::new()?,
         })
     }
-
-    /// Create the scratch file inside `dir` (drop-in for
-    /// `NamedTempFile::new_in`).
-    ///
-    /// # Errors
-    ///
-    /// Any I/O error from `NamedTempFile::new_in`.
-    pub(crate) fn new_in<P: AsRef<Path>>(dir: P) -> std::io::Result<Self> {
-        Ok(Self {
-            inner: NamedTempFile::new_in(dir)?,
-        })
-    }
 }
 
 impl Deref for SqliteTempFile {

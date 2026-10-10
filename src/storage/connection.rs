@@ -2033,6 +2033,7 @@ mod tests {
         // install. We bypass the validator by writing directly with
         // rusqlite::execute so the trigger is the only thing standing
         // between the bad row and persistence.
+        let _no_pass = crate::test_support::no_passphrase_guard();
         let tmp = crate::test_support::SqliteTempFile::new().expect("tempfile");
         let conn = open(tmp.path()).expect("open");
         let now = chrono::Utc::now().to_rfc3339();
