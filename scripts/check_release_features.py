@@ -4472,6 +4472,76 @@ def package_runtime(root: Path, base: Path, payload: bytes) -> int:
     return failures
 
 
+# #6909: interpreter-level injections an earlier step can leave in the job
+# environment (GITHUB_ENV) for the two-build proof: (env, files under HOME).
+PROOF_FORMS: Dict[str, Tuple[Dict[str, str], Dict[str, str]]] = {
+    "PYTHONPATH sitecustomize": ({"PYTHONPATH": "{evil}"}, {}),
+    "PYTHONHOME redirect": ({"PYTHONHOME": "{evil}"}, {}),
+    "user site-packages usercustomize": ({}, {
+        "Library/Python/{ver}/lib/python/site-packages/usercustomize.py": "{hook}",
+        ".local/lib/python{ver}/site-packages/usercustomize.py": "{hook}"}),
+}
+PROOF_HOOK = ("import hashlib\nclass _F:\n    def __init__(s, *a, **k): pass\n    def update(s, b): pass\n"
+              "    def hexdigest(s): return '0' * 64\n    def digest(s): return bytes(32)\nhashlib.sha256 = _F\n")
+PROOF_CARGO = ("import os, sys\nt = sys.argv[sys.argv.index('--target') + 1]\n"
+               "d = os.path.join(os.environ.get('CARGO_TARGET_DIR') or 'target', t, 'release')\n"
+               "os.makedirs(d, exist_ok=True)\nopen(os.path.join(d, 'ai-memory'), 'wb').write({payload})\n")
+PROOF_NFPM = ("import os, sys, pathlib\na = sys.argv[1:]\nfmt, out = a[a.index('-p') + 1], pathlib.Path(a[a.index('-t') + 1])\n"
+              "out.mkdir(parents=True, exist_ok=True)\n"
+              "(out / ('ai-memory_%s_%s.%s' % (os.environ['VERSION'], os.environ['ARCH'], fmt))).write_bytes("
+              "pathlib.Path('dist/ai-memory').read_bytes())\n")
+
+
+def proof_runtime(root: Path, base: Path) -> int:
+    """#3613 / #6909: run the pinned two-build proof statement under the pinned
+    step shell. A reproducible build is proven (control); a NON-reproducible
+    build must be refused whatever interpreter-level injection an earlier step
+    left in the job environment (PROOF_FORMS)."""
+    failures = 0
+    git = ["git", "-c", "user.name=self-test", "-c", "user.email=self-test@localhost", "-c", "commit.gpgsign=false"]
+    # The proof runs /usr/bin/python3, whatever interpreter runs this guard.
+    ver = subprocess.run(["/usr/bin/python3", "-I", "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    cases = [("control", "b'reproducible\\n'", {}, {}, True)]
+    cases += [(form, "os.urandom(32)", env, files, False) for form, (env, files) in PROOF_FORMS.items()]
+    for form, payload, extra, files, proven_wanted in cases:
+        work = base / "proof-runtime"
+        shutil.rmtree(work, ignore_errors=True)
+        repo, stub, evil, home, rt = (work / n for n in ("repo", "stub", "evil", "home", "rt"))
+        for d in (repo / "scripts" / "release", stub, evil, home, rt / "nfpm"):
+            d.mkdir(parents=True)
+        shutil.copy2(root / REPRO_SCRIPT, repo / REPRO_SCRIPT)
+        (repo / "Cargo.toml").write_text("[package]\nname = 'x'\n", encoding="utf-8")
+        for cmd in (["init", "-q"], ["add", "."], ["commit", "-q", "-m", "pin the proof"]):
+            subprocess.run(git + cmd, cwd=repo, capture_output=True, check=True)
+        (evil / "sitecustomize.py").write_text(PROOF_HOOK, encoding="utf-8")
+        for rel in files:
+            p = home / rel.replace("{ver}", ver)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(PROOF_HOOK, encoding="utf-8")
+        for path, code in ((stub / "cargo", PROOF_CARGO.replace("{payload}", payload)), (rt / "nfpm" / "nfpm", PROOF_NFPM)):
+            path.write_text("#!/usr/bin/python3 -I\n" + code, encoding="utf-8")
+            path.chmod(0o755)
+        out = work / "output.txt"
+        out.write_text("", encoding="utf-8")
+        env = {"PATH": f"{stub}:/usr/bin:/bin", "HOME": str(home), "RUNNER_TEMP": str(rt), "TMPDIR": str(rt),
+               "GITHUB_OUTPUT": str(out), "TAG": "v1.0.0"}
+        env.update({k: v.replace("{evil}", str(evil)) for k, v in extra.items()})
+        body = "\n".join(("set -euo pipefail", "FEATURES=sal", REPRO_PROOF))
+        rc = subprocess.run(shell_argv(SANE_SHELL) + [body], cwd=repo, env=env, capture_output=True).returncode
+        digests = [ln.split("=", 1)[1] for ln in out.read_text(encoding="utf-8").splitlines() if ln.startswith("sha256=")]
+        proven = rc == 0 and bool(digests)
+        if proven_wanted and not proven:
+            print(f"self-test FAIL: the pinned two-build proof does not prove a reproducible build (rc {rc}) (#3613)",
+                  file=sys.stderr)
+            failures += 1
+        elif not proven_wanted and (rc == 0 or digests):
+            print(f"self-test FAIL: the pinned two-build proof proved a non-reproducible build ({form}, rc {rc}, "
+                  f"{digests[-1:]!r:.20}) (#6909): fail-open", file=sys.stderr)
+            failures += 1
+    return failures
+
+
 def condition_anchor_failures() -> int:
     """#6280: a condition-mutant anchor that occurs more than once above CONDITION_MARKER is never applied
     (the sweep reports it as a survivor only after a full run); refuse it here, in seconds. No replacement
@@ -4658,6 +4728,9 @@ def self_test(root: Path) -> int:
         # ship only the bytes the strict assert checked, whatever an earlier step
         # put on PATH or left running.
         failures += package_runtime(root, tmp / "bound", payload)
+        # #6909: the two-build proof refuses a non-reproducible build whatever an
+        # earlier step left in the job environment for the interpreter.
+        failures += proof_runtime(root, tmp / "bound")
 
         # --- #3613: the two-build proof script proves itself (two identical
         # builds pass; a perturbed SOURCE_DATE_EPOCH and an unremapped workspace
