@@ -376,7 +376,7 @@ fn process_clone_is_dropped_at_exit_6570() {
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let name = stdout
         .lines()
-        .find_map(|l| l.strip_prefix(CHILD_PRINT_6570))
+        .find_map(|l| l.split_once(CHILD_PRINT_6570).map(|(_, rest)| rest.trim()))
         .map(str::to_string);
     // Reclaim a leaked clone before asserting so a red run leaves nothing behind.
     let leaked = name
