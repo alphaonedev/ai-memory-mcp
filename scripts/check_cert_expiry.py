@@ -220,6 +220,15 @@ LOG_CF_RANGES = ((0x00AD, 0x00AD), (0x0600, 0x0605), (0x061C, 0x061C), (0x06DD, 
                  (0xE0001, 0xE0001), (0xE0020, 0xE007F))
 
 
+# Default_Ignorable_Code_Point (Unicode 15.0) that is not Cf, plus U+2800 BRAILLE PATTERN BLANK: code points a
+# terminal or the checks page renders as nothing, written out so the escaping is the same on every
+# interpreter (#6917).
+LOG_INVISIBLE_RANGES = ((0x034F, 0x034F), (0x115F, 0x1160), (0x17B4, 0x17B5), (0x180B, 0x180D), (0x180F, 0x180F),
+                        (0x2065, 0x2065), (0x2800, 0x2800), (0x3164, 0x3164), (0xFE00, 0xFE0F), (0xFFA0, 0xFFA0),
+                        (0xFFF0, 0xFFF8), (0xE0000, 0xE0000), (0xE0002, 0xE001F), (0xE0080, 0xE00FF),
+                        (0xE0100, 0xE01EF), (0xE01F0, 0xE0FFF))
+
+
 def _in_ranges(code, ranges):
     return any(first <= code <= last for first, last in ranges)
 
@@ -231,7 +240,10 @@ def log_safe(text):
     BOM; #6683) as `\\uNNNN` (`\\UNNNNNNNN` above U+FFFF). The format
     characters of Unicode 15.0 come from the explicit table LOG_CF_RANGES, so
     Python 3.9 and 3.12 print the same text; the interpreter's own category Cf
-    is kept as a net for code points newer than the table. A name the change
+    is kept as a net for code points newer than the table. The default-ignorable
+    code points that are not format characters (Hangul fillers, the combining
+    grapheme joiner, variation selectors, U+2800; LOG_INVISIBLE_RANGES, #6917)
+    are escaped the same way. A name the change
     controls (a path, a workflow file name, a trailer value, git's stderr
     echoing one) therefore stays on its own step-log line and can never begin
     a line the Actions runner reads as a workflow command (`::error`, ...)."""
@@ -242,7 +254,8 @@ def log_safe(text):
             out.append("\\\\")
         elif code < 0x20 or 0x7F <= code <= 0x9F:
             out.append(f"\\x{code:02x}")
-        elif code in (0x2028, 0x2029) or _in_ranges(code, LOG_CF_RANGES) or unicodedata.category(ch) == "Cf":
+        elif code in (0x2028, 0x2029) or _in_ranges(code, LOG_CF_RANGES) or _in_ranges(code, LOG_INVISIBLE_RANGES) \
+                or unicodedata.category(ch) == "Cf":
             out.append(f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}")
         else:
             out.append(ch)
@@ -4116,7 +4129,9 @@ SELF_TEST_OK = (
     "(tr round 8, #6765/#6919/#6920) the line names every cell of rounds 6 to 8, read from the cell "
     "functions' source, so a new cell that is not named here is red (summary-rounds); (tr round 8, #6683) "
     "every Cf code point of Unicode 15.0 escaped from an explicit table even when the interpreter does not "
-    "report it as a format character, so Python 3.9 and 3.12 agree (log-safe-cf-table)."
+    "report it as a format character, so Python 3.9 and 3.12 agree (log-safe-cf-table); (tr round 8, #6917) "
+    "the default-ignorable code points that are not format characters (Hangul fillers, the grapheme "
+    "joiner, variation selectors, unassigned default-ignorables) and U+2800 escaped too (log-safe-di-U+XXXX)."
 )
 
 
