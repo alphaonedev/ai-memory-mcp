@@ -232,6 +232,8 @@ jobs:
         run: python3 scripts/test/test_workflow_concurrency_6340.py
       - name: Shard partition and wiring unit tests (#6344)
         run: python3 -m unittest discover -s scripts/ci/tests
+      - name: AGE self-heal helper unit test (#6161)
+        run: python3 scripts/test/test_ensure_age_extension_6161.py
       - id: cls
         shell: bash
         env:
@@ -1075,6 +1077,8 @@ jobs:
           # actionlint expression-injection guard stays satisfied; sanitised
           # in-shell below into a pg-identifier-safe suffix.
           LEG: ${{ matrix.leg }}
+          # #6161 — node label via env (same expression-injection rule as LEG).
+          CI_NODE: ${{ matrix.node }}
           CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}
         run: |
           set -euo pipefail
@@ -1117,6 +1121,18 @@ jobs:
             *)    q=""; head="$base_url" ;;
           esac
           new_url="${head%/*}/${CI_FED_DB}${q}"
+          # #6161 — the macos-fed AGE install is hand-built; a Homebrew upgrade
+          # relinks the postgresql@18 trees and drops its files. Self-heal from
+          # the node-local, brew-independent copy BEFORE CREATE EXTENSION
+          # (five sha256-pinned files only; its one-line reason is on stderr).
+          # macos-fed only: the linux-fed path is unchanged.
+          # python3 -I (#6339): the helper builds PGPASSWORD, so no sys.path[0] or PYTHONPATH.
+          if [ "${CI_NODE:-}" = "macos-fed" ]; then
+            if ! python3 -I scripts/ci/ensure-age-extension.py --url-file "$url_file"; then
+              echo "::error::enterprise-fed leg on $RUNNER_NAME: AGE self-heal failed (#6161), see the ensure-age-extension line above"
+              exit 1
+            fi
+          fi
           # Provision the ephemeral db's extensions (the tier role is SUPERUSER).
           if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"; then
             echo "::error::enterprise-fed leg on $RUNNER_NAME failed to create age/vector extensions in $CI_FED_DB"
