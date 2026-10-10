@@ -1534,6 +1534,11 @@ R14_CELLS = (
     # #6858: the report names the path limit instead of "None" for a citation past it.
     ("W6858-long-path-wording", "See x/" + "d/" * 2100 + "check-gone.sh here.\n", "", 1,
      "(checked at a path longer than 4096 bytes)"),
+    # #6902: a citation past the path limit whose bare name exists under scripts/ is still a missing
+    # script (fail closed): no file has such a path, so the target must not fall back to scripts/<name>.
+    ("L6902-long-unrooted-existing", "a/" * 2100 + "scripts/check_new.py\n", "", 1,
+     "checked at a path longer than 4096 bytes"),
+    ("L6902-long-plain-existing", "q" * 4200 + "/check_new.py\n", "", 1, "checked at a path longer than 4096 bytes"),
 )
 
 # #6753, #6757: in-place edits of the real tree (a copy of docs/compliance and scripts next to the
