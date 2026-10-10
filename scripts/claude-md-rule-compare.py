@@ -98,8 +98,11 @@ def git(repo: Path, *args: str) -> bytes:
     """Run git in `repo` and return stdout bytes; a non-zero exit raises RuntimeError (fail closed)."""
     # #6712: local replace objects (refs/replace, `git replace --graft`) change the messages and parents base..head reads;
     # every git call here ignores them, so the history the comparison judges is the history that was fetched.
+    # #6798: a commit-graph file (in the repository or an alternate object store) supplies parent edges without a
+    # checksum check and GIT_NO_REPLACE_OBJECTS does not turn it off, so the graph is disabled per call as well.
     env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")
-    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=False, env=env)
+    command = ["git", "-C", str(repo), "-c", "core.commitGraph=false", *args]
+    result = subprocess.run(command, capture_output=True, check=False, env=env)
     if result.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.decode('utf-8', 'replace').strip()}")
     return result.stdout
