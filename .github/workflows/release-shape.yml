@@ -107,7 +107,7 @@ jobs:
           PREFLIGHT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in scripts/release-features.sh scripts/assert-compiled-features.sh; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; test -n "$a"; test "$a" = "$b"; done'
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "4dcd53494e52381437e6fe13f21d06a5393a4e2ef83d02369d02278b00f5d9d6 *scripts/release-features.sh"; echo "ea836345a37906f6cf7f867533915f3b52b39a6ac273e22a590050a1d68e9a13 *scripts/assert-compiled-features.sh"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           export SOURCE_DATE_EPOCH
           RUSTFLAGS="--remap-path-prefix=$PWD=/src --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo"
@@ -174,7 +174,7 @@ jobs:
           PREFLIGHT_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in scripts/release-shape-pg-proof.sh scripts/release-features.sh scripts/assert-compiled-features.sh; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; test -n "$a"; test "$a" = "$b"; done'
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "e8a5a2c8db9e41d150d778ef223842bd85d03c63a82a8631636f23ae488ae16a *scripts/release-shape-pg-proof.sh"; echo "4dcd53494e52381437e6fe13f21d06a5393a4e2ef83d02369d02278b00f5d9d6 *scripts/release-features.sh"; echo "ea836345a37906f6cf7f867533915f3b52b39a6ac273e22a590050a1d68e9a13 *scripts/assert-compiled-features.sh"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
           url="postgres://postgres:${PGTLS_PW}@127.0.0.1:55432/proof?sslmode=verify-full&sslrootcert=${PGTLS_DIR}/ca.crt"
           /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc scripts/release-shape-pg-proof.sh target/release/ai-memory "$url"
 

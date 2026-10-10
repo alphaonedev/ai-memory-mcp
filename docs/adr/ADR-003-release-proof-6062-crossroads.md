@@ -72,6 +72,24 @@ commit`, `fix(#6275): bind the assert inputs in a sanitized shell by content
 hash` and `fix(#6277): Dockerfile build RUN checks the declaration and
 asserter sha256`.
 
+### D4 (#6908, T3, same defect class failed review twice): pin the bound files' SHA-256 in the workflow text (3-0)
+
+`3-agent vote (6def5ab6)`, memory `af6af3b1`. D3 read the expected blob
+from the job's own `.git`, which an earlier step can rewrite: a forged
+loose tree, an exploded pack, an alternate object store, a gitfile or a
+symlinked `.git` each forged the expected value together with the file.
+Option A won 3-0 over B (GitHub REST contents at the preflight sha) and C
+(fetch the preflight sha into a fresh private repository): every bind now
+pipes `echo "<sha256> *<file>"` lines, pinned in the workflow text, to
+`/usr/bin/shasum -a 256 -c -` and still requires `HEAD` to be the preflight
+sha. The guard recomputes each digest from the tree it checks
+(`BIND_SUMMED`, the #6277 Dockerfile precedent) and refuses a stale pin or a
+pin of an unbound file, so a bound-file edit lands with its pin in the same
+commit. A tag whose bound files differ from the dispatch tip fails closed.
+The window between the bind and the interpreter opening the file, and a
+step able to replace `/usr/bin` tools, are the runner-trust boundary and
+are tracked as a residual issue.
+
 ## Consequences
 
 - Intel macOS users build from source. The release no longer publishes an

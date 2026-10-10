@@ -365,7 +365,7 @@ jobs:
           # with PREFLIGHT_SHA, in an `env -i` shell with absolute paths (no
           # job-level environment value or PATH entry reaches it). The step
           # shell is an absolute bash in POSIX mode (no startup file).
-          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in scripts/release-features.sh scripts/assert-compiled-features.sh; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; test -n "$a"; test "$a" = "$b"; done'
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "4dcd53494e52381437e6fe13f21d06a5393a4e2ef83d02369d02278b00f5d9d6 *scripts/release-features.sh"; echo "ea836345a37906f6cf7f867533915f3b52b39a6ac273e22a590050a1d68e9a13 *scripts/assert-compiled-features.sh"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
           # #3613 — deterministic inputs, the same ones the `reproducible` job
           # below builds with twice: the tagged commit's own timestamp (the SBOM
           # job's lever) and runner paths remapped out of the binary, so the
@@ -391,7 +391,7 @@ jobs:
           # #4768 / #6275 — same bind as the build step, re-checked here because
           # a step ran in between: the asserter and the declaration are the
           # verified commit's, read and run by an absolute, sanitized bash.
-          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in scripts/release-features.sh scripts/assert-compiled-features.sh; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; test -n "$a"; test "$a" = "$b"; done'
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "4dcd53494e52381437e6fe13f21d06a5393a4e2ef83d02369d02278b00f5d9d6 *scripts/release-features.sh"; echo "ea836345a37906f6cf7f867533915f3b52b39a6ac273e22a590050a1d68e9a13 *scripts/assert-compiled-features.sh"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
           bin="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
           REQUIRE_FLAGS="$(/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc scripts/release-features.sh --require-flags)"
           test -n "$REQUIRE_FLAGS"
@@ -427,7 +427,7 @@ jobs:
           SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
         run: |
           set -euo pipefail
-          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in scripts/release/reproducible_build.py; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; test -n "$a"; test "$a" = "$b"; done'
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "9eb082dedae45a610512bbdb827f3cf9b87f4bdc2b1ebf0a81875f6788a08408 *scripts/release/reproducible_build.py"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
           test -n "$SOURCE_DATE_EPOCH"
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "dist/${{ matrix.artifact }}"
@@ -669,7 +669,7 @@ jobs:
         run: |
           set -euo pipefail
           # #4768 / #6275 — the declaration and the proof script are the verified commit's.
-          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in scripts/release-features.sh scripts/release/reproducible_build.py; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; test -n "$a"; test "$a" = "$b"; done'
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "4dcd53494e52381437e6fe13f21d06a5393a4e2ef83d02369d02278b00f5d9d6 *scripts/release-features.sh"; echo "9eb082dedae45a610512bbdb827f3cf9b87f4bdc2b1ebf0a81875f6788a08408 *scripts/release/reproducible_build.py"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
           FEATURES="$(/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc scripts/release-features.sh)"
           test -n "$FEATURES"
           /usr/bin/python3 scripts/release/reproducible_build.py --target x86_64-unknown-linux-gnu --features "$FEATURES" --workspace-b "$RUNNER_TEMP/reproducible-b" --sha256-output "$GITHUB_OUTPUT" --nfpm "$RUNNER_TEMP/nfpm/nfpm" --nfpm-arch amd64 --version "${TAG#v}"
@@ -918,7 +918,7 @@ jobs:
           SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
         run: |
           set -euo pipefail
-          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in scripts/release/reproducible_build.py; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; test -n "$a"; test "$a" = "$b"; done'
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "9eb082dedae45a610512bbdb827f3cf9b87f4bdc2b1ebf0a81875f6788a08408 *scripts/release/reproducible_build.py"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
           test -n "$SOURCE_DATE_EPOCH"
           cd dist
           /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/python3 -I ../scripts/release/reproducible_build.py --pack ai-memory-ios.xcframework.tar.gz --epoch "$SOURCE_DATE_EPOCH" AiMemory.xcframework
@@ -1091,7 +1091,7 @@ jobs:
           SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
         run: |
           set -euo pipefail
-          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in scripts/release/reproducible_build.py; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; test -n "$a"; test "$a" = "$b"; done'
+          /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "9eb082dedae45a610512bbdb827f3cf9b87f4bdc2b1ebf0a81875f6788a08408 *scripts/release/reproducible_build.py"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
           test -n "$SOURCE_DATE_EPOCH"
           # Drop a minimal AndroidManifest.xml stub alongside the jniLibs
           # tree so the archive maps 1:1 onto AGP's expected layout.

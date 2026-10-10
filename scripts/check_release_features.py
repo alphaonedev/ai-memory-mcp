@@ -183,15 +183,22 @@ characters (CR, form feed, NUL...), NBSP and every other Unicode space or zero-w
 workflows or Dockerfile are refused, never folded: Python, YAML and bash
 disagree on what a line and a blank are.
 
-RUNTIME BIND (#4768, #6275). The whole-job pin sees every ``run:`` line but
-not what an action (``uses:``) does at runtime, so the build and assert units
-(and the two-build proof) open with ``BIND_INPUTS`` (``sane_bind``): under
-``/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc`` it checks
-that HEAD is the verified preflight commit (``PREFLIGHT_SHA``, step env) and
-that each bound file's content (``/usr/bin/git hash-object --no-filters``) is
-the blob that commit records (``--no-replace-objects``). Index flags
-(assume-unchanged, skip-worktree), an in-job commit and a repository
-redirection in the job environment cannot hide a rewrite from it. The
+RUNTIME BIND (#4768, #6275, #6908). The whole-job pin sees every ``run:``
+line but not what an action (``uses:``) does at runtime, so the build and
+assert units (and the two-build proof) open with ``BIND_INPUTS``
+(``sane_bind``): under ``/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash
+--noprofile --norc`` it checks that HEAD is the verified preflight commit
+(``PREFLIGHT_SHA``, step env) and that each bound file's content has the
+SHA-256 the workflow text itself carries (``/usr/bin/shasum -a 256 -c``).
+#6908 (3-agent vote (6def5ab6), option A): the expected value is never read
+from the git object store, which the job can write (a forged loose tree, an
+alternate store, a gitfile or symlinked ``.git``); it is a literal in the
+workflow, which GitHub fixes at dispatch, and the guard recomputes every
+literal from the tree on each run and refuses drift (``BIND_SUMMED``,
+``check_bind_pins``), the way the Dockerfile pin is kept (#6277). Index flags
+(assume-unchanged, skip-worktree), an in-job commit, a repository redirection
+in the job environment and a rewritten object store cannot hide a rewrite from
+it. The
 declaration is read and the asserter run by the same absolute, sanitized
 interpreter (``SANE_FEATURES``, ``SANE_REQUIRE``, ``SANE_ASSERT``), and the
 units' own shell is ``SANE_SHELL``: an absolute ``/bin/bash`` in POSIX mode,
@@ -237,10 +244,10 @@ ALLOWED_REQUIRE = 'REQUIRE_FLAGS="$(bash scripts/release-features.sh --require-f
 # #6275: the bound forms. Every interpreter is an absolute path and runs under
 # `env -i` with a fixed PATH, so neither a job-level environment value (a
 # startup file, a repository redirection, an exported function) nor a PATH
-# entry an earlier step added can change what runs. The bind compares the
-# CONTENT of each file (`git hash-object --no-filters`) with the blob the
-# verified preflight commit records, and HEAD with that commit: index flags
-# (assume-unchanged, skip-worktree) and an in-job commit cannot hide a rewrite.
+# entry an earlier step added can change what runs. The bind requires HEAD to
+# be the verified preflight commit and the SHA-256 of each file's CONTENT to be
+# the digest the workflow itself pins (#6908): index flags, an in-job commit and
+# a rewritten object store cannot hide a rewrite.
 SANE_ENV = "/usr/bin/env -i PATH=/usr/bin:/bin"
 SANE_BASH = SANE_ENV + " /bin/bash --noprofile --norc"
 # The step shell: an absolute bash in POSIX mode, which reads no startup file.
@@ -248,13 +255,38 @@ SANE_SHELL = "/bin/bash --posix --noprofile --norc -eo pipefail {0}"
 BIND_ENV: Dict[str, "Spec"] = {"PREFLIGHT_SHA": "${{ needs.preflight.outputs.sha }}"}
 
 
+# #6908 (3-agent vote (6def5ab6), option A): every file a bind covers, and the
+# SHA-256 the workflow pins for it. Like DOCKER_SUMMED (#6277) the values are
+# not hand-copied: BIND_DIGESTS is this checkout's, run_guard recomputes them
+# from the tree it checks and check_bind_pins refuses any other literal.
+BIND_SUMMED = ("scripts/release-features.sh", "scripts/assert-compiled-features.sh",
+               "scripts/release/reproducible_build.py", "scripts/release-shape-pg-proof.sh")
+BIND_MISMATCH = ("::error::a bound release script is not the content this workflow pins (#6908); "
+                 "re-tag at the dispatch tip")
+
+
+def bind_digests(root: Path) -> Dict[str, str]:
+    """sha256 of each BIND_SUMMED file under ``root``; NO_DIGEST when unreadable."""
+    out = {}
+    for rel in BIND_SUMMED:
+        try:
+            out[rel] = hashlib.sha256((root / rel).read_bytes()).hexdigest()
+        except OSError:
+            out[rel] = NO_DIGEST
+    return out
+
+
+NO_DIGEST = "0" * 64
+BIND_DIGESTS = bind_digests(HERE.parent)
+
+
 def sane_bind(files: Tuple[str, ...]) -> str:
-    """The #6275 bind statement over ``files`` (fatal on any difference)."""
+    """The #6275 / #6908 bind statement over ``files`` (fatal on any difference):
+    HEAD is the verified commit and each file has its pinned SHA-256."""
+    sums = "; ".join(f'echo "{BIND_DIGESTS[f]} *{f}"' for f in files)
     return (SANE_ENV + ' PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c \''
-            'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; for f in ' + " ".join(files)
-            + '; do a="$(/usr/bin/git hash-object --no-filters -- "$f")"; '
-            'b="$(/usr/bin/git --no-replace-objects rev-parse --verify --quiet "$PREFLIGHT_SHA:$f")"; '
-            'test -n "$a"; test "$a" = "$b"; done\'')
+            'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { ' + sums
+            + '; } | /usr/bin/shasum -a 256 -c - || { echo "' + BIND_MISMATCH + '"; exit 1; }\'')
 
 
 SANE_BIND_INPUTS = sane_bind(("scripts/release-features.sh", "scripts/assert-compiled-features.sh"))
@@ -361,7 +393,6 @@ SHAPE_BUILD = WF_BUILD[:-1] + (SHAPE_BUILD_CMD,)
 # statement. The digests are not hand-copied pins: they are recomputed on every
 # guard run, and the Dockerfile must carry exactly those values.
 DOCKER_SUMMED = ("scripts/release-features.sh", "scripts/assert-compiled-features.sh")
-NO_DIGEST = "0" * 64
 
 
 def tree_digests(root: Path) -> Tuple[str, ...]:
@@ -2421,8 +2452,9 @@ def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], s
     for name, text in (("release.yml", rel), ("release-shape.yml", shape), ("Dockerfile", docker)):
         if text is not None:
             check_inline_use(name, text, rep)
+    pins = bind_digests(root)
     if rel is not None:
-        check_release_yml(rel, rep)
+        check_release_yml(check_bind_pins("release.yml", rel, pins, rep), rep)
     if docker is not None:
         digests = tree_digests(root)
         for rel, digest in zip(DOCKER_SUMMED, digests):
@@ -2430,7 +2462,7 @@ def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], s
                 rep.bad(f"{rel}: unreadable, so the Dockerfile checksum pin cannot be computed (#6277)")
         check_dockerfile(docker, rep, digests)
     if shape is not None:
-        check_shape(shape, rep, advisory)
+        check_shape(check_bind_pins("release-shape.yml", shape, pins, rep), rep, advisory)
     if cargo is not None:
         check_shape_paths(cargo, rep)
     if install is not None:
@@ -2443,6 +2475,31 @@ def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], s
         rep.bad("nfpm.yaml differs from NFPM_YAML (#6497: it sets the deb/rpm payload, modes and maintainer scripts); "
                 "if this change is intended, update NFPM_YAML in " + GUARD_PATH + " in the same commit")
     return rep.errors, declared
+
+
+BIND_PIN_RE = re.compile(r'echo "(?P<hex>[0-9a-f]{64}) \*(?P<rel>[^"]*)"')
+
+
+def check_bind_pins(name: str, text: str, pins: Dict[str, str], rep: Report) -> str:
+    """#6908: every ``echo "<sha256> *<file>"`` bind pin in ``text`` must name a
+    BIND_SUMMED file and carry the SHA-256 of that file in the tree checked
+    (``pins``). Returns ``text`` with each tree digest written as this
+    checkout's (BIND_DIGESTS), so the unit comparison that follows checks the
+    rest of every statement exactly; a pin that differs is refused here and
+    left as it is, so it also fails that comparison."""
+    for m in BIND_PIN_RE.finditer(text):
+        rel, hexd = m.group("rel"), m.group("hex")
+        if rel not in pins:
+            rep.bad(f"{name}: a bind pins {rel!r}, which is not a bound file (BIND_SUMMED, #6908)")
+        elif hexd != pins[rel]:
+            now = "unreadable" if pins[rel] == NO_DIGEST else pins[rel]
+            rep.bad(f"{name}: the bind pins {rel} at {hexd}, but its content in this tree is {now} (#6908); "
+                    "update the pin in the workflow to the tree's SHA-256 in the same commit")
+    out = text
+    for rel in BIND_SUMMED:
+        if pins[rel] != BIND_DIGESTS[rel]:
+            out = out.replace(f'echo "{pins[rel]} *{rel}"', f'echo "{BIND_DIGESTS[rel]} *{rel}"')
+    return out
 
 
 # --------------------------------------------------------------- self-test --
@@ -2489,13 +2546,18 @@ def mutate_file(path: Path, old: str, new: Union[str, None, Transform], every: b
 
 
 def mk_root(src: Path, dst: Path) -> None:
-    """A scratch repo root holding the guard's inputs: INPUT_FILES plus every
-    workflow file (the #4935 sweep reads the whole directory)."""
+    """A scratch repo root holding the guard's inputs: INPUT_FILES, the files the
+    runtime bind pins (BIND_SUMMED, #6908) and every workflow file (the #4935
+    sweep reads the whole directory)."""
     if dst.exists():
         shutil.rmtree(dst)
     for rel in INPUT_FILES:
         (dst / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src / rel, dst / rel)
+    for rel in BIND_SUMMED:
+        if (src / rel).is_file() and not (dst / rel).exists():
+            (dst / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src / rel, dst / rel)
     for wf in sorted((src / WORKFLOWS).glob("*.y*ml")):
         if wf.is_file() and not (dst / WORKFLOWS / wf.name).exists():
             shutil.copy2(wf, dst / WORKFLOWS / wf.name)
@@ -2913,7 +2975,7 @@ def _in_proof_step(fn: Transform) -> Transform:
 def _drop_proof_bind(step: str) -> str:
     """The proof step without its content-hash bind line (#6278: unchanged
     until the bind lands, so the case is red exactly until then)."""
-    return "".join(ln for ln in step.splitlines(True) if "git hash-object" not in ln)
+    return "".join(ln for ln in step.splitlines(True) if "/usr/bin/shasum -a 256 -c" not in ln)
 
 
 def _proof_via_path_bash(step: str) -> str:
@@ -3122,17 +3184,21 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     # and run the same way, and the units' own shell reads no startup file
     "6275 bind compares the index (git diff HEAD)": ("fail", [_rel(BUILD_HDR, _edit_all(SANE_BIND_LINE, OLD_BIND_LINE))]),
     "6275 bind runs git from PATH": ("fail", [_rel(BUILD_HDR, _edit_all(
-        SANE_BIND_LINE, SANE_BIND_LINE.replace("/usr/bin/git hash-object", "git hash-object")))]),
+        SANE_BIND_LINE, SANE_BIND_LINE.replace("/usr/bin/git rev-parse", "git rev-parse")))]),
     "6275 bind not under env -i": ("fail", [_rel(BUILD_HDR, _edit_all(
         SANE_BIND_LINE, SANE_BIND_LINE.replace(SANE_ENV + " ", "")))]),
-    "6275 bind compares HEAD's blobs": ("fail", [_rel(BUILD_HDR, _edit_all(
-        SANE_BIND_LINE, SANE_BIND_LINE.replace('"$PREFLIGHT_SHA:$f"', '"HEAD:$f"')))]),
+    "6908 bind pins another digest": ("fail", [_rel(BUILD_HDR, _edit_all(
+        SANE_BIND_LINE, SANE_BIND_LINE.replace(BIND_DIGESTS[DECL], "f" * 64)))]),
     "6275 bind skips the HEAD check": ("fail", [_rel(BUILD_HDR, _edit_all(
         SANE_BIND_LINE, SANE_BIND_LINE.replace('test "$h" = "$PREFLIGHT_SHA"; ', "")))]),
-    "6275 bind reads filtered content": ("fail", [_rel(BUILD_HDR, _edit_all(
-        SANE_BIND_LINE, SANE_BIND_LINE.replace(" --no-filters", "")))]),
-    "6275 bind honours replace refs": ("fail", [_rel(BUILD_HDR, _edit_all(
-        SANE_BIND_LINE, SANE_BIND_LINE.replace(" --no-replace-objects", "")))]),
+    "6908 bind runs shasum from PATH": ("fail", [_rel(BUILD_HDR, _edit_all(
+        SANE_BIND_LINE, SANE_BIND_LINE.replace("/usr/bin/shasum", "shasum")))]),
+    "6908 bind drops the asserter pin": ("fail", [_rel(BUILD_HDR, _edit_all(
+        SANE_BIND_LINE, SANE_BIND_LINE.replace(f'; echo "{BIND_DIGESTS[ASSERTER]} *{ASSERTER}"', "")))]),
+    "6908 bind mismatch made non-fatal": ("fail", [_rel(BUILD_HDR, _edit_all(
+        SANE_BIND_LINE, SANE_BIND_LINE.replace("exit 1; }", "true; }")))]),
+    "6908 bind pins a file that is not bound": ("fail", [_rel(BUILD_HDR, _edit_all(
+        SANE_BIND_LINE, SANE_BIND_LINE.replace(f'*{ASSERTER}"', '*scripts/decoy.sh"')))]),
     "6275 bind made non-fatal": ("fail", [_rel(BUILD_HDR, _edit_all(SANE_BIND_LINE, SANE_BIND_LINE[:-1] + " || true\n"))]),
     "6275 asserter run by PATH bash": ("fail", [_rel(BUILD_HDR, _edit_all(IND + SANE_ASSERT, IND + OLD_ASSERT))]),
     "6275 declaration read by PATH bash in the build": ("fail", [_rel(BUILD_HDR, _in_build_step(
@@ -3534,7 +3600,7 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "6290 cleanup step if: always() narrowed": ("fail", [_shape("        if: always()\n", "        if: success()\n")]),
     # --- #6284: the release-shape build is the release build (one constant, SHAPE_BUILD from WF_BUILD)
     "6284 shape build without the input bind": ("fail", [_shape(SHAPE_HDR, _in_shape_build(_drop_lines_with(
-        "git hash-object")))]),
+        "/usr/bin/shasum -a 256 -c")))]),
     "6284 shape build without SOURCE_DATE_EPOCH": ("fail", [_shape(SHAPE_HDR, _in_shape_build(_drop_lines_with(
         "SOURCE_DATE_EPOCH")))]),
     "6284 shape build without the path remap": ("fail", [_shape(SHAPE_HDR, _in_shape_build(_drop_lines_with(
@@ -3923,6 +3989,12 @@ ADVISORY_CASES: Dict[str, Tuple[bool, str, List[Edit]]] = {
 }
 # C-6: (edits, exact error count, substring of the first message).
 MESSAGE_CASES: Dict[str, Tuple[List[Edit], int, str]] = {
+    "message: 6908 a stale bind pin names the tree digest": (
+        [_rel(f'echo "{BIND_DIGESTS[DECL]} *{DECL}"', f'echo "{"f" * 64} *{DECL}"')], 3,
+        "update the pin in the workflow to the tree's SHA-256"),
+    "message: 6908 a pin of an unbound file is refused": (
+        [_rel(f'echo "{BIND_DIGESTS[ASSERTER]} *{ASSERTER}"', f'echo "{BIND_DIGESTS[ASSERTER]} *scripts/decoy.sh"')], 3,
+        "which is not a bound file (BIND_SUMMED, #6908)"),
     "message: LOGIN_USES SHA bump": ([_rel(LOGIN_USES, LOGIN_USES[:-1] + "0")], 1,
                                      "registry login step): `jobs.docker.steps.4.uses` is"),
     "message: LOGIN_USES SHA bump names the constant": ([_rel(LOGIN_USES, LOGIN_USES[:-1] + "0")], 1,
