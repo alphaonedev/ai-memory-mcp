@@ -14,7 +14,7 @@
 //! wrong reason (`dns_ssrf_rejected`), one refactor from not holding.
 //!
 //! Both guards now strip userinfo at the LAST `@` of the authority before
-//! any host extraction (`subscriptions::authority_without_userinfo`); the
+//! any host extraction (the shared `reqwest::Url` parse in `subscriptions::webhook_url` (#6371)); the
 //! unit cells beside the guards pin the syntactic and the DNS line. These
 //! cells pin the REGISTRATION surface the tenant reaches: `insert` refuses
 //! each shape, names the real host, and never echoes the userinfo.
@@ -101,7 +101,7 @@ fn registration_still_accepts_a_public_host_with_userinfo_3744() {
 /// row belongs to — never `dns_ssrf_rejected` (the accidental refusal the
 /// pre-fix guard produced by failing to RESOLVE the username), and the
 /// loopback listener must see no connection at all. RED with f1fbfe312's
-/// `authority_without_userinfo` reverted (the DLQ row reads
+/// the userinfo strip reverted (the DLQ row reads
 /// `dns_ssrf_rejected`), GREEN on the tip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_userinfo_row_is_refused_at_dispatch_as_ssrf_not_dns_3744() {

@@ -1,0 +1,87 @@
+// Copyright 2026 AlphaOne LLC
+// SPDX-License-Identifier: Apache-2.0
+
+//! #6371 (WP-EGRESS #6053, follow-up to #4018) — ONE parse of a webhook URL
+//! for the syntactic guard, the DNS-resolved guard and the HTTP client.
+//!
+//! Both SSRF guards used to carve the host out of the raw string with a
+//! hand-rolled `find(['/', '?', '#'])` / `rfind('@')` / `rfind(':')` scan,
+//! while `send()` handed the same string to reqwest, whose WHATWG parser ends
+//! the authority at a backslash in the special schemes (`https`, `http`),
+//! strips tab/newline, and normalizes legacy IPv4 spellings (`2130706433`,
+//! `0x7f.1`, `127.1`). The guard therefore cleared host A while the client
+//! connected to host B: `https://127.0.0.1\@8.8.8.8/hook` read as the public
+//! `8.8.8.8` to the guard and as loopback to reqwest, so a tenant who could
+//! register a webhook reached loopback and cloud-metadata endpoints with the
+//! loopback opt-in off. The inference lane closed the same class in #4018 by
+//! reading host, port and DNS pin off a single `reqwest::Url`
+//! (`egress::parse_target`); this module is that rule for the webhook lane.
+//!
+//! The contract is agree-or-refuse: every guard decision reads
+//! [`ParsedWebhookUrl::host`] / [`ParsedWebhookUrl::port`], and `send()`
+//! posts [`ParsedWebhookUrl::url`], the parsed object itself, so reqwest never
+//! re-parses the string. A string the parser rejects is refused.
+
+use reqwest::Url;
+
+/// Why a webhook URL could not be parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WebhookUrlError {
+    /// No `scheme://` separator at all.
+    MissingScheme,
+    /// The reqwest URL parser rejects the string (empty host, bad port,
+    /// unbalanced bracket, invalid character, ...). The client could never
+    /// send to it.
+    Malformed,
+}
+
+/// A webhook URL parsed once, by the parser the HTTP client uses.
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedWebhookUrl {
+    url: Url,
+}
+
+impl ParsedWebhookUrl {
+    /// Parse `raw` with `reqwest::Url::parse` (per ERRORS-19: a string the
+    /// client could not parse is refused, never guessed at).
+    ///
+    /// # Errors
+    /// [`WebhookUrlError::MissingScheme`] when `raw` has no `://`;
+    /// [`WebhookUrlError::Malformed`] when the parser rejects it.
+    pub(crate) fn parse(raw: &str) -> Result<Self, WebhookUrlError> {
+        match Url::parse(raw) {
+            Ok(url) => Ok(Self { url }),
+            Err(_) if !raw.contains("://") => Err(WebhookUrlError::MissingScheme),
+            Err(_) => Err(WebhookUrlError::Malformed),
+        }
+    }
+
+    /// The lowercased scheme.
+    pub(crate) fn scheme(&self) -> &str {
+        self.url.scheme()
+    }
+
+    /// The bracket-free, lowercased host exactly as the client will connect
+    /// to it (an IPv4/IPv6 literal in canonical text form, or a domain). The
+    /// form reqwest's `Client::builder().resolve()` keys on and
+    /// `ToSocketAddrs` resolves. `None` when the URL has no host.
+    pub(crate) fn host(&self) -> Option<String> {
+        let host = self.url.host_str()?;
+        Some(
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_ascii_lowercase(),
+        )
+    }
+
+    /// The port the client opens: the explicit one, else the scheme default
+    /// (443 for https, #4075).
+    pub(crate) fn port(&self) -> Option<u16> {
+        self.url.port_or_known_default()
+    }
+
+    /// The parsed URL the client must post to.
+    pub(crate) fn url(&self) -> &Url {
+        &self.url
+    }
+}
