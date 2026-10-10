@@ -190,35 +190,65 @@ AMENDMENT_HEAD_RE = re.compile(
 )
 AMENDMENT_ITEM_RE = re.compile(r"^>[ ]{0,4}[-*][ \t]+`([^`\n]+)`[ \t\r]*$")
 AMENDMENT_BACK_RE = re.compile(r"^>[ ]{0,4}Path back to LIVE:")
-# CommonMark fence opener: optional `>`, then a run of >= 3 backticks or
-# tildes; a backtick fence's info string carries no backtick. Indentation is
-# deliberately NOT capped here: reading an indented code line as a fence only
-# hides more text from the ledger, which can only make the gate stricter.
-FENCE_OPEN_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
 QUOTED_BLANK_RE = re.compile(r"^>[ \t\r]*$")
 BLANK_RE = re.compile(r"^[ \t\r]*$")
-HTML_COMMENT_RE = re.compile(r"<!--.*?-->")
-# #6365: the CommonMark HTML block kinds other than the comment (type 2, kept
-# by the anywhere-in-line `<!--` rule). START is matched against the line's
-# content (blockquote markers removed) at most 3 columns in; END is the text
-# that closes the block (searched after the opener on its own line too), or
-# None for types 6/7, which end at a blank line. Types 6 and 7 are matched by
-# any tag at line start: reading more lines as HTML only hides more text from
-# the ledger, which can only make the gate stricter.
-HTML_BLOCK_KINDS = (
-    (re.compile(r"^[ ]{0,3}<(?:script|pre|style|textarea)(?:[ \t>]|$)", re.IGNORECASE),
-     re.compile(r"</(?:script|pre|style|textarea)>", re.IGNORECASE)),
-    (re.compile(r"^[ ]{0,3}<\?"), re.compile(r"\?>")),
-    (re.compile(r"^[ ]{0,3}<!\[CDATA\["), re.compile(r"\]\]>")),
-    (re.compile(r"^[ ]{0,3}<![A-Za-z]"), re.compile(r">")),
-    (re.compile(r"^[ ]{0,3}</?[A-Za-z]"), None),
+# #6124 round 5, design B (3-agent vote 6def5ab6, B 3/0, decision memory
+# e56e8661): the ledger region (the document from its first line to the end of
+# the blockquote that holds its last amendment header, and at least to the end
+# of the STATUS blockquote) is read in a CANONICAL SUBSET of GitHub Markdown
+# and every construct outside it is refused, instead of modelling each
+# CommonMark divergence case by case (#6722 #6723 #6724 #6725 #6730 #6732,
+# #6443 by construction). The subset:
+#   - no carriage return (bare or CRLF), no tab, no NUL / form feed / other C0
+#     or C1 control / DEL, no zero-width (U+200B-U+200F, U+2060-U+2064, U+FEFF)
+#     and no bidi control (U+061C, U+202A-U+202E, U+2066-U+206F) anywhere in
+#     the document;
+#   - exactly one STATUS heading line in the document, in the canonical form
+#     '> ## STATUS — **<LIVE|VOID|EXPIRED> as of YYYY-MM-DD**', after a blank
+#     line and above every amendment header;
+#   - a line is plain or carries ONE blockquote marker: '>' in column 0
+#     followed by one space or nothing (no nested or indented '>');
+#   - inside its container a line starts at most 3 spaces in (no indented
+#     code, no 4-space nested-list continuation); a list marker ('-', '*',
+#     '+', '1.' or '1)') is followed by exactly one space;
+#   - blocks are paragraphs, ATX headings, list items, thematic breaks and
+#     pipe tables only: no code fence (``` or ~~~), no HTML block or inline
+#     tag, comment, autolink, <details>/<summary>, no link reference
+#     definition, no setext underline, no lazy continuation line, no '$$';
+#   - code spans are single-backtick spans that close inside their paragraph
+#     (no '``' run, no escaped backtick); their content is exempt from the
+#     tag rule. Link destinations are plain: '](' then no space, quote,
+#     backtick or angle bracket up to ')'; no '][' reference link;
+#   - a table row (a line of a block with a '|'-and-dash delimiter row) has an
+#     even backtick count in every cell and no '\|' and no entity.
+# Below the region only an unclosed fence, HTML comment, HTML block or
+# <details> element is refused (it cannot reach back into the region).
+LEDGER_BAD_CHAR_RE = re.compile(
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2064"
+    "\u2066-\u206f\ufeff]")
+CANON_STATUS_RE = re.compile(
+    r"^> ## STATUS — \*\*(?:LIVE|VOID|EXPIRED) as of \d{4}-\d{2}-\d{2}\*\*(?: .*)?$")
+STATUS_WORD_RE = re.compile(r"^[ >]*#{1,6}[ ]*STATUS\b", re.IGNORECASE)
+SPDX_COMMENT_RE = re.compile(r"^<!--(?:(?!--)[^<>])*-->$")
+CANON_ITEM_RE = re.compile(r"^(?:[-*+]|\d{1,9}[.)])(?: (?=[^ ])|$)")
+CANON_MARK_RE = re.compile(r"^(?:[-*+]|\d{1,9}[.)])(?=[ ]|$)")
+CANON_HEADING_RE = re.compile(r"^#{1,6}(?: |$)")
+CANON_THEMATIC_RE = re.compile(r"^(?:(?:-[ ]*){3,}|(?:\*[ ]*){3,}|(?:_[ ]*){3,})$")
+CANON_SETEXT_RE = re.compile(r"^(?:=+|-+)[ ]*$")
+CANON_DELIM_RE = re.compile(r"^\|?[ ]*:?-+:?[ ]*(?:\|[ ]*:?-+:?[ ]*)*\|?[ ]*$")
+CANON_LINK_REF_RE = re.compile(r"^\[[^\]]*\]:")
+CANON_LINK_DEST_RE = re.compile(r"[^\s()`<>\"'\\]*\)")
+CANON_TAG_RE = re.compile(r"<[A-Za-z/!?]")
+CANON_ENTITY_RE = re.compile(r"&(?:#[0-9]+|#[xX][0-9A-Fa-f]+|[A-Za-z][A-Za-z0-9]*);")
+CANON_FENCE_RUN_RE = re.compile(r"^[ >\-*+0-9.)]*(`{3,}|~{3,})")
+CANON_HTML_END = (
+    (re.compile(r"<!--"), "-->", "an HTML comment"),
+    (re.compile(r"<(?:script|pre|style|textarea)(?:[ \t>]|$)", re.IGNORECASE), None,
+     "an HTML <script>/<pre>/<style>/<textarea> block"),
+    (re.compile(r"<\?"), "?>", "an HTML processing instruction"),
+    (re.compile(r"<!\[CDATA\["), "]]>", "an HTML CDATA section"),
 )
-# #6443: one blockquote marker (up to 3 columns of indent, one optional space
-# after the '>'; the line's tabs are expanded first) and one list-item marker
-# (bullet or ordered; its content starts 1-4 columns after the marker).
-QUOTE_MARK_RE = re.compile(r"^[ ]{0,3}>[ ]?")
-QUOTE_START_RE = re.compile(r"^[ ]{0,3}>")
-LIST_MARK_RE = re.compile(r"^([ ]{0,3})(?:[-*+]|\d{1,9}[.)])(?:([ ]{1,4})(?=[^ ])|[ ]*$)")
+CANON_REASONS_SHOWN = 6
 # #6354/#6367: the new record's grammar and character set. Every body line is
 # a list entry, the back line or plain prose (a letter first); every line
 # (header included) is printable ASCII, a tab, or one of a few typographic
@@ -467,56 +497,6 @@ def read_cert_doc(repo, tree):
         ) from exc
 
 
-def _containers(ln):
-    """(quoted, quote-stripped content, fully stripped content, list pad) of
-    LN (#6443, #6365). Tabs are expanded, then every blockquote marker is
-    removed (up to 3 columns of indent, one optional space), and inside a
-    blockquote every list-item marker too, nested in any order. PAD is the
-    columns the list markers took: a fence or HTML block opened in a list
-    item ends only with the blockquote or at its own closing text, and a
-    reader that did not see the opener would accept a hidden record."""
-    text = ln.expandtabs(4)
-    quoted = QUOTE_START_RE.match(text) is not None
-    if not quoted:
-        return False, text, text, 0
-    pad = 0
-    while True:
-        m = QUOTE_MARK_RE.match(text)
-        if not m:
-            break
-        text = text[m.end():]
-    plain = text
-    while True:
-        m = QUOTE_MARK_RE.match(text) or LIST_MARK_RE.match(text)
-        if not m:
-            break
-        if QUOTE_MARK_RE.match(text):
-            text = text[m.end():]
-            continue
-        pad += m.end()
-        text = text[m.end():]
-    return True, plain, text, pad
-
-
-def _fence_opener(content, quoted, pad):
-    """(quoted, char, run length, pad) when CONTENT (a line with its
-    containers removed) opens a CommonMark code fence."""
-    m = FENCE_OPEN_RE.match(content)
-    if not m or (m.group(1)[0] == "`" and "`" in m.group(2)):
-        return None
-    return (quoted, m.group(1)[0], len(m.group(1)), pad)
-
-
-def _fence_closes(plain, fence):
-    """True iff PLAIN (a line with its blockquote markers removed) closes
-    FENCE: at most 3 columns of indentation past the list item content the
-    fence was opened in, the same character, a run at least as long, nothing
-    after."""
-    _quoted, char, run, pad = fence
-    prefix = "^[ ]{0,%d}" % (pad + 3)
-    return re.match(prefix + re.escape(char) + "{%d,}[ \\t\\r]*$" % run, plain) is not None
-
-
 def _ledger_plain(ln):
     """True iff LN continues the new record's paragraph: a non-blank quoted
     line (#6354: whatever it carries, it is part of the record and is held
@@ -524,72 +504,295 @@ def _ledger_plain(ln):
     return ln.startswith(">") and not QUOTED_BLANK_RE.match(ln)
 
 
-def _html_opener(content):
-    """(end regex or None, closed on this line) when CONTENT (a line with its
-    blockquote markers removed) opens a CommonMark HTML block (#6365)."""
-    for start, end in HTML_BLOCK_KINDS:
-        m = start.match(content)
+def _canon_split(raw):
+    """(quoted, content, problem) of the line RAW: one blockquote marker in
+    column 0 followed by one space (or nothing) is removed (design B)."""
+    if not raw.startswith(">"):
+        return False, raw, ""
+    if raw == ">" or raw[1:].strip() == "":
+        return True, "", ""
+    if raw.startswith("> "):
+        return True, raw[2:], ""
+    return True, raw[1:], "a blockquote marker '>' not followed by one space"
+
+
+def _canon_item(body):
+    """(text after every list marker of BODY, is a list item, problem)."""
+    item, is_item = body, False
+    while not CANON_THEMATIC_RE.match(item):
+        m = CANON_ITEM_RE.match(item)
         if m:
-            return end, end is not None and end.search(content, m.end()) is not None
-    return None
+            item, is_item = item[m.end():], True
+            continue
+        if CANON_MARK_RE.match(item):
+            return item, is_item, "a list marker not followed by exactly one space"
+        break
+    return item, is_item, ""
+
+
+def _canon_inline(text):
+    """(text with code-span content masked, problem) of one paragraph or
+    table cell TEXT: single-backtick spans that close inside it, plain link
+    destinations, no reference-style link (design B)."""
+    if "``" in text:
+        return text, "a multi-backtick run (a code fence or a multi-backtick code span)"
+    if "\\`" in text:
+        return text, "a backslash-escaped backtick"
+    out, k = [], 0
+    while k < len(text):
+        if text[k] == "`":
+            j = text.find("`", k + 1)
+            if j < 0:
+                return text, "a backtick that opens no closed code span in its paragraph"
+            out.append("`" + "".join("\n" if c == "\n" else "x" for c in text[k + 1:j]) + "`")
+            k = j + 1
+            continue
+        if text.startswith("](", k):
+            m = CANON_LINK_DEST_RE.match(text, k + 2)
+            if not m:
+                return text, ("a link destination outside the plain form '](url)' (a space, "
+                              "quote, title, backtick or angle bracket in it)")
+            out.append(text[k:m.end()])
+            k = m.end()
+            continue
+        if text.startswith("][", k):
+            return text, "a reference-style link ('][')"
+        out.append(text[k])
+        k += 1
+    return "".join(out), ""
+
+
+def _canon_masked_problem(masked):
+    """Why a line of code-span-masked text MASKED leaves the subset ('' when
+    it does not)."""
+    low = masked.lower()
+    if "<!--" in masked:
+        return "an HTML comment opener"
+    if "<details" in low or "<summary" in low:
+        return "a <details>/<summary> element"
+    if CANON_TAG_RE.search(masked):
+        return "an HTML tag or autolink opener ('<' then a letter, '/', '!' or '?')"
+    if "~~~" in masked:
+        return "a tilde fence run"
+    if "$$" in masked:
+        return "a math block marker ('$$')"
+    return ""
+
+
+def _canon_tables(lines, end):
+    """Indices below END of every line of a pipe table: a header line, its
+    delimiter row and the rows after it up to a blank line or a container
+    change (an over-approximation: a line read as a table row is held to the
+    stricter per-cell rule)."""
+    rows = set()
+    for i in range(1, end):
+        quoted, content, _ = _canon_split(lines[i])
+        body = _canon_item(content.lstrip(" "))[0]
+        if "|" not in body or "-" not in body or not CANON_DELIM_RE.match(body):
+            continue
+        pq, prev, _ = _canon_split(lines[i - 1])
+        if pq != quoted or not prev.strip():
+            continue
+        rows.update((i - 1, i))
+        j = i + 1
+        while j < end:
+            q, c, _ = _canon_split(lines[j])
+            if q != quoted or not c.strip():
+                break
+            rows.add(j)
+            j += 1
+    return rows
+
+
+def _canon_region(lines, status, end):
+    """[(line index, reason)] for LINES[:END], the ledger region (design B)."""
+    why = []
+    tables = _canon_tables(lines, end)
+    para = []  # [(line index, text)] of the open paragraph
+    prev_text, prev_quoted = False, False
+
+    def flush():
+        if para:
+            masked, problem = _canon_inline("\n".join(txt for _, txt in para))
+            if problem:
+                why.append((para[0][0], problem))
+            else:
+                for (idx, _), mline in zip(para, masked.split("\n")):
+                    hit = _canon_masked_problem(mline)
+                    if hit:
+                        why.append((idx, hit))
+            para.clear()
+
+    for i in range(end):
+        raw = lines[i]
+        if i < status and SPDX_COMMENT_RE.match(raw):
+            flush()
+            prev_text, prev_quoted = False, False
+            continue
+        quoted, content, problem = _canon_split(raw)
+        if quoted != prev_quoted:
+            flush()
+        if not problem and not content.strip():
+            flush()
+            prev_text, prev_quoted = False, quoted
+            continue
+        lead = len(content) - len(content.lstrip(" "))
+        body = content[lead:]
+        item, is_item, item_problem = _canon_item(body)
+        if not problem and lead >= 4:
+            problem = ("a line indented 4 or more spaces in its container (indented code or a "
+                       "deep nested-list continuation)")
+        if not problem and body.startswith(">"):
+            problem = "a nested or indented blockquote marker"
+        if not problem and prev_quoted and not quoted and prev_text:
+            problem = "a lazy continuation line (no '>' under a quoted paragraph)"
+        if not problem and prev_text and prev_quoted == quoted and CANON_SETEXT_RE.match(body):
+            problem = "a setext heading underline under a paragraph"
+        problem = problem or item_problem
+        if not problem and (item.startswith("```") or item.startswith("~~~")):
+            problem = "a code fence opener"
+        if not problem and item.startswith("<"):
+            problem = "an HTML block or tag at the start of a line"
+        if not problem and CANON_LINK_REF_RE.match(item):
+            problem = "a link reference or footnote definition"
+        if problem:
+            flush()
+            why.append((i, problem))
+            prev_text, prev_quoted = False, quoted
+            continue
+        if i in tables:
+            flush()
+            cells = item.split("|")
+            if any(cell.count("`") % 2 for cell in cells):
+                why.append((i, "a table cell with an unpaired backtick (GitHub splits table "
+                               "cells at every '|', inside code spans too)"))
+            elif "\\|" in item or CANON_ENTITY_RE.search(item):
+                why.append((i, "an escaped pipe or an entity in a table row"))
+            else:
+                masked, hit = _canon_inline(item)
+                hit = hit or _canon_masked_problem(masked)
+                if hit:
+                    why.append((i, hit))
+            prev_text, prev_quoted = True, quoted
+            continue
+        if CANON_HEADING_RE.match(item) or CANON_THEMATIC_RE.match(body):
+            flush()
+            para.append((i, item))
+            flush()
+            prev_text, prev_quoted = False, quoted
+            continue
+        if is_item:
+            flush()
+        para.append((i, item))
+        prev_text, prev_quoted = True, quoted
+    flush()
+    if end < len(lines) and prev_text and prev_quoted and lines[end].strip():
+        why.append((end, "a lazy continuation line (no '>' under a quoted paragraph)"))
+    return why
+
+
+def _canon_tail(lines, start):
+    """[(line index, reason)]: a code fence, HTML comment, HTML block or
+    <details> element opened in LINES[start:] and never closed (design B:
+    the unclosed-construct scan covers the whole document)."""
+    why = []
+    fence = None
+    for i in range(start, len(lines)):
+        m = CANON_FENCE_RUN_RE.match(lines[i])
+        if not m:
+            continue
+        run = m.group(1)
+        if fence is None:
+            fence = (i, run)
+        elif run[0] == fence[1][0] and len(run) >= len(fence[1]) and \
+                lines[i][m.end():].strip() == "":
+            fence = None
+    if fence is not None:
+        why.append((fence[0], "a code fence that is never closed"))
+    text = "\n".join(lines[start:])
+    for opener, closer, name in CANON_HTML_END:
+        for m in opener.finditer(text):
+            tail = text[m.end():]
+            if closer is None:
+                tag = m.group(0)[1:].rstrip(" \t>").lower()
+                closed = f"</{tag}>" in tail.lower()
+            else:
+                closed = closer in tail
+            if not closed:
+                why.append((start + text.count("\n", 0, m.start()), f"{name} that is never closed"))
+                break
+    low = text.lower()
+    if low.count("<details") > low.count("</details"):
+        last = low.rfind("<details")
+        why.append((start + text.count("\n", 0, last),
+                    "a <details> element that is never closed"))
+    return why
+
+
+def ledger_deny(text):
+    """Why the cert doc TEXT leaves the canonical ledger subset (#6124 design
+    B; [] when it does not): characters anywhere, the STATUS pin, the region
+    grammar, and the unclosed-construct scan below the region."""
+    lines = text.split("\n")
+    why = []
+    for i, ln in enumerate(lines):
+        m = LEDGER_BAD_CHAR_RE.search(ln)
+        if m:
+            what = ("a carriage return (a bare CR or a CRLF line ending)" if m.group(0) == "\r"
+                    else f"the forbidden character U+{ord(m.group(0)):04X}")
+            why.append(f"line {i + 1}: {what}")
+        elif "\t" in ln:
+            why.append(f"line {i + 1}: a tab")
+    if why:
+        return why
+    status = [i for i, ln in enumerate(lines) if STATUS_WORD_RE.match(ln) or STATUS_LINE_RE.match(ln)]
+    if len(status) != 1:
+        where = ", ".join(str(i + 1) for i in status) or "none"
+        return [f"the document carries {len(status)} STATUS heading lines (lines {where}); "
+                "exactly one is allowed"]
+    st = status[0]
+    if not CANON_STATUS_RE.match(lines[st]):
+        why.append(f"line {st + 1}: the STATUS line is not in its canonical form "
+                   "'> ## STATUS — **<LIVE|VOID|EXPIRED> as of YYYY-MM-DD**'")
+    if st == 0 or lines[st - 1] != "":
+        why.append(f"line {st + 1}: the STATUS line does not follow a blank line")
+    heads = [i for i, ln in enumerate(lines) if AMENDMENT_LEDGER_RE.match(ln)]
+    if heads and heads[0] < st:
+        why.append(f"line {heads[0] + 1}: an amendment header above the STATUS line")
+    end = max([st] + heads) + 1
+    while end < len(lines) and lines[end].startswith(">"):
+        end += 1
+    found = _canon_region(lines, st, end) + _canon_tail(lines, end)
+    why.extend(f"line {i + 1}: {reason}" for i, reason in sorted(found))
+    return why
+
+
+def ledger_deny_text(reasons):
+    """The gate's sentence for a non-empty ledger_deny() result."""
+    shown = "; ".join(reasons[:CANON_REASONS_SHOWN])
+    more = len(reasons) - CANON_REASONS_SHOWN
+    if more > 0:
+        shown += f"; and {more} more"
+    return (f"{CERT_DOC} leaves the canonical ledger subset (#6124: no code fence, HTML, "
+            "comment, indented code, lazy line, setext, link definition, control, bidi or "
+            f"zero-width character in the ledger region; see the script docstring): {shown}")
 
 
 def parse_ledger(lines):
     """The amendment ledger of the cert doc LINES (#6124): one entry per
-    `**Amendment` record outside code fences (CommonMark: a fence closes only
-    on the same character with a run at least as long), outside HTML
-    comments and outside every other CommonMark HTML block kind (#6365: a
-    quoted block ends with its blockquote; types 1/3/4/5 end at their closing
-    text, types 6/7 at a blank line; an unquoted block swallows '>' lines).
-    Returns dicts: start (line index), header, quoted, below_status."""
+    `**Amendment` line. Design B makes this a plain line scan: a judged doc is
+    first held to the canonical subset (ledger_deny), which leaves no fence,
+    HTML block or comment that could hide a line from GitHub; a merge-base
+    line counted here that GitHub hides only makes the gate stricter.
+    Returns dicts: start (line index), header, below_status."""
     entries = []
-    fence = None
-    in_comment = False
-    html = None  # (quoted, end regex or None) of the open HTML block
     seen_status = False
     for idx, ln in enumerate(lines):
-        quoted, plain, content, pad = _containers(ln)
-        if html is not None:
-            if html[0] and not quoted:
-                html = None  # the blockquote ended, and its HTML block with it
-            else:
-                # In an unquoted block a '>' is raw text, so the raw line is read.
-                text = plain if html[0] else ln
-                if html[1] is None:
-                    if BLANK_RE.match(text):
-                        html = None
-                elif html[1].search(text):
-                    html = None
-                continue
-        if fence is not None:
-            if fence[0] and not quoted:
-                fence = None  # the blockquote ended, and its fence with it
-            else:
-                if _fence_closes(plain, fence):
-                    fence = None
-                continue
-        if in_comment:
-            if "-->" in ln:
-                in_comment = False
-            continue
-        if "<!--" in ln:
-            in_comment = "<!--" in HTML_COMMENT_RE.sub("", ln)
-            continue
-        opener = _fence_opener(content, quoted, pad)
-        if opener is not None:
-            fence = opener
-            continue
-        block = _html_opener(content)
-        if block is not None:
-            if not block[1]:
-                html = (quoted, block[0])
-            continue
         if STATUS_LINE_RE.match(ln):
             seen_status = True
             continue
         if AMENDMENT_LEDGER_RE.match(ln):
-            entries.append({"start": idx, "header": ln, "quoted": quoted,
-                            "below_status": seen_status})
+            entries.append({"start": idx, "header": ln, "below_status": seen_status})
     return entries
 
 
@@ -688,6 +891,19 @@ def ledger_append_only(repo, mb, judged):
     return ""
 
 
+def ledger_canonical(repo, mb, judged):
+    """The reason the cert doc at JUDGED leaves the canonical ledger subset
+    ('' when it does not, or when the rule does not apply): checked whenever
+    the change touches the doc, the merge-base banner is EXPIRED/VOID and
+    the judged one is not a LIVE re-issue (design B, #6124)."""
+    if cert_banner(repo, mb)[0] not in ("EXPIRED", "VOID"):
+        return ""
+    if cert_banner(repo, judged)[0] in ("LIVE", "ABSENT"):
+        return ""
+    deny = ledger_deny(read_cert_doc(repo, judged))
+    return ledger_deny_text(deny) if deny else ""
+
+
 RECORD_FLOOR_CAP_DAYS = 14
 
 
@@ -738,7 +954,12 @@ def amendment_verdict(repo, mb, judged, required):
     today) + 1, list exactly REQUIRED, keep to the record grammar and cite
     only #6063 by its issue URL (#6367). Doc read failures raise GateError."""
     old_lines = read_cert_doc(repo, mb).split("\n")
-    new_lines = read_cert_doc(repo, judged).split("\n")
+    new_text = read_cert_doc(repo, judged)
+    # Design B: nothing else is read from a doc outside the canonical subset.
+    deny = ledger_deny(new_text)
+    if deny:
+        return False, ledger_deny_text(deny)
+    new_lines = new_text.split("\n")
     # Every header line already in the merge-base doc, wherever it sits (a
     # fenced or hidden copy included), is not a new record.
     old_heads = {ln.rstrip("\r") for ln in old_lines if AMENDMENT_LEDGER_RE.match(ln)}
@@ -1032,7 +1253,7 @@ def _judge(repo, base, head, judged, mb, tip):
 
     if not watched and not id_changed:
         if cert_touched:
-            problem = ledger_append_only(repo, mb, judged)
+            problem = ledger_append_only(repo, mb, judged) or ledger_canonical(repo, mb, judged)
             if problem:
                 return False, f"{PREFIX}: FAIL — {problem}"
         ok, more = check_banner_consistency(repo, judged)
@@ -2992,9 +3213,7 @@ SELF_TEST_OK = (
     "GitHub Actions and CERT_EXPIRY_BASE/HEAD overrides are refused there but honoured "
     "outside CI; (6124-h1..h9, #6124) EXPIRED/VOID at both ends plus exactly ONE inserted "
     "amendment record (and one blank separator) below STATUS, directly above an existing "
-    "record (also opening its blockquote) or closing its blockquote, after HTML blocks, "
-    "code fences and blockquotes that already ended and after a backtick line that is not "
-    "a fence, dated from the "
+    "record (also opening its blockquote) or closing its blockquote, dated from the "
     "merge-base day - 1 to today + 1, listing exactly the changed watched paths and "
     "identifiers and citing only #6063 by its issue URL GREEN; (6124-f1..f15d) missing, "
     "extra, substring, prose-only, reused, re-dated, split, deleted, edited or moved prior "
@@ -3017,7 +3236,10 @@ SELF_TEST_OK = (
     "doc-only delete, re-date, edit, reorder or doc deletion of the records RED; (6124-i*) a "
     "header citing zero, two, three or a suffixed issue RED; (6124-m*) the #6063 cite as an "
     "image RED; (6124-e*) no re-issue advice for an EXPIRED deleted or garbled doc; "
-    "(6124-k*, #6444) the six mutant-killing cells"
+    "(6124-k*, #6444) the six mutant-killing cells; (6124-b*, design B, vote 6def5ab6) a ledger "
+    "region outside the canonical subset (fence, HTML, comment, tab, CR, nested or indented "
+    "'>', indented code, setext, link definition, lazy line, invisible or bidi character, "
+    "a STATUS decoy) RED, an unclosed construct anywhere RED, and its controls GREEN"
 )
 SELF_TEST_OK_R = (
     "; (6124-r1..r4, #6355) the committed cert doc with a record at each legal spot GREEN "

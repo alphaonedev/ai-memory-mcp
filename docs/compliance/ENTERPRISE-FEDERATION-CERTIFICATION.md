@@ -1519,9 +1519,16 @@ also accepts a change that inserts exactly ONE new amendment record below
 STATUS, plus at most one blank separator line, and changes no other line of
 this document, as a non-discharging record (never a re-mint). The record's
 header stands alone on its line and opens its own paragraph; the record
-sits directly above an existing amendment header or closes its blockquote,
-outside code fences and every HTML block kind, with no lazy continuation
-line after it; it is dated from the merge-base commit day less one to today
+sits directly above an existing amendment header or closes its blockquote.
+The ledger region (line 1 to the end of the blockquote holding the last
+amendment header) must stay in a canonical Markdown subset: one canonical
+STATUS line after a blank line; one `>` marker in column 0 per line; at
+most 3 spaces of indent; paragraphs, ATX headings, list items, thematic
+breaks and pipe tables only; single-backtick code spans that close in
+their paragraph; plain link destinations. It has no code fence, HTML tag,
+block or comment, autolink, collapsible section, link definition, setext underline,
+lazy line, tab, CR, control, zero-width or bidi character, and no fence,
+comment or HTML block is left open anywhere in the document; it is dated from the merge-base commit day less one to today
 plus one; every line is plain printable text, a list entry or the
 `Path back to LIVE:` line; it lists exactly the changed watched paths and
 identifiers and cites only #6063, by its issue URL, with no other issue,
