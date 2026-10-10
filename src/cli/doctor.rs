@@ -9059,6 +9059,140 @@ enabled = true
         }
     }
 
+    /// Review F2 (#6052) — under `internal-only` the probe must reach the
+    /// ADMITTED address, never re-resolve the host: `probe_client(Some(pin))`
+    /// sends a request for an unresolvable host name to the pinned socket.
+    /// Control: the same request without the pin never reaches that socket.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_client_dials_the_pinned_address_4121() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const HOST: &str = "pinned-4121.test";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let addr = *server.address();
+        let url = format!("http://{HOST}:{}/models", addr.port());
+        let pin = crate::egress::PinnedTarget {
+            host: HOST.into(),
+            addrs: vec![addr],
+        };
+        let (pinned, unpinned) = tokio::task::spawn_blocking(move || {
+            let pinned = probe_client(Some(&pin))
+                .expect("pinned probe client")
+                .get(&url)
+                .send()
+                .map(|r| r.status());
+            let unpinned = probe_client(None)
+                .expect("unpinned probe client")
+                .get(&url)
+                .send()
+                .map(|r| r.status());
+            (pinned, unpinned)
+        })
+        .await
+        .expect("join");
+        assert!(
+            pinned.as_ref().is_ok_and(reqwest::StatusCode::is_success),
+            "#4121: the pinned probe must reach the admitted address; got {pinned:?}"
+        );
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert_eq!(
+            requests.len(),
+            1,
+            "#4121: exactly the pinned request reaches the admitted socket; the \
+             unpinned control ({unpinned:?}) must not"
+        );
+        assert!(
+            !unpinned.as_ref().is_ok_and(reqwest::StatusCode::is_success),
+            "control: without the pin `{HOST}` must not resolve to the admitted socket; \
+             got {unpinned:?}"
+        );
+    }
+
+    /// Review F3 (#6052) — an off-host plaintext `http://` target is refused
+    /// under EVERY posture (#3823), including the default `allow`. The skipped
+    /// probe's note must carry the actual refusal reason, not a fixed sentence
+    /// pointing at `AI_MEMORY_INFERENCE_EGRESS`; and under `allow` (where the
+    /// refusal is a misconfiguration, not a chosen posture) the section is a
+    /// `Warning`, so `--fail-on-warn` does not pass a daemon that will build no
+    /// client. Control: a refusal by a chosen posture (`deny`) stays `Info`.
+    #[test]
+    fn off_host_plaintext_refusal_is_reported_by_reason_4121() {
+        for (mode, want) in [(None, Severity::Warning), (Some("deny"), Severity::Info)] {
+            let (llm, embed) = {
+                let _config = crate::config::test_env_lock();
+                let _reach = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+                clear_llm_embed_env();
+                let mut vars: Vec<(&str, &str)> = vec![
+                    (
+                        "AI_MEMORY_LLM_BACKEND",
+                        crate::llm::BACKEND_OPENAI_COMPATIBLE,
+                    ),
+                    ("AI_MEMORY_LLM_BASE_URL", "http://192.0.2.1:11434/v1"),
+                    ("AI_MEMORY_LLM_API_KEY", "pw-placeholder-4121"),
+                    ("AI_MEMORY_LLM_MODEL", "fixture-model-4121"),
+                    (
+                        "AI_MEMORY_EMBED_BACKEND",
+                        crate::llm::BACKEND_OPENAI_COMPATIBLE,
+                    ),
+                    ("AI_MEMORY_EMBED_BASE_URL", "http://192.0.2.1:11434/v1"),
+                    ("AI_MEMORY_EMBED_API_KEY", "pw-placeholder-4121"),
+                    ("AI_MEMORY_EMBED_MODEL", "fixture-embed-4121"),
+                ];
+                // The scope records (and on drop restores) the egress var's
+                // prior value; the default-posture cell then unsets it.
+                vars.push((crate::egress::ENV_INFERENCE_EGRESS, mode.unwrap_or("allow")));
+                let _scope = EnvScope::set(&vars);
+                if mode.is_none() {
+                    // SAFETY: serialised by `test_env_lock` + `reach_env_lock`.
+                    unsafe { std::env::remove_var(crate::egress::ENV_INFERENCE_EGRESS) };
+                }
+                (
+                    section_llm_reachability_1146(),
+                    section_embeddings_reachability_1598(),
+                )
+            };
+            for section in [&llm, &embed] {
+                let reason = section
+                    .facts
+                    .iter()
+                    .find(|(k, _)| k == "inference_egress")
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{} must report the refusal fact; facts={:?}",
+                            section.name, section.facts
+                        )
+                    });
+                assert_eq!(
+                    section.severity, want,
+                    "#4121: {} under {mode:?}: severity",
+                    section.name
+                );
+                let note = section.note.as_deref().unwrap_or_default();
+                if mode.is_none() {
+                    assert!(
+                        !note.contains(crate::egress::ENV_INFERENCE_EGRESS),
+                        "#4121: under the default posture the note must not blame \
+                         {}; note={note}",
+                        crate::egress::ENV_INFERENCE_EGRESS
+                    );
+                }
+                assert!(
+                    note.contains(&reason),
+                    "#4121: {} note must carry the actual refusal reason {reason:?}; \
+                     note={note}",
+                    section.name
+                );
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn llm_reachability_probe_arms_1146() {
         use wiremock::matchers::{method, path};
