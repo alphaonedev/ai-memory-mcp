@@ -228,6 +228,9 @@ def _refuse_shared_writable(what: str, path: str, mode: int) -> None:
         )
 
 
+#: Path separators a CA path may end with; a trailing one names a directory.
+_PATH_SEPARATORS = tuple(sep for sep in (os.sep, os.altsep) if sep)
+
 #: Symlinks followed while resolving one CA path, as Linux's MAXSYMLINKS.
 _MAX_SYMLINK_HOPS = 40
 
@@ -355,7 +358,7 @@ def _load_trust_file(context: ssl.SSLContext, shown: str, entry: str) -> None:
         raise ValueError(f"verify= CA file {shown!r} changed while it was being read (#6377).")
 
 
-def _context_from_path(path: str) -> ssl.SSLContext:
+def _context_from_path(path: str, *, kind: str | None = None) -> ssl.SSLContext:
     """A verifying context for the CA file or directory ``path`` (#6269, #6377).
 
     The path is resolved NOW, as ``os.path.realpath`` does, refusing a symlink
@@ -371,12 +374,28 @@ def _context_from_path(path: str) -> ssl.SSLContext:
     directory, file, symlink target or target directory that the group or
     others can write is refused (POSIX; #6377). An empty directory gives a
     context with no anchor at all, which fails every handshake (#6269).
+
+    ``kind`` (``"file"`` or ``"directory"``) additionally requires that kind;
+    the env trust variables pass it, so ``SSL_CERT_FILE`` and ``verify=`` share
+    this one check (#6538, #6690). A path ending in a separator names a
+    directory, as it does for the kernel: ``ca.pem/`` is refused (#6690).
     """
     resolved = _checked_realpath(path)
     try:
         mode = os.stat(resolved).st_mode
     except OSError:
         mode = 0
+    if path.endswith(_PATH_SEPARATORS) and not stat.S_ISDIR(mode):
+        # A trailing separator names a directory: the kernel refuses
+        # ``ca.pem/`` (ENOTDIR) even though the walk above drops the empty
+        # last part (#6690).
+        mode = 0
+    wanted = {"file": stat.S_ISREG, "directory": stat.S_ISDIR}.get(kind or "")
+    if wanted is not None and not wanted(mode):
+        raise ValueError(
+            f"CA path {path!r} is not an existing "
+            f"{'regular file' if kind == 'file' else kind} (#6538, #6690)."
+        )
     if stat.S_ISDIR(mode):
         _refuse_shared_writable("CA directory", path, mode)
         context = _pinned_base_context()
@@ -422,21 +441,13 @@ def _context_from_env() -> ssl.SSLContext | None:
         if not value:
             continue
         try:
-            mode = os.stat(value).st_mode
-        except OSError:
-            mode = 0
-        if not (stat.S_ISDIR(mode) if wants_directory else stat.S_ISREG(mode)):
-            kind = "directory" if wants_directory else "regular file"
-            raise ValueError(
-                f"{variable}={value!r} is not an existing {kind}; httpx would read "
-                f"trust from it. Point {variable} at a CA "
-                f"{'hashed directory' if wants_directory else 'bundle file'} or unset it "
-                "(#6538)."
-            )
-        try:
-            return _context_from_path(value)
+            return _context_from_path(value, kind="directory" if wants_directory else "file")
         except ValueError as exc:
-            raise ValueError(f"{variable}: {exc} (#6538)") from None
+            raise ValueError(
+                f"{variable}={value!r}: {exc} httpx would read trust from it; point "
+                f"{variable} at a CA {'hashed directory' if wants_directory else 'bundle file'} "
+                "or unset it (#6538)."
+            ) from None
     return None
 
 
