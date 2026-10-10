@@ -174,7 +174,8 @@ fn glob_at(pat: &[u8], text: &[u8], segment_start: bool) -> Option<bool> {
         b'*' => {
             let run = pat.iter().take_while(|byte| **byte == b'*').count();
             let rest = &pat[run..];
-            let whole_segment = run >= 2 && segment_start && matches!(rest.first(), None | Some(b'/'));
+            let whole_segment =
+                run >= 2 && segment_start && matches!(rest.first(), None | Some(b'/'));
             if whole_segment {
                 let Some(after) = rest.strip_prefix(b"/") else {
                     return Some(true);
@@ -364,9 +365,87 @@ fn walk(root: &Path, out: &mut Vec<PathBuf>, unreadable: &mut Vec<String>) {
     walk_with(root, &env, out, unreadable);
 }
 
-/// The environment git itself would use for `root`.
-fn git_env(_root: &Path, _unreadable: &mut Vec<String>) -> Env {
-    Env::default()
+/// Run `git -C root <args>` with the repository-selecting environment
+/// cleared. A spawn failure is recorded in `unreadable` (fail closed).
+fn git_output(
+    root: &Path,
+    args: &[&str],
+    unreadable: &mut Vec<String>,
+) -> Option<std::process::Output> {
+    match std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .output()
+    {
+        Ok(out) => Some(out),
+        Err(e) => {
+            unreadable.push(format!("git {args:?}: {e}"));
+            None
+        }
+    }
+}
+
+/// The facts git itself would use for `root` (#7008, #7017): the tracked
+/// files (git applies no ignore rule to a tracked path) and
+/// `core.ignorecase`. A root without `.git` has nothing tracked. When `.git`
+/// exists but git cannot answer for exactly this root, the failure is
+/// recorded in `unreadable` (fail closed).
+fn git_env(root: &Path, unreadable: &mut Vec<String>) -> Env {
+    if !root.join(".git").exists() {
+        return Env::default();
+    }
+    // An empty `.git` directory is not a repository: git would climb to an
+    // enclosing one. The root must be the top level (empty prefix).
+    let Some(prefix) = git_output(root, &["rev-parse", "--show-prefix"], unreadable) else {
+        return Env::default();
+    };
+    if !prefix.status.success() || !prefix.stdout.iter().all(u8::is_ascii_whitespace) {
+        unreadable.push(format!(
+            "{}: git does not report this directory as a repository top level",
+            root.display()
+        ));
+        return Env::default();
+    }
+    let mut env = Env::default();
+    if let Some(list) = git_output(root, &["ls-files", "-z"], unreadable) {
+        if list.status.success() {
+            for raw in list.stdout.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+                match std::str::from_utf8(raw) {
+                    Ok(path) => {
+                        env.tracked.insert(path.to_string());
+                        let mut dir = path;
+                        while let Some((parent, _)) = dir.rsplit_once('/') {
+                            env.tracked_dirs.insert(parent.to_string());
+                            dir = parent;
+                        }
+                    }
+                    Err(_) => unreadable.push("git ls-files: a tracked path is not UTF-8".into()),
+                }
+            }
+        } else {
+            unreadable.push(format!("git ls-files failed: {}", list.status));
+        }
+    }
+    if let Some(case) = git_output(
+        root,
+        &["config", "--bool", "--get", "core.ignorecase"],
+        unreadable,
+    ) {
+        match case.status.code() {
+            Some(0) => env.ignore_case = case.stdout.starts_with(b"true"),
+            // Exit 1: the key is unset, which git treats as false.
+            Some(1) => {}
+            _ => unreadable.push(format!(
+                "git config core.ignorecase failed: {}",
+                case.status
+            )),
+        }
+    }
+    env
 }
 
 /// [`walk`] with the git facts supplied by the caller.
@@ -439,7 +518,18 @@ fn walk_dir(
         }
         let rel = format!("{base}{name}");
         match is_ignored(&rel, file_type.is_dir(), rules, env.ignore_case) {
-            Ok(true) => continue,
+            // git applies no ignore rule to a tracked path, and a directory
+            // holding one must still be entered (#7008).
+            Ok(true) => {
+                let tracked = if file_type.is_dir() {
+                    env.tracked_dirs.contains(&rel)
+                } else {
+                    env.tracked.contains(&rel)
+                };
+                if !tracked {
+                    continue;
+                }
+            }
             Ok(false) => {}
             Err(e) => {
                 unreadable.push(format!("{rel}: {e}"));
@@ -1248,12 +1338,7 @@ fn issue_6524_glob_and_parse_follow_gitignore5() {
 }
 
 /// The verdict of the walk's matcher for `rel` under the ignore `lines`.
-fn ignored_by(
-    lines: &[&str],
-    rel: &str,
-    is_dir: bool,
-    ignore_case: bool,
-) -> Result<bool, String> {
+fn ignored_by(lines: &[&str], rel: &str, is_dir: bool, ignore_case: bool) -> Result<bool, String> {
     let mut rules = Vec::new();
     for line in lines {
         rules.extend(parse_ignore_line(line, "")?);
@@ -1386,10 +1471,7 @@ fn issue_7008_walk_reads_tracked_files_the_ignore_rules_match() {
     plant(&scratch, "docs/plain.md", PLANT);
     plant(&scratch, "build-out/keep/tracked.json", PLANT);
     plant(&scratch, "build-out/other.json", PLANT);
-    let env = Env::from_tracked(
-        ["docs/.env.example", "build-out/keep/tracked.json"],
-        false,
-    );
+    let env = Env::from_tracked(["docs/.env.example", "build-out/keep/tracked.json"], false);
     let (seen, unreadable) = walked_with(&scratch, &env);
     let _ = fs::remove_dir_all(&scratch);
 
@@ -1412,7 +1494,11 @@ fn git_scratch_repo(tag: &str, ignore_case: bool) -> PathBuf {
     git_ok(&scratch, &["init", "-q"]);
     git_ok(
         &scratch,
-        &["config", "core.ignorecase", if ignore_case { "true" } else { "false" }],
+        &[
+            "config",
+            "core.ignorecase",
+            if ignore_case { "true" } else { "false" },
+        ],
     );
     scratch
 }
