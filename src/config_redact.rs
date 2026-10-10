@@ -413,6 +413,38 @@ pub fn redact_parse_error<E: std::fmt::Display + ?Sized>(err: &E) -> String {
     crate::secret_screen::redact_for_storage(&joined).unwrap_or(joined)
 }
 
+/// #6584 / #6605 — what a boot line prints for "the config file at `path`"
+/// when the path is NOT the resolved default location.
+pub const NON_DEFAULT_CONFIG_LABEL: &str =
+    "the explicitly selected config file (not the default location; `ai-memory doctor` names it)";
+
+/// #6584 / #6605 (`CodeQL` `rust/cleartext-logging`) — the operator-facing
+/// name of a loaded config file, for boot `eprintln!` lines.
+///
+/// A boot line must not echo the caller's `path` value: the load funnel
+/// receives it from whoever loads the file, and a caller can name a path
+/// after its contents (`secret.toml`). When `path` IS the resolved default
+/// location, the text is rendered from `resolved_default` — the value
+/// [`crate::config::AppConfig::config_path`] resolves from the environment —
+/// so the line still names the file the operator expects. Any other path
+/// gets [`NON_DEFAULT_CONFIG_LABEL`]. Pure.
+#[must_use]
+pub fn config_path_label(
+    path: &std::path::Path,
+    resolved_default: Option<&std::path::Path>,
+) -> String {
+    match resolved_default {
+        Some(default) if default == path => default.display().to_string(),
+        _ => NON_DEFAULT_CONFIG_LABEL.to_string(),
+    }
+}
+
+/// [`config_path_label`] against the live default location.
+#[must_use]
+pub fn config_label(path: &std::path::Path) -> String {
+    config_path_label(path, crate::config::AppConfig::config_path().as_deref())
+}
+
 /// Replace the contents of every backtick- or double-quote-delimited span
 /// with [`CONFIG_REDACTION_MASK`].
 ///
@@ -462,6 +494,26 @@ fn is_source_echo_line(line: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #6584 / #6605 — a non-default caller path is never echoed; the
+    /// default location is named from the resolved default, not the caller.
+    #[test]
+    fn config_path_label_never_echoes_a_non_default_path_6584() {
+        let fake = std::path::Path::new("/placeholder/FAKE-PLACEHOLDER-secret.toml");
+        let default = std::path::Path::new("/home/placeholder/.config/ai-memory/config.toml");
+        for resolved in [None, Some(default)] {
+            let label = config_path_label(fake, resolved);
+            assert!(
+                !label.contains("FAKE-PLACEHOLDER"),
+                "non-default path leaked"
+            );
+            assert_eq!(label, NON_DEFAULT_CONFIG_LABEL);
+        }
+        assert_eq!(
+            config_path_label(default, Some(default)),
+            "/home/placeholder/.config/ai-memory/config.toml"
+        );
+    }
 
     /// #3667 in the #3711 idiom — URL-valued settings render through the
     /// allowlist: a store URL keeps scheme/host/port/database, an LLM base

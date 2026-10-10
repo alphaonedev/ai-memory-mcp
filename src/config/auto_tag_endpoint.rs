@@ -90,16 +90,72 @@ impl super::AppConfig {
         }
         static WARN_ONCE: std::sync::Once = std::sync::Once::new();
         WARN_ONCE.call_once(|| {
-            eprintln!(
-                "ai-memory: WARN — [llm.auto_tag] in {} sets {} which are IGNORED: \
-                 production threads only [llm.auto_tag].model (a per-call model \
-                 override on the primary LLM client). A separate auto_tag endpoint \
-                 is not wired at v1.0.0 (it would bypass the inference-egress boot \
-                 gate); it is deferred to v1.1.0 (#3808). Remove these keys, or set \
-                 only `model`.",
-                path.display(),
-                ignored.join(", "),
-            );
+            let label = crate::config_redact::config_label(path);
+            eprintln!("{}", ignored_endpoint_keys_warn_line(&label, &ignored));
         });
+    }
+}
+
+/// #3808 — the one-shot WARN text. #6584 (`CodeQL` `rust/cleartext-logging`):
+/// the file is named by `config_label` (a label resolved from the environment,
+/// never the caller's `path` value) and the keys are the `&'static str` NAMES
+/// [`super::LlmAutoTagSection::ignored_endpoint_keys`] returns, never a value.
+/// Pure, so the cell below needs no stderr capture.
+fn ignored_endpoint_keys_warn_line(config_label: &str, ignored: &[&'static str]) -> String {
+    format!(
+        "ai-memory: WARN — [llm.auto_tag] in {config_label} sets {} which are IGNORED: \
+         production threads only [llm.auto_tag].model (a per-call model \
+         override on the primary LLM client). A separate auto_tag endpoint \
+         is not wired at v1.0.0 (it would bypass the inference-egress boot \
+         gate); it is deferred to v1.1.0 (#3808). Remove these keys, or set \
+         only `model`.",
+        ignored.join(", "),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// #6584 — the WARN names the ignored KEYS and a config label, and carries
+    /// neither a key value nor a non-default caller path.
+    #[test]
+    fn ignored_endpoint_warn_carries_key_names_not_values_6584() {
+        let section = super::super::LlmAutoTagSection {
+            base_url: Some("https://placeholder.invalid/v1".to_string()),
+            api_key_env: Some("FAKE_PLACEHOLDER_KEY_ENV".to_string()),
+            api_key_file: Some("/placeholder/FAKE-KEY-FILE".to_string()),
+            ..Default::default()
+        };
+        let path = Path::new("/placeholder/FAKE-PLACEHOLDER-secret.toml");
+        let label = crate::config_redact::config_path_label(path, None);
+        let line = ignored_endpoint_keys_warn_line(&label, &section.ignored_endpoint_keys());
+        for name in ["base_url", "api_key_env", "api_key_file", "[llm.auto_tag]"] {
+            assert!(line.contains(name), "WARN must still name `{name}`");
+        }
+        for value in [
+            "FAKE-PLACEHOLDER-secret.toml",
+            "FAKE_PLACEHOLDER_KEY_ENV",
+            "FAKE-KEY-FILE",
+            "placeholder.invalid",
+        ] {
+            assert!(
+                !line.contains(value),
+                "WARN must not carry the fixture value #{}",
+                value.len()
+            );
+        }
+        assert!(line.contains(crate::config_redact::NON_DEFAULT_CONFIG_LABEL));
+    }
+
+    /// #6584 — at the default location the WARN still names the file.
+    #[test]
+    fn ignored_endpoint_warn_names_the_default_config_file_6584() {
+        let default = Path::new("/home/placeholder/.config/ai-memory/config.toml");
+        let label = crate::config_redact::config_path_label(default, Some(default));
+        let line = ignored_endpoint_keys_warn_line(&label, &["backend"]);
+        assert!(line.contains("/home/placeholder/.config/ai-memory/config.toml"));
+        assert!(line.contains("sets backend which are IGNORED"));
     }
 }
