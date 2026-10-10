@@ -2417,23 +2417,30 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     # (6124-f12a) RED - the cert doc cannot be read at the merge-base for the
     # ledger: fail closed, never "no prior amendments".
     real_run_git = globals()["run_git"]
-    reads = {"n": 0}
+    # R4: the injected failure targets one git verb. A cert-doc read of the
+    # merge-base also happens through `git log -S` (the date floor, #6421), so
+    # an unspecific match let a fail-open `ls-tree` survive the R13 mutant.
+    f12g = edit_range("\n" + rec6124, label="f12g")
+    for lab_, verb, skip, base_, head_ in (("f12a", "ls-tree", 0, pre, f4),
+                                           ("f12g", "log", 0, exp6124, f12g)):
+        reads = {"n": 0}
 
-    def flaky_run_git(repo_, *args, **kw):
-        joined = " ".join(str(a) for a in args)
-        if CERT_DOC in joined and pre in joined:
-            reads["n"] += 1
-            if reads["n"] > 1:
-                return subprocess.CompletedProcess(list(args), 128, b"",
-                                                   b"injected read failure (self-test)")
-        return real_run_git(repo_, *args, **kw)
+        def flaky_run_git(repo_, *args, _verb=verb, _skip=skip, _reads=reads, **kw):
+            joined = " ".join(str(a) for a in args)
+            if args and args[0] == _verb and CERT_DOC in joined and base_ in joined:
+                _reads["n"] += 1
+                if _reads["n"] > _skip:
+                    return subprocess.CompletedProcess(list(args), 128, b"",
+                                                       b"injected read failure (self-test)")
+            return real_run_git(repo_, *args, **kw)
 
-    globals()["run_git"] = flaky_run_git
-    try:
-        t.expect_red("6124-f12a", "cert doc unreadable at the merge-base", repo, pre, f4,
-                     [("fail-closed", "did not fail closed on the unreadable cert doc")])
-    finally:
-        globals()["run_git"] = real_run_git
+        globals()["run_git"] = flaky_run_git
+        try:
+            t.expect_red(f"6124-{lab_}", f"git {verb} of the cert doc fails at the merge-base",
+                         repo, base_, head_,
+                         [("fail-closed", "did not fail closed on the unreadable cert doc")])
+        finally:
+            globals()["run_git"] = real_run_git
     # (6124-f12b) RED (#6359: the production reader, called directly) - a
     # symlink at the cert-doc path is never read as the ledger.
     fx.reset(exp6124)
