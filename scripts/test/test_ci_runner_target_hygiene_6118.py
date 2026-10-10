@@ -2879,6 +2879,16 @@ class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
                 self.assertEqual([], self._before_prune(
                     R7_PRE + "        run: |\n          %s\n          cargo test --no-run\n" % body), label)
 
+    # ---- #6530: job-level defaults.run.working-directory (plain block form) ----
+
+    def test_6118_r7_6530_job_defaults_run_working_directory_is_flagged(self) -> None:
+        job_yaml = "    defaults:\n      run:\n        working-directory: sub\n"
+        found = self._mutated(_replace_once(self.ci, CHECK_RUNS_ON, CHECK_RUNS_ON + job_yaml))
+        self.assertTrue(any("R-DEBUG defaults.run.working-directory moves cargo to another .cargo/config" in v
+                            for v in found), found)
+        shell_only = "    defaults:\n      run:\n        shell: bash\n"
+        self.assertEqual([], self._mutated(_replace_once(self.ci, CHECK_RUNS_ON, CHECK_RUNS_ON + shell_only)))
+
 class PruneScript6118(unittest.TestCase):
     """scripts/ci/prune-runner-target.py against a fake cargo target tree."""
 
