@@ -148,6 +148,30 @@ sys.exit(mod.main(sys.argv[4:]))
 """
 
 
+# Like HARNESS, but records the argv of every Popen the helper starts (one JSON line each) before delegating.
+# argv: script, cfg, record-file, then the helper's own arguments.
+RECORD_HARNESS = """import importlib.util, json, subprocess, sys
+spec = importlib.util.spec_from_file_location("ensure_age_extension", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+with open(sys.argv[2]) as fh:
+    mod.MANIFEST = tuple(tuple(row) for row in json.load(fh)["manifest"])
+record = sys.argv[3]
+real_popen = subprocess.Popen
+
+
+class RecordPopen(real_popen):
+    def __init__(self, args, *rest, **kwargs):
+        with open(record, "a") as fh:
+            fh.write(json.dumps([str(a) for a in args]) + "\\n")
+        super().__init__(args, *rest, **kwargs)
+
+
+subprocess.Popen = RecordPopen
+sys.exit(mod.main(sys.argv[4:]))
+"""
+
+
 def write_exe(path, text):
     path.write_text(text)
     path.chmod(0o755)
@@ -1045,6 +1069,39 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             os.close(w)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout.strip(), "1")
+
+    def run_recorded(self, env=None):
+        """Run the helper on a healthy install and return (result, the argv of the --supervise Popen)."""
+        self.install_good()
+        cmd = self.cmd()
+        harness, record = self.base / "record_harness.py", self.base / "popen.jsonl"
+        harness.write_text(RECORD_HARNESS)
+        cmd[2:4] = [str(harness), str(SCRIPT)]
+        cmd.insert(5, str(record))
+        r = subprocess.run(cmd, capture_output=True, text=True, check=False, env=env)
+        calls = [json.loads(line) for line in record.read_text().splitlines()] if record.exists() else []
+        sup = [argv for argv in calls if "--supervise" in argv]
+        self.assertEqual(len(sup), 1, (r.stdout + r.stderr, calls))
+        return r, sup[0]
+
+    def test_supervisor_runs_isolated_6641_6675(self):
+        # The supervisor inherits the env that holds PGPASSWORD: it must run as `python -I` so no PYTHONPATH,
+        # PYTHONSTARTUP, sitecustomize or user site directory can run code in it (#6641, #6675, #6339 class).
+        site = self.base / "site"
+        site.mkdir()
+        marker = self.base / "sitecustomize.ran"
+        # the fake psql and pg_config are Python scripts without -I: the hook records only the --supervise process
+        (site / "sitecustomize.py").write_text(
+            f"import sys\nif '--supervise' in sys.argv:\n    open({str(marker)!r}, 'a').write('ran')\n")
+        env = dict(os.environ, PYTHONPATH=str(site), PYTHONSTARTUP=str(site / "sitecustomize.py"))
+        control = subprocess.run([sys.executable, "-c", "pass", "--supervise"], env=env, check=False)
+        self.assertEqual(control.returncode, 0)
+        self.assertTrue(marker.exists(), "control: without -I the sitecustomize hook runs")
+        marker.unlink()
+        r, argv = self.run_recorded(env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(argv[:4], [sys.executable, "-I", os.path.abspath(str(SCRIPT)), "--supervise"])
+        self.assertFalse(marker.exists(), "the --supervise process ran a sitecustomize hook")
 
     def test_overall_deadline_stops_a_stalled_psql_6506(self):
         # #6506: the 60 s limit is the only bound on a psql that connects and then stalls.  The supervisor
