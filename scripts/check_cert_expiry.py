@@ -749,7 +749,8 @@ def amendment_verdict(repo, mb, judged, required):
     if len(fresh) > 1:
         lines = ", ".join(str(e["start"] + 1) for e in fresh)
         return False, (f"exactly one new amendment per change is accepted; this change adds "
-                       f"{len(fresh)} (lines {lines})")
+                       f"{len(fresh)} (lines {lines}); one record may list every changed path "
+                       "and identifier")
     ent = fresh[0]
     at = f"the new amendment at line {ent['start'] + 1}"
     start = ent["start"]
@@ -843,8 +844,11 @@ def amendment_remedy(status, required):
         "re-measurement is forbidden (#3899). Record this change instead (#6124): insert ONE "
         f"new amendment record below STATUS in {CERT_DOC}, directly above an existing "
         "amendment header (a blank '>' line between them) or as the last paragraph of its "
-        "blockquote, as its own paragraph, dated from the merge-base day to today, in plain "
-        "text shaped exactly as below, and change no other line of the doc:",
+        "blockquote (when the doc holds no record yet, anywhere below STATUS), as its own "
+        "paragraph, dated from the day of its own commit (at most 14 days below the merge-base "
+        "day) to today, in plain text shaped exactly as below. ONE record may list every "
+        "changed path and identifier; do not split them across records. Change no other line "
+        "of the doc:",
         "  > **Amendment (YYYY-MM-DD, #<issue> - section 7 record, non-discharging).**",
     ]
     lines.extend(f"  > - `{_doc_safe(r)}`" for r in sorted(required))
