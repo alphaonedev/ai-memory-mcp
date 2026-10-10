@@ -6,9 +6,11 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from urllib.parse import parse_qs, urlsplit
 
@@ -17,17 +19,21 @@ RUNNER_DIRECTORY = Path('infra/lan-parity-test')
 PYTHON_RUNNER = 'run-parity-tests.py'
 SHELL_RUNNER = 'run-parity-tests.sh'
 PROCESS_TIMEOUT = 30
+POLL_SECONDS = 0.02
 FAILURE_STATUS = 7
+FIXTURE_PASSWORD = 'lan-test-password'
 STAND_IN = r'''#!/usr/bin/env python3
 import json
 import os
 from pathlib import Path
 import sys
+import time
 
 NAME = Path(sys.argv[0]).name
 ARGUMENTS = sys.argv[1:]
 CASE = os.environ.get('LAN_TEST_CASE', 'healthy')
 FAILURE_STATUS = 7
+INTERRUPT_WAIT_SECONDS = 60
 EVENTS = Path(os.environ['LAN_TEST_EVENTS'])
 with EVENTS.open('a') as output:
     output.write(json.dumps({'program': NAME, 'arguments': ARGUMENTS,
@@ -40,6 +46,8 @@ if NAME == 'cargo':
                           'executable': os.environ['LAN_TEST_BINARY']}))
     elif CASE == 'default-fails':
         raise SystemExit(FAILURE_STATUS)
+    elif CASE == 'interrupt-default':
+        time.sleep(INTERRUPT_WAIT_SECONDS)
 elif NAME == 'psql':
     statement = ARGUMENTS[ARGUMENTS.index('-c') + 1] if '-c' in ARGUMENTS else ''
     if CASE == 'create-fails' and statement.startswith('CREATE DATABASE'):
@@ -87,6 +95,7 @@ class LanParityRunner7086(unittest.TestCase):
             self.environment.pop(key, None)
         self.environment.update(
             PATH=str(fake_bin) + os.pathsep + os.environ['PATH'], PG_CA=str(self.ca),
+            PGPASSWORD=FIXTURE_PASSWORD,
             LAN_TEST_EVENTS=str(self.events), LAN_TEST_BINARY=str(fake_bin / 'live-test'),
             TMPDIR=str(self.root), TMP=str(self.root), TEMP=str(self.root))
 
@@ -150,6 +159,37 @@ class LanParityRunner7086(unittest.TestCase):
         statements = self.statements(events)
         self.assertTrue(any(statement.startswith('CREATE DATABASE') for statement in statements))
         self.assertTrue(any(statement.startswith('DROP DATABASE') for statement in statements))
+
+    def test_term_during_default_pass_drains_child_and_cleans_only_owned_databases(self):
+        process = subprocess.Popen(self.command,
+                                   env=dict(self.environment, LAN_TEST_CASE='interrupt-default'),
+                                   cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   text=True)
+        try:
+            deadline = time.monotonic() + PROCESS_TIMEOUT
+            while time.monotonic() < deadline:
+                if self.events.exists():
+                    events = [json.loads(line) for line in self.events.read_text().splitlines()]
+                    if any(event['program'] == 'cargo' for event in events):
+                        break
+                time.sleep(POLL_SECONDS)
+            else:
+                self.fail('default pass did not start')
+            process.send_signal(signal.SIGTERM)
+            output, _ = process.communicate(timeout=PROCESS_TIMEOUT)
+            self.assertNotEqual(process.returncode, 0, output)
+            events = [json.loads(line) for line in self.events.read_text().splitlines()]
+            statements = self.statements(events)
+            creates = [statement for statement in statements if statement.startswith('CREATE DATABASE')]
+            drops = [statement for statement in statements if statement.startswith('DROP DATABASE')]
+            self.assertEqual(len(creates), 1)
+            self.assertEqual(len(drops), 1, 'interrupted acquired database must be cleaned once')
+            self.assertEqual(creates[0].split('"')[1], drops[0].split('"')[1])
+            self.assertNotIn('FORCE', drops[0])
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate(timeout=PROCESS_TIMEOUT)
 
 
 if __name__ == '__main__':

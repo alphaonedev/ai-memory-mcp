@@ -66,7 +66,7 @@ Each stub script captures the operator-stated contract for its scenario
 (input setup, failure injection, expected outcome). A future contributor
 or test-infra session fleshes out the bash glue (`docker kill`,
 `docker exec`, federation-push curl, recall verification) and wires the
-scripts into `infra/lan-parity-test/run-parity-tests.sh`.
+scripts into `infra/lan-parity-test/run-parity-tests.py`.
 
 The substrate-side acceptance is COMPLETE at v0.7.0 ship; this directory
 is the integration-test follow-up surface.

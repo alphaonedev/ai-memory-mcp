@@ -77,7 +77,7 @@ against the LOCKED config above.
 |-------|-------|---------|----------------|
 | **A** | NHI dogfood P0-P11 | `docs/v1.0.0/nhi-playbook-P0-P11.md` (this campaign's versioned playbook) | Every phase P0-P11 SHIP per its own pass assertion; final verdict rubric = SHIP. Exercised MCP/HTTP/CLI against the v1.0.0 binary. |
 | **B** | A2A multi-agent | IronClaw + Grok 4.5 two-daemon mesh (lan-parity `ic-parity-alice` ↔ `ic-parity-bob`, then DO multi-node) | Two enrolled daemons exchange signed A2A signals/actions across the federation transport; cross-agent memory visible per governance; no unsigned authority-write accepted. |
-| **C** | pg+AGE+pgvector + full regression | `infra/lan-parity-test/run-parity-tests.sh` | `cargo test --features sal,sal-postgres --release` GREEN against the live PG16+AGE 1.6.0+pgvector container on `127.0.0.1:15432`. postgres-backed `live_*` tests are gated on `AI_MEMORY_TEST_POSTGRES_URL` (self-skip when unset); the `#[ignore]`-marked tests require `-- --include-ignored` (see execution note below). Actual live-test count + pass rate recorded in the run log under `.local-runs/`. sqlite↔postgres SAL parity asserted. |
+| **C** | pg+AGE+pgvector + full regression | `infra/lan-parity-test/run-parity-tests.py` | `cargo test --features sal,sal-postgres --release` GREEN against the live PG16+AGE 1.6.0+pgvector container on `127.0.0.1:15432`. postgres-backed `live_*` tests are gated on `AI_MEMORY_TEST_POSTGRES_URL` (self-skip when unset); the `#[ignore]`-marked tests require `-- --include-ignored` (see execution note below). Actual live-test count + pass rate recorded in the run log under `.local-runs/`. sqlite↔postgres SAL parity asserted. |
 | **D** | Federation | Enrolled multi-node quorum (lan-parity 2-node → DO N-node) | A W-of-N quorum write commits locally AND replicates to the peer over the mutually-authenticated channel; peer-enrollment + write-sig + nonce + policy-current gates all default-ON and satisfied by REAL enrollment (not an escape hatch). |
 | **E** | Encryption — 3 legs, pos + neg | The 6 scripts in `infra/do-hive/crypto/` (see §2.1) | Every leg's positive assertion PASSES and every negative assertion is REFUSED (fail-closed). `run-all-local.sh` exits 0 (all legs green). |
 | **F** | USL capacity, crypto-ON | DO N-node hive under the encrypted+attested config (`infra/do-hive/`) | Capacity measured on the certified config (encryption + attestation ON) — NOT the earlier invalidated plaintext/attestation-off run. Reported against the defined unit + measured cells (per the operator's 500-1000-agent-cluster / 500-agent-block certification scope). |
@@ -197,13 +197,13 @@ any assertion FAILs. `run-all-local.sh` regenerates certs then runs all six legs
 
 1. **Local (free) proves green.**
    - Crypto legs: `infra/do-hive/crypto/run-all-local.sh` (regenerates certs, runs all six legs, non-zero exit if any leg fails).
-   - pg+AGE+pgvector + regression: bring up `infra/lan-parity-test/docker-compose.yml` (PG+AGE 1.6.0+pgvector container + 2 IronClaw daemons), then `infra/lan-parity-test/run-parity-tests.sh`.
+   - pg+AGE+pgvector + regression: bring up `infra/lan-parity-test/docker-compose.yml` (PG+AGE 1.6.0+pgvector container + 2 IronClaw daemons), then `infra/lan-parity-test/run-parity-tests.py`.
    - This entire local stage costs $0 (Docker on the local node + in-process MiniLM embedder).
 2. **DO re-hosts the identical config** for the parts local cannot prove: real federated multi-node reachability across droplets, and capacity (Track F) at cluster scale. The DO substrate (`infra/do-hive/`) is provisioned with the byte-identical AGE 1.6.0 pin and Grok 4.5 wiring so a result proven locally is proven on DO.
 3. **One observable orchestration.** Each phase writes a per-phase log under `.local-runs/`; teardown is trap-guarded (`infra/do-hive/teardown.sh` is idempotent; the crypto legs trap-clean their temp dirs). No synchronized-blast defaults; the DO hive is paced and money-gated (operator-triggered spend only).
 
 **Execution notes (surfaced findings, not deferrals):**
-- `run-parity-tests.sh` as shipped runs `cargo test --features sal,sal-postgres --release` WITHOUT `-- --include-ignored`, so the `#[ignore]`-marked postgres tests are NOT exercised by it. The cert run MUST additionally invoke the suite with `-- --include-ignored` (or extend the script) to cover those, and the run log records both invocations. This is a Track C coverage item to close during execution.
+- `run-parity-tests.py` runs two serialized passes: the default release suite, then each binary containing ignored tests with `--include-ignored --test-threads=1` in its own database. A failing first pass does not suppress the second. Discovery and cleanup failures produce a nonzero result; the log records both passes. Actual native execution and its test counts remain required certification evidence.
 - The DO substrate binary MUST be the #1882-fixed `sal-postgres` build; the memory droplet's `serve` unit only starts once such a binary is present (`infra/do-hive/cloud-init-memory.yaml.tpl`).
 
 ---
@@ -235,7 +235,7 @@ stood between "CI is green" and "enterprise-certified":
    path; Track C exercises the sal-postgres embedding column end-to-end with the
    #1882 dim-fix.
 6. **Unified cert-runner being built.** The local-first orchestration
-   (crypto `run-all-local.sh` + lan-parity `run-parity-tests.sh` + the P0-P11
+   (crypto `run-all-local.sh` + lan-parity `run-parity-tests.py` + the P0-P11
    playbook) is the seed of the single cert-runner; this PLAN is its
    specification.
 
