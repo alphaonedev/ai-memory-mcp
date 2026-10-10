@@ -269,7 +269,7 @@ fn screened_credentials_are_not_recoverable_from_cause_hash() {
     let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAbSecretKeyMaterialHere\n-----END RSA PRIVATE KEY-----";
     let jwt = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
 
-    for secret in [aws, pem, jwt] {
+    for (label, secret) in [("aws", aws), ("pem", pem), ("jwt", jwt)] {
         let args = format!("field-a={secret}&field-b=ok");
         let cause = compute_cause_hash("ai:agent", "action.kind", "action-id", &args);
 
@@ -291,7 +291,7 @@ fn screened_credentials_are_not_recoverable_from_cause_hash() {
                 ai_memory::secret_screen::screen(&args),
                 ai_memory::secret_screen::ScreenOutcome::Hit { .. }
             ),
-            "secret_screen must detect the planted credential: {secret}",
+            "secret_screen must detect the planted credential (fixture {label})",
         );
     }
 }
