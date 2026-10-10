@@ -215,6 +215,7 @@ class Step:
         self.env: Dict[str, str] = {}
         self.with_: Dict[str, str] = {}
         self.workdir = ""
+        self.shell = ""
         self.run: List[str] = []
 
     def run_text(self) -> str:
@@ -232,7 +233,9 @@ class Job:
         self.env: Dict[str, str] = {}
         self.matrix: Dict[str, List[str]] = {}  # every literal value of every matrix key
         self.legs: List[List[str]] = []  # one label list per possible runner
-        self.workdir = False  # `defaults.run.working-directory` is set
+        self.workdir = ""  # `defaults.run.working-directory`
+        self.shell = ""  # `defaults.run.shell`
+        self.container = False  # a `container:` job runs its steps in an image with its own env
         self.steps: List[Step] = []
 
     def self_hosted(self) -> bool:
@@ -245,7 +248,8 @@ class Job:
 
 class Workflow:
     def __init__(self) -> None:
-        self.workdir = False  # top-level `defaults.run.working-directory` is set
+        self.workdir = ""  # top-level `defaults.run.working-directory`
+        self.shell = ""  # top-level `defaults.run.shell`
         self.env: Dict[str, str] = {}
         self.jobs: Dict[str, Job] = {}
 
@@ -277,7 +281,17 @@ def _unquote(value: str) -> str:
     return value
 
 
-_KEY_ROW = re.compile(r"^(- )?([A-Za-z_][A-Za-z0-9_.-]*):(?: (.*))?$")
+_KEY_ROW = re.compile(r"^(- +)?([A-Za-z_][A-Za-z0-9_.-]*):(?: (.*))?$")
+# Round 7 (3-agent vote (6def5ab6), option C): the reader accepts a strict subset of YAML and
+# raises Unparsed (R-SHAPE) for everything outside it, instead of skipping what it cannot read.
+WORKFLOW_KEYS = frozenset({"name", "on", "run-name", "permissions", "concurrency", "env", "defaults", "jobs"})
+JOB_KEYS = frozenset({"name", "runs-on", "steps", "needs", "if", "timeout-minutes", "permissions", "outputs",
+                      "env", "strategy", "environment", "continue-on-error", "defaults", "uses", "with",
+                      "secrets", "concurrency", "container", "services"})
+STEP_KEYS = frozenset({"id", "if", "name", "uses", "run", "shell", "with", "env", "continue-on-error",
+                       "timeout-minutes", "working-directory"})
+DEFAULTS_RUN_KEYS = frozenset({"shell", "working-directory"})
+BLOCK_HEADER_RE = re.compile(r"[|>][+-]?")
 
 
 def _split_key(content: str) -> Tuple[bool, str, str]:
@@ -286,6 +300,35 @@ def _split_key(content: str) -> Tuple[bool, str, str]:
     if not m:
         return content.startswith("- "), "", content
     return m.group(1) is not None, m.group(2), (m.group(3) or "")
+
+
+def _dash_width(content: str) -> int:
+    """Width of the ``-`` plus spaces that open a sequence entry (0 for a plain key row)."""
+    m = re.match(r"- +", content)
+    return len(m.group()) if m else 0
+
+
+def _children_end(rows: List[Tuple[int, str, int]], start: int, indent: int) -> int:
+    i = start
+    while i < len(rows) and rows[i][0] > indent:
+        i += 1
+    return i
+
+
+def _strict_key(content: str, n: int, where: str, allowed: "frozenset[str]", seen: set) -> Tuple[str, str]:
+    """(key, value) of a row the strict grammar reads; Unparsed for anything else."""
+    _dash, key, value = _split_key(content)
+    if not key:
+        raise Unparsed("%s row at line %d is not a bare `key: value` row: %r" % (where, n, content))
+    if key not in allowed:
+        raise Unparsed("%s key %r at line %d is not read by this guard" % (where, key, n))
+    if key in seen:
+        raise Unparsed("duplicate %s key %r at line %d" % (where, key, n))
+    seen.add(key)
+    head = _strip_comment(value).strip()
+    if head[:1] in ("&", "*", "!") or head.startswith("<<"):
+        raise Unparsed("anchor, alias or tag at line %d is not read: %r" % (n, content))
+    return key, value
 
 
 def _flow_items(text: str, line: int) -> List[str]:
@@ -396,16 +439,53 @@ def _resolve_runs_on(job: Job, spec: str, block: List[Tuple[int, str, int]], lin
     job.legs = [[_unquote(spec)]]
 
 
-def _env_block(lines: List[Tuple[int, str, str]], start: int, indent: int) -> Tuple[Dict[str, str], int]:
-    """Read ``KEY: value`` rows deeper than ``indent`` from ``start``; return (env, next index)."""
+def _quote_end(v: str) -> int:
+    """Index of the quote that closes the scalar opened at ``v[0]``, or -1."""
+    q = v[0]
+    i = 1
+    while i < len(v):
+        ch = v[i]
+        if q == '"' and ch == "\\":
+            i += 2
+            continue
+        if ch == q:
+            if q == "'" and i + 1 < len(v) and v[i + 1] == "'":
+                i += 2
+                continue
+            return i
+        i += 1
+    return -1
+
+
+def _scalar(value: str, n: int) -> str:
+    """One inline scalar: plain, or quoted and closed on its own row; Unparsed otherwise."""
+    v = _strip_comment(value).strip()
+    if v[:1] in ("|", ">", "[", "{", "&", "*", "!", "%", "@", "`"):
+        raise Unparsed("value at line %d is not an inline scalar: %r" % (n, value))
+    if v[:1] in ("'", '"') and _quote_end(v) != len(v) - 1:
+        raise Unparsed("quoted value at line %d is not closed on its row: %r" % (n, value))
+    return _unquote(v)
+
+
+def _no_children(rows: List[Tuple[int, str, int]], start: int, indent: int, what: str) -> None:
+    if start < len(rows) and rows[start][0] > indent:
+        raise Unparsed("%s continues on line %d; a multi-line value is not read: %r"
+                       % (what, rows[start][2], rows[start][1]))
+
+
+def _env_block(lines: List[Tuple[int, str, int]], start: int, indent: int) -> Tuple[Dict[str, str], int]:
+    """Read ``KEY: value`` rows (one column, inline scalars) deeper than ``indent``; return (env, next index)."""
     env: Dict[str, str] = {}
     i = start
+    col = lines[i][0] if i < len(lines) and lines[i][0] > indent else -1
     while i < len(lines) and lines[i][0] > indent:
-        _dash, key, value = _split_key(lines[i][1])
-        if not key or value.endswith("|") or value.endswith(">"):
-            raise Unparsed("env row is not KEY: value at line %d: %r" % (lines[i][2], lines[i][1]))
-        env[key] = _unquote(_strip_comment(value))
+        ind, content, n = lines[i]
+        _dash, key, value = _split_key(content)
+        if ind != col or not key or content.startswith("-") or key in env:
+            raise Unparsed("env row is not KEY: value at line %d: %r" % (n, content))
+        env[key] = _scalar(value, n)
         i += 1
+        _no_children(lines, i, col, "env value %s" % key)
     return env, i
 
 
@@ -416,36 +496,61 @@ def _with_block(lines: List[Tuple[int, str, int]], start: int, indent: int) -> T
     own: Optional[int] = None
     last = ""
     while i < len(lines) and lines[i][0] > indent:
-        ind, content, _n = lines[i]
+        ind, content, n = lines[i]
         if own is None:
             own = ind
-        _dash, key, value = _split_key(content)
-        if ind == own and key:
-            header = _strip_comment(value)
-            inputs[key] = "" if header in ("|", "|-", "|+", ">", ">-", ">+") else _unquote(header)
+        if ind == own:
+            _dash, key, value = _split_key(content)
+            header = _strip_comment(value).strip()
+            if not key or content.startswith("-") or key in inputs:
+                raise Unparsed("with: row is not KEY: value at line %d: %r" % (n, content))
+            if header[:1] in ("&", "*", "!"):
+                raise Unparsed("anchor, alias or tag at line %d is not read: %r" % (n, content))
+            if header[:1] in ("|", ">") and not BLOCK_HEADER_RE.fullmatch(header):
+                raise Unparsed("block header %r at line %d is not read" % (header, n))
+            inputs[key] = "" if BLOCK_HEADER_RE.fullmatch(header) else _unquote(header)
             last = key
-        elif last:
+        elif ind < own:
+            raise Unparsed("with: row at line %d is left of the input column" % n)
+        else:
             inputs[last] += "\n" + content
         i += 1
     return inputs, i
 
 
-def _defaults_workdir(rows: List[Tuple[int, str, int]], start: int, indent: int) -> Tuple[bool, int]:
-    found = False
-    i = start
-    while i < len(rows) and rows[i][0] > indent:
-        if _split_key(rows[i][1])[1] == "working-directory":
-            found = True
+def _read_defaults(rows: List[Tuple[int, str, int]], start: int, indent: int) -> Tuple[str, str, int]:
+    """``defaults: run: {shell, working-directory}`` -> (working directory, shell, next index)."""
+    end = _children_end(rows, start, indent)
+    if start == end:
+        raise Unparsed("empty defaults: block at line %d" % rows[start - 1][2])
+    run_ind, content, n = rows[start]
+    key, value = _strict_key(content, n, "defaults", frozenset({"run"}), set())
+    if value.strip() or content.startswith("-"):
+        raise Unparsed("defaults.run at line %d is not a block mapping" % n)
+    i = start + 1
+    seen: set = set()
+    got: Dict[str, str] = {}
+    col = rows[i][0] if i < end else -1
+    if col <= run_ind:
+        raise Unparsed("empty defaults.run block at line %d" % n)
+    while i < end:
+        ind, content, n = rows[i]
+        if ind != col or content.startswith("-"):
+            raise Unparsed("defaults.run row at line %d is not at the key column: %r" % (n, content))
+        key, value = _strict_key(content, n, "defaults.run", DEFAULTS_RUN_KEYS, seen)
+        got[key] = _scalar(value, n)
         i += 1
-    return found, i
+        _no_children(rows, i, col, "defaults.run.%s" % key)
+    return got.get("working-directory", ""), got.get("shell", ""), end
 
 
 def read_workflow(text: str) -> Workflow:
-    """Read the top-level env and every job's runs-on / env / matrix runners / steps.
+    """Read the top-level env / defaults and every job's runs-on / env / matrix / defaults / steps.
 
     Structure rows are (indent, content, 1-based line number) with blank and
     comment lines dropped; block-scalar bodies of ``run:`` are collected from
-    the RAW lines so the cargo invocations are seen verbatim.
+    the RAW lines so the cargo invocations are seen verbatim.  Anything outside
+    the strict subset the guard reads raises Unparsed (R-SHAPE).
     """
     raw = text.split("\n")
     rows: List[Tuple[int, str, int]] = []
@@ -458,23 +563,24 @@ def read_workflow(text: str) -> Workflow:
             continue
         rows.append((_indent(content), content[_indent(content):], n))
     wf = Workflow()
+    seen: set = set()
     i = 0
     while i < len(rows):
-        ind, content, _n = rows[i]
+        ind, content, n = rows[i]
         if ind != 0:
-            i += 1
-            continue
-        _dash, key, value = _split_key(content)
-        if key == "env" and not value.strip():
-            wf.env, i = _env_block(rows, i + 1, 0)
-            continue
-        if key == "defaults":
-            wf.workdir, i = _defaults_workdir(rows, i + 1, 0)
-            continue
-        if key == "jobs":
-            i = _read_jobs(wf, rows, raw, i + 1)
-            continue
+            raise Unparsed("row at line %d is not under a top-level key" % n)
+        key, value = _strict_key(content, n, "workflow", WORKFLOW_KEYS, seen)
         i += 1
+        if key in ("env", "defaults", "jobs") and value.strip():
+            raise Unparsed("top-level %s at line %d is not a block mapping: %r" % (key, n, content))
+        if key == "env":
+            wf.env, i = _env_block(rows, i, 0)
+        elif key == "defaults":
+            wf.workdir, wf.shell, i = _read_defaults(rows, i, 0)
+        elif key == "jobs":
+            i = _read_jobs(wf, rows, raw, i)
+        else:
+            i = _children_end(rows, i, 0)  # name / on / run-name / permissions / concurrency: inert
     if not wf.jobs:
         raise Unparsed("no jobs: block with at least one job")
     return wf
@@ -490,7 +596,7 @@ def _read_jobs(wf: Workflow, rows: List[Tuple[int, str, int]], raw: List[str], s
         if ind != job_indent:
             raise Unparsed("row at line %d is not at the job-id column" % n)
         dash, job_id, value = _split_key(content)
-        if dash or not job_id or value.strip():
+        if dash or not job_id or value.strip() or job_id in wf.jobs:
             raise Unparsed("job row at line %d is not `<id>:`: %r" % (n, content))
         job = Job(job_id)
         job_line = n
@@ -499,36 +605,42 @@ def _read_jobs(wf: Workflow, rows: List[Tuple[int, str, int]], raw: List[str], s
         runs_on_block: List[Tuple[int, str, int]] = []
         seen_runs_on = False
         calls_workflow = False
+        seen: set = set()
+        key_col = rows[i][0] if i < len(rows) and rows[i][0] > job_indent else -1
         while i < len(rows) and rows[i][0] > job_indent:
             kind, kcontent, kn = rows[i]
-            if kind != job_indent + 2:
-                i += 1
-                continue
-            _d, key, val = _split_key(kcontent)
+            if kind != key_col or kcontent.startswith("-"):
+                raise Unparsed("job %s row at line %d is not at its key column: %r" % (job_id, kn, kcontent))
+            key, val = _strict_key(kcontent, kn, "job", JOB_KEYS, seen)
+            i += 1
+            end = _children_end(rows, i, kind)
+            if key in ("env", "strategy", "defaults", "steps") and val.strip():
+                raise Unparsed("job %s %s at line %d is not a block mapping: %r" % (job_id, key, kn, kcontent))
             if key == "runs-on":
                 seen_runs_on = True
                 runs_on_line = kn
                 job.runs_on = _strip_comment(val)
-                i += 1
                 if job.runs_on.strip() == "":
-                    while i < len(rows) and rows[i][0] > kind:
-                        runs_on_block.append(rows[i])
-                        i += 1
+                    runs_on_block.extend(rows[i:end])
+                else:
+                    _no_children(rows, i, kind, "runs-on")
+                i = end
             elif key == "uses":
                 calls_workflow = True
-                i += 1
+                i = end
             elif key == "env":
-                if val.strip():
-                    raise Unparsed("inline job env at line %d is not read: %r" % (kn, kcontent))
-                job.env, i = _env_block(rows, i + 1, kind)
+                job.env, i = _env_block(rows, i, kind)
             elif key == "strategy":
-                i = _read_matrix(rows, i + 1, kind, job)
+                i = _read_matrix(rows, i, kind, job)
             elif key == "defaults":
-                job.workdir, i = _defaults_workdir(rows, i + 1, kind)
+                job.workdir, job.shell, i = _read_defaults(rows, i, kind)
             elif key == "steps":
-                i = _read_steps(job, rows, raw, i + 1, kind)
+                i = _read_steps(job, rows, raw, i, kind)
             else:
-                i += 1
+                job.container = job.container or key == "container"
+                i = end  # name / needs / if / permissions / outputs / ...: no cargo setting
+            if i != end:
+                raise Unparsed("job %s key %s at line %d was not read to its end" % (job_id, key, kn))
         if seen_runs_on:
             _resolve_runs_on(job, job.runs_on, runs_on_block, runs_on_line)
         elif not calls_workflow:
@@ -542,55 +654,48 @@ def _read_jobs(wf: Workflow, rows: List[Tuple[int, str, int]], raw: List[str], s
 def _read_steps(job: Job, rows: List[Tuple[int, str, int]], raw: List[str], start: int, steps_indent: int) -> int:
     i = start
     step: Optional[Step] = None
-    step_col: Optional[int] = None  # column of the `- ` that opens each step
+    step_col: Optional[int] = None  # column of the `-` that opens each step
     key_col = 0  # column of the current step's own keys
+    seen: set = set()
     while i < len(rows) and rows[i][0] > steps_indent:
         ind, content, n = rows[i]
-        dash, key, value = _split_key(content)
-        if dash and (step_col is None or ind == step_col):
-            step_col = ind
+        width = _dash_width(content)
+        if width:
+            if step_col is None:
+                step_col = ind
+            if ind != step_col:
+                raise Unparsed("step entry at line %d is not at the step column" % n)
             step = Step()
             job.steps.append(step)
-            key_col = ind + 2
-        elif dash or ind != key_col:
-            # A deeper row (a `with:` mapping, a step `env:`, a run-body line that
-            # happens to look like `key: value` or `- item`) is not a step key.
-            i += 1
-            continue
-        if step is None:
-            raise Unparsed("step key before the first `- ` at line %d" % n)
+            key_col = ind + width
+            seen = set()
+        elif step is None or ind != key_col:
+            raise Unparsed("row at line %d is not a step key: %r" % (n, content))
+        key, value = _strict_key(content, n, "step", STEP_KEYS, seen)
+        i += 1
+        end = _children_end(rows, i, key_col)
+        if key in ("env", "with") and value.strip() and not value.strip().startswith("{"):
+            raise Unparsed("inline step %s at line %d is not read: %r" % (key, n, content))
         if key == "env":
             if value.strip():
                 raise Unparsed("inline step env at line %d is not read: %r" % (n, content))
-            step.env, i = _env_block(rows, i + 1, key_col)
-            continue
-        if key == "with":
+            step.env, i = _env_block(rows, i, key_col)
+        elif key == "with":
             flow = _strip_comment(value).strip()
-            if flow.startswith("{") and flow.endswith("}"):
+            if flow:
+                if not flow.endswith("}"):
+                    raise Unparsed("inline step with at line %d is not read: %r" % (n, content))
                 # `with: { a: 1, b: x }`: every entry is read like a block input.
                 for part in flow[1:-1].split(","):
                     k, _sep, v = part.partition(":")
                     if k.strip():
                         step.with_[_unquote(k.strip())] = _unquote(v.strip())
-                i += 1
-                continue
-            if flow:
-                raise Unparsed("inline step with at line %d is not read: %r" % (n, content))
-            step.with_, i = _with_block(rows, i + 1, key_col)
-            continue
-        if key == "name":
-            step.name = _unquote(_strip_comment(value))
-        elif key == "working-directory":
-            step.workdir = _unquote(_strip_comment(value))
-        elif key == "if":
-            step.cond = _strip_comment(value)
-        elif key == "uses":
-            step.uses = _strip_comment(value)
-        elif key == "id":
-            step.step_id = _unquote(_strip_comment(value))
+                _no_children(rows, i, key_col, "with")
+            else:
+                step.with_, i = _with_block(rows, i, key_col)
         elif key == "run":
-            header = _strip_comment(value)
-            if header in ("|", "|-", "|+", ">", ">-", ">+"):
+            header = _strip_comment(value).strip()
+            if BLOCK_HEADER_RE.fullmatch(header):
                 # Block scalar: raw lines after row n indented deeper than the key.
                 j = n  # raw index of the line AFTER the header (raw is 0-based, n is 1-based)
                 while j < len(raw):
@@ -603,9 +708,27 @@ def _read_steps(job: Job, rows: List[Tuple[int, str, int]], raw: List[str], star
                         break
                     step.run.append(line.strip())
                     j += 1
+                i = end
             else:
-                step.run.append(_unquote(header))
-        i += 1
+                step.run.append(_scalar(value, n))
+                _no_children(rows, i, key_col, "run")
+        else:
+            text = _scalar(value, n)
+            _no_children(rows, i, key_col, key)
+            if key == "name":
+                step.name = text
+            elif key == "working-directory":
+                step.workdir = text
+            elif key == "if":
+                step.cond = _strip_comment(value).strip()
+            elif key == "uses":
+                step.uses = text
+            elif key == "id":
+                step.step_id = text
+            elif key == "shell":
+                step.shell = text
+        if i != end:
+            raise Unparsed("step key %s at line %d was not read to its end" % (key, n))
     return i
 
 
