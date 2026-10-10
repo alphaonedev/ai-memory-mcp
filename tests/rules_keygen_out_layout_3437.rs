@@ -232,7 +232,7 @@ fn claude_code_operator_workflow_uses_one_key_dir_3437() {
     for verb in ["keygen", "sign-seed", "enable"] {
         let step = rules_lines
             .iter()
-            .find(|l| l.contains(&format!("{verb} ")) && l.contains("**"))
+            .find(|l| l.contains(&format!(" {verb}")) && l.contains("**"))
             .unwrap_or_else(|| panic!("workflow step for `rules {verb}` is documented"));
         assert!(
             step.contains("--key-dir <dir>"),

@@ -556,7 +556,8 @@ pub fn run(
 
 /// Resolve where `rules keygen` writes (#1610). Precedence:
 ///
-/// 1. explicit `--out <PATH>` — always wins;
+/// 1. explicit `--out <PATH>` — wins, but must be named `operator.key` and,
+///    when a key-dir override is in force, live in that directory (#3437);
 /// 2. `<key_dir>/operator.key` when a key-dir override is in force
 ///    (`--key-dir` flag or `AI_MEMORY_KEY_DIR`) — keeps the write
 ///    path and the `--sign` verbs' read path
@@ -591,12 +592,47 @@ fn resolve_keygen_out_path(
                 p.display()
             );
         }
+        // #3437 (review F8, #6052) — with a key-dir override in force the
+        // signing verbs read the operator key from `key_dir` only, so an
+        // `--out` in another directory wrote a key `rules --key-dir <dir>
+        // enable --sign` could never find. Refuse before anything is written.
+        if key_dir_overridden && !same_dir(p.parent(), key_dir) {
+            bail!(
+                "rules.keygen: refusing --out {}: the key-dir override in force ({}) is where \
+                 `rules enable --sign` and the other signing verbs read the operator key, so a \
+                 key written outside it could never be loaded. Pass `--out {}` or drop --out \
+                 (#3437).",
+                p.display(),
+                key_dir.display(),
+                key_dir.join(OPERATOR_KEY_FILENAME).display()
+            );
+        }
         return Ok(p.to_path_buf());
     }
     if key_dir_overridden {
         return Ok(key_dir.join(OPERATOR_KEY_FILENAME));
     }
     resolve_operator_key_path(None)
+}
+
+/// #3437 — whether `--out`'s parent directory is `key_dir`: the same path
+/// spelling, or (when both exist) the same canonical directory. A bare file
+/// name has the empty parent, i.e. the current directory.
+fn same_dir(parent: Option<&Path>, key_dir: &Path) -> bool {
+    let parent = match parent {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    if parent == key_dir {
+        return true;
+    }
+    match (
+        std::fs::canonicalize(parent),
+        std::fs::canonicalize(key_dir),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// Resolve the operator key path: explicit `--out` override → default

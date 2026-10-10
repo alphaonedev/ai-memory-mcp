@@ -372,7 +372,7 @@ Operators inspect / mutate rules via:
 
 ```text
 ai-memory rules list                          # read-only, no signature
-ai-memory rules enable R001 --sign            # activate; requires operator.priv
+ai-memory rules --key-dir <dir> enable --id R001 --sign   # activate; signs with <dir>/operator.key
 ai-memory rules add ...   --sign              # author a new rule
 ```
 
@@ -383,14 +383,18 @@ must not be able to weaken its own constraints. See
 
 ### Operator workflow (end-to-end)
 
-1. **Keygen** — `ai-memory rules keygen --out <dir>/operator.key` writes
-   `operator.key` + `operator.key.pub` (the operator's signing keypair). The
-   basename must be `operator.key`, the name the signer and verifier read;
-   `--out` relocates the directory only (#3437).
-2. **Sign-seed** — `ai-memory rules sign-seed --key <dir>/operator.key` signs
-   the four seed rules (they ship unsigned + disabled by design).
-3. **Enable** — `ai-memory rules enable R001 --sign` (and R002/R003/R004
-   as the audit clears each one).
+Every `rules` step names the same `--key-dir <dir>`: keygen writes the
+operator keypair there and the signing verbs read it from there (#3437).
+
+1. **Keygen** — `ai-memory rules --key-dir <dir> keygen` writes
+   `<dir>/operator.key` + `<dir>/operator.key.pub` (the operator's signing
+   keypair). `--out` may only relocate the file within that directory under
+   the name `operator.key`, the name the signer and verifier read; an `--out`
+   outside the `--key-dir`, or under another name, is refused (#3437).
+2. **Sign-seed** — `ai-memory rules --key-dir <dir> sign-seed` signs the four
+   seed rules (they ship unsigned + disabled by design).
+3. **Enable** — `ai-memory rules --key-dir <dir> enable --id R001 --sign`
+   (and R002/R003/R004 as the audit clears each one).
 4. **Install hook** — `ai-memory install claude-code --hook pretool
    --apply`. Restart Claude Code.
 5. **Smoke test** — open a session, ask the model to write to `/tmp/foo`.

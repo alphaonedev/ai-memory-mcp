@@ -154,7 +154,10 @@ pub enum AgentsAction {
         /// token (#3781). The hygienic channel: unlike `--token`, a file path is
         /// not the secret and never lands in `/proc/<pid>/cmdline`. Equivalent to
         /// the `AI_MEMORY_AGENT_API_KEY_FILE` env var (the flag wins when both set).
-        #[arg(long)]
+        /// `--token-file -` reads the token from stdin instead (#3437): exactly
+        /// one line, e.g. piped from a secret manager; an empty or multi-line
+        /// stdin is refused.
+        #[arg(long, value_name = "PATH|-")]
         token_file: Option<std::path::PathBuf>,
         /// v1.0.0 #3418 — the data tier this enrollment is written to.
         ///
@@ -294,13 +297,16 @@ pub enum PendingAction {
 /// #3781 — resolve the `bind-api-key` token from a non-argv channel, REFUSING a
 /// token supplied on argv (`--token`).
 ///
-/// Resolution order (first hit wins): `--token-file <path>` > the
-/// [`AGENT_API_KEY_FILE_ENV`] file > REFUSE `--token` > error when none is given.
+/// Resolution order (first hit wins): `--token-file <path>` (`-` = stdin,
+/// #3437) > the [`AGENT_API_KEY_FILE_ENV`] file > REFUSE `--token` > error
+/// when none is given.
 ///
 /// # Errors
 ///
 /// - a token was supplied on argv (`--token`) — refused, naming the file forms;
 /// - no token channel was supplied;
+/// - `--token-file -` and stdin is empty, multi-line or oversized
+///   ([`parse_stdin_api_key_token`]);
 /// - the file cannot be read or (unix) has group/world-accessible permissions
 ///   without the lax-perms opt-out ([`read_api_key_token_file`]).
 pub(crate) fn resolve_bind_api_key_token(
@@ -320,6 +326,9 @@ pub(crate) fn resolve_bind_api_key_token(
         );
     }
     if let Some(path) = token_file {
+        if path.as_os_str() == TOKEN_FILE_STDIN {
+            return read_api_key_token_stdin();
+        }
         return read_api_key_token_file(path);
     }
     if let Some(env_path) = std::env::var_os(AGENT_API_KEY_FILE_ENV) {
@@ -331,6 +340,66 @@ pub(crate) fn resolve_bind_api_key_token(
         "bind-api-key: no api-key token — supply `--token-file <0600 path>` or set \
          `{AGENT_API_KEY_FILE_ENV}` (a token on `--token` argv is refused; #3781)."
     )
+}
+
+/// #3437 — the `--token-file` value that selects stdin.
+const TOKEN_FILE_STDIN: &str = "-";
+
+/// #3437 — upper bound on the bytes read from stdin for `--token-file -`; a
+/// token is a short single line, so anything longer is refused rather than
+/// buffered without limit.
+const MAX_STDIN_TOKEN_BYTES: u64 = 4096;
+
+/// #3437 — read the api-key token from stdin (`--token-file -`). No mode check
+/// applies (stdin is not a file the operator left lying around); the content
+/// is validated by [`parse_stdin_api_key_token`].
+///
+/// # Errors
+///
+/// - stdin cannot be read or is not UTF-8;
+/// - the token is empty, spans more than one line, or exceeds
+///   [`MAX_STDIN_TOKEN_BYTES`].
+fn read_api_key_token_stdin() -> Result<String> {
+    use std::io::Read as _;
+    let mut raw = String::new();
+    std::io::stdin()
+        .lock()
+        .take(MAX_STDIN_TOKEN_BYTES.saturating_add(1))
+        .read_to_string(&mut raw)
+        .context("bind-api-key: reading the api-key token from stdin (`--token-file -`)")?;
+    parse_stdin_api_key_token(&raw)
+}
+
+/// #3437 — validate a token read from stdin: exactly one non-empty line (the
+/// trailing newline is not part of the token).
+///
+/// # Errors
+///
+/// The input is longer than [`MAX_STDIN_TOKEN_BYTES`], empty after trimming,
+/// or contains a line break inside the token.
+fn parse_stdin_api_key_token(raw: &str) -> Result<String> {
+    if u64::try_from(raw.len())
+        .ok()
+        .is_none_or(|n| n > MAX_STDIN_TOKEN_BYTES)
+    {
+        anyhow::bail!(
+            "bind-api-key: the api-key token on stdin (`--token-file -`) exceeds \
+             {MAX_STDIN_TOKEN_BYTES} bytes; supply a single-line token (#3437)"
+        );
+    }
+    let token = raw.trim();
+    if token.is_empty() {
+        anyhow::bail!(
+            "bind-api-key: the api-key token on stdin (`--token-file -`) is empty (#3437)"
+        );
+    }
+    if token.contains(['\n', '\r']) {
+        anyhow::bail!(
+            "bind-api-key: the api-key token on stdin (`--token-file -`) spans more than one \
+             line; supply exactly one line (#3437)"
+        );
+    }
+    Ok(token.to_owned())
 }
 
 /// Read the api-key token from a `0600` file (the #1927 non-argv channel;
@@ -1175,6 +1244,29 @@ mod tests {
     use crate::daemon_runtime::{Cli, run};
     #[cfg(feature = "sal")]
     use clap::Parser;
+
+    /// #3437 (review F6, #6052) — the stdin token parser: one line binds (the
+    /// trailing newline is not part of the token); empty, whitespace-only,
+    /// multi-line and oversized input is refused.
+    #[test]
+    fn parse_stdin_api_key_token_accepts_one_line_only_3437() {
+        assert_eq!(
+            parse_stdin_api_key_token("pw-placeholder-3437\n").unwrap(),
+            "pw-placeholder-3437"
+        );
+        assert_eq!(
+            parse_stdin_api_key_token("pw-placeholder-3437\r\n").unwrap(),
+            "pw-placeholder-3437"
+        );
+        for bad in ["", " \n", "pw-a\npw-b\n", "pw-a\rpw-b"] {
+            assert!(
+                parse_stdin_api_key_token(bad).is_err(),
+                "#3437: {bad:?} must be refused"
+            );
+        }
+        let oversized = "x".repeat(usize::try_from(MAX_STDIN_TOKEN_BYTES).unwrap() + 1);
+        assert!(parse_stdin_api_key_token(&oversized).is_err());
+    }
 
     #[test]
     fn test_agents_list_empty() {
