@@ -213,7 +213,7 @@ def trailer_block(message: bytes) -> str:
     try:
         result = subprocess.run(["git", "interpret-trailers", "--parse", "--no-divider"], input=message,
                                 capture_output=True, check=False, cwd=os.sep, env=config_free_env())
-    except OSError as exc:
+    except ValueError as exc:
         raise RuntimeError(f"git interpret-trailers could not run: {exc}") from exc
     if result.returncode != 0:
         raise RuntimeError("git interpret-trailers failed: " + result.stderr.decode("utf-8", "replace").strip())
