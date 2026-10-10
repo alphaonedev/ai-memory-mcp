@@ -1521,6 +1521,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     reported = {"mask-confusable": "+ AI_MEMORY_FED_MASK_KNO",
                 "mask-confusable-note": "+ AI_MEMORY_FED_MASK_KNO",
                 "mask-zwsp": "+ AI_MEMORY_FED_MASK_", "mask-crsplit": "+ AI_MEMORY_FED_MASK_"}
+    gate_labels = {"mask-xfile", "mask-incomment", "mask-longer", "mask-blockcomment",
+                   "mask-annot", "mask-u2028", "mask-trailing"}
     for label, desc, edits in offsets:
         fx.g("checkout", "-q", "-B", f"mo-{label}", mk0)
         for rel, text in edits.items():
@@ -1531,6 +1533,16 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                                (sentence, "did not carry the required section 7 expiry sentence")])
         if label == "mask-xfile" and "occurrences in src/ fell" in out_mo:
             t.fail(f"(mask-xfile): an offset removal was annotated as a count fall: {out_mo!r}")
+        if label in gate_labels:
+            # (#6566) the same removal judged end to end on a pull_request merge commit.
+            fx.g("checkout", "-q", "main")
+            fx.g("reset", "-q", "--hard", mk0)
+            fx.g("update-ref", "refs/remotes/origin/main", mk0)
+            merge_mo = fx.merge(f"mo-{label}", f"Merge mo-{label} into main")
+            t.gate(f"{label}-gate", f"pull_request: {desc}", repo,
+                   _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=head_mo,
+                             GITHUB_BASE_REF="main", GITHUB_SHA=merge_mo,
+                             PATH=os.environ.get("PATH", "")), f"- {kid}")
     # (mask-netzero, #6370 F7) the total never falls: the definition is removed and
     #       a note naming the identifier is added in the same change, so the count
     #       is unchanged. Judged on the lines, not the total, it stays RED, both
@@ -2085,6 +2097,9 @@ SELF_TEST_OK = (
     "(mask, mask-gate, mask-drift, mask-add, #6370) removing the definition of an identifier "
     "that a comment still names stays RED (occurrence counts, not name sets), while an extra "
     "mention is GREEN; "
+    "(mask-xfile-gate, mask-incomment-gate, mask-longer-gate, mask-blockcomment-gate, "
+    "mask-annot-gate, mask-u2028-gate, mask-trailing-gate, #6566) the same seven removals "
+    "RED end to end on a pull_request merge commit; "
     "(mask-lost2, mask-trailing-ws, mask-dup-add, #6565) two rewritten identifier lines are "
     "both counted in the report, trailing blanks and an identical line added elsewhere are GREEN; "
     "(mask-u2028, mask-trailing, #6564) a definition behind a // comment joined by U+2028 and a "
