@@ -5400,5 +5400,46 @@ class EncodedTokenWholeRedaction6578(unittest.TestCase):
                 self.assertEqual([], _leaked_windows(body, line))
 
 
+# ---- Round 6 (#6629, #6630): the checkout's `with:` and the workflow's top level are pinned ----
+
+
+class ApprovalCheckoutAndTopLevel6629(unittest.TestCase):
+    """The checkout that supplies the evaluator takes exactly ``persist-credentials: false``
+    (#6629): a ``ref:`` or ``repository:`` would judge with code from another commit or repo.
+    The workflow's top level carries no ``env:`` (#6630): a workflow env such as ``GH_HOST``
+    reaches the Evaluate step and redirects its API calls."""
+
+    def setUp(self) -> None:
+        self.c8 = C8_WORKFLOW.read_text(encoding="utf-8")
+        self.with_row = "          persist-credentials: false\n"
+        self.assertEqual(1, _job_text(self.c8, APPROVAL_JOB).count(self.with_row))
+
+    def checkout_mutant(self, extra: str) -> List[str]:
+        job = _job_text(self.c8, APPROVAL_JOB)
+        return _approval_job_problems(self.c8.replace(job, job.replace(self.with_row, self.with_row + extra, 1), 1))
+
+    def test_6629_live_job_is_intact(self) -> None:
+        self.assertEqual([], _approval_job_problems(self.c8))
+
+    def test_6629_checkout_ref_is_killed(self) -> None:
+        self.assertTrue(self.checkout_mutant("          ref: " + "0" * 40 + "\n"))
+
+    def test_6629_checkout_repository_is_killed(self) -> None:
+        self.assertTrue(self.checkout_mutant("          repository: someone/fork\n"))
+
+    def test_6629_checkout_path_and_token_are_killed(self) -> None:
+        for extra in ("          path: elsewhere\n", "          token: ${{ github.token }}\n",
+                      "          fetch-depth: 0\n"):
+            with self.subTest(extra=extra.strip()):
+                self.assertTrue(self.checkout_mutant(extra))
+
+    def test_6630_workflow_env_is_killed(self) -> None:
+        anchor = "\npermissions:\n  contents: read\n"
+        for env in ("\nenv:\n  GH_HOST: evil.example\n", "\nenv:\n  GH_REPO: someone/fork\n",
+                    "\nenv: {GH_HOST: evil.example}\n"):
+            with self.subTest(env=env.strip()):
+                self.assertTrue(_c8_mutant_problems(self.c8, anchor, env + anchor))
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
