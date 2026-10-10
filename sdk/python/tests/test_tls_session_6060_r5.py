@@ -1417,7 +1417,7 @@ def _linked_ca(lab: Lab, tmp_path: pathlib.Path, kind: str, mode: int) -> str:
 
 @_POSIX_ONLY
 @pytest.mark.parametrize("client_cls", _CLIENTS)
-@pytest.mark.parametrize("mode", [0o777, 0o775], ids=oct)
+@pytest.mark.parametrize("mode", [0o777, 0o775, 0o757, 0o707], ids=oct)  # #6691: group AND other
 @pytest.mark.parametrize("kind", ["file", "directory", "component", "entry"])
 def test_symlink_in_a_shared_writable_directory_is_refused_6559(
     lab: Lab, tmp_path: pathlib.Path, client_cls: type, mode: int, kind: str
