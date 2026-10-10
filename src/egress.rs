@@ -226,52 +226,64 @@ impl EgressDecision {
 }
 
 /// Whether `base_url`'s host is a loopback / localhost target — i.e. local
-/// inference that ships nothing off-host. Best-effort host parse: a URL
-/// whose host cannot be extracted is treated as NON-loopback (fail-closed
-/// for the `loopback-only` / `deny` postures — an unparseable target is
-/// refused rather than assumed local).
+/// inference that ships nothing off-host. The host is the one reqwest
+/// connects to ([`admitted_host`], #4018); a URL the client could never send
+/// to is treated as NON-loopback (fail-closed for the `loopback-only` /
+/// `deny` postures — an unparseable target is refused rather than assumed
+/// local).
 #[must_use]
 pub fn target_is_loopback(base_url: &str) -> bool {
-    let Some(host) = host_of(base_url) else {
+    let Some(host) = admitted_host(base_url) else {
         return false;
     };
-    let host = host.to_ascii_lowercase();
     if matches!(host.as_str(), "localhost" | "localhost.localdomain") {
         return true;
     }
-    // IPv6 literals arrive bracketed (`[::1]`); strip the brackets.
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    match bare.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback() || v4.is_unspecified(),
-        Ok(std::net::IpAddr::V6(v6)) => v6.is_loopback() || v6.is_unspecified(),
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => v4.is_loopback() || v4.is_unspecified(),
+        Ok(IpAddr::V6(v6)) => v6.is_loopback() || v6.is_unspecified(),
         Err(_) => false,
     }
 }
 
-/// Extract the host from a `scheme://[user@]host[:port][/path]` base URL.
-/// Returns `None` when no authority can be found.
-fn host_of(base_url: &str) -> Option<String> {
-    let after_scheme = base_url
-        .split_once("://")
-        .map_or(base_url, |(_, rest)| rest);
-    // #3744 (A4) — ONE userinfo-stripping helper shared with the subscriptions
-    // SSRF lane, so egress and the webhook guard read the identical host.
-    let host_port = crate::subscriptions::authority_without_userinfo(after_scheme);
-    if host_port.is_empty() {
+/// #4018 — the ONE parse admission and the HTTP client agree on: reqwest's
+/// own `Url` parser (the request is built from the same parse by
+/// [`crate::llm::join_api_path`], #3742). Before #4018 the gate read the host
+/// with a hand-rolled authority parser that bounded the authority at the
+/// first `/`, `?` or `#` and took the text after the LAST `@`; the WHATWG
+/// parser also ends a special scheme's authority at a BACKSLASH, so
+/// `https://evil.example\@127.0.0.1/v1` was admitted as loopback while the
+/// client connected to `evil.example`.
+///
+/// `None` when the client could never send to `url`: it does not parse, its
+/// scheme is not `http` / `https` (reqwest refuses every other scheme), or it
+/// has no host. The gate then fails closed — there is no host to agree on.
+fn parse_target(url: &str) -> Option<reqwest::Url> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
         return None;
     }
-    // Strip the port. IPv6 literals are bracketed, so a `]` guards the
-    // port split from eating a `:` inside the address.
-    let host = if let Some(end) = host_port.find(']') {
-        &host_port[..=end]
-    } else {
-        host_port.split(':').next().unwrap_or(host_port)
-    };
-    if host.is_empty() {
-        None
-    } else {
-        Some(host.to_string())
-    }
+    parsed.host_str()?;
+    Some(parsed)
+}
+
+/// The bracket-stripped, lowercased host of a parsed target — the form
+/// reqwest's `resolve_to_addrs` keys on and `ToSocketAddrs` resolves.
+fn bare_host(parsed: &reqwest::Url) -> Option<String> {
+    let host = parsed.host_str()?;
+    Some(
+        host.trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase(),
+    )
+}
+
+/// #4018 — the host reqwest connects to for `url`, or `None` when the client
+/// could never send to it (see [`parse_target`]). Every admission decision
+/// in this module reads its host through here.
+#[must_use]
+pub fn admitted_host(url: &str) -> Option<String> {
+    bare_host(&parse_target(url)?)
 }
 
 /// The pure inference-plane egress gate. Given the resolved posture, the
@@ -393,9 +405,7 @@ pub fn evaluate_inference_egress(
 /// `None` for a DNS name. Used by the name-based [`evaluate_inference_egress`]
 /// `InternalOnly` arm (an IP-literal target classifies without DNS).
 fn host_ip_literal(base_url: &str) -> Option<IpAddr> {
-    let host = host_of(base_url)?;
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    bare.parse::<IpAddr>().ok()
+    admitted_host(base_url)?.parse::<IpAddr>().ok()
 }
 
 /// #3822 — an address is INTERNAL iff, after `normalize_ip`, it is loopback /
@@ -485,38 +495,26 @@ pub struct PinnedTarget {
 /// resolves without DNS; a hostname uses the system resolver. Failure / empty
 /// set is an `Err` (fail CLOSED — `AI_MEMORY_SSRF_GUARD_ALLOW_DNS_FAIL` does
 /// NOT apply on this lane). Returns `(resolved_host, addrs)`.
+///
+/// #4018 — the host and the port come from the SAME `reqwest::Url` parse the
+/// client sends with ([`parse_target`]): the resolve key is the host reqwest
+/// will look up, and the port is the explicit one or the scheme default
+/// (`port_or_known_default`, #4075: 443 for https — the port the pinned
+/// connector keeps).
 fn resolve_inference_authority(url: &str) -> Result<(String, Vec<SocketAddr>), String> {
-    let lower = url.to_ascii_lowercase();
-    let (scheme, rest) = lower
-        .split_once("://")
-        .map_or(("", lower.as_str()), |(s, r)| (s, r));
-    let host_port = crate::subscriptions::authority_without_userinfo(rest);
-    if host_port.is_empty() {
-        return Err("target URL has no authority to resolve".to_string());
-    }
-    // Bracket/port-stripped host (the reqwest resolve key), and a resolvable
-    // `host:port` (the SCHEME's default port when the URL omits one — #4075:
-    // 443 for https, the port the pinned connector keeps), mirroring the
-    // subscriptions SSRF lane's normalization.
-    let (resolved_host, resolv_target) =
-        if let Some(close) = host_port.strip_prefix('[').and(host_port.find(']')) {
-            let inner = host_port[1..close].to_string();
-            let after = &host_port[close + 1..];
-            let tgt = if after.starts_with(':') {
-                host_port.to_string()
-            } else {
-                crate::subscriptions::dns_guard::host_port_with_default_port(host_port, scheme)
-            };
-            (inner, tgt)
-        } else if let Some(idx) = host_port.rfind(':') {
-            (host_port[..idx].to_string(), host_port.to_string())
-        } else {
-            (
-                host_port.to_string(),
-                crate::subscriptions::dns_guard::host_port_with_default_port(host_port, scheme),
-            )
-        };
-    match resolv_target.to_socket_addrs() {
+    let Some(parsed) = parse_target(url) else {
+        return Err(
+            "target URL is not an http(s) URL with a host, so the client could never send \
+             to it (internal-only fails closed)"
+                .to_string(),
+        );
+    };
+    let resolved_host =
+        bare_host(&parsed).ok_or_else(|| "target URL has no authority to resolve".to_string())?;
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "target URL has no port and no scheme default".to_string())?;
+    match (resolved_host.as_str(), port).to_socket_addrs() {
         Ok(iter) => {
             let addrs: Vec<SocketAddr> = iter.collect();
             if addrs.is_empty() {
@@ -879,7 +877,9 @@ mod tests {
         assert!(target_is_loopback("http://127.0.0.1:11434/api/embed"));
         assert!(target_is_loopback("http://[::1]:11434"));
         assert!(target_is_loopback("http://0.0.0.0:8080"));
-        assert!(target_is_loopback("localhost:11434")); // scheme-less
+        // #4018 — scheme-less: reqwest can never send to it (no http(s)
+        // host to agree on), so the gate fails closed instead of admitting.
+        assert!(!target_is_loopback("localhost:11434"));
         // External vendors are NOT loopback.
         assert!(!target_is_loopback("https://api.openai.com/v1"));
         assert!(!target_is_loopback("https://openrouter.ai/api/v1"));
