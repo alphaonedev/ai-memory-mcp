@@ -38,11 +38,12 @@ certification and triggers re-cert** (see §7).
 > run after code freeze. Re-binding to a newer SHA without that re-measurement is
 > forbidden (#3899).
 >
-> **Amendment (2026-10-10, #6162 - section 7 record for the ports of #4208 and #4314, non-discharging; re-issue tracked in #6413).**
+> **Amendment (2026-10-10, #6162).**
 > Two section 7 watched federation-wire files changed after the 2026-10-07 expiry record:
 > - `src/handlers/federation_receive.rs`
 > - `src/handlers/federation_signing_check.rs`
 > Receive behaviour changed in this record, unlike the doc-comment only record above it.
+> This is the section 7 record for the ports of issues 4208 and 4314, and it is non-discharging; re-issue is tracked in issue 6413.
 > The stale-push quarantine release path now frees a quarantined row on dequarantine-on-attest
 > only when the persisted row itself carries the verified signed surface (same content, same
 > signing author), and on SQLite that release joins a caller-held transaction instead of nesting
