@@ -157,6 +157,7 @@ import ast
 import contextlib
 import errno
 import io
+import itertools
 import os
 import re
 import shutil
@@ -3508,6 +3509,7 @@ def _log_safe_cells(t):
     _log_safe_table_cell(t)
     _log_safe_di_cell(t)
     _log_safe_unknown_cells(t)
+    _log_safe_backslash_cells(t)
 
 
 # Every Cf code point of Unicode 15.0 as the cell's own oracle for LOG_CF_RANGES (#6683); the nine code
@@ -3582,6 +3584,35 @@ def _log_safe_unknown_cells(t):
                 t.fail(f"({label}): log_safe printed U+{code:04X} as {got!r}, not {'a' + want + 'b'!r}")
 
 
+def _log_unsafe(text):
+    """The inverse of log_safe(), for the round-trip cell."""
+    def one(match):
+        body = match.group(1)
+        return "\\" if body == "\\" else chr(int(body[1:], 16))
+    return re.sub(r"\\(\\|x[0-9a-f]{2}|u[0-9a-f]{4}|U[0-9a-f]{8})", one, text)
+
+
+def _log_safe_backslash_cells(t):
+    """#6921: log_safe() prints a backslash as two, which keeps the escape
+    form one-to-one: a name holding a real control or format character and a
+    name holding the text of its escape print differently, and log_safe's
+    output decodes back to the name. Cells `log-safe-backslash` and
+    `log-safe-roundtrip`."""
+    if log_safe("\\") != "\\\\":
+        t.fail(f"(log-safe-backslash): log_safe printed one backslash as {log_safe(chr(92))!r}, not two")
+    for real, text in (("x\u202ey", "x\\u202ey"), ("a\nb", "a\\x0ab"), ("a\U000e0001b", "a\\U000e0001b")):
+        if log_safe(real) == log_safe(text):
+            t.fail(f"(log-safe-backslash): a name with a real character and one with the text of its escape both "
+                   f"print as {log_safe(real)!r}")
+    alphabet = ("\\", "u", "x", "0", "a", "\n", "\u202e", "\u00ad", "\U000e0001")
+    corpus = ["", "\\", "\\u202e", "\\\\u202e", "\\\u202e", "plain"]
+    corpus += ["".join(p) for n in (1, 2, 3) for p in itertools.product(alphabet, repeat=n)]
+    for text in corpus:
+        if _log_unsafe(log_safe(text)) != text:
+            t.fail(f"(log-safe-roundtrip): log_safe({text!r}) = {log_safe(text)!r} does not decode back to the name")
+            break
+
+
 def _round7_shapes(shapes, pr, wf_rel):
     """#6683 shapes: an approval trailer value and a workflow file name that
     carry a bidi override (U+202E)."""
@@ -3615,6 +3646,7 @@ SUMMARY_CELL_SOURCES = (
     ("_log_safe_table_cell", ""),
     ("_log_safe_di_cell", ""),
     ("_log_safe_unknown_cells", ""),
+    ("_log_safe_backslash_cells", ""),
     ("_trusted_round7_cells", ""),
     ("_summary_cells", ""),
 )
@@ -4154,7 +4186,10 @@ SELF_TEST_OK = (
     "the default-ignorable code points that are not format characters (Hangul fillers, the grapheme "
     "joiner, variation selectors, unassigned default-ignorables) and U+2800 escaped too (log-safe-di-U+XXXX); "
     "(tr round 8, #6918) unassigned, private-use and lone-surrogate code points escaped, failing closed on a "
-    "code point the interpreter cannot classify (log-safe-cn, log-safe-co, log-safe-cs)."
+    "code point the interpreter cannot classify (log-safe-cn, log-safe-co, log-safe-cs); (tr round 8, #6921) "
+    "a backslash printed doubled, so the escape form is one-to-one: a real control or format character and "
+    "the text of its escape print differently and log_safe's output decodes back to the name "
+    "(log-safe-backslash, log-safe-roundtrip)."
 )
 
 
