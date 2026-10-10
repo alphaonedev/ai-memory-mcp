@@ -166,3 +166,38 @@ def test_entry_vanishing_at_the_relstat_is_refused_not_matched_6959(
     _walk_two(monkeypatch, before=lambda: None, after=lambda: _lstat_of(monkeypatch, ca, vanished))
     with pytest.raises(ValueError, match="#6828"):
         _load(ca)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_entry_symlink_retargeted_after_the_open_is_refused_6959(
+    monkeypatch: pytest.MonkeyPatch, lab: Lab, tmp_path: pathlib.Path, client_cls: type
+) -> None:
+    """Kills M12, the mutant whose second walk follows the resolved path, not ``entry``.
+
+    ``entry`` is a hashed directory entry, a symlink to ``a.pem`` (the shape
+    ``c_rehash`` writes). Right after ``a.pem`` is opened, the symlink is
+    retargeted to ``b.pem``. The walk made after the open must end
+    at the inode the descriptor holds (#6828), so the load is refused. A walk
+    of the already-resolved ``a.pem`` still ends at that inode and admits it.
+    """
+    directory = _ca_dir(tmp_path, "retarget")
+    first = _bundle(lab, directory, "a.pem")
+    second = _bundle(lab, directory, "b.pem")
+    link = directory / "1a2b3c4d.0"
+    link.symlink_to(first)
+    real_open = os.open
+    retargeted: list[str] = []
+
+    def open_then_retarget(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if os.fspath(path) == str(first.resolve()) and not retargeted:
+            retargeted.append(os.fspath(path))
+            link.unlink()
+            link.symlink_to(second)
+        return descriptor
+
+    monkeypatch.setattr(os, "open", open_then_retarget)
+    with pytest.raises(ValueError, match="#6828"):
+        _built(client_cls, str(directory))
+    assert retargeted, "the symlink must have been retargeted for the walk to matter"
