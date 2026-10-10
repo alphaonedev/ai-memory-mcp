@@ -3038,6 +3038,7 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     _trusted_round4_cells(judge, shapes)
     _trusted_round5_cells(judge, shapes)
     _trusted_round3_fetch_cells(tmp, t, fx, mirror, head8, good8)
+    _shim_trace_cells(t)
 
 
 CERT_CONTEXT_FIXTURE = "Enterprise-federation cert-expiry gate (cert §7 / F7)"
@@ -3601,6 +3602,38 @@ def _trusted_round3_fetch_cells(tmp, t, fx, mirror, head8, good8):
             globals().pop("_sleep", None)
         else:
             globals()["_sleep"] = real_sleep
+
+
+# The functions of this file that format GIT_SHIM for a trusted-mode cell (#6550).
+TRACE_SHIM_SITES = ("_trusted_round3_fetch_cells", "trusted_cli_shimmed")
+
+
+def _shim_trace_cells(t):
+    """#6550: a sibling change adds a `trace` field to GIT_SHIM, and a template
+    field with no value raises KeyError at format time. Every trusted-mode
+    site that fills GIT_SHIM names `trace=` so the template keeps formatting
+    whichever side lands first (cell `shim-trace`)."""
+    import ast
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    seen = 0
+    for func in ast.walk(tree):
+        if not isinstance(func, ast.FunctionDef) or func.name not in TRACE_SHIM_SITES:
+            continue
+        for call in ast.walk(func):
+            if not isinstance(call, ast.Call):
+                continue
+            fn = call.func
+            formats = (isinstance(fn, ast.Attribute) and fn.attr == "format"
+                       and isinstance(fn.value, ast.Name) and fn.value.id == "GIT_SHIM")
+            wraps = (isinstance(fn, ast.Name) and fn.id == "_git_shim" and len(call.args) > 1
+                     and isinstance(call.args[1], ast.Name) and call.args[1].id == "GIT_SHIM")
+            if not (formats or wraps):
+                continue
+            seen += 1
+            if "trace" not in {kw.arg for kw in call.keywords}:
+                t.fail(f"(shim-trace): {func.name} line {call.lineno} fills GIT_SHIM without trace=")
+    if seen != 3:
+        t.fail(f"(shim-trace): expected 3 GIT_SHIM sites in {TRACE_SHIM_SITES}, found {seen}")
 
 
 def trusted_cli_shimmed(tmp, repo, fail, shape):
