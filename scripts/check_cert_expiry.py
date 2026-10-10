@@ -130,7 +130,9 @@ macro, any `name! {..}`), an open block comment or string literal, a
 (return / break / continue, `let _ = return ..`, todo! / unimplemented! /
 unreachable! / panic! under any path, any `..exit(..)` / `..abort(..)`,
 assert!(false), a bare / unsafe / `if true` block that exits, a loop with no
-break), and the same attributes on the `mod NAME;` declarations that reach the
+break; any of these in expression position too, such as `_ = return;`,
+`drop(return);` or a first call argument, unless a closure, `=>` or a
+short-circuit `&&` / `||` comes first in its group, #6842), and the same attributes on the `mod NAME;` declarations that reach the
 file, keyed by their inline-mod path (a file no declaration reaches is a
 finding too). The comparison is RELATIVE: a finding on a line the base also
 carried, absent from the base's context for that line, is drift and RED; a
@@ -448,11 +450,16 @@ _LOOP_HEADER_RE = re.compile(r"(?:^|[ :])loop$|\bwhile (?:true|! false)$")
 # Any loop an unlabelled `break` can leave (loop, while, for).
 _BREAK_TARGET_RE = re.compile(r"(?:^|: |= )(?:loop|while|for)\b")
 _PATH = r"(?::: )?(?:(?:r\#)?[^\W\d]\w* :: )*"
+# Diverging macros and calls (also matched anywhere in a statement, #6842).
+_EXIT_MACROS = ("todo", "unimplemented", "unreachable", "panic")
+_EXIT_CALLS = ("exit", "abort")
 _EXIT_RE = re.compile(
     r"^(?:let\b[^=]*= )?(?:return\b|break\b|continue\b|"
-    + _PATH + r"(?:r\#)?(?:todo|unimplemented|unreachable|panic) !|"
-    + _PATH + r"(?:r\#)?(?:exit|abort) \(|"
+    + _PATH + r"(?:r\#)?(?:" + "|".join(_EXIT_MACROS) + r") !|"
+    + _PATH + r"(?:r\#)?(?:" + "|".join(_EXIT_CALLS) + r") \(|"
     + _PATH + r"assert ! \( false \))")
+_DIV_WORDS = frozenset({"return", "break", "continue"})
+_VALUE_WORDS = frozenset({"true", "false", "self", "Self"})
 _MOD_DECL_RE = re.compile(r"^(?:pub(?: \( [^()]* \))? )?mod (?:r\#)?([^\W\d]\w*)$")
 _PROPAGATE_RE = re.compile(r"^(?:unsafe|if (?:true|! false))?$")
 _HEADER_RULES = (
@@ -529,6 +536,45 @@ def _attr_rebinds(toks):
     return out
 
 
+def _value_like(tok):
+    """True when `tok` can end an operand (so a following `|` or `&&` is binary)."""
+    kind, v = tok
+    if kind in ("num", "str", "char"):
+        return True
+    if kind == "ident":
+        return v in _VALUE_WORDS or v not in _KEYWORDS
+    return v in (")", "]", "?")
+
+
+def _diverges(vals):
+    """The first return, break, continue, exit macro or exit call that a
+    statement always evaluates, wherever it sits in the statement (#6842), else
+    "". `vals` is the flattened statement, nested ( ) and [ ] groups included;
+    `=>`, a closure opener and a short-circuit `&&` / `||` make the rest of
+    their group conditional. A "div" token stands for a diverging argument
+    found before a comma reset (see the `,` and close handling in _scan_rust)."""
+    blocked, prev, n = [False], ("", ""), len(vals)
+    for k, (kind, v) in enumerate(vals):
+        nxt = vals[k + 1][1] if k + 1 < n else ""
+        if kind == "punct":
+            if v in ("(", "["):
+                blocked.append(blocked[-1])
+            elif v in (")", "]"):
+                if len(blocked) > 1:
+                    blocked.pop()
+            elif v == "=>" or (v == "|" and (not _value_like(prev) or nxt == "|")) \
+                    or (v == "&" and nxt == "&" and _value_like(prev)):
+                blocked[-1] = True
+        elif not blocked[-1] and prev[1] not in (".", "fn"):
+            name = v[2:] if v.startswith("r#") else v
+            if kind == "div" or (kind == "ident" and (
+                    v in _DIV_WORDS or (name in _EXIT_MACROS and nxt == "!")
+                    or (name in _EXIT_CALLS and nxt == "("))):
+                return v
+        prev = (kind, v)
+    return ""
+
+
 def _norm(vals):
     """Header text for the rules: tokens joined by one space, parentheses
     dropped and `! !` pairs cancelled (#6707)."""
@@ -572,7 +618,7 @@ def _header_findings(norm, vals):
 
 class _Frame:
     __slots__ = ("kind", "norm", "attrs", "cum", "exit", "has_break", "is_loop", "stops_break",
-                 "mod", "scrut", "cur", "line", "pend", "pend_found", "rebound")
+                 "mod", "scrut", "cur", "line", "pend", "pend_found", "rebound", "div")
 
     def __init__(self, kind, toks, attrs, parent, line):
         vals = [v for _, v in toks]
@@ -580,6 +626,7 @@ class _Frame:
         self.norm = _norm(vals)
         self.attrs = list(attrs)
         self.exit = ""
+        self.div = ""  # a diverging argument before a comma of this ( or [ group (#6842)
         self.has_break = False
         self.is_loop = kind == "{" and bool(_LOOP_HEADER_RE.search(self.norm))
         self.stops_break = kind == "{" and bool(_BREAK_TARGET_RE.search(self.norm))
@@ -872,7 +919,7 @@ def _scan_rust(path, text, offsets):
             parent = stack[-1]
             if val == "}":
                 tail = " ".join(v for _, v in done.cur)
-                if done.cur and _EXIT_RE.match(tail):
+                if done.cur and (_EXIT_RE.match(tail) or _diverges(done.cur)):
                     done.exit = done.exit or tail[:48]
                 if done.exit and _PROPAGATE_RE.match(done.norm):
                     parent.exit = parent.exit or done.exit
@@ -881,7 +928,11 @@ def _scan_rust(path, text, offsets):
                 last_closed = done.norm
                 parent.reset()
             else:
+                # an earlier argument's exit, or one in a group cut to `..`
+                div = done.div or (_diverges(done.cur) if len(done.cur) > 64 else "")
                 inside = done.cur if len(done.cur) <= 64 else [("punct", "..")]
+                if div:
+                    inside = [("div", div)] + inside
                 parent.cur.append(("punct", done.kind))
                 parent.cur.extend(inside)
                 parent.cur.append(("punct", val))
@@ -889,7 +940,7 @@ def _scan_rust(path, text, offsets):
             continue
         if val == ";" and kind == "punct" and top.kind in ("root", "{"):
             stmt = " ".join(v for _, v in top.cur)
-            if _EXIT_RE.match(stmt):
+            if _EXIT_RE.match(stmt) or _diverges(top.cur):
                 top.exit = top.exit or stmt[:48]
             md = _MOD_DECL_RE.match(stmt)
             if md and all(fr.mod for fr in stack[1:]):
@@ -899,6 +950,8 @@ def _scan_rust(path, text, offsets):
             i += 1
             continue
         if val == "," and kind == "punct":
+            if top.kind in ("(", "[") and not top.div:
+                top.div = _diverges(top.cur)
             top.reset()
             i += 1
             continue
