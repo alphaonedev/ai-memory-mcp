@@ -926,7 +926,18 @@ R11_CELLS = (
 )
 
 
-def r11_cells(base, cells, expect):
+# Round 12: one table, cells named for the issue they pin.
+R12_CELLS = (
+    # #6622: an image (``!``) or inline math (``$``, ``{``, ``}``) between the pieces of a name.
+    ("M-image-adjacent", "Run check-![](x)old.sh daily.\n", "", 1, "fragment `check-` is followed by '!'"),
+    ("M-image-inside", "Run che![ck-old.sh](x) daily.\n", "", 1, "fragment `che` is followed by '!'"),
+    ("M-math-text", "Run $\\text{check-old}$.sh daily.\n", "", 1, "fragment `check-old` is followed by '}'"),
+    ("M-math-wrap", "Run $check$-old.sh daily.\n", "", 1, "fragment `check` is followed by '$'"),
+    ("M-math-brace", "Run $check{-old}.sh$ daily.\n", "", 1, "fragment `check` is followed by '{'"),
+)
+
+
+def r11_cells(base, cells, expect, tag="R11"):
     """Run each cell in a fresh tree under ``base``; every red cell must exit as expected with no traceback."""
     for index, (name, docs, allow, want, needle) in enumerate(cells):
         r = base / ("c%03d" % index)
@@ -941,8 +952,8 @@ def r11_cells(base, cells, expect):
         rc, err = run_main(r)
         expect(
             rc == want and (needle is None or needle in err) and "Traceback" not in err,
-            "R11-%s: expected exit %d%s, got %r (stderr=%r)"
-            % (name, want, "" if needle is None else " naming %r" % needle, rc, err[-300:]),
+            "%s-%s: expected exit %d%s, got %r (stderr=%r)"
+            % (tag, name, want, "" if needle is None else " naming %r" % needle, rc, err[-300:]),
         )
 
 
@@ -1137,6 +1148,9 @@ def self_test():
         cells = root / "r11"
         cells.mkdir()
         r11_cells(cells, R11_CELLS, expect)
+        cells12 = root / "r12"
+        cells12.mkdir()
+        r11_cells(cells12, R12_CELLS, expect, "R12")
         # Every cell the round-10 evidence found fail-open (any tip or base) is red (design B, item 7).
         fixtures = root / "r11-fixtures"
         fixtures.mkdir()
