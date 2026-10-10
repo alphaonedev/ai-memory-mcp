@@ -39,7 +39,16 @@ const MARKERS: [&str; 3] = ["protocolVersion", "Protocol version", "speaks MCP"]
 ///   `.codegraph`: local symbol index; `.cloud-review`: review sandbox output.
 /// - `vendor`: the vendored upstream `paste` crate; a hit there could not be
 ///   fixed in-tree, and it carries no MCP code.
-const EXCLUDED_DIRS: [&str; 7] = [
+/// - Gitignored local artefacts a developer or agent machine can hold but a
+///   clean checkout never has (round 3, #6157 F2): `dist` and `build` (tsc and
+///   packaging output, e.g. `clients/*-shim-ts/dist`), `.venv` and `venv`
+///   (Python virtualenvs whose `site-packages` ship other SDKs' revision
+///   strings), `__pycache__`, `.mypy_cache`, `.pytest_cache`, `.ruff_cache`
+///   (tool caches) and `worktrees` (sibling Claude Code worktrees under the
+///   ignored `.claude/worktrees`, which can sit at an older base). `.claude`
+///   itself is NOT excluded: `.claude/settings.json` is tracked. No tracked
+///   directory carries any of these names (`git ls-files` check in the PR).
+const EXCLUDED_DIRS: [&str; 16] = [
     ".git",
     "target",
     "node_modules",
@@ -47,6 +56,15 @@ const EXCLUDED_DIRS: [&str; 7] = [
     ".codegraph",
     ".cloud-review",
     "vendor",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "worktrees",
 ];
 const EXTENSIONS: [&str; 14] = [
     "rs", "md", "html", "sh", "py", "json", "ts", "tsx", "mjs", "cjs", "js", "toml", "yml", "yaml",
