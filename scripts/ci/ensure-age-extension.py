@@ -30,21 +30,47 @@ Behaviour:
 
 The tier URL is read from a file.  Its password is passed to psql through the
 ``PGPASSWORD`` environment variable and removed from the URL psql receives, so
-it never appears on a process argv.  Because urllib and libpq split a URL
-differently, the URL is refused (exit 2) when the two could disagree: it holds a
-TAB, CR, LF or NUL (urlsplit drops the first three, subprocess refuses NUL), a
-``#`` (libpq has no fragment and reads keys after it), more than one ``@`` in
-the host part or an ``@`` after it, or a query segment without exactly one
-``=``.  An empty host part (``postgres:///db``) is refused too; a socket
-directory given as ``?host=%2F...`` or as a percent-encoded host is accepted.
-The query is percent-decoded only, as libpq does (``+`` stays a plus), and the
-kept segments are passed on exactly as written.  Every query key other than
-``password`` must be on ``ALLOWED_QUERY_KEYS``, a case-sensitive allowlist of
-non-secret libpq parameters, so ``sslpassword``, ``oauth_client_secret``,
-``scram_client_key``, ``scram_server_key`` (no environment variable) and any
-other key are refused.  A refusal names a key only when it is a known libpq
+the password never appears on a process argv.  ONLY the password is moved off
+argv: path- and name-valued keys that are allowed (``sslrootcert``, ``sslcert``,
+``sslkey``, ``sslcrl``, ``sslcrldir``, ``passfile``, ``service``, ``krbsrvname``,
+``requirepeer``) stay in the URL on psql's argv, as do host, user and database.
+
+Because urllib and libpq split a URL differently, the URL is refused (exit 2,
+one stderr line, no value printed) when any of these hold: it does not start
+with the exact lowercase ``postgres://`` or ``postgresql://``; it holds a
+control character (TAB, CR, LF, NUL), a raw space, a ``#`` (libpq has no
+fragment), or a ``%`` not followed by two hex digits; it holds ``%00`` anywhere;
+the host part has more than one ``@`` or an ``@`` after it, or is empty
+(``postgres:///db``); the query has an empty segment (``a=1&&b=2``; a single
+trailing ``&`` is accepted), a segment without exactly one ``=``, or a key not
+on ``ALLOWED_QUERY_KEYS``.  These are the checks libpq itself makes
+(``conninfo_uri_decode``, ``conninfo_uri_parse_params``) plus fail-closed
+refusals where libpq would accept something urlsplit reads differently.  The
+helper is stricter than libpq in those cases only; a URL the helper accepts is
+read the same way by libpq (the parity oracle in the tests pins this).
+
+Decoding is percent-decoding only: ``%XX`` becomes one raw byte (``%FF``
+reaches PGPASSWORD as byte 0xFF, not U+FFFD) and ``+`` stays a literal plus, as
+in libpq.  A socket directory given as ``?host=%2F...`` or as a percent-encoded
+host works, including with a userinfo password and an empty host
+(``postgres://:pw@/db?host=%2Fdir``).  The rewritten URL psql receives drops
+the password and keeps every other segment as written.
+
+``ALLOWED_QUERY_KEYS`` is a case-sensitive allowlist that is a SUBSET of libpq's
+non-secret parameters.  The remaining keys are refused by name when they are
+known libpq keywords: secrets (``sslpassword``, ``oauth_client_secret``,
+``scram_client_key``, ``scram_server_key``, which libpq cannot take from the
+environment) and keys that change the authentication mechanism or session mode
+(``gsslib``, ``gssdelegation``, ``replication``, ``oauth_issuer``,
+``oauth_client_id``, ``oauth_scope``).  ``ssl=true`` is a JDBC alias libpq does
+not know; use ``sslmode``.  A refusal names a key only when it is a known libpq
 keyword (an unlisted key can be the tail of a password that held a raw ``&``),
 never a value, and neither form of the URL is printed.
+
+psql runs with ``PGCONNECT_TIMEOUT=15`` (a ``connect_timeout`` in the URL
+overrides it) and a 60 second overall limit.  SIGTERM and SIGINT stop the psql
+child, print ``ensure-age-extension: interrupted`` and exit 1, so no orphan
+keeps PGPASSWORD in its environment.
 
 Exit codes: 0 healthy, 1 still unhealthy / probe or install failed,
 2 bad input (URL file, pg_config, source validation).
@@ -55,11 +81,13 @@ import errno
 import hashlib
 import os
 from pathlib import Path
+import re
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit
 
 EXIT_OK = 0
 EXIT_UNAVAILABLE = 1
@@ -69,6 +97,8 @@ DEFAULT_URL_FILE = Path.home() / ".ai-memory-ci-fed-url"
 DEFAULT_AGE_DIR = Path.home() / "pg-age-stack" / "age-1.8.0"
 DEFAULT_PG_CONFIG = "/opt/homebrew/opt/postgresql@18/bin/pg_config"
 DEFAULT_PSQL = "/opt/homebrew/opt/postgresql@18/bin/psql"
+PROBE_TIMEOUT_SECONDS = 60
+CONNECT_TIMEOUT_SECONDS = "15"  # PGCONNECT_TIMEOUT for psql; a connect_timeout in the URL overrides it
 PROBE_SQL = "SELECT count(*) FROM pg_available_extensions WHERE name = 'age'"
 URL_SCHEMES = ("postgres", "postgresql")
 # Non-secret libpq connection parameters accepted as tier URL query keys,
@@ -82,12 +112,17 @@ ALLOWED_QUERY_KEYS = frozenset((
     "target_session_attrs", "client_encoding", "keepalives", "keepalives_idle",
     "keepalives_interval", "keepalives_count", "tcp_user_timeout", "channel_binding",
     "gssencmode", "krbsrvname", "service", "passfile", "requirepeer", "load_balance_hosts",
+    "fallback_application_name", "sslnegotiation", "sslcompression", "sslcertmode", "sslcrldir",
+    "min_protocol_version", "max_protocol_version", "ssl_min_protocol_version", "ssl_max_protocol_version",
 ))
-# Keywords that are refused but safe to name in a message: known libpq keys that
-# are secret or alter authentication.  Any other refused key stays unnamed.
+# Keywords that are refused but safe to name in a message: known libpq keys (and the
+# ``ssl`` JDBC alias) that are secret or change the authentication mechanism or the
+# session mode.  Every libpq 18 keyword is in this set or on ALLOWED_QUERY_KEYS;
+# any other refused key stays unnamed.
 REFUSED_KNOWN_KEYS = frozenset((
     "password", "sslpassword", "oauth_client_secret", "scram_client_key", "scram_server_key",
-    "sslkeylogfile", "require_auth",
+    "sslkeylogfile", "require_auth", "gsslib", "gssdelegation", "replication", "oauth_issuer",
+    "oauth_client_id", "oauth_scope", "ssl",
 ))
 KNOWN_KEY_NAMES = ALLOWED_QUERY_KEYS | REFUSED_KNOWN_KEYS
 TEMP_SUFFIX = ".age-restore"
@@ -133,6 +168,15 @@ def psql_target(url):
         raise HelperError("tier URL file holds a TAB, line break or NUL; the URL must be one line", EXIT_BAD_INPUT)
     if "#" in url:
         raise HelperError("tier URL file holds a '#'; libpq reads past it, so it is refused", EXIT_BAD_INPUT)
+    if not url.startswith(tuple(f"{scheme}://" for scheme in URL_SCHEMES)):
+        # libpq matches the scheme case-sensitively; urlsplit would lower-case it.
+        raise HelperError("tier URL file does not hold a postgres:// URL", EXIT_BAD_INPUT)
+    if " " in url:
+        raise HelperError("tier URL file holds a space; libpq refuses it, use %20", EXIT_BAD_INPUT)
+    if re.search(r"%(?![0-9A-Fa-f]{2})", url):
+        raise HelperError("tier URL file holds an invalid percent-encoded token; libpq refuses it", EXIT_BAD_INPUT)
+    if "%00" in url:
+        raise HelperError("tier URL file holds a %00; libpq refuses a percent-encoded NUL", EXIT_BAD_INPUT)
     try:
         parts = urlsplit(url)
     except ValueError:
@@ -155,11 +199,15 @@ def psql_target(url):
         userinfo, hostport = netloc.rsplit("@", 1)
         if ":" in userinfo:
             user, raw_password = userinfo.split(":", 1)
-            password = unquote(raw_password)
+            password = unquote(raw_password, errors="surrogateescape")
             userinfo = user
         netloc = f"{userinfo}@{hostport}" if userinfo else hostport
-    segments = parts.query.split("&")
-    if any(seg and "=" not in seg for seg in segments):
+    # libpq accepts one trailing '&' and refuses every other empty segment.
+    body = parts.query[:-1] if parts.query.endswith("&") else parts.query
+    segments = body.split("&") if parts.query else []
+    if any(not seg for seg in segments):
+        raise HelperError("tier URL file has an empty query segment; libpq refuses it", EXIT_BAD_INPUT)
+    if any("=" not in seg for seg in segments):
         # A bare segment is a value, not a key, so it is refused without being named.
         raise HelperError("tier URL file has a query parameter without '='", EXIT_BAD_INPUT)
     if any(seg.count("=") > 1 for seg in segments):
@@ -168,15 +216,13 @@ def psql_target(url):
     kept = []
     removed = False
     for seg in segments:
-        if not seg:
-            continue
-        # libpq percent-decodes only: '+' is a plus, not a space (#6221).
+        # libpq percent-decodes only: '+' is a plus, not a space (#6221), and %XX is one raw byte.
         raw_key, raw_value = seg.split("=", 1)
-        key = unquote(raw_key)
+        key = unquote(raw_key, errors="surrogateescape")
         if key.lower() == "sslpassword":
             raise HelperError("tier URL file carries sslpassword; use a key without a passphrase", EXIT_BAD_INPUT)
         if key == "password":
-            password = unquote(raw_value)
+            password = unquote(raw_value, errors="surrogateescape")
             removed = True
         elif key in ALLOWED_QUERY_KEYS:
             kept.append(seg)
@@ -191,8 +237,20 @@ def psql_target(url):
                               "non-secret libpq parameters", EXIT_BAD_INPUT)
     if password is not None and "\x00" in password:
         raise HelperError("tier URL file password decodes to a NUL; it cannot be passed to psql", EXIT_BAD_INPUT)
+    if password is None:
+        return url, None  # nothing moved to the environment: psql gets the URL as written
     query = "&".join(kept) if removed else parts.query
-    return urlunsplit((parts.scheme, netloc, parts.path, query, "")), password
+    # Concatenate: urlunsplit drops '//' when the netloc is empty (':pw@' with a host in the query).
+    return f"{parts.scheme}://{netloc}{parts.path}" + (f"?{query}" if query else ""), password
+
+
+def stop_child(proc):
+    """Kill and reap a psql child; it holds PGPASSWORD in its environment."""
+    try:
+        proc.kill()
+        proc.communicate()
+    except OSError:
+        pass  # already gone
 
 
 def probe_lists_age(psql, url):
@@ -201,20 +259,29 @@ def probe_lists_age(psql, url):
     env = dict(os.environ)
     if password is not None:
         env["PGPASSWORD"] = password
+    env["PGCONNECT_TIMEOUT"] = CONNECT_TIMEOUT_SECONDS  # a connect_timeout in the URL overrides it
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [psql, target, "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", PROBE_SQL],
-            capture_output=True, text=True, errors="replace", check=False, timeout=60, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", env=env,
         )
     except ValueError as exc:
         # subprocess refuses a NUL in argv or env before spawning anything.
         raise HelperError(f"age probe refused its psql arguments ({type(exc).__name__})", EXIT_BAD_INPUT)
     except (OSError, subprocess.SubprocessError) as exc:
         raise HelperError(f"age probe could not run psql ({type(exc).__name__})", EXIT_UNAVAILABLE)
+    try:
+        stdout, _ = proc.communicate(timeout=PROBE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        stop_child(proc)
+        raise HelperError("age probe could not run psql (TimeoutExpired)", EXIT_UNAVAILABLE)
+    except BaseException:
+        stop_child(proc)  # SIGTERM/SIGINT: never leave psql (and its PGPASSWORD) behind
+        raise
     if proc.returncode != 0:
         # psql stderr is deliberately not echoed (it can carry connection detail).
         raise HelperError(f"age probe failed: psql exited {proc.returncode}", EXIT_UNAVAILABLE)
-    return proc.stdout.strip() == "1"
+    return stdout.strip() == "1"
 
 
 def pg_config_value(pg_config, flag):
@@ -392,12 +459,25 @@ def run(args):
     print(f"age extension restored from {args.age_dir} and available")
 
 
+def raise_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def main(argv=None):
+    try:
+        # SIGTERM ends like SIGINT: unwinds to the probe, which kills the psql child first.
+        signal.signal(signal.SIGTERM, raise_interrupt)
+        signal.signal(signal.SIGINT, raise_interrupt)
+    except ValueError:
+        pass  # not the main thread (in-process callers); the default handlers stay
     try:
         run(parse_args(argv))
     except HelperError as exc:
         print(f"ensure-age-extension: {exc}", file=sys.stderr)
         return exc.code
+    except KeyboardInterrupt:
+        print("ensure-age-extension: interrupted", file=sys.stderr)
+        return EXIT_UNAVAILABLE
     return EXIT_OK
 
 

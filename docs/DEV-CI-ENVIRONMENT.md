@@ -215,21 +215,35 @@ before `CREATE EXTENSION`:
   exits 1. Files already written stay in place: each carries its pinned bytes,
   and removing one could undo a restore another runner has already verified.
 - **Secrets.** The tier password goes to psql through `PGPASSWORD`; the URL on
-  psql's argv carries no password, and neither form is printed. Because urllib
-  and libpq split a URL differently, a URL holding a TAB, line break or NUL, a
-  `#` (libpq has no fragment), more than one `@` in the host part or an `@`
-  after it, a query segment without exactly one `=`, or an empty host part
-  (`postgres:///db...`) is refused with exit 2 before psql runs; a socket
-  directory given as `?host=%2F...` or as a percent-encoded host works. The
-  query is percent-decoded only, as libpq does (`+` stays a plus), and kept
-  segments reach psql as written. Every
-  query key other than `password` must be on `ALLOWED_QUERY_KEYS`, a
-  case-sensitive allowlist of non-secret libpq parameters (`sslmode`,
-  `application_name`, `connect_timeout`, ...); any other key, including
-  `sslpassword`, `oauth_client_secret`, `scram_client_key` and
-  `scram_server_key` (which libpq cannot take from the environment), is refused
-  the same way. The message names a key only when it is a known libpq keyword
-  (an unlisted key can be the tail of a password that held a raw `&`), never a value.
+  psql's argv carries no password, and neither form is printed. Only the
+  password is moved off argv: allowed path- and name-valued keys (`sslrootcert`,
+  `sslcert`, `sslkey`, `sslcrl`, `sslcrldir`, `passfile`, `service`,
+  `krbsrvname`, `requirepeer`) stay in the URL on psql's argv. The URL is refused
+  with exit 2 and one stderr line (no value printed) when it does not start with
+  the exact lowercase `postgres://` or `postgresql://`; holds a control
+  character, a raw space, a `#`, a `%` not followed by two hex digits or `%00`;
+  has more than one `@` in the host part, an `@` after it, or an empty host part
+  (`postgres:///db...`); or its query has an empty segment (one trailing `&` is
+  accepted), a segment without exactly one `=`, or a key not on
+  `ALLOWED_QUERY_KEYS`. These are libpq's own refusals plus fail-closed cases
+  where urllib and libpq could split the URL differently; a URL the helper
+  accepts is read the same way by libpq. Decoding is percent-decoding only:
+  `%XX` becomes one raw byte (`%FF` reaches `PGPASSWORD` as byte 0xFF) and `+`
+  stays a plus. A socket directory given as `?host=%2F...` or as a
+  percent-encoded host works, also with a userinfo password and an empty host
+  (`postgres://:pw@/db?host=%2Fdir`). The URL psql receives drops the password
+  and keeps every other segment as written. `ALLOWED_QUERY_KEYS` is a
+  case-sensitive allowlist that is a subset of the non-secret libpq parameters
+  (`sslmode`, `application_name`, `connect_timeout`, `sslnegotiation`,
+  `min_protocol_version`, ...). Secrets (`sslpassword`, `oauth_client_secret`,
+  `scram_client_key`, `scram_server_key`, which libpq cannot take from the
+  environment) and keys that change the auth mechanism or session mode
+  (`gsslib`, `gssdelegation`, `replication`, `oauth_issuer`, `oauth_client_id`,
+  `oauth_scope`) are refused by name; `ssl=true` is a JDBC alias, use `sslmode`.
+  A refusal names a key only when it is a known libpq keyword (an unlisted key
+  can be the tail of a password that held a raw `&`), never a value. psql runs
+  with `PGCONNECT_TIMEOUT=15` and a 60 s limit; SIGTERM/SIGINT stop the psql
+  child and exit 1 with one `ensure-age-extension: interrupted` line.
 
 It is a no-op when AGE is healthy. `--age-dir` exists for the unit tests only;
 CI always uses the default node path, and there is no environment override.
