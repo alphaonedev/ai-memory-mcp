@@ -22,7 +22,6 @@ mod parity_fault;
 #[path = "common/parity_oracle.rs"]
 mod parity_oracle;
 
-use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, MemoryStore, StoreError};
 use parity_fault::{CALLER, OWNER, PoisonKind, poison_row};
 use parity_oracle::{RawDb, StateDigest, exec, state_digest};
@@ -94,22 +93,18 @@ fn assert_atomic(run: &Run, backend: &str) {
 }
 
 async fn sqlite_run() -> Run {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("x1.db");
-    let store = SqliteStore::open(&path).expect("open sqlite");
-    run_x1(&store, &RawDb::Sqlite(path)).await
+    let (_dir, store, raw) = parity_oracle::sqlite_scratch();
+    run_x1(&store, &raw).await
 }
 
 #[cfg(feature = "sal-postgres")]
 async fn pg_run() -> Option<Run> {
-    use ai_memory::store::postgres::PostgresStore;
-    let Some(env) = common::postgres_env::PostgresTestEnv::new("x1_store_batch").await else {
-        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL unset (X1b needs a live postgres)");
+    let Some((_scratch, store, raw)) = parity_oracle::pg_scratch(PREFIX).await else {
         return None;
     };
-    let store = PostgresStore::connect(env.url()).await.expect("connect pg");
-    let raw = RawDb::Pg(store.pool().clone());
-    Some(run_x1(&store, &raw).await)
+    let run = run_x1(&store, &raw).await;
+    store.pool().close().await;
+    Some(run)
 }
 
 /// X1a: sqlite is all-or-nothing and retry-clean.
@@ -158,15 +153,15 @@ fn x1_pg_lane_guard_precedes_connect() {
 async fn x1_parity() {
     let Some(pg) = pg_run().await else { return };
     let sq = sqlite_run().await;
-    assert_eq!(
-        sq.after_fault.without(&["quota"]),
-        pg.after_fault.without(&["quota"]),
-        "X1 state after the faulted batch"
+    parity_oracle::assert_digest_parity(
+        "X1 after the faulted batch",
+        &sq.after_fault.without(&["quota"]),
+        &pg.after_fault.without(&["quota"]),
     );
-    assert_eq!(
-        sq.after_retry.without(&["quota"]),
-        pg.after_retry.without(&["quota"]),
-        "X1 state after the healthy retry"
+    parity_oracle::assert_digest_parity(
+        "X1 after the healthy retry",
+        &sq.after_retry.without(&["quota"]),
+        &pg.after_retry.without(&["quota"]),
     );
 }
 
@@ -177,10 +172,10 @@ async fn x1_parity() {
 async fn x1_parity_error_variant() {
     let Some(pg) = pg_run().await else { return };
     let sq = sqlite_run().await;
-    assert_eq!(
-        parity_oracle::err_variant(sq.fault_err.as_ref().expect("sqlite err")).0,
-        parity_oracle::err_variant(pg.fault_err.as_ref().expect("pg err")).0,
-        "X1 error variant for a poisoned store_batch row (sqlite vs postgres)"
+    parity_oracle::assert_err_parity(
+        "X1 poisoned store_batch row",
+        sq.fault_err.as_ref().expect("sqlite err"),
+        pg.fault_err.as_ref().expect("pg err"),
     );
 }
 

@@ -37,14 +37,16 @@ pub enum PoisonKind {
 
 /// A poisoned row: position plus failure kind. Pure data.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Poison {
+pub struct Poison<K = PoisonKind> {
     pub k: usize,
-    pub kind: PoisonKind,
+    pub kind: K,
 }
 
-/// Build the poison for row `k` of the input.
+/// Build the poison for row `k` of the input. X3-X8 define their own kind enum
+/// and per-operation builders in their cell; they need not extend `PoisonKind`
+/// or edit the existing holder/consolidation match arms.
 #[must_use]
-pub fn poison_row(k: usize, kind: PoisonKind) -> Poison {
+pub fn poison_row<K>(k: usize, kind: K) -> Poison<K> {
     Poison { k, kind }
 }
 

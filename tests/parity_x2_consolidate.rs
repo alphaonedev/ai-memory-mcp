@@ -24,7 +24,6 @@ mod parity_fault;
 mod parity_oracle;
 
 use ai_memory::models::Tier;
-use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, MemoryStore, StoreError};
 use parity_fault::{CALLER, PoisonKind, poison_row, row_id};
 use parity_oracle::{RawDb, StateDigest, state_digest};
@@ -34,9 +33,6 @@ const K: usize = 1;
 const PREFIX: &str = "x2";
 const NS: &str = "parity/x2";
 
-/// Serialises the runs: the lineage flags are process-global atomics.
-static FLAGS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
 struct Run {
     seeded: StateDigest,
     fault_err: Option<StoreError>,
@@ -45,17 +41,8 @@ struct Run {
     after_retry: StateDigest,
 }
 
-/// Tables a consolidation can touch; wiped before a postgres run (see `pg_run`).
-const RESET_SQL: &str = "TRUNCATE memories, memory_links, archived_memories, \
-    forget_tombstones, signed_events, memory_revisions, agent_quotas, actions, leases CASCADE";
-
-async fn run_x2(store: &dyn MemoryStore, raw: &RawDb, reset: bool) -> Run {
-    let _guard = FLAGS.lock().await;
-    if reset {
-        parity_oracle::exec(raw, RESET_SQL).await;
-    }
-    ai_memory::config::set_lineage_dag(true);
-    ai_memory::config::set_consolidate_tombstone_sources(true);
+async fn run_x2(store: &dyn MemoryStore, raw: &RawDb) -> Run {
+    let _guard = parity_oracle::LineageGuard::enable().await;
 
     let poison = poison_row(K, PoisonKind::MissingSource);
     let caller = CallerContext::for_agent(CALLER);
@@ -102,8 +89,6 @@ async fn run_x2(store: &dyn MemoryStore, raw: &RawDb, reset: bool) -> Run {
     let retry = consolidate(ids, versions).await;
     let after_retry = state_digest(raw).await;
 
-    ai_memory::config::set_lineage_dag(false);
-    ai_memory::config::set_consolidate_tombstone_sources(false);
     Run {
         seeded,
         fault_err,
@@ -138,8 +123,7 @@ fn assert_atomic(run: &Run, backend: &str) {
         "{backend}: consolidating a missing source {K} must fail"
     );
     assert_eq!(
-        run.after_fault.without(&["signed_events"]),
-        run.seeded.without(&["signed_events"]),
+        run.after_fault, run.seeded,
         "{backend}: a failed consolidation must leave NO durable change"
     );
     let id = run
@@ -156,28 +140,25 @@ fn assert_atomic(run: &Run, backend: &str) {
 }
 
 async fn sqlite_run() -> Run {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let path = dir.path().join("x2.db");
-    let store = SqliteStore::open(&path).expect("open sqlite");
-    run_x2(&store, &RawDb::Sqlite(path), false).await
+    let (_dir, store, raw) = parity_oracle::sqlite_scratch();
+    run_x2(&store, &raw).await
 }
 
 /// F3: a panic in a cell must restore both process-global flags.
 #[tokio::test]
 async fn x2_flags_reset_after_panic() {
     let failed = tokio::spawn(async {
-        let dir = tempfile::tempdir().expect("panic control tempdir");
-        let store = SqliteStore::open(dir.path().join("flags.db")).expect("flags sqlite");
+        let (dir, store, _raw) = parity_oracle::sqlite_scratch();
         // The first digest fails after the run has enabled both flags.
         let raw = RawDb::Sqlite(dir.path().join("absent.db"));
-        run_x2(&store, &raw, false).await;
+        run_x2(&store, &raw).await;
     })
     .await;
     assert!(
         failed.expect_err("oracle open must panic").is_panic(),
         "F3 panic control"
     );
-    let _guard = FLAGS.lock().await;
+    let _guard = parity_oracle::LINEAGE_FLAGS.lock().await;
     let lineage = ai_memory::config::lineage_dag_enabled();
     // Inspect the sub-flag while its master is on, then reset even on red.
     ai_memory::config::set_lineage_dag(true);
@@ -196,10 +177,20 @@ async fn x2_flags_reset_after_panic() {
 #[tokio::test]
 async fn x2_postgres_preserves_lane_sentinel() {
     const SENTINEL: &str = "x2-lane-sentinel";
-    let Some(url) = common::pg_isolate::isolated_url() else {
-        eprintln!("skip: x2_postgres_preserves_lane_sentinel: AI_MEMORY_TEST_POSTGRES_URL unset");
-        return;
+    let base = match std::env::var("AI_MEMORY_TEST_POSTGRES_URL") {
+        Ok(base) => base,
+        Err(std::env::VarError::NotPresent) => {
+            eprintln!(
+                "skip: x2_postgres_preserves_lane_sentinel: AI_MEMORY_TEST_POSTGRES_URL unset"
+            );
+            return;
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("AI_MEMORY_TEST_POSTGRES_URL must be valid Unicode");
+        }
     };
+    common::lane_db::assert_lane_database(&base);
+    let url = common::pg_isolate::isolated_url().expect("configured postgres URL");
     common::lane_db::assert_lane_database(&url);
     let store = ai_memory::store::postgres::PostgresStore::connect(&url)
         .await
@@ -220,25 +211,21 @@ async fn x2_postgres_preserves_lane_sentinel() {
         retained
             .expect("F1: lane sentinel survives a sibling run")
             .id,
-        SENTINEL
+        SENTINEL,
+        "F1: the provisioning lane retains its sentinel"
     );
 }
 
-/// Postgres runs in the database's `public` schema, not a per-test schema:
-/// the lineage leaf path issues `SET LOCAL search_path = ag_catalog, "$user",
-/// public` (AGE), which drops a test schema from the path. The campaign tables
-/// are therefore wiped per run, so the URL must be a dedicated lane database.
+/// A private database per run avoids #7101's AGE schema-path defect without
+/// sharing or truncating the provisioning lane's public tables.
 #[cfg(feature = "sal-postgres")]
 async fn pg_run() -> Option<Run> {
-    use ai_memory::store::postgres::PostgresStore;
-    let Some(url) = common::pg_isolate::isolated_url() else {
-        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL unset (X2b needs a live postgres)");
+    let Some((_scratch, store, raw)) = parity_oracle::pg_scratch(PREFIX).await else {
         return None;
     };
-    common::lane_db::assert_lane_database(&url);
-    let store = PostgresStore::connect(&url).await.expect("connect pg");
-    let raw = RawDb::Pg(store.pool().clone());
-    Some(run_x2(&store, &raw, true).await)
+    let run = run_x2(&store, &raw).await;
+    store.pool().close().await;
+    Some(run)
 }
 
 /// X2a: sqlite consolidation is atomic and retry-clean.
@@ -281,19 +268,19 @@ async fn x2_parity() {
     let Some(pg) = pg_run().await else { return };
     let sq = sqlite_run().await;
     let skip = ["signed_events", "quota"];
-    assert_eq!(
-        sq.after_fault.without(&skip),
-        pg.after_fault.without(&skip),
-        "X2 state after the faulted consolidation"
+    parity_oracle::assert_digest_parity(
+        "X2 after the faulted consolidation",
+        &sq.after_fault.without(&["quota"]),
+        &pg.after_fault.without(&["quota"]),
     );
     let (sid, pid) = (
         sq.retry.as_ref().expect("sqlite retry"),
         pg.retry.as_ref().expect("pg retry"),
     );
-    assert_eq!(
-        mask(&sq.after_retry, sid).without(&skip),
-        mask(&pg.after_retry, pid).without(&skip),
-        "X2 state after the healthy consolidation"
+    parity_oracle::assert_digest_parity(
+        "X2 after the healthy consolidation",
+        &mask(&sq.after_retry, sid).without(&skip),
+        &mask(&pg.after_retry, pid).without(&skip),
     );
 }
 
@@ -304,10 +291,10 @@ async fn x2_parity() {
 async fn x2_parity_error_variant() {
     let Some(pg) = pg_run().await else { return };
     let sq = sqlite_run().await;
-    assert_eq!(
-        parity_oracle::err_variant(sq.fault_err.as_ref().expect("sqlite err")).0,
-        parity_oracle::err_variant(pg.fault_err.as_ref().expect("pg err")).0,
-        "X2 error variant for a missing consolidation source (sqlite vs postgres)"
+    parity_oracle::assert_err_parity(
+        "X2 missing consolidation source",
+        sq.fault_err.as_ref().expect("sqlite err"),
+        pg.fault_err.as_ref().expect("pg err"),
     );
 }
 

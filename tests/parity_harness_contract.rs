@@ -88,27 +88,17 @@ async fn digest_contract(store: &dyn MemoryStore, raw: &RawDb) {
 
 #[tokio::test]
 async fn sqlite_digest_contract() {
-    let dir = tempfile::tempdir().expect("oracle tempdir");
-    let path = dir.path().join("oracle.db");
-    let store = ai_memory::store::sqlite::SqliteStore::open(&path).expect("oracle sqlite");
-    digest_contract(&store, &RawDb::Sqlite(path)).await;
+    let (_dir, store, raw) = parity_oracle::sqlite_scratch();
+    digest_contract(&store, &raw).await;
 }
 
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn postgres_digest_contract() {
-    let Some(url) = common::pg_isolate::isolated_url() else {
-        eprintln!("skip: postgres_digest_contract: AI_MEMORY_TEST_POSTGRES_URL unset");
+    let Some((_scratch, store, raw)) = parity_oracle::pg_scratch("digest").await else {
         return;
     };
-    common::lane_db::assert_lane_database(&url);
-    let scratch = common::pg_barrier::ScratchDb::create(&url, "ai_memory_oracle_contract")
-        .await
-        .expect("oracle scratch database");
-    let store = ai_memory::store::postgres::PostgresStore::connect(&scratch.url())
-        .await
-        .expect("oracle postgres");
-    digest_contract(&store, &RawDb::Pg(store.pool().clone())).await;
+    digest_contract(&store, &raw).await;
     store.pool().close().await;
 }
 
@@ -157,29 +147,96 @@ async fn link_audit_control(store: &dyn MemoryStore, raw: &RawDb) {
 
 #[tokio::test]
 async fn sqlite_signed_events_positive_control() {
-    let dir = tempfile::tempdir().expect("audit tempdir");
-    let path = dir.path().join("audit.db");
-    let store = ai_memory::store::sqlite::SqliteStore::open(&path).expect("audit sqlite");
-    link_audit_control(&store, &RawDb::Sqlite(path)).await;
+    let (_dir, store, raw) = parity_oracle::sqlite_scratch();
+    link_audit_control(&store, &raw).await;
 }
 
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 #[ignore = "X5 link audit divergence tracked in issue #7095 — un-ignore when fixed"]
 async fn postgres_signed_events_positive_control() {
-    let Some(url) = common::pg_isolate::isolated_url() else {
-        eprintln!(
-            "skip: postgres_signed_events_positive_control: AI_MEMORY_TEST_POSTGRES_URL unset"
-        );
+    let Some((_scratch, store, raw)) = parity_oracle::pg_scratch("audit").await else {
         return;
     };
-    common::lane_db::assert_lane_database(&url);
-    let scratch = common::pg_barrier::ScratchDb::create(&url, "ai_memory_oracle_contract")
-        .await
-        .expect("audit scratch database");
-    let store = ai_memory::store::postgres::PostgresStore::connect(&scratch.url())
-        .await
-        .expect("audit postgres");
-    link_audit_control(&store, &RawDb::Pg(store.pool().clone())).await;
+    link_audit_control(&store, &raw).await;
     store.pool().close().await;
+}
+
+#[test]
+fn shared_error_assertion_accepts_sanitized_equivalence() {
+    let sqlite = StoreError::NotFound {
+        id: "ROW-1".to_string(),
+    };
+    let postgres = StoreError::NotFound {
+        id: "row-2".to_string(),
+    };
+    parity_oracle::assert_err_parity("normalization control", &sqlite, &postgres);
+}
+
+#[test]
+#[should_panic(expected = "message control: error parity (variant and sanitized message)")]
+fn shared_error_assertion_rejects_same_variant_different_message() {
+    let sqlite = StoreError::InvalidInput {
+        detail: "missing source".to_string(),
+    };
+    let postgres = StoreError::InvalidInput {
+        detail: "stale version".to_string(),
+    };
+    parity_oracle::assert_err_parity("message control", &sqlite, &postgres);
+}
+
+#[test]
+#[should_panic(expected = "variant control: error parity (variant and sanitized message)")]
+fn shared_error_assertion_rejects_different_variant() {
+    let sqlite = StoreError::NotFound {
+        id: MEMORY_ID.to_string(),
+    };
+    let postgres = StoreError::Conflict {
+        id: MEMORY_ID.to_string(),
+    };
+    parity_oracle::assert_err_parity("variant control", &sqlite, &postgres);
+}
+
+#[test]
+#[should_panic(expected = "digest control: state digest parity")]
+fn shared_digest_assertion_rejects_changed_row() {
+    let sqlite = parity_oracle::StateDigest::default();
+    parity_oracle::assert_digest_parity("equal control", &sqlite, &sqlite);
+    let mut postgres = sqlite.clone();
+    postgres.0.insert(
+        "leases".to_string(),
+        vec![vec!["action".to_string(), CALLER.to_string()]],
+    );
+    parity_oracle::assert_digest_parity("digest control", &sqlite, &postgres);
+}
+
+#[test]
+fn cell_local_poison_kind_builds_without_shared_enum_changes() {
+    #[derive(Debug, PartialEq, Eq)]
+    enum ArchiveFault {
+        ForeignOwner,
+    }
+    const POISON_INDEX: usize = 1;
+    let poison = parity_fault::poison_row(POISON_INDEX, ArchiveFault::ForeignOwner);
+    let rows: Vec<_> = (0..=POISON_INDEX)
+        .map(|index| {
+            let agent = if index == poison.k {
+                parity_fault::OWNER
+            } else {
+                CALLER
+            };
+            memory(&parity_fault::row_id("archive", index), TITLE, NS, agent)
+        })
+        .collect();
+    assert_eq!(
+        poison.kind,
+        ArchiveFault::ForeignOwner,
+        "F3: per-cell kind survives"
+    );
+    assert_eq!(rows[0].metadata["agent_id"], CALLER, "F3: healthy prefix");
+    assert_eq!(
+        rows[poison.k].metadata["agent_id"],
+        parity_fault::OWNER,
+        "F3: poisoned owner"
+    );
 }
