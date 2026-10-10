@@ -352,7 +352,8 @@ def scrub_file(path, secrets):
             for key, value in element.attrib.items():
                 element.set(key, redact(value, forms))
         tree.write(str(path), encoding="utf-8", xml_declaration=True)
-    except (OSError, ET.ParseError):
+    except BaseException:
+        # Any failure, a stop signal (a BaseException) included, leaves no unfiltered report (#7048).
         path.unlink(missing_ok=True)
         raise
 
@@ -406,13 +407,18 @@ def run_redacted(argv, *, cwd, env, secrets):
         proc.kill()  # a stop signal or an error here must not leave pytest running
         raise
     finally:
-        proc.stdout.close()
-        code = proc.wait()
-        # pytest writes its own report file; filter it exactly like the log (#7048).
-        for arg in argv:
-            if isinstance(arg, str) and arg.startswith("--junitxml="):
+        reports = [
+            Path(arg.split("=", 1)[1])
+            for arg in argv
+            if isinstance(arg, str) and arg.startswith("--junitxml=")
+        ]
+        try:
+            proc.stdout.close()
+            code = proc.wait()
+            # pytest writes its own report file; filter it exactly like the log (#7048).
+            for report in reports:
                 try:
-                    scrub_file(Path(arg.split("=", 1)[1]), secrets)
+                    scrub_file(report, secrets)
                 except FileNotFoundError:
                     pass
                 except (OSError, ET.ParseError) as exc:
@@ -420,6 +426,11 @@ def run_redacted(argv, *, cwd, env, secrets):
                         f"sdk-python-live: the junit report could not be filtered and was removed: {exc}",
                         file=sys.stderr,
                     )
+        except BaseException:
+            # A stop signal before the scrub finished: the unfiltered report must not stay on disk.
+            for report in reports:
+                report.unlink(missing_ok=True)
+            raise
     return code
 
 
