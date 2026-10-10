@@ -28,7 +28,8 @@ Behaviour:
 
 The tier URL is read from a file.  Its password is passed to psql through the
 ``PGPASSWORD`` environment variable and removed from the URL psql receives, so
-it never appears on a process argv.  Neither form of the URL is printed.
+it never appears on a process argv.  A URL carrying ``sslpassword`` (libpq has
+no environment variable for it) is refused.  Neither form of the URL is printed.
 
 Exit codes: 0 healthy, 1 still unhealthy / probe or install failed,
 2 bad input (URL file, pg_config, source validation).
@@ -96,7 +97,8 @@ def psql_target(url):
     """Split the tier URL into (password-free URL for argv, password or None).
 
     Fails closed on anything that is not a postgres:// URL, because a keyword
-    DSN would carry its password on argv.
+    DSN would carry its password on argv, and on an ``sslpassword`` query key,
+    because libpq has no environment variable for it.
     """
     try:
         parts = urlsplit(url)
@@ -116,6 +118,8 @@ def psql_target(url):
     query_pairs = parse_qsl(parts.query, keep_blank_values=True)
     kept = []
     for key, value in query_pairs:
+        if key.lower() == "sslpassword":
+            raise HelperError("tier URL file carries sslpassword; use a key without a passphrase", EXIT_BAD_INPUT)
         if key == "password":
             password = value
         else:
