@@ -166,7 +166,7 @@ fn http_foreign_per_agent_key_does_not_bind_3549() {
 #[test]
 fn http_no_identity_is_anonymous_and_never_admin_3549() {
     let anon_allow = allow(&["anonymous:req-abcdef12"]);
-    for header in [None, Some("")] {
+    for (case, header) in [(0_usize, None), (1, Some(""))] {
         let a = http(
             header,
             None,
@@ -176,7 +176,7 @@ fn http_no_identity_is_anonymous_and_never_admin_3549() {
             true,
         )
         .expect("resolves");
-        assert!(a.is_anonymous(), "{}", a.principal());
+        assert!(a.is_anonymous(), "header case {case} must be anonymous");
         assert!(
             a.principal()
                 .starts_with(ai_memory::identity::sentinels::ANONYMOUS_REQ_PREFIX)
