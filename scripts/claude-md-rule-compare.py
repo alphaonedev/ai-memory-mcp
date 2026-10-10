@@ -1809,6 +1809,9 @@ def _self_test_cases() -> int:
         guarded(f"a git that answers {wording} to --is-shallow-repository (#6742) fixture", cell)
 
     shallow_answer_cell("echo", "--is-shallow-repository\n", "the option name")
+    # #6713: the same refusal for an empty answer and for a capitalised one; only the exact word `false` is accepted.
+    shallow_answer_cell("empty", "", "nothing")
+    shallow_answer_cell("capital", "False\n", "False")
 
     # #6744: the fixtures of the #6575, #6609 and #6573 cells run inside guarded(), so a fault while building one
     # (a git that refuses `clone --depth`, a full disk) is that cell's named FAIL and the cells after it still run.
