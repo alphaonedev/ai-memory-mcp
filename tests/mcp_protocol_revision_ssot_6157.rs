@@ -762,13 +762,16 @@ fn issue_6534_walk_reads_files_outside_the_round3_extension_allowlist() {
     );
 }
 
+/// One #6535 case: what it shows, the file text, the uses expected.
+type SplitCase = (&'static str, &'static str, Vec<(usize, &'static str)>);
+
 /// #6535: a revision on a line after its marker is still a use. Pretty-
 /// printed JSON, YAML, TOML, Rust and TS put a key and its value on
 /// different lines; the round-3 line scan never checked such a value, so an
 /// unsupported revision passed by line placement alone (false green).
 #[test]
 fn issue_6535_a_revision_split_from_its_marker_is_still_a_use() {
-    let cases: [(&str, &str, Vec<(usize, &str)>); 6] = [
+    let cases: [SplitCase; 6] = [
         (
             "pretty-printed JSON",
             "{\n  \"protocolVersion\":\n    \"2099-01-01\"\n}\n",
