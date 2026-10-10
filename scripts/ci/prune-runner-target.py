@@ -153,11 +153,16 @@ CONTROL_RE = re.compile("[\x00-\x1f\x7f]")
 # (space separators: no-break, em, ideographic ...; U+0020 itself is exempt
 # below), Mn (combining marks) and Me (enclosing marks), which print blank or
 # attach to the previous character so a name reads as a different one (#6299).
-# Cs only reaches here from a lone surrogate.  Written as \\u{hex}.
-INVISIBLE_CATEGORIES = frozenset({"Zl", "Zp", "Zs", "Mn", "Me", "Cf", "Cs", "Co", "Cn", "Cc"})
+# All written as \\u{hex}.  Cs is not listed: no surrogate reaches this pass
+# (a surrogateescape byte U+DC80-U+DCFF is \\xNN after os.fsencode, and every
+# other surrogate is split off by LONE_SURROGATE_RE first) (#6532).
+INVISIBLE_CATEGORIES = frozenset({"Zl", "Zp", "Zs", "Mn", "Me", "Cf", "Co", "Cn", "Cc"})
 # Letters and symbols that render as blank space: the Hangul fillers and the
 # blank braille pattern (#6299).
 INVISIBLE_CODE_POINTS = frozenset({0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800})
+# A surrogate that surrogateescape cannot encode (everything but U+DC80-U+DCFF):
+# os.fsencode raises on it, so _escape writes it as \\u{hex} itself (#6532).
+LONE_SURROGATE_RE = re.compile("([%s-%s%s-%s])" % (chr(0xD800), chr(0xDC7F), chr(0xDD00), chr(0xDFFF)))
 WARNING_PREFIX = "::warning::prune-runner-target: "
 
 
@@ -178,8 +183,17 @@ def _escape(text: str) -> str:
     text (U+2028 / U+2029, bidi and zero-width format characters, space
     separators other than U+0020, combining and enclosing marks, the Hangul
     fillers and the blank braille pattern, private-use and unassigned code
-    points) (#6299).
+    points) (#6299).  A surrogate outside U+DC80-U+DCFF (which no OS name decodes
+    to, but any str may hold) becomes ``\\u{hex}``, so the function is total over
+    ``str`` and two unpaired halves never print as the character they would pair
+    to (#6532).
     """
+    parts = LONE_SURROGATE_RE.split(text)
+    return "".join("\\u{%x}" % ord(part) if odd % 2 else _escape_run(part) for odd, part in enumerate(parts))
+
+
+def _escape_run(text: str) -> str:
+    """``_escape`` for text holding no surrogate outside U+DC80-U+DCFF."""
     text = os.fsencode(text).replace(b"\\", b"\\\\").decode("utf-8", "backslashreplace")
     text = text.replace("%", "%25").replace("#", "%23").replace("\r", "%0D").replace("\n", "%0A")
     text = CONTROL_RE.sub(lambda m: "\\x%02x" % ord(m.group()), text)
