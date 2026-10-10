@@ -1023,9 +1023,11 @@ jobs:
 
       - name: Configure NDK toolchain envs (all 4 ABIs)
         shell: bash
+        env:
+          NDK_PATH: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           set -euo pipefail
-          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          NDK="${NDK_PATH:?the setup-ndk output is empty}"
           TC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           # min-sdk 24 (Android 7.0+). Same floor as the cross-compile
           # gate in ci.yml.
@@ -1248,9 +1250,10 @@ jobs:
         id: sha
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION=${{ steps.version.outputs.version }}
+          : "${VERSION:?the version step output is empty}"
           BASE="https://github.com/alphaonedev/ai-memory-mcp/releases/download/v${VERSION}"
 
           for TARGET in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
@@ -1289,8 +1292,17 @@ jobs:
           path: homebrew-tap
 
       - name: Update formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          PIN_X86_64_LINUX: ${{ steps.sha.outputs.sha_x86_64_unknown_linux_gnu }}
+          PIN_AARCH64_LINUX: ${{ steps.sha.outputs.sha_aarch64_unknown_linux_gnu }}
+          PIN_AARCH64_DARWIN: ${{ steps.sha.outputs.sha_aarch64_apple_darwin }}
         run: |
-          VERSION=${{ steps.version.outputs.version }}
+          set -euo pipefail
+          : "${VERSION:?the version step output is empty}"
+          for sha in "$PIN_X86_64_LINUX" "$PIN_AARCH64_LINUX" "$PIN_AARCH64_DARWIN"; do
+            printf '%s' "$sha" | grep -Eq '^[0-9a-f]{64}$' || { echo "::error::pinned SHA is not 64 hex digits"; exit 1; }
+          done
           cat > homebrew-tap/Formula/ai-memory.rb << 'FORMULA_EOF'
           class AiMemory < Formula
             desc "AI-agnostic persistent memory system — MCP server, HTTP API, and CLI"
@@ -1343,17 +1355,21 @@ jobs:
           FORMULA_EOF
 
           sed -i "s/VERSION_PLACEHOLDER/${VERSION}/" homebrew-tap/Formula/ai-memory.rb
-          sed -i "s/SHA_X86_64_UNKNOWN_LINUX_GNU/${{ steps.sha.outputs.sha_x86_64_unknown_linux_gnu }}/" homebrew-tap/Formula/ai-memory.rb
-          sed -i "s/SHA_AARCH64_UNKNOWN_LINUX_GNU/${{ steps.sha.outputs.sha_aarch64_unknown_linux_gnu }}/" homebrew-tap/Formula/ai-memory.rb
-          sed -i "s/SHA_AARCH64_APPLE_DARWIN/${{ steps.sha.outputs.sha_aarch64_apple_darwin }}/" homebrew-tap/Formula/ai-memory.rb
+          sed -i "s/SHA_X86_64_UNKNOWN_LINUX_GNU/${PIN_X86_64_LINUX}/" homebrew-tap/Formula/ai-memory.rb
+          sed -i "s/SHA_AARCH64_UNKNOWN_LINUX_GNU/${PIN_AARCH64_LINUX}/" homebrew-tap/Formula/ai-memory.rb
+          sed -i "s/SHA_AARCH64_APPLE_DARWIN/${PIN_AARCH64_DARWIN}/" homebrew-tap/Formula/ai-memory.rb
 
       - name: Push updated formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
+          set -euo pipefail
+          : "${VERSION:?the version step output is empty}"
           cd homebrew-tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Formula/ai-memory.rb
-          git commit -m "Update ai-memory to ${{ steps.version.outputs.version }}"
+          git commit -m "Update ai-memory to ${VERSION}"
           git push
 
   # --------------------------------------------------------------------
@@ -1481,9 +1497,13 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Configure copr-cli
+        env:
+          COPR_CONFIG: ${{ secrets.COPR_CONFIG }}
         run: |
+          set -euo pipefail
+          umask 077
           mkdir -p ~/.config
-          echo "${{ secrets.COPR_CONFIG }}" > ~/.config/copr
+          printf '%s\n' "$COPR_CONFIG" > ~/.config/copr
 
       - name: Install RPM build tools
         timeout-minutes: 5
@@ -1504,8 +1524,9 @@ jobs:
       - name: Build source RPM
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          VERSION=${{ steps.version.outputs.version }}
+          : "${VERSION:?the version step output is empty}"
           mkdir -p ~/rpmbuild/{SOURCES,SPECS,SRPMS}
 
           # #2449 - verify each tarball against its published .sha256 before
