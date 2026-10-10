@@ -860,7 +860,8 @@ def _flow_strings(obj, owner: str = "") -> List[Tuple[str, str]]:
         elif isinstance(item, dict):
             for k, v in item.items():
                 out.append(("", str(k)))
-                todo.append((v, str(k)))
+                # #6780: below a credential-named key the nearest credential key stays the owner.
+                todo.append((v, own if is_credential_key(own) else str(k)))
         else:
             todo.extend((sub, own) for sub in item)
     return out
@@ -871,8 +872,8 @@ def owned_strings(node: Node) -> List[Tuple[int, str, str]]:
 
     A key contributes ``name:`` (owner ``""``); a scalar its parsed text; a flow collection every key and
     scalar; a block scalar each content line whole (a ``#`` there is text).  Comments are never included
-    and quoting never shifts what is read (#6617).  The owner of a value is the key it sits under, so a
-    caller that echoes the value can pass the key to ``mask`` (#6735).
+    and quoting never shifts what is read (#6617).  The owner of a value is the key it sits under, or the nearest
+    credential-named key above it (#6735, #6780), so a caller can tell a credential value from any depth.
     """
     out: List[Tuple[int, str, str]] = []
     owner_of = {id(node): ""}
@@ -880,7 +881,9 @@ def owned_strings(node: Node) -> List[Tuple[int, str, str]]:
         own = owner_of.get(id(sub), "")
         if sub.kind == "key":
             out.append((sub.line, "", key_name(sub.name) + ":"))
-            own = key_name(sub.name)
+            # #6780: a credential-named ancestor keeps owning every value below it.
+            if not is_credential_key(own):
+                own = key_name(sub.name)
         for child in sub.children:
             owner_of[id(child)] = own
         if sub.kind == "root":
