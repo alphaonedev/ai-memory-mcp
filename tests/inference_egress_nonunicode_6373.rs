@@ -7,7 +7,7 @@
 //! `resolve_inference_egress_mode` failed closed to `Deny` for an
 //! unrecognised UTF-8 value but mapped every `env::var` error to `Allow`,
 //! including `VarError::NotUnicode`: an operator who SET the knob (to a
-//! value that is not valid UTF-8) got the widest posture. Only NotPresent
+//! value that is not valid UTF-8) got the widest posture. Only `NotPresent`
 //! keeps the legacy `Allow` default (per ERRORS-19).
 //!
 //! This binary holds exactly one test so the process-env edit is not racy.
