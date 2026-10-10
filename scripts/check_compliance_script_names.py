@@ -1537,6 +1537,9 @@ R14_CELLS = (
     ("P6857-rooted-long-url-existing", "See https://" + "h" * 4100 + "/scripts/check_new.py here.\n", "", 0, None),
     # #6931: the same holds for a ./ or ../ rooted citation longer than PATH_LIMIT.
     ("P6931-rooted-long-dotdot-existing", "See " + "../" * 1400 + "scripts/check_new.py here.\n", "", 0, None),
+    # #6932: and for a rooted run far past PATH_LIMIT, up to LINE_CEILING (no whole-run cap).
+    ("P6932-rooted-huge-url-existing", "See https://" + "h" * 60000 + "/scripts/check_new.py here.\n", "", 0, None),
+    ("P6932-rooted-9000-url-existing", "See https://" + "h" * 9000 + "/scripts/check_new.py here.\n", "", 0, None),
     # #6858: the report names the path limit instead of "None" for a citation past it.
     ("W6858-long-path-wording", "See x/" + "d/" * 2100 + "check-gone.sh here.\n", "", 1,
      "(checked at a path longer than 4096 bytes)"),
