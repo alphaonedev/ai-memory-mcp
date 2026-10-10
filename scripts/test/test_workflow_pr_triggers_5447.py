@@ -5012,5 +5012,33 @@ class ApprovalValidatorBounds6393(unittest.TestCase):
         self.assertEqual(1, rc, out)
         self.assertIn("invalid author login", out)
 
+
+
+class RelayedTextSanitiser6394(unittest.TestCase):
+    """U+0085 never reaches an ::error:: line, and a relayed gh stderr line is cut at 300 characters."""
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+
+    def test_6394_next_line_is_replaced(self) -> None:
+        def api(path: str):
+            raise self.mod.GateError("boom\x85::error::forged")
+        _rc, lines = self.mod.run_gate("push", {}, REPO_6117, SHA_A, OPERATOR_6117, api)
+        text = "\n".join(lines)
+        self.assertNotIn("\x85", text)
+        self.assertIn("boom?::error::forged", text)
+
+    def test_6394_relayed_stderr_is_capped_at_300_characters(self) -> None:
+        import types
+
+        def fake_run(*_a, **_k):
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="Z" * 5000 + "\nsecond line")
+        with unittest.mock.patch.object(self.mod.subprocess, "run", fake_run):
+            rc, lines = self.mod.run_gate("push", {}, REPO_6117, SHA_A, OPERATOR_6117, self.mod.gh_api)
+        text = "\n".join(lines)
+        self.assertEqual(1, rc, text)
+        self.assertEqual(300, text.count("Z"), text[:200])
+        self.assertNotIn("second line", text)
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
