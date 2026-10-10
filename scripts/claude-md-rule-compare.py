@@ -58,6 +58,7 @@ import shutil
 import stat
 import subprocess
 import tokenize
+import unicodedata
 from pathlib import Path
 from typing import NamedTuple
 
@@ -66,6 +67,11 @@ MANIFEST_REL = "scripts/qc-allowlists/claude-md-rule-sections.sha256"
 DATA_PATHS = ("CLAUDE.md", "docs/reference/ARCHITECTURE_REFERENCE.md", "docs/reference/CODE_STYLE.md")
 TRAILER = re.compile(r"^Rule-Change-Approved-By: (\S.*)$", re.MULTILINE)
 SHA = re.compile(r"^[0-9a-f]{40}$")
+# #6572: an approval value must name somebody. These Unicode categories (control, format, unassigned, private use,
+# surrogate, separators, combining marks) and the fillers below render as nothing, so a value made only of them
+# is the same as an empty value and does not count.
+INVISIBLE_CATEGORIES = frozenset(("Cc", "Cf", "Cn", "Co", "Cs", "Zl", "Zp", "Zs", "Mn", "Me"))
+INVISIBLE_FILLERS = frozenset("\u115f\u1160\u3164\uffa0\u2800")
 # R4 (#4507): a digit is rule text (a vote size, a file threshold, a release branch). Only a digit run that is a
 # public-surface census count INSIDE a section whose heading STARTS WITH CENSUS_SECTION (the real heading carries a
 # date, so the match is a prefix; #5375) may change without the trailer; the same words in any other section are rule
@@ -222,18 +228,26 @@ def trailer_block(message: bytes) -> str:
     return result.stdout.decode("utf-8", "replace")
 
 
+def names_someone(value: str) -> bool:
+    """#6572: True when `value` has at least one character that renders (not invisible, not a filler)."""
+    return any(unicodedata.category(char) not in INVISIBLE_CATEGORIES and char not in INVISIBLE_FILLERS
+               for char in value)
+
+
 def approvals(repo: Path, base_sha: str, head_sha: str) -> list:
     """The `Rule-Change-Approved-By` trailer values in base..head (commit messages are data). #6179: only the
     git trailer block (the final paragraph, git interpret-trailers semantics) is read; a body line that starts
     with the key is prose, not an approval. #6396: each raw message is parsed by `trailer_block`, which loads no
     git configuration, so neither the host nor the repository can widen what counts as a trailer. #6431: the log
     read pins `--no-show-signature` and `--encoding=UTF-8`, so a host `log.showSignature` cannot inject verifier text
-    and a host `i18n.logOutputEncoding` cannot turn a real approval into unreadable bytes."""
+    and a host `i18n.logOutputEncoding` cannot turn a real approval into unreadable bytes. #6572: a value made only
+    of invisible characters or fillers names nobody and does not count."""
     out = git(repo, "log", "-z", "--no-show-signature", "--encoding=UTF-8", "--format=%B", f"{base_sha}..{head_sha}")
     found = []
     for message in out.split(b"\0"):
         if message.strip():
-            found += [match.group(1).strip() for match in TRAILER.finditer(trailer_block(message))]
+            values = [match.group(1).strip() for match in TRAILER.finditer(trailer_block(message))]
+            found += [value for value in values if names_someone(value)]
     return found
 
 
@@ -482,7 +496,7 @@ def plant_coverage_gap(probed: list, names: list, rounds: int) -> bool:
 # truth that does not come from imported_modules() itself. Adding or removing an import without updating this tuple
 # makes the self-test red.
 EXPECTED_IMPORTS = ("argparse", "ast", "contextlib", "difflib", "importlib", "io", "os", "pathlib", "py_compile", "re",
-                    "shutil", "stat", "subprocess", "tokenize", "typing")
+                    "shutil", "stat", "subprocess", "tokenize", "typing", "unicodedata")
 
 
 def import_pin_gap(found: list, pinned) -> tuple:
