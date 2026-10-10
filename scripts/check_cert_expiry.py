@@ -2907,6 +2907,18 @@ def _wrap_cells(t, fx, repo, base):
          {"src/wrap_a.rs": "#\u200f[cfg(any())]\n" + a_line}),
         ("wrap-adv-lrm-inner-file", "#![cfg(any())]", "an inner attribute written `#!`, U+200E, `[cfg(any())]`",
          {"src/wrap_a.rs": "#!\u200e[cfg(any())]\n" + a_line}),
+        # #6839: rustc drops a first line `#!..` (after a BOM) unless its next token is `[`,
+        # so a quote or comment opener there cannot hide what follows
+        ("wrap-adv-shebang-string", "cfg(any())", "a shebang line ending in a quote above #[cfg(any())]",
+         {"src/wrap_a.rs": '#!/x "\n#[cfg(any())] // "\n' + a_line}),
+        ("wrap-adv-shebang-block", "cfg(any())", "a shebang line ending in /* above #[cfg(any())]",
+         {"src/wrap_a.rs": "#!/x /*\n#[cfg(any())] // */\n" + a_line}),
+        ("wrap-bom-shebang", "cfg(any())", "a BOM, then a shebang line ending in a quote above #[cfg(any())]",
+         {"src/wrap_a.rs": '\ufeff#!/x "\n#[cfg(any())] // "\n' + a_line}),
+        ("wrap-shebang-root-decl", "cfg(any())", "a shebang line in lib.rs hiding #[cfg(any())] on `mod wrapmod;`",
+         {"src/lib.rs": '#!/x "\n#[cfg(any())] // "\npub mod wrapmod;\npub mod wrappc;\n'}),
+        ("wrap-shebang-comment-then-inner", "#![cfg(any())]", "`#!`, a comment, then `[cfg(any())]` is an inner attribute",
+         {"src/wrap_a.rs": "#! // c\n[cfg(any())]\n" + a_line}),
     ]
     for label, reason, desc, edits in reds:
         fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
@@ -3014,6 +3026,10 @@ def _wrap_cells(t, fx, repo, base):
                                   "    /* a note\n       on two lines */\n    // another note\n")}),
         ("wrap-ctl-samewrap", "an unrelated edit next to a definition already behind #[cfg(feature = ...)] at the base",
          {"src/wrap_g.rs": files["src/wrap_g.rs"] + "pub const OTHER_G: u32 = 1;\n"}),
+        ("wrap-ctl-shebang", "a plain shebang line above the item",
+         {"src/wrap_a.rs": "#!/usr/bin/env run-cargo-script\n" + a_line}),
+        ("wrap-ctl-shebang-quote", "a shebang line ending in a quote is stripped, not an open string",
+         {"src/wrap_a.rs": '#!/x "\n' + a_line}),
     ]
     for label, desc, edits in controls:
         fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
@@ -3190,6 +3206,7 @@ SELF_TEST_OK = (
     "(wrap-adv-lrm-outer, wrap-adv-rlm-outer, wrap-adv-lrm-inner-file, each with -gate, #6838) "
     "U+200E or U+200F between `#`, `!` and `[` keeps the attribute, and (wrap-ws-outer-u0009, wrap-ws-inner-u0009, wrap-ws-outer-u000a, wrap-ws-inner-u000a, wrap-ws-outer-u000b, wrap-ws-inner-u000b, wrap-ws-outer-u000c, wrap-ws-inner-u000c, wrap-ws-outer-u000d, wrap-ws-inner-u000d, wrap-ws-outer-u0020, wrap-ws-inner-u0020, wrap-ws-outer-u0085, wrap-ws-inner-u0085, wrap-ws-outer-u200e, wrap-ws-inner-u200e, wrap-ws-outer-u200f, wrap-ws-inner-u200f, wrap-ws-outer-u2028, wrap-ws-inner-u2028, wrap-ws-outer-u2029, wrap-ws-inner-u2029) every Rust "
     "Pattern_White_Space code point there is RED; "
+    "(wrap-adv-shebang-string, wrap-adv-shebang-block, wrap-bom-shebang, wrap-shebang-root-decl, wrap-shebang-comment-then-inner, each with -gate, #6839) a first line rustc strips as a shebang (after an optional BOM, in any file) cannot hide the attribute below it, and `#!`, a comment, then `[` stays an inner attribute; (wrap-ctl-shebang, wrap-ctl-shebang-quote) a shebang line, one ending in a quote included, is GREEN; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
