@@ -39,9 +39,8 @@ const WATCHDOG: Duration = Duration::from_secs(10);
 /// handful of connections; far below any `RLIMIT_NOFILE` in use (#6323).
 const BACKLOG_BOUND: usize = 64;
 
-/// More connects than any listen backlog the kernel will grant an
-/// unprivileged listener (`somaxconn` defaults to 4096 on modern kernels).
-const BACKLOG_FILL_CEILING: usize = 8192;
+/// Safety ceiling for the fill loop; a backlog-1 listener fills in a handful.
+const BACKLOG_FILL_CEILING: usize = 256;
 
 fn private_dir() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -112,9 +111,33 @@ fn nonblocking_connect(path: &Path) -> io::Result<UnixStream> {
     }
 }
 
-/// A listener that never accepts, so its queue can be filled.
+/// A listener that never accepts, bound with an EXPLICIT backlog of 1 (#6323).
+/// `UnixListener::bind` asks for the system maximum (`net.core.somaxconn`,
+/// 4096 on modern kernels), so filling its queue needs thousands of
+/// descriptors and fails with EMFILE under the common soft `RLIMIT_NOFILE` of
+/// 1024. With a backlog of 1 the queue is full after two or three connects.
 fn listener(path: &Path) -> UnixListener {
-    UnixListener::bind(path).expect("bind")
+    let (addr, len) = unix_sockaddr(path);
+    // SAFETY: a plain syscall with constant arguments; the descriptor is
+    // checked and then owned by `OwnedFd`, which closes it on every path.
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    assert!(raw >= 0, "socket: {}", io::Error::last_os_error());
+    // SAFETY: `raw` is a freshly created descriptor nothing else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: `addr` is fully initialised and outlives the call; `len` is the
+    // number of its bytes in use.
+    let rc = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            (&raw const addr).cast::<libc::sockaddr>(),
+            len,
+        )
+    };
+    assert_eq!(rc, 0, "bind: {}", io::Error::last_os_error());
+    // SAFETY: `fd` is a bound stream socket.
+    let rc = unsafe { libc::listen(fd.as_raw_fd(), 1) };
+    assert_eq!(rc, 0, "listen: {}", io::Error::last_os_error());
+    UnixListener::from(fd)
 }
 
 /// Fill `path`'s accept queue with non-blocking connects until the kernel
