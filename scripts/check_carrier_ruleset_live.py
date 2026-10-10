@@ -521,6 +521,8 @@ def trigger_covers(workflow_text, branch):
         if _indent(line) == 0 and line.startswith("on:"):
             inline = line[3:].strip()
             if inline:
+                if inline.startswith("{"):
+                    return False  # flow mapping: not parsed, so it never "covers" (#6429)
                 return "pull_request" in re.findall(r"[\w-]+", inline)
             block = []
             for body in lines[i + 1:]:
@@ -534,7 +536,10 @@ def trigger_covers(workflow_text, branch):
         return False
     event_indent = _indent(block[0])
     for j, body in enumerate(block):
-        if _indent(body) == event_indent and re.match(r"pull_request\s*:", body.strip()):
+        head = re.match(r"pull_request\s*:\s*(.*)$", body.strip()) if _indent(body) == event_indent else None
+        if head:
+            if head.group(1) not in ("", "null", "~"):
+                return False  # a flow mapping or any inline value after the colon is not parsed (#6429)
             sub = []
             for deeper in block[j + 1:]:
                 if _indent(deeper) <= event_indent:
