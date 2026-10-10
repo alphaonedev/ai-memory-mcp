@@ -2397,6 +2397,16 @@ def _self_test_cases() -> int:
     masks("#6663 R5 a table row after a bare name still ends the wait", "api_key:\n| a | b |\n  6163shown", shown=(
         "| a | b |", "6163shown"), count=0)
 
+    # #6163 round 5 (#6664): a YAML block scalar may carry a tag or an anchor before its indicator.
+    masks("#6664 R5 C a tagged block scalar under a credential name is masked",
+          "secret: !!binary |\n  6163CanaryCValue\nnext: shown-6163", hidden=("6163CanaryCValue",),
+          shown=("secret: !!binary |", "next: shown-6163"), count=1)
+    masks("#6664 R5 D an anchored block scalar under a credential name is masked",
+          "secret: &anchor6163 |\n  6163CanaryDValue\nnext: shown-6163", hidden=("6163CanaryDValue",),
+          shown=("secret: &anchor6163 |", "next: shown-6163"), count=1)
+    masks("#6664 R5 a tagged one-line value is still masked", "secret: !!str 6163CanaryTagValue",
+          hidden=("6163CanaryTagValue",), count=1)
+
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
     fetch_root = base_dir / "pr-fetch"
