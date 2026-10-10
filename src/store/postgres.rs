@@ -835,7 +835,10 @@ const SQL_DELETE_FORGET_TOMBSTONE_BY_MEMORY_ID: &str =
 /// `memory_links.source_cid`/`target_cid` mirror stamp.
 const SQL_SELECT_CID_BY_ID: &str = "SELECT cid FROM memories WHERE id = $1";
 const SQL_LOAD_AGE: &str = "LOAD 'age'";
-const SQL_SET_AGE_SEARCH_PATH: &str = "SET LOCAL search_path = ag_catalog, \"$user\", public";
+// #7101 — keep the configured app schema for relational writes after AGE.
+// As in after_connect, preserve the current path; true confines it to this tx.
+const SQL_SET_AGE_SEARCH_PATH: &str =
+    "SELECT set_config('search_path', 'ag_catalog, ' || current_setting('search_path'), true)";
 /// AGE graph bootstrap — shared with `ai-memory schema-init`
 /// (`src/cli/schema_init.rs`).
 pub(crate) const SQL_CREATE_AGE_GRAPH: &str = "SELECT create_graph('memory_graph')";
