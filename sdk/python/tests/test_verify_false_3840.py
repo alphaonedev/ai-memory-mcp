@@ -900,7 +900,7 @@ def test_negotiated_session_check_is_fail_closed_6305() -> None:
             return self._peer
 
     good = FakeSession(context, {"subject": ((("commonName", "x"),),)})
-    _assert_negotiated_session(good, context)  # does not raise
+    _assert_negotiated_session(good, context, "x")  # does not raise
     for session in {
         "no session at all": None,
         "other context": FakeSession(other, {"subject": ((("commonName", "x"),),)}),
@@ -908,7 +908,7 @@ def test_negotiated_session_check_is_fail_closed_6305() -> None:
         "peer certificate unavailable": FakeSession(context, None),
     }.values():
         with pytest.raises(ValueError, match="verify=False"):
-            _assert_negotiated_session(session, context)  # type: ignore[arg-type]
+            _assert_negotiated_session(session, context, "x")  # type: ignore[arg-type]
 
 
 # ---- #6307: a FIFO as verify= must be refused, not opened ----------------
