@@ -1780,6 +1780,36 @@ def _self_test_cases() -> int:
 
     guarded("the program exit code for an unapproved and an approved rule change (#6741) fixture", cli_exit_cell)
 
+    # #6742: the shallow refusal is "anything but a plain `false`". A git too old to know --is-shallow-repository
+    # echoes the option name back; that answer must be refused, not read as "not shallow". The stand-in git sits first
+    # on PATH and answers only that query, every other call goes to the real git (reviewer mutant X5, `== "true"`).
+    def old_git(label, answer):
+        real_git = shutil.which("git")
+        if real_git is None:
+            raise RuntimeError("git is not on PATH")
+        fake_dir = base_dir / f"fake-git-{label}"
+        fake_dir.mkdir()
+        (fake_dir / "git").write_text(
+            f"#!{sys.executable}\nimport os, sys\nif sys.argv[-1] == '--is-shallow-repository':\n"
+            f"    sys.stdout.write({answer!r})\n    sys.exit(0)\nos.execv({real_git!r}, [{real_git!r}] + sys.argv[1:])\n",
+            encoding="utf-8")
+        (fake_dir / "git").chmod(0o755)
+        return fake_dir
+
+    def shallow_answer_cell(label, answer, wording):
+        def cell():
+            fake_dir = old_git(label, answer)
+            saved_path = os.environ["PATH"]
+            os.environ["PATH"] = f"{fake_dir}{os.pathsep}{saved_path}"
+            try:
+                case(f"a git that answers {wording} to --is-shallow-repository is refused (#6742)", reword, True,
+                     "the repository is shallow", trailer="Justin")
+            finally:
+                os.environ["PATH"] = saved_path
+        guarded(f"a git that answers {wording} to --is-shallow-repository (#6742) fixture", cell)
+
+    shallow_answer_cell("echo", "--is-shallow-repository\n", "the option name")
+
     # #6744: the fixtures of the #6575, #6609 and #6573 cells run inside guarded(), so a fault while building one
     # (a git that refuses `clone --depth`, a full disk) is that cell's named FAIL and the cells after it still run.
     # Read from this file's own syntax tree: no `fresh_pair` call for those fixtures may sit directly in the body of
