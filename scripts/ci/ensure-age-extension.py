@@ -47,7 +47,8 @@ on ``ALLOWED_QUERY_KEYS``.  These are the checks libpq itself makes
 (``conninfo_uri_decode``, ``conninfo_uri_parse_params``) plus fail-closed
 refusals where libpq would accept something urlsplit reads differently.  The
 helper is stricter than libpq in those cases only; a URL the helper accepts is
-read the same way by libpq (the parity oracle in the tests pins this).
+read the same way by libpq (``LibpqOracleTests`` in
+``scripts/test/test_ensure_age_extension_6161.py`` checks this against the real libpq and skips when none is installed).
 
 Decoding is percent-decoding only: ``%XX`` becomes one raw byte (``%FF``
 reaches PGPASSWORD as byte 0xFF, not U+FFFD) and ``+`` stays a literal plus, as
