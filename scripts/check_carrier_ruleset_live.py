@@ -1168,6 +1168,25 @@ def self_test():
     check("pre-apply tip whose negation uses ?", lambda: pre_tip(
         qneg, 1, "does not trigger on pull_request for chain/promo6-ssh"))
 
+    # Mutant S14 (round 4): a `pull_request_target` trigger would run fork code with a write token.
+    # No gate looked at the event set, so the mutation survived every test.
+    target_wf = wf_text.replace("\n  pull_request:\n", "\n  pull_request_target:\n    branches: ['chain/**']\n"
+                                "  pull_request:\n", 1)
+    for label, text, event, want in (
+            ("events: committed workflow has no pull_request_target", wf_text, "pull_request_target", False),
+            ("events: committed workflow has pull_request", wf_text, "pull_request", True),
+            ("events: pull_request_target block key", target_wf, "pull_request_target", True),
+            ("events: pull_request_target inline list", "on: [push, pull_request_target]\n",
+             "pull_request_target", True),
+            ("events: pull_request_target inline flow mapping", "on: {pull_request_target: {}}\n",
+             "pull_request_target", True),
+            ("events: pull_request_target scalar", "on: pull_request_target\n", "pull_request_target", True),
+            ("events: pull_request is not pull_request_target", "on:\n  pull_request:\n", "pull_request_target",
+             False),
+            ("events: no on block", "name: x\n", "pull_request_target", False)):
+        check(label, lambda t=text, e=event, w=want: None if (e in on_events(t)) is w
+              else f"{e!r} in on_events is not {w}")
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"
