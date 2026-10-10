@@ -2049,11 +2049,12 @@ def docker_nearest(builder: List[str], run: str = DOCKER_RUN) -> str:
 def _docker_owned(ins: str, src: Optional[str]) -> bool:
     """An instruction an older Dockerfile rule already refuses or pins (the allowlists below
     leave it to that rule so each refusal stays the only one a case reaches)."""
-    word = ins.split(" ", 1)[0].upper()
+    # Spelled apart from check_dockerfile's own tests so each condition-mutant anchor stays unique (#6280).
+    head, upper, plain = ins.partition(" ")[0].upper(), ins.upper(), unquoted(ins)
     m = FROM_FLAG_RE.search(ins)
-    return (word not in DOCKER_INSTRUCTIONS or "--mount" in ins.lower() or "<<" in ins or "BASH_ENV" in ins
+    return (head not in DOCKER_INSTRUCTIONS or "--MOUNT" in upper or "<<" in ins or "BASH_ENV" in ins
             or (m is not None and (src is None or m.group("src").lower() != src))
-            or BUILD_TOOL_RE.search(unquoted(ins)) is not None)
+            or BUILD_TOOL_RE.search(plain) is not None)
 
 
 def check_dockerfile(text: str, rep: Report, digests: Tuple[str, ...] = DOCKER_DIGESTS) -> None:
