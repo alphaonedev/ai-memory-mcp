@@ -45,9 +45,17 @@ if "--health" in args:
     sys.exit(1)
 if args[:2] == ["identity", "export-pub"]:
     print("AAAA")
-if args[:2] == ["identity", "hub-cache"] and {write_allowlist!r}:
-    with open(args[args.index("--out") + 1], "w") as out:
-        out.write("{{}}")
+if args[:2] == ["identity", "hub-cache"]:
+    if {write_allowlist!r}:
+        with open(args[args.index("--out") + 1], "w") as out:
+            out.write("{{}}")
+    else:
+        # Fail only once serve is up, so the error always has a child to leak.
+        end = time.monotonic() + 30
+        while time.monotonic() < end and not any(
+            name.startswith("serve-") for name in os.listdir({marks!r})
+        ):
+            time.sleep(0.05)
 sys.exit(0)
 """
 
