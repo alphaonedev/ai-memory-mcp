@@ -2600,6 +2600,21 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     i5 = edit_range("\n" + amend("#6162", [mod_rs]), label="i5")
     t.expect_green("6124-i5", "one issue in the header", repo, exp6124, i5, green6124)
 
+    # (6124-m1/m2) RED (R3-F8, #6367 residual) - the #6063 cite written as an
+    # IMAGE renders a broken image, not a link: refused. m3 is the GREEN
+    # control (the canonical link).
+    image6124 = [("as an image", "did not refuse the #6063 cite written as an image")]
+    img_back = f"> Path back to LIVE: WP-B1 re-cert (!{cite6063}) only."
+    for tag, label, rec in (
+            ("m1", "back line citing #6063 as an image",
+             amend("#6162", [mod_rs], back=img_back)),
+            ("m2", "an image beside the real back line",
+             amend("#6162", [mod_rs], prose=f"> Changed in this range: !{cite6063}"))):
+        cell_m = edit_range("\n" + rec, label=tag)
+        t.expect_red(f"6124-{tag}", label, repo, exp6124, cell_m, red6124 + image6124)
+    m3 = edit_range("\n" + amend("#6162", [mod_rs]), label="m3")
+    t.expect_green("6124-m3", "the canonical #6063 link", repo, exp6124, m3, green6124)
+
     # (6124-r1..r4) #6355: the COMMITTED cert doc of this checkout, as the
     # merge-base, with a record inserted at each legal spot (GREEN), behind an
     # inserted HTML opener (RED), and above non-record prose that would then
