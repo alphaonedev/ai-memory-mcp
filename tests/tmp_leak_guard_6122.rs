@@ -117,7 +117,8 @@ fn suite_sources() -> Vec<(String, String)> {
 /// Source-text classifiers used by the ceilings (#6788). Each one is a pure
 /// function so a fixture string pins every shape it must recognise.
 ///
-/// Sqlite open needles (the old, literal list).
+/// Literal sqlite open needles; aliases and bare imports are resolved by
+/// `use_statements` below.
 const OPEN_NEEDLES: &[&str] = &[
     "db::open",
     "SqliteStore::open",
@@ -125,29 +126,188 @@ const OPEN_NEEDLES: &[&str] = &[
     "Connection::open",
     "storage::open",
     "open_read_only",
+    "open_with_flags",
 ];
 
-/// Shapes that leak a temp handle without `mem::forget(`; zero ceiling.
-const LEAK_SHAPES: &[&str] = &[];
+/// Free functions that open a sqlite database when imported by name.
+const OPEN_FNS: &[&str] = &["open", "open_db", "open_read_only", "open_with_flags"];
 
-fn opens_sqlite(src: &str) -> bool {
-    OPEN_NEEDLES.iter().any(|needle| src.contains(needle))
+/// Types / modules whose `::open` opens sqlite; `use X as Y` makes `Y::open`.
+const OPEN_OWNERS: &[&str] = &["Connection", "SqliteStore", "storage", "db"];
+
+/// Shapes that leak a temp handle without `mem::forget(`; zero ceiling
+/// (checked only in files that hold a temp handle, see `holds_temp_handle`).
+/// `persist` is deliberately absent: it moves the file to a caller-chosen
+/// path, which is a move, not a leak of the scratch location.
+const LEAK_SHAPES: &[&str] = &[
+    "ManuallyDrop::new(",
+    "Box::leak(",
+    ".into_path()",
+    ".into_temp_path()",
+    ".keep()",
+];
+
+fn is_ident(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
-fn holds_raw_named_tempfile(src: &str) -> bool {
-    src.contains("NamedTempFile")
+/// Tokens (identifiers) of `s`.
+fn tokens(s: &str) -> Vec<&str> {
+    s.split(|c: char| !is_ident(c))
+        .filter(|t| !t.is_empty())
+        .collect()
 }
 
+/// The text of every `use ...;` statement in `src`.
+fn use_statements(src: &str) -> Vec<&str> {
+    src.match_indices("use ")
+        .filter(|(i, _)| !src[..*i].chars().next_back().is_some_and(is_ident))
+        .map(|(i, _)| {
+            let rest = &src[i..];
+            &rest[..rest.find(';').unwrap_or(rest.len())]
+        })
+        .collect()
+}
+
+/// Names bound by `<name> as <alias>` in `statement` for each `name` in `names`.
+fn aliases_of(statement: &str, names: &[&str]) -> Vec<String> {
+    let t = tokens(statement);
+    t.windows(3)
+        .filter(|w| w[1] == "as" && names.contains(&w[0]))
+        .map(|w| w[2].to_owned())
+        .collect()
+}
+
+/// Number of calls `name(` that is a bare call: not a method call
+/// (`x.name(`), not a path call (`a::name(`), not a definition (`fn name(`).
+fn bare_calls(src: &str, name: &str) -> usize {
+    let needle = format!("{name}(");
+    src.match_indices(&needle)
+        .filter(|(i, _)| {
+            let before = &src[..*i];
+            let prev = before.chars().next_back();
+            let is_def = before.trim_end().ends_with("fn") && prev.is_some_and(char::is_whitespace);
+            !prev.is_some_and(|c| is_ident(c) || c == '.' || c == ':') && !is_def
+        })
+        .count()
+}
+
+/// Occurrences of `path::name(` where `path` starts at an identifier boundary.
+fn path_calls(src: &str, path_and_name: &str) -> usize {
+    let needle = format!("{path_and_name}(");
+    src.match_indices(&needle)
+        .filter(|(i, _)| !src[..*i].chars().next_back().is_some_and(is_ident))
+        .count()
+}
+
+fn is_std_mem_statement(statement: &str) -> bool {
+    let t = tokens(statement);
+    (t.contains(&"std") || t.contains(&"core")) && t.contains(&"mem")
+}
+
+/// Call sites of `std::mem::forget`: the qualified `mem::forget(`, a bare
+/// `forget(` when it is imported (also by glob), an alias of `forget`, and a
+/// call through an alias of `mem`.
 fn forget_sites(src: &str) -> usize {
-    src.matches("mem::forget(").count()
+    let mut sites = src.matches("mem::forget(").count();
+    let mut bare_imported = false;
+    let mut fn_aliases = Vec::new();
+    let mut mem_aliases = Vec::new();
+    for st in use_statements(src)
+        .into_iter()
+        .filter(|s| is_std_mem_statement(s))
+    {
+        let t = tokens(st);
+        bare_imported |= t.windows(2).any(|w| w[0] == "forget" && w[1] != "as")
+            || t.last() == Some(&"forget")
+            || st.contains("mem::*");
+        fn_aliases.extend(aliases_of(st, &["forget"]));
+        mem_aliases.extend(aliases_of(st, &["mem"]));
+    }
+    if bare_imported {
+        sites += bare_calls(src, "forget");
+    }
+    for alias in &fn_aliases {
+        sites += bare_calls(src, alias);
+    }
+    for alias in mem_aliases.iter().filter(|a| a.as_str() != "mem") {
+        sites += path_calls(src, &format!("{alias}::forget"));
+    }
+    sites
+}
+
+/// A file that holds a `tempfile` handle (directory or file).
+fn holds_temp_handle(src: &str) -> bool {
+    ["tempfile", "TempDir", "tempdir", "TempPath"]
+        .iter()
+        .any(|m| src.contains(m))
 }
 
 fn leak_shape_hits(src: &str) -> Vec<&'static str> {
+    if !holds_temp_handle(src) {
+        return Vec::new();
+    }
     LEAK_SHAPES
         .iter()
         .copied()
         .filter(|shape| src.contains(shape))
         .collect()
+}
+
+/// A raw `tempfile::NamedTempFile`, however it is built: the type name, or the
+/// `tempfile::Builder` terminals `.tempfile(` / `.tempfile_in(` / `.make(` /
+/// `.make_in(`.
+fn holds_raw_named_tempfile(src: &str) -> bool {
+    src.contains("NamedTempFile")
+        || src.contains(".tempfile(")
+        || src.contains(".tempfile_in(")
+        || (src.contains("Builder::new") && (src.contains(".make(") || src.contains(".make_in(")))
+}
+
+/// Does `src` open a sqlite database? Literal needles, aliases of the owning
+/// type / module (`use rusqlite::Connection as Conn;`), aliases of the open
+/// function (`use ai_memory::db::open as o;`), bare imports of an open
+/// function and globs over the owning modules.
+fn opens_sqlite(src: &str) -> bool {
+    if OPEN_NEEDLES.iter().any(|needle| src.contains(needle)) {
+        return true;
+    }
+    for st in use_statements(src) {
+        let t = tokens(st);
+        let sqlite_path = t
+            .iter()
+            .any(|w| matches!(*w, "ai_memory" | "rusqlite" | "crate" | "super"));
+        if !sqlite_path {
+            continue;
+        }
+        if aliases_of(st, OPEN_OWNERS)
+            .iter()
+            .any(|a| src.contains(&format!("{a}::open")))
+        {
+            return true;
+        }
+        if aliases_of(st, OPEN_FNS)
+            .iter()
+            .any(|a| bare_calls(src, a) > 0)
+        {
+            return true;
+        }
+        let imports_open_fn = t
+            .windows(2)
+            .any(|w| OPEN_FNS.contains(&w[0]) && w[1] != "as")
+            || t.last().is_some_and(|l| OPEN_FNS.contains(l));
+        if imports_open_fn {
+            return true;
+        }
+        let glob_owner = OPEN_OWNERS
+            .iter()
+            .chain(["rusqlite"].iter())
+            .any(|o| st.contains(&format!("{o}::*")));
+        if glob_owner && OPEN_FNS.iter().any(|f| bare_calls(src, f) > 0) {
+            return true;
+        }
+    }
+    false
 }
 
 /// A suite that binds a sqlite database to a raw, non-`SqliteTempFile` handle.
@@ -190,6 +350,11 @@ fn no_suite_leaks_temp_handle_by_other_means_6788() {
     );
 }
 
+/// Pinned sum of `KNOWN_MEM_FORGET_SITES` counts (#6804).
+const KNOWN_MEM_FORGET_TOTAL: usize = 78;
+/// Pinned number of files in `KNOWN_MEM_FORGET_SITES` (#6804).
+const KNOWN_MEM_FORGET_FILES: usize = 68;
+
 /// `std::mem::forget(<temp handle>)` leaks the scratch file (and its sidecars)
 /// on every run by design. Sites that already existed when the guard landed are
 /// listed here with their EXACT count, and the table is pinned in total below.
@@ -199,11 +364,6 @@ fn no_suite_leaks_temp_handle_by_other_means_6788() {
 /// `KNOWN_MEM_FORGET_TOTAL` and (when a file reaches 0 and is removed from the
 /// table) `KNOWN_MEM_FORGET_FILES` in the same commit. Raising any of the three
 /// needs coordinated edits that are visible in review.
-/// Pinned sum of `KNOWN_MEM_FORGET_SITES` counts (#6804).
-const KNOWN_MEM_FORGET_TOTAL: usize = 78;
-/// Pinned number of files in `KNOWN_MEM_FORGET_SITES` (#6804).
-const KNOWN_MEM_FORGET_FILES: usize = 68;
-
 const KNOWN_MEM_FORGET_SITES: &[(&str, usize)] = &[
     ("tests/authority_boundary_3549.rs", 1),
     ("tests/conformance_export_roundtrip_2030.rs", 1),
