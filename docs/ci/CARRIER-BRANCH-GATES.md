@@ -359,13 +359,19 @@ verifier fails otherwise), and the live carrier ruleset updated with the
   `runs-on`, `uses`, `permissions`, `concurrency`, `timeout-minutes`, the
   `env`/`with` token scan) names the value shapes it accepts, and any other
   shape is refused with its line; no pin compares raw row text. A construct
-  the reader does not model (anchor, alias, `<<:`, tab, `---`, duplicate key,
-  BOM, U+2028, NEL, a quote character inside a plain key, nesting deeper than
-  64 levels) makes the gate exit non-zero and name the construct and the line.
+  the reader does not model (anchor, alias, `<<:`, tab, `---`, a duplicate key
+  in a block or a flow mapping, compared in any letter case (#6680), BOM,
+  U+2028, NEL, a quote character inside a plain key, nesting deeper than 64
+  levels) makes the gate exit non-zero and name the construct and the line.
   The workflow must have a `permissions:` block, and it and every job's block
   must be a block mapping of lowercase scopes to `read` or `none` (flow
   mappings, block scalars, `read-all`/`write-all` and case variants are
-  refused). No job name may be an expression (#6618). The secret and token
+  refused). Every `jobs.<id>` must be a block mapping: a job written as a
+  flow mapping, a scalar or an empty value is refused with its line, and the
+  accessor never reads a key of such a node as absent (#6679). No job name
+  may be an expression (#6618). A problem or refusal reprints at most 120
+  characters of a row, masks GitHub-token-shaped strings and withholds the
+  literal value of a credential-named key (#6681). The secret and token
   scan reads parsed scalars, keys, flow entries and block-scalar lines
   (#6617); `secrets` matches in any letter case. The two #6143 jobs have a
   closed shape: `name`, one plain `runs-on` label, a `timeout-minutes` of

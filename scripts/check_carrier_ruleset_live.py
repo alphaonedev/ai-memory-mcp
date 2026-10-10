@@ -523,9 +523,9 @@ def _event_key(node):
     """The event name of a key under `on:`; anything the reader does not model is Unparsed (#6481)."""
     name = node.name
     if not EVENT_NAME.fullmatch(name):
-        raise Unparsed(f"line {node.line}: trigger name {name!r} is not a plain ASCII word")
+        raise Unparsed(f"line {node.line}: trigger name {SUBSET.echo(name)} is not a plain ASCII word")
     if name.lower() in SUBSET.YAML11_BOOLEANS + ("null",):
-        raise Unparsed(f"line {node.line}: trigger name {name!r} reads as a boolean or null in YAML 1.1")
+        raise Unparsed(f"line {node.line}: trigger name {SUBSET.echo(name)} reads as a boolean or null in YAML 1.1")
     return name
 
 
@@ -623,14 +623,17 @@ def _scope_problems(label, node, is_job):
     problems = []
     for number, text in SUBSET.strings(node):
         if SECRETS_REF.search(text):
-            problems.append(f"{label} references a repository secret (line {number}): {text.strip()}")
+            problems.append(f"{label} references a repository secret (line {number}): {SUBSET.clip(text.strip())}")
         if is_job and NEEDS_REF.search(text):
-            problems.append(f"{label} reads a needs output or declares needs (line {number}): {text.strip()}")
+            problems.append(f"{label} reads a needs output or declares needs (line {number}):"
+                            f" {SUBSET.clip(text.strip())}")
     for sub in node.walk():
         if sub.kind == "key" and SUBSET.key_name(sub.name).upper() in TOKEN_ENV_NAMES:
             got = SUBSET.value(sub, SUBSET.SCALAR)
             if got != GITHUB_TOKEN_EXPR:
-                problems.append(f"{label} {sub.name} is not {GITHUB_TOKEN_EXPR} (line {sub.line}): {got}")
+                # #6681: a credential slot's literal value is never reprinted, only its length.
+                problems.append(f"{label} {SUBSET.clip(sub.name)} is not {GITHUB_TOKEN_EXPR} (line {sub.line});"
+                                f" its value is withheld ({len(got)} characters)")
     return problems
 
 
@@ -647,7 +650,7 @@ def _permissions_problems(label, holder, required):
         for sub in node.keys():
             scope, level = SUBSET.key_name(sub.name), SUBSET.value(sub, (SUBSET.PLAIN,))
             if not PERMISSION_SCOPE.match(scope) or level not in PERMISSION_LEVELS:
-                bad.append(f"{scope}: {level} (line {sub.line})")
+                bad.append(f"{SUBSET.clip(scope)}: {SUBSET.clip(level)} (line {sub.line})")
     except Unparsed as exc:
         return [f"{label} {PERMISSIONS_PROBLEM} ({exc})"]
     return [f"{label} {PERMISSIONS_PROBLEM}: " + "; ".join(bad)] if bad else []
@@ -706,7 +709,8 @@ def job_token_problems(workflow_text):
     (3-agent vote (6def5ab6), option C): a shape the pin does not allow is a problem naming its line,
     and nothing is compared as raw text. Everything outside `jobs:` (workflow `env:`, `defaults:`,
     `permissions:`) is inherited by every job, so it is held to the same rule as the jobs: no
-    repository secret, no GH_TOKEN/GITHUB_TOKEN that is not exactly `${{ github.token }}`. The
+    repository secret, no GH_TOKEN/GITHUB_TOKEN that is not exactly `${{ github.token }}` (its literal
+    value is never reprinted, #6681). Every `jobs.<id>` must be a block mapping (#6679). The
     workflow `permissions:` block must exist and every job's `permissions:` must be a block mapping
     of read/none (#6610). No job name may be an expression (#6618). A #6143 job also takes no
     `needs:` (an output can carry a credential), has the closed CARRIER_JOB_SPEC shape, and its check
@@ -724,7 +728,12 @@ def job_token_problems(workflow_text):
     jobs = jobs_node.keys() if jobs_node is not None else []
     names = {}
     for node in jobs:
-        label = f"job {node.name}"
+        label = f"job {SUBSET.clip(node.name)}"
+        form = SUBSET.shape(node)
+        if form != SUBSET.MAP:  # #6679: refuse, never skip; no pin may read a flow job as "no name"
+            problems.append(f"{label} (line {node.line}) is not a block mapping ({form}); every job must be"
+                            f" one, so its name and permissions are read by the pins (#6679)")
+            continue
         problems.extend(_permissions_problems(label, node, False))
         try:
             name_node = SUBSET.child(node, "name")
@@ -744,7 +753,7 @@ def job_token_problems(workflow_text):
             if node.name == job_id:
                 wanted = node
             elif same_id or claims:
-                problems.append(f"job {node.name} (line {node.line}) imitates {job_id} / {context!r}")
+                problems.append(f"job {SUBSET.clip(node.name)} (line {node.line}) imitates {job_id} / {context!r}")
         if wanted is None:
             problems.append(f"job {job_id} not found")
             continue
@@ -1822,6 +1831,12 @@ def self_test():
             f"      - name: q\n        env:\n          X: ${{{{ secrets.PAT }}}} {tok}\n        run: printenv\n"), tok[-12:]))
         r9_cells.append((f"round9 #6681: {tok[:4]} token masked in a refusal", r8_after_vstep(
             f"      - name: q\n        env:\n          X: \"{tok}\n        run: printenv\n"), tok[-12:]))
+    r9_cells.append(("round9 #6681: a token-shaped permission level is masked", r8_in_live(
+        job_perm, f"    permissions:\n      contents: {r9_tokens[0]}\n      issues: read\n"), r9_tokens[0][-12:]))
+    r9_cells.append(("round9 #6681: a 3000-character refused trigger name is cut", swap(
+        wf_text, "\non:\n", "\non:\n  " + "Z" * 3000 + ".x:\n"), "Z" * 121))
+    r9_cells.append(("round9 #6681: a 3000-character key of the wrong shape is cut in the refusal", swap(
+        wf_text, top_perm, top_perm + "  " + "Z" * 3000 + ": [read]\n"), "Z" * 121))
     for label, text, leak in r9_cells:
         check(label, lambda t=text, s=leak: (
             "workflow_pin_problems is empty" if not workflow_pin_problems(t)

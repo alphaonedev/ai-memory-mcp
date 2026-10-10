@@ -8,9 +8,9 @@ was differential-tested against PyYAML 6.0.1 yaml.SafeLoader (see that file's do
 the grammar and the differential runs).  It lives here so the verifier
 scripts/check_carrier_ruleset_live.py reads workflow files with the SAME grammar instead of
 regular expressions (#6481, #6482, #6542, #6543, #6545): a construct the reader does not model
-(anchor, alias, merge key, tab, a second document, a duplicate key, BOM, NEL and the other
-exotic line breaks, a quoted key below the top level, a flow collection that does not close on
-its row) raises ``Unparsed`` and the caller fails closed.  ``parse_workflow`` prefixes the
+(anchor, alias, merge key, tab, a second document, a duplicate key in a block or a flow mapping,
+BOM, NEL and the other exotic line breaks, a quoted key below the top level, a flow collection
+that does not close on its row) raises ``Unparsed`` and the caller fails closed.  ``parse_workflow`` prefixes the
 message with ``line N:``.  The functions from ``Unparsed`` to ``_check_top_level`` are moved
 from the test unchanged, except that ``_meaningful`` takes an optional ``detail`` list (one
 record per row) that the tree reader at the end of this file uses.
@@ -26,7 +26,61 @@ from typing import Dict, List, Optional, Set, Tuple
 
 
 class Unparsed(Exception):
-    """Raised when the reader cannot interpret a trigger (a FAILURE, never a skip)."""
+    """Raised when the reader cannot interpret a trigger (a FAILURE, never a skip).
+
+    The message is passed through ``mask`` (#6681), so no refusal reprints a GitHub-token-shaped
+    string or the literal value of a credential-named key, whichever site built it.
+    """
+
+    def __init__(self, *args: object) -> None:
+        super().__init__(*(mask(a) if isinstance(a, str) else a for a in args))
+
+
+# #6681: a refusal or problem reprints at most ECHO_LIMIT characters of a workflow row or value, with
+# every GitHub-token-shaped string masked and the literal value of a credential-named key withheld
+# (an expression such as ``${{ github.token }}`` is kept: it names a source, it is not a value).
+ECHO_LIMIT = 120
+_TOKEN_SHAPE = re.compile(r"\b(gh[pousr]_|github_pat_)[A-Za-z0-9_]+")
+# A key (a word, optionally quoted) and its ``:`` or ``=``; the lookbehind starts a match only at the
+# start of a word, so the scan is linear in the text (no nested backtracking).
+_PAIR_KEY = re.compile(r"(?<![\w.-])([\w.-]+)['\"]?[ \t]*[:=][ \t]*")
+_CREDENTIAL_WORD = re.compile(r"token|secret|password|passwd|credential|api[_-]?key|private[_-]?key", re.IGNORECASE)
+_PAIR_VALUE = re.compile(r"[^\s,\]}#][^,\]}#]*")
+_KEPT_VALUES = ("${{", "'${{", '"${{', "<withheld ")
+
+
+def mask(text: str) -> str:
+    """``text`` with credential-named values withheld and token-shaped strings masked (idempotent, #6681)."""
+    out: List[str] = []
+    pos = 0
+    for key in _PAIR_KEY.finditer(text):
+        if key.start() < pos or not _CREDENTIAL_WORD.search(key.group(1)):
+            continue
+        if any(text.startswith(kept, key.end()) for kept in _KEPT_VALUES):
+            continue
+        val = _PAIR_VALUE.match(text, key.end())
+        if val is None:
+            continue
+        out.append(text[pos:key.end()])
+        out.append("<withheld %d chars>" % len(val.group()))
+        pos = val.end()
+    out.append(text[pos:])
+    return _TOKEN_SHAPE.sub(lambda m: m.group(1) + "<masked>", "".join(out))
+
+
+def clip(text: str) -> str:
+    """``mask(text)`` cut to ECHO_LIMIT characters, with ``...`` when it was cut (#6681).
+
+    Only a bounded window of the text is masked, so a very long row costs no more than a short one.
+    """
+    raw = str(text)
+    text = mask(raw[:4 * ECHO_LIMIT])
+    return text[:ECHO_LIMIT] + "..." if len(raw) > 4 * ECHO_LIMIT or len(text) > ECHO_LIMIT else text
+
+
+def echo(text: str) -> str:
+    """The quoted ``clip`` of a row for a refusal message (#6681)."""
+    return repr(clip(text))
 
 
 def _strip_comment(line: str) -> str:
@@ -60,15 +114,15 @@ def _parse_inline_list(text: str) -> List[str]:
     """The items of an inline filter list; each must be one scalar (#5733)."""
     text = text.strip(" ")
     if not text.startswith("["):
-        raise Unparsed("unterminated or non-list flow value: " + text)
+        raise Unparsed("unterminated or non-list flow value: " + echo(text))
     # _value already read this flow collection to its end and refused any text after
     # it (_tail), so nothing follows it here (#5777).
     items = _flow(text, 0)[1]
     for item in items:  # type: ignore[attr-defined]
         if not isinstance(item, str):
-            raise Unparsed("inline list item is not one scalar (#5733): " + text)
+            raise Unparsed("inline list item is not one scalar (#5733): " + echo(text))
         if isinstance(item, _Plain) and _typed_plain(item):
-            raise Unparsed("plain scalar YAML 1.1 reads as other than a string (#5734): " + text)
+            raise Unparsed("plain scalar YAML 1.1 reads as other than a string (#5734): " + echo(text))
     return [str(item) for item in items]  # type: ignore[attr-defined]
 
 
@@ -120,11 +174,11 @@ def _quoted_end(s: str, i: int) -> int:
     """
     end = s.find(s[i], i + 1)
     if end < 0:
-        raise Unparsed("quoted scalar does not close on its row: " + repr(s))
+        raise Unparsed("quoted scalar does not close on its row: " + echo(s))
     if s[i] == '"' and "\\" in s[i + 1:end]:
-        raise Unparsed("double-quoted scalar holds a backslash (#5706): " + repr(s))
+        raise Unparsed("double-quoted scalar holds a backslash (#5706): " + echo(s))
     if s[i] == "'" and s[end + 1:end + 2] == "'":
-        raise Unparsed("single-quoted scalar holds a doubled quote (#5706): " + repr(s))
+        raise Unparsed("single-quoted scalar holds a doubled quote (#5706): " + echo(s))
     return end + 1
 
 
@@ -134,7 +188,7 @@ def _tail(s: str, i: int, what: str) -> str:
     after = rest.lstrip(" ")
     if not after or (after[0] == "#" and len(after) < len(rest)):
         return s[:i]
-    raise Unparsed("text after " + what + ": " + repr(s))
+    raise Unparsed("text after " + what + ": " + echo(s))
 
 
 def _flow_space(s: str, j: int) -> int:
@@ -142,7 +196,7 @@ def _flow_space(s: str, j: int) -> int:
     while j < len(s) and s[j] == " ":
         j += 1
     if j == len(s) or (s[j] == "#" and s[j - 1] == " "):
-        raise Unparsed("flow collection does not close on its row: " + repr(s))
+        raise Unparsed("flow collection does not close on its row: " + echo(s))
     return j
 
 
@@ -154,30 +208,30 @@ def _flow_plain(s: str, j: int, key: bool) -> Tuple[int, str]:
     """
     ch = s[j]
     if ch in ",]}":
-        raise Unparsed("empty flow entry or trailing comma (#5733): " + repr(s))
+        raise Unparsed("empty flow entry or trailing comma (#5733): " + echo(s))
     if ch in _NODE_PROPERTY:
-        raise Unparsed("anchor, alias, tag or reserved indicator in a flow collection (#5733): " + repr(s))
+        raise Unparsed("anchor, alias, tag or reserved indicator in a flow collection (#5733): " + echo(s))
     if ch in "-?:|>[{":
-        raise Unparsed("flow entry starts with an indicator (#5733): " + repr(s))
+        raise Unparsed("flow entry starts with an indicator (#5733): " + echo(s))
     k = j
     while k < len(s) and s[k] not in _FLOW_STOPS:
         ch = s[k]
         if ch in "'\"":
-            raise Unparsed("quote inside a plain flow scalar: " + repr(s))
+            raise Unparsed("quote inside a plain flow scalar: " + echo(s))
         if ch == ":":
             if key:
                 break
-            raise Unparsed("':' inside a plain flow scalar (#5733): " + repr(s))
+            raise Unparsed("':' inside a plain flow scalar (#5733): " + echo(s))
         if ch == "#":
             if s[k - 1] == " ":
-                raise Unparsed("flow collection does not close on its row: " + repr(s))
-            raise Unparsed("'#' inside a plain flow scalar (#5733): " + repr(s))
+                raise Unparsed("flow collection does not close on its row: " + echo(s))
+            raise Unparsed("'#' inside a plain flow scalar (#5733): " + echo(s))
         if not " " <= ch <= "~":
-            raise Unparsed("non-ASCII or control character in a flow scalar (#5733): " + repr(s))
+            raise Unparsed("non-ASCII or control character in a flow scalar (#5733): " + echo(s))
         k += 1
     text = s[j:k].rstrip(" ")
     if text in ("<<", "="):
-        raise Unparsed("plain << or = (merge or value tag) in a flow collection (#5749): " + repr(s))
+        raise Unparsed("plain << or = (merge or value tag) in a flow collection (#5749): " + echo(s))
     return k, _Plain(text)
 
 
@@ -195,7 +249,7 @@ def _flow_node(s: str, j: int, depth: int = 1) -> Tuple[int, object]:
     if ch in "'\"":
         end = _quoted_end(s, j)
         if "," in s[j:end]:
-            raise Unparsed("quoted flow item with an embedded comma (#5733): " + repr(s))
+            raise Unparsed("quoted flow item with an embedded comma (#5733): " + echo(s))
         return end, s[j + 1:end - 1]
     return _flow_plain(s, j, False)
 
@@ -204,15 +258,17 @@ def _flow(s: str, i: int, depth: int = 1) -> Tuple[int, object]:
     """(index past, value) of the flow collection that opens at s[i] (#5733).
 
     It must close on its row. A sequence holds entries; a mapping holds
-    ``key: value`` entries with a plain key. Entries are separated by a comma, and
+    ``key: value`` entries with a plain key; a key repeated in any letter case is
+    refused (#6680), never read last-wins. Entries are separated by a comma, and
     only ASCII spaces may stand around them; an empty entry, a trailing comma and
     any other text are refused.
     """
     if depth > MAX_DEPTH:
-        raise Unparsed("flow collection nested deeper than %d levels (#6612): %r" % (MAX_DEPTH, s[:80]))
+        raise Unparsed("flow collection nested deeper than %d levels (#6612): %s" % (MAX_DEPTH, echo(s)))
     close = "]" if s[i] == "[" else "}"
     items: List[object] = []
     pairs: Dict[str, object] = {}
+    folded: Set[str] = set()  # #6680: casefolded keys of this flow mapping, as parse_workflow compares
     j = _flow_space(s, i + 1)
     if s[j] == close:
         return j + 1, (items if close == "]" else pairs)
@@ -222,20 +278,23 @@ def _flow(s: str, i: int, depth: int = 1) -> Tuple[int, object]:
             items.append(value)
         else:
             if s[j] in "'\"":
-                raise Unparsed("flow mapping entry with a quoted key (#5733): " + repr(s))
+                raise Unparsed("flow mapping entry with a quoted key (#5733): " + echo(s))
             j, key = _flow_plain(s, j, True)
             if s[j:j + 2] != ": ":
-                raise Unparsed("flow mapping entry is not key: value (#5733): " + repr(s))
+                raise Unparsed("flow mapping entry is not key: value (#5733): " + echo(s))
             j = _flow_space(s, j + 1)
             if s[j] in ",}":
-                raise Unparsed("flow mapping entry with no value (#5733): " + repr(s))
+                raise Unparsed("flow mapping entry with no value (#5733): " + echo(s))
+            if key.casefold() in folded:
+                raise Unparsed("repeated flow mapping key %s (#6680): %s" % (echo(key), echo(s)))
+            folded.add(key.casefold())
             j, value = _flow_node(s, j, depth)
             pairs[key] = value
         j = _flow_space(s, j)
         if s[j] == close:
             return j + 1, (items if close == "]" else pairs)
         if s[j] != ",":
-            raise Unparsed("text after a flow entry (#5733): " + repr(s))
+            raise Unparsed("text after a flow entry (#5733): " + echo(s))
         j = _flow_space(s, j + 1)
 
 
@@ -255,16 +314,16 @@ def _value(s: str, i: int) -> Tuple[str, bool]:
         assert header is not None
         return _tail(s, header.end(), "a block scalar header"), True
     if ch in _NODE_PROPERTY:
-        raise Unparsed("anchor, alias, tag or reserved indicator: " + repr(s))
+        raise Unparsed("anchor, alias, tag or reserved indicator: " + echo(s))
     if ch in ",]}" or (ch in "?:-" and s[i + 1:i + 2] in ("", " ")):
-        raise Unparsed("indicator where a value belongs: " + repr(s))
+        raise Unparsed("indicator where a value belongs: " + echo(s))
     cut = s.find(" #", i)
     end = len(s) if cut < 0 else cut
     plain = s[i:end].rstrip(" ")
     if ": " in plain or plain.endswith(":"):
-        raise Unparsed("nested mapping on one row: " + repr(s))
+        raise Unparsed("nested mapping on one row: " + echo(s))
     if plain in ("<<", "="):
-        raise Unparsed("plain << or = (merge or value tag) as a value (#5749): " + repr(s))
+        raise Unparsed("plain << or = (merge or value tag) as a value (#5749): " + echo(s))
     return s[:end].rstrip(" "), False
 
 
@@ -314,11 +373,11 @@ def _scan_row(rest: str) -> Tuple[str, str, int, bool, List[int], bool]:
         if colon >= 0:
             key = rest[i:colon].rstrip(" ")
             if key == "<<":
-                raise Unparsed("merge key: " + repr(rest))
+                raise Unparsed("merge key: " + echo(rest))
             body, header = _value(rest, colon + 1)
             return body, key, i, header, dashes, _opens_block(rest, colon + 1)
     if not dashes:
-        raise Unparsed("row is neither a mapping key, a sequence entry nor a comment: " + repr(rest))
+        raise Unparsed("row is neither a mapping key, a sequence entry nor a comment: " + echo(rest))
     body, header = _value(rest, i)
     return body, "", dashes[-1], header, dashes, _opens_block(rest, i)
 
@@ -337,20 +396,20 @@ def _nest(stack: List[Tuple[int, str]], opened: Optional[int], ind: int, kind: s
         stack.append((ind, kind))
         return
     if opened is not None and ind == opened and kind == "seq" and stack and stack[-1] == (ind, "map"):
-        raise Unparsed("indentless sequence (a sequence at its key's column): " + repr(raw))
+        raise Unparsed("indentless sequence (a sequence at its key's column): " + echo(raw))
     if not stack:
         stack.append((ind, kind))
         return
     if ind > stack[-1][0]:
-        raise Unparsed("row indented past its block continues the scalar above it: " + repr(raw))
+        raise Unparsed("row indented past its block continues the scalar above it: " + echo(raw))
     while stack[-1][0] > ind:
         stack.pop()
         if not stack:
-            raise Unparsed("row is less indented than the first row: " + repr(raw))
+            raise Unparsed("row is less indented than the first row: " + echo(raw))
     if stack[-1][0] != ind:
-        raise Unparsed("row is indented to no open block's column: " + repr(raw))
+        raise Unparsed("row is indented to no open block's column: " + echo(raw))
     if stack[-1][1] != kind:
-        raise Unparsed("row is of the other kind than its block (key row or sequence entry): " + repr(raw))
+        raise Unparsed("row is of the other kind than its block (key row or sequence entry): " + echo(raw))
 
 
 def _row_value(body: str, key: str, node: int) -> str:
@@ -401,22 +460,22 @@ def _meaningful(text: str, detail: Optional[list] = None) -> List[Tuple[int, str
             if ind > owner:
                 if _space_like(rest[0]):
                     raise Unparsed("block scalar line starts with a tab or a Unicode space, separator, control or format"
-                               " character (#5732): " + repr(raw))
+                               " character (#5732): " + echo(raw))
                 if content is None:
                     if blank > ind:
                         raise Unparsed("leading blank line of a block scalar holds more spaces than its first"
-                                       " line (#5750): " + repr(raw))
+                                       " line (#5750): " + echo(raw))
                     content = ind
                 elif ind < content:
-                    raise Unparsed("block scalar line less indented than its first line: " + repr(raw))
+                    raise Unparsed("block scalar line less indented than its first line: " + echo(raw))
                 continue
             owner = None
         if not rest:
             continue
         if not " " < rest[0] <= "~":
-            raise Unparsed("row starts with non-space whitespace or a non-ASCII character: " + repr(raw))
+            raise Unparsed("row starts with non-space whitespace or a non-ASCII character: " + echo(raw))
         if "\t" in rest:
-            raise Unparsed("tab on a structure row: " + repr(raw))
+            raise Unparsed("tab on a structure row: " + echo(raw))
         if rest[0] == "#":
             continue
         if ind == 0 and _strip_comment(rest) in ("---", "..."):
@@ -432,7 +491,7 @@ def _meaningful(text: str, detail: Optional[list] = None) -> List[Tuple[int, str
             stack.append((ind + node, "map"))
         opened = ind + node if empty else None
         if key[:1] in ("'", '"') and ind > 0:
-            raise Unparsed("quoted mapping key below the top level (#5731): " + repr(raw))
+            raise Unparsed("quoted mapping key below the top level (#5731): " + echo(raw))
         rows.append((ind, body, key))
         if detail is not None:
             detail.append((lineno, ind, node, dashes, _row_value(body, key, node)))
@@ -468,14 +527,14 @@ def _check_top_level(rows: List[Tuple[int, str, str]]) -> None:
         if idx == 0 and body == "---":
             continue
         if not key or not TOP_KEY.fullmatch(key):
-            raise Unparsed("top-level row is not a plain mapping key (#5668): " + repr(body))
+            raise Unparsed("top-level row is not a plain mapping key (#5668): " + echo(body))
         name = key.strip("\"'").lower()
         if name in YAML11_BOOLEANS and key not in ON_KEYS:
-            raise Unparsed("top-level key is a YAML 1.1 boolean other than on (#5708): " + body)
+            raise Unparsed("top-level key is a YAML 1.1 boolean other than on (#5708): " + echo(body))
         if key[0] in ("'", '"') and key not in ON_KEYS:
-            raise Unparsed("quoted mapping key other than a top-level on (#5731): " + body)
+            raise Unparsed("quoted mapping key other than a top-level on (#5731): " + echo(body))
         if name in seen:
-            raise Unparsed("repeated top-level key (#5667): " + body)
+            raise Unparsed("repeated top-level key (#5667): " + echo(body))
         seen.add(name)
 
 
@@ -577,8 +636,8 @@ def parse_workflow(text: str) -> Node:
     """The document as a tree.  Raises ``Unparsed("line N: ...")`` on anything not modelled.
 
     No BOM is stripped (a BOM is refused, #6543); a second document, a duplicate key at any
-    level, an alias, an anchor, a merge key, a tab and a quoted key below the top level are
-    all refused by the reader or here.
+    level of a block or a flow mapping (compared casefolded, #6680), an alias, an anchor, a merge
+    key, a tab and a quoted key below the top level are all refused by the reader or here.
     """
     detail: list = []
     try:
@@ -604,13 +663,13 @@ def parse_workflow(text: str) -> Node:
             if node.col > 0 and ("'" in node.name or '"' in node.name):
                 # YAML reads a quote inside a plain key as text; a lexical reader that toggles a quote
                 # state on it misreads the rest of the row (#6617), so the tree refuses such keys.
-                raise Unparsed("line %d: quote character inside a plain mapping key %r (#6617)"
-                               % (node.line, node.name))
+                raise Unparsed("line %d: quote character inside a plain mapping key %s (#6617)"
+                               % (node.line, echo(node.name)))
             folded = key_name(node.name).casefold()
             known = seen.setdefault(id(parent), {})
             if folded in known:
-                raise Unparsed("line %d: repeated mapping key %r (first on line %d)"
-                               % (node.line, node.name, known[folded]))
+                raise Unparsed("line %d: repeated mapping key %s (first on line %d)"
+                               % (node.line, echo(node.name), known[folded]))
             known[folded] = node.line
         parent.children.append(node)
         stack.append(node)
@@ -690,7 +749,7 @@ def shape(node: Node) -> str:
 
 def where(node: Node) -> str:
     """``line N: <key>`` (``line N: sequence entry``, ``line N: document``) for a refusal message."""
-    label = key_name(node.name) if node.kind == "key" else ("document" if node.kind == "root" else "sequence entry")
+    label = clip(key_name(node.name)) if node.kind == "key" else ("document" if node.kind == "root" else "sequence entry")
     return "line %d: %s" % (node.line, label)
 
 
@@ -720,7 +779,10 @@ def child(node: Node, name: str) -> Optional[Node]:
 
     GitHub reads workflow keys case-sensitively, so ``Permissions:`` is not ``permissions:``; a pin
     that looked only for the exact spelling would miss what the variant does on another reader.
+    ``node`` itself must be a block mapping (the document included): a flow mapping, a scalar, an
+    empty value or a sequence is Unparsed with its line, never read as "no such key" (#6679).
     """
+    value(node, (MAP,))
     for sub in node.children:
         if sub.kind == "key" and key_name(sub.name).casefold() == name.casefold():
             if key_name(sub.name) != name:
@@ -736,9 +798,7 @@ def read(node: Node, path: Tuple[str, ...], allowed: Tuple[str, ...]):
     """
     here = node
     for name in path:
-        if here is not node:
-            value(here, (MAP,))
-        found = child(here, name)
+        found = child(here, name)  # child() refuses a node on the path that is not a block mapping
         if found is None:
             return None, None
         here = found
