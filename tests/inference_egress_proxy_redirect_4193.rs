@@ -183,7 +183,10 @@ async fn allow_control_follows_redirect_4193() {
             let client = build(openai, &target.uri());
             client.is_available_async().await
         };
-        assert!(available, "control (openai={openai}): allow follows the 307");
+        assert!(
+            available,
+            "control (openai={openai}): allow follows the 307"
+        );
         assert_eq!(hits(&target, "/leaked").await, 1);
     }
 }
@@ -239,7 +242,10 @@ async fn allow_control_honours_env_proxy_4193() {
             let client = build(openai, &target.uri());
             client.is_available_async().await
         };
-        assert!(available, "control (openai={openai}): the proxy answers 200");
+        assert!(
+            available,
+            "control (openai={openai}): the proxy answers 200"
+        );
         let proxied = proxy.received_requests().await.unwrap_or_default().len();
         assert_eq!(
             proxied, 1,
