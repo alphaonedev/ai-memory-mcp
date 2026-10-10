@@ -32,10 +32,12 @@ The tier URL is read from a file.  Its password is passed to psql through the
 ``PGPASSWORD`` environment variable and removed from the URL psql receives, so
 it never appears on a process argv.  Because urllib and libpq split a URL
 differently, the URL is refused (exit 2) when the two could disagree: it holds a
-``#`` (libpq has no fragment and reads keys after it), or an ``@`` after the
-point where urllib ended the host part.  Every query key other than
-``password`` must be on ``ALLOWED_QUERY_KEYS``, a case-sensitive allowlist of
-non-secret libpq parameters, so ``sslpassword``, ``oauth_client_secret``,
+TAB, CR, LF or NUL (urlsplit drops the first three, subprocess refuses NUL), a
+``#`` (libpq has no fragment and reads keys after it), more than one ``@`` in
+the host part or an ``@`` after it, or a query segment without exactly one
+``=``.  A socket-directory URL (empty host part) is refused too.  Every query
+key other than ``password`` must be on ``ALLOWED_QUERY_KEYS``, a case-sensitive
+allowlist of non-secret libpq parameters, so ``sslpassword``, ``oauth_client_secret``,
 ``scram_client_key``, ``scram_server_key`` (no environment variable) and any
 other key are refused.  A refusal names the key, never its value, and neither
 form of the URL is printed.
@@ -110,21 +112,32 @@ def psql_target(url):
 
     Fails closed on anything that is not a postgres:// URL, because a keyword
     DSN would carry its password on argv; on any URL urllib and libpq could
-    split differently (a ``#``, or an ``@`` past urllib's host part); and on any
+    split differently (TAB/CR/LF/NUL, a ``#``, several ``@`` in the host part,
+    an ``@`` past it, a query segment without exactly one ``=``); and on any
     query key that is not ``password`` or on ``ALLOWED_QUERY_KEYS``, because it
     would stay on argv.  Messages name a key only, never a value.
     """
+    if any(ch in url for ch in "\t\r\n\x00"):
+        # urlsplit silently drops TAB/CR/LF (joining lines); subprocess refuses NUL.
+        raise HelperError("tier URL file holds a TAB, line break or NUL; the URL must be one line", EXIT_BAD_INPUT)
     if "#" in url:
         raise HelperError("tier URL file holds a '#'; libpq reads past it, so it is refused", EXIT_BAD_INPUT)
     try:
         parts = urlsplit(url)
     except ValueError:
         raise HelperError("tier URL file does not hold a valid postgres:// URL", EXIT_BAD_INPUT)
-    if parts.scheme not in URL_SCHEMES or not parts.netloc:
+    if parts.scheme not in URL_SCHEMES:
         raise HelperError("tier URL file does not hold a postgres:// URL", EXIT_BAD_INPUT)
+    if not parts.netloc:
+        raise HelperError("tier URL file has no host part; socket-directory URLs (postgres:///db?host=...) "
+                          "are not supported", EXIT_BAD_INPUT)
     if "@" in parts.path or "@" in parts.query:
         # libpq ends the userinfo at the first '@' before '/', urllib at '/', '?' or '#'.
         raise HelperError("tier URL file has an '@' after the host part; percent-encode it", EXIT_BAD_INPUT)
+    if parts.netloc.count("@") > 1:
+        # urllib splits the userinfo at the last '@', libpq at the first.
+        raise HelperError("tier URL file has more than one '@' in the host part; percent-encode '@' as %40",
+                          EXIT_BAD_INPUT)
     password = None
     netloc = parts.netloc
     if "@" in netloc:
@@ -137,6 +150,9 @@ def psql_target(url):
     if any(seg and "=" not in seg for seg in parts.query.split("&")):
         # A bare segment is a value, not a key, so it is refused without being named.
         raise HelperError("tier URL file has a query parameter without '='", EXIT_BAD_INPUT)
+    if any(seg.count("=") > 1 for seg in parts.query.split("&")):
+        # parse_qsl would read the remainder (';password=...') as one value; libpq refuses it.
+        raise HelperError("tier URL file has a query parameter with more than one '='", EXIT_BAD_INPUT)
     query_pairs = parse_qsl(parts.query, keep_blank_values=True)
     kept = []
     for key, value in query_pairs:
@@ -150,6 +166,8 @@ def psql_target(url):
             name = key if key.isidentifier() and key.isascii() and len(key) <= 64 else "<unprintable>"
             raise HelperError(f"tier URL file carries query key {name}, which is not on the allowlist of "
                               "non-secret libpq parameters", EXIT_BAD_INPUT)
+    if password is not None and "\x00" in password:
+        raise HelperError("tier URL file password decodes to a NUL; it cannot be passed to psql", EXIT_BAD_INPUT)
     query = urlencode(kept) if len(kept) != len(query_pairs) else parts.query
     return urlunsplit((parts.scheme, netloc, parts.path, query, "")), password
 
@@ -165,6 +183,9 @@ def probe_lists_age(psql, url):
             [psql, target, "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", PROBE_SQL],
             capture_output=True, text=True, errors="replace", check=False, timeout=60, env=env,
         )
+    except ValueError as exc:
+        # subprocess refuses a NUL in argv or env before spawning anything.
+        raise HelperError(f"age probe refused its psql arguments ({type(exc).__name__})", EXIT_BAD_INPUT)
     except (OSError, subprocess.SubprocessError) as exc:
         raise HelperError(f"age probe could not run psql ({type(exc).__name__})", EXIT_UNAVAILABLE)
     if proc.returncode != 0:
