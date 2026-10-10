@@ -173,3 +173,79 @@ def test_file_opened_is_the_file_the_walk_checked_6828(
     with pytest.raises(ValueError, match="changed"):
         _built(client_cls, str(victim))
     assert opened == [str(victim)]
+
+
+# ---- #6829: a concurrent change is the typed refusal, never a raw OSError --
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_directory_removed_during_the_holder_check_is_a_value_error_6829(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+) -> None:
+    """The directory holding the CA file is gone between the entry's lstat and its stat."""
+    directory = _ca_dir(tmp_path)
+    bundle = _bundle(lab, directory)
+    real_stat = os.stat
+
+    def vanished(target: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if os.fspath(target) == str(directory):
+            raise FileNotFoundError(2, "No such file or directory", os.fspath(target))
+        return real_stat(target, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", vanished)
+    with pytest.raises(ValueError, match="#6829"):
+        _built(client_cls, str(bundle))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_file_removed_during_the_load_is_a_value_error_6829(
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+) -> None:
+    bundle = _bundle(lab, _ca_dir(tmp_path))
+
+    def load_then_remove(load: Callable[[], None]) -> None:
+        load()
+        bundle.unlink()
+
+    monkeypatch.setattr(_common, "_pinned_base_context", _racy_base(load_then_remove))
+    with pytest.raises(ValueError, match="changed while it was being read"):
+        _built(client_cls, str(bundle))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_removed_working_directory_is_a_value_error_6829(
+    monkeypatch: pytest.MonkeyPatch, client_cls: type
+) -> None:
+    """A relative CA path needs the working directory; one removed under us is refused."""
+
+    def gone() -> str:
+        raise FileNotFoundError(2, "No such file or directory")
+
+    monkeypatch.setattr(os, "getcwd", gone)
+    with pytest.raises(ValueError, match="#6829"):
+        _built(client_cls, "ca.pem")
+
+
+# ---- #6811: nothing follows a file, as the kernel says (ENOTDIR) ----------
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("suffix", ["/.", "/..", "/./", "/../ca.pem", "/../."])
+def test_component_after_a_file_is_refused_6811(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type, suffix: str
+) -> None:
+    """``ca.pem/.`` and ``ca.pem/..`` are ENOTDIR to the kernel; never ``ca.pem`` or its directory."""
+    directory = _ca_dir(tmp_path)
+    bundle = _bundle(lab, directory)
+    with pytest.raises(ValueError, match="not a directory"):
+        _built(client_cls, str(bundle) + suffix)
