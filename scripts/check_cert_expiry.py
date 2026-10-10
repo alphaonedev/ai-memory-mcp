@@ -2408,6 +2408,7 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     _trusted_round3_fetch_cells(tmp, t, fx, mirror, head8, good8)
     _shim_trace_cells(t)
     _ws_unit_cells(t)
+    _ws_wording_cells(t)
 
 
 CERT_CONTEXT_FIXTURE = "Enterprise-federation cert-expiry gate (cert §7 / F7)"
@@ -2803,6 +2804,26 @@ def _ws_unit_cells(t):
     for ok in (" ", "\t"):
         if _whitespace_findings(".github/workflows/u.yml", f"name: u\n# a{ok}b\n"):
             t.fail(f"(tr-s-ws-yaml): {ok!r} is YAML whitespace and must not be refused")
+
+
+def _ws_wording_cells(t):
+    """#6554: YAML refuses FF and VT outright (PyYAML: unacceptable character),
+    so a line led by one is not a second producer and YAML does not keep it as
+    content; only the other Unicode spaces are kept. The refusal stays, the
+    stated reason must be true. Cell `ws-wording` fails on a sentence of this
+    file or of changelog.d/6304.fixed.md that says otherwise."""
+    log = REPO_ROOT / "changelog.d" / "6304.fixed.md"
+    flat = re.sub(r"\s*\n\s*(?:#\s*)?", " ", Path(__file__).read_text(encoding="utf-8")
+                  + ("\n" + log.read_text(encoding="utf-8") if log.is_file() else ""))
+    ff_vt = r"\b(?:F" + "F|V" + r"T)\b"
+    wrong = (ff_vt + r"[^.;]{0,60}\b(?:keeps?|kept) as content",
+             r"U\+3000, " + ff_vt + r"[^.;]{0,30}(?:and|or) (?:others|other characters) that YAML",
+             r"second producer on an? [^.;]{0,50}" + ff_vt,
+             r"second producer on a \{code\}-led",
+             r"U\+3000 or F" + "F is scanned")
+    for pattern in wrong:
+        for hit in re.finditer(pattern, flat):
+            t.fail(f"(ws-wording): FF/VT wording claims YAML keeps them or that they hide a producer: {hit.group(0)!r}")
 
 
 def _trusted_round5_cells(judge, shapes):
