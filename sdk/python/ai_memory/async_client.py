@@ -28,6 +28,7 @@ from ai_memory._common import (
     DEFAULT_TIMEOUT,
     build_create_body,
     build_httpx_kwargs,
+    gate_transports,
     encode_path_segment,
     handle_response,
     if_match_headers,
@@ -74,18 +75,18 @@ class AsyncAiMemoryClient:
         cert: str | tuple[str, str] | None = None,
         headers: dict[str, str] | None = None,
     ) -> None:
-        self._client = httpx.AsyncClient(
-            **build_httpx_kwargs(
-                base_url=base_url,
-                api_key=api_key,
-                agent_id=agent_id,
-                timeout=timeout,
-                verify=verify,
-                cert=cert,
-                extra_headers=headers,
-                is_async=True,
-            )
+        kwargs = build_httpx_kwargs(
+            base_url=base_url,
+            api_key=api_key,
+            agent_id=agent_id,
+            timeout=timeout,
+            verify=verify,
+            cert=cert,
+            extra_headers=headers,
+            is_async=True,
         )
+        self._client = httpx.AsyncClient(**kwargs)
+        gate_transports(self._client, kwargs, verify)
 
     # -- lifecycle ----------------------------------------------------------
     async def aclose(self) -> None:
