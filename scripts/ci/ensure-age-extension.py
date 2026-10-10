@@ -72,6 +72,8 @@ TLS session secrets to a file) and ``require_auth`` (it changes the accepted aut
 keyword (an unlisted key can be the tail of a password that held a raw ``&``),
 never a value, and neither form of the URL is printed.
 
+The database name is not left on psql's argv: ``split_database`` moves it to ``PGDATABASE`` (#6181).
+
 psql runs with ``PGCONNECT_TIMEOUT=15`` and a 60 second overall limit.  A
 ``connect_timeout`` in the URL overrides the default but must be an integer in
 1..60 (#6338).  That timeout bounds only the connect phase of ONE host, and psql 18.6
@@ -292,6 +294,26 @@ def psql_target(url):
     return f"{parts.scheme}://{netloc}{parts.path}" + (f"?{query}" if query else ""), password
 
 
+def split_database(target):
+    """Return (target without its database path segment, decoded database name or None) (#6181).
+
+    The name travels in ``PGDATABASE`` so that psql's argv carries no path component: a database name that
+    equals a secret would otherwise show on every psql command line.  ``target`` is a URL that
+    ``psql_target`` already validated; everything else is kept as written.
+    """
+    scheme_end = target.index("://") + 3
+    cut = min((i for i in (target.find("/", scheme_end), target.find("?", scheme_end)) if i != -1),
+              default=len(target))
+    if cut == len(target) or target[cut] == "?":
+        return target, None
+    query_at = target.find("?", cut)
+    path_end = len(target) if query_at == -1 else query_at
+    database = unquote(target[cut + 1:path_end], errors="surrogateescape")
+    if "\x00" in database:
+        raise HelperError("tier URL file database name decodes to a NUL; it cannot be passed to psql", EXIT_BAD_INPUT)
+    return target[:cut] + target[path_end:], (database or None)
+
+
 _interrupt = {"defer": False, "pending": False}
 
 
@@ -422,9 +444,12 @@ def supervise_main(argv):
 def probe_lists_age(psql, url):
     """Return True when the tier lists ``age`` in pg_available_extensions."""
     target, password = psql_target(url)
+    target, database = split_database(target)
     env = dict(os.environ)
     if password is not None:
         env["PGPASSWORD"] = password
+    if database is not None:
+        env["PGDATABASE"] = database  # #6181: the name is not on argv
     env["PGCONNECT_TIMEOUT"] = CONNECT_TIMEOUT_SECONDS  # a connect_timeout in the URL overrides it
     for name in SERVICE_ENV:
         env.pop(name, None)  # #6345: a service-file password would beat the moved PGPASSWORD

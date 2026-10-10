@@ -810,6 +810,16 @@ else
         "$(grep -E '^FAIL|^ERROR|AssertionError' "$SCRATCH/g-6339.out" | head -12)"
 fi
 
+# SECTION H (#6181): the enterprise-fed tier password check runs before the URL is used,
+# and its helper refuses empty / short / URL-component passwords.
+if python3 "$ROOT/scripts/test/test_ci_tier_password_check_6181.py" >"$SCRATCH/h-6181a.out" 2>&1 \
+    && python3 "$ROOT/scripts/test/test_check_tier_password_6181.py" >"$SCRATCH/h-6181b.out" 2>&1; then
+    ok "H: ci.yml runs the tier password check before the URL is used (#6181)"
+else
+    bad "H: tier password check pin failed (#6181)" \
+        "$(cat "$SCRATCH"/h-6181a.out "$SCRATCH"/h-6181b.out 2>/dev/null | grep -E '^FAIL|^ERROR|AssertionError' | head -12)"
+fi
+
 echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo "ci.yml invariants: $PASS/$PASS PASS"

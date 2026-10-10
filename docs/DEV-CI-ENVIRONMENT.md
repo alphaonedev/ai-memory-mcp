@@ -186,6 +186,15 @@ pg_ctl -D <pg-age-stack>/pgdata start|stop
 # rebuild: operator-local f1-tier-init.sh equivalent
 ```
 
+**Tier password rule (#6181).** The tier role password in `~/.ai-memory-ci-fed-url` must be random, at least 32 bytes
+(for example `secrets.token_urlsafe(48)`), and must not equal or contain any other URL component (user, host,
+database). Those components are shown on psql argv and in process listings, so a password equal to one of them is
+exposed with it. The "Configure enterprise-fed tier" step enforces the floor before it uses the URL:
+`python3 -I scripts/ci/check-tier-password.py --url-file "$url_file"` fails the step with a `::error::` line (no value
+printed) when the password is empty, shorter than 16 characters, equal to or contained in the user, host or database,
+or contains such a component of 8+ characters. Rotate a failing tier password, never relax the check. The AGE
+self-heal passes the database name to psql through `PGDATABASE`, so its argv carries no path component.
+
 **AGE self-heal (#6161).** The hand-built AGE 1.8.0 files originally lived inside
 Homebrew's `postgresql@18` share/lib trees, which `brew upgrade` relinks, dropping
 them (CI then fails with `extension "age" is not available`). A brew-independent
