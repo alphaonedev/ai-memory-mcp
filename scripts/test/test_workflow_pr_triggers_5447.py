@@ -4089,18 +4089,23 @@ SHELL_PUNCTUATION = "();<>|&"
 
 
 def _bare_python_script(rest: str) -> Optional[str]:
-    """The `python3 ... x.py` text when ``rest`` (what follows `python3`) runs a script without -I, else None.
+    """The `python3 ... x.py` or `python3 ... -m mod` text when ``rest`` (what follows `python3`)
+    runs a script or a module without -I, else None (#6241, #6799).
 
     A command line shlex cannot tokenise up to the decision is reported (fail closed).
+    `-c` runs are #6330's scope and are not judged here.
     """
     lexer = shlex.shlex(rest, posix=True, punctuation_chars=SHELL_PUNCTUATION)
     lexer.whitespace_split = True
     seen: List[str] = []
     isolated = False
     skip_next = False
+    want_module = False
     try:
         for token in lexer:
             seen.append(token)
+            if want_module:
+                return None if isolated else "python3 " + " ".join(seen)
             if skip_next:
                 skip_next = False
                 continue
@@ -4112,8 +4117,13 @@ def _bare_python_script(rest: str) -> Optional[str]:
                 for pos, flag in enumerate(token[1:], 1):
                     if flag == "I":
                         isolated = True
-                    elif flag in "cm":
+                    elif flag == "c":
                         return None
+                    elif flag == "m":
+                        if pos < len(token) - 1:
+                            return None if isolated else "python3 " + " ".join(seen)
+                        want_module = True
+                        break
                     elif flag in PYTHON_OPTIONS_WITH_ARGUMENT:
                         skip_next = pos == len(token) - 1
                         break
@@ -4123,7 +4133,16 @@ def _bare_python_script(rest: str) -> Optional[str]:
             return None
     except ValueError:
         return f"python3 {rest.strip()} (shlex cannot tokenise it)"
+    if want_module and not isolated:
+        return "python3 " + " ".join(seen) + " (no module named)"
     return None
+
+
+# #6799: module runs that install third-party code on a GitHub-hosted job, kept without -I.
+# coverage.yml's `python3 -m pip install huggingface_hub` runs on ubuntu-latest, where the
+# checked-out code already runs (cargo build scripts), and its fallback and the following
+# `python3 -c` import read the user site that -I would hide.  Exact (workflow, text) pairs.
+MODULE_RUNS_WITHOUT_I_6799 = frozenset((("coverage.yml", "python3 -m pip"),))
 
 
 def _bare_python_script_runs(texts: Dict[str, str]) -> List[str]:
@@ -4134,7 +4153,7 @@ def _bare_python_script_runs(texts: Dict[str, str]) -> List[str]:
                 continue
             for m in PYTHON_CALL_RE.finditer(row):
                 bare = _bare_python_script(row[m.end():])
-                if bare is not None:
+                if bare is not None and (name, bare) not in MODULE_RUNS_WITHOUT_I_6799:
                     found.append(f"{name}:{lineno}: {bare}")
     return found
 
@@ -4938,7 +4957,7 @@ class WorkflowPythonOptionIsolation6389(unittest.TestCase):
 
     def test_6389_isolated_or_non_script_forms_are_not_flagged(self) -> None:
         for run in ('python3 -u -I "scripts/x.py"', "python3 -IB scripts/x.py", "python3 -I 'scripts/x.py' --self-test",
-                    'python3 -c "import sys"', "python3 -m pip install x", "python3 --version",
+                    'python3 -c "import sys"', "python3 -I -m pip install x", "python3 --version",
                     'echo "$(python3 --version)"', "command -v python3 >/dev/null"):
             with self.subTest(run=run):
                 texts = {"new.yml": f"jobs:\n  x:\n    steps:\n      - run: {run}\n"}
@@ -6041,6 +6060,16 @@ class ModuleRunsIsolated6799(unittest.TestCase):
                     'python3 -u "scripts/ci/x.py" --flag', "python3 -uB scripts/ci/x.py"):
             with self.subTest(row=row):
                 self.assertEqual(1, len(self.planted(row)), row)
+
+    def test_6799_the_module_allowlist_is_exact_and_used(self) -> None:
+        texts = _all_workflow_texts()
+        for name, text in MODULE_RUNS_WITHOUT_I_6799:
+            with self.subTest(workflow=name):
+                rows = [r for r in texts[name].splitlines()
+                        if any(_bare_python_script(r[m.end():]) == text for m in PYTHON_CALL_RE.finditer(r))]
+                self.assertEqual(1, len(rows), rows)
+        planted = {"other.yml": "jobs:\n  x:\n    steps:\n      - run: python3 -m pip install x\n"}
+        self.assertEqual(["other.yml:4: python3 -m pip"], _bare_python_script_runs(planted))
 
     def test_6799_n11_dropping_I_from_the_ci_tests_discover_step_is_killed(self) -> None:
         texts = _all_workflow_texts()
