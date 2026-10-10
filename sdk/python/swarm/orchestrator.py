@@ -111,9 +111,7 @@ class Swarm:
             if value.strip()
         }
         if not any(agent.identity.agent_id in admin_ids for agent in self.agents):
-            self.coverage.mark_documented_fail_closed(
-                "stats", "namespaces", "agents", "forget"
-            )
+            self.coverage.mark_documented_fail_closed("stats", "namespaces", "agents", "forget")
         return self.agents
 
     # -- provisioning ------------------------------------------------------
@@ -154,9 +152,7 @@ class Swarm:
                         **self.config.daemon_client_kwargs(),
                     )
                     admins[base_url] = admin
-                await admin.register_agent(
-                    agent.identity.agent_id, agent_type="ai:glm-swarm"
-                )
+                await admin.register_agent(agent.identity.agent_id, agent_type="ai:glm-swarm")
                 # #3464 — the bind runs a challenge/response, so it takes the
                 # signing key itself (the private half proves possession).
                 await admin.bind_agent_pubkey(
@@ -194,10 +190,15 @@ class Swarm:
 
     def mission_completion(self) -> dict[str, bool]:
         """STRICT completion: exactly one shared summary + lineage + every source id cited."""
-        return {agent.identity.agent_id:
-                bool(agent.mission_summary_id and agent.mission_summary_count == 1
-                     and agent.mission_lineage_proved and agent.mission_summary_cites_sources)
-                for agent in self.agents}
+        return {
+            agent.identity.agent_id: bool(
+                agent.mission_summary_id
+                and agent.mission_summary_count == 1
+                and agent.mission_lineage_proved
+                and agent.mission_summary_cites_sources
+            )
+            for agent in self.agents
+        }
 
     def mission_progress(self) -> dict[str, dict[str, object]]:
         """Per-agent breakdown so a 0% strict rate is explainable, not opaque.
@@ -209,24 +210,30 @@ class Swarm:
         summaries stored but ``summary_in_shared_namespace`` false for all of
         them is a mission the agents did most of, not a harness that saw none.
         """
-        evidence = mission_evidence(self.call_log.entries,
-                                    shared_namespace=self.shared_namespace)
-        empty = {"summary_stored": False, "summary_count": 0,
-                 "summary_in_shared_namespace": False, "lineage_proved": False,
-                 "facts_stored": 0}
-        return {agent.identity.agent_id: {
-            "summary_stored": bool(agent.mission_summary_id),
-            "single_summary": agent.mission_summary_count == 1,
-            "lineage_proved": agent.mission_lineage_proved,
-            "cites_all_sources": agent.mission_summary_cites_sources,
-            "facts_stored": len(agent.mission_memory_ids),
-            "summary_stored_evidence": found["summary_stored"],
-            "summary_count_evidence": found["summary_count"],
-            "summary_in_shared_namespace": found["summary_in_shared_namespace"],
-            "lineage_proved_evidence": found["lineage_proved"],
-            "facts_stored_evidence": found["facts_stored"],
-        } for agent in self.agents
-            for found in (evidence.get(agent.identity.agent_id, empty),)}
+        evidence = mission_evidence(self.call_log.entries, shared_namespace=self.shared_namespace)
+        empty = {
+            "summary_stored": False,
+            "summary_count": 0,
+            "summary_in_shared_namespace": False,
+            "lineage_proved": False,
+            "facts_stored": 0,
+        }
+        return {
+            agent.identity.agent_id: {
+                "summary_stored": bool(agent.mission_summary_id),
+                "single_summary": agent.mission_summary_count == 1,
+                "lineage_proved": agent.mission_lineage_proved,
+                "cites_all_sources": agent.mission_summary_cites_sources,
+                "facts_stored": len(agent.mission_memory_ids),
+                "summary_stored_evidence": found["summary_stored"],
+                "summary_count_evidence": found["summary_count"],
+                "summary_in_shared_namespace": found["summary_in_shared_namespace"],
+                "lineage_proved_evidence": found["lineage_proved"],
+                "facts_stored_evidence": found["facts_stored"],
+            }
+            for agent in self.agents
+            for found in (evidence.get(agent.identity.agent_id, empty),)
+        }
 
 
 async def run_swarm(config: SwarmConfig) -> CoverageTracker:

@@ -166,7 +166,7 @@ Ed25519 key whose public half is bound to the agent:
 from ai_memory import AiMemoryClient, Tier
 from ai_memory.attestation import AgentSigningKey
 
-key = AgentSigningKey.generate()          # or .from_file("svc.priv")
+key = AgentSigningKey.generate()  # or .from_file("svc.priv")
 # `.from_file` refuses a key that is not a regular file, is reached through a
 # symlink, has any group/other bit, or is owned by another uid (#3784) — the
 # same standard the daemon applies to `<key_dir>/<agent_id>.priv`.
@@ -181,7 +181,7 @@ with AiMemoryClient(base_url="https://localhost:9077", verify=str(ca)) as client
         content="Use --with-openssl=/opt/openssl, disable DoH for the lab.",
         tier=Tier.LONG,
         tags=["dns", "bind9"],
-        agent_id="svc",       # required when signing — it is inside the envelope
+        agent_id="svc",  # required when signing — it is inside the envelope
         signing_key=key,
     )
     print(created["id"])
@@ -213,12 +213,14 @@ Notes:
 import asyncio
 from ai_memory import AsyncAiMemoryClient
 
+
 async def main() -> None:
     # `ca`: see "Trust the daemon's CA".
     async with AsyncAiMemoryClient(base_url="https://localhost:9077", verify=str(ca)) as client:
         resp = await client.recall(context="hello")
         for memory in resp.memories:
             print(memory.title)
+
 
 asyncio.run(main())
 ```
@@ -251,7 +253,9 @@ server writes `metadata.agent_id` accordingly (see docs/reference/ARCHITECTURE_R
 Identity).
 
 ```python
-AiMemoryClient(base_url="https://localhost:9077", verify=str(ca), agent_id="ai:claude-opus-4.7@host")
+AiMemoryClient(
+    base_url="https://localhost:9077", verify=str(ca), agent_id="ai:claude-opus-4.7@host"
+)
 ```
 
 ## All methods
@@ -326,10 +330,12 @@ bundle = DelegationBundle.load(
 # `ca` is the daemon CA path — see "Trust the daemon's CA".
 client = AiMemoryClient(base_url="https://localhost:9077", verify=str(ca))
 
+
 def catch_up(signal):
     # EXACTLY ONE inbox read per signal — never one per queued hint.
     for message in client.inbox(agent_id=bundle.agent_id, unread_only=True):
         handle(message)
+
 
 WakeListener("/run/user/1000/ai-memory/wake-hub.sock", bundle, catch_up).run()
 ```
@@ -374,6 +380,7 @@ the hello.
 
 ```python
 from ai_memory import verify_webhook_signature
+
 
 def handle(request) -> None:
     sig = request.headers["X-AI-Memory-Signature"]

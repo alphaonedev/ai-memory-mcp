@@ -217,8 +217,9 @@ class CoverageTracker:
         ]
         if not self.is_full():
             lines.append("uncovered: " + ", ".join(self.uncovered()))
-        failures = [(name, summary) for name, cov in self.tools.items()
-                    for summary in cov.failure_summaries]
+        failures = [
+            (name, summary) for name, cov in self.tools.items() for summary in cov.failure_summaries
+        ]
         if failures:
             lines += ["", "FAILURES", "-" * 60]
             lines.extend(f"{name}: {summary}" for name, summary in failures)

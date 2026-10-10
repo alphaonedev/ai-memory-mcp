@@ -60,6 +60,7 @@ def export_ceiling_from_error(exc: Exception) -> int | None:
     ceiling = payload.get("max")
     return ceiling if isinstance(ceiling, int) and ceiling > 0 else None
 
+
 #: The daemon's own default `memory_kind` when the field is absent. Kept here
 #: because a SIGNED write must sign the kind the server will actually store —
 #: leaving `kind` unset while signing a different value silently 403s.
@@ -163,7 +164,9 @@ def _context_verifies(context: object) -> bool:
         return False
     if any(hasattr(ssl.SSLContext, key) for key in vars(context)):
         return False
-    if any(ssl.SSLContext.__dict__.get(name) is not stock for name, stock in _STOCK_HANDSHAKE.items()):
+    if any(
+        ssl.SSLContext.__dict__.get(name) is not stock for name, stock in _STOCK_HANDSHAKE.items()
+    ):
         return False
     flags = int(ssl.SSLContext.verify_flags.__get__(context))  # type: ignore[attr-defined]
     if flags & ~_ALLOWED_VERIFY_FLAGS:
@@ -545,7 +548,9 @@ def _dns_name_matches(pattern: object, host: str) -> bool:
     if labels[0] != "*" or len(labels) < 3 or any("*" in label for label in labels[1:]):
         return False
     host_labels = host.split(".")
-    return len(host_labels) == len(labels) and bool(host_labels[0]) and host_labels[1:] == labels[1:]
+    return (
+        len(host_labels) == len(labels) and bool(host_labels[0]) and host_labels[1:] == labels[1:]
+    )
 
 
 def _peer_matches_host(peer: dict[str, Any], host: str, context: ssl.SSLContext) -> bool:
@@ -1116,9 +1121,7 @@ def build_create_body(
 
     if signing_key is not None:
         if supplied.get("signature"):
-            raise ValueError(
-                "pass either signing_key or an explicit signature, not both"
-            )
+            raise ValueError("pass either signing_key or an explicit signature, not both")
         agent_id = supplied.get("agent_id")
         if not agent_id:
             raise ValueError(

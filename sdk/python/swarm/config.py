@@ -113,8 +113,7 @@ class SwarmConfig:
         if self.max_steps < 1:
             raise ConfigError(f"max_steps must be >= 1, got {self.max_steps}")
         if self.assess_concurrency < 1:
-            raise ConfigError(
-                f"assess_concurrency must be >= 1, got {self.assess_concurrency}")
+            raise ConfigError(f"assess_concurrency must be >= 1, got {self.assess_concurrency}")
         if self.model_slug != OPENROUTER_MODEL_SLUG and not self.model_override_reason:
             raise ConfigError(
                 f"model {self.model_slug!r} is not the pinned acceptance model "
@@ -169,9 +168,9 @@ class SwarmConfig:
             backoff_max_secs=_float_env(env, "SWARM_BACKOFF_MAX_SECS", 8.0),
             key_dir=key_dir,
             openrouter_api_key=env.get("OPENROUTER_API_KEY") or None,
-            openrouter_base_url=env.get(
-                "OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL
-            ).rstrip("/"),
+            openrouter_base_url=env.get("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL).rstrip(
+                "/"
+            ),
             request_timeout_secs=_float_env(env, "SWARM_REQUEST_TIMEOUT_SECS", 30.0),
             namespace_prefix=env.get("SWARM_NAMESPACE_PREFIX", "swarm"),
             client_cert=env.get("SWARM_CLIENT_CERT") or None,
@@ -181,7 +180,8 @@ class SwarmConfig:
             admin_agent_id=env.get("SWARM_ADMIN_AGENT_ID", "ai:hive-loadgen-f2"),
             mission=env.get("SWARM_MISSION", DEFAULT_MISSION),
             assess_concurrency=_int_env(
-                env, "SWARM_ASSESS_CONCURRENCY", DEFAULT_ASSESS_CONCURRENCY),
+                env, "SWARM_ASSESS_CONCURRENCY", DEFAULT_ASSESS_CONCURRENCY
+            ),
             model_slug=env.get("SWARM_MODEL_SLUG") or OPENROUTER_MODEL_SLUG,
             model_override_reason=env.get("SWARM_MODEL_OVERRIDE_REASON") or None,
         )

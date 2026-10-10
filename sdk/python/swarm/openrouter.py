@@ -149,8 +149,7 @@ class OpenRouterClient:
         while completions are issued one at a time. Concurrent callers must use
         :meth:`complete_with_usage`, which returns the usage of their own call.
         """
-        content, _usage = await self.complete_with_usage(
-            messages=messages, temperature=temperature)
+        content, _usage = await self.complete_with_usage(messages=messages, temperature=temperature)
         return content
 
     async def complete_with_usage(
@@ -167,12 +166,14 @@ class OpenRouterClient:
         with the response instead, so per-agent accounting stays exact at any
         concurrency.
         """
-        body, message = await self._chat({
-            "model": self._model,
-            "messages": messages,
-            "temperature": temperature,
-            "usage": {"include": True},
-        })
+        body, message = await self._chat(
+            {
+                "model": self._model,
+                "messages": messages,
+                "temperature": temperature,
+                "usage": {"include": True},
+            }
+        )
         content = message.get("content")
         usage = body.get("usage") if isinstance(body, dict) else None
         self.last_usage = usage
@@ -180,18 +181,14 @@ class OpenRouterClient:
             raise OpenRouterError("malformed OpenRouter response: missing assessment content")
         return content.strip(), usage if isinstance(usage, dict) else None
 
-    async def _chat(
-        self, payload: dict[str, Any]
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
+    async def _chat(self, payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
         """Post and validate the common OpenAI-compatible response envelope."""
         try:
             resp = await self._client.post("/chat/completions", json=payload)
         except httpx.HTTPError as exc:
             raise OpenRouterError(f"OpenRouter transport error: {exc}") from exc
         if resp.status_code >= 400:
-            raise OpenRouterError(
-                f"OpenRouter returned {resp.status_code}: {resp.text[:500]}"
-            )
+            raise OpenRouterError(f"OpenRouter returned {resp.status_code}: {resp.text[:500]}")
         try:
             body = resp.json()
             message = body["choices"][0]["message"]
@@ -216,15 +213,11 @@ class OpenRouterClient:
             return AccountSnapshot(
                 **{
                     name: float(data[name])
-                    for name in (
-                        "usage", "usage_daily", "usage_weekly", "usage_monthly"
-                    )
+                    for name in ("usage", "usage_daily", "usage_weekly", "usage_monthly")
                 }
             )
         except (ValueError, TypeError, KeyError) as exc:
-            raise OpenRouterError(
-                f"malformed OpenRouter usage response: {exc}"
-            ) from exc
+            raise OpenRouterError(f"malformed OpenRouter usage response: {exc}") from exc
 
 
 def _parse_tool_calls(raw_calls: list[dict[str, Any]]) -> list[ToolCall]:

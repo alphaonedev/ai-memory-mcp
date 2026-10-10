@@ -31,9 +31,7 @@ def test_the_gate_is_inert_unless_both_knobs_are_set() -> None:
     assert resolve_gate({}) is None
     assert resolve_gate({"SWARM_WAKE_HUB_SOCKET": "/x.sock"}) is None
     assert resolve_gate({"SWARM_WAKE_HUB_BUNDLE_DIR": "/keys"}) is None
-    gate = resolve_gate(
-        {"SWARM_WAKE_HUB_SOCKET": "/x.sock", "SWARM_WAKE_HUB_BUNDLE_DIR": "/keys"}
-    )
+    gate = resolve_gate({"SWARM_WAKE_HUB_SOCKET": "/x.sock", "SWARM_WAKE_HUB_BUNDLE_DIR": "/keys"})
     assert gate == WakeGate(Path("/x.sock"), Path("/keys"), DEFAULT_HUB_ID)
     assert gate.bundle_for("ai:alice") == Path("/keys/ai:alice.a2a-hub.json")
 

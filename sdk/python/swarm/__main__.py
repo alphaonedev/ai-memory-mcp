@@ -20,10 +20,18 @@ import sys
 from dataclasses import asdict
 from pathlib import Path
 
-from swarm.audit import (build_nhi_report, harness_dispatches, render_nhi_report,
-                         write_audit_artifacts)
-from swarm.choreography import (collect_assessments, negative_authorization_evidence,
-                                nhi_assessment, run_all)
+from swarm.audit import (
+    build_nhi_report,
+    harness_dispatches,
+    render_nhi_report,
+    write_audit_artifacts,
+)
+from swarm.choreography import (
+    collect_assessments,
+    negative_authorization_evidence,
+    nhi_assessment,
+    run_all,
+)
 from swarm.config import ConfigError, SwarmConfig
 from swarm.coverage import CoverageTracker
 from swarm.openrouter import AccountSnapshot, OpenRouterClient
@@ -62,7 +70,8 @@ def _write_usage(
     after_data = asdict(after) if after else None
     delta = (
         {name: after_data[name] - before_data[name] for name in before_data}
-        if before_data and after_data else None
+        if before_data and after_data
+        else None
     )
     payload = {
         "schema_version": 1,
@@ -80,7 +89,6 @@ def _write_usage(
     }
     destination.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     return destination
-
 
 
 async def _snapshot(model: OpenRouterClient) -> AccountSnapshot | None:
@@ -102,14 +110,19 @@ def _usage_block(
     t = coverage.model_usage_totals()
     delta = (after.usage - before.usage) if (before and after) else None
     lat = coverage.model_latency_summary()
-    lines = ["", "AI MODEL USAGE (OpenRouter)", "-" * 60,
-             f"completions {t['requests']}  prompt {t['prompt_tokens']}  completion {t['completion_tokens']}  total {t['total_tokens']} tokens",
-             f"generation cost ${t['cost_usd']:.4f}  account delta {'$%.4f' % delta if delta is not None else 'n/a'} (includes daemon embed/LLM calls)",
-             f"decide latency ms mean {lat['mean_ms']}  p95 {lat['p95_ms']}  n {lat['n']}",
-             "phase wall-clock secs " + (json.dumps(coverage.phase_secs, sort_keys=True)
-                                         if coverage.phase_secs else "n/a"),
-             f"usage.json -> {path}"]
+    lines = [
+        "",
+        "AI MODEL USAGE (OpenRouter)",
+        "-" * 60,
+        f"completions {t['requests']}  prompt {t['prompt_tokens']}  completion {t['completion_tokens']}  total {t['total_tokens']} tokens",
+        f"generation cost ${t['cost_usd']:.4f}  account delta {'$%.4f' % delta if delta is not None else 'n/a'} (includes daemon embed/LLM calls)",
+        f"decide latency ms mean {lat['mean_ms']}  p95 {lat['p95_ms']}  n {lat['n']}",
+        "phase wall-clock secs "
+        + (json.dumps(coverage.phase_secs, sort_keys=True) if coverage.phase_secs else "n/a"),
+        f"usage.json -> {path}",
+    ]
     return "\n".join(lines)
+
 
 def _mission_partial(progress: dict[str, dict[str, object]]) -> dict[str, int]:
     """Fleet totals for both mission views: the strict flags and the call-log
@@ -117,17 +130,20 @@ def _mission_partial(progress: dict[str, dict[str, object]]) -> dict[str, int]:
     actually did — e.g. 61 summaries stored, 0 of them in the shared namespace.
     """
     rows = list(progress.values())
-    return {name: sum(int(bool(row[key])) if isinstance(row[key], bool) else int(row[key])
-                      for row in rows)
-            for name, key in (
-                ("summary_stored", "summary_stored"),
-                ("lineage_proved", "lineage_proved"),
-                ("facts_stored_total", "facts_stored"),
-                ("summary_stored_evidence", "summary_stored_evidence"),
-                ("summary_in_shared_namespace", "summary_in_shared_namespace"),
-                ("lineage_proved_evidence", "lineage_proved_evidence"),
-                ("facts_stored_evidence", "facts_stored_evidence"),
-            )}
+    return {
+        name: sum(
+            int(bool(row[key])) if isinstance(row[key], bool) else int(row[key]) for row in rows
+        )
+        for name, key in (
+            ("summary_stored", "summary_stored"),
+            ("lineage_proved", "lineage_proved"),
+            ("facts_stored_total", "facts_stored"),
+            ("summary_stored_evidence", "summary_stored_evidence"),
+            ("summary_in_shared_namespace", "summary_in_shared_namespace"),
+            ("lineage_proved_evidence", "lineage_proved_evidence"),
+            ("facts_stored_evidence", "facts_stored_evidence"),
+        )
+    }
 
 
 def _auditor_verdict(assessment: str | None) -> str:
@@ -140,6 +156,7 @@ def _auditor_verdict(assessment: str | None) -> str:
     if not assessment:
         return "UNKNOWN"
     import re
+
     marks = re.findall(r"verdict\W{0,6}(PASS|FAIL)", assessment, flags=re.I)
     if marks:
         return marks[-1].upper()
@@ -178,8 +195,11 @@ async def _main() -> int:
                 assessments = await collect_assessments(swarm)
                 reconcile_result = swarm.call_log.reconcile(coverage)
                 assessment_result, assessment = await nhi_assessment(
-                    swarm, results, reconcile_result=reconcile_result,
-                    negative_evidence=negative_evidence)
+                    swarm,
+                    results,
+                    reconcile_result=reconcile_result,
+                    negative_evidence=negative_evidence,
+                )
             results.append(assessment_result)
             final_reconcile = swarm.call_log.reconcile(coverage)
             _write_journals(swarm, assessment=assessment)
@@ -189,10 +209,14 @@ async def _main() -> int:
             completion = swarm.mission_completion()
             verdict = _auditor_verdict(assessment)
             report = build_nhi_report(
-                n_agents=len(swarm.agents), completed=sum(completion.values()),
-                assessments=assessments, auditor_verdict=verdict,
+                n_agents=len(swarm.agents),
+                completed=sum(completion.values()),
+                assessments=assessments,
+                auditor_verdict=verdict,
                 negative_evidence=negative_evidence,
-                model=config.model_slug, model_override_reason=config.model_override_reason)
+                model=config.model_slug,
+                model_override_reason=config.model_override_reason,
+            )
             report["call_log_reconcile"] = final_reconcile
             report["assessment_phase_secs"] = coverage.phase_secs.get("assessments")
             report["mission_progress"] = swarm.mission_progress()
@@ -203,9 +227,7 @@ async def _main() -> int:
                 write_audit_artifacts(journal_dir, assessments, report)
         finally:
             usage_after = await _snapshot(model)
-            usage_path = _write_usage(
-                coverage, usage_before, usage_after, model=config.model_slug
-            )
+            usage_path = _write_usage(coverage, usage_before, usage_after, model=config.model_slug)
             print(_usage_block(coverage, usage_before, usage_after, usage_path))
     finally:
         await swarm.aclose()
@@ -214,8 +236,16 @@ async def _main() -> int:
     print(coverage.matrix())
     negative_ok = all(item.get("refused") is True for item in negative_evidence)
     reconciled = bool(final_reconcile.get("ok"))
-    return 0 if (coverage.is_full() and all(result.ok for result in results)
-                 and negative_ok and reconciled) else 1
+    return (
+        0
+        if (
+            coverage.is_full()
+            and all(result.ok for result in results)
+            and negative_ok
+            and reconciled
+        )
+        else 1
+    )
 
 
 def main() -> None:

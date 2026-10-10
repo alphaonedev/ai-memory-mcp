@@ -102,8 +102,9 @@ def _participants(swarm: Swarm, agents: list[SwarmAgent] | None) -> list[SwarmAg
     return swarm.agents if agents is None else agents
 
 
-async def producer_consumer(swarm: Swarm, agents: list[SwarmAgent] | None = None,
-                            module: str | None = None) -> ScenarioResult:
+async def producer_consumer(
+    swarm: Swarm, agents: list[SwarmAgent] | None = None, module: str | None = None
+) -> ScenarioResult:
     """A -> B message lane; C must not see B's mail (isolation).
 
     ``agents`` defaults to the whole population; a multi-module run passes ONE
@@ -118,13 +119,24 @@ async def producer_consumer(swarm: Swarm, agents: list[SwarmAgent] | None = None
 
     subject = f"handoff-{a.identity.agent_id}"
     send = await dispatch(
-        a.client, a.identity, "notify",
-        {"to_agent": b.identity.agent_id, "subject": subject, "body": "unit-of-work"})
+        a.client,
+        a.identity,
+        "notify",
+        {"to_agent": b.identity.agent_id, "subject": subject, "body": "unit-of-work"},
+    )
     swarm.coverage.record(send)
     # Also exercise the coordination signal lane.
-    sig = await dispatch(a.client, a.identity, "signal_send",
-                         {"to_agent": b.identity.agent_id, "subject": subject,
-                          "signal_type": "request", "body": {"work": 1}})
+    sig = await dispatch(
+        a.client,
+        a.identity,
+        "signal_send",
+        {
+            "to_agent": b.identity.agent_id,
+            "subject": subject,
+            "signal_type": "request",
+            "body": {"work": 1},
+        },
+    )
     swarm.coverage.record(sig)
 
     # #3470: WAIT for the wake instead of racing the write (or, as the fleet
@@ -145,12 +157,14 @@ async def producer_consumer(swarm: Swarm, agents: list[SwarmAgent] | None = None
         c_isolated = not (c_inbox.ok and subject in json.dumps(c_inbox.result, default=str))
 
     ok = send.ok and b_saw and c_isolated
-    return ScenarioResult(name, ok=ok,
-                          detail=f"sent={send.ok} b_saw={b_saw} c_isolated={c_isolated}")
+    return ScenarioResult(
+        name, ok=ok, detail=f"sent={send.ok} b_saw={b_saw} c_isolated={c_isolated}"
+    )
 
 
-async def consensus_quorum(swarm: Swarm, agents: list[SwarmAgent] | None = None,
-                           module: str | None = None) -> ScenarioResult:
+async def consensus_quorum(
+    swarm: Swarm, agents: list[SwarmAgent] | None = None, module: str | None = None
+) -> ScenarioResult:
     """N agents attest the same fact into the shared ns; one consolidates.
 
     The consolidator must be able to READ every vote, so all voters and the
@@ -166,10 +180,17 @@ async def consensus_quorum(swarm: Swarm, agents: list[SwarmAgent] | None = None,
     for ordinal, agent in enumerate(population):
         # Votes are "collective"-scoped: a private-scope row is readable only by
         # its author, so the consolidator could not read its peers' votes.
-        out = await dispatch(agent.client, agent.identity, "store",
-                             {"title": f"consensus-vote-{_RUN}-{_slug(module)}{ordinal}",
-                              "content": fact,
-                              "namespace": swarm.shared_namespace, "scope": "collective"})
+        out = await dispatch(
+            agent.client,
+            agent.identity,
+            "store",
+            {
+                "title": f"consensus-vote-{_RUN}-{_slug(module)}{ordinal}",
+                "content": fact,
+                "namespace": swarm.shared_namespace,
+                "scope": "collective",
+            },
+        )
         swarm.coverage.record(out)
         if out.ok and isinstance(out.result, dict) and out.result.get("id"):
             ids.append(str(out.result["id"]))
@@ -183,11 +204,17 @@ async def consensus_quorum(swarm: Swarm, agents: list[SwarmAgent] | None = None,
     while True:
         next_level: list[str] = []
         for start in range(0, len(level), batch_size):
-            chunk = level[start:start + batch_size]
-            cons = await dispatch(consolidator.client, consolidator.identity, "consolidate",
-                                  {"ids": chunk,
-                                   "title": f"consensus-{_RUN}-{_slug(module)}{start // batch_size}-{len(level)}",
-                                   "namespace": swarm.shared_namespace})
+            chunk = level[start : start + batch_size]
+            cons = await dispatch(
+                consolidator.client,
+                consolidator.identity,
+                "consolidate",
+                {
+                    "ids": chunk,
+                    "title": f"consensus-{_RUN}-{_slug(module)}{start // batch_size}-{len(level)}",
+                    "namespace": swarm.shared_namespace,
+                },
+            )
             swarm.coverage.record(cons)
             if not cons.ok:
                 break
@@ -198,35 +225,59 @@ async def consensus_quorum(swarm: Swarm, agents: list[SwarmAgent] | None = None,
             break
         level = next_level
     ok = len(ids) >= 2 and cons is not None and cons.ok
-    return ScenarioResult(name, ok=ok,
-                          detail=f"votes={len(ids)} consolidated={cons is not None and cons.ok}")
+    return ScenarioResult(
+        name, ok=ok, detail=f"votes={len(ids)} consolidated={cons is not None and cons.ok}"
+    )
 
 
-async def governance_approval(swarm: Swarm, agents: list[SwarmAgent] | None = None,
-                              module: str | None = None) -> ScenarioResult:
+async def governance_approval(
+    swarm: Swarm, agents: list[SwarmAgent] | None = None, module: str | None = None
+) -> ScenarioResult:
     """Proposer requests; approver attests an approval decision + notifies back."""
     name = _named("governance_approval", module)
     population = _participants(swarm, agents)
     if len(population) < 2:
         return ScenarioResult(name, ok=False, detail="need >= 2 agents")
     proposer, approver = population[0], population[1]
-    ask = await dispatch(proposer.client, proposer.identity, "notify",
-                         {"to_agent": approver.identity.agent_id,
-                          "subject": "approve: publish-report", "body": "please approve"})
+    ask = await dispatch(
+        proposer.client,
+        proposer.identity,
+        "notify",
+        {
+            "to_agent": approver.identity.agent_id,
+            "subject": "approve: publish-report",
+            "body": "please approve",
+        },
+    )
     swarm.coverage.record(ask)
     decision = await dispatch(
-        approver.client, approver.identity, "store",
-        {"title": f"approval-decision-{_RUN}-{_slug(module)}", "content": "APPROVED: publish-report",
-         "namespace": swarm.shared_namespace, "scope": "collective",
-         "tags": ["governance", "approval"]})
+        approver.client,
+        approver.identity,
+        "store",
+        {
+            "title": f"approval-decision-{_RUN}-{_slug(module)}",
+            "content": "APPROVED: publish-report",
+            "namespace": swarm.shared_namespace,
+            "scope": "collective",
+            "tags": ["governance", "approval"],
+        },
+    )
     swarm.coverage.record(decision)
-    ack = await dispatch(approver.client, approver.identity, "notify",
-                         {"to_agent": proposer.identity.agent_id,
-                          "subject": "approved: publish-report", "body": "granted"})
+    ack = await dispatch(
+        approver.client,
+        approver.identity,
+        "notify",
+        {
+            "to_agent": proposer.identity.agent_id,
+            "subject": "approved: publish-report",
+            "body": "granted",
+        },
+    )
     swarm.coverage.record(ack)
     ok = ask.ok and decision.ok and ack.ok
-    return ScenarioResult(name, ok=ok,
-                          detail=f"asked={ask.ok} decided={decision.ok} acked={ack.ok}")
+    return ScenarioResult(
+        name, ok=ok, detail=f"asked={ask.ok} decided={decision.ok} acked={ack.ok}"
+    )
 
 
 async def replay_guard(agent: SwarmAgent, namespace: str | None = None) -> ScenarioResult:
@@ -250,8 +301,13 @@ async def replay_guard(agent: SwarmAgent, namespace: str | None = None) -> Scena
 
     async def _submit() -> dict[str, object]:
         return await agent.client.store(
-            title=title, content=content, namespace=ns, agent_id=agent.identity.agent_id,
-            signature=fields["signature"], created_at=fields["created_at"], kind=fields["kind"],
+            title=title,
+            content=content,
+            namespace=ns,
+            agent_id=agent.identity.agent_id,
+            signature=fields["signature"],
+            created_at=fields["created_at"],
+            kind=fields["kind"],
         )
 
     first = await _submit()
@@ -272,8 +328,9 @@ async def replay_guard(agent: SwarmAgent, namespace: str | None = None) -> Scena
     return ScenarioResult("replay_guard", ok=bool(first_id) and guarded, detail=detail)
 
 
-async def full_surface_sweep(swarm: Swarm, agents: list[SwarmAgent] | None = None,
-                             module: str | None = None) -> ScenarioResult:
+async def full_surface_sweep(
+    swarm: Swarm, agents: list[SwarmAgent] | None = None, module: str | None = None
+) -> ScenarioResult:
     """Exercise the complete memory lifecycle through the dispatcher."""
     name = _named("full_surface_sweep", module)
     population = _participants(swarm, agents)
@@ -292,7 +349,12 @@ async def full_surface_sweep(swarm: Swarm, agents: list[SwarmAgent] | None = Non
 
     first = await call("store", {"title": f"{pattern}-source", "content": "source"})
     second = await call("store", {"title": f"{pattern}-target", "content": "target"})
-    if not first.ok or not second.ok or not isinstance(first.result, dict) or not isinstance(second.result, dict):
+    if (
+        not first.ok
+        or not second.ok
+        or not isinstance(first.result, dict)
+        or not isinstance(second.result, dict)
+    ):
         return ScenarioResult(name, False, f"stopped after {','.join(completed)}")
     source_id, target_id = first.result.get("id"), second.result.get("id")
     if not source_id or not target_id:
@@ -306,11 +368,23 @@ async def full_surface_sweep(swarm: Swarm, agents: list[SwarmAgent] | None = Non
         ("get_links", {"memory_id": target_id}),
         ("get_memory", {"memory_id": source_id}),
         ("lineage", {"memory_id": target_id, "direction": "ancestors"}),
-        ("update", {"memory_id": source_id, "content": "source updated",
-                    "expected_version": int(first.result.get("version") or 1)}),
+        (
+            "update",
+            {
+                "memory_id": source_id,
+                "content": "source updated",
+                "expected_version": int(first.result.get("version") or 1),
+            },
+        ),
         ("promote", {"memory_id": source_id}),
-        ("reflect", {"source_ids": [source_id, target_id],
-                     "title": f"{pattern}-reflection", "content": "reflection"}),
+        (
+            "reflect",
+            {
+                "source_ids": [source_id, target_id],
+                "title": f"{pattern}-reflection",
+                "content": "reflection",
+            },
+        ),
         ("delete", {"memory_id": target_id}),
         ("forget", {"pattern": pattern}),
     )
@@ -323,8 +397,9 @@ async def full_surface_sweep(swarm: Swarm, agents: list[SwarmAgent] | None = Non
             if tool in swarm.coverage.documented_fail_closed and outcome.fail_closed:
                 completed.append(f"{tool}(fail-closed:documented)")
                 continue
-            return ScenarioResult(name, False,
-                                  f"{tool} failed after {','.join(completed)}: {outcome.summary}")
+            return ScenarioResult(
+                name, False, f"{tool} failed after {','.join(completed)}: {outcome.summary}"
+            )
     return ScenarioResult(name, True, " -> ".join(completed))
 
 
@@ -335,11 +410,17 @@ _AUDIT_EVIDENCE_CHARS = 600_000
 def _budget(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
-    return text[:limit] + f"\n...[evidence truncated: {len(text) - limit} chars omitted; full artifacts on disk]"
+    return (
+        text[:limit]
+        + f"\n...[evidence truncated: {len(text) - limit} chars omitted; full artifacts on disk]"
+    )
 
 
 async def nhi_assessment(
-    swarm: Swarm, scenarios: list[ScenarioResult], *, reconcile_result: dict[str, object] | None = None,
+    swarm: Swarm,
+    scenarios: list[ScenarioResult],
+    *,
+    reconcile_result: dict[str, object] | None = None,
     negative_evidence: list[dict[str, object]] | None = None,
 ) -> tuple[ScenarioResult, str | None]:
     """Ask one NHI to audit the completed run, then attest its report.
@@ -365,8 +446,11 @@ async def nhi_assessment(
         "scenarios": [result.__dict__ for result in scenarios],
         "agent_journals": {
             item.identity.agent_id: [
-                {**record.__dict__, "perceived": _clip(record.perceived, 600),
-                 "outcomes": [_clip(o, 300) for o in record.outcomes]}
+                {
+                    **record.__dict__,
+                    "perceived": _clip(record.perceived, 600),
+                    "outcomes": [_clip(o, 300) for o in record.outcomes],
+                }
                 for record in item.journal
             ]
             for item in swarm.agents
@@ -383,7 +467,9 @@ async def nhi_assessment(
     if extra_path:
         try:
             # Intentionally verbatim: the auditor must see the original battery artifact.
-            evidence["extra_evidence_verbatim"] = Path(extra_path).read_text(encoding="utf-8")[:60000]
+            evidence["extra_evidence_verbatim"] = Path(extra_path).read_text(encoding="utf-8")[
+                :60000
+            ]
         except OSError as exc:
             evidence["extra_evidence_error"] = f"{type(exc).__name__}: {exc}"
     messages = [
@@ -404,7 +490,9 @@ async def nhi_assessment(
     ]
     try:
         report = await agent.model.complete(messages=messages)
-        swarm.coverage.record_model_usage(agent.identity.agent_id, getattr(agent.model, "last_usage", None))
+        swarm.coverage.record_model_usage(
+            agent.identity.agent_id, getattr(agent.model, "last_usage", None)
+        )
     except OpenRouterError as exc:
         # The caller renders this as a failed choreography. No fabricated
         # assessment is stored when OpenRouter fails or returns empty content.
@@ -427,7 +515,9 @@ async def nhi_assessment(
     swarm.coverage.record(stored)
     memory_id = stored.result.get("id") if stored.ok and isinstance(stored.result, dict) else None
     ok = stored.ok and bool(memory_id)
-    detail = f"assessment_memory={memory_id}" if ok else f"assessment store failed: {stored.summary}"
+    detail = (
+        f"assessment_memory={memory_id}" if ok else f"assessment store failed: {stored.summary}"
+    )
     return ScenarioResult("nhi_assessment", ok, detail), report
 
 
@@ -437,29 +527,56 @@ async def negative_authorization_evidence(swarm: Swarm) -> list[dict[str, object
         return [{"probe": "authorization", "ok": False, "detail": "need >= 2 agents"}]
     owner, attacker = swarm.agents[0], swarm.agents[1]
     title = f"isolation-canary-{_RUN}"
-    created = await dispatch(owner.client, owner.identity, "store",
-                             {"title": title, "content": "owner only"})
+    created = await dispatch(
+        owner.client, owner.identity, "store", {"title": title, "content": "owner only"}
+    )
     swarm.coverage.record(created)
-    memory_id = created.result.get("id") if created.ok and isinstance(created.result, dict) else None
+    memory_id = (
+        created.result.get("id") if created.ok and isinstance(created.result, dict) else None
+    )
     probes: list[tuple[str, object]] = []
     if memory_id:
-        probes.extend([
-            ("cross_namespace_read", await dispatch(attacker.client, attacker.identity, "get_memory",
-                                                     {"memory_id": memory_id})),
-            ("unauthorized_update", await dispatch(attacker.client, attacker.identity, "update",
-                                                    {"memory_id": memory_id, "content": "tamper"})),
-            ("unauthorized_delete", await dispatch(attacker.client, attacker.identity, "delete",
-                                                    {"memory_id": memory_id})),
-        ])
-    duplicate = await dispatch(owner.client, owner.identity, "store",
-                               {"title": title, "content": "duplicate"})
+        probes.extend(
+            [
+                (
+                    "cross_namespace_read",
+                    await dispatch(
+                        attacker.client, attacker.identity, "get_memory", {"memory_id": memory_id}
+                    ),
+                ),
+                (
+                    "unauthorized_update",
+                    await dispatch(
+                        attacker.client,
+                        attacker.identity,
+                        "update",
+                        {"memory_id": memory_id, "content": "tamper"},
+                    ),
+                ),
+                (
+                    "unauthorized_delete",
+                    await dispatch(
+                        attacker.client, attacker.identity, "delete", {"memory_id": memory_id}
+                    ),
+                ),
+            ]
+        )
+    duplicate = await dispatch(
+        owner.client, owner.identity, "store", {"title": title, "content": "duplicate"}
+    )
     probes.append(("duplicate_title_conflict", duplicate))
     evidence = []
     for name, outcome in probes:
         swarm.coverage.record(outcome)
         refused = (not outcome.ok) and "unknown tool" not in outcome.summary
-        evidence.append({"probe": name, "expected_refusal": True,
-                         "refused": refused, "summary": outcome.summary})
+        evidence.append(
+            {
+                "probe": name,
+                "expected_refusal": True,
+                "refused": refused,
+                "summary": outcome.summary,
+            }
+        )
     return evidence
 
 
@@ -491,17 +608,30 @@ def _append_partial(path: Path | None, assessment: AgentAssessment) -> None:
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(asdict(assessment), sort_keys=True, default=str) + "\n")
     except OSError as exc:  # pragma: no cover - disk-full / permission
-        print(f"[assessments] partial stream unavailable: {type(exc).__name__}: {exc}",
-              file=sys.stderr)
+        print(
+            f"[assessments] partial stream unavailable: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
 
 
 async def _assess_one(swarm: Swarm, agent: SwarmAgent) -> AgentAssessment:
     """One agent's strict no-tools rubric completion, with ITS own usage."""
-    messages = [{"role": "system", "content": _RUBRIC_PROMPT},
-                {"role": "user", "content": _budget(json.dumps(
-                    {"agent_id": agent.identity.agent_id,
-                     "journal": [record.__dict__ for record in agent.journal]},
-                    default=str), 200_000)}]
+    messages = [
+        {"role": "system", "content": _RUBRIC_PROMPT},
+        {
+            "role": "user",
+            "content": _budget(
+                json.dumps(
+                    {
+                        "agent_id": agent.identity.agent_id,
+                        "journal": [record.__dict__ for record in agent.journal],
+                    },
+                    default=str,
+                ),
+                200_000,
+            ),
+        },
+    ]
     try:
         # Per-call usage, never the client-wide `last_usage`: several rubrics
         # are in flight, so shared-attribute accounting would misbill agents.
@@ -510,12 +640,12 @@ async def _assess_one(swarm: Swarm, agent: SwarmAgent) -> AgentAssessment:
         return parse_assessment(agent.identity.agent_id, raw)
     except OpenRouterError as exc:
         assessment = parse_assessment(agent.identity.agent_id, "")
-        return AgentAssessment(**{**assessment.__dict__,
-                                  "error": f"{type(exc).__name__}: {exc}"})
+        return AgentAssessment(**{**assessment.__dict__, "error": f"{type(exc).__name__}: {exc}"})
 
 
-async def collect_assessments(swarm: Swarm, *, concurrency: int | None = None,
-                              journal_dir: str | Path | None = None) -> list[AgentAssessment]:
+async def collect_assessments(
+    swarm: Swarm, *, concurrency: int | None = None, journal_dir: str | Path | None = None
+) -> list[AgentAssessment]:
     """Run one strict no-tools rubric completion per agent and attest it.
 
     Bounded-concurrent (#3346): at 256 agents and ~12 s per completion the
@@ -544,16 +674,30 @@ async def collect_assessments(swarm: Swarm, *, concurrency: int | None = None,
                 assessment = await _assess_one(swarm, agent)
             except Exception as exc:  # noqa: BLE001 - one agent never aborts the fleet
                 assessment = AgentAssessment(
-                    agent.identity.agent_id, None, None, [], None, None, "",
-                    assessment_invalid=True, error=f"{type(exc).__name__}: {exc}")
+                    agent.identity.agent_id,
+                    None,
+                    None,
+                    [],
+                    None,
+                    None,
+                    "",
+                    assessment_invalid=True,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
             assessments[index] = assessment
             _append_partial(partial, assessment)
-            stored = await dispatch(agent.client, agent.identity, "store", {
-                "title": f"nhi-audit-{agent.identity.agent_id}-{_RUN}",
-                "content": json.dumps(asdict(assessment), sort_keys=True),
-                "namespace": swarm.shared_namespace, "scope": "collective",
-                "tags": ["nhi-audit"],
-            })
+            stored = await dispatch(
+                agent.client,
+                agent.identity,
+                "store",
+                {
+                    "title": f"nhi-audit-{agent.identity.agent_id}-{_RUN}",
+                    "content": json.dumps(asdict(assessment), sort_keys=True),
+                    "namespace": swarm.shared_namespace,
+                    "scope": "collective",
+                    "tags": ["nhi-audit"],
+                },
+            )
             swarm.coverage.record(stored)
 
     await asyncio.gather(*(_one(index, agent) for index, agent in enumerate(agents)))
@@ -574,8 +718,9 @@ def federation_expected(environ: dict[str, str] | None = None) -> bool:
     return (env.get(FEDERATED_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
-async def cross_module_handoff(swarm: Swarm, groups: dict[str, list[SwarmAgent]],
-                               *, federated: bool | None = None) -> ScenarioResult:
+async def cross_module_handoff(
+    swarm: Swarm, groups: dict[str, list[SwarmAgent]], *, federated: bool | None = None
+) -> ScenarioResult:
     """A on module 1 notifies B on module 2 — the federation boundary probe.
 
     This is an ASSERTION in both directions, never a rubber stamp:
@@ -597,9 +742,12 @@ async def cross_module_handoff(swarm: Swarm, groups: dict[str, list[SwarmAgent]]
         return ScenarioResult(name, ok=False, detail="need an agent on each module")
 
     subject = f"cross-module-{_RUN}-{a.identity.agent_id}"
-    send = await dispatch(a.client, a.identity, "notify",
-                          {"to_agent": b.identity.agent_id, "subject": subject,
-                           "body": "cross-module handoff probe"})
+    send = await dispatch(
+        a.client,
+        a.identity,
+        "notify",
+        {"to_agent": b.identity.agent_id, "subject": subject, "body": "cross-module handoff probe"},
+    )
     swarm.coverage.record(send)
     # #3470: wait for the wake where one is configured. This lane asserts in
     # BOTH directions, so the wait must never be load-bearing for the negative
@@ -611,14 +759,16 @@ async def cross_module_handoff(swarm: Swarm, groups: dict[str, list[SwarmAgent]]
     crossed = got.ok and subject in json.dumps(got.result, default=str)
     where = f"{ordered[0]} -> {ordered[1]}"
     if expect_federated:
-        return ScenarioResult(name, ok=bool(send.ok and crossed),
-                              detail=f"federated: {where} sent={send.ok} b_saw={crossed}")
+        return ScenarioResult(
+            name,
+            ok=bool(send.ok and crossed),
+            detail=f"federated: {where} sent={send.ok} b_saw={crossed}",
+        )
     if crossed:
         return ScenarioResult(
-            name, ok=False,
-            detail=f"cross-module: {where} message CROSSED an unfederated boundary")
-    return ScenarioResult(name, ok=True,
-                          detail=f"cross-module: not federated (expected) [{where}]")
+            name, ok=False, detail=f"cross-module: {where} message CROSSED an unfederated boundary"
+        )
+    return ScenarioResult(name, ok=True, detail=f"cross-module: not federated (expected) [{where}]")
 
 
 async def run_all(swarm: Swarm) -> list[ScenarioResult]:

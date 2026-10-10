@@ -159,7 +159,9 @@ def _raise_with_body(resp: Any) -> None:
     text a triage needs; every driver-local failure surfaces it verbatim.
     """
     if resp.status_code >= 400:
-        raise RuntimeError(f"HTTP {resp.status_code} {resp.request.method} {resp.request.url.path}: {resp.text[:300]}")
+        raise RuntimeError(
+            f"HTTP {resp.status_code} {resp.request.method} {resp.request.url.path}: {resp.text[:300]}"
+        )
 
 
 async def _post_raw(client: AsyncAiMemoryClient, path: str, body: dict[str, Any]) -> Any:
@@ -180,9 +182,7 @@ async def _get_raw(client: AsyncAiMemoryClient, path: str) -> Any:
 # ---------------------------------------------------------------------------
 
 
-async def _h_store(
-    client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]
-) -> Any:
+async def _h_store(client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]) -> Any:
     title = _require(args, "title")
     content = _require(args, "content")
     ns = ident.confine(args.get("namespace"))
@@ -201,17 +201,13 @@ async def _h_store(
     )
 
 
-async def _h_update(
-    client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]
-) -> Any:
+async def _h_update(client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]) -> Any:
     memory_id = _require(args, "memory_id")
     patch = {k: args[k] for k in ("content", "priority", "tags", "confidence") if k in args}
     return await client.update(memory_id, patch, expected_version=args.get("expected_version"))
 
 
-async def _h_delete(
-    client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]
-) -> Any:
+async def _h_delete(client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]) -> Any:
     return await client.delete(_require(args, "memory_id"))
 
 
@@ -221,9 +217,7 @@ async def _h_promote(
     return await client.promote(_require(args, "memory_id"))
 
 
-async def _h_forget(
-    client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]
-) -> Any:
+async def _h_forget(client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]) -> Any:
     # Confined to the agent's PRIVATE namespace: bulk delete never reaches a
     # shared consensus namespace, so one agent cannot wipe collective state.
     return await client.forget(
@@ -231,9 +225,7 @@ async def _h_forget(
     )
 
 
-async def _h_link(
-    client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]
-) -> Any:
+async def _h_link(client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]) -> Any:
     return await client.link(
         _require(args, "source_id"),
         _require(args, "target_id"),
@@ -241,33 +233,25 @@ async def _h_link(
     )
 
 
-async def _h_recall(
-    client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]
-) -> Any:
+async def _h_recall(client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]) -> Any:
     return await client.recall(
         _require(args, "context"), namespace=ident.namespace, limit=args.get("limit")
     )
 
 
-async def _h_search(
-    client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]
-) -> Any:
+async def _h_search(client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]) -> Any:
     return await client.search(
         _require(args, "q"), namespace=ident.namespace, limit=args.get("limit")
     )
 
 
-async def _h_list(
-    client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]
-) -> Any:
+async def _h_list(client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]) -> Any:
     return await client.list(
         namespace=ident.namespace, tier=args.get("tier"), limit=args.get("limit")
     )
 
 
-async def _h_get(
-    client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]
-) -> Any:
+async def _h_get(client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]) -> Any:
     return await client.get(_require(args, "memory_id"))
 
 
@@ -285,17 +269,13 @@ async def _h_lineage(
     )
 
 
-async def _h_inbox(
-    client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]
-) -> Any:
+async def _h_inbox(client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]) -> Any:
     return await client.inbox(
         agent_id=ident.agent_id, unread_only=args.get("unread_only"), limit=args.get("limit")
     )
 
 
-async def _h_notify(
-    client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]
-) -> Any:
+async def _h_notify(client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]) -> Any:
     return await client.notify(
         {
             "target_agent_id": _require(args, "to_agent"),
@@ -305,9 +285,7 @@ async def _h_notify(
     )
 
 
-async def _h_stats(
-    client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]
-) -> Any:
+async def _h_stats(client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]) -> Any:
     return await client.stats()
 
 
@@ -317,15 +295,11 @@ async def _h_namespaces(
     return await client.namespaces()
 
 
-async def _h_agents(
-    client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]
-) -> Any:
+async def _h_agents(client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]) -> Any:
     return await client.agents()
 
 
-async def _h_health(
-    client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]
-) -> Any:
+async def _h_health(client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]) -> Any:
     return await client.health()
 
 
@@ -383,9 +357,11 @@ async def _h_reflect(
     client: AsyncAiMemoryClient, ident: AgentIdentity, args: dict[str, Any]
 ) -> Any:
     """``POST /api/v1/memory_reflect`` — substrate reflection over a set."""
-    body = {key: args[key] for key in
-            ("source_ids", "title", "content", "tier", "priority", "tags")
-            if key in args}
+    body = {
+        key: args[key]
+        for key in ("source_ids", "title", "content", "tier", "priority", "tags")
+        if key in args
+    }
     # Namespace-CONFINED like every other write: a model-chosen namespace outside
     # the agent's grant collapses to its private namespace (North Star guardrail).
     body["namespace"] = ident.confine(args.get("namespace"))
@@ -413,79 +389,257 @@ def _schema(props: dict[str, Any], required: list[str] | None = None) -> dict[st
 
 TOOL_SPECS: list[ToolSpec] = [
     # -- reads (perceive + act) --------------------------------------------
-    ToolSpec("recall", KIND_READ, "POST", "/api/v1/recall", "sdk",
-             "Hybrid FTS+semantic recall of memories relevant to a context string.",
-             _schema({"context": _S, "limit": _I}, ["context"]), _h_recall),
-    ToolSpec("search", KIND_READ, "GET", "/api/v1/search", "sdk",
-             "Keyword FTS search over memories.",
-             _schema({"q": _S, "limit": _I}, ["q"]), _h_search),
-    ToolSpec("list_memories", KIND_READ, "GET", "/api/v1/memories", "sdk",
-             "List memories in the agent's namespace, optionally by tier.",
-             _schema({"tier": _S, "limit": _I}), _h_list),
-    ToolSpec("get_memory", KIND_READ, "GET", "/api/v1/memories/{id}", "sdk",
-             "Fetch one memory by id.",
-             _schema({"memory_id": _S}, ["memory_id"]), _h_get),
-    ToolSpec("get_links", KIND_READ, "GET", "/api/v1/links/{id}", "sdk",
-             "List links of a memory.",
-             _schema({"memory_id": _S}, ["memory_id"]), _h_get_links),
-    ToolSpec("lineage", KIND_READ, "GET", "/api/v1/memories/{id}/lineage", "sdk",
-             "Walk the derivation lineage-DAG of a memory.",
-             _schema({"memory_id": _S, "direction": _S}, ["memory_id"]), _h_lineage),
-    ToolSpec("inbox", KIND_READ, "GET", "/api/v1/inbox", "sdk",
-             "Read this agent's received agent-to-agent messages.",
-             _schema({"unread_only": {"type": "boolean"}, "limit": _I}), _h_inbox),
-    ToolSpec("stats", KIND_READ, "GET", "/api/v1/stats", "sdk",
-             "Daemon-wide memory statistics.", _schema({}), _h_stats),
-    ToolSpec("namespaces", KIND_READ, "GET", "/api/v1/namespaces", "sdk",
-             "List namespaces known to the daemon.", _schema({}), _h_namespaces),
-    ToolSpec("agents", KIND_READ, "GET", "/api/v1/agents", "sdk",
-             "List registered agents.", _schema({}), _h_agents),
-    ToolSpec("health", KIND_READ, "GET", "/api/v1/health", "sdk",
-             "Daemon liveness probe.", _schema({}), _h_health, agent_selectable=False),
-    ToolSpec("capabilities", KIND_READ, "GET", "/api/v1/capabilities", "driver-local",
-             "Report the daemon's live capability surface.", _schema({}), _h_capabilities,
-             agent_selectable=False),
+    ToolSpec(
+        "recall",
+        KIND_READ,
+        "POST",
+        "/api/v1/recall",
+        "sdk",
+        "Hybrid FTS+semantic recall of memories relevant to a context string.",
+        _schema({"context": _S, "limit": _I}, ["context"]),
+        _h_recall,
+    ),
+    ToolSpec(
+        "search",
+        KIND_READ,
+        "GET",
+        "/api/v1/search",
+        "sdk",
+        "Keyword FTS search over memories.",
+        _schema({"q": _S, "limit": _I}, ["q"]),
+        _h_search,
+    ),
+    ToolSpec(
+        "list_memories",
+        KIND_READ,
+        "GET",
+        "/api/v1/memories",
+        "sdk",
+        "List memories in the agent's namespace, optionally by tier.",
+        _schema({"tier": _S, "limit": _I}),
+        _h_list,
+    ),
+    ToolSpec(
+        "get_memory",
+        KIND_READ,
+        "GET",
+        "/api/v1/memories/{id}",
+        "sdk",
+        "Fetch one memory by id.",
+        _schema({"memory_id": _S}, ["memory_id"]),
+        _h_get,
+    ),
+    ToolSpec(
+        "get_links",
+        KIND_READ,
+        "GET",
+        "/api/v1/links/{id}",
+        "sdk",
+        "List links of a memory.",
+        _schema({"memory_id": _S}, ["memory_id"]),
+        _h_get_links,
+    ),
+    ToolSpec(
+        "lineage",
+        KIND_READ,
+        "GET",
+        "/api/v1/memories/{id}/lineage",
+        "sdk",
+        "Walk the derivation lineage-DAG of a memory.",
+        _schema({"memory_id": _S, "direction": _S}, ["memory_id"]),
+        _h_lineage,
+    ),
+    ToolSpec(
+        "inbox",
+        KIND_READ,
+        "GET",
+        "/api/v1/inbox",
+        "sdk",
+        "Read this agent's received agent-to-agent messages.",
+        _schema({"unread_only": {"type": "boolean"}, "limit": _I}),
+        _h_inbox,
+    ),
+    ToolSpec(
+        "stats",
+        KIND_READ,
+        "GET",
+        "/api/v1/stats",
+        "sdk",
+        "Daemon-wide memory statistics.",
+        _schema({}),
+        _h_stats,
+    ),
+    ToolSpec(
+        "namespaces",
+        KIND_READ,
+        "GET",
+        "/api/v1/namespaces",
+        "sdk",
+        "List namespaces known to the daemon.",
+        _schema({}),
+        _h_namespaces,
+    ),
+    ToolSpec(
+        "agents",
+        KIND_READ,
+        "GET",
+        "/api/v1/agents",
+        "sdk",
+        "List registered agents.",
+        _schema({}),
+        _h_agents,
+    ),
+    ToolSpec(
+        "health",
+        KIND_READ,
+        "GET",
+        "/api/v1/health",
+        "sdk",
+        "Daemon liveness probe.",
+        _schema({}),
+        _h_health,
+        agent_selectable=False,
+    ),
+    ToolSpec(
+        "capabilities",
+        KIND_READ,
+        "GET",
+        "/api/v1/capabilities",
+        "driver-local",
+        "Report the daemon's live capability surface.",
+        _schema({}),
+        _h_capabilities,
+        agent_selectable=False,
+    ),
     # -- writes (act) -------------------------------------------------------
-    ToolSpec("store", KIND_WRITE, "POST", "/api/v1/memories", "sdk",
-             "Store a new attested memory in the agent's namespace.",
-             _schema({"title": _S, "content": _S, "tier": _S, "priority": _I,
-                      "tags": {"type": "array", "items": _S},
-                      "scope": {"type": "string", "enum": ["private", "team", "unit", "org", "collective"]}},
-                     ["title", "content"]), _h_store),
-    ToolSpec("update", KIND_WRITE, "PUT", "/api/v1/memories/{id}", "sdk",
-             "Update an existing memory (optionally version-guarded).",
-             _schema({"memory_id": _S, "content": _S, "priority": _I,
-                      "expected_version": _I}, ["memory_id"]), _h_update),
-    ToolSpec("delete", KIND_WRITE, "DELETE", "/api/v1/memories/{id}", "sdk",
-             "Delete (tombstone) a memory by id.",
-             _schema({"memory_id": _S}, ["memory_id"]), _h_delete),
-    ToolSpec("promote", KIND_WRITE, "POST", "/api/v1/memories/{id}/promote", "sdk",
-             "Promote a memory's tier toward long-term.",
-             _schema({"memory_id": _S}, ["memory_id"]), _h_promote),
-    ToolSpec("forget", KIND_WRITE, "POST", "/api/v1/forget", "sdk",
-             "Bulk-forget memories in the agent's private namespace by pattern/tier.",
-             _schema({"pattern": _S, "tier": _S}), _h_forget),
-    ToolSpec("link", KIND_WRITE, "POST", "/api/v1/links", "sdk",
-             "Create a typed link between two memories.",
-             _schema({"source_id": _S, "target_id": _S, "relation": _S},
-                     ["source_id", "target_id"]), _h_link),
-    ToolSpec("notify", KIND_WRITE, "POST", "/api/v1/notify", "sdk",
-             "Send an agent-to-agent message.",
-             _schema({"to_agent": _S, "subject": _S, "body": _S}, ["to_agent"]), _h_notify),
-    ToolSpec("signal_send", KIND_WRITE, "POST", "/api/v1/signals", "driver-local",
-             "Send a coordination signal (point-to-point or namespace broadcast).",
-             _schema({"subject": _S, "to_agent": _S, "signal_type": _S,
-                      "correlation_id": _S, "in_reply_to": _S,
-                      "body": {"type": "object"}}, ["subject"]), _h_signal_send),
-    ToolSpec("consolidate", KIND_WRITE, "POST", "/api/v1/consolidate", "driver-local",
-             "Consolidate several source memories into one summary memory.",
-             _schema({"ids": {"type": "array", "items": _S}, "title": _S, "summary": _S},
-                     ["ids"]), _h_consolidate),
-    ToolSpec("reflect", KIND_WRITE, "POST", "/api/v1/memory_reflect", "driver-local",
-             "Reflect over the agent's memory substrate, minting reflection memories.",
-             _schema({"source_ids": _A, "title": _S, "content": _S,
-                      "tier": _S, "priority": _I, "tags": _A},
-                     ["source_ids", "title", "content"]), _h_reflect),
+    ToolSpec(
+        "store",
+        KIND_WRITE,
+        "POST",
+        "/api/v1/memories",
+        "sdk",
+        "Store a new attested memory in the agent's namespace.",
+        _schema(
+            {
+                "title": _S,
+                "content": _S,
+                "tier": _S,
+                "priority": _I,
+                "tags": {"type": "array", "items": _S},
+                "scope": {
+                    "type": "string",
+                    "enum": ["private", "team", "unit", "org", "collective"],
+                },
+            },
+            ["title", "content"],
+        ),
+        _h_store,
+    ),
+    ToolSpec(
+        "update",
+        KIND_WRITE,
+        "PUT",
+        "/api/v1/memories/{id}",
+        "sdk",
+        "Update an existing memory (optionally version-guarded).",
+        _schema(
+            {"memory_id": _S, "content": _S, "priority": _I, "expected_version": _I}, ["memory_id"]
+        ),
+        _h_update,
+    ),
+    ToolSpec(
+        "delete",
+        KIND_WRITE,
+        "DELETE",
+        "/api/v1/memories/{id}",
+        "sdk",
+        "Delete (tombstone) a memory by id.",
+        _schema({"memory_id": _S}, ["memory_id"]),
+        _h_delete,
+    ),
+    ToolSpec(
+        "promote",
+        KIND_WRITE,
+        "POST",
+        "/api/v1/memories/{id}/promote",
+        "sdk",
+        "Promote a memory's tier toward long-term.",
+        _schema({"memory_id": _S}, ["memory_id"]),
+        _h_promote,
+    ),
+    ToolSpec(
+        "forget",
+        KIND_WRITE,
+        "POST",
+        "/api/v1/forget",
+        "sdk",
+        "Bulk-forget memories in the agent's private namespace by pattern/tier.",
+        _schema({"pattern": _S, "tier": _S}),
+        _h_forget,
+    ),
+    ToolSpec(
+        "link",
+        KIND_WRITE,
+        "POST",
+        "/api/v1/links",
+        "sdk",
+        "Create a typed link between two memories.",
+        _schema({"source_id": _S, "target_id": _S, "relation": _S}, ["source_id", "target_id"]),
+        _h_link,
+    ),
+    ToolSpec(
+        "notify",
+        KIND_WRITE,
+        "POST",
+        "/api/v1/notify",
+        "sdk",
+        "Send an agent-to-agent message.",
+        _schema({"to_agent": _S, "subject": _S, "body": _S}, ["to_agent"]),
+        _h_notify,
+    ),
+    ToolSpec(
+        "signal_send",
+        KIND_WRITE,
+        "POST",
+        "/api/v1/signals",
+        "driver-local",
+        "Send a coordination signal (point-to-point or namespace broadcast).",
+        _schema(
+            {
+                "subject": _S,
+                "to_agent": _S,
+                "signal_type": _S,
+                "correlation_id": _S,
+                "in_reply_to": _S,
+                "body": {"type": "object"},
+            },
+            ["subject"],
+        ),
+        _h_signal_send,
+    ),
+    ToolSpec(
+        "consolidate",
+        KIND_WRITE,
+        "POST",
+        "/api/v1/consolidate",
+        "driver-local",
+        "Consolidate several source memories into one summary memory.",
+        _schema({"ids": {"type": "array", "items": _S}, "title": _S, "summary": _S}, ["ids"]),
+        _h_consolidate,
+    ),
+    ToolSpec(
+        "reflect",
+        KIND_WRITE,
+        "POST",
+        "/api/v1/memory_reflect",
+        "driver-local",
+        "Reflect over the agent's memory substrate, minting reflection memories.",
+        _schema(
+            {"source_ids": _A, "title": _S, "content": _S, "tier": _S, "priority": _I, "tags": _A},
+            ["source_ids", "title", "content"],
+        ),
+        _h_reflect,
+    ),
 ]
 
 SPECS_BY_NAME: dict[str, ToolSpec] = {s.name: s for s in TOOL_SPECS}
@@ -520,36 +674,50 @@ async def dispatch(
     module = str(getattr(getattr(client, "_client", None), "base_url", "") or "") or None
     spec = SPECS_BY_NAME.get(tool_name)
     if spec is None:
-        outcome = ToolOutcome(tool_name, ok=False, fail_closed=True,
-                              summary=f"unknown tool {tool_name!r}")
+        outcome = ToolOutcome(
+            tool_name, ok=False, fail_closed=True, summary=f"unknown tool {tool_name!r}"
+        )
         record_dispatch(identity.agent_id, tool_name, args, outcome, module=module)
         return outcome
     try:
         result = await spec.handler(client, identity, args)
     except Exception as exc:  # noqa: BLE001 - fail-closed boundary, re-surfaced in outcome
-        outcome = ToolOutcome(tool_name, ok=False, fail_closed=True,
-                              summary=f"{type(exc).__name__}: {exc}")
+        outcome = ToolOutcome(
+            tool_name, ok=False, fail_closed=True, summary=f"{type(exc).__name__}: {exc}"
+        )
     else:
         pending = result_is_pending(result)
         memory_id = result_memory_id(result)
         if pending:
             # 200 {"status":"pending"} is its own bucket, never a success (#3543).
             outcome = ToolOutcome(
-                tool_name, ok=False, fail_closed=False,
-                summary="pending (not covered)", result=result,
-                pending=True, memory_id=None,
+                tool_name,
+                ok=False,
+                fail_closed=False,
+                summary="pending (not covered)",
+                result=result,
+                pending=True,
+                memory_id=None,
             )
         elif spec.kind == KIND_WRITE and spec.name == "store" and not memory_id:
             outcome = ToolOutcome(
-                tool_name, ok=False, fail_closed=True,
-                summary="store without persisted memory_id", result=result,
-                pending=False, memory_id=None,
+                tool_name,
+                ok=False,
+                fail_closed=True,
+                summary="store without persisted memory_id",
+                result=result,
+                pending=False,
+                memory_id=None,
             )
         else:
             outcome = ToolOutcome(
-                tool_name, ok=True, fail_closed=False,
-                summary=_summarize(result), result=result,
-                pending=False, memory_id=memory_id,
+                tool_name,
+                ok=True,
+                fail_closed=False,
+                summary=_summarize(result),
+                result=result,
+                pending=False,
+                memory_id=memory_id,
             )
     record_dispatch(identity.agent_id, tool_name, args, outcome, module=module)
     return outcome

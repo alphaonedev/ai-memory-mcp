@@ -19,8 +19,15 @@ import pytest
 from ai_memory import AsyncAiMemoryClient
 from ai_memory.attestation import AgentSigningKey
 from swarm.agent import SwarmAgent
-from swarm.choreography import (consensus_quorum, cross_module_handoff, federation_expected,
-                                module_of, modules, producer_consumer, run_all)
+from swarm.choreography import (
+    consensus_quorum,
+    cross_module_handoff,
+    federation_expected,
+    module_of,
+    modules,
+    producer_consumer,
+    run_all,
+)
 from swarm.config import SwarmConfig
 from swarm.coverage import CoverageTracker
 from swarm.toolset import AgentIdentity
@@ -74,18 +81,38 @@ class _Module:
         if path == "/api/v1/consolidate":
             # A tier can only fold ids IT stored: a vote written to the other
             # module is "memory not found" here, exactly as the daemon reports.
-            unknown = [i for i in json.loads(request.content).get("ids", [])
-                       if i not in self.minted]
+            unknown = [
+                i for i in json.loads(request.content).get("ids", []) if i not in self.minted
+            ]
             if unknown:
                 return httpx.Response(404, json={"error": f"memory not found: {unknown[0]}"})
             return httpx.Response(201, json={"id": f"{self.base_url}-con"})
-        if path.startswith("/api/v1/memories/") and method == "GET" \
-                and not path.endswith("/lineage"):
-            return httpx.Response(200, json={"memory": {
-                "id": path.rsplit("/", 1)[-1], "tier": "mid", "namespace": "swarm-000",
-                "title": "t", "content": "c", "tags": [], "priority": 5, "confidence": 1.0,
-                "source": "api", "access_count": 0, "created_at": "2026-09-01T00:00:00Z",
-                "updated_at": "2026-09-01T00:00:00Z", "metadata": {}}, "links": []})
+        if (
+            path.startswith("/api/v1/memories/")
+            and method == "GET"
+            and not path.endswith("/lineage")
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "memory": {
+                        "id": path.rsplit("/", 1)[-1],
+                        "tier": "mid",
+                        "namespace": "swarm-000",
+                        "title": "t",
+                        "content": "c",
+                        "tags": [],
+                        "priority": 5,
+                        "confidence": 1.0,
+                        "source": "api",
+                        "access_count": 0,
+                        "created_at": "2026-09-01T00:00:00Z",
+                        "updated_at": "2026-09-01T00:00:00Z",
+                        "metadata": {},
+                    },
+                    "links": [],
+                },
+            )
         if path == "/api/v1/recall":
             return httpx.Response(200, json={"count": 0, "memories": []})
         if path == "/api/v1/search":
@@ -100,24 +127,33 @@ def _agent_on(module: _Module, ordinal: int) -> SwarmAgent:
     config = SwarmConfig(base_urls=[module.base_url], n_agents=1, max_steps=1)
     client = AsyncAiMemoryClient(base_url=module.base_url, agent_id=agent_id)
     client._client = httpx.AsyncClient(  # noqa: SLF001 - offline transport injection
-        base_url=module.base_url, transport=httpx.MockTransport(module.handle),
-        headers={"X-Agent-Id": agent_id})
+        base_url=module.base_url,
+        transport=httpx.MockTransport(module.handle),
+        headers={"X-Agent-Id": agent_id},
+    )
     identity = AgentIdentity(
-        agent_id=agent_id, signing_key=AgentSigningKey.generate(),
-        namespace=namespace, allowed_namespaces={namespace, "swarm-shared"})
-    return SwarmAgent(identity=identity, client=client,
-                      model=_FakeModel(Decision(None, [], {})),  # type: ignore[arg-type]
-                      config=config, coverage=CoverageTracker())
+        agent_id=agent_id,
+        signing_key=AgentSigningKey.generate(),
+        namespace=namespace,
+        allowed_namespaces={namespace, "swarm-shared"},
+    )
+    return SwarmAgent(
+        identity=identity,
+        client=client,
+        model=_FakeModel(Decision(None, [], {})),  # type: ignore[arg-type]
+        config=config,
+        coverage=CoverageTracker(),
+    )
 
 
 def _two_module_swarm(*, leaky: bool = False) -> tuple[SimpleNamespace, _Module, _Module]:
     """Agents round-robined across two modules, exactly as the launcher does."""
     second = _Module("http://mod-b")
     first = _Module("http://mod-a", leaks_to=second if leaky else None)
-    agents = [_agent_on(first if ordinal % 2 == 0 else second, ordinal)
-              for ordinal in range(6)]
-    swarm = SimpleNamespace(agents=agents, coverage=CoverageTracker(),
-                            shared_namespace="swarm-shared")
+    agents = [_agent_on(first if ordinal % 2 == 0 else second, ordinal) for ordinal in range(6)]
+    swarm = SimpleNamespace(
+        agents=agents, coverage=CoverageTracker(), shared_namespace="swarm-shared"
+    )
     return swarm, first, second
 
 
@@ -197,8 +233,12 @@ async def test_run_all_runs_every_scenario_once_per_module() -> None:
     finally:
         await _aclose(swarm)
     names = [result.name for result in results]
-    for scenario in ("producer_consumer", "consensus_quorum", "governance_approval",
-                     "full_surface_sweep"):
+    for scenario in (
+        "producer_consumer",
+        "consensus_quorum",
+        "governance_approval",
+        "full_surface_sweep",
+    ):
         assert f"{scenario}@http://mod-a" in names
         assert f"{scenario}@http://mod-b" in names
         # No un-tagged (cross-module) variant is run any more.
@@ -213,15 +253,21 @@ async def test_run_all_runs_every_scenario_once_per_module() -> None:
 async def test_single_module_run_is_unchanged() -> None:
     only = _Module("http://mod-a")
     agents = [_agent_on(only, ordinal) for ordinal in range(3)]
-    swarm = SimpleNamespace(agents=agents, coverage=CoverageTracker(),
-                            shared_namespace="swarm-shared")
+    swarm = SimpleNamespace(
+        agents=agents, coverage=CoverageTracker(), shared_namespace="swarm-shared"
+    )
     try:
         results = await run_all(swarm)
     finally:
         await _aclose(swarm)
     names = [result.name for result in results]
-    assert names == ["producer_consumer", "consensus_quorum", "governance_approval",
-                     "full_surface_sweep", "replay_guard"]
+    assert names == [
+        "producer_consumer",
+        "consensus_quorum",
+        "governance_approval",
+        "full_surface_sweep",
+        "replay_guard",
+    ]
     assert all(result.ok for result in results), [r.detail for r in results if not r.ok]
 
 
@@ -261,8 +307,9 @@ async def test_cross_module_handoff_asserts_delivery_once_federated() -> None:
 
     federated_swarm, _a, _b = _two_module_swarm(leaky=True)
     try:
-        delivered = await cross_module_handoff(federated_swarm, modules(federated_swarm),
-                                               federated=True)
+        delivered = await cross_module_handoff(
+            federated_swarm, modules(federated_swarm), federated=True
+        )
     finally:
         await _aclose(federated_swarm)
     assert delivered.ok
@@ -281,8 +328,9 @@ def test_federation_flag_is_opt_in_and_explicit() -> None:
 async def test_cross_module_handoff_is_not_applicable_on_one_module() -> None:
     only = _Module("http://mod-a")
     agents = [_agent_on(only, ordinal) for ordinal in range(2)]
-    swarm = SimpleNamespace(agents=agents, coverage=CoverageTracker(),
-                            shared_namespace="swarm-shared")
+    swarm = SimpleNamespace(
+        agents=agents, coverage=CoverageTracker(), shared_namespace="swarm-shared"
+    )
     try:
         result = await cross_module_handoff(swarm, modules(swarm), federated=False)
     finally:

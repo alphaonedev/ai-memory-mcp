@@ -243,7 +243,9 @@ class AiMemoryClient:
         )
         return self._request("POST", "/api/v1/memories", json_body=body)
 
-    def bulk_store(self, memories: builtins.list[CreateMemory | dict[str, Any]]) -> BulkCreateResponse:
+    def bulk_store(
+        self, memories: builtins.list[CreateMemory | dict[str, Any]]
+    ) -> BulkCreateResponse:
         """``POST /api/v1/memories/bulk`` — insert up to 1000 at once."""
         payload = [prep_json(m) for m in memories]
         raw = self._request("POST", "/api/v1/memories/bulk", json_body=payload)
@@ -405,9 +407,7 @@ class AiMemoryClient:
         )
 
     # -- links / stats / admin ---------------------------------------------
-    def link(
-        self, source_id: str, target_id: str, relation: str = "related_to"
-    ) -> dict[str, Any]:
+    def link(self, source_id: str, target_id: str, relation: str = "related_to") -> dict[str, Any]:
         """``POST /api/v1/links``."""
         return self._request(
             "POST",
@@ -524,9 +524,7 @@ class AiMemoryClient:
         endpoint kept receiving signed deliveries indefinitely. Check the
         returned ``deleted`` flag.
         """
-        return self._request(
-            "DELETE", "/api/v1/subscriptions", params={"id": subscription_id}
-        )
+        return self._request("DELETE", "/api/v1/subscriptions", params={"id": subscription_id})
 
     def subscriptions(self) -> builtins.list[Subscription]:
         """``GET /api/v1/subscriptions``."""

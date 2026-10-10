@@ -16,15 +16,23 @@ async def test_account_snapshot_reads_authenticated_key_counters() -> None:
 
     def handler(request: httpx.Request) -> httpx.Response:
         seen.append(request)
-        return httpx.Response(200, json={"data": {
-            "usage": 1.25, "usage_daily": 0.25,
-            "usage_weekly": 0.75, "usage_monthly": 1.0,
-        }})
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "usage": 1.25,
+                    "usage_daily": 0.25,
+                    "usage_weekly": 0.75,
+                    "usage_monthly": 1.0,
+                }
+            },
+        )
 
     client = OpenRouterClient(api_key="secret", model_slug="test")
     await client._client.aclose()  # noqa: SLF001
     client._client = httpx.AsyncClient(  # noqa: SLF001
-        base_url="https://openrouter.ai/api/v1", transport=httpx.MockTransport(handler),
+        base_url="https://openrouter.ai/api/v1",
+        transport=httpx.MockTransport(handler),
         headers={"Authorization": "Bearer secret"},
     )
     try:
