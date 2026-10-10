@@ -4533,5 +4533,47 @@ class OperatorLatestReview6329(unittest.TestCase):
                 text = " ".join((ROOT / rel).read_text(encoding="utf-8").split())
                 self.assertIn("latest review", text)
 
+
+
+# ---- Round 5 (#6331): the team-association allowlist is pinned ----
+
+
+class TeamAssociations6331(unittest.TestCase):
+    """Only OWNER / MEMBER / COLLABORATOR with a same-repo head skip the operator approval."""
+
+    NON_TEAM = ("CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "MANNEQUIN", "NONE")
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+
+    def gate(self, assoc: str, mod=None) -> int:
+        api = _fake_api([_pr(7, SHA_A, assoc, REPO_6117)], {7: []})
+        return (mod or self.mod).run_gate("push", {}, REPO_6117, SHA_A, OPERATOR_6117, api)[0]
+
+    def test_6331_allowlist_is_exactly_the_three_team_associations(self) -> None:
+        self.assertEqual(frozenset({"OWNER", "MEMBER", "COLLABORATOR"}), self.mod.TEAM_ASSOCIATIONS)
+
+    def test_6331_every_non_team_association_needs_approval_on_a_same_repo_head(self) -> None:
+        for assoc in self.NON_TEAM:
+            with self.subTest(assoc=assoc):
+                self.assertEqual(1, self.gate(assoc))
+        for assoc in ("OWNER", "MEMBER", "COLLABORATOR"):
+            with self.subTest(assoc=assoc):
+                self.assertEqual(0, self.gate(assoc))
+
+    def test_6331_m01_contributor_widening_is_killed(self) -> None:
+        src = APPROVAL_PY.read_text(encoding="utf-8")
+        needle = '("OWNER", "MEMBER", "COLLABORATOR")'
+        self.assertEqual(1, src.count(needle))
+        mutant = _exec_approval_src(src.replace(needle, '("OWNER", "MEMBER", "COLLABORATOR", "CONTRIBUTOR")'))
+        self.assertEqual(0, self.gate("CONTRIBUTOR", mod=mutant))  # the mutant exempts a contributor
+        self.assertEqual(1, self.gate("CONTRIBUTOR"))
+
+    def test_6331_self_test_covers_a_same_repo_contributor(self) -> None:
+        out = subprocess.run([sys.executable, "-I", str(APPROVAL_PY), "--self-test"],
+                             capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(0, out.returncode, out.stdout + out.stderr)
+        self.assertIn("self-test PASS: push-contributor-same-repo-unapproved (exit 1, want 1)", out.stdout)
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
