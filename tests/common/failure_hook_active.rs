@@ -103,13 +103,13 @@ fn active_clock_7029() {
             expected,
             "common checked offset domain"
         );
-        scenarios::sqlite_clock(expected);
         #[cfg(feature = "sal-postgres")]
         tokio::runtime::Runtime::new()
             .expect("runtime")
             .block_on(async {
                 scenarios::pg::isolated_clock(expected).await;
             });
+        scenarios::sqlite_clock(expected);
         return;
     }
     let cases = [
