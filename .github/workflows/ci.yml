@@ -632,7 +632,7 @@ jobs:
     # single cap sized for the slowest one is a 35-minute blind spot on the
     # fastest. Values and their basis:
     #
-    #   ubuntu-latest,sqlite      55  Pre-#3109 this exact workload ran on this
+    #   ubuntu-latest,sqlite      95  (was 55: raised in #3538, see the matrix entry.) Pre-#3109 this exact workload ran on this
     #                                 exact runner class under a 45-min cap and
     #                                 passed (`Check (ubuntu-latest)`), so 45 is
     #                                 a MEASURED hosted value, not an f2 value.
@@ -640,7 +640,7 @@ jobs:
     #                                 `cargo audit` steps to the leg, so +10.
     #                                 The 1500s (25 min) sqlite watchdog stays
     #                                 well inside it.
-    #   linux-fed,enterprise-fed  80  Unchanged. Compile ~12 min (hoisted
+    #   linux-fed,enterprise-fed 160  (was 80: raised in #6411/#6344, see the matrix entry.) Compile ~12 min (hoisted
     #                                 OUTSIDE the per-invocation watchdog) plus
     #                                 the 3300s (55 min) hang-watchdog can
     #                                 legitimately approach ~67 min, so the
@@ -655,7 +655,7 @@ jobs:
     #                                 It also no longer needs the contention
     #                                 headroom #3139 measured: this is now the
     #                                 ONLY Linux `check` leg on the fleet.
-    #   macos-fed,*               80  Unchanged. With the #3140 watchdog fix
+    #   macos-fed,sqlite          80  Unchanged. With the #3140 watchdog fix
     #                                 below, a macOS hang is now cut at the
     #                                 per-invocation cap instead of burning
     #                                 this whole 80-min budget (#3140 observed
@@ -667,6 +667,13 @@ jobs:
     #                                 (40 min) still sits well inside this 80,
     #                                 so the named watchdog, not a nameless
     #                                 job-level cancel, is still what fires.
+    #   macos-fed,enterprise-fed 160  Same sharded suite and cap as the linux-fed
+    #                                 enterprise-fed leg (see its matrix entry).
+    #
+    # #6795: the Load gate step may wait up to 1200 s inside these caps; every
+    # watchdog and shard budget is capped to the job time left (JOB_T0), so a
+    # named #1492 watchdog fires before GitHub's cancel. Do not raise a cap
+    # for the gate.
     timeout-minutes: ${{ matrix.timeout }}
     env:
       # Debuginfo budget for this job — the heaviest compile in CI (~600
@@ -803,6 +810,14 @@ jobs:
             # table: docs/ci/CARRIER-BRANCH-GATES.md.
             timeout: 160
     steps:
+      # #6795 — job start, recorded FIRST so every later budget (the serial
+      # shard, the parallel shards and the non-sharded watchdogs) is derived
+      # from the real time left under the job `timeout-minutes`, including the
+      # load-gate wait and every pre-test step.
+      - name: Record job start (#6795)
+        if: needs.classify.outputs.docs_only != 'true'
+        run: echo "JOB_T0=$(date +%s)" >> "$GITHUB_ENV"
+
       # 2026-08-26 rigid-security-controls: a fork PR must NEVER have its code
       # checked out on a self-hosted node (f2 = the operator's home gateway,
       # f1 = the macOS fed node). Primary control is the repository's Actions
@@ -1169,6 +1184,16 @@ jobs:
           done
           echo "::notice::[#3539] passphrase env scrubbed for this job (AI_MEMORY_NO_CONFIG kept)"
 
+      # #6795 — per-runner load gate. The 7800 s shard budgets were derived on an
+      # idle host; on f1 at load ~100 the single-threaded serial shard ran 5-6x
+      # slower and was killed by the #1492 watchdog. Wait (bounded, default 20
+      # min) while the 1-minute load average exceeds 1.5 x cores, print the
+      # measured load, then proceed. The helper NEVER fails on load alone.
+      # Self-hosted legs only: hosted runners are dedicated VMs.
+      - name: Load gate (#6795)
+        if: needs.classify.outputs.docs_only != 'true' && contains(matrix.runner, 'self-hosted')
+        run: python3 scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
+
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.docs_only != 'true'
         env:
@@ -1184,9 +1209,21 @@ jobs:
           TEST_IMPACT_REASON: ${{ needs.classify.outputs.test_impact_reason }}
           TEST_IMPACT_COUNT: ${{ needs.classify.outputs.test_impact_count }}
           TEST_IMPACT_TOTAL: ${{ needs.classify.outputs.test_impact_total }}
+          # #6795 — the job cap (minutes) the serial shard budget is derived from.
+          JOB_TIMEOUT_MIN: ${{ matrix.timeout }}
         shell: bash
         run: |
           set -euo pipefail
+          # #6795 — JOB_T0 is written to $GITHUB_ENV by the first step of the job.
+          # Invalid or missing: warn and keep the flat watchdog values (fail
+          # toward the old behaviour, never toward a 0 s or empty watchdog).
+          case "${JOB_T0:-}" in
+            ''|*[!0-9]*)
+              echo "::warning::[#6795] JOB_T0 missing or non-numeric; watchdogs keep their flat values"
+              JOB_T0_VALID=0
+              ;;
+            *) JOB_T0_VALID=1 ;;
+          esac
           # v1.0.0 2x2 — tier-parametrised feature/thread selection. The
           # `enterprise-fed` legs add `--features sal-postgres` and serialise
           # DDL with `-- --test-threads=1` (the sal-postgres suite shares one
@@ -1373,9 +1410,25 @@ jobs:
           else
             echo "::notice::[#1492] watchdog disabled on ${RUNNER_OS:-unknown} — no coreutils gtimeout/timeout found (job-level timeout-minutes still applies)"
           fi
+          # #6795 — seconds left under the job timeout-minutes, minus 300 s for
+          # teardown/upload, so a watchdog always fires (named) before GitHub's
+          # nameless job cancel. Floor 60 s: `timeout 0` would mean no limit.
+          job_left() {
+            local left=$(( JOB_TIMEOUT_MIN * 60 - ($(date +%s) - JOB_T0) - 300 ))
+            if [ "$left" -lt 60 ]; then left=60; fi
+            echo "$left"
+          }
+          # cap_to_job_left <secs>: min(secs, job_left)
+          cap_to_job_left() {
+            local want="$1" left
+            if [ "$JOB_T0_VALID" -ne 1 ]; then echo "$want"; return 0; fi
+            left=$(job_left)
+            if [ "$left" -lt "$want" ]; then echo "$left"; else echo "$want"; fi
+          }
           run_tests() {
             local label="$1"; shift
             local rc=0
+            local WATCHDOG_SECS="$(cap_to_job_left "$WATCHDOG_SECS")"
             # #3461 — margin telemetry. The 1500s kill on e06961ca was a
             # surprise only because no green run had ever printed how close it
             # came: the step reported the budget and nothing else, so a suite
@@ -1448,12 +1501,15 @@ jobs:
           # (7800 s on this tier; derivation at the WATCHDOG_SECS assignment).
           # Every shard has its own log and PID; each PID is waited on
           # separately and the step fails if ANY shard failed.
+          # SHARD_BUDGET is set per shard by run_shard (#6795): WATCHDOG_SECS for
+          # the parallel shards, SERIAL_BUDGET_SECS for the serial one.
           shard_left() {
-            echo $(( WATCHDOG_SECS - ($(date +%s) - $1) ))
+            echo $(( SHARD_BUDGET - ($(date +%s) - $1) ))
           }
           run_doc_tests() {
             local label="$1"; shift
             local rc=0 started elapsed
+            local WATCHDOG_SECS="$(cap_to_job_left "$WATCHDOG_SECS")"
             # `cargo test --doc --no-run` is rejected by cargo, so the prebuild
             # is the plain `--no-run` of the same feature set (lib + doc deps).
             cargo test --no-run "$@" || return "$?"
@@ -1477,6 +1533,13 @@ jobs:
             local -a itargs libargs
             itargs=(); libargs=()
             t0=$(date +%s)
+            # #6795: the serial shard cannot be split further, so it gets the
+            # whole remaining job budget; the parallel shards keep 7800 s.
+            if [ "$name" = serial ]; then
+              SHARD_BUDGET="$(cap_to_job_left "$SERIAL_BUDGET_SECS")"
+            else
+              SHARD_BUDGET="$(cap_to_job_left "$WATCHDOG_SECS")"
+            fi
             while IFS= read -r l; do
               [ -n "$l" ] || continue
               if [ "$l" = "--lib" ]; then
@@ -1503,7 +1566,7 @@ jobs:
               fi
               remaining=$(shard_left "$t0")
               if [ "$remaining" -lt 60 ]; then
-                echo "::error::[#6344 shard] ${name}: ${WATCHDOG_SECS}s shard budget exhausted before the lib run"
+                echo "::error::[#6344 shard] ${name}: ${SHARD_BUDGET}s shard budget exhausted before the lib run"
                 return 124
               fi
               WATCHDOG_SECS="$remaining" run_tests "[${name}] lib unittests" $FEAT --lib -- --test-threads="$threads" ${libargs[@]+"${libargs[@]}"} || rc=$?
@@ -1511,7 +1574,7 @@ jobs:
             if [ "$n_it" -gt 0 ]; then
               remaining=$(shard_left "$t0")
               if [ "$remaining" -lt 60 ]; then
-                echo "::error::[#6344 shard] ${name}: ${WATCHDOG_SECS}s shard budget exhausted before the binaries run"
+                echo "::error::[#6344 shard] ${name}: ${SHARD_BUDGET}s shard budget exhausted before the binaries run"
                 return 124
               fi
               WATCHDOG_SECS="$remaining" run_tests "[${name}] test binaries" $FEAT "${itargs[@]}" -- --test-threads="$threads" || rc=$?
@@ -1519,7 +1582,7 @@ jobs:
             if [ "$with_doc" = "1" ]; then
               remaining=$(shard_left "$t0")
               if [ "$remaining" -lt 60 ]; then
-                echo "::error::[#6344 shard] ${name}: ${WATCHDOG_SECS}s shard budget exhausted before the doc tests"
+                echo "::error::[#6344 shard] ${name}: ${SHARD_BUDGET}s shard budget exhausted before the doc tests"
                 return 124
               fi
               WATCHDOG_SECS="$remaining" run_doc_tests "[${name}] doc tests" $FEAT -- --test-threads="$threads" || rc=$?
@@ -1530,11 +1593,25 @@ jobs:
           run_sharded() {
             local label="$1" with_doc="$2"; shift 2
             local sd="${RUNNER_TEMP:-$PWD/.local-runs}/ci-shard"
-            local pid_s pid_1 pid_2 hb rc_s=0 rc_1=0 rc_2=0 rc=0 n
+            local job_now job_elapsed pid_s pid_1 pid_2 hb rc_s=0 rc_1=0 rc_2=0 rc=0 n
             rm -rf "$sd"; mkdir -p "$sd"
             echo "::notice::[#6344] '${label}': compile once, partition, then run serial + 2 parallel shards"
             cargo test --no-run --message-format=json-render-diagnostics $FEAT "$@" > "$sd/build.jsonl" || return "$?"
             python3 scripts/ci/partition_test_binaries.py --build-json "$sd/build.jsonl" --repo-root . --out-dir "$sd" --with-doc "$with_doc" || return "$?"
+            # #6795: the serial shard cannot be split further, so it gets the
+            # whole job time left (job cap - time since the job started, which
+            # includes the load-gate wait, setup, compile and partition - 300 s
+            # safety). Parallel shards keep the flat WATCHDOG_SECS (7800 s),
+            # capped by the same job time left.
+            job_elapsed=0
+            SERIAL_BUDGET_SECS="$WATCHDOG_SECS"
+            if [ "$JOB_T0_VALID" -eq 1 ]; then
+              job_now=$(date +%s)
+              job_elapsed=$(( job_now - JOB_T0 ))
+              SERIAL_BUDGET_SECS=$(( JOB_TIMEOUT_MIN * 60 - (job_now - JOB_T0) - 300 ))
+              if [ "$SERIAL_BUDGET_SECS" -lt 60 ]; then SERIAL_BUDGET_SECS=60; fi
+            fi
+            echo "::notice::[#6795] serial shard budget ${SERIAL_BUDGET_SECS}s (job cap ${JOB_TIMEOUT_MIN} min - ${job_elapsed}s elapsed since job start - 300s safety); parallel shards min(${WATCHDOG_SECS}s, job time left)"
             ( run_shard serial "$sd" 1 pg "$with_doc" ) > "$sd/serial.log" 2>&1 &
             pid_s=$!
             ( run_shard parallel_1 "$sd" 3 skip 0 ) > "$sd/parallel_1.log" 2>&1 &

@@ -122,6 +122,36 @@ within 20 % of the watchdog; lower it toward 1.4x the measured longest shard
 once the figure is known). These numbers are pinned by
 `scripts/ci/tests/test_ci_shard_wiring_6344.py`.
 
+### Load gate, serial-shard budget and cargo cap (#6795)
+
+The 7800 s budget was measured on an idle host. On f1 at load ~100 (run
+38015742119) the single-threaded serial shard ran 5-6x slower and the #1492
+watchdog killed it, while `parallel_1` and `parallel_2` passed.
+
+- **Load gate.** The `Load gate (#6795)` step runs immediately before `Run tests
+  (impact-aware)` on the self-hosted legs only (`contains(matrix.runner,
+  'self-hosted')`). `scripts/ci/load_gate.py` waits while the 1-minute load
+  average exceeds 1.5 x cores (`--max-ratio`), for at most 1200 s
+  (`--max-wait-secs`), polling every 30 s, and prints the measured load in a
+  `::notice::`. It never fails on load alone: after the wait it warns and
+  proceeds. Unit tests: `scripts/ci/tests/test_load_gate_6795.py`.
+- **Job start anchor.** The first step of the `check` job (`Record job start
+  (#6795)`) writes `JOB_T0` (epoch seconds) to `$GITHUB_ENV`, so every budget
+  counts the real time since the job started, including the load-gate wait.
+- **Serial shard budget.** The serial shard is the only shard that cannot be
+  split further, so `SERIAL_BUDGET_SECS` = job `timeout-minutes` x 60 - (now -
+  `JOB_T0`) - 300 s safety (floor 60 s). It is printed in a `[#6795] serial
+  shard budget` notice. `parallel_1` and `parallel_2` keep `WATCHDOG_SECS` =
+  7800 s.
+- **Job-cap clamp.** Every shard budget and every non-sharded watchdog is
+  clamped to min(its value, job time left - 300 s), so the named #1492
+  watchdog always fires before GitHub's job cancel, whatever the gate waited.
+  The matrix `timeout` values are not raised for the gate. Pinned by
+  `scripts/ci/tests/test_ci_load_gate_wiring_6795.py`.
+- **Operational cap.** Run at most 2 concurrent cargo lanes per host (f1 had 9
+  cargo / 17 rustc processes during the failing run). This is a fleet rule for
+  Modules, not enforced by the workflow.
+
 ## Carrier-branch gates (#6143)
 
 `chain/**` and `rehearsal/**` are `pull_request` base branches of the gating
