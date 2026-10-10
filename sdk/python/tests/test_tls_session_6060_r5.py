@@ -1804,3 +1804,24 @@ def test_foreign_symlink_in_a_sticky_directory_is_refused_6655(
     monkeypatch.setattr(os, "lstat", _as_foreign(os.lstat, (found.st_dev, found.st_ino)))
     with pytest.raises(ValueError, match="symlink"):
         _built(client_cls, verify)
+
+
+# ---- #6657 / #6658: which env variable httpx would honour ------------------
+
+
+@_POSIX_ONLY
+@_ENV_VERIFY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_ssl_cert_file_wins_over_ssl_cert_dir_6657(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    verify: object,
+) -> None:
+    """httpx reads SSL_CERT_FILE first; the SDK must load the same one."""
+    bundle = _bundle(lab, _ca_dir(tmp_path, "file"))
+    empty = _ca_dir(tmp_path, "empty")  # a valid hashed directory trusting nothing
+    _env_trust(monkeypatch, SSL_CERT_FILE=str(bundle), SSL_CERT_DIR=str(empty))
+    assert _get_once(client_cls, origin.url, verify) == 200
