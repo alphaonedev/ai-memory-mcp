@@ -70,6 +70,8 @@ SHARED_BASE_DB = 'ai_memory_test'
 MINTED_BASE_PREFIX = 'ci_base_'
 EPHEMERAL_BASE_PREFIXES = ('ai_memory_test_ci_', MINTED_BASE_PREFIX)
 MAINTENANCE_DB = 'postgres'
+SQL_DROP_DATABASE = 'DROP DATABASE IF EXISTS %s'
+SQL_RELEASE_TEMPLATE = 'ALTER DATABASE %s WITH IS_TEMPLATE false'
 KILL_VAR = 'CI_PG_ISOLATE_OFF'
 ISOLATED_PREFIX = 'ai_memory_t'
 TEMPLATE_SUFFIX = '_tpl'
@@ -324,7 +326,7 @@ def drop(admin_url: str, name: str, run_id: Optional[str], attempts: int = DROP_
     retried while the session drains, then the drop fails."""
     if parse_isolated_name(name, run_id) is None:
         raise WrapperError('refusing to drop %r: not a clone of run %r' % (name, run_id))
-    sql = 'DROP DATABASE IF EXISTS %s' % quote_ident(name)
+    sql = SQL_DROP_DATABASE % quote_ident(name)
     for attempt in range(1, attempts + 1):
         try:
             psql(admin_url, sql)
@@ -418,7 +420,7 @@ def drop_base(url: str, name: str) -> bool:
         log('WARN refusing to drop %r: not a minted ci_base_ database' % name)
         return False
     try:
-        psql(with_database(url, MAINTENANCE_DB), 'DROP DATABASE IF EXISTS %s' % quote_ident(_checked_ident(name)))
+        psql(with_database(url, MAINTENANCE_DB), SQL_DROP_DATABASE % quote_ident(_checked_ident(name)))
         return True
     except (WrapperError, OSError) as exc:
         log('WARN could not drop minted base %s (drop it by hand): %s' % (name, exc))
@@ -512,15 +514,30 @@ def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
     lineage_precheck(url, db_name)
     q = quote_ident(tpl)
     try:
-        psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE false' % q)
+        psql(url, SQL_RELEASE_TEMPLATE % q)
     except WrapperError:
         pass  # no leftover template from an earlier attempt
-    psql(url, 'DROP DATABASE IF EXISTS %s' % q)
+    psql(url, SQL_DROP_DATABASE % q)
     psql(url, 'CREATE DATABASE %s' % q)
-    psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')
-    psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE true ALLOW_CONNECTIONS false' % q)
-    log('template %s ready (%d free connection slots, need %d)' % (tpl, available, need))
-    return tpl
+    initialized = False
+    try:
+        psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')
+        psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE true ALLOW_CONNECTIONS false' % q)
+        log('template %s ready (%d free connection slots, need %d)' % (tpl, available, need))
+        initialized = True
+        return tpl
+    finally:
+        if not initialized:
+            primary = sys.exc_info()[1]
+            try:
+                try:
+                    psql(url, SQL_RELEASE_TEMPLATE % q)
+                finally:
+                    psql(url, SQL_DROP_DATABASE % q)
+            except BaseException:
+                if primary is None:
+                    raise
+                log('WARN owned template cleanup also failed; manual cleanup required')
 
 
 def _names(url: str, sql: str) -> List[str]:
@@ -543,11 +560,11 @@ def teardown(url: str, db_name: str, run_id: str) -> int:
             log('WARN could not drop %s: %s' % (name, exc))
     q = quote_ident(tpl)
     try:
-        psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE false' % q)
+        psql(url, SQL_RELEASE_TEMPLATE % q)
     except WrapperError:
         pass  # already gone
     try:
-        psql(url, 'DROP DATABASE IF EXISTS %s' % q)
+        psql(url, SQL_DROP_DATABASE % q)
     except WrapperError as exc:
         failed += 1
         log('WARN could not drop the template %s: %s' % (tpl, exc))
@@ -568,8 +585,8 @@ def _sweep_minted_bases(url: str, now: int, older_than: int) -> List[str]:
         q = quote_ident(name)
         try:
             if name.endswith(TEMPLATE_SUFFIX):
-                psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE false' % q)
-            psql(url, 'DROP DATABASE IF EXISTS %s' % q)
+                psql(url, SQL_RELEASE_TEMPLATE % q)
+            psql(url, SQL_DROP_DATABASE % q)
             dropped.append(name)
         except WrapperError as exc:
             log('WARN could not sweep %s: %s' % (name, exc))
@@ -873,7 +890,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     % (BASE_VAR, base, db))
             elif base and base == db and base.startswith(MINTED_BASE_PREFIX):
                 # Plain drop (no force option): a live session fails it, loudly.
-                psql(with_database(url, MAINTENANCE_DB), 'DROP DATABASE IF EXISTS %s' % quote_ident(_checked_ident(base)))
+                psql(with_database(url, MAINTENANCE_DB), SQL_DROP_DATABASE % quote_ident(_checked_ident(base)))
             return 0
         if args.cmd == 'sweep':
             sweep(url, args.older_than)
