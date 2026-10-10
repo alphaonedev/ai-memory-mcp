@@ -3911,6 +3911,9 @@ APPROVAL_JOB_KEYS = ["name", "runs-on", "timeout-minutes", "permissions", "steps
 # #6629: the checkout that supplies the evaluator takes exactly this `with:` mapping (no ref,
 # repository, path or token: each would judge with code from another commit or repository).
 APPROVAL_CHECKOUT_WITH = {"persist-credentials": "false"}
+# #6630: the workflow's top-level keys are exact. A workflow `env:` (GH_HOST, GH_REPO, ...)
+# reaches the Evaluate step and redirects its API calls; `defaults:` reroutes its shell.
+WORKFLOW_TOP_KEYS = ["name", "on", "permissions", "concurrency", "jobs"]
 
 
 def _row_scalar(body: str) -> str:
@@ -4027,6 +4030,8 @@ def _approval_job_problems(c8: str) -> List[str]:
     withs = [step["with"] for step in shape["steps"] if "with" in step["keys"]]  # type: ignore[union-attr,index,operator]
     if withs != [APPROVAL_CHECKOUT_WITH]:
         problems.append(f"step with mappings are {withs!r}, not exactly [{APPROVAL_CHECKOUT_WITH!r}]")
+    if shape["top_keys"] != WORKFLOW_TOP_KEYS:
+        problems.append(f"workflow top-level keys are {shape['top_keys']!r}, not exactly {WORKFLOW_TOP_KEYS!r}")
     for where, keys in (("job", shape["job_keys"]), ("workflow", shape["top_keys"])):
         if "defaults" in keys:  # type: ignore[operator]
             problems.append(f"the {where} declares `defaults:`; an approval step's shell may not be overridden")
