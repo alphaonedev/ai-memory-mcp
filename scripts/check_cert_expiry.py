@@ -2862,17 +2862,30 @@ def _ws_wording_cells(t):
     stated reason must be true. Cell `ws-wording` fails on a sentence of this
     file or of changelog.d/6304.fixed.md that says otherwise."""
     log = REPO_ROOT / "changelog.d" / "6304.fixed.md"
-    flat = re.sub(r"\s*\n\s*(?:#\s*)?", " ", Path(__file__).read_text(encoding="utf-8")
-                  + ("\n" + log.read_text(encoding="utf-8") if log.is_file() else ""))
+    if not log.is_file():
+        t.fail("(ws-wording): changelog.d/6304.fixed.md is missing while this script carries the #6304 cells; "
+               "the wording cell fails closed instead of skipping it (#6554)")
+        return
+    own, fragment = Path(__file__).read_text(encoding="utf-8"), log.read_text(encoding="utf-8")
+    flat = re.sub(r"\s*\n\s*(?:#\s*)?", " ", own + "\n" + fragment)
     ff_vt = r"\b(?:F" + "F|V" + r"T)\b"
+    pair = r"\bF" + "F and V" + r"T\b"
     wrong = (ff_vt + r"[^.;]{0,60}\b(?:keeps?|kept) as content",
              r"U\+3000, " + ff_vt + r"[^.;]{0,30}(?:and|or) (?:others|other characters) that YAML",
              r"second producer on an? [^.;\"']{0,50}" + ff_vt,
              r"second producer on a \{code\}-led",
-             r"U\+3000 or F" + "F is scanned")
+             r"U\+3000 or F" + "F is scanned",
+             # PyYAML 6.0.1 refuses U+001C-U+001F as well, so a sentence that lists just the
+             # pair as refused by YAML is incomplete (#6554).
+             pair + r"[^.;]{0,40}(?:refus|not load)",
+             r"refus\w* F" + "F and V" + "T")
     for pattern in wrong:
         for hit in re.finditer(pattern, flat):
-            t.fail(f"(ws-wording): FF/VT wording claims YAML keeps them or that they hide a producer: {hit.group(0)!r}")
+            t.fail(f"(ws-wording): FF/VT wording claims YAML keeps them, that they hide a producer, or lists just "
+                   f"two of the code points YAML refuses: {hit.group(0)!r}")
+    if "U+001C-U+001F" not in fragment:
+        t.fail("(ws-wording): changelog.d/6304.fixed.md does not name U+001C-U+001F among the code points YAML "
+               "refuses (#6554)")
 
 
 def _trusted_round5_cells(judge, shapes):
