@@ -227,10 +227,9 @@ def approvals(repo: Path, base_sha: str, head_sha: str) -> list:
     git configuration, so neither the host nor the repository can widen what counts as a trailer. #6431: the log
     read pins `--no-show-signature` and `--encoding=UTF-8`, so a host `log.showSignature` cannot inject verifier text
     and a host `i18n.logOutputEncoding` cannot turn a real approval into unreadable bytes."""
-    out = git(repo, "log", "-z", "--no-merges", "--first-parent", "--no-show-signature", "--encoding=UTF-8",
-              "--format=%B", f"{base_sha}..{head_sha}")
+    out = git(repo, "log", "-z", "--no-show-signature", "--encoding=UTF-8", "--format=%B", f"{base_sha}..{head_sha}")
     found = []
-    for message in out.split(b"\0")[:1]:
+    for message in out.split(b"\0"):
         if message.strip():
             found += [match.group(1).strip() for match in TRAILER.finditer(trailer_block(message))]
     return found
