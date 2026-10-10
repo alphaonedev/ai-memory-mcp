@@ -1940,8 +1940,8 @@ def _self_test_cases() -> int:
     # _self_test_cases, and the function that holds each one must be handed to guarded().
     ROUND4_FIXTURES = ("showsigverifier", "nonasciiapprover", "shallow")
 
-    def fixtures_guarded_cell():
-        tree = ast.parse(Path(__file__).resolve().read_text(encoding="utf-8"))
+    def fixtures_guarded_cell(source=None):
+        tree = ast.parse(Path(source or __file__).resolve().read_text(encoding="utf-8"))
         outer = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
                      and node.name == "_self_test_cases")
         handed = {arg.id for node in ast.walk(outer) if isinstance(node, ast.Call)
@@ -1960,13 +1960,16 @@ def _self_test_cases() -> int:
         visit(outer, None)
         return {name: found.get(name) for name in ROUND4_FIXTURES}, handed
 
-    holders, handed = fixtures_guarded_cell()
-    loose = [name for name, holder in holders.items() if holder is None or holder not in handed]
-    if loose:
-        failures.append("round-4 fixtures outside guarded")
-        print(f"FAIL: self-test - the fixtures {loose!r} are built outside guarded() (#6744)", file=sys.stderr)
-    else:
-        print("PASS: self-test - the #6575, #6609 and #6573 fixtures are built inside guarded() (#6744)")
+    def fixtures_pin(source=None):
+        holders, handed = fixtures_guarded_cell(source)
+        loose = [name for name, holder in holders.items() if holder is None or holder not in handed]
+        if loose:
+            failures.append("round-4 fixtures outside guarded")
+            print(f"FAIL: self-test - the fixtures {loose!r} are built outside guarded() (#6744)", file=sys.stderr)
+        else:
+            print("PASS: self-test - the #6575, #6609 and #6573 fixtures are built inside guarded() (#6744)")
+
+    guarded("the #6744 fixture-construction pin", fixtures_pin)  # #6818: a fault here is a named FAIL, not an abort
 
     # #6818: the #6744 pin reads this file's syntax tree, so a fault there (a missing file, a changed layout) used to
     # abort the whole run at this point and hide every later cell. The pin must therefore never be called directly in
@@ -1982,7 +1985,7 @@ def _self_test_cases() -> int:
                 if isinstance(child, (ast.FunctionDef, ast.Lambda)):
                     continue
                 if (isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
-                        and child.func.id == "fixtures_guarded_cell"):
+                        and child.func.id in ("fixtures_guarded_cell", "fixtures_pin")):
                     direct.append(child.lineno)
                 visit(child)
 
@@ -1995,6 +1998,25 @@ def _self_test_cases() -> int:
             print("PASS: self-test - the #6744 pin runs only inside guarded() (#6818)")
 
     guarded("the #6744 pin is never called outside guarded() (#6818) fixture", pin_call_guarded_cell)
+
+    # #6818: the pin on a script that cannot be read (reviewer mutant R9) is that check's named FAIL, a later check still
+    # runs, and the failure list is non-empty so the final result is FAIL (closed). The entry is removed afterwards so
+    # this proof does not fail the real run.
+    def pin_fault_cell():
+        name, ran, seen = "the #6744 pin on a missing script", [], len(failures)
+        with contextlib.redirect_stderr(io.StringIO()):
+            guarded(name, lambda: fixtures_pin(base_dir / "no-such-script.py"))
+            guarded("a check after the faulted pin", lambda: ran.append(True))
+        raised = failures[seen:]
+        del failures[seen:]
+        if raised != [name] or ran != [True]:
+            failures.append("the #6744 pin fault")
+            print(f"FAIL: self-test - a faulted #6744 pin must be one named FAIL and let later checks run: {raised!r}, "
+                  f"later checks ran: {ran!r} (#6818)", file=sys.stderr)
+        else:
+            print("PASS: self-test - a faulted #6744 pin is a named FAIL (closed) and later checks still run (#6818)")
+
+    guarded("a faulted #6744 pin lets the later checks run (#6818) fixture", pin_fault_cell)
 
     # #5180: the COUNT CHANGED branch uses the same dynamic fence as the rule branch; no other census diff carries
     # a backtick run, so a static fence there was never caught.
