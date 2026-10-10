@@ -4096,8 +4096,23 @@ class QueueRefDigitCap6244(unittest.TestCase):
         mod = _exec_approval_src(src.replace(needle, "pr-([0-9]+)-"))
         ref = f"refs/heads/gh-readonly-queue/main/pr-{'9' * 5000}-{SHA_C}"
         event = {"merge_group": {"head_sha": SHA_C, "base_sha": SHA_C, "head_ref": ref}}
-        with self.assertRaises(ValueError):  # the mutant dies in int(); the live gate returns 1
-            mod.run_gate("merge_group", event, REPO_6117, SHA_C, OPERATOR_6117, _fake_api([_pr(7, SHA_A)]))
+        # #6326: the kill must not depend on the interpreter. Python >= 3.11 caps int() at 4300
+        # digits (ValueError); 3.9/3.10 parse 5000 digits and the mutant then echoes the whole
+        # number in its error line. Either way the mutant loses the property the cap gives: one
+        # bounded line naming no oversized number. The live gate keeps it on every version.
+        self.assertIsNone(self.mod.QUEUE_REF_RE.fullmatch(ref))
+        self.assertIsNotNone(mod.QUEUE_REF_RE.fullmatch(ref))
+        try:
+            rc, lines = mod.run_gate("merge_group", event, REPO_6117, SHA_C, OPERATOR_6117,
+                                     _fake_api([_pr(7, SHA_A)]))
+        except ValueError:
+            pass  # killed: the mutant crashes instead of failing closed
+        else:
+            self.assertEqual(1, rc, lines)
+            self.assertGreaterEqual(max(len(line) for line in lines), 5000, lines)  # killed: unbounded line
+        live_rc, live_lines = self.gate("9" * 5000)
+        self.assertEqual((1, 1), (live_rc, len(live_lines)))
+        self.assertLess(len(live_lines[0]), 600)
 
 
 # ---- Round 4, item 6 (#6243): workflow-command data is escaped; fine-grained tokens are redacted ----
