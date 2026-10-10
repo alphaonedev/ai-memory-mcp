@@ -1813,7 +1813,7 @@ def self_test():
 
     # round9 #6681: a problem or refusal never reprints more than SUBSET.ECHO_LIMIT characters of a row,
     # never a GitHub-token-shaped string, and never the literal value of a credential-named key.
-    r9_tokens = ("gh" + "p_" + "A1b2C3d4" * 5, "github" + "_pat_" + "11AB" + "c9" * 30, "gh" + "s_" + "Zz09" * 9)
+    r9_tokens = ("gh" + "p_" + "A1b2C3d4" * 5, "github" + "_pat_" + "11AB" + "c9" * 14 + "_" + "c9" * 16, "gh" + "s_" + "Zz09" * 9)
     r9_fake = "FAKE" + "0" * 37
     r9_cells = [
         ("round9 #6681: a 3000-character refused row is cut", r8_after_vstep(
@@ -1981,6 +1981,25 @@ def self_test():
             "workflow_pin_problems is empty" if not workflow_pin_problems(t)
             else None if not any(s in p for p in workflow_pin_problems(t))
             else f"a problem echoes {s[:16]!r}..."))
+
+    # round11 #6800 #6801 #6802 #6803: test gaps found by the round-10 mutant run (comma after a kept expression,
+    # text between two expressions, an underscore inside a token body, the owner on the needs problem path).
+    r11_gap_tail = "LEAK" + "TAIL123"
+    r11_pat = "github" + "_pat_" + "Qx" * 8 + "_" + "Qx" * 20
+    for label, row, leak in (
+            ("round11 #6800: a comma after a kept expression withholds the value",
+             "PASSWORD: ${{ secrets.P }}," + r11_gap_tail, r11_gap_tail),
+            ("round11 #6801: text between two expressions is withheld",
+             "PASSWORD: ${{ secrets.A }} " + r11_gap_tail + " ${{ secrets.B }}", r11_gap_tail),
+            ("round11 #6802: a github_pat token with an underscore inside its body is masked whole",
+             "X: " + r11_pat, "Qx" * 8)):
+        check(label, lambda r=row, s=leak: None if s not in SUBSET.mask(r) and s not in SUBSET.clip(r)
+              else f"mask or clip echoes {s[:16]!r}...")
+    check("round11 #6803: the needs problem names the owning key and withholds the value", lambda: (
+        None if (lambda ps: ps and not any(r11_gap_tail in p for p in ps)
+                 and any("PASSWORD: <withheld " in p for p in ps))(
+            workflow_pin_problems(r10_env("PASSWORD: ${{ needs.a.outputs.b }} " + r11_gap_tail)))
+        else "the needs problem echoes the value or lacks the owning key"))
 
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")

@@ -496,7 +496,8 @@ class Round9AccessorShape(unittest.TestCase):
         tail = "LEAK" + "TAIL123"
         for row in ("API_KEY: abc,%s", "PASSWORD: abc]%s", "TOKEN: abc}%s", "TOKEN: abc #%s",
                     "export TOKEN=abc,%s", "PASSWORD: ${{ secrets.P }} %s", "TOKEN: ${{ 'x' }}%s",
-                    "TOKEN: ${{ a }}${{ b }}%s"):
+                    "TOKEN: ${{ a }}${{ b }}%s", "PASSWORD: ${{ secrets.P }},%s",
+                    "PASSWORD: ${{ secrets.A }} %s ${{ secrets.B }}"):
             self.assertNotIn(tail, SUBSET.mask(row % tail), row)
             self.assertNotIn(tail, SUBSET.clip(row % tail), row)
         self.assertEqual(SUBSET.mask("GH_TOKEN: ${{ github.token }}"), "GH_TOKEN: ${{ github.token }}")
@@ -509,6 +510,7 @@ class Round9AccessorShape(unittest.TestCase):
             tok = "gh" + "p_" + "Q" * 36
             self.assertNotIn("Q" * 8, SUBSET.mask("v=" + glue + tok), glue)
             self.assertNotIn("Q" * 8, SUBSET.mask("v " + glue + "github" + "_pat_" + "Q" * 40), glue)
+            self.assertNotIn("Q" * 8, SUBSET.mask("v " + glue + "github" + "_pat_" + "Q" * 20 + "_" + "Q" * 20), glue)
 
     def test_credential_vocabulary_6739(self):
         for name in ("Authorization", "bearer", "NPM_AUTH", "db_pass", "pwd", "passphrase", "AWS_ACCESS_KEY_ID",
