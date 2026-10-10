@@ -1867,7 +1867,7 @@ def _self_test_cases() -> int:
         oids = [bytes(data[chunks[b"OIDL"] + 20 * i:chunks[b"OIDL"] + 20 * (i + 1)]).hex() for i in range(count)]
         entry = chunks[b"CDAT"] + 36 * oids.index(child) + 20
         data[entry:entry + 4] = oids.index(new_parent).to_bytes(4, "big")
-        graph.write_bytes(bytes(data))
+        graph.write_bytes(graph.read_bytes())  # red state: mutant M13, the rewrite is a no-op
 
     def lying_graph_fixture(name):
         """An unapproved two-commit change plus an approved side commit; returns the repo and its commits."""
