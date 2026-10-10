@@ -1103,6 +1103,22 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertEqual(argv[:4], [sys.executable, "-I", os.path.abspath(str(SCRIPT)), "--supervise"])
         self.assertFalse(marker.exists(), "the --supervise process ran a sitecustomize hook")
 
+    def test_supervisor_deadline_is_the_probe_limit_plus_5_s_6644_6678(self):
+        # The supervisor deadline is the only bound on an authenticated psql while the helper is SIGSTOPped; the
+        # value the helper passes, not one a test hands to supervise(), is pinned (#6644 R18, #6678 S09).
+        mod = load_module()
+        _, argv = self.run_recorded()
+        deadline = argv[argv.index("--supervise") + 2]
+        self.assertEqual(deadline, str(mod.PROBE_TIMEOUT_SECONDS + mod.SUPERVISOR_GRACE_SECONDS))
+        self.assertEqual((mod.PROBE_TIMEOUT_SECONDS, mod.SUPERVISOR_GRACE_SECONDS), (60, 5))
+        self.assertLessEqual(mod.SUPERVISOR_GRACE_SECONDS, 10)
+        self.assertEqual(argv[argv.index("--supervise") + 3], "--")
+        for path in ("docs/DEV-CI-ENVIRONMENT.md", "changelog.d/6161.fixed.md"):
+            with self.subTest(doc=path):
+                self.assertIn(f"{int(deadline)} s deadline", " ".join((ROOT / path).read_text().split()))
+        self.assertIn(f"the {mod.PROBE_TIMEOUT_SECONDS} s limit plus {mod.SUPERVISOR_GRACE_SECONDS} s",
+                      " ".join(mod.__doc__.split()))
+
     def test_overall_deadline_stops_a_stalled_psql_6506(self):
         # #6506: the 60 s limit is the only bound on a psql that connects and then stalls.  The supervisor
         # deadline is held far away so only the helper's own limit and stop_child can end psql here (#6518).
