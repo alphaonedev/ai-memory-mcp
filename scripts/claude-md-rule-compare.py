@@ -2115,6 +2115,42 @@ def _self_test_cases() -> int:
 
     guarded("the pin-fault proof keeps earlier failures (#6885) fixture", earlier_failure_kept_cell)
 
+    # #6927: the run-wide failure list is only ever appended to. A proof cell that raises failures on purpose records
+    # them in a local sink, so no cleanup statement can erase a red cell that ran before it (reviewer mutants M7, M11,
+    # M12, X7 all mutated such a cleanup). Read from this file's own syntax tree: inside _self_test_cases `failures` is
+    # bound once (`failures = []`) and is otherwise only read or the receiver of `.append(...)`.
+    def failures_append_only_cell():
+        tree = ast.parse(Path(__file__).resolve().read_text(encoding="utf-8"))
+        outer = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                     and node.name == "_self_test_cases")
+
+        def is_failures(node):
+            return isinstance(node, ast.Name) and node.id == "failures"
+
+        def writes(node):
+            if isinstance(node, ast.Delete):
+                return [t for t in node.targets if isinstance(t, ast.Subscript) and is_failures(t.value)]
+            if isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                return [t for t in targets if is_failures(t) or (isinstance(t, ast.Subscript) and is_failures(t.value))]
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and is_failures(node.func.value):
+                return [node] if node.func.attr != "append" else []
+            return []
+
+        binding = [node for node in outer.body if isinstance(node, ast.Assign) and len(node.targets) == 1
+                   and is_failures(node.targets[0])]
+        found = sorted({node.lineno for node in ast.walk(outer) for _ in writes(node)
+                        if not (binding and node is binding[0])})
+        if len(binding) != 1 or found:
+            failures.append("the run-wide failure list is not append-only")
+            print(f"FAIL: self-test - the run-wide failure list is changed other than by append at line(s) {found!r} "
+                  f"(bindings in the body: {len(binding)}) (#6927)", file=sys.stderr)
+        else:
+            print("PASS: self-test - the run-wide failure list is only ever appended to; proof cells use a local sink "
+                  "(#6927)")
+
+    guarded("the run-wide failure list is append-only (#6927) fixture", failures_append_only_cell)
+
     # #5180: the COUNT CHANGED branch uses the same dynamic fence as the rule branch; no other census diff carries
     # a backtick run, so a static fence there was never caught.
     work, _, _ = fresh_pair("countfence")
