@@ -8942,7 +8942,9 @@ enabled = true
             (crate::llm::BACKEND_VLLM, true, true),
         ] {
             let mut delayed = delayed_selector_connection_7071().await;
-            let server = MockServer::start().await;
+            // Own the listener: a pooled socket can deliver an old fixture's
+            // delayed request into a new fixture's counts (#7071).
+            let server = MockServer::builder().start().await;
             finish_delayed_selector_request_7071(&mut delayed).await;
             Mock::given(method("GET"))
                 .and(path("/models"))
