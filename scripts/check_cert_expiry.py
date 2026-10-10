@@ -4028,11 +4028,16 @@ SELF_TEST_OK = (
     "a +K more marker (tr-s-ws-lines, tr-s-ws-nine) and a wording cell that fails on a false reason for refusing "
     "FF or VT (ws-wording); (tr round 7, #6760/#6761/#6762/#6763/#6684/#6554/#6683/#6765) one "
     "line number per line (tr-s-ws-oneline), repeated code points listed once in first-seen order "
-    "(tr-s-ws-dedup), no +K more marker at exactly eight items (tr-s-ws-eight), the count in lines "
-    "(tr-s-ws-count), the refusal on line 1 (tr-s-ws-line1-U+XXXX), U+001C-U+001F named among the code points "
+    "(tr-s-ws-dedup, in that order: tr-s-ws-dedup-order), no +K more marker at exactly eight items "
+    "(tr-s-ws-eight) and the marker at nine (tr-s-ws-nine-unit), the count in lines "
+    "(tr-s-ws-count), the refusal on line 1 (tr-s-ws-line1-U+XXXX), all 22 refused code points present and "
+    "space and tab not refused (tr-s-ws-all, tr-s-ws-yaml), U+001C-U+001F named among the code points "
     "YAML refuses and a missing changelog failing ws-wording, Unicode format characters escaped in every "
-    "printed name (log-safe-cf-U+XXXX, tr-log-cf-who, tr-log-cf-name) and this line naming every round "
-    "(summary-rounds)."
+    "printed name (log-safe-cf-U+XXXX, log-safe-cf-sweep, tr-log-cf-who, tr-log-cf-name) while plain text "
+    "passes unchanged (log-safe-plain) and this line naming every round "
+    "(summary-rounds) with no two words joined (summary-join); "
+    "(tr round 8, #6765/#6919/#6920) the line names every cell of rounds 6 to 8, read from the cell "
+    "functions' source, so a new cell that is not named here is red (summary-rounds)."
 )
 
 
