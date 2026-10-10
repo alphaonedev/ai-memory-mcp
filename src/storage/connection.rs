@@ -193,6 +193,9 @@ impl<'c> WriteTxn<'c> {
     /// already inside one. No guard is constructed on failure, so nothing
     /// is left to roll back.
     pub fn begin(conn: &'c Connection) -> rusqlite::Result<Self> {
+        // #6541: report stale frames BEFORE `BEGIN`; the debug-build assert
+        // inside may unwind and must not strand an open write transaction.
+        super::escalation_deferral::report_stale_frames(conn);
         conn.execute_batch(SQL_BEGIN_IMMEDIATE)?;
         Ok(Self::opened(conn))
     }
@@ -205,6 +208,7 @@ impl<'c> WriteTxn<'c> {
     /// Propagates the `rusqlite` error from `BEGIN EXCLUSIVE`. As with
     /// [`WriteTxn::begin`], no guard is constructed on failure.
     pub fn begin_exclusive(conn: &'c Connection) -> rusqlite::Result<Self> {
+        super::escalation_deferral::report_stale_frames(conn);
         conn.execute_batch(SQL_BEGIN_EXCLUSIVE)?;
         Ok(Self::opened(conn))
     }

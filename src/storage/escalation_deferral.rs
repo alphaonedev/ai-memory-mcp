@@ -199,32 +199,65 @@ fn forced_failure() -> bool {
     false
 }
 
+/// Report intents that an older frame on `conn`'s database still holds
+/// (#4116, #6132, #6540), BEFORE the caller opens its transaction.
+///
+/// Runs ahead of `BEGIN` so the debug-build `debug_assert!` can unwind without
+/// leaving a transaction open and holding the write lock (#6541). The report is
+/// written to raw stderr, the channel `Frames::drop` uses: a `tracing` event
+/// reaches no sink when no subscriber is installed (the default on most CLI
+/// paths), is filterable, and can be dropped by the non-blocking pipeline, so
+/// it alone cannot count as a delivered report. Intents are marked reported
+/// only AFTER that write succeeds; a failed write leaves them for the
+/// thread-exit report (ERRORS-19, fail closed).
+pub(super) fn report_stale_frames(conn: &Connection) {
+    let db_path = conn.path().filter(|p| !p.is_empty()).map(str::to_string);
+    if db_path.is_none() {
+        return;
+    }
+    let stale = TXN_FRAMES.with(|frames| {
+        let frames = frames.borrow();
+        frames
+            .0
+            .iter()
+            .filter(|f| f.db_path == db_path)
+            .map(TxnFrame::unreported)
+            .fold(0usize, usize::saturating_add)
+    });
+    if stale == 0 {
+        return;
+    }
+    let delivered = std::io::Write::write_fmt(
+        &mut std::io::stderr(),
+        format_args!(
+            "ERROR #4116: a WriteTxn is opening while {stale} deferred escalation(s) of an \
+             older frame on the same database were never settled (a leaked WriteTxn); those \
+             escalated writes stay REFUSED but were NOT queued\n"
+        ),
+    )
+    .is_ok();
+    if delivered {
+        TXN_FRAMES.with(|frames| {
+            let mut frames = frames.borrow_mut();
+            for frame in frames.0.iter_mut().filter(|f| f.db_path == db_path) {
+                frame.reported = frame.deferred.len();
+            }
+        });
+    }
+    tracing::error!(
+        stale,
+        delivered,
+        "stale escalation frame on the database being opened (leaked or unsettled transaction)"
+    );
+    debug_assert!(false, "#4116: stale escalation frame on this database");
+}
+
 /// Register a frame for a write transaction just opened on `conn`.
 pub(super) fn open_frame(conn: &Connection) -> u64 {
     let id = NEXT_FRAME_ID.fetch_add(1, Ordering::Relaxed);
     let db_path = conn.path().filter(|p| !p.is_empty()).map(str::to_string);
     TXN_FRAMES.with(|frames| {
-        let mut frames = frames.borrow_mut();
-        // #6132 — report each stale intent once: mark it reported here (before
-        // the debug_assert can unwind) so `Frames::drop` does not repeat it.
-        let mut stale = 0usize;
-        for frame in frames
-            .0
-            .iter_mut()
-            .filter(|f| db_path.is_some() && f.db_path == db_path)
-        {
-            stale = stale.saturating_add(frame.unreported());
-            frame.reported = frame.deferred.len();
-        }
-        if stale > 0 {
-            tracing::error!(
-                stale,
-                "#4116: a WriteTxn opened while an older frame on the same database still \
-                 holds deferred escalations (leaked or unsettled transaction)"
-            );
-            debug_assert!(false, "#4116: stale escalation frame on this database");
-        }
-        frames.0.push(TxnFrame {
+        frames.borrow_mut().0.push(TxnFrame {
             id,
             db_path,
             deferred: Vec::new(),
@@ -631,7 +664,8 @@ mod tests {
     #[test]
     fn issue_6540_untraced_loss_still_reported() {
         const ROLE: &str = "AI_MEMORY_TEST_6540_UNTRACED_LOSS";
-        const PATH: &str = "storage::escalation_deferral::tests::issue_6540_untraced_loss_still_reported";
+        const PATH: &str =
+            "storage::escalation_deferral::tests::issue_6540_untraced_loss_still_reported";
         if std::env::var(ROLE).as_deref() != Ok("child") {
             let out = crate::spawn_audit::audited_command(
                 std::env::current_exe().expect("current_exe"),
