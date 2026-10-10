@@ -2408,6 +2408,11 @@ def _self_test_cases() -> int:
     masks("#6664 R5 a tagged one-line value is still masked", "secret: !!str 6163CanaryTagValue",
           hidden=("6163CanaryTagValue",), count=1)
 
+    # #6163 round 5 (#6665): a private key block inside a YAML block scalar does not end the block.
+    masks("#6665 R5 J a key block inside a block scalar keeps the block masked",
+          "secret: |\n  -----BEGIN PRIVATE KEY-----\n  6163CanaryJKey\n  -----END PRIVATE KEY-----\n  6163CanaryJTail\n"
+          "next: shown-6163", hidden=("6163CanaryJKey", "6163CanaryJTail"), shown=("secret: |", "next: shown-6163"))
+
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
     fetch_root = base_dir / "pr-fetch"
