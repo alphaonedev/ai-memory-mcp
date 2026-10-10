@@ -494,10 +494,57 @@ mod tests {
         }
     }
 
-    /// #6098 — a secret-ABSENCE assertion (`!<x>.contains(secret)`) must not
-    /// put the fixture value, or any rendering that carries it, into its own
-    /// panic text: a failing run would print exactly the cleartext #4934
-    /// forbids, and static analysis flags the shape whether or not the
+    /// The identifiers a failure message would print: the names inside its
+    /// `{..}` placeholders plus every identifier in the arguments after the
+    /// literal. `stmt` is one whole assertion statement.
+    fn message_words(stmt: &str) -> Vec<String> {
+        let flat = stmt.split_whitespace().collect::<Vec<_>>().join(" ");
+        let Some(at) = flat.find("), \"") else {
+            return Vec::new();
+        };
+        let message = &flat[at + 3..];
+        let Some(body) = message.strip_prefix('"') else {
+            return Vec::new();
+        };
+        let end = body.find('"').unwrap_or(body.len());
+        let (literal, args) = body.split_at(end);
+        let mut words: Vec<String> = Vec::new();
+        for placeholder in literal.split('{').skip(1) {
+            let name = placeholder.split(['}', ':']).next().unwrap_or("");
+            words.push(name.to_string());
+        }
+        words.extend(
+            args.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .filter(|w| !w.is_empty())
+                .map(str::to_string),
+        );
+        words
+    }
+
+    /// Every panic macro call in `source` must carry one plain string literal
+    /// with no placeholder and no arguments, so its text cannot print a value.
+    fn panic_sink_defects(source: &str) -> usize {
+        // Built at run time so this helper's own text is not a match.
+        let call = format!("{}!(", "panic");
+        let mut defects = 0_usize;
+        for (at, _) in source.match_indices(call.as_str()) {
+            let rest = source[at + call.len()..].trim_start();
+            let plain = rest.strip_prefix('"').and_then(|body| {
+                let end = body.find('"')?;
+                let tail = body[end + 1..].trim_start();
+                (!body[..end].contains('{') && tail.starts_with(')')).then_some(())
+            });
+            if plain.is_none() {
+                defects += 1;
+            }
+        }
+        defects
+    }
+
+    /// #6098 / #6351 — a secret-ABSENCE assertion (`!<x>.contains(secret)`)
+    /// must not put the fixture value, or any rendering that carries it, into
+    /// its own panic text: a failing run would print exactly the cleartext
+    /// #4934 forbids, and static analysis flags the shape whether or not the
     /// fixture is a real credential.
     ///
     /// Scanning decision (test structure, no vote): the pin reads this
@@ -505,15 +552,39 @@ mod tests {
     /// STRUCTURALLY (one string literal, only `{i}` allowed, no format
     /// arguments after it) rather than blacklisting identifiers, so
     /// `{secret:?}`, positional arguments, `{err:?}` and `{dsn}` are all
-    /// refused by one rule. It also enforces the F3 ordering: inside a test
-    /// fn, no other assertion message interpolates a rendering (`shown`,
-    /// `rendering`, `out`, `err`) before that rendering's absence assertion
-    /// has run.
+    /// refused by one rule. Ordering: inside a test fn, no other assertion
+    /// message prints a rendering (`shown`, `rendering`, `out`, `err`,
+    /// whether by placeholder or by positional argument) before that
+    /// rendering's absence assertion has run. #6351 sinks: this module may
+    /// not use the value-printing macros and result accessors at all (they
+    /// print the operands, or the `Debug` of the credential-bearing value),
+    /// and a `panic!` carries a plain literal only. Redacting helpers
+    /// replace them.
     #[test]
     fn secret_absence_messages_never_interpolate_the_fixture_6098() {
         let source = tests_source_without_the_6098_pin();
         let mut absence_asserts = 0_usize;
         let mut defects = Vec::new();
+        for token in [
+            "assert_eq!(",
+            "assert_ne!(",
+            ".expect(",
+            ".expect_err(",
+            ".unwrap(",
+            ".unwrap_err(",
+            "eprintln!(",
+            "println!(",
+            "dbg!(",
+        ] {
+            let n = source.matches(token).count();
+            if n > 0 {
+                defects.push(format!("{n} use(s) of the value-printing sink {token}"));
+            }
+        }
+        let bad_panics = panic_sink_defects(&source);
+        if bad_panics > 0 {
+            defects.push(format!("{bad_panics} panic sink(s) with a placeholder"));
+        }
         for function in source.split("\n    fn ").skip(1) {
             let mut first_absence: Vec<(String, usize)> = Vec::new();
             let mut others: Vec<usize> = Vec::new();
@@ -543,13 +614,15 @@ mod tests {
             for at in others {
                 let stmt = &function[at..];
                 let stmt = &stmt[..stmt.find(");").unwrap_or(stmt.len())];
+                let words = message_words(stmt);
                 for (var, guard) in [
                     ("shown", "shown"),
                     ("rendering", "rendering"),
                     ("out", "out"),
                     ("err", "rendering"),
+                    ("dsn", "rendering"),
                 ] {
-                    if !stmt.contains(&format!("{{{var}")) {
+                    if !words.iter().any(|w| w == var) {
                         continue;
                     }
                     let guarded = first_absence.iter().any(|(g, p)| g == guard && *p < at);

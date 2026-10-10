@@ -621,3 +621,64 @@ fn no_production_site_renders_a_url_through_the_userinfo_maskers_3711() {
         offenders.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------
+// #6351 — the sink-absence helpers must not themselves be a sink. A failing
+// run of `assert_clean` printed the planted credential and the whole sink,
+// and the DLQ cell dumped the captured log sink to stderr: the exact
+// cleartext this file proves no production path emits.
+// ---------------------------------------------------------------------
+
+/// Pins the failure text of this file's own sink checks, by reading its
+/// source. Structural (test structure, no vote): `assert_clean`'s message is
+/// one literal whose only placeholders are `{i}` and `{what}` with no format
+/// arguments, no debug print may mention the captured sink's text, and no
+/// DLQ-row `Debug` may be interpolated into a message.
+#[test]
+fn sink_checks_never_print_the_planted_credential_or_the_sink_6351() {
+    const SOURCE: &str = include_str!("credential_to_sink_3711.rs");
+    let own = SOURCE
+        .find("fn sink_checks_never_print_the_planted_credential_or_the_sink_6351")
+        .unwrap_or(SOURCE.len());
+    let source = &SOURCE[..own];
+    let mut defects: Vec<String> = Vec::new();
+
+    let start = source.find("fn assert_clean(").unwrap_or(source.len());
+    let body = &source[start..];
+    let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+    let message = body
+        .split_once("contains(s),")
+        .map_or("", |(_, rest)| rest)
+        .trim_start();
+    let literal = message
+        .strip_prefix('"')
+        .and_then(|m| m.split_once('"'))
+        .map_or(("", message), |(lit, after)| (lit, after));
+    if literal.0.is_empty() {
+        defects.push("assert_clean has no message literal".to_string());
+    }
+    if literal
+        .0
+        .replace("{i}", "")
+        .replace("{what}", "")
+        .contains(['{', '}'])
+    {
+        defects.push("assert_clean message has a placeholder other than {i} / {what}".to_string());
+    }
+    if !literal.1.trim_start().starts_with(')') {
+        defects.push("assert_clean message has format arguments".to_string());
+    }
+
+    let print = format!("{}!(", "eprintln");
+    for (at, _) in source.match_indices(print.as_str()) {
+        let stmt = &source[at..];
+        let stmt = &stmt[..stmt.find(';').unwrap_or(stmt.len())];
+        if stmt.contains(".text()") {
+            defects.push("a debug print interpolates the captured sink text".to_string());
+        }
+    }
+    if source.contains("{rows:?}") {
+        defects.push("a message interpolates the DLQ rows' Debug".to_string());
+    }
+    assert!(defects.is_empty(), "#6351: {defects:?}");
+}
