@@ -266,3 +266,12 @@ def test_every_input_of_the_binary_triggers_the_live_job_6830() -> None:
         block = re.split(r"\n  [a-z_]+:\n", on.split(f"\n  {event}:\n", 1)[1], maxsplit=1)[0]
         for path in ('"migrations/**"', '"vendor/**"', '"rust-toolchain.toml"'):
             assert f"- {path}" in block, f"clients-ci {event} paths miss {path} (#6830)"
+
+
+def test_live_docs_do_not_name_a_fixed_daemon_port_6831() -> None:
+    """The harness picks a free port; its docstring and the job comment must not name 9077."""
+    harness_doc = _HARNESS.read_text().split('"""', 2)[1]
+    assert "9077" not in harness_doc
+    job = _WORKFLOW.read_text()
+    comment = job[job.index("# #6746") : job.index("sdk-python-live:")]
+    assert "9077" not in comment
