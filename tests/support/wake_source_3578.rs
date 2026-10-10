@@ -137,3 +137,63 @@ pub fn production_tokens(source: &str) -> Vec<&str> {
     }
     out
 }
+
+/// End (exclusive token index) of the single item that starts at `item`, which
+/// follows a `#[cfg(test)]` attribute (#6321). `mod`, `impl`, `fn`, `struct`,
+/// `enum` and `trait` items end at their `{ ... }` body (or a bare `;`);
+/// `const`, `static`, `use` and `type` items end at their `;`, skipping any
+/// brace group inside the initialiser. `None` when no item can be delimited,
+/// in which case the attribute is left counted as production (fail closed).
+#[allow(dead_code)]
+fn test_item_end(t: &[&str], item: usize) -> Option<usize> {
+    let mut i = item;
+    while matches!(t.get(i), Some(&("pub" | "unsafe" | "async" | "extern" | "default"))) {
+        i += 1;
+        if t.get(i) == Some(&"(") {
+            i = group_end(t, i);
+        }
+    }
+    let to_semicolon = match t.get(i)? {
+        &("static" | "use" | "type") => true,
+        &"const" => !matches!(t.get(i + 1), Some(&("fn" | "unsafe" | "async" | "extern"))),
+        _ => false,
+    };
+    while i < t.len() {
+        match t[i] {
+            ";" => return Some(i + 1),
+            "{" if !to_semicolon => return Some(group_end(t, i)),
+            "{" | "[" | "(" => i = group_end(t, i),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::production_tokens;
+
+    /// #6321 — test-only fn, impl, const, static and use items outside a test
+    /// module leave the production token stream unchanged.
+    #[test]
+    fn cfg_test_items_outside_a_test_module_are_not_production_6321() {
+        let base = "fn decode() { metadata() }";
+        for seam in [
+            "#[cfg(test)] pub(crate) fn start_injectable(a: Option<(u8, u8)>) -> X { store(); }",
+            "#[cfg(test)] impl Foo { fn seam(&self) { store(); } }",
+            "#[cfg(test)] const FIXTURE: Foo = Foo { a: 1 };",
+            "#[cfg(test)] static GATE: Mutex<()> = Mutex::new(());",
+            "#[cfg(test)] #[allow(dead_code)] const fn seam() -> u8 { 1 }",
+            "#[cfg(test)] use crate::mcp::handle_notify;",
+        ] {
+            let with = format!("{seam} {base}");
+            assert_eq!(
+                production_tokens(base),
+                production_tokens(&with),
+                "should skip: {seam}"
+            );
+        }
+        let tail = format!("{base} #[cfg(feature = \"x\")] fn new_decoder() {{ store(); }}");
+        assert_ne!(production_tokens(base), production_tokens(&tail));
+    }
+}

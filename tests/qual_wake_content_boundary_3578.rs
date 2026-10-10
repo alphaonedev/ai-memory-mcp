@@ -357,7 +357,7 @@ fn mutations_at_producer_decoder_consumer_and_audit_boundaries_are_refused() {
 fn rust_comments_and_inline_test_changes_are_allowed_but_new_production_is_not() {
     let mode = "rust-production-tokens";
     let original = "fn decode() { metadata() }";
-    let allowed = "// explain the boundary\nfn decode () { /* note */ metadata ( ) }\n#[cfg(test)] mod tests { fn fixture() { store(); } }";
+    let allowed = "// explain the boundary\nfn decode () { /* note */ metadata ( ) }\n#[cfg(test)] mod tests { fn fixture() { store(); } }\n#[cfg(test)] pub(crate) fn seam() -> u8 { store(); 1 }\n#[cfg(test)] impl Probe { fn t(&self) { store(); } }\n#[cfg(test)] const FIXTURE: Probe = Probe { a: 1 };";
     assert_eq!(fingerprint(original, mode), fingerprint(allowed, mode));
     for suffix in [
         "fn new_decoder() { notify(); }",
