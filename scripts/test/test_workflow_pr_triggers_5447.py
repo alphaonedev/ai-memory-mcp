@@ -5289,5 +5289,38 @@ class AuthorizationValueFloor6638(unittest.TestCase):
                 self.assertIn(f"{scheme} {self.SEVEN}", seven)
 
 
+# ---- Round 6 (#6608): deciding reviews are ordered by (submitted_at, id), time first ----
+
+
+class ReviewOrderingTimeFirst6608(unittest.TestCase):
+    """The review submitted LAST decides even when it has the SMALLER id.
+
+    Ordering by id alone, or by id before time, picks the wrong review in both cases below.
+    """
+
+    T1, T2 = OperatorLatestReview6329.T1, OperatorLatestReview6329.T2
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+
+    def both_orders(self, reviews: List[dict], want: int) -> None:
+        for order in (reviews, list(reversed(reviews))):
+            api = _fake_api([_pr(7, SHA_A)], {7: order})
+            rc, lines = self.mod.run_gate("push", {}, REPO_6117, SHA_A, OPERATOR_6117, api)
+            self.assertEqual(want, rc, "\n".join(lines))
+
+    def test_6608_later_change_request_with_lower_id_fails(self) -> None:
+        self.both_orders([_review(SHA_A, submitted_at=self.T1, review_id=9),
+                          _review(SHA_A, state="CHANGES_REQUESTED", submitted_at=self.T2, review_id=3)], 1)
+
+    def test_6608_later_approval_with_lower_id_passes(self) -> None:
+        self.both_orders([_review(SHA_A, state="CHANGES_REQUESTED", submitted_at=self.T1, review_id=9),
+                          _review(SHA_A, submitted_at=self.T2, review_id=3)], 0)
+
+    def test_6608_equal_time_falls_back_to_id(self) -> None:
+        self.both_orders([_review(SHA_A, submitted_at=self.T1, review_id=3),
+                          _review(SHA_A, state="DISMISSED", submitted_at=self.T1, review_id=9)], 1)
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
