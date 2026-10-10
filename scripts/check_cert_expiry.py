@@ -540,8 +540,13 @@ class _Frame:
         self.cum = own
 
     def add_inner(self, attr):
+        """An inner attribute applies to the whole enclosing item. A file-level
+        one (root frame) is collected only: the caller applies it once to every
+        occurrence and `mod` declaration of the file, wherever it is written, so
+        that is the single path that carries it (#6719)."""
         self.attrs.append(attr)
-        _attr_findings(attr, self.cum)
+        if self.kind != "root":
+            _attr_findings(attr, self.cum)
 
     def reset(self):
         self.cur, self.pend, self.pend_found = [], [], set()
