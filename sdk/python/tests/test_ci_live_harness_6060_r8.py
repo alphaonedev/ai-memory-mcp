@@ -12,6 +12,9 @@
 from __future__ import annotations
 
 import base64
+import os
+import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -120,3 +123,119 @@ def test_a_secret_spanning_lines_is_filtered_across_the_chunks_6964(
     assert "first-line-of-secret" not in text
     assert "second-line-of-secret" not in text
     assert "head " in text and " tail" in text
+
+
+# ---- #6935 / #6961: the r7 harness test's own teardown and lookups ---------------
+
+
+def test_run_close_survives_eperm_from_a_zombie_only_group_6935(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """macOS answers ``killpg`` on a group holding only zombies with EPERM; close() must absorb it."""
+    from . import test_ci_live_harness_6060_r7 as r7
+
+    run = r7.Run(tmp_path)
+    run.proc = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    run.proc.wait()
+
+    def eperm(pgid: int, sig: int) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "killpg", eperm)
+    run.close()
+
+
+def test_run_close_is_idempotent_and_never_signals_a_reaped_group_6935(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After ``wait()`` the pid may be reused, so a second close() must not ``killpg`` it again."""
+    from . import test_ci_live_harness_6060_r7 as r7
+
+    run = r7.Run(tmp_path)
+    run.proc = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+    run.proc.wait()
+    signalled: list[int] = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: signalled.append(pgid))
+    run.close()
+    run.close()
+    assert len(signalled) <= 1, signalled
+
+
+def test_leader_pgid_retries_a_transient_lookup_error_6961(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``os.getpgid`` of a just-started child can say ESRCH once under load: retry, then answer."""
+    from . import test_ci_live_harness_6060_r7 as r7
+
+    run = r7.Run(tmp_path)
+    run.proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"], start_new_session=True
+    )
+    real = os.getpgid
+    attempts = {"n": 0}
+
+    def flaky(pid: int) -> int:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise ProcessLookupError(3, "No such process")
+        return real(pid)
+
+    monkeypatch.setattr(os, "getpgid", flaky)
+    try:
+        assert r7.leader_pgid(run) == run.proc.pid
+        assert attempts["n"] == 3
+    finally:
+        run.proc.kill()
+        run.proc.wait()
+
+
+def test_leader_pgid_reports_the_output_of_a_harness_that_exited_6961(tmp_path: Path) -> None:
+    from . import test_ci_live_harness_6060_r7 as r7
+
+    run = r7.Run(tmp_path)
+    run.proc = subprocess.Popen(
+        [sys.executable, "-c", "print('harness died early')"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    run.proc.wait()
+    with pytest.raises(pytest.fail.Exception, match="harness died early"):
+        r7.leader_pgid(run)
+
+
+# ---- #6960: a stop signal inside Stack.spawn leaves no untracked child ------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+def test_a_stop_signal_inside_spawn_does_not_orphan_the_child_6960(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = _harness()
+    previous = {sig: signal.signal(sig, h._stop) for sig in h.STOP_SIGNALS}
+    stack = h.Stack(Path(sys.executable), tmp_path / "run", 0)
+    (tmp_path / "run").mkdir()
+    real = subprocess.Popen
+    started: list[subprocess.Popen[bytes]] = []
+
+    def popen(argv: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        child = real([sys.executable, "-c", "import time; time.sleep(300)"], **kwargs)  # type: ignore[call-overload]
+        started.append(child)
+        os.kill(os.getpid(), signal.SIGTERM)  # the stop signal lands right after the fork
+        return child
+
+    monkeypatch.setattr(h.subprocess, "Popen", popen)
+    try:
+        with pytest.raises(h.Stopped):
+            stack.spawn("daemon", "-c", "pass")
+        monkeypatch.setattr(h.subprocess, "Popen", real)
+        stack.close()
+        assert started, "the stub never started the child"
+        assert started[0].poll() is not None, "the child outlived close(): it was never tracked"
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+        for child in started:
+            if child.poll() is None:
+                child.kill()
+                child.wait()

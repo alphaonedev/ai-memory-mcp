@@ -103,7 +103,14 @@ class Stopped(BaseException):
         self.signum = signum
 
 
+#: Set while ``Stack.spawn`` forks a child: a stop signal then waits until the child is tracked (#6960).
+_spawn_guard = {"active": False, "pending": None}
+
+
 def _stop(signum, _frame):
+    if _spawn_guard["active"]:
+        _spawn_guard["pending"] = signum  # delivered by spawn() once the child is in Stack.procs
+        return
     raise Stopped(signum)
 
 
@@ -282,8 +289,17 @@ class Stack:
         env = self.env()
         env.update(extra_env or {})
         log = open(self.run / f"{name}.log", "wb")  # noqa: SIM115 - held open for the child, closed in close()
-        proc = subprocess.Popen([self.binary, *args], env=env, stdout=log, stderr=subprocess.STDOUT)
-        self.procs.append((name, proc, log))
+        _spawn_guard["pending"] = None
+        _spawn_guard["active"] = True
+        try:
+            proc = subprocess.Popen([self.binary, *args], env=env, stdout=log, stderr=subprocess.STDOUT)
+            self.procs.append((name, proc, log))
+        finally:
+            _spawn_guard["active"] = False
+        pending = _spawn_guard["pending"]
+        if pending is not None:
+            _spawn_guard["pending"] = None
+            raise Stopped(pending)
         return proc
 
     @property

@@ -75,6 +75,7 @@ class Run:
         stub.chmod(0o755)
         self.stub = stub
         self.work = work
+        self._closed = False
         self.proc: subprocess.Popen[bytes] | None = None
 
     def start(self, *extra: str) -> subprocess.Popen[bytes]:
@@ -135,14 +136,28 @@ class Run:
         return left
 
     def close(self) -> None:
-        if self.proc is not None:
+        if self.proc is not None and not self._closed:
+            self._closed = True  # the pid may be reused once reaped: signal the group once (#6935)
             try:
                 os.killpg(self.proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            except (ProcessLookupError, PermissionError):
+                pass  # macOS answers EPERM for a group that holds only zombies (#6935)
             self.proc.wait()
         for pid in self.alive().values():
             os.kill(pid, signal.SIGKILL)
+
+
+def leader_pgid(run: Run, attempts: int = 20) -> int:
+    """The harness's process group, retrying the transient ESRCH a loaded host can answer (#6961)."""
+    assert run.proc is not None
+    for _ in range(attempts):
+        try:
+            return os.getpgid(run.proc.pid)
+        except ProcessLookupError:
+            if run.proc.poll() is not None:
+                break
+            time.sleep(0.05)
+    pytest.fail(f"the harness is gone before its group could be read: {run.output()}")
 
 
 @pytest.fixture
@@ -230,7 +245,7 @@ def test_teardown_reaps_every_child_of_the_harness_6812(run: Run) -> None:
     run.start()
     assert run.proc is not None
     pgid = run.proc.pid
-    assert os.getpgid(run.proc.pid) == pgid, "the harness must lead its own process group"
+    assert leader_pgid(run) == pgid, "the harness must lead its own process group"
     run.wait_for("serve")
     run.close()
     end = time.monotonic() + 10
