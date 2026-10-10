@@ -41,10 +41,9 @@ fn deliver_with_proxy_env() {
         });
         format!("{}/hook", crate::test_support::spawn_tls_mock(app).await)
     });
-    let res =
-        std::thread::spawn(move || send_with(&url, "{}", "1700000000", None, "corr-6372", true))
-            .join()
-            .expect("dispatch thread");
+    let res = std::thread::spawn(move || send(&url, "{}", "1700000000", None, "corr-6372", true))
+        .join()
+        .expect("dispatch thread");
     assert_eq!(
         res,
         Ok(()),

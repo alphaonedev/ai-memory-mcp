@@ -1599,7 +1599,14 @@ fn deliver_with_retry(
             std::thread::sleep(RETRY_BACKOFFS[attempt_idx - 1]);
         }
         attempts += 1;
-        match send(url, body, timestamp, signature, correlation_id) {
+        match send(
+            url,
+            body,
+            timestamp,
+            signature,
+            correlation_id,
+            crate::config::allow_loopback_webhooks(),
+        ) {
             Ok(()) => {
                 return DeliveryOutcome {
                     success: true,
@@ -1661,27 +1668,11 @@ fn refusal_is_terminal(reason: &str) -> bool {
 /// [`ACK_TIMEOUT`]. Anything else (network error, non-2xx, ACK
 /// timeout, mismatched correlation id) returns Err with a short
 /// reason string the retry driver records.
+///
+/// `allow_loopback` is passed explicitly (production: the process-wide
+/// opt-in) so a test can drive the production-default posture (`false`)
+/// without racing that flag, which is `true` under `cfg(test)` (#6371).
 fn send(
-    url: &str,
-    body: &str,
-    timestamp: &str,
-    signature: Option<&str>,
-    correlation_id: &str,
-) -> Result<(), String> {
-    send_with(
-        url,
-        body,
-        timestamp,
-        signature,
-        correlation_id,
-        crate::config::allow_loopback_webhooks(),
-    )
-}
-
-/// [`send`] with the loopback opt-in passed explicitly, so a test can drive
-/// the production-default posture (`false`) without racing the process-wide
-/// flag, which is `true` under `cfg(test)` (#6371).
-fn send_with(
     url: &str,
     body: &str,
     timestamp: &str,
@@ -4195,6 +4186,7 @@ mod tests {
                 "1700000000",
                 Some("deadbeef"),
                 &corr,
+                true,
             )
         })
         .await
@@ -4213,7 +4205,7 @@ mod tests {
         let url = receiver.hook_url();
         let corr = uuid::Uuid::now_v7().to_string();
         let res = tokio::task::spawn_blocking(move || {
-            send(&url, "{\"event\":\"x\"}", "1700000000", None, &corr)
+            send(&url, "{\"event\":\"x\"}", "1700000000", None, &corr, true)
         })
         .await
         .unwrap();
@@ -4230,9 +4222,10 @@ mod tests {
         let receiver = spawn_tls_receiver(Reply::Status(404)).await;
         let url = receiver.hook_url();
         let corr = uuid::Uuid::now_v7().to_string();
-        let res = tokio::task::spawn_blocking(move || send(&url, "{}", "1700000000", None, &corr))
-            .await
-            .unwrap();
+        let res =
+            tokio::task::spawn_blocking(move || send(&url, "{}", "1700000000", None, &corr, true))
+                .await
+                .unwrap();
         assert!(res.is_err(), "4xx must return Err");
         assert_eq!(
             receiver.received().len(),
@@ -4259,9 +4252,10 @@ mod tests {
         let receiver = spawn_tls_receiver(Reply::Redirect("/internal-rebind-target")).await;
         let url = receiver.hook_url();
         let corr = uuid::Uuid::now_v7().to_string();
-        let res = tokio::task::spawn_blocking(move || send(&url, "{}", "1700000000", None, &corr))
-            .await
-            .unwrap();
+        let res =
+            tokio::task::spawn_blocking(move || send(&url, "{}", "1700000000", None, &corr, true))
+                .await
+                .unwrap();
         assert!(
             res.is_err(),
             "redirect must not be followed; 3xx surfaces as a failed dispatch: {res:?}"
@@ -4288,7 +4282,7 @@ mod tests {
         let url = receiver.hook_url();
         let corr = uuid::Uuid::now_v7().to_string();
         let res = tokio::task::spawn_blocking(move || {
-            send(&url, "{}", "1700000000", Some("abc123"), &corr)
+            send(&url, "{}", "1700000000", Some("abc123"), &corr, true)
         })
         .await
         .unwrap();
@@ -4323,7 +4317,7 @@ mod tests {
         let res = tokio::task::spawn_blocking({
             let url = url.clone();
             let corr = corr.clone();
-            move || send(&url, "{}", "1700000000", None, &corr)
+            move || send(&url, "{}", "1700000000", None, &corr, true)
         })
         .await
         .unwrap();
@@ -4353,6 +4347,7 @@ mod tests {
             "1700000000",
             None,
             "some-corr",
+            true,
         );
         assert!(
             res.is_err(),
@@ -4363,7 +4358,14 @@ mod tests {
     #[test]
     fn send_rejects_invalid_scheme_without_network() {
         // ftp:// is rejected by validate_url; send returns Err.
-        let res = send("ftp://example.com/hook", "{}", "1700000000", None, "x");
+        let res = send(
+            "ftp://example.com/hook",
+            "{}",
+            "1700000000",
+            None,
+            "x",
+            true,
+        );
         assert!(res.is_err(), "send must reject non-http(s) URL");
     }
 

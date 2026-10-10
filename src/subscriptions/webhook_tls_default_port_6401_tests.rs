@@ -84,7 +84,7 @@ fn https_url_without_port_delivers_to_443_over_tls_6401() {
         });
     });
     let res = std::thread::spawn(|| {
-        send_with(
+        send(
             IMPLICIT_PORT_URL,
             "{\"e\":1}",
             "1700000000",
