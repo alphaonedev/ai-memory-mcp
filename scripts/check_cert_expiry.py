@@ -1118,24 +1118,37 @@ def _line_break_findings(rel, text):
             f"CR, NEL, LS or PS; {len(numbers)} in this file) is refused in every workflow file {SHADOW_NOTE}"]
 
 
+def _listed(items, shown_max=8):
+    """The first `shown_max` items joined by ', ', then ', +K more' for the rest."""
+    text = ", ".join(str(item) for item in items[:shown_max])
+    return text + (f", +{len(items) - shown_max} more" if len(items) > shown_max else "")
+
+
 def _whitespace_findings(rel, text):
     """GUARD SHADOW for a whitespace character other than space or tab (NBSP,
-    U+3000, FF, VT, ...) anywhere in a workflow file (#6304): YAML keeps it as
-    content, Python treats it as blank, so a line led by one and then `#`
-    would be a comment to the scan and content to the parser. No legitimate
-    workflow needs one; it is refused, not interpreted. Line breaks are the
+    U+3000, the other Unicode spaces, FF, VT, ...) anywhere in a workflow file
+    (#6304). YAML keeps most of them as content (it refuses FF and VT
+    outright) while Python treats them as blank, so a line led by one and then
+    `#` would be a comment to the scan and content to a parser. No legitimate
+    workflow needs one; it is refused, not interpreted. The message names
+    every offending line (the first 8, then a "+K more" marker) and every
+    code point (the first 8, then "+K more"; #6556). Line breaks are the
     business of _line_break_findings."""
-    seen, first = [], None
+    seen, numbers = [], []
     for number, line in enumerate(yaml_lines(text), 1):
+        hit = False
         for ch in line:
             if ch.isspace() and ch not in YAML_WHITE:
-                first = first or number
+                hit = True
                 if ch not in seen:
                     seen.append(ch)
-    if first is None:
+        if hit:
+            numbers.append(number)
+    if not numbers:
         return []
-    shown = ", ".join(f"U+{ord(c):04X}" for c in seen[:8])
-    return [f"GUARD SHADOW: {log_safe(rel)} line {first}: a whitespace character other than space or tab "
+    where = f"{'line' if len(numbers) == 1 else 'lines'} {_listed(numbers)} ({len(numbers)} in this file)"
+    shown = _listed([f"U+{ord(c):04X}" for c in seen])
+    return [f"GUARD SHADOW: {log_safe(rel)} {where}: a whitespace character other than space or tab "
             f"({shown}) is refused in every workflow file {SHADOW_NOTE}"]
 
 
