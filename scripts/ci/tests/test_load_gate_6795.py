@@ -11,7 +11,7 @@ Python 3.9+, standard library only.
 import io
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -82,16 +82,30 @@ class Run(unittest.TestCase):
         self.assertEqual(sum(sleeps), 90)
         self.assertIn('::warning::[#6795 load gate]', out)
 
-    def test_notice_at_start_each_wait_and_exit(self):
-        rc, out, _ = self.run_gate([90.0, 80.0, 10.0])
-        self.assertEqual(out.count('::notice::[#6795 load gate]'), 3)
+    def test_only_first_and_last_lines_are_annotations(self):
+        rc, out, _ = self.run_gate([90.0, 80.0, 70.0, 10.0])
+        self.assertEqual(out.count('::notice::[#6795 load gate]'), 2)
+        self.assertIn('load=80.00', out)
+        self.assertIn('load=70.00', out)
+        lines = out.splitlines()
+        self.assertTrue(lines[0].startswith('::notice::'))
+        self.assertTrue(lines[-1].startswith('::notice::'))
+
+    def test_unreadable_load_warns_and_exits_0(self):
+        def boom():
+            raise OSError('no loadavg')
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = load_gate.run('x', 1.5, 60, 30, 10, boom, lambda s: None)
+        self.assertEqual(rc, 0)
+        self.assertIn('::warning::[#6795 load gate]', out.getvalue())
 
 
 class Main(unittest.TestCase):
     def test_bad_args_exit_2(self):
         for argv in (['--max-ratio', '0'], ['--poll-secs', '0'], ['--max-wait-secs', '-1']):
             with self.assertRaises(SystemExit) as cm:
-                with redirect_stdout(io.StringIO()):
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
                     load_gate.main(argv + ['--label', 'x'])
             self.assertEqual(cm.exception.code, 2, argv)
 

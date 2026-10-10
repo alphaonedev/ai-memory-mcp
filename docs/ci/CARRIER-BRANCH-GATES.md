@@ -135,12 +135,18 @@ watchdog killed it, while `parallel_1` and `parallel_2` passed.
   (`--max-wait-secs`), polling every 30 s, and prints the measured load in a
   `::notice::`. It never fails on load alone: after the wait it warns and
   proceeds. Unit tests: `scripts/ci/tests/test_load_gate_6795.py`.
+- **Job start anchor.** The first step of the `check` job (`Record job start
+  (#6795)`) writes `JOB_T0` (epoch seconds) to `$GITHUB_ENV`, so every budget
+  counts the real time since the job started, including the load-gate wait.
 - **Serial shard budget.** The serial shard is the only shard that cannot be
-  split further, so `SERIAL_BUDGET_SECS` = job `timeout-minutes` x 60 - seconds
-  spent in the step before the shards start (compile and partition) - 300 s
-  safety - 600 s allowance for the earlier steps (floor 60 s). `parallel_1` and
-  `parallel_2` keep `WATCHDOG_SECS` = 7800 s. The value is printed in a
-  `[#6795] serial shard budget` notice. Pinned by
+  split further, so `SERIAL_BUDGET_SECS` = job `timeout-minutes` x 60 - (now -
+  `JOB_T0`) - 300 s safety (floor 60 s). It is printed in a `[#6795] serial
+  shard budget` notice. `parallel_1` and `parallel_2` keep `WATCHDOG_SECS` =
+  7800 s.
+- **Job-cap clamp.** Every shard budget and every non-sharded watchdog is
+  clamped to min(its value, job time left - 300 s), so the named #1492
+  watchdog always fires before GitHub's job cancel, whatever the gate waited.
+  The matrix `timeout` values are not raised for the gate. Pinned by
   `scripts/ci/tests/test_ci_load_gate_wiring_6795.py`.
 - **Operational cap.** Run at most 2 concurrent cargo lanes per host (f1 had 9
   cargo / 17 rustc processes during the failing run). This is a fleet rule for

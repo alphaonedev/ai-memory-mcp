@@ -31,10 +31,21 @@ def format_notice(label, load, cores, ratio, waited):
         TAG, label, load, cores, ratio, waited)
 
 
+def _plain(label, load, cores, ratio, waited):
+    """Intermediate poll line: plain log text, not an annotation (GitHub caps annotations per step)."""
+    return "%s '%s': waiting, load=%.2f cores=%d ratio=%s waited=%ds" % (
+        TAG, label, load, cores, ratio, waited)
+
+
 def run(label, max_ratio, max_wait_secs, poll_secs, cores, load_fn, sleep_fn):
     """Poll until the load is acceptable or the wait budget is spent. Always returns 0."""
     waited = 0
-    load = load_fn()
+    try:
+        load = load_fn()
+    except (OSError, AttributeError) as exc:
+        print('::warning::%s %r: cannot read the load average (%s); proceeding without the gate'
+              % (TAG, label, exc), flush=True)
+        return 0
     print(format_notice(label, load, cores, max_ratio, waited), flush=True)
     while should_wait(load, cores, max_ratio):
         if waited >= max_wait_secs:
@@ -45,9 +56,14 @@ def run(label, max_ratio, max_wait_secs, poll_secs, cores, load_fn, sleep_fn):
         step = min(poll_secs, max_wait_secs - waited)
         sleep_fn(step)
         waited += step
-        load = load_fn()
+        try:
+            load = load_fn()
+        except (OSError, AttributeError) as exc:
+            print('::warning::%s %r: load average became unreadable (%s); proceeding'
+                  % (TAG, label, exc), flush=True)
+            return 0
         if should_wait(load, cores, max_ratio):
-            print(format_notice(label, load, cores, max_ratio, waited), flush=True)
+            print(_plain(label, load, cores, max_ratio, waited), flush=True)
     print(format_notice(label, load, cores, max_ratio, waited), flush=True)
     return 0
 
