@@ -5164,5 +5164,64 @@ class CarrierOutputGrouped6188(unittest.TestCase):
         extra = '            echo "x=y" >> "$GITHUB_OUTPUT"\n' + old
         self.assertTrue(_carrier_output_problems(self.ci.replace(old, extra, 1)))
 
+
+# ---- Round 6 (#6579, #6639): the revocation sentence says when it takes effect ----
+
+
+def _comment_text(text: str) -> str:
+    """``text`` with YAML comment markers removed and whitespace folded (``#NNNN`` survives)."""
+    return " ".join(re.sub(r"(?m)^\s*#+", " ", text).split())
+
+
+class ApprovalRevocationTiming6579(unittest.TestCase):
+    """A later review revokes an approval only at the NEXT run of the check (#6579, #6639).
+
+    c8-precheck.yml has no ``pull_request_review`` trigger and ``release/v1.0.0`` has no merge
+    queue, so a check that already passed stays green until the job runs again (#6511; the
+    trigger was kept off this branch by the 3-agent vote (6def5ab6), Q3).  Every surface that
+    states the #6329 rule must also state that timing and name #6511, and none may say an
+    approval is simply revoked.
+    """
+
+    DOCS = ApprovalDocResiduals6327.DOCS
+
+    def surfaces(self) -> Dict[str, str]:
+        doc_paragraph = ApprovalDocResiduals6327("test_6327_the_guarantee_is_scoped").paragraph
+        script = APPROVAL_PY.read_text(encoding="utf-8")
+        docstring = script.split('"""', 2)[1]
+        return {
+            "c8-precheck.yml approval job": _comment_text(_job_text(C8_WORKFLOW.read_text(encoding="utf-8"),
+                                                                    APPROVAL_JOB)),
+            "docs/AI_DEVELOPER_GOVERNANCE.md": doc_paragraph(self.DOCS[0]),
+            "docs/contributing-external.md": doc_paragraph(self.DOCS[1]),
+            "changelog.d/6117.security.md": " ".join((ROOT / "changelog.d" / "6117.security.md")
+                                                     .read_text(encoding="utf-8").split()),
+            "check_external_pr_approval.py docstring": " ".join(docstring.split()),
+        }
+
+    def test_6579_every_surface_states_the_next_run_timing(self) -> None:
+        for where, text in self.surfaces().items():
+            with self.subTest(surface=where):
+                self.assertIn("#6329", text)
+                self.assertIn("#6511", text)
+                self.assertIn("next run", text)
+                self.assertIn("pull_request_review", text)
+
+    def test_6579_no_surface_claims_an_immediate_revocation(self) -> None:
+        for where, text in self.surfaces().items():
+            with self.subTest(surface=where):
+                self.assertNotRegex(text, r"(?i)\brevokes\b")
+
+    def test_6579_docs_name_the_window_its_cause_and_the_vote(self) -> None:
+        for rel in self.DOCS:
+            para = self.surfaces()[rel]
+            with self.subTest(doc=rel):
+                self.assertIn("four open residuals", para)
+                self.assertIn("no merge queue", para)
+                self.assertIn("stays green", para)
+                self.assertIn("3-agent vote (6def5ab6)", para)
+                self.assertIn("Q3", para)
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
