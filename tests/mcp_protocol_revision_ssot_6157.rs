@@ -862,6 +862,50 @@ fn issue_6535_a_revision_split_from_its_marker_is_still_a_use() {
     }
 }
 
+/// #6535 residue (security review round 4): a comment line between a key
+/// and its value was taken as the value line, so the real value two lines
+/// down was never checked. Dates on the comment lines themselves are kept
+/// as uses (a bulleted value looks like a comment), and the scan stops at
+/// the first line that is not a comment or at the next marker.
+#[test]
+fn issue_6535_a_comment_between_key_and_value_does_not_hide_the_value() {
+    let cases: [SplitCase; 6] = [
+        (
+            "YAML comment line",
+            "protocolVersion:\n  # pinned by the client\n  \"2099-01-08\"\n",
+            vec![(3, "2099-01-08")],
+        ),
+        (
+            "TS line comment",
+            "protocolVersion:\n  // note\n  '2099-01-09'\n",
+            vec![(3, "2099-01-09")],
+        ),
+        (
+            "block comment",
+            "protocolVersion =\n/* note */\n\"2099-01-10\"\n",
+            vec![(3, "2099-01-10")],
+        ),
+        (
+            "a comment that carries a date of its own",
+            "protocolVersion:\n# was 2099-01-11\n2099-01-12\n",
+            vec![(2, "2099-01-11"), (3, "2099-01-12")],
+        ),
+        (
+            "two comment lines",
+            "protocolVersion:\n# a\n// b\n\"2099-01-13\"\n",
+            vec![(4, "2099-01-13")],
+        ),
+        (
+            "a marker after the comment is a use of its own",
+            "protocolVersion:\n# a\nprotocolVersion: 2099-01-14\n2099-01-15\n",
+            vec![(3, "2099-01-14")],
+        ),
+    ];
+    for (what, text, want) in cases {
+        assert_eq!(protocol_version_uses(text), want, "{what}");
+    }
+}
+
 /// Every tracked `.gitignore` outside the skipped root `vendor/`. The #6524
 /// test pins that the real walk finds exactly these, so a new ignore file
 /// cannot join the tree without joining the plant test below.
