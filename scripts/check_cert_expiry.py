@@ -891,6 +891,26 @@ def shimmed_cell(t, label, tmp, repo, env, **kw):
         return None
 
 
+def _shim_nonce_freshness(t, tmp, repo, env):
+    """(shim-probe-exact, #6567): two shimmed runs must hand the probe two
+    distinct 32-hex-digit markers (a module constant would repeat)."""
+    seen_markers = []
+    real_probe = _require_shim_reachable
+
+    def spy_probe(path, marker, timeout=GIT_SHIM_PROBE_TIMEOUT):
+        seen_markers.append(marker)
+        return real_probe(path, marker, timeout)
+
+    with unittest.mock.patch.object(sys.modules[__name__], "_require_shim_reachable",
+                                    side_effect=spy_probe):
+        for _ in range(2):
+            run_gate_shimmed(tmp, repo, env, version="git version 2.29.9")
+    if (len(seen_markers) != 2 or seen_markers[0] == seen_markers[1]
+            or not all(re.fullmatch("[0-9a-f]{32}", m) for m in seen_markers)):
+        t.fail(f"(shim-probe-exact): the probe marker is not a fresh 32-hex nonce per "
+               f"run: {seen_markers!r}")
+
+
 def _gate_env(**kw):
     return {k: v for k, v in kw.items() if v is not None}
 
@@ -1491,21 +1511,22 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                 shutil.rmtree(stub_dir, ignore_errors=True)
         # The nonce is drawn per run_gate_shimmed call: two calls must hand the probe
         # two distinct 32-hex-digit markers (a module constant would repeat).
-        seen_markers = []
-        real_probe = _require_shim_reachable
-
-        def spy_probe(path, marker, timeout=GIT_SHIM_PROBE_TIMEOUT):
-            seen_markers.append(marker)
-            return real_probe(path, marker, timeout)
-
-        with unittest.mock.patch.object(sys.modules[__name__], "_require_shim_reachable",
-                                        side_effect=spy_probe):
-            for _ in range(2):
-                run_gate_shimmed(tmp, repo, env7, version="git version 2.29.9")
-        if (len(seen_markers) != 2 or seen_markers[0] == seen_markers[1]
-                or not all(re.fullmatch("[0-9a-f]{32}", m) for m in seen_markers)):
-            t.fail(f"(shim-probe-exact): the probe marker is not a fresh 32-hex nonce per "
-                   f"run: {seen_markers!r}")
+        _shim_nonce_freshness(t, tmp, repo, env7)
+        # #6650: the freshness loop must keep the #6380 contract. A shim that cannot
+        # be executed (modelled: chmod is a no-op, so the shim keeps its 0o644 mode)
+        # is a named (shim-probe-exact) failure, never an escaped exception.
+        rec = FailureRecorder()
+        try:
+            with unittest.mock.patch.object(Path, "chmod", lambda self, *a, **k: None):
+                _shim_nonce_freshness(rec, tmp, repo, env7)
+        except Exception as exc:  # noqa: BLE001 - an escaped error is the failure
+            t.fail(f"(shim-probe-exact-noexec): an unreachable shim escaped the nonce "
+                   f"check as {exc!r}")
+        else:
+            if not rec.messages or not all(m.startswith("(shim-probe-exact)")
+                                           for m in rec.messages):
+                t.fail(f"(shim-probe-exact-noexec): an unreachable shim was not a named "
+                       f"(shim-probe-exact) failure: {rec.messages!r}")
     # #6381: the shim PATH entry is process-global; every shim cell above, on its
     # success path (shim-control), its gate-verdict paths (gitver, anc-error) and
     # its refusal paths (shim-pathsep, shim-unreach), must leave PATH as found.
