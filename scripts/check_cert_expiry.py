@@ -867,17 +867,18 @@ def ledger_blocks(lines):
 def ledger_append_only(repo, mb, judged):
     """The reason the change breaks the append-only ledger ('' when it keeps
     it), for a change that touches the cert doc while the certification is
-    EXPIRED/VOID and is not a re-issue (#6423): every record of the merge-base
-    doc stays, byte-identical, in the same order, whatever else the change is.
-    A deleted doc loses every record."""
+    EXPIRED/VOID at the merge-base (#6423): every record of the merge-base doc
+    stays, byte-identical, in the same order, whatever else the change is.
+    Only a LIVE head (a re-issue, held to rule C and #3899) is exempt; a new
+    Binds-to value or EXPIRED -> VOID is not a re-issue (#6726). A deleted doc
+    loses every record."""
     banner_mb = cert_banner(repo, mb)
     banner_head = cert_banner(repo, judged)
     if banner_mb[0] not in ("EXPIRED", "VOID"):
         return ""
+    if banner_head[0] == "LIVE":
+        return ""  # a re-issue keeps its own path (rule C, #3899)
     deleted = banner_head == ("ABSENT", "-")
-    malformed = banner_head[0] in ("DUPLICATE", "UNPARSEABLE") or banner_head[1] == "DUPLICATE"
-    if banner_mb != banner_head and not deleted and not malformed:
-        return ""  # a real re-issue or voiding keeps its own path
     old = ledger_blocks(read_cert_doc(repo, mb).split("\n"))
     new = [] if deleted else ledger_blocks(read_cert_doc(repo, judged).split("\n"))
     at = 0
@@ -1275,6 +1276,11 @@ def _judge(repo, base, head, judged, mb, tip):
         malformed = banner_head[0] in ("DUPLICATE", "UNPARSEABLE") or banner_head[1] == "DUPLICATE"
 
     if cert_touched and not incidental and not deleted and not malformed:
+        # #6726: the hatch does not lift the append-only ledger unless the
+        # judged banner is LIVE.
+        problem = ledger_append_only(repo, mb, judged)
+        if problem:
+            return False, f"{PREFIX}: FAIL — {problem}"
         ok, more = check_banner_consistency(repo, judged)
         head_line = (
             f"{PREFIX}: PASS — federation-wire surface changed AND cert doc "
