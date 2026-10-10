@@ -193,9 +193,10 @@ NAME_ONLY = re.compile(r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")(?:[*_]{1,2}|[\
 # mask_named_values leaves visible.
 BLOCK_INDICATOR = re.compile(r"[|>][+-]?[1-9]?[+-]?")
 BLOCK_COMMENT = r"(?:\s+#.*)?"  # a YAML comment may follow the indicator (round 5, #6663, #6614)
-BLOCK_VALUE = re.compile(BLOCK_INDICATOR.pattern + BLOCK_COMMENT)
+BLOCK_PROPERTIES = r"(?:[!&]\S*[ \t]+)*"  # YAML node properties (a tag, an anchor) may precede it (#6664)
+BLOCK_VALUE = re.compile(BLOCK_PROPERTIES + BLOCK_INDICATOR.pattern + BLOCK_COMMENT)
 BLOCK_NAME = re.compile(r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")(?:[*_]{1,2}|[\"'`])?\s*:\s*"
-                        + BLOCK_INDICATOR.pattern + BLOCK_COMMENT + r"\s*$")
+                        + BLOCK_PROPERTIES + BLOCK_INDICATOR.pattern + BLOCK_COMMENT + r"\s*$")
 # A next line that is a table row is structure, not the value; #6163 round 4 (code F6): a nested `key:` with no value
 # of its own is structure and passes the wait on to the line after it; a nested `key: value` is judged by its value
 # (prose_cell), so `api_key:` then `  value: <secret>` masks the secret. Round 5 (#6663): a comment line (`#`) is
