@@ -150,7 +150,10 @@ fn failing_writer_mid_save_leaves_the_original_keypair_intact_3146() {
         return;
     }
 
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .expect("tempdir");
     let dir = tmp.path();
 
     // The sole, irreplaceable identity on disk.

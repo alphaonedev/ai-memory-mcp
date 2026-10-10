@@ -85,7 +85,10 @@ fn ephemeral_keypair() -> (
     ai_memory::identity::keypair::AgentKeypair,
     tempfile::TempDir,
 ) {
-    let dir = tempfile::TempDir::new().expect("keys tempdir");
+    let dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .expect("keys tempdir");
 
     // SAFETY: caller acquired `env_var_lock` before invoking. The
     // serial-test discipline for cross-file mutation is still enforced

@@ -204,7 +204,10 @@ const PEER_HEADER: &str = "x-peer-id";
 /// guard + the signing key so the test can sign bodies that
 /// `resolve_peer_verifying_key` will then verify against the enrolled key.
 fn enroll_peer(peer_id: &str) -> (tempfile::TempDir, SigningKey) {
-    let dir = tempfile::tempdir().expect("keydir");
+    let dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .expect("keydir");
     let kp = ai_memory::identity::keypair::generate(peer_id).expect("gen keypair");
     ai_memory::identity::keypair::save(&kp, dir.path()).expect("save keypair");
     // SAFETY: caller holds FED_ENV_LOCK for the duration.
@@ -416,7 +419,10 @@ async fn sync_push_applies_signals_sqlite() {
 async fn sync_push_applies_action_transition_sqlite() {
     let _g = FED_ENV_LOCK.lock().await;
     let _scope = NamespaceScopeGuard::new("ai:cov-ga2-txactor", "covga2tx");
-    let keydir = tempfile::tempdir().expect("keydir");
+    let keydir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .expect("keydir");
     let actor = "ai:cov-ga2-txactor";
     let kp = ai_memory::identity::keypair::generate(actor).expect("kp");
     ai_memory::identity::keypair::save(&kp, keydir.path()).expect("save");
@@ -544,7 +550,10 @@ async fn sync_push_applies_action_transition_sqlite() {
 async fn sync_push_replayed_action_transition_refused_1805() {
     let _g = FED_ENV_LOCK.lock().await;
     let _scope = NamespaceScopeGuard::new("ai:cov-ga2-replayactor", "covga2replay");
-    let keydir = tempfile::tempdir().expect("keydir");
+    let keydir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .expect("keydir");
     let actor = "ai:cov-ga2-replayactor";
     let kp = ai_memory::identity::keypair::generate(actor).expect("kp");
     ai_memory::identity::keypair::save(&kp, keydir.path()).expect("save");

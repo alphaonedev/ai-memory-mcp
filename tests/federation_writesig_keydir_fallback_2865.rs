@@ -68,7 +68,10 @@ fn consolidation_mem() -> Memory {
 fn resolve_seam_db_miss_falls_back_to_keydir_2865() {
     // The peer's FEDERATION identity key is cross-enrolled into the key-dir
     // (mesh cross-enrollment) but NOT DB-bound → registry miss.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .expect("tempdir");
     let kp = keypair::generate(AUTHOR).expect("generate");
     keypair::save(&kp, dir.path()).expect("save keypair");
 
@@ -97,7 +100,10 @@ fn resolve_seam_db_registry_wins_over_keydir_2865() {
     // MISS-ONLY precedence: a key bound into the DB registry (e.g. the cert-round
     // author via the admin PUT route / `agents bind-key`) ALWAYS wins, so a
     // stale/rotated key-dir entry can never shadow the authoritative registry key.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .expect("tempdir");
     let keydir_kp = keypair::generate(AUTHOR).expect("generate keydir");
     keypair::save(&keydir_kp, dir.path()).expect("save keydir keypair");
 
@@ -136,7 +142,10 @@ fn end_to_end_keydir_enrolled_author_reaches_agent_attested_2865() {
     // the peer cross-enrolled that key into the key-dir (no DB bind). The push
     // lane resolves the key from the key-dir and the propagated write_signature
     // verifies → agent_attested, OUT-OF-BOX.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .expect("tempdir");
     let kp = keypair::generate(AUTHOR).expect("generate");
     keypair::save(&kp, dir.path()).expect("save keypair");
 
@@ -190,7 +199,10 @@ fn end_to_end_forged_signature_rejected_regardless_of_key_source_2865() {
     // The key-dir fallback NEVER weakens verification: a forged signature against
     // the key-dir-resolved key is rejected UNCONDITIONALLY (never downgraded to
     // claimed) — the fix widens the KEY SOURCE, never the accept criterion.
-    let dir = tempfile::TempDir::new().expect("tempdir");
+    let dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .expect("tempdir");
     let kp = keypair::generate(AUTHOR).expect("generate");
     keypair::save(&kp, dir.path()).expect("save keypair");
 

@@ -390,7 +390,10 @@ async fn strict_mode_requires_enrolled_author_key_1843() {
     relax_orthogonal_gates();
 
     // Enroll "alice"'s public key in an isolated key dir; "bob" stays unenrolled.
-    let key_dir = tempfile::tempdir().expect("key dir");
+    let key_dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .expect("key dir");
     let alice = ai_memory::identity::keypair::generate("alice").expect("gen alice");
     ai_memory::identity::keypair::save(&alice, key_dir.path()).expect("save alice");
     unsafe {

@@ -832,6 +832,7 @@ fn require_identity_lineage_fail_closes_when_missing() {
 fn rotate_with_succession_end_to_end() {
     let (_dir, conn) = fresh_db();
     let key_dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
         .prefix("lineage-keys-")
         .tempdir()
         .expect("key dir");

@@ -353,7 +353,10 @@ fn push_req(body: &[u8], headers: &[(&str, &str)]) -> Request<Body> {
 /// signing key so the test can sign bodies that `resolve_peer_verifying_key`
 /// then verifies against the enrolled key. Caller MUST hold `FED_ENV_LOCK`.
 fn enroll_peer(peer_id: &str) -> (tempfile::TempDir, SigningKey) {
-    let dir = tempfile::tempdir().expect("keydir");
+    let dir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .expect("keydir");
     let kp = ai_memory::identity::keypair::generate(peer_id).expect("gen keypair");
     ai_memory::identity::keypair::save(&kp, dir.path()).expect("save keypair");
     // SAFETY: caller holds FED_ENV_LOCK for the duration.
@@ -566,7 +569,10 @@ async fn pg_sync_push_via_store_applies_action_transition() {
         return;
     };
     clear_fed_env();
-    let keydir = tempfile::tempdir().expect("keydir");
+    let keydir = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .expect("keydir");
     let actor = uniq("ai:cov-ga2-pg-txactor");
     let kp = ai_memory::identity::keypair::generate(&actor).expect("kp");
     ai_memory::identity::keypair::save(&kp, keydir.path()).expect("save");

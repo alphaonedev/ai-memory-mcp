@@ -56,7 +56,10 @@ fn priv_path(dir: &std::path::Path) -> std::path::PathBuf {
 /// Which half is on disk afterwards therefore reports the ORDER directly.
 #[test]
 fn save_writes_the_private_half_first_3146() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = tempfile::Builder::new()
+        .permissions(<std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700))
+        .tempdir()
+        .expect("tempdir");
     let dir = tmp.path();
 
     let original = keypair::generate(AGENT).expect("generate original");
