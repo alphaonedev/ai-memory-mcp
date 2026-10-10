@@ -204,10 +204,13 @@ mod tests_6157 {
     /// value are escaped, so the diagnostic is one inert line.
     #[test]
     fn issue_6157_downgrade_diagnostic_escapes_control_and_bidi_chars() {
-        let asked = "a\u{1b}[31mb\nc\rd\u{202e}e\0f";
+        let asked = "a\u{1b}[31mb\nc\rd\u{202e}e\0f\u{2028}g\u{2029}h\u{85}i\u{2066}j\u{2067}k\u{2068}l\u{2069}m";
         let line = protocol_downgrade_diagnostic(&params_asking(asked), NEWEST_PROTOCOL_REVISION);
 
-        for raw in ['\u{1b}', '\n', '\r', '\u{202e}', '\0'] {
+        for raw in [
+            '\u{1b}', '\n', '\r', '\u{202e}', '\0', '\u{2028}', '\u{2029}', '\u{85}', '\u{2066}',
+            '\u{2067}', '\u{2068}', '\u{2069}',
+        ] {
             assert!(
                 !line.contains(raw),
                 "raw {raw:?} reached the diagnostic: {line:?}"
@@ -218,7 +221,20 @@ mod tests_6157 {
             1,
             "diagnostic must be one line: {line:?}"
         );
-        for escaped in [r"\u{1b}", r"\n", r"\r", r"\u{202e}", r"\0"] {
+        for escaped in [
+            r"\u{1b}",
+            r"\n",
+            r"\r",
+            r"\u{202e}",
+            r"\0",
+            r"\u{2028}",
+            r"\u{2029}",
+            r"\u{85}",
+            r"\u{2066}",
+            r"\u{2067}",
+            r"\u{2068}",
+            r"\u{2069}",
+        ] {
             assert!(line.contains(escaped), "missing escape {escaped}: {line}");
         }
     }
