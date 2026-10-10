@@ -5384,5 +5384,21 @@ class EncodedTokenRedaction6578(unittest.TestCase):
                 self.assertIn(text.replace("%", "%25"), line)
 
 
+class EncodedTokenWholeRedaction6578(unittest.TestCase):
+    """A credential visible only after percent-decoding, or text nested past the decode bound,
+    replaces the whole message (#6578): no partial decoding decides what is shown."""
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+
+    def test_6578_decoded_only_credentials_redact_the_whole_message(self) -> None:
+        body = _token_body(30, 2)
+        for text in (f"x %67%68%73%5F{body}", f"h Bearer%20{body}", "a%" + "25" * 8 + "41 " + body):
+            with self.subTest(text=text[:24]):
+                line = self.mod.workflow_error(text)
+                self.assertEqual("::error::" + self.mod.REDACTED_WHOLE, line)
+                self.assertEqual([], _leaked_windows(body, line))
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
