@@ -6009,5 +6009,50 @@ class ClosedWorldMergeGroupGuard6850(unittest.TestCase):
         self.assertTrue(_pinned_merge_group_problems_6850(pinned, self.texts, self.covered))
 
 
+# ---- Round 7 (#6799): `python3 -m <module>` runs, `-u` and quoted paths are scanned for -I ----
+
+CI_TESTS_DISCOVER_6799 = "run: python3 -I -m unittest discover -s scripts/ci/tests\n"
+
+
+class ModuleRunsIsolated6799(unittest.TestCase):
+    """#6799: the #6241 scanner returned None for every `-m` run, so dropping -I from
+    `python3 -I -m unittest discover -s scripts/ci/tests` (ci.yml, conflict commit 3d19bb5c7)
+    passed every gate.  Planted rows pin each form the scanner must report or accept."""
+
+    def planted(self, row: str) -> List[str]:
+        texts = {"new.yml": "jobs:\n  x:\n    steps:\n      - run: " + row + "\n"}
+        return _bare_python_script_runs(texts)
+
+    def test_6799_module_runs_without_isolation_are_reported(self) -> None:
+        for row in ("python3 -m unittest discover -s scripts/ci/tests", "python3 -um unittest",
+                    "python3 -munittest discover", "python3 -u -m scripts.ci.tool",
+                    "python3 -W error -m unittest", "python3 -X dev -m unittest"):
+            with self.subTest(row=row):
+                self.assertEqual(1, len(self.planted(row)), row)
+
+    def test_6799_isolated_module_runs_pass(self) -> None:
+        for row in ("python3 -I -m unittest discover -s scripts/ci/tests", "python3 -Im unittest",
+                    "python3 -u -I -m unittest", "python3 -IW error -m unittest"):
+            with self.subTest(row=row):
+                self.assertEqual([], self.planted(row), row)
+
+    def test_6799_unbuffered_and_quoted_script_runs_are_reported(self) -> None:
+        for row in ("python3 -u scripts/ci/x.py", "python3 'scripts/ci/x y.py'",
+                    'python3 -u "scripts/ci/x.py" --flag', "python3 -uB scripts/ci/x.py"):
+            with self.subTest(row=row):
+                self.assertEqual(1, len(self.planted(row)), row)
+
+    def test_6799_n11_dropping_I_from_the_ci_tests_discover_step_is_killed(self) -> None:
+        texts = _all_workflow_texts()
+        self.assertEqual(1, texts["ci.yml"].count(CI_TESTS_DISCOVER_6799))
+        self.assertEqual([], _bare_python_script_runs(texts))
+        texts["ci.yml"] = texts["ci.yml"].replace(CI_TESTS_DISCOVER_6799,
+                                                  CI_TESTS_DISCOVER_6799.replace(" -I ", " "), 1)
+        found = _bare_python_script_runs(texts)
+        self.assertEqual(1, len(found), found)
+        self.assertTrue(found[0].startswith("ci.yml:"), found)
+        self.assertIn("-m unittest", found[0])
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
