@@ -54,7 +54,14 @@ _CREDENTIAL_WORD = re.compile(
     r"token|secret|pass|pwd|credential|api[_-]?key|private[_-]?key|access[_-]?key|auth|bearer|session|cookie|signing",
     re.IGNORECASE)
 _PAIR_VALUE = re.compile(r"[^\n]+")
-_EXPRESSION_VALUE = re.compile(r"""['"]?\$\{\{[^'"{}\n]*\}\}['"]*[ \t]*(?=\n|\Z)""")
+# #6782: the kept expression holds only context references (``github.token``, ``needs.a.outputs.b``) joined by
+# ``||`` ``&&`` ``==`` ``!=``, with ``!`` and parentheses; a number, ``true``, ``false``, ``null``, ``NaN`` or
+# ``Infinity`` operand can be a literal credential, so it is withheld.  Each repeated part starts with a
+# distinct character, so the match is linear in the row.
+_CONTEXT_REF = r"(?!(?i:true|false|null|nan|infinity)\b)[A-Za-z_][\w.-]*"
+_OPERAND = r"(?:[!(][ \t]*)*" + _CONTEXT_REF + r"(?:[ \t]*\))*"
+_EXPRESSION_VALUE = re.compile(
+    r"['\"]?\$\{\{[ \t]*" + _OPERAND + r"(?:[ \t]*(?:\|\||&&|==|!=)[ \t]*" + _OPERAND + r")*[ \t]*\}\}['\"]*[ \t]*(?=\n|\Z)")
 # #6792: ``mask`` keeps a value only when it is exactly one marker that ``mask`` itself wrote, which always runs
 # to the end of its row, so a committed value that merely starts with that text is withheld like any other.
 _WITHHELD_MARK = re.compile(r"<withheld \d+ chars>[ \t]*(?=\n|\Z)")
