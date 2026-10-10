@@ -26,7 +26,7 @@ import {
 } from "node:fs";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { randomBytes } from "node:crypto";
 
 import { AgentSigningKey } from "../src/attestation.js";
@@ -57,6 +57,18 @@ import {
 
 const HUB_ID = "hub-3470-ts";
 const AGENT_ID = "ai:listener-3470";
+const WINDOWS_PLATFORM = "win32";
+const WINDOWS_PIPE_PREFIX = "\\\\.\\pipe\\";
+const OWNER_ONLY_MODE = 0o600;
+const isWindows = process.platform === WINDOWS_PLATFORM;
+const posixOnly = isWindows ? it.skip : it;
+const windowsOnly = isWindows ? it : it.skip;
+
+function mockSocketPath(directory: string, name: string): string {
+  return isWindows
+    ? `${WINDOWS_PIPE_PREFIX}${basename(directory)}-${name}`
+    : join(directory, name);
+}
 
 function short(raw: Buffer): Buffer {
   return Buffer.concat([Buffer.from([raw.length]), raw]);
@@ -306,7 +318,9 @@ describe("delegation bundle", () => {
     ).toThrow(/identity delegate/);
   });
 
-  it("refuses a group-readable or symlinked bundle on disk", () => {
+  // The key-directory contract requires POSIX owner/mode semantics (wake.ts).
+  // Windows exercises its actual inability to establish that guarantee below.
+  posixOnly("refuses a group-readable or symlinked bundle on disk", () => {
     const dir = mkdtempSync(join(tmpdir(), "wake-3470-"));
     try {
       const { file } = makeBundle();
@@ -323,6 +337,23 @@ describe("delegation bundle", () => {
       symlinkSync(path, link);
       expect(() => DelegationBundle.load(link, { hubId: HUB_ID })).toThrow(/symlink/);
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  windowsOnly("refuses to read credential bytes when Windows cannot establish owner-only mode (#7121)", () => {
+    const dir = mkdtempSync(join(tmpdir(), "wake-7121-"));
+    const fs = require("node:fs") as typeof import("node:fs");
+    let read: jest.SpiedFunction<typeof fs.readFileSync> | undefined;
+    try {
+      const path = join(dir, "bundle.json");
+      writeFileSync(path, JSON.stringify(makeBundle().file), { mode: OWNER_ONLY_MODE });
+      chmodSync(path, OWNER_ONLY_MODE);
+      read = jest.spyOn(fs, "readFileSync");
+      expect(() => DelegationBundle.load(path, { hubId: HUB_ID })).toThrow(/must be 0600/);
+      expect(read).not.toHaveBeenCalled();
+    } finally {
+      read?.mockRestore();
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -393,8 +424,6 @@ describe("delegation bundle", () => {
     }
     return fired;
   }
-
-  const posixOnly = process.platform === "win32" ? it.skip : it;
 
   posixOnly.each(["before", "after"] as const)(
     "never reads a symlink swapped in at the last instant (swap %s the open)",
@@ -494,7 +523,7 @@ describe("delegation bundle", () => {
     }
   }, 15_000);
 
-  it("keeps every refusal and the allowed path on the descriptor-bound read", () => {
+  posixOnly("keeps every refusal and the allowed path on the descriptor-bound read", () => {
     const dir = mkdtempSync(join(tmpdir(), "wake-3780-"));
     try {
       const { file } = makeBundle();
@@ -527,7 +556,7 @@ describe("delegation bundle", () => {
 
   it("resolves the path `identity delegate` writes", () => {
     expect(DelegationBundle.defaultPath("/keys", AGENT_ID)).toBe(
-      `/keys/${AGENT_ID}.a2a-hub.json`,
+      join("/keys", `${AGENT_ID}.a2a-hub.json`),
     );
   });
 });
@@ -775,7 +804,7 @@ describe("bounds", () => {
 });
 
 // ---------------------------------------------------------------------------
-// A mock hub over a real Unix domain socket
+// A mock hub over a real Unix domain socket or Windows named pipe
 // ---------------------------------------------------------------------------
 
 describe("WakeListener over a socket", () => {
@@ -793,7 +822,7 @@ describe("WakeListener over a socket", () => {
   });
 
   it("handshakes with a mock hub and turns a wake into one signal", async () => {
-    const sockPath = join(dir, "h.sock");
+    const sockPath = mockSocketPath(dir, "h.sock");
     const bundle = loadedBundle();
     server = createServer((sock: Socket) => {
       sock.write(lengthPrefixed(challengeFrame()));
@@ -827,7 +856,7 @@ describe("WakeListener over a socket", () => {
     // No hub at all is the documented degraded mode, not an error.
     const signals: WakeSignal[] = [];
     const listener = new WakeListener(
-      join(dir, "absent.sock"),
+      mockSocketPath(dir, "absent.sock"),
       loadedBundle(),
       (s) => signals.push(s),
       { pollIntervalMs: 50, reconnectBaseMs: 5, reconnectJitterMs: 0 },
