@@ -34,6 +34,7 @@
 //! file that is not UTF-8, FAILS the pin instead of being skipped: a pin that
 //! cannot see a file must not report it clean.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -64,6 +65,21 @@ const SELF: &str = "tests/mcp_protocol_revision_ssot_6157.rs";
 /// it from four sub-trees to the repository root).
 const MIN_FILES_WALKED: usize = 2000;
 const MIN_PROTOCOL_VERSION_USES: usize = 40;
+
+/// What git knows that the ignore files alone cannot say (#7008, #7017).
+/// A scratch tree or a source export carries no `.git`, so it gets the
+/// default: nothing tracked, `core.ignorecase` off.
+#[derive(Default)]
+struct Env {
+    /// Every tracked file, relative to the walk root. git applies no ignore
+    /// rule to a tracked path.
+    tracked: BTreeSet<String>,
+    /// Every directory that holds a tracked file, so an ignored directory
+    /// that carries one is still entered.
+    tracked_dirs: BTreeSet<String>,
+    /// `core.ignorecase`: ignore patterns then match with ASCII case folded.
+    ignore_case: bool,
+}
 
 /// One parsed `.gitignore` line (#6521). Only the syntax the repository's
 /// tracked `.gitignore` files use is supported; anything else (a backslash
@@ -199,7 +215,12 @@ fn glob(pat: &[u8], text: &[u8]) -> Option<bool> {
 /// Last matching rule wins (gitignore(5)); rules from deeper `.gitignore`
 /// files come later in `rules`, so they override shallower ones. `Err` on a
 /// pattern [`glob`] cannot evaluate.
-fn is_ignored(rel: &str, is_dir: bool, rules: &[IgnoreRule]) -> Result<bool, String> {
+fn is_ignored(
+    rel: &str,
+    is_dir: bool,
+    rules: &[IgnoreRule],
+    _ignore_case: bool,
+) -> Result<bool, String> {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     let mut ignored = false;
     for rule in rules {
@@ -300,16 +321,28 @@ fn info_exclude(root: &Path, unreadable: &mut Vec<String>) -> Option<PathBuf> {
 /// cannot be listed, or ignore rule that cannot be evaluated, is recorded in
 /// `unreadable` so the pin fails closed.
 fn walk(root: &Path, out: &mut Vec<PathBuf>, unreadable: &mut Vec<String>) {
+    let env = git_env(root, unreadable);
+    walk_with(root, &env, out, unreadable);
+}
+
+/// The environment git itself would use for `root`.
+fn git_env(_root: &Path, _unreadable: &mut Vec<String>) -> Env {
+    Env::default()
+}
+
+/// [`walk`] with the git facts supplied by the caller.
+fn walk_with(root: &Path, env: &Env, out: &mut Vec<PathBuf>, unreadable: &mut Vec<String>) {
     let mut rules = Vec::new();
     if let Some(exclude) = info_exclude(root, unreadable) {
         load_ignore_file(&exclude, "", &mut rules, unreadable);
     }
-    walk_dir(root, root, &mut rules, out, unreadable);
+    walk_dir(root, root, env, &mut rules, out, unreadable);
 }
 
 fn walk_dir(
     root: &Path,
     dir: &Path,
+    env: &Env,
     rules: &mut Vec<IgnoreRule>,
     out: &mut Vec<PathBuf>,
     unreadable: &mut Vec<String>,
@@ -355,8 +388,7 @@ fn walk_dir(
         if file_type.is_symlink() {
             continue;
         }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            unreadable.push(format!("{}: file name is not UTF-8", path.display()));
+        let Some(name) = utf8_name(&path, unreadable) else {
             continue;
         };
         // git never tracks a `.git` entry (object store, or a nested
@@ -367,7 +399,7 @@ fn walk_dir(
             continue;
         }
         let rel = format!("{base}{name}");
-        match is_ignored(&rel, file_type.is_dir(), rules) {
+        match is_ignored(&rel, file_type.is_dir(), rules, env.ignore_case) {
             Ok(true) => continue,
             Ok(false) => {}
             Err(e) => {
@@ -376,12 +408,22 @@ fn walk_dir(
             }
         }
         if file_type.is_dir() {
-            walk_dir(root, &path, rules, out, unreadable);
+            walk_dir(root, &path, env, rules, out, unreadable);
         } else if file_type.is_file() && !is_binary(name) {
             out.push(path);
         }
     }
     rules.truncate(depth);
+}
+
+/// The final component of `path` as UTF-8; a name that is not UTF-8 is
+/// recorded in `unreadable` (fail closed) and yields `None`.
+fn utf8_name<'a>(path: &'a Path, unreadable: &mut Vec<String>) -> Option<&'a str> {
+    let name = path.file_name().and_then(|n| n.to_str());
+    if name.is_none() {
+        unreadable.push(format!("{}: file name is not UTF-8", path.display()));
+    }
+    name
 }
 
 /// A file the walk skips without reading (#6522): a known binary name or
@@ -461,20 +503,17 @@ fn protocol_version_uses(text: &str) -> Vec<(usize, &str)> {
     uses
 }
 
-#[test]
-fn issue_6157_every_protocol_version_use_is_a_supported_revision() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files = Vec::new();
-    let mut unreadable = Vec::new();
-    walk(root, &mut files, &mut unreadable);
-    assert!(
-        files.len() >= MIN_FILES_WALKED,
-        "walk found only {} files",
-        files.len()
-    );
+/// Read every file in `files` and return the number of `protocolVersion`
+/// uses plus the ones outside [`SUPPORTED_PROTOCOL_REVISIONS`]. A file that
+/// cannot be read or is not UTF-8 is recorded in `unreadable` (fail closed).
+fn scan_files(
+    root: &Path,
+    files: &[PathBuf],
+    unreadable: &mut Vec<String>,
+) -> (usize, Vec<String>) {
     let mut offenders = Vec::new();
     let mut uses = 0usize;
-    for file in &files {
+    for file in files {
         let rel = file.strip_prefix(root).unwrap_or(file);
         if rel == Path::new(SELF) {
             continue;
@@ -497,6 +536,21 @@ fn issue_6157_every_protocol_version_use_is_a_supported_revision() {
             }
         }
     }
+    (uses, offenders)
+}
+
+#[test]
+fn issue_6157_every_protocol_version_use_is_a_supported_revision() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    let mut unreadable = Vec::new();
+    walk(root, &mut files, &mut unreadable);
+    assert!(
+        files.len() >= MIN_FILES_WALKED,
+        "walk found only {} files",
+        files.len()
+    );
+    let (uses, offenders) = scan_files(root, &files, &mut unreadable);
     assert!(
         unreadable.is_empty(),
         "the pin cannot see these paths, so it cannot vouch for them:\n{}",
@@ -1051,7 +1105,7 @@ fn issue_6524_glob_and_parse_follow_gitignore5() {
             .filter_map(|line| parse_ignore_line(line, "").expect("parse"))
             .collect();
         assert_eq!(
-            is_ignored(rel, is_dir, &rules),
+            is_ignored(rel, is_dir, &rules, false),
             Ok(want),
             "{lines:?} vs {rel:?} (dir: {is_dir})"
         );
@@ -1067,7 +1121,7 @@ fn issue_6524_glob_and_parse_follow_gitignore5() {
         .flatten()
         .collect();
     assert!(
-        is_ignored("abc", false, &malformed).is_err(),
+        is_ignored("abc", false, &malformed, false).is_err(),
         "malformed class matched"
     );
 }
