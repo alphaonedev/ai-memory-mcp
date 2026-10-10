@@ -484,14 +484,23 @@ peers = ["https://u:PEER_CANARY@peer.internal:8443/m"]
         .expect("fixture parses");
         redact_toml_value(&mut value);
         let rendered = toml::to_string_pretty(&value).expect("render");
-        for secret in [
+        // Name the fixture by index and print the rendered length only:
+        // a failing message must not carry the value it guards (#6585).
+        for (secret_idx, secret) in [
             "DB_CANARY",
             "Q_CANARY",
             "LLM_CANARY",
             "T_CANARY",
             "PEER_CANARY",
-        ] {
-            assert!(!rendered.contains(secret), "{secret} leaked: {rendered}");
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(
+                !rendered.contains(secret),
+                "fixture secret #{secret_idx} leaked ({} bytes rendered)",
+                rendered.len()
+            );
         }
         assert!(
             rendered.contains("postgres://db.internal:5432/ai"),
@@ -571,15 +580,21 @@ hmac_secret = "hmac-secret-must-not-leak"
         .expect("fixture parses");
         redact_toml_value(&mut value);
         let rendered = toml::to_string_pretty(&value).expect("render");
-        for secret in [
+        // Name the fixture by index and print the rendered length only:
+        // a failing message must not carry the value it guards (#6585).
+        for (secret_idx, secret) in [
             "legacy-top-level-secret",
             "reranker-secret-must-not-leak",
             "auto-tag-secret-must-not-leak",
             "hmac-secret-must-not-leak",
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             assert!(
                 !rendered.contains(secret),
-                "leaked {secret} in:\n{rendered}"
+                "leaked fixture secret #{secret_idx} ({} bytes rendered)",
+                rendered.len()
             );
         }
         // ALLOWED: the shape stays readable and the pointer stays visible.
