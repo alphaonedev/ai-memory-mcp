@@ -2594,6 +2594,18 @@ def _self_test_cases() -> int:
               shown=(shape_shown,), count=1)
     masks("#6851 R6 an at sign followed by no host character is not the end of the userinfo",
           "https://u:6163pw0M@h.co/p?x=@", hidden=("6163pw0M",), shown=("h.co/p?x=@",), count=1)
+    # #6929: a URL whose authority has an empty host after the userinfo (the libpq socket form) ends the userinfo at the
+    # `@` as well: the password before it is masked whatever path, query or fragment follows.
+    for empty_label, empty_text, empty_canary, empty_shown in (
+            ("a path", "postgresql://u:6163Canary29a@/dbname", "6163Canary29a", "@/dbname"),
+            ("a query", "postgresql://u:6163Canary29b@?host=/var/run", "6163Canary29b", "@?host=/var/run"),
+            ("a fragment", "https://u:6163Canary29c@#frag", "6163Canary29c", "@#frag"),
+            ("the libpq socket query", "postgresql://u:6163Canary29d@/db?host=/var/run/postgresql", "6163Canary29d",
+             "@/db?host=/var/run/postgresql")):
+        masks(f"#6929 R6 a URL password before an empty host and {empty_label} is masked", empty_text,
+              hidden=(empty_canary,), shown=(empty_shown,), count=1)
+    masks("#6929 R6 a later @ with a host still ends the userinfo before an empty-host shape",
+          "https://u:6163Canary29e@/x@h.co/db", hidden=("6163Canary29e",), shown=("h.co/db",), count=1)
 
     # #6163 round 5 (#6663, #6614): a YAML comment line between a bare credential name and its value passes the wait
     # on, and a comment after the bare name or after a block indicator does not hide the name from the mask. The
