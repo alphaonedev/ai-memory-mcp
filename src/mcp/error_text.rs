@@ -205,6 +205,74 @@ mod tests {
         let e = anyhow::anyhow!("SQLITE_BUSY: database is locked (memories.db)");
         assert_eq!(mcp_foreign_err("insert", e), DB_ERROR_TEXT);
     }
+
+    /// Capture the formatted `tracing` lines a closure writes (#4090: the
+    /// callsite-interest cache means the caller runs in an isolated child).
+    fn captured_operator_lines<T>(f: impl FnOnce() -> T) -> (T, Vec<String>) {
+        let (subscriber, sink) = crate::test_support::error_debug_capture();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let log = crate::test_support::captured_text(&sink);
+        let lines = log
+            .lines()
+            .filter(|l| l.contains(TRACE_TARGET))
+            .map(str::to_owned)
+            .collect();
+        (out, lines)
+    }
+
+    /// #6457 / #6147: an `anyhow` chain whose root is a driver error under a
+    /// context wrapper logs the WHOLE chain on its one operator line, while
+    /// the caller text stays the storage constant, byte for byte.
+    #[test]
+    fn issue_6457_anyhow_chain_logs_the_driver_root_and_caller_text_is_unchanged() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "mcp::error_text::tests::issue_6457_anyhow_chain_logs_the_driver_root_and_caller_text_is_unchanged",
+        ) {
+            return;
+        }
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory db");
+        let root = conn
+            .execute("DELETE FROM missing_table_6457", [])
+            .expect_err("missing table");
+        let err = anyhow::Error::new(root).context("outer operation context");
+        let (text, lines) = captured_operator_lines(|| mcp_foreign_err("probe_6457", err));
+        assert_eq!(lines.len(), 1, "exactly one operator line: {lines:?}");
+        assert!(lines[0].contains("probe_6457"), "{lines:?}");
+        assert!(lines[0].contains("outer operation context"), "{lines:?}");
+        assert!(
+            lines[0].contains("missing_table_6457"),
+            "inner driver cause lost: {lines:?}"
+        );
+        assert_eq!(text, DB_ERROR_TEXT);
+        assert!(!text.contains("missing_table_6457"), "{text}");
+    }
+
+    /// #6457: a typed refusal riding an `anyhow` chain keeps its caller text
+    /// and the operator line carries the chain context too (warn arm).
+    #[test]
+    fn issue_6457_typed_refusal_in_a_chain_logs_the_chain_and_keeps_caller_text() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "mcp::error_text::tests::issue_6457_typed_refusal_in_a_chain_logs_the_chain_and_keeps_caller_text",
+        ) {
+            return;
+        }
+        let err = anyhow::Error::new(crate::storage::StorageError::MemoryNotFound {
+            id: "zzz6457".into(),
+            role: None,
+        })
+        .context("refusal wrapper 6457");
+        let expected = mcp_error_text(&MemoryError::from(anyhow::Error::new(
+            crate::storage::StorageError::MemoryNotFound {
+                id: "zzz6457".into(),
+                role: None,
+            },
+        )));
+        let (text, lines) = captured_operator_lines(|| mcp_foreign_err("get_6457", err));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("refusal wrapper 6457"), "{lines:?}");
+        assert!(text.contains("zzz6457"), "{text}");
+        assert_eq!(text, expected);
+    }
 }
 
 /// pm-v3.1 hardcoded-literal ratchet — site names that are spelled in MORE

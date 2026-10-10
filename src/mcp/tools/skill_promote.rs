@@ -763,4 +763,50 @@ mod tests {
         let metadata: Value = serde_json::from_str(&metadata_json).unwrap();
         assert_eq!(metadata["parameters_schema"], schema);
     }
+
+    /// #6147 / #6457: the MCP promote path routes a failed promote through
+    /// the shared helper, so its operator line carries the whole chain (the
+    /// inner database error), is labelled with the operation, and the caller
+    /// text stays the storage constant.
+    #[test]
+    fn issue_6457_mcp_promote_operator_log_carries_the_inner_database_error() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "mcp::skill_promote::tests::issue_6457_mcp_promote_operator_log_carries_the_inner_database_error",
+        ) {
+            return;
+        }
+        let (conn, _dir) = open_db();
+        let obs_id = insert_observation(&conn, "source", "ns");
+        let refl_id = make_reflection(&conn, &[obs_id], "ns");
+        // The promote body reads the reflects_on edges under a context
+        // wrapper ("loading reflects_on edges"); a missing links table is a
+        // real driver error beneath that wrapper.
+        conn.execute_batch("PRAGMA foreign_keys = OFF; DROP TABLE memory_links;")
+            .expect("drop links");
+        let params = sjson!({
+            "reflection_id": refl_id,
+            "skill_name": "chain-6457",
+            "skill_description": "desc",
+            "agent_id": "ai:test",
+        });
+        let (subscriber, sink) = crate::test_support::error_debug_capture();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            super::handle_skill_promote_from_reflection(&conn, &params, None)
+        });
+        let log = crate::test_support::captured_text(&sink);
+        let text = result.expect_err("promote must fail");
+        assert_eq!(text, crate::mcp::error_text::DB_ERROR_TEXT, "{log}");
+        let lines: Vec<&str> = log
+            .lines()
+            .filter(|l| l.contains(crate::mcp::error_text::TRACE_TARGET))
+            .collect();
+        assert_eq!(lines.len(), 1, "one operator line: {log}");
+        assert!(lines[0].contains("loading reflects_on edges"), "{log}");
+        assert!(lines[0].contains("memory_links"), "inner cause lost: {log}");
+        assert!(
+            lines[0].contains("skill_promote_from_reflection"),
+            "context label: {log}"
+        );
+        assert!(!lines[0].contains("as_deref"), "wrong label: {log}");
+    }
 }
