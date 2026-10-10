@@ -2334,6 +2334,21 @@ def _self_test_cases() -> int:
           hidden=("123456789_123_456_789",), count=1)
     masks("#6211 R4 the line after a YAML block stays visible", "secret: |\n  6163CanaryBlockLine\nnext: shown-6163",
           hidden=("6163CanaryBlockLine",), shown=("secret: |", "next: shown-6163"), count=1)
+    # #6163 round 4 mutants N8, N12, R4e, R4ac, N36: a digit group longer than three digits is not a count; a prose word
+    # of thirteen or more letters is not prose; digits in two words of one value are one split number; a meta row is
+    # shown as is and not inspected, whatever it holds.
+    masks("#6209 R4 N8 a number with a digit group longer than three is masked", "token: 1.23456",
+          hidden=("1.23456",), count=1)
+    masks("#6210 R4 N12 a table cell word of thirteen or more letters is not prose",
+          "| api_token | rotate qzxcanaryqzxcanary now |", hidden=("qzxcanaryqzxcanary",), count=1)
+    masks("#6209 R4 R4e digits in two words of one value are masked", "token: 4111 1111", hidden=("4111",), count=1)
+    masks("#6209 R4 R4ac a later word of thirteen or more lower-case letters is masked",
+          "token: 20000 qzxcanaryqzxcanary", hidden=("qzxcanaryqzxcanary",), count=1)
+    meta_redactor = Redactor()
+    meta_rows = meta_redactor.mask_rows([("--- api_key: qzxcanary6163meta", "meta")], True)
+    unit("#6211 R4 N36 a meta row is shown as is and not counted",
+         meta_rows == ["--- api_key: qzxcanary6163meta"] and meta_redactor.count == 0,
+         f"count={meta_redactor.count}\n{meta_rows!r}")
 
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
