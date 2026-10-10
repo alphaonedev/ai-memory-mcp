@@ -654,5 +654,99 @@ def test_out_of_date_leaf_is_refused_after_the_handshake_6375(
         server.close()
 
 
+# ---- #6305: suites without server authentication refused at construction --
+
+_UNAUTHENTICATED_SUITES = {
+    "auth-null": "aNULL:@SECLEVEL=0",
+    "null-encryption": "eNULL:@SECLEVEL=0",
+    "auth-psk": "PSK:@SECLEVEL=0",
+    "auth-srp": "SRP:@SECLEVEL=0",
+    "openssl-DEFAULT": "DEFAULT",
+}
+
+
+def _with_ciphers(spec: str) -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    try:
+        context.set_ciphers(spec)
+    except ssl.SSLError:
+        pytest.skip(f"this OpenSSL has no {spec!r} suites")
+    return context
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize(
+    "spec", _UNAUTHENTICATED_SUITES.values(), ids=_UNAUTHENTICATED_SUITES.keys()
+)
+def test_unauthenticated_suites_are_refused_at_construction_6305(
+    client_cls: type, spec: str
+) -> None:
+    context = _with_ciphers(spec)
+    if not any(
+        suite.get("auth") in {"auth-null", "auth-psk", "auth-srp"} or suite.get("symmetric") is None
+        for suite in context.get_ciphers()
+    ):
+        pytest.skip(f"{spec!r} has no unauthenticated suite on this OpenSSL")
+    with pytest.raises(ValueError, match="verify=False") as refused:
+        client_cls(base_url=_ORIGIN, verify=context)
+    assert ":!PSK:!SRP:!aNULL:!eNULL" in str(refused.value)  # names the remedy
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_remedy_cipher_string_is_admitted_6305(client_cls: type) -> None:
+    context = _with_ciphers("DEFAULT:!PSK:!SRP:!aNULL:!eNULL")
+    client = client_cls(base_url=_ORIGIN, verify=context)
+    if client_cls is AiMemoryClient:
+        client.close()
+    else:
+        asyncio.run(client.aclose())
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_unauthenticated_suites_set_after_construction_are_refused_per_request_6305(
+    origin: RecordingServer, lab: Lab, monkeypatch: pytest.MonkeyPatch, client_cls: type
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    context = lab.client_context()
+    if client_cls is AiMemoryClient:
+        with AiMemoryClient(base_url=origin.url, verify=context, timeout=5) as client:
+            context.set_ciphers("HIGH:aNULL:@SECLEVEL=0")
+            with pytest.raises(ValueError, match="verify=False is refused"):
+                client._client.get("/x")  # noqa: SLF001
+    else:
+
+        async def run() -> None:
+            async with AsyncAiMemoryClient(
+                base_url=origin.url, verify=context, timeout=5
+            ) as client:
+                context.set_ciphers("HIGH:aNULL:@SECLEVEL=0")
+                with pytest.raises(ValueError, match="verify=False is refused"):
+                    await client._client.get("/x")  # noqa: SLF001
+
+        asyncio.run(run())
+    assert origin.hits == []
+
+
+class _NoCipherSession(_Session):
+    def cipher(self) -> Any:
+        return None
+
+
+@pytest.mark.parametrize("session_kind", ["zero-secret-bits", "no-cipher"])
+def test_session_without_secret_bits_is_refused_6305(
+    driver: tuple[_Driver, ssl.SSLContext], session_kind: str
+) -> None:
+    drive, context = driver
+    session = (
+        _Session(context, bits=0)
+        if session_kind == "zero-secret-bits"
+        else _NoCipherSession(context)
+    )
+    stream = _Stream(session)
+    with pytest.raises(ValueError, match="verify=False"):
+        drive.new_request()("connection.start_tls.complete", {"return_value": stream})
+    assert stream.closed
+
+
 def test_lab_temp_root_is_project_local_6309(lab: Lab) -> None:
     assert ".local-runs" in pathlib.Path(lab.ca_path).resolve().parts
