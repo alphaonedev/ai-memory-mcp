@@ -167,7 +167,7 @@ async fn sqlite_run() -> Run {
 async fn x2_flags_reset_after_panic() {
     let failed = tokio::spawn(async {
         let dir = tempfile::tempdir().expect("panic control tempdir");
-        let store = SqliteStore::open(&dir.path().join("flags.db")).expect("flags sqlite");
+        let store = SqliteStore::open(dir.path().join("flags.db")).expect("flags sqlite");
         // The first digest fails after the run has enabled both flags.
         let raw = RawDb::Sqlite(dir.path().join("absent.db"));
         run_x2(&store, &raw, false).await;
