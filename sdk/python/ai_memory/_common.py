@@ -228,6 +228,68 @@ def _refuse_shared_writable(what: str, path: str, mode: int) -> None:
         )
 
 
+#: Symlinks followed while resolving one CA path, as Linux's MAXSYMLINKS.
+_MAX_SYMLINK_HOPS = 40
+
+
+def _checked_realpath(path: str) -> str:
+    """``os.path.realpath(path)``, refusing a symlink others could re-point (#6559).
+
+    Every component is resolved in order. A symlink met on the way (the path
+    itself, a directory component, or a link its target leads through) is
+    refused when the directory holding it lets the group or others write and
+    is not sticky with the link owned by this user or root: anyone with that
+    write access could replace the link and change which CA is read. This is
+    the #6377 rule for a CA file's directory, applied to every link. A
+    missing component ends the walk with the remainder appended, as
+    ``realpath`` does; the caller then refuses the path.
+    """
+    if os.name == "nt":
+        return os.path.realpath(path)
+    parts = [part for part in os.path.join(os.getcwd(), path).split(os.sep) if part]
+    resolved = os.sep
+    hops = 0
+    while parts:
+        name = parts.pop(0)
+        if name == ".":
+            continue
+        if name == "..":
+            resolved = os.path.dirname(resolved)
+            continue
+        candidate = os.path.join(resolved, name)
+        try:
+            info = os.lstat(candidate)
+        except OSError:
+            return os.path.join(candidate, *parts)
+        if not stat.S_ISLNK(info.st_mode):
+            resolved = candidate
+            continue
+        hops += 1
+        if hops > _MAX_SYMLINK_HOPS:
+            raise ValueError(f"verify= CA path {path!r} has too many symlinks (#6559).")
+        held = os.stat(resolved).st_mode
+        sticky_and_owned = bool(held & stat.S_ISVTX) and info.st_uid in (0, os.geteuid())
+        if _shared_writable(held) and not sticky_and_owned:
+            raise ValueError(
+                f"verify= CA path {path!r} passes through the symlink {candidate!r}, "
+                f"whose directory is group- or world-writable (mode {stat.S_IMODE(held):o}): "
+                "anyone with that write access could re-point it and change which "
+                "servers this client trusts. Pass the real path, or keep the link in "
+                "a directory only its owner can change (#6559)."
+            )
+        try:
+            target = os.readlink(candidate)
+        except OSError as exc:
+            raise ValueError(
+                f"verify= CA path {path!r}: symlink {candidate!r} cannot be read: "
+                f"{exc.strerror} (#6559)."
+            ) from None
+        if os.path.isabs(target):
+            resolved = os.sep
+        parts = [part for part in target.split(os.sep) if part] + parts
+    return resolved
+
+
 def _pinned_base_context() -> ssl.SSLContext:
     """``ssl.create_default_context()`` with NO trust anchors loaded (#6377).
 
@@ -252,14 +314,14 @@ def _pinned_base_context() -> ssl.SSLContext:
 def _load_trust_file(context: ssl.SSLContext, shown: str, entry: str) -> None:
     """Load one CA file into ``context`` NOW, after checking who can change it.
 
-    ``entry`` is resolved through symlinks, opened without blocking (a FIFO
+    ``entry`` is resolved through symlinks (each held to #6559), opened without blocking (a FIFO
     would otherwise hang), and must be a regular file that neither it nor its
     directory lets the group or others rewrite; a sticky directory is
     admitted when the file belongs to this user or root, since nobody else
     can then replace it. The file is loaded by path and re-checked to be the
     same inode afterwards, so a swap during the load is refused (#6377).
     """
-    real = os.path.realpath(entry)
+    real = _checked_realpath(entry)
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         fd = os.open(real, flags)
@@ -296,7 +358,8 @@ def _load_trust_file(context: ssl.SSLContext, shown: str, entry: str) -> None:
 def _context_from_path(path: str) -> ssl.SSLContext:
     """A verifying context for the CA file or directory ``path`` (#6269, #6377).
 
-    The path is resolved with ``os.path.realpath`` NOW. A path that is neither
+    The path is resolved NOW, as ``os.path.realpath`` does, refusing a symlink
+    on the way that sits in a directory others can write (#6559). A path that is neither
     an existing regular file nor an existing directory (missing, FIFO, socket,
     device) is a ``ValueError`` rather than a late ``FileNotFoundError`` or a
     hang (#6307).
@@ -309,7 +372,7 @@ def _context_from_path(path: str) -> ssl.SSLContext:
     others can write is refused (POSIX; #6377). An empty directory gives a
     context with no anchor at all, which fails every handshake (#6269).
     """
-    resolved = os.path.realpath(path)
+    resolved = _checked_realpath(path)
     try:
         mode = os.stat(resolved).st_mode
     except OSError:

@@ -103,8 +103,11 @@ Refused with `ValueError` (#3840, #6267, #6268, #6269):
   `str`/path subclass).
 - A path that does not exist, or is neither a file nor a directory; a CA
   file, CA directory, symlink target or target directory that its group or
-  others can write (POSIX, #6377); a directory entry that is not a regular
-  file.
+  others can write (POSIX, #6377); a symlink anywhere on the path (the path
+  itself, a directory component, or a link a hashed entry leads through)
+  whose directory its group or others can write, unless that directory is
+  sticky and the link is yours or root's (POSIX, #6559); a directory entry
+  that is not a regular file.
 - A context with `verify_mode` of `CERT_NONE` or `CERT_OPTIONAL`, or with
   `check_hostname` off.
 - A context with a verify flag that relaxes chain validation, such as

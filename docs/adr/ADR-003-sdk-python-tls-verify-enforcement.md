@@ -118,8 +118,10 @@ Decisions below the vote threshold (recorded as `decision:` lines in the commits
   suites and are refused; the error message gives the remedy string.
 - #6377: `verify=<CA path>` is read once, at construction. For a directory, only the hashed entries OpenSSL's own
   `capath` lookup reads (`<hash>.<n>`, `<hash>.r<n>`) are loaded. A group- or world-writable directory, file, symlink
-  target or target directory is refused (POSIX). An empty directory gives a context with no trust anchor, which fails
-  every handshake (#6269).
+  target or target directory is refused (POSIX). Every symlink met while resolving the path or an entry is held to
+  the same rule as a CA file's directory: refused when the directory holding the link is group- or world-writable,
+  unless it is sticky and the link belongs to this user or root (#6559). An empty directory gives a context with no
+  trust anchor, which fails every handshake (#6269).
 
 Residuals (accepted, each with its reason):
 - The validity-date check after the handshake reads the leaf only, because `getpeercert()` returns no chain.
