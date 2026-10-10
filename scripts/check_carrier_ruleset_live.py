@@ -1843,6 +1843,52 @@ def self_test():
             else None if not any(s in p for p in workflow_pin_problems(t))
             else f"a problem echoes {s[:16]!r}..."))
 
+    # round10 #6735 #6736 #6737 #6738 #6739 #6745: the whole value of a credential-named key is withheld
+    # (no stop character, no kept literal after an expression), glued tokens are masked, and the
+    # credential vocabulary covers authorization, bearer, auth, pass, pwd, access keys, sessions and cookies.
+    r10_tail = "LEAK" + "TAIL123"
+
+    def r10_env(row):
+        return r8_after_vstep(f"      - name: q\n        env:\n          {row}\n        run: printenv\n")
+
+    r10_cells = [
+        ("round10 #6735: comma inside a refused credential value", r10_env(f"API_KEY: &a abc,{r10_tail}"), r10_tail),
+        ("round10 #6735: ] inside an unclosed-quote credential value", r10_env(f'PASSWORD: "abc]{r10_tail}'), r10_tail),
+        ("round10 #6735: literal text after an expression in a secret problem",
+         r10_env("PASSWORD: ${{ secrets.P }} " + r10_tail), r10_tail),
+        ("round10 #6735: KEY=value in a run line with a comma", r8_after_vstep(
+            "      - name: q\n        run: echo ${{ secrets.P }} && export TOKEN=abc," + r10_tail + "\n"), r10_tail),
+        ("round10 #6735: credential value in a flow mapping owned by its key", r8_after_vstep(
+            "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
+            '        with: {PASSWORD: "${{ secrets.P }} ' + r10_tail + '"}\n'), r10_tail),
+        ("round10 #6738: # inside a refused credential value", r10_env(f"API_KEY: &a abc#{r10_tail}"), r10_tail),
+        ("round10 #6738: } inside a refused credential value", r10_env(f"API_KEY: &a abc}}{r10_tail}"), r10_tail),
+        ("round10 #6738: string literal inside an expression", r10_env('API_KEY: "${{ \'' + r10_tail + '\' }}'), r10_tail),
+    ]
+    for word in ("AUTHORIZATION", "BEARER", "NPM_AUTH", "DB_PASS", "PASSPHRASE", "PWD", "AWS_ACCESS_KEY_ID",
+                 "SESSION_ID", "COOKIE", "SIGNING_KEY"):
+        r10_cells.append((f"round10 #6739: {word} value withheld in a refusal",
+                          r10_env(f"{word}: &a {r10_tail}"), r10_tail))
+    for glue in ("MY_", "9", "x", "%3A"):
+        for tok in r9_tokens[:2]:
+            r10_cells.append((f"round10 #6736 #6737: {tok[:4]} token glued after {glue!r} masked in a secret problem",
+                              r10_env("X: ${{ secrets.PAT }} " + glue + tok), tok[-12:]))
+            r10_cells.append((f"round10 #6736 #6737: {tok[:4]} token glued after {glue!r} masked in a refusal",
+                              r10_env("X: &a " + glue + tok), tok[-12:]))
+    r10_cells.append(("round10 #6745: uppercase-first repeated flow key", r8_after_vstep(
+        "      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n"
+        "        with: {REF: main, ref: evil}\n"), "repeated flow mapping key"))
+    for label, text, leak in r10_cells:
+        if "#6745" in label:
+            check(label, lambda t=text, s=leak: None if any(s in p for p in workflow_pin_problems(t))
+                  else f"no {s!r} problem in {workflow_pin_problems(t)!r}")
+            continue
+        check(label, lambda t=text, s=leak: (
+            "workflow_pin_problems is empty" if not workflow_pin_problems(t)
+            else None if not any(s in p for p in workflow_pin_problems(t))
+            else f"a problem echoes {s[:16]!r}..."))
+
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"

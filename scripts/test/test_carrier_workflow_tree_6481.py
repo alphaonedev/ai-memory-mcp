@@ -492,6 +492,33 @@ class Round9AccessorShape(unittest.TestCase):
         self.assertTrue(refused("a:\n  b: {k: 1, k: 2}\n", "line 2: repeated flow mapping key"))
         self.assertEqual(SUBSET.flow_of("{push: x, pull_request: y}"), {"push": "x", "pull_request": "y"})
 
+    def test_mask_withholds_the_whole_value_6735(self):
+        tail = "LEAK" + "TAIL123"
+        for row in ("API_KEY: abc,%s", "PASSWORD: abc]%s", "TOKEN: abc}%s", "TOKEN: abc #%s",
+                    "export TOKEN=abc,%s", "PASSWORD: ${{ secrets.P }} %s", "TOKEN: ${{ 'x' }}%s",
+                    "TOKEN: ${{ a }}${{ b }}%s"):
+            self.assertNotIn(tail, SUBSET.mask(row % tail), row)
+            self.assertNotIn(tail, SUBSET.clip(row % tail), row)
+        self.assertEqual(SUBSET.mask("GH_TOKEN: ${{ github.token }}"), "GH_TOKEN: ${{ github.token }}")
+        self.assertEqual(SUBSET.mask("GH_TOKEN: ${{ github.token }}'"), "GH_TOKEN: ${{ github.token }}'")
+        self.assertEqual(SUBSET.mask(SUBSET.mask("A_TOKEN: abc,d")), SUBSET.mask("A_TOKEN: abc,d"))
+        self.assertNotIn("github.token", SUBSET.mask("GH_TOKEN: ${{ github.token }} x"))
+
+    def test_mask_token_glued_to_a_word_6736(self):
+        for glue in ("MY_", "9", "x", "%3A", "_"):
+            tok = "gh" + "p_" + "Q" * 36
+            self.assertNotIn("Q" * 8, SUBSET.mask("v=" + glue + tok), glue)
+            self.assertNotIn("Q" * 8, SUBSET.mask("v " + glue + "github" + "_pat_" + "Q" * 40), glue)
+
+    def test_credential_vocabulary_6739(self):
+        for name in ("Authorization", "bearer", "NPM_AUTH", "db_pass", "pwd", "passphrase", "AWS_ACCESS_KEY_ID",
+                     "session_id", "cookie", "signing_key"):
+            self.assertNotIn("VALUE9", SUBSET.mask(name + ": VALUE9"), name)
+
+    def test_flow_duplicate_key_uppercase_first_6745(self):
+        self.assertTrue(refused("on: {Push: x, push: y}\n", "repeated flow mapping key"))
+        self.assertTrue(refused("a:\n  b: {REF: a, ref: b}\n", "line 2: repeated flow mapping key"))
+
     def test_clip_caps_and_masks_6681(self):
         self.assertEqual(SUBSET.clip("a" * 120), "a" * 120)
         self.assertEqual(SUBSET.clip("a" * 121), "a" * SUBSET.ECHO_LIMIT + "...")
