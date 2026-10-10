@@ -243,7 +243,10 @@ def log_safe(text):
     is kept as a net for code points newer than the table. The default-ignorable
     code points that are not format characters (Hangul fillers, the combining
     grapheme joiner, variation selectors, U+2800; LOG_INVISIBLE_RANGES, #6917)
-    are escaped the same way. A name the change
+    are escaped the same way, and so is every code point the interpreter
+    reports as unassigned (Cn), private-use (Co) or a surrogate (Cs; #6918),
+    so a code point it cannot classify fails closed (an older interpreter
+    escapes more than a newer one, never less). A name the change
     controls (a path, a workflow file name, a trailer value, git's stderr
     echoing one) therefore stays on its own step-log line and can never begin
     a line the Actions runner reads as a workflow command (`::error`, ...)."""
@@ -255,7 +258,7 @@ def log_safe(text):
         elif code < 0x20 or 0x7F <= code <= 0x9F:
             out.append(f"\\x{code:02x}")
         elif code in (0x2028, 0x2029) or _in_ranges(code, LOG_CF_RANGES) or _in_ranges(code, LOG_INVISIBLE_RANGES) \
-                or unicodedata.category(ch) == "Cf":
+                or unicodedata.category(ch) in ("Cf", "Cn", "Co", "Cs"):
             out.append(f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}")
         else:
             out.append(ch)
@@ -4149,7 +4152,9 @@ SELF_TEST_OK = (
     "every Cf code point of Unicode 15.0 escaped from an explicit table even when the interpreter does not "
     "report it as a format character, so Python 3.9 and 3.12 agree (log-safe-cf-table); (tr round 8, #6917) "
     "the default-ignorable code points that are not format characters (Hangul fillers, the grapheme "
-    "joiner, variation selectors, unassigned default-ignorables) and U+2800 escaped too (log-safe-di-U+XXXX)."
+    "joiner, variation selectors, unassigned default-ignorables) and U+2800 escaped too (log-safe-di-U+XXXX); "
+    "(tr round 8, #6918) unassigned, private-use and lone-surrogate code points escaped, failing closed on a "
+    "code point the interpreter cannot classify (log-safe-cn, log-safe-co, log-safe-cs)."
 )
 
 
