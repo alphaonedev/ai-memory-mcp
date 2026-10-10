@@ -1037,6 +1037,7 @@ R11_CELLS = (
 R12_BASE = "Clause (c) applies.\nOther (c) item.\n"
 R12_FRAG = "docs/compliance/A.md:c:2\n"
 R12_JOIN = "joins into script name `check-gone.sh`"
+R12_LEFT = "`check-old.sh` does not exist (checked at scripts/check-old.sh)"
 
 
 def r12_swap(join):
@@ -1075,6 +1076,19 @@ R12_CELLS = (
     ("S-inventory-check", "| x | (cross-PR check<!-- -->-gone.sh |\n", "docs/compliance/A.md:check:1\n", 1, R12_JOIN),
     ("S-inventory-c", "Per recommendation c<!-- -->heck-gone.sh \u2014 done.\n", "docs/compliance/A.md:c:1\n", 1,
      R12_JOIN),
+    # #6632: a name after a run of dots or dashes is a name; a path and a longer word are not.
+    ("M-left-ellipsis3", "Then...check-old.sh daily.\n", "", 1, R12_LEFT),
+    ("M-left-ellipsis2", "Then..check-old.sh daily.\n", "", 1, R12_LEFT),
+    ("M-left-dot", "Run .check-old.sh daily.\n", "", 1, R12_LEFT),
+    ("M-left-dash", "Run -check-old.sh daily.\n", "", 1, R12_LEFT),
+    ("M-left-dashdash", "Run --check-old.sh daily.\n", "", 1, R12_LEFT),
+    ("M-left-path", "Run docs/x-check-old.sh daily.\n", "", 1,
+     "`docs/x-check-old.sh` does not exist (checked at docs/x-check-old.sh)"),
+    ("M-left-frag", "Then...c<!-- -->heck-old.sh daily.\n", "", 1, "joins into script name `check-old.sh`"),
+    ("M-left-dot-slash", "Run ./check-x.sh daily.\n", "", 1, "`./check-x.sh` does not exist (checked at ./check-x.sh)"),
+    ("M-left-word", "Run xcheck-a.sh daily.\n", "", 0, None),
+    ("M-left-digit", "Run 1check-old.sh daily.\n", "", 0, None),
+    ("M-left-existing", "Then...check_new.py daily.\n", "", 0, None),
 )
 
 
