@@ -238,4 +238,37 @@ mod tests_6157 {
             assert!(line.contains(escaped), "missing escape {escaped}: {line}");
         }
     }
+
+    /// #6536: a non-string `protocolVersion` (object, array) is never echoed:
+    /// the diagnostic carries `<non-string>` in its place, so a client-sized
+    /// value with U+2028 or bidi controls (which `serde_json` serialisation
+    /// does not escape) cannot reach stderr. The line is the same, byte for
+    /// byte, as the one for a scalar non-string, and stays short.
+    #[test]
+    fn issue_6536_downgrade_diagnostic_never_echoes_non_string_values() {
+        const MARKER: &str = "NONSTRING6536";
+        const MAX_BYTES: usize = 300;
+        let big = format!("{MARKER}\u{2028}\u{202e}{}", "x".repeat(10_000));
+        let diagnostic_for = |value: serde_json::Value| {
+            let mut map = serde_json::Map::new();
+            map.insert(PROTOCOL_VERSION_FIELD.to_string(), value);
+            protocol_downgrade_diagnostic(&serde_json::Value::Object(map), NEWEST_PROTOCOL_REVISION)
+        };
+        let baseline = diagnostic_for(serde_json::Value::Bool(true));
+        for value in [
+            serde_json::json!({ "v": big.clone() }),
+            serde_json::json!([big.clone()]),
+        ] {
+            let line = diagnostic_for(value);
+            assert!(line.contains("<non-string>"), "no redaction: {line:?}");
+            assert!(!line.contains(MARKER), "the value leaked: {line:?}");
+            assert!(!line.contains('\u{2028}'), "raw U+2028 leaked: {line:?}");
+            assert!(!line.contains('\u{202e}'), "raw U+202E leaked: {line:?}");
+            assert!(line.len() < MAX_BYTES, "{} bytes: {line:?}", line.len());
+            assert_eq!(
+                line, baseline,
+                "the redacted line must not depend on the value"
+            );
+        }
+    }
 }
