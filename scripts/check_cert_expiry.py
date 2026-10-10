@@ -93,9 +93,18 @@ THE TWO PREDICATES #3556 ADDS (2026-09-21).
       <commit>`), so ancestry is not required; an unparseable banner or a
       bound SHA absent from the repository is fail-closed.
 
-WHAT THIS DOES NOT CLAIM. A value-only edit of an existing AI_MEMORY_FED_*
-identifier in a file outside the three path watches does not trip the
-identifier check. This gate does not re-run 5.4(2)-(5); it only forces the
+WHAT THIS DOES NOT CLAIM. The identifier check compares, per identifier, the
+trimmed text of every line under src/ that names it (#6427). So a value edited
+on the line that carries an AI_MEMORY_FED_* identifier, a rewrap of that line,
+a trailing comment on it, or a block comment opened and closed ON it is drift
+and RED; a value that sits on a different line from the name is not seen.
+LEXICAL BOUND: the check is a text scan, so a change that leaves every
+identifier-bearing line byte-identical is not seen. Measured examples, each
+GREEN: a multi-line comment opened and closed on the neighbouring lines, an
+attribute that compiles the definition out added on the line above, a raw-string
+wrap, and a move of the line into a file that is not compiled (tracked in
+#6560). A block comment AROUND a definition is therefore caught only in the
+same-line form. This gate does not re-run 5.4(2)-(5); it only forces the
 cert-doc to be touched so a human/re-issue cannot be skipped.
 
 Usage:
@@ -1480,7 +1489,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
          {"src/mask_def.rs": f"// {kid} was read here\npub const M: &str = \"\";\n"}),
         ("mask-longer", "definition removed + a longer token that contains the name",
          {"src/mask_def.rs": 'pub const M: &str = "";\n', "src/mask_new.rs": f"// NOT{kid}\n"}),
-        ("mask-blockcomment", "defining line wrapped in a block comment",
+        ("mask-blockcomment", "defining line wrapped in a block comment opened and closed on that line",
          {"src/mask_def.rs": "/* " + def_line.rstrip("\n") + " */\npub const M: &str = \"\";\n"}),
         ("mask-annot", "definition removed + a mention carrying the drift annotation text",
          {"src/mask_def.rs": 'pub const M: &str = "";\n',
@@ -2044,9 +2053,13 @@ SELF_TEST_OK = (
     "(mask, mask-gate, mask-drift, mask-add, #6370) removing the definition of an identifier "
     "that a comment still names stays RED (occurrence counts, not name sets), while an extra "
     "mention is GREEN; "
+    "(value-same-line, value-next-line, doc-bound, #6563) a value edited on the identifier "
+    "line is RED, a value on the next line GREEN, and the docstring states the lexical bound; "
     "(mask-xfile, mask-incomment, mask-longer, mask-blockcomment, mask-annot, #6427) a removed "
     "definition offset by a mention in another file, a comment in its place, a longer token, a "
-    "block comment around it or the drift annotation text stays RED, as do look-alike spellings "
+    "block comment opened and closed on the defining line or the drift annotation text stays RED "
+    "(a comment opened on a neighbouring line leaves the line unchanged and is the documented "
+    "lexical bound, #6560), as do look-alike spellings "
     "(mask-confusable, mask-confusable-note, mask-zwsp, mask-crsplit) and a removed mention "
     "(mask-note-removed), a removal whose total never falls (mask-netzero, mask-netzero-gate) "
     "and a 3 -> 2 fall (mask-3to2), a rising total (mask-rise) and one of two identical definitions (mask-dup) stay RED, a longer token is GREEN (mask-longer-letter, mask-longer-underscore), while a defining line moved to another file is GREEN (mask-moved); "
