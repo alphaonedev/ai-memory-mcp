@@ -3896,6 +3896,7 @@ APPROVAL_OPERATOR = "alphaonedev"
 APPROVAL_JOB_PERMISSIONS = {"contents": "read", "pull-requests": "read"}
 WORKFLOW_PERMISSIONS = {"contents": "read"}
 APPROVAL_EVALUATE_ENV = {"GH_TOKEN": "${{ github.token }}", "OPERATOR_LOGIN": APPROVAL_OPERATOR}
+APPROVAL_STEP_KEYS = [["uses", "with"], ["name", "run"], ["name", "env", "run"]]
 
 
 def _row_scalar(body: str) -> str:
@@ -3997,6 +3998,14 @@ def _approval_job_problems(c8: str) -> List[str]:
         problems.append(f"step env mappings are {envs!r}, not exactly [{APPROVAL_EVALUATE_ENV!r}]")
     if any("secrets." in body for _, body, _ in _meaningful(job)):
         problems.append("the approval job references `secrets.`; it may use only github.token")
+    # #6388: no step key beyond the pinned ones (so no `shell:`), and no `defaults:` on the
+    # job or the workflow: either reroutes the step's script through another command.
+    step_keys = [step["keys"] for step in shape["steps"]]  # type: ignore[union-attr,index]
+    if step_keys != APPROVAL_STEP_KEYS:
+        problems.append(f"approval step keys are {step_keys!r}, not exactly {APPROVAL_STEP_KEYS!r}")
+    for where, keys in (("job", shape["job_keys"]), ("workflow", shape["top_keys"])):
+        if "defaults" in keys:  # type: ignore[operator]
+            problems.append(f"the {where} declares `defaults:`; an approval step's shell may not be overridden")
     return problems
 
 
