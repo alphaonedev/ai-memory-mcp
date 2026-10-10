@@ -1128,6 +1128,17 @@ def self_test():
         ("pre-apply no carriers", payload, [], [], {}, 1, "no carrier branch"),
         ("pre-apply payload drift", mut(lambda rs: rs.update(bypass_actors=[{"actor_id": 1}]), base=good_c), [],
          live_two, {sha_a: wf_text, sha_b: wf_text}, 1, "bypass_actors"),
+        # round8 #6619: check_tip routes every tip through workflow_pin_problems; each needle below is
+        # produced only by that wiring (reviewer mutant R6 deletes it).
+        ("round8 #6619: pre-apply tip with a forbidden trigger", payload, [], live_two,
+         {sha_a: wf_text.replace("\non:\n", "\non:\n  workflow_call:\n", 1), sha_b: wf_text}, 1,
+         "workflow names the forbidden trigger workflow_call"),
+        ("round8 #6619: pre-apply tip without a workflow permissions block", payload, [], live_two,
+         {sha_a: wf_text, sha_b: wf_text.replace("\npermissions:\n  contents: read\n", "\n", 1)}, 1,
+         "no permissions block, so the repository default applies"),
+        ("round8 #6619: pre-apply tip the reader refuses names the construct and line", payload, [], live_two,
+         {sha_a: wf_text + "".join(" " * i + f"k{i}:\n" for i in range(80)), sha_b: wf_text}, 1,
+         "not readable by the fail-closed reader: line"),
     ]
 
     def pre_case(p, rulesets, carriers, texts, want_rc, needle):

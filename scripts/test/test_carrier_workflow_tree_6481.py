@@ -351,6 +351,30 @@ def pr_on(block):
     return "on:\n" + block + "jobs: {}\n"
 
 
+class CheckTipWiring(unittest.TestCase):
+    """#6619: check_tip (pre-apply and the release-tip check) reports every workflow pin problem."""
+
+    def tip(self, text):
+        return GATE.check_tip("t", text, "rehearsal/audit-wip", GATE.CARRIER_JOBS)
+
+    def test_clean_tip(self):
+        self.assertEqual(self.tip(WF), [])
+
+    def test_pin_problems_reach_check_tip(self):
+        forbidden = WF.replace("\non:\n", "\non:\n  workflow_run:\n    workflows: [x]\n", 1)
+        self.assertNotEqual(forbidden, WF)
+        self.assertIn("t: workflow names the forbidden trigger workflow_run", self.tip(forbidden))
+        no_perm = WF.replace("\npermissions:\n  contents: read\n", "\n", 1)
+        self.assertNotEqual(no_perm, WF)
+        self.assertTrue([r for r in self.tip(no_perm) if r.startswith("t: workflow permissions grant write")])
+        secret = with_verifier("    env:\n      EXTRA: ${{ secrets.PAT }}\n")
+        self.assertTrue([r for r in self.tip(secret) if "references a repository secret" in r])
+
+    def test_refused_tip_names_line(self):
+        got = self.tip("\ufeff" + WF)
+        self.assertTrue([r for r in got if r.startswith("t: workflow is not readable by the fail-closed reader: line 1")])
+
+
 class TriggerFilters(unittest.TestCase):
     """trigger_covers reads `on.pull_request` filters through the allowed-shape accessor (#6610)."""
 
