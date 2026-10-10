@@ -3,7 +3,7 @@ layout: doc
 ---
 # ADR-003 - Python SDK TLS verification: post-handshake enforcement (vote record for 785838d82, #6308)
 
-Status: **ACCEPTED + IMPLEMENTED** (commits 785838d82 and the round-4 fix on `fix/6060-promo6-ssh`).
+Status: **ACCEPTED + IMPLEMENTED** (commits 785838d82, the round-4 fix and the round-5 series on `fix/6060-promo6-ssh`; round 5 below).
 
 Context: commit 785838d82 refused `CERT_OPTIONAL` contexts and added a per-request
 refusal hook (a T3 security-posture choice) without the vote that
@@ -13,10 +13,23 @@ predicate plus a post-handshake check as the enforcement. Issues: #6267, #6268,
 #6305, #6306, #6308.
 
 Decision: the SDK accepts a caller `ssl.SSLContext` only when it is exactly
-`ssl.SSLContext` with stock handshake attributes (early, clear error), and
-enforces after every TLS handshake, before any request byte is sent, that the
-negotiated session uses the caller's context object and carries a non-empty
-peer certificate. Failure closes the stream and raises `ValueError` (fail closed).
+`ssl.SSLContext` with stock handshake attributes, verification and hostname
+checks on, no verify flag that relaxes chain validation and no cipher suite
+without server authentication. This check runs at construction and again before
+every request, which gives an early, clear error. After every TLS handshake of a
+request (direct, through an `http://` or `https://` CONNECT proxy, or over
+SOCKS), and before that request's first byte is written on the connection, the
+SDK enforces that the negotiated session:
+- uses the caller's context object
+- carries a non-empty peer certificate that names the request host and whose
+  validity dates include now
+- negotiated a cipher with secret bits
+
+Failure closes the stream and raises `ValueError` (fail closed). A response-time
+backstop repeats the check on the connection the response came over. It covers a
+pooled connection and a trace event that never fired, but it runs after the
+request was written. The pre-send check holds only while the SDK's trace is the
+one httpcore calls (#6537).
 
 ## Vote record
 
@@ -72,3 +85,47 @@ Binding conditions taken from the voters' killer objections (all implemented and
 2. Sync and async clients get matching sync/async trace callables; a caller-supplied trace extension is wrapped, never replaced.
 3. The abort closes the stream before raising, and no request byte is sent (asserted with a recording server).
 4. Canary test: the trace fires on both httpx pins; a mutation that removes the enforcement turns the tests red.
+
+---
+
+# Round 5: every session of a request, and what "verified" means (#6349 #6350 #6375 #6305 #6376 #6377)
+
+Protocol: 3-agent vote (6def5ab6), operator directive relayed by ai:god-f2. Runner: ai:f1-fix-6060-r5, 2026-10-09.
+Memory: bdb2d654 (vote record); round-4 votes 5d31459d stand.
+
+Q1 (#6349 #6376): which TLS sessions the post-handshake check acts on, and how an `https://` proxy leg is treated.
+Options: A, check every `*.start_tls.complete` session against the caller's context, and admit a session on another
+context only on `connection.start_tls` as a per-request "pending" proxy leg that a verified origin session must follow
+before any request other than the bare tunnel CONNECT is written; B, force `trust_env=False`; C, skip sessions whose
+server name differs from the request host. Lenses fail-closed security, client-compat, testability/spec: A 3, B 0, C 0.
+Verdict: A. Binding conditions: pending state per request; the CONNECT exemption admits only httpcore's own CONNECT
+(Host, Accept, Proxy-Authorization headers); the trace closes the stream itself before raising; tests drive the
+branches a real server cannot reach.
+
+Decisions below the vote threshold (recorded as `decision:` lines in the commits):
+- #6350: the peer certificate must name the request host (the URL host, not the proxy). A DNS SAN wildcard matches
+  only as the whole left-most label of a name with at least three labels (`*.example.com`, never `f*.example.com`
+  or `*.com`), and never more than one label; an IP host matches only an IP SAN; the subject
+  CN is used only when the certificate has no DNS SAN and the context's `hostname_checks_common_name` is on.
+- #6375: verify flags are an allowlist. `VERIFY_X509_PARTIAL_CHAIN` is admitted, because Python 3.13+
+  `create_default_context` sets it; a flag that relaxes validation, such as `VERIFY_X509_NO_CHECK_TIME` or
+  `VERIFY_ALLOW_PROXY_CERTS`, is refused.
+- #6305: a context offering a suite without server authentication (auth-null, PSK, SRP, eNULL) is refused at
+  construction. Cost: the plain OpenSSL `"DEFAULT"` cipher string and some system cipher policies include PSK and SRP
+  suites and are refused; the error message gives the remedy string.
+- #6377: `verify=<CA path>` is read once, at construction. For a directory, only the hashed entries OpenSSL's own
+  `capath` lookup reads (`<hash>.<n>`, `<hash>.r<n>`) are loaded. A group- or world-writable directory, file, symlink
+  target or target directory is refused (POSIX). An empty directory gives a context with no trust anchor, which fails
+  every handshake (#6269).
+
+Residuals (accepted, each with its reason):
+- The validity-date check after the handshake reads the leaf only, because `getpeercert()` returns no chain.
+  OpenSSL checks every certificate's dates during the handshake, and the flag that would turn that off
+  (`VERIFY_X509_NO_CHECK_TIME`) is refused.
+- The `https://` proxy leg is authenticated by httpx's own default context (`SSL_CERT_FILE` / `SSL_CERT_DIR` /
+  certifi), not by the caller's context. No SDK secret crosses that leg: only httpcore's CONNECT, with the caller's
+  own `Proxy-Authorization` when the proxy URL carries credentials. The origin session inside the tunnel is held to
+  the caller's context.
+- The response backstop cannot stop a request that was already written; it exists for the paths where the pre-send
+  trace did not run. #6537 tracks moving the trace out of reach of later caller event hooks.
+- `verify=None` with `SSL_CERT_DIR` set still lets httpx read that directory lazily and unchecked; #6538 tracks it.

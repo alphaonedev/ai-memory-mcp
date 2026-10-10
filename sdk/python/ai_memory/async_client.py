@@ -58,7 +58,9 @@ class AsyncAiMemoryClient:
     """Async client bound to a single daemon instance.
 
     Use as an async context manager or call :meth:`aclose` explicitly.
-    Arguments match :class:`ai_memory.client.AiMemoryClient`.
+    Arguments match :class:`ai_memory.client.AiMemoryClient`, including every
+    ``verify=`` rule and the per-session TLS check before each request is
+    written (#3840, #6349).
     """
 
     def __init__(
