@@ -150,6 +150,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import string
 import subprocess
 import sys
@@ -4057,7 +4058,49 @@ class ApprovalJobPinned6261(unittest.TestCase):
 
 GEOMETRY_WRAPPER = ROOT / "scripts" / "check-promotion-geometry.sh"
 # `python3 path/to/script.py ...` without -I puts the script's directory first on sys.path (#5163).
-BARE_PYTHON_SCRIPT_RE = re.compile(r"python3\s+(?!-)[^\s\"'$|;&]*\.py\b")
+# #6389: a positive rule, not a regex. Every `python3` whose first non-option argument ends in
+# `.py` must carry -I among its options; options and quoted paths are tokenised with shlex.
+PYTHON_CALL_RE = re.compile(r"(?<![\w./@-])python3(?=\s)")
+PYTHON_OPTIONS_WITH_ARGUMENT = "XW"
+SHELL_PUNCTUATION = "();<>|&"
+
+
+def _bare_python_script(rest: str) -> Optional[str]:
+    """The `python3 ... x.py` text when ``rest`` (what follows `python3`) runs a script without -I, else None.
+
+    A command line shlex cannot tokenise up to the decision is reported (fail closed).
+    """
+    lexer = shlex.shlex(rest, posix=True, punctuation_chars=SHELL_PUNCTUATION)
+    lexer.whitespace_split = True
+    seen: List[str] = []
+    isolated = False
+    skip_next = False
+    try:
+        for token in lexer:
+            seen.append(token)
+            if skip_next:
+                skip_next = False
+                continue
+            if token and all(ch in SHELL_PUNCTUATION for ch in token):
+                return None
+            if token.startswith("--"):
+                continue
+            if token.startswith("-") and len(token) > 1:
+                for pos, flag in enumerate(token[1:], 1):
+                    if flag == "I":
+                        isolated = True
+                    elif flag in "cm":
+                        return None
+                    elif flag in PYTHON_OPTIONS_WITH_ARGUMENT:
+                        skip_next = pos == len(token) - 1
+                        break
+                continue
+            if token.endswith(".py") and not isolated:
+                return "python3 " + " ".join(seen)
+            return None
+    except ValueError:
+        return f"python3 {rest.strip()} (shlex cannot tokenise it)"
+    return None
 
 
 def _bare_python_script_runs(texts: Dict[str, str]) -> List[str]:
@@ -4066,8 +4109,10 @@ def _bare_python_script_runs(texts: Dict[str, str]) -> List[str]:
         for lineno, row in enumerate(text.splitlines(), 1):
             if row.lstrip().startswith("#"):
                 continue
-            for m in BARE_PYTHON_SCRIPT_RE.finditer(row):
-                found.append(f"{name}:{lineno}: {m.group(0)}")
+            for m in PYTHON_CALL_RE.finditer(row):
+                bare = _bare_python_script(row[m.end():])
+                if bare is not None:
+                    found.append(f"{name}:{lineno}: {bare}")
     return found
 
 
