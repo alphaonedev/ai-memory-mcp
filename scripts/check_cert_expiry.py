@@ -108,26 +108,44 @@ code or an undeclared file carries a context finding the base line did not
 have, so the context check below makes it RED: (value-copy-bound) pins the
 block-comment copy as RED.
 CONTEXT CHECK (#6560): a guarded line can also be disabled while it stays
-byte-identical (nothing on it is edited), so each identifier-bearing line is scanned with a Rust-aware lexer (comments,
-strings, raw strings, chars, nested blocks, attributes, brace depth) and the
-constructs that enclose it are recorded: an attribute on it or on any enclosing
-item or `mod` (cfg, cfg_attr, path, #[test], any attribute outside a short
-allow-list), an inner `#![cfg(..)]`, an `if false` / `if cfg!(..)` / `while false`
-block, the else branch of an `if true`, an open block comment or string literal,
-a `macro_rules!` body, an unconditional return/break/continue/todo!/panic! (or a
-loop with no break) earlier in the same block, and the same attributes on the
-`mod NAME;` declarations that reach the file (a file no declaration reaches is a
+byte-identical (nothing on it is edited), so each identifier-bearing line is
+scanned with a Rust tokenizer (line, nested block and doc comments, strings,
+raw strings, byte and C strings, chars, lifetimes; whitespace or a newline
+between `#`, `!` and `[` of an attribute; an end-of-file string, raw string or
+block comment is a named ERROR) and the constructs that enclose it are
+recorded: an attribute on it or on any enclosing item or `mod` (cfg, cfg_attr,
+path, #[test], any attribute outside a short allow-list), an inner
+`#![cfg(..)]`, an `if false` / `if (false)` / `if !!false` / `if cfg!(..)` /
+`if !cfg!(..)` / `while false` block, the else branch of an `if true`, a `for`
+over an empty literal range, a match arm whose literal never matches a literal
+scrutinee, the input of a macro invocation (stringify!, a local macro_rules!
+macro, any `name! {..}`), an open block comment or string literal, a
+`macro_rules!` body, an unconditional exit earlier in the same block
+(return / break / continue, `let _ = return ..`, todo! / unimplemented! /
+unreachable! / panic! under any path, any `..exit(..)` / `..abort(..)`,
+assert!(false), a bare / unsafe / `if true` block that exits, a loop with no
+break), and the same attributes on the `mod NAME;` declarations that reach the
+file, keyed by their inline-mod path (a file no declaration reaches is a
 finding too). The comparison is RELATIVE: a finding on a line the base also
-carried, absent from the base's context for that line, is drift and RED. A parse
-the scan cannot trust (unbalanced braces or attribute brackets, a git read
-error) is a named ERROR, fail closed.
+carried, absent from the base's context for that line, is drift and RED; a
+clean copy of the line does not mask a disabled original (wrap-mask-copy).
+The scan is one pass over the tokens (linear: (wrap-scale)). A parse the scan
+cannot trust (unbalanced braces or brackets, an unterminated literal or
+comment, a git read error) is a named ERROR, fail closed.
 LEXICAL BOUND (residual gap, NOT closed): a text scan has no call graph, no
-constant evaluation and no macro expansion, so these stay GREEN and are pinned
-by the (wrap-gap-*) cells: deleting the only caller of a function that holds the
-line, an `if FLAG {` where FLAG is a constant that is false, a definition moved
-into a function nothing calls, an include!d fragment, and a proc-macro that
-rewrites its input. The #6140 trust model applies as well: the gate runs the
-change's own copy of this script, so it is defense in depth beside review.
+name resolution, no constant evaluation and no macro expansion, so these stay
+GREEN and are pinned by the (wrap-gap-*) cells: deleting the only caller of a
+function that holds the line (wrap-gap-uncalled), an `if FLAG {` where FLAG is a
+constant that is false (wrap-gap-constflag), a local fn that shadows the callee
+named on the line (wrap-gap-shadow), the enclosing impl moved to a type nothing
+uses (wrap-gap-impl-target), an include! switched to a fragment without the line
+(wrap-gap-include), and the line moved into a function nothing calls
+(wrap-gap-uncalled-move). Further shapes of the same class are documented only,
+without a cell: a proc-macro that rewrites its input, a trait impl method
+replaced by the trait's default, a `mod` declared but never used, a condition
+that is constant only after evaluation (`if 1 > 2`), and a closure that is never
+called. The #6140 trust model applies as well: the gate runs the change's own
+copy of this script, so it is defense in depth beside review.
 This gate does not re-run 5.4(2)-(5); it only forces the
 cert-doc to be touched so a human/re-issue cannot be skipped.
 
@@ -394,42 +412,50 @@ _ATTR_BENIGN = frozenset({
 })
 _ATTR_NAME_RE = re.compile(r"^#!?\[\s*([A-Za-z_][\w:]*)")
 _ATTR_ALWAYS_RE = re.compile(r"\bcfg(?:_attr)?\b|\bunreachable_code\b|^#!?\[\s*path\b")
-_CODE_TOKEN_RE = re.compile(
-    r"""//|/\*|(?<![A-Za-z0-9_])(?:b?r|cr)(#*)"|"|'|\#!?\[|[{}();\[\],]""")
+# One Rust token per match (#6704, #6705): the scan runs on tokens, so a
+# comment, a string, a raw string or a char literal can never be mistaken for
+# a bracket, and `#`, `!` and `[` of an attribute may be apart.
+_TOKEN_RE = re.compile(r"""
+    (?P<ws>\s+)
+  | (?P<line>//[^\n]*)
+  | (?P<block>/\*)
+  | (?P<raw>[bc]?r(?P<hashes>\#*)")
+  | (?P<str>[bc]?")
+  | (?P<quote>b?')
+  | (?P<ident>r\#[^\W\d]\w*|[^\W\d]\w*)
+  | (?P<num>\d\w*(?:\.\d\w*)?)
+  | (?P<punct>::|\.\.=|\.\.\.|\.\.|=>|->|.)
+""", re.VERBOSE | re.DOTALL)
 _CHAR_LIT_RE = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])'", re.DOTALL)
+_LIFETIME_RE = re.compile(r"'(?:r#)?[^\W\d]\w*")
 _BLOCK_TOKEN_RE = re.compile(r"/\*|\*/")
 _STR_TOKEN_RE = re.compile(r'["\\]')
-_BREAK_RE = re.compile(r"\bbreak\b(\s*')?")
-_LOOP_HEADER_RE = re.compile(r"(?:^|[\s:=(])loop$|\bwhile\s+true$")
+_LOOP_HEADER_RE = re.compile(r"(?:^|[ :])loop$|\bwhile (?:true|! false)$")
+# Any loop an unlabelled `break` can leave (loop, while, for).
+_BREAK_TARGET_RE = re.compile(r"(?:^|: |= )(?:loop|while|for)\b")
+_PATH = r"(?::: )?(?:[^\W\d]\w* :: )*"
 _EXIT_RE = re.compile(
-    r"^(?:return\b|break\b|continue\b|(?:todo|unimplemented|unreachable|panic)!|"
-    r"(?:std::)?process::exit\b)")
-_MOD_DECL_RE = re.compile(r"^(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_]\w*)$")
+    r"^(?:let\b[^=]*= )?(?:return\b|break\b|continue\b|"
+    + _PATH + r"(?:todo|unimplemented|unreachable|panic) !|"
+    + _PATH + r"(?:exit|abort) \(|"
+    + _PATH + r"assert ! \( false \))")
+_MOD_DECL_RE = re.compile(r"^(?:pub(?: \( [^()]* \))? )?mod ([^\W\d]\w*)$")
+_PROPAGATE_RE = re.compile(r"^(?:unsafe|if (?:true|! false))?$")
 _HEADER_RULES = (
-    (re.compile(r"\bif\s+(?:false|!\s*true)\b"), "inside an `if false` block"),
-    (re.compile(r"\bif\s+cfg!\s*\("), "inside an `if cfg!(..)` block"),
-    (re.compile(r"\bwhile\s+false\b"), "inside a `while false` loop"),
-    (re.compile(r"\bif\s+(?:true|!\s*false)\b.*\belse\b"), "in the else branch of an if true"),
-    (re.compile(r"(?:^|\s)macro_rules!"), "inside a macro_rules! body (expands only where invoked)"),
+    (re.compile(r"\bif (?:false|! true)(?: && .*)?$"), "inside an `if false` block"),
+    (re.compile(r"\b(?:if|while)\b.*\bcfg !"), "inside an `if cfg!(..)` block"),
+    (re.compile(r"\bwhile (?:false|! true)(?: && .*)?$"), "inside a `while false` loop"),
+    (re.compile(r"\bif (?:true|! false) else\b"), "in the else branch of an if true"),
+    (re.compile(r"\bmacro_rules !"), "inside a macro_rules! body (expands only where invoked)"),
 )
+_RANGE_RE = re.compile(r"\bfor .* in (\d[\w]*) (\.\.=?) (\d[\w]*)$")
+_KEYWORDS = frozenset(
+    "as async await break const continue crate dyn else enum extern false fn for if impl in "
+    "let loop match mod move mut pub ref return self Self static struct super trait true "
+    "type unsafe use where while".split())
 _UNDECLARED = "module file that no `mod` declaration in a parent file reaches (not compiled)"
 _MOD_DEPTH_CAP = 64
-
-
-class _Frame:
-    __slots__ = ("header", "attrs", "exit", "has_break", "is_loop", "paren")
-
-    def __init__(self, header, attrs):
-        self.header = header
-        self.attrs = list(attrs)
-        self.exit = ""
-        self.has_break = False
-        self.is_loop = bool(_LOOP_HEADER_RE.search(header))
-        self.paren = 0
-
-
-def _collapse(parts):
-    return " ".join("".join(parts).split())
+_HEADER_TAIL = 16  # tokens of a paren/bracket header kept for the rules (#6710)
 
 
 def _attr_findings(attr, out):
@@ -441,176 +467,326 @@ def _attr_findings(attr, out):
         out.add(f"attribute {attr}")
 
 
-def _context_findings(stack, pend, extra):
+def _norm(vals):
+    """Header text for the rules: tokens joined by one space, parentheses
+    dropped and `! !` pairs cancelled (#6707)."""
+    out = []
+    for v in vals:
+        if v in ("(", ")"):
+            continue
+        if v == "!" and out and out[-1] == "!":
+            out.pop()
+            continue
+        out.append(v)
+    return " ".join(out)
+
+
+def _int_lit(v):
+    m = re.match(r"\d[\d_]*", v)
+    return int(m.group(0).replace("_", "")) if m else None
+
+
+def _is_lit(tok):
+    return tok[0] in ("num", "char") or tok[1] in ("true", "false")
+
+
+def _header_findings(norm, vals):
     out = set()
-    for fr in stack:
-        for attr in fr.attrs:
-            _attr_findings(attr, out)
-        if fr.exit:
-            out.add(f"after an unconditional early exit ({fr.exit}) in the same block")
-    for attr in pend:
-        _attr_findings(attr, out)
-    for text in [fr.header for fr in stack[1:]] + [" ".join(extra.split())]:
-        for rule, why in _HEADER_RULES:
-            if rule.search(text):
-                out.add(why)
+    for rule, why in _HEADER_RULES:
+        if rule.search(norm):
+            out.add(why)
+    rng = _RANGE_RE.search(norm)
+    if rng:
+        lo, hi = _int_lit(rng.group(1)), _int_lit(rng.group(3))
+        if lo is not None and hi is not None and (lo > hi or (lo == hi and rng.group(2) == "..")):
+            out.add(f"inside a `for` over an empty range ({rng.group(1)}{rng.group(2)}{rng.group(3)})")
+    if len(vals) >= 2 and vals[-1] == "!" and re.fullmatch(r"[^\W\d]\w*", vals[-2]) \
+            and vals[-2] not in _KEYWORDS and "macro_rules" not in vals:
+        out.add(f"inside the input of a macro invocation `{vals[-2]}!` (it expands to whatever "
+                "the macro makes of it)")
     return out
 
 
-def _skip_string(text, pos):
+class _Frame:
+    __slots__ = ("kind", "norm", "attrs", "cum", "exit", "has_break", "is_loop", "stops_break",
+                 "mod", "scrut", "cur", "line", "pend", "pend_found")
+
+    def __init__(self, kind, toks, attrs, parent, line):
+        vals = [v for _, v in toks]
+        self.kind, self.line = kind, line
+        self.norm = _norm(vals)
+        self.attrs = list(attrs)
+        self.exit = ""
+        self.has_break = False
+        self.is_loop = kind == "{" and bool(_LOOP_HEADER_RE.search(self.norm))
+        self.stops_break = kind == "{" and bool(_BREAK_TARGET_RE.search(self.norm))
+        self.pend, self.pend_found = [], set()
+        md = _MOD_DECL_RE.match(" ".join(vals)) if kind == "{" else None
+        self.mod = md.group(1) if md else None
+        self.scrut = toks[1] if kind == "{" and len(toks) == 2 and toks[0][1] == "match" \
+            and _is_lit(toks[1]) else None
+        self.cur = []
+        own = _header_findings(self.norm, vals) if parent is not None else set()
+        for attr in self.attrs:
+            _attr_findings(attr, own)
+        if parent is not None and parent.scrut is not None and len(toks) >= 2 \
+                and toks[1][1] == "=>" and _is_lit(toks[0]) and toks[0][1] != parent.scrut[1]:
+            own.add(f"in a match arm `{toks[0][1]}` that never matches the scrutinee "
+                    f"`{parent.scrut[1]}`")
+        if parent is not None:
+            own |= parent.cum
+            if kind != "{":  # a paren or bracket group is part of the pending item
+                own |= parent.pend_found
+        self.cum = own
+
+    def add_inner(self, attr):
+        self.attrs.append(attr)
+        _attr_findings(attr, self.cum)
+
+    def reset(self):
+        self.cur, self.pend, self.pend_found = [], [], set()
+
+
+def _end_string(path, text, pos, line):
     """Index just past the closing quote of the string whose body starts at `pos`."""
     while True:
         m = _STR_TOKEN_RE.search(text, pos)
         if m is None:
-            return len(text)
+            raise GateError(f"{path}: unterminated string literal opened at line {line} "
+                            "(cannot parse; fail-closed)")
         if m.group(0) == "\\":
             pos = m.start() + 2
             continue
         return m.end()
 
 
-def _skip_block_comment(text, pos):
-    """Index just past the nested block comment whose body starts at `pos` (EOF if open)."""
+def _end_block_comment(path, text, pos, line):
+    """Index just past the nested block comment whose body starts at `pos`."""
     depth = 1
     while depth:
         m = _BLOCK_TOKEN_RE.search(text, pos)
         if m is None:
-            return len(text)
+            raise GateError(f"{path}: unterminated block comment opened at line {line} "
+                            "(cannot parse; fail-closed)")
         depth += 1 if m.group(0) == "/*" else -1
         pos = m.end()
     return pos
 
 
+def _rust_tokens(path, text, line_of):
+    """(kind, start, end, text) for every non-blank token of `text`; an open
+    string, raw string or block comment at end of file is a GateError (#6705)."""
+    toks, i, n = [], 0, len(text)
+    while i < n:
+        m = _TOKEN_RE.match(text, i)
+        kind = m.lastgroup if m.lastgroup != "hashes" else "raw"
+        if kind == "ws":
+            i = m.end()
+            continue
+        if kind == "block":
+            end = _end_block_comment(path, text, m.end(), line_of(i))
+        elif kind == "raw":
+            close = '"' + m.group("hashes")
+            k = text.find(close, m.end())
+            if k < 0:
+                raise GateError(f"{path}: unterminated raw string literal opened at line "
+                                f"{line_of(i)} (cannot parse; fail-closed)")
+            end, kind = k + len(close), "str"
+        elif kind == "str":
+            end = _end_string(path, text, m.end(), line_of(i))
+        elif kind == "quote":
+            q = m.end() - 1
+            lit = _CHAR_LIT_RE.match(text, q)
+            life = None if lit else _LIFETIME_RE.match(text, q)
+            if lit:
+                end, kind = lit.end(), "char"
+            elif life:
+                end, kind = life.end(), "life"
+            else:
+                end, kind = m.end(), "punct"
+        else:
+            end = m.end()
+        toks.append((kind, i, end, text[i:end]))
+        i = end
+    return toks
+
+
+def _compact(vals):
+    out = ""
+    for v in vals:
+        if out and (out[-1].isalnum() or out[-1] == "_") and (v[0].isalnum() or v[0] in "_'\""):
+            out += " "
+        out += v
+    return out
+
+
 def _scan_rust(path, text, offsets):
-    """Lexical scan of one Rust file. Returns (snaps, inner, mods): snaps maps
+    """Token scan of one Rust file. Returns (snaps, inner, mods): snaps maps
     each offset to the set of disabling findings there (None inside a line
     comment), inner the findings of the file-level inner attributes, mods the
-    findings at each `mod NAME;` declaration."""
+    findings at each `mod NAME;` declaration keyed by its inline path
+    (`inner/NAME` under `mod inner { .. }`, #6715)."""
     starts = [0] + [m.end() for m in re.finditer("\n", text)]
     line_of = lambda pos: bisect.bisect_right(starts, pos)  # noqa: E731
-    root = _Frame("", [])
-    stack, pend, cur = [root], [], []
+    toks = _rust_tokens(path, text, line_of)
+    root = _Frame("root", [], [], None, 0)
+    stack = [root]
     last_closed = ""
     snaps, mods = {}, collections.defaultdict(set)
     offs = sorted(set(offsets))
     oi = 0
 
-    def take(lo, hi, extra_for, carried=None, opened=0, label=""):
-        """Record every offset in [lo, hi). `carried` names a construct that
-        opened on an earlier line than the offset (a finding on its own)."""
+    def context():
+        top = stack[-1]
+        out = top.cum | top.pend_found
+        for fr in stack:
+            if fr.exit:
+                out.add(f"after an unconditional early exit ({fr.exit}) in the same block")
+        cur = top.cur
+        if top.scrut is not None and len(cur) >= 2 and cur[1][1] == "=>" and _is_lit(cur[0]) \
+                and cur[0][1] != top.scrut[1]:
+            out.add(f"in a match arm `{cur[0][1]}` that never matches the scrutinee `{top.scrut[1]}`")
+        return out
+
+    def take(tok):
+        """Record every offset inside `tok` (one context per token, #6710)."""
         nonlocal oi
+        kind, lo, hi, _ = tok
+        found = None
         while oi < len(offs) and offs[oi] < hi:
             o = offs[oi]
             oi += 1
-            if carried == "line":
+            if o < lo:
+                snaps[o] = context()
+                continue
+            if kind == "line":
                 snaps[o] = None
                 continue
-            found = _context_findings(stack, pend, extra_for(o))
-            if carried and (label == "block comment" or line_of(o) > opened):
-                found.add("inside a block comment" if label == "block comment"
-                          else "inside a string literal that began on an earlier line")
-            snaps[o] = found
+            if found is None:
+                found = context()
+            here = set(found)
+            if kind == "block":
+                here.add("inside a block comment")
+            elif kind == "str" and line_of(o) > line_of(lo):
+                here.add("inside a string literal that began on an earlier line")
+            snaps[o] = here
 
-    i, n = 0, len(text)
+    def code(start):
+        """Index of the next non-comment token at or after `start`."""
+        k = start
+        while k < len(toks) and toks[k][0] in ("line", "block"):
+            take(toks[k])
+            k += 1
+        return k
+
+    i, n = 0, len(toks)
     while i < n:
-        m = _CODE_TOKEN_RE.search(text, i)
-        j = m.start() if m else n
-        chunk = text[i:j]
-        take(i, j, lambda o, lo=i: text[lo:o])
-        if chunk:
-            cur.append(chunk)
-            for bm in _BREAK_RE.finditer(chunk):
-                for fr in reversed(stack):
-                    fr.has_break = True
-                    if fr.is_loop and not bm.group(1):
-                        break
-        if m is None:
-            break
-        tok, i = m.group(0), j
+        tok = toks[i]
+        kind, lo, _, val = tok
+        if oi < len(offs) and offs[oi] < tok[2]:
+            take(tok)
         top = stack[-1]
-        if tok == "//":
-            eol = text.find("\n", i)
-            end = n if eol < 0 else eol
-            take(i, end, lambda o: "", carried="line")
-            i = end
-        elif tok == "/*":
-            end = _skip_block_comment(text, i + 2)
-            take(i, end, lambda o: "".join(cur), carried=True, opened=line_of(i), label="block comment")
-            cur.append(" ")
-            i = end
-        elif tok.endswith('"') and tok != '"':
-            close = '"' + "#" * len(m.group(1))
-            k = text.find(close, i + len(tok))
-            end = n if k < 0 else k + len(close)
-            take(i, end, lambda o: "".join(cur), carried=True, opened=line_of(i), label="string literal")
-            cur.append('""')
-            i = end
-        elif tok == '"':
-            end = _skip_string(text, i + 1)
-            take(i, end, lambda o: "".join(cur), carried=True, opened=line_of(i), label="string literal")
-            cur.append('""')
-            i = end
-        elif tok == "'":
-            lit = _CHAR_LIT_RE.match(text, i)
-            end = lit.end() if lit else i + 1
-            take(i, end, lambda o: "".join(cur))
-            cur.append("''" if lit else "'")
-            i = end
-        elif tok.startswith("#"):
-            k, depth = i + len(tok), 1
-            while depth:
-                bm = re.compile(r'[\[\]"]').search(text, k)
-                if bm is None:
-                    raise GateError(f"{path}: unbalanced attribute bracket at line {line_of(i)} "
-                                    "(cannot parse; fail-closed)")
-                if bm.group(0) == '"':
-                    k = _skip_string(text, bm.end())
-                else:
-                    depth += 1 if bm.group(0) == "[" else -1
-                    k = bm.end()
-            take(i, k, lambda o: "".join(cur))
-            attr = " ".join(text[i:k].split())
-            (top.attrs if tok.startswith("#!") else pend).append(attr)
-            i = k
-        elif tok == "{":
-            header = _collapse(cur)
-            if header.startswith("else"):
-                header = (last_closed + " " + header).strip()
-            stack.append(_Frame(header, pend))
-            cur, pend = [], []
+        if kind in ("line", "block"):
             i += 1
-        elif tok == "}":
+            continue
+        if val == "#" and kind == "punct":
+            j = code(i + 1)
+            inner = j < n and toks[j][3] == "!"
+            if inner:
+                j = code(j + 1)
+            if j < n and toks[j][3] == "[":
+                depth, k, body = 0, j, []
+                while True:
+                    if k >= n:
+                        raise GateError(f"{path}: unbalanced attribute bracket at line {line_of(lo)} "
+                                        "(cannot parse; fail-closed)")
+                    t2 = toks[k]
+                    if oi < len(offs) and offs[oi] < t2[2]:
+                        take(t2)
+                    if t2[0] not in ("line", "block"):
+                        if t2[3] == "[":
+                            depth += 1
+                        elif t2[3] == "]":
+                            depth -= 1
+                        body.append(t2[3])
+                    k += 1
+                    if depth == 0:
+                        break
+                attr = ("#!" if inner else "#") + _compact(body)
+                if inner:
+                    top.add_inner(attr)
+                else:
+                    top.pend.append(attr)
+                    _attr_findings(attr, top.pend_found)
+                i = k
+                continue
+        if kind == "ident" and val == "break":
+            j = code(i + 1)
+            labelled = j < n and toks[j][0] == "life"
+            for fr in reversed(stack):
+                fr.has_break = True
+                if fr.stops_break and not labelled:
+                    break
+        if val in ("(", "[", "{") and kind == "punct":
+            if val == "{":
+                hdr = top.cur
+                if hdr and hdr[0][1] == "else":
+                    hdr = [("ident", w) for w in last_closed.split()] + hdr
+                fr = _Frame("{", hdr, top.pend, top, line_of(lo))
+                top.reset()
+            else:
+                fr = _Frame(val, top.cur[-_HEADER_TAIL:], (), top, line_of(lo))
+            stack.append(fr)
+            i += 1
+            continue
+        if val in (")", "]", "}") and kind == "punct":
             if len(stack) == 1:
-                raise GateError(f"{path}: unbalanced braces: a closing brace at line {line_of(i)} "
+                raise GateError(f"{path}: unbalanced braces: a closing `{val}` at line {line_of(lo)} "
                                 "has no opener (cannot parse; fail-closed)")
             done = stack.pop()
-            if done.is_loop and not done.has_break:
-                stack[-1].exit = stack[-1].exit or "a loop with no break"
-            last_closed = done.header
-            cur, pend = [], []
+            want = {"(": ")", "[": "]", "{": "}"}[done.kind]
+            if val != want:
+                raise GateError(f"{path}: unbalanced braces: a closing `{val}` at line {line_of(lo)} "
+                                f"does not match the `{done.kind}` opened at line {done.line} "
+                                "(cannot parse; fail-closed)")
+            parent = stack[-1]
+            if val == "}":
+                tail = " ".join(v for _, v in done.cur)
+                if done.cur and _EXIT_RE.match(tail):
+                    done.exit = done.exit or tail[:48]
+                if done.exit and _PROPAGATE_RE.match(done.norm):
+                    parent.exit = parent.exit or done.exit
+                if done.is_loop and not done.has_break:
+                    parent.exit = parent.exit or "a loop with no break"
+                last_closed = done.norm
+                parent.reset()
+            else:
+                inside = done.cur if len(done.cur) <= 64 else [("punct", "..")]
+                parent.cur.append(("punct", done.kind))
+                parent.cur.extend(inside)
+                parent.cur.append(("punct", val))
             i += 1
-        elif tok == ";" and top.paren == 0:
-            stmt = _collapse(cur)
+            continue
+        if val == ";" and kind == "punct" and top.kind in ("root", "{"):
+            stmt = " ".join(v for _, v in top.cur)
             if _EXIT_RE.match(stmt):
                 top.exit = top.exit or stmt[:48]
             md = _MOD_DECL_RE.match(stmt)
-            if md:
-                mods[md.group(1)] |= _context_findings(stack, pend, "")
-            cur, pend = [], []
+            if md and all(fr.mod for fr in stack[1:]):
+                key = "/".join([fr.mod for fr in stack[1:]] + [md.group(1)])
+                mods[key] |= context()
+            top.reset()
             i += 1
-        elif tok == ",":
-            if top.paren == 0:
-                cur = []
-            else:
-                cur.append(tok)
+            continue
+        if val == "," and kind == "punct":
+            top.reset()
             i += 1
-        else:
-            if tok in "([":
-                top.paren += 1
-            elif tok in ")]":
-                top.paren = max(0, top.paren - 1)
-            cur.append(tok)
-            i += 1
+            continue
+        top.cur.append((kind, '""' if kind == "str" else val))
+        i += 1
+    while oi < len(offs):
+        snaps[offs[oi]] = context()
+        oi += 1
     if len(stack) != 1:
         raise GateError(f"{path}: unbalanced braces: {len(stack) - 1} block(s) still open at end "
                         "of file (cannot parse; fail-closed)")
@@ -648,7 +824,9 @@ class _TreeScan:
         return self.cache[path]
 
     def module_findings(self, path, depth=0):
-        """Findings contributed by the `mod` declaration chain above `path`."""
+        """Findings contributed by the `mod` declaration chain above `path`. A
+        declaration inside inline mods is keyed by its inline path (#6715), so
+        the parent searched may sit several directories up."""
         if depth > _MOD_DEPTH_CAP:
             raise GateError(f"{path}: module chain deeper than {_MOD_DEPTH_CAP} (cannot parse; fail-closed)")
         if _is_crate_root(path) or "/" not in path:
@@ -659,12 +837,18 @@ class _TreeScan:
             directory, modname = directory.rsplit("/", 1)
         else:
             modname = stem
-        for cand in (f"{directory}/mod.rs", f"{directory}.rs", f"{directory}/lib.rs", f"{directory}/main.rs"):
-            if cand in self.files:
-                _, (_, inner, mods) = self.scan(cand)
-                if modname in mods:
-                    return mods[modname] | inner | self.module_findings(cand, depth + 1)
-        return {_UNDECLARED}
+        key = modname
+        while True:
+            for cand in (f"{directory}/mod.rs", f"{directory}.rs", f"{directory}/lib.rs",
+                         f"{directory}/main.rs"):
+                if cand in self.files and cand != path:
+                    _, (_, inner, mods) = self.scan(cand)
+                    if key in mods:
+                        return mods[key] | inner | self.module_findings(cand, depth + 1)
+            if "/" not in directory or directory == "src":
+                return {_UNDECLARED}
+            directory, outer = directory.rsplit("/", 1)
+            key = f"{outer}/{key}"
 
 
 def extract_fed_wrap_counts(repo, tree):
@@ -715,8 +899,11 @@ def wrap_delta(base_wraps, head_wraps):
     base and head occurrences are matched by their finding set; an occurrence the
     base had that the head no longer has in that context (lost), paired with a
     head occurrence the base did not have (new), is a context change, and the
-    findings the new context carries that the lost one did not are reported. An
-    extra copy of the line elsewhere (nothing lost) is a mention, not a disable."""
+    findings the new context carries that the lost one did not are reported.
+    When nothing is lost (the base's occurrences all survive, #6709), a head
+    occurrence whose findings the base never carried for that line is reported
+    too: a clean copy cannot mask a disabled original. A clean extra copy of
+    the line is a mention, not a disable."""
     by_line = collections.defaultdict(lambda: (collections.Counter(), collections.Counter()))
     for (name, text, found), n in base_wraps.items():
         by_line[(name, text)][0][found] += n
@@ -725,9 +912,12 @@ def wrap_delta(base_wraps, head_wraps):
     hits = collections.Counter()
     for (name, _), (before, after) in by_line.items():
         lost, new = before - after, after - before
-        if not lost or not new:
-            continue
-        old = {f for found in lost for f in found}
+        if not new or not before:
+            continue  # a line the base never had is the per-line check's (#6427)
+        # A new disabled occurrence with nothing lost is still drift when its
+        # findings are new to the line (#6709: a cfg'd original next to a
+        # clean dead copy); the base's findings for the line are the baseline.
+        old = {f for found in (lost or before) for f in found}
         for found, n in new.items():
             for finding in found:
                 if finding not in old:
@@ -2930,22 +3120,39 @@ SELF_TEST_OK = (
     "(mask-xfile, mask-incomment, mask-longer, mask-blockcomment, mask-annot, #6427) a removed "
     "definition offset by a mention in another file, a comment in its place, a longer token, a "
     "block comment opened and closed on the defining line or the drift annotation text stays RED "
-    "(a comment opened on a neighbouring line leaves the line unchanged and is the documented "
-    "lexical bound, #6560), as do look-alike spellings "
+    "(a comment opened on a neighbouring line leaves the line unchanged and is handled by the "
+    "#6560 context check), as do look-alike spellings "
     "(mask-confusable, mask-confusable-note, mask-zwsp, mask-crsplit) and a removed mention "
     "(mask-note-removed), a removal whose total never falls (mask-netzero, mask-netzero-gate) "
     "and a 3 -> 2 fall (mask-3to2), a rising total (mask-rise) and one of two identical definitions (mask-dup) stay RED, a longer token is GREEN (mask-longer-letter, mask-longer-underscore, mask-longer-digit), while a defining line moved to another file is GREEN (mask-moved); "
-    "(wrap-cfg-item, wrap-cfg-feature, wrap-cfg-mod, wrap-cfg-fn, wrap-inner, wrap-attr-test, "
-    "wrap-iffalse, wrap-ifcfg, wrap-else, wrap-blockcomment, wrap-rawstring, wrap-return, "
-    "wrap-todo, wrap-loop, wrap-macro, wrap-decl, and each with -gate on a pull_request, #6560) "
+    "(wrap-cfg-item, wrap-cfg-feature, wrap-cfg-mod, wrap-cfg-fn, wrap-inner, wrap-inner-late, "
+    "wrap-allow-unreach, wrap-attr-test, wrap-iffalse, wrap-ifcfg, wrap-else, wrap-blockcomment, "
+    "wrap-rawstring, wrap-return, wrap-todo, wrap-loop, wrap-loop-inner-break, wrap-macro, wrap-decl, wrap-moved-undeclared, "
+    "wrap-attr-spaced, wrap-attr-newline, wrap-inner-spaced, wrap-attr-rawstr-desync, "
+    "wrap-attr-comment-desync, wrap-exit-abort, wrap-exit-rooted, wrap-exit-imported, "
+    "wrap-exit-std-panic, wrap-exit-assert-false, wrap-exit-bare-block, wrap-exit-let-return, "
+    "wrap-exit-if-true, wrap-if-paren-false, wrap-if-not-cfg, wrap-if-not-not-false, "
+    "wrap-for-empty-range, wrap-match-never-arm, wrap-macro-stringify, wrap-macro-local, "
+    "wrap-mask-copy, wrap-decl-inline-mod, wrap-parent-inner, wrap-decl-pubcrate, "
+    "wrap-undeclared-nested, and each with -gate on a pull_request, #6560) "
     "a guarded line left byte-identical but disabled by its context (an attribute on it, its "
-    "enclosing mod or fn or the file, an if false / if cfg! block, the else of an if true, a block "
-    "comment opened 36 lines above, a raw string, an unconditional early exit, a loop with no break, "
-    "a macro_rules body, cfg on the parent's mod declaration) stays RED naming the construct; "
-    "(wrap-unbalanced) a file whose braces do not balance fails closed by name; (wrap-ctl-condreturn, "
-    "wrap-ctl-inline, wrap-ctl-comment, wrap-ctl-samewrap) a conditional return, an allow-listed "
-    "attribute, closed comments and a wrapper the base already had are GREEN; (wrap-gap-uncalled, "
-    "wrap-gap-constflag) the residual gap (call graph, constant flag) is GREEN and pinned as NOT "
+    "enclosing mod or fn or the file, spaced or split across lines, after a raw string or comment "
+    "inside an earlier attribute, an if false / if (false) / if !!false / if cfg! / if !cfg! block, "
+    "the else of an if true, a for over an empty range, a never-matching match arm, the input of "
+    "stringify! or a local macro, a block comment opened 36 lines above, a raw string, any of the "
+    "early exits, a loop with no break, a macro_rules body, cfg on the parent's mod declaration or "
+    "file, a declaration moved into an inline mod, a file no declaration reaches, a clean dead copy "
+    "beside a cfg'd original) stays RED naming the construct; "
+    "(wrap-unbalanced, wrap-eof-comment, wrap-eof-string, wrap-eof-rawstring, wrap-lstree-error) "
+    "unbalanced braces, an end-of-file comment, string or raw string and a git ls-tree failure fail "
+    "closed by name; (wrap-scale) 8,000 and 50,000 occurrences scan in linear time; "
+    "(wrap-ctl-condreturn, wrap-ctl-new-line-cfg, wrap-ctl-inline, wrap-ctl-comment, wrap-ctl-samewrap, wrap-ctl-lexer, "
+    "wrap-ctl-charlit, wrap-ctl-samefinding, wrap-ctl-labelled-break) a conditional return, an "
+    "allow-listed attribute, closed comments, a wrapper the base already had, char literals and "
+    "lifetimes, an unbalanced char literal, a move between two items with the same cfg and a "
+    "labelled break out of an outer loop are GREEN; (wrap-gap-uncalled, wrap-gap-constflag, "
+    "wrap-gap-shadow, wrap-gap-impl-target, wrap-gap-include, wrap-gap-uncalled-move) the residual "
+    "gap (call graph, constant flag, name resolution, include target) is GREEN and pinned as NOT "
     "closed; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "

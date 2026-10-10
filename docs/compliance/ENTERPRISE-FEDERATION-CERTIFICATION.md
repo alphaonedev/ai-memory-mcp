@@ -1517,13 +1517,26 @@ set, the gate is a red check, not a merge block.)
 The gate's identifier scan also checks the CONTEXT of an unchanged
 `AI_MEMORY_FED_*` line ([**#6560**](https://github.com/alphaonedev/ai-memory-mcp/issues/6560)):
 a `cfg` or other non-benign attribute on the enclosing item or an enclosing
-`mod`, an inner `#![..]` attribute, `if false` / `if cfg!(..)`, an unclosed
-block comment or string above the line, an earlier unconditional exit, a
-`macro_rules!` body, or a module file no `mod` declaration reaches goes RED
-when the change introduces it. A scan that cannot parse a file fails closed.
-It is a lexical scan, not a compiler: an uncalled function, a constant-false
-flag, `include!` and proc-macro rewriting are NOT detected and are pinned as
-GREEN `(wrap-gap-*)` cells in the self-test, documented in the
+`mod` (also written `# [..]` or split across lines), an inner `#![..]`
+attribute, `if false` / `if (false)` / `if !!false` / `if cfg!(..)` /
+`if !cfg!(..)`, a `for` over an empty literal range, a match arm that never
+matches a literal scrutinee, the input of a macro invocation such as
+`stringify!` or a local `macro_rules!` macro, an unclosed block comment or
+string above the line, an earlier unconditional exit (return, break,
+continue, `let _ = return`, panic-family macros under any path, any `exit(..)`
+or `abort(..)`, `assert!(false)`, a bare, `unsafe` or `if true` block that
+exits, a loop with no break), a `macro_rules!` body, a `mod NAME;` moved into
+an inline mod, or a module file no `mod` declaration reaches goes RED when the
+change introduces it, and a clean dead copy of the line does not mask a
+disabled original. The scan is a single linear pass over Rust tokens; a file
+it cannot parse (unbalanced braces, an unterminated string, raw string or
+block comment) fails closed. It is a lexical scan, not a compiler: an uncalled
+function, a constant-false flag, a shadowing local fn, an impl moved to an
+unused type, an `include!` retarget and a definition moved into an uncalled
+function are NOT detected and are pinned as GREEN `(wrap-gap-*)` cells in the
+self-test; proc-macro rewriting, a trait method replaced by its default, a
+never-used `mod`, an evaluated-constant condition (`if 1 > 2`) and a closure
+never called are documented only. Both lists are in the
 `check_cert_expiry.py` docstring (LEXICAL BOUND).
 
 **Re-cert trigger — FIRED (12 §7-watched federation-wire files changed
