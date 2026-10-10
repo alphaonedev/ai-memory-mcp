@@ -263,7 +263,8 @@ before `CREATE EXTENSION`:
   65 s deadline, which covers a SIGSTOPped helper. Any catchable signal valid on the
   platform (except default-ignored, job-control and fault signals) stops the psql child,
   also when it arrives while it is being spawned (#6337, #6504), and exits 1 with one
-  `ensure-age-extension: interrupted` line.
+  `ensure-age-extension: interrupted` line. Only a `0` or `1` answer counts: a psql that exits
+  non-zero or prints anything else fails the run with no restore (#6677).
 
 It is a no-op when AGE is healthy. `--age-dir` exists for the unit tests only;
 CI always uses the default node path, and there is no environment override.
