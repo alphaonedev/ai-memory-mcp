@@ -4149,8 +4149,27 @@ def bound_runtime(root: Path, base: Path, payload: bytes, build: str, assert_bod
     return failures
 
 
+def condition_anchor_failures() -> int:
+    """#6280: a condition-mutant anchor that occurs more than once above CONDITION_MARKER is never applied
+    (the sweep reports it as a survivor only after a full run); refuse it here, in seconds. No replacement
+    may contain an anchor, so a mutant applied by the sweep can never trip this check by itself."""
+    src = Path(__file__).read_text(encoding="utf-8")
+    head = src[: src.index(CONDITION_MARKER + "\n")]
+    failures = 0
+    for desc, old, new in CONDITION_MUTANTS:
+        if head.count(old) > 1:
+            print(f"self-test FAIL: condition-mutant anchor for '{desc}' occurs {head.count(old)} times above "
+                  "the marker; it must occur once (#6280)", file=sys.stderr)
+            failures += 1
+        clash = [d for d, o, _ in CONDITION_MUTANTS if o in new]
+        if clash:
+            print(f"self-test FAIL: replacement of '{desc}' contains the anchor of {clash} (#6280)", file=sys.stderr)
+            failures += 1
+    return failures
+
+
 def self_test(root: Path) -> int:
-    failures = unit_checks()
+    failures = unit_checks() + condition_anchor_failures()
     missing = [rel for rel in INPUT_FILES if not (root / rel).is_file()]
     if missing:
         print(f"check_release_features: self-test FAIL: missing inputs under {root}: {', '.join(missing)}", file=sys.stderr)
