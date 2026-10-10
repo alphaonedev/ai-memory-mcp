@@ -370,13 +370,21 @@ verifier fails otherwise), and the live carrier ruleset updated with the
   flow mapping, a scalar or an empty value is refused with its line, and the
   accessor never reads a key of such a node as absent (#6679). No job name
   may be an expression (#6618). A problem or refusal reprints at most 120
-  characters of a row, masks GitHub-token-shaped strings (also when glued
-  after a letter, digit or `_`, #6736) and withholds the whole value of a
-  credential-named key (names containing token, secret, pass, pwd,
-  credential, api key, private key, access key, auth, bearer, session,
-  cookie or signing; #6681, #6739) to the end of its row, whatever
+  characters. A secret or needs problem names the owning key, the line and
+  `<withheld N chars>` and never reprints value text; a credential-named key
+  owns every value nested below it (#6780, #6781, #6783). A refusal row keeps
+  what precedes its first `: ` or `=` and withholds the rest with its length;
+  a row with no separator keeps its first 24 characters (#6783). Other message
+  text masks GitHub-token-shaped strings (also when glued after a letter,
+  digit or `_`, #6736, or cut by the mask window, #6791) and withholds the
+  whole value of a credential-named key (names containing token, secret,
+  pass, pwd, credential, api key, private key, access key, auth, bearer,
+  session, cookie or signing; #6681, #6739) to the end of its row, whatever
   characters it holds; only a value that is exactly one `${{ ... }}`
-  expression without a quote is kept (#6735, #6738). The secret and token
+  expression of context references, without a quote, a brace, a number or a
+  `true`/`false`/`null`/`NaN`/`Infinity` operand, is kept (#6735, #6738,
+  #6782), and a value that merely starts with the text `<withheld ` is
+  withheld (#6792). The secret and token
   scan reads parsed scalars, keys, flow entries and block-scalar lines
   (#6617); `secrets` matches in any letter case. The two #6143 jobs have a
   closed shape: `name`, one plain `runs-on` label, a `timeout-minutes` of
