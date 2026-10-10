@@ -823,6 +823,96 @@ class MintOwnership7114(unittest.TestCase):
         self.assert_owned_cleanup(rec)
 
 
+class TemplateOwnership7124(unittest.TestCase):
+    """A failed template initialization must release only its acquired resource."""
+
+    SIBLING = 'ai_memory_test_ci_other_live_tpl'
+    DB = 'ai_memory_test_ci_9_1_x'
+    DROP = 'DROP DATABASE IF EXISTS "%s"' % TPL
+    CREATE = 'CREATE DATABASE "%s"' % TPL
+    LOCK = 'ALTER DATABASE "%s" WITH IS_TEMPLATE true ALLOW_CONNECTIONS false' % TPL
+
+    def exercise(self, stage=None, failure=None, cleanup_failure=None):
+        resources = {self.SIBLING}
+        acquired = False
+        calls = []
+
+        def answer(argv, kw):
+            nonlocal acquired
+            sql = argv[argv.index('-c') + 1]
+            calls.append(sql)
+            if sql == self.CREATE:
+                if stage == 'create':
+                    # A competing invocation acquires the name before refusal.
+                    resources.add(TPL)
+                    raise failure
+                resources.add(TPL)
+                acquired = True
+            if sql == self.DROP:
+                if acquired and cleanup_failure is not None:
+                    raise cleanup_failure
+                resources.discard(TPL)
+            if ((stage == 'extension' and sql.startswith('CREATE EXTENSION'))
+                    or (stage == 'lockdown' and sql == self.LOCK)):
+                raise failure
+            return default_answer(argv, kw)
+
+        def log(message):
+            if stage == 'ready-log' and message.startswith('template '):
+                raise failure
+
+        caught = None
+        result = None
+        with Patched(Recorder(answer)), mock.patch.object(pib, 'log', side_effect=log) as logger:
+            try:
+                result = pib.setup(BASE, self.DB, jobs=1)
+            except BaseException as error:
+                caught = error
+        return resources, calls, logger, caught, result
+
+    def test_post_create_failures_release_only_owned_template(self):
+        for stage in ('extension', 'lockdown', 'ready-log'):
+            for kind in (pib.WrapperError, OSError, ValueError, KeyboardInterrupt):
+                with self.subTest(stage=stage, exception=kind.__name__):
+                    failure = kind('injected template initialization failure')
+                    resources, calls, _, caught, result = self.exercise(stage, failure)
+                    self.assertIs(caught, failure)
+                    self.assertIsNone(result)
+                    self.assertEqual(resources, {self.SIBLING},
+                                     'failure must reclaim acquired template and preserve sibling')
+                    self.assertFalse(any('FORCE' in sql.upper() for sql in calls))
+
+    def test_refused_create_never_claims_competing_template(self):
+        failure = pib.WrapperError('injected concurrent CREATE refusal')
+        resources, calls, _, caught, result = self.exercise('create', failure)
+        self.assertIs(caught, failure)
+        self.assertIsNone(result)
+        self.assertEqual(resources, {self.SIBLING, TPL})
+        self.assertEqual(calls[-1], self.CREATE,
+                         'no cleanup authority is acquired after a refused CREATE')
+
+    def test_success_transfers_template_to_caller(self):
+        resources, calls, _, caught, result = self.exercise()
+        self.assertIsNone(caught)
+        self.assertEqual(result, TPL)
+        self.assertEqual(resources, {self.SIBLING, TPL})
+        self.assertNotIn(self.DROP, calls[calls.index(self.CREATE) + 1:])
+
+    def test_secondary_cleanup_failure_preserves_primary_and_warns(self):
+        primary = KeyboardInterrupt('injected primary interruption')
+        cleanup = RuntimeError('PRIVATE_CLEANUP_CANARY_7124')
+        resources, calls, logger, caught, result = self.exercise('extension', primary, cleanup)
+        self.assertIs(caught, primary)
+        self.assertIsNone(result)
+        self.assertEqual(resources, {self.SIBLING, TPL})
+        self.assertIn(self.DROP, calls[calls.index(self.CREATE) + 1:],
+                      'the failing cleanup must actually have been attempted')
+        messages = '\n'.join(str(call.args[0]) for call in logger.call_args_list)
+        self.assertIn('cleanup', messages)
+        self.assertIn('failed', messages)
+        self.assertNotIn('PRIVATE_CLEANUP_CANARY_7124', messages)
+
+
 class LeakAndLineage7031(unittest.TestCase):
     """#7031 H1 review F2 (no leaked base) and H2 (lineage watermark precheck)."""
 
