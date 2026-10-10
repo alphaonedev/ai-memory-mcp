@@ -19,11 +19,14 @@ lives under the repo's ``.local-runs`` (never /tmp).
 """
 
 import argparse
+import ctypes
+import ctypes.util
 import errno
 import hashlib
 import importlib.util
 import json
 import os
+import random
 from pathlib import Path
 import re
 import stat
@@ -1110,6 +1113,199 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             self.assertRegex(pin, r"\A[0-9a-f]{64}\Z")
         self.assertEqual(dict(((s, n), p) for s, n, p in rows)[("lib", "age.dylib")],
                          "8ecfc082a55b667ed2773d622d726bbc4ca299c0b44248a8ec7d27b1460ed927")
+
+
+# ---- #6347: the libpq oracle behind the docstring claim "a URL the helper accepts is read the same way by libpq" --
+LIBPQ_CANDIDATES = (
+    "/opt/homebrew/opt/libpq/lib/libpq.5.dylib",
+    "/opt/homebrew/opt/postgresql@18/lib/postgresql/libpq.5.dylib",
+    "/usr/local/opt/libpq/lib/libpq.5.dylib",
+    "/usr/lib/x86_64-linux-gnu/libpq.so.5",
+    "/usr/lib/aarch64-linux-gnu/libpq.so.5",
+)
+
+
+class _ConninfoOption(ctypes.Structure):
+    _fields_ = [("keyword", ctypes.c_char_p), ("envvar", ctypes.c_char_p), ("compiled", ctypes.c_char_p),
+                ("val", ctypes.c_char_p), ("label", ctypes.c_char_p), ("dispchar", ctypes.c_char_p),
+                ("dispsize", ctypes.c_int)]
+
+
+def load_libpq():
+    """Return the libpq CDLL with PQconninfoParse, or None when no libpq is installed."""
+    names = list(LIBPQ_CANDIDATES)
+    found = ctypes.util.find_library("pq")
+    if found:
+        names.insert(0, found)
+    for name in names:
+        try:
+            lib = ctypes.CDLL(name)
+            lib.PQconninfoParse.restype = ctypes.POINTER(_ConninfoOption)
+            lib.PQconninfoParse.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_char_p)]
+            lib.PQconninfoFree.argtypes = [ctypes.POINTER(_ConninfoOption)]
+            return lib
+        except (OSError, AttributeError):
+            continue
+    return None
+
+
+def libpq_options(lib, url):
+    """PQconninfoParse(url) -> {keyword: value bytes}, or None when libpq refuses the URL."""
+    err = ctypes.c_char_p()
+    res = lib.PQconninfoParse(os.fsencode(url), ctypes.byref(err))
+    if not res:
+        return None
+    out, i = {}, 0
+    while res[i].keyword:
+        if res[i].val is not None:
+            out[res[i].keyword.decode()] = res[i].val
+        i += 1
+    lib.PQconninfoFree(res)
+    return out
+
+
+def oracle_divergences(lib, psql_target, helper_error, url):
+    """Why a URL the helper ACCEPTS is not read the same way by libpq (empty list = parity holds)."""
+    try:
+        target, pw = psql_target(url)
+    except helper_error:
+        return []  # a refusal is never a parity break (the helper may be stricter)
+    orig, rew = libpq_options(lib, url), libpq_options(lib, target)
+    if orig is None:
+        return ["libpq refuses the original URL the helper accepted"]
+    if rew is None:
+        return ["libpq refuses the password-free argv URL"]
+    bad = []
+    rest_o = {k: v for k, v in orig.items() if k != "password"}
+    rest_r = {k: v for k, v in rew.items() if k != "password"}
+    if rest_o != rest_r:
+        bad.append("non-password options differ")
+    want = orig.get("password") or None
+    have = os.fsencode(pw) if pw else None
+    if want != have:
+        bad.append("PGPASSWORD differs from libpq's password")
+    if rew.get("password"):
+        bad.append("the argv URL still carries a password per libpq")
+    return bad
+
+
+ORACLE_URLS = (
+    "postgres://u:Fk3Pw0rd@h:5432/db?sslmode=require",
+    "postgres://:Fk3Pw0rd@/db?host=%2Fvar%2Frun",
+    "postgres://u:Fk3:Pw0rd@h/db",
+    "postgres://u:Fk3%40Pw0rd@h/db",
+    "postgres://u:Fk3%FFPw0rd@h/db",
+    "postgres://u:Fk3+Pw0rd@h/db",
+    "postgres://u:Fk3Pw0rd@[::1]:5432/db",
+    "postgres://u:Fk3Pw0rd@h1:5432,h2:5433/db",
+    "postgres://u@h/db?password=Fk3Pw0rd&application_name=a%26b",
+    "postgres://u@h/db?application_name=a&password=Fk3Pw0rd&",
+    "postgres://u:Fk3Pw0rd@h/db?password=Other9pw",
+    "postgres://u:Fk3Pw0rd@h/d%40b?connect_timeout=7",
+    "postgres://u:Fk3\x0bPw0rd@h/db",
+    "postgres://u:Fk3\x0cPw0rd@h/db",
+    "postgres://u:Fk3\x7fPw0rd@h/db",
+    "postgres://u:Fk3 Pw0rd@h/db",
+    "postgres://u@h/db?password=Fk3Pw0rd&sslmode=disable",
+    "postgres://u@h/db?password=Fk3%0D%0APw0rd",
+    "postgres://u@h/db?pass%77ord=Fk3Pw0rd",
+    "postgres://u@h/db?PASSWORD=Fk3Pw0rd",
+    "postgresql://u:Fk3Pw0rd@h/db",
+)
+
+ORACLE_FUZZ_PIECES = ("%", "%2", "%41", "%40", "%3A", "%2F", "%26", "%3D", "%00", "%FF", "%C0%AF", "%25", "%23",
+                      "@", ":", "/", "?", "&", "=", "#", "+", "[", "]", ",", " ", "\\", ";", "a", "Fk3", "Pw0", "9",
+                      "é", "＠", "／", "\x0b")
+ORACLE_FUZZ_KEYS = ("password", "%70assword", "Password", "sslmode", "%73slmode", "host", "hostaddr", "port", "user",
+                    "dbname", "options", "passfile", "ssl", "application_name", "x", "", "p%00")
+
+
+def oracle_fuzz_urls(seed, count):
+    rnd = random.Random(seed)
+    for _ in range(count):
+        pw = "Fk3" + "".join(rnd.choice(ORACLE_FUZZ_PIECES) for _ in range(rnd.randint(0, 5)))
+        user = "".join(rnd.choice(ORACLE_FUZZ_PIECES) for _ in range(rnd.randint(0, 3)))
+        host = rnd.choice(["h", "h:5432", "", "h1,h2", "[::1]", "%2Fs", "h" + rnd.choice(ORACLE_FUZZ_PIECES)])
+        path = rnd.choice(["/db", "", "/", "/d" + rnd.choice(ORACLE_FUZZ_PIECES) + "b"])
+        segs = [rnd.choice(ORACLE_FUZZ_KEYS) + rnd.choice(["=", "=", "==", ""]) +
+                "".join(rnd.choice(ORACLE_FUZZ_PIECES) for _ in range(rnd.randint(0, 3)))
+                for _ in range(rnd.randint(0, 3))]
+        if rnd.random() < 0.5:
+            segs.append("password=" + pw)
+        userinfo = rnd.choice([f"{user}:{pw}@", f"{user}@", "", f":{pw}@"])
+        yield (rnd.choice(["postgres://", "postgresql://"]) + userinfo + host + path +
+               ("?" + "&".join(segs) if segs or rnd.random() < 0.1 else ""))
+
+
+class LibpqOracleTests(unittest.TestCase):
+    """#6347: a URL the helper accepts is read the same way by libpq (checked against the real libpq)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.lib = load_libpq()
+        if cls.lib is None:
+            raise unittest.SkipTest("no libpq with PQconninfoParse on this host")
+        cls.mod = load_module()
+
+    def divergences(self, urls):
+        found = []
+        for url in urls:
+            for why in oracle_divergences(self.lib, self.mod.psql_target, self.mod.HelperError, url):
+                found.append(f"{why}: {url!r}")
+        return found
+
+    def test_hostile_table_has_parity_with_libpq(self):
+        self.assertEqual(self.divergences(ORACLE_URLS), [])
+
+    def test_seeded_fuzz_has_parity_with_libpq(self):
+        for seed in (6161, 90210):
+            with self.subTest(seed=seed):
+                self.assertEqual(self.divergences(oracle_fuzz_urls(seed, 1500)), [])
+
+    def test_oracle_accepts_urls_and_is_not_vacuous(self):
+        accepted = 0
+        for url in ORACLE_URLS:
+            try:
+                self.mod.psql_target(url)
+            except self.mod.HelperError:
+                continue
+            accepted += 1
+        self.assertGreaterEqual(accepted, 15, "the oracle table must exercise accepted URLs")
+
+    def test_fuzz_exercises_accepted_urls(self):
+        accepted = 0
+        for url in oracle_fuzz_urls(6161, 1500):
+            try:
+                self.mod.psql_target(url)
+                accepted += 1
+            except self.mod.HelperError:
+                continue
+        self.assertGreaterEqual(accepted, 100, "the fuzz must reach accepted URLs, not only refusals")
+
+    def test_docstring_names_the_oracle_that_pins_the_claim(self):
+        doc = " ".join(self.mod.__doc__.split())
+        self.assertTrue("LibpqOracleTests" in doc, "the parity claim must name the test class that pins it")
+
+    def test_oracle_detects_a_password_left_on_argv(self):
+        def leaky(url):
+            return url, "Fk3Pw0rd"
+        self.assertTrue(oracle_divergences(self.lib, leaky, self.mod.HelperError,
+                                           "postgres://u:Fk3Pw0rd@h/db"))
+
+    def test_oracle_detects_a_wrong_password(self):
+        real = self.mod.psql_target
+
+        def wrong(url):
+            target, _ = real(url)
+            return target, "not-the-password"
+        self.assertTrue(oracle_divergences(self.lib, wrong, self.mod.HelperError,
+                                           "postgres://u:Fk3Pw0rd@h/db"))
+
+    def test_oracle_detects_a_dropped_option(self):
+        def drops(url):
+            return "postgres://u@h/db", None
+        self.assertTrue(oracle_divergences(self.lib, drops, self.mod.HelperError,
+                                           "postgres://u@h/db?application_name=a"))
 
 
 if __name__ == "__main__":
