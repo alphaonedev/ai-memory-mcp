@@ -2844,6 +2844,9 @@ def _ws_format_cells(t):
     _ws_format_cell(t, "tr-s-ws-nine-unit", nine, (
         "lines 2, 3, 4, 5, 6, 7, 8, 9, +1 more (9 in this file)",
         "U+2005, +1 more)"))
+    # #6763: the per-file count is lines, not code points.
+    _ws_format_cell(t, "tr-s-ws-count", "name: u\n# a b\n# c d\n",
+                    ("lines 2, 3 (2 in this file)", "(U+00A0)"))
 
 
 def _ws_wording_cells(t):
