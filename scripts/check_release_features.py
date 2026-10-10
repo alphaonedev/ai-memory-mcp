@@ -4648,27 +4648,53 @@ def proof_runtime(root: Path, base: Path) -> int:
     return failures
 
 
-def condition_anchor_failures() -> int:
+def condition_anchor_failures(src: str, table: Tuple[Tuple[str, str, str], ...]) -> List[str]:
     """#6280: a condition-mutant anchor that occurs more than once above CONDITION_MARKER is never applied
     (the sweep reports it as a survivor only after a full run); refuse it here, in seconds. No replacement
-    may contain an anchor, so a mutant applied by the sweep can never trip this check by itself."""
-    src = Path(__file__).read_text(encoding="utf-8")
+    may contain an anchor, so a mutant applied by the sweep can never trip this check by itself.
+    #6954: takes the source and table as arguments so the self-test can pin both refusals on fixtures."""
     head = src[: src.index(CONDITION_MARKER + "\n")]
-    failures = 0
-    for desc, old, new in CONDITION_MUTANTS:
+    out: List[str] = []
+    for desc, old, new in table:
         if head.count(old) > 1:
-            print(f"self-test FAIL: condition-mutant anchor for '{desc}' occurs {head.count(old)} times above "
-                  "the marker; it must occur once (#6280)", file=sys.stderr)
-            failures += 1
-        clash = [d for d, o, _ in CONDITION_MUTANTS if o in new]
+            out.append(f"condition-mutant anchor for '{desc}' occurs {head.count(old)} times above "
+                       "the marker; it must occur once (#6280)")
+        clash = [d for d, o, _ in table if o in new]
         if clash:
-            print(f"self-test FAIL: replacement of '{desc}' contains the anchor of {clash} (#6280)", file=sys.stderr)
+            out.append(f"replacement of '{desc}' contains the anchor of {clash} (#6280)")
+    return out
+
+
+def condition_anchor_fixture_failures() -> int:
+    """#6954: the fast anchor check refuses a duplicated anchor and a replacement holding another anchor,
+    and accepts a clean table (fixture tokens are not live anchors, so the live check stays exact-once)."""
+    tail = CONDITION_MARKER + "\n"
+    fixtures = [
+        ("duplicate anchor", "x = ALPHA_6954\ny = ALPHA_6954\n" + tail, (("dup", "ALPHA_6954", "GAMMA_6954"),), 1),
+        ("replacement holds another anchor", "ALPHA_6954\nBETA_6954\n" + tail,
+         (("a", "ALPHA_6954", "BETA_6954 + 1"), ("b", "BETA_6954", "DELTA_6954")), 1),
+        ("clean table", "ALPHA_6954\nBETA_6954\n" + tail,
+         (("a", "ALPHA_6954", "GAMMA_6954"), ("b", "BETA_6954", "DELTA_6954")), 0),
+    ]
+    failures = 0
+    for name, src, table, want in fixtures:
+        got = len(condition_anchor_failures(src, table))
+        if got != want:
+            print(f"self-test FAIL: condition anchor fixture '{name}' gave {got} refusals, want {want} (#6954)",
+                  file=sys.stderr)
             failures += 1
     return failures
 
 
+def live_condition_anchor_failures() -> int:
+    msgs = condition_anchor_failures(Path(__file__).read_text(encoding="utf-8"), CONDITION_MUTANTS)
+    for msg in msgs:
+        print(f"self-test FAIL: {msg}", file=sys.stderr)
+    return len(msgs)
+
+
 def self_test(root: Path) -> int:
-    failures = unit_checks() + condition_anchor_failures()
+    failures = unit_checks() + live_condition_anchor_failures() + condition_anchor_fixture_failures()
     missing = [rel for rel in INPUT_FILES if not (root / rel).is_file()]
     if missing:
         print(f"check_release_features: self-test FAIL: missing inputs under {root}: {', '.join(missing)}", file=sys.stderr)
