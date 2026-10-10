@@ -66,7 +66,7 @@ def test_clients_ci_has_a_job_that_runs_the_live_tests_6746() -> None:
     assert re.search(r"python -m pip install -e \"\.\[dev\]\"", body), (
         "the live job does not install sdk/python[dev]"
     )
-    run = re.search(r"python (?:\.\./\.\./)?scripts/sdk-python-live\.py[^\n]*", body)
+    run = re.search(r"python (?:-I )?(?:\.\./\.\./)?scripts/sdk-python-live\.py[^\n]*", body)
     assert run is not None, "the live job does not run scripts/sdk-python-live.py (#6746)"
     assert "--binary" in run.group(0) and "--sdk" in run.group(0), run.group(0)
 
