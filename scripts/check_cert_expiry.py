@@ -3060,6 +3060,19 @@ def _wrap_cells(t, fx, repo, base):
          {"src/wrap_a.rs": "macro_rules! gone {\n    ($($t:tt)*) => {};\n}\nr#gone! {\n" + a_line + "}\n"}),
         ("wrap-raw-panic", "early exit", "`r#panic!()` before the line",
          {"src/wrap_d.rs": around(d_text, d_set, "    r#panic!();\n")}),
+        # #6842: a diverging expression anywhere in a statement it always evaluates
+        ("wrap-adv-underscore-assign-return", "early exit", "`_ = return;` before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    _ = return;\n")}),
+        ("wrap-adv-paren-return", "early exit", "`(return);` before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    (return);\n")}),
+        ("wrap-adv-return-in-call", "early exit", "`drop(return);` before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    drop(return);\n")}),
+        ("wrap-return-first-arg", "early exit", "`return` as the first of two call arguments before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    let _ = max(return, 1);\n")}),
+        ("wrap-break-in-loop-call", "early exit", "`drop(break);` in a loop body before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    loop {\n        drop(break);\n", "    }\n")}),
+        ("wrap-panic-in-call", "early exit", "`drop(panic!());` before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    drop(panic!());\n")}),
     ]
     for label, reason, desc, edits in reds:
         fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
@@ -3177,6 +3190,13 @@ def _wrap_cells(t, fx, repo, base):
          {"src/wrap_d.rs": 'use serde::Serialize;\n#[serde(rename = "k")]\n' + d_text}),
         ("wrap-ctl-raw-mod-decl", "`pub mod r#wrapmod;` declares the same module as `pub mod wrapmod;`",
          {"src/lib.rs": "pub mod r#wrapmod;\npub mod wrappc;\n"}),
+        ("wrap-ctl-closure-return", "a `return` inside a closure body before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    let _f = |x: u32| return x;\n")}),
+        ("wrap-ctl-shortcircuit-return", "a `return` on the right of `||` before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, '    let _ = k.is_empty() || return "";\n')}),
+        ("wrap-ctl-match-arm-return", "a `return` in one match arm before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, '    match k.len() {\n        0 => return "",\n'
+                                  "        _ => {}\n    }\n")}),
     ]
     for label, desc, edits in controls:
         fx.g("checkout", "-q", "-B", f"wv-{label}", w0)
@@ -3356,6 +3376,7 @@ SELF_TEST_OK = (
     "(wrap-adv-shebang-string, wrap-adv-shebang-block, wrap-bom-shebang, wrap-shebang-root-decl, wrap-shebang-comment-then-inner, each with -gate, #6839) a first line rustc strips as a shebang (after an optional BOM, in any file) cannot hide the attribute below it, and `#!`, a comment, then `[` stays an inner attribute; (wrap-ctl-shebang, wrap-ctl-shebang-quote) a shebang line, one ending in a quote included, is GREEN; "
     "(wrap-adv-alias-test-as-serde, wrap-adv-alias-test-as-async_trait, wrap-adv-alias-test-as-schemars, wrap-adv-alias-mod-tokio-main, wrap-adv-m02-alias-serde-cfg-arg, wrap-alias-derive, wrap-glob-alias-serde, wrap-alias-braced-schemars, wrap-tool-clippy-mod, wrap-tool-rustfmt-crate-self, each with -gate, #6840) an attribute name a `use`, a glob, a local `mod` or `extern crate self as` can rebind is a finding, and only names rustc refuses to rebind are inert; (wrap-ctl-attr-string-cfg, wrap-ctl-serde-path-import) `cfg` inside the string of an inert attribute and `use serde::X;` are GREEN; "
     "(wrap-adv-raw-ident-macro-swallow, wrap-raw-panic, each with -gate, #6841) the raw identifier form `r#name!` of a swallowing macro or an exit macro is the same construct; (wrap-ctl-raw-mod-decl) `mod r#name;` declares the module and is GREEN; "
+    "(wrap-adv-underscore-assign-return, wrap-adv-paren-return, wrap-adv-return-in-call, wrap-return-first-arg, wrap-break-in-loop-call, wrap-panic-in-call, each with -gate, #6842) a return, break, continue or exit macro anywhere a statement always evaluates is an early exit; (wrap-ctl-closure-return, wrap-ctl-shortcircuit-return, wrap-ctl-match-arm-return) one inside a closure, after `||` or in one match arm is GREEN; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
