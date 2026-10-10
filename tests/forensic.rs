@@ -9,6 +9,10 @@
 //! tests from `tests/forensic/bundle_test.rs` the same way
 //! `tests/transcripts.rs` mounts `tests/transcripts/replay_test.rs`.
 
+// #6122 — sqlite scratch files own their -wal/-shm side files.
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 #[path = "forensic/bundle_test.rs"]
 mod bundle_test;
 

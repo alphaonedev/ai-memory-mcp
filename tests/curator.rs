@@ -13,6 +13,10 @@
 //!   3-reflection acceptance, depth-cap refusal, chain across passes,
 //!   signature-verified `reflects_on` edges.
 
+// #6122 — sqlite scratch files own their -wal/-shm side files.
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 #[path = "curator/compaction_test.rs"]
 mod compaction_test;
 

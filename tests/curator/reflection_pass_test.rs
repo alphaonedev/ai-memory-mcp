@@ -33,6 +33,7 @@
 //!    (one per source). The `verify()` walk completes cleanly. Plus a
 //!    dry-run proposal test.
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::autonomy::AutonomyLlm;
 use ai_memory::curator::reflection_pass::{self, ReflectionPassConfig, run_reflection_pass};
 use ai_memory::db;
@@ -43,7 +44,6 @@ use anyhow::Result;
 use chrono::Utc;
 use std::path::Path;
 use std::sync::Mutex;
-use tempfile::NamedTempFile;
 
 /// Issue #1548 — `run_reflection_pass` now operates over the SAL
 /// `MemoryStore` trait. These acceptance tests open a `SqliteStore` at
@@ -141,8 +141,8 @@ fn make_observation(ns: &str, topic: &str, idx: usize) -> Memory {
 /// each (30 total), all in `namespace`. Each group's contents share
 /// strong Jaccard overlap; cross-group overlap is below the threshold.
 /// Returns the open DB path.
-fn seed_30_observations() -> NamedTempFile {
-    let tmp = NamedTempFile::new().expect("tempfile");
+fn seed_30_observations() -> SqliteTempFile {
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let conn = db::open(tmp.path()).expect("db::open");
 
     let topics = [
@@ -731,7 +731,7 @@ async fn run_pass_respects_enabled_gate_predicate() {
 /// pins the "≥3 members" criterion from the spec.
 #[tokio::test]
 async fn cluster_of_two_is_not_eligible_for_reflection() {
-    let tmp = NamedTempFile::new().unwrap();
+    let tmp = SqliteTempFile::new().unwrap();
     let conn = db::open(tmp.path()).unwrap();
     // Two observations only — same namespace, same topic.
     for i in 0..2 {
