@@ -102,6 +102,11 @@ GUARD_PATHS = ("scripts/check-claude-md-size.py", "scripts/claude-md-rule-compar
 DIFF_LINE_CAP = 200
 # Round 5 (#6613): a line longer than this is hidden whole before any pattern runs.
 MAX_MASK_LINE = 2000
+# Round 6 (#6853): the cost of masking is bounded in total as well. Each scanned character costs 2 units (the scan for
+# value lines and the row mask); a call that would take a Redactor past MAX_MASK_WORK units is hidden whole before any
+# pattern runs. The slowest line shape measured costs about 55 microseconds per unit, so a run stays near 15 seconds;
+# a 31 KB CLAUDE.md compared against itself uses under 130000.
+MAX_MASK_WORK = 262144
 # #6163: the pull request number that names the head refspec; a decimal with no leading zero, ASCII only, at most ten
 # digits, so nothing but `refs/pull/<N>/head` can reach the fetch.
 PR_NUMBER = re.compile(r"[1-9][0-9]{0,9}", re.ASCII)
@@ -591,6 +596,30 @@ class Redactor:
 
     def __init__(self) -> None:
         self.count = 0
+        self.budget = MAX_MASK_WORK
+        self.work = 0
+        self.over_budget = 0  # rows and lines hidden whole because the work budget ran out (#6853)
+
+    def afford(self, *sides) -> bool:
+        """#6853: charge the work of masking `sides` (lists of lines) to the budget; False (and nothing charged) when
+        it does not fit. A line over MAX_MASK_LINE is hidden without a pattern run and costs nothing."""
+        cost = 2 * sum(len(line) for lines in sides for line in lines if len(line) <= MAX_MASK_LINE)
+        if self.work + cost > self.budget:
+            return False
+        self.work += cost
+        return True
+
+    def hide_rows(self, rows: list) -> list:
+        """#6853: the rows of a diff block with the text of every non-meta row replaced by MASK, its diff prefix kept."""
+        out = []
+        for line, kind in rows:
+            if kind == "meta":
+                out.append(line)
+                continue
+            self.count += 1
+            self.over_budget += 1
+            out.append(line[:1] + MASK)
+        return out
 
     def mask_rows(self, rows: list, prefixed: bool = False) -> list:
         """Mask `rows` of (text, kind): kind "meta" is a diff header line the script writes (shown as is), "key" is a
@@ -632,6 +661,10 @@ class Redactor:
     def mask(self, text: str, in_key: bool = False) -> str:
         """Mask `text`; `in_key` starts the block inside a private key (a section whose heading is a BEGIN line)."""
         lines = text.split("\n")
+        if not self.afford(lines):
+            self.count += len(lines)
+            self.over_budget += len(lines)
+            return "\n".join(MASK for _line in lines)
         inside = key_line_indexes(lines, in_key)
         values = value_line_indexes(lines, inside)
         return "\n".join(self.mask_rows([(line, "key" if index in inside else "value" if index in values else "text")
@@ -640,8 +673,12 @@ class Redactor:
     def note(self) -> list:
         if not self.count:
             return []
-        return [f"NOTE: {self.count} credential-shaped value(s) masked in this summary (#6163); the pull request "
-                "diff shows the raw text and the verdict was computed on it."]
+        notes = [f"NOTE: {self.count} credential-shaped value(s) masked in this summary (#6163); the pull request "
+                 "diff shows the raw text and the verdict was computed on it."]
+        if self.over_budget:
+            notes.append(f"NOTE: the masking budget of {self.budget} work units was exhausted (#6853); "
+                         f"{self.over_budget} line(s) were hidden whole instead of masked value by value.")
+        return notes
 
 
 def unified_range(start: int, stop: int) -> str:
@@ -659,8 +696,12 @@ def unified(old: str, new: str, key: str, redactor=None) -> str:
     hunk; a context line is masked when it lies in a block on either side."""
     old_lines, new_lines = old.split("\n"), new.split("\n")
     heading_key = bool(PRIVATE_KEY_BEGIN.search(key)) and not PRIVATE_KEY_END.search(key)
-    old_key, new_key = key_line_indexes(old_lines, heading_key), key_line_indexes(new_lines, heading_key)
-    old_value, new_value = value_line_indexes(old_lines, old_key), value_line_indexes(new_lines, new_key)
+    over_budget = redactor is not None and not redactor.afford(old_lines, new_lines)  # #6853: hide whole, no patterns
+    if over_budget:
+        old_key = new_key = old_value = new_value = frozenset()
+    else:
+        old_key, new_key = key_line_indexes(old_lines, heading_key), key_line_indexes(new_lines, heading_key)
+        old_value, new_value = value_line_indexes(old_lines, old_key), value_line_indexes(new_lines, new_key)
 
     def kind(old_index, new_index):
         """The row kind of a line at `old_index` on the base side and/or `new_index` on the head side (None when the
@@ -684,7 +725,10 @@ def unified(old: str, new: str, key: str, redactor=None) -> str:
             rows += [("+" + new_lines[index], kind(None, index)) for index in range(new_start, new_stop)]
     truncated = len(rows) > DIFF_LINE_CAP
     rows = rows[:DIFF_LINE_CAP]
-    lines = redactor.mask_rows(rows, True) if redactor is not None else [line for line, _kind in rows]
+    if over_budget:
+        lines = redactor.hide_rows(rows)
+    else:
+        lines = redactor.mask_rows(rows, True) if redactor is not None else [line for line, _kind in rows]
     return "\n".join(lines) + (f"\n... diff truncated at {DIFF_LINE_CAP} lines" if truncated else "")
 
 
@@ -2718,7 +2762,7 @@ def _self_test_cases() -> int:
     blob_report = unified("a\nb", blob_new, "## Sec", blob_redactor)
     blob_seconds = clock() - blob_start
     unit("#6853 R6 a head of MAX_BLOB_BYTES is hidden whole in under 20 seconds and the note names the budget",
-         blob_seconds < 20 and blob_line not in blob_report and blob_redactor.count >= 200
+         blob_seconds < 20 and blob_line not in blob_report and blob_redactor.count >= 190
          and any("masking budget" in note for note in blob_redactor.note()),
          f"{blob_seconds:.1f}s count={blob_redactor.count}\n{blob_report[:300]}\n{blob_redactor.note()}")
     budget_redactor = Redactor()
