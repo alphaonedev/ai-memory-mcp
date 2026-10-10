@@ -191,6 +191,12 @@ jobs:
       - name: ruff
         working-directory: sdk/python
         run: python -m ruff check .
+      # #6662 — the formatter is gated too, on the ruff minor the dev extra
+      # pins (`ruff>=0.17,<0.18`): a new ruff style is a deliberate bump with
+      # its own reformat commit, never churn inside an unrelated diff.
+      - name: ruff format
+        working-directory: sdk/python
+        run: python -m ruff format --check .
       - name: mypy
         working-directory: sdk/python
         run: python -m mypy ai_memory
