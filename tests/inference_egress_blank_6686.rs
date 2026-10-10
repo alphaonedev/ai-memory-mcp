@@ -32,12 +32,15 @@ fn blank_inference_egress_value_fails_closed_to_deny_6686() {
             "#6686: a set-but-blank value ({blank:?}) must fail closed to Deny"
         );
     }
-    // Control: a padded explicit token is still honoured (trim stays).
-    // SAFETY: as above.
-    unsafe { std::env::set_var(ENV_INFERENCE_EGRESS, " allow ") };
-    assert_eq!(
-        resolve_inference_egress_mode(),
-        InferenceEgressMode::Allow,
-        "control: an explicit padded allow is still Allow"
-    );
+    // Controls: a padded or upper/mixed-case explicit token is still honoured
+    // (trim and ASCII case-folding stay; N13).
+    for ok in [" allow ", " ALLOW ", "Allow"] {
+        // SAFETY: as above.
+        unsafe { std::env::set_var(ENV_INFERENCE_EGRESS, ok) };
+        assert_eq!(
+            resolve_inference_egress_mode(),
+            InferenceEgressMode::Allow,
+            "control: the explicit token {ok:?} is still Allow"
+        );
+    }
 }
