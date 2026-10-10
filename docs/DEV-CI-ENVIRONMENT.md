@@ -194,7 +194,7 @@ exposed with it. The "Configure enterprise-fed tier" step enforces the floor bef
 printed) when the password is empty, shorter than 16 characters, equal to or contained in the user, host or database,
 or contains such a component of 8+ characters. The `user=`, `host=`, `hostaddr=` and `dbname=` query keys count as
 those components, and every other query value is checked the same way (#6640). Rotate a failing tier password, never relax the check. The AGE
-self-heal passes the database name to psql through `PGDATABASE`, so its argv carries no path component.
+self-heal passes the database name to psql through `PGDATABASE`, so its argv carries no path component. A tier URL that names no database is refused with exit 2 before any restore or psql call, and psql's environment is an allowlist: `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_*` and `TZ` from the caller, then the helper's own `PGPASSWORD`, `PGDATABASE` and `PGCONNECT_TIMEOUT`; no caller `PG*` variable reaches psql (redirect `PGHOST` `PGHOSTADDR` `PGPORT` `PGLOADBALANCEHOSTS`; transport `PGSSLMODE` `PGREQUIRESSL` `PGGSSENCMODE` `PGCHANNELBINDING` `PGSSLROOTCERT` `PGSSLCRL` `PGSSLNEGOTIATION` `PGREQUIREAUTH` `PGMINPROTOCOLVERSION` `PGMAXPROTOCOLVERSION`; credentials `PGUSER` `PGPASSWORD` `PGPASSFILE` `PGSSLCERT` `PGSSLKEY`; target `PGDATABASE` `PGOPTIONS` `PGTARGETSESSIONATTRS`) (#6676).
 
 **AGE self-heal (#6161).** The hand-built AGE 1.8.0 files originally lived inside
 Homebrew's `postgresql@18` share/lib trees, which `brew upgrade` relinks, dropping
