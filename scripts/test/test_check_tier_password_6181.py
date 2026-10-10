@@ -104,6 +104,23 @@ class TestCheckTierPassword6181(unittest.TestCase):
         r = self.run_check(f"postgres://u@h:5445/db?password={GOOD}")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
+    def test_query_keys_that_name_a_component_are_checked_6640(self):
+        # libpq reads user=, dbname=, hostaddr= (and every other key) from the query string; #6181 says the
+        # password may match NO URL component, so a password equal to or contained in any query value is refused
+        long_name = "ai_memory_test_ci_user_long"
+        for key, rule in (("user", "user"), ("dbname", "database"), ("hostaddr", "host"), ("host", "host"),
+                          ("application_name", "query"), ("options", "query"), ("%75ser", "user")):
+            with self.subTest(equal_to=key):
+                self.assert_refused(f"postgres://u:{long_name}@h:5445/db?{key}={long_name}", rule, [long_name])
+            with self.subTest(contained_in=key):
+                self.assert_refused(f"postgres://u:{long_name}@h:5445/db?sslmode=disable&{key}=x{long_name}y",
+                                    rule, [long_name])
+        # a long query value inside the password is refused too, and an unrelated query value still passes
+        self.assert_refused(f"postgres://u:Zx9{long_name}Qv4@h:5445/db?dbname={long_name}", "contains the database",
+                            [long_name])
+        r = self.run_check(f"postgres://u:{GOOD}@h:5445/db?user=ai_memory&dbname=ai_memory_test&sslmode=disable")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
     def test_no_value_is_ever_printed(self):
         user, db, pw = "tierroleXq93", "tierdbXq93zw", "tierpwXq93"
         for url in (f"postgres://{user}:{pw}@h:5445/{db}",  # short
