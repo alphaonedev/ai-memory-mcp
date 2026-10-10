@@ -1296,6 +1296,162 @@ def _run_findings(run_text: str) -> List[str]:
     return found
 
 
+# Committed files a self-hosted run step may execute without the guard reading them (#6477):
+# the prune script is pinned by its own tests (PruneScript6118) and never sets a cargo variable.
+SCRIPT_ALLOWLIST = frozenset({"scripts/ci/prune-runner-target.py"})
+SCRIPT_DEPTH = 3  # shell scripts are followed this many levels deep; a deeper chain is a finding
+SHELL_RUNNERS = frozenset({"bash", "sh", "dash", "zsh", "ksh", "source", "."})
+OTHER_RUNNERS = frozenset({"python", "python3", "node", "perl", "ruby", "pwsh", "make", "gmake", "just", "cmake",
+                           "npx", "ninja"})
+# npm runs a committed package.json script for these subcommands; `npm install -g x` stays clean (#6312 pin)
+NPM_SCRIPT_SUBCOMMANDS = frozenset({"run", "run-script", "exec", "test", "t", "start", "restart", "stop"})
+PREFIX_WORDS = frozenset({"exec", "time", "nohup", "env", "command", "builtin", "nice", "sudo"})
+SHELL_SHEBANG_RE = re.compile(r"#!\s*\S*/(?:env\s+)?(?:ba|da|z|k)?sh\b")
+ASSIGN_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _simple_command_units(units: List[Unit]) -> List[List[Unit]]:
+    """The words of each simple command, redirect targets and here-document lines left out."""
+    cmds: List[List[Unit]] = []
+    cur: List[Unit] = []
+    skip_target = False
+    for u in units:
+        if u.kind == "op":
+            if u.text in (">", ">>", "<"):
+                skip_target = True
+            elif u.text in (";", "&", "|", "(", ")", "{", "}", "\n"):
+                if cur:
+                    cmds.append(cur)
+                cur = []
+            continue
+        if u.kind != "word":
+            continue
+        if skip_target:
+            skip_target = False
+            continue
+        cur.append(u)
+    if cur:
+        cmds.append(cur)
+    return cmds
+
+
+def _script_ref(words: List[Unit]) -> Optional[Tuple[str, Unit]]:
+    """``(kind, word)`` when a simple command runs a file: kind ``shell`` (read it), ``other`` or ``exec``."""
+    i = 0
+    while i < len(words):
+        text = words[i].text
+        if ASSIGN_WORD_RE.match(text):
+            i += 1
+        elif text in PREFIX_WORDS:
+            if text == "command" and i + 1 < len(words) and words[i + 1].text.startswith("-v"):
+                return None
+            if text == "command" and i + 1 < len(words) and words[i + 1].text.startswith("-V"):
+                return None
+            i += 1
+            while i < len(words) and words[i].text.startswith("-") and words[0].text != "exec":
+                i += 1
+        else:
+            break
+    if i >= len(words):
+        return None
+    head = words[i]
+    rest = words[i + 1:]
+    if head.dynamic:
+        # a program named by a variable or substitution ("$PSQL", "$(...)") is not followed: the live
+        # workflows use such heads for psql / docker, and the run-body rules still read its arguments
+        return None
+    if head.text in SHELL_RUNNERS:
+        for w in rest:
+            if w.text in ("-c", "-s") or w.text.startswith("-") and "c" in w.text.lstrip("-") and head.text != ".":
+                return None  # inline code is part of the step text, read by _run_findings
+            if not w.text.startswith("-") or w.dynamic:
+                return ("shell", w)
+        return None  # the shell reads stdin (a here-document the step text already holds)
+    if head.text == "npm":
+        sub = [w for w in rest if not w.text.startswith("-")]
+        return ("other", head) if sub and (sub[0].dynamic or sub[0].text in NPM_SCRIPT_SUBCOMMANDS) else None
+    if head.text in OTHER_RUNNERS or os.path.basename(head.text) in OTHER_RUNNERS:
+        for w in rest:
+            if w.text in ("-c", "-e", "-") and head.text.startswith(("python", "node", "perl", "ruby")):
+                return None  # inline code / stdin: its text is part of the body the run-body rules read
+            if not w.text.startswith("-") or w.dynamic:
+                return ("other", w)
+        return ("other", head)
+    if "/" in head.text:
+        return ("exec", head)
+    return None
+
+
+_SCRIPT_CACHE: Dict[Tuple[str, str, int], List[str]] = {}  # findings of an on-disk script, by (path, text, depth)
+
+
+def _script_text(path: str, scripts: Optional[Dict[str, str]]) -> Optional[str]:
+    if scripts is not None and path in scripts:
+        return scripts[path]
+    full = ROOT / path
+    try:
+        return full.read_text(encoding="utf-8-sig") if full.is_file() else None
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _script_findings(text: str, scripts: Optional[Dict[str, str]] = None, depth: int = 0) -> List[str]:
+    """Findings for the committed files a run body executes (#6477).
+
+    A shell script (run with a shell, sourced, or executed with a shell shebang) is read with the run-body
+    rules, following the scripts it runs up to ``SCRIPT_DEPTH`` levels. Any other program file (python,
+    make, just, ...) can set any cargo variable, so it is a finding unless it is on ``SCRIPT_ALLOWLIST``.
+    ``scripts`` overlays file contents by repository path (tests and mutation drivers); a path that is
+    neither in it nor a file below the repository root is a finding.
+    """
+    found: List[str] = []
+    for words in _simple_command_units(_shell_units(text)):
+        ref = _script_ref(words)
+        if ref is None:
+            continue
+        kind, word = ref
+        if word.dynamic:
+            found.append("a script whose path is computed at run time (%s); the guard cannot read it" % word.text)
+            continue
+        path = os.path.normpath(word.text).replace(os.sep, "/") if word.text else word.text
+        if kind == "other" and word.text == words[-1].text and word.text in OTHER_RUNNERS:
+            path = word.text
+        if path in SCRIPT_ALLOWLIST:
+            continue
+        if path.startswith("/") or path.startswith("../") or path == "..":
+            found.append("%s, a file outside the repository the guard cannot read" % word.text)
+            continue
+        if kind == "other":
+            found.append("%s, a program the guard cannot read (it can set any cargo variable); add a reviewed "
+                         "file to SCRIPT_ALLOWLIST or run a shell script" % path)
+            continue
+        body = _script_text(path, scripts)
+        if body is None:
+            found.append("%s, which is not a readable file in the repository" % path)
+            continue
+        if kind == "exec" and not (path.endswith((".sh", ".bash")) or SHELL_SHEBANG_RE.match(body)):
+            found.append("%s, an executable that is not a shell script the guard can read" % path)
+            continue
+        if depth >= SCRIPT_DEPTH:
+            found.append("%s, nested more than %d scripts deep" % (path, SCRIPT_DEPTH))
+            continue
+        cache_key = (path, body, depth)
+        if scripts is None and cache_key in _SCRIPT_CACHE:
+            found.extend(_SCRIPT_CACHE[cache_key])
+            continue
+        start = len(found)
+        for spelled in _run_findings(body) + toml_debug_findings(body):
+            # a `cd` inside a script is not one: every .cargo/config below the repository root is judged
+            # wherever it sits (#6297), and a config the script writes is read by toml_debug_findings
+            if not spelled.startswith(("cd changes", "pushd changes")):
+                found.append("%s, which sets %s" % (path, spelled))
+        for spelled in _script_findings(body, scripts, depth + 1):
+            found.append("%s, which runs %s" % (path, spelled))
+        if scripts is None:
+            _SCRIPT_CACHE[cache_key] = found[start:]
+    return found
+
+
 def _level_spellings(text: str, flags_value: bool) -> List[str]:
     """Every debuginfo level other than off spelled in ``text`` as a rustc flag or cargo --config.
 
@@ -1351,7 +1507,8 @@ def _value_findings(key: str, value: str) -> List[str]:
     return found
 
 
-def _debug_overrides(where: str, effective: Dict[str, str], job: Job) -> List[str]:
+def _debug_overrides(where: str, effective: Dict[str, str], job: Job,
+                     scripts: Optional[Dict[str, str]] = None) -> List[str]:
     """Every place a self-hosted job sets a debuginfo level other than ``0``."""
     found: List[str] = []
     for key, value in sorted(effective.items()):
@@ -1391,10 +1548,12 @@ def _debug_overrides(where: str, effective: Dict[str, str], job: Job) -> List[st
             found.append("%s: R-DEBUG step %r run sets %s, want %r" % (where, label, spelled, DEBUG_LEVEL))
         for spelled in toml_debug_findings(step.run_text()):
             found.append("%s: R-DEBUG step %r writes a cargo config with %s, want %r" % (where, label, spelled, DEBUG_LEVEL))
+        for spelled in _script_findings(step.run_text(), scripts):
+            found.append("%s: R-DEBUG step %r runs %s, want %r" % (where, label, spelled, DEBUG_LEVEL))
     return found
 
 
-def violations(name: str, wf: Workflow, job: Job) -> List[str]:
+def violations(name: str, wf: Workflow, job: Job, scripts: Optional[Dict[str, str]] = None) -> List[str]:
     """Every R-DEBUG / R-PRUNE violation for one self-hosted job."""
     found: List[str] = []
     where = "%s job %s" % (name, job.job_id)
@@ -1404,7 +1563,7 @@ def violations(name: str, wf: Workflow, job: Job) -> List[str]:
         got = effective.get(key)
         if got != DEBUG_LEVEL:
             found.append("%s: R-DEBUG %s is %r, want %r" % (where, key, got, DEBUG_LEVEL))
-    found.extend(_debug_overrides(where, effective, job))
+    found.extend(_debug_overrides(where, effective, job, scripts))
     if wf.workdir:
         found.append("%s: R-DEBUG workflow defaults.run.working-directory moves cargo to another .cargo/config" % where)
     if wf.shell and wf.shell not in SHELL_ALLOWLIST:
@@ -1437,7 +1596,9 @@ def violations(name: str, wf: Workflow, job: Job) -> List[str]:
     return found
 
 
-def all_violations(workflows: Dict[str, str], repo_files: Optional[Dict[str, str]] = None) -> List[str]:
+def all_violations(workflows: Dict[str, str], repo_files: Optional[Dict[str, str]] = None,
+                   scripts: Optional[Dict[str, str]] = None) -> List[str]:
+    """Every violation; ``scripts`` overlays committed script contents by repository path (#6477)."""
     found: List[str] = []
     found.extend(repo_file_violations(load_repo_files() if repo_files is None else repo_files))
     try:
@@ -1450,7 +1611,7 @@ def all_violations(workflows: Dict[str, str], repo_files: Optional[Dict[str, str
     for extra in sorted(census - EXPECTED_SELF_HOSTED_JOBS):
         found.append("R-CENSUS unpinned self-hosted job %s/%s (add it to EXPECTED_SELF_HOSTED_JOBS)" % extra)
     for (name, _job_id), (wf, job) in sorted(jobs.items()):
-        found.extend(violations(name, wf, job))
+        found.extend(violations(name, wf, job, scripts))
     return found
 
 
@@ -2479,6 +2640,23 @@ class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
             ("command -v probe", "command -v python3 >/dev/null"),
             ("script named in an echo", "echo see {d}/build.sh"),
         ], False)
+
+
+    def test_6118_r7_6477_script_overlay_and_npm_scripts(self) -> None:
+        anchor = "      - name: " + PRUNE_STEP_NAME + "\n"
+        for label, run, overlay, want in (
+            ("overlay script sets RUSTFLAGS", "bash scripts/ci/x-6477.sh", {"scripts/ci/x-6477.sh": "export RUSTFLAGS=-g\n"}, True),
+            ("overlay script is clean", "bash scripts/ci/x-6477.sh", {"scripts/ci/x-6477.sh": "cargo test --no-run\n"}, False),
+            ("no overlay, no file", "bash scripts/ci/x-6477.sh", None, True),
+            ("npm run", "npm run build", None, True),
+            ("npx", "npx some-tool", None, True),
+            ("npm ci", "npm ci", None, False),
+        ):
+            with self.subTest(label):
+                files = dict(self.live)
+                files["ci.yml"] = _replace_once(self.ci, anchor, R7_PRE + "        run: %s\n" % run + anchor)
+                found = all_violations(files, None, overlay)
+                self.assertEqual(want, any("R-DEBUG" in v for v in found), (label, found))
 
 
 class PruneScript6118(unittest.TestCase):
