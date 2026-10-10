@@ -3895,6 +3895,26 @@ class PruneScript6118(unittest.TestCase):
             outs.setdefault(mod._escape(x), []).append(x)
         self.assertEqual([], [v for v in outs.values() if len(v) > 1])
 
+    # ---- #6299 residual: blank, combining and filler code points ----
+
+    def test_6118_r7_6299_blank_combining_and_filler_code_points_are_escaped(self) -> None:
+        mod = _load_prune()
+        cases = (
+            0x00A0, 0x1680, 0x2000, 0x2007, 0x200A, 0x202F, 0x205F, 0x3000,  # Zs other than space
+            0x0301, 0x0333, 0x20E3,  # Mn (combining marks)
+            0x20DD, 0x0488,  # Me (enclosing marks)
+            0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800,  # fillers and the blank braille pattern
+        )
+        for cp in cases:
+            with self.subTest(cp="U+%04X" % cp):
+                self.assertEqual("x\\u{%x}y" % cp, mod._escape("x%sy" % chr(cp)))
+
+    def test_6118_r7_6299_space_and_visible_letters_stay_raw(self) -> None:
+        mod = _load_prune()
+        for text in ("a b", "café", "日本", "naïve-ß"):
+            with self.subTest(text=text):
+                self.assertEqual(text, mod._escape(text))
+
 EXAMPLE_HASHED = "debug/examples/demo-0123456789abcdef"
 EXAMPLE_UPLIFT = "debug/examples/demo"
 # Bytes the default scope frees from examples/ (the uplift pair once, two .d)
