@@ -2024,6 +2024,11 @@ def self_test():
             else None if not any(r11_tail in p for p in workflow_pin_problems(r10_env(r)))
             else f"a problem echoes {r11_tail[:16]!r}..."))
 
+    # #6947 #6952: the kept key word of a refusal row is masked like any other echoed text.
+    check("#6947: a token-shaped key word of a refusal row is masked",
+          lambda: None if not re.search("gh" + "p_[A-Za-z0-9]", SUBSET.echo("gh" + "p_" + "Zq7" * 12 + ": x"))
+          else "echo reprints the body of a token-shaped key word")
+
     # #6945 #6949: an ``=`` keeps a key word only after an unquoted flag word with value text after it, so a
     # padded base64 row, a bare ``word=`` row and a quote-opened sequence item reprint no value text.
     r13_padded = "QUJD" * 9

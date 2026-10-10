@@ -596,6 +596,17 @@ class Round11EchoMask(unittest.TestCase):
         self.assertEqual(SUBSET.echo("NOTE:\t" + self.TAIL + " and more text past col 24"), repr("NOTE:\t<withheld 37 chars>"))
         # #6892: the row is split at its first separator, not a later one.
         self.assertEqual(SUBSET.echo("NOTE: " + self.TAIL + " x=1"), repr("NOTE: <withheld 15 chars>"))
+        # #6947 #6952: the kept key word passes through clip(), so a token-shaped key is masked and a long key is cut.
+        token = "gh" + "p_" + "Zq7" * 12
+        for row in (token + "=x", "  " + token + ": x", token + ": x"):
+            shown = SUBSET.echo(row)
+            self.assertIn("<masked>", shown, row)
+            self.assertIsNone(re.search("gh" + "p_[A-Za-z0-9]", shown), row)
+            self.assertNotIn("Zq7", shown, row)
+        for width in (300, 3000):
+            shown = SUBSET.echo("K" * width + ": x")
+            self.assertLessEqual(len(shown), SUBSET.ECHO_LIMIT + 5, width)
+            self.assertTrue(shown.endswith("...'"), (width, shown[-12:]))
 
     def test_a_row_without_a_separator_masks_a_token_before_it_is_cut_6880(self):
         """A token that starts at column 10 to 23 of a separator-less row is cut by the row limit, not by its end."""
