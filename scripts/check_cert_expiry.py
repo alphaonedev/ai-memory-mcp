@@ -2632,6 +2632,9 @@ def _wrap_cells(t, fx, repo, base):
          {"src/wrap_d.rs": around(files["src/wrap_d.rs"], d_set, "    todo!();\n")}),
         ("wrap-loop", "loop", "a loop with no break before the line",
          {"src/wrap_d.rs": around(files["src/wrap_d.rs"], d_set, "    loop {\n    }\n")}),
+        ("wrap-loop-inner-break", "loop", "a loop whose only break leaves an inner while, before the line",
+         {"src/wrap_d.rs": around(d_text, d_set, "    loop {\n        while k.is_empty() {\n"
+                                  "            break;\n        }\n    }\n")}),
         ("wrap-macro", "macro_rules", "the line inside a macro that nothing invokes",
          {"src/wrap_d.rs": "macro_rules! never_called {\n    () => {\n" + files["src/wrap_d.rs"] + "    };\n}\n"}),
         ("wrap-decl", "cfg(any())", "cfg(any()) on the parent's `mod child;` declaration",
@@ -2772,6 +2775,8 @@ def _wrap_cells(t, fx, repo, base):
         ("wrap-ctl-labelled-break", "a labelled break that leaves an outer loop before the line",
          {"src/wrap_d.rs": around(d_text, d_set, "    'outer: loop {\n        loop {\n"
                                   "            break 'outer;\n        }\n    }\n")}),
+        ("wrap-ctl-new-line-cfg", "a new identifier line the base never had, added inside #[cfg(test)]",
+         {"src/wrap_n.rs": f'#[cfg(test)]\nconst NEW_T: &str = "{kid}";\n'}),
         ("wrap-ctl-condreturn", "a conditional early return (inside an if) before the line is not an exit",
          {"src/wrap_d.rs": around(files["src/wrap_d.rs"], d_set, "    if k.is_empty() {\n        return \"\";\n    }\n")}),
         ("wrap-ctl-lexer", "char literals, a lifetime and an escaped quote in a string never unbalance the scan",
