@@ -137,10 +137,15 @@ fn the_2026_10_08_record_is_byte_identical_6127() {
         1,
         "#6127: the 2026-10-08 (#6116) record is present once in {CERT_DOC}"
     );
-    assert!(
-        doc.contains(OLD_RECORD),
+    // Anchored on both sides: the record sits between its predecessor's last line and the
+    // bare `>` separator before the correction, so an in-place edit cannot hide in a substring.
+    let anchored = format!("forbidden (#3899).\n>\n{OLD_RECORD}\n>\n> {NEW_HEAD}");
+    assert_eq!(
+        doc.matches(anchored.as_str()).count(),
+        1,
         "#6127: the amendment ledger is append-only (#6423): the 2026-10-08 (#6116) record \
-         must stay byte-for-byte as it was at 6025dd3cd; fix a mistake with a new dated record"
+         must stay byte-for-byte as it was at 6025dd3cd, between its neighbours; fix a \
+         mistake with a new dated record"
     );
 }
 
@@ -205,6 +210,7 @@ fn doc_comment_appears_only_for_the_mod_rs_retarget_6127() {
     for spelling in [
         "doc-comment",
         "doc comment",
+        "doccomment",
         "documentation comment",
         "documentation-comment",
         "inner doc",
