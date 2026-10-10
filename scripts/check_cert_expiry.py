@@ -110,7 +110,8 @@ block-comment copy as RED.
 CONTEXT CHECK (#6560): a guarded line can also be disabled while it stays
 byte-identical (nothing on it is edited), so each identifier-bearing line is
 scanned with a Rust tokenizer (line, nested block and doc comments, strings,
-raw strings, byte and C strings, chars, lifetimes; whitespace, a newline or a
+raw strings, byte and C strings, chars, lifetimes; whitespace (the Rust
+Pattern_White_Space set, U+200E and U+200F included, #6838), a newline or a
 comment between `#`, `!` and `[` of an attribute; an end-of-file string, raw string or
 block comment is a named ERROR) and the constructs that enclose it are
 recorded: an attribute on it or on any enclosing item or `mod` (cfg, cfg_attr,
@@ -416,7 +417,7 @@ _ATTR_ALWAYS_RE = re.compile(r"\bcfg(?:_attr)?\b|\bunreachable_code\b|^#!?\[\s*p
 # comment, a string, a raw string or a char literal can never be mistaken for
 # a bracket, and `#`, `!` and `[` of an attribute may be apart.
 _TOKEN_RE = re.compile(r"""
-    (?P<ws>\s+)
+    (?P<ws>[\t\n\x0b\x0c\r \x85\u200e\u200f\u2028\u2029]+)
   | (?P<line>//[^\n]*)
   | (?P<block>/\*)
   | (?P<raw>[bc]?r(?P<hashes>\#*)")
