@@ -48,7 +48,9 @@ On each peer host:
 docker compose -f packaging/docker-compose.postgres.yml up -d
 
 # ai-memory daemon with federation
-export AI_MEMORY_STORE_URL=postgres://ai_memory:ai_memory_test@localhost:5433/ai_memory_test
+psql postgres://ai_memory:ai_memory_test@localhost:5433/postgres \
+    -c 'CREATE DATABASE ai_memory_test_chaos'   # ephemeral db, never the shared base (#7031)
+export AI_MEMORY_STORE_URL=postgres://ai_memory:ai_memory_test@localhost:5433/ai_memory_test_chaos
 ai-memory serve \
     --host 0.0.0.0 --port 9077 \
     --tls-cert /etc/ai-memory/cert.pem \

@@ -1,18 +1,36 @@
 # Shared ai_memory_test references allowed at the baseline (#7031 H4).
-# Ratchet: an entry that no longer matches a hit makes the gate exit 2, so this
-# file may only shrink (docs/reference/CODE_STYLE.md:103-105).  Format:
-#   path[:line]   # citation
-tests/common/lane_db.rs   # the refusal predicate and its unit tests name the shared database on purpose
+# Ratchet: an entry that no longer matches a hit (or names a missing file) makes the gate exit 2,
+# so this file may only shrink (docs/reference/CODE_STYLE.md:103-105).  Line-pinned only:
+#   path:line   # citation
+.github/workflows/coverage.yml:484   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
+.github/workflows/coverage.yml:491   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
+.github/workflows/coverage.yml:505   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
+.github/workflows/coverage.yml:511   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
+.github/workflows/coverage.yml:512   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
+.github/workflows/coverage.yml:550   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
+.github/workflows/coverage.yml:551   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
+.github/workflows/coverage.yml:553   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
+tests/common/lane_db.rs:123   # refusal predicate cases (lane_database_predicate_cases_3777) name the shared database on purpose
+tests/common/lane_db.rs:127   # refusal predicate cases (lane_database_predicate_cases_3777) name the shared database on purpose
+tests/common/lane_db.rs:138   # refusal predicate cases (lane_database_predicate_cases_3777) name the shared database on purpose
+tests/common/lane_db.rs:152   # refusal predicate cases (lane_database_predicate_cases_3777) name the shared database on purpose
+tests/common/lane_db.rs:183   # refusal predicate cases (lane_database_predicate_cases_3777) name the shared database on purpose
+tests/common/lane_db.rs:187   # refusal predicate cases (lane_database_predicate_cases_3777) name the shared database on purpose
+tests/common/lane_db.rs:190   # refusal predicate cases (lane_database_predicate_cases_3777) name the shared database on purpose
+tests/export_import_false_success_2490.rs:78   # refusal probe constant (never connected); rename later
+tests/http_notify_caller_binding_3579.rs:347   # asserts the lane URL is NOT the shared database
 tests/pg_isolate_helper_6383.rs:81   # negative case: helper must refuse the shared name
 tests/pg_isolate_helper_6383.rs:417   # negative case: helper must refuse the shared name
-src/store/postgres_inbox_tests.rs:126   # classify_create_failure probe URLs (negative cases)
-src/store/postgres_inbox_tests.rs:127   # classify_create_failure probe URLs (negative cases)
-src/store/postgres_inbox_tests.rs:159   # port_of / classify_create_failure probe URLs (negative cases)
-src/store/postgres_inbox_tests.rs:161   # port_of / classify_create_failure probe URLs (negative cases)
-src/store/postgres/tx_retry.rs:464   # URL-redaction fixture string
-tests/export_import_false_success_2490.rs:78   # refusal probe constant (never connected); rename later
 tests/wake_hub_write_authority_3578.rs:635   # asserts the lane URL is NOT the shared database
-tests/http_notify_caller_binding_3579.rs:347   # asserts the lane URL is NOT the shared database
-packaging/docker-compose.postgres.yml   # dev compose, not a CI lane
-infra/lan-parity-test/docker-compose.yml   # LAN parity dev compose container database; burn down with the parity Pass 1 rework
-.github/workflows/coverage.yml   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
+infra/lan-parity-test/docker-compose.yml:87   # LAN parity dev compose container database (parity Pass 1 rework burns this down)
+infra/lan-parity-test/docker-compose.yml:99   # LAN parity dev compose container database (parity Pass 1 rework burns this down)
+infra/lan-parity-test/docker-compose.yml:161   # LAN parity dev compose container database (parity Pass 1 rework burns this down)
+infra/lan-parity-test/docker-compose.yml:253   # LAN parity dev compose container database (parity Pass 1 rework burns this down)
+infra/lan-parity-test/run-parity-tests.sh:68   # TEMP until #7031 lane A lands (fix/7031a-promo6-ssh-r2)
+src/store/postgres/tx_retry.rs:464   # URL-redaction fixture string
+src/store/postgres_inbox_tests.rs:126   # classify_create_failure / port_of probe URLs (negative cases)
+src/store/postgres_inbox_tests.rs:127   # classify_create_failure / port_of probe URLs (negative cases)
+src/store/postgres_inbox_tests.rs:159   # classify_create_failure / port_of probe URLs (negative cases)
+src/store/postgres_inbox_tests.rs:161   # classify_create_failure / port_of probe URLs (negative cases)
+packaging/docker-compose.postgres.yml:28   # dev compose fixture, not a CI lane
+packaging/docker-compose.postgres.yml:37   # dev compose fixture, not a CI lane
