@@ -23,6 +23,7 @@ import pathlib
 import shutil
 import ssl
 import subprocess
+import sys
 from collections.abc import Iterator
 from typing import Any, Callable
 
@@ -970,6 +971,88 @@ def test_backstop_refuses_when_the_session_trace_never_ran_6360(
     monkeypatch.setattr("ai_memory._common._with_trace", lambda _request, _trace: None)
     with pytest.raises(ValueError, match="verify=False"):
         _fetch(client_cls, wrong_name_origin.url, lab.client_context(), hook=_no_hostname_check)
+
+
+# ---- #6361: a refused session's stream is closed, once, before the raise ---
+
+
+class _CountingStream(_Stream):
+    """Counts close calls; optionally fails them the way a dead socket does."""
+
+    def __init__(self, session: object, *, fail: bool = False) -> None:
+        super().__init__(session)
+        self.closes = 0
+        self.fail = fail
+        self.closed_while_raising = False
+
+    def close(self) -> None:
+        self.closes += 1
+        # Closed by a handler or finally that runs after the refusal was raised?
+        self.closed_while_raising |= sys.exc_info()[0] is not None
+        if self.fail:
+            raise OSError("already closed")
+
+    async def aclose(self) -> None:
+        self.close()
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["clean-close", "close-raises"])
+@pytest.mark.parametrize(
+    ("event", "session"),
+    [
+        pytest.param(
+            "connection.start_tls.complete",
+            lambda context: _Session(context, host="elsewhere.lab"),
+            id="direct-wrong-name",
+        ),
+        pytest.param("connection.start_tls.complete", lambda _context: None, id="direct-none"),
+        pytest.param(
+            "proxy.start_tls.complete",
+            lambda _context: _Session(ssl.create_default_context()),
+            id="tunnel-foreign",
+        ),
+        pytest.param(
+            "socks.start_tls.complete",
+            lambda context: _Session(context, bits=0),
+            id="socks-no-bits",
+        ),
+    ],
+)
+def test_refused_session_stream_is_closed_once_before_the_raise_6361(
+    driver: tuple[_Driver, ssl.SSLContext],
+    event: str,
+    session: Callable[[ssl.SSLContext], object],
+    fail: bool,
+) -> None:
+    drive, context = driver
+    stream = _CountingStream(session(context), fail=fail)
+    with pytest.raises(ValueError, match="verify=False"):
+        drive.new_request()(event, {"return_value": stream})
+    assert stream.closes == 1
+    assert not stream.closed_while_raising
+
+
+def test_pending_proxy_leg_stream_is_closed_when_the_request_is_refused_6361(
+    driver: tuple[_Driver, ssl.SSLContext],
+) -> None:
+    drive, _ = driver
+    fire = drive.new_request()
+    leg = _CountingStream(_Session(ssl.create_default_context()))
+    fire("connection.start_tls.complete", {"return_value": leg})
+    assert leg.closes == 0  # a proxy leg is pending, not yet refused
+    with pytest.raises(ValueError, match="verify=False"):
+        fire("http11.send_request_headers.started", {"request": _get_request()})
+    assert leg.closes == 1
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_verified_session_stream_is_left_open_6361(is_async: bool) -> None:
+    context = ssl.create_default_context()
+    stream = _CountingStream(_Session(context))
+    _Driver(context, is_async=is_async).new_request()(
+        "connection.start_tls.complete", {"return_value": stream}
+    )
+    assert stream.closes == 0
 
 
 def test_lab_temp_root_is_project_local_6309(lab: Lab) -> None:
