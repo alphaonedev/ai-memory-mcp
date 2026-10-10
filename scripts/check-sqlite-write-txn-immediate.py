@@ -11,6 +11,9 @@ must open IMMEDIATE (or EXCLUSIVE).  The one sanctioned entry point is
 ``crate::storage::connection::WriteTxn::begin``.
 
 Rules (each has a mutant in ``--self-test``):
+  R0  the source cannot be read with certainty (an unterminated string or
+      comment, a ``cfg(test)`` module whose layout the indent cannot place):
+      fail closed instead of guessing (#6154).
   R1  ``.transaction()`` / ``unchecked_transaction()`` open DEFERRED.
   R2  ``transaction_with_behavior`` / ``Transaction::new_unchecked`` /
       ``TransactionBehavior::Deferred`` must not name Deferred.
@@ -25,17 +28,34 @@ Rules (each has a mutant in ``--self-test``):
   R6  ``.savepoint()`` / ``savepoint_with_name`` / a raw ``SAVEPOINT`` open a
       DEFERRED transaction when no transaction is open.
 
-SQL text rules (R3 literals, R6 literals) match string-literal contents in any
-case and in batches ("BEGIN; ...") and format strings ("BEGIN {m}"); they skip
-the Postgres adapter files (sqlx has its own transaction model).
+SQL text rules (R3 literals, R6 literals) read EVERY string literal of a SQLite
+source file, in any case, in batches ("BEGIN; ...") and format strings
+("BEGIN {m}"), whole (a multi-line literal is read to its closing quote, #6155),
+wherever it sits: a let / const / static value, a format!/String::from
+argument, a helper's return value, a match arm, a struct field, an argument of
+any call.  Only a literal that is an argument of a MESSAGE SINK is skipped
+(#6152, #6154): ``expect`` / ``expect_err`` / ``context`` / ``with_context``;
+the macros ``panic!`` ``assert*!`` ``debug_assert*!`` ``unreachable!``
+``todo!`` ``unimplemented!`` ``trace!/debug!/info!/warn!/error!``
+``print!/println!/eprint!/eprintln!`` ``anyhow!/bail!/ensure!``
+``params!/named_params!`` (``write!/writeln!`` are NOT sinks: they build SQL text); and ``format!`` / ``concat!`` when it is itself an
+argument of one of those.  A literal that reaches a block ``{..}``, an array
+or any other call before a sink is NOT a message and stays scanned.  Source
+text is lexed once per file (strings, raw strings, byte strings, char
+literals, nested block comments), so a quote anywhere cannot desynchronise a
+later line.  They skip the Postgres adapter files (sqlx has its own
+transaction model).
 
 Closed world: only sites in ``ALLOWLIST`` (file, enclosing fn) pass, and each
 carries a written reason.  A stale allowlist entry (no matching site) also
 fails, so the list cannot rot.  Test code is skipped only by cfg: ``tests/`` is
 not scanned; in ``src/`` a ``#[cfg(test)]`` / ``#[cfg(all(test, ..))]`` module
-block, an external ``mod x;`` under such a cfg (``#[path]`` honoured), and a
-file with ``#![cfg(test)]``.  No file is skipped by name and no file is cut
-short, so production code after a test module is scanned.
+block, an external ``mod x;`` under such a cfg or declared inside such a block
+(``#[path]`` honoured; #6152), and a file with ``#![cfg(test)]``.  A ``mod x;``
+inside such a block whose indentation does not place it inside the block (or
+any other ambiguous nesting) is reported as R0 instead of resolving a guessed
+path (#6154).  No file is skipped by name and no file is cut short, so
+production code after a test module is scanned.
 
 Known limit (R5): it reads SQL literals in the allowlisted fn body only; a
 write through a helper call or a caller-supplied closure is not seen.
@@ -43,8 +63,10 @@ write through a helper call or a caller-supplied closure is not seen.
 Python 3.9 stdlib only.  Exit 0 = clean, 1 = violation, 2 = usage error.
 """
 import argparse
+import bisect
 import re
 import sys
+from collections import namedtuple
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -66,7 +88,7 @@ RULES = [
     (
         "R1",
         re.compile(
-            r"\.transaction\s*\(\s*(?:\)|$)|unchecked_transaction\s*\(\s*(?:\)|$)"
+            r"\.transaction\s*\(\s*\)|unchecked_transaction\s*\(\s*\)"
             r"|::\s*(?:unchecked_)?transaction\s*\("
         ),
     ),
@@ -83,17 +105,17 @@ RULES = [
     ("R4", re.compile(r"WriteTxn::begin_deferred")),
     ("R6", re.compile(r"\.savepoint\s*\(\s*\)|\bsavepoint_with_name\s*\(")),
 ]
-# R3 on string-literal contents: a statement that starts with BEGIN and does not
-# name IMMEDIATE / EXCLUSIVE, in any case, including a batch "BEGIN; ...",
-# a format string "BEGIN {mode}" and a raw string.
+# R3 / R6 on the CONTENTS of string literals (SQLite files only), every literal
+# of the file (#6154): a statement that starts with BEGIN and does not name
+# IMMEDIATE / EXCLUSIVE, in any case, including a batch "BEGIN; ...", a format
+# string "BEGIN {mode}" and a raw string; a raw SAVEPOINT outside a transaction
+# opens DEFERRED.
 BEGIN_SQL = re.compile(
     r"(?:^|;)\s*BEGIN(?:\s+(?:DEFERRED|TRANSACTION))*\s*(?:;|$|\{)", re.IGNORECASE
 )
-# R6 on string-literal contents (SQLite files only): a raw SAVEPOINT outside a
-# transaction opens DEFERRED.
 SAVEPOINT_SQL = re.compile(r"(?:^|;)\s*SAVEPOINT\b", re.IGNORECASE)
 LIT_RULES = [("R3", BEGIN_SQL), ("R6", SAVEPOINT_SQL)]
-STRING_LIT = re.compile(r'r#*"(?:[^"]|"(?!#))*"#*|"(?:[^"\\]|\\.)*"')
+
 NONLITERAL_EXEC = re.compile(r"\.execute(?:_batch)?\s*\(\s*(?!\"|r#*\"|if\b)\S")
 WRITE_SQL = re.compile(r"\b(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|DROP|ALTER)\b", re.IGNORECASE)
 # A test-only cfg: cfg(test) or cfg(all(test, ...)).  cfg(any(test, ...)) also
@@ -102,50 +124,214 @@ TEST_CFG = re.compile(r"#\[cfg\(\s*(?:test|all\(\s*test\b[^\]]*)\s*\)\]")
 MOD_DECL = re.compile(r"^\s*(?:pub(?:\([a-z]+\))?\s+)?mod\s+(\w+)\s*([;{])")
 PATH_ATTR = re.compile(r'#\[path\s*=\s*"([^"]+)"\]')
 
+# --- message sinks (#6152, #6154) -------------------------------------------
+# A string literal is NOT scanned for SQL only when it is an argument of one of
+# these: it is a message or a bound value, never a statement.  Everything else
+# (let / const / static values, format!/String::from, helper returns, match
+# arms, struct fields, arrays, closures, any other call) stays scanned.
+SINK_METHODS = frozenset({"expect", "expect_err", "context", "with_context"})
+SINK_MACROS = frozenset(
+    {
+        "panic", "assert", "assert_eq", "assert_ne", "debug_assert",
+        "debug_assert_eq", "debug_assert_ne", "unreachable", "todo",
+        "unimplemented", "trace", "debug", "info", "warn", "error", "print",
+        "println", "eprint", "eprintln", "anyhow", "bail",
+        "ensure", "params", "named_params",
+    }
+)
+# format! / concat! only pass a literal on to whatever contains them.
+WRAP_MACROS = frozenset({"format", "format_args", "concat"})
+_CLOSERS = {")": "(", "]": "[", "}": "{"}
+_MACRO_BEFORE = re.compile(r"([A-Za-z_]\w*)\s*!$")
+_IDENT_BEFORE = re.compile(r"([A-Za-z_]\w*)$")
 
-CHAR_LIT = re.compile(r"'(?:[^'\\]|\\.[^']*)'")
+
+def _opener(masked, k, bracket):
+    """Verdict for the innermost enclosing bracket ``masked[k]``: True when it
+    is a message sink, False when the literal must be scanned, None when the
+    walk continues outward (a grouping paren, a tuple, a format!/concat!)."""
+    head = masked[max(0, k - 200) : k].rstrip()
+    macro = _MACRO_BEFORE.search(head)
+    if macro:
+        name = macro.group(1)
+        if name in SINK_MACROS:
+            return True
+        return None if name in WRAP_MACROS and bracket == "(" else False
+    if bracket != "(":
+        return False  # a block, struct body, array or index is a wall
+    ident = _IDENT_BEFORE.search(head)
+    if ident:
+        name = ident.group(1)
+        return name in SINK_METHODS and re.search(r"\.\s*" + name + r"$", head) is not None
+    if head and head[-1] in ")]}>":
+        return False  # a call on a computed value: unknown, scan
+    return None  # grouping / tuple paren
 
 
-def strip_comment(line):
-    """Drop a trailing ``//`` comment that is not inside a string literal
-    (plain ``"..."``, raw ``r#"..."#``) or a char literal (``'"'``)."""
-    out, i, n = [], 0, len(line)
-    while i < n:
-        if line[i] == "'":
-            ch = CHAR_LIT.match(line, i)
-            if ch:
-                out.append(ch.group(0))
-                i = ch.end()
-                continue
-        m = re.match(r'r(#*)"', line[i:]) if line[i] == "r" and (i == 0 or not (line[i - 1].isalnum() or line[i - 1] == "_")) else None
-        if m:
-            close = '"' + m.group(1)
-            j = line.find(close, i + len(m.group(0)))
-            j = n if j < 0 else j + len(close)
-            out.append(line[i:j])
-            i = j
-            continue
-        c = line[i]
-        if c == '"':
-            j, esc = i + 1, False
-            while j < n:
-                if esc:
-                    esc = False
-                elif line[j] == "\\":
-                    esc = True
-                elif line[j] == '"':
-                    break
-                j += 1
-            out.append(line[i : j + 1])
-            i = j + 1
-            continue
-        if line[i : i + 2] == "//":
+def message_sink(masked, pos):
+    """True when the literal that starts at ``masked[pos]`` is an argument of a
+    message sink.  Walk the enclosing brackets outwards; fail closed (False,
+    meaning "scan it") on a statement boundary, an unknown call or a mismatch."""
+    stack, k = [], pos - 1
+    while k >= 0:
+        c = masked[k]
+        if c in _CLOSERS:
+            stack.append(_CLOSERS[c])
+        elif c in "([{":
+            if stack:
+                if stack.pop() != c:
+                    return False
+            else:
+                verdict = _opener(masked, k, c)
+                if verdict is not None:
+                    return verdict
+        elif c == ";" and not stack:
+            return False
+        k -= 1
+    return False
+
+
+# --- lexer (#6154): one whole-file pass ---------------------------------------
+# Comments, string literals (plain, raw r#".."#, byte, c-string) and char
+# literals are lexed once per file, so a quote anywhere cannot desynchronise a
+# later line (the old 3-line window could).  ``masked`` is the source with
+# comments and char literals blanked and string bodies blanked (quotes kept),
+# same length and same newlines; ``lits`` holds every string literal whole.
+Lit = namedtuple("Lit", "line pos body raw")
+CHAR_LIT = re.compile(r"'(?:[^'\\\n]|\\(?:x[0-9A-Fa-f]{2}|u\{[0-9A-Fa-f_]+\}|[^xu\n]))'")
+_RAW_START = r'(?<![A-Za-z0-9_])(?:br|cr|r)(#*)"'
+_BLOCK = re.compile(r"/\*|\*/")
+_STR_END = re.compile(r'\\.|"', re.S)
+_ESC = re.compile(r"\\(\r?\n[ \t\r\n]*|[nrt0\\\"']|x[0-9A-Fa-f]{2})")
+_SIMPLE_ESC = {"n": "\n", "r": "\r", "t": "\t", "0": "\0", "\\": "\\", '"': '"', "'": "'"}
+
+
+def _build_token(raw=True):
+    parts = [r"//[^\n]*", r"/\*"] + ([_RAW_START] if raw else []) + ['"', "'"]
+    return re.compile("|".join("(?:%s)" % p for p in parts))
+
+
+TOKEN = _build_token()
+
+
+def _blank(s):
+    return re.sub(r"[^\n]", " ", s)
+
+
+def _blank_block(s):
+    return re.sub(r"[^\n]", " ", s)
+
+
+def _blank_lit(s):
+    return re.sub(r"[^\n]", " ", s)
+
+
+def unescape(body):
+    """The text a plain string literal denotes, for the escapes that matter to
+    SQL: ``\\n`` ``\\t`` ``\\"`` and a line-continuation backslash."""
+
+    def rep(m):
+        g = m.group(1)
+        if g[0] in "\r\n":
+            return ""
+        if g[0] == "x":
+            return chr(int(g[1:], 16))
+        return _SIMPLE_ESC[g]
+
+    return _ESC.sub(rep, body)
+
+
+def lex(text):
+    """(masked, literals, problems) for one source text."""
+    starts = [0] + [m.end() for m in re.finditer("\n", text)]
+
+    def line_of(off):
+        return bisect.bisect_right(starts, off)
+
+    out, lits, problems = [], [], []
+    pos = last = 0
+    while True:
+        m = TOKEN.search(text, pos)
+        if not m:
             break
-        out.append(c)
-        i += 1
-    return "".join(out)
+        t, s = m.group(0), m.start()
+        if t.startswith("//"):
+            out += [text[last:s], _blank(t)]
+            pos = last = m.end()
+        elif t == "/*":
+            depth, e = 1, m.end()
+            while depth:
+                b = _BLOCK.search(text, e)
+                if not b:
+                    problems.append((line_of(s), "unterminated block comment: fail closed"))
+                    e = len(text)
+                    break
+                depth += 1 if b.group(0) == "/*" else -1
+                e = b.end()
+            out += [text[last:s], _blank_block(text[s:e])]
+            pos = last = e
+        elif t == "'":
+            c = CHAR_LIT.match(text, s)
+            if c:
+                out += [text[last:s], _blank_lit(c.group(0))]
+                pos = last = c.end()
+            else:
+                pos = m.end()  # a lifetime or loop label
+        else:
+            raw = t != '"'
+            body_start = m.end()
+            if raw:
+                close = '"' + "#" * t.count("#")
+                j = text.find(close, body_start)
+                body_end, end = (j, j + len(close)) if j >= 0 else (len(text), len(text))
+                closed = j >= 0
+            else:
+                close, e, closed = '"', body_start, False
+                while True:
+                    q = _STR_END.search(text, e)
+                    if not q:
+                        break
+                    e = q.end()
+                    if q.group(0) == '"':
+                        closed = True
+                        break
+                body_end, end = (e - 1, e) if closed else (len(text), len(text))
+            if not closed:
+                problems.append((line_of(s), "unterminated string literal: fail closed"))
+            body = text[body_start:body_end]
+            out += [text[last:body_start], _blank_lit(body), close if closed else ""]
+            lits.append(Lit(line_of(s), s, body, raw))
+            pos = last = end
+    out.append(text[last:])
+    return "".join(out), lits, problems
 
 
+class Src:
+    """One lexed source file."""
+
+    def __init__(self, text):
+        self.text = text
+        self.masked, self.lits, self.problems = lex(text)
+        self.starts = [0] + [m.end() for m in re.finditer("\n", text)]
+        trim = 1 if text.endswith("\n") else 0
+        self.raw = text.split("\n")[: len(self.starts) - trim]
+        self.lines = self.masked.split("\n")[: len(self.starts) - trim]
+
+    def line_of(self, off):
+        return bisect.bisect_right(self.starts, off)
+
+    def fn_names(self):
+        """Enclosing fn name per line (masked, so a comment cannot name one)."""
+        cur, out = "?", []
+        for code in self.lines:
+            m = FN.search(code)
+            if m:
+                cur = m.group(1)
+            out.append(cur)
+        return out
+
+
+# --- cfg(test) regions ------------------------------------------------------
 def _child_dir(rel):
     """Directory that holds the child modules of the file ``rel``."""
     p = Path(rel)
@@ -154,17 +340,88 @@ def _child_dir(rel):
     return p.parent / p.stem
 
 
-def test_regions(rel, lines):
-    """(skip_line_numbers, external_test_files, unterminated_lines) for one file.
+def block_balanced(lines, j, k):
+    """True when the braces of ``lines[j..k]`` balance, i.e. the closing brace
+    found by indent really closes the module opened on line ``j``."""
+    return sum(l.count("{") for l in lines[j : k + 1]) == sum(l.count("}") for l in lines[j : k + 1])
+
+
+def mod_inside(stack):
+    """True when the indent of a ``mod x;`` places it inside the test block."""
+    return bool(stack)
+
+
+def _nested_ext(rel, lines, raw, j, k, name):
+    """(external files, problems) of ``mod x;`` declared inside the cfg(test)
+    block ``lines[j..k]`` (#6152).  A module nested in ``mod a { mod b; }`` lives
+    at ``<child dir of rel>/a/b.rs`` or ``.../a/b/mod.rs``; ``#[path]`` is
+    relative to that directory.  Blocks are tracked by rustfmt indent; a layout
+    the indent cannot place with certainty is a problem, never a guessed path
+    (#6154)."""
+    found, problems = set(), []
+    if not block_balanced(lines, j, k):
+        problems.append(
+            (
+                j + 1,
+                "cfg(test) module `%s`: braces do not balance at the indent of its "
+                "closing brace, nesting is ambiguous: fail closed" % name,
+            )
+        )
+        return found, problems
+    stack = [(len(lines[j]) - len(lines[j].lstrip(" ")), name)]
+    for idx in range(j + 1, k + 1):
+        line = lines[idx]
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        m = MOD_DECL.match(line)
+        if not m:
+            continue
+        if m.group(2) == "{":
+            if line.count("{") != line.count("}"):
+                stack.append((indent, m.group(1)))
+            continue
+        if not mod_inside(stack):
+            problems.append(
+                (
+                    idx + 1,
+                    "`mod %s;` sits inside the braces of cfg(test) module `%s` but its "
+                    "indentation places it outside: ambiguous layout, fail closed"
+                    % (m.group(1), name),
+                )
+            )
+            continue
+        base = _child_dir(rel).joinpath(*[n for _, n in stack])
+        path_attr = None
+        back = idx - 1
+        while back > j and lines[back].lstrip().startswith("#["):
+            pm = PATH_ATTR.search(raw[back])
+            if pm:
+                path_attr = pm.group(1)
+            back -= 1
+        if path_attr:
+            found.add((base / path_attr).as_posix())
+        else:
+            found.add((base / (m.group(1) + ".rs")).as_posix())
+            found.add((base / m.group(1) / "mod.rs").as_posix())
+    return found, problems
+
+
+def test_regions(rel, lines, raw):
+    """(skip_line_numbers, external_test_files, problems) for one file, from
+    its masked ``lines`` (``raw`` supplies ``#[path]`` values).
 
     A test-only cfg attribute (possibly followed by other attributes) applied
     to ``mod x { ... }`` skips that block up to its closing brace at the same
     indent (rustfmt layout); applied to ``mod x;`` it marks the external file.
-    A file-level ``#![cfg(test)]`` skips the whole file.
+    A file-level ``#![cfg(test)]`` skips the whole file.  Layout the indent
+    cannot resolve is reported in ``problems`` (R0).
     """
-    skip, ext, unterminated = set(), set(), []
+    skip, ext, problems = set(), set(), []
     if any(re.match(r"#!\[cfg\(\s*test\s*\)\]", l.strip()) for l in lines[:40]):
-        return set(range(1, len(lines) + 1)), ext, unterminated
+        return set(range(1, len(lines) + 1)), ext, problems
     i = 0
     while i < len(lines):
         if not TEST_CFG.search(lines[i]):
@@ -172,7 +429,7 @@ def test_regions(rel, lines):
             continue
         j, path_attr = i + 1, None
         while j < len(lines) and lines[j].lstrip().startswith("#["):
-            m = PATH_ATTR.search(lines[j])
+            m = PATH_ATTR.search(raw[j])
             if m:
                 path_attr = m.group(1)
             j += 1
@@ -192,9 +449,7 @@ def test_regions(rel, lines):
             continue
         indent = len(lines[j]) - len(lines[j].lstrip(" "))
         k = j
-        closed = False
-        if strip_comment(lines[j]).count("{") == strip_comment(lines[j]).count("}"):
-            closed = True  # one-line ``mod x { .. }``
+        closed = lines[j].count("{") == lines[j].count("}")  # one-line ``mod x { .. }``
         while not closed and k < len(lines):
             skip.add(k + 1)
             if k > j and lines[k].rstrip() == " " * indent + "}":
@@ -202,92 +457,84 @@ def test_regions(rel, lines):
                 break
             k += 1
         skip.add(j + 1)
+        if closed and k > j:
+            e, p = _nested_ext(rel, lines, raw, j, k, name)
+            ext |= e
+            problems += p
         if not closed:
             # Fail closed: never swallow the rest of the file silently.
-            unterminated.append(j + 1)
+            problems.append((j + 1, "unterminated cfg(test) module: fail closed"))
         for a in range(i, j):
             skip.add(a + 1)
         i = max(k, j) + 1
-    return skip, ext, unterminated
+    return skip, ext, problems
 
 
-def scan(files):
+def scan(files, srcs=None):
     """files: {rel_path: text}.  Returns sorted [(rel, line, fn, rule, text)].
 
     No file is skipped by name and no file is cut short: only test-only cfg
-    regions and test-only external modules are skipped.
+    regions and test-only external modules are skipped.  Every string literal
+    of a SQLite file is read, whole, unless it is a message-sink argument.
     """
+    if srcs is None:
+        srcs = {rel: Src(text) for rel, text in files.items()}
     regions, ext, hits = {}, set(), []
-    for rel, text in files.items():
-        sk, ex, bad = test_regions(rel, text.splitlines())
+    for rel, src in srcs.items():
+        sk, ex, bad = test_regions(rel, src.lines, src.raw)
         regions[rel] = sk
         ext |= ex
-        for n in bad:
-            hits.append((rel, n, "?", "R0", "unterminated cfg(test) module: fail closed"))
-    hits = list(hits)
-    for rel in sorted(files):
+        for n, msg in sorted(bad + src.problems):
+            hits.append((rel, n, "?", "R0", msg))
+    for rel in sorted(srcs):
         if rel in ext:
             continue
-        lines = files[rel].splitlines()
-        skip = regions[rel]
+        src, skip = srcs[rel], regions[rel]
+        fns = src.fn_names()
+        cands = {}  # line -> (priority, rule); one hit per line, rule order wins
+
+        def note(n, prio, rule):
+            if n not in skip and (n not in cands or prio < cands[n][0]):
+                cands[n] = (prio, rule)
+
+        for prio, (rule, rx) in enumerate(RULES):
+            for mm in rx.finditer(src.masked):
+                note(src.line_of(mm.start()), prio, rule)
         # SQL-text rules (R3 literal, R6 literal) apply to SQLite code only;
         # the Postgres adapter (sqlx) has its own transaction model.
-        sqlite_file = "postgres" not in rel
-        cur = "?"
-        for n, raw in enumerate(lines, 1):
-            if n in skip:
-                continue
-            code = strip_comment(raw)
-            if not code.strip() or code.lstrip().startswith("//"):
-                continue
-            m = FN.search(code)
-            if m:
-                cur = m.group(1)
-            rule_hit = None
-            # A call split across lines (rustfmt chains) still matches when it
-            # STARTS on this line: look 3 lines ahead, keep only starts here.
-            window = " ".join([code] + [strip_comment(l).strip() for l in lines[n : n + 2]])
-            for rule, rx in RULES:
-                mm = rx.search(window)
-                if mm and mm.start() < len(code):
-                    rule_hit = rule
-                    break
-            if rule_hit is None and sqlite_file:
-                bodies = [re.sub(r'^r#*"|"#*$|^"|"$', "", lit) for lit in STRING_LIT.findall(code)]
-                # A literal that opens here and closes on a later line (a
-                # multi-line SQL string): its first line is checked as text.
-                rest = STRING_LIT.sub("", code)
-                opened = re.search(r'r#*"|"', rest)
-                if opened:
-                    bodies.append(rest[opened.end():])
-                for body in bodies:
-                    rule_hit = next((r for r, rx in LIT_RULES if rx.search(body)), None)
-                    if rule_hit:
+        if "postgres" not in rel:
+            for lit in src.lits:
+                if lit.line in skip or message_sink(src.masked, lit.pos):
+                    continue
+                body = lit.body if lit.raw else unescape(lit.body)
+                for off, (rule, rx) in enumerate(LIT_RULES):
+                    if rx.search(body):
+                        note(lit.line, len(RULES) + off, rule)
                         break
-            if rule_hit:
-                hits.append((rel, n, cur, rule_hit, raw.strip()))
-    return hits
+        for n in sorted(cands):
+            hits.append((rel, n, fns[n - 1], cands[n][1], src.raw[n - 1].strip()))
+    return sorted(hits, key=lambda h: (h[0], h[1], h[3]))
 
 
-def fn_body(text, name):
-    """Lines of ``fn name`` up to its closing brace at the same indent."""
-    lines = text.splitlines()
-    for i, raw in enumerate(lines):
-        m = re.search(r"\bfn\s+" + re.escape(name) + r"\b", strip_comment(raw))
-        if not m:
+def fn_span(lines, name):
+    """(first, last) line indexes of ``fn name`` up to its closing brace at the
+    same indent, or None."""
+    for i, code in enumerate(lines):
+        if not re.search(r"\bfn\s+" + re.escape(name) + r"\b", code):
             continue
-        indent = len(raw) - len(raw.lstrip(" "))
-        out = [raw]
-        for nxt in lines[i + 1 :]:
-            out.append(nxt)
-            if nxt.rstrip() == " " * indent + "}":
-                break
-        return out
-    return []
+        if "{" in code and code.count("{") == code.count("}"):
+            return i, i
+        indent = len(code) - len(code.lstrip(" "))
+        for j in range(i + 1, len(lines)):
+            if lines[j].rstrip() == " " * indent + "}":
+                return i, j
+        return i, len(lines) - 1
+    return None
 
 
 def evaluate(files, allowlist):
-    hits = scan(files)
+    srcs = {rel: Src(text) for rel, text in files.items()}
+    hits = scan(files, srcs)
     used, bad = set(), []
     for rel, n, fn, rule, text in hits:
         key = (rel, fn)
@@ -296,19 +543,26 @@ def evaluate(files, allowlist):
         else:
             bad.append((rel, n, fn, rule, text))
     for rel, fn in sorted(used):
-        defs = [l for l in files[rel].splitlines()
-                if re.search(r"\bfn\s+" + re.escape(fn) + r"\b", strip_comment(l))]
+        src = srcs[rel]
+        defs = [l for l in src.lines if re.search(r"\bfn\s+" + re.escape(fn) + r"\b", l)]
         if len(defs) != 1:
             bad.append((rel, 0, fn, "R5", "allowlisted fn name defined %d times in file" % len(defs)))
-        for raw in fn_body(files[rel], fn):
-            code = strip_comment(raw)
+        span = fn_span(src.lines, fn)
+        if span is None:
+            continue
+        a, b = span
+        rows = set()
+        for idx in range(a, b + 1):
             # SQL passed by name (a const or variable) cannot be proven read-only.
-            if NONLITERAL_EXEC.search(code):
-                bad.append((rel, 0, fn, "R5", raw.strip()))
-                continue
-            # Only SQL text: look inside string literals, ignore identifiers.
-            if any(WRITE_SQL.search(lit) for lit in re.findall(r'"(?:[^"\\]|\\.)*"', code)):
-                bad.append((rel, 0, fn, "R5", raw.strip()))
+            if NONLITERAL_EXEC.search(src.lines[idx]):
+                rows.add(idx + 1)
+        for lit in src.lits:
+            if a + 1 <= lit.line <= b + 1:
+                body = lit.body if lit.raw else unescape(lit.body)
+                if WRITE_SQL.search(body):
+                    rows.add(lit.line)
+        for n in sorted(rows):
+            bad.append((rel, 0, fn, "R5", src.raw[n - 1].strip()))
     stale = sorted(k for k in allowlist if k not in used)
     return bad, stale, len(hits)
 
@@ -320,8 +574,10 @@ def load_tree(root):
     return files
 
 
-def self_test():
-    """Red/green probes plus one mutant per rule."""
+def _probes():
+    """Run every red/green probe against the current engine.
+
+    Returns (failures, counts)."""
     allow = {("src/ok.rs", "ro"): "probe"}
 
     def run(text, name="src/x.rs"):
@@ -493,6 +749,251 @@ def self_test():
     for name in ("src/identity/attest.rs", "src/storage/model_attest.rs", "src/peer_attestation.rs"):
         bad, _, _ = run("fn f(c: &Connection) {\n c.unchecked_transaction();\n}\n", name)
         expect("red:" + name + " is scanned", len(bad) == 1)
+    # --- #6152: the BEGIN literal rule reads SQL argument positions only ---
+    for label, text in (
+        ("expect(\"begin\")", 'fn f(c: &Connection) {\n let t = WriteTxn::begin(c).expect("begin");\n}\n'),
+        ("expect(\"BEGIN\")", 'fn f(c: &Connection) {\n let t = WriteTxn::begin(c).expect("BEGIN");\n}\n'),
+        ("expect(\"begin a ..\")", 'fn f(c: &Connection) {\n let t = WriteTxn::begin(c).expect("begin a write txn");\n}\n'),
+        ("panic message", 'fn f() {\n panic!("begin");\n}\n'),
+        ("assert message", 'fn f(a: u8) {\n assert_eq!(a, 1, "begin");\n}\n'),
+        ("split expect", 'fn f(c: &Connection) {\n let t = WriteTxn::begin(c)\n .expect(\n "begin",\n );\n}\n'),
+        ("param value", 'fn f(c: &Connection) {\n c.execute("INSERT INTO t(a) VALUES (?1)", params!["begin"])?;\n}\n'),
+    ):
+        bad, _, _ = run(text)
+        expect("green:#6152 message literal is not SQL: " + label, not bad)
+    for label, text in (
+        ("prepare", 'fn f(c: &Connection) {\n let s = c.prepare("BEGIN")?;\n}\n'),
+        ("prepare_cached", 'fn f(c: &Connection) {\n let s = c.prepare_cached("BEGIN")?;\n}\n'),
+        ("query_row", 'fn f(c: &Connection) {\n c.query_row("BEGIN", [], |_| Ok(()))?;\n}\n'),
+        ("execute split line", 'fn f(c: &Connection) {\n c.execute(\n "BEGIN",\n [],\n )?;\n}\n'),
+        ("const item", 'const OPEN: &str = "BEGIN";\nfn f() {}\n'),
+        ("static item", 'static OPEN: &str = "BEGIN DEFERRED";\nfn f() {}\n'),
+        ("let binding", 'fn f(c: &Connection) {\n let sql = "BEGIN";\n c.execute_batch(sql)?;\n}\n'),
+    ):
+        bad, _, _ = run(text)
+        expect("red:#6152 SQL position still fires: " + label, len(bad) == 1 and bad[0][3] == "R3")
+    # --- #6152: `mod x;` declared inside a cfg(test) block is test code ---
+    # (src/daemon_runtime.rs declares escalate_under_write_lock_4116_tests so)
+    deferred = "fn t(c: &Connection) { c.unchecked_transaction(); }\n"
+    for label, files, flagged in (
+        (
+            "inline block in a non-mod.rs file",
+            {
+                "src/foo.rs": "#[cfg(test)]\nmod t {\n    mod inner;\n    fn h() {}\n}\nfn prod() {}\n",
+                "src/foo/t/inner.rs": deferred,
+            },
+            [],
+        ),
+        (
+            "inline block in a mod.rs file, <name>/mod.rs layout",
+            {
+                "src/m/mod.rs": "#[cfg(test)]\nmod t {\n    mod inner;\n}\n",
+                "src/m/t/inner/mod.rs": deferred,
+            },
+            [],
+        ),
+        (
+            "two levels of nesting",
+            {
+                "src/foo.rs": "#[cfg(test)]\nmod t {\n    mod u {\n        mod inner;\n    }\n}\n",
+                "src/foo/t/u/inner.rs": deferred,
+            },
+            [],
+        ),
+        (
+            "a sibling outside the test mod directory is still scanned",
+            {
+                "src/foo.rs": "#[cfg(test)]\nmod t {\n    mod inner;\n}\n",
+                "src/foo/t/inner.rs": deferred,
+                "src/foo/inner.rs": deferred,
+            },
+            ["src/foo/inner.rs"],
+        ),
+        (
+            "mod x; after the test block closes is not test code",
+            {
+                "src/foo.rs": "#[cfg(test)]\nmod t {\n    fn h() {}\n}\nmod inner;\n",
+                "src/foo/inner.rs": deferred,
+            },
+            ["src/foo/inner.rs"],
+        ),
+    ):
+        got = sorted({h[0] for h in scan(files)})
+        expect("red:#6152 nested mod in cfg(test): " + label, got == flagged)
+    # --- #6154 review R2 (F1): every literal is read; only message sinks skip ---
+    # Decision (single correct answer, fail closed; no vote): the base gate read
+    # every string literal, and the #6152 narrowing to SQL argument positions let
+    # DEFERRED statements escape.  Keep the base behaviour and exempt only
+    # literals that are arguments of message sinks.
+    f_open = "fn f(c: &Connection) -> Result<()> {\n%s\n    Ok(())\n}\n"
+    for label, text in (
+        ("let String::from", f_open % '    let sql = String::from("BEGIN");\n    c.execute_batch(&sql)?;'),
+        ("let to_string", f_open % '    let sql = "BEGIN".to_string();\n    c.execute_batch(&sql)?;'),
+        ("as_str chain", f_open % '    let sql = String::from("BEGIN");\n    c.execute_batch(sql.as_str())?;'),
+        ("helper fn returns literal", "fn open_sql() -> &'static str {\n    \"BEGIN\"\n}\n"),
+        ("helper fn one-line return", "fn open_sql() -> &'static str { \"BEGIN\" }\n"),
+        ("pub(crate) const", 'pub(crate) const OPEN: &str = "BEGIN";\n'),
+        ("pub(in path) const", 'pub(in crate::storage) const OPEN: &str = "BEGIN";\n'),
+        ("const wrapped by rustfmt", 'const OPEN_AND_LOG: &str =\n    "BEGIN";\n'),
+        ("let wrapped by rustfmt", f_open % '    let sql =\n        "BEGIN";\n    c.execute_batch(sql)?;'),
+        ("UFCS execute_batch", f_open % '    rusqlite::Connection::execute_batch(c, "BEGIN")?;'),
+        ("UFCS split", f_open % '    rusqlite::Connection::execute_batch(\n        c,\n        "BEGIN",\n    )?;'),
+        ("query_row_and_then", f_open % '    c.query_row_and_then("BEGIN", [], |_| Ok::<(), rusqlite::Error>(()))?;'),
+        ("prepare_with_flags", f_open % '    c.prepare_with_flags("BEGIN", PrepFlags::empty())?;'),
+        ("Batch::new", f_open % '    let mut b = rusqlite::Batch::new(c, "BEGIN");'),
+        ("helper wrapper arg", f_open % '    exec(c, "BEGIN")?;'),
+        ("if expr let", f_open % '    let sql = if ro { "BEGIN" } else { "BEGIN IMMEDIATE" };\n    c.execute_batch(sql)?;'),
+        (
+            "match arm",
+            f_open % '    let sql = match m {\n        Mode::Read => "BEGIN",\n        Mode::Write => "BEGIN IMMEDIATE",\n    };\n    c.execute_batch(sql)?;',
+        ),
+        ("reassign mut", f_open % '    let mut sql = "SELECT 1";\n    sql = "BEGIN";\n    c.execute_batch(sql)?;'),
+        ("struct field", f_open % '    let s = Stmt { sql: "BEGIN" };\n    c.execute_batch(s.sql)?;'),
+        ("array of statements", f_open % '    for s in ["BEGIN", "INSERT INTO t VALUES (1)"] {\n        c.execute(s, [])?;\n    }'),
+        ("format! in let", f_open % '    let sql = format!("BEGIN {}", mode);\n    c.execute_batch(&sql)?;'),
+        ("format! arg literal in execute_batch", f_open % '    c.execute_batch(&format!("{}", "BEGIN"))?;'),
+        ("closure return", f_open % '    let open = || "BEGIN";\n    c.execute_batch(open())?;'),
+        ("Some(literal)", f_open % '    let sql = Some("BEGIN");\n    c.execute_batch(sql.unwrap_or_default())?;'),
+        ("write! builds SQL", f_open % '    let mut sql = String::new();\n    write!(sql, "BEGIN")?;\n    c.execute_batch(&sql)?;'),
+        ("writeln! builds SQL", f_open % '    let mut sql = String::new();\n    writeln!(sql, "BEGIN;")?;\n    c.execute_batch(&sql)?;'),
+        ("write! to a writer", f_open % '    write!(f, "BEGIN")?;'),
+        ("writeln! to a writer", f_open % '    writeln!(f, "begin")?;'),
+        ("write! literal argument", f_open % '    let mut sql = String::new();\n    write!(sql, "{}", "BEGIN")?;\n    c.execute_batch(&sql)?;'),
+        ("String::from SAVEPOINT", f_open % '    let s = String::from("SAVEPOINT a");\n    c.execute_batch(&s)?;'),
+        ("plain fn named info (not a macro)", f_open % '    info(c, "BEGIN")?;'),
+        ("free fn named expect (not a method)", f_open % '    expect("BEGIN");'),
+        ("block inside assert!", f_open % '    assert!({ let s = "BEGIN"; c.execute_batch(s).is_ok() });'),
+        ("unknown call inside a sink", f_open % '    panic!("{}", exec(c, "BEGIN"));'),
+        ("let inside a closure passed to context", f_open % '    r.with_context(|| { let s = "BEGIN"; s })?;'),
+    ):
+        rule = "R6" if "SAVEPOINT" in text else "R3"
+        bad, _, _ = run(text)
+        expect("red:#6154 F1 literal escapes the SQL-position rule: " + label, [b[3] for b in bad] == [rule])
+    for label, text in (
+        ("expect", 'let t = WriteTxn::begin(c).expect("begin");'),
+        ("expect_err", 'let e = WriteTxn::begin(c).expect_err("BEGIN");'),
+        ("context", 'let t = WriteTxn::begin(c).context("BEGIN")?;'),
+        ("with_context", 'let t = WriteTxn::begin(c).with_context(|| format!("begin {}", n))?;'),
+        ("expect(&format!)", 'let t = WriteTxn::begin(c).expect(&format!("BEGIN {}", n));'),
+        ("panic!", 'panic!("BEGIN");'),
+        ("assert!", 'assert!(ok, "begin");'),
+        ("assert_eq!", 'assert_eq!(a, 1, "BEGIN");'),
+        ("assert_ne!", 'assert_ne!(a, 1, "begin;");'),
+        ("debug_assert!", 'debug_assert!(ok, "begin");'),
+        ("debug_assert_eq!", 'debug_assert_eq!(a, 1, "BEGIN");'),
+        ("unreachable!", 'unreachable!("begin");'),
+        ("todo!", 'todo!("BEGIN");'),
+        ("unimplemented!", 'unimplemented!("begin");'),
+        ("trace!", 'trace!("BEGIN");'),
+        ("debug!", 'debug!("begin");'),
+        ("info!", 'info!("BEGIN");'),
+        ("warn!", 'warn!("begin");'),
+        ("error!", 'error!("BEGIN");'),
+        ("tracing::info!", 'tracing::info!("BEGIN");'),
+        ("print!", 'print!("BEGIN");'),
+        ("println!", 'println!("begin");'),
+        ("eprint!", 'eprint!("BEGIN");'),
+        ("eprintln!", 'eprintln!("begin");'),
+        ("anyhow!", 'return Err(anyhow!("BEGIN"));'),
+        ("bail!", 'bail!("begin");'),
+        ("ensure!", 'ensure!(ok, "BEGIN");'),
+        ("params!", 'c.execute("INSERT INTO t(a) VALUES (?1)", params!["BEGIN"])?;'),
+        ("named_params!", 'c.execute("INSERT INTO t(a) VALUES (:a)", named_params! {":a": "begin"})?;'),
+        ("format! inside panic!", 'panic!("{}", format!("BEGIN {}", n));'),
+        ("rustfmt-wrapped expect", 'let t = WriteTxn::begin(c)\n        .expect(\n            "BEGIN",\n        );'),
+    ):
+        bad, _, _ = run("fn f(c: &Connection) {\n    %s\n}\n" % text)
+        expect("green:#6154 F1 message sink literal is not SQL: " + label, not bad)
+    # --- #6154 review R2 (F2): one whole-file literal pass, no 3-line window ---
+    for label, text in (
+        (
+            "multi-line SQL execute closing within 3 lines, then BEGIN",
+            'fn f(c: &Connection) -> Result<()> {\n    c.execute(\n        "UPDATE t SET a = 1\n'
+            '         WHERE b = 2\n         AND c = 3\n         AND d = 4",\n        [],\n    )?;\n'
+            '    c.execute_batch("BEGIN")?;\n    Ok(())\n}\n',
+        ),
+        ("char literal quote on the line above", "fn f(c: &Connection) {\n    let q = '\"';\n    c.execute_batch(\"BEGIN\")?;\n}\n"),
+        (
+            "open multi-line string above",
+            'fn f(c: &Connection) {\n    let note = "line one\n        line two";\n    c.execute_batch("BEGIN")?;\n}\n',
+        ),
+        (
+            "raw string with a quote above",
+            'fn f(c: &Connection) {\n    let s = r#"a"b"#;\n    c.execute_batch("BEGIN")?;\n}\n',
+        ),
+        ("escaped quote above", 'fn f(c: &Connection) {\n    let s = "a\\"";\n    c.execute_batch("BEGIN")?;\n}\n'),
+        ("byte string with a quote above", 'fn f(c: &Connection) {\n    let s = b"\\"";\n    c.execute_batch("BEGIN")?;\n}\n'),
+        (
+            "block comment with a quote above",
+            'fn f(c: &Connection) {\n    /* it"s */\n    c.execute_batch("BEGIN")?;\n}\n',
+        ),
+    ):
+        bad, _, _ = run(text)
+        expect("red:#6154 F2 unbalanced quote outside the window: " + label, [b[3] for b in bad] == ["R3"])
+    for label, text in (
+        ("escaped newline before BEGIN", f_open % '    c.execute_batch("PRAGMA x = 1;\\nBEGIN")?;'),
+        ("tab escape after BEGIN", f_open % '    c.execute_batch("BEGIN\\t;")?;'),
+    ):
+        bad, _, _ = run(text)
+        expect("red:#6154 r3 F2 escapes are decoded: " + label, [b[3] for b in bad] == ["R3"])
+    for label, text in (
+        ("block comment holding code", f_open % "    /* c.unchecked_transaction() */"),
+        ("block comment holding a BEGIN call", f_open % '    /* c.execute_batch("BEGIN")?; */'),
+    ):
+        bad, _, _ = run(text)
+        expect("green:#6154 r3 F2 " + label + " is not code", not bad)
+    bad, _, _ = run("fn f() {\n    let s = \"c.unchecked_transaction()\";\n}\n")
+    expect("green:#6154 F2 code-looking text inside a string literal is not code", not bad)
+    # --- #6155 (closed by the whole-literal read): a multi-line literal is read whole ---
+    for label, text in (
+        ("raw const, BEGIN on the 2nd line", 'const S: &str = r#"\nBEGIN;\nINSERT INTO t VALUES (1);\n"#;\n'),
+        ("plain string batch", 'fn f(c: &Connection) {\n    c.execute_batch("\n        BEGIN;\n        COMMIT;")?;\n}\n'),
+        ("statement after a semicolon on line 2", 'fn f(c: &Connection) {\n    c.execute_batch("PRAGMA x = 1;\n BEGIN")?;\n}\n'),
+    ):
+        bad, _, _ = run(text)
+        expect("red:#6155 multi-line literal read whole: " + label, [b[3] for b in bad] == ["R3"])
+    bad, _, _ = run('const S: &str = r#"\nBEGIN IMMEDIATE;\nINSERT INTO t VALUES (1);\n"#;\n')
+    expect("green:#6155 multi-line BEGIN IMMEDIATE batch", not bad)
+    # --- #6154 review R2 (F3): ambiguous mod layout in a cfg(test) block fails closed ---
+    deferred = "fn t(c: &Connection) { c.unchecked_transaction(); }\n"
+    for label, files in (
+        (
+            "mod x; at the block indent, non-rustfmt",
+            {
+                "src/a.rs": "#[cfg(test)]\nmod tests {\nmod helpers;\n}\n",
+                "src/a/tests/helpers.rs": deferred,
+                "src/a/helpers.rs": deferred,
+            },
+        ),
+        (
+            "mod x; left of the block indent",
+            {
+                "src/a.rs": "    #[cfg(test)]\n    mod tests {\n  mod helpers;\n    }\n",
+                "src/a/tests/helpers.rs": deferred,
+                "src/a/helpers.rs": deferred,
+            },
+        ),
+        (
+            "mod x; closing brace missing before the next item",
+            {
+                "src/a.rs": "#[cfg(test)]\nmod tests {\n    mod u {\n        fn h() {}\n}\n",
+                "src/a/tests/u.rs": deferred,
+            },
+        ),
+    ):
+        got = {(h[0], h[3]) for h in scan(files)}
+        expect("red:#6154 F3 ambiguous cfg(test) layout is a violation: " + label, ("src/a.rs", "R0") in got)
+    got = sorted({h[0] for h in scan({
+        "src/a.rs": "#[cfg(test)]\nmod tests {\n        mod helpers;\n}\n",
+        "src/a/tests/helpers.rs": deferred,
+    })})
+    expect("green:#6154 F3 mod x; indented deeper than the block is test code", got == [])
+    got = sorted({h[0] for h in scan({
+        "src/lib.rs": "mod prod;\n#[cfg(test)]\n#[path = \"unit_tests.rs\"]\nmod unit;\n",
+        "src/prod.rs": deferred,
+        "src/unit_tests.rs": deferred,
+    })})
+    expect("red:#6154 F3 mod x; outside a cfg(test) block is scanned, #[path] honoured", got == ["src/prod.rs"])
     # stale allowlist entry must fail
     _, stale, _ = evaluate({"src/x.rs": "fn f() {}\n"}, allow)
     expect("red:stale allowlist", stale == [("src/ok.rs", "ro")])
@@ -501,28 +1002,74 @@ def self_test():
         {"src/ok.rs": "fn other(c: &Connection) {\n c.unchecked_transaction();\n}\n"}, allow
     )
     expect("red:allowlist scoped to fn", len(bad) == 1)
-    # mutants: dropping any one rule must make at least one red probe pass
-    # undetected (proves each rule is load-bearing, not vacuous).
-    global RULES, LIT_RULES
-    full, full_lit = RULES, LIT_RULES
+    return failures, counts
+
+
+def _never(*_args, **_kw):
+    return False
+
+
+def _always(*_args, **_kw):
+    return True
+
+
+def _identity(s):
+    return s
+
+
+def self_test():
+    """Red/green probes against the real engine, then mutants: each one breaks a
+    single mechanism and must make at least one probe fail (killed)."""
+    failures, counts = _probes()
+    g = globals()
+    full_rules, full_lit = list(RULES), list(LIT_RULES)
+
+    def drop_rule(rule):
+        def patch():
+            g["RULES"] = [r for r in full_rules if r[0] != rule]
+            g["LIT_RULES"] = [r for r in full_lit if r[0] != rule]
+
+        return patch
+
+    mutants = [("rule %s dropped" % r, drop_rule(r)) for r, _ in full_rules]
+    mutants += [
+        ("R5 write-keyword scan removed", lambda: g.update(WRITE_SQL=re.compile(r"(?!)"))),
+        ("R5 SQL-by-name check removed", lambda: g.update(NONLITERAL_EXEC=re.compile(r"(?!)"))),
+        ("sink-skip removed (every literal scanned)", lambda: g.update(message_sink=_never)),
+        ("sink-skip widened (every literal skipped)", lambda: g.update(message_sink=_always)),
+        ("escape decoding removed", lambda: g.update(unescape=_identity)),
+        ("block-comment blanking removed", lambda: g.update(_blank_block=_identity)),
+        ("literal blanking removed", lambda: g.update(_blank_lit=_identity)),
+        ("raw-string handling removed", lambda: g.update(TOKEN=_build_token(raw=False))),
+        ("char-literal handling removed", lambda: g.update(CHAR_LIT=re.compile(r"(?!)"))),
+        ("ambiguous-mod guard removed (indent placement)", lambda: g.update(mod_inside=_always)),
+        ("ambiguous-mod guard removed (brace balance)", lambda: g.update(block_balanced=_always)),
+    ]
+    saved = {k: g[k] for k in (
+        "RULES", "LIT_RULES", "WRITE_SQL", "NONLITERAL_EXEC", "message_sink",
+        "_blank_lit", "_blank_block", "unescape", "TOKEN", "CHAR_LIT", "mod_inside", "block_balanced",
+    )}
+    killed = 0
     try:
-        for dropped, _ in full:
-            RULES = [r for r in full if r[0] != dropped]
-            LIT_RULES = [r for r in full_lit if r[0] != dropped]
-            silent = True  # every probe of the dropped rule goes unflagged
-            for rule, text in red.values():
-                if rule == dropped and run(text)[0]:
-                    silent = False
-            expect("mutant:%s dropped goes silent (rule is load-bearing)" % dropped, silent)
+        for label, patch in mutants:
+            patch()
+            try:
+                got, _ = _probes()
+            finally:
+                g.update(saved)
+            if got:
+                killed += 1
+            else:
+                failures.append("mutant survived (no probe fails): " + label)
     finally:
-        RULES, LIT_RULES = full, full_lit
+        g.update(saved)
     if failures:
         for f in failures:
             print("SELF-TEST FAIL: " + f, file=sys.stderr)
         return 1
     print(
-        "self-test ok: %d green, %d red probes, %d mutants, %d rules"
-        % (counts["green"], counts["red"], counts["mutant"], len(RULES) + 1)
+        "self-test ok: %d green, %d red probes, %d/%d mutants killed, %d rules"
+        % (counts["green"], counts["red"], killed, len(mutants), len(RULES) + 1)
     )
     return 0
 
@@ -540,6 +1087,9 @@ def main(argv=None):
         return 2
     bad, stale, total = evaluate(load_tree(root), ALLOWLIST)
     for rel, n, fn, rule, text in bad:
+        if rule == "R0":
+            print("%s:%d: [R0] layout or lexing cannot be resolved with certainty: %s" % (rel, n, text))
+            continue
         why = (
             "allowlisted read-only fn contains a write"
             if rule == "R5"
