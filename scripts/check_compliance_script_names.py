@@ -1214,6 +1214,38 @@ def r11_cells(base, cells, expect, tag="R11"):
         )
 
 
+# #6635: long lines in seconds (exit code, text the report must contain, line). A line over
+# LINE_CEILING characters is undecidable (exit 2); one at the ceiling is scanned in linear time.
+R12_TIMED = (
+    ("I-line-1MB", 2, "line too long", "check-a.sh/" * 95326),
+    ("I-path-ceiling", 1, "`check-a.sh` does not exist", "check-a.sh/" * 5957),
+    ("I-loose-ceiling", 0, None, "check\u00e9" * 10922),
+)
+R12_TIME_BOUND = 30
+
+
+def r12_timed_cells(base, expect):
+    """Run each R12_TIMED line in a fresh tree in a child process that must exit within R12_TIME_BOUND seconds."""
+    for name, want, needle, line in R12_TIMED:
+        r = base / name
+        (r / "scripts" / "qc-allowlists").mkdir(parents=True)
+        (r / "docs" / "compliance").mkdir(parents=True)
+        (r / "docs" / "compliance" / "A.md").write_text(line + "\n", encoding="utf-8")
+        (r / ALLOW_REL).write_text("")
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-I", str(Path(__file__).resolve()), "--root", str(r)],
+                capture_output=True, text=True, timeout=R12_TIME_BOUND, check=False,
+            )
+        except subprocess.TimeoutExpired:
+            expect(False, "R12-%s: no exit within %d s" % (name, R12_TIME_BOUND))
+            continue
+        expect(
+            proc.returncode == want and (needle is None or needle in proc.stderr) and "Traceback" not in proc.stderr,
+            "R12-%s: expected exit %d%s, got %r (stderr=%r)"
+            % (name, want, "" if needle is None else " naming %r" % needle, proc.returncode, proc.stderr[-300:]),
+        )
+
 # The round-10 evidence cells (round10-secrev results-linux.json FAIL-OPEN at tip or base, the MANUAL
 # erratum cells E1-E8, and the code-review probe_ws / probe_paren2 cells): each must exit 1.
 R11_FIXTURES = (
@@ -1408,6 +1440,9 @@ def self_test():
         cells12 = root / "r12"
         cells12.mkdir()
         r11_cells(cells12, R12_CELLS, expect, "R12")
+        timed = root / "r12-timed"
+        timed.mkdir()
+        r12_timed_cells(timed, expect)
         # Every cell the round-10 evidence found fail-open (any tip or base) is red (design B, item 7).
         fixtures = root / "r11-fixtures"
         fixtures.mkdir()
