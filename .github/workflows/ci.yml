@@ -1081,6 +1081,11 @@ jobs:
             echo "::error::enterprise-fed leg on $RUNNER_NAME is missing $url_file — the native pg tier URL is not provisioned on this node"
             exit 1
           fi
+          # #6181 — fail closed on a tier password that is empty, shorter than 16, or equal to / contained in
+          # the user, host or database (those appear on psql argv). The helper prints a ::error:: line and no value.
+          if ! python3 -I scripts/ci/check-tier-password.py --url-file "$url_file"; then
+            exit 1
+          fi
           base_url="$(cat "$url_file")"
           # Unique db name: valid pg identifier (lowercase, [a-z0-9_], <=63
           # chars). run_id+attempt make it unique across concurrent runs; the
