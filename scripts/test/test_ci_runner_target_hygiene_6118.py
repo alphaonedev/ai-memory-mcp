@@ -2344,6 +2344,26 @@ class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
             self.assertTrue(any(".cargo/config.toml" in v and "R-DEBUG" in v for v in found), found)
 
 
+    def test_6118_r7_6475_6489_cargo_alias_values_are_judged(self) -> None:
+        cfg, nested = ".cargo/config.toml", "crates/sub/.cargo/config.toml"
+        pkg = 'profile.dev.package.\\"*\\".debug=2'
+        self._repo_cases([
+            ("string alias, root config", cfg, '[alias]\nxt = "test --config %s"\n' % pkg),
+            ("array alias, root config", cfg, '[alias]\nxt = ["test", "--config", "profile.dev.debug=2"]\n'),
+            ("string alias, nested config", nested, '[alias]\nxt = "test --config profile.test.debug=2"\n'),
+            ("array alias, nested config", nested, "[alias]\nxt = [\n  'test',\n  '--config',\n  'build.rustflags=[\"-g\"]',\n]\n"),
+            ("dotted alias key", cfg, 'alias.xt = "test --config profile.dev.debug=2"\n'),
+            ("alias with -Z", cfg, '[alias]\nxt = "test -Zunstable-options"\n'),
+            ("alias with custom profile", cfg, '[alias]\nxt = "test --profile dbg"\n'),
+            ("alias with config file", cfg, '[alias]\nxt = "test --config dbg.toml"\n'),
+            ("alias rustc -g", cfg, '[alias]\nxr = "rustc -- -g"\n'),
+        ])
+
+    def test_6118_r7_6475_plain_alias_stays_clean(self) -> None:
+        found = self._repo_mutated(".cargo/config.toml", '[alias]\nxt = "test --no-run --locked"\nb = ["build", "--release"]\n')
+        self.assertEqual([], found)
+
+
 class PruneScript6118(unittest.TestCase):
     """scripts/ci/prune-runner-target.py against a fake cargo target tree."""
 
