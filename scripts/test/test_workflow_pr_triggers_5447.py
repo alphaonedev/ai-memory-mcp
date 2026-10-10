@@ -5535,6 +5535,16 @@ def _self_hosted_6727(body: str) -> bool:
     return False
 
 
+def _fork_refusal_problems_6727(body: str) -> List[str]:
+    """Why a self-hosted job body would run fork pull_request code (empty: it refuses)."""
+    if SelfHostedMergeGroupGuard6727.JOB_IF in body:
+        return []
+    pre_checkout, sep, _rest = body.partition(SelfHostedMergeGroupGuard6727.CHECKOUT)
+    if sep and SelfHostedMergeGroupGuard6727.STEP_IF in pre_checkout and "exit 1" in pre_checkout:
+        return []
+    return ["no fork-PR refusal before actions/checkout"]
+
+
 class SelfHostedMergeGroupGuard6727(unittest.TestCase):
     """#6727: adding ``merge_group`` to a workflow with a self-hosted job must keep the fork
     refusal the precedent uses.  ci.yml's ``check`` job (the only self-hosted job of the four
@@ -5553,10 +5563,7 @@ class SelfHostedMergeGroupGuard6727(unittest.TestCase):
     CHECKOUT = "- uses: actions/checkout@"
 
     def guarded(self, body: str) -> bool:
-        if self.JOB_IF in body:
-            return True
-        pre_checkout, sep, _rest = body.partition(self.CHECKOUT)
-        return bool(sep) and self.STEP_IF in pre_checkout and "exit 1" in pre_checkout
+        return not _fork_refusal_problems_6727(body)
 
     def self_hosted_jobs(self) -> List[Tuple[str, str, str]]:
         out = []
@@ -5582,6 +5589,59 @@ class SelfHostedMergeGroupGuard6727(unittest.TestCase):
             with self.subTest(workflow=name, job=job):
                 mutant = body.replace(self.JOB_IF, "").replace(self.STEP_IF, "true")
                 self.assertFalse(self.guarded(mutant))
+
+
+# ---- Round 7 (#6849): the fork-PR refusal is pinned by its effect, not its text ----
+
+REFUSAL_IF_6849 = ("        if: needs.classify.outputs.docs_only != 'true' && github.event_name == 'pull_request' && "
+                   "github.event.pull_request.head.repo.full_name != github.repository && "
+                   "contains(matrix.runner, 'self-hosted')\n")
+REFUSAL_EXIT_6849 = ("          exit 1\n      - uses: actions/checkout@")
+
+
+class ForkRefusalEffect6849(unittest.TestCase):
+    """Each edit below lets fork pull_request code reach a self-hosted runner while keeping the
+    refusal's text, so the guard must judge what the predicate and the step do (#6849)."""
+
+    def body(self, workflow: str, job: str) -> str:
+        return _jobs_6727((WORKFLOWS / workflow).read_text(encoding="utf-8"))[job]
+
+    def assert_killed(self, body: str, old: str, new: str) -> None:
+        self.assertEqual(1, body.count(old), old)
+        self.assertEqual([], _fork_refusal_problems_6727(body))
+        self.assertTrue(_fork_refusal_problems_6727(body.replace(old, new, 1)), new)
+
+    def test_6849_n18b_job_if_commented_out_is_killed(self) -> None:
+        job_if = SelfHostedMergeGroupGuard6727.JOB_IF
+        for workflow, job in (("postgres-ignored.yml", "postgres-ignored"),
+                              ("cert-postgres-age.yml", "cert-postgres-age")):
+            with self.subTest(workflow=workflow):
+                self.assert_killed(self.body(workflow, job), job_if, "#" + job_if)
+                self.assert_killed(self.body(workflow, job), job_if, "    # " + job_if.lstrip())
+
+    def test_6849_job_if_admitting_forks_is_killed(self) -> None:
+        job_if = SelfHostedMergeGroupGuard6727.JOB_IF
+        body = self.body("postgres-ignored.yml", "postgres-ignored")
+        self.assert_killed(body, job_if, job_if.replace(" == github.repository", " != ''"))
+        self.assert_killed(body, job_if, job_if.replace("    if: ", "    if: true || "))
+
+    def test_6849_n23b_never_true_clause_on_the_refusal_is_killed(self) -> None:
+        body = self.body("ci.yml", "check")
+        self.assert_killed(body, REFUSAL_IF_6849, REFUSAL_IF_6849.replace(
+            "&& github.event_name == 'pull_request'",
+            "&& github.event_name == 'merge_group' && github.event_name == 'pull_request'"))
+        self.assert_killed(body, REFUSAL_IF_6849, REFUSAL_IF_6849.replace("        if: ", "        if: false && "))
+
+    def test_6849_n24_continue_on_error_on_the_refusal_is_killed(self) -> None:
+        body = self.body("ci.yml", "check")
+        self.assert_killed(body, REFUSAL_EXIT_6849, REFUSAL_EXIT_6849.replace(
+            "exit 1\n", "exit 1\n        continue-on-error: true\n"))
+        self.assert_killed(body, REFUSAL_IF_6849, REFUSAL_IF_6849 + "        continue-on-error: true\n")
+
+    def test_6849_refusal_exit_status_and_order_are_killed(self) -> None:
+        body = self.body("ci.yml", "check")
+        self.assert_killed(body, REFUSAL_EXIT_6849, REFUSAL_EXIT_6849.replace("exit 1", "exit 0"))
+        self.assert_killed(body, REFUSAL_EXIT_6849, REFUSAL_EXIT_6849.replace("exit 1", "# exit 1"))
 
 
 if __name__ == "__main__":
