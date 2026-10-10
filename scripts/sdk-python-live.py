@@ -2,8 +2,9 @@
 """Run the opt-in live tests of sdk/python against a real daemon and a real wake hub (#6746).
 
 Five sdk/python tests prove the SDK against the Rust binary itself and skip
-without it: four in ``tests/test_client.py`` need a daemon on
-``https://localhost:9077`` (``AI_MEMORY_TEST_DAEMON=1``) and one in
+without it: four in ``tests/test_client.py`` need a daemon at
+``AI_MEMORY_TEST_BASE_URL`` (``AI_MEMORY_TEST_DAEMON=1``; this harness sets
+the URL to the free loopback port it picks, #6831) and one in
 ``tests/test_wake_client.py`` needs a live ``ai-memory wake-hub`` and a
 delegation bundle. Before #6746 no CI job started either, so the five never ran.
 

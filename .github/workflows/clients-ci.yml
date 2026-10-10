@@ -224,7 +224,8 @@ jobs:
         run: python -m mypy ai_memory
 
   # #6746 — the live legs of sdk/python. Four tests in tests/test_client.py
-  # need a daemon on https://localhost:9077 and one in tests/test_wake_client.py
+  # need a daemon at AI_MEMORY_TEST_BASE_URL (the harness starts one on a free
+  # loopback port and sets that URL, #6831) and one in tests/test_wake_client.py
   # needs a live `ai-memory wake-hub`; without them they skip, and before #6746
   # nothing started either, so the only tests that prove the SDK against the
   # Rust binary never ran. scripts/sdk-python-live.py mints a throwaway CA,

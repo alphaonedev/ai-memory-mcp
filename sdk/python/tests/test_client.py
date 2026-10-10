@@ -7,7 +7,8 @@ The suite is split in two:
 * **Offline tests** (always run) — exercise the pure-Python parts: model
   serialization, webhook HMAC, error mapping.
 * **Daemon tests** (opt-in) — run only when ``AI_MEMORY_TEST_DAEMON=1`` is
-  set and a daemon is reachable at ``https://localhost:9077``. Every daemon
+  set and a daemon is reachable at ``AI_MEMORY_TEST_BASE_URL`` (default
+  ``https://localhost:9077``). Every daemon
   test writes into its own namespace and deletes what it wrote by id.
   A stock daemon refuses an unsigned HTTP write (403 ``ATTESTATION_FAILED``,
   #1985), so the write tests sign as ``AI_MEMORY_TEST_AGENT_ID`` with the
@@ -54,7 +55,7 @@ def _daemon_reachable() -> bool:
 
 skip_without_daemon = pytest.mark.skipif(
     not _daemon_reachable(),
-    reason="AI_MEMORY_TEST_DAEMON!=1 or daemon not reachable at localhost:9077",
+    reason=f"AI_MEMORY_TEST_DAEMON!=1 or daemon not reachable at {TEST_BASE_URL}",
 )
 
 
