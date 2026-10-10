@@ -3988,7 +3988,7 @@ SELF_TEST_OK = (
     "name printed escaped by both the line-break and the shadow messages; (tr round 6, #6550/#6555/#6556/#6554) "
     "the git shim's trace stripped from the fetch cells (shim-trace), each of the 22 refused whitespace code "
     "points refused as itself (tr-s-ws-U+XXXX), the refusal listing every offending line and code point with "
-    "a +K more marker (tr-s-ws-lines, tr-s-ws-nine) and a wording cell that fails on a false reason for refusing"
+    "a +K more marker (tr-s-ws-lines, tr-s-ws-nine) and a wording cell that fails on a false reason for refusing "
     "FF or VT (ws-wording); (tr round 7, #6760/#6761/#6762/#6763/#6684/#6554/#6683/#6765) one "
     "line number per line (tr-s-ws-oneline), repeated code points listed once in first-seen order "
     "(tr-s-ws-dedup), no +K more marker at exactly eight items (tr-s-ws-eight), the count in lines "
