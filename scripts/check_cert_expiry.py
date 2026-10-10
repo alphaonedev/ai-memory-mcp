@@ -1981,8 +1981,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     # its issue URL, placed directly above an existing amendment header or as
     # the last paragraph of its blockquote (R3: #6354..#6359, #6365..#6369).
     # Container cells keep the container in the merge-base so only the record
-    # is inserted, and the container model is the only guard that can refuse
-    # them (#6357).
+    # is inserted. Since design B (round 5) a container in the ledger region
+    # leaves the canonical subset and the doc is refused as a whole (#6357).
     url6063 = "https://github.com/alphaonedev/ai-memory-mcp/issues/6063"
     cite6063 = f"[#6063]({url6063})"
     back6063 = f"> Path back to LIVE: WP-B1 re-cert ({cite6063}) only."
@@ -2039,6 +2039,10 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
 
     rec6124 = amend("#6162", [mod_rs])
     red6124 = [(sentence, "did not carry the required section 7 expiry sentence")]
+    # Design B (#6124 round 5, 3-agent vote 6def5ab6): a ledger region
+    # outside the canonical subset is refused with this sentence.
+    canon6124 = [("leaves the canonical ledger subset",
+                  "did not refuse the doc as outside the canonical ledger subset")]
 
     # (6124-h1) GREEN - EXPIRED both ends + new amendment listing the one path.
     h1 = edit_range("\n" + rec6124, label="h1")
@@ -2074,15 +2078,15 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     mb_h8 = doc_only("\n" + old_a, quoted=">\n> ```\n> open fence\n", label="h8-mb")
     h8 = edit_range("\n" + old_a + ">\n" + rec6124, quoted=">\n> ```\n> open fence\n",
                     label="h8", frm=mb_h8)
-    t.expect_green("6124-h8", "record after a blockquote that ended inside a code fence", repo,
-                   mb_h8, h8, green6124)
+    t.expect_red("6124-h8", "record after a blockquote that ended inside a code fence (outside the canonical ledger subset)",
+                 repo, mb_h8, h8, red6124 + canon6124)
     # (6124-h9) GREEN (#6356, S02) - a backtick run whose info string holds a
     # backtick is inline text, not a fence opener; the record after it counts.
     mb_h9 = doc_only(quoted=">\n> ```x`y\n>\n" + old_a, label="h9-mb")
     h9 = edit_range("", quoted=">\n> ```x`y\n>\n" + rec6124 + ">\n" + old_a, label="h9",
                     frm=mb_h9)
-    t.expect_green("6124-h9", "record after a backtick line that is not a fence", repo, mb_h9,
-                   h9, green6124)
+    t.expect_red("6124-h9", "record after a backtick line that is not a fence (outside the canonical ledger subset)",
+                 repo, mb_h9, h9, red6124 + canon6124)
     # (6124-h2) GREEN - two watched paths + a new identifier, all listed.
     h2 = edit_range("\n" + amend("#6162", [mod_rs, recv_rs, new_id]), touch=(mod_rs, recv_rs),
                     ids=True, label="h2")
@@ -2109,8 +2113,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     html_ok = ("\n<div>\n</div>\n\n<pre>one line</pre>\n\n> <pre>\n> kept as code\n\n")
     mb_h5 = doc_only(html_ok, label="h5-mb")
     h5 = edit_range(html_ok + rec6124, label="h5", frm=mb_h5)
-    t.expect_green("6124-h5", "record after HTML blocks that already ended", repo, mb_h5, h5,
-                   green6124)
+    t.expect_red("6124-h5", "record after HTML blocks that already ended (outside the canonical ledger subset)",
+                 repo, mb_h5, h5, red6124 + canon6124)
     # (6124-h6) GREEN (#6355) - the date may be the merge-base commit day - 1
     # (time-zone slack) and today + 1.
     h6 = edit_range("\n" + amend("#6162", [mod_rs], date=(
@@ -2176,7 +2180,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     mb_f4g = doc_only(fenced_old, label="f4g-mb")
     f4g = edit_range(fenced_old + "\n" + rec6124, label="f4g", frm=mb_f4g)
     t.expect_red("6124-f4g", "copy of a header already present in the merge-base", repo, mb_f4g,
-                 f4g, red6124 + [("no NEW amendment record", "did not say no new record")])
+                 f4g, red6124 + canon6124)
     # (6124-f5) RED - LIVE at both ends keeps rule B whatever the doc says.
     fx.reset(base)
     fx.write(mod_rs, "// f5\n", append=True)
@@ -2256,8 +2260,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     f7p = edit_range("", quoted=">\n" + rec6124 + ">\n> <?\n" + old_a + ">\n" + old_b,
                      label="f7p", frm=mb_f7p)
     t.expect_red("6124-f7p", "HTML opener hiding the existing records", repo, mb_f7p, f7p,
-                 red6124 + [("may only gain the new amendment record",
-                             "did not name the insertion-only rule")])
+                 red6124 + canon6124)
     # (6124-f8) RED - an identifier changed but is not listed.
     f8 = edit_range("\n" + rec6124, ids=True, label="f8")
     t.expect_red("6124-f8", "identifier changed but not listed", repo, exp6124, f8, red6124)
@@ -2556,12 +2559,13 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     # items, the record indented into the item) hides the record from the
     # rendered doc, and an opener behind an indented `>` or a `>` + tab does
     # the same. The opener is already in the merge-base so only the record is
-    # inserted; the container model is the only guard that can refuse it.
+    # inserted; since design B (round 5) the canonical subset refuses the
+    # doc, so these cells expect the subset sentence.
     # Offline cells only, one per HTML block kind 1-7 and per fence kind.
     def indented(rec, n):
         return "".join("> " + " " * n + ln[2:] + "\n" for ln in rec.rstrip("\n").split("\n"))
 
-    gone6124 = [("no NEW amendment record", "did not report the hidden record as not added")]
+    gone6124 = canon6124
     for oname, op in (("script", "<script>"), ("style", "<style>"), ("pre", "<pre>"),
                       ("textarea", "<textarea>"), ("comment", "<!-- x"), ("pi", "<?x"),
                       ("decl", "<!X"), ("cdata", "<![CDATA["), ("div", "<div>"),
@@ -2580,8 +2584,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     mb_lc = doc_only(quoted=pre_l + ">\n" + old_b, label="l-ctl-mb")
     l_ctl = edit_range("", quoted=pre_l + indented(rec6124, 2) + ">\n" + old_b, label="l-ctl",
                        frm=mb_lc)
-    t.expect_green("6124-l-ctl", "record after a list item HTML block that already ended",
-                   repo, mb_lc, l_ctl, green6124)
+    t.expect_red("6124-l-ctl", "record after a list item HTML block that already ended (outside the canonical ledger subset)",
+                 repo, mb_lc, l_ctl, red6124 + canon6124)
     # (6124-q1..q5) RED (#6443, T1/T2/T3/T11/T12): the opener behind a tab
     # after '>' or behind an indented '>' (up to three columns) is an opener.
     for tag, opener in (("q1", ">\t<pre>"), ("q2", "  > <pre>"), ("q3", "  > ```"),
@@ -2595,8 +2599,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     mb_qc = doc_only(quoted=">\n>\tplain\n>\n" + old_b, label="q-ctl-mb")
     q_ctl = edit_range("", quoted=">\n>\tplain\n>\n" + rec6124 + ">\n" + old_b, label="q-ctl",
                        frm=mb_qc)
-    t.expect_green("6124-q-ctl", "record after a tab-indented plain line", repo, mb_qc, q_ctl,
-                   green6124)
+    t.expect_red("6124-q-ctl", "record after a tab-indented plain line (outside the canonical ledger subset)",
+                 repo, mb_qc, q_ctl, red6124 + canon6124)
 
     # (6124-p1..p4) RED (R3-F3, #6420) - once the doc has an amendment ledger,
     # a new record is accepted only inside it: directly above an existing
@@ -2616,7 +2620,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         pre = extra[:extra.index(rec6124)]
         mb_p = doc_only(pre, label=f"{tag}-mb")
         cell_p = edit_range(extra, label=tag, frm=mb_p)
-        t.expect_red(f"6124-{tag}", label, repo, mb_p, cell_p, red6124 + placed6124)
+        t.expect_red(f"6124-{tag}", label, repo, mb_p, cell_p,
+                     red6124 + (canon6124 if tag == "p4" else placed6124))
     # (6124-p5) RED - above an existing record but separated by a PLAIN blank
     # line: two blockquotes, so not inside the ledger.
     mb_p5 = doc_only("\n" + old_a, label="p5-mb")
@@ -2706,15 +2711,15 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     pre_k1 = ">\n> <pre>\n> text\n> </pre>\n>\n"
     mb_k1 = doc_only(quoted=pre_k1 + old_b, label="k1-mb")
     k1 = edit_range("", quoted=pre_k1 + rec6124 + ">\n" + old_b, label="k1", frm=mb_k1)
-    t.expect_green("6124-k1", "record after a multi-line HTML block that ended", repo, mb_k1, k1,
-                   green6124)
+    t.expect_red("6124-k1", "record after a multi-line HTML block that ended (outside the canonical ledger subset)",
+                 repo, mb_k1, k1, red6124 + canon6124)
     # k2 RED: a CDATA block holding a lone ']' does not end there; the record
     # inside it stays hidden.
     pre_k2 = ">\n> <![CDATA[\n> a ] b\n>\n"
     mb_k2 = doc_only(quoted=pre_k2 + "> ]]>\n>\n" + old_b, label="k2-mb")
     k2 = edit_range("", quoted=pre_k2 + rec6124 + "> ]]>\n>\n" + old_b, label="k2", frm=mb_k2)
     t.expect_red("6124-k2", "record inside a CDATA block after a lone ']'", repo, mb_k2, k2,
-                 red6124 + [("no NEW amendment record", "did not report the hidden record")])
+                 red6124 + canon6124)
     # k3..k6 RED: one banned character in the plain-prose line of the record.
     for tag, label, prose in (
             ("k3", "a '<' in the record prose", "> Changed in <this range:"),
@@ -2722,8 +2727,9 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
             ("k5", "a backslash in the record prose", "> Changed in this\\ range:"),
             ("k6", "a backtick in the record prose", "> Changed in `this` range:")):
         cell_k = edit_range("\n" + amend("#6162", [mod_rs], prose=prose), label=tag)
-        t.expect_red(f"6124-{tag}", label, repo, exp6124, cell_k, red6124 +
-                     [("cites or links something other than", "did not refuse the prose line")])
+        t.expect_red(f"6124-{tag}", label, repo, exp6124, cell_k, red6124 + (
+            canon6124 if tag == "k3" else
+            [("cites or links something other than", "did not refuse the prose line")]))
     # k7/k8 RED: a 'GH-7' form and a 'www.' form in the header.
     for tag, label, ref in (("k7", "a GH-N form in the record header", "#6162 GH-7"),
                             ("k8", "a www. form in the record header", "#6162 www.example")):
@@ -2761,6 +2767,130 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         else:
             t.expect_red(f"6124-{tag}", label, repo, mb_t, cell_t, red6124 +
                          [("is before", "did not refuse the back-dated record")])
+
+    # (6124-b*) #6124 round 5, design B (3-agent vote 6def5ab6): the ledger
+    # region is held to a canonical Markdown subset and every other construct
+    # is refused, whatever GitHub would make of it. Each RED shape is tried as
+    # a doc-only change above the existing records (they would render as code
+    # or HTML) and, where it can hide a record, with a new record after it.
+    # #6445: one family per try block, so a base without a helper fails a
+    # NAMED cell instead of crashing the corpus.
+    try:
+        led_b = ">\n" + old_b
+        mb_b = doc_only(quoted=led_b, label="b-mb")
+        for tag, label, pre, record in (
+                ("b-v2", "a fence opened in a list item, then a less-indented fence line (#6722)",
+                 ">\n> - ```\n> ```\n", True),
+                ("b-ic", "an indented-code fence run, then a fence opener (#6723)",
+                 ">\n>     ```\n> ```\n", True),
+                ("b-t7", "a type-7 tag line in a paragraph, then a fence opener (#6724)",
+                 ">\n> para text\n> <x-y>\n> ```\n", True),
+                ("b-mc", "a mid-line comment opener, a fence opener, then '-->' (#6725)",
+                 ">\n> text <!-- a\n> ```\n> -->\n", True),
+                ("b-cr", "a bare CR before an HTML block opener (#6730)",
+                 ">\n> prose\r<pre>\n", True),
+                ("b-crlf", "a CRLF line ending in the ledger (#6730)", ">\n> prose\r\n", False),
+                ("b-det", "the ledger wrapped in <details> (#6732)",
+                 ">\n> <details><summary>older</summary>\n>\n", False),
+                ("b-tab", "a tab after '>' (#6443)", ">\n>\tplain\n", True),
+                ("b-iq", "an indented '>' marker (#6443)", ">\n  > plain\n", False),
+                ("b-nest", "a nested blockquote", ">\n> > nested\n", False),
+                ("b-ind4", "a nested-list continuation 4 spaces in",
+                 ">\n> - item\n>     continued\n", True),
+                ("b-setext", "a setext underline under a paragraph", ">\n> Title text\n> ===\n",
+                 False),
+                ("b-setext2", "a '-' setext underline under a paragraph",
+                 ">\n> Title text\n> ---\n", False),
+                ("b-lrd", "a link reference definition",
+                 ">\n> [x]: https://example.invalid/x\n", False),
+                ("b-lazy", "a lazy continuation line", ">\n> para\nlazy line\n", False),
+                ("b-tag", "an inline tag in prose", ">\n> a <b>bold</b> word\n", True),
+                ("b-auto", "an autolink in prose", ">\n> see <https://example.invalid>\n", False),
+                ("b-tilde", "a tilde run in prose", ">\n> a ~~~ b\n", False),
+                ("b-math", "a math block marker", ">\n> $$\n", False),
+                ("b-esc", "a backslash-escaped backtick", ">\n> a \\` b\n", False),
+                ("b-dbl", "a double-backtick code span", ">\n> a ``x`` b\n", False),
+                ("b-span", "a code span that does not close in its paragraph",
+                 ">\n> text `a\n>\n> <b>x</b> `\n", False),
+                ("b-title", "a link with a title", '>\n> [a](https://example.invalid "t")\n',
+                 False),
+                ("b-ref", "a reference-style link", ">\n> [a][b]\n", False),
+                ("b-tpipe", "an escaped pipe in a table row",
+                 ">\n> | a | b |\n> | --- | --- |\n> | x \\| y | z |\n", False),
+                ("b-tent", "an entity in a table row",
+                 ">\n> | a | b |\n> | --- | --- |\n> | &lt;b&gt; | z |\n", False),
+                ("b-tcell", "a code span split by a table cell",
+                 ">\n> | a | b |\n> | --- | --- |\n> | `x | y` | z |\n", False),
+                ("b-nul", "a NUL character", ">\n> a\x00b\n", False),
+                ("b-ff", "a form feed", ">\n> a\x0cb\n", False),
+                ("b-ls", "a U+2028 line separator", ">\n> a b\n", False),
+                ("b-ps", "a U+2029 paragraph separator", ">\n> a b\n", False),
+                ("b-zw", "a zero-width space", ">\n> a​b\n", False),
+                ("b-wj", "a word joiner", ">\n> a⁠b\n", False),
+                ("b-bom", "a byte-order mark", ">\n> a﻿b\n", False),
+                ("b-rlo", "a bidi override", ">\n> a‮b\n", False),
+                ("b-rli", "a bidi isolate", ">\n> a⁧b\n", False)):
+            cell_b = edit_range("", touch=(), label=f"{tag}-doc", frm=mb_b, quoted=pre + led_b)
+            t.expect_red(f"6124-{tag}", f"doc-only: {label}", repo, mb_b, cell_b, canon6124)
+            if record:
+                mb_br = doc_only(quoted=pre + led_b, label=f"{tag}-rmb")
+                cell_br = edit_range("", quoted=pre + ">\n" + rec6124 + led_b,
+                                     label=f"{tag}-rec", frm=mb_br)
+                t.expect_red(f"6124-{tag}-rec", f"new record after {label}", repo, mb_br,
+                             cell_br, red6124 + canon6124)
+        # GREEN controls: the subset keeps plain prose, lists, tables, code
+        # spans (their content is exempt from the tag rule), a literal '<'
+        # that opens no tag, plain links and a closed fence below the region.
+        for tag, label, pre in (
+                ("b-ok-lt", "a literal '<' that opens no tag", ">\n> 3 < 4 and a <= b\n"),
+                ("b-ok-cs", "tags and comment openers inside code spans",
+                 ">\n> uses `<details>`, `<!-- x` and `<pre>` literally\n"),
+                ("b-ok-ml", "a code span wrapped across two lines", ">\n> a `wrapped\n> span` ends\n"),
+                ("b-ok-ind", "a nested-list continuation 2 spaces in",
+                 ">\n> - item\n>   continued\n>   - nested\n"),
+                ("b-ok-tbl", "a pipe table with code spans",
+                 ">\n> | a | b |\n> | --- | --- |\n> | `x` | y |\n"),
+                ("b-ok-link", "a plain inline link", ">\n> see [a](https://example.invalid/a)\n")):
+            mb_g = doc_only(quoted=pre + led_b, label=f"{tag}-mb")
+            cell_g = edit_range("", quoted=pre + ">\n" + rec6124 + led_b, label=tag, frm=mb_g)
+            t.expect_green(f"6124-{tag}", f"new record after {label}", repo, mb_g, cell_g,
+                           green6124)
+        mb_tail = doc_only(quoted=led_b, label="b-tail-mb")
+        mb_tail_ok = doc_only("\n```\ncode\n```\n", quoted=led_b, label="b-ok-tail-mb")
+        tail_ok = edit_range("\n```\ncode\n```\n", quoted=led_b + ">\n" + rec6124,
+                             label="b-ok-tail", frm=mb_tail_ok)
+        t.expect_green("6124-b-ok-tail", "a closed fence below the ledger region", repo,
+                       mb_tail_ok, tail_ok, green6124)
+        tail_bad = edit_range("\n```\nnever closed\n", quoted=led_b + ">\n" + rec6124,
+                              label="b-tail", frm=mb_tail)
+        t.expect_red("6124-b-tail", "a fence below the ledger region that never closes", repo,
+                     mb_tail, tail_bad, red6124 + canon6124)
+
+        # STATUS pin: one canonical STATUS line, after a blank line, above
+        # every record; a decoy anywhere in the document is refused.
+        def pinned(label, frm, edit, touch=(mod_rs,)):
+            fx.reset(frm)
+            for tp in touch:
+                fx.write(tp, f"// {label}\n", append=True)
+            fx.banner("EXPIRED", genesis, "", led_b + ">\n" + rec6124)
+            fx.write(CERT_DOC, edit((repo / CERT_DOC).read_text(encoding="utf-8")))
+            return fx.commit(list(touch) + [CERT_DOC], f"6124 cell {label}")
+
+        st_line = "> ## STATUS — **EXPIRED as of 2026-01-01** (fixture)"
+        for tag, label, edit in (
+                ("b-st-decoy", "a second STATUS heading below the ledger",
+                 lambda d: d + "\n#### Status notes\n"),
+                ("b-st-form", "a STATUS line outside its canonical form",
+                 lambda d: d.replace(st_line, st_line.replace("## STATUS", "##  STATUS"))),
+                ("b-st-blank", "a STATUS line glued to the paragraph above it",
+                 lambda d: d.replace("(fixture bind)\n\n", "(fixture bind)\n"))):
+            cell_s = pinned(tag, mb_b, edit)
+            t.expect_red(f"6124-{tag}", label, repo, mb_b, cell_s, red6124 + canon6124)
+            cell_sd = pinned(f"{tag}-doc", mb_b, edit, touch=())
+            t.expect_red(f"6124-{tag}-doc", f"doc-only: {label}", repo, mb_b, cell_sd, canon6124)
+    except Exception as exc:  # noqa: BLE001 - #6445: a crash is a named failure
+        t.fail(f"(6124-b) crashed: {type(exc).__name__}: {exc}")
+
 
     # (6124-r1..r4) #6355: the COMMITTED cert doc of this checkout, as the
     # merge-base, with a record inserted at each legal spot (GREEN), behind an
