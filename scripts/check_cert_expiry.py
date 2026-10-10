@@ -816,6 +816,9 @@ class Fixture:
 class SelfTest:
     def __init__(self):
         self.failed = False
+        # every cell label that ran, so (doc-bound) can require that each
+        # `(name)` the changelog fragment cites is a real cell (#6718)
+        self.labels = set()
 
     def fail(self, msg, out=None):
         print(f"self-test FAILED {msg}", file=sys.stderr)
@@ -824,6 +827,7 @@ class SelfTest:
         self.failed = True
 
     def expect_red(self, label, desc, repo, base, head, needles, tip=None):
+        self.labels.add(label)
         ok, out = check_change(repo, base, head, tip)
         if ok:
             self.fail(f"({label}): {desc} was NOT rejected", out)
@@ -834,6 +838,7 @@ class SelfTest:
         return out
 
     def expect_green(self, label, desc, repo, base, head, needles=(), tip=None):
+        self.labels.add(label)
         ok, out = check_change(repo, base, head, tip)
         if not ok:
             self.fail(f"({label}): {desc} was REJECTED:", out)
@@ -848,6 +853,7 @@ class SelfTest:
         """Run the whole gate. needle None: it must pass. Else it must fail
         closed (rc 1) AND say `needle` (a fail-closed for the wrong reason, or
         a wrong remedy, is a defect too)."""
+        self.labels.add(label)
         rc, out, err = run_gate(repo, env)
         text = out + err
         if needle is None:
@@ -1732,6 +1738,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     # (doc-bound, #6563 / #6561) the docstring, the OK banner and the #6427
     #       changelog fragment say what is detected and name the lexical bound:
     #       none may claim that a block comment AROUND a definition is caught.
+    t.labels.add("doc-bound")
     doc_texts = [("module docstring", __doc__ or ""), ("OK banner", SELF_TEST_OK)]
     fragment = REPO_ROOT / "changelog.d" / "6427.fixed.md"
     if fragment.is_file():
@@ -2115,6 +2122,17 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     else:
         print("self-test NOTE (o): skipped own-PR check (no origin/release/v1.0.0 "
               "and no @{upstream})", file=sys.stderr)
+
+    # (doc-bound, #6718) every cell the #6427 changelog fragment names, as a
+    #       backticked `(name)` or as "the NAME cells", is a cell that ran.
+    fragment = REPO_ROOT / "changelog.d" / "6427.fixed.md"
+    if fragment.is_file():
+        frag = fragment.read_text(encoding="utf-8")
+        cited = set(re.findall(r"`\(([a-z0-9][a-z0-9-]*)\)`", frag))
+        cited |= set(re.findall(r"\bthe ([a-z][a-z0-9]*(?:-[a-z0-9]+)+) cells?\b", frag))
+        for name in sorted(cited - t.labels):
+            t.fail(f"(doc-bound): changelog.d/6427.fixed.md names ({name}), which is not a "
+                   "self-test cell (#6718)")
 
     if t.failed:
         print("check-cert-expiry self-test: FAIL", file=sys.stderr)
