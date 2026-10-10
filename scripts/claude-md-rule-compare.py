@@ -2686,6 +2686,12 @@ def _self_test_cases() -> int:
           'secret = """\nbody-6163\n' + "z" * 2100 + ' token"""\nafter-shown-6163', hidden=("body-6163",),
           shown=("after-shown-6163",), count=3)
 
+    # #6163 round 6 (#6870): a line over MAX_MASK_LINE that carries the closing triple quote closes the value; the line
+    # after it is shown and the long line is hidden (the cell kills a change that drops the close on a long line).
+    masks("#6870 R6 an over-long line that carries the closing triple quote closes the value",
+          'secret = """\n' + "q" * 2001 + '"""\nafter-shown-6163', hidden=("q" * 2001,),
+          shown=("after-shown-6163",), count=2)
+
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
     fetch_root = base_dir / "pr-fetch"
