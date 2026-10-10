@@ -5263,5 +5263,31 @@ class MergeGroupDuplicateListing6637(unittest.TestCase):
         self.assertEqual(0, rc, out)
 
 
+# ---- Round 6 (#6638): the 8-character floor of an authorization value is pinned ----
+
+
+class AuthorizationValueFloor6638(unittest.TestCase):
+    """``bearer`` / ``basic`` / ``token`` followed by 8 or more value characters is redacted;
+    7 characters is not (so "token expired" and similar prose stays readable)."""
+
+    SEVEN = "Zq7.x-1"
+    EIGHT = "Zq7.x-1/"
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+
+    def test_6638_eight_characters_are_redacted_seven_are_not(self) -> None:
+        self.assertEqual(7, len(self.SEVEN))
+        self.assertEqual(8, len(self.EIGHT))
+        for scheme in ("bearer", "Basic", "TOKEN"):
+            with self.subTest(scheme=scheme):
+                eight = self.mod.workflow_error(f"Authorization: {scheme} {self.EIGHT}")
+                self.assertIn("[redacted]", eight)
+                self.assertNotIn(self.EIGHT, eight)
+                seven = self.mod.workflow_error(f"Authorization: {scheme} {self.SEVEN}")
+                self.assertNotIn("[redacted]", seven)
+                self.assertIn(f"{scheme} {self.SEVEN}", seven)
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
