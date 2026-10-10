@@ -1238,7 +1238,9 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertTrue((self.base / "sleep.pid").exists(), r.stdout + r.stderr)
         child = int((self.base / "sleep.pid").read_text())
         self.addCleanup(self.kill_quietly, child)
-        self.assert_fails(r, 1, "age probe failed: psql exited -9")
+        # #6728: a negative returncode is the supervisor's own death (psql's signals arrive as 128+N, #6643).
+        self.assert_fails(r, 1, "age probe failed: the psql supervisor was killed by signal 9")
+        self.assertNotIn("psql exited -", r.stderr)
         self.assert_gone_within(child, 3, "the supervisor was SIGKILLed after psql closed its pipes")
 
     @staticmethod
