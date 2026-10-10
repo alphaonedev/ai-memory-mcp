@@ -122,7 +122,9 @@ that binds no such name by `use`, glob, `extern crate` or `macro_rules!`;
 every multi-segment path such as clippy:: or rustfmt:: is a finding, #6840;
 `cfg` inside a string argument does not count), an inner
 `#![cfg(..)]`, an `if false` / `if (false)` / `if !!false` / `if cfg!(..)` /
-`if !cfg!(..)` / `while false` block, the else branch of an `if true`, a `for`
+`if !cfg!(..)` / `while false` block (the `if false` / `while false` anywhere in
+the header, a match guard `_ if false =>` included, #6844; `if false || x` is
+a fail-closed false positive), the else branch of an `if true`, a `for`
 over an empty literal range, a match arm whose literal never matches a literal
 scrutinee, the input of a macro invocation (stringify!, a local macro_rules!
 macro, any `name! {..}`), an open block comment or string literal, a
@@ -464,9 +466,11 @@ _VALUE_WORDS = frozenset({"true", "false", "self", "Self"})
 _MOD_DECL_RE = re.compile(r"^(?:pub(?: \( [^()]* \))? )?mod (?:r\#)?([^\W\d]\w*)$")
 _PROPAGATE_RE = re.compile(r"^(?:unsafe|if (?:true|! false))?$")
 _HEADER_RULES = (
-    (re.compile(r"\bif (?:false|! true)(?: && .*)?$"), "inside an `if false` block"),
+    # anywhere in the header, a match guard included, unless an `else` follows
+    # (that is the else branch of `if false`, which runs) (#6844)
+    (re.compile(r"\bif (?:false|! true)\b(?!.*\belse\b)"), "inside an `if false` block"),
     (re.compile(r"\b(?:if|while)\b.*\bcfg !"), "inside an `if cfg!(..)` block"),
-    (re.compile(r"\bwhile (?:false|! true)(?: && .*)?$"), "inside a `while false` loop"),
+    (re.compile(r"\bwhile (?:false|! true)\b"), "inside a `while false` loop"),
     (re.compile(r"\bif (?:true|! false) else\b"), "in the else branch of an if true"),
     (re.compile(r"\bmacro_rules !"), "inside a macro_rules! body (expands only where invoked)"),
 )
