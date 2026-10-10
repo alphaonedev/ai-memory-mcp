@@ -87,13 +87,11 @@ certification and triggers re-cert** (see §7).
 > `e22bc93c`**. The delta between the two is **exactly three files, all
 > documentation or harness, additions only**:
 >
-> ```
-> $ git diff --stat e22bc93c 580d8427
->  .../ENTERPRISE-FEDERATION-CERTIFICATION.md         | 218 +++++++++++++++++++++
->  docs/enterprise-deployment.md                      |  14 ++
->  scripts/check-cert-removal-proof.sh                | 143 ++++++++++++++
->  3 files changed, 375 insertions(+)
-> ```
+> - `$ git diff --stat e22bc93c 580d8427`
+> - `.../ENTERPRISE-FEDERATION-CERTIFICATION.md | 218 +++++++++++++++++++++`
+> - `docs/enterprise-deployment.md | 14 ++`
+> - `scripts/check-cert-removal-proof.sh | 143 ++++++++++++++`
+> - `3 files changed, 375 insertions(+)`
 >
 > **Zero changes under `src/`, `.github/workflows/`, or any
 > `AI_MEMORY_FED_*` identifier**, so the §7 re-cert trigger is **not**
