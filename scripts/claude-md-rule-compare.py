@@ -213,7 +213,7 @@ def trailer_block(message: bytes) -> str:
     try:
         result = subprocess.run(["git", "interpret-trailers", "--parse", "--no-divider"], input=message,
                                 capture_output=True, check=False, cwd=os.sep, env=config_free_env())
-    except ValueError as exc:
+    except OSError as exc:
         raise RuntimeError(f"git interpret-trailers could not run: {exc}") from exc
     if result.returncode != 0:
         raise RuntimeError("git interpret-trailers failed: " + result.stderr.decode("utf-8", "replace").strip())
@@ -609,6 +609,10 @@ def _self_test_cases() -> int:
             report, failed = compare(base_root, work / "repo", base_sha, head_sha, work / "scratch", guard.fixture_index_pins())
         except RuntimeError as exc:
             report, failed = f"RESULT: FAIL (closed) - {exc}", True
+        except Exception as exc:  # noqa: BLE001 - #6435: any other exception is this cell's FAIL, never an abort
+            failures.append(name)
+            print(f"FAIL: self-test - {name}: unexpected {type(exc).__name__}: {exc}", file=sys.stderr)
+            return
         if failed != want_fail or needle not in report:
             failures.append(name)
             print(f"FAIL: self-test - {name}: failed={failed} (wanted {want_fail}), needle {needle!r}\n{report}",
@@ -733,6 +737,12 @@ def _self_test_cases() -> int:
             raised = False
         except RuntimeError:
             raised = True
+        except Exception as exc:  # noqa: BLE001 - #6435: a different exception is this cell's FAIL, never an abort
+            raised = False
+            print(f"FAIL: self-test - a trailer parser that {label}: expected RuntimeError, got {type(exc).__name__}"
+                  f": {exc} (#6435)", file=sys.stderr)
+            failures.append(f"parser {label}")
+            return
         finally:
             if saved_path is None:
                 os.environ.pop("PATH", None)
@@ -1382,6 +1392,8 @@ def _self_test_cases() -> int:
                 print(f"PASS: self-test - {label}")
                 return
             print(f"FAIL: self-test - {label}: refused with {exc} (wanted {needle!r})", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 - #6435: any other exception is this cell's FAIL, never an abort
+            print(f"FAIL: self-test - {label}: unexpected {type(exc).__name__}: {exc}", file=sys.stderr)
         else:
             print(f"FAIL: self-test - {label}: not refused", file=sys.stderr)
         failures.append(label)
@@ -1454,6 +1466,10 @@ def _self_test_cases() -> int:
             report, failed = compare(base_root, repo, base_sha, head_sha, work / "scratch", guard.fixture_index_pins())
         except RuntimeError as exc:
             report, failed = f"RESULT: FAIL (closed) - {exc}", True
+        except Exception as exc:  # noqa: BLE001 - #6435: any other exception is this cell's FAIL, never an abort
+            failures.append(name)
+            print(f"FAIL: self-test - {name}: unexpected {type(exc).__name__}: {exc}", file=sys.stderr)
+            return
         if failed != want_fail or needle not in report:
             failures.append(name)
             print(f"FAIL: self-test - {name}: failed={failed} (wanted {want_fail}), needle {needle!r}\n{report}",
