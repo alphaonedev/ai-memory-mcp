@@ -3809,6 +3809,67 @@ class PruneScript6118(unittest.TestCase):
             self.assertIn("restore_mode", src, name)
 
 
+    # ---- #6479: a different file system mounted inside the target tree ----
+
+    def _other_device(self, mod: object, mounts: List[Path]):  # type: ignore[no-untyped-def]
+        """Patch ``mod.os.stat`` / ``mod.os.fstat`` so each directory in ``mounts`` and everything below it
+        reports another st_dev, the way a volume mounted there does."""
+        inos = set()
+        for top in mounts:
+            for path in [top, *top.rglob("*")]:
+                inos.add(os.lstat(str(path)).st_ino)
+        real_stat, real_fstat = os.stat, os.fstat
+
+        def moved(st: os.stat_result) -> os.stat_result:
+            if st.st_ino not in inos:
+                return st
+            fields = list(st[:10])
+            fields[2] = st.st_dev + 1
+            return os.stat_result(fields)
+
+        def fake_stat(*args, **kwargs):  # type: ignore[no-untyped-def]
+            return moved(real_stat(*args, **kwargs))
+
+        def fake_fstat(fd: int) -> os.stat_result:
+            return moved(real_fstat(fd))
+
+        dir_fd_ok = set(os.supports_dir_fd) | {fake_stat}
+        return contextlib.ExitStack(), [
+            unittest.mock.patch.object(mod.os, "stat", fake_stat),  # type: ignore[attr-defined]
+            unittest.mock.patch.object(mod.os, "fstat", fake_fstat),  # type: ignore[attr-defined]
+            unittest.mock.patch.object(mod.os, "supports_dir_fd", dir_fd_ok),  # type: ignore[attr-defined]
+        ]
+
+    def test_6118_r7_6479_prune_never_descends_into_another_file_system(self) -> None:
+        cases = [
+            ("mount below a candidate", "debug/incremental/ai_memory-xyz/mnt", "test-bins"),
+            ("mount below a candidate, scope all", "debug/incremental/ai_memory-xyz/mnt", "all"),
+            ("artifact dir is the mount", "debug/incremental", "test-bins"),
+            ("deps is the mount, scope all", "debug/deps", "all"),
+        ]
+        for label, rel, scope in cases:
+            for dry_run in (True, False):
+                with self.subTest(label, dry_run=dry_run):
+                    self.setUp()  # a fresh tree per subcase
+                    mount = self.target / rel
+                    victim = mount / "victim-on-other-volume"
+                    _write(victim, 64)
+                    mod = _load_prune()
+                    stack, patches = self._other_device(mod, [mount])
+                    out = io.StringIO()
+                    args = ["--target-dir", str(self.target), "--scope", scope] + (["--dry-run"] if dry_run else [])
+                    with stack:
+                        for patch in patches:
+                            stack.enter_context(patch)
+                        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                            rc = mod.main(args)
+                    self.assertEqual(0, rc, out.getvalue())
+                    self.assertTrue(victim.is_file(), (label, out.getvalue()))
+                    self.assertIn("other file system", out.getvalue(), label)
+                    if not dry_run and mount.name == "mnt":
+                        # the same-device artifacts around the mount still go
+                        self.assertFalse((self.target / "debug" / "deps" / "ai_memory-0a1b").exists(), label)
+
 EXAMPLE_HASHED = "debug/examples/demo-0123456789abcdef"
 EXAMPLE_UPLIFT = "debug/examples/demo"
 # Bytes the default scope frees from examples/ (the uplift pair once, two .d)
