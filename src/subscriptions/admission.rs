@@ -245,6 +245,80 @@ mod tests {
         conn.query_row(sql, [], |r| r.get(0)).expect("count")
     }
 
+    /// #6568 — a second connection's write, with no busy wait: `true` when
+    /// it is refused with `SQLITE_BUSY` because another connection already
+    /// holds the database write lock.
+    fn write_is_locked_out(db: &Path) -> bool {
+        let other = Connection::open(db).expect("probe connection");
+        other
+            .busy_timeout(std::time::Duration::ZERO)
+            .expect("busy_timeout");
+        match other.execute(
+            "INSERT INTO subscription_dlq (subscription_id, correlation_id, event_type, payload, \
+             retry_count, last_error, first_failed_at, last_failed_at) \
+             VALUES ('probe', 'probe', 'probe', '{}', 0, 'probe', 't', 't')",
+            [],
+        ) {
+            Ok(_) => false,
+            Err(rusqlite::Error::SqliteFailure(e, _)) => {
+                e.code == rusqlite::ErrorCode::DatabaseBusy
+            }
+            Err(e) => panic!("unexpected probe error: {e}"),
+        }
+    }
+
+    #[test]
+    fn admission_on_an_autocommit_caller_takes_the_write_lock_at_begin_6568() {
+        let (_keep, db) = fresh_db();
+        let conn = Connection::open(&db).expect("open");
+        let adm = Admission::begin(Some(&conn), &db);
+        assert!(
+            write_is_locked_out(&db),
+            "the admission batch must hold the write lock from BEGIN (BEGIN IMMEDIATE, #5084), \
+             not upgrade a deferred lock at its first write"
+        );
+        adm.commit().expect("commit");
+        assert!(!write_is_locked_out(&db), "commit releases the write lock");
+    }
+
+    #[test]
+    fn admission_on_the_sidecar_takes_the_write_lock_at_begin_6568() {
+        let (_keep, db) = fresh_db();
+        let adm = Admission::begin(None, &db);
+        assert!(
+            write_is_locked_out(&db),
+            "the sidecar admission batch must hold the write lock from BEGIN (#5084)"
+        );
+        adm.commit().expect("commit");
+        assert!(!write_is_locked_out(&db), "commit releases the write lock");
+    }
+
+    #[test]
+    fn the_drain_transfer_takes_the_write_lock_at_begin_6568() {
+        let (_keep, db) = fresh_db();
+        let holder = Connection::open(&db).expect("lock holder");
+        holder
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("hold the write lock");
+        let err = transfer_unstarted_to_dlq(
+            &db,
+            "sub-a",
+            "corr-a",
+            "memory_store",
+            "{}",
+            "shutdown_unstarted",
+            "t",
+        )
+        .expect_err("a held write lock must refuse the transfer");
+        holder.execute_batch("ROLLBACK").expect("release");
+        let chain = format!("{err:#}");
+        assert!(
+            chain.starts_with("shutdown DLQ transaction"),
+            "contention must surface at BEGIN IMMEDIATE (the lock is taken up front, #5084), \
+             not at the first write of a deferred transaction; got: {chain}"
+        );
+    }
+
     #[test]
     fn admission_rows_commit_together_and_survive_without_a_worker_3980() {
         let (_keep, db) = fresh_db();
