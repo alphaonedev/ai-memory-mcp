@@ -1734,6 +1734,40 @@ def _self_test_cases() -> int:
     range_cell("a shallow repository is refused instead of counting an old approval (#6573)", work, base_root,
                clones["shallow"], shallow_base, merge_sha, True, "the repository is shallow")
 
+    # #6744: the fixtures of the #6575, #6609 and #6573 cells run inside guarded(), so a fault while building one
+    # (a git that refuses `clone --depth`, a full disk) is that cell's named FAIL and the cells after it still run.
+    # Read from this file's own syntax tree: no `fresh_pair` call for those fixtures may sit directly in the body of
+    # _self_test_cases, and the function that holds each one must be handed to guarded().
+    ROUND4_FIXTURES = ("showsigverifier", "nonasciiapprover", "shallow")
+
+    def fixtures_guarded_cell():
+        tree = ast.parse(Path(__file__).resolve().read_text(encoding="utf-8"))
+        outer = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                     and node.name == "_self_test_cases")
+        handed = {arg.id for node in ast.walk(outer) if isinstance(node, ast.Call)
+                  and isinstance(node.func, ast.Name) and node.func.id == "guarded"
+                  for arg in node.args[1:] if isinstance(arg, ast.Name)}
+        found = {}
+
+        def visit(node, holder):
+            for child in ast.iter_child_nodes(node):
+                inner = child.name if isinstance(child, ast.FunctionDef) else holder
+                if (isinstance(child, ast.Call) and isinstance(child.func, ast.Name) and child.func.id == "fresh_pair"
+                        and child.args and isinstance(child.args[0], ast.Constant)):
+                    found[child.args[0].value] = holder
+                visit(child, inner)
+
+        visit(outer, None)
+        return {name: found.get(name) for name in ROUND4_FIXTURES}, handed
+
+    holders, handed = fixtures_guarded_cell()
+    loose = [name for name, holder in holders.items() if holder is None or holder not in handed]
+    if loose:
+        failures.append("round-4 fixtures outside guarded")
+        print(f"FAIL: self-test - the fixtures {loose!r} are built outside guarded() (#6744)", file=sys.stderr)
+    else:
+        print("PASS: self-test - the #6575, #6609 and #6573 fixtures are built inside guarded() (#6744)")
+
     # #5180: the COUNT CHANGED branch uses the same dynamic fence as the rule branch; no other census diff carries
     # a backtick run, so a static fence there was never caught.
     work, _, _ = fresh_pair("countfence")
