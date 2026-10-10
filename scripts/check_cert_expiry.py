@@ -1638,7 +1638,7 @@ SELF_TEST_OK = (
     "GITHUB_EVENT_BEFORE / GITHUB_SHA (push) pass the validator and fail cleanly at the later "
     "lookup; (pr4-sha-case, #6144) upper-case 40/64-hex shas pass the validator on every "
     "validated key; (pr4-sha-len) 63/65-hex, 40 non-ASCII-digit (Arabic-Indic, fullwidth, superscript), 40 non-hex ASCII, newline- or CR-suffixed and space-prefixed 40-hex values, BOM-, bidi-override-, combining-mark- and Cyrillic-look-alike 40/64-hex values (#6463), and every str.isspace() character as a prefix and as a suffix of a 40-hex value, refused on every validated sha site (PR_HEAD_SHA, GITHUB_SHA and PR_BASE_SHA on pull_request; GITHUB_EVENT_BEFORE and GITHUB_SHA on push) with only the "
-    "`git --version` probe traced before the validator."
+    "`git --version` probe traced before the validator; (pr4-sha-comment, #6649) the comment block above the sha values names each loosening and claims no false only-cell; (pr4-sha-ast, #6697) an ast pin of the five env_sha(env, KEY) read sites, env_sha and ENV_SHA_RE."
 )
 
 
