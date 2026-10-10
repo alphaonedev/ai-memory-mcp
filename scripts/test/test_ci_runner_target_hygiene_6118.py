@@ -4069,6 +4069,23 @@ class PruneScript6118(unittest.TestCase):
                     self.assertIn("refusing: %s changed while it was being checked" % self.target, out.getvalue())
                     self.assertEqual(before, self._snapshot(self.target), out.getvalue())
 
+    # ---- #6528: the NothingToPrune notice carries warnings=0 ----
+
+    def test_6118_r7_6528_nothing_to_prune_notice_ends_with_warnings_0(self) -> None:
+        no_profile = Path(self.scratch.name) / "fresh-target"  # cargo wrote the tag, no build ran yet
+        no_profile.mkdir()
+        (no_profile / "CACHEDIR.TAG").write_bytes(_load_prune().CACHEDIR_SIGNATURE + b"\n")
+        for label, target in (("absent target", Path(self.scratch.name) / "absent"), ("no profile dir", no_profile)):
+            for dry in (False, True):
+                with self.subTest(label, dry_run=dry):
+                    proc = self._run("--target-dir", str(target), *(["--dry-run"] if dry else []))
+                    self.assertEqual(0, proc.returncode, proc.stdout + proc.stderr)
+                    self.assertIn("nothing to prune", proc.stdout)
+                    notices = [line for line in proc.stdout.splitlines() if line.startswith("::notice::")]
+                    self.assertEqual(1, len(notices), proc.stdout)
+                    self.assertTrue(notices[0].endswith(" warnings=0"), notices[0])
+                    self.assertIn("mode=%s " % ("dry-run" if dry else "pruned"), notices[0])
+
 EXAMPLE_HASHED = "debug/examples/demo-0123456789abcdef"
 EXAMPLE_UPLIFT = "debug/examples/demo"
 # Bytes the default scope frees from examples/ (the uplift pair once, two .d)
