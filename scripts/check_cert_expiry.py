@@ -688,6 +688,30 @@ def ledger_append_only(repo, mb, judged):
     return ""
 
 
+RECORD_FLOOR_CAP_DAYS = 14
+
+
+def _record_floor(repo, mb, judged, header):
+    """Earliest date a new record may carry (#6421; 5-agent vote 4d3ea1c5,
+    F4-A): the committer day of the first commit in MB..JUDGED that adds the
+    record's header, less one, so queue latency and a moving base cannot turn
+    an honest record red. The committer date is author-controlled, so the
+    floor is never lower than RECORD_FLOOR_CAP_DAYS below the merge-base
+    commit day. No commit adding the header found: the judged commit day."""
+    cap = _commit_day(repo, mb) - datetime.timedelta(days=RECORD_FLOOR_CAP_DAYS)
+    proc = run_git(repo, "log", "-m", "--reverse", "--format=%cs", "-S" + header.rstrip("\r"),
+                   "--end-of-options", f"{mb}..{judged}", "--", CERT_DOC)
+    if proc.returncode != 0:
+        err = _doc_safe(proc.stderr.decode("utf-8", "replace").strip())
+        raise GateError(f"git log {mb}..{judged} exited {proc.returncode}: {err}")
+    days = proc.stdout.decode("utf-8", "replace").split()
+    try:
+        own = datetime.date.fromisoformat(days[0]) if days else _commit_day(repo, judged)
+    except ValueError as exc:
+        raise GateError(f"committer date of the record commit is unreadable: {days[0]!r}") from exc
+    return max(own - datetime.timedelta(days=1), cap)
+
+
 def _in_ledger(lines, known, start, end):
     """True iff the record at LINES[start:end] sits in the ledger (#6420):
     LINES[end] (past at most one blank '>' line) is the header of a KNOWN
@@ -784,12 +808,13 @@ def amendment_verdict(repo, mb, judged, required):
         else:
             today = datetime.datetime.now(datetime.timezone.utc).date()
             latest = min(_commit_day(repo, judged), today) + datetime.timedelta(days=1)
-            earliest = _commit_day(repo, mb) - datetime.timedelta(days=1)
+            earliest = _record_floor(repo, mb, judged, ent["header"])
             if day > latest:
                 why.append(f"{at}: {head.group(1)} is in the future (after {latest})")
             if day < earliest:
-                why.append(f"{at}: {head.group(1)} is before the merge-base commit day less "
-                           f"one ({earliest}); a record is dated when it is written")
+                why.append(f"{at}: {head.group(1)} is before the day its record was "
+                           f"committed less one ({earliest}); a record is dated when it is "
+                           "written")
     if not _is_sep([prev], 0):
         why.append(f"{at}: its header must open its own paragraph (a blank line or a blank "
                    "'>' line before it)")
@@ -2507,7 +2532,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     f15d = edit_range("\n" + amend("#6162", [mod_rs], date=(
         day6124 - datetime.timedelta(days=3)).isoformat()), label="f15d")
     t.expect_red("6124-f15d", "header back-dated before the merge-base day", repo, exp6124,
-                 f15d, red6124 + [("before the merge-base", "did not name the date floor")])
+                 f15d, red6124 + [("is before", "did not name the date floor")])
 
     # (6124-l*) RED (R3-F1 #6365 residual, #6443): an HTML block or a fence
     # opened inside a LIST ITEM of the ledger blockquote (`> - ` and `> 1. `
@@ -2712,7 +2737,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
             ("t2", "record dated 2 days before its own commit day", 6, 8, False),
             ("t3", "forged commit date 30 days back", 30, 30, False)):
         cell_t = at_day(ago, lambda: edit_range(
-            "\n" + amend("#6162", [mod_rs], date=dated(rec_ago)), label=tag, frm=mb_t))
+            "\nBase prose.\n\n" + amend("#6162", [mod_rs], date=dated(rec_ago)),
+            label=tag, frm=mb_t))
         if green:
             t.expect_green(f"6124-{tag}", label, repo, mb_t, cell_t, green6124)
         else:
