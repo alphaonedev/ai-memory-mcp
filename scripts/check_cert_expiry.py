@@ -3475,6 +3475,11 @@ def _ws_format_cells(t):
     # #6760: one line, two refused characters -> one line number, not one per character.
     _ws_format_cell(t, "tr-s-ws-oneline", "name: u\n# a\u00a0b\u3000c\n",
                     ("line 2 (1 in this file)", "(U+00A0, U+3000)"), absent=("lines ",))
+    # #6761: a repeated code point is listed once, in first-seen order.
+    _ws_format_cell(t, "tr-s-ws-dedup", "name: u\n# a b c　d\n", ("(U+00A0, U+3000)",),
+                    absent=("U+00A0, U+00A0",))
+    _ws_format_cell(t, "tr-s-ws-dedup-order", "name: u\n# a　b c d\n#  \n",
+                    ("lines 2, 3 (2 in this file)", "(U+3000, U+00A0)"))
 
 
 def _ws_wording_cells(t):
