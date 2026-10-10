@@ -156,7 +156,9 @@ without a cell: a proc-macro that rewrites its input, a trait impl method
 replaced by the trait's default, a `mod` declared but never used, a condition
 that is constant only after evaluation (`if 1 > 2`), and a closure that is never
 called. The #6140 trust model applies as well: the gate runs the change's own
-copy of this script, so it is defense in depth beside review.
+copy of this script, so it is defense in depth beside review. The
+compiled-liveness authority (a per-identifier behavioural test against the
+release binary in a cargo-tier gate) is tracked in #6911.
 This gate does not re-run 5.4(2)-(5); it only forces the
 cert-doc to be touched so a human/re-issue cannot be skipped.
 
