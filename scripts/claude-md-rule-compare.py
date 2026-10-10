@@ -123,7 +123,6 @@ CREDENTIAL_VALUE = re.compile(
 # A line that starts with `|` (after a diff prefix) is a table row; elsewhere a `|` inside a code span (a regex
 # alternation such as `password|secret|token` in rule prose) separates no cells.
 TABLE_ROW_START = re.compile(r"[+ -]?\s*\|")
-CODE_SPAN = re.compile(r"(`+).*?\1")
 # #6210 round 4 (security F5): a GitHub Flavored Markdown row may omit its leading pipe (`password | v |`), so a name
 # cell may also start the line (after an optional diff prefix).
 TABLE_NAME_CELL = re.compile(r"(?i)(?:^[+ -]?\s*|\|\s*)[*_`]{0,2}(" + CREDENTIAL_NAME + r")[*_`]{0,2}\s*(?=\|)")
@@ -188,8 +187,9 @@ JWK_TYPE = re.compile(r"\"kty\"\s*:")
 JWK_MEMBER_MIN = 16
 # #6211: a credential name with no value on its line (`api_key:`); the value is on the next line that is not blank.
 # Round 5 (#6663, #6614): a YAML comment (`\s+#...`) may follow the bare name; the value is still on the next line.
-NAME_ONLY = re.compile(r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")(?:[*_]{1,2}|[\"'`])?\s*[:=]\s*(?:[*_]{1,2})?\s*"
-                       r"(?:\s+#.*)?$")
+# The classes are written so no two adjacent parts match the same character (no super-linear backtracking, #6613).
+NAME_ONLY = re.compile(r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")(?:[*_]{1,2}|[\"'`])?\s*[:=]\s*(?:[*_]{1,2}\s*)?"
+                       r"(?:(?<=\s)#.*)?$")
 # #6211 round 4 (security F1): a YAML block scalar under a credential name (`private_key: |`, `secret: >-`); every
 # following line more indented than the name line is the value. BLOCK_INDICATOR is the indicator alone, which
 # mask_named_values leaves visible.
@@ -382,12 +382,35 @@ def prose_cell(name: str, value: str) -> bool:
                                        and all(plain_word(name, word) or PROSE_WORD.fullmatch(word) for word in words))
 
 
+def blank_code_span_pipes(line: str) -> str:
+    """#6613: `line` with every `|` inside a Markdown code span turned into a space. One left-to-right pass: a run of n
+    backticks opens a span that the next n backticks close; a run with no closer is literal text (its pipes stay
+    separators, which masks more, never less). Linear in the line length per run, the line is capped at MAX_MASK_LINE."""
+    out, index = [], 0
+    while True:
+        start = line.find("`", index)
+        if start < 0:
+            break
+        stop = start
+        while stop < len(line) and line[stop] == "`":
+            stop += 1
+        closer = line.find(line[start:stop], stop)
+        if closer < 0:
+            out.append(line[index:stop])
+            index = stop
+            continue
+        out.append(line[index:start])
+        out.append(line[start:closer + stop - start].replace("|", " "))
+        index = closer + stop - start
+    out.append(line[index:])
+    return "".join(out)
+
+
 def mask_table_cells(line: str) -> tuple:
     """#6210: in a Markdown table row with a credential-name cell, mask every later cell that is not prose_cell
     (Markdown emphasis and code quotes around the cell ignored); returns (line, count). A `|` inside a code span of a
-    line that does not start with `|` is not a cell separator (TABLE_ROW_START, CODE_SPAN)."""
-    scan = line if TABLE_ROW_START.match(line) else CODE_SPAN.sub(lambda span_match: span_match.group(0).replace(
-        "|", " "), line)
+    line that does not start with `|` is not a cell separator (TABLE_ROW_START, blank_code_span_pipes)."""
+    scan = line if TABLE_ROW_START.match(line) else blank_code_span_pipes(line)
     match = TABLE_NAME_CELL.search(scan)
     if match is None:
         return line, 0
@@ -471,6 +494,17 @@ def value_line_indexes(lines: list, key_indexes=frozenset()) -> set:
     inside, pending, block, triple = set(), None, None, None
     for index, line in enumerate(lines):
         content = line.strip()
+        if index not in key_indexes and len(line) > MAX_MASK_LINE:
+            # #6613: a line this long is hidden whole by Redactor.mask_rows, so no pattern runs on it here; it is a
+            # value line when a name or a block or a triple quote is waiting for one.
+            if pending is not None or triple is not None or (block is not None and indent_width(line) > block):
+                inside.add(index)
+            if triple is not None and triple in line:
+                triple = None
+            if block is not None and indent_width(line) <= block:
+                block = None
+            pending = None
+            continue
         if index in key_indexes:
             pending = None  # round 5 (#6665): the block state stays, a later more-indented line is still a block line
             if triple is not None and triple in line:
@@ -547,6 +581,12 @@ class Redactor:
                 out.append(line[:1] + MASK if line[:1] in "+- " else MASK)
                 continue
             if kind == "value":
+                body = line[1:] if prefixed else line
+                self.count += 1
+                out.append(line[:len(line) - len(body.lstrip())] + MASK)
+                continue
+            if len(line[1:] if prefixed else line) > MAX_MASK_LINE:
+                # #6613: no pattern runs on a line this long (cost); it is hidden whole, fail closed.
                 body = line[1:] if prefixed else line
                 self.count += 1
                 out.append(line[:len(line) - len(body.lstrip())] + MASK)
