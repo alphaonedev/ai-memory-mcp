@@ -1117,3 +1117,71 @@ Status `queued`, conclusion `-`, created 2026-10-10T16:53:19Z, updated 2026-10-1
 | job id | job | runner | created | queue wait | started | ended | duration | conclusion |
 |---|---|---|---|---|---|---|---|---|
 | 114263777897 | Certified pg+AGE cells (live PG 18.6 + AGE 1.8.0 + pgvector 0.8.6) | - | 16:53:19Z | 0.0 min | 16:53:19Z |  | - | queued |
+
+## Update 17:06Z: run 38069454811 Certified Postgres + AGE + pgvector tier (#2548) (fix/6142-promo6-ssh @ 46efe00ab) reached terminal state
+
+Status `completed`, conclusion `success`, created 2026-10-10T16:52:59Z, updated 2026-10-10T17:06:12Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38069454811
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114263710996 | Certified pg+AGE cells (live PG 18.6 + AGE 1.8.0 + pgvector 0.8.6) | f2-linux-fed | 16:52:59Z | 0.0 min | 16:53:00Z | 17:06:11 | 13.2 min | success |
+
+## Update 17:06Z: run 38069459459 Certified Postgres + AGE + pgvector tier (#2548) (fix/6157-promo6-ssh @ 41b051b3c) changed to in_progress/
+
+Status `in_progress`, conclusion `-`, created 2026-10-10T16:53:03Z, updated 2026-10-10T17:06:13Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38069459459
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114263724600 | Certified pg+AGE cells (live PG 18.6 + AGE 1.8.0 + pgvector 0.8.6) | f2-linux-fed | 16:53:03Z | 13.2 min | 17:06:12Z |  | - | in_progress |
+
+## Update 17:06Z: run 38069459565 c8-precheck (fix/6157-promo6-ssh @ 41b051b3c) reached terminal state
+
+Status `completed`, conclusion `success`, created 2026-10-10T16:53:03Z, updated 2026-10-10T17:00:12Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38069459565
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114263725222 | Doc symbol/path anchor gate (#2629) | GitHub Actions 1000125280 | 16:53:03Z | 0.1 min | 16:53:06Z | 16:53:23 | 0.3 min | success |
+| 114263725377 | Truthy-grammar consolidation gate (#3200) | GitHub Actions 1000125320 | 16:53:03Z | 0.6 min | 16:53:40Z | 16:53:54 | 0.2 min | success |
+| 114263725412 | SDK-path vs routes.rs membership gate (#2629) | GitHub Actions 1000125333 | 16:53:03Z | 0.9 min | 16:53:57Z | 16:54:03 | 0.1 min | success |
+| 114263725418 | Count-assertion declaration gate (#5499) | GitHub Actions 1000125324 | 16:53:03Z | 0.7 min | 16:53:47Z | 16:54:07 | 0.3 min | success |
+| 114263725424 | SDK TLS-scheme + CA-trust gate (#3782) | GitHub Actions 1000125352 | 16:53:03Z | 1.2 min | 16:54:16Z | 16:54:23 | 0.1 min | success |
+| 114263725435 | C8 caller-context allowlist check | GitHub Actions 1000125345 | 16:53:03Z | 1.1 min | 16:54:09Z | 16:54:34 | 0.4 min | success |
+| 114263725440 | Enterprise-federation cert-expiry gate (cert §7 / F7) | GitHub Actions 1000125346 | 16:53:03Z | 1.1 min | 16:54:12Z | 16:54:34 | 0.4 min | success |
+| 114263725450 | Git-dependency-source supply-chain gate (#2050/#2512) | GitHub Actions 1000125339 | 16:53:03Z | 1.0 min | 16:54:04Z | 16:54:11 | 0.1 min | success |
+| 114263725464 | SQLite write-transaction IMMEDIATE gate (#5084) | GitHub Actions 1000125381 | 16:53:03Z | 1.8 min | 16:54:52Z | 16:55:04 | 0.2 min | success |
+| 114263725479 | Capacity-claim ceiling gate (#2869) | GitHub Actions 1000125362 | 16:53:03Z | 1.4 min | 16:54:26Z | 16:54:39 | 0.2 min | success |
+| 114263725484 | Const-name-literal identifier gate (#3121) | GitHub Actions 1000125388 | 16:53:03Z | 1.9 min | 16:54:57Z | 16:55:20 | 0.4 min | success |
+| 114263725494 | Hardcoded-literal duplication ratchet (pm-v3.1) | GitHub Actions 1000125382 | 16:53:03Z | 1.8 min | 16:54:52Z | 16:55:14 | 0.4 min | success |
+| 114263725499 | External-PR operator-approval gate (author outside team => @alphaonedev review) | GitHub Actions 1000125363 | 16:53:03Z | 1.4 min | 16:54:27Z | 16:54:30 | 0.1 min | success |
+| 114263725502 | No-credentials-on-argv gate (#4577) | GitHub Actions 1000125394 | 16:53:03Z | 2.0 min | 16:55:06Z | 16:55:15 | 0.1 min | success |
+| 114263725504 | MCP transport-isolation gate (#3829) | GitHub Actions 1000125350 | 16:53:03Z | 1.2 min | 16:54:13Z | 16:54:19 | 0.1 min | success |
+| 114263725510 | Cloud-init ASCII gate | GitHub Actions 1000125364 | 16:53:03Z | 1.4 min | 16:54:30Z | 16:54:38 | 0.1 min | success |
+| 114263725519 | Named-CI-job existence + enforcement-truthfulness gate (#2629) | GitHub Actions 1000125383 | 16:53:03Z | 1.8 min | 16:54:53Z | 16:55:07 | 0.2 min | success |
+| 114263725534 | Foreign-text-to-caller gate (#3688 gate 7) | GitHub Actions 1000125375 | 16:53:03Z | 1.6 min | 16:54:40Z | 16:55:06 | 0.4 min | success |
+| 114263725543 | Docs vs SSOT drift gate | GitHub Actions 1000125395 | 16:53:03Z | 2.0 min | 16:55:05Z | 16:55:44 | 0.7 min | success |
+| 114263725548 | Declaration hash gate (#3557) | GitHub Actions 1000125401 | 16:53:03Z | 2.1 min | 16:55:10Z | 16:55:25 | 0.2 min | success |
+| 114263725552 | Test-reachable stdin-read gate (#1989) | GitHub Actions 1000125376 | 16:53:03Z | 1.6 min | 16:54:41Z | 16:55:13 | 0.5 min | success |
+| 114263725555 | Installer checksum fail-closed gate (#2449) | GitHub Actions 1000125385 | 16:53:03Z | 1.9 min | 16:54:55Z | 16:55:01 | 0.1 min | success |
+| 114263725561 | Migration-ladder-uniqueness gate (guardrail-D) | GitHub Actions 1000125393 | 16:53:03Z | 2.0 min | 16:55:04Z | 16:55:39 | 0.6 min | success |
+| 114263725567 | Claude plugin manifest gate (#3967) | GitHub Actions 1000125386 | 16:53:03Z | 1.9 min | 16:54:55Z | 16:55:03 | 0.1 min | success |
+| 114263725572 | Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10) | GitHub Actions 1000125448 | 16:53:04Z | 6.0 min | 16:59:02Z | 16:59:35 | 0.6 min | success |
+| 114263725580 | Benchmark-claim canon gate (#2879) | GitHub Actions 1000125374 | 16:53:04Z | 1.6 min | 16:54:40Z | 16:54:50 | 0.2 min | success |
+| 114263725590 | Commit-signing posture gate (#2486) | GitHub Actions 1000125449 | 16:53:04Z | 6.2 min | 16:59:19Z | 16:59:39 | 0.3 min | success |
+| 114263725592 | Non-Rust conformance-reader proof gate (#2452) | GitHub Actions 1000125411 | 16:53:04Z | 2.3 min | 16:55:22Z | 16:55:40 | 0.3 min | success |
+| 114263725595 | Test key-dir mode gate (#3733) | GitHub Actions 1000125389 | 16:53:04Z | 1.9 min | 16:55:00Z | 16:55:09 | 0.1 min | success |
+| 114263725603 | L3-boundary perma-ban gate (§25.3 S5 / RQ-10 #1853) | GitHub Actions 1000125452 | 16:53:04Z | 6.8 min | 16:59:50Z | 17:00:04 | 0.2 min | success |
+| 114263725618 | URL-sink redaction gate (#3688 / #3967) | GitHub Actions 1000125387 | 16:53:04Z | 1.9 min | 16:54:55Z | 16:55:25 | 0.5 min | success |
+| 114263725625 | Stale contract-assertion gate (#3688 / #3967) | GitHub Actions 1000125438 | 16:53:04Z | 3.8 min | 16:56:49Z | 16:57:08 | 0.3 min | success |
+| 114263725628 | Doc surface completeness gate (#2839) | GitHub Actions 1000125453 | 16:53:04Z | 6.8 min | 16:59:50Z | 16:59:58 | 0.1 min | success |
+| 114263725633 | Test-env $HOME-lock gate (#2146) | GitHub Actions 1000125428 | 16:53:04Z | 2.9 min | 16:55:57Z | 16:57:11 | 1.2 min | success |
+| 114263725657 | CREATE EXTENSION allowlist gate (#2648) | GitHub Actions 1000125455 | 16:53:04Z | 6.9 min | 17:00:00Z | 17:00:11 | 0.2 min | success |
+| 114263725658 | Required-context + classify-base soundness gate (#2494/#2496/#2508) | GitHub Actions 1000125286 | 16:53:04Z | 0.1 min | 16:53:11Z | 16:53:48 | 0.6 min | success |
+
+## Update 17:06Z: run 38069478180 Per-Module Coverage Thresholds (fix/6152-6153-promo6-ssh @ 3406b3338) changed to in_progress/
+
+Status `in_progress`, conclusion `-`, created 2026-10-10T16:53:19Z, updated 2026-10-10T16:57:13Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38069478180
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114263777794 | Coverage classify (docs-only short-circuit) | GitHub Actions 1000125361 | 16:53:19Z | 1.1 min | 16:54:25Z | 16:54:33 | 0.1 min | success |
+| 114264023380 | Per-Module Coverage Thresholds | GitHub Actions 1000125443 | 16:54:34Z | 2.6 min | 16:57:13Z |  | - | in_progress |
