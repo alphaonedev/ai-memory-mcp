@@ -87,7 +87,7 @@
     "path": "src/wake_hub/startup.rs",
     "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
     "mode": "rust-production-tokens",
-    "sha256": "f12102376634db8f19dfd0e7fd9a38a3763be6b7cf1ed0f0fc74d0da1f32794c"
+    "sha256": "7ec1bc0e0357672fca9fefcd4c748792257b4695f69c4a472f2be276c3bb79cc"
   },
   {
     "path": "src/wake_client/bundle.rs",
@@ -99,7 +99,7 @@
     "path": "src/wake_client/mod.rs",
     "role": "Client bundle/session/signal boundary; decode hints and request a read, never write memory.",
     "mode": "rust-production-tokens",
-    "sha256": "6044e3880be01ddf7348430e7ad18f51fea9406641579f2e57bfc76a1b3422ca"
+    "sha256": "7cad4fc0e315b4f7f326fcfda799dce8d131f707138bf38e63bb8e72017d0e38"
   },
   {
     "path": "src/wake_client/session.rs",
@@ -141,7 +141,7 @@
     "path": "src/cli/wake_listen.rs",
     "role": "Operator-resolved caller catch_up_read -> handle_inbox; refuses a Postgres store before opening the local sidecar (#3730, control-plane guard ahead of the content path); metadata rendering; operator --exec via audited_tokio_command.",
     "mode": "rust-production-tokens",
-    "sha256": "cffd2e342d1de14c190520b2c5784a3ff1463a50d87fb1ee8d6c5166ec7f5bcf"
+    "sha256": "46a49b081ff392e269f5a89dbf59ccd83edb48fd9657233205ab0387a307d1a2"
   },
   {
     "path": "src/inbox_wake.rs",
@@ -171,6 +171,6 @@
     "path": "sdk/typescript/src/wake.ts",
     "role": "TypeScript decoder/state machine -> metadata WakeSignal -> operator-provided onSignal callback; external trust boundary.",
     "mode": "sdk-source-bytes",
-    "sha256": "eb190b501757892e23e53db83c6217fa2a56396d6662425b9ad9c1559d6af0b2"
+    "sha256": "b51d5fbff50d33423eb41f67ae3e1b937a55a207fa0095947f918090fefd7ac6"
   }
 ]
