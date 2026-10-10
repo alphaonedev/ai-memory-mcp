@@ -138,6 +138,9 @@ pub use shape::{
 /// #3808 + #3819 — the `[llm.auto_tag]` reality gap (ignored endpoint keys +
 /// the live model override). Child module so config.rs stays under its ceiling.
 mod auto_tag_endpoint;
+/// #6701 — credential-free `Debug` for the LLM / embeddings sections.
+/// Child module so config.rs stays under its ceiling.
+mod debug_redact;
 /// v1.0.0 #3715 item 3 — the key deprecation lifecycle, as data.
 pub mod deprecated_keys;
 /// #3823 — refuse a non-loopback plaintext inference endpoint at config
@@ -3603,17 +3606,19 @@ pub struct AppConfig {
 
 // #1454 (SEC, LOW) — manual `Debug` so the `api_key` secret renders as
 // `<redacted>` instead of leaking through a `{:?}` of the whole config
-// (mirrors the `ResolvedLlm` redaction model further down this file).
-// Every other field is rendered verbatim. KEEP IN SYNC: a new field on
+// (mirrors the `ResolvedLlm` redaction model in `config/debug_redact.rs`).
+// `db` and the URL fields go through `url_display` (#6701). KEEP IN SYNC: a new field on
 // `AppConfig` must be mirrored here or it silently drops from Debug.
 #[allow(deprecated)] // legacy flat fields are deprecated but still debugged
 impl std::fmt::Debug for AppConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::url_display::{db_path_display as shown, url_origin}; // #6701: no credential
+        let urls = |u: &Option<String>| u.as_deref().map(url_origin);
         f.debug_struct("AppConfig")
             .field("tier", &self.tier)
-            .field("db", &self.db)
-            .field(config_keys::OLLAMA_URL, &self.ollama_url)
-            .field("embed_url", &self.embed_url)
+            .field("db", &self.db.as_deref().map(|d| shown(Path::new(d))))
+            .field(config_keys::OLLAMA_URL, &urls(&self.ollama_url))
+            .field("embed_url", &urls(&self.embed_url))
             .field(config_keys::EMBEDDING_MODEL, &self.embedding_model)
             .field("llm_model", &self.llm_model)
             .field(config_keys::AUTO_TAG_MODEL, &self.auto_tag_model)
@@ -3661,7 +3666,7 @@ impl std::fmt::Debug for AppConfig {
             .field("llm_call_timeout_secs", &self.llm_call_timeout_secs)
             .field(
                 "mcp_federation_forward_url",
-                &self.mcp_federation_forward_url,
+                &urls(&self.mcp_federation_forward_url),
             )
             .field("agents", &self.agents)
             .field("governance", &self.governance)
@@ -3914,34 +3919,12 @@ pub struct LlmSection {
     pub auto_tag: Option<LlmAutoTagSection>,
 }
 
-// #1454 (SEC, LOW) — manual `Debug` redacts the parse-time-rejected
-// inline `api_key` so a `{:?}` of an `LlmSection` never echoes a secret
-// (mirrors `ResolvedLlm`). `api_key_env` / `api_key_file` are env-var
-// names / file paths (config, not secret) and stay verbatim. KEEP IN
-// SYNC: a new field must be mirrored here or it drops from Debug.
-impl std::fmt::Debug for LlmSection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LlmSection")
-            .field("backend", &self.backend)
-            .field("model", &self.model)
-            .field("base_url", &self.base_url)
-            .field("api_key_env", &self.api_key_env)
-            .field("api_key_file", &self.api_key_file)
-            .field(
-                "api_key",
-                &self.api_key.as_ref().map(|_| crate::REDACTED_PLACEHOLDER),
-            )
-            .field("auto_tag", &self.auto_tag)
-            .finish()
-    }
-}
-
 /// v0.7.x (#1146) — `[llm.auto_tag]` sub-table. Fast structured-output
 /// sibling of [`LlmSection`]. Fields fall back to the parent `[llm]`
 /// section field-by-field when unset; commonly only `model` is
 /// overridden to point at a faster model (default `gemma3:4b`,
 /// ~0.7s p50 vs ~15s p50 for thinking-mode Gemma 4 per L15 patch).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct LlmAutoTagSection {
     /// Backend override. Unset = inherit `[llm].backend`.
     pub backend: Option<String>,
@@ -3978,7 +3961,7 @@ pub struct LlmAutoTagSection {
 /// backfill_batch = 100                         # 1-10000 (env override:
 ///                                              # AI_MEMORY_EMBED_BACKFILL_BATCH)
 /// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct EmbeddingsSection {
     /// Embedding backend. `ollama` (the default — local `/api/embed`
     /// wire shape) or, since #1598, any #1067 OpenAI-compatible alias
@@ -4560,22 +4543,6 @@ impl ResolvedLlm {
     }
 }
 
-impl std::fmt::Debug for ResolvedLlm {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResolvedLlm")
-            .field("backend", &self.backend)
-            .field("model", &self.model)
-            .field("base_url", &self.base_url)
-            .field(
-                "api_key",
-                &self.api_key.as_ref().map(|_| crate::REDACTED_PLACEHOLDER),
-            )
-            .field("api_key_source", &self.api_key_source)
-            .field("source", &self.source)
-            .finish()
-    }
-}
-
 /// Canonical resolved-embedder configuration. Produced by
 /// [`AppConfig::resolve_embeddings`].
 ///
@@ -4677,29 +4644,6 @@ impl ResolvedEmbeddings {
     pub fn with_requested_dim(mut self, dim: Option<u32>) -> Self {
         self.requested_dim = dim;
         self
-    }
-}
-
-impl std::fmt::Debug for ResolvedEmbeddings {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResolvedEmbeddings")
-            .field("backend", &self.backend)
-            .field("url", &self.url)
-            .field("model", &self.model)
-            .field("backfill_batch", &self.backfill_batch)
-            .field(
-                crate::models::field_names::EMBEDDING_DIM,
-                &self.embedding_dim,
-            )
-            .field("requested_dim", &self.requested_dim)
-            .field("dim_source", &self.dim_source)
-            .field(
-                "api_key",
-                &self.api_key.as_ref().map(|_| crate::REDACTED_PLACEHOLDER),
-            )
-            .field("key_source", &self.key_source)
-            .field("source", &self.source)
-            .finish()
     }
 }
 
