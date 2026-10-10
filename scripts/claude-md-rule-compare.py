@@ -2075,6 +2075,24 @@ def _self_test_cases() -> int:
 
     guarded("the #6744 pin records an unguarded fixture (#6884) fixture", unguarded_fixture_pin_cell)
 
+    # #6885: the proof above removes only the failures it raised itself. A red cell that ran before it must survive,
+    # so a seeded earlier failure has to still be in the list after the proof has cleaned up.
+    def earlier_failure_kept_cell():
+        earlier = "a red cell that ran earlier (#6885)"
+        failures.append(earlier)
+        with contextlib.redirect_stdout(io.StringIO()):
+            pin_fault_cell()
+        kept = earlier in failures
+        failures[:] = [item for item in failures if item != earlier]  # the seeded entry must not fail the real run
+        if not kept:
+            failures.append("the pin-fault proof erased an earlier failure")
+            print("FAIL: self-test - the faulted-pin proof removed a failure recorded before it ran (#6885)",
+                  file=sys.stderr)
+        else:
+            print("PASS: self-test - the faulted-pin proof keeps the failures recorded before it (#6885)")
+
+    guarded("the pin-fault proof keeps earlier failures (#6885) fixture", earlier_failure_kept_cell)
+
     # #5180: the COUNT CHANGED branch uses the same dynamic fence as the rule branch; no other census diff carries
     # a backtick run, so a static fence there was never caught.
     work, _, _ = fresh_pair("countfence")
