@@ -870,6 +870,34 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                     if not good:
                         self.assert_nothing_installed()
 
+    def test_an_empty_effective_dbname_is_refused_6871(self):
+        # #6871: libpq takes the LAST dbname key, and a dbname key beats the URL path.  When that value is empty
+        # libpq falls back to the user name, so each of these URLs names no database and is refused before any
+        # restore or psql call, whatever PGDATABASE the caller sets.
+        for text in ("postgres://ciuser@127.0.0.1:5445/?dbname=cidb&dbname=",
+                     "postgres://ciuser@127.0.0.1:5445/cidb?dbname=",
+                     "postgres://ciuser@127.0.0.1:5445/cidb?dbname=other&%64bname=",
+                     "postgres://ciuser:pw-6871@127.0.0.1:5445/cidb?sslmode=disable&dbname=&application_name=a"):
+            with self.subTest(url=text.split("@", 1)[1]):
+                (self.base / "psql.log").unlink(missing_ok=True)
+                self.url_file.write_text(text + "\n")
+                r = self.run_script(env=dict(os.environ, PGDATABASE="callerdb"))
+                self.assert_fails(r, 2, "tier URL file names no database")
+                self.assertNotIn("pw-6871", r.stdout + r.stderr)
+                self.assertFalse((self.base / "psql.log").exists())
+                self.assert_nothing_installed()
+        # A non-empty last dbname names the database even after an empty one or a path database (libpq reads it).
+        for text in ("postgres://ciuser@127.0.0.1:5445/?dbname=&dbname=cidb",
+                     "postgres://ciuser@127.0.0.1:5445/other?dbname=cidb"):
+            with self.subTest(accepted=text.split("@", 1)[1]):
+                (self.base / "psql.log").unlink(missing_ok=True)
+                self.url_file.write_text(text + "\n")
+                r = self.run_script()
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
+                self.assertTrue(calls)
+                self.assertTrue(all(call["argv"][1].endswith("dbname=cidb") for call in calls), calls)
+
     def test_service_key_in_url_is_refused_by_name(self):
         # libpq fills unset options from the service file BEFORE it reads PGPASSWORD, so a service
         # entry carrying a password beats the moved password (the URL password beat it originally).
@@ -1908,6 +1936,29 @@ class LibpqOracleTests(unittest.TestCase):
             except self.mod.HelperError:
                 continue
         self.assertGreaterEqual(accepted, 100, "the fuzz must reach accepted URLs, not only refusals")
+
+    def test_every_url_probe_target_accepts_names_a_database_for_libpq_6871(self):
+        # #6871: the helper's database rule must agree with libpq: libpq's own parse of every URL that probe_target
+        # accepts yields a non-empty dbname, and libpq's parse of each refused #6871 shape yields an empty one.
+        refused = ("postgres://u@h:5445/?dbname=x&dbname=", "postgres://u@h:5445/db?dbname=",
+                   "postgres://u@h:5445/db?dbname=x&%64bname=")
+        for url in refused:
+            with self.subTest(libpq_premise=url):
+                self.assertFalse((libpq_options(self.lib, url) or {}).get("dbname"))
+        urls = list(refused) + list(ORACLE_URLS) + list(oracle_fuzz_urls(6871, 1500)) + [
+            "postgres://u@h:5445/?dbname=&dbname=x", "postgres://u@h:5445/db?dbname=x", "postgres://u@h:5445/db"]
+        accepted, empty = 0, []
+        for url in urls:
+            try:
+                self.mod.probe_target(url)
+            except self.mod.HelperError:
+                continue
+            accepted += 1
+            opts = libpq_options(self.lib, url)
+            if opts is not None and not opts.get("dbname"):
+                empty.append(url)
+        self.assertEqual(empty, [], "probe_target accepted a URL whose libpq dbname is empty")
+        self.assertGreaterEqual(accepted, 20, "the check must exercise accepted URLs")
 
     def test_keyword_table_covers_the_installed_libpq(self):
         # #6347 (a): every keyword the installed libpq defines is in LIBPQ_18_KEYWORDS (subset, since an older
