@@ -1802,9 +1802,15 @@ pub trait MemoryStore: Send + Sync {
     /// row back to [`crate::models::LifecycleState::Open`] via a raw UPDATE
     /// that bypasses the `can_transition_to` gate (`Quarantined` is terminal +
     /// system-only). The adapter guards on `lifecycle_state = 'quarantined'`
-    /// so it is idempotent and a no-op on any non-quarantined row. This is the
-    /// shared route-OUT surface for both dequarantine-on-attest (federation
-    /// receive-attestation upgrade) and operator dequarantine.
+    /// so it is idempotent and a no-op on any non-quarantined row.
+    ///
+    /// This is an UNVERIFIED primitive: it releases whatever the row holds
+    /// without checking any signed evidence, and since #4208 no production
+    /// path calls it. Dequarantine-on-attest goes through
+    /// [`Self::dequarantine_verified`] (which releases only when the stored
+    /// row carries the verified signed surface), and the operator release
+    /// goes through [`Self::operator_dequarantine`] (#2402, audited). Retiring
+    /// this raw surface is tracked in #6224.
     ///
     /// Returns `true` when a quarantined row was cleared.
     ///
@@ -1840,7 +1846,7 @@ pub trait MemoryStore: Send + Sync {
     /// append a `memory.dequarantined` signed event in the SAME transaction.
     ///
     /// This is the sanctioned route OUT that #1948 advertised and never
-    /// exposed. It differs from [`Self::dequarantine`] — the SYSTEM
+    /// exposed. It differs from [`Self::dequarantine_verified`] — the SYSTEM
     /// dequarantine-on-attest path, where the substrate re-decides on new
     /// cryptographic evidence — in exactly the way that matters for an audit:
     /// a human is OVERRIDING a containment decision, so WHO released WHAT
