@@ -988,6 +988,421 @@ def run_main(root):
     return rc, err.getvalue()
 
 
+# Round 11 (design B, 3-agent vote (6def5ab6)): finite enumerated cells, one table per predicate.
+# A cell is (name, docs, allowlist text, expected exit code, text the report must contain or None).
+# ``docs`` is the text of docs/compliance/A.md (str, or bytes written as is) or a dict of document
+# names to texts. Every fixture tree also holds scripts/check_new.py.
+R11_ERR = "## Erratum (#1)\n\nErratum (#1): `check-old.sh` is `scripts/check_new.py`.\n\n"
+R11_OK = "# Title\n\nIntro line.\n\n" + R11_ERR + "N30 enforcer is `check-old.sh`.\n"
+R11_ALLOW = "docs/compliance/A.md:check-old.sh:2\n"
+NOT_FOUND = "does not exist"
+R11_NAME_CELLS = (
+    ("N-plain", "Run check-old.sh daily.\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("N-dash-py", "Run check-old.py daily.\n", "", 1, "`check-old.py` " + NOT_FOUND),
+    ("N-under-sh", "Run check_old.sh daily.\n", "", 1, "`check_old.sh` " + NOT_FOUND),
+    ("N-under-py", "Run check_old.py daily.\n", "", 1, "`check_old.py` " + NOT_FOUND),
+    ("N-upper", "Run CHECK-old.sh daily.\n", "", 1, "`CHECK-old.sh` " + NOT_FOUND),
+    ("N-mixed", "Run Check_Old.PY daily.\n", "", 1, "`Check_Old.PY` " + NOT_FOUND),
+    ("N-case-existing", "Run check_NEW.py daily.\n", "", 1, "`check_NEW.py` " + NOT_FOUND),
+    ("N-comment", "<!-- check-old.sh -->\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("N-fence", "```\ncheck-old.sh\n```\n", "", 1, "A.md:2: `check-old.sh` " + NOT_FOUND),
+    ("N-details", "<details>\n\ncheck-old.sh\n</details>\n", "", 1, "A.md:3: `check-old.sh` " + NOT_FOUND),
+    ("N-link-dest", "[x](check-old.sh)\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("N-ref-def", "[x]: check-old.sh\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("N-attr", '<a title="check-old.sh">x</a>\n', "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("N-scripts-prefix", "Run `scripts/check-old.sh`.\n", "", 1, "`scripts/check-old.sh` " + NOT_FOUND),
+    ("N-infra", "Run `infra/check_new.py`.\n", "", 1, "`infra/check_new.py` " + NOT_FOUND),
+    ("N-tools-scripts", "Run `tools/scripts/check_new.py`.\n", "", 1, "`tools/scripts/check_new.py` " + NOT_FOUND),
+    ("N-dot", "Run `./check_new.py`.\n", "", 1, "`./check_new.py` " + NOT_FOUND),
+    ("N-scripts-scripts", "Run `scripts/scripts/check_new.py`.\n", "", 1, "checked at scripts/scripts/check_new.py"),
+    ("N-exists", "See `check_new.py` and `scripts/check_new.py`.\n", "", 0, None),
+    ("N-exists-paths", "See `./scripts/check_new.py` and `../../scripts/check_new.py`.\n", "", 0, None),
+    ("N-bounded", "Run xcheck-old.sh and check-old.shx today.\n", "", 0, None),
+)
+R11_UNESCAPE_CELLS = (
+    ("U-dec", "Run check&#45;old.sh daily.\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("U-hex", "Run check&#x2d;old.sh daily.\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("U-named-hyphen", "Run check&hyphen;old.sh daily.\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("U-named-period", "Run check-old&period;sh daily.\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("U-dec-letter", "Run &#99;heck-old.sh daily.\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("U-zwsp", "Run check-\u200bold.sh daily.\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("U-shy", "Run check-ol\u00add.sh daily.\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("U-vs", "Run check-\ufe0fold.sh daily.\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("U-fullwidth", "Run \uff43heck-old.sh daily.\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("U-cyrillic", "Run \u0441heck-old.sh daily.\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("U-mark", "Run che\u0301ck-old.sh daily.\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("U-minus", "Run check\u2212old.sh daily.\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("U-star", "Run *check*-old.sh daily.\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("U-underscore", "Run _check_-old.sh daily.\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("U-tilde", "Run ~~check~~-old.sh daily.\n", "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("U-hidden-existing", "Run check&#95;new.py daily.\n", "", 1, "`check_new.py` is shown only after"),
+    ("U-hidden-zw-existing", "Run check_\u200bnew.py daily.\n", "", 1, "`check_new.py` is shown only after"),
+    ("U-lookalike", "Run \u0188heck-old.sh daily.\n", "", 1, "look-alike script name"),
+    ("U-lookalike-existing", "Run \u0188heck_new.py daily.\n", "", 1, "look-alike script name"),
+    ("U-bidi-raw", "Run check_new.py\u202e daily.\n", "", 1, "bidirectional control character U+202E"),
+    ("U-bidi-ref", "Run check_new.py&#x202E; daily.\n", "", 1, "bidirectional control character U+202E"),
+    ("U-bidi-code", "Run `\u2066` daily.\n", "", 1, "bidirectional control character U+2066"),
+    ("U-amp-literal", "Fish &amp;#x202E; chips.\n", "", 0, None),
+)
+R11_STALE = "N30 enforcer is `check-old.sh`.\n"
+R11_DECL = "v1.0.0-DECLARATION.md"
+R11_PIN = "docs/compliance/v1.0.0-DECLARATION.md:check-old.sh:1:pinned\n"
+R11_B_ERR = "docs/compliance/B.md:check-old.sh:1\n"
+R11_ALLOW_CELLS = (
+    ("A-ok", R11_OK, R11_ALLOW, 0, None),
+    ("A-padded", R11_OK, "  docs/compliance/A.md:check-old.sh:2  \n", 0, None),
+    ("A-count-high", R11_OK, "docs/compliance/A.md:check-old.sh:3\n", 1, "expects 3 occurrence(s), the document holds 2"),
+    ("A-count-low", R11_OK, "docs/compliance/A.md:check-old.sh:1\n", 1, "expects 1 occurrence(s), the document holds 2"),
+    ("A-count-missing", R11_OK, "docs/compliance/A.md:check-old.sh\n", 1, "malformed allowlist entry"),
+    ("A-count-zero", R11_OK, "docs/compliance/A.md:check-old.sh:0\n", 1, "malformed allowlist entry"),
+    ("A-count-lead-zero", R11_OK, "docs/compliance/A.md:check-old.sh:02\n", 1, "malformed allowlist entry"),
+    ("A-count-sign", R11_OK, "docs/compliance/A.md:check-old.sh:+2\n", 1, "malformed allowlist entry"),
+    ("A-tail-x", R11_OK, "docs/compliance/A.md:check-old.sh:2x\n", 1, "malformed allowlist entry"),
+    ("A-tail-pinnedx", R11_OK, "docs/compliance/A.md:check-old.sh:2:pinnedx\n", 1, "malformed allowlist entry"),
+    ("A-tail-word", R11_OK, "docs/compliance/A.md:check-old.sh:2 trailing\n", 1, "malformed allowlist entry"),
+    ("A-tail-bogus", R11_OK, "docs/compliance/A.md:check-old.sh:2:bogus\n", 1, "malformed allowlist entry"),
+    ("A-junk", R11_OK, R11_ALLOW + "junk # note\n", 1, "malformed allowlist entry"),
+    ("A-outside", R11_OK, "notes/A.md:check-old.sh:2\n", 1, "malformed allowlist entry"),
+    ("A-duplicate", R11_OK, R11_ALLOW * 2, 1, "duplicate allowlist entry docs/compliance/A.md:check-old.sh"),
+    ("A-case", R11_OK, "docs/compliance/A.md:check-OLD.sh:2\n", 1, "`check-old.sh` " + NOT_FOUND),
+    ("A-stale-entry", R11_OK, R11_ALLOW + "docs/compliance/A.md:check-gone.sh:1\n", 1, "check-gone.sh suppresses nothing"),
+    ("A-none", R11_OK, "", 1, "`check-old.sh` " + NOT_FOUND),
+    ("A-no-erratum", R11_STALE, "docs/compliance/A.md:check-old.sh:1\n", 1, "`check-old.sh` " + NOT_FOUND),
+    ("A-other-erratum", {"A.md": R11_STALE, "B.md": R11_ERR}, "docs/compliance/A.md:check-old.sh:1\n" + R11_B_ERR,
+     1, "A.md:1: `check-old.sh` " + NOT_FOUND),
+    ("A-pinned-ok", {R11_DECL: R11_STALE, "B.md": R11_ERR}, R11_PIN + R11_B_ERR, 0, None),
+    ("A-pinned-no-erratum", {R11_DECL: R11_STALE}, R11_PIN, 1, "`check-old.sh` " + NOT_FOUND),
+    ("A-pinned-outside", {"A.md": R11_STALE, "B.md": R11_ERR},
+     "docs/compliance/A.md:check-old.sh:1:pinned\n" + R11_B_ERR, 1, ":pinned not permitted"),
+    ("A-pinned-subdir", {"sub/" + R11_DECL: R11_STALE, "B.md": R11_ERR},
+     "docs/compliance/sub/v1.0.0-DECLARATION.md:check-old.sh:1:pinned\n" + R11_B_ERR, 1, ":pinned not permitted"),
+    ("A-pinned-unnecessary", {R11_DECL: R11_ERR + R11_STALE}, "docs/compliance/v1.0.0-DECLARATION.md:check-old.sh:2:pinned\n",
+     1, "unnecessary :pinned"),
+    ("A-fragment-ok", "Section (c) applies.\n", "docs/compliance/A.md:c:1\n", 0, None),
+    ("A-fragment-count", "Section (c) applies.\n", "docs/compliance/A.md:c:2\n", 1, "expects 2 occurrence(s)"),
+    ("A-fragment-case", "Section (c) applies.\n", "docs/compliance/A.md:C:1\n", 1, "fragment `c` is followed by"),
+    ("A-fragment-pinned", "Section (c) applies.\n", "docs/compliance/A.md:c:1:pinned\n", 1, "malformed allowlist entry"),
+    ("A-ceiling", {"D%02d.md" % i: "Section (c) applies.\n" for i in range(32)},
+     "".join("docs/compliance/D%02d.md:c:1\n" % i for i in range(32)), 1, "exceed the allowlist ceiling"),
+    ("A-successor-missing", R11_OK.replace("check_new.py", "check_missing.py"), R11_ALLOW, 1, "`check-old.sh` " + NOT_FOUND),
+    ("A-successor-dotdot", R11_OK.replace("scripts/check_new.py", "scripts/../check_new.py"), R11_ALLOW, 1,
+     "`check-old.sh` " + NOT_FOUND),
+    ("A-successor-dot", R11_OK.replace("scripts/check_new.py", "scripts/./check_new.py"), R11_ALLOW, 1,
+     "`check-old.sh` " + NOT_FOUND),
+    ("A-successor-elsewhere", R11_OK + "Old copy: `scripts/legacy/check_new.py`.\n",
+     R11_ALLOW + "docs/compliance/A.md:check_new.py:1\n", 1, "`scripts/legacy/check_new.py` " + NOT_FOUND),
+)
+
+
+def r11_pre(text):
+    """R11_OK with ``text`` inserted before the erratum heading."""
+    return R11_OK.replace("Intro line.\n", "Intro line.\n\n" + text, 1)
+
+
+def r11_err(line):
+    """R11_OK with the erratum paragraph replaced by ``line``."""
+    return R11_OK.replace("Erratum (#1): `check-old.sh` is `scripts/check_new.py`.\n", line, 1)
+
+
+BEFORE = "before the erratum heading"
+IN_BLOCK = "in the erratum block"
+R11_ERRATUM_CELLS = (
+    ("E-ok", R11_OK, R11_ALLOW, 0, None),
+    ("E-ok-top", R11_ERR + R11_STALE, R11_ALLOW, 0, None),
+    ("E-ok-two-lines", r11_err("Erratum (#1): `check-old.sh` is `scripts/check_new.py`.\nSee issue 1.\n"), R11_ALLOW, 0, None),
+    ("E-pre-comment", r11_pre("<!-- note -->\n"), R11_ALLOW, 1, "an HTML comment " + BEFORE),
+    ("E-pre-comment-open", r11_pre("<!--\n\n"), R11_ALLOW, 1, "an HTML comment " + BEFORE),
+    ("E-pre-details", r11_pre("<details>\n\n"), R11_ALLOW, 1, "a <details> element " + BEFORE),
+    ("E-pre-fence", r11_pre("```\n"), R11_ALLOW, 1, "a code fence " + BEFORE),
+    ("E-pre-tilde-fence", r11_pre("~~~\n"), R11_ALLOW, 1, "a code fence " + BEFORE),
+    ("E-pre-indented", r11_pre("    code\n"), R11_ALLOW, 1, "indented code " + BEFORE),
+    ("E-pre-quote", r11_pre("> quote\n"), R11_ALLOW, 1, "a block quote " + BEFORE),
+    ("E-pre-refdef", r11_pre("[a]: https://example.com\n"), R11_ALLOW, 1, "a link reference definition " + BEFORE),
+    ("E-pre-tag", r11_pre("Text <b>x</b>\n"), R11_ALLOW, 1, "raw HTML or an autolink " + BEFORE),
+    ("E-pre-link", r11_pre("See [a](b).\n"), R11_ALLOW, 1, "a link or image bracket " + BEFORE),
+    ("E-pre-table", r11_pre("a | b\n"), R11_ALLOW, 1, "a table pipe " + BEFORE),
+    ("E-pre-charref", r11_pre("Fish &amp; chips\n"), R11_ALLOW, 1, "a character reference " + BEFORE),
+    ("E-pre-escape", r11_pre("Back\\slash\n"), R11_ALLOW, 1, "a backslash escape " + BEFORE),
+    ("E-pre-code", r11_pre("Use `x` here\n"), R11_ALLOW, 1, "a code span " + BEFORE),
+    ("E-pre-bullet", r11_pre("- item\n"), R11_ALLOW, 1, "a list item " + BEFORE),
+    ("E-pre-ordered", r11_pre("1. item\n"), R11_ALLOW, 1, "a list item " + BEFORE),
+    ("E-pre-ordered-paren", r11_pre("1) item\n"), R11_ALLOW, 1, "a list item " + BEFORE),
+    ("E-pre-tab", r11_pre("Tab\there\n"), R11_ALLOW, 1, "a tab " + BEFORE),
+    ("E-pre-blankish", r11_pre("   \n"), R11_ALLOW, 1, "a whitespace-only line " + BEFORE),
+    ("E-pre-indent-1", r11_pre(" Text\n"), R11_ALLOW, 1, "an indented line " + BEFORE),
+    ("E-pre-punct", r11_pre("(paren) start\n"), R11_ALLOW, 1, "does not start with a letter or digit " + BEFORE),
+    ("E-pre-setext", r11_pre("Text\n===\n"), R11_ALLOW, 1, "does not start with a letter or digit " + BEFORE),
+    ("E-pre-math", r11_pre("Price $5\n"), R11_ALLOW, 1, "a math delimiter " + BEFORE),
+    ("E-pre-strike", r11_pre("Strike ~x~\n"), R11_ALLOW, 1, "a strikethrough or tilde fence " + BEFORE),
+    ("E-pre-invisible", r11_pre("Zero\u200bwidth\n"), R11_ALLOW, 1, "outside the plain set " + BEFORE),
+    ("E-pre-heading-tag", r11_pre("## Heading <b>\n"), R11_ALLOW, 1, "raw HTML or an autolink " + BEFORE),
+    ("E-block-lt", r11_err("Erratum (#1): `check-old.sh` is `scripts/check_new.py` for git < 2.30.\n"), R11_ALLOW, 1,
+     "raw HTML or an autolink " + IN_BLOCK),
+    ("E-block-link", r11_err("Erratum (#1): `check-old.sh` is [`scripts/check_new.py`](x).\n"), R11_ALLOW, 1,
+     "a link or image bracket " + IN_BLOCK),
+    ("E-block-odd-tick", r11_err("Erratum (#1): `check-old.sh` is `scripts/check_new.py`.`\n"), R11_ALLOW, 1,
+     "a code span that is not a balanced single-backtick pair " + IN_BLOCK),
+    ("E-block-double-tick", r11_err("Erratum (#1): ``check-old.sh`` is `scripts/check_new.py`.\n"), R11_ALLOW, 1,
+     "a code span that is not a balanced single-backtick pair " + IN_BLOCK),
+    ("E-block-code-lt", r11_err("Erratum (#1): `check-old.sh` is `scripts/check_new.py`; `a<b`.\n"), R11_ALLOW, 1,
+     "raw HTML or an autolink " + IN_BLOCK),
+    ("E-block-indented", r11_err("  Erratum (#1): `check-old.sh` is `scripts/check_new.py`.\n"), R11_ALLOW, 1,
+     "an indented line " + IN_BLOCK),
+    ("E-block-setext", r11_err("Erratum (#1): `check-old.sh` is `scripts/check_new.py`.\n---\n"), R11_ALLOW, 1,
+     "does not start with a letter or digit " + IN_BLOCK),
+    ("E-block-comment", r11_err("Erratum (#1): `check-old.sh` is `scripts/check_new.py`. <!--\n"), R11_ALLOW, 1,
+     "an HTML comment " + IN_BLOCK),
+    ("E-no-heading", "Intro.\n\nErratum (#1): `check-old.sh` is `scripts/check_new.py`.\n\n" + R11_STALE, R11_ALLOW, 1,
+     "erratum line without an erratum heading"),
+    ("E-no-start", r11_err("The enforcer `check-old.sh` is `scripts/check_new.py`.\n"), R11_ALLOW, 1,
+     "no line of the erratum block starts"),
+    ("E-mid-line", r11_err("See Erratum (#1): `check-old.sh` is `scripts/check_new.py`.\n"), R11_ALLOW, 1,
+     "no line of the erratum block starts"),
+    ("E-outside", R11_OK + "\nErratum (#2): `check-old.sh` is `scripts/check_new.py`.\n", "docs/compliance/A.md:check-old.sh:3\n",
+     1, "erratum line outside the erratum block"),
+    ("E-outside-ref", R11_OK + "\nErratum&#32;(#2): x.\n", R11_ALLOW, 1, "erratum line outside the erratum block"),
+    ("E-second-heading", R11_OK + "\n## Erratum (#2)\n\nMore.\n", R11_ALLOW, 1, "a second erratum heading"),
+    ("E-no-paragraph", R11_STALE + "\n## Erratum (#1)\n", "docs/compliance/A.md:check-old.sh:1\n", 1,
+     "erratum heading with no paragraph"),
+    ("E-heading-tag", R11_OK.replace("## Erratum (#1)", "## Erratum (#1) <!-- x -->"), R11_ALLOW, 1,
+     "an HTML comment at the erratum heading"),
+)
+R11_ADJACENT_CELLS = (
+    ("M-bracket", "Run [check-](x)old.sh.\n", "", 1, "fragment `check-` is followed by ']'"),
+    ("M-backtick", "Run `check-`old.sh.\n", "", 1, "fragment `check-` is followed by '`'"),
+    ("M-tag", "Run check-<b></b>old.sh.\n", "", 1, "fragment `check-` is followed by '<'"),
+    ("M-comment", "Run che<!-- -->ck-old.sh.\n", "", 1, "fragment `che` is followed by '<'"),
+    ("M-escape", "Run check\\-old.sh.\n", "", 1, "fragment `check` is followed by '\\\\'"),
+    ("M-amp", "Run check&#8203;-old.sh.\n", "", 1, "fragment `check` is followed by '&'"),
+    ("M-paren", "Run c(x)heck-old.sh.\n", "", 1, "fragment `c` is followed by '('"),
+    ("M-close-paren", "Run check)\n", "", 1, "fragment `check` is followed by ')'"),
+    ("M-gt", "Run check-old>.sh\n", "", 1, "fragment `check-old` is followed by '>'"),
+    ("M-open-bracket", "Run check_old[.sh]\n", "", 1, "fragment `check_old` is followed by '['"),
+    ("M-break", "Run check-\nold.sh daily.\n", "", 1, "ends the line and the next line completes it to check-old.sh"),
+    ("M-break-short", "Run chec\nk-old.sh daily.\n", "", 1, "ends the line and the next line completes it to check-old.sh"),
+    ("M-break-indent", "Run check-\n\t  old.sh daily.\n", "", 1, "ends the line and the next line completes it"),
+    ("M-break-markup", "Run check-\n<b>old.sh</b>\n", "", 1, "ends the line and the next line starts with '<'"),
+    ("M-break-entity", "Run check\n&#45;old.sh\n", "", 1, "ends the line and the next line starts with '&'"),
+    ("M-prose", "Run the checklist daily.\nCheck in at noon.\n", "", 0, None),
+    ("M-prose-break", "Please check-in\nthe lobby.\n", "", 0, None),
+    ("M-prose-paren", "Section (b) applies to abc(x).\n", "", 0, None),
+)
+R11_UNDECIDABLE_CELLS = (
+    ("X-vt", "Run check\x0bold.\n", "", 1, "character U+000B"),
+    ("X-ff", "Run check\x0cold.\n", "", 1, "character U+000C"),
+    ("X-nel", "Run check\x85old.\n", "", 1, "character U+0085"),
+    ("X-ls", "Run check\u2028old.\n", "", 1, "character U+2028"),
+    ("X-ps", "Run check\u2029old.\n", "", 1, "character U+2029"),
+    ("X-bom-mid", "Run check\ufeffold.\n", "", 1, "character U+FEFF"),
+    ("X-bom-second", "\ufeff\ufeffRun.\n", "", 1, "character U+FEFF"),
+    ("X-nul", "Run check\x00old.\n", "", 1, "character U+0000"),
+    ("X-cr", "Run check.\r\n", "", 1, "character U+000D"),
+    ("X-del", "Run check\x7fold.\n", "", 1, "character U+007F"),
+    ("X-c1", "Run check\x9bold.\n", "", 1, "character U+009B"),
+    ("X-bom-lead", "\ufeffSee `check_new.py`.\n", "", 0, None),
+    ("X-invalid-utf8", b"Run \xff\xfe.\n", "", 2, "A.md: unreadable"),
+    ("X-truncated-utf8", b"Run \xc3(.\n", "", 2, "A.md: unreadable"),
+    ("X-allow-invalid-utf8", "See `check_new.py`.\n", b"docs/compliance/A.md:c\xff:1\n", 2, ALLOW_REL + ": unreadable"),
+)
+R11_CELLS = (
+    R11_NAME_CELLS + R11_UNESCAPE_CELLS + R11_ALLOW_CELLS + R11_ERRATUM_CELLS + R11_ADJACENT_CELLS + R11_UNDECIDABLE_CELLS
+)
+
+
+def r11_cells(base, cells, expect):
+    """Run each cell in a fresh tree under ``base``; every red cell must exit as expected with no traceback."""
+    for index, (name, docs, allow, want, needle) in enumerate(cells):
+        r = base / ("c%03d" % index)
+        (r / "scripts" / "qc-allowlists").mkdir(parents=True)
+        (r / "docs" / "compliance").mkdir(parents=True)
+        (r / "scripts" / "check_new.py").write_text("")
+        for rel, text in (docs if isinstance(docs, dict) else {"A.md": docs}).items():
+            path = r / "docs" / "compliance" / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(text if isinstance(text, bytes) else text.encode("utf-8"))
+        (r / ALLOW_REL).write_bytes(allow if isinstance(allow, bytes) else allow.encode("utf-8"))
+        rc, err = run_main(r)
+        expect(
+            rc == want and (needle is None or needle in err) and "Traceback" not in err,
+            "R11-%s: expected exit %d%s, got %r (stderr=%r)"
+            % (name, want, "" if needle is None else " naming %r" % needle, rc, err[-300:]),
+        )
+
+
+# The round-10 evidence cells (round10-secrev results-linux.json FAIL-OPEN at tip or base, the MANUAL
+# erratum cells E1-E8, and the code-review probe_ws / probe_paren2 cells): each must exit 1.
+R11_FIXTURES = (
+    ('S10-L2b-00', 'Run [check-](a\x00b)old.sh daily.\n', ''),
+    ('S10-L2b-01', 'Run [check-](a\x01b)old.sh daily.\n', ''),
+    ('S10-L2b-02', 'Run [check-](a\x02b)old.sh daily.\n', ''),
+    ('S10-L2b-03', 'Run [check-](a\x03b)old.sh daily.\n', ''),
+    ('S10-L2b-04', 'Run [check-](a\x04b)old.sh daily.\n', ''),
+    ('S10-L2b-05', 'Run [check-](a\x05b)old.sh daily.\n', ''),
+    ('S10-L2b-06', 'Run [check-](a\x06b)old.sh daily.\n', ''),
+    ('S10-L2b-07', 'Run [check-](a\x07b)old.sh daily.\n', ''),
+    ('S10-L2b-08', 'Run [check-](a\x08b)old.sh daily.\n', ''),
+    ('S10-L2b-0B', 'Run [check-](a\x0bb)old.sh daily.\n', ''),
+    ('S10-L2b-0C', 'Run [check-](a\x0cb)old.sh daily.\n', ''),
+    ('S10-L2b-0E', 'Run [check-](a\x0eb)old.sh daily.\n', ''),
+    ('S10-L2b-0F', 'Run [check-](a\x0fb)old.sh daily.\n', ''),
+    ('S10-L2b-10', 'Run [check-](a\x10b)old.sh daily.\n', ''),
+    ('S10-L2b-11', 'Run [check-](a\x11b)old.sh daily.\n', ''),
+    ('S10-L2b-12', 'Run [check-](a\x12b)old.sh daily.\n', ''),
+    ('S10-L2b-13', 'Run [check-](a\x13b)old.sh daily.\n', ''),
+    ('S10-L2b-14', 'Run [check-](a\x14b)old.sh daily.\n', ''),
+    ('S10-L2b-15', 'Run [check-](a\x15b)old.sh daily.\n', ''),
+    ('S10-L2b-16', 'Run [check-](a\x16b)old.sh daily.\n', ''),
+    ('S10-L2b-17', 'Run [check-](a\x17b)old.sh daily.\n', ''),
+    ('S10-L2b-18', 'Run [check-](a\x18b)old.sh daily.\n', ''),
+    ('S10-L2b-19', 'Run [check-](a\x19b)old.sh daily.\n', ''),
+    ('S10-L2b-1A', 'Run [check-](a\x1ab)old.sh daily.\n', ''),
+    ('S10-L2b-1B', 'Run [check-](a\x1bb)old.sh daily.\n', ''),
+    ('S10-L2b-1C', 'Run [check-](a\x1cb)old.sh daily.\n', ''),
+    ('S10-L2b-1D', 'Run [check-](a\x1db)old.sh daily.\n', ''),
+    ('S10-L2b-1E', 'Run [check-](a\x1eb)old.sh daily.\n', ''),
+    ('S10-L2b-1F', 'Run [check-](a\x1fb)old.sh daily.\n', ''),
+    ('S10-L2b-7F', 'Run [check-](a\x7fb)old.sh daily.\n', ''),
+    ('S10-L3e-cr', 'Run [check-](<a\\\rb>)old.sh daily.\n', ''),
+    ('S10-L3e-lf', 'Run [check-](<a\\\nb>)old.sh daily.\n', ''),
+    ('S10-L3e-crlf', 'Run [check-](<a\\\r\nb>)old.sh daily.\n', ''),
+    ('S10-L6-00', 'Run [check-](\x0bx)old.sh daily.\n', ''),
+    ('S10-L6-01', 'Run [check-](x\x0b)old.sh daily.\n', ''),
+    ('S10-L6-02', 'Run [check-](\x0cx)old.sh daily.\n', ''),
+    ('S10-L6-03', 'Run [check-](x\x0c)old.sh daily.\n', ''),
+    ('S10-L6-04', 'Run [check-](\n\x0b\nx)old.sh daily.\n', ''),
+    ('S10-L6-05', 'Run [check-](\n\x0c\nx)old.sh daily.\n', ''),
+    ('S10-L6-06', 'Run [check-](x\n\x0b\n)old.sh daily.\n', ''),
+    ('S10-L6-07', 'Run [check-](x\n\x0b\n"t")old.sh daily.\n', ''),
+    ('S10-L6-11', 'Run [check-](x \x0b\n(t))old.sh daily.\n', ''),
+    ('S10-L6-12', 'Run [check-](x\r\x0b\r"t)y")old.sh daily.\n', ''),
+    ('S10-L6-13', 'Run [check-](\r\n\x0b\r\nx)old.sh daily.\n', ''),
+    ('S10-L6-14', 'Run [check-](x "t"\x0b)old.sh daily.\n', ''),
+    ('S10-L6-15', 'Run [check-](x "t"\n\x0c\n)old.sh daily.\n', ''),
+    ('S10-L7-06', 'Run [check-](x "a\\\\")b")old.sh daily.\n', ''),
+    ('S10-U-00', 'Run [check-]((\n)old.sh daily.\n', ''),
+    ('S10-U-01', 'Run [check-]((\x01\t)old.sh daily.\n', ''),
+    ('S10-U-02', 'Run [check-](a(\t)old.sh daily.\n', ''),
+    ('S10-U-03', 'Run [check-](a( )old.sh daily.\n', ''),
+    ('S10-U-04', 'Run [check-](a(b )old.sh daily.\n', ''),
+    ('S10-U-05', 'Run [check-]((\n"t")old.sh daily.\n', ''),
+    ('S10-U-06', 'Run [check-](a(b\n)old.sh daily.\n', ''),
+    ('S10-U-08', 'Run [check-](((\n)old.sh daily.\n', ''),
+    ('S10-U-09', 'Run [check-](a(b(c )old.sh daily.\n', ''),
+    ('S10-U-10', 'Run [check-](a\\((\t)old.sh daily.\n', ''),
+    ('S10-R-00', 'Run [check-][a b]old.sh daily.\n\n[a b]: https://x\n', ''),
+    ('S10-R-01', 'Run [check-][a\x0bb]old.sh daily.\n\n[a\x0bb]: https://x\n', ''),
+    ('S10-R-02', 'Run [check-][a\tb]old.sh daily.\n\n[a b]: https://x\n', ''),
+    ('S10-R-07', 'Run [check-][a\\[b]old.sh daily.\n\n[a\\[b]: https://x\n', ''),
+    ('S10-Bcp-061C', 'Run check_new.py&#x61C; daily.\n', ''),
+    ('S10-Bcpd-061C', 'Run check_new.py&#1564; daily.\n', ''),
+    ('S10-Bcp-200E', 'Run check_new.py&#x200E; daily.\n', ''),
+    ('S10-Bcpd-200E', 'Run check_new.py&#8206; daily.\n', ''),
+    ('S10-Bcp-200F', 'Run check_new.py&#x200F; daily.\n', ''),
+    ('S10-Bcpd-200F', 'Run check_new.py&#8207; daily.\n', ''),
+    ('S10-Bcp-202A', 'Run check_new.py&#x202A; daily.\n', ''),
+    ('S10-Bcpd-202A', 'Run check_new.py&#8234; daily.\n', ''),
+    ('S10-Bcp-202B', 'Run check_new.py&#x202B; daily.\n', ''),
+    ('S10-Bcpd-202B', 'Run check_new.py&#8235; daily.\n', ''),
+    ('S10-Bcp-202C', 'Run check_new.py&#x202C; daily.\n', ''),
+    ('S10-Bcpd-202C', 'Run check_new.py&#8236; daily.\n', ''),
+    ('S10-Bcp-202D', 'Run check_new.py&#x202D; daily.\n', ''),
+    ('S10-Bcpd-202D', 'Run check_new.py&#8237; daily.\n', ''),
+    ('S10-Bcp-202E', 'Run check_new.py&#x202E; daily.\n', ''),
+    ('S10-Bcpd-202E', 'Run check_new.py&#8238; daily.\n', ''),
+    ('S10-Bcp-2066', 'Run check_new.py&#x2066; daily.\n', ''),
+    ('S10-Bcpd-2066', 'Run check_new.py&#8294; daily.\n', ''),
+    ('S10-Bcp-2067', 'Run check_new.py&#x2067; daily.\n', ''),
+    ('S10-Bcpd-2067', 'Run check_new.py&#8295; daily.\n', ''),
+    ('S10-Bcp-2068', 'Run check_new.py&#x2068; daily.\n', ''),
+    ('S10-Bcpd-2068', 'Run check_new.py&#8296; daily.\n', ''),
+    ('S10-Bcp-2069', 'Run check_new.py&#x2069; daily.\n', ''),
+    ('S10-Bcpd-2069', 'Run check_new.py&#8297; daily.\n', ''),
+    ('S10-Bf-hexlc', 'Run check_new.py&#x202e; daily.\n', ''),
+    ('S10-Bf-HEX', 'Run check_new.py&#X202E; daily.\n', ''),
+    ('S10-Bf-hex-lead0-6', 'Run check_new.py&#x0202E; daily.\n', ''),
+    ('S10-Bf-hex-lead0-7', 'Run check_new.py&#x00202E; daily.\n', ''),
+    ('S10-Bf-dec-lead0-7', 'Run check_new.py&#0008238; daily.\n', ''),
+    ('S10-Bf-dec-lead0-8', 'Run check_new.py&#00008238; daily.\n', ''),
+    ('S10-Bf-rlm', 'Run check_new.py&rlm; daily.\n', ''),
+    ('S10-Bc-heading-hex', '# Title &#x202E; x\n', ''),
+    ('S10-Bc-heading-dec', '# Title &#8238; x\n', ''),
+    ('S10-Bc-setext-hex', 'Title &#x202E; x\n===\n', ''),
+    ('S10-Bc-setext-dec', 'Title &#8238; x\n===\n', ''),
+    ('S10-Bc-list-hex', '- item &#x202E; x\n', ''),
+    ('S10-Bc-list-dec', '- item &#8238; x\n', ''),
+    ('S10-Bc-olist-hex', '1. item &#x202E; x\n', ''),
+    ('S10-Bc-olist-dec', '1. item &#8238; x\n', ''),
+    ('S10-Bc-quote-hex', '> q &#x202E; x\n', ''),
+    ('S10-Bc-quote-dec', '> q &#8238; x\n', ''),
+    ('S10-Bc-html-block-hex', '<div>\nh &#x202E; x\n</div>\n', ''),
+    ('S10-Bc-html-block-dec', '<div>\nh &#8238; x\n</div>\n', ''),
+    ('S10-Bc-link-title-hex', '[a](x "t &#x202E;")\n', ''),
+    ('S10-Bc-link-title-dec', '[a](x "t &#8238;")\n', ''),
+    ('S10-Bc-image-alt-hex', '![a &#x202E;](x)\n', ''),
+    ('S10-Bc-image-alt-dec', '![a &#8238;](x)\n', ''),
+    ('S10-Bc-table-hex', '| a |\n|---|\n| &#x202E; |\n', ''),
+    ('S10-Bc-table-dec', '| a |\n|---|\n| &#8238; |\n', ''),
+    ('S10-Bc-details-summary-hex', '<details><summary>s &#x202E;</summary>\n\nb\n</details>\n', ''),
+    ('S10-Bc-details-summary-dec', '<details><summary>s &#8238;</summary>\n\nb\n</details>\n', ''),
+    ('S10-Bc-ref-def-title-hex', '[r]\n\n[r]: https://x "t &#x202E;"\n', ''),
+    ('S10-Bc-ref-def-title-dec', '[r]\n\n[r]: https://x "t &#8238;"\n', ''),
+    ('S10-E1-top-fence-3sp-closer', 'N30 enforcer is `check-old.sh`.\n\n<details>\n\n   ```\n</details>\n   ```\n\nErratum (#1): `check-old.sh` is `scripts/check_new.py`.\n', 'docs/compliance/A.md:check-old.sh:2\n'),
+    ('S10-E2-top-fence-1sp-closer', 'N30 enforcer is `check-old.sh`.\n\n<details>\n\n ```\n</details>\n ```\n\nErratum (#1): `check-old.sh` is `scripts/check_new.py`.\n', 'docs/compliance/A.md:check-old.sh:2\n'),
+    ('S10-E3-top-fence-3sp-erratum', 'N30 enforcer is `check-old.sh`.\n\n   ```\nx\n\nErratum (#1): `check-old.sh` is `scripts/check_new.py`.\n   ```\n', 'docs/compliance/A.md:check-old.sh:2\n'),
+    ('S10-E4-top-tilde-2sp-closer', 'N30 enforcer is `check-old.sh`.\n\n<details>\n\n  ~~~\n</details>\n  ~~~\n\nErratum (#1): `check-old.sh` is `scripts/check_new.py`.\n', 'docs/compliance/A.md:check-old.sh:2\n'),
+    ('S10-E5-list-fence-closer', 'N30 enforcer is `check-old.sh`.\n\n<details>\n\n- a\n  ```\n</details>\n  ```\n\nErratum (#1): `check-old.sh` is `scripts/check_new.py`.\n', 'docs/compliance/A.md:check-old.sh:2\n'),
+    ('S10-E6-control-closed', 'N30 enforcer is `check-old.sh`.\n\n<details>\n\nx\n\n</details>\n\nErratum (#1): `check-old.sh` is `scripts/check_new.py`.\n', 'docs/compliance/A.md:check-old.sh:2\n'),
+    ('S10-E7-top-fence-3sp-comment', 'N30 enforcer is `check-old.sh`.\n\n   ```\n<!--\n   ```\n\nErratum (#1): `check-old.sh` is `scripts/check_new.py`.\n-->\n', 'docs/compliance/A.md:check-old.sh:2\n'),
+    ('S10-E8-quote-fence-closer', 'N30 enforcer is `check-old.sh`.\n\n<details>\n\n> ```\n</details>\n> ```\n\nErratum (#1): `check-old.sh` is `scripts/check_new.py`.\n', 'docs/compliance/A.md:check-old.sh:2\n'),
+    ('S10-X-001', 'Run [check-](\t\x0b\t\n )old.sh daily.\n', ''),
+    ('S10-X-002', 'Run [check-](>\x0b\\")old.sh daily.\n', ''),
+    ('S10-X-008', 'Run [check-](\x7f\x7fb\x7f\x0c>\xa0)old.sh daily.\n', ''),
+    ('S10-X-010', 'Run [check-](\\"]\\\\a\x00``)old.sh daily.\n', ''),
+    ('S10-X-015', 'Run [check-](\x7f"\x00>\x0c)old.sh daily.\n', ''),
+    ('S10-X-022', "Run [check-](\x00\x00')old.sh daily.\n", ''),
+    ('S10-X-026', 'Run [check-](\\"\x00\\")old.sh daily.\n', ''),
+    ('S10-X-027', 'Run [check-](\\"\\ab\\a\x00\\a\\ )old.sh daily.\n', ''),
+    ('S10-X-028', 'Run [check-](\r\x0b\r\\\n)old.sh daily.\n', ''),
+    ('S10-X-030', 'Run [check-](&#41;\\(\\(]``\x0b\\(")old.sh daily.\n', ''),
+    ('S10-X-032', 'Run [check-](\x0c&lt;\\(\\")old.sh daily.\n', ''),
+    ('S10-X-034', "Run [check-](a\\)'\x7f&lt;\r)old.sh daily.\n", ''),
+    ('S10-X-036', 'Run [check-](\t\x7f\\a\xa0)old.sh daily.\n', ''),
+    ('S10-X-039', 'Run [check-](\x0ca\\\n )old.sh daily.\n', ''),
+    ('S10-X-047', 'Run [check-](\n\u2028\x7f&#41;)old.sh daily.\n', ''),
+    ('S10-X-049', 'Run [check-](\\)\\\\(\\\n)old.sh daily.\n', ''),
+    ('S10-X-056', 'Run [check-](\x7f \x0c\x0c)old.sh daily.\n', ''),
+    ('S10-X-068', 'Run [check-](\x0b)old.sh daily.\n', ''),
+    ('S10-X-074', "Run [check-](&lt;'\x0c&#41;a\x7f)old.sh daily.\n", ''),
+    ('S10-X-079', 'Run [check-](\ra]\x0b\xa0&#41;\\aa)old.sh daily.\n', ''),
+    ('S10-X-100', 'Run [check-](\\)]\x00\\(``\\"\')old.sh daily.\n', ''),
+    ('S10-X-102', 'Run [check-](\n\x0b)old.sh daily.\n', ''),
+    ('S10-X-112', 'Run [check-](\xa0\xa0\x7f)old.sh daily.\n', ''),
+    ('S10-X-115', 'Run [check-](&lt;\\(a\x00\\ \t\t)old.sh daily.\n', ''),
+    ('S10-X-116', 'Run [check-](]\xa0b]]\x0c)old.sh daily.\n', ''),
+    ('S10-X-120', 'Run [check-](\xa0a\x7f])old.sh daily.\n', ''),
+    ('S10-X-129', 'Run [check-](\x0c``)old.sh daily.\n', ''),
+    ('S10-X-133', 'Run [check-](\r``\\((\t)old.sh daily.\n', ''),
+    ('S10-X-148', 'Run [check-](\\a\x0c\\))old.sh daily.\n', ''),
+    ('C10-ws-00', 'Run [check-](<a>\x0b)old.sh daily.\n', ''),
+    ('C10-ws-01', 'Run [check-](<a>\x0c)old.sh daily.\n', ''),
+    ('C10-ws-02', 'Run [check-](<a>\x0b"t")old.sh daily.\n', ''),
+    ('C10-ws-03', 'Run [check-](a\x0b"t")old.sh daily.\n', ''),
+    ('C10-ws-04', 'Run [check-](a\x0c"t")old.sh daily.\n', ''),
+    ('C10-ws-05', 'Run [check-](\x0ba)old.sh daily.\n', ''),
+    ('C10-ws-06', 'Run [check-](\x0c<a>)old.sh daily.\n', ''),
+    ('C10-ws-07', 'Run [check-](<a> "t"\x0b)old.sh daily.\n', ''),
+    ('C10-ws-08', 'Run [check-](a\x0b"t)")old.sh daily.\n', ''),
+    ('C10-ws-09', "Run [check-](a\x0c'x)y')old.sh daily.\n", ''),
+    ('C10-ws-10', 'Run [check-](<a\x0bb>)old.sh daily.\n', ''),
+    ('C10-ws-11', 'Run [check-](a\x0b(t))old.sh daily.\n', ''),
+    ('C10-paren-02', 'Run [check-]((\\ )old.sh daily.\n', ''),
+    ('C10-paren-03', 'Run [check-]((\\a )old.sh daily.\n', ''),
+    ('C10-paren-04', 'Run [check-]((a\x01\\ )old.sh daily.\n', ''),
+    ('C10-paren-05', 'Run [check-]( (\x01\n)\n))old.sh daily.\n', ''),
+    ('C10-paren-06', 'Run [check-]((t )old.sh daily.\n', ''),
+)
+
+
 def self_test():
     scratch = Path(__file__).resolve().parent.parent / ".local-runs"
     scratch.mkdir(exist_ok=True)
@@ -1002,6 +1417,13 @@ def self_test():
 
     with tempfile.TemporaryDirectory(dir=str(scratch)) as d:
         root = Path(d)
+        r11 = root / "r11"
+        r11.mkdir()
+        r11_cells(r11, R11_CELLS, expect)
+        # Every cell the round-10 evidence found fail-open (any tip or base) is red (design B, item 7).
+        r11_fixtures = root / "r11-fixtures"
+        r11_fixtures.mkdir()
+        r11_cells(r11_fixtures, tuple((n, doc, allow, 1, None) for n, doc, allow in R11_FIXTURES), expect)
         (root / "scripts" / "qc-allowlists").mkdir(parents=True)
         (root / "docs" / "compliance").mkdir(parents=True)
         (root / "scripts" / "check_new.py").write_text("")
