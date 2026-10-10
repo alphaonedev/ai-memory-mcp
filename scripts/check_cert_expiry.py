@@ -978,7 +978,9 @@ def amendment_verdict(repo, mb, judged, required):
         lines = ", ".join(str(e["start"] + 1) for e in fresh)
         return False, (f"exactly one new amendment per change is accepted; this change adds "
                        f"{len(fresh)} (lines {lines}); one record may list every changed path "
-                       "and identifier")
+                       "and identifier. Records already landed on the carrier cannot be merged "
+                       "into one (the ledger is append-only, #6423): promote step-wise, one "
+                       "landed record per promotion step (#6422)")
     ent = fresh[0]
     at = f"the new amendment at line {ent['start'] + 1}"
     start = ent["start"]
