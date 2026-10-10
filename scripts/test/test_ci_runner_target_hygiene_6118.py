@@ -1340,6 +1340,11 @@ def _value_findings(key: str, value: str) -> List[str]:
     if _key_kind(key) == "forbidden":
         found.extend(_judge(key, "forbidden", text, False))
     flags = bool(RUSTC_FLAGS_KEY_RE.fullmatch(key)) or key.lower().replace("-", "") in FLAGS_CONFIG_KEYS
+    kind = _key_kind(key) or ("flags" if flags else "")
+    if kind in ("debug", "flags") and "${{" in text:
+        # the value is decided outside the workflow text (a variable, matrix or event data), as a
+        # run-line value computed at run time is (#6476)
+        found.extend(_judge(key, kind, text, True))
     found.extend(_level_spellings(text, flags))
     found.extend(_run_findings(text))
     return found
