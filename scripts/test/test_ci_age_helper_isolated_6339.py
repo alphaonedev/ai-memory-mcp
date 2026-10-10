@@ -14,6 +14,12 @@ scripts with ``python3 -I`` (#5163, #5280).
 log (``set -x``, a URL in an ``::error::`` line, a URL on the helper argv), widens the ``macos-fed``
 guard, or lets a failed self-heal pass (``|| true``, ``exit 0``, ``continue-on-error``) fails here.
 
+#6672 closes the remaining output paths: a step line that names the URL file (by variable or by path), the URL,
+or the parts the step cuts from it (``head``, ``q``) must be one of the exact lines in ``URL_LINES``, the step
+may not export them, and it may not dump the environment (``env``, ``printenv``, ``export -p``, ``declare -p``,
+``typeset -p``, ``compgen -v``, a bare ``set``).  A new use of the URL therefore fails here until it is reviewed
+and added to the allowlist.
+
 Rule: every ci.yml line that runs ``ensure-age-extension.py`` through python3 passes ``-I``
 before the script path, and at least one such invocation exists (a rename must not make
 the pin vacuous).  The check is exercised against a mutant that drops ``-I``.
@@ -37,6 +43,47 @@ GUARD = 'if [ "${CI_NODE:-}" = "macos-fed" ]; then'
 CALL = re.compile(r'^\s*if ! python3 -I ' + re.escape(HELPER) + r' --url-file "\$url_file"; then$')
 URL_VARS = re.compile(r"\$\{?(?:base_url|new_url)\b|\$\(cat\b")
 READ = 'base_url="$(cat "$url_file")"'
+URL_REF = re.compile(r"\$\{?(?:url_file|base_url|new_url|head|q)\b|ai-memory-ci-fed-url")
+URL_NAMES = re.compile(r"\b(?:url_file|base_url|new_url|head|q)\b")
+EXPORTS = re.compile(r"^(?:export|declare\s+-\S*x|typeset\s+-\S*x|readonly)\b(.*)$")
+ENV_DUMP = re.compile(r"(?:^|[;&|(]\s*)(?:env|printenv|compgen\s+-[vA]|(?:export|declare|typeset)\s+-p|set)\s*(?:$|[;&|)])")
+# The reviewed lines that use the URL.  psql "$base_url"/"$new_url" on argv and the $GITHUB_ENV write are #6172.
+URL_LINES = frozenset((
+    'url_file="$HOME/.ai-memory-ci-fed-url"',
+    'if [ ! -f "$url_file" ]; then',
+    'echo "::error::enterprise-fed leg on $RUNNER_NAME is missing $url_file — the native pg tier URL is not'
+    ' provisioned on this node"',
+    'if ! python3 -I scripts/ci/check-tier-password.py --url-file "$url_file"; then',
+    READ,
+    'if ! psql "$base_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \\"$CI_FED_DB\\";"; then',
+    'case "$base_url" in',
+    '*\\?*) q="?${base_url#*\\?}"; head="${base_url%%\\?*}" ;;',
+    '*)    q=""; head="$base_url" ;;',
+    'new_url="${head%/*}/${CI_FED_DB}${q}"',
+    'if ! python3 -I scripts/ci/ensure-age-extension.py --url-file "$url_file"; then',
+    'if ! psql "$new_url" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS'
+    ' vector;"; then',
+    'echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url" >> "$GITHUB_ENV"',
+))
+
+
+def url_leaks(step):
+    """#6672: step lines that use the URL outside the allowlist, export it, or dump the environment."""
+    found = []
+    for ln in step:
+        s = ln.strip()
+        if s.startswith("#"):
+            continue
+        if URL_REF.search(s) and s not in URL_LINES:
+            found.append(f"a line uses the tier URL outside the reviewed lines: {s[:60]}")
+        exported = EXPORTS.match(s)
+        if exported and URL_NAMES.search(exported.group(1)):
+            found.append(f"a line exports the tier URL: {s[:60]}")
+        if ENV_DUMP.search(s):
+            found.append(f"a line dumps the environment: {s[:60]}")
+    return found
+
+
 NOTICE = 'echo "::notice::[enterprise-fed] created ephemeral db $CI_FED_DB on the native tier ($RUNNER_NAME) and pointed AI_MEMORY_TEST_POSTGRES_URL at it"'
 
 
@@ -80,7 +127,7 @@ def wiring_problems(text):
         s = ln.strip()
         if s.startswith("echo") and ">>" not in s and URL_VARS.search(s):
             found.append(f"an echo line prints the tier URL: {s[:60]}")
-    return found
+    return found + url_leaks(step)
 
 
 def helper_invocations(text):
@@ -108,6 +155,10 @@ class TestAgeHelperIsolated6339(unittest.TestCase):
 
     def test_the_step_wiring_is_pinned_6508(self):
         self.assertEqual(wiring_problems(CI_YML.read_text(encoding="utf-8")), [])
+
+    def test_every_reviewed_url_line_is_in_the_step_6672(self):
+        step = {ln.strip() for ln in helper_step(CI_YML.read_text(encoding="utf-8"))}
+        self.assertEqual(sorted(URL_LINES - step), [], "a reviewed URL line is gone; shrink URL_LINES")
 
     def test_the_wiring_check_rejects_each_mutant_6508(self):
         text = CI_YML.read_text(encoding="utf-8")
