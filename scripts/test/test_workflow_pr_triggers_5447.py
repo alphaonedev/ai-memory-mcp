@@ -5455,5 +5455,39 @@ class ApprovalCheckoutAndTopLevel6629(unittest.TestCase):
                 self.assertTrue(_c8_mutant_problems(self.c8, anchor, env + anchor))
 
 
+# ---- Round 6 (#6682): the merge_group trigger of every required-context workflow is pinned ----
+
+
+class MergeGroupTriggerPinned6682(unittest.TestCase):
+    """A required workflow without ``merge_group`` never reports on the queue ref, so a merge
+    queue wedges (#3089), and the approval evaluator's merge_group arm (#6227, #6325) never
+    runs.  The four workflows that carry the trigger keep it exactly; the two self-hosted
+    required workflows that lack it are an explicit, tracked gap (#6727) that cannot grow."""
+
+    PINNED = ("c8-precheck.yml", "ci.yml", "coverage.yml", "claude-md-guard.yml")
+    KNOWN_GAP_6727 = ("cert-postgres-age.yml", "postgres-ignored.yml")
+    ROW = "  merge_group:\n    types: [checks_requested]\n"
+
+    def carries(self, name: str) -> bool:
+        text = (WORKFLOWS / name).read_text(encoding="utf-8")
+        return "merge_group" in parse_triggers(text) and self.ROW in text
+
+    def test_6682_pinned_workflows_trigger_on_checks_requested(self) -> None:
+        for name in self.PINNED:
+            with self.subTest(workflow=name):
+                self.assertTrue(self.carries(name), name)
+
+    def test_6682_known_gap_is_exactly_6727(self) -> None:
+        for name in self.KNOWN_GAP_6727:
+            with self.subTest(workflow=name):
+                self.assertFalse(self.carries(name), f"{name} gained merge_group: move it to PINNED and close #6727")
+
+    def test_6682_dropping_the_c8_trigger_is_killed(self) -> None:
+        text = C8_WORKFLOW.read_text(encoding="utf-8")
+        self.assertEqual(1, text.count(self.ROW))
+        mutant = text.replace(self.ROW, "", 1)
+        self.assertNotIn("merge_group", parse_triggers(mutant))
+
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
