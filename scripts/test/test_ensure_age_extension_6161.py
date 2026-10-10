@@ -200,6 +200,31 @@ sys.exit(mod.main(sys.argv[4:]))
 """
 
 
+class PsqlStartClock:
+    """Stand-in for the helper's ``time`` module: ``monotonic()`` stays frozen until the stub psql records its pid
+    (or a 30 s real-time cap passes), then advances in real time.  A deadline test then measures the helper's limit
+    from psql's start, whatever the host load (#6646, #6674)."""
+
+    def __init__(self, pid_file, cap_seconds=30):
+        self.pid_file = pid_file
+        self.frozen = time.monotonic()
+        self.cap_at = self.frozen + cap_seconds
+        self.started = None
+        self.psql_started = False
+
+    def monotonic(self):
+        now = time.monotonic()
+        if self.started is None:
+            self.psql_started = self.pid_file.exists() and bool(self.pid_file.read_text())
+            if not self.psql_started and now < self.cap_at:
+                return self.frozen
+            self.started = now
+        return self.frozen + (now - self.started)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
 def write_exe(path, text):
     path.write_text(text)
     path.chmod(0o755)
@@ -1028,7 +1053,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertNotIn(PW_MARKER, out + err)
         self.assert_gone_within(child, 3, "the supervisor was SIGKILLed")
 
-    def run_supervisor(self, deadline, psql_template=STUBBORN_PSQL, keep_pipe=True):
+    def run_supervisor(self, deadline, psql_template=STUBBORN_PSQL, keep_pipe=True, require_pid=True):
         """Run the supervisor mode directly; returns (process, write end of the pipe or None, psql pid)."""
         write_exe(self.psql, psql_template.format(py=sys.executable, base=str(self.base)))
         for stale in ("sleep.pid", "sleep.ppid"):
@@ -1043,14 +1068,18 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         pid_file = self.base / "sleep.pid"
         end = time.monotonic() + 15
         while time.monotonic() < end and not (pid_file.exists() and pid_file.read_text()):
+            if not require_pid and proc.poll() is not None:
+                break  # the supervisor stopped psql before it recorded its pid (#6646, #6674)
             time.sleep(0.05)
-        child = int(pid_file.read_text())
+        child = int(pid_file.read_text()) if require_pid or (pid_file.exists() and pid_file.read_text()) else None
         if not keep_pipe:  # closed only once psql is running, or the supervisor would stop it before it starts
             os.close(w)
             w = None
 
         def reap():
             for pid in (child, proc.pid):
+                if pid is None:
+                    continue
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -1074,11 +1103,15 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
 
     def check_supervisor_enforces_its_own_deadline(self, template):
         # A helper that is SIGSTOPped keeps the pipe open and cannot enforce the probe limit.
-        proc, child = self.run_supervisor(1, psql_template=template)
+        # The deadline counts from the supervisor's start, so on a loaded host (or with a slow stub) it can stop
+        # psql before psql records its pid.  Exit 1 is the kill path, which kills AND reaps psql before returning.
+        proc, child = self.run_supervisor(1, psql_template=template, require_pid=False)
         t0 = time.monotonic()
         proc.communicate(timeout=15)
         self.assertLess(time.monotonic() - t0, 6)
-        self.assert_gone_within(child, 3, "the supervisor deadline passed")
+        self.assertEqual(proc.returncode, 1, "the supervisor must report its own deadline kill, not psql's status")
+        if child is not None:
+            self.assert_gone_within(child, 3, "the supervisor deadline passed")
 
     def test_supervisor_kills_psql_on_a_signal_sent_to_itself(self):
         for signum in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGUSR1):
@@ -1233,10 +1266,12 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         mod = load_module()
         mod.PROBE_TIMEOUT_SECONDS = 1
         mod.SUPERVISOR_GRACE_SECONDS = 600
-        t0 = time.monotonic()
+        clock = PsqlStartClock(self.base / "sleep.pid")
+        mod.time = clock  # the 1 s limit counts from psql's start, not from two Python start-ups (#6646, #6674)
         with self.assertRaises(mod.HelperError) as ctx:
             mod.probe_lists_age(str(self.psql), f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb")
-        self.assertLess(time.monotonic() - t0, 8)
+        self.assertTrue(clock.psql_started, "psql never recorded its pid within the clock's 30 s cap")
+        self.assertLess(time.monotonic() - clock.started, 6)
         self.assertEqual(ctx.exception.code, mod.EXIT_UNAVAILABLE)
         self.assertEqual(str(ctx.exception), "age probe could not run psql (TimeoutExpired)")
         self.assertNotIn(PW_MARKER, str(ctx.exception))
