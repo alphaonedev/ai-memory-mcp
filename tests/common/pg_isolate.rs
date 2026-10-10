@@ -25,6 +25,10 @@
 //!   when the flag is on and the URL is not already isolated, holds a session
 //!   on the clone for the life of the process, and publishes the minted URL to
 //!   the process environment under the shared env lock so children inherit it.
+//!   Outside the wrapper the process owns that clone: an exit hook (`atexit`)
+//!   releases the session and drops it, best effort and never a panic (#6570).
+//!   If the shared env lock cannot be taken in time the mint fails closed
+//!   instead of leaving raw env readers on the shared database (#6571).
 //!
 //! Fail closed: flag on but the clone cannot be made is a panic with the
 //! reason, never a silent fall back to the shared database. In particular the
@@ -45,7 +49,7 @@
 
 use std::future::Future;
 use std::sync::mpsc;
-use std::sync::{MutexGuard, OnceLock, TryLockError};
+use std::sync::{Mutex, MutexGuard, Once, OnceLock, PoisonError, TryLockError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -205,7 +209,18 @@ fn run_of(name: &str) -> Option<&str> {
 }
 
 static ISOLATED: OnceLock<Option<String>> = OnceLock::new();
-static PROCESS_HOLD: OnceLock<Hold> = OnceLock::new();
+/// What this process minted for itself, kept so the exit hook can release the
+/// session and drop the clone (#6570). `None` once released, or when the URL
+/// came from the wrapper (which owns that clone).
+static PROCESS_CLONE: Mutex<Option<ProcessClone>> = Mutex::new(None);
+static EXIT_HOOK: Once = Once::new();
+
+struct ProcessClone {
+    hold: Hold,
+    base: String,
+    run: String,
+    name: String,
+}
 
 /// The Postgres URL tests should use: the raw `AI_MEMORY_TEST_POSTGRES_URL`
 /// when isolation is off (today's behaviour), else this process's own clone
@@ -246,21 +261,94 @@ fn mint_for_process(base: &str) -> Result<String, String> {
     let run = run_id_from(std::env::var(RUN_ID_VAR).ok().as_deref())?;
     let minted = mint_blocking(base, &template, &run)?;
     let name = super::lane_db::database_name(&minted).to_string();
-    match hold_blocking(&minted) {
-        Ok(hold) => {
-            // First and only initialisation: `resolve` runs once per process.
-            let _ = PROCESS_HOLD.set(hold);
-        }
+    let hold = match hold_blocking(&minted) {
+        Ok(hold) => hold,
         Err(why) => {
-            if let Err(e) = drop_database_blocking(base, &run, &name) {
-                eprintln!("WARN: [pg_isolate] could not drop {name} after a failed hold: {e}");
-            }
+            discard_clone(base, &run, &name, "a failed hold");
             return Err(format!("could not hold a session on {name}: {why}"));
         }
+    };
+    // #6571: a publish that cannot finish leaves raw env readers on the shared
+    // database, so it fails the mint (the caller panics) instead of warning.
+    if let Err(why) = publish_env(base, &name, &minted) {
+        drop(hold);
+        discard_clone(base, &run, &name, "a failed env publish");
+        return Err(why);
     }
-    publish_env(base, &name, &minted);
+    // #6570: the exit hook releases the session and drops the clone.
+    *PROCESS_CLONE.lock().unwrap_or_else(PoisonError::into_inner) = Some(ProcessClone {
+        hold,
+        base: base.to_string(),
+        run,
+        name: name.clone(),
+    });
+    install_exit_hook();
     eprintln!("[pg_isolate] {} -> {name}", exe_stem());
     Ok(minted)
+}
+
+/// Best-effort drop of a clone this process just made and could not use.
+fn discard_clone(base: &str, run: &str, name: &str, why: &str) {
+    if let Err(e) = drop_database_blocking(base, run, name) {
+        eprintln!("WARN: [pg_isolate] could not drop {name} after {why}: {e}");
+    }
+}
+
+/// Release the session on this process's own clone and drop the clone. Returns
+/// the dropped name, `None` when this process owns no clone (flag off, wrapper
+/// URL, or already released). Idempotent; never panics.
+///
+/// # Errors
+///
+/// The `DROP` failed (for example another session in this process still holds
+/// the clone); the clone is then left for the run's teardown or the admin sweep.
+pub fn release_process_clone() -> Result<Option<String>, String> {
+    let taken = PROCESS_CLONE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .take();
+    let Some(ProcessClone {
+        hold,
+        base,
+        run,
+        name,
+    }) = taken
+    else {
+        return Ok(None);
+    };
+    drop(hold);
+    drop_database_blocking(&base, &run, &name).map(|()| Some(name))
+}
+
+#[cfg(unix)]
+extern "C" fn exit_release_clone() {
+    // `extern "C"` must not unwind: contain any panic and report best effort.
+    let outcome = std::panic::catch_unwind(release_process_clone);
+    match outcome {
+        Ok(Ok(_)) => {}
+        Ok(Err(why)) => eprintln!("WARN: [pg_isolate] exit cleanup left a clone behind: {why}"),
+        Err(_) => eprintln!("WARN: [pg_isolate] exit cleanup panicked; clone left behind"),
+    }
+}
+
+/// Register [`release_process_clone`] to run when the test binary exits,
+/// including `process::exit` after a failed run. Registered once.
+fn install_exit_hook() {
+    EXIT_HOOK.call_once(|| {
+        #[cfg(unix)]
+        {
+            // SAFETY: `exit_release_clone` is a plain `extern "C" fn()` with no
+            // captured state that never unwinds (panics are caught inside).
+            let rc = unsafe { libc::atexit(exit_release_clone) };
+            if rc != 0 {
+                eprintln!(
+                    "WARN: [pg_isolate] atexit registration failed (rc {rc}); clone relies on sweep"
+                );
+            }
+        }
+        #[cfg(not(unix))]
+        eprintln!("WARN: [pg_isolate] no exit hook on this platform; clone relies on sweep");
+    });
 }
 
 fn exe_stem() -> String {
@@ -270,10 +358,10 @@ fn exe_stem() -> String {
         .unwrap_or_else(|| "unknown-binary".to_string())
 }
 
-/// Take the shared env lock, giving up after [`ENV_LOCK_WAIT`] so a caller that
-/// already holds an `EnvVarGuard` cannot deadlock this thread.
-fn lock_env_bounded() -> Option<MutexGuard<'static, ()>> {
-    let deadline = Instant::now() + ENV_LOCK_WAIT;
+/// Take the shared env lock, giving up after `wait` so a caller that already
+/// holds an `EnvVarGuard` cannot deadlock this thread.
+fn lock_env_bounded(wait: Duration) -> Option<MutexGuard<'static, ()>> {
+    let deadline = Instant::now() + wait;
     loop {
         match super::ENV_LOCK.try_lock() {
             Ok(guard) => return Some(guard),
@@ -296,16 +384,34 @@ fn same_server(a: &str, b: &str) -> bool {
 }
 
 /// Point the process environment at the minted database so every raw env reader
-/// and every spawned child sees it. On env-lock timeout the cached return value
-/// of [`isolated_url`] is still isolated; only raw env readers are not.
-fn publish_env(base: &str, name: &str, minted: &str) {
-    let Some(_guard) = lock_env_bounded() else {
-        eprintln!(
-            "WARN: [pg_isolate] env lock busy for {}s; {URL_VAR} left unchanged, helper callers \
-             still get the isolated URL",
-            ENV_LOCK_WAIT.as_secs()
-        );
-        return;
+/// and every spawned child sees it.
+///
+/// # Errors
+///
+/// The shared env lock was not free within [`ENV_LOCK_WAIT`]; nothing was
+/// changed and raw readers would still see the shared database.
+fn publish_env(base: &str, name: &str, minted: &str) -> Result<(), String> {
+    publish_env_within(base, name, minted, ENV_LOCK_WAIT)
+}
+
+/// [`publish_env`] with an explicit lock wait.
+///
+/// # Errors
+///
+/// The shared env lock was not free within `wait` (#6571); the environment is
+/// untouched.
+pub fn publish_env_within(
+    base: &str,
+    name: &str,
+    minted: &str,
+    wait: Duration,
+) -> Result<(), String> {
+    let Some(_guard) = lock_env_bounded(wait) else {
+        return Err(format!(
+            "the env lock stayed busy for {}ms, so {URL_VAR} and {AGE_URL_VAR} still name the \
+             shared database; refusing to run against it",
+            wait.as_millis()
+        ));
     };
     // SAFETY: env mutation is serialised by `ENV_LOCK`, held in `_guard`.
     unsafe {
@@ -316,6 +422,7 @@ fn publish_env(base: &str, name: &str, minted: &str) {
             std::env::set_var(AGE_URL_VAR, with_database(&age, name));
         }
     }
+    Ok(())
 }
 
 /// Run `fut` to completion on its own thread and runtime, so it works from a
