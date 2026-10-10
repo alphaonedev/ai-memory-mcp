@@ -2584,6 +2584,22 @@ def _self_test_cases() -> int:
     masks("#6625 R5 S7 a tab between unquoted value words keeps one value", "token: 20000\t6163CanaryS7Word",
           hidden=("6163CanaryS7Word",), count=1)
 
+    # #6163 round 5 (mutant survivors R5b, R5c, R5f, R5i, R5j, R5p): the cap is pinned by literals, not by the
+    # constant; an unclosed code span keeps the pipes before it as cell separators; the URL host lookahead keeps the
+    # host visible and ends at a fragment; a key line that carries the closing triple quote closes the value.
+    masks("#6613 R5 a line of 2000 characters is shown and a line of 2001 is hidden (literal pin)",
+          "k-6163\n" + "q" * 2000 + "\n" + "q" * 2001 + "\nz-6163", shown=("q" * 2000, "k-6163", "z-6163"),
+          hidden=("q" * 2001,), count=1)
+    masks("#6613 R5 an unclosed code span keeps the pipes before it as cell separators",
+          "note | password | 6163CanaryUnclosed | `open", hidden=("6163CanaryUnclosed",), shown=("note | password |",))
+    masks("#6615 R5 a later @ not followed by a host leaves the host visible",
+          "https://u:6163CanaryHost@h.co/p?x=@ end", hidden=("6163CanaryHost",), shown=("h.co/p",), count=1)
+    masks("#6667 R5 a URL host followed by a fragment still ends the password",
+          "https://u:6163CanaryFrag@h.co#frag", hidden=("6163CanaryFrag",), shown=("h.co#frag",), count=1)
+    masks("#6666 R5 a key line that carries the closing triple quote closes the value",
+          'secret = """\n-----BEGIN PRIVATE KEY-----\n6163CanaryTk\n-----END PRIVATE KEY-----"""\nafter-shown-6163',
+          hidden=("6163CanaryTk",), shown=("after-shown-6163",))
+
     # #6163 round 2 (review F2 of the code review): run() itself fetches the pull request head with --pr-number. A
     # scratch origin holds refs/pull/7/head; the base clone has no head objects until the script fetches them.
     fetch_root = base_dir / "pr-fetch"
