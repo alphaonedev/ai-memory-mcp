@@ -38,6 +38,8 @@ pub(crate) mod dns_guard;
 mod dns_guard_4075_tests;
 #[cfg(test)]
 mod dns_guard_4165_tests;
+#[cfg(test)]
+mod webhook_url_6371_tests;
 // #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
 mod unstarted;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
@@ -1658,11 +1660,32 @@ fn send(
     signature: Option<&str>,
     correlation_id: &str,
 ) -> Result<(), String> {
+    send_with(
+        url,
+        body,
+        timestamp,
+        signature,
+        correlation_id,
+        crate::config::allow_loopback_webhooks(),
+    )
+}
+
+/// [`send`] with the loopback opt-in passed explicitly, so a test can drive
+/// the production-default posture (`false`) without racing the process-wide
+/// flag, which is `true` under `cfg(test)` (#6371).
+fn send_with(
+    url: &str,
+    body: &str,
+    timestamp: &str,
+    signature: Option<&str>,
+    correlation_id: &str,
+    allow_loopback: bool,
+) -> Result<(), String> {
     // #3684 — a webhook URL is tenant-supplied and commonly carries its
     // credential in the PATH (Slack / Discord) or the query string; every
     // log line renders it as `scheme://host[:port]` only.
     let target = crate::url_display::url_origin(url);
-    if let Err(e) = validate_url(url) {
+    if let Err(e) = validate_url_with(url, allow_loopback) {
         tracing::warn!("SSRF guard rejected webhook URL {target}: {e}");
         return Err(dlq_reason::SSRF_REJECTED.to_string());
     }
@@ -1678,17 +1701,16 @@ fn send(
     // resolver override pins reqwest's connect to the daemon's
     // already-validated IP set; reqwest's own DNS query never
     // happens for this client.
-    let (resolved_host, validated_addrs) =
-        match validate_url_dns_resolved(url, crate::config::allow_loopback_webhooks()) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!("DNS SSRF guard rejected webhook URL {target}: {e}");
-                // #4165 — the typed refusal picks its own DLQ reason, so the
-                // ladder can tell a permanent address-class verdict from a
-                // transient resolver failure.
-                return Err(e.dlq_reason().to_string());
-            }
-        };
+    let (resolved_host, validated_addrs) = match validate_url_dns_resolved(url, allow_loopback) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("DNS SSRF guard rejected webhook URL {target}: {e}");
+            // #4165 — the typed refusal picks its own DLQ reason, so the
+            // ladder can tell a permanent address-class verdict from a
+            // transient resolver failure.
+            return Err(e.dlq_reason().to_string());
+        }
+    };
     // v0.7.0 SR-W3 (HIGH) — redirect SSRF-pin bypass. The
     // `builder.resolve(host, addr)` pins below shadow reqwest's DNS
     // for the *validated* host only. reqwest's default redirect
