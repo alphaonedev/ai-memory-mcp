@@ -1108,7 +1108,8 @@ def _self_test_cases() -> int:
 
     counter = [0]
 
-    def case(name, mutate, want_fail, needle, trailer=None, base_mutate=None, message=None, absent=None, needles=()):
+    def case(name, mutate, want_fail, needle, trailer=None, base_mutate=None, message=None, absent=None, needles=(),
+             probe=False):
         counter[0] += 1
         work = base_dir / f"c{counter[0]}"
         base_sha = make_repo(guard, work / "repo")
@@ -1126,12 +1127,16 @@ def _self_test_cases() -> int:
         except RuntimeError as exc:
             report, failed = f"RESULT: FAIL (closed) - {exc}", True
         missing = [want for want in (needle, *needles) if want not in report]
-        if failed != want_fail or missing or (absent is not None and absent in report):
+        wrong = failed != want_fail or bool(missing) or (absent is not None and absent in report)
+        if probe:
+            return not wrong  # #6163 round 6 (non-vacuity probe): the verdict only, no PASS or FAIL line, no failure
+        if wrong:
             failures.append(name)
             print(f"FAIL: self-test - {name}: failed={failed} (wanted {want_fail}), missing {missing!r}, "
                   f"absent {absent!r}\n{report}", file=sys.stderr)
         else:
             print(f"PASS: self-test - {name}")
+        return not wrong
 
     heading = guard.CLAUDE_MD_REQUIRED_HEADINGS[2]
 
@@ -2291,6 +2296,27 @@ def _self_test_cases() -> int:
     case("#6163 a credential in an approval trailer is masked (S1, O10)", reword, False,
          "approval trailer(s): ` password=[MASKED] `", trailer="password=6163-canary-trailer",
          absent="6163-canary-trailer")
+    # #6163 round 6 (non-vacuity, merge note for fix/6179): case() must FAIL a cell whose `absent` text is in the report,
+    # whose needle or extra needle is missing, or whose expected verdict is wrong. A merge that keeps another branch's
+    # shorter check line (`failed != want_fail or needle not in report`) would pass every masking cell vacuously.
+    for probe_name, probe_args, probe_kwargs in (
+            ("absent text present", (reword, False, "approval trailer(s): ` password=[MASKED] `"),
+             {"trailer": "password=6163-canary-trailer", "absent": "password=[MASKED]"}),
+            ("extra needle missing", (reword, False, "approval trailer(s): ` password=[MASKED] `"),
+             {"trailer": "password=6163-canary-trailer", "needles": ("6163-needle-not-in-report",)}),
+            ("needle missing", (reword, False, "6163-needle-not-in-report"), {"trailer": "Justin"}),
+            ("wrong verdict", (reword, True, "approval trailer(s):"), {"trailer": "Justin"})):
+        if case(f"probe {probe_name}", *probe_args, probe=True, **probe_kwargs):
+            failures.append(f"non-vacuity: case() passed a cell with {probe_name}")
+            print(f"FAIL: self-test - #6163 non-vacuity: case() passed a cell with {probe_name}", file=sys.stderr)
+        else:
+            print(f"PASS: self-test - #6163 non-vacuity: case() fails a cell with {probe_name}")
+    if not case("probe positive control", reword, False, "approval trailer(s): ` password=[MASKED] `",
+                trailer="password=6163-canary-trailer", absent="6163-canary-trailer", probe=True):
+        failures.append("non-vacuity: the positive control of case() failed")
+        print("FAIL: self-test - #6163 non-vacuity: the positive control of case() failed", file=sys.stderr)
+    else:
+        print("PASS: self-test - #6163 non-vacuity: case() passes a cell that holds")
 
     # #6163 round 3: unit cells on unified() itself (the diff shape, the line cap and CRLF lines).
     def unit(label, ok, detail):
@@ -2327,17 +2353,38 @@ def _self_test_cases() -> int:
 
     # #6163 round 4: unit cells on Redactor().mask() and unified() for the round-3 review findings. Each names the
     # finding it pins; `hidden` must not appear in the output, `shown` must.
-    def masks(label, text, hidden=(), shown=(), count=None):
-        redactor = Redactor()
+    def masks_ok(redactor, text, hidden=(), shown=(), count=None):
+        """(verdict, detail) of one masking cell against `redactor`; masks() and the non-vacuity cells share it."""
         got = redactor.mask(text)
-        unit(label, all(item not in got for item in hidden) and all(item in got for item in shown)
-             and (count is None or redactor.count == count), f"count={redactor.count}\n{got}")
+        return (all(item not in got for item in hidden) and all(item in got for item in shown)
+                and (count is None or redactor.count == count)), f"count={redactor.count}\n{got}"
+
+    def masks(label, text, hidden=(), shown=(), count=None):
+        unit(label, *masks_ok(Redactor(), text, hidden, shown, count))
 
     def diff_masks(label, old_text, new_text, hidden=(), shown=(), count=None):
         redactor = Redactor()
         got = unified(old_text, new_text, "## Sec", redactor)
         unit(label, all(item not in got for item in hidden) and all(item in got for item in shown)
              and (count is None or redactor.count == count), f"count={redactor.count}\n{got}")
+
+    # #6163 round 6 (non-vacuity): a masking cell fails when the text is not masked. The stand-in masks nothing; each
+    # expectation of a cell (a hidden item, a shown item, a count) alone must make the cell fail against it, and the
+    # real Redactor must pass the same expectations (positive control).
+    class NoMask:
+        count = 0
+
+        def mask(self, text):
+            return text
+
+    for aspect, aspect_kwargs in (("hidden text still present", {"hidden": ("6163NonVacuous",)}),
+                                  ("shown text missing", {"shown": ("6163-not-in-the-text",)}),
+                                  ("count not reached", {"count": 1})):
+        unit(f"non-vacuity: a masking cell with {aspect} fails against a Redactor that masks nothing",
+             not masks_ok(NoMask(), "password: 6163NonVacuous", **aspect_kwargs)[0], aspect)
+    unit("non-vacuity: the same masking expectations hold for the real Redactor",
+         masks_ok(Redactor(), "password: 6163NonVacuous", hidden=("6163NonVacuous",), shown=("password:",), count=1)[0],
+         str(masks_ok(Redactor(), "password: 6163NonVacuous")))
 
     # #6211 round 4 (security F1, code F1): the value on the line after a bare credential name is found on each side
     # of the diff, so a rotated value under an unchanged name line is masked on both its `-` and its `+` row, at the
