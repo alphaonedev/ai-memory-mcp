@@ -893,7 +893,9 @@ def shimmed_cell(t, label, tmp, repo, env, **kw):
 
 def _shim_nonce_freshness(t, tmp, repo, env):
     """(shim-probe-exact, #6567): two shimmed runs must hand the probe two
-    distinct 32-hex-digit markers (a module constant would repeat)."""
+    distinct 32-hex-digit markers (a module constant would repeat). Each run
+    goes through shimmed_cell, so a shim that cannot be reached is a named
+    (shim-probe-exact) failure on `t`, never an escaped exception (#6650)."""
     seen_markers = []
     real_probe = _require_shim_reachable
 
@@ -904,7 +906,7 @@ def _shim_nonce_freshness(t, tmp, repo, env):
     with unittest.mock.patch.object(sys.modules[__name__], "_require_shim_reachable",
                                     side_effect=spy_probe):
         for _ in range(2):
-            run_gate_shimmed(tmp, repo, env, version="git version 2.29.9")
+            shimmed_cell(t, "shim-probe-exact", tmp, repo, env, version="git version 2.29.9")
     if (len(seen_markers) != 2 or seen_markers[0] == seen_markers[1]
             or not all(re.fullmatch("[0-9a-f]{32}", m) for m in seen_markers)):
         t.fail(f"(shim-probe-exact): the probe marker is not a fresh 32-hex nonce per "
@@ -1709,6 +1711,8 @@ SELF_TEST_OK = (
     "(shim-probe-exact, #6567/#6562) the probe answer is a per-run nonce compared exactly on "
     "stdout, so an affixed, split, whitespace-padded, stderr-only, wrong-nonce or "
     "blank-line-padded answer is refused; "
+    "(shim-probe-exact-noexec, #6650) a shim that cannot be executed in the nonce check is a "
+    "named (shim-probe-exact) failure, never a traceback; "
     "(shim-pathsep-clean, #6428) a refused separator path leaves no shim directory; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
