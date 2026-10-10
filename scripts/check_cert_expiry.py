@@ -1549,6 +1549,41 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                  repo, m3, m32, [
                      (f"- {kid}", "did not name the removed identifier"),
                      ("occurrences in src/ fell 3 -> 2", "did not carry the 3 -> 2 count change")])
+    # (mask-rise) the total goes UP (definition removed, two mentions added): still
+    #       RED, and the report must not claim a fall.
+    fx.g("update-ref", "refs/remotes/origin/main", mk0)
+    fx.g("checkout", "-q", "-B", "mo-rise", mk0)
+    fx.write("src/mask_def.rs", 'pub const M: &str = "";\n')
+    fx.write("src/mask_new.rs", f"// {kid} one\n// {kid} two\n")
+    rise = fx.commit(["src/mask_def.rs", "src/mask_new.rs"], "mask-rise: definition out, two notes in")
+    out_rise = t.expect_red("mask-rise", "definition removed while the total rises 2 -> 3",
+                            repo, mk0, rise, [
+                                (f"- {kid}", "did not name the removed identifier"),
+                                ("the total did not fall: 2 -> 3", "did not state that the total rose")])
+    if "occurrences in src/ fell" in out_rise:
+        t.fail(f"(mask-rise): a rising total was annotated as a fall: {out_rise!r}")
+    # (mask-dup) two files carry the same defining line; removing ONE of them is a
+    #       loss even though the line text survives in the other (counts are not
+    #       collapsed per line).
+    fx.g("checkout", "-q", "-B", "mo-dup0", mk0)
+    fx.write("src/mask_dup.rs", def_line)
+    dup0 = fx.commit(["src/mask_dup.rs"], "mask-dup0: the same defining line in a second file")
+    fx.g("update-ref", "refs/remotes/origin/main", dup0)
+    fx.g("checkout", "-q", "-B", "mo-dup1", dup0)
+    fx.write("src/mask_dup.rs", 'pub const M: &str = "";\n')
+    dup1 = fx.commit(["src/mask_dup.rs"], "mask-dup1: one of the two identical definitions goes")
+    t.expect_red("mask-dup", "one of two identical defining lines removed",
+                 repo, dup0, dup1, [
+                     ("occurrences in src/ fell 3 -> 2", "did not carry the 3 -> 2 count change")])
+    # Controls: a longer token that merely CONTAINS the prefix is not an identifier,
+    # so adding one is GREEN (the left word boundary; letter and underscore prefixes).
+    fx.g("update-ref", "refs/remotes/origin/main", mk0)
+    for suffix, pre in (("letter", "NOT"), ("underscore", "X_")):
+        fx.g("checkout", "-q", "-B", f"mo-longer-{suffix}", mk0)
+        fx.write("src/mask_new.rs", f"// {pre}AI_MEMORY_FED_MASK_OTHER_{suffix.upper()}\n")
+        lg = fx.commit(["src/mask_new.rs"], f"mask-longer-{suffix}: a longer token is added")
+        t.expect_green(f"mask-longer-{suffix}", f"a {suffix}-prefixed longer token is not a new identifier",
+                       repo, mk0, lg)
     fx.g("checkout", "-q", "main")
     fx.reset(base)
     fx.g("update-ref", "refs/remotes/origin/main", base)
@@ -1979,7 +2014,7 @@ SELF_TEST_OK = (
     "block comment around it or the drift annotation text stays RED, as do look-alike spellings "
     "(mask-confusable, mask-confusable-note, mask-zwsp, mask-crsplit) and a removed mention "
     "(mask-note-removed), a removal whose total never falls (mask-netzero, mask-netzero-gate) "
-    "and a 3 -> 2 fall (mask-3to2) stay RED, while a defining line moved to another file is GREEN (mask-moved); "
+    "and a 3 -> 2 fall (mask-3to2), a rising total (mask-rise) and one of two identical definitions (mask-dup) stay RED, a longer token is GREEN (mask-longer-letter, mask-longer-underscore), while a defining line moved to another file is GREEN (mask-moved); "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
