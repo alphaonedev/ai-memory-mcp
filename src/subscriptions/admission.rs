@@ -13,15 +13,15 @@
 //! Now `dispatch_event_to_subs` writes every matching delivery's row as
 //! `delivery_status = 'pending'` BEFORE it spawns anything, and the worker
 //! only UPDATEs that row. On the sqlite path the rows go through the
-//! dispatching caller's own connection inside one SAVEPOINT (one commit per
-//! dispatch call, safe whether or not the caller is inside a transaction,
-//! and no second writer competing for the WAL lock the caller may hold); the
-//! postgres daemon, whose audit mirror is the sqlite sidecar at `db_path`,
-//! opens that sidecar once per call.
+//! dispatching caller's own connection in one `BEGIN IMMEDIATE` transaction
+//! (one commit per dispatch call; a caller already inside a transaction is
+//! joined, so no second writer competes for the WAL lock the caller holds,
+//! #6568); the postgres daemon, whose audit mirror is the sqlite sidecar at
+//! `db_path`, opens that sidecar once per call.
 //!
 //! * **Fail closed (#3191 F-5 shape).** A delivery whose admission row
 //!   cannot be written is not sent: it gets a DLQ row instead, synchronously.
-//!   If the SAVEPOINT cannot be committed, every delivery it carried is
+//!   If the batch cannot be committed, every delivery it carried is
 //!   refused the same way before any worker is spawned.
 //! * **Crash recovery is a read, not a re-send.** A crash leaves the
 //!   unstarted delivery's row `pending` with its full payload, so
@@ -41,57 +41,70 @@ use std::path::Path;
 use anyhow::{Context as _, Result};
 use rusqlite::Connection;
 
+use crate::storage::connection::WriteTxn;
+
 /// Tracing target for admission failures.
 const TRACE_TARGET: &str = "ai_memory::subscriptions::admission";
 
-/// The SAVEPOINT name; nested safely inside any caller transaction.
-const SAVEPOINT: &str = "webhook_admission_3980";
-
-enum Conn<'c> {
-    Caller(&'c Connection),
-    Sidecar(Connection),
-    /// The sidecar could not be opened; every admission fails closed.
-    Unavailable(String),
-}
-
 /// One dispatch call's admission batch.
+///
+/// #6568 (#5084) — the batch takes the write lock at BEGIN: on a connection
+/// in autocommit (the sidecar, or a caller outside any transaction) it owns a
+/// [`WriteTxn`] (`BEGIN IMMEDIATE`). A caller already inside a transaction is
+/// JOINED instead ([`crate::storage::connection::in_write_txn`] semantics):
+/// every production SQLite transaction opens `BEGIN IMMEDIATE` (closed-world
+/// gate `scripts/check-sqlite-write-txn-immediate.py`), so that caller already
+/// holds the write lock, and its own commit decides the batch.
 pub(super) struct Admission<'c> {
-    conn: Conn<'c>,
+    /// The audit connection, or why it could not be opened (every admission
+    /// then fails closed).
+    conn: std::result::Result<&'c Connection, String>,
     db_path: &'c Path,
-    savepoint: bool,
+    /// The batch's own transaction; `None` when joined to the caller's, or
+    /// when `BEGIN IMMEDIATE` failed (each row then commits on its own).
+    txn: Option<WriteTxn<'c>>,
 }
 
 impl<'c> Admission<'c> {
     /// Open the batch on `caller` (sqlite path) or on the sidecar at
-    /// `db_path` (postgres path, `caller = None`).
-    pub(super) fn begin(caller: Option<&'c Connection>, db_path: &'c Path) -> Self {
+    /// `db_path` (postgres path, `caller = None`), which is opened into
+    /// `sidecar` so the batch's transaction can borrow it.
+    pub(super) fn begin(
+        caller: Option<&'c Connection>,
+        db_path: &'c Path,
+        sidecar: &'c mut Option<Connection>,
+    ) -> Self {
         let conn = match caller {
-            Some(c) => Conn::Caller(c),
+            Some(c) => Ok(c),
             // Through the `crate::storage` open funnel (pragmas, sqlcipher
             // key), not a raw open (#2445 ledger).
             None => match crate::storage::open_unmigrated(db_path) {
-                Ok(c) => Conn::Sidecar(c),
-                Err(e) => Conn::Unavailable(e.to_string()),
+                Ok(c) => Ok(&*sidecar.insert(c)),
+                Err(e) => Err(e.to_string()),
             },
         };
-        let savepoint = match &conn {
-            Conn::Caller(c) => c.execute_batch(&format!("SAVEPOINT {SAVEPOINT}")).is_ok(),
-            Conn::Sidecar(c) => c.execute_batch(&format!("SAVEPOINT {SAVEPOINT}")).is_ok(),
-            Conn::Unavailable(_) => false,
+        let txn = match conn {
+            Ok(c) if c.is_autocommit() => match WriteTxn::begin(c) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    tracing::warn!(
+                        target: TRACE_TARGET,
+                        "webhook admission BEGIN IMMEDIATE failed: {e}; each admission row \
+                         commits on its own (#6568)"
+                    );
+                    None
+                }
+            },
+            _ => None,
         };
-        Self {
-            conn,
-            db_path,
-            savepoint,
-        }
+        Self { conn, db_path, txn }
     }
 
-    fn conn(&self) -> Result<&Connection> {
-        match &self.conn {
-            Conn::Caller(c) => Ok(c),
-            Conn::Sidecar(c) => Ok(c),
-            Conn::Unavailable(e) => Err(anyhow::anyhow!("audit db open failed: {e}")),
-        }
+    fn conn(&self) -> Result<&'c Connection> {
+        self.conn
+            .as_ref()
+            .copied()
+            .map_err(|e| anyhow::anyhow!("audit db open failed: {e}"))
     }
 
     /// Write the delivery's `pending` audit row. `false` means the row could
@@ -180,16 +193,15 @@ impl<'c> Admission<'c> {
 
     /// Commit the batch. On `Err` every admission row of the batch is gone
     /// and the caller must refuse every delivery it admitted.
+    ///
+    /// A failed COMMIT leaves the [`WriteTxn`] armed, so its drop rolls the
+    /// batch back. A batch joined to the caller's transaction has nothing of
+    /// its own to commit.
     pub(super) fn commit(self) -> Result<()> {
-        if !self.savepoint {
-            return Ok(());
+        match self.txn {
+            Some(txn) => txn.commit().context("webhook admission commit"),
+            None => Ok(()),
         }
-        let c = self.conn()?;
-        if let Err(e) = c.execute_batch(&format!("RELEASE {SAVEPOINT}")) {
-            let _ = c.execute_batch(&format!("ROLLBACK TO {SAVEPOINT}; RELEASE {SAVEPOINT}"));
-            return Err(e).context("webhook admission commit");
-        }
-        Ok(())
     }
 }
 
@@ -208,10 +220,11 @@ pub(super) fn transfer_unstarted_to_dlq(
     last_error: &str,
     at: &str,
 ) -> Result<()> {
-    let mut conn = crate::storage::open_unmigrated(db_path).context("subscription_dlq open")?;
-    let tx = conn.transaction().context("shutdown DLQ transaction")?;
+    let conn = crate::storage::open_unmigrated(db_path).context("subscription_dlq open")?;
+    // #6568 (#5084) — BEGIN IMMEDIATE: the write lock is taken up front.
+    let tx = WriteTxn::begin(&conn).context("shutdown DLQ transaction")?;
     super::record_dlq_with_conn(
-        &tx,
+        &conn,
         sub_id,
         correlation_id,
         event,
@@ -221,7 +234,7 @@ pub(super) fn transfer_unstarted_to_dlq(
         at,
         at,
     )?;
-    tx.execute(
+    conn.execute(
         "DELETE FROM subscription_events WHERE subscription_id = ?1 \
          AND correlation_id = ?2 AND delivery_status = 'pending'",
         rusqlite::params![sub_id, correlation_id],
@@ -271,7 +284,8 @@ mod tests {
     fn admission_on_an_autocommit_caller_takes_the_write_lock_at_begin_6568() {
         let (_keep, db) = fresh_db();
         let conn = Connection::open(&db).expect("open");
-        let adm = Admission::begin(Some(&conn), &db);
+        let mut sidecar = None;
+        let adm = Admission::begin(Some(&conn), &db, &mut sidecar);
         assert!(
             write_is_locked_out(&db),
             "the admission batch must hold the write lock from BEGIN (BEGIN IMMEDIATE, #5084), \
@@ -284,13 +298,36 @@ mod tests {
     #[test]
     fn admission_on_the_sidecar_takes_the_write_lock_at_begin_6568() {
         let (_keep, db) = fresh_db();
-        let adm = Admission::begin(None, &db);
+        let mut sidecar = None;
+        let adm = Admission::begin(None, &db, &mut sidecar);
         assert!(
             write_is_locked_out(&db),
             "the sidecar admission batch must hold the write lock from BEGIN (#5084)"
         );
         adm.commit().expect("commit");
         assert!(!write_is_locked_out(&db), "commit releases the write lock");
+    }
+
+    #[test]
+    fn a_caller_transaction_is_joined_and_its_rollback_discards_the_batch_6568() {
+        let (_keep, db) = fresh_db();
+        let conn = Connection::open(&db).expect("open");
+        let caller = WriteTxn::begin(&conn).expect("caller BEGIN IMMEDIATE");
+        let mut sidecar = None;
+        let adm = Admission::begin(Some(&conn), &db, &mut sidecar);
+        assert!(adm.admit("sub-a", "corr-a", "memory_store", "{}"));
+        adm.commit()
+            .expect("a joined batch has nothing of its own to commit");
+        assert!(
+            !conn.is_autocommit(),
+            "the caller's transaction is still open"
+        );
+        caller.rollback();
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM subscription_events"),
+            0,
+            "the caller's rollback decides the joined batch"
+        );
     }
 
     #[test]
@@ -323,7 +360,8 @@ mod tests {
     fn admission_rows_commit_together_and_survive_without_a_worker_3980() {
         let (_keep, db) = fresh_db();
         let conn = Connection::open(&db).expect("open");
-        let adm = Admission::begin(Some(&conn), &db);
+        let mut sidecar = None;
+        let adm = Admission::begin(Some(&conn), &db, &mut sidecar);
         assert!(adm.admit("sub-a", "corr-a", "memory_store", "{}"));
         assert!(adm.admit("sub-b", "corr-b", "memory_store", "{}"));
         adm.commit().expect("commit");
@@ -343,7 +381,8 @@ mod tests {
         let conn = Connection::open(&db).expect("open");
         conn.execute_batch("DROP TABLE subscription_events")
             .expect("drop audit table");
-        let adm = Admission::begin(Some(&conn), &db);
+        let mut sidecar = None;
+        let adm = Admission::begin(Some(&conn), &db, &mut sidecar);
         assert!(!adm.admit("sub-a", "corr-a", "memory_store", "{}"));
         adm.commit().expect("commit");
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM subscription_dlq"), 1);
@@ -352,7 +391,8 @@ mod tests {
     #[test]
     fn the_sidecar_path_admits_without_a_caller_connection_3980() {
         let (_keep, db) = fresh_db();
-        let adm = Admission::begin(None, &db);
+        let mut sidecar = None;
+        let adm = Admission::begin(None, &db, &mut sidecar);
         assert!(adm.admit("sub-a", "corr-a", "memory_store", "{}"));
         adm.commit().expect("commit");
         let conn = Connection::open(&db).expect("open");
@@ -363,7 +403,8 @@ mod tests {
     fn the_drain_transfer_replaces_a_pending_row_but_never_a_settled_one_3980() {
         let (_keep, db) = fresh_db();
         let conn = Connection::open(&db).expect("open");
-        let adm = Admission::begin(Some(&conn), &db);
+        let mut sidecar = None;
+        let adm = Admission::begin(Some(&conn), &db, &mut sidecar);
         assert!(adm.admit("sub-a", "corr-a", "memory_store", "{}"));
         assert!(adm.admit("sub-b", "corr-b", "memory_store", "{}"));
         adm.commit().expect("commit");

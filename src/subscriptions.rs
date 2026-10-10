@@ -1109,7 +1109,8 @@ pub fn dispatch_event_to_subs(
     // #3980 — every delivery's `pending` audit row is written HERE, before
     // anything is spawned, so a crash cannot lose an admitted delivery; the
     // spawns wait until the batch has committed (`admission.rs`).
-    let admission = admission::Admission::begin(admission_conn, db_path);
+    let mut sidecar = None;
+    let admission = admission::Admission::begin(admission_conn, db_path, &mut sidecar);
     let mut staged = Vec::new();
     for (sub, sub_secret_hash) in matching {
         // v0.7.0 K6 — UUIDv7 correlation id is generated per
