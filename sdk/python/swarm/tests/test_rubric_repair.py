@@ -11,6 +11,7 @@ and in CI. ``fixtures/reduce_journal.py`` rebuilds that copy from a full journal
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -302,6 +303,38 @@ def test_journal_fixture_is_in_the_tree_6721() -> None:
     for name in ("assessments.json", "nhi-audit.json", "calls.jsonl.gz"):
         assert (here / name).is_file(), f"missing in-tree journal fixture {name}"
     assert (here.parent / "reduce_journal.py").is_file()
+
+
+#: The reviewed content of the reduced journal (#6832): SHA-256 of each file,
+#: ``calls.jsonl.gz`` hashed decompressed so a rebuild by
+#: ``fixtures/reduce_journal.py`` (whose gzip header carries a timestamp)
+#: gives the same digest. A changed pin needs the same review as a changed test.
+_JOURNAL_SHA256 = {
+    "assessments.json": "957e59942e741e45075963a968fa9fd1aef444c8eb2fcaa856f6f2b97f765119",
+    "nhi-audit.json": "c73885c423a8b2b49724047f4500bad06465f27b8509e18da17005d8042a053e",
+    "calls.jsonl": "e0e34ac7fb424792fb480954dc8b457777989713b1aa9a76d8887383171d3578",
+}
+
+
+def test_journal_fixture_is_the_reviewed_one_6832() -> None:
+    """#6832: a deleted link row or an edited title must fail, not replay green."""
+    digests = {
+        name: hashlib.sha256((_JOURNAL / name).read_bytes()).hexdigest()
+        for name in ("assessments.json", "nhi-audit.json")
+    }
+    with gzip.open(_JOURNAL / "calls.jsonl.gz", "rb") as handle:
+        raw = handle.read()
+    digests["calls.jsonl"] = hashlib.sha256(raw).hexdigest()
+    rows = [json.loads(line) for line in raw.decode("utf-8").splitlines() if line.strip()]
+    links = sum(1 for row in rows if row["tool"] == "link")
+    consolidations = sum(1 for row in rows if row["tool"] == "consolidate")
+    titled = sum(
+        1
+        for row in rows
+        if row["tool"] == "store" and isinstance(row["args"], dict) and row["args"].get("title")
+    )
+    assert (len(rows), links, consolidations, titled) == (11662, 400, 40, 1291)
+    assert digests == _JOURNAL_SHA256, f"{_JOURNAL} is not the reviewed journal (#6832)"
 
 
 def test_journal_invalid_rubrics_are_now_repairable() -> None:

@@ -9,6 +9,10 @@ OUT_DIR. No model prose is kept: ``free_text`` becomes a run of ``x`` of the
 same length, store ``content`` keeps only the memory ids it cites, a call
 ``summary`` keeps only its first memory id, and a title is kept only when the
 audit classifies it by its text (a harness prefix or ``mission-summary-<id>``).
+
+The replay pins the reduced copy's content (``_JOURNAL_SHA256`` and the row
+counts in ``test_rubric_repair.py``, #6832): a rebuild that changes it must
+update those pins in the same reviewed commit.
 """
 
 from __future__ import annotations
