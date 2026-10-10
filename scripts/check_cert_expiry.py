@@ -3504,6 +3504,7 @@ def _log_safe_cells(t):
             t.fail(f"(log-safe-plain): log_safe changed {plain!r} to {log_safe(plain)!r}")
     _log_safe_table_cell(t)
     _log_safe_di_cell(t)
+    _log_safe_unknown_cells(t)
 
 
 # Every Cf code point of Unicode 15.0 as the cell's own oracle for LOG_CF_RANGES (#6683); the nine code
@@ -3562,6 +3563,22 @@ def _log_safe_di_cell(t):
                 return
 
 
+def _log_safe_unknown_cells(t):
+    """#6918: a code point the interpreter has no assignment for (Cn), a
+    private-use code point (Co) and a lone surrogate (Cs) are printed escaped,
+    so the gate fails closed on a code point it cannot classify. Cells
+    `log-safe-cn` (U+0378, noncharacters), `log-safe-co` and `log-safe-cs`."""
+    cases = (("log-safe-cn", (0x0378, 0xFDD0, 0xFFFE, 0xFFFF, 0x10FFFF)),
+             ("log-safe-co", (0xE000, 0xF8FF, 0xF0000, 0x10FFFD)),
+             ("log-safe-cs", (0xD800, 0xDC80, 0xDFFF)))
+    for label, codes in cases:
+        for code in codes:
+            want = f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
+            got = log_safe(f"a{chr(code)}b")
+            if got != f"a{want}b":
+                t.fail(f"({label}): log_safe printed U+{code:04X} as {got!r}, not {'a' + want + 'b'!r}")
+
+
 def _round7_shapes(shapes, pr, wf_rel):
     """#6683 shapes: an approval trailer value and a workflow file name that
     carry a bidi override (U+202E)."""
@@ -3594,6 +3611,7 @@ SUMMARY_CELL_SOURCES = (
     ("_log_safe_cells", ""),
     ("_log_safe_table_cell", ""),
     ("_log_safe_di_cell", ""),
+    ("_log_safe_unknown_cells", ""),
     ("_trusted_round7_cells", ""),
     ("_summary_cells", ""),
 )
