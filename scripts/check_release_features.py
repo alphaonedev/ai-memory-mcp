@@ -756,7 +756,12 @@ REPRO_JOB: Dict[str, Spec] = {
 }
 REPRO_TARGET = "x86_64-unknown-linux-gnu"
 REPRO_BIND = SANE_REPRO_BIND
-REPRO_PROOF = ('/usr/bin/python3 scripts/release/reproducible_build.py --target ' + REPRO_TARGET
+# #6909: the proof runs isolated (-I) under a cleared environment that passes
+# only the build allowlist (BUILD_ENV_ALLOWLIST), so nothing an earlier step
+# exports loads into the interpreter before the proof.
+REPRO_PROOF_ENV = ('/usr/bin/env -i PATH="$PATH" HOME="$HOME" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"'
+                   ' RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -I ')
+REPRO_PROOF = (REPRO_PROOF_ENV + 'scripts/release/reproducible_build.py --target ' + REPRO_TARGET
                + ' --features "$FEATURES" --workspace-b "$RUNNER_TEMP/reproducible-b"'
                + ' --sha256-output "$GITHUB_OUTPUT"'
                # #6283: each build's tarball (the deterministic packer) and deb/rpm
@@ -2622,7 +2627,9 @@ SANE_SHELL_LINE = "        shell: " + SANE_SHELL + "\n"
 REPRO_SCRIPT = "scripts/release/reproducible_build.py"
 REPRO_HDR = "\n  reproducible:\n"
 PROOF_STEP_NAME = "      - name: Build twice from two workspaces and compare (#3613)\n"
-PROOF_CMD = ('/usr/bin/python3 scripts/release/reproducible_build.py --target x86_64-unknown-linux-gnu --features "$FEATURES" '
+PROOF_CMD = ('/usr/bin/env -i PATH="$PATH" HOME="$HOME" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" '
+             'RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -I '
+             'scripts/release/reproducible_build.py --target x86_64-unknown-linux-gnu --features "$FEATURES" '
              '--workspace-b "$RUNNER_TEMP/reproducible-b" --sha256-output "$GITHUB_OUTPUT"'
              ' --nfpm "$RUNNER_TEMP/nfpm/nfpm" --nfpm-arch amd64 --version "${TAG#v}"')
 EPOCH_LINES = IND + 'SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"\n' + IND + "export SOURCE_DATE_EPOCH\n"
@@ -3254,6 +3261,10 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "3613 proof compares a different target": ("fail", [_rel(
         BUILD_HDR, _edit_all(IND + PROOF_CMD + "\n", IND + PROOF_CMD.replace("x86_64-unknown-linux-gnu", "x86_64-pc-windows-gnu") + "\n"))]),
     "3613 proof step deleted": ("fail", [_rel(BUILD_HDR, _edit_all(IND + PROOF_CMD + "\n", IND + "true\n"))]),
+    "6909 proof runs without -I": ("fail", [_rel(PROOF_CMD, PROOF_CMD.replace("/usr/bin/python3 -I ", "/usr/bin/python3 "))]),
+    "6909 proof runs outside env -i": ("fail", [_rel(PROOF_CMD, PROOF_CMD.replace("/usr/bin/env -i ", "/usr/bin/env "))]),
+    "6909 proof passes PYTHONPATH through": ("fail", [_rel(PROOF_CMD, PROOF_CMD.replace(
+        'TMPDIR="$RUNNER_TEMP" ', 'TMPDIR="$RUNNER_TEMP" PYTHONPATH="${PYTHONPATH:-}" '))]),
     "3613 proof job restores a build cache": ("fail", [_rel(
         BUILD_HDR, _edit_all(PROOF_STEP_NAME, "      - uses: " + RUST_CACHE_USES + " # v2\n\n" + PROOF_STEP_NAME))]),
     "3613 proof step does not bind the proof script to HEAD": ("fail", [_rel(

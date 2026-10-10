@@ -682,7 +682,7 @@ jobs:
           /usr/bin/env -i PATH=/usr/bin:/bin PREFLIGHT_SHA="$PREFLIGHT_SHA" /bin/bash --noprofile --norc -euo pipefail -c 'h="$(/usr/bin/git rev-parse --verify HEAD)"; test "$h" = "$PREFLIGHT_SHA"; { echo "4dcd53494e52381437e6fe13f21d06a5393a4e2ef83d02369d02278b00f5d9d6 *scripts/release-features.sh"; echo "ecfa3032195653c5f72fa5cc1806f4e7d32acdde1e7f1ebb905b38ad2ba7133f *scripts/release/reproducible_build.py"; } | /usr/bin/shasum -a 256 -c - || { echo "::error::a bound release script is not the content this workflow pins (#6908); re-tag at the dispatch tip"; exit 1; }'
           FEATURES="$(/usr/bin/env -i PATH=/usr/bin:/bin /bin/bash --noprofile --norc scripts/release-features.sh)"
           test -n "$FEATURES"
-          /usr/bin/python3 scripts/release/reproducible_build.py --target x86_64-unknown-linux-gnu --features "$FEATURES" --workspace-b "$RUNNER_TEMP/reproducible-b" --sha256-output "$GITHUB_OUTPUT" --nfpm "$RUNNER_TEMP/nfpm/nfpm" --nfpm-arch amd64 --version "${TAG#v}"
+          /usr/bin/env -i PATH="$PATH" HOME="$HOME" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" TMPDIR="$RUNNER_TEMP" /usr/bin/python3 -I scripts/release/reproducible_build.py --target x86_64-unknown-linux-gnu --features "$FEATURES" --workspace-b "$RUNNER_TEMP/reproducible-b" --sha256-output "$GITHUB_OUTPUT" --nfpm "$RUNNER_TEMP/nfpm/nfpm" --nfpm-arch amd64 --version "${TAG#v}"
 
   # --------------------------------------------------------------------
   # #1973 (v1.0 supply-chain, epic #1940) - CycloneDX SBOM per release.
