@@ -1382,6 +1382,68 @@ def test_trace_set_by_a_later_hook_still_receives_events_6537(
     assert origin.hits == ["/x"]
 
 
+# ---- #6559: a symlink on the CA path may not sit in a shared-writable dir ---
+
+
+def _linked_ca(lab: Lab, tmp_path: pathlib.Path, kind: str, mode: int) -> str:
+    """A ``verify=`` path whose ``kind`` symlink lives in a directory of ``mode``.
+
+    The CA file and CA directory themselves are safe (0644 in 0755); only the
+    directory holding the link lets others replace it.
+    """
+    safe = _ca_dir(tmp_path, "safe", 0o755)
+    bundle = safe / "lab-ca.pem"
+    shutil.copy(lab.ca_path, bundle)
+    bundle.chmod(0o644)
+    hashed = _ca_dir(tmp_path, "hashed", 0o755)
+    _add_anchor(hashed, lab.ca_path)
+    swap = _ca_dir(tmp_path, "swap", 0o755)
+    if kind == "file":
+        (swap / "ca.pem").symlink_to(bundle)
+        verify = swap / "ca.pem"
+    elif kind == "directory":
+        (swap / "ca").symlink_to(hashed)
+        verify = swap / "ca"
+    elif kind == "component":
+        (swap / "certs").symlink_to(safe)
+        verify = swap / "certs" / "lab-ca.pem"
+    else:  # an entry of a safe CA directory points through a link in `swap`
+        (swap / "anchor.pem").symlink_to(bundle)
+        verify = _ca_dir(tmp_path, "entries", 0o755)
+        (verify / f"{_subject_hash(lab.ca_path)}.0").symlink_to(swap / "anchor.pem")
+    swap.chmod(mode)
+    return str(verify)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("mode", [0o777, 0o775], ids=oct)
+@pytest.mark.parametrize("kind", ["file", "directory", "component", "entry"])
+def test_symlink_in_a_shared_writable_directory_is_refused_6559(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type, mode: int, kind: str
+) -> None:
+    verify = _linked_ca(lab, tmp_path, kind, mode)
+    with pytest.raises(ValueError, match="symlink") as refused:
+        client_cls(base_url=_ORIGIN, verify=verify)
+    assert "writable" in str(refused.value)
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("kind", ["file", "directory", "component", "entry"])
+def test_own_symlink_in_a_sticky_directory_is_accepted_6559(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+    kind: str,
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    verify = _linked_ca(lab, tmp_path, kind, 0o1777)
+    assert _get_once(client_cls, origin.url, verify) == 200
+
+
 # ---- #6538: env trust (SSL_CERT_FILE / SSL_CERT_DIR) is held to #6377 ------
 
 _ENV_VERIFY = pytest.mark.parametrize("verify", [None, True], ids=["None", "True"])
