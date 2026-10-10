@@ -10,8 +10,8 @@ fbe2f5e766c42769e75aa182c50e982b89dd006a06a5d0dcf56b9d8b5b116b8a  ## Reproducing
 82403f6ca9427d84ef1b56aa4c6b5ce82c646d97d09ba1048c8d3758bc8c6c05  ## Architecture
 22e511869f7d39f3c5554333831f49faff25ab98572f34a00c384b2f9eef4d27  ## Adding New Functionality
 9b92321c53d0efe15cb34cdb952ec476058a881b6bdbd1b55582edf60a3892df  ## Code Style
-109ae6ca72f2f18aca0a9731c902503127cc45c20edfcb8e12129beefbd79385  ## Prime directive (operator-set, 2026-05-17)
-04577a907af3deb2b1fc680dc4c3ea5f39bea9becb03bf16ab85626672b97467  ## Crossroads decision protocol — 1x3 adversarial vote with a threshold (operator-set 2026-06-18, slimmed 2026-10-10)
+2d6b30780058da3153b5c367f5e97bd78260662f78eda5a744309afa2f999ddd  ## Prime directive (operator-set, 2026-05-17)
+2ee348fe4f938fcc4c596dc247a62b7f1e65a0d54af96c473c7fb5fc02e9169f  ## Crossroads decision protocol — 1x3 adversarial vote with a threshold (operator-set 2026-06-18, slimmed 2026-10-10)
 b96fb1a5548a92acc32d77668f33884ecdb636e6e2bbfa0af7c0040924704cb8  ## v0.7.0 release gate (operator-set 2026-05-17 pm-v5)
 76d73d2153d0ad4235f4067a56d9e1aea9f37c173dc220c06271f101a1584477  ## Sole-authority operator + no-external-code-injection (operator-set 2026-05-25)
 64fbc0644f5a0b1dee5694f373deaf52037be787f17cc0539a65db59b910dc8d  ## Commit & push policy (project override of global default)
