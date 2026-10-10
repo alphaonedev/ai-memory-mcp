@@ -146,6 +146,46 @@ if os.environ['FAKE_MODE'] == 'retry' and first: sys.exit(1)
         self.assertEqual(state['done'], [])
         self.assertGreater(len(reads), 1)
 
+    def test_7054_state_file_is_never_torn(self):
+        # #7054: a reader must never see a state.json that exists but is not JSON.
+        # BASH_ENV slows printf, so a `printf ... > "$state"` write leaves state.json
+        # empty for 0.5 s; the poller hits that window every time.
+        guide = (ROOT / 'docs/a2a-integration.md').read_text()
+        gate = next(b for b in re.findall(r'^```bash\n(.*?)^```', guide, re.M | re.S)
+                    if b.startswith('#!/usr/bin/env bash'))
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            (base / 'gate.sh').write_text(gate)
+            (base / 'slow.sh').write_text('printf() { sleep 0.5; builtin printf "$@"; }\n')
+            fake = base / 'ai-memory'
+            fake.write_text("#!/usr/bin/env python3\nprint('{\"messages\":[]}')\n")
+            fake.chmod(0o700)
+            environment = dict(os.environ, PATH=str(base) + os.pathsep + os.environ['PATH'],
+                               BASH_ENV=str(base / 'slow.sh'), AGENT='ai:test', AGENT_PASS='true',
+                               GATE_STATE=str(base / 'state'))
+            process = subprocess.Popen(['bash', str(base / 'gate.sh')], env=environment,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                       start_new_session=True, text=True)
+            path = base / 'state/state.json'
+            torn = []
+            try:
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline and process.poll() is None:
+                    if path.exists():
+                        text = path.read_text()
+                        try:
+                            json.loads(text)
+                            break
+                        except ValueError:
+                            torn.append(text)
+                    time.sleep(0.01)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGTERM)
+                _, errors = process.communicate(timeout=60)
+            self.assertTrue(path.exists(), errors)
+            self.assertEqual(torn, [], 'state.json was readable before it held JSON')
+
     def test_3636_full_page_refuses_false_completion(self):
         state, calls, _, errors = self.exercise('full')
         self.assertEqual(calls, [])
