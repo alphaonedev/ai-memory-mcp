@@ -619,6 +619,10 @@ def _record_problems(header, body):
             continue
         if AMENDMENT_ITEM_RE.match(ln):
             continue
+        if "!" + RE_CERT_LINK in ln:
+            why.append(f"record line {_doc_safe(ln)!s} writes the {RE_CERT_ISSUE} cite as an "
+                       "image (it renders no link); write it as the plain link")
+            continue
         rest = AMENDMENT_MARKER_RE.sub("", ln, count=1).replace(RE_CERT_LINK, "")
         hit = AMENDMENT_BODY_BANNED_RE.search(rest)
         if hit:
