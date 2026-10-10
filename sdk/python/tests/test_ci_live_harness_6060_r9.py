@@ -167,3 +167,13 @@ def test_pytest_child_env_is_the_allow_list_7049(
     assert isinstance(env, dict)
     assert "GITHUB_TOKEN" not in env
     assert env["AI_MEMORY_TEST_DAEMON"] == "1"
+
+
+def test_every_checkout_step_does_not_persist_the_token_6813() -> None:
+    text = _WORKFLOW.read_text(encoding="utf-8")
+    steps = list(
+        re.finditer(r"^( *)- uses: actions/checkout@[^\n]*\n((?:\1 {2,}[^\n]*\n)*)", text, re.M)
+    )
+    assert len(steps) == text.count("actions/checkout@") >= 6
+    for step in steps:
+        assert re.search(r"^\s+persist-credentials: false$", step.group(2), re.M), step.group(0)
