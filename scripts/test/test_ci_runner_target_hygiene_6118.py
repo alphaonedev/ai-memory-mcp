@@ -2435,6 +2435,21 @@ class Evasions6118(_GuardHelpers6118, unittest.TestCase):
             with self.subTest(label):
                 self._clean(self._step("a", run))
 
+    # ---- #6514: compiler-wrapper keys on a run line and as a with: input ----
+
+    def test_6118_r7_6514_rustc_wrapper_keys_on_a_run_line_are_flagged(self) -> None:
+        for key in ("rustc-workspace-wrapper", "rustc-wrapper", "rustc"):
+            with self.subTest(key=key):
+                self._caught(self._step("a", "cargo test --config build.%s='\"w\"'" % key))
+        self._clean(self._step("a", "cargo test --no-run"))
+
+    def test_6118_r7_6514_rustc_wrapper_keys_as_a_with_input_are_flagged(self) -> None:
+        for key in ("rustc-workspace-wrapper", "rustc-wrapper", "rustc"):
+            with self.subTest(key=key):
+                self._caught(self._step("a", uses="dtolnay/rust-toolchain@stable",
+                                        with_=[("toolchain", "stable"), (key, "w")]))
+        self._clean(self._step("a", uses="dtolnay/rust-toolchain@stable", with_=[("toolchain", "stable")]))
+
 
 
 def _write(path: Path, size: int, executable: bool = False) -> None:
