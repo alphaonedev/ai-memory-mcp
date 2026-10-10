@@ -570,7 +570,8 @@ chmod 700 &quot;$GATE_STATE&quot;
 state=&quot;$GATE_STATE/state.json&quot;
 batch=&quot;$GATE_STATE/batch.json&quot;
 if [[ ! -f &quot;$state&quot; ]]; then
-  printf '%s\n' '{&quot;done&quot;:[],&quot;pending&quot;:[]}' &gt; &quot;$state&quot;
+  printf '%s\n' '{&quot;done&quot;:[],&quot;pending&quot;:[]}' &gt; &quot;$state.next&quot;
+  mv &quot;$state.next&quot; &quot;$state&quot;
 fi
 worker=''
 cleanup() {
