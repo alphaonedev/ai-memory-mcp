@@ -88,6 +88,25 @@ pub fn mcp_error_text(e: &MemoryError) -> String {
 /// own-vocabulary result (a typed `StorageError` / governance refusal that
 /// rode an `anyhow` chain) logs at `warn`, since the caller already has it.
 pub fn log_foreign<E: Into<MemoryError> + 'static>(context: &'static str, e: E) -> MemoryError {
+    log_foreign_inner(context, None, e)
+}
+
+/// [`log_foreign`] for a site that also returns an HTTP status to its caller
+/// (#6149): the same single operator line additionally records `status`, so
+/// the line can be matched to the response. The caller text is unchanged.
+pub fn log_foreign_with_status<E: Into<MemoryError> + 'static>(
+    context: &'static str,
+    status: u16,
+    e: E,
+) -> MemoryError {
+    log_foreign_inner(context, Some(status), e)
+}
+
+fn log_foreign_inner<E: Into<MemoryError> + 'static>(
+    context: &'static str,
+    status: Option<u16>,
+    e: E,
+) -> MemoryError {
     // #6147 / #6457 - the operator detail is the WHOLE `anyhow` chain
     // (`{e:#}`), captured before the typed conversion: `From<anyhow::Error>`
     // renders only the outermost context, which dropped a context-wrapped
@@ -100,6 +119,7 @@ pub fn log_foreign<E: Into<MemoryError> + 'static>(context: &'static str, e: E) 
         tracing::error!(
             target: TRACE_TARGET,
             context,
+            status,
             code = e.code(),
             detail = %detail,
             "#3713: foreign error kept on the operator log; the caller receives the class"
@@ -108,6 +128,7 @@ pub fn log_foreign<E: Into<MemoryError> + 'static>(context: &'static str, e: E) 
         tracing::warn!(
             target: TRACE_TARGET,
             context,
+            status,
             code = e.code(),
             detail = %detail,
             "#3713: typed refusal passed through to the caller"
@@ -129,6 +150,16 @@ fn anyhow_chain<E: 'static>(e: &E) -> Option<String> {
 /// return the caller-safe text — `.map_err(|e| mcp_foreign_err("ctx", e))?`.
 pub fn mcp_foreign_err<E: Into<MemoryError> + 'static>(context: &'static str, e: E) -> String {
     mcp_error_text(&log_foreign(context, e))
+}
+
+/// [`mcp_foreign_err`] for a site that also returns an HTTP status (#6149):
+/// the operator line records `status`; the returned text is identical.
+pub fn mcp_foreign_err_with_status<E: Into<MemoryError> + 'static>(
+    context: &'static str,
+    status: u16,
+    e: E,
+) -> String {
+    mcp_error_text(&log_foreign_with_status(context, status, e))
 }
 
 /// Classify a provider / curator failure as the LLM class. The client's

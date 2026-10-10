@@ -426,7 +426,10 @@ pub async fn skill_promote_route(
 /// their typed text, store / driver / io text is replaced by its class
 /// constant and never crosses to the wire.
 fn promote_error_message(e: anyhow::Error) -> String {
-    crate::mcp::error_text::mcp_foreign_err("skill_promote_route", e)
+    // #6149 - the status the route returns for this chain, recorded on the
+    // one operator line so the line can be matched to the response.
+    let status = promote_error_status(&e).as_u16();
+    crate::mcp::error_text::mcp_foreign_err_with_status("skill_promote_route", status, e)
 }
 
 /// #4622 - HTTP status for a failed skill-promote: 404 only when the chain
