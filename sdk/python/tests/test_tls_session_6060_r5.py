@@ -17,6 +17,7 @@ session before any non-CONNECT request is sent.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import pathlib
 import ssl
 from collections.abc import Iterator
@@ -538,6 +539,119 @@ def test_common_name_fallback_follows_the_context_6350() -> None:
     context = ssl.create_default_context()
     context.hostname_checks_common_name = False
     assert not _peer_matches_host(_peer(cn="api.lab.example"), "api.lab.example", context)
+
+
+# ---- #6375: verify_flags that relax chain validation are refused -----------
+
+# OpenSSL X509_V_FLAG_* bits that relax validation (by value: Python names
+# only some of them in ssl.VerifyFlags).
+_RELAXING_FLAGS = {
+    "CB_ISSUER_CHECK": 0x1,
+    "USE_CHECK_TIME": 0x2,
+    "IGNORE_CRITICAL": 0x10,
+    "ALLOW_PROXY_CERTS": 0x40,
+    "NO_CHECK_TIME": 0x200000,
+    "UNKNOWN_HIGH_BIT": 0x40000000,
+}
+# Bits that only strengthen validation (or are Python 3.13+ defaults).
+_STRENGTHENING_FLAGS = {
+    "CRL_CHECK_LEAF": 0x4,
+    "CRL_CHECK_CHAIN": 0xC,
+    "X509_STRICT": 0x20,
+    "POLICY_CHECK": 0x80,
+    "EXPLICIT_POLICY": 0x100,
+    "INHIBIT_ANY": 0x200,
+    "INHIBIT_MAP": 0x400,
+    "EXTENDED_CRL_SUPPORT": 0x1000,
+    "USE_DELTAS": 0x2000,
+    "CHECK_SS_SIGNATURE": 0x4000,
+    "TRUSTED_FIRST": 0x8000,
+    "SUITEB_128_LOS": 0x30000,
+    "PARTIAL_CHAIN": 0x80000,
+    "NO_ALT_CHAINS": 0x100000,
+}
+
+
+def _with_flags(context: ssl.SSLContext, bits: int) -> ssl.SSLContext:
+    context.verify_flags = ssl.VerifyFlags(int(context.verify_flags) | bits)
+    return context
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("bits", _RELAXING_FLAGS.values(), ids=_RELAXING_FLAGS.keys())
+def test_relaxing_verify_flags_are_refused_at_construction_6375(
+    client_cls: type, bits: int
+) -> None:
+    context = _with_flags(ssl.create_default_context(), bits)
+    with pytest.raises(ValueError, match="verify=False"):
+        client_cls(base_url=_ORIGIN, verify=context)
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("bits", _STRENGTHENING_FLAGS.values(), ids=_STRENGTHENING_FLAGS.keys())
+def test_strengthening_verify_flags_are_admitted_6375(client_cls: type, bits: int) -> None:
+    client = client_cls(base_url=_ORIGIN, verify=_with_flags(ssl.create_default_context(), bits))
+    if client_cls is AiMemoryClient:
+        client.close()
+    else:
+        asyncio.run(client.aclose())
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_relaxing_flag_set_after_construction_is_refused_per_request_6375(
+    origin: RecordingServer, lab: Lab, monkeypatch: pytest.MonkeyPatch, client_cls: type
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    context = lab.client_context()
+
+    if client_cls is AiMemoryClient:
+        with AiMemoryClient(base_url=origin.url, verify=context, timeout=5) as client:
+            _with_flags(context, _RELAXING_FLAGS["NO_CHECK_TIME"])
+            with pytest.raises(ValueError, match="verify=False is refused"):
+                client._client.get("/x")  # noqa: SLF001
+    else:
+
+        async def run() -> None:
+            async with AsyncAiMemoryClient(
+                base_url=origin.url, verify=context, timeout=5
+            ) as client:
+                _with_flags(context, _RELAXING_FLAGS["NO_CHECK_TIME"])
+                with pytest.raises(ValueError, match="verify=False is refused"):
+                    await client._client.get("/x")  # noqa: SLF001
+
+        asyncio.run(run())
+    assert origin.hits == []
+
+
+_DAY = datetime.timedelta(days=1)
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("window", ["expired", "not-yet-valid"])
+def test_out_of_date_leaf_is_refused_after_the_handshake_6375(
+    lab: Lab, monkeypatch: pytest.MonkeyPatch, client_cls: type, window: str
+) -> None:
+    # The flag is set AFTER the SDK's per-request check, before the handshake:
+    # only the post-handshake leaf validity check stands between the request
+    # and a server whose certificate is out of date.
+    _clear_proxy_env(monkeypatch)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if window == "expired":
+        dates = {"not_before": now - 3 * _DAY, "not_after": now - _DAY}
+    else:
+        dates = {"not_before": now + _DAY, "not_after": now + 3 * _DAY}
+    server = RecordingServer(lab.server_context(f"leaf-{window}", **dates))
+    try:
+        with pytest.raises(ValueError, match="verify=False"):
+            _fetch(
+                client_cls,
+                server.url,
+                lab.client_context(),
+                hook=lambda context: _with_flags(context, _RELAXING_FLAGS["NO_CHECK_TIME"]),
+            )
+        assert server.hits == []
+    finally:
+        server.close()
 
 
 def test_lab_temp_root_is_project_local_6309(lab: Lab) -> None:
