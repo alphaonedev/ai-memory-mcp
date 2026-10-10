@@ -567,14 +567,18 @@ def dest_dirs(pg_config):
     }
 
 
-def sha256_of_regular_file(path):
-    """sha256 of path when it is a regular file (not a symlink), else None."""
+def sha256_of_regular_file(path, refuse_writable=False):
+    """sha256 of path when it is a regular file (not a symlink), else None.
+
+    With refuse_writable, a group- or world-writable file also gives None (#7016).
+    """
     try:
         fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
         return None
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        mode = os.fstat(fd).st_mode
+        if not stat.S_ISREG(mode) or (refuse_writable and mode & (stat.S_IWGRP | stat.S_IWOTH)):
             return None
         digest = hashlib.sha256()
         with os.fdopen(fd, "rb", closefd=False) as fh:
@@ -588,8 +592,12 @@ def sha256_of_regular_file(path):
 
 
 def installed_ok(dests):
-    """True when every manifest file is at its destination with the pinned hash."""
-    return all(sha256_of_regular_file(dests[sub] / name) == pin for sub, name, pin in MANIFEST)
+    """True when every manifest file is at its destination with the pinned hash and not group- or world-writable.
+
+    #7016: right bytes are not enough; a writable age.dylib in pkglibdir lets any local user replace code the
+    postgres backend loads, so it counts as not installed and the restore rewrites it with the source's mode.
+    """
+    return all(sha256_of_regular_file(dests[sub] / name, refuse_writable=True) == pin for sub, name, pin in MANIFEST)
 
 
 def healthy(args, dests, url):

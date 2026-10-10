@@ -211,8 +211,9 @@ before `CREATE EXTENSION`:
   is read or copied. Rebuilding AGE means updating those pins in the same change.
 - **Health check.** AGE counts as present only when `pg_available_extensions`
   lists `age` (that view reflects `age.control` alone) AND all five files are at
-  their destinations as regular files with the pinned hashes. A lost or stale
-  `age.dylib` or SQL file is therefore restored, not reported as healthy.
+  their destinations as regular files with the pinned hashes, none of them group-
+  or world-writable (#7016). A lost, stale or writable `age.dylib` or SQL file is
+  therefore restored with its source's mode (#6898), not reported as healthy.
 - **Source validation.** Before any write, the source dir, `share/`, `lib/` and
   each file must be real (no symlinks), owned by the runner's uid and not group-
   or world-writable, and each file's bytes (read through an `O_NOFOLLOW` fd) must
