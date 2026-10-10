@@ -115,8 +115,14 @@ class ShardWiringTests(unittest.TestCase):
         self.assertTrue(self.body.rstrip().endswith('return "$rc"'))
 
     def test_partition_runs_with_the_doc_flag_and_fails_closed(self):
-        self.assertRegex(self.body, r'python3 scripts/ci/partition_test_binaries\.py --build-json "\$sd/build\.jsonl"'
+        self.assertRegex(self.body, r'python3 -I scripts/ci/partition_test_binaries\.py --build-json "\$sd/build\.jsonl"'
                                     r' --repo-root \. --out-dir "\$sd" --with-doc "\$with_doc" \|\| return "\$\?"')
+
+    def test_6734_partition_runs_isolated(self):
+        # #6734 / #6241: every workflow python3 script run uses -I, so neither the checkout
+        # directory nor PYTHON* environment variables can shadow the stdlib the script imports.
+        self.assertNotRegex(self.body, r'python3 scripts/ci/partition_test_binaries\.py')
+        self.assertIn('python3 -I scripts/ci/partition_test_binaries.py', self.body)
 
     def test_watchdog_is_on_every_shard_run(self):
         text = ci_text()
