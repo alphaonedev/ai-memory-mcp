@@ -586,6 +586,13 @@ class Round11EchoMask(unittest.TestCase):
         self.assertEqual(SUBSET.echo(long_row), repr(long_row[:24] + "..."))
         self.assertNotIn(self.TAIL, SUBSET.echo("A: " + "x" * 600 + self.TAIL))
 
+    def test_mask_shapes_the_round11_campaign_left_unkilled(self):
+        """Mutants Y3 (quote allowed in an operand), Y4 (ghs_ prefix) and V7 (= as a row separator) survived."""
+        self.assertIn("<withheld", SUBSET.mask("PIN_TOKEN: ${{ 'LEAK" + "TAIL' }}"))
+        self.assertIn("<withheld", SUBSET.mask("PIN_TOKEN: ${{ \"LEAK" + "TAIL\" }}"))
+        self.assertEqual(SUBSET.mask("v gh" + "s_" + "A" * 20), "v gh" + "s_<masked>")
+        self.assertEqual(SUBSET.echo("FOO=" + self.TAIL), repr("FOO=<withheld 11 chars>"))
+
 
 if __name__ == "__main__":
     unittest.main()
