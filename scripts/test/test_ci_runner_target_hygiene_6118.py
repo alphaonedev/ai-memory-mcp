@@ -2777,6 +2777,29 @@ class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
                 self.assertEqual(want, any("R-DEBUG" in v for v in found), (label, found))
 
 
+    def test_6118_r7_6477_each_unread_script_and_runner_names_its_reason(self) -> None:
+        # Benign bodies: only the specific refusal can produce the finding (mutants G22, G24, G30).
+        files = {"tool.py": "#!/usr/bin/env python3\nprint('hi')\n"}
+        LOCAL_RUNS.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="scripts-6477-", dir=str(LOCAL_RUNS)) as tmp:
+            rel = Path(tmp).relative_to(ROOT).as_posix()
+            for name, text in files.items():
+                (Path(tmp) / name).write_text(text, encoding="utf-8")
+            for label, run, fragment in (
+                ("non-shell executable", "./%s/tool.py" % rel, "an executable that is not a shell script"),
+                ("absolute path outside the repository", "bash /dev/null", "a file outside the repository"),
+                ("relative path outside the repository", "bash ../outside-6477.sh", "a file outside the repository"),
+            ):
+                with self.subTest(label):
+                    found = self._before_prune(R7_PRE + "        run: %s\n" % run)
+                    self.assertTrue(any("R-DEBUG" in v and fragment in v for v in found), (label, found))
+        with self.subTest("runs-on flow list item is an expression"):
+            found = self._mutated(_replace_once(self.ci, CHECK_RUNS_ON,
+                                                '    runs-on: [self-hosted, "${{ inputs.extra }}"]\n'))
+            self.assertTrue(any(v.startswith("R-SHAPE") and "runs-on value is itself an expression" in v
+                                for v in found), found)
+
+
     def _prune_flagged(self, cases: List[Tuple[str, List[str]]], want: bool) -> None:
         for label, found in cases:
             with self.subTest(label):
