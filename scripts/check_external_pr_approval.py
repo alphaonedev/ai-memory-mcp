@@ -45,7 +45,9 @@ REPO_RE = re.compile(r"[A-Za-z0-9_.-]{1,39}/[A-Za-z0-9_.-]{1,100}")
 # A login is 1-39 characters; a GitHub App account carries exactly one "[bot]" suffix (#6259).
 LOGIN_RE = re.compile(r"[A-Za-z0-9-]{1,39}(?:\[bot\])?")
 ASSOC_RE = re.compile(r"[A-Z_]{1,32}")
-TOKEN_RE = re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,})")
+# GitHub token shapes, plus any HTTP authorization value after its scheme word (#6328).
+TOKEN_RE = re.compile(r"(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,}"
+                      r"|(?i:bearer|basic|token)\s+[A-Za-z0-9._~+/=-]{8,})")
 QUEUE_REF_RE = re.compile(r"refs/heads/gh-readonly-queue/.+/pr-([0-9]{1,9})-([^/]*)")
 
 
