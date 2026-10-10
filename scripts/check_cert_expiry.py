@@ -2580,6 +2580,20 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     d7 = edit_range("", touch=(), label="d7", frm=mb_d, quoted=led_ab + ">\n" + rec6124)
     t.expect_green("6124-d7", "doc-only change that only appends a record", repo, mb_d, d7)
 
+    # (6124-i1..i4) RED (R3-F2) - the record's citation set is exact: the
+    # header names exactly ONE issue (`#N`, a whole number); extra issues,
+    # a suffixed number and no issue at all are refused. i5 is the GREEN
+    # control (the single-issue header of every other GREEN cell).
+    issue6124 = [("cites exactly one issue", "did not say the header cites exactly one issue")]
+    for tag, label, ref in (("i1", "two issues in the header", "#6162, #6163"),
+                            ("i2", "three issues in the header", "#6162 #6163 #6164"),
+                            ("i3", "a suffixed issue number", "#6162x"),
+                            ("i4", "no issue in the header", "WP-B1")):
+        cell_i = edit_range("\n" + amend(ref, [mod_rs]), label=tag)
+        t.expect_red(f"6124-{tag}", label, repo, exp6124, cell_i, red6124 + issue6124)
+    i5 = edit_range("\n" + amend("#6162", [mod_rs]), label="i5")
+    t.expect_green("6124-i5", "one issue in the header", repo, exp6124, i5, green6124)
+
     # (6124-r1..r4) #6355: the COMMITTED cert doc of this checkout, as the
     # merge-base, with a record inserted at each legal spot (GREEN), behind an
     # inserted HTML opener (RED), and above non-record prose that would then
