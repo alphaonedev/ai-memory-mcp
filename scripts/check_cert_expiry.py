@@ -825,7 +825,7 @@ YAML_BREAK_RE = re.compile("\r\n|[\r\n\x85\u2028\u2029]")
 
 # Round 5 (#6304): YAML s-white is a space or a tab and nothing else. Python's
 # str.strip() also removes NBSP, U+3000 and the other Unicode spaces that YAML
-# keeps as content (and FF and VT, which YAML refuses outright), so blank and
+# keeps as content (and FF, VT and U+001C-U+001F, which YAML refuses outright), so blank and
 # comment tests strip YAML_WHITE only.
 YAML_WHITE = " \t"
 
@@ -1128,8 +1128,8 @@ def _listed(items, shown_max=8):
 def _whitespace_findings(rel, text):
     """GUARD SHADOW for a whitespace character other than space or tab (NBSP,
     U+3000, the other Unicode spaces, FF, VT, ...) anywhere in a workflow file
-    (#6304). YAML keeps most of them as content (it refuses FF and VT
-    outright) while Python treats them as blank, so a line led by one and then
+    (#6304). YAML keeps most of them as content (it refuses FF, VT and
+    U+001C-U+001F outright) while Python treats them as blank, so a line led by one and then
     `#` would be a comment to the scan and content to a parser. No legitimate
     workflow needs one; it is refused, not interpreted. The message names
     every offending line (the first 8, then a "+K more" marker) and every
@@ -3501,8 +3501,8 @@ def _ws_format_cells(t):
 
 
 def _ws_wording_cells(t):
-    """#6554: YAML refuses FF and VT outright (PyYAML: unacceptable character),
-    so a line led by one is not a second producer and YAML does not keep it as
+    """#6554: YAML refuses FF, VT and U+001C-U+001F outright (PyYAML: unacceptable
+    character), so a line led by one is not a second producer and YAML does not keep it as
     content; only the other Unicode spaces are kept. The refusal stays, the
     stated reason must be true. Cell `ws-wording` fails on a sentence of this
     file or of changelog.d/6304.fixed.md that says otherwise."""
@@ -3536,8 +3536,8 @@ def _ws_wording_cells(t):
 def _trusted_round5_cells(judge, shapes):
     """#6140 round 5 (security review R4 SR4-1, #6304): the blank and comment
     tests use YAML whitespace only (space, tab), so a line led by NBSP or U+3000
-    is scanned, and any other whitespace character in a workflow file (FF and
-    VT included, which YAML does not load at all) is refused as GUARD SHADOW
+    is scanned, and any other whitespace character in a workflow file (FF, VT
+    and U+001C-U+001F included, which YAML does not load at all) is refused as GUARD SHADOW
     (RED even WITH the trailer, no waiver)."""
     shadow = "GUARD SHADOW: "
     ws = "a whitespace character other than space or tab"
@@ -3878,7 +3878,7 @@ SELF_TEST_OK = (
     "by 4 and a merge key after a block scalar each RED with the trailer; a name fragment split after 9 "
     "characters and a section-sign-only fragment RED; a failed update-ref -d stopping before any fetch and "
     "git's fetch stderr escaped; (tr round 5, #6304) a second producer on a NBSP or U+3000 led line, "
-    "and an FF or VT led line (not loadable YAML), of a new workflow, a Unicode whitespace character only inside a quoted value, and a "
+    "and an FF, VT or U+001C-U+001F led line (not loadable YAML), of a new workflow, a Unicode whitespace character only inside a quoted value, and a "
     "NBSP-only line ending a block scalar of c8-precheck.yml RED (no trailer needed; not waivable) "
     "while a tab-indented comment and trailing spaces stay GREEN; (tr round 5, #6228) a second producer "
     "joined by LS or PS in the trusted workflow RED with the trailer, and a hostile workflow file "
