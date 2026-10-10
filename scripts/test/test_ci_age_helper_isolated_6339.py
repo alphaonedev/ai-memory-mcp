@@ -20,6 +20,11 @@ may not export them, and it may not dump the environment (``env``, ``printenv``,
 ``typeset -p``, ``compgen -v``, a bare ``set``).  A new use of the URL therefore fails here until it is reviewed
 and added to the allowlist.
 
+#6996 pins where the guard's ``CI_NODE`` comes from: the step's ``env:`` sets it exactly once, to
+``${{ matrix.node }}`` (not ``matrix.leg`` or a literal), no step line other than the guard writes, exports,
+unsets or reads it, and the matrix still has the ``macos-fed`` / ``enterprise-fed`` entry, so the guard can
+neither be fed another value nor silently never match.
+
 Rule: every ci.yml line that runs ``ensure-age-extension.py`` through python3 passes ``-I``
 before the script path, and at least one such invocation exists (a rename must not make
 the pin vacuous).  The check is exercised against a mutant that drops ``-I``.
@@ -130,6 +135,49 @@ def wiring_problems(text):
     return found + url_leaks(step)
 
 
+CI_NODE_ENV = "CI_NODE: ${{ matrix.node }}"
+CI_NODE_REF = re.compile(r"\bCI_NODE\b")
+
+
+def matrix_entries(text):
+    """Every matrix ``include:`` entry (a ``- leg:`` item) as {key: value}."""
+    entries, current, indent = [], None, None
+    for ln in text.splitlines():
+        stripped = ln.strip()
+        if stripped.startswith("- leg:"):
+            current, indent = {}, len(ln) - len(ln.lstrip())
+            entries.append(current)
+            stripped = stripped[2:]
+        elif current is None or not stripped or stripped.startswith("#"):
+            continue
+        elif len(ln) - len(ln.lstrip()) <= indent:
+            current = None
+            continue
+        key, sep, value = stripped.partition(":")
+        if sep and current is not None:
+            current[key.strip()] = value.strip().strip("'\"")
+    return entries
+
+
+def node_provenance_problems(text):
+    """#6996: the guard's CI_NODE is the matrix node label, set once in env and never touched in the script."""
+    step = helper_step(text)
+    found = []
+    run_at = next((i for i, ln in enumerate(step) if re.match(r"^\s*run:", ln)), len(step))
+    env_lines = [ln.strip() for ln in step[:run_at] if re.match(r"^\s*CI_NODE\s*:", ln)]
+    if env_lines != [CI_NODE_ENV]:
+        found.append(f"the step env must set CI_NODE exactly once, as `{CI_NODE_ENV}`")
+    for ln in step[run_at:]:
+        s = ln.strip()
+        if s.startswith("#") or s == GUARD:
+            continue
+        if CI_NODE_REF.search(s):
+            found.append(f"a script line other than the guard touches CI_NODE: {s[:60]}")
+    if not any(e.get("node") == "macos-fed" and e.get("tier") == "enterprise-fed" for e in matrix_entries(text)):
+        found.append("the matrix has no node macos-fed / tier enterprise-fed entry; the guard would never match")
+    return found
+
+
 def helper_invocations(text):
     """Lines that run the helper through python3."""
     return [ln for ln in text.splitlines() if HELPER in ln and re.search(r"\bpython3\b", ln)]
@@ -155,6 +203,31 @@ class TestAgeHelperIsolated6339(unittest.TestCase):
 
     def test_the_step_wiring_is_pinned_6508(self):
         self.assertEqual(wiring_problems(CI_YML.read_text(encoding="utf-8")), [])
+
+    def test_the_guard_reads_the_matrix_node_label_6996(self):
+        self.assertEqual(node_provenance_problems(CI_YML.read_text(encoding="utf-8")), [])
+
+    def test_the_provenance_check_rejects_each_mutant_6996(self):
+        text = CI_YML.read_text(encoding="utf-8")
+        env = "          # #6161 — node label via env (same expression-injection rule as LEG).\n          " + CI_NODE_ENV
+        comment = "          # python3 -I (#6339): the helper builds PGPASSWORD, so no sys.path[0] or PYTHONPATH.\n"
+        entry = "            node: macos-fed\n            tier: enterprise-fed\n"
+        mutants = {
+            "Y09b CI_NODE from matrix.leg": (env, env.replace("matrix.node", "matrix.leg")),
+            "Y11b CI_NODE env dropped": (env + "\n", env.split("\n")[0] + "\n"),
+            "Y13 CI_NODE reset before the guard": (comment, comment + "          CI_NODE=moved\n"),
+            "CI_NODE literal": (env, env.replace("${{ matrix.node }}", "macos-fed")),
+            "CI_NODE set twice": (env, env + "\n          CI_NODE: linux-fed"),
+            "export CI_NODE": (comment, comment + "          export CI_NODE=macos-fed\n"),
+            "unset CI_NODE": (comment, comment + "          unset CI_NODE\n"),
+            "read CI_NODE": (comment, comment + "          read -r CI_NODE < /dev/null || true\n"),
+            "matrix node renamed": (entry, entry.replace("node: macos-fed", "node: macos-fed-2")),
+            "matrix tier renamed": (entry, entry.replace("tier: enterprise-fed", "tier: enterprise")),
+        }
+        for name, (old, new) in mutants.items():
+            with self.subTest(mutant=name):
+                self.assertEqual(text.count(old), 1, f"ci.yml no longer holds the text mutated by {name!r}")
+                self.assertTrue(node_provenance_problems(text.replace(old, new, 1)), f"mutant not caught: {name}")
 
     def test_every_reviewed_url_line_is_in_the_step_6672(self):
         step = {ln.strip() for ln in helper_step(CI_YML.read_text(encoding="utf-8"))}
