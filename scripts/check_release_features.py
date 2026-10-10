@@ -225,6 +225,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Tuple, Union
@@ -4079,6 +4080,102 @@ def shell_argv(spec: str) -> List[str]:
 BOUND_FILES = (DECL, ASSERTER, SHAPE_PROOF_SCRIPT)
 TAMPER_FORMS = ("plain rewrite", "assume-unchanged", "skip-worktree", "in-job commit", "git shim on PATH",
                 "startup file in the job env", "exported git function", "repository redirection")
+# #6908: forms that rewrite the git object store the job can write, so the
+# expected content read from it is forged together with the working file.
+STORE_FORMS = ("forged loose tree object", "packed repo + forged loose tree", "pack exploded + forged tree",
+               "alternate object store", "gitfile redirect to a decoy store", "symlinked .git to a decoy store",
+               "git replace of the tree", "core.worktree decoy", "clean filter", "core.fsmonitor + core.hooksPath")
+
+
+def _forge_tree(repo: Path, sha: str, rel: str, objdir: Path) -> None:
+    """#6908: write, at the object id of ``rel``'s parent tree, a tree whose
+    entry for ``rel`` names the rewritten working file's blob (a loose object
+    is not hash-checked when git reads it)."""
+    def g(*cmd: str) -> bytes:
+        return subprocess.run(["git", *cmd], cwd=repo, capture_output=True, check=True).stdout
+
+    blob = g("hash-object", "-w", "--no-filters", "--", rel).decode().strip()
+    parent, name = rel.rsplit("/", 1)
+    tree = g("rev-parse", f"{sha}:{parent}").decode().strip()
+    body, out, i = g("cat-file", "tree", tree), b"", 0
+    while i < len(body):
+        sp = body.index(b" ", i)
+        nul = body.index(b"\0", sp)
+        oid = body[nul + 1:nul + 21]
+        if body[sp + 1:nul] == name.encode():
+            oid = bytes.fromhex(blob)
+        out += body[i:nul + 1] + oid
+        i = nul + 21
+    path = objdir / tree[:2] / tree[2:]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        path.chmod(0o644)
+        path.unlink()
+    path.write_bytes(zlib.compress(b"tree " + str(len(out)).encode() + b"\0" + out))
+
+
+def store_tamper(form: str, repo: Path, sha: str, rel: str, base: Path, root: Path) -> None:
+    """#6908: apply one STORE_FORMS form after ``rel`` was rewritten."""
+    def g(*cmd: str, inp: Optional[bytes] = None) -> None:
+        subprocess.run(["git", *cmd], cwd=repo, capture_output=True, check=True, input=inp)
+
+    objects = repo / ".git" / "objects"
+    if form in ("packed repo + forged loose tree", "pack exploded + forged tree"):
+        g("gc", "-q")
+        if form == "pack exploded + forged tree":
+            held = base / "held-packs"
+            shutil.rmtree(held, ignore_errors=True)
+            held.mkdir(parents=True)
+            for pk in (objects / "pack").glob("*.pack"):
+                shutil.move(str(pk), str(held / pk.name))
+                (objects / "pack" / (pk.stem + ".idx")).unlink()
+            for pk in held.glob("*.pack"):
+                g("unpack-objects", "-q", inp=pk.read_bytes())
+    if form in ("forged loose tree object", "packed repo + forged loose tree", "pack exploded + forged tree"):
+        _forge_tree(repo, sha, rel, objects)
+    elif form == "alternate object store":
+        alt = base / "alt-objects"
+        shutil.rmtree(alt, ignore_errors=True)
+        alt.mkdir(parents=True)
+        _forge_tree(repo, sha, rel, alt)
+        tree = subprocess.run(["git", "rev-parse", f"{sha}:{rel.rsplit('/', 1)[0]}"], cwd=repo, capture_output=True,
+                              text=True, check=True).stdout.strip()
+        (objects / tree[:2] / tree[2:]).unlink()
+        (objects / "info").mkdir(exist_ok=True)
+        (objects / "info" / "alternates").write_text(str(alt) + "\n", encoding="utf-8")
+    elif form in ("gitfile redirect to a decoy store", "symlinked .git to a decoy store"):
+        decoy = base / "decoy-store.git"
+        shutil.rmtree(decoy, ignore_errors=True)
+        shutil.move(str(repo / ".git"), str(decoy))
+        (repo / ".git").write_text(f"gitdir: {decoy}\n", encoding="utf-8")
+        _forge_tree(repo, sha, rel, decoy / "objects")
+        if form == "symlinked .git to a decoy store":
+            (repo / ".git").unlink()
+            os.symlink(decoy, repo / ".git")
+    elif form == "git replace of the tree":
+        held = base / "replace-objects"
+        shutil.rmtree(held, ignore_errors=True)
+        _forge_tree(repo, sha, rel, held)
+        tree = subprocess.run(["git", "rev-parse", f"{sha}:{rel.rsplit('/', 1)[0]}"], cwd=repo, capture_output=True,
+                              text=True, check=True).stdout.strip()
+        forged = zlib.decompress((held / tree[:2] / tree[2:]).read_bytes())
+        new = subprocess.run(["git", "hash-object", "-w", "-t", "tree", "--stdin"], cwd=repo, input=forged.split(b"\0", 1)[1],
+                             capture_output=True, check=True).stdout.decode().strip()
+        g("replace", tree, new)
+    elif form == "core.worktree decoy":
+        pristine = base / "pristine"
+        shutil.rmtree(pristine, ignore_errors=True)
+        for r in BOUND_FILES:
+            (pristine / r).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(root / r, pristine / r)
+        g("config", "core.worktree", str(pristine))
+    elif form == "clean filter":
+        (repo / ".git" / "info").mkdir(exist_ok=True)
+        (repo / ".git" / "info" / "attributes").write_text(f"{rel} filter=undo\n", encoding="utf-8")
+        g("config", "filter.undo.clean", f"head -c {(root / rel).stat().st_size}")
+    elif form == "core.fsmonitor + core.hooksPath":
+        g("config", "core.fsmonitor", "false")
+        g("config", "core.hooksPath", str(base))
 
 
 def bound_runtime(root: Path, base: Path, payload: bytes, build: str, assert_body: str) -> int:
@@ -4138,11 +4235,13 @@ def bound_runtime(root: Path, base: Path, payload: bytes, build: str, assert_bod
         if run(repo, body, env) != 0:
             print(f"self-test FAIL: the {label} does not pass with the verified declaration and asserter", file=sys.stderr)
             failures += 1
-        for form in TAMPER_FORMS:
+        for form in TAMPER_FORMS + STORE_FORMS:
             for rel in rels:
                 repo, sha = fresh("tamper")
                 env = dict(os.environ, GITHUB_OUTPUT=str(repo / "output.txt"), PREFLIGHT_SHA=sha)
                 env = tamper(form, repo, rel, env)
+                if form in STORE_FORMS:
+                    store_tamper(form, repo, sha, rel, base, root)
                 if run(repo, body, env) == 0:
                     print(f"self-test FAIL: the {label} PASSED with {rel} rewritten after checkout ({form}, #4768/#6275): "
                           "fail-open", file=sys.stderr)
