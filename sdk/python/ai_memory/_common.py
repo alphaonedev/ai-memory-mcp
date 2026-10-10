@@ -338,10 +338,51 @@ def _context_from_path(path: str) -> ssl.SSLContext:
     )
 
 
+#: httpx's env trust, in its own precedence order: the variable, and whether
+#: it must name a directory (else a regular file).
+_ENV_TRUST = (("SSL_CERT_FILE", False), ("SSL_CERT_DIR", True))
+
+
+def _context_from_env() -> ssl.SSLContext | None:
+    """The env trust httpx would use for ``verify=None``/``True``, read NOW (#6538).
+
+    httpx takes ``SSL_CERT_FILE`` when it is non-empty, else ``SSL_CERT_DIR``,
+    else certifi (``None`` here). The named path is loaded through
+    :func:`_context_from_path`, so the #6377 rules hold for it: read once at
+    construction, never re-read per handshake, and refused when the group or
+    others can change it. A path that is missing or of the wrong kind is
+    refused, fail closed, where httpx 0.27 would silently fall back to
+    certifi.
+    """
+    for variable, wants_directory in _ENV_TRUST:
+        value = os.environ.get(variable, "")
+        if not value:
+            continue
+        try:
+            mode = os.stat(value).st_mode
+        except OSError:
+            mode = 0
+        if not (stat.S_ISDIR(mode) if wants_directory else stat.S_ISREG(mode)):
+            kind = "directory" if wants_directory else "regular file"
+            raise ValueError(
+                f"{variable}={value!r} is not an existing {kind}; httpx would read "
+                f"trust from it. Point {variable} at a CA "
+                f"{'hashed directory' if wants_directory else 'bundle file'} or unset it "
+                "(#6538)."
+            )
+        try:
+            return _context_from_path(value)
+        except ValueError as exc:
+            raise ValueError(f"{variable}: {exc} (#6538)") from None
+    return None
+
+
 def _checked_verify(verify: object) -> bool | ssl.SSLContext | None:
     """Return the ONLY value ``build_httpx_kwargs`` may forward, or raise (#3840).
 
-    Forwarded to httpx: ``None`` (httpx default trust, kwarg omitted), ``True``,
+    Forwarded to httpx: ``None`` (httpx default trust, kwarg omitted) and
+    ``True`` when no ``SSL_CERT_FILE`` / ``SSL_CERT_DIR`` is set, else the
+    context :func:`_context_from_env` builds from that variable (#6538),
     a caller context that passes :func:`_context_verifies` (exactly
     ``ssl.SSLContext``), or a context this SDK builds itself from the resolved
     absolute path of an existing CA file or directory (``str`` or
@@ -352,7 +393,8 @@ def _checked_verify(verify: object) -> bool | ssl.SSLContext | None:
     exist, and any type this SDK does not document.
     """
     if verify is None or verify is True:
-        return verify
+        from_env = _context_from_env()
+        return verify if from_env is None else from_env
     if isinstance(verify, ssl.SSLContext):
         if _context_verifies(verify):
             return verify

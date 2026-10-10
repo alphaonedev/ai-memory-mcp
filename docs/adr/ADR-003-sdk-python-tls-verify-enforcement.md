@@ -131,4 +131,6 @@ Residuals (accepted, each with its reason):
   the caller's context.
 - The response backstop cannot stop a request that was already written; it exists for the paths where the pre-send
   trace did not run. The trace lives in the transport, after every request event hook (#6537).
-- `verify=None` with `SSL_CERT_DIR` set still lets httpx read that directory lazily and unchecked; #6538 tracks it.
+- `verify=None` / `verify=True` with `SSL_CERT_FILE` or `SSL_CERT_DIR` set: the SDK loads that path itself under the
+  rules above (read once, permissions checked), and refuses a missing or wrong-kind path instead of httpx 0.27's
+  silent fallback to certifi (#6538).
