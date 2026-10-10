@@ -127,6 +127,30 @@ async fn x1b_postgres_store_batch_atomic() {
     }
 }
 
+/// F6: refuse the shared-store URL shape before attempting a connection.
+/// The reserved .invalid host ensures this negative control cannot reach a DB.
+#[cfg(feature = "sal-postgres")]
+#[test]
+fn x1_pg_lane_guard_precedes_connect() {
+    let url = format!(
+        "postgres://parity.invalid:{}/{}",
+        common::lane_db::SHARED_LIVE_STORE_PORT,
+        common::lane_db::SHARED_LIVE_STORE_DATABASE,
+    );
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", "x1b_postgres_store_batch_atomic", "--nocapture"])
+        .env("AI_MEMORY_TEST_POSTGRES_URL", url)
+        .env_remove("AI_MEMORY_TEST_PG_ISOLATE")
+        .output()
+        .expect("lane guard child");
+    assert!(!output.status.success(), "F6: unsafe lane must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refusing to run against a non-lane database"),
+        "F6: lane guard must run before connect, got {stderr}"
+    );
+}
+
 /// Cross-backend: same state after fault and after retry
 /// (everything except the quota row, which `x1_parity_quota` owns).
 #[cfg(feature = "sal-postgres")]

@@ -56,7 +56,7 @@ async fn digest_contract(store: &dyn MemoryStore, raw: &RawDb) {
     let before = state_digest(raw).await;
     assert_eq!(
         before.section("memories"),
-        &[vec![MEMORY_ID, TITLE, NS, "long", "active", "1", CALLER]],
+        &[vec![MEMORY_ID, TITLE, NS, "long", "open", "1", CALLER]],
         "F2: memory digest includes tier and metadata.agent_id"
     );
     assert_eq!(
