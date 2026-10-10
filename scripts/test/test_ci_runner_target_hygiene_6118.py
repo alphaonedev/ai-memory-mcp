@@ -168,7 +168,12 @@ CARGO_PROFILE_ARG_RE = re.compile(r"\bcargo\b[^|;&\n]*?--profile(?:=|\s+)([A-Za-
 # rustc's `-g` is `-C debuginfo=2`.  Matched as a standalone token in a rustc
 # flags env value, or in a run line that sets RUSTFLAGS / calls rustc (a bare
 # `-g` elsewhere, e.g. `npm install -g`, is not a rustc flag).
-RUSTC_FLAGS_KEY_RE = re.compile(r"(CARGO_ENCODED_)?RUST(DOC)?FLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_[A-Z0-9_]+_RUSTFLAGS")
+RUSTC_FLAGS_KEY_RE = re.compile(r"(CARGO_ENCODED_)?RUST(DOC)?FLAGS|CARGO_BUILD_RUSTFLAGS|CARGO_TARGET_[A-Z0-9_]+_RUSTFLAGS"
+                                r"|CARGO_PROFILE_[A-Z0-9_]+_RUSTFLAGS")
+# cargo nightly switches (#6473): RUSTC_BOOTSTRAP / the channel override make the pinned stable
+# toolchain accept `-Z`, `cargo-features` and `[unstable]`, e.g. profile-rustflags.
+UNSTABLE_ENV_KEY_RE = re.compile(r"CARGO_UNSTABLE_[A-Z0-9_]+")
+CARGO_UNSTABLE_ARG_RE = re.compile(r"\bcargo\b[^|;&\n]*?\s-Z")
 # A run body is read as shell: words (quotes, escapes, ``$'..'`` decoded), operators and
 # here-document bodies.  A ``KEY=value`` / ``KEY+=value`` / ``KEY<<DELIM`` inside a word or a
 # here-document line is an assignment of KEY.  Kinds of KEY that matter:
@@ -180,7 +185,8 @@ RUN_ASSIGN_RE = re.compile(r"(?<![A-Za-z0-9_-])([A-Za-z_][A-Za-z0-9_-]*)(\+?=|<<
 TOOL_OVERRIDE_KEYS = frozenset({
     "CARGO_HOME", "RUSTC", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC",
     "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
-    "rustc", "rustc-wrapper", "rustc-workspace-wrapper"})
+    "rustc", "rustc-wrapper", "rustc-workspace-wrapper",
+    "RUSTC_BOOTSTRAP", "__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS"})
 FLAGS_CONFIG_KEYS = frozenset({"rustflags", "rustdocflags"})
 # Actions whose behaviour is pinned and known not to raise a debuginfo level.  A `with:` input of
 # ANY step is still read; a step that `uses:` anything else (a local composite action, a reusable
@@ -882,10 +888,14 @@ def toml_debug_findings(text: str) -> List[str]:
                 if level and level not in LEVEL_OFF:
                     found.append("%s = %r (a profile package / build-override table beats the CARGO_PROFILE_* env)"
                                  % (dotted, level))
-        # cargo keys are case-sensitive and `[env]` values never reach rustc's flags (#6316)
-        if path[-1] in FLAGS_CONFIG_KEYS and (path[0] in ("build", "target") or len(path) == 1):
+        # cargo keys are case-sensitive and `[env]` values never reach rustc's flags (#6316); a
+        # `[profile.*]` rustflags is the profile-rustflags feature (#6473)
+        if path[-1] in FLAGS_CONFIG_KEYS and (path[0] in ("build", "target", "profile") or len(path) == 1):
             for spelled in _level_spellings(value, True):
                 found.append("%s carries %s" % (dotted, spelled))
+        if path == ("cargo-features",) or path[0] == "unstable":
+            found.append("%s (a cargo nightly feature switch; with RUSTC_BOOTSTRAP it enables profile rustflags)"
+                         % dotted)
         if path[0] == "build" and len(path) == 2 and path[1] in ("rustc", "rustc-wrapper", "rustc-workspace-wrapper"):
             found.append("%s = %s (a compiler wrapper can add any debuginfo flag)" % (dotted, value.strip()))
     return found
@@ -1174,7 +1184,7 @@ def _key_kind(key: str) -> str:
         return "debug"
     if RUSTC_FLAGS_KEY_RE.fullmatch(key) or key in FLAGS_CONFIG_KEYS:
         return "flags"
-    if key in TOOL_OVERRIDE_KEYS:
+    if key in TOOL_OVERRIDE_KEYS or UNSTABLE_ENV_KEY_RE.fullmatch(key):
         return "forbidden"
     return ""
 
@@ -1291,6 +1301,8 @@ def _level_spellings(text: str, flags_value: bool) -> List[str]:
     if any(DASH_G_RE.search(piece) for piece in scanned):
         found.append("rustc -g (= -C debuginfo=2)")
     if not flags_value:
+        if CARGO_UNSTABLE_ARG_RE.search(text):
+            found.append("cargo -Z (an unstable flag can enable profile rustflags or any other nightly setting)")
         for m in CARGO_CONFIG_ARG_RE.finditer(text):
             value = next(g for g in m.groups() if g is not None)
             if "=" not in value:
@@ -1306,7 +1318,7 @@ def _value_findings(key: str, value: str) -> List[str]:
     """Findings for one env row or ``with:`` input named ``key``."""
     text = _yaml_unescape(value)
     found: List[str] = []
-    if key in TOOL_OVERRIDE_KEYS:
+    if _key_kind(key) == "forbidden":
         found.extend(_judge(key, "forbidden", text, False))
     flags = bool(RUSTC_FLAGS_KEY_RE.fullmatch(key)) or key.lower().replace("-", "") in FLAGS_CONFIG_KEYS
     found.extend(_level_spellings(text, flags))
