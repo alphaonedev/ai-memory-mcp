@@ -122,7 +122,7 @@ within 20 % of the watchdog; lower it toward 1.4x the measured longest shard
 once the figure is known). These numbers are pinned by
 `scripts/ci/tests/test_ci_shard_wiring_6344.py`.
 
-# Carrier-branch gates (#6143)
+## Carrier-branch gates (#6143)
 
 `chain/**` and `rehearsal/**` are `pull_request` base branches of the gating
 workflows (for example `.github/workflows/c8-precheck.yml`). GitHub does not
@@ -136,14 +136,14 @@ the tree that actually lands (#6143, found in the #6137/#6138 review).
 status check or an up-to-date head. The two jobs in this document report, but
 neither blocks a merge.
 
-## Repo-side controls
+### Repo-side controls
 
 | Job (context) | Script | What it reports | Required? |
 |---|---|---|---|
 | `Carrier-base freshness gate (#6143)` (`carrier-base-fresh-gate`) | `scripts/check_carrier_base_fresh.py` | RED when the merge commit the job checked out is not built on the live tip of the carrier base. It fetches the tip on every run, so re-running a stale green turns it red. Remedy printed by the gate: `gh pr update-branch <PR>`, then wait for the new run. | Advisory. Carrier ruleset context once #6182 lands; never a release/v1.0.0 context. |
 | `Carrier-ruleset live verifier (#6143)` (`carrier-ruleset-live-gate`) | `scripts/check_carrier_ruleset_live.py` | Read-only (GET) comparison of the live repository rulesets with the committed payload. | Advisory until the #6182 promotion. |
 
-## The carrier ruleset (exact payload, applied by ai:god-f2)
+### The carrier ruleset (exact payload, applied by ai:god-f2)
 
 The exact POST body is committed at `docs/ci/carrier-ruleset.json`:
 
@@ -231,7 +231,7 @@ Effects to expect once the ruleset is live:
 - Ruleset 17752665 `signed-attested-branches` (main, develop, release/*) is a
   separate object and is not changed.
 
-## Verifier states (5-agent vote (4d3ea1c5), memory a03dd15d)
+### Verifier states (5-agent vote (4d3ea1c5), memory a03dd15d)
 
 `scripts/qc-allowlists/carrier-ruleset-state.json` holds
 `{"state": "pending-apply" | "applied", "tracking_issue": 6182}`. Any other
@@ -270,7 +270,7 @@ The state is coupled to the promotion of the verifier's own context,
 - The job is granted `contents: read` and `issues: read` at job level. The
   issue read therefore does not depend on the repository being public.
 
-## Landing order (#6182)
+### Landing order (#6182)
 
 1. This change lands on every unfrozen carrier that still takes pull
    requests: `chain/promo6-ssh` and `rehearsal/audit-wip-ssh` (2026-10-09).
@@ -341,7 +341,7 @@ A context added to `required-contexts-release.txt` later must be added to
 verifier fails otherwise), and the live carrier ruleset updated with the
 `PUT` command above.
 
-## Limits
+### Limits
 
 - Advisory until required. Neither job blocks a merge until the carrier
   ruleset requires it (#6182).
