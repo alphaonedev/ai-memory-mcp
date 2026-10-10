@@ -176,6 +176,16 @@ Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
 
 Use the trailer that matches the actual model/agent producing the commit.
 
+Do not add a `Claude-Session:` trailer (or any other session-URL trailer) to a
+commit (#6580). Before pushing, check the commits your branch adds:
+
+```
+python3 -I scripts/check_commit_trailers.py --range <base>..HEAD
+```
+
+It exits 1 and names each commit that carries the trailer, and exits 2 when
+the range cannot be listed or is empty.
+
 ### 5.3 Code style (Rust)
 
 The rules in [`ENGINEERING_STANDARDS.md` §1.4](ENGINEERING_STANDARDS.html) are binding for
