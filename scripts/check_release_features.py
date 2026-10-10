@@ -1833,6 +1833,31 @@ def node_lines(node: Node) -> Iterator[Tuple[int, str]]:
             yield node.line + 1 + k, line
 
 
+RUN_EXPR_OK_RE = re.compile(r"\$\{\{\s*matrix\.[A-Za-z_][A-Za-z0-9_-]*\s*\}\}")
+
+
+def check_run_expressions(doc: Node, name: str, rep: Report) -> None:
+    """#6293 (CWE-94 class): a `${{ }}` inside a `run:` script is pasted into
+    the script text before the shell reads it, so a secret or a step / job
+    output there becomes shell syntax. Inside `run:` only a `matrix.<key>`
+    expression (pinned static values) is allowed; everything else goes
+    through the step's `env:` and is read as a quoted variable. Comment
+    lines count: the runner expands them too."""
+    for path, node in walk(doc):
+        if not path or path[-1] != "run":
+            continue
+        for line, text in node_lines(node):
+            at = text.find("${{")
+            while at != -1:
+                m = RUN_EXPR_OK_RE.match(text, at)
+                if m is None:
+                    rep.bad(f"{name}: line {line + 1}: `{text[at:at + 60]}` expands an expression inside `run:` "
+                            "(#6293: pass it through the step's `env:` and quote the variable; only "
+                            "`${{ matrix.<key> }}` may appear in a script)")
+                    break
+                at = text.find("${{", m.end())
+
+
 def check_secrets_and_registry(doc: Node, rep: Report) -> None:
     """Every `secrets` reference is `secrets.<NAME>` with NAME in RELEASE_SECRETS,
     no key is named `secrets`, and the image registry is named only inside the
@@ -1938,6 +1963,7 @@ def check_release_yml(text: str, rep: Report) -> None:
         return
     check_blocks(doc, "release.yml", rep)
     check_run_continuations(doc, "release.yml", rep)
+    check_run_expressions(doc, "release.yml", rep)
     check_secrets_and_registry(doc, rep)
     for key in doc.keys():
         if key not in TOP_KEYS:
@@ -2156,6 +2182,7 @@ def check_shape(text: str, rep: Report, advisory: Optional[bool] = None) -> None
         return
     check_blocks(doc, "release-shape.yml", rep)
     check_run_continuations(doc, "release-shape.yml", rep)
+    check_run_expressions(doc, "release-shape.yml", rep)
     if doc.keys() != list(SHAPE_TOP_KEYS):
         rep.bad(pin_message("release-shape.yml", f"top-level keys {doc.keys()} differ from the pinned "
                             f"{list(SHAPE_TOP_KEYS)} (a top-level `defaults:` or `env:` change redirects every step)",
@@ -3534,6 +3561,16 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "6286 3613 fragment drops the Docker layer item": ("fail", [("changelog.d/3613.added.md", "#6409", "#0", True)]),
     "6286 3613 fragment is not a bold entry": ("fail", [("changelog.d/3613.added.md", "**[release]", "[release]", False)]),
     "6286 4720 fragment missing": ("fail", [("changelog.d/4720.fixed.md", "", None, False)]),
+    # --- #6293: no secret or step/job output is expanded inside a run: script
+    "6293 secret expanded in a run script": ("fail", [_rel("          rpm --version\n", "          rpm --version\n" + '          echo "${{ secrets.COPR_CONFIG }}" > f\n')]),
+    "6293 secret by index in a run script": ("fail", [_rel("          rpm --version\n", "          rpm --version\n" + "          echo ${{ secrets['COPR_CONFIG'] }}\n")]),
+    "6293 step output in a run script": ("fail", [_rel("          rpm --version\n", "          rpm --version\n" + "          VERSION=${{ steps.version.outputs.version }}\n")]),
+    "6293 job output in a run script": ("fail", [_rel("          rpm --version\n", "          rpm --version\n" + "          T=${{ needs.preflight.outputs.tag }}\n")]),
+    "6293 event payload in a run script": ("fail", [_rel("          rpm --version\n", "          rpm --version\n" + '          echo "${{ github.event.inputs.tag }}"\n')]),
+    "6293 expression in a run comment line": ("fail", [_rel("          rpm --version\n", "          rpm --version\n" + "          # ${{ secrets.COPR_CONFIG }}\n")]),
+    "6293 matrix then a secret on one line": ("fail", [_rel("          rpm --version\n", "          rpm --version\n" + '          echo ${{ matrix.target }} ${{ secrets.COPR_CONFIG }}\n')]),
+    "6293 unterminated expression in a run script": ("fail", [_rel("          rpm --version\n", "          rpm --version\n" + "          echo ${{ matrix.target\n")]),
+    "6293 expression in a release-shape run script": ("fail", [(SHAPE, "        run: |\n", "        run: |\n          echo ${{ github.ref_name }}\n", False)]),
     "6292 path dependency outside the release-shape paths filter": ("fail", [(CARGO, PASTE_DEP,
         PASTE_DEP.replace("vendor/paste", "third_party/paste"), False)]),
     "6292 dependency-table path dependency outside the filter": ("fail", [(CARGO, PASTE_DEP,
