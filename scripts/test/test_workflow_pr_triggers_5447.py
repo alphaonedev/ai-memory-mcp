@@ -5085,5 +5085,24 @@ class ApprovalFailClosedGuards6395(unittest.TestCase):
                 self.assertEqual(1, rc, lines)
                 self.assertIn("no valid number", "\n".join(lines))
 
+
+
+class ChangelogRounds45_6334(unittest.TestCase):
+    """The #6117 changelog fragments record the round 4-5 gate behaviour, issue by issue."""
+
+    ISSUES = ("#6240", "#6241", "#6242", "#6243", "#6259", "#6261", "#6325", "#6328", "#6329", "#6332",
+              "#6335", "#6341", "#6387", "#6388", "#6389", "#6390", "#6392", "#6393", "#6394", "#6395")
+
+    def setUp(self) -> None:
+        self.text = "".join((ROOT / "changelog.d" / name).read_text(encoding="utf-8")
+                            for name in ("6117.security.md", "6117.fixed.md"))
+
+    def test_6334_every_round_4_5_issue_is_recorded(self) -> None:
+        self.assertEqual([], [n for n in self.ISSUES if n not in self.text])
+
+    def test_6334_the_queue_binding_is_described_as_base_sha(self) -> None:
+        self.assertIn("merge_group.head_ref", self.text)
+        self.assertIn("merge_group.base_sha", self.text)
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
