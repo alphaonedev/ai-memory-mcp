@@ -55,7 +55,10 @@ fn flag_unset_is_passthrough_6383() {
         assert_eq!(pg_isolate::plan(flag, None, None), Plan::Passthrough(None));
     }
     // flag on but no URL: nothing to isolate, the cell skips as before.
-    assert_eq!(pg_isolate::plan(Some("1"), None, None), Plan::Passthrough(None));
+    assert_eq!(
+        pg_isolate::plan(Some("1"), None, None),
+        Plan::Passthrough(None)
+    );
 }
 
 #[test]
@@ -77,7 +80,9 @@ fn flag_set_mints_unless_already_isolated_6383() {
     assert!(!pg_isolate::is_isolated_url(
         "postgres://u:pw@h:5445/ai_memory_test"
     ));
-    assert!(!pg_isolate::is_isolated_url("postgres://u:pw@h:5445/ai_memory_tx"));
+    assert!(!pg_isolate::is_isolated_url(
+        "postgres://u:pw@h:5445/ai_memory_tx"
+    ));
 }
 
 #[test]
@@ -181,12 +186,13 @@ fn run_id_rules_6383() {
     for bad in ["", "UPPER", "a-b", "a_b", "x;y"] {
         assert!(pg_isolate::run_id_from(Some(bad)).is_err(), "{bad:?}");
     }
-    assert!(
-        pg_isolate::run_id_from(Some(&"a".repeat(pg_isolate::RUN_ID_MAX_LEN + 1))).is_err()
-    );
+    assert!(pg_isolate::run_id_from(Some(&"a".repeat(pg_isolate::RUN_ID_MAX_LEN + 1))).is_err());
     let fresh = pg_isolate::run_id_from(None).expect("a generated run id");
     assert!(pg_isolate::is_valid_run_id(&fresh), "{fresh}");
-    assert_ne!(fresh, pg_isolate::run_id_from(None).expect("a second run id"));
+    assert_ne!(
+        fresh,
+        pg_isolate::run_id_from(None).expect("a second run id")
+    );
 }
 
 #[test]
@@ -207,19 +213,23 @@ fn live_inputs(case: &str) -> Option<(String, String)> {
         return None;
     };
     let flag_on = std::env::var(pg_isolate::FLAG_VAR).ok().as_deref() == Some("1");
-    match std::env::var(pg_isolate::TEMPLATE_VAR).ok().filter(|t| !t.is_empty()) {
-        Some(template) => Some((base, template)),
-        None => {
-            assert!(
-                !flag_on,
-                "#6383 {case}: {}=1 but {} is unset; the clone path must run, not skip",
-                pg_isolate::FLAG_VAR,
-                pg_isolate::TEMPLATE_VAR
-            );
-            eprintln!("SKIP {case}: {} unset (no clone source)", pg_isolate::TEMPLATE_VAR);
-            None
-        }
+    if let Some(template) = std::env::var(pg_isolate::TEMPLATE_VAR)
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        return Some((base, template));
     }
+    assert!(
+        !flag_on,
+        "#6383 {case}: {}=1 but {} is unset; the clone path must run, not skip",
+        pg_isolate::FLAG_VAR,
+        pg_isolate::TEMPLATE_VAR
+    );
+    eprintln!(
+        "SKIP {case}: {} unset (no clone source)",
+        pg_isolate::TEMPLATE_VAR
+    );
+    None
 }
 
 fn now_unix() -> u64 {
@@ -243,11 +253,17 @@ fn mint_clones_template_with_extensions_6383() {
     let minted = pg_isolate::mint_blocking(&base, &template, &run).expect("mint from the template");
     let name = lane_db::database_name(&minted).to_string();
     let verdict = std::panic::catch_unwind(|| {
-        assert_eq!(pg_isolate::parse_isolated_name(&run, &name).is_some(), true, "{name}");
+        assert!(
+            pg_isolate::parse_isolated_name(&run, &name).is_some(),
+            "{name}"
+        );
         assert_eq!(lane_db::lane_database_refusal(&minted), None);
         let found = pg_isolate::extension_count_blocking(&minted, &["age", "vector"])
             .expect("count extensions in the clone");
-        assert_eq!(found, 2, "the clone must carry age + vector from the template");
+        assert_eq!(
+            found, 2,
+            "the clone must carry age + vector from the template"
+        );
     });
     // Always reclaim the clone, even when an assertion above failed.
     pg_isolate::drop_database_blocking(&base, &run, &name).expect("drop the clone");
@@ -277,7 +293,11 @@ fn sweep_is_run_scoped_and_spares_held_clones_6383() {
         .expect("hold a session on the clone");
     let verdict = std::panic::catch_unwind(|| {
         let swept = pg_isolate::sweep_run_blocking(&base, &mine).expect("run-scoped sweep");
-        assert_eq!(swept, vec![mine_idle.clone()], "only this run's idle stale clone");
+        assert_eq!(
+            swept,
+            vec![mine_idle.clone()],
+            "only this run's idle stale clone"
+        );
         for name in [&other_idle, &mine_held] {
             assert!(
                 pg_isolate::database_exists_blocking(&base, name).expect("exists query"),
@@ -288,7 +308,11 @@ fn sweep_is_run_scoped_and_spares_held_clones_6383() {
         assert!(pg_isolate::drop_database_blocking(&base, &mine, &mine_held).is_err());
     });
     drop(hold);
-    for (run, name) in [(&other, &other_idle), (&mine, &mine_held), (&mine, &mine_idle)] {
+    for (run, name) in [
+        (&other, &other_idle),
+        (&mine, &mine_held),
+        (&mine, &mine_idle),
+    ] {
         if let Err(e) = pg_isolate::drop_database_blocking(&base, run, name) {
             eprintln!("WARN cleanup {name}: {e}");
         }
