@@ -2240,6 +2240,12 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     for helper in ("_commit_day", "read_cert_doc", "ledger_append_only", "_in_ledger"):
         if helper not in globals():
             t.fail(f"(6124-helpers): production helper {helper} is missing")
+    # (6124-fixture) #6445: the fixture runs git itself; a fixture that calls
+    # the production run_git breaks on any base whose run_git signature
+    # differs, and one traceback then hides every cell after it.
+    if "run_git" in Fixture.g.__code__.co_names:
+        t.fail("(6124-fixture): the self-test fixture calls the production run_git, so a base "
+               "with another run_git signature crashes the corpus instead of naming cells")
     day6124 = datetime.date.fromisoformat(fx.g("show", "-s", "--format=%cs", exp6124))
     today6124 = day6124.isoformat()
 
