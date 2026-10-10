@@ -69,6 +69,23 @@ class TreeShape(unittest.TestCase):
         self.assertIsNone(root.get("e").block)
         self.assertIsNone(root.get("a").block)
 
+    def test_block_stops_at_next_structure_row_6611(self):
+        # the block ends at the next structure row even when a nested mapping follows it, so the
+        # nested rows are never read as block text (pins the row_lines / bisection of #6611)
+        doc = "".join("k%d: 1\n" % i for i in range(9)) + "b: |\n  x\nc:\n  y: 1\n  z: 2\n"
+        b = SUBSET.parse_workflow(doc).get("b")
+        self.assertEqual(b.block, (11, 11))
+        self.assertEqual(b.block_lines, [(11, "  x")])
+
+    def test_8000_block_scalars_parse_in_linear_time_6611(self):
+        import time
+        for doc in ("a:\n" + "".join("  k%d: |\n    x\n" % i for i in range(8000)),
+                    "a:\n" + "".join("  - |\n    x\n" for _ in range(8000)),
+                    "".join("k%d: |\n  x\n" % i for i in range(8000))):
+            start = time.monotonic()
+            SUBSET.parse_workflow(doc)
+            self.assertLess(time.monotonic() - start, 5.0)
+
     def test_block_excludes_trailing_blank_and_outdented_comment(self):
         root = SUBSET.parse_workflow("k: |\n  one\n\n# tail\nz: 1\n")
         self.assertEqual(root.get("k").block, (2, 2))

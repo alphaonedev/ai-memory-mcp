@@ -19,6 +19,7 @@ The reader is the Python standard library only; no PyYAML is imported.
 """
 from __future__ import annotations
 
+import bisect
 import re
 import unicodedata
 from typing import Dict, List, Optional, Set, Tuple
@@ -578,6 +579,9 @@ def parse_workflow(text: str) -> Node:
     total = text.count("\n") + 1
     root = Node("root", "", "", 0, -1)
     stack: List[Node] = [root]
+    # #6611: casefolded key -> first line, per parent (by id), so the duplicate check is one lookup
+    # per key instead of a scan of every earlier sibling.
+    seen: Dict[int, Dict[str, int]] = {}
 
     def push(node: Node) -> None:
         while stack[-1].col >= node.col:
@@ -590,10 +594,12 @@ def parse_workflow(text: str) -> Node:
                 # state on it misreads the rest of the row (#6617), so the tree refuses such keys.
                 raise Unparsed("line %d: quote character inside a plain mapping key %r (#6617)"
                                % (node.line, node.name))
-            for sibling in parent.children:
-                if sibling.kind == "key" and key_name(sibling.name).casefold() == key_name(node.name).casefold():
-                    raise Unparsed("line %d: repeated mapping key %r (first on line %d)"
-                                   % (node.line, node.name, sibling.line))
+            folded = key_name(node.name).casefold()
+            known = seen.setdefault(id(parent), {})
+            if folded in known:
+                raise Unparsed("line %d: repeated mapping key %r (first on line %d)"
+                               % (node.line, node.name, known[folded]))
+            known[folded] = node.line
         parent.children.append(node)
         stack.append(node)
 
@@ -612,8 +618,9 @@ def parse_workflow(text: str) -> Node:
     for node in root.walk():
         if node.kind == "root" or not node.value or node.value[0] not in "|>":
             continue
-        later = [n for n in row_lines if n > node.line]
-        last = (later[0] - 1) if later else total
+        # #6611: row_lines is ascending, so the next structure row is one bisection, not a scan.
+        nxt = bisect.bisect_right(row_lines, node.line)
+        last = (row_lines[nxt] - 1) if nxt < len(row_lines) else total
         while last > node.line and (not lines[last - 1].strip(" ")
                                     or len(lines[last - 1]) - len(lines[last - 1].lstrip(" ")) <= node.col):
             last -= 1  # trailing blank or less-indented comment lines are not content
