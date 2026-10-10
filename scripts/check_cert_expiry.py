@@ -864,14 +864,16 @@ def ledger_blocks(lines):
     return blocks
 
 
-def ledger_append_only(repo, mb, judged):
+def ledger_append_only(repo, mb, judged, exact=False):
     """The reason the change breaks the append-only ledger ('' when it keeps
     it), for a change that touches the cert doc while the certification is
     EXPIRED/VOID at the merge-base (#6423): every record of the merge-base doc
     stays, byte-identical, in the same order, whatever else the change is.
     Only a LIVE head (a re-issue, held to rule C and #3899) is exempt; a new
     Binds-to value or EXPIRED -> VOID is not a re-issue (#6726). A deleted doc
-    loses every record."""
+    loses every record. With EXACT (the doc-only path, #6731) the ledger may
+    not gain a record either: a record belongs to the wire change it records,
+    and only that path validates its grammar, citation, placement and date."""
     banner_mb = cert_banner(repo, mb)
     banner_head = cert_banner(repo, judged)
     if banner_mb[0] not in ("EXPIRED", "VOID"):
@@ -889,6 +891,10 @@ def ledger_append_only(repo, mb, judged):
         return (f"{CERT_DOC} is {banner_mb[0]} and its amendment ledger is append-only: this "
                 "change removes, edits, re-dates, moves or reorders an existing record "
                 f"(or deletes the document); only a new record may be added (#6124, #6423)")
+    if exact and len(new) != len(old):
+        return (f"{CERT_DOC} is {banner_mb[0]} and this change touches no watched path or "
+                "AI_MEMORY_FED_* identifier, so it may not add an amendment record: a record "
+                "is added only by the wire change it records (#6124, #6731)")
     return ""
 
 
@@ -1254,7 +1260,9 @@ def _judge(repo, base, head, judged, mb, tip):
 
     if not watched and not id_changed:
         if cert_touched:
-            problem = ledger_append_only(repo, mb, judged) or ledger_canonical(repo, mb, judged)
+            # The subset first: a doc outside it is not parsed for records.
+            problem = (ledger_canonical(repo, mb, judged)
+                       or ledger_append_only(repo, mb, judged, exact=True))
             if problem:
                 return False, f"{PREFIX}: FAIL — {problem}"
         ok, more = check_banner_consistency(repo, judged)
@@ -3275,7 +3283,8 @@ SELF_TEST_OK = (
     "remedy names the record, its legal spots and #3899; (6124-l*, q*, #6443) a record behind "
     "an HTML block or fence opened in a `> - ` / `> 1. ` item, behind an indented `>` or a "
     "`>` + tab RED; (6124-p*, #6420) a record away from the ledger RED; (6124-d*, #6423) a "
-    "doc-only delete, re-date, edit, reorder or doc deletion of the records RED; (6124-i*) a "
+    "doc-only delete, re-date, edit, reorder, addition (#6731) or doc deletion of the records, "
+    "and a record deleted alongside a new Binds-to value or EXPIRED -> VOID (#6726), RED; (6124-i*) a "
     "header citing zero, two, three or a suffixed issue RED; (6124-m*) the #6063 cite as an "
     "image RED; (6124-e*) no re-issue advice for an EXPIRED deleted or garbled doc; "
     "(6124-k*, #6444) the six mutant-killing cells; (6124-b*, design B, vote 6def5ab6) a ledger "
