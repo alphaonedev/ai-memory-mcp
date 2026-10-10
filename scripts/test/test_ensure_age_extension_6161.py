@@ -95,6 +95,13 @@ import os
 os.kill(os.getpid(), {signum})
 """
 
+# Fake psql that prints a fixed text and exits with a fixed code (#6677).
+EXITING_PSQL = """#!{py}
+import sys
+sys.stdout.write("{out}")
+sys.exit({code})
+"""
+
 # Signals the helper does not turn into an interrupt: default-ignored (CHLD, URG, WINCH, INFO, CONT),
 # job control (TSTP, TTIN, TTOU), PIPE (Python ignores it), the synchronous faults (SEGV, BUS, ILL, FPE) and the
 # two nothing can catch (KILL, STOP).  Every other signal valid on this platform must end in `interrupted` (#6504).
@@ -1095,6 +1102,24 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                 before = self.install_snapshot()
                 r = self.run_script()
                 self.assert_fails(r, 1, f"age probe failed: psql exited {128 + int(signum)}")
+                self.assertEqual(self.install_snapshot(), before, "a failed probe must never trigger a restore")
+
+    def test_a_failed_or_garbled_probe_never_reads_as_age_missing_6677(self):
+        # Only "1" (listed) and "0" (not listed) are answers.  A psql that fails, or exits 0 with any other output,
+        # must fail closed with no restore: a restore on a misread answer rewrites a healthy install (#6677, S16).
+        cases = (
+            (2, "", "age probe failed: psql exited 2"),
+            (0, "", "age probe failed: psql printed no 0/1 answer"),
+            (0, "garbage", "age probe failed: psql printed no 0/1 answer"),
+            (0, "2", "age probe failed: psql printed no 0/1 answer"),
+            (0, "1\\n1", "age probe failed: psql printed no 0/1 answer"),
+        )
+        for code, out, message in cases:
+            write_exe(self.psql, EXITING_PSQL.format(py=sys.executable, out=out, code=code))
+            with self.subTest(code=code, out=out):
+                before = self.install_snapshot()
+                r = self.run_script()
+                self.assert_fails(r, 1, message)
                 self.assertEqual(self.install_snapshot(), before, "a failed probe must never trigger a restore")
 
     def install_snapshot(self):
