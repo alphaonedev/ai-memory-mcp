@@ -1620,7 +1620,10 @@ mod tests {
     #[test]
     fn resolve_http_fallback_is_anonymous_req() {
         let id = resolve_http_agent_id(None, None).unwrap();
-        assert!(id.starts_with("anonymous:req-"), "got: {id}");
+        assert!(
+            id.starts_with("anonymous:req-"),
+            "HTTP fallback id must carry the anonymous request-scoped prefix"
+        );
         // Two calls produce distinct request-scoped ids
         let id2 = resolve_http_agent_id(None, None).unwrap();
         assert_ne!(id, id2);
