@@ -217,6 +217,14 @@ NESTED_VALUE = re.compile(r"[\w-]+:\s+(\S.*)")
 # starts a run of value lines that ends at the line with the closing triple quote.
 TRIPLE_OPEN = re.compile(r"(?i)(?<![\w-])(" + CREDENTIAL_NAME + r")(?:[*_]{1,2}|[\"'`])?\s*[:=]\s*[rbuf]{0,2}"
                          r"(\"\"\"|''')(.*)$")
+# Round 6 (#6852): a line over MAX_MASK_LINE is not searched by the name patterns (cost, #6613). It still keeps the wait
+# for a value open when it mentions a credential word anywhere (literal alternatives, linear); a trailing block
+# indicator (with an optional comment) opens a block scalar, an odd number of triple quotes opens a triple quote, and
+# anything else makes the next non-blank line a value line unless it is structure or prose (LONG_LINE_PENDING).
+LONG_LINE_NAME_HINT = re.compile(r"(?i)passw(?:or)?d|passphrase|secret|token|api[_-]?key|access[_-]?key|"
+                                 r"private[_-]?key|credential")
+LONG_LINE_BLOCK_TAIL = re.compile(r"[|>][+-]?[1-9]?[+-]?(?:\s+#.*)?\s*$")
+LONG_LINE_PENDING = "credential"
 MASK = "[MASKED]"
 # #6212: Unicode categories of head text that are escaped before they reach the summary (see printable).
 UNPRINTABLE_CATEGORIES = ("Cc", "Cf", "Cs", "Zl", "Zp")
@@ -505,11 +513,23 @@ def value_line_indexes(lines: list, key_indexes=frozenset()) -> set:
             # value line when a name or a block or a triple quote is waiting for one.
             if pending is not None or triple is not None or (block is not None and indent_width(line) > block):
                 inside.add(index)
-            if triple is not None and triple in line:
+            closed = triple is not None and triple in line
+            if closed:
                 triple = None
             if block is not None and indent_width(line) <= block:
                 block = None
             pending = None
+            if not closed and LONG_LINE_NAME_HINT.search(line):
+                # #6852: the line is hidden whole, but it may carry a credential name anywhere in it, so the lines
+                # after it wait for a value, a block scalar or a triple quote exactly as after a short name line.
+                if block is None and LONG_LINE_BLOCK_TAIL.search(line):
+                    block = indent_width(line)
+                elif line.count('"""') % 2:
+                    triple = '"""'
+                elif line.count("'''") % 2:
+                    triple = "'''"
+                else:
+                    pending = LONG_LINE_PENDING
             continue
         if index in key_indexes:
             pending = None  # round 5 (#6665): the block state stays, a later more-indented line is still a block line
