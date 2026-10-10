@@ -1122,6 +1122,29 @@ def self_test():
         wf_text.replace('"chain/**"]\n', '"chain/**"]\n    branches-ignore: [\'feature/**\']\n', 1), 1,
         "does not trigger on pull_request for chain/promo6-ssh"))
 
+    # #6437: GitHub filters give `?`, `+` and `[...]` meaning; the verifier does not translate them,
+    # so a pattern using one is unsupported and fails closed (a negation written with them was ignored).
+    def br(items):
+        return "on:\n  pull_request:\n    branches: [" + ", ".join(items) + "]\n"
+
+    trigger_cells((
+        ("trigger negation with ?", br(["'chain/**'", "'!chain/a?'"]), "chain/ab", False),
+        ("trigger negation with +", br(["'chain/**'", "'!chain/a+'"]), "chain/a", False),
+        ("trigger negation with a class", br(["'chain/**'", "'!chain/[ab]'"]), "chain/a", False),
+        ("trigger negation with ? (block list)",
+         "on:\n  pull_request:\n    branches:\n      - 'chain/**'\n      - '!chain/a?'\n", "chain/ab", False),
+        ("trigger negation with a class (block list)",
+         "on:\n  pull_request:\n    branches:\n      - 'chain/**'\n      - '!chain/[ab]'\n", "chain/a", False),
+        ("trigger positive ?", br(["'chain/a?'"]), "chain/ab", False),
+        ("trigger positive class", br(["'chain/[a-z]'"]), "chain/a", False),
+        ("trigger ignore with ?",
+         "on:\n  pull_request:\n    branches-ignore: ['chain/a?']\n", "chain/ab", False),
+        ("trigger plain negation excludes", br(["'chain/**'", "'!chain/a'"]), "chain/a", False),
+        ("trigger plain negation keeps others", br(["'chain/**'", "'!chain/a'"]), "chain/b", True)))
+    qneg = wf_text.replace('"chain/**"]\n', '"chain/**", "!chain/promo6-ss?"]\n', 1)
+    check("pre-apply tip whose negation uses ?", lambda: pre_tip(
+        qneg, 1, "does not trigger on pull_request for chain/promo6-ssh"))
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"
