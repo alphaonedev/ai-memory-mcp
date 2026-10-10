@@ -491,13 +491,24 @@ def verify_payload(packages: List[Path], expect: str) -> None:
             raise ProofError(f"{what}: {PACKAGED_PATH} ({got}) is not the binary the strict assert checked ({expect})")
 
 
-def _synthetic_tar(entries: List[Tuple[str, bytes, int, str]]) -> bytes:
+# #6907 fixtures: the control file and rpm header nfpm 2.41.1 writes for nfpm.yaml.
+DEB_CONTROL_FIXTURE = (b"Package: ai-memory\nVersion: 1.0.0\nSection: utils\nPriority: optional\n"
+                       b"Architecture: amd64\nLicense: Apache-2.0\n"
+                       b"Maintainer: AlphaOne LLC <alphaonedev@users.noreply.github.com>\nInstalled-Size: 0\n"
+                       b"Homepage: https://alphaonedev.github.io/ai-memory-mcp/\n"
+                       b"Description: AI-agnostic persistent memory system\n")
+RPM_COMPRESSOR = {"gzip": "gzip", "xz": "xz", "bzip2": "bzip2", "zstd": "zstd"}
+
+
+def _synthetic_tar(entries: List[Tuple[str, bytes, int, str]], uid: int = 0, uname: str = "root") -> bytes:
     """A gzip tar of (name, data, mode, kind) entries; kind is 'f', 'd' or 'l'."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz", format=tarfile.GNU_FORMAT) as tf:
         for name, data, mode, kind in entries:
             info = tarfile.TarInfo(name)
             info.mode = mode
+            info.uid = info.gid = uid
+            info.uname = info.gname = uname
             if kind == "d":
                 info.type = tarfile.DIRTYPE
                 tf.addfile(info)
@@ -511,14 +522,47 @@ def _synthetic_tar(entries: List[Tuple[str, bytes, int, str]]) -> bytes:
     return buf.getvalue()
 
 
+def _rpm_header_bytes(tags: Dict[int, Tuple[int, list]]) -> bytes:
+    """An rpm header structure (magic, index, store) holding ``tags``:
+    tag -> (type, values); type 3 int16, 4 int32, 6 string, 7 bin, 8 string array."""
+    index, store = b"", b""
+    for tag in sorted(tags):
+        typ, vals = tags[tag]
+        if typ == 3:
+            store += b"\x00" * ((-len(store)) % 2)
+            body = b"".join(struct.pack(">H", v) for v in vals)
+        elif typ == 4:
+            store += b"\x00" * ((-len(store)) % 4)
+            body = b"".join(struct.pack(">i", v) for v in vals)
+        elif typ == 7:
+            body = bytes(vals[0])
+        else:
+            body = b"".join(v.encode() + b"\x00" for v in vals)
+        index += struct.pack(">iiii", tag, typ, len(store), len(body) if typ == 7 else len(vals))
+        store += body
+    return b"\x8e\xad\xe8\x01" + b"\x00" * 4 + struct.pack(">II", len(tags), len(store)) + index + store
+
+
 def _synthetic_package(fmt: str, entries: List[Tuple[str, bytes, int, str]], nlink: int = 1,
-                       compress: str = "gzip", data_members: int = 1) -> bytes:
-    """#6907 self-test fixture: a deb (ar + data.tar.gz) or an rpm (lead, empty
-    signature and main headers, compressed newc cpio) holding ``entries``. The
-    format is what nfpm writes; the self-test also runs on real nfpm output."""
+                       compress: str = "gzip", data_members: int = 1,
+                       control: Optional[Dict[str, Optional[bytes]]] = None, uid: int = 0, uname: str = "root",
+                       tags: Optional[Dict[int, Optional[Tuple[int, list]]]] = None,
+                       data_tar: Optional[bytes] = None) -> bytes:
+    """#6907 self-test fixture: a deb (ar of debian-binary, control.tar.gz and
+    data.tar.gz) or an rpm (lead, signature header, main header with nfpm's file
+    and payload tags, compressed newc cpio) holding ``entries``. ``control``
+    adds / replaces (None removes) control.tar members, ``tags`` main-header
+    tags; ``data_tar`` replaces the deb data member. The layout is what nfpm
+    writes; the self-test also runs on real nfpm output."""
+    regular = [(n, d, m) for n, d, m, k in entries if k == "f"]
     if fmt == "deb":
-        members = [("debian-binary", b"2.0\n"), ("control.tar.gz", _synthetic_tar([("./control", b"x\n", 0o644, "f")]))]
-        members += [("data.tar.gz", _synthetic_tar(entries))] * data_members
+        sums = b"".join(hashlib.md5(d).hexdigest().encode() + b"  " + n.encode() + b"\n"  # noqa: S324 (dpkg md5sums)
+                        for n, d, _ in regular)
+        ctl: Dict[str, Optional[bytes]] = {"./control": DEB_CONTROL_FIXTURE, "./md5sums": sums, "./conffiles": b"\n"}
+        ctl.update(control or {})
+        ctl_tar = _synthetic_tar([(n, b, 0o644, "f") for n, b in ctl.items() if b is not None], 0, "")
+        data = data_tar if data_tar is not None else _synthetic_tar(entries, uid, uname)
+        members = [("debian-binary", b"2.0\n"), ("control.tar.gz", ctl_tar)] + [("data.tar.gz", data)] * data_members
         out = b"!<arch>\n"
         for name, body in members:
             out += b"%-16s%-12s%-6s%-6s%-8s%-10d`\n" % (name.encode(), b"0", b"0", b"0", b"100644", len(body))
@@ -529,14 +573,45 @@ def _synthetic_package(fmt: str, entries: List[Tuple[str, bytes, int, str]], nli
     for name, data, mode, kind in entries + [("TRAILER!!!", b"", 0, "t")]:
         ftype = {"f": stat.S_IFREG, "d": stat.S_IFDIR, "l": stat.S_IFLNK, "t": 0}[kind]
         nm = name.encode() + b"\x00"
-        fields = [ino, ftype | mode, 0, 0, nlink if kind == "f" else 1, 0, len(data), 0, 0, 0, 0, len(nm), 0]
+        fields = [ino, ftype | mode, uid, uid, nlink if kind == "f" else 1, 0, len(data), 0, 0, 0, 0, len(nm), 0]
         hdr = b"070701" + b"".join(b"%08X" % v for v in fields) + nm
         cpio += hdr + b"\x00" * ((-len(hdr)) % 4) + data + b"\x00" * ((-len(data)) % 4)
         ino += 1
     payload = {"gzip": gzip.compress, "xz": lzma.compress, "bzip2": bz2.compress,
                "zstd": lambda b: b"\x28\xb5\x2f\xfd" + b}[compress](cpio)
-    empty_header = b"\x8e\xad\xe8\x01" + b"\x00" * 4 + struct.pack(">II", 0, 0)
-    return b"\xed\xab\xee\xdb" + b"\x00" * 92 + empty_header + empty_header + payload
+    listed = [(n, d, m, k) for n, d, m, k in entries if k in ("f", "l")]
+    paths = ["/" + n.lstrip(".").lstrip("/") for n, _, _, _ in listed]
+    dirnames = sorted({q.rsplit("/", 1)[0] + "/" for q in paths})
+    main: Dict[int, Tuple[int, list]] = {
+        1000: (6, ["ai-memory"]), 1001: (6, ["1.0.0"]), 1002: (6, ["1"]), 1004: (6, ["ai-memory"]),
+        1006: (4, [1700000000]), 1022: (6, ["x86_64"]),
+        1028: (4, [len(d) for _, d, _, _ in listed]),
+        1030: (3, [({"f": stat.S_IFREG, "l": stat.S_IFLNK}[k]) | m for _, _, m, k in listed]),
+        1034: (4, [1700000000] * len(listed)),
+        1035: (8, [hashlib.sha256(d).hexdigest() if k == "f" else "" for _, d, _, k in listed]),
+        1036: (8, [d.decode() if k == "l" else "" for _, d, _, k in listed]),
+        1037: (4, [0] * len(listed)), 1039: (8, ["root"] * len(listed)), 1040: (8, ["root"] * len(listed)),
+        1116: (4, [dirnames.index(q.rsplit("/", 1)[0] + "/") for q in paths]),
+        1117: (8, [q.rsplit("/", 1)[1] for q in paths]), 1118: (8, dirnames),
+        1124: (6, ["cpio"]), 1125: (6, [RPM_COMPRESSOR[compress]]), 1126: (6, ["9"]),
+        5011: (4, [8]), 5092: (8, [hashlib.sha256(payload).hexdigest()]), 5093: (4, [8]),
+    }
+    for tag, val in (tags or {}).items():
+        if val is None:
+            main.pop(tag, None)
+        else:
+            main[tag] = val
+    sig = _rpm_header_bytes({1000: (4, [0])})
+    sig += b"\x00" * ((-len(sig)) % 8)
+    return b"\xed\xab\xee\xdb" + b"\x00" * 92 + sig + _rpm_header_bytes(main) + payload
+
+
+def _gz_tar(build) -> bytes:
+    """gzip of the raw tar ``build(tarfile)`` writes (a fixture with a pax header or a corrupt member)."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w", format=tarfile.PAX_FORMAT) as tf:
+        build(tf)
+    return gzip.compress(buf.getvalue())
 
 
 def _self_test_6907(tmp: Path) -> List[str]:
@@ -573,6 +648,69 @@ def _self_test_6907(tmp: Path) -> List[str]:
     payload("6907 rpm binary with two links is refused", False, "rpm", dirs + [bin_entry], nlink=2)
     payload("6907 rpm xz payload holding the binary passes", True, "rpm", dirs + [bin_entry], compress="xz")
     payload("6907 rpm zstd payload is refused, not guessed", False, "rpm", dirs + [bin_entry], compress="zstd")
+    # Class (a): an archive member or metadata the package manager acts on that
+    # the payload check never looked at (maintainer scripts, dependencies,
+    # conffiles, directories, ownership, file capabilities).
+    ctl = DEB_CONTROL_FIXTURE
+    payload("6907a deb with a postinst maintainer script is refused", False, "deb", dirs + [bin_entry],
+            control={"./postinst": b"#!/bin/sh\nexit 0\n"})
+    payload("6907a deb control declaring Pre-Depends is refused", False, "deb", dirs + [bin_entry],
+            control={"./control": ctl + b"Pre-Depends: other\n"})
+    payload("6907a deb control naming another package is refused", False, "deb", dirs + [bin_entry],
+            control={"./control": ctl.replace(b"Package: ai-memory", b"Package: libc6")})
+    payload("6907a deb marking the binary a conffile is refused", False, "deb", dirs + [bin_entry],
+            control={"./conffiles": b"/usr/bin/ai-memory\n"})
+    payload("6907a deb md5sums of other bytes is refused", False, "deb", dirs + [bin_entry],
+            control={"./md5sums": hashlib.md5(evil).hexdigest().encode() + b"  ./usr/bin/ai-memory\n"})  # noqa: S324
+    payload("6907a deb creating another directory is refused", False, "deb",
+            dirs + [("./etc/", b"", 0o755, "d"), ("./etc/cron.d/", b"", 0o777, "d"), bin_entry])
+    payload("6907a deb binary owned by a non-root uid is refused", False, "deb", dirs + [bin_entry], uid=1000)
+    payload("6907a rpm with a %post scriptlet is refused", False, "rpm", dirs + [bin_entry],
+            tags={1024: (6, ["exit 0"]), 1086: (6, ["/bin/sh"])})
+    payload("6907a rpm requiring another package is refused", False, "rpm", dirs + [bin_entry],
+            tags={1048: (4, [0]), 1049: (8, ["other"]), 1050: (8, [""])})
+    payload("6907a rpm granting a file capability is refused", False, "rpm", dirs + [bin_entry],
+            tags={5010: (8, ["cap_setuid=ep"])})
+    # Class (b): two readers of the same bytes that disagree. rpm installs from
+    # its header (file list, modes, owners, digests), dpkg resolves owners by
+    # name and honours tar extension headers its own way; the check must read
+    # the same thing the installer acts on, or refuse.
+    payload("6907b rpm header mode 04755 over a 0755 cpio entry is refused", False, "rpm", dirs + [bin_entry],
+            tags={1030: (3, [stat.S_IFREG | 0o4755])})
+    payload("6907b rpm header naming another file is refused", False, "rpm", dirs + [bin_entry],
+            tags={1117: (8, ["other"])})
+    payload("6907b rpm header digest of other bytes is refused", False, "rpm", dirs + [bin_entry],
+            tags={1035: (8, [hashlib.sha256(evil).hexdigest()])})
+    payload("6907b rpm header owner not root is refused", False, "rpm", dirs + [bin_entry],
+            tags={1039: (8, ["nobody"])})
+    payload("6907b rpm payload digest of other bytes is refused", False, "rpm", dirs + [bin_entry],
+            tags={5092: (8, [hashlib.sha256(evil).hexdigest()])})
+    payload("6907b deb binary owner name not root is refused", False, "deb", dirs + [bin_entry], uname="www-data")
+
+    def pax_rename(tf: tarfile.TarFile) -> None:
+        info = tarfile.TarInfo("./usr/bin/other")
+        info.size, info.mode = len(good), 0o755
+        info.pax_headers = {"path": "./usr/bin/ai-memory"}
+        tf.addfile(info, io.BytesIO(good))
+
+    def corrupt_tail(tf: tarfile.TarFile) -> None:
+        info = tarfile.TarInfo("./usr/bin/ai-memory")
+        info.size, info.mode = len(good), 0o755
+        tf.addfile(info, io.BytesIO(good))
+        hidden = io.BytesIO()
+        with tarfile.open(fileobj=hidden, mode="w", format=tarfile.GNU_FORMAT) as h:
+            extra = tarfile.TarInfo("./etc/hidden")
+            extra.size, extra.mode = len(evil), 0o644
+            h.addfile(extra, io.BytesIO(evil))
+        raw = bytearray(hidden.getvalue()[:1024])
+        raw[148:156] = b"0000000\x00"
+        tf.fileobj.write(bytes(raw))
+        tf.offset += len(raw)
+
+    payload("6907b deb pax header renaming a member is refused", False, "deb", dirs + [bin_entry],
+            data_tar=_gz_tar(pax_rename))
+    payload("6907b deb member past a corrupt tar header is refused", False, "deb", dirs + [bin_entry],
+            data_tar=_gz_tar(corrupt_tail))
     junk = d / "junk.rpm"
     junk.write_bytes(b"\xed\xab\xee\xdb" + b"\x00" * 10)
     for name, call in (("6907 a truncated rpm is refused", lambda: verify_payload([junk], want)),

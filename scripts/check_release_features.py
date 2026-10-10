@@ -626,6 +626,34 @@ NFPM_STEP_RUN = (
     PACK_BIND,
     PAYLOAD_CHECK,
 )
+# The checksum sweep of the release job (#2449, #6502).
+SWEEP_RUN = (
+    "set -euo pipefail",
+    "cd dist",
+    "emitted=0",
+    "for f in *; do",
+    '  [ -f "$f" ] || continue',
+    '  case "$f" in',
+    "    *.sha256)          continue ;;",
+    '    ai-memory)         rm -f -- "$f"; echo "::notice::removed the non-arch-qualified \'$f\' from dist (collides across matrix legs; the tarball and deb/rpm carry it)"; continue ;;',
+    "  esac",
+    "  if command -v sha256sum >/dev/null 2>&1; then",
+    '    sha256sum "$f" > "$f.sha256"',
+    "  else",
+    '    shasum -a 256 "$f" > "$f.sha256"',
+    "  fi",
+    "  emitted=$((emitted + 1))",
+    "done",
+    "# Fail loudly rather than publishing a release with no checksums:",
+    "# a sweep that silently emitted nothing would be the exact",
+    '# "reports success when it did nothing" defect #2449 is about.',
+    'if [ "$emitted" -eq 0 ]; then',
+    '  echo "::error::checksum sweep produced nothing - refusing to publish unverifiable artifacts"',
+    "  exit 1",
+    "fi",
+    'echo "checksummed ${emitted} artifact(s)"',
+    "ls -la",
+)
 RELEASE_STEPS: List[Spec] = [
     {"uses": CHECKOUT_USES, "with": {"ref": "${{ needs.preflight.outputs.sha }}"}},
     dict(EPOCH_STEP),
@@ -638,33 +666,7 @@ RELEASE_STEPS: List[Spec] = [
      "env": dict(_TAG_ENV, SOURCE_DATE_EPOCH=EPOCH_REF, ASSERTED_SHA256="${{ steps.assert.outputs.sha256 }}",
                  PREFLIGHT_SHA="${{ needs.preflight.outputs.sha }}"),
      "run": Block(NFPM_STEP_RUN)},
-    {"name": "Checksum every release artifact", "shell": "bash", "run": Block((
-        "set -euo pipefail",
-        "cd dist",
-        "emitted=0",
-        "for f in *; do",
-        '  [ -f "$f" ] || continue',
-        '  case "$f" in',
-        "    *.sha256)          continue ;;",
-        '    ai-memory)         rm -f -- "$f"; echo "::notice::removed the non-arch-qualified \'$f\' from dist (collides across matrix legs; the tarball and deb/rpm carry it)"; continue ;;',
-        "  esac",
-        "  if command -v sha256sum >/dev/null 2>&1; then",
-        '    sha256sum "$f" > "$f.sha256"',
-        "  else",
-        '    shasum -a 256 "$f" > "$f.sha256"',
-        "  fi",
-        "  emitted=$((emitted + 1))",
-        "done",
-        "# Fail loudly rather than publishing a release with no checksums:",
-        "# a sweep that silently emitted nothing would be the exact",
-        '# "reports success when it did nothing" defect #2449 is about.',
-        'if [ "$emitted" -eq 0 ]; then',
-        '  echo "::error::checksum sweep produced nothing - refusing to publish unverifiable artifacts"',
-        "  exit 1",
-        "fi",
-        'echo "checksummed ${emitted} artifact(s)"',
-        "ls -la",
-    ))},
+    {"name": "Checksum every release artifact", "shell": "bash", "run": Block(SWEEP_RUN)},
     {"name": "Upload release artifact", "uses": UPLOAD_ARTIFACT_USES,
      "with": {"name": "ai-memory-${{ matrix.target }}", "path": "dist/ai-memory*"}},
     {"name": "Attest build provenance (release binaries + packages)", "if": "github.event.inputs.dry_run == 'false'",
@@ -4473,6 +4475,9 @@ PACKAGE_FORMS: Dict[str, Tuple[Dict[str, str], str, str]] = {
                   "print(hashlib.sha256(open(p, 'rb').read()).hexdigest() + '  ' + p)\n"
                   "open(p, 'wb').write(b'evil\\n') if 'dist/' in p else None\n"}, "true", "true"),
     "dist binary rewritten before nfpm": ({}, "true", 'printf "evil\\n" > dist/ai-memory'),
+    # #6907 class (a): a file an earlier step (or the checked-out tree) left in
+    # dist/ is checksummed, attested and uploaded by the `dist/ai-memory*` globs.
+    "unchecked file planted in dist": ({}, "true", 'printf "evil\\n" > dist/ai-memory-installer.sh'),
 }
 
 
@@ -4524,13 +4529,18 @@ def package_runtime(root: Path, base: Path, payload: bytes) -> int:
             rcs.append(run(["set -euo pipefail"] + list(WF_PACKAGE), env))
         if rcs[-1] == 0:
             rcs.append(run(["set -euo pipefail", between] + tail, env))
+        if rcs[-1] == 0:
+            rcs.append(run(list(SWEEP_RUN), env))
         shipped = []
         tgz = repo / "dist" / "ai-memory-x.tar.gz"
         if tgz.is_file():
             with tarfile.open(tgz) as tf:
                 shipped += [(m.name, (tf.extractfile(m) or io.BytesIO()).read()) for m in tf.getmembers() if m.isfile()]
         shipped += [(p.name, p.read_bytes()) for p in sorted(repo.glob("nfpm-saw-*"))]
-        complete = len(rcs) == 3 and all(rc == 0 for rc in rcs)
+        # Whatever else the `dist/ai-memory*` upload glob would publish ships as is.
+        shipped += [(p.name, p.read_bytes()) for p in sorted((repo / "dist").glob("ai-memory*"))
+                    if p.is_file() and p != tgz and not p.name.endswith((".sha256", ".deb", ".rpm"))]
+        complete = len(rcs) == 4 and all(rc == 0 for rc in rcs)
         if form == "control":
             if not complete or asserted != want or [n for n, _ in shipped] != ["ai-memory", "nfpm-saw-deb", "nfpm-saw-rpm"] \
                     or any(b != payload for _, b in shipped):
