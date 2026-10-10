@@ -21,9 +21,12 @@ the carrier declaration must contain every release-required context
 
 Live: every ACTIVE branch ruleset that carries a required_status_checks rule
 and covers a carrier ref, or that has the payload's name, is a CANDIDATE and is
-judged in full against the payload (include, exclude == [], bypass_actors == [],
-strict, do_not_enforce_on_create, the exact context set, integration_id). The
-carriers are protected only when a candidate matches.
+judged in full against the payload (name == payload name, include == exactly the
+two carrier patterns, exclude == [], bypass_actors == [], the payload's exact rule
+types, strict, do_not_enforce_on_create, the exact context set with no repeated
+context, integration_id). A wider ruleset, another name or two matching rulesets
+never match, so the printed id is never a wrong PUT target (#6436). The carriers
+are protected only when a candidate matches.
 
 State machine (5-agent vote (4d3ea1c5), memory a03dd15d). The state file must
 name tracking issue TRACKING_ISSUE (#6182) and no other, and the state is
@@ -245,12 +248,19 @@ def judge_one(rs, payload, require_full_view):
     rid = f"ruleset {rs.get('id')} ({rs.get('name')!r})"
     reasons, warnings = [], []
     ref = (rs.get("conditions") or {}).get("ref_name") or {}
-    include = ref.get("include") or []
-    missing_pat = [p for p in REQUIRED_PATTERNS if p not in include and "~ALL" not in include]
+    if rs.get("name") != payload.get("name"):
+        reasons.append(f"{rid}: name must be {payload.get('name')!r}: only the ruleset of that name "
+                       "is ever the PUT target (5-agent vote (4d3ea1c5), #6436)")
+    include = ref.get("include")
+    include = include if isinstance(include, list) else []
+    missing_pat = [p for p in REQUIRED_PATTERNS if p not in include]
     if missing_pat:
         reasons.append(f"{rid}: include lacks {missing_pat}")
-    if ref.get("exclude"):
-        reasons.append(f"{rid}: exclude must be empty, has {ref.get('exclude')}")
+    if sorted(map(repr, include)) != sorted(map(repr, REQUIRED_PATTERNS)):
+        reasons.append(f"{rid}: include must be exactly {list(REQUIRED_PATTERNS)} (no ~ALL, "
+                       f"~DEFAULT_BRANCH, other pattern or repeat), has {include!r}")
+    if ref.get("exclude") != []:
+        reasons.append(f"{rid}: exclude must be empty, has {ref.get('exclude')!r}")
     if "bypass_actors" not in rs:
         msg = f"{rid}: bypass_actors UNVERIFIED (field hidden from this token; rerun with an admin token)"
         (reasons if require_full_view else warnings).append(msg)
@@ -260,6 +270,10 @@ def judge_one(rs, payload, require_full_view):
     if not rules:
         reasons.append(f"{rid}: no required_status_checks rule")
         return reasons, warnings
+    have_types = sorted(str(r.get("type")) for r in rs.get("rules") or [])
+    want_types = sorted(str(r.get("type")) for r in payload.get("rules") or [])
+    if have_types != want_types:
+        reasons.append(f"{rid}: rule types must be exactly {want_types}, has {have_types}")
     want = {c["context"]: c.get("integration_id") for c in
             rsc_rules(payload)[0]["parameters"]["required_status_checks"]}
     for rule in rules:
@@ -270,6 +284,8 @@ def judge_one(rs, payload, require_full_view):
                 sub.append(f"{rid}: {key} is not true")
         have = {}
         for c in params.get("required_status_checks") or []:
+            if c.get("context") in have:
+                sub.append(f"{rid}: duplicate required context {c.get('context')!r}")
             have[c.get("context")] = c.get("integration_id")
         if set(have) != set(want):
             sub.append(f"{rid}: required contexts drift: missing {sorted(set(want) - set(have))}, "
@@ -308,6 +324,10 @@ def verify(payload, carrier_decl, release_decl, ledger, state, rulesets, issue_s
             drift.extend(rs_reasons)
         else:
             matched.append(rs)
+    if len(matched) > 1:
+        drift.append(f"ambiguous: {len(matched)} rulesets named {payload.get('name')!r} match "
+                     f"(ids {[m.get('id') for m in matched]}); the PUT target must be unique")
+        matched = []
     if st == "applied":
         if matched:
             lines.append(f"OK: {ruleset_label(matched[0])} is live and matches")

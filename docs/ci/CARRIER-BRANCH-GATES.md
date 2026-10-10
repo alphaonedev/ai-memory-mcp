@@ -76,8 +76,14 @@ python3 -I scripts/check_carrier_ruleset_live.py --require-full-view
   matches; flip carrier-ruleset-state.json to "applied"`. The promotion (step 3
   below) flips the state and promotes the verifier job.
 - The ruleset `<id>` for the later `PUT` is the `id` field of the POST
-  response, and the same id is printed in the verifier's flip line (and in its
-  `OK: carrier ruleset <id> ...` line once the state is `applied`).
+  response, confirmed before use by `gh api repos/alphaonedev/ai-memory-mcp/rulesets/<id>`
+  showing `name == carrier-branches-strict-checks`. It is never taken from a CI
+  log: under `pull_request` the log line comes from the pull request's own copy
+  of the verifier (the #6140 class). The verifier names a ruleset as a match, and
+  so as a `PUT` target, only when it carries the payload name, exactly the two
+  include patterns (no `~ALL`, `~DEFAULT_BRANCH` or other pattern), exactly the
+  payload's rule types and no repeated context; two matching rulesets are
+  reported as ambiguous (#6436).
 
 Effects to expect once the ruleset is live:
 
@@ -173,8 +179,12 @@ The state is coupled to the promotion of the verifier's own context,
       release tip is read), then updates the live ruleset from the promotion
       pull request's payload:
       `gh api -X PUT repos/alphaonedev/ai-memory-mcp/rulesets/<id> --input docs/ci/carrier-ruleset.json`,
-      where `<id>` is the `id` field of the POST response or the id in the
-      verifier's flip line.
+      where `<id>` is the `id` field of the POST response, cross-checked
+      against the id of a verifier run made locally from the landed tree and
+      confirmed with `gh api repos/alphaonedev/ai-memory-mcp/rulesets/<id>`
+      showing `name == carrier-branches-strict-checks` immediately before the
+      `PUT` (the `PUT` replaces the whole ruleset body, so a wrong id would
+      narrow some other ruleset; never take the id from a CI log, #6436).
    3. Re-run the promotion pull request's checks. Its verifier is now green
       (`OK`), and it merges.
 
