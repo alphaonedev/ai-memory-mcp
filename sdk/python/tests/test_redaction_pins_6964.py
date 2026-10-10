@@ -62,11 +62,21 @@ def test_a_key_split_across_two_writes_is_redacted():  # R35
     assert hx not in out
 
 
-def test_a_key_at_the_very_end_of_the_output_is_redacted():  # R41
+def test_a_key_at_the_very_end_of_the_output_is_redacted():
+    # Not an R41 killer (#7065): every output here is already redacted before the final flush.
     h = _h()
     hx = KEY.hex()
     out = _run(h, f"import sys; sys.stdout.write({hx!r})", [KEY])
     assert hx not in out
+
+
+def test_the_final_decoder_flush_is_redacted():  # R41 (#7065)
+    """The final decode can add U+FFFD; a form that ends in it matches only after that flush."""
+    h = _h()
+    secret = b"0123456789A\xef\xbf\xbd"  # 14 bytes, valid UTF-8, ends in U+FFFD
+    out = _run(h, "import sys; sys.stdout.buffer.write(b'0123456789A\\xef'); sys.stdout.flush()", [secret])
+    assert secret.decode("utf-8") not in out
+    assert "\ufffd" not in out
 
 
 SHORT = b"Zk3!pQ9x"  # 8 bytes: long enough to be a secret, too short for a 12-character window
