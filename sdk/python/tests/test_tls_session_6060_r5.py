@@ -910,6 +910,39 @@ def test_fifo_entry_in_a_ca_directory_is_refused_without_blocking_6377(
         client_cls(base_url=_ORIGIN, verify=str(directory))
 
 
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_ca_directory_read_is_the_one_whose_mode_was_checked_6377(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+) -> None:
+    # verify= names a symlink to a checked 0755 directory. The link is moved to
+    # a sticky shared directory holding the anchor after the mode check and
+    # before the directory is listed: the SDK must list the directory it
+    # resolved and checked, never what the name points at later.
+    _clear_proxy_env(monkeypatch)
+    checked = _ca_dir(tmp_path, "checked", 0o755)
+    swapped = _ca_dir(tmp_path, "swapped", 0o755)
+    _add_anchor(swapped, lab.ca_path)
+    swapped.chmod(0o1777)
+    link = tmp_path / "ca-link"
+    link.symlink_to(checked)
+    listdir = os.listdir
+
+    def retarget_then_list(target: Any = ".") -> list[str]:
+        if link.resolve() == checked.resolve():
+            link.unlink()
+            link.symlink_to(swapped)
+        return listdir(target)
+
+    monkeypatch.setattr(os, "listdir", retarget_then_list)
+    assert _get_once(client_cls, origin.url, str(link)) is httpx.ConnectError
+    assert origin.hits == []
+
+
 # ---- #6360: the response backstop refuses on its own -----------------------
 
 
