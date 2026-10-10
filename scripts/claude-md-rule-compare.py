@@ -256,6 +256,11 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
     for sha in (base_sha, head_sha):
         if not SHA.fullmatch(sha):
             raise RuntimeError(f"{sha!r} is not a 40-hex commit id")
+    # #6573: a shallow boundary at the base hides that an old commit is an ancestor of it, so base..head would count
+    # that commit's earlier approval for this change. Anything but a plain `false` (a git too old to know the
+    # option echoes it back) is refused.
+    if git(repo, "rev-parse", "--is-shallow-repository").decode().strip() != "false":
+        raise RuntimeError("the repository is shallow (or git cannot say); the comparison needs full history (#6573)")
     guard = load_base_guard(base_root)
     head_root = scratch / "head"
     if head_root.exists():
