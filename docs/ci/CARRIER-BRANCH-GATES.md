@@ -352,5 +352,13 @@ verifier fails otherwise), and the live carrier ruleset updated with the
   these two jobs before their verdict is load-bearing.
 - The freshness gate cannot close the window between job completion and the
   merge click. Only the ruleset's strict up-to-date rule can.
+- The workflow pins are read through one fail-closed YAML-subset reader
+  (`scripts/workflow_yaml_subset.py`, shared with the #5447 trigger test), not
+  by regex (#6481, #6482, #6542, #6543, #6545). A construct the reader does not
+  model (anchor, alias, `<<:`, tab, `---`, duplicate key, BOM, U+2028, NEL)
+  makes the gate exit non-zero and name the construct and the line. The pins
+  cover workflow-level `env`, `defaults` and `permissions`, `needs`, flow-style
+  and quoted keys, trigger respellings, and the triggers `pull_request_target`,
+  `workflow_run` and `workflow_call`.
 - A run with the Actions token cannot prove `bypass_actors` is empty; the
   admin verification in step 2 above is the evidence for that field.

@@ -7,10 +7,13 @@ The reader was written for scripts/test/test_workflow_pr_triggers_5447.py (#5447
 was differential-tested against PyYAML 6.0.1 yaml.SafeLoader (see that file's docstring for
 the grammar and the differential runs).  It lives here so the verifier
 scripts/check_carrier_ruleset_live.py reads workflow files with the SAME grammar instead of
-regular expressions (#6481, #6482): a construct the reader does not model raises
-``Unparsed`` and the caller fails closed.  The functions from ``Unparsed`` to
-``_check_top_level`` are moved from the test unchanged, except that ``_meaningful`` takes an
-optional ``detail`` list (one record per row, for the tree reader below).
+regular expressions (#6481, #6482, #6542, #6543, #6545): a construct the reader does not model
+(anchor, alias, merge key, tab, a second document, a duplicate key, BOM, NEL and the other
+exotic line breaks, a quoted key below the top level, a flow collection that does not close on
+its row) raises ``Unparsed`` and the caller fails closed.  ``parse_workflow`` prefixes the
+message with ``line N:``.  The functions from ``Unparsed`` to ``_check_top_level`` are moved
+from the test unchanged, except that ``_meaningful`` takes an optional ``detail`` list (one
+record per row) that the tree reader at the end of this file uses.
 
 The reader is the Python standard library only; no PyYAML is imported.
 """
@@ -341,7 +344,14 @@ def _nest(stack: List[Tuple[int, str]], opened: Optional[int], ind: int, kind: s
         raise Unparsed("row is of the other kind than its block (key row or sequence entry): " + repr(raw))
 
 
-def _meaningful(text: str) -> List[Tuple[int, str, str]]:
+def _row_value(body: str, key: str, node: int) -> str:
+    """The value text of a structure row: after ``key:`` for a key row, after ``-`` for an entry."""
+    if key:
+        return body[node + len(key):].lstrip(" ")[1:].strip(" ")
+    return body[node + 1:].strip(" ")
+
+
+def _meaningful(text: str, detail: Optional[list] = None) -> List[Tuple[int, str, str]]:
     """(indent, row text, mapping key or '') per structure row; closed world (#5660, #5705).
 
     Every line must be accepted by a positive rule: a blank line, a comment line, a
@@ -351,6 +361,9 @@ def _meaningful(text: str) -> List[Tuple[int, str, str]]:
     row (which _check_top_level accepts only as one leading ``---``), or a
     structure row that _scan_row accepts. A structure row starts with printable
     ASCII after ASCII-space indentation and holds no tab.
+
+    When ``detail`` is a list, one record ``(line number, indent, node column, dash
+    columns, value text)`` is appended per row, in step with the returned rows (#6481).
     """
     if re.search(r"\r(?!\n)", text):
         raise Unparsed("lone carriage return line break")
@@ -366,7 +379,7 @@ def _meaningful(text: str) -> List[Tuple[int, str, str]]:
     blank = 0  # spaces on its longest blank line before that first line (#5750)
     stack: List[Tuple[int, str]] = []  # open block collections (#5730)
     opened: Optional[int] = None  # column of the node above whose value is empty
-    for raw in text.split("\n"):
+    for lineno, raw in enumerate(text.split("\n"), 1):
         if raw.endswith("\r"):
             raw = raw[:-1]
         ind = _indent(raw)
@@ -399,6 +412,8 @@ def _meaningful(text: str) -> List[Tuple[int, str, str]]:
             continue
         if ind == 0 and _strip_comment(rest) in ("---", "..."):
             rows.append((0, _strip_comment(rest), ""))
+            if detail is not None:
+                detail.append((lineno, 0, 0, [], _strip_comment(rest)))
             continue
         body, key, node, header, dashes, empty = _scan_row(rest)
         _nest(stack, opened, ind, "seq" if dashes and dashes[0] == 0 else "map", raw)
@@ -410,6 +425,8 @@ def _meaningful(text: str) -> List[Tuple[int, str, str]]:
         if key[:1] in ("'", '"') and ind > 0:
             raise Unparsed("quoted mapping key below the top level (#5731): " + repr(raw))
         rows.append((ind, body, key))
+        if detail is not None:
+            detail.append((lineno, ind, node, dashes, _row_value(body, key, node)))
         if header:
             owner, content, blank = ind + node, None, 0
     return rows
@@ -451,3 +468,157 @@ def _check_top_level(rows: List[Tuple[int, str, str]]) -> None:
         if name in seen:
             raise Unparsed("repeated top-level key (#5667): " + body)
         seen.add(name)
+
+
+# ---------------------------------------------------------------------------------------------
+# Tree reader (#6481, #6482, #6542, #6545).  It adds no grammar: every row has already been
+# accepted by ``_meaningful`` and ``_check_top_level``; the tree only records which row sits
+# under which key, by column, the way ``_nest`` already guarantees is unambiguous.
+# ---------------------------------------------------------------------------------------------
+
+
+class Node:
+    """One mapping key (kind ``key``), sequence entry (``item``) or the document (``root``)."""
+
+    __slots__ = ("kind", "name", "value", "line", "end", "col", "children", "block")
+
+    def __init__(self, kind: str, name: str, value: str, line: int, col: int) -> None:
+        self.kind = kind
+        self.name = name  # the key as written (a quoted top-level ``on`` keeps its quotes)
+        self.value = value  # the value text after the colon or the dash, comment removed
+        self.line = line  # 1-based line of the row that opens the node
+        self.end = line  # 1-based last line that belongs to the node
+        self.col = col
+        self.children: List["Node"] = []
+        # (first, last) 1-based lines of this node's block-scalar content, or None.  A ``#`` in
+        # such a line is text, not a comment, so a scan must not strip it (a ``${{ }}`` there is
+        # expanded before the shell runs).
+        self.block: Optional[Tuple[int, int]] = None
+
+    def keys(self) -> List["Node"]:
+        return [c for c in self.children if c.kind == "key"]
+
+    def items(self) -> List["Node"]:
+        return [c for c in self.children if c.kind == "item"]
+
+    def get(self, name: str) -> Optional["Node"]:
+        """The child key written exactly ``name`` (keys are unique among siblings)."""
+        for child in self.children:
+            if child.kind == "key" and child.name == name:
+                return child
+        return None
+
+    def walk(self):
+        """This node and every descendant, in document order."""
+        yield self
+        for child in self.children:
+            yield from child.walk()
+
+
+def _text_failure_line(text: str) -> Optional[int]:
+    """Line of the first character the whole-stream checks of ``_meaningful`` refuse, or None."""
+    lone = re.search(r"\r(?!\n)", text)
+    exotic = next((i for i, ch in enumerate(text) if ch in _EXOTIC_BREAKS), None)
+    bad = _FORBIDDEN.search(text)
+    hits = [m for m in (lone.start() if lone else None, exotic, bad.start() if bad else None) if m is not None]
+    return text.count("\n", 0, min(hits)) + 1 if hits else None
+
+
+def _failing_line(text: str) -> int:
+    """1-based line on which ``_meaningful`` or ``_check_top_level`` first refuses ``text``."""
+    at = _text_failure_line(text)
+    if at is not None:
+        return at
+    lines = text.split("\n")
+    lo, hi = 1, len(lines)
+    try:
+        _meaningful(text)
+    except Unparsed:
+        while lo < hi:  # smallest prefix that is refused; the refusal is deterministic per row
+            mid = (lo + hi) // 2
+            try:
+                _meaningful("\n".join(lines[:mid]))
+                lo = mid + 1
+            except Unparsed:
+                hi = mid
+        return lo
+    detail: list = []
+    rows = _meaningful(text, detail)
+    lo, hi = 1, len(rows)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        try:
+            _check_top_level(rows[:mid])
+            lo = mid + 1
+        except Unparsed:
+            hi = mid
+    return detail[lo - 1][0] if detail else 1
+
+
+def key_name(raw: str) -> str:
+    """A mapping key without its quotes (only a top-level ``on`` can be quoted)."""
+    return _unquote(raw)
+
+
+def parse_workflow(text: str) -> Node:
+    """The document as a tree.  Raises ``Unparsed("line N: ...")`` on anything not modelled.
+
+    No BOM is stripped (a BOM is refused, #6543); a second document, a duplicate key at any
+    level, an alias, an anchor, a merge key, a tab and a quoted key below the top level are
+    all refused by the reader or here.
+    """
+    detail: list = []
+    try:
+        rows = _meaningful(text, detail)
+        _check_top_level(rows)
+    except Unparsed as exc:
+        raise Unparsed("line %d: %s" % (_failing_line(text), exc)) from None
+    total = text.count("\n") + 1
+    root = Node("root", "", "", 0, -1)
+    stack: List[Node] = [root]
+
+    def push(node: Node) -> None:
+        while stack[-1].col >= node.col:
+            done = stack.pop()
+            done.end = max(done.line, node.line - 1)
+        parent = stack[-1]
+        if node.kind == "key":
+            for sibling in parent.children:
+                if sibling.kind == "key" and key_name(sibling.name).casefold() == key_name(node.name).casefold():
+                    raise Unparsed("line %d: repeated mapping key %r (first on line %d)"
+                                   % (node.line, node.name, sibling.line))
+        parent.children.append(node)
+        stack.append(node)
+
+    for (ind, _body, key), (lineno, _ind, node_col, dashes, value) in zip(rows, detail):
+        if ind == 0 and not key and _body == "---":
+            continue
+        for d in dashes:
+            push(Node("item", "", value if (not key and d == dashes[-1]) else "", lineno, ind + d))
+        if key:
+            push(Node("key", key, value, lineno, ind + node_col))
+    for node in stack[1:]:
+        node.end = total
+    root.end = total
+    row_lines = [d[0] for d in detail]
+    lines = text.split("\n")
+    for node in root.walk():
+        if node.kind == "root" or not node.value or node.value[0] not in "|>":
+            continue
+        later = [n for n in row_lines if n > node.line]
+        last = (later[0] - 1) if later else total
+        while last > node.line and (not lines[last - 1].strip(" ")
+                                    or len(lines[last - 1]) - len(lines[last - 1].lstrip(" ")) <= node.col):
+            last -= 1  # trailing blank or less-indented comment lines are not content
+        node.block = (node.line + 1, last) if last > node.line else None
+    return root
+
+
+def flow_of(value: str):
+    """The list or dict of a one-row flow collection value (the reader has already checked it)."""
+    return _flow(value, 0)[1]
+
+
+def scalar_of(value: str) -> str:
+    """The string of a plain or quoted one-row scalar value."""
+    return _unquote(value)

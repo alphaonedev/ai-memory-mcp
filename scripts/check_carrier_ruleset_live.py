@@ -78,6 +78,7 @@ Exit: 0 pass (or pending WARN), 1 drift/unreadable, 2 usage.
 
 import argparse
 import functools
+import importlib.util
 import json
 import re
 import subprocess
@@ -86,6 +87,22 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _load_subset():
+    """Load the shared fail-closed workflow reader by path (the script may run under `python3 -I`)."""
+    path = Path(__file__).resolve().parent / "workflow_yaml_subset.py"
+    spec = importlib.util.spec_from_file_location("workflow_yaml_subset", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"carrier-ruleset-live: FAIL: cannot load {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["workflow_yaml_subset"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+SUBSET = _load_subset()
+Unparsed = SUBSET.Unparsed
 PAYLOAD = REPO_ROOT / "docs" / "ci" / "carrier-ruleset.json"
 CARRIER_DECL = REPO_ROOT / "scripts" / "qc-allowlists" / "required-contexts-carrier.txt"
 RELEASE_DECL = REPO_ROOT / "scripts" / "qc-allowlists" / "required-contexts-release.txt"
@@ -445,7 +462,9 @@ def frozen_by(ref, rulesets):
 
 def job_defined(workflow_text, job_id, name):
     """True when `jobs.<job_id>` in the workflow text carries `name: <name>`."""
-    lines = workflow_text.splitlines()
+    if _hostile(workflow_text):
+        return False
+    lines = workflow_text.split("\n")
     for i, line in enumerate(lines):
         if line.rstrip() != f"  {job_id}:":
             continue
@@ -505,8 +524,8 @@ def _indent(line):
 def _code_lines(text):
     """Lines without comments or blanks (a quoted `#` does not occur in a branch filter)."""
     out = []
-    for raw in text.splitlines():
-        line = re.sub(r"(^|\s)#.*$", "", raw).rstrip()
+    for raw in text.split("\n"):
+        line = re.sub(r"(^|[ \t])#.*$", "", raw).rstrip(" \t\r")
         if line.strip():
             out.append(line)
     return out
@@ -534,84 +553,185 @@ def _items(block, start):
     return [v.strip().strip("\"'") for v in values if v.strip()]
 
 
+def _hostile(text):
+    """True when the stream holds a character the workflow reader refuses (BOM, NEL, U+2028, controls).
+
+    Such a character can split or hide a line for one reader and not for another (#6543), so the
+    regex helpers below that still read lines treat the workflow as unreadable and fail closed."""
+    return SUBSET._text_failure_line(text) is not None
+
+
+EVENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+
+
+def _event_key(node):
+    """The event name of a key under `on:`; anything the reader does not model is Unparsed (#6481)."""
+    name = node.name
+    if not EVENT_NAME.fullmatch(name):
+        raise Unparsed(f"line {node.line}: trigger name {name!r} is not a plain ASCII word")
+    if name.lower() in SUBSET.YAML11_BOOLEANS + ("null",):
+        raise Unparsed(f"line {node.line}: trigger name {name!r} reads as a boolean or null in YAML 1.1")
+    return name
+
+
 def on_events(workflow_text):
-    """Event names of the workflow's top-level `on:`: block keys, or every word of an inline value.
+    """Event names of the workflow's `on:`, read through the fail-closed YAML-subset reader.
 
-    Used to pin that no `pull_request_target` trigger (fork code with a write token) is added
-    (mutant S14, #6440). An inline value yields all its words, a superset: it only ever adds names."""
-    lines = _code_lines(workflow_text)
-    for i, line in enumerate(lines):
-        if _indent(line) == 0 and line.startswith("on:"):
-            inline = line[3:].strip()
-            if inline:
-                return set(re.findall(r"[\w-]+", inline))
-            events = set()
-            block = []
-            for body in lines[i + 1:]:
-                if _indent(body) == 0:
-                    break
-                block.append(body)
-            if block:
-                top = _indent(block[0])
-                for body in block:
-                    m = re.match(r"([\w-]+)\s*:", body.strip()) if _indent(body) == top else None
-                    if m:
-                        events.add(m.group(1))
-            return events
-    return set()
+    The block keys, the entries of a block sequence, the words of a flow list, the keys of a flow
+    mapping or a scalar are all names; a quoted, escaped, fullwidth, aliased or merged key, a second
+    document, a duplicate `on:` or any other construct the reader does not model raises Unparsed
+    ("line N: ...") so the caller fails closed (#6481, #6545). A scalar yields its words too: a
+    superset, which only ever adds names."""
+    root = SUBSET.parse_workflow(workflow_text)
+    on = next((k for k in root.keys() if k.name in SUBSET.ON_KEYS), None)
+    if on is None:
+        return set()
+    names = []
+    value = on.value
+    if value:
+        if value[0] in "|>":
+            raise Unparsed(f"line {on.line}: on: is a block scalar")
+        if value[0] in "[{":
+            flow = SUBSET.flow_of(value)
+            if isinstance(flow, dict):
+                names.extend(flow)
+            else:
+                for item in flow:
+                    if not isinstance(item, str):
+                        raise Unparsed(f"line {on.line}: on: list entry is not a scalar")
+                    names.append(str(item))
+        else:
+            word = SUBSET.scalar_of(value)
+            names.extend([word] + re.findall(r"[\w-]+", word))
+    elif not on.children:
+        raise Unparsed(f"line {on.line}: on: is empty")
+    for child in on.children:
+        if child.kind == "key":
+            names.append(_event_key(child))
+        elif child.keys() or child.items() or not child.value or child.value[0] in "[{|>":
+            raise Unparsed(f"line {child.line}: on: sequence entry is not a scalar")
+        else:
+            names.append(SUBSET.scalar_of(child.value))
+    return set(names)
 
 
-FORBIDDEN_TRIGGERS = ("pull_request_target", "workflow_run")
+FORBIDDEN_TRIGGERS = ("pull_request_target", "workflow_run", "workflow_call")
 
 
 def forbidden_triggers(workflow_text):
-    """Sorted names from FORBIDDEN_TRIGGERS that the workflow `on:` block names (#6453).
+    """Sorted names from FORBIDDEN_TRIGGERS that the workflow `on:` names, in any letter case (#6453, #6544).
 
-    Both events run in the base repository context with a write-capable token, so a pull request
-    must never be able to add one of them to the workflow that carries the #6143 jobs."""
-    return sorted(set(FORBIDDEN_TRIGGERS) & on_events(workflow_text))
+    pull_request_target and workflow_run run in the base repository context with a write-capable
+    token; workflow_call lets another workflow run these jobs with its own secrets and token. A pull
+    request must never be able to add one of them to the workflow that carries the #6143 jobs."""
+    return sorted({name.lower() for name in on_events(workflow_text)} & set(FORBIDDEN_TRIGGERS))
 
 
-C8_JOBS = ("carrier-base-fresh-gate", "carrier-ruleset-live-gate")
-VERIFIER_JOB = "carrier-ruleset-live-gate"
 GITHUB_TOKEN_EXPR = "${{ github.token }}"
+TOKEN_ENV_NAMES = ("GH_TOKEN", "GITHUB_TOKEN")
+SECRETS_REF = re.compile(r"\bsecrets\b", re.I)
+NEEDS_REF = re.compile(r"\bneeds\s*(?:[.\[:])", re.I)
+WRITE_PERMISSIONS = ("write", "write-all")
 
 
-def job_lines(workflow_text, job_id):
-    """Code lines of the top-level job `job_id` (indent-2 key under `jobs:`), or None when absent."""
-    lines = _code_lines(workflow_text)
-    start = None
-    for i, line in enumerate(lines):
-        if start is None:
-            if line.rstrip() == f"  {job_id}:":
-                start = i + 1
-        elif _indent(line) <= 2:
-            return lines[start:i]
-    return lines[start:] if start is not None else None
+def _scan_lines(lines, node, block_lines):
+    """(line number, text) for every line of `node`: comments stripped, except in a block scalar.
+
+    A `#` in a block scalar is text and a `${{ }}` there is expanded before the shell runs, so a
+    block-scalar line is kept whole. Elsewhere only an ASCII space or tab before `#` opens a
+    comment (#6543): a no-break space or U+3000 does not."""
+    out = []
+    for number in range(node.line, node.end + 1):
+        raw = lines[number - 1]
+        out.append((number, raw if number in block_lines else SUBSET._strip_comment(raw)))
+    return out
+
+
+def _scope_problems(label, node, lines, block_lines, is_job):
+    """Token-source problems inside one workflow section or job (#6452, #6482, #6542)."""
+    problems = []
+    for number, text in _scan_lines(lines, node, block_lines):
+        if SECRETS_REF.search(text):
+            problems.append(f"{label} references a repository secret (line {number}): {text.strip()}")
+        if is_job and NEEDS_REF.search(text):
+            problems.append(f"{label} reads a needs output or declares needs (line {number}): {text.strip()}")
+    for sub in node.walk():
+        if sub.kind != "key":
+            continue
+        field = sub.name.upper()
+        if field in TOKEN_ENV_NAMES and SUBSET.scalar_of(sub.value) != GITHUB_TOKEN_EXPR:
+            problems.append(f"{label} {sub.name} is not {GITHUB_TOKEN_EXPR} (line {sub.line}): {sub.value}")
+        if sub.name == "env" and sub.value:
+            if sub.value[0] != "{":
+                problems.append(f"{label} env is not a mapping (line {sub.line}): {sub.value}")
+            else:
+                for key, val in SUBSET.flow_of(sub.value).items():
+                    if key.upper() in TOKEN_ENV_NAMES and val != GITHUB_TOKEN_EXPR:
+                        problems.append(f"{label} {key} is not {GITHUB_TOKEN_EXPR} (line {sub.line}): {val}")
+        if sub.name == "permissions":
+            grants = [sub.value] + [c.value for c in sub.keys()]
+            if any(SUBSET.scalar_of(g).strip().lower() in WRITE_PERMISSIONS for g in grants if g):
+                problems.append(f"{label} permissions grant write (line {sub.line})")
+    return problems
+
+
+def _job_nodes(root):
+    jobs = root.get("jobs")
+    return list(jobs.keys()) if jobs is not None else []
 
 
 def job_token_problems(workflow_text):
-    """Problems with the token source of the two #6143 jobs (#6452); an empty list is clean.
+    """Problems with the token source of the workflow and of the two #6143 jobs; empty is clean.
 
-    A job that reads a repository secret, or a GH_TOKEN/GITHUB_TOKEN that is not exactly
-    `${{ github.token }}`, would hand a write-capable credential to code a pull request controls.
-    The verifier job must also set GH_TOKEN, or `gh` has no credential and every read fails."""
+    Read through the fail-closed reader (Unparsed on anything it does not model, #6482, #6542).
+    Everything outside `jobs:` (workflow `env:`, `defaults:`, `permissions:`) is inherited by every
+    job, so it is held to the same rule as the jobs: no repository secret, no GH_TOKEN/GITHUB_TOKEN
+    that is not exactly `${{ github.token }}`, no write permission. A #6143 job also takes no
+    `needs:` (an output can carry a credential) and its check name is claimed by it alone: another
+    job id that differs only in case or space, or another job carrying the same `name:`, is a
+    problem (#6542). The verifier job must set GH_TOKEN, or `gh` has no credential."""
+    root = SUBSET.parse_workflow(workflow_text)
+    lines = workflow_text.split("\n")
+    block_lines = {n for node in root.walk() if node.block for n in range(node.block[0], node.block[1] + 1)}
     problems = []
-    for job in C8_JOBS:
-        body = job_lines(workflow_text, job)
-        if body is None:
-            problems.append(f"job {job} not found")
+    for top in root.keys():
+        if top.name != "jobs":
+            problems.extend(_scope_problems("workflow", top, lines, block_lines, False))
+    jobs = _job_nodes(root)
+    for job_id, context in ((FRESHNESS_JOB_ID, FRESHNESS_CONTEXT), (VERIFIER_JOB_ID, VERIFIER_CONTEXT)):
+        wanted = None
+        for node in jobs:
+            same_id = node.name.strip().casefold() == job_id.casefold()
+            name_node = node.get("name")
+            claims = name_node is not None and SUBSET.scalar_of(name_node.value).strip().casefold() == context.casefold()
+            if node.name == job_id:
+                wanted = node
+            elif same_id or claims:
+                problems.append(f"job {node.name} (line {node.line}) imitates {job_id} / {context!r}")
+        if wanted is None:
+            problems.append(f"job {job_id} not found")
             continue
-        for line in body:
-            if re.search(r"\bsecrets\b", line, re.I):
-                problems.append(f"job {job} references a repository secret: {line.strip()}")
-            m = re.match(r"\s*(GH_TOKEN|GITHUB_TOKEN)\s*:\s*(.*?)\s*$", line)
-            if m and m.group(2) != GITHUB_TOKEN_EXPR:
-                problems.append(f"job {job} {m.group(1)} is not {GITHUB_TOKEN_EXPR}: {m.group(2)}")
-        if job == VERIFIER_JOB and not any(
-                re.match(rf"\s*GH_TOKEN\s*:\s*{re.escape(GITHUB_TOKEN_EXPR)}\s*$", ln) for ln in body):
-            problems.append(f"job {job} does not set GH_TOKEN: {GITHUB_TOKEN_EXPR}")
+        label = f"job {job_id}"
+        problems.extend(_scope_problems(label, wanted, lines, block_lines, True))
+        if wanted.get("needs") is not None:
+            problems.append(f"{label} declares needs (line {wanted.get('needs').line})")
+        name_node = wanted.get("name")
+        if name_node is None or SUBSET.scalar_of(name_node.value) != context:
+            problems.append(f"{label} does not carry name: {context}")
+        if job_id == VERIFIER_JOB_ID and not any(
+                n.kind == "key" and n.name == "GH_TOKEN" and SUBSET.scalar_of(n.value) == GITHUB_TOKEN_EXPR
+                for n in wanted.walk()):
+            problems.append(f"{label} does not set GH_TOKEN: {GITHUB_TOKEN_EXPR}")
     return problems
+
+
+def workflow_pin_problems(workflow_text):
+    """Every pin on the workflow that carries the #6143 jobs; a construct the reader refuses is a problem."""
+    try:
+        problems = [f"workflow names the forbidden trigger {name}" for name in forbidden_triggers(workflow_text)]
+        return problems + job_token_problems(workflow_text)
+    except Unparsed as exc:
+        return [f"workflow is not readable by the fail-closed reader: {exc}"]
 
 
 def trigger_covers(workflow_text, branch):
@@ -622,6 +742,8 @@ def trigger_covers(workflow_text, branch):
     requests and a required context would never report (#6429, #6430). Also False for `branches`
     together with `branches-ignore` (invalid on GitHub, #6438) and for a pattern using `?`, `+`
     or `[...]` (not translated, #6437)."""
+    if _hostile(workflow_text):
+        return False  # a BOM, NEL, U+2028 or control character: the lines cannot be trusted (#6543)
     lines = _code_lines(workflow_text)
     for i, line in enumerate(lines):
         if _indent(line) == 0 and line.startswith("on:"):
@@ -691,6 +813,7 @@ def check_tip(label, text, branch, jobs):
     if not trigger_covers(text, branch):
         reasons.append(f"{label}: {WORKFLOW_PATH} does not trigger on pull_request for {branch}: "
                        "the required context would never report")
+    reasons.extend(f"{label}: {problem}" for problem in workflow_pin_problems(text))
     return reasons
 
 
@@ -898,6 +1021,9 @@ def self_test():
             problem = f"raised {type(exc).__name__}: {exc}"
         if problem:
             failures.append(f"{label}: {problem}")
+
+    check("round7 pin: the committed c8-precheck.yml parses and carries no trigger or token problem",
+          lambda: None if not workflow_pin_problems(wf_text) else f"{workflow_pin_problems(wf_text)!r}")
 
     def verify_case(bundle, rulesets, state, issue_state, full, want_rc, needle):
         rc, lines = verify(*bundle, state, rulesets, issue_state, full)
@@ -1330,10 +1456,10 @@ def self_test():
              "quoted mapping key", 2),
             ("round7 trigger: single-quoted key", "on:\n  'workflow_run':\n    workflows: [x]\n",
              "quoted mapping key", 2),
-            ("round7 trigger: escaped quoted key", "on:\n  \"pull_request\\x5ftarget\":\n", "quoted mapping key", 2),
+            ("round7 trigger: escaped quoted key", "on:\n  \"pull_request\\x5ftarget\":\n", "backslash", 2),
             ("round7 trigger: quoted key in a flow mapping", "on: {\"pull_request_target\": {}}\n",
              "quoted key", 1),
-            ("round7 trigger: fullwidth key", "on:\n  ｐull_request_target:\n", "trigger", 2),
+            ("round7 trigger: fullwidth key", "on:\n  ｐull_request_target:\n", "non-ASCII", 2),
             ("round7 trigger: merge key", "env: &t\n  workflow_run: x\non:\n  <<: *t\n", "anchor", 1),
             ("round7 trigger: alias value", "on:\n  push: *t\n", "alias", 2),
             ("round7 trigger: multi-line flow list", "on: [push,\n  pull_request_target]\n", "flow collection", 1),
@@ -1342,7 +1468,7 @@ def self_test():
             ("round7 trigger: duplicate on key", "on: push\njobs: {}\non: [pull_request_target]\n",
              "repeated top-level key", 3),
             ("round7 trigger: U+2028 in a scalar", "name: \"a b\"\non: push\n", "U+2028", 1),
-            ("round7 trigger: tab", "on:\n\tpush:\n", "tab", 2)):
+            ("round7 trigger: tab", "on:\n\tpush:\n", "whitespace", 2)):
         check(label, lambda t=text, c=construct, n=line: closed(forbidden_triggers, t, c, n))
 
     for label, text, want in (
@@ -1406,8 +1532,6 @@ def self_test():
                          "        run: python3 -I scripts/check_carrier_ruleset_live.py --self-test\n" + leak, 1)),
             ("round7 token: no-break space before # hides a secret", in_verifier(nbsp_leak)),
             ("round7 token: ideographic space before # hides a secret", in_verifier(ideo_leak)),
-            ("round7 token: case-variant job id reports the verifier name", swap(
-                wf_text, "  carrier-base-fresh-gate:\n", decoy + "  carrier-base-fresh-gate:\n")),
             ("round7 token: second job claims the verifier check name", swap(
                 wf_text, "  carrier-base-fresh-gate:\n", decoy_named + "  carrier-base-fresh-gate:\n")),
             ("round7 token: #6483 freshness GITHUB_TOKEN with a suffix", in_job(
@@ -1417,6 +1541,15 @@ def self_test():
             ("round7 token: #6483 freshness GITHUB_TOKEN from secrets.GITHUB_TOKEN", in_job(
                 fresh_at, "    steps:\n", "    env:\n      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}\n    steps:\n"))):
         check(label, lambda t=text: None if job_token_problems(t) else "job_token_problems is empty")
+    def case_variant_refused():
+        try:
+            problems = job_token_problems(swap(
+                wf_text, "  carrier-base-fresh-gate:\n", decoy + "  carrier-base-fresh-gate:\n"))
+        except Unparsed as exc:
+            ok = "carrier-ruleset-live-gate" in str(exc) and "line" in str(exc)
+            return None if ok else f"refusal lacks the id or a line: {exc}"
+        return None if problems else "a case-variant job id was accepted"
+    check("round7 token: case-variant job id is refused (reader or policy)", case_variant_refused)
     check("round7 token: #6483 freshness GITHUB_TOKEN github.token is clean", lambda: (
         None if not job_token_problems(in_job(
             fresh_at, "    steps:\n", "    env:\n      GITHUB_TOKEN: ${{ github.token }}\n    steps:\n"))
@@ -1433,7 +1566,7 @@ def self_test():
              "quoted mapping key", None),
             ("round7 token: U+2028 in a quoted scalar", in_verifier(
                 "      - name: x\n        run: \"echo ok   zz:\"\n"), "U+2028", None),
-            ("round7 token: tab indentation", in_verifier("      - name: x\n\trun: x\n"), "tab", None),
+            ("round7 token: tab indentation", in_verifier("      - name: x\n\trun: x\n"), "whitespace", None),
             ("round7 token: second document", wf_text + "---\non: [pull_request_target]\n", "top-level row", None),
             ("round7 token: duplicate top-level key", wf_text + "on: push\n", "repeated top-level key", None)):
         def expect(t=text, c=construct):
