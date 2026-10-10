@@ -3019,6 +3019,14 @@ def _wrap_cells(t, fx, repo, base):
          {"src/wrap_a.rs": "#/* c */[cfg(any())]\n" + a_line}),
         ("wrap-inner-comment-split", "#![cfg(any())]", "an inner attribute written `#/* c */!/* d */[cfg(any())]`",
          {"src/wrap_a.rs": "#/* c */!/* d */[cfg(any())]\n" + a_line}),
+        # #6823/#6824/#6825: an inner attribute of an inline mod, a second file-level
+        # inner attribute, and a file-level inner attribute that is not a cfg
+        ("wrap-inline-mod-inner", "#![cfg(any())]", "an inner attribute inside an inline `pub mod m {` around the line",
+         {"src/wrap_a.rs": "pub mod m {\n    #![cfg(any())]\n" + a_line + "}\n"}),
+        ("wrap-inner-second", "#![cfg(any())]", "a cfg inner attribute after an allow inner attribute at the top of the file",
+         {"src/wrap_a.rs": "#![allow(dead_code)]\n#![cfg(any())]\n" + a_line}),
+        ("wrap-inner-allow-unreach", "unreachable_code", "#![allow(unreachable_code)] at the top of the file",
+         {"src/wrap_d.rs": "#![allow(unreachable_code)]\n" + d_text}),
         # #6705: a raw string or a comment inside an attribute keeps the lexer in step
         ("wrap-attr-rawstr-desync", "cfg(any())", "a raw string with a backslash in an attribute before a cfg",
          {"src/wrap_d.rs": '#[doc = r"\\"]\n#[cfg(any())]\n' + d_text[:-2] + '} // "]\n'}),
@@ -3465,6 +3473,7 @@ SELF_TEST_OK = (
     "(wrap-adv-underscore-assign-return, wrap-adv-paren-return, wrap-adv-return-in-call, wrap-return-first-arg, wrap-break-in-loop-call, wrap-panic-in-call, each with -gate, #6842) a return, break, continue or exit macro anywhere a statement always evaluates is an early exit; (wrap-ctl-closure-return, wrap-ctl-shortcircuit-return, wrap-ctl-match-arm-return) one inside a closure, after `||` or in one match arm is GREEN; "
     "(wrap-adv-panic-any, wrap-adv-resume-unwind, wrap-adv-unreachable-unchecked, each with -gate, #6843) panic_any, resume_unwind and unreachable_unchecked under any path are exits; "
     "(wrap-adv-match-guard-false, wrap-adv-if-false-or-false, wrap-while-false-or, wrap-if-false-and, each with -gate, #6844) `if false` or `while false` anywhere in a header, a match guard included, is RED, and (wrap-if-cfg-test, wrap-while-false, wrap-else-if-false, wrap-loop-empty-before, each with -gate) stay RED; (wrap-ctl-if-false-else) the else branch of `if false` is GREEN; "
+    "(wrap-inline-mod-inner, wrap-inner-second, wrap-inner-allow-unreach, each with -gate, #6823/#6824/#6825) an inner attribute of an inline mod, a second file-level inner attribute and a file-level non-cfg inner attribute are RED; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
