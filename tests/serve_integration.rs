@@ -82,6 +82,9 @@ struct ServeChild {
     port: u16,
     /// #3705 — the leaf the daemon serves; every client trusts exactly it.
     tls: common::tls::TestTls,
+    /// Everything the daemon has written to stderr so far (#6236 reads the
+    /// shutdown log lines from here to pin their order).
+    stderr: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 impl ServeChild {
@@ -212,6 +215,7 @@ fn try_spawn_serve_once(
     });
     // Join the stderr drainer (the pipe EOFs once the child exits, so the
     // thread ends promptly) and return everything it captured.
+    let stderr_sink = std::sync::Arc::clone(&stderr_buf);
     let drain_stderr = move || -> String {
         if let Some(handle) = stderr_handle {
             let _ = handle.join();
@@ -230,6 +234,7 @@ fn try_spawn_serve_once(
                 child: Some(child),
                 port,
                 tls,
+                stderr: stderr_sink,
             });
         }
         // Bail early if the child crashed — don't burn the full timeout.
@@ -497,6 +502,7 @@ fn serve_api_key_required_when_configured() {
             child: Some(child),
             port,
             tls: tls.clone(),
+            stderr: std::sync::Arc::clone(&stderr_buf),
         };
         if !ready {
             last_err = format!(
@@ -547,12 +553,12 @@ fn serve_graceful_shutdown_on_sigterm() {
     let serve = spawn_serve(&db, &[], &[]);
     let pid = serve.child.as_ref().unwrap().id();
 
-    // SIGINT (the daemon's wired signal — see `tokio::signal::ctrl_c()`
-    // in `daemon_runtime::serve`). SIGTERM is not currently wired but
-    // the spec calls the test "shutdown_on_sigterm" — using SIGINT keeps
-    // the assertion meaningful (graceful shutdown path actually runs).
+    // SIGTERM: the signal this test is named for and the one `docker stop`
+    // sends. `serve` resolves SIGTERM and SIGINT through the same shutdown
+    // future (#4072); `serve_sigterm_takes_the_same_graceful_path_as_sigint_4072`
+    // pins the two against each other.
     unsafe {
-        libc::kill(i32::try_from(pid).expect("pid fits in i32"), libc::SIGINT);
+        libc::kill(i32::try_from(pid).expect("pid fits in i32"), libc::SIGTERM);
     }
     // Give the daemon up to 10s to flush the WAL and exit.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -562,7 +568,7 @@ fn serve_graceful_shutdown_on_sigterm() {
             // Force kill so the test reports a real failure rather than
             // hanging the suite.
             let _ = serve_mut.child.as_mut().unwrap().kill();
-            panic!("daemon did not exit within 10s of SIGINT");
+            panic!("daemon did not exit within 10s of SIGTERM");
         }
         match serve_mut.child.as_mut().unwrap().try_wait() {
             Ok(Some(status)) => break status,
@@ -573,30 +579,135 @@ fn serve_graceful_shutdown_on_sigterm() {
     // Discard the child handle so Drop doesn't try to wait again.
     serve_mut.child = None;
 
-    // Either a clean exit (status 0) or signalled-by-INT is acceptable;
-    // what we *don't* want is a panic / abort signal.
-    let signal = exit_status.signal();
+    // The graceful path ends in a clean exit, never death by signal.
     assert!(
-        exit_status.success() || signal == Some(libc::SIGINT) || signal.is_none(),
-        "unexpected exit: {exit_status:?} signal={signal:?}"
+        exit_status.success() && exit_status.signal().is_none(),
+        "SIGTERM must end in a clean exit: {exit_status:?}"
     );
 }
 
-/// #4072 — the outcome of one graceful shutdown: how the daemon exited and
-/// how many bytes its WAL still held afterwards (0 once the final
-/// `wal_checkpoint(TRUNCATE)` has run).
+/// #4072/#6236 — the outcome of one graceful shutdown taken while a request
+/// is still in flight.
 #[cfg(unix)]
-fn shutdown_outcome_4072(signal: libc::c_int) -> (std::process::ExitStatus, u64) {
+struct DrainOutcome4072 {
+    exit: std::process::ExitStatus,
+    /// WAL length just before the signal (must be non-zero: the checkpoint
+    /// assertion is meaningless on a database that never had a WAL).
+    wal_before: u64,
+    /// WAL length after exit (0 once the final `wal_checkpoint(TRUNCATE)` ran).
+    wal_after: u64,
+    /// Status of the request that was in flight when the signal landed.
+    inflight_status: reqwest::StatusCode,
+    /// The daemon was still running while that request was unfinished.
+    alive_during_drain: bool,
+    stderr: String,
+}
+
+/// A request body that hands over its first half, announces the request is in
+/// flight, then blocks until the test releases it.
+#[cfg(unix)]
+struct GatedBody4072 {
+    first: Option<Vec<u8>>,
+    rest: Option<Vec<u8>>,
+    started: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(unix)]
+impl std::io::Read for GatedBody4072 {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let chunk = if let Some(first) = self.first.take() {
+            let _ = self.started.send(());
+            first
+        } else if let Some(rest) = self.rest.take() {
+            // Held until the test has delivered the signal.
+            self.release
+                .recv_timeout(Duration::from_secs(30))
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::TimedOut, e))?;
+            rest
+        } else {
+            return Ok(0);
+        };
+        let n = chunk.len().min(buf.len());
+        buf[..n].copy_from_slice(&chunk[..n]);
+        if n < chunk.len() {
+            // Not reachable for these small bodies; keep the tail rather than
+            // silently truncating the request.
+            self.rest = Some(chunk[n..].to_vec());
+        }
+        Ok(n)
+    }
+}
+
+#[cfg(unix)]
+fn drain_outcome_4072(signal: libc::c_int) -> DrainOutcome4072 {
+    const AGENT: &str = "ai:drain-4072";
     let tmp = TempDir::new().unwrap();
     let db = tmp.path().join("ai-memory.db");
     let mut serve = spawn_serve(&db, &[], &[]);
     let pid = serve.child.as_ref().unwrap().id();
+    let client = http_client(&serve);
+
+    // A committed write first, so a WAL exists to be checkpointed.
+    let seed = send_first_request(|| {
+        client
+            .post(serve.url("/api/v1/memories"))
+            .header("X-Agent-Id", AGENT)
+            .json(&serde_json::json!({
+                "tier": "mid", "namespace": "drain-4072",
+                "title": "seed", "content": "seed row so the WAL is non-empty"
+            }))
+    });
+    assert!(seed.status().is_success(), "seed write: {}", seed.status());
+    let wal_path = tmp.path().join("ai-memory.db-wal");
+    let wal_before = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
+
+    // A request that is mid-flight (headers + half the body sent) when the
+    // signal lands.
+    let body = serde_json::to_vec(&serde_json::json!({
+        "tier": "mid", "namespace": "drain-4072",
+        "title": "in-flight", "content": "completed during the graceful drain"
+    }))
+    .unwrap();
+    let (head, tail) = body.split_at(body.len() / 2);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let gated = GatedBody4072 {
+        first: Some(head.to_vec()),
+        rest: Some(tail.to_vec()),
+        started: started_tx,
+        release: release_rx,
+    };
+    let url = serve.url("/api/v1/memories");
+    let slow_client = serve.tls.client_with_timeout(Duration::from_secs(60));
+    let inflight = std::thread::spawn(move || {
+        slow_client
+            .post(url)
+            .header("X-Agent-Id", AGENT)
+            .header("Content-Type", "application/json")
+            .body(reqwest::blocking::Body::new(gated))
+            .send()
+            .map(|r| r.status())
+    });
+    started_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the in-flight request must start");
+    std::thread::sleep(Duration::from_millis(500));
+
     // SAFETY: a plain signal to a pid this test spawned and still owns.
     unsafe {
         libc::kill(i32::try_from(pid).expect("pid fits in i32"), signal);
     }
+    std::thread::sleep(Duration::from_millis(1500));
+    let alive_during_drain = matches!(serve.child.as_mut().unwrap().try_wait(), Ok(None));
+    release_tx.send(()).expect("release the gated body");
+    let inflight_status = inflight
+        .join()
+        .expect("in-flight thread")
+        .expect("the in-flight request must complete, not be dropped");
+
     let deadline = Instant::now() + Duration::from_secs(30);
-    let exit_status = loop {
+    let exit = loop {
         if Instant::now() > deadline {
             let _ = serve.child.as_mut().unwrap().kill();
             panic!("daemon did not exit within 30s of signal {signal}");
@@ -608,39 +719,95 @@ fn shutdown_outcome_4072(signal: libc::c_int) -> (std::process::ExitStatus, u64)
         }
     };
     serve.child = None;
-    let wal_len = std::fs::metadata(tmp.path().join("ai-memory.db-wal")).map_or(0, |m| m.len());
-    (exit_status, wal_len)
+    std::thread::sleep(Duration::from_millis(200));
+    let stderr = serve.stderr.lock().unwrap().clone();
+    let wal_after = std::fs::metadata(&wal_path).map_or(0, |m| m.len());
+    DrainOutcome4072 {
+        exit,
+        wal_before,
+        wal_after,
+        inflight_status,
+        alive_during_drain,
+        stderr,
+    }
 }
 
-/// #4072 — SIGTERM (the container image's default stop signal, and what
-/// `docker stop` / Kubernetes / most supervisors send) must take the SAME
-/// graceful path as SIGINT: the daemon exits on its own terms instead of
-/// dying by signal, and the final WAL checkpoint has run. Pinned against the
-/// SIGINT control in the same process image, so the two signals can never
-/// drift apart again.
+/// #4072/#6236 — SIGTERM (the container image's stop signal; what `docker
+/// stop` / Kubernetes send) takes the SAME graceful path as SIGINT, with a
+/// request in flight: the request completes, the daemon stays up for it, the
+/// shutdown stages run in order (drain, then deferred-audit drain), the exit
+/// is a clean success, and the final WAL checkpoint ran on a WAL that existed.
 #[cfg(unix)]
 #[test]
 fn serve_sigterm_takes_the_same_graceful_path_as_sigint_4072() {
     use std::os::unix::process::ExitStatusExt;
 
-    let (term_status, term_wal) = shutdown_outcome_4072(libc::SIGTERM);
+    for (name, signal) in [("SIGTERM", libc::SIGTERM), ("SIGINT", libc::SIGINT)] {
+        let out = drain_outcome_4072(signal);
+        assert!(
+            out.exit.success() && out.exit.signal().is_none(),
+            "{name}: the daemon must exit success on its own terms: {:?}\n{}",
+            out.exit,
+            out.stderr
+        );
+        assert!(
+            out.alive_during_drain,
+            "{name}: the daemon must stay up while a request is in flight"
+        );
+        assert!(
+            out.inflight_status.is_success(),
+            "{name}: the in-flight request must complete with 2xx, got {}",
+            out.inflight_status
+        );
+        assert!(
+            out.wal_before > 0,
+            "{name}: the test needs a non-empty WAL before the signal"
+        );
+        assert_eq!(
+            out.wal_after, 0,
+            "{name}: the final wal_checkpoint(TRUNCATE) must run"
+        );
+        let drain = out.stderr.find("shutting down");
+        let audit = out.stderr.find("deferred-audit queue drained");
+        assert!(
+            matches!((drain, audit), (Some(d), Some(a)) if d < a),
+            "{name}: shutdown stages must log in order (drain, then deferred-audit drain):\n{}",
+            out.stderr
+        );
+    }
+}
+
+/// #6236 — the packaging half of #4072: the image stops the daemon with
+/// SIGTERM, runs the binary as PID 1 in exec form (so the signal reaches it,
+/// not a shell), and the admin guide states the stop budget.
+#[test]
+fn dockerfile_delivers_sigterm_to_the_binary_and_the_guide_states_the_budget_6236() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dockerfile = std::fs::read_to_string(root.join("Dockerfile")).expect("read Dockerfile");
+    let lines: Vec<&str> = dockerfile.lines().map(str::trim).collect();
     assert!(
-        term_status.signal().is_none(),
-        "SIGTERM must enter the graceful drain, not kill the daemon: {term_status:?}"
+        lines.contains(&"STOPSIGNAL SIGTERM"),
+        "the image must declare STOPSIGNAL SIGTERM"
     );
-    let (int_status, int_wal) = shutdown_outcome_4072(libc::SIGINT);
+    let entry = lines
+        .iter()
+        .find(|l| l.starts_with("ENTRYPOINT"))
+        .expect("an ENTRYPOINT");
     assert!(
-        int_status.signal().is_none(),
-        "SIGINT control did not shut down gracefully: {int_status:?}"
+        entry.starts_with("ENTRYPOINT [") && !entry.contains("sh\"") && !entry.contains("bash"),
+        "ENTRYPOINT must be exec form without a shell wrapper so SIGTERM reaches the daemon: {entry}"
     );
-    assert_eq!(
-        term_status.code(),
-        int_status.code(),
-        "SIGTERM and SIGINT must exit through the same certification path"
+    let cmd = lines
+        .iter()
+        .find(|l| l.starts_with("CMD"))
+        .expect("a CMD");
+    assert!(
+        cmd.starts_with("CMD [") && !cmd.contains("sh\""),
+        "CMD must be exec form: {cmd}"
     );
-    assert_eq!(
-        (term_wal, int_wal),
-        (0, 0),
-        "the final WAL checkpoint (TRUNCATE) must run on both signals"
+    let guide = std::fs::read_to_string(root.join("docs/ADMIN_GUIDE.md")).expect("read guide");
+    assert!(
+        guide.contains("at least 90 seconds") && guide.contains("STOPSIGNAL SIGTERM"),
+        "ADMIN_GUIDE must state the 90 s stop budget and the image STOPSIGNAL"
     );
 }
