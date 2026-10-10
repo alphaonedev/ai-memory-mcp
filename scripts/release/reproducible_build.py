@@ -1116,6 +1116,14 @@ def _self_test_6907(tmp: Path) -> List[str]:
             out.append("6907 pack_binary did not pack the asserted bytes as one 0755 member")
         if copy.is_symlink() or copy.read_bytes() != good or decoy.read_bytes() != b"decoy\n":
             out.append("6907 pack_binary followed a planted link or did not write the asserted bytes")
+        # #6907 parity with the #6282 pack check: the published tarball carries no
+        # clock time, host owner or file name (gzip header and member metadata).
+        head = tgz.read_bytes()[:10]
+        if head[4:8] != b"\0\0\0\0" or head[3] & 0x08:
+            out.append("6907 pack_binary: the gzip header carries a timestamp or a file name")
+        if (members[0].mtime, members[0].uid, members[0].gid, members[0].uname, members[0].gname) != (
+                1700000000, 0, 0, "", ""):
+            out.append("6907 pack_binary: the member carries a build-host mtime or owner")
     except ProofError as exc:
         out.append(f"6907 pack_binary refused the asserted binary: {exc}")
     for i, (name, s) in enumerate((("6907 pack_binary refuses bytes the assert did not check", evil),
