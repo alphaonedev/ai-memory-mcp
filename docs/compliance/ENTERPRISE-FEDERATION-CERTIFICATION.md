@@ -1510,7 +1510,10 @@ merged 2026-08-13: the `cert-expiry-gate` job in
 to this document goes RED. Since [**#3556**](https://github.com/alphaonedev/ai-memory-mcp/issues/3556)
 (2026-09-21) the gate also READS this banner: a same-change edit satisfies
 it only if the STATUS line or the Binds-to line changed (an incidental
-prose edit is not a re-issue), and a banner that says LIVE bound to a SHA
+prose edit is not a re-issue; while STATUS stays EXPIRED or VOID a
+Binds-to line that sets or changes a bound SHA is a re-bind, not a
+re-issue, and dropping the bound SHA is the only Binds-to change that
+counts, [**#6774**](https://github.com/alphaonedev/ai-memory-mcp/issues/6774)), and a banner that says LIVE bound to a SHA
 with §7-watched drift between that SHA and HEAD goes RED on every PR until
 the document is re-issued at HEAD or its STATUS is set to VOID/EXPIRED —
 the one-line remedy the failure names. While the banner is EXPIRED or VOID

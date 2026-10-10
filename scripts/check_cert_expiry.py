@@ -90,6 +90,10 @@ THE TWO PREDICATES #3556 ADDS (2026-09-21).
       Binds-to line changed between the range start (merge-base; on a
       pull_request the merge commit's first parent) and the judged commit (a
       re-issue rebinds; a voiding record flips STATUS; prose does neither).
+      While the range-start STATUS is EXPIRED or VOID and STATUS does not
+      change, a Binds-to edit that sets or changes a bound SHA is a re-bind
+      without re-measurement and takes the amendment route (#6774); dropping
+      the bound SHA withdraws the live bind and still counts.
   (C) at the judged commit, a banner that says LIVE bound to <sha> must have
       NO wire-surface drift between <sha> and that commit (paths and
       AI_MEMORY_FED_* identifiers); STATUS VOID or EXPIRED makes no live claim
@@ -100,7 +104,15 @@ THE TWO PREDICATES #3556 ADDS (2026-09-21).
 WHAT THIS DOES NOT CLAIM. A value-only edit of an existing AI_MEMORY_FED_*
 identifier in a file outside the three path watches does not trip the
 identifier check. This gate does not re-run 5.4(2)-(5); it only forces the
-cert-doc to be touched so a human/re-issue cannot be skipped.
+cert-doc to be touched so a human/re-issue cannot be skipped. Residual of the
+#6774 rule (B, 3-agent vote 6def5ab6, memory 078e762f): dropping the bound SHA
+while STATUS stays EXPIRED/VOID counts as a voiding record, so one-shot drop
+exists only while the base still carries a bound SHA under EXPIRED; vanishes
+after promo6 lands. Before promo6 a base that still carries a bound SHA under
+EXPIRED permits one drop without a STATUS change; the drop must still pass the
+append-only record check (cell 6124-b5). Once the base carries no bound SHA,
+every Binds-to change while EXPIRED/VOID is a refused re-bind (cell 6124-b4);
+#6877 tightens the rule to the literal form then.
 
 Usage:
   scripts/check_cert_expiry.py              # against the resolved range
@@ -1271,7 +1283,7 @@ def _judge(repo, base, head, judged, mb, tip):
 
     # (B) #3556: the hatch is a REAL re-issue/voiding only if the banner
     # (STATUS line or Binds-to line) differs between merge-base and judged.
-    incidental = deleted = malformed = False
+    incidental = rebind_only = deleted = malformed = False
     banner_mb = banner_head = ("", "")
     if cert_touched:
         banner_mb = cert_banner(repo, mb)
@@ -1282,8 +1294,20 @@ def _judge(repo, base, head, judged, mb, tip):
         # #3556 ruling, fix 1: a banner the gate cannot read as exactly one
         # STATUS line and at most one Binds-to line is not a re-issue.
         malformed = banner_head[0] in ("DUPLICATE", "UNPARSEABLE") or banner_head[1] == "DUPLICATE"
+        # #6774: while the range start is EXPIRED/VOID and STATUS does not change,
+        # a Binds-to edit that sets or changes a bound SHA is a re-bind without
+        # re-measurement (#3899), not a re-issue or a voiding record, so it takes
+        # the amendment route like any other incidental edit. Dropping the bound
+        # SHA (Binds-to absent at the judged commit) withdraws the live bind and
+        # stays a voiding record (#6116). decision (3-agent vote 6def5ab6, memory
+        # 078e762f): B over A because A leaves #6160 permanently RED with no
+        # append-only remedy; B over C because a sha pin inside a governance gate
+        # is a standing bypass that ages across re-cuts. #6877 flips this clause
+        # to the literal form once the base carries no bound SHA (after promo6).
+        rebind_only = (banner_mb[0] in ("EXPIRED", "VOID") and banner_head[0] == banner_mb[0]
+                       and not incidental and banner_head[1] != "-")
 
-    if cert_touched and not incidental and not deleted and not malformed:
+    if cert_touched and not incidental and not rebind_only and not deleted and not malformed:
         # #6726: the hatch does not lift the append-only ledger unless the
         # judged banner is LIVE.
         problem = ledger_append_only(repo, mb, judged)
@@ -1300,7 +1324,8 @@ def _judge(repo, base, head, judged, mb, tip):
     amend_why = ""
     # `incidental` means the banner is identical at both ends, so checking the
     # merge-base STATUS alone also pins the judged one.
-    if incidental and not deleted and not malformed and banner_mb[0] in ("EXPIRED", "VOID"):
+    if (incidental or rebind_only) and not deleted and not malformed \
+            and banner_mb[0] in ("EXPIRED", "VOID"):
         amend_ok, amend_why = amendment_verdict(
             repo, mb, judged, set(watched) | set(added) | set(removed)
         )
@@ -1326,6 +1351,13 @@ def _judge(repo, base, head, judged, mb, tip):
             f"nor its Binds-to line changed (banner {fmt_banner(banner_head)} at "
             "both ends) — an incidental edit is not a re-issue and not a voiding "
             "record (#3556)."
+        )
+    if rebind_only:
+        out.append(
+            f"The cert doc's Binds-to line sets a bound SHA while its STATUS stays "
+            f"{banner_head[0]} (banner {fmt_banner(banner_mb)} → {fmt_banner(banner_head)}) — "
+            "a re-bind without a STATUS change is not a re-issue and not a voiding record (#6774); "
+            f"only the WP-B1 re-cert ({RE_CERT_ISSUE}) re-binds the certification (#3899)."
         )
     if amend_why:
         out.append(
@@ -2978,6 +3010,36 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         b2 = banner_cell("VOID", genesis, led_ab, "b2", touch=(mod_rs,))
         t.expect_green("6124-b2", "EXPIRED -> VOID with a wire change, ledger untouched", repo,
                        mb_d, b2)
+        # (6124-b3) GREEN #6774 - dropping the bound SHA while EXPIRED withdraws
+        # the live bind (the carrier's #6116 record); it is not a re-bind.
+        fx.reset(mb_d)
+        fx.write(mod_rs, "// b3\n", append=True)
+        doc_b3 = fx.repo / CERT_DOC
+        doc_b3.write_text(doc_b3.read_text(encoding="utf-8").replace(
+            "**Binds to:**", "Last LIVE bind (historical):", 1), encoding="utf-8")
+        b3 = fx.commit([mod_rs, CERT_DOC], "6124 cell b3")
+        t.expect_green("6124-b3", "the bound SHA dropped while EXPIRED, with a wire change", repo,
+                       mb_d, b3)
+        # (6124-b4) RED #6774 - once the base carries no bound SHA (b3, as release
+        # will after promo6) the drop is spent: setting a bound SHA again with
+        # STATUS EXPIRED kept beside a wire change is a refused re-bind.
+        fx.reset(b3)
+        fx.write(mod_rs, "// b4\n", append=True)
+        fx.banner("EXPIRED", mb_d, "", led_ab)
+        b4 = fx.commit([mod_rs, CERT_DOC], "6124 cell b4")
+        t.expect_red("6124-b4", "a bound SHA set again after the drop, STATUS EXPIRED kept",
+                     repo, b3, b4, rebind6774)
+        # (6124-b5) RED #6774 - the one drop is still held to the append-only
+        # ledger: dropping the bound SHA while deleting a record is refused.
+        fx.reset(mb_d)
+        fx.write(mod_rs, "// b5\n", append=True)
+        fx.banner("EXPIRED", genesis, "", ">\n" + old_b)
+        doc_b5 = fx.repo / CERT_DOC
+        doc_b5.write_text(doc_b5.read_text(encoding="utf-8").replace(
+            "**Binds to:**", "Last LIVE bind (historical):", 1), encoding="utf-8")
+        b5 = fx.commit([mod_rs, CERT_DOC], "6124 cell b5")
+        t.expect_red("6124-b5", "the bound SHA dropped while EXPIRED with a record deleted",
+                     repo, mb_d, b5, append6124)
     except Exception as exc:  # noqa: BLE001 - #6445: name the family, run the rest
         t.fail(f"(6124-d*) crashed: {type(exc).__name__}: {exc}")
 
@@ -3363,7 +3425,11 @@ SELF_TEST_OK = (
     "an HTML block or fence opened in a `> - ` / `> 1. ` item, behind an indented `>` or a "
     "`>` + tab RED; (6124-p*, #6420) a record away from the ledger RED; (6124-d*, #6423) a "
     "doc-only delete, re-date, edit, reorder, addition (#6731) or doc deletion of the records, "
-    "and a record deleted alongside a new Binds-to value or EXPIRED -> VOID (#6726), RED; (6124-i*) a "
+    "and a record deleted alongside a new Binds-to value or EXPIRED -> VOID (#6726), RED; (6124-b1, "
+    "#6774) a Binds-to edit setting a SHA with STATUS EXPIRED kept beside a wire change RED, "
+    "(6124-b2) EXPIRED -> VOID and (6124-b3) dropping the bound SHA beside it GREEN, and "
+    "(6124-b4) a bound SHA set again after the drop and (6124-b5) a drop that deletes a "
+    "record RED; (6124-i*) a "
     "header citing zero, two, three or a suffixed issue RED; (6124-m*) the #6063 cite as an "
     "image RED; (6124-e*) no re-issue advice for an EXPIRED deleted or garbled doc; "
     "(6124-k*, #6444) the six mutant-killing cells; (6124-b*, design B, vote 6def5ab6) a ledger "
