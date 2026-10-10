@@ -743,6 +743,7 @@ mod postgres_parity {
     #[tokio::test]
     #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — live postgres"]
     async fn pg_head_hash_clean_chain_not_detected_and_rewrite_mismatch() {
+        const MAX_WATERMARK_APPENDS: usize = 300;
         // #7031 H3: run in a private schema. The old `DELETE FROM agent_lineage`
         // on the shared base removed every row but left the durable
         // `lineage_integrity_watermark` high-water mark standing, so every later
@@ -769,17 +770,37 @@ mod postgres_parity {
         // Drive the REAL pg append path until a watermark is anchored. Each
         // `emit_spawn_audit` stamps `Utc::now()` (nanoseconds) — the exact F2 skew
         // surface — and appends through `pg_append_signed_event_with_chain`.
+        pg.emit_spawn_audit("argv0-genesis", "1822-f2-headhash")
+            .await;
+        let (genesis_id, genesis_agent, genesis_payload): (String, String, Vec<u8>) =
+            sqlx::query_as(ai_memory::signed_events::GENESIS_ROW_SQL)
+                .fetch_one(pg.pool())
+                .await
+                .expect("read private PostgreSQL audit genesis");
+        let db_id = ai_memory::signed_events::db_id_from_genesis_parts(
+            &genesis_id,
+            &genesis_agent,
+            &genesis_payload,
+        );
         let mut anchored: Option<i64> = None;
-        for i in 0..300 {
+        for i in 0..MAX_WATERMARK_APPENDS {
             pg.emit_spawn_audit(&format!("argv0-{i}"), "1822-f2-headhash")
                 .await;
-            if let Some((seq, _)) = witness::last_audit_watermark(None) {
+            if let Some((seq, _)) = witness::last_audit_watermark(Some(&db_id)) {
                 anchored = Some(seq); // fired on the just-appended head → anchored == head
                 break;
             }
         }
         let anchored =
             anchored.expect("#7115: configured PostgreSQL fixture must emit an audit watermark");
+        let current_head: i64 = sqlx::query_scalar("SELECT MAX(sequence) FROM signed_events")
+            .fetch_one(pg.pool())
+            .await
+            .expect("read anchored PostgreSQL head");
+        assert_eq!(
+            anchored, current_head,
+            "watermark must anchor the actual head"
+        );
 
         // CLEAN chain: the anchored row survives intact → the micros-readback
         // recompute MATCHES the anchor (also micros, post-#2203) → NotDetected.
@@ -814,12 +835,18 @@ mod postgres_parity {
 
         // SAME-LENGTH rewrite of the anchored (head) row → the at-anchored-seq
         // recompute differs from the anchor → Mismatch (#2202 on pg).
-        sqlx::query("UPDATE signed_events SET payload_hash = $1 WHERE sequence = $2")
-            .bind(vec![0x11u8; 32])
-            .bind(anchored)
-            .execute(pg.pool())
-            .await
-            .expect("rewrite anchored row");
+        let rewritten =
+            sqlx::query("UPDATE signed_events SET payload_hash = $1 WHERE sequence = $2")
+                .bind(vec![0x11u8; 32])
+                .bind(anchored)
+                .execute(pg.pool())
+                .await
+                .expect("rewrite anchored row");
+        assert_eq!(
+            rewritten.rows_affected(),
+            1,
+            "rewrite must reach the anchor"
+        );
         let report2 = pg
             .verify_audit_trail(None, None)
             .await
