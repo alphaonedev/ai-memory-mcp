@@ -1050,8 +1050,9 @@ def _judge(repo, base, head, judged, mb, tip):
             return ok, "\n".join([head_line] + more)
 
     status_mb = banner_mb[0] if cert_touched else cert_banner(repo, mb)[0]
-    amendable = status_mb in ("EXPIRED", "VOID") and not deleted and not malformed
-    out = [EXPIRY_AMEND_SENTENCE.format(status=status_mb) if amendable else EXPIRY_SENTENCE]
+    expired = status_mb in ("EXPIRED", "VOID")
+    amendable = expired and not deleted and not malformed
+    out = [EXPIRY_AMEND_SENTENCE.format(status=status_mb) if expired else EXPIRY_SENTENCE]
     if incidental:
         out.append(
             "The cert doc WAS edited in this change, but neither its STATUS line "
@@ -1102,6 +1103,14 @@ def _judge(repo, base, head, judged, mb, tip):
     out.append("")
     if amendable:
         out.extend(amendment_remedy(status_mb, set(watched) | set(added) | set(removed)))
+    elif expired:
+        out.append(
+            f"Remedy: restore {CERT_DOC} with its banner exactly as it was (a deleted or "
+            f"garbled banner is not a record), then record this change as an amendment "
+            f"(#6124). The certification is {status_mb}: only the WP-B1 re-cert "
+            f"({RE_CERT_ISSUE}) re-issues it, and re-binding without re-measurement is "
+            "forbidden (#3899)."
+        )
     else:
         out.append(
             f"Remedy: modify {CERT_DOC} in this same change (re-issue against the "
