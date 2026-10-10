@@ -2965,6 +2965,19 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         d10 = banner_cell("EXPIRED", mb_d, led_ab, "d10")
         t.expect_green("6124-d10", "Binds-to changed by a doc-only change, ledger untouched", repo,
                        mb_d, d10)
+        # (6124-b1) RED #6774 - while the merge-base is EXPIRED/VOID the rule-B
+        # hatch needs a STATUS change: a Binds-to-only edit beside a wire change
+        # keeps STATUS, so it is neither a re-issue nor a voiding record (#3899
+        # forbids re-binding without re-measurement) and must take the amendment
+        # route. b2 is the GREEN control (EXPIRED -> VOID beside a wire change).
+        rebind6774 = [("is not a re-issue and not a voiding record (#6774)",
+                       "did not refuse a Binds-to-only edit as the hatch")]
+        b1 = banner_cell("EXPIRED", mb_d, led_ab, "b1", touch=(mod_rs,))
+        t.expect_red("6124-b1", "Binds-to changed with STATUS EXPIRED kept and a wire change",
+                     repo, mb_d, b1, rebind6774)
+        b2 = banner_cell("VOID", genesis, led_ab, "b2", touch=(mod_rs,))
+        t.expect_green("6124-b2", "EXPIRED -> VOID with a wire change, ledger untouched", repo,
+                       mb_d, b2)
     except Exception as exc:  # noqa: BLE001 - #6445: name the family, run the rest
         t.fail(f"(6124-d*) crashed: {type(exc).__name__}: {exc}")
 
