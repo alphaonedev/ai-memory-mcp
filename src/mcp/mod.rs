@@ -3570,7 +3570,7 @@ fn handle_request(
             ok_response(
                 id,
                 json!({
-                    "protocolVersion": protocol_revision,
+                    (jsonrpc::PROTOCOL_VERSION_FIELD): protocol_revision,
                     (field_names::CAPABILITIES): { "tools": {}, "prompts": {} },
                     "serverInfo": server_info,
                 }),
