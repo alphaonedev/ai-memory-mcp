@@ -2001,6 +2001,19 @@ def self_test():
             workflow_pin_problems(r10_env("PASSWORD: ${{ needs.a.outputs.b }} " + r11_gap_tail)))
         else "the needs problem echoes the value or lacks the owning key"))
 
+    # round12 #6880: a token cut by the row limit of a separator-less refusal row is masked before it is cut.
+    def r12_cut_leak():
+        for column in range(10, 24):
+            text = r10_env("y" * column + "gh" + "p_" + "Zq7" * 12)
+            problems = workflow_pin_problems(text)
+            if not problems:
+                return f"workflow_pin_problems is empty at column {column}"
+            if any(re.search("gh" + "p_[A-Za-z0-9]", p) for p in problems):
+                return f"a refusal at column {column} echoes body characters of a cut token"
+        return None
+
+    check("round12 #6880: a token cut by the row limit of a separator-less refusal row is masked", r12_cut_leak)
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"

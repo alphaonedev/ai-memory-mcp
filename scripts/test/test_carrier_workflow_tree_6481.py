@@ -8,6 +8,7 @@ uses this file with the gate self-test to kill mutations of `parse_workflow` and
 Stdlib only; run with `python3 scripts/test/test_carrier_workflow_tree_6481.py`.
 """
 import importlib.util
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -593,6 +594,13 @@ class Round11EchoMask(unittest.TestCase):
         self.assertEqual(SUBSET.echo("NOTE:\t" + self.TAIL + " and more text past col 24"), repr("NOTE:\t<withheld 37 chars>"))
         # #6892: the row is split at its first separator, not a later one.
         self.assertEqual(SUBSET.echo("NOTE: " + self.TAIL + " x=1"), repr("NOTE: <withheld 15 chars>"))
+
+    def test_a_row_without_a_separator_masks_a_token_before_it_is_cut_6880(self):
+        """A token that starts at column 10 to 23 of a separator-less row is cut by the row limit, not by its end."""
+        for column in range(10, 24):
+            row = "y" * column + "gh" + "p_" + "Zq7" * 12
+            shown = SUBSET.echo(row)
+            self.assertIsNone(re.search("gh" + "p_[A-Za-z0-9]", shown), (column, shown))
 
     def test_mask_shapes_the_round11_campaign_left_unkilled(self):
         """Mutants Y3 (quote allowed in an operand), Y4 (ghs_ prefix) and V7 (= as a row separator) survived."""
