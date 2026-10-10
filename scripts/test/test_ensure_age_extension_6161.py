@@ -1717,6 +1717,17 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertEqual(mod.supervise(read_fd, 30, [str(self.psql)]), mod.EXIT_UNAVAILABLE)
         self.assertEqual(spawned, [], "psql was spawned after the stop was recorded")
 
+    def test_probe_leaves_no_descriptor_open_in_the_helper_6847(self):
+        # #6847 (mutant S20): the supervisor is the only holder of the pipe's read end; the helper closes its
+        # copy after the spawn, so one probe leaves the helper's descriptor set unchanged.
+        mod = load_module()
+        url = f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb"
+        mod.probe_lists_age(str(self.psql), url)  # warm-up: imports and caches may open descriptors once
+        before = set(os.listdir("/dev/fd"))
+        self.assertFalse(mod.probe_lists_age(str(self.psql), url))
+        after = set(os.listdir("/dev/fd"))
+        self.assertEqual(after - before, set(), "probe_lists_age left a descriptor open in the helper")
+
 # ---- #6347: the libpq oracle behind the docstring claim "a URL the helper accepts is read the same way by libpq" --
 LIBPQ_CANDIDATES = (
     "/opt/homebrew/opt/libpq/lib/libpq.5.dylib",
