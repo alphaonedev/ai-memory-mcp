@@ -436,6 +436,26 @@ async fn wait_on(stream: &mut WakeStream, timeout: Option<Duration>) -> Option<W
     }
 }
 
+/// Fold one catch-up read result into the wake stream's backstop clock.
+///
+/// `Some(envelope)` after a read that completed; `None` after one that
+/// failed. (#6233 red: the failed arm still acknowledges a read.)
+fn settle_catch_up(stream: &mut WakeStream, result: anyhow::Result<Value>) -> Option<Value> {
+    match result {
+        Ok(v) => {
+            stream.note_read();
+            Some(v)
+        }
+        Err(e) => {
+            // Degrade, never corrupt: the row is committed and the next
+            // signal (at worst the backstop) reads it again.
+            tracing::error!("wake listener: catch-up inbox read failed ({e:#}); will retry");
+            stream.note_read();
+            None
+        }
+    }
+}
+
 /// Block until a wake is due, refusing if the hub credential will not load.
 ///
 /// The shape `ai-memory wake-listen` wants: an operator who ran the listener
@@ -536,20 +556,12 @@ pub async fn dispatch(
             },
         };
 
-        let envelope =
-            match catch_up_read(db_path, &resolved.agent_id, args.unread_only, args.limit).await {
-                Ok(v) => v,
-                Err(e) => {
-                    // Degrade, never corrupt: the row is committed and the next
-                    // signal (at worst the backstop) reads it again.
-                    tracing::error!(
-                        "wake listener: catch-up inbox read failed ({e:#}); will retry"
-                    );
-                    stream.note_read();
-                    continue;
-                }
-            };
-        stream.note_read();
+        let Some(envelope) = settle_catch_up(
+            &mut stream,
+            catch_up_read(db_path, &resolved.agent_id, args.unread_only, args.limit).await,
+        ) else {
+            continue;
+        };
         let count = envelope.get("count").and_then(Value::as_u64).unwrap_or(0);
 
         emit(&resolved, args, &signal, count).await?;

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::wait_on;
+use super::{settle_catch_up, wait_on};
 use crate::wake_client::{WakeClientConfig, WakeReason, WakeSignal, WakeStream};
 
 const POLL: Duration = Duration::from_secs(10);
@@ -116,4 +116,42 @@ async fn a_real_read_still_restarts_the_backstop_clock_4058() {
         elapsed >= Duration::from_secs(19) && elapsed <= Duration::from_secs(9) + POLL,
         "a completed read restarts the interval: returned at {elapsed:?}"
     );
+}
+
+/// RED before #6233: a FAILED catch-up read still called `note_read()`, so a
+/// failure at t=9 s moved the backstop to t=19 s and a persistently failing
+/// read postponed the retry forever. Only a completed read restarts the clock.
+#[tokio::test(start_paused = true)]
+async fn a_failed_catch_up_read_does_not_postpone_the_backstop_6233() {
+    let (mut stream, _inject) = WakeStream::start_injectable(cfg()).expect("start");
+    let started = Instant::now();
+    tokio::time::sleep(Duration::from_secs(9)).await;
+    let settled = settle_catch_up(&mut stream, Err(anyhow::anyhow!("inbox: database is locked")));
+    assert!(settled.is_none(), "a failed read yields no envelope");
+    let signal = wait_on(&mut stream, None)
+        .await
+        .expect("the backstop must fire");
+    assert_eq!(signal.reason, WakeReason::Backstop);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed <= POLL,
+        "a failed read must not postpone the backstop past one interval: returned at \
+         {elapsed:?}, bound {POLL:?}"
+    );
+}
+
+/// The completed-read half of the contract stays: a successful read restarts
+/// the backstop clock (the read just proved the inbox state).
+#[tokio::test(start_paused = true)]
+async fn a_completed_catch_up_read_restarts_the_backstop_6233() {
+    let (mut stream, _inject) = WakeStream::start_injectable(cfg()).expect("start");
+    let started = Instant::now();
+    tokio::time::sleep(Duration::from_secs(9)).await;
+    let settled = settle_catch_up(&mut stream, Ok(serde_json::json!({"count": 0})));
+    assert!(settled.is_some());
+    let signal = wait_on(&mut stream, None)
+        .await
+        .expect("the backstop must fire");
+    assert_eq!(signal.reason, WakeReason::Backstop);
+    assert!(started.elapsed() > POLL, "a completed read restarts the clock");
 }
