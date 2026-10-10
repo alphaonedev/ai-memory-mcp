@@ -26,8 +26,11 @@ fn mem_with_id(id: &str, content: &str, attest: Option<&str>) -> Memory {
     Memory {
         id: id.to_string(),
         tier: Tier::Long,
-        namespace: "ns-4208".into(),
-        title: "title-4208".into(),
+        // The store upserts on (title, namespace): derive both from the id so
+        // every cell (every id) owns its own slot and cells can run in parallel
+        // against one database (#6162 round 3).
+        namespace: format!("ns-4208-{id}"),
+        title: format!("title-4208-{id}"),
         content: content.into(),
         tags: Vec::new(),
         priority: 5,
