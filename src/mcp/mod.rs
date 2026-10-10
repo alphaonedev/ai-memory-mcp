@@ -385,6 +385,19 @@ fn observe_capture_nag(
     action
 }
 
+/// #6607 (`CodeQL` `rust/cleartext-logging`) — the `capture_lag` stderr line.
+/// The session id is NOT printed (it is server-minted per stdio process,
+/// `mcp-<uuid>`, and grants nothing, but it stays out of stderr); the audit
+/// event [`emit_capture_lag`] emits still carries it for correlation. Pure.
+fn capture_lag_line(agent_id: &str, streak: u32, threshold: u32, escalated: bool) -> String {
+    let tier = if escalated { "escalation" } else { "warn" };
+    format!(
+        "ai-memory capture_lag [{tier}]: agent={agent_id} session=<redacted; in the audit \
+         event> — {streak} consecutive non-capture tool calls (threshold {threshold}); \
+         call memory_store or memory_capture_turn to record progress"
+    )
+}
+
 /// Emit the L1 `capture_lag` signal: a stderr WARN (MCP convention —
 /// stdout owns JSON-RPC framing, diagnostics go to stderr) plus a
 /// hash-chained `capture_lag` audit event when auditing is enabled. The
@@ -397,11 +410,9 @@ fn emit_capture_lag(
     threshold: u32,
     escalated: bool,
 ) {
-    let tier = if escalated { "escalation" } else { "warn" };
     eprintln!(
-        "ai-memory capture_lag [{tier}]: agent={agent_id} session={session_id} — \
-         {streak} consecutive non-capture tool calls (threshold {threshold}); \
-         call memory_store or memory_capture_turn to record progress"
+        "{}",
+        capture_lag_line(agent_id, streak, threshold, escalated)
     );
     if !crate::audit::is_enabled() {
         return;
@@ -5496,6 +5507,22 @@ pub fn run_mcp_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #6607 — the `capture_lag` stderr line keeps agent, tier and streak
+    /// counts and carries no session id (the audit event still does).
+    #[test]
+    fn capture_lag_line_omits_session_id_6607() {
+        let line = capture_lag_line("ai:placeholder-agent", 7, 5, true);
+        assert!(line.contains("agent=ai:placeholder-agent"));
+        assert!(line.contains("[escalation]"));
+        assert!(line.contains("7 consecutive non-capture tool calls (threshold 5)"));
+        assert!(line.contains("session=<redacted"));
+        assert!(
+            !line.contains("mcp-"),
+            "no session id shape may reach the line"
+        );
+        assert!(capture_lag_line("a", 1, 1, false).contains("[warn]"));
+    }
     use crate::models::{Memory, Tier};
     use serde_json::json;
 
