@@ -474,24 +474,8 @@ def rel_path(root, path):
         return str(path)
 
 
-def compliance_docs(root):
-    """Return (docs, problems) for the scan set: every ``*.md`` (any case) under docs/compliance/.
-
-    The walk never skips silently (#6169, #6197). A directory that cannot be listed, or a missing
-    docs/compliance/, raises Unreadable (exit 2). Symlinked directories, docs/compliance/ itself
-    included, are refused and never followed: following one would scan documents outside the
-    reviewed tree and admit cycles, and a git checkout of this tree contains none. A symlinked
-    document is read only when it resolves inside the repository; one that leaves it is refused.
-    """
-    top = root / "docs" / "compliance"
-    if os.path.islink(str(top)):
-        return [], ["%s: symlinked directory refused (not scanned)" % rel_path(root, top)]
-
-    def unlistable(err):
-        raise Unreadable(rel_path(root, err.filename if err.filename else top))
-
-    docs, problems = [], []
-    real_root = root.resolve()
+def _walk_docs(root, real_root, top, unlistable, docs, problems):
+    """Append the Markdown documents under ``top`` to ``docs`` and each refusal to ``problems``."""
     for dirpath, dirnames, filenames in os.walk(str(top), onerror=unlistable):
         for name in dirnames:
             if os.path.islink(os.path.join(dirpath, name)):
@@ -499,9 +483,14 @@ def compliance_docs(root):
                     "%s: symlinked directory refused (not scanned)" % rel_path(root, Path(dirpath) / name)
                 )
         for name in filenames:
-            if not name.lower().endswith(".md"):
-                continue
             path = Path(dirpath) / name
+            if not markdown_like(name.casefold()):
+                if markdown_like(name_key(name)):
+                    problems.append(
+                        "%s: name only looks like a Markdown document (invisible character, trailing space "
+                        "or look-alike form; refused)" % rel_path(root, path)
+                    )
+                continue
             if path.is_symlink():
                 try:
                     os.stat(str(path))
@@ -523,6 +512,66 @@ def compliance_docs(root):
                     )
                     continue
             docs.append(path)
+
+
+# GitHub renders each of these as Markdown (#6634).
+MARKDOWN_EXTS = (
+    ".md", ".markdown", ".mdown", ".mkdn", ".mkd", ".mdwn", ".mdx", ".mkdown", ".livemd", ".ronn", ".scd", ".workbook",
+)
+
+
+def name_key(name):
+    """``name`` as a reader sees it: invisible characters removed, NFKC, casefolded, trailing space dropped."""
+    return unicodedata.normalize("NFKC", visible(name)).casefold().rstrip()
+
+
+def markdown_like(key):
+    """True when ``key`` ends with a Markdown extension or holds one followed by a dot (``A.md.txt``)."""
+    return key.endswith(MARKDOWN_EXTS) or any(ext + "." in key for ext in MARKDOWN_EXTS)
+
+
+def compliance_docs(root):
+    """Return (docs, problems) for the scan set: the Markdown documents under docs/compliance/.
+
+    Scanned (#6634): every directory under docs/ whose name, with invisible characters removed and
+    NFKC and casefold applied, is ``compliance`` (docs/compliance/ itself must exist); in them,
+    every file whose name in any letter case ends with a GitHub Markdown extension
+    (``MARKDOWN_EXTS``) or holds one followed by a dot. A name that is Markdown only once invisible
+    characters, a trailing space or an NFKC-only form (a look-alike dot, fullwidth letters) is
+    normalised away is refused, never skipped.
+
+    The walk never skips silently (#6169, #6197). A directory that cannot be listed, or a missing
+    docs/compliance/, raises Unreadable (exit 2). Symlinked directories, docs/compliance/ itself
+    included, are refused and never followed: following one would scan documents outside the
+    reviewed tree and admit cycles, and a git checkout of this tree contains none. A symlinked
+    document is read only when it resolves inside the repository; one that leaves it is refused.
+    """
+    top = root / "docs" / "compliance"
+    if os.path.islink(str(top)):
+        return [], ["%s: symlinked directory refused (not scanned)" % rel_path(root, top)]
+    if not os.path.isdir(str(top)):
+        raise Unreadable(rel_path(root, top))
+    try:
+        siblings = sorted(os.listdir(str(root / "docs")))
+    except OSError:
+        raise Unreadable(rel_path(root, root / "docs")) from None
+
+    def unlistable(err):
+        raise Unreadable(rel_path(root, err.filename if err.filename else top))
+
+    docs, problems = [], []
+    tops = [top]
+    for name in siblings:
+        path = root / "docs" / name
+        if name == "compliance" or name_key(name) != "compliance":
+            continue
+        if os.path.islink(str(path)):
+            problems.append("%s: symlinked directory refused (not scanned)" % rel_path(root, path))
+        elif os.path.isdir(str(path)):
+            tops.append(path)
+    real_root = root.resolve()
+    for walk_top in tops:
+        _walk_docs(root, real_root, walk_top, unlistable, docs, problems)
     return sorted(docs), problems
 
 
