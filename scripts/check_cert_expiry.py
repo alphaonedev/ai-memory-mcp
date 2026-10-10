@@ -3490,6 +3490,7 @@ def _log_safe_cells(t):
         if log_safe(plain) != plain:
             t.fail(f"(log-safe-plain): log_safe changed {plain!r} to {log_safe(plain)!r}")
     _log_safe_table_cell(t)
+    _log_safe_di_cell(t)
 
 
 # Every Cf code point of Unicode 15.0 as the cell's own oracle for LOG_CF_RANGES (#6683); the nine code
@@ -3523,6 +3524,31 @@ def _log_safe_table_cell(t):
         unicodedata.category = saved
 
 
+# Default_Ignorable_Code_Point (Unicode 15.0) that is not Cf, plus U+2800 BRAILLE PATTERN BLANK: code points a
+# terminal renders as nothing; the cell's own oracle for LOG_INVISIBLE_RANGES (#6917).
+LOG_DI_ORACLE = ((0x034F, 0x034F), (0x115F, 0x1160), (0x17B4, 0x17B5), (0x180B, 0x180D), (0x180F, 0x180F),
+                 (0x2065, 0x2065), (0x2800, 0x2800), (0x3164, 0x3164), (0xFE00, 0xFE0F), (0xFFA0, 0xFFA0),
+                 (0xFFF0, 0xFFF8), (0xE0000, 0xE0000), (0xE0002, 0xE001F), (0xE0080, 0xE00FF),
+                 (0xE0100, 0xE01EF), (0xE01F0, 0xE0FFF))
+
+
+def _log_safe_di_cell(t):
+    """#6917: default-ignorable code points that are not format characters
+    (Hangul fillers, the combining grapheme joiner, variation selectors, the
+    unassigned default-ignorables, U+2800) render as nothing, so a printed
+    name carrying one can pass for the trusted name; log_safe() escapes every
+    one of them. Cell `log-safe-di-U+XXXX`, named by the first code point
+    printed wrongly."""
+    for first, last in LOG_DI_ORACLE:
+        for code in range(first, last + 1):
+            want = f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}"
+            got = log_safe(f"a{chr(code)}b")
+            if got != f"a{want}b":
+                t.fail(f"(log-safe-di-U+{code:04X}): log_safe printed the invisible U+{code:04X} as {got!r}, "
+                       f"not {'a' + want + 'b'!r}")
+                return
+
+
 def _round7_shapes(shapes, pr, wf_rel):
     """#6683 shapes: an approval trailer value and a workflow file name that
     carry a bidi override (U+202E)."""
@@ -3554,6 +3580,7 @@ SUMMARY_CELL_SOURCES = (
     ("_ws_wording_cells", ""),
     ("_log_safe_cells", ""),
     ("_log_safe_table_cell", ""),
+    ("_log_safe_di_cell", ""),
     ("_trusted_round7_cells", ""),
     ("_summary_cells", ""),
 )
