@@ -2659,6 +2659,49 @@ class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
                 self.assertEqual(want, any("R-DEBUG" in v for v in found), (label, found))
 
 
+    def _prune_flagged(self, cases: List[Tuple[str, List[str]]], want: bool) -> None:
+        for label, found in cases:
+            with self.subTest(label):
+                if want:
+                    self.assertTrue(any("R-PRUNE" in v for v in found), (label, found))
+                else:
+                    self.assertEqual([], found, label)
+
+    def test_6118_r7_6478_builds_outside_the_pruned_tree_are_flagged(self) -> None:
+        def run(line: str) -> List[str]:
+            return self._before_prune(R7_PRE + "        run: %s\n" % line)
+
+        def step_env(row: str) -> List[str]:
+            return self._before_prune(R7_PRE + "        env:\n          %s\n        run: cargo test --no-run\n" % row)
+
+        cfg = ".cargo/config.toml"
+        self._prune_flagged([
+            ("run --target-dir", run("cargo test --no-run --target-dir elsewhere")),
+            ("run --target-dir=", run("cargo build --target-dir=/srv/elsewhere")),
+            ("run --target triple", run("cargo test --no-run --target x86_64-unknown-linux-gnu")),
+            ("run --target=triple", run("cargo test --no-run --target=x86_64-unknown-linux-gnu")),
+            ("run --config build.target-dir", run("cargo test --no-run --config build.target-dir=\\\"elsewhere\\\"")),
+            ("run --config build.target", run("cargo test --no-run --config 'build.target=\"x86_64-unknown-linux-gnu\"'")),
+            ("run CARGO_TARGET_DIR prefix", run("CARGO_TARGET_DIR=elsewhere cargo test --no-run")),
+            ("run export CARGO_BUILD_TARGET", run("export CARGO_BUILD_TARGET=x86_64-unknown-linux-gnu")),
+            ("run GITHUB_ENV CARGO_BUILD_TARGET_DIR", run("echo \"CARGO_BUILD_TARGET_DIR=elsewhere\" >> \"$GITHUB_ENV\"")),
+            ("step env CARGO_TARGET_DIR", step_env("CARGO_TARGET_DIR: elsewhere")),
+            ("step env CARGO_BUILD_TARGET", step_env("CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu")),
+            ("job env CARGO_BUILD_TARGET_DIR", self._mutated(_replace_once(
+                self.ci, self.JOB_ENV, self.JOB_ENV + "      CARGO_BUILD_TARGET_DIR: elsewhere\n"))),
+            ("config [build] target-dir", self._repo_mutated(cfg, '[build]\ntarget-dir = "elsewhere"\n')),
+            ("config [build] target", self._repo_mutated(cfg, '[build]\ntarget = "x86_64-unknown-linux-gnu"\n')),
+            ("nested config dotted build.target-dir", self._repo_mutated("crates/sub/.cargo/config.toml",
+                                                                         'build.target-dir = "elsewhere"\n')),
+            ("step writes build.target-dir", run("printf '[build]\\\\ntarget-dir = \"elsewhere\"\\\\n' > .cargo/config.toml")),
+        ], True)
+
+    def test_6118_r7_6478_job_level_cargo_target_dir_stays_clean(self) -> None:
+        # the prune step reads ${CARGO_TARGET_DIR:-target}, so a job-wide CARGO_TARGET_DIR is pruned
+        self._prune_flagged([("job env CARGO_TARGET_DIR", self._mutated(_replace_once(
+            self.ci, self.JOB_ENV, self.JOB_ENV + "      CARGO_TARGET_DIR: /srv/target\n")))], False)
+
+
 class PruneScript6118(unittest.TestCase):
     """scripts/ci/prune-runner-target.py against a fake cargo target tree."""
 
