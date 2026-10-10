@@ -294,6 +294,17 @@ class Stack:
         try:
             proc = subprocess.Popen([self.binary, *args], env=env, stdout=log, stderr=subprocess.STDOUT)
             self.procs.append((name, proc, log))
+        except BaseException as exc:
+            # No child owns the log now, so close it here (#7040). A stop signal that
+            # arrived while the guard was active outranks the spawn error: the run
+            # must end as that signal (128+N), not as a failed start (exit 2).
+            log.close()
+            _spawn_guard["active"] = False
+            pending = _spawn_guard["pending"]
+            if pending is not None:
+                _spawn_guard["pending"] = None
+                raise Stopped(pending) from exc
+            raise
         finally:
             _spawn_guard["active"] = False
         pending = _spawn_guard["pending"]

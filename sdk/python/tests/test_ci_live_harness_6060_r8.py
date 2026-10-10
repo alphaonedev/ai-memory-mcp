@@ -239,3 +239,49 @@ def test_a_stop_signal_inside_spawn_does_not_orphan_the_child_6960(
             if child.poll() is None:
                 child.kill()
                 child.wait()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signals")
+def test_a_stop_signal_survives_a_failed_spawn_and_the_log_is_closed_7040(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stop signal deferred by the guard outranks a ``Popen`` error; the log handle is closed."""
+    h = _harness()
+    previous = {sig: signal.signal(sig, h._stop) for sig in h.STOP_SIGNALS}
+    (tmp_path / "run").mkdir()
+    stack = h.Stack(Path(sys.executable), tmp_path / "run", 0)
+    logs: list[object] = []
+    real_open = open
+
+    def spying_open(*args: object, **kwargs: object) -> object:
+        handle = real_open(*args, **kwargs)  # type: ignore[call-overload]
+        logs.append(handle)
+        return handle
+
+    def popen(argv: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        os.kill(os.getpid(), signal.SIGTERM)  # a stop is requested while the guard is active
+        raise FileNotFoundError(2, "No such file or directory", argv[0])
+
+    monkeypatch.setattr(h, "open", spying_open, raising=False)
+    monkeypatch.setattr(h.subprocess, "Popen", popen)
+    try:
+        with pytest.raises(h.Stopped) as stopped:
+            stack.spawn("daemon", "-c", "pass")
+        assert stopped.value.signum == signal.SIGTERM
+        assert isinstance(stopped.value.__cause__, FileNotFoundError)
+        assert h._spawn_guard == {"active": False, "pending": None}
+        assert stack.procs == []
+        assert len(logs) == 1
+        assert logs[0].closed, "the child's log handle was leaked"  # type: ignore[attr-defined]
+        # Without a pending stop signal the spawn error itself is what propagates.
+        monkeypatch.setattr(
+            h.subprocess,
+            "Popen",
+            lambda argv, **kw: (_ for _ in ()).throw(FileNotFoundError(2, "gone")),
+        )
+        with pytest.raises(FileNotFoundError):
+            stack.spawn("daemon", "-c", "pass")
+        assert logs[1].closed  # type: ignore[attr-defined]
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
