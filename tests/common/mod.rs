@@ -69,6 +69,19 @@
 #[cfg(feature = "sal-postgres")]
 pub mod postgres_env;
 
+// #6383 — per-binary Postgres database isolation (`AI_MEMORY_TEST_PG_ISOLATE=1`,
+// default off). Gated like `postgres_env`: it pulls sqlx, which the default
+// feature set must not link into every test binary.
+#[cfg(feature = "sal-postgres")]
+pub mod pg_isolate;
+
+// #6569 — the ONE declaration of `pg_barrier.rs` for every crate that has
+// `mod common;`. `pg_isolate` reaches it as `super::pg_barrier`, and a test file
+// that also needs it writes `use common::pg_barrier;`. A second `#[path]` load
+// in the same crate trips `clippy::duplicate_mod` (`-D clippy::all`).
+#[cfg(feature = "sal-postgres")]
+pub mod pg_barrier;
+
 // #3777 — the ONE lane-database predicate every guarded postgres cell calls.
 pub mod lane_db;
 
@@ -396,7 +409,16 @@ pub fn sign_rule(mut rule: Rule, signing: &SigningKey) -> Rule {
 /// files with bit-identical bodies before this consolidation.
 #[must_use]
 pub fn postgres_url() -> Option<String> {
-    std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()
+    // #6383: with `AI_MEMORY_TEST_PG_ISOLATE=1` this binary's own cloned
+    // database; flag off it is exactly the raw env value.
+    #[cfg(feature = "sal-postgres")]
+    {
+        pg_isolate::isolated_url()
+    }
+    #[cfg(not(feature = "sal-postgres"))]
+    {
+        std::env::var("AI_MEMORY_TEST_POSTGRES_URL").ok()
+    }
 }
 
 /// Read the `AI_MEMORY_TEST_AGE_URL` env var, returning `None` when
@@ -404,6 +426,9 @@ pub fn postgres_url() -> Option<String> {
 /// tests. Mirrored here for symmetry with `postgres_url`.
 #[must_use]
 pub fn age_url() -> Option<String> {
+    // #6383: mint first so the AGE URL is rewritten to the same clone.
+    #[cfg(feature = "sal-postgres")]
+    let _ = pg_isolate::isolated_url();
     std::env::var("AI_MEMORY_TEST_AGE_URL").ok()
 }
 
