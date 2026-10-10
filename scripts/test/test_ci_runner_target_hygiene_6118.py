@@ -2028,6 +2028,83 @@ def _tree_size(root: Path) -> int:
     return total
 
 
+R7_CFG = "profile.dev.debug=2"
+R7_PRE = "      - name: Probe\n"
+CHECK_RUNS_ON = "    runs-on: ${{ fromJSON(matrix.runner) }}\n"
+
+
+class StrictReader6118(_GuardHelpers6118, unittest.TestCase):
+    """Round 7 (3-agent vote (6def5ab6), option C): the reader refuses every row it cannot read.
+
+    Each case is valid YAML that GitHub Actions runs with debuginfo above 0 (or
+    with a hidden key); each must give R-DEBUG or R-SHAPE, never silence.
+    """
+
+    def _flagged(self, found: List[str]) -> bool:
+        return any("R-DEBUG" in v or "R-SHAPE" in v for v in found)
+
+    def _step_cases(self, cases: List[Tuple[str, str]]) -> None:
+        for label, step_yaml in cases:
+            with self.subTest(label):
+                found = self._before_prune(step_yaml)
+                self.assertTrue(self._flagged(found), (label, found))
+
+    def _job_cases(self, cases: List[Tuple[str, str]]) -> None:
+        for label, job_yaml in cases:
+            with self.subTest(label):
+                found = self._mutated(_replace_once(self.ci, CHECK_RUNS_ON, CHECK_RUNS_ON + job_yaml))
+                self.assertTrue(self._flagged(found), (label, found))
+
+    def _top_cases(self, cases: List[Tuple[str, str]]) -> None:
+        for label, top_yaml in cases:
+            with self.subTest(label):
+                found = self._mutated(_replace_once(self.ci, "\njobs:\n", "\n" + top_yaml + "jobs:\n"))
+                self.assertTrue(self._flagged(found), (label, found))
+
+    def test_6118_r7_6484_unreadable_step_keys_are_refused(self) -> None:
+        self._step_cases([
+            ("quoted run key", R7_PRE + '        "run": cargo test --no-run --config ' + R7_CFG + "\n"),
+            ("single-quoted run key", R7_PRE + "        'run': cargo test --no-run --config " + R7_CFG + "\n"),
+            ("space before colon", R7_PRE + "        run : cargo test --no-run --config " + R7_CFG + "\n"),
+            ("quoted uses key", R7_PRE + "        'uses': evil/action@v1\n"),
+            ("quoted working-directory key", R7_PRE + '        "working-directory": sub\n        run: cargo test\n'),
+            ("dash and three spaces", "      -   name: Probe\n          run: cargo test --no-run --config " + R7_CFG + "\n"),
+            ("bare dash then keys", "      -\n        name: Probe\n        run: cargo test --no-run --config " + R7_CFG + "\n"),
+            ("anchor on run", R7_PRE + "        run: &x cargo test --no-run --config " + R7_CFG + "\n"),
+            ("duplicate run key", R7_PRE + "        run: cargo test\n        run: cargo test --config " + R7_CFG + "\n"),
+        ])
+
+    def test_6118_r7_6484_unreadable_defaults_keys_are_refused(self) -> None:
+        self._job_cases([
+            ("job quoted working-directory", '    defaults:\n      run:\n        "working-directory": sub\n'),
+            ("job working-directory space colon", "    defaults:\n      run:\n        working-directory : sub\n"),
+            ("job quoted defaults key", "    'defaults':\n      run:\n        working-directory: sub\n"),
+        ])
+        self._top_cases([
+            ("workflow quoted working-directory", 'defaults:\n  run:\n    "working-directory": sub\n'),
+            ("workflow unknown top key", "x-anchors: &a\n  CARGO_PROFILE_DEV_DEBUG: '2'\n"),
+        ])
+
+    def test_6118_r7_6485_block_header_indentation_indicator_is_read_or_refused(self) -> None:
+        body = "          cargo test --no-run --config " + R7_CFG + "\n"
+        self._step_cases([
+            ("|2", R7_PRE + "        run: |2\n" + body),
+            (">2", R7_PRE + "        run: >2\n" + body),
+            ("|-2", R7_PRE + "        run: |-2\n" + body),
+            ("|2-", R7_PRE + "        run: |2-\n" + body),
+            ("with input |2", R7_PRE + "        uses: actions/cache@v4\n        with:\n          path: |2\n"
+             "            x\n          key: |2\n            --config " + R7_CFG + "\n"),
+        ])
+
+    def test_6118_r7_6486_multi_line_flow_run_is_read_or_refused(self) -> None:
+        self._step_cases([
+            ("plain continuation", R7_PRE + "        run: cargo test --no-run\n          --config " + R7_CFG + "\n"),
+            ("double-quoted continuation", R7_PRE + '        run: "cargo test --no-run\n          --config ' + R7_CFG + '"\n'),
+            ("single-quoted continuation", R7_PRE + "        run: 'cargo test --no-run\n          --config " + R7_CFG + "'\n"),
+            ("unterminated quote", R7_PRE + '        run: "cargo test --no-run --config ' + R7_CFG + "\n"),
+        ])
+
+
 class PruneScript6118(unittest.TestCase):
     """scripts/ci/prune-runner-target.py against a fake cargo target tree."""
 
