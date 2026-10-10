@@ -163,6 +163,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -2923,6 +2924,7 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     _round3_shapes(repo, shapes, pr, approve, wf_rel, c8_rel)
     _round4_shapes(shapes, pr, approve, wf_rel, c8_rel)
     _round5_shapes(shapes, pr, approve, wf_rel, c8_rel)
+    _round7_shapes(shapes, pr, wf_rel)
     # Merge-structure shapes off one PR head (#6138 cells, here in --trusted mode).
     fx.g("checkout", "-q", "-b", "h8", base)
     fx.write("src/unrelated.rs", "// h8 PR work\n", append=True)
@@ -3051,8 +3053,10 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     _trusted_round3_cells(tmp, t, judge, shapes)
     _trusted_round4_cells(judge, shapes)
     _trusted_round5_cells(judge, shapes)
+    _trusted_round7_cells(t, judge, shapes)
     _trusted_round3_fetch_cells(tmp, t, fx, mirror, head8, good8)
     _shim_trace_cells(t)
+    _log_safe_cells(t)
     _ws_unit_cells(t)
     _ws_format_cells(t)
     _ws_wording_cells(t)
@@ -3435,6 +3439,51 @@ def _round5_shapes(shapes, pr, approve, wf_rel, c8_rel):
     }
     for key, (edits, trailer_msg) in r5.items():
         shapes["r5-" + key] = pr("r5-" + key, edits, trailer_msg)
+
+
+# Unicode format characters (category Cf) that reorder or hide a printed name (#6683).
+LOG_CF = (0x00AD, 0x061C, 0x200B, 0x200C, 0x200D, 0x200E, 0x200F, *range(0x202A, 0x202F), 0x2060,
+          *range(0x2066, 0x206A), 0xFEFF)
+
+
+def _log_safe_cells(t):
+    """#6683: log_safe() escapes Unicode format characters (bidi controls,
+    zero-width characters, soft hyphen, BOM) as \\uNNNN, so a printed name
+    cannot be shown reordered or invisible; ASCII, a section sign and NBSP
+    pass through unchanged."""
+    for code in LOG_CF:
+        got = log_safe(f"a{chr(code)}b")
+        if got != f"a\\u{code:04x}b":
+            t.fail(f"(log-safe-cf-U+{code:04X}): log_safe left U+{code:04X} unescaped or mangled: {got!r}")
+    # Every Cf code point of this interpreter's Unicode tables, sweep (the table version differs by Python).
+    for code in range(0x110000):
+        if unicodedata.category(chr(code)) == "Cf" and "\\" not in log_safe(chr(code)):
+            t.fail(f"(log-safe-cf-sweep): log_safe left the format character U+{code:04X} raw")
+            break
+    for plain in ("plain ascii-name_1.yml", "\xa77 / F7", "a\u00a0b", "caf\u00e9"):
+        if log_safe(plain) != plain:
+            t.fail(f"(log-safe-plain): log_safe changed {plain!r} to {log_safe(plain)!r}")
+
+
+def _round7_shapes(shapes, pr, wf_rel):
+    """#6683 shapes: an approval trailer value and a workflow file name that
+    carry a bidi override (U+202E)."""
+    shapes["r7-cf-who"] = pr("r7-cf-who", {wf_rel: "name: weakened (fixture)\n"},
+                             "\n\nRule-Change-Approved-By: Appr\u202eoved")
+    shapes["r7-cf-name"] = pr("r7-cf-name", {".github/workflows/x\u202ey.yml": f"name: {CERT_CONTEXT_FIXTURE}\n"})
+
+
+def _trusted_round7_cells(t, judge, shapes):
+    """#6683: a bidi override in an approval trailer or a workflow file name
+    is printed escaped (\\u202e), never raw."""
+    out = judge("tr-log-cf-who", "an approval trailer value carrying U+202E", *shapes["r7-cf-who"], ok=True,
+                needles=("approval trailer(s): Appr\\u202eoved", "::warning title=GUARD CHANGED::"))
+    if "\u202e" in out:
+        t.fail("(tr-log-cf-who): a raw U+202E from the trailer reached the log:", out)
+    out = judge("tr-log-cf-name", "a workflow file name carrying U+202E", *shapes["r7-cf-name"],
+                needles=("GUARD SHADOW: .github/workflows/x\\u202ey.yml",))
+    if "\u202e" in out:
+        t.fail("(tr-log-cf-name): a raw U+202E from the file name reached the log:", out)
 
 
 def _ws_unit_cells(t):
