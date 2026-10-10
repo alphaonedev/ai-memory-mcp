@@ -2300,3 +2300,46 @@ Status `completed`, conclusion `success`, created 2026-10-10T17:28:55Z, updated 
 | 114270871215 | Claude plugin manifest gate (#3967) | GitHub Actions 1000126020 | 17:28:56Z | 29.1 min | 17:58:05Z | 17:58:13 | 0.1 min | success |
 | 114270871223 | No-credentials-on-argv gate (#4577) | GitHub Actions 1000126021 | 17:28:56Z | 29.3 min | 17:58:15Z | 17:58:22 | 0.1 min | success |
 | 114270871242 | Doc surface completeness gate (#2839) | GitHub Actions 1000126023 | 17:28:56Z | 29.5 min | 17:58:24Z | 17:58:35 | 0.2 min | success |
+
+## Update 18:18Z: run 38069454896 Per-Module Coverage Thresholds (fix/6142-promo6-ssh @ 46efe00ab) reached terminal state
+
+Status `completed`, conclusion `cancelled`, created 2026-10-10T16:52:59Z, updated 2026-10-10T18:09:10Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38069454896
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114263711313 | Coverage classify (docs-only short-circuit) | GitHub Actions 1000125255 | 16:52:59Z | 0.1 min | 16:53:02Z | 16:53:10 | 0.1 min | success |
+| 114263749302 | Per-Module Coverage Thresholds | GitHub Actions 1000125326 | 16:53:10Z | 0.7 min | 16:53:50Z | 18:09:09 | 75.3 min (over 45) | cancelled |
+
+- job 114263749302 `Per-Module Coverage Thresholds`: cancelled, first non-green step: `Generate coverage JSON` (https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38069454896/job/114263749302)
+
+Failed-log excerpt (secrets masked, <= 20 lines):
+
+```
+(no matching lines in --log-failed)
+```
+
+## Update 18:18Z: run 38069474052 Per-Module Coverage Thresholds (fix/6141-promo6-ssh @ 7110dd960) reached terminal state
+
+Status `completed`, conclusion `cancelled`, created 2026-10-10T16:53:15Z, updated 2026-10-10T18:10:38Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38069474052
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114263765887 | Coverage classify (docs-only short-circuit) | GitHub Actions 1000125322 | 16:53:15Z | 0.5 min | 16:53:46Z | 16:53:55 | 0.1 min | success |
+| 114263894665 | Per-Module Coverage Thresholds | GitHub Actions 1000125417 | 16:53:55Z | 1.6 min | 16:55:34Z | 18:10:37 | 75.0 min (over 45) | cancelled |
+
+- job 114263894665 `Per-Module Coverage Thresholds`: cancelled, first non-green step: `Post Cache HuggingFace models (#2019)` (https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38069474052/job/114263894665)
+
+Failed-log excerpt (secrets masked, <= 20 lines):
+
+```
+(no matching lines in --log-failed)
+```
+
+## Update 18:18Z: run 38069478180 Per-Module Coverage Thresholds (fix/6152-6153-promo6-ssh @ 3406b3338) reached terminal state
+
+Status `completed`, conclusion `success`, created 2026-10-10T16:53:19Z, updated 2026-10-10T18:09:42Z, https://github.com/alphaonedev/ai-memory-mcp/actions/runs/38069478180
+
+| job id | job | runner | created | queue wait | started | ended | duration | conclusion |
+|---|---|---|---|---|---|---|---|---|
+| 114263777794 | Coverage classify (docs-only short-circuit) | GitHub Actions 1000125361 | 16:53:19Z | 1.1 min | 16:54:25Z | 16:54:33 | 0.1 min | success |
+| 114264023380 | Per-Module Coverage Thresholds | GitHub Actions 1000125443 | 16:54:34Z | 2.6 min | 16:57:13Z | 18:09:41 | 72.5 min (over 45) | success |
