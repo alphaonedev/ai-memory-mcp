@@ -418,12 +418,14 @@ impl<'a> PersonaGenerator<'a> {
         // mid-sequence failure left an orphaned / mis-attested persona row.
         // Wrap the memory insert + N derived_from links + the metadata patch
         // (none of which use an inner transaction) in one unit; the guard rolls
-        // back on any early `?` (Transaction's Drop default). `generate()` is a
+        // back on any early `?` (`WriteTxn`'s Drop issues ROLLBACK). `generate()` is a
         // top-level call so there is no nesting. The signed_events emit is
         // committed-after (it self-transacts via append_signed_event).
-        let persona_tx = self
-            .conn
-            .unchecked_transaction()
+        //
+        // BEGIN IMMEDIATE (#5084, the #2250 class): `db::insert` reads the
+        // title slot before it writes, so a DEFERRED upgrade could fail with
+        // SQLITE_BUSY_SNAPSHOT (not retried by busy_timeout).
+        let persona_tx = crate::storage::connection::WriteTxn::begin(self.conn)
             .context("begin persona write transaction")?;
 
         // #2110 — persona rows are substrate-generated (the QW-2 generator
@@ -990,6 +992,31 @@ mod tests {
             lifecycle_state: crate::models::LifecycleState::Open,
         };
         db::insert(conn, &mem).unwrap()
+    }
+
+    /// #5084 / #5243 — `generate_in_scope` opens its write transaction
+    /// `BEGIN IMMEDIATE`: a second writer cannot commit inside its
+    /// read-then-write window, and the lock upgrade does not fail with
+    /// `SQLITE_BUSY_SNAPSHOT`.
+    #[test]
+    fn generate_in_scope_is_immediate_5084() {
+        use crate::storage::txn_immediate_5084_tests::{arm_interleaved_writer_5084, disarm_5084};
+        let (mut conn, dir) = fresh_db();
+        seed_two_alice_reflections(&conn, "team/alpha");
+        let committed = arm_interleaved_writer_5084(&mut conn, &dir.path().join("ai-memory.db"));
+        let llm = StubLlm {
+            canned: "Alice is methodical.".into(),
+        };
+        let out = {
+            let generator = PersonaGenerator::new(&conn, &llm, None, PersonaConfig::default());
+            generator.generate("alice", "team/alpha")
+        };
+        assert!(disarm_5084(&mut conn), "interleaving hook never fired");
+        assert!(out.is_ok(), "#5084 generate_in_scope failed: {out:?}");
+        assert!(
+            !committed.get(),
+            "#5084 generate_in_scope: a concurrent writer committed inside the window"
+        );
     }
 
     #[test]

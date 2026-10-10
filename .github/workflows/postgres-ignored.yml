@@ -22,8 +22,12 @@
 name: Postgres ignored tests (#3274)
 
 on:
+  # #5447: rehearsal/** is a PR BASE here (the batch landing line). It is added to
+  # pull_request.branches ONLY, never to push.branches: #2506 (both lists edited
+  # together), #2523 and #2508 (push must not overlap a PR head such as
+  # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
-    branches: ["release/**"]
+    branches: ["release/**", "rehearsal/**", "chain/**"]
   push:
     branches: ["release/**"]
   workflow_dispatch:
@@ -33,7 +37,7 @@ permissions:
 
 concurrency:
   group: pg-ignored-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always

@@ -66,8 +66,12 @@ on:
   # scripts/check-required-contexts.sh, which runs in this very workflow.
   push:
     branches: [main, develop, "release/**"]
+  # #5447: rehearsal/** is a PR BASE here (the batch landing line). It is added to
+  # pull_request.branches ONLY, never to push.branches: #2506 (both lists edited
+  # together), #2523 and #2508 (push must not overlap a PR head such as
+  # rehearsal/audit-wip, the head of the promotion PR).
   pull_request:
-    branches: [main, develop, "release/**"]
+    branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]
   # Merge Queue (#3089) — this workflow carries several REQUIRED gate contexts,
   # so it MUST report on the `merge_group` ref or the queue wedges. Its jobs
   # have no docs-only/event `if:` gating (the two event-scoped gates —
@@ -254,6 +258,10 @@ jobs:
         # in a tmpdir + invokes the gate against AI_MEMORY_DOCS_GATE_ROOT
         # = tmpdir; the gate must catch the drift.
         run: bash scripts/check-docs-vs-ssot.sh --self-test
+      - name: CLAUDE.md size ceiling (#4507)
+        run: python3 scripts/check-claude-md-size.py
+      - name: Self-test the CLAUDE.md size guard
+        run: python3 scripts/check-claude-md-size.py --self-test
 
   doc-symbol-anchor-gate:
     # Issue #2629 / 3x7 claims register. `check-docs-vs-ssot.sh` pins
@@ -403,9 +411,9 @@ jobs:
         # The release build, the assert pin, the release-shaped proof job and
         # the INSTALL "pre-built binaries" claim all follow the one declaration
         # in scripts/release-features.sh (sal-postgres ships).
-        run: bash scripts/check-release-features.sh
+        run: python3 scripts/check_release_features.py
       - name: Release feature-set guard self-test (a broken declaration must fail the build, #4480)
-        run: bash scripts/check-release-features.sh --self-test
+        run: python3 scripts/check_release_features.py --self-test
       - name: Self-test the gate (regression evidence)
         # Plants all four historical claims. The C-31 leg is the
         # load-bearing one: the workflow EXISTS and its job EXISTS, so
@@ -1088,11 +1096,22 @@ jobs:
     # change could merge through green CI while the cert kept being cited
     # (the #2444 "reports success while doing nothing" shape).
     #
-    # Diff range is the standard PR diff (merge-base-with-PR-base .. HEAD),
-    # NEVER a diff against the cert's pinned SHA, so unrelated later PRs
-    # do not fail forever. `fetch-depth: 0` is required (default
-    # actions/checkout@v4 is a shallow single-commit checkout of the PR
-    # merge ref, which cannot walk merge-base(base, head)).
+    # Diff range is the standard PR diff, NEVER a diff against the cert's
+    # pinned SHA, so unrelated later PRs do not fail forever. On
+    # pull_request (#6137, #6138) the gate judges the MERGE commit this job
+    # checked out (GITHUB_SHA), not the PR head in isolation and not the
+    # payload's PR_BASE_SHA (report-only; it can be stale). It computes NO
+    # merge-base: the range starts at the merge commit's first parent, which
+    # must be on the live base ref (GITHUB_BASE_REF, fetched explicitly if
+    # absent), and the second parent must be PR_HEAD_SHA, else it fails
+    # closed (push a new commit or sync the branch with the base; a re-run
+    # reuses the same GITHUB_SHA). A branch cut before the carrier's banner
+    # fix is judged on the tree that would actually merge. `fetch-depth: 0`
+    # is required (default actions/checkout@v4 is a shallow single-commit
+    # checkout of the PR merge ref, which cannot walk the history to the base
+    # branch; push and override ranges still need merge-base(base, head)).
+    # The Python runs with `-I` (isolated mode, precedent #5163) so a module in
+    # scripts/ can never shadow the standard library.
     #
     # No `needs:`, no job-level `if:`, no `paths:` filter — always runs.
     # Declared REQUIRED in required-contexts-release.txt and live-required
@@ -1111,8 +1130,9 @@ jobs:
           GITHUB_EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_BASE_REF: ${{ github.base_ref }}
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
-        run: bash scripts/check-cert-expiry.sh
+        run: python3 -I scripts/check_cert_expiry.py
       - name: Self-test the gate (regression evidence)
         # --self-test builds a throwaway repo under .local-runs/ (never a
         # real branch, never /tmp) and asserts: a watched-path violation
@@ -1128,7 +1148,18 @@ jobs:
         # diff (a non-ancestor bind is measured, not waved), a decoy or
         # duplicated banner line fail-closes, deleting the doc alongside a
         # wire change fail-closes, and a pure banner reformat is GREEN.
-        run: bash scripts/check-cert-expiry.sh --self-test
+        # (#6137, #6138) A stale-LIVE head banner is GREEN at the
+        # pull_request merge commit when the live base records EXPIRED, a
+        # head that flips the banner is detected over first-parent..merge-
+        # commit, a stale payload base sha is ignored, a stale branch is not
+        # charged for base-side wire changes (pr5), a base that moved by an
+        # unrelated commit stays GREEN (pr4-moved), a PR wire change without
+        # a banner flip is RED (pr6), and a missing or unresolvable base ref /
+        # head / merge commit, a non-hex sha, reversed parents, a second
+        # parent that is not the PR head, an octopus merge, or a first parent
+        # not on the base fail-close with their reason. (#5970) under GitHub
+        # Actions CERT_EXPIRY_BASE/HEAD overrides are refused.
+        run: python3 -I scripts/check_cert_expiry.py --self-test
 
   foreign-text-to-caller-gate:
     # #3688 gate 7 (Conductor ruling on the reviewer-f2r secret-to-sink sweep,
@@ -1261,11 +1292,10 @@ jobs:
   # ---------------------------------------------------------------------------
   # #3967 — three gates that existed and ran NOWHERE. Rule (g) of
   # check-required-contexts.sh now fails a check-*.sh that no workflow
-  # references, so these jobs are the burn-down half of that finding; the two
-  # gates still unwired (`check-count-assertion-declared.sh`,
-  # `check-shared-namespace-claims.sh`) carry dated entries in
-  # scripts/qc-allowlists/gates-not-wired.txt with the reason each cannot run
-  # on a PR event today. All three jobs are declared in
+  # references, so these jobs are the burn-down half of that finding; the one
+  # gate still unwired (`check-shared-namespace-claims.sh`) carries a dated
+  # entry in scripts/qc-allowlists/gates-not-wired.txt with the reason it
+  # cannot run on a PR event today. All three jobs are declared in
   # required-contexts-not-required.txt (rule (f)) until the branch-protection
   # call + live-pin update promote them together.
   url-sink-redaction-gate:
@@ -1317,6 +1347,40 @@ jobs:
       - name: Self-test the gate (regression evidence)
         run: bash scripts/check-stale-contract-assertions.sh --self-test
 
+  count-assertion-declared-gate:
+    # #5499 / #5517 / #5518 (5-agent vote 4d3ea1c5) -- a commit that moves a
+    # shared .len()/.count() count assertion must declare it (own Count: or a
+    # later Count-Declared: trailer). Enforced over the PR's merge-base..head
+    # range only: carrier-history offenders outside a PR range are not checked.
+    name: "Count-assertion declaration gate (#5499)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Run count-assertion declaration gate over the change range
+        env:
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            base="$(git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA")"
+            range="$base..$PR_HEAD_SHA"
+          elif [ -n "${GITHUB_EVENT_BEFORE:-}" ] && [ "$GITHUB_EVENT_BEFORE" != "0000000000000000000000000000000000000000" ] \
+               && git rev-parse --verify --quiet "$GITHUB_EVENT_BEFORE^{commit}" >/dev/null; then
+            range="$GITHUB_EVENT_BEFORE..$GITHUB_SHA"
+          else
+            range="HEAD~1..HEAD"
+          fi
+          echo "range=$range"
+          bash scripts/check-count-assertion-declared.sh --range "$range"
+      - name: Self-test the gate (regression evidence)
+        run: bash scripts/check-count-assertion-declared.sh --self-test
+
   claude-plugin-gate:
     # The `.claude-plugin/` manifest structural check; existed, ran nowhere.
     name: Claude plugin manifest gate (#3967)
@@ -1347,3 +1411,18 @@ jobs:
         # Green near-misses: file form, no password, redaction tokens,
         # shell expansion, the schema-init allowlist.
         run: python3 scripts/check-docs-no-argv-secrets.py --self-test
+
+  sqlite-write-txn-immediate-gate:
+    # #5084 / #5241: a rusqlite DEFERRED transaction that reads then writes
+    # fails with SQLITE_BUSY_SNAPSHOT (517), which busy_timeout never retries.
+    # Every SQLite write transaction in src/ must open via WriteTxn::begin
+    # (BEGIN IMMEDIATE). Fails closed on an unknown or unparseable open.
+    name: SQLite write-transaction IMMEDIATE gate (#5084)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run SQLite write-transaction IMMEDIATE gate
+        run: python3 scripts/check-sqlite-write-txn-immediate.py
+      - name: Self-test the gate (regression evidence)
+        run: python3 scripts/check-sqlite-write-txn-immediate.py --self-test

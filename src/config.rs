@@ -806,9 +806,9 @@ pub struct CapabilityFeatures {
     /// - **Column** (Task 1/8, commit `f5d8a9e`) —
     ///   `memories.reflection_depth INTEGER NOT NULL DEFAULT 0`,
     ///   first added in the recursive-learning schema bump (column
-    ///   inventory lives in `docs/MIGRATION_v0.7.md`; the current
-    ///   `CURRENT_SCHEMA_VERSION` is 53 in lockstep on both sqlite
-    ///   and postgres ladders as of v0.7.0 — v48 added
+    ///   inventory lives in `docs/MIGRATION_v0.7.md`; the v0.7.0
+    ///   `CURRENT_SCHEMA_VERSION` was 57 in lockstep on both sqlite
+    ///   and postgres ladders — v48 added
     ///   `federation_push_dlq` (#933), v49 added 14 nullable
     ///   `archived_memories` columns (#1025), v50 extended
     ///   `agent_quotas` PK with `namespace` (#1156), v51 added
@@ -3789,7 +3789,7 @@ pub struct AdminConfig {
     /// verbatim. Validation: the SAL accepts the same NHI
     /// `agent_id` charset that
     /// [`crate::validate::validate_agent_id`] enforces (see the
-    /// "Agent Identity (NHI)" section of CLAUDE.md). Entries that
+    /// "Agent Identity (NHI)" section of `docs/reference/ARCHITECTURE_REFERENCE.md`). Entries that
     /// fail validation at boot are logged at `warn` and dropped
     /// from the in-memory allowlist; the daemon still starts so
     /// a single typo does not lock the operator out.
@@ -13938,7 +13938,7 @@ max_page_size = 1000000
     #[test]
     fn pg_pool_env_const_names_byte_match_documented() {
         // Doc-name-match guard: these byte values are documented in
-        // CLAUDE.md's Environment Variables table + the enterprise
+        // docs/reference/ARCHITECTURE_REFERENCE.md's Environment Variables table + the enterprise
         // deployment guide §5.6. Pin the drift so it can never recur.
         assert_eq!(ENV_PG_POOL_MAX, "AI_MEMORY_PG_POOL_MAX");
         assert_eq!(ENV_PG_POOL_MIN, "AI_MEMORY_PG_POOL_MIN");
@@ -13965,7 +13965,7 @@ max_page_size = 1000000
     #[test]
     fn every_recognized_selector_is_advertised_in_the_refusal_3627() {
         // The documented vocabulary: docs/integrations/llm-backends.md
-        // (per-vendor sections + the fallback-key table) and CLAUDE.md env
+        // (per-vendor sections + the fallback-key table) and docs/reference/ARCHITECTURE_REFERENCE.md env
         // row 31.
         const DOCUMENTED_SELECTORS: &[&str] = &[
             "ollama",

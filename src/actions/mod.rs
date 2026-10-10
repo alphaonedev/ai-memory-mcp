@@ -121,7 +121,11 @@ pub fn create_guarded(
     conn: &Connection,
     action: Action,
 ) -> Result<Action, crate::errors::MemoryError> {
-    let tx = conn.unchecked_transaction()?;
+    // BEGIN IMMEDIATE (#5084, the #2250 class): the record-stop gate and the
+    // quota-row read precede the INSERT, so a DEFERRED upgrade could fail with
+    // SQLITE_BUSY_SNAPSHOT (not retried by busy_timeout) when another
+    // connection committed in between.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let action = create_guarded_in_transaction(&tx, action)?;
     tx.commit()?;
     Ok(action)
@@ -860,7 +864,7 @@ fn requeue_claimed_after_lease_expiry(
 /// The `DELETE ... RETURNING` is atomic, so the returned set is EXACTLY the rows
 /// removed (no SELECT-then-DELETE TOCTOU where a concurrently renewed lease
 /// could be audited as reclaimed without being deleted). #2419 wraps the delete
-/// AND the requeues in ONE transaction (`unchecked_transaction` — both
+/// AND the requeues in ONE `BEGIN IMMEDIATE` transaction (`WriteTxn` — both
 /// production callers hold a bare autocommit `&Connection`) so a crash can never
 /// leave the substrate with the lease gone but the state still `claimed`, which
 /// is precisely the stranded shape the fix exists to prevent.
@@ -871,10 +875,11 @@ fn sweep_expired_leases_reclaim(
     conn: &Connection,
     now: i64,
 ) -> rusqlite::Result<Vec<(String, String, bool)>> {
-    let tx = conn.unchecked_transaction()?;
+    // BEGIN IMMEDIATE (#5084): write-first, but one rule for every write path.
+    let tx = crate::storage::connection::WriteTxn::begin(conn)?;
     let expired = {
         let mut stmt =
-            tx.prepare("DELETE FROM leases WHERE expires_at <= ?1 RETURNING action_id, holder")?;
+            conn.prepare("DELETE FROM leases WHERE expires_at <= ?1 RETURNING action_id, holder")?;
         stmt.query_map(params![now], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?
@@ -882,7 +887,7 @@ fn sweep_expired_leases_reclaim(
     };
     let mut out = Vec::with_capacity(expired.len());
     for (action_id, holder) in expired {
-        let requeued = requeue_claimed_after_lease_expiry(&tx, &action_id, now)?;
+        let requeued = requeue_claimed_after_lease_expiry(conn, &action_id, now)?;
         out.push((action_id, holder, requeued));
     }
     tx.commit()?;

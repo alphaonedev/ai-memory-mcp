@@ -1,0 +1,2117 @@
+#!/usr/bin/env python3
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+"""CI gate for the enterprise-federation certification section 7 expiry trigger.
+
+Ported from scripts/check-cert-expiry.sh (#6137, per the operator's standing
+Python-not-shell rule). F7 / 2026-08-12 ratification caveat, #3556, #6137.
+
+THE DEFECT CLASS THIS CLOSES. docs/compliance/ENTERPRISE-FEDERATION-
+CERTIFICATION.md section 7 states that the certification "expires on any
+change to the federation wire path (`src/federation/**`,
+`src/handlers/federation_receive.rs`,
+`src/handlers/federation_signing_check.rs`) or the `AI_MEMORY_FED_*`
+env surface" and that any such change "requires re-running 5.4(2)-(5) and
+re-issuing this document against the new SHA." Until this gate that sentence
+was prose-only: a federation-wire change could merge through green CI while
+the cert kept being cited (the #2444 "reports success while doing nothing"
+shape applied to a certification expiry trigger).
+
+THE RULE (TASK C, verbatim, no extra escape hatches). The change under test is
+the standard PR diff (push / local: `merge-base(PR-base, HEAD)..HEAD`;
+pull_request: first parent..merge commit, see RANGE RESOLUTION), NEVER a diff
+against the cert's pinned SHA (unrelated later PRs must not fail forever). The gate
+FAILS when that diff touches ANY of:
+
+  * src/federation/**  (the directory itself or any path under it)
+  * src/handlers/federation_receive.rs
+  * src/handlers/federation_signing_check.rs
+  * added / removed / renamed `AI_MEMORY_FED_[A-Z0-9_]+` identifiers anywhere
+    in src/  (set-diff of identifiers at merge-base vs the judged commit)
+
+UNLESS the same change also modifies
+`docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md` (a re-issue or voiding
+record in the same change satisfies the gate).
+
+Failure message (required wording):
+  federation-wire surface changed -> the enterprise-federation certification
+  expires per its section 7 -> re-issue or void the cert doc in this same change.
+
+RANGE RESOLUTION.
+  pull_request     (#6137) The job checks out the pull_request MERGE commit
+                   (GITHUB_SHA). The gate judges (B) and (C) at that merge
+                   commit, never at the PR head in isolation, so a branch cut
+                   before the carrier's banner fix is judged on the tree that
+                   would actually merge. NO merge-base is computed on a
+                   pull_request: the range starts at the merge commit's FIRST
+                   PARENT. A PR's change is its effect on the merged result, so
+                   (A) drift and (B) the banner flip are measured from the first
+                   parent to the merge commit; base-side changes since the fork
+                   point were judged when they landed on the base. (Conductor
+                   decision, no vote: precedent = every other CI job tests the
+                   merge ref.) The first parent must be ON the live base branch
+                   (`git merge-base --is-ancestor <first parent>
+                   origin/$GITHUB_BASE_REF`, the ref fetched explicitly when
+                   absent), not necessarily its tip: a landing on the base
+                   after the merge ref was built does not change what the PR
+                   contributes. The event payload's PR_BASE_SHA, which can be
+                   stale, is report-only. Fail-closed (the remedy is to push a
+                   new commit or sync the branch with the base; a re-run reuses
+                   the same GITHUB_SHA) when GITHUB_BASE_REF / PR_HEAD_SHA are
+                   unset, a sha taken from the environment is not exactly
+                   40 (or 64) hex characters, the base ref cannot be fetched, a sha does not
+                   resolve, the merge commit does not have exactly two parents,
+                   its second parent is not PR_HEAD_SHA, its first parent is the
+                   PR head (reversed parents), or its first parent is not on the
+                   live base. (#6138: first parent on the base; strictly tighter
+                   than the landed gate; no vote.)
+  push             github.event.before .. GITHUB_SHA. An all-zero `before`
+                   (new branch / first push) is N/A-skip, never a false-fail.
+  workflow_dispatch / other / empty
+                   CERT_EXPIRY_BASE[/HEAD] override if set (outside CI only;
+                   refused under GitHub Actions, #5970); else (local
+                   convenience) merge-base with @{upstream} or
+                   origin/release/v1.0.0; else N/A-skip.
+  GitHub Actions   (GITHUB_ACTIONS set, #5970) the event payload range is
+                   authoritative: CERT_EXPIRY_BASE / CERT_EXPIRY_HEAD set in
+                   the environment are refused (rc 1), as is an empty event
+                   name. Outside CI the overrides stay honoured for local use.
+  Shallow checkout if merge-base fails and the repo is shallow, unshallow /
+                   deepen + fetch the missing tip, then retry.
+
+THE TWO PREDICATES #3556 ADDS (2026-09-21).
+  (B) a cert-doc edit satisfies the hatch ONLY if the STATUS line or the
+      Binds-to line changed between the range start (merge-base; on a
+      pull_request the merge commit's first parent) and the judged commit (a
+      re-issue rebinds; a voiding record flips STATUS; prose does neither).
+  (C) at the judged commit, a banner that says LIVE bound to <sha> must have
+      NO wire-surface drift between <sha> and that commit (paths and
+      AI_MEMORY_FED_* identifiers); STATUS VOID or EXPIRED makes no live claim
+      and is never failed by (C). Drift is a TREE comparison (`git diff <sha>
+      <commit>`), so ancestry is not required; an unparseable banner or a
+      bound SHA absent from the repository is fail-closed.
+
+WHAT THIS DOES NOT CLAIM. A value-only edit of an existing AI_MEMORY_FED_*
+identifier in a file outside the three path watches does not trip the
+identifier check. This gate does not re-run 5.4(2)-(5); it only forces the
+cert-doc to be touched so a human/re-issue cannot be skipped.
+
+Usage:
+  scripts/check_cert_expiry.py              # against the resolved range
+  scripts/check_cert_expiry.py --self-test  # plant-a-violation in a scratch
+                                            # repository (never a real branch)
+
+Exit codes: 0 clean / N/A-skip, 1 violation, 2 usage / self-test failure.
+"""
+
+import argparse
+import contextlib
+import errno
+import io
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+CERT_DOC = "docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
+FED_ID_PATTERN = "AI_MEMORY_FED_[A-Z0-9_]+"
+FED_ID_RE = re.compile(FED_ID_PATTERN)
+ZERO_SHA_RE = re.compile(r"^0+$")
+PREFIX = "check-cert-expiry"
+# Every sha taken from the environment is exactly 40 (SHA-1) or 64 (SHA-256)
+# hex chars (#6138 S-F2, R2-1), matched with `fullmatch` so a trailing newline
+# or an abbreviation (which git would resolve as a ref name) is refused before
+# any git call, and an option-shaped value can never reach a git argv.
+ENV_SHA_RE = re.compile(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?")
+# `--end-of-options` is passed ahead of positional refs. `git rev-parse`
+# learned it only in git 2.30 (git RelNotes/2.30.0.txt:74-76); fetch,
+# merge-base, diff, show and rev-list had it since 2.24. The floor is the
+# newest of those, because the gate calls `rev-parse --verify` throughout.
+MIN_GIT_VERSION = (2, 30)
+
+# POSIX [[:space:]] spelled out so a Unicode space cannot widen the match.
+_S = r"[ \t\r\n\f\v]"
+# The banner patterns are TOLERANT of formatting (#3556 ruling, fix 3):
+# optional blockquote, one to three '#', flexible whitespace, em dash / en dash
+# / hyphen, optional backticks, case-insensitive hex. They are anchored at line
+# start and require the heading marker / the bold "Binds to", so the section 7
+# history records that QUOTE these words in prose do not match.
+STATUS_LINE_RE = re.compile(
+    r"^>?" + _S + r"*#{1,3}" + _S + r"*STATUS" + _S + r"*(?:—|–|-)" + _S
+    + r"*\*\*" + _S + r"*(LIVE|VOID|EXPIRED)",
+    re.IGNORECASE,
+)
+BINDS_LINE_RE = re.compile(
+    r"^>?" + _S + r"*\*\*" + _S + r"*Binds" + _S + r"+to" + _S + r"*:?" + _S
+    + r"*\*\*" + _S + r"*:?" + _S + r"*`?([0-9a-fA-F]{40})`?",
+    re.IGNORECASE,
+)
+
+EXPIRY_SENTENCE = (
+    "federation-wire surface changed → the enterprise-federation certification "
+    "expires per its §7 → re-issue or void the cert doc in this same change."
+)
+
+
+class GateError(Exception):
+    """Evidence is missing or ambiguous: the gate fails closed."""
+
+
+# ---------------------------------------------------------------------------
+# git plumbing
+# ---------------------------------------------------------------------------
+
+
+def _git_env():
+    # Resolve the requested repository, not an inherited worktree/index override.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return env
+
+
+def run_git(repo, *args, timeout=120):
+    """Run git in `repo`; returns CompletedProcess with bytes output."""
+    try:
+        return subprocess.run(
+            ["git", "-c", "core.quotePath=false", "-C", str(repo), *args],
+            capture_output=True, env=_git_env(), timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise GateError(f"git {args[0] if args else ''} could not complete: {exc}") from exc
+
+
+def git_text(repo, *args):
+    """Stdout of a git command that must succeed, as stripped text."""
+    proc = run_git(repo, *args)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise GateError(f"git {args[0]} exited {proc.returncode}: {err}")
+    return proc.stdout.decode("utf-8", "replace").strip()
+
+
+def require_git_version(repo):
+    """Fail closed unless `git rev-parse` understands `--end-of-options` (>= 2.30)."""
+    text = git_text(repo, "--version")
+    m = re.match(r"git version (\d+)\.(\d+)", text)
+    if not m or (int(m.group(1)), int(m.group(2))) < MIN_GIT_VERSION:
+        need = ".".join(str(n) for n in MIN_GIT_VERSION)
+        raise GateError(f"git >= {need} is required for --end-of-options (got {text!r})")
+
+
+def env_sha(env, key):
+    """The sha in env[key], exactly 40 or 64 hex chars (S-F2, R2-1, fail-closed)."""
+    val = env.get(key, "")
+    if not ENV_SHA_RE.fullmatch(val):
+        raise GateError(f"{key} {val!r} is not exactly 40 or 64 hex characters (fail-closed)")
+    return val
+
+
+def is_commit(repo, ref):
+    return run_git(
+        repo, "rev-parse", "--verify", "--quiet", "--end-of-options", ref + "^{commit}",
+    ).returncode == 0
+
+
+def ensure_commit(repo, sha):
+    """Fetch SHA if it is not yet a local commit; True iff it resolves."""
+    if is_commit(repo, sha):
+        return True
+    run_git(repo, "fetch", "--no-tags", "--quiet", "--end-of-options", "origin", sha)
+    return is_commit(repo, sha)
+
+
+def resolve_merge_base(repo, a, b):
+    """merge-base of a and b; deepen a shallow clone once. None if unresolvable."""
+    proc = run_git(repo, "merge-base", "--end-of-options", a, b)
+    if proc.returncode == 0:
+        return proc.stdout.decode().strip()
+    shallow = run_git(repo, "rev-parse", "--is-shallow-repository")
+    if shallow.stdout.decode().strip() == "true":
+        if run_git(repo, "fetch", "--unshallow", "--quiet").returncode != 0:
+            run_git(repo, "fetch", "--deepen=2147483647", "--quiet")
+        ensure_commit(repo, a)
+        ensure_commit(repo, b)
+        proc = run_git(repo, "merge-base", "--end-of-options", a, b)
+        if proc.returncode == 0:
+            return proc.stdout.decode().strip()
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Path / identifier classifiers
+# ---------------------------------------------------------------------------
+
+
+def is_watched_path(path):
+    """True iff `path` is on the section 7 federation-wire surface."""
+    return (
+        path == "src/federation"
+        or path.startswith("src/federation/")
+        or path == "src/handlers/federation_receive.rs"
+        or path == "src/handlers/federation_signing_check.rs"
+    )
+
+
+def changed_paths(repo, frm, to):
+    """Raw NUL-delimited changed paths. --no-renames so a move of a watched
+    file cannot hide as an unwatched destination-only name; -z so a non-ASCII
+    or newline-bearing name cannot be C-quoted past the path globs."""
+    proc = run_git(repo, "diff", "--name-only", "-z", "--no-renames", "--end-of-options", frm, to)
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise GateError(f"git diff {frm} {to} exited {proc.returncode}: {err}")
+    return [p.decode("utf-8", "replace") for p in proc.stdout.split(b"\0") if p]
+
+
+def extract_fed_ids(repo, tree):
+    """Unique AI_MEMORY_FED_* identifiers in src/ at TREE (set of str)."""
+    proc = run_git(repo, "grep", "-h", "-I", "-E", FED_ID_PATTERN, tree, "--", "src")
+    if proc.returncode == 1:  # no match
+        return set()
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise GateError(f"git grep at {tree} exited {proc.returncode}: {err}")
+    return set(FED_ID_RE.findall(proc.stdout.decode("utf-8", "replace")))
+
+
+def wire_drift(repo, frm, to):
+    """Section 7 surface that differs between two trees: watched paths, then
+    +added / -removed AI_MEMORY_FED_* identifiers. Empty list = no drift."""
+    out = [p for p in changed_paths(repo, frm, to) if is_watched_path(p)]
+    from_ids = extract_fed_ids(repo, frm)
+    to_ids = extract_fed_ids(repo, to)
+    out.extend("+" + i for i in sorted(to_ids - from_ids))
+    out.extend("-" + i for i in sorted(from_ids - to_ids))
+    return out
+
+
+def cert_banner(repo, tree):
+    """(STATUS, BINDS) of the cert doc at TREE.
+
+    STATUS: LIVE | VOID | EXPIRED | UNPARSEABLE (doc present, no STATUS line)
+    | DUPLICATE (two or more STATUS lines: a decoy above the real banner must
+    not be read as the banner) | ABSENT (no doc at TREE).
+    BINDS: the lowercase 40-hex bound SHA, "-" when no Binds-to line matches,
+    "DUPLICATE" when two or more do.
+    """
+    proc = run_git(repo, "show", "--end-of-options", f"{tree}:{CERT_DOC}")
+    if proc.returncode != 0:
+        return ("ABSENT", "-")
+    lines = proc.stdout.decode("utf-8", "replace").split("\n")
+    statuses = [m for m in (STATUS_LINE_RE.match(ln) for ln in lines) if m]
+    binds = [m for m in (BINDS_LINE_RE.match(ln) for ln in lines) if m]
+    if not statuses:
+        status = "UNPARSEABLE"
+    elif len(statuses) == 1:
+        status = statuses[0].group(1).upper()
+    else:
+        status = "DUPLICATE"
+    if not binds:
+        bound = "-"
+    elif len(binds) == 1:
+        bound = binds[0].group(1).lower()
+    else:
+        bound = "DUPLICATE"
+    return (status, bound)
+
+
+def fmt_banner(banner):
+    return f"{banner[0]} {banner[1]}"
+
+
+# ---------------------------------------------------------------------------
+# The check
+# ---------------------------------------------------------------------------
+
+
+def check_banner_consistency(repo, judged):
+    """(C) #3556: the doc's own claim at `judged` must be true. STATUS LIVE
+    bound to <sha> means no section 7 wire-surface drift between <sha> and
+    `judged`. Returns (ok, lines)."""
+    status, binds = cert_banner(repo, judged)
+    if status == "ABSENT":
+        return True, [f"{PREFIX}: banner — {CERT_DOC} absent at HEAD; no live claim to check"]
+    if status == "UNPARSEABLE":
+        return False, [
+            f"{PREFIX}: ERROR — {CERT_DOC} at HEAD has no parseable STATUS line. "
+            "Expected a line shaped like '> ## STATUS — **LIVE as of …**' "
+            "(blockquote, heading level, dash style, spacing and hex case are "
+            "tolerated). If this change reformatted the banner, restore that "
+            "shape; if it removed the banner, the document must say LIVE, VOID "
+            "or EXPIRED. Fail-closed, #3556."
+        ]
+    if status == "DUPLICATE":
+        return False, [
+            f"{PREFIX}: ERROR — {CERT_DOC} at HEAD has two or more STATUS banner "
+            "lines; the gate reads exactly one and will not guess which is the "
+            "banner (a decoy line above the real banner is how a stale LIVE "
+            "could be read as VOID). Remove the duplicate. Fail-closed, #3556."
+        ]
+    if status in ("VOID", "EXPIRED"):
+        return True, [
+            f"{PREFIX}: banner STATUS={status} — the doc makes no live claim; "
+            "nothing to hold it to"
+        ]
+    # LIVE
+    if binds == "-":
+        return False, [
+            f"{PREFIX}: ERROR — {CERT_DOC} at HEAD says STATUS LIVE but has no "
+            "parseable Binds-to line. Expected a line shaped like "
+            "'**Binds to:** `<40-hex sha>`' (spacing, backticks and hex case are "
+            "tolerated). Fail-closed, #3556."
+        ]
+    if binds == "DUPLICATE":
+        return False, [
+            f"{PREFIX}: ERROR — {CERT_DOC} at HEAD has two or more Binds-to "
+            "lines; the gate reads exactly one and will not guess which SHA the "
+            "LIVE claim binds to. Remove the duplicate. Fail-closed, #3556."
+        ]
+    if not ensure_commit(repo, binds):
+        return False, [
+            f"{PREFIX}: ERROR — banner is LIVE bound to {binds} but that commit "
+            "is not in this repository, so the claim cannot be checked "
+            "(fail-closed, #3556)"
+        ]
+    # Ancestry is deliberately NOT required: `git diff <binds> <judged>` is a
+    # tree-to-tree comparison, so a squash-merge whose watched surface equals
+    # the bound tree passes on zero drift, and a bind pointed at some
+    # unrelated commit (an evasion) reds on the drift it carries.
+    drift = wire_drift(repo, binds, judged)
+    if not drift:
+        return True, [
+            f"{PREFIX}: PASS — banner LIVE bound to {binds}; federation-wire "
+            "surface unchanged since the bind (#3556)"
+        ]
+    lines = [
+        f"the enterprise-federation certification claims LIVE bound to {binds} "
+        f"but {len(drift)} federation-wire change(s) landed since → the "
+        "certification expired per its §7 while its banner still says LIVE → "
+        f"re-issue it at HEAD or record VOID/EXPIRED in {CERT_DOC}.",
+        "",
+        f"Bound: {binds}  HEAD: {judged}",
+        "Federation-wire drift since the bind (paths; +added / -removed "
+        "AI_MEMORY_FED_* identifiers):",
+    ]
+    lines.extend("  " + d for d in drift)
+    lines.append("")
+    lines.append(
+        f"Remedy: re-run §5.4(2)–(5) at HEAD and rebind {CERT_DOC}, or set its "
+        "STATUS line to VOID/EXPIRED (#3556)."
+    )
+    return False, lines
+
+
+def pr_base_tip(repo, base, head, tip, base_name=None):
+    """Validate the pull_request merge commit and return its first parent.
+
+    The merge commit must have exactly two parents; its second parent must be
+    PR_HEAD_SHA (#6138 S-F7); its first parent must be on the live base branch
+    (an ancestor of, or equal to, the live tip). The first parent need not be
+    the live tip: a landing on the base after the merge ref was built does not
+    change what the PR contributes, so the gate stays green and measures
+    first parent..merge commit (#6138 F1; strictly tighter than the landed
+    gate, no vote). Anything else is not the PR's merge result (fail-closed).
+    `base_name` (origin/<GITHUB_BASE_REF>) only labels the messages.
+    """
+    parents = git_text(repo, "rev-list", "--parents", "-n", "1", "--end-of-options", tip).split()
+    if len(parents) != 3:
+        raise GateError(
+            f"merge commit {tip} does not have exactly two parents "
+            "(not a pull_request merge result)"
+        )
+    first, second = parents[1], parents[2]
+    head_full = git_text(repo, "rev-parse", "--verify", "--end-of-options", f"{head}^{{commit}}")
+    if first == head_full:
+        raise GateError(
+            f"merge commit {tip} has the PR head {head_full} as its FIRST parent "
+            "(reversed parents: the base branch must be the first parent); "
+            "push a new commit or sync the branch with the base so GitHub rebuilds "
+            "the merge ref"
+        )
+    if second != head_full:
+        raise GateError(
+            f"merge commit {tip} second parent {second} is not PR_HEAD_SHA "
+            f"{head_full} (not this PR's merge result)"
+        )
+    live = git_text(repo, "rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}")
+    anc = run_git(repo, "merge-base", "--is-ancestor", "--end-of-options", first, live)
+    if anc.returncode == 1:
+        raise GateError(
+            f"merge commit {tip} first parent {first} is not on the live base "
+            f"{base_name or 'branch'} (tip {live}); the merge ref was not built from this base: "
+            "push a new commit or sync the branch with the base so GitHub "
+            "rebuilds the merge ref (a re-run reuses the same GITHUB_SHA)"
+        )
+    if anc.returncode != 0:
+        err = anc.stderr.decode("utf-8", "replace").strip()
+        raise GateError(f"git merge-base --is-ancestor exited {anc.returncode}: {err}")
+    return first
+
+
+def check_change(repo, base, head, tip=None, base_name=None):
+    """Judge the change. Without `tip` it is merge-base(base, head)..head. With
+    `tip` (the pull_request merge commit, #6137) it is tip^1..tip, tip^1 being
+    verified to lie on the live base and tip^2 to be the PR head. Returns
+    (ok, text)."""
+    judged = tip if tip else head
+    refs = [base, head] + ([tip] if tip else [])
+    if not all(is_commit(repo, r) for r in refs):
+        return False, f"{PREFIX}: ERROR — cannot resolve range {base}..{judged} (fail-closed)"
+    if tip:
+        # #6137 (conductor decision): a pull_request's change is its effect on
+        # the merged result, so (A)/(B) compare the merge commit's first parent
+        # (on the base branch) with the merge commit. Base-side changes since
+        # the fork point were judged when they landed on the base.
+        try:
+            mb = pr_base_tip(repo, base, head, tip, base_name)
+        except GateError as exc:
+            return False, f"{PREFIX}: ERROR — {exc} (fail-closed)"
+    else:
+        mb = resolve_merge_base(repo, base, head)
+    if mb is None:
+        return False, (
+            f"{PREFIX}: ERROR — no merge-base for {base}..{head} "
+            "(fail-closed; shallow checkout?)"
+        )
+    try:
+        return _judge(repo, base, head, judged, mb, tip)
+    except GateError as exc:
+        return False, f"{PREFIX}: ERROR — {exc} (fail-closed)"
+
+
+def _judge(repo, base, head, judged, mb, tip):
+    watched = []
+    cert_touched = False
+    for p in changed_paths(repo, mb, judged):
+        if p == CERT_DOC:
+            cert_touched = True
+        if is_watched_path(p):
+            watched.append(p)
+    base_ids = extract_fed_ids(repo, mb)
+    head_ids = extract_fed_ids(repo, judged)
+    added = sorted(head_ids - base_ids)
+    removed = sorted(base_ids - head_ids)
+    id_changed = bool(added or removed)
+
+    if not watched and not id_changed:
+        ok, more = check_banner_consistency(repo, judged)
+        lines = [f"{PREFIX}: PASS — federation-wire surface unchanged in {mb}..{judged}"]
+        return ok, "\n".join(lines + more)
+
+    # (B) #3556: the hatch is a REAL re-issue/voiding only if the banner
+    # (STATUS line or Binds-to line) differs between merge-base and judged.
+    incidental = deleted = malformed = False
+    banner_mb = banner_head = ("", "")
+    if cert_touched:
+        banner_mb = cert_banner(repo, mb)
+        banner_head = cert_banner(repo, judged)
+        incidental = banner_mb == banner_head
+        # #3556 ruling, fix 2: a DELETED cert doc is not a voiding record.
+        deleted = banner_head == ("ABSENT", "-")
+        # #3556 ruling, fix 1: a banner the gate cannot read as exactly one
+        # STATUS line and at most one Binds-to line is not a re-issue.
+        malformed = banner_head[0] in ("DUPLICATE", "UNPARSEABLE") or banner_head[1] == "DUPLICATE"
+
+    if cert_touched and not incidental and not deleted and not malformed:
+        ok, more = check_banner_consistency(repo, judged)
+        head_line = (
+            f"{PREFIX}: PASS — federation-wire surface changed AND cert doc "
+            f"re-issued/voided in the same change ({mb}..{judged}; banner "
+            f"{fmt_banner(banner_mb)} → {fmt_banner(banner_head)})"
+        )
+        return ok, "\n".join([head_line] + more)
+
+    out = [EXPIRY_SENTENCE]
+    if incidental:
+        out.append(
+            "The cert doc WAS edited in this change, but neither its STATUS line "
+            f"nor its Binds-to line changed (banner {fmt_banner(banner_head)} at "
+            "both ends) — an incidental edit is not a re-issue and not a voiding "
+            "record (#3556)."
+        )
+    if deleted:
+        out.append(
+            "The cert doc is ABSENT at HEAD (deleted in this change) while the "
+            "federation-wire surface changed — deleting the certification is not "
+            "a voiding record; record VOID/EXPIRED in the document instead (#3556)."
+        )
+    if malformed:
+        out.append(
+            "The cert doc at HEAD does not carry exactly one STATUS banner line "
+            f"and at most one Binds-to line (parsed: {fmt_banner(banner_head)}) — "
+            "the gate reads one banner and will not guess; a duplicated or "
+            "unparseable banner is not a re-issue and not a voiding record (#3556)."
+        )
+    out.append("")
+    if tip:
+        out.append(
+            f"Range: {mb}..{judged}  (first parent to the pull_request merge commit; "
+            "judged at the pull_request merge commit)"
+        )
+    else:
+        out.append(f"Range: {mb}..{judged}  (merge-base of {base} and {head})")
+    if watched:
+        out.append("Watched federation-wire paths touched:")
+        out.extend("  " + w for w in watched)
+    if id_changed:
+        out.append("AI_MEMORY_FED_* identifiers added/removed/renamed in src/:")
+        out.extend("  + " + a for a in added)
+        out.extend("  - " + r for r in removed)
+    out.append("")
+    out.append(
+        f"Remedy: modify {CERT_DOC} in this same change (re-issue against the "
+        "new SHA, or record the voiding)."
+    )
+    return False, "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Range resolution
+# ---------------------------------------------------------------------------
+
+
+class Skip(Exception):
+    """N/A: no range to check (not a failure)."""
+
+
+def _need(env, key, why):
+    val = env.get(key, "")
+    if not val:
+        raise GateError(f"{key} is unset on {why} (fail-closed)")
+    return val
+
+
+def resolve_live_base(repo, base_ref):
+    """Sha of the LIVE base ref origin/<base_ref>, fetched explicitly if absent."""
+    if base_ref.startswith("-") or ".." in base_ref or any(c.isspace() for c in base_ref):
+        raise GateError(f"GITHUB_BASE_REF {base_ref!r} is not a plain branch name (fail-closed)")
+    tracking = f"refs/remotes/origin/{base_ref}"
+    if not is_commit(repo, tracking):
+        run_git(
+            repo, "fetch", "--no-tags", "--quiet", "--end-of-options", "origin",
+            f"+refs/heads/{base_ref}:{tracking}",
+        )
+    if not is_commit(repo, tracking):
+        raise GateError(
+            f"cannot resolve the live base ref origin/{base_ref} (fetch failed; fail-closed)"
+        )
+    return git_text(repo, "rev-parse", "--verify", "--end-of-options", tracking + "^{commit}")
+
+
+def resolve_range(repo, env):
+    """(base, head, tip) for the change under test. tip is the commit that
+    (B)/(C) are judged at (None = judge at head). Raises Skip / GateError."""
+    event = env.get("GITHUB_EVENT_NAME", "")
+    # #5970 (precedent: PR #5871 head 3be284991): inside GitHub Actions the
+    # event payload names the range, so a CERT_EXPIRY_BASE / CERT_EXPIRY_HEAD
+    # override is refused (even an empty one); outside CI it is honoured.
+    in_ci = "GITHUB_ACTIONS" in env
+    if in_ci:
+        refused = [k for k in ("CERT_EXPIRY_BASE", "CERT_EXPIRY_HEAD") if k in env]
+        if refused:
+            raise GateError(
+                f"refused (#5970, fail-closed): {', '.join(refused)} set in the gate's "
+                "environment under GitHub Actions; the range comes only from the "
+                "event payload"
+            )
+    if env.get("CERT_EXPIRY_BASE"):
+        return env["CERT_EXPIRY_BASE"], env.get("CERT_EXPIRY_HEAD") or "HEAD", None
+
+    if event == "pull_request":
+        # #6137: judge the merge commit the job checked out, against the LIVE
+        # base ref, not the (possibly stale) payload PR_BASE_SHA.
+        _need(env, "PR_HEAD_SHA", "a pull_request event")
+        head = env_sha(env, "PR_HEAD_SHA")
+        base_ref = _need(env, "GITHUB_BASE_REF", "a pull_request event")
+        tip = env_sha(env, "GITHUB_SHA") if env.get("GITHUB_SHA") else "HEAD"
+        stale = env_sha(env, "PR_BASE_SHA") if env.get("PR_BASE_SHA") else ""
+        base = resolve_live_base(repo, base_ref)
+        if not is_commit(repo, head):
+            ensure_commit(repo, head)
+        if not is_commit(repo, head):
+            raise GateError(f"PR_HEAD_SHA {head} does not resolve to a commit (fail-closed)")
+        if not is_commit(repo, tip):
+            raise GateError(f"merge commit {tip} does not resolve to a commit (fail-closed)")
+        # The merge commit's parent structure (two parents, second parent ==
+        # PR_HEAD_SHA, first parent on the live base) is verified in pr_base_tip.
+        if stale and stale != base:
+            print(
+                f"{PREFIX}: note — payload PR_BASE_SHA {stale} differs from the live "
+                f"base origin/{base_ref} {base}; using the live base (#6137)",
+                file=sys.stderr,
+            )
+        return base, head, tip
+
+    if event == "push":
+        before = env.get("GITHUB_EVENT_BEFORE", "")
+        if not before or ZERO_SHA_RE.match(before):
+            raise Skip("push has no previous tip (new branch / first push); skip")
+        before = env_sha(env, "GITHUB_EVENT_BEFORE")
+        after = env_sha(env, "GITHUB_SHA") if env.get("GITHUB_SHA") else "HEAD"
+        return before, after, None
+    if event == "workflow_dispatch":
+        raise Skip(
+            "workflow_dispatch has no PR/push range (outside CI, CERT_EXPIRY_BASE/HEAD "
+            "check a range by hand; they are refused under GitHub Actions); skip"
+        )
+    if event == "":
+        if in_ci:
+            raise GateError(
+                "GITHUB_EVENT_NAME is empty in a CI run; the event payload is the "
+                "only range source under GitHub Actions (fail-closed)"
+            )
+        # Local convenience: standard PR-shaped range vs the tracking branch or
+        # origin/release/v1.0.0. Never invent a range against the pinned SHA.
+        for ref in ("@{upstream}", "origin/release/v1.0.0"):
+            if is_commit(repo, ref):
+                return git_text(repo, "rev-parse", "--verify", "--end-of-options", ref), "HEAD", None
+        raise Skip(
+            "no CERT_EXPIRY_BASE, no @{upstream}, no origin/release/v1.0.0; skip"
+        )
+    raise Skip(f"event '{event}' has no PR/push range; skip")
+
+
+def run_gate(repo, env):
+    """Returns (rc, stdout_text, stderr_text)."""
+    try:
+        require_git_version(repo)
+        base, head, tip = resolve_range(repo, env)
+    except Skip as skip:
+        return 0, "", f"{PREFIX}: N/A — {skip}"
+    except GateError as exc:
+        return 1, "", f"{PREFIX}: ERROR — {exc}"
+    base_name = f"origin/{env['GITHUB_BASE_REF']}" if tip is not None else None
+    ok, text = check_change(repo, base, head, tip, base_name)
+    return (0, text, "") if ok else (1, "", text)
+
+
+# ---------------------------------------------------------------------------
+# Plant-a-violation self-test (scratch repository; never a real branch)
+# ---------------------------------------------------------------------------
+
+
+class Fixture:
+    """A throwaway repository the self-test plants violations in."""
+
+    def __init__(self, repo):
+        self.repo = repo
+
+    def g(self, *args):
+        proc = run_git(self.repo, *args)
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", "replace").strip()
+            raise GateError(f"fixture git {args} failed: {err}")
+        return proc.stdout.decode("utf-8", "replace").strip()
+
+    def write(self, rel, text, append=False):
+        path = self.repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a" if append else "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def commit(self, paths, msg):
+        self.g("add", "--", *paths)
+        self.g("commit", "-q", "-m", msg)
+        return self.g("rev-parse", "HEAD")
+
+    def reset(self, sha):
+        self.g("reset", "-q", "--hard", sha)
+
+    def banner(self, status, binds, extra=""):
+        """The cert doc in its real shape (the gate READS the banner)."""
+        self.write(
+            CERT_DOC,
+            "# Enterprise federation certification (fixture)\n\n"
+            f"**Binds to:** `{binds}` (fixture bind)\n\n"
+            f"> ## STATUS — **{status} as of 2026-01-01** (fixture)\n\n"
+            f"Body prose.\n{extra}",
+        )
+
+    def prepend(self, rel, line):
+        path = self.repo / rel
+        path.write_text(line + "\n" + path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    def merge(self, other, msg):
+        self.g("merge", "-q", "--no-ff", "-m", msg, other)
+        return self.g("rev-parse", "HEAD")
+
+
+class SelfTest:
+    def __init__(self):
+        self.failed = False
+
+    def fail(self, msg, out=None):
+        print(f"self-test FAILED {msg}", file=sys.stderr)
+        if out:
+            print(out, file=sys.stderr)
+        self.failed = True
+
+    def expect_red(self, label, desc, repo, base, head, needles, tip=None):
+        ok, out = check_change(repo, base, head, tip)
+        if ok:
+            self.fail(f"({label}): {desc} was NOT rejected", out)
+            return out
+        for needle, why in needles:
+            if needle not in out:
+                self.fail(f"({label}): rejection {why}:", out)
+        return out
+
+    def expect_green(self, label, desc, repo, base, head, needles=(), tip=None):
+        ok, out = check_change(repo, base, head, tip)
+        if not ok:
+            self.fail(f"({label}): {desc} was REJECTED:", out)
+            return out
+        for needle, why in needles:
+            if needle not in out:
+                self.fail(f"({label}): pass output {why}:", out)
+        return out
+
+
+    def gate(self, label, why, repo, env, needle=None):
+        """Run the whole gate. needle None: it must pass. Else it must fail
+        closed (rc 1) AND say `needle` (a fail-closed for the wrong reason, or
+        a wrong remedy, is a defect too)."""
+        rc, out, err = run_gate(repo, env)
+        text = out + err
+        if needle is None:
+            if rc != 0:
+                self.fail(f"({label}): {why} was REJECTED:", text)
+        elif rc == 0:
+            self.fail(f"({label}): {why} did not fail closed", text)
+        elif needle not in text:
+            self.fail(f"({label}): {why} failed for the wrong reason (wanted {needle!r}):", text)
+        return text
+
+
+GIT_SHIM = """#!{python} -I
+import os, sys
+real, argv = {real!r}, sys.argv[1:]
+if argv == ["--shim-isolation-probe"]:
+    try:
+        import gitshim_canary_6145
+        planted = True
+    except ImportError:
+        planted = False
+    print(sys.flags.isolated, planted)
+    sys.exit(0)
+if "--version" in argv and {version!r}:
+    print({version!r})
+    sys.exit(0)
+if {fail!r} and {fail!r} in argv:
+    sys.stderr.write("fatal: shim refuses " + {fail!r} + chr(10))
+    sys.exit(128)
+os.execv(real, [real] + argv)
+"""
+
+
+SHEBANG_MAX = 255  # Linux truncates the interpreter line at 256 bytes (newline included)
+MKDTEMP_NAME_LEN = len("gitshim-long.") + 8  # tempfile.mkdtemp appends 8 random characters
+# Longest absolute scratch path under which the 255-byte boundary cell still fits:
+# 255 - '#!' - ' -I' - '/gitshim-long.XXXXXXXX' - the pad's 1 byte - a 1-byte file name.
+SCRATCH_PATH_LIMIT = 255 - len("#!") - len(" -I") - (1 + MKDTEMP_NAME_LEN) - 2
+
+
+def write_git_shim(shim_dir, real, version="", fail="", interpreter=None):
+    """Write the executable `git` PATH shim into shim_dir (#6145: its interpreter
+    line is `python3 -I`, like the gate itself in c8-precheck.yml, so the shim's
+    own directory is never on its sys.path). Fails closed with GateError when the
+    interpreter line cannot carry `-I` intact: whitespace or a NUL byte in the
+    interpreter path splits it, a path that is not valid UTF-8 cannot be written, and
+    a line over SHEBANG_MAX (255) bytes is truncated by the kernel, which silently
+    drops `-I` (a 255-byte line is accepted, a 256-byte line refused).
+
+    Self-test limit (#6145 R5-F3): the `shim-interpreter` cell builds 255/256-byte
+    interpreter lines under its scratch dir, so that dir's absolute path must be at
+    most SCRATCH_PATH_LIMIT (226) bytes, i.e. the checkout path at most 184 bytes
+    (CI uses 44); the checkout-depth cell pins that no other cell needs more (R8-F1).
+    A deeper checkout fails the cell with a message naming both
+    lengths; it is a property of the environment, not a defect in the gate."""
+    python = sys.executable if interpreter is None else str(interpreter)
+    line = f"#!{python} -I"
+    if not python or "\x00" in python or any(ch.isspace() for ch in python):
+        raise GateError(f"the shim interpreter path {python!r} is empty or contains "
+                        "whitespace or a NUL byte; its '-I' flag would not survive the shebang")
+    try:
+        line_bytes = len(line.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise GateError(f"the shim interpreter path {python!r} is not valid UTF-8 ({exc.reason}); "
+                        "the shim is written as UTF-8, so its '-I' flag cannot be guaranteed") from exc
+    if line_bytes > SHEBANG_MAX:
+        raise GateError(f"the shim interpreter line is {line_bytes} bytes, over "
+                        f"{SHEBANG_MAX}; the kernel would truncate it and drop '-I'")
+    shim = shim_dir / "git"
+    shim.write_text(GIT_SHIM.format(python=python, real=real, version=version,
+                                    fail=fail), encoding="utf-8")
+    shim.chmod(0o755)
+    return shim
+
+
+def shim_interpreter_violation(tmp):
+    """None when write_git_shim refuses every unsafe interpreter path and accepts
+    the longest safe one (#6145 S-F1), else a description. The boundary is sized to
+    the LITERAL 255/256 byte lines the kernel allows/truncates, never to SHEBANG_MAX,
+    so changing that constant to 256 fails here (#6145 R3-F1). Needs the scratch dir's
+    absolute path to be at most SCRATCH_PATH_LIMIT (226) bytes, i.e. a checkout path
+    of at most 184 bytes; deeper, it reports the lengths instead of building (R5-F3)."""
+    fixed = len("#!") + len(" -I")
+    deep = None
+    try:
+        deep = Path(tempfile.mkdtemp(prefix="gitshim-long.", dir=str(tmp)))
+        pad = 255 - fixed - len(os.fsencode(str(deep))) - 1
+        if pad < 1:
+            have = len(os.fsencode(str(tmp)))
+            return (f"the scratch path is too deep to build the boundary cases (pad {pad}): "
+                    f"the scratch path is {have} bytes but the 255-byte shebang boundary cell "
+                    f"needs it at most {SCRATCH_PATH_LIMIT} bytes (checkout path at most "
+                    f"{SCRATCH_PATH_LIMIT - have + len(os.fsencode(str(REPO_ROOT)))} bytes); "
+                    "run the self-test from a shallower checkout")
+        long_dir = deep / ("d" * 200)
+        long_dir.mkdir()
+        too_long = long_dir / ("p" * 60)
+        too_long.symlink_to(sys.executable)
+        spaced = deep / "with space" / "python3"
+        longest_ok = deep / ("q" * pad)
+        one_over = deep / ("q" * (pad + 1))
+        for want, interp in ((255, longest_ok), (256, one_over)):
+            got = len(os.fsencode(f"#!{interp} -I"))
+            if got != want:
+                return f"the {want}-byte boundary case is {got} bytes"
+        non_utf8 = deep / "py\udcff"
+        cases = [("an over-long interpreter path", too_long, True),
+                 ("an interpreter path with whitespace", spaced, True),
+                 ("the longest in-limit interpreter path", longest_ok, False),
+                 ("a 256-byte interpreter line", one_over, True),
+                 ("a non-UTF-8 (surrogate-escaped) interpreter path", non_utf8, True),
+                 ("an interpreter path with a NUL byte", deep / "py\x00x", True)]
+        for label, interp, must_raise in cases:
+            try:
+                write_git_shim(deep, "git", interpreter=interp)
+            except GateError:
+                if not must_raise:
+                    return f"{label} was refused"
+                continue
+            except Exception as exc:  # noqa: BLE001 - report any non-GateError as a violation
+                return f"{label} raised {type(exc).__name__}, not GateError: {exc}"
+            if must_raise:
+                return f"{label} was accepted (the kernel would drop '-I')"
+        return None
+    except OSError as exc:
+        return f"could not build the boundary cases: {exc}"
+    finally:
+        if deep is not None:
+            shutil.rmtree(deep, ignore_errors=True)
+
+
+
+def platform_path_max():
+    """The platform's PATH_MAX: 1024 on macOS and the BSDs, 4096 elsewhere (R5-F1)."""
+    bsd = ("darwin", "freebsd", "openbsd", "netbsd")
+    return 1024 if sys.platform.startswith(bsd) else 4096
+
+
+def path_max(path):
+    """The PATH_MAX of the filesystem holding path (Linux 4096, macOS 1024),
+    falling back to the platform's value when os.pathconf cannot say (#6145 R4-F1,
+    R5-F1), so the fallback never exceeds the real limit."""
+    try:
+        limit = os.pathconf(str(path), "PC_PATH_MAX")
+    except (OSError, ValueError, AttributeError):
+        return platform_path_max()
+    return limit if isinstance(limit, int) and limit > 0 else platform_path_max()
+
+
+def deep_scratch(tmp, target_len):
+    """A scratch directory whose absolute path is EXACTLY target_len bytes, built
+    with dir_fd so no single syscall sees a path over PATH_MAX (#6145 R3-F2, R4-F2).
+    Returns (base, deepest); on any failure removes base and raises OSError (R4-F3)."""
+    base = Path(tempfile.mkdtemp(prefix="gitshim-deep.", dir=str(tmp)))
+    fds = []
+    try:
+        cur, cur_len = base, len(os.fsencode(str(base)))
+        fds.append(os.open(str(base), os.O_RDONLY))
+        while cur_len < target_len:
+            room = target_len - cur_len
+            step = min(200, room - 1)
+            if room - step - 1 == 1:
+                step -= 1  # a final component needs 2 bytes ('/' + 1 char)
+            if step < 1:
+                raise OSError(errno.ENAMETOOLONG,
+                              f"cannot land on exactly {target_len} bytes from {cur_len}")
+            name = "d" * step
+            os.mkdir(name, dir_fd=fds[-1])
+            fds.append(os.open(name, os.O_RDONLY, dir_fd=fds[-1]))
+            cur, cur_len = cur / name, cur_len + 1 + step
+        if cur_len != target_len:
+            raise OSError(errno.ENAMETOOLONG,
+                          f"the scratch base is {cur_len} bytes, over the {target_len}-byte target")
+        return base, cur
+    except BaseException:
+        shutil.rmtree(base, ignore_errors=True)
+        raise
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def shim_boundary_robustness_violation(tmp):
+    """None when shim_interpreter_violation reports (never raises) on a scratch dir
+    that is missing or sits just under PATH_MAX (#6145 R3-F2), else a description.
+    The near-PATH_MAX path is sized from the platform's PATH_MAX (R4-F1) and the cell
+    asserts the 200-byte directory build would overflow it (R4-F2), so moving the
+    'too deep' check after the build turns this cell red."""
+    missing = shim_interpreter_violation(tmp / "no-such-scratch-6145")
+    if missing is None or not missing.startswith("could not build the boundary cases"):
+        return f"a missing scratch dir gave {missing!r}, not a 'could not build' violation"
+    limit = path_max(tmp)
+    target = limit - 1 - (MKDTEMP_NAME_LEN + 1) - 1
+    try:
+        base, near_max = deep_scratch(tmp, target)
+    except OSError as exc:
+        return f"could not build the near-PATH_MAX scratch: {exc}"
+    try:
+        if len(os.fsencode(str(near_max))) + MKDTEMP_NAME_LEN + 1 + 201 < limit:
+            return (f"the near-PATH_MAX scratch ({target} bytes) is too short for the 200-byte "
+                    f"build to overflow PATH_MAX {limit}")
+        try:
+            deep = shim_interpreter_violation(near_max)
+        except OSError as exc:
+            return f"a near-PATH_MAX scratch dir raised {type(exc).__name__}: {exc}"
+        if deep is None or not deep.startswith("the scratch path is too deep"):
+            return f"a near-PATH_MAX scratch dir gave {deep!r}, not a 'too deep' violation"
+        left = [p.name for p in near_max.iterdir()] if near_max.is_dir() else []
+        if left:
+            return f"a near-PATH_MAX scratch dir was left with {left!r}"
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    return None
+
+
+def deep_scratch_base_len(tmp):
+    """Length of the shortest path deep_scratch(tmp, ...) can return: the scratch dir,
+    a separator, the `gitshim-deep.` prefix and the 8-byte mkdtemp suffix (#6145 R7-F2)."""
+    return len(os.fsencode(str(tmp))) + 1 + len("gitshim-deep.") + 8
+
+
+def deep_scratch_violation(tmp):
+    """None when deep_scratch lands on the exact length, cleans up after itself on
+    failure and the robustness cell turns a build failure into a named violation
+    (#6145 R4-F1/F2/F3), else a description. The two targets are relative to the scratch
+    path length (+300 and +600 bytes past the deep_scratch base) and capped below
+    PATH_MAX, so they stay valid on a deep checkout (R5-F3)."""
+    cap = path_max(tmp) - 1
+    base_len = deep_scratch_base_len(tmp)
+    if base_len + 2 > cap:  # deep_scratch cannot extend a path by one byte (R6-F2)
+        return (f"the scratch path is {len(os.fsencode(str(tmp)))} bytes; deep_scratch needs "
+                f"room below the {cap + 1}-byte PATH_MAX")
+    for want in (min(base_len + 300, cap), min(base_len + 600, cap)):
+        base = None
+        try:
+            base, cur = deep_scratch(tmp, want)
+            got = len(os.fsencode(str(cur)))
+            if got != want:
+                return f"deep_scratch({want}) built a {got}-byte path, not the exact length"
+        except OSError as exc:
+            return f"deep_scratch({want}) raised {type(exc).__name__}: {exc}"
+        finally:
+            if base is not None:
+                shutil.rmtree(base, ignore_errors=True)
+    try:
+        deep_scratch(tmp, 10)
+    except OSError:
+        pass
+    else:
+        return "deep_scratch with a target shorter than its base did not fail"
+    left = sorted(p.name for p in tmp.glob("gitshim-deep.*"))
+    if left:
+        return f"a failed deep_scratch left {left!r} behind"
+    real, boom = globals()["deep_scratch"], OSError(28, "No space left on device")
+
+    def failing(_tmp, _target):
+        raise boom
+    globals()["deep_scratch"] = failing
+    try:
+        res = shim_boundary_robustness_violation(tmp)
+    except Exception as exc:  # noqa: BLE001 - the cell must report, never raise
+        return f"a deep_scratch build failure raised {type(exc).__name__}: {exc}"
+    finally:
+        globals()["deep_scratch"] = real
+    if res is None or not res.startswith("could not build the near-PATH_MAX scratch"):
+        return f"a deep_scratch build failure gave {res!r}, not a named violation"
+    return None
+
+
+FALLBACK_PLATFORMS = (("darwin", 1024), ("freebsd14", 1024), ("openbsd7", 1024),
+                      ("netbsd10", 1024), ("linux", 4096))
+
+
+def path_max_fallback_violation(tmp):
+    """None when path_max falls back to the platform's PATH_MAX (1024 on darwin and the
+    BSDs, 4096 elsewhere) when os.pathconf raises or answers nonsense, else a
+    description (#6145 R5-F1). os.pathconf and sys.platform are patched in place and
+    restored."""
+    real_pathconf, real_platform = os.pathconf, sys.platform
+
+    def raising(_path, _name):
+        raise OSError(errno.EINVAL, "PC_PATH_MAX unavailable")
+    # the host's own platform first (False sorts first), so the last patch applied is never the host's and
+    # a leaked sys.platform patch is visible on every host (R6-F3)
+    plans = sorted(FALLBACK_PLATFORMS, key=lambda entry: entry[0] != real_platform)
+    try:
+        for plat, want in plans:
+            for label, patch in (("raises", raising), ("answers 0", lambda _p, _n: 0),
+                                 ("answers None", lambda _p, _n: None)):
+                os.pathconf, sys.platform = patch, plat
+                got = path_max(tmp)
+                if got != want:
+                    return (f"path_max fell back to {got} on {plat} when os.pathconf {label}, "
+                            f"not the platform limit {want}")
+    finally:
+        os.pathconf, sys.platform = real_pathconf, real_platform
+    return None
+
+
+PATH_MAX_LEAK_PREFIX = "path_max_fallback_violation leaked"
+PATH_MAX_FALLBACK_PLANT = "planted fallback failure 6145"
+
+
+def path_max_restore_violation(tmp, fallback=path_max_fallback_violation):
+    """None when the fallback check (path_max_fallback_violation unless a caller passes
+    another) hands os.pathconf and sys.platform back exactly as it found them AND
+    passes, else a description (#6145 R6-F3). It is the only caller of
+    path_max_fallback_violation and runs first in the cell list, so the snapshot is the
+    true entry state and a leak names the real host platform (R7-F1). The patch list
+    ends on a platform that is not the host's, so a dropped restore is visible on Linux
+    too. The check is a parameter, not a patched global, so the diagnostic can hand in
+    a leaking one without anything to put back (R8-F2)."""
+    saved_pathconf, saved_platform = os.pathconf, sys.platform
+    try:
+        res = fallback(tmp)
+    finally:
+        leaked = []
+        if os.pathconf is not saved_pathconf:
+            leaked.append("os.pathconf")
+        if sys.platform != saved_platform:
+            leaked.append(f"sys.platform ({sys.platform!r}, not {saved_platform!r})")
+        os.pathconf, sys.platform = saved_pathconf, saved_platform
+    if leaked:
+        return f"{PATH_MAX_LEAK_PREFIX} a patched {', '.join(leaked)}"
+    return res
+
+
+def path_max_restore_diagnostic_violation(tmp):
+    """None when the path-max-restore cell, handed a fallback check that leaks its
+    patches (what a dropped `finally` does), fails with a leak message naming the REAL
+    host platform and puts os.pathconf and sys.platform back, and, handed a fallback
+    check that fails without leaking, fails as `(path-max-fallback, #6145)`, else a
+    description (#6145 R7-F1, R8-F1, R8-F2, R9-F3). Only that one cell runs (once per
+    planted check), through the same run_cells loop as _self_test, with the planted
+    check passed as its `fallback` argument: no global is patched, no other cell
+    re-runs and no scratch dir is created, so the diagnostic adds no checkout depth
+    (the 184-byte limit holds)."""
+    host, real_pathconf = sys.platform, os.pathconf
+
+    def leaking(_tmp):
+        for plat, _want in sorted(FALLBACK_PLATFORMS, key=lambda entry: entry[0] != sys.platform):
+            os.pathconf, sys.platform = (lambda _p, _n: 0), plat
+        return None
+    def planted(_tmp):
+        return PATH_MAX_FALLBACK_PLANT
+    err, fb_err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            rc = run_cells(SelfTest(), (("path-max-restore", path_max_restore_violation, (tmp, leaking)),))
+        put_back = os.pathconf is real_pathconf and sys.platform == host
+        with contextlib.redirect_stderr(fb_err):
+            fb_rc = run_cells(SelfTest(), (("path-max-restore", path_max_restore_violation, (tmp, planted)),))
+    finally:
+        os.pathconf, sys.platform = real_pathconf, host
+    out, fb_out = err.getvalue().strip(), fb_err.getvalue().strip()
+    if not put_back:
+        return ("the path-max-restore cell did not put os.pathconf and sys.platform back "
+                "after a leaking fallback check")
+    if rc != 2:
+        return f"a leaking fallback check was not reported (rc {rc}): {out[-300:]!r}"
+    if f"(path-max-restore, #6145): {PATH_MAX_LEAK_PREFIX}" not in out:
+        return f"a leaking fallback check was reported as another failure: {out[-300:]!r}"
+    if f"not {host!r}" not in out:
+        return (f"the leak message does not name the real host platform {host!r}: "
+                f"{out[-300:]!r}")
+    if fb_rc != 2 or f"(path-max-fallback, #6145): {PATH_MAX_FALLBACK_PLANT}" not in fb_out:
+        return (f"a failing (not leaking) fallback check was not reported as path-max-fallback "
+                f"(rc {fb_rc}): {fb_out[-300:]!r}")
+    return None
+
+
+def guarded_violation():
+    """None when guarded() turns an Exception into '<cell> raised <Type>: <msg>',
+    returns None for a passing cell and lets KeyboardInterrupt propagate, else a
+    description (#6145 R5-F2)."""
+    def boom():
+        raise RuntimeError("x")
+
+    def fine():
+        return None
+
+    def interrupted():
+        raise KeyboardInterrupt
+    try:
+        got = guarded(boom)
+    except Exception as exc:  # noqa: BLE001 - an unguarded crash is the defect under test
+        return f"guarded let a RuntimeError escape: {exc}"
+    if got != "boom raised RuntimeError: x":
+        return f"guarded gave {got!r} for a raising cell, not 'boom raised RuntimeError: x'"
+    if guarded(fine) is not None:
+        return "guarded changed the result of a passing cell"
+    try:
+        guarded(interrupted)
+    except KeyboardInterrupt:
+        return None
+    return "guarded swallowed a KeyboardInterrupt"
+
+
+def scratch_limit_message_violation(tmp):
+    """None when the 'scratch path is too deep' violation names the actual scratch path
+    length and the limit, else a description (#6145 R5-F3). The limit is derived here
+    independently of the code under test: 255 - '#!' - ' -I' - '/gitshim-long.XXXXXXXX'
+    - the pad's 1 byte and the 1-byte file name."""
+    limit = 255 - len("#!") - len(" -I") - (1 + MKDTEMP_NAME_LEN) - 2
+    base, deepest = deep_scratch(tmp, limit + 40)
+    try:
+        msg = shim_interpreter_violation(deepest)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    if msg is None or not msg.startswith("the scratch path is too deep"):
+        return f"a {limit + 40}-byte scratch gave {msg!r}, not a 'too deep' violation"
+    for need in (f"{limit + 40} bytes", f"{limit} bytes"):
+        if need not in msg:
+            return f"the 'too deep' message {msg!r} does not state {need!r}"
+    return None
+
+
+def deep_scratch_relative_violation(tmp):
+    """None when deep_scratch_violation stays valid on a deep scratch dir (its targets
+    are relative to the scratch path length and capped below PATH_MAX), else a
+    description (#6145 R5-F3)."""
+    limit = path_max(tmp)
+    base, deepest = deep_scratch(tmp, max(limit - 700, len(os.fsencode(str(tmp))) + 100))
+    try:
+        res = deep_scratch_violation(deepest)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    return res
+
+
+def deep_scratch_cap_violation(tmp):
+    """None when deep_scratch_violation keeps its two targets inside
+    [deep_scratch_base_len, PATH_MAX-1] on a scratch dir 400 bytes under PATH_MAX (where
+    the +600 target hits the cap) and reports a named 'needs room' violation at 24 bytes
+    under PATH_MAX (base 2 bytes under it) but not at 25 (R6-F1, R6-F2, R7-F2), else a
+    description (#6145)."""
+    limit = path_max(tmp)
+    cap = limit - 1
+    seen = []
+    real = globals()["deep_scratch"]
+
+    def spy(spy_tmp, target):
+        seen.append(target)
+        return real(spy_tmp, target)
+    base, deepest = deep_scratch(tmp, limit - 400)
+    globals()["deep_scratch"] = spy
+    try:
+        res = deep_scratch_violation(deepest)
+    finally:
+        globals()["deep_scratch"] = real
+        shutil.rmtree(base, ignore_errors=True)
+    if res is not None:
+        return f"deep_scratch_violation failed on a scratch {limit - 400} bytes long: {res}"
+    low = deep_scratch_base_len(deepest)
+    targets = seen[:2]  # the two build targets come before the too-short probe
+    if len(targets) != 2 or cap not in targets:
+        return f"the deep_scratch targets {seen!r} never reached the cap {cap}"
+    if any(t > cap or t < low for t in targets):
+        return f"the deep_scratch targets {targets!r} leave [{low}, {cap}]"
+    if targets != [min(low + 300, cap), min(low + 600, cap)]:
+        return f"the deep_scratch targets {targets!r} are not base+300 and base+600 capped at {cap}"
+    for room, want_room in ((limit - 24, True), (limit - 25, False)):
+        base, deepest = deep_scratch(tmp, room)
+        try:
+            res = deep_scratch_violation(deepest)
+        finally:
+            shutil.rmtree(base, ignore_errors=True)
+        if want_room:
+            need = f"the scratch path is {room} bytes; deep_scratch needs room"
+            if res is None or not res.startswith(need):
+                return f"a {room}-byte scratch gave {res!r}, not a violation starting {need!r}"
+        elif res is not None:
+            return f"a {room}-byte scratch gave {res!r}, not None"
+    return None
+
+
+CHECKOUT_DEPTH_PREFIX = "cert-expiry-depth."
+
+
+def checkout_depth_cells():
+    """The cells checkout_depth_violation runs in its 226-byte scratch dir (#6145 R10-F1)."""
+    return (shim_isolation_violation, shim_interpreter_violation,
+            shim_boundary_robustness_violation, deep_scratch_violation,
+            path_max_restore_diagnostic_violation, deep_scratch_cap_violation,
+            scratch_limit_message_violation, deep_scratch_relative_violation,
+            shim_unexecutable_violation)
+
+
+# Cells whose scratch path or shim interpreter line grows with the scratch depth; each
+# must run in checkout_depth_violation's 226-byte scratch dir (#6145 R10-F1).
+CHECKOUT_DEPTH_REQUIRED = ("shim_unexecutable_violation",)
+
+
+def checkout_depth_coverage_violation():
+    """None when checkout_depth_cells() names every cell in CHECKOUT_DEPTH_REQUIRED, else
+    a description (#6145 R10-F1): the shim-unexecutable cell's interpreter line is 251
+    bytes at a 226-byte scratch dir, so a cell left out of checkout-depth lets a deeper
+    one pass from a shallow checkout."""
+    have = {cell.__name__ for cell in checkout_depth_cells()}
+    missing = [name for name in CHECKOUT_DEPTH_REQUIRED if name not in have]
+    if missing:
+        return f"checkout-depth does not run {', '.join(missing)}"
+    return None
+
+
+def checkout_depth_violation(tmp):
+    """None when every #6145 shim and scratch cell passes in a scratch dir exactly
+    SCRATCH_PATH_LIMIT (226) bytes long, the scratch a 184-byte checkout gets, else a
+    description (#6145 R8-F1, R9-F2). No cell may need more depth than shim-interpreter
+    itself, so a cell that nests the self-test (or any of its cells) deeper than its
+    own scratch dir fails here (checkout_depth_cells lists them; the checkout-depth-coverage
+    cell pins shim_unexecutable_violation in it). path_max_restore_violation builds no
+    path and is not in the list; the diagnostic still runs it, but only with planted
+    fallbacks, so the real fallback check runs once per self-test (R9-F1); the gate-run
+    fixtures build one `gitshim.*` level under the scratch dir and fit within it. The
+    dir is a sibling of tmp (tmp itself is 226 bytes at a 184-byte checkout) and is
+    removed afterwards."""
+    parent = tmp.parent
+    pad = SCRATCH_PATH_LIMIT - len(os.fsencode(str(parent))) - 1 - len(CHECKOUT_DEPTH_PREFIX) - 8
+    if pad < 0:
+        return (f"the scratch root {str(parent)!r} is too deep to build a "
+                f"{SCRATCH_PATH_LIMIT}-byte scratch dir")
+    deep = Path(tempfile.mkdtemp(prefix=CHECKOUT_DEPTH_PREFIX + "d" * pad, dir=str(parent)))
+    try:
+        got = len(os.fsencode(str(deep)))
+        if got != SCRATCH_PATH_LIMIT:
+            return f"the depth scratch dir is {got} bytes, not {SCRATCH_PATH_LIMIT}"
+        for cell in checkout_depth_cells():
+            res = guarded(cell, deep)
+            if res is not None:
+                return f"{cell.__name__} failed in a {got}-byte scratch dir: {res}"
+    finally:
+        shutil.rmtree(deep, ignore_errors=True)
+    return None
+
+
+def shim_isolation_violation(tmp, interpreter=None):
+    """None when the git shim is isolated, else a description (#6145). Plants an
+    empty `gitshim_canary_6145.py` beside the shim and runs the shim's own probe,
+    which reports `sys.flags.isolated` and whether the canary imported (without
+    -I the script directory is sys.path[0], so a planted module imports). The
+    real import system decides, so a symlinked scratch path cannot fool it."""
+    real = shutil.which("git")
+    if real is None:
+        raise GateError("git is not on PATH")
+    shim_dir = Path(tempfile.mkdtemp(prefix="gitshim-iso.", dir=str(tmp)))
+    try:
+        shim = write_git_shim(shim_dir, real, interpreter=interpreter)
+        (shim_dir / "gitshim_canary_6145.py").write_text("", encoding="utf-8")
+        first = shim.read_text(encoding="utf-8").splitlines()[0]
+        if not first.startswith("#!") or first.split()[1:] != ["-I"]:
+            return f"shim interpreter line {first!r} is not '<python> -I'"
+        try:
+            res = subprocess.run([str(shim), "--shim-isolation-probe"], capture_output=True,
+                                 text=True, cwd=str(shim_dir), check=False)
+        except OSError as exc:
+            return f"the shim could not be executed: {exc}"
+        if res.returncode != 0 or res.stdout.split() != ["1", "False"]:
+            return ("the shim is not isolated: probe printed "
+                    f"{res.stdout.strip()!r} (want '1 False'), rc {res.returncode}: {res.stderr}")
+        return None
+    finally:
+        shutil.rmtree(shim_dir, ignore_errors=True)
+
+
+def run_gate_shimmed(tmp, repo, env, version="", fail=""):
+    """run_gate with a PATH shim `git` that reports `version` for --version
+    and exits 128 on any call whose argv contains `fail`, and otherwise
+    delegates to the real git (R2-F2: pins the guarded branches)."""
+    real = shutil.which("git")
+    if real is None:
+        raise GateError("git is not on PATH")
+    shim_dir = Path(tempfile.mkdtemp(prefix="gitshim.", dir=str(tmp)))
+    write_git_shim(shim_dir, real, version, fail)
+    saved = os.environ.get("PATH")
+    os.environ["PATH"] = f"{shim_dir}{os.pathsep}{saved or ''}"
+    try:
+        return run_gate(repo, dict(env, PATH=os.environ["PATH"]))
+    finally:
+        if saved is None:
+            os.environ.pop("PATH", None)
+        else:
+            os.environ["PATH"] = saved
+        shutil.rmtree(shim_dir, ignore_errors=True)
+
+
+def _gate_env(**kw):
+    return {k: v for k, v in kw.items() if v is not None}
+
+
+def self_test():
+    try:
+        require_git_version(REPO_ROOT)
+    except GateError as exc:
+        print(f"{PREFIX}: ERROR — {exc}", file=sys.stderr)
+        return 2
+    scratch_root = REPO_ROOT / ".local-runs"
+    scratch_root.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(prefix="cert-expiry-selftest.", dir=str(scratch_root)))
+    try:
+        return _self_test(tmp)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def guarded(cell, *args, **kwargs):
+    """Run a self-test cell; a crash becomes a named violation string, not a traceback
+    (#6145 security O1)."""
+    try:
+        return cell(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - report any crash as a named failure
+        return f"{cell.__name__} raised {type(exc).__name__}: {exc}"
+
+
+def run_cells(t, cells):
+    """Run (tag, cell, args) self-test cells in order (#6145 R8-F1). The first violation
+    is reported through t.fail as `(<tag>, #6145): <violation>` and returns 2; None when
+    every cell passes. A path-max-restore violation that is not a leak is tagged
+    path-max-fallback, since the fallback check runs inside that cell."""
+    for tag, cell, cell_args in cells:
+        try:
+            res = guarded(cell, *cell_args)
+        except Exception as exc:  # noqa: BLE001 - guarded itself must never leak a crash
+            res = f"{cell.__name__} escaped guarded: {type(exc).__name__}: {exc}"
+        if res is not None:
+            if tag == "path-max-restore" and not res.startswith(PATH_MAX_LEAK_PREFIX):
+                tag = "path-max-fallback"  # the fallback check runs inside the restore cell
+            t.fail(f"({tag}, #6145): {res}")
+            print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+            return 2
+    return None
+
+
+def shim_unexecutable_violation(tmp):
+    """None when a shim whose interpreter does not exist is reported as 'the shim could
+    not be executed', else a description (#6145 R10-F1). The interpreter line is 251
+    bytes at a 226-byte scratch dir, so checkout-depth runs this cell too."""
+    unexec = guarded(shim_isolation_violation, tmp, interpreter=tmp / "no-such-python-6145")
+    if unexec is None or not unexec.startswith("the shim could not be executed"):
+        return (f"an unexecutable shim gave {unexec!r}, "
+                "not a 'the shim could not be executed' violation")
+    return None
+
+
+def shim_isolation_result(tmp, check=shim_isolation_violation):
+    """The shim-isolation verdict for _self_test: None when `check(tmp)` passes, else a
+    description. A GateError is the description itself; any other crash becomes the
+    `guarded` form, so a crash is a named failure and not a traceback (#6145 R10-F2)."""
+    try:
+        return check(tmp)
+    except GateError as exc:
+        return str(exc)
+    except Exception as exc:  # noqa: BLE001 - report any crash as a named failure
+        return f"shim_isolation_violation raised {type(exc).__name__}: {exc}"
+
+
+def shim_isolation_crash_violation():
+    """None when shim_isolation_result turns an OSError, a ValueError and a class defined
+    here raised by the check into `shim_isolation_violation raised <Type>: ...`, else a
+    description. The private class derives from Exception only, so no narrower tuple of
+    builtin types catches it: the three plants pin the handler at Exception. Decoding the
+    probe output of non-UTF-8 bytes raises UnicodeDecodeError, a ValueError (#6145 R10-F2,
+    R11-F1, R12-F1)."""
+    class _Planted6145(Exception):
+        pass
+
+    for exc_type in (OSError, ValueError, _Planted6145):
+        def crashing(_tmp, exc_type=exc_type):
+            raise exc_type("planted 6145")
+        got = shim_isolation_result(None, crashing)
+        want = f"shim_isolation_violation raised {exc_type.__name__}: planted 6145"
+        if got != want:
+            return f"{exc_type.__name__} raised in the isolation cell gave {got!r}, not {want!r}"
+    return None
+
+
+def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
+    repo = tmp / "repo"
+    repo.mkdir()
+    t = SelfTest()
+    # #6145: prove the git PATH shim is isolated before any gate run uses it; an
+    # unisolated shim aborts the self-test here.
+    iso = shim_isolation_result(tmp)
+    if iso is not None:
+        t.fail(f"(shim-isolation, #6145): {iso}")
+        print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+        return 2
+    iface = guarded(shim_interpreter_violation, tmp)
+    if iface is not None:
+        t.fail(f"(shim-interpreter, #6145): {iface}")
+        print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+        return 2
+    robust = guarded(shim_boundary_robustness_violation, tmp)
+    if robust is not None:
+        t.fail(f"(shim-interpreter-robust, #6145): {robust}")
+        print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+        return 2
+    deepx = guarded(deep_scratch_violation, tmp)
+    if deepx is not None:
+        t.fail(f"(shim-deep-scratch, #6145): {deepx}")
+        print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+        return 2
+    rc = run_cells(t, (("path-max-restore", path_max_restore_violation, (tmp,)),
+                       ("path-max-diagnostic", path_max_restore_diagnostic_violation, (tmp,)),
+                       ("shim-deep-cap", deep_scratch_cap_violation, (tmp,)),
+                       ("guarded", guarded_violation, ()),
+                       ("shim-isolation-crash", shim_isolation_crash_violation, ()),
+                       ("checkout-depth-coverage", checkout_depth_coverage_violation, ()),
+                       ("shim-scratch-limit", scratch_limit_message_violation, (tmp,)),
+                       ("shim-deep-relative", deep_scratch_relative_violation, (tmp,)),
+                       ("checkout-depth", checkout_depth_violation, (tmp,))))
+    if rc is not None:
+        return rc
+    rc = run_cells(t, (("shim-unexecutable", shim_unexecutable_violation, (tmp,)),))
+    if rc is not None:
+        return rc
+    fx = Fixture(repo)
+    fx.g("init", "-q", "-b", "main")
+    fx.g("config", "user.name", "Cert Expiry Selftest")
+    fx.g("config", "user.email", "selftest@invalid.example")
+    fx.g("config", "commit.gpgsign", "false")
+
+    fx.write("src/federation/mod.rs", "fn federation_mod() {}\n")
+    fx.write("src/handlers/federation_receive.rs", "fn receive() {}\n")
+    fx.write("src/handlers/federation_signing_check.rs", "fn signing_check() {}\n")
+    fx.write("src/config.rs", 'pub const X: &str = "AI_MEMORY_FED_REQUIRE_SIG";\n')
+    fx.write("src/unrelated.rs", "fn other() {}\n")
+    genesis = fx.commit(["src"], "genesis")
+
+    # The base fixture is LIVE and bound to the genesis tree, so a range from
+    # base carries no wire drift since the bind ((C) is true).
+    fx.banner("LIVE", genesis)
+    base = fx.commit([CERT_DOC], "base: certification LIVE bound to genesis")
+
+    sentence = "federation-wire surface changed → the enterprise-federation certification expires per its §7"
+    mod_rs = "src/federation/mod.rs"
+
+    # (a) RED - watched federation path, no cert-doc touch.
+    fx.write(mod_rs, "// mutate\n", append=True)
+    viol = fx.commit([mod_rs], "violate: touch src/federation without cert doc")
+    t.expect_red("a", "watched-path violation", repo, base, viol, [
+        (sentence, "did not carry the required §7 expiry sentence"),
+        (mod_rs, "did not name the watched path"),
+    ])
+
+    # (b) GREEN - same violation PLUS a REAL re-issue: the doc rebinds to the
+    #     wire-change commit.
+    fx.banner("LIVE", viol)
+    satisfied = fx.commit([CERT_DOC], "satisfy: re-issue cert doc alongside wire change")
+    t.expect_green("b", "cert-doc-touching variant", repo, base, satisfied, [
+        ("cert doc re-issued/voided", "did not name the cert-doc satisfy path"),
+    ])
+    fx.reset(base)
+
+    # (c) RED - AI_MEMORY_FED_* identifier added in src/ OUTSIDE the path watches.
+    fx.write("src/config.rs", 'pub const X: &str = "AI_MEMORY_FED_REQUIRE_SIG";\n'
+             'pub const Y: &str = "AI_MEMORY_FED_NEW_KNOB";\n')
+    id_sha = fx.commit(["src/config.rs"], "violate: add AI_MEMORY_FED_* identifier")
+    t.expect_red("c", "identifier-add violation", repo, base, id_sha, [
+        ("AI_MEMORY_FED_NEW_KNOB", "did not name the added identifier"),
+        (sentence, "did not carry the required §7 expiry sentence"),
+    ])
+
+    # (d) GREEN - identifier add + a real re-issue (rebind to the add).
+    fx.banner("LIVE", id_sha)
+    id_ok = fx.commit([CERT_DOC], "satisfy: re-issue cert doc alongside identifier add")
+    t.expect_green("d", "identifier-add + cert-doc variant", repo, base, id_ok)
+    fx.reset(base)
+
+    # (e) GREEN - unrelated src/ edit.
+    fx.write("src/unrelated.rs", "// unrelated\n", append=True)
+    clean = fx.commit(["src/unrelated.rs"], "clean: unrelated src edit")
+    t.expect_green("e", "unrelated src edit", repo, base, clean, [
+        ("federation-wire surface unchanged", "did not say the surface was unchanged"),
+    ])
+    fx.reset(base)
+
+    # (f) GREEN - cert-doc-only change.
+    fx.write(CERT_DOC, "// docs only\n", append=True)
+    docs = fx.commit([CERT_DOC], "clean: cert-doc only")
+    t.expect_green("f", "cert-doc-only change", repo, base, docs)
+    fx.reset(base)
+
+    # (g) RED - federation_receive.rs.
+    fx.write("src/handlers/federation_receive.rs", "// mutate receive\n", append=True)
+    recv = fx.commit(["src/handlers/federation_receive.rs"], "violate: touch federation_receive.rs")
+    t.expect_red("g", "federation_receive.rs violation", repo, base, recv, [
+        ("src/handlers/federation_receive.rs", "did not name federation_receive.rs"),
+    ])
+    fx.reset(base)
+
+    # (h) RED - federation_signing_check.rs.
+    fx.write("src/handlers/federation_signing_check.rs", "// mutate signing\n", append=True)
+    sign = fx.commit(["src/handlers/federation_signing_check.rs"],
+                     "violate: touch federation_signing_check.rs")
+    t.expect_red("h", "federation_signing_check.rs violation", repo, base, sign, [
+        ("src/handlers/federation_signing_check.rs", "did not name federation_signing_check.rs"),
+    ])
+    fx.reset(base)
+
+    # (h2) RED - nested path under src/federation/** (a non-recursive glob would
+    #      let src/federation/identity/*.rs through).
+    fx.write("src/federation/identity/mod.rs", "fn identity() {}\n")
+    nested = fx.commit(["src/federation/identity/mod.rs"],
+                       "violate: touch nested src/federation/identity")
+    t.expect_red("h2", "nested src/federation/identity/mod.rs", repo, base, nested, [
+        ("src/federation/identity/mod.rs", "did not name the nested watched path"),
+    ])
+    fx.reset(base)
+
+    # (i) RED - rename of a watched file (D of the old path must still trip).
+    (repo / "src/elsewhere").mkdir(parents=True, exist_ok=True)
+    fx.g("mv", mod_rs, "src/elsewhere/mod.rs")
+    fx.g("commit", "-q", "-m", "violate: rename watched federation file away")
+    rename = fx.g("rev-parse", "HEAD")
+    t.expect_red("i", "watched-file rename", repo, base, rename, [
+        (mod_rs, "rename rejection did not name the old watched path"),
+    ])
+    fx.reset(base)
+
+    # (j) RED - identifier RENAME (remove one, add another).
+    fx.write("src/config.rs", 'pub const X: &str = "AI_MEMORY_FED_REQUIRE_SIGNATURE";\n')
+    idren = fx.commit(["src/config.rs"], "violate: rename AI_MEMORY_FED_* identifier")
+    t.expect_red("j", "identifier-rename", repo, base, idren, [
+        ("AI_MEMORY_FED_REQUIRE_SIGNATURE", "did not name the added identifier"),
+        ("AI_MEMORY_FED_REQUIRE_SIG", "did not name the removed identifier"),
+    ])
+    fx.reset(base)
+
+    # (p) RED - non-ASCII path under a watched dir. core.quotePath would
+    #     C-quote it and the path match would MISS; the gate reads raw -z paths.
+    fx.write("src/federation/naïve_wire.rs", "fn wire() {}\n")
+    quoted = fx.commit(["src/federation/naïve_wire.rs"], "violate: non-ASCII watched path")
+    t.expect_red("p", "non-ASCII watched path (core.quotePath bypass)", repo, base, quoted, [
+        ("src/federation/naïve_wire.rs", "did not name the raw (unquoted) non-ASCII path"),
+    ])
+
+    # ---- #3556 predicates (B) and (C) ----------------------------------
+
+    # (q) RED - wire change + an INCIDENTAL cert-doc edit (banner untouched).
+    fx.write(mod_rs, "// mutate\n", append=True)
+    fx.banner("LIVE", genesis, "An incidental prose edit.\n")
+    incidental = fx.commit([mod_rs, CERT_DOC], "violate: wire change + incidental doc edit")
+    t.expect_red("q", "wire change + incidental cert-doc edit (#3556 hole open)", repo, base,
+                 incidental, [
+        ("an incidental edit is not a re-issue and not a voiding record",
+         "did not name the incidental edit"),
+        (sentence, "did not carry the required §7 expiry sentence"),
+    ])
+    fx.reset(base)
+
+    # (r) GREEN - wire change + the STATUS line flipped to VOID.
+    fx.write(mod_rs, "// mutate\n", append=True)
+    fx.banner("VOID", genesis)
+    void = fx.commit([mod_rs, CERT_DOC], "satisfy: wire change + VOID record")
+    t.expect_green("r", "wire change + VOID record", repo, base, void, [
+        ("banner STATUS=VOID", "did not report the VOID banner"),
+    ])
+
+    # (t) GREEN - an unrelated change ON TOP of the VOID record.
+    fx.write("src/unrelated.rs", "// unrelated\n", append=True)
+    over_void = fx.commit(["src/unrelated.rs"], "clean: unrelated edit over a VOID record")
+    t.expect_green("t", "unrelated change over a VOID banner", repo, void, over_void)
+    fx.reset(base)
+
+    # (s) RED - LIVE banner + wire drift since the bind, on a range that touches
+    #     NOTHING watched.
+    fx.write(mod_rs, "// mutate\n", append=True)
+    drifted = fx.commit([mod_rs], "earlier: wire change with no re-issue")
+    fx.write("src/unrelated.rs", "// unrelated\n", append=True)
+    stale_live = fx.commit(["src/unrelated.rs"], "later: unrelated edit over a stale LIVE banner")
+    t.expect_red("s", "LIVE banner over wire drift (#3556 hole open)", repo, drifted, stale_live, [
+        (f"claims LIVE bound to {genesis} but 1 federation-wire change(s) landed since",
+         "did not name the bound SHA and the drift count"),
+        ("while its banner still says LIVE", "did not carry the banner-vs-drift sentence"),
+        (mod_rs, "did not list the drifted path"),
+    ])
+
+    # (u) GREEN - the same stale state HEALED by a STATUS flip to EXPIRED.
+    fx.banner("EXPIRED", genesis)
+    healed = fx.commit([CERT_DOC], "heal: record EXPIRED")
+    t.expect_green("u", "recording EXPIRED over the stale LIVE banner", repo, stale_live, healed)
+    fx.reset(base)
+
+    # (v1) GREEN - LIVE bound to a non-ancestor whose watched tree equals HEAD's
+    #      (squash-merge shape): drift is a tree comparison.
+    fx.g("checkout", "-q", "-b", "side", genesis)
+    fx.write("src/unrelated.rs", "// side\n", append=True)
+    side = fx.commit(["src/unrelated.rs"], "side commit (unwatched)")
+    fx.g("checkout", "-q", "main")
+    fx.banner("LIVE", side)
+    nonanc = fx.commit([CERT_DOC], "bind to a non-ancestor with an identical watched tree")
+    t.expect_green("v1", "a bind to a non-ancestor with an identical watched tree", repo, base,
+                   nonanc, [("federation-wire surface unchanged since the bind",
+                             "did not report zero drift since the bind")])
+    fx.reset(base)
+
+    # (v2) RED - LIVE bound to a non-ancestor whose watched tree DIFFERS.
+    fx.g("checkout", "-q", "-b", "side2", genesis)
+    fx.write(mod_rs, "// side wire\n", append=True)
+    side2 = fx.commit([mod_rs], "side commit (watched)")
+    fx.g("checkout", "-q", "main")
+    fx.banner("LIVE", side2)
+    evasive = fx.commit([CERT_DOC], "bind to a non-ancestor whose watched tree differs")
+    t.expect_red("v2", "a bind to a non-ancestor with a DIFFERENT watched tree (evasion open)",
+                 repo, base, evasive, [
+        (f"claims LIVE bound to {side2}", "did not name the evasive bound SHA"),
+    ])
+    fx.reset(base)
+
+    # (w) fail-closed - the doc exists but its STATUS line is unparseable.
+    fx.write(CERT_DOC, "# cert\nno banner here\n")
+    unparseable = fx.commit([CERT_DOC], "break: banner unparseable")
+    t.expect_red("w", "an unparseable STATUS line (not fail-closed)", repo, base, unparseable, [
+        ("no parseable STATUS line", "did not name the missing STATUS line"),
+    ])
+    fx.reset(base)
+
+    # ---- #3556 ruling: the three fixes, a cell each -----------------------
+
+    # (x1) RED - DECOY STATUS line above the real LIVE banner + wire change.
+    fx.write(mod_rs, "// mutate\n", append=True)
+    fx.banner("LIVE", genesis)
+    fx.prepend(CERT_DOC, "> ## STATUS — **VOID as of 2026-01-02** (decoy)")
+    decoy_status = fx.commit([mod_rs, CERT_DOC],
+                             "violate: decoy STATUS line above the banner + wire change")
+    t.expect_red("x1", "a decoy STATUS line above the real banner", repo, base, decoy_status, [
+        ("not carry exactly one STATUS banner line", "did not name the duplicated banner"),
+    ])
+    fx.reset(base)
+
+    # (x2) RED - DECOY on the Binds-to line.
+    fx.write(mod_rs, "// mutate\n", append=True)
+    wire = fx.commit([mod_rs], "wire change")
+    fx.banner("LIVE", genesis)
+    fx.prepend(CERT_DOC, f"**Binds to:** `{wire}` (decoy)")
+    decoy_binds = fx.commit([CERT_DOC], "violate: decoy Binds-to line above the real one")
+    t.expect_red("x2", "a decoy Binds-to line above the real one", repo, base, decoy_binds, [
+        ("at most one Binds-to line", "did not name the duplicated Binds-to"),
+    ])
+    fx.reset(base)
+
+    # (y) RED - the cert doc DELETED in the same change as a wire change.
+    fx.write(mod_rs, "// mutate\n", append=True)
+    fx.g("rm", "-q", CERT_DOC)
+    deleted = fx.commit([mod_rs], "violate: delete the certification + wire change")
+    t.expect_red("y", "deleting the cert doc alongside a wire change", repo, base, deleted, [
+        ("ABSENT at HEAD (deleted in this change)", "did not name the deletion"),
+    ])
+    fx.reset(base)
+
+    # (z) GREEN - a PURE REFORMAT of the banner on a docs-only change.
+    fx.write(
+        CERT_DOC,
+        "# Enterprise federation certification (fixture)\n\n"
+        f"**Binds  to:**  {genesis.upper()}  (reformatted)\n\n"
+        "#  STATUS  -  **LIVE as of 2026-01-01**  (reformatted)\n\nBody prose.\n",
+    )
+    reformat = fx.commit([CERT_DOC], "docs: reformat the banner")
+    t.expect_green("z", "a pure banner reformat (typographic landmine)", repo, base, reformat, [
+        (f"banner LIVE bound to {genesis}; federation-wire surface unchanged since the bind",
+         "did not parse the reformatted banner to LIVE bound to genesis"),
+    ])
+
+    # (z2) RED - the same reformat carried alongside a wire change is INCIDENTAL.
+    fx.write(mod_rs, "// mutate\n", append=True)
+    reformat_wire = fx.commit([mod_rs], "violate: wire change over the reformatted banner")
+    t.expect_red("z2", "reformat + wire change", repo, base, reformat_wire, [
+        ("an incidental edit is not a re-issue",
+         "did not classify the reformat as incidental (pair unchanged)"),
+    ])
+    fx.reset(base)
+
+    # ---- #6137: pull_request judged at the merge commit ----------------------
+    # History: base (LIVE bound genesis) -> stale_tip (wire change W landed with
+    # no re-issue: banner LIVE with drift, the pre-#6121 carrier state). The
+    # feature branch is cut at stale_tip. The live base then heals to EXPIRED.
+    fx.write(mod_rs, "// W: wire change, banner not re-issued\n", append=True)
+    stale_tip = fx.commit([mod_rs], "carrier before the banner fix: wire change, banner still LIVE")
+    fx.g("checkout", "-q", "-b", "feature", stale_tip)
+    fx.write("src/unrelated.rs", "// feature work\n", append=True)
+    feature = fx.commit(["src/unrelated.rs"], "feature: unrelated change on a stale branch")
+    fx.g("checkout", "-q", "main")
+    fx.banner("EXPIRED", genesis)
+    healed_base = fx.commit([CERT_DOC], "carrier banner fix: record EXPIRED (#6121 shape)")
+    fx.g("update-ref", "refs/remotes/origin/main", healed_base)
+    pr_merge = fx.merge("feature", "Merge feature into main (pull_request merge commit)")
+
+    # (pr1) GREEN at the merge commit; RED if judged at the head in isolation
+    #       (the old semantics), proving the two differ on this very history.
+    t.expect_green("pr1", "stale-LIVE head banner with base banner EXPIRED, judged at the merge commit",
+                   repo, healed_base, feature, [
+        ("federation-wire surface unchanged", "did not pass at the merge commit"),
+        ("banner STATUS=EXPIRED", "did not read the EXPIRED banner at the merge commit"),
+    ], tip=pr_merge)
+    t.expect_red("pr1-head", "head-only judgment of the same stale branch (old semantics)", repo,
+                 healed_base, feature, [
+        ("while its banner still says LIVE", "did not show the stale-LIVE head failure"),
+    ])
+    pr_env = _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=feature,
+                       GITHUB_BASE_REF="main", GITHUB_SHA=pr_merge, PATH=os.environ.get("PATH", ""))
+    rc, out, err = run_gate(repo, pr_env)
+    if rc != 0:
+        t.fail("(pr1-gate): pull_request event on the stale branch did not pass end to end:", out + err)
+
+    # (pr3) the payload PR_BASE_SHA is stale (genesis); the LIVE base ref wins.
+    captured = io.StringIO()
+    with contextlib.redirect_stderr(captured):
+        rc, out, err = run_gate(repo, dict(pr_env, PR_BASE_SHA=genesis))
+    err = err + captured.getvalue()
+    if rc != 0:
+        t.fail("(pr3): a stale payload PR_BASE_SHA broke the pull_request verdict:", out + err)
+    elif f"unchanged in {healed_base}..{pr_merge}" not in out:
+        t.fail("(pr3): the live base was NOT used (range should be base tip..merge commit):", out)
+    elif "using the live base" not in err:
+        t.fail("(pr3): the stale payload base was not reported:", err)
+
+    # (pr3b) the stale payload base would have given a different range: prove
+    #        the verdict text changes if the stale sha were honoured.
+    stale_ok, stale_text = check_change(repo, genesis, feature, pr_merge)
+    if stale_ok or "is not on the live base" not in stale_text:
+        t.fail("(pr3b): a base that does not contain the merge commit's first parent did not fail closed", stale_text)
+
+    # (pr2) the head FLIPS the banner (voiding record + wire change) while the
+    #       live base has moved on: detected over merge-base..merge-commit.
+    fx.reset(base)
+    fx.g("checkout", "-q", "-b", "flip", base)
+    fx.write(mod_rs, "// flip branch wire change\n", append=True)
+    fx.banner("VOID", genesis)
+    flip = fx.commit([mod_rs, CERT_DOC], "flip: wire change + VOID record")
+    fx.g("checkout", "-q", "main")
+    fx.write("src/unrelated.rs", "// base moved\n", append=True)
+    moved_base = fx.commit(["src/unrelated.rs"], "base moves on with an unrelated change")
+    fx.g("update-ref", "refs/remotes/origin/main", moved_base)
+    flip_merge = fx.merge("flip", "Merge flip into main")
+    t.expect_green("pr2", "head that flips the banner (VOID) with the base moved on", repo,
+                   moved_base, flip, [
+        ("cert doc re-issued/voided", "did not detect the banner flip over merge-base..merge-commit"),
+        (f"{moved_base}..{flip_merge}", "did not measure base tip..merge-commit"),
+    ], tip=flip_merge)
+    # (pr2b) the same wire change WITHOUT the banner flip is still RED there.
+    fx.reset(moved_base)
+    fx.g("checkout", "-q", "-b", "noflip", base)
+    fx.write(mod_rs, "// noflip branch wire change\n", append=True)
+    noflip = fx.commit([mod_rs], "noflip: wire change, no cert-doc change")
+    fx.g("checkout", "-q", "main")
+    noflip_merge = fx.merge("noflip", "Merge noflip into main")
+    t.expect_red("pr2b", "wire change without a banner flip over a moved base", repo, moved_base,
+                 noflip, [
+        (sentence, "did not carry the required §7 expiry sentence"),
+        (mod_rs, "did not name the watched path"),
+        ("judged at the pull_request merge commit", "did not say it judged the merge commit"),
+    ], tip=noflip_merge)
+
+    # (pr5) conductor decision (#6137): the banner is already EXPIRED at the
+    #       fork point, the base then gained a wire change, and a stale branch
+    #       with no wire change of its own must PASS (the base-side change was
+    #       judged when it landed; the PR's own effect is nil).
+    fx.reset(base)
+    fx.banner("EXPIRED", genesis)
+    fork5 = fx.commit([CERT_DOC], "base: banner EXPIRED at the fork point")
+    fx.g("checkout", "-q", "-b", "stale5", fork5)
+    fx.write("src/unrelated.rs", "// stale5 branch work\n", append=True)
+    stale5 = fx.commit(["src/unrelated.rs"], "stale5: unrelated change, no wire change")
+    fx.g("checkout", "-q", "main")
+    fx.write(mod_rs, "// base-side wire change after the fork\n", append=True)
+    base5 = fx.commit([mod_rs], "base gains a wire change after the fork (banner already EXPIRED)")
+    fx.g("update-ref", "refs/remotes/origin/main", base5)
+    merge5 = fx.merge("stale5", "Merge stale5 into main")
+    if mod_rs not in changed_paths(repo, fork5, merge5):
+        t.fail("(pr5): control: merge-base..merge-commit no longer sees the base-side wire change")
+    t.expect_green("pr5", "stale branch with no wire change over a base that gained one", repo,
+                   base5, stale5, [
+        (f"unchanged in {base5}..{merge5}", "did not measure base tip..merge-commit"),
+    ], tip=merge5)
+    rc, out, err = run_gate(repo, dict(pr_env, PR_HEAD_SHA=stale5, GITHUB_SHA=merge5))
+    if rc != 0:
+        t.fail("(pr5-gate): pull_request event on the stale branch did not pass end to end:", out + err)
+
+    # (pr6) the PR itself adds a wire change, does not flip the banner, base
+    #       unchanged: still RED under (A)/(B).
+    fx.reset(base)
+    fx.g("checkout", "-q", "-b", "wire6", base)
+    fx.write(mod_rs, "// wire6 branch wire change\n", append=True)
+    wire6 = fx.commit([mod_rs], "wire6: wire change, banner untouched")
+    fx.g("checkout", "-q", "main")
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+    merge6 = fx.merge("wire6", "Merge wire6 into main")
+    t.expect_red("pr6", "PR wire change without a banner flip, base unchanged", repo, base, wire6, [
+        (sentence, "did not carry the required section 7 expiry sentence"),
+        (mod_rs, "did not name the watched path"),
+        (f"{base}..{merge6}", "did not measure base tip..merge-commit"),
+    ], tip=merge6)
+
+    # ---- #6138: merge-commit structure cells ------------------------------
+    # main is at `base`; h7 is the PR head, o7 an unrelated branch.
+    fx.reset(base)
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+    fx.g("checkout", "-q", "-b", "h7", base)
+    fx.write("src/unrelated.rs", "// h7 PR work\n", append=True)
+    head7 = fx.commit(["src/unrelated.rs"], "h7: PR work")
+    fx.g("checkout", "-q", "-b", "o7", base)
+    fx.write("src/other7.rs", "fn other7() {}\n")
+    fx.commit(["src/other7.rs"], "o7: an unrelated branch")
+    fx.g("checkout", "-q", "main")
+    good7 = fx.merge("h7", "Merge h7 into main")
+    fx.reset(base)
+    unrel7 = fx.merge("o7", "Merge o7 into main (an unrelated branch, not the PR head)")
+    fx.reset(base)
+    fx.g("merge", "-q", "--no-ff", "-m", "octopus: h7 and o7 into main", "h7", "o7")
+    octo7 = fx.g("rev-parse", "HEAD")
+    fx.reset(base)
+    env7 = _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=head7,
+                     GITHUB_BASE_REF="main", GITHUB_SHA=good7, PATH=os.environ.get("PATH", ""))
+    t.gate("pr7-ok", "control: a two-parent merge of the live tip and the PR head", repo, env7)
+    # R2-F2: the version guard and the is-ancestor error branch are pinned.
+    rc, out, err = run_gate_shimmed(tmp, repo, env7, version="git version 2.29.9")
+    if rc != 1 or "git >= 2.30 is required" not in out + err:
+        t.fail("(gitver): git 2.29.9 did not fail closed with the version guard:", out + err)
+    rc, out, err = run_gate_shimmed(tmp, repo, env7, fail="--is-ancestor")
+    if rc != 1 or "merge-base --is-ancestor exited 128" not in out + err:
+        t.fail("(anc-error): an is-ancestor error did not fail closed:", out + err)
+    rc, out, err = run_gate_shimmed(tmp, repo, env7)
+    if rc != 0:
+        t.fail("(shim-control): the pass-through git shim was REJECTED:", out + err)
+    # Each of the next two cells is rejected by exactly one predicate.
+    t.gate("pr7-second", "a two-parent merge whose second parent is an unrelated branch, not "
+           "PR_HEAD_SHA", repo, dict(env7, GITHUB_SHA=unrel7), "is not PR_HEAD_SHA")
+    t.gate("pr7-octopus", "a three-parent (octopus) merge containing the PR head", repo,
+           dict(env7, GITHUB_SHA=octo7), "does not have exactly two parents")
+    # The base moves by an unrelated commit after the merge ref was built.
+    fx.write("src/main7.rs", "fn main7() {}\n")
+    moved7 = fx.commit(["src/main7.rs"], "base moves on with an unrelated commit")
+    fx.g("update-ref", "refs/remotes/origin/main", moved7)
+    out = t.gate("pr4-moved", "base moved by an unrelated commit (first parent on the base)", repo, env7)
+    if f"unchanged in {base}..{good7}" not in out:
+        t.fail("(pr4-moved): the range did not start at the merge commit's first parent:", out)
+    # Reversed parents: the PR head is the first parent, the base the second.
+    fx.g("checkout", "-q", "h7")
+    rev7 = fx.merge("main", "Merge main into h7 (reversed parents)")
+    fx.g("checkout", "-q", "main")
+    t.gate("pr4-reversed", "reversed parents (PR head first)", repo,
+           dict(env7, GITHUB_SHA=rev7), "reversed parents")
+    # The first parent is not on the live base at all.
+    fx.g("update-ref", "refs/remotes/origin/main", side)
+    off = t.gate("pr4-offbase", "first parent not on the live base", repo, env7,
+                 "is not on the live base")
+    if "re-run the job" in off or "push a new commit or sync the branch" not in off:
+        t.fail("(pr4-offbase): the remedy must say to push or sync, never re-run:", off)
+    if "is not on the live base origin/main (tip " not in off:
+        t.fail("(pr4-offbase): the message must name origin/<GITHUB_BASE_REF>:", off)
+    for what, sha in (("first parent", fx.g("rev-parse", f"{good7}^1")), ("live tip", side)):
+        if off.count(sha) != 1:
+            t.fail(f"(pr4-offbase): the {what} sha must be printed exactly once:", off)
+    fx.g("update-ref", "refs/remotes/origin/main", base)
+
+    # (pr4) pull_request fail-closed cells; each asserts the reason.
+    pr_base_env = _gate_env(GITHUB_EVENT_NAME="pull_request", PR_HEAD_SHA=feature,
+                            GITHUB_BASE_REF="main", GITHUB_SHA=pr_merge,
+                            PATH=os.environ.get("PATH", ""))
+    hex_msg = "is not exactly 40 or 64 hex characters"
+    closed = [
+        ("no GITHUB_BASE_REF", {k: v for k, v in pr_base_env.items() if k != "GITHUB_BASE_REF"},
+         "GITHUB_BASE_REF is unset"),
+        ("no PR_HEAD_SHA", {k: v for k, v in pr_base_env.items() if k != "PR_HEAD_SHA"},
+         "PR_HEAD_SHA is unset"),
+        ("unresolvable PR_HEAD_SHA", dict(pr_base_env, PR_HEAD_SHA="1" * 40),
+         "does not resolve to a commit"),
+        ("unresolvable merge commit", dict(pr_base_env, GITHUB_SHA="2" * 40),
+         "does not resolve to a commit"),
+        ("a GITHUB_SHA that is not a two-parent merge", dict(pr_base_env, GITHUB_SHA=base),
+         "does not have exactly two parents"),
+        ("base ref neither local nor fetchable", dict(pr_base_env, GITHUB_BASE_REF="no-such-branch"),
+         "cannot resolve the live base ref"),
+        ("option-shaped base ref", dict(pr_base_env, GITHUB_BASE_REF="--upload-pack=x"),
+         "is not a plain branch name"),
+        ("option-shaped PR_HEAD_SHA", dict(pr_base_env, PR_HEAD_SHA="--upload-pack=x"), hex_msg),
+        ("too-short PR_HEAD_SHA", dict(pr_base_env, PR_HEAD_SHA=feature[:6]), hex_msg),
+        ("12-char abbreviated PR_HEAD_SHA", dict(pr_base_env, PR_HEAD_SHA=feature[:12]), hex_msg),
+        ("40-hex GITHUB_SHA with a trailing newline",
+         dict(pr_base_env, GITHUB_SHA=pr_merge + "\n"), hex_msg),
+        ("non-hex GITHUB_SHA", dict(pr_base_env, GITHUB_SHA="zz" + pr_merge[2:]), hex_msg),
+        ("non-hex PR_BASE_SHA", dict(pr_base_env, PR_BASE_SHA="--oops"), hex_msg),
+        ("option-shaped push GITHUB_EVENT_BEFORE",
+         {"GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_BEFORE": "--upload-pack=x",
+          "GITHUB_SHA": base, "PATH": os.environ.get("PATH", "")}, hex_msg),
+    ]
+    for why, env, needle in closed:
+        t.gate("pr4", f"pull_request with {why}", repo, env, needle)
+
+    # (k) fail-closed - pull_request with nothing set (missing PR head sha / base ref).
+    t.gate("k", "pull_request with PR_HEAD_SHA and GITHUB_BASE_REF unset", repo,
+           {"GITHUB_EVENT_NAME": "pull_request"}, "PR_HEAD_SHA is unset")
+
+    # ---- #5970 (ported from PR #5871): the event payload is authoritative in CI ----
+    push_env = {"GITHUB_EVENT_NAME": "push", "GITHUB_EVENT_BEFORE": base, "GITHUB_SHA": docs,
+                "PATH": os.environ.get("PATH", "")}
+    refuse = "refused (#5970, fail-closed)"
+    t.gate("ci1", "control: a push range from the payload under GitHub Actions", repo,
+           dict(push_env, GITHUB_ACTIONS="true"))
+    t.gate("ci2", "CERT_EXPIRY_BASE/HEAD overrides under GitHub Actions", repo,
+           dict(push_env, GITHUB_ACTIONS="true", CERT_EXPIRY_BASE=base, CERT_EXPIRY_HEAD=docs),
+           refuse)
+    t.gate("ci3", "an empty CERT_EXPIRY_BASE under GitHub Actions", repo,
+           dict(push_env, GITHUB_ACTIONS="true", CERT_EXPIRY_BASE=""), refuse)
+    t.gate("ci4", "CERT_EXPIRY_HEAD alone under GitHub Actions", repo,
+           dict(push_env, GITHUB_ACTIONS="true", CERT_EXPIRY_HEAD=viol), refuse)
+    t.gate("ci5", "an empty event name under GitHub Actions", repo,
+           {"GITHUB_ACTIONS": "true", "PATH": os.environ.get("PATH", "")},
+           "GITHUB_EVENT_NAME is empty in a CI run")
+    t.gate("ci6", "the CERT_EXPIRY_BASE override outside CI (honoured, RED range)", repo,
+           {"CERT_EXPIRY_BASE": base, "CERT_EXPIRY_HEAD": viol,
+            "PATH": os.environ.get("PATH", "")}, sentence)
+    t.gate("ci7", "the CERT_EXPIRY_BASE override outside CI (honoured, docs range)", repo,
+           {"CERT_EXPIRY_BASE": base, "CERT_EXPIRY_HEAD": docs,
+            "PATH": os.environ.get("PATH", "")})
+
+    # (l) N/A-skip - workflow_dispatch with no override (must not false-fail).
+    rc, _o, skip_msg = run_gate(repo, {"GITHUB_EVENT_NAME": "workflow_dispatch"})
+    if rc != 0:
+        t.fail("(l): workflow_dispatch without CERT_EXPIRY_BASE did not skip")
+    if "outside CI" not in skip_msg or "refused under GitHub Actions" not in skip_msg:
+        t.fail("(l): the skip message must say the overrides work only outside CI:", skip_msg)
+
+    # (m) N/A-skip - push with all-zero before (new branch / first push).
+    rc, _o, _e = run_gate(repo, {"GITHUB_EVENT_NAME": "push", "GITHUB_SHA": base,
+                                  "GITHUB_EVENT_BEFORE": "0" * 40})
+    if rc != 0:
+        t.fail("(m): push with zero before-SHA did not skip")
+
+    # (n) fail-closed - unresolvable range.
+    if check_change(repo, "0" * 40, base)[0]:
+        t.fail("(n): unresolvable base SHA did not fail closed")
+
+    # (o) GREEN - this PR itself (scripts / workflow / allowlist / CHANGELOG
+    #     only; must not trip the gate). Runs against the REAL worktree so a
+    #     future edit that accidentally touches the watched surface turns the
+    #     self-test red before CI does.
+    own_base = ""
+    for ref in ("origin/release/v1.0.0", "@{upstream}"):
+        if is_commit(REPO_ROOT, ref):
+            own_base = git_text(REPO_ROOT, "rev-parse", ref)
+            break
+    if own_base:
+        own_head = git_text(REPO_ROOT, "rev-parse", "HEAD")
+        ok, out = check_change(REPO_ROOT, own_base, own_head)
+        if not ok:
+            t.fail("(o): THIS change trips the cert-expiry gate without touching the cert doc:", out)
+    else:
+        print("self-test NOTE (o): skipped own-PR check (no origin/release/v1.0.0 "
+              "and no @{upstream})", file=sys.stderr)
+
+    if t.failed:
+        print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+        return 2
+    print(SELF_TEST_OK)
+    return 0
+
+
+SELF_TEST_OK = (
+    "check-cert-expiry self-test OK: (a) watched-path violation RED with the §7 expiry "
+    "sentence; (b) same change + cert-doc GREEN; (c) AI_MEMORY_FED_* identifier-add outside "
+    "the path watches RED; (d) identifier-add + cert-doc GREEN; (e) unrelated src/ edit GREEN; "
+    "(f) cert-doc-only GREEN; (g) federation_receive.rs RED; (h) federation_signing_check.rs "
+    "RED; (h2) nested src/federation/identity/** RED; (i) watched-file rename RED (old path "
+    "still named); (j) identifier-rename RED (both names listed); (k) pull_request missing "
+    "PR_HEAD_SHA / GITHUB_BASE_REF fail-closed with its reason; (l) workflow_dispatch skip naming the outside-CI-only overrides; (m) push with zero before-SHA skip; "
+    "(n) unresolvable range fail-closed; (o) this checkout vs origin/release/v1.0.0 GREEN; "
+    "(p) non-ASCII watched path RED (core.quotePath bypass closed); (q) wire change + "
+    "incidental cert-doc edit RED (#3556 B); (r) wire change + VOID record GREEN; (s) unrelated "
+    "change over a LIVE banner with wire drift since the bind RED (#3556 C, names the bound SHA "
+    "and the drift); (t) unrelated change over a VOID banner GREEN; (u) stale LIVE healed by "
+    "recording EXPIRED GREEN; (v1) LIVE bound to a non-ancestor with an identical watched tree "
+    "GREEN (squash-merge shape, tree diff); (v2) LIVE bound to a non-ancestor whose watched "
+    "tree differs RED (the ancestry hatch would have silenced it); (w) unparseable STATUS line "
+    "fail-closed; (x1) decoy STATUS line above the banner RED (exactly-one rule); (x2) decoy "
+    "Binds-to line RED; (y) cert doc deleted alongside a wire change RED (ABSENT fails closed); "
+    "(z) pure banner reformat on a docs-only change GREEN (tolerant parse); (z2) reformat + "
+    "wire change RED as incidental, not unparseable; (pr1) #6137 stale-LIVE head banner with "
+    "the base EXPIRED GREEN at the merge commit (and RED if judged at the head alone); (pr2) "
+    "head that flips the banner detected over base-tip..merge-commit, and a wire change "
+    "without the flip RED; (pr3) stale payload PR_BASE_SHA ignored, the live base ref used; "
+    "(pr4) pull_request fail-closed, each with its reason, on missing/unresolvable base ref, "
+    "head or merge commit and on non-hex, abbreviated or newline-suffixed shas; (pr4-moved) base moved by an unrelated commit "
+    "GREEN; (pr4-offbase) first parent not on the base RED naming origin/<base ref>, each sha once, "
+    "with the push-or-sync remedy; (gitver) git below 2.30 fail-closed; (anc-error) an is-ancestor "
+    "error fail-closed; "
+    "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
+    "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
+    "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
+    "octopus merge RED; (ci1-ci7, #5970) the event payload range is authoritative under "
+    "GitHub Actions and CERT_EXPIRY_BASE/HEAD overrides are refused there but honoured "
+    "outside CI; (shim-isolation, #6145) the git PATH shim runs under python3 -I: isolated flag set and "
+    "a module planted beside it not importable, checked before any shimmed gate run; "
+    "(shim-interpreter, #6145) a whitespace, NUL, over-long (>255 byte) or non-UTF-8 interpreter line is "
+    "refused and a 255-byte line is accepted; (shim-interpreter-robust, #6145) a missing or near-PATH_MAX "
+    "scratch dir, sized from the platform PATH_MAX, yields a named violation, not a traceback; "
+    "(shim-deep-scratch, #6145) the deep scratch builder lands on the exact length, removes itself on failure and "
+    "a build failure is a named violation; (shim-unexecutable, #6145) an unexecutable shim "
+    "is reported as a violation; (path-max-fallback, #6145) PATH_MAX falls back to 1024 on macOS/BSD and "
+    "4096 elsewhere when os.pathconf fails; (guarded, #6145) a crashing cell becomes a named failure and "
+    "KeyboardInterrupt propagates; (shim-scratch-limit, #6145) a too-deep scratch path is reported with its "
+    "length and the limit; (shim-deep-relative, #6145) the deep-scratch targets stay valid on a deep checkout; "
+    "(shim-deep-cap, #6145) they stay inside [deep_scratch base, PATH_MAX-1] and a scratch 24 bytes under "
+    "PATH_MAX gets the 'needs room' message; (path-max-restore, #6145) os.pathconf and sys.platform are "
+    "restored and the fallback check runs once, first; (path-max-diagnostic, #6145) a dropped restore "
+    "names the real host platform and is put back, and a failing (not leaking) fallback check is "
+    "reported as path-max-fallback, running only that cell in the same scratch dir; "
+    "(shim-isolation-crash, #6145) a crash in the isolation cell is a named failure; "
+    "(checkout-depth-coverage, #6145) checkout-depth runs the shim-unexecutable cell; "
+    "(checkout-depth, #6145) every #6145 shim and scratch cell (including shim-unexecutable) passes in a "
+    "226-byte scratch dir, the one a 184-byte checkout gets; the gate-run fixtures build one gitshim.* level under the scratch "
+    "dir and fit within it."
+)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Enterprise-federation certification section 7 expiry gate.")
+    parser.add_argument("--self-test", action="store_true",
+                        help="plant-a-violation corpus in a scratch repository")
+    args = parser.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    if args.self_test:
+        return self_test()
+    rc, out, err = run_gate(REPO_ROOT, dict(os.environ))
+    if out:
+        print(out)
+    if err:
+        print(err, file=sys.stderr)
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

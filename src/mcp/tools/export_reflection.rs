@@ -113,7 +113,7 @@ pub(super) fn read_reflection_member(
     db::get(conn, member_id)
         .context("reading reflection substrate")?
         .filter(|memory| crate::visibility::is_readable_on_query(memory, caller, None))
-        .ok_or_else(|| crate::errors::refusal(format!("reflection not found: {reflection_id}")))
+        .ok_or_else(|| anyhow::Error::new(crate::errors::ReflectionNotFound::new(reflection_id)))
 }
 
 /// Local copy of the format parser — kept here so the MCP error

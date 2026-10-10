@@ -405,13 +405,39 @@ pub async fn skill_promote_route(
     match crate::mcp::handle_skill_promote_for_caller(&lock.0, &params, kp, &caller, read_caller) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
         Err(e) => {
-            let e = e.to_string();
-            if e.contains("not found") {
-                (StatusCode::NOT_FOUND, Json(json!({"error": e}))).into_response()
-            } else {
-                (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()
-            }
+            // #3707 / #6115 - the chain may carry a store or driver `Display`
+            // (SQL fragments, paths); the caller gets the class text below.
+            // #6131 F5 - `mcp_foreign_err` below owns the ONE operator log
+            // line for this failure (detail at error for a foreign root, warn
+            // for a typed refusal), so this arm does not log it again.
+            let status = promote_error_status(&e);
+            // #6125 - the same classifier the MCP path of this operation
+            // uses: our own typed refusal / not-found text reaches the
+            // caller, a foreign (db / fs / codec) root becomes its class
+            // constant. `mcp_foreign_err` also owns the operator log line.
+            (status, Json(json!({"error": promote_error_message(e)}))).into_response()
         }
+    }
+}
+
+/// #3707 / #6115 / #6125 - caller-facing message for a failed skill-promote,
+/// byte-identical to the text the MCP tool returns for the same chain
+/// (`crate::mcp::error_text::mcp_foreign_err`): first-party refusals keep
+/// their typed text, store / driver / io text is replaced by its class
+/// constant and never crosses to the wire.
+fn promote_error_message(e: anyhow::Error) -> String {
+    crate::mcp::error_text::mcp_foreign_err("skill_promote_route", e)
+}
+
+/// #4622 - HTTP status for a failed skill-promote: 404 only when the chain
+/// carries the typed `ReflectionNotFound` root, never by matching error text.
+fn promote_error_status(e: &anyhow::Error) -> StatusCode {
+    if e.downcast_ref::<crate::errors::ReflectionNotFound>()
+        .is_some()
+    {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::BAD_REQUEST
     }
 }
 
@@ -580,5 +606,225 @@ pub async fn skill_delete_route(
                 (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod promote_status_4622_tests {
+    use super::{promote_error_message, promote_error_status};
+    use crate::errors::{MemoryError, ReflectionNotFound};
+    use crate::models::{Memory, MemoryKind, Tier};
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    const CALLER: &str = "ai:alice4622";
+
+    fn seed(conn: &rusqlite::Connection, title: &str, kind: MemoryKind) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        let memory = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: title.to_string(),
+            content: "body".to_string(),
+            namespace: "ns4622".to_string(),
+            tier: Tier::Long,
+            metadata: json!({"agent_id": CALLER, "scope": "collective"}),
+            memory_kind: kind,
+            reflection_depth: i32::from(kind == MemoryKind::Reflection),
+            created_at: now.clone(),
+            updated_at: now,
+            ..Memory::default()
+        };
+        crate::db::insert(conn, &memory).expect("seed memory");
+        memory.id
+    }
+
+    fn promote(
+        conn: &rusqlite::Connection,
+        id: &str,
+        name: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        crate::mcp::handle_skill_promote_for_caller(
+            conn,
+            &json!({"reflection_id": id, "skill_name": name, "skill_description": "d"}),
+            None,
+            CALLER,
+            Some(CALLER),
+        )
+    }
+
+    fn db() -> (rusqlite::Connection, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let conn = crate::db::open(&dir.path().join("m.db")).expect("open db");
+        (conn, dir)
+    }
+
+    /// Pin 1: the MCP wire code and text for a missing reflection.
+    #[test]
+    fn issue_4622_mcp_code_and_text_are_unchanged() {
+        let (conn, _dir) = db();
+        let err = promote(&conn, "absent-id", "good-name").expect_err("missing reflection");
+        assert_eq!(err.to_string(), "reflection not found: absent-id");
+        assert_eq!(format!("{err:#}"), "reflection not found: absent-id");
+        // The pre-fix construction, kept here as the byte-for-byte reference.
+        let legacy = || crate::errors::refusal("reflection not found: absent-id");
+        let legacy_code = MemoryError::from(legacy()).code();
+        let legacy_wire = crate::mcp::error_text::mcp_foreign_err("legacy", legacy());
+        let wire = crate::mcp::error_text::mcp_foreign_err("now", err);
+        assert_eq!(wire, legacy_wire, "MCP wire text is byte-identical");
+        let again = promote(&conn, "absent-id", "good-name").expect_err("again");
+        let mapped = MemoryError::from(again);
+        assert_eq!(mapped.code(), "REFUSED");
+        assert_eq!(mapped.code(), legacy_code);
+        assert_eq!(mapped.message(), "reflection not found: absent-id");
+    }
+
+    /// Pin 2: a different error whose text contains the words is not a 404.
+    #[test]
+    fn issue_4622_other_error_containing_not_found_is_not_404() {
+        let (conn, _dir) = db();
+        let id = seed(&conn, "r", MemoryKind::Reflection);
+        let err = promote(&conn, &id, "not found").expect_err("bad skill name");
+        assert!(err.to_string().contains("not found"), "{err}");
+        assert_eq!(promote_error_status(&err), StatusCode::BAD_REQUEST);
+    }
+
+    /// #6115: a foreign (store or driver) root never reaches the caller body.
+    #[test]
+    fn issue_6115_foreign_error_text_is_withheld_from_the_body() {
+        let err = anyhow::anyhow!("no such table: skills (SQLITE_ERROR) at /var/db/x.sqlite");
+        assert_eq!(
+            promote_error_message(err),
+            crate::mcp::error_text::DB_ERROR_TEXT
+        );
+        let rnf = anyhow::Error::new(ReflectionNotFound::new("abc"));
+        assert_eq!(promote_error_message(rnf), "reflection not found: abc");
+    }
+
+    /// #6126: table-driven body pins beyond the plain-string case - our own
+    /// typed refusals survive verbatim, wrapped db / io errors carrying a
+    /// path or DSN are replaced by their class constant.
+    #[test]
+    fn issue_6126_typed_refusal_survives_and_wrapped_foreign_error_is_withheld() {
+        use crate::mcp::error_text::DB_ERROR_TEXT;
+        let cases: Vec<(&str, anyhow::Error, String)> = vec![
+            (
+                "typed invalid-input refusal",
+                crate::errors::invalid_input("skill 'description' must be <= 1024 characters"),
+                "skill 'description' must be <= 1024 characters".to_owned(),
+            ),
+            (
+                "typed own-text refusal",
+                crate::errors::refusal("reflection depth 0 is below the promote minimum 1"),
+                "reflection depth 0 is below the promote minimum 1".to_owned(),
+            ),
+            (
+                "wrapped database error with DSN and path",
+                anyhow::Error::new(rusqlite::Error::InvalidPath("/var/db/x.sqlite".into()))
+                    .context("connect svc:hunter2@db.internal:5432 failed"),
+                DB_ERROR_TEXT.to_owned(),
+            ),
+            (
+                "wrapped io error with path",
+                anyhow::Error::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "/srv/tenant/skills: EACCES",
+                ))
+                .context("write skill bundle"),
+                // The `anyhow` classifier has no io arm: a wrapped io root is the
+                // storage constant, identical to the MCP wire text.
+                DB_ERROR_TEXT.to_owned(),
+            ),
+        ];
+        for (label, err, expected) in cases {
+            let body = promote_error_message(err);
+            assert_eq!(body, expected, "{label}");
+            for leak in ["hunter2", "postgres://", "/var/db", "/srv/tenant", "EACCES"] {
+                assert!(!body.contains(leak), "{label}: {leak} leaked into {body}");
+            }
+        }
+    }
+
+    /// #6125 / #6131 F3: for every refusal shape the HTTP body text equals the
+    /// text the REAL MCP handler (`handle_skill_promote_from_reflection`) puts
+    /// on the wire for the same input, and the first-party refusals are present
+    /// in it. The last case is a foreign root (the namespace governance table is
+    /// gone): both transports must answer the storage constant and nothing from
+    /// the chain, so a `format!("{e:#}")` body goes red here.
+    #[test]
+    fn issue_6125_http_body_text_matches_mcp_wire_text() {
+        let _agent_id_env_lock = crate::identity::agent_id_env_test_lock();
+        let (conn, _dir) = db();
+        let id = seed(&conn, "r", MemoryKind::Reflection);
+        let (broken, _broken_dir) = db();
+        let broken_id = seed(&broken, "r", MemoryKind::Reflection);
+        broken
+            .execute_batch("DROP TABLE namespace_meta;")
+            .expect("break the namespace governance table");
+        let long = "x".repeat(1025);
+        let db_text = crate::mcp::error_text::DB_ERROR_TEXT;
+        for (c, rid, name, desc, needle) in [
+            (&conn, id.as_str(), "BadName", "d", "spec \u{a7}3.1"),
+            (&conn, id.as_str(), "good-name", long.as_str(), "1024"),
+            (
+                &conn,
+                "absent-id",
+                "good-name",
+                "d",
+                "reflection not found: absent-id",
+            ),
+            (&broken, broken_id.as_str(), "good-name", "d", db_text),
+        ] {
+            let params = json!({
+                "reflection_id": rid, "skill_name": name, "skill_description": desc,
+                "agent_id": CALLER
+            });
+            let wire = crate::mcp::handle_skill_promote_from_reflection(c, &params, None)
+                .expect_err("MCP refused");
+            let http_err =
+                crate::mcp::handle_skill_promote_for_caller(c, &params, None, CALLER, Some(CALLER))
+                    .expect_err("HTTP refused");
+            let body = promote_error_message(http_err);
+            assert_eq!(body, wire, "HTTP and MCP text diverge for {name}");
+            assert!(body.contains(needle), "{needle} missing from {body}");
+        }
+    }
+
+    /// Pin 3: the 404 follows the type, not the Display text.
+    #[test]
+    fn issue_4622_reworded_display_keeps_404() {
+        let err =
+            anyhow::Error::new(ReflectionNotFound::new("x")).context("a wholly different wording");
+        assert!(!err.to_string().contains("not found"), "{err}");
+        assert_eq!(promote_error_status(&err), StatusCode::NOT_FOUND);
+    }
+
+    /// Pin 5: a missing or hidden source member still answers 404.
+    #[test]
+    fn issue_4622_missing_source_member_is_404() {
+        let (conn, _dir) = db();
+        let id = seed(&conn, "r", MemoryKind::Reflection);
+        conn.pragma_update(None, "foreign_keys", false)
+            .expect("foreign keys off");
+        conn.execute(
+            "INSERT INTO memory_links (source_id, target_id, relation, created_at) \
+             VALUES (?1, ?2, 'reflects_on', ?3)",
+            rusqlite::params![
+                id,
+                uuid::Uuid::new_v4().to_string(),
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )
+        .expect("dangling source edge");
+        let err = promote(&conn, &id, "good-name").expect_err("missing source");
+        assert_eq!(err.to_string(), format!("reflection not found: {id}"));
+        assert_eq!(promote_error_status(&err), StatusCode::NOT_FOUND);
+    }
+
+    /// Pin 6: the typed root maps to `Refused`, never `NotFound`.
+    #[test]
+    fn issue_4622_mapping_to_refused_is_pinned() {
+        let mapped = MemoryError::from(anyhow::Error::new(ReflectionNotFound::new("z")));
+        assert!(matches!(&mapped, MemoryError::Refused(m) if m == "reflection not found: z"));
+        assert_eq!(mapped.code(), "REFUSED");
     }
 }

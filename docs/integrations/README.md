@@ -35,7 +35,7 @@ agents and humans always know exactly what's loaded and what's configured.
 ```text
 # ai-memory boot: ok
 #   version:    1.0.0
-#   db:         /home/u/.claude/ai-memory.db (schema=v90, 161 memories)
+#   db:         /home/u/.claude/ai-memory.db (schema=v100, 161 memories)
 #   tier:       autonomous (embedder=nomic-ai/nomic-embed-text-v1.5, reranker=ms-marco-MiniLM-L-6-v2, llm=gemma3:4b)
 #   latency:    12ms
 #   namespace:  ai-memory-mcp/v1.0.0-release (loaded 3 memories)

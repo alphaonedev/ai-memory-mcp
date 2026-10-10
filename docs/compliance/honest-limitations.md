@@ -6,7 +6,7 @@ layout: doc
 **Document classification:** Public-facing, procurement-grade.
 **Date:** first published 2026-05-23; version stamp, mitigation claims, and code
 anchors re-verified against `release/v1.0.0` HEAD on 2026-08-01.
-**ai-memory version:** v1.0.0 (sqlite + postgres schema **v91**, lockstep).
+**ai-memory version:** v1.0.0 (sqlite + postgres schema **v100**, lockstep).
 **Companion document:** [`docs/compliance/nsa-csi-mcp-security-mapping.md`](nsa-csi-mcp-security-mapping.html) — the NSA CSI concern + recommendation mapping that Task E ships.
 **Source-of-truth inventory:** [`docs/compliance/_inventory/v1.0.0-capabilities.json`](_inventory/v1.0.0-capabilities.json) (46 capabilities, codegraph-verified at commit `580d8427bb4da887f7a25731792c55c4e49d56d6` on `release/v1.0.0`). The v0.7.0 file ([`v0.7.0-capabilities.json`](_inventory/v0.7.0-capabilities.json), 27 primitives at `4add7a85`) is retained as a historical artefact.
 
@@ -90,7 +90,7 @@ Adversarial content embedded in a recall result text can manipulate the consumer
 Operator-signed governance rules express only what the operator writes. A permissive policy permits permissively. A policy that grants `for_admin` to a wider agent set than intended grants too broadly. Mitigation: the substrate ships seed governance rules (R001–R004) disabled by default — the operator must explicitly enable and sign them to opt in. The `ai-memory governance migrate-to-permissions --apply` verb assists in policy authoring with a dry-run preview. Federal procurement reviewers reviewing an ai-memory deployment should also review the operator's policy corpus; the substrate cannot validate the operator's intent.
 
 ### 3.5 Application-layer authentication beyond agent_id
-The substrate accepts `agent_id` as a claimed-identity marker (see CLAUDE.md §"Agent Identity (NHI)"). It is not an attested identity unless the operator pairs it with Ed25519 signing (per-agent keypair, V-4 chain row attribution). Consumers building on top of the substrate must implement their own caller-authentication layer (mTLS, bearer token, SPIFFE workload identity, federated identity provider) and bind it to the substrate's `agent_id` via the HTTP `X-Agent-Id` header or MCP `clientInfo.name` capture. The substrate does not ship its own multi-tenant authentication system.
+The substrate accepts `agent_id` as a claimed-identity marker (see docs/reference/ARCHITECTURE_REFERENCE.md §"Agent Identity (NHI)"). It is not an attested identity unless the operator pairs it with Ed25519 signing (per-agent keypair, V-4 chain row attribution). Consumers building on top of the substrate must implement their own caller-authentication layer (mTLS, bearer token, SPIFFE workload identity, federated identity provider) and bind it to the substrate's `agent_id` via the HTTP `X-Agent-Id` header or MCP `clientInfo.name` capture. The substrate does not ship its own multi-tenant authentication system.
 
 ---
 

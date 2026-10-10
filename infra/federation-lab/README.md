@@ -24,7 +24,7 @@ writes only inside this directory and removes what it wrote when it exits.
 - [Running it](#running-it)
 - [What each step does](#what-each-step-does)
 - [Expected output](#expected-output)
-- [The asi-hard 16/17 caveat, stated honestly](#the-asi-hard-1617-caveat-stated-honestly)
+- [The asi-hard posture, stated honestly](#the-asi-hard-posture-stated-honestly)
 - [The corpus](#the-corpus)
 - [What this does and does not prove](#what-this-does-and-does-not-prove)
 - [Troubleshooting](#troubleshooting)
@@ -43,7 +43,7 @@ A two-node federation on loopback:
         ├─ presents peerA.crt as client   ───────►  allowlist  SHA-256(peerA.crt)
         ├─ fed identity ai:lab-node-a             ├─ fed identity ai:lab-node-b
         │   (peer's public half enrolled)         │   (peer's public half enrolled)
-        ├─ 16/17 asi-hard knobs at hard floor     ├─ 16/17 asi-hard knobs at hard floor
+        ├─ asi-hard knobs at floor, all but 1     ├─ asi-hard knobs at floor, all but 1
         ├─ attestation REQUIRED                   ├─ attestation REQUIRED
         └─ 300 synthetic corpus rows              └─ (receives the replicated write)
                          └──────── quorum W=2, mutual TLS ────────┘
@@ -100,7 +100,9 @@ they never load or download an embedding model.
 ./run.sh --port-a 20481 --port-b 20482
 ./run.sh --corpus-db /path/to/your.db     # seed YOUR local corpus instead of the fixture
 ./run.sh --recall-query 'kiln rotation'   # choose the corpus-recall proof query
-./run.sh --no-caveat-probe        # skip the asi-hard 17/17 cold-boot demonstration
+./run.sh --no-caveat-probe        # skip the asi-hard full-profile cold-boot demonstration
+./run.sh --probe-mutation          # lower the rollback-check knob in the probe; the boot must refuse for that knob (PASS row)
+./run.sh --posture-selftest       # drift-guard legs only (names AND values), no daemons
 ./run.sh --help
 ```
 
@@ -121,8 +123,8 @@ stops every daemon it started and (absent `--keep`) removes `run/`.
 Checks the five tools, resolves the binary and the signer, refuses to start if
 either lab port is already bound, and then runs the **posture drift guard**:
 `lib/posture.sh::lab_posture_ssot_check` re-parses `src/security_profile.rs::KNOBS`
-and asserts the lab's knob list is exactly the SSOT's, minus the one documented
-omission. If the code grows an eighteenth pinned knob, this step goes red
+and asserts the lab's knob list is exactly the SSOT's, names and hard values (no
+omissions). If the code grows another pinned knob or raises a floor, this step goes red
 rather than quietly demonstrating a posture that no longer exists. (Running
 from a release tarball with no `src/` tree, the check reports "skip" — it
 cannot verify, and says so, rather than passing.)
@@ -190,11 +192,10 @@ deserves to be told rather than left to infer.
 ### 5 · asi-hard posture
 
 Prints the exact knob set (also written to `run/evidence/posture.env`), then —
-unless `--no-caveat-probe` — **demonstrates** the 17th-knob caveat instead of
-merely asserting it: it cold-boots a throwaway node under the full
-`AI_MEMORY_SECURITY_PROFILE=asi-hard` profile on a fresh database and records
-the actual exit code and stderr into
-`run/evidence/caveat-asi-hard-coldboot.txt`. See the next section.
+unless `--no-caveat-probe` — **proves** the full profile cold-boots: it boots a
+throwaway node under `AI_MEMORY_SECURITY_PROFILE=asi-hard` on a fresh database,
+requires it to listen (a refusal is a FAIL) and records the actual exit code and
+stderr into `run/evidence/caveat-asi-hard-coldboot.txt`. See the next section.
 
 ### 6 · launch the two-node mTLS federation
 
@@ -239,13 +240,13 @@ The closing summary of a real green run on this machine
 
 ```
 ══ SUMMARY 
-   PASS asi-hard posture list matches src/security_profile.rs::KNOBS — ok: lab posture covers all 17 SSOT knobs (16/17 at hard floor, 1 omitted per #2942)
+   PASS asi-hard posture list matches src/security_profile.rs::KNOBS — ok: lab posture covers all 31 SSOT knobs (31 of 31 at hard floor, names and values compared)
    PASS gen-certs.sh minted the CA + peer/client leaves into run/crypto
    PASS cross-peer federation identities enrolled (ai:lab-node-a ↔ ai:lab-node-b)
    PASS node-a: author pubkey bound AND read back from the _agents registry row (#2941 guard, attempt 1)
    PASS node-b: author pubkey bound AND read back from the _agents registry row (#2941 guard, attempt 1)
    PASS node-a seeded with 300 rows in namespace 'lab-corpus', all unexpired (from the committed SYNTHETIC fixture lab-corpus.json; file declares 300)
-   PASS caveat demonstrated: full 17-knob asi-hard cold boot on a fresh DB exited 75 naming the rollback check (issue #2942) — evidence in run/evidence/caveat-asi-hard-coldboot.txt
+   PASS full asi-hard cold boot on a fresh DB succeeded (listening, exit 124 after the probe timeout) — evidence in run/evidence/caveat-asi-hard-coldboot.txt
    PASS both nodes answer /api/v1/health over mutual TLS with a PINNED client cert
    PASS node-a loaded its private config (tier=keyword) — no embedder, no network
    PASS N1 unpinned client cert refused at node-b's TLS layer (same CA, absent from the allowlist)
@@ -268,44 +269,51 @@ actually emitted. What matters is `0 FAIL` and exit code `0`.
 
 ---
 
-## The asi-hard 16/17 caveat, stated honestly
+## The asi-hard posture, stated honestly
 
 The certified enterprise-federation posture is **`asi-hard`**
 (`AI_MEMORY_SECURITY_PROFILE=asi-hard`, rendered for operators as
 `docs/deploy/asi-hard.env`, SSOT `src/security_profile.rs::KNOBS`). It pins
-**seventeen** security knobs to a hard floor and refuses to boot if any of them
-is set *below* that floor — the "no-disable" contract.
+every knob in that table (the run prints the count it read) to a hard floor and
+refuses to boot if any of them is set *below* that floor — the "no-disable"
+contract.
 
-**This lab runs sixteen of the seventeen, and does not set the profile knob.**
+**This lab runs every pinned knob at its hard floor (all of them, no count to go stale), and does not set the profile knob.**
+It sets each knob directly (and unsets the permissive hatches) so the run can name every
+one, and a drift check re-derives the list from the Rust SSOT on every run.
 
-The seventeenth, `AI_MEMORY_REQUIRE_ROLLBACK_CHECK`, **cannot cold-boot a fresh
-node.** In require-mode the open-time rollback-evidence check treats an absent
+One knob used to be left out. `AI_MEMORY_REQUIRE_ROLLBACK_CHECK` could not cold-boot a
+fresh node: in require-mode the open-time rollback-evidence check treated an absent
 off-table head anchor as refuse-to-open, and that anchor is emitted only by the
 witness watermark cadence over the `signed_events` chain — which is empty on a
-brand-new database. Fresh DB → no anchor → **exit 75**. This is tracked as
-[**issue #2942**](https://github.com/alphaonedev/ai-memory-mcp/issues/2942)
-(open as of 2026-08-15), filed from the v1.0.0 federation-config assessment.
+brand-new database. Fresh DB → no anchor → exit 75
+([**issue #2942**](https://github.com/alphaonedev/ai-memory-mcp/issues/2942), filed 2026-08-15,
+**closed**: fixed by PR #3096). On a current build the fresh cold boot succeeds under the
+full profile, so the omission is removed (issue #4938) and the lab sets the knob like the others.
 
-Because the profile knob's contract is *pin and refuse*, there is no such thing
-as "asi-hard with rollback-check off": setting the profile **and** lowering one
-pin is precisely the case the profile refuses. So the lab sets the sixteen
-satisfiable knobs to their hard-floor values directly and leaves
-`REQUIRE_ROLLBACK_CHECK` at its safe default (emit-evidence-and-continue). That
-is the same 16/17 shape a persistent hive node runs today.
+The step-5 cold-boot probe keeps that fix honest. It boots one throwaway node on a fresh
+database under the **full** `AI_MEMORY_SECURITY_PROFILE=asi-hard` profile and requires it to
+come up listening; a boot that refuses is a FAIL. `./run.sh --probe-mutation` re-runs the
+probe with `AI_MEMORY_REQUIRE_ROLLBACK_CHECK=0` (below the floor, which the profile refuses)
+and requires the boot to refuse with an error naming that knob, which proves the probe can fail;
+a refusal for any other reason, or a node that listens, is a FAIL.
 
-Two of the seventeen are *permissive* hatches whose hard floor is "unset"
-(`AI_MEMORY_ALLOW_SCHEMA_AHEAD`, #2445; `AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS`,
-#2477). The lab actively **unsets** them rather than inheriting whatever the
+Some of the pinned knobs are *permissive* hatches whose hard floor is "unset"
+(for example `AI_MEMORY_ALLOW_SCHEMA_AHEAD`, #2445, and
+`AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS`, #2477; the list is `LAB_POSTURE_UNSET` in
+`lib/posture.sh`). The lab actively **unsets** them rather than inheriting whatever the
 operator's shell exported — an inherited hatch is exactly the silent weakening
 the posture exists to prevent.
 
 The kit does not ask you to take any of this on faith:
 
-- **Step 0** re-derives the pinned set from the Rust SSOT and fails on drift.
-- **Step 5** cold-boots a throwaway node under the *full* 17-knob profile and
-  records the real exit code, so the caveat is demonstrated rather than
-  asserted. If that boot ever succeeds — i.e. #2942 is fixed on your build —
-  the kit says so loudly and tells you this README is now stale.
+- **Step 0** re-derives the pinned set (names AND hard values) from the Rust SSOT and fails on drift;
+  `./run.sh --posture-selftest` runs the guard's legs (no daemons) and requires a weakened value, a dropped knob and
+  a pinned knob moved to the unset list to go red (issue #5078).
+- **Step 5** cold-boots a throwaway node under the *full* asi-hard profile (every `src/security_profile.rs::KNOBS` entry) and
+  records the real exit code. The node must listen (it is then stopped by the probe timeout, exit 124);
+  a refusing boot is a FAIL and a timeout kill is never counted as a refusal (issue #4938).
+  `--probe-mutation` proves the probe goes red when the knob breaks the boot.
 - **Step 7 N4** proves the no-disable contract is real by trying to loosen a
   pin under the profile and asserting the refusal.
 
@@ -404,9 +412,8 @@ goes red if any of it stops being true:
 - That attested write replicates to the peer and arrives `agent_attested`, and
   the peer returns it from `recall`.
 - The `asi-hard` no-disable contract refuses a boot with a loosened pin.
-- Sixteen of the seventeen pinned knobs boot cleanly together on a fresh node.
-- The seventeenth does not (issue #2942) — demonstrated, with its exit code
-  captured.
+- Every pinned knob (including `AI_MEMORY_REQUIRE_ROLLBACK_CHECK`, issue #2942 since fixed) boots cleanly together on a fresh node.
+- The full-profile cold boot is probed on every run; a refusal fails the run and a timeout kill of a healthy node is not counted as a refusal (issue #4938).
 
 **Plausible** — consistent with what the kit shows, but *not* measured here:
 

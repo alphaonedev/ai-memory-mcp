@@ -401,11 +401,13 @@ pub fn resolve(
     // first-resolution-wins — every retry then answered `Conflict` FOREVER,
     // permanently stranding the anchor unsigned so every peer running
     // `AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG` rejects it. Wrapping both writes in
-    // one `unchecked_transaction` makes the whole resolve fail closed: a signing
+    // one `WriteTxn` (BEGIN IMMEDIATE) makes the whole resolve fail closed: a signing
     // failure rolls the state-flip back (the `?` drops `tx`), so a resolved
     // checkpoint can NEVER persist with an empty/absent attestation.
-    let tx = conn.unchecked_transaction()?;
-    let n = tx.execute(
+    // BEGIN IMMEDIATE (#5084): write-first, but one rule for every write path
+    // (a DEFERRED upgrade can fail with SQLITE_BUSY_SNAPSHOT, the #2250 class).
+    let tx = crate::storage::connection::WriteTxn::begin(conn)?;
+    let n = conn.execute(
         RESOLVE_CAS_SQL,
         params![
             state.as_str(),
@@ -421,14 +423,14 @@ pub fn resolve(
         // The CAS did not fire: either no row exists, or the checkpoint is
         // already resolved (first-resolution-wins — keep the prior verdict).
         // This arm writes nothing; commit is a clean no-op close of the txn.
-        let outcome = match get(&tx, id)? {
+        let outcome = match get(conn, id)? {
             None => ResolveOutcome::NotFound,
             Some(existing) => ResolveOutcome::Conflict(Box::new(existing)),
         };
         tx.commit()?;
         return Ok(outcome);
     }
-    let Some(mut row) = get(&tx, id)? else {
+    let Some(mut row) = get(conn, id)? else {
         // Cannot happen after a firing CAS, but fail closed: dropping `tx` here
         // rolls the state-flip back rather than reporting a resolve we cannot
         // read back.
@@ -455,7 +457,7 @@ pub fn resolve(
                     "checkpoint resolution sign failed: {e:#}"
                 ))))
             })?;
-            tx.execute(
+            conn.execute(
                 "UPDATE checkpoints SET signature = ?1, resolver_pubkey = ?2 WHERE id = ?3",
                 params![row.signature, row.resolver_pubkey, id],
             )?;

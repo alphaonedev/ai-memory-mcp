@@ -1803,17 +1803,20 @@ pub async fn run(
             // `OllamaClient::generate` are issued cleanly.
             let db_path_owned = db_path.clone();
             let app_config_owned = app_config.clone();
-            tokio::task::spawn_blocking(move || {
+            // #4347 — SIGTERM / SIGINT / SIGHUP stop the loop gracefully and
+            // run the exit drain; handlers are installed before it starts.
+            // Fail closed: with no stop listener the server would serve, then
+            // lose queued forensic rows to a default-disposition kill.
+            let stop_signals = mcp::shutdown::StopSignals::install().await?;
+            let loop_handle = tokio::task::spawn_blocking(move || {
                 mcp::run_mcp_server(
                     &db_path_owned,
                     feature_tier,
                     &app_config_owned,
                     &resolved_profile,
                 )
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("mcp join: {e}"))??;
-            Ok(())
+            });
+            mcp::shutdown::supervise(loop_handle, stop_signals).await
         }
         Command::Store(a) => {
             let stdout = std::io::stdout();
@@ -4324,7 +4327,7 @@ fn spawn_postgres_fold_loop_if_enabled(
 /// the local sqlite `Db` mutex and call rusqlite free-functions, so on a
 /// `--store-url postgres://…` daemon they ticked against the placeholder sqlite
 /// DB while the pg corpus's expired rows / stale archives / expired leases
-/// accumulated unbounded (the CLAUDE.md "GC runs every 30 minutes; expired
+/// accumulated unbounded (the `docs/reference/ARCHITECTURE_REFERENCE.md` "GC runs every 30 minutes; expired
 /// memories are archived before deletion" contract was silently false on pg).
 /// Only `spawn_postgres_fold_loop_if_enabled` had a pg twin.
 ///
@@ -4623,7 +4626,7 @@ fn spawn_gc_loop_with_shadow_retention_tracked(
             }
             // #1690 — recall_observations retention sweep. The pruner
             // (observations::gc::prune, honouring AI_MEMORY_OBSERVATIONS_TTL_DAYS
-            // — CLAUDE.md env #42) previously had NO production caller, so the
+            // — ARCHITECTURE_REFERENCE.md env #42) previously had NO production caller, so the
             // recall-observation ledger grew unbounded with recall traffic.
             match crate::observations::gc::prune(&lock.0) {
                 Ok(n) if n > 0 => {
@@ -5429,15 +5432,14 @@ pub(crate) fn route_or_block_escalated_write(
         Ok(pending_id) => {
             tracing::info!(
                 "L1-6 governance pre-write escalated namespace={:?} rule_id={} reason={} — \
-                 queued signed-approval pending_id={} (blocked until m-of-n quorum met)",
+                 routed signed-approval pending_id={} (now, or when the write txn ends: #4116)",
                 mem.namespace,
                 rule_id,
                 reason,
                 pending_id
             );
-            Err(format!(
-                "action escalated for signed approval (pending_id={pending_id}): {reason}"
-            ))
+            // #4116 — deferred vs queued text (never a phantom id).
+            Err(crate::storage::escalation_deferral::escalation_refusal_text(&pending_id, reason))
         }
         Err(e) => {
             // Fail CLOSED if the pending could not be queued — never let an
@@ -5480,7 +5482,7 @@ pub(crate) fn install_governance_pre_write_hook(
             };
             // Resolve the agent_id from the memory's metadata
             // (every substrate-written memory carries it under
-            // `metadata.agent_id` — see CLAUDE.md §"Agent
+            // `metadata.agent_id` — see docs/reference/ARCHITECTURE_REFERENCE.md §"Agent
             // Identity"). Fall back to a stable hook-source tag
             // when the metadata key is missing so the audit row
             // still attributes the refusal.
@@ -7852,7 +7854,7 @@ pub async fn bootstrap_serve(
     // lease-sweep). The sqlite gc/lease/pending loops above all bind the local
     // sqlite `Db` mutex, so a `--store-url postgres://…` daemon never reaped
     // expired rows / stale archives / expired leases on its pg corpus (the
-    // CLAUDE.md GC contract was silently false on postgres). This drives the
+    // ARCHITECTURE_REFERENCE.md GC contract was silently false on postgres). This drives the
     // existing SAL trait methods on the pg backend at the same GC cadence.
     #[cfg(feature = "sal")]
     {
@@ -14584,6 +14586,17 @@ mod escalate_producer_2991_tests {
         base64::engine::general_purpose::STANDARD.encode(sk.verifying_key().to_bytes())
     }
 
+    mod escalate_under_write_lock_4116_tests;
+    fn set_approver_env(key: Option<&str>) {
+        let env = crate::approvals::signed::APPROVER_PUBKEYS_ENV;
+        // SAFETY: only called in an env-isolated single-test child (#2991/#4116 cells).
+        unsafe { std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY") };
+        key.map_or_else(
+            || unsafe { std::env::remove_var(env) },
+            |k| unsafe { std::env::set_var(env, k) },
+        );
+    }
+
     #[test]
     fn keyless_escalation_blocks_without_queuing_a_pending() {
         // Env-isolated: asserts the KEYLESS state, so no concurrent test's
@@ -14593,10 +14606,7 @@ mod escalate_producer_2991_tests {
         ) {
             return;
         }
-        unsafe {
-            std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY");
-            std::env::remove_var(crate::approvals::signed::APPROVER_PUBKEYS_ENV);
-        }
+        set_approver_env(None);
         // Also neutralise any on-disk operator key so the fleet is TRULY keyless
         // (a dev host may have staged an operator.key.pub).
         let _no_pk = crate::governance::rules_store::force_no_operator_pubkey_for_test();
@@ -14618,13 +14628,7 @@ mod escalate_producer_2991_tests {
         ) {
             return;
         }
-        unsafe {
-            std::env::remove_var("AI_MEMORY_OPERATOR_PUBKEY");
-            std::env::set_var(
-                crate::approvals::signed::APPROVER_PUBKEYS_ENV,
-                approver_pubkey_b64(9),
-            );
-        }
+        set_approver_env(Some(&approver_pubkey_b64(9)));
         let conn = crate::db::open(std::path::Path::new(":memory:")).expect("open");
         let m = mem("gov-ns", "body-keyed");
         let r =
@@ -14646,9 +14650,7 @@ mod escalate_producer_2991_tests {
             serde_json::from_value(pend[0].payload.clone()).expect("payload is a Memory");
         assert_eq!(back.content, "body-keyed");
         assert_eq!(back.namespace, "gov-ns");
-        unsafe {
-            std::env::remove_var(crate::approvals::signed::APPROVER_PUBKEYS_ENV);
-        }
+        set_approver_env(None);
     }
 
     #[test]

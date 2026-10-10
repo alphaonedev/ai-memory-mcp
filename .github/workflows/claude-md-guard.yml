@@ -1,0 +1,50 @@
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+#
+# CLAUDE.md rule-section guard (issue #4507, PR #4508 review R3-F4).
+#
+# scripts/check-claude-md-size.py keeps the tracked CLAUDE.md small and intact
+# (binding rule sections, the binding-rules index, the two reference files).
+# Before this workflow the guard ran only inside the `docs-vs-ssot-drift` job of
+# c8-precheck.yml, whose pull_request trigger is `branches: [main, develop,
+# "release/**"]` (a BASE-branch filter), so a PR into `rehearsal/**` got no
+# guard run and a rule weakening was first seen after it had landed.
+#
+# This workflow is the guard's own, dedicated run on every base branch work
+# lands on. The guard also checks THIS file (workflow_errors in the script), so
+# narrowing its triggers, widening its permissions or unpinning an action
+# fails the guard itself.
+name: CLAUDE.md guard
+
+on:
+  # `push` does not name rehearsal/** (#5447 R-PUSH, #5659): the carrier is
+  # covered by the pull_request trigger below, which does.
+  push:
+    branches: [main, develop, "release/**"]
+  pull_request:
+    branches: [main, develop, "release/**", "rehearsal/**", "chain/**"]
+  # Merge Queue (#3089): report on the merge_group ref so the queue never wedges
+  # on this context. See ci.yml for the full rationale.
+  merge_group:
+    types: [checks_requested]
+
+# Least privilege (#3591): this job only reads the checkout.
+permissions:
+  contents: read
+
+# Fork-PR-safe concurrency key; see c8-precheck.yml for the rationale.
+concurrency:
+  group: claude-md-guard-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: CLAUDE.md rule-section guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Guard the tracked CLAUDE.md and its reference files
+        run: python3 scripts/check-claude-md-size.py
+      - name: Guard self-test
+        run: python3 scripts/check-claude-md-size.py --self-test
