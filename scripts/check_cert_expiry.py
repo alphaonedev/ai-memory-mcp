@@ -1463,6 +1463,90 @@ def shim_isolation_crash_violation():
     return None
 
 
+SHA_SITE_STMTS = (
+    'head = env_sha(env, "PR_HEAD_SHA")',
+    'tip = env_sha(env, "GITHUB_SHA") if env.get("GITHUB_SHA") else "HEAD"',
+    'stale = env_sha(env, "PR_BASE_SHA") if env.get("PR_BASE_SHA") else ""',
+    'before = env_sha(env, "GITHUB_EVENT_BEFORE")',
+    'after = env_sha(env, "GITHUB_SHA") if env.get("GITHUB_SHA") else "HEAD"',
+)
+SHA_SITE_BINDINGS = {"head": 1, "tip": 1, "stale": 1, "before": 2, "after": 1}
+
+
+def binds_name(node, name):
+    """True when the ast node binds, rebinds, deletes or imports `name` (#6940)."""
+    if isinstance(node, ast.Name):
+        return node.id == name and not isinstance(node.ctx, ast.Load)
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return node.name == name
+    if isinstance(node, ast.arg):
+        return node.arg == name
+    if isinstance(node, ast.alias):
+        return (node.asname or node.name).split(".")[0] == name
+    if isinstance(node, ast.ExceptHandler):
+        return node.name == name
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        return name in node.names
+    return False
+
+
+def sha_ast_violations(src):
+    """Structural pin of every path by which a CI-supplied sha reaches the validator
+    (#6697, #6940): the five `env_sha(env, KEY)` read statements of resolve_range
+    whole (so a conditional bypass of the call is a change), no binding of `env`
+    beyond the parameter of resolve_range and run_gate, no mutation of `env` through
+    a method other than .get or a subscript store, the exact resolve_range call in
+    run_gate, the unchanged body of env_sha and the exact ENV_SHA_RE pattern.
+    Returns the list of violations (empty when the pin holds)."""
+    tree = ast.parse(src)
+    out = []
+    dump = lambda text: ast.dump(ast.parse(text, mode="eval").body)  # noqa: E731
+    top = {n.name: n for n in tree.body if isinstance(n, ast.FunctionDef)}
+    sites = sorted(c.args[1].value for c in ast.walk(tree)
+                   if isinstance(c, ast.Call) and getattr(c.func, "id", "") == "env_sha"
+                   and len(c.args) == 2 and not c.keywords and isinstance(c.args[0], ast.Name)
+                   and c.args[0].id == "env" and isinstance(c.args[1], ast.Constant))
+    n_calls = sum(isinstance(c, ast.Call) and getattr(c.func, "id", "") == "env_sha"
+                  for c in ast.walk(tree))
+    want_sites = ["GITHUB_EVENT_BEFORE", "GITHUB_SHA", "GITHUB_SHA", "PR_BASE_SHA", "PR_HEAD_SHA"]
+    if sites != want_sites or n_calls != len(want_sites):
+        out.append(f"env_sha call sites {sites!r} ({n_calls} calls) are not the five "
+                   f"`env_sha(env, KEY)` sites {want_sites!r}")
+    rr, rg = top.get("resolve_range"), top.get("run_gate")
+    if rr is None or rg is None:
+        return out + ["resolve_range or run_gate is missing"]
+    stmts = [ast.dump(n) for n in ast.walk(rr) if isinstance(n, ast.Assign)]
+    for text in SHA_SITE_STMTS:
+        if stmts.count(ast.dump(ast.parse(text).body[0])) != 1:
+            out.append(f"resolve_range does not hold exactly one unchanged `{text}`")
+    for name, count in SHA_SITE_BINDINGS.items():
+        n = sum(binds_name(x, name) for x in ast.walk(rr))
+        if n != count:
+            out.append(f"resolve_range binds `{name}` {n} times, want {count}")
+    for fn in (rr, rg):
+        if [n for n in ast.walk(fn) if binds_name(n, "env")] != [fn.args.args[-1]] or fn.args.args[-1].arg != "env":
+            out.append(f"{fn.name} binds `env` other than as its parameter")
+        for n in ast.walk(fn):
+            if (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == "env"
+                    and n.attr != "get") or (isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name)
+                                             and n.value.id == "env" and not isinstance(n.ctx, ast.Load)):
+                out.append(f"{fn.name} mutates `env` (line {n.lineno})")
+    call = ast.dump(ast.parse("base, head, tip = resolve_range(repo, env)").body[0])
+    if [ast.dump(n) for n in ast.walk(rg) if isinstance(n, ast.Assign)].count(call) != 1:
+        out.append("run_gate does not call `resolve_range(repo, env)` with the unchanged env")
+    fn = top.get("env_sha")
+    st = fn.body[1:] if fn else []
+    if (len(st) != 3 or not isinstance(st[0], ast.Assign) or ast.dump(st[0].value) != dump('env.get(key, "")')
+            or not isinstance(st[1], ast.If) or ast.dump(st[1].test) != dump("not ENV_SHA_RE.fullmatch(val)")
+            or ast.dump(st[2]) != ast.dump(ast.parse("return val").body[0])):
+        out.append("env_sha does not fullmatch the value read from env.get(key, \"\") unchanged")
+    pat = next((n.value for n in tree.body if isinstance(n, ast.Assign)
+                and [getattr(x, "id", "") for x in n.targets] == ["ENV_SHA_RE"]), None)
+    if pat is None or ast.dump(pat) != dump('re.compile(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?")'):
+        out.append("ENV_SHA_RE is not the exact 40-or-64 ASCII-hex pattern compiled without flags")
+    return out
+
+
 def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     repo = tmp / "repo"
     repo.mkdir()
@@ -2123,32 +2207,40 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         if stale_claim in block_text:
             t.fail(f"(pr4-sha-comment): the comment block still claims {stale_claim!r}")
 
-    # (pr4-sha-ast, #6697): structural pin of the five env sha read sites, so a loosening of ANY
-    # character form (ZWSP, ZWJ, LRM, DEL, ...) fails here without a per-form cell. Each production
-    # `env_sha(env, KEY)` call must pass the bare name `env`, `env_sha` must fullmatch the value it
-    # read unchanged, and ENV_SHA_RE must be the exact 40-or-64 ASCII-hex pattern, no flags.
-    tree = ast.parse(own_src)
-    dump = lambda src: ast.dump(ast.parse(src, mode="eval").body)  # noqa: E731
-    sites = sorted(c.args[1].value for c in ast.walk(tree)
-                   if isinstance(c, ast.Call) and getattr(c.func, "id", "") == "env_sha"
-                   and len(c.args) == 2 and not c.keywords and isinstance(c.args[0], ast.Name)
-                   and c.args[0].id == "env" and isinstance(c.args[1], ast.Constant))
-    n_calls = sum(isinstance(c, ast.Call) and getattr(c.func, "id", "") == "env_sha"
-                  for c in ast.walk(tree))
-    want_sites = ["GITHUB_EVENT_BEFORE", "GITHUB_SHA", "GITHUB_SHA", "PR_BASE_SHA", "PR_HEAD_SHA"]
-    if sites != want_sites or n_calls != len(want_sites):
-        t.fail(f"(pr4-sha-ast): env_sha call sites {sites!r} ({n_calls} calls) are not the five "
-               f"`env_sha(env, KEY)` sites {want_sites!r}")
-    fn = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "env_sha"), None)
-    st = fn.body[1:] if fn else []
-    if (len(st) != 3 or not isinstance(st[0], ast.Assign) or ast.dump(st[0].value) != dump('env.get(key, "")')
-            or not isinstance(st[1], ast.If) or ast.dump(st[1].test) != dump("not ENV_SHA_RE.fullmatch(val)")
-            or ast.dump(st[2]) != ast.dump(ast.parse("return val").body[0])):
-        t.fail("(pr4-sha-ast): env_sha does not fullmatch the value read from env.get(key, \"\") unchanged")
-    pat = next((n.value for n in tree.body if isinstance(n, ast.Assign)
-                and [getattr(x, "id", "") for x in n.targets] == ["ENV_SHA_RE"]), None)
-    if pat is None or ast.dump(pat) != dump('re.compile(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?")'):
-        t.fail("(pr4-sha-ast): ENV_SHA_RE is not the exact 40-or-64 ASCII-hex pattern compiled without flags")
+    # (pr4-sha-ast, #6697, #6940): structural pin of the five env sha read statements of
+    # resolve_range, taken whole, plus the paths that feed them: `env` is bound only as the parameter
+    # of resolve_range and run_gate and is never mutated, run_gate passes it on unchanged, env_sha
+    # fullmatches the value it read, and ENV_SHA_RE is the exact 40-or-64 ASCII-hex pattern, no
+    # flags. A loosening made AT those statements or by REBINDING their input (a stripped copy of
+    # env) fails here without a per-character-form cell; a loosening anywhere else (a different
+    # function, a changed environment build in main) is outside this pin and needs its own cell.
+    for why in sha_ast_violations(own_src):
+        t.fail(f"(pr4-sha-ast): {why}")
+    # (pr4-sha-ast-mutants, #6940): the pin must reject each of these edits to a copy of this
+    # very file. Each anchor must occur exactly once, so a moved anchor fails the cell loudly.
+    zw = "\\u200b"
+    for label, edits in (
+        ("a conditional at the PR_HEAD_SHA read site that keeps the env_sha call",
+         [('        head = env_sha(env, "PR_HEAD_SHA")\n',
+           '        head = (env_sha(env, "PR_HEAD_SHA") if "' + zw + '" not in env.get("PR_HEAD_SHA", "")\n'
+           '                else ENV_SHA_RE.fullmatch(env["PR_HEAD_SHA"].replace("' + zw + '", "")).group(0))\n')]),
+        ("env rebound to a stripped copy at the top of resolve_range",
+         [('    event = env.get("GITHUB_EVENT_NAME", "")\n',
+           '    env = {k: v.replace("' + zw + '", "") for k, v in env.items()}\n'
+           '    event = env.get("GITHUB_EVENT_NAME", "")\n')]),
+        ("run_gate passing a stripped env copy to resolve_range",
+         [('        base, head, tip = resolve_range(repo, env)\n',
+           '        base, head, tip = resolve_range(repo, {k: v.replace("' + zw + '", "") for k, v in env.items()})\n')]),
+    ):
+        msrc = own_src
+        for old, new in edits:
+            if own_src.count(old) != 1:
+                t.fail(f"(pr4-sha-ast-mutants): the anchor for {label} occurs {own_src.count(old)} times, want 1")
+                break
+            msrc = msrc.replace(old, new, 1)
+        else:
+            if not sha_ast_violations(msrc):
+                t.fail(f"(pr4-sha-ast-mutants): the structural pin did not reject {label}")
 
     # (k) fail-closed - pull_request with nothing set (missing PR head sha / base ref).
     t.gate("k", "pull_request with PR_HEAD_SHA and GITHUB_BASE_REF unset", repo,
@@ -2301,7 +2393,9 @@ SELF_TEST_OK = (
     "(pr4-sha-len) 63/65-hex, 40 non-ASCII-digit (Arabic-Indic, fullwidth, superscript), 40 non-hex ASCII, newline- or CR-suffixed and space-prefixed 40-hex values, BOM-, bidi-override-, combining-mark- and Cyrillic-look-alike 40/64-hex values (#6463), and every str.isspace() character as a prefix and as a suffix of a 40-hex value, refused on every validated sha site (PR_HEAD_SHA, GITHUB_SHA and PR_BASE_SHA on pull_request; "
     "GITHUB_EVENT_BEFORE and GITHUB_SHA on push) with only the `git --version` probe traced before the validator; "
     "(pr4-sha-comment, #6649) the comment block above the sha values names each loosening and claims no false only-cell; "
-    "(pr4-sha-ast, #6697) an ast pin of the five env_sha(env, KEY) read sites, env_sha and ENV_SHA_RE."
+    "(pr4-sha-ast, #6697, #6940) an ast pin of the five whole env_sha(env, KEY) read statements of resolve_range, "
+    "the bindings and mutations of env in resolve_range and run_gate, env_sha and ENV_SHA_RE; (pr4-sha-ast-mutants, #6940) "
+    "the pin rejects a conditional bypass at a read site, an env rebound in resolve_range and a stripped env passed from run_gate."
 )
 
 
