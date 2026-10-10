@@ -69,6 +69,9 @@ unset.
   That includes the Rust helper's in-process publish: if the shared env lock
   stays busy past its bound, the mint fails (the test panics with the reason)
   instead of running with the URL still naming the shared database (#6571).
+  The wait defaults to 30 s; tests may shorten it with
+  `AI_MEMORY_TEST_PG_ENV_LOCK_WAIT_MS` (a non-number keeps the default), which
+  the caller-side cell for #6889 uses.
 * **Own clone, own cleanup.** A clone the Rust helper mints for its own process
   (no wrapper) is released and dropped by an exit hook, best effort, never a
   panic (#6570). A clone the wrapper minted is dropped by the wrapper.
