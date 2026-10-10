@@ -33,7 +33,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/ci/ensure-age-extension.py"
-SECRET = "s3cr3t-pw-6161"
+PW_MARKER = "marker-6161-pw"
 PREFIX = "ensure-age-extension: "
 SHARE_FILES = ("age--1.6.0--1.7.0.sql", "age--1.7.0--1.8.0.sql", "age--1.8.0.sql", "age.control")
 DYLIB = b"\x7fAGE-dylib-6161" * 64
@@ -45,12 +45,12 @@ print({{"--sharedir": base + "/share", "--pkglibdir": base + "/lib"}}[sys.argv[1
 """
 
 # Fake psql with real-view semantics: only the control file decides the row.
-# It records its argv and whether PGPASSWORD carried the secret.
+# It records its argv and whether PGPASSWORD carried the marker value.
 FAKE_PSQL = """#!{py}
 import json, os, sys
 base = {base!r}
 with open(base + "/psql.log", "a") as fh:
-    fh.write(json.dumps({{"argv": sys.argv, "pgpassword": os.environ.get("PGPASSWORD") == {secret!r}}}) + "\\n")
+    fh.write(json.dumps({{"argv": sys.argv, "env_marker_ok": os.environ.get("PGPASSWORD") == {marker!r}}}) + "\\n")
 print(1 if os.path.isfile(base + "/share/extension/age.control") else 0)
 """
 
@@ -110,9 +110,9 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.pg_config = self.base / "pg_config"
         self.psql = self.base / "psql"
         write_exe(self.pg_config, FAKE_PG_CONFIG.format(py=sys.executable, base=str(self.base)))
-        write_exe(self.psql, FAKE_PSQL.format(py=sys.executable, base=str(self.base), secret=SECRET))
+        write_exe(self.psql, FAKE_PSQL.format(py=sys.executable, base=str(self.base), marker=PW_MARKER))
         self.url_file = self.base / "url"
-        self.url_file.write_text(f"postgres://ciuser:{SECRET}@127.0.0.1:5445/cidb?sslmode=disable\n")
+        self.url_file.write_text(f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb?sslmode=disable\n")
         self.harness = self.base / "harness.py"
         self.harness.write_text(HARNESS)
         self.uid = None
@@ -155,7 +155,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertTrue(r.stderr.startswith(PREFIX + message), r.stderr)
         self.assertEqual(len(r.stderr.strip().splitlines()), 1, r.stderr)
         self.assertNotIn("Traceback", r.stderr)
-        self.assertNotIn(SECRET, r.stdout + r.stderr)
+        self.assertNotIn(PW_MARKER, r.stdout + r.stderr)
 
     def assert_nothing_installed(self):
         self.assertEqual(sorted(p.name for p in self.ext.iterdir()), [])
@@ -168,7 +168,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertIn("restored", r.stdout)
         self.assert_restored()
         self.assert_no_temp_files()
-        self.assertNotIn(SECRET, r.stdout + r.stderr)
+        self.assertNotIn(PW_MARKER, r.stdout + r.stderr)
 
     def test_present_extension_is_a_noop(self):
         self.install_good()
@@ -236,21 +236,21 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertTrue(calls)
         for call in calls:
             argv = " ".join(call["argv"])
-            self.assertNotIn(SECRET, argv)
+            self.assertNotIn(PW_MARKER, argv)
             self.assertIn("postgres://ciuser@127.0.0.1:5445/cidb?sslmode=disable", call["argv"])
-            self.assertTrue(call["pgpassword"], "PGPASSWORD must carry the password")
+            self.assertTrue(call["env_marker_ok"], "PGPASSWORD must carry the password")
 
     def test_password_in_query_moves_to_env(self):
-        self.url_file.write_text(f"postgres://ciuser@127.0.0.1:5445/cidb?password={SECRET}&sslmode=disable\n")
+        self.url_file.write_text(f"postgres://ciuser@127.0.0.1:5445/cidb?password={PW_MARKER}&sslmode=disable\n")
         r = self.run_script()
         self.assertEqual(r.returncode, 0, r.stderr)
         for line in (self.base / "psql.log").read_text().splitlines():
             call = json.loads(line)
-            self.assertNotIn(SECRET, " ".join(call["argv"]))
-            self.assertTrue(call["pgpassword"])
+            self.assertNotIn(PW_MARKER, " ".join(call["argv"]))
+            self.assertTrue(call["env_marker_ok"])
 
     def test_keyword_dsn_is_rejected(self):
-        self.url_file.write_text(f"host=127.0.0.1 user=ciuser password={SECRET}\n")
+        self.url_file.write_text(f"host=127.0.0.1 user=ciuser password={PW_MARKER}\n")
         self.assert_fails(self.run_script(), 2, "tier URL file does not hold a postgres:// URL")
         self.assertFalse((self.base / "psql.log").exists())
 
@@ -258,7 +258,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         # libpq has no env var for sslpassword, so it cannot be moved off argv: refuse it.
         self.install_good()  # a healthy tier would reach psql if the URL were accepted
         self.url_file.write_text(
-            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslpassword={SECRET}\n")
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslpassword={PW_MARKER}\n")
         self.assert_fails(self.run_script(), 2,
                           "tier URL file carries sslpassword; use a key without a passphrase")
         self.assertFalse((self.base / "psql.log").exists(), "psql must never be called")
@@ -282,7 +282,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assert_nothing_installed()
 
     def test_non_utf8_url_file_fails_closed(self):
-        self.url_file.write_bytes(b"\xff\xfepostgres://u:" + SECRET.encode() + b"@h/db")
+        self.url_file.write_bytes(b"\xff\xfepostgres://u:" + PW_MARKER.encode() + b"@h/db")
         self.assert_fails(self.run_script(), 2, "tier URL file ")
         self.assert_nothing_installed()
 
