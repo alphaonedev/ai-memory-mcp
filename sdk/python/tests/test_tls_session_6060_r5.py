@@ -31,7 +31,7 @@ import httpcore
 import httpx
 import pytest
 
-from ai_memory import AiMemoryClient, AsyncAiMemoryClient
+from ai_memory import AiMemoryClient, AsyncAiMemoryClient, _common
 from ai_memory._common import build_httpx_kwargs
 
 from ._tlslab import Lab, RecordingServer, TunnelProxy
@@ -252,8 +252,32 @@ def _get_request() -> httpcore.Request:
     return httpcore.Request(b"GET", _ORIGIN + "/x", headers=[(b"X-API-Key", _API_KEY.encode())])
 
 
+def _gated_trace(context: ssl.SSLContext, request: httpx.Request, *, is_async: bool) -> Any:
+    """The trace the SDK's gated transport hands its inner transport (#6537)."""
+    captured: list[Any] = []
+
+    def capture(sent: httpx.Request) -> httpx.Response:
+        captured.append(sent.extensions["trace"])
+        return httpx.Response(200)
+
+    if is_async:
+
+        async def acapture(sent: httpx.Request) -> httpx.Response:
+            return capture(sent)
+
+        transport: Any = _common._AsyncGatedTransport(  # noqa: SLF001
+            httpx.MockTransport(acapture), context
+        )
+        asyncio.run(transport.handle_async_request(request))
+    else:
+        _common._GatedTransport(httpx.MockTransport(capture), context).handle_request(  # noqa: SLF001
+            request
+        )
+    return captured[0]
+
+
 class _Driver:
-    """Installs the SDK's request hook on a fresh request and drives its trace."""
+    """Runs a fresh request through the SDK's gated transport and drives its trace."""
 
     def __init__(self, context: ssl.SSLContext, *, is_async: bool) -> None:
         kwargs = build_httpx_kwargs(
@@ -267,16 +291,12 @@ class _Driver:
             is_async=is_async,
         )
         self.is_async = is_async
+        self.context = context
         self.hooks = kwargs["event_hooks"]
 
     def new_request(self) -> Callable[[str, dict[str, Any]], None]:
         request = httpx.Request("GET", _ORIGIN + "/x")
-        hook = self.hooks["request"][0]
-        if self.is_async:
-            asyncio.run(hook(request))
-        else:
-            hook(request)
-        trace = request.extensions["trace"]
+        trace = _gated_trace(self.context, request, is_async=self.is_async)
 
         def fire(event: str, info: dict[str, Any]) -> None:
             if self.is_async:
@@ -1099,7 +1119,7 @@ def test_verified_session_stream_is_left_open_6361(is_async: bool) -> None:
 def _chained(
     context: ssl.SSLContext, *, is_async: bool, inherited_async: bool
 ) -> tuple[Callable[[str, dict[str, Any]], None], list[str]]:
-    """Run the SDK request hook on a request that already carries a trace."""
+    """Run the SDK gated transport on a request that already carries a trace."""
     seen: list[str] = []
 
     def inherited(event: str, _info: dict[str, Any]) -> None:
@@ -1111,12 +1131,7 @@ def _chained(
     request = httpx.Request(
         "GET", _ORIGIN + "/x", extensions={"trace": ainherited if inherited_async else inherited}
     )
-    hook = _Driver(context, is_async=is_async).hooks["request"][0]
-    if is_async:
-        asyncio.run(hook(request))
-    else:
-        hook(request)
-    trace = request.extensions["trace"]
+    trace = _gated_trace(context, request, is_async=is_async)
 
     def fire(event: str, info: dict[str, Any]) -> None:
         if is_async:
@@ -1365,6 +1380,27 @@ def test_trace_set_by_a_later_hook_still_receives_events_6537(
     assert "connection.start_tls.complete" in seen
     assert "http11.send_request_headers.started" in seen
     assert origin.hits == ["/x"]
+
+
+@pytest.mark.parametrize("client_cls", [httpx.Client, httpx.AsyncClient], ids=["sync", "async"])
+def test_unwrappable_transport_refuses_construction_6537(client_cls: type) -> None:
+    context = ssl.create_default_context()
+    kwargs = build_httpx_kwargs(
+        base_url=_ORIGIN,
+        api_key=_API_KEY,
+        agent_id=None,
+        timeout=1.0,
+        verify=context,
+        cert=None,
+        extra_headers=None,
+        is_async=client_cls is httpx.AsyncClient,
+    )
+    client = client_cls(**kwargs)
+    inner = client._transport  # noqa: SLF001
+    client._mounts[httpx.URL("https://other.invalid")] = object()  # type: ignore[index]  # noqa: SLF001
+    with pytest.raises(ValueError, match="#6537"):
+        _common.gate_transports(client, kwargs, context)
+    assert client._transport is inner  # noqa: SLF001 - never left half-wrapped
 
 
 def test_lab_temp_root_is_project_local_6309(lab: Lab) -> None:

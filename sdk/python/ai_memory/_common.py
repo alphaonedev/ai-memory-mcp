@@ -23,6 +23,7 @@ import ssl
 import stat
 import sys
 import time
+from types import TracebackType
 from typing import TYPE_CHECKING, Any, Union
 from urllib.parse import quote
 
@@ -633,17 +634,168 @@ async def _aclose_quietly(stream: object) -> None:
         pass  # the refusal below is raised either way
 
 
+def _session_trace(context: ssl.SSLContext, request: httpx.Request) -> Any:
+    """The per-request httpcore trace that runs :class:`_SessionGate` (sync)."""
+    gate = _SessionGate(context, request)
+
+    def _trace(event: str, info: dict[str, Any]) -> None:
+        streams = gate.refused(event, info)
+        if streams is None:
+            return
+        for stream in streams:
+            _close_quietly(stream)
+        raise ValueError(_SESSION_MESSAGE)
+
+    return _trace
+
+
+def _async_session_trace(context: ssl.SSLContext, request: httpx.Request) -> Any:
+    """The per-request httpcore trace that runs :class:`_SessionGate` (async)."""
+    gate = _SessionGate(context, request)
+
+    async def _atrace(event: str, info: dict[str, Any]) -> None:
+        streams = gate.refused(event, info)
+        if streams is None:
+            return
+        for stream in streams:
+            await _aclose_quietly(stream)
+        raise ValueError(_SESSION_MESSAGE)
+
+    return _atrace
+
+
+class _GatedTransport(httpx.BaseTransport):
+    """Installs the session trace AFTER every request event hook ran (#6537).
+
+    httpx calls a transport's ``handle_request`` once all request hooks have
+    run, so a caller hook can no longer replace or remove the trace: a trace
+    it set is chained after the SDK's. The request's own ``extensions`` dict
+    is restored afterwards, so a resent or redirected request never stacks
+    one hop's check on the next.
+    """
+
+    def __init__(self, inner: httpx.BaseTransport, context: ssl.SSLContext) -> None:
+        self._inner = inner
+        self._context = context
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        original = request.extensions
+        request.extensions = dict(original)
+        _with_trace(request, _session_trace(self._context, request))
+        try:
+            return self._inner.handle_request(request)
+        finally:
+            request.extensions = original
+
+    def close(self) -> None:
+        self._inner.close()
+
+    def __enter__(self) -> _GatedTransport:
+        self._inner.__enter__()
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        self._inner.__exit__(exc_type, exc_value, traceback)
+
+
+class _AsyncGatedTransport(httpx.AsyncBaseTransport):
+    """The async :class:`_GatedTransport` (#6537)."""
+
+    def __init__(self, inner: httpx.AsyncBaseTransport, context: ssl.SSLContext) -> None:
+        self._inner = inner
+        self._context = context
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        original = request.extensions
+        request.extensions = dict(original)
+        _with_trace(request, _async_session_trace(self._context, request))
+        try:
+            return await self._inner.handle_async_request(request)
+        finally:
+            request.extensions = original
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
+
+    async def __aenter__(self) -> _AsyncGatedTransport:
+        await self._inner.__aenter__()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        await self._inner.__aexit__(exc_type, exc_value, traceback)
+
+
+_GATE_UNSUPPORTED = (
+    "verify=<ssl.SSLContext> needs the TLS session check on every transport, "
+    "and this httpx client does not expose them; pass verify= a CA file or "
+    "directory path instead (#6537)."
+)
+
+
+def gate_transports(
+    client: httpx.Client | httpx.AsyncClient,
+    kwargs: dict[str, Any],
+    verify: object,
+) -> None:
+    """Put the post-handshake session check on every transport of ``client`` (#6537).
+
+    Applies when ``kwargs`` (from :func:`build_httpx_kwargs`) forwards the
+    caller's own context. The default transport and every mounted proxy
+    transport are wrapped, so the check runs inside the transport, after all
+    request event hooks. Fails closed: if the client does not expose its
+    transports the client is closed and construction is refused.
+    """
+    context = kwargs.get("verify")
+    if not (isinstance(context, ssl.SSLContext) and context is verify):
+        return
+    is_async = isinstance(client, httpx.AsyncClient)
+    base: type = httpx.AsyncBaseTransport if is_async else httpx.BaseTransport
+    gated: Any = _AsyncGatedTransport if is_async else _GatedTransport
+    transport = getattr(client, "_transport", None)
+    mounts = getattr(client, "_mounts", None)
+    wrapped: dict[Any, Any] = {}
+    supported = isinstance(transport, base) and isinstance(mounts, dict)
+    if supported and isinstance(mounts, dict):
+        for pattern, mounted in mounts.items():
+            if isinstance(mounted, base):
+                wrapped[pattern] = gated(mounted, context)
+            elif mounted is not None:
+                supported = False
+                break
+    if not supported or not isinstance(mounts, dict):
+        # A just-built client has opened no connection; its sync transports
+        # are closed anyway so nothing outlives the refusal.
+        if not is_async:
+            owned = [transport, *(mounts.values() if isinstance(mounts, dict) else ())]
+            for candidate in owned:
+                if isinstance(candidate, httpx.BaseTransport):
+                    candidate.close()
+        raise ValueError(_GATE_UNSUPPORTED)
+    client._transport = gated(transport, context)  # noqa: SLF001
+    mounts.update(wrapped)
+
+
 def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> dict[str, list[Any]]:
     """httpx event hooks that enforce a caller-held context (#6249, #6305, #6306, #6349).
 
     * ``request``: re-check the context before every request (early, clear
-      error) and install a per-request httpcore ``trace`` (:class:`_SessionGate`)
-      that inspects every TLS session of the request, direct, tunnelled or
-      over SOCKS, right after its handshake and before the request's first
-      byte is written on that connection; an unverified session is closed and
-      refused. This holds while this trace is the one httpcore calls: a
-      later caller hook that replaces ``request.extensions["trace"]``
-      bypasses it (#6537).
+      error). The post-handshake session check (:class:`_SessionGate`) is not
+      installed here: a caller hook appended later could replace the trace
+      (#6537). :func:`gate_transports` installs it inside every transport,
+      after all request hooks; it inspects every TLS session of the request,
+      direct, tunnelled or over SOCKS, right after its handshake and before
+      the request's first byte is written on that connection, and an
+      unverified session is closed and refused.
     * ``response``: a backstop that inspects the connection the response came
       over, which also covers a pooled connection and a trace event that never
       fired. It runs after the request was written, so it refuses the result
@@ -660,19 +812,8 @@ def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> dict[str, list
 
     if is_async:
 
-        async def _arequest(request: httpx.Request) -> None:
+        async def _arequest(_request: httpx.Request) -> None:
             _recheck()
-            gate = _SessionGate(context, request)
-
-            async def _atrace(event: str, info: dict[str, Any]) -> None:
-                streams = gate.refused(event, info)
-                if streams is None:
-                    return
-                for stream in streams:
-                    await _aclose_quietly(stream)
-                raise ValueError(_SESSION_MESSAGE)
-
-            _with_trace(request, _atrace)
 
         async def _aresponse(response: httpx.Response) -> None:
             _assert_negotiated_session(
@@ -683,19 +824,8 @@ def _request_hooks(context: ssl.SSLContext, *, is_async: bool) -> dict[str, list
 
         return {"request": [_arequest], "response": [_aresponse]}
 
-    def _request(request: httpx.Request) -> None:
+    def _request(_request: httpx.Request) -> None:
         _recheck()
-        gate = _SessionGate(context, request)
-
-        def _trace(event: str, info: dict[str, Any]) -> None:
-            streams = gate.refused(event, info)
-            if streams is None:
-                return
-            for stream in streams:
-                _close_quietly(stream)
-            raise ValueError(_SESSION_MESSAGE)
-
-        _with_trace(request, _trace)
 
     def _response(response: httpx.Response) -> None:
         _assert_negotiated_session(

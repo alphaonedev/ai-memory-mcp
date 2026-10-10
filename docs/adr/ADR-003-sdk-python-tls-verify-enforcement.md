@@ -28,8 +28,11 @@ SDK enforces that the negotiated session:
 Failure closes the stream and raises `ValueError` (fail closed). A response-time
 backstop repeats the check on the connection the response came over. It covers a
 pooled connection and a trace event that never fired, but it runs after the
-request was written. The pre-send check holds only while the SDK's trace is the
-one httpcore calls (#6537).
+request was written. The pre-send check is installed inside every transport of
+the client (the default one and each mounted proxy transport), so it runs after
+all request event hooks: a caller hook cannot replace or remove it, and a trace
+a hook sets is chained after the SDK's (#6537). A client whose transports cannot
+be wrapped is refused at construction.
 
 ## Vote record
 
@@ -127,5 +130,5 @@ Residuals (accepted, each with its reason):
   own `Proxy-Authorization` when the proxy URL carries credentials. The origin session inside the tunnel is held to
   the caller's context.
 - The response backstop cannot stop a request that was already written; it exists for the paths where the pre-send
-  trace did not run. #6537 tracks moving the trace out of reach of later caller event hooks.
+  trace did not run. The trace lives in the transport, after every request event hook (#6537).
 - `verify=None` with `SSL_CERT_DIR` set still lets httpx read that directory lazily and unchecked; #6538 tracks it.
