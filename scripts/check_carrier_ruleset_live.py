@@ -1757,6 +1757,77 @@ def self_test():
         check(label, lambda t=text, n=needle: None if any(n in p and "line " in p for p in workflow_pin_problems(t))
               else f"workflow_pin_problems does not name {n!r} with a line")
 
+    # round9 #6679: a job written as a flow mapping (or as a scalar or empty value) is refused with its
+    # line; SUBSET.child never reads "absent" from a node that is not a block mapping. P01 P02 P23 are
+    # the round-7 code-review probes (they passed with zero problems before the fix).
+    r9_ctx = "Carrier-ruleset live verifier (#6143)"
+    for label, block in (
+            ("round9 #6679 P01: flow-mapping decoy job claims the verifier check name",
+             '  decoy: {runs-on: ubuntu-latest, name: "%s", steps: [{run: "true"}]}\n' % r9_ctx),
+            ("round9 #6679 P02: flow-mapping decoy job with permissions write-all",
+             '  decoy: {runs-on: ubuntu-latest, permissions: write-all, steps: [{run: "true"}]}\n'),
+            ("round9 #6679 P23: flow-mapping decoy job with an expression name",
+             "  decoy: {runs-on: ubuntu-latest, name: \"${{ 'x' }}\", steps: [{run: \"true\"}]}\n"),
+            ("round9 #6679: flow-mapping decoy job with no name",
+             '  decoy: {runs-on: ubuntu-latest, steps: [{run: "true"}]}\n'),
+            ("round9 #6679: decoy job with an empty value", "  decoy:\n"),
+            ("round9 #6679: decoy job with a scalar value", "  decoy: ubuntu-latest\n")):
+        text = r8_decoy(block)
+        at = text.split("\n").index(block.split("\n")[0]) + 1
+        needle = f"job decoy (line {at}) is not a block mapping"
+        check(label, lambda t=text, n=needle: None if any(n in p for p in workflow_pin_problems(t))
+              else f"workflow_pin_problems does not report {n!r}: {workflow_pin_problems(t)!r}")
+    jobs_at = wf_text.index("\njobs:\n")
+    for label, text, needle in (
+            ("round9 #6679: flow-mapping permissions on the verifier job", r8_in_live(
+                job_perm, "    permissions: {contents: read, issues: read}\n"), "permissions has the shape flow mapping"),
+            ("round9 #6679: flow-mapping steps element in the verifier job", r8_after_vstep(
+                '      - {name: q, run: "true"}\n'), "sequence entry has the shape flow mapping"),
+            ("round9 #6679: scalar jobs value", wf_text[:jobs_at] + "\njobs: none\n", "jobs has the shape plain scalar"),
+            ("round9 #6679: flow-mapping jobs value", wf_text[:jobs_at] + "\njobs: {decoy: {runs-on: x}}\n",
+             "jobs has the shape flow mapping")):
+        check(label, lambda t=text, n=needle: None if any(n in p and "line " in p for p in workflow_pin_problems(t))
+              else f"workflow_pin_problems does not report {n!r} with a line")
+
+    # round9 #6680: a repeated key inside a flow mapping is refused (exact and case variant), never last-wins.
+    for label, row in (
+            ("round9 #6680: repeated flow mapping key", "        with: {ref: main, ref: evil}\n"),
+            ("round9 #6680: case-variant repeated flow mapping key", "        with: {ref: main, REF: evil}\n"),
+            ("round9 #6680: repeated key in a nested flow mapping", "        with: {a: {b: 1, b: 2}}\n")):
+        text = r8_after_vstep("      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262\n" + row)
+        at = text.split("\n").index(row.rstrip("\n")) + 1
+        check(label, lambda t=text, a=at: None if any(f"line {a}: repeated flow mapping key" in p
+                                                      for p in workflow_pin_problems(t))
+              else f"no 'line {a}: repeated flow mapping key' in {workflow_pin_problems(t)!r}")
+
+    # round9 #6681: a problem or refusal never reprints more than SUBSET.ECHO_LIMIT characters of a row,
+    # never a GitHub-token-shaped string, and never the literal value of a credential-named key.
+    r9_tokens = ("gh" + "p_" + "A1b2C3d4" * 5, "github" + "_pat_" + "11AB" + "c9" * 30, "gh" + "s_" + "Zz09" * 9)
+    r9_fake = "FAKE" + "0" * 37
+    r9_cells = [
+        ("round9 #6681: a 3000-character refused row is cut", r8_after_vstep(
+            "      - name: &a " + "Z" * 3000 + "\n"), "Z" * 121),
+        ("round9 #6681: a 3000-character secret row is cut", r8_after_vstep(
+            "      - name: q\n        env:\n          X: ${{ secrets.PAT }}" + "Z" * 3000 + "\n        run: printenv\n"),
+         "Z" * 121),
+        ("round9 #6681: a literal GH_TOKEN value is withheld (problem path)", r8_in_live(
+            "          GH_TOKEN: ${{ github.token }}\n", f"          GH_TOKEN: {r9_fake}\n"), r9_fake[:12]),
+        ("round9 #6681: a literal GH_TOKEN value is withheld (unclosed quote refusal)", r8_in_live(
+            "          GH_TOKEN: ${{ github.token }}\n", f"          GH_TOKEN: \"{r9_fake}\n"), r9_fake[:12]),
+        ("round9 #6681: a literal GH_TOKEN value is withheld (anchor refusal)", r8_in_live(
+            "          GH_TOKEN: ${{ github.token }}\n", f"          GH_TOKEN: &a {r9_fake}\n"), r9_fake[:12]),
+    ]
+    for tok in r9_tokens:
+        r9_cells.append((f"round9 #6681: {tok[:4]} token masked in a secret problem", r8_after_vstep(
+            f"      - name: q\n        env:\n          X: ${{{{ secrets.PAT }}}} {tok}\n        run: printenv\n"), tok[-12:]))
+        r9_cells.append((f"round9 #6681: {tok[:4]} token masked in a refusal", r8_after_vstep(
+            f"      - name: q\n        env:\n          X: \"{tok}\n        run: printenv\n"), tok[-12:]))
+    for label, text, leak in r9_cells:
+        check(label, lambda t=text, s=leak: (
+            "workflow_pin_problems is empty" if not workflow_pin_problems(t)
+            else None if not any(s in p for p in workflow_pin_problems(t))
+            else f"a problem echoes {s[:16]!r}..."))
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"

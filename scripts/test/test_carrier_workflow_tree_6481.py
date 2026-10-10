@@ -450,5 +450,57 @@ class HostileText(unittest.TestCase):
             self.assertFalse(GATE.trigger_covers(bad, "rehearsal/audit-wip"))
 
 
+class Round9AccessorShape(unittest.TestCase):
+    """#6679: child() refuses a node that is not a block mapping; #6680: a repeated flow key is refused;
+    #6681: echoed row text is cut and token-shaped strings are masked."""
+
+    def test_child_refuses_flow_mapping_6679(self):
+        root = SUBSET.parse_workflow("jobs:\n  decoy: {name: x, permissions: write-all}\n")
+        decoy = root.get("jobs").get("decoy")
+        with self.assertRaisesRegex(Unparsed, r"line 2: decoy has the shape flow mapping; allowed: block mapping"):
+            SUBSET.child(decoy, "name")
+        with self.assertRaisesRegex(Unparsed, r"line 2: decoy has the shape flow mapping"):
+            SUBSET.child(decoy, "permissions")
+
+    def test_child_refuses_scalar_empty_and_sequence_6679(self):
+        root = SUBSET.parse_workflow("a: x\nb:\nc: [x]\nd:\n  - x\n")
+        for key, form in (("a", "plain scalar"), ("b", "empty"), ("c", "flow sequence"), ("d", "block sequence")):
+            with self.assertRaisesRegex(Unparsed, "has the shape " + form):
+                SUBSET.child(root.get(key), "name")
+
+    def test_child_refuses_empty_document_6679(self):
+        with self.assertRaisesRegex(Unparsed, "line 0: document has the shape empty"):
+            SUBSET.child(SUBSET.parse_workflow(""), "jobs")
+
+    def test_child_reads_block_mapping_6679(self):
+        root = SUBSET.parse_workflow("jobs:\n  a:\n    name: x\n")
+        job = root.get("jobs").get("a")
+        self.assertIs(SUBSET.child(job, "name"), job.get("name"))
+        self.assertIsNone(SUBSET.child(job, "permissions"))
+
+    def test_flow_job_reported_with_line_6679(self):
+        text = WF.replace("  carrier-base-fresh-gate:\n",
+                          '  decoy: {name: "Carrier-ruleset live verifier (#6143)"}\n  carrier-base-fresh-gate:\n', 1)
+        at = text.split("\n").index('  decoy: {name: "Carrier-ruleset live verifier (#6143)"}') + 1
+        got = GATE.workflow_pin_problems(text)
+        self.assertTrue([p for p in got if f"job decoy (line {at}) is not a block mapping" in p], got)
+
+    def test_flow_duplicate_key_refused_6680(self):
+        self.assertTrue(refused("on: {push: x, push: y}\n", "repeated flow mapping key"))
+        self.assertTrue(refused("on: {push: x, Push: y}\n", "repeated flow mapping key"))
+        self.assertTrue(refused("on: {push: {branches: [a], branches: [b]}}\n", "repeated flow mapping key"))
+        self.assertTrue(refused("a:\n  b: {k: 1, k: 2}\n", "line 2: repeated flow mapping key"))
+        self.assertEqual(SUBSET.flow_of("{push: x, pull_request: y}"), {"push": "x", "pull_request": "y"})
+
+    def test_clip_caps_and_masks_6681(self):
+        self.assertEqual(SUBSET.clip("a" * 120), "a" * 120)
+        self.assertEqual(SUBSET.clip("a" * 121), "a" * SUBSET.ECHO_LIMIT + "...")
+        tok = "gh" + "p_" + "Q" * 36
+        self.assertNotIn("Q" * 8, SUBSET.clip("x " + tok))
+        self.assertNotIn("Q" * 8, str(Unparsed("refused: " + tok)))
+        self.assertNotIn("SECRETVALUE", SUBSET.clip("GH_TOKEN: SECRETVALUE"))
+        self.assertIn("${{ github.token }}", SUBSET.clip("GH_TOKEN: ${{ github.token }}"))
+
+
 if __name__ == "__main__":
     unittest.main()
