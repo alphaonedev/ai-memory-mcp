@@ -32,6 +32,15 @@ binary (``readelf -S``, when present) and a ``diffoscope`` report (when
 installed), then exits 1. A build that fails, a binary that is missing, or a
 git / worktree error exits 2. Only an exact digest match exits 0.
 
+#6282 / #6283: ``--pack OUT --epoch E NAME...`` writes a deterministic
+``.tar.gz`` of NAMEs (relative to ``--pack-root``, default the current
+directory): members sorted, every mtime = E, owner 0/0 with empty names, modes
+normalised to 0644 / 0755, no gzip timestamp or file name. The release job
+packs every shipped tarball with it. The two-build proof packs each build's
+binary the same way and compares the tarballs; with ``--nfpm`` it also builds
+the deb and rpm of each workspace (``nfpm.yaml``, ``SOURCE_DATE_EPOCH``) and
+compares them. Any difference is a mismatch (exit 1).
+
 ``--self-test`` drives the comparison with a stub ``cargo`` that writes a
 binary derived from SOURCE_DATE_EPOCH, the feature set, the target and the
 REMAPPED working directory: two builds must match; a perturbed epoch on the
@@ -41,6 +50,8 @@ mismatch (the negative fixtures #3613 asks for).
 Usage:
   scripts/release/reproducible_build.py --target T --features F --workspace-b DIR
       [--workspace-a DIR] [--bin NAME] [--epoch N] [--cargo PATH]
+      [--nfpm PATH --nfpm-arch ARCH --version VERSION]
+  scripts/release/reproducible_build.py --pack OUT --epoch N [--pack-root DIR] NAME...
   scripts/release/reproducible_build.py --self-test
 Exit codes: 0 identical · 1 mismatch · 2 usage, build or git error.
 """
@@ -48,12 +59,16 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import gzip
 import os
+import re
 import shutil
+import stat
+import tarfile
 import subprocess
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import List, Optional, Tuple
 
 REMAP_SRC = "/src"
@@ -64,6 +79,10 @@ WRAPPER_VARS = ("RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_RUSTC_W
                 "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
 REMAP_CARGO = "/cargo"
 CHUNK = 1 << 20
+EPOCH_RE = re.compile(r"[0-9]+")
+# #6283: the environment nfpm runs with in the proof (plus SOURCE_DATE_EPOCH, ARCH, VERSION).
+NFPM_ENV_ALLOWLIST = ("PATH", "HOME", "TMPDIR")
+NFPM_FORMATS = ("deb", "rpm")
 
 
 class ProofError(Exception):
@@ -155,6 +174,102 @@ def ensure_workspace_b(workspace_a: Path, workspace_b: Path) -> None:
     git(workspace_a, "worktree", "add", "--detach", str(workspace_b), "HEAD")
 
 
+def _pack_entries(root: Path, names: List[str]) -> List[Tuple[str, Path, os.stat_result]]:
+    """(arcname, path, lstat) for every NAME and everything under it, sorted by
+    arcname. #6282: only regular files and directories are packed."""
+    if not names:
+        raise ProofError("--pack needs at least one name to pack")
+    found = {}
+    pending: List[Tuple[str, Path]] = []
+    for name in names:
+        rel = PurePosixPath(name)
+        if rel.is_absolute() or not rel.parts or ".." in rel.parts or rel.parts == (".",) or "." in rel.parts:
+            raise ProofError(f"--pack name {name!r} is not a plain relative path under the pack root")
+        pending.append((rel.as_posix(), root.joinpath(*rel.parts)))
+    while pending:
+        arc, path = pending.pop()
+        try:
+            st = path.lstat()
+        except OSError as exc:
+            raise ProofError(f"--pack cannot read {path}: {exc}") from exc
+        if arc in found:
+            raise ProofError(f"--pack name {arc!r} is packed twice")
+        if stat.S_ISDIR(st.st_mode):
+            for child in path.iterdir():
+                pending.append((f"{arc}/{child.name}", child))
+        elif not stat.S_ISREG(st.st_mode):
+            raise ProofError(f"--pack refuses {path}: not a regular file or directory (a link or special file)")
+        found[arc] = (path, st)
+    return [(arc, found[arc][0], found[arc][1]) for arc in sorted(found)]
+
+
+def pack_tarball(out: Path, root: Path, names: List[str], epoch: str) -> str:
+    """#6282: write a deterministic gzip tarball of ``names`` (relative to
+    ``root``) to ``out`` and return its SHA-256. The bytes depend only on the
+    file contents, the names, the executable bits and ``epoch``."""
+    if not EPOCH_RE.fullmatch(epoch or ""):
+        raise ProofError(f"--pack epoch {epoch!r} is not a non-negative integer (SOURCE_DATE_EPOCH must be set)")
+    mtime = int(epoch)
+    entries = _pack_entries(root, names)
+    partial = out.with_name(out.name + ".partial")
+    try:
+        with open(partial, "wb") as raw:
+            with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=9) as gz:
+                with tarfile.open(fileobj=gz, mode="w", format=tarfile.GNU_FORMAT) as tf:
+                    for arc, path, st in entries:
+                        info = tarfile.TarInfo(arc)
+                        info.mtime = mtime
+                        info.uid = info.gid = 0
+                        info.uname = info.gname = ""
+                        if stat.S_ISDIR(st.st_mode):
+                            info.type = tarfile.DIRTYPE
+                            info.mode = 0o755
+                            tf.addfile(info)
+                            continue
+                        info.mode = 0o755 if st.st_mode & 0o111 else 0o644
+                        info.size = st.st_size
+                        with open(path, "rb") as fh:
+                            tf.addfile(info, fh)
+        os.replace(partial, out)
+    except OSError as exc:
+        raise ProofError(f"--pack cannot write {out}: {exc}") from exc
+    finally:
+        if partial.exists():
+            partial.unlink()
+    return sha256_of(out)
+
+
+def nfpm_packages(workspace: Path, binary: Path, nfpm: str, arch: str, version: str, epoch: str) -> List[Tuple[str, str]]:
+    """#6283: build the deb and rpm of ``binary`` in ``workspace`` the way the
+    release job does (``nfpm.yaml``, ``dist/ai-memory``) and return the sorted
+    (file name, SHA-256) pairs."""
+    dist = workspace / "dist"
+    outdir = workspace / "target" / "reproducible-nfpm"
+    shutil.rmtree(outdir, ignore_errors=True)
+    try:
+        dist.mkdir(exist_ok=True)
+        outdir.mkdir(parents=True)
+        shutil.copyfile(binary, dist / "ai-memory")
+        (dist / "ai-memory").chmod(0o755)
+    except OSError as exc:
+        raise ProofError(f"cannot stage dist/ai-memory in {workspace}: {exc}") from exc
+    env = {k: os.environ[k] for k in NFPM_ENV_ALLOWLIST if k in os.environ}
+    env.update({"SOURCE_DATE_EPOCH": epoch, "ARCH": arch, "VERSION": version})
+    for fmt in NFPM_FORMATS:
+        cmd = [nfpm, "package", "-p", fmt, "-f", "nfpm.yaml", "-t", str(outdir)]
+        print("reproducible-build: + " + " ".join(cmd), flush=True)
+        try:
+            proc = subprocess.run(cmd, cwd=workspace, env=env, check=False)
+        except OSError as exc:
+            raise ProofError(f"cannot run {nfpm}: {exc}") from exc
+        if proc.returncode != 0:
+            raise ProofError(f"nfpm {fmt} in {workspace} exited {proc.returncode}")
+    built = sorted(p for p in outdir.iterdir() if p.is_file())
+    if len(built) != len(NFPM_FORMATS):
+        raise ProofError(f"nfpm in {workspace} produced {len(built)} packages, wanted {len(NFPM_FORMATS)}")
+    return [(p.name, sha256_of(p)) for p in built]
+
+
 def differing(a: bytes, b: bytes) -> Tuple[int, int]:
     """(count of differing bytes over the common prefix, first differing offset or -1)."""
     n = min(len(a), len(b))
@@ -187,11 +302,17 @@ def describe_mismatch(bin_a: Path, bin_b: Path) -> None:
 
 def two_builds(workspace_a: Path, workspace_b: Path, target: str, features: str, bin_name: str, cargo: str,
                epoch: Optional[str] = None, epoch_b: Optional[str] = None, remap: bool = True,
-               sha256_output: Optional[Path] = None) -> int:
-    """Build in both workspaces and compare. Returns the exit code (0 / 1).
-    ``epoch_b`` and ``remap=False`` exist for the negative fixtures only."""
+               sha256_output: Optional[Path] = None, pack_epoch_b: Optional[str] = None,
+               nfpm: Optional[str] = None, nfpm_arch: Optional[str] = None, version: Optional[str] = None,
+               nfpm_epoch_b: Optional[str] = None) -> int:
+    """Build in both workspaces and compare the binaries, their tarballs and
+    (with ``nfpm``) their deb and rpm packages. Returns the exit code (0 / 1).
+    ``epoch_b``, ``remap=False``, ``pack_epoch_b`` and ``nfpm_epoch_b`` exist for
+    the negative fixtures only."""
     if not features.strip():
         raise ProofError("--features is empty (the release feature declaration came back empty: fail closed)")
+    if nfpm is not None and (not version or not nfpm_arch):
+        raise ProofError("--nfpm needs a non-empty --version and --nfpm-arch (fail closed)")
     epoch_a = epoch if epoch is not None else epoch_of(workspace_a)
     ensure_workspace_b(workspace_a, workspace_b)
     bin_a = build_once(workspace_a, target, features, epoch_a, cargo, remap, bin_name)
@@ -204,7 +325,30 @@ def two_builds(workspace_a: Path, workspace_b: Path, target: str, features: str,
               f"({sha_a} vs {sha_b}); the build is not reproducible (#3613)", flush=True)
         describe_mismatch(bin_a, bin_b)
         return 1
-    print(f"reproducible-build: OK (two builds of {bin_name} for {target} are byte-identical: {sha_a})", flush=True)
+    # #6283: the shipped form is the tarball (and the deb/rpm), not the bare binary.
+    tar_name = f"{bin_name}-{target}.tar.gz"
+    tars = []
+    for ws, bin_path, pack_epoch in ((workspace_a, bin_a, epoch_a),
+                                     (workspace_b, bin_b, pack_epoch_b if pack_epoch_b is not None else epoch_a)):
+        pack_dir = ws / "target" / "reproducible-pack"
+        pack_dir.mkdir(parents=True, exist_ok=True)
+        tars.append(pack_tarball(pack_dir / tar_name, bin_path.parent, [bin_name], pack_epoch))
+    print(f"reproducible-build: tarballs {tar_name} sha256 A={tars[0]} B={tars[1]}", flush=True)
+    if tars[0] != tars[1]:
+        print(f"::error::reproducible-build: MISMATCH: the tarballs of two identical builds differ ({tars[0]} vs "
+              f"{tars[1]}); packaging is not reproducible (#6283)", flush=True)
+        return 1
+    if nfpm is not None:
+        pkgs_a = nfpm_packages(workspace_a, bin_a, nfpm, nfpm_arch or "", version or "", epoch_a)
+        pkgs_b = nfpm_packages(workspace_b, bin_b, nfpm, nfpm_arch or "", version or "",
+                               nfpm_epoch_b if nfpm_epoch_b is not None else epoch_a)
+        print(f"reproducible-build: packages A={pkgs_a} B={pkgs_b}", flush=True)
+        if pkgs_a != pkgs_b:
+            print("::error::reproducible-build: MISMATCH: the deb/rpm packages of two identical builds differ; "
+                  "packaging is not reproducible (#6283)", flush=True)
+            return 1
+    print(f"reproducible-build: OK (two builds of {bin_name} for {target} are byte-identical: {sha_a}; tarballs"
+          f"{' and deb/rpm' if nfpm is not None else ''} identical)", flush=True)
     if sha256_output is not None:
         # #6274: the proven digest, for the release job's shipped-binary compare.
         with open(sha256_output, "a", encoding="utf-8") as fh:
@@ -385,7 +529,8 @@ def _self_test(root: Path) -> int:
         return 1
     print("reproducible_build: self-test OK (identical builds pass; perturbed epoch, unremapped path, empty feature set "
           "and missing build tool are refused; a stale, dirty or prebuilt workspace B, a compiler wrapper and caller "
-          "environment leaks are refused, #6291)")
+          "environment leaks are refused, #6291; the packed tarball and the deb/rpm are compared and a "
+          "perturbed packing epoch is refused, #6282/#6283)")
     return 0
 
 
@@ -517,17 +662,35 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--cargo", default="cargo", help="build tool to run (default cargo)")
     ap.add_argument("--sha256-output", help="append `sha256=<digest>` here when the two builds match "
                     "(the job's GITHUB_OUTPUT, #6274)")
+    ap.add_argument("--nfpm", help="nfpm binary: also build and compare the deb and rpm of each workspace (#6283)")
+    ap.add_argument("--nfpm-arch", help="ARCH for nfpm.yaml (with --nfpm)")
+    ap.add_argument("--version", help="VERSION for nfpm.yaml (with --nfpm)")
+    ap.add_argument("--pack", help="write a deterministic tarball of NAMEs here and print its SHA-256 (#6282)")
+    ap.add_argument("--pack-root", default=".", help="directory the NAMEs are relative to (with --pack; default .)")
+    ap.add_argument("names", nargs="*", help="files or directories to pack (with --pack)")
     ap.add_argument("--self-test", action="store_true", help="prove the comparison with a stub build tool")
     args = ap.parse_args(argv)
     root = Path(__file__).resolve().parent.parent.parent
     if args.self_test:
         return self_test(root)
+    if args.pack:
+        if args.epoch is None:
+            ap.error("--pack needs --epoch")
+        try:
+            print(pack_tarball(Path(args.pack), Path(args.pack_root), args.names, args.epoch))
+        except ProofError as exc:
+            print(f"::error::reproducible-build: {exc}", file=sys.stderr)
+            return 2
+        return 0
+    if args.names:
+        ap.error("NAMEs are only accepted with --pack")
     if not args.target or args.features is None or not args.workspace_b:
         ap.error("--target, --features and --workspace-b are required")
     try:
         return two_builds(Path(args.workspace_a).resolve(), Path(args.workspace_b).resolve(), args.target, args.features,
                           args.bin, args.cargo, epoch=args.epoch,
-                          sha256_output=Path(args.sha256_output) if args.sha256_output else None)
+                          sha256_output=Path(args.sha256_output) if args.sha256_output else None,
+                          nfpm=args.nfpm, nfpm_arch=args.nfpm_arch, version=args.version)
     except ProofError as exc:
         print(f"::error::reproducible-build: {exc}", file=sys.stderr)
         return 2

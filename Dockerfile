@@ -16,6 +16,8 @@ FROM rust:1.98-slim-bookworm@sha256:ff521445a372125ed4f76e1453a1f8098f2d05332d16
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev build-essential && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
+# #6282: the release job passes the verified commit's time as a build argument (no default).
+ARG SOURCE_DATE_EPOCH
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY benches/ benches/
