@@ -3897,6 +3897,7 @@ APPROVAL_JOB_PERMISSIONS = {"contents": "read", "pull-requests": "read"}
 WORKFLOW_PERMISSIONS = {"contents": "read"}
 APPROVAL_EVALUATE_ENV = {"GH_TOKEN": "${{ github.token }}", "OPERATOR_LOGIN": APPROVAL_OPERATOR}
 APPROVAL_STEP_KEYS = [["uses", "with"], ["name", "run"], ["name", "env", "run"]]
+APPROVAL_JOB_KEYS = ["name", "runs-on", "timeout-minutes", "permissions", "steps"]
 
 
 def _row_scalar(body: str) -> str:
@@ -3985,6 +3986,10 @@ def _approval_job_problems(c8: str) -> List[str]:
         shape = _approval_job_shape(c8)
     except Unparsed as exc:
         return problems + [f"c8-precheck.yml does not parse: {exc}"]
+    # #6387: the job's own keys are exact, so `if :`/`needs :`/`continue-on-error :` with a
+    # space before the colon (which YAML and actionlint accept) cannot slip past a regex.
+    if shape["job_keys"] != APPROVAL_JOB_KEYS:
+        problems.append(f"approval job keys are {shape['job_keys']!r}, not exactly {APPROVAL_JOB_KEYS!r}")
     # #6335: the token scopes are exact, for the job and for the workflow default.
     if shape["permissions_row"] != "permissions:" or shape["permissions"] != APPROVAL_JOB_PERMISSIONS:
         problems.append(f"job permissions are {shape['permissions_row']!r} {shape['permissions']!r}, "
