@@ -226,11 +226,13 @@ import argparse
 import ast
 import fnmatch
 import hashlib
+import io
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import zlib
 from concurrent.futures import ThreadPoolExecutor
@@ -582,6 +584,34 @@ _TAG_ENV = {"TAG": "${{ needs.preflight.outputs.tag }}"}
 # mobile-android, docker), right after the checkout of the verified commit.
 EPOCH_STEP: Dict[str, Spec] = {"name": "Source date epoch (#3613)", "id": "epoch", "shell": "bash",
                                "run": Block(EPOCH_RUN)}
+# The deb/rpm step of the release job (#3546, #6282).
+NFPM_STEP_RUN = (
+    "set -euo pipefail",
+    "# #6282 — nfpm reads SOURCE_DATE_EPOCH (the job's epoch) for every",
+    "# timestamp it writes into the deb and the rpm.",
+    PACK_EPOCH_CHECK,
+    "# #3546 — download to a file and check a PINNED digest before",
+    "# extracting; never `curl | tar`. Digests from goreleaser's",
+    "# v2.41.1 checksums.txt, cross-checked on 2026-09-11 by hashing",
+    "# both downloaded tarballs.",
+    "NFPM_ARCH=$(uname -m | sed 's/aarch64/arm64/')",
+    'case "$NFPM_ARCH" in',
+    "  x86_64) NFPM_SHA256=b3cf95aa6dabed836d09ad7f0c190a13c74c5b1304db60846f0f702ee407f430 ;;",
+    "  arm64)  NFPM_SHA256=17350a838c8e2c422c6e573ed379b18424565d2de8a2b1cb1b20211976124eb5 ;;",
+    '  *) echo "::error::no pinned nfpm digest for $NFPM_ARCH"; exit 1 ;;',
+    "esac",
+    'NFPM_TGZ="$RUNNER_TEMP/nfpm_2.41.1_Linux_${NFPM_ARCH}.tar.gz"',
+    'curl -fsSL -o "$NFPM_TGZ" "https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_Linux_${NFPM_ARCH}.tar.gz"',
+    'echo "${NFPM_SHA256}  ${NFPM_TGZ}" | sha256sum -c -',
+    'tar xzf "$NFPM_TGZ" -C /usr/local/bin nfpm',
+    "",
+    'VERSION="${TAG#v}"',
+    "",
+    "ARCH=${{ matrix.nfpm_arch }} VERSION=$VERSION nfpm package -p deb -f nfpm.yaml -t dist/",
+    "ARCH=${{ matrix.nfpm_arch }} VERSION=$VERSION nfpm package -p rpm -f nfpm.yaml -t dist/",
+    "",
+    "ls -la dist/*.deb dist/*.rpm",
+)
 RELEASE_STEPS: List[Spec] = [
     {"uses": CHECKOUT_USES, "with": {"ref": "${{ needs.preflight.outputs.sha }}"}},
     dict(EPOCH_STEP),
@@ -591,33 +621,7 @@ RELEASE_STEPS: List[Spec] = [
     Unit("assert"),
     Unit("package"),
     {"name": "Build deb and rpm packages", "if": "matrix.nfpm_arch",
-     "env": dict(_TAG_ENV, SOURCE_DATE_EPOCH=EPOCH_REF), "run": Block((
-        "set -euo pipefail",
-        "# #6282 — nfpm reads SOURCE_DATE_EPOCH (the job's epoch) for every",
-        "# timestamp it writes into the deb and the rpm.",
-        PACK_EPOCH_CHECK,
-        "# #3546 — download to a file and check a PINNED digest before",
-        "# extracting; never `curl | tar`. Digests from goreleaser's",
-        "# v2.41.1 checksums.txt, cross-checked on 2026-09-11 by hashing",
-        "# both downloaded tarballs.",
-        "NFPM_ARCH=$(uname -m | sed 's/aarch64/arm64/')",
-        'case "$NFPM_ARCH" in',
-        "  x86_64) NFPM_SHA256=b3cf95aa6dabed836d09ad7f0c190a13c74c5b1304db60846f0f702ee407f430 ;;",
-        "  arm64)  NFPM_SHA256=17350a838c8e2c422c6e573ed379b18424565d2de8a2b1cb1b20211976124eb5 ;;",
-        '  *) echo "::error::no pinned nfpm digest for $NFPM_ARCH"; exit 1 ;;',
-        "esac",
-        'NFPM_TGZ="$RUNNER_TEMP/nfpm_2.41.1_Linux_${NFPM_ARCH}.tar.gz"',
-        'curl -fsSL -o "$NFPM_TGZ" "https://github.com/goreleaser/nfpm/releases/download/v2.41.1/nfpm_2.41.1_Linux_${NFPM_ARCH}.tar.gz"',
-        'echo "${NFPM_SHA256}  ${NFPM_TGZ}" | sha256sum -c -',
-        'tar xzf "$NFPM_TGZ" -C /usr/local/bin nfpm',
-        "",
-        'VERSION="${TAG#v}"',
-        "",
-        "ARCH=${{ matrix.nfpm_arch }} VERSION=$VERSION nfpm package -p deb -f nfpm.yaml -t dist/",
-        "ARCH=${{ matrix.nfpm_arch }} VERSION=$VERSION nfpm package -p rpm -f nfpm.yaml -t dist/",
-        "",
-        "ls -la dist/*.deb dist/*.rpm",
-    ))},
+     "env": dict(_TAG_ENV, SOURCE_DATE_EPOCH=EPOCH_REF), "run": Block(NFPM_STEP_RUN)},
     {"name": "Checksum every release artifact", "shell": "bash", "run": Block((
         "set -euo pipefail",
         "cd dist",
@@ -4320,6 +4324,114 @@ def bound_runtime(root: Path, base: Path, payload: bytes, build: str, assert_bod
                     failures += 1
     return failures
 
+# #6907: a stand-in nfpm for package_runtime. It records the bytes it packaged
+# (``nfpm-saw-<fmt>`` beside the checkout) and writes a deb / rpm in the real
+# container format through the bound packer's fixture writer when it has one.
+STUB_NFPM_6907 = '''import importlib.util, pathlib, sys
+args = sys.argv[1:]
+fmt = args[args.index("-p") + 1]
+data = pathlib.Path("dist/ai-memory").read_bytes()
+pathlib.Path("nfpm-saw-" + fmt).write_bytes(data)
+spec = importlib.util.spec_from_file_location("rb", "scripts/release/reproducible_build.py")
+rb = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(rb)
+make = getattr(rb, "_synthetic_package", None)
+entries = [("./usr/", b"", 0o755, "d"), ("./usr/bin/", b"", 0o755, "d"), ("./usr/bin/ai-memory", data, 0o755, "f")]
+blob = make(fmt, entries) if make else b"stub package"
+pathlib.Path("dist/ai-memory_1.0.0_amd64." + fmt).write_bytes(blob)
+'''
+# name -> (shims {tool: python body}, statement run between the record halves,
+# statement run between the package unit and the deb/rpm step)
+PACKAGE_FORMS: Dict[str, Tuple[Dict[str, str], str, str]] = {
+    "control": ({}, "true", "true"),
+    "binary rewritten after the record": ({}, "true", 'printf "evil\\n" > target/x/release/ai-memory'),
+    "binary rewritten while the strict assert reads it": ({}, 'printf "evil\\n" > "$bin"', "true"),
+    "cp + shasum shims on PATH": ({
+        "cp": "import sys, shutil\nsrc, dst = sys.argv[-2], sys.argv[-1]\n"
+              "open(dst, 'wb').write(b'evil\\n') if 'dist/' in dst else shutil.copy(src, dst)\n",
+        "shasum": "import sys, hashlib, glob\np = sys.argv[-1]\n"
+                  "q = glob.glob('target/*/release/ai-memory')[0] if 'dist/' in p else p\n"
+                  "print(hashlib.sha256(open(q, 'rb').read()).hexdigest() + '  ' + p)\n"}, "true", "true"),
+    "self-swapping cut shim on PATH": ({
+        "cut": "import sys, os, glob\nd = sys.stdin.read().split()[0]\na = os.environ.get('ASSERTED_SHA256')\n"
+               "print(a if a else d)\n"
+               "if not a:\n    open(glob.glob('target/*/release/ai-memory')[0], 'wb').write(b'evil\\n')\n"},
+        "true", "true"),
+    "shasum shim swaps the copy after hashing it": ({
+        "shasum": "import sys, hashlib, os\np = sys.argv[-1]\n"
+                  "print(hashlib.sha256(open(p, 'rb').read()).hexdigest() + '  ' + p)\n"
+                  "open(p, 'wb').write(b'evil\\n') if 'dist/' in p else None\n"}, "true", "true"),
+    "dist binary rewritten before nfpm": ({}, "true", 'printf "evil\\n" > dist/ai-memory'),
+}
+
+
+def package_runtime(root: Path, base: Path, payload: bytes) -> int:
+    """#4752 / #6907: run the assert record, the package unit and the deb/rpm
+    step's packaging statements, in order, under the pinned step shell, against
+    every PACKAGE_FORMS tamper an earlier step (a PATH entry, a process left
+    running) could apply. Every form must either stop a unit or ship only the
+    asserted bytes in the tarball and in both packages."""
+    failures = 0
+    git = ["git", "-c", "user.name=self-test", "-c", "user.email=self-test@localhost", "-c", "commit.gpgsign=false"]
+    want = hashlib.sha256(payload).hexdigest()
+    record = [s for s in WF_ASSERT if s in ASSERT_RECORD or s == ASSERT_WORKFLOW]
+    nfpm_run = list(NFPM_STEP_RUN)
+    first = next(i for i, s in enumerate(nfpm_run) if "nfpm package" in s)
+    tail = ["set -euo pipefail", "VERSION=1.0.0"] + [s.replace("${{ matrix.nfpm_arch }}", "amd64")
+                                                       for s in nfpm_run[first:] if s and not s.startswith("#")]
+    for form, (shims, mid, between) in PACKAGE_FORMS.items():
+        repo = base / "pkg-runtime"
+        shutil.rmtree(repo, ignore_errors=True)
+        (repo / "scripts" / "release").mkdir(parents=True)
+        shutil.copy2(root / PACK_SCRIPT, repo / PACK_SCRIPT)
+        for cmd in (["init", "-q"], ["add", PACK_SCRIPT], ["commit", "-q", "-m", "pin the packer"]):
+            subprocess.run(git + cmd, cwd=repo, capture_output=True, check=True)
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True,
+                             check=True).stdout.strip()
+        (repo / "target" / "x" / "release").mkdir(parents=True)
+        (repo / "target" / "x" / "release" / "ai-memory").write_bytes(payload)
+        shim = base / "pkg-shim"
+        shutil.rmtree(shim, ignore_errors=True)
+        shim.mkdir()
+        for tool, code in dict(shims, nfpm=STUB_NFPM_6907).items():
+            (shim / tool).write_text("#!/usr/bin/python3 -I\n" + code, encoding="utf-8")
+            (shim / tool).chmod(0o755)
+        env = {"PATH": f"{shim}:/usr/bin:/bin", "GITHUB_OUTPUT": str(repo / "output.txt"), "PREFLIGHT_SHA": sha,
+               "SOURCE_DATE_EPOCH": "1700000000"}
+        body = ["set -euo pipefail", 'bin="target/x/release/ai-memory"'] + [mid if s == ASSERT_WORKFLOW else s
+                                                                           for s in record]
+
+        def run(statements: List[str], step_env: Dict[str, str]) -> int:
+            text = "\n".join(statements).replace("${{ matrix.target }}", "x").replace("${{ matrix.artifact }}", "ai-memory")
+            return subprocess.run(shell_argv(SANE_SHELL) + [text], cwd=repo, env=step_env, capture_output=True).returncode
+
+        rcs = [run(body, env)]
+        out = (repo / "output.txt").read_text(encoding="utf-8") if (repo / "output.txt").is_file() else ""
+        asserted = ([ln.split("=", 1)[1] for ln in out.splitlines() if ln.startswith("sha256=")] or [""])[-1]
+        env["ASSERTED_SHA256"] = asserted
+        if rcs[-1] == 0:
+            rcs.append(run(["set -euo pipefail"] + list(WF_PACKAGE), env))
+        if rcs[-1] == 0:
+            rcs.append(run(["set -euo pipefail", between] + tail, env))
+        shipped = []
+        tgz = repo / "dist" / "ai-memory-x.tar.gz"
+        if tgz.is_file():
+            with tarfile.open(tgz) as tf:
+                shipped += [(m.name, (tf.extractfile(m) or io.BytesIO()).read()) for m in tf.getmembers() if m.isfile()]
+        shipped += [(p.name, p.read_bytes()) for p in sorted(repo.glob("nfpm-saw-*"))]
+        complete = len(rcs) == 3 and all(rc == 0 for rc in rcs)
+        if form == "control":
+            if not complete or asserted != want or [n for n, _ in shipped] != ["ai-memory", "nfpm-saw-deb", "nfpm-saw-rpm"] \
+                    or any(b != payload for _, b in shipped):
+                print(f"self-test FAIL: the release packaging does not ship the asserted binary (rc {rcs}) (#4752)",
+                      file=sys.stderr)
+                failures += 1
+        elif complete and any(b != payload for _, b in shipped):
+            print(f"self-test FAIL: the release packaging shipped bytes the strict assert never checked ({form}, "
+                  "#4752/#6907): fail-open", file=sys.stderr)
+            failures += 1
+    return failures
+
 
 def condition_anchor_failures() -> int:
     """#6280: a condition-mutant anchor that occurs more than once above CONDITION_MARKER is never applied
@@ -4503,6 +4615,10 @@ def self_test(root: Path) -> int:
                         .replace(SANE_BASH + " scripts/assert-compiled-features.sh", "echo assert")
                         .replace("bash scripts/assert-compiled-features.sh", "echo assert"))
         failures += bound_runtime(root, tmp / "bound", payload, bound_build, bound_assert)
+        # #4752 / #6907: the assert record, the package unit and the deb/rpm step
+        # ship only the bytes the strict assert checked, whatever an earlier step
+        # put on PATH or left running.
+        failures += package_runtime(root, tmp / "bound", payload)
 
         # --- #3613: the two-build proof script proves itself (two identical
         # builds pass; a perturbed SOURCE_DATE_EPOCH and an unremapped workspace
