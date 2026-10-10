@@ -111,6 +111,21 @@ class VerifyError(Exception):
     """A declaration or API problem that fails the gate."""
 
 
+def _no_dup(pairs):
+    """object_pairs_hook: a repeated key is ambiguous input (#6439); the last value must never win."""
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        out[key] = value
+    return out
+
+
+def loads_strict(text):
+    """json.loads that rejects a duplicate key at any depth with ValueError (#6439)."""
+    return json.loads(text, object_pairs_hook=_no_dup)
+
+
 def read_decl(path):
     """Declaration lines: non-empty, not starting with '#', kept byte-exact."""
     try:
@@ -122,7 +137,7 @@ def read_decl(path):
 
 def read_json(path):
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
+        return loads_strict(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise VerifyError(f"cannot read {path}: {exc}") from exc
 
@@ -335,7 +350,7 @@ def gh_run(args):
 
 def parse_pages(text):
     """`gh api --paginate` prints one JSON array per page; concatenate them."""
-    dec = json.JSONDecoder()
+    dec = json.JSONDecoder(object_pairs_hook=_no_dup)
     out, i, pages = [], 0, 0
     while True:
         while i < len(text) and text[i].isspace():
@@ -366,7 +381,7 @@ def live_rulesets(repo, run=gh_run):
                 raise VerifyError(f"ruleset listing entry has no integer id: {item!r}")
             rid = item["id"]
             try:
-                detail = json.loads(run([f"repos/{repo}/rulesets/{rid}"]))
+                detail = loads_strict(run([f"repos/{repo}/rulesets/{rid}"]))
             except ValueError as exc:
                 raise VerifyError(f"ruleset {rid} detail unreadable: {exc}") from exc
             if not (isinstance(detail, dict) and detail.get("id") == rid
@@ -381,7 +396,7 @@ def live_rulesets(repo, run=gh_run):
 def live_issue_state(repo, run=gh_run):
     def fetch(number):
         try:
-            data = json.loads(run([f"repos/{repo}/issues/{int(number)}"]))
+            data = loads_strict(run([f"repos/{repo}/issues/{int(number)}"]))
         except ValueError as exc:
             raise VerifyError(f"issue response unparseable: {exc}") from exc
         if not (isinstance(data, dict) and data.get("number") == number
