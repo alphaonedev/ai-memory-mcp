@@ -65,8 +65,9 @@ environment) and keys that change the authentication mechanism or session mode
 ``oauth_client_id``, ``oauth_scope``).  ``service`` is refused too (#6345): libpq reads a
 ``pg_service.conf`` entry BEFORE ``PGPASSWORD``, so a service-file password would beat the
 password the helper moved off argv, while in the original URL the URL password wins.  For the
-same reason psql runs without ``PGSERVICE`` and ``PGSERVICEFILE`` in its environment.  ``ssl=true`` is a JDBC alias libpq does
-not know; use ``sslmode``.  A refusal names a key only when it is a known libpq
+same reason psql runs without ``PGSERVICE`` and ``PGSERVICEFILE`` in its environment.  ``ssl=true`` (a JDBC alias libpq maps
+to ``sslmode=require``) is refused so that the TLS mode is always spelled ``sslmode``.  ``sslkeylogfile`` (it writes
+TLS session secrets to a file) and ``require_auth`` (it changes the accepted authentication methods) are refused too.  A refusal names a key only when it is a known libpq
 keyword (an unlisted key can be the tail of a password that held a raw ``&``),
 never a value, and neither form of the URL is printed.
 
