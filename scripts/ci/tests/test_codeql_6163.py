@@ -157,7 +157,7 @@ class ComparisonTests(unittest.TestCase):
 
         with unittest.mock.patch.object(self.compare, 'fetch_objects', side_effect=acquire):
             with self.compare.isolated_objects(self.repo, self.event(), self.work / 'outside') as objects:
-                self.assertTrue(self.compare.git(objects, 'rev-parse', '--is-bare-repository').strip() == b'true')
+                self.assertEqual(self.compare.git(objects, 'rev-parse', '--is-bare-repository').strip(), b'true')
                 self.assertNotIn(self.repo, objects.resolve().parents)
                 self.assertEqual(stat.S_IMODE(objects.parent.stat().st_mode), DIRECTORY_MODE)
                 self.assertEqual(self.compare.git(objects, 'rev-parse', self.base).decode().strip(), self.base)

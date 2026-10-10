@@ -936,28 +936,30 @@ def directory_descriptor(path, parent=None):
 
 
 def deep_scratch(tmp, target_len):
-    """Build an exact-length path; ExitStack closes every descriptor even if another close raises."""
+    """Build an exact-length path with a lexical owner for every descriptor."""
     base = Path(tempfile.mkdtemp(prefix="gitshim-deep.", dir=str(tmp)))
-    try:
-        with contextlib.ExitStack() as descriptors:
-            cur, cur_len = base, len(os.fsencode(str(base)))
-            parent = descriptors.enter_context(directory_descriptor(str(base)))
-            while cur_len < target_len:
-                room = target_len - cur_len
-                step = min(200, room - 1)
-                if room - step - 1 == 1:
-                    step -= 1  # a final component needs 2 bytes ('/' + 1 char)
-                if step < 1:
-                    raise OSError(errno.ENAMETOOLONG,
-                                  f"cannot land on exactly {target_len} bytes from {cur_len}")
-                name = "d" * step
-                os.mkdir(name, dir_fd=parent)
-                parent = descriptors.enter_context(directory_descriptor(name, parent))
-                cur, cur_len = cur / name, cur_len + 1 + step
-            if cur_len != target_len:
+
+    def descend(cur, cur_len, component, parent=None):
+        """Unwind every directory owner even if an inner traversal or close fails."""
+        with directory_descriptor(component, parent) as descriptor:
+            if cur_len == target_len:
+                return cur
+            if cur_len > target_len:
                 raise OSError(errno.ENAMETOOLONG,
                               f"the scratch base is {cur_len} bytes, over the {target_len}-byte target")
-        return base, cur
+            room = target_len - cur_len
+            step = min(200, room - 1)
+            if room - step - 1 == 1:
+                step -= 1  # a final component needs 2 bytes ('/' + 1 char)
+            if step < 1:
+                raise OSError(errno.ENAMETOOLONG,
+                              f"cannot land on exactly {target_len} bytes from {cur_len}")
+            name = "d" * step
+            os.mkdir(name, dir_fd=descriptor)
+            return descend(cur / name, cur_len + 1 + step, name, descriptor)
+
+    try:
+        return base, descend(base, len(os.fsencode(str(base))), str(base))
     except BaseException:
         shutil.rmtree(base, ignore_errors=True)
         raise
