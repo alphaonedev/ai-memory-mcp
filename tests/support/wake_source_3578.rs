@@ -127,8 +127,8 @@ pub fn production_tokens(source: &str) -> Vec<&str> {
             while t.get(item) == Some(&"#") && t.get(item + 1) == Some(&"[") {
                 item = group_end(&t, item + 1);
             }
-            if t.get(item) == Some(&"mod") && t.get(item + 2) == Some(&"{") {
-                i = group_end(&t, item + 2);
+            if let Some(end) = test_item_end(&t, item) {
+                i = end;
                 continue;
             }
         }
@@ -144,7 +144,6 @@ pub fn production_tokens(source: &str) -> Vec<&str> {
 /// `const`, `static`, `use` and `type` items end at their `;`, skipping any
 /// brace group inside the initialiser. `None` when no item can be delimited,
 /// in which case the attribute is left counted as production (fail closed).
-#[allow(dead_code)]
 fn test_item_end(t: &[&str], item: usize) -> Option<usize> {
     let mut i = item;
     while matches!(t.get(i), Some(&("pub" | "unsafe" | "async" | "extern" | "default"))) {
