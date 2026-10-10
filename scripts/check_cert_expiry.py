@@ -1463,6 +1463,29 @@ def shim_isolation_crash_violation():
     return None
 
 
+SHA_COMMENT_LABELS = ("BOM plus 40-hex", "RLO plus 40-hex", "40-hex plus combining acute",
+                      "64-hex with one Cyrillic a")
+
+
+def sha_comment_violations(block_text, labels):
+    """Violations of the pr4-sha-len comment block (#6649, #6941): each #6463 label is named
+    in SHA_COMMENT_LABELS (never picked by position in the value table), must be a row of
+    the value table `labels`, and must have its own `# <label> : <loosening>` comment row; the
+    two false "only cell" claims must be gone. Returns the list of violations."""
+    out = []
+    if not block_text:
+        return ["the sha_len_values comment block was not found"]
+    for label in SHA_COMMENT_LABELS:
+        if label not in labels:
+            out.append(f"sha_len_values has no row labelled {label!r}")
+        if not re.search(r"^\s*#\s+" + re.escape(label) + r"\s+:\s+\S", block_text, re.M):
+            out.append(f"the comment block has no row naming the loosening of {label!r}")
+    for stale_claim in ("(only this cell)", "only cells for theirs"):
+        if stale_claim in block_text:
+            out.append(f"the comment block still claims {stale_claim!r}")
+    return out
+
+
 SHA_SITE_STMTS = (
     'head = env_sha(env, "PR_HEAD_SHA")',
     'tip = env_sha(env, "GITHUB_SHA") if env.get("GITHUB_SHA") else "HEAD"',
@@ -2198,14 +2221,22 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
     own_src = Path(__file__).read_text(encoding="utf-8")
     block = re.search(r"# Each non-length value below.*?\(#6414, #6404\)", own_src, re.S)
     block_text = block.group(0) if block else ""
-    if not block_text:
-        t.fail("(pr4-sha-comment): the sha_len_values comment block was not found")
-    for label in [lb for lb, _ in sha_len_values[9:13]]:
-        if not re.search(r"^\s*#\s+" + re.escape(label) + r"\s+:\s+\S", block_text, re.M):
-            t.fail(f"(pr4-sha-comment): the comment block has no row naming the loosening of {label!r}")
-    for stale_claim in ("(only this cell)", "only cells for theirs"):
-        if stale_claim in block_text:
-            t.fail(f"(pr4-sha-comment): the comment block still claims {stale_claim!r}")
+    for why in sha_comment_violations(block_text, [lb for lb, _ in sha_len_values]):
+        t.fail(f"(pr4-sha-comment): {why}")
+    # (pr4-sha-comment-position, #6941): the check is by name, so moving, adding or removing a row
+    # of the value table changes nothing, and the round-9 control that drops the fullwidth row
+    # (#6649: that row is the sole killer of the fullwidth-digit loosening) is not killed by it.
+    names = [lb for lb, _ in sha_len_values]
+    for label, shaped in (
+        ("a new first row", ["a new first row"] + names),
+        ("the fullwidth row dropped", [lb for lb in names if lb != "40 fullwidth digit"]),
+        ("the rows reversed", names[::-1]),
+    ):
+        if sha_comment_violations(block_text, shaped):
+            t.fail(f"(pr4-sha-comment-position): {label} changes the comment-block verdict: "
+                   f"{sha_comment_violations(block_text, shaped)!r}")
+    if not sha_comment_violations(block_text, [lb for lb in names if lb != "BOM plus 40-hex"]):
+        t.fail("(pr4-sha-comment-position): a missing #6463 row is not reported")
 
     # (pr4-sha-ast, #6697, #6940): structural pin of the five env sha read statements of
     # resolve_range, taken whole, plus the paths that feed them: `env` is bound only as the parameter
@@ -2392,7 +2423,7 @@ SELF_TEST_OK = (
     "(pr4-sha-case, #6144) upper-case 40/64-hex shas pass the validator on every validated key; "
     "(pr4-sha-len) 63/65-hex, 40 non-ASCII-digit (Arabic-Indic, fullwidth, superscript), 40 non-hex ASCII, newline- or CR-suffixed and space-prefixed 40-hex values, BOM-, bidi-override-, combining-mark- and Cyrillic-look-alike 40/64-hex values (#6463), and every str.isspace() character as a prefix and as a suffix of a 40-hex value, refused on every validated sha site (PR_HEAD_SHA, GITHUB_SHA and PR_BASE_SHA on pull_request; "
     "GITHUB_EVENT_BEFORE and GITHUB_SHA on push) with only the `git --version` probe traced before the validator; "
-    "(pr4-sha-comment, #6649) the comment block above the sha values names each loosening and claims no false only-cell; "
+    "(pr4-sha-comment, #6649, #6941) the comment block above the sha values names each loosening and claims no false only-cell, the four #6463 labels chosen by name so a moved row neither shifts the check nor kills the fullwidth-row control; "
     "(pr4-sha-ast, #6697, #6940) an ast pin of the five whole env_sha(env, KEY) read statements of resolve_range, "
     "the bindings and mutations of env in resolve_range and run_gate, env_sha and ENV_SHA_RE; (pr4-sha-ast-mutants, #6940) "
     "the pin rejects a conditional bypass at a read site, an env rebound in resolve_range and a stripped env passed from run_gate."
