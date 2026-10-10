@@ -1169,6 +1169,16 @@ jobs:
           done
           echo "::notice::[#3539] passphrase env scrubbed for this job (AI_MEMORY_NO_CONFIG kept)"
 
+      # #6795 — per-runner load gate. The 7800 s shard budgets were derived on an
+      # idle host; on f1 at load ~100 the single-threaded serial shard ran 5-6x
+      # slower and was killed by the #1492 watchdog. Wait (bounded, default 20
+      # min) while the 1-minute load average exceeds 1.5 x cores, print the
+      # measured load, then proceed. The helper NEVER fails on load alone.
+      # Self-hosted legs only: hosted runners are dedicated VMs.
+      - name: Load gate (#6795)
+        if: needs.classify.outputs.docs_only != 'true' && contains(matrix.runner, 'self-hosted')
+        run: python3 scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
+
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.docs_only != 'true'
         env:
@@ -1184,9 +1194,13 @@ jobs:
           TEST_IMPACT_REASON: ${{ needs.classify.outputs.test_impact_reason }}
           TEST_IMPACT_COUNT: ${{ needs.classify.outputs.test_impact_count }}
           TEST_IMPACT_TOTAL: ${{ needs.classify.outputs.test_impact_total }}
+          # #6795 — the job cap (minutes) the serial shard budget is derived from.
+          JOB_TIMEOUT_MIN: ${{ matrix.timeout }}
         shell: bash
         run: |
           set -euo pipefail
+          # #6795 — step start, for the serial shard's remaining-job-budget maths.
+          STEP_T0=$(date +%s)
           # v1.0.0 2x2 — tier-parametrised feature/thread selection. The
           # `enterprise-fed` legs add `--features sal-postgres` and serialise
           # DDL with `-- --test-threads=1` (the sal-postgres suite shares one
@@ -1448,8 +1462,10 @@ jobs:
           # (7800 s on this tier; derivation at the WATCHDOG_SECS assignment).
           # Every shard has its own log and PID; each PID is waited on
           # separately and the step fails if ANY shard failed.
+          # SHARD_BUDGET is set per shard by run_shard (#6795): WATCHDOG_SECS for
+          # the parallel shards, SERIAL_BUDGET_SECS for the serial one.
           shard_left() {
-            echo $(( WATCHDOG_SECS - ($(date +%s) - $1) ))
+            echo $(( SHARD_BUDGET - ($(date +%s) - $1) ))
           }
           run_doc_tests() {
             local label="$1"; shift
@@ -1477,6 +1493,13 @@ jobs:
             local -a itargs libargs
             itargs=(); libargs=()
             t0=$(date +%s)
+            # #6795: the serial shard cannot be split further, so it gets the
+            # whole remaining job budget; the parallel shards keep 7800 s.
+            if [ "$name" = serial ]; then
+              SHARD_BUDGET="$SERIAL_BUDGET_SECS"
+            else
+              SHARD_BUDGET="$WATCHDOG_SECS"
+            fi
             while IFS= read -r l; do
               [ -n "$l" ] || continue
               if [ "$l" = "--lib" ]; then
@@ -1503,7 +1526,7 @@ jobs:
               fi
               remaining=$(shard_left "$t0")
               if [ "$remaining" -lt 60 ]; then
-                echo "::error::[#6344 shard] ${name}: ${WATCHDOG_SECS}s shard budget exhausted before the lib run"
+                echo "::error::[#6344 shard] ${name}: ${SHARD_BUDGET}s shard budget exhausted before the lib run"
                 return 124
               fi
               WATCHDOG_SECS="$remaining" run_tests "[${name}] lib unittests" $FEAT --lib -- --test-threads="$threads" ${libargs[@]+"${libargs[@]}"} || rc=$?
@@ -1511,7 +1534,7 @@ jobs:
             if [ "$n_it" -gt 0 ]; then
               remaining=$(shard_left "$t0")
               if [ "$remaining" -lt 60 ]; then
-                echo "::error::[#6344 shard] ${name}: ${WATCHDOG_SECS}s shard budget exhausted before the binaries run"
+                echo "::error::[#6344 shard] ${name}: ${SHARD_BUDGET}s shard budget exhausted before the binaries run"
                 return 124
               fi
               WATCHDOG_SECS="$remaining" run_tests "[${name}] test binaries" $FEAT "${itargs[@]}" -- --test-threads="$threads" || rc=$?
@@ -1519,7 +1542,7 @@ jobs:
             if [ "$with_doc" = "1" ]; then
               remaining=$(shard_left "$t0")
               if [ "$remaining" -lt 60 ]; then
-                echo "::error::[#6344 shard] ${name}: ${WATCHDOG_SECS}s shard budget exhausted before the doc tests"
+                echo "::error::[#6344 shard] ${name}: ${SHARD_BUDGET}s shard budget exhausted before the doc tests"
                 return 124
               fi
               WATCHDOG_SECS="$remaining" run_doc_tests "[${name}] doc tests" $FEAT -- --test-threads="$threads" || rc=$?
@@ -1535,6 +1558,13 @@ jobs:
             echo "::notice::[#6344] '${label}': compile once, partition, then run serial + 2 parallel shards"
             cargo test --no-run --message-format=json-render-diagnostics $FEAT "$@" > "$sd/build.jsonl" || return "$?"
             python3 scripts/ci/partition_test_binaries.py --build-json "$sd/build.jsonl" --repo-root . --out-dir "$sd" --with-doc "$with_doc" || return "$?"
+            # #6795: serial shard budget = job cap - time spent in this step so
+            # far (compile + partition) - 300 s safety - 600 s allowance for the
+            # steps before this one (checkout, database setup). Parallel shards
+            # keep the flat WATCHDOG_SECS (7800 s).
+            SERIAL_BUDGET_SECS=$(( JOB_TIMEOUT_MIN * 60 - ($(date +%s) - STEP_T0) - 300 - 600 ))
+            if [ "$SERIAL_BUDGET_SECS" -lt 60 ]; then SERIAL_BUDGET_SECS=60; fi
+            echo "::notice::[#6795] serial shard budget ${SERIAL_BUDGET_SECS}s (job cap ${JOB_TIMEOUT_MIN} min - compile/partition $(( $(date +%s) - STEP_T0 ))s - 900s safety); parallel shards ${WATCHDOG_SECS}s"
             ( run_shard serial "$sd" 1 pg "$with_doc" ) > "$sd/serial.log" 2>&1 &
             pid_s=$!
             ( run_shard parallel_1 "$sd" 3 skip 0 ) > "$sd/parallel_1.log" 2>&1 &

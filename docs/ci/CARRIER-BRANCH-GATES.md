@@ -121,3 +121,27 @@ weights, and re-derive the budget (the 20 % rule: raise it when a shard comes
 within 20 % of the watchdog; lower it toward 1.4x the measured longest shard
 once the figure is known). These numbers are pinned by
 `scripts/ci/tests/test_ci_shard_wiring_6344.py`.
+
+### Load gate, serial-shard budget and cargo cap (#6795)
+
+The 7800 s budget was measured on an idle host. On f1 at load ~100 (run
+38015742119) the single-threaded serial shard ran 5-6x slower and the #1492
+watchdog killed it, while `parallel_1` and `parallel_2` passed.
+
+- **Load gate.** The `Load gate (#6795)` step runs immediately before `Run tests
+  (impact-aware)` on the self-hosted legs only (`contains(matrix.runner,
+  'self-hosted')`). `scripts/ci/load_gate.py` waits while the 1-minute load
+  average exceeds 1.5 x cores (`--max-ratio`), for at most 1200 s
+  (`--max-wait-secs`), polling every 30 s, and prints the measured load in a
+  `::notice::`. It never fails on load alone: after the wait it warns and
+  proceeds. Unit tests: `scripts/ci/tests/test_load_gate_6795.py`.
+- **Serial shard budget.** The serial shard is the only shard that cannot be
+  split further, so `SERIAL_BUDGET_SECS` = job `timeout-minutes` x 60 - seconds
+  spent in the step before the shards start (compile and partition) - 300 s
+  safety - 600 s allowance for the earlier steps (floor 60 s). `parallel_1` and
+  `parallel_2` keep `WATCHDOG_SECS` = 7800 s. The value is printed in a
+  `[#6795] serial shard budget` notice. Pinned by
+  `scripts/ci/tests/test_ci_load_gate_wiring_6795.py`.
+- **Operational cap.** Run at most 2 concurrent cargo lanes per host (f1 had 9
+  cargo / 17 rustc processes during the failing run). This is a fleet rule for
+  Modules, not enforced by the workflow.
