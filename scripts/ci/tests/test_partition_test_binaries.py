@@ -180,7 +180,7 @@ class PartitionTests(Base):
         halves = [{e.name for e in h1}, {e.name for e in h2}]
         homes = [i for i, h in enumerate(halves) if {'p1', 'p2', 'p3'} & h]
         self.assertEqual(len(homes), 1)
-        self.assertTrue({'p1', 'p2', 'p3'} <= halves[homes[0]])
+        self.assertLessEqual({'p1', 'p2', 'p3'}, halves[homes[0]])
 
     def test_unmeasured_uses_class_mean(self):
         exes = self.build({'b1': '', 'new_b': '', 'a1': 'PgPool', 'new_a': '#[serial]'})

@@ -205,6 +205,7 @@ class ComparisonTests(unittest.TestCase):
                                   ('info/grafts', self.base + '\n')):
             with self.subTest(kind=relative):
                 path = self.repo / '.git' / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(payload)
                 try:
                     with self.assertRaises(RuntimeError):
