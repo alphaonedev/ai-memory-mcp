@@ -1662,7 +1662,7 @@ def test_env_and_verify_share_one_path_check_6690(
     assert seen == [(str(tmp_path / "absent.pem"), "file")]
 
 
-# ---- #6692: the component walk, not a lexical normalisation ---------------
+# ---- #6692 / #6656: the component walk, not a lexical normalisation --------
 
 
 def _built(client_cls: type, verify: Any) -> None:
@@ -1705,3 +1705,14 @@ def test_missing_component_before_a_shared_link_is_refused_6692(
     shared.chmod(0o777)
     with pytest.raises(ValueError):
         _built(client_cls, str(directory / "missing" / ".." / "shared777" / "link.pem"))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_dotdot_after_an_existing_component_steps_back_one_level_6656(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type
+) -> None:
+    directory = _ca_dir(tmp_path)
+    _bundle(lab, directory)
+    _ca_dir(directory, "sub")
+    _built(client_cls, str(directory / "sub" / ".." / "ca.pem"))
