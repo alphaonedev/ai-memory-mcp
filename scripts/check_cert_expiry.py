@@ -3054,6 +3054,7 @@ def _trusted_cells(tmp, t, sentence):  # noqa: C901 - one linear corpus
     _trusted_round3_fetch_cells(tmp, t, fx, mirror, head8, good8)
     _shim_trace_cells(t)
     _ws_unit_cells(t)
+    _ws_format_cells(t)
     _ws_wording_cells(t)
 
 
@@ -3450,6 +3451,30 @@ def _ws_unit_cells(t):
     for ok in (" ", "\t"):
         if _whitespace_findings(".github/workflows/u.yml", f"name: u\n# a{ok}b\n"):
             t.fail(f"(tr-s-ws-yaml): {ok!r} is YAML whitespace and must not be refused")
+
+
+def _ws_format_cell(t, label, text, needles, absent=()):
+    """One refusal message of _whitespace_findings for TEXT: exactly one
+    finding that carries every needle and none of the absent strings."""
+    found = _whitespace_findings(".github/workflows/u.yml", text)
+    if len(found) != 1:
+        t.fail(f"({label}): expected exactly one whitespace finding, got {found!r}")
+        return
+    for needle in needles:
+        if needle not in found[0]:
+            t.fail(f"({label}): the refusal does not say {needle!r}: {found[0]!r}")
+    for needle in absent:
+        if needle in found[0]:
+            t.fail(f"({label}): the refusal must not say {needle!r}: {found[0]!r}")
+
+
+def _ws_format_cells(t):
+    """#6556 message format, pinned on direct calls of _whitespace_findings
+    (#6760 one line with two refused characters, #6761 repeated code points,
+    #6762 the eight-item boundary, #6763 lines are counted, not code points)."""
+    # #6760: one line, two refused characters -> one line number, not one per character.
+    _ws_format_cell(t, "tr-s-ws-oneline", "name: u\n# a\u00a0b\u3000c\n",
+                    ("line 2 (1 in this file)", "(U+00A0, U+3000)"), absent=("lines ",))
 
 
 def _ws_wording_cells(t):
