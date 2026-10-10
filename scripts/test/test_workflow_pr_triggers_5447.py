@@ -5040,5 +5040,50 @@ class RelayedTextSanitiser6394(unittest.TestCase):
         self.assertEqual(300, text.count("Z"), text[:200])
         self.assertNotIn("second line", text)
 
+
+
+class ApprovalFailClosedGuards6395(unittest.TestCase):
+    """An empty operator login, a hung gh and a boolean PR number each fail closed with their own reason."""
+
+    def setUp(self) -> None:
+        self.mod = _load_approval()
+
+    def test_6395_empty_operator_login_is_named(self) -> None:
+        for operator in ("", None):
+            with self.subTest(operator=operator):
+                api = _fake_api([_pr(1, SHA_A)], {1: [_review(SHA_A, login="")]})
+                rc, lines = self.mod.run_gate("push", {}, REPO_6117, SHA_A, operator, api)
+                self.assertEqual(1, rc, lines)
+                self.assertIn("no operator login configured", "\n".join(lines))
+                self.assertEqual([], api.calls)  # refused before any API call
+
+    def test_6395_gh_runs_with_a_120_second_timeout_and_a_hang_fails_closed(self) -> None:
+        seen: List[dict] = []
+
+        def hung_run(*args, **kwargs):
+            seen.append(kwargs)
+            raise subprocess.TimeoutExpired(cmd=args[0] if args else "gh", timeout=kwargs.get("timeout"))
+        with unittest.mock.patch.object(self.mod.subprocess, "run", hung_run):
+            with self.assertRaises(self.mod.GateError):
+                self.mod.gh_api("repos/o/r/pulls?state=open")
+            rc, lines = self.mod.run_gate("push", {}, REPO_6117, SHA_A, OPERATOR_6117, self.mod.gh_api)
+        self.assertEqual(1, rc, lines)
+        self.assertTrue(seen)
+        self.assertEqual([120] * len(seen), [kw.get("timeout") for kw in seen])
+
+    def test_6395_boolean_pr_number_fails_closed(self) -> None:
+        pr = _pr(1, SHA_A)
+        pr["number"] = True
+
+        def api(path: str):
+            if "/reviews" in path:
+                return [_review(SHA_A)]
+            return [pr]
+        for event_name, event in (("push", {}), ("pull_request", {"pull_request": pr})):
+            with self.subTest(event=event_name):
+                rc, lines = self.mod.run_gate(event_name, event, REPO_6117, SHA_A, OPERATOR_6117, api)
+                self.assertEqual(1, rc, lines)
+                self.assertIn("no valid number", "\n".join(lines))
+
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False, verbosity=1).result.wasSuccessful() else 1)
