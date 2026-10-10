@@ -505,6 +505,18 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             with self.subTest(shape=label):
                 self.assert_url_refused(url, ("percent-encoded",))
 
+    def test_percent_encoded_nul_anywhere_is_refused(self):
+        # libpq: 'forbidden value %00 in percent-encoded value' in every URI component.
+        host = "127.0.0.1:5445/cidb"
+        for label, url in (
+            ("user", f"postgres://ci%00user:{PW_MARKER}@{host}"),
+            ("host", f"postgres://ciuser:{PW_MARKER}@127.0.0.1%00:5445/cidb"),
+            ("path", f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/ci%00db"),
+            ("kept value", f"postgres://ciuser:{PW_MARKER}@{host}?options=a%00b"),
+        ):
+            with self.subTest(shape=label):
+                self.assert_url_refused(url, ("%00",))
+
     def test_raw_space_is_refused(self):
         # libpq: 'unexpected spaces found ... use percent-encoded spaces (%20)'.
         host = "127.0.0.1:5445/cidb"
