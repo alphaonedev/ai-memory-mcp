@@ -1968,6 +1968,34 @@ def _self_test_cases() -> int:
     else:
         print("PASS: self-test - the #6575, #6609 and #6573 fixtures are built inside guarded() (#6744)")
 
+    # #6818: the #6744 pin reads this file's syntax tree, so a fault there (a missing file, a changed layout) used to
+    # abort the whole run at this point and hide every later cell. The pin must therefore never be called directly in
+    # the body of _self_test_cases: it runs only inside guarded(), where a fault is its named FAIL.
+    def pin_call_guarded_cell():
+        tree = ast.parse(Path(__file__).resolve().read_text(encoding="utf-8"))
+        outer = next(node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+                     and node.name == "_self_test_cases")
+        direct = []
+
+        def visit(node):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.Lambda)):
+                    continue
+                if (isinstance(child, ast.Call) and isinstance(child.func, ast.Name)
+                        and child.func.id == "fixtures_guarded_cell"):
+                    direct.append(child.lineno)
+                visit(child)
+
+        visit(outer)
+        if direct:
+            failures.append("the #6744 pin is called outside guarded")
+            print(f"FAIL: self-test - the #6744 pin is called directly at line(s) {direct!r} of _self_test_cases, "
+                  "outside guarded() (#6818)", file=sys.stderr)
+        else:
+            print("PASS: self-test - the #6744 pin runs only inside guarded() (#6818)")
+
+    guarded("the #6744 pin is never called outside guarded() (#6818) fixture", pin_call_guarded_cell)
+
     # #5180: the COUNT CHANGED branch uses the same dynamic fence as the rule branch; no other census diff carries
     # a backtick run, so a static fence there was never caught.
     work, _, _ = fresh_pair("countfence")
