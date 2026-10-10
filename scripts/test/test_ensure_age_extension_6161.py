@@ -102,6 +102,17 @@ sys.stdout.write("{out}")
 sys.exit({code})
 """
 
+# Fake psql that closes its output pipes, SIGKILLs its parent (the supervisor) and keeps running (#6642).
+PARENT_KILLING_PSQL = """#!{py}
+import os, signal, time
+with open({base!r} + "/sleep.pid", "w") as fh:
+    fh.write(str(os.getpid()))
+os.close(1)
+os.close(2)
+os.kill(os.getppid(), signal.SIGKILL)
+time.sleep(120)
+"""
+
 # Signals the helper does not turn into an interrupt: default-ignored (CHLD, URG, WINCH, INFO, CONT),
 # job control (TSTP, TTIN, TTOU), PIPE (Python ignores it), the synchronous faults (SEGV, BUS, ILL, FPE) and the
 # two nothing can catch (KILL, STOP).  Every other signal valid on this platform must end in `interrupted` (#6504).
@@ -1121,6 +1132,26 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                 r = self.run_script()
                 self.assert_fails(r, 1, message)
                 self.assertEqual(self.install_snapshot(), before, "a failed probe must never trigger a restore")
+
+    def test_psql_that_outlives_a_killed_supervisor_with_closed_pipes_is_killed_6642(self):
+        # psql closes its output pipes and the supervisor is SIGKILLed: communicate() returns (EOF, supervisor
+        # reaped), wait_for_probe never sees a live dead-supervisor slice, and only the returncode < 0 group kill
+        # stops psql, which still holds PGPASSWORD (#6642 R03).
+        write_exe(self.psql, PARENT_KILLING_PSQL.format(py=sys.executable, base=str(self.base)))
+        self.install_good()
+        r = self.run_script()
+        self.assertTrue((self.base / "sleep.pid").exists(), r.stdout + r.stderr)
+        child = int((self.base / "sleep.pid").read_text())
+        self.addCleanup(self.kill_quietly, child)
+        self.assert_fails(r, 1, "age probe failed: psql exited -9")
+        self.assert_gone_within(child, 3, "the supervisor was SIGKILLed after psql closed its pipes")
+
+    @staticmethod
+    def kill_quietly(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
 
     def install_snapshot(self):
         """Install the good files once and return their (inode, mtime_ns, bytes): a restore replaces the inode."""
