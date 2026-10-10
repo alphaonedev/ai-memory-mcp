@@ -92,6 +92,7 @@ import html
 import io
 import os
 import re
+import shutil
 import stat
 import string
 import subprocess
@@ -1357,6 +1358,93 @@ def r12_timed_cells(base, expect):
             % (name, want, "" if needle is None else " naming %r" % needle, proc.returncode, proc.stderr[-300:]),
         )
 
+
+# #6753, #6757: markup after a name fragment is tracked from its opener to its close across the
+# whole paragraph (up to the next blank line), however many lines it spans; a construct that does
+# not close within the paragraph and the JOIN_WINDOW cap is unresolved.
+R13_FRAG1 = "docs/compliance/A.md:c:1\n"
+R13_JOIN_OLD = "joins into script name `check-old.sh`"
+R13_CELLS = (
+    # Code review round 12 fixtures (#6753).
+    ("J1-comment-3line-gt", "Conditions (c<!-- x > y\nz\n-->heck-old.sh) apply.\n", R13_FRAG1, 1, R13_JOIN_OLD),
+    ("J1d-comment-4line-gt", "Conditions (c<!-- x > y\nz\nw\n-->heck-old.sh) apply.\n", R13_FRAG1, 1, R13_JOIN_OLD),
+    ("J2-tag-attr-3line", 'Conditions (c<span title="a>b"\nclass="x"\n>heck-old.sh</span>) apply.\n', R13_FRAG1, 1,
+     R13_JOIN_OLD),
+    ("J3-link-title-3line", 'Conditions [c](x "a)\nb\n")heck-old.sh apply.\n', R13_FRAG1, 1, R13_JOIN_OLD),
+    # Security review round 12 documents (#6757).
+    ("S1-3line-comment", "Intro text.\n\nRun c<!-- note\nx > y\n-->heck-gone.sh now.\n", R13_FRAG1, 1, R12_JOIN),
+    ("S2-3line-tag", 'Intro text.\n\nRun c<span title="a\nb>c\nd"></span>heck-gone.sh now.\n', R13_FRAG1, 1, R12_JOIN),
+    ("S3-3line-comment-check", "Intro text.\n\nRun check<!-- a\nb > c\n-->-gone.sh now.\n",
+     "docs/compliance/A.md:check:1\n", 1, R12_JOIN),
+    ("T1-3line-html-block", "Intro text.\n\n<div>c<!-- n\nx > y\n-->heck-gone.sh</div>\n", R13_FRAG1, 1, R12_JOIN),
+    ("T2-3line-in-list", "Intro text.\n\n- item c<!-- n\n  x > y\n  -->heck-gone.sh now\n", R13_FRAG1, 1, R12_JOIN),
+    ("T8-3line-upper-C", "Intro text.\n\nRun C<!-- n\nx > y\n-->HECK-GONE.SH now.\n", "docs/compliance/A.md:C:1\n", 1,
+     "joins into script name `CHECK-GONE.SH`"),
+    ("T9-3line-check_agent", "Intro text.\n\nRun check_agent<!-- n\nx > y\n-->_action.sh now.\n",
+     "docs/compliance/A.md:check_agent:1\n", 1, "joins into script name `check_agent_action.sh`"),
+    ("T10-3line-ref-gt", "Intro text.\n\nRun c<!-- n\nx &gt; y > z\n-->heck-gone.sh now.\n", R13_FRAG1, 1, R12_JOIN),
+    # A 3-line comment whose middle line holds '>'.
+    ("P-3line-mid-gt", "Run c<!-- a\nx > y\n-->heck-gone.sh now.\n", R13_FRAG1, 1, R12_JOIN),
+    # A construct that never closes within its paragraph is unresolved, also inside an HTML block
+    # that GitHub continues past the blank line (it renders "Run check-gone.sh").
+    ("P-never-closes", "Run c<!-- a > b\nz\n\n-->heck-gone.sh now.\n", R13_FRAG1, 1, R12_UNRESOLVED),
+    ("P-never-closes-pre", "<pre>Run c<!-- a > b\n\n-->heck-gone.sh</pre>\n", R13_FRAG1, 1, R12_UNRESOLVED),
+    ("P-never-closes-attr-pre", '<pre>Run c<span title="a>b\n\nz">heck-gone.sh</span></pre>\n', R13_FRAG1, 1,
+     R12_UNRESOLVED),
+    # A construct that closes exactly at the paragraph end: the join on its last line is red, and
+    # with nothing after the close the next paragraph is not joined (green).
+    ("P-closes-at-end-join", "Run c<!-- a > b\nz\n-->heck-gone.sh\n\nNext.\n", R13_FRAG1, 1, R12_JOIN),
+    ("P-closes-at-end", "Run c<!-- a > b\nz\n-->\n\nheck-gone.sh now.\n", R13_FRAG1, 0, None),
+    ("P-3line-control", "Run c<!-- a > b\nz\n-->x now.\n", R13_FRAG1, 0, None),
+    # The JOIN_WINDOW cap fails closed: an opener whose close lies past the cap is unresolved.
+    ("P-cap-paren", "Run c(x " + "y" * 600 + ")\n", R13_FRAG1, 1, R12_UNRESOLVED),
+    ("P-cap-tag", 'Run c<b title="' + "y" * 600 + '"> end.\n', R13_FRAG1, 1, R12_UNRESOLVED),
+    ("P-cap-tag-gt", 'Run c<b title="x>' + "y" * 600 + '">heck-gone.sh\n', R13_FRAG1, 1, R12_UNRESOLVED),
+)
+
+# #6753, #6757: in-place edits of the real tree (a copy of docs/compliance and scripts next to the
+# gate, allowlist unchanged) that join an allowlisted fragment into a script name across a
+# construct spanning three lines. (name, document, anchor found exactly once, replacement).
+R13_PLAN = "docs/compliance/_inventory/v0.7.x-code-changes-test-plan.md"
+R13_ENT = "docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
+R13_TREE_EDITS = (
+    ("T1-testplan-comment", R13_PLAN, "recommendation (c) —",
+     "recommendation (c<!-- x > y\nz\n-->heck-cert-expiry.sh) —"),
+    ("T3-testplan-linktitle", R13_PLAN, "recommendation (c) —",
+     'recommendation [c](x "a)\nb\n")heck-cert-expiry.sh —'),
+    ("ENT-c-3line-comment", R13_ENT, "never a row. (c) **NOT", "never a row. (c<!-- n\n  y > z\n  -->heck-gone.sh) **NOT"),
+    ("ENT-C-3line-blockquote", R13_ENT, "and predicate (C) fails",
+     "and predicate (C<!-- n\n> y > z\n> -->HECK-GONE.SH) fails"),
+)
+
+
+def r13_tree_cells(base, expect, skipped):
+    """Copy the real docs/compliance and scripts next to the gate; each R13_TREE_EDITS edit is red (exit 1, a join)."""
+    repo = Path(__file__).resolve().parent.parent
+    if not (repo / "docs" / "compliance").is_dir():
+        skipped.append("R13 real-tree cells (no docs/compliance next to %s)" % Path(__file__).name)
+        return
+    shutil.copytree(str(repo / "docs" / "compliance"), str(base / "docs" / "compliance"), symlinks=True)
+    shutil.copytree(str(repo / "scripts"), str(base / "scripts"), symlinks=True)
+    rc, err = run_main(base)
+    expect(rc == 0, "R13-tree-control: the copied tree must be green, got %r (stderr=%r)" % (rc, err[-300:]))
+    for name, rel, anchor, edit in R13_TREE_EDITS:
+        path = base / rel
+        original = path.read_text(encoding="utf-8")
+        if original.count(anchor) != 1:
+            expect(False, "R13-tree-%s: anchor %r found %d times in %s" % (name, anchor, original.count(anchor), rel))
+            continue
+        path.write_text(original.replace(anchor, edit), encoding="utf-8")
+        try:
+            rc, err = run_main(base)
+        finally:
+            path.write_text(original, encoding="utf-8")
+        expect(
+            rc == 1 and "joins into script name" in err and "Traceback" not in err,
+            "R13-tree-%s: expected exit 1 naming a join, got %r (stderr=%r)" % (name, rc, err[-300:]),
+        )
+
+
 # The round-10 evidence cells (round10-secrev results-linux.json FAIL-OPEN at tip or base, the MANUAL
 # erratum cells E1-E8, and the code-review probe_ws / probe_paren2 cells): each must exit 1.
 R11_FIXTURES = (
@@ -1554,6 +1642,12 @@ def self_test():
         timed = root / "r12-timed"
         timed.mkdir()
         r12_timed_cells(timed, expect)
+        cells13 = root / "r13"
+        cells13.mkdir()
+        r11_cells(cells13, R13_CELLS, expect, "R13")
+        tree13 = root / "r13-tree"
+        tree13.mkdir()
+        r13_tree_cells(tree13, expect, skipped)
         # Every cell the round-10 evidence found fail-open (any tip or base) is red (design B, item 7).
         fixtures = root / "r11-fixtures"
         fixtures.mkdir()
