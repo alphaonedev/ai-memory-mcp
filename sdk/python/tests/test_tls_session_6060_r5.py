@@ -1660,3 +1660,48 @@ def test_env_and_verify_share_one_path_check_6690(
     with pytest.raises(ValueError, match="SSL_CERT_FILE"):
         AiMemoryClient(base_url=_ORIGIN, verify=None)
     assert seen == [(str(tmp_path / "absent.pem"), "file")]
+
+
+# ---- #6692: the component walk, not a lexical normalisation ---------------
+
+
+def _built(client_cls: type, verify: Any) -> None:
+    """Construct (and close) one client; raises what construction raises."""
+    client = client_cls(base_url=_ORIGIN, verify=verify)
+    if client_cls is AsyncAiMemoryClient:
+        asyncio.run(client.aclose())
+    else:
+        client.close()
+
+
+def _bundle(lab: Lab, directory: pathlib.Path, name: str = "ca.pem") -> pathlib.Path:
+    bundle = directory / name
+    shutil.copy(lab.ca_path, bundle)
+    bundle.chmod(0o644)
+    return bundle
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_missing_component_before_dotdot_is_refused_6692(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type
+) -> None:
+    """``dir/missing/../ca.pem`` is ENOENT to the kernel; it is never read as ``dir/ca.pem``."""
+    directory = _ca_dir(tmp_path)
+    _bundle(lab, directory)
+    with pytest.raises(ValueError, match="not an existing"):
+        _built(client_cls, str(directory / "missing" / ".." / "ca.pem"))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_missing_component_before_a_shared_link_is_refused_6692(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type
+) -> None:
+    directory = _ca_dir(tmp_path)
+    bundle = _bundle(lab, directory)
+    shared = _ca_dir(tmp_path / "ca", "shared777", 0o755)
+    (shared / "link.pem").symlink_to(bundle)
+    shared.chmod(0o777)
+    with pytest.raises(ValueError):
+        _built(client_cls, str(directory / "missing" / ".." / "shared777" / "link.pem"))
