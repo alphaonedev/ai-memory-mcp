@@ -33,7 +33,7 @@ use crate::models::field_names;
 
 // #3659 — delivery-audit bookkeeping evidence (counters, /metrics, /health).
 pub mod audit_status;
-mod dns_guard;
+pub(crate) mod dns_guard;
 #[cfg(test)]
 mod dns_guard_4075_tests;
 #[cfg(test)]
@@ -1996,15 +1996,6 @@ pub(crate) fn authority_without_userinfo(rest: &str) -> &str {
         .map_or(authority, |at| &authority[at + 1..])
 }
 
-/// #3822 — append the default HTTP port (`:80`) to a bracket/colon-normalized
-/// `host_port` that omits one, so `ToSocketAddrs` resolves it. Single home of
-/// the `host:80` default-port literal, shared by the webhook SSRF lane
-/// (`validate_url_dns_with`) and the egress inference lane (`egress::host_of`
-/// via the #3744 one-helper rule).
-pub(crate) fn host_port_with_default_http_port(host_port: &str) -> String {
-    format!("{host_port}:80")
-}
-
 pub(crate) fn validate_url_dns_resolved(
     url: &str,
     allow_loopback: bool,
@@ -2063,7 +2054,7 @@ fn validate_url_dns_with(
     let shown = crate::url_display::url_origin(url);
     let url_display = shown.as_str();
     let lower = url.to_ascii_lowercase();
-    let (_scheme, rest) = lower
+    let (scheme, rest) = lower
         .split_once("://")
         .ok_or_else(|| ForbiddenAddress(format!("webhook URL missing scheme: {url_display}")))?;
     // #3744 — userinfo is stripped BEFORE any host extraction, the same
@@ -2093,8 +2084,10 @@ fn validate_url_dns_with(
     // with no trailing ":N") was previously passed to ToSocketAddrs as-is,
     // which errors with "invalid port value" — and the catch-all `Err(_) =>
     // return Ok(())` below treated that as a DNS hiccup, silently bypassing
-    // the SSRF guard. Detect the no-trailing-port form and append `:80` so
-    // resolution succeeds and the IP is checked.
+    // the SSRF guard. Detect the no-trailing-port form and append the
+    // SCHEME's default port (#4075: 443 for https, the port the connector
+    // keeps from the pinned override) so resolution succeeds and the IP is
+    // checked.
     let resolv_target =
         if let Some(close_idx) = host_port.strip_prefix('[').and(host_port.find(']')) {
             let after_bracket = &host_port[close_idx + 1..];
@@ -2103,13 +2096,13 @@ fn validate_url_dns_with(
                 host_port.to_string()
             } else {
                 // [ipv6] without port — append default
-                host_port_with_default_http_port(host_port)
+                dns_guard::host_port_with_default_port(host_port, scheme)
             }
         } else if host_port.contains(':') {
             // IPv4:port or hostname:port — use as-is
             host_port.to_string()
         } else {
-            host_port_with_default_http_port(host_port)
+            dns_guard::host_port_with_default_port(host_port, scheme)
         };
     // v0.7.0 #1053 (Agent-2 #3) — fail-CLOSED on DNS resolution
     // failure. Pre-#1053 a SERVFAIL / timeout / hang at the daemon's
