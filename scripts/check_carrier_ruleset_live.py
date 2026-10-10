@@ -2018,7 +2018,8 @@ def self_test():
     for label, row in (
             ("round12 #6881: a flag value in a separator-less refusal row", "--password " + r11_tail),
             ("round12 #6881: a flag value before the first separator of a refusal row",
-             "tool --password " + r11_tail + " | x=1")):
+             "tool --password " + r11_tail + " | x=1"),
+            ("#6948: URL userinfo before the first = of a refusal row", "user:" + r11_tail + "@host=1")):
         check(label, lambda r=row: (
             "workflow_pin_problems is empty" if not workflow_pin_problems(r10_env(r))
             else None if not any(r11_tail in p for p in workflow_pin_problems(r10_env(r)))

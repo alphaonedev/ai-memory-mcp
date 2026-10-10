@@ -618,7 +618,10 @@ class Round11EchoMask(unittest.TestCase):
     def test_a_row_reprints_no_value_text_before_its_separator_6881(self):
         """Text before the first separator, or in a row with none, is value text unless it is one key word."""
         for row in ("--password " + self.TAIL, "tool --password " + self.TAIL + " | x=1", "      " + self.TAIL,
-                    "curl -u user:" + self.TAIL, "my key: " + self.TAIL, "- two words " + self.TAIL):
+                    "curl -u user:" + self.TAIL, "my key: " + self.TAIL, "- two words " + self.TAIL,
+                    # #6948 #6950: the key word is [\w.-] only, so URL userinfo or a comma list is value text.
+                    "user:" + self.TAIL + "@host=1", "https://u:" + self.TAIL + "@h: x",
+                    "https://u:" + self.TAIL + "@h=1", "a,b," + self.TAIL + ": x"):
             self.assertNotIn(self.TAIL, SUBSET.echo(row), row)
         self.assertEqual(SUBSET.echo("      PASSWORD: hunter2"), repr("      PASSWORD: <withheld 7 chars>"))
         self.assertEqual(SUBSET.echo("  - name: q"), repr("  - name: <withheld 1 chars>"))
