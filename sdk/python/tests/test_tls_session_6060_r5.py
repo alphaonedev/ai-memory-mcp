@@ -18,8 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import os
 import pathlib
+import shutil
 import ssl
+import subprocess
 from collections.abc import Iterator
 from typing import Any, Callable
 
@@ -746,6 +749,159 @@ def test_session_without_secret_bits_is_refused_6305(
     with pytest.raises(ValueError, match="verify=False"):
         drive.new_request()("connection.start_tls.complete", {"return_value": stream})
     assert stream.closed
+
+
+# ---- #6377: a CA directory is read once, at construction, and not shared ---
+
+_POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+
+
+def _subject_hash(cert_path: pathlib.Path) -> str:
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("openssl is needed to hash a CA directory")
+    return subprocess.run(  # noqa: S603 - fixed argv
+        [openssl, "x509", "-hash", "-noout", "-in", str(cert_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+
+
+def _add_anchor(directory: pathlib.Path, cert_path: pathlib.Path) -> pathlib.Path:
+    entry = directory / f"{_subject_hash(cert_path)}.0"
+    shutil.copy(cert_path, entry)
+    entry.chmod(0o644)
+    return entry
+
+
+def _ca_dir(tmp_path: pathlib.Path, name: str = "ca", mode: int = 0o755) -> pathlib.Path:
+    directory = tmp_path / name
+    directory.mkdir()
+    directory.chmod(mode)
+    return directory
+
+
+def _get_once(client_cls: type, url: str, verify: Any) -> object:
+    """One GET on a fresh client: the status code, or the connect error type."""
+    try:
+        return _fetch(client_cls, url, verify)[0]
+    except httpx.ConnectError as exc:
+        return type(exc)
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_anchor_added_after_construction_is_not_trusted_6377(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    directory = _ca_dir(tmp_path)
+    if client_cls is AiMemoryClient:
+        with AiMemoryClient(base_url=origin.url, verify=str(directory), timeout=5) as client:
+            _add_anchor(directory, lab.ca_path)
+            with pytest.raises(httpx.ConnectError):
+                client._client.get("/x")  # noqa: SLF001
+    else:
+
+        async def run() -> None:
+            async with AsyncAiMemoryClient(
+                base_url=origin.url, verify=str(directory), timeout=5
+            ) as client:
+                _add_anchor(directory, lab.ca_path)
+                with pytest.raises(httpx.ConnectError):
+                    await client._client.get("/x")  # noqa: SLF001
+
+        asyncio.run(run())
+    assert origin.hits == []
+
+
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_anchor_present_at_construction_is_trusted_6377(
+    origin: RecordingServer,
+    lab: Lab,
+    tmp_path: pathlib.Path,
+    monkeypatch: pytest.MonkeyPatch,
+    client_cls: type,
+) -> None:
+    _clear_proxy_env(monkeypatch)
+    directory = _ca_dir(tmp_path)
+    _add_anchor(directory, lab.ca_path)
+    assert _get_once(client_cls, origin.url, str(directory)) == 200
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("mode", [0o775, 0o757, 0o777, 0o1777], ids=oct)
+def test_shared_writable_ca_directory_is_refused_6377(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type, mode: int
+) -> None:
+    directory = _ca_dir(tmp_path)
+    _add_anchor(directory, lab.ca_path)
+    directory.chmod(mode)
+    with pytest.raises(ValueError, match="writable") as refused:
+        client_cls(base_url=_ORIGIN, verify=str(directory))
+    assert str(directory) in str(refused.value)
+    assert oct(mode)[2:] in str(refused.value)  # names the mode, not the contents
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+@pytest.mark.parametrize("mode", [0o664, 0o646], ids=oct)
+def test_shared_writable_ca_file_is_refused_6377(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type, mode: int
+) -> None:
+    bundle = tmp_path / "bundle.pem"
+    shutil.copy(lab.ca_path, bundle)
+    bundle.chmod(mode)
+    with pytest.raises(ValueError, match="writable"):
+        client_cls(base_url=_ORIGIN, verify=str(bundle))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_shared_writable_anchor_behind_a_symlink_is_refused_6377(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type
+) -> None:
+    shared = _ca_dir(tmp_path, "shared", 0o755)
+    target = shared / "lab-ca.pem"
+    shutil.copy(lab.ca_path, target)
+    target.chmod(0o666)
+    directory = _ca_dir(tmp_path)
+    (directory / f"{_subject_hash(lab.ca_path)}.0").symlink_to(target)
+    with pytest.raises(ValueError, match="writable"):
+        client_cls(base_url=_ORIGIN, verify=str(directory))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_anchor_in_a_shared_writable_directory_is_refused_6377(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type
+) -> None:
+    # The file is 0644 but its directory lets others replace it.
+    shared = _ca_dir(tmp_path, "shared", 0o755)
+    target = shared / "lab-ca.pem"
+    shutil.copy(lab.ca_path, target)
+    target.chmod(0o644)
+    shared.chmod(0o777)
+    directory = _ca_dir(tmp_path)
+    (directory / f"{_subject_hash(lab.ca_path)}.0").symlink_to(target)
+    with pytest.raises(ValueError, match="writable"):
+        client_cls(base_url=_ORIGIN, verify=str(directory))
+
+
+@_POSIX_ONLY
+@pytest.mark.parametrize("client_cls", _CLIENTS)
+def test_fifo_entry_in_a_ca_directory_is_refused_without_blocking_6377(
+    lab: Lab, tmp_path: pathlib.Path, client_cls: type
+) -> None:
+    directory = _ca_dir(tmp_path)
+    os.mkfifo(directory / f"{_subject_hash(lab.ca_path)}.0", 0o644)
+    with pytest.raises(ValueError, match="regular file"):
+        client_cls(base_url=_ORIGIN, verify=str(directory))
 
 
 def test_lab_temp_root_is_project_local_6309(lab: Lab) -> None:
