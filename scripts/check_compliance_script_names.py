@@ -1522,6 +1522,14 @@ R13_CELLS = (
     ("ceiling-plus-one", "x" * (LINE_CEILING + 1) + "\n", "", 2, "line too long"),
 )
 
+# Round-13 review follow-ups: self-test cells that kill the surviving mutants of the join walk.
+R14_CELLS = (
+    # #6856: the rest of the paragraph is read in the fragment's own view, so a zero-width space or a
+    # soft hyphen on the third line of a comment still joins the name (a raw-view read would miss it).
+    ("J6856-3line-zero-width", "Run c<!-- a\nx > y\n-->h\u200beck-gone.sh now.\n", R13_FRAG1, 1, R12_JOIN),
+    ("J6856-3line-soft-hyphen", "Run c<!-- a\nx > y\n-->he\u00adck-gone.sh now.\n", R13_FRAG1, 1, R12_JOIN),
+)
+
 # #6753, #6757: in-place edits of the real tree (a copy of docs/compliance and scripts next to the
 # gate, allowlist unchanged) that join an allowlisted fragment into a script name across a
 # construct spanning three lines. (name, document, anchor found exactly once, replacement).
@@ -1768,6 +1776,9 @@ def self_test():
         cells13 = root / "r13"
         cells13.mkdir()
         r11_cells(cells13, R13_CELLS, expect, "R13")
+        cells14 = root / "r14"
+        cells14.mkdir()
+        r11_cells(cells14, R14_CELLS, expect, "R14")
         tree13 = root / "r13-tree"
         tree13.mkdir()
         r13_tree_cells(tree13, expect, skipped)
