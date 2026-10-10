@@ -497,9 +497,13 @@ mod tests {
     fn tests_source_without_the_6098_pin() -> String {
         const SOURCE: &str = include_str!("dsn.rs");
         let module = SOURCE.find("mod tests {").map_or("", |at| &SOURCE[at..]);
-        let pin = module
-            .find("fn secret_absence_messages_never_interpolate_the_fixture_6098")
-            .unwrap_or(module.len());
+        // Built at run time: a literal of the whole name here would be found
+        // first and cut this helper out instead of the pin.
+        let pin_fn = format!(
+            "fn {}",
+            "secret_absence_messages_never_interpolate_the_fixture_6098"
+        );
+        let pin = module.find(pin_fn.as_str()).unwrap_or(module.len());
         let tail = &module[pin..];
         let pin_end = tail
             .find("\n    }\n")
