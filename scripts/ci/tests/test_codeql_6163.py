@@ -10,7 +10,6 @@ import argparse
 import contextlib
 import importlib.util
 import io
-import json
 import os
 from pathlib import Path
 import shutil
@@ -18,8 +17,7 @@ import stat
 import sys
 import subprocess
 import tempfile
-import unittest
-from unittest import mock
+import unittest.mock
 
 ROOT = Path(__file__).resolve().parents[3]
 SCRATCH = ROOT / '.local-runs' / 'codeql-6163'
@@ -87,8 +85,8 @@ class ComparisonTests(unittest.TestCase):
             return compare(*args, index_pins=self.guard.fixture_index_pins())
 
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(self.compare, 'compare', side_effect=actual), \
-                mock.patch.object(self.compare.sys, 'flags', ISOLATED_FLAGS), \
+        with unittest.mock.patch.object(self.compare, 'compare', side_effect=actual), \
+                unittest.mock.patch.object(self.compare.sys, 'flags', ISOLATED_FLAGS), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             result = self.compare.run(args)
         return result, out.getvalue() + err.getvalue() + (self.work / 'summary').read_text(), head
@@ -127,8 +125,8 @@ class ComparisonTests(unittest.TestCase):
                                           repo=str(self.repo), base_sha=self.base, head_sha=self.base,
                                           summary=str(self.work / 'summary-error'), event=None)
                 out, err = io.StringIO(), io.StringIO()
-                with mock.patch.object(self.compare, 'compare', side_effect=exception), \
-                        mock.patch.object(self.compare.sys, 'flags', ISOLATED_FLAGS), \
+                with unittest.mock.patch.object(self.compare, 'compare', side_effect=exception), \
+                        unittest.mock.patch.object(self.compare.sys, 'flags', ISOLATED_FLAGS), \
                         contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
                     self.assertEqual(self.compare.run(args), 1)
                 self.assertNotIn(CANARY, out.getvalue() + err.getvalue() + Path(args.summary).read_text())
@@ -157,7 +155,7 @@ class ComparisonTests(unittest.TestCase):
             subprocess.run(['git', '-C', str(repo), 'fetch', '--quiet', str(self.repo),
                             base, head], check=True)
 
-        with mock.patch.object(self.compare, 'fetch_objects', side_effect=acquire):
+        with unittest.mock.patch.object(self.compare, 'fetch_objects', side_effect=acquire):
             with self.compare.isolated_objects(self.repo, self.event(), self.work / 'outside') as objects:
                 self.assertTrue(self.compare.git(objects, 'rev-parse', '--is-bare-repository').strip() == b'true')
                 self.assertNotIn(self.repo, objects.resolve().parents)
@@ -170,7 +168,7 @@ class ComparisonTests(unittest.TestCase):
     def test_w1_rejects_mismatch_and_inside_checkout_before_acquisition(self):
         for event, scratch in ((self.event('a' * 40), self.repo / 'nested'),
                                (dict(self.event(), number=True), self.work / 'outside')):
-            with mock.patch.object(self.compare, 'fetch_objects') as fetch:
+            with unittest.mock.patch.object(self.compare, 'fetch_objects') as fetch:
                 with self.assertRaises(RuntimeError):
                     with self.compare.isolated_objects(self.repo, event, scratch):
                         self.fail('invalid boundary accepted')
@@ -178,11 +176,103 @@ class ComparisonTests(unittest.TestCase):
 
     def test_w1_missing_objects_fail_closed_and_clean_up(self):
         outside = self.work / 'outside'
-        with mock.patch.object(self.compare, 'fetch_objects'):
+        with unittest.mock.patch.object(self.compare, 'fetch_objects'):
             with self.assertRaises(RuntimeError):
                 with self.compare.isolated_objects(self.repo, self.event(), outside):
                     self.fail('missing objects accepted')
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_git_reads_ignore_hostile_environment_and_global_config(self):
+        """Healthy Git objects remain readable under hostile ambient configuration."""
+        hostile = self.work / 'hostile.gitconfig'
+        hostile.write_text('[include]\npath = /nonexistent/6163\n[core]\nbare = true\n')
+        overrides = {'GIT_CONFIG_GLOBAL': str(hostile), 'GIT_DIR': '/nonexistent/6163',
+                     'GIT_OBJECT_DIRECTORY': '/nonexistent/6163', 'GIT_CONFIG_COUNT': '1',
+                     'GIT_CONFIG_KEY_0': 'core.bare', 'GIT_CONFIG_VALUE_0': 'true',
+                     'GIT_ALTERNATE_OBJECT_DIRECTORIES': '/nonexistent/6163'}
+        with unittest.mock.patch.dict(os.environ, overrides):
+            self.assertEqual(self.compare.git(self.repo, 'rev-parse', 'HEAD').strip(), self.base.encode())
+
+    def test_shallow_and_alternate_history_are_refused(self):
+        """No approval is accepted from a truncated or substituted comparison range."""
+        for relative, payload in (('shallow', self.base + '\n'), ('objects/info/alternates', '/missing\n'),
+                                  ('info/grafts', self.base + '\n')):
+            with self.subTest(kind=relative):
+                path = self.repo / '.git' / relative
+                path.write_text(payload)
+                try:
+                    with self.assertRaises(RuntimeError):
+                        self.compare.compare(self.base_root, self.repo, self.base, self.base,
+                                             self.work / 'data', self.guard.fixture_index_pins())
+                finally:
+                    path.unlink()
+
+    def test_event_endpoints_are_exact_commits_and_repositories(self):
+        """Malformed, stale and cross-repository events never start network acquisition."""
+        events = []
+        for field, value in (('sha', 'HEAD'), ('sha', self.base + '\n'), ('sha', 'f' * 40)):
+            event = self.event()
+            event['pull_request']['base'][field] = value
+            events.append(event)
+        event = self.event()
+        event['repository']['full_name'] = 'outside/repository'
+        events.append(event)
+        for event in events:
+            with unittest.mock.patch.object(self.compare, 'fetch_objects') as fetch:
+                with self.assertRaises(RuntimeError):
+                    with self.compare.isolated_objects(self.repo, event, self.work / 'outside'):
+                        self.fail('invalid event accepted')
+                fetch.assert_not_called()
+
+    def test_fetch_binds_pr_ref_to_event_sha_and_never_uses_checkout(self):
+        """A moved PR ref is refused even when fetching succeeds."""
+        for observed, accepted in ((self.base, True), ('f' * 40, False)):
+            with self.subTest(accepted=accepted):
+                calls = []
+
+                def git(repo, *args, **kwargs):
+                    calls.append((repo, args, kwargs))
+                    return (observed + '\n').encode() if args[0] == 'rev-parse' else b''
+
+                with unittest.mock.patch.object(self.compare, 'git', side_effect=git):
+                    if accepted:
+                        self.compare.fetch_objects(self.work, self.base, self.base, 6163)
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            self.compare.fetch_objects(self.work, self.base, self.base, 6163)
+                fetch = calls[0]
+                self.assertEqual(fetch[0], self.work)
+                self.assertEqual(fetch[1][0], 'fetch')
+                self.assertIn('https://github.com/alphaonedev/ai-memory-mcp.git', fetch[1])
+                self.assertIn('refs/pull/6163/head:refs/compare/head', fetch[1])
+                self.assertNotIn('--depth', fetch[1])
+
+    def test_structured_link_rejects_untrusted_paths_and_ranges(self):
+        """Healthy source links work; headings and negative or huge ranges cannot form metadata."""
+        self.assertIn('/CLAUDE.md#L1-L2', self.compare.review_location(self.base, 'CLAUDE.md', 1, 2))
+        for path, start, end in ((CANARY, 1, 2), ('CLAUDE.md', -1, 2), ('CLAUDE.md', 1, 10**10),
+                                 ('CLAUDE.md', True, 2)):
+            with self.assertRaises(RuntimeError):
+                self.compare.review_location(self.base, path, start, end)
+
+    def test_argument_error_never_echoes_unknown_argument(self):
+        """The CLI's earliest error path follows the same closed diagnostic contract."""
+        result = subprocess.run([sys.executable, '-I', str(ROOT / 'scripts/claude-md-rule-compare.py'),
+                                 '--' + CANARY], capture_output=True, text=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn(CANARY, result.stdout + result.stderr)
+
+    def test_selftest_failure_sink_with_healthy_control(self):
+        """Force the real case reporter down both branches; stop after its first diagnostic."""
+        for report, expected in ((CANARY, 'FAIL:'), ('RULE TEXT CHANGED', 'PASS:')):
+            out, err = io.StringIO(), io.StringIO()
+            with unittest.mock.patch.object(self.compare, 'compare', side_effect=[(report, True), SystemExit(1)]), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit):
+                    self.compare.self_test()
+            output = out.getvalue() + err.getvalue()
+            self.assertIn(expected, output)
+            self.assertNotIn(CANARY, output)
 
 
 class ResourceTests(unittest.TestCase):
@@ -211,8 +301,8 @@ class ResourceTests(unittest.TestCase):
                 raise OSError('synthetic close failure')
 
         try:
-            with mock.patch.object(cert.os, 'open', side_effect=record_open), \
-                    mock.patch.object(cert.os, 'close', side_effect=fail_first_close):
+            with unittest.mock.patch.object(cert.os, 'open', side_effect=record_open), \
+                    unittest.mock.patch.object(cert.os, 'close', side_effect=fail_first_close):
                 with self.assertRaises(OSError):
                     cert.deep_scratch(self.work, len(os.fsencode(self.work)) + 500)
             self.assertGreater(len(opened), 1)
@@ -231,6 +321,7 @@ class ResourceTests(unittest.TestCase):
 
     def test_permission_probes_restore_private_modes(self):
         guard = module('guard_modes_6163', 'scripts/check-claude-md-size.py')
+        guard.FIXTURE_PINS[0] = guard.fixture_index_pins()
         roots = []
 
         def fresh():
@@ -250,7 +341,7 @@ class ResourceTests(unittest.TestCase):
             changed.append((Path(path), mode))
             real_chmod(path, mode, **kwargs)
 
-        with mock.patch.object(guard.os, 'chmod', side_effect=record_chmod), \
+        with unittest.mock.patch.object(guard.os, 'chmod', side_effect=record_chmod), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.assertTrue(guard.run_manifest_cases(fresh))
             self.assertTrue(guard.run_ref_cases(fresh, 'docs/reference/ARCHITECTURE_REFERENCE.md',
