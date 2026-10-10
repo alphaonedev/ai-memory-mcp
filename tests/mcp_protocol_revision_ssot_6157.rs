@@ -765,6 +765,22 @@ fn issue_6157_negotiate_echoes_supported_and_downgrades_everything_else() {
             (*rev, false)
         );
     }
+    // #7005: a value that merely starts with, or contains, a supported
+    // revision is not that revision; only the exact string is echoed.
+    for near in [
+        "2024-11-05 ",
+        "2024-11-05\u{0}",
+        "2024-11-05-x",
+        " 2024-11-05",
+        "2024-11-0",
+        "2024-11-05\n",
+    ] {
+        assert_eq!(
+            negotiate_protocol_revision(&json!({"protocolVersion": near})),
+            (newest, true),
+            "near-miss {near:?} must downgrade"
+        );
+    }
     for params in [
         json!({"protocolVersion": "1999-01-01"}),
         json!({"protocolVersion": ""}),
@@ -1561,4 +1577,168 @@ fn issue_7008_walk_fails_closed_when_git_cannot_list_the_root() {
             "{tag}: the walk did not report that git could not list the root: {unreadable:?}"
         );
     }
+}
+
+/// Run `walked` on a tree holding `rel` as a path git cannot read as an
+/// ignore file (or any other fail-closed trigger) and return `unreadable`.
+fn unreadable_for(tag: &str, prepare: impl FnOnce(&Path)) -> Vec<String> {
+    let scratch = scratch_tree(tag);
+    prepare(&scratch);
+    let (_, unreadable) = walked(&scratch);
+    let _ = fs::remove_dir_all(&scratch);
+    unreadable
+}
+
+/// #7007 (R11): an ignore file that is a symlink or a directory is not a
+/// regular file; the walk records it instead of skipping it or following it.
+#[cfg(unix)]
+#[test]
+fn issue_7007_an_ignore_file_that_is_not_a_regular_file_fails_closed() {
+    let linked = unreadable_for("7007-link", |scratch| {
+        plant(scratch, "real/target.txt", "x\n");
+        fs::create_dir_all(scratch.join("sub")).expect("create sub");
+        std::os::unix::fs::symlink(
+            scratch.join("real/target.txt"),
+            scratch.join("sub/.gitignore"),
+        )
+        .expect("symlink .gitignore");
+    });
+    assert!(
+        linked.iter().any(|u| u.contains("not a regular file")),
+        "a symlinked .gitignore was not reported: {linked:?}"
+    );
+    let dir = unreadable_for("7007-dir", |scratch| {
+        fs::create_dir_all(scratch.join("sub/.gitignore")).expect("create .gitignore dir");
+    });
+    assert!(
+        dir.iter().any(|u| u.contains("not a regular file")),
+        "a directory named .gitignore was not reported: {dir:?}"
+    );
+}
+
+/// #7007 (R12): a backslash escape is unsupported syntax in any ignore file,
+/// not only the root one, and is reported with the file it came from.
+#[test]
+fn issue_7007_an_unsupported_escape_in_a_nested_ignore_file_fails_closed() {
+    let unreadable = unreadable_for("7007-escape", |scratch| {
+        plant(scratch, "sub2/.gitignore", "a\\b\n");
+        plant(scratch, "sub2/a.txt", "x\n");
+    });
+    assert!(
+        unreadable
+            .iter()
+            .any(|u| u.contains("sub2") && u.contains("unsupported .gitignore escape")),
+        "an escape in sub2/.gitignore was not reported: {unreadable:?}"
+    );
+}
+
+/// #7007 (P03): a candidate file that is not UTF-8 cannot be scanned, so the
+/// scan records it (fail closed) rather than counting it as clean.
+#[test]
+fn issue_7007_a_non_utf8_candidate_file_fails_closed() {
+    let scratch = scratch_tree("7007-utf8");
+    fs::write(scratch.join("notes.txt"), [0x66_u8, 0xff, 0xfe, 0x6f]).expect("plant bytes");
+    let files = vec![scratch.join("notes.txt")];
+    let mut unreadable = Vec::new();
+    let (uses, offenders) = scan_files(&scratch, &files, &mut unreadable);
+    let _ = fs::remove_dir_all(&scratch);
+    assert_eq!((uses, offenders.len()), (0, 0));
+    assert!(
+        unreadable.iter().any(|u| u.contains("not UTF-8")),
+        "a non-UTF-8 file was not reported: {unreadable:?}"
+    );
+}
+
+/// #7007 (P20): a file NAME that is not UTF-8 is recorded, and the walk does
+/// not guess a lossy name.
+#[cfg(unix)]
+#[test]
+fn issue_7007_a_non_utf8_file_name_fails_closed() {
+    use std::os::unix::ffi::OsStrExt;
+    let path = Path::new(std::ffi::OsStr::from_bytes(b"dir/na\xffme.txt"));
+    let mut unreadable = Vec::new();
+    assert_eq!(utf8_name(path, &mut unreadable), None);
+    assert!(
+        unreadable
+            .iter()
+            .any(|u| u.contains("file name is not UTF-8")),
+        "{unreadable:?}"
+    );
+    let mut unreadable = Vec::new();
+    assert_eq!(
+        utf8_name(Path::new("dir/name.txt"), &mut unreadable),
+        Some("name.txt")
+    );
+    assert!(unreadable.is_empty());
+}
+
+/// Set the Unix mode of `path`.
+#[cfg(unix)]
+fn chmod(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("chmod");
+}
+
+/// #7007 (P19): a directory that cannot be listed is recorded. Skipped when
+/// the process can list it anyway (running as root).
+#[cfg(unix)]
+#[test]
+fn issue_7007_a_directory_that_cannot_be_listed_fails_closed() {
+    let scratch = scratch_tree("7007-p19");
+    plant(&scratch, "locked/a.txt", "x\n");
+    chmod(&scratch.join("locked"), 0o000);
+    let root_can_list = fs::read_dir(scratch.join("locked")).is_ok();
+    let (_, unreadable) = walked(&scratch);
+    chmod(&scratch.join("locked"), 0o755);
+    let _ = fs::remove_dir_all(&scratch);
+    if root_can_list {
+        return;
+    }
+    assert!(
+        unreadable.iter().any(|u| u.contains("read_dir")),
+        "an unlistable directory was not reported: {unreadable:?}"
+    );
+}
+
+/// #7007 (P23): a directory that can be listed but not searched yields
+/// entries whose metadata cannot be read; each is recorded.
+#[cfg(unix)]
+#[test]
+fn issue_7007_an_entry_whose_metadata_cannot_be_read_fails_closed() {
+    let scratch = scratch_tree("7007-p23");
+    plant(&scratch, "listed/a.txt", "x\n");
+    chmod(&scratch.join("listed"), 0o444);
+    let root_can_stat = fs::symlink_metadata(scratch.join("listed/a.txt")).is_ok();
+    let (_, unreadable) = walked(&scratch);
+    chmod(&scratch.join("listed"), 0o755);
+    let _ = fs::remove_dir_all(&scratch);
+    if root_can_stat {
+        return;
+    }
+    assert!(
+        unreadable.iter().any(|u| u.contains("symlink_metadata")),
+        "an entry with unreadable metadata was not reported: {unreadable:?}"
+    );
+}
+
+/// #7021 (R19, R20): a binary extension matches whatever its case, and the
+/// `.DS_Store` file name is skipped; neither is read as text.
+#[test]
+fn issue_7021_binary_names_are_skipped_case_insensitively() {
+    assert!(is_binary("x.PNG"));
+    assert!(is_binary("x.Png"));
+    assert!(is_binary("x.png"));
+    assert!(is_binary(".DS_Store"));
+    assert!(!is_binary("x.png.txt"));
+    assert!(!is_binary("DS_Store"));
+    let scratch = scratch_tree("7021");
+    for rel in ["docs/.DS_Store", "docs/IMG.PNG", "docs/x.Png"] {
+        fs::create_dir_all(scratch.join("docs")).expect("create docs");
+        fs::write(scratch.join(rel), [0xff_u8, 0xfe, 0x00]).expect("plant binary");
+    }
+    plant(&scratch, "docs/kept.txt", "x\n");
+    let (seen, unreadable) = walked(&scratch);
+    let _ = fs::remove_dir_all(&scratch);
+    assert!(unreadable.is_empty(), "unreadable: {unreadable:?}");
+    assert_eq!(seen, vec!["docs/kept.txt".to_string()]);
 }
