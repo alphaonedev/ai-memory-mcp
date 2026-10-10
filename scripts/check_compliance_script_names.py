@@ -1528,6 +1528,10 @@ R14_CELLS = (
     # soft hyphen on the third line of a comment still joins the name (a raw-view read would miss it).
     ("J6856-3line-zero-width", "Run c<!-- a\nx > y\n-->h\u200beck-gone.sh now.\n", R13_FRAG1, 1, R12_JOIN),
     ("J6856-3line-soft-hyphen", "Run c<!-- a\nx > y\n-->he\u00adck-gone.sh now.\n", R13_FRAG1, 1, R12_JOIN),
+    # #6930: the folded view reads the folded rest of the paragraph, so a combining mark or an en dash
+    # on the third line of a comment still joins the name (a decoded-view read would miss it).
+    ("J6930-3line-combining-mark", "Run c<!-- a\nx > y\n-->h\u0301eck-gone.sh now.\n", R13_FRAG1, 1, R12_JOIN),
+    ("J6930-3line-en-dash", "Run c<!-- a\nx > y\n-->heck\u2013gone.sh now.\n", R13_FRAG1, 1, R12_JOIN),
     # #6857: a rooted citation (a URL before `scripts/`) is measured from its `scripts` component, so a
     # run longer than PATH_LIMIT whose rooted target is short and exists stays green.
     ("P6857-rooted-long-url-existing", "See https://" + "h" * 4100 + "/scripts/check_new.py here.\n", "", 0, None),
