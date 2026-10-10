@@ -557,8 +557,11 @@ jobs:
           # PGSSLMODE=verify-full / PGSSLROOTCERT come from $GITHUB_ENV (set by
           # the TLS start step), so these provisioning connects take the same
           # verified TLS path the tests do.
-          psql -h localhost -p 5432 -U ai_memory -d "$CI_COV_DB" -c "CREATE EXTENSION IF NOT EXISTS vector;"
-          psql -h localhost -p 5432 -U ai_memory -d "$CI_COV_DB" -c "LOAD 'age'; SET search_path = ag_catalog, \"\$user\", public; SELECT ag_catalog.create_graph('memory_graph');" || echo "memory_graph already exists or AGE init handled by ladder"
+          # The image creates `age` only in POSTGRES_DB (`postgres`), so the minted
+          # db gets BOTH extensions here (ci.yml enterprise-fed recipe); a failure
+          # fails the step (ON_ERROR_STOP, no swallow).
+          psql -h localhost -p 5432 -U ai_memory -d "$CI_COV_DB" -v ON_ERROR_STOP=1 -c "CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector;"
+          psql -h localhost -p 5432 -U ai_memory -d "$CI_COV_DB" -v ON_ERROR_STOP=1 -c "LOAD 'age'; SET search_path = ag_catalog, \"\$user\", public; SELECT ag_catalog.create_graph('memory_graph');"
           # Sanity check: extensions present.
           psql -h localhost -p 5432 -U ai_memory -d "$CI_COV_DB" -c "SELECT extname FROM pg_extension ORDER BY extname;"
 

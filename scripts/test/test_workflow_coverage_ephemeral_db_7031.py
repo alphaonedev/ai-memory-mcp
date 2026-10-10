@@ -55,6 +55,18 @@ class CoverageEphemeralDb7031(unittest.TestCase):
         for var in ("AI_MEMORY_TEST_POSTGRES_URL", "AI_MEMORY_TEST_AGE_URL"):
             self.assertRegex(self.text, var + r"=postgres://[^\"]*/\$\{CI_COV_DB\}\?")
 
+    def test_both_extensions_are_created_on_the_minted_db_and_not_swallowed(self):
+        # The image creates `age` only in POSTGRES_DB; the minted db needs both.
+        lines = [l for _, l in _code_lines(self.text) if "CREATE EXTENSION" in l or "create_graph" in l]
+        ext = [l for l in lines if "CREATE EXTENSION IF NOT EXISTS age" in l]
+        self.assertTrue(ext, "no `CREATE EXTENSION IF NOT EXISTS age` in coverage.yml")
+        for line in ext:
+            self.assertIn('-d "$CI_COV_DB"', line)
+            self.assertIn("CREATE EXTENSION IF NOT EXISTS vector", line)
+            self.assertIn("ON_ERROR_STOP=1", line)
+        for line in lines:
+            self.assertNotRegex(line, r"\|\|\s*(echo|true)", "extension/graph failure must fail the step")
+
 
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False).result.wasSuccessful() else 1)

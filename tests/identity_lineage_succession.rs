@@ -1421,8 +1421,21 @@ mod postgres_parity {
     /// sqlite twin above asserts.
     #[tokio::test]
     async fn postgres_parity_identical_verdicts() {
-        let Some(store) = connect().await else { return };
-        let Some(pool) = raw_pool().await else { return };
+        // #7031 H3: this test deletes an `agent_lineage` row (C3 rollback),
+        // which would leave the shared base's watermark above its row count
+        // (#6983). Run it in its own schema so the shared tables are untouched.
+        let Some(env) = common::postgres_env::PostgresTestEnv::new("lineage_parity_7031").await
+        else {
+            return;
+        };
+        let store = PostgresStore::connect(env.url())
+            .await
+            .expect("connect scoped schema");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(env.url())
+            .await
+            .expect("connect scoped raw pool");
 
         let (agent_id, k0) = pg_register_and_enroll(&store).await;
         let ctx = CallerContext::for_agent(agent_id.clone());
