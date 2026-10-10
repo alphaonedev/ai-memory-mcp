@@ -1514,6 +1514,18 @@ the one-line remedy the failure names. Its reported context is declared in
 operator-gated branch-protection API call adds it to the live required
 set, the gate is a red check, not a merge block.)
 
+The gate's identifier scan also checks the CONTEXT of an unchanged
+`AI_MEMORY_FED_*` line ([**#6560**](https://github.com/alphaonedev/ai-memory-mcp/issues/6560)):
+a `cfg` or other non-benign attribute on the enclosing item or an enclosing
+`mod`, an inner `#![..]` attribute, `if false` / `if cfg!(..)`, an unclosed
+block comment or string above the line, an earlier unconditional exit, a
+`macro_rules!` body, or a module file no `mod` declaration reaches goes RED
+when the change introduces it. A scan that cannot parse a file fails closed.
+It is a lexical scan, not a compiler: an uncalled function, a constant-false
+flag, `include!` and proc-macro rewriting are NOT detected and are pinned as
+GREEN `(wrap-gap-*)` cells in the self-test, documented in the
+`check_cert_expiry.py` docstring (LEXICAL BOUND).
+
 **Re-cert trigger — FIRED (12 §7-watched federation-wire files changed
 `ab6f2175` → `f32c18dad`) and DISCHARGED by re-issue (`f32c18dad`,
 2026-09-21).** Between the prior bind `ab6f2175` (2026-09-12 #3607) and the

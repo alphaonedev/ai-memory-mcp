@@ -98,13 +98,28 @@ trimmed text of every line under src/ that names it (#6427). So a value edited
 on the line that carries an AI_MEMORY_FED_* identifier, a rewrap of that line,
 a trailing comment on it, or a block comment opened and closed ON it is drift
 and RED; a value that sits on a different line from the name is not seen.
-LEXICAL BOUND: the check is a text scan, so a change that leaves every
-identifier-bearing line byte-identical is not seen. Measured examples, each
-GREEN: a multi-line comment opened and closed on the neighbouring lines, an
-attribute that compiles the definition out added on the line above, a raw-string
-wrap, and a move of the line into a file that is not compiled (tracked in
-#6560). A block comment AROUND a definition is therefore caught only in the
-same-line form. This gate does not re-run 5.4(2)-(5); it only forces the
+CONTEXT CHECK (#6560): a guarded line can also be disabled while it stays
+byte-identical (nothing on it is edited), so each identifier-bearing line is scanned with a Rust-aware lexer (comments,
+strings, raw strings, chars, nested blocks, attributes, brace depth) and the
+constructs that enclose it are recorded: an attribute on it or on any enclosing
+item or `mod` (cfg, cfg_attr, path, #[test], any attribute outside a short
+allow-list), an inner `#![cfg(..)]`, an `if false` / `if cfg!(..)` / `while false`
+block, the else branch of an `if true`, an open block comment or string literal,
+a `macro_rules!` body, an unconditional return/break/continue/todo!/panic! (or a
+loop with no break) earlier in the same block, and the same attributes on the
+`mod NAME;` declarations that reach the file (a file no declaration reaches is a
+finding too). The comparison is RELATIVE: a finding on a line the base also
+carried, absent from the base's context for that line, is drift and RED. A parse
+the scan cannot trust (unbalanced braces or attribute brackets, a git read
+error) is a named ERROR, fail closed.
+LEXICAL BOUND (residual gap, NOT closed): a text scan has no call graph, no
+constant evaluation and no macro expansion, so these stay GREEN and are pinned
+by the (wrap-gap-*) cells: deleting the only caller of a function that holds the
+line, an `if FLAG {` where FLAG is a constant that is false, a definition moved
+into a function nothing calls, an include!d fragment, and a proc-macro that
+rewrites its input. The #6140 trust model applies as well: the gate runs the
+change's own copy of this script, so it is defense in depth beside review.
+This gate does not re-run 5.4(2)-(5); it only forces the
 cert-doc to be touched so a human/re-issue cannot be skipped.
 
 Usage:
@@ -116,6 +131,7 @@ Exit codes: 0 clean / N/A-skip, 1 violation, 2 usage / self-test failure.
 """
 
 import argparse
+import bisect
 import collections
 import contextlib
 import io
@@ -347,12 +363,383 @@ def fed_id_delta(base_counts, head_counts):
     return added, removed
 
 
+# ---------------------------------------------------------------------------
+# Context check (#6560): a guarded line disabled by what SURROUNDS it
+# ---------------------------------------------------------------------------
+#
+# The per-line pin above (#6427) cannot see a wrapper that leaves the guarded
+# line byte-identical. This lexical pass records, for every identifier-bearing
+# line, the disabling constructs that enclose it (attributes, if false, an open
+# block comment or string, an earlier unconditional exit, a loop with no break,
+# a macro_rules body, the parent's `mod` declaration chain). The comparison is
+# RELATIVE: a finding on a line that the base did not already carry is drift.
+# Anything the scan cannot parse raises GateError (fail closed).
+
+# Attributes that cannot remove an item from the build. Everything else on an
+# enclosing item is a finding, cfg/cfg_attr/path/unreachable_code always.
+_ATTR_BENIGN = frozenset({
+    "derive", "doc", "allow", "warn", "deny", "forbid", "expect", "must_use", "inline",
+    "cold", "track_caller", "deprecated", "non_exhaustive", "repr", "serde", "schemars",
+    "automatically_derived", "async_trait", "tokio::main", "recursion_limit", "feature",
+})
+_ATTR_NAME_RE = re.compile(r"^#!?\[\s*([A-Za-z_][\w:]*)")
+_ATTR_ALWAYS_RE = re.compile(r"\bcfg(?:_attr)?\b|\bunreachable_code\b|^#!?\[\s*path\b")
+_CODE_TOKEN_RE = re.compile(
+    r"""//|/\*|(?<![A-Za-z0-9_])(?:b?r|cr)(#*)"|"|'|\#!?\[|[{}();\[\],]""")
+_CHAR_LIT_RE = re.compile(r"'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^\\'\n])'", re.DOTALL)
+_BLOCK_TOKEN_RE = re.compile(r"/\*|\*/")
+_STR_TOKEN_RE = re.compile(r'["\\]')
+_BREAK_RE = re.compile(r"\bbreak\b(\s*')?")
+_LOOP_HEADER_RE = re.compile(r"(?:^|[\s:=(])loop$|\bwhile\s+true$")
+_EXIT_RE = re.compile(
+    r"^(?:return\b|break\b|continue\b|(?:todo|unimplemented|unreachable|panic)!|"
+    r"(?:std::)?process::exit\b)")
+_MOD_DECL_RE = re.compile(r"^(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_]\w*)$")
+_HEADER_RULES = (
+    (re.compile(r"\bif\s+(?:false|!\s*true)\b"), "inside an `if false` block"),
+    (re.compile(r"\bif\s+cfg!\s*\("), "inside an `if cfg!(..)` block"),
+    (re.compile(r"\bwhile\s+false\b"), "inside a `while false` loop"),
+    (re.compile(r"\bif\s+(?:true|!\s*false)\b.*\belse\b"), "in the else branch of an if true"),
+    (re.compile(r"(?:^|\s)macro_rules!"), "inside a macro_rules! body (expands only where invoked)"),
+)
+_UNDECLARED = "module file that no `mod` declaration in a parent file reaches (not compiled)"
+_MOD_DEPTH_CAP = 64
+
+
+class _Frame:
+    __slots__ = ("header", "attrs", "exit", "has_break", "is_loop", "paren")
+
+    def __init__(self, header, attrs):
+        self.header = header
+        self.attrs = list(attrs)
+        self.exit = ""
+        self.has_break = False
+        self.is_loop = bool(_LOOP_HEADER_RE.search(header))
+        self.paren = 0
+
+
+def _collapse(parts):
+    return " ".join("".join(parts).split())
+
+
+def _attr_findings(attr, out):
+    name = _ATTR_NAME_RE.match(attr)
+    name = name.group(1) if name else ""
+    if _ATTR_ALWAYS_RE.search(attr):
+        out.add(f"attribute {attr}")
+    elif name not in _ATTR_BENIGN and not name.startswith(("clippy::", "rustfmt::")):
+        out.add(f"attribute {attr}")
+
+
+def _context_findings(stack, pend, extra):
+    out = set()
+    for fr in stack:
+        for attr in fr.attrs:
+            _attr_findings(attr, out)
+        if fr.exit:
+            out.add(f"after an unconditional early exit ({fr.exit}) in the same block")
+    for attr in pend:
+        _attr_findings(attr, out)
+    for text in [fr.header for fr in stack[1:]] + [" ".join(extra.split())]:
+        for rule, why in _HEADER_RULES:
+            if rule.search(text):
+                out.add(why)
+    return out
+
+
+def _skip_string(text, pos):
+    """Index just past the closing quote of the string whose body starts at `pos`."""
+    while True:
+        m = _STR_TOKEN_RE.search(text, pos)
+        if m is None:
+            return len(text)
+        if m.group(0) == "\\":
+            pos = m.start() + 2
+            continue
+        return m.end()
+
+
+def _skip_block_comment(text, pos):
+    """Index just past the nested block comment whose body starts at `pos` (EOF if open)."""
+    depth = 1
+    while depth:
+        m = _BLOCK_TOKEN_RE.search(text, pos)
+        if m is None:
+            return len(text)
+        depth += 1 if m.group(0) == "/*" else -1
+        pos = m.end()
+    return pos
+
+
+def _scan_rust(path, text, offsets):
+    """Lexical scan of one Rust file. Returns (snaps, inner, mods): snaps maps
+    each offset to the set of disabling findings there (None inside a line
+    comment), inner the findings of the file-level inner attributes, mods the
+    findings at each `mod NAME;` declaration."""
+    starts = [0] + [m.end() for m in re.finditer("\n", text)]
+    line_of = lambda pos: bisect.bisect_right(starts, pos)  # noqa: E731
+    root = _Frame("", [])
+    stack, pend, cur = [root], [], []
+    last_closed = ""
+    snaps, mods = {}, collections.defaultdict(set)
+    offs = sorted(set(offsets))
+    oi = 0
+
+    def take(lo, hi, extra_for, carried=None, opened=0, label=""):
+        """Record every offset in [lo, hi). `carried` names a construct that
+        opened on an earlier line than the offset (a finding on its own)."""
+        nonlocal oi
+        while oi < len(offs) and offs[oi] < hi:
+            o = offs[oi]
+            oi += 1
+            if carried == "line":
+                snaps[o] = None
+                continue
+            found = _context_findings(stack, pend, extra_for(o))
+            if carried and (label == "block comment" or line_of(o) > opened):
+                found.add("inside a block comment" if label == "block comment"
+                          else "inside a string literal that began on an earlier line")
+            snaps[o] = found
+
+    i, n = 0, len(text)
+    while i < n:
+        m = _CODE_TOKEN_RE.search(text, i)
+        j = m.start() if m else n
+        chunk = text[i:j]
+        take(i, j, lambda o, lo=i: text[lo:o])
+        if chunk:
+            cur.append(chunk)
+            for bm in _BREAK_RE.finditer(chunk):
+                for fr in reversed(stack):
+                    fr.has_break = True
+                    if fr.is_loop and not bm.group(1):
+                        break
+        if m is None:
+            break
+        tok, i = m.group(0), j
+        top = stack[-1]
+        if tok == "//":
+            eol = text.find("\n", i)
+            end = n if eol < 0 else eol
+            take(i, end, lambda o: "", carried="line")
+            i = end
+        elif tok == "/*":
+            end = _skip_block_comment(text, i + 2)
+            take(i, end, lambda o: "".join(cur), carried=True, opened=line_of(i), label="block comment")
+            cur.append(" ")
+            i = end
+        elif tok.endswith('"') and tok != '"':
+            close = '"' + "#" * len(m.group(1))
+            k = text.find(close, i + len(tok))
+            end = n if k < 0 else k + len(close)
+            take(i, end, lambda o: "".join(cur), carried=True, opened=line_of(i), label="string literal")
+            cur.append('""')
+            i = end
+        elif tok == '"':
+            end = _skip_string(text, i + 1)
+            take(i, end, lambda o: "".join(cur), carried=True, opened=line_of(i), label="string literal")
+            cur.append('""')
+            i = end
+        elif tok == "'":
+            lit = _CHAR_LIT_RE.match(text, i)
+            end = lit.end() if lit else i + 1
+            take(i, end, lambda o: "".join(cur))
+            cur.append("''" if lit else "'")
+            i = end
+        elif tok.startswith("#"):
+            k, depth = i + len(tok), 1
+            while depth:
+                bm = re.compile(r'[\[\]"]').search(text, k)
+                if bm is None:
+                    raise GateError(f"{path}: unbalanced attribute bracket at line {line_of(i)} "
+                                    "(cannot parse; fail-closed)")
+                if bm.group(0) == '"':
+                    k = _skip_string(text, bm.end())
+                else:
+                    depth += 1 if bm.group(0) == "[" else -1
+                    k = bm.end()
+            take(i, k, lambda o: "".join(cur))
+            attr = " ".join(text[i:k].split())
+            (top.attrs if tok.startswith("#!") else pend).append(attr)
+            i = k
+        elif tok == "{":
+            header = _collapse(cur)
+            if header.startswith("else"):
+                header = (last_closed + " " + header).strip()
+            stack.append(_Frame(header, pend))
+            cur, pend = [], []
+            i += 1
+        elif tok == "}":
+            if len(stack) == 1:
+                raise GateError(f"{path}: unbalanced braces: a closing brace at line {line_of(i)} "
+                                "has no opener (cannot parse; fail-closed)")
+            done = stack.pop()
+            if done.is_loop and not done.has_break:
+                stack[-1].exit = stack[-1].exit or "a loop with no break"
+            last_closed = done.header
+            cur, pend = [], []
+            i += 1
+        elif tok == ";" and top.paren == 0:
+            stmt = _collapse(cur)
+            if _EXIT_RE.match(stmt):
+                top.exit = top.exit or stmt[:48]
+            md = _MOD_DECL_RE.match(stmt)
+            if md:
+                mods[md.group(1)] |= _context_findings(stack, pend, "")
+            cur, pend = [], []
+            i += 1
+        elif tok == ",":
+            if top.paren == 0:
+                cur = []
+            else:
+                cur.append(tok)
+            i += 1
+        else:
+            if tok in "([":
+                top.paren += 1
+            elif tok in ")]":
+                top.paren = max(0, top.paren - 1)
+            cur.append(tok)
+            i += 1
+    if len(stack) != 1:
+        raise GateError(f"{path}: unbalanced braces: {len(stack) - 1} block(s) still open at end "
+                        "of file (cannot parse; fail-closed)")
+    inner = set()
+    for attr in root.attrs:
+        _attr_findings(attr, inner)
+    return snaps, inner, mods
+
+
+def _is_crate_root(path):
+    return path in ("src/lib.rs", "src/main.rs") or bool(
+        re.fullmatch(r"src/bin/[^/]+\.rs|src/bin/[^/]+/main\.rs", path))
+
+
+class _TreeScan:
+    """Reads and scans the Rust files of one tree on demand (cached)."""
+
+    def __init__(self, repo, tree):
+        self.repo, self.tree = repo, tree
+        proc = run_git(repo, "ls-tree", "-r", "-z", "--name-only", tree, "--", "src")
+        if proc.returncode != 0:
+            err = proc.stderr.decode("utf-8", "replace").strip()
+            raise GateError(f"git ls-tree at {tree} exited {proc.returncode}: {err}")
+        self.files = {p.decode("utf-8", "replace") for p in proc.stdout.split(b"\0") if p}
+        self.cache = {}
+
+    def scan(self, path):
+        if path not in self.cache:
+            proc = run_git(self.repo, "cat-file", "blob", "--end-of-options", f"{self.tree}:{path}")
+            if proc.returncode != 0:
+                err = proc.stderr.decode("utf-8", "replace").strip()
+                raise GateError(f"git cat-file {self.tree}:{path} exited {proc.returncode}: {err}")
+            text = proc.stdout.decode("utf-8", "replace")
+            self.cache[path] = (text, _scan_rust(path, text, ()))
+        return self.cache[path]
+
+    def module_findings(self, path, depth=0):
+        """Findings contributed by the `mod` declaration chain above `path`."""
+        if depth > _MOD_DEPTH_CAP:
+            raise GateError(f"{path}: module chain deeper than {_MOD_DEPTH_CAP} (cannot parse; fail-closed)")
+        if _is_crate_root(path) or "/" not in path:
+            return set()
+        directory, base = path.rsplit("/", 1)
+        stem = base[:-3] if base.endswith(".rs") else base
+        if stem == "mod" and "/" in directory:
+            directory, modname = directory.rsplit("/", 1)
+        else:
+            modname = stem
+        for cand in (f"{directory}/mod.rs", f"{directory}.rs", f"{directory}/lib.rs", f"{directory}/main.rs"):
+            if cand in self.files:
+                _, (_, inner, mods) = self.scan(cand)
+                if modname in mods:
+                    return mods[modname] | inner | self.module_findings(cand, depth + 1)
+        return {_UNDECLARED}
+
+
+def extract_fed_wrap_counts(repo, tree):
+    """(identifier, trimmed line text, sorted disabling findings) -> occurrences,
+    for the identifier-bearing lines of src/ at TREE (#6560). A finding names a
+    construct that encloses the line and would compile it out or make it
+    unreachable; a clean line carries the empty tuple."""
+    proc = run_git(repo, "grep", "-l", "-z", "-a", "-E", FED_ID_PATTERN, tree, "--", "src")
+    if proc.returncode == 1:
+        return collections.Counter()
+    if proc.returncode != 0:
+        err = proc.stderr.decode("utf-8", "replace").strip()
+        raise GateError(f"git grep -l at {tree} exited {proc.returncode}: {err}")
+    prefix = f"{tree}:"
+    paths = []
+    for raw in proc.stdout.split(b"\0"):
+        name = raw.decode("utf-8", "replace")
+        if name:
+            paths.append(name[len(prefix):] if name.startswith(prefix) else name)
+    ts = _TreeScan(repo, tree)
+    counts = collections.Counter()
+    for path in sorted(paths):
+        proc_text = run_git(repo, "cat-file", "blob", "--end-of-options", f"{tree}:{path}")
+        if proc_text.returncode != 0:
+            err = proc_text.stderr.decode("utf-8", "replace").strip()
+            raise GateError(f"git cat-file {tree}:{path} exited {proc_text.returncode}: {err}")
+        text = proc_text.stdout.decode("utf-8", "replace")
+        hits = list(FED_ID_RE.finditer(text))
+        snaps, inner, mods = _scan_rust(path, text, [h.start() for h in hits])
+        ts.cache[path] = (text, (snaps, inner, mods))
+        chain = None
+        for h in hits:
+            found = snaps.get(h.start())
+            if found is None:  # inside a // comment: not a definition
+                continue
+            if chain is None:
+                chain = ts.module_findings(path)
+            lo = text.rfind("\n", 0, h.start()) + 1
+            hi = text.find("\n", h.start())
+            line = text[lo:len(text) if hi < 0 else hi].strip()
+            counts[(h.group(0), line, tuple(sorted(found | inner | chain)))] += 1
+    return counts
+
+
+def wrap_delta(base_wraps, head_wraps):
+    """Report lines for a guarded line whose CONTEXT gained a disabling finding
+    while its text stayed (the #6560 shape). Per (identifier, trimmed line) the
+    base and head occurrences are matched by their finding set; an occurrence the
+    base had that the head no longer has in that context (lost), paired with a
+    head occurrence the base did not have (new), is a context change, and the
+    findings the new context carries that the lost one did not are reported. An
+    extra copy of the line elsewhere (nothing lost) is a mention, not a disable."""
+    by_line = collections.defaultdict(lambda: (collections.Counter(), collections.Counter()))
+    for (name, text, found), n in base_wraps.items():
+        by_line[(name, text)][0][found] += n
+    for (name, text, found), n in head_wraps.items():
+        by_line[(name, text)][1][found] += n
+    hits = collections.Counter()
+    for (name, _), (before, after) in by_line.items():
+        lost, new = before - after, after - before
+        if not lost or not new:
+            continue
+        old = {f for found in lost for f in found}
+        for found, n in new.items():
+            for finding in found:
+                if finding not in old:
+                    hits[(name, finding)] += n
+    return [f"{name} (guarded line newly disabled: {finding}; {n} occurrence(s))"
+            for (name, finding), n in sorted(hits.items())]
+
+
+def fed_drift(repo, frm, to):
+    """(added, removed) AI_MEMORY_FED_* drift between two trees: the keyed line
+    comparison (#6427) plus the context check (#6560)."""
+    base_ids = extract_fed_id_counts(repo, frm)
+    added, removed = fed_id_delta(base_ids, extract_fed_id_counts(repo, to))
+    removed.extend(wrap_delta(extract_fed_wrap_counts(repo, frm), extract_fed_wrap_counts(repo, to)))
+    return added, removed
+
+
 def wire_drift(repo, frm, to):
     """Section 7 surface that differs between two trees: watched paths, then
     +added / -removed AI_MEMORY_FED_* identifiers. Empty list = no drift."""
     out = [p for p in changed_paths(repo, frm, to) if is_watched_path(p)]
-    added, removed = fed_id_delta(extract_fed_id_counts(repo, frm),
-                                  extract_fed_id_counts(repo, to))
+    added, removed = fed_drift(repo, frm, to)
     out.extend("+" + i for i in added)
     out.extend("-" + i for i in removed)
     return out
@@ -560,8 +947,7 @@ def _judge(repo, base, head, judged, mb, tip):
             cert_touched = True
         if is_watched_path(p):
             watched.append(p)
-    added, removed = fed_id_delta(extract_fed_id_counts(repo, mb),
-                                  extract_fed_id_counts(repo, judged))
+    added, removed = fed_drift(repo, mb, judged)
     id_changed = bool(added or removed)
 
     if not watched and not id_changed:
@@ -1677,7 +2063,7 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
         if needle not in SELF_TEST_OK:
             t.fail(f"(doc-bound): the OK banner does not name {needle}; the value-edit claim "
                    "must be pinned by a cell that changes a value (#6626)")
-    for needle in ("LEXICAL BOUND", "byte-identical", "#6560"):
+    for needle in ("LEXICAL BOUND", "byte-identical", "#6560", "NOT closed", "(wrap-gap-*)"):
         if needle not in (__doc__ or ""):
             t.fail(f"(doc-bound): the module docstring does not state the lexical bound "
                    f"({needle!r} missing)")
@@ -2056,11 +2442,14 @@ def _wrap_cells(t, fx, repo, base):
         "src/wrap_b.rs": ("pub fn alpha() -> u32 {\n    let mut n = 0;\n" + filler + "    n\n}\n"
                           f'pub const WRAP_B: &str = "{kid}";\n'
                           "pub fn omega() -> u32 {\n    2\n}\n"),
-        "src/wrap_c.rs": f'pub mod inner {{\n    pub const WRAP_C: &str = "{kid}";\n}}\n',
+        "src/wrap_c.rs": ("pub mod outer {\n    pub mod inner {\n"
+                          f'        pub const WRAP_C: &str = "{kid}";\n    }}\n}}\n'),
         "src/wrap_d.rs": ("pub fn read_d() -> &'static str {\n    let mut k = \"\";\n"
                           f'    k = "{kid}";\n    k\n}}\n'),
+        "src/lib.rs": "pub mod wrapmod;\n",
         "src/wrapmod/mod.rs": "pub mod child;\n",
         "src/wrapmod/child.rs": f'pub const WRAP_CHILD: &str = "{kid}";\n',
+        "src/wrap_j.rs": f'pub fn first() {{}}\npub const WRAP_J: &str = "{kid}";\n',
         "src/wrap_g.rs": f'#[cfg(feature = "wrap-live")]\npub const WRAP_G: &str = "{kid}";\n',
         "src/wrap_h.rs": f'pub fn read_h() -> &\'static str {{\n    "{kid}"\n}}\n',
         "src/wrap_caller.rs": "pub fn call() -> &'static str {\n    crate::wrap_h::read_h()\n}\n",
@@ -2084,6 +2473,13 @@ def _wrap_cells(t, fx, repo, base):
          {"src/wrap_a.rs": '#[cfg(feature = "wrap-never")]\n' + files["src/wrap_a.rs"]}),
         ("wrap-cfg-mod", "cfg(any())", "cfg(any()) on the ENCLOSING mod",
          {"src/wrap_c.rs": '#[cfg(any())]\n' + files["src/wrap_c.rs"]}),
+        ("wrap-inner-late", "#![cfg(any())]", "an inner attribute above an item that comes BEFORE the line",
+         {"src/wrap_j.rs": '#![cfg(any())]\n' + files["src/wrap_j.rs"]}),
+        ("wrap-allow-unreach", "unreachable_code", "#[allow(unreachable_code)] on the enclosing fn",
+         {"src/wrap_d.rs": '#[allow(unreachable_code)]\n' + files["src/wrap_d.rs"]}),
+        ("wrap-moved-undeclared", "module file that no", "the line moved out of a compiled module into a file no mod declares",
+         {"src/wrapmod/child.rs": "pub const WRAP_CHILD: u8 = 1;\n",
+          "src/wrap_orphan.rs": files["src/wrapmod/child.rs"]}),
         ("wrap-cfg-fn", "cfg(any())", "cfg(any()) on the enclosing fn",
          {"src/wrap_d.rs": '#[cfg(any())]\n' + files["src/wrap_d.rs"]}),
         ("wrap-inner", "#![cfg(any())]", "an inner attribute at the top of the file",
@@ -2145,6 +2541,11 @@ def _wrap_cells(t, fx, repo, base):
     controls = [
         ("wrap-ctl-condreturn", "a conditional early return (inside an if) before the line is not an exit",
          {"src/wrap_d.rs": around(files["src/wrap_d.rs"], d_set, "    if k.is_empty() {\n        return \"\";\n    }\n")}),
+        ("wrap-ctl-lexer", "char literals, a lifetime and an escaped quote in a string never unbalance the scan",
+         {"src/wrap_d.rs": around(files["src/wrap_d.rs"], d_set,
+                                  "    let _c = ('{', '}', '\"', '\\'', b'{');\n"
+                                  "    let _s = \"quote \\\" { brace\";\n"
+                                  "    let _l: &'static str = \"\";\n")}),
         ("wrap-ctl-inline", "an allow-listed attribute (#[inline]) on the enclosing fn",
          {"src/wrap_d.rs": "#[inline]\n" + files["src/wrap_d.rs"]}),
         ("wrap-ctl-comment", "comments closed before the line, and a line comment",
@@ -2248,6 +2649,18 @@ SELF_TEST_OK = (
     "(mask-confusable, mask-confusable-note, mask-zwsp, mask-crsplit) and a removed mention "
     "(mask-note-removed), a removal whose total never falls (mask-netzero, mask-netzero-gate) "
     "and a 3 -> 2 fall (mask-3to2), a rising total (mask-rise) and one of two identical definitions (mask-dup) stay RED, a longer token is GREEN (mask-longer-letter, mask-longer-underscore, mask-longer-digit), while a defining line moved to another file is GREEN (mask-moved); "
+    "(wrap-cfg-item, wrap-cfg-feature, wrap-cfg-mod, wrap-cfg-fn, wrap-inner, wrap-attr-test, "
+    "wrap-iffalse, wrap-ifcfg, wrap-else, wrap-blockcomment, wrap-rawstring, wrap-return, "
+    "wrap-todo, wrap-loop, wrap-macro, wrap-decl, and each with -gate on a pull_request, #6560) "
+    "a guarded line left byte-identical but disabled by its context (an attribute on it, its "
+    "enclosing mod or fn or the file, an if false / if cfg! block, the else of an if true, a block "
+    "comment opened 36 lines above, a raw string, an unconditional early exit, a loop with no break, "
+    "a macro_rules body, cfg on the parent's mod declaration) stays RED naming the construct; "
+    "(wrap-unbalanced) a file whose braces do not balance fails closed by name; (wrap-ctl-condreturn, "
+    "wrap-ctl-inline, wrap-ctl-comment, wrap-ctl-samewrap) a conditional return, an allow-listed "
+    "attribute, closed comments and a wrapper the base already had are GREEN; (wrap-gap-uncalled, "
+    "wrap-gap-constflag) the residual gap (call graph, constant flag) is GREEN and pinned as NOT "
+    "closed; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
