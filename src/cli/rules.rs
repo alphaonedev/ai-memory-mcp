@@ -2263,8 +2263,12 @@ mod tests {
         // #3437 — `--out` relocates the directory; the basename must be the
         // loadable `operator.key` (a custom name is refused).
         let key_path = dir.path().join("explicit-out").join(OPERATOR_KEY_FILENAME);
+        // #3437 (review F8, #6052) — the lib test harness installs a sandbox
+        // `AI_MEMORY_KEY_DIR` process-wide, which is a key-dir override, and
+        // `--out` must then sit inside the key dir. Name the --out directory
+        // as the key dir so the case stays hermetic.
         let args = RulesArgs {
-            key_dir: None,
+            key_dir: key_path.parent().map(Path::to_path_buf),
             action: RulesAction::Keygen {
                 out: Some(key_path.clone()),
                 force: false,
@@ -2634,8 +2638,25 @@ mod tests {
     fn resolve_keygen_out_path_explicit_out_wins_1610() {
         let out = std::path::PathBuf::from("/custom/operator.key");
         let kd = std::path::PathBuf::from("/etc/ai-memory/keys");
-        let r = resolve_keygen_out_path(Some(&out), &kd, true).unwrap();
-        assert_eq!(r, out, "--out must win over a key-dir override");
+        // No key-dir override: an explicit --out wins outright.
+        let r = resolve_keygen_out_path(Some(&out), &kd, false).unwrap();
+        assert_eq!(
+            r, out,
+            "--out must win when no key-dir override is in force"
+        );
+        // With an override, --out wins only INSIDE the overridden dir; one
+        // outside it is refused, naming both paths (#3437, review F8 #6052:
+        // the signing verbs read the key from the override only).
+        let inside = kd.join(OPERATOR_KEY_FILENAME);
+        let r = resolve_keygen_out_path(Some(&inside), &kd, true).unwrap();
+        assert_eq!(r, inside, "--out inside the key-dir override is honoured");
+        let err = resolve_keygen_out_path(Some(&out), &kd, true)
+            .expect_err("--out outside the key-dir override must be refused")
+            .to_string();
+        assert!(
+            err.contains("/custom/operator.key") && err.contains("/etc/ai-memory/keys"),
+            "the refusal must name both paths: {err}"
+        );
     }
 
     #[test]
