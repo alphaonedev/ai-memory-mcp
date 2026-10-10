@@ -347,3 +347,60 @@ fn both_hub_loaders_build_from_env_and_consult_the_posture_4123() {
         "#4123: the posture predicate is the one composition point the offline guard consults"
     );
 }
+
+// ─── 5. docs pins (#6397 / #6398 / #6399) ────────────────────────────────
+
+/// The row of `file` whose text contains `needle`.
+fn doc_line(file: &str, needle: &str) -> String {
+    read_src(file)
+        .lines()
+        .find(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("{file}: no line contains {needle:?}"))
+        .to_string()
+}
+
+#[test]
+fn security_md_model_weight_row_names_the_posture_6397() {
+    let row = doc_line("SECURITY.md", "**Model-weight fetch**");
+    assert!(
+        !row.contains("**NOT `AI_MEMORY_INFERENCE_EGRESS`**"),
+        "#6397: the posture DOES govern the model-weight lane since #4123:\n{row}"
+    );
+    assert!(
+        row.contains("AI_MEMORY_INFERENCE_EGRESS") && row.contains("remote_fetch_disabled_reason"),
+        "#6397: the row must name the posture and the live symbol:\n{row}"
+    );
+    assert!(
+        !row.contains("remote_fetch_disabled]"),
+        "#6397: the row cites a removed symbol:\n{row}"
+    );
+}
+
+#[test]
+fn telemetry_md_download_item_names_the_posture_6398() {
+    let item = doc_line("docs/telemetry.md", "one-time embedder model download");
+    assert!(
+        item.contains("AI_MEMORY_INFERENCE_EGRESS"),
+        "#6398: item (b) must list the restricted posture as a trigger:\n{item}"
+    );
+    assert!(
+        !item.contains("remote_fetch_disabled`") && item.contains("remote_fetch_disabled_reason"),
+        "#6398: item (b) must cite the live symbol:\n{item}"
+    );
+}
+
+#[test]
+fn architecture_row_58_scopes_hf_home_to_the_embedder_6399() {
+    let row = doc_line(
+        "docs/reference/ARCHITECTURE_REFERENCE.md",
+        "`AI_MEMORY_EMBED_OFFLINE`",
+    );
+    assert!(
+        row.contains("$HOME/.cache/huggingface/hub"),
+        "#6399: row 58 must state the cross-encoder cache root:\n{row}"
+    );
+    assert!(
+        !row.contains("so `HF_HOME` (cache root) and `HF_ENDPOINT` (mirror) are honoured"),
+        "#6399: HF_HOME is honoured by the MiniLM embedder only:\n{row}"
+    );
+}
