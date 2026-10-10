@@ -64,7 +64,8 @@ class StepExec(unittest.TestCase):
         self.assertGreaterEqual(n, 1)
 
     def test_non_numeric_job_start_falls_back_to_flat_watchdog(self):
-        for bogus in ('bogus', ''):
+        # #6834: leading-zero values are octal to bash arithmetic; '0' is no epoch.
+        for bogus in ('bogus', '', '089', '0', '00', 'abc', '12abc'):
             r, n = self.run_step(bogus)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertGreaterEqual(n, 1)

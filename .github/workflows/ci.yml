@@ -1074,6 +1074,7 @@ jobs:
           # actionlint expression-injection guard stays satisfied; sanitised
           # in-shell below into a pg-identifier-safe suffix.
           LEG: ${{ matrix.leg }}
+          CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}
         run: |
           set -euo pipefail
           # psql lives under a platform-specific prefix. Prepend it to
@@ -1122,6 +1123,25 @@ jobs:
           fi
           echo "AI_MEMORY_TEST_POSTGRES_URL=$new_url" >> "$GITHUB_ENV"
           echo "::notice::[enterprise-fed] created ephemeral db $CI_FED_DB on the native tier ($RUNNER_NAME) and pointed AI_MEMORY_TEST_POSTGRES_URL at it"
+          # #6383 / #6386 — per-binary Postgres isolation, OPT-IN (decided by
+          # GOD, review r1 M4): it runs only when AI_MEMORY_TEST_PG_ISOLATE is 1
+          # already in the job environment, and this workflow sets it on NO leg.
+          # Default-on (and --test-threads>1) waits for two green sharded
+          # carrier runs and a 5-agent vote (4d3ea1c5). CI_PG_ISOLATE_OFF=1
+          # (repo variable) is an extra hard kill switch. When on: assert the
+          # LIVE connection budget (fails closed), build the locked age+vector
+          # template, and export the template and this run's id (clone names
+          # carry it, so teardown touches only this run's clones). The URL
+          # reaches the wrapper through the environment, never argv.
+          if [ "${AI_MEMORY_TEST_PG_ISOLATE:-0}" != "1" ]; then
+            echo "::notice::[#6383] per-binary Postgres isolation is off (opt-in; not enabled for this leg)"
+          elif [ "${CI_PG_ISOLATE_OFF:-}" = "1" ]; then
+            echo "AI_MEMORY_TEST_PG_ISOLATE=0" >> "$GITHUB_ENV"
+            echo "::notice::[#6383] per-binary Postgres isolation disabled by CI_PG_ISOLATE_OFF=1"
+          else
+            AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB" --jobs 8 --emit-env >> "$GITHUB_ENV"
+            echo "::notice::[#6383] per-binary Postgres isolation ON: template ${CI_FED_DB}_tpl"
+          fi
 
       # Isolation shot after e380ca5d: mold + debuginfo=0 linked and RAN
       # the sqlite suite, then `hot_swap_llm_2166` SIGSEGV'd. That binary
@@ -1192,7 +1212,7 @@ jobs:
       # Self-hosted legs only: hosted runners are dedicated VMs.
       - name: Load gate (#6795)
         if: needs.classify.outputs.docs_only != 'true' && contains(matrix.runner, 'self-hosted')
-        run: python3 scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
+        run: python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
 
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.docs_only != 'true'
@@ -1211,6 +1231,7 @@ jobs:
           TEST_IMPACT_TOTAL: ${{ needs.classify.outputs.test_impact_total }}
           # #6795 — the job cap (minutes) the serial shard budget is derived from.
           JOB_TIMEOUT_MIN: ${{ matrix.timeout }}
+          CI_PG_ISOLATE_OFF: ${{ vars.CI_PG_ISOLATE_OFF }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1218,12 +1239,29 @@ jobs:
           # Invalid or missing: warn and keep the flat watchdog values (fail
           # toward the old behaviour, never toward a 0 s or empty watchdog).
           case "${JOB_T0:-}" in
-            ''|*[!0-9]*)
-              echo "::warning::[#6795] JOB_T0 missing or non-numeric; watchdogs keep their flat values"
+            ''|0*|*[!0-9]*)
+              echo "::warning::[#6795] JOB_T0 missing, non-numeric or zero-prefixed (octal in bash arithmetic); watchdogs keep their flat values"
               JOB_T0_VALID=0
               ;;
             *) JOB_T0_VALID=1 ;;
           esac
+          # #6383 / #6386 — the per-binary isolated lane is OPT-IN (review r1
+          # M4): it runs only with AI_MEMORY_TEST_PG_ISOLATE at 1 (set by no leg of
+          # this workflow), never with CI_PG_ISOLATE_OFF=1, and only on the
+          # enterprise-fed tier. With it on, the template and run id exported by
+          # the configure step are REQUIRED (review r1 M6: fail, never skip),
+          # so a residual binary can never clone the shared database. With it
+          # off the flag is forced to 0 for every cargo child.
+          PG_ISO_LANE=0
+          if [ "${AI_MEMORY_TEST_PG_ISOLATE:-0}" = "1" ] && [ "${CI_PG_ISOLATE_OFF:-}" != "1" ] && [ "${TIER:-}" = "enterprise-fed" ]; then
+            if [ -z "${AI_MEMORY_TEST_PG_TEMPLATE:-}" ] || [ -z "${AI_MEMORY_TEST_PG_RUN_ID:-}" ]; then
+              echo "::error::[#6383] AI_MEMORY_TEST_PG_ISOLATE is 1 but the template or run id was not exported by the configure step"
+              exit 1
+            fi
+            PG_ISO_LANE=1
+          else
+            export AI_MEMORY_TEST_PG_ISOLATE=0
+          fi
           # v1.0.0 2x2 — tier-parametrised feature/thread selection. The
           # `enterprise-fed` legs add `--features sal-postgres` and serialise
           # DDL with `-- --test-threads=1` (the sal-postgres suite shares one
@@ -1526,10 +1564,49 @@ jobs:
             fi
             return "$rc"
           }
+          # #6383 / #6386 — class (a) binaries when the opt-in lane is on:
+          # each binary runs `cargo test --no-fail-fast --test <bin>` against its
+          # OWN database cloned from the template, 8 at a time, in-binary
+          # --test-threads=1 unchanged (raising it is a T3/T6 vote item). The
+          # residual-serial names run last on the shared database. Same
+          # #1492 watchdog, #2500 --no-fail-fast and #2657 prebuild shapes as
+          # run_tests; the wrapper exits with the worst per-binary code.
+          # run_isolated_lane <label> <shard-dir> [cargo feature args...]
+          run_isolated_lane() {
+            local label="$1" sd="$2"; shift 2
+            local rc=0 started elapsed l tflag tname
+            local -a sel
+            # Review r1 H1: prebuild ONLY the impacted isolated targets (one
+            # `--test NAME` / `--bin NAME` per line, split into two quoted words
+            # as in run_shard, SC2206).
+            sel=()
+            while IFS= read -r l; do
+              [ -n "$l" ] || continue
+              read -r tflag tname <<< "$l"
+              sel+=("$tflag" "$tname")
+            done < "$sd/iso_targets.txt"
+            if [ "${#sel[@]}" -eq 0 ]; then
+              echo "::error::[#6383] '${label}': the isolated target list is empty"
+              return 2
+            fi
+            cargo test --no-run "$@" "${sel[@]}" || return "$?"
+            started=$(date +%s)
+            if [ -n "$TIMEOUT_BIN" ]; then
+              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" python3 scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --no-fail-fast "$@" || rc=$?
+            else
+              python3 scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --no-fail-fast "$@" || rc=$?
+            fi
+            elapsed=$(( $(date +%s) - started ))
+            echo "::notice::[#6383] '${label}' ran ${elapsed}s of the ${WATCHDOG_SECS}s per-invocation watchdog budget (tier=${TIER:-sqlite} node=${CI_NODE:-unknown})"
+            if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+              echo "::error::[#1492 watchdog] '${label}' exceeded the ${WATCHDOG_SECS}s per-invocation timeout (tier=${TIER:-sqlite}) and was terminated."
+            fi
+            return "$rc"
+          }
           # run_shard <name> <shard-dir> <threads> <lib-mode: pg|skip> <with-doc: 0|1>
           run_shard() {
             local name="$1" sd="$2" threads="$3" libmode="$4" with_doc="$5"
-            local list="$sd/$1.txt" t0 remaining rc=0 l tflag tname has_lib=0 n_it=0 n_lib=0
+            local list="$sd/$1.txt" t0 remaining rc=0 l tflag tname has_lib=0 n_it=0 n_lib=0 n_iso=0
             local -a itargs libargs
             itargs=(); libargs=()
             t0=$(date +%s)
@@ -1551,6 +1628,17 @@ jobs:
                 itargs+=("$tflag" "$tname"); n_it=$((n_it + 1))
               fi
             done < "$list"
+            if [ "$name" = "serial" ] && [ "$PG_ISO_LANE" = "1" ]; then
+              # #6383: the --test/--bin binaries move to the isolated lane; only
+              # the other selectors (--example, --bench) keep the single run.
+              itargs=(); n_it=0
+              while IFS= read -r l; do
+                [ -n "$l" ] || continue
+                read -r tflag tname <<< "$l"
+                itargs+=("$tflag" "$tname"); n_it=$((n_it + 1))
+              done < "$sd/iso_other.txt"
+              n_iso=$(grep -c . "$sd/iso_targets.txt" || true)
+            fi
             if [ "$has_lib" -eq 1 ]; then
               # Same prefixes on both sides: positional filter in the serial
               # shard, --skip in the parallel one. libtest substring matching
@@ -1579,6 +1667,14 @@ jobs:
               fi
               WATCHDOG_SECS="$remaining" run_tests "[${name}] test binaries" $FEAT "${itargs[@]}" -- --test-threads="$threads" || rc=$?
             fi
+            if [ "$n_iso" -gt 0 ]; then
+              remaining=$(shard_left "$t0")
+              if [ "$remaining" -lt 60 ]; then
+                echo "::error::[#6383 shard] ${name}: ${WATCHDOG_SECS}s shard budget exhausted before the isolated binaries"
+                return 124
+              fi
+              WATCHDOG_SECS="$remaining" run_isolated_lane "[${name}] isolated test binaries" "$sd" $FEAT || rc=$?
+            fi
             if [ "$with_doc" = "1" ]; then
               remaining=$(shard_left "$t0")
               if [ "$remaining" -lt 60 ]; then
@@ -1598,6 +1694,9 @@ jobs:
             echo "::notice::[#6344] '${label}': compile once, partition, then run serial + 2 parallel shards"
             cargo test --no-run --message-format=json-render-diagnostics $FEAT "$@" > "$sd/build.jsonl" || return "$?"
             python3 scripts/ci/partition_test_binaries.py --build-json "$sd/build.jsonl" --repo-root . --out-dir "$sd" --with-doc "$with_doc" || return "$?"
+            if [ "$PG_ISO_LANE" = "1" ]; then
+              python3 scripts/ci/pg_isolate_split.py --build-json "$sd/build.jsonl" --serial-file "$sd/serial.txt" --out-dir "$sd" || return "$?"
+            fi
             # #6795: the serial shard cannot be split further, so it gets the
             # whole job time left (job cap - time since the job started, which
             # includes the load-gate wait, setup, compile and partition - 300 s
@@ -1723,6 +1822,18 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+      # #6383 / #6386 review r1 M3 — one log file per isolated binary, written
+      # by scripts/test/pg_isolated_binary.py under the shard directory. Only
+      # present when the opt-in lane ran; uploaded on success AND failure.
+      - name: Upload isolated-lane per-binary logs (#6383)
+        if: needs.classify.outputs.docs_only != 'true' && always() && matrix.tier == 'enterprise-fed'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: pg-iso-logs-${{ matrix.node }}-${{ matrix.tier }}
+          path: ${{ runner.temp }}/ci-shard/iso-logs
+          if-no-files-found: ignore
+          retention-days: 30
+
       # cargo-audit runs once (the advisory DB is platform-independent) — on
       # the `once` leg so it does not multiply across the 2x2.
       - name: Security audit
@@ -1802,6 +1913,15 @@ jobs:
           # Connect to the base ai_memory_test to drop the ephemeral db. FORCE
           # terminates any lingering backend so the drop cannot wedge on a
           # still-connected test process.
+          # #6383: when the opt-in lane exported a run id, drop THIS run's
+          # leftover clones and the locked template first (no FORCE; another
+          # run's clones are never touched). Anything left behind is reclaimed
+          # by the admin-only `pg_isolated_binary.py sweep --older-than N`,
+          # which CI never runs. The URL travels in the environment, not argv.
+          if [ -n "${AI_MEMORY_TEST_PG_RUN_ID:-}" ]; then
+            AI_MEMORY_TEST_POSTGRES_URL="$base_url" python3 scripts/test/pg_isolated_binary.py teardown --db "$CI_FED_DB" --run-id "$AI_MEMORY_TEST_PG_RUN_ID" \
+              || echo "::warning::[#6383] isolation teardown failed on $RUNNER_NAME (admin sweep reclaims it)"
+          fi
           if psql "$base_url" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$CI_FED_DB\" WITH (FORCE);"; then
             echo "::notice::dropped ephemeral db $CI_FED_DB on $RUNNER_NAME"
           else
