@@ -827,8 +827,9 @@ def _require_shim_reachable(path, marker, timeout=GIT_SHIM_PROBE_TIMEOUT):
     """Positive probe (#6379): `git` looked up on `path` must be the shim, which
     answers GIT_SHIM_PROBE_ARG with this run's `marker` (a per-run random nonce,
     #6567/#6562) and nothing else. The answer is compared exactly (`marker` plus
-    one newline) on stdout only, so a decoy git that echoes a constant, pads or
-    affixes the marker, or writes it to stderr is refused. Any cause that makes
+    one newline) on stdout only, byte for byte, so a decoy git that echoes a
+    constant, pads or affixes the marker (a CR before the newline included),
+    changes its case, or writes it to stderr is refused (#6651). Any cause that makes
     the shim unreachable (not executable, an exec-refusing mount, a split PATH
     entry) lets lookup fall through to the real git; refuse by name so the cells
     never blame the gate for it. Output is decoded with errors="replace" so a
@@ -1714,8 +1715,9 @@ SELF_TEST_OK = (
     "(shim-probe-half, #6448) a git that exits 0 without the marker and a git that prints "
     "the marker but exits 1 are each refused; "
     "(shim-probe-exact, #6567/#6562) the probe answer is a per-run nonce compared exactly on "
-    "stdout, so an affixed, split, whitespace-padded, stderr-only, wrong-nonce or "
-    "blank-line-padded answer is refused; "
+    "stdout, so an affixed, split, whitespace-padded, stderr-only, wrong-nonce, "
+    "blank-line-padded, CR-padded (crlf, #6651) or upper-cased (upper, #6651) answer is "
+    "refused; "
     "(shim-probe-exact-noexec, #6650) a shim that cannot be executed in the nonce check is a "
     "named (shim-probe-exact) failure, never a traceback; "
     "(shim-pathsep-clean, #6428) a refused separator path leaves no shim directory; "
