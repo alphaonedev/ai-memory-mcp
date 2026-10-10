@@ -1239,8 +1239,8 @@ jobs:
           # Invalid or missing: warn and keep the flat watchdog values (fail
           # toward the old behaviour, never toward a 0 s or empty watchdog).
           case "${JOB_T0:-}" in
-            ''|*[!0-9]*)
-              echo "::warning::[#6795] JOB_T0 missing or non-numeric; watchdogs keep their flat values"
+            ''|0*|*[!0-9]*)
+              echo "::warning::[#6795] JOB_T0 missing, non-numeric or zero-prefixed (octal in bash arithmetic); watchdogs keep their flat values"
               JOB_T0_VALID=0
               ;;
             *) JOB_T0_VALID=1 ;;
