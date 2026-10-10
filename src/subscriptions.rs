@@ -2298,6 +2298,14 @@ pub(crate) fn normalize_ip(ip: IpAddr) -> IpAddr {
                 let v4_bits = (u32::from(segs[6]) << 16) | u32::from(segs[7]);
                 return IpAddr::V4(Ipv4Addr::from(v4_bits));
             }
+            // #6687 — the deprecated IPv4-compatible `::/96` form
+            // (`::127.0.0.1` serialises as `::7f00:1`) unwraps like `::ffff:`.
+            // `::` (unspecified) and `::1` (loopback) are IPv6 addresses in
+            // their own right and keep their IPv6 classification.
+            if segs[..6].iter().all(|seg| *seg == 0) && (segs[6] != 0 || segs[7] > 1) {
+                let v4_bits = (u32::from(segs[6]) << 16) | u32::from(segs[7]);
+                return IpAddr::V4(Ipv4Addr::from(v4_bits));
+            }
             IpAddr::V6(v6)
         }
         v4 @ IpAddr::V4(_) => v4,
