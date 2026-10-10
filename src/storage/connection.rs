@@ -1396,6 +1396,30 @@ mod tests {
         assert_ne!(query_only, 0, "existing open must stay query_only");
     }
 
+    /// #6861 (mutant N14) — the #6374 regular-file guard follows symlinks
+    /// (`metadata`, not `symlink_metadata`): a symlink to a REAL database is
+    /// the common deployment shape and must still open, while a symlink to a
+    /// non-regular target is refused.
+    #[cfg(unix)]
+    #[test]
+    fn open_existing_read_only_follows_a_symlink_to_a_real_database_6861() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let real = tmp.path().join("real.db");
+        drop(open(&real).expect("create"));
+        let link = tmp.path().join("link.db");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        open_existing_read_only(&link)
+            .expect("#6861: a symlink to a regular database file must open");
+        let dir_link = tmp.path().join("dirlink.db");
+        std::os::unix::fs::symlink(tmp.path(), &dir_link).expect("symlink to a directory");
+        let err = open_existing_read_only(&dir_link)
+            .expect_err("#6374: a symlink to a directory is not a database");
+        assert!(
+            format!("{err:#}").contains("not a regular file"),
+            "refusal names the file-type rule: {err:#}"
+        );
+    }
+
     #[test]
     fn open_existing_read_only_refuses_schema_behind_3411() {
         let tmp = tempfile::tempdir().expect("tempdir");
