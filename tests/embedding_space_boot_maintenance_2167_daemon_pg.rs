@@ -102,10 +102,13 @@ async fn daemon_bootstrap_runs_pg_embedding_space_boot_maintenance_2179() {
 
     // A throwaway sqlite db path for the (unused-by-pg) local handle; the store
     // is the postgres one selected by `store_url`.
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for local db");
+    // #6122 — both scratch handles stay bound until the test ends, so the
+    // main file, its -wal/-shm siblings and the TLS leaf dir are removed on
+    // drop instead of being leaked by `mem::forget`.
+    let tmp = common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile for local db");
     let path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
-    let tls = common::tls::TestTls::generate(&path.with_extension("tls3705"));
+    let tls_dir = tempfile::tempdir().expect("tls scratch dir");
+    let tls = common::tls::TestTls::generate(tls_dir.path());
 
     let args = serve_args(&url, &tls);
     let cfg = app_config_with_offline_api_embedder();
@@ -145,10 +148,13 @@ async fn daemon_bootstrap_skips_pg_boot_maintenance_on_sqlite_backend() {
         return;
     }
 
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for local db");
+    // #6122 — both scratch handles stay bound until the test ends, so the
+    // main file, its -wal/-shm siblings and the TLS leaf dir are removed on
+    // drop instead of being leaked by `mem::forget`.
+    let tmp = common::sqlite_tempfile::SqliteTempFile::new().expect("tempfile for local db");
     let path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
-    let tls = common::tls::TestTls::generate(&path.with_extension("tls3705"));
+    let tls_dir = tempfile::tempdir().expect("tls scratch dir");
+    let tls = common::tls::TestTls::generate(tls_dir.path());
 
     let args = ServeArgs {
         host: "127.0.0.1".to_string(),

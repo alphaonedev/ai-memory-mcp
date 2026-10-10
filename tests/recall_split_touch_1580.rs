@@ -26,7 +26,11 @@
 //!     RETURNS the row (the SELECT works) but does NOT touch it — proving
 //!     the read phase is write-free end-to-end.
 
+#[path = "common/sqlite_tempfile.rs"]
+mod sqlite_tempfile;
+
 use rusqlite::params;
+use sqlite_tempfile::SqliteTempFile;
 
 const SHORT_EXTEND: i64 = 3_600;
 const MID_EXTEND: i64 = 86_400;
@@ -67,7 +71,7 @@ fn read_tier(conn: &rusqlite::Connection, id: &str) -> String {
 
 #[test]
 fn touch_many_noop_on_readonly_then_full_ladder_on_writer() {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let writer = ai_memory::storage::open(tmp.path()).expect("open writer");
     seed_mid_at_4(&writer, "m1");
 
@@ -119,7 +123,7 @@ fn touch_many_noop_on_readonly_then_full_ladder_on_writer() {
 
 #[test]
 fn recall_on_readonly_connection_returns_rows_without_touching() {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp = SqliteTempFile::new().expect("tempfile");
     let writer = ai_memory::storage::open(tmp.path()).expect("open writer");
     seed_mid_at_4(&writer, "m1");
 

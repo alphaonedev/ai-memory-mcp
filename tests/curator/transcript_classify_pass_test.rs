@@ -22,6 +22,7 @@
 //! 5. The store guard protects `reflection` kinds from being clobbered, even
 //!    via a direct `reclassify_memory_kind` call.
 
+use crate::sqlite_tempfile::SqliteTempFile;
 use ai_memory::autonomy::AutonomyLlm;
 use ai_memory::curator::transcript_classify_pass::run_transcript_classify_pass;
 use ai_memory::db;
@@ -33,7 +34,6 @@ use ai_memory::store::{CallerContext, Filter, MemoryStore};
 use anyhow::Result;
 use chrono::Utc;
 use std::path::Path;
-use tempfile::NamedTempFile;
 
 const NS: &str = "ns-1393";
 
@@ -122,7 +122,7 @@ fn reclassified_audit_count(path: &Path) -> usize {
 
 #[tokio::test]
 async fn recovered_observation_reclassified_with_audit() {
-    let tmp = NamedTempFile::new().unwrap();
+    let tmp = SqliteTempFile::new().unwrap();
     let m = make_mem("recovered decision turn", true, MemoryKind::Observation);
     let id = m.id.clone();
     seed(tmp.path(), &[m]);
@@ -148,7 +148,7 @@ async fn recovered_observation_reclassified_with_audit() {
 
 #[tokio::test]
 async fn abstain_is_noop() {
-    let tmp = NamedTempFile::new().unwrap();
+    let tmp = SqliteTempFile::new().unwrap();
     let m = make_mem("recovered ambiguous turn", true, MemoryKind::Observation);
     let id = m.id.clone();
     seed(tmp.path(), &[m]);
@@ -169,7 +169,7 @@ async fn abstain_is_noop() {
 
 #[tokio::test]
 async fn non_recovered_observation_skipped() {
-    let tmp = NamedTempFile::new().unwrap();
+    let tmp = SqliteTempFile::new().unwrap();
     // No recovered-from-transcript tag → not a candidate.
     let m = make_mem("ordinary observation", false, MemoryKind::Observation);
     let id = m.id.clone();
@@ -193,7 +193,7 @@ async fn non_recovered_observation_skipped() {
 
 #[tokio::test]
 async fn dry_run_does_not_write() {
-    let tmp = NamedTempFile::new().unwrap();
+    let tmp = SqliteTempFile::new().unwrap();
     let m = make_mem("recovered dry-run turn", true, MemoryKind::Observation);
     let id = m.id.clone();
     seed(tmp.path(), &[m]);
@@ -220,7 +220,7 @@ async fn dry_run_does_not_write() {
 async fn reclassify_protects_reflection_kind() {
     // The store-layer guard: a reflection-kind memory is never clobbered,
     // even by a direct `reclassify_memory_kind` call (mirrors the upsert CASE).
-    let tmp = NamedTempFile::new().unwrap();
+    let tmp = SqliteTempFile::new().unwrap();
     let m = make_mem("a synthesised reflection", true, MemoryKind::Reflection);
     let id = m.id.clone();
     seed(tmp.path(), &[m]);
