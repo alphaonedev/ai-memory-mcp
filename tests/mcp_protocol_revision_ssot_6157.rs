@@ -613,3 +613,37 @@ fn issue_6521_walk_skips_every_path_the_repository_gitignores() {
         "the walk read a gitignored path (false red on a clean tree) or lost a trackable one"
     );
 }
+
+/// #6522: the walk must read every trackable text file, not a 14-extension
+/// allowlist. Each plant mirrors a tracked file type the allowlist skipped
+/// (`requirements.txt`, a `.jsonl` scenario set, a `Dockerfile`, a `.sql`
+/// bootstrap, a golden `.out`); all must be collected. A known binary type
+/// (`.pdf`, `.jpg`) is skipped without being read.
+#[test]
+fn issue_6522_walk_reads_every_trackable_text_file_type() {
+    const KEPT: [&str; 6] = [
+        "Dockerfile",
+        "benchmarks/longmemeval/requirements.txt",
+        "benchmarks/longmemeval_reflection/data/scenarios.jsonl",
+        "deploy/hive-1461/provision/pg-age/bootstrap.sql",
+        "deploy/zz/Dockerfile",
+        "tests/golden/probe.out",
+    ];
+    let scratch = scratch_tree("6522");
+    copy_gitignore(&scratch, ".gitignore");
+    for rel in KEPT {
+        plant(&scratch, rel, PLANT);
+    }
+    plant(&scratch, "docs/logo.jpg", "");
+    fs::write(scratch.join("docs/logo.jpg"), [0xff_u8, 0xd8, 0xff, 0xe0]).expect("plant jpg");
+    let (seen, unreadable) = walked(&scratch);
+    let _ = fs::remove_dir_all(&scratch);
+
+    assert!(unreadable.is_empty(), "unreadable: {unreadable:?}");
+    let mut want: Vec<String> = KEPT.iter().map(ToString::to_string).collect();
+    want.sort();
+    assert_eq!(
+        seen, want,
+        "the walk skipped a trackable text file type (false green)"
+    );
+}
