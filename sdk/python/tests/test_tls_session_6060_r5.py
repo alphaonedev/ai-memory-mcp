@@ -1897,3 +1897,22 @@ def test_refused_gate_closes_the_sync_transports_6693() -> None:
     with pytest.raises(ValueError, match="#6537"):
         _common.gate_transports(client, kwargs, context)
     assert recording.closed
+
+
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync", "async"])
+def test_closing_the_client_closes_the_gated_inner_transport_6694(is_async: bool) -> None:
+    context = ssl.create_default_context()
+    kwargs = _gate_kwargs(context, is_async=is_async)
+    if is_async:
+        inner: Any = _AsyncRecordingTransport()
+        client: Any = httpx.AsyncClient(**{**kwargs, "transport": inner})
+    else:
+        inner = _RecordingTransport()
+        client = httpx.Client(**{**kwargs, "transport": inner})
+    _common.gate_transports(client, kwargs, context)
+    assert client._transport is not inner  # noqa: SLF001 - wrapped
+    if is_async:
+        asyncio.run(client.aclose())
+    else:
+        client.close()
+    assert inner.closed
