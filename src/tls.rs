@@ -1534,8 +1534,7 @@ mod tests {
         let certs = rustls_pki_pem_iter_certs(&pem).unwrap();
         assert!(
             certs.len() >= 2,
-            "expected leaf + intermediate, got {}",
-            certs.len()
+            "expected leaf + intermediate (at least two certs) in cert_chain.pem"
         );
     }
 
@@ -1620,7 +1619,10 @@ mod tests {
         let cert = rustls::pki_types::CertificateDer::from(fake_cert.to_vec());
         let now = rustls::pki_types::UnixTime::now();
         let result = verifier.verify_client_cert(&cert, &[], now);
-        assert!(result.is_ok(), "expected accept, got: {result:?}");
+        assert!(
+            result.is_ok(),
+            "expected the allowlisted fingerprint to be accepted"
+        );
     }
 
     #[test]
@@ -1783,7 +1785,7 @@ mod tests {
         let cert = rustls::pki_types::CertificateDer::from(cert_bytes.to_vec());
         let now = rustls::pki_types::UnixTime::now();
         let res = verifier.verify_server_cert(&cert, &[], &server_name("peer.example"), &[], now);
-        assert!(res.is_ok(), "matching pinned fp must be accepted: {res:?}");
+        assert!(res.is_ok(), "matching pinned fp must be accepted");
     }
 
     #[test]
@@ -1831,10 +1833,7 @@ mod tests {
         let cert = rustls::pki_types::CertificateDer::from(b"unpinned-host cert".to_vec());
         let now = rustls::pki_types::UnixTime::now();
         let res = verifier.verify_server_cert(&cert, &[], &server_name("other.example"), &[], now);
-        assert!(
-            res.is_ok(),
-            "AcceptAny fallthrough must pass unpinned host: {res:?}"
-        );
+        assert!(res.is_ok(), "AcceptAny fallthrough must pass unpinned host");
     }
 
     /// CRITICAL (#1678 5-agent vote 4d3ea1c5): the pin verifier MUST do REAL
