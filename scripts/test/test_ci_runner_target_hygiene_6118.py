@@ -877,6 +877,15 @@ def _toml_entries(text: str) -> List[Tuple[Tuple[str, ...], str]]:
     return out
 
 
+def _toml_alias_command(value: str) -> str:
+    """The command line of a cargo ``[alias]`` value: a string, or an array of words joined by blanks."""
+    text = value.strip()
+    if text.startswith("["):
+        inner = text[1:-1] if text.endswith("]") else text[1:]
+        return " ".join(w.strip().strip("\"'") for w in _toml_split(inner, ",") if w.strip())
+    return text.strip("\"'")
+
+
 def toml_debug_findings(text: str) -> List[str]:
     """Debuginfo overrides cargo would honour over the ``CARGO_PROFILE_*_DEBUG=0`` pin (#6255)."""
     found: List[str] = []
@@ -901,6 +910,11 @@ def toml_debug_findings(text: str) -> List[str]:
         if path == ("cargo-features",) or path[0] == "unstable":
             found.append("%s (a cargo nightly feature switch; with RUSTC_BOOTSTRAP it enables profile rustflags)"
                          % dotted)
+        if path[0] == "alias" and len(path) == 2:
+            # an alias value is a cargo command line (#6475 #6489): judge it as a run line would be judged
+            command = "cargo " + _toml_alias_command(value)
+            for spelled in _level_spellings(command, False) + _run_findings(command):
+                found.append("%s (alias) carries %s" % (dotted, spelled))
         if path[0] == "build" and len(path) == 2 and path[1] in ("rustc", "rustc-wrapper", "rustc-workspace-wrapper"):
             found.append("%s = %s (a compiler wrapper can add any debuginfo flag)" % (dotted, value.strip()))
     return found
