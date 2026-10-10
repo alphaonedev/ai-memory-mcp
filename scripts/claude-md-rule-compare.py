@@ -1793,6 +1793,51 @@ def _self_test_cases() -> int:
 
     guarded("the program exit code for an unapproved and an approved rule change (#6741) fixture", cli_exit_cell)
 
+    # #6712: history substitution through local repository state. A replace object that swaps the head commit for one
+    # carrying an approval, and one that grafts an approved commit in as a parent, must not make an unapproved range
+    # pass (the git calls pin GIT_NO_REPLACE_OBJECTS=1); a graft file or GIT_GRAFT_FILE is refused outright.
+    def replace_cell():
+        work, fork_sha, base_root = fresh_pair("replaceswap")
+        repo = work / "repo"
+        reword(repo)
+        head_sha = commit_all(repo, "head change")
+        approved = git(repo, *IDENT, "commit-tree", f"{head_sha}^{{tree}}", "-p", fork_sha, "-m",
+                       "head change\n\nRule-Change-Approved-By: Justin").decode().strip()
+        git(repo, "replace", head_sha, approved)
+        range_cell("a replace object that swaps the head for an approved commit does not approve it (#6712)", work,
+                   base_root, repo, fork_sha, head_sha, True, "no commit in the range carries")
+        work, fork_sha, base_root = fresh_pair("replacegraft")
+        repo = work / "repo"
+        old_sha = git(repo, *IDENT, "commit-tree", f"{fork_sha}^{{tree}}", "-p", fork_sha, "-m",
+                      "old change\n\nRule-Change-Approved-By: Justin").decode().strip()
+        reword(repo)
+        head_sha = commit_all(repo, "head change")
+        git(repo, "replace", "--graft", head_sha, fork_sha, old_sha)
+        range_cell("a grafted approved parent does not approve the head (#6712)", work, base_root, repo, fork_sha,
+                   head_sha, True, "no commit in the range carries")
+        work, fork_sha, base_root = fresh_pair("graftfile")
+        repo = work / "repo"
+        reword(repo)
+        head_sha = commit_all(repo, "head change\n\nRule-Change-Approved-By: Justin")
+        grafts = repo / ".git" / "info" / "grafts"
+        grafts.parent.mkdir(parents=True, exist_ok=True)
+        grafts.write_text(f"{head_sha} {fork_sha}\n", encoding="utf-8")
+        range_cell("a repository with a graft file is refused (#6712)", work, base_root, repo, fork_sha, head_sha, True,
+                   "has a graft file")
+        grafts.unlink()
+        saved_graft = os.environ.get("GIT_GRAFT_FILE")
+        os.environ["GIT_GRAFT_FILE"] = str(grafts)
+        try:
+            range_cell("a GIT_GRAFT_FILE override is refused (#6712)", work, base_root, repo, fork_sha, head_sha, True,
+                       "has a graft file")
+        finally:
+            if saved_graft is None:
+                os.environ.pop("GIT_GRAFT_FILE", None)
+            else:
+                os.environ["GIT_GRAFT_FILE"] = saved_graft
+
+    guarded("replace objects and grafts cannot approve a range (#6712) fixture", replace_cell)
+
     # #6742: the shallow refusal is "anything but a plain `false`". A git too old to know --is-shallow-repository
     # echoes the option name back; that answer must be refused, not read as "not shallow". The stand-in git sits first
     # on PATH and answers only that query, every other call goes to the real git (reviewer mutant X5, `== "true"`).
