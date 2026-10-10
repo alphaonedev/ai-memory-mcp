@@ -447,13 +447,13 @@ _STR_TOKEN_RE = re.compile(r'["\\]')
 _LOOP_HEADER_RE = re.compile(r"(?:^|[ :])loop$|\bwhile (?:true|! false)$")
 # Any loop an unlabelled `break` can leave (loop, while, for).
 _BREAK_TARGET_RE = re.compile(r"(?:^|: |= )(?:loop|while|for)\b")
-_PATH = r"(?::: )?(?:[^\W\d]\w* :: )*"
+_PATH = r"(?::: )?(?:(?:r\#)?[^\W\d]\w* :: )*"
 _EXIT_RE = re.compile(
     r"^(?:let\b[^=]*= )?(?:return\b|break\b|continue\b|"
-    + _PATH + r"(?:todo|unimplemented|unreachable|panic) !|"
-    + _PATH + r"(?:exit|abort) \(|"
+    + _PATH + r"(?:r\#)?(?:todo|unimplemented|unreachable|panic) !|"
+    + _PATH + r"(?:r\#)?(?:exit|abort) \(|"
     + _PATH + r"assert ! \( false \))")
-_MOD_DECL_RE = re.compile(r"^(?:pub(?: \( [^()]* \))? )?mod ([^\W\d]\w*)$")
+_MOD_DECL_RE = re.compile(r"^(?:pub(?: \( [^()]* \))? )?mod (?:r\#)?([^\W\d]\w*)$")
 _PROPAGATE_RE = re.compile(r"^(?:unsafe|if (?:true|! false))?$")
 _HEADER_RULES = (
     (re.compile(r"\bif (?:false|! true)(?: && .*)?$"), "inside an `if false` block"),
@@ -562,8 +562,9 @@ def _header_findings(norm, vals):
         lo, hi = _int_lit(rng.group(1)), _int_lit(rng.group(3))
         if lo is not None and hi is not None and (lo > hi or (lo == hi and rng.group(2) == "..")):
             out.add(f"inside a `for` over an empty range ({rng.group(1)}{rng.group(2)}{rng.group(3)})")
-    if len(vals) >= 2 and vals[-1] == "!" and re.fullmatch(r"[^\W\d]\w*", vals[-2]) \
-            and vals[-2] not in _KEYWORDS and "macro_rules" not in vals:
+    # `r#name!` is the macro `name` (#6841); a raw name is never a keyword
+    if len(vals) >= 2 and vals[-1] == "!" and re.fullmatch(r"(?:r#)?[^\W\d]\w*", vals[-2]) \
+            and (vals[-2].startswith("r#") or vals[-2] not in _KEYWORDS) and "macro_rules" not in vals:
         out.add(f"inside the input of a macro invocation `{vals[-2]}!` (it expands to whatever "
                 "the macro makes of it)")
     return out
