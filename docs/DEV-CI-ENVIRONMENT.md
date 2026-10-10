@@ -142,7 +142,39 @@ controls, both pinned by `scripts/test/test_ci_runner_target_hygiene_6118.py`
   included; it beats the `CARGO_PROFILE_*` env) or a custom `cargo --profile`, and it
   censuses every job whose `runs-on` can resolve to a self-hosted runner
   (`ubuntu-slim` and the `ubuntu-`/`macos-`/`windows-` images count as
-  GitHub-hosted).
+  GitHub-hosted). It also fails such a job on:
+  - **Unreadable workflow text.** The reader takes a strict subset of YAML. A
+    quoted or spaced key, a wide dash, an anchor, alias or tag, a duplicate key
+    or an unknown top-level key is refused rather than skipped.
+  - **Shell.** A step `shell:` or `defaults.run.shell` outside the shell
+    allowlist (`bash`, `sh`, and their `-e {0}` / `--noprofile --norc -eo
+    pipefail {0}` forms), and a self-hosted job in a `container:`.
+  - **`uses:`.** Any action outside the allowlist; an allowlisted action's
+    `with:` inputs are judged as env rows.
+  - **Cargo config files.** `[profile.<p>]` settings, `[build]` / `[target.*]`
+    `rustflags` / `rustdocflags`, `rustc` / `rustc-wrapper` /
+    `rustc-workspace-wrapper`, and each `[alias]` value, read as a cargo command
+    line. A cargo config `include` fails closed, because the included file is
+    not read.
+  - **Scripts.** A committed shell script that a run step executes is read up
+    to three levels deep. Any other interpreter (`python`, `make`, `node`, ...)
+    or a file outside the repository is a finding unless the file is on the
+    script allowlist (only `scripts/ci/prune-runner-target.py`).
+  - **R-PRUNE: target dir.** A build that writes outside the pruned
+    `target/<profile>`, through `CARGO_TARGET_DIR`, `CARGO_BUILD_TARGET_DIR`,
+    `CARGO_BUILD_TARGET`, `--target-dir`, `--target`, `build.target-dir` or
+    `build.target`. The exception is the three exact allowlisted target dirs
+    (`.local-runs/ci-prebuilt-t0`, `$REPO_ROOT/target/cert-gate-pg`,
+    `$REPO_ROOT/target/cert-gate-driverless`).
+  - **Dynamic names.** An env write whose variable *name* is computed at run
+    time (`export "$n=..."`, `printf '%s=' "$n" >> "$GITHUB_ENV"`, `declare`,
+    `read` into a computed name), because the guard cannot tell which variable
+    it sets.
+  - **Unreadable values.** A `${{ }}` expression as the value of a debug or
+    flags key.
+  - **`working-directory`.** A step `working-directory` or a job or workflow
+    `defaults.run.working-directory`, which moves cargo to another
+    `.cargo/config`.
 - **`Prune runner target dir (#6118)` is the LAST step of each such job**,
   under `if: always() && ... && steps.checkout.outcome == 'success'` (it never
   runs a script the job's own checkout did not produce), running
@@ -179,9 +211,25 @@ controls, both pinned by `scripts/test/test_ci_runner_target_hygiene_6118.py`
   the `::notice::` line carries `warnings=<n>`, and the exit code is still 0:
   the step runs under `if: always()` and a finished prune must not turn a job
   red (#6300). Only the refusals above exit 2. Names in those lines are
-  escaped (a backslash `\\`, `%` `%25`, `#` `%23`, CR `%0D`, LF `%0A`, any other C0 control character or DEL `\xNN`, a non-UTF-8 byte `\xNN`, a C1 control code point U+0080-U+009F `\u{hex}` (never `\xNN`, so it cannot print the same as the raw byte), and U+2028 / U+2029, bidi, zero-width, space separators other than U+0020, combining and enclosing marks, the Hangul fillers U+115F / U+1160 / U+3164 / U+FFA0, the blank braille pattern U+2800, private-use and unassigned code points, and any surrogate outside U+DC80-U+DCFF `\u{hex}`),
-  so a file name cannot start a workflow command of its own (the runner also
-  parses the legacy `##[command]` form anywhere in a line). A directory nested
+  escaped as in the table below, so a file name cannot start a workflow command
+  of its own (the runner also parses the legacy `##[command]` form anywhere in
+  a line). The mapping is injective (two different names never print the same)
+  and total (printing never raises):
+
+  | In the name | Printed as |
+  | --- | --- |
+  | a backslash | `\\` (doubled first, so every escape below is unambiguous) |
+  | `%`, `#`, CR, LF | `%25`, `%23`, `%0D`, `%0A` |
+  | any other C0 control character, DEL | `\xNN` |
+  | a byte that is not UTF-8 | `\xNN` |
+  | a C1 control code point U+0080-U+009F | `\u{hex}` (never `\xNN`, so it cannot print the same as the raw byte) |
+  | U+2028 / U+2029, bidi and zero-width format characters | `\u{hex}` |
+  | space separators other than U+0020, combining and enclosing marks | `\u{hex}` |
+  | the Hangul fillers U+115F / U+1160 / U+3164 / U+FFA0, the blank braille pattern U+2800 | `\u{hex}` |
+  | private-use and unassigned code points | `\u{hex}` |
+  | a surrogate outside U+DC80-U+DCFF | `\u{hex}` |
+
+  A directory nested
   more than 100 levels deep is warned about and left in place. `freed_bytes`
   is exact on Linux: a hard-linked file counts once, and only when all of its
   links go. On macOS/APFS it is an upper bound: each clone counts at full
