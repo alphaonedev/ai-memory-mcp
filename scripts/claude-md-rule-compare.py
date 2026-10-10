@@ -96,7 +96,10 @@ DRIFT_MARKERS = ("changed: sha256", "is not pinned in", "is missing from CLAUDE.
 
 def git(repo: Path, *args: str) -> bytes:
     """Run git in `repo` and return stdout bytes; a non-zero exit raises RuntimeError (fail closed)."""
-    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=False)
+    # #6712: local replace objects (refs/replace, `git replace --graft`) change the messages and parents base..head reads;
+    # every git call here ignores them, so the history the comparison judges is the history that was fetched.
+    env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")
+    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=False, env=env)
     if result.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.decode('utf-8', 'replace').strip()}")
     return result.stdout
@@ -263,6 +266,12 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
     # option echoes it back) is refused.
     if git(repo, "rev-parse", "--is-shallow-repository").decode().strip() != "false":
         raise RuntimeError("the repository is shallow (or git cannot say); the comparison needs full history (#6573)")
+    # #6712: a legacy graft file (old git still honours it, new git ignores it) rewrites parents the same way a replace
+    # object does and cannot be switched off per call, so a repository that has one, or a GIT_GRAFT_FILE override, is refused.
+    graft_path = git(repo, "rev-parse", "--git-path", "info/grafts").decode().strip()
+    if "GIT_GRAFT_FILE" in os.environ or os.path.lexists(repo / graft_path):
+        raise RuntimeError("the repository has a graft file (info/grafts or GIT_GRAFT_FILE); the comparison needs the "
+                           "real history (#6712)")
     guard = load_base_guard(base_root)
     head_root = scratch / "head"
     if head_root.exists():
