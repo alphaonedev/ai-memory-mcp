@@ -1240,6 +1240,30 @@ def self_test():
         check(label, lambda t=text, w=want: None if forbidden_triggers(t) == w
               else f"forbidden_triggers is {forbidden_triggers(t)!r}, want {w!r}")
 
+    # #6452 (security round 4, mutant S13): both #6143 jobs take their token from `github.token`
+    # and never reference a repository secret.
+    live_at = wf_text.index("  carrier-ruleset-live-gate:\n")
+    fresh_at = wf_text.index("  carrier-base-fresh-gate:\n")
+    pat = "GH_TOKEN: ${{ secrets.PAT }}"
+    tok = "GH_TOKEN: ${{ github.token }}"
+    s13 = wf_text[:live_at] + wf_text[live_at:].replace(tok, pat, 1)
+    fresh_secret = wf_text[:fresh_at] + wf_text[fresh_at:].replace(
+        "    steps:\n", "    steps:\n      - run: echo ${{ secrets.OTHER }}\n", 1)
+    no_tok = wf_text[:live_at] + wf_text[live_at:].replace("          " + tok + "\n", "", 1)
+    for label, text, want in (
+            ("job token: committed workflow is clean", wf_text, 0),
+            ("job token: verifier GH_TOKEN from a repository secret", s13, 1),
+            ("job token: secret in the freshness job", fresh_secret, 1),
+            ("job token: verifier GH_TOKEN absent", no_tok, 1),
+            ("job token: bracket secrets syntax", wf_text[:live_at] + wf_text[live_at:].replace(
+                tok, "GH_TOKEN: ${{ secrets['PAT'] }}", 1), 1),
+            ("job token: github.token with a suffix", wf_text[:live_at] + wf_text[live_at:].replace(
+                tok, "GH_TOKEN: ${{ github.token }}x", 1), 1),
+            ("job token: a #6143 job is missing", wf_text.replace("  carrier-ruleset-live-gate:\n",
+                                                                "  carrier-ruleset-gone:\n", 1), 1)):
+        check(label, lambda t=text, w=want: None if (len(job_token_problems(t)) >= 1) is bool(w)
+              else f"job_token_problems is {job_token_problems(t)!r}, want {'problems' if w else 'none'}")
+
     # R3-F5 (code): TRACKING_ISSUE is assigned once and never read from env vars.
     own = Path(__file__).read_text(encoding="utf-8")
     pin_assign = r"(?<![A-Za-z_])TRACKING_ISSUE\s*(?:[-+*/|&]?=(?!=)|:=)"
