@@ -173,7 +173,8 @@ ALWAYS_MASK_NAME = re.compile(r"(?i)passw(?:or)?d|passphrase")
 # Round 6 (#6851): "followed by a host" means one or more characters that are not whitespace, `@`, `/`, `?` or `#`,
 # then a path, query, fragment, whitespace or the end of the text; the host is not judged, so a Markdown or prose
 # terminator after it (a backtick, `)`, `,`, `>`, a quote), an IPv6 literal, an underscore or a non-ASCII host all end it.
-URL_USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]*:([^\s@]+(?:@[^\s@]*)*)@(?=[^\s@/?#]+(?:[/?#]|\s|$))")
+# Round 6 (#6929): an empty host followed by a path, query or fragment (`postgresql://u:pw@/db?host=/run`) ends it too.
+URL_USERINFO = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^/\s:@]*:([^\s@]+(?:@[^\s@]*)*)@(?=[^\s@/?#]+(?:[/?#]|\s|$)|[/?#])")
 URL_USER_MIN = 20
 URL_USER_ONLY = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://([^/?#\s:@]{" + str(URL_USER_MIN) + r",})@")
 BEARER_VALUE = re.compile(r"(?i)\b(?:bearer|basic)\s+([A-Za-z0-9._~+/-]{8,}=*)")
