@@ -3495,12 +3495,45 @@ def _trusted_round7_cells(t, judge, shapes):
         t.fail("(tr-log-cf-name): a raw U+202E from the file name reached the log:", out)
 
 
-# The cells each round pinned, as the SELF_TEST_OK line must name them (#6765).
-SUMMARY_CELLS = {
-    "round 6": ("shim-trace", "tr-s-ws-U+XXXX", "tr-s-ws-lines", "tr-s-ws-nine", "ws-wording"),
-    "round 7": ("tr-s-ws-oneline", "tr-s-ws-dedup", "tr-s-ws-eight", "tr-s-ws-count", "tr-s-ws-line1-U+XXXX",
-                "log-safe-cf-U+XXXX", "tr-log-cf-who", "tr-log-cf-name"),
-}
+# The cell functions of rounds 6 to 8 and the cell-name prefix to take from each; the names are read
+# from their source, so a cell added to one of them must be named in SELF_TEST_OK (#6765, #6920).
+SUMMARY_CELL_SOURCES = (
+    ("_shim_trace_cells", ""),
+    ("_trusted_round5_cells", "tr-s-ws-"),
+    ("_ws_unit_cells", ""),
+    ("_ws_format_cells", ""),
+    ("_ws_wording_cells", ""),
+    ("_log_safe_cells", ""),
+    ("_trusted_round7_cells", ""),
+    ("_summary_cells", ""),
+)
+SUMMARY_ROUNDS = (4, 5, 6, 7, 8)
+_CELL_NAME_RES = (
+    re.compile(r"\(([a-z][a-z0-9]*(?:-[a-z0-9]+)+(?:-U\+(?:XXXX|\{[^}]*\}))?)\)"),
+    re.compile(r"\b(?:judge|_ws_format_cell)\((?:t, )?\"([a-z][^\"]*)\""),
+    re.compile(r"\blabel = f?\"([a-z][^\"]*)\""),
+)
+
+
+def _summary_cell_names():
+    """{cell name: defining function} read from the source of SUMMARY_CELL_SOURCES
+    (a hex field `-U+{code:04X}` is normalised to `-U+XXXX`), and the sources
+    that could not be found."""
+    own = Path(__file__).read_text(encoding="utf-8")
+    segments = {node.name: ast.get_source_segment(own, node)
+                for node in ast.walk(ast.parse(own)) if isinstance(node, ast.FunctionDef)}
+    names, missing = {}, []
+    for function, prefix in SUMMARY_CELL_SOURCES:
+        segment = segments.get(function)
+        if segment is None:
+            missing.append(function)
+            continue
+        for pattern in _CELL_NAME_RES:
+            for found in pattern.findall(segment):
+                name = re.sub(r"-U\+\{[^}]*\}", "-U+XXXX", found)
+                if name.startswith(prefix):
+                    names.setdefault(name, function)
+    return names, missing
 
 
 def _self_test_ok_literals():
@@ -3531,13 +3564,17 @@ def _summary_cells(t):
     for left, right in zip(literals, literals[1:]):
         if left[-1:].isalnum() and right[:1].isalnum():
             t.fail(f"(summary-join): SELF_TEST_OK joins {left[-12:]!r} and {right[:12]!r} without a space")
-    for number in (4, 5, 6, 7):
+    for number in SUMMARY_ROUNDS:
         if f"round {number}" not in SELF_TEST_OK:
             t.fail(f"(summary-rounds): SELF_TEST_OK carries no sentence for round {number}")
-    for label, names in SUMMARY_CELLS.items():
-        for name in names:
-            if name not in SELF_TEST_OK:
-                t.fail(f"(summary-rounds): SELF_TEST_OK does not name the {label} cell {name}")
+    names, missing = _summary_cell_names()
+    for function in missing:
+        t.fail(f"(summary-rounds): cell function {function} named in SUMMARY_CELL_SOURCES does not exist")
+    if len(names) < 20:
+        t.fail(f"(summary-rounds): only {len(names)} cell names were read from SUMMARY_CELL_SOURCES")
+    for name, function in sorted(names.items()):
+        if not re.search(r"(?<![A-Za-z0-9+-])" + re.escape(name) + r"(?![A-Za-z0-9+-])", SELF_TEST_OK):
+            t.fail(f"(summary-rounds): SELF_TEST_OK does not name the cell {name} (defined in {function})")
 
 
 def _ws_unit_cells(t):
