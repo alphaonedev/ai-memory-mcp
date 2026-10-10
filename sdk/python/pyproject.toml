@@ -45,7 +45,9 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "mypy>=1.8,<3",
-    "ruff>=0.3",
+    # #6662: one minor, so the `ruff format --check` gate cannot move under
+    # a new ruff release; bump it together with a reformat commit.
+    "ruff>=0.17,<0.18",
     "cryptography>=42.0",
     # #6688: the TLS security tests need these; without them the SOCKS legs
     # of the session check (#6349, #6537) and the truststore pins (#6267)
