@@ -1394,17 +1394,22 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
          for k in ("PR_HEAD_SHA", "GITHUB_SHA", "PR_BASE_SHA")]
         + [("push", k, push_sha_env) for k in ("GITHUB_EVENT_BEFORE", "GITHUB_SHA")]
     )
-    # Each non-length value below catches the loosening named on its row; the `$`, fullwidth and
-    # lstrip rows are the only cells for theirs, the Arabic-Indic and newline rows are not (noted there):
+    # Each non-length value below catches at least the loosening named on its row; only the fullwidth
+    # row is the sole killer of its loosening (the whitespace corpus below also covers the newline,
+    # CR and space rows, and the pr4 non-ASCII-digit cell also covers Arabic-Indic):
     #   Arabic-Indic digit  : a `\d` / `str.isdigit` / any-Unicode-digit class (the pr4 non-ASCII-digit
     #                         cell also catches these; this row is not their only killer).
     #   fullwidth digit     : a class widened with the fullwidth digit range U+FF10-U+FF19.
-    #   40-hex plus newline : a `$`-anchored match (only this cell); a `.strip()` before the match is
+    #   40-hex plus newline : a `$`-anchored match; a `.strip()` before the match is
     #                         also caught by the CR row and the whitespace corpus.
     #   40-hex plus CR      : a `.rstrip('\r')` before the match.
     #   space plus 40-hex   : a `.strip(' ')` or `.lstrip()` before the match.
     #   superscript digit   : a translate of superscript digits to ASCII before the match.
     #   40 non-hex letter   : a `len in (40, 64)` plus `isascii() and isalnum()` check instead of hex.
+    #   BOM plus 40-hex     : a `.strip('\ufeff')` or BOM strip before the match.
+    #   RLO plus 40-hex     : removal of bidi / format (Cf) characters such as U+202E before the match.
+    #   40-hex plus combining acute : a combining-mark drop (NFD, then filter `combining`) before the match.
+    #   64-hex with one Cyrillic a  : a confusable fold of Cyrillic letters to ASCII before the match.
     # (#6414, #6404)
     sha_len_values = (("63-hex", "b" * 63), ("65-hex", "b" * 65),
                       ("40 Arabic-Indic digit", "\u0661" * 40),
