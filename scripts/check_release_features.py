@@ -424,6 +424,17 @@ DOCKER_RUNTIME_ASSERT = ("RUN set -eu; " + ALLOWED_REQUIRE_IMAGE + '; test -n "$
 # the commit under test (the #6275 content-hash bind, 5-agent vote (4d3ea1c5)
 # D3=C) and runs it under an empty environment with absolute interpreters.
 SHAPE_PROOF_SCRIPT = "scripts/release-shape-pg-proof.sh"
+# #6285/#6286: (fragment, statements it must carry). One per child of #6062.
+RELEASE_FRAGMENTS: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("4720.fixed.md", ()),
+    ("4752.security.md", ()),
+    ("4768.security.md", ("5-agent vote (4d3ea1c5)", "#6275", "#6277")),
+    ("4935.security.md", ()),
+    ("4936.fixed.md", ()),
+    ("4937.security.md", ()),
+    ("6287.removed.md", ("5-agent vote 4d3ea1c5",)),
+    ("3613.added.md", ("Not yet proven", "aarch64-unknown-linux-gnu", "#6407", "#6408", "#6409")),
+)
 SHAPE_BIND_ENV: Dict[str, "Spec"] = {"PREFLIGHT_SHA": "${{ github.sha }}"}
 SHAPE_PROOF_BIND = sane_bind((SHAPE_PROOF_SCRIPT, "scripts/release-features.sh", "scripts/assert-compiled-features.sh"))
 SHAPE_PROOF_CMD = SANE_BASH + " " + SHAPE_PROOF_SCRIPT + ' target/release/ai-memory "$url"'
@@ -2209,6 +2220,26 @@ def check_shape(text: str, rep: Report, advisory: Optional[bool] = None) -> None
             rep.bad(msg)
 
 
+def check_release_fragments(root: Path, rep: Report) -> None:
+    """#6285/#6286: every child of umbrella #6062 carries its changelog.d
+    fragment, and each fragment states what it must (the vote it rests on,
+    the parts not yet proven) so the release notes never overclaim."""
+    for name, needles in RELEASE_FRAGMENTS:
+        path = root / "changelog.d" / name
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            rep.bad(f"changelog.d/{name} missing or unreadable (#6285/#6286)")
+            continue
+        issue = "#" + name.split(".", 1)[0]
+        head = re.match(r"\*\*(.+?)\*\*", text, re.S)
+        if head is None or f"({issue}" not in head.group(1):
+            rep.bad(f"changelog.d/{name}: does not open with a bold entry naming ({issue} (#6285/#6286)")
+        for needle in needles:
+            if needle not in text:
+                rep.bad(f"changelog.d/{name} does not state {needle!r} (#6285/#6286)")
+
+
 def check_install(text: str, rep: Report) -> None:
     m = re.search(r"^## Pre-built Binaries.*?(?=^## (?!Pre-built Binaries))", text, re.M | re.S)
     section = m.group(0) if m else ""
@@ -2306,6 +2337,7 @@ def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], s
     if install is not None:
         check_install(install, rep)
     check_workflow_sweep(root, rep)
+    check_release_fragments(root, rep)
     return rep.errors, declared
 
 
@@ -2331,7 +2363,11 @@ INPUT_FILES = (REL, SHAPE, DOCKER, INSTALL, DECL, ASSERTER, SHAPE_PROOF_SCRIPT, 
 
 def mutate_file(path: Path, old: str, new: Union[str, None, Transform], every: bool = False) -> None:
     """Apply one edit. ``new`` None deletes the file, a callable transforms the
-    whole text, an empty ``old`` overwrites the file (surrogateescape bytes)."""
+    whole text, an empty ``old`` overwrites the file (surrogateescape bytes).
+    A missing file (other than one an overwrite creates) is a broken case,
+    reported as such, never a crash."""
+    if not (old == "" and isinstance(new, str)) and not path.is_file():
+        raise RuntimeError(f"mutation target missing: {path.name}")
     if new is None:
         path.unlink()
         return
@@ -2358,6 +2394,10 @@ def mk_root(src: Path, dst: Path) -> None:
     for wf in sorted((src / WORKFLOWS).glob("*.y*ml")):
         if wf.is_file() and not (dst / WORKFLOWS / wf.name).exists():
             shutil.copy2(wf, dst / WORKFLOWS / wf.name)
+    (dst / "changelog.d").mkdir(parents=True, exist_ok=True)
+    for name, _ in RELEASE_FRAGMENTS:
+        if (src / "changelog.d" / name).is_file():
+            shutil.copy2(src / "changelog.d" / name, dst / "changelog.d" / name)
 
 
 IND = "          "
@@ -3484,6 +3524,16 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
         '          sed -i "s/SHA_AARCH64_APPLE_DARWIN/', '          sed -i "s/SHA_X86_64_APPLE_DARWIN/x/" f.rb\n'
         '          sed -i "s/SHA_AARCH64_APPLE_DARWIN/')]),
     # --- #6292: the release-shape `paths:` filter covers every build input
+    # --- #6285/#6286: one honest changelog.d fragment per child of #6062
+    "6285 4768 fragment missing": ("fail", [("changelog.d/4768.security.md", "", None, False)]),
+    "6285 4768 fragment without the vote citation": ("fail", [("changelog.d/4768.security.md",
+        "5-agent vote (4d3ea1c5)", "a vote", True)]),
+    "6285 4768 fragment does not name its issue": ("fail", [("changelog.d/4768.security.md", "(#4768", "(#47", False)]),
+    "6286 3613 fragment missing": ("fail", [("changelog.d/3613.added.md", "", None, False)]),
+    "6286 3613 fragment drops the not-yet-proven list": ("fail", [("changelog.d/3613.added.md", "Not yet proven", "Proven", False)]),
+    "6286 3613 fragment drops the Docker layer item": ("fail", [("changelog.d/3613.added.md", "#6409", "#0", True)]),
+    "6286 3613 fragment is not a bold entry": ("fail", [("changelog.d/3613.added.md", "**[release]", "[release]", False)]),
+    "6286 4720 fragment missing": ("fail", [("changelog.d/4720.fixed.md", "", None, False)]),
     "6292 path dependency outside the release-shape paths filter": ("fail", [(CARGO, PASTE_DEP,
         PASTE_DEP.replace("vendor/paste", "third_party/paste"), False)]),
     "6292 dependency-table path dependency outside the filter": ("fail", [(CARGO, PASTE_DEP,
