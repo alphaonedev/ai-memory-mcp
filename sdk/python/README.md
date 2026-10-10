@@ -95,6 +95,14 @@ Accepted (anything else raises `ValueError` from the constructor):
   names the directory, its owner and mode, and the fix: `chmod go-w <dir>`
   (or `chown` it to yourself or root), or copy the bundle to a directory only
   you can change (#6653).
+
+  On macOS an extended ACL counts as well as the mode bits (#6934): a CA file
+  or any directory on the path is refused when an ACL entry lets someone other
+  than you or root write, append, delete, delete a child, change the ACL or
+  change the owner (`ls -le` shows the entries; `chmod -N <path>` removes
+  them), and a credential file read by the SDK is refused when an ACL entry
+  lets someone else read it. An ACL the SDK cannot read is refused, not
+  assumed empty.
 - Exactly `ssl.SSLContext` (not a subclass): the object returned by
   `ssl.create_default_context(cafile=...)`, with `verify_mode` left at
   `CERT_REQUIRED`, `check_hostname` on, no verify flag that relaxes chain

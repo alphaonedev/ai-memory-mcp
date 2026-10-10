@@ -154,3 +154,12 @@ Residuals (accepted, each with its reason):
 - `verify=None` / `verify=True` with `SSL_CERT_FILE` or `SSL_CERT_DIR` set: the SDK loads that path itself under the
   rules above (read once, permissions checked), and refuses a missing or wrong-kind path instead of httpx 0.27's
   silent fallback to certifi (#6538).
+- #6934 (extends the same vote; `decision: ctypes over libSystem's ACL API over refusing every extended ACL or
+  shelling out to ls, because it asks the kernel's ACL object on the descriptor already open, with no spawn and no
+  dependency`): on macOS an extended ACL can grant a right the mode bits do not show. Every CA path component and the
+  CA file are refused when an ACL ALLOW entry gives anyone but this user or root a write, append, delete,
+  delete_child, writesecurity or chown right; the owner-only credential readers refuse a foreign read right too. A
+  deny entry grants nothing and is ignored; a group principal always counts. An ACL that cannot be read is a typed
+  refusal (fail closed), never a pass. Other platforms have no extended ACL this reads. The CA file is checked with
+  `fstat` on the descriptor that was opened, the path is walked again after the open and must end at that inode
+  (`st_dev`, `st_ino`), and the file/dir mode rule above applies to each.
