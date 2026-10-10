@@ -911,6 +911,9 @@ def toml_debug_findings(text: str) -> List[str]:
         if path == ("cargo-features",) or path[0] == "unstable":
             found.append("%s (a cargo nightly feature switch; with RUSTC_BOOTSTRAP it enables profile rustflags)"
                          % dotted)
+        if path[0] == "include":
+            # cargo's config include (#6488) loads more config files; fail closed rather than resolve them
+            found.append("%s = %s (an included config is not read)" % (dotted, value.strip()))
         if path in (("build", "target-dir"), ("build", "target")):
             found.append("%s = %s %s" % (dotted, value.strip(), PRUNE_MARK))
         if path[0] == "alias" and len(path) == 2:
