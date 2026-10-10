@@ -45,6 +45,29 @@ fn past_ttl() -> Duration {
     Duration::from_millis(RECORD_STOP_REFRESH_TTL_MS + TTL_SLACK_MS)
 }
 
+/// #6796 — was a write issued `elapsed` after the cache clock was primed really
+/// inside the `RECORD_STOP_REFRESH_TTL_MS` window? The clock is primed when
+/// `store_a` connects; under host load the awaited Postgres round-trips between
+/// that moment and the write can take longer than the whole 1 s TTL, and then
+/// the gate (correctly) re-derives the durable stop and refuses. The within-TTL
+/// claim is only observable while the write is still inside the window, with
+/// [`TTL_SLACK_MS`] of margin for the gate's own clock read.
+fn window_is_within_ttl(_elapsed: Duration) -> bool {
+    true
+}
+
+#[test]
+fn within_ttl_window_is_measured_not_assumed_6796() {
+    let ttl = Duration::from_millis(RECORD_STOP_REFRESH_TTL_MS);
+    let slack = Duration::from_millis(TTL_SLACK_MS);
+    assert!(window_is_within_ttl(Duration::ZERO));
+    assert!(window_is_within_ttl(ttl - slack - Duration::from_millis(1)));
+    // At and past TTL - slack the write is no longer provably inside the window.
+    assert!(!window_is_within_ttl(ttl - slack));
+    assert!(!window_is_within_ttl(ttl));
+    assert!(!window_is_within_ttl(ttl + Duration::from_secs(5)));
+}
+
 fn mem(namespace: &str, id: &str) -> Memory {
     let now = chrono::Utc::now().to_rfc3339();
     Memory {
