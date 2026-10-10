@@ -2740,6 +2740,62 @@ mod tests {
         );
     }
 
+    /// #3170 F1 — the store-backed sweep's op budget must BIND: with
+    /// `max_ops_per_cycle = 1` and two disjoint near-duplicate pairs, exactly
+    /// one cluster is summarised and the other is deferred to the next cycle.
+    #[cfg(feature = "sal")]
+    #[tokio::test]
+    async fn consolidation_sweep_op_budget_binds_below_cluster_count_3170() {
+        let env = TestEnv::fresh();
+        seed_two_dup_memories(&env.db_path);
+        {
+            let conn = db::open(&env.db_path).unwrap();
+            let dup = "postgres vacuum autovacuum tuning checklist with enough length";
+            let space = crate::embeddings::embedding_space_fingerprint("test-space");
+            for (id, title) in [("ccc33333", "t3"), ("ddd44444", "t4")] {
+                let m = crate::models::Memory {
+                    id: id.to_string(),
+                    namespace: "ns".to_string(),
+                    title: title.to_string(),
+                    content: dup.to_string(),
+                    tier: crate::models::Tier::Mid,
+                    access_count: 5,
+                    ..Default::default()
+                };
+                db::insert(&conn, &m).unwrap();
+                db::set_embedding(&conn, &m.id, &[0.0, 1.0], &space).unwrap();
+            }
+        }
+        let store = crate::store::sqlite::SqliteStore::open(&env.db_path).expect("open store");
+        let stub = CovStubLlm;
+        let cfg = curator::CuratorConfig {
+            max_ops_per_cycle: 1,
+            compaction: curator::CompactionConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let report = store_backed_consolidation_sweep(
+            &store,
+            Some(&stub as &dyn crate::autonomy::AutonomyLlm),
+            &cfg,
+        )
+        .await;
+        assert_eq!(
+            report.operations_attempted, 1,
+            "budget of 1 allows exactly one summarise op; report: {report:?}"
+        );
+        assert_eq!(
+            report.operations_skipped_cap, 1,
+            "the second cluster is deferred by the budget; report: {report:?}"
+        );
+        assert_eq!(
+            report.memories_consolidated, 2,
+            "only one pair folded; report: {report:?}"
+        );
+    }
+
     #[cfg(feature = "sal")]
     #[tokio::test]
     async fn consolidation_sweep_noop_when_disabled() {
