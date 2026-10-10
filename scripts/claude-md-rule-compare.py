@@ -100,7 +100,9 @@ def git(repo: Path, *args: str) -> bytes:
     # every git call here ignores them, so the history the comparison judges is the history that was fetched.
     # #6798: a commit-graph file (in the repository or an alternate object store) supplies parent edges without a
     # checksum check and GIT_NO_REPLACE_OBJECTS does not turn it off, so the graph is disabled per call as well.
-    env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1")
+    # #6883: git's test-only GIT_TEST_COMMIT_GRAPH=1 loads a commit-graph regardless of core.commitGraph, so a host that
+    # sets it re-opens #6798; the pinned value turns it off for every call.
+    env = dict(os.environ, GIT_NO_REPLACE_OBJECTS="1", GIT_TEST_COMMIT_GRAPH="0")
     command = ["git", "-C", str(repo), "-c", "core.commitGraph=false", *args]
     result = subprocess.run(command, capture_output=True, check=False, env=env)
     if result.returncode != 0:
