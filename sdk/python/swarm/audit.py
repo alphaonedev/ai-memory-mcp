@@ -44,8 +44,15 @@ class CallLog:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text("", encoding="utf-8")
 
-    def append(self, *, agent_id: str, tool: str, args: dict[str, Any], outcome: Any,
-               module: str | None = None) -> None:
+    def append(
+        self,
+        *,
+        agent_id: str,
+        tool: str,
+        args: dict[str, Any],
+        outcome: Any,
+        module: str | None = None,
+    ) -> None:
         entry = {
             "agent_id": agent_id,
             "module": module,  # daemon base URL the call went to (multi-module runs)
@@ -68,15 +75,21 @@ class CallLog:
     def reconcile(self, coverage: Any) -> dict[str, Any]:
         """Assert coverage invocation counts equal logged dispatch counts."""
         logged = Counter(entry["tool"] for entry in self.entries)
-        covered = {name: item.invocations for name, item in coverage.tools.items() if item.invocations}
+        covered = {
+            name: item.invocations for name, item in coverage.tools.items() if item.invocations
+        }
         names = set(logged) | set(covered)
         diff = {
             name: {"calls": logged.get(name, 0), "coverage": covered.get(name, 0)}
             for name in sorted(names)
             if logged.get(name, 0) != covered.get(name, 0)
         }
-        result = {"ok": not diff, "logged": sum(logged.values()),
-                  "coverage": sum(covered.values()), "diff": diff}
+        result = {
+            "ok": not diff,
+            "logged": sum(logged.values()),
+            "coverage": sum(covered.values()),
+            "diff": diff,
+        }
         # Never raise: a mismatch is EVIDENCE for the auditor and a non-zero
         # exit for the run, not an abort that would lose the artifacts.
         print("call-log reconcile: " + json.dumps(result, sort_keys=True))
@@ -113,10 +126,13 @@ def set_call_log(log: CallLog | None) -> None:
     _active_call_log = log
 
 
-def record_dispatch(agent_id: str, tool: str, args: dict[str, Any], outcome: Any,
-                    module: str | None = None) -> None:
+def record_dispatch(
+    agent_id: str, tool: str, args: dict[str, Any], outcome: Any, module: str | None = None
+) -> None:
     if _active_call_log is not None:
-        _active_call_log.append(agent_id=agent_id, tool=tool, args=args, outcome=outcome, module=module)
+        _active_call_log.append(
+            agent_id=agent_id, tool=tool, args=args, outcome=outcome, module=module
+        )
 
 
 @dataclass(frozen=True)
@@ -141,10 +157,16 @@ class AgentAssessment:
 
 
 #: The rubric fields :data:`swarm.choreography._RUBRIC_PROMPT` demands.
-_RUBRIC_FIELDS = frozenset({
-    "recall_usefulness", "latency_acceptable", "failures_encountered",
-    "isolation_respected", "would_rely_on_it", "free_text",
-})
+_RUBRIC_FIELDS = frozenset(
+    {
+        "recall_usefulness",
+        "latency_acceptable",
+        "failures_encountered",
+        "isolation_respected",
+        "would_rely_on_it",
+        "free_text",
+    }
+)
 #: Hard cap on the rubric's free-text field. Over-long text is TRUNCATED (the
 #: prose is commentary, never durable memory data), not thrown away with the
 #: five structured judgements that came with it.
@@ -178,15 +200,16 @@ def _first_json_object(text: str) -> str | None:
         elif char == "}" and depth:
             depth -= 1
             if depth == 0:
-                return text[start:index + 1]
+                return text[start : index + 1]
     return None
 
 
 def _json_candidates(raw: str) -> list[tuple[str, str]]:
     """The verbatim reply first, then bounded repairs, as ``(text, repair)``."""
     candidates: list[tuple[str, str]] = [(raw, "")]
-    candidates.extend((match.group("body"), "code_fence_stripped")
-                      for match in _FENCE_RE.finditer(raw))
+    candidates.extend(
+        (match.group("body"), "code_fence_stripped") for match in _FENCE_RE.finditer(raw)
+    )
     embedded = _first_json_object(raw)
     if embedded is not None and embedded != raw.strip():
         candidates.append((embedded, "json_extracted"))
@@ -209,9 +232,10 @@ def _validate_rubric(value: dict[str, Any], repairs: list[str]) -> dict[str, Any
     for field in ("latency_acceptable", "isolation_respected", "would_rely_on_it"):
         if type(value[field]) is not bool:
             raise ValueError(f"{field} must be boolean")
-    if (not isinstance(failures, list) or
-            any(not isinstance(x, list) or len(x) != 2 or
-                any(not isinstance(y, str) for y in x) for x in failures)):
+    if not isinstance(failures, list) or any(
+        not isinstance(x, list) or len(x) != 2 or any(not isinstance(y, str) for y in x)
+        for x in failures
+    ):
         raise ValueError("failures_encountered must be [[tool, what], ...]")
     free_text = value["free_text"]
     if not isinstance(free_text, str):
@@ -253,31 +277,59 @@ def parse_assessment(agent_id: str, raw: str) -> AgentAssessment:
                 repairs.append(repair)
             break
     if value is None:
-        return AgentAssessment(agent_id, None, None, [], None, None, "",
-                               assessment_invalid=True,
-                               error="no JSON rubric object in the model reply",
-                               raw_excerpt=text[:_RAW_EXCERPT_CHARS])
+        return AgentAssessment(
+            agent_id,
+            None,
+            None,
+            [],
+            None,
+            None,
+            "",
+            assessment_invalid=True,
+            error="no JSON rubric object in the model reply",
+            raw_excerpt=text[:_RAW_EXCERPT_CHARS],
+        )
     try:
         fields = _validate_rubric(value, repairs)
     except (ValueError, TypeError) as exc:
-        return AgentAssessment(agent_id, None, None, [], None, None, "",
-                               assessment_invalid=True, error=str(exc),
-                               repairs=tuple(repairs),
-                               raw_excerpt=text[:_RAW_EXCERPT_CHARS])
-    return AgentAssessment(agent_id=agent_id, **fields, repaired=bool(repairs),
-                           repairs=tuple(repairs),
-                           raw_excerpt=text[:_RAW_EXCERPT_CHARS] if repairs else "")
+        return AgentAssessment(
+            agent_id,
+            None,
+            None,
+            [],
+            None,
+            None,
+            "",
+            assessment_invalid=True,
+            error=str(exc),
+            repairs=tuple(repairs),
+            raw_excerpt=text[:_RAW_EXCERPT_CHARS],
+        )
+    return AgentAssessment(
+        agent_id=agent_id,
+        **fields,
+        repaired=bool(repairs),
+        repairs=tuple(repairs),
+        raw_excerpt=text[:_RAW_EXCERPT_CHARS] if repairs else "",
+    )
 
 
 #: Titles the HARNESS writes through an agent's own dispatch (choreographies,
 #: authorization probes, rubric attestations). They are the harness's evidence,
 #: never the agent's mission work, so they are excluded from mission evidence.
 HARNESS_TITLE_PREFIXES = (
-    "consensus-vote-", "consensus-", "nhi-audit-", "approval-decision-",
-    "isolation-canary-", "replay-probe-", "full-surface-", "AI-NHI swarm assessment",
+    "consensus-vote-",
+    "consensus-",
+    "nhi-audit-",
+    "approval-decision-",
+    "isolation-canary-",
+    "replay-probe-",
+    "full-surface-",
+    "AI-NHI swarm assessment",
 )
 _MEMORY_ID_RE = re.compile(
-    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
 #: A summary must fold at least this many of the agent's OWN earlier memory ids
 #: to count as summary-shaped without carrying the mission title. One citation
 #: is a fact referencing an observation; several is a consolidation.
@@ -288,8 +340,9 @@ def _is_harness_title(title: str) -> bool:
     return title.startswith(HARNESS_TITLE_PREFIXES)
 
 
-def mission_evidence(entries: list[dict[str, Any]], *,
-                     shared_namespace: str | None = None) -> dict[str, dict[str, Any]]:
+def mission_evidence(
+    entries: list[dict[str, Any]], *, shared_namespace: str | None = None
+) -> dict[str, dict[str, Any]]:
     """Derive per-agent mission progress from the CALL LOG, not from a fixed tag.
 
     #3440: the in-agent ``summary_stored`` flag only fired when the model both
@@ -318,11 +371,17 @@ def mission_evidence(entries: list[dict[str, Any]], *,
     evidence: dict[str, dict[str, Any]] = {}
 
     def _for(agent_id: str) -> dict[str, Any]:
-        return evidence.setdefault(agent_id, {
-            "summary_stored": False, "summary_count": 0,
-            "summary_in_shared_namespace": False, "lineage_proved": False,
-            "facts_stored": 0, "_ids": [],
-        })
+        return evidence.setdefault(
+            agent_id,
+            {
+                "summary_stored": False,
+                "summary_count": 0,
+                "summary_in_shared_namespace": False,
+                "lineage_proved": False,
+                "facts_stored": 0,
+                "_ids": [],
+            },
+        )
 
     for entry in entries:
         agent_id = str(entry.get("agent_id") or "")
@@ -347,10 +406,14 @@ def mission_evidence(entries: list[dict[str, Any]], *,
             continue
         content = str(args.get("content") or "")
         cited = {value for value in _MEMORY_ID_RE.findall(content) if value in item["_ids"]}
-        durable = (args.get("tier") == "long" or args.get("scope") in ("collective", "team")
-                   or (shared_namespace is not None and args.get("namespace") == shared_namespace))
-        is_summary = (title == f"mission-summary-{agent_id}"
-                      or (durable and len(cited) >= _SUMMARY_MIN_CITATIONS))
+        durable = (
+            args.get("tier") == "long"
+            or args.get("scope") in ("collective", "team")
+            or (shared_namespace is not None and args.get("namespace") == shared_namespace)
+        )
+        is_summary = title == f"mission-summary-{agent_id}" or (
+            durable and len(cited) >= _SUMMARY_MIN_CITATIONS
+        )
         if is_summary:
             item["summary_stored"] = True
             item["summary_count"] += 1
@@ -366,11 +429,16 @@ def mission_evidence(entries: list[dict[str, Any]], *,
     return evidence
 
 
-def build_nhi_report(*, n_agents: int, completed: int,
-                     assessments: list[AgentAssessment], auditor_verdict: str,
-                     negative_evidence: list[dict[str, Any]] | None = None,
-                     model: str | None = None, model_override_reason: str | None = None,
-                     ) -> dict[str, Any]:
+def build_nhi_report(
+    *,
+    n_agents: int,
+    completed: int,
+    assessments: list[AgentAssessment],
+    auditor_verdict: str,
+    negative_evidence: list[dict[str, Any]] | None = None,
+    model: str | None = None,
+    model_override_reason: str | None = None,
+) -> dict[str, Any]:
     valid = [a for a in assessments if not a.assessment_invalid]
     repaired = [a for a in valid if a.repaired]
     repair_kinds = Counter(kind for a in assessments for kind in a.repairs)
@@ -403,46 +471,72 @@ def build_nhi_report(*, n_agents: int, completed: int,
 
 
 def render_nhi_report(report: dict[str, Any]) -> str:
-    lines = ["NHI AUDIT", "=" * 60,
-             f"model: {report.get('model')}" + (f"  (override: {report['model_override_reason']})" if report.get('model_override_reason') else ""),
-             f"agents: {report['n_agents']}",
-             f"mission completion rate: {report['mission_completion_rate']:.1%}",
-             f"valid/invalid rubrics: {report['assessments_valid']}/{report['assessments_invalid']}"
-             + f"  (raw {report.get('assessments_valid_raw', report['assessments_valid'])}"
-               f" + repaired {report.get('assessments_repaired', 0)})",
-             f"recall usefulness mean: {report['recall_usefulness_mean']}",
-             f"latency acceptable: {report['latency_acceptable_count']}",
-             f"isolation respected: {report['isolation_respected_count']}",
-             f"would rely on it: {report['would_rely_on_it_count']}",
-             "top failures: " + ("; ".join(report["top_failures"]) or "none")]
+    lines = [
+        "NHI AUDIT",
+        "=" * 60,
+        f"model: {report.get('model')}"
+        + (
+            f"  (override: {report['model_override_reason']})"
+            if report.get("model_override_reason")
+            else ""
+        ),
+        f"agents: {report['n_agents']}",
+        f"mission completion rate: {report['mission_completion_rate']:.1%}",
+        f"valid/invalid rubrics: {report['assessments_valid']}/{report['assessments_invalid']}"
+        + f"  (raw {report.get('assessments_valid_raw', report['assessments_valid'])}"
+        f" + repaired {report.get('assessments_repaired', 0)})",
+        f"recall usefulness mean: {report['recall_usefulness_mean']}",
+        f"latency acceptable: {report['latency_acceptable_count']}",
+        f"isolation respected: {report['isolation_respected_count']}",
+        f"would rely on it: {report['would_rely_on_it_count']}",
+        "top failures: " + ("; ".join(report["top_failures"]) or "none"),
+    ]
     if report.get("assessment_phase_secs") is not None:
         lines.append(f"assessment phase: {report['assessment_phase_secs']:.1f}s wall-clock")
     if report.get("mission_partial"):
         mp = report["mission_partial"]
-        lines.append(f"mission partial: summaries {mp['summary_stored']} · lineage {mp['lineage_proved']} · facts {mp['facts_stored_total']}")
+        lines.append(
+            f"mission partial: summaries {mp['summary_stored']} · lineage {mp['lineage_proved']} · facts {mp['facts_stored_total']}"
+        )
         if "summary_stored_evidence" in mp:
             lines.append(
                 f"mission evidence (call log): summaries {mp['summary_stored_evidence']}"
                 f" · in shared ns {mp['summary_in_shared_namespace']}"
                 f" · lineage {mp['lineage_proved_evidence']}"
-                f" · facts {mp['facts_stored_evidence']}")
+                f" · facts {mp['facts_stored_evidence']}"
+            )
     lines.extend(f"quote [{q['agent_id']}]: {q['free_text']}" for q in report["quotes"])
     lines.append("auditor verdict: " + report["auditor_verdict"])
     return "\n".join(lines)
 
 
-def write_audit_artifacts(directory: str | Path, assessments: list[AgentAssessment],
-                          report: dict[str, Any]) -> None:
+def write_audit_artifacts(
+    directory: str | Path, assessments: list[AgentAssessment], report: dict[str, Any]
+) -> None:
     destination = Path(directory)
     destination.mkdir(parents=True, exist_ok=True)
     (destination / "assessments.json").write_text(
         json.dumps([asdict(a) for a in assessments], indent=2, sort_keys=True) + "\n",
-        encoding="utf-8")
+        encoding="utf-8",
+    )
     (destination / "nhi-audit.json").write_text(
-        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
-__all__ = ["FREE_TEXT_LIMIT", "HARNESS_TITLE_PREFIXES", "AgentAssessment", "CallLog",
-           "build_nhi_report", "harness_dispatches", "mission_evidence", "parse_assessment",
-           "record_dispatch", "redact", "render_nhi_report", "set_call_log", "utc_now",
-           "write_audit_artifacts"]
+__all__ = [
+    "FREE_TEXT_LIMIT",
+    "HARNESS_TITLE_PREFIXES",
+    "AgentAssessment",
+    "CallLog",
+    "build_nhi_report",
+    "harness_dispatches",
+    "mission_evidence",
+    "parse_assessment",
+    "record_dispatch",
+    "redact",
+    "render_nhi_report",
+    "set_call_log",
+    "utc_now",
+    "write_audit_artifacts",
+]

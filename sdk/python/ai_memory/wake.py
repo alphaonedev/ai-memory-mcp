@@ -351,9 +351,7 @@ def encode_topics(topics: tuple[str, ...]) -> bytes:
     a client cannot construct a frame the hub would refuse.
     """
     if len(topics) > _MAX_TOPICS_PER_FRAME:
-        raise WakeError(
-            f"at most {_MAX_TOPICS_PER_FRAME} topics per frame, got {len(topics)}"
-        )
+        raise WakeError(f"at most {_MAX_TOPICS_PER_FRAME} topics per frame, got {len(topics)}")
     out = bytearray([len(topics)])
     for t in topics:
         raw = t.encode("utf-8")
@@ -587,8 +585,7 @@ class DelegationBundle:
         seed = _b64(bundle.get("delegate_private_b64", ""), f"{source}: delegate_private_b64")
         if len(seed) != _DELEGATE_KEY_ID_BYTES:
             raise WakeError(
-                f"{source}: the delegated seed is {len(seed)} bytes, not "
-                f"{_DELEGATE_KEY_ID_BYTES}"
+                f"{source}: the delegated seed is {len(seed)} bytes, not {_DELEGATE_KEY_ID_BYTES}"
             )
         signing_key = _ed25519_key(seed)
         public = signing_key.public_key().public_bytes_raw()
@@ -900,9 +897,7 @@ class WakeListener:
             raise WakeError("the hub's first frame must be a hello challenge")
         if len(challenge.payload) != _HELLO_NONCE_BYTES:
             raise WakeError(f"the hello challenge is {_HELLO_NONCE_BYTES} bytes")
-        transcript = hello_transcript(
-            self.bundle.hub_id, challenge.payload, self.bundle.agent_id
-        )
+        transcript = hello_transcript(self.bundle.hub_id, challenge.payload, self.bundle.agent_id)
         write_frame(
             transport,
             Frame(Kind.HELLO, self.bundle.agent_id, "", self.bundle.hello_payload(transcript)),
@@ -1015,7 +1010,9 @@ class WakeListener:
                 attempt += 1
                 self.metrics["reconnects"] += 1
                 self.last_error = str(exc)
-                deadline = time.monotonic() + backoff_for(self.reconnect_base, attempt) + self._jitter()
+                deadline = (
+                    time.monotonic() + backoff_for(self.reconnect_base, attempt) + self._jitter()
+                )
                 # The backstop stays armed WHILE disconnected: a hub that is
                 # down, refusing, or absent must cost LATENCY and nothing else.
                 while time.monotonic() < deadline:

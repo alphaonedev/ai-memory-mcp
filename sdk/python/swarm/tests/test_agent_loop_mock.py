@@ -95,8 +95,11 @@ def _agent(
         allowed_namespaces={"swarm-000", "swarm-shared"},
     )
     return SwarmAgent(
-        identity=identity, client=client, model=model,  # type: ignore[arg-type]
-        config=config, coverage=CoverageTracker(),
+        identity=identity,
+        client=client,
+        model=model,  # type: ignore[arg-type]
+        config=config,
+        coverage=CoverageTracker(),
     )
 
 
@@ -104,8 +107,9 @@ def _agent(
 async def test_one_loop_step_dispatches_and_records() -> None:
     decision = Decision(
         content=None,
-        tool_calls=[ToolCall(id="c1", name="store",
-                             arguments={"title": "t", "content": "hello world"})],
+        tool_calls=[
+            ToolCall(id="c1", name="store", arguments={"title": "t", "content": "hello world"})
+        ],
         raw={},
     )
     seen: list[httpx.Request] = []
@@ -138,7 +142,9 @@ async def test_write_namespace_is_confined() -> None:
     try:
         # Model asks to write into a namespace this agent was NOT granted.
         outcome = await dispatch(
-            agent.client, agent.identity, "store",
+            agent.client,
+            agent.identity,
+            "store",
             {"title": "t", "content": "c", "namespace": "victim-namespace"},
         )
     finally:
@@ -155,7 +161,9 @@ async def test_signal_send_hits_driver_local_route() -> None:
     agent = _agent(_FakeModel(Decision(None, [], {})), seen)
     try:
         outcome = await dispatch(
-            agent.client, agent.identity, "signal_send",
+            agent.client,
+            agent.identity,
+            "signal_send",
             {"subject": "hi", "to_agent": "swarm-agent-001", "signal_type": "request"},
         )
     finally:
@@ -170,7 +178,10 @@ async def test_tool_error_fails_closed() -> None:
     agent = _agent(_FakeModel(Decision(None, [], {})), seen, fail_paths={"/api/v1/consolidate"})
     try:
         outcome = await dispatch(
-            agent.client, agent.identity, "consolidate", {"ids": ["a", "b"], "title": "x"},
+            agent.client,
+            agent.identity,
+            "consolidate",
+            {"ids": ["a", "b"], "title": "x"},
         )
     finally:
         await agent.aclose()

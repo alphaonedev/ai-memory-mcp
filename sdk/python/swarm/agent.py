@@ -110,8 +110,14 @@ class SwarmAgent:
             namespace=namespace,
             allowed_namespaces=set(allowed_namespaces) | {namespace},
         )
-        return cls(identity=identity, client=client, model=model,
-                   config=config, coverage=coverage, goal=goal or config.mission)
+        return cls(
+            identity=identity,
+            client=client,
+            model=model,
+            config=config,
+            coverage=coverage,
+            goal=goal or config.mission,
+        )
 
     async def aclose(self) -> None:
         await self.client.aclose()
@@ -179,21 +185,33 @@ class SwarmAgent:
             summaries.append(
                 f"{call.name} -> {'ok' if outcome.ok else 'FAIL-CLOSED'}: {outcome.summary}"
             )
-            if (outcome.ok and (call.name == "consolidate" or
-                                (call.name == "link" and
-                                 call.arguments.get("relation") == "derives_from"))):
+            if outcome.ok and (
+                call.name == "consolidate"
+                or (call.name == "link" and call.arguments.get("relation") == "derives_from")
+            ):
                 self.mission_lineage_proved = True
             expected = f"mission-summary-{self.identity.agent_id}"
-            if (outcome.ok and call.name == "store" and call.arguments.get("title") == expected
-                    and self.identity.confine(call.arguments.get("namespace")) != self.identity.namespace
-                    and isinstance(outcome.result, dict) and outcome.result.get("id")):
+            if (
+                outcome.ok
+                and call.name == "store"
+                and call.arguments.get("title") == expected
+                and self.identity.confine(call.arguments.get("namespace"))
+                != self.identity.namespace
+                and isinstance(outcome.result, dict)
+                and outcome.result.get("id")
+            ):
                 self.mission_summary_id = str(outcome.result["id"])
                 self.mission_summary_count += 1
                 content = str(call.arguments.get("content", ""))
                 self.mission_summary_cites_sources = bool(self.mission_memory_ids) and all(
-                    memory_id in content for memory_id in self.mission_memory_ids)
-            elif (outcome.ok and call.name == "store" and isinstance(outcome.result, dict)
-                  and outcome.result.get("id")):
+                    memory_id in content for memory_id in self.mission_memory_ids
+                )
+            elif (
+                outcome.ok
+                and call.name == "store"
+                and isinstance(outcome.result, dict)
+                and outcome.result.get("id")
+            ):
                 self.mission_memory_ids.append(str(outcome.result["id"]))
         return summaries
 
@@ -211,25 +229,52 @@ class SwarmAgent:
             except OpenRouterError as exc:
                 # Fail closed: record the decide failure and back off, then
                 # continue to the next bounded step rather than spinning.
-                self.journal.append(StepRecord(step, perceived, [], [f"decide-error: {exc}"],
-                                               started_at, utc_now(),
-                                               round((time.perf_counter() - started) * 1000, 3)))
+                self.journal.append(
+                    StepRecord(
+                        step,
+                        perceived,
+                        [],
+                        [f"decide-error: {exc}"],
+                        started_at,
+                        utc_now(),
+                        round((time.perf_counter() - started) * 1000, 3),
+                    )
+                )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, self.config.backoff_max_secs)
                 continue
             self.coverage.record_model_usage(
-                self.identity.agent_id, decision.raw.get("usage"),
+                self.identity.agent_id,
+                decision.raw.get("usage"),
                 latency_ms=(time.perf_counter() - t_decide) * 1000,
             )
             tool_names = [c.name for c in decision.tool_calls]
             if not tool_names:
                 # The model declined to act this step; that is a valid no-op.
-                self.journal.append(StepRecord(step, perceived, [], ["no-tool"], started_at,
-                                               utc_now(), round((time.perf_counter() - started) * 1000, 3)))
+                self.journal.append(
+                    StepRecord(
+                        step,
+                        perceived,
+                        [],
+                        ["no-tool"],
+                        started_at,
+                        utc_now(),
+                        round((time.perf_counter() - started) * 1000, 3),
+                    )
+                )
                 continue
             outcomes = await self.act(decision)
-            self.journal.append(StepRecord(step, perceived, tool_names, outcomes, started_at,
-                                           utc_now(), round((time.perf_counter() - started) * 1000, 3)))
+            self.journal.append(
+                StepRecord(
+                    step,
+                    perceived,
+                    tool_names,
+                    outcomes,
+                    started_at,
+                    utc_now(),
+                    round((time.perf_counter() - started) * 1000, 3),
+                )
+            )
             backoff = self.config.backoff_base_secs  # reset after a productive step
 
     async def run_once(self) -> StepRecord:
@@ -238,13 +283,18 @@ class SwarmAgent:
         started = time.perf_counter()
         perceived = await self.perceive()
         decision = await self.decide(perceived, 1)
-        self.coverage.record_model_usage(
-            self.identity.agent_id, decision.raw.get("usage")
-        )
+        self.coverage.record_model_usage(self.identity.agent_id, decision.raw.get("usage"))
         tool_names = [c.name for c in decision.tool_calls]
         outcomes = await self.act(decision) if tool_names else ["no-tool"]
-        record = StepRecord(1, perceived, tool_names, outcomes, started_at, utc_now(),
-                            round((time.perf_counter() - started) * 1000, 3))
+        record = StepRecord(
+            1,
+            perceived,
+            tool_names,
+            outcomes,
+            started_at,
+            utc_now(),
+            round((time.perf_counter() - started) * 1000, 3),
+        )
         self.journal.append(record)
         return record
 

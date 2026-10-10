@@ -49,8 +49,16 @@ def test_tracker_starts_fully_uncovered() -> None:
 
 def test_success_marks_covered() -> None:
     tracker = CoverageTracker()
-    tracker.record(ToolOutcome("store", ok=True, fail_closed=False, summary="{'id': 'x'}",
-                               memory_id="x", result={"id": "x"}))
+    tracker.record(
+        ToolOutcome(
+            "store",
+            ok=True,
+            fail_closed=False,
+            summary="{'id': 'x'}",
+            memory_id="x",
+            result={"id": "x"},
+        )
+    )
     assert tracker.tools["store"].covered
     assert "store" not in tracker.uncovered()
 
@@ -58,10 +66,16 @@ def test_success_marks_covered() -> None:
 def test_pending_is_not_covered() -> None:
     """#3543: a 200 {status: pending} is its own bucket, never coverage."""
     tracker = CoverageTracker()
-    tracker.record(ToolOutcome(
-        "store", ok=True, fail_closed=False, summary="pending",
-        pending=True, result={"status": "pending"},
-    ))
+    tracker.record(
+        ToolOutcome(
+            "store",
+            ok=True,
+            fail_closed=False,
+            summary="pending",
+            pending=True,
+            result={"status": "pending"},
+        )
+    )
     cov = tracker.tools["store"]
     assert cov.pending == 1
     assert cov.successes == 0
@@ -80,10 +94,15 @@ def test_unexpected_failure_is_not_coverage() -> None:
 def test_tracker_keeps_last_five_failures_and_renders_them() -> None:
     tracker = CoverageTracker()
     for number in range(7):
-        tracker.record(ToolOutcome("forget", ok=False, fail_closed=True,
-                                   summary=f"failure-{number}"))
+        tracker.record(
+            ToolOutcome("forget", ok=False, fail_closed=True, summary=f"failure-{number}")
+        )
     assert list(tracker.tools["forget"].failure_summaries) == [
-        "failure-2", "failure-3", "failure-4", "failure-5", "failure-6"
+        "failure-2",
+        "failure-3",
+        "failure-4",
+        "failure-5",
+        "failure-6",
     ]
     matrix = tracker.matrix()
     assert "FAILURES" in matrix
@@ -109,9 +128,16 @@ def test_assert_full_raises_with_gap_names() -> None:
 def test_full_coverage_passes() -> None:
     tracker = CoverageTracker()
     for spec in TOOL_SPECS:
-        tracker.record(ToolOutcome(spec.name, ok=True, fail_closed=False, summary="ok",
-                                   memory_id="m-1" if spec.name == "store" else None,
-                                   result={"id": "m-1"} if spec.name == "store" else {"ok": True}))
+        tracker.record(
+            ToolOutcome(
+                spec.name,
+                ok=True,
+                fail_closed=False,
+                summary="ok",
+                memory_id="m-1" if spec.name == "store" else None,
+                result={"id": "m-1"} if spec.name == "store" else {"ok": True},
+            )
+        )
     assert tracker.is_full()
     tracker.assert_full()  # does not raise
     assert "PASS" in tracker.matrix()

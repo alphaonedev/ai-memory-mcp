@@ -56,6 +56,7 @@ def _no_hostname_check_context() -> ssl.SSLContext:
     context.check_hostname = False
     return context
 
+
 BASE_URL = "https://localhost:9077"
 
 
@@ -146,7 +147,9 @@ _CLIENTS = [AiMemoryClient, AsyncAiMemoryClient]
     ],
     ids=["str-lying-bool", "str-lying-len", "pathlike-lying-bool", "path-subclass-lying-bool"],
 )
-def test_lying_path_objects_never_yield_an_unverified_client_6248(client_cls: type, make: object) -> None:
+def test_lying_path_objects_never_yield_an_unverified_client_6248(
+    client_cls: type, make: object
+) -> None:
     # #6248 — httpx 0.27 decides with `if self.verify:`; the guard must forward
     # an exact checked value, not the caller's object. The client either
     # refuses or is built on a CERT_REQUIRED + check_hostname context.
@@ -247,7 +250,9 @@ def tls_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[tuple[str, 
 
 
 @pytest.mark.parametrize("as_path", [True, False], ids=["pathlib.Path", "str"])
-def test_ca_path_gives_a_working_verified_client_6245(tls_server: tuple[str, str], as_path: bool) -> None:
+def test_ca_path_gives_a_working_verified_client_6245(
+    tls_server: tuple[str, str], as_path: bool
+) -> None:
     # #6245 — a `pathlib.Path` CA crashed every request on httpx 0.28
     # (`set_alpn_protocols`). The server's own cert as the CA must verify.
     base_url, cert_path = tls_server
@@ -374,7 +379,17 @@ async def test_async_constructor_admits_ca_path() -> None:
 @pytest.mark.parametrize(
     "verify",
     ["", " ", "\t\n", _EmptyStr(""), b"", [], {}, 1, object()],
-    ids=["empty", "space", "whitespace", "str-subclass-empty", "bytes", "list", "dict", "int", "object"],
+    ids=[
+        "empty",
+        "space",
+        "whitespace",
+        "str-subclass-empty",
+        "bytes",
+        "list",
+        "dict",
+        "int",
+        "object",
+    ],
 )
 def test_funnel_refuses_blank_or_undocumented_verify_values(verify: object) -> None:
     # httpx 0.27.x reads ``verify=""`` as "do not verify"; any value the SDK
@@ -500,7 +515,13 @@ def _instance_patched_context() -> ssl.SSLContext:
         lambda: _BenignSubclass(ssl.PROTOCOL_TLS_CLIENT),
         _instance_patched_context,
     ],
-    ids=["inner-delegating", "wrap-override", "getattribute", "benign-subclass", "instance-patched"],
+    ids=[
+        "inner-delegating",
+        "wrap-override",
+        "getattribute",
+        "benign-subclass",
+        "instance-patched",
+    ],
 )
 def test_only_an_exact_ssl_context_is_admitted_6267_6268(client_cls: type, make: object) -> None:
     with pytest.raises(ValueError) as excinfo:
@@ -565,7 +586,9 @@ def test_class_level_wrap_patch_is_refused_per_request_6268(
     with AiMemoryClient(base_url=base_url, verify=context) as client:
         assert client._client.get("/ok").status_code == 200  # noqa: SLF001
         stock = ssl.SSLContext.wrap_socket
-        monkeypatch.setattr(ssl.SSLContext, "wrap_socket", lambda self, *a, **kw: stock(self, *a, **kw))
+        monkeypatch.setattr(
+            ssl.SSLContext, "wrap_socket", lambda self, *a, **kw: stock(self, *a, **kw)
+        )
         with pytest.raises(ValueError, match="verify=False"):
             client._client.get("/ok")  # noqa: SLF001
 
@@ -650,7 +673,11 @@ def test_verify_annotation_lists_every_documented_form_6270() -> None:
 
     from ai_memory._common import build_httpx_kwargs as funnel
 
-    for callable_ in (sync_module.AiMemoryClient.__init__, async_module.AsyncAiMemoryClient.__init__, funnel):
+    for callable_ in (
+        sync_module.AiMemoryClient.__init__,
+        async_module.AsyncAiMemoryClient.__init__,
+        funnel,
+    ):
         hint = typing.get_type_hints(callable_)["verify"]
         members = {typing.get_origin(arg) or arg for arg in typing.get_args(hint)}
         assert {bool, str, os.PathLike, ssl.SSLContext, type(None)} <= members, callable_
@@ -689,7 +716,13 @@ def test_readme_lists_the_accepted_and_refused_verify_forms_6273() -> None:
     assert marker in readme, "README needs a section titled: " + marker
     section = readme.split(marker, 1)[1].split("\n## ", 1)[0]
     accepted, _, refused = section.partition("Refused")
-    for token in ("None", "True", "os.PathLike", "ssl.create_default_context", "exactly `ssl.SSLContext`"):
+    for token in (
+        "None",
+        "True",
+        "os.PathLike",
+        "ssl.create_default_context",
+        "exactly `ssl.SSLContext`",
+    ):
         assert token.lower() in accepted.lower(), f"accepted list lacks {token!r}"
     for token in (
         "False",
@@ -863,6 +896,7 @@ def test_context_flipped_between_check_and_handshake_is_aborted_6306(
             client._client.get("/x")  # noqa: SLF001
         client.close()
     else:
+
         async def run() -> None:
             client = AsyncAiMemoryClient(base_url=counting_server.url, verify=context, timeout=5)
             client._client.event_hooks["request"].append(aweaken)  # noqa: SLF001

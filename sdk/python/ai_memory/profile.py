@@ -129,8 +129,7 @@ def resolve_required_families(profile: str) -> list[str]:
             continue
         if tok not in _VALID_FAMILIES:
             raise ValueError(
-                f"unknown profile or family '{tok}'. "
-                f"Valid: {', '.join(_VALID_FAMILIES)}, full"
+                f"unknown profile or family '{tok}'. Valid: {', '.join(_VALID_FAMILIES)}, full"
             )
         if tok not in requested:
             requested.append(tok)
@@ -159,9 +158,7 @@ def _missing_from(payload: Any, required: list[str]) -> list[str] | None:
     predates v0.6.4 (no ``families`` block) so callers can take the
     permissive fallback path."""
 
-    families_block = (
-        payload.get("families") if isinstance(payload, dict) else None
-    )
+    families_block = payload.get("families") if isinstance(payload, dict) else None
     if not isinstance(families_block, dict):
         return None
     rows = families_block.get("families")
@@ -207,9 +204,7 @@ def require_profile(client: _SyncCapabilitiesProbe, profile: str) -> None:
         raise ProfileNotLoaded(profile, missing)
 
 
-async def require_profile_async(
-    client: _AsyncCapabilitiesProbe, profile: str
-) -> None:
+async def require_profile_async(client: _AsyncCapabilitiesProbe, profile: str) -> None:
     """Async counterpart of :func:`require_profile` for use with
     :class:`ai_memory.AsyncAiMemoryClient`."""
 

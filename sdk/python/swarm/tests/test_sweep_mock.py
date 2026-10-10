@@ -21,9 +21,21 @@ from swarm.openrouter import AccountSnapshot, Decision
 
 
 def _mem(memory_id: str) -> dict[str, object]:
-    return {"id": memory_id, "tier": "mid", "namespace": "swarm-000", "title": "t", "content": "c", "tags": [],
-            "priority": 5, "confidence": 1.0, "source": "api", "access_count": 0,
-            "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z", "metadata": {}}
+    return {
+        "id": memory_id,
+        "tier": "mid",
+        "namespace": "swarm-000",
+        "title": "t",
+        "content": "c",
+        "tags": [],
+        "priority": 5,
+        "confidence": 1.0,
+        "source": "api",
+        "access_count": 0,
+        "created_at": "2026-09-01T00:00:00Z",
+        "updated_at": "2026-09-01T00:00:00Z",
+        "metadata": {},
+    }
 
 
 @pytest.mark.asyncio
@@ -56,9 +68,14 @@ async def test_full_surface_sweep_dispatches_order_and_confines_forget() -> None
         if request.url.path == "/api/v1/memories" and request.method == "POST":
             counter += 1
             return httpx.Response(201, json={"id": f"mem-{counter}", "version": 3})
-        if request.method == "GET" and request.url.path.startswith("/api/v1/memories/mem-") \
-                and not request.url.path.endswith("/lineage"):
-            return httpx.Response(200, json={"memory": _mem(request.url.path.rsplit("/", 1)[-1]), "links": []})
+        if (
+            request.method == "GET"
+            and request.url.path.startswith("/api/v1/memories/mem-")
+            and not request.url.path.endswith("/lineage")
+        ):
+            return httpx.Response(
+                200, json={"memory": _mem(request.url.path.rsplit("/", 1)[-1]), "links": []}
+            )
         return httpx.Response(200, json={"ok": True})
 
     await agent.client._client.aclose()  # noqa: SLF001
@@ -72,14 +89,17 @@ async def test_full_surface_sweep_dispatches_order_and_confines_forget() -> None
         await agent.aclose()
     assert result.ok, result.detail
     expected = [
-        ("POST", "/api/v1/memories"), ("POST", "/api/v1/memories"),
-        ("POST", "/api/v1/links"), ("GET", "/api/v1/links/mem-2"),
+        ("POST", "/api/v1/memories"),
+        ("POST", "/api/v1/memories"),
+        ("POST", "/api/v1/links"),
+        ("GET", "/api/v1/links/mem-2"),
         ("GET", "/api/v1/memories/mem-1"),
         ("GET", "/api/v1/memories/mem-2/lineage"),
         ("PUT", "/api/v1/memories/mem-1"),
         ("POST", "/api/v1/memories/mem-1/promote"),
         ("POST", "/api/v1/memory_reflect"),
-        ("DELETE", "/api/v1/memories/mem-2"), ("POST", "/api/v1/forget"),
+        ("DELETE", "/api/v1/memories/mem-2"),
+        ("POST", "/api/v1/forget"),
     ]
     assert [(request.method, request.url.path) for request in seen] == expected
     assert seen[6].headers["if-match"] == "3"
@@ -96,8 +116,13 @@ async def test_run_all_includes_full_surface_sweep(monkeypatch: pytest.MonkeyPat
         return SimpleNamespace(name="fake", ok=True, detail="ok")
 
     import swarm.choreography as choreography
-    for name in ("producer_consumer", "consensus_quorum", "governance_approval",
-                 "full_surface_sweep"):
+
+    for name in (
+        "producer_consumer",
+        "consensus_quorum",
+        "governance_approval",
+        "full_surface_sweep",
+    ):
         monkeypatch.setattr(choreography, name, fake)
     results = await run_all(SimpleNamespace(agents=[]))
     assert len(results) == 4
@@ -109,9 +134,13 @@ def test_write_journals_serializes_each_agent(tmp_path: Path) -> None:
     _write_journals(SimpleNamespace(agents=[agent]), str(tmp_path))
     path = tmp_path / "ai:test-agent.jsonl"
     assert json.loads(path.read_text()) == {
-        "decided_tools": ["store"], "outcomes": ["ok"],
-        "perceived": "seen", "step": 1, "started_at": "",
-        "finished_at": "", "latency_ms": 0.0,
+        "decided_tools": ["store"],
+        "outcomes": ["ok"],
+        "perceived": "seen",
+        "step": 1,
+        "started_at": "",
+        "finished_at": "",
+        "latency_ms": 0.0,
     }
 
 
@@ -130,9 +159,7 @@ async def test_nhi_assessment_is_plain_completion_and_attested_store() -> None:
         agents=[agent], coverage=CoverageTracker(), shared_namespace="swarm-shared"
     )
     try:
-        result, report = await nhi_assessment(
-            swarm, [ScenarioResult("probe", True, "proved")]
-        )
+        result, report = await nhi_assessment(swarm, [ScenarioResult("probe", True, "proved")])
     finally:
         await agent.aclose()
     assert result.ok, result.detail
@@ -156,8 +183,7 @@ def test_write_journals_writes_assessment_artifact(tmp_path: Path) -> None:
 def test_write_usage_serializes_account_delta_and_agent_totals(tmp_path: Path) -> None:
     coverage = CoverageTracker()
     coverage.record_model_usage(
-        "ai:a", {"prompt_tokens": 10, "completion_tokens": 2,
-                  "total_tokens": 12, "cost": 0.003}
+        "ai:a", {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12, "cost": 0.003}
     )
     before = AccountSnapshot(1.0, 0.1, 0.5, 0.9)
     after = AccountSnapshot(1.003, 0.103, 0.503, 0.903)

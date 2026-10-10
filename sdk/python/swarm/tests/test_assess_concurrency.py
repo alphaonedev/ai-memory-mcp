@@ -57,8 +57,12 @@ class _LatentModel:
                 "free_text": f"agent {ordinal} reporting",
             }
             # Distinct token counts per agent: misattribution is then visible.
-            usage = {"prompt_tokens": 10 + ordinal, "completion_tokens": 1,
-                     "total_tokens": 11 + ordinal, "cost": 0.001}
+            usage = {
+                "prompt_tokens": 10 + ordinal,
+                "completion_tokens": 1,
+                "total_tokens": 11 + ordinal,
+                "cost": 0.001,
+            }
             return json.dumps(rubric), usage
         finally:
             self.in_flight -= 1
@@ -77,24 +81,34 @@ def _mock_daemon() -> httpx.MockTransport:
 
 
 def _swarm(model: _LatentModel, n_agents: int, *, concurrency: int) -> SimpleNamespace:
-    config = SwarmConfig(base_urls=["http://mock"], n_agents=n_agents, max_steps=1,
-                         assess_concurrency=concurrency)
+    config = SwarmConfig(
+        base_urls=["http://mock"], n_agents=n_agents, max_steps=1, assess_concurrency=concurrency
+    )
     agents = []
     for ordinal in range(n_agents):
         agent_id = f"ai:swarm-{ordinal}"
         client = AsyncAiMemoryClient(base_url="http://mock", agent_id=agent_id)
         client._client = httpx.AsyncClient(  # noqa: SLF001 - offline transport injection
-            base_url="http://mock", transport=_mock_daemon())
-        identity = AgentIdentity(agent_id=agent_id, signing_key=AgentSigningKey.generate(),
-                                 namespace=f"swarm-{ordinal:03d}",
-                                 allowed_namespaces={f"swarm-{ordinal:03d}", "swarm-shared"})
-        agent = SwarmAgent(identity=identity, client=client,
-                           model=model,  # type: ignore[arg-type]
-                           config=config, coverage=CoverageTracker())
+            base_url="http://mock", transport=_mock_daemon()
+        )
+        identity = AgentIdentity(
+            agent_id=agent_id,
+            signing_key=AgentSigningKey.generate(),
+            namespace=f"swarm-{ordinal:03d}",
+            allowed_namespaces={f"swarm-{ordinal:03d}", "swarm-shared"},
+        )
+        agent = SwarmAgent(
+            identity=identity,
+            client=client,
+            model=model,  # type: ignore[arg-type]
+            config=config,
+            coverage=CoverageTracker(),
+        )
         agent.journal.append(StepRecord(1, "recall[ok]", ["store"], ["store -> ok"]))
         agents.append(agent)
-    return SimpleNamespace(agents=agents, coverage=CoverageTracker(), config=config,
-                           shared_namespace="swarm-shared")
+    return SimpleNamespace(
+        agents=agents, coverage=CoverageTracker(), config=config, shared_namespace="swarm-shared"
+    )
 
 
 async def _aclose(swarm: SimpleNamespace) -> None:
@@ -179,8 +193,10 @@ async def test_each_rubric_is_streamed_as_it_lands(tmp_path) -> None:
         assessments = await collect_assessments(swarm, journal_dir=tmp_path)
     finally:
         await _aclose(swarm)
-    streamed = [json.loads(line) for line in
-                (tmp_path / PARTIAL_ASSESSMENTS).read_text(encoding="utf-8").splitlines()]
+    streamed = [
+        json.loads(line)
+        for line in (tmp_path / PARTIAL_ASSESSMENTS).read_text(encoding="utf-8").splitlines()
+    ]
     # A killed run keeps every rubric it had already paid for, in any order.
     assert len(streamed) == len(assessments) == 8
     assert {item["agent_id"] for item in streamed} == {a.agent_id for a in assessments}
@@ -204,20 +220,31 @@ async def test_complete_with_usage_returns_this_calls_usage() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         payload = json.loads(request.content)
         tag = payload["messages"][0]["content"]
-        return httpx.Response(200, json={
-            "choices": [{"message": {"content": f"reply-{tag}"}}],
-            "usage": {"prompt_tokens": int(tag), "completion_tokens": 1,
-                      "total_tokens": int(tag) + 1, "cost": 0.5},
-        })
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": f"reply-{tag}"}}],
+                "usage": {
+                    "prompt_tokens": int(tag),
+                    "completion_tokens": 1,
+                    "total_tokens": int(tag) + 1,
+                    "cost": 0.5,
+                },
+            },
+        )
 
     client = OpenRouterClient(api_key="test", model_slug="test-model", base_url="http://mock")
     await client._client.aclose()  # noqa: SLF001
     client._client = httpx.AsyncClient(  # noqa: SLF001
-        base_url="http://mock", transport=httpx.MockTransport(handler))
+        base_url="http://mock", transport=httpx.MockTransport(handler)
+    )
     try:
-        results = await asyncio.gather(*(
-            client.complete_with_usage(messages=[{"role": "system", "content": str(n)}])
-            for n in (7, 11, 13)))
+        results = await asyncio.gather(
+            *(
+                client.complete_with_usage(messages=[{"role": "system", "content": str(n)}])
+                for n in (7, 11, 13)
+            )
+        )
     finally:
         await client.aclose()
     assert [content for content, _usage in results] == ["reply-7", "reply-11", "reply-13"]
