@@ -8957,7 +8957,7 @@ pub async fn sync_cycle_once(
     api_key: Option<&str>,
     batch_size: usize,
 ) -> Result<()> {
-    let peer_url = peer_url.trim_end_matches('/');
+    let (raw_peer_url, peer_url) = (peer_url, peer_url.trim_end_matches('/'));
     // #3675 / #3687 / #3711 — the peer's DURABLE identity (the `sync_state`
     // key) and its LOG label are the allowlist rendering `scheme://host
     // [:port]/path`: never the userinfo or the query string a `--peers` URL
@@ -8968,13 +8968,23 @@ pub async fn sync_cycle_once(
     // `sync_state.peer_id`, every backup or every `VACUUM INTO` snapshot.
     let peer_key = crate::url_display::url_origin_and_path(peer_url);
     let peer_key = peer_key.as_str();
-    // #6101 — an ambiguous or unparseable peer URL renders a CONSTANT, so
-    // two such peers would share one cursor row (and the #3675 heal below
-    // would fold both raw rows into it). Refuse before sync_state is read.
+    // #6101 / #6628 — a peer URL with a literal `@` after its PARSED
+    // authority, or an unparseable one, renders a CONSTANT, so two such peers
+    // would share one cursor row (and the #3675 heal below would fold both
+    // raw rows into it). Refuse before sync_state is read or rekeyed, and
+    // delete a row an older daemon keyed by the raw credential URL.
     if !crate::url_display::origin_and_path_is_durable_key(peer_url) {
+        let conn = db::open(db_path)?;
+        let raw_keys = [raw_peer_url, peer_url];
+        let n = db::sync_state_rekey::forget_raw_peer(&conn, local_agent_id, &raw_keys)?;
+        if n > 0 {
+            tracing::warn!(
+                "sync-daemon: deleted {n} sync_state row(s) keyed by the raw URL of refused peer {peer_key} (#6628)"
+            );
+        }
         anyhow::bail!(
-            "peer {peer_key} refused: its URL has no unique sync_state key \
-             (ambiguous or unparseable authority; percent-encode the userinfo) (#6101)"
+            "peer {peer_key} refused: its URL has no unique sync_state key (a literal '@' after \
+             the authority, or unparseable); percent-encode a literal '@' as %40 (#6101 #6628)"
         );
     }
 

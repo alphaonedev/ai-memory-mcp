@@ -62,6 +62,29 @@ pub fn rekey_peer(
     Ok(true)
 }
 
+/// Delete every `sync_state` row of `agent_id` keyed by one of `raw_keys`
+/// (#6628): the verbatim URL of a peer the daemon REFUSES because it has no
+/// durable key. Such a row was written by a daemon that predates the
+/// refusal; its key is the credential URL, so it is deleted rather than
+/// kept at rest (there is no unique key to fold it into). A raw key never
+/// equals another peer's rendered key: a refused URL either does not parse
+/// or keeps a literal `@` after its authority, which no rendering does.
+///
+/// Returns the number of rows deleted.
+///
+/// # Errors
+/// Any sqlite error from the delete.
+pub fn forget_raw_peer(conn: &Connection, agent_id: &str, raw_keys: &[&str]) -> Result<usize> {
+    let mut deleted = 0_usize;
+    for raw in raw_keys {
+        deleted = deleted.saturating_add(conn.execute(
+            "DELETE FROM sync_state WHERE agent_id = ?1 AND peer_id = ?2",
+            params![agent_id, raw],
+        )?);
+    }
+    Ok(deleted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -118,5 +141,33 @@ mod tests {
     fn equal_keys_are_a_no_op_3675() {
         let conn = open();
         assert!(!rekey_peer(&conn, "me", RENDERED, RENDERED).unwrap());
+    }
+
+    #[test]
+    fn refused_peer_raw_rows_are_deleted_and_others_kept_6628() {
+        let conn = open();
+        let refused = "https://svc:123/SECRETK6628@peer.example/mesh";
+        super::super::sync_state_observe(&conn, "me", refused, "2026-09-01T00:00:00Z").unwrap();
+        super::super::sync_state_observe(&conn, "me", RENDERED, "2026-09-02T00:00:00Z").unwrap();
+        super::super::sync_state_observe(&conn, "other", refused, "2026-09-03T00:00:00Z").unwrap();
+        assert_eq!(
+            forget_raw_peer(&conn, "me", &[refused, refused]).unwrap(),
+            1
+        );
+        let clock = super::super::sync_state_load(&conn, "me").unwrap();
+        assert!(
+            clock.entries.get(refused).is_none(),
+            "raw credential key must be gone"
+        );
+        assert!(
+            clock.entries.get(RENDERED).is_some(),
+            "an unrelated peer row was deleted"
+        );
+        let other = super::super::sync_state_load(&conn, "other").unwrap();
+        assert!(
+            other.entries.get(refused).is_some(),
+            "another agent's row was deleted"
+        );
+        assert_eq!(forget_raw_peer(&conn, "me", &[refused]).unwrap(), 0);
     }
 }

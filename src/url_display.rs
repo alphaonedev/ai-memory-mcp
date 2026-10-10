@@ -116,57 +116,25 @@ fn redacted_authority(parsed: &reqwest::Url) -> String {
     format!("{}://{REDACTED_AUTHORITY}", parsed.scheme())
 }
 
-/// Schemes the WHATWG parser treats as special: on these `\` ends the
-/// authority exactly like `/`.
-const SPECIAL_SCHEMES: [&str; 6] = ["http", "https", "ws", "wss", "ftp", "file"];
-
-/// `true` when a URL with an `@` after its parsed authority shows the
-/// credential shape (#6101), so [`url_origin_and_path`] must not render it.
+/// `true` when the PARSED URL holds a literal `@` after its authority: in
+/// the path, the query or the fragment (#6096, #6628).
 ///
-/// [`url_origin_and_path`] is a DURABLE peer key (`sync_state.peer_id`), so
-/// unlike [`url_origin`] it cannot redact every `@` in a path: a legitimate
-/// `https://host/a@b` must keep its key. The URL is ambiguous when
-/// [`store_url_is_ambiguous`] holds AND one of:
-/// - the parsed userinfo is non-empty (the delimiter came after the
-///   credential, so the parsed host is credential bytes);
-/// - the raw text has no `scheme://` (the parser invented the authority);
-/// - the RAW authority span (after the parser's own tab / LF / CR deletion,
-///   up to the first `/`, `?`, `#`, or `\` on a special scheme) has a `:`
-///   whose port is empty or not all digits (`svc:` + delimiter);
-/// - the text between that span and the first `@` holds a `:` (a
-///   `user:password@` remainder).
-///
-/// Not distinguishable from a legitimate path, and so still rendered: a
-/// numeric-prefixed password (`svc:123/<pw>@host`, parsed as port `123`) and
-/// a delimiter in a password-less username token.
-fn origin_and_path_is_ambiguous(raw: &str, parsed: &reqwest::Url) -> bool {
-    if !store_url_is_ambiguous(raw) {
-        return false;
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        return true;
-    }
-    let normalised: String = raw
-        .chars()
-        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
-        .collect();
-    let Some((_, rest)) = normalised.split_once("://") else {
-        return true;
-    };
-    let special = SPECIAL_SCHEMES.contains(&parsed.scheme());
-    let end = rest
-        .find(|c: char| matches!(c, '/' | '?' | '#') || (special && c == '\\'))
-        .unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(end);
-    let bad_port = !authority.ends_with(']')
-        && authority
-            .rsplit_once(':')
-            .is_some_and(|(_, port)| port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()));
-    bad_port
-        || tail
-            .split('@')
-            .next()
-            .is_some_and(|before| before.contains(':'))
+/// `@` stays literal in the path, query and fragment encode sets, and the
+/// parser folds every `@` it reads INSIDE the authority into the userinfo,
+/// so an `@` left after the parsed authority means the parser ended the
+/// authority early: an unencoded `/`, `?`, `#` (or `\` on a special scheme)
+/// in the userinfo put the rest of the credential and the real `@host` in
+/// the path, query or fragment, and the parsed host / port / path are
+/// credential bytes. The decision is made on the PARSED value only, never
+/// on the raw text: the parser deletes tab / LF / CR, folds `\`, accepts
+/// `https:` with no slashes and reads a numeric password as a port, and a
+/// raw-text scan diverged from it on each (#6700). A legitimate `@` in a
+/// path or query is written `%40` (ERRORS-01 fail closed, ERRORS-09 one
+/// predicate).
+fn at_after_authority(parsed: &reqwest::Url) -> bool {
+    parsed.path().contains('@')
+        || parsed.query().is_some_and(|q| q.contains('@'))
+        || parsed.fragment().is_some_and(|f| f.contains('@'))
 }
 
 /// `scheme://host[:port]/path` — the origin plus the PATH of `url`, still
@@ -176,12 +144,14 @@ fn origin_and_path_is_ambiguous(raw: &str, parsed: &reqwest::Url) -> bool {
 /// `sync_state.peer_id`): two peers behind one host differ by path, and a
 /// peer's path is operator config, never a tenant credential channel. A
 /// webhook target is NOT rendered this way — chat webhooks carry their
-/// secret in the path (#3684); use [`url_origin`] there.
+/// secret in the path (#3684); use [`url_origin`] there. A URL with a
+/// literal `@` after its parsed authority renders the constant
+/// `scheme://<redacted-authority>` (#6628, see [`at_after_authority`]).
 #[must_use]
 pub fn url_origin_and_path(url: &str) -> String {
     let trimmed = url.trim();
     match reqwest::Url::parse(trimmed) {
-        Ok(parsed) if origin_and_path_is_ambiguous(trimmed, &parsed) => redacted_authority(&parsed),
+        Ok(parsed) if at_after_authority(&parsed) => redacted_authority(&parsed),
         Ok(parsed) => {
             let mut out = origin_of(&parsed);
             let path = parsed.path();
@@ -197,14 +167,15 @@ pub fn url_origin_and_path(url: &str) -> String {
 /// `true` when [`url_origin_and_path`] renders `url` as a key that names
 /// this URL alone, so it can be a DURABLE key (`sync_state.peer_id`, #3675).
 ///
-/// `false` for an ambiguous authority (rendered as the constant
-/// `scheme://<redacted-authority>`, #6101) and for an unparseable URL
+/// `false` for a literal `@` after the parsed authority (rendered as the
+/// constant `scheme://<redacted-authority>`, #6101 / #6628: a legitimate
+/// `@` is written `%40`, which keeps the key) and for an unparseable URL
 /// (rendered as the constant `scheme://<unparseable>`): every such URL
 /// renders the same text, so two of them would share one cursor row.
 #[must_use]
 pub fn origin_and_path_is_durable_key(url: &str) -> bool {
     let trimmed = url.trim();
-    reqwest::Url::parse(trimmed).is_ok_and(|parsed| !origin_and_path_is_ambiguous(trimmed, &parsed))
+    reqwest::Url::parse(trimmed).is_ok_and(|parsed| !at_after_authority(&parsed))
 }
 
 /// `true` when `url` PARSES to a URL whose path, query or fragment holds an
@@ -227,11 +198,7 @@ pub fn origin_and_path_is_durable_key(url: &str) -> bool {
 /// also one the floor refuses before any connection or DNS lookup.
 #[must_use]
 pub(crate) fn store_url_is_ambiguous(url: &str) -> bool {
-    reqwest::Url::parse(url.trim()).is_ok_and(|parsed| {
-        parsed.path().contains('@')
-            || parsed.query().is_some_and(|q| q.contains('@'))
-            || parsed.fragment().is_some_and(|f| f.contains('@'))
-    })
+    reqwest::Url::parse(url.trim()).is_ok_and(|parsed| at_after_authority(&parsed))
 }
 
 /// A store URL (`--store-url`, `AI_MEMORY_STORE_URL[_FILE]`) for every
