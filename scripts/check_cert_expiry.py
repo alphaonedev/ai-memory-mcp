@@ -1334,6 +1334,8 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
             t.fail(f"(shim-pathsep): the refusal does not tell the user the remedy: {exc}")
     else:
         t.fail("(shim-pathsep): a scratch path containing the PATH separator was not refused")
+    if list(sep_dir.glob("gitshim.*")):
+        t.fail("(shim-pathsep-clean): a refused separator path left its shim directory behind")
     # #6380: the call-site wrapper turns a refused shim into exactly one named
     # self-test failure (it must neither swallow the error nor fabricate a verdict).
     rec = FailureRecorder()
@@ -1424,6 +1426,27 @@ def _self_test(tmp):  # noqa: C901 - one linear plant-a-violation corpus
                 t.fail("(shim-probe-timeout): a probe that timed out was treated as reachable")
         finally:
             shutil.rmtree(fake_dir, ignore_errors=True)
+    # #6448: each half of the reachability probe is pinned on its own. The real git
+    # fails both halves at once (exit 129, no marker), so only stub gits tell them
+    # apart: one exits 0 and prints nothing, one prints the marker and exits 1.
+    if os.pathsep not in str(tmp):
+        for stub_label, body in (
+                ("exit0-no-marker", "pass"),
+                ("marker-exit1", f"print({GIT_SHIM_PROBE_MARKER!r})\nsys.exit(1)")):
+            stub_dir = Path(tempfile.mkdtemp(prefix="stubgit.", dir=str(tmp)))
+            try:
+                stub = stub_dir / "git"
+                stub.write_text(f"#!{sys.executable}\nimport sys\n{body}\n", encoding="utf-8")
+                stub.chmod(0o755)
+                try:
+                    _require_shim_reachable(str(stub_dir))
+                except GateError as exc:
+                    if "is not the git on PATH" not in str(exc):
+                        t.fail(f"(shim-probe-half): {stub_label} refused for the wrong reason: {exc}")
+                else:
+                    t.fail(f"(shim-probe-half): a git that is {stub_label} was treated as the shim")
+            finally:
+                shutil.rmtree(stub_dir, ignore_errors=True)
     # #6381: the shim PATH entry is process-global; every shim cell above, on its
     # success path (shim-control), its gate-verdict paths (gitver, anc-error) and
     # its refusal paths (shim-pathsep, shim-unreach), must leave PATH as found.
@@ -1601,6 +1624,9 @@ SELF_TEST_OK = (
     "(shim-clean-any-exc, #6428) any exception, not only GateError, removes the shim "
     "directory; (shim-probe-decode) non-UTF-8 probe output refused by name; "
     "(shim-probe-timeout) a probe past its timeout refused by name; "
+    "(shim-probe-half, #6448) a git that exits 0 without the marker and a git that prints "
+    "the marker but exits 1 are each refused; "
+    "(shim-pathsep-clean, #6428) a refused separator path leaves no shim directory; "
     "(pr4-reversed) reversed parents RED; (pr5) stale branch without a wire change "
     "over a base that gained one GREEN; (pr6) PR wire change without a banner flip RED; "
     "(pr7) merge with an unrelated branch (second parent is not the PR head) RED and an "
