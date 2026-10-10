@@ -249,7 +249,14 @@ def _refuse_untrusted_holder(
     does not exist: no sticky exception then, since anyone who can write the
     directory can create it after this check (#6828).
     """
-    held = os.stat(directory)
+    try:
+        held = os.stat(directory)
+    except OSError as exc:
+        raise ValueError(
+            f"verify= CA path {path!r}: the directory {directory!r} holding {entry!r} "
+            f"cannot be checked ({exc.strerror}); it changed while the path was being "
+            "checked (#6829)."
+        ) from None
     trusted = (0, os.geteuid())
     if held.st_uid not in trusted:
         raise ValueError(
@@ -293,15 +300,36 @@ def _checked_realpath(path: str) -> str:
     appended unchanged (a later ``..`` is NOT collapsed lexically; the kernel
     returns ENOENT for it too), so the caller refuses the path; the directory
     that would hold it is held to the same rule first, so nobody else can
-    create it between this walk and the open (#6828).
+    create it between this walk and the open (#6828). Any component after a
+    file (``ca.pem/.``, ``ca.pem/..``) is refused, as the kernel's ENOTDIR
+    (#6811), and a directory that vanishes mid-walk is a ``ValueError``,
+    never a raw ``OSError`` (#6829).
     """
     if os.name == "nt":
         return os.path.realpath(path)
-    parts = [part for part in os.path.join(os.getcwd(), path).split(os.sep) if part]
+    if not os.path.isabs(path):
+        try:
+            path_from_root = os.path.join(os.getcwd(), path)
+        except OSError as exc:
+            raise ValueError(
+                f"verify= CA path {path!r} is relative and the working directory cannot "
+                f"be read ({exc.strerror}) (#6829)."
+            ) from None
+    else:
+        path_from_root = path
+    parts = [part for part in path_from_root.split(os.sep) if part]
     resolved = os.sep
+    resolved_is_dir = True
     hops = 0
     while parts:
         name = parts.pop(0)
+        if not resolved_is_dir:
+            # The kernel gives ENOTDIR for anything after a file, `.` and
+            # `..` included: `ca.pem/.` is never `ca.pem` (#6811).
+            raise ValueError(
+                f"verify= CA path {path!r}: {resolved!r} is not a directory, so no "
+                "component can follow it (ENOTDIR, #6811)."
+            )
         if name == ".":
             continue
         if name == "..":
@@ -316,6 +344,7 @@ def _checked_realpath(path: str) -> str:
         _refuse_untrusted_holder(path, resolved, candidate, info)
         if not stat.S_ISLNK(info.st_mode):
             resolved = candidate
+            resolved_is_dir = stat.S_ISDIR(info.st_mode)
             continue
         hops += 1
         if hops > _MAX_SYMLINK_HOPS:
@@ -406,8 +435,11 @@ def _load_trust_file(context: ssl.SSLContext, shown: str, entry: str) -> None:
         raise ValueError(
             f"verify= CA file {shown!r} holds no usable certificate: {exc} (#6377)."
         ) from None
-    after = os.stat(real)
-    if (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
+    try:
+        after = os.stat(real)
+    except OSError:
+        after = None
+    if after is None or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino):
         raise ValueError(f"verify= CA file {shown!r} changed while it was being read (#6377).")
 
 
