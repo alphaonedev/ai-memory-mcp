@@ -636,6 +636,21 @@ def _is_sep(lines, i):
     return 0 <= i < len(lines) and (BLANK_RE.match(lines[i]) or QUOTED_BLANK_RE.match(lines[i]))
 
 
+def _in_ledger(lines, known, start, end):
+    """True iff the record at LINES[start:end] sits in the ledger (#6420):
+    LINES[end] (past at most one blank '>' line) is the header of a KNOWN
+    record, or the unbroken '>' run above START holds one."""
+    nxt = end + 1 if end < len(lines) and QUOTED_BLANK_RE.match(lines[end]) else end
+    if nxt in known and lines[nxt].startswith(">"):
+        return True
+    i = start - 1
+    while i >= 0 and lines[i].startswith(">"):
+        if i in known:
+            return True
+        i -= 1
+    return False
+
+
 def amendment_verdict(repo, mb, judged, required):
     """(ok, why) for the #6124 pass path. The cert doc at JUDGED must be the
     doc at MB with exactly ONE new amendment record inserted (plus at most one
@@ -695,6 +710,15 @@ def amendment_verdict(repo, mb, judged, required):
                    "amendment header or as the last paragraph of its blockquote")
     if not ent["below_status"]:
         why.append(f"{at} is above the STATUS line")
+    # #6420: once the doc has a ledger the record belongs inside it: its next
+    # line (past at most one blank '>' line) is an existing record's header,
+    # or the unbroken blockquote above it holds an existing record's header.
+    known = {e["start"] for e in parse_ledger(new_lines) if e is not ent
+             and e["header"].rstrip("\r") in old_heads}
+    if known and not _in_ledger(new_lines, known, start, end):
+        why.append(f"{at} is not adjacent to the amendment ledger: place it directly above "
+                   "an existing amendment header (a blank '>' line between them) or as the "
+                   "last paragraph of the blockquote that holds one")
     head = AMENDMENT_HEAD_RE.match(ent["header"])
     if not head:
         why.append(f"{at}: its header must stand alone on its line, inside the blockquote, "
