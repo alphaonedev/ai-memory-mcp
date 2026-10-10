@@ -12578,6 +12578,14 @@ mod tests {
 
     #[test]
     fn test_apply_startup_env_with_db_passphrase_file_does_not_export_env() {
+        // #6790 — seeds the process-global passphrase slot that EVERY sqlite
+        // `open` reads; run it in an isolated child so no concurrent lib test
+        // can observe the seed (the window lock only excludes callers that take it).
+        if crate::config::run_env_isolated_child_or_spawn(
+            "daemon_runtime::tests::test_apply_startup_env_with_db_passphrase_file_does_not_export_env",
+        ) {
+            return;
+        }
         // #3213 — the `--db-passphrase-file` channel seeds process-private
         // state (`storage::set_db_passphrase`) and MUST NOT re-publish into
         // `AI_MEMORY_DB_PASSPHRASE` (the #2905 env-leak class; children

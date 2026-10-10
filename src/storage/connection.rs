@@ -2050,31 +2050,10 @@ mod tests {
         );
     }
 
-    /// Wave-1 S1 pin: passphrase-set + non-sqlcipher build must NOT
-    /// silently open a plaintext DB.
-    #[cfg(not(feature = "sqlcipher"))]
-    #[test]
-    fn passphrase_set_on_non_sqlcipher_refuses_open_s1() {
-        if crate::config::run_env_isolated_child_or_spawn(
-            "storage::connection::tests::passphrase_set_on_non_sqlcipher_refuses_open_s1",
-        ) {
-            return;
-        }
-        let _lock = crate::test_support::env_lock();
-        let guard = crate::test_support::EnvGuard::capture(ENV_DB_PASSPHRASE);
-        guard.set("s1-test-passphrase");
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
-        let err = open(tmp.path()).expect_err("passphrase + non-sqlcipher must refuse");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("sqlcipher"),
-            "refusal must name sqlcipher: {msg}"
-        );
-        assert!(
-            msg.contains("AI_MEMORY_DB_PASSPHRASE") || msg.contains("passphrase"),
-            "refusal must name the passphrase request: {msg}"
-        );
-    }
+    // Wave-1 S1 pin `passphrase_set_on_non_sqlcipher_refuses_open_s1` moved to
+    // `tests/db_passphrase_refusal_6790.rs` (#6790): it writes
+    // `AI_MEMORY_DB_PASSPHRASE`, which every `open` reads, so it runs in its own
+    // process rather than beside the lib tests that open databases unlocked.
 
     /// Wave-2 B3: ENCRYPT_AT_REST on a non-sqlcipher build must OPEN —
     /// it is app-level ChaCha, not a SQLCipher request.
@@ -2119,6 +2098,14 @@ mod tests {
     #[cfg(not(feature = "sqlcipher"))]
     #[test]
     fn db_passphrase_test_reset_does_not_poison_later_open_b11() {
+        // #6790 — seeds the process-global passphrase slot that EVERY `open`
+        // reads; run it in an isolated child so no concurrent lib test can
+        // observe the seed (the window lock only excludes callers that take it).
+        if crate::config::run_env_isolated_child_or_spawn(
+            "storage::connection::tests::db_passphrase_test_reset_does_not_poison_later_open_b11",
+        ) {
+            return;
+        }
         // #3539 — ONE window for the whole body: the env var stays cleared
         // and no other test can open sqlite while the seed below is live.
         let iso = crate::test_support::PassphraseEnvIsolation::enter();
