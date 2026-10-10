@@ -220,8 +220,8 @@ before `CREATE EXTENSION`:
   `sslcert`, `sslkey`, `sslcrl`, `sslcrldir`, `passfile`,
   `krbsrvname`, `requirepeer`) stay in the URL on psql's argv. The URL is refused
   with exit 2 and one stderr line (no value printed) when it does not start with
-  the exact lowercase `postgres://` or `postgresql://`; holds a control
-  character, a raw space, a `#`, a `%` not followed by two hex digits or `%00`;
+  the exact lowercase `postgres://` or `postgresql://`; holds a TAB, CR, LF or NUL
+  (VT, FF, DEL and NBSP pass, as in libpq), a raw space, a `#`, a `%` not followed by two hex digits or `%00`;
   has more than one `@` in the host part, an `@` after it, or an empty host part
   (`postgres:///db...`); or its query has an empty segment (one trailing `&` is
   accepted), a segment without exactly one `=`, or a key not on
