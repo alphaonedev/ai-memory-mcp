@@ -470,7 +470,7 @@ class LibGateFollowUps6344R2(Base):
 
 
 class LibCallerResolution6412(Base):
-    """#6412: callers of a Postgres helper are followed by resolved path, not bare name."""
+    """#6412: callers of a Postgres helper are the union of the bare-name matcher and the path resolver (r3)."""
 
     HELPER = 'pub(crate) fn live_pg_url() -> String { std::env::var("AI_MEMORY_TEST_POSTGRES_URL").unwrap() }\n'
 
@@ -484,9 +484,10 @@ class LibCallerResolution6412(Base):
         fx('src/a.rs', a_rs)
         return pt.uncovered_lib_pg_modules(SCRATCH / 'src', list(prefixes))
 
-    def test_same_named_unrelated_fn_is_not_a_pg_site_6412(self):
+    def test_same_named_unrelated_fn_stays_an_over_match_by_design_6412(self):
+        # r3: the bare-name matcher reports it and the resolver never removes a site (5-agent vote 4d3ea1c5).
         a = 'fn live_pg_url() -> &\'static str { "x" }\n' + self.in_tests('let _ = live_pg_url();')
-        self.assertEqual(self.gate(a), [])
+        self.assertEqual(self.gate(a), ['a::tests::t'])
 
     def test_same_named_method_is_not_a_pg_site_6412(self):
         a = ('struct S;\nimpl S { fn live_pg_url(&self) -> u8 { 0 } }\n'
@@ -525,9 +526,10 @@ class LibCallerResolution6412(Base):
                      'crate :: support :: live_pg_url::<>()'):
             self.assertEqual(self.gate(self.in_tests('let _ = %s;' % call)), ['a::tests::t'], call)
 
-    def test_qualifier_that_resolves_elsewhere_is_not_a_pg_site_6412(self):
+    def test_qualifier_that_resolves_elsewhere_stays_an_over_match_by_design_6412(self):
+        # r3: `other::live_pg_url()` matches by bare name; no module reasoning excludes it (vote 4d3ea1c5).
         a = self.in_tests('let _ = other::live_pg_url();')
-        self.assertEqual(self.gate(a), [])
+        self.assertEqual(self.gate(a), ['a::tests::t'])
 
     def test_helper_defined_as_a_method_stays_fail_closed_6412(self):
         fx('src/lib.rs', 'mod support;\nmod a;\n')
@@ -587,10 +589,11 @@ class LibCallerTransitive6412(Base):
                  'a/b.rs': self.with_tests('let _ = live_pg_url();', 'use super::super::live_pg_url;')}
         self.assertEqual(self.gate(files), ['a::b::tests::t'])
 
-    def test_reexport_cycle_terminates_and_stays_clean_6412(self):
+    def test_reexport_cycle_terminates_and_still_matches_by_name_6412(self):
+        # r3: terminates; the bare-name call is a site even though no chain reaches the helper (vote 4d3ea1c5).
         files = {'a.rs': self.with_tests('let _ = live_pg_url();', 'use crate::re::*;'),
                  're.rs': 'pub use crate::a::*;\n'}
-        self.assertEqual(self.gate(files), [])
+        self.assertEqual(self.gate(files), ['a::tests::t'])
 
     def test_reexport_cycle_still_finds_the_helper_6412(self):
         files = {'a.rs': 'pub use crate::re::*;\n' + self.with_tests('let _ = live_pg_url();', 'use crate::re::*;'),
@@ -601,19 +604,20 @@ class LibCallerTransitive6412(Base):
         files = {'a.rs': self.with_tests('let _ = live_pg_url();', 'use crate::Kind::*;')}
         self.assertEqual(self.gate(files), ['a::tests::t'])
 
-    def test_external_glob_is_not_a_caller_6412(self):
+    def test_external_glob_is_still_a_by_name_site_6412(self):
+        # r3: a bare `live_pg_url()` matches by name whatever the glob offers (vote 4d3ea1c5).
         files = {'a.rs': self.with_tests('let _ = live_pg_url();', 'use some_extern_crate::*;')}
-        self.assertEqual(self.gate(files), [])
+        self.assertEqual(self.gate(files), ['a::tests::t'])
 
-    # probe cases from the review that must stay green
-    def test_local_fn_shadows_a_glob_6412(self):
+    # same-named free fns are an over-match by design (fail closed, vote 4d3ea1c5)
+    def test_local_fn_beside_a_glob_is_still_a_site_6412(self):
         a = 'use crate::support::*;\nfn live_pg_url() -> u8 { 0 }\n' + self.with_tests('let _ = super::live_pg_url();')
-        self.assertEqual(self.gate({'a.rs': a}), [])
+        self.assertEqual(self.gate({'a.rs': a}), ['a::tests::t'])
 
-    def test_local_fn_shadows_through_super_glob_6412(self):
+    def test_local_fn_beside_a_super_glob_is_still_a_site_6412(self):
         a = ('use crate::support::*;\nfn live_pg_url() -> u8 { 0 }\n'
              + self.with_tests('let _ = live_pg_url();', 'use super::*;'))
-        self.assertEqual(self.gate({'a.rs': a}), [])
+        self.assertEqual(self.gate({'a.rs': a}), ['a::tests::t'])
 
     def test_path_expression_without_use_6412(self):
         a = self.with_tests('let _ = crate::support::live_pg_url();')

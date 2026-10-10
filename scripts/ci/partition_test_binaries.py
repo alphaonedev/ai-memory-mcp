@@ -153,6 +153,7 @@ ITEM_RE = re.compile(
     r'\b(?:(fn|struct|enum|union|trait|type|const|static|mod)\s+(?:mut\s+)?(?:r#)?([A-Za-z_][A-Za-z0-9_]*)'
     r'|(macro_rules!)\s*([A-Za-z_][A-Za-z0-9_]*)|(impl)\b)')
 FN_BEFORE_RE = re.compile(r'\bfn\s+$')  # the name is being defined here, not called
+DEF_BEFORE_RE = re.compile(r'\b(?:fn|mod|struct|enum|union|trait|type)\s+$')  # any item definition token
 SHARD_THREADS = 3  # --test-threads of each parallel shard
 PG_TOKEN = 'AI_MEMORY_TEST_POSTGRES_URL'
 PG_TOKEN_RE = re.compile(r'\bAI_MEMORY_TEST_POSTGRES_URL\b')
@@ -738,8 +739,29 @@ def module_tuple(modp, ctx):
     return tuple(parts)
 
 
+def bound_modules(seg, here, scopes, root_fallback=True, seen=None):
+    """Module tuples the name ``seg`` can denote inside ``here``: a child module, an explicit
+    `use`, or anything a glob import (``use super::*``, ``use crate::deep::*``) offers, followed
+    transitively with a cycle guard (#6412 r3: a module name a glob brings in is in scope)."""
+    seen = set() if seen is None else seen
+    if (here, seg) in seen:
+        return set()
+    seen.add((here, seg))
+    out = {here + (seg,)}
+    if root_fallback:
+        out.add((seg,))
+    scope = scopes.get(here, UseScope())
+    for target, local in scope.items:
+        if local == seg:
+            out |= resolve_modules(target, here, {})
+    for glob in scope.globs:
+        for g in resolve_modules(glob, here, {}):
+            out |= bound_modules(seg, g, scopes, False, seen)
+    return out
+
+
 def resolve_modules(segs, here, scopes):
-    """Module tuples a path prefix can name from module ``here`` (crate/self/super and `use` aliases)."""
+    """Module tuples a path prefix can name from module ``here`` (crate/self/super, `use` aliases and globs)."""
     cur = None
     for seg in segs:
         if cur is None:
@@ -750,20 +772,15 @@ def resolve_modules(segs, here, scopes):
             elif seg == 'super':
                 cur = {here[:-1]}
             else:
-                cur = {here + (seg,), (seg,)}
-                for target in scopes.get(here, UseScope()).items:
-                    if target[1] == seg:
-                        cur |= resolve_modules(target[0], here, {})
+                cur = bound_modules(seg, here, scopes)
         elif seg == 'super':
             cur = {q[:-1] for q in cur}
         elif seg == 'self':
             continue
         else:
-            nxt = {q + (seg,) for q in cur}
+            nxt = set()
             for q in cur:
-                for target in scopes.get(q, UseScope()).items:
-                    if target[1] == seg:
-                        nxt |= resolve_modules(target[0], q, {})
+                nxt |= bound_modules(seg, q, scopes, False)
             cur = nxt
     return cur or set()
 
@@ -784,45 +801,66 @@ def collect_use_scopes(units):
     return scopes, spans
 
 
-CRATE_ROOTS = ('crate', 'self', 'super')
-DEF_KINDS = ('fn', 'struct', 'enum', 'union', 'trait', 'type', 'const', 'static', 'mod')
+STD_CRATES = frozenset(('std', 'core', 'alloc'))
+DEP_SECTION_RE = re.compile(r'^\[\s*(?:target\s*\..*\.)?(?:dev-|build-)?dependencies\s*(?:\.\s*([A-Za-z0-9_-]+))?\s*\]')
+DEP_KEY_RE = re.compile(r'^([A-Za-z0-9_-]+)\s*=')
+
+
+def external_crates(src_root):
+    """Names the code can use for crates outside this one: std/core/alloc plus the Cargo.toml dependency keys."""
+    names = set(STD_CRATES)
+    try:
+        text = (Path(src_root).parent / 'Cargo.toml').read_text(errors='replace')
+    except OSError:
+        return names
+    in_deps = False
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith('['):
+            m = DEP_SECTION_RE.match(line)
+            in_deps = bool(m) and not m.group(1)
+            if m and m.group(1):
+                names.add(m.group(1).replace('-', '_'))
+        elif in_deps:
+            m = DEP_KEY_RE.match(line)
+            if m:
+                names.add(m.group(1).replace('-', '_'))
+    return names
 
 
 class ModuleFacts:
-    """Per-module `use` scopes, item definitions and the set of known module tuples of the lib."""
+    """Per-module `use` scopes and the set of known module tuples of the lib."""
 
-    def __init__(self, units):
+    def __init__(self, units, external=STD_CRATES):
         self.scopes, self.spans = collect_use_scopes(units)
-        self.defs = {}    # module tuple -> names of items defined directly in it
+        self.external = frozenset(external)
         self.known = {()}  # module tuples that exist (file modules, inline mods and their prefixes)
         for rf, modp in units:
             parts = tuple(x for x in modp.split('::') if x)
             self.known.update(parts[:i] for i in range(1, len(parts) + 1))
-            found = list(ITEM_RE.finditer(rf.shape))
+            found = list(MOD_DECL_RE.finditer(rf.shape))
             for m, ctx in zip(found, rf.contexts([m.start() for m in found])):
-                if m.group(1) not in DEF_KINDS or any(kind != 'mod' for kind, _n, _t in ctx):
-                    continue  # impl items, fn-local items, macros: not module-level names
-                here = module_tuple(modp, ctx)
-                self.defs.setdefault(here, set()).add(m.group(2))
-                if m.group(1) == 'mod':
-                    self.known.add(here + (m.group(2),))
+                if all(kind == 'mod' for kind, _n, _t in ctx):  # a module-level `mod`, not a fn-local one
+                    self.known.add(module_tuple(modp, ctx) + (m.group(2),))
 
     def modules(self, segs, here):
-        """(known module tuples ``segs`` can name from ``here``, whether the path is unresolvable in-crate).
+        """(known module tuples ``segs`` can name from ``here``, whether the path is unresolvable).
 
-        Unresolvable means the path starts at the crate (or at a name this module imports) yet
-        reaches no known module (an enum, a type, a macro-made module): the caller then fails
-        closed instead of treating the name as a different item.
+        A path that reaches no known module is unresolvable, and the caller then fails closed,
+        unless its first segment is a known external crate that nothing in the lib binds.
         """
         found = resolve_modules(segs, here, self.scopes) & self.known
         if found:
             return found, False
-        imported = {local for _s, local in self.scopes.get(here, UseScope()).items}
-        return set(), bool(segs) and (segs[0] in CRATE_ROOTS or segs[0] in imported)
+        return set(), bool(segs) and segs[0] not in self.external
 
 
 class HelperResolver:
-    """Whether a name, seen from a module, may denote one free-fn Postgres helper (fail closed)."""
+    """Whether a name, seen from a module, may denote one free-fn Postgres helper (add-only, fail closed).
+
+    No shadowing, namespace or cfg reasoning: a module that both defines and imports a name, or
+    imports it explicitly and by glob, keeps every candidate.
+    """
 
     def __init__(self, defmod, name, facts):
         self.defmod, self.name, self.facts = defmod, name, facts
@@ -834,12 +872,9 @@ class HelperResolver:
         seen.add((mod, ident))
         if ident == self.name and mod == self.defmod:
             return True
-        if ident in self.facts.defs.get(mod, ()):
-            return False  # a different item defined here shadows any glob
         scope = self.facts.scopes.get(mod, UseScope())
-        explicit = [segs for segs, local in scope.items if local == ident]
-        if explicit:
-            return any(self.item_offers(segs, mod, seen) for segs in explicit)
+        if any(self.item_offers(segs, mod, seen) for segs, local in scope.items if local == ident):
+            return True
         return any(self.glob_offers(g, mod, ident, seen) for g in scope.globs)
 
     def item_offers(self, segs, mod, seen):
@@ -923,19 +958,53 @@ def macro_callers(units, hit_positions, site_path):
     return out
 
 
-def helper_callers(units, helpers, site_path):
-    """(sites, hit positions) of callers of a Postgres helper, resolved by module path, `use` and globs.
+def bare_name_callers(units, helpers, site_path):
+    """(sites, hit positions) of every ``name(`` call of a Postgres helper, matched by bare name.
 
-    Strings and comments are blanked (``shape`` view). A free-fn helper matches a name only when
-    the name is defined, imported (plain, aliased, group), glob-imported or re-exported (``pub
-    use``) along a chain that reaches it, followed transitively with a cycle guard, so
-    ``mod tests { use super::*; }`` sees what its parent imports. A name the resolver cannot prove
-    is a different item counts as the helper (fail closed, the posture of the bare-name matcher
-    this replaced); only a same-module different definition, a method call, or a path that
-    provably leaves the crate is excluded (#6412). A helper that is itself an impl/trait method
+    The 674a893c8 matcher, kept as its own function: ``\\b(name)\\s*\\(`` anywhere in the lib,
+    except at the definition (``fn name``) and inside the helper's own test path. Whether the
+    name denotes the helper or a same-named free fn is not decided, so a same-named free
+    function is an over-match by design (fail closed; 5-agent vote (4d3ea1c5)). Only lexical
+    false positives are dropped: comments and string/char literals (the ``shape`` view blanks
+    them) and ``.name(`` method calls of a free-fn helper. This matcher is never filtered by
+    the path resolver, so ``sites(resolver) >= sites(bare name)`` holds by construction.
+    """
+    by_name = {}  # fn name -> [is method, def paths]
+    for (_mod, name), (is_method, def_paths) in helpers.items():
+        entry = by_name.setdefault(name, [False, set()])
+        entry[0] = entry[0] or is_method
+        entry[1] |= def_paths
+    out, hits = [], []
+    call_re = re.compile(r'\b(%s)\s*\(' % '|'.join(map(re.escape, sorted(by_name))))
+    for rf, modp in units:
+        calls = []
+        for m in call_re.finditer(rf.shape):
+            if FN_BEFORE_RE.search(rf.shape[max(0, m.start() - 16):m.start()]):
+                continue  # the definition, not a call
+            if not by_name[m.group(1)][0] and rf.shape[max(0, m.start() - 256):m.start()].rstrip().endswith('.'):
+                continue  # `x.name(` is a method call, never the free fn
+            calls.append(m)
+        for m, ctx in zip(calls, rf.contexts([m.start() for m in calls])):
+            path, _ = site_path(modp, ctx)
+            if path not in by_name[m.group(1)][1]:
+                out.append((path, '%s:%d (calls %s)' % (rf.path, rf.code.count('\n', 0, m.start()) + 1, m.group(1))))
+                hits.append((rf, m.start()))
+    return out, hits
+
+
+def helper_callers(units, helpers, site_path, external=STD_CRATES):
+    """(sites, hit positions) of callers of a Postgres helper found by path, `use`, alias and glob (add-only).
+
+    The resolver adds sites the bare-name matcher cannot see (an alias, a re-export, a pass-by-name
+    reference); it never removes one (:func:`lib_pg_sites` unions the two). Strings and comments
+    are blanked (``shape`` view). A free-fn helper matches a name when the name is defined,
+    imported (plain, aliased, group), glob-imported or re-exported (``pub use``) along a chain that
+    reaches it, followed transitively with a cycle guard, so ``mod tests { use super::*; }`` sees
+    what its parent imports. Only lexical exclusions apply: a ``.name`` method call or field access
+    of a free-fn helper, a definition, a macro name. A helper that is itself an impl/trait method
     has no path to resolve, so any non-definition mention of its name counts.
     """
-    facts = ModuleFacts(units)
+    facts = ModuleFacts(units, external)
     names = {n for (_m, n) in helpers}
     grew = True
     while grew:  # every local name a chain of imports can give a helper (alias of an alias)
@@ -955,7 +1024,7 @@ def helper_callers(units, helpers, site_path):
                 continue  # an import, not a reference
             before = rf.shape[max(0, m.start() - 256):m.start()]
             after = rf.shape[m.end():m.end() + 4]
-            if FN_BEFORE_RE.search(before) or re.match(r'\s*(!|:(?!:)|::(?!\s*<))', after):
+            if DEF_BEFORE_RE.search(before) or re.match(r'\s*(!|:(?!:)|::(?!\s*<))', after):
                 continue  # definition, macro, field/param/label or a module prefix
             q = re.search(r'((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)+)$', before)
             qual = tuple(re.findall(r'[A-Za-z_][A-Za-z0-9_]*', q.group(1))) if q else ()
@@ -984,6 +1053,16 @@ def lib_pg_sites(src_root):
     Yields (test path, file:line): the path of the enclosing ``#[test]`` fn
     when there is one, else the enclosing module (a helper fn can be called by
     any test in that module, so the whole module must be covered).
+
+    Callers of a non-test helper fn are the UNION of two passes (#6412, #6425;
+    5-agent vote (4d3ea1c5)): :func:`bare_name_callers` (the 674a893c8 by-name
+    matcher, kept as is) and :func:`helper_callers` (aliases, re-exports,
+    ``pub use`` chains, globs, pass-by-name references), plus the invokers of
+    macros whose body reaches either (:func:`macro_callers`). The resolver is
+    add-only: it never removes a by-name site. Misses fixed: the by-name pass, aliases,
+    re-exports, macros. Lexical false positives dropped: strings, comments, method
+    calls, field access. Same-named free functions remain an over-match by design
+    (fail closed). A resolver exception propagates and fails the step.
     """
     units = lib_units(src_root)
     consts = set()
@@ -991,7 +1070,7 @@ def lib_pg_sites(src_root):
         consts.update(m.group(1) for m in PG_CONST_RE.finditer(rf.code))
     const_re = re.compile(r'\b(%s)\b' % '|'.join(map(re.escape, sorted(consts)))) if consts else None
     out, direct = [], []
-    helpers = {}  # (module tuple, fn name) -> [is method, def paths]: a non-test fn that names the URL (r2 F2; resolved by path, #6412)
+    helpers = {}  # (module tuple, fn name) -> [is method, def paths]: a non-test fn that names the URL (r2 F2)
 
     def site_path(modp, ctx):
         parts = [modp] if modp else []
@@ -1025,8 +1104,14 @@ def lib_pg_sites(src_root):
             out.append((path, '%s:%d' % (rf.path, line)))
     hits = [(rf, at) for rf, at in direct]
     if helpers:
-        found, more = helper_callers(units, helpers, site_path)
-        out.extend(found)
+        # Union at this layer (5-agent vote 4d3ea1c5): the bare-name matcher decides what is a
+        # site, the resolver only adds. A raise in the resolver propagates (the step fails red).
+        base, base_hits = bare_name_callers(units, helpers, site_path)
+        found, more = helper_callers(units, helpers, site_path, external_crates(src_root))
+        out.extend(base)
+        seen = set(base)
+        out.extend(site for site in dict.fromkeys(found) if site not in seen)  # one entry per site
+        hits.extend(base_hits)
         hits.extend(more)
     out.extend(macro_callers(units, hits, site_path))
     return out
