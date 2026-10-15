@@ -30224,12 +30224,13 @@ impl MemoryStore for PostgresStore {
         // ON CONFLICT DO UPDATE clobbers archived_at/archive_reason).
         // Pinned by `tests/store_parity_gaps.rs::run_gc_is_transactional_1026`
         // (crash-injection: drop tx mid-flow, assert no orphans).
-        let now = crate::test_clock::now();
+        let now = chrono::Utc::now();
+        let cutoff = crate::test_clock::at(now);
         // v1.0.0 #3520 — routed through the shared bounded-retry funnel:
         // this is the `size_gc` twin (archive-copy + link snapshot +
         // cascade DELETE + AGE unprojection in one tx), so it races a
         // concurrent bootstrap's relation-level ShareLock the same way and
-        // can be picked as the deadlock victim. `now` is pinned OUTSIDE the
+        // can be picked as the deadlock victim. `cutoff` is pinned OUTSIDE the
         // loop on purpose: every attempt evaluates the SAME `expires_at <
         // $1` horizon, so a retry cannot widen the eviction set. Nothing in
         // the block below has an effect outside the transaction.
@@ -30245,7 +30246,7 @@ impl MemoryStore for PostgresStore {
                 // `id COLLATE "C"` (CONCURRENCY-04); every later statement runs
                 // over exactly that locked set, on both the archive and the
                 // hard-delete path.
-                let victims = lock_order_4329::lock_expired_set(&mut tx, now).await?;
+                let victims = lock_order_4329::lock_expired_set(&mut tx, cutoff).await?;
                 let locked: Vec<String> = victims.iter().map(|(id, _, _)| id.clone()).collect();
 
                 if archive {
@@ -30265,7 +30266,7 @@ impl MemoryStore for PostgresStore {
                         )
                         SELECT id, tier, namespace, title, content, tags, priority, confidence,
                                source, access_count, created_at, updated_at, last_accessed_at,
-                               expires_at, $1::timestamptz, 'ttl_expired', metadata,
+                               expires_at, $3::timestamptz, 'ttl_expired', metadata,
                                embedding, embedding_dim, embedding_space, tier, expires_at,
                                reflection_depth, atomised_into, atom_of, memory_kind,
                                entity_id, persona_version, citations, source_uri, source_span,
@@ -30277,8 +30278,9 @@ impl MemoryStore for PostgresStore {
                         -- #2195 - LAST-WINS re-archive parity with sqlite INSERT OR REPLACE.
                         {SQL_ARCHIVE_ON_CONFLICT_LAST_WINS}"
                     ))
-                    .bind(now)
+                    .bind(cutoff)
                     .bind(&locked)
+                    .bind(now)
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| to_store_err("gc archive copy", e))?;
@@ -30372,7 +30374,7 @@ impl MemoryStore for PostgresStore {
                        AND id = ANY($2) \
                      RETURNING id, namespace",
                 )
-                .bind(now)
+                .bind(cutoff)
                 .bind(&locked)
                 .fetch_all(&mut *tx)
                 .await
