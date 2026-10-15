@@ -16,8 +16,12 @@ Sub-commands (``-h`` on each):
               reserved slots minus the sessions open right now) and create
               ``<db>_tpl`` (age + vector, ``IS_TEMPLATE true
               ALLOW_CONNECTIONS false``). ``--emit-env`` prints
-              ``AI_MEMORY_TEST_PG_TEMPLATE=`` and ``AI_MEMORY_TEST_PG_RUN_ID=``
-              lines for ``$GITHUB_ENV``. Fails closed.
+              ``AI_MEMORY_TEST_PG_TEMPLATE=``, ``AI_MEMORY_TEST_PG_RUN_ID=``
+              and ``AI_MEMORY_TEST_PG_BASE=`` lines for ``$GITHUB_ENV``;
+              ``--emit-env-unmasked`` adds ``AI_MEMORY_TEST_POSTGRES_URL=``
+              (never emitted masked: a masked value would break the next
+              step). SIGTERM during a minted setup drops the owned base.
+              Fails closed.
 ``run``       run ``cargo test --no-fail-fast --test <bin>`` once per binary,
               each against its own clone (held by a keepalive session while in
               use), ``--jobs`` at a time (degraded to what the live budget
@@ -62,6 +66,7 @@ could not be minted or held, 143 terminated, otherwise the worst exit code of
 the cargo runs. Standard library only, Python 3.9+.
 """
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -615,6 +620,41 @@ def revoke(admin_url: str, base: str, run_id: str, reason: str) -> None:
     terminalize(admin_url, base, run_id, INTENT_REVOKE, reason, adopt=True)
 
 
+class _Terminated(BaseException):
+    """SIGTERM turned into an exception so ``finally`` cleanup runs (#7152)."""
+
+
+@contextlib.contextmanager
+def _sigterm_as_exception():
+    """While a minted base is owned but not yet committed, convert SIGTERM
+    into :class:`_Terminated` so the owner's ``finally`` drops exactly that
+    base. Raised once; a second signal during cleanup is ignored. The previous
+    handler is restored afterwards. A no-op off the main thread."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    fired: List[int] = []
+
+    def on_term(signum: int, _frame: object) -> None:
+        if not fired:
+            fired.append(signum)
+            raise _Terminated(signum)
+
+    previous = signal.signal(signal.SIGTERM, on_term)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
+
+
+def _die_by_sigterm() -> int:
+    """Re-deliver SIGTERM with the default action so the exit status stays
+    the signal's (the caller sees what it sent). Returns 143 if it survives."""
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    os.kill(os.getpid(), signal.SIGTERM)
+    return EXIT_TERM
+
+
 def mask_url_password(url: str) -> str:
     """``postgres://u:pw@h/db`` -> ``postgres://u:***@h/db``. A URL without a
     password (including one with an ``@`` only in its query) is unchanged."""
@@ -1118,6 +1158,37 @@ def _cmd_run(args: argparse.Namespace, url: str) -> int:
     return runner.run_all(targets, residual)
 
 
+def _cmd_setup(args: argparse.Namespace, url: str) -> int:
+    """``setup``: mint (or accept) the base, mark it ACTIVE, build the template.
+
+    Masked ``--emit-env`` never emits ``URL_VAR``: that is the variable this
+    wrapper reads, so a masked value sourced into a later ``run``/``teardown``
+    would fail authentication and strand an ACTIVE family (#7153)."""
+    admin = url
+    run_id = checked_run_id(args.run_id or new_run_id())  # before any CREATE (N1)
+    url, db, minted = resolve_base(url, args.db, args.allow_shared_base, args.jobs)
+    done = False
+    try:
+        if minted:  # #7113: ACTIVE (verified) before the template exists
+            mark_active(with_database(admin, MAINTENANCE_DB), db, run_id)
+        tpl = setup(url, db, args.jobs)
+        done = True
+    finally:
+        if minted and not done:  # any failure or SIGTERM, not only WrapperError
+            log('setup failed after minting %s; dropping it' % db)
+            drop_base(admin, db)
+    if args.emit_env:
+        _emit('%s=%s' % (TEMPLATE_VAR, tpl))
+        _emit('%s=%s' % (RUN_ID_VAR, run_id))
+        _emit('%s=%s' % (BASE_VAR, db))
+        if args.emit_env_unmasked:
+            _emit('%s=%s' % (URL_VAR, url))
+        else:
+            log('masked --emit-env: %s is not emitted (keep the real URL; use --emit-env-unmasked '
+                'for a minted base URL)' % URL_VAR)
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     try:
         args = build_parser().parse_args(argv)
@@ -1126,25 +1197,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         url = _url(args)
         if args.cmd == 'setup':
-            admin = url
-            run_id = checked_run_id(args.run_id or new_run_id())  # before any CREATE (N1)
-            url, db, minted = resolve_base(url, args.db, args.allow_shared_base, args.jobs)
-            done = False
-            try:
-                if minted:  # #7113: ACTIVE (verified) before the template exists
-                    mark_active(with_database(admin, MAINTENANCE_DB), db, run_id)
-                tpl = setup(url, db, args.jobs)
-                done = True
-            finally:
-                if minted and not done:  # any failure, not only WrapperError
-                    log('setup failed after minting %s; dropping it' % db)
-                    drop_base(admin, db)
-            if args.emit_env:
-                _emit('%s=%s' % (TEMPLATE_VAR, tpl))
-                _emit('%s=%s' % (RUN_ID_VAR, run_id))
-                _emit('%s=%s' % (BASE_VAR, db))
-                _emit('%s=%s' % (URL_VAR, url if args.emit_env_unmasked else mask_url_password(url)))
-            return 0
+            with _sigterm_as_exception():  # #7152: SIGTERM must not strand a minted base
+                return _cmd_setup(args, url)
         if args.cmd == 'teardown':
             db = args.db or database_name(url)
             run_id = checked_run_id(args.run_id or os.environ.get(RUN_ID_VAR))
@@ -1179,6 +1233,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             sweep(url, args.older_than)
             return 0
         return _cmd_run(args, url)
+    except _Terminated:
+        log('terminated by SIGTERM; owned resources were released')
+        return _die_by_sigterm()
     except WrapperError as exc:
         print('pg_isolated_binary: %s' % exc, file=sys.stderr)
         return EXIT_USAGE

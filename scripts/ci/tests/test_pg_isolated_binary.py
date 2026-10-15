@@ -408,8 +408,7 @@ class TierSteps(unittest.TestCase):
                            '--emit-env'])
         self.assertEqual(rc, 0)
         self.assertEqual(out, ['%s=%s' % (pib.TEMPLATE_VAR, TPL), '%s=%s' % (pib.RUN_ID_VAR, RUN),
-                               '%s=ai_memory_test_ci_9_1_x' % pib.BASE_VAR,
-                               '%s=%s' % (pib.URL_VAR, pib.mask_url_password(BASE))])
+                               '%s=ai_memory_test_ci_9_1_x' % pib.BASE_VAR])  # no URL key (#7153)
         self.assertNotIn('pw@', ''.join(out))
 
     def test_setup_emit_env_unmasked_prints_the_real_url(self):
@@ -759,7 +758,7 @@ class SharedBaseRefusal7031(unittest.TestCase):
         self.assertTrue(any(k['env']['PGDATABASE'] == name for _, k in ext))
         lines = out.splitlines()
         self.assertIn('%s=%s' % (pib.BASE_VAR, name), lines)
-        self.assertIn('%s=postgres://u:***@127.0.0.1:5445/%s' % (pib.URL_VAR, name), lines)
+        self.assertFalse([ln for ln in lines if ln.startswith(pib.URL_VAR + '=')], 'masked mode emits no URL (#7153)')
         self.assertNotIn('pw@', out)
 
     def test_7031_ephemeral_urls_pass_without_minting(self):
@@ -1350,8 +1349,9 @@ class Review7088R1(unittest.TestCase):
 
     def emit_for(self, argv):
         out = []
+        url = BASE if '--db' in argv else SharedBaseRefusal7031.SHARED  # no --db: the minted path
         with unittest.mock.patch.object(pib.subprocess, 'run', Recorder()), \
-                unittest.mock.patch.dict(os.environ, {pib.URL_VAR: BASE}, clear=False), \
+                unittest.mock.patch.dict(os.environ, {pib.URL_VAR: url}, clear=False), \
                 unittest.mock.patch.object(pib, '_emit', out.append):
             rc = pib.main(argv + ['--jobs', '8', '--emit-env'])
         self.assertEqual(rc, 0)
@@ -1404,7 +1404,7 @@ class Review7088R1(unittest.TestCase):
             '    return R()\n'
             'pib.subprocess.run = fake\n'
             'sys.exit(pib.main(["setup", "--url", %r, "--jobs", "1", "--run-id", "rsig"]))\n'
-            % (str(SCRIPT), str(sqllog), str(ready), BASE))
+            % (str(SCRIPT), str(sqllog), str(ready), SharedBaseRefusal7031.SHARED))
         proc = subprocess.Popen([sys.executable, str(driver)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True)
         self.addCleanup(lambda: proc.poll() is None and proc.kill())
