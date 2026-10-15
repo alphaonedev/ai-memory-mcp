@@ -11,15 +11,18 @@
   LEG B row fails (helper ``scripts/cert_gate_evidence.py``),
 * mint the witness and recorder keys inside the same hermetic sandbox as every
   other LEG B call (no bare ``"$BIN" identity generate``, output not silenced),
-  with EVERY role key directory set explicitly,
-* remove every ``mktemp`` work directory on EXIT (``trap``), and
-* the workflow must upload the evidence directory with ``if: failure()``.
+  with EVERY role key directory set explicitly and every inherited path
+  variable cleared,
+* remove every ``mktemp`` work directory on EXIT through ONE python invocation
+  (no shell control flow), with ``TMPDIR`` pinned under the repo (no /tmp), and
+* the workflow must upload only a REDACTED copy of the evidence on failure.
 
 Stdlib only. Run: ``python3 -I scripts/test/test_cert_gate_evidence_7181.py``
 """
 import importlib.util
 import io
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -30,6 +33,8 @@ GATE = ROOT / "scripts" / "check-bootstrap-cert-gate.sh"
 HELPER = ROOT / "scripts" / "cert_gate_evidence.py"
 WORKFLOW = ROOT / ".github" / "workflows" / "cert-postgres-age.yml"
 TAIL_LINES = 200
+# Scratch dirs live under the repo's ignored .local-runs/ (never /tmp).
+SCRATCH_ROOT = ROOT / ".local-runs" / "test-7181"
 ROLE_KEY_DIR_ENVS = (
     "AI_MEMORY_KEY_DIR",
     "AI_MEMORY_WITNESS_KEY_DIR",
@@ -42,7 +47,34 @@ ROLE_KEY_DIR_ENVS = (
 # the same genesis-derived db id, so a fresh bring-up is convicted of
 # truncation. Every sandbox wrapper must pin its own sink dirs.
 SINK_DIR_ENVS = ("AI_MEMORY_AUDIT_DIR", "AI_MEMORY_LOG_DIR")
+# F5: every inherited AI_MEMORY_* path / credential variable the sandbox
+# wrappers must clear (env::var literals in src/ ending DB, DIR, FILE, PATH,
+# ROOT or URL, plus the passphrase pair).
+CLEARED_ENVS = (
+    "AI_MEMORY_DB",
+    "AI_MEMORY_DB_PASSPHRASE",
+    "AI_MEMORY_DB_PASSPHRASE_FILE",
+    "AI_MEMORY_AGENT_API_KEY_FILE",
+    "AI_MEMORY_CAPABILITY_FILE",
+    "AI_MEMORY_ERASURE_DIR",
+    "AI_MEMORY_FED_CRED_CHAIN_PATH",
+    "AI_MEMORY_FED_CRED_PATH",
+    "AI_MEMORY_FED_INVENTORY_PATH",
+    "AI_MEMORY_FED_TRUST_BUNDLE_DIR",
+    "AI_MEMORY_LOG_SYSLOG_TLS_CA_FILE",
+    "AI_MEMORY_SKILLS_EXPORT_ROOT",
+    "AI_MEMORY_SKILLS_IMPORT_ROOT",
+    "AI_MEMORY_SYSTEM_PROMPT_DIR",
+    "AI_MEMORY_EMBED_BASE_URL",
+    "AI_MEMORY_LLM_BASE_URL",
+)
 PINNED_UPLOAD = re.compile(r"actions/upload-artifact@[0-9a-f]{40}\b")
+REDACTED_DIR = ".local-runs/cert-bootstrap-evidence-redacted"
+
+
+def _scratch() -> tempfile.TemporaryDirectory:
+    SCRATCH_ROOT.mkdir(parents=True, exist_ok=True)
+    return tempfile.TemporaryDirectory(dir=str(SCRATCH_ROOT))
 
 
 def _load_helper():
@@ -56,6 +88,16 @@ def _leg_b_text() -> str:
     text = GATE.read_text(encoding="utf-8")
     start = text.index("== LEG B")
     return text[start:]
+
+
+# Secrets are built at runtime so no credential-shaped literal is in the file.
+HEX64 = "ab12" * 16
+B64 = "Zm9v" * 11
+PEM_LABEL = "ED25519 PRIVATE" + " KEY"
+BEGIN = "-----BEGIN " + PEM_LABEL + "-----"
+END = "-----END " + PEM_LABEL + "-----"
+SPACED = "hunter2" + "value"
+BEARER_TOK = "abc123" + "tokenvalue"
 
 
 class HelperRedactsAndBounds(unittest.TestCase):
@@ -77,9 +119,108 @@ class HelperRedactsAndBounds(unittest.TestCase):
         self.assertEqual(out[3], sample[3])
         self.assertEqual(out[4], sample[4])
 
+    # F1: one test per leaked shape.
+    def test_f1_hex_after_token_word_and_bare(self):
+        mod = _load_helper()
+        for ln in ("tok" + "en " + HEX64, "value is " + HEX64):
+            self.assertNotIn(HEX64[:20], mod.redact_line(ln), ln)
+
+    def test_f1_pem_digit_label_and_body(self):
+        mod = _load_helper()
+        lines = [BEGIN, "QUJD" + "REVG", B64[:30], END, "after: plain"]
+        out = mod.redact_lines(lines)
+        self.assertEqual(out[:4], [mod.REDACTED] * 4)
+        self.assertEqual(out[4], "after: plain")
+
+    def test_f1_secret_key_b64_whitespace_separator(self):
+        mod = _load_helper()
+        self.assertNotIn(B64[:8], mod.redact_line("secret" + "_key_b64 " + B64[:20]))
+
+    def test_f1_json_quoted_key_and_value(self):
+        mod = _load_helper()
+        self.assertNotIn(B64[:8], mod.redact_line('"private' + '_key": "' + B64[:20] + '"'))
+
+    def test_f1_spaced_secret_key_colon(self):
+        mod = _load_helper()
+        self.assertNotIn(SPACED, mod.redact_line("secret" + " key: " + SPACED))
+
+    def test_f1_authorization_bearer(self):
+        mod = _load_helper()
+        self.assertNotIn(BEARER_TOK, mod.redact_line("Authori" + "zation: Bear" + "er " + BEARER_TOK))
+        self.assertNotIn(BEARER_TOK, mod.redact_line("send Bear" + "er " + BEARER_TOK + " now"))
+
+    def test_f1_long_runs_masked_but_public_key_line_allowlisted(self):
+        mod = _load_helper()
+        self.assertNotIn(B64, mod.redact_line("blob " + B64))
+        pub = "pub_b" + "64: " + B64
+        self.assertEqual(mod.redact_line(pub), pub)
+        self.assertNotIn(HEX64, mod.redact_line("pub_b" + "64: x tok" + "en=" + HEX64))
+
+    def test_f1_error_path_never_echoes_argument(self):
+        marker = "ARGMARKER" + "9f3a"
+        for argv in (["--evidence-dir", "/nonexistent/" + marker], ["--tail", marker, "--evidence-dir", "."]):
+            proc = subprocess.run([sys.executable, str(HELPER)] + argv, capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 2)
+            self.assertNotIn(marker, proc.stdout + proc.stderr)
+
+    def test_f2_redacted_copy_has_no_secrets(self):
+        with _scratch() as td:
+            ev = Path(td) / "ev"
+            ev.mkdir()
+            lines = [
+                "tok" + "en " + HEX64,
+                BEGIN,
+                B64,
+                END,
+                '"private' + '_key": "' + B64 + '"',
+                "secret" + " key: " + SPACED,
+                "Authori" + "zation: Bear" + "er " + BEARER_TOK,
+            ]
+            (ev / "bring-up.out").write_text("\n".join(lines) + "\n", encoding="utf-8")
+            (ev / "pg-posture-1.out").write_text("dsn " + HEX64 + "\n", encoding="utf-8")
+            out = Path(td) / "red"
+            rc = subprocess.run(
+                [sys.executable, str(HELPER), "--evidence-dir", str(ev), "--write-redacted", str(out)]
+            ).returncode
+            names = sorted(p.name for p in out.iterdir())
+            blob = "".join(p.read_text(encoding="utf-8") for p in out.iterdir())
+        self.assertEqual(rc, 0)
+        self.assertEqual(names, ["bring-up.out"])
+        for sec in (HEX64, B64, SPACED, BEARER_TOK):
+            self.assertNotIn(sec, blob)
+
+    def test_finalize_reports_leg_b_then_cleans(self):
+        mod = _load_helper()
+        with _scratch() as td:
+            td = Path(td)
+            ev, state, victim = td / "ev", td / "state", td / "victim"
+            for d in (ev, state, victim):
+                d.mkdir()
+            (ev / "bring-up.out").write_text("hello\n", encoding="utf-8")
+            (state / "fail-rows").write_text("A\tleg a row\nB\tleg b row\n", encoding="utf-8")
+            (state / "cleanup-list").write_text("%s\n/\nrelative\n" % victim, encoding="utf-8")
+            buf = io.StringIO()
+            self.assertEqual(mod.finalize(state, ev, TAIL_LINES, buf), 0)
+            self.assertIn("== LEG B evidence", buf.getvalue())
+            self.assertIn("hello", buf.getvalue())
+            self.assertFalse(victim.exists())
+            self.assertFalse(state.exists())
+
+    def test_finalize_silent_without_leg_b_failure(self):
+        mod = _load_helper()
+        with _scratch() as td:
+            td = Path(td)
+            ev, state = td / "ev", td / "state"
+            ev.mkdir()
+            state.mkdir()
+            (state / "fail-rows").write_text("A\tleg a row\n", encoding="utf-8")
+            buf = io.StringIO()
+            mod.finalize(state, ev, TAIL_LINES, buf)
+            self.assertEqual(buf.getvalue(), "")
+
     def test_tail_is_bounded_with_header(self):
         mod = _load_helper()
-        with tempfile.TemporaryDirectory() as td:
+        with _scratch() as td:
             ev = Path(td)
             (ev / "bring-up.out").write_text(
                 "".join("line %d\n" % i for i in range(1000)), encoding="utf-8"
@@ -107,36 +248,65 @@ class GateScriptPins(unittest.TestCase):
             if "identity generate" in ln:
                 self.assertNotRegex(ln, r'^"\$BIN"', "bare unsandboxed identity generate: " + ln)
 
-    def test_every_role_key_dir_is_explicit_in_each_sandbox_wrapper(self):
+    def _wrapper(self, name):
         leg_b = _leg_b_text()
+        m = re.search(r"^%s\(\) \{.*?\); \}$" % name, leg_b, re.S | re.M)
+        self.assertIsNotNone(m, name)
+        return m.group(0)
+
+    def test_every_role_key_dir_is_explicit_in_each_sandbox_wrapper(self):
         for name in ("am_b", "am_d", "am_e"):
-            m = re.search(r"^%s\(\) \{.*?^\}|^%s\(\) \{.*?\}$" % (name, name), leg_b, re.S | re.M)
-            self.assertIsNotNone(m, name)
-            body = m.group(0)
+            body = self._wrapper(name)
             for env in ROLE_KEY_DIR_ENVS + SINK_DIR_ENVS:
                 self.assertIn(env + "=", body, "%s lacks explicit %s" % (name, env))
+
+    def test_f5_every_wrapper_unsets_full_env_list(self):
+        for name in ("am_b", "am_d", "am_e"):
+            body = self._wrapper(name) + " "
+            for env in CLEARED_ENVS:
+                self.assertIn("-u " + env + " ", body, "%s does not unset %s" % (name, env))
 
     def test_work_dirs_are_cleaned_by_exit_trap(self):
         text = GATE.read_text(encoding="utf-8")
         gate_body = text[text.rindex("EVIDENCE_DIR=") :]
-        self.assertRegex(gate_body, r"trap\s+'?\"?\w+.*EXIT")
+        self.assertRegex(gate_body, r"trap\s+.*EXIT")
         self.assertIn("cert_gate_evidence.py", gate_body)
 
-    def test_leg_b_failure_prints_evidence(self):
+    def test_leg_b_failure_prints_evidence_via_python_finalize(self):
         text = GATE.read_text(encoding="utf-8")
-        self.assertIn("LEGB_FAILED", text)
+        self.assertIn("--finalize", text)
         self.assertIn("--tail", text)
+
+    def test_f3_tmpdir_pinned_under_repo_before_first_mktemp(self):
+        text = GATE.read_text(encoding="utf-8")
+        export = text.index("export TMPDIR=")
+        self.assertIn(".local-runs/tmp", text[export : export + 160])
+        self.assertLess(export, text.index("mktemp"))
+        self.assertIn("chmod 700", text[export : export + 320])
+
+    def test_f4_no_shell_control_flow_for_cleanup(self):
+        text = GATE.read_text(encoding="utf-8")
+        for name in ("CLEANUP_PATHS", "LEGB_FAILED", "IN_LEG_B", "cleanup_and_report"):
+            self.assertNotIn(name, text)
+        traps = [ln for ln in text.splitlines() if ln.lstrip().startswith("trap ") and "--finalize" in ln]
+        self.assertEqual(len(traps), 1)
+        self.assertEqual(traps[0].count("cert_gate_evidence.py"), 1)
 
 
 class WorkflowUploadsEvidence(unittest.TestCase):
-    def test_artifact_upload_on_failure_is_pinned(self):
+    def test_artifact_upload_on_failure_is_pinned_and_redacted_only(self):
         text = WORKFLOW.read_text(encoding="utf-8")
         self.assertRegex(text, PINNED_UPLOAD)
-        idx = text.index("cert-bootstrap-evidence")
         block = text[text.rindex("      - name:", 0, text.index("actions/upload-artifact")) :]
+        block = block[: block.index("retention-days")]
         self.assertIn("if: failure()", block)
-        self.assertIn(".local-runs/cert-bootstrap-evidence", block)
-        self.assertGreater(idx, 0)
+        self.assertIn(REDACTED_DIR, block)
+        self.assertNotRegex(block, r"\.local-runs/cert-bootstrap-evidence(?!-redacted)")
+
+    def test_redacted_copy_is_made_before_upload(self):
+        text = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("--write-redacted " + REDACTED_DIR, text)
+        self.assertLess(text.index("--write-redacted"), text.index("actions/upload-artifact"))
 
 
 if __name__ == "__main__":

@@ -96,6 +96,10 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SELF="$REPO_ROOT/scripts/$(basename "${BASH_SOURCE[0]}")"
 cd "$REPO_ROOT"
 
+# #7181 — no /tmp: every temp dir created below lands under the repo's ignored .local-runs.
+export TMPDIR="$REPO_ROOT/.local-runs/tmp"
+mkdir -p "$TMPDIR"; chmod 700 "$TMPDIR"
+
 python3 -c 'import json,sys' 2>/dev/null \
   || { echo "INSTRUMENT ERROR: python3 is required to parse the feature probe and posture rows (#4434 #2676)"; exit 3; }
 
@@ -203,28 +207,19 @@ fi
 EVIDENCE_DIR="${AI_MEMORY_CERT_EVIDENCE_DIR:-$REPO_ROOT/.local-runs/cert-bootstrap-evidence}"
 mkdir -p "$EVIDENCE_DIR"
 
-# #7181 — every mktemp work dir is removed on ANY exit (a failing or aborted run
-# used to leave them behind), and a LEG B failure prints its evidence into the
-# job log: the evidence dir lives in the runner workspace and is lost with it.
-CLEANUP_PATHS=()
-LEGB_FAILED=0
-IN_LEG_B=0
-cleanup_and_report() {
-  local rc=$?
-  if [[ $LEGB_FAILED -ne 0 ]]; then
-    echo
-    echo "== LEG B evidence (redacted, last 200 lines per file; #7181) =="
-    python3 "$REPO_ROOT/scripts/cert_gate_evidence.py" --evidence-dir "$EVIDENCE_DIR" --tail 200 || true
-  fi
-  if [[ ${#CLEANUP_PATHS[@]} -gt 0 ]]; then rm -rf "${CLEANUP_PATHS[@]}"; fi
-  return $rc
-}
-trap cleanup_and_report EXIT
+# #7181 — every mktemp work dir is removed on ANY exit, and a LEG B failure
+# prints its evidence into the job log (the evidence dir lives in the runner
+# workspace and is lost with it). The decision logic lives in the python helper:
+# the shell only appends plain rows to STATE_DIR (fail-rows, cleanup-list) and
+# the EXIT trap is ONE program invocation (it keeps the gate's exit status).
+STATE_DIR="$(mktemp -d)"
+PHASE=A
+trap 'python3 "$REPO_ROOT/scripts/cert_gate_evidence.py" --evidence-dir "$EVIDENCE_DIR" --tail 200 --finalize "$STATE_DIR"' EXIT
 
 FAILED=0
 note() { printf '  %s\n' "$*"; }
 pass() { printf '[PASS] %s\n' "$*"; }
-fail() { printf '[FAIL] %s\n' "$*"; FAILED=1; if [[ $IN_LEG_B -ne 0 ]]; then LEGB_FAILED=1; fi; }
+fail() { printf '[FAIL] %s\n' "$*"; FAILED=1; printf '%s\t%s\n' "$PHASE" "$*" >> "$STATE_DIR/fail-rows"; }
 instrument_error() {
   echo "INSTRUMENT ERROR: $*" >&2
   echo "  (#4434: a driverless binary can never certify a pg posture; #2676: 'features --json' is the probe)" >&2
@@ -320,7 +315,7 @@ leg_a_setup() {
   KEYDIR_A="$WORK_A/keys"
   mkdir -p "$KEYDIR_A"
   FPFILE_A="$(mktemp)"
-  CLEANUP_PATHS+=("$WORK_A" "$FPFILE_A")
+  printf '%s\n' "$WORK_A" "$FPFILE_A" >> "$STATE_DIR/cleanup-list"
   printf 'example.org 0000000000000000000000000000000000000000000000000000000000000000\n' > "$FPFILE_A"
   # The daemon audit signing key for check #19 (resolve_agent_id honours
   # AI_MEMORY_AGENT_ID); generate it into the key dir.
@@ -480,9 +475,9 @@ BIN="$BIN_PG"
 echo
 echo "== LEG B — #3016/#3067 born-dirty bring-up gate (certified asi-hard modes) =="
 
-IN_LEG_B=1
+PHASE=B
 WORK_B="$(mktemp -d)"
-CLEANUP_PATHS+=("$WORK_B")
+printf '%s\n' "$WORK_B" >> "$STATE_DIR/cleanup-list"
 KEYDIR_B="$WORK_B/keys"; WDIR_B="$WORK_B/witness"; RDIR_B="$WORK_B/recorder"
 EMPTY_W="$WORK_B/empty-witness"; EMPTY_R="$WORK_B/empty-recorder"
 EMPTY_J="$WORK_B/empty-judge"; EMPTY_S="$WORK_B/empty-stopper"
@@ -510,7 +505,14 @@ CERT_MODES=(AI_MEMORY_REQUIRE_WITNESS=1 AI_MEMORY_REQUIRE_ROLE_SEPARATION=1 AI_M
 # was then CONVICTED of tail truncation ("NOT CERTIFIED ... TRUNCATION"). The
 # result flipped between runs on the same SHA depending on what ran before.
 # Unset role dirs fell back to the user config dir the same way.
-am_b() { ( cd "$WORK_B" && env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_STORE_URL= AI_MEMORY_STORE_URL_FILE= \
+am_b() { ( cd "$WORK_B" && env \
+    -u AI_MEMORY_DB -u AI_MEMORY_DB_PASSPHRASE -u AI_MEMORY_DB_PASSPHRASE_FILE \
+    -u AI_MEMORY_AGENT_API_KEY_FILE -u AI_MEMORY_CAPABILITY_FILE -u AI_MEMORY_ERASURE_DIR \
+    -u AI_MEMORY_FED_CRED_CHAIN_PATH -u AI_MEMORY_FED_CRED_PATH -u AI_MEMORY_FED_INVENTORY_PATH \
+    -u AI_MEMORY_FED_TRUST_BUNDLE_DIR -u AI_MEMORY_LOG_SYSLOG_TLS_CA_FILE -u AI_MEMORY_SKILLS_EXPORT_ROOT \
+    -u AI_MEMORY_SKILLS_IMPORT_ROOT -u AI_MEMORY_SYSTEM_PROMPT_DIR -u AI_MEMORY_EMBED_BASE_URL \
+    -u AI_MEMORY_LLM_BASE_URL \
+    AI_MEMORY_NO_CONFIG=1 AI_MEMORY_STORE_URL= AI_MEMORY_STORE_URL_FILE= \
     AI_MEMORY_KEY_DIR="$KEYDIR_B" AI_MEMORY_WITNESS_KEY_DIR="$WDIR_B" AI_MEMORY_RECORDER_KEY_DIR="$RDIR_B" \
     AI_MEMORY_JUDGE_KEY_DIR="$EMPTY_J" AI_MEMORY_STOPPER_KEY_DIR="$EMPTY_S" \
     AI_MEMORY_AUDIT_DIR="$SINK_AUDIT" AI_MEMORY_LOG_DIR="$SINK_LOG" "$@" ); }
@@ -579,10 +581,17 @@ fi
 
 # NEGATIVE CONTROL 1 (MB1 core) — asi-hard modes armed but NO custody keys
 # (empty dirs) MUST refuse and name the unmet ceremonies. A FRESH node.
-WORK_D="$(mktemp -d)"; CLEANUP_PATHS+=("$WORK_D"); KEYDIR_D="$WORK_D/keys"
+WORK_D="$(mktemp -d)"; printf '%s\n' "$WORK_D" >> "$STATE_DIR/cleanup-list"; KEYDIR_D="$WORK_D/keys"
 SINK_AUDIT_D="$WORK_D/audit-sink"; SINK_LOG_D="$WORK_D/log-sink"
 mkdir -p "$KEYDIR_D" "$SINK_AUDIT_D" "$SINK_LOG_D"; chmod 700 "$KEYDIR_D" "$SINK_AUDIT_D" "$SINK_LOG_D"
-am_d() { ( cd "$WORK_D" && env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_STORE_URL= AI_MEMORY_STORE_URL_FILE= \
+am_d() { ( cd "$WORK_D" && env \
+    -u AI_MEMORY_DB -u AI_MEMORY_DB_PASSPHRASE -u AI_MEMORY_DB_PASSPHRASE_FILE \
+    -u AI_MEMORY_AGENT_API_KEY_FILE -u AI_MEMORY_CAPABILITY_FILE -u AI_MEMORY_ERASURE_DIR \
+    -u AI_MEMORY_FED_CRED_CHAIN_PATH -u AI_MEMORY_FED_CRED_PATH -u AI_MEMORY_FED_INVENTORY_PATH \
+    -u AI_MEMORY_FED_TRUST_BUNDLE_DIR -u AI_MEMORY_LOG_SYSLOG_TLS_CA_FILE -u AI_MEMORY_SKILLS_EXPORT_ROOT \
+    -u AI_MEMORY_SKILLS_IMPORT_ROOT -u AI_MEMORY_SYSTEM_PROMPT_DIR -u AI_MEMORY_EMBED_BASE_URL \
+    -u AI_MEMORY_LLM_BASE_URL \
+    AI_MEMORY_NO_CONFIG=1 AI_MEMORY_STORE_URL= AI_MEMORY_STORE_URL_FILE= \
     AI_MEMORY_KEY_DIR="$KEYDIR_D" AI_MEMORY_WITNESS_KEY_DIR="$EMPTY_W" AI_MEMORY_RECORDER_KEY_DIR="$EMPTY_R" \
     AI_MEMORY_JUDGE_KEY_DIR="$EMPTY_J" AI_MEMORY_STOPPER_KEY_DIR="$EMPTY_S" \
     AI_MEMORY_AUDIT_DIR="$SINK_AUDIT_D" AI_MEMORY_LOG_DIR="$SINK_LOG_D" "$@" ); }
@@ -604,10 +613,17 @@ fi
 
 # NEGATIVE CONTROL 2 (MB1 core) — certified modes NOT armed MUST refuse to claim
 # certified even though the bare verify would be clean. A FRESH node.
-WORK_E="$(mktemp -d)"; CLEANUP_PATHS+=("$WORK_E"); KEYDIR_E="$WORK_E/keys"
+WORK_E="$(mktemp -d)"; printf '%s\n' "$WORK_E" >> "$STATE_DIR/cleanup-list"; KEYDIR_E="$WORK_E/keys"
 SINK_AUDIT_E="$WORK_E/audit-sink"; SINK_LOG_E="$WORK_E/log-sink"
 mkdir -p "$KEYDIR_E" "$SINK_AUDIT_E" "$SINK_LOG_E"; chmod 700 "$KEYDIR_E" "$SINK_AUDIT_E" "$SINK_LOG_E"
-am_e() { ( cd "$WORK_E" && env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_STORE_URL= AI_MEMORY_STORE_URL_FILE= \
+am_e() { ( cd "$WORK_E" && env \
+    -u AI_MEMORY_DB -u AI_MEMORY_DB_PASSPHRASE -u AI_MEMORY_DB_PASSPHRASE_FILE \
+    -u AI_MEMORY_AGENT_API_KEY_FILE -u AI_MEMORY_CAPABILITY_FILE -u AI_MEMORY_ERASURE_DIR \
+    -u AI_MEMORY_FED_CRED_CHAIN_PATH -u AI_MEMORY_FED_CRED_PATH -u AI_MEMORY_FED_INVENTORY_PATH \
+    -u AI_MEMORY_FED_TRUST_BUNDLE_DIR -u AI_MEMORY_LOG_SYSLOG_TLS_CA_FILE -u AI_MEMORY_SKILLS_EXPORT_ROOT \
+    -u AI_MEMORY_SKILLS_IMPORT_ROOT -u AI_MEMORY_SYSTEM_PROMPT_DIR -u AI_MEMORY_EMBED_BASE_URL \
+    -u AI_MEMORY_LLM_BASE_URL \
+    AI_MEMORY_NO_CONFIG=1 AI_MEMORY_STORE_URL= AI_MEMORY_STORE_URL_FILE= \
     AI_MEMORY_KEY_DIR="$KEYDIR_E" AI_MEMORY_WITNESS_KEY_DIR="$EMPTY_W" AI_MEMORY_RECORDER_KEY_DIR="$EMPTY_R" \
     AI_MEMORY_JUDGE_KEY_DIR="$EMPTY_J" AI_MEMORY_STOPPER_KEY_DIR="$EMPTY_S" \
     AI_MEMORY_AUDIT_DIR="$SINK_AUDIT_E" AI_MEMORY_LOG_DIR="$SINK_LOG_E" \
@@ -624,7 +640,7 @@ else
   fail "unarmed certified modes did NOT refuse — see $EVIDENCE_DIR/refuse-unarmed.out"
 fi
 
-IN_LEG_B=0
+PHASE=done
 
 echo
 if [[ $FAILED -eq 0 ]]; then
