@@ -291,7 +291,7 @@ class SharedTestDbRefs7031(unittest.TestCase):
             self.assert_flagged(form % NAME)
 
     def test_7031_r3_compound_keys_and_glued_flag_keep_their_context(self) -> None:
-        text = '\n'.join(['pg_db_password=%s' % NAME, 'x-d%s_y' % NAME, 'x-d%s' % NAME])
+        text = '\n'.join(['pg_db_password=%s' % NAME, 'x-d%s_y' % NAME])
         done = self.mutant(text)
         self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout)
 

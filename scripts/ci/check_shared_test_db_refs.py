@@ -9,10 +9,12 @@ merely start with ``ai_memory_test_`` never match.
 Rules, applied to non-comment lines only (NAME is the bare shared name):
   R1  URL literal         slash + NAME not followed by a name character
   R2  POSTGRES_DB[=:]     NAME
-  R3  --db / --db= / --dbname / -d (optionally quoted)  NAME
+  R3  --db / --db= / --dbname / -d / glued -dNAME (optionally quoted)  NAME
   R4  pg_isready ... -d   NAME
-  R5  KEY [=:] NAME, KEY being PGDATABASE, dbname, db, database (any case),
-      or an upper-case word containing DB or DATABASE; the key may be quoted
+  R5  KEY [=:] NAME, KEY being PGDATABASE, dbname, db, database, db_name,
+      database_name (any case), a lower-case key ending in _db, _dbname,
+      _db_name, _database or _database_name, or an upper-case word containing
+      DB or DATABASE; the key may be quoted
   R6  a quoted literal    "NAME" or 'NAME'
   R7  SQL                 DATABASE NAME (any case: GRANT/DROP/ALTER/CREATE ...)
   R8  positional argument NAME as a word after psql, createdb, dropdb, pg_dump
@@ -65,8 +67,9 @@ COMMENT_SQL = re.compile(r'^\s*(#|//|--(\s|$))')
 SQL_SUFFIX = '.sql'
 QUOTES = '"\''
 TOKEN_STRIP = '"\'`;,()<>'
-KEY_LOWER = {'pgdatabase', 'dbname', 'db', 'database'}
-KEY_UPPER_PARTS = ('DB', 'DATABASE')
+KEY_LOWER = {'pgdatabase', 'dbname', 'db', 'database', 'db_name', 'database_name'}
+KEY_LOWER_SUFFIXES = ('_db', '_dbname', '_db_name', '_database', '_database_name')
+KEY_UPPER_PARTS =('DB', 'DATABASE')
 COUPLED_MARK = re.compile(r'\[landing-order #(\d+)\]')
 # The only PR whose pinned lines may be absent until it lands, and the only path it may mark (#7164).
 # Remove both constants and the seven markers in the change that lands after #7088.
@@ -79,7 +82,8 @@ LinePredicate = Callable[[str], bool]
 
 
 def _key_is_database(key: str) -> bool:
-    if key.lower() in KEY_LOWER:
+    lowered = key.lower()
+    if lowered in KEY_LOWER or lowered.endswith(KEY_LOWER_SUFFIXES):
         return True
     return key == key.upper() and any(part in key for part in KEY_UPPER_PARTS)
 
@@ -144,7 +148,7 @@ R4_FLAG = re.compile(r'\s-d\s+' + DB + NOT_NAME_CONT)
 RULES = (
     ('R1', re.compile('/' + DB + NOT_NAME_CONT).search),
     ('R2', re.compile(r'POSTGRES_DB[=:]\s*' + DB + NOT_NAME_CONT).search),
-    ('R3', re.compile(r'(--db(name)?|-d)(\s+|=)["\']?' + DB + NOT_NAME_CONT).search),
+    ('R3', re.compile(r'(--db(name)?|-d)(\s+|=)?["\']?' + DB + NOT_NAME_CONT).search),
     ('R4', rule_r4),
     ('R5', rule_r5),
     ('R6', re.compile('["\']' + DB + '["\']').search),
