@@ -20,12 +20,23 @@ after another. With the lane on (flag `1`, kill switch not `1`, tier
 1. **Configure** runs `pg_isolated_binary.py setup --emit-env`. It checks the
    live connection budget: `max_connections` minus the reserved slots minus the
    sessions open right now (`pg_stat_activity`) must cover
-   `jobs * (18 + 1) + 20` (172 for width 8), or the step fails. It builds
-   `<CI_FED_DB>_tpl` with the `age` and `vector` extensions and marks it
-   `IS_TEMPLATE true ALLOW_CONNECTIONS false`, so `CREATE DATABASE ... TEMPLATE`
-   only hits SQLSTATE 55006 under a stray session, which the mint retries. It
-   exports `AI_MEMORY_TEST_PG_TEMPLATE` and `AI_MEMORY_TEST_PG_RUN_ID` to
-   `$GITHUB_ENV`.
+   `jobs * (18 + 1) + 20` (172 for width 8), or the step fails. By default it
+   mints its own base `ci_base_<pid>_<unix seconds>_<8 hex>` and marks the
+   family ACTIVE (a JSON database COMMENT naming the base, its OID and the
+   run). It builds `<base>_tpl` with the `age` and `vector` extensions and
+   marks it `IS_TEMPLATE true ALLOW_CONNECTIONS false`, so
+   `CREATE DATABASE ... TEMPLATE` only hits SQLSTATE 55006 under a stray
+   session, which the mint retries. If `setup` fails or is terminated by
+   SIGTERM before the marker is written, it drops the base it minted: every
+   wrapper `psql` call carries a per-process `application_name`, the cleanup
+   cancels that application's backends (a killed `psql` leaves its
+   `CREATE DATABASE` running on the server, and it would commit later), waits
+   until none remain, drops by name and confirms in `pg_database`. It logs
+   `NOT released: <names>` and exits 4 when a name still exists. It
+   emits `AI_MEMORY_TEST_PG_TEMPLATE`, `AI_MEMORY_TEST_PG_RUN_ID` and
+   `AI_MEMORY_TEST_PG_BASE` for `$GITHUB_ENV`. Masked mode (the default) does not emit
+   `AI_MEMORY_TEST_POSTGRES_URL`, because a URL with a masked password cannot
+   authenticate a later `teardown`; `--emit-env-unmasked` emits it.
 2. **Run.** The test step fails with `::error::` when the lane is on but the
    template or run id is missing; it never skips. `run_isolated_lane` prebuilds
    only the targets in `iso_targets.txt`, then calls
@@ -46,7 +57,12 @@ after another. With the lane on (flag `1`, kill switch not `1`, tier
    on the shared database. The flag is stripped from their environment, so the
    Rust helper does not mint for them.
 3. **Cleanup** runs `pg_isolated_binary.py teardown --run-id <this run>`, which
-   drops this run's leftover clones and the template.
+   drops this run's leftover clones and the template. For a minted base the
+   command also drops the base: without `--db` it takes the base from
+   `AI_MEMORY_TEST_PG_BASE` (the masked URL still names the maintenance
+   database), and `--db` must then equal `AI_MEMORY_TEST_PG_BASE`. A
+   different `--db` exits 2 and drops nothing, so a minted base and its
+   `<base>_tpl` template are never left behind under a success exit.
 
 On SIGTERM (the watchdog) or SIGINT, the wrapper stops dispatching, sends TERM
 to every running `cargo` process group and KILL 5 s later, drops the clones in
@@ -86,7 +102,26 @@ unset.
   race with another binary fails the drop instead of terminating that binary.
 * **Admin-only cross-run sweep.**
   `pg_isolated_binary.py sweep --older-than N` (N at least 600 s) drops idle
-  clones of any run. CI never calls it (invariant `G2-no-ci-sweep`).
+  clones of any run except a run whose family is ACTIVE. CI never calls it
+  (invariant `G2-no-ci-sweep`).
+* **Family ownership (#7113).** When `setup` auto-mints a `ci_base_*` base it
+  writes an ACTIVE marker as the base's COMMENT (strict JSON: protocol
+  `ai-memory-pg-family` version 1, the base name and OID, the run id) and reads
+  it back; an unverified marker fails setup and drops the base. `teardown`
+  first moves the family to TERMINAL (it refuses another run's family before
+  any drop), drops the clones and the template, drops the base last, and exits
+  2 when any drop failed, keeping the TERMINAL base for the sweep. The sweep
+  reclaims a family only when its base carries a valid TERMINAL marker at least
+  N seconds old and no member has a session, and re-reads the marker and OID
+  before it drops the base. An unmarked, malformed or ACTIVE family, and an
+  orphan template, are always preserved: age, PID or a name prefix never
+  confer ownership, so an ACTIVE family survives a prepared-setup or
+  interbinary gap with no session at all. An explicit `--db` base is the
+  caller's and is never marked.
+* **Admin revoke.** `pg_isolated_binary.py revoke --db <ci_base_*> --run-id ID
+  --reason TEXT` marks an abandoned, idle family TERMINAL (intent `REVOKE`) so
+  the sweep can reclaim it after the age delay. It refuses while the base, the
+  template or any clone of the run has a session, and it never drops anything.
 * **No secrets in argv.** `psql` gets the connection through libpq environment
   variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`,
   `PGSSLMODE`, ...). ci.yml passes the URL through the environment, never with

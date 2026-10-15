@@ -38,6 +38,8 @@
 
 #![allow(clippy::missing_panics_doc)]
 
+mod common;
+
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
@@ -70,10 +72,54 @@ fn fresh_dir(label: &str) -> tempfile::TempDir {
         .join(".local-runs")
         .join("issue-1822-witness");
     std::fs::create_dir_all(&root).ok();
-    tempfile::Builder::new()
-        .prefix(&format!("{label}-"))
+    let prefix = format!("{label}-");
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix);
+    // #7158 / #7161 — the witness key directory must satisfy the #3198
+    // key-directory gate whatever the process umask, so the mode is set on
+    // the builder and the directory never exists in a umask-derived mode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder
         .tempdir_in(&root)
         .expect("tempdir under .local-runs")
+}
+
+/// #7158 / #7161 — the fixture key directory is private whatever the process
+/// umask. Under umask `0002` a umask-derived directory is mode `775`, and
+/// `keypair::save` refuses it by design (#3198), so every witness cell failed
+/// on an operator account with that umask and passed under `022`. The fixture,
+/// not the gate, is what must be deterministic.
+#[cfg(unix)]
+#[test]
+fn fresh_dir_is_mode_0700_under_umask_0002_7158_7161() {
+    use std::os::unix::fs::PermissionsExt;
+    let _g = lock();
+    // The umask is process-wide: the env lock serialises every cell in this
+    // binary that mutates process state, and the previous mask is restored
+    // before the lock is released (`--test-threads=1` is the recorded run shape).
+    // SAFETY: `umask(2)` only reads and replaces the process creation mask.
+    let previous = unsafe { libc::umask(0o002) };
+    let dir = fresh_dir("umask-7158");
+    let saved = ai_memory::identity::keypair::generate(witness::WITNESS_KEY_LABEL)
+        .and_then(|kp| ai_memory::identity::keypair::save(&kp, dir.path()));
+    // SAFETY: restores the mask read above; no other state is touched.
+    unsafe {
+        libc::umask(previous);
+    }
+    let mode = std::fs::metadata(dir.path())
+        .expect("stat fixture dir")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "fresh_dir must not inherit the process umask (got {mode:o})"
+    );
+    saved.expect("the #3198 key-directory gate must accept the fixture dir under umask 0002");
 }
 
 fn open_db(dir: &std::path::Path) -> (PathBuf, Connection) {
@@ -741,23 +787,19 @@ mod postgres_parity {
     #[tokio::test]
     #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL — live postgres"]
     async fn pg_head_hash_clean_chain_not_detected_and_rewrite_mismatch() {
-        let Some(pg) = live_pg().await else {
+        const MAX_WATERMARK_APPENDS: usize = 300;
+        // #7031 H3: run in a private schema. The old `DELETE FROM agent_lineage`
+        // on the shared base removed every row but left the durable
+        // `lineage_integrity_watermark` high-water mark standing, so every later
+        // clone failed IntegrityFailed (#6983). A fresh schema starts with an
+        // empty lineage table (the #2843 residue concern) and shares nothing.
+        let Some(env) = super::common::postgres_env::PostgresTestEnv::new("pg_hh_1822").await
+        else {
             return;
         };
-        // #2843 test-isolation: the lan-parity Pass-2 suite serializes every
-        // live-pg test binary against the SHARED `ai_memory_test` DB. Sibling
-        // #1831 G17 M-of-N recovery tests seed `agent_lineage` rows for
-        // `ai:rec-*` agents with no matching signed_events witness, so a stale
-        // residue makes `verify_audit_trail` correctly return
-        // `lineage: Forged` — which is NOT what this head-hash test exercises.
-        // Clear the lineage table so the clean-chain precondition is
-        // order-independent (agent_lineage is NOT part of the signed_events
-        // hash chain, so this never perturbs the head-hash / truncation /
-        // chain-intact axes under test). Fresh-DB runs start empty → no-op.
-        sqlx::query("DELETE FROM agent_lineage")
-            .execute(pg.pool())
+        let pg = PostgresStore::connect(env.url())
             .await
-            .ok();
+            .expect("connect scoped schema");
         let fdir = fresh_dir("pg-hh-forensic");
         // Live forensic sink so `maybe_record_audit_watermark` writes and
         // `last_audit_watermark` reads (process-global; torn down at the end).
@@ -772,25 +814,37 @@ mod postgres_parity {
         // Drive the REAL pg append path until a watermark is anchored. Each
         // `emit_spawn_audit` stamps `Utc::now()` (nanoseconds) — the exact F2 skew
         // surface — and appends through `pg_append_signed_event_with_chain`.
+        pg.emit_spawn_audit("argv0-genesis", "1822-f2-headhash")
+            .await;
+        let (genesis_id, genesis_agent, genesis_payload): (String, String, Vec<u8>) =
+            sqlx::query_as(ai_memory::signed_events::GENESIS_ROW_SQL)
+                .fetch_one(pg.pool())
+                .await
+                .expect("read private PostgreSQL audit genesis");
+        let db_id = ai_memory::signed_events::db_id_from_genesis_parts(
+            &genesis_id,
+            &genesis_agent,
+            &genesis_payload,
+        );
         let mut anchored: Option<i64> = None;
-        for i in 0..300 {
+        for i in 0..MAX_WATERMARK_APPENDS {
             pg.emit_spawn_audit(&format!("argv0-{i}"), "1822-f2-headhash")
                 .await;
-            if let Some((seq, _)) = witness::last_audit_watermark(None) {
+            if let Some((seq, _)) = witness::last_audit_watermark(Some(&db_id)) {
                 anchored = Some(seq); // fired on the just-appended head → anchored == head
                 break;
             }
         }
-        let Some(anchored) = anchored else {
-            eprintln!("skip: no watermark fired within 300 pg appends (shared-DB throttle state)");
-            sqlx::query("DELETE FROM signed_events WHERE sequence > $1")
-                .bind(base_seq)
-                .execute(pg.pool())
-                .await
-                .ok();
-            witness::shutdown();
-            return;
-        };
+        let anchored =
+            anchored.expect("#7115: configured PostgreSQL fixture must emit an audit watermark");
+        let current_head: i64 = sqlx::query_scalar("SELECT MAX(sequence) FROM signed_events")
+            .fetch_one(pg.pool())
+            .await
+            .expect("read anchored PostgreSQL head");
+        assert_eq!(
+            anchored, current_head,
+            "watermark must anchor the actual head"
+        );
 
         // CLEAN chain: the anchored row survives intact → the micros-readback
         // recompute MATCHES the anchor (also micros, post-#2203) → NotDetected.
@@ -825,12 +879,18 @@ mod postgres_parity {
 
         // SAME-LENGTH rewrite of the anchored (head) row → the at-anchored-seq
         // recompute differs from the anchor → Mismatch (#2202 on pg).
-        sqlx::query("UPDATE signed_events SET payload_hash = $1 WHERE sequence = $2")
-            .bind(vec![0x11u8; 32])
-            .bind(anchored)
-            .execute(pg.pool())
-            .await
-            .expect("rewrite anchored row");
+        let rewritten =
+            sqlx::query("UPDATE signed_events SET payload_hash = $1 WHERE sequence = $2")
+                .bind(vec![0x11u8; 32])
+                .bind(anchored)
+                .execute(pg.pool())
+                .await
+                .expect("rewrite anchored row");
+        assert_eq!(
+            rewritten.rows_affected(),
+            1,
+            "rewrite must reach the anchor"
+        );
         let report2 = pg
             .verify_audit_trail(None, None)
             .await
@@ -854,6 +914,8 @@ mod postgres_parity {
             .await
             .ok();
         witness::shutdown();
+        // #7031 N1: close the pool before the schema drop (see PostgresTestEnv::finish).
+        env.finish(&[pg.pool()]).await;
     }
 }
 

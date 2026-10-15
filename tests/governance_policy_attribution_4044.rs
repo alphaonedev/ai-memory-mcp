@@ -143,8 +143,8 @@ impl Drop for RoleEnvGuard {
 fn enrol_judge(dir: &std::path::Path) -> RoleEnvGuard {
     let judge_dir = dir.join("judge");
     let empty_dir = dir.join("empty");
-    std::fs::create_dir_all(&judge_dir).expect("judge dir");
-    std::fs::create_dir_all(&empty_dir).expect("empty dir");
+    private_dir(&judge_dir);
+    private_dir(&empty_dir);
     let judge = ai_memory::identity::keypair::generate(roles::JUDGE_KEY_LABEL).expect("gen judge");
     ai_memory::identity::keypair::save(&judge, &judge_dir).expect("save judge");
     // SAFETY: serialised by `lock()`; no other thread reads these vars.
@@ -277,4 +277,17 @@ fn standalone_policy_version_is_snapshot_consistent_4044() {
         p1.seq,
         p1.digest_hex()
     );
+}
+
+/// #7185 - create a key directory (and any missing parents) as 0700 whatever
+/// the process umask; the mode is applied at creation, never after.
+fn private_dir(path: &std::path::Path) {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path).expect("private key dir");
 }

@@ -68,7 +68,7 @@ fn store_only_migrated_node() -> (tempfile::TempDir, PathBuf, PathBuf, String) {
         .expect("tempdir");
     let db_path = dir.path().join("memories.db");
     let key_dir = dir.path().join("keys");
-    std::fs::create_dir_all(&key_dir).expect("mk key_dir");
+    private_dir(&key_dir);
 
     let conn = db::open(&db_path).expect("open + migrate");
     // Registry row copied by a store-only migration; register_agent does NOT
@@ -182,8 +182,8 @@ fn run_bootstrap(
 fn bootstrap_node_certifies_under_full_asi_hard_modes_with_custody_keys() {
     let (_dir, db_path, key_dir, recovery) = store_only_migrated_node();
     let cfg = cfg_for(&db_path);
-    let wdir = tempfile::tempdir().expect("witness dir");
-    let rdir = tempfile::tempdir().expect("recorder dir");
+    let wdir = private_tempdir();
+    let rdir = private_tempdir();
     enroll_custody_key(wdir.path(), roles::WITNESS_KEY_LABEL);
     enroll_custody_key(rdir.path(), roles::RECORDER_KEY_LABEL);
 
@@ -233,8 +233,8 @@ fn bootstrap_node_refuses_under_asi_hard_modes_without_custody_keys() {
     let cfg = cfg_for(&db_path);
     // Point the custody dirs at EMPTY dirs so no key resolves (hermetic —
     // never the operator's real custody dir).
-    let empty_w = tempfile::tempdir().expect("empty witness dir");
-    let empty_r = tempfile::tempdir().expect("empty recorder dir");
+    let empty_w = private_tempdir();
+    let empty_r = private_tempdir();
     let mut muts = base_mutations();
     muts.push((roles::WITNESS_KEY_DIR_ENV, empty_w.path().to_str()));
     muts.push((roles::RECORDER_KEY_DIR_ENV, empty_r.path().to_str()));
@@ -334,4 +334,31 @@ mod postgres_parity {
             report.lineage
         );
     }
+}
+
+/// #7185 - a key directory must satisfy the #3198 gate whatever the process
+/// umask, so the mode is set on the builder and the directory never exists in a
+/// umask-derived (group-writable) mode.
+fn private_tempdir() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("keydir-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().expect("private tempdir")
+}
+
+/// #7185 - create a key directory (and any missing parents) as 0700 whatever
+/// the process umask; the mode is applied at creation, never after.
+fn private_dir(path: &std::path::Path) {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path).expect("private key dir");
 }
