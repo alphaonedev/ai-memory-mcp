@@ -512,7 +512,10 @@ pub mod pg {
                 "SELECT archived_at::timestamptz FROM archived_memories",
                 archived,
             ),
-            ("SELECT archived_at::timestamptz FROM archived_memory_links", 1),
+            (
+                "SELECT archived_at::timestamptz FROM archived_memory_links",
+                1,
+            ),
             (
                 "SELECT forgotten_at::timestamptz FROM forget_tombstones WHERE memory_id='hard-delete-clock'",
                 1,
