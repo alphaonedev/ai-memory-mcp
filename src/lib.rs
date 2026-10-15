@@ -1034,10 +1034,10 @@ pub mod sizes;
 // signed `process.spawn_audited` row per production `Command` spawn (argv0 +
 // caller), routing every production subprocess launch through one audited
 // helper so a new un-audited spawn site fails the CI gate.
+mod eval_clock;
 pub mod spawn_audit;
 pub mod subscriptions;
 pub mod synthesis;
-mod test_clock;
 pub mod tls;
 // v1.0.0 #3705 — the operator mandate "only encrypted data in transit": the
 // one floor every transit surface consults (daemon listener, federation

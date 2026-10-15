@@ -8722,7 +8722,7 @@ pub fn recall(
     // `None` = no valid-time filter (bound to ?13, NULL-guarded in the SQL).
     valid_at: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
-    let now = crate::test_clock::now().to_rfc3339();
+    let now = crate::eval_clock::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
     // Pre-ship 3x7 (#1834) — canonicalize the AS-OF instant before the ?13
     // TEXT bind so byte comparison against the canonical stored bounds is
@@ -16518,7 +16518,7 @@ pub(crate) fn gc_for_caller(
         }
     }
     let real = Utc::now();
-    let cutoff = crate::test_clock::at(real).to_rfc3339();
+    let cutoff = crate::eval_clock::at(real).to_rfc3339();
     let now = real.to_rfc3339();
     let expired_chunk_ids =
         format!("SELECT id FROM memories WHERE {SQL_GC_EXPIRED_WHERE} ORDER BY rowid LIMIT ?3");
@@ -20822,7 +20822,7 @@ fn prepare_hybrid_query<'a>(
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`HybridPrep`].
     caller: Option<&str>,
 ) -> HybridPrep<'a> {
-    let now = crate::test_clock::now().to_rfc3339();
+    let now = crate::eval_clock::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
     let prefixes = compute_visibility_prefixes(as_agent);
     let (fts_hierarchy_in, hierarchy_active) = hierarchy_in_clause(namespace);
