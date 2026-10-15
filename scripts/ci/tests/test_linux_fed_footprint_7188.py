@@ -86,7 +86,7 @@ class SharedTargetLeg(unittest.TestCase):
     def test_shared_target_step_is_gated_on_the_flag(self):
         job = "\n".join(active(check_job_lines()))
         self.assertIn(SHARED_HELPER + " --github-env", job)
-        self.assertRegex(job, r"if: matrix\.%s\b" % SHARED_FLAG)
+        self.assertRegex(job, r"if:[^\n]*&& matrix\.%s\b" % SHARED_FLAG)
 
     def test_no_literal_target_dir_in_the_job(self):
         job = "\n".join(active(check_job_lines()))
