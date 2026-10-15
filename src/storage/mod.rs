@@ -2977,6 +2977,15 @@ pub fn capture_turn_idempotent(
         })
         .map_err(|e| idempotent_err(ERR_DEDUP_INSERT, e))?;
 
+        // #7029 (H1) — test-only fault point between the memories INSERT and
+        // the signed-event append; the closure's Err rolls the whole tx back.
+        #[cfg(test)]
+        if crate::recover::durability::fail_before_signed_commit_decision(&inserted_id) {
+            return Err(format!(
+                "SIGNED_EVENTS_APPEND_FAILED: {}",
+                crate::recover::durability::INJECTED_BEFORE_SIGNED_COMMIT_MSG
+            ));
+        }
         crate::signed_events::append_signed_event_no_tx(conn, &write.signed_event)
             .map_err(|e| format!("SIGNED_EVENTS_APPEND_FAILED: {e}"))?;
 
@@ -3123,6 +3132,15 @@ where
         })
         .map_err(|e| idempotent_err(ERR_DEDUP_INSERT, e))?;
 
+        // #7029 (H1) — test-only fault point between the memories INSERT and
+        // the signed-event append; the closure's Err rolls the whole tx back.
+        #[cfg(test)]
+        if crate::recover::durability::fail_before_signed_commit_decision(&inserted_id) {
+            return Err(format!(
+                "SIGNED_EVENTS_APPEND_FAILED: {}",
+                crate::recover::durability::INJECTED_BEFORE_SIGNED_COMMIT_MSG
+            ));
+        }
         crate::signed_events::append_signed_event_no_tx(conn, &write.signed_event)
             .map_err(|e| format!("SIGNED_EVENTS_APPEND_FAILED: {e}"))?;
 
