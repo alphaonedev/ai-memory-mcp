@@ -436,27 +436,23 @@ bin-dir = "ai-memory"
 pkg-fmt = "tgz"
 
 [patch.crates-io]
-# C1 — `paste` 1.x is unmaintained (RUSTSEC-2024-0436). The recommended
-# migration target is `pastey`, a community-maintained drop-in fork on
-# crates.io. Cargo's `[patch.crates-io]` rejects a same-source
-# registry-to-registry rename (it requires the patch source to differ
-# from the registry), so two viable swap paths exist:
+# C1 — `paste` 1.x is unmaintained (RUSTSEC-2024-0436). The crate is now
+# vendored under `vendor/paste/` (#2050; release/v1.0.0 commit b835cadfa,
+# main port PR #7128) and patched in from the `path` entry below, so the
+# build is self-contained and rebuildable offline. The former
+# alphaonedev/paste fork (rev `6a30252`) was deleted and is unfetchable.
+# Cargo's `[patch.crates-io]` rejects a same-source registry-to-registry
+# rename, so the two remaining migration paths to `pastey` (a
+# community-maintained drop-in fork) stay open as future options:
 #
 #   1. Vendor a chosen pastey release into `vendor/pastey/` and patch
-#      from a `path = "vendor/pastey"` entry. This is the audit-clean
-#      path: the third-party source lands in-tree under our review and
-#      is rebuildable offline.
+#      from a `path = "vendor/pastey"` entry.
 #
 #   2. Patch from a vetted git mirror under our control (e.g. fork
-#      `pastey` into `alphaonedev/pastey` then pin a tag here). Avoids
-#      vendoring but adds a second fork to maintain.
+#      `pastey` into `alphaonedev/pastey` then pin a tag here).
 #
-# Until either path lands, we hold on the existing alphaonedev/paste
-# fork pinned to rev `6a30252`. That fork is the maintained substitute
-# under our org's control and addresses the RUSTSEC advisory by
-# pointing cargo-audit at code we attest to. No direct caller in this
-# repo invokes `paste::paste!`; the substitution only feeds transitive
-# consumers (gemm-*, candle-*, etc.).
+# No direct caller in this repo invokes `paste::paste!`; the patch only
+# feeds transitive consumers (gemm-*, candle-*, etc.).
 paste = { path = "vendor/paste" }  # #2050: vendored (alphaonedev/paste fork deleted; rev 6a30252 unfetchable). Self-contained for cold CI.
 
 [profile.release]
