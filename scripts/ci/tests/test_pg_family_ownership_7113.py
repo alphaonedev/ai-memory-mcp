@@ -26,6 +26,8 @@ NATIVE_VAR = "H7113_NATIVE"
 NATIVE_PORT = 5445
 AGE_SECONDS = 7200
 SWEEP_SECONDS = 3600
+LOCK_REFIND_7130 = "failed to re-find shared lock object"
+RETRIES_7130 = 2
 
 
 @unittest.skipUnless(os.environ.get(NATIVE_VAR) == "1", "native ownership acceptance requires H7113_NATIVE=1")
@@ -197,14 +199,31 @@ class FamilyLifecycleNative(unittest.TestCase):
         self.assertTrue(self.exists(control) and self.exists(control_tpl), 'ACTIVE control family untouched')
         self.assertEqual(pib.psql(control_url, 'SELECT 1', True).strip(), '1')
 
+    def teardown_retrying_7130(self, run, base):
+        """Run teardown; retry only the exact #7130 server error (XX000 lock
+        re-find) that aborts before the family is terminalized."""
+        for attempt in range(RETRIES_7130 + 1):
+            with unittest.mock.patch.object(pib.time, 'sleep'):
+                rc, _, err = self.cli(['teardown', '--run-id', run], base=base)
+            if rc == 0 or LOCK_REFIND_7130 not in err or attempt == RETRIES_7130:
+                return rc, err
+        return rc, err
+
     def test_failed_teardown_exits_nonzero_and_sweep_finishes_it(self):
         token = uuid.uuid4().hex[:8]
         run = "h7113f" + token
         base, tpl = self.family(int(time.time()), run)
         _, held = self.clone(tpl, run, hold=True)
-        with unittest.mock.patch.object(pib.time, 'sleep'):
-            rc, _, err = self.cli(['teardown', '--run-id', run], base=base)
+        rc, err = self.teardown_retrying_7130(run, base)
         self.assertNotEqual(rc, 0, 'a teardown that left %s behind must not report success: %s' % (held, err))
+        # #7159: assert the cause, not just a non-zero rc. Any error returns non-zero,
+        # including a transient server error before the family is terminalized.
+        self.assertIn(held, err, 'stderr must name the held clone: %s' % err)
+        oid, comment = pib.read_family(self.admin, base)
+        found = pib.parse_family_marker(comment, base, oid)
+        self.assertIsNotNone(found, 'family marker unreadable after the failed teardown: %s' % err)
+        self.assertEqual((found['phase'], found['intent']), (pib.PHASE_TERMINAL, pib.INTENT_TEARDOWN),
+                         'teardown must terminalize before it drops; stderr: %s' % err)
         self.assertTrue(self.exists(base), 'base kept as the TERMINAL authority while a member remains')
         for hold in self.holds:
             pib.close_hold(hold)
