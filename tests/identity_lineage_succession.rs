@@ -87,6 +87,46 @@ fn kp(label: &str) -> AgentKeypair {
     keypair::generate(label).expect("generate keypair")
 }
 
+/// Key directory for the cells that `keypair::save` into (#3198 gate).
+fn key_dir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix("lineage-keys-")
+        .tempdir()
+        .expect("key dir")
+}
+
+/// #7158 / #7161 — the key fixture directory is private whatever the process
+/// umask. Under umask `0002` a umask-derived directory is mode `775` and
+/// `keypair::save` refuses it by design (#3198): the PR #7088 live-PG run
+/// failed `rotate_with_succession_end_to_end` on exactly that refusal.
+#[cfg(unix)]
+#[test]
+fn key_dir_is_mode_0700_under_umask_0002_7158_7161() {
+    use std::os::unix::fs::PermissionsExt;
+    // The umask is process-wide and this binary runs its cells concurrently
+    // by default. The flip is harmless to siblings: every key directory in
+    // this binary comes from `key_dir()`, which sets its mode explicitly, and
+    // the sqlite fixture directories are never permission-checked.
+    // SAFETY: `umask(2)` only reads and replaces the process creation mask.
+    let previous = unsafe { libc::umask(0o002) };
+    let dir = key_dir();
+    let saved = keypair::save(&kp("umask-7158"), dir.path());
+    // SAFETY: restores the mask read above; no other state is touched.
+    unsafe {
+        libc::umask(previous);
+    }
+    let mode = std::fs::metadata(dir.path())
+        .expect("stat key dir")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "key_dir must not inherit the process umask (got {mode:o})"
+    );
+    saved.expect("the #3198 key-directory gate must accept the fixture dir under umask 0002");
+}
+
 /// Raw corruption helper for adversarial lineage-verifier tests. Public bind
 /// APIs now refuse these desynchronisations by construction (#3464), so tests
 /// that exercise the deeper tamper detector must model a database attacker.
@@ -830,10 +870,7 @@ fn require_identity_lineage_fail_closes_when_missing() {
 #[test]
 fn rotate_with_succession_end_to_end() {
     let (_dir, conn) = fresh_db();
-    let key_dir = tempfile::Builder::new()
-        .prefix("lineage-keys-")
-        .tempdir()
-        .expect("key dir");
+    let key_dir = key_dir();
     db::register_agent(&conn, "rot-agent", "ai:test", &[]).expect("register");
     let k0 = kp("rot-agent");
     keypair::save(&k0, key_dir.path()).expect("save K0");
