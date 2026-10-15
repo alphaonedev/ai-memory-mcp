@@ -27,7 +27,12 @@ after another. With the lane on (flag `1`, kill switch not `1`, tier
    marks it `IS_TEMPLATE true ALLOW_CONNECTIONS false`, so
    `CREATE DATABASE ... TEMPLATE` only hits SQLSTATE 55006 under a stray
    session, which the mint retries. If `setup` fails or is terminated by
-   SIGTERM before the marker is written, it drops the base it minted. It
+   SIGTERM before the marker is written, it drops the base it minted: every
+   wrapper `psql` call carries a per-process `application_name`, the cleanup
+   cancels that application's backends (a killed `psql` leaves its
+   `CREATE DATABASE` running on the server, and it would commit later), waits
+   until none remain, drops by name and confirms in `pg_database`. It logs
+   `NOT released: <names>` and exits 4 when a name still exists. It
    emits `AI_MEMORY_TEST_PG_TEMPLATE`, `AI_MEMORY_TEST_PG_RUN_ID` and
    `AI_MEMORY_TEST_PG_BASE` for `$GITHUB_ENV`. Masked mode (the default) does not emit
    `AI_MEMORY_TEST_POSTGRES_URL`, because a URL with a masked password cannot

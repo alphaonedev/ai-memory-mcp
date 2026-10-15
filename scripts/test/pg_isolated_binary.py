@@ -62,7 +62,8 @@ run id is ``[a-z0-9]{1,20}``. The Rust helper (``tests/common/pg_isolate.rs``)
 uses the same shape.
 
 Exit codes: 0 success, 2 usage or wrapper error (fails closed), 3 a clone
-could not be minted or held, 143 terminated, otherwise the worst exit code of
+could not be minted or held, 4 an owned database or template still exists after the
+cleanup (#7179), 143 terminated, otherwise the worst exit code of
 the cargo runs. Standard library only, Python 3.9+.
 """
 import argparse
@@ -127,6 +128,19 @@ TEARDOWN_REASON = 'teardown'
 EXIT_USAGE = 2
 EXIT_MINT = 3
 EXIT_TERM = 143
+EXIT_UNRELEASED = 4  # an owned database or template still exists after the cleanup (#7179)
+
+# Every wrapper psql call carries this application_name, so cleanup can cancel
+# exactly this process's server backends (#7179). A run id is shared by several
+# processes (setup, run, teardown) and is never used for that.
+APP_NAME_PREFIX = 'pgiso-'
+SETTLE_SECS = 30.0
+SETTLE_POLL_SECS = 0.2
+SQL_CANCEL_OWN = ("SELECT pg_cancel_backend(pid) FROM pg_stat_activity "
+                  "WHERE application_name = '%s' AND pid <> pg_backend_pid()")
+SQL_COUNT_OWN = ("SELECT count(*) FROM pg_stat_activity "
+                 "WHERE application_name = '%s' AND pid <> pg_backend_pid()")
+SQL_NAME_EXISTS = "SELECT count(*) FROM pg_database WHERE datname = '%s'"
 
 # URL query keys and the libpq variable each maps to. Anything else fails
 # closed rather than being silently dropped.
@@ -299,20 +313,32 @@ def libpq_env(url: str) -> Dict[str, str]:
     return env
 
 
-def _pg_env(url: str) -> Dict[str, str]:
-    """The process env with inherited PG* removed and this URL's libpq vars."""
+def new_app_name() -> str:
+    """A process-unique application_name (<= 63 bytes, lowercase, no quoting needed)."""
+    return '%s%d-%s' % (APP_NAME_PREFIX, os.getpid(), uuid.uuid4().hex[:8])
+
+
+_APP_NAME = new_app_name()
+
+
+def _pg_env(url: str, app: Optional[str] = None) -> Dict[str, str]:
+    """The process env with inherited PG* removed and this URL's libpq vars;
+    ``app`` (when given) is the application_name of the connection."""
     env = {k: v for k, v in os.environ.items() if not k.startswith('PG')}
     env.update(libpq_env(url))
+    if app:
+        env['PGAPPNAME'] = app
     return env
 
 
-def psql(url: str, sql: str, tuples: bool = False) -> str:
-    """Run one statement through psql; returns stdout, raises on failure."""
+def psql(url: str, sql: str, tuples: bool = False, app: Optional[str] = None) -> str:
+    """Run one statement through psql; returns stdout, raises on failure. Every
+    call is tagged with this process's application_name (#7179)."""
     argv = ['psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1']
     if tuples:
         argv.append('-At')
     argv += ['-c', sql]
-    done = subprocess.run(argv, capture_output=True, text=True, env=_pg_env(url))
+    done = subprocess.run(argv, capture_output=True, text=True, env=_pg_env(url, app or _APP_NAME))
     if done.returncode != 0:
         raise WrapperError('psql failed (%d): %s' % (done.returncode, (done.stderr or '').strip()))
     return done.stdout or ''
@@ -436,27 +462,48 @@ def _disown(name: str) -> None:
         _OWNED.remove(name)
 
 
+def settle_backends(admin_url: str) -> bool:
+    """Cancel every server backend this process started and wait until none is
+    left (#7179). A psql killed mid-``CREATE DATABASE`` leaves the server-side
+    statement running; it commits later unless it is cancelled here. Runs on a
+    separate application_name so it never cancels itself."""
+    maint = with_database(admin_url, MAINTENANCE_DB)
+    cleaner = _APP_NAME + '-gc'
+    deadline = time.monotonic() + SETTLE_SECS
+    while True:
+        psql(maint, SQL_CANCEL_OWN % _APP_NAME, app=cleaner)
+        if psql(maint, SQL_COUNT_OWN % _APP_NAME, tuples=True, app=cleaner).strip() == '0':
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(SETTLE_POLL_SECS)
+
+
+def name_exists(admin_url: str, name: str) -> bool:
+    """True unless pg_database proves the name is gone (fails closed on any other answer)."""
+    answer = psql(with_database(admin_url, MAINTENANCE_DB), SQL_NAME_EXISTS % _checked_ident(name),
+                  tuples=True, app=_APP_NAME + '-gc').strip()
+    return answer != '0'
+
+
 def mint_base(url: str) -> str:
     """CREATE an ephemeral base (the ci.yml recipe: database, then age + vector)
     and return its URL. ``url`` is only the maintenance connection."""
     name = _checked_ident(mint_base_name())
     _own(name)  # before the CREATE: an interrupted CREATE that did commit is dropped by name
     initialized = False
-    refused = False
     try:
-        try:
-            psql(url, 'CREATE DATABASE %s' % quote_ident(name))
-        except WrapperError:
-            refused = True  # the server answered with an error: nothing was created
-            _disown(name)
-            raise
+        # Any failure keeps the name owned: it is unique to this process, and a
+        # connection loss can follow a server-side commit (#7179). The cleanup
+        # below proves the name gone before it is released.
+        psql(url, 'CREATE DATABASE %s' % quote_ident(name))
         new_url = with_database(url, name)
         psql(new_url, 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')
         log('minted ephemeral base %s' % name)
         initialized = True
         return new_url
     finally:
-        if not initialized and not refused:
+        if not initialized:
             primary = sys.exc_info()[1]
             try:
                 if not drop_base(url, name):
@@ -478,7 +525,12 @@ def drop_base(url: str, name: str) -> bool:
         return False
     try:
         with _sigterm_deferred():  # #7179: the first SIGTERM must not abandon the drop
+            if not settle_backends(url):
+                log('WARN backends of this run are still alive after %ds' % int(SETTLE_SECS))
             psql(with_database(url, MAINTENANCE_DB), SQL_DROP_DATABASE % quote_ident(_checked_ident(name)))
+            if name_exists(url, name):
+                log('WARN minted base %s still exists after the drop (drop it by hand)' % name)
+                return False
             _disown(name)
         return True
     except (WrapperError, OSError) as exc:
@@ -818,11 +870,15 @@ def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
             primary = sys.exc_info()[1]
             try:
                 with _sigterm_deferred():
+                    if not settle_backends(url):  # #7179: the CREATE commits after psql is gone
+                        log('WARN backends of this run are still alive after %ds' % int(SETTLE_SECS))
                     try:
                         psql(url, SQL_RELEASE_TEMPLATE % q)
                     except WrapperError:
                         pass  # the CREATE never committed, or it is no longer a template
                     psql(url, SQL_DROP_DATABASE % q)
+                    if name_exists(url, tpl):
+                        raise WrapperError('template %s still exists after the drop' % tpl)
                     _disown(tpl)
             except _Terminated:
                 raise
@@ -1326,12 +1382,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _cmd_run(args, url)
     except _Terminated:
         if _OWNED:
-            log('terminated by SIGTERM; NOT released, drop by hand: %s' % ', '.join(_OWNED))
-        else:
-            log('terminated by SIGTERM; owned resources were released')
+            log('terminated by SIGTERM; NOT released: %s (drop by hand)' % ', '.join(_OWNED))
+            return EXIT_UNRELEASED
+        log('terminated by SIGTERM; owned resources were released')
         return _die_by_sigterm()
     except WrapperError as exc:
         print('pg_isolated_binary: %s' % exc, file=sys.stderr)
+        if _OWNED:
+            log('NOT released: %s (drop by hand)' % ', '.join(_OWNED))
         return EXIT_USAGE
 
 

@@ -64,6 +64,7 @@ def default_answer(argv, kw):
 _COMMENT_RE = re.compile(r'^COMMENT ON DATABASE "([A-Za-z0-9_]+)" IS \'(.*)\'$', re.S)
 _MARKER_READ_RE = re.compile(r"shobj_description.*datname = '([A-Za-z0-9_]+)'", re.S)
 _CREATE_DB_RE = re.compile(r'^CREATE DATABASE "([A-Za-z0-9_]+)"')
+_NAME_EXISTS_RE = re.compile(r"^SELECT count\(\*\) FROM pg_database WHERE datname = '([A-Za-z0-9_]+)'$")
 _DROP_DB_RE = re.compile(r'^DROP DATABASE IF EXISTS "([A-Za-z0-9_]+)"$')
 
 
@@ -99,6 +100,11 @@ class Recorder:
             if name not in self.dbs:
                 return Result(0, '')
             return Result(0, '%d|%s\n' % (fake_oid(name), self.comments.get(name, '')))
+        if "application_name = '" in sql:  # #7179: the settle poll finds no backend of this process
+            return Result(0, '0\n' if 'count(*)' in sql else '')
+        exists = _NAME_EXISTS_RE.match(sql)
+        if exists:
+            return Result(0, '%d\n' % (exists.group(1) in self.dbs))
         comment = _COMMENT_RE.match(sql)
         if comment:
             if self.sink and comment.group(1) in self.dbs:
@@ -819,7 +825,7 @@ class MintOwnership7114(unittest.TestCase):
                 self.assertIs(caught.exception, failure)
                 self.assert_owned_cleanup(rec)
 
-    def test_create_failure_does_not_claim_or_drop_database(self):
+    def test_create_failure_keeps_the_name_owned_and_drops_only_that_name(self):  # #7179 (iv)
         failure = pib.WrapperError('injected CREATE refusal')
 
         def answer(argv, kw):
@@ -832,7 +838,11 @@ class MintOwnership7114(unittest.TestCase):
             with self.assertRaises(pib.WrapperError) as caught:
                 pib.mint_base(BASE)
         self.assertIs(caught.exception, failure)
-        self.assertFalse(any(sql.startswith('DROP DATABASE') for sql in rec.sql()))
+        drops = [sql for sql in rec.sql() if sql.startswith('DROP DATABASE')]
+        self.assertEqual(drops, ['DROP DATABASE IF EXISTS "%s"' % self.NAME],
+                         'the unique owned name is dropped (a commit may follow a lost connection)')
+        self.assertFalse(any('FORCE' in sql.upper() for sql in rec.sql()))
+        self.assertEqual(pib._OWNED, [], 'released only after pg_database proved the name gone')
 
     def test_success_transfers_owned_database_without_dropping_it(self):
         with self.mint_with(default_answer) as rec, \
@@ -1397,6 +1407,8 @@ class Review7088R1(unittest.TestCase):
             'def fake(argv, **kw):\n'
             '    sql = argv[argv.index("-c") + 1]\n'
             '    open(%r, "a").write(sql + "\\n")\n'
+            '    if "count(*)" in sql and ("application_name" in sql or "FROM pg_database" in sql):\n'
+            '        return R("0\\n")\n'
             '    if "max_connections" in sql:\n'
             '        return R("1000|3|0|10\\n")\n'
             '    if sql.startswith("CREATE EXTENSION"):\n'
@@ -1530,6 +1542,7 @@ sys.modules["pib"] = pib
 spec.loader.exec_module(pib)
 cfg = json.loads(sys.argv[2])
 dbs = set()
+pending = set()  # CREATE DATABASE statements still running on the server after the client died (#7179)
 comments = {}
 
 
@@ -1545,6 +1558,14 @@ def save():
 
 def fake(argv, **kw):
     sql = argv[argv.index("-c") + 1]
+    if "application_name = '" in sql:  # the settle poll: cancel, then count this process's backends
+        if "pg_cancel_backend" in sql:
+            pending.clear()  # a cancelled CREATE DATABASE aborts: it never commits
+            return R()
+        return R("%d\n" % len(pending))
+    seen = re.match(r"^SELECT count\(\*\) FROM pg_database WHERE datname = '([A-Za-z0-9_]+)'$", sql)
+    if seen:
+        return R("%d\n" % (seen.group(1) in dbs))
     if "max_connections" in sql:
         return R("1000|3|0|10\n")
     if sql.startswith("CREATE EXTENSION") and cfg.get("fail_extension"):
@@ -1568,6 +1589,10 @@ def fake(argv, **kw):
     sig = cfg.get("signal") or {}
     fire = sig.get("verb") == verb and re.search(sig["name_re"], name)
     if verb == "CREATE":
+        if fire and cfg.get("async_commit"):
+            pending.add(name)  # the server is still running the CREATE; the client is killed (#7179)
+            os.kill(os.getpid(), signal.SIGTERM)
+            return R()
         dbs.add(name)  # committed on the server
         save()
         if fire:
@@ -1578,6 +1603,9 @@ def fake(argv, **kw):
     if cfg.get("fail_drop_re") and re.search(cfg["fail_drop_re"], name):
         return R("", "ERROR: cannot drop", 1)
     dbs.discard(name)
+    if pending:  # a CREATE that nobody cancelled commits after this DROP found nothing to drop
+        dbs.update(pending)
+        pending.clear()
     save()
     return R()
 
@@ -1628,6 +1656,23 @@ class SigtermWindows7179(unittest.TestCase):
         rc, err, left = self.probe(argv=self.minted_argv(), signal={'verb': 'CREATE', 'name_re': '^ci_base_'})
         self.assert_clean_sigterm(rc, err, left)
 
+    def test_7179_async_commit_sigterm_during_the_base_create_is_cancelled_not_raced(self):
+        rc, err, left = self.probe(argv=self.minted_argv(), async_commit=True,
+                                   signal={'verb': 'CREATE', 'name_re': '^ci_base_'})
+        self.assert_clean_sigterm(rc, err, left)
+
+    def test_7179_async_commit_sigterm_during_the_template_create_on_the_minted_path(self):
+        rc, err, left = self.probe(argv=self.minted_argv(), async_commit=True,
+                                   signal={'verb': 'CREATE', 'name_re': '_tpl$'})
+        self.assert_clean_sigterm(rc, err, left)
+
+    def test_7179_async_commit_sigterm_during_the_template_create_on_the_db_path(self):
+        rc, err, left = self.probe(argv=self.db_argv(), async_commit=True,
+                                   signal={'verb': 'CREATE', 'name_re': '_tpl$'})
+        self.assertEqual(rc, -signal.SIGTERM, err[-300:])
+        self.assertEqual([n for n in left if n.endswith('_tpl')], [], 'the template window (--db path)')
+        self.assertIn('owned resources were released', err)
+
     def test_7179_sigterm_right_after_mint_returns_before_setup_owns_it(self):
         rc, err, left = self.probe(argv=self.minted_argv(), signal_after_mint=True)
         self.assert_clean_sigterm(rc, err, left)
@@ -1650,10 +1695,10 @@ class SigtermWindows7179(unittest.TestCase):
     def test_7179_release_log_names_what_is_left_when_a_drop_fails(self):
         rc, err, left = self.probe(argv=self.minted_argv(), signal={'verb': 'CREATE', 'name_re': '^ci_base_'},
                                    fail_drop_re='^ci_base_')
-        self.assertEqual(rc, -signal.SIGTERM, err[-300:])
+        self.assertEqual(rc, pib.EXIT_UNRELEASED, 'a leaked database is a non-zero, non-signal exit: ' + err[-300:])
         self.assertEqual(len(left), 1, left)
         self.assertNotIn('owned resources were released', err)
-        self.assertIn(left[0], err, 'the log names the database that was left behind')
+        self.assertIn('NOT released: %s' % left[0], err, 'the log names the database that was left behind')
 
     def test_7179_a_clean_failure_still_drops_without_a_signal(self):
         rc, err, left = self.probe(argv=self.minted_argv(), fail_extension=True)
