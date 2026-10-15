@@ -100,6 +100,17 @@ class SharedTargetFreshness(unittest.TestCase):
             stdout=subprocess.DEVNULL,
         )
 
+    def test_both_prepared_before_either_builds_each_runs_its_own_code(self):
+        # The lock-wait race: both jobs bump at checkout, then build in turn.
+        self.prepare(self.a)
+        self.prepare(self.b)
+        self.build(self.b)
+        self.assertEqual(self.marks_in_target(), {MARK_B})
+        self.build(self.a)
+        self.assertEqual(self.marks_in_target(), {MARK_A})
+        self.build(self.b)
+        self.assertEqual(self.marks_in_target(), {MARK_B})
+
     def test_control_unprepared_checkout_reuses_the_other_checkouts_artifact(self):
         self.build(self.b)
         self.build(self.a)

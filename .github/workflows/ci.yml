@@ -869,6 +869,15 @@ jobs:
         if: needs.classify.outputs.docs_only != 'true' && matrix.shared_target
         run: python3 scripts/ci/shared_cargo_target.py --github-env "$GITHUB_ENV"
 
+      # #7188 - cargo judges workspace crates fresh by source mtime versus the
+      # artifact mtime, so a checkout older than another PR's build would link
+      # that PR's compiled code out of the shared target. Date every tracked
+      # file ahead of any artifact so workspace crates always rebuild here;
+      # registry/git dependencies keep their cached artifacts.
+      - name: Rebuild workspace crates for this checkout (#7188)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.shared_target
+        run: python3 scripts/ci/touch_workspace_sources.py --root "$GITHUB_WORKSPACE"
+
       # #2452 — tests/conformance_readers.rs is FAIL-CLOSED: an absent
       # python3/node is a test FAILURE, not a silent pass. This job now spans
       # BOTH runner classes, so the guarantee is met two ways:
