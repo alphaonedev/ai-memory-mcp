@@ -18,11 +18,12 @@ Exit codes: 0 done, 2 usage or unreadable evidence directory (the offending
 argument is never echoed).
 """
 import argparse
+import json
 import re
 import shutil
 import sys
 from pathlib import Path
-from typing import IO, Iterable, List
+from typing import IO, Any, Iterable, List
 
 DEFAULT_TAIL_LINES = 200
 REDACTED = "<redacted>"
@@ -35,40 +36,118 @@ DEFAULT_NAMES = (
 )
 PEM_BEGIN = re.compile(r"-----BEGIN [A-Z0-9 ]*-----")
 PEM_END = re.compile(r"-----END [A-Z0-9 ]*-----")
-# A secret-ish name, an optional closing quote, then ``:`` / ``=`` / whitespace,
-# then an optionally quoted value. Covers ``k=v``, ``"k": "v"``, ``secret key: v``
-# and ``token v``.
+# Strong secret names (match as a substring of a longer key, any separator).
+_STRONG_NAMES = (
+    r"private[_ -]?key|secret|token|password|passwd|passphrase|pass[_ -]?phrase|seed|"
+    r"api[_ -]?key|signing[_ -]?key|credentials?"
+)
+# Weak names are common words: match only as a whole word (or `_.-` delimited
+# part of a key), and with a whitespace separator only when the value is 8+ chars.
+_WEAK_NAMES = r"pass|pwd|auth|session|sessionid|session_id|cookie|csrf"
+_VALUE = r"(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|\S+)"
+# Shape 1 (strong name): ``k=v``, ``"k": "v"``, ``--passphrase v``, ``--passphrase=v``,
+# ``secret key: v`` and ``token v``; a quoted value runs to the closing UNESCAPED quote.
 SECRET_KEY_VALUE = re.compile(
     r"(?i)(?<![a-z0-9])([a-z0-9_.-]*"
-    r"(?:private[_ -]?key|secret|token|password|passwd|seed|api[_ -]?key|signing[_ -]?key|credential)"
+    r"(?:" + _STRONG_NAMES + r")"
     r"(?:[ _.-]?(?:key|b64|hex|value|id))?[a-z0-9_.-]*)"
-    r"([\"']?(?:\s*[:=]\s*|\s+))(\"[^\"]*\"|'[^']*'|\S+)"
+    r"([\"']?(?:\s*[:=]\s*|\s+))" + _VALUE
 )
+# Shape 2 (weak name, ``:`` or ``=`` separator): ``session=v``, ``cookie: v``, ``AI_X_PASS=v``.
+WEAK_KEY_VALUE = re.compile(
+    r"(?i)(?<![a-z0-9])((?:[a-z0-9_.-]*[_.-])?(?:" + _WEAK_NAMES + r")(?:[_.-][a-z0-9_.-]*)?)(?![a-z0-9])"
+    r"([\"']?\s*[:=]\s*)" + _VALUE
+)
+# Shape 3 (weak name, whitespace separator): only a value of 8+ chars is masked.
+WEAK_KEY_SPACE = re.compile(
+    r"(?i)(?<![a-z0-9])((?:[a-z0-9_.-]*[_.-])?(?:" + _WEAK_NAMES + r")(?:[_.-][a-z0-9_.-]*)?)(?![a-z0-9])"
+    r"([\"']?\s+)(\S{8,})"
+)
+# Name test for a decoded JSON key (strong substring or weak whole word).
+JSON_KEY_NAME = re.compile(
+    r"(?i)(?:" + _STRONG_NAMES + r")|(?<![a-z0-9])(?:" + _WEAK_NAMES + r")(?![a-z0-9])"
+)
+# Shape 4: ``Authorization: <anything to end of line>`` and ``Bearer <tok>``.
 AUTHORIZATION = re.compile(r"(?i)(authorization[\"']?\s*[:=]\s*).*")
 BEARER = re.compile(r"(?i)\b(bearer\s+)\S+")
+# Shape 5: well-known API token prefixes.
 TOKEN_SHAPES = re.compile(r"\b(?:ghp_|gho_|ghs_|github_pat_|sk-)[A-Za-z0-9_\-]{8,}")
-URL_CREDENTIALS = re.compile(r"(://)[^/@\s]*@")
-# Long runs: 64+ hex chars (a 32-byte key or digest) and 43+ base64/base64url
-# chars (a 32-byte key encodes to 43). Masked unless the line is allowlisted.
+# Shape 6: URL userinfo, from ``://`` through the LAST ``@`` of the token (a raw
+# ``@`` or ``/`` in the password stays inside the mask).
+URL_CREDENTIALS = re.compile(r"(://)\S*@")
+# Shape 7: 64+ hex chars (32-byte key or digest). Shape 8: base64 / base64url
+# runs of 32+ chars (a 24-byte key encodes to 32), except an exact 40-hex git sha
+# and a lowercase filesystem path with 2+ slashes.
 LONG_HEX = re.compile(r"(?<![0-9A-Za-z])[0-9a-fA-F]{64,}(?![0-9A-Za-z])")
-LONG_B64 = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{43,}={0,2}")
-# Explicit allowlist (public material only): a line whose key is one of these
-# names keeps its long run, so a public key stays debuggable in the log.
+LONG_B64 = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{32,}={0,2}")
+GIT_SHA = re.compile(r"[0-9a-f]{40}")
+PATH_RUN = re.compile(r"[a-z0-9/_-]+")
+MIN_PATH_SLASHES = 2
+# Shape 9: ``\u00XX`` escapes that decode to a key-name character (alnum, ``_.- ``).
+KEY_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
+# Public-key allowlist: a line starting with one of these keys keeps ONLY that
+# field's value span; every other long run on the line is still masked.
 PUBLIC_KEY_LINE = re.compile(
-    r"(?i)^\s*[\"']?(?:pub_b64|pub_hex|pubkey|public_key|public_key_b64|public_key_hex)[\"']?\s*[:=]"
+    r"(?i)^\s*[\"']?(?:pub_b64|pub_hex|pubkey|public_key|public_key_b64|public_key_hex)[\"']?\s*[:=]\s*"
 )
+PUBLIC_VALUE = re.compile(_VALUE)
+PUBLIC_SENTINEL = "\x00PUBVAL\x00"
 # Evidence files that may carry connection settings: never copied or uploaded.
 EXCLUDED_PREFIXES = ("pg-posture-", "driverless-posture-")
 USAGE_ERROR = "usage error (arguments not echoed)"
 
 
+def _decode_key_escapes(line: str) -> str:
+    """Decode ``\\uXXXX`` escapes that yield a key-name character so ``"p\\u0061ss"`` matches."""
+
+    def sub(m: "re.Match") -> str:
+        ch = chr(int(m.group(1), 16))
+        return ch if (ch.isascii() and (ch.isalnum() or ch in "_.- ")) else m.group(0)
+
+    return KEY_ESCAPE.sub(sub, line)
+
+
+def _mask_json(node: Any) -> Any:
+    """Mask every value (recursively) whose decoded key matches a secret name."""
+    if isinstance(node, dict):
+        return {k: (REDACTED if JSON_KEY_NAME.search(str(k)) else _mask_json(v)) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_mask_json(v) for v in node]
+    return node
+
+
+def _try_json(text: str) -> Any:
+    """Decoded object when ``text`` is a JSON object or array, else ``None``."""
+    stripped = text.strip()
+    if not stripped or stripped[0] not in "{[":
+        return None
+    try:
+        return json.loads(stripped)
+    except ValueError:
+        return None
+
+
+def _b64_sub(m: "re.Match") -> str:
+    run = m.group(0)
+    if GIT_SHA.fullmatch(run):
+        return run
+    if PATH_RUN.fullmatch(run) and run.count("/") >= MIN_PATH_SLASHES:
+        return run
+    return REDACTED
+
+
 class Redactor:
-    """Stateful line redactor: tracks whether we are inside a PEM block."""
+    """Stateful redactor: ``in_pem`` survives line and chunk boundaries.
+
+    Use ``feed_line`` per line or ``feed`` per arbitrary text chunk (a partial
+    trailing line is carried to the next chunk; ``flush`` emits it).
+    """
 
     def __init__(self) -> None:
         self.in_pem = False
+        self._carry = ""
 
-    def line(self, line: str) -> str:
+    def feed_line(self, line: str) -> str:
         """Return ``line`` with key material, secret values, tokens and credentials masked."""
         if self.in_pem:
             if PEM_END.search(line):
@@ -77,26 +156,60 @@ class Redactor:
         if PEM_BEGIN.search(line):
             self.in_pem = not PEM_END.search(line)
             return REDACTED
-        out = AUTHORIZATION.sub(lambda m: m.group(1) + REDACTED, line)
+        text = _decode_key_escapes(line)
+        obj = _try_json(text)
+        if obj is not None:
+            text = json.dumps(_mask_json(obj), ensure_ascii=False)
+        pub_value = None
+        head = PUBLIC_KEY_LINE.match(text)
+        if head:
+            val = PUBLIC_VALUE.match(text, head.end())
+            if val:
+                pub_value = val.group(0)
+                text = text[: val.start()] + PUBLIC_SENTINEL + text[val.end():]
+        out = AUTHORIZATION.sub(lambda m: m.group(1) + REDACTED, text)
         out = BEARER.sub(lambda m: m.group(1) + REDACTED, out)
         out = SECRET_KEY_VALUE.sub(lambda m: m.group(1) + m.group(2) + REDACTED, out)
+        out = WEAK_KEY_VALUE.sub(lambda m: m.group(1) + m.group(2) + REDACTED, out)
+        out = WEAK_KEY_SPACE.sub(lambda m: m.group(1) + m.group(2) + REDACTED, out)
         out = TOKEN_SHAPES.sub(REDACTED, out)
         out = URL_CREDENTIALS.sub(lambda m: m.group(1) + REDACTED + "@", out)
-        if not PUBLIC_KEY_LINE.search(line):
-            out = LONG_HEX.sub(REDACTED, out)
-            out = LONG_B64.sub(REDACTED, out)
+        out = LONG_HEX.sub(REDACTED, out)
+        out = LONG_B64.sub(_b64_sub, out)
+        if pub_value is not None:
+            out = out.replace(PUBLIC_SENTINEL, pub_value)
         return out
+
+    def feed(self, chunk: str) -> List[str]:
+        """Redact a text chunk of any size; returns the completed lines."""
+        pieces = (self._carry + chunk).split("\n")
+        self._carry = pieces.pop()
+        return [self.feed_line(p) for p in pieces]
+
+    def flush(self) -> List[str]:
+        """Emit the carried partial line (if any)."""
+        rest, self._carry = self._carry, ""
+        return [self.feed_line(rest)] if rest else []
 
 
 def redact_line(line: str) -> str:
     """Redact one standalone line (no PEM-block state)."""
-    return Redactor().line(line)
+    return Redactor().feed_line(line)
 
 
 def redact_lines(lines: Iterable[str]) -> List[str]:
     """Redact a sequence of lines, masking whole PEM blocks."""
     red = Redactor()
-    return [red.line(x) for x in lines]
+    return [red.feed_line(x) for x in lines]
+
+
+def redact_text(text: str) -> List[str]:
+    """Redact a whole file: a JSON document is walked by decoded key first."""
+    obj = _try_json(text) if "\n" in text.strip() else None
+    if obj is not None:
+        text = json.dumps(_mask_json(obj), ensure_ascii=False, indent=2)
+    red = Redactor()
+    return red.feed(text) + red.flush()
 
 
 def evidence_names(evidence_dir: Path, names: Iterable[str]) -> List[str]:
@@ -118,8 +231,7 @@ def print_evidence(evidence_dir: Path, names: Iterable[str], tail_lines: int, st
         if not path.is_file():
             stream.write("(not present)\n")
             continue
-        full = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        masked = redact_lines(full)
+        masked = redact_text(path.read_text(encoding="utf-8", errors="replace"))
         for line in masked[-tail_lines:] if tail_lines > 0 else []:
             stream.write(line + "\n")
     stream.flush()
@@ -139,8 +251,8 @@ def write_redacted(evidence_dir: Path, out_dir: Path) -> int:
     for path in sorted(evidence_dir.iterdir()):
         if not path.is_file() or path.name.startswith(EXCLUDED_PREFIXES):
             continue
-        text = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        (out_dir / path.name).write_text("\n".join(redact_lines(text)) + "\n", encoding="utf-8")
+        masked = redact_text(path.read_text(encoding="utf-8", errors="replace"))
+        (out_dir / path.name).write_text("\n".join(masked) + "\n", encoding="utf-8")
     return 0
 
 

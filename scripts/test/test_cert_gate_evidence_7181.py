@@ -235,6 +235,103 @@ class HelperRedactsAndBounds(unittest.TestCase):
         self.assertIn("absent.log", text)
 
 
+class RedactorRound3(unittest.TestCase):
+    """r3 (F1): one test per leak class (a)-(g); every secret is built at runtime."""
+
+    PW = "Tr0ub" + "4dor" + "x9Qz"
+
+    def test_a_passphrase_env_json_and_flag_forms(self):
+        mod = _load_helper()
+        forms = [
+            "AI_MEMORY_DB_PASS" + "PHRASE=" + self.PW,
+            '"db_pass' + 'phrase": "' + self.PW + '"',
+            "--pass" + "phrase " + self.PW,
+            "--pass" + "phrase=" + self.PW,
+            "pass_" + "phrase: " + self.PW,
+            "pw" + "d=" + self.PW,
+            "pa" + "ss=" + self.PW,
+            "cook" + "ie: " + self.PW,
+            "session" + "id=" + self.PW,
+            "sess" + "ion_id: " + self.PW,
+            "cs" + "rf=" + self.PW,
+            "au" + "th=" + self.PW,
+            "creden" + "tials=" + self.PW,
+            "creden" + "tial: " + self.PW,
+        ]
+        for ln in forms:
+            self.assertNotIn(self.PW, mod.redact_line(ln), ln)
+
+    def test_b_url_userinfo_with_raw_at_and_slash(self):
+        mod = _load_helper()
+        for pw in ("p@" + "ss" + "w0rd", "pa/" + "ss" + "w0rd", "a@b/" + "c@" + "dee"):
+            ln = "dsn postgres://u:" + pw + "@h:5432/db"
+            out = mod.redact_line(ln)
+            self.assertNotIn(pw.split("@")[-1].split("/")[-1], out, ln)
+            self.assertNotIn("ssw0rd", out, ln)
+            self.assertIn("@h:5432/db", out)
+
+    def test_c_escaped_quote_inside_quoted_value(self):
+        mod = _load_helper()
+        tail = "tail" + "Secret77"
+        ln = '"val' + 'ue": "ab\\"cd' + tail + '"'
+        self.assertNotIn(tail, mod.redact_line(ln.replace("val" + "ue", "pass" + "word")))
+        ln2 = 'secret' + '="ab\\"cd' + tail + '" next'
+        out = mod.redact_line(ln2)
+        self.assertNotIn(tail, out)
+        self.assertIn("next", out)
+
+    def test_d_unicode_escaped_json_key(self):
+        mod = _load_helper()
+        for ln in ('{"\\u0070assword": "' + self.PW + '"}', '{"outer": {"pass\\u0077ord": "' + self.PW + '"}}',
+                   'log "\\u0070assword": "' + self.PW + '"'):
+            self.assertNotIn(self.PW, mod.redact_line(ln), ln)
+        with _scratch() as td:
+            doc = Path(td) / "doc.out"
+            doc.write_text('{\n  "u": {\n    "\\u0070asswor\\u0064": "' + self.PW + '"\n  }\n}\n', encoding="utf-8")
+            buf = io.StringIO()
+            mod.print_evidence(Path(td), ["doc.out"], TAIL_LINES, buf)
+        self.assertNotIn(self.PW, buf.getvalue())
+
+    def test_e_base64_floor_is_32_and_hex_policy(self):
+        mod = _load_helper()
+        b32 = "Zm9v" * 8
+        self.assertNotIn(b32, mod.redact_line("nonce " + b32))
+        self.assertEqual(len(b32), 32)
+        sha = "0123456789abcdef" * 2 + "01234567"
+        self.assertEqual(len(sha), 40)
+        self.assertEqual(mod.redact_line("commit " + sha), "commit " + sha)
+        self.assertNotIn(HEX64, mod.redact_line("digest " + HEX64))
+        self.assertEqual(mod.redact_line("31 chars " + "Zm9v" * 7 + "Zm9"), "31 chars " + "Zm9v" * 7 + "Zm9")
+
+    def test_f_public_key_allowlist_is_value_span_only(self):
+        mod = _load_helper()
+        pk, sk = "AAAA" * 11, "Qm9i" * 11
+        out = mod.redact_line("pub_b" + "64: " + pk + " sk: " + sk)
+        self.assertIn(pk, out)
+        self.assertNotIn(sk, out)
+        out2 = mod.redact_line("pub" + "key: x " + HEX64)
+        self.assertNotIn(HEX64, out2)
+
+    def test_g_pem_state_survives_chunk_boundaries(self):
+        mod = _load_helper()
+        red = mod.Redactor()
+        self.assertEqual(red.feed_line("before " + BEGIN), mod.REDACTED)
+        self.assertEqual(red.feed_line("QUJDREVG"), mod.REDACTED)
+        self.assertEqual(red.feed_line(END), mod.REDACTED)
+        self.assertEqual(red.feed_line("after: plain"), "after: plain")
+        red2 = mod.Redactor()
+        got = red2.feed(BEGIN + "\nQUJDRE") + red2.feed("VG\nshort\n" + END + "\nok: 1\n") + red2.flush()
+        self.assertEqual(got, [mod.REDACTED] * 4 + ["ok: 1"])
+
+    def test_negative_git_sha_and_public_key_unchanged(self):
+        mod = _load_helper()
+        sha = "fedcba9876543210" * 2 + "fedcba98"
+        ln = "pub_b" + "64: " + "AAAA" * 11 + " head " + sha
+        self.assertEqual(mod.redact_line(ln), ln)
+        self.assertEqual(mod.redact_line("path /srv/work/app/target/x"),
+                         "path /srv/work/app/target/x")
+
+
 class GateScriptPins(unittest.TestCase):
     def test_witness_recorder_generate_is_sandboxed_and_not_silenced(self):
         leg_b = _leg_b_text()
