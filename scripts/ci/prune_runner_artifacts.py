@@ -7,8 +7,9 @@ Removes ONLY: the workspace ``target/debug/incremental`` tree (CI builds with
 CARGO_INCREMENTAL=0, so anything there is a leftover), workspace ``.tmp*``
 directories, and entries of ``<work-root>/_temp`` older than ``--max-age-days``.
 
-It NEVER removes the shared per-host cargo target (``--shared-target``) nor any
-path inside it or above it; ``is_protected`` is checked on every candidate and
+It NEVER removes the per-runner cargo target ROOT (``--protected-root``,
+``~/.cache/ai-memory-ci/cargo-target``) nor any path inside it (every runner's
+target, so one runner's prune can never delete a sibling's) or above it; ``is_protected`` is checked on every candidate and
 again immediately before each removal. Symlinks are never followed or deleted
 (each one met is reported as skipped) and every removal must resolve inside the
 work root. Use ``--dry-run`` to list only.
@@ -37,11 +38,11 @@ def resolve(path):
     return Path(path).resolve()
 
 
-def is_protected(candidate, shared_target):
-    """True if ``candidate`` is, is inside, or contains the shared target."""
+def is_protected(candidate, protected_root):
+    """True if ``candidate`` is, is inside, or contains the protected root."""
     cand = resolve(candidate)
-    shared = resolve(shared_target)
-    return cand == shared or shared in cand.parents or cand in shared.parents
+    protected = resolve(protected_root)
+    return cand == protected or protected in cand.parents or cand in protected.parents
 
 
 def is_within(path, root):
@@ -57,7 +58,7 @@ def is_old(path, max_age_days, now):
     return now - path.stat().st_mtime > max_age_days * SECS_PER_DAY
 
 
-def scan(work_root, workspace, shared_target, max_age_days, now):
+def scan(work_root, workspace, protected_root, max_age_days, now):
     """Return ``(candidates, skipped)``; a symlink is never a candidate.
 
     ``skipped`` lists every symlink met on the way (never followed, never
@@ -95,24 +96,24 @@ def scan(work_root, workspace, shared_target, max_age_days, now):
                 skipped.append(entry)
             elif entry.is_dir() and is_old(entry, max_age_days, now):
                 found.append(entry)
-    keep = [path for path in found if not is_protected(path, shared_target)]
+    keep = [path for path in found if not is_protected(path, protected_root)]
     return keep, skipped
 
 
-def find_candidates(work_root, workspace, shared_target, max_age_days, now):
+def find_candidates(work_root, workspace, protected_root, max_age_days, now):
     """Return the stale paths to prune, never including protected ones."""
-    return scan(work_root, workspace, shared_target, max_age_days, now)[0]
+    return scan(work_root, workspace, protected_root, max_age_days, now)[0]
 
 
 def is_filesystem_root(path):
     return path == path.parent
 
 
-def validate_arguments(work_root, workspace, shared_target):
+def validate_arguments(work_root, workspace, protected_root):
     """Return a refusal reason, or None when the arguments are safe to act on.
 
     Refused: a work root that is a filesystem root, missing or not a directory;
-    an empty or relative shared target; a shared target neither inside nor
+    an empty or relative protected root; a protected root neither inside nor
     beside the work root (no common ancestor below the filesystem root); a
     workspace that does not resolve inside the work root.
     """
@@ -123,16 +124,16 @@ def validate_arguments(work_root, workspace, shared_target):
         return "work root is a filesystem root"
     if not root.is_dir():
         return "work root is not an existing directory"
-    if not str(shared_target).strip():
-        return "empty shared target"
-    if not Path(shared_target).is_absolute():
-        return "shared target must be an absolute path"
-    shared = resolve(shared_target)
-    if is_filesystem_root(shared):
-        return "shared target is a filesystem root"
-    common = [p for p in root.parents if p in shared.parents or p == shared]
-    if not is_within(shared, root) and not any(not is_filesystem_root(p) for p in common):
-        return "shared target is neither inside nor beside the work root"
+    if not str(protected_root).strip():
+        return "empty protected root"
+    if not Path(protected_root).is_absolute():
+        return "protected root must be an absolute path"
+    protected = resolve(protected_root)
+    if is_filesystem_root(protected):
+        return "protected root is a filesystem root"
+    common = [p for p in root.parents if p in protected.parents or p == protected]
+    if not is_within(protected, root) and not any(not is_filesystem_root(p) for p in common):
+        return "protected root is neither inside nor beside the work root"
     if not is_within(workspace, root):
         return "workspace is not inside the work root"
     return None
@@ -142,7 +143,7 @@ def build_parser():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--work-root", required=True, help="runner _work directory")
     parser.add_argument("--workspace", required=True, help="checkout of this job")
-    parser.add_argument("--shared-target", required=True, help="shared cargo target (never pruned)")
+    parser.add_argument("--protected-root", required=True, help="per-runner cargo target root (never pruned)")
     parser.add_argument("--max-age-days", type=int, default=DEFAULT_MAX_AGE_DAYS)
     parser.add_argument("--dry-run", action="store_true", help="list, delete nothing")
     return parser
@@ -153,18 +154,18 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.max_age_days < 1:
         parser.error("--max-age-days must be >= 1")
-    problem = validate_arguments(args.work_root, args.workspace, args.shared_target)
+    problem = validate_arguments(args.work_root, args.workspace, args.protected_root)
     if problem:
         print("prune_runner_artifacts: refusing: %s" % problem, file=sys.stderr)
         return EXIT_USAGE
     failures = 0
     candidates, skipped = scan(
-        args.work_root, args.workspace, args.shared_target, args.max_age_days, time.time()
+        args.work_root, args.workspace, args.protected_root, args.max_age_days, time.time()
     )
     for link in skipped:
         print("skipped symlink %s" % link)
     for path in candidates:
-        if path.is_symlink() or is_protected(path, args.shared_target):
+        if path.is_symlink() or is_protected(path, args.protected_root):
             continue
         if not is_within(path, args.work_root):
             print("skipped outside root %s" % path)
