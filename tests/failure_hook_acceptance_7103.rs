@@ -3,7 +3,7 @@
 
 //! Ordinary externally linked artifacts must ignore fault controls, in every profile.
 use ai_memory as library;
-#[path = "common/failure_hook_scenarios.rs"]
+#[path = "../src/failure_hook_tests/scenarios.rs"]
 mod scenarios;
 use scenarios::{CLOCK_ENV, FAIL_ENV, TARGET_ID};
 
@@ -70,7 +70,7 @@ fn ordinary_clock_extrema_7106() {
         tokio::runtime::Runtime::new()
             .expect("runtime")
             .block_on(async {
-                scenarios::pg::isolated_clock(0).await;
+                scenarios::pg::fault_pg_isolated_clock(0).await;
             });
         return;
     }
@@ -112,8 +112,8 @@ fn ordinary_artifact_inactive_7103() {
         tokio::runtime::Runtime::new()
             .expect("runtime")
             .block_on(async {
-                scenarios::pg::isolated_capture().await;
-                scenarios::pg::isolated_clock(0).await;
+                scenarios::pg::fault_pg_isolated_capture().await;
+                scenarios::pg::fault_pg_isolated_clock(0).await;
             });
         for auto in [false, true] {
             let conn =

@@ -292,7 +292,7 @@ pub mod pg {
 
     /// CREATE succeeds before any tested operation. The owned random database,
     /// not an ambient name/prefix, establishes isolation even with an unsafe URL.
-    pub async fn create() -> (sqlx::PgPool, String, PostgresStore) {
+    pub async fn fault_pg_create() -> (sqlx::PgPool, String, PostgresStore) {
         let supplied = std::env::var(PG_ENV).expect("native private PG URL required");
         let mut url = reqwest::Url::parse(&supplied).expect("valid PG URL");
         url.set_path("/postgres");
@@ -313,7 +313,7 @@ pub mod pg {
         .await
         .expect("record database ownership");
         assert!(
-            !owned(&admin).await,
+            !fault_pg_owned(&admin).await,
             "administrative database must be refused"
         );
         url.set_path(&format!("/{name}"));
@@ -339,22 +339,25 @@ pub mod pg {
         let store = PostgresStore::connect(url.as_str())
             .await
             .expect("owned store connect");
-        assert!(owned(store.pool()).await, "minted ownership evidence");
+        assert!(
+            fault_pg_owned(store.pool()).await,
+            "minted ownership evidence"
+        );
         (admin, name, store)
     }
 
-    pub async fn owned(pool: &sqlx::PgPool) -> bool {
+    pub async fn fault_pg_owned(pool: &sqlx::PgPool) -> bool {
         sqlx::query_scalar("SELECT COALESCE(shobj_description(oid, 'pg_database') = 'failure-hook-owned:' || datname, false) FROM pg_database WHERE datname = current_database()")
             .fetch_one(pool).await.expect("verify explicit ownership marker")
     }
 
-    pub async fn connect_owned(url: &str) -> PostgresStore {
+    pub async fn fault_pg_connect_owned(url: &str) -> PostgresStore {
         let probe = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
             .connect(url)
             .await
             .expect("ownership probe connection");
-        let permitted = owned(&probe).await;
+        let permitted = fault_pg_owned(&probe).await;
         probe.close().await;
         assert!(
             permitted,
@@ -365,7 +368,7 @@ pub mod pg {
             .expect("owned child store")
     }
 
-    pub async fn cleanup(admin: sqlx::PgPool, name: String, store: PostgresStore) {
+    pub async fn fault_pg_cleanup(admin: sqlx::PgPool, name: String, store: PostgresStore) {
         store.pool().close().await;
         sqlx::query(&format!("DROP DATABASE \"{name}\""))
             .execute(&admin)
@@ -376,37 +379,37 @@ pub mod pg {
 
     /// Join catches assertion panics so the parent can close the pool and drop
     /// the database before propagating a red result (OWNERSHIP-25).
-    pub async fn isolated_clock(offset: i64) {
-        let (admin, name, store) = create().await;
+    pub async fn fault_pg_isolated_clock(offset: i64) {
+        let (admin, name, store) = fault_pg_create().await;
         let child_store = store.clone();
-        let result = tokio::spawn(async move { clock(&child_store, offset).await }).await;
-        cleanup(admin, name, store).await;
+        let result = tokio::spawn(async move { fault_pg_clock(&child_store, offset).await }).await;
+        fault_pg_cleanup(admin, name, store).await;
         result.expect("clock scenario must pass after cleanup");
     }
 
-    pub async fn isolated_capture() {
-        let (admin, name, store) = create().await;
+    pub async fn fault_pg_isolated_capture() {
+        let (admin, name, store) = fault_pg_create().await;
         let child_store = store.clone();
         let result = tokio::spawn(async move {
-            capture(&child_store, TARGET_ID)
+            fault_pg_capture(&child_store, TARGET_ID)
                 .await
                 .expect("ordinary PG capture");
-            assert_eq!(counts(&child_store).await, (1, 1, 1));
-            stamps(&child_store, TARGET_ID).await;
+            assert_eq!(fault_pg_counts(&child_store).await, (1, 1, 1));
+            fault_pg_stamps(&child_store, TARGET_ID).await;
         })
         .await;
-        cleanup(admin, name, store).await;
+        fault_pg_cleanup(admin, name, store).await;
         result.expect("capture scenario must pass after cleanup");
     }
 
-    pub async fn counts(store: &PostgresStore) -> (i64, i64, i64) {
+    pub async fn fault_pg_counts(store: &PostgresStore) -> (i64, i64, i64) {
         sqlx::query_as(SQL_COUNTS)
             .fetch_one(store.pool())
             .await
             .expect("PG snapshot")
     }
 
-    pub async fn snapshot(store: &PostgresStore) -> Vec<String> {
+    pub async fn fault_pg_snapshot(store: &PostgresStore) -> Vec<String> {
         let mut snapshot = Vec::new();
         for sql in [
             "SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY id)::text, '[]') FROM memories t",
@@ -423,7 +426,7 @@ pub mod pg {
         snapshot
     }
 
-    pub async fn capture(
+    pub async fn fault_pg_capture(
         store: &PostgresStore,
         id: &str,
     ) -> Result<(), library::store::StoreError> {
@@ -433,7 +436,7 @@ pub mod pg {
             .map(|_| ())
     }
 
-    pub async fn stamps(store: &PostgresStore, id: &str) {
+    pub async fn fault_pg_stamps(store: &PostgresStore, id: &str) {
         let memory = store
             .get(&CallerContext::for_agent(AGENT), id)
             .await
@@ -447,7 +450,7 @@ pub mod pg {
         assert_stamps(&memory.created_at, &memory.updated_at, &signed.to_rfc3339());
     }
 
-    pub async fn clock(store: &PostgresStore, offset: i64) {
+    pub async fn fault_pg_clock(store: &PostgresStore, offset: i64) {
         library::config::set_append_only(true);
         let ctx = CallerContext::for_agent(AGENT);
         let rows = clock_rows();
@@ -495,10 +498,10 @@ pub mod pg {
             assert_eq!(present, expected.contains(&memory.id));
         }
         gc_stamps(store, removed).await;
-        capture(store, "healthy-clock-write")
+        fault_pg_capture(store, "healthy-clock-write")
             .await
             .expect("PG write under offset");
-        stamps(store, "healthy-clock-write").await;
+        fault_pg_stamps(store, "healthy-clock-write").await;
     }
 
     async fn gc_stamps(store: &PostgresStore, archived: usize) {
