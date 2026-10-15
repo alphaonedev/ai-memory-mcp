@@ -20,12 +20,18 @@ after another. With the lane on (flag `1`, kill switch not `1`, tier
 1. **Configure** runs `pg_isolated_binary.py setup --emit-env`. It checks the
    live connection budget: `max_connections` minus the reserved slots minus the
    sessions open right now (`pg_stat_activity`) must cover
-   `jobs * (18 + 1) + 20` (172 for width 8), or the step fails. It builds
-   `<CI_FED_DB>_tpl` with the `age` and `vector` extensions and marks it
-   `IS_TEMPLATE true ALLOW_CONNECTIONS false`, so `CREATE DATABASE ... TEMPLATE`
-   only hits SQLSTATE 55006 under a stray session, which the mint retries. It
-   exports `AI_MEMORY_TEST_PG_TEMPLATE` and `AI_MEMORY_TEST_PG_RUN_ID` to
-   `$GITHUB_ENV`.
+   `jobs * (18 + 1) + 20` (172 for width 8), or the step fails. By default it
+   mints its own base `ci_base_<pid>_<unix seconds>_<8 hex>` and marks the
+   family ACTIVE (a JSON database COMMENT naming the base, its OID and the
+   run). It builds `<base>_tpl` with the `age` and `vector` extensions and
+   marks it `IS_TEMPLATE true ALLOW_CONNECTIONS false`, so
+   `CREATE DATABASE ... TEMPLATE` only hits SQLSTATE 55006 under a stray
+   session, which the mint retries. If `setup` fails or is terminated by
+   SIGTERM before the marker is written, it drops the base it minted. It
+   emits `AI_MEMORY_TEST_PG_TEMPLATE`, `AI_MEMORY_TEST_PG_RUN_ID` and
+   `AI_MEMORY_TEST_PG_BASE` for `$GITHUB_ENV`. Masked mode (the default) does not emit
+   `AI_MEMORY_TEST_POSTGRES_URL`, because a URL with a masked password cannot
+   authenticate a later `teardown`; `--emit-env-unmasked` emits it.
 2. **Run.** The test step fails with `::error::` when the lane is on but the
    template or run id is missing; it never skips. `run_isolated_lane` prebuilds
    only the targets in `iso_targets.txt`, then calls
