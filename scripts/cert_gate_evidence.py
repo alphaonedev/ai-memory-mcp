@@ -44,31 +44,43 @@ _STRONG_NAMES = (
 # Weak names are common words: match only as a whole word (or `_.-` delimited
 # part of a key), and with a whitespace separator only when the value is 8+ chars.
 _WEAK_NAMES = r"pass|pwd|auth|session|sessionid|session_id|cookie|csrf"
-_VALUE = r"(\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|\S+)"
+# A value is, in order: an escaped-quote value (backslash-quote ... backslash-quote, the
+# Rust Debug / JSON-in-string shape), a double-quoted value, a single-quoted value, or a
+# bare token. A quoted value whose closing quote is missing runs to the end of the line
+# (the closer is optional).
+_ESC_Q = r"\\*[\"']"
+_VALUE = (
+    r"(\\\"(?:[^\\]|\\(?!\"))*(?:\\\")?"
+    r"|\"(?:[^\"\\]|\\.)*\"?"
+    r"|'(?:[^'\\]|\\.)*'?"
+    r"|\S+)"
+)
 # Shape 1 (strong name): ``k=v``, ``"k": "v"``, ``--passphrase v``, ``--passphrase=v``,
-# ``secret key: v`` and ``token v``; a quoted value runs to the closing UNESCAPED quote.
+# ``secret key: v``, ``token v`` and list renders (``["--passphrase", "v"]``, Rust ``{:?}`` / repr); a quoted value runs to the closing UNESCAPED quote.
 SECRET_KEY_VALUE = re.compile(
     r"(?i)(?<![a-z0-9])([a-z0-9_.-]*"
     r"(?:" + _STRONG_NAMES + r")"
     r"(?:[ _.-]?(?:key|b64|hex|value|id))?[a-z0-9_.-]*)"
-    r"([\"']?(?:\s*[:=]\s*|\s+))" + _VALUE
+    r"((?:" + _ESC_Q + r")\s*,\s*|(?:" + _ESC_Q + r")?(?:\s*[:=]\s*|\s+))" + _VALUE
 )
 # Shape 2 (weak name, ``:`` or ``=`` separator): ``session=v``, ``cookie: v``, ``AI_X_PASS=v``.
 WEAK_KEY_VALUE = re.compile(
     r"(?i)(?<![a-z0-9])((?:[a-z0-9_.-]*[_.-])?(?:" + _WEAK_NAMES + r")(?:[_.-][a-z0-9_.-]*)?)(?![a-z0-9])"
-    r"([\"']?\s*[:=]\s*)" + _VALUE
+    r"((?:" + _ESC_Q + r")?\s*[:=]\s*)" + _VALUE
 )
 # Shape 3 (weak name, whitespace separator): only a value of 8+ chars is masked.
 WEAK_KEY_SPACE = re.compile(
     r"(?i)(?<![a-z0-9])((?:[a-z0-9_.-]*[_.-])?(?:" + _WEAK_NAMES + r")(?:[_.-][a-z0-9_.-]*)?)(?![a-z0-9])"
-    r"([\"']?\s+)(\S{8,})"
+    r"((?:" + _ESC_Q + r")?\s+)(\S{8,})"
 )
 # Name test for a decoded JSON key (strong substring or weak whole word).
 JSON_KEY_NAME = re.compile(
     r"(?i)(?:" + _STRONG_NAMES + r")|(?<![a-z0-9])(?:" + _WEAK_NAMES + r")(?![a-z0-9])"
 )
 # Shape 4: ``Authorization: <anything to end of line>`` and ``Bearer <tok>``.
-AUTHORIZATION = re.compile(r"(?i)(authorization[\"']?\s*[:=]\s*).*")
+AUTHORIZATION = re.compile(r"(?i)(authorization(?:" + _ESC_Q + r")?\s*[:=]\s*).*")
+# Shape 4b: ``Cookie:`` / ``Set-Cookie:`` header, masked to the end of the line (every pair).
+COOKIE_HEADER = re.compile(r"(?i)(?<![a-z0-9])((?:set-)?cookie2?(?:" + _ESC_Q + r")?\s*[:=]\s*).*")
 BEARER = re.compile(r"(?i)\b(bearer\s+)\S+")
 # Shape 5: well-known API token prefixes.
 TOKEN_SHAPES = re.compile(r"\b(?:ghp_|gho_|ghs_|github_pat_|sk-)[A-Za-z0-9_\-]{8,}")
@@ -76,13 +88,17 @@ TOKEN_SHAPES = re.compile(r"\b(?:ghp_|gho_|ghs_|github_pat_|sk-)[A-Za-z0-9_\-]{8
 # ``@`` or ``/`` in the password stays inside the mask).
 URL_CREDENTIALS = re.compile(r"(://)\S*@")
 # Shape 7: 64+ hex chars (32-byte key or digest). Shape 8: base64 / base64url
-# runs of 32+ chars (a 24-byte key encodes to 32), except an exact 40-hex git sha
-# and a lowercase filesystem path with 2+ slashes.
+# runs of 32+ chars (a 24-byte key encodes to 32), except an exact 40-hex git sha.
 LONG_HEX = re.compile(r"(?<![0-9A-Za-z])[0-9a-fA-F]{64,}(?![0-9A-Za-z])")
 LONG_B64 = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{32,}={0,2}")
 GIT_SHA = re.compile(r"[0-9a-f]{40}")
-PATH_RUN = re.compile(r"[a-z0-9/_-]+")
-MIN_PATH_SLASHES = 2
+# Shape 8b: an absolute path under a well-known filesystem root stays readable, but
+# every ``/`` segment is still checked on its own (a 32+ base64 run that is not exactly
+# a 40-hex sha, or 64+ hex, is masked). Any other slash run (URL path, bare ``a/b/c``)
+# gets no exemption.
+PATH_ROOTS = "home|srv|usr|var|opt|mnt|etc|tmp|root|run|lib|bin|sbin|github|runner|workspace|ai-scratch"
+ABS_PATH = re.compile(r"(?<![A-Za-z0-9+/_.=-])(/(?:" + PATH_ROOTS + r")(?:/[A-Za-z0-9._+=-]*)*)")
+PATH_SENTINEL = "\x00PATH%d\x00"
 # Shape 9: ``\u00XX`` escapes that decode to a key-name character (alnum, ``_.- ``).
 KEY_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
 # Public-key allowlist: a line starting with one of these keys keeps ONLY that
@@ -90,7 +106,9 @@ KEY_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
 PUBLIC_KEY_LINE = re.compile(
     r"(?i)^\s*[\"']?(?:pub_b64|pub_hex|pubkey|public_key|public_key_b64|public_key_hex)[\"']?\s*[:=]\s*"
 )
-PUBLIC_VALUE = re.compile(_VALUE)
+# Only the key alphabet is exempt: a quoted or bare run of ``[A-Za-z0-9+/=_-]``, so
+# ``pub_b64=<pk>;signing_key=<s>`` and ``pub_b64=<pk>,<s>`` keep only the public key.
+PUBLIC_VALUE = re.compile(r"\"[A-Za-z0-9+/=_-]*\"|'[A-Za-z0-9+/=_-]*'|[A-Za-z0-9+/=_-]+")
 PUBLIC_SENTINEL = "\x00PUBVAL\x00"
 # Evidence files that may carry connection settings: never copied or uploaded.
 EXCLUDED_PREFIXES = ("pg-posture-", "driverless-posture-")
@@ -131,9 +149,22 @@ def _b64_sub(m: "re.Match") -> str:
     run = m.group(0)
     if GIT_SHA.fullmatch(run):
         return run
-    if PATH_RUN.fullmatch(run) and run.count("/") >= MIN_PATH_SLASHES:
-        return run
     return REDACTED
+
+
+def _mask_segment(seg: str) -> str:
+    """Mask one path segment: 64+ hex or a 32+ base64 run that is not an exact 40-hex sha."""
+    return LONG_B64.sub(_b64_sub, LONG_HEX.sub(REDACTED, seg))
+
+
+def _path_sub(found: List[str]):
+    """Substitution that stashes a segment-checked absolute path behind a sentinel."""
+
+    def sub(m: "re.Match") -> str:
+        found.append("/".join(_mask_segment(seg) for seg in m.group(1).split("/")))
+        return PATH_SENTINEL % (len(found) - 1)
+
+    return sub
 
 
 class Redactor:
@@ -168,14 +199,19 @@ class Redactor:
                 pub_value = val.group(0)
                 text = text[: val.start()] + PUBLIC_SENTINEL + text[val.end():]
         out = AUTHORIZATION.sub(lambda m: m.group(1) + REDACTED, text)
+        out = COOKIE_HEADER.sub(lambda m: m.group(1) + REDACTED, out)
         out = BEARER.sub(lambda m: m.group(1) + REDACTED, out)
         out = SECRET_KEY_VALUE.sub(lambda m: m.group(1) + m.group(2) + REDACTED, out)
         out = WEAK_KEY_VALUE.sub(lambda m: m.group(1) + m.group(2) + REDACTED, out)
         out = WEAK_KEY_SPACE.sub(lambda m: m.group(1) + m.group(2) + REDACTED, out)
         out = TOKEN_SHAPES.sub(REDACTED, out)
         out = URL_CREDENTIALS.sub(lambda m: m.group(1) + REDACTED + "@", out)
+        paths: List[str] = []
+        out = ABS_PATH.sub(_path_sub(paths), out)
         out = LONG_HEX.sub(REDACTED, out)
         out = LONG_B64.sub(_b64_sub, out)
+        for i, kept in enumerate(paths):
+            out = out.replace(PATH_SENTINEL % i, kept)
         if pub_value is not None:
             out = out.replace(PUBLIC_SENTINEL, pub_value)
         return out

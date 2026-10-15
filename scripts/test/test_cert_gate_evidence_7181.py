@@ -332,6 +332,96 @@ class RedactorRound3(unittest.TestCase):
                          "path /srv/work/app/target/x")
 
 
+class RedactorRound4(unittest.TestCase):
+    """r4 (F1-r3): one test per leaked shape; every secret is built at runtime."""
+
+    S = "Qx7Kp2" + "Lm9Zr4Tv8Wy3Bn6Hc1Dj5Fg0AaZ"
+    BQ = "\\" + '"'
+
+    def _red(self, line):
+        return _load_helper().redact_line(line)
+
+    def test_a_cookie_multi_pair_masked_to_end_of_line(self):
+        s2 = "Uv3" + "Wx5Yz7Ab9Cd1Ef"
+        out = self._red("Cookie: sid=%s; uid=%s; k=%s" % (self.S, s2, self.S))
+        for sec in (self.S, s2):
+            self.assertNotIn(sec, out)
+        out = self._red("Set-Cookie: sid=%s; Path=/; k=%s" % (self.S, s2))
+        self.assertNotIn(self.S, out)
+        self.assertNotIn(s2, out)
+
+    def test_c_rust_debug_nested_json_passphrase(self):
+        b = self.BQ
+        out = self._red('Error: "{%spassphrase%s: %s%s%s}"' % (b, b, b, self.S, b))
+        self.assertNotIn(self.S, out)
+        self.assertIn(_load_helper().REDACTED, out)
+
+    def test_c_rust_debug_nested_json_db_password_no_space(self):
+        b = self.BQ
+        out = self._red('body="{%sdb_password%s:%s%s%s}"' % (b, b, b, self.S, b))
+        self.assertNotIn(self.S, out)
+
+    def test_c_unterminated_quoted_value_runs_to_end_of_line(self):
+        tail = "Ta1l" + "Secret88"
+        out = self._red('password: "%s %s' % (self.S, tail))
+        self.assertNotIn(self.S, out)
+        self.assertNotIn(tail, out)
+
+    def test_a_flag_named_secret_in_list_render(self):
+        flag = "--pass" + "phrase"
+        short = "Tr0ub" + "4dor" + "x9Qz"
+        for q in ('"', "'"):
+            out = self._red("argv: [%s%s%s, %s%s%s]" % (q, flag, q, q, short, q))
+            self.assertNotIn(short, out, q)
+        out = self._red("args=[%s, %s]" % ('"' + flag + '"', '"' + short + '"'))
+        self.assertNotIn(short, out)
+
+    def test_e_lowercase_32_with_two_slashes_masked(self):
+        run = "abcdefghij/klmnopqrst/uvwxyzabcd"
+        self.assertEqual(len(run), 32)
+        self.assertNotIn(run, self._red("x " + run))
+
+    def test_e_48hex_token_inside_absolute_path_masked(self):
+        tok = "ab12" * 12
+        self.assertNotIn(tok, self._red("loaded /srv/hooks/" + tok))
+
+    def test_e_32hex_token_inside_url_path_masked(self):
+        tok = "cd34" * 8
+        self.assertNotIn(tok, self._red("POST https://hooks.example.net/v1/hook/" + tok))
+
+    def test_e_long_readable_key_dir_path_unchanged(self):
+        ln = "key_dir: /home/runner/work/ai-memory-mcp/ai-memory-mcp/.local-runs/cert-bootstrap-evidence/witness/keys"
+        self.assertEqual(self._red(ln), ln)
+
+    def test_f_secret_joined_to_public_key_by_semicolon(self):
+        pk = "AAAA" * 11
+        out = self._red("pub_b" + "64=" + pk + ";signing_" + "key=" + self.S)
+        self.assertIn(pk, out)
+        self.assertNotIn(self.S, out)
+
+    def test_f_secret_joined_to_public_key_by_comma(self):
+        pk = "AAAA" * 11
+        out = self._red("pub_b" + "64=" + pk + "," + self.S)
+        self.assertIn(pk, out)
+        self.assertNotIn(self.S, out)
+
+    def test_finalize_path_masks_rust_debug_escaped_json(self):
+        mod = _load_helper()
+        b = self.BQ
+        with _scratch() as td:
+            ev = Path(td) / "ev"
+            ev.mkdir()
+            line = 'Error: "{%spassphrase%s: %s%s%s}"' % (b, b, b, self.S, b)
+            (ev / "bring-up.out").write_text(line + "\n", encoding="utf-8")
+            state = Path(td) / "state"
+            state.mkdir()
+            (state / "fail-rows").write_text("B\tprobe\n", encoding="utf-8")
+            buf = io.StringIO()
+            self.assertEqual(mod.finalize(state, ev, TAIL_LINES, buf), 0)
+        self.assertNotIn(self.S, buf.getvalue())
+        self.assertIn(mod.REDACTED, buf.getvalue())
+
+
 class GateScriptPins(unittest.TestCase):
     def test_witness_recorder_generate_is_sandboxed_and_not_silenced(self):
         leg_b = _leg_b_text()
