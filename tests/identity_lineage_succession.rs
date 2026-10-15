@@ -89,10 +89,17 @@ fn kp(label: &str) -> AgentKeypair {
 
 /// Key directory for the cells that `keypair::save` into (#3198 gate).
 fn key_dir() -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix("lineage-keys-")
-        .tempdir()
-        .expect("key dir")
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("lineage-keys-");
+    // #7158 / #7161 — the directory must satisfy the #3198 key-directory gate
+    // whatever the process umask, so the mode is set on the builder and the
+    // directory never exists in a umask-derived mode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().expect("key dir")
 }
 
 /// #7158 / #7161 — the key fixture directory is private whatever the process
