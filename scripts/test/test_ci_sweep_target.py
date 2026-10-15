@@ -96,14 +96,14 @@ class SweepTests(SweepTestCase):
         outside = self.root / "elsewhere" / "target"
         victim = outside / "debug" / "deps" / "a.rlib"
         write_blob(victim)
-        res = self.run_sweep("--max-bytes", "0", target=outside)
+        res = self.run_sweep("--max-bytes", "1", target=outside)
         self.assertEqual(res.returncode, EXIT_REFUSED)
         self.assertIn(str(outside), res.stderr)
         self.assertTrue(victim.exists())
 
     def test_refuses_without_workspace_env(self):
         victim = self.make_entries(1)[0]
-        res = self.run_sweep("--max-bytes", "0", workspace=False)
+        res = self.run_sweep("--max-bytes", "1", workspace=False)
         self.assertEqual(res.returncode, EXIT_REFUSED)
         self.assertTrue(victim.exists())
 
@@ -111,13 +111,13 @@ class SweepTests(SweepTestCase):
         outside = self.root / "elsewhere" / "target"
         victim = outside / "debug" / "deps" / "a.rlib"
         write_blob(victim)
-        res = self.run_sweep("--max-bytes", "0", "--allow-root", target=outside)
+        res = self.run_sweep("--max-bytes", "1", "--allow-root", target=outside)
         self.assertEqual(res.returncode, EXIT_OK, res.stderr)
         self.assertFalse(victim.exists())
 
     def test_dry_run_removes_nothing(self):
         paths = self.make_entries(4)
-        res = self.run_sweep("--max-bytes", "0", "--dry-run")
+        res = self.run_sweep("--max-bytes", "1", "--dry-run")
         self.assertEqual(res.returncode, EXIT_OK, res.stderr)
         self.assertTrue(all(p.exists() for p in paths))
         self.assertIn("removed=4", res.stdout)
@@ -131,7 +131,7 @@ class SweepTests(SweepTestCase):
         link.parent.mkdir(parents=True, exist_ok=True)
         link.symlink_to(outside, target_is_directory=True)
         set_age(link, 0)
-        res = self.run_sweep("--max-bytes", "0")
+        res = self.run_sweep("--max-bytes", "1")
         self.assertEqual(res.returncode, EXIT_OK, res.stderr)
         self.assertFalse(link.is_symlink())
         self.assertTrue(keep.exists())
@@ -205,7 +205,7 @@ class SweepTests(SweepTestCase):
         ]
         for path in bystanders:
             write_blob(path)
-        res = self.run_sweep("--max-bytes", "0")
+        res = self.run_sweep("--max-bytes", "1")
         self.assertEqual(res.returncode, EXIT_OK, res.stderr)
         self.assertFalse(any(p.exists() for p in swept))
         self.assertTrue(all(p.exists() for p in bystanders))
