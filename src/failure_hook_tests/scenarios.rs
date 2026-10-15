@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 use super::library;
+use super::library::cli::commands::capture_turn::HOST_KIND_CLAUDE_CODE;
 use super::library::models::{CaptureTurnWrite, Memory, Tier, default_metadata};
 use chrono::{Duration, Utc};
 
@@ -18,6 +19,7 @@ pub const NEEDLE: &str = "clockprobe";
 pub const LIMIT: usize = 20;
 const EMBEDDING_DIM: usize = 384;
 const SPACE: &str = "failure-hook-fixture-space";
+const HEALTHY_CLOCK_WRITE: &str = "healthy-clock-write";
 const SQL_COUNTS: &str = "SELECT (SELECT COUNT(*) FROM memories), (SELECT COUNT(*) FROM transcript_line_dedup), (SELECT COUNT(*) FROM signed_events)";
 
 pub fn capture_write(id: &str) -> CaptureTurnWrite {
@@ -40,7 +42,7 @@ pub fn capture_write(id: &str) -> CaptureTurnWrite {
             ..Memory::default()
         },
         sha256: sha.clone(),
-        host_kind: "claude-code".into(),
+        host_kind: HOST_KIND_CLAUDE_CODE.into(),
         host_session_id: id.into(),
         host_turn_index: 0,
         recovered_at_ms: Utc::now().timestamp_millis(),
@@ -252,8 +254,8 @@ pub fn sqlite_clock(offset: i64) {
         );
     }
     sqlite_gc_stamps(&conn, removed);
-    sqlite_capture(&conn, "healthy-clock-write", false).expect("write under clock offset");
-    sqlite_stamps(&conn, "healthy-clock-write");
+    sqlite_capture(&conn, HEALTHY_CLOCK_WRITE, false).expect("write under clock offset");
+    sqlite_stamps(&conn, HEALTHY_CLOCK_WRITE);
 }
 
 fn sqlite_gc_stamps(conn: &rusqlite::Connection, archived: usize) {
@@ -498,10 +500,10 @@ pub mod pg {
             assert_eq!(present, expected.contains(&memory.id));
         }
         gc_stamps(store, removed).await;
-        fault_pg_capture(store, "healthy-clock-write")
+        fault_pg_capture(store, HEALTHY_CLOCK_WRITE)
             .await
             .expect("PG write under offset");
-        fault_pg_stamps(store, "healthy-clock-write").await;
+        fault_pg_stamps(store, HEALTHY_CLOCK_WRITE).await;
     }
 
     async fn gc_stamps(store: &PostgresStore, archived: usize) {
