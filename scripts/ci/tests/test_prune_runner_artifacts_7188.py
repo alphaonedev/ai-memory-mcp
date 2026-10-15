@@ -16,7 +16,7 @@ import shutil
 import sys
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -118,6 +118,84 @@ class Cli(Fixture):
             with redirect_stdout(io.StringIO()):
                 prune.main(["--max-age-days", "0"])
         self.assertEqual(ctx.exception.code, 2)
+
+
+class Arguments(Fixture):
+    """r1 MEDIUM-3: refuse unsafe arguments with EXIT_USAGE and delete nothing."""
+
+    def run_with(self, work=None, workspace=None, shared=None):
+        argv = [
+            "--work-root", str(self.work if work is None else work),
+            "--workspace", str(self.workspace if workspace is None else workspace),
+            "--shared-target", str(self.shared if shared is None else shared),
+        ]
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = prune.main(argv)
+        return rc, err.getvalue()
+
+    def assert_refused(self, rc):
+        self.assertEqual(rc, prune.EXIT_USAGE)
+        self.assertEqual(prune.EXIT_USAGE, 2)
+        self.assertTrue(self.old_tmp.exists())
+        self.assertTrue(self.ws_incr.exists())
+        self.assertTrue(self.ws_tmp.exists())
+
+    def test_filesystem_root_is_refused(self):
+        rc, _ = self.run_with(work="/")
+        self.assert_refused(rc)
+
+    def test_missing_root_is_refused(self):
+        rc, _ = self.run_with(work=SCRATCH / "no-such-root")
+        self.assert_refused(rc)
+
+    def test_root_that_is_a_file_is_refused(self):
+        plain = SCRATCH / "plain-file"
+        plain.write_text("x", encoding="utf-8")
+        rc, _ = self.run_with(work=plain)
+        self.assert_refused(rc)
+
+    def test_empty_shared_target_is_refused(self):
+        rc, _ = self.run_with(shared="")
+        self.assert_refused(rc)
+
+    def test_missing_shared_target_option_is_refused(self):
+        with self.assertRaises(SystemExit) as ctx:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                prune.main(["--work-root", str(self.work), "--workspace", str(self.workspace)])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertTrue(self.old_tmp.exists())
+
+    def test_shared_target_neither_inside_nor_beside_the_root_is_refused(self):
+        rc, _ = self.run_with(shared="/opt/ci-cargo-target")
+        self.assert_refused(rc)
+
+    def test_relative_shared_target_is_refused(self):
+        rc, _ = self.run_with(shared="cargo-target")
+        self.assert_refused(rc)
+
+    def test_workspace_outside_the_root_is_refused(self):
+        outside = touch_dir(SCRATCH / "elsewhere" / "ws")
+        touch_dir(outside / "target" / "debug" / "incremental")
+        rc, _ = self.run_with(workspace=outside)
+        self.assert_refused(rc)
+        self.assertTrue((outside / "target" / "debug" / "incremental" / "f").exists())
+
+    def test_shared_target_inside_the_root_is_accepted(self):
+        rc, _ = self.run_with(shared=self.work / "shared-target")
+        self.assertEqual(rc, 0)
+        self.assertFalse(self.old_tmp.exists())
+
+    def test_dry_run_still_previews_with_valid_arguments(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = prune.main(
+                ["--work-root", str(self.work), "--workspace", str(self.workspace),
+                 "--shared-target", str(self.shared), "--dry-run"]
+            )
+        self.assertEqual(rc, 0)
+        self.assertIn("would remove", out.getvalue())
+        self.assertTrue(self.old_tmp.exists())
 
 
 class Symlinks(Fixture):
