@@ -183,7 +183,7 @@ RULES = (
     ('R9', re.compile(r'^\s*\\(c|connect)\s+["\']?' + DB + NOT_NAME_CONT, re.IGNORECASE).search),
 )  # type: Tuple[Tuple[str, LinePredicate], ...]
 R8_SUPPRESSED_BY = ('R2', 'R3')
-BACKTICK_LITERAL = re.compile('`' + DB + '`', re.IGNORECASE).search  # an R6 form outside prose files
+BACKTICK_LITERAL = re.compile('(?<!`)`' + DB + '`(?!`)', re.IGNORECASE).search  # an R6 form outside prose files
 PROSE_SUFFIXES = frozenset({'.md', '.markdown'})
 
 
