@@ -179,3 +179,20 @@ scripts/reproduce-recursive-learning.sh
 The full conceptual primer lives at `docs/RECURSIVE_LEARNING.md`; the
 release-notes intro lives under `docs/v0.7.0/release-notes.md`
 §"Substrate-native recursive refinement".
+
+## Self-hosted runner host budget (#7188)
+
+The `Check (linux-fed,enterprise-fed)` job compiles every integration test binary with
+`--features sal-postgres`; an unshared per-runner `target/` measured ~166 GiB. All
+linux-fed enterprise-fed jobs on a host now build into ONE shared `CARGO_TARGET_DIR`
+(`~/.cache/ai-memory-ci/cargo-target`, defined in `scripts/ci/shared_cargo_target.py`;
+cargo's build-directory lock serialises compilation, tests still run in parallel), so
+the footprint is one target per host, not one per runner. Size the host with:
+
+    runners per host = floor((disk - fixed - lanes - headroom) / 166 GiB)
+
+where `disk` is the root disk, `fixed` the non-CI usage (databases, services), `lanes`
+the agent-lane cargo targets and `headroom` the free-space floor. Example, f2: 912 GiB
+disk - ~400 GiB fixed leaves ~512 GiB before lanes and headroom, which is 3 unshared
+targets at most and was the cause of two ENOSPC incidents on 2026-10-15. After each job
+`scripts/ci/prune_runner_artifacts.py` prunes stale scratch (never the shared target).
