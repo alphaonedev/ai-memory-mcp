@@ -701,7 +701,7 @@ class MainRun(unittest.TestCase):
 class SharedBaseRefusal7031(unittest.TestCase):
     """#7031 H1: setup refuses a shared base; mints an ephemeral one by default."""
 
-    SHARED = 'postgres://u:pw@127.0.0.1:5445/ai_memory_test'
+    SHARED = 'postgres://u:pw@127.0.0.1:5445/' + pib.SHARED_BASE_DB
 
     def run_main(self, argv, env=None):
         import io
