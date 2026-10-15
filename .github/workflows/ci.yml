@@ -144,6 +144,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # #7160 - size cap for the persistent self-hosted target/debug build state
+  # (40 GiB); scripts/ci-sweep-target.py reads it via the sweep step below.
+  SELF_HOSTED_TARGET_CAP_BYTES: 42949672960
   # #3128 — EXPLICIT, not inherited. `Swatinem/rust-cache` is what used to export
   # CARGO_INCREMENTAL=0, and it is now skipped on the self-hosted fleet (see the
   # rust-cache guards below), so the value must be declared here. Incremental
@@ -1973,6 +1976,12 @@ jobs:
       - name: Prune stale runner artifacts (#7188)
         if: always() && matrix.shared_target && needs.classify.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: python3 scripts/ci/prune_runner_artifacts.py --work-root "$RUNNER_WORKSPACE/.." --workspace "$GITHUB_WORKSPACE" --protected-root "$AI_MEMORY_CI_TARGET_ROOT"
+
+      # #7160 - cap the persistent self-hosted target/debug (workspace-local,
+      # oldest-mtime first). Last step so it never races a running build.
+      - name: Sweep target/debug to the size cap (self-hosted)
+        if: always() && runner.environment == 'self-hosted'
+        run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
 
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
   #
