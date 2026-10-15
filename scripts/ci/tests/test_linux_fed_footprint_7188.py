@@ -7,8 +7,8 @@ Four properties, read from the repository text (stdlib only, Python 3.9+; the
 workflow and Cargo.toml are parsed by line because PyYAML and ``tomllib`` are
 not guaranteed on every node):
 
-  (a) the self-hosted linux-fed enterprise-fed matrix leg opts in to ONE shared
-      per-host ``CARGO_TARGET_DIR`` (a matrix flag + one helper step); the
+  (a) the self-hosted linux-fed enterprise-fed matrix leg opts in to a PER-RUNNER
+      ``CARGO_TARGET_DIR`` (a matrix flag + one helper step); the
       hosted and macOS legs do not;
   (b) the dev profile strips debuginfo from dependencies;
   (c) a post-job prune step runs ``if: always()`` on the opted-in leg and the
@@ -87,6 +87,8 @@ class SharedTargetLeg(unittest.TestCase):
         job = "\n".join(active(check_job_lines()))
         self.assertIn(SHARED_HELPER + " --github-env", job)
         self.assertRegex(job, r"if:[^\n]*&& matrix\.%s\b" % SHARED_FLAG)
+        self.assertIn('--runner-name "${{ runner.name }}"', job)
+        self.assertNotIn("touch_workspace_sources", job)
 
     def test_no_literal_target_dir_in_the_job(self):
         job = "\n".join(active(check_job_lines()))
@@ -100,8 +102,9 @@ class SharedTargetLeg(unittest.TestCase):
             import shared_cargo_target as mod
         finally:
             sys.path.pop(0)
-        path = mod.shared_target_dir(Path("/home/runner-user"))
+        path = mod.runner_target_dir(Path("/home/runner-user"), "linux-fed-1")
         self.assertEqual(path.parts[:3], ("/", "home", "runner-user"))
+        self.assertEqual(path.name, "linux-fed-1")
         for banned in ("/tmp", "/var/tmp", "/dev/shm"):
             self.assertFalse(str(path).startswith(banned))
 

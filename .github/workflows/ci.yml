@@ -708,10 +708,9 @@ jobs:
       # never wait on each other while a fourth leg cannot pile on. N = 3 and
       # not lower because a lower cap would serialise the macOS legs behind the
       # hosted sqlite leg (~75 min) with no benefit to the f2 disk. The host-level
-      # bound lives elsewhere: every linux-fed enterprise-fed job builds into ONE
-      # shared CARGO_TARGET_DIR (below), where cargo's build-directory lock lets
-      # exactly one compile run per host while tests run in parallel afterwards,
-      # so concurrent runs cost one target instead of one 166 GiB target each.
+      # bound lives elsewhere: every linux-fed enterprise-fed job builds into the
+      # PER-RUNNER CARGO_TARGET_DIR of the runner it runs on (below), so a target
+      # has exactly one writer and compiles once across that runner's jobs.
       # A cross-run `concurrency` group is deliberately NOT used: GitHub replaces
       # a PENDING run in a group, which would silently cancel a required check.
       max-parallel: 3
@@ -858,25 +857,19 @@ jobs:
         if: needs.classify.outputs.docs_only == 'true'
         run: echo "::notice::docs-only PR — ${{ matrix.leg }} matrix leg is a no-op"
 
-      # #7188 - ONE shared per-host CARGO_TARGET_DIR for every self-hosted
-      # linux-fed enterprise-fed job: outside the checkout (checkout cleaning
-      # cannot wipe it), under the runner user's home (per host), never a tmp
-      # path. The path is defined once, in scripts/ci/shared_cargo_target.py.
-      # cargo's build-directory lock serialises compilation into it; tests still
-      # run in parallel after the build and the dependency cache stays warm
-      # across PRs. Self-hosted legs only (matrix.shared_target).
-      - name: Shared per-host cargo target (#7188)
+      # #7188 - PER-RUNNER CARGO_TARGET_DIR for the self-hosted linux-fed
+      # enterprise-fed job: ~/.cache/ai-memory-ci/cargo-target/<runner name>,
+      # outside the checkout (checkout cleaning cannot wipe it), under the runner
+      # user's home, never a tmp path. A target with exactly one writer cannot
+      # have one PR's test binary replaced by another PR's build (cargo releases
+      # its build lock before it runs test binaries), and the cache stays warm
+      # for that runner's later jobs. runner.name is assigned by the runner, not
+      # by the PR; the helper fails closed on a missing or unsafe name. The path
+      # root is defined once, in scripts/ci/shared_cargo_target.py.
+      # Self-hosted legs only (matrix.shared_target).
+      - name: Per-runner cargo target (#7188)
         if: needs.classify.outputs.docs_only != 'true' && matrix.shared_target
-        run: python3 scripts/ci/shared_cargo_target.py --github-env "$GITHUB_ENV"
-
-      # #7188 - cargo judges workspace crates fresh by source mtime versus the
-      # artifact mtime, so a checkout older than another PR's build would link
-      # that PR's compiled code out of the shared target. Date every tracked
-      # file ahead of any artifact so workspace crates always rebuild here;
-      # registry/git dependencies keep their cached artifacts.
-      - name: Rebuild workspace crates for this checkout (#7188)
-        if: needs.classify.outputs.docs_only != 'true' && matrix.shared_target
-        run: python3 scripts/ci/touch_workspace_sources.py --root "$GITHUB_WORKSPACE"
+        run: python3 scripts/ci/shared_cargo_target.py --github-env "$GITHUB_ENV" --runner-name "${{ runner.name }}"
 
       # #2452 — tests/conformance_readers.rs is FAIL-CLOSED: an absent
       # python3/node is a test FAILURE, not a silent pass. This job now spans
