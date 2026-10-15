@@ -286,8 +286,14 @@ class SharedTestDbRefs7031(unittest.TestCase):
     def test_7031_s4_literal_forms(self) -> None:
         for form in ['let x = "%s";', "let x = '%s';", 'format!("{}", "%s")', 'db = "%s"',
                      'connect(database="%s")', 'DATABASE=%s', 'GRANT ALL ON DATABASE %s TO u;',
-                     'DROP DATABASE %s;', 'drop database %s;', 'Db: %s']:
+                     'DROP DATABASE %s;', 'drop database %s;', 'Db: %s',
+                     'test_db=%s', 'db_name=%s', 'database_name: %s', 'psql -d%s']:
             self.assert_flagged(form % NAME)
+
+    def test_7031_r3_compound_keys_and_glued_flag_keep_their_context(self) -> None:
+        text = '\n'.join(['pg_db_password=%s' % NAME, 'x-d%s_y' % NAME, 'x-d%s' % NAME])
+        done = self.mutant(text)
+        self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout)
 
     def test_7031_s4_sql_database_form_in_sql_file(self) -> None:
         self.assert_flagged('GRANT ALL PRIVILEGES ON DATABASE %s TO ai_memory;' % NAME, name='init.sql')
