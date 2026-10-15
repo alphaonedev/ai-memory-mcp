@@ -78,6 +78,40 @@ fn fresh_dir(label: &str) -> tempfile::TempDir {
         .expect("tempdir under .local-runs")
 }
 
+/// #7158 / #7161 — the fixture key directory is private whatever the process
+/// umask. Under umask `0002` a umask-derived directory is mode `775`, and
+/// `keypair::save` refuses it by design (#3198), so every witness cell failed
+/// on an operator account with that umask and passed under `022`. The fixture,
+/// not the gate, is what must be deterministic.
+#[cfg(unix)]
+#[test]
+fn fresh_dir_is_mode_0700_under_umask_0002_7158_7161() {
+    use std::os::unix::fs::PermissionsExt;
+    let _g = lock();
+    // The umask is process-wide: the env lock serialises every cell in this
+    // binary that mutates process state, and the previous mask is restored
+    // before the lock is released (`--test-threads=1` is the recorded run shape).
+    // SAFETY: `umask(2)` only reads and replaces the process creation mask.
+    let previous = unsafe { libc::umask(0o002) };
+    let dir = fresh_dir("umask-7158");
+    let saved = ai_memory::identity::keypair::generate(witness::WITNESS_KEY_LABEL)
+        .and_then(|kp| ai_memory::identity::keypair::save(&kp, dir.path()));
+    // SAFETY: restores the mask read above; no other state is touched.
+    unsafe {
+        libc::umask(previous);
+    }
+    let mode = std::fs::metadata(dir.path())
+        .expect("stat fixture dir")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "fresh_dir must not inherit the process umask (got {mode:o})"
+    );
+    saved.expect("the #3198 key-directory gate must accept the fixture dir under umask 0002");
+}
+
 fn open_db(dir: &std::path::Path) -> (PathBuf, Connection) {
     let path = dir.join("audit.db");
     drop(ai_memory::db::open(&path).expect("init db"));
