@@ -227,10 +227,15 @@ def continues(line: str, suffix: str) -> bool:
     return line.endswith(CONTINUATION) and not is_comment(line, suffix)
 
 
-def join_continuation(lines: List[str], start: int) -> str:
+def join_continuation(lines: List[str], start: int, suffix: str) -> str:
+    """Join the chain that starts at ``start``; it ends at the first line that does not continue.
+
+    A comment line ends the chain (it never continues), so the next chain starts after it and each
+    physical line is joined at most once: the whole scan stays linear (#7171).
+    """
     parts = [lines[start][:-1]]
     pos = start
-    while lines[pos].endswith(CONTINUATION) and pos + 1 < len(lines):
+    while continues(lines[pos], suffix) and pos + 1 < len(lines):
         pos += 1
         parts.append(lines[pos][:-1] if lines[pos].endswith(CONTINUATION) else lines[pos])
     return ' '.join(part.strip() for part in parts)
@@ -247,7 +252,7 @@ def scan_text(text: str, suffix: str) -> Dict[int, List[str]]:
             continue
         found = raw_rules(line, prose)
         if joins and continues(line, suffix) and not (index and continues(lines[index - 1], suffix)):
-            found |= raw_rules(join_continuation(lines, index), prose)
+            found |= raw_rules(join_continuation(lines, index, suffix), prose)
         rules = finish_rules(found)
         if rules:
             out[index + 1] = rules
