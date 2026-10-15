@@ -296,17 +296,26 @@ pub mod pg {
     use super::library::store::{CallerContext, Filter, MemoryStore, postgres::PostgresStore};
     use super::*;
 
+    /// Single-connection pool on the production DSN funnel (#3674): the raw
+    /// DSN never reaches sqlx directly, so the TLS floor applies to the
+    /// harness exactly as it does to every CLI path.
+    pub async fn fault_pg_pool(url: &str, what: &str) -> sqlx::PgPool {
+        let options = library::store::postgres::dsn::floored_connect_options(url)
+            .expect("harness DSN must pass the production floor");
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect(what)
+    }
+
     /// CREATE succeeds before any tested operation. The owned random database,
     /// not an ambient name/prefix, establishes isolation even with an unsafe URL.
     pub async fn fault_pg_create() -> (sqlx::PgPool, String, PostgresStore) {
         let supplied = std::env::var(PG_ENV).expect("native private PG URL required");
         let mut url = reqwest::Url::parse(&supplied).expect("valid PG URL");
         url.set_path("/postgres");
-        let admin = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(url.as_str())
-            .await
-            .expect("PG admin connect");
+        let admin = fault_pg_pool(url.as_str(), "PG admin connect").await;
         let name = format!("ai_memory_hooks_{}", uuid::Uuid::new_v4().simple());
         sqlx::query(&format!("CREATE DATABASE \"{name}\" TEMPLATE template0"))
             .execute(&admin)
@@ -323,11 +332,7 @@ pub mod pg {
             "administrative database must be refused"
         );
         url.set_path(&format!("/{name}"));
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(url.as_str())
-            .await
-            .expect("owned database connect");
+        let pool = fault_pg_pool(url.as_str(), "owned database connect").await;
         for sql in ["CREATE EXTENSION age", "CREATE EXTENSION vector"] {
             sqlx::query(sql)
                 .execute(&pool)
@@ -358,11 +363,7 @@ pub mod pg {
     }
 
     pub async fn fault_pg_connect_owned(url: &str) -> PostgresStore {
-        let probe = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(url)
-            .await
-            .expect("ownership probe connection");
+        let probe = fault_pg_pool(url, "ownership probe connection").await;
         let permitted = fault_pg_owned(&probe).await;
         probe.close().await;
         assert!(
@@ -374,12 +375,18 @@ pub mod pg {
             .expect("owned child store")
     }
 
+    /// `WITH (FORCE)` terminates the sessions a cloned child store still holds
+    /// (a `PostgresStore` clone shares one pool, so `close()` on the parent
+    /// does not disconnect a clone that a spawned scenario kept alive); without
+    /// it the drop fails with 55006 and the owned database leaks (#7029).
+    /// The ownership probe in `fault_pg_owned` already guarantees the name is
+    /// a database this lane created, so forcing is never a cross-lane drop.
     pub async fn fault_pg_cleanup(admin: sqlx::PgPool, name: String, store: PostgresStore) {
         store.pool().close().await;
-        sqlx::query(&format!("DROP DATABASE \"{name}\""))
+        sqlx::query(&format!("DROP DATABASE \"{name}\" WITH (FORCE)"))
             .execute(&admin)
             .await
-            .expect("drop only owned database without FORCE");
+            .expect("drop owned database with FORCE");
         admin.close().await;
     }
 
