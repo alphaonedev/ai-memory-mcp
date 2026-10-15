@@ -926,6 +926,10 @@ pub mod mcp;
 pub mod metrics;
 pub mod mine;
 pub mod models;
+// #7029: active fault evidence lives only in the private library test harness.
+#[cfg(all(test, unix))]
+#[path = "../tests/common/failure_hook_active.rs"]
+mod failure_hook_tests;
 /// Crate-internal, test-only isolation helpers: process-wide env lock +
 /// snapshot/restore `EnvGuard` (#3301, #2905 class) and `LineageDagIsolation`
 /// for the process-global `LINEAGE_DAG` atomic (#3577).
