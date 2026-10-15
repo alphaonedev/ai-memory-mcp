@@ -184,7 +184,7 @@ fn build_client() -> reqwest::Client {
 #[tokio::test(flavor = "current_thread")]
 async fn push_signed_is_accepted_2297() {
     let _g = env_lock();
-    let key_tmp = TempDir::new().expect("key tempdir");
+    let key_tmp = private_tempdir();
     // SAFETY: env mutation; the file-scoped env_lock is held for the whole
     // set → run → assert window so no sibling test sees intermediate state.
     unsafe {
@@ -247,7 +247,7 @@ async fn push_unsigned_is_refused_2297() {
     let _g = env_lock();
     // Empty key dir → `load_daemon_signing_key` returns None → the pre-#2297
     // unsigned push client.
-    let key_tmp = TempDir::new().expect("key tempdir");
+    let key_tmp = private_tempdir();
     unsafe {
         std::env::set_var("AI_MEMORY_KEY_DIR", key_tmp.path());
     }
@@ -295,4 +295,18 @@ async fn push_unsigned_is_refused_2297() {
         "pre-#2297 baseline: the enrolled strict receiver refuses the unsigned \
          push (401) — this is the functional break #2297 fixes"
     );
+}
+
+/// #7185 - a key directory must satisfy the #3198 gate whatever the process
+/// umask, so the mode is set on the builder and the directory never exists in a
+/// umask-derived (group-writable) mode.
+fn private_tempdir() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("keydir-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().expect("private tempdir")
 }
