@@ -713,7 +713,9 @@ def lineage_precheck(url: str, db_name: str) -> None:
     present = psql(url, "SELECT to_regclass('lineage_integrity_watermark') IS NOT NULL", tuples=True).strip()
     if present != 't':
         return
-    listing = psql(url, "SELECT relation || '|' || high_water FROM lineage_integrity_watermark "
+    # coalesce: concat with a NULL high_water would yield a blank line that the
+    # loop below drops, silently skipping the row (#7157).
+    listing = psql(url, "SELECT relation, coalesce(high_water::text, 'NULL') FROM lineage_integrity_watermark "
                         "ORDER BY relation", tuples=True)
     for line in (ln.strip() for ln in listing.splitlines()):
         if not line:
@@ -816,13 +818,18 @@ def _census(url: str) -> Tuple[List[str], Dict[str, Tuple[Optional[int], Optiona
 
 
 def _reap_family(url: str, base: str, oid: int, family: Dict[str, object], present: Set[str],
-                 done: Set[str]) -> List[str]:
+                 done: Set[str], active_runs: Set[str]) -> List[str]:
     """Reclaim one TERMINAL family: remaining clones, the template, then the
     base (the authority) last, after re-reading its marker. Any live member or
-    failed drop keeps the base so a later sweep can finish."""
+    failed drop keeps the base so a later sweep can finish. When another base
+    is still ACTIVE under the same run id, its clones are indistinguishable
+    from this family's and the sweep owns none of them (#7156)."""
     run_id = str(family['run_id'])
     tpl = template_name(base)
     clones = [n for n in _run_clones(url, run_id) if n not in done]
+    if clones and run_id in active_runs:
+        log('keeping TERMINAL family %s: run %s is still ACTIVE on another base' % (base, run_id))
+        return []
     members = clones + ([tpl] if tpl in present else []) + [base]
     live = [name for name in members if session_count(url, name) > 0]
     if live:
@@ -862,7 +869,7 @@ def _reap_family(url: str, base: str, oid: int, family: Dict[str, object], prese
 
 def _sweep_minted_bases(url: str, now: int, older_than: int, names: List[str],
                         families: Dict[str, Tuple[Optional[int], Optional[Dict[str, object]], str]],
-                        done: Set[str]) -> List[str]:
+                        done: Set[str], active_runs: Set[str]) -> List[str]:
     """#7113: reclaim only families whose base carries a valid TERMINAL marker
     at least ``older_than`` s old. Unmarked, malformed and ACTIVE families and
     orphan templates are preserved: age, PID or a name never confer ownership."""
@@ -881,7 +888,7 @@ def _sweep_minted_bases(url: str, now: int, older_than: int, names: List[str],
         if now - int(family['terminal_at']) < older_than:
             log('preserving %s: TERMINAL for less than %ds' % (base, older_than))
             continue
-        dropped += _reap_family(url, base, int(oid), family, present, done)
+        dropped += _reap_family(url, base, int(oid), family, present, done, active_runs)
     return dropped
 
 
@@ -910,7 +917,7 @@ def sweep(url: str, older_than: int) -> List[str]:
             dropped.append(name)
         except WrapperError as exc:
             log('WARN could not sweep %s: %s' % (name, exc))
-    dropped += _sweep_minted_bases(url, now, older_than, names, families, set(dropped))
+    dropped += _sweep_minted_bases(url, now, older_than, names, families, set(dropped), active_runs)
     log('admin sweep dropped %d clone(s)/base(s) older than %ds' % (len(dropped), older_than))
     return dropped
 
