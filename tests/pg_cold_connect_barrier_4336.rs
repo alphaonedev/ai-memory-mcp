@@ -362,3 +362,145 @@ async fn scratch_guard_drops_the_database_on_panic_4489() {
         "the guard must drop the scratch database on a panic unwind"
     );
 }
+
+/// #7125: the scratch helper owns exactly the database it created. It must
+/// never drop by a name prefix or by age (another invocation's database is not
+/// its own), and it must never terminate sessions with `WITH (FORCE)`.
+#[test]
+fn scratch_helper_never_forces_or_reclaims_by_prefix_7125() {
+    let src = include_str!("common/pg_barrier.rs");
+    assert!(
+        !src.contains("WITH (FORCE)"),
+        "tests/common/pg_barrier.rs must never DROP ... WITH (FORCE) (#7125)"
+    );
+    assert!(
+        !src.contains("starts_with(datname"),
+        "tests/common/pg_barrier.rs must not enumerate databases by prefix (#7125)"
+    );
+}
+
+/// Exists probe for the #7125 cells.
+async fn database_exists_7125(admin: &sqlx::PgPool, db: &str) -> bool {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
+        .bind(db)
+        .fetch_one(admin)
+        .await
+        .expect("catalog probe")
+}
+
+/// Plain-drop a database this cell created itself (never FORCE).
+async fn drop_owned_7125(admin: &sqlx::PgPool, db: &str) -> Result<(), String> {
+    sqlx::query(&format!(
+        "DROP DATABASE IF EXISTS {}",
+        pg_barrier::quote_ident(db)
+    ))
+    .execute(admin)
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("drop {db}: {e}"))
+}
+
+/// #7125: creating a scratch database leaves every other invocation's database
+/// intact, an aged idle one and an aged one with a live session alike, and the
+/// live session keeps working.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+async fn scratch_create_leaves_other_invocations_intact_7125() {
+    let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+        eprintln!(
+            "skip: AI_MEMORY_TEST_POSTGRES_URL not set (scratch_create_leaves_other_invocations_intact_7125)"
+        );
+        return;
+    };
+    let prefix = "ai_memory_7125own";
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect admin pool");
+    let now = pg_barrier::server_unix(&admin).await.expect("server clock");
+    let aged = now - pg_barrier::STALE_SCRATCH_AGE.as_secs() - 60;
+    let other_idle = pg_barrier::scratch_db_name(prefix, aged);
+    let other_live = pg_barrier::scratch_db_name(prefix, aged);
+    for db in [&other_idle, &other_live] {
+        sqlx::query(&format!("CREATE DATABASE {}", pg_barrier::quote_ident(db)))
+            .execute(&admin)
+            .await
+            .unwrap_or_else(|e| panic!("create fixture database {db}: {e}"));
+    }
+    let mut live = sqlx::PgConnection::connect(&pg_barrier::with_database(&url, &other_live))
+        .await
+        .expect("live session on the other invocation's database");
+    let mine = pg_barrier::ScratchDb::create(&url, prefix).await;
+    let idle_kept = database_exists_7125(&admin, &other_idle).await;
+    let live_kept = database_exists_7125(&admin, &other_live).await;
+    let session_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&mut live)
+        .await
+        .is_ok();
+    drop(live.close().await);
+    drop(mine);
+    let mut cleanup = Vec::new();
+    for db in [&other_idle, &other_live] {
+        if let Err(e) = drop_owned_7125(&admin, db).await {
+            cleanup.push(e);
+        }
+    }
+    admin.close().await;
+    assert!(
+        idle_kept,
+        "another invocation's aged idle database was dropped"
+    );
+    assert!(
+        live_kept,
+        "another invocation's aged database with a live session was dropped"
+    );
+    assert!(
+        session_ok,
+        "another invocation's live session was terminated"
+    );
+    assert!(
+        cleanup.is_empty(),
+        "owned fixture cleanup failed: {cleanup:?}"
+    );
+}
+
+/// #7125: the guard's drop never terminates a live session; with one open the
+/// database stays (reported on stderr), and the session keeps working.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+async fn scratch_guard_never_terminates_a_live_session_7125() {
+    let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+        eprintln!(
+            "skip: AI_MEMORY_TEST_POSTGRES_URL not set (scratch_guard_never_terminates_a_live_session_7125)"
+        );
+        return;
+    };
+    let scratch = pg_barrier::ScratchDb::create(&url, "ai_memory_7125live")
+        .await
+        .expect("create scratch database");
+    let name = scratch.name().to_string();
+    let mut live = sqlx::PgConnection::connect(&scratch.url())
+        .await
+        .expect("live session on the scratch database");
+    drop(scratch);
+    let session_ok = sqlx::query_scalar::<_, i32>("SELECT 1")
+        .fetch_one(&mut live)
+        .await
+        .is_ok();
+    drop(live.close().await);
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("connect admin pool");
+    let kept = database_exists_7125(&admin, &name).await;
+    let cleanup = drop_owned_7125(&admin, &name).await;
+    admin.close().await;
+    assert!(session_ok, "the guard terminated a live session (FORCE)");
+    assert!(
+        kept,
+        "the guard dropped a database that still had a session"
+    );
+    assert!(cleanup.is_ok(), "owned cleanup failed: {cleanup:?}");
+}
