@@ -94,10 +94,13 @@ LONG_B64 = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{32,}={0,2}")
 GIT_SHA = re.compile(r"[0-9a-f]{40}")
 # Shape 8b: an absolute path under a well-known filesystem root stays readable, but
 # every ``/`` segment is still checked on its own (a 32+ base64 run that is not exactly
-# a 40-hex sha, or 64+ hex, is masked). Any other slash run (URL path, bare ``a/b/c``)
-# gets no exemption.
+# a 40-hex sha, or 64+ hex, is masked). Only a segment in the lowercase path alphabet is
+# checked alone; a segment with an uppercase letter, ``+`` or ``=`` is joined with its
+# neighbours and floor-checked as one run (a std-base64 secret holding ``/``). Any other
+# slash run (URL path, bare ``a/b/c``) gets no exemption. ``KEY=/abs/path`` is a path too.
 PATH_ROOTS = "home|srv|usr|var|opt|mnt|etc|tmp|root|run|lib|bin|sbin|github|runner|workspace|ai-scratch"
-ABS_PATH = re.compile(r"(?<![A-Za-z0-9+/_.=-])(/(?:" + PATH_ROOTS + r")(?:/[A-Za-z0-9._+=-]*)*)")
+SEG_LOWER = re.compile(r"[a-z0-9._-]*")
+ABS_PATH = re.compile(r"(?<![A-Za-z0-9+/_.-])(/(?:" + PATH_ROOTS + r")(?:/[A-Za-z0-9._+=-]*)*)")
 PATH_SENTINEL = "\x00PATH%d\x00"
 # Shape 9: ``\u00XX`` escapes that decode to a key-name character (alnum, ``_.- ``).
 KEY_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
@@ -157,11 +160,28 @@ def _mask_segment(seg: str) -> str:
     return LONG_B64.sub(_b64_sub, LONG_HEX.sub(REDACTED, seg))
 
 
+def _mask_path(path: str) -> str:
+    """Mask an absolute path: lowercase segments alone, other segments joined with their neighbours."""
+    segs = path.split("/")
+    odd = [SEG_LOWER.fullmatch(s) is None for s in segs]
+    n = len(segs)
+    joined = [odd[i] or (i > 0 and odd[i - 1]) or (i + 1 < n and odd[i + 1]) for i in range(n)]
+    out: List[str] = []
+    i = 0
+    while i < n:
+        j = i + 1
+        while joined[i] and j < n and joined[j]:
+            j += 1
+        out.append(_mask_segment("/".join(segs[i:j])))
+        i = j
+    return "/".join(out)
+
+
 def _path_sub(found: List[str]):
     """Substitution that stashes a segment-checked absolute path behind a sentinel."""
 
     def sub(m: "re.Match") -> str:
-        found.append("/".join(_mask_segment(seg) for seg in m.group(1).split("/")))
+        found.append(_mask_path(m.group(1)))
         return PATH_SENTINEL % (len(found) - 1)
 
     return sub

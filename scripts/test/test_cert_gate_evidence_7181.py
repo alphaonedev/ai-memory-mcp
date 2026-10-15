@@ -21,7 +21,9 @@ Stdlib only. Run: ``python3 -I scripts/test/test_cert_gate_evidence_7181.py``
 """
 import importlib.util
 import io
+import random
 import re
+import string
 import subprocess
 import sys
 import tempfile
@@ -337,6 +339,8 @@ class RedactorRound4(unittest.TestCase):
 
     S = "Qx7Kp2" + "Lm9Zr4Tv8Wy3Bn6Hc1Dj5Fg0AaZ"
     BQ = "\\" + '"'
+    # 16 chars: below the 32 LONG_B64 floor, so only the escaped-quote handling can mask it.
+    SHORT = "".join(random.Random(7181).choice(string.ascii_letters + string.digits) for _ in range(16))
 
     def _red(self, line):
         return _load_helper().redact_line(line)
@@ -352,14 +356,14 @@ class RedactorRound4(unittest.TestCase):
 
     def test_c_rust_debug_nested_json_passphrase(self):
         b = self.BQ
-        out = self._red('Error: "{%spassphrase%s: %s%s%s}"' % (b, b, b, self.S, b))
-        self.assertNotIn(self.S, out)
+        out = self._red('Error: "{%spassphrase%s: %s%s%s}"' % (b, b, b, self.SHORT, b))
+        self.assertNotIn(self.SHORT, out)
         self.assertIn(_load_helper().REDACTED, out)
 
     def test_c_rust_debug_nested_json_db_password_no_space(self):
         b = self.BQ
-        out = self._red('body="{%sdb_password%s:%s%s%s}"' % (b, b, b, self.S, b))
-        self.assertNotIn(self.S, out)
+        out = self._red('body="{%sdb_password%s:%s%s%s}"' % (b, b, b, self.SHORT, b))
+        self.assertNotIn(self.SHORT, out)
 
     def test_c_unterminated_quoted_value_runs_to_end_of_line(self):
         tail = "Ta1l" + "Secret88"
@@ -393,6 +397,47 @@ class RedactorRound4(unittest.TestCase):
         ln = "key_dir: /home/runner/work/ai-memory-mcp/ai-memory-mcp/.local-runs/cert-bootstrap-evidence/witness/keys"
         self.assertEqual(self._red(ln), ln)
 
+    def test_f2_mixed_case_std_base64_with_slash_under_root_masked_everywhere(self):
+        mod = _load_helper()
+        alpha = string.ascii_letters + string.digits
+        rnd = random.Random(7182)
+        left = "A" + "".join(rnd.choice(alpha) for _ in range(21))
+        right = "".join(rnd.choice(alpha) for _ in range(20)) + "z"
+        sec = left + "/" + right
+        self.assertEqual(len(sec), 44)
+        line = "key file /run/secrets/" + sec
+        self.assertNotIn(sec, self._red(line))
+        self.assertNotIn(left, self._red(line))
+        with _scratch() as td:
+            ev = Path(td) / "ev"
+            ev.mkdir()
+            (ev / "bring-up.out").write_text(line + "\n", encoding="utf-8")
+            state = Path(td) / "state"
+            state.mkdir()
+            (state / "fail-rows").write_text("B\tprobe\n", encoding="utf-8")
+            buf = io.StringIO()
+            self.assertEqual(mod.finalize(state, ev, TAIL_LINES, buf), 0)
+            self.assertNotIn(sec, buf.getvalue())
+            out = Path(td) / "red"
+            subprocess.run([sys.executable, str(HELPER), "--evidence-dir", str(ev),
+                            "--write-redacted", str(out)], check=True, capture_output=True)
+            blob = "".join(q.read_text(encoding="utf-8") for q in out.glob("*"))
+            self.assertNotIn(sec, blob)
+            self.assertNotIn(left, blob)
+
+    def test_7207_key_equals_absolute_lowercase_path_unchanged(self):
+        path = "/home/runner/work/ai-memory-mcp/ai-memory-mcp/.local-runs/cert-bootstrap-evidence/witness/keys"
+        for key in ("key_dir", "AI_MEMORY_AUDIT_DIR"):
+            ln = key + "=" + path
+            self.assertEqual(self._red(ln), ln)
+
+    def test_7207_key_equals_non_lowercase_path_value_still_masked(self):
+        alpha = string.ascii_letters + string.digits
+        sec = "Q" + "".join(random.Random(7207).choice(alpha) for _ in range(40))
+        self.assertNotIn(sec, self._red("blob=" + sec))
+        self.assertNotIn(sec, self._red("dir=/home/x/" + sec))
+        self.assertNotIn(sec, self._red("dir=/run/" + sec[:20] + "/" + sec[20:]))
+
     def test_f_secret_joined_to_public_key_by_semicolon(self):
         pk = "AAAA" * 11
         out = self._red("pub_b" + "64=" + pk + ";signing_" + "key=" + self.S)
@@ -411,14 +456,14 @@ class RedactorRound4(unittest.TestCase):
         with _scratch() as td:
             ev = Path(td) / "ev"
             ev.mkdir()
-            line = 'Error: "{%spassphrase%s: %s%s%s}"' % (b, b, b, self.S, b)
+            line = 'Error: "{%spassphrase%s: %s%s%s}"' % (b, b, b, self.SHORT, b)
             (ev / "bring-up.out").write_text(line + "\n", encoding="utf-8")
             state = Path(td) / "state"
             state.mkdir()
             (state / "fail-rows").write_text("B\tprobe\n", encoding="utf-8")
             buf = io.StringIO()
             self.assertEqual(mod.finalize(state, ev, TAIL_LINES, buf), 0)
-        self.assertNotIn(self.S, buf.getvalue())
+        self.assertNotIn(self.SHORT, buf.getvalue())
         self.assertIn(mod.REDACTED, buf.getvalue())
 
 
