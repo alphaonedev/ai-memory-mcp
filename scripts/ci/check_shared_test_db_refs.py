@@ -71,7 +71,7 @@ import os
 import re
 import sys
 from pathlib import Path, PurePosixPath
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, FrozenSet, List, Optional, Set, Tuple
 
 DB = 'ai_memory' + '_test'
 NAME_CHAR = r'[A-Za-z0-9_]'
@@ -99,10 +99,12 @@ KEY_LOWER = {'pgdatabase', 'dbname', 'db', 'database', 'db_name', 'database_name
 KEY_LOWER_SUFFIXES = ('_db', '_dbname', '_db_name', '_database', '_database_name')
 KEY_UPPER_PARTS =('DB', 'DATABASE')
 COUPLED_MARK = re.compile(r'\[landing-order #(\d+)\]')
-# The only PR whose pinned lines may be absent until it lands, and the only path it may mark (#7164).
-# Remove both constants and the seven markers in the change that lands after #7088.
-LANDING_ORDER_PRS = frozenset({7088})
-LANDING_ORDER_COUPLED = frozenset({('scripts/ci/tests/test_pg_isolated_binary.py', 7088)})
+# The only PR whose pinned lines may be absent until it lands, the only path it may mark and the exact
+# lines the marker may bind (#7164, #7172).  When #7088 moves a line, move it here with its pin.
+# Remove this constant and the seven markers in the change that lands after #7088.
+LANDING_ORDER_COUPLED = {
+    ('scripts/ci/tests/test_pg_isolated_binary.py', 7088): frozenset({717, 728, 735, 742, 782, 783, 785}),
+}  # type: Dict[Tuple[str, int], FrozenSet[int]]
 POSITIONAL_COMMANDS = {'psql', 'createdb', 'dropdb', 'pg_dump', 'pg_restore'}
 
 Hit = Tuple[str, int, str]
@@ -352,9 +354,13 @@ def load_allowlist(path: Path) -> Tuple[List[Tuple[str, int]], Set[Tuple[str, in
         marker = COUPLED_MARK.search(citation)
         if marker:
             pr_number = int(marker.group(1))
-            if pr_number not in LANDING_ORDER_PRS or (name, pr_number) not in LANDING_ORDER_COUPLED:
+            bound = LANDING_ORDER_COUPLED.get((name, pr_number))
+            if bound is None:
                 raise AllowlistError('%s: unknown landing-order marker (only %s may carry it)'
                                      % (where, ', '.join('%s #%d' % pair for pair in sorted(LANDING_ORDER_COUPLED))))
+            if int(tail) not in bound:
+                raise AllowlistError('%s: landing-order marker does not apply to line %d (bound lines: %s)'
+                                     % (where, int(tail), ', '.join(str(n) for n in sorted(bound))))
             coupled.add(pin)
     return entries, coupled
 
