@@ -13,9 +13,8 @@ import io
 import os
 from pathlib import Path
 import time
-import unittest
+import unittest.mock
 import uuid
-from unittest import mock
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -49,7 +48,7 @@ class ActiveFamilyNative(unittest.TestCase):
             return pib.psql(admin, "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = '%s')" % name, True).strip() == 't'
 
         def make_family(name, family_run):
-            with mock.patch.object(pib, 'mint_base_name', return_value=name):
+            with unittest.mock.patch.object(pib, 'mint_base_name', return_value=name):
                 url = pib.mint_base(admin)
             owned.append(name)
             tpl = pib.setup(url, name, jobs=1)
@@ -70,7 +69,7 @@ class ActiveFamilyNative(unittest.TestCase):
             def owned_names(url, statement):
                 return [name for name in original_names(url, statement) if name in owned]
 
-            with mock.patch.object(pib, '_names', side_effect=owned_names):
+            with unittest.mock.patch.object(pib, '_names', side_effect=owned_names):
                 dropped = pib.sweep(admin, SWEEP_SECONDS)
             observations['active_clone_query'] = pib.psql(clone_url, 'SELECT 1', True).strip() == '1'
             observations['healthy_concurrent_family'] = all(exists(n) for n in (control, control_tpl, control_clone))
@@ -133,7 +132,7 @@ class FamilyLifecycleNative(unittest.TestCase):
         if base is not None:
             env[pib.BASE_VAR] = base
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.dict(os.environ, env, clear=True), \
+        with unittest.mock.patch.dict(os.environ, env, clear=True), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = pib.main(argv)
         return rc, out.getvalue(), err.getvalue()
@@ -143,7 +142,7 @@ class FamilyLifecycleNative(unittest.TestCase):
         name = "ci_base_%d_%d_%s" % (os.getpid(), stamp, uuid.uuid4().hex[:8])
         self.owned.append(name)
         self.owned.append(name + pib.TEMPLATE_SUFFIX)
-        with mock.patch.object(pib, 'mint_base_name', return_value=name):
+        with unittest.mock.patch.object(pib, 'mint_base_name', return_value=name):
             rc, out, err = self.cli(['setup', '--jobs', '1', '--run-id', run, '--emit-env'])
         self.assertEqual(rc, 0, err)
         emitted = dict(line.split('=', 1) for line in out.split())
@@ -165,8 +164,8 @@ class FamilyLifecycleNative(unittest.TestCase):
         def owned_names(url, statement):
             return [name for name in original_names(url, statement) if name in self.owned]
         real_now = int(time.time())
-        with mock.patch.object(pib, '_names', side_effect=owned_names), \
-                mock.patch.object(pib, '_server_now', return_value=real_now + skew, create=True):
+        with unittest.mock.patch.object(pib, '_names', side_effect=owned_names), \
+                unittest.mock.patch.object(pib, '_server_now', return_value=real_now + skew, create=True):
             return pib.sweep(self.admin, SWEEP_SECONDS)
 
     def test_active_family_in_an_interbinary_gap_survives_sweep(self):
@@ -203,7 +202,7 @@ class FamilyLifecycleNative(unittest.TestCase):
         run = "h7113f" + token
         base, tpl = self.family(int(time.time()), run)
         _, held = self.clone(tpl, run, hold=True)
-        with mock.patch.object(pib.time, 'sleep'):
+        with unittest.mock.patch.object(pib.time, 'sleep'):
             rc, _, err = self.cli(['teardown', '--run-id', run], base=base)
         self.assertNotEqual(rc, 0, 'a teardown that left %s behind must not report success: %s' % (held, err))
         self.assertTrue(self.exists(base), 'base kept as the TERMINAL authority while a member remains')

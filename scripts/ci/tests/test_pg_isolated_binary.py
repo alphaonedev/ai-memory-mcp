@@ -19,11 +19,10 @@ import subprocess
 import sys
 import tempfile
 import threading
-import unittest
+import unittest.mock
 import uuid
 import zlib
 from pathlib import Path
-from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / 'scripts' / 'test' / 'pg_isolated_binary.py'
@@ -133,7 +132,7 @@ class FakePopen:
         self.argv, self.kw = list(argv), kw
         self.pid = 40000 + len(FakePopen.instances)
         self.returncode = None
-        self.stdin = mock.Mock()
+        self.stdin = unittest.mock.Mock()
         self.is_hold = argv[0] == 'psql'
         with FakePopen.lock:
             FakePopen.instances.append(self)
@@ -175,10 +174,10 @@ def patched(rec=None):
     """Context: fake run, fake Popen, fake killpg, no sleeping."""
     FakePopen.reset()
     rec = rec or Recorder()
-    stack = [mock.patch.object(pib.subprocess, 'run', rec),
-             mock.patch.object(pib.subprocess, 'Popen', FakePopen),
-             mock.patch.object(pib.os, 'killpg'),
-             mock.patch.object(pib.time, 'sleep')]
+    stack = [unittest.mock.patch.object(pib.subprocess, 'run', rec),
+             unittest.mock.patch.object(pib.subprocess, 'Popen', FakePopen),
+             unittest.mock.patch.object(pib.os, 'killpg'),
+             unittest.mock.patch.object(pib.time, 'sleep')]
     return rec, stack
 
 
@@ -282,8 +281,8 @@ class LibpqEnv(unittest.TestCase):
 
     def test_psql_argv_has_no_url_or_password_and_strips_inherited_pg_vars(self):
         rec = Recorder()
-        with mock.patch.object(pib.subprocess, 'run', rec), \
-                mock.patch.dict(os.environ, {'PGSERVICE': 'evil', 'PGPASSFILE': '/x'}):
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec), \
+                unittest.mock.patch.dict(os.environ, {'PGSERVICE': 'evil', 'PGPASSFILE': '/x'}):
             pib.psql(BASE, 'SELECT 1', tuples=True)
         argv, kw = rec.calls[0]
         joined = ' '.join(argv)
@@ -300,7 +299,7 @@ class LibpqEnv(unittest.TestCase):
 class MintAndDrop(unittest.TestCase):
     def test_mint_issues_create_database_template_with_run_id(self):
         rec = Recorder()
-        with mock.patch.object(pib.subprocess, 'run', rec):
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
             url, name = pib.mint(BASE, TPL, RUN, now=1700000000)
         self.assertEqual(pib.database_name(url), name)
         self.assertEqual(pib.parse_isolated_name(name, RUN), 1700000000)
@@ -315,26 +314,26 @@ class MintAndDrop(unittest.TestCase):
             if state['n'] < 3:
                 return Result(1, '', 'ERROR:  source database "t" is being accessed by other users')
             return Result()
-        with mock.patch.object(pib.subprocess, 'run', Recorder(answer)), mock.patch.object(pib.time, 'sleep'):
+        with unittest.mock.patch.object(pib.subprocess, 'run', Recorder(answer)), unittest.mock.patch.object(pib.time, 'sleep'):
             pib.mint(BASE, TPL, RUN, now=1700000000)
         self.assertEqual(state['n'], 3)
 
     def test_mint_does_not_retry_other_errors(self):
         rec = Recorder(lambda a, k: Result(1, '', 'ERROR: permission denied to create database'))
-        with mock.patch.object(pib.subprocess, 'run', rec):
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
             with self.assertRaises(pib.WrapperError):
                 pib.mint(BASE, TPL, RUN, now=1700000000)
         self.assertEqual(len(rec.calls), 1)
 
     def test_drop_never_forces(self):
         rec = Recorder()
-        with mock.patch.object(pib.subprocess, 'run', rec):
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
             pib.drop(BASE, 'ai_memory_t_r6386_1700000000_0123abcd', RUN)
         self.assertEqual(rec.sql(), ['DROP DATABASE IF EXISTS "ai_memory_t_r6386_1700000000_0123abcd"'])
 
     def test_drop_refuses_another_runs_clone_and_non_clone_names(self):
         rec = Recorder()
-        with mock.patch.object(pib.subprocess, 'run', rec):
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
             for name in ('ai_memory_t_zother_1700000000_0123abcd', 'ai_memory_test_ci_9_1_x'):
                 with self.assertRaises(pib.WrapperError, msg=name):
                     pib.drop(BASE, name, RUN)
@@ -342,7 +341,7 @@ class MintAndDrop(unittest.TestCase):
 
     def test_drop_retries_while_in_use_then_fails_closed(self):
         rec = Recorder(lambda a, k: Result(1, '', 'ERROR: database "x" is being accessed by other users'))
-        with mock.patch.object(pib.subprocess, 'run', rec), mock.patch.object(pib.time, 'sleep'):
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec), unittest.mock.patch.object(pib.time, 'sleep'):
             with self.assertRaises(pib.WrapperError):
                 pib.drop(BASE, 'ai_memory_t_r6386_1700000000_0123abcd', RUN)
         self.assertEqual(len(rec.calls), pib.DROP_ATTEMPTS)
@@ -357,7 +356,7 @@ class Budget(unittest.TestCase):
 
     def test_budget_subtracts_reserved_and_live_sessions(self):
         rec = Recorder(lambda a, k: Result(0, '200|3|2|150\n'))
-        with mock.patch.object(pib.subprocess, 'run', rec):
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
             got = pib.connection_budget(BASE)
         self.assertEqual(got, (200, 5, 150, 45))
         self.assertIn('pg_stat_activity', rec.sql()[0])
@@ -372,7 +371,7 @@ class Budget(unittest.TestCase):
     def test_setup_fails_closed_when_live_budget_is_short(self):
         rec = Recorder(lambda a, k: Result(0, '1000|3|0|950\n') if 'max_connections' in ' '.join(a)
                        else Result())
-        with mock.patch.object(pib.subprocess, 'run', rec):
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
             with self.assertRaises(pib.WrapperError) as ctx:
                 pib.setup(BASE, 'ai_memory_test_ci_9_1_x', 8)
         self.assertIn('connection', str(ctx.exception))
@@ -386,7 +385,7 @@ class Budget(unittest.TestCase):
 class TierSteps(unittest.TestCase):
     def test_setup_creates_template_installs_extensions_then_locks_it(self):
         rec = Recorder()
-        with mock.patch.object(pib.subprocess, 'run', rec):
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
             tpl = pib.setup(BASE, 'ai_memory_test_ci_9_1_x', 8)
         self.assertEqual(tpl, TPL)
         sql = rec.sql()
@@ -401,9 +400,9 @@ class TierSteps(unittest.TestCase):
     def test_setup_emit_env_prints_template_and_run_id_lines(self):
         rec = Recorder()
         out = []
-        with mock.patch.object(pib.subprocess, 'run', rec), \
-                mock.patch.dict(os.environ, {pib.URL_VAR: BASE}, clear=False), \
-                mock.patch.object(pib, '_emit', out.append):
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec), \
+                unittest.mock.patch.dict(os.environ, {pib.URL_VAR: BASE}, clear=False), \
+                unittest.mock.patch.object(pib, '_emit', out.append):
             rc = pib.main(['setup', '--db', 'ai_memory_test_ci_9_1_x', '--jobs', '8', '--run-id', RUN,
                            '--emit-env'])
         self.assertEqual(rc, 0)
@@ -414,9 +413,9 @@ class TierSteps(unittest.TestCase):
 
     def test_setup_emit_env_unmasked_prints_the_real_url(self):
         out = []
-        with mock.patch.object(pib.subprocess, 'run', Recorder()), \
-                mock.patch.dict(os.environ, {pib.URL_VAR: BASE}, clear=False), \
-                mock.patch.object(pib, '_emit', out.append):
+        with unittest.mock.patch.object(pib.subprocess, 'run', Recorder()), \
+                unittest.mock.patch.dict(os.environ, {pib.URL_VAR: BASE}, clear=False), \
+                unittest.mock.patch.object(pib, '_emit', out.append):
             rc = pib.main(['setup', '--db', 'ai_memory_test_ci_9_1_x', '--run-id', RUN,
                            '--emit-env', '--emit-env-unmasked'])
         self.assertEqual(rc, 0)
@@ -430,7 +429,7 @@ class TierSteps(unittest.TestCase):
                                  'ai_memory_test_ci_9_1_x\n')
             return Result()
         rec = Recorder(answer)
-        with mock.patch.object(pib.subprocess, 'run', rec):
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
             pib.teardown(BASE, 'ai_memory_test_ci_9_1_x', RUN)
         sql = rec.sql()
         listing = [s for s in sql if s.startswith('SELECT')][0]
@@ -445,12 +444,12 @@ class TierSteps(unittest.TestCase):
         self.assertTrue(unmark and drop_tpl and unmark[0] < drop_tpl[0])
 
     def test_teardown_requires_a_valid_run_id(self):
-        with mock.patch.object(pib.subprocess, 'run', Recorder()):
+        with unittest.mock.patch.object(pib.subprocess, 'run', Recorder()):
             with self.assertRaises(pib.WrapperError):
                 pib.teardown(BASE, 'ai_memory_test_ci_9_1_x', 'Bad-Run')
 
     def test_admin_sweep_needs_an_explicit_age_floor(self):
-        with mock.patch.object(pib.subprocess, 'run', Recorder()):
+        with unittest.mock.patch.object(pib.subprocess, 'run', Recorder()):
             with self.assertRaises(pib.WrapperError):
                 pib.sweep(BASE, pib.MIN_SWEEP_AGE_SECS - 1)
         self.assertNotEqual(pib.main(['sweep']), 0, '--older-than is required')
@@ -466,7 +465,7 @@ class TierSteps(unittest.TestCase):
                                  'ai_memory_test_ci_9_1_x\n')
             return Result()
         rec = Recorder(answer)
-        with mock.patch.object(pib.subprocess, 'run', rec):
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
             dropped = pib.sweep(BASE, 3600)
         self.assertEqual(dropped, ['ai_memory_t_zother_1700000000_0123abcd'])
         listing = [s for s in rec.sql() if 'pg_database' in s][0]
@@ -502,7 +501,7 @@ class RunOne(unittest.TestCase):
                 return Result(0, '0\n')
             return Result()
         r = runner()
-        with Patched(Recorder(answer)), mock.patch.object(pib.time, 'monotonic',
+        with Patched(Recorder(answer)), unittest.mock.patch.object(pib.time, 'monotonic',
                                                            side_effect=[0.0] + [1e6] * 50):
             rc = r.run_one(['--test', 'foo'], isolate=True)
         self.assertEqual(rc, pib.EXIT_MINT)
@@ -551,7 +550,7 @@ class PerBinaryLogs(unittest.TestCase):
         d = scratch_dir()
         r = runner(log_dir=d)
         printed = []
-        with Patched(), mock.patch.object(pib, '_out', printed.append):
+        with Patched(), unittest.mock.patch.object(pib, '_out', printed.append):
             FakePopen.cargo_rc = 101
             FakePopen.cargo_output = ''.join('line %d\n' % i for i in range(500)) + 'test result: FAILED.\n'
             rc = r.run_one(['--test', 'bad'], isolate=True)
@@ -565,7 +564,7 @@ class PerBinaryLogs(unittest.TestCase):
     def test_success_prints_only_the_result_lines(self):
         r = runner()
         printed = []
-        with Patched(), mock.patch.object(pib, '_out', printed.append):
+        with Patched(), unittest.mock.patch.object(pib, '_out', printed.append):
             FakePopen.cargo_output = 'noise\ntest result: ok. 3 passed; 0 failed\n'
             r.run_one(['--test', 'good'], isolate=True)
         text = '\n'.join(printed)
@@ -589,7 +588,7 @@ class Pool(unittest.TestCase):
             order.append((target[1], isolate))
             return 101 if target[1] == 'bad' else 0
         targets = [['--test', 'a'], ['--test', 'bad'], ['--test', 'res'], ['--test', 'b']]
-        with mock.patch.object(r, 'run_one', fake_run_one):
+        with unittest.mock.patch.object(r, 'run_one', fake_run_one):
             rc = r.run_all(targets, {'res'})
         self.assertEqual(rc, 101)
         self.assertEqual(sorted(n for n, _ in order), ['a', 'b', 'bad', 'res'])
@@ -623,8 +622,8 @@ class Termination(unittest.TestCase):
                 for p in FakePopen.cargo():
                     p.returncode = -sig
                 FakePopen.block.set()
-            with mock.patch.object(FakePopen, '__init__', init), \
-                    mock.patch.object(pib.os, 'killpg', killpg):
+            with unittest.mock.patch.object(FakePopen, '__init__', init), \
+                    unittest.mock.patch.object(pib.os, 'killpg', killpg):
                 t = threading.Thread(target=lambda: result.setdefault('rc', r.run_all(targets, {'b3'})))
                 t.start()
                 self.assertTrue(started.wait(10), 'the first child started')
@@ -664,8 +663,8 @@ class MainRun(unittest.TestCase):
     def test_main_run_with_url_flag_runs_and_returns_zero(self):
         d, targets = self.write_targets('one', 'two')
         env = {pib.FLAG_VAR: '1'}
-        with Patched() as rec, mock.patch.dict(os.environ, env), \
-                mock.patch.object(pib.signal, 'signal'):
+        with Patched() as rec, unittest.mock.patch.dict(os.environ, env), \
+                unittest.mock.patch.object(pib.signal, 'signal'):
             rc = pib.main(['run', '--url', BASE, '--run-id', RUN, '--template', TPL,
                            '--targets-file', str(targets), '--log-dir', d, '--jobs', '2',
                            '--', 'cargo', 'test', '--no-fail-fast'])
@@ -681,7 +680,7 @@ class MainRun(unittest.TestCase):
         for env in ({}, {pib.FLAG_VAR: '0'}, {pib.FLAG_VAR: '1', pib.KILL_VAR: '1'}):
             clean = {k: v for k, v in os.environ.items() if k not in (pib.FLAG_VAR, pib.KILL_VAR)}
             clean.update(env)
-            with Patched(), mock.patch.dict(os.environ, clean, clear=True):
+            with Patched(), unittest.mock.patch.dict(os.environ, clean, clear=True):
                 self.assertEqual(pib.main(list(argv)), pib.EXIT_USAGE, env)
             self.assertEqual(FakePopen.cargo(), [], env)
 
@@ -694,7 +693,7 @@ class MainRun(unittest.TestCase):
             del argv[i:i + 2]
             clean = {k: v for k, v in os.environ.items() if k not in (pib.TEMPLATE_VAR, pib.RUN_ID_VAR)}
             clean[pib.FLAG_VAR] = '1'
-            with Patched(), mock.patch.dict(os.environ, clean, clear=True):
+            with Patched(), unittest.mock.patch.dict(os.environ, clean, clear=True):
                 self.assertEqual(pib.main(argv), pib.EXIT_USAGE, missing)
 
 
@@ -709,7 +708,7 @@ class SharedBaseRefusal7031(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         clean = {k: v for k, v in os.environ.items() if not k.startswith('AI_MEMORY_TEST_')}
         clean.update(env or {})
-        with Patched() as rec, mock.patch.dict(os.environ, clean, clear=True), \
+        with Patched() as rec, unittest.mock.patch.dict(os.environ, clean, clear=True), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = pib.main(argv)
         return rc, rec, out.getvalue(), err.getvalue()
@@ -814,7 +813,7 @@ class MintOwnership7114(unittest.TestCase):
                     return default_answer(argv, kw)
 
                 with self.mint_with(answer) as rec, \
-                        mock.patch.object(pib, 'mint_base_name', return_value=self.NAME):
+                        unittest.mock.patch.object(pib, 'mint_base_name', return_value=self.NAME):
                     with self.assertRaises(kind) as caught:
                         pib.mint_base(BASE)
                 self.assertIs(caught.exception, failure)
@@ -829,7 +828,7 @@ class MintOwnership7114(unittest.TestCase):
             return default_answer(argv, kw)
 
         with self.mint_with(answer) as rec, \
-                mock.patch.object(pib, 'mint_base_name', return_value=self.NAME):
+                unittest.mock.patch.object(pib, 'mint_base_name', return_value=self.NAME):
             with self.assertRaises(pib.WrapperError) as caught:
                 pib.mint_base(BASE)
         self.assertIs(caught.exception, failure)
@@ -837,7 +836,7 @@ class MintOwnership7114(unittest.TestCase):
 
     def test_success_transfers_owned_database_without_dropping_it(self):
         with self.mint_with(default_answer) as rec, \
-                mock.patch.object(pib, 'mint_base_name', return_value=self.NAME):
+                unittest.mock.patch.object(pib, 'mint_base_name', return_value=self.NAME):
             url = pib.mint_base(BASE)
         self.assertEqual(pib.database_name(url), self.NAME)
         self.assertEqual(sum(sql.startswith('CREATE EXTENSION') for sql in rec.sql()), 1)
@@ -856,7 +855,7 @@ class MintOwnership7114(unittest.TestCase):
             return default_answer(argv, kw)
 
         with self.mint_with(answer) as rec, \
-                mock.patch.object(pib, 'mint_base_name', return_value=self.NAME):
+                unittest.mock.patch.object(pib, 'mint_base_name', return_value=self.NAME):
             with self.assertRaises(ValueError) as caught:
                 pib.mint_base(BASE)
         self.assertIs(caught.exception, primary)
@@ -903,7 +902,7 @@ class TemplateOwnership7124(unittest.TestCase):
 
         caught = None
         result = None
-        with Patched(Recorder(answer)), mock.patch.object(pib, 'log', side_effect=log) as logger:
+        with Patched(Recorder(answer)), unittest.mock.patch.object(pib, 'log', side_effect=log) as logger:
             try:
                 result = pib.setup(BASE, self.DB, jobs=1)
             except BaseException as error:
@@ -1013,7 +1012,7 @@ class LeakAndLineage7031(unittest.TestCase):
         marker = pib.family_marker(terminal, fake_oid(terminal), RUN, pib.PHASE_TERMINAL,
                                    terminal_at=1700000100, intent=pib.INTENT_TEARDOWN, reason='teardown')
         rec = Recorder(answer, dbs=names, comments={terminal: marker})
-        with mock.patch.object(pib.subprocess, 'run', rec):
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
             dropped = pib.sweep(BASE, 3600)
         self.assertEqual(sorted(dropped), [terminal, terminal + '_tpl'])
         self.assertFalse([s for s in rec.sql() if 'FORCE' in s.upper()])
@@ -1143,7 +1142,7 @@ class FamilyOwnership7113(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         clean = {k: v for k, v in os.environ.items() if not k.startswith('AI_MEMORY_TEST_')}
         clean.update(env or {})
-        with Patched(rec), mock.patch.dict(os.environ, clean, clear=True), \
+        with Patched(rec), unittest.mock.patch.dict(os.environ, clean, clear=True), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             rc = pib.main(argv)
         return rc, out.getvalue(), err.getvalue()
@@ -1247,7 +1246,7 @@ class FamilyOwnership7113(unittest.TestCase):
             junk: '{"protocol": "ai-memory-pg-family"',
         }
         rec = Recorder(self.sweep_answer(names), dbs=names, comments=comments)
-        with mock.patch.object(pib.subprocess, 'run', rec):
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
             dropped = pib.sweep(BASE, 3600)
         self.assertEqual(dropped, [old_clone, old + '_tpl', old])
         self.assertFalse([s for s in rec.sql() if 'FORCE' in s.upper()])
@@ -1260,7 +1259,7 @@ class FamilyOwnership7113(unittest.TestCase):
         names = [old, old + '_tpl', clone]
         comments = {old: self.marker(old, pib.PHASE_TERMINAL, run='rold', terminal_at=1700001000)}
         rec = Recorder(self.sweep_answer(names, sessions={clone: 1}), dbs=names, comments=comments)
-        with mock.patch.object(pib.subprocess, 'run', rec):
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
             dropped = pib.sweep(BASE, 3600)
         self.assertEqual(dropped, [])
         self.assertEqual(set(names), rec.dbs, 'the authority stays while a member is live')
