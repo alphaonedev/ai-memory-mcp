@@ -18,6 +18,8 @@ SCRATCH_ROOT = REPO_ROOT / ".local-runs"
 SWEPT_SUBDIRS = ("deps", "incremental", "build", ".fingerprint")
 EXIT_OK = 0
 EXIT_REFUSED = 2
+EXIT_BAD_CAP = 3
+EXIT_UNREADABLE = 4
 ENTRY_BYTES = 1000
 BASE_MTIME = 1_700_000_000
 MTIME_STEP = 100
@@ -43,8 +45,11 @@ class SweepTestCase(unittest.TestCase):
         self.target = self.workspace / "target"
         self.debug = self.target / "debug"
         self.debug.mkdir(parents=True)
+        self.locked = []
 
     def tearDown(self):
+        for locked in self.locked:
+            locked.chmod(0o755)
         resolved = self.root.resolve()
         if str(resolved).startswith(str(SCRATCH_ROOT.resolve())):
             shutil.rmtree(str(resolved), ignore_errors=True)
@@ -132,15 +137,57 @@ class SweepTests(SweepTestCase):
         self.assertTrue(keep.exists())
         self.assertNotIn("before=50", res.stdout)
 
-    def test_symlinked_subdir_is_skipped(self):
+    def test_symlinked_subdir_is_refused(self):
         outside = self.root / "outside2"
         keep = outside / "precious.bin"
         write_blob(keep)
-        (self.debug).mkdir(parents=True, exist_ok=True)
         (self.debug / "deps").symlink_to(outside, target_is_directory=True)
-        res = self.run_sweep("--max-bytes", "0")
-        self.assertEqual(res.returncode, EXIT_OK, res.stderr)
+        res = self.run_sweep("--max-bytes", "1")
+        self.assertEqual(res.returncode, EXIT_REFUSED, res.stderr)
+        self.assertIn("deps", res.stderr)
         self.assertTrue(keep.exists())
+
+    def test_symlinked_debug_dir_is_refused(self):
+        outside = self.root / "outside3"
+        victim = outside / "deps" / "victim.rlib"
+        write_blob(victim)
+        shutil.rmtree(str(self.debug))
+        self.debug.symlink_to(outside, target_is_directory=True)
+        res = self.run_sweep("--max-bytes", "1")
+        self.assertEqual(res.returncode, EXIT_REFUSED, res.stderr)
+        self.assertIn(str(self.debug), res.stderr)
+        self.assertTrue(victim.exists())
+
+    def test_nonpositive_max_bytes_is_rejected(self):
+        entry = self.make_entries(1)[0]
+        for bad in ("0", "-1"):
+            res = self.run_sweep("--max-bytes", bad)
+            self.assertEqual(res.returncode, EXIT_BAD_CAP, res.stderr)
+            self.assertIn("--max-bytes", res.stderr)
+            self.assertTrue(entry.exists())
+
+    def test_unreadable_dir_warns_without_traceback(self):
+        deps = self.debug / "deps"
+        write_blob(deps / "a.rlib")
+        deps.chmod(0)
+        self.locked.append(deps)
+        res = self.run_sweep("--max-bytes", "10")
+        self.assertEqual(res.returncode, EXIT_UNREADABLE, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertIn(str(deps), res.stderr)
+
+    def test_unreadable_dir_does_not_stop_other_dirs(self):
+        deps = self.debug / "deps"
+        write_blob(deps / "a.rlib")
+        deps.chmod(0)
+        self.locked.append(deps)
+        other = self.debug / "build" / "pkg"
+        write_blob(other)
+        res = self.run_sweep("--max-bytes", "10")
+        self.assertEqual(res.returncode, EXIT_OK, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertIn(str(deps), res.stderr)
+        self.assertFalse(other.exists())
 
     def test_nothing_outside_four_dirs_touched(self):
         swept = []
