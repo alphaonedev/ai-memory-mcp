@@ -362,6 +362,95 @@ class SharedTestDbRefs7031(unittest.TestCase):
             self.assertTrue(raw.startswith(COUPLED_PATH + ':'), raw)
             self.assertIn(COUPLED_MARK, raw)
 
+    # --- round 3: security r2 S6 (#7165), one cell per form ---
+    def assert_clean(self, form: str, name: str = 'm.txt') -> None:
+        done = self.mutant(form, name=name)
+        self.assertEqual(done.returncode, EXIT_CLEAN, form + '\n' + done.stdout + done.stderr)
+
+    def test_7031_r3_b7_b8_case_variants(self) -> None:
+        self.assert_flagged('DROP DATABASE %s;' % NAME.upper(), name='m.sql')
+        self.assert_flagged('u=postgres://h/%s' % NAME.upper())
+        self.assert_flagged('GRANT ALL ON DATABASE %s TO u;' % NAME.title(), name='n.sql')
+
+    def test_7031_r3_b1_b2_shell_line_continuation(self) -> None:
+        for form in ['psql -h h -U u \\\n  %s', 'psql --dbname \\\n  %s', 'createdb \\\n%s']:
+            done = self.mutant(form % NAME, name='m.sh')
+            self.assertEqual(done.returncode, EXIT_VIOLATION, form + done.stdout + done.stderr)
+            self.assertIn('line=1::', done.stdout)
+        self.assert_clean('psql -h h -U u \\\n  %s_ci_1' % NAME, name='ok.sh')
+
+    def test_7031_r3_b5_b6_psql_meta_commands(self) -> None:
+        for form in ['\\c %s', '  \\connect %s', "\\c '%s'"]:
+            self.assert_flagged(form % NAME, name='m.sh')
+        self.assert_clean('\\c %s_ci_1' % NAME, name='ok.sh')
+
+    def test_7031_r3_b10_b11_b18_comment_markers_are_suffix_aware(self) -> None:
+        self.assert_flagged('#[sqlx(db = "%s")]' % NAME, name='m.rs')
+        self.assert_flagged('#define DB_URL "postgres://h/%s"' % NAME, name='m.h')
+        self.assert_flagged('//postgres://h/%s' % NAME, name='m.py')
+        self.assert_flagged('//postgres://h/%s' % NAME, name='m.sh')
+        self.assert_clean('// psql -d %s' % NAME, name='ok.rs')
+        self.assert_clean('# psql -d %s' % NAME, name='ok.sh')
+        self.assert_clean('# psql -d %s' % NAME, name='ok.py')
+
+    def test_7031_r3_b9_utf16_file_fails_closed(self) -> None:
+        (self.dir / 'u16.txt').write_bytes(('POSTGRES_DB: %s\n' % NAME).encode('utf-16'))
+        done = gate(self.dir, '--paths', 'u16.txt', '--allowlist', str(self.dir / 'allow.txt'))
+        self.assertEqual(done.returncode, EXIT_USAGE, done.stdout + done.stderr)
+        self.assertIn('file=u16.txt', done.stdout)
+
+    def test_7031_r3_b20_nul_inside_the_name_is_still_scanned(self) -> None:
+        (self.dir / 'nul.txt').write_bytes(b'POSTGRES_DB: ai_memory\x00_test\n')
+        done = gate(self.dir, '--paths', 'nul.txt', '--allowlist', str(self.dir / 'allow.txt'))
+        self.assertEqual(done.returncode, EXIT_VIOLATION, done.stdout + done.stderr)
+        self.assertIn('file=nul.txt', done.stdout)
+
+    def test_7031_r3_b14_backtick_quoted_literal(self) -> None:
+        self.assert_flagged('let x = `%s`;' % NAME)
+
+    def test_7031_r3_b4_b17_lower_case_database_keys(self) -> None:
+        self.assert_flagged('test_db: %s' % NAME, name='m.yml')
+        self.assert_flagged('target_db = %s' % NAME, name='m.toml')
+
+    def test_7031_r3_scope_is_a_deny_list_of_top_level_directories(self) -> None:
+        for rel in ['.github/scripts/x.py', '.github/Dockerfile.ci', 'migrations/0001.sql', '.config/nextest.toml',
+                    'coverage/check.sh', 'debian/postinst', 'fuzz/f.rs', 'benchmarks/b.py', 'zz_new_dir/x.sh']:
+            self.make_default_tree()
+            target = self.dir / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('psql -d %s\n' % NAME if not rel.endswith('.sql') else 'DROP DATABASE %s;\n' % NAME,
+                              encoding='utf-8')
+            done = gate(self.dir)
+            self.assertEqual(done.returncode, EXIT_VIOLATION, rel + done.stdout + done.stderr)
+            self.assertIn('file=' + rel, done.stdout)
+            target.unlink()
+        for rel in ['changelog.d/x.md', 'target/x.sh', 'vendor/x.sh']:
+            self.make_default_tree()
+            target = self.dir / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('psql -d %s\n' % NAME, encoding='utf-8')
+            done = gate(self.dir)
+            self.assertEqual(done.returncode, EXIT_CLEAN, rel + done.stdout + done.stderr)
+            target.unlink()
+
+    def test_7031_r3_allowlist_pin_paths_are_normalised(self) -> None:
+        self.allow('./m.txt:1  # cited\n')
+        done = self.mutant('POSTGRES_DB=%s' % NAME)
+        self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout + done.stderr)
+        done = self.mutant('clean')
+        self.assertEqual(done.returncode, EXIT_USAGE, done.stdout + done.stderr)
+        self.assertIn('stale allowlist entry', done.stderr)
+        for bad in ['../m.txt:1  # c\n', '/etc/hosts:1  # c\n', 'a/../m.txt:1  # c\n']:
+            self.allow(bad)
+            done = self.mutant('clean')
+            self.assertEqual(done.returncode, EXIT_USAGE, bad + done.stdout + done.stderr)
+            self.assertIn('allowlist line 1', done.stderr)
+
+    def test_7031_r3_docstring_states_the_out_of_scope_indirection_forms(self) -> None:
+        text = GATE.read_text(encoding='utf-8')
+        for needle in ['env indirection', 'string concatenation', 'escape', 'percent-encoded']:
+            self.assertIn(needle, text, needle)
+
     def test_7031_f4_changelog_fragment_states_the_gate(self) -> None:
         text = (ROOT / 'changelog.d' / '7031b.fixed.md').read_text(encoding='utf-8')
         for needle in ['R1', 'R5', 'docs/', 'exit 2', 'allowlist', 'unreadable', 'stale', 'ephemeral']:
