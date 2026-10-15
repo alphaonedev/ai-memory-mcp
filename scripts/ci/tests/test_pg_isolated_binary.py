@@ -1734,6 +1734,60 @@ class LiveEndToEnd(unittest.TestCase):
 
 
 @unittest.skipUnless(_live_url() and shutil.which('psql'), 'AI_MEMORY_TEST_POSTGRES_URL unset (live e2e)')
+class LiveSigtermWindows7179(unittest.TestCase):
+    """#7179 windows (a) and (c) on a real server: a SIGTERM while CREATE DATABASE waits on a held
+    template1. The server-side statement commits after the killed psql is gone, so only a cancel of
+    the wrapper's own backends (its application_name) leaves nothing behind."""
+
+    CREATE_ACTIVE = ("SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND pid <> pg_backend_pid() "
+                     "AND query LIKE 'CREATE DATABASE \"%s%%'")
+
+    def window(self, argv_tail, create_prefix, leftover_like, pre_db=None):
+        url = _live_url()
+        maint = pib.with_database(url, pib.MAINTENANCE_DB)
+        d = Path(scratch_dir())
+        env = {k: v for k, v in os.environ.items() if not k.startswith('PG')}
+        env.update({pib.URL_VAR: url, pib.FLAG_VAR: '1'})
+        env.pop(pib.KILL_VAR, None)
+        if pre_db:
+            pib.psql(url, 'CREATE DATABASE "%s"' % pre_db)
+            self.addCleanup(pib.psql, maint, 'DROP DATABASE IF EXISTS "%s"' % pre_db)
+        hold = pib.open_hold(pib.with_database(url, 'template1'))
+        self.addCleanup(pib.close_hold, hold)
+        pib.wait_for_hold(maint, 'template1', hold)
+        with open(str(d / 'err.log'), 'w') as err:
+            proc = subprocess.Popen([sys.executable, str(SCRIPT), 'setup', '--jobs', '1'] + argv_tail,
+                                    env=env, stdout=subprocess.DEVNULL, stderr=err)
+            leftover_like = leftover_like.replace('PID', str(proc.pid))
+            self.addCleanup(lambda: [pib.psql(maint, 'DROP DATABASE IF EXISTS "%s"' % n) for n in
+                                     pib.psql(maint, "SELECT datname FROM pg_database WHERE datname LIKE '%s'"
+                                              % leftover_like, tuples=True).split()])
+            sql = self.CREATE_ACTIVE % create_prefix.replace('PID', str(proc.pid))
+            deadline = time.monotonic() + 60
+            while pib.psql(maint, sql, tuples=True).strip() == '0':
+                self.assertIsNone(proc.poll(), 'the wrapper exited before its CREATE DATABASE waited')
+                self.assertLess(time.monotonic(), deadline, 'CREATE DATABASE never waited on template1')
+                time.sleep(0.1)
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=60)
+        pib.close_hold(hold)  # the server-side CREATE may now commit, unless it was cancelled
+        time.sleep(2)
+        left = pib.psql(maint, "SELECT datname FROM pg_database WHERE datname LIKE '%s'"
+                        % leftover_like, tuples=True).split()
+        log = (d / 'err.log').read_text()
+        self.assertNotEqual(proc.returncode, 0, log)
+        self.assertEqual(left, [], 'a database outlived the SIGTERM (log: %s)' % log[-400:])
+        self.assertIn('owned resources were released', log)
+
+    def test_7179_live_sigterm_during_the_base_create_leaves_no_database(self):
+        self.window(['--run-id', 'l%s' % uuid.uuid4().hex[:9]], 'ci_base_PID_', 'ci_base_PID_%')
+
+    def test_7179_live_sigterm_during_the_template_create_leaves_no_template(self):
+        db = 'ai_memory_test_ci_w7179_%s' % uuid.uuid4().hex[:8]
+        self.window(['--db', db, '--run-id', 'l%s' % uuid.uuid4().hex[:9]], db + '_tpl', db + '_tpl', pre_db=db)
+
+
+@unittest.skipUnless(_live_url() and shutil.which('psql'), 'AI_MEMORY_TEST_POSTGRES_URL unset (live e2e)')
 class LiveLineagePrecheck7031(unittest.TestCase):
     """#7031 H2/H3 on a real server: the #6983 state (watermark above rows) is refused."""
 
