@@ -201,3 +201,37 @@ fn active_postgres_7029() {
     assert_child(&armed);
     assert_child(&retry);
 }
+
+/// Review r2 F3 (TEST-02): cleanup must drop the owned database even while a
+/// second backend still holds a connection to it.
+#[cfg(feature = "sal-postgres")]
+#[test]
+fn cleanup_drops_owned_db_with_open_connection_7029() {
+    let Ok(supplied) = std::env::var(PG_ENV) else {
+        eprintln!("skipped: {PG_ENV} is unset");
+        return;
+    };
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let (admin, name, store) = scenarios::pg::fault_pg_create().await;
+        let mut url = reqwest::Url::parse(&supplied).expect("valid URL");
+        url.set_path(&format!("/{name}"));
+        let held =
+            scenarios::pg::fault_pg_pool(url.as_str(), "second connection to the owned database")
+                .await;
+        let mut admin_url = reqwest::Url::parse(&supplied).expect("valid URL");
+        admin_url.set_path("/postgres");
+        let admin_probe =
+            scenarios::pg::fault_pg_pool(admin_url.as_str(), "probe admin connect").await;
+        scenarios::pg::fault_pg_cleanup(admin, name.clone(), store).await;
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(1) FROM pg_database WHERE datname = $1")
+                .bind(&name)
+                .fetch_one(&admin_probe)
+                .await
+                .expect("pg_database lookup");
+        held.close().await;
+        admin_probe.close().await;
+        assert_eq!(remaining, 0, "owned database must be gone after cleanup");
+    });
+}
