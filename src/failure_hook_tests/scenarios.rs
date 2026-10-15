@@ -83,7 +83,11 @@ pub fn sqlite_snapshot(conn: &rusqlite::Connection) -> Vec<Vec<Vec<rusqlite::typ
     .collect()
 }
 
-pub fn sqlite_capture(conn: &rusqlite::Connection, id: &str, auto: bool) -> Result<(), String> {
+pub fn sqlite_capture(
+    conn: &rusqlite::Connection,
+    id: &str,
+    auto: bool,
+) -> Result<(), impl std::fmt::Debug> {
     let write = capture_write(id);
     if auto {
         library::storage::capture_turn_idempotent_auto(

@@ -41,7 +41,7 @@ fn active_sqlite_7029() {
             assert_eq!(scenarios::sqlite_counts(&conn), (0, 0, 0));
             let snapshot = scenarios::sqlite_snapshot(&conn);
             let err = scenarios::sqlite_capture(&conn, TARGET_ID, auto).expect_err("armed capture");
-            assert!(err.contains("injected before signed commit"));
+            assert!(format!("{err:?}").contains("injected before signed commit"));
             assert_eq!(
                 scenarios::sqlite_counts(&conn),
                 (0, 0, 0),
