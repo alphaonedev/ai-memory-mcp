@@ -1555,8 +1555,9 @@ class Review7088R4(unittest.TestCase):
         del pib._OWNED[:]
 
     def test_7200_wrapper_error_without_owned_names_still_exits_usage(self):
-        rc, _, err = self.run_main(['setup', '--url', FamilyOwnership7113.SHARED, '--db', 'ai_memory_test'],
-                                   Recorder(default_answer))
+        with unittest.mock.patch.object(pib, 'setup', side_effect=pib.WrapperError('injected, nothing owned')):
+            rc, _, err = self.run_main(['setup', '--url', FamilyOwnership7113.SHARED, '--db', 'ai_memory_test_ci_9_1_x'],
+                                       Recorder(default_answer))
         self.assertEqual(rc, pib.EXIT_USAGE, err[-300:])
         self.assertNotIn('NOT released', err)
 
