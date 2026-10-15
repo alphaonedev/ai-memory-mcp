@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[3]
 FRAGMENTS = ROOT / 'changelog.d'
 DOC = ROOT / 'docs' / 'ci' / 'PG-ISOLATION.md'
 SCRIPT = ROOT / 'scripts' / 'test' / 'pg_isolated_binary.py'
-CLOSED_BY_7088 = (6848, 7114, 7115, 7124, 7125, 7152, 7153, 7156, 7157, 7158, 7159, 7161)
+CLOSED_BY_7088 = (6848, 7114, 7115, 7124, 7125, 7152, 7153, 7156, 7157, 7158, 7159, 7161, 7180)
 HELD_PHRASE = 'Implementation remains held'
 
 
@@ -68,6 +68,15 @@ class PgIsolationDoc7088(unittest.TestCase):
             self.assertIn(var, step1)
         self.assertIn('--emit-env-unmasked', step1)
         self.assertIsNone(re.search(r'exports\s+`AI_MEMORY_TEST_PG_TEMPLATE`\s+and\s+`AI_MEMORY_TEST_PG_RUN_ID`\s+to', step1))
+
+    def test_step_3_documents_teardown_of_a_minted_base(self):
+        # #7180: after a masked --emit-env the URL still names the maintenance
+        # database, so teardown must be told (or find) the minted base.
+        wrapper = load_wrapper()
+        text = DOC.read_text(encoding='utf-8')
+        step3 = text[text.index('3. **Cleanup**'):text.index('On SIGTERM (the watchdog)')]
+        self.assertIn(wrapper.BASE_VAR, step3)
+        self.assertRegex(step3, r'(?is)minted.{0,300}(template|`_tpl`|<base>_tpl)')
 
     def test_step_1_documents_the_masked_mode_url_behaviour(self):
         wrapper = load_wrapper()

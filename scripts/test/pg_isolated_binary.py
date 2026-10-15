@@ -1196,6 +1196,50 @@ def _cmd_setup(args: argparse.Namespace, url: str) -> int:
     return 0
 
 
+def resolve_teardown_db(url: str, db_arg: Optional[str], env_base: Optional[str]) -> str:
+    """Pick the database ``teardown`` works on (#7180).
+
+    A masked ``setup --emit-env`` keeps the caller's maintenance URL, so the URL
+    database is not the run's base; the emitted ``BASE_VAR`` names it. Without
+    ``--db`` a minted ``BASE_VAR`` is used. An explicit ``--db`` that differs
+    from a minted ``BASE_VAR`` is refused: teardown never reports success while
+    the minted family it was told about stays behind."""
+    minted = env_base if env_base and env_base.startswith(MINTED_BASE_PREFIX) else None
+    if db_arg:
+        if minted and minted != db_arg:
+            raise WrapperError('%s names minted base %s but --db is %s; pass --db %s (or unset %s) so '
+                               'the minted family is not stranded' % (BASE_VAR, minted, db_arg, minted, BASE_VAR))
+        return db_arg
+    return minted or database_name(url)
+
+
+def _cmd_teardown(args: argparse.Namespace, url: str) -> int:
+    """``teardown``: TERMINAL first, drop the run's clones and template, base last."""
+    base = os.environ.get(BASE_VAR)
+    db = resolve_teardown_db(url, args.db, base)
+    run_id = checked_run_id(args.run_id or os.environ.get(RUN_ID_VAR))
+    admin = with_database(url, MAINTENANCE_DB)
+    if is_minted_base(db):
+        # #7113: TERMINAL first (refuses another run's family before any drop).
+        terminalize(admin, db, run_id, INTENT_TEARDOWN, TEARDOWN_REASON)
+    failed = teardown(url, db, run_id)
+    if base and base == db and base.startswith(MINTED_BASE_PREFIX):
+        if failed:
+            log('keeping base %s (TERMINAL authority): %d member drop(s) failed; sweep finishes it'
+                % (base, failed))
+        else:
+            # Plain drop (no force option), base last: a live session fails it, loudly.
+            try:
+                psql(admin, SQL_DROP_DATABASE % quote_ident(_checked_ident(base)))
+            except WrapperError as exc:
+                failed += 1
+                log('WARN could not drop the base %s: %s' % (base, exc))
+    if failed:
+        print('pg_isolated_binary: teardown left %d database(s) behind' % failed, file=sys.stderr)
+        return EXIT_USAGE
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     try:
         args = build_parser().parse_args(argv)
@@ -1207,32 +1251,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             with _sigterm_as_exception():  # #7152: SIGTERM must not strand a minted base
                 return _cmd_setup(args, url)
         if args.cmd == 'teardown':
-            db = args.db or database_name(url)
-            run_id = checked_run_id(args.run_id or os.environ.get(RUN_ID_VAR))
-            admin = with_database(url, MAINTENANCE_DB)
-            if is_minted_base(db):
-                # #7113: TERMINAL first (refuses another run's family before any drop).
-                terminalize(admin, db, run_id, INTENT_TEARDOWN, TEARDOWN_REASON)
-            failed = teardown(url, db, run_id)
-            base = os.environ.get(BASE_VAR)
-            if base and base.startswith(MINTED_BASE_PREFIX) and base != db:
-                log('warning: %s names minted base %s but the URL database is %s; the base was not dropped'
-                    % (BASE_VAR, base, db))
-            elif base and base == db and base.startswith(MINTED_BASE_PREFIX):
-                if failed:
-                    log('keeping base %s (TERMINAL authority): %d member drop(s) failed; sweep finishes it'
-                        % (base, failed))
-                else:
-                    # Plain drop (no force option), base last: a live session fails it, loudly.
-                    try:
-                        psql(admin, SQL_DROP_DATABASE % quote_ident(_checked_ident(base)))
-                    except WrapperError as exc:
-                        failed += 1
-                        log('WARN could not drop the base %s: %s' % (base, exc))
-            if failed:
-                print('pg_isolated_binary: teardown left %d database(s) behind' % failed, file=sys.stderr)
-                return EXIT_USAGE
-            return 0
+            return _cmd_teardown(args, url)
         if args.cmd == 'revoke':
             revoke(with_database(url, MAINTENANCE_DB), _checked_ident(args.db), args.run_id, args.reason)
             return 0

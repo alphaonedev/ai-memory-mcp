@@ -52,7 +52,12 @@ after another. With the lane on (flag `1`, kill switch not `1`, tier
    on the shared database. The flag is stripped from their environment, so the
    Rust helper does not mint for them.
 3. **Cleanup** runs `pg_isolated_binary.py teardown --run-id <this run>`, which
-   drops this run's leftover clones and the template.
+   drops this run's leftover clones and the template. For a minted base the
+   command also drops the base: without `--db` it takes the base from
+   `AI_MEMORY_TEST_PG_BASE` (the masked URL still names the maintenance
+   database), and `--db` must then equal `AI_MEMORY_TEST_PG_BASE`. A
+   different `--db` exits 2 and drops nothing, so a minted base and its
+   `<base>_tpl` template are never left behind under a success exit.
 
 On SIGTERM (the watchdog) or SIGINT, the wrapper stops dispatching, sends TERM
 to every running `cargo` process group and KILL 5 s later, drops the clones in

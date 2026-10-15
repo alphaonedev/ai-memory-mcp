@@ -1017,12 +1017,13 @@ class LeakAndLineage7031(unittest.TestCase):
         self.assertEqual(sorted(dropped), [terminal, terminal + '_tpl'])
         self.assertFalse([s for s in rec.sql() if 'FORCE' in s.upper()])
 
-    def test_7031_teardown_warns_when_url_db_is_not_the_minted_base(self):
-        rc, rec, _, err = self.run_main(['teardown', '--url', self.SHARED, '--run-id', RUN],
-                                        {pib.BASE_VAR: 'ci_base_1_2_abc'})
-        self.assertEqual(rc, 0)
-        self.assertIn('warning:', err)
-        self.assertNotIn('DROP DATABASE IF EXISTS "ci_base_1_2_abc"', rec.sql())
+    def test_7180_teardown_refuses_a_db_that_differs_from_the_minted_base(self):
+        # #7031 used to warn and exit 0 here; a stranded family is never success (#7180).
+        rc, rec, _, err = self.run_main(['teardown', '--url', self.SHARED, '--db', 'ai_memory_test_ci_9_1_x',
+                                         '--run-id', RUN], {pib.BASE_VAR: 'ci_base_1_2_abc'})
+        self.assertEqual(rc, pib.EXIT_USAGE, err)
+        self.assertIn('ci_base_1_2_abc', err)
+        self.assertFalse([s for s in rec.sql() if s.startswith('DROP')])
 
     def lineage_answer(self, present, hwm, rows, table=None):
         """``present``: watermark table exists; ``hwm`` None = no watermark row;
@@ -1479,6 +1480,45 @@ class Review7088R1(unittest.TestCase):
         self.assertIn(clone, err, 'stderr names the held clone')
         found = pib.parse_family_marker(rec.comments[name], name, fake_oid(name))
         self.assertEqual((found['phase'], found['intent']), (pib.PHASE_TERMINAL, pib.INTENT_TEARDOWN))
+
+
+class Review7088R2(unittest.TestCase):
+    """PR #7088 review r2: #7180 teardown after a masked --emit-env."""
+
+    def masked_flow_teardown(self, extra_argv=()):
+        helper = FamilyOwnership7113()
+        name = helper.BASE_NAME
+        rec = Recorder(helper.teardown_answer([]), dbs=[name, name + '_tpl'],
+                       comments={name: helper.marker(name, pib.PHASE_ACTIVE)})
+        # Masked setup keeps the caller's maintenance URL and emits only
+        # TEMPLATE, RUN_ID and BASE (#7153): that is what the caller sources.
+        env = {pib.BASE_VAR: name, pib.RUN_ID_VAR: RUN}
+        rc, _, err = helper.run_main(['teardown', '--url', helper.SHARED, '--run-id', RUN] + list(extra_argv),
+                                     rec, env)
+        return rc, err, rec, name
+
+    def test_7180_teardown_after_masked_emit_env_drops_the_minted_base_and_template(self):
+        rc, err, rec, name = self.masked_flow_teardown()
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(rec.dbs & {name, name + '_tpl'}, 'the minted family must not outlive its teardown')
+        self.assertEqual([s for s in rec.sql() if s.startswith('DROP')][-1],
+                         'DROP DATABASE IF EXISTS "%s"' % name, 'base last')
+        self.assertFalse([s for s in rec.sql() if 'FORCE' in s.upper()])
+
+    def test_7180_explicit_db_equal_to_the_minted_base_still_tears_down(self):
+        rc, err, rec, name = self.masked_flow_teardown(['--db', FamilyOwnership7113.BASE_NAME])
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(rec.dbs & {name, name + '_tpl'})
+
+    def test_7180_other_runs_minted_base_is_still_refused(self):
+        helper = FamilyOwnership7113()
+        name = helper.BASE_NAME
+        rec = Recorder(helper.teardown_answer([]), dbs=[name, name + '_tpl'],
+                       comments={name: helper.marker(name, pib.PHASE_ACTIVE, run='zother')})
+        rc, _, err = helper.run_main(['teardown', '--url', helper.SHARED, '--run-id', RUN], rec,
+                                     {pib.BASE_VAR: name})
+        self.assertEqual(rc, pib.EXIT_USAGE, err)
+        self.assertEqual({name, name + '_tpl'}, rec.dbs)
 
 
 class NoShell(unittest.TestCase):
