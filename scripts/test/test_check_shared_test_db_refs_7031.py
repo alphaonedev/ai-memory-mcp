@@ -125,8 +125,12 @@ class SharedTestDbRefs7031(unittest.TestCase):
             self.assertEqual(done.returncode, 1, form + done.stdout)
 
     def test_f3_password_variable_is_not_a_database_key(self) -> None:
-        done = self.mutant('PG_PASS="%s"\nPOSTGRES_PASSWORD=%s' % (NAME, NAME))
+        done = self.mutant('PG_PASS=%s\nPOSTGRES_PASSWORD=%s' % (NAME, NAME))
         self.assertEqual(done.returncode, 0, done.stdout)
+        # a quoted password value is a quoted literal (R6), never a database key (R5)
+        done = self.mutant('PG_PASS="%s"' % NAME)
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertNotIn('R5', done.stdout)
 
     def test_f5_no_whole_file_entries_in_real_allowlist(self) -> None:
         text = (ROOT / 'scripts' / 'qc-allowlists' / 'shared-test-db-allow.txt').read_text(encoding='utf-8')
@@ -178,7 +182,9 @@ class SharedTestDbRefs7031(unittest.TestCase):
         (self.dir / 'allow.txt').write_text(text, encoding='utf-8')
 
     def make_default_tree(self) -> None:
-        for rel in ['.github/workflows', 'tests', 'scripts/qc-allowlists', 'infra', 'src', 'packaging', 'docs']:
+        for rel in ['.github/workflows', 'tests', 'scripts/qc-allowlists', 'infra', 'src', 'packaging', 'docs',
+                    'benches', 'clients', 'conformance', 'deploy', 'examples', 'hooks', 'loadtest', 'ops',
+                    'plugins', 'sdk', 'tools']:
             (self.dir / rel).mkdir(parents=True, exist_ok=True)
         (self.dir / 'scripts' / 'qc-allowlists' / 'shared-test-db-allow.txt').write_text('', encoding='utf-8')
 
