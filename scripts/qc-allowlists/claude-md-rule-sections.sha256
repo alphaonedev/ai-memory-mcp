@@ -7,7 +7,7 @@ a9fbc9ca04a04d2bdf13c4772dd56ebea116b82de18e675ff1df36ee8f8711cd  ## Hard rule â
 2bdf119184bfae244ccbc9061bc1eae94d7c8ace6f5d5928ff24ccfec036af01  ## Build & Test Commands
 990a4a862fcdbc3d511b5803e51a49891ac65ae85351dcd6edd7f33732cf1ffd  ## Dogfooding release branches
 fbe2f5e766c42769e75aa182c50e982b89dd006a06a5d0dcf56b9d8b5b116b8a  ## Reproducing the v0.7.0 recursive-learning primitive
-2cd928ce771deb82e281e113fa697a284700876654540aa8a744c17baadbc7da  ## Architecture
+0f763f68a46af2ec5e9b4558a5c4d43de73dcba29aa8806c8c297361bcac3202  ## Architecture
 22e511869f7d39f3c5554333831f49faff25ab98572f34a00c384b2f9eef4d27  ## Adding New Functionality
 9b92321c53d0efe15cb34cdb952ec476058a881b6bdbd1b55582edf60a3892df  ## Code Style
 2d6b30780058da3153b5c367f5e97bd78260662f78eda5a744309afa2f999ddd  ## Prime directive (operator-set, 2026-05-17)
