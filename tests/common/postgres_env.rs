@@ -78,6 +78,23 @@
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
+/// #7029 (H4) test-only environment variable naming a pre-created, quota-limited
+/// Postgres tablespace for disk-full failure cells. Classification `test-only`;
+/// CI does not set it, so those cells skip with a reason. The value is never
+/// logged.
+pub const ENV_PG_QUOTA_TABLESPACE: &str = "AI_MEMORY_TEST_PG_QUOTA_TABLESPACE";
+
+/// Read-through for [`ENV_PG_QUOTA_TABLESPACE`]: `Some(name)` when set to a
+/// non-blank value (trimmed), otherwise `None`.
+#[must_use]
+#[allow(dead_code)]
+pub fn quota_tablespace() -> Option<String> {
+    std::env::var(ENV_PG_QUOTA_TABLESPACE)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
 /// Per-test isolated Postgres schema + URL wrapper.
 ///
 /// Created via [`PostgresTestEnv::new`]; the returned struct holds a

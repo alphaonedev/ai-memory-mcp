@@ -78,6 +78,13 @@ pub struct Mcp {
 }
 
 impl Mcp {
+    /// OS process id of the direct child (#7029 H3), so a test can signal or
+    /// inspect the real server process.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Start the child bound to `agent` (`AI_MEMORY_AGENT_ID`), or with no
     /// configured identity (the local-operator posture) when `None`.
     #[must_use]

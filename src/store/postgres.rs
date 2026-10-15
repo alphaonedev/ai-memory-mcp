@@ -22596,6 +22596,17 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err("capture_turn insert dedup row", e))?;
 
+        // #7029 (H1) — test-only fault point between the memories INSERT and
+        // the signed-event append. Returning here drops `tx` un-committed, so
+        // sqlx rolls the whole unit of work back (memories, dedup, chain).
+        #[cfg(test)]
+        if crate::recover::durability::fail_before_signed_commit_decision(&inserted_id) {
+            return Err(StoreError::BackendUnavailable {
+                backend: "postgres".to_string(),
+                sqlstate: None,
+                detail: crate::recover::durability::INJECTED_BEFORE_SIGNED_COMMIT_MSG.to_string(),
+            });
+        }
 
         // signed_events chain row in the SAME tx (#1415) so audit can
         // prove L4 caught the turn and never lags the data.
