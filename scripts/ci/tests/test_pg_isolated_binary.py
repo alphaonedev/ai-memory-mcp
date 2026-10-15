@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest.mock
 import uuid
 import zlib
@@ -1342,6 +1343,142 @@ class FamilyOwnership7113(unittest.TestCase):
         self.assertFalse([s for s in idle.sql() if s.startswith('DROP')], 'revoke never drops')
         rc, _, _ = self.run_main(argv[:-1] + [' '], Recorder(self.sweep_answer(names), dbs=names))
         self.assertEqual(rc, pib.EXIT_USAGE, 'revoke needs a non-empty reason')
+
+
+class Review7088R1(unittest.TestCase):
+    """PR #7088 review r1: #7152 #7153 #7156 #7157 #7159 (wrapper behaviour)."""
+
+    def emit_for(self, argv):
+        out = []
+        with unittest.mock.patch.object(pib.subprocess, 'run', Recorder()), \
+                unittest.mock.patch.dict(os.environ, {pib.URL_VAR: BASE}, clear=False), \
+                unittest.mock.patch.object(pib, '_emit', out.append):
+            rc = pib.main(argv + ['--jobs', '8', '--emit-env'])
+        self.assertEqual(rc, 0)
+        return out
+
+    def test_7153_masked_emit_env_never_emits_the_url_key(self):
+        for argv in (['setup', '--db', 'ai_memory_test_ci_9_1_x', '--run-id', RUN],
+                     ['setup', '--run-id', RUN]):
+            out = self.emit_for(argv)
+            self.assertFalse([ln for ln in out if ln.startswith(pib.URL_VAR + '=')], out)
+            self.assertNotIn('***', ''.join(out))
+            sourced = {pib.URL_VAR: BASE}
+            sourced.update(dict(ln.split('=', 1) for ln in out))
+            self.assertEqual(sourced[pib.URL_VAR], BASE, 'sourcing the masked output keeps the real URL')
+
+    def test_7153_masked_output_over_the_real_url_still_tears_down(self):
+        out = self.emit_for(['setup', '--db', 'ai_memory_test_ci_9_1_x', '--run-id', RUN])
+        env = {pib.URL_VAR: BASE}
+        env.update(dict(ln.split('=', 1) for ln in out))
+        rec = Recorder()
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec), \
+                unittest.mock.patch.dict(os.environ, env, clear=True):
+            rc = pib.main(['teardown', '--run-id', RUN])
+        self.assertEqual(rc, 0)
+        self.assertTrue(rec.calls)
+        for _, kw in rec.calls:
+            self.assertEqual(kw['env'].get('PGPASSWORD'), 'pw')
+
+    def test_7152_sigterm_during_minted_setup_drops_the_owned_base(self):
+        d = Path(scratch_dir())
+        ready, sqllog = d / 'ready', d / 'sql.log'
+        driver = d / 'driver.py'
+        driver.write_text(
+            'import importlib.util, sys, time\n'
+            'spec = importlib.util.spec_from_file_location("pib", %r)\n'
+            'pib = importlib.util.module_from_spec(spec)\n'
+            'sys.modules["pib"] = pib\n'
+            'spec.loader.exec_module(pib)\n'
+            'class R:\n'
+            '    def __init__(s, out=""):\n'
+            '        s.returncode, s.stdout, s.stderr = 0, out, ""\n'
+            'def fake(argv, **kw):\n'
+            '    sql = argv[argv.index("-c") + 1]\n'
+            '    open(%r, "a").write(sql + "\\n")\n'
+            '    if "max_connections" in sql:\n'
+            '        return R("1000|3|0|10\\n")\n'
+            '    if sql.startswith("CREATE EXTENSION"):\n'
+            '        open(%r, "w").write("x")\n'
+            '        time.sleep(60)\n'
+            '    return R()\n'
+            'pib.subprocess.run = fake\n'
+            'sys.exit(pib.main(["setup", "--url", %r, "--jobs", "1", "--run-id", "rsig"]))\n'
+            % (str(SCRIPT), str(sqllog), str(ready), BASE))
+        proc = subprocess.Popen([sys.executable, str(driver)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True)
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        deadline = time.time() + 30
+        while not ready.exists() and time.time() < deadline and proc.poll() is None:
+            time.sleep(0.05)
+        self.assertTrue(ready.exists(), 'the extension stall was never reached')
+        proc.send_signal(signal.SIGTERM)
+        _, err = proc.communicate(timeout=30)
+        self.assertEqual(proc.returncode, -signal.SIGTERM, 'the signal status is preserved: ' + err[-300:])
+        sql = sqllog.read_text().splitlines()
+        created = [s for s in sql if s.startswith('CREATE DATABASE "ci_base_')]
+        self.assertEqual(len(created), 1, sql)
+        name = created[0].split('"')[1]
+        self.assertIn('DROP DATABASE IF EXISTS "%s"' % name, sql, 'SIGTERM must reclaim the owned base')
+        self.assertFalse([s for s in sql if 'FORCE' in s.upper()])
+
+    def test_7156_sweep_keeps_the_idle_clone_of_an_active_family_sharing_a_run_id(self):
+        old, act = 'ci_base_1_1700000000_dddddddd', 'ci_base_1_1700000001_aaaaaaaa'
+        clone = 'ai_memory_t_rshr_1700000000_0123abcd'
+        names = [old, old + '_tpl', act, act + '_tpl', clone]
+        comments = {
+            old: pib.family_marker(old, fake_oid(old), 'rshr', pib.PHASE_TERMINAL, terminal_at=1700001000,
+                                   intent=pib.INTENT_TEARDOWN, reason='teardown'),
+            act: pib.family_marker(act, fake_oid(act), 'rshr', pib.PHASE_ACTIVE),
+        }
+        rec = Recorder(FamilyOwnership7113().sweep_answer(names), dbs=names, comments=comments)
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
+            dropped = pib.sweep(BASE, 3600)
+        self.assertNotIn(clone, dropped, 'the ACTIVE family clone is not owned by the sweep')
+        self.assertIn(clone, rec.dbs)
+        self.assertIn(old, rec.dbs, 'the TERMINAL base is kept while that clone exists')
+        self.assertTrue({act, act + '_tpl'} <= rec.dbs)
+
+    def test_7156_terminal_family_without_a_shared_run_is_still_reaped(self):
+        old = 'ci_base_1_1700000000_dddddddd'
+        clone = 'ai_memory_t_rold_1700000000_0123abcd'
+        names = [old, old + '_tpl', clone]
+        comments = {old: pib.family_marker(old, fake_oid(old), 'rold', pib.PHASE_TERMINAL, terminal_at=1700001000,
+                                           intent=pib.INTENT_TEARDOWN, reason='teardown')}
+        rec = Recorder(FamilyOwnership7113().sweep_answer(names), dbs=names, comments=comments)
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
+            dropped = pib.sweep(BASE, 3600)
+        self.assertEqual(dropped, [clone, old + '_tpl', old])
+
+    def test_7157_null_high_water_is_refused(self):
+        def answer(argv, kw):
+            sql = argv[argv.index('-c') + 1]
+            if "to_regclass('lineage_integrity_watermark')" in sql:
+                return Result(0, 't\n')
+            if 'FROM lineage_integrity_watermark' in sql:
+                if '||' in sql:
+                    return Result(0, '\n')  # concat with a NULL column is NULL: an empty line
+                if 'coalesce' in sql:
+                    return Result(0, 'agent_lineage|NULL\n')
+                return Result(0, 'agent_lineage|\n')
+            return default_answer(argv, kw)
+        with Patched(Recorder(answer)):
+            with self.assertRaises(pib.WrapperError) as ctx:
+                pib.lineage_precheck(BASE, 'ai_memory_test_ci_9_1_x')
+        self.assertIn('could not read the lineage watermark', str(ctx.exception))
+
+    def test_7159_failed_teardown_names_the_held_clone_and_marks_teardown_intent(self):
+        helper = FamilyOwnership7113()
+        name = helper.BASE_NAME
+        clone = 'ai_memory_t_%s_1700000000_0123abcd' % RUN
+        rec = Recorder(helper.teardown_answer([clone], fail_drop={clone}), dbs=[name, name + '_tpl', clone],
+                       comments={name: helper.marker(name, pib.PHASE_ACTIVE)})
+        rc, _, err = helper.run_main(['teardown', '--url', helper.base_url(name), '--run-id', RUN], rec,
+                                     {pib.BASE_VAR: name})
+        self.assertNotEqual(rc, 0)
+        self.assertIn(clone, err, 'stderr names the held clone')
+        found = pib.parse_family_marker(rec.comments[name], name, fake_oid(name))
+        self.assertEqual((found['phase'], found['intent']), (pib.PHASE_TERMINAL, pib.INTENT_TEARDOWN))
 
 
 class NoShell(unittest.TestCase):
