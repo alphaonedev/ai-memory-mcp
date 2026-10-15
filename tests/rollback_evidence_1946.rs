@@ -91,7 +91,9 @@ fn fresh_dir(label: &str) -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
         builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
-    builder.tempdir_in(&root).expect("tempdir under .local-runs")
+    builder
+        .tempdir_in(&root)
+        .expect("tempdir under .local-runs")
 }
 
 fn open_db(dir: &std::path::Path) -> (PathBuf, Connection) {
