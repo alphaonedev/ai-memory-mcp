@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Refuse new references to the shared ``ai_memory_test`` database (#7031 H4).
+"""Refuse new references to the shared ai_memory_test database (#7031 H4).
 
-The bare name ``ai_memory_test`` is the long-lived shared database on the
+The bare name ai_memory_test is the long-lived shared database on the
 Postgres test hosts; its lineage high-water mark poisons every clone (#6983).
 Lanes must mint an ephemeral ``ai_memory_test_*`` database instead.  Names that
 merely start with ``ai_memory_test_`` never match.
@@ -15,27 +15,46 @@ Rules, applied to non-comment lines only (NAME is the bare shared name):
       database_name (any case), a lower-case key ending in _db, _dbname,
       _db_name, _database or _database_name, or an upper-case word containing
       DB or DATABASE; the key may be quoted
-  R6  a quoted literal    "NAME" or 'NAME'
+  R6  a quoted literal    "NAME", 'NAME' or `NAME` (a backtick in Markdown is a prose
+                          code span and is not matched there)
   R7  SQL                 DATABASE NAME (any case: GRANT/DROP/ALTER/CREATE ...)
   R8  positional argument NAME as a word after psql, createdb, dropdb, pg_dump
                           or pg_restore (reported only when R2/R3 did not match)
+  R9  psql meta-command   \\c NAME or \\connect NAME at the start of a line
+Matching is case-insensitive for the name (Postgres folds unquoted identifiers).
+A shell line that ends in a backslash is also scanned joined with the lines it
+continues (not in .sql); the hit is reported at its first physical line.
 
 A line that matches several rules gets one annotation listing all of them.
 Every rule scans in linear time (no nested or overlapping quantifiers), so a
 one MiB single-line file cannot stall the CI classify job.
 
-Scan scope: the DEFAULT_PATHS directories (all must exist, a renamed one exits
-2), every file directly under --root (Dockerfile*, install.sh, entrypoint
-scripts), and any ``--paths`` entry (it must exist).  A symlinked directory is
-not traversed.  An ``--`` line is a comment only in .sql files.
+Comments are suffix-aware: ``//`` starts a comment in Rust, C-family, JS/TS and
+Go files only, ``#`` in shell, Python, YAML, TOML, Dockerfile-style and
+suffix-less files only; ``#[``, ``#!`` and C preprocessor lines are code.  A
+file of unknown suffix treats both as comments.  An ``--`` line is a comment
+only in .sql files.
 
-A static gate cannot follow computed names (concat!, string building); the
-runtime refusals (tests/common/lane_db.rs, the pg_isolated_binary.py base rule)
-cover those.  An unreadable file or directory, a missing path and a bad
-argument exit 2, never 0.
+Scan scope is a deny list: every top-level directory except SKIP_TOP (build
+output, VCS, scratch, changelog fragments, vendored code), every file directly
+under --root (Dockerfile*, install.sh, entrypoint scripts), and any ``--paths``
+entry (it must exist).  The DEFAULT_PATHS directories must all exist (a renamed
+one exits 2).  A symlinked directory is not traversed.
+
+Encoding: a UTF-8 BOM is stripped; a UTF-16 or UTF-32 BOM exits 2 naming the
+file (it cannot be decoded as text, fail closed); a file with NUL bytes is
+scanned both as is and with the NULs removed.
+
+Out of scope, by design: a static gate cannot follow computed names.  That is
+env indirection (``TARGET=NAME`` then ``psql -d "$TARGET"``),
+string concatenation (``concat!``, string building), an ``_`` escape or a split
+of the name, and a percent-encoded URL.  The runtime refusals (tests/common/lane_db.rs,
+the pg_isolated_binary.py base rule) cover those.  An unreadable file or
+directory, a missing path and a bad argument exit 2, never 0.
 
 Allowlist lines are ``path:line  # citation``: line-pinned only, a non-empty
-citation is required, a duplicate pin or a whole-file entry exits 2.  It is a
+citation is required, a duplicate pin or a whole-file entry exits 2.  The path
+is normalised (``./x`` is ``x``); an absolute path or a ``..`` segment exits 2.  It is a
 ratchet: an entry that no longer matches a hit exits 2, so the baseline may
 only shrink.  The one bounded exception is a citation carrying
 ``[landing-order #7088]`` on the seven pins of scripts/ci/tests/test_pg_isolated_binary.py
@@ -47,24 +66,33 @@ for the marker's removal.  Remove the constants and markers once #7088 lands.
 Exit: 0 clean, 1 violations, 2 usage error, bad allowlist or stale entry.
 """
 import argparse
+import codecs
 import os
 import re
 import sys
-from pathlib import Path
-from typing import Callable, List, Optional, Set, Tuple
+from pathlib import Path, PurePosixPath
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 DB = 'ai_memory' + '_test'
 NAME_CHAR = r'[A-Za-z0-9_]'
 NOT_NAME_CONT = r'(?!' + NAME_CHAR + r')'
-DEFAULT_PATHS = ['.github/workflows', 'tests', 'scripts', 'infra', 'src', 'packaging', 'docs',
+DEFAULT_PATHS = ['.github', 'tests', 'scripts', 'infra', 'src', 'packaging', 'docs',
                  'benches', 'clients', 'conformance', 'deploy', 'examples', 'hooks', 'loadtest',
                  'ops', 'plugins', 'sdk', 'tools']
 DEFAULT_ALLOWLIST = 'scripts/qc-allowlists/shared-test-db-allow.txt'
-SKIP_TOP = {'target', '.git', '.local-runs'}
+SKIP_TOP = frozenset({'target', '.git', '.local-runs', 'changelog.d', 'vendor', 'node_modules'})
 SKIP_ANY = {'node_modules', '__pycache__'}
-COMMENT = re.compile(r'^\s*(#|//)')
 COMMENT_SQL = re.compile(r'^\s*(#|//|--(\s|$))')
 SQL_SUFFIX = '.sql'
+SLASH_SUFFIXES = frozenset({'.rs', '.js', '.mjs', '.ts', '.tsx', '.jsx', '.go', '.c', '.h', '.cc', '.cpp', '.hpp',
+                            '.java'})
+HASH_SUFFIXES = frozenset({'.sh', '.bash', '.py', '.yml', '.yaml', '.toml', '.cfg', '.ini', '.conf', '.env',
+                           '.rb', '.pl', '.mk', ''})
+PREPROCESSOR = re.compile(r'#\s*(define|include|ifn?def|if|else|elif|endif|pragma|undef|error|warning)\b')
+NOT_COMMENT_AFTER_HASH = ('#[', '#!')
+UTF_WIDE_BOMS = (codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE, codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)
+NAME_RE = re.compile(DB, re.IGNORECASE)
+CONTINUATION = '\\'
 QUOTES = '"\''
 TOKEN_STRIP = '"\'`;,()<>'
 KEY_LOWER = {'pgdatabase', 'dbname', 'db', 'database', 'db_name', 'database_name'}
@@ -115,12 +143,10 @@ def _assignment_key(line: str, name_at: int) -> str:
 def _name_offsets(line: str) -> List[int]:
     """Offsets of every NAME occurrence that is not the start of a longer name."""
     out = []  # type: List[int]
-    at = line.find(DB)
-    while at != -1:
-        after = at + len(DB)
+    for found in NAME_RE.finditer(line):
+        after = found.end()
         if after >= len(line) or not _is_word_char(line[after]):
-            out.append(at)
-        at = line.find(DB, at + 1)
+            out.append(found.start())
     return out
 
 
@@ -139,34 +165,93 @@ def rule_r8(line: str) -> bool:
         bare = token.strip(TOKEN_STRIP)
         if bare.rsplit('/', 1)[-1] in POSITIONAL_COMMANDS:
             seen_command = True
-        elif seen_command and bare == DB:
+        elif seen_command and bare.lower() == DB:
             return True
     return False
 
 
-R4_FLAG = re.compile(r'\s-d\s+' + DB + NOT_NAME_CONT)
+R4_FLAG = re.compile(r'\s-d\s+' + DB + NOT_NAME_CONT, re.IGNORECASE)
 RULES = (
-    ('R1', re.compile('/' + DB + NOT_NAME_CONT).search),
-    ('R2', re.compile(r'POSTGRES_DB[=:]\s*' + DB + NOT_NAME_CONT).search),
-    ('R3', re.compile(r'(--db(name)?|-d)(\s+|=)?["\']?' + DB + NOT_NAME_CONT).search),
+    ('R1', re.compile('/' + DB + NOT_NAME_CONT, re.IGNORECASE).search),
+    ('R2', re.compile(r'POSTGRES_DB[=:]\s*' + DB + NOT_NAME_CONT, re.IGNORECASE).search),
+    ('R3', re.compile(r'(--db(name)?|-d)(\s+|=)?["\']?' + DB + NOT_NAME_CONT, re.IGNORECASE).search),
     ('R4', rule_r4),
     ('R5', rule_r5),
-    ('R6', re.compile('["\']' + DB + '["\']').search),
+    ('R6', re.compile('["\']' + DB + '["\']', re.IGNORECASE).search),
     ('R7', re.compile(r'\bDATABASE\s+' + DB + NOT_NAME_CONT, re.IGNORECASE).search),
     ('R8', rule_r8),
+    ('R9', re.compile(r'^\s*\\(c|connect)\s+["\']?' + DB + NOT_NAME_CONT, re.IGNORECASE).search),
 )  # type: Tuple[Tuple[str, LinePredicate], ...]
 R8_SUPPRESSED_BY = ('R2', 'R3')
+BACKTICK_LITERAL = re.compile('`' + DB + '`', re.IGNORECASE).search  # an R6 form outside prose files
+PROSE_SUFFIXES = frozenset({'.md', '.markdown'})
 
 
 def skipped(rel: Path) -> bool:
     return rel.parts[0] in SKIP_TOP or bool(SKIP_ANY.intersection(rel.parts))
 
 
-def line_rules(line: str) -> List[str]:
-    rules = [rule for rule, check in RULES if check(line)]
+def raw_rules(line: str, prose: bool = False) -> Set[str]:
+    if not NAME_RE.search(line):
+        return set()
+    found = {rule for rule, check in RULES if check(line)}
+    if not prose and BACKTICK_LITERAL(line):
+        found.add('R6')
+    return found
+
+
+def finish_rules(found: Set[str]) -> List[str]:
+    rules = [rule for rule, _check in RULES if rule in found]
     if 'R8' in rules and any(other in rules for other in R8_SUPPRESSED_BY):
         rules.remove('R8')
     return rules
+
+
+def line_rules(line: str) -> List[str]:
+    return finish_rules(raw_rules(line))
+
+
+def is_comment(line: str, suffix: str) -> bool:
+    if suffix == SQL_SUFFIX:
+        return bool(COMMENT_SQL.match(line))
+    body = line.lstrip()
+    if suffix in SLASH_SUFFIXES:
+        return body.startswith('//')
+    hash_comment = body.startswith('#') and not body.startswith(NOT_COMMENT_AFTER_HASH)
+    if suffix in HASH_SUFFIXES:
+        return hash_comment
+    return (hash_comment and not PREPROCESSOR.match(body)) or body.startswith('//')
+
+
+def continues(line: str, suffix: str) -> bool:
+    return line.endswith(CONTINUATION) and not is_comment(line, suffix)
+
+
+def join_continuation(lines: List[str], start: int) -> str:
+    parts = [lines[start][:-1]]
+    pos = start
+    while lines[pos].endswith(CONTINUATION) and pos + 1 < len(lines):
+        pos += 1
+        parts.append(lines[pos][:-1] if lines[pos].endswith(CONTINUATION) else lines[pos])
+    return ' '.join(part.strip() for part in parts)
+
+
+def scan_text(text: str, suffix: str) -> Dict[int, List[str]]:
+    """Map line number to the rules it hits.  A continued shell line is also scanned joined."""
+    lines = [raw.rstrip('\r') for raw in text.split('\n')]
+    joins = suffix != SQL_SUFFIX
+    out = {}  # type: Dict[int, List[str]]
+    prose = suffix in PROSE_SUFFIXES
+    for index, line in enumerate(lines):
+        if is_comment(line, suffix):
+            continue
+        found = raw_rules(line, prose)
+        if joins and continues(line, suffix) and not (index and continues(lines[index - 1], suffix)):
+            found |= raw_rules(join_continuation(lines, index), prose)
+        rules = finish_rules(found)
+        if rules:
+            out[index + 1] = rules
+    return out
 
 
 def iter_files(root: Path, paths: List[str], unreadable: List[str]) -> List[Path]:
@@ -196,6 +281,12 @@ def root_files(root: Path) -> List[str]:
     return sorted(p.name for p in root.iterdir() if p.is_file() and not skipped(Path(p.name)))
 
 
+def default_scan_paths(root: Path) -> List[str]:
+    """Deny-list scope: every top-level directory except SKIP_TOP, plus DEFAULT_PATHS and the root files."""
+    tops = sorted(p.name for p in root.iterdir() if p.is_dir() and not p.is_symlink() and p.name not in SKIP_TOP)
+    return sorted(set(DEFAULT_PATHS) | set(tops)) + root_files(root)
+
+
 def scan(root: Path, paths: List[str]) -> Tuple[List[Hit], Set[str], List[str]]:
     hits = []  # type: List[Hit]
     scanned = set()  # type: Set[str]
@@ -205,18 +296,22 @@ def scan(root: Path, paths: List[str]) -> Tuple[List[Hit], Set[str], List[str]]:
         rel = path.relative_to(top).as_posix()
         scanned.add(rel)
         try:
-            text = path.read_bytes().decode('utf-8', errors='surrogateescape')
+            data = path.read_bytes()
         except OSError:
             unreadable.append(rel)
             continue
-        comment = COMMENT_SQL if path.suffix == SQL_SUFFIX else COMMENT
-        for number, line in enumerate(text.split('\n'), 1):
-            line = line.rstrip('\r')
-            if DB not in line or comment.match(line):
-                continue
-            rules = line_rules(line)
-            if rules:
-                hits.append((rel, number, ','.join(rules)))
+        if data.startswith(UTF_WIDE_BOMS):
+            unreadable.append(rel)  # UTF-16/32 cannot be scanned as text: fail closed
+            continue
+        if data.startswith(codecs.BOM_UTF8):
+            data = data[len(codecs.BOM_UTF8):]
+        found = scan_text(data.decode('utf-8', errors='surrogateescape'), path.suffix)
+        if b'\x00' in data:
+            stripped = data.replace(b'\x00', b'').decode('utf-8', errors='surrogateescape')
+            for number, rules in scan_text(stripped, path.suffix).items():
+                found.setdefault(number, rules)
+        for number in sorted(found):
+            hits.append((rel, number, ','.join(found[number])))
     return hits, scanned, unreadable
 
 
@@ -240,6 +335,10 @@ def load_allowlist(path: Path) -> Tuple[List[Tuple[str, int]], Set[Tuple[str, in
             raise AllowlistError('%s: expected path:line, whole-file entries are not allowed' % where)
         if not hash_sep or not citation.strip():
             raise AllowlistError('%s: a non-empty # citation is required' % where)
+        pure = PurePosixPath(name)
+        if pure.is_absolute() or '..' in pure.parts or not pure.parts:
+            raise AllowlistError('%s: the path must be relative without .. segments' % where)
+        name = pure.as_posix()
         pin = (name, int(tail))
         if pin in seen:
             raise AllowlistError('%s: duplicate pin' % where)
@@ -287,7 +386,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     except AllowlistError as exc:
         print('usage: %s: %s' % (allow_path, exc), file=sys.stderr)
         return 2
-    paths = args.paths if args.paths else DEFAULT_PATHS + (root_files(root) if root.is_dir() else [])
+    paths = args.paths if args.paths else default_scan_paths(root)
     try:
         hits, scanned, unreadable = scan(root, paths)
     except (OSError, ValueError) as exc:
