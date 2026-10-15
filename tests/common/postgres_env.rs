@@ -78,6 +78,61 @@
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 
+/// Longest the schema drop waits for a lock before it fails (#7031 N1). A
+/// connection of the test process that is still `idle in transaction` holds
+/// locks the `DROP SCHEMA` needs; without a ceiling the job hangs until its
+/// own timeout while holding the minted database family.
+pub const SCHEMA_DROP_LOCK_TIMEOUT: &str = "30s";
+
+/// Why a schema cleanup did not complete.
+#[derive(Debug)]
+pub enum CleanupError {
+    /// The cleanup connection could not be opened (best effort: reported, not fatal).
+    Connect(String),
+    /// `DROP SCHEMA` itself failed, for example on the lock timeout (fatal for the test).
+    Drop(String),
+}
+
+/// Drop `schema_name` on a dedicated connection that has
+/// `lock_timeout = <lock_timeout>`, so a stuck cleanup fails instead of waiting forever.
+pub async fn drop_schema_bounded(
+    base_url: &str,
+    schema_name: &str,
+    lock_timeout: &str,
+) -> Result<(), CleanupError> {
+    assert!(
+        lock_timeout.chars().all(|c| c.is_ascii_alphanumeric()),
+        "lock_timeout is a literal such as 30s"
+    );
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(10))
+        .connect(base_url)
+        .await
+        .map_err(|e| CleanupError::Connect(format!("connect for drop of {schema_name}: {e}")))?;
+    let outcome = async {
+        let mut conn = pool.acquire().await.map_err(|e| {
+            CleanupError::Connect(format!("acquire for drop of {schema_name}: {e}"))
+        })?;
+        sqlx::query(&format!("SET lock_timeout = '{lock_timeout}'"))
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| CleanupError::Drop(format!("SET lock_timeout failed: {e}")))?;
+        sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema_name} CASCADE"))
+            .execute(&mut *conn)
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                CleanupError::Drop(format!(
+                    "DROP SCHEMA {schema_name} CASCADE failed (lock_timeout {lock_timeout}): {e}"
+                ))
+            })
+    }
+    .await;
+    pool.close().await;
+    outcome
+}
+
 /// Per-test isolated Postgres schema + URL wrapper.
 ///
 /// Created via [`PostgresTestEnv::new`]; the returned struct holds a
@@ -125,6 +180,7 @@ impl PostgresTestEnv {
         let cleanup = SchemaCleanupGuard {
             base_url: base_url.clone(),
             schema_name: schema_name.clone(),
+            finished: false,
         };
 
         Some(Self {
@@ -133,6 +189,30 @@ impl PostgresTestEnv {
             schema_name,
             _cleanup: cleanup,
         })
+    }
+
+    /// End the test: close every pool of the test first, then drop the schema,
+    /// all on the test runtime (#7031 N1).
+    ///
+    /// Why: sqlx rolls a dropped `Transaction` back lazily, on the next poll of
+    /// its connection. The drop-time guard blocks the (single-threaded) test
+    /// runtime while it runs `DROP SCHEMA`, so that rollback never ships and
+    /// the `DROP SCHEMA` waits on a lock the same process still holds. Closing
+    /// the pools here lets the pending rollbacks run, and the awaited drop
+    /// leaves the runtime free. `pools` are every `PgPool` the test opened
+    /// (`store.pool()` for a `PostgresStore`). A drop that fails, for example on
+    /// the `lock_timeout`, panics so the test result is a failure, not a hang.
+    pub async fn finish(mut self, pools: &[&PgPool]) {
+        for pool in pools {
+            pool.close().await;
+        }
+        self._cleanup.finished = true; // the guard must not drop the schema a second time
+        match drop_schema_bounded(&self.base_url, &self.schema_name, SCHEMA_DROP_LOCK_TIMEOUT).await
+        {
+            Ok(()) => {}
+            Err(CleanupError::Connect(m)) => eprintln!("PostgresTestEnv finish: {m}"),
+            Err(CleanupError::Drop(m)) => panic!("PostgresTestEnv finish: {m}"),
+        }
     }
 
     /// The per-test URL with `?options=-c%20search_path=<schema>`
@@ -174,59 +254,56 @@ impl PostgresTestEnv {
 pub struct SchemaCleanupGuard {
     base_url: String,
     schema_name: String,
+    /// Set by [`PostgresTestEnv::finish`], which already dropped the schema.
+    finished: bool,
 }
 
 impl Drop for SchemaCleanupGuard {
     fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
         let base_url = self.base_url.clone();
         let schema_name = self.schema_name.clone();
         // Drop is sync; sqlx is async. Spawn a thread that builds its
         // own tokio runtime to run the DROP SCHEMA. The thread joins
         // on drop completion so the schema is gone before the next
         // test's setup runs (important for the issue #1213 tests that
-        // assert exact catalog row counts).
+        // assert exact catalog row counts). The drop runs with a
+        // `lock_timeout` (#7031 N1): a lock held by this very process
+        // fails the cleanup within SCHEMA_DROP_LOCK_TIMEOUT instead of
+        // hanging the job. Tests should call `finish` instead, which
+        // closes their pools first.
         let join = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("build drop-time tokio runtime");
-            rt.block_on(async move {
-                let pool = match PgPoolOptions::new()
-                    .max_connections(1)
-                    .acquire_timeout(std::time::Duration::from_secs(10))
-                    .connect(&base_url)
-                    .await
-                {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!(
-                            "PostgresTestEnv cleanup: failed to connect for drop of {schema_name}: {e}"
-                        );
-                        return;
-                    }
-                };
-                if let Err(e) = sqlx::query(&format!(
-                    "DROP SCHEMA IF EXISTS {schema_name} CASCADE"
-                ))
-                .execute(&pool)
-                .await
-                {
-                    eprintln!(
-                        "PostgresTestEnv cleanup: DROP SCHEMA {schema_name} CASCADE failed: {e}"
-                    );
-                }
-            });
+            rt.block_on(drop_schema_bounded(
+                &base_url,
+                &schema_name,
+                SCHEMA_DROP_LOCK_TIMEOUT,
+            ))
         });
-        // We deliberately let the thread join here so the cleanup
-        // completes before the next test's PostgresTestEnv::new runs.
         // join() returning an Err means the thread panicked during
         // cleanup; we surface that to stderr but do NOT re-panic from
         // Drop (double-panic during unwind would abort the process).
-        if let Err(e) = join.join() {
-            eprintln!(
+        match join.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(CleanupError::Connect(m))) => {
+                eprintln!("PostgresTestEnv cleanup: {m}");
+            }
+            Ok(Err(CleanupError::Drop(m))) => {
+                eprintln!("PostgresTestEnv cleanup: {m}");
+                // Fail the test loudly, but never double-panic during unwind.
+                if !std::thread::panicking() {
+                    panic!("PostgresTestEnv cleanup: {m}");
+                }
+            }
+            Err(e) => eprintln!(
                 "PostgresTestEnv cleanup thread for {} panicked: {:?}",
                 self.schema_name, e
-            );
+            ),
         }
     }
 }

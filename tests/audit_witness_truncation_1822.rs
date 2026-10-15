@@ -914,6 +914,8 @@ mod postgres_parity {
             .await
             .ok();
         witness::shutdown();
+        // #7031 N1: close the pool before the schema drop (see PostgresTestEnv::finish).
+        env.finish(&[pg.pool()]).await;
     }
 }
 

@@ -1716,6 +1716,9 @@ mod postgres_parity {
             1,
             "refused postgres hijack leaves no history mutation"
         );
+        // #7031 N1: close both pools before the schema drop so a lazily
+        // rolled-back transaction cannot hold a lock the drop waits for.
+        env.finish(&[store.pool(), &pool]).await;
     }
 
     #[tokio::test]
