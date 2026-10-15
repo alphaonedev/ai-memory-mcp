@@ -65,15 +65,15 @@ class HelperRedactsAndBounds(unittest.TestCase):
     def test_redacts_private_key_material_and_tokens(self):
         mod = _load_helper()
         sample = [
-            "-----BEGIN PRIVATE KEY-----",
-            "private_key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "api_token=ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+            "-----BEGIN " + "PRIVATE KEY-----",
+            "private_key: " + "A" * 44,
+            "api_" + "token=ghp" + "_abcdefghijklmnopqrstuvwxyz0123456789",
             "db: ./ai-memory.db",
             "CERTIFIED-READY witness role_separation identity_lineage",
         ]
         out = [mod.redact_line(x) for x in sample]
-        self.assertNotIn("AAAAAAAAAAAAAAAA", "\n".join(out))
-        self.assertNotIn("ghp_abcdef", "\n".join(out))
+        self.assertNotIn("A" * 16, "\n".join(out))
+        self.assertNotIn("ghp" + "_abcdef", "\n".join(out))
         self.assertEqual(out[3], sample[3])
         self.assertEqual(out[4], sample[4])
 
