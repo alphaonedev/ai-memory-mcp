@@ -86,7 +86,26 @@ unset.
   race with another binary fails the drop instead of terminating that binary.
 * **Admin-only cross-run sweep.**
   `pg_isolated_binary.py sweep --older-than N` (N at least 600 s) drops idle
-  clones of any run. CI never calls it (invariant `G2-no-ci-sweep`).
+  clones of any run except a run whose family is ACTIVE. CI never calls it
+  (invariant `G2-no-ci-sweep`).
+* **Family ownership (#7113).** When `setup` auto-mints a `ci_base_*` base it
+  writes an ACTIVE marker as the base's COMMENT (strict JSON: protocol
+  `ai-memory-pg-family` version 1, the base name and OID, the run id) and reads
+  it back; an unverified marker fails setup and drops the base. `teardown`
+  first moves the family to TERMINAL (it refuses another run's family before
+  any drop), drops the clones and the template, drops the base last, and exits
+  2 when any drop failed, keeping the TERMINAL base for the sweep. The sweep
+  reclaims a family only when its base carries a valid TERMINAL marker at least
+  N seconds old and no member has a session, and re-reads the marker and OID
+  before it drops the base. An unmarked, malformed or ACTIVE family, and an
+  orphan template, are always preserved: age, PID or a name prefix never
+  confer ownership, so an ACTIVE family survives a prepared-setup or
+  interbinary gap with no session at all. An explicit `--db` base is the
+  caller's and is never marked.
+* **Admin revoke.** `pg_isolated_binary.py revoke --db <ci_base_*> --run-id ID
+  --reason TEXT` marks an abandoned, idle family TERMINAL (intent `REVOKE`) so
+  the sweep can reclaim it after the age delay. It refuses while the base, the
+  template or any clone of the run has a session, and it never drops anything.
 * **No secrets in argv.** `psql` gets the connection through libpq environment
   variables (`PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`,
   `PGSSLMODE`, ...). ci.yml passes the URL through the environment, never with

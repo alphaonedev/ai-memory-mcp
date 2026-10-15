@@ -26,9 +26,24 @@ Sub-commands (``-h`` on each):
               binary under ``--log-dir``; a failing binary's tail is echoed.
               SIGTERM/SIGINT stop dispatch, signal every child group, drop the
               clones and exit 143.
-``teardown``  drop THIS run's clones (``--run-id``) and the template.
+``teardown``  drop THIS run's clones (``--run-id``) and the template; for an
+              auto-minted base, mark the family TERMINAL first and drop the
+              base last. Exits 2 when any drop failed.
+``revoke``    ADMIN ONLY: mark an idle auto-minted family TERMINAL (``--db``,
+              ``--run-id``, ``--reason``) so the sweep may reclaim it. Never
+              drops anything.
 ``sweep``     ADMIN ONLY, never run by CI: drop idle clones of any run that
-              are older than ``--older-than`` seconds (at least 600).
+              are older than ``--older-than`` seconds (at least 600), except
+              clones of an ACTIVE family, and reclaim an auto-minted family
+              only once its base carries a TERMINAL marker at least that old.
+
+Family ownership (#7113): when ``setup`` auto-mints a ``ci_base_*`` base it
+writes an ACTIVE marker (strict JSON, ``ai-memory-pg-family`` version 1: base
+name and OID, run id) as the base's COMMENT and reads it back. Age, PID or a
+name prefix never confer ownership: an unmarked, malformed or ACTIVE family is
+always preserved, including in a prepared-setup or interbinary gap with zero
+sessions. Only ``teardown`` and ``revoke`` move a family to TERMINAL, and
+TERMINAL never becomes ACTIVE.
 
 No drop ever uses the FORCE option: a database with a session (another run's
 binary, or a held clone) cannot be dropped, so a race fails instead of
@@ -47,6 +62,7 @@ could not be minted or held, 143 terminated, otherwise the worst exit code of
 the cargo runs. Standard library only, Python 3.9+.
 """
 import argparse
+import json
 import os
 import re
 import signal
@@ -92,6 +108,17 @@ TERM_GRACE_SECS = 5.0
 LOG_TAIL_LINES = 200
 CONNECT_TIMEOUT_SECS = '30'
 IN_USE_TEXT = 'being accessed by other users'
+FAMILY_PROTOCOL = 'ai-memory-pg-family'
+FAMILY_VERSION = 1
+PHASE_ACTIVE = 'ACTIVE'
+PHASE_TERMINAL = 'TERMINAL'
+INTENT_TEARDOWN = 'TEARDOWN'
+INTENT_REVOKE = 'REVOKE'
+FAMILY_KEYS = frozenset(('protocol', 'version', 'phase', 'base', 'base_oid', 'run_id',
+                         'terminal_at', 'intent', 'reason'))
+FAMILY_REASON_MAX = 512
+FAMILY_MARKER_MAX = 2048
+TEARDOWN_REASON = 'teardown'
 EXIT_USAGE = 2
 EXIT_MINT = 3
 EXIT_TERM = 143
@@ -427,6 +454,167 @@ def drop_base(url: str, name: str) -> bool:
         return False
 
 
+# --- family ownership (#7113) ---------------------------------------------
+
+_FAMILY_PHASES = (PHASE_ACTIVE, PHASE_TERMINAL)
+_FAMILY_INTENTS = (INTENT_TEARDOWN, INTENT_REVOKE)
+
+
+def is_minted_base(name: str) -> bool:
+    """True for an auto-minted ``ci_base_<pid>_<secs>_<8hex>`` base (not its template)."""
+    return bool(_MINTED_BASE_RE.match(name or '')) and not name.endswith(TEMPLATE_SUFFIX)
+
+
+def _int_field(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _valid_reason(reason: object) -> bool:
+    return (isinstance(reason, str) and 0 < len(reason) <= FAMILY_REASON_MAX
+            and reason == reason.strip() and reason.isprintable() and any(ch.isalnum() for ch in reason))
+
+
+def family_marker(base: str, oid: int, run_id: str, phase: str, terminal_at: Optional[int] = None,
+                  intent: Optional[str] = None, reason: Optional[str] = None) -> str:
+    """The canonical marker text for a family base COMMENT (strict JSON)."""
+    record = {'protocol': FAMILY_PROTOCOL, 'version': FAMILY_VERSION, 'phase': phase, 'base': base,
+              'base_oid': oid, 'run_id': run_id, 'terminal_at': terminal_at, 'intent': intent,
+              'reason': reason}
+    text = json.dumps(record, sort_keys=True, ensure_ascii=True)
+    if parse_family_marker(text, base, oid) is None:
+        raise WrapperError('refusing to write an invalid family marker for %s' % base)
+    return text
+
+
+def _no_duplicates(pairs: List[Tuple[str, object]]) -> Dict[str, object]:
+    record: Dict[str, object] = {}
+    for key, value in pairs:
+        if key in record:
+            raise ValueError('duplicate key %r' % key)
+        record[key] = value
+    return record
+
+
+def parse_family_marker(text: str, base: str, oid: int) -> Optional[Dict[str, object]]:
+    """The marker as a dict when it is a valid marker for exactly this base
+    (name and OID), else ``None``. Unknown keys, versions or phases, duplicate
+    keys and inconsistent terminal fields all make it invalid."""
+    if not text or len(text) > FAMILY_MARKER_MAX:
+        return None
+    try:
+        record = json.loads(text, object_pairs_hook=_no_duplicates)
+    except ValueError:
+        return None
+    if not isinstance(record, dict) or set(record) != FAMILY_KEYS:
+        return None
+    if record['protocol'] != FAMILY_PROTOCOL or record['version'] != FAMILY_VERSION \
+            or isinstance(record['version'], bool):
+        return None
+    if record['phase'] not in _FAMILY_PHASES or record['base'] != base:
+        return None
+    if not _int_field(record['base_oid']) or record['base_oid'] != oid:
+        return None
+    if not isinstance(record['run_id'], str) or not valid_run_id(record['run_id']):
+        return None
+    terminal = (record['terminal_at'], record['intent'], record['reason'])
+    if record['phase'] == PHASE_ACTIVE:
+        return record if terminal == (None, None, None) else None
+    if not _int_field(record['terminal_at']) or record['intent'] not in _FAMILY_INTENTS \
+            or not _valid_reason(record['reason']):
+        return None
+    return record
+
+
+def read_family(admin_url: str, base: str) -> Tuple[Optional[int], str]:
+    """``(oid, comment)`` of ``base`` from the catalog; ``(None, '')`` when it
+    does not exist."""
+    sql = ("SELECT d.oid, coalesce(shobj_description(d.oid, 'pg_database'), '') "
+           "FROM pg_database d WHERE d.datname = '%s'" % _checked_ident(base))
+    raw = psql(admin_url, sql, tuples=True)
+    if not raw.strip():
+        return None, ''
+    oid_text, sep, comment = raw.rstrip('\n').partition('|')
+    if not sep or not oid_text.isdigit():
+        raise WrapperError('could not read the family marker of %s' % base)
+    return int(oid_text), comment
+
+
+def _write_family(admin_url: str, base: str, oid: int, text: str) -> None:
+    """COMMENT the marker, then read it back: PostgreSQL only warns (3D000) and
+    exits 0 for a COMMENT on a missing database, so the write proves nothing."""
+    psql(admin_url, "COMMENT ON DATABASE %s IS '%s'" % (quote_ident(_checked_ident(base)),
+                                                       text.replace("'", "''")))
+    found_oid, found = read_family(admin_url, base)
+    if found_oid != oid or found != text:
+        raise WrapperError('the family marker of %s did not persist' % base)
+
+
+def _server_now(url: str) -> int:
+    raw = psql(url, 'SELECT extract(epoch FROM now())::bigint', tuples=True).strip()
+    if not raw.isdigit():
+        raise WrapperError('could not read the server clock (got %r)' % raw)
+    return int(raw)
+
+
+def mark_active(admin_url: str, base: str, run_id: str) -> None:
+    """Claim a freshly minted base for ``run_id`` (ACTIVE, verified)."""
+    oid, comment = read_family(admin_url, base)
+    if oid is None:
+        raise WrapperError('cannot mark %s ACTIVE: it does not exist' % base)
+    if comment:
+        raise WrapperError('refusing to mark %s ACTIVE: it already carries a COMMENT' % base)
+    _write_family(admin_url, base, oid, family_marker(base, oid, checked_run_id(run_id), PHASE_ACTIVE))
+    log('family %s ACTIVE for run %s' % (base, run_id))
+
+
+def terminalize(admin_url: str, base: str, run_id: str, intent: str, reason: str,
+                adopt: bool = False) -> Optional[Dict[str, object]]:
+    """Move ``run_id``'s family to TERMINAL (idempotent). Returns the marker, or
+    ``None`` for an unmarked (legacy) base unless ``adopt`` claims it. A foreign
+    run, a malformed marker or a foreign COMMENT is refused."""
+    checked_run_id(run_id)
+    oid, comment = read_family(admin_url, base)
+    if oid is None:
+        if adopt:
+            raise WrapperError('cannot mark %s TERMINAL: it does not exist' % base)
+        return None
+    if not comment and not adopt:
+        return None
+    found = parse_family_marker(comment, base, oid) if comment else None
+    if comment and found is None:
+        raise WrapperError('refusing %s: its COMMENT is not a valid family marker' % base)
+    if found is not None and found['run_id'] != run_id:
+        raise WrapperError('refusing %s: it belongs to run %s, not %s' % (base, found['run_id'], run_id))
+    if found is not None and found['phase'] == PHASE_TERMINAL:
+        return found
+    text = family_marker(base, oid, run_id, PHASE_TERMINAL, terminal_at=_server_now(admin_url),
+                         intent=intent, reason=reason)
+    _write_family(admin_url, base, oid, text)
+    log('family %s TERMINAL (%s): %s' % (base, intent, reason))
+    return parse_family_marker(text, base, oid)
+
+
+def _run_clones(url: str, run_id: str) -> List[str]:
+    sql = "SELECT datname FROM pg_database WHERE starts_with(datname, '%s')" % run_prefix(run_id)
+    return [n for n in _names(url, sql) if parse_isolated_name(n, run_id) is not None]
+
+
+def revoke(admin_url: str, base: str, run_id: str, reason: str) -> None:
+    """ADMIN ONLY: mark an idle family TERMINAL so the sweep may reclaim it.
+    Refused while the base, its template or any clone of the run has a session.
+    Never drops anything."""
+    if not is_minted_base(base):
+        raise WrapperError('refusing to revoke %r: not an auto-minted ci_base_ base' % base)
+    if not _valid_reason(reason):
+        raise WrapperError('--reason must be non-empty printable text with a letter or digit (max %d)'
+                           % FAMILY_REASON_MAX)
+    members = [base, template_name(base)] + _run_clones(admin_url, checked_run_id(run_id))
+    live = [name for name in members if session_count(admin_url, name) > 0]
+    if live:
+        raise WrapperError('refusing to revoke %s: live session(s) on %s' % (base, ', '.join(live)))
+    terminalize(admin_url, base, run_id, INTENT_REVOKE, reason, adopt=True)
+
+
 def mask_url_password(url: str) -> str:
     """``postgres://u:pw@h/db`` -> ``postgres://u:***@h/db``. A URL without a
     password (including one with an ``@`` only in its query) is unchanged."""
@@ -572,49 +760,117 @@ def teardown(url: str, db_name: str, run_id: str) -> int:
     return failed
 
 
-def _sweep_minted_bases(url: str, now: int, older_than: int) -> List[str]:
-    """Drop idle, aged ``ci_base_*`` bases (and their templates) left by a failed run."""
-    listing = ("SELECT d.datname FROM pg_database d WHERE starts_with(d.datname, '%s') "
-               "AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)"
-               % MINTED_BASE_PREFIX)
-    dropped = []
-    for name in sorted(_names(url, listing), key=lambda n: not n.endswith(TEMPLATE_SUFFIX)):
-        found = _MINTED_BASE_RE.match(name)
-        if not found or now - int(found.group(1)) < older_than:
+def _census(url: str) -> Tuple[List[str], Dict[str, Tuple[Optional[int], Optional[Dict[str, object]], str]]]:
+    """Every ``ci_base_*`` name, and for each auto-minted base ``(oid, marker,
+    comment)``; ``marker`` is ``None`` when unmarked or malformed."""
+    names = _names(url, "SELECT datname FROM pg_database WHERE starts_with(datname, '%s')" % MINTED_BASE_PREFIX)
+    families = {}
+    for name in names:
+        if not is_minted_base(name):
             continue
-        q = quote_ident(name)
+        oid, comment = read_family(url, name)
+        if oid is None:
+            continue
+        families[name] = (oid, parse_family_marker(comment, name, oid) if comment else None, comment)
+    return names, families
+
+
+def _reap_family(url: str, base: str, oid: int, family: Dict[str, object], present: Set[str],
+                 done: Set[str]) -> List[str]:
+    """Reclaim one TERMINAL family: remaining clones, the template, then the
+    base (the authority) last, after re-reading its marker. Any live member or
+    failed drop keeps the base so a later sweep can finish."""
+    run_id = str(family['run_id'])
+    tpl = template_name(base)
+    clones = [n for n in _run_clones(url, run_id) if n not in done]
+    members = clones + ([tpl] if tpl in present else []) + [base]
+    live = [name for name in members if session_count(url, name) > 0]
+    if live:
+        log('keeping TERMINAL family %s: live session(s) on %s' % (base, ', '.join(live)))
+        return []
+    dropped = []
+    for name in clones:
         try:
-            if name.endswith(TEMPLATE_SUFFIX):
-                psql(url, SQL_RELEASE_TEMPLATE % q)
-            psql(url, SQL_DROP_DATABASE % q)
+            drop(url, name, run_id, attempts=1)
             dropped.append(name)
         except WrapperError as exc:
-            log('WARN could not sweep %s: %s' % (name, exc))
+            log('WARN could not sweep %s; keeping %s: %s' % (name, base, exc))
+            return dropped
+    if tpl in present:
+        q = quote_ident(tpl)
+        try:
+            psql(url, SQL_RELEASE_TEMPLATE % q)
+        except WrapperError:
+            pass  # not flagged as a template
+        try:
+            psql(url, SQL_DROP_DATABASE % q)
+            dropped.append(tpl)
+        except WrapperError as exc:
+            log('WARN could not sweep %s; keeping %s: %s' % (tpl, base, exc))
+            return dropped
+    again_oid, again = read_family(url, base)
+    if again_oid != oid or parse_family_marker(again, base, oid) != family:
+        log('keeping %s: its marker changed during the sweep' % base)
+        return dropped
+    try:
+        psql(url, SQL_DROP_DATABASE % quote_ident(base))
+        dropped.append(base)
+    except WrapperError as exc:
+        log('WARN could not sweep %s: %s' % (base, exc))
+    return dropped
+
+
+def _sweep_minted_bases(url: str, now: int, older_than: int, names: List[str],
+                        families: Dict[str, Tuple[Optional[int], Optional[Dict[str, object]], str]],
+                        done: Set[str]) -> List[str]:
+    """#7113: reclaim only families whose base carries a valid TERMINAL marker
+    at least ``older_than`` s old. Unmarked, malformed and ACTIVE families and
+    orphan templates are preserved: age, PID or a name never confer ownership."""
+    present = set(names)
+    dropped: List[str] = []
+    for name in sorted(present):
+        if name.endswith(TEMPLATE_SUFFIX) and name[:-len(TEMPLATE_SUFFIX)] not in present:
+            log('preserving orphan template %s (no base, no authority)' % name)
+    for base in sorted(families):
+        oid, family, comment = families[base]
+        if family is None:
+            log('preserving %s: %s' % (base, 'malformed marker' if comment else 'unmarked (caller-owned)'))
+            continue
+        if family['phase'] != PHASE_TERMINAL:
+            continue
+        if now - int(family['terminal_at']) < older_than:
+            log('preserving %s: TERMINAL for less than %ds' % (base, older_than))
+            continue
+        dropped += _reap_family(url, base, int(oid), family, present, done)
     return dropped
 
 
 def sweep(url: str, older_than: int) -> List[str]:
-    """ADMIN ONLY: drop idle clones of any run older than ``older_than`` s."""
+    """ADMIN ONLY: drop idle clones older than ``older_than`` s (never of an
+    ACTIVE family), then reclaim aged TERMINAL families (#7113)."""
     if older_than < MIN_SWEEP_AGE_SECS:
         raise WrapperError('--older-than must be at least %d seconds' % MIN_SWEEP_AGE_SECS)
-    now_raw = psql(url, 'SELECT extract(epoch FROM now())::bigint', tuples=True).strip()
-    if not now_raw.isdigit():
-        raise WrapperError('could not read the server clock (got %r)' % now_raw)
-    now = int(now_raw)
+    now = _server_now(url)
     listing = ("SELECT d.datname FROM pg_database d WHERE starts_with(d.datname, '%s_') "
                "AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)"
                % ISOLATED_PREFIX)
-    dropped = []
-    for name in _names(url, listing):
+    idle = _names(url, listing)
+    names, families = _census(url)
+    active_runs = {str(f['run_id']) for _, f, _ in families.values() if f is not None and f['phase'] == PHASE_ACTIVE}
+    dropped: List[str] = []
+    for name in idle:
         created = parse_isolated_name(name)
         if created is None or now - created < older_than:
             continue
+        found = _ANY_NAME_RE.match(name)
+        if found and found.group(1) in active_runs:
+            continue  # a clone of an ACTIVE family is never reclaimed
         try:
             drop(url, name, None, attempts=1)
             dropped.append(name)
         except WrapperError as exc:
             log('WARN could not sweep %s: %s' % (name, exc))
-    dropped += _sweep_minted_bases(url, now, older_than)
+    dropped += _sweep_minted_bases(url, now, older_than, names, families, set(dropped))
     log('admin sweep dropped %d clone(s)/base(s) older than %ds' % (len(dropped), older_than))
     return dropped
 
@@ -809,6 +1065,12 @@ def build_parser() -> argparse.ArgumentParser:
     down.add_argument('--db', help='base database (default: the URL database)')
     down.add_argument('--run-id', help='the run whose clones are dropped (default: $%s)' % RUN_ID_VAR)
 
+    revoke_p = sub.add_parser('revoke', help='ADMIN ONLY: mark an idle auto-minted family TERMINAL (never drops)')
+    revoke_p.add_argument('--url', help=url_help)
+    revoke_p.add_argument('--db', required=True, help='the auto-minted ci_base_* base of the family')
+    revoke_p.add_argument('--run-id', required=True, help='the run the family belongs to')
+    revoke_p.add_argument('--reason', required=True, help='why the family is abandoned (non-empty, logged)')
+
     sweep_p = sub.add_parser('sweep', help='ADMIN ONLY: drop idle clones of any run older than N s')
     sweep_p.add_argument('--url', help=url_help)
     sweep_p.add_argument('--older-than', type=int, required=True,
@@ -869,6 +1131,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             url, db, minted = resolve_base(url, args.db, args.allow_shared_base, args.jobs)
             done = False
             try:
+                if minted:  # #7113: ACTIVE (verified) before the template exists
+                    mark_active(with_database(admin, MAINTENANCE_DB), db, run_id)
                 tpl = setup(url, db, args.jobs)
                 done = True
             finally:
@@ -883,14 +1147,33 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
         if args.cmd == 'teardown':
             db = args.db or database_name(url)
-            teardown(url, db, checked_run_id(args.run_id or os.environ.get(RUN_ID_VAR)))
+            run_id = checked_run_id(args.run_id or os.environ.get(RUN_ID_VAR))
+            admin = with_database(url, MAINTENANCE_DB)
+            if is_minted_base(db):
+                # #7113: TERMINAL first (refuses another run's family before any drop).
+                terminalize(admin, db, run_id, INTENT_TEARDOWN, TEARDOWN_REASON)
+            failed = teardown(url, db, run_id)
             base = os.environ.get(BASE_VAR)
             if base and base.startswith(MINTED_BASE_PREFIX) and base != db:
                 log('warning: %s names minted base %s but the URL database is %s; the base was not dropped'
                     % (BASE_VAR, base, db))
             elif base and base == db and base.startswith(MINTED_BASE_PREFIX):
-                # Plain drop (no force option): a live session fails it, loudly.
-                psql(with_database(url, MAINTENANCE_DB), SQL_DROP_DATABASE % quote_ident(_checked_ident(base)))
+                if failed:
+                    log('keeping base %s (TERMINAL authority): %d member drop(s) failed; sweep finishes it'
+                        % (base, failed))
+                else:
+                    # Plain drop (no force option), base last: a live session fails it, loudly.
+                    try:
+                        psql(admin, SQL_DROP_DATABASE % quote_ident(_checked_ident(base)))
+                    except WrapperError as exc:
+                        failed += 1
+                        log('WARN could not drop the base %s: %s' % (base, exc))
+            if failed:
+                print('pg_isolated_binary: teardown left %d database(s) behind' % failed, file=sys.stderr)
+                return EXIT_USAGE
+            return 0
+        if args.cmd == 'revoke':
+            revoke(with_database(url, MAINTENANCE_DB), _checked_ident(args.db), args.run_id, args.reason)
             return 0
         if args.cmd == 'sweep':
             sweep(url, args.older_than)
