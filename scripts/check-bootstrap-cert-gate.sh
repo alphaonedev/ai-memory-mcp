@@ -203,10 +203,28 @@ fi
 EVIDENCE_DIR="${AI_MEMORY_CERT_EVIDENCE_DIR:-$REPO_ROOT/.local-runs/cert-bootstrap-evidence}"
 mkdir -p "$EVIDENCE_DIR"
 
+# #7181 — every mktemp work dir is removed on ANY exit (a failing or aborted run
+# used to leave them behind), and a LEG B failure prints its evidence into the
+# job log: the evidence dir lives in the runner workspace and is lost with it.
+CLEANUP_PATHS=()
+LEGB_FAILED=0
+IN_LEG_B=0
+cleanup_and_report() {
+  local rc=$?
+  if [[ $LEGB_FAILED -ne 0 ]]; then
+    echo
+    echo "== LEG B evidence (redacted, last 200 lines per file; #7181) =="
+    python3 "$REPO_ROOT/scripts/cert_gate_evidence.py" --evidence-dir "$EVIDENCE_DIR" --tail 200 || true
+  fi
+  if [[ ${#CLEANUP_PATHS[@]} -gt 0 ]]; then rm -rf "${CLEANUP_PATHS[@]}"; fi
+  return $rc
+}
+trap cleanup_and_report EXIT
+
 FAILED=0
 note() { printf '  %s\n' "$*"; }
 pass() { printf '[PASS] %s\n' "$*"; }
-fail() { printf '[FAIL] %s\n' "$*"; FAILED=1; }
+fail() { printf '[FAIL] %s\n' "$*"; FAILED=1; if [[ $IN_LEG_B -ne 0 ]]; then LEGB_FAILED=1; fi; }
 instrument_error() {
   echo "INSTRUMENT ERROR: $*" >&2
   echo "  (#4434: a driverless binary can never certify a pg posture; #2676: 'features --json' is the probe)" >&2
@@ -302,6 +320,7 @@ leg_a_setup() {
   KEYDIR_A="$WORK_A/keys"
   mkdir -p "$KEYDIR_A"
   FPFILE_A="$(mktemp)"
+  CLEANUP_PATHS+=("$WORK_A" "$FPFILE_A")
   printf 'example.org 0000000000000000000000000000000000000000000000000000000000000000\n' > "$FPFILE_A"
   # The daemon audit signing key for check #19 (resolve_agent_id honours
   # AI_MEMORY_AGENT_ID); generate it into the key dir.
@@ -461,10 +480,15 @@ BIN="$BIN_PG"
 echo
 echo "== LEG B — #3016/#3067 born-dirty bring-up gate (certified asi-hard modes) =="
 
+IN_LEG_B=1
 WORK_B="$(mktemp -d)"
+CLEANUP_PATHS+=("$WORK_B")
 KEYDIR_B="$WORK_B/keys"; WDIR_B="$WORK_B/witness"; RDIR_B="$WORK_B/recorder"
 EMPTY_W="$WORK_B/empty-witness"; EMPTY_R="$WORK_B/empty-recorder"
-mkdir -p "$KEYDIR_B" "$WDIR_B" "$RDIR_B" "$EMPTY_W" "$EMPTY_R"
+EMPTY_J="$WORK_B/empty-judge"; EMPTY_S="$WORK_B/empty-stopper"
+SINK_AUDIT="$WORK_B/audit-sink"; SINK_LOG="$WORK_B/log-sink"
+mkdir -p "$KEYDIR_B" "$WDIR_B" "$RDIR_B" "$EMPTY_W" "$EMPTY_R" "$EMPTY_J" "$EMPTY_S" "$SINK_AUDIT" "$SINK_LOG"
+chmod 700 "$KEYDIR_B" "$WDIR_B" "$RDIR_B" "$EMPTY_W" "$EMPTY_R" "$EMPTY_J" "$EMPTY_S" "$SINK_AUDIT" "$SINK_LOG"
 AGENT_B="cert-node-3016"
 
 # The certified verdict is gated on the FULL asi-hard AUDIT require-mode set
@@ -478,7 +502,18 @@ CERT_MODES=(AI_MEMORY_REQUIRE_WITNESS=1 AI_MEMORY_REQUIRE_ROLE_SEPARATION=1 AI_M
 # `AI_MEMORY_NO_CONFIG=1` skips config loading so `effective_db` falls to the
 # cwd-relative default (`./ai-memory.db` in $WORK_B); `AI_MEMORY_STORE_URL` /
 # `_FILE` are cleared so no external store is opened.
-am_b() { ( cd "$WORK_B" && env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_STORE_URL= AI_MEMORY_STORE_URL_FILE= "$@" ); }
+#
+# #7181 — the sandbox ALSO pins every role key dir and the forensic audit/log
+# sink dirs. The forensic sink defaults to a SHARED per-user state dir; an
+# earlier gate run on the same host leaves an audit watermark there for the
+# same genesis-derived db id, and a fresh bring-up (head below that watermark)
+# was then CONVICTED of tail truncation ("NOT CERTIFIED ... TRUNCATION"). The
+# result flipped between runs on the same SHA depending on what ran before.
+# Unset role dirs fell back to the user config dir the same way.
+am_b() { ( cd "$WORK_B" && env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_STORE_URL= AI_MEMORY_STORE_URL_FILE= \
+    AI_MEMORY_KEY_DIR="$KEYDIR_B" AI_MEMORY_WITNESS_KEY_DIR="$WDIR_B" AI_MEMORY_RECORDER_KEY_DIR="$RDIR_B" \
+    AI_MEMORY_JUDGE_KEY_DIR="$EMPTY_J" AI_MEMORY_STOPPER_KEY_DIR="$EMPTY_S" \
+    AI_MEMORY_AUDIT_DIR="$SINK_AUDIT" AI_MEMORY_LOG_DIR="$SINK_LOG" "$@" ); }
 
 # Store-only-migrated node: registry populated, spine empty. Enroll the
 # operator custody keys bring-up VERIFIES (never mints): witness + recorder.
@@ -487,8 +522,8 @@ am_b() { ( cd "$WORK_B" && env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_STORE_URL= AI_MEM
 am_b "$BIN" identity generate --agent-id "$AGENT_B" --key-dir "$KEYDIR_B" >/dev/null 2>&1
 am_b "$BIN" identity generate --agent-id "${AGENT_B}-recovery" --key-dir "$KEYDIR_B" >/dev/null 2>&1
 RECOVERY_B="$(am_b "$BIN" identity export-pub --agent-id "${AGENT_B}-recovery" --key-dir "$KEYDIR_B" 2>/dev/null)"
-"$BIN" identity generate --agent-id audit-witness --key-dir "$WDIR_B" >/dev/null 2>&1
-"$BIN" identity generate --agent-id governance-recorder --key-dir "$RDIR_B" >/dev/null 2>&1
+am_b "$BIN" identity generate --agent-id audit-witness --key-dir "$WDIR_B" > "$EVIDENCE_DIR/witness-generate.out" 2>&1
+am_b "$BIN" identity generate --agent-id governance-recorder --key-dir "$RDIR_B" > "$EVIDENCE_DIR/recorder-generate.out" 2>&1
 am_b "$BIN" agents register --agent-id "$AGENT_B" --agent-type ai:test >/dev/null 2>&1
 
 # BORN DIRTY — under an armed audit require-mode, the empty spine convicts.
@@ -544,8 +579,13 @@ fi
 
 # NEGATIVE CONTROL 1 (MB1 core) — asi-hard modes armed but NO custody keys
 # (empty dirs) MUST refuse and name the unmet ceremonies. A FRESH node.
-WORK_D="$(mktemp -d)"; KEYDIR_D="$WORK_D/keys"; mkdir -p "$KEYDIR_D"
-am_d() { ( cd "$WORK_D" && env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_STORE_URL= AI_MEMORY_STORE_URL_FILE= "$@" ); }
+WORK_D="$(mktemp -d)"; CLEANUP_PATHS+=("$WORK_D"); KEYDIR_D="$WORK_D/keys"
+SINK_AUDIT_D="$WORK_D/audit-sink"; SINK_LOG_D="$WORK_D/log-sink"
+mkdir -p "$KEYDIR_D" "$SINK_AUDIT_D" "$SINK_LOG_D"; chmod 700 "$KEYDIR_D" "$SINK_AUDIT_D" "$SINK_LOG_D"
+am_d() { ( cd "$WORK_D" && env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_STORE_URL= AI_MEMORY_STORE_URL_FILE= \
+    AI_MEMORY_KEY_DIR="$KEYDIR_D" AI_MEMORY_WITNESS_KEY_DIR="$EMPTY_W" AI_MEMORY_RECORDER_KEY_DIR="$EMPTY_R" \
+    AI_MEMORY_JUDGE_KEY_DIR="$EMPTY_J" AI_MEMORY_STOPPER_KEY_DIR="$EMPTY_S" \
+    AI_MEMORY_AUDIT_DIR="$SINK_AUDIT_D" AI_MEMORY_LOG_DIR="$SINK_LOG_D" "$@" ); }
 am_d "$BIN" identity generate --agent-id nokeys-node --key-dir "$KEYDIR_D" >/dev/null 2>&1
 am_d "$BIN" identity generate --agent-id nokeys-recovery --key-dir "$KEYDIR_D" >/dev/null 2>&1
 REC_D="$(am_d "$BIN" identity export-pub --agent-id nokeys-recovery --key-dir "$KEYDIR_D" 2>/dev/null)"
@@ -564,8 +604,13 @@ fi
 
 # NEGATIVE CONTROL 2 (MB1 core) — certified modes NOT armed MUST refuse to claim
 # certified even though the bare verify would be clean. A FRESH node.
-WORK_E="$(mktemp -d)"; KEYDIR_E="$WORK_E/keys"; mkdir -p "$KEYDIR_E"
+WORK_E="$(mktemp -d)"; CLEANUP_PATHS+=("$WORK_E"); KEYDIR_E="$WORK_E/keys"
+SINK_AUDIT_E="$WORK_E/audit-sink"; SINK_LOG_E="$WORK_E/log-sink"
+mkdir -p "$KEYDIR_E" "$SINK_AUDIT_E" "$SINK_LOG_E"; chmod 700 "$KEYDIR_E" "$SINK_AUDIT_E" "$SINK_LOG_E"
 am_e() { ( cd "$WORK_E" && env AI_MEMORY_NO_CONFIG=1 AI_MEMORY_STORE_URL= AI_MEMORY_STORE_URL_FILE= \
+    AI_MEMORY_KEY_DIR="$KEYDIR_E" AI_MEMORY_WITNESS_KEY_DIR="$EMPTY_W" AI_MEMORY_RECORDER_KEY_DIR="$EMPTY_R" \
+    AI_MEMORY_JUDGE_KEY_DIR="$EMPTY_J" AI_MEMORY_STOPPER_KEY_DIR="$EMPTY_S" \
+    AI_MEMORY_AUDIT_DIR="$SINK_AUDIT_E" AI_MEMORY_LOG_DIR="$SINK_LOG_E" \
     AI_MEMORY_REQUIRE_WITNESS= AI_MEMORY_REQUIRE_ROLE_SEPARATION= AI_MEMORY_REQUIRE_IDENTITY_LINEAGE= "$@" ); }
 am_e "$BIN" identity generate --agent-id unarmed-node --key-dir "$KEYDIR_E" >/dev/null 2>&1
 am_e "$BIN" identity generate --agent-id unarmed-recovery --key-dir "$KEYDIR_E" >/dev/null 2>&1
@@ -579,7 +624,7 @@ else
   fail "unarmed certified modes did NOT refuse — see $EVIDENCE_DIR/refuse-unarmed.out"
 fi
 
-rm -rf "$WORK_B" "$WORK_D" "$WORK_E"
+IN_LEG_B=0
 
 echo
 if [[ $FAILED -eq 0 ]]; then
