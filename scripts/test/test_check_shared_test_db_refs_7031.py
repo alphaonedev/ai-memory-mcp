@@ -1,20 +1,26 @@
 #!/usr/bin/env python3
 """Unit tests for scripts/ci/check_shared_test_db_refs.py (#7031 H4)."""
+import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from typing import Optional
 
 ROOT = Path(__file__).resolve().parents[2]
 GATE = ROOT / 'scripts' / 'ci' / 'check_shared_test_db_refs.py'
 NAME = 'ai_memory' + '_test'  # built so this file never matches its own gate
 SCRATCH = ROOT / '.local-runs'
+GATE_LINE_SCAN_BUDGET_SECS = 5.0  # the gate must scan one adversarial line this fast (#7031 S1)
+ADVERSARIAL_LINE_BYTES = 1 << 20  # one MiB on a single line
+EXIT_CLEAN, EXIT_VIOLATION, EXIT_USAGE = 0, 1, 2
 
 
-def gate(root: Path, *extra: str) -> 'subprocess.CompletedProcess[str]':
+def gate(root: Path, *extra: str, timeout: Optional[float] = None) -> 'subprocess.CompletedProcess[str]':
     return subprocess.run([sys.executable, str(GATE), '--root', str(root)] + list(extra),
-                          capture_output=True, text=True, check=False)
+                          capture_output=True, text=True, check=False, timeout=timeout)
 
 
 class SharedTestDbRefs7031(unittest.TestCase):
@@ -59,8 +65,10 @@ class SharedTestDbRefs7031(unittest.TestCase):
 
     def test_comment_only_lines_never_match(self) -> None:
         text = '\n'.join(['# psql -d %s' % NAME, '// "postgres://h/%s"' % NAME,
-                          '-- POSTGRES_DB=%s' % NAME, '  //! pg_isready -d %s' % NAME])
+                          '  //! pg_isready -d %s' % NAME])
         done = self.mutant(text)
+        self.assertEqual(done.returncode, 0, done.stdout)
+        done = self.mutant('-- POSTGRES_DB=%s' % NAME, name='m.sql')
         self.assertEqual(done.returncode, 0, done.stdout)
 
     def test_allowlist_whole_file_and_line(self) -> None:
@@ -69,7 +77,7 @@ class SharedTestDbRefs7031(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stdout)
 
     def test_stale_allowlist_entry_exits_2(self) -> None:
-        (self.dir / 'allow.txt').write_text('m.txt  # nothing matches\n', encoding='utf-8')
+        (self.dir / 'allow.txt').write_text('m.txt:1  # nothing matches\n', encoding='utf-8')
         done = self.mutant('clean line')
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
         self.assertIn('stale allowlist entry', done.stderr)
@@ -102,11 +110,11 @@ class SharedTestDbRefs7031(unittest.TestCase):
         self.assertIn('::error file=locked.txt', done.stdout)
 
     def test_f2_allowlist_entry_for_missing_file_exits_2(self) -> None:
-        (self.dir / 'allow.txt').write_text('gone.rs:5  # deleted\ngone2.rs  # deleted\n', encoding='utf-8')
+        (self.dir / 'allow.txt').write_text('gone.rs:5  # deleted\ngone2.rs:7  # deleted\n', encoding='utf-8')
         done = self.mutant('clean')
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
         self.assertIn('gone.rs:5', done.stderr)
-        self.assertIn('gone2.rs', done.stderr)
+        self.assertIn('gone2.rs:7', done.stderr)
 
     def test_f3_r5_forms(self) -> None:
         forms = ['x --db=%s', 'x --dbname %s', 'x --dbname=%s', 'export PGDATABASE=%s',
@@ -155,13 +163,136 @@ class SharedTestDbRefs7031(unittest.TestCase):
         self.assertIn('line=2::R3', done.stdout)
 
     def test_f10_docs_are_scanned_by_default(self) -> None:
-        (self.dir / 'docs').mkdir()
+        self.make_default_tree()
         (self.dir / 'docs' / 'r.md').write_text('export U=postgres://h/%s\n' % NAME, encoding='utf-8')
-        (self.dir / 'scripts' / 'qc-allowlists').mkdir(parents=True)
-        (self.dir / 'scripts' / 'qc-allowlists' / 'shared-test-db-allow.txt').write_text('', encoding='utf-8')
         done = gate(self.dir)
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
         self.assertIn('file=docs/r.md', done.stdout)
+
+    # --- round 2: code r1 F1-F4, security r1 S1-S4 (#7149 #7150 #7151 #7154 #7155) ---
+    def assert_flagged(self, form: str, name: str = 'm.txt') -> None:
+        done = self.mutant(form, name=name)
+        self.assertEqual(done.returncode, EXIT_VIOLATION, form + '\n' + done.stdout + done.stderr)
+
+    def allow(self, text: str) -> None:
+        (self.dir / 'allow.txt').write_text(text, encoding='utf-8')
+
+    def make_default_tree(self) -> None:
+        for rel in ['.github/workflows', 'tests', 'scripts/qc-allowlists', 'infra', 'src', 'packaging', 'docs']:
+            (self.dir / rel).mkdir(parents=True, exist_ok=True)
+        (self.dir / 'scripts' / 'qc-allowlists' / 'shared-test-db-allow.txt').write_text('', encoding='utf-8')
+
+    def test_7031_f1_r1_url_terminators(self) -> None:
+        for form in ['url: `postgres://u@h:5432/%s`', 'see (postgres://h/%s)', 'x=postgres://h/%s,y',
+                     'echo postgres://h/%s>f', 'u=postgres://h/%s;', 'u=postgres://h/%s)', '<postgres://h/%s>']:
+            self.assert_flagged(form % NAME)
+
+    def test_7031_f1_database_key_and_positional_forms(self) -> None:
+        for form in ['database=%s', '"database": "%s"', 'database: %s', 'psql -h h %s', 'createdb %s',
+                     'dropdb %s', 'psql -h h -U u "%s"', 'pg_dump -h h %s > out.sql']:
+            self.assert_flagged(form % NAME)
+
+    def test_7031_f1_prefixed_names_stay_clean_for_new_forms(self) -> None:
+        text = '\n'.join(['postgres://h/%s_x`' % NAME, 'database=%s_x' % NAME, 'createdb %s_x' % NAME,
+                          'psql -h h %s_x' % NAME, '"%s_x"' % NAME, 'DROP DATABASE %s_x;' % NAME])
+        done = self.mutant(text)
+        self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout)
+
+    def test_7031_s1_one_mib_line_scans_within_budget(self) -> None:
+        pieces = {
+            'db_runs': 'DB' * (ADVERSARIAL_LINE_BYTES // 2) + '=' + NAME,
+            'pg_isready_runs': 'pg_isready ' * (ADVERSARIAL_LINE_BYTES // 11) + NAME,
+            'word_run': 'A' * ADVERSARIAL_LINE_BYTES + ' ' + NAME,
+            'space_run': ' ' * ADVERSARIAL_LINE_BYTES + NAME,
+            'flag_runs': '-d ' * (ADVERSARIAL_LINE_BYTES // 3) + NAME,
+            'name_runs': (NAME + ' ') * (ADVERSARIAL_LINE_BYTES // (len(NAME) + 1)),
+            'psql_tokens': 'psql ' + 'x ' * (ADVERSARIAL_LINE_BYTES // 2) + NAME,
+        }
+        for label, text in pieces.items():
+            (self.dir / 'big.txt').write_text(text + '\n', encoding='utf-8')
+            started = time.monotonic()
+            try:
+                gate(self.dir, '--paths', 'big.txt', '--allowlist', str(self.dir / 'allow.txt'),
+                     '--list', timeout=GATE_LINE_SCAN_BUDGET_SECS)
+            except subprocess.TimeoutExpired:
+                self.fail('%s: scan exceeded the %.1fs budget' % (label, GATE_LINE_SCAN_BUDGET_SECS))
+            self.assertLess(time.monotonic() - started, GATE_LINE_SCAN_BUDGET_SECS, label)
+
+    def test_7031_s2_whole_file_allowlist_entry_exits_2(self) -> None:
+        self.allow('m.txt  # whole file\n')
+        done = self.mutant('POSTGRES_DB=%s' % NAME)
+        self.assertEqual(done.returncode, EXIT_USAGE, done.stdout + done.stderr)
+        self.assertIn('allowlist line 1', done.stderr)
+
+    def test_7031_s2_uncited_pin_exits_2(self) -> None:
+        for body in ['m.txt:1\n', 'm.txt:1  #\n', 'm.txt:1  #   \n']:
+            self.allow('# header\n' + body)
+            done = self.mutant('POSTGRES_DB=%s' % NAME)
+            self.assertEqual(done.returncode, EXIT_USAGE, body + done.stdout + done.stderr)
+            self.assertIn('allowlist line 2', done.stderr)
+
+    def test_7031_s2_duplicate_pin_exits_2(self) -> None:
+        self.allow('m.txt:1  # cited\nm.txt:1  # cited again\n')
+        done = self.mutant('POSTGRES_DB=%s' % NAME)
+        self.assertEqual(done.returncode, EXIT_USAGE, done.stdout + done.stderr)
+        self.assertIn('allowlist line 2', done.stderr)
+
+    def test_7031_f2_unreadable_directory_exits_2(self) -> None:
+        sub = self.dir / 'locked'
+        sub.mkdir()
+        (sub / 'z.sh').write_text('psql -d %s\n' % NAME, encoding='utf-8')
+        sub.chmod(0)
+        self.addCleanup(sub.chmod, 0o755)
+        if os.access(str(sub), os.R_OK):
+            self.skipTest('running as a user that ignores directory modes')
+        done = gate(self.dir, '--paths', 'locked', '--allowlist', str(self.dir / 'allow.txt'))
+        self.assertEqual(done.returncode, EXIT_USAGE, done.stdout + done.stderr)
+        self.assertIn('file=locked', done.stdout)
+
+    def test_7031_s3_missing_paths_entry_exits_2(self) -> None:
+        done = gate(self.dir, '--paths', 'nope_7031', '--allowlist', str(self.dir / 'allow.txt'))
+        self.assertEqual(done.returncode, EXIT_USAGE, done.stdout + done.stderr)
+        self.assertIn('nope_7031', done.stderr)
+
+    def test_7031_s3_renamed_default_directory_exits_2(self) -> None:
+        self.make_default_tree()
+        (self.dir / 'infra').rmdir()
+        done = gate(self.dir)
+        self.assertEqual(done.returncode, EXIT_USAGE, done.stdout + done.stderr)
+        self.assertIn('infra', done.stderr)
+
+    def test_7031_s3_executable_top_level_surfaces_are_scanned(self) -> None:
+        for rel in ['deploy/up.sh', 'ops/run.sh', 'tools/x.py', 'loadtest/l.js', 'benches/b.rs', 'examples/e.rs',
+                    'sdk/s.py', 'clients/c.py', 'conformance/c.sh', 'hooks/h.sh', 'plugins/p.sh',
+                    'Dockerfile', 'Dockerfile.plan-c', 'entrypoint.plan-c.sh', 'install.sh']:
+            self.make_default_tree()
+            target = self.dir / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('psql -d %s\n' % NAME, encoding='utf-8')
+            done = gate(self.dir)
+            self.assertEqual(done.returncode, EXIT_VIOLATION, rel + done.stdout + done.stderr)
+            self.assertIn('file=' + rel, done.stdout)
+            target.unlink()
+
+    def test_7031_s4_literal_forms(self) -> None:
+        for form in ['let x = "%s";', "let x = '%s';", 'format!("{}", "%s")', 'db = "%s"',
+                     'connect(database="%s")', 'DATABASE=%s', 'GRANT ALL ON DATABASE %s TO u;',
+                     'DROP DATABASE %s;', 'drop database %s;', 'Db: %s']:
+            self.assert_flagged(form % NAME)
+
+    def test_7031_s4_sql_database_form_in_sql_file(self) -> None:
+        self.assert_flagged('GRANT ALL PRIVILEGES ON DATABASE %s TO ai_memory;' % NAME, name='init.sql')
+
+    def test_7031_s4_double_dash_continuation_is_not_a_comment_outside_sql(self) -> None:
+        self.assert_flagged('-- --db %s' % NAME)
+        self.assert_flagged('-- --db %s' % NAME, name='run.sh')
+        done = self.mutant('-- --db %s' % NAME, name='q.sql')
+        self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout)
+
+    def test_7031_f4_changelog_fragment_states_the_gate(self) -> None:
+        text = (ROOT / 'changelog.d' / '7031b.fixed.md').read_text(encoding='utf-8')
+        for needle in ['R1', 'R5', 'docs/', 'exit 2', 'allowlist', 'unreadable', 'stale', 'ephemeral']:
+            self.assertIn(needle, text, needle)
 
 
 if __name__ == '__main__':
