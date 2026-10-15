@@ -408,6 +408,10 @@ class SharedTestDbRefs7031(unittest.TestCase):
     def test_7031_r3_b14_backtick_quoted_literal(self) -> None:
         self.assert_flagged('let x = `%s`;' % NAME)
 
+    def test_7031_r3_b14_double_backtick_docstring_prose_is_not_a_literal(self) -> None:
+        self.assert_clean('shared ``%s`` database' % NAME, name='m.py')
+        self.assert_flagged('const x = `%s`;' % NAME, name='m.js')
+
     def test_7031_r3_b4_b17_lower_case_database_keys(self) -> None:
         self.assert_flagged('test_db: %s' % NAME, name='m.yml')
         self.assert_flagged('target_db = %s' % NAME, name='m.toml')
