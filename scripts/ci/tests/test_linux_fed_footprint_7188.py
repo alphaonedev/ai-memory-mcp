@@ -88,7 +88,7 @@ class SharedTargetLeg(unittest.TestCase):
         self.assertIn(SHARED_HELPER + " --github-env", job)
         self.assertRegex(job, r"if:[^\n]*&& matrix\.%s\b" % SHARED_FLAG)
         self.assertIn('--runner-name "${{ runner.name }}"', job)
-        self.assertNotIn("touch_workspace_sources", job)
+        self.assertNotIn("touch_workspace" + "_sources", job)
 
     def test_no_literal_target_dir_in_the_job(self):
         job = "\n".join(active(check_job_lines()))
