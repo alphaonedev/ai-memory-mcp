@@ -10,7 +10,8 @@ The BASE guard (scripts/check-claude-md-size.py of the base checkout) and the BA
 (scripts/qc-allowlists/claude-md-rule-sections.sha256) then judge the head copies:
 
   * every rule section whose raw text no longer hashes to the BASE manifest (changed, added, removed) is
-    written to the step summary with the section name and a unified diff, headed "RULE TEXT CHANGED";
+    reported using numeric section IDs, bounded line ranges/counts and immutable links under "RULE TEXT CHANGED";
+    arbitrary prose, headings, approval identities and exceptions never enter diagnostics (R2, #6163);
   * if the only differences are ASCII digit runs of the generated census (a number before its unit words)
     inside a section whose heading starts with `## Prime directive` (the real heading carries a date), the
     heading is "COUNT CHANGED" instead;
@@ -46,15 +47,20 @@ if __name__ == "__main__" and not sys.flags.isolated:
 
 import argparse  # noqa: E402 - after the isolated-mode refusal on purpose (#5163)
 import ast
+import contextlib
 import difflib
 import importlib.machinery
 import importlib.util
+import json
 import os
 import py_compile
 import re
+import resource
 import shutil
+import signal
 import stat
 import subprocess
+import tempfile
 import tokenize
 from pathlib import Path
 from typing import NamedTuple
@@ -80,16 +86,140 @@ TRUSTED_PATHS = ("scripts/check-claude-md-size.py", "scripts/claude-md-rule-comp
                  ".github/CODEOWNERS")
 DIFF_LINE_CAP = 200
 MAX_BLOB_BYTES = 2 * 1024 * 1024  # far above any legitimate file; refuses a memory-exhaustion blob
+# #6163: current and healthy fixture each have 16 sections. Bound both the
+# comparison metadata and UTF-8 report before accumulation, even for malformed input.
+MAX_REPORT_SECTIONS = 256
+MAX_REPORT_RANGES = 1024  # combined base and head occurrences, including preambles
+MAX_REPORT_BYTES = 128 * 1024
 # Messages of the base guard that the section comparison already reports in its own words.
 DRIFT_MARKERS = ("changed: sha256", "is not pinned in", "is missing from CLAUDE.md")
 
 
-def git(repo: Path, *args: str) -> bytes:
-    """Run git in `repo` and return stdout bytes; a non-zero exit raises RuntimeError (fail closed)."""
-    result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, check=False)
-    if result.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.decode('utf-8', 'replace').strip()}")
-    return result.stdout
+REPOSITORY = "alphaonedev/ai-memory-mcp"
+REMOTE_URL = "https://github.com/alphaonedev/ai-memory-mcp.git"
+REVIEW_URL = "https://github.com/alphaonedev/ai-memory-mcp"
+GIT_BINARY = "/usr/bin/git"
+GIT_PATH = "/usr/bin:/bin"
+GIT_TIMEOUT_SECONDS = 180
+MAX_GIT_FILE_BYTES = 256 * 1024 * 1024
+MAX_GIT_MEMORY_BYTES = 1024 * 1024 * 1024
+MAX_GIT_OUTPUT_BYTES = 8 * 1024 * 1024
+MAX_OBJECT_STORE_BYTES = 512 * 1024 * 1024
+MAX_EVENT_BYTES = 1024 * 1024
+MAX_COMMITS = 100_000
+MAX_PR_NUMBER = 100_000_000
+FAIL_REPORT = "## CLAUDE.md rule-change comparison\n\nRESULT: FAIL (closed) - comparison evidence unavailable\n"
+GIT_CONFIG = ("core.hooksPath=/dev/null", "core.attributesFile=/dev/null", "core.fsmonitor=false",
+              "credential.helper=", "protocol.allow=never", "http.followRedirects=false",
+              "fetch.fsckObjects=true", "transfer.fsckObjects=true", "gc.auto=0", "maintenance.auto=false")
+
+
+def git_environment() -> dict:
+    """No ambient Git config, credentials, replacement objects, helper or discovery overrides."""
+    return {"PATH": GIT_PATH, "LANG": "C", "LC_ALL": "C", "HOME": "/dev/null",
+            "XDG_CONFIG_HOME": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_NO_LAZY_FETCH": "1"}
+
+
+def git_limits() -> None:
+    """Bound child address space and each pack/output file; used only in this single-threaded CLI."""
+    resource.setrlimit(resource.RLIMIT_FSIZE, (MAX_GIT_FILE_BYTES, MAX_GIT_FILE_BYTES))
+    resource.setrlimit(resource.RLIMIT_AS, (MAX_GIT_MEMORY_BYTES, MAX_GIT_MEMORY_BYTES))
+
+
+def git(repo: Path, *args: str, network: bool = False) -> bytes:
+    """Bound Git execution, kill its process group on timeout, and never surface subprocess prose."""
+    command = [GIT_BINARY, "--no-replace-objects", "-C", str(repo)]
+    for setting in GIT_CONFIG:
+        command += ["-c", setting]
+    if network:
+        command += ["-c", "protocol.https.allow=always"]
+    command += list(args)
+    with tempfile.TemporaryFile(dir=repo.parent) as output:
+        with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.DEVNULL,
+                              env=git_environment(), start_new_session=True, preexec_fn=git_limits) as process:
+            try:
+                result = process.wait(timeout=GIT_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+                raise RuntimeError("git operation timed out") from None
+        if result != 0:
+            raise RuntimeError("git operation failed")
+        if output.tell() > MAX_GIT_OUTPUT_BYTES:
+            raise RuntimeError("git output exceeds the comparison budget")
+        output.seek(0)
+        return output.read(MAX_GIT_OUTPUT_BYTES)
+
+
+def verify_history(repo: Path, base: str, head: str) -> None:
+    """Reject incomplete or redirected history before computing ANY approval or merge-base decision."""
+    git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir").decode("utf-8").strip())
+    for relative in ("info/grafts", "objects/info/alternates", "objects/info/http-alternates", "shallow"):
+        if (git_dir / relative).exists():
+            raise RuntimeError("redirected or shallow object history refused")
+    if git(repo, "for-each-ref", "refs/replace").strip():
+        raise RuntimeError("replacement objects refused")
+    for sha in (base, head):
+        if git(repo, "cat-file", "-t", sha).strip() != b"commit":
+            raise RuntimeError("event endpoint is not a commit")
+    commits = git(repo, "rev-list", "--count", base, head).strip()
+    if not commits.isdigit() or not 0 < int(commits) <= MAX_COMMITS:
+        raise RuntimeError("commit history exceeds comparison budget")
+    git(repo, "rev-list", "--objects", "--missing=error", base, head)
+    git(repo, "merge-base", base, head)
+
+
+def event_binding(event: dict) -> tuple:
+    """Validate only the canonical repository, bounded PR number and immutable event endpoints."""
+    try:
+        number = event["number"]
+        pr = event["pull_request"]
+        base, head = pr["base"]["sha"], pr["head"]["sha"]
+        valid = (type(number) is int and 0 < number <= MAX_PR_NUMBER
+                 and type(pr["number"]) is int and pr["number"] == number
+                 and event["repository"]["full_name"] == REPOSITORY
+                 and pr["base"]["repo"]["full_name"] == REPOSITORY
+                 and isinstance(base, str) and SHA.fullmatch(base)
+                 and isinstance(head, str) and SHA.fullmatch(head))
+    except (KeyError, TypeError):
+        valid = False
+    if not valid:
+        raise RuntimeError("invalid event binding")
+    return base, head, number
+
+
+def fetch_objects(repo: Path, base: str, head: str, number: int) -> None:
+    """Acquire full ancestry into the NEW bare store, never into the executable checkout."""
+    git(repo, "fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", REMOTE_URL,
+        base + ":refs/compare/base", f"refs/pull/{number}/head:refs/compare/head", network=True)
+    for ref, expected in (("refs/compare/base", base), ("refs/compare/head", head)):
+        if git(repo, "rev-parse", "--verify", ref).decode("ascii").strip() != expected:
+            raise RuntimeError("fetched event identity mismatch")
+
+
+@contextlib.contextmanager
+def isolated_objects(base_root: Path, event: dict, scratch: Path):
+    """W1: private disposable bare object store physically outside the trusted executable checkout."""
+    base, head, number = event_binding(event)
+    checkout = base_root.resolve(strict=True)
+    outside = scratch.resolve()
+    if outside == checkout or checkout in outside.parents or outside in checkout.parents:
+        raise RuntimeError("object store must be outside the checkout")
+    if git(checkout, "rev-parse", "HEAD").decode("ascii").strip() != base:
+        raise RuntimeError("trusted checkout does not match the event base")
+    outside.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="objects-6163-", dir=outside) as temporary:
+        private = Path(temporary)
+        objects = private / "objects.git"
+        objects.mkdir()
+        git(objects, "init", "--bare", "--template=", "--quiet")
+        fetch_objects(objects, base, head, number)
+        size = sum(path.stat().st_size for path in objects.rglob("*") if path.is_file())
+        if size > MAX_OBJECT_STORE_BYTES:
+            raise RuntimeError("object store exceeds comparison budget")
+        verify_history(objects, base, head)
+        yield objects
 
 
 def regular_file(path: Path, label: str) -> None:
@@ -198,11 +328,77 @@ def approvals(repo: Path, base_sha: str, head_sha: str) -> list:
     return found
 
 
+def section_ranges(guard, text: str, range_budget=None) -> dict:
+    """Map internal section keys to numeric source ranges; keys never enter the output schema."""
+    remaining = MAX_REPORT_RANGES if range_budget is None else range_budget
+    current, start, end = guard.PREAMBLE_KEY, 1, 1
+    ranges = {}
+
+    def add_range(last: int) -> None:
+        nonlocal remaining
+        if remaining <= 0 or (current not in ranges and len(ranges) >= MAX_REPORT_SECTIONS):
+            raise RuntimeError("section metadata exceeds comparison budget")
+        remaining -= 1
+        ranges.setdefault(current, []).append((start, max(start, last)))
+
+    for end, (line, in_code) in enumerate(guard.fence_scan(text), 1):
+        if not in_code and line.startswith("## "):
+            add_range(end - 1)
+            current, start = line.rstrip(), end
+    add_range(end)
+    return ranges
+
+
+class BoundedReport:
+    """Reject before appending a line that exceeds the encoded report budget."""
+
+    def __init__(self):
+        self.lines = []
+        self.byte_count = 0
+
+    def append(self, line: str) -> None:
+        size = len(line.encode("utf-8")) + len(b"\n")
+        if size > MAX_REPORT_BYTES - self.byte_count:
+            raise RuntimeError("report exceeds comparison budget")
+        self.lines.append(line)
+        self.byte_count += size
+
+    def extend(self, lines) -> None:
+        for line in lines:
+            self.append(line)
+
+    def render(self) -> str:
+        return "\n".join(self.lines) + "\n"
+
+
+def review_location(sha: str, relative: str, start: int, end: int) -> str:
+    """Closed link grammar: fixed path, full immutable SHA and bounded positive line numbers."""
+    if (not SHA.fullmatch(sha) or relative not in DATA_PATHS + TRUSTED_PATHS
+            or type(start) is not int or type(end) is not int or not 1 <= start <= end <= MAX_BLOB_BYTES):
+        raise RuntimeError("invalid structured review location")
+    return f"{REVIEW_URL}/blob/{sha}/{relative}#L{start}-L{end}"
+
+
+def section_diagnostic(category: str, state: str, number: int, old: list, new: list,
+                       base_sha: str, head_sha: str):
+    """Stream closed categories and numeric ranges into the bounded report (R2)."""
+    if category not in ("RULE TEXT CHANGED", "COUNT CHANGED") or state not in (
+            "added", "removed", "changed", "duplicated heading") or type(number) is not int or not 1 <= number <= MAX_BLOB_BYTES:
+        raise RuntimeError("invalid structured section")
+    yield f"### {category} ({state}): section={number}"
+    for side, sha, ranges in (("base", base_sha, old), ("head", head_sha, new)):
+        for start, end in ranges:
+            link = review_location(sha, "CLAUDE.md", start, end)
+            yield f"- {side}: lines={start}-{end}; count={end - start + 1}; [review]({link})"
+    yield ""
+
+
 def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: Path, index_pins=None):
     """Return (report_text, failed). Raises RuntimeError for a fail-closed precondition."""
     for sha in (base_sha, head_sha):
         if not SHA.fullmatch(sha):
             raise RuntimeError(f"{sha!r} is not a 40-hex commit id")
+    verify_history(repo, base_sha, head_sha)
     guard = load_base_guard(base_root)
     head_root = scratch / "head"
     if head_root.exists():
@@ -218,14 +414,26 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
         raise RuntimeError("the base manifest is unusable: " + "; ".join(manifest_errors))
     head_text = guard.read_utf8(head_root / "CLAUDE.md")
     base_text = guard.read_utf8(base_root / "CLAUDE.md")
+    base_ranges = section_ranges(guard, base_text)
+    head_ranges = section_ranges(guard, head_text, MAX_REPORT_RANGES - sum(map(len, base_ranges.values())))
+    if len(set(pinned) | set(base_ranges) | set(head_ranges)) > MAX_REPORT_SECTIONS:
+        raise RuntimeError("section keys exceed comparison budget")
     head_hashes, duplicates = guard.rule_section_hashes(head_text)
     head_bodies = section_texts(guard, head_text)
     base_bodies = section_texts(guard, base_text)
 
-    lines = ["## CLAUDE.md rule-change comparison (base manifest vs pull request head)", ""]
+    keys = sorted(pinned) + sorted(set(head_hashes) - set(pinned))
+    section_ids = {key: number for number, key in enumerate(keys, 1)}
+    lines = BoundedReport()
+    lines.extend(["## CLAUDE.md rule-change comparison (structured schema 1)", ""])
+    for rel in DATA_PATHS:
+        lines.append(f"- Source: {rel}; [base]({review_location(base_sha, rel, 1, 1)}); "
+                     f"[head]({review_location(head_sha, rel, 1, 1)})")
+    lines.extend([f"- [Approval range]({REVIEW_URL}/compare/{base_sha}...{head_sha})", ""])
     rule_changed = False
     count_changed = False
-    for key in sorted(set(pinned) | set(head_hashes)):
+    reported_keys = set()
+    for key in keys:
         if key in pinned and head_hashes.get(key) == pinned[key]:
             continue
         old = base_bodies.get(key)
@@ -235,25 +443,32 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
         if old is not None and new is not None and key.startswith(CENSUS_SECTION) and (
                 CENSUS_DIGITS.split(old) == CENSUS_DIGITS.split(new)):
             count_changed = True
-            lines += [f"### COUNT CHANGED: {span(key)}", "", "Only census counts differ.", ""] + fenced(
-                unified(old, new, key)) + [""]
+            lines.extend(section_diagnostic("COUNT CHANGED", "changed", section_ids[key],
+                                            base_ranges.get(key, []), head_ranges.get(key, []), base_sha, head_sha))
         else:
             rule_changed = True
             state = "removed" if new is None else ("added" if old is None else "changed")
-            lines += [f"### RULE TEXT CHANGED ({state}): {span(key)}", ""] + fenced(
-                unified(old or "", new or "", key)) + [""]
-    for key in duplicates:
+            lines.extend(section_diagnostic("RULE TEXT CHANGED", state, section_ids[key],
+                                            base_ranges.get(key, []), head_ranges.get(key, []), base_sha, head_sha))
+        reported_keys.add(key)
+    for key in sorted(set(duplicates)):
         rule_changed = True
-        lines += [f"### RULE TEXT CHANGED (duplicated heading): {span(key)}", ""]
+        # Keep both change categories, but navigate each occurrence only once.
+        old = [] if key in reported_keys else base_ranges.get(key, [])
+        new = [] if key in reported_keys else head_ranges.get(key, [])
+        lines.extend(section_diagnostic("RULE TEXT CHANGED", "duplicated heading", section_ids[key],
+                                        old, new, base_sha, head_sha))
     residual = [error for error in guard.check(head_root, index_pins) if not any(marker in error for marker in DRIFT_MARKERS)]
-    for error in residual:
+    if residual:
         rule_changed = True
-        lines.append(f"- BASE GUARD REFUSES THE HEAD: {span(error)}")
+        lines.append(f"- BASE GUARD REFUSES THE HEAD: count={len(residual)}")
     if residual:
         lines.append("")
-    for rel in trusted_changes(repo, base_sha, head_sha):
-        rule_changed = True
-        lines.append(f"- GUARD CHANGED: {rel} (the code that judges rule changes; needs the trailer)")
+    changed_paths = trusted_changes(repo, base_sha, head_sha)
+    for rel in TRUSTED_PATHS:
+        if rel in changed_paths:
+            rule_changed = True
+            lines.append(f"- GUARD CHANGED: {rel}; [review]({review_location(head_sha, rel, 1, 1)})")
     approved = approvals(repo, base_sha, head_sha)
     failed = False
     if rule_changed and not approved:
@@ -261,14 +476,13 @@ def compare(base_root: Path, repo: Path, base_sha: str, head_sha: str, scratch: 
         lines.append("RESULT: FAIL - the rule text changed and no commit in the range carries a "
                      "`Rule-Change-Approved-By: <who>` trailer.")
     elif rule_changed:
-        lines.append("RESULT: PASS - rule text changed; approval trailer(s): "
-                     + "; ".join(span(value) for value in approved)
-                     + ". This is tamper-evidence: the trailer is data, and review plus the sole merger enforce.")
+        lines.append(f"RESULT: PASS - rule text changed; approval trailer(s): count={len(approved)}. "
+                     "This is tamper-evidence; review plus the sole merger enforce.")
     elif count_changed:
         lines.append("RESULT: PASS - only counts changed (printed above for review).")
     else:
         lines.append("RESULT: PASS - no rule section differs from the base manifest.")
-    return "\n".join(lines) + "\n", failed
+    return lines.render(), failed
 
 
 def run(args) -> int:
@@ -281,13 +495,28 @@ def run(args) -> int:
     scratch = Path(args.scratch)
     try:
         scratch.mkdir(parents=True, exist_ok=True)
-        report, failed = compare(Path(args.base_root), Path(args.repo), args.base_sha, args.head_sha, scratch)
-    except (RuntimeError, OSError, UnicodeDecodeError, ValueError, SyntaxError) as exc:
-        report, failed = f"## CLAUDE.md rule-change comparison\n\nRESULT: FAIL (closed) - {exc}\n", True
+        if getattr(args, "event", None):
+            if os.environ.get("GITHUB_EVENT_NAME") != "pull_request_target":
+                raise RuntimeError("unexpected workflow event")
+            event_path = Path(args.event)
+            if event_path.stat().st_size > MAX_EVENT_BYTES:
+                raise RuntimeError("event exceeds comparison budget")
+            event = json.loads(event_path.read_text(encoding="utf-8"))
+            base, head, _ = event_binding(event)
+            with isolated_objects(Path(args.base_root), event, scratch) as objects:
+                report, failed = compare(Path(args.base_root), objects, base, head, objects.parent / "data")
+        else:
+            report, failed = compare(Path(args.base_root), Path(args.repo), args.base_sha, args.head_sha, scratch)
+    except (RuntimeError, OSError, UnicodeError, ValueError, SyntaxError, TypeError):
+        report, failed = FAIL_REPORT, True
     print(report)
     if args.summary:
-        with open(args.summary, "a", encoding="utf-8") as handle:
-            handle.write(report)
+        try:
+            with open(args.summary, "a", encoding="utf-8") as handle:
+                handle.write(report)
+        except OSError:
+            print("RESULT: FAIL (closed) - summary unavailable", file=sys.stderr)
+            return 1
     return 1 if failed else 0
 
 
@@ -300,7 +529,7 @@ IDENT = ("-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commi
 def make_repo(guard, root: Path):
     """A git repo whose first commit is a valid tree (CLAUDE.md, references, manifest). Returns the base sha."""
     root.mkdir(parents=True)
-    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    git(root, "init", "--quiet", "--template=")
     guard.build_fixture(root)
     path = root / "CLAUDE.md"
     heading = guard.CLAUDE_MD_REQUIRED_HEADINGS[2]
@@ -319,8 +548,11 @@ def make_repo(guard, root: Path):
 
 
 def commit_all(root: Path, message: str) -> str:
-    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
-    subprocess.run(["git", "-C", str(root), *IDENT, "commit", "-q", "--allow-empty", "-m", message], check=True)
+    paths = git(root, "ls-files", "--cached", "--others", "--exclude-standard", "-z").split(b"\0")
+    explicit = sorted({path.decode("utf-8") for path in paths if path})
+    if explicit:
+        git(root, "add", "--all", "--", *explicit)
+    git(root, *IDENT, "commit", "-q", "--allow-empty", "-m", message)
     return git(root, "rev-parse", "HEAD").decode().strip()
 
 
@@ -442,8 +674,8 @@ def plant_coverage_gap(probed: list, names: list, rounds: int) -> bool:
 # #5472: the top-level modules this script imports (except sys), pinned as a literal so the self-test has a source of
 # truth that does not come from imported_modules() itself. Adding or removing an import without updating this tuple
 # makes the self-test red.
-EXPECTED_IMPORTS = ("argparse", "ast", "difflib", "importlib", "os", "pathlib", "py_compile", "re", "shutil", "stat",
-                    "subprocess", "tokenize", "typing")
+EXPECTED_IMPORTS = ("argparse", "ast", "contextlib", "difflib", "importlib", "json", "os", "pathlib", "py_compile", "re",
+                    "resource", "shutil", "signal", "stat", "subprocess", "tempfile", "tokenize", "typing")
 
 
 def import_pin_gap(found: list, pinned) -> tuple:
@@ -541,12 +773,12 @@ def _self_test_cases() -> int:
     guard_path = repo_root / GUARD_REL
     try:
         guard = load_source_module("sibling_guard", guard_path)
-    except (RuntimeError, OSError, SyntaxError, ValueError) as exc:
-        print(f"FAIL: self-test - cannot load the sibling guard: {exc}", file=sys.stderr)
+    except (RuntimeError, OSError, SyntaxError, ValueError):
+        print('FAIL: self-test category=guard-load', file=sys.stderr)
         return 1
     refusal = guard.scratch_base_error(repo_root)
     if refusal:
-        print(refusal, file=sys.stderr)
+        print("FAIL: self-test scratch unavailable", file=sys.stderr)
         return 1
     base_dir = selftest_dir()
     shutil.rmtree(base_dir, ignore_errors=True)
@@ -574,10 +806,10 @@ def _self_test_cases() -> int:
             report, failed = f"RESULT: FAIL (closed) - {exc}", True
         if failed != want_fail or needle not in report:
             failures.append(name)
-            print(f"FAIL: self-test - {name}: failed={failed} (wanted {want_fail}), needle {needle!r}\n{report}",
+            print(f"FAIL: self-test case={counter[0]}; verdict={int(failed)}; expected={int(want_fail)}",
                   file=sys.stderr)
         else:
-            print(f"PASS: self-test - {name}")
+            print(f"PASS: self-test case={counter[0]}")
 
     heading = guard.CLAUDE_MD_REQUIRED_HEADINGS[2]
 
@@ -595,10 +827,10 @@ def _self_test_cases() -> int:
         reseal(root)
 
     case("reworded section without a trailer fails with the diff", reword, True, "RULE TEXT CHANGED")
-    case("the diff names the section and shows the change", reword, True, "+The tool limit is NOT 103 tools.")
-    case("reworded section with the trailer passes", reword, False, "approval trailer(s): ` Justin `", trailer="Justin")
-    case("a trailer value with a backtick is one code span (#5378)", reword, False,
-         "approval trailer(s): `` Jus`tin ``", trailer="Jus`tin")
+    case("the report names a numeric section and links its source", reword, True, "section=")
+    case("reworded section with the trailer passes", reword, False, "approval trailer(s): count=1", trailer="Justin")
+    case("a trailer value with a backtick has a closed structured diagnostic (#5378)", reword, False,
+         "approval trailer(s): count=1", trailer="Jus`tin")
     case("a trailer quoted mid-line does not count", reword, True, "RESULT: FAIL",
          message="head change Rule-Change-Approved-By: Justin")
     case("an empty trailer value does not count", reword, True, "RESULT: FAIL",
@@ -610,7 +842,6 @@ def _self_test_cases() -> int:
 
     case("same-size filler swap is a rule change", filler, True, "RULE TEXT CHANGED")
 
-    census_heading = next(h for h in guard.CLAUDE_MD_REQUIRED_HEADINGS if h.startswith(CENSUS_SECTION))
 
     def census_edit(old, new):
         def apply(root):
@@ -646,7 +877,7 @@ def _self_test_cases() -> int:
                           encoding="utf-8")
 
     case("a head heading is a code span in the summary (R5, #5166)", link_heading, True,
-         "RULE TEXT CHANGED (added): ` ## [ok](https://e.invalid/x) `")
+         "RULE TEXT CHANGED (added): section=")
 
     def trusted_write(rel, data=b"# weakened\n"):
         def apply(root):
@@ -665,7 +896,7 @@ def _self_test_cases() -> int:
                       ".github/CODEOWNERS")
     if TRUSTED_PATHS != pinned_trusted:
         failures.append("TRUSTED_PATHS pin")
-        print(f"FAIL: self-test - TRUSTED_PATHS {TRUSTED_PATHS} differs from the pinned set (R5, #5164)",
+        print('FAIL: self-test category=trusted-path-pins',
               file=sys.stderr)
     else:
         print("PASS: self-test - TRUSTED_PATHS equals the pinned set (R5, #5164)")
@@ -895,7 +1126,7 @@ def _self_test_cases() -> int:
                 probed.append(name)
                 if plant.planted_ran:
                     live.append(name)
-            print(f"INFO: self-test - planted file ran (measured) for {live} with options {xopts}")
+            print('INFO: self-test category=module-plant')
         # #5509: the child's exit code reaches parse_plant: a planted file that ran and exited 3 is never ok.
         # #5565: run on a module name no interpreter provides, so the planted file always runs and the pin cannot be
         # skipped on an interpreter where every probed name is inert. exit_code 0 is the positive control.
@@ -943,14 +1174,14 @@ def _self_test_cases() -> int:
             control = plant_probe("importlib", base_dir / "implant", [], child_env({"PYTHONSAFEPATH": "1"}), ("-S",))
             if control.safe_path != 1 or control.ok:
                 return "the probe cannot tell an inert planted file from a live one"
-        print(f"INFO: self-test - this interpreter honours PYTHONSAFEPATH: {honours} (measured; the control runs only then)")
+        print('INFO: self-test category=safe-path-control')
         # #5473: the flag report can say 0. A child started without -S must report no_site 0 (and -E still 1), and a
         # child started without -E must report ignore_environment 0; an always-1 report is red.
         no_s = plant_probe("importlib", base_dir / "implant", [], isolate=("-E",))
         no_e = plant_probe("importlib", base_dir / "implant", [], isolate=("-S",))
         if (no_s.no_site, no_s.ignore_env, no_e.no_site, no_e.ignore_env) != (0, 1, 1, 0) or not (no_s.ok and no_e.ok):
             return "the probe child's flag report does not follow the flags it was started with (#5473)"
-        print(f"INFO: self-test - importlib already loaded without -S: {no_s.preloaded} (measured, not assumed)")
+        print('INFO: self-test category=import-preload-control')
         return ""
 
     plant_failure = importlib_plant()
@@ -958,7 +1189,7 @@ def _self_test_cases() -> int:
         print("PASS: self-test - the plant set equals the pinned imports and every planted file ran as the child reported (#5424)")
     else:
         failures.append("importlib plant")
-        print(f"FAIL: self-test - the importlib plant check failed: {plant_failure} (#5424, #5441)", file=sys.stderr)
+        print('FAIL: self-test category=module-isolation', file=sys.stderr)
 
     def importer_refusal():
         # #5377: a caller that imports the module skips the module-top refusal (it is gated on __name__ ==
@@ -1092,13 +1323,13 @@ def _self_test_cases() -> int:
         edit("tool limit is 103 tools", "tool limit is 103 tools\n```\n[link](https://e.invalid)")(root)
         reseal(root)
 
-    case("head backticks cannot close the summary fence (R4)", fence_check, True, "````diff")
+    case("head backticks cannot enter the summary (R4)", fence_check, True, "section=")
 
     def long_fence(root):
         edit("tool limit is 103 tools", "tool limit is 103 tools\n``````\n[link](https://e.invalid)")(root)
         reseal(root)
 
-    case("a long head backtick run gets a longer fence (R4)", long_fence, True, "```````diff")
+    case("a long head backtick run retains numeric section navigation (R4)", long_fence, True, "section=")
 
     def reseal_only(root):
         manifest = root / MANIFEST_REL
@@ -1189,11 +1420,11 @@ def _self_test_cases() -> int:
             compare(base_root, repo, base_sha, head_sha, scratch, guard.fixture_index_pins())
         except RuntimeError as exc:
             if needle in str(exc):
-                print(f"PASS: self-test - {label}")
+                print('PASS: self-test category=commit-ref-refused')
                 return
-            print(f"FAIL: self-test - {label}: refused with {exc} (wanted {needle!r})", file=sys.stderr)
+            print('FAIL: self-test category=commit-ref-refusal-kind', file=sys.stderr)
         else:
-            print(f"FAIL: self-test - {label}: not refused", file=sys.stderr)
+            print('FAIL: self-test category=commit-ref-accepted', file=sys.stderr)
         failures.append(label)
 
     work, base_sha, base_root = fresh_pair("sym")
@@ -1214,10 +1445,10 @@ def _self_test_cases() -> int:
         got = fenced(body)
         closes = got[2]
         if got[0] != want or closes != want[:-len("diff")] or got[1] != body:
-            print(f"FAIL: self-test - R5 fenced(): {label}: {got!r}", file=sys.stderr)
+            print('FAIL: self-test category=fence-control', file=sys.stderr)
             failures.append(label)
         else:
-            print(f"PASS: self-test - R5 fenced(): {label}")
+            print('PASS: self-test category=fence-control')
 
     # #5179: the trusted-path diff starts at the merge base, so a trusted change that landed on the base after
     # the head forked is not charged to the head (every other fixture is linear).
@@ -1225,7 +1456,7 @@ def _self_test_cases() -> int:
     repo = work / "repo"
     (repo / GUARD_REL).write_text("# the base moved on\n", encoding="utf-8")
     moved_sha = commit_all(repo, "base moves on")
-    subprocess.run(["git", "-C", str(repo), "checkout", "-q", fork_sha], check=True)
+    git(repo, "checkout", "-q", fork_sha)
     (repo / "docs").mkdir(parents=True, exist_ok=True)
     (repo / "docs" / "untrusted-note.md").write_text("x\n", encoding="utf-8")
     head_sha = commit_all(repo, "head change")
@@ -1234,14 +1465,14 @@ def _self_test_cases() -> int:
     except RuntimeError as exc:
         report, failed = f"RESULT: FAIL (closed) - {exc}", True
     if failed or "GUARD CHANGED" in report:
-        print(f"FAIL: self-test - R6 a base-side trusted change after the fork is charged to the head\n{report}",
+        print('FAIL: self-test category=merge-base-control',
               file=sys.stderr)
         failures.append("merge base")
     else:
         print("PASS: self-test - R6 a base-side trusted change after the fork is not charged to the head (#5179)")
 
-    # #5180: the COUNT CHANGED branch uses the same dynamic fence as the rule branch; no other census diff carries
-    # a backtick run, so a static fence there was never caught.
+    # #5180 / #6163 R2: hostile backticks still permit census classification and immutable navigation;
+    # the raw census diff is no longer an output field.
     work, _, _ = fresh_pair("countfence")
     repo = work / "repo"
     claude = repo / "CLAUDE.md"
@@ -1261,41 +1492,41 @@ def _self_test_cases() -> int:
         report, failed = compare(base_root, repo, fence_base, head_sha, work / "scratch", guard.fixture_index_pins())
     except RuntimeError as exc:
         report, failed = f"RESULT: FAIL (closed) - {exc}", True
-    if failed or "COUNT CHANGED" not in report or not re.search(r"\n`````diff\n.*?\n`````\n", report, re.S):
-        print(f"FAIL: self-test - R6 the COUNT CHANGED fence is not longer than a backtick run\n{report}",
+    if failed or "COUNT CHANGED" not in report or "/CLAUDE.md#L" not in report:
+        print('FAIL: self-test category=census-navigation',
               file=sys.stderr)
         failures.append("count fence")
     else:
-        print("PASS: self-test - R6 the COUNT CHANGED fence is longer than a backtick run in the census section "
+        print("PASS: self-test - R6 COUNT CHANGED retains immutable navigation for a backtick-bearing census section "
               "(#5180)")
 
-    # #5282: every head-controlled string printed outside a fence goes through span(), including text that holds a
-    # backtick run; the cases below carry backticks in head headings and in the guard message that quotes them.
+    # #5282: preserve the legacy span helper controls. R2 report tests below ensure that headings and
+    # guard messages instead produce numeric identifiers/counts, including backtick-bearing inputs.
     for raw, want in (("a", "` a `"), ("a ``` b", "```` a ``` b ````"), ("a\nb", "` a b `"),
                       ("`", "`` ` ``"), ("a`b", "`` a`b ``"),
                       ("a\rb", "` a b `"), ("a\u2028b", "` a b `")):  # #5381: CR and U+2028 break lines too
         if span(raw) == want:
-            print(f"PASS: self-test - span({raw!r}) is one code span (#5282)")
+            print('PASS: self-test category=span-control')
         else:
             failures.append(f"span {raw!r}")
-            print(f"FAIL: self-test - span({raw!r}) = {span(raw)!r}, wanted {want!r} (#5282)", file=sys.stderr)
+            print('FAIL: self-test category=span-control', file=sys.stderr)
 
     def tick_heading(root):
         target = root / "CLAUDE.md"
         target.write_text(target.read_text(encoding="utf-8") + "\n## added `x` heading\n\nbody\n", encoding="utf-8")
 
-    case("a head heading with a backtick is one code span (#5282)", tick_heading, True,
-         "RULE TEXT CHANGED (added): `` ## added `x` heading ``")
+    case("a head heading with a backtick has a closed structured diagnostic (#5282)", tick_heading, True,
+         "RULE TEXT CHANGED (added): section=")
 
     def duplicated_tick_heading(root):
         target = root / "CLAUDE.md"
         target.write_text(target.read_text(encoding="utf-8") + "\n## dup `y`\n\nbody\n\n## dup `y`\n\nbody\n",
                           encoding="utf-8")
 
-    case("a duplicated head heading with a backtick is one code span (#5282)", duplicated_tick_heading, True,
-         "RULE TEXT CHANGED (duplicated heading): `` ## dup `y` ``")
-    case("a base-guard refusal quoting a head heading with a backtick is one code span (#5282)",
-         duplicated_tick_heading, True, "- BASE GUARD REFUSES THE HEAD: `` FAIL: CLAUDE.md has the heading '## dup `y`' more than once")
+    case("a duplicated head heading with a backtick has a closed structured diagnostic (#5282)", duplicated_tick_heading, True,
+         "RULE TEXT CHANGED (duplicated heading): section=")
+    case("a base-guard refusal quoting a head heading with a backtick has a closed structured diagnostic (#5282)",
+         duplicated_tick_heading, True, "- BASE GUARD REFUSES THE HEAD: count=")
 
     work, _, _ = fresh_pair("countkey")
     repo = work / "repo"
@@ -1315,12 +1546,12 @@ def _self_test_cases() -> int:
         report, failed = compare(base_root, repo, key_base, head_sha, work / "scratch", guard.fixture_index_pins())
     except RuntimeError as exc:
         report, failed = f"RESULT: FAIL (closed) - {exc}", True
-    needle = "### COUNT CHANGED: `` ## Prime directive census `z` addendum ``"
+    needle = "### COUNT CHANGED (changed): section="
     if failed or needle not in report:
-        print(f"FAIL: self-test - the COUNT CHANGED heading is not one code span (#5282)\n{report}", file=sys.stderr)
+        print('FAIL: self-test category=census-section-id', file=sys.stderr)
         failures.append("count key span")
     else:
-        print("PASS: self-test - the COUNT CHANGED heading with a backtick is one code span (#5282)")
+        print("PASS: self-test - the COUNT CHANGED heading with a backtick has a closed structured diagnostic (#5282)")
 
     # #5376: a head census line that holds a literal "#" where the base had a number is a rule change, not a count.
     def hash_for_count(root):
@@ -1462,11 +1693,19 @@ def _self_test_cases() -> int:
     return 0
 
 
+class ClosedArgumentParser(argparse.ArgumentParser):
+    """Argument errors never echo unknown arguments or attacker-controlled paths."""
+
+    def error(self, message):
+        self.exit(2, "RESULT: FAIL (closed) - invalid comparison arguments\n")
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = ClosedArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--base-root")
     parser.add_argument("--repo")
+    parser.add_argument("--event")
     parser.add_argument("--base-sha")
     parser.add_argument("--head-sha")
     parser.add_argument("--scratch")
@@ -1474,10 +1713,16 @@ def main() -> int:
     args = parser.parse_args()
     if args.self_test:
         return self_test()
-    if not all((args.base_root, args.repo, args.base_sha, args.head_sha, args.scratch)):
+    event_args = args.event and args.base_root and args.scratch
+    local_args = all((args.base_root, args.repo, args.base_sha, args.head_sha, args.scratch))
+    if not event_args and not local_args:
         parser.error("--base-root, --repo, --base-sha, --head-sha and --scratch are required")
     return run(args)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception:
+        print("RESULT: FAIL (closed) - comparison execution failed", file=sys.stderr)
+        sys.exit(1)
