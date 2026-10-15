@@ -353,7 +353,7 @@ fn push_req(body: &[u8], headers: &[(&str, &str)]) -> Request<Body> {
 /// signing key so the test can sign bodies that `resolve_peer_verifying_key`
 /// then verifies against the enrolled key. Caller MUST hold `FED_ENV_LOCK`.
 fn enroll_peer(peer_id: &str) -> (tempfile::TempDir, SigningKey) {
-    let dir = tempfile::tempdir().expect("keydir");
+    let dir = private_tempdir();
     let kp = ai_memory::identity::keypair::generate(peer_id).expect("gen keypair");
     ai_memory::identity::keypair::save(&kp, dir.path()).expect("save keypair");
     // SAFETY: caller holds FED_ENV_LOCK for the duration.
@@ -566,7 +566,7 @@ async fn pg_sync_push_via_store_applies_action_transition() {
         return;
     };
     clear_fed_env();
-    let keydir = tempfile::tempdir().expect("keydir");
+    let keydir = private_tempdir();
     let actor = uniq("ai:cov-ga2-pg-txactor");
     let kp = ai_memory::identity::keypair::generate(&actor).expect("kp");
     ai_memory::identity::keypair::save(&kp, keydir.path()).expect("save");
@@ -1198,4 +1198,18 @@ async fn pg_sync_push_enrolled_signed_nonce_drives_deep_body() {
         1,
         "signed row applied; body={b}"
     );
+}
+
+/// #7178 - a key directory must satisfy the #3198 gate whatever the process
+/// umask, so the mode is set on the builder and the directory never exists in a
+/// umask-derived (group-writable) mode.
+fn private_tempdir() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("keydir-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().expect("private tempdir")
 }

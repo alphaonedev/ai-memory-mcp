@@ -204,7 +204,7 @@ const PEER_HEADER: &str = "x-peer-id";
 /// guard + the signing key so the test can sign bodies that
 /// `resolve_peer_verifying_key` will then verify against the enrolled key.
 fn enroll_peer(peer_id: &str) -> (tempfile::TempDir, SigningKey) {
-    let dir = tempfile::tempdir().expect("keydir");
+    let dir = private_tempdir();
     let kp = ai_memory::identity::keypair::generate(peer_id).expect("gen keypair");
     ai_memory::identity::keypair::save(&kp, dir.path()).expect("save keypair");
     // SAFETY: caller holds FED_ENV_LOCK for the duration.
@@ -416,7 +416,7 @@ async fn sync_push_applies_signals_sqlite() {
 async fn sync_push_applies_action_transition_sqlite() {
     let _g = FED_ENV_LOCK.lock().await;
     let _scope = NamespaceScopeGuard::new("ai:cov-ga2-txactor", "covga2tx");
-    let keydir = tempfile::tempdir().expect("keydir");
+    let keydir = private_tempdir();
     let actor = "ai:cov-ga2-txactor";
     let kp = ai_memory::identity::keypair::generate(actor).expect("kp");
     ai_memory::identity::keypair::save(&kp, keydir.path()).expect("save");
@@ -544,7 +544,7 @@ async fn sync_push_applies_action_transition_sqlite() {
 async fn sync_push_replayed_action_transition_refused_1805() {
     let _g = FED_ENV_LOCK.lock().await;
     let _scope = NamespaceScopeGuard::new("ai:cov-ga2-replayactor", "covga2replay");
-    let keydir = tempfile::tempdir().expect("keydir");
+    let keydir = private_tempdir();
     let actor = "ai:cov-ga2-replayactor";
     let kp = ai_memory::identity::keypair::generate(actor).expect("kp");
     ai_memory::identity::keypair::save(&kp, keydir.path()).expect("save");
@@ -868,7 +868,7 @@ async fn sync_push_sig_present_no_enrolled_key_refuses_401() {
     // REQUIRE_SIG default ON, a sig header present, but NO enrolled key for
     // the peer (KEY_DIR points at an empty dir) → (Some, None) arm:
     // x_memory_sig_no_enrolled_key 401.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     unsafe {
         std::env::set_var(ai_memory::identity::keypair::KEY_DIR_ENV, dir.path());
     }
@@ -1058,7 +1058,7 @@ async fn sync_since_require_sig_off_permissive_ok() {
 async fn sync_since_sig_present_no_enrolled_key_refuses_401() {
     let _g = FED_ENV_LOCK.lock().await;
     clear_fed_env();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     unsafe {
         std::env::set_var(ai_memory::identity::keypair::KEY_DIR_ENV, dir.path());
     }
@@ -1419,4 +1419,18 @@ async fn pg_sync_push_via_store_invalid_sender_rejected() {
         status == StatusCode::BAD_REQUEST || status == StatusCode::FORBIDDEN,
         "invalid pg sender rejected; status={status}"
     );
+}
+
+/// #7178 - a key directory must satisfy the #3198 gate whatever the process
+/// umask, so the mode is set on the builder and the directory never exists in a
+/// umask-derived (group-writable) mode.
+fn private_tempdir() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("keydir-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().expect("private tempdir")
 }

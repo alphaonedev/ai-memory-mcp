@@ -56,7 +56,7 @@ fn priv_path(dir: &std::path::Path) -> std::path::PathBuf {
 /// Which half is on disk afterwards therefore reports the ORDER directly.
 #[test]
 fn save_writes_the_private_half_first_3146() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = private_tempdir();
     let dir = tmp.path();
 
     let original = keypair::generate(AGENT).expect("generate original");
@@ -121,7 +121,7 @@ fn save_writes_the_private_half_first_3146() {
 
 #[test]
 fn ensure_keypair_generates_when_neither_half_exists_3147() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = private_tempdir();
     let outcome = ensure_keypair(AGENT, tmp.path(), false).expect("ensure");
     assert!(
         matches!(outcome, EnsureOutcome::Generated { .. }),
@@ -133,7 +133,7 @@ fn ensure_keypair_generates_when_neither_half_exists_3147() {
 
 #[test]
 fn ensure_keypair_is_idempotent_when_both_halves_exist_3147() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = private_tempdir();
     let dir = tmp.path();
     ensure_keypair(AGENT, dir, false).expect("first");
     let pub_before = fs::read(pub_path(dir)).expect("pub");
@@ -152,7 +152,7 @@ fn ensure_keypair_is_idempotent_when_both_halves_exist_3147() {
 /// deliberately produces. Must SELF-HEAL to the SAME identity.
 #[test]
 fn ensure_keypair_re_derives_a_missing_public_half_3147() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = private_tempdir();
     let dir = tmp.path();
     ensure_keypair(AGENT, dir, false).expect("first");
     let priv_before = fs::read(priv_path(dir)).expect("priv");
@@ -197,7 +197,7 @@ fn ensure_keypair_re_derives_a_missing_public_half_3147() {
 /// re-entered as `AlreadyExists`.
 #[test]
 fn ensure_keypair_reports_a_public_only_directory_as_degraded_3147() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = private_tempdir();
     let dir = tmp.path();
     ensure_keypair(AGENT, dir, false).expect("first");
     let pub_before = fs::read(pub_path(dir)).expect("pub");
@@ -252,7 +252,7 @@ fn ensure_keypair_reports_a_public_only_directory_as_degraded_3147() {
 /// into a boot failure by the `asi-hard` posture.
 #[test]
 fn public_only_refusal_is_scoped_to_the_degraded_outcome_3147() {
-    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let tmp = private_tempdir();
     let p = pub_path(tmp.path());
     for outcome in [
         EnsureOutcome::AlreadyExists {
@@ -289,4 +289,18 @@ fn no_signing_identity_refusal_is_asi_hard_only_3147() {
         refusal.contains("asi-hard") && refusal.contains("group-writable"),
         "refusal must name the posture and the cause, got: {refusal}"
     );
+}
+
+/// #7178 - a key directory must satisfy the #3198 gate whatever the process
+/// umask, so the mode is set on the builder and the directory never exists in a
+/// umask-derived (group-writable) mode.
+fn private_tempdir() -> tempfile::TempDir {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("keydir-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir().expect("private tempdir")
 }
