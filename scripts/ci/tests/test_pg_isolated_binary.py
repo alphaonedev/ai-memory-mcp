@@ -1533,6 +1533,78 @@ class Review7088R2(unittest.TestCase):
         self.assertEqual({name, name + '_tpl'}, rec.dbs)
 
 
+class Review7088R4(unittest.TestCase):
+    """PR #7088 review r4: #7200 exit code and #7212 disown after a failed settle."""
+
+    NAME = 'ci_base_7212_1700000000_0123abcd'
+
+    def run_main(self, argv, rec, env=None):
+        return FamilyOwnership7113.run_main(self, argv, rec, env)
+
+    def test_7200_wrapper_error_with_owned_names_exits_unreleased_not_usage(self):
+        def stranded_setup(*_args, **_kwargs):
+            pib._own(TPL)  # a template: not a minted base, so setup's own cleanup does not release it
+            raise pib.WrapperError('injected failure after a name was acquired')
+
+        with unittest.mock.patch.object(pib, 'setup', side_effect=stranded_setup), \
+                unittest.mock.patch.object(pib, 'mint_base', return_value=BASE):
+            rc, _, err = self.run_main(['setup', '--url', FamilyOwnership7113.SHARED, '--db', 'ai_memory_test_ci_9_1_x'],
+                                       Recorder(default_answer))
+        self.assertEqual(rc, pib.EXIT_UNRELEASED, err[-300:])
+        self.assertIn('NOT released: %s' % TPL, err)
+        del pib._OWNED[:]
+
+    def test_7200_wrapper_error_without_owned_names_still_exits_usage(self):
+        rc, _, err = self.run_main(['setup', '--url', FamilyOwnership7113.SHARED, '--db', 'ai_memory_test'],
+                                   Recorder(default_answer))
+        self.assertEqual(rc, pib.EXIT_USAGE, err[-300:])
+        self.assertNotIn('NOT released', err)
+
+    def test_7212_drop_base_keeps_the_name_owned_when_the_settle_times_out(self):
+        pib._own(self.NAME)
+        rec = Recorder(default_answer, dbs=[self.NAME])
+        try:
+            with Patched(rec), unittest.mock.patch.object(pib, 'settle_backends', return_value=False):
+                dropped = pib.drop_base(BASE, self.NAME)
+            self.assertFalse(dropped)
+            self.assertIn(self.NAME, pib._OWNED, 'a name a live backend may still create stays owned')
+            self.assertFalse([s for s in rec.sql() if s.startswith('DROP DATABASE')],
+                             'no drop is attempted while a backend of this run is alive')
+        finally:
+            del pib._OWNED[:]
+
+    def test_7212_drop_base_still_disowns_after_a_settled_drop(self):
+        pib._own(self.NAME)
+        rec = Recorder(default_answer, dbs=[self.NAME])
+        try:
+            with Patched(rec), unittest.mock.patch.object(pib, 'settle_backends', return_value=True):
+                dropped = pib.drop_base(BASE, self.NAME)
+            self.assertTrue(dropped)
+            self.assertNotIn(self.NAME, pib._OWNED)
+        finally:
+            del pib._OWNED[:]
+
+    def test_7212_template_cleanup_keeps_the_name_owned_when_the_settle_times_out(self):
+        failure = pib.WrapperError('injected extension failure')
+
+        def answer(argv, kw):
+            sql = argv[argv.index('-c') + 1]
+            if sql.startswith('CREATE EXTENSION'):
+                raise failure
+            return default_answer(argv, kw)
+
+        rec = Recorder(answer)
+        del pib._OWNED[:]
+        try:
+            with Patched(rec), unittest.mock.patch.object(pib, 'settle_backends', return_value=False):
+                with self.assertRaises(pib.WrapperError) as caught:
+                    pib.setup(BASE, 'ai_memory_test_ci_9_1_x', jobs=1)
+            self.assertIs(caught.exception, failure)
+            self.assertIn(TPL, pib._OWNED, 'the template stays owned when its backends are still alive')
+        finally:
+            del pib._OWNED[:]
+
+
 SIGTERM_DRIVER = r'''
 import importlib.util, json, os, re, signal, sys, zlib
 

@@ -526,7 +526,11 @@ def drop_base(url: str, name: str) -> bool:
     try:
         with _sigterm_deferred():  # #7179: the first SIGTERM must not abandon the drop
             if not settle_backends(url):
-                log('WARN backends of this run are still alive after %ds' % int(SETTLE_SECS))
+                # #7212: a backend of this run may still hold or commit the CREATE;
+                # the name stays owned so the exit is EXIT_UNRELEASED, not a release.
+                log('WARN backends of this run are still alive after %ds; %s stays owned (drop it by hand)'
+                    % (int(SETTLE_SECS), name))
+                return False
             psql(with_database(url, MAINTENANCE_DB), SQL_DROP_DATABASE % quote_ident(_checked_ident(name)))
             if name_exists(url, name):
                 log('WARN minted base %s still exists after the drop (drop it by hand)' % name)
@@ -871,7 +875,9 @@ def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
             try:
                 with _sigterm_deferred():
                     if not settle_backends(url):  # #7179: the CREATE commits after psql is gone
-                        log('WARN backends of this run are still alive after %ds' % int(SETTLE_SECS))
+                        # #7212: never disown a name a live backend may still create.
+                        raise WrapperError('template %s: backends of this run are still alive after %ds'
+                                           % (tpl, int(SETTLE_SECS)))
                     try:
                         psql(url, SQL_RELEASE_TEMPLATE % q)
                     except WrapperError:
@@ -1390,6 +1396,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print('pg_isolated_binary: %s' % exc, file=sys.stderr)
         if _OWNED:
             log('NOT released: %s (drop by hand)' % ', '.join(_OWNED))
+            return EXIT_UNRELEASED  # #7200: an owned name was left behind
         return EXIT_USAGE
 
 
