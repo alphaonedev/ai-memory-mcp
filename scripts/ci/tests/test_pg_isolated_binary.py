@@ -1521,6 +1521,146 @@ class Review7088R2(unittest.TestCase):
         self.assertEqual({name, name + '_tpl'}, rec.dbs)
 
 
+SIGTERM_DRIVER = r'''
+import importlib.util, json, os, re, signal, sys, zlib
+
+spec = importlib.util.spec_from_file_location("pib", sys.argv[1])
+pib = importlib.util.module_from_spec(spec)
+sys.modules["pib"] = pib
+spec.loader.exec_module(pib)
+cfg = json.loads(sys.argv[2])
+dbs = set()
+comments = {}
+
+
+class R:
+    def __init__(self, out="", err="", rc=0):
+        self.returncode, self.stdout, self.stderr = rc, out, err
+
+
+def save():
+    with open(cfg["state"], "w") as handle:
+        json.dump(sorted(dbs), handle)
+
+
+def fake(argv, **kw):
+    sql = argv[argv.index("-c") + 1]
+    if "max_connections" in sql:
+        return R("1000|3|0|10\n")
+    if sql.startswith("CREATE EXTENSION") and cfg.get("fail_extension"):
+        return R("", "ERROR: boom", 1)
+    if "extract(epoch" in sql:
+        return R("1700009000\n")
+    read = re.search(r"shobj_description.*datname = '([A-Za-z0-9_]+)'", sql, re.S)
+    if read:
+        who = read.group(1)
+        if who not in dbs:
+            return R()
+        return R("%d|%s\n" % (16384 + zlib.crc32(who.encode()) % 1000000, comments.get(who, "")))
+    note = re.match(r'^COMMENT ON DATABASE "([A-Za-z0-9_]+)" IS \'(.*)\'$', sql, re.S)
+    if note:
+        comments[note.group(1)] = note.group(2).replace("''", "'")
+        return R()
+    hit = re.match(r'^(CREATE|DROP) DATABASE (?:IF EXISTS )?"([A-Za-z0-9_]+)"', sql)
+    if not hit:
+        return R()
+    verb, name = hit.groups()
+    sig = cfg.get("signal") or {}
+    fire = sig.get("verb") == verb and re.search(sig["name_re"], name)
+    if verb == "CREATE":
+        dbs.add(name)  # committed on the server
+        save()
+        if fire:
+            os.kill(os.getpid(), signal.SIGTERM)  # lands while the CREATE call is still returning
+        return R()
+    if fire:
+        os.kill(os.getpid(), signal.SIGTERM)  # lands before the DROP commits
+    if cfg.get("fail_drop_re") and re.search(cfg["fail_drop_re"], name):
+        return R("", "ERROR: cannot drop", 1)
+    dbs.discard(name)
+    save()
+    return R()
+
+
+pib.subprocess.run = fake
+if cfg.get("signal_after_mint"):
+    real_mint = pib.mint_base
+
+    def mint_then_signal(url):
+        result = real_mint(url)
+        os.kill(os.getpid(), signal.SIGTERM)
+        return result
+
+    pib.mint_base = mint_then_signal
+sys.exit(pib.main(cfg["argv"]))
+'''
+
+
+class SigtermWindows7179(unittest.TestCase):
+    """#7179: one SIGTERM never strands a database the wrapper created, in any window."""
+
+    SHARED = SharedBaseRefusal7031.SHARED
+    EPHEMERAL = 'ai_memory_test_ci_9_1_x'
+
+    def probe(self, **cfg):
+        d = Path(scratch_dir())
+        state = d / 'dbs.json'
+        state.write_text('[]')
+        cfg['state'] = str(state)
+        driver = d / 'driver.py'
+        driver.write_text(SIGTERM_DRIVER)
+        done = subprocess.run([sys.executable, str(driver), str(SCRIPT), json.dumps(cfg)],
+                              capture_output=True, text=True, timeout=60)
+        return done.returncode, done.stderr, json.loads(state.read_text())
+
+    def minted_argv(self):
+        return ['setup', '--url', self.SHARED, '--jobs', '1', '--run-id', 'rsig']
+
+    def db_argv(self):
+        return ['setup', '--url', self.SHARED, '--db', self.EPHEMERAL, '--jobs', '1', '--run-id', 'rsig']
+
+    def assert_clean_sigterm(self, rc, err, left):
+        self.assertEqual(rc, -signal.SIGTERM, 'the signal status is preserved: ' + err[-300:])
+        self.assertEqual(left, [], 'a SIGTERM stranded a database: %s' % left)
+        self.assertIn('owned resources were released', err)
+
+    def test_7179_sigterm_while_the_base_create_database_returns(self):
+        rc, err, left = self.probe(argv=self.minted_argv(), signal={'verb': 'CREATE', 'name_re': '^ci_base_'})
+        self.assert_clean_sigterm(rc, err, left)
+
+    def test_7179_sigterm_right_after_mint_returns_before_setup_owns_it(self):
+        rc, err, left = self.probe(argv=self.minted_argv(), signal_after_mint=True)
+        self.assert_clean_sigterm(rc, err, left)
+
+    def test_7179_sigterm_during_the_failure_cleanup_drop_of_the_base(self):
+        rc, err, left = self.probe(argv=self.minted_argv(), fail_extension=True,
+                                   signal={'verb': 'DROP', 'name_re': '^ci_base_[0-9_a-f]+$'})
+        self.assert_clean_sigterm(rc, err, left)
+
+    def test_7179_sigterm_while_the_template_create_database_returns_on_the_minted_path(self):
+        rc, err, left = self.probe(argv=self.minted_argv(), signal={'verb': 'CREATE', 'name_re': '_tpl$'})
+        self.assert_clean_sigterm(rc, err, left)
+
+    def test_7179_sigterm_while_the_template_create_database_returns_on_the_db_path(self):
+        rc, err, left = self.probe(argv=self.db_argv(), signal={'verb': 'CREATE', 'name_re': '_tpl$'})
+        self.assertEqual(rc, -signal.SIGTERM, err[-300:])
+        self.assertEqual([n for n in left if n.endswith('_tpl')], [], 'the template window (--db path)')
+        self.assertIn('owned resources were released', err)
+
+    def test_7179_release_log_names_what_is_left_when_a_drop_fails(self):
+        rc, err, left = self.probe(argv=self.minted_argv(), signal={'verb': 'CREATE', 'name_re': '^ci_base_'},
+                                   fail_drop_re='^ci_base_')
+        self.assertEqual(rc, -signal.SIGTERM, err[-300:])
+        self.assertEqual(len(left), 1, left)
+        self.assertNotIn('owned resources were released', err)
+        self.assertIn(left[0], err, 'the log names the database that was left behind')
+
+    def test_7179_a_clean_failure_still_drops_without_a_signal(self):
+        rc, err, left = self.probe(argv=self.minted_argv(), fail_extension=True)
+        self.assertEqual(rc, pib.EXIT_USAGE, err[-300:])
+        self.assertEqual(left, [])
+
+
 class NoShell(unittest.TestCase):
     def test_source_never_uses_shell_true_or_tmp(self):
         src = SCRIPT.read_text()

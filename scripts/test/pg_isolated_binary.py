@@ -420,24 +420,49 @@ def mint_base_name(now: Optional[int] = None) -> str:
     return '%s%d_%d_%s' % (MINTED_BASE_PREFIX, os.getpid(), stamp, uuid.uuid4().hex[:8])
 
 
+# Databases this process created and has not yet released or dropped (#7179).
+# A name is registered BEFORE its CREATE DATABASE is issued, so a SIGTERM that
+# lands while (or just after) the CREATE commits still finds the owner.
+_OWNED: List[str] = []
+
+
+def _own(name: str) -> None:
+    if name not in _OWNED:
+        _OWNED.append(name)
+
+
+def _disown(name: str) -> None:
+    if name in _OWNED:
+        _OWNED.remove(name)
+
+
 def mint_base(url: str) -> str:
     """CREATE an ephemeral base (the ci.yml recipe: database, then age + vector)
     and return its URL. ``url`` is only the maintenance connection."""
     name = _checked_ident(mint_base_name())
-    psql(url, 'CREATE DATABASE %s' % quote_ident(name))
+    _own(name)  # before the CREATE: an interrupted CREATE that did commit is dropped by name
     initialized = False
+    refused = False
     try:
+        try:
+            psql(url, 'CREATE DATABASE %s' % quote_ident(name))
+        except WrapperError:
+            refused = True  # the server answered with an error: nothing was created
+            _disown(name)
+            raise
         new_url = with_database(url, name)
         psql(new_url, 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')
         log('minted ephemeral base %s' % name)
         initialized = True
         return new_url
     finally:
-        if not initialized:
+        if not initialized and not refused:
             primary = sys.exc_info()[1]
             try:
                 if not drop_base(url, name):
                     raise WrapperError('owned minted base cleanup failed')
+            except _Terminated:
+                raise  # SIGTERM held during the drop is delivered after it (#7179)
             except BaseException:
                 # Keep the original failure/interrupt, never a cleanup success.
                 # No raw exception text: libpq failures may contain credentials.
@@ -452,7 +477,9 @@ def drop_base(url: str, name: str) -> bool:
         log('WARN refusing to drop %r: not a minted ci_base_ database' % name)
         return False
     try:
-        psql(with_database(url, MAINTENANCE_DB), SQL_DROP_DATABASE % quote_ident(_checked_ident(name)))
+        with _sigterm_deferred():  # #7179: the first SIGTERM must not abandon the drop
+            psql(with_database(url, MAINTENANCE_DB), SQL_DROP_DATABASE % quote_ident(_checked_ident(name)))
+            _disown(name)
         return True
     except (WrapperError, OSError) as exc:
         log('WARN could not drop minted base %s (drop it by hand): %s' % (name, exc))
@@ -647,6 +674,28 @@ def _sigterm_as_exception():
         signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
 
 
+@contextlib.contextmanager
+def _sigterm_deferred():
+    """Hold SIGTERM while an owned database is being dropped (#7179). A signal
+    that arrives meanwhile is recorded and handed to the previous handler once
+    the drop is done, so the cleanup completes and the exit stays the signal's.
+    A no-op off the main thread."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    pending: List[int] = []
+    previous = signal.signal(signal.SIGTERM, lambda signum, _frame: pending.append(signum))
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous if previous is not None else signal.SIG_DFL)
+        if pending:
+            if callable(previous):
+                previous(pending[0], None)
+            elif previous in (None, signal.SIG_DFL):
+                os.kill(os.getpid(), signal.SIGTERM)
+
+
 def _die_by_sigterm() -> int:
     """Re-deliver SIGTERM with the default action so the exit status stays
     the signal's (the caller sees what it sent). Returns 143 if it survives."""
@@ -748,22 +797,35 @@ def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
     except WrapperError:
         pass  # no leftover template from an earlier attempt
     psql(url, SQL_DROP_DATABASE % q)
-    psql(url, 'CREATE DATABASE %s' % q)
+    _own(tpl)  # before the CREATE (#7179), also on the --db path
     initialized = False
+    refused = False
     try:
+        try:
+            psql(url, 'CREATE DATABASE %s' % q)
+        except WrapperError:
+            refused = True  # a competing template is never claimed or dropped (#7124)
+            _disown(tpl)
+            raise
         psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')
         psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE true ALLOW_CONNECTIONS false' % q)
         log('template %s ready (%d free connection slots, need %d)' % (tpl, available, need))
         initialized = True
+        _disown(tpl)
         return tpl
     finally:
-        if not initialized:
+        if not initialized and not refused:
             primary = sys.exc_info()[1]
             try:
-                try:
-                    psql(url, SQL_RELEASE_TEMPLATE % q)
-                finally:
+                with _sigterm_deferred():
+                    try:
+                        psql(url, SQL_RELEASE_TEMPLATE % q)
+                    except WrapperError:
+                        pass  # the CREATE never committed, or it is no longer a template
                     psql(url, SQL_DROP_DATABASE % q)
+                    _disown(tpl)
+            except _Terminated:
+                raise
             except BaseException:
                 if primary is None:
                     raise
@@ -1173,26 +1235,28 @@ def _cmd_setup(args: argparse.Namespace, url: str) -> int:
     would fail authentication and strand an ACTIVE family (#7153)."""
     admin = url
     run_id = checked_run_id(args.run_id or new_run_id())  # before any CREATE (N1)
-    url, db, minted = resolve_base(url, args.db, args.allow_shared_base, args.jobs)
     done = False
     try:
+        url, db, minted = resolve_base(url, args.db, args.allow_shared_base, args.jobs)
         if minted:  # #7113: ACTIVE (verified) before the template exists
             mark_active(with_database(admin, MAINTENANCE_DB), db, run_id)
         tpl = setup(url, db, args.jobs)
+        if args.emit_env:
+            _emit('%s=%s' % (TEMPLATE_VAR, tpl))
+            _emit('%s=%s' % (RUN_ID_VAR, run_id))
+            _emit('%s=%s' % (BASE_VAR, db))
+            if args.emit_env_unmasked:
+                _emit('%s=%s' % (URL_VAR, url))
+            else:
+                log('masked --emit-env: %s is not emitted (keep the real URL; use --emit-env-unmasked '
+                    'for a minted base URL)' % URL_VAR)
         done = True
+        _disown(db)  # handed to the caller: teardown owns it from here
     finally:
-        if minted and not done:  # any failure or SIGTERM, not only WrapperError
-            log('setup failed after minting %s; dropping it' % db)
-            drop_base(admin, db)
-    if args.emit_env:
-        _emit('%s=%s' % (TEMPLATE_VAR, tpl))
-        _emit('%s=%s' % (RUN_ID_VAR, run_id))
-        _emit('%s=%s' % (BASE_VAR, db))
-        if args.emit_env_unmasked:
-            _emit('%s=%s' % (URL_VAR, url))
-        else:
-            log('masked --emit-env: %s is not emitted (keep the real URL; use --emit-env-unmasked '
-                'for a minted base URL)' % URL_VAR)
+        if not done:  # any failure or SIGTERM, not only WrapperError (#7152, #7179)
+            for name in [n for n in _OWNED if n.startswith(MINTED_BASE_PREFIX)]:
+                log('setup failed after minting %s; dropping it' % name)
+                drop_base(admin, name)
     return 0
 
 
@@ -1245,6 +1309,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         args = build_parser().parse_args(argv)
     except SystemExit as exc:
         return exc.code if isinstance(exc.code, int) else EXIT_USAGE
+    del _OWNED[:]
     try:
         url = _url(args)
         if args.cmd == 'setup':
@@ -1260,7 +1325,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             return 0
         return _cmd_run(args, url)
     except _Terminated:
-        log('terminated by SIGTERM; owned resources were released')
+        if _OWNED:
+            log('terminated by SIGTERM; NOT released, drop by hand: %s' % ', '.join(_OWNED))
+        else:
+            log('terminated by SIGTERM; owned resources were released')
         return _die_by_sigterm()
     except WrapperError as exc:
         print('pg_isolated_binary: %s' % exc, file=sys.stderr)

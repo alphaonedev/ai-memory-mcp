@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[3]
 FRAGMENTS = ROOT / 'changelog.d'
 DOC = ROOT / 'docs' / 'ci' / 'PG-ISOLATION.md'
 SCRIPT = ROOT / 'scripts' / 'test' / 'pg_isolated_binary.py'
-CLOSED_BY_7088 = (6848, 7114, 7115, 7124, 7125, 7152, 7153, 7156, 7157, 7158, 7159, 7161, 7180)
+CLOSED_BY_7088 = (6848, 7114, 7115, 7124, 7125, 7152, 7153, 7156, 7157, 7158, 7159, 7161, 7179, 7180)
 HELD_PHRASE = 'Implementation remains held'
 
 
