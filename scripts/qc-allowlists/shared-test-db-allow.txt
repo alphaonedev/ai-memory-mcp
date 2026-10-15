@@ -25,6 +25,4 @@ src/store/postgres_inbox_tests.rs:159   # classify_create_failure / port_of prob
 src/store/postgres_inbox_tests.rs:161   # classify_create_failure / port_of probe URLs (negative cases)
 packaging/docker-compose.postgres.yml:28   # dev compose fixture, not a CI lane
 packaging/docker-compose.postgres.yml:37   # dev compose fixture, not a CI lane
-scripts/test/pg_isolated_binary.py:69   # SHARED_BASE_DB: the name the wrapper itself refuses as a setup base (#7031 H1)
-scripts/ci/tests/test_pg_isolated_binary.py:664   # SHARED fixture URL: negative case proving setup refuses the shared base (#7031 H1)
 infra/lan-parity-test/run-parity-tests.sh:68   # PG_MAINT_DB: maintenance connection used only to CREATE/DROP the minted Pass-1 database (#7031 lane A)
