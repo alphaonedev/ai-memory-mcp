@@ -72,8 +72,18 @@ fn fresh_dir(label: &str) -> tempfile::TempDir {
         .join(".local-runs")
         .join("issue-1822-witness");
     std::fs::create_dir_all(&root).ok();
-    tempfile::Builder::new()
-        .prefix(&format!("{label}-"))
+    let prefix = format!("{label}-");
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(&prefix);
+    // #7158 / #7161 — the witness key directory must satisfy the #3198
+    // key-directory gate whatever the process umask, so the mode is set on
+    // the builder and the directory never exists in a umask-derived mode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder
         .tempdir_in(&root)
         .expect("tempdir under .local-runs")
 }
