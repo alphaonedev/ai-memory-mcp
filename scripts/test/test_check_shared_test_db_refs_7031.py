@@ -15,6 +15,7 @@ NAME = 'ai_memory' + '_test'  # built so this file never matches its own gate
 SCRATCH = ROOT / '.local-runs'
 GATE_LINE_SCAN_BUDGET_SECS = 5.0  # the gate must scan one adversarial line this fast (#7031 S1)
 ADVERSARIAL_LINE_BYTES = 1 << 20  # one MiB on a single line
+CONTINUATION_SCAN_BUDGET_SECS = 2.0  # one MiB of continuation lines must scan this fast (#7171)
 EXIT_CLEAN, EXIT_VIOLATION, EXIT_USAGE = 0, 1, 2
 COUPLED_PATH = 'scripts/ci/tests/test_pg_isolated_binary.py'
 COUPLED_MARK = '[landing-order #7088]'
@@ -459,6 +460,28 @@ class SharedTestDbRefs7031(unittest.TestCase):
         text = (ROOT / 'changelog.d' / '7031b.fixed.md').read_text(encoding='utf-8')
         for needle in ['R1', 'R5', 'docs/', 'exit 2', 'allowlist', 'unreadable', 'stale', 'ephemeral']:
             self.assertIn(needle, text, needle)
+
+
+    # --- round 4: code r3 F1 (#7171) ---
+    def test_7171_r4_one_mib_of_continuation_lines_scans_in_linear_time(self) -> None:
+        pair = 'a \\\n# \\\n'
+        forms = {
+            'code_comment_alternating': pair * (ADVERSARIAL_LINE_BYTES // len(pair)) + 'x\n',
+            'code_only_chain': 'a \\\n' * (ADVERSARIAL_LINE_BYTES // 4) + 'x\n',
+            'comment_chain': '# \\\n' * (ADVERSARIAL_LINE_BYTES // 4) + 'x\n',
+        }
+        for label, text in forms.items():
+            self.assertGreaterEqual(len(text), ADVERSARIAL_LINE_BYTES, label)
+            (self.dir / 'm.sh').write_text(text, encoding='utf-8')
+            started = time.monotonic()
+            try:
+                done = gate(self.dir, '--paths', 'm.sh', '--allowlist', str(self.dir / 'allow.txt'),
+                            timeout=CONTINUATION_SCAN_BUDGET_SECS * 10)
+            except subprocess.TimeoutExpired:
+                self.fail('%s: scan exceeded %.0fs' % (label, CONTINUATION_SCAN_BUDGET_SECS * 10))
+            elapsed = time.monotonic() - started
+            self.assertEqual(done.returncode, EXIT_CLEAN, label + done.stdout + done.stderr)
+            self.assertLess(elapsed, CONTINUATION_SCAN_BUDGET_SECS, '%s took %.2fs' % (label, elapsed))
 
 
 if __name__ == '__main__':
