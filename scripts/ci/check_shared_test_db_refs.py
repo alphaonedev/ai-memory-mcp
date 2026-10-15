@@ -35,9 +35,13 @@ argument exit 2, never 0.
 Allowlist lines are ``path:line  # citation``: line-pinned only, a non-empty
 citation is required, a duplicate pin or a whole-file entry exits 2.  It is a
 ratchet: an entry that no longer matches a hit exits 2, so the baseline may
-only shrink.  The one exception is a citation carrying ``[landing-order #N]``:
-the pinned line is added by another open PR, so the pin may be absent until
-both land (it still pins exactly that line; remove the marker once #N is in).
+only shrink.  The one bounded exception is a citation carrying
+``[landing-order #7088]`` on the seven pins of scripts/ci/tests/test_pg_isolated_binary.py
+(LANDING_ORDER_COUPLED): those lines are added by PR #7088, so such a pin is
+excused only while its line does not exist yet (file absent or pin past EOF).
+Any other PR number or path exits 2; a coupled pin whose line exists but is not
+a hit is stale; a coupled pin that matches a hit prints a ``::warning`` asking
+for the marker's removal.  Remove the constants and markers once #7088 lands.
 Exit: 0 clean, 1 violations, 2 usage error, bad allowlist or stale entry.
 """
 import argparse
@@ -63,7 +67,11 @@ QUOTES = '"\''
 TOKEN_STRIP = '"\'`;,()<>'
 KEY_LOWER = {'pgdatabase', 'dbname', 'db', 'database'}
 KEY_UPPER_PARTS = ('DB', 'DATABASE')
-COUPLED_MARK = re.compile(r'\[landing-order #\d+\]')
+COUPLED_MARK = re.compile(r'\[landing-order #(\d+)\]')
+# The only PR whose pinned lines may be absent until it lands, and the only path it may mark (#7164).
+# Remove both constants and the seven markers in the change that lands after #7088.
+LANDING_ORDER_PRS = frozenset({7088})
+LANDING_ORDER_COUPLED = frozenset({('scripts/ci/tests/test_pg_isolated_binary.py', 7088)})
 POSITIONAL_COMMANDS = {'psql', 'createdb', 'dropdb', 'pg_dump', 'pg_restore'}
 
 Hit = Tuple[str, int, str]
@@ -233,9 +241,26 @@ def load_allowlist(path: Path) -> Tuple[List[Tuple[str, int]], Set[Tuple[str, in
             raise AllowlistError('%s: duplicate pin' % where)
         seen.add(pin)
         entries.append(pin)
-        if COUPLED_MARK.search(citation):
+        marker = COUPLED_MARK.search(citation)
+        if marker:
+            pr_number = int(marker.group(1))
+            if pr_number not in LANDING_ORDER_PRS or (name, pr_number) not in LANDING_ORDER_COUPLED:
+                raise AllowlistError('%s: unknown landing-order marker (only %s may carry it)'
+                                     % (where, ', '.join('%s #%d' % pair for pair in sorted(LANDING_ORDER_COUPLED))))
             coupled.add(pin)
     return entries, coupled
+
+
+def line_exists(path: Path, number: int) -> bool:
+    """True when ``path`` is a readable file with at least ``number`` lines (an unreadable file counts as existing)."""
+    try:
+        text = path.read_bytes().decode('utf-8', errors='surrogateescape')
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    count = text.count('\n') + (0 if text.endswith('\n') or not text else 1)
+    return number <= count
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -276,7 +301,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     for name, line in entries:
         if (root / name).is_file() and name not in scanned:
             continue
-        if (name, line) not in hit_lines and (name, line) not in coupled:
+        if (name, line) in hit_lines:
+            if (name, line) in coupled:
+                print('::warning file=%s,line=%d::coupled pin now matches a hit; remove its [landing-order] marker'
+                      % (name, line))
+        elif (name, line) not in coupled or line_exists(root / name, line):
             stale.append('%s:%d' % (name, line))
     violations = [h for h in hits if (h[0], h[1]) not in pinned]
     for rel, number, rule in violations:
