@@ -1,9 +1,8 @@
 // Copyright 2026 AlphaOne LLC
 // SPDX-License-Identifier: Apache-2.0
 
-//! Included only by the library's cfg(test) module, never a deployed artifact.
+//! Library-side active fault harness: compiled only under cfg(test), never a deployed artifact.
 use crate as library;
-#[path = "failure_hook_scenarios.rs"]
 mod scenarios;
 #[cfg(feature = "sal-postgres")]
 use scenarios::PG_ENV;
@@ -107,7 +106,7 @@ fn active_clock_7029() {
         tokio::runtime::Runtime::new()
             .expect("runtime")
             .block_on(async {
-                scenarios::pg::isolated_clock(expected).await;
+                scenarios::pg::fault_pg_isolated_clock(expected).await;
             });
         scenarios::sqlite_clock(expected);
         return;
@@ -144,42 +143,46 @@ fn active_postgres_7029() {
     if let Ok(mode) = std::env::var(MODE_ENV) {
         runtime.block_on(async {
             let url = std::env::var(PG_ENV).expect("parent-owned DB URL");
-            let store = scenarios::pg::connect_owned(&url).await;
+            let store = scenarios::pg::fault_pg_connect_owned(&url).await;
             if mode == "armed" {
-                assert_eq!(scenarios::pg::counts(&store).await, (0, 0, 0));
-                let snapshot = scenarios::pg::snapshot(&store).await;
-                let err = scenarios::pg::capture(&store, TARGET_ID)
+                assert_eq!(scenarios::pg::fault_pg_counts(&store).await, (0, 0, 0));
+                let snapshot = scenarios::pg::fault_pg_snapshot(&store).await;
+                let err = scenarios::pg::fault_pg_capture(&store, TARGET_ID)
                     .await
                     .expect_err("armed PG capture");
                 assert!(format!("{err:?}").contains("injected before signed commit"));
-                assert_eq!(scenarios::pg::counts(&store).await, (0, 0, 0));
-                assert_eq!(scenarios::pg::snapshot(&store).await, snapshot);
-                scenarios::pg::capture(&store, HEALTHY_ID)
+                assert_eq!(scenarios::pg::fault_pg_counts(&store).await, (0, 0, 0));
+                assert_eq!(scenarios::pg::fault_pg_snapshot(&store).await, snapshot);
+                scenarios::pg::fault_pg_capture(&store, HEALTHY_ID)
                     .await
                     .expect("unrelated PG healthy write");
-                assert_eq!(scenarios::pg::counts(&store).await, (1, 1, 1));
-                let snapshot = scenarios::pg::snapshot(&store).await;
-                assert!(scenarios::pg::capture(&store, TARGET_ID).await.is_err());
-                assert_eq!(scenarios::pg::counts(&store).await, (1, 1, 1));
-                assert_eq!(scenarios::pg::snapshot(&store).await, snapshot);
+                assert_eq!(scenarios::pg::fault_pg_counts(&store).await, (1, 1, 1));
+                let snapshot = scenarios::pg::fault_pg_snapshot(&store).await;
+                assert!(
+                    scenarios::pg::fault_pg_capture(&store, TARGET_ID)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(scenarios::pg::fault_pg_counts(&store).await, (1, 1, 1));
+                assert_eq!(scenarios::pg::fault_pg_snapshot(&store).await, snapshot);
             } else {
                 assert_eq!(mode, "retry");
-                assert_eq!(scenarios::pg::counts(&store).await, (1, 1, 1));
-                scenarios::pg::capture(&store, TARGET_ID)
+                assert_eq!(scenarios::pg::fault_pg_counts(&store).await, (1, 1, 1));
+                scenarios::pg::fault_pg_capture(&store, TARGET_ID)
                     .await
                     .expect("PG same-target retry");
-                assert_eq!(scenarios::pg::counts(&store).await, (2, 2, 2));
-                scenarios::pg::capture(&store, TARGET_ID)
+                assert_eq!(scenarios::pg::fault_pg_counts(&store).await, (2, 2, 2));
+                scenarios::pg::fault_pg_capture(&store, TARGET_ID)
                     .await
                     .expect("PG idempotent retry");
-                assert_eq!(scenarios::pg::counts(&store).await, (2, 2, 2));
-                scenarios::pg::stamps(&store, TARGET_ID).await;
+                assert_eq!(scenarios::pg::fault_pg_counts(&store).await, (2, 2, 2));
+                scenarios::pg::fault_pg_stamps(&store, TARGET_ID).await;
             }
             store.pool().close().await;
         });
         return;
     }
-    let (admin, name, store) = runtime.block_on(scenarios::pg::create());
+    let (admin, name, store) = runtime.block_on(scenarios::pg::fault_pg_create());
     let mut url = reqwest::Url::parse(&std::env::var(PG_ENV).expect("PG URL")).expect("valid URL");
     url.set_path(&format!("/{name}"));
     let armed = crate::test_support::spawn_test_child(
@@ -194,7 +197,7 @@ fn active_postgres_7029() {
         PG_TEST,
         &[(MODE_ENV, "retry"), (PG_ENV, url.as_str())],
     );
-    runtime.block_on(scenarios::pg::cleanup(admin, name, store));
+    runtime.block_on(scenarios::pg::fault_pg_cleanup(admin, name, store));
     assert_child(&armed);
     assert_child(&retry);
 }
