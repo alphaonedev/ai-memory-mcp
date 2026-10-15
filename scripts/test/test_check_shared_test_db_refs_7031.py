@@ -16,6 +16,9 @@ SCRATCH = ROOT / '.local-runs'
 GATE_LINE_SCAN_BUDGET_SECS = 5.0  # the gate must scan one adversarial line this fast (#7031 S1)
 ADVERSARIAL_LINE_BYTES = 1 << 20  # one MiB on a single line
 EXIT_CLEAN, EXIT_VIOLATION, EXIT_USAGE = 0, 1, 2
+COUPLED_PATH = 'scripts/ci/tests/test_pg_isolated_binary.py'
+COUPLED_MARK = '[landing-order #7088]'
+LANDING_ORDER_MARKERS_MAX = 7  # the set of coupled pins may only shrink (#7164)
 
 
 def gate(root: Path, *extra: str, timeout: Optional[float] = None) -> 'subprocess.CompletedProcess[str]':
@@ -295,16 +298,63 @@ class SharedTestDbRefs7031(unittest.TestCase):
         done = self.mutant('-- --db %s' % NAME, name='q.sql')
         self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout)
 
+    def coupled_file(self, lines: int, body: str = 'clean') -> None:
+        target = self.dir / COUPLED_PATH
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('\n'.join([body] * lines) + '\n', encoding='utf-8')
+
+    def run_coupled(self, allow: str, lines: int = 3, body: str = 'clean') -> 'subprocess.CompletedProcess[str]':
+        self.coupled_file(lines, body)
+        self.allow(allow)
+        return gate(self.dir, '--paths', COUPLED_PATH, '--allowlist', str(self.dir / 'allow.txt'))
+
     def test_7031_landing_order_pin_may_be_absent_but_plain_pin_may_not(self) -> None:
-        self.allow('m.txt:9  # added by another PR [landing-order #7088]\n')
-        done = self.mutant('clean')
-        self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout + done.stderr)
         self.allow('m.txt:9  # plain pin\n')
         done = self.mutant('clean')
         self.assertEqual(done.returncode, EXIT_USAGE, done.stdout + done.stderr)
-        self.allow('m.txt:1  # added by another PR [landing-order #7088]\n')
-        done = self.mutant('POSTGRES_DB=%s' % NAME)
+
+    def test_7031_r3_landing_order_positive_cases(self) -> None:
+        # the marker past EOF on the listed path is excused (the coupled PR has not landed)
+        done = self.run_coupled('%s:9  # added by another PR %s\n' % (COUPLED_PATH, COUPLED_MARK))
         self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout + done.stderr)
+        # the listed file absent is excused too
+        (self.dir / COUPLED_PATH).unlink()
+        done = self.mutant('clean')
+        self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout + done.stderr)
+
+    def test_7031_r3_landing_order_m1_unknown_pr_or_path_exits_2(self) -> None:
+        for allow in ['zz_never.sh:3  # x [landing-order #1]\n',
+                      '%s:3  # x [landing-order #1]\n' % COUPLED_PATH,
+                      'zz_never.sh:3  # x %s\n' % COUPLED_MARK]:
+            done = self.run_coupled(allow)
+            self.assertEqual(done.returncode, EXIT_USAGE, allow + done.stdout + done.stderr)
+            self.assertIn('allowlist line 1', done.stderr)
+
+    def test_7031_r3_landing_order_m2_existing_non_hit_line_is_stale(self) -> None:
+        done = self.run_coupled('%s:1  # x %s\n' % (COUPLED_PATH, COUPLED_MARK))
+        self.assertEqual(done.returncode, EXIT_USAGE, done.stdout + done.stderr)
+        self.assertIn('stale allowlist entry', done.stderr)
+
+    def test_7031_r3_landing_order_m3_marker_cannot_preauthorise_a_hit(self) -> None:
+        (self.dir / 'zz_pre.sh').write_text('POSTGRES_DB=%s\n' % NAME, encoding='utf-8')
+        self.allow('zz_pre.sh:1  # x %s\n' % COUPLED_MARK)
+        done = gate(self.dir, '--paths', 'zz_pre.sh', '--allowlist', str(self.dir / 'allow.txt'))
+        self.assertEqual(done.returncode, EXIT_USAGE, done.stdout + done.stderr)
+
+    def test_7031_r3_landing_order_landed_pin_asks_for_marker_removal(self) -> None:
+        pins = ''.join('%s:%d  # x %s\n' % (COUPLED_PATH, n, COUPLED_MARK) for n in (1, 2, 3))
+        done = self.run_coupled(pins, lines=3, body='POSTGRES_DB=%s' % NAME)
+        self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout + done.stderr)
+        self.assertIn('::warning', done.stdout)
+        self.assertIn('remove', done.stdout)
+
+    def test_7031_r3_landing_order_marker_count_only_shrinks(self) -> None:
+        text = (ROOT / 'scripts' / 'qc-allowlists' / 'shared-test-db-allow.txt').read_text(encoding='utf-8')
+        marked = [raw for raw in text.splitlines() if '[landing-order' in raw]
+        self.assertLessEqual(len(marked), LANDING_ORDER_MARKERS_MAX, marked)
+        for raw in marked:
+            self.assertTrue(raw.startswith(COUPLED_PATH + ':'), raw)
+            self.assertIn(COUPLED_MARK, raw)
 
     def test_7031_f4_changelog_fragment_states_the_gate(self) -> None:
         text = (ROOT / 'changelog.d' / '7031b.fixed.md').read_text(encoding='utf-8')
