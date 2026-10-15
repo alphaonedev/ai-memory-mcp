@@ -404,6 +404,22 @@ jobs:
           AI_MEMORY_BIN_PG="$(pwd)/target/debug/ai-memory" \
             bash scripts/check-bootstrap-cert-gate.sh
 
+      # #7181 — the gate evidence lives in the runner workspace and was lost
+      # with it when LEG B failed. Upload the LEG B evidence on failure. The pg
+      # posture outputs (LEG A, they run with connection settings in the
+      # environment) are excluded so a posture capture can never leak a DSN.
+      - name: Upload cert-bootstrap evidence on failure
+        if: failure()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: cert-bootstrap-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .local-runs/cert-bootstrap-evidence/
+            !.local-runs/cert-bootstrap-evidence/pg-posture-*
+            !.local-runs/cert-bootstrap-evidence/driverless-posture-*
+          if-no-files-found: ignore
+          retention-days: 7
+
       # Drop the per-job ephemeral db (created by "Point at the native
       # enterprise-fed tier" above). always() so a failed/cancelled run still
       # reclaims it. Guarded on CI_FED_DB so it no-ops if the configure step
