@@ -10,11 +10,17 @@ oldest-mtime entries until the total is at or under ``--max-bytes``.
 Safety:
   * ``--target`` must resolve (realpath) under ``$GITHUB_WORKSPACE`` unless
     ``--allow-root`` is given (node cron); otherwise exit 2 naming the path.
-  * Symlinks are never followed: a symlink entry is unlinked, never descended,
-    and a symlinked swept directory is skipped.
+  * ``<target>/debug`` and the four swept directories must not be symlinks and
+    must resolve under the real target: otherwise exit 2 naming the path and
+    nothing is deleted.
+  * Symlink entries inside a swept directory are unlinked, never descended.
   * Nothing outside the four directories is read for sizing or deleted.
+  * An unreadable directory or entry is reported as a warning naming the path
+    and skipped; no traceback.
 
-Exit codes: 0 success, 2 refused path.
+Exit codes: 0 success, 2 refused path (argparse usage errors also use 2),
+3 ``--max-bytes`` is zero or negative, 4 nothing could be sized because every
+swept directory or entry was unreadable.
 """
 
 import argparse
@@ -28,6 +34,8 @@ SWEPT_SUBDIRS = ("deps", "incremental", "build", ".fingerprint")
 WORKSPACE_ENV = "GITHUB_WORKSPACE"
 EXIT_OK = 0
 EXIT_REFUSED = 2
+EXIT_BAD_CAP = 3
+EXIT_UNREADABLE = 4
 
 
 def entry_size(path):
@@ -45,19 +53,54 @@ def entry_size(path):
     return total
 
 
-def collect_entries(target):
-    """Return (mtime, name, path, size) for each top-level entry of the swept dirs."""
-    entries = []
+class Refused(Exception):
+    """A swept path is a symlink or escapes the real target."""
+
+
+def is_under(path, root):
+    try:
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
+
+
+def checked_dirs(target):
+    """Return the existing swept directories, or raise Refused on any symlink/escape."""
     debug = Path(target) / DEBUG_DIR_NAME
+    if debug.is_symlink():
+        raise Refused("{} is a symlink".format(debug))
+    found = []
     for sub in SWEPT_SUBDIRS:
         base = debug / sub
-        if base.is_symlink() or not base.is_dir():
+        if base.is_symlink():
+            raise Refused("{} is a symlink".format(base))
+        if not base.is_dir():
             continue
-        for child in os.scandir(str(base)):
+        if not is_under(os.path.realpath(str(base)), target):
+            raise Refused("{} resolves outside {}".format(base, target))
+        found.append(base)
+    return found
+
+
+def collect_entries(target, warnings):
+    """Return (mtime, name, path, size) for each top-level entry of the swept dirs.
+
+    Unreadable directories and entries are appended to ``warnings`` and skipped.
+    """
+    entries = []
+    for base in checked_dirs(target):
+        try:
+            with os.scandir(str(base)) as it:
+                children = list(it)
+        except OSError as exc:
+            warnings.append("cannot read {}: {}".format(base, exc))
+            continue
+        for child in children:
             try:
                 mtime = child.stat(follow_symlinks=False).st_mtime
                 size = entry_size(child.path)
-            except OSError:
+            except OSError as exc:
+                warnings.append("cannot size {}: {}".format(child.path, exc))
                 continue
             entries.append((mtime, child.path, child.path, size))
     entries.sort(key=lambda item: (item[0], item[1]))
@@ -71,13 +114,6 @@ def remove_entry(path):
         shutil.rmtree(path)
 
 
-def is_under(path, root):
-    try:
-        return os.path.commonpath([path, root]) == root
-    except ValueError:
-        return False
-
-
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--target", required=True, help="cargo target directory")
@@ -86,6 +122,10 @@ def main(argv=None):
                         help="permit a target outside $GITHUB_WORKSPACE (node cron)")
     parser.add_argument("--dry-run", action="store_true", help="report only; delete nothing")
     args = parser.parse_args(argv)
+    if args.max_bytes <= 0:
+        print("usage: --max-bytes must be a positive integer, got {}".format(
+            args.max_bytes), file=sys.stderr)
+        return EXIT_BAD_CAP
 
     real_target = os.path.realpath(args.target)
     if not args.allow_root:
@@ -96,7 +136,14 @@ def main(argv=None):
                 real_target, WORKSPACE_ENV), file=sys.stderr)
             return EXIT_REFUSED
 
-    entries = collect_entries(real_target)
+    warnings = []
+    try:
+        entries = collect_entries(real_target, warnings)
+    except Refused as exc:
+        print("refused: {}".format(exc), file=sys.stderr)
+        return EXIT_REFUSED
+    for line in warnings:
+        print("warning: {}".format(line), file=sys.stderr)
     before = sum(item[3] for item in entries)
     remaining = before
     removed = 0
@@ -114,6 +161,8 @@ def main(argv=None):
     print("ci-sweep-target: target={} cap={} before={} after={} removed={}{}".format(
         real_target, args.max_bytes, before, remaining, removed,
         " (dry-run)" if args.dry_run else ""))
+    if warnings and not entries:
+        return EXIT_UNREADABLE
     return EXIT_OK
 
 
