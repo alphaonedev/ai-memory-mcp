@@ -295,6 +295,17 @@ class SharedTestDbRefs7031(unittest.TestCase):
         done = self.mutant('-- --db %s' % NAME, name='q.sql')
         self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout)
 
+    def test_7031_landing_order_pin_may_be_absent_but_plain_pin_may_not(self) -> None:
+        self.allow('m.txt:9  # added by another PR [landing-order #7088]\n')
+        done = self.mutant('clean')
+        self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout + done.stderr)
+        self.allow('m.txt:9  # plain pin\n')
+        done = self.mutant('clean')
+        self.assertEqual(done.returncode, EXIT_USAGE, done.stdout + done.stderr)
+        self.allow('m.txt:1  # added by another PR [landing-order #7088]\n')
+        done = self.mutant('POSTGRES_DB=%s' % NAME)
+        self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout + done.stderr)
+
     def test_7031_f4_changelog_fragment_states_the_gate(self) -> None:
         text = (ROOT / 'changelog.d' / '7031b.fixed.md').read_text(encoding='utf-8')
         for needle in ['R1', 'R5', 'docs/', 'exit 2', 'allowlist', 'unreadable', 'stale', 'ephemeral']:

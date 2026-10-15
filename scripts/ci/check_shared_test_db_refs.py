@@ -35,7 +35,9 @@ argument exit 2, never 0.
 Allowlist lines are ``path:line  # citation``: line-pinned only, a non-empty
 citation is required, a duplicate pin or a whole-file entry exits 2.  It is a
 ratchet: an entry that no longer matches a hit exits 2, so the baseline may
-only shrink.
+only shrink.  The one exception is a citation carrying ``[landing-order #N]``:
+the pinned line is added by another open PR, so the pin may be absent until
+both land (it still pins exactly that line; remove the marker once #N is in).
 Exit: 0 clean, 1 violations, 2 usage error, bad allowlist or stale entry.
 """
 import argparse
@@ -61,6 +63,7 @@ QUOTES = '"\''
 TOKEN_STRIP = '"\'`;,()<>'
 KEY_LOWER = {'pgdatabase', 'dbname', 'db', 'database'}
 KEY_UPPER_PARTS = ('DB', 'DATABASE')
+COUPLED_MARK = re.compile(r'\[landing-order #\d+\]')
 POSITIONAL_COMMANDS = {'psql', 'createdb', 'dropdb', 'pg_dump', 'pg_restore'}
 
 Hit = Tuple[str, int, str]
@@ -209,8 +212,10 @@ class AllowlistError(Exception):
     """A malformed allowlist line (exit 2)."""
 
 
-def load_allowlist(path: Path) -> List[Tuple[str, int]]:
+def load_allowlist(path: Path) -> Tuple[List[Tuple[str, int]], Set[Tuple[str, int]]]:
+    """Return (pins, coupled pins).  A coupled pin names a line another open PR adds."""
     entries = []  # type: List[Tuple[str, int]]
+    coupled = set()  # type: Set[Tuple[str, int]]
     seen = set()  # type: Set[Tuple[str, int]]
     for number, raw in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
         body, hash_sep, citation = raw.partition('#')
@@ -228,7 +233,9 @@ def load_allowlist(path: Path) -> List[Tuple[str, int]]:
             raise AllowlistError('%s: duplicate pin' % where)
         seen.add(pin)
         entries.append(pin)
-    return entries
+        if COUPLED_MARK.search(citation):
+            coupled.add(pin)
+    return entries, coupled
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -244,7 +251,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print('usage: --root %s is not a directory' % root, file=sys.stderr)
         return 2
     try:
-        entries = load_allowlist(allow_path)
+        entries, coupled = load_allowlist(allow_path)
     except (OSError, UnicodeDecodeError) as exc:
         print('usage: cannot read allowlist %s: %s' % (allow_path, exc), file=sys.stderr)
         return 2
@@ -269,7 +276,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     for name, line in entries:
         if (root / name).is_file() and name not in scanned:
             continue
-        if (name, line) not in hit_lines:
+        if (name, line) not in hit_lines and (name, line) not in coupled:
             stale.append('%s:%d' % (name, line))
     violations = [h for h in hits if (h[0], h[1]) not in pinned]
     for rel, number, rule in violations:
