@@ -29,7 +29,8 @@ INCREMENTAL_RELATIVE = Path("target") / "debug" / "incremental"
 TMP_PREFIX = ".tmp"
 DEFAULT_MAX_AGE_DAYS = 7
 EXIT_OK = 0
-EXIT_BAD_ARGS = 2
+EXIT_USAGE = 2
+EXIT_BAD_ARGS = EXIT_USAGE
 
 
 def resolve(path):
@@ -103,6 +104,40 @@ def find_candidates(work_root, workspace, shared_target, max_age_days, now):
     return scan(work_root, workspace, shared_target, max_age_days, now)[0]
 
 
+def is_filesystem_root(path):
+    return path == path.parent
+
+
+def validate_arguments(work_root, workspace, shared_target):
+    """Return a refusal reason, or None when the arguments are safe to act on.
+
+    Refused: a work root that is a filesystem root, missing or not a directory;
+    an empty or relative shared target; a shared target neither inside nor
+    beside the work root (no common ancestor below the filesystem root); a
+    workspace that does not resolve inside the work root.
+    """
+    if not str(work_root).strip():
+        return "empty work root"
+    root = resolve(work_root)
+    if is_filesystem_root(root):
+        return "work root is a filesystem root"
+    if not root.is_dir():
+        return "work root is not an existing directory"
+    if not str(shared_target).strip():
+        return "empty shared target"
+    if not Path(shared_target).is_absolute():
+        return "shared target must be an absolute path"
+    shared = resolve(shared_target)
+    if is_filesystem_root(shared):
+        return "shared target is a filesystem root"
+    common = [p for p in root.parents if p in shared.parents or p == shared]
+    if not is_within(shared, root) and not any(not is_filesystem_root(p) for p in common):
+        return "shared target is neither inside nor beside the work root"
+    if not is_within(workspace, root):
+        return "workspace is not inside the work root"
+    return None
+
+
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--work-root", required=True, help="runner _work directory")
@@ -118,6 +153,10 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.max_age_days < 1:
         parser.error("--max-age-days must be >= 1")
+    problem = validate_arguments(args.work_root, args.workspace, args.shared_target)
+    if problem:
+        print("prune_runner_artifacts: refusing: %s" % problem, file=sys.stderr)
+        return EXIT_USAGE
     failures = 0
     candidates, skipped = scan(
         args.work_root, args.workspace, args.shared_target, args.max_age_days, time.time()
