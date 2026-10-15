@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[3]
 FRAGMENTS = ROOT / 'changelog.d'
 DOC = ROOT / 'docs' / 'ci' / 'PG-ISOLATION.md'
 SCRIPT = ROOT / 'scripts' / 'test' / 'pg_isolated_binary.py'
-CLOSED_BY_7088 = (7114, 7115, 7124, 7125, 7152, 7153, 7156, 7157, 7159)
+CLOSED_BY_7088 = (6848, 7114, 7115, 7124, 7125, 7152, 7153, 7156, 7157, 7158, 7159, 7161)
 HELD_PHRASE = 'Implementation remains held'
 
 
@@ -35,6 +35,16 @@ class ChangelogFragments7088(unittest.TestCase):
                 self.assertTrue(found, 'changelog.d/%d.<kind>.md is missing' % number)
                 text = ''.join(p.read_text(encoding='utf-8') for p in found)
                 self.assertIn('#%d' % number, text)
+
+    def test_7115_fragment_headline_matches_the_issue(self):
+        # Issue #7115: the audit head-hash fixture silently passed without
+        # reaching its watermark assertions.
+        text = (FRAGMENTS / '7115.fixed.md').read_text(encoding='utf-8')
+        match = re.match(r'\*\*(.+?)\*\*', text)
+        self.assertIsNotNone(match, 'fragment must open with a bold headline')
+        headline = match.group(1).lower()
+        self.assertIn('head-hash', headline)
+        self.assertIn('watermark', headline)
 
     def test_7113_fragments_do_not_contradict_the_shipped_reduced_option_b(self):
         fragments = sorted(FRAGMENTS.glob('7113.*.md'))
