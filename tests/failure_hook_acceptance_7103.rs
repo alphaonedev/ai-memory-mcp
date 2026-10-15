@@ -12,7 +12,8 @@ const CHILD_ENV: &str = "AI_MEMORY_HOOK_ORDINARY_CHILD";
 #[test]
 fn deployed_binary_has_no_fault_ingress_7103() {
     let binary = std::fs::read(env!("CARGO_BIN_EXE_ai-memory")).expect("ordinary binary artifact");
-    for marker in [FAIL_ENV, CLOCK_ENV] {
+    // #7186: the evaluator clock module name must not advertise a test control either.
+    for marker in [FAIL_ENV, CLOCK_ENV, "test_clock"] {
         assert!(
             !binary
                 .windows(marker.len())

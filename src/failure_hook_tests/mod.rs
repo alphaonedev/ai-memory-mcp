@@ -98,7 +98,7 @@ fn active_clock_7029() {
             .parse()
             .expect("offset integer");
         assert_eq!(
-            crate::test_clock::offset_secs(),
+            crate::eval_clock::offset_secs(),
             expected,
             "common checked offset domain"
         );

@@ -25663,7 +25663,7 @@ impl MemoryStore for PostgresStore {
         // per row.
         // #1579 B2 — rank + match read the stored generated `tsv`
         // column (schema v57); see search() above for the rationale.
-        let now_sql = crate::test_clock::pg_now_sql();
+        let now_sql = crate::eval_clock::pg_now_sql();
         let fts_rows = sqlx::query(&format!(
             "SELECT {cols},
                     ts_rank(tsv, to_tsquery('english', $1))
@@ -30240,7 +30240,7 @@ impl MemoryStore for PostgresStore {
         // Pinned by `tests/store_parity_gaps.rs::run_gc_is_transactional_1026`
         // (crash-injection: drop tx mid-flow, assert no orphans).
         let now = chrono::Utc::now();
-        let cutoff = crate::test_clock::at(now);
+        let cutoff = crate::eval_clock::at(now);
         // v1.0.0 #3520 — routed through the shared bounded-retry funnel:
         // this is the `size_gc` twin (archive-copy + link snapshot +
         // cascade DELETE + AGE unprojection in one tx), so it races a
