@@ -413,7 +413,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2 if unreadable else 0
     stale = []  # type: List[str]
     for name, line in entries:
-        if (root / name).is_file() and name not in scanned:
+        if args.paths and (root / name).is_file() and name not in scanned:  # narrowed scan only (#7173)
             continue
         if (name, line) in hit_lines:
             if (name, line) in coupled:
