@@ -1034,6 +1034,7 @@ pub mod sizes;
 pub mod spawn_audit;
 pub mod subscriptions;
 pub mod synthesis;
+mod test_clock;
 pub mod tls;
 // v1.0.0 #3705 — the operator mandate "only encrypted data in transit": the
 // one floor every transit surface consults (daemon listener, federation

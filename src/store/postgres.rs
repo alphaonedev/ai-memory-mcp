@@ -22592,6 +22592,7 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err("capture_turn insert dedup row", e))?;
 
+
         // signed_events chain row in the SAME tx (#1415) so audit can
         // prove L4 caught the turn and never lags the data.
         let ev = &write.signed_event;
@@ -25647,6 +25648,7 @@ impl MemoryStore for PostgresStore {
         // per row.
         // #1579 B2 — rank + match read the stored generated `tsv`
         // column (schema v57); see search() above for the rationale.
+        let now_sql = crate::test_clock::pg_now_sql();
         let fts_rows = sqlx::query(&format!(
             "SELECT {cols},
                     ts_rank(tsv, to_tsquery('english', $1))
@@ -25670,7 +25672,7 @@ impl MemoryStore for PostgresStore {
                AND ($5::text IS NULL OR metadata ->> 'agent_id' = $5)
                AND ($6::timestamptz IS NULL OR created_at >= $6)
                AND ($7::timestamptz IS NULL OR created_at <= $7)
-               AND (expires_at IS NULL OR expires_at > NOW())
+               AND (expires_at IS NULL OR expires_at > {now_sql})
                AND (
                    $9::text IS NULL
                    OR COALESCE(metadata->>'scope', 'private') <> 'private'
@@ -25762,7 +25764,7 @@ impl MemoryStore for PostgresStore {
                    AND ($5::text IS NULL OR metadata ->> 'agent_id' = $5)
                    AND ($6::timestamptz IS NULL OR created_at >= $6)
                    AND ($7::timestamptz IS NULL OR created_at <= $7)
-                   AND (expires_at IS NULL OR expires_at > NOW())
+                   AND (expires_at IS NULL OR expires_at > {now_sql})
                    AND (1.0 - (embedding <=> $1)) > 0.2
                    AND (
                        $9::text IS NULL
@@ -30222,7 +30224,7 @@ impl MemoryStore for PostgresStore {
         // ON CONFLICT DO UPDATE clobbers archived_at/archive_reason).
         // Pinned by `tests/store_parity_gaps.rs::run_gc_is_transactional_1026`
         // (crash-injection: drop tx mid-flow, assert no orphans).
-        let now = chrono::Utc::now();
+        let now = crate::test_clock::now();
         // v1.0.0 #3520 — routed through the shared bounded-retry funnel:
         // this is the `size_gc` twin (archive-copy + link snapshot +
         // cascade DELETE + AGE unprojection in one tx), so it races a
