@@ -87,7 +87,6 @@ pub const ENV_PG_QUOTA_TABLESPACE: &str = "AI_MEMORY_TEST_PG_QUOTA_TABLESPACE";
 /// Read-through for [`ENV_PG_QUOTA_TABLESPACE`]: `Some(name)` when set to a
 /// non-blank value (trimmed), otherwise `None`.
 #[must_use]
-#[allow(dead_code)]
 pub fn quota_tablespace() -> Option<String> {
     std::env::var(ENV_PG_QUOTA_TABLESPACE)
         .ok()
