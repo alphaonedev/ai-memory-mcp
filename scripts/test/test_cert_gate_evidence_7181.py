@@ -21,8 +21,10 @@ Stdlib only. Run: ``python3 -I scripts/test/test_cert_gate_evidence_7181.py``
 """
 import importlib.util
 import io
+import os
 import random
 import re
+import secrets
 import string
 import subprocess
 import sys
@@ -465,6 +467,85 @@ class RedactorRound4(unittest.TestCase):
             self.assertEqual(mod.finalize(state, ev, TAIL_LINES, buf), 0)
         self.assertNotIn(self.SHORT, buf.getvalue())
         self.assertIn(mod.REDACTED, buf.getvalue())
+
+
+class RedactorRound6(unittest.TestCase):
+    """r6 (F1-r4 security): the root-path exemption floors the WHOLE path before any split.
+
+    Every secret comes from ``os.urandom`` / ``secrets`` at run time; each one is shown masked on
+    stdout, through ``finalize`` and through ``--write-redacted``.
+    """
+
+    @staticmethod
+    def _std_b64_with_slash(nbytes):
+        import base64
+        while True:
+            v = base64.b64encode(os.urandom(nbytes)).decode("ascii").rstrip("=")
+            parts = v.split("/")
+            if "/" in v and v[0] != "/" and v[-1] != "/" and all(len(p) < 32 for p in parts) \
+                    and any(c.isupper() or c == "+" for c in v):
+                return v
+
+    @staticmethod
+    def _mixed_token(n):
+        while True:
+            v = secrets.token_urlsafe(n)[:n]
+            if any(c.isupper() for c in v):
+                return v
+
+    def _masked_everywhere(self, line, parts):
+        mod = _load_helper()
+        out = mod.redact_line(line)
+        for p in parts:
+            self.assertNotIn(p, out, "stdout path")
+        with _scratch() as td:
+            ev = Path(td) / "ev"
+            ev.mkdir()
+            (ev / "bring-up.out").write_text(line + "\n", encoding="utf-8")
+            state = Path(td) / "state"
+            state.mkdir()
+            (state / "fail-rows").write_text("B\tprobe\n", encoding="utf-8")
+            buf = io.StringIO()
+            self.assertEqual(mod.finalize(state, ev, TAIL_LINES, buf), 0)
+            for p in parts:
+                self.assertNotIn(p, buf.getvalue(), "finalize path")
+            red = Path(td) / "red"
+            subprocess.run([sys.executable, str(HELPER), "--evidence-dir", str(ev),
+                            "--write-redacted", str(red)], check=True, capture_output=True)
+            blob = "".join(q.read_text(encoding="utf-8") for q in red.glob("*"))
+            for p in parts:
+                self.assertNotIn(p, blob, "write-redacted path")
+
+    @staticmethod
+    def _long_parts(sec):
+        return [sec] + [p for p in sec.split("/") if len(p) >= 8]
+
+    def test_r6_std_base64_with_slash_under_home_masked_everywhere(self):
+        sec = self._std_b64_with_slash(32)
+        self._masked_everywhere("dir /home/u/" + sec, self._long_parts(sec))
+
+    def test_r6_std_base64_with_slash_under_etc_masked_everywhere(self):
+        sec = self._std_b64_with_slash(48)
+        self._masked_everywhere("/etc/" + sec, self._long_parts(sec))
+
+    def test_r6_31_char_segment_under_root_masked_everywhere(self):
+        sec = self._mixed_token(31)
+        self.assertEqual(len(sec), 31)
+        self._masked_everywhere("dir /home/u/" + sec, [sec])
+
+    def test_r6_root_glued_to_token_is_not_a_path(self):
+        sec = secrets.token_urlsafe(24)[:30]
+        self.assertEqual(len(sec), 30)
+        self._masked_everywhere("tok /run" + sec, [sec])
+        self._masked_everywhere("tok /lib" + sec, [sec])
+
+    def test_r6_lowercase_path_and_sha_in_path_unchanged(self):
+        mod = _load_helper()
+        sha = secrets.token_hex(20)
+        for ln in ("key_dir: /home/runner/work/ai-memory-mcp/ai-memory-mcp/.local-runs/cert-bootstrap-evidence/witness/keys",
+                   "/home/runner/_work/" + sha + "/log",
+                   "ls /runner/work/x /run/user/1000 /root/.cache"):
+            self.assertEqual(mod.redact_line(ln), ln)
 
 
 class GateScriptPins(unittest.TestCase):

@@ -92,15 +92,21 @@ URL_CREDENTIALS = re.compile(r"(://)\S*@")
 LONG_HEX = re.compile(r"(?<![0-9A-Za-z])[0-9a-fA-F]{64,}(?![0-9A-Za-z])")
 LONG_B64 = re.compile(r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{32,}={0,2}")
 GIT_SHA = re.compile(r"[0-9a-f]{40}")
-# Shape 8b: an absolute path under a well-known filesystem root stays readable, but
-# every ``/`` segment is still checked on its own (a 32+ base64 run that is not exactly
-# a 40-hex sha, or 64+ hex, is masked). Only a segment in the lowercase path alphabet is
-# checked alone; a segment with an uppercase letter, ``+`` or ``=`` is joined with its
-# neighbours and floor-checked as one run (a std-base64 secret holding ``/``). Any other
-# slash run (URL path, bare ``a/b/c``) gets no exemption. ``KEY=/abs/path`` is a path too.
+# Shape 8b: an absolute path under a well-known filesystem root stays readable, in two
+# passes. Pass 1 runs the 32+ floor over the WHOLE path before any ``/`` split: a 32+ run
+# stays readable only when it is path-like (all of ``[a-z0-9._/-]``: no uppercase, no
+# ``+``, no ``=``), so a std-base64 secret holding ``/`` is masked as one run. Pass 2 then
+# checks every ``/`` segment on its own (a 32+ base64 run that is not exactly a 40-hex sha,
+# or 64+ hex, is masked); a segment with an uppercase letter, ``+`` or ``=`` is joined with
+# its neighbours. The root needs a boundary (``/run<token>`` is not a path). Any other slash
+# run (URL path, bare ``a/b/c``) gets no exemption. ``KEY=/abs/path`` is a path too.
 PATH_ROOTS = "home|srv|usr|var|opt|mnt|etc|tmp|root|run|lib|bin|sbin|github|runner|workspace|ai-scratch"
+ROOT_BOUNDARY = r"(?=/|[^A-Za-z0-9+_=-]|$)"
 SEG_LOWER = re.compile(r"[a-z0-9._-]*")
-ABS_PATH = re.compile(r"(?<![A-Za-z0-9+/_.-])(/(?:" + PATH_ROOTS + r")(?:/[A-Za-z0-9._+=-]*)*)")
+PATH_LIKE = re.compile(r"[a-z0-9._/-]*")
+ABS_PATH = re.compile(
+    r"(?<![A-Za-z0-9+/_.-])(/(?:" + PATH_ROOTS + r")" + ROOT_BOUNDARY + r"(?:/[A-Za-z0-9._+=-]*)*)"
+)
 PATH_SENTINEL = "\x00PATH%d\x00"
 # Shape 9: ``\u00XX`` escapes that decode to a key-name character (alnum, ``_.- ``).
 KEY_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})")
@@ -160,8 +166,16 @@ def _mask_segment(seg: str) -> str:
     return LONG_B64.sub(_b64_sub, LONG_HEX.sub(REDACTED, seg))
 
 
+def _path_run_sub(m: "re.Match") -> str:
+    run = m.group(0)
+    if PATH_LIKE.fullmatch(run) or GIT_SHA.fullmatch(run):
+        return run
+    return REDACTED
+
+
 def _mask_path(path: str) -> str:
-    """Mask an absolute path: lowercase segments alone, other segments joined with their neighbours."""
+    """Mask an absolute path: the whole-path floor first, then every segment on its own."""
+    path = LONG_B64.sub(_path_run_sub, LONG_HEX.sub(REDACTED, path))
     segs = path.split("/")
     odd = [SEG_LOWER.fullmatch(s) is None for s in segs]
     n = len(segs)
