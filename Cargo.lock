@@ -2783,7 +2783,6 @@ dependencies = [
 [[package]]
 name = "paste"
 version = "1.0.15"
-source = "git+https://github.com/alphaonedev/paste?rev=6a30252#6a302522990cbfd9de4e0c61d91854622f7b2999"
 
 [[package]]
 name = "pem"
