@@ -1980,7 +1980,7 @@ jobs:
       # #7160 - cap the persistent self-hosted target/debug (workspace-local,
       # oldest-mtime first). Last step so it never races a running build.
       - name: Sweep target/debug to the size cap (self-hosted)
-        if: always() && runner.environment == 'self-hosted'
+        if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted'
         run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
 
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
