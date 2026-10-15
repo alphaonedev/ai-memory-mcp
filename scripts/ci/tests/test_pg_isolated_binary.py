@@ -10,6 +10,7 @@ runs the real script against the Postgres named by
 ``AI_MEMORY_TEST_POSTGRES_URL`` and skips when that is unset.
 """
 import importlib.util
+import json
 import os
 import re
 import shutil
@@ -20,6 +21,7 @@ import tempfile
 import threading
 import unittest
 import uuid
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -59,20 +61,58 @@ def default_answer(argv, kw):
     return Result()
 
 
-class Recorder:
-    """subprocess.run stand-in: records calls, answers from a script."""
+_COMMENT_RE = re.compile(r'^COMMENT ON DATABASE "([A-Za-z0-9_]+)" IS \'(.*)\'$', re.S)
+_MARKER_READ_RE = re.compile(r"shobj_description.*datname = '([A-Za-z0-9_]+)'", re.S)
+_CREATE_DB_RE = re.compile(r'^CREATE DATABASE "([A-Za-z0-9_]+)"')
+_DROP_DB_RE = re.compile(r'^DROP DATABASE IF EXISTS "([A-Za-z0-9_]+)"$')
 
-    def __init__(self, answer=None):
+
+def fake_oid(name):
+    return 16384 + zlib.crc32(name.encode()) % 1000000
+
+
+class Recorder:
+    """subprocess.run stand-in: records calls, answers from a script.
+
+    It also emulates the database COMMENT catalog (#7113): ``dbs`` are the
+    databases that exist, ``comments`` their COMMENT text. ``sink=False``
+    discards COMMENT like PostgreSQL does for a missing database (warning
+    3D000, exit 0)."""
+
+    def __init__(self, answer=None, dbs=(), comments=None, sink=True):
         self.calls = []
         self.answer = answer or default_answer
         self.lock = threading.Lock()
+        self.dbs = set(dbs) | set(comments or {})
+        self.comments = dict(comments or {})
+        self.sink = sink
 
     def __call__(self, argv, **kw):
         assert isinstance(argv, list), 'argument list, never a shell string'
         assert not kw.get('shell'), 'shell=True is forbidden'
         with self.lock:
             self.calls.append((list(argv), kw))
-        return self.answer(list(argv), kw)
+        sql = argv[argv.index('-c') + 1] if '-c' in argv else ''
+        read = _MARKER_READ_RE.search(sql)
+        if read:
+            name = read.group(1)
+            if name not in self.dbs:
+                return Result(0, '')
+            return Result(0, '%d|%s\n' % (fake_oid(name), self.comments.get(name, '')))
+        comment = _COMMENT_RE.match(sql)
+        if comment:
+            if self.sink and comment.group(1) in self.dbs:
+                self.comments[comment.group(1)] = comment.group(2).replace("''", "'")
+            return Result()
+        result = self.answer(list(argv), kw)
+        if result.returncode == 0:
+            created, dropped = _CREATE_DB_RE.match(sql), _DROP_DB_RE.match(sql)
+            if created:
+                self.dbs.add(created.group(1))
+            elif dropped:
+                self.dbs.discard(dropped.group(1))
+                self.comments.pop(dropped.group(1), None)
+        return result
 
     def sql(self):
         return [a[a.index('-c') + 1] for a, _ in self.calls if '-c' in a]
@@ -957,19 +997,25 @@ class LeakAndLineage7031(unittest.TestCase):
         self.assertTrue([s for s in rec.sql() if s.startswith('DROP DATABASE IF EXISTS "ci_base_')])
 
     def test_7031_sweep_removes_aged_idle_ci_base(self):
+        # #7113: only a proven TERMINAL family is reclaimed; age alone is not ownership.
+        terminal = 'ci_base_11_1700000000_0123abcd'
+        names = [terminal, terminal + '_tpl', 'ci_base_12_1700004900_0123abcd', 'ci_base_manual']
+
         def answer(argv, kw):
             sql = argv[argv.index('-c') + 1]
             if 'extract(epoch' in sql:
                 return Result(0, '1700005000\n')
             if sql.startswith('SELECT') and "'ci_base_'" in sql:
-                return Result(0, 'ci_base_11_1700000000_0123abcd\nci_base_11_1700000000_0123abcd_tpl\n'
-                                 'ci_base_12_1700004900_0123abcd\nci_base_manual\n')
+                return Result(0, '\n'.join(names) + '\n')
+            if 'count(*)' in sql and 'pg_stat_activity' in sql:
+                return Result(0, '0\n')
             return Result()
-        rec = Recorder(answer)
+        marker = pib.family_marker(terminal, fake_oid(terminal), RUN, pib.PHASE_TERMINAL,
+                                   terminal_at=1700000100, intent=pib.INTENT_TEARDOWN, reason='teardown')
+        rec = Recorder(answer, dbs=names, comments={terminal: marker})
         with mock.patch.object(pib.subprocess, 'run', rec):
             dropped = pib.sweep(BASE, 3600)
-        self.assertEqual(sorted(dropped), ['ci_base_11_1700000000_0123abcd',
-                                           'ci_base_11_1700000000_0123abcd_tpl'])
+        self.assertEqual(sorted(dropped), [terminal, terminal + '_tpl'])
         self.assertFalse([s for s in rec.sql() if 'FORCE' in s.upper()])
 
     def test_7031_teardown_warns_when_url_db_is_not_the_minted_base(self):
@@ -1083,6 +1129,220 @@ class LeakAndLineage7031(unittest.TestCase):
                 pib.setup(BASE, 'ai_memory_test_ci_9_1_x')
         self.assertIn('high_water=6', str(ctx.exception))
         self.assertIn('0 rows', str(ctx.exception))
+
+
+class FamilyOwnership7113(unittest.TestCase):
+    """#7113: the base COMMENT is the family authority; sweep reaps TERMINAL only."""
+
+    SHARED = SharedBaseRefusal7031.SHARED
+    BASE_NAME = 'ci_base_1_1700000000_0123abcd'
+
+    def run_main(self, argv, rec, env=None):
+        import io
+        import contextlib
+        out, err = io.StringIO(), io.StringIO()
+        clean = {k: v for k, v in os.environ.items() if not k.startswith('AI_MEMORY_TEST_')}
+        clean.update(env or {})
+        with Patched(rec), mock.patch.dict(os.environ, clean, clear=True), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = pib.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def marker(self, name, phase, run=RUN, terminal_at=None, **extra):
+        if phase == pib.PHASE_TERMINAL:
+            extra.setdefault('intent', pib.INTENT_TEARDOWN)
+            extra.setdefault('reason', 'teardown')
+            terminal_at = 1700000100 if terminal_at is None else terminal_at
+        return pib.family_marker(name, fake_oid(name), run, phase, terminal_at=terminal_at, **extra)
+
+    def test_marker_parse_is_strict(self):
+        name, oid = self.BASE_NAME, fake_oid(self.BASE_NAME)
+        good = self.marker(name, pib.PHASE_ACTIVE)
+        self.assertEqual(pib.parse_family_marker(good, name, oid)['run_id'], RUN)
+        terminal = self.marker(name, pib.PHASE_TERMINAL)
+        self.assertEqual(pib.parse_family_marker(terminal, name, oid)['phase'], pib.PHASE_TERMINAL)
+        loaded = json.loads(good)
+        bad = [
+            '', 'not json', '[]', good[:-1],
+            good[:-1] + ', "run_id": "%s"}' % RUN,                     # duplicate key
+            json.dumps(dict(loaded, extra=1)),                         # unknown field
+            json.dumps(dict(loaded, version=2)),                       # unknown version
+            json.dumps(dict(loaded, protocol='other')),
+            json.dumps(dict(loaded, phase='DONE')),
+            json.dumps(dict(loaded, base='ci_base_9_1700000000_ffffffff')),  # name mismatch
+            json.dumps(dict(loaded, base_oid=oid + 1)),                # OID mismatch (same-name replacement)
+            json.dumps(dict(loaded, base_oid=True)),
+            json.dumps(dict(loaded, run_id='Bad-Run')),
+            json.dumps(dict(loaded, reason='x')),                      # ACTIVE carries no terminal fields
+            json.dumps(dict(json.loads(terminal), terminal_at=None)),
+            json.dumps(dict(json.loads(terminal), intent='GUESS')),
+            json.dumps(dict(json.loads(terminal), reason='')),
+            json.dumps(dict(json.loads(terminal), reason='r' * (pib.FAMILY_REASON_MAX + 1))),
+        ]
+        for text in bad:
+            self.assertIsNone(pib.parse_family_marker(text, name, oid), text)
+
+    def test_setup_marks_a_minted_base_active_with_its_run(self):
+        rec = Recorder()
+        rc, out, err = self.run_main(['setup', '--url', self.SHARED, '--run-id', RUN, '--emit-env'], rec)
+        self.assertEqual(rc, 0, err)
+        base = dict(ln.split('=', 1) for ln in out.split())[pib.BASE_VAR]
+        found = pib.parse_family_marker(rec.comments.get(base, ''), base, fake_oid(base))
+        self.assertIsNotNone(found, rec.comments)
+        self.assertEqual((found['phase'], found['run_id']), (pib.PHASE_ACTIVE, RUN))
+        sql = rec.sql()
+        mark = [i for i, s in enumerate(sql) if s.startswith('COMMENT ON DATABASE "%s"' % base)]
+        tpl = [i for i, s in enumerate(sql) if s == 'CREATE DATABASE "%s_tpl"' % base]
+        self.assertTrue(mark and tpl and mark[0] < tpl[0], 'ACTIVE before the template exists')
+
+    def test_explicit_base_is_never_marked(self):
+        rec = Recorder()
+        url = 'postgres://u:pw@127.0.0.1:5445/ai_memory_test_ci_9_1_x'
+        rc, _, err = self.run_main(['setup', '--url', url, '--run-id', RUN], rec)
+        self.assertEqual(rc, 0, err)
+        self.assertFalse([s for s in rec.sql() if s.startswith('COMMENT')])
+
+    def test_unverified_mark_fails_setup_and_drops_the_minted_base(self):
+        rec = Recorder(sink=False)  # COMMENT accepted but not stored (3D000 warning)
+        rc, _, err = self.run_main(['setup', '--url', self.SHARED, '--run-id', RUN], rec)
+        self.assertEqual(rc, pib.EXIT_USAGE, err)
+        minted = re.search(r'CREATE DATABASE "(ci_base_\w+?)"', ' '.join(rec.sql())).group(1)
+        self.assertIn('DROP DATABASE IF EXISTS "%s"' % minted, rec.sql())
+        self.assertFalse([s for s in rec.sql() if s.endswith('_tpl"') and s.startswith('CREATE')])
+
+    def sweep_answer(self, names, sessions=None):
+        sessions = sessions or {}
+
+        def answer(argv, kw):
+            sql = argv[argv.index('-c') + 1]
+            if 'extract(epoch' in sql:
+                return Result(0, '1700009000\n')
+            if sql.startswith('SELECT') and 'pg_stat_activity' in sql and 'count(*)' in sql:
+                hit = re.search(r"datname = '(\w+)'", sql)
+                return Result(0, '%d\n' % sessions.get(hit.group(1) if hit else '', 0))
+            if sql.startswith('SELECT') and 'pg_database' in sql:
+                prefix = re.search(r"starts_with\(d?\.?datname, '(\w+)'\)", sql)
+                pick = [n for n in names if prefix is None or n.startswith(prefix.group(1))]
+                if 'NOT EXISTS' in sql:
+                    pick = [n for n in pick if not sessions.get(n)]
+                return Result(0, '\n'.join(pick) + '\n')
+            return Result()
+        return answer
+
+    def test_sweep_reaps_only_aged_terminal_families(self):
+        active = 'ci_base_1_1700000000_aaaaaaaa'
+        unmarked = 'ci_base_1_1700000000_bbbbbbbb'
+        fresh = 'ci_base_1_1700000000_cccccccc'
+        old = 'ci_base_1_1700000000_dddddddd'
+        junk = 'ci_base_1_1700000000_eeeeeeee'
+        active_clone = 'ai_memory_t_ract_1700000000_0123abcd'
+        old_clone = 'ai_memory_t_rold_1700000000_0123abcd'
+        orphan_tpl = 'ci_base_1_1700000000_ffffffff_tpl'
+        bases = [active, unmarked, fresh, old, junk]
+        names = bases + [b + '_tpl' for b in bases] + [active_clone, old_clone, orphan_tpl]
+        comments = {
+            active: self.marker(active, pib.PHASE_ACTIVE, run='ract'),
+            fresh: self.marker(fresh, pib.PHASE_TERMINAL, run='rfre', terminal_at=1700008000),
+            old: self.marker(old, pib.PHASE_TERMINAL, run='rold', terminal_at=1700001000),
+            junk: '{"protocol": "ai-memory-pg-family"',
+        }
+        rec = Recorder(self.sweep_answer(names), dbs=names, comments=comments)
+        with mock.patch.object(pib.subprocess, 'run', rec):
+            dropped = pib.sweep(BASE, 3600)
+        self.assertEqual(dropped, [old_clone, old + '_tpl', old])
+        self.assertFalse([s for s in rec.sql() if 'FORCE' in s.upper()])
+        for kept in (active, unmarked, fresh, junk, active_clone, orphan_tpl):
+            self.assertIn(kept, rec.dbs, kept)
+
+    def test_sweep_keeps_a_terminal_family_with_a_live_member(self):
+        old = 'ci_base_1_1700000000_dddddddd'
+        clone = 'ai_memory_t_rold_1700000000_0123abcd'
+        names = [old, old + '_tpl', clone]
+        comments = {old: self.marker(old, pib.PHASE_TERMINAL, run='rold', terminal_at=1700001000)}
+        rec = Recorder(self.sweep_answer(names, sessions={clone: 1}), dbs=names, comments=comments)
+        with mock.patch.object(pib.subprocess, 'run', rec):
+            dropped = pib.sweep(BASE, 3600)
+        self.assertEqual(dropped, [])
+        self.assertEqual(set(names), rec.dbs, 'the authority stays while a member is live')
+
+    def teardown_answer(self, clones, fail_drop=()):
+        def answer(argv, kw):
+            sql = argv[argv.index('-c') + 1]
+            if 'extract(epoch' in sql:
+                return Result(0, '1700009000\n')
+            if sql.startswith('SELECT') and 'pg_database' in sql:
+                return Result(0, '\n'.join(clones) + '\n')
+            hit = _DROP_DB_RE.match(sql)
+            if hit and hit.group(1) in fail_drop:
+                return Result(1, '', 'ERROR: database "%s" is being accessed by other users' % hit.group(1))
+            return default_answer(argv, kw)
+        return answer
+
+    def base_url(self, name):
+        return 'postgres://u:pw@127.0.0.1:5445/' + name
+
+    def test_teardown_terminalizes_first_and_drops_the_base_last(self):
+        name = self.BASE_NAME
+        clone = 'ai_memory_t_%s_1700000000_0123abcd' % RUN
+        rec = Recorder(self.teardown_answer([clone]), dbs=[name, name + '_tpl', clone],
+                       comments={name: self.marker(name, pib.PHASE_ACTIVE)})
+        rc, _, err = self.run_main(['teardown', '--url', self.base_url(name), '--run-id', RUN], rec,
+                                   {pib.BASE_VAR: name})
+        self.assertEqual(rc, 0, err)
+        sql = rec.sql()
+        mark = [i for i, s in enumerate(sql) if s.startswith('COMMENT ON DATABASE "%s"' % name)]
+        drops = [s for s in sql if s.startswith('DROP DATABASE')]
+        self.assertTrue(mark and mark[0] < sql.index(drops[0]), 'TERMINAL before any drop')
+        self.assertEqual(drops[-1], 'DROP DATABASE IF EXISTS "%s"' % name, 'base (the authority) last')
+        self.assertFalse(rec.dbs & {name, name + '_tpl', clone})
+
+    def test_teardown_partial_failure_exits_nonzero_and_keeps_terminal_authority(self):
+        name = self.BASE_NAME
+        clone = 'ai_memory_t_%s_1700000000_0123abcd' % RUN
+        rec = Recorder(self.teardown_answer([clone], fail_drop={clone}), dbs=[name, name + '_tpl', clone],
+                       comments={name: self.marker(name, pib.PHASE_ACTIVE)})
+        rc, _, err = self.run_main(['teardown', '--url', self.base_url(name), '--run-id', RUN], rec,
+                                   {pib.BASE_VAR: name})
+        self.assertNotEqual(rc, 0, 'a failed clone drop is not a successful teardown')
+        self.assertIn(name, rec.dbs)
+        found = pib.parse_family_marker(rec.comments[name], name, fake_oid(name))
+        self.assertEqual(found['phase'], pib.PHASE_TERMINAL)
+
+    def test_teardown_with_an_explicit_base_propagates_failure(self):
+        db = 'ai_memory_test_ci_9_1_x'
+        clone = 'ai_memory_t_%s_1700000000_0123abcd' % RUN
+        rec = Recorder(self.teardown_answer([clone], fail_drop={clone}), dbs=[db, TPL, clone])
+        rc, _, _ = self.run_main(['teardown', '--url', self.base_url(db), '--run-id', RUN], rec)
+        self.assertNotEqual(rc, 0)
+
+    def test_teardown_refuses_a_family_of_another_run(self):
+        name = self.BASE_NAME
+        rec = Recorder(self.teardown_answer([]), dbs=[name, name + '_tpl'],
+                       comments={name: self.marker(name, pib.PHASE_ACTIVE, run='zother')})
+        rc, _, err = self.run_main(['teardown', '--url', self.base_url(name), '--run-id', RUN], rec,
+                                   {pib.BASE_VAR: name})
+        self.assertEqual(rc, pib.EXIT_USAGE, err)
+        self.assertFalse([s for s in rec.sql() if s.startswith(('DROP', 'ALTER', 'COMMENT'))])
+
+    def test_revoke_refuses_a_live_family_and_marks_an_idle_one(self):
+        name = self.BASE_NAME
+        clone = 'ai_memory_t_%s_1700000000_0123abcd' % RUN
+        names = [name, name + '_tpl', clone]
+        argv = ['revoke', '--url', self.SHARED, '--db', name, '--run-id', RUN, '--reason', 'owner lost']
+        live = Recorder(self.sweep_answer(names, sessions={clone: 1}), dbs=names,
+                        comments={name: self.marker(name, pib.PHASE_ACTIVE)})
+        rc, _, _ = self.run_main(argv, live)
+        self.assertEqual(rc, pib.EXIT_USAGE)
+        self.assertFalse([s for s in live.sql() if s.startswith(('COMMENT', 'DROP'))])
+        idle = Recorder(self.sweep_answer(names), dbs=names, comments={name: self.marker(name, pib.PHASE_ACTIVE)})
+        rc, _, err = self.run_main(argv, idle)
+        self.assertEqual(rc, 0, err)
+        found = pib.parse_family_marker(idle.comments[name], name, fake_oid(name))
+        self.assertEqual((found['phase'], found['intent'], found['reason']),
+                         (pib.PHASE_TERMINAL, pib.INTENT_REVOKE, 'owner lost'))
+        self.assertFalse([s for s in idle.sql() if s.startswith('DROP')], 'revoke never drops')
+        rc, _, _ = self.run_main(argv[:-1] + [' '], Recorder(self.sweep_answer(names), dbs=names))
+        self.assertEqual(rc, pib.EXIT_USAGE, 'revoke needs a non-empty reason')
 
 
 class NoShell(unittest.TestCase):
