@@ -512,5 +512,32 @@ class SharedTestDbRefs7031(unittest.TestCase):
         self.assertIn('allowlist line 8', done.stderr)
 
 
+    # --- round 4: code r3 F3 (#7173) ---
+    def default_scope_run(self, allow: str) -> 'subprocess.CompletedProcess[str]':
+        self.make_default_tree()
+        (self.dir / 'src' / 'live.sh').write_text('POSTGRES_DB=%s\n' % NAME, encoding='utf-8')
+        for rel in ('changelog.d/n.md', '.local-runs/probe.py', 'node_modules/dep.js', 'src/__pycache__/c.py'):
+            target = self.dir / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('x = 1\n', encoding='utf-8')
+        (self.dir / 'scripts' / 'qc-allowlists' / 'shared-test-db-allow.txt').write_text(allow, encoding='utf-8')
+        return gate(self.dir)
+
+    def test_7173_r4_default_scope_pin_on_an_unscanned_file_is_stale(self) -> None:
+        live = 'src/live.sh:1  # live pin\n'
+        done = self.default_scope_run(live)
+        self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout + done.stderr)
+        for dead in ('changelog.d/n.md', '.local-runs/probe.py', 'node_modules/dep.js', 'src/__pycache__/c.py'):
+            done = self.default_scope_run(live + '%s:1  # dead pin\n' % dead)
+            self.assertEqual(done.returncode, EXIT_USAGE, dead + done.stdout + done.stderr)
+            self.assertIn('%s:1' % dead, done.stderr, dead)
+
+    def test_7173_r4_narrowed_paths_still_skip_pins_outside_the_scan(self) -> None:
+        (self.dir / 'other.sh').write_text('POSTGRES_DB=%s\n' % NAME, encoding='utf-8')
+        self.allow('other.sh:1  # pin outside the narrowed scan\n')
+        done = self.mutant('clean')
+        self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout + done.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()
