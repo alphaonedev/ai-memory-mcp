@@ -120,5 +120,57 @@ class Cli(Fixture):
         self.assertEqual(ctx.exception.code, 2)
 
 
+class Symlinks(Fixture):
+    """r1 HIGH-2: the helper must never follow a symlink out of its root."""
+
+    run_main = Cli.run_main
+
+    def setUp(self):
+        super().setUp()
+        shutil.rmtree(self.workspace / "target")  # replace the real tree by a link
+        self.outside = SCRATCH / "outside"
+        self.outside_incr = touch_dir(self.outside / "debug" / "incremental", OLD)
+        (self.workspace / "target").symlink_to(self.outside, target_is_directory=True)
+
+    def test_symlinked_target_is_never_a_candidate(self):
+        self.assertNotIn(self.workspace / "target" / "debug" / "incremental", self.candidates())
+
+    def test_outside_directory_survives_a_real_run_and_the_skip_is_reported(self):
+        rc, out = self.run_main()
+        self.assertEqual(rc, 0)
+        self.assertTrue((self.outside_incr / "f").exists())
+        self.assertTrue((self.outside / "debug").is_dir())
+        self.assertIn("skipped", out)
+        self.assertFalse(self.old_tmp.exists())  # ordinary candidates still pruned
+
+    def test_symlink_to_another_runners_tree_survives(self):
+        other = touch_dir(SCRATCH / "work2" / "repo" / "repo" / "target" / "debug" / "incremental")
+        (self.workspace / ".tmplink").symlink_to(other, target_is_directory=True)
+        link = self.work / "_temp" / "oldlink"
+        link.symlink_to(other, target_is_directory=True)
+        os.utime(link, (time.time() - OLD, time.time() - OLD), follow_symlinks=False)
+        rc, out = self.run_main()
+        self.assertEqual(rc, 0)
+        self.assertTrue((other / "f").exists())
+        self.assertIn("skipped", out)
+
+    def test_symlinked_debug_component_is_skipped(self):
+        (self.workspace / "target").unlink()
+        (self.workspace / "target").mkdir()
+        (self.workspace / "target" / "debug").symlink_to(
+            self.outside / "debug", target_is_directory=True
+        )
+        rc, _ = self.run_main()
+        self.assertEqual(rc, 0)
+        self.assertTrue((self.outside_incr / "f").exists())
+
+    def test_shared_target_reached_through_a_link_stays_protected(self):
+        link = self.workspace / ".tmpshared"
+        link.symlink_to(self.shared, target_is_directory=True)
+        rc, _ = self.run_main()
+        self.assertEqual(rc, 0)
+        self.assertTrue((self.shared / "debug" / "incremental" / "f").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
