@@ -4,7 +4,8 @@
 """Unit tests for scripts/ci/prune_runner_artifacts.py (#7188).
 
 The helper prunes stale per-job artifacts after a self-hosted job and must
-NEVER list, let alone delete, the shared per-host cargo target. Every tree is
+NEVER list, let alone delete, the per-runner cargo target ROOT
+(every runner's target) passed as --protected-root. Every tree is
 built under <repo>/.local-runs/, never a tmp path.
 
 Run: python3 -m unittest discover -s scripts/ci/tests
@@ -91,7 +92,7 @@ class Cli(Fixture):
         with redirect_stdout(out):
             rc = prune.main(
                 ["--work-root", str(self.work), "--workspace", str(self.workspace),
-                 "--shared-target", str(self.shared), "--max-age-days", str(MAX_AGE_DAYS)]
+                 "--protected-root", str(self.shared), "--max-age-days", str(MAX_AGE_DAYS)]
                 + list(extra)
             )
         return rc, out.getvalue()
@@ -127,7 +128,7 @@ class Arguments(Fixture):
         argv = [
             "--work-root", str(self.work if work is None else work),
             "--workspace", str(self.workspace if workspace is None else workspace),
-            "--shared-target", str(self.shared if shared is None else shared),
+            "--protected-root", str(self.shared if shared is None else shared),
         ]
         err = io.StringIO()
         with redirect_stdout(io.StringIO()), redirect_stderr(err):
@@ -191,7 +192,7 @@ class Arguments(Fixture):
         with redirect_stdout(out):
             rc = prune.main(
                 ["--work-root", str(self.work), "--workspace", str(self.workspace),
-                 "--shared-target", str(self.shared), "--dry-run"]
+                 "--protected-root", str(self.shared), "--dry-run"]
             )
         self.assertEqual(rc, 0)
         self.assertIn("would remove", out.getvalue())
@@ -248,6 +249,42 @@ class Symlinks(Fixture):
         rc, _ = self.run_main()
         self.assertEqual(rc, 0)
         self.assertTrue((self.shared / "debug" / "incremental" / "f").exists())
+
+
+class PerRunnerRoot(Fixture):
+    """r3: the whole per-runner target root is protected, siblings included."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = self.workspace / (prune.TMP_PREFIX + "-targets")
+        self.runner_1 = touch_dir(self.root / "runner-1" / "debug" / "incremental")
+        self.runner_2 = touch_dir(self.root / "runner-2" / "debug" / "deps", OLD)
+
+    def test_sibling_runner_target_is_protected_from_this_runners_prune(self):
+        self.assertTrue(prune.is_protected(self.runner_2, self.root))
+        self.assertTrue(prune.is_protected(self.runner_1.parent.parent, self.root))
+        self.assertTrue(prune.is_protected(self.root, self.root))
+
+    def test_sibling_runner_target_survives_a_real_run(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = prune.main(
+                ["--work-root", str(self.work), "--workspace", str(self.workspace),
+                 "--protected-root", str(self.root), "--max-age-days", str(MAX_AGE_DAYS)]
+            )
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.runner_1.exists())
+        self.assertTrue(self.runner_2.exists())
+        self.assertTrue(self.root.exists())
+        self.assertFalse(self.old_tmp.exists())
+        self.assertNotIn("runner-", out.getvalue())
+
+    def test_old_flag_name_is_gone(self):
+        with self.assertRaises(SystemExit) as ctx:
+            with redirect_stderr(io.StringIO()):
+                prune.main(["--work-root", str(self.work), "--workspace", str(self.workspace),
+                            "--shared-target", str(self.root)])
+        self.assertEqual(ctx.exception.code, 2)
 
 
 if __name__ == "__main__":
