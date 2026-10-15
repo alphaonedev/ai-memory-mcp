@@ -47,7 +47,6 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
-use tempfile::TempDir;
 use tokio::net::TcpListener;
 
 use ai_memory::db;

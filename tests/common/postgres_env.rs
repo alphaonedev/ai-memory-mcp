@@ -143,8 +143,8 @@ pub struct PostgresTestEnv {
     base_url: String,
     url_with_search_path: String,
     schema_name: String,
-    // Held purely for Drop side effects.
-    _cleanup: SchemaCleanupGuard,
+    // Dropped for its side effects; finish marks it finished first.
+    cleanup: SchemaCleanupGuard,
 }
 
 impl PostgresTestEnv {
@@ -187,7 +187,7 @@ impl PostgresTestEnv {
             base_url,
             url_with_search_path,
             schema_name,
-            _cleanup: cleanup,
+            cleanup,
         })
     }
 
@@ -206,7 +206,7 @@ impl PostgresTestEnv {
         for pool in pools {
             pool.close().await;
         }
-        self._cleanup.finished = true; // the guard must not drop the schema a second time
+        self.cleanup.finished = true; // the guard must not drop the schema a second time
         match drop_schema_bounded(&self.base_url, &self.schema_name, SCHEMA_DROP_LOCK_TIMEOUT).await
         {
             Ok(()) => {}
@@ -296,9 +296,7 @@ impl Drop for SchemaCleanupGuard {
             Ok(Err(CleanupError::Drop(m))) => {
                 eprintln!("PostgresTestEnv cleanup: {m}");
                 // Fail the test loudly, but never double-panic during unwind.
-                if !std::thread::panicking() {
-                    panic!("PostgresTestEnv cleanup: {m}");
-                }
+                assert!(std::thread::panicking(), "PostgresTestEnv cleanup: {m}");
             }
             Err(e) => eprintln!(
                 "PostgresTestEnv cleanup thread for {} panicked: {:?}",
