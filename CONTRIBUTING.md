@@ -64,6 +64,7 @@ scripts/check-vendor-literals.sh        # vendor-monoculture + SECS_PER_* magic-
 scripts/qc-codegraph-precheck.py        # C8 caller-context allowlist + structural-drift HARD-BLOCK (#923)
 scripts/check-l3-boundary.sh            # L3-boundary perma-ban HARD-BLOCK (§25.3 S5 / RQ-10, #1853)
 scripts/check-hardcoded-literals.sh     # hardcoded-literal duplication ratchet (pm-v3.1)
+python3 scripts/ci/check_src_path_literals.py  # src/ path-literal ratchet, fail-closed on a missing scan root (#7260)
 scripts/check-docs-vs-ssot.sh           # docs-vs-SSOT drift HARD-BLOCK (operator directive 2026-05-31)
 scripts/check-cloud-init-ascii.sh       # cloud-init template ASCII-only HARD-BLOCK (#1880)
 ```

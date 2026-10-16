@@ -232,6 +232,8 @@ jobs:
         run: python3 scripts/test/test_workflow_concurrency_6340.py
       - name: Shard partition and wiring unit tests (#6344)
         run: python3 -m unittest discover -s scripts/ci/tests
+      - name: src path-literal ratchet, fail-closed on a missing scan root (#7260)
+        run: python3 scripts/ci/check_src_path_literals.py
       - id: cls
         shell: bash
         env:
