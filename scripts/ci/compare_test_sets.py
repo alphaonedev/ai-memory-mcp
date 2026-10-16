@@ -38,9 +38,14 @@ PASS = 'pass'
 FAIL = 'fail'
 LIB_KEY = 'lib'
 BIN_PREFIX = 'bin/'
+EXAMPLE_PREFIX = 'example/'
+EXAMPLE_SRC_PREFIX = 'examples/'
 DEFAULT_MAX_LIST = 40
 
-_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+# ESC, or the two characters ^[ that `gh run view --log` prints in its place.
+_ANSI_RE = re.compile(r'(?:\x1b|\^\[)\[[0-9;]*[A-Za-z]')
+# GitHub inserts a byte-order mark at log-chunk boundaries, anywhere in a line.
+_BOM = '\ufeff'
 _STAMP_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T[\d:.]+Z ?')
 _RUNNING_RE = re.compile(r'^\s*Running (?:(?P<unit>unittests) )?(?P<src>\S+)(?: \((?P<exe>[^)]+)\))?\s*$')
 _DOCTEST_RE = re.compile(r'^\s*Doc-tests\b')
@@ -52,6 +57,10 @@ _CARGO_TEST_RE = re.compile(
 _CARGO_OPEN_RE = re.compile(r'^test (?P<name>.+?)(?: - should panic)? \.\.\.(?: |$)')
 _CARGO_VERDICT_RE = re.compile(r'^(?P<res>ok|FAILED|ignored)(?![A-Za-z])')
 _HASH_RE = re.compile(r'-[0-9a-f]{16}$')
+# A test that spawns its own libtest child prints a nested `running N test(s)` block (inline after
+# `test <name> ... ` or on its own line) that ends with its own `test result:` line.
+_NESTED_START_RE = re.compile(r'(?:^|\s)running \d+ tests?$')
+_RESULT_RE = re.compile(r'^test result: ')
 _NEXTEST_RE = re.compile(
     r'^\s*(?P<st>PASS|LEAK-FAIL|LEAK|FAIL|TIMEOUT|ABORT|SIG[A-Z0-9]+|EXEC-?FAIL|FLAKY(?: \d+/\d+)?)'
     r'\s+\[[^\]]*\]\s+(?:\(\s*\d+/\s*\d+\)\s+)?(?P<bin>\S+)\s+(?P<name>.+?)\s*$')
@@ -78,7 +87,7 @@ class Report(NamedTuple):
 
 
 def _clean(line: str) -> str:
-    return _STAMP_RE.sub('', _ANSI_RE.sub('', line)).rstrip()
+    return _STAMP_RE.sub('', _ANSI_RE.sub('', line.replace(_BOM, ''))).rstrip()
 
 
 def _norm(name: str) -> str:
@@ -98,6 +107,8 @@ def _cargo_binary(match: 're.Match[str]') -> str:
         src = match.group('src').strip()
         if src.endswith('lib.rs'):
             return LIB_KEY
+        if src.startswith(EXAMPLE_SRC_PREFIX):
+            return EXAMPLE_PREFIX + stem  # nextest id `<package>::example/<name>`
         return BIN_PREFIX + stem
     return stem
 
@@ -107,15 +118,24 @@ def parse_cargo_log(text: str) -> Outcomes:
     out: Outcomes = {}
     current: Optional[str] = None
     pending: Optional[str] = None
+    parents: List[Optional[str]] = []  # parent verdicts waiting while a nested child block runs
     in_doc = False
     for raw in text.splitlines():
         line = _clean(raw)
         running = _RUNNING_RE.match(line)
         if running and (running.group('src').endswith('.rs') or '/deps/' in running.group('src')):
-            current, in_doc = _cargo_binary(running), False
+            current, in_doc, pending, parents = _cargo_binary(running), False, None, []
             continue
         if _DOCTEST_RE.match(line):
-            current, in_doc = None, True
+            current, in_doc, pending, parents = None, True, None, []
+            continue
+        if parents or (pending and _NESTED_START_RE.search(line)):
+            # inside a child libtest block: its lines are not tests of this binary
+            if _NESTED_START_RE.search(line):
+                parents.append(pending)
+                pending = None
+            elif _RESULT_RE.match(line):
+                pending = parents.pop()
             continue
         found = _CARGO_TEST_RE.match(line)
         if found:
@@ -128,6 +148,9 @@ def parse_cargo_log(text: str) -> Outcomes:
                 opened = _CARGO_OPEN_RE.match(line)
                 if opened:
                     pending = opened.group('name')
+                    if _NESTED_START_RE.search(line):  # child block opens on the same line
+                        parents.append(pending)
+                        pending = None
                 continue
         if in_doc or res == 'ignored':
             continue
