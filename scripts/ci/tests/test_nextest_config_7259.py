@@ -5,7 +5,7 @@ Run: python3 -m unittest discover -s scripts/ci/tests -p test_nextest_config_725
 
 Text-level checks (no TOML or YAML parser is available on every node):
 the ci profile keeps cargo-test parity (no retries, no fail-fast), keeps a
-per-test timeout no looser than the watchdog it replaces, writes JUnit, and
+per-test timeout no looser than the watchdog it replaces, claims no JUnit file, and
 serialises exactly the lib Postgres prefixes that the sharded run keeps
 serial. ci.yml runs every non-doc test leg through nextest, installed from
 crates.io at one pinned version.
@@ -49,8 +49,12 @@ class CiProfile(unittest.TestCase):
     def test_pass_lines_are_printed_so_the_log_can_be_compared(self):
         self.assertRegex(profile('ci'), r'(?m)^status-level\s*=\s*"pass"')
 
-    def test_junit_is_written(self):
-        self.assertRegex(CONFIG, r'(?m)^\[profile\.ci\.junit\]\npath\s*=\s*"junit\.xml"')
+    def test_ci_profile_makes_no_junit_claim_and_its_header_matches_the_settings(self):
+        self.assertNotIn('[profile.ci.junit]', CONFIG)
+        self.assertNotIn('machine-readable twin', CONFIG)
+        header = re.search(r'(?m)^#\s+ci\s+[^\n]*$', CONFIG).group(0)
+        retries = re.search(r'(?m)^retries\s*=\s*(\d+)', profile('ci')).group(1)
+        self.assertIn('retries=%s' % retries, header)
 
 
 class PostgresTestGroup(unittest.TestCase):

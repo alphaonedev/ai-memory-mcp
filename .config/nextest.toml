@@ -3,7 +3,7 @@
 # Profiles:
 #   default — local dev, fail-fast off, surface flakes
 #   macos   — local macOS dev (alias of default with retries=1)
-#   ci      — CI / Linux, retries=2, JUnit output
+#   ci      — CI (every platform), retries=0, one PASS/FAIL line per test
 #
 # Usage:
 #   cargo nextest run --features sal
@@ -41,7 +41,10 @@ test-threads = "num-cpus"
 #   looser.
 # - status-level = "pass": one PASS/FAIL line per test lands in the CI log so
 #   scripts/ci/compare_test_sets.py can diff the executed set against a
-#   `cargo test` log. The JUnit file is the machine-readable twin.
+#   `cargo test` log. decision: no JUnit file for ci - the three shards and the
+#   isolated lane all ran `--profile ci` into the same junit.xml path and no step
+#   uploaded it, so it was never a record; the captured log IS the record and the
+#   test-results artifact below already uploads it.
 [profile.ci]
 retries = 0
 fail-fast = false
@@ -49,9 +52,6 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 status-level = "pass"
 final-status-level = "flaky"
 test-threads = "num-cpus"
-
-[profile.ci.junit]
-path = "junit.xml"
 
 # The lib tests that touch the shared per-job Postgres database. The sal-postgres
 # legs already pass `--test-threads 1` (translated from `-- --test-threads=1`
