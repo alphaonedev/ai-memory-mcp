@@ -4,6 +4,9 @@ Every tree is synthetic and lives under the worktree's own ``.local-runs/``
 directory, never under a tmpfs path.
 """
 
+import contextlib
+import importlib.util
+import io
 import os
 import shutil
 import subprocess
@@ -255,6 +258,69 @@ class SweepTests(SweepTestCase):
         self.assertEqual(res.returncode, EXIT_OK, res.stderr)
         self.assertTrue(newest.exists())
         self.assertFalse(oldest.parent.exists())
+
+
+def load_script_module():
+    spec = importlib.util.spec_from_file_location("ci_sweep_target_under_test", str(SCRIPT))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class ScanDeleteRaceTests(SweepTestCase):
+    """#7160 S1: a swap between the scan and the delete must never be followed."""
+
+    def run_main_with_swap(self, swap):
+        module = load_script_module()
+        real_collect = module.collect_entries
+
+        def collect_then_swap(*args, **kwargs):
+            entries = real_collect(*args, **kwargs)
+            swap()
+            return entries
+
+        module.collect_entries = collect_then_swap
+        err = io.StringIO()
+        out = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            rc = module.main(["--target", str(self.target), "--max-bytes", "1",
+                              "--allow-root"])
+        return rc, err.getvalue(), out.getvalue()
+
+    def test_swept_dir_swapped_for_symlink_is_refused(self):
+        self.make_entries(2)
+        outside = self.root / "outside"
+        outside_files = [outside / "lib0.rlib", outside / "lib1.rlib"]
+        for path in outside_files:
+            write_blob(path, PRECIOUS_BYTES)
+        deps = self.debug / "deps"
+
+        def swap():
+            deps.rename(self.debug / "deps.moved")
+            deps.symlink_to(outside, target_is_directory=True)
+
+        rc, err, _out = self.run_main_with_swap(swap)
+        self.assertEqual(rc, EXIT_REFUSED, err)
+        self.assertIn("deps", err)
+        self.assertIn("refused", err)
+        self.assertTrue(all(path.exists() for path in outside_files))
+        self.assertTrue(deps.is_symlink())
+
+    def test_entry_dir_swapped_for_symlink_is_unlinked_not_followed(self):
+        pkg = self.debug / "deps" / "pkg"
+        write_blob(pkg / "inner.o")
+        outside = self.root / "outside"
+        keep = outside / "inner.o"
+        write_blob(keep, PRECIOUS_BYTES)
+
+        def swap():
+            shutil.rmtree(str(pkg))
+            pkg.symlink_to(outside, target_is_directory=True)
+
+        rc, err, _out = self.run_main_with_swap(swap)
+        self.assertEqual(rc, EXIT_OK, err)
+        self.assertTrue(keep.exists())
+        self.assertFalse(pkg.is_symlink())
 
 
 if __name__ == "__main__":
