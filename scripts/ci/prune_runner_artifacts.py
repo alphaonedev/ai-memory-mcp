@@ -42,8 +42,9 @@ stale ``.evicting-*`` leftovers are swept first. The lock file lives in the
 protected root and is never deleted. An unreadable subtree, a walk cut short by
 WALK_ENTRY_CAP or an unreadable marker counts as busy (#7289).
 
-Exit codes: 0 ok, 2 bad arguments (only validate_arguments, which also checks the
-eviction arguments). A failed removal is reported and counted but
+Exit codes: 0 ok, 2 bad arguments (validate_arguments, which also checks the
+eviction arguments, and any argument path that does not resolve: ``refusing:
+unresolvable path``). A failed removal is reported and counted but
 does not fail the post-job step (exit stays 0): cleanup must never red a job.
 Python 3.9+, standard library only.
 """
@@ -82,6 +83,17 @@ def resolve(path):
     return Path(path).resolve()
 
 
+UNRESOLVABLE_WARNED = set()
+
+
+def _protect_unresolvable_child(child):
+    """Lexical protection for a protected-root child that does not resolve (#7284 S2)."""
+    if child not in UNRESOLVABLE_WARNED:
+        UNRESOLVABLE_WARNED.add(child)
+        print("protected root child unresolvable: %s" % child, file=sys.stderr)
+    return Path(os.path.abspath(child))
+
+
 def is_protected(candidate, protected_root):
     """True if ``candidate`` is, is inside, or contains the protected root."""
     # r3 F1: an unknown state (loop, vanished or unreadable path) is protected.
@@ -96,7 +108,16 @@ def is_protected(candidate, protected_root):
             children = list(Path(protected_root).iterdir())
         except (FileNotFoundError, NotADirectoryError):
             return False  # no such root yet: it has no children to protect
-        return any(_covers(cand, resolve(child)) for child in children)
+        for child in children:
+            # #7284 S2: each child resolves in its own try, so one loop link
+            # protects only its own lexical path, not every candidate.
+            try:
+                real = resolve(child)
+            except (OSError, RuntimeError):
+                real = _protect_unresolvable_child(child)
+            if _covers(cand, real):
+                return True
+        return False
     except (OSError, RuntimeError):
         return True
 
@@ -204,7 +225,12 @@ def scan(work_root, workspace, protected_root, max_age_days, now):
                     found.append(entry)
             except OSError as err:
                 print("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
-    keep = [path for path in found if not is_protected(path, protected_root)]
+    keep = []
+    for path in found:
+        if is_protected(path, protected_root):
+            print("skipped protected %s" % path)
+        else:
+            keep.append(path)
     return keep, skipped
 
 
@@ -526,7 +552,10 @@ def prune_all(args):
     for link in skipped:
         print("skipped symlink %s" % link)
     for path in candidates:
-        if path.is_symlink() or is_protected(path, args.protected_root):
+        if path.is_symlink():
+            continue
+        if is_protected(path, args.protected_root):
+            print("skipped protected %s" % path)
             continue
         if not is_within(path, args.work_root):
             print("skipped outside root %s" % path)
@@ -555,14 +584,22 @@ def main(argv=None):
         parser.error("--evict-root requires --runner-name")
     if args.idle_target_days < 1 or args.free_floor_gib < 0:
         parser.error("--idle-target-days must be >= 1 and --free-floor-gib >= 0")
-    problem = validate_arguments(
-        args.work_root, args.workspace, args.protected_root,
-        args.evict_root, args.runner_name, args.home,
-    )
+    UNRESOLVABLE_WARNED.clear()
+    try:
+        # #7284 S1: every resolve() of the prune AND the eviction arguments is
+        # covered; a loop or unreadable path is a usage error, never a traceback.
+        problem = validate_arguments(
+            args.work_root, args.workspace, args.protected_root,
+            args.evict_root, args.runner_name, args.home,
+        )
+        out_of_tree = not problem and is_out_of_tree(args.work_root, args.protected_root)
+    except (OSError, RuntimeError) as err:
+        print("prune_runner_artifacts: refusing: unresolvable path: %s" % err, file=sys.stderr)
+        return EXIT_USAGE
     if problem:
         print("prune_runner_artifacts: refusing: %s" % problem, file=sys.stderr)
         return EXIT_USAGE
-    if is_out_of_tree(args.work_root, args.protected_root):
+    if out_of_tree:
         print("protected root %s is outside the work root; nothing to protect" % args.protected_root)
     failures = 0
     try:

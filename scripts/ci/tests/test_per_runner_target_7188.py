@@ -235,6 +235,44 @@ class WorkflowNoExpressionInRun(unittest.TestCase):
     def ci_text(self):
         return (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
+    @staticmethod
+    def indent_of(line):
+        return len(line) - len(line.lstrip(" "))
+
+    @classmethod
+    def run_body(cls, ci_text, step_name):
+        """Every line of the ``run:`` value of step ``step_name`` (block scalars included).
+
+        The body is the text after ``run:`` on its line plus every following
+        line that is blank or indented deeper than the ``run:`` key; no YAML
+        dependency is needed.
+        """
+        lines = ci_text.splitlines()
+        needle = "- name: " + step_name
+        start = next((n for n, ln in enumerate(lines) if ln.strip() == needle), None)
+        if start is None:
+            raise AssertionError("step not found: %s" % step_name)
+        step_indent = cls.indent_of(lines[start])
+        body = []
+        in_run = False
+        run_indent = 0
+        for line in lines[start + 1:]:
+            if line.strip() and cls.indent_of(line) <= step_indent:
+                break  # the next step or job
+            if in_run:
+                if line.strip() and cls.indent_of(line) <= run_indent:
+                    in_run = False
+                else:
+                    body.append(line)
+                    continue
+            if line.strip().startswith("run:"):
+                in_run = True
+                run_indent = cls.indent_of(line)
+                body.append(line.strip()[len("run:"):])
+        if not body:
+            raise AssertionError("step has no run: %s" % step_name)
+        return "\n".join(body)
+
     def step_run(self, name):
         return self.run_body(self.ci_text(), name)
 
