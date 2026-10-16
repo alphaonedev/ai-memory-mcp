@@ -4122,7 +4122,74 @@ mod tests {
     // lands.
     // -----------------------------------------------------------------
 
+    /// #7281 (TEST-01): the first ancestor of `start` (itself included) that the
+    /// production spool guard would reject, with its mode. Uses
+    /// `spool_ancestor_permissions_trusted`, the production predicate, so the
+    /// fixture and the guard cannot drift apart.
+    #[cfg(unix)]
+    fn first_untrusted_ancestor(start: &Path) -> Option<(PathBuf, u32)> {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        // SAFETY: geteuid has no preconditions and only reads credentials.
+        let effective_uid = unsafe { libc::geteuid() };
+        start.ancestors().find_map(|ancestor| {
+            let metadata = std::fs::metadata(ancestor).ok()?;
+            let mode = metadata.permissions().mode();
+            (!spool_ancestor_permissions_trusted(metadata.uid(), mode, effective_uid))
+                .then(|| (ancestor.to_path_buf(), mode))
+        })
+    }
+
+    /// Octal mask kept when reporting a mode (permission and sticky bits).
+    #[cfg(unix)]
+    const REPORTED_MODE_MASK: u32 = 0o7777;
+
+    /// #7281: the checkout itself is an ancestor of every fixture spool and
+    /// the production guard (correctly) rejects a group- or world-writable
+    /// one, which used to surface as dozens of opaque `unwrap` failures.
+    /// Fail once, naming the path, its mode and the fix.
+    #[cfg(unix)]
+    fn assert_checkout_ancestors_trusted() {
+        let manifest =
+            std::fs::canonicalize(env!("CARGO_MANIFEST_DIR")).expect("resolve the checkout root");
+        if let Some((path, mode)) = first_untrusted_ancestor(&manifest) {
+            panic!(
+                "checkout ancestor {} is group/world-writable or not owned by this user \
+                 (mode {:o}); the #2271 spool guard rejects it. Run `chmod g-w {}` \
+                 or clone the checkout under umask 022 (docs/DEVELOPER_SETUP_NOTES.md)",
+                path.display(),
+                mode & REPORTED_MODE_MASK,
+                path.display()
+            );
+        }
+    }
+
+    /// #7281 - a group-writable ancestor is reported, a private one is not.
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_checkout_ancestor_is_named_with_its_mode_7281() {
+        use std::os::unix::fs::PermissionsExt as _;
+        const GROUP_WRITABLE: u32 = 0o775;
+        const PRIVATE: u32 = 0o700;
+        let dir = fresh_tempdir();
+        let loose = dir.path().join("loose");
+        let child = loose.join("child");
+        std::fs::create_dir_all(&child).expect("create nested dirs");
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(GROUP_WRITABLE))
+            .expect("loosen");
+        let (path, mode) = first_untrusted_ancestor(&child).expect("loose ancestor reported");
+        assert_eq!(path, loose);
+        assert_eq!(mode & REPORTED_MODE_MASK, GROUP_WRITABLE);
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(PRIVATE))
+            .expect("tighten");
+        assert!(
+            first_untrusted_ancestor(&child).is_none_or(|(p, _)| p != loose && p != child),
+            "a private ancestor must not be reported"
+        );
+    }
+
     fn fresh_tempdir() -> tempfile::TempDir {
+        #[cfg(unix)]
+        assert_checkout_ancestors_trusted();
         let runs = Path::new(env!("CARGO_MANIFEST_DIR")).join(".local-runs");
         let scratch = runs.join("test-tmp");
         std::fs::create_dir_all(&scratch).expect("create repository-owned test scratch");
