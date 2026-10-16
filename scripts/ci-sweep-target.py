@@ -39,6 +39,13 @@ Safety:
     ``warning: cannot size <entry>: ... skipped`` names the entry, it is never
     counted and never on the delete list, so none of it is deleted (a partly
     deleted cargo output is worse than an oversized one).
+  * A top-level entry that holds a directory that cannot be emptied (unreadable,
+    or read-only so its files cannot be unlinked) is checked for that during the
+    descriptor-relative sizing walk, before anything is deleted: it is kept
+    whole, one ``warning: cannot remove <entry>: ... entry kept whole`` names it,
+    and its bytes still count toward ``before=`` and ``after=`` (they stay on
+    disk). The summary reports ``removed=`` (entries fully deleted) and
+    ``freed=`` (bytes really unlinked, also after a removal that fails midway).
 
 Exit codes: 0 success, 2 refused path (target outside the workspace, a
 symlinked or swapped component, a target path component that is not a
@@ -127,13 +134,31 @@ class SkippedWarning(str):
     """A warning for an entry skipped whole as too deep; it is not an unreadable-directory failure."""
 
 
-def entry_size(dir_fd, name, path, warnings, depth=0):
+def dir_is_writable(dir_fd):
+    """Whether the account can unlink inside the open directory ``dir_fd``.
+
+    ``os.access`` on ``"."`` relative to the held descriptor looks at that very
+    directory (no path is resolved, a swapped component is irrelevant) and uses
+    the effective ids where the platform supports it.
+    """
+    kwargs = {"dir_fd": dir_fd}
+    if os.access in os.supports_effective_ids:
+        kwargs["effective_ids"] = True
+    return os.access(".", os.W_OK | os.X_OK, **kwargs)
+
+
+def entry_size(dir_fd, name, path, warnings, depth=0, blockers=None):
     """Bytes under ``name`` (relative to ``dir_fd``) without following symlinks.
 
     A symlink counts as itself. A nested directory that cannot be listed is
     appended to ``warnings`` (same wording as the top-level unreadable-directory
     warning) and counts as its own size only. TooDeep (or RecursionError) is
     never caught here: it propagates so the caller drops the whole entry.
+
+    ``blockers`` (a list, when given) collects one reason per directory in the
+    entry that cannot be emptied: one that cannot be listed or opened, or one
+    that is not writable (a read-only directory sizes cleanly but its files
+    cannot be unlinked). An entry with any blocker is kept whole (S9).
     """
     st = os.lstat(name, dir_fd=dir_fd)
     if not stat.S_ISDIR(st.st_mode):
@@ -145,6 +170,8 @@ def entry_size(dir_fd, name, path, warnings, depth=0):
         child_fd = open_dir(name, dir_fd)
     except OSError as exc:
         warnings.append("cannot read {}: {}".format(path, exc))
+        if blockers is not None:
+            blockers.append("{} cannot be read".format(path))
         return total
     try:
         try:
@@ -152,14 +179,20 @@ def entry_size(dir_fd, name, path, warnings, depth=0):
                 children = list(it)
         except OSError as exc:
             warnings.append("cannot read {}: {}".format(path, exc))
+            if blockers is not None:
+                blockers.append("{} cannot be read".format(path))
             return total
+        if blockers is not None and not dir_is_writable(child_fd):
+            blockers.append("{} is not writable".format(path))
         for child in children:
             try:
                 child_path = os.path.join(path, child.name)
                 total += entry_size(child_fd, child.name, child_path, warnings,
-                                    depth + 1)
+                                    depth + 1, blockers)
             except OSError as exc:
                 warnings.append("cannot size {}/{}: {}".format(path, child.name, exc))
+                if blockers is not None:
+                    blockers.append("{} cannot be sized".format(child_path))
     finally:
         os.close(child_fd)
     return total
@@ -266,9 +299,12 @@ def open_swept_dirs(real_target, warnings, handles):
 
 
 def collect_entries(target, warnings, handles):
-    """Return (mtime, path, swept_dir, name, size) for each top-level entry.
+    """Return (mtime, path, swept_dir, name, size, removable) for each top-level entry.
 
     Unreadable directories and entries are appended to ``warnings`` and skipped.
+    An entry that holds a directory that cannot be emptied is returned with
+    ``removable`` False after one warning naming it: it still counts toward the
+    totals (its bytes stay on disk) but is never on the delete list.
     Descriptors stay open in ``handles`` so the delete phase reuses them.
     """
     entries = []
@@ -281,9 +317,11 @@ def collect_entries(target, warnings, handles):
             continue
         for child in children:
             child_path = os.path.join(sdir.path, child.name)
+            blockers = []
             try:
                 mtime = child.stat(follow_symlinks=False).st_mtime
-                size = entry_size(sdir.fd, child.name, child_path, warnings)
+                size = entry_size(sdir.fd, child.name, child_path, warnings,
+                                  blockers=blockers)
             except (TooDeep, RecursionError) as exc:
                 warnings.append(SkippedWarning(
                     "cannot size {}: too deep to walk ({}); entry skipped, nothing "
@@ -292,7 +330,11 @@ def collect_entries(target, warnings, handles):
             except OSError as exc:
                 warnings.append("cannot size {}: {}".format(child_path, exc))
                 continue
-            entries.append((mtime, child_path, sdir, child.name, size))
+            if blockers:
+                warnings.append(SkippedWarning(
+                    "cannot remove {}: {}; entry kept whole, nothing of it "
+                    "deleted".format(child_path, blockers[0])))
+            entries.append((mtime, child_path, sdir, child.name, size, not blockers))
     entries.sort(key=lambda item: (item[0], item[1]))
     return entries
 
@@ -317,27 +359,35 @@ def verify_unchanged(sdir):
             raise Refused("{} was replaced after the scan".format(held.path))
 
 
-def remove_tree(parent_fd, name):
-    """Remove directory ``name`` under ``parent_fd`` using only descriptor-relative calls."""
+def remove_tree(parent_fd, name, freed):
+    """Remove directory ``name`` under ``parent_fd`` using only descriptor-relative calls.
+
+    ``freed`` is a one-element list that accumulates the bytes unlinked so far,
+    so a removal that fails midway still reports what it really deleted.
+    """
     fd = open_dir(name, parent_fd)
     try:
         with os.scandir(fd) as it:
             names = [child.name for child in it]
         for child in names:
-            if stat.S_ISDIR(os.lstat(child, dir_fd=fd).st_mode):
-                remove_tree(fd, child)
+            st = os.lstat(child, dir_fd=fd)
+            if stat.S_ISDIR(st.st_mode):
+                remove_tree(fd, child, freed)
             else:
                 os.unlink(child, dir_fd=fd)
+                freed[0] += st.st_size
     finally:
         os.close(fd)
     os.rmdir(name, dir_fd=parent_fd)
 
 
-def remove_entry(sdir, name):
-    if stat.S_ISDIR(os.lstat(name, dir_fd=sdir.fd).st_mode):
-        remove_tree(sdir.fd, name)
+def remove_entry(sdir, name, freed):
+    st = os.lstat(name, dir_fd=sdir.fd)
+    if stat.S_ISDIR(st.st_mode):
+        remove_tree(sdir.fd, name, freed)
     else:
         os.unlink(name, dir_fd=sdir.fd)
+        freed[0] += st.st_size
 
 
 def sweep(real_target, args, warnings, handles):
@@ -349,17 +399,22 @@ def sweep(real_target, args, warnings, handles):
     remaining = before
     removed = 0
     verified = set()
-    for _mtime, path, sdir, name, size in entries:
+    for _mtime, path, sdir, name, size, removable in entries:
         if remaining <= args.max_bytes:
             break
+        if not removable:
+            continue
         if not args.dry_run:
             if id(sdir) not in verified:
                 verify_unchanged(sdir)
                 verified.add(id(sdir))
+            freed = [0]
             try:
-                remove_entry(sdir, name)
+                remove_entry(sdir, name, freed)
             except (OSError, RecursionError) as exc:
-                print("warning: cannot remove {}: {}".format(path, exc), file=sys.stderr)
+                remaining -= freed[0]
+                print("warning: cannot remove {}: {} ({} bytes of it were deleted)".format(
+                    path, exc, freed[0]), file=sys.stderr)
                 continue
         remaining -= size
         removed += 1
@@ -408,8 +463,8 @@ def main(argv=None):
                 os.close(fd)
             except OSError:
                 pass
-    print("ci-sweep-target: target={} cap={} before={} after={} removed={}{}".format(
-        real_target, args.max_bytes, before, remaining, removed,
+    print("ci-sweep-target: target={} cap={} before={} after={} removed={} freed={}{}".format(
+        real_target, args.max_bytes, before, remaining, removed, before - remaining,
         " (dry-run)" if args.dry_run else ""))
     return code
 

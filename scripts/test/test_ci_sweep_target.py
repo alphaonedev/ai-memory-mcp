@@ -575,5 +575,123 @@ class DeepEntrySkippedTests(SweepTestCase):
             resource.setrlimit(resource.RLIMIT_NOFILE, old)
 
 
+def tree_bytes(path):
+    """Bytes the sweep counts under ``path``: lstat size of every file and directory."""
+    total = os.lstat(str(path)).st_size
+    for dirpath, dirnames, filenames in os.walk(str(path)):
+        for name in dirnames + filenames:
+            total += os.lstat(os.path.join(dirpath, name)).st_size
+    return total
+
+
+def summary_field(stdout, key):
+    for token in stdout.split():
+        if token.startswith(key + "="):
+            return int(token.split("=", 1)[1])
+    raise AssertionError("no {} in {!r}".format(key, stdout))
+
+
+class PartialDeleteTests(SweepTestCase):
+    """#7160 S9 / code F2: an entry that cannot be emptied is kept whole, and the summary is true."""
+
+    FILES = 40
+    FILE_BYTES = 100
+
+    def make_pkg(self, locked_names, mode):
+        pkg = self.debug / "build" / "pkg"
+        pkg.mkdir(parents=True)
+        for idx in range(self.FILES):
+            (pkg / "f{:02d}".format(idx)).write_bytes(b"x" * self.FILE_BYTES)
+        for name in locked_names:
+            sub = pkg / name
+            sub.mkdir()
+            (sub / "inner").write_bytes(b"z" * 10)
+            sub.chmod(mode)
+            self.locked.append(sub)
+        return pkg
+
+    def count_files(self, pkg):
+        return len([n for n in os.listdir(str(pkg)) if n.startswith("f")])
+
+    @unittest.skipIf(os.geteuid() == 0, "root can unlink inside a read-only directory")
+    def test_entry_with_read_only_nested_dir_is_kept_whole_7160_s9(self):
+        pkg = self.make_pkg(["a-ro", "m-ro", "zz-ro"], 0o555)
+        expected = tree_bytes(pkg)
+        res = self.run_sweep("--max-bytes", "1")
+        self.assertEqual(res.returncode, EXIT_OK, res.stderr)
+        self.assertEqual(self.count_files(pkg), self.FILES)
+        self.assertTrue((pkg / "m-ro" / "inner").exists())
+        self.assertIn("cannot remove {}".format(pkg), res.stderr)
+        self.assertEqual(res.stderr.count("cannot remove"), 1, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertEqual(summary_field(res.stdout, "before"), expected)
+        self.assertEqual(summary_field(res.stdout, "after"), expected)
+        self.assertEqual(summary_field(res.stdout, "removed"), 0)
+        self.assertEqual(summary_field(res.stdout, "freed"), 0)
+
+    @unittest.skipIf(os.geteuid() == 0, "root can read a mode-000 directory")
+    def test_entry_with_unreadable_nested_dir_is_kept_whole_7160_s9(self):
+        for position, name in enumerate(["a-locked", "m-locked", "zz-locked"]):
+            with self.subTest(name=name):
+                for locked in self.locked:
+                    locked.chmod(0o755)
+                self.locked = []
+                shutil.rmtree(str(self.debug / "build"), ignore_errors=True)
+                pkg = self.make_pkg([name], 0)
+                res = self.run_sweep("--max-bytes", "1")
+                self.assertEqual(res.returncode, EXIT_OK, res.stderr)
+                self.assertEqual(self.count_files(pkg), self.FILES)
+                self.assertIn("cannot remove {}".format(pkg), res.stderr)
+                self.assertNotIn("Traceback", res.stderr)
+                self.assertEqual(summary_field(res.stdout, "removed"), 0)
+                self.assertEqual(summary_field(res.stdout, "freed"), 0)
+                self.assertEqual(summary_field(res.stdout, "before"),
+                                 summary_field(res.stdout, "after"))
+
+    @unittest.skipIf(os.geteuid() == 0, "root can unlink inside a read-only directory")
+    def test_kept_entry_does_not_stop_other_entries_7160_s9(self):
+        pkg = self.make_pkg(["m-ro"], 0o555)
+        os.utime(str(pkg), (1, 1))
+        plain = self.make_entries(2)
+        res = self.run_sweep("--max-bytes", "1")
+        self.assertEqual(res.returncode, EXIT_OK, res.stderr)
+        self.assertEqual(self.count_files(pkg), self.FILES)
+        self.assertFalse(any(path.exists() for path in plain))
+        self.assertEqual(summary_field(res.stdout, "removed"), 2)
+        self.assertEqual(summary_field(res.stdout, "freed"), 2 * ENTRY_BYTES)
+
+    def test_summary_reports_bytes_really_deleted_after_a_failed_removal_7160_f2(self):
+        module = load_script_module()
+        pkg = self.debug / "build" / "pkg"
+        for idx in range(20):
+            write_blob(pkg / "f{:02d}".format(idx))
+        real_unlink = os.unlink
+        calls = []
+
+        def flaky_unlink(name, *args, **kwargs):
+            if len(calls) == 9:
+                raise PermissionError(13, "Permission denied", name)
+            calls.append(name)
+            return real_unlink(name, *args, **kwargs)
+
+        out = io.StringIO()
+        err = io.StringIO()
+        with mock.patch.object(os, "unlink", flaky_unlink), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            rc = module.main(["--target", str(self.target), "--max-bytes", "1",
+                              "--allow-root"])
+        self.assertEqual(rc, EXIT_OK, err.getvalue())
+        self.assertEqual(self.count_files_in(pkg), 11)
+        self.assertEqual(summary_field(out.getvalue(), "removed"), 0)
+        self.assertEqual(summary_field(out.getvalue(), "freed"), 9 * ENTRY_BYTES)
+        self.assertEqual(summary_field(out.getvalue(), "after"),
+                         summary_field(out.getvalue(), "before") - 9 * ENTRY_BYTES)
+        self.assertIn("cannot remove {}".format(pkg), err.getvalue())
+
+    @staticmethod
+    def count_files_in(path):
+        return len(os.listdir(str(path)))
+
+
 if __name__ == "__main__":
     unittest.main()
