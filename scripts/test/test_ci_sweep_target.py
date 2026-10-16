@@ -387,6 +387,43 @@ class TargetWalkTests(SweepTestCase):
             self.assertNotIn("replaced", result.stderr)
         self.assertTrue(not_dir.exists())
 
+    def test_parent_opens_use_o_path_flags_7160_s7(self):
+        """Only the listed directories are opened readable; every parent uses PARENT_OPEN_FLAGS."""
+        self.make_entries(2)
+        module = load_script_module()
+        want_parent = getattr(os, "O_PATH", 0) | os.O_NOFOLLOW | os.O_DIRECTORY
+        self.assertEqual(module.PARENT_OPEN_FLAGS, want_parent)
+        real_open = os.open
+        opened = []
+
+        def recording_open(path, flags, *args, **kwargs):
+            opened.append((str(path), flags))
+            return real_open(path, flags, *args, **kwargs)
+
+        out = io.StringIO()
+        with mock.patch.object(module.os, "open", recording_open), \
+                contextlib.redirect_stdout(out):
+            rc = module.main(["--target", str(self.target), "--max-bytes", "1",
+                              "--allow-root"])
+        self.assertEqual(rc, EXIT_OK)
+        by_name = dict(opened)
+        for parent in (os.sep, "debug") + tuple(
+                part for part in os.path.realpath(str(self.target)).split(os.sep) if part):
+            self.assertEqual(by_name[parent], want_parent, parent)
+        self.assertEqual(by_name["deps"], module.OPEN_DIR_FLAGS)
+
+    def test_search_only_parent_is_swept_7160_s7(self):
+        if not hasattr(os, "O_PATH"):
+            self.skipTest("os.O_PATH is unavailable on this platform (macOS): every "
+                          "parent of the target must be readable, as documented")
+        self.make_entries(3)
+        self.workspace.chmod(0o311)
+        self.locked.append(self.workspace)
+        canonical = Path(os.path.realpath(str(self.target)))
+        result = self.run_sweep("--max-bytes", "1", "--allow-root", target=canonical)
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        self.assertIn("removed=3", result.stdout)
+
     def test_allow_root_accepts_canonical_target(self):
         self.make_entries(3)
         canonical = Path(os.path.realpath(str(self.target)))
