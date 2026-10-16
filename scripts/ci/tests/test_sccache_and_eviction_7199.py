@@ -27,6 +27,7 @@ import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[3]
 SCRATCH = REPO / ".local-runs" / "sccache-evict-7199"
@@ -58,6 +59,8 @@ if sys.argv[1:] == ["--show-stats"]:
 DAY = 86400
 GIB = 1024 ** 3
 ME = "f2-linux-fed"
+REAL_RMTREE = shutil.rmtree
+prune_other_targets_real = prune.other_targets
 
 
 def make_target(root, name, age_days):
@@ -307,20 +310,59 @@ class Eviction(unittest.TestCase):
         self.evict(self.starved)
         self.assertTrue(odd.exists() and stray.exists())
 
-    def test_root_outside_home_or_relative_is_refused(self):
-        outside = SCRATCH / "elsewhere"
-        make_target(outside, "r1", 30)
-        with redirect_stderr(io.StringIO()):
-            rc, _ = self.evict(self.starved, root=outside)
-            self.assertEqual(rc, prune.EXIT_OK)
-            self.assertTrue((outside / "r1").exists())
-            rc, _ = self.evict(self.starved, root=Path("rel/root"))
-            self.assertEqual(rc, prune.EXIT_OK)
+    def assert_refused(self, root, sentinel=None, stub_delete=False):
+        """Eviction on ``root`` must print ``skipping eviction:`` and delete nothing (#7291).
 
-    def test_home_itself_or_filesystem_root_is_refused(self):
-        with redirect_stderr(io.StringIO()):
-            self.assertEqual(self.evict(self.starved, root=self.home)[0], prune.EXIT_OK)
-            self.assertEqual(self.evict(self.starved, root=Path("/"))[0], prune.EXIT_OK)
+        ``stub_delete`` is for a path that is not ours to build a tree under (a
+        relative path, ``/``): other_targets and shutil.rmtree are stubbed, so a
+        regressed guard calls the stub, which fails the assertion without
+        touching the live filesystem.
+        """
+        err = io.StringIO()
+        with mock.patch.object(prune, "other_targets", return_value=[Path("victim-7291")]) as listing, \
+                mock.patch.object(prune.shutil, "rmtree") as rmtree, \
+                redirect_stderr(err):
+            if not stub_delete:
+                listing.side_effect = prune_other_targets_real
+                rmtree.side_effect = REAL_RMTREE
+            rc, _ = self.evict(self.starved, root=root)
+        self.assertEqual(rc, prune.EXIT_OK)
+        self.assertIn("skipping eviction:", err.getvalue())
+        rmtree.assert_not_called()
+        if sentinel is not None:
+            self.assertTrue(sentinel.exists(), "a sibling under a refused root must survive")
+        return err.getvalue()
+
+    def test_root_outside_home_is_refused_and_sibling_survives(self):
+        outside = SCRATCH / "elsewhere"
+        sibling = make_target(outside, "r1", 30)
+        text = self.assert_refused(outside, sentinel=sibling)
+        self.assertIn("not under the home", text)
+
+    def test_relative_root_is_refused_without_deleting(self):
+        text = self.assert_refused(Path("rel/root"), stub_delete=True)
+        self.assertIn("absolute", text)
+
+    def test_home_itself_is_refused_and_sibling_survives(self):
+        sibling = make_target(self.home, "r2", 30)
+        text = self.assert_refused(self.home, sentinel=sibling)
+        self.assertIn("home itself", text)
+
+    def test_filesystem_root_is_refused_without_touching_the_live_root(self):
+        # Never hand the live filesystem root to a deleting call: the guard is
+        # asserted directly and the evict call runs with the deletes stubbed.
+        fs_root = Path(os.sep)
+        self.assertIsNotNone(prune.eviction_problem(fs_root, ME, self.home))
+        self.assertIsNotNone(prune.eviction_problem(self.home, ME, fs_root))
+        self.assert_refused(fs_root, stub_delete=True)
+
+    def test_refusal_assertions_go_red_when_the_guard_is_stubbed_out(self):
+        # R6: with eviction_problem stubbed to "safe", the refusal helper must fail.
+        outside = SCRATCH / "elsewhere"
+        sibling = make_target(outside, "r1", 30)
+        with mock.patch.object(prune, "eviction_problem", return_value=None):
+            with self.assertRaises(AssertionError):
+                self.assert_refused(outside, sentinel=sibling)
 
     def test_cli_requires_runner_name_with_evict_root(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -405,11 +447,8 @@ class Eviction(unittest.TestCase):
         # LOW 5: ~/.cache is under the home but is not the runner target root.
         cache = self.home / ".cache"
         pip = make_target(cache, "pip", 30)
-        with redirect_stderr(io.StringIO()) as err:
-            rc, _ = self.evict(self.starved, root=cache)
-        self.assertEqual(rc, prune.EXIT_OK)
-        self.assertTrue(pip.exists())
-        self.assertIn("runner target root", err.getvalue())
+        text = self.assert_refused(cache, sentinel=pip)
+        self.assertIn("runner target root", text)
 
     def test_shared_literals_are_imported_not_duplicated(self):
         # LOW 6: one definition of the runner-name rules.
