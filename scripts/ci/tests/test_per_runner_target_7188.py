@@ -229,6 +229,23 @@ def prove_defect():
     return 0 if ran == {"B"} else 1
 
 
+class WorkflowNoExpressionInRun(unittest.TestCase):
+    """r3 F2: no ${{ expression is spliced into a ``run:`` script."""
+
+    def step_run(self, name):
+        ci = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        body = ci.split(name, 1)[1]
+        return [ln for ln in body.splitlines() if ln.strip().startswith("run:")][0]
+
+    def test_per_runner_target_step_has_no_expression_in_run(self):
+        run = self.step_run("Per-runner cargo target (#7188)")
+        self.assertNotIn("${{", run)
+        self.assertIn("RUNNER_NAME_ARG", run)
+
+    def test_prune_step_has_no_expression_in_run(self):
+        self.assertNotIn("${{", self.step_run("Prune stale runner artifacts (#7188)"))
+
+
 if __name__ == "__main__":
     if PROVE_FLAG in sys.argv:
         sys.exit(prove_defect())

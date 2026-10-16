@@ -869,7 +869,9 @@ jobs:
       # Self-hosted legs only (matrix.shared_target).
       - name: Per-runner cargo target (#7188)
         if: needs.classify.outputs.docs_only != 'true' && matrix.shared_target
-        run: python3 scripts/ci/shared_cargo_target.py --github-env "$GITHUB_ENV" --runner-name "${{ runner.name }}"
+        env:
+          RUNNER_NAME_ARG: ${{ runner.name }}
+        run: python3 scripts/ci/shared_cargo_target.py --github-env "$GITHUB_ENV" --runner-name "$RUNNER_NAME_ARG"
 
       # #7199 - sccache for the self-hosted Linux enterprise-fed leg. Each runner
       # compiles into its own ~160 GiB target (#7188), so a cross-runner compile
@@ -1984,13 +1986,16 @@ jobs:
 
       - name: sccache stop CI server (#7199)
         if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.docs_only != 'true'
-        run: python3 scripts/ci/sccache_env.py --stop --runner-name "${{ runner.name }}"
+        env:
+          RUNNER_NAME_ARG: ${{ runner.name }}
+        run: python3 scripts/ci/sccache_env.py --stop --runner-name "$RUNNER_NAME_ARG"
 
       # #7188 - post-job cleanup on the self-hosted legs: prune stale per-job
       # artifacts (leftover .tmp* dirs, workspace incremental state, old
       # runner _temp entries) so an idle runner holds no stale scratch. The
       # prune pass NEVER touches the per-runner cargo target root (the helper
-      # refuses any path in, at or above it) and never fails the job. always()
+      # refuses any path in, at or above it) and a failed removal exits 0. Skipped
+      # for fork PRs (refused above, no checkout ran). always()
       # so a failed or cancelled run is pruned too.
       # #7199 - after the prune, this runner clears its in-use marker and evicts
       # OTHER runners' targets only when idle: no fresh in-use marker, no write
@@ -1999,8 +2004,10 @@ jobs:
       # Never this runner's target, never outside the root shared_cargo_target.py
       # computes, never through a symlink. Bad arguments are refused with exit 2.
       - name: Prune stale runner artifacts (#7188)
-        if: always() && matrix.shared_target && needs.classify.outputs.docs_only != 'true'
-        run: python3 scripts/ci/prune_runner_artifacts.py --work-root "$RUNNER_WORKSPACE/.." --workspace "$GITHUB_WORKSPACE" --protected-root "$AI_MEMORY_CI_TARGET_ROOT" --evict-root "$AI_MEMORY_CI_TARGET_ROOT" --runner-name "${{ runner.name }}"
+        if: always() && matrix.shared_target && needs.classify.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          RUNNER_NAME_ARG: ${{ runner.name }}
+        run: python3 scripts/ci/prune_runner_artifacts.py --work-root "$RUNNER_WORKSPACE/.." --workspace "$GITHUB_WORKSPACE" --protected-root "$AI_MEMORY_CI_TARGET_ROOT" --evict-root "$AI_MEMORY_CI_TARGET_ROOT" --runner-name "$RUNNER_NAME_ARG"
 
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
   #

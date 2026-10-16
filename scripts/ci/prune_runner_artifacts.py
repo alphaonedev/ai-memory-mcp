@@ -11,8 +11,12 @@ It NEVER removes the per-runner cargo target ROOT (``--protected-root``,
 ``~/.cache/ai-memory-ci/cargo-target``) nor any path inside it (every runner's
 target, so one runner's prune can never delete a sibling's) or above it; ``is_protected`` is checked on every candidate and
 again immediately before each removal. Symlinks are never followed or deleted
-(each one met is reported as skipped) and every removal must resolve inside the
-work root. Use ``--dry-run`` to list only.
+(each one met is reported as skipped; there is no os.walk, only is_symlink checks
+and shutil.rmtree, which unlinks a symlink met inside a tree without entering it
+and refuses a symlink given as the root) and every removal must resolve inside the
+work root. A protected root whose realpath is outside the work root (a symlinked
+cargo-target on fed runners) is unreachable by a prune confined to the work root,
+so it is logged and ignored, not refused. Use ``--dry-run`` to list only.
 
 Idle-target eviction (#7199, ``--evict-root`` + ``--runner-name``) runs AFTER the
 prune. Under the per-runner target root it deletes every OTHER runner's target
@@ -29,7 +33,8 @@ shared_cargo_target.py computes for the home. This runner's own in-use marker
 is cleared first. One line is printed per eviction plus a summary line; a
 floor that cannot be met prints a ``::warning::`` line.
 
-Exit codes: 0 ok, 2 bad arguments. A failed removal is reported and counted but
+Exit codes: 0 ok, 2 bad arguments (only validate_arguments, which also checks the
+eviction arguments). A failed removal is reported and counted but
 does not fail the post-job step (exit stays 0): cleanup must never red a job.
 Python 3.9+, standard library only.
 """
@@ -54,6 +59,7 @@ BUSY_MTIME_MINUTES = 30
 SECS_PER_MINUTE = 60
 # Cap on entries visited when looking for a recent write or ranking a target.
 WALK_ENTRY_CAP = 200_000
+MIN_WORK_ROOT_COMPONENTS = 2
 EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_BAD_ARGS = EXIT_USAGE
@@ -65,8 +71,24 @@ def resolve(path):
 
 def is_protected(candidate, protected_root):
     """True if ``candidate`` is, is inside, or contains the protected root."""
-    cand = resolve(candidate)
-    protected = resolve(protected_root)
+    # r3 F1: an unknown state (loop, vanished or unreadable path) is protected.
+    try:
+        cand = resolve(candidate)
+        protected = resolve(protected_root)
+        if _covers(cand, protected):
+            return True
+        # A direct child of the root may be a link that resolves elsewhere
+        # (including back into the work root); its target is protected too.
+        try:
+            children = list(Path(protected_root).iterdir())
+        except (FileNotFoundError, NotADirectoryError):
+            return False  # no such root yet: it has no children to protect
+        return any(_covers(cand, resolve(child)) for child in children)
+    except (OSError, RuntimeError):
+        return True
+
+
+def _covers(cand, protected):
     return cand == protected or protected in cand.parents or cand in protected.parents
 
 
@@ -77,6 +99,38 @@ def is_within(path, root):
     except ValueError:
         return False
     return True
+
+
+def has_symlink_below(path, root):
+    """True if ``path`` is not lexically below ``root`` or any component below it is a symlink."""
+    base = Path(os.path.abspath(root))
+    try:
+        rel = Path(os.path.abspath(path)).relative_to(base)
+    except ValueError:
+        return True
+    current = base
+    for part in rel.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def remove_candidate(path, work_root, protected_root):
+    """Delete one candidate; return ``(status, reason)``, status removed or skipped.
+
+    F2: re-check right before deleting, then delete the RESOLVED path, never a
+    path that could be (or traverse) a symlink.
+    """
+    if has_symlink_below(path, work_root):
+        return "skipped", "symlink in path chain"
+    real = resolve(path)
+    if real.is_symlink() or not real.is_dir():
+        return "skipped", "not a plain directory"
+    if is_protected(real, protected_root) or not is_within(real, work_root):
+        return "skipped", "protected or outside root"
+    shutil.rmtree(real)
+    return "removed", None
 
 
 def is_old(path, max_age_days, now):
@@ -105,22 +159,38 @@ def scan(work_root, workspace, protected_root, max_age_days, now):
                 break
         else:
             found.append(current)
-        for entry in sorted(workspace.iterdir()):
+        try:
+            entries = sorted(workspace.iterdir())
+        except OSError as err:
+            print("could not list %s: %s" % (workspace, err), file=sys.stderr)
+            entries = []
+        for entry in entries:
             if not entry.name.startswith(TMP_PREFIX):
                 continue
-            if entry.is_symlink():
-                skipped.append(entry)
-            elif entry.is_dir():
-                found.append(entry)
+            try:
+                if entry.is_symlink():
+                    skipped.append(entry)
+                elif entry.is_dir():
+                    found.append(entry)
+            except OSError as err:
+                print("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
     temp_root = Path(work_root) / TEMP_DIR_NAME
     if temp_root.is_symlink():
         skipped.append(temp_root)
     elif temp_root.is_dir():
-        for entry in sorted(temp_root.iterdir()):
-            if entry.is_symlink():
-                skipped.append(entry)
-            elif entry.is_dir() and is_old(entry, max_age_days, now):
-                found.append(entry)
+        try:
+            entries = sorted(temp_root.iterdir())
+        except OSError as err:
+            print("could not list %s: %s" % (temp_root, err), file=sys.stderr)
+            entries = []
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    skipped.append(entry)
+                elif entry.is_dir() and is_old(entry, max_age_days, now):
+                    found.append(entry)
+            except OSError as err:
+                print("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
     keep = [path for path in found if not is_protected(path, protected_root)]
     return keep, skipped
 
@@ -134,13 +204,15 @@ def is_filesystem_root(path):
     return path == path.parent
 
 
-def validate_arguments(work_root, workspace, protected_root):
+def validate_arguments(work_root, workspace, protected_root, evict_root=None,
+                       runner_name=None, home=None):
     """Return a refusal reason, or None when the arguments are safe to act on.
 
-    Refused: a work root that is a filesystem root, missing or not a directory;
-    an empty or relative protected root; a protected root neither inside nor
-    beside the work root (no common ancestor below the filesystem root); a
-    workspace that does not resolve inside the work root.
+    Refused: a work root that is a filesystem root, has fewer than two path
+    components, is missing or not a directory; an empty or relative protected
+    root; a protected root that is the work root or one of its ancestors; a
+    workspace that does not resolve inside the work root. A protected root whose
+    realpath is outside the work root is NOT refused (see ``is_out_of_tree``).
     """
     if not str(work_root).strip():
         return "empty work root"
@@ -153,14 +225,17 @@ def validate_arguments(work_root, workspace, protected_root):
         return "empty protected root"
     if not Path(protected_root).is_absolute():
         return "protected root must be an absolute path"
+    if len(root.parts) - 1 < MIN_WORK_ROOT_COMPONENTS:
+        return "work root has fewer than %d path components" % MIN_WORK_ROOT_COMPONENTS
     protected = resolve(protected_root)
-    if is_filesystem_root(protected):
-        return "protected root is a filesystem root"
-    common = [p for p in root.parents if p in protected.parents or p == protected]
-    if not is_within(protected, root) and not any(not is_filesystem_root(p) for p in common):
-        return "protected root is neither inside nor beside the work root"
+    if protected == root or protected in root.parents:
+        return "protected root is the work root or one of its ancestors"
     if not is_within(workspace, root):
         return "workspace is not inside the work root"
+    if evict_root:
+        # #7199: the eviction arguments are validated here, with the prune
+        # arguments, so EXIT_USAGE has one source.
+        return eviction_problem(evict_root, runner_name, home)
     return None
 
 
@@ -206,18 +281,28 @@ def newest_mtime(path, newer_than=None, max_entries=None):
     if newer_than is not None and newest > newer_than:
         return newest
     seen = 0
-    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
-        for name in dirnames + filenames:
+    pending = [str(path)]
+    while pending:
+        current = pending.pop()
+        try:
+            with os.scandir(current) as scan_it:
+                entries = list(scan_it)
+        except OSError:
+            continue  # unreadable directory: skip it, the caller treats the rest as is
+        for entry in entries:
             seen += 1
             if max_entries is not None and seen > max_entries:
                 return newest
             try:
-                stamp = os.lstat(os.path.join(dirpath, name)).st_mtime
+                stamp = entry.stat(follow_symlinks=False).st_mtime
+                is_real_dir = entry.is_dir(follow_symlinks=False)
             except OSError:
                 continue
             newest = max(newest, stamp)
             if newer_than is not None and newest > newer_than:
                 return newest
+            if is_real_dir:
+                pending.append(entry.path)
     return newest
 
 
@@ -242,8 +327,8 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
     """Evict idle (then, below the free floor, oldest) other-runner targets."""
     problem = eviction_problem(evict_root, runner_name, home)
     if problem:
-        print("prune_runner_artifacts: refusing eviction: %s" % problem, file=sys.stderr)
-        return EXIT_USAGE
+        print("prune_runner_artifacts: skipping eviction: %s" % problem, file=sys.stderr)
+        return EXIT_OK
     base = resolve(evict_root)
     if not base.is_dir():
         print("eviction summary: 0 evicted, root %s does not exist" % evict_root)
@@ -255,9 +340,13 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
 
     def is_busy(path):
         """True while a fresh in-use marker or a recent write says a job uses it."""
-        if shared.marker_is_fresh(path, now):
+        # r3 F1: an unreadable target (any OSError) counts as busy, never evicted.
+        try:
+            if shared.marker_is_fresh(path, now):
+                return True
+            return newest_mtime(path, newer_than=busy_cutoff, max_entries=WALK_ENTRY_CAP) > busy_cutoff
+        except (OSError, RuntimeError):
             return True
-        return newest_mtime(path, newer_than=busy_cutoff, max_entries=WALK_ENTRY_CAP) > busy_cutoff
 
     def remove(path, reason):
         if path.is_symlink() or path.parent != base:
@@ -282,13 +371,23 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
 
     remaining = []
     for entry in other_targets(base, runner_name):
-        if newest_mtime(entry, newer_than=cutoff) <= cutoff:
+        try:
+            idle = newest_mtime(entry, newer_than=cutoff) <= cutoff
+        except OSError as err:
+            print("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
+            continue
+        if idle:
             remove(entry, "idle over %d days" % idle_days)
         else:
             remaining.append(entry)
     if free_bytes(base) < floor_bytes:
-        ranked = sorted((newest_mtime(entry, max_entries=WALK_ENTRY_CAP), entry)
-                        for entry in remaining)
+        ranked = []
+        for entry in remaining:
+            try:
+                ranked.append((newest_mtime(entry, max_entries=WALK_ENTRY_CAP), entry))
+            except OSError as err:
+                print("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
+        ranked.sort()
         for _, entry in ranked:
             if not dry_run and free_bytes(base) >= floor_bytes:
                 break
@@ -300,6 +399,11 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
         state["evicted"], state["failed"], state["busy"],
         free_bytes(base) // BYTES_PER_GIB, floor_gib))
     return EXIT_OK
+
+
+def is_out_of_tree(work_root, protected_root):
+    """True if the protected root resolves outside the work root (and is not above it)."""
+    return not is_within(protected_root, work_root)
 
 
 def build_parser():
@@ -317,21 +421,8 @@ def build_parser():
     return parser
 
 
-def main(argv=None):
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if args.max_age_days < 1:
-        parser.error("--max-age-days must be >= 1")
-    if args.evict_root and not args.runner_name:
-        parser.error("--evict-root requires --runner-name")
-    if args.idle_target_days < 1 or args.free_floor_gib < 0:
-        parser.error("--idle-target-days must be >= 1 and --free-floor-gib >= 0")
-    problem = validate_arguments(args.work_root, args.workspace, args.protected_root)
-    if not problem and args.evict_root:
-        problem = eviction_problem(args.evict_root, args.runner_name, args.home)
-    if problem:
-        print("prune_runner_artifacts: refusing: %s" % problem, file=sys.stderr)
-        return EXIT_USAGE
+def prune_all(args):
+    """Scan and remove; return the number of failed removals."""
     failures = 0
     candidates, skipped = scan(
         args.work_root, args.workspace, args.protected_root, args.max_age_days, time.time()
@@ -348,19 +439,54 @@ def main(argv=None):
             print("would remove %s" % path)
             continue
         try:
-            shutil.rmtree(path)
-            print("removed %s" % path)
-        except OSError as err:
+            status, why = remove_candidate(path, args.work_root, args.protected_root)
+            if status == "removed":
+                print("removed %s" % path)
+            else:
+                print("skipped %s: %s" % (path, why))
+        except (OSError, RuntimeError) as err:
             failures += 1
             print("could not remove %s: %s" % (path, err), file=sys.stderr)
+    return failures
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.max_age_days < 1:
+        parser.error("--max-age-days must be >= 1")
+    if args.evict_root and not args.runner_name:
+        parser.error("--evict-root requires --runner-name")
+    if args.idle_target_days < 1 or args.free_floor_gib < 0:
+        parser.error("--idle-target-days must be >= 1 and --free-floor-gib >= 0")
+    problem = validate_arguments(
+        args.work_root, args.workspace, args.protected_root,
+        args.evict_root, args.runner_name, args.home,
+    )
+    if problem:
+        print("prune_runner_artifacts: refusing: %s" % problem, file=sys.stderr)
+        return EXIT_USAGE
+    if is_out_of_tree(args.work_root, args.protected_root):
+        print("protected root %s is outside the work root; nothing to protect" % args.protected_root)
+    failures = 0
+    try:
+        failures = prune_all(args)
+    except (OSError, RuntimeError) as err:
+        # r3 F1: fail closed on deletion, soft on the exit code.
+        failures += 1
+        print("prune_runner_artifacts: aborted: %s" % err, file=sys.stderr)
     if failures:
         print("prune_runner_artifacts: %d removal(s) failed" % failures, file=sys.stderr)
     if args.evict_root:
-        shared.clear_in_use_marker(Path(args.evict_root) / args.runner_name)
-        return evict_idle_targets(
-            args.evict_root, args.runner_name, args.home, args.idle_target_days,
-            args.free_floor_gib, time.time(), dry_run=args.dry_run,
-        )
+        # #7199 + r3 F1: eviction never reds the job; an error is reported.
+        try:
+            shared.clear_in_use_marker(Path(args.evict_root) / args.runner_name)
+            evict_idle_targets(
+                args.evict_root, args.runner_name, args.home, args.idle_target_days,
+                args.free_floor_gib, time.time(), dry_run=args.dry_run,
+            )
+        except (OSError, RuntimeError) as err:
+            print("prune_runner_artifacts: eviction aborted: %s" % err, file=sys.stderr)
     return EXIT_OK
 
 

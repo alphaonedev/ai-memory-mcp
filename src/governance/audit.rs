@@ -2966,11 +2966,7 @@ pub fn watermark_emission_due(head_sequence: i64) -> bool {
 /// Lock-free throttle via a compare-and-swap on [`LAST_WATERMARKED_SEQ`];
 /// concurrent callers crossing the same interval boundary collapse to a
 /// single emission.
-pub fn maybe_record_audit_watermark(
-    head_sequence: i64,
-    head_canonical_hash: &str,
-    db_id: Option<&str>,
-) {
+pub fn maybe_record_audit_watermark(head_sequence: i64, head_canonical_hash: &str, db_id: &str) {
     if head_sequence <= 0 {
         return;
     }
@@ -2986,7 +2982,24 @@ pub fn maybe_record_audit_watermark(
     {
         return;
     }
-    record_audit_watermark(head_sequence, head_canonical_hash, db_id);
+    record_audit_watermark(head_sequence, head_canonical_hash, Some(db_id));
+}
+
+/// Set once the "no genesis row, watermark skipped" warning has been logged.
+static WATERMARK_SKIP_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// #7228 - a store with no genesis row has no `db_id`, and a db_id-less
+/// (legacy) watermark is counted against EVERY opener of the shared sink, so
+/// the writers skip the emission instead of anchoring an unattributable head.
+/// Logs a single WARN per process (the skip repeats on every append past the
+/// interval until the genesis row exists).
+pub fn warn_watermark_skipped_no_genesis() {
+    if !WATERMARK_SKIP_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "audit watermark skipped: this database has no genesis row, so the anchor would \
+             carry no db_id (#7228)"
+        );
+    }
 }
 
 /// Forensic directory of the live sink, if [`init`] has run.
