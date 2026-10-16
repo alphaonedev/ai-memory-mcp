@@ -420,8 +420,13 @@ def remove_deep_chain(parent, name, depth):
                 fds.append(os.open("d", DIR_FLAGS, dir_fd=fds[-1]))
             except FileNotFoundError:
                 break
-        for idx in range(len(fds) - 1, 0, -1):
-            os.rmdir("d", dir_fd=fds[idx - 1])
+        for idx in range(len(fds) - 1, -1, -1):
+            try:
+                os.unlink("f", dir_fd=fds[idx])
+            except FileNotFoundError:
+                pass
+            if idx:
+                os.rmdir("d", dir_fd=fds[idx - 1])
     finally:
         for fd in fds:
             os.close(fd)
@@ -452,6 +457,71 @@ class DeepTreeTests(SweepTestCase):
             self.assertIn("ci-sweep-target:", out.getvalue())
         finally:
             remove_deep_chain(pkg_parent, "pkg", self.DEPTH)
+            resource.setrlimit(resource.RLIMIT_NOFILE, old)
+
+
+def make_deep_chain_with_files(parent, name, depth):
+    """Like make_deep_chain, with one small file at every level; returns the file count."""
+    os.makedirs(str(parent / name))
+    fd = os.open(str(parent / name), DIR_FLAGS)
+    count = 0
+    for _ in range(depth):
+        file_fd = os.open("f", os.O_WRONLY | os.O_CREAT, 0o644, dir_fd=fd)
+        os.write(file_fd, b"0123456789")
+        os.close(file_fd)
+        count += 1
+        os.mkdir("d", dir_fd=fd)
+        child = os.open("d", DIR_FLAGS, dir_fd=fd)
+        os.close(fd)
+        fd = child
+    os.close(fd)
+    return count
+
+
+def count_files(root):
+    """Count regular files under ``root`` iteratively, by descriptor (no path limit)."""
+    total = 0
+    stack = [os.open(str(root), DIR_FLAGS)]
+    while stack:
+        fd = stack.pop()
+        try:
+            with os.scandir(fd) as it:
+                children = list(it)
+            for child in children:
+                if child.is_dir(follow_symlinks=False):
+                    stack.append(os.open(child.name, DIR_FLAGS, dir_fd=fd))
+                else:
+                    total += 1
+        finally:
+            os.close(fd)
+    return total
+
+
+class DeepEntrySkippedTests(SweepTestCase):
+    """#7160 S6: an entry too deep to walk is skipped whole, never partly deleted."""
+
+    DEPTH = 1100
+
+    def test_deep_entry_is_not_partly_deleted_7160_s6(self):
+        old = raise_fd_limit(self.DEPTH + 200)
+        if old is None:
+            self.skipTest("cannot raise the descriptor limit for a deep tree")
+        build = self.debug / "build"
+        build.mkdir()
+        files = make_deep_chain_with_files(build, "pkg", self.DEPTH)
+        os.utime(str(build / "pkg"), (1, 1))
+        plain = self.make_entries(2)
+        try:
+            res = self.run_sweep("--max-bytes", "1")
+            self.assertEqual(res.returncode, EXIT_OK, res.stderr)
+            self.assertEqual(count_files(build / "pkg"), files)
+            self.assertIn("pkg", res.stderr)
+            self.assertEqual(res.stderr.count("pkg"), 1, res.stderr)
+            self.assertIn("skipped", res.stderr)
+            self.assertNotIn("Traceback", res.stderr)
+            self.assertFalse(any(path.exists() for path in plain))
+        finally:
+            remove_deep_chain(build, "pkg", self.DEPTH)
             resource.setrlimit(resource.RLIMIT_NOFILE, old)
 
 
