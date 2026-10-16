@@ -1981,11 +1981,11 @@ jobs:
       # #7199 - hit rate of the CI sccache server, then stop that server (same
       # SCCACHE_SERVER_PORT) unless a sibling runner's in-use marker is fresh.
       - name: sccache hit-rate summary (#7199)
-        if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.docs_only != 'true'
+        if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: python3 scripts/ci/sccache_env.py --stats
 
       - name: sccache stop CI server (#7199)
-        if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.docs_only != 'true'
+        if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         env:
           RUNNER_NAME_ARG: ${{ runner.name }}
         run: python3 scripts/ci/sccache_env.py --stop --runner-name "$RUNNER_NAME_ARG"
