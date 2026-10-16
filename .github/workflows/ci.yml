@@ -1828,8 +1828,8 @@ jobs:
 
       # Durable audit-history artifact (#4). Uploaded on success AND failure so
       # a red leg's full output is retrievable long after the log view expires.
-      # #7259: the runner is cargo-nextest (`--profile ci`, .config/nextest.toml),
-      # which writes target/nextest/ci/junit.xml; the #1492 watchdog, #2500
+      # #7259: the runner is cargo-nextest (`--profile ci`, .config/nextest.toml);
+      # the #1492 watchdog, #2500
       # --no-fail-fast and impact-aware dispatch keep their shape around the
       # `cargo nextest run` lines. The captured log (one PASS/FAIL line per
       # test) stays the durable record that scripts/ci/compare_test_sets.py reads.
