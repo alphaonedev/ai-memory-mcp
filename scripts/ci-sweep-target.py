@@ -10,6 +10,9 @@ oldest-mtime entries until the total is at or under ``--max-bytes``.
 Safety:
   * ``--target`` must resolve (realpath) under ``$GITHUB_WORKSPACE`` unless
     ``--allow-root`` is given (node cron); otherwise exit 2 naming the path.
+    Under ``--allow-root`` the target must already be canonical (it equals its
+    own realpath, no symlink in any component) or exit 2 ``is not a canonical
+    path``.
   * ``<target>/debug`` and the four swept directories must not be symlinks:
     otherwise exit 2 naming the path and nothing is deleted.
   * The target is opened once by a descriptor walk from ``/``: every path
@@ -326,6 +329,11 @@ def main(argv=None):
             print("refused: {} is not under {} (use --allow-root)".format(
                 real_target, WORKSPACE_ENV), file=sys.stderr)
             return EXIT_REFUSED
+    elif real_target != os.path.normpath(os.path.abspath(args.target)):
+        print("refused: {} is not a canonical path (it resolves to {}); pass the "
+              "resolved path with --allow-root".format(args.target, real_target),
+              file=sys.stderr)
+        return EXIT_REFUSED
 
     warnings = []
     handles = []
