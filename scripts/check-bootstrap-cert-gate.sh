@@ -100,24 +100,28 @@ cd "$REPO_ROOT"
 export TMPDIR="$REPO_ROOT/.local-runs/tmp"
 mkdir -p "$TMPDIR"; chmod 700 "$TMPDIR"
 
+python3 -c 'import json,sys' 2>/dev/null \
+  || { echo "INSTRUMENT ERROR: python3 is required to parse the feature probe and posture rows (#4434 #2676)"; exit 3; }
+
 # #7182 - HERMETIC config for EVERY binary invocation in the gate (certified env
 # block, LEG A, LEG B, D, E, self-test). Without these the binary reads the host
 # user config (`~/.config/ai-memory/config.toml`), which on a dev or runner host
-# can name a LIVE database. NO_CONFIG skips config loading; XDG_CONFIG_HOME is a
-# per-run empty dir under the gate's own scratch so no fallback can reach the
-# user config either.
+# can name a LIVE database. AI_MEMORY_NO_CONFIG=1 is the config fence: it makes
+# config loading return before any file is read. On Linux an empty
+# XDG_CONFIG_HOME does NOT block it, because the binary falls back to
+# `~/.config/ai-memory`. The per-run XDG_CONFIG_HOME under the gate's own scratch
+# only keeps `dirs::config_dir()` consumers (default key dir) off the user
+# profile. The dir is created after the python3 check so that early exit cannot
+# leak it; the self-test trap and the main cleanup-list both remove it.
 export AI_MEMORY_NO_CONFIG=1
 XDG_CONFIG_HOME="$TMPDIR/xdg-config-$$"
 mkdir -p "$XDG_CONFIG_HOME"; chmod 700 "$XDG_CONFIG_HOME"
 export XDG_CONFIG_HOME
 
-python3 -c 'import json,sys' 2>/dev/null \
-  || { echo "INSTRUMENT ERROR: python3 is required to parse the feature probe and posture rows (#4434 #2676)"; exit 3; }
-
 # ── --self-test: STUB binaries only, writes only inside its own temp dir ────
 if [[ $SELF_TEST -eq 1 ]]; then
   ST="$(mktemp -d)"
-  trap 'rm -rf "$ST"' EXIT
+  trap 'rm -rf "$ST" "$XDG_CONFIG_HOME"' EXIT
   ST_FAIL=0
   git_state() { git -C "$REPO_ROOT" status --porcelain 2>/dev/null | sha256sum; }
   TREE_BEFORE="$(git_state)"
