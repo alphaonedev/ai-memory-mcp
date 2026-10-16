@@ -12,11 +12,13 @@ Safety:
     ``--allow-root`` is given (node cron); otherwise exit 2 naming the path.
   * ``<target>/debug`` and the four swept directories must not be symlinks:
     otherwise exit 2 naming the path and nothing is deleted.
-  * Each swept directory is opened once (``O_NOFOLLOW | O_DIRECTORY``) and
-    every scan and every delete is relative to that handle (``dir_fd``), so a
-    directory swapped for a symlink after the scan is never followed. A swept
-    directory that is no longer the directory that was scanned is refused
-    (exit 2) before anything is deleted from it.
+  * The target is opened once by a descriptor walk from ``/``: every path
+    component (target, ``debug``, each swept directory) is opened relative to
+    its parent with ``O_NOFOLLOW | O_DIRECTORY``, and every scan and every
+    delete is relative to those handles (``dir_fd``). No path is looked up
+    twice, so a component swapped for a symlink before the open, after the scan
+    or during removal is never followed. A component that is no longer the
+    directory that was opened is refused (exit 2) before anything is deleted.
   * Symlink entries inside a swept directory are unlinked, never descended.
   * Nothing outside the four directories is read for sizing or deleted.
   * An unreadable directory or entry, or a tree too deep to walk (a
@@ -63,13 +65,22 @@ class Refused(Exception):
 
 
 class SweptDir(object):
-    """An open swept directory: its path, handle and the identity it had at open."""
+    """An open directory: its path, handle and the identity it had at open.
 
-    def __init__(self, path, fd, dev, ino):
+    ``parent_fd`` and ``name`` say how it was reached (``None`` for ``/``);
+    ``chain`` lists every held directory from ``/`` down to this one, so the
+    whole walk can be re-checked through descriptors, never through a path.
+    """
+
+    def __init__(self, path, fd, parent_fd, name, chain):
+        opened = os.fstat(fd)
         self.path = path
         self.fd = fd
-        self.dev = dev
-        self.ino = ino
+        self.parent_fd = parent_fd
+        self.name = name
+        self.dev = opened.st_dev
+        self.ino = opened.st_ino
+        self.chain = chain + [self]
 
 
 def open_dir(name, dir_fd=None):
@@ -118,55 +129,82 @@ def is_under(path, root):
         return False
 
 
-def open_swept_dirs(target, warnings, handles):
-    """Open the existing swept directories; raise Refused on any symlink.
+def open_target(real_target, warnings, handles):
+    """Open ``real_target`` by walking it from ``/`` one component at a time.
 
-    Every opened descriptor is appended to ``handles`` for the caller to close.
+    Each component is opened relative to its parent with ``O_NOFOLLOW |
+    O_DIRECTORY``, so a component swapped for a symlink (or any non-directory)
+    after the realpath check is refused, never followed. Returns the held
+    ``SweptDir`` for the target, or ``None`` when the target does not exist or
+    cannot be read (the latter is also appended to ``warnings``).
     """
-    debug_path = os.path.join(target, DEBUG_DIR_NAME)
-    try:
-        debug_st = os.lstat(debug_path)
-    except FileNotFoundError:
-        return []
-    except OSError as exc:
-        warnings.append("cannot read {}: {}".format(debug_path, exc))
-        return []
-    if stat.S_ISLNK(debug_st.st_mode):
-        raise Refused("{} is a symlink".format(debug_path))
-    if not stat.S_ISDIR(debug_st.st_mode):
-        return []
-    try:
-        debug_fd = open_dir(debug_path)
-    except OSError as exc:
-        if exc.errno in SWAPPED_ERRNOS:
-            raise Refused("{} is a symlink".format(debug_path))
-        warnings.append("cannot read {}: {}".format(debug_path, exc))
-        return []
-    handles.append(debug_fd)
-    found = []
-    for sub in SWEPT_SUBDIRS:
-        path = os.path.join(debug_path, sub)
+    root_fd = open_dir(os.sep)
+    handles.append(root_fd)
+    held = SweptDir(os.sep, root_fd, None, None, [])
+    path = os.sep
+    for component in [part for part in real_target.split(os.sep) if part]:
+        path = os.path.join(path, component)
         try:
-            st = os.lstat(sub, dir_fd=debug_fd)
+            fd = open_dir(component, held.fd)
         except FileNotFoundError:
-            continue
-        except OSError as exc:
-            warnings.append("cannot read {}: {}".format(path, exc))
-            continue
-        if stat.S_ISLNK(st.st_mode):
-            raise Refused("{} is a symlink".format(path))
-        if not stat.S_ISDIR(st.st_mode):
-            continue
-        try:
-            fd = open_dir(sub, debug_fd)
+            return None
         except OSError as exc:
             if exc.errno in SWAPPED_ERRNOS:
-                raise Refused("{} is a symlink".format(path))
+                raise Refused("{} was replaced by a symlink or non-directory "
+                              "before it could be opened".format(path))
             warnings.append("cannot read {}: {}".format(path, exc))
-            continue
+            return None
         handles.append(fd)
-        opened = os.fstat(fd)
-        found.append(SweptDir(path, fd, opened.st_dev, opened.st_ino))
+        held = SweptDir(path, fd, held.fd, component, held.chain)
+    return held
+
+
+def open_child(parent, name, warnings, handles):
+    """Open directory ``name`` under the held ``parent``; None when absent or not a directory.
+
+    Raises Refused when ``name`` is a symlink or is swapped for one while opening.
+    """
+    path = os.path.join(parent.path, name)
+    try:
+        st = os.lstat(name, dir_fd=parent.fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        warnings.append("cannot read {}: {}".format(path, exc))
+        return None
+    if stat.S_ISLNK(st.st_mode):
+        raise Refused("{} is a symlink".format(path))
+    if not stat.S_ISDIR(st.st_mode):
+        return None
+    try:
+        fd = open_dir(name, parent.fd)
+    except OSError as exc:
+        if exc.errno in SWAPPED_ERRNOS:
+            raise Refused("{} is a symlink".format(path))
+        warnings.append("cannot read {}: {}".format(path, exc))
+        return None
+    handles.append(fd)
+    return SweptDir(path, fd, parent.fd, name, parent.chain)
+
+
+def open_swept_dirs(real_target, warnings, handles):
+    """Open the existing swept directories; raise Refused on any symlink.
+
+    The target, ``debug`` and each swept directory are reached through one
+    descriptor walk (no path is looked up twice). Every opened descriptor is
+    appended to ``handles`` for the caller to close.
+    """
+    target = open_target(real_target, warnings, handles)
+    if target is None:
+        return []
+    debug = open_child(target, DEBUG_DIR_NAME, warnings, handles)
+    if debug is None:
+        return []
+    found = []
+    for sub in SWEPT_SUBDIRS:
+        swept = open_child(debug, sub, warnings, handles)
+        if swept is not None:
+            found.append(swept)
     return found
 
 
@@ -198,14 +236,23 @@ def collect_entries(target, warnings, handles):
 
 
 def verify_unchanged(sdir):
-    """Refuse when the swept path no longer names the directory that was scanned."""
-    try:
-        now = os.lstat(sdir.path)
-    except OSError as exc:
-        raise Refused("{} cannot be re-checked before delete: {}".format(sdir.path, exc))
-    if stat.S_ISLNK(now.st_mode) or not stat.S_ISDIR(now.st_mode) \
-            or (now.st_dev, now.st_ino) != (sdir.dev, sdir.ino):
-        raise Refused("{} was replaced after the scan".format(sdir.path))
+    """Refuse when any held directory on the walk was replaced after the scan.
+
+    Every link of the chain (``/`` to the swept directory) is looked up by name
+    relative to the descriptor of its parent and compared with ``os.fstat`` of
+    the handle that was opened; no full path is resolved.
+    """
+    for held in sdir.chain:
+        if held.parent_fd is None:
+            continue
+        try:
+            now = os.lstat(held.name, dir_fd=held.parent_fd)
+            opened = os.fstat(held.fd)
+        except OSError as exc:
+            raise Refused("{} cannot be re-checked before delete: {}".format(held.path, exc))
+        if stat.S_ISLNK(now.st_mode) or not stat.S_ISDIR(now.st_mode) \
+                or (now.st_dev, now.st_ino) != (opened.st_dev, opened.st_ino):
+            raise Refused("{} was replaced after the scan".format(held.path))
 
 
 def remove_tree(parent_fd, name):
