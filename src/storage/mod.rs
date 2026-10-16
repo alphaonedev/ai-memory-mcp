@@ -2986,8 +2986,10 @@ pub fn capture_turn_idempotent(
                 crate::recover::durability::INJECTED_BEFORE_SIGNED_COMMIT_MSG
             ));
         }
-        crate::signed_events::append_signed_event_no_tx(conn, &write.signed_event)
+        // #7241 - the anchor is emitted when `write_txn` commits.
+        let anchor = crate::signed_events::append_signed_event_no_tx(conn, &write.signed_event)
             .map_err(|e| format!("SIGNED_EVENTS_APPEND_FAILED: {e}"))?;
+        escalation_deferral::defer_audit_anchor(conn, anchor);
 
         Ok(inserted_id)
     })();
@@ -3141,8 +3143,10 @@ where
                 crate::recover::durability::INJECTED_BEFORE_SIGNED_COMMIT_MSG
             ));
         }
-        crate::signed_events::append_signed_event_no_tx(conn, &write.signed_event)
+        // #7241 - the anchor is emitted when `write_txn` commits.
+        let anchor = crate::signed_events::append_signed_event_no_tx(conn, &write.signed_event)
             .map_err(|e| format!("SIGNED_EVENTS_APPEND_FAILED: {e}"))?;
+        escalation_deferral::defer_audit_anchor(conn, anchor);
 
         Ok(inserted_id)
     })();
@@ -4136,8 +4140,8 @@ pub fn operator_dequarantine(conn: &mut Connection, id: &str, agent_id: &str) ->
     // under the write lock, never by the caller (`decontaminate`).
     match decontaminate::observe_and_release_sqlite(&tx, id, agent_id)? {
         decontaminate::Observed::Quarantined => {}
-        decontaminate::Observed::Decontaminated(target) => {
-            tx.commit()?;
+        decontaminate::Observed::Decontaminated(target, anchor) => {
+            crate::signed_events::commit_and_emit(tx, anchor)?;
             decontaminate::warn_released(id, agent_id, target);
             return Ok(true);
         }
@@ -4170,8 +4174,8 @@ pub fn operator_dequarantine(conn: &mut Connection, id: &str, agent_id: &str) ->
         Utc::now().to_rfc3339(),
         Some(&cause),
     );
-    crate::signed_events::append_signed_event_no_tx(&tx, &event)?;
-    tx.commit()?;
+    let anchor = crate::signed_events::append_signed_event_no_tx(&tx, &event)?;
+    crate::signed_events::commit_and_emit(tx, anchor)?;
     // #2402 — observability. The chain row is the forensic record; this WARN +
     // counter are the fleet-watchable signal, and they are emitted from the
     // BACKEND primitive rather than each caller so no surface (CLI, admin
@@ -5021,7 +5025,9 @@ pub(crate) fn sever_namespace_standards(conn: &Connection, id: &str) -> Result<u
         now,
         None,
     );
-    crate::signed_events::append_signed_event_no_tx(conn, &event)?;
+    // #7241 - runs inside the caller's transaction: its owner emits the anchor.
+    let anchor = crate::signed_events::append_signed_event_no_tx(conn, &event)?;
+    escalation_deferral::defer_audit_anchor(conn, anchor);
     Ok(changed)
 }
 
@@ -6932,7 +6938,9 @@ pub fn emit_crypto_erase_attestation(
         erased_at.to_string(),
         None,
     );
-    crate::signed_events::append_signed_event_no_tx(conn, &event)?;
+    // #7241 - runs inside the caller's transaction: its owner emits the anchor.
+    let anchor = crate::signed_events::append_signed_event_no_tx(conn, &event)?;
+    escalation_deferral::defer_audit_anchor(conn, anchor);
     Ok(())
 }
 
@@ -13000,7 +13008,10 @@ pub fn invalidate_link(
                 // unchecked_transaction which would fail under nesting
                 // (SQLite does not allow nested transactions on a single
                 // connection).
-                if let Err(e) = crate::signed_events::append_signed_event_no_tx(conn, &event) {
+                // #7241 - on success the anchor is emitted when `write_txn` commits.
+                let appended = crate::signed_events::append_signed_event_no_tx(conn, &event)
+                    .map(|anchor| escalation_deferral::defer_audit_anchor(conn, anchor));
+                if let Err(e) = appended {
                     // P2 (#628 agent-3): refuse to commit the UPDATE if
                     // the audit row can't be appended. Otherwise the
                     // signature clearing happens silently and we lose
@@ -13995,7 +14006,7 @@ pub fn swarm_rewind(
     let contaminated = crate::models::LifecycleState::Contaminated.as_str();
 
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    {
+    let anchor = {
         let mut read = tx.prepare(SELECT_LIFECYCLE_META_BY_ID_SQL)?;
         let mut upd = tx.prepare(
             "UPDATE memories \
@@ -14149,10 +14160,11 @@ pub fn swarm_rewind(
             now.clone(),
             None,
         );
-        crate::signed_events::append_signed_event_no_tx(&tx, &event)?;
+        let anchor = crate::signed_events::append_signed_event_no_tx(&tx, &event)?;
         report.signed_event_id = Some(event.id.clone());
-    }
-    tx.commit()?;
+        anchor
+    };
+    crate::signed_events::commit_and_emit(tx, anchor)?;
 
     Ok(report)
 }
@@ -15697,8 +15709,10 @@ pub fn append_lineage_record(
             timestamp: now.clone(),
             ..crate::signed_events::SignedEvent::default()
         };
-        crate::signed_events::append_signed_event_no_tx(conn, &witness)
+        // #7241 - the anchor is emitted when `write_txn` commits.
+        let anchor = crate::signed_events::append_signed_event_no_tx(conn, &witness)
             .context("append_lineage_record: witness append")?;
+        escalation_deferral::defer_audit_anchor(conn, anchor);
         Ok(())
     })();
 
@@ -20177,7 +20191,9 @@ pub fn reown(
             now,
             Some(&cause),
         );
-        crate::signed_events::append_signed_event_no_tx(conn, &event)?;
+        // #7241 - the anchor is emitted when `write_txn` commits.
+        let anchor = crate::signed_events::append_signed_event_no_tx(conn, &event)?;
+        escalation_deferral::defer_audit_anchor(conn, anchor);
         Ok(rewritten)
     })();
     let rewritten = match result {

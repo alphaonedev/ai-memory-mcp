@@ -113,6 +113,17 @@ safeguard (added to the C1–C7 set in §"Enforceable Orchestrator
 Safeguards"); HARD-BLOCK on any violation.
 
 
+## Checkout permissions: use umask 022 (#7281)
+
+The deferred-audit spool guard (#2271) rejects any spool ancestor that is
+group- or world-writable and not sticky, and the checkout root is an ancestor
+of every `deferred_audit` test fixture. A checkout or `git worktree add` made
+under umask 002 is mode 775, so `cargo test --features sal --lib deferred_audit`
+cannot pass there. The fixtures now fail once with a message naming the path
+and its mode instead of 34 opaque failures. Create checkouts under umask 022,
+or run `chmod g-w <dir>` on the named directory. The production guard is
+never relaxed for tests.
+
 ## Local coverage (matching CI's `coverage.yml`)
 
 ```bash
@@ -179,3 +190,31 @@ scripts/reproduce-recursive-learning.sh
 The full conceptual primer lives at `docs/RECURSIVE_LEARNING.md`; the
 release-notes intro lives under `docs/v0.7.0/release-notes.md`
 §"Substrate-native recursive refinement".
+
+## Self-hosted runner host budget (#7188)
+
+The `Check (linux-fed,enterprise-fed)` job compiles every integration test binary with
+`--features sal-postgres`; an unshared per-checkout `target/` measured ~166 GiB. Each
+labelled linux-fed runner now builds into its OWN `CARGO_TARGET_DIR`,
+`~/.cache/ai-memory-ci/cargo-target/<runner name>` (root defined once in
+`scripts/ci/shared_cargo_target.py`, which takes the name from `runner.name` and fails
+closed on a missing or unsafe name). A target has exactly one writer, so one PR's build
+can never replace a test binary another PR's job is about to run (cargo releases its
+build lock before it executes test binaries; decided by 3-agent vote 6def5ab6, memory
+023ed7e7-8650-424b-a5f7-2eb48573aa5f), and the runner compiles once and reuses its
+target for its later jobs. Jobs on different runners therefore do not share compiled
+output: each runner pays one cold build, and two runners hold two targets.
+
+Size the host with:
+
+    footprint = labelled-runners x per-runner target (~158 GiB measured after the debuginfo strip)
+    labelled runners per host = floor((disk - fixed - lanes - headroom) / per-runner target)
+
+where `disk` is the root disk, `fixed` the non-CI usage (databases, services), `lanes`
+the agent-lane cargo targets and `headroom` the free-space floor. The 158 GiB figure is a
+lower bound (the unstripped comparison build was stopped past 215 GiB before it finished).
+Example, f2: 912 GiB disk - ~400 GiB fixed leaves ~512 GiB before lanes and headroom,
+which holds about two per-runner targets; runners 3 and 4 stay unlabelled for that reason
+(tracked in #7199, which also covers sccache or a larger disk). After each job
+`scripts/ci/prune_runner_artifacts.py --protected-root` prunes stale scratch and never
+touches the target root, so a prune on one runner cannot delete a sibling runner's target.

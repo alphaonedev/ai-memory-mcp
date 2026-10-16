@@ -703,6 +703,17 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     strategy:
       fail-fast: false
+      # #7188 - concurrency cap: at most 3 of this job's 4 legs run at once per
+      # workflow run, so the self-hosted linux-fed leg and the two macOS legs
+      # never wait on each other while a fourth leg cannot pile on. N = 3 and
+      # not lower because a lower cap would serialise the macOS legs behind the
+      # hosted sqlite leg (~75 min) with no benefit to the f2 disk. The host-level
+      # bound lives elsewhere: every linux-fed enterprise-fed job builds into the
+      # PER-RUNNER CARGO_TARGET_DIR of the runner it runs on (below), so a target
+      # has exactly one writer and compiles once across that runner's jobs.
+      # A cross-run `concurrency` group is deliberately NOT used: GitHub replaces
+      # a PENDING run in a group, which would silently cancel a required check.
+      max-parallel: 3
       matrix:
         # 2x2 via `include:` so the single name variable `leg` co-varies with
         # `runner` (runs-on labels), `node` (a descriptive tag used by the
@@ -779,6 +790,12 @@ jobs:
             runner: '["self-hosted","linux-fed"]'
             node: linux-fed
             tier: enterprise-fed
+            # #7188 - opt in to the shared per-host cargo target (see the
+            # "Shared per-host cargo target" step). An explicit flag, not a
+            # `matrix.node ==` comparison, so a rename cannot silently drop it;
+            # the hosted and macOS legs do not set it and keep their default
+            # workspace `target/`.
+            shared_target: true
             # #3525/#3976/#6202/#6344: compile (~6-12 min) + the 7800 s
             # per-shard watchdog + the ephemeral-db setup/teardown must fit
             # inside this outer bound. 160 = 130 min watchdog + 28 min of
@@ -839,6 +856,22 @@ jobs:
       - name: docs-only short-circuit
         if: needs.classify.outputs.docs_only == 'true'
         run: echo "::notice::docs-only PR — ${{ matrix.leg }} matrix leg is a no-op"
+
+      # #7188 - PER-RUNNER CARGO_TARGET_DIR for the self-hosted linux-fed
+      # enterprise-fed job: ~/.cache/ai-memory-ci/cargo-target/<runner name>,
+      # outside the checkout (checkout cleaning cannot wipe it), under the runner
+      # user's home, never a tmp path. A target with exactly one writer cannot
+      # have one PR's test binary replaced by another PR's build (cargo releases
+      # its build lock before it runs test binaries), and the cache stays warm
+      # for that runner's later jobs. runner.name is assigned by the runner, not
+      # by the PR; the helper fails closed on a missing or unsafe name. The path
+      # root is defined once, in scripts/ci/shared_cargo_target.py.
+      # Self-hosted legs only (matrix.shared_target).
+      - name: Per-runner cargo target (#7188)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.shared_target
+        env:
+          RUNNER_NAME_ARG: ${{ runner.name }}
+        run: python3 scripts/ci/shared_cargo_target.py --github-env "$GITHUB_ENV" --runner-name "$RUNNER_NAME_ARG"
 
       # #2452 — tests/conformance_readers.rs is FAIL-CLOSED: an absent
       # python3/node is a test FAILURE, not a silent pass. This job now spans
@@ -1928,6 +1961,18 @@ jobs:
           else
             echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"
           fi
+
+      # #7188 - post-job cleanup on the self-hosted legs: prune stale per-job
+      # artifacts (leftover .tmp* dirs, workspace incremental state, old
+      # runner _temp entries) so an idle runner holds no stale scratch. It
+      # NEVER touches the per-runner cargo target root (the helper refuses any
+      # path in, at or above it, so a sibling runner target is safe). Removal
+      # failures never fail the job; unsafe arguments do (exit 2). Skipped for
+      # fork PRs (refused above, no checkout ran). always() so a failed or
+      # cancelled run is pruned too.
+      - name: Prune stale runner artifacts (#7188)
+        if: always() && matrix.shared_target && needs.classify.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        run: python3 scripts/ci/prune_runner_artifacts.py --work-root "$RUNNER_WORKSPACE/.." --workspace "$GITHUB_WORKSPACE" --protected-root "$AI_MEMORY_CI_TARGET_ROOT"
 
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
   #

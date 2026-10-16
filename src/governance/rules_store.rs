@@ -660,7 +660,7 @@ pub fn remove_signed(
         timestamp: chrono::Utc::now().to_rfc3339(),
         ..crate::signed_events::SignedEvent::default()
     };
-    crate::signed_events::append_signed_event_no_tx(&tx, &event)?;
+    let removed_anchor = crate::signed_events::append_signed_event_no_tx(&tx, &event)?;
 
     let affected = tx
         .execute("DELETE FROM governance_rules WHERE id = ?1", params![id])
@@ -669,13 +669,13 @@ pub fn remove_signed(
     // v0.9.0 §25.3 S4 (F-41) — advance the policy version in the SAME
     // transaction as the removal, so the policy surface and the rule
     // audit row commit atomically together.
-    crate::governance::policy_version::append_policy_advance_no_tx(
+    let advance_anchor = crate::governance::policy_version::append_policy_advance_no_tx(
         &tx,
         signing_key,
         operator_agent_id,
     )?;
 
-    tx.commit()
+    crate::signed_events::commit_and_emit(tx, removed_anchor.merge(advance_anchor))
         .context("rules_store::remove_signed: commit tx")?;
     Ok(affected > 0)
 }
@@ -754,7 +754,7 @@ pub fn set_enabled_signed(
         timestamp: chrono::Utc::now().to_rfc3339(),
         ..crate::signed_events::SignedEvent::default()
     };
-    crate::signed_events::append_signed_event_no_tx(&tx, &event)?;
+    let toggled_anchor = crate::signed_events::append_signed_event_no_tx(&tx, &event)?;
 
     // Persist enabled + signature + attest_level in the SAME tx (folds
     // in what the separate `update_signature` call did before).
@@ -774,13 +774,13 @@ pub fn set_enabled_signed(
     // v0.9.0 §25.3 S4 (F-41) — advance the policy version in the SAME
     // transaction as the rule mutation, so the monotonic policy surface
     // and the rule audit row commit atomically together.
-    crate::governance::policy_version::append_policy_advance_no_tx(
+    let advance_anchor = crate::governance::policy_version::append_policy_advance_no_tx(
         &tx,
         signing_key,
         operator_agent_id,
     )?;
 
-    tx.commit()
+    crate::signed_events::commit_and_emit(tx, toggled_anchor.merge(advance_anchor))
         .context("rules_store::set_enabled_signed: commit tx")?;
     Ok(true)
 }
@@ -806,12 +806,12 @@ pub fn insert_signed(
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
         .context("rules_store::insert_signed: begin IMMEDIATE tx")?;
     insert(&tx, rule)?;
-    crate::governance::policy_version::append_policy_advance_no_tx(
+    let advance_anchor = crate::governance::policy_version::append_policy_advance_no_tx(
         &tx,
         signing_key,
         operator_agent_id,
     )?;
-    tx.commit()
+    crate::signed_events::commit_and_emit(tx, advance_anchor)
         .context("rules_store::insert_signed: commit tx")?;
     Ok(())
 }
