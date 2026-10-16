@@ -12,7 +12,7 @@
 > (`docs/audit/3x7-v1-cutline-ruling-2026-08-01.md`) is the standard this
 > certification answers to; this document is the evidence-bound answer.
 
-**Binds to:** `385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5` (historical only: the certification is EXPIRED and makes no live claim; the re-assembled batch-6 tip;
+Last LIVE bind (historical, no live bind while EXPIRED): `385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5` (the re-assembled batch-6 tip;
 re-issued 2026-10-02 after **3 §7-watched federation-wire files changed** since the prior bind
 `eba96b307` — 74 changed lines, **49 of them code**, from five commits — §5.4(2)–(5) re-run at the
 new SHA per §7). The 2026-09-26 re-issue at `eba96b307`, the 2026-09-23 re-issue at `eae99be43`, the 2026-09-22 re-issue at `92209ad91`, the 2026-09-21 re-issue at `f32c18dad`, the 2026-09-12 #3607 re-bind at `ab6f2175`, the 2026-09-11
@@ -20,7 +20,7 @@ re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the orig
 mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **EXPIRED as of 2026-10-07** (§7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
+> ## STATUS — **VOID as of 2026-10-16** (EXPIRED since 2026-10-07; §7 fired again on test-only edits to `src/federation/mod.rs`, see the third amendment; §7 fired originally: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
 >
 > **Amendment (2026-10-07, #6063 WP-B1 — §7 EXPIRY RECORD, certification EXPIRED).**
 > The federation certification **expired** per §7 when four §7-watched
@@ -59,18 +59,19 @@ certification and triggers re-cert** (see §7).
 > hook itself instead of relying on a sibling test in the same process. No
 > production code, no `AI_MEMORY_FED_*` identifier and no wire behaviour changed.
 > This record does **not** re-measure anything and does **not** re-bind. The
-> certification stays EXPIRED, and the re-measurement and re-issue stay under
-> WP-B1 ([#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063));
+> certification makes no live claim, and the re-measurement and re-issue stay
+> under WP-B1 ([#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063));
 > re-binding without that re-measurement is forbidden (#3899).
 >
 > Rule (B) of the §7 gate (#3556) accepts a cert-doc edit only when the STATUS
-> word or the bound SHA differs from the merge-base, and the base already reads
-> "EXPIRED -". So this record restores the bold `**Binds to:**` marker (kept
-> exactly once) on the historical `385da3a05` line, the same toggle commit
-> `30f0d0498` used in the other direction. The status line is unchanged and still
-> exactly one, EXPIRED makes no live claim (rule (C) never fails it), no SHA is
-> re-bound and nothing is re-measured. WP-B1 (#6063) replaces the marker when it
-> re-issues LIVE.
+> word or the bound SHA differs from the merge-base ("a voiding record flips
+> STATUS"), and self-test case (o) judges the same change against
+> `origin/release/v1.0.0`, which reads EXPIRED bound to `385da3a05`. The carrier
+> reads "EXPIRED -", so restoring the marker would satisfy one comparison and
+> void the other. This record therefore flips the single STATUS line to VOID, the
+> voiding record the gate defines: it differs from both comparison points, makes
+> no live claim (rule (C) never fails VOID), re-binds no SHA and re-measures
+> nothing. WP-B1 (#6063) replaces the STATUS when it re-issues LIVE.
 >
 > Re-validated and re-bound against `f32c18dadf8a659567960747cc2802186bac9de9`
 > at the v1.0.0 promotion tip on 2026-09-21: §5.4(2) posture legs re-measured at 22 checks
