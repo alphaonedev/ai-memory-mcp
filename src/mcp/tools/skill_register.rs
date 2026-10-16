@@ -399,8 +399,9 @@ pub(super) fn register_core(
     let version = compute_skill_version(conn, &new_id);
 
     // Commit the atomic register (skills + resources + supersede) as one unit.
-    crate::signed_events::commit_and_emit(tx, anchor)
+    tx.commit()
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill register COMMIT", e))?;
+    anchor.emit_after_commit();
 
     Ok(RegisterResult {
         id: new_id,

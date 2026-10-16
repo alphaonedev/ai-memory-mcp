@@ -223,8 +223,9 @@ pub fn handle_skill_retire(
         crate::governance::audit::PendingAuditAnchor::none()
     });
 
-    crate::signed_events::commit_and_emit(tx, anchor)
+    tx.commit()
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill retire COMMIT", e))?;
+    anchor.emit_after_commit();
 
     let flag = if unretire {
         field_names::UNRETIRED
@@ -416,8 +417,9 @@ pub fn handle_skill_delete(
         )
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_delete DELETE", e))?;
 
-    crate::signed_events::commit_and_emit(tx, anchor)
+    tx.commit()
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill delete COMMIT", e))?;
+    anchor.emit_after_commit();
 
     Ok(json!({
         "purged": true,

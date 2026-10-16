@@ -4123,15 +4123,19 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn fresh_tempdir() -> tempfile::TempDir {
-        let scratch = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(".local-runs")
-            .join("test-tmp");
+        let runs = Path::new(env!("CARGO_MANIFEST_DIR")).join(".local-runs");
+        let scratch = runs.join("test-tmp");
         std::fs::create_dir_all(&scratch).expect("create repository-owned test scratch");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700))
-                .expect("secure repository-owned test scratch");
+            // #7241 (G4): the spool ancestor check rejects a group-writable
+            // ancestor, and `.local-runs` is created by the fixtures (mode
+            // 0775 under umask 002), so the fixture owns and secures it too.
+            for owned in [&runs, &scratch] {
+                std::fs::set_permissions(owned, std::fs::Permissions::from_mode(0o700))
+                    .expect("secure repository-owned test scratch");
+            }
         }
         let dir = tempfile::Builder::new()
             .prefix("deferred-audit-")

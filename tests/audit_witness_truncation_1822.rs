@@ -52,6 +52,9 @@ use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
 /// Process-global serialisation for the witness ENV + throttle static.
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -69,11 +72,15 @@ fn fresh_dir(label: &str) -> tempfile::TempDir {
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".local-runs")
         .join("issue-1822-witness");
-    std::fs::create_dir_all(&root).ok();
-    tempfile::Builder::new()
+    // #7241 (G4): create the fixture directories owner-only, whatever the host
+    // umask, so the key-dir guard (#3198) sees 0700 and not 0775.
+    key_dir_sandbox::mkdir_0700(&root);
+    let dir = tempfile::Builder::new()
         .prefix(&format!("{label}-"))
         .tempdir_in(&root)
-        .expect("tempdir under .local-runs")
+        .expect("tempdir under .local-runs");
+    key_dir_sandbox::mkdir_0700(dir.path());
+    dir
 }
 
 fn open_db(dir: &std::path::Path) -> (PathBuf, Connection) {

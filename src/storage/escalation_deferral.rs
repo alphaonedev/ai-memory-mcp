@@ -367,7 +367,13 @@ pub fn defer_audit_anchor(conn: &Connection, anchor: crate::governance::audit::P
     if conn.is_autocommit() {
         anchor.emit_after_commit();
     } else {
-        tracing::debug!(
+        // A new raw-transaction caller of a deferring funnel would under-anchor
+        // silently: fail loudly in debug and test builds, warn in release.
+        debug_assert!(
+            false,
+            "#7241: audit anchor dropped: its append ran in a transaction with no WriteTxn frame"
+        );
+        tracing::warn!(
             "#7241: audit anchor dropped: its append ran in a transaction with no WriteTxn \
              frame on this thread; the next due append re-anchors the head"
         );
