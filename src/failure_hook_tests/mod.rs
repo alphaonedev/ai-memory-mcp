@@ -18,6 +18,19 @@ const CLOCK_TEST: &str = "failure_hook_tests::active_clock_7029";
 #[cfg(feature = "sal-postgres")]
 const PG_TEST: &str = "failure_hook_tests::active_postgres_7029";
 
+/// The one skip policy for every test that needs the native Postgres tier:
+/// an unset `AI_MEMORY_TEST_POSTGRES_URL` skips the Postgres part with a note
+/// (the SQLite parts still run); a set URL runs every assertion unchanged.
+#[cfg(feature = "sal-postgres")]
+fn pg_url_or_skip(test: &str) -> Option<String> {
+    if let Ok(url) = std::env::var(PG_ENV) {
+        Some(url)
+    } else {
+        eprintln!("skipped: {PG_ENV} is unset ({test})");
+        None
+    }
+}
+
 fn assert_child(output: &std::process::Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -103,11 +116,13 @@ fn active_clock_7029() {
             "common checked offset domain"
         );
         #[cfg(feature = "sal-postgres")]
-        tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(async {
-                scenarios::pg::fault_pg_isolated_clock(expected).await;
-            });
+        if std::env::var_os(PG_ENV).is_some() {
+            tokio::runtime::Runtime::new()
+                .expect("runtime")
+                .block_on(async {
+                    scenarios::pg::fault_pg_isolated_clock(expected).await;
+                });
+        }
         scenarios::sqlite_clock(expected);
         return;
     }
@@ -122,6 +137,8 @@ fn active_clock_7029() {
         (Some("9223372036854775807"), 0),
         (Some("-9223372036854775808"), 0),
     ];
+    #[cfg(feature = "sal-postgres")]
+    let pg_url = pg_url_or_skip(CLOCK_TEST);
     for (value, offset) in cases {
         let expected = offset.to_string();
         let mut env = vec![(MODE_ENV, "clock"), (EXPECT_ENV, expected.as_str())];
@@ -129,9 +146,9 @@ fn active_clock_7029() {
             env.push((CLOCK_ENV, value));
         }
         #[cfg(feature = "sal-postgres")]
-        let pg_url = std::env::var(PG_ENV).expect("PG evidence requires native PG URL");
-        #[cfg(feature = "sal-postgres")]
-        env.push((PG_ENV, pg_url.as_str()));
+        if let Some(url) = pg_url.as_deref() {
+            env.push((PG_ENV, url));
+        }
         assert_child(&crate::test_support::spawn_test_child(CLOCK_TEST, &env));
     }
 }
@@ -182,8 +199,11 @@ fn active_postgres_7029() {
         });
         return;
     }
+    let Some(supplied) = pg_url_or_skip(PG_TEST) else {
+        return;
+    };
     let (admin, name, store) = runtime.block_on(scenarios::pg::fault_pg_create());
-    let mut url = reqwest::Url::parse(&std::env::var(PG_ENV).expect("PG URL")).expect("valid URL");
+    let mut url = reqwest::Url::parse(&supplied).expect("valid URL");
     url.set_path(&format!("/{name}"));
     let armed = crate::test_support::spawn_test_child(
         PG_TEST,
@@ -207,8 +227,9 @@ fn active_postgres_7029() {
 #[cfg(feature = "sal-postgres")]
 #[test]
 fn cleanup_drops_owned_db_with_open_connection_7029() {
-    let Ok(supplied) = std::env::var(PG_ENV) else {
-        eprintln!("skipped: {PG_ENV} is unset");
+    let Some(supplied) =
+        pg_url_or_skip("failure_hook_tests::cleanup_drops_owned_db_with_open_connection_7029")
+    else {
         return;
     };
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
