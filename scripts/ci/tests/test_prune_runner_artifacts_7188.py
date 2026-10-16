@@ -17,6 +17,7 @@ import shutil
 import sys
 import time
 import unittest
+from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -167,9 +168,20 @@ class Arguments(Fixture):
         self.assertEqual(ctx.exception.code, 2)
         self.assertTrue(self.old_tmp.exists())
 
-    def test_shared_target_neither_inside_nor_beside_the_root_is_refused(self):
-        rc, _ = self.run_with(shared="/opt/ci-cargo-target")
+    def test_protected_root_equal_to_work_root_is_refused(self):
+        rc, _ = self.run_with(shared=self.work)
         self.assert_refused(rc)
+
+    def test_protected_root_ancestor_of_work_root_is_refused(self):
+        rc, _ = self.run_with(shared=SCRATCH)
+        self.assert_refused(rc)
+        rc, _ = self.run_with(shared="/")
+        self.assert_refused(rc)
+
+    def test_work_root_with_fewer_than_two_components_is_refused(self):
+        rc, _ = self.run_with(work="/home", workspace="/home/x", shared="/opt/ci-cargo-target")
+        self.assertEqual(rc, prune.EXIT_USAGE)
+        self.assertTrue(self.old_tmp.exists())
 
     def test_relative_shared_target_is_refused(self):
         rc, _ = self.run_with(shared="cargo-target")
@@ -249,6 +261,73 @@ class Symlinks(Fixture):
         rc, _ = self.run_main()
         self.assertEqual(rc, 0)
         self.assertTrue((self.shared / "debug" / "incremental" / "f").exists())
+
+
+class OutOfTreeProtectedRoot(Fixture):
+    """#7188 fed runners: the protected root is a symlink whose target is outside the work root."""
+
+    run_main = Cli.run_main
+    FAKE = Path("/zz-7188-outside/cargo-target")
+
+    def setUp(self):
+        super().setUp()
+        self.link = SCRATCH / "home" / "cache-link"
+        self.link.symlink_to(self.shared, target_is_directory=True)
+        real_resolve = prune.resolve
+        link = self.link
+
+        def fake_resolve(path):
+            # Emulate fed hosts: after resolving, only the filesystem root is shared.
+            if Path(path) == link:
+                return OutOfTreeProtectedRoot.FAKE
+            return real_resolve(path)
+
+        patcher = mock.patch.object(prune, "resolve", fake_resolve)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_link(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = prune.main(
+                ["--work-root", str(self.work), "--workspace", str(self.workspace),
+                 "--protected-root", str(self.link), "--max-age-days", str(MAX_AGE_DAYS)]
+            )
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_out_of_tree_protected_root_is_not_refused_and_logs_once(self):
+        rc, out, err = self.run_link()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(out.count("is outside the work root; nothing to protect"), 1)
+        self.assertIn("protected root %s is outside the work root" % self.link, out)
+
+    def test_out_of_tree_protected_root_prunes_work_root_and_deletes_nothing_outside(self):
+        rc, _, err = self.run_link()
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(self.old_tmp.exists())
+        self.assertFalse(self.ws_incr.exists())
+        self.assertTrue(self.new_tmp.exists())
+        self.assertTrue((self.shared / "debug" / "incremental" / "f").exists())
+        self.assertTrue((self.shared / "debug" / "deps" / "f").exists())
+
+    def test_link_inside_work_root_to_protected_target_is_not_followed(self):
+        inner = self.workspace / ".tmpinner"
+        inner.mkdir()
+        (inner / "f").write_text("x", encoding="utf-8")
+        (inner / "to-shared").symlink_to(self.shared, target_is_directory=True)
+        top = self.workspace / ".tmptop"
+        top.symlink_to(self.shared, target_is_directory=True)
+        rc, _, err = self.run_link()
+        self.assertEqual(rc, 0, err)
+        self.assertFalse(inner.exists())  # real candidate removed; inner link unlinked only
+        self.assertTrue(top.is_symlink())  # top-level link skipped, never followed
+        self.assertTrue((self.shared / "debug" / "incremental" / "f").exists())
+        self.assertTrue((self.shared / "debug" / "deps" / "f").exists())
+
+    def test_prune_never_uses_a_following_walk(self):
+        src = Path(prune.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("os.walk", src)
+        self.assertNotIn("followlinks=True", src)
 
 
 class PerRunnerRoot(Fixture):
