@@ -153,6 +153,10 @@ env:
   # Declaring it at workflow level also means no job depends on the runner
   # `.env` supplying it.
   CARGO_INCREMENTAL: "0"
+  # #7259 — the ONE place the cargo-nextest pin is written. scripts/ci/install_nextest.py
+  # reads it; scripts/ci/tests/test_nextest_config_7259.py pins that this literal
+  # appears once in this file.
+  NEXTEST_VERSION: "0.9.146"
 
 jobs:
   # Classify the diff so docs-only PRs can short-circuit the heavy Rust
@@ -1006,6 +1010,9 @@ jobs:
           # cache (slower, never wrong). rust-cache@v2 is the repo's existing
           # house action — no new/unpinned Action is introduced.
           save-if: ${{ github.event_name == 'push' }}
+          # #7259 — also restore the cargo-nextest root (scripts/ci/install_nextest.py):
+          # a hit makes `cargo install` a no-op, a miss builds it once (~10 min).
+          cache-directories: ${{ runner.temp }}/cargo-nextest
 
       # v0.9.0 pre-GA (#1853) — e1 macOS anti-flake. The
       # tests/e1_orchestration_dry_run.rs harness historically ran a NESTED
@@ -1215,17 +1222,16 @@ jobs:
         if: needs.classify.outputs.docs_only != 'true' && contains(matrix.runner, 'self-hosted')
         run: python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
 
-      # #7259 — cargo-nextest, from crates.io only, pinned and locked. The
-      # install is skipped when the pinned version is already on the runner
-      # (self-hosted nodes keep a persistent ~/.cargo). Doc tests stay on
-      # `cargo test --doc` because nextest does not run them.
+      # #7259 — cargo-nextest, from crates.io only, pinned (NEXTEST_VERSION) and
+      # locked, built into a root THIS JOB owns ($RUNNER_TEMP/cargo-nextest, put on
+      # PATH through GITHUB_PATH). Never ~/.cargo/bin: some self-hosted runners keep
+      # it write-protected, and a binary an earlier job left there is not trusted.
+      # Hosted runners restore the root through the rust-cache step above
+      # (`cache-directories`). Doc tests stay on `cargo test --doc` because nextest
+      # does not run them.
       - name: Install cargo-nextest (#7259)
         if: needs.classify.outputs.docs_only != 'true'
-        run: |
-          case "$(cargo nextest --version 2>/dev/null)" in
-            "cargo-nextest 0.9.146"*) echo "cargo-nextest 0.9.146 already installed" ;;
-            *) cargo install cargo-nextest --locked --version 0.9.146 ;;
-          esac
+        run: python3 -I scripts/ci/install_nextest.py
 
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.docs_only != 'true'
@@ -2202,6 +2208,8 @@ jobs:
       # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
+        with:
+          cache-directories: ${{ runner.temp }}/cargo-nextest
 
       - name: Clippy (sal feature)
         run: cargo clippy --features sal -- -D warnings -D clippy::all -D clippy::pedantic
@@ -2209,15 +2217,13 @@ jobs:
       - name: Build release (sal feature)
         run: cargo build --release --features sal
 
+      - name: Install cargo-nextest (#7259)
+        run: python3 -I scripts/ci/install_nextest.py
+
       - name: Run lib tests (sal feature)
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: |
-          case "$(cargo nextest --version 2>/dev/null)" in
-            "cargo-nextest 0.9.146"*) ;;
-            *) cargo install cargo-nextest --locked --version 0.9.146 ;;
-          esac
-          cargo nextest run --profile ci --no-fail-fast --features sal --lib
+        run: cargo nextest run --profile ci --no-fail-fast --features sal --lib
 
   # v1.0.0 #2257 — vectorlite OPT-IN feature gate. The `vectorlite` cargo
   # feature (#1860/#2219; `rusqlite/load_extension` + `src/vectorlite.rs`)
@@ -2261,19 +2267,19 @@ jobs:
       # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
+        with:
+          cache-directories: ${{ runner.temp }}/cargo-nextest
 
       - name: Clippy (vectorlite feature, all targets)
         run: cargo clippy --all-targets --features vectorlite -- -D warnings -D clippy::all -D clippy::pedantic
 
+      - name: Install cargo-nextest (#7259)
+        run: python3 -I scripts/ci/install_nextest.py
+
       - name: Run vectorlite no-native-lib seam tests (#1860)
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: |
-          case "$(cargo nextest --version 2>/dev/null)" in
-            "cargo-nextest 0.9.146"*) ;;
-            *) cargo install cargo-nextest --locked --version 0.9.146 ;;
-          esac
-          cargo nextest run --profile ci --no-fail-fast --features vectorlite --test vectorlite_1860
+        run: cargo nextest run --profile ci --no-fail-fast --features vectorlite --test vectorlite_1860
 
       - name: Run config-precedence under vectorlite (#2256 feature-gated pin)
         env:
