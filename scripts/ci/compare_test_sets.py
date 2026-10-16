@@ -44,7 +44,13 @@ _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 _STAMP_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T[\d:.]+Z ?')
 _RUNNING_RE = re.compile(r'^\s*Running (?:(?P<unit>unittests) )?(?P<src>\S+)(?: \((?P<exe>[^)]+)\))?\s*$')
 _DOCTEST_RE = re.compile(r'^\s*Doc-tests\b')
-_CARGO_TEST_RE = re.compile(r'^test (?P<name>.+?) \.\.\. (?P<res>ok|FAILED|ignored)\b')
+# libtest prints ``test <name> - should panic ... ok`` for #[should_panic] tests; the suffix is
+# not part of the name nextest reports. A test that logs mid-line leaves the verdict either glued
+# to the noise (``ok<noise>``) or alone on a later line (``test <name> ... <noise>`` then ``ok``).
+_CARGO_TEST_RE = re.compile(
+    r'^test (?P<name>.+?)(?: - should panic)? \.\.\. (?P<res>ok|FAILED|ignored)(?![A-Za-z])')
+_CARGO_OPEN_RE = re.compile(r'^test (?P<name>.+?)(?: - should panic)? \.\.\.(?: |$)')
+_CARGO_VERDICT_RE = re.compile(r'^(?P<res>ok|FAILED|ignored)(?![A-Za-z])')
 _HASH_RE = re.compile(r'-[0-9a-f]{16}$')
 _NEXTEST_RE = re.compile(
     r'^\s*(?P<st>PASS|LEAK-FAIL|LEAK|FAIL|TIMEOUT|ABORT|SIG[A-Z0-9]+|EXEC-?FAIL|FLAKY(?: \d+/\d+)?)'
@@ -100,6 +106,7 @@ def parse_cargo_log(text: str) -> Outcomes:
     """``cargo test`` log -> ``{(binary, test): pass|fail}`` (ignored tests and doc tests excluded)."""
     out: Outcomes = {}
     current: Optional[str] = None
+    pending: Optional[str] = None
     in_doc = False
     for raw in text.splitlines():
         line = _clean(raw)
@@ -111,13 +118,22 @@ def parse_cargo_log(text: str) -> Outcomes:
             current, in_doc = None, True
             continue
         found = _CARGO_TEST_RE.match(line)
-        if not found:
-            continue
-        if in_doc or found.group('res') == 'ignored':
+        if found:
+            name, res, pending = found.group('name'), found.group('res'), None
+        else:
+            verdict = _CARGO_VERDICT_RE.match(line) if pending else None
+            if verdict:
+                name, res, pending = pending, verdict.group('res'), None
+            else:
+                opened = _CARGO_OPEN_RE.match(line)
+                if opened:
+                    pending = opened.group('name')
+                continue
+        if in_doc or res == 'ignored':
             continue
         if current is None:
             raise ParseError('cargo log: test line %r before any "Running" header' % line[:80])
-        _merge(out, (current, found.group('name')), PASS if found.group('res') == 'ok' else FAIL)
+        _merge(out, (current, name), PASS if res == 'ok' else FAIL)
     if not out:
         raise ParseError('cargo log: no executed tests found')
     return out
