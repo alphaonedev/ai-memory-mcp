@@ -561,6 +561,10 @@ mod tests {
     }
 
     async fn spawn_mock_peer(behaviour: MockBehaviour) -> (String, Arc<AtomicUsize>) {
+        // #7259 — see `spawn_envelope_peer`: seed the one-shot governance hook
+        // so a test that reaches the peer POST without `build_config` does not
+        // depend on a sibling test having installed it (#3515).
+        crate::governance::wire_check::ensure_installed_for_test();
         let call_count = Arc::new(AtomicUsize::new(0));
         let state = MockState {
             behaviour,
@@ -2569,6 +2573,9 @@ mod tests {
     /// dispatch) — distinct from the `Fail` arm that performs the retry.
     #[tokio::test]
     async fn post_and_classify_id_drift_does_not_retry() {
+        // #7259 — the governance pre-action hook is a process-wide one-shot; a fresh process
+        // (nextest) has none and the fan-out fails closed. Install the test hook (#3515).
+        crate::governance::wire_check::ensure_installed_for_test();
         // Hand-rolled mock that always 200's with a divergent id.
         let count = Arc::new(AtomicUsize::new(0));
         let cnt_clone = count.clone();
@@ -2616,6 +2623,10 @@ mod tests {
 
     /// Spawn a mock peer that always 200s with the given response envelope.
     async fn spawn_envelope_peer(envelope: serde_json::Value) -> String {
+        // #7259 — every peer POST fails closed while the one-shot governance
+        // hook is unset; under cargo-nextest (one process per test) no sibling
+        // test installs it, so seed it here like `build_config` does (#3515).
+        crate::governance::wire_check::ensure_installed_for_test();
         let app = Router::new().route(
             "/api/v1/sync/push",
             post(move |AxumJson(_b): AxumJson<serde_json::Value>| {
