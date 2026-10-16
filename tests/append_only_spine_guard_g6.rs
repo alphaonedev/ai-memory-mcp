@@ -66,6 +66,9 @@
 //! cargo test --test append_only_spine_guard_g6 -- --nocapture
 //! ```
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::path::{Path, PathBuf};
 
 /// Recursively visit every `.rs` file under `dir`, handing each
@@ -485,7 +488,10 @@ struct UnroutedSite {
 /// sites that are NOT inside an `APPEND-ONLY-SANCTIONED` fn and NOT
 /// allow-listed.
 fn collect_unrouted_sites() -> Vec<UnroutedSite> {
-    let src_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src_root = pathpin::pin_rs_root(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
+        pathpin::SRC_RS_MIN,
+    );
 
     // P1 / P3 needles assembled at runtime (split/concat) so this guard file's
     // own literal cannot self-trip a future copy of the guard.
@@ -730,7 +736,10 @@ fn p4_matches_the_real_insert_inner_and_pg_store_are_sanctioned() {
     // which already covers routing; here we assert the detector finds the
     // production upserts at all, so a future refactor that hides them from the
     // scan can't silently disable the invariant.
-    let src_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src_root = pathpin::pin_rs_root(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
+        pathpin::SRC_RS_MIN,
+    );
     let mut p4_total = 0usize;
     walk_rs_files(&src_root, &mut |_path, raw| {
         let stripped = strip_rust_comments(raw);

@@ -61,7 +61,7 @@ fn crate_root() -> &'static Path {
 }
 
 fn read_lf(path: &Path) -> String {
-    std::fs::read_to_string(path)
+    std::fs::read_to_string(crate::pathpin::pin_file(path))
         .unwrap_or_else(|e| panic!("pg_sources: read {}: {e}", path.display()))
         .replace("\r\n", "\n")
 }
@@ -194,7 +194,10 @@ pub fn pg_adapter_sources() -> Vec<PgSource> {
     );
 
     let mut paths = Vec::new();
-    collect_rs(&crate_root().join(PG_CHILD_DIR_REL), &mut paths);
+    collect_rs(
+        &crate::pathpin::pin_rs_root(crate_root().join(PG_CHILD_DIR_REL), 1),
+        &mut paths,
+    );
     paths.sort();
     assert!(
         !paths.is_empty(),

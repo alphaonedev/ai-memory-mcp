@@ -29,6 +29,9 @@
 //! `crate::db::open` or to call `crate::storage::assert_schema_not_ahead` right
 //! after the raw open — NOT to widen the allowlist without a reason.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::path::{Path, PathBuf};
 
 #[path = "common/cfg_test_modules.rs"]
@@ -296,7 +299,10 @@ fn walk_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 fn every_production_raw_sqlite_open_is_enumerated_2445() {
     let root = repo_root();
     let mut files = Vec::new();
-    walk_rs(&root.join("src"), &mut files);
+    walk_rs(
+        &pathpin::pin_rs_root(root.join("src"), pathpin::SRC_RS_MIN),
+        &mut files,
+    );
     files.sort();
 
     // #4200 — a module its PARENT declares `#[cfg(test)] mod x;` is
@@ -419,7 +425,9 @@ fn the_production_test_boundary_heuristic_is_load_bearing_2445() {
 #[test]
 fn both_backends_gate_before_their_bootstrap_ddl_2445() {
     let root = repo_root();
-    let read = |rel: &str| std::fs::read_to_string(root.join(rel)).expect("read source");
+    let read = |rel: &str| {
+        std::fs::read_to_string(pathpin::pin_file(root.join(rel))).expect("read source")
+    };
 
     // ---- sqlite: db::open ----
     let sqlite = read("src/storage/connection.rs");

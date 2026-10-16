@@ -23,6 +23,9 @@
 //! Each capture is proven non-vacuous: the same sink, handed the RAW DSN
 //! through sqlx directly, does contain the secret.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -463,7 +466,10 @@ fn walk_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 fn every_production_sqlx_connect_goes_through_the_dsn_funnel_3674() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
-    walk_rs(&root.join("src"), &mut files);
+    walk_rs(
+        &pathpin::pin_rs_root(root.join("src"), pathpin::SRC_RS_MIN),
+        &mut files,
+    );
     files.sort();
 
     let mut observed: Vec<(String, usize, usize)> = Vec::new();

@@ -66,6 +66,9 @@
 
 #![allow(clippy::missing_panics_doc)]
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::path::{Path, PathBuf};
 
 /// Recursively visit every `.rs` file under `dir`. Copied (not shared) from the
@@ -159,7 +162,10 @@ fn line_has_bare_excluded_floor(line: &str) -> bool {
 /// in the two storage adapters; any test fixture reproducing it lives in THIS
 /// file, which is not under `src/`.
 fn collect_bare_floor_sites() -> Vec<BareFloorSite> {
-    let src_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src_root = pathpin::pin_rs_root(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
+        pathpin::SRC_RS_MIN,
+    );
     let mut sites: Vec<BareFloorSite> = Vec::new();
     walk_rs_files(&src_root, &mut |path, raw| {
         let stripped = strip_all_comments(raw);
@@ -296,7 +302,10 @@ fn detector_sees_the_real_floored_funnels_in_src() {
     // Belt-and-braces: prove the FLOORED form is actually present in production
     // (so a refactor that hides the funnels from the scan can't silently
     // disable the invariant while the enforced test passes vacuously).
-    let src_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src_root = pathpin::pin_rs_root(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src"),
+        pathpin::SRC_RS_MIN,
+    );
     let mut floored = 0usize;
     walk_rs_files(&src_root, &mut |_path, raw| {
         let stripped = strip_all_comments(raw);

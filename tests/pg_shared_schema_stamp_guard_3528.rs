@@ -58,6 +58,9 @@
 //! gate is proven to CATCH the pre-#3528 shape and SPARE the corrected one,
 //! rather than passing vacuously on today's tree (M-TAUTOLOGICAL-TESTS).
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::path::{Path, PathBuf};
 
 /// The accessor that returns the SHARED `AI_MEMORY_TEST_POSTGRES_URL`.
@@ -78,7 +81,10 @@ const STAMP_MUTATIONS: [&str; 3] = [
 const INLINE_SQLX: [&str; 2] = ["sqlx::query(", "sqlx::raw_sql("];
 
 fn repo_src_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    pathpin::pin_rs_root(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        pathpin::SRC_RS_MIN,
+    )
 }
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {

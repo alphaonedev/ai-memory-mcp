@@ -32,6 +32,9 @@
 //! file, so a pin that has stopped measuring anything shows up as a
 //! failing control rather than as a green vacuum.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -224,7 +227,7 @@ fn retired_alias_is_absent_from_every_current_surface_3627() {
 
     let mut files: Vec<PathBuf> = Vec::new();
     for rel in SCANNED_ROOTS {
-        collect_files(&root.join(rel), &mut files);
+        collect_files(&pathpin::pin_dir(root.join(rel)), &mut files);
     }
     for rel in SCANNED_ROOT_FILES {
         let path = root.join(rel);

@@ -50,7 +50,10 @@ fn moved_dir_panics() {
 #[test]
 fn present_file_resolves() {
     let tree = scratch("present_file");
-    assert_eq!(pathpin::pin_file(tree.join("src/a.rs")), tree.join("src/a.rs"));
+    assert_eq!(
+        pathpin::pin_file(tree.join("src/a.rs")),
+        tree.join("src/a.rs")
+    );
 }
 
 #[test]
@@ -72,7 +75,10 @@ fn moved_file_panics() {
 fn files_are_found_recursively_and_sorted() {
     let tree = scratch("files");
     let files = pathpin::pin_files(tree.join("src"), "*.rs", 2);
-    assert_eq!(files, vec![tree.join("src/a.rs"), tree.join("src/sub/b.rs")]);
+    assert_eq!(
+        files,
+        vec![tree.join("src/a.rs"), tree.join("src/sub/b.rs")]
+    );
 }
 
 #[test]

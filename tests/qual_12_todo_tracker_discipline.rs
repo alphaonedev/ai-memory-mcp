@@ -18,6 +18,9 @@
 //! An untracked TODO is a substrate defect. Adding one requires
 //! also adding the tracker reference or filing the issue first.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::fs;
 use std::path::Path;
 
@@ -94,7 +97,10 @@ const KNOWN_UNTRACKED_LOCATIONS: &[(&str, u32)] = &[];
 
 #[test]
 fn qual_12_every_todo_has_a_tracker_reference() {
-    let files = walk_rs(Path::new("src"));
+    let files = walk_rs(&pathpin::pin_rs_root(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        pathpin::SRC_RS_MIN,
+    ));
     let mut violations: Vec<(String, u32, String)> = Vec::new();
 
     for path in &files {
@@ -190,7 +196,10 @@ fn qual_12_todo_count_pinned_at_known_ceiling() {
     // the G2/G3 + hooks/chain.rs gap TODOs). Bumping above this
     // ceiling fails the test; bringing the count below requires
     // lowering the ceiling in the same commit.
-    let files = walk_rs(Path::new("src"));
+    let files = walk_rs(&pathpin::pin_rs_root(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        pathpin::SRC_RS_MIN,
+    ));
     let mut count = 0usize;
     for path in &files {
         let Ok(content) = fs::read_to_string(path) else {

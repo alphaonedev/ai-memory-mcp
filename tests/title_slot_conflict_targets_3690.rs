@@ -36,11 +36,14 @@
 //! adapters only route. That is pinned by the unit tests beside it and by
 //! `tests/title_slot_admission_3690{,_pg}.rs`.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
 fn read(rel: &str) -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+    let path = pathpin::pin_file(Path::new(env!("CARGO_MANIFEST_DIR")).join(rel));
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
@@ -56,7 +59,13 @@ fn src_files() -> Vec<String> {
         }
     }
     let mut out = Vec::new();
-    walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
+    walk(
+        &pathpin::pin_rs_root(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            pathpin::SRC_RS_MIN,
+        ),
+        &mut out,
+    );
     out.sort();
     out
 }

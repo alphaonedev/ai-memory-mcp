@@ -35,6 +35,9 @@
 //! `tests/db_open_funnel_ceiling_2445.rs` precedent. The fix for a violation is
 //! to add/keep the guard and update the pin — NOT to widen it silently.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::path::{Path, PathBuf};
 
 /// The frozen guard-CALL inventory: `(file, count, disposition)`.
@@ -238,7 +241,10 @@ fn walk_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 fn every_class_a_guard_call_is_enumerated_2572() {
     let root = repo_root();
     let mut files = Vec::new();
-    walk_rs(&root.join("src"), &mut files);
+    walk_rs(
+        &pathpin::pin_rs_root(root.join("src"), pathpin::SRC_RS_MIN),
+        &mut files,
+    );
     files.sort();
 
     let mut observed: Vec<(String, usize)> = Vec::new();
@@ -321,7 +327,8 @@ fn carve_outs_stay_node_local_and_unguarded_2572() {
 #[test]
 fn the_shared_guard_funnel_names_the_http_daemon_remedy_2572() {
     let root = repo_root();
-    let backup = std::fs::read_to_string(root.join("src/cli/backup.rs")).expect("read backup.rs");
+    let backup = std::fs::read_to_string(pathpin::pin_file(root.join("src/cli/backup.rs")))
+        .expect("read backup.rs");
     assert!(
         backup.contains("pub(crate) fn refuse_pg_store("),
         "the single shared class-(a) funnel `refuse_pg_store` must be defined in src/cli/backup.rs"

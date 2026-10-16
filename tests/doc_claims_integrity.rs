@@ -30,6 +30,9 @@
 //! Run: `( umask 022; cargo test --test doc_claims_integrity )`
 //! (the bare `cargo test` umask trap is #2628).
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -39,7 +42,8 @@ fn repo_root() -> PathBuf {
 }
 
 fn read(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    fs::read_to_string(pathpin::pin_file(path))
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
 /// Collapse every path-PARAMETER segment to `{}`.

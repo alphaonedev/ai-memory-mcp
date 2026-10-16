@@ -15,6 +15,9 @@
 // skip `*test*.rs` / `tests.rs` / lines at-or-below the first
 // `mod tests {` / `pub mod tests {` occurrence in each file.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use ai_memory::models::AttestLevel;
 use std::fs;
 use std::path::Path;
@@ -80,7 +83,13 @@ fn extract_attest_level_literals(line: &str) -> Vec<String> {
 fn every_production_attest_level_literal_parses_via_from_str() {
     let mut files = Vec::new();
     for dir in SRC_DIRS {
-        walk_rs_files(Path::new(dir), &mut files);
+        walk_rs_files(
+            &pathpin::pin_rs_root(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join(dir),
+                pathpin::SRC_RS_MIN,
+            ),
+            &mut files,
+        );
     }
     assert!(
         !files.is_empty(),

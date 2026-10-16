@@ -45,6 +45,9 @@
 //! allowlisted", not "every write is gated at run time". The run-time
 //! proof is the record-stop behavioural cells.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::collections::{HashMap, HashSet};
 
 #[path = "common/cfg_test_modules.rs"]
@@ -1195,7 +1198,7 @@ fn b7_gate_must_be_called_by_the_target_itself_r4_g2() {
 #[test]
 fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let src_root = root.join("src");
+    let src_root = pathpin::pin_rs_root(root.join("src"), pathpin::SRC_RS_MIN);
     let mut files = Vec::new();
     walk_rs(&src_root, &mut files);
     let sources: Vec<(String, String)> = files
@@ -1323,8 +1326,10 @@ fn record_stop_write_sql_fns_are_gated_or_allowlisted_b7() {
         extra.join("\n  ")
     );
 
-    let sqlite_src = fs::read_to_string(root.join("src/storage/mod.rs")).expect("storage/mod.rs");
-    let pg_src = fs::read_to_string(root.join("src/store/postgres.rs")).expect("postgres.rs");
+    let sqlite_src = fs::read_to_string(pathpin::pin_file(root.join("src/storage/mod.rs")))
+        .expect("storage/mod.rs");
+    let pg_src = fs::read_to_string(pathpin::pin_file(root.join("src/store/postgres.rs")))
+        .expect("postgres.rs");
     let allow_txt = include_str!("record_stop_b7_allowlist.txt");
     let mut parity_fail = Vec::new();
     for (sqlite_fn, pg_fn) in SQLITE_PG_TWINS {
@@ -1473,7 +1478,8 @@ fn a_comment_ending_in_a_backslash_never_hides_a_writer_4148() {
 #[test]
 fn migrate_only_repair_is_not_public_4324() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let src = fs::read_to_string(root.join("src/storage/embed_skip.rs")).expect("embed_skip.rs");
+    let src = fs::read_to_string(pathpin::pin_file(root.join("src/storage/embed_skip.rs")))
+        .expect("embed_skip.rs");
     let decl = src
         .lines()
         .find(|l| l.contains("fn repair_sqlite_after_trigger_gap"))
@@ -1506,7 +1512,10 @@ fn mentions_bare_ident(line: &str, name: &str) -> bool {
 fn repair_call_sites_are_migrate_only_4324() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
-    walk_rs(&root.join("src"), &mut files);
+    walk_rs(
+        &pathpin::pin_rs_root(root.join("src"), pathpin::SRC_RS_MIN),
+        &mut files,
+    );
     let mut sites: Vec<String> = Vec::new();
     for f in &files {
         let Ok(text) = fs::read_to_string(f) else {

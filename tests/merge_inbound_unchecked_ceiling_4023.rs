@@ -32,6 +32,9 @@
 //!
 //! Counts are pinned in BOTH directions so the ledger cannot rot.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::path::Path;
 
 #[path = "common/cfg_test_modules.rs"]

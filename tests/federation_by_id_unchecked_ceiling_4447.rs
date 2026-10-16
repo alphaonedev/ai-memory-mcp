@@ -24,6 +24,9 @@
 //! are different identifiers and are never counted; comments, doc lines and
 //! string literals are not code.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::path::Path;
 
 #[path = "common/cfg_test_modules.rs"]

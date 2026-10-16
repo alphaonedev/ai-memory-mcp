@@ -8,6 +8,9 @@
 //! that asserts N named sites are clean cannot see site N+1 and passes
 //! precisely because someone forgot one.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::path::Path;
 
 /// Sites whose error is OUR OWN closed vocabulary, not foreign text.
@@ -85,7 +88,10 @@ fn leak_sites(src: &str) -> Vec<(usize, String)> {
 
 #[test]
 fn no_handler_renders_a_driver_error_into_a_caller_body_3707() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers");
+    let root = pathpin::pin_rs_root(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/handlers"),
+        10,
+    );
     let mut offenders: Vec<String> = Vec::new();
     let mut scanned = 0usize;
 

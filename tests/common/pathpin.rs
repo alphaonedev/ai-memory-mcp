@@ -9,7 +9,7 @@
 //! minimum, so a `git mv` of the target turns the test red.
 //!
 //! Leaf module, `std` only. It is deliberately NOT declared in
-//! `tests/common/mod.rs` (that module pulls reqwest, ed25519_dalek and
+//! `tests/common/mod.rs` (that module pulls `reqwest`, `ed25519_dalek` and
 //! rusqlite into every binary that declares it); take it with the path idiom:
 //!
 //! ```ignore
@@ -31,6 +31,10 @@ pub const MIN_PIN: usize = 1;
 
 /// The glob that selects Rust sources.
 pub const RS_GLOB: &str = "*.rs";
+
+/// The floor for a walk over the whole crate source tree (601 `.rs` files today). A
+/// partial move of the tree trips it as surely as a missing directory does.
+pub const SRC_RS_MIN: usize = 100;
 
 /// Resolve a pinned directory; panic when it is missing.
 pub fn pin_dir(path: impl AsRef<Path>) -> PathBuf {
@@ -57,7 +61,10 @@ pub fn pin_file(path: impl AsRef<Path>) -> PathBuf {
 /// Pin `path` and return the sorted files under it whose NAME matches `glob`;
 /// panic when the directory is missing or fewer than `min` files match.
 pub fn pin_files(path: impl AsRef<Path>, glob: &str, min: usize) -> Vec<PathBuf> {
-    assert!(min >= MIN_PIN, "pathpin: minimum must be at least {MIN_PIN}, got {min}");
+    assert!(
+        min >= MIN_PIN,
+        "pathpin: minimum must be at least {MIN_PIN}, got {min}"
+    );
     let dir = pin_dir(path);
     let mut files = Vec::new();
     collect(&dir, glob, &mut files);
@@ -82,20 +89,27 @@ pub fn pin_rs_root(path: impl AsRef<Path>, min: usize) -> PathBuf {
 
 /// Assert a count a test computed itself is at least `min`, naming `what`.
 pub fn pin_count(what: &str, found: usize, min: usize) {
-    assert!(min >= MIN_PIN, "pathpin: minimum must be at least {MIN_PIN}, got {min}");
+    assert!(
+        min >= MIN_PIN,
+        "pathpin: minimum must be at least {MIN_PIN}, got {min}"
+    );
     assert!(found >= min, "pathpin: {found} {what}, need at least {min}");
 }
 
 fn collect(dir: &Path, glob: &str, out: &mut Vec<PathBuf>) {
-    let entries = fs::read_dir(dir)
-        .unwrap_or_else(|e| panic!("pathpin: read_dir {}: {e}", dir.display()));
+    let entries =
+        fs::read_dir(dir).unwrap_or_else(|e| panic!("pathpin: read_dir {}: {e}", dir.display()));
     for entry in entries {
         let path = entry
             .unwrap_or_else(|e| panic!("pathpin: dir entry under {}: {e}", dir.display()))
             .path();
         if path.is_dir() {
             collect(&path, glob, out);
-        } else if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| glob_match(glob, n)) {
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| glob_match(glob, n))
+        {
             out.push(path);
         }
     }

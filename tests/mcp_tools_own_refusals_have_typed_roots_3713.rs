@@ -12,6 +12,9 @@
 //! that ends with the macro opener (`anyhow!(` / `bail!(`) carries its literal
 //! on the next line and counts too — three promote refusals had that shape.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::path::Path;
 
 /// (file, exact trimmed line, reason). Every entry must still exist — a
@@ -55,11 +58,14 @@ const CARRIERS: &[&str] = &[
 
 #[test]
 fn every_string_carrier_in_mcp_tools_is_a_typed_root_or_an_allowed_foreign_wrap_3713() {
-    let dir = Path::new("src/mcp/tools");
+    let dir = pathpin::pin_rs_root(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp/tools"),
+        10,
+    );
     let mut violations = Vec::new();
     let mut seen_allowed = vec![0usize; ALLOWED.len()];
     let mut files = 0;
-    for entry in std::fs::read_dir(dir).expect("src/mcp/tools exists") {
+    for entry in std::fs::read_dir(&dir).expect("src/mcp/tools exists") {
         let path = entry.expect("dir entry").path();
         if path.extension().and_then(|e| e.to_str()) != Some("rs") {
             continue;

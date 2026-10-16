@@ -47,6 +47,9 @@
 //! guard is proven to CATCH the defect rather than pass vacuously on
 //! today's tree (M-TAUTOLOGICAL-TESTS).
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -84,7 +87,7 @@ fn root() -> PathBuf {
 }
 
 fn read(rel: &str) -> String {
-    let p = root().join(rel);
+    let p = pathpin::pin_file(root().join(rel));
     fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
 }
 
@@ -475,7 +478,10 @@ fn mcp_tools_call_arm_resolves_authority_before_the_table_lookup_3549() {
 #[test]
 fn mcp_ctx_is_constructed_at_exactly_one_site_3549() {
     let mut files = Vec::new();
-    collect_rs(&root().join("src"), &mut files);
+    collect_rs(
+        &pathpin::pin_rs_root(root().join("src"), pathpin::SRC_RS_MIN),
+        &mut files,
+    );
     let mut sites = Vec::new();
     for f in &files {
         let src = fs::read_to_string(f).expect("read");
@@ -549,7 +555,10 @@ fn every_http_route_registration_sits_under_the_authority_layer_3549() {
 #[test]
 fn http_route_registrations_live_only_in_the_router_builder_3549() {
     let mut files = Vec::new();
-    collect_rs(&root().join("src"), &mut files);
+    collect_rs(
+        &pathpin::pin_rs_root(root().join("src"), pathpin::SRC_RS_MIN),
+        &mut files,
+    );
     let mut stray = Vec::new();
     for f in &files {
         let src = fs::read_to_string(f).expect("read");
@@ -634,8 +643,11 @@ fn authority_is_constructed_only_inside_its_own_module_3549() {
         "Authority::new must stay a PRIVATE fn"
     );
     let mut files = Vec::new();
-    collect_rs(&root().join("src"), &mut files);
-    collect_rs(&root().join("tests"), &mut files);
+    collect_rs(
+        &pathpin::pin_rs_root(root().join("src"), pathpin::SRC_RS_MIN),
+        &mut files,
+    );
+    collect_rs(&pathpin::pin_rs_root(root().join("tests"), 1), &mut files);
     let mut leaks = Vec::new();
     // This guard names the construction needles as string literals, so it
     // is the one file besides the definition that legitimately contains them.
@@ -678,7 +690,10 @@ fn is_visible_to_caller_is_retired_as_a_public_predicate_3549() {
         "is_visible_to_caller must not be pub / pub(crate)"
     );
     let mut files = Vec::new();
-    collect_rs(&root().join("src"), &mut files);
+    collect_rs(
+        &pathpin::pin_rs_root(root().join("src"), pathpin::SRC_RS_MIN),
+        &mut files,
+    );
     let mut callers = Vec::new();
     for f in &files {
         if rel(f) == VISIBILITY {
@@ -721,7 +736,10 @@ fn every_read_only_tool_calls_the_read_funnel_or_is_allowlisted_3549() {
         tools.len()
     );
     let mut files = Vec::new();
-    collect_rs(&root().join("src/mcp/tools"), &mut files);
+    collect_rs(
+        &pathpin::pin_rs_root(root().join("src/mcp/tools"), 1),
+        &mut files,
+    );
     let tool_files: Vec<(String, String)> = files
         .iter()
         .map(|f| (rel(f), fs::read_to_string(f).expect("read")))
