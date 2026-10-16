@@ -235,6 +235,11 @@ jobs:
         run: python3 scripts/test/test_workflow_concurrency_6340.py
       - name: Shard partition and wiring unit tests (#6344)
         run: python3 -m unittest discover -s scripts/ci/tests
+      # #7160 - scripts/test/ is outside the discovery root above; run the
+      # sweep script tests (including the Linux-only O_PATH test, which this
+      # ubuntu-latest job is where it executes) and the sweep workflow pin.
+      - name: Target sweep unit tests (#7160)
+        run: python3 -m unittest scripts/test/test_ci_sweep_target.py scripts/test/test_workflow_sweep_7160.py
       - id: cls
         shell: bash
         env:

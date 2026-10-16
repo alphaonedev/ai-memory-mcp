@@ -199,5 +199,38 @@ class CapLiteral(unittest.TestCase):
             self.assertEqual(field(found[0], "continue-on-error"), "")
 
 
+class SweepTestsRunInCi(unittest.TestCase):
+    """#7160 F3: a CI step runs the sweep unit tests, so the Linux-only S7 test executes there."""
+
+    SWEEP_TEST_FILE = "scripts/test/test_ci_sweep_target.py"
+    PIN_TEST_FILE = "scripts/test/test_workflow_sweep_7160.py"
+    DISCOVERY = "python3 -m unittest discover -s scripts/ci/tests"
+
+    def setUp(self):
+        self.classify = steps(job_lines(read(CI_YML), "classify"))
+
+    def runs(self, test_file):
+        return [
+            s for s in self.classify
+            if "unittest" in field(s, "run") and test_file in field(s, "run")
+        ]
+
+    def test_classify_job_runs_the_sweep_unit_tests_7160_f3(self):
+        found = self.runs(self.SWEEP_TEST_FILE)
+        self.assertEqual(len(found), 1, "no classify step runs %s" % self.SWEEP_TEST_FILE)
+        self.assertEqual(field(found[0], "if"), "", "the sweep tests must run on every event")
+        self.assertEqual(field(found[0], "continue-on-error"), "")
+
+    def test_classify_job_runs_the_sweep_workflow_pin_7160_f3(self):
+        self.assertEqual(len(self.runs(self.PIN_TEST_FILE)), 1)
+
+    def test_existing_discovery_step_is_intact_7160_f3(self):
+        found = [s for s in self.classify if field(s, "run") == self.DISCOVERY]
+        self.assertEqual(len(found), 1)
+
+    def test_classify_job_runs_on_linux_so_o_path_exists_7160_f3(self):
+        self.assertIn("    runs-on: ubuntu-latest", job_lines(read(CI_YML), "classify"))
+
+
 if __name__ == "__main__":
     unittest.main()
