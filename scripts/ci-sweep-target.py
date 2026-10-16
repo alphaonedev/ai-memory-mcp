@@ -38,13 +38,23 @@ EXIT_BAD_CAP = 3
 EXIT_UNREADABLE = 4
 
 
-def entry_size(path):
-    """Bytes under path without following symlinks (a symlink counts as itself)."""
+def entry_size(path, warnings=None):
+    """Bytes under path without following symlinks (a symlink counts as itself).
+
+    A nested directory that cannot be listed is appended to ``warnings`` (same
+    wording as the top-level unreadable-directory warning) and counts as its
+    own size only.
+    """
     st = os.lstat(path)
     if not os.path.isdir(path) or os.path.islink(path):
         return st.st_size
     total = st.st_size
-    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+
+    def on_error(exc):
+        if warnings is not None:
+            warnings.append("cannot read {}: {}".format(exc.filename, exc))
+
+    for dirpath, dirnames, filenames in os.walk(path, followlinks=False, onerror=on_error):
         for name in dirnames + filenames:
             try:
                 total += os.lstat(os.path.join(dirpath, name)).st_size
@@ -98,7 +108,7 @@ def collect_entries(target, warnings):
         for child in children:
             try:
                 mtime = child.stat(follow_symlinks=False).st_mtime
-                size = entry_size(child.path)
+                size = entry_size(child.path, warnings)
             except OSError as exc:
                 warnings.append("cannot size {}: {}".format(child.path, exc))
                 continue

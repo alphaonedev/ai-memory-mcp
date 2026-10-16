@@ -189,6 +189,18 @@ class SweepTests(SweepTestCase):
         self.assertIn(str(deps), res.stderr)
         self.assertFalse(other.exists())
 
+    @unittest.skipIf(os.geteuid() == 0, "root can read a mode-000 directory")
+    def test_unreadable_nested_dir_warns_7160_s3(self):
+        nested = self.debug / "deps" / "pkg" / "sub"
+        write_blob(nested / "inner.o")
+        write_blob(self.debug / "deps" / "pkg" / "top.o")
+        nested.chmod(0)
+        self.locked.append(nested)
+        res = self.run_sweep("--max-bytes", str(100 * ENTRY_BYTES), "--dry-run")
+        self.assertEqual(res.returncode, EXIT_OK, res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertIn("cannot read {}".format(nested), res.stderr)
+
     def test_nothing_outside_four_dirs_touched(self):
         swept = []
         for rank, sub in enumerate(SWEPT_SUBDIRS):
