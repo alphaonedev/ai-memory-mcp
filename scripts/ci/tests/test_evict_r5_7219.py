@@ -291,5 +291,71 @@ class EvictionIsSerialisedAgainstJobStart7292(JobStartHelper):
         self.assertTrue((outside / "keep").exists())
 
 
+class UnresolvablePaths7284(Fixture):
+    def loop(self, path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(path)
+        return path
+
+    def run_main(self, protected, evict=None):
+        work = SCRATCH / "runner" / "_work"
+        workspace = work / "repo" / "repo"
+        workspace.mkdir(parents=True, exist_ok=True)
+        argv = ["--work-root", str(work), "--workspace", str(workspace),
+                "--protected-root", str(protected), "--home", str(self.home)]
+        if evict is not None:
+            argv += ["--evict-root", str(evict), "--runner-name", ME]
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = prune.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_s1_loop_as_protected_and_evict_root_is_usage_not_a_traceback(self):
+        looped = self.loop(self.home / "loop-root")
+        rc, _, err = self.run_main(looped, looped)
+        self.assertEqual(rc, prune.EXIT_USAGE)
+        self.assertIn("refusing: unresolvable path:", err)
+
+    def test_s1_loop_only_as_evict_root_is_usage(self):
+        looped = self.loop(self.home / "loop-root")
+        rc, _, err = self.run_main(self.root, looped)
+        self.assertEqual(rc, prune.EXIT_USAGE)
+        self.assertIn("refusing: unresolvable path:", err)
+        self.assertTrue(self.idle.exists())
+
+    def test_s1_loop_only_as_protected_root_is_usage(self):
+        looped = self.loop(self.home / "loop-root")
+        rc, _, err = self.run_main(looped)
+        self.assertEqual(rc, prune.EXIT_USAGE)
+        self.assertIn("refusing: unresolvable path:", err)
+
+    def stale_temp(self, name="old-job"):
+        stale = SCRATCH / "runner" / "_work" / "_temp" / name
+        stale.mkdir(parents=True)
+        old = time.time() - IDLE_AGE_DAYS * DAY
+        os.utime(stale, (old, old))
+        return stale
+
+    def test_s2_one_unresolvable_child_does_not_disable_every_prune(self):
+        self.loop(self.root / "loop-child")
+        stale = self.stale_temp()
+        rc, _, err = self.run_main(self.root)
+        self.assertEqual(rc, prune.EXIT_OK)
+        self.assertFalse(stale.exists(), "the loop child disabled the prune")
+        self.assertIn("protected root child unresolvable: %s" % (self.root / "loop-child"), err)
+
+    def test_s2_an_unresolvable_child_is_protected_by_its_lexical_path(self):
+        looped = self.loop(self.root / "loop-child")
+        self.assertTrue(prune.is_protected(looped, self.root))
+        self.assertFalse(prune.is_protected(SCRATCH / "runner" / "_work" / "_temp" / "x", self.root))
+
+    def test_s2_dropped_protected_candidates_are_logged(self):
+        protected = self.stale_temp("keep-me")
+        rc, out, _ = self.run_main(protected)
+        self.assertEqual(rc, prune.EXIT_OK)
+        self.assertTrue(protected.exists())
+        self.assertIn("skipped protected %s" % protected, out)
+
+
 if __name__ == "__main__":
     unittest.main()

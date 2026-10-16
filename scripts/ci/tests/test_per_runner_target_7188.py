@@ -230,12 +230,13 @@ def prove_defect():
 
 
 class WorkflowNoExpressionInRun(unittest.TestCase):
-    """r3 F2: no ${{ expression is spliced into a ``run:`` script."""
+    """r3 F2 + #7284 S3: no ${{ expression is spliced into any line of a ``run:`` body."""
+
+    def ci_text(self):
+        return (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
 
     def step_run(self, name):
-        ci = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        body = ci.split(name, 1)[1]
-        return [ln for ln in body.splitlines() if ln.strip().startswith("run:")][0]
+        return self.run_body(self.ci_text(), name)
 
     def test_per_runner_target_step_has_no_expression_in_run(self):
         run = self.step_run("Per-runner cargo target (#7188)")
@@ -244,6 +245,41 @@ class WorkflowNoExpressionInRun(unittest.TestCase):
 
     def test_prune_step_has_no_expression_in_run(self):
         self.assertNotIn("${{", self.step_run("Prune stale runner artifacts (#7188)"))
+
+    def test_the_pin_reads_every_line_of_a_block_scalar(self):
+        fixture = (
+            "jobs:\n  a:\n    steps:\n"
+            "      - name: Demo step\n"
+            "        run: |\n"
+            "          echo first\n"
+            "          echo ${{ github.event.head_commit.message }}\n"
+            "      - name: Next step\n"
+            "        run: echo clean\n")
+        self.assertIn("${{", self.run_body(fixture, "Demo step"))
+        self.assertNotIn("${{", self.run_body(fixture, "Next step"))
+
+    def test_the_pin_reads_folded_and_single_line_run_bodies(self):
+        fixture = (
+            "      - name: Folded\n"
+            "        run: >\n"
+            "          echo one\n"
+            "          ${{ x }}\n"
+            "      - name: Single\n"
+            "        run: echo ${{ y }}\n")
+        self.assertIn("${{", self.run_body(fixture, "Folded"))
+        self.assertIn("${{", self.run_body(fixture, "Single"))
+
+    def test_a_clean_block_scalar_passes_the_pin(self):
+        fixture = (
+            "      - name: Clean\n"
+            "        env:\n"
+            "          RUNNER_NAME_ARG: ${{ runner.name }}\n"
+            "        run: |\n"
+            "          python3 x.py \"$RUNNER_NAME_ARG\"\n"
+            "          echo done\n")
+        body = self.run_body(fixture, "Clean")
+        self.assertNotIn("${{", body)
+        self.assertIn("echo done", body)
 
 
 if __name__ == "__main__":
