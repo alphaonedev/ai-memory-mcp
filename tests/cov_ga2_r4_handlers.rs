@@ -558,6 +558,9 @@ async fn admin_register_invalid_agent_type_is_400() {
 
 #[tokio::test]
 async fn admin_register_sqlite_create_path() {
+    // #7259 — a sibling test used to install the admin header trust for this process; under
+    // cargo nextest (one process per test) the test installs its own prerequisite.
+    enable_admin_header_trust();
     let (r, _t, _db) = sqlite_router();
     let agent_id = uid("ai:cov-ga2-r4-reg");
     let (status, body) = post_as(

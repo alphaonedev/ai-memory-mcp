@@ -2207,6 +2207,9 @@ async fn pg_session_start_invalid_agent_id_400() {
 
 #[tokio::test]
 async fn pg_sync_since_no_param_returns_envelope() {
+    // #7259 — the peer-enrollment opt-out used to come from a sibling test (nextest: one
+    // process per test), so the test installs its own prerequisite.
+    install_federation_legacy_bypass_pg();
     let (router, _f) = build_fake_pg_router();
     let (status, _v) = get_uri(&router, "/api/v1/sync/since").await;
     assert!(
@@ -2219,6 +2222,8 @@ async fn pg_sync_since_no_param_returns_envelope() {
 
 #[tokio::test]
 async fn pg_sync_since_with_peer_query() {
+    // #7259 — see pg_sync_since_no_param_returns_envelope.
+    install_federation_legacy_bypass_pg();
     let (router, _f) = build_fake_pg_router();
     let (status, _v) = get_uri(&router, "/api/v1/sync/since?peer=pg-peer-x&limit=10").await;
     assert!(

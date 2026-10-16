@@ -362,6 +362,10 @@ async fn k8_http_link_at_links_per_day_limit_returns_429_1621() {
 
     const AID: &str = "ai:k8-http-1621";
 
+    // #7259 — the two seeding stores are attestation-gated (#1919); under cargo nextest no
+    // sibling test has opted this process out, so the test installs its own prerequisite.
+    common::permissive_attestation_for_tests();
+
     let f = tempfile::NamedTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
