@@ -46,17 +46,21 @@ def resolve(path):
 
 def is_protected(candidate, protected_root):
     """True if ``candidate`` is, is inside, or contains the protected root."""
-    cand = resolve(candidate)
-    protected = resolve(protected_root)
-    if _covers(cand, protected):
-        return True
-    # F1: a direct child of the root may be a link that resolves elsewhere
-    # (including back into the work root); its target is protected too.
+    # r3 F1: an unknown state (loop, vanished or unreadable path) is protected.
     try:
-        children = list(Path(protected_root).iterdir())
-    except OSError:
-        return False
-    return any(_covers(cand, resolve(child)) for child in children)
+        cand = resolve(candidate)
+        protected = resolve(protected_root)
+        if _covers(cand, protected):
+            return True
+        # A direct child of the root may be a link that resolves elsewhere
+        # (including back into the work root); its target is protected too.
+        try:
+            children = list(Path(protected_root).iterdir())
+        except (FileNotFoundError, NotADirectoryError):
+            return False  # no such root yet: it has no children to protect
+        return any(_covers(cand, resolve(child)) for child in children)
+    except (OSError, RuntimeError):
+        return True
 
 
 def _covers(cand, protected):
@@ -130,22 +134,38 @@ def scan(work_root, workspace, protected_root, max_age_days, now):
                 break
         else:
             found.append(current)
-        for entry in sorted(workspace.iterdir()):
+        try:
+            entries = sorted(workspace.iterdir())
+        except OSError as err:
+            print("could not list %s: %s" % (workspace, err), file=sys.stderr)
+            entries = []
+        for entry in entries:
             if not entry.name.startswith(TMP_PREFIX):
                 continue
-            if entry.is_symlink():
-                skipped.append(entry)
-            elif entry.is_dir():
-                found.append(entry)
+            try:
+                if entry.is_symlink():
+                    skipped.append(entry)
+                elif entry.is_dir():
+                    found.append(entry)
+            except OSError as err:
+                print("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
     temp_root = Path(work_root) / TEMP_DIR_NAME
     if temp_root.is_symlink():
         skipped.append(temp_root)
     elif temp_root.is_dir():
-        for entry in sorted(temp_root.iterdir()):
-            if entry.is_symlink():
-                skipped.append(entry)
-            elif entry.is_dir() and is_old(entry, max_age_days, now):
-                found.append(entry)
+        try:
+            entries = sorted(temp_root.iterdir())
+        except OSError as err:
+            print("could not list %s: %s" % (temp_root, err), file=sys.stderr)
+            entries = []
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    skipped.append(entry)
+                elif entry.is_dir() and is_old(entry, max_age_days, now):
+                    found.append(entry)
+            except OSError as err:
+                print("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
     keep = [path for path in found if not is_protected(path, protected_root)]
     return keep, skipped
 
@@ -204,17 +224,8 @@ def build_parser():
     return parser
 
 
-def main(argv=None):
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if args.max_age_days < 1:
-        parser.error("--max-age-days must be >= 1")
-    problem = validate_arguments(args.work_root, args.workspace, args.protected_root)
-    if problem:
-        print("prune_runner_artifacts: refusing: %s" % problem, file=sys.stderr)
-        return EXIT_USAGE
-    if is_out_of_tree(args.work_root, args.protected_root):
-        print("protected root %s is outside the work root; nothing to protect" % args.protected_root)
+def prune_all(args):
+    """Scan and remove; return the number of failed removals."""
     failures = 0
     candidates, skipped = scan(
         args.work_root, args.workspace, args.protected_root, args.max_age_days, time.time()
@@ -236,9 +247,30 @@ def main(argv=None):
                 print("removed %s" % path)
             else:
                 print("skipped %s: %s" % (path, why))
-        except OSError as err:
+        except (OSError, RuntimeError) as err:
             failures += 1
             print("could not remove %s: %s" % (path, err), file=sys.stderr)
+    return failures
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.max_age_days < 1:
+        parser.error("--max-age-days must be >= 1")
+    problem = validate_arguments(args.work_root, args.workspace, args.protected_root)
+    if problem:
+        print("prune_runner_artifacts: refusing: %s" % problem, file=sys.stderr)
+        return EXIT_USAGE
+    if is_out_of_tree(args.work_root, args.protected_root):
+        print("protected root %s is outside the work root; nothing to protect" % args.protected_root)
+    failures = 0
+    try:
+        failures = prune_all(args)
+    except (OSError, RuntimeError) as err:
+        # r3 F1: fail closed on deletion, soft on the exit code.
+        failures += 1
+        print("prune_runner_artifacts: aborted: %s" % err, file=sys.stderr)
     if failures:
         print("prune_runner_artifacts: %d removal(s) failed" % failures, file=sys.stderr)
     return EXIT_OK

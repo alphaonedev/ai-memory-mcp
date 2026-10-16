@@ -367,6 +367,61 @@ class Hardening7188R2(Fixture):
         self.assertNotIn("never fails the job", ci)
 
 
+class FailSoft(Fixture):
+    """r3 F1: fail CLOSED on deletion, SOFT on the exit code."""
+
+    def run_main(self, protected=None):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = prune.main(
+                ["--work-root", str(self.work), "--workspace", str(self.workspace),
+                 "--protected-root", str(protected or self.shared),
+                 "--max-age-days", str(MAX_AGE_DAYS)]
+            )
+        return rc
+
+    def test_b_symlink_loop_in_protected_root_does_not_crash(self):
+        loop = self.shared / "loop"
+        loop.symlink_to(loop)
+        self.assertEqual(self.run_main(), 0)
+        self.assertTrue((self.shared / "debug" / "deps").exists())
+        self.assertTrue(self.new_tmp.exists())
+        self.assertTrue(self.keep.exists())
+
+    def test_c_temp_entry_vanishing_mid_scan_does_not_crash(self):
+        real_is_old = prune.is_old
+
+        def vanish(path, max_age_days, now):
+            if path.name == "old":
+                shutil.rmtree(path)
+            return real_is_old(path, max_age_days, now)
+
+        with mock.patch.object(prune, "is_old", vanish):
+            self.assertEqual(self.run_main(), 0)
+        self.assertTrue(self.new_tmp.exists())
+        self.assertTrue(self.keep.exists())
+        self.assertTrue((self.shared / "debug" / "deps").exists())
+
+    def test_d_unreadable_temp_root_does_not_crash(self):
+        temp = self.work / "_temp"
+        real_iterdir = Path.iterdir
+
+        def deny(self_path):
+            if self_path == temp:
+                raise PermissionError(13, "Permission denied", str(self_path))
+            return real_iterdir(self_path)
+
+        with mock.patch.object(Path, "iterdir", deny):
+            self.assertEqual(self.run_main(), 0)
+        self.assertTrue(self.old_tmp.exists())
+        self.assertTrue(self.new_tmp.exists())
+        self.assertTrue((self.shared / "debug" / "deps").exists())
+
+    def test_unknown_resolve_state_is_protected(self):
+        with mock.patch.object(prune, "resolve", side_effect=RuntimeError("loop")):
+            self.assertTrue(prune.is_protected(self.old_tmp, self.shared))
+
+
 class PerRunnerRoot(Fixture):
     """r3: the whole per-runner target root is protected, siblings included."""
 
