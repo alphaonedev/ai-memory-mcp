@@ -52,14 +52,42 @@ fn deployment_selects_ordinary_artifacts_7103() {
     }
 }
 
+/// Every file of the fault harness: the integration suite plus each `.rs` file
+/// of the library-side module directory (globbed, so a new harness file is
+/// guarded without editing this list).
+fn harness_sources_7104() -> Vec<(String, String)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = vec![root.join("tests/failure_injection_hooks_7029.rs")];
+    let module_dir = root.join("src/failure_hook_tests");
+    let mut module_files: Vec<_> = std::fs::read_dir(&module_dir)
+        .expect("harness module directory")
+        .map(|entry| entry.expect("harness directory entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .collect();
+    module_files.sort();
+    assert!(
+        module_files.len() >= 2,
+        "the guard must see mod.rs and scenarios.rs, found {module_files:?}"
+    );
+    files.extend(module_files);
+    files
+        .into_iter()
+        .map(|path| {
+            let source = std::fs::read_to_string(&path).expect("harness source file");
+            (path.display().to_string(), source)
+        })
+        .collect()
+}
+
 #[test]
 fn hooks_do_not_mutate_process_environment_7104() {
-    let source = include_str!("failure_injection_hooks_7029.rs");
-    for forbidden in ["std::env::set_var", "std::env::remove_var", "MutexGuard"] {
-        assert!(
-            !source.contains(forbidden),
-            "fault tests must use child-only environment: {forbidden}"
-        );
+    for (path, source) in harness_sources_7104() {
+        for forbidden in ["std::env::set_var", "std::env::remove_var", "MutexGuard"] {
+            assert!(
+                !source.contains(forbidden),
+                "fault tests must use child-only environment: {forbidden} in {path}"
+            );
+        }
     }
 }
 
