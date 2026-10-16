@@ -69,7 +69,7 @@ NEXTEST_LOG = """\
         PASS [   0.020s] ai-memory::recall_basic recall_one
         PASS [   0.021s] ai-memory::recall_basic recall_two
 ------------
-     Summary [   0.100s] 4 tests run: 3 passed, 1 failed, 1 skipped
+     Summary [   0.100s] 5 tests run: 4 passed, 1 failed, 1 skipped
 """
 
 JUNIT = """\
@@ -262,6 +262,111 @@ class SplicedPrefix(unittest.TestCase):
         report = cts.compare(cts.parse_cargo_log(base), cts.parse_nextest_log(cand))
         self.assertEqual(report.baseline[('t', 'mod::a')], 'fail')
         self.assertEqual(report.candidate[('t', 'mod::a')], 'fail')
+
+
+class TotalsReconciliation(unittest.TestCase):
+    """#7298 F2: parsed per-test lines must agree with the runners' own totals."""
+
+    def test_cargo_totals_sum_across_binaries_and_skip_doc_tests(self):
+        scan = cts.scan_cargo_log(CARGO_LOG)
+        self.assertEqual((scan.total, scan.total_lines), (5, 3))  # 2 + 1 + 2 executed; the doc-test binary is excluded
+
+    def test_child_libtest_results_before_the_parents_closing_line_are_not_its_total(self):
+        # a test that re-executes its own test binary prints `running 1 test` / `test result:` first
+        log = ('     Running tests/t.rs (target/debug/deps/t-aaaaaaaaaaaaaaaa)\n\nrunning 3 tests\n'
+               'test mod::a ... ok\n\nrunning 1 test\ntest mod::b ... ok\n\n'
+               'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.01s\n\n'
+               'test mod::b ... ok\ntest mod::c ... ok\n\n'
+               'test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s\n')
+        scan = cts.scan_cargo_log(log)
+        self.assertEqual((scan.parsed, scan.total, scan.total_lines), (3, 3, 1))
+        cts.check_totals('cargo', scan)
+
+    def test_nextest_total_is_the_tests_run_figure(self):
+        scan = cts.scan_nextest_log(NEXTEST_LOG)
+        self.assertEqual((scan.total, scan.total_lines), (5, 1))
+
+    def test_gh_form_totals_parse(self):
+        scan = cts.scan_nextest_log(GH_NEXTEST_LINE + '\n' + GH_NEXTEST_SUMMARY + '\n')
+        self.assertEqual((scan.total, len(scan.outcomes)), (1, 1))
+
+    def test_consistent_logs_pass_the_check(self):
+        cts.check_totals('cargo', cts.scan_cargo_log(CARGO_LOG))
+        cts.check_totals('nextest', cts.scan_nextest_log(NEXTEST_LOG))
+
+    def test_a_line_missing_from_the_log_disagrees_with_the_total(self):
+        broken = CARGO_LOG.replace('test recall_two ... ok\n', '')
+        with self.assertRaises(cts.ParseError) as ctx:
+            cts.check_totals('cargo', cts.scan_cargo_log(broken))
+        self.assertIn('cargo', str(ctx.exception))
+        self.assertIn('4', str(ctx.exception))
+        self.assertIn('5', str(ctx.exception))
+
+    def test_a_log_without_any_total_is_refused_naming_the_missing_total(self):
+        no_total = '\n'.join(l for l in NEXTEST_LOG.splitlines() if 'Summary' not in l) + '\n'
+        with self.assertRaises(cts.ParseError) as ctx:
+            cts.check_totals('nextest', cts.scan_nextest_log(no_total))
+        self.assertIn('Summary', str(ctx.exception))
+        no_total = '\n'.join(l for l in CARGO_LOG.splitlines() if not l.startswith('test result:')) + '\n'
+        with self.assertRaises(cts.ParseError) as ctx:
+            cts.check_totals('cargo', cts.scan_cargo_log(no_total))
+        self.assertIn('test result:', str(ctx.exception))
+
+
+class TotalsCli(unittest.TestCase):
+    def setUp(self):
+        scratch = REPO / '.local-runs' / 'compare-test-sets-unittest'
+        scratch.mkdir(parents=True, exist_ok=True)
+        self.dir = Path(tempfile.mkdtemp(dir=str(scratch)))
+        self.cargo = self.dir / 'cargo.log'
+        self.cargo.write_text(CARGO_LOG)
+        self.nextest = self.dir / 'nextest.log'
+        self.nextest.write_text(NEXTEST_LOG)
+
+    def tearDown(self):
+        for p in self.dir.iterdir():
+            p.unlink()
+        self.dir.rmdir()
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(SCRIPT)] + list(args), capture_output=True, text=True)
+
+    def test_same_line_removed_on_both_sides_exits_two_not_identical(self):
+        self.cargo.write_text(CARGO_LOG.replace('test recall_two ... ok\n', ''))
+        self.nextest.write_text(NEXTEST_LOG.replace('        PASS [   0.021s] ai-memory::recall_basic recall_two\n', ''))
+        done = self.run_cli('--cargo-log', str(self.cargo), '--nextest-log', str(self.nextest))
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertNotIn('IDENTICAL', done.stdout)
+
+    def test_a_line_missing_on_one_side_only_still_reports_different(self):
+        # the line AND the matching total are removed on one side: a real one-sided difference
+        self.nextest.write_text(NEXTEST_LOG.replace('        PASS [   0.021s] ai-memory::recall_basic recall_two\n', '')
+                                .replace('5 tests run: 4 passed', '4 tests run: 3 passed'))
+        done = self.run_cli('--cargo-log', str(self.cargo), '--nextest-log', str(self.nextest))
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn('DIFFERENT', done.stdout)
+
+    def test_log_without_totals_exits_two_with_a_message(self):
+        self.nextest.write_text('\n'.join(l for l in NEXTEST_LOG.splitlines() if 'Summary' not in l) + '\n')
+        done = self.run_cli('--cargo-log', str(self.cargo), '--nextest-log', str(self.nextest))
+        self.assertEqual(done.returncode, 2)
+        self.assertIn('Summary', done.stderr)
+
+    def test_totals_line_is_printed_when_they_agree(self):
+        done = self.run_cli('--cargo-log', str(self.cargo), '--nextest-log', str(self.nextest))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn('totals: cargo 5 of 5', done.stdout)
+        self.assertIn('nextest 5 of 5', done.stdout)
+
+    def test_gh_run_view_form_compares_identical(self):
+        cargo = '\n'.join([GH_CARGO_RUNNING, GH_CARGO_LINE, GH_CARGO_RESULT]) + '\n'
+        nextest = GH_NEXTEST_LINE.replace('ai-memory::write_receipts_cli_mcp_3555', 'ai-memory')
+        nextest = nextest.replace('mcp_store_update_capture_receipts_3555',
+                                  'actions::tests::authorize_claimed_by_binds_live_holder_3009') + '\n' + GH_NEXTEST_SUMMARY + '\n'
+        self.cargo.write_text(cargo)
+        self.nextest.write_text(nextest)
+        done = self.run_cli('--cargo-log', str(self.cargo), '--nextest-log', str(self.nextest))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
 
 class ParseNextest(unittest.TestCase):

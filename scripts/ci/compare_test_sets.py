@@ -20,9 +20,26 @@ Usage::
     compare_test_sets.py --cargo-log A.log [B.log ...] \\
         (--nextest-log C.log [...] | --nextest-junit junit.xml [...])
 
+Totals reconciliation (#7298 F2). Each log also carries its runner's own total, and the
+tool refuses (exit 2) a log whose parsed per-test lines disagree with it, so a line lost
+the same way on both sides can never read as IDENTICAL:
+
+* cargo: the sum of ``passed`` + ``failed`` of the LAST top-level ``test result: ok|FAILED.
+  N passed; M failed; ...`` line of each non-doc-test binary (ignored tests are not
+  executed tests; doc tests are not parsed; a test that re-executes its own test binary
+  prints child ``running 1 test`` / ``test result:`` blocks into the parent's log before the
+  parent's closing line, so earlier result lines of the same binary are not its total).
+* nextest: the sum of ``N`` over ``Summary [ ... ] N tests run: P passed, ...`` lines.
+
+The unique (binary, test) keys parsed from a side must equal its total. A log with no totals
+line at all (an older format, a truncated log) is refused with a message naming the missing
+total. A JUnit-only candidate has no totals line and is not reconciled. The step log prints
+``totals: cargo N of N, nextest N of N`` when both agree.
+
 Exit codes: 0 identical sets AND identical outcomes, 1 they differ (a readable
-diff is printed), 2 unusable input: an empty, missing or unparseable file is a
-failure, never a pass (fail closed). Standard library only, Python 3.9+.
+diff is printed), 2 unusable input: an empty, missing, unparseable or
+total-inconsistent file is a failure, never a pass (fail closed). Standard
+library only, Python 3.9+.
 """
 import argparse
 import re
@@ -66,6 +83,8 @@ _HASH_RE = re.compile(r'-[0-9a-f]{16}$')
 # `test <name> ... ` or on its own line) that ends with its own `test result:` line.
 _NESTED_START_RE = re.compile(r'(?:^|\s)running \d+ tests?$')
 _RESULT_RE = re.compile(r'^test result: ')
+_TOTAL_RE = re.compile(r'^test result: (?:ok|FAILED)\. (?P<passed>\d+) passed; (?P<failed>\d+) failed;')
+_SUMMARY_RE = re.compile(r'Summary \[[^\]]*\]\s+(?P<run>\d+) tests? run:')
 _NEXTEST_RE = re.compile(
     r'(?P<st>PASS|LEAK-FAIL|LEAK|FAIL|TIMEOUT|ABORT|SIG[A-Z0-9]+|EXEC-?FAIL|FLAKY(?: \d+/\d+)?)'
     r'\s+\[[^\]]*\]\s+(?:\(\s*\d+/\s*\d+\)\s+)?(?P<bin>\S+)\s+(?P<name>.+?)\s*$')
@@ -80,9 +99,13 @@ class ParseError(Exception):
 
 
 class Scan(NamedTuple):
-    """One log parsed: the outcomes and how many result lines carried a spliced prefix (#7299)."""
+    """One log parsed: the outcomes, how many result lines carried a spliced prefix (#7299), the
+    unique per-test keys parsed, and the runner's own total (summed) with the number of totals lines."""
     outcomes: Outcomes
     spliced: int
+    parsed: int
+    total: int
+    total_lines: int
 
 
 class Report(NamedTuple):
@@ -134,10 +157,18 @@ def parse_cargo_log(text: str) -> Outcomes:
     return scan_cargo_log(text).outcomes
 
 
+def _close_section(total: int, total_lines: int, section_total: Optional[int]) -> Tuple[int, int]:
+    """Add the finished binary's own total (if it printed one) to the running sums."""
+    if section_total is None:
+        return total, total_lines
+    return total + section_total, total_lines + 1
+
+
 def scan_cargo_log(text: str) -> Scan:
     """``parse_cargo_log`` plus the count of result lines that carried a spliced prefix."""
     out: Outcomes = {}
-    spliced = 0
+    spliced = total = total_lines = 0
+    section_total: Optional[int] = None  # passed + failed of the last top-level result of this binary
     current: Optional[str] = None
     pending: Optional[str] = None
     parents: List[Optional[str]] = []  # parent verdicts waiting while a nested child block runs
@@ -146,9 +177,13 @@ def scan_cargo_log(text: str) -> Scan:
         line = _clean(raw)
         running = _RUNNING_RE.match(line)
         if running and (running.group('src').endswith('.rs') or '/deps/' in running.group('src')):
+            total, total_lines = _close_section(total, total_lines, section_total)
+            section_total = None
             current, in_doc, pending, parents = _cargo_binary(running), False, None, []
             continue
         if _DOCTEST_RE.match(line):
+            total, total_lines = _close_section(total, total_lines, section_total)
+            section_total = None
             current, in_doc, pending, parents = None, True, None, []
             continue
         if parents or (pending and _NESTED_START_RE.search(line)):
@@ -158,6 +193,12 @@ def scan_cargo_log(text: str) -> Scan:
                 pending = None
             elif _RESULT_RE.match(line):
                 pending = parents.pop()
+            continue
+        totals = _TOTAL_RE.match(line)
+        if totals:
+            pending = None
+            if not in_doc:
+                section_total = int(totals.group('passed')) + int(totals.group('failed'))
             continue
         found = _CARGO_TEST_RE.search(line)
         if found:
@@ -180,9 +221,10 @@ def scan_cargo_log(text: str) -> Scan:
         if current is None:
             raise ParseError('cargo log: test line %r before any "Running" header' % line[:80])
         _merge(out, (current, name), PASS if res == 'ok' else FAIL)
+    total, total_lines = _close_section(total, total_lines, section_total)
     if not out:
         raise ParseError('cargo log: no executed tests found')
-    return Scan(out, spliced)
+    return Scan(out, spliced, len(out), total, total_lines)
 
 
 def _nextest_binary(binary_id: str) -> str:
@@ -198,9 +240,14 @@ def parse_nextest_log(text: str) -> Outcomes:
 def scan_nextest_log(text: str) -> Scan:
     """``parse_nextest_log`` plus the count of status lines that carried a spliced prefix."""
     out: Outcomes = {}
-    spliced = 0
+    spliced = total = total_lines = 0
     for raw in text.splitlines():
         line = _clean(raw)
+        summary = _SUMMARY_RE.search(line)
+        if summary:
+            total += int(summary.group('run'))
+            total_lines += 1
+            continue
         found = _NEXTEST_RE.search(line)
         if not found:
             continue
@@ -210,7 +257,20 @@ def scan_nextest_log(text: str) -> Scan:
         _merge(out, (_nextest_binary(found.group('bin')), found.group('name')), PASS if ok else FAIL)
     if not out:
         raise ParseError('nextest log: no PASS/FAIL result lines found')
-    return Scan(out, spliced)
+    return Scan(out, spliced, len(out), total, total_lines)
+
+
+def check_totals(label: str, scan: Scan) -> None:
+    """Refuse a side whose parsed per-test lines disagree with its runner's own total (#7298 F2)."""
+    missing = {'cargo': "no top-level 'test result: ok|FAILED. N passed; M failed' totals line",
+               'nextest': "no 'Summary [ ... ] N tests run:' totals line"}[label]
+    if not scan.total_lines:
+        raise ParseError('%s log: %s found, so the %d parsed test lines cannot be reconciled with the '
+                         "runner's own total" % (label, missing, scan.parsed))
+    if scan.parsed != scan.total:
+        raise ParseError("%s log: parsed %d per-test lines but the runner reports %d executed tests "
+                         "(%d totals lines); a result line was lost or merged" %
+                         (label, scan.parsed, scan.total, scan.total_lines))
 
 
 def parse_junit(text: str) -> Outcomes:
@@ -283,16 +343,19 @@ def _read(paths: List[str]) -> List[str]:
     return texts
 
 
-def _load(scanner, paths: List[str]) -> Tuple[Outcomes, int]:
-    """Merge the outcomes of every log of one side; also return its spliced-line count."""
+def _load(scanner, paths: List[str]) -> Scan:
+    """Merge every log of one side: outcomes merged, counters and totals summed over the logs."""
     merged: Outcomes = {}
-    spliced = 0
+    spliced = parsed = total = total_lines = 0
     for text in _read(paths):
         scan = scanner(text)
         spliced += scan.spliced
+        parsed += scan.parsed
+        total += scan.total
+        total_lines += scan.total_lines
         for key, outcome in scan.outcomes.items():
             _merge(merged, key, outcome)
-    return merged, spliced
+    return Scan(merged, spliced, parsed, total, total_lines)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -312,8 +375,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         if not (args.nextest_log or args.nextest_junit):
             raise ParseError('a candidate is required: --nextest-log and/or --nextest-junit')
-        baseline, spliced_base = _load(scan_cargo_log, args.cargo_log)
-        candidate, spliced_cand = _load(scan_nextest_log, args.nextest_log)
+        base_scan = _load(scan_cargo_log, args.cargo_log)
+        cand_scan = _load(scan_nextest_log, args.nextest_log)
+        check_totals('cargo', base_scan)
+        if args.nextest_log:
+            check_totals('nextest', cand_scan)
+        baseline, candidate = base_scan.outcomes, cand_scan.outcomes
         for text in _read(args.nextest_junit):
             for key, outcome in parse_junit(text).items():
                 _merge(candidate, key, outcome)
@@ -322,8 +389,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print('compare_test_sets: %s' % exc, file=sys.stderr)
         return EXIT_UNUSABLE
     print(render(report, max(args.max_list, 0)))
+    print('totals: cargo %d of %d, nextest %s (parsed per-test lines of the runners\' own totals)'
+          % (base_scan.parsed, base_scan.total,
+             ('%d of %d' % (cand_scan.parsed, cand_scan.total)) if args.nextest_log else 'junit only, no totals'))
     print('spliced result lines (stderr glued in front, still counted): baseline=%d candidate=%d'
-          % (spliced_base, spliced_cand))
+          % (base_scan.spliced, cand_scan.spliced))
     return EXIT_IDENTICAL if report.identical else EXIT_DIFFERENT
 
 
