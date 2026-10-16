@@ -72,6 +72,8 @@ CLEARED_ENVS = (
     "AI_MEMORY_EMBED_BASE_URL",
     "AI_MEMORY_LLM_BASE_URL",
 )
+# #7182: the earliest points at which the gate runs (or builds) a binary.
+FIRST_BINARY_MARKERS = ("mkstub()", "cargo build", "probe_features()")
 PINNED_UPLOAD = re.compile(r"actions/upload-artifact@[0-9a-f]{40}\b")
 REDACTED_DIR = ".local-runs/cert-bootstrap-evidence-redacted"
 
@@ -596,6 +598,15 @@ class GateScriptPins(unittest.TestCase):
         self.assertIn(".local-runs/tmp", text[export : export + 160])
         self.assertLess(export, text.index("mktemp"))
         self.assertIn("chmod 700", text[export : export + 320])
+
+    def test_7182_hermetic_config_exported_before_first_binary_invocation(self):
+        text = GATE.read_text(encoding="utf-8")
+        no_config = text.index("export AI_MEMORY_NO_CONFIG=1")
+        xdg = text.index("export XDG_CONFIG_HOME")
+        self.assertIn("$TMPDIR/xdg-config-", text[xdg - 200 : xdg])
+        first_binary = min(text.index(marker) for marker in FIRST_BINARY_MARKERS if marker in text)
+        self.assertLess(no_config, first_binary)
+        self.assertLess(xdg, first_binary)
 
     def test_f4_no_shell_control_flow_for_cleanup(self):
         text = GATE.read_text(encoding="utf-8")

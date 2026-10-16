@@ -100,6 +100,17 @@ cd "$REPO_ROOT"
 export TMPDIR="$REPO_ROOT/.local-runs/tmp"
 mkdir -p "$TMPDIR"; chmod 700 "$TMPDIR"
 
+# #7182 - HERMETIC config for EVERY binary invocation in the gate (certified env
+# block, LEG A, LEG B, D, E, self-test). Without these the binary reads the host
+# user config (`~/.config/ai-memory/config.toml`), which on a dev or runner host
+# can name a LIVE database. NO_CONFIG skips config loading; XDG_CONFIG_HOME is a
+# per-run empty dir under the gate's own scratch so no fallback can reach the
+# user config either.
+export AI_MEMORY_NO_CONFIG=1
+XDG_CONFIG_HOME="$TMPDIR/xdg-config-$$"
+mkdir -p "$XDG_CONFIG_HOME"; chmod 700 "$XDG_CONFIG_HOME"
+export XDG_CONFIG_HOME
+
 python3 -c 'import json,sys' 2>/dev/null \
   || { echo "INSTRUMENT ERROR: python3 is required to parse the feature probe and posture rows (#4434 #2676)"; exit 3; }
 
@@ -214,6 +225,7 @@ mkdir -p "$EVIDENCE_DIR"
 # the EXIT trap is ONE program invocation (it keeps the gate's exit status).
 STATE_DIR="$(mktemp -d)"
 PHASE=A
+printf '%s\n' "$XDG_CONFIG_HOME" >> "$STATE_DIR/cleanup-list"
 trap 'python3 "$REPO_ROOT/scripts/cert_gate_evidence.py" --evidence-dir "$EVIDENCE_DIR" --tail 200 --finalize "$STATE_DIR"' EXIT
 
 FAILED=0
