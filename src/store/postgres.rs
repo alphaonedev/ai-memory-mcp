@@ -15541,14 +15541,18 @@ pub(crate) async fn pg_append_signed_event_with_chain_in_tx(
             sqlx::query_as(crate::signed_events::GENESIS_ROW_SQL)
                 .fetch_optional(&mut **tx)
                 .await?;
-        let db_id = genesis.map(|(gid, gagent, gpayload)| {
-            crate::signed_events::db_id_from_genesis_parts(&gid, &gagent, &gpayload)
-        });
-        crate::governance::audit::maybe_record_audit_watermark(
-            next_seq,
-            &head_hash_hex,
-            db_id.as_deref(),
-        );
+        // #7228 — never anchor a db_id-less (legacy) watermark (sqlite parity):
+        // an absent genesis skips the emission with a single WARN.
+        if let Some((gid, gagent, gpayload)) = genesis {
+            let db_id = crate::signed_events::db_id_from_genesis_parts(&gid, &gagent, &gpayload);
+            crate::governance::audit::maybe_record_audit_watermark(
+                next_seq,
+                &head_hash_hex,
+                &db_id,
+            );
+        } else {
+            crate::governance::audit::warn_watermark_skipped_no_genesis();
+        }
     }
 
     // v0.9.0 G5b (#1822, item 6) — INDEPENDENT dual-chain audit-head witness
