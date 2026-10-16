@@ -17,6 +17,11 @@ Safety:
     otherwise exit 2 naming the path and nothing is deleted. A target path
     component that is not a directory (``--target`` names a regular file) exits
     2 with ``refused: <path> is not a directory``.
+  * Every parent of the target must be searchable by the sweeping account;
+    where the platform has ``O_PATH`` (Linux) the parents, the target and
+    ``debug`` are opened with it and need no read permission. On macOS (no
+    ``O_PATH``) every parent of the target must also be readable by the
+    sweeping account, else nothing is swept (exit 4, ``cannot read``).
   * The target is opened once by a descriptor walk from ``/``: every path
     component (target, ``debug``, each swept directory) is opened relative to
     its parent with ``O_NOFOLLOW | O_DIRECTORY``, and every scan and every
@@ -64,7 +69,13 @@ MAX_TREE_DEPTH = 300
 # errno values open() reports for a symlink (or non-directory) met under
 # O_NOFOLLOW | O_DIRECTORY; Linux reports ENOTDIR, macOS reports ELOOP.
 SWAPPED_ERRNOS = (errno.ELOOP, errno.ENOTDIR)
+# Directories that are listed (scandir) need read permission: O_RDONLY.
 OPEN_DIR_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
+# Directories that are only walked through (``/``, every parent of the target,
+# the target, ``debug``) are opened with O_PATH where the platform has it, so
+# they need search permission only, as a full-path open does (Linux). Without
+# O_PATH (macOS) this equals OPEN_DIR_FLAGS and every parent must be readable.
+PARENT_OPEN_FLAGS = getattr(os, "O_PATH", 0) | os.O_NOFOLLOW | os.O_DIRECTORY
 
 
 class UsageParser(argparse.ArgumentParser):
@@ -98,9 +109,14 @@ class SweptDir(object):
         self.chain = chain + [self]
 
 
-def open_dir(name, dir_fd=None):
-    """Open a directory without following a symlink in its final component."""
-    return os.open(name, OPEN_DIR_FLAGS, dir_fd=dir_fd)
+def open_dir(name, dir_fd=None, listing=True):
+    """Open a directory without following a symlink in its final component.
+
+    ``listing=False`` opens a directory that is only walked through (see
+    PARENT_OPEN_FLAGS); ``listing=True`` one that is scanned.
+    """
+    flags = OPEN_DIR_FLAGS if listing else PARENT_OPEN_FLAGS
+    return os.open(name, flags, dir_fd=dir_fd)
 
 
 class TooDeep(Exception):
@@ -180,14 +196,14 @@ def open_target(real_target, warnings, handles):
     ``SweptDir`` for the target, or ``None`` when the target does not exist or
     cannot be read (the latter is also appended to ``warnings``).
     """
-    root_fd = open_dir(os.sep)
+    root_fd = open_dir(os.sep, listing=False)
     handles.append(root_fd)
     held = SweptDir(os.sep, root_fd, None, None, [])
     path = os.sep
     for component in [part for part in real_target.split(os.sep) if part]:
         path = os.path.join(path, component)
         try:
-            fd = open_dir(component, held.fd)
+            fd = open_dir(component, held.fd, listing=False)
         except FileNotFoundError:
             return None
         except OSError as exc:
@@ -200,7 +216,7 @@ def open_target(real_target, warnings, handles):
     return held
 
 
-def open_child(parent, name, warnings, handles):
+def open_child(parent, name, warnings, handles, listing=True):
     """Open directory ``name`` under the held ``parent``; None when absent or not a directory.
 
     Raises Refused when ``name`` is a symlink or is swapped for one while opening.
@@ -218,7 +234,7 @@ def open_child(parent, name, warnings, handles):
     if not stat.S_ISDIR(st.st_mode):
         return None
     try:
-        fd = open_dir(name, parent.fd)
+        fd = open_dir(name, parent.fd, listing=listing)
     except OSError as exc:
         if exc.errno in SWAPPED_ERRNOS:
             raise Refused("{} is a symlink".format(path))
@@ -238,7 +254,7 @@ def open_swept_dirs(real_target, warnings, handles):
     target = open_target(real_target, warnings, handles)
     if target is None:
         return []
-    debug = open_child(target, DEBUG_DIR_NAME, warnings, handles)
+    debug = open_child(target, DEBUG_DIR_NAME, warnings, handles, listing=False)
     if debug is None:
         return []
     found = []
