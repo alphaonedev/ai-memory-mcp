@@ -12,6 +12,21 @@ use chrono::{Duration, Utc};
 pub const FAIL_ENV: &str = "AI_MEMORY_TEST_FAIL_BEFORE_SIGNED_COMMIT";
 pub const CLOCK_ENV: &str = "AI_MEMORY_TEST_CLOCK_OFFSET_SECS";
 pub const PG_ENV: &str = "AI_MEMORY_TEST_POSTGRES_URL";
+
+/// The one skip policy for every test that needs the native Postgres tier,
+/// shared by the library harness and the integration tests: an unset
+/// `AI_MEMORY_TEST_POSTGRES_URL` skips the Postgres part with a note naming
+/// only the variable (the SQLite parts still run); a set URL runs every
+/// assertion unchanged.
+#[cfg(feature = "sal-postgres")]
+pub fn pg_url_or_skip(test: &str) -> Option<String> {
+    if let Ok(url) = std::env::var(PG_ENV) {
+        Some(url)
+    } else {
+        eprintln!("skipped: {PG_ENV} is unset ({test})");
+        None
+    }
+}
 pub const TARGET_ID: &str = "failure-hook-target-7029";
 pub const AGENT: &str = "ai:fi-7029";
 pub const NAMESPACE: &str = "fi-7029";

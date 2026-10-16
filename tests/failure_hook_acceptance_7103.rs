@@ -96,11 +96,13 @@ fn ordinary_clock_extrema_7106() {
     if std::env::var_os(CHILD_ENV).is_some() {
         scenarios::sqlite_clock(0);
         #[cfg(feature = "sal-postgres")]
-        tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(async {
-                scenarios::pg::fault_pg_isolated_clock(0).await;
-            });
+        if scenarios::pg_url_or_skip("ordinary_clock_extrema_7106").is_some() {
+            tokio::runtime::Runtime::new()
+                .expect("runtime")
+                .block_on(async {
+                    scenarios::pg::fault_pg_isolated_clock(0).await;
+                });
+        }
         return;
     }
     for value in [
@@ -138,12 +140,14 @@ fn ordinary_clock_extrema_7106() {
 fn ordinary_artifact_inactive_7103() {
     if std::env::var_os(CHILD_ENV).is_some() {
         #[cfg(feature = "sal-postgres")]
-        tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(async {
-                scenarios::pg::fault_pg_isolated_capture().await;
-                scenarios::pg::fault_pg_isolated_clock(0).await;
-            });
+        if scenarios::pg_url_or_skip("ordinary_artifact_inactive_7103").is_some() {
+            tokio::runtime::Runtime::new()
+                .expect("runtime")
+                .block_on(async {
+                    scenarios::pg::fault_pg_isolated_capture().await;
+                    scenarios::pg::fault_pg_isolated_clock(0).await;
+                });
+        }
         for auto in [false, true] {
             let conn =
                 ai_memory::db::open(std::path::Path::new(":memory:")).expect("private sqlite");

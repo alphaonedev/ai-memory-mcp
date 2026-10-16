@@ -4,9 +4,9 @@
 //! Library-side active fault harness: compiled only under cfg(test), never a deployed artifact.
 use crate as library;
 mod scenarios;
-#[cfg(feature = "sal-postgres")]
-use scenarios::PG_ENV;
 use scenarios::{CLOCK_ENV, FAIL_ENV, TARGET_ID};
+#[cfg(feature = "sal-postgres")]
+use scenarios::{PG_ENV, pg_url_or_skip};
 
 const MODE_ENV: &str = "AI_MEMORY_HOOK_CHILD_MODE";
 const DB_ENV: &str = "AI_MEMORY_HOOK_CHILD_DB";
@@ -17,19 +17,6 @@ const SQLITE_TEST: &str = "failure_hook_tests::active_sqlite_7029";
 const CLOCK_TEST: &str = "failure_hook_tests::active_clock_7029";
 #[cfg(feature = "sal-postgres")]
 const PG_TEST: &str = "failure_hook_tests::active_postgres_7029";
-
-/// The one skip policy for every test that needs the native Postgres tier:
-/// an unset `AI_MEMORY_TEST_POSTGRES_URL` skips the Postgres part with a note
-/// (the SQLite parts still run); a set URL runs every assertion unchanged.
-#[cfg(feature = "sal-postgres")]
-fn pg_url_or_skip(test: &str) -> Option<String> {
-    if let Ok(url) = std::env::var(PG_ENV) {
-        Some(url)
-    } else {
-        eprintln!("skipped: {PG_ENV} is unset ({test})");
-        None
-    }
-}
 
 fn assert_child(output: &std::process::Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
