@@ -24,10 +24,14 @@ Safety:
     directory that was opened is refused (exit 2) before anything is deleted.
   * Symlink entries inside a swept directory are unlinked, never descended.
   * Nothing outside the four directories is read for sizing or deleted.
-  * An unreadable directory or entry, or a tree too deep to walk (a
-    RecursionError), at any depth, is reported as
+  * An unreadable directory or entry at any depth is reported as
     ``warning: cannot read <path>`` (or ``cannot size`` / ``cannot remove``)
     naming the path and skipped; no traceback.
+  * A top-level entry whose tree is deeper than ``MAX_TREE_DEPTH`` levels (or
+    that hits a RecursionError) is skipped as a whole: one
+    ``warning: cannot size <entry>: ... skipped`` names the entry, it is never
+    counted and never on the delete list, so none of it is deleted (a partly
+    deleted cargo output is worse than an oversized one).
 
 Exit codes: 0 success, 2 refused path, 3 ``--max-bytes`` is zero or negative,
 4 nothing could be sized because every swept directory or entry was
@@ -49,6 +53,10 @@ EXIT_REFUSED = 2
 EXIT_BAD_CAP = 3
 EXIT_UNREADABLE = 4
 EXIT_USAGE = 5
+# Deeper than this an entry is skipped whole. Sizing and removal both recurse
+# one frame per level, so a tree sized within this depth is also removable
+# within it and removal can never stop half way on the interpreter limit.
+MAX_TREE_DEPTH = 300
 # errno values open() reports for a symlink (or non-directory) met under
 # O_NOFOLLOW | O_DIRECTORY; Linux reports ENOTDIR, macOS reports ELOOP.
 SWAPPED_ERRNOS = (errno.ELOOP, errno.ENOTDIR)
@@ -91,16 +99,27 @@ def open_dir(name, dir_fd=None):
     return os.open(name, OPEN_DIR_FLAGS, dir_fd=dir_fd)
 
 
-def entry_size(dir_fd, name, path, warnings):
+class TooDeep(Exception):
+    """An entry's tree is deeper than MAX_TREE_DEPTH."""
+
+
+class SkippedWarning(str):
+    """A warning for an entry skipped whole as too deep; it is not an unreadable-directory failure."""
+
+
+def entry_size(dir_fd, name, path, warnings, depth=0):
     """Bytes under ``name`` (relative to ``dir_fd``) without following symlinks.
 
     A symlink counts as itself. A nested directory that cannot be listed is
     appended to ``warnings`` (same wording as the top-level unreadable-directory
-    warning) and counts as its own size only.
+    warning) and counts as its own size only. TooDeep (or RecursionError) is
+    never caught here: it propagates so the caller drops the whole entry.
     """
     st = os.lstat(name, dir_fd=dir_fd)
     if not stat.S_ISDIR(st.st_mode):
         return st.st_size
+    if depth >= MAX_TREE_DEPTH:
+        raise TooDeep("deeper than {} levels".format(MAX_TREE_DEPTH))
     total = st.st_size
     try:
         child_fd = open_dir(name, dir_fd)
@@ -117,8 +136,9 @@ def entry_size(dir_fd, name, path, warnings):
         for child in children:
             try:
                 child_path = os.path.join(path, child.name)
-                total += entry_size(child_fd, child.name, child_path, warnings)
-            except (OSError, RecursionError) as exc:
+                total += entry_size(child_fd, child.name, child_path, warnings,
+                                    depth + 1)
+            except OSError as exc:
                 warnings.append("cannot size {}/{}: {}".format(path, child.name, exc))
     finally:
         os.close(child_fd)
@@ -230,7 +250,12 @@ def collect_entries(target, warnings, handles):
             try:
                 mtime = child.stat(follow_symlinks=False).st_mtime
                 size = entry_size(sdir.fd, child.name, child_path, warnings)
-            except (OSError, RecursionError) as exc:
+            except (TooDeep, RecursionError) as exc:
+                warnings.append(SkippedWarning(
+                    "cannot size {}: too deep to walk ({}); entry skipped, nothing "
+                    "of it deleted".format(child_path, exc)))
+                continue
+            except OSError as exc:
                 warnings.append("cannot size {}: {}".format(child_path, exc))
                 continue
             entries.append((mtime, child_path, sdir, child.name, size))
@@ -304,7 +329,8 @@ def sweep(real_target, args, warnings, handles):
                 continue
         remaining -= size
         removed += 1
-    code = EXIT_UNREADABLE if warnings and not entries else EXIT_OK
+    unreadable = [line for line in warnings if not isinstance(line, SkippedWarning)]
+    code = EXIT_UNREADABLE if unreadable and not entries else EXIT_OK
     return code, before, remaining, removed
 
 
