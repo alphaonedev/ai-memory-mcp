@@ -116,7 +116,9 @@ fn isolated_root_is_removed_at_process_exit_7259() {
     const ROOT_PREFIX: &str = "ROOT_7259=";
     if std::env::var_os(PROBE_ENV).is_some() {
         let (home, _keys) = isolated_home_and_keys();
-        let root = home.parent().expect("home sits inside the per-process root");
+        let root = home
+            .parent()
+            .expect("home sits inside the per-process root");
         println!("{ROOT_PREFIX}{}", root.display());
         return;
     }
