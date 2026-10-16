@@ -8,11 +8,13 @@ import contextlib
 import importlib.util
 import io
 import os
+import resource
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -321,6 +323,136 @@ class ScanDeleteRaceTests(SweepTestCase):
         self.assertEqual(rc, EXIT_OK, err)
         self.assertTrue(keep.exists())
         self.assertFalse(pkg.is_symlink())
+
+
+class TargetWalkTests(SweepTestCase):
+    """#7160 R2-F1 / S4: the target and every ancestor are opened without following links."""
+
+    def make_outside(self):
+        outside = self.root / "outside"
+        files = []
+        for idx in range(3):
+            path = outside / "debug" / "deps" / "lib{}.rlib".format(idx)
+            write_blob(path, PRECIOUS_BYTES)
+            files.append(path)
+        return outside, files
+
+    def test_target_swapped_for_symlink_before_first_open_is_refused(self):
+        self.make_entries(2)
+        outside, outside_files = self.make_outside()
+        module = load_script_module()
+        real_is_under = module.is_under
+        target = self.target
+
+        def is_under_then_swap(path, root):
+            verdict = real_is_under(path, root)
+            moved = target.parent / "target.moved"
+            if not moved.exists():
+                target.rename(moved)
+                target.symlink_to(outside, target_is_directory=True)
+            return verdict
+
+        module.is_under = is_under_then_swap
+        err = io.StringIO()
+        out = io.StringIO()
+        env = {module.WORKSPACE_ENV: str(self.workspace)}
+        with mock.patch.dict(os.environ, env), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            rc = module.main(["--target", str(self.target), "--max-bytes", "1"])
+        self.assertEqual(rc, EXIT_REFUSED, err.getvalue())
+        self.assertIn("refused", err.getvalue())
+        self.assertIn("target", err.getvalue())
+        self.assertTrue(all(path.exists() for path in outside_files))
+
+    def test_allow_root_refuses_symlinked_target_7160_s4(self):
+        self.make_entries(2)
+        outside, outside_files = self.make_outside()
+        link = self.root / "linked-target"
+        link.symlink_to(outside, target_is_directory=True)
+        result = self.run_sweep("--max-bytes", "1", "--allow-root", target=link)
+        self.assertEqual(result.returncode, EXIT_REFUSED, result.stderr)
+        self.assertIn("is not a canonical path", result.stderr)
+        self.assertTrue(all(path.exists() for path in outside_files))
+
+    def test_allow_root_accepts_canonical_target(self):
+        self.make_entries(3)
+        canonical = Path(os.path.realpath(str(self.target)))
+        result = self.run_sweep("--max-bytes", "1500", "--allow-root", target=canonical)
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+
+
+def raise_fd_limit(wanted):
+    """Raise the soft descriptor limit to ``wanted``; return the old limits or None."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft >= wanted:
+        return (soft, hard)
+    ceiling = wanted if hard == resource.RLIM_INFINITY else min(wanted, hard)
+    if ceiling < wanted:
+        return None
+    resource.setrlimit(resource.RLIMIT_NOFILE, (ceiling, hard))
+    return (soft, hard)
+
+
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def make_deep_chain(parent, name, depth):
+    """Create ``parent/name/d/d/...`` ``depth`` levels deep using dir_fd-relative calls."""
+    os.makedirs(str(parent / name))
+    fd = os.open(str(parent / name), DIR_FLAGS)
+    for _ in range(depth):
+        os.mkdir("d", dir_fd=fd)
+        child = os.open("d", DIR_FLAGS, dir_fd=fd)
+        os.close(fd)
+        fd = child
+    os.close(fd)
+
+
+def remove_deep_chain(parent, name, depth):
+    """Remove whatever is left of the chain made by make_deep_chain, without recursion."""
+    try:
+        fds = [os.open(str(parent / name), DIR_FLAGS)]
+    except FileNotFoundError:
+        return
+    try:
+        while len(fds) <= depth:
+            try:
+                fds.append(os.open("d", DIR_FLAGS, dir_fd=fds[-1]))
+            except FileNotFoundError:
+                break
+        for idx in range(len(fds) - 1, 0, -1):
+            os.rmdir("d", dir_fd=fds[idx - 1])
+    finally:
+        for fd in fds:
+            os.close(fd)
+    os.rmdir(str(parent / name))
+
+
+class DeepTreeTests(SweepTestCase):
+    """#7160 R2-F2 / S5: a very deep tree is a warning, not a traceback."""
+
+    DEPTH = 1200
+
+    def test_deep_tree_warns_and_keeps_documented_exit_code(self):
+        old = raise_fd_limit(self.DEPTH + 200)
+        if old is None:
+            self.skipTest("cannot raise the descriptor limit for a deep tree")
+        pkg_parent = self.debug / "build"
+        pkg_parent.mkdir()
+        make_deep_chain(pkg_parent, "pkg", self.DEPTH)
+        try:
+            module = load_script_module()
+            err = io.StringIO()
+            out = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+                rc = module.main(["--target", str(self.target), "--max-bytes", "1",
+                                  "--allow-root"])
+            self.assertEqual(rc, EXIT_OK, err.getvalue())
+            self.assertIn("warning: cannot", err.getvalue())
+            self.assertIn("ci-sweep-target:", out.getvalue())
+        finally:
+            remove_deep_chain(pkg_parent, "pkg", self.DEPTH)
+            resource.setrlimit(resource.RLIMIT_NOFILE, old)
 
 
 if __name__ == "__main__":
