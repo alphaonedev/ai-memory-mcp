@@ -94,13 +94,23 @@ class ColdBuildPerProcess(unittest.TestCase):
     warms; the E2 verifier build must share one stable dir (cargo's own build
     lock serialises concurrent builds and later ones are no-ops)."""
 
-    SOURCE = (REPO / 'tests' / 'e2_post_ship_dry_run.rs').read_text(encoding='utf-8')
+    # test file -> the one stable target-dir name its cold build must use
+    BUILDERS = {
+        'e2_post_ship_dry_run.rs': '"ai-memory-post-ship-converge-target"',
+        'e1_orchestration_dry_run.rs': '"ai-memory-t0-orchestrate-target"',
+        'g11_auto_link_detector.rs': '"ai-memory-auto-link-detector-target"',
+        'transcript_extractor.rs': '"ai-memory-transcript-extractor-target"',
+    }
 
-    def test_verifier_target_dir_is_not_keyed_by_process_id(self):
-        self.assertNotIn('std::process::id()', self.SOURCE)
+    def test_build_target_dirs_are_not_keyed_by_process_id(self):
+        for name in self.BUILDERS:
+            source = (REPO / 'tests' / name).read_text(encoding='utf-8')
+            self.assertIsNone(re.search(r'target_dir\s*=\s*scratch_root\s*\.join\(\s*format!', source), name)
 
-    def test_verifier_target_dir_is_one_stable_name(self):
-        self.assertIn('"ai-memory-post-ship-converge-target"', self.SOURCE)
+    def test_build_target_dirs_are_one_stable_name(self):
+        for name, literal in self.BUILDERS.items():
+            source = (REPO / 'tests' / name).read_text(encoding='utf-8')
+            self.assertIn(literal, source, name)
 
 
 class WorkflowWiring(unittest.TestCase):

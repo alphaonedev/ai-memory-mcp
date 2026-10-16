@@ -116,10 +116,8 @@ fn build_orchestrator_once() -> PathBuf {
         .join(".local-runs")
         .join("e1-orchestration-dry-run");
     std::fs::create_dir_all(&scratch_root).ok();
-    let target_dir = scratch_root.join(format!(
-        "ai-memory-t0-orchestrate-target-{}",
-        std::process::id()
-    ));
+    // #7259 — one stable dir, not one per process (nextest = process per test).
+    let target_dir = scratch_root.join("ai-memory-t0-orchestrate-target");
 
     // #1853 — one bounded retry: on the resource-constrained macOS CI
     // runner this nested build intermittently failed on transient
