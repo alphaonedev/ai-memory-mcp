@@ -367,6 +367,10 @@ pub fn defer_audit_anchor(conn: &Connection, anchor: crate::governance::audit::P
     if conn.is_autocommit() {
         anchor.emit_after_commit();
     } else {
+        // Count first so the drop is recorded even when the debug assertion
+        // below unwinds (#7281, ERRORS-19).
+        FRAMELESS_ANCHOR_DROPS.fetch_add(FRAMELESS_DROP_INCREMENT, Ordering::Relaxed);
+        crate::metrics::inc_audit_anchor_frameless_drop();
         // A new raw-transaction caller of a deferring funnel would under-anchor
         // silently: fail loudly in debug and test builds, warn in release.
         debug_assert!(
@@ -379,6 +383,20 @@ pub fn defer_audit_anchor(conn: &Connection, anchor: crate::governance::audit::P
         );
         anchor.discard();
     }
+}
+
+/// Step of the monotonic frameless-drop counter.
+const FRAMELESS_DROP_INCREMENT: u64 = 1;
+
+/// #7281 - audit anchors dropped unrecorded because their append ran in a raw
+/// transaction with no `WriteTxn` frame (monotonic, process-wide).
+static FRAMELESS_ANCHOR_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// #7281 - how many audit anchors the frameless-drop branch has discarded.
+/// Mirrored to `ai_memory_audit_anchor_frameless_drop_total`.
+#[must_use]
+pub fn frameless_anchor_drop_count() -> u64 {
+    FRAMELESS_ANCHOR_DROPS.load(Ordering::Relaxed)
 }
 
 /// `true` when `pending_id` is deferred in a frame still open on this thread.
@@ -491,8 +509,6 @@ mod tests {
     /// `debug_assert!` so a new raw-transaction caller cannot under-anchor
     /// silently (ERRORS-19).
     #[test]
-    #[cfg(debug_assertions)]
-    #[should_panic(expected = "no WriteTxn frame")]
     fn frameless_raw_transaction_anchor_drop_trips_debug_assert_7241() {
         /// Head sequence of the pending watermark the funnel hands over.
         const HEAD_SEQUENCE: i64 = 64;
@@ -503,7 +519,29 @@ mod tests {
             "head-hash",
             "db-id",
         );
-        super::defer_audit_anchor(&conn, anchor);
+        let before = super::frameless_anchor_drop_count();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::defer_audit_anchor(&conn, anchor);
+        }));
+        if cfg!(debug_assertions) {
+            let payload = outcome.expect_err("debug build must trip the assertion");
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            assert!(
+                message.contains("no WriteTxn frame"),
+                "panic text: {message}"
+            );
+        } else {
+            assert!(outcome.is_ok(), "release build must not panic");
+        }
+        assert_eq!(
+            super::frameless_anchor_drop_count(),
+            before + 1,
+            "the frameless drop must be counted (#7281)"
+        );
     }
 
     /// Vote item 5(a) — a leaked `WriteTxn` whose frame still holds a deferred
