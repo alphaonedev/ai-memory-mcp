@@ -118,6 +118,21 @@ class ParseCargo(unittest.TestCase):
         with self.assertRaises(cts.ParseError):
             cts.parse_cargo_log('test orphan ... ok\n')
 
+    def test_should_panic_suffix_is_not_part_of_the_name(self):
+        log = ('     Running unittests src/lib.rs (target/debug/deps/ai_memory-0123456789abcdef)\n'
+               'test a::b - should panic ... ok\n')
+        self.assertEqual(cts.parse_cargo_log(log), {('lib', 'a::b'): cts.PASS})
+
+    def test_verdict_glued_to_log_noise_or_on_a_later_line_is_still_read(self):
+        log = ('     Running unittests src/lib.rs (target/debug/deps/ai_memory-0123456789abcdef)\n'
+               'test glued ... ok2026-10-16T13:59:34.9Z  INFO noise\n'
+               'test split ... 2026-10-16T13:57:55.6Z  WARN noise\n'
+               'ok\n'
+               'test split_fail ... noise\n'
+               'FAILED\n')
+        self.assertEqual(cts.parse_cargo_log(log), {
+            ('lib', 'glued'): cts.PASS, ('lib', 'split'): cts.PASS, ('lib', 'split_fail'): cts.FAIL})
+
     def test_no_tests_is_an_error(self):
         with self.assertRaises(cts.ParseError):
             cts.parse_cargo_log('   Compiling x\n    Finished\n')
