@@ -613,7 +613,7 @@ class GateScriptPins(unittest.TestCase):
         self.assertNotRegex(text, r"unset\s+(AI_MEMORY_NO_CONFIG|XDG_CONFIG_HOME)")
         # cleanup: registered for the main path and removed by the self-test trap
         self.assertRegex(text, r'printf .*"\$XDG_CONFIG_HOME".*cleanup-list')
-        self.assertRegex(text, r"trap 'rm -rf \"\$ST\" \"\$XDG_CONFIG_HOME\"' EXIT")
+        self.assertRegex(text, r"trap 'rm -rf -- \"\$ST\" \"\$\{TMPDIR:\?\}/xdg-config-\$\$\"' EXIT")
         # the python3 early exit precedes the dir creation, so it cannot leak it
         self.assertLess(text.index("python3 -c 'import json,sys'"), text.index('mkdir -p "$XDG_CONFIG_HOME"'))
 
@@ -625,7 +625,7 @@ class GateScriptPins(unittest.TestCase):
         start = text.index('export TMPDIR="$REPO_ROOT')
         end_marker = "export XDG_CONFIG_HOME\n"
         prologue = text[start : text.index(end_marker) + len(end_marker)]
-        with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as scratch:
+        with _scratch() as scratch:
             root = Path(scratch)
             record = root / "env.out"
             stub = root / "stub-bin"

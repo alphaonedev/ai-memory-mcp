@@ -121,7 +121,7 @@ export XDG_CONFIG_HOME
 # ── --self-test: STUB binaries only, writes only inside its own temp dir ────
 if [[ $SELF_TEST -eq 1 ]]; then
   ST="$(mktemp -d)"
-  trap 'rm -rf "$ST" "$XDG_CONFIG_HOME"' EXIT
+  trap 'rm -rf -- "$ST" "${TMPDIR:?}/xdg-config-$$"' EXIT
   ST_FAIL=0
   git_state() { git -C "$REPO_ROOT" status --porcelain 2>/dev/null | sha256sum; }
   TREE_BEFORE="$(git_state)"
