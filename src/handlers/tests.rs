@@ -1389,9 +1389,6 @@ async fn http_bulk_create_fans_out_with_federation() {
     // #7259 — the governance pre-action hook is a process-wide one-shot; a fresh process
     // (nextest) has none and the fan-out fails closed. Install the test hook (#3515).
     crate::governance::wire_check::ensure_installed_for_test();
-    // #7259 — bulk_create requires row attestation by default (#1919/#1985); a fresh process
-    // has no sibling that opted the lib-test binary out (#1751), so do it here.
-    crate::identity::attest::permissive_attestation_for_lib_tests();
     // S40 — with federation configured, each successfully-inserted row
     // in a bulk call must fan out to every peer. We spin up an axum
     // mock peer that records sync_push POSTs and bulk-create N rows;
@@ -1438,47 +1435,12 @@ async fn http_bulk_create_fans_out_with_federation() {
     .unwrap()
     .expect("federation must be built");
 
+    // #7259 — `test_app_state` carries the lib-test attestation opt-out (#1751) and the shared
+    // fixture fields; only the federation handle and the closed admin allowlist differ here.
     let app_state = AppState {
-        db: state.clone(),
-        embedder: Arc::new(None),
-        vector_index: Arc::new(Mutex::new(None)),
         federation: Arc::new(Some(fed)),
-        tier_config: Arc::new(crate::config::FeatureTier::Keyword.config()),
-        scoring: Arc::new(crate::config::ResolvedScoring::default()),
-        profile: Arc::new(crate::profile::Profile::core()),
-        mcp_config: Arc::new(None),
-        active_keypair: Arc::new(None),
-        family_embeddings: Arc::new(RwLock::new(Some(Vec::new()))),
-        storage_backend: StorageBackend::Sqlite,
-        #[cfg(feature = "sal")]
-        store: test_sqlite_store_handle(),
-        llm: Arc::new(crate::reload::SwappableLlm::new(None)),
-        auto_tag_model: Arc::new(None),
-        llm_call_timeout: std::time::Duration::from_secs(
-            crate::config::DEFAULT_LLM_CALL_TIMEOUT_SECS,
-        ),
-        replay_cache: std::sync::Arc::new(crate::identity::replay::ReplayCache::default()),
-
-        verify_require_nonce: false,
-        federation_nonce_cache: std::sync::Arc::new(
-            crate::identity::replay::FederationNonceCache::default(),
-        ),
-        autonomous_hooks: false,
-        auto_tag_queue: None,
-        atomise_queue: None,
-        recall_scope: Arc::new(None),
-        deferred_audit_queue: Arc::new(None),
         admin_agent_ids: Arc::new(Vec::new()),
-        rule_cache: std::sync::Arc::new(crate::governance::rule_cache::RuleCache::new()),
-        resolved_models: std::sync::Arc::new(crate::reload::Swappable::new(
-            crate::config::ResolvedModels::default(),
-        )),
-        runtime: crate::runtime_context::RuntimeContext::global_arc(),
-        max_page_size: crate::handlers::MAX_BULK_SIZE,
-        enrolled_agent_keys: std::sync::Arc::new(
-            crate::handlers::identity_binding::EnrolledAgentKeys::empty(),
-        ),
-        http_identity_mode: crate::config::HttpIdentityMode::default(),
+        ..test_app_state(state.clone())
     };
     let router = Router::new()
         .route("/api/v1/memories/bulk", axum_post(bulk_create))
