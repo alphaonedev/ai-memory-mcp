@@ -270,12 +270,20 @@ def eviction_problem(evict_root, runner_name, home):
     return None
 
 
-def newest_mtime(path, newer_than=None, max_entries=None):
+class WalkIncomplete(RuntimeError):
+    """A strict walk stopped at WALK_ENTRY_CAP before it saw every entry."""
+
+
+def newest_mtime(path, newer_than=None, max_entries=None, strict=False):
     """Newest mtime under ``path`` (symlinks never followed, only lstat'd).
 
     With ``newer_than`` the walk stops early and returns as soon as one entry
     is newer than it (the target is not idle). With ``max_entries`` the walk
     stops after that many entries and returns the newest seen so far.
+
+    ``strict`` (#7289) is for the busy check: an unreadable directory or entry
+    re-raises the OSError, and a walk that reaches ``max_entries`` raises
+    WalkIncomplete, so the caller can treat an unknown state as busy.
     """
     newest = os.lstat(path).st_mtime
     if newer_than is not None and newest > newer_than:
@@ -288,15 +296,21 @@ def newest_mtime(path, newer_than=None, max_entries=None):
             with os.scandir(current) as scan_it:
                 entries = list(scan_it)
         except OSError:
+            if strict:
+                raise
             continue  # unreadable directory: skip it, the caller treats the rest as is
         for entry in entries:
             seen += 1
             if max_entries is not None and seen > max_entries:
+                if strict:
+                    raise WalkIncomplete("more than %d entries under %s" % (max_entries, path))
                 return newest
             try:
                 stamp = entry.stat(follow_symlinks=False).st_mtime
                 is_real_dir = entry.is_dir(follow_symlinks=False)
             except OSError:
+                if strict:
+                    raise
                 continue
             newest = max(newest, stamp)
             if newer_than is not None and newest > newer_than:
@@ -340,11 +354,13 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
 
     def is_busy(path):
         """True while a fresh in-use marker or a recent write says a job uses it."""
-        # r3 F1: an unreadable target (any OSError) counts as busy, never evicted.
+        # r3 F1 + #7289: an unreadable subtree, a walk cut short by WALK_ENTRY_CAP
+        # or an unreadable marker counts as busy, never evicted.
         try:
             if shared.marker_is_fresh(path, now):
                 return True
-            return newest_mtime(path, newer_than=busy_cutoff, max_entries=WALK_ENTRY_CAP) > busy_cutoff
+            return newest_mtime(
+                path, newer_than=busy_cutoff, max_entries=WALK_ENTRY_CAP, strict=True) > busy_cutoff
         except (OSError, RuntimeError):
             return True
 

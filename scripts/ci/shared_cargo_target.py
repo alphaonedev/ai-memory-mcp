@@ -25,6 +25,7 @@ Python 3.9+, standard library only.
 """
 import argparse
 import re
+import stat
 import sys
 import time
 from pathlib import Path
@@ -62,13 +63,21 @@ def clear_in_use_marker(target):
 
 
 def marker_is_fresh(target, now, max_age_secs=IN_USE_MARKER_MAX_AGE_SECS):
-    """True when ``target`` has a real (non-symlink) marker younger than ``max_age_secs``."""
+    """True when ``target`` has a real (non-symlink) marker younger than ``max_age_secs``.
+
+    Fail closed (#7289): only a missing marker (FileNotFoundError) or a target
+    that is not a directory (NotADirectoryError) is "no marker". Any other
+    OSError means the state is unknown, which counts as fresh (the target is
+    treated as in use).
+    """
     marker = Path(target) / IN_USE_MARKER_NAME
     try:
         info = marker.lstat()
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return False
-    return not marker.is_symlink() and now - info.st_mtime < max_age_secs
+    except OSError:
+        return True
+    return not stat.S_ISLNK(info.st_mode) and now - info.st_mtime < max_age_secs
 
 
 def target_root_dir(home):
