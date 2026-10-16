@@ -23,6 +23,7 @@ does not fail the post-job step (exit stays 0): cleanup must never red a job.
 Python 3.9+, standard library only.
 """
 import argparse
+import os
 import shutil
 import sys
 import time
@@ -47,6 +48,18 @@ def is_protected(candidate, protected_root):
     """True if ``candidate`` is, is inside, or contains the protected root."""
     cand = resolve(candidate)
     protected = resolve(protected_root)
+    if _covers(cand, protected):
+        return True
+    # F1: a direct child of the root may be a link that resolves elsewhere
+    # (including back into the work root); its target is protected too.
+    try:
+        children = list(Path(protected_root).iterdir())
+    except OSError:
+        return False
+    return any(_covers(cand, resolve(child)) for child in children)
+
+
+def _covers(cand, protected):
     return cand == protected or protected in cand.parents or cand in protected.parents
 
 
@@ -57,6 +70,38 @@ def is_within(path, root):
     except ValueError:
         return False
     return True
+
+
+def has_symlink_below(path, root):
+    """True if ``path`` is not lexically below ``root`` or any component below it is a symlink."""
+    base = Path(os.path.abspath(root))
+    try:
+        rel = Path(os.path.abspath(path)).relative_to(base)
+    except ValueError:
+        return True
+    current = base
+    for part in rel.parts:
+        current = current / part
+        if current.is_symlink():
+            return True
+    return False
+
+
+def remove_candidate(path, work_root, protected_root):
+    """Delete one candidate; return ``(status, reason)``, status removed or skipped.
+
+    F2: re-check right before deleting, then delete the RESOLVED path, never a
+    path that could be (or traverse) a symlink.
+    """
+    if has_symlink_below(path, work_root):
+        return "skipped", "symlink in path chain"
+    real = resolve(path)
+    if real.is_symlink() or not real.is_dir():
+        return "skipped", "not a plain directory"
+    if is_protected(real, protected_root) or not is_within(real, work_root):
+        return "skipped", "protected or outside root"
+    shutil.rmtree(real)
+    return "removed", None
 
 
 def is_old(path, max_age_days, now):
@@ -186,8 +231,11 @@ def main(argv=None):
             print("would remove %s" % path)
             continue
         try:
-            shutil.rmtree(path)
-            print("removed %s" % path)
+            status, why = remove_candidate(path, args.work_root, args.protected_root)
+            if status == "removed":
+                print("removed %s" % path)
+            else:
+                print("skipped %s: %s" % (path, why))
         except OSError as err:
             failures += 1
             print("could not remove %s: %s" % (path, err), file=sys.stderr)

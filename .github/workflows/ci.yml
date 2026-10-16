@@ -1964,10 +1964,12 @@ jobs:
       # artifacts (leftover .tmp* dirs, workspace incremental state, old
       # runner _temp entries) so an idle runner holds no stale scratch. It
       # NEVER touches the per-runner cargo target root (the helper refuses any
-      # path in, at or above it, so a sibling runner target is safe) and never fails the job. always() so a failed or
+      # path in, at or above it, so a sibling runner target is safe). Removal
+      # failures never fail the job; unsafe arguments do (exit 2). Skipped for
+      # fork PRs (refused above, no checkout ran). always() so a failed or
       # cancelled run is pruned too.
       - name: Prune stale runner artifacts (#7188)
-        if: always() && matrix.shared_target && needs.classify.outputs.docs_only != 'true'
+        if: always() && matrix.shared_target && needs.classify.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: python3 scripts/ci/prune_runner_artifacts.py --work-root "$RUNNER_WORKSPACE/.." --workspace "$GITHUB_WORKSPACE" --protected-root "$AI_MEMORY_CI_TARGET_ROOT"
 
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.

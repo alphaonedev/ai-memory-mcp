@@ -332,6 +332,41 @@ class OutOfTreeProtectedRoot(Fixture):
         self.assertNotIn("followlinks=True", src)
 
 
+class Hardening7188R2(Fixture):
+    def test_f1_child_link_into_work_root_is_protected(self):
+        child = self.shared / "r2"
+        target = touch_dir(self.work / "_temp" / "runnerB", OLD)
+        child.symlink_to(target, target_is_directory=True)
+        self.assertNotIn(target, self.candidates())
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            prune.main(["--work-root", str(self.work), "--workspace", str(self.workspace),
+                        "--protected-root", str(self.shared)])
+        self.assertTrue(target.exists())
+
+    def test_f2_swapped_component_is_not_followed(self):
+        outside = touch_dir(SCRATCH / "outside" / "debug" / "incremental")
+        victim = self.ws_incr
+        self.assertIn(victim, self.candidates())
+        shutil.rmtree(self.workspace / "target")
+        (self.workspace / "target").symlink_to(SCRATCH / "outside", target_is_directory=True)
+        status, _ = prune.remove_candidate(victim, self.work, self.shared)
+        self.assertEqual(status, "skipped")
+        self.assertTrue((outside / "f").exists())
+
+    def test_f2_plain_candidate_is_removed(self):
+        status, _ = prune.remove_candidate(self.ws_incr, self.work, self.shared)
+        self.assertEqual(status, "removed")
+        self.assertFalse(self.ws_incr.exists())
+
+    def test_f3_f4_workflow_step(self):
+        ci = (Path(prune.__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        step = ci.split("Prune stale runner artifacts (#7188)")[1].split("run:")[0]
+        self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", step)
+        self.assertIn("github.event_name != 'pull_request'", step)
+        self.assertNotIn("never fails the job", ci)
+
+
 class PerRunnerRoot(Fixture):
     """r3: the whole per-runner target root is protected, siblings included."""
 
