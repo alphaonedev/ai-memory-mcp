@@ -18,8 +18,11 @@ Sub-commands (``-h`` on each):
               ALLOW_CONNECTIONS false``). ``--emit-env`` prints
               ``AI_MEMORY_TEST_PG_TEMPLATE=`` and ``AI_MEMORY_TEST_PG_RUN_ID=``
               lines for ``$GITHUB_ENV``. Fails closed.
-``run``       run ``cargo test --no-fail-fast --test <bin>`` once per binary,
-              each against its own clone (held by a keepalive session while in
+``run``       run ``cargo test --no-fail-fast --test <bin>`` (or ``cargo nextest
+              run --profile ci --no-fail-fast --test <bin>``, #7259; the
+              ``--test-arg=--test-threads=N`` libtest flag becomes
+              ``--test-threads N``, see scripts/ci/nextest_args.py) once per
+              binary, each against its own clone (held by a keepalive session while in
               use), ``--jobs`` at a time (degraded to what the live budget
               allows), then the residual list one at a time on the shared
               database with the flag stripped. Output goes to one log file per
@@ -59,6 +62,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, IO, List, Optional, Set, Tuple
 from urllib.parse import parse_qsl, unquote, urlsplit
+
+# #7259: the shared libtest -> nextest argument translation lives in scripts/ci.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'ci'))
+import nextest_args  # noqa: E402
 
 URL_VAR = 'AI_MEMORY_TEST_POSTGRES_URL'
 AGE_URL_VAR = 'AI_MEMORY_TEST_AGE_URL'
@@ -530,9 +537,7 @@ class Runner:
         label = target[-1]
         if self.stop.is_set():
             return EXIT_TERM
-        argv = self.cargo + list(target)
-        if self.test_args:
-            argv += ['--'] + self.test_args
+        argv = nextest_args.command_for(self.cargo, list(target), self.test_args)
         child_env = dict(self.env)
         minted: Optional[str] = None
         hold = None
@@ -647,8 +652,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument('--jobs', type=int, default=MAX_JOBS)
     run.add_argument('--targets-file', required=True, help='one "--test NAME" / "--bin NAME" per line')
     run.add_argument('--residual-file', help='names that stay serial on the shared database')
-    run.add_argument('--test-arg', action='append', default=[], help='forwarded after "--" to libtest')
-    run.add_argument('cargo', nargs=argparse.REMAINDER, help='-- cargo test --no-fail-fast [features]')
+    run.add_argument('--test-arg', action='append', default=[], help='libtest argument: forwarded after "--" to cargo test, mapped '
+                                                              'to its nextest equivalent (--test-threads N) for cargo nextest run')
+    run.add_argument('cargo', nargs=argparse.REMAINDER, help='-- cargo test|nextest run --no-fail-fast [features]')
     return parser
 
 
@@ -660,6 +666,13 @@ def _cmd_run(args: argparse.Namespace, url: str) -> int:
     cargo = args.cargo[1:] if args.cargo[:1] == ['--'] else args.cargo
     if not cargo:
         raise WrapperError('missing the cargo command after "--"')
+    if not (cargo[:2] == ['cargo', 'test'] or nextest_args.is_nextest(cargo)):
+        raise WrapperError('the runner after "--" must be `cargo test ...` or `cargo nextest run ...`')
+    try:
+        # Validate the libtest -> runner mapping once, before any clone is minted.
+        nextest_args.command_for(cargo, ['--test', 'probe'], args.test_arg)
+    except nextest_args.ArgError as exc:
+        raise WrapperError(str(exc))
     tpl = _checked_ident(args.template or os.environ.get(TEMPLATE_VAR) or '')
     run_id = checked_run_id(args.run_id or os.environ.get(RUN_ID_VAR))
     targets = [parse_target_line(ln) for ln in read_lines(args.targets_file)]
