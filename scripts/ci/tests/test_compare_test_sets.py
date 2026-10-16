@@ -193,6 +193,77 @@ class ParseCargo(unittest.TestCase):
         self.assertEqual(cts.parse_nextest_log(nextest), {('a', 'one'): cts.PASS})
 
 
+# Verbatim lines of `gh run view <run> --log --job <job>` (run 38964028218 / baseline run 38876017305):
+# `<job>\t<step>\t<timestamp>Z ` in front of the line, then the runner's own text with ^[ escapes.
+GH_NEXTEST_LINE = ('Check (macos-fed,sqlite)\tUNKNOWN STEP\t2026-10-16T15:38:45.1478690Z '
+                   '^[[32;1m        PASS^[[0m [   3.937s] (14239/14239) ^[[35;1mai-memory::write_receipts_cli_mcp_3555^[[0m '
+                   '^[[34;1mmcp_store_update_capture_receipts_3555^[[0m')
+GH_CARGO_RUNNING = ('Check (macos-fed,sqlite)\tUNKNOWN STEP\t2026-10-16T08:56:31.3000000Z      '
+                    'Running unittests src/lib.rs (target/debug/deps/ai_memory-0123456789abcdef)')
+GH_CARGO_LINE = ('Check (macos-fed,sqlite)\tUNKNOWN STEP\t2026-10-16T08:56:31.4140500Z '
+                 'test actions::tests::authorize_claimed_by_binds_live_holder_3009 ... ok')
+GH_CARGO_RESULT = ('Check (macos-fed,sqlite)\tUNKNOWN STEP\t2026-10-16T08:59:24.0988110Z '
+                   'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 8983 filtered out; finished in 0.01s')
+GH_NEXTEST_SUMMARY = ('Check (macos-fed,sqlite)\tUNKNOWN STEP\t2026-10-16T15:38:45.1481420Z '
+                      '^[[32;1m     Summary^[[0m [ 359.524s] ^[[1m1^[[0m tests run: ^[[1m1^[[0m ^[[32;1mpassed^[[0m, '
+                      '^[[1m9^[[0m ^[[33;1mskipped^[[0m')
+
+
+class GhRunViewLogForm(unittest.TestCase):
+    """#7298 F1: `gh run view --log` prefixes every line with `<job>\\t<step>\\t<timestamp>`."""
+
+    def test_nextest_line_with_job_step_prefix_parses(self):
+        out = cts.parse_nextest_log(GH_NEXTEST_LINE + '\n')
+        self.assertEqual(out, {('write_receipts_cli_mcp_3555', 'mcp_store_update_capture_receipts_3555'): 'pass'})
+
+    def test_cargo_lines_with_job_step_prefix_parse(self):
+        out = cts.parse_cargo_log('\n'.join([GH_CARGO_RUNNING, GH_CARGO_LINE, GH_CARGO_RESULT]) + '\n')
+        self.assertEqual(out, {('lib', 'actions::tests::authorize_claimed_by_binds_live_holder_3009'): 'pass'})
+
+    def test_a_log_with_genuinely_no_tests_is_still_refused(self):
+        prefixed = 'Check (macos-fed,sqlite)\tUNKNOWN STEP\t2026-10-16T08:56:31.4140500Z Compiling x v1\n'
+        with self.assertRaises(cts.ParseError):
+            cts.parse_cargo_log(prefixed)
+        with self.assertRaises(cts.ParseError):
+            cts.parse_nextest_log(prefixed)
+
+    def test_a_tab_inside_ordinary_text_is_not_a_job_prefix(self):
+        line = 'a\tb\tno timestamp here PASS [ 0.1s] ai-memory::x y'
+        self.assertEqual(cts._clean(line), line)
+
+
+class SplicedPrefix(unittest.TestCase):
+    """#7299: a stderr fragment glued in front of a result line must not drop the result."""
+
+    def cargo(self, *body):
+        return '     Running tests/t.rs (target/debug/deps/t-aaaaaaaaaaaaaaaa)\n' + '\n'.join(body) + '\n'
+
+    def test_prefixed_ok_line_is_kept(self):
+        out = cts.parse_cargo_log(self.cargo('the file log sink failed to deliver a record: no space lefttest mod::a ... ok'))
+        self.assertEqual(out, {('t', 'mod::a'): 'pass'})
+
+    def test_prefixed_failed_line_is_a_failure(self):
+        out = cts.parse_cargo_log(self.cargo('warn: noise test mod::a ... FAILED'))
+        self.assertEqual(out, {('t', 'mod::a'): 'fail'})
+
+    def test_prefixed_nextest_fail_line_is_kept(self):
+        out = cts.parse_nextest_log('stderr noise        FAIL [   0.012s] ai-memory::t mod::a\n')
+        self.assertEqual(out, {('t', 'mod::a'): 'fail'})
+
+    def test_spliced_lines_are_counted(self):
+        scan = cts.scan_cargo_log(self.cargo('noise test mod::a ... ok', 'test mod::b ... ok'))
+        self.assertEqual(scan.spliced, 1)
+        scan = cts.scan_nextest_log('noise        PASS [   0.012s] ai-memory::t mod::a\n')
+        self.assertEqual(scan.spliced, 1)
+
+    def test_same_prefixed_failure_on_both_sides_is_kept_as_a_failure(self):
+        base = self.cargo('noise test mod::a ... FAILED')
+        cand = 'noise        FAIL [   0.012s] ai-memory::t mod::a\n'
+        report = cts.compare(cts.parse_cargo_log(base), cts.parse_nextest_log(cand))
+        self.assertEqual(report.baseline[('t', 'mod::a')], 'fail')
+        self.assertEqual(report.candidate[('t', 'mod::a')], 'fail')
+
+
 class ParseNextest(unittest.TestCase):
     def test_binary_ids_are_normalised_to_the_cargo_keys(self):
         self.assertEqual(cts.parse_nextest_log(NEXTEST_LOG), EXPECTED)

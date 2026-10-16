@@ -47,13 +47,18 @@ _ANSI_RE = re.compile(r'(?:\x1b|\^\[)\[[0-9;]*[A-Za-z]')
 # GitHub inserts a byte-order mark at log-chunk boundaries, anywhere in a line.
 _BOM = '\ufeff'
 _STAMP_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T[\d:.]+Z ?')
+# `gh run view --log` puts `<job>\t<step>\t` in front of every line's timestamp (#7298 F1); a tab pair is
+# only a prefix when a timestamp follows it, so tabs inside ordinary test output are left alone.
+_GH_PREFIX_RE = re.compile(r'^[^\t]*\t[^\t]*\t(?=\d{4}-\d{2}-\d{2}T[\d:.]+Z)')
 _RUNNING_RE = re.compile(r'^\s*Running (?:(?P<unit>unittests) )?(?P<src>\S+)(?: \((?P<exe>[^)]+)\))?\s*$')
 _DOCTEST_RE = re.compile(r'^\s*Doc-tests\b')
 # libtest prints ``test <name> - should panic ... ok`` for #[should_panic] tests; the suffix is
 # not part of the name nextest reports. A test that logs mid-line leaves the verdict either glued
 # to the noise (``ok<noise>``) or alone on a later line (``test <name> ... <noise>`` then ``ok``).
+# Another thread's unterminated stderr write can land in front of a result line (#7299), so the
+# result is searched for anywhere in the line; a non-blank prefix is counted as a spliced line.
 _CARGO_TEST_RE = re.compile(
-    r'^test (?P<name>.+?)(?: - should panic)? \.\.\. (?P<res>ok|FAILED|ignored)(?![A-Za-z])')
+    r'test (?P<name>\S+)(?: - should panic)? \.\.\. (?P<res>ok|FAILED|ignored)(?![A-Za-z])')
 _CARGO_OPEN_RE = re.compile(r'^test (?P<name>.+?)(?: - should panic)? \.\.\.(?: |$)')
 _CARGO_VERDICT_RE = re.compile(r'^(?P<res>ok|FAILED|ignored)(?![A-Za-z])')
 _HASH_RE = re.compile(r'-[0-9a-f]{16}$')
@@ -62,7 +67,7 @@ _HASH_RE = re.compile(r'-[0-9a-f]{16}$')
 _NESTED_START_RE = re.compile(r'(?:^|\s)running \d+ tests?$')
 _RESULT_RE = re.compile(r'^test result: ')
 _NEXTEST_RE = re.compile(
-    r'^\s*(?P<st>PASS|LEAK-FAIL|LEAK|FAIL|TIMEOUT|ABORT|SIG[A-Z0-9]+|EXEC-?FAIL|FLAKY(?: \d+/\d+)?)'
+    r'(?P<st>PASS|LEAK-FAIL|LEAK|FAIL|TIMEOUT|ABORT|SIG[A-Z0-9]+|EXEC-?FAIL|FLAKY(?: \d+/\d+)?)'
     r'\s+\[[^\]]*\]\s+(?:\(\s*\d+/\s*\d+\)\s+)?(?P<bin>\S+)\s+(?P<name>.+?)\s*$')
 _NEXTEST_PASS = ('PASS', 'LEAK')
 
@@ -72,6 +77,12 @@ Outcomes = Dict[Key, str]
 
 class ParseError(Exception):
     """Unusable input: empty, unparseable or contradictory (fail closed)."""
+
+
+class Scan(NamedTuple):
+    """One log parsed: the outcomes and how many result lines carried a spliced prefix (#7299)."""
+    outcomes: Outcomes
+    spliced: int
 
 
 class Report(NamedTuple):
@@ -87,7 +98,12 @@ class Report(NamedTuple):
 
 
 def _clean(line: str) -> str:
-    return _STAMP_RE.sub('', _ANSI_RE.sub('', line.replace(_BOM, ''))).rstrip()
+    return _STAMP_RE.sub('', _GH_PREFIX_RE.sub('', _ANSI_RE.sub('', line.replace(_BOM, '')))).rstrip()
+
+
+def _spliced(line: str, found: 're.Match[str]') -> bool:
+    """True when non-blank text was glued in front of the matched result."""
+    return bool(line[:found.start()].strip())
 
 
 def _norm(name: str) -> str:
@@ -115,7 +131,13 @@ def _cargo_binary(match: 're.Match[str]') -> str:
 
 def parse_cargo_log(text: str) -> Outcomes:
     """``cargo test`` log -> ``{(binary, test): pass|fail}`` (ignored tests and doc tests excluded)."""
+    return scan_cargo_log(text).outcomes
+
+
+def scan_cargo_log(text: str) -> Scan:
+    """``parse_cargo_log`` plus the count of result lines that carried a spliced prefix."""
     out: Outcomes = {}
+    spliced = 0
     current: Optional[str] = None
     pending: Optional[str] = None
     parents: List[Optional[str]] = []  # parent verdicts waiting while a nested child block runs
@@ -137,9 +159,10 @@ def parse_cargo_log(text: str) -> Outcomes:
             elif _RESULT_RE.match(line):
                 pending = parents.pop()
             continue
-        found = _CARGO_TEST_RE.match(line)
+        found = _CARGO_TEST_RE.search(line)
         if found:
             name, res, pending = found.group('name'), found.group('res'), None
+            spliced += _spliced(line, found)
         else:
             verdict = _CARGO_VERDICT_RE.match(line) if pending else None
             if verdict:
@@ -159,7 +182,7 @@ def parse_cargo_log(text: str) -> Outcomes:
         _merge(out, (current, name), PASS if res == 'ok' else FAIL)
     if not out:
         raise ParseError('cargo log: no executed tests found')
-    return out
+    return Scan(out, spliced)
 
 
 def _nextest_binary(binary_id: str) -> str:
@@ -169,18 +192,25 @@ def _nextest_binary(binary_id: str) -> str:
 
 def parse_nextest_log(text: str) -> Outcomes:
     """nextest status lines -> ``{(binary, test): pass|fail}`` (retry attempts and skips excluded)."""
+    return scan_nextest_log(text).outcomes
+
+
+def scan_nextest_log(text: str) -> Scan:
+    """``parse_nextest_log`` plus the count of status lines that carried a spliced prefix."""
     out: Outcomes = {}
+    spliced = 0
     for raw in text.splitlines():
         line = _clean(raw)
-        found = _NEXTEST_RE.match(line)
+        found = _NEXTEST_RE.search(line)
         if not found:
             continue
+        spliced += _spliced(line, found)
         status = found.group('st')
         ok = status in _NEXTEST_PASS or status.startswith('FLAKY')
         _merge(out, (_nextest_binary(found.group('bin')), found.group('name')), PASS if ok else FAIL)
     if not out:
         raise ParseError('nextest log: no PASS/FAIL result lines found')
-    return out
+    return Scan(out, spliced)
 
 
 def parse_junit(text: str) -> Outcomes:
@@ -253,12 +283,16 @@ def _read(paths: List[str]) -> List[str]:
     return texts
 
 
-def _load(parser, paths: List[str]) -> Outcomes:
+def _load(scanner, paths: List[str]) -> Tuple[Outcomes, int]:
+    """Merge the outcomes of every log of one side; also return its spliced-line count."""
     merged: Outcomes = {}
+    spliced = 0
     for text in _read(paths):
-        for key, outcome in parser(text).items():
+        scan = scanner(text)
+        spliced += scan.spliced
+        for key, outcome in scan.outcomes.items():
             _merge(merged, key, outcome)
-    return merged
+    return merged, spliced
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -278,15 +312,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         if not (args.nextest_log or args.nextest_junit):
             raise ParseError('a candidate is required: --nextest-log and/or --nextest-junit')
-        baseline = _load(parse_cargo_log, args.cargo_log)
-        candidate = _load(parse_nextest_log, args.nextest_log)
-        for key, outcome in _load(parse_junit, args.nextest_junit).items():
-            _merge(candidate, key, outcome)
+        baseline, spliced_base = _load(scan_cargo_log, args.cargo_log)
+        candidate, spliced_cand = _load(scan_nextest_log, args.nextest_log)
+        for text in _read(args.nextest_junit):
+            for key, outcome in parse_junit(text).items():
+                _merge(candidate, key, outcome)
         report = compare(baseline, candidate)
     except ParseError as exc:
         print('compare_test_sets: %s' % exc, file=sys.stderr)
         return EXIT_UNUSABLE
     print(render(report, max(args.max_list, 0)))
+    print('spliced result lines (stderr glued in front, still counted): baseline=%d candidate=%d'
+          % (spliced_base, spliced_cand))
     return EXIT_IDENTICAL if report.identical else EXIT_DIFFERENT
 
 
