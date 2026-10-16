@@ -26,6 +26,7 @@ Python 3.9+, standard library only.
 import argparse
 import re
 import sys
+import time
 from pathlib import Path
 
 TARGET_ROOT_RELATIVE = Path(".cache") / "ai-memory-ci" / "cargo-target"
@@ -33,8 +34,41 @@ ENV_NAME = "CARGO_TARGET_DIR"
 ROOT_ENV_NAME = "AI_MEMORY_CI_TARGET_ROOT"
 RUNNER_NAME_PATTERN = re.compile(r"\A[A-Za-z0-9._-]+\Z")
 DOT_NAMES = (".", "..")
+# In-use marker (#7199): written into this runner's target at job start and
+# removed by the post-job prune step. Eviction in a sibling runner skips a
+# target whose marker is younger than IN_USE_MARKER_MAX_AGE_SECS, so a crashed
+# job's marker expires instead of pinning the target forever (6 h is above the
+# longest linux-fed job timeout).
+IN_USE_MARKER_NAME = ".in-use"
+IN_USE_MARKER_MAX_AGE_SECS = 6 * 3600
+MARKER_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 EXIT_OK = 0
 EXIT_USAGE = 2
+
+
+def write_in_use_marker(target, runner_name, now=None):
+    """Write the in-use marker (runner name + ISO UTC time) into ``target``."""
+    stamp = time.strftime(MARKER_TIME_FORMAT, time.gmtime(time.time() if now is None else now))
+    (Path(target) / IN_USE_MARKER_NAME).write_text(
+        "%s %s\n" % (runner_name, stamp), encoding="utf-8")
+
+
+def clear_in_use_marker(target):
+    """Remove the in-use marker of ``target``; a missing marker is fine."""
+    try:
+        (Path(target) / IN_USE_MARKER_NAME).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def marker_is_fresh(target, now, max_age_secs=IN_USE_MARKER_MAX_AGE_SECS):
+    """True when ``target`` has a real (non-symlink) marker younger than ``max_age_secs``."""
+    marker = Path(target) / IN_USE_MARKER_NAME
+    try:
+        info = marker.lstat()
+    except OSError:
+        return False
+    return not marker.is_symlink() and now - info.st_mtime < max_age_secs
 
 
 def target_root_dir(home):
@@ -72,6 +106,7 @@ def main(argv=None):
         print("shared_cargo_target: refusing: %s" % err, file=sys.stderr)
         return EXIT_USAGE
     path.mkdir(parents=True, exist_ok=True)
+    write_in_use_marker(path, args.runner_name)
     if args.github_env:
         with open(args.github_env, "a", encoding="utf-8") as handle:
             handle.write("%s=%s\n" % (ENV_NAME, path))

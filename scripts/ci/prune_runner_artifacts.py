@@ -18,10 +18,16 @@ Idle-target eviction (#7199, ``--evict-root`` + ``--runner-name``) runs AFTER th
 prune. Under the per-runner target root it deletes every OTHER runner's target
 directory whose newest mtime is older than IDLE_TARGET_DAYS and, while the
 root's filesystem has less than FREE_FLOOR_GIB free, the oldest remaining other
-targets. It never touches this runner's target, anything that is not a real
-directory with a runner-safe name directly under the root (symlinks are never
-followed or deleted), or any root that is not an absolute path under the home.
-One line is printed per eviction plus a summary line.
+targets. A sibling target is evicted only when idle: in both passes it is
+skipped (``skipped busy``) while its in-use marker (written by
+shared_cargo_target.py at job start, cleared by this script's post-job run) is
+younger than IN_USE_MARKER_MAX_AGE_SECS or while its newest mtime is younger
+than BUSY_MTIME_MINUTES. It never touches this runner's target, anything that
+is not a real directory with a runner-safe name directly under the root
+(symlinks are never followed or deleted), or any root other than the one
+shared_cargo_target.py computes for the home. This runner's own in-use marker
+is cleared first. One line is printed per eviction plus a summary line; a
+floor that cannot be met prints a ``::warning::`` line.
 
 Exit codes: 0 ok, 2 bad arguments. A failed removal is reported and counted but
 does not fail the post-job step (exit stays 0): cleanup must never red a job.
@@ -29,11 +35,12 @@ Python 3.9+, standard library only.
 """
 import argparse
 import os
-import re
 import shutil
 import sys
 import time
 from pathlib import Path
+
+import shared_cargo_target as shared
 
 SECS_PER_DAY = 86400
 TEMP_DIR_NAME = "_temp"
@@ -43,8 +50,10 @@ DEFAULT_MAX_AGE_DAYS = 7
 IDLE_TARGET_DAYS = 7
 FREE_FLOOR_GIB = 200
 BYTES_PER_GIB = 1024 ** 3
-RUNNER_NAME_PATTERN = re.compile(r"\A[A-Za-z0-9._-]+\Z")
-DOT_NAMES = (".", "..")
+BUSY_MTIME_MINUTES = 30
+SECS_PER_MINUTE = 60
+# Cap on entries visited when looking for a recent write or ranking a target.
+WALK_ENTRY_CAP = 200_000
 EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_BAD_ARGS = EXIT_USAGE
@@ -159,8 +168,10 @@ def eviction_problem(evict_root, runner_name, home):
     """Return a refusal reason for the eviction arguments, or None when safe.
 
     The root must be an absolute, ``..``-free path strictly under the absolute
-    home (checked lexically: the cache directory may itself be a symlink to an
-    external disk) and the runner name must be a safe single path component.
+    home and must be the very directory shared_cargo_target.py computes for
+    that home (the cache directory may itself be a symlink to an external disk,
+    so the comparison is on resolved paths). The runner name must be a safe
+    single path component.
     """
     root = Path(evict_root)
     home = Path(home)
@@ -176,22 +187,30 @@ def eviction_problem(evict_root, runner_name, home):
         return "evict root is not under the home"
     if not relative.parts:
         return "evict root is the home itself"
-    if not runner_name or runner_name in DOT_NAMES or not RUNNER_NAME_PATTERN.match(runner_name):
+    expected = shared.target_root_dir(home)
+    if resolve(root) != resolve(expected):
+        return "evict root is not the runner target root %s" % expected
+    if not shared.valid_runner_name(runner_name):
         return "invalid runner name"
     return None
 
 
-def newest_mtime(path, newer_than=None):
+def newest_mtime(path, newer_than=None, max_entries=None):
     """Newest mtime under ``path`` (symlinks never followed, only lstat'd).
 
     With ``newer_than`` the walk stops early and returns as soon as one entry
-    is newer than it (the target is not idle).
+    is newer than it (the target is not idle). With ``max_entries`` the walk
+    stops after that many entries and returns the newest seen so far.
     """
     newest = os.lstat(path).st_mtime
     if newer_than is not None and newest > newer_than:
         return newest
+    seen = 0
     for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
         for name in dirnames + filenames:
+            seen += 1
+            if max_entries is not None and seen > max_entries:
+                return newest
             try:
                 stamp = os.lstat(os.path.join(dirpath, name)).st_mtime
             except OSError:
@@ -208,7 +227,7 @@ def other_targets(base, runner_name):
     for entry in sorted(base.iterdir()):
         if entry.name == runner_name or entry.is_symlink() or not entry.is_dir():
             continue
-        if entry.name in DOT_NAMES or not RUNNER_NAME_PATTERN.match(entry.name):
+        if not shared.valid_runner_name(entry.name):
             continue
         found.append(entry)
     return found
@@ -230,12 +249,23 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
         print("eviction summary: 0 evicted, root %s does not exist" % evict_root)
         return EXIT_OK
     cutoff = now - idle_days * SECS_PER_DAY
+    busy_cutoff = now - BUSY_MTIME_MINUTES * SECS_PER_MINUTE
     floor_bytes = floor_gib * BYTES_PER_GIB
-    state = {"evicted": 0, "failed": 0}
+    state = {"evicted": 0, "failed": 0, "busy": 0}
+
+    def is_busy(path):
+        """True while a fresh in-use marker or a recent write says a job uses it."""
+        if shared.marker_is_fresh(path, now):
+            return True
+        return newest_mtime(path, newer_than=busy_cutoff, max_entries=WALK_ENTRY_CAP) > busy_cutoff
 
     def remove(path, reason):
         if path.is_symlink() or path.parent != base:
             print("skipped unsafe %s" % path)
+            return
+        if is_busy(path):
+            state["busy"] += 1
+            print("skipped busy %s" % path)
             return
         if dry_run:
             print("would evict %s (%s)" % (path, reason))
@@ -257,13 +287,18 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
         else:
             remaining.append(entry)
     if free_bytes(base) < floor_bytes:
-        ranked = sorted((newest_mtime(entry), entry) for entry in remaining)
+        ranked = sorted((newest_mtime(entry, max_entries=WALK_ENTRY_CAP), entry)
+                        for entry in remaining)
         for _, entry in ranked:
             if not dry_run and free_bytes(base) >= floor_bytes:
                 break
             remove(entry, "below the %d GiB free-space floor" % floor_gib)
-    print("eviction summary: %d evicted, %d failed, %d GiB free (floor %d GiB)" % (
-        state["evicted"], state["failed"], free_bytes(base) // BYTES_PER_GIB, floor_gib))
+        if not dry_run and free_bytes(base) < floor_bytes:
+            print("::warning::free space under %s is below the %d GiB floor and no idle "
+                  "sibling target is left to evict" % (base, floor_gib))
+    print("eviction summary: %d evicted, %d failed, %d busy skipped, %d GiB free (floor %d GiB)" % (
+        state["evicted"], state["failed"], state["busy"],
+        free_bytes(base) // BYTES_PER_GIB, floor_gib))
     return EXIT_OK
 
 
@@ -321,6 +356,7 @@ def main(argv=None):
     if failures:
         print("prune_runner_artifacts: %d removal(s) failed" % failures, file=sys.stderr)
     if args.evict_root:
+        shared.clear_in_use_marker(Path(args.evict_root) / args.runner_name)
         return evict_idle_targets(
             args.evict_root, args.runner_name, args.home, args.idle_target_days,
             args.free_floor_gib, time.time(), dry_run=args.dry_run,

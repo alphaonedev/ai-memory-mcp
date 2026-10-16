@@ -873,13 +873,16 @@ jobs:
 
       # #7199 - sccache for the self-hosted Linux enterprise-fed leg. Each runner
       # compiles into its own ~160 GiB target (#7188), so a cross-runner compile
-      # cache (one sccache server per host user, SCCACHE_DIR under the same
-      # ~/.cache/ai-memory-ci root, capped by SCCACHE_CACHE_SIZE) removes most of
-      # the cold-build cost of a second runner. sccache cannot cache incremental
-      # artifacts: CARGO_INCREMENTAL=0 is set in this workflow env and in the
-      # runner .env on f2. The helper FAILS CLOSED when sccache is not on PATH
-      # (the job reds instead of silently building cold). Linux self-hosted
-      # legs only: the macOS fleet hosts may lack sccache.
+      # cache (ONE dedicated CI sccache server per host user on its own port,
+      # SCCACHE_SERVER_PORT, never the dev lanes' default-port server; SCCACHE_DIR
+      # under the same ~/.cache/ai-memory-ci root, capped by SCCACHE_CACHE_SIZE)
+      # removes most of the cold-build cost of a second runner. sccache cannot
+      # cache incremental artifacts: CARGO_INCREMENTAL=0 is set in this workflow
+      # env and in the runner .env on f2. The helper FAILS CLOSED when sccache is
+      # not on PATH or when the server reports any cache location other than
+      # SCCACHE_DIR (the job reds instead of silently building cold or into the
+      # wrong disk). Linux self-hosted legs only: the macOS fleet hosts may lack
+      # sccache.
       - name: sccache build cache (#7199)
         if: needs.classify.outputs.docs_only != 'true' && matrix.shared_target && runner.os == 'Linux'
         run: python3 scripts/ci/sccache_env.py --github-env "$GITHUB_ENV"
@@ -1973,20 +1976,28 @@ jobs:
             echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"
           fi
 
-      # #7188 - post-job cleanup on the self-hosted legs: prune stale per-job
-      # artifacts (leftover .tmp* dirs, workspace incremental state, old
-      # runner _temp entries) so an idle runner holds no stale scratch. It
-      # NEVER touches the per-runner cargo target root (the helper refuses any
-      # path in, at or above it, so a sibling runner target is safe) and never fails the job. always() so a failed or
-      # cancelled run is pruned too.
+      # #7199 - hit rate of the CI sccache server, then stop that server (same
+      # SCCACHE_SERVER_PORT) unless a sibling runner's in-use marker is fresh.
       - name: sccache hit-rate summary (#7199)
         if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.docs_only != 'true'
         run: python3 scripts/ci/sccache_env.py --stats
 
-      # #7199 - after the prune, evict OTHER runners idle cargo targets (idle
-      # over IDLE_TARGET_DAYS, then oldest-first while the cache filesystem is
-      # under FREE_FLOOR_GIB free). Never this runner target, never outside
-      # the root, never through a symlink. Bad arguments are refused with exit 2.
+      - name: sccache stop CI server (#7199)
+        if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.docs_only != 'true'
+        run: python3 scripts/ci/sccache_env.py --stop --runner-name "${{ runner.name }}"
+
+      # #7188 - post-job cleanup on the self-hosted legs: prune stale per-job
+      # artifacts (leftover .tmp* dirs, workspace incremental state, old
+      # runner _temp entries) so an idle runner holds no stale scratch. The
+      # prune pass NEVER touches the per-runner cargo target root (the helper
+      # refuses any path in, at or above it) and never fails the job. always()
+      # so a failed or cancelled run is pruned too.
+      # #7199 - after the prune, this runner clears its in-use marker and evicts
+      # OTHER runners' targets only when idle: no fresh in-use marker, no write
+      # within BUSY_MTIME_MINUTES, and either idle over IDLE_TARGET_DAYS or,
+      # oldest first, while the cache filesystem is under FREE_FLOOR_GIB free.
+      # Never this runner's target, never outside the root shared_cargo_target.py
+      # computes, never through a symlink. Bad arguments are refused with exit 2.
       - name: Prune stale runner artifacts (#7188)
         if: always() && matrix.shared_target && needs.classify.outputs.docs_only != 'true'
         run: python3 scripts/ci/prune_runner_artifacts.py --work-root "$RUNNER_WORKSPACE/.." --workspace "$GITHUB_WORKSPACE" --protected-root "$AI_MEMORY_CI_TARGET_ROOT" --evict-root "$AI_MEMORY_CI_TARGET_ROOT" --runner-name "${{ runner.name }}"
