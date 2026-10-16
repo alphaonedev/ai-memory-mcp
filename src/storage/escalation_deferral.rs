@@ -480,6 +480,26 @@ pub fn insert_pending_action_row(
 
 #[cfg(test)]
 mod tests {
+    /// #7241 L1 - an anchor handed to a funnel that runs in a raw transaction
+    /// with no `WriteTxn` frame is dropped; a debug or test build must trip a
+    /// `debug_assert!` so a new raw-transaction caller cannot under-anchor
+    /// silently (ERRORS-19).
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no WriteTxn frame")]
+    fn frameless_raw_transaction_anchor_drop_trips_debug_assert_7241() {
+        /// Head sequence of the pending watermark the funnel hands over.
+        const HEAD_SEQUENCE: i64 = 64;
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch("BEGIN").expect("raw transaction");
+        let anchor = crate::governance::audit::PendingAuditAnchor::watermark(
+            HEAD_SEQUENCE,
+            "head-hash",
+            "db-id",
+        );
+        super::defer_audit_anchor(&conn, anchor);
+    }
+
     /// Vote item 5(a) — a leaked `WriteTxn` whose frame still holds a deferred
     /// escalation is detected when the next transaction opens on the database.
     #[test]
