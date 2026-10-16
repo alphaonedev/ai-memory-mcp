@@ -32,6 +32,8 @@ DAY = 86400
 ME = "f2-linux-fed"
 IDLE_AGE_DAYS = 30
 BUSY_AGE_DAYS = 1
+FORK_GUARD = ("(github.event_name != 'pull_request' || "
+              "github.event.pull_request.head.repo.full_name == github.repository)")
 STEP_NAMES = (
     "Per-runner cargo target (#7188)",
     "sccache stop CI server (#7199)",
@@ -183,6 +185,15 @@ class RunnerNameThroughEnvOnly(unittest.TestCase):
             self.assertNotIn("${{", run, name)
             self.assertIn("RUNNER_NAME_ARG: ${{ runner.name }}", step, name)
             self.assertIn('"$RUNNER_NAME_ARG"', run, name)
+
+    def test_sccache_stats_and_stop_steps_carry_the_fork_pr_guard(self):
+        # #7290: a refused fork-PR leg must not run the always() sccache steps.
+        ci = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+        for name in ("sccache hit-rate summary (#7199)", "sccache stop CI server (#7199)"):
+            step = self.step_text(ci, name)
+            condition = [ln for ln in step.splitlines() if ln.strip().startswith("if:")]
+            self.assertEqual(len(condition), 1, name)
+            self.assertIn(FORK_GUARD, condition[0], name)
 
     def test_prune_step_keeps_the_fork_pr_guard_and_the_eviction_arguments(self):
         ci = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
