@@ -9,6 +9,7 @@ import fcntl
 import importlib.util
 import io
 import os
+import re
 import resource
 import shutil
 import subprocess
@@ -565,8 +566,9 @@ class EvictLockTests(SweepTestCase):
             os.close(fd)
         self.assertEqual(result.returncode, EXIT_OK, result.stderr)
         self.assertEqual(len(list(self.deps.iterdir())), 4)
-        warnings = [ln for ln in result.stderr.splitlines() if "not taken within" in ln]
-        self.assertEqual(len(warnings), 1, result.stderr)
+        warnings = [ln for ln in result.stdout.splitlines() if "not taken within" in ln
+                    and ln.startswith("::warning::")]
+        self.assertEqual(len(warnings), 1, result.stdout)
         self.assertIn("sweep skipped", warnings[0])
         self.assertNotIn("ci-sweep-target: target=", result.stdout)
         self.assertLess(elapsed, 15, "the wait must be bounded by --lock-timeout")
@@ -597,7 +599,8 @@ class EvictLockTests(SweepTestCase):
         self.lock_path.symlink_to(victim)
         result = self.sweep("--lock", str(self.lock_path), "--lock-timeout", "1")
         self.assertEqual(result.returncode, EXIT_OK, result.stderr)
-        self.assertIn("sweep skipped", result.stderr)
+        self.assertIn("::warning::", result.stdout)
+        self.assertIn("sweep skipped", result.stdout)
         self.assertEqual(victim.read_bytes(), b"keep")
         self.assertEqual(len(list(self.deps.iterdir())), 4)
 
@@ -633,6 +636,150 @@ class EvictLockTests(SweepTestCase):
         result = self.sweep()
         self.assertEqual(result.returncode, EXIT_OK, result.stderr)
         self.assertTrue(evicting.exists())
+
+
+class LockHardeningTests(SweepTestCase):
+    """#7297 round 6: --lock-timeout validation, true skip causes, annotations,
+    non-UTF-8 paths and the lock wait/hold report."""
+
+    def setUp(self):
+        super().setUp()
+        self.cache_root = self.root / "cache" / "cargo-target"
+        self.runner = self.cache_root / "f2-linux-fed"
+        self.deps = self.runner / "debug" / "deps"
+        for idx in range(4):
+            entry = self.deps / "lib{}.rlib".format(idx)
+            write_blob(entry)
+            set_age(entry, idx)
+        self.lock_path = self.cache_root / ".evict.lock"
+
+    def sweep(self, *extra, target=None):
+        return self.run_sweep("--max-bytes", "1500", "--allow-root", "--within",
+                              str(self.cache_root), *extra, target=target or self.runner)
+
+    def assert_untouched(self):
+        self.assertEqual(len(list(self.deps.iterdir())), 4)
+
+    def annotations(self, result):
+        return [ln for ln in result.stdout.splitlines() if ln.startswith("::warning::")]
+
+    def test_non_finite_or_negative_lock_timeout_is_usage_7297_r6(self):
+        for bad in ("nan", "inf", "-inf", "-1", "abc", ""):
+            with self.subTest(timeout=bad):
+                result = self.sweep("--lock", str(self.lock_path), "--lock-timeout", bad)
+                self.assertEqual(result.returncode, EXIT_USAGE, result.stderr)
+                self.assertIn("--lock-timeout", result.stderr)
+                self.assert_untouched()
+
+    def test_zero_lock_timeout_is_a_single_attempt_7297_r6(self):
+        result = self.sweep("--lock", str(self.lock_path), "--lock-timeout", "0")
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        self.assertIn("removed=3", result.stdout)
+
+    def assert_skipped(self, result, cause_word):
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        self.assert_untouched()
+        annotations = self.annotations(result)
+        self.assertEqual(len(annotations), 1, result.stdout)
+        self.assertIn(cause_word, annotations[0])
+        self.assertNotIn("not taken within", annotations[0])
+        self.assertRegex(annotations[0], r"Errno|errno")
+        summary = [ln for ln in result.stdout.splitlines()
+                   if "sweep skipped (" in ln and not ln.startswith("::")]
+        self.assertEqual(len(summary), 1, result.stdout)
+        self.assertNotIn("removed=0", result.stdout)
+
+    def test_symlink_lock_path_reports_symlink_7297_r6(self):
+        victim = self.root / "victim"
+        victim.write_bytes(b"keep")
+        self.lock_path.symlink_to(victim)
+        self.assert_skipped(self.sweep("--lock", str(self.lock_path)), "symlink")
+        self.assertEqual(victim.read_bytes(), b"keep")
+
+    def test_directory_lock_path_reports_directory_7297_r6(self):
+        self.lock_path.mkdir()
+        self.assert_skipped(self.sweep("--lock", str(self.lock_path)), "directory")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root ignores mode bits")
+    def test_unwritable_root_reports_not_writable_7297_r6(self):
+        self.cache_root.chmod(0o555)
+        self.addCleanup(self.cache_root.chmod, 0o755)
+        self.assert_skipped(self.sweep("--lock", str(self.lock_path)), "not writable")
+
+    def test_missing_root_reports_missing_7297_r6(self):
+        gone = self.root / "gone-root"
+        result = self.run_sweep("--max-bytes", "1500", "--allow-root", "--within", str(gone),
+                                "--lock", str(gone / ".evict.lock"),
+                                target=gone / "f2-linux-fed")
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        annotations = self.annotations(result)
+        self.assertEqual(len(annotations), 1, result.stdout)
+        self.assertIn("missing", annotations[0])
+        self.assertNotIn("not taken within", annotations[0])
+        self.assertIn("sweep skipped (", result.stdout)
+
+    def test_contention_timeout_is_annotated_and_skipped_7297_r6(self):
+        self.lock_path.write_bytes(b"")
+        fd = os.open(str(self.lock_path), os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            result = self.sweep("--lock", str(self.lock_path), "--lock-timeout", "1")
+        finally:
+            os.close(fd)
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        self.assert_untouched()
+        annotations = self.annotations(result)
+        self.assertEqual(len(annotations), 1, result.stdout)
+        self.assertIn("not taken within", annotations[0])
+        self.assertIn("sweep skipped (", result.stdout)
+        self.assertNotIn("removed=0", result.stdout)
+
+    def test_summary_reports_lock_wait_and_hold_7297_r6(self):
+        result = self.sweep("--lock", str(self.lock_path))
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        self.assertRegex(result.stdout,
+                         r"freed=\d+ lock_wait=\d+\.\d\d lock_held=\d+\.\d\d")
+
+    def test_summary_without_lock_reports_zero_7297_r6(self):
+        result = self.sweep()
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        self.assertIn("lock_wait=0.00 lock_held=0.00", result.stdout)
+
+    def test_wait_is_measured_when_the_lock_is_released_late_7297_r6(self):
+        self.lock_path.write_bytes(b"")
+        fd = os.open(str(self.lock_path), os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        timer = threading.Timer(0.6, os.close, args=(fd,))
+        timer.start()
+        try:
+            result = self.sweep("--lock", str(self.lock_path), "--lock-timeout", "20")
+        finally:
+            timer.join()
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        match = re.search(r"lock_wait=(\d+\.\d\d)", result.stdout)
+        self.assertIsNotNone(match, result.stdout)
+        self.assertGreaterEqual(float(match.group(1)), 0.4)
+
+    def non_utf8_path(self, parent):
+        """A path with a non-UTF-8 component. It is not created: macOS (APFS)
+        refuses to create such a name, and a missing target is still summarised."""
+        return Path(os.fsdecode(os.path.join(os.fsencode(str(parent)), b"bad-\xff-name")))
+
+    def test_non_utf8_target_summary_has_no_traceback_7297_r6(self):
+        base = self.non_utf8_path(self.root)
+        result = self.run_sweep("--max-bytes", "1500", "--allow-root", "--within",
+                                str(self.root), target=base)
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertRegex(result.stdout, r"bad-\\(xff|udcff)-name")
+        self.assertIn("removed=0", result.stdout)
+
+    def test_non_utf8_target_refusal_has_documented_rc_7297_r6(self):
+        base = self.non_utf8_path(self.root)
+        result = self.run_sweep("--max-bytes", "1500", target=base)
+        self.assertEqual(result.returncode, EXIT_REFUSED, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertRegex(result.stderr, r"bad-\\(xff|udcff)-name")
 
 
 def raise_fd_limit(wanted):

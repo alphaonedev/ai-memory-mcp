@@ -24,9 +24,15 @@ Safety:
     flock of #7219's idle-target eviction) takes that lock exclusively while
     sweeping; ``FILE`` must sit directly in the resolved ``--within`` root and
     is opened ``O_NOFOLLOW``. If the lock is not taken within ``--lock-timeout``
-    seconds (default 20) or cannot be opened, one ``warning: ... sweep skipped``
-    line is printed and the exit is 0 (the always-run step stays green; the
-    next job sweeps). Nothing outside ``<target>/debug/{deps,incremental,
+    seconds (default 20; a finite number >= 0, ``0`` is one attempt) or cannot
+    be opened (the lock path is a symlink or a directory, the root is not
+    writable or is missing), one ``::warning::`` GitHub Actions annotation
+    naming the real cause and its errno is printed on stdout, the summary line
+    reads ``sweep skipped (<reason>)``, and the exit is 0 (the always-run step
+    stays green; the next job sweeps). The summary line also reports
+    ``lock_wait=<s> lock_held=<s>`` (0.00 without ``--lock``); the lock is
+    taken right before the walk and released right after the delete.
+    Non-UTF-8 path bytes print as backslash escapes (no traceback). Nothing outside ``<target>/debug/{deps,incremental,
     build,.fingerprint}`` is ever read or deleted, so the in-use marker
     (``<target>/.in-use``), ``<root>/.evict.lock`` and the ``<root>/.evicting-*``
     directories are never entries of a sweep.
@@ -66,16 +72,21 @@ Safety:
 
 Exit codes: 0 success, 2 refused path (target outside the workspace, a
 symlinked or swapped component, a target path component that is not a
-directory, or an ``--allow-root`` target not strictly inside ``--within``), 3 ``--max-bytes`` is zero or negative,
+directory, an ``--allow-root`` target not strictly inside ``--within``, or a
+``--lock`` not directly inside the resolved ``--within`` root), 3 ``--max-bytes`` is zero or negative,
 4 nothing could be sized because every swept directory or entry was
 unreadable, 5 usage error (a missing, unknown or unparsable argument such as
 ``--max-bytes abc`` or an empty ``--max-bytes``; ``--allow-root`` without
-``--within`` or ``--within`` without ``--allow-root``; ``--help`` exits 0).
+``--within``, ``--within`` without ``--allow-root``, ``--lock`` without
+``--allow-root``, or a negative, non-numeric or non-finite (``nan``, ``inf``)
+``--lock-timeout``; ``--help`` exits 0). An unopenable or contended lock file
+is not an error: the sweep is skipped with a warning and the exit is 0.
 """
 
 import argparse
 import errno
 import fcntl
+import math
 import os
 import stat
 import sys
@@ -110,33 +121,82 @@ LOCK_FILE_MODE = 0o600
 DEFAULT_LOCK_TIMEOUT_SECS = 20.0
 
 
+def lock_open_reason(path, exc):
+    """Name why ``path`` could not be opened as the lock file, with the OSError."""
+    code = exc.errno
+    if code == errno.ELOOP:
+        what = "lock path is a symlink (not followed)"
+    elif code == errno.EISDIR:
+        what = "lock path is a directory"
+    elif code == errno.ENOENT:
+        what = "lock root is missing"
+    elif code in (errno.EACCES, errno.EPERM, errno.EROFS):
+        what = "lock root or file is not writable"
+    else:
+        what = "lock file cannot be opened"
+    return "{}: {} [Errno {}] {}".format(what, path, code, exc.strerror)
+
+
 def take_lock(path, timeout_secs):
     """Take the exclusive flock on ``path`` for at most ``timeout_secs``.
 
-    Return the held descriptor, or ``None`` when the lock file cannot be
-    opened or the wait timed out (the caller skips the sweep, fail soft). The
-    file is opened ``O_NOFOLLOW`` so a symlinked lock file is never followed.
-    Same primitive as ``evict_lock`` in scripts/ci/shared_cargo_target.py
-    (#7219): ``LOCK_EX | LOCK_NB`` polled until the deadline.
+    Return ``(fd, None)`` when held, else ``(None, reason)`` where ``reason``
+    names the real cause: an open failure (symlink, directory, unwritable or
+    missing root, with the OSError errno and strerror) or a contention timeout
+    (the caller skips the sweep, fail soft). The file is opened ``O_NOFOLLOW``
+    so a symlinked lock file is never followed. Same primitive as
+    ``evict_lock`` in scripts/ci/shared_cargo_target.py (#7219):
+    ``LOCK_EX | LOCK_NB`` polled until the deadline.
     """
     try:
         fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
                      LOCK_FILE_MODE)
-    except OSError:
-        return None
+    except OSError as exc:
+        return None, lock_open_reason(path, exc)
     deadline = time.monotonic() + timeout_secs
+    reason = "lock {} not taken within {} s (held by another process)".format(
+        path, timeout_secs)
     while True:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
+            return fd, None
         except BlockingIOError:
             if time.monotonic() >= deadline:
                 break
             time.sleep(LOCK_POLL_SECS)
-        except OSError:
+        except OSError as exc:
+            reason = "lock {} cannot be taken: [Errno {}] {}".format(
+                path, exc.errno, exc.strerror)
             break
     os.close(fd)
-    return None
+    return None, reason
+
+
+def lock_timeout_arg(text):
+    """argparse type: a finite float >= 0 (``nan``, ``inf`` and negatives are usage errors)."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "--lock-timeout must be a number of seconds, got {!r}".format(text))
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(
+            "--lock-timeout must be a finite number >= 0, got {!r}".format(text))
+    return value
+
+
+def annotate_warning(message):
+    """Print a GitHub Actions ``::warning::`` annotation on stdout (one line)."""
+    escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+    print("::warning::ci-sweep-target: {}".format(escaped))
+
+
+def configure_output():
+    """Never raise on a non-UTF-8 path: undecodable bytes print as backslash escapes (#7297 S14)."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            reconfigure(errors="backslashreplace")
 
 
 class UsageParser(argparse.ArgumentParser):
@@ -478,6 +538,7 @@ def sweep(real_target, args, warnings, handles):
 
 
 def main(argv=None):
+    configure_output()
     parser = UsageParser(description=__doc__.splitlines()[0])
     parser.add_argument("--target", required=True, help="cargo target directory")
     parser.add_argument("--max-bytes", required=True, type=int, help="size cap in bytes")
@@ -492,9 +553,10 @@ def main(argv=None):
                              "the --within root, e.g. <root>/.evict.lock) while sweeping; "
                              "if it is not taken within --lock-timeout seconds print one "
                              "warning and skip the sweep with exit 0")
-    parser.add_argument("--lock-timeout", type=float, default=DEFAULT_LOCK_TIMEOUT_SECS,
-                        metavar="SECS", help="longest wait for --lock (default {})".format(
-                            DEFAULT_LOCK_TIMEOUT_SECS))
+    parser.add_argument("--lock-timeout", type=lock_timeout_arg,
+                        default=DEFAULT_LOCK_TIMEOUT_SECS, metavar="SECS",
+                        help="longest wait for --lock, a finite number >= 0 (default {}; "
+                             "0 is a single attempt)".format(DEFAULT_LOCK_TIMEOUT_SECS))
     parser.add_argument("--dry-run", action="store_true", help="report only; delete nothing")
     args = parser.parse_args(argv)
     if args.allow_root and not args.within:
@@ -503,8 +565,6 @@ def main(argv=None):
         parser.error("--within is only valid with --allow-root")
     if args.lock and not args.allow_root:
         parser.error("--lock is only valid with --allow-root")
-    if args.lock_timeout < 0:
-        parser.error("--lock-timeout must not be negative")
     if args.max_bytes <= 0:
         print("usage: --max-bytes must be a positive integer, got {}".format(
             args.max_bytes), file=sys.stderr)
@@ -527,6 +587,9 @@ def main(argv=None):
             return EXIT_REFUSED
 
     lock_fd = None
+    lock_held = 0.0
+    lock_wait = 0.0
+    lock_taken_at = None
     if args.lock:
         lock_dir, lock_name = os.path.split(os.path.abspath(args.lock))
         if (not lock_name or lock_name in (".", "..")
@@ -534,11 +597,15 @@ def main(argv=None):
             print("refused: --lock {} is not a file directly inside the resolved --within "
                   "root {}".format(args.lock, real_root), file=sys.stderr)
             return EXIT_REFUSED
-        lock_fd = take_lock(os.path.join(real_root, lock_name), args.lock_timeout)
+        wait_started = time.monotonic()
+        lock_fd, skip_reason = take_lock(os.path.join(real_root, lock_name),
+                                         args.lock_timeout)
+        lock_taken_at = time.monotonic()
+        lock_wait = lock_taken_at - wait_started
         if lock_fd is None:
-            print("ci-sweep-target: warning: lock {} not taken within {} s; sweep skipped "
-                  "(target uncapped this run)".format(
-                      os.path.join(real_root, lock_name), args.lock_timeout), file=sys.stderr)
+            annotate_warning("{}; sweep skipped, target uncapped this run".format(skip_reason))
+            print("ci-sweep-target: sweep skipped ({}) target={} lock_wait={:.2f} "
+                  "lock_held=0.00".format(skip_reason, real_target, lock_wait))
             return EXIT_OK
 
     warnings = []
@@ -556,9 +623,11 @@ def main(argv=None):
                 pass
         if lock_fd is not None:
             os.close(lock_fd)  # closing the descriptor releases the flock
-    print("ci-sweep-target: target={} cap={} before={} after={} removed={} freed={}{}".format(
-        real_target, args.max_bytes, before, remaining, removed, before - remaining,
-        " (dry-run)" if args.dry_run else ""))
+            lock_held = time.monotonic() - lock_taken_at
+    print("ci-sweep-target: target={} cap={} before={} after={} removed={} freed={} "
+          "lock_wait={:.2f} lock_held={:.2f}{}".format(
+              real_target, args.max_bytes, before, remaining, removed, before - remaining,
+              lock_wait, lock_held, " (dry-run)" if args.dry_run else ""))
     return code
 
 
