@@ -3046,12 +3046,22 @@ pub fn append_signed_event_no_tx(conn: &Connection, event: &SignedEvent) -> Resu
     // peek keeps the genesis read off the 63-of-64 non-emitting appends,
     // mirroring the witness lane's interval pre-check.
     if crate::governance::audit::watermark_emission_due(next_seq) {
-        let db_id = genesis_db_id(conn).ok().flatten();
-        crate::governance::audit::maybe_record_audit_watermark(
-            next_seq,
-            &head_hash_hex,
-            db_id.as_deref(),
-        );
+        // #7228 — never anchor a db_id-less (legacy) watermark: the reader counts
+        // it against EVERY opener of the shared sink. An absent genesis skips the
+        // emission (one WARN); a genesis read error is WARNed and skipped, never
+        // silently dropped (ERRORS-19), mirroring the witness lane's swallow.
+        match genesis_db_id(conn) {
+            Ok(Some(db_id)) => crate::governance::audit::maybe_record_audit_watermark(
+                next_seq,
+                &head_hash_hex,
+                &db_id,
+            ),
+            Ok(None) => crate::governance::audit::warn_watermark_skipped_no_genesis(),
+            Err(e) => tracing::warn!(
+                target: SIGNED_EVENTS_TRACE_TARGET,
+                "audit watermark skipped: genesis db-id read failed: {e:#}"
+            ),
+        }
     }
 
     // v0.9.0 G5b (#1822) — INDEPENDENT dual-chain audit-head witness anchor.

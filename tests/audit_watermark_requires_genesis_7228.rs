@@ -76,10 +76,10 @@ fn watermark_payloads(dir: &Path) -> Vec<serde_json::Value> {
             let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
-            if row.get("kind").and_then(serde_json::Value::as_str) == Some(WATERMARK_KIND) {
-                if let Some(payload) = row.get("payload") {
-                    out.push(payload.clone());
-                }
+            if row.get("kind").and_then(serde_json::Value::as_str) == Some(WATERMARK_KIND)
+                && let Some(payload) = row.get("payload")
+            {
+                out.push(payload.clone());
             }
         }
     }
