@@ -33,6 +33,15 @@ shared_cargo_target.py computes for the home. This runner's own in-use marker
 is cleared first. One line is printed per eviction plus a summary line; a
 floor that cannot be met prints a ``::warning::`` line.
 
+Eviction is serialised against a job start (#7292): shared_cargo_target.py takes
+an exclusive flock on ``<root>/.evict.lock`` around its mkdir and marker write;
+eviction takes the same lock (bounded wait, a timeout skips the eviction), re-runs
+the busy check, renames the target to ``<root>/.evicting-<name>-<pid>`` and only
+then, lock released, deletes it. Names starting with ``.`` are never siblings;
+stale ``.evicting-*`` leftovers are swept first. The lock file lives in the
+protected root and is never deleted. An unreadable subtree, a walk cut short by
+WALK_ENTRY_CAP or an unreadable marker counts as busy (#7289).
+
 Exit codes: 0 ok, 2 bad arguments (only validate_arguments, which also checks the
 eviction arguments). A failed removal is reported and counted but
 does not fail the post-job step (exit stays 0): cleanup must never red a job.
@@ -56,6 +65,10 @@ IDLE_TARGET_DAYS = 7
 FREE_FLOOR_GIB = 200
 BYTES_PER_GIB = 1024 ** 3
 BUSY_MTIME_MINUTES = 30
+# #7292: under the eviction lock a target is renamed to
+# <root>/.evicting-<name>-<pid> and deleted there; a leftover of a killed
+# eviction is swept once its mtime is older than BUSY_MTIME_MINUTES.
+EVICTING_PREFIX = ".evicting-"
 SECS_PER_MINUTE = 60
 # Cap on entries visited when looking for a recent write or ranking a target.
 WALK_ENTRY_CAP = 200_000
@@ -321,10 +334,16 @@ def newest_mtime(path, newer_than=None, max_entries=None, strict=False):
 
 
 def other_targets(base, runner_name):
-    """Real runner-named directories directly under ``base``, except this runner's."""
+    """Real runner-named directories directly under ``base``, except this runner's.
+
+    A name starting with ``.`` (the lock file, ``.evicting-*`` leftovers) is
+    never a sibling target.
+    """
     found = []
     for entry in sorted(base.iterdir()):
-        if entry.name == runner_name or entry.is_symlink() or not entry.is_dir():
+        if entry.name.startswith(".") or entry.name == runner_name:
+            continue
+        if entry.is_symlink() or not entry.is_dir():
             continue
         if not shared.valid_runner_name(entry.name):
             continue
@@ -332,13 +351,48 @@ def other_targets(base, runner_name):
     return found
 
 
+def sweep_stale_evicting(base, now, dry_run=False):
+    """Delete leftover ``.evicting-*`` directories older than BUSY_MTIME_MINUTES.
+
+    These are targets renamed by an eviction that was killed before its rmtree
+    finished; no job can reach them. A symlink or a recent entry (possibly a
+    running eviction) is left alone.
+    """
+    cutoff = now - BUSY_MTIME_MINUTES * SECS_PER_MINUTE
+    swept = 0
+    for entry in sorted(base.iterdir()):
+        if not entry.name.startswith(EVICTING_PREFIX):
+            continue
+        try:
+            if entry.is_symlink() or not entry.is_dir() or entry.lstat().st_mtime > cutoff:
+                continue
+            if dry_run:
+                print("would sweep stale %s" % entry)
+                continue
+            shutil.rmtree(entry)
+        except OSError as err:
+            print("could not sweep %s: %s" % (entry, err), file=sys.stderr)
+            continue
+        swept += 1
+        print("swept stale %s" % entry)
+    return swept
+
+
 def free_bytes_of(path):
     return shutil.disk_usage(path).free
 
 
 def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
-                       dry_run=False, free_bytes=free_bytes_of):
-    """Evict idle (then, below the free floor, oldest) other-runner targets."""
+                       dry_run=False, free_bytes=free_bytes_of,
+                       lock_timeout=shared.EVICT_LOCK_TIMEOUT_SECS):
+    """Evict idle (then, below the free floor, oldest) other-runner targets.
+
+    Each delete (#7292) runs as: take ``<root>/.evict.lock`` (bounded wait; on a
+    timeout the whole eviction is skipped, fail closed), re-run the busy check,
+    ``os.rename`` the target to ``<root>/.evicting-<name>-<pid>``, release the
+    lock, then ``rmtree`` the renamed path. A job that starts afterwards creates
+    a fresh target and never shares a tree with the delete.
+    """
     problem = eviction_problem(evict_root, runner_name, home)
     if problem:
         print("prune_runner_artifacts: skipping eviction: %s" % problem, file=sys.stderr)
@@ -350,7 +404,7 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
     cutoff = now - idle_days * SECS_PER_DAY
     busy_cutoff = now - BUSY_MTIME_MINUTES * SECS_PER_MINUTE
     floor_bytes = floor_gib * BYTES_PER_GIB
-    state = {"evicted": 0, "failed": 0, "busy": 0}
+    state = {"evicted": 0, "failed": 0, "busy": 0, "lock_timeout": False}
 
     def is_busy(path):
         """True while a fresh in-use marker or a recent write says a job uses it."""
@@ -365,19 +419,42 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
             return True
 
     def remove(path, reason):
+        if state["lock_timeout"]:
+            return
         if path.is_symlink() or path.parent != base:
             print("skipped unsafe %s" % path)
             return
-        if is_busy(path):
-            state["busy"] += 1
-            print("skipped busy %s" % path)
-            return
         if dry_run:
+            if is_busy(path):
+                state["busy"] += 1
+                print("skipped busy %s" % path)
+                return
             print("would evict %s (%s)" % (path, reason))
             state["evicted"] += 1
             return
+        renamed = base / ("%s%s-%d" % (EVICTING_PREFIX, path.name, os.getpid()))
+        with shared.evict_lock(base, lock_timeout) as held:
+            if not held:
+                state["lock_timeout"] = True
+                print("prune_runner_artifacts: skipping eviction: lock %s not taken within %s s"
+                      % (base / shared.EVICT_LOCK_NAME, lock_timeout), file=sys.stderr)
+                return
+            # The decision is made again under the lock: a job start holds the
+            # same lock around its marker write, so after this check no marker
+            # can appear in a target we are about to move.
+            if path.is_symlink() or is_busy(path):
+                state["busy"] += 1
+                print("skipped busy %s" % path)
+                return
+            try:
+                os.rename(path, renamed)
+                os.utime(renamed)
+            except OSError as err:
+                state["failed"] += 1
+                print("could not evict %s: %s" % (path, err), file=sys.stderr)
+                return
         try:
-            shutil.rmtree(path)
+            shutil.rmtree(renamed)
         except OSError as err:
             state["failed"] += 1
             print("could not evict %s: %s" % (path, err), file=sys.stderr)
@@ -385,6 +462,7 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
         state["evicted"] += 1
         print("evicted %s (%s)" % (path, reason))
 
+    sweep_stale_evicting(base, now, dry_run=dry_run)
     remaining = []
     for entry in other_targets(base, runner_name):
         try:
@@ -405,6 +483,8 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
                 print("skipped unreadable %s: %s" % (entry, err), file=sys.stderr)
         ranked.sort()
         for _, entry in ranked:
+            if state["lock_timeout"]:
+                break
             if not dry_run and free_bytes(base) >= floor_bytes:
                 break
             remove(entry, "below the %d GiB free-space floor" % floor_gib)

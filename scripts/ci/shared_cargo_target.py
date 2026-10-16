@@ -24,6 +24,9 @@ Exit codes: 0 ok, 2 bad arguments or an unusable home directory or runner name.
 Python 3.9+, standard library only.
 """
 import argparse
+import contextlib
+import fcntl
+import os
 import re
 import stat
 import sys
@@ -43,8 +46,51 @@ DOT_NAMES = (".", "..")
 IN_USE_MARKER_NAME = ".in-use"
 IN_USE_MARKER_MAX_AGE_SECS = 6 * 3600
 MARKER_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# Eviction lock (#7292): an exclusive flock on <root>/.evict.lock serialises a
+# job start (mkdir + marker write) against an eviction's busy check + rename.
+# The lock file lives inside the protected root, so a prune never deletes it.
+EVICT_LOCK_NAME = ".evict.lock"
+EVICT_LOCK_TIMEOUT_SECS = 20.0
+JOB_START_LOCK_TIMEOUT_SECS = 60.0
+LOCK_POLL_SECS = 0.05
+LOCK_FILE_MODE = 0o600
 EXIT_OK = 0
 EXIT_USAGE = 2
+
+
+@contextlib.contextmanager
+def evict_lock(root, timeout_secs):
+    """Take ``<root>/.evict.lock`` exclusively for at most ``timeout_secs``; yield True if held.
+
+    Never raises for a lock problem: a lock file that cannot be opened or a
+    timeout yields False and the caller decides (eviction skips, a job start
+    warns and proceeds). The lock is released when the block exits.
+    """
+    fd = None
+    held = False
+    try:
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(Path(root) / EVICT_LOCK_NAME), flags, LOCK_FILE_MODE)
+    except OSError:
+        fd = None
+    try:
+        if fd is not None:
+            deadline = time.monotonic() + timeout_secs
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    held = True
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(LOCK_POLL_SECS)
+                except OSError:
+                    break
+        yield held
+    finally:
+        if fd is not None:
+            os.close(fd)  # closing the descriptor releases the flock
 
 
 def write_in_use_marker(target, runner_name, now=None):
@@ -104,6 +150,9 @@ def main(argv=None):
     parser.add_argument(
         "--github-env", help="append CARGO_TARGET_DIR and the root to this $GITHUB_ENV file"
     )
+    parser.add_argument(
+        "--lock-timeout", type=float, default=JOB_START_LOCK_TIMEOUT_SECS,
+        help="seconds to wait for the eviction lock before proceeding with a warning")
     args = parser.parse_args(argv)
     home = Path(args.home)
     if not home.is_absolute() or str(home) in ("/", ""):
@@ -114,8 +163,16 @@ def main(argv=None):
     except ValueError as err:
         print("shared_cargo_target: refusing: %s" % err, file=sys.stderr)
         return EXIT_USAGE
-    path.mkdir(parents=True, exist_ok=True)
-    write_in_use_marker(path, args.runner_name)
+    root = target_root_dir(home)
+    root.mkdir(parents=True, exist_ok=True)
+    with evict_lock(root, args.lock_timeout) as held:
+        if not held:
+            # A job start never fails or deadlocks on the lock (#7292).
+            print("shared_cargo_target: warning: eviction lock %s not taken within %s s; "
+                  "proceeding without it" % (root / EVICT_LOCK_NAME, args.lock_timeout),
+                  file=sys.stderr)
+        path.mkdir(parents=True, exist_ok=True)
+        write_in_use_marker(path, args.runner_name)
     if args.github_env:
         with open(args.github_env, "a", encoding="utf-8") as handle:
             handle.write("%s=%s\n" % (ENV_NAME, path))
