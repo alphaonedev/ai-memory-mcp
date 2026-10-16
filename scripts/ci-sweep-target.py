@@ -18,9 +18,10 @@ Safety:
   * An unreadable directory or entry is reported as a warning naming the path
     and skipped; no traceback.
 
-Exit codes: 0 success, 2 refused path (argparse usage errors also use 2),
-3 ``--max-bytes`` is zero or negative, 4 nothing could be sized because every
-swept directory or entry was unreadable.
+Exit codes: 0 success, 2 refused path, 3 ``--max-bytes`` is zero or negative,
+4 nothing could be sized because every swept directory or entry was
+unreadable, 5 usage error (a missing, unknown or unparsable argument such as
+``--max-bytes abc`` or an empty ``--max-bytes``; ``--help`` exits 0).
 """
 
 import argparse
@@ -36,6 +37,15 @@ EXIT_OK = 0
 EXIT_REFUSED = 2
 EXIT_BAD_CAP = 3
 EXIT_UNREADABLE = 4
+EXIT_USAGE = 5
+
+
+class UsageParser(argparse.ArgumentParser):
+    """ArgumentParser whose parse errors exit EXIT_USAGE, not the refused-path code."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE, "{}: error: {}\n".format(self.prog, message))
 
 
 def entry_size(path, warnings=None):
@@ -125,7 +135,7 @@ def remove_entry(path):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser = UsageParser(description=__doc__.splitlines()[0])
     parser.add_argument("--target", required=True, help="cargo target directory")
     parser.add_argument("--max-bytes", required=True, type=int, help="size cap in bytes")
     parser.add_argument("--allow-root", action="store_true",
