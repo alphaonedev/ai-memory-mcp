@@ -926,6 +926,9 @@ pub mod mcp;
 pub mod metrics;
 pub mod mine;
 pub mod models;
+// #7029: active fault evidence lives only in the private library test harness.
+#[cfg(all(test, unix))]
+mod failure_hook_tests;
 /// Crate-internal, test-only isolation helpers: process-wide env lock +
 /// snapshot/restore `EnvGuard` (#3301, #2905 class) and `LineageDagIsolation`
 /// for the process-global `LINEAGE_DAG` atomic (#3577).
@@ -1031,6 +1034,7 @@ pub mod sizes;
 // signed `process.spawn_audited` row per production `Command` spawn (argv0 +
 // caller), routing every production subprocess launch through one audited
 // helper so a new un-audited spawn site fails the CI gate.
+mod eval_clock;
 pub mod spawn_audit;
 pub mod subscriptions;
 pub mod synthesis;

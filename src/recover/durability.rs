@@ -53,6 +53,21 @@ use rusqlite::Connection;
 /// Production deployments MUST leave it unset.
 pub const ENV_ABORT_AFTER_COMMIT: &str = "AI_MEMORY_TEST_ABORT_AFTER_COMMIT";
 
+/// #7029 H1: fail matching captures before their signed-event append.
+/// The helper and its callsites exist only in the private library test harness.
+/// Exact IDs (trimmed, nonempty) isolate faults from unrelated healthy writes.
+#[cfg(test)]
+const ENV_FAIL_BEFORE_SIGNED_COMMIT: &str = "AI_MEMORY_TEST_FAIL_BEFORE_SIGNED_COMMIT";
+
+#[cfg(test)]
+pub(crate) const INJECTED_BEFORE_SIGNED_COMMIT_MSG: &str = "injected before signed commit";
+
+#[cfg(test)]
+pub(crate) fn fail_before_signed_commit_decision(memory_id: &str) -> bool {
+    std::env::var(ENV_FAIL_BEFORE_SIGNED_COMMIT)
+        .is_ok_and(|value| !value.trim().is_empty() && value.trim() == memory_id)
+}
+
 /// The `source` + `metadata.agent_id` label stamped on durability-probe
 /// rows. One named site so the label is not scattered as a literal.
 const DURABILITY_LABEL: &str = "durability";

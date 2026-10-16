@@ -2977,6 +2977,15 @@ pub fn capture_turn_idempotent(
         })
         .map_err(|e| idempotent_err(ERR_DEDUP_INSERT, e))?;
 
+        // #7029 (H1) — test-only fault point between the memories INSERT and
+        // the signed-event append; the closure's Err rolls the whole tx back.
+        #[cfg(test)]
+        if crate::recover::durability::fail_before_signed_commit_decision(&inserted_id) {
+            return Err(format!(
+                "SIGNED_EVENTS_APPEND_FAILED: {}",
+                crate::recover::durability::INJECTED_BEFORE_SIGNED_COMMIT_MSG
+            ));
+        }
         crate::signed_events::append_signed_event_no_tx(conn, &write.signed_event)
             .map_err(|e| format!("SIGNED_EVENTS_APPEND_FAILED: {e}"))?;
 
@@ -3123,6 +3132,15 @@ where
         })
         .map_err(|e| idempotent_err(ERR_DEDUP_INSERT, e))?;
 
+        // #7029 (H1) — test-only fault point between the memories INSERT and
+        // the signed-event append; the closure's Err rolls the whole tx back.
+        #[cfg(test)]
+        if crate::recover::durability::fail_before_signed_commit_decision(&inserted_id) {
+            return Err(format!(
+                "SIGNED_EVENTS_APPEND_FAILED: {}",
+                crate::recover::durability::INJECTED_BEFORE_SIGNED_COMMIT_MSG
+            ));
+        }
         crate::signed_events::append_signed_event_no_tx(conn, &write.signed_event)
             .map_err(|e| format!("SIGNED_EVENTS_APPEND_FAILED: {e}"))?;
 
@@ -8704,7 +8722,7 @@ pub fn recall(
     // `None` = no valid-time filter (bound to ?13, NULL-guarded in the SQL).
     valid_at: Option<&str>,
 ) -> Result<(Vec<(Memory, f64)>, BudgetOutcome)> {
-    let now = Utc::now().to_rfc3339();
+    let now = crate::eval_clock::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
     // Pre-ship 3x7 (#1834) — canonicalize the AS-OF instant before the ?13
     // TEXT bind so byte comparison against the canonical stored bounds is
@@ -16499,7 +16517,9 @@ pub(crate) fn gc_for_caller(
             Err(e) => tracing::warn!("expired bind-challenge reap failed (in gc): {e}"),
         }
     }
-    let now = Utc::now().to_rfc3339();
+    let real = Utc::now();
+    let cutoff = crate::eval_clock::at(real).to_rfc3339();
+    let now = real.to_rfc3339();
     let expired_chunk_ids =
         format!("SELECT id FROM memories WHERE {SQL_GC_EXPIRED_WHERE} ORDER BY rowid LIMIT ?3");
     // #1579 B6 (F5.7) — bounded-lock-hold chunked sweep. Each loop
@@ -16534,7 +16554,7 @@ pub(crate) fn gc_for_caller(
               cid, cid_genesis)
                      SELECT id, tier, namespace, title, content, tags, priority, confidence,
                             source, access_count, created_at, updated_at, last_accessed_at,
-                            expires_at, ?1, 'ttl_expired', metadata,
+                            expires_at, ?4, 'ttl_expired', metadata,
                             embedding, embedding_dim, embedding_space, tier, expires_at,
                             reflection_depth, atomised_into, atom_of, memory_kind,
                             entity_id, persona_version, citations, source_uri, source_span,
@@ -16544,7 +16564,7 @@ pub(crate) fn gc_for_caller(
                      FROM memories
                      WHERE id IN ({expired_chunk_ids})"
                 ))?;
-                archive_stmt.execute(params![now, caller, GC_CHUNK_ROWS])?;
+                archive_stmt.execute(params![cutoff, caller, GC_CHUNK_ROWS, now])?;
                 // #3161 (v1.0.0) — DATA-LOSS CLOSE. The archive copy above
                 // moves only the memory ROW; `memory_links` carries an
                 // `ON DELETE CASCADE` FK on both endpoints, so the DELETE at
@@ -16562,7 +16582,7 @@ pub(crate) fn gc_for_caller(
                 // the `DELETE` below both target — so the three statements
                 // provably pin to the identical row set inside this
                 // `BEGIN IMMEDIATE`, with no materialized id list to drift.
-                // The edge's `archived_at` binds `?1`, the same stamp the
+                // The edge's `archived_at` binds `?4`, the same real stamp the
                 // memory row's archive copy takes, so a row and its edges
                 // carry ONE archive timestamp.
                 //
@@ -16582,13 +16602,13 @@ pub(crate) fn gc_for_caller(
                           valid_until, observed_by, signature, attest_level, archived_at,
                           source_cid, target_cid)
                      SELECT source_id, target_id, relation, created_at, valid_from,
-                            valid_until, observed_by, signature, attest_level, ?1,
+                            valid_until, observed_by, signature, attest_level, ?4,
                             source_cid, target_cid
                      FROM memory_links
                      WHERE source_id IN ({expired_chunk_ids})
                         OR target_id IN ({expired_chunk_ids})"
                 ))?;
-                links_stmt.execute(params![now, caller, GC_CHUNK_ROWS])?;
+                links_stmt.execute(params![cutoff, caller, GC_CHUNK_ROWS, now])?;
             }
             // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
             // append ONE identity-only EXPIRE leaf per doomed row IN THIS
@@ -16601,7 +16621,7 @@ pub(crate) fn gc_for_caller(
                      WHERE id IN ({expired_chunk_ids})"
                 ))?;
                 let doomed: Vec<(String, String, i64)> = leaf_stmt
-                    .query_map(params![now, caller, GC_CHUNK_ROWS], |r| {
+                    .query_map(params![cutoff, caller, GC_CHUNK_ROWS], |r| {
                         Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                     })?
                     .collect::<rusqlite::Result<_>>()?;
@@ -16629,7 +16649,7 @@ pub(crate) fn gc_for_caller(
                      FROM memories WHERE id IN ({expired_chunk_ids})"
                 ))?;
                 let evicted: Vec<(String, String, Option<String>)> = evict_stmt
-                    .query_map(params![now, caller, GC_CHUNK_ROWS], |r| {
+                    .query_map(params![cutoff, caller, GC_CHUNK_ROWS], |r| {
                         Ok((r.get(0)?, r.get(1)?, r.get(2)?))
                     })?
                     .collect::<rusqlite::Result<_>>()?;
@@ -16640,7 +16660,7 @@ pub(crate) fn gc_for_caller(
             let mut delete_stmt = conn.prepare_cached(&format!(
                 "DELETE FROM memories WHERE id IN ({expired_chunk_ids})"
             ))?;
-            let deleted = delete_stmt.execute(params![now, caller, GC_CHUNK_ROWS])?;
+            let deleted = delete_stmt.execute(params![cutoff, caller, GC_CHUNK_ROWS])?;
             Ok(deleted)
         })();
         match result {
@@ -20802,7 +20822,7 @@ fn prepare_hybrid_query<'a>(
     // v0.8.0 #1720 A3 — read-path visibility caller. See [`HybridPrep`].
     caller: Option<&str>,
 ) -> HybridPrep<'a> {
-    let now = Utc::now().to_rfc3339();
+    let now = crate::eval_clock::now().to_rfc3339();
     let fts_query = sanitize_fts_query(context, true);
     let prefixes = compute_visibility_prefixes(as_agent);
     let (fts_hierarchy_in, hierarchy_active) = hierarchy_in_clause(namespace);
