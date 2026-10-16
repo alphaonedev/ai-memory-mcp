@@ -374,6 +374,19 @@ class TargetWalkTests(SweepTestCase):
         self.assertIn("is not a canonical path", result.stderr)
         self.assertTrue(all(path.exists() for path in outside_files))
 
+    def test_target_that_is_a_regular_file_says_not_a_directory_7160_s8(self):
+        not_dir = self.root / "target-is-a-file"
+        not_dir.write_bytes(b"x")
+        for extra in ((), ("--allow-root",)):
+            workspace = self.root if not extra else None
+            result = self.run_sweep("--max-bytes", "1", *extra, target=not_dir,
+                                    workspace=workspace)
+            self.assertEqual(result.returncode, EXIT_REFUSED, result.stderr)
+            self.assertIn("refused: {} is not a directory".format(not_dir.resolve()),
+                          result.stderr)
+            self.assertNotIn("replaced", result.stderr)
+        self.assertTrue(not_dir.exists())
+
     def test_allow_root_accepts_canonical_target(self):
         self.make_entries(3)
         canonical = Path(os.path.realpath(str(self.target)))
