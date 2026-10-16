@@ -124,7 +124,9 @@ class ShardWiringTests(unittest.TestCase):
     def test_watchdog_is_on_every_shard_run(self):
         text = ci_text()
         run_tests = function_body(text, 'run_tests')
-        self.assertIn('"$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" cargo test', run_tests)
+        # #7259: the timed run is cargo nextest run --profile ci (the prebuild stays cargo test).
+        self.assertIn('"$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" '
+                      'cargo nextest run --profile ci --no-fail-fast', run_tests)
         shard = function_body(text, 'run_shard')
         self.assertEqual(len(re.findall(r'run_(?:doc_)?tests "\[\$\{name\}\]', shard)), 3)
 

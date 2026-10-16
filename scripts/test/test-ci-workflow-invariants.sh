@@ -331,7 +331,7 @@ echo "  --- Section B: #2500 test-invocation completeness ---"
 # Every `cargo test` that is wrapped by the #1492 watchdog runs a MULTI-binary
 # selection and must not fail fast. Single-target invocations (`--lib`,
 # `--test <one>`) are unaffected by the flag and are not required to carry it.
-watchdog_lines="$(grep -nE '(TIMEOUT_BIN|--kill-after=60)[^|]*cargo test' "$CI_YML" || true)"
+watchdog_lines="$(grep -nE '(TIMEOUT_BIN|--kill-after=60)[^|]*cargo (test|nextest run)' "$CI_YML" || true)"
 if [ -z "$watchdog_lines" ]; then
     bad "B: found no watchdog-wrapped 'cargo test' invocation in $CI_YML" \
         "the #1492 watchdog wrapper was removed or renamed — this guard has gone blind"
@@ -351,7 +351,8 @@ else
                "a single transient flake would discard every later binary's result (#2500)"
     # The un-wrapped fallback arm of each wrapper must match its wrapped twin,
     # or a runner without GNU timeout silently reverts to fail-fast.
-    fallback_bad="$(grep -nE '^\s+cargo test "\$@"' "$CI_YML" || true)"
+    # #7259: the nextest fallback arm must carry the flag too.
+    fallback_bad="$(grep -nE '^\s+cargo test "\$@"' "$CI_YML" || true)$(grep -nE '^\s+cargo nextest run' "$CI_YML" | grep -v -e '--no-fail-fast' || true)"
     [ -z "$fallback_bad" ] \
         && ok "B: no watchdog-fallback 'cargo test \"\$@\"' arm reverts to fail-fast" \
         || bad "B: a watchdog-fallback arm lacks --no-fail-fast" "$fallback_bad"
@@ -633,7 +634,7 @@ d_scan() {
             printf '         no short-circuiting `cargo test --no-run "$@" || return "$?"` between the function opener (line %s) and the timed invocation (line %s)\n' \
                 "$opener" "$w" >&2
         fi
-    done <<< "$(grep -nE '(TIMEOUT_BIN|--kill-after=60)[^|]*cargo test' "$file" || true)"
+    done <<< "$(grep -nE '(TIMEOUT_BIN|--kill-after=60)[^|]*cargo (test|nextest run)' "$file" || true)"
     printf '%s/%s' "$bad" "$total"
 }
 
