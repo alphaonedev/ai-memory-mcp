@@ -113,6 +113,17 @@ safeguard (added to the C1–C7 set in §"Enforceable Orchestrator
 Safeguards"); HARD-BLOCK on any violation.
 
 
+## Checkout permissions: use umask 022 (#7281)
+
+The deferred-audit spool guard (#2271) rejects any spool ancestor that is
+group- or world-writable and not sticky, and the checkout root is an ancestor
+of every `deferred_audit` test fixture. A checkout or `git worktree add` made
+under umask 002 is mode 775, so `cargo test --features sal --lib deferred_audit`
+cannot pass there. The fixtures now fail once with a message naming the path
+and its mode instead of 34 opaque failures. Create checkouts under umask 022,
+or run `chmod g-w <dir>` on the named directory. The production guard is
+never relaxed for tests.
+
 ## Local coverage (matching CI's `coverage.yml`)
 
 ```bash

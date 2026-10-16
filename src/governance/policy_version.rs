@@ -221,11 +221,14 @@ fn advance_signable_bytes(seq: i64, digest: &[u8; 32]) -> Vec<u8> {
 ///
 /// Propagates SQLite errors, canonicalisation errors, and audit-chain
 /// INSERT errors.
+///
+/// #7241 - returns the pending audit anchor of the appended event; the
+/// owner of the transaction emits it after its commit succeeded.
 pub fn append_policy_advance_no_tx(
     conn: &Connection,
     signing_key: &ed25519_dalek::SigningKey,
     operator_agent_id: &str,
-) -> Result<()> {
+) -> Result<crate::governance::audit::PendingAuditAnchor> {
     use ed25519_dalek::Signer;
 
     // Digest of the post-mutation enabled rule set; the new sequence is
@@ -247,8 +250,7 @@ pub fn append_policy_advance_no_tx(
         timestamp: chrono::Utc::now().to_rfc3339(),
         ..crate::signed_events::SignedEvent::default()
     };
-    crate::signed_events::append_signed_event_no_tx(conn, &event)?;
-    Ok(())
+    crate::signed_events::append_signed_event_no_tx(conn, &event)
 }
 
 /// v0.9.0 §25.3 S4 — ADVISORY boot check. Recompute the live

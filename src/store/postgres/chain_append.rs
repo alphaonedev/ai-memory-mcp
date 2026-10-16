@@ -705,7 +705,10 @@ mod tests {
                 cause_hash: None,
             },
         )
-        .await?;
+        .await?
+        // The probe exercises sequence allocation only; no off-table anchor
+        // is wanted (#7241).
+        .discard();
         sqlx::query_scalar("SELECT sequence FROM signed_events WHERE id = $1")
             .bind(id)
             .fetch_one(&mut **tx)
