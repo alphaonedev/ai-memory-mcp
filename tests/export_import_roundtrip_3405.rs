@@ -180,9 +180,12 @@ fn import(db: &Path, payload: &str, extra: &[&str]) -> (i32, serde_json::Value, 
         .assert();
     let out = assert.get_output();
     let code = out.status.code().expect("import exits with a code");
-    let report: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("import --json emits a JSON report");
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "import --json emits a JSON report (exit {code}, parse error {e}); stderr: {stderr}"
+        )
+    });
     (code, report, stderr)
 }
 
