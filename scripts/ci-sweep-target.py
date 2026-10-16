@@ -19,7 +19,8 @@ Safety:
     (exit 2) before anything is deleted from it.
   * Symlink entries inside a swept directory are unlinked, never descended.
   * Nothing outside the four directories is read for sizing or deleted.
-  * An unreadable directory or entry, at any depth, is reported as
+  * An unreadable directory or entry, or a tree too deep to walk (a
+    RecursionError), at any depth, is reported as
     ``warning: cannot read <path>`` (or ``cannot size`` / ``cannot remove``)
     naming the path and skipped; no traceback.
 
@@ -100,11 +101,11 @@ def entry_size(dir_fd, name, path, warnings):
             warnings.append("cannot read {}: {}".format(path, exc))
             return total
         for child in children:
-            child_path = os.path.join(path, child.name)
             try:
+                child_path = os.path.join(path, child.name)
                 total += entry_size(child_fd, child.name, child_path, warnings)
-            except OSError as exc:
-                warnings.append("cannot size {}: {}".format(child_path, exc))
+            except (OSError, RecursionError) as exc:
+                warnings.append("cannot size {}/{}: {}".format(path, child.name, exc))
     finally:
         os.close(child_fd)
     return total
@@ -188,7 +189,7 @@ def collect_entries(target, warnings, handles):
             try:
                 mtime = child.stat(follow_symlinks=False).st_mtime
                 size = entry_size(sdir.fd, child.name, child_path, warnings)
-            except OSError as exc:
+            except (OSError, RecursionError) as exc:
                 warnings.append("cannot size {}: {}".format(child_path, exc))
                 continue
             entries.append((mtime, child_path, sdir, child.name, size))
@@ -248,7 +249,7 @@ def sweep(real_target, args, warnings, handles):
                 verified.add(id(sdir))
             try:
                 remove_entry(sdir, name)
-            except OSError as exc:
+            except (OSError, RecursionError) as exc:
                 print("warning: cannot remove {}: {}".format(path, exc), file=sys.stderr)
                 continue
         remaining -= size
