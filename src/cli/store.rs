@@ -1268,6 +1268,9 @@ mod tests {
     #[test]
     fn test_store_sign_with_bound_key_stamps_agent_attested() {
         let _lock = locked_env();
+        // #7259 — install the process-wide key-dir sandbox BEFORE pinning the env: a fresh
+        // process (nextest) otherwise lets `TestEnv::fresh()` overwrite the pin below.
+        crate::cli::test_utils::ensure_no_config_env();
         let key_dir = tempfile::tempdir().unwrap();
         let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
         // #1751 — pin "0" (never clear): clearing would open a strict
@@ -1314,6 +1317,9 @@ mod tests {
     #[test]
     fn store_sign_without_bound_key_refuses_3409() {
         let _lock = locked_env();
+        // #7259 — install the process-wide key-dir sandbox BEFORE pinning the env: a fresh
+        // process (nextest) otherwise lets `TestEnv::fresh()` overwrite the pin below.
+        crate::cli::test_utils::ensure_no_config_env();
         let key_dir = tempfile::tempdir().unwrap();
         let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
         let _req = EnvVarGuard::set(
@@ -1361,6 +1367,9 @@ mod tests {
     #[test]
     fn store_sign_with_allow_claimed_stores_claimed_and_warns_3409() {
         let _lock = locked_env();
+        // #7259 — install the process-wide key-dir sandbox BEFORE pinning the env: a fresh
+        // process (nextest) otherwise lets `TestEnv::fresh()` overwrite the pin below.
+        crate::cli::test_utils::ensure_no_config_env();
         let key_dir = tempfile::tempdir().unwrap();
         let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
         let _req = EnvVarGuard::set(
@@ -1393,6 +1402,9 @@ mod tests {
     #[test]
     fn store_sign_with_bound_key_is_agent_attested_3409() {
         let _lock = locked_env();
+        // #7259 — install the process-wide key-dir sandbox BEFORE pinning the env: a fresh
+        // process (nextest) otherwise lets `TestEnv::fresh()` overwrite the pin below.
+        crate::cli::test_utils::ensure_no_config_env();
         let key_dir = tempfile::tempdir().unwrap();
         let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
         let _req = EnvVarGuard::set(
@@ -1438,6 +1450,9 @@ mod tests {
     #[test]
     fn test_store_sign_without_local_keypair_errors() {
         let _lock = locked_env();
+        // #7259 — install the process-wide key-dir sandbox BEFORE pinning the env: a fresh
+        // process (nextest) otherwise lets `TestEnv::fresh()` overwrite the pin below.
+        crate::cli::test_utils::ensure_no_config_env();
         // Empty key dir — no `<agent_id>.priv` to load.
         let key_dir = tempfile::tempdir().unwrap();
         let _kd = EnvVarGuard::set("AI_MEMORY_KEY_DIR", key_dir.path().as_os_str());
@@ -1481,6 +1496,9 @@ mod tests {
     #[test]
     fn env_var_guard_restores_previous_value_on_drop() {
         let _lock = locked_env();
+        // #7259 — install the process-wide key-dir sandbox BEFORE pinning the env: a fresh
+        // process (nextest) otherwise lets `TestEnv::fresh()` overwrite the pin below.
+        crate::cli::test_utils::ensure_no_config_env();
         let prior = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("AI_MEMORY_KEY_DIR", prior.path().as_os_str()) };
         {

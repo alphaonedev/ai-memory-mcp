@@ -1386,6 +1386,12 @@ async fn http_bulk_create_uses_appstate_and_persists() {
 
 #[tokio::test]
 async fn http_bulk_create_fans_out_with_federation() {
+    // #7259 — the governance pre-action hook is a process-wide one-shot; a fresh process
+    // (nextest) has none and the fan-out fails closed. Install the test hook (#3515).
+    crate::governance::wire_check::ensure_installed_for_test();
+    // #7259 — bulk_create requires row attestation by default (#1919/#1985); a fresh process
+    // has no sibling that opted the lib-test binary out (#1751), so do it here.
+    crate::identity::attest::permissive_attestation_for_lib_tests();
     // S40 — with federation configured, each successfully-inserted row
     // in a bulk call must fan out to every peer. We spin up an axum
     // mock peer that records sync_push POSTs and bulk-create N rows;
