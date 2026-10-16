@@ -71,6 +71,38 @@ class PostgresTestGroup(unittest.TestCase):
         self.assertEqual(sorted(in_filter), sorted(expected))
 
 
+class TimingTestIsolation(unittest.TestCase):
+    """The wall-clock bound in handlers_concurrent_http_no_block must not be
+    measured while other tests compete for the CPU (229.8 ms against 200 ms on
+    the enterprise-fed leg). The bound itself is not raised."""
+
+    def test_the_timing_binary_reserves_every_thread_in_the_ci_profile(self):
+        match = re.search(
+            r"\[\[profile\.ci\.overrides\]\]\nfilter\s*=\s*'binary\(handlers_concurrent_http_no_block\)'\n"
+            r"threads-required\s*=\s*'num-cpus'",
+            CONFIG)
+        self.assertIsNotNone(match, 'threads-required = num-cpus override missing')
+
+    def test_the_wall_clock_bound_is_not_raised(self):
+        src = (REPO / 'tests' / 'handlers_concurrent_http_no_block.rs').read_text(encoding='utf-8')
+        self.assertIn('const MIN_WALL_CLOCK_BUDGET: Duration = Duration::from_millis(200);', src)
+
+
+class ColdBuildPerProcess(unittest.TestCase):
+    """nextest runs every test in its own process, so a per-process `OnceLock`
+    cold build runs once per test. A target dir keyed by the process id never
+    warms; the E2 verifier build must share one stable dir (cargo's own build
+    lock serialises concurrent builds and later ones are no-ops)."""
+
+    SOURCE = (REPO / 'tests' / 'e2_post_ship_dry_run.rs').read_text(encoding='utf-8')
+
+    def test_verifier_target_dir_is_not_keyed_by_process_id(self):
+        self.assertNotIn('std::process::id()', self.SOURCE)
+
+    def test_verifier_target_dir_is_one_stable_name(self):
+        self.assertIn('"ai-memory-post-ship-converge-target"', self.SOURCE)
+
+
 class WorkflowWiring(unittest.TestCase):
     def test_the_version_is_pinned_once_in_a_workflow_level_env(self):
         pins = re.findall(r'(?m)^  NEXTEST_VERSION: "(\d+\.\d+\.\d+)"$', CI_YML)

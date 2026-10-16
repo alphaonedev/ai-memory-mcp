@@ -81,10 +81,10 @@ fn build_verifier_once() -> PathBuf {
         .join(".local-runs")
         .join("e2-post-ship-dry-run");
     std::fs::create_dir_all(&scratch_root).ok();
-    let target_dir = scratch_root.join(format!(
-        "ai-memory-post-ship-converge-target-{}",
-        std::process::id()
-    ));
+    // #7259 — one stable dir, not one per process: under nextest every test is
+    // its own process, so a pid-keyed dir cold-built the verifier once per test.
+    // Concurrent builds serialise on cargo's build lock and later ones are no-ops.
+    let target_dir = scratch_root.join("ai-memory-post-ship-converge-target");
 
     let status = Command::new("cargo")
         .args([

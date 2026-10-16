@@ -64,3 +64,13 @@ pg-lib-serial = { max-threads = 1 }
 [[profile.ci.overrides]]
 filter = 'kind(lib) & (test(~store::postgres) | test(~store::update_atomicity_3152_tests) | test(~background::auto_tag_worker) | test(~cli::schema_init) | test(~curator::compaction) | test(~daemon_runtime::cov_boot_degrade_arms_3521::curator_store_handle_connects_postgres_without_an_embedder))'
 test-group = 'pg-lib-serial'
+
+# handlers_concurrent_http_no_block asserts a wall-clock bound (200 ms floor) on
+# concurrent requests. `cargo test` ran it as one of a handful of tests in a few
+# binaries; nextest schedules every test of every binary at once, and on the
+# enterprise-fed leg the bound was measured at 229.8 ms while other tests held the
+# CPU. `threads-required = 'num-cpus'` makes nextest run it with every thread
+# reserved, so nothing else runs beside it. The bound itself is unchanged.
+[[profile.ci.overrides]]
+filter = 'binary(handlers_concurrent_http_no_block)'
+threads-required = 'num-cpus'
