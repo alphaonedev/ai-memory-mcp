@@ -295,7 +295,7 @@ cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
 AI_MEMORY_NO_CONFIG=1 cargo test
 cargo audit
 scripts/check-vendor-literals.sh        # vendor-monoculture + SECS_PER_* magic-number HARD-BLOCK (#1200)
-scripts/qc-codegraph-precheck.sh        # C8 caller-context allowlist + structural-drift HARD-BLOCK (#923)
+scripts/qc-codegraph-precheck.py        # C8 caller-context allowlist + structural-drift HARD-BLOCK (#923)
 scripts/check-l3-boundary.sh            # L3-boundary perma-ban HARD-BLOCK (§25.3 S5 / RQ-10, #1853)
 scripts/check-hardcoded-literals.sh     # hardcoded-literal duplication ratchet (pm-v3.1)
 scripts/check-docs-vs-ssot.sh           # docs-vs-SSOT drift HARD-BLOCK (operator directive 2026-05-31)
@@ -341,7 +341,7 @@ PRs target `develop`. **Never** target `main`.
 - [ ] AI_MEMORY_NO_CONFIG=1 cargo test
 - [ ] cargo audit
 - [ ] scripts/check-vendor-literals.sh (vendor-monoculture + SECS_PER_* — #1200)
-- [ ] scripts/qc-codegraph-precheck.sh (C8 caller-context allowlist + structural drift — #923)
+- [ ] scripts/qc-codegraph-precheck.py (C8 caller-context allowlist + structural drift — #923)
 - [ ] scripts/check-l3-boundary.sh (L3-boundary perma-ban — §25.3 S5 / RQ-10, #1853)
 - [ ] scripts/check-hardcoded-literals.sh (hardcoded-literal duplication ratchet — pm-v3.1)
 - [ ] scripts/check-docs-vs-ssot.sh (docs-vs-SSOT drift — operator directive 2026-05-31)
@@ -464,7 +464,7 @@ Quick reference: which `ai-memory` tools and external commands you use at each p
 | 4 Branching | — | `git checkout -b <type>/<slug> origin/develop` |
 | 5 Implementation | `memory_store` (debug, decision) | `git add`, `git commit` (with Co-Authored-By trailer) |
 | 6 Memory hygiene | `memory_store`, `memory_link`, `memory_detect_contradiction`, `memory_consolidate` | — |
-| 7 Self-review | — | `cargo fmt --check`, `cargo clippy`, `cargo test`, `cargo audit`, `scripts/check-vendor-literals.sh`, `scripts/qc-codegraph-precheck.sh`, `scripts/check-l3-boundary.sh`, `scripts/check-hardcoded-literals.sh`, `scripts/check-docs-vs-ssot.sh`, `scripts/check-cloud-init-ascii.sh` (10 gates) |
+| 7 Self-review | — | `cargo fmt --check`, `cargo clippy`, `cargo test`, `cargo audit`, `scripts/check-vendor-literals.sh`, `scripts/qc-codegraph-precheck.py`, `scripts/check-l3-boundary.sh`, `scripts/check-hardcoded-literals.sh`, `scripts/check-docs-vs-ssot.sh`, `scripts/check-cloud-init-ascii.sh` (10 gates) |
 | 8 PR submission | `memory_store` (followup) | `git push -u origin <branch>`, `gh pr create --base develop` |
 | 9 Handoff | `memory_promote`, `memory_store` (outcome), `memory_link` | `gh pr view`, `gh issue close` (only if necessary) |
 

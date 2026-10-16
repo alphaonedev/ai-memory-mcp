@@ -61,7 +61,7 @@ cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
 AI_MEMORY_NO_CONFIG=1 cargo test
 cargo audit
 scripts/check-vendor-literals.sh        # vendor-monoculture + SECS_PER_* magic-number HARD-BLOCK (#1200)
-scripts/qc-codegraph-precheck.sh        # C8 caller-context allowlist + structural-drift HARD-BLOCK (#923)
+scripts/qc-codegraph-precheck.py        # C8 caller-context allowlist + structural-drift HARD-BLOCK (#923)
 scripts/check-l3-boundary.sh            # L3-boundary perma-ban HARD-BLOCK (§25.3 S5 / RQ-10, #1853)
 scripts/check-hardcoded-literals.sh     # hardcoded-literal duplication ratchet (pm-v3.1)
 scripts/check-docs-vs-ssot.sh           # docs-vs-SSOT drift HARD-BLOCK (operator directive 2026-05-31)
@@ -177,7 +177,7 @@ the standing thresholds-rise-NEVER-fall discipline.
 1. Fork the repository (external contributors) or branch directly (collaborators).
 2. Create a feature branch from `develop` (`git checkout develop && git checkout -b feature/my-change`).
 3. Make your changes, following the code style and testing guidelines above.
-4. Ensure all ten gates pass: the four cargo gates (`cargo fmt`, `cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic`, `AI_MEMORY_NO_CONFIG=1 cargo test`, `cargo audit`) plus the six script/workflow gates (`scripts/check-vendor-literals.sh`, `scripts/qc-codegraph-precheck.sh`, `scripts/check-l3-boundary.sh`, `scripts/check-hardcoded-literals.sh`, `scripts/check-docs-vs-ssot.sh`, `scripts/check-cloud-init-ascii.sh`) — see [CODE_STYLE.md §"Lint gates"](docs/reference/CODE_STYLE.md).
+4. Ensure all ten gates pass: the four cargo gates (`cargo fmt`, `cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic`, `AI_MEMORY_NO_CONFIG=1 cargo test`, `cargo audit`) plus the six script/workflow gates (`scripts/check-vendor-literals.sh`, `scripts/qc-codegraph-precheck.py`, `scripts/check-l3-boundary.sh`, `scripts/check-hardcoded-literals.sh`, `scripts/check-docs-vs-ssot.sh`, `scripts/check-cloud-init-ascii.sh`) — see [CODE_STYLE.md §"Lint gates"](docs/reference/CODE_STYLE.md).
 5. Push your branch and open a pull request against `develop` (not `main`).
 6. Fill out the PR description with what changed and why.
 7. Address any review feedback.

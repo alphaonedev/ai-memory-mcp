@@ -30,9 +30,9 @@
 # `[self-hosted, linux-fed]`; on a 2-node fleet that put 22 zero-cargo gates
 # into contention with the four required `Check (…)` legs and starved them.
 #
-# Mirrors the local-developer flow: both `scripts/qc-codegraph-precheck.sh`
+# Mirrors the local-developer flow: both `scripts/qc-codegraph-precheck.py`
 # and `scripts/check-vendor-literals.sh` are the same scripts CI uses.
-# Run `scripts/qc-codegraph-precheck.sh --update` locally to regenerate
+# Run `scripts/qc-codegraph-precheck.py --update` locally to regenerate
 # the C8 allowlist when you deliberately add a new exception; run
 # `scripts/check-vendor-literals.sh --self-test` locally to confirm the
 # vendor gate still catches a contrived violation.
@@ -102,7 +102,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run C8 precheck
-        run: bash scripts/qc-codegraph-precheck.sh
+        run: python3 scripts/qc-codegraph-precheck.py
 
   vendor-literal-gate:
     name: Vendor-monoculture + SECS_PER_* lint-gate (#1174 PR10)

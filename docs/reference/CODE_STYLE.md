@@ -112,7 +112,7 @@ gated by #2; a general numeric gate is too noisy). Burn the baseline down
 over time.
 
 **1. C8 caller-context allowlist** —
-`scripts/qc-codegraph-precheck.sh`. Blocks any new
+`scripts/qc-codegraph-precheck.py`. Blocks any new
 `CallerContext::for_agent("<literal>")` or
 `CallerContext::for_admin("<literal>")` site outside
 `scripts/qc-codegraph-allowlists/*.txt`. See the §"Enforceable
@@ -187,7 +187,7 @@ this section. Operator-approved review before merge.
   occurrence in each file
 - Comment lines (`//`, `///`) and block-comment continuations (`*`)
 
-The heuristic mirrors `scripts/qc-codegraph-precheck.sh` so the
+The heuristic mirrors `scripts/qc-codegraph-precheck.py` so the
 two gates have the same production-vs-test boundary across the
 codebase.
 

@@ -60,7 +60,7 @@ class ProductionLines(unittest.TestCase):
             run = subprocess.run(['awk', '-f', str(awk), str(path)], capture_output=True,
                                  text=True, check=True)
             expected = run.stdout.split('\n')[:-1]
-            got = gate.production_lines(str(path), path.read_text(encoding='utf-8'))
+            got = gate.production_lines(str(path), path.read_bytes().decode('utf-8', errors='replace'))
             self.assertEqual(got, expected, path.as_posix())
             checked += 1
         self.assertGreater(checked, 50)

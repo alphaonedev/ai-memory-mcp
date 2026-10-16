@@ -121,7 +121,7 @@ is_foundational() {
         src/federation/*) return 0 ;;
         # CI + gate scripts (changes to CI itself need full validation)
         .github/workflows/ci.yml|.github/workflows/c8-precheck.yml) return 0 ;;
-        scripts/check-vendor-literals.sh|scripts/qc-codegraph-precheck.sh|scripts/ci-test-impact.sh) return 0 ;;
+        scripts/check-vendor-literals.sh|scripts/qc-codegraph-precheck.py|scripts/ci-test-impact.sh) return 0 ;;
         # The #3464 follow-up at 31faaa20 changed only these C8 allowlists;
         # that push selected 7/747 tests. Authorization bypass approvals
         # need the same full-suite validation as the gate that reads them.

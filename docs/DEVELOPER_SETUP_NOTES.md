@@ -105,7 +105,7 @@ no project-side changes are needed for the runtime priors.
   not committed).
 
 **Allowlist-gated structural checks** (tracked under #923 D2):
-`scripts/qc-codegraph-precheck.sh` will run pre-PR + in CI to block
+`scripts/qc-codegraph-precheck.py` will run pre-PR + in CI to block
 new `CallerContext::for_agent("<literal>")` sites outside the
 allowlist + new `for_admin` privacy-bypass sites outside the allowlist
 + dangling callers after symbol removal. This is the **C8** orchestrator

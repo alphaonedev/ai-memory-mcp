@@ -224,7 +224,7 @@ fn enclosing_fn_is_cfg_test(lines: &[&str], idx: usize) -> bool {
 }
 
 /// Byte offset of the first `#[cfg(test)]` test *module*, or the whole
-/// file when there is none. Matches `scripts/qc-codegraph-precheck.sh`
+/// file when there is none. Matches `scripts/qc-codegraph-precheck.py`
 /// and `scripts/check-hardcoded-literals.sh`: only a cfg(test) whose
 /// next item opens an inline `mod … {` ends the production region.
 /// Interior `#[cfg(test)]` on `use`/`fn`/`static` (Wave-2 B11

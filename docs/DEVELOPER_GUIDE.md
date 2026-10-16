@@ -1152,7 +1152,7 @@ gates every PR must pass (see `CLAUDE.md` §Build & Test Commands):
 Plus the script-based HARD-BLOCK gates wired into
 `.github/workflows/c8-precheck.yml` (#1174 PR10):
 
-- **C8 caller-context allowlist** -- `scripts/qc-codegraph-precheck.sh`
+- **C8 caller-context allowlist** -- `scripts/qc-codegraph-precheck.py`
   (no new `CallerContext::for_agent("<literal>")` / `for_admin` sites
   outside `scripts/qc-codegraph-allowlists/`).
 - **Vendor-monoculture + SECS_PER_\*** -- `scripts/check-vendor-literals.sh`
