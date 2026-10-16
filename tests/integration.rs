@@ -45,6 +45,29 @@ const INTEGRATION_TEST_ADMIN: &str = "ai:integration-test-admin";
 /// regardless of parent perms — the same reason the #3733 fixtures pass under
 /// umask `0002`. Built once and shared so a daemon/CLI signing key persists
 /// across the multiple invocations a single test makes.
+/// #7259 — delete the per-process root (it holds a signing key) when the process exits.
+/// A `static` never drops, so the cleanup is an `atexit` hook; `cargo nextest` starts one
+/// process per test and would otherwise leak one root per test. Best effort: a hard kill
+/// leaves the root, which the next process with the same pid removes before reuse.
+#[cfg(unix)]
+fn remove_root_at_exit(root: &std::path::Path) {
+    use std::sync::OnceLock;
+    static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
+    extern "C" fn cleanup() {
+        if let Some(root) = ROOT.get() {
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+    if ROOT.set(root.to_path_buf()).is_ok() {
+        // SAFETY: `cleanup` is an `extern "C" fn()` with no arguments, valid for the whole
+        // process lifetime, and it never unwinds (every fallible call is discarded).
+        let _ = unsafe { libc::atexit(cleanup) };
+    }
+}
+
+#[cfg(not(unix))]
+fn remove_root_at_exit(_root: &std::path::Path) {}
+
 fn isolated_home_and_keys() -> (&'static std::path::Path, &'static std::path::Path) {
     use std::sync::OnceLock;
     static ISOLATED: OnceLock<(std::path::PathBuf, std::path::PathBuf)> = OnceLock::new();
@@ -57,8 +80,11 @@ fn isolated_home_and_keys() -> (&'static std::path::Path, &'static std::path::Pa
             .join(format!("integration-isolated-{}", std::process::id()));
         let home = root.join("home");
         let keys = root.join("keys");
+        // A recycled pid may have left a stale root behind (a killed run): start clean.
+        let _ = std::fs::remove_dir_all(&root);
         key_dir_sandbox::mkdir_0700(&home);
         key_dir_sandbox::mkdir_0700(&keys);
+        remove_root_at_exit(&root);
         // RACE-FREE first boot — mint the daemon signing key ONCE, in-process,
         // before any parallel test spawns concurrent `serve` daemons. On a cold
         // shared key dir, multiple daemons would otherwise race to generate the
@@ -78,6 +104,43 @@ fn isolated_home_and_keys() -> (&'static std::path::Path, &'static std::path::Pa
         (home, keys)
     });
     (home.as_path(), keys.as_path())
+}
+
+/// #7259 — the per-process key/home root must not outlive its process: under
+/// `cargo nextest` every test is its own process, so an undeleted root leaks one
+/// directory (holding a signing key) per test into `CARGO_TARGET_TMPDIR`.
+/// The test re-runs itself as a child that prints its root and exits.
+#[test]
+fn isolated_root_is_removed_at_process_exit_7259() {
+    const PROBE_ENV: &str = "AI_MEMORY_ISOLATED_ROOT_PROBE_7259";
+    const ROOT_PREFIX: &str = "ROOT_7259=";
+    if std::env::var_os(PROBE_ENV).is_some() {
+        let (home, _keys) = isolated_home_and_keys();
+        let root = home.parent().expect("home sits inside the per-process root");
+        println!("{ROOT_PREFIX}{}", root.display());
+        return;
+    }
+    let exe = std::env::current_exe().expect("test binary path");
+    let out = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "isolated_root_is_removed_at_process_exit_7259",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(PROBE_ENV, "1")
+        .output()
+        .expect("spawn the probe child");
+    assert!(out.status.success(), "probe child failed: {:?}", out.status);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let root = stdout
+        .lines()
+        .find_map(|l| l.find(ROOT_PREFIX).map(|at| &l[at + ROOT_PREFIX.len()..]))
+        .expect("probe child printed its root");
+    assert!(
+        !std::path::Path::new(root).exists(),
+        "per-process isolated root {root} survived its process"
+    );
 }
 
 fn cmd(binary: &str) -> std::process::Command {
