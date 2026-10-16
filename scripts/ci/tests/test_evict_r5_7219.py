@@ -133,5 +133,163 @@ class FailClosedBusyChecksPortable7289(Fixture):
             self.assertTrue(shared.marker_is_fresh(self.idle, now))
 
 
+class JobStartHelper(Fixture):
+    def job_start(self, name=OTHER, *extra):
+        """The linux-fed job-start step for runner ``name`` (shared_cargo_target.main)."""
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = shared.main(["--home", str(self.home), "--runner-name", name] + list(extra))
+        return rc, err.getvalue()
+
+    def marker_of(self, name=OTHER):
+        return self.root / name / shared.IN_USE_MARKER_NAME
+
+
+class EvictionIsSerialisedAgainstJobStart7292(JobStartHelper):
+    def hook_rmtree(self, action):
+        """Run ``action`` at the moment eviction calls shutil.rmtree, then delete for real."""
+        seen = []
+        real = shutil.rmtree
+
+        def hooked(path, *args, **kwargs):
+            seen.append(Path(path))
+            action(Path(path))
+            return real(path, *args, **kwargs)
+
+        return mock.patch.object(prune.shutil, "rmtree", side_effect=hooked), seen
+
+    def test_r1_job_start_between_the_check_and_the_delete_survives(self):
+        patch, _ = self.hook_rmtree(lambda _p: self.job_start())
+        with patch:
+            self.evict()
+        self.assertTrue(self.marker_of().exists(), "the started job's marker was deleted")
+
+    def test_r1b_files_written_by_a_job_that_starts_mid_eviction_survive(self):
+        big = make_target(self.root, "f2-linux-fed-9", IDLE_AGE_DAYS, files=3000)
+        shutil.rmtree(self.idle)
+        lost = []
+        written = 200
+
+        def job():
+            shared.main(["--home", str(self.home), "--runner-name", "f2-linux-fed-9"])
+            deps = big / "debug" / "deps"
+            for number in range(written):
+                try:
+                    deps.mkdir(parents=True, exist_ok=True)
+                    (deps / ("live%d.o" % number)).write_text("x", encoding="utf-8")
+                except OSError:
+                    lost.append(number)
+                time.sleep(0.0005)
+
+        holder = {}
+
+        def start_job(_path):
+            holder["thread"] = threading.Thread(target=job)
+            holder["thread"].start()
+
+        patch, _ = self.hook_rmtree(start_job)
+        with patch:
+            self.evict()
+        holder["thread"].join()
+        survivors = sorted(p.name for p in (big / "debug" / "deps").glob("live*.o"))
+        self.assertEqual(lost, [])
+        self.assertEqual(len(survivors), written, "files of the live job were deleted")
+        self.assertTrue(self.marker_of("f2-linux-fed-9").exists())
+
+    def test_the_target_is_renamed_under_the_lock_before_the_delete(self):
+        calls = []
+
+        def look(path):
+            calls.append((path.name, path.parent, self.idle.exists()))
+
+        patch, _ = self.hook_rmtree(look)
+        with patch:
+            self.evict()
+        self.assertEqual(len(calls), 1)
+        name, parent, original_exists = calls[0]
+        self.assertTrue(name.startswith(".evicting-%s-" % OTHER), name)
+        self.assertEqual(parent, self.root.resolve())
+        self.assertFalse(original_exists, "the delete must run on the renamed path")
+
+    def test_busy_is_rechecked_under_the_lock(self):
+        real = shared.evict_lock
+        started = []
+
+        def start_then_lock(*args, **kwargs):
+            if not started:
+                started.append(True)
+                self.job_start()
+            return real(*args, **kwargs)
+
+        with mock.patch.object(shared, "evict_lock", side_effect=start_then_lock):
+            _, out, _ = self.evict()
+        self.assertTrue(self.idle.exists())
+        self.assertIn("skipped busy %s" % self.idle, out)
+
+    def test_eviction_skips_when_the_lock_cannot_be_taken_in_time(self):
+        with shared.evict_lock(self.root, 1.0) as held:
+            self.assertTrue(held)
+            started = time.monotonic()
+            rc, _, err = self.evict(lock_timeout=LOCK_TEST_TIMEOUT_SECS)
+            elapsed = time.monotonic() - started
+        self.assertEqual(rc, prune.EXIT_OK)
+        self.assertTrue(self.idle.exists())
+        self.assertIn("skipping eviction:", err)
+        self.assertLess(elapsed, 5)
+
+    def test_job_start_never_fails_or_deadlocks_on_the_lock(self):
+        with shared.evict_lock(self.root, 1.0) as held:
+            self.assertTrue(held)
+            started = time.monotonic()
+            rc, err = self.job_start(OTHER, "--lock-timeout", str(LOCK_TEST_TIMEOUT_SECS))
+            elapsed = time.monotonic() - started
+        self.assertEqual(rc, shared.EXIT_OK)
+        self.assertTrue(self.marker_of().exists())
+        self.assertIn("warning", err.lower())
+        self.assertLess(elapsed, 5)
+
+    def test_job_start_creates_the_lock_file_under_the_root(self):
+        self.job_start(OTHER)
+        self.assertTrue((self.root / shared.EVICT_LOCK_NAME).is_file())
+
+    def test_the_lock_file_is_never_pruned_or_evicted(self):
+        lock = self.root / shared.EVICT_LOCK_NAME
+        lock.write_text("", encoding="utf-8")
+        old = time.time() - IDLE_AGE_DAYS * DAY
+        os.utime(lock, (old, old))
+        work = SCRATCH / "runner" / "_work"
+        workspace = work / "repo" / "repo"
+        workspace.mkdir(parents=True)
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            prune.main(["--work-root", str(work), "--workspace", str(workspace),
+                        "--protected-root", str(self.root), "--evict-root", str(self.root),
+                        "--runner-name", ME, "--home", str(self.home), "--free-floor-gib", "0"])
+        self.assertTrue(lock.is_file())
+        self.assertFalse(self.idle.exists())
+
+    def test_dot_names_are_not_siblings(self):
+        hidden = make_target(self.root, ".hidden", IDLE_AGE_DAYS)
+        evicting = make_target(self.root, ".evicting-x-1", 0)
+        names = [p.name for p in prune.other_targets(self.root, ME)]
+        self.assertNotIn(hidden.name, names)
+        self.assertNotIn(evicting.name, names)
+        self.assertIn(OTHER, names)
+
+    def test_only_stale_evicting_leftovers_are_swept(self):
+        stale = make_target(self.root, ".evicting-dead-11", IDLE_AGE_DAYS)
+        fresh = make_target(self.root, ".evicting-live-12", 0)
+        link = self.root / ".evicting-link-13"
+        outside = SCRATCH / "outside"
+        (outside / "keep").mkdir(parents=True)
+        link.symlink_to(outside, target_is_directory=True)
+        os.utime(link, (1, 1), follow_symlinks=False)
+        _, out, _ = self.evict(lambda _p: 10_000 * GIB)
+        self.assertFalse(stale.exists())
+        self.assertIn("swept stale %s" % stale, out)
+        self.assertTrue(fresh.exists(), "a recent leftover may belong to a running eviction")
+        self.assertTrue(link.is_symlink())
+        self.assertTrue((outside / "keep").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
