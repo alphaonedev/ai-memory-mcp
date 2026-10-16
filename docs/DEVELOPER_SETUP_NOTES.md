@@ -207,3 +207,18 @@ which holds about two per-runner targets; runners 3 and 4 stay unlabelled for th
 (tracked in #7199, which also covers sccache or a larger disk). After each job
 `scripts/ci/prune_runner_artifacts.py --protected-root` prunes stale scratch and never
 touches the target root, so a prune on one runner cannot delete a sibling runner's target.
+
+### linux-fed runner capacity budget (#7199)
+
+decision: Option 1 (sccache) + Option 4 (idle-target eviction) over buying disk, because sccache is already installed and the external SSD already exists (operator directive fb58a3c8).
+
+The cache filesystem must hold, with headroom:
+
+    labelled_runners x per_runner_target (~165 GiB) + SCCACHE_CACHE_SIZE (50G) + FREE_FLOOR_GIB (200) <= cache filesystem size
+
+Constants (named in code, change them there): `SCCACHE_CACHE_SIZE = "50G"` in `scripts/ci/sccache_env.py`; `IDLE_TARGET_DAYS = 7` and `FREE_FLOOR_GIB = 200` in `scripts/ci/prune_runner_artifacts.py`.
+
+- sccache: on the Linux self-hosted legs the step `sccache build cache (#7199)` runs `scripts/ci/sccache_env.py`, which exports `RUSTC_WRAPPER`, `SCCACHE_DIR` (`~/.cache/ai-memory-ci/sccache`), `SCCACHE_CACHE_SIZE` and `SCCACHE_ERROR_LOG` and fails the job when `sccache` is not on PATH. It needs `CARGO_INCREMENTAL=0` (set in the workflow env and in the runner `.env`). The hit rate is printed at the end of the job (`sccache hit-rate summary`).
+- Eviction: after the post-job prune, `prune_runner_artifacts.py --evict-root` deletes other runners' target directories idle for more than `IDLE_TARGET_DAYS` and, while the filesystem has less than `FREE_FLOOR_GIB` free, the oldest remaining other targets. It never touches the running runner's target, a symlink, or a root that is not an absolute path under the home.
+- f2 layout: `~/.cache/ai-memory-ci` is a symlink to a directory on the 1.8 TB external SSD mount (1.2 TB free when moved), so the cargo targets and the sccache directory share that disk: four labelled runners need about 4 x 165 + 50 + 200 = 910 GiB.
+- Relabel a runner once the budget allows: re-add the `linux-fed` label to the next unlabelled runner (f2-linux-fed-3, then -4) only when `df -BG ~/.cache/ai-memory-ci/` shows free space of at least `FREE_FLOOR_GIB` plus one more per-runner target after the new runner's first cold build; relabel one runner at a time and watch the first job's sccache hit rate and free space before the next.

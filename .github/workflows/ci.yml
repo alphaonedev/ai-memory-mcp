@@ -871,6 +871,19 @@ jobs:
         if: needs.classify.outputs.docs_only != 'true' && matrix.shared_target
         run: python3 scripts/ci/shared_cargo_target.py --github-env "$GITHUB_ENV" --runner-name "${{ runner.name }}"
 
+      # #7199 - sccache for the self-hosted Linux enterprise-fed leg. Each runner
+      # compiles into its own ~160 GiB target (#7188), so a cross-runner compile
+      # cache (one sccache server per host user, SCCACHE_DIR under the same
+      # ~/.cache/ai-memory-ci root, capped by SCCACHE_CACHE_SIZE) removes most of
+      # the cold-build cost of a second runner. sccache cannot cache incremental
+      # artifacts: CARGO_INCREMENTAL=0 is set in this workflow env and in the
+      # runner .env on f2. The helper FAILS CLOSED when sccache is not on PATH
+      # (the job reds instead of silently building cold). Linux self-hosted
+      # legs only: the macOS fleet hosts may lack sccache.
+      - name: sccache build cache (#7199)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.shared_target && runner.os == 'Linux'
+        run: python3 scripts/ci/sccache_env.py --github-env "$GITHUB_ENV"
+
       # #2452 — tests/conformance_readers.rs is FAIL-CLOSED: an absent
       # python3/node is a test FAILURE, not a silent pass. This job now spans
       # BOTH runner classes, so the guarantee is met two ways:
@@ -1966,9 +1979,17 @@ jobs:
       # NEVER touches the per-runner cargo target root (the helper refuses any
       # path in, at or above it, so a sibling runner target is safe) and never fails the job. always() so a failed or
       # cancelled run is pruned too.
+      - name: sccache hit-rate summary (#7199)
+        if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.docs_only != 'true'
+        run: python3 scripts/ci/sccache_env.py --stats
+
+      # #7199 - after the prune, evict OTHER runners idle cargo targets (idle
+      # over IDLE_TARGET_DAYS, then oldest-first while the cache filesystem is
+      # under FREE_FLOOR_GIB free). Never this runner target, never outside
+      # the root, never through a symlink. Bad arguments are refused with exit 2.
       - name: Prune stale runner artifacts (#7188)
         if: always() && matrix.shared_target && needs.classify.outputs.docs_only != 'true'
-        run: python3 scripts/ci/prune_runner_artifacts.py --work-root "$RUNNER_WORKSPACE/.." --workspace "$GITHUB_WORKSPACE" --protected-root "$AI_MEMORY_CI_TARGET_ROOT"
+        run: python3 scripts/ci/prune_runner_artifacts.py --work-root "$RUNNER_WORKSPACE/.." --workspace "$GITHUB_WORKSPACE" --protected-root "$AI_MEMORY_CI_TARGET_ROOT" --evict-root "$AI_MEMORY_CI_TARGET_ROOT" --runner-name "${{ runner.name }}"
 
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
   #
