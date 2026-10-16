@@ -1977,11 +1977,21 @@ jobs:
         if: always() && matrix.shared_target && needs.classify.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: python3 scripts/ci/prune_runner_artifacts.py --work-root "$RUNNER_WORKSPACE/.." --workspace "$GITHUB_WORKSPACE" --protected-root "$AI_MEMORY_CI_TARGET_ROOT"
 
-      # #7160 - cap the persistent self-hosted target/debug (workspace-local,
-      # oldest-mtime first). Last step so it never races a running build.
+      # #7160 - cap the persistent self-hosted target/debug (oldest-mtime
+      # first). Last steps so they never race a running build. Two shapes,
+      # exactly one runs per self-hosted leg: legs that build in the workspace
+      # sweep the workspace `target`; the shared_target leg (#7188) builds into
+      # its own per-runner CARGO_TARGET_DIR outside the workspace, so it sweeps
+      # that one directory (never the whole cache root holding the sibling
+      # runners' targets) with --allow-root. The prune step above never touches
+      # that directory, so this is its only cap.
       - name: Sweep target/debug to the size cap (self-hosted)
-        if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted'
+        if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted' && !matrix.shared_target
         run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
+
+      - name: Sweep per-runner cargo target to the size cap (self-hosted, #7160)
+        if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted' && matrix.shared_target
+        run: python3 scripts/ci-sweep-target.py --target "${CARGO_TARGET_DIR:?per-runner cargo target not set}" --allow-root --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
 
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
   #
