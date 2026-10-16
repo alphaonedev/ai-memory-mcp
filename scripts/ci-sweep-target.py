@@ -14,7 +14,9 @@ Safety:
     own realpath, no symlink in any component) or exit 2 ``is not a canonical
     path``.
   * ``<target>/debug`` and the four swept directories must not be symlinks:
-    otherwise exit 2 naming the path and nothing is deleted.
+    otherwise exit 2 naming the path and nothing is deleted. A target path
+    component that is not a directory (``--target`` names a regular file) exits
+    2 with ``refused: <path> is not a directory``.
   * The target is opened once by a descriptor walk from ``/``: every path
     component (target, ``debug``, each swept directory) is opened relative to
     its parent with ``O_NOFOLLOW | O_DIRECTORY``, and every scan and every
@@ -33,7 +35,9 @@ Safety:
     counted and never on the delete list, so none of it is deleted (a partly
     deleted cargo output is worse than an oversized one).
 
-Exit codes: 0 success, 2 refused path, 3 ``--max-bytes`` is zero or negative,
+Exit codes: 0 success, 2 refused path (target outside the workspace, a
+symlinked or swapped component, a target path component that is not a
+directory, or a non-canonical ``--allow-root`` target), 3 ``--max-bytes`` is zero or negative,
 4 nothing could be sized because every swept directory or entry was
 unreadable, 5 usage error (a missing, unknown or unparsable argument such as
 ``--max-bytes abc`` or an empty ``--max-bytes``; ``--help`` exits 0).
@@ -152,6 +156,21 @@ def is_under(path, root):
         return False
 
 
+def not_openable_message(parent, component, path):
+    """Say why ``component`` under the held ``parent`` could not be opened as a directory.
+
+    The target is a realpath, so a symlink here was swapped in after the check;
+    anything else that is not a directory (a regular file) was never one.
+    """
+    try:
+        kind = os.lstat(component, dir_fd=parent.fd).st_mode
+    except OSError:
+        kind = None
+    if kind is not None and not stat.S_ISLNK(kind):
+        return "{} is not a directory".format(path)
+    return "{} was replaced by a symlink before it could be opened".format(path)
+
+
 def open_target(real_target, warnings, handles):
     """Open ``real_target`` by walking it from ``/`` one component at a time.
 
@@ -173,8 +192,7 @@ def open_target(real_target, warnings, handles):
             return None
         except OSError as exc:
             if exc.errno in SWAPPED_ERRNOS:
-                raise Refused("{} was replaced by a symlink or non-directory "
-                              "before it could be opened".format(path))
+                raise Refused(not_openable_message(held, component, path))
             warnings.append("cannot read {}: {}".format(path, exc))
             return None
         handles.append(fd)
