@@ -20,6 +20,7 @@ EXIT_OK = 0
 EXIT_REFUSED = 2
 EXIT_BAD_CAP = 3
 EXIT_UNREADABLE = 4
+EXIT_USAGE = 5
 ENTRY_BYTES = 1000
 BASE_MTIME = 1_700_000_000
 MTIME_STEP = 100
@@ -188,6 +189,26 @@ class SweepTests(SweepTestCase):
         self.assertNotIn("Traceback", res.stderr)
         self.assertIn(str(deps), res.stderr)
         self.assertFalse(other.exists())
+
+    def test_unparsable_max_bytes_has_its_own_exit_code_7167(self):
+        entry = self.make_entries(1)[0]
+        for bad in ("abc", "", "1.5"):
+            res = self.run_sweep("--max-bytes", bad)
+            self.assertEqual(res.returncode, EXIT_USAGE, (bad, res.stderr))
+            self.assertNotEqual(res.returncode, EXIT_REFUSED)
+            self.assertIn("--max-bytes", res.stderr)
+            self.assertTrue(entry.exists())
+
+    def test_other_argument_errors_use_usage_exit_code_7167(self):
+        entry = self.make_entries(1)[0]
+        for extra in (("--bogus-flag",), ("--max-bytes",), ()):
+            res = self.run_sweep(*extra)
+            self.assertEqual(res.returncode, EXIT_USAGE, (extra, res.stderr))
+            self.assertTrue(entry.exists())
+
+    def test_help_exits_zero(self):
+        res = self.run_sweep("--help")
+        self.assertEqual(res.returncode, EXIT_OK, res.stderr)
 
     @unittest.skipIf(os.geteuid() == 0, "root can read a mode-000 directory")
     def test_unreadable_nested_dir_warns_7160_s3(self):
