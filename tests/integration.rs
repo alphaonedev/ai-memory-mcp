@@ -49,8 +49,12 @@ fn isolated_home_and_keys() -> (&'static std::path::Path, &'static std::path::Pa
     use std::sync::OnceLock;
     static ISOLATED: OnceLock<(std::path::PathBuf, std::path::PathBuf)> = OnceLock::new();
     let (home, keys) = ISOLATED.get_or_init(|| {
-        let root =
-            std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("integration-isolated");
+        // #7259 — one root PER PROCESS. `cargo test` runs the whole binary in one process,
+        // so this is still one shared root; `cargo nextest` runs every test in its own
+        // process, and a root shared across processes made concurrent first boots race to
+        // mint the same `host:<hostname>` key (#3354 "no signing key ... loadable").
+        let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("integration-isolated-{}", std::process::id()));
         let home = root.join("home");
         let keys = root.join("keys");
         key_dir_sandbox::mkdir_0700(&home);
