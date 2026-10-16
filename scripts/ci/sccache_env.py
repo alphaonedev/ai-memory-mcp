@@ -5,7 +5,8 @@
 
 ``--github-env FILE`` resolves ``sccache`` on PATH, starts a DEDICATED sccache
 server for CI and appends RUSTC_WRAPPER (absolute path), SCCACHE_DIR,
-SCCACHE_CACHE_SIZE, SCCACHE_ERROR_LOG and SCCACHE_SERVER_PORT to the
+SCCACHE_CACHE_SIZE, SCCACHE_ERROR_LOG, SCCACHE_SERVER_PORT, SCCACHE_IDLE_TIMEOUT
+(0: the server never idles out) and SCCACHE_IGNORE_SERVER_IO_ERROR (1) to the
 $GITHUB_ENV file. SCCACHE_DIR, SCCACHE_CACHE_SIZE and SCCACHE_ERROR_LOG are read
 only when a server starts, and the dev lanes keep their own server on the
 default port SCCACHE_DEFAULT_PORT with its own store; a CI client that attached
@@ -21,9 +22,10 @@ targets, never a tmp path). sccache cannot cache incremental artifacts: the
 workflow already sets CARGO_INCREMENTAL=0.
 
 ``--stats`` prints a summary (at most STATS_MAX_LINES lines) of
-``sccache --show-stats`` (same port, from the job environment). It never fails.
+``sccache --show-stats`` on the CI port; a job whose environment lacks that port
+(sccache step skipped or refused) prints a skip message. It never fails.
 
-``--stop --home H --runner-name N`` stops the CI server at job end, on the same
+``--stop --home H --runner-name N`` (name required and validated) stops the CI server at job end, on the same
 port, unless a sibling runner's in-use marker is fresh (its job still compiles
 through the shared server). It never fails the job.
 
@@ -51,6 +53,12 @@ SCCACHE_CACHE_SIZE = "50G"
 # CI must never attach to it, so it gets its own, unused port.
 SCCACHE_DEFAULT_PORT = 4226
 SCCACHE_SERVER_PORT = 4227
+# The server never idles out: an idle-exited server would be auto-restarted by
+# the next client under that job's RUNNER_TRACKING_ID and the runner's orphan
+# cleanup would then kill the shared server under a sibling job. A client that
+# loses the server falls back to a local rustc instead of failing.
+SCCACHE_IDLE_TIMEOUT_SECS = "0"
+SCCACHE_IGNORE_SERVER_IO_ERROR = "1"
 RUNNER_TRACKING_ENV = "RUNNER_TRACKING_ID"
 CACHE_LOCATION_PATTERN = re.compile(r'^Cache location\s+.*?"([^"]+)"', re.MULTILINE)
 STATS_MAX_LINES = 12
@@ -81,6 +89,8 @@ def ci_server_env(base_env, cache_dir, error_log):
     env["SCCACHE_CACHE_SIZE"] = SCCACHE_CACHE_SIZE
     env["SCCACHE_ERROR_LOG"] = str(error_log)
     env["SCCACHE_SERVER_PORT"] = str(SCCACHE_SERVER_PORT)
+    env["SCCACHE_IDLE_TIMEOUT"] = SCCACHE_IDLE_TIMEOUT_SECS
+    env["SCCACHE_IGNORE_SERVER_IO_ERROR"] = SCCACHE_IGNORE_SERVER_IO_ERROR
     return env
 
 
@@ -125,9 +135,15 @@ def print_stats():
     if binary is None:
         print("sccache_env: sccache not on PATH, no stats")
         return EXIT_OK
+    if os.environ.get("SCCACHE_SERVER_PORT") != str(SCCACHE_SERVER_PORT):
+        # The sccache step was skipped or refused: never print the dev server's counters.
+        print("sccache_env: CI sccache not configured for this job, no stats")
+        return EXIT_OK
+    env = dict(os.environ)
+    env["SCCACHE_SERVER_PORT"] = str(SCCACHE_SERVER_PORT)
     try:
         result = subprocess.run(
-            [binary, "--show-stats"], capture_output=True, text=True,
+            [binary, "--show-stats"], env=env, capture_output=True, text=True,
             timeout=STATS_TIMEOUT_SECS, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as err:
@@ -180,6 +196,8 @@ def main(argv=None):
     parser.add_argument("--stop", action="store_true", help="stop the CI server (needs --runner-name)")
     parser.add_argument("--runner-name", help="this runner's name (its marker is ignored by --stop)")
     args = parser.parse_args(argv)
+    if args.stop and not shared.valid_runner_name(args.runner_name):
+        parser.error("--stop needs --runner-name with a valid runner name (got %r)" % (args.runner_name,))
     if args.stats:
         return print_stats()
     home = Path(args.home)
@@ -204,7 +222,8 @@ def main(argv=None):
         return EXIT_WRONG_CACHE
     values = (("RUSTC_WRAPPER", binary),) + tuple(
         (name, env[name]) for name in (
-            "SCCACHE_DIR", "SCCACHE_CACHE_SIZE", "SCCACHE_ERROR_LOG", "SCCACHE_SERVER_PORT"))
+            "SCCACHE_DIR", "SCCACHE_CACHE_SIZE", "SCCACHE_ERROR_LOG", "SCCACHE_SERVER_PORT",
+            "SCCACHE_IDLE_TIMEOUT", "SCCACHE_IGNORE_SERVER_IO_ERROR"))
     with open(args.github_env, "a", encoding="utf-8") as handle:
         for name, value in values:
             handle.write("%s=%s\n" % (name, value))
