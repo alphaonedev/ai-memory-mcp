@@ -869,7 +869,9 @@ jobs:
       # Self-hosted legs only (matrix.shared_target).
       - name: Per-runner cargo target (#7188)
         if: needs.classify.outputs.docs_only != 'true' && matrix.shared_target
-        run: python3 scripts/ci/shared_cargo_target.py --github-env "$GITHUB_ENV" --runner-name "${{ runner.name }}"
+        env:
+          RUNNER_NAME_ARG: ${{ runner.name }}
+        run: python3 scripts/ci/shared_cargo_target.py --github-env "$GITHUB_ENV" --runner-name "$RUNNER_NAME_ARG"
 
       # #2452 — tests/conformance_readers.rs is FAIL-CLOSED: an absent
       # python3/node is a test FAILURE, not a silent pass. This job now spans
