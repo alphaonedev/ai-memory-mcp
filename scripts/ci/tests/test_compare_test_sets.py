@@ -250,6 +250,20 @@ class SplicedPrefix(unittest.TestCase):
         out = cts.parse_nextest_log('stderr noise        FAIL [   0.012s] ai-memory::t mod::a\n')
         self.assertEqual(out, {('t', 'mod::a'): 'fail'})
 
+    def test_watchdog_progress_notice_mirroring_in_flight_tests_is_not_a_result(self):
+        # verbatim shape of the sharded legs' progress notice (baseline run 38876017305, enterprise-fed)
+        notice = ("##[notice][#6344] progress | serial: test config1_full_surface_attested_nhi_e2e ...  | parallel_1: "
+                  "test hnsw::d1_968_tests::rebuild_failure_leaves_active_unchanged_968 ... ok | parallel_2: "
+                  "test http_check_duplicate_no_embedder_400 ... ok")
+        scan = cts.scan_cargo_log(self.cargo(notice, 'test mod::a ... ok'))
+        self.assertEqual(scan.outcomes, {('t', 'mod::a'): 'pass'})
+        self.assertEqual(scan.spliced, 0)
+        before_any_header = '2026-10-16T09:04:32.8167340Z ' + notice + '\n' + self.cargo('test mod::a ... ok')
+        self.assertEqual(cts.parse_cargo_log(before_any_header), {('t', 'mod::a'): 'pass'})
+        nextest = ('##[notice][#6344] progress | parallel_1: PASS [   0.012s] ai-memory::t mod::z\n'
+                   '        PASS [   0.012s] ai-memory::t mod::a\n')
+        self.assertEqual(cts.parse_nextest_log(nextest), {('t', 'mod::a'): 'pass'})
+
     def test_spliced_lines_are_counted(self):
         scan = cts.scan_cargo_log(self.cargo('noise test mod::a ... ok', 'test mod::b ... ok'))
         self.assertEqual(scan.spliced, 1)

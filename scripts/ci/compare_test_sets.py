@@ -124,6 +124,12 @@ def _clean(line: str) -> str:
     return _STAMP_RE.sub('', _GH_PREFIX_RE.sub('', _ANSI_RE.sub('', line.replace(_BOM, '')))).rstrip()
 
 
+def _is_runner_notice(line: str) -> bool:
+    """GitHub workflow commands (``##[notice]``, ``::notice::``): the watchdog's progress mirror repeats
+    the tail of in-flight ``test ... ok`` lines, which are not results of their own."""
+    return line.startswith(('##[', '::'))
+
+
 def _spliced(line: str, found: 're.Match[str]') -> bool:
     """True when non-blank text was glued in front of the matched result."""
     return bool(line[:found.start()].strip())
@@ -175,6 +181,8 @@ def scan_cargo_log(text: str) -> Scan:
     in_doc = False
     for raw in text.splitlines():
         line = _clean(raw)
+        if _is_runner_notice(line):
+            continue
         running = _RUNNING_RE.match(line)
         if running and (running.group('src').endswith('.rs') or '/deps/' in running.group('src')):
             total, total_lines = _close_section(total, total_lines, section_total)
@@ -243,6 +251,8 @@ def scan_nextest_log(text: str) -> Scan:
     spliced = total = total_lines = 0
     for raw in text.splitlines():
         line = _clean(raw)
+        if _is_runner_notice(line):
+            continue
         summary = _SUMMARY_RE.search(line)
         if summary:
             total += int(summary.group('run'))
