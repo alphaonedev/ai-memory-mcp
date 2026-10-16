@@ -68,11 +68,23 @@ class PostgresTestGroup(unittest.TestCase):
 
 
 class WorkflowWiring(unittest.TestCase):
-    def test_nextest_is_installed_from_crates_io_at_one_pinned_version(self):
-        installs = re.findall(r'cargo install cargo-nextest --locked --version (\d+\.\d+\.\d+)', CI_YML)
-        self.assertGreaterEqual(len(installs), 1)
-        self.assertEqual(len(set(installs)), 1, 'one pinned version everywhere')
+    def test_the_version_is_pinned_once_in_a_workflow_level_env(self):
+        pins = re.findall(r'(?m)^  NEXTEST_VERSION: "(\d+\.\d+\.\d+)"$', CI_YML)
+        self.assertEqual(len(pins), 1, 'exactly one workflow-level NEXTEST_VERSION')
+        self.assertEqual(CI_YML.count(pins[0]), 1, 'the version literal appears once in ci.yml')
+
+    def test_every_install_goes_through_the_per_job_helper_from_crates_io(self):
+        steps = re.findall(r'(?m)^        run: python3 -I scripts/ci/install_nextest\.py$', CI_YML)
+        self.assertGreaterEqual(len(steps), 3)
+        self.assertNotIn('cargo install cargo-nextest', CI_YML)
+        self.assertNotIn('cargo nextest --version', CI_YML)
         self.assertNotRegex(CI_YML, r'(?i)uses:\s*\S*nextest')
+        helper = (REPO / 'scripts' / 'ci' / 'install_nextest.py').read_text(encoding='utf-8')
+        self.assertIn("'--locked'", helper)
+        self.assertIn('RUNNER_TEMP', helper)
+
+    def test_hosted_runs_restore_the_installed_root_through_the_existing_cache_action(self):
+        self.assertGreaterEqual(CI_YML.count('cache-directories: ${{ runner.temp }}/cargo-nextest'), 3)
 
     def test_timed_runs_use_nextest_with_the_ci_profile_and_no_fail_fast(self):
         lines = [ln for ln in CI_YML.splitlines() if 'cargo nextest run' in ln and not ln.lstrip().startswith('#')]
