@@ -1898,9 +1898,9 @@ fn append_occurrence_serialized(
             .context("deferred-audit occurrence append: commit residence check")?;
         return Ok(outcome);
     }
-    append_signed_event_no_tx(&tx, event)
+    let anchor = append_signed_event_no_tx(&tx, event)
         .context("deferred-audit occurrence append: append signed event")?;
-    tx.commit()
+    crate::signed_events::commit_and_emit(tx, anchor)
         .context("deferred-audit occurrence append: commit signed event")?;
     Ok(AppendOutcome::Appended)
 }
@@ -4483,7 +4483,7 @@ mod tests {
         let tx_a =
             rusqlite::Transaction::new_unchecked(&conn_a, rusqlite::TransactionBehavior::Immediate)
                 .unwrap();
-        append_signed_event_no_tx(&tx_a, &signed).unwrap();
+        let anchor_a = append_signed_event_no_tx(&tx_a, &signed).unwrap();
 
         let signed_for_b = signed.clone();
         let (busy_seen_tx, busy_seen_rx) = sync_channel(0);
@@ -4496,7 +4496,7 @@ mod tests {
         });
 
         busy_seen_rx.recv().unwrap();
-        tx_a.commit().unwrap();
+        crate::signed_events::commit_and_emit(tx_a, anchor_a).unwrap();
         peer_committed_tx.send(()).unwrap();
         let (outcome, freshly_landed) = writer_b.join().unwrap().unwrap();
         assert_eq!(outcome, AppendOutcome::Appended);

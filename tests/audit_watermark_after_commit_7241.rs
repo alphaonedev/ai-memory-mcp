@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 
 use ai_memory::governance::audit as forensic;
 use ai_memory::governance::rules_store::{self, Rule};
+use ai_memory::models::{Memory, MemoryKind, Tier};
 use ai_memory::signed_events::{
     HeadHashCheck, SignedEvent, TruncationCheck, append_signed_event, append_signed_event_no_tx,
     genesis_db_id, payload_hash, verify_audit_trail,
@@ -88,8 +89,32 @@ fn assert_no_false_verdict(truncation: &TruncationCheck, head_hash: &HeadHashChe
     );
 }
 
+/// Database file name inside each cell's scratch directory.
+const DB_FILE: &str = "audit.db";
+
+/// Namespace of the memories the erasure path deletes.
+const ERASE_NAMESPACE: &str = "issue-7241-erase";
+
+/// A memory owned by `agent`, for the nested erasure path (`delete`).
+fn probe_memory(agent: &str, title: &str) -> Memory {
+    let now = chrono::Utc::now().to_rfc3339();
+    Memory {
+        id: uuid::Uuid::new_v4().to_string(),
+        tier: Tier::Long,
+        namespace: ERASE_NAMESPACE.to_string(),
+        title: title.to_string(),
+        content: "body".to_string(),
+        source: "test".to_string(),
+        memory_kind: MemoryKind::Observation,
+        created_at: now.clone(),
+        updated_at: now,
+        metadata: serde_json::json!({ "agent_id": agent }),
+        ..Default::default()
+    }
+}
+
 fn open_db(dir: &Path) -> Connection {
-    let path = dir.join("audit.db");
+    let path = dir.join(DB_FILE);
     drop(ai_memory::db::open(&path).expect("init db"));
     ai_memory::db::open(&path).expect("open db")
 }
@@ -231,8 +256,71 @@ fn sqlite_main_write_paths_still_anchor_7241() {
             "set_enabled_signed at the interval must anchor (crossing {crossing})"
         );
     }
+    // Path 3: a nested erasure funnel on an autocommit connection (no
+    // WriteTxn frame): the crypto-erase attestation is emitted at once.
+    for crossing in 0..MAIN_PATH_CROSSINGS {
+        let victim = ai_memory::db::insert(
+            &conn,
+            &probe_memory(ROW_AGENT, &format!("erase-{crossing}")),
+        )
+        .expect("insert erase probe");
+        drive_sqlite_until_due(&conn);
+        let before = head(&conn);
+        assert!(ai_memory::db::delete(&conn, &victim).expect("delete erase probe"));
+        assert!(
+            head(&conn) > before,
+            "the delete must append its erasure attestation"
+        );
+        assert!(
+            anchored_seq(&db_id) > before,
+            "an autocommit delete at the interval must anchor (crossing {crossing})"
+        );
+    }
     let report = verify_audit_trail(&conn, None, None).expect("verify");
     assert_no_false_verdict(&report.truncation, &report.head_hash, "sqlite main paths");
+    forensic::shutdown();
+}
+
+/// The store `delete` appends the crypto-erase attestation deep inside its
+/// `WriteTxn`: the frame must emit the anchor on COMMIT.
+#[cfg(feature = "sal")]
+#[test]
+fn sqlite_store_delete_frame_anchors_7241() {
+    use ai_memory::store::sqlite::SqliteStore;
+    use ai_memory::store::{CallerContext, MemoryStore};
+
+    let _g = CELL_LOCK.blocking_lock();
+    let fdir = fresh_dir("sqlite-frame-sink");
+    let ddir = fresh_dir("sqlite-frame-db");
+    forensic::init(fdir.path(), None).expect("forensic init");
+    let conn = open_db(ddir.path());
+    drive_sqlite_until_due(&conn);
+    let db_id = sqlite_db_id(&conn);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let store = SqliteStore::open(ddir.path().join(DB_FILE)).expect("open store");
+    let ctx = CallerContext::for_agent(ROW_AGENT);
+    for crossing in 0..MAIN_PATH_CROSSINGS {
+        let victim = rt
+            .block_on(store.store(&ctx, &probe_memory(ROW_AGENT, &format!("frame-{crossing}"))))
+            .expect("store erase probe");
+        drive_sqlite_until_due(&conn);
+        let before = head(&conn);
+        rt.block_on(store.delete(&ctx, &victim))
+            .expect("delete erase probe");
+        assert!(
+            head(&conn) > before,
+            "the delete must append its erasure attestation"
+        );
+        assert!(
+            anchored_seq(&db_id) > before,
+            "the store delete at the interval must anchor (crossing {crossing})"
+        );
+    }
+    let report = verify_audit_trail(&conn, None, None).expect("verify");
+    assert_no_false_verdict(&report.truncation, &report.head_hash, "sqlite frame path");
     forensic::shutdown();
 }
 
@@ -445,6 +533,28 @@ mod postgres_twin {
             assert!(
                 anchored_seq(&db_id) > before,
                 "reclassify_memory_kind at the interval must anchor (crossing {crossing})"
+            );
+        }
+        // Path 3: a nested erasure funnel. The crypto-erase attestation is
+        // appended inside the hard-delete helper; `delete` commits and emits.
+        for crossing in 0..MAIN_PATH_CROSSINGS {
+            let victim = pg
+                .store(
+                    &ctx,
+                    &super::probe_memory(RECLASSIFY_AGENT, &format!("erase-{crossing}")),
+                )
+                .await
+                .expect("store erase probe");
+            drive_pg_until_due(&pg).await;
+            let before = pg_head(&pg).await;
+            pg.delete(&ctx, &victim).await.expect("delete erase probe");
+            assert!(
+                pg_head(&pg).await > before,
+                "the delete must append its erasure attestation"
+            );
+            assert!(
+                anchored_seq(&db_id) > before,
+                "delete at the interval must anchor (crossing {crossing})"
             );
         }
         let report = pg.verify_audit_trail(None, None).await.expect("verify");

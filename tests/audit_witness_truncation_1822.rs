@@ -585,10 +585,35 @@ fn pg_append_chokepoint_references_witness_and_watermark_emitters() {
         "/src/store/postgres.rs"
     ))
     .expect("read postgres.rs");
-    // The pg chokepoint must wire the #1850 watermark (item 7) ...
+    // The pg chokepoint must wire the #1850 watermark (item 7) ... #7241: it
+    // builds a pending anchor in the tx, and the commit helper records it
+    // only AFTER the COMMIT succeeds (never for a rolled-back append).
     assert!(
-        src.contains("maybe_record_audit_watermark"),
-        "pg chokepoint must call maybe_record_audit_watermark (item 7 parity)"
+        src.contains("PendingAuditAnchor::watermark("),
+        "pg chokepoint must build the watermark anchor (item 7 parity)"
+    );
+    let commit_helper = src
+        .split("pub(crate) async fn pg_commit_and_emit(")
+        .nth(1)
+        .expect("pg_commit_and_emit must exist (#7241)");
+    let commit_at = commit_helper
+        .find("tx.commit().await?")
+        .expect("helper commits");
+    let emit_at = commit_helper
+        .find("anchor.emit_after_commit()")
+        .expect("helper emits the anchor");
+    assert!(
+        commit_at < emit_at,
+        "the watermark anchor must be recorded only after the COMMIT (#7241)"
+    );
+    let audit_src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/governance/audit.rs"
+    ))
+    .expect("read audit.rs");
+    assert!(
+        audit_src.contains("maybe_record_audit_watermark(w.head_sequence"),
+        "the post-commit emit must reach maybe_record_audit_watermark (item 7 parity)"
     );
     // ... and the #1822 dual-chain witness emitter (item 6).
     assert!(

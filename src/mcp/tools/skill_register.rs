@@ -388,14 +388,18 @@ pub(super) fn register_core(
     // `_no_tx` variant: the public `append_signed_event` opens its OWN
     // IMMEDIATE tx, which SQLite rejects as a nested transaction. Still
     // best-effort — an audit-append error does not fail (or roll back) the
-    // registration; the audit row is simply skipped.
-    let _ = append_signed_event_no_tx(conn, &event);
+    // registration; the audit row is simply skipped. #7241 - an appended
+    // row's audit anchor is emitted only after the COMMIT below.
+    let anchor = append_signed_event_no_tx(conn, &event).unwrap_or_else(|e| {
+        tracing::warn!("skill register: audit append skipped (best-effort): {e:#}");
+        crate::governance::audit::PendingAuditAnchor::none()
+    });
 
     // v0.9.0 §11.5 B7-SKILL (#1865) — surface the version-chain position.
     let version = compute_skill_version(conn, &new_id);
 
     // Commit the atomic register (skills + resources + supersede) as one unit.
-    tx.commit()
+    crate::signed_events::commit_and_emit(tx, anchor)
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill register COMMIT", e))?;
 
     Ok(RegisterResult {

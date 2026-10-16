@@ -3957,8 +3957,9 @@ impl MemoryStore for SqliteStore {
             chrono::Utc::now().to_rfc3339(),
             Some(&cause),
         );
-        crate::signed_events::append_signed_event_no_tx(&conn, &event).map_err(box_err)?;
-        tx.commit().map_err(box_err)?;
+        let anchor =
+            crate::signed_events::append_signed_event_no_tx(&conn, &event).map_err(box_err)?;
+        tx.commit_and_emit(anchor).map_err(box_err)?;
         Ok(true)
     }
 

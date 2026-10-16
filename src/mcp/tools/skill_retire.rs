@@ -216,9 +216,14 @@ pub fn handle_skill_retire(
         chrono::Utc::now().to_rfc3339(),
         None,
     );
-    let _ = append_signed_event_no_tx(txn, &event);
+    // Best-effort audit row (unchanged); #7241 - its anchor is emitted only
+    // after the COMMIT.
+    let anchor = append_signed_event_no_tx(txn, &event).unwrap_or_else(|e| {
+        tracing::warn!("skill retire: audit append skipped (best-effort): {e:#}");
+        crate::governance::audit::PendingAuditAnchor::none()
+    });
 
-    tx.commit()
+    crate::signed_events::commit_and_emit(tx, anchor)
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill retire COMMIT", e))?;
 
     let flag = if unretire {
@@ -396,7 +401,12 @@ pub fn handle_skill_delete(
         chrono::Utc::now().to_rfc3339(),
         None,
     );
-    let _ = append_signed_event_no_tx(txn, &event);
+    // Best-effort audit row (unchanged); #7241 - its anchor is emitted only
+    // after the COMMIT.
+    let anchor = append_signed_event_no_tx(txn, &event).unwrap_or_else(|e| {
+        tracing::warn!("skill purge: audit append skipped (best-effort): {e:#}");
+        crate::governance::audit::PendingAuditAnchor::none()
+    });
 
     // Purge the whole lineage; skill_resources cascade via ON DELETE CASCADE.
     let affected = txn
@@ -406,7 +416,7 @@ pub fn handle_skill_delete(
         )
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill_delete DELETE", e))?;
 
-    tx.commit()
+    crate::signed_events::commit_and_emit(tx, anchor)
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("skill delete COMMIT", e))?;
 
     Ok(json!({

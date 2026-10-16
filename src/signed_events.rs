@@ -2932,8 +2932,26 @@ pub fn append_signed_event(conn: &Connection, event: &SignedEvent) -> Result<()>
     // INSERT pair is serialized at the SQLite layer.
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
         .context("append signed_event: begin IMMEDIATE tx")?;
-    append_signed_event_no_tx(&tx, event)?;
-    tx.commit().context("append signed_event: commit tx")?;
+    let anchor = append_signed_event_no_tx(&tx, event)?;
+    commit_and_emit(tx, anchor).context("append signed_event: commit tx")?;
+    Ok(())
+}
+
+/// #7241 - the single sqlite commit helper for a transaction that appended
+/// signed events: COMMIT first, then record the off-table audit anchors the
+/// appends produced. A failed commit returns its error and drops the anchors
+/// unrecorded, so a rolled-back append never anchors a head that does not
+/// exist (and never claims the watermark throttle).
+///
+/// # Errors
+///
+/// Returns the `rusqlite` error of the `COMMIT`.
+pub fn commit_and_emit(
+    tx: rusqlite::Transaction<'_>,
+    anchor: crate::governance::audit::PendingAuditAnchor,
+) -> rusqlite::Result<()> {
+    tx.commit()?;
+    anchor.emit_after_commit();
     Ok(())
 }
 
@@ -2953,7 +2971,16 @@ pub fn append_signed_event(conn: &Connection, event: &SignedEvent) -> Result<()>
 /// Returns the underlying `rusqlite` error if the chain-head read
 /// fails or the INSERT itself fails. Callers MUST rollback their
 /// own transaction on error.
-pub fn append_signed_event_no_tx(conn: &Connection, event: &SignedEvent) -> Result<()> {
+///
+/// #7241 - the returned [`PendingAuditAnchor`](crate::governance::audit::PendingAuditAnchor)
+/// carries the off-table audit anchors of this append. The caller that
+/// commits the transaction emits it only AFTER the commit succeeded
+/// ([`commit_and_emit`]), or folds it into its own pending anchor when an
+/// outer caller owns the commit.
+pub fn append_signed_event_no_tx(
+    conn: &Connection,
+    event: &SignedEvent,
+) -> Result<crate::governance::audit::PendingAuditAnchor> {
     let (max_seq, prev_hash) = read_chain_head(conn).context("append signed_event: read head")?;
     let next_seq = max_seq + 1;
 
@@ -3020,14 +3047,16 @@ pub fn append_signed_event_no_tx(conn: &Connection, event: &SignedEvent) -> Resu
     // what the NEXT row's `prev_hash` would be). Sink-gated + fire-and-
     // forget — never fails the append.
     //
-    // NB: emitted pre-commit on the caller's transaction. A rollback after
-    // an anchor landed could — only at an exact interval boundary, and only
-    // if no later append re-reaches the sequence — leave the anchor one
-    // ahead of the committed head. The interval makes that vanishingly
-    // rare; the residual is a single-row false "Detected", never a MISSED
-    // truncation. This is the single append chokepoint (both the public
-    // `append_signed_event` tx wrapper and every direct `_no_tx` caller
-    // route through here), so one wiring point anchors every write path.
+    // #7241 - the anchor is only COMPUTED here: it is returned as a pending
+    // value and recorded by the committing owner after `COMMIT` succeeded
+    // (`commit_and_emit`). Recording it in the caller's transaction left an
+    // anchor above the surviving head after a rollback (a false truncation
+    // verdict) and burned the throttle, so the next append that reused the
+    // sequence with a different row went un-anchored and convicted the head
+    // row of tampering (a false head-hash mismatch). This is the single
+    // append chokepoint (both the public `append_signed_event` tx wrapper and
+    // every direct `_no_tx` caller route through here), so one wiring point
+    // anchors every write path.
     let head_view = SignedEvent {
         sequence: next_seq,
         // #1925 — anchor the STORED (re-signed) signature so the off-table
@@ -3045,17 +3074,20 @@ pub fn append_signed_event_no_tx(conn: &Connection, event: &SignedEvent) -> Resu
     // (query-bearing) db_id ONLY when an emission is actually due — the cheap
     // peek keeps the genesis read off the 63-of-64 non-emitting appends,
     // mirroring the witness lane's interval pre-check.
+    let mut anchor = crate::governance::audit::PendingAuditAnchor::none();
     if crate::governance::audit::watermark_emission_due(next_seq) {
         // #7228 — never anchor a db_id-less (legacy) watermark: the reader counts
         // it against EVERY opener of the shared sink. An absent genesis skips the
         // emission (one WARN); a genesis read error is WARNed and skipped, never
         // silently dropped (ERRORS-19), mirroring the witness lane's swallow.
         match genesis_db_id(conn) {
-            Ok(Some(db_id)) => crate::governance::audit::maybe_record_audit_watermark(
-                next_seq,
-                &head_hash_hex,
-                &db_id,
-            ),
+            Ok(Some(db_id)) => {
+                anchor = crate::governance::audit::PendingAuditAnchor::watermark(
+                    next_seq,
+                    &head_hash_hex,
+                    &db_id,
+                );
+            }
             Ok(None) => crate::governance::audit::warn_watermark_skipped_no_genesis(),
             Err(e) => tracing::warn!(
                 target: SIGNED_EVENTS_TRACE_TARGET,
@@ -3066,13 +3098,18 @@ pub fn append_signed_event_no_tx(conn: &Connection, event: &SignedEvent) -> Resu
 
     // v0.9.0 G5b (#1822) — INDEPENDENT dual-chain audit-head witness anchor.
     // Emitted on the SAME `WATERMARK_INTERVAL` cadence (throttled), in the
-    // caller's transaction so the witness lands atomically with the head it
-    // binds. Opt-in (no-op unless a witness key is enrolled) + fire-and-
-    // forget (a witness failure NEVER fails the append). This is the single
-    // sqlite append chokepoint, so one wiring point witnesses every path.
-    maybe_emit_audit_head_witness(conn, next_seq, &head_hash_hex, false);
+    // caller's transaction so the witness checkpoint row lands atomically with
+    // the head it binds. Opt-in (no-op unless a witness key is enrolled) +
+    // fire-and-forget (a witness failure NEVER fails the append). This is the
+    // single sqlite append chokepoint, so one wiring point witnesses every
+    // path. #7241 - its OFF-TABLE head-anchor mirror rides the pending anchor
+    // and is written after commit, so a rollback cannot leave a mirror of a
+    // checkpoint the rollback discarded.
+    if let Some(cp) = maybe_emit_audit_head_witness(conn, next_seq, &head_hash_hex) {
+        anchor = anchor.with_head_anchor(cp);
+    }
 
-    Ok(())
+    Ok(anchor)
 }
 
 /// v0.9.0 G5b (#1822) — emit the dual-chain audit-head witness anchor if a
@@ -3081,40 +3118,50 @@ pub fn append_signed_event_no_tx(conn: &Connection, event: &SignedEvent) -> Resu
 /// swallowed — it NEVER fails the signed-events append (mirrors the #1850
 /// watermark). Opt-in: a deployment with no enrolled witness key emits
 /// nothing (byte-identical legacy behaviour).
+///
+/// #7241 - returns the inserted checkpoint so the caller mirrors it OFF-TABLE
+/// only after its transaction commits.
 fn maybe_emit_audit_head_witness(
     conn: &Connection,
     signed_head_seq: i64,
     signed_head_hash: &str,
-    force: bool,
-) {
-    if let Err(e) =
-        try_emit_audit_head_witness(conn, signed_head_seq, signed_head_hash, force, false)
-    {
-        tracing::warn!(
-            target: SIGNED_EVENTS_TRACE_TARGET,
-            "audit-head witness emission failed (swallowed): {e:#}"
-        );
+) -> Option<crate::models::Checkpoint> {
+    match try_emit_audit_head_witness(conn, signed_head_seq, signed_head_hash, false, false) {
+        Ok(cp) => cp,
+        Err(e) => {
+            tracing::warn!(
+                target: SIGNED_EVENTS_TRACE_TARGET,
+                "audit-head witness emission failed (swallowed): {e:#}"
+            );
+            None
+        }
     }
 }
 
 /// Fallible core of [`maybe_emit_audit_head_witness`]. Cheap boundary
 /// pre-check FIRST (no key I/O off the hot path), then load the witness key,
 /// then claim the emission slot (CAS) and write the signed dual-head anchor.
+///
+/// `strict` (the graceful-shutdown certification, which runs outside any
+/// caller transaction, so its checkpoint INSERT is already committed) writes
+/// the off-table mirror durably here and returns `None`. The append-path call
+/// (`strict == false`) runs in the caller's transaction and returns the
+/// inserted checkpoint for a post-commit mirror (#7241).
 fn try_emit_audit_head_witness(
     conn: &Connection,
     signed_head_seq: i64,
     signed_head_hash: &str,
     force: bool,
     strict: bool,
-) -> Result<()> {
+) -> Result<Option<crate::models::Checkpoint>> {
     use crate::governance::audit as witness;
     // Cheap pre-check — keeps witness-key file I/O off every append.
     if !force && !witness::witness_interval_reached(signed_head_seq) {
-        return Ok(());
+        return Ok(None);
     }
     let keypair = if strict {
         match witness::inspect_witness_custody()? {
-            witness::WitnessCustody::Absent => return Ok(()),
+            witness::WitnessCustody::Absent => return Ok(None),
             witness::WitnessCustody::Unloadable(detail) => {
                 return Err(anyhow::anyhow!(
                     "witness custody is enrolled but unloadable: {detail}"
@@ -3124,13 +3171,13 @@ fn try_emit_audit_head_witness(
         }
     } else {
         let Some(keypair) = witness::load_witness_signing_key()? else {
-            return Ok(()); // opt-in: no witness key enrolled → no-op.
+            return Ok(None); // opt-in: no witness key enrolled → no-op.
         };
         Box::new(keypair)
     };
     // Claim the slot only once we know we can actually sign.
     if !witness::witness_claim_slot(signed_head_seq, force) {
-        return Ok(());
+        return Ok(None);
     }
     let (mem_seq, mem_hash) = crate::revisions::read_revision_chain_head(conn)
         .context("witness: read memory_revisions head")?;
@@ -3150,14 +3197,14 @@ fn try_emit_audit_head_witness(
     let db_id = genesis_db_id(conn).context("witness: read genesis db-id")?;
     let cp = witness::build_signed_witness_checkpoint(&dual, rollback, db_id, now, &keypair)?;
     crate::checkpoints::insert(conn, &cp).context("witness: insert checkpoint")?;
-    // v1.0.0 #1946 B — mirror the signed anchor OFF-TABLE (fire-and-forget) so
-    // a whole-DB-file rollback is detectable at the next `db::open`.
+    // v1.0.0 #1946 B — mirror the signed anchor OFF-TABLE so a whole-DB-file
+    // rollback is detectable at the next `db::open`. #7241 - the append path
+    // hands the checkpoint back for a post-commit, fire-and-forget mirror.
     if strict {
         witness::append_head_anchor_durable(&cp)?;
-    } else {
-        witness::append_head_anchor(&cp);
+        return Ok(None);
     }
-    Ok(())
+    Ok(Some(cp))
 }
 
 /// v0.9.0 G5b (#1822) — force-emit a dual-chain audit-head witness anchor for
@@ -3174,7 +3221,7 @@ pub fn try_force_emit_audit_head_witness(conn: &Connection) -> Result<()> {
     if head_seq <= 0 {
         return Ok(());
     }
-    try_emit_audit_head_witness(conn, head_seq, &hex_lower(&head_hash), true, true)
+    try_emit_audit_head_witness(conn, head_seq, &hex_lower(&head_hash), true, true).map(drop)
 }
 
 /// Backward-compatible fire-and-forget wrapper for operator/legacy call sites.
