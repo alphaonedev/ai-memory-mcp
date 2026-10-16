@@ -491,11 +491,13 @@ const SIGN_BATCH_SIZE: usize = 1000;
 /// Timed batches per run; the guard uses the FASTEST batch (#7187).
 const SIGN_BATCH_RUNS: usize = 3;
 /// Unscaled wall-clock budget for one batch of [`SIGN_BATCH_SIZE`] signs.
-/// An unloaded debug build takes ~0.3 s, so this is ~16x headroom: loaded
-/// self-hosted runners (2.61 s measured at load ~21, #7187) pass, while an
-/// order-of-magnitude regression (key derivation or hashing in the loop)
-/// still fails. Scaled by `AI_MEMORY_TEST_TIMING_BUDGET_MULT`.
-const SIGN_BATCH_BASE_BUDGET: Duration = Duration::from_secs(5);
+/// An unloaded debug build takes ~0.3 s per batch, so 2 s trips at a slowdown
+/// of 2 / 0.3 = ~6.7x: a 10x regression (~3.0 s per batch, key derivation or
+/// hashing in the loop) fails, while best-of-[`SIGN_BATCH_RUNS`] absorbs a
+/// transient load spike. Runners under sustained oversubscription (2.61 s
+/// measured at load ~21, #7187) set `AI_MEMORY_TEST_TIMING_BUDGET_MULT`,
+/// which scales this budget (and widens the threshold by the same factor).
+const SIGN_BATCH_BASE_BUDGET: Duration = Duration::from_secs(2);
 
 #[test]
 fn one_thousand_signs_complete_within_load_tolerant_budget() {
