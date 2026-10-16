@@ -30,13 +30,37 @@ status-level = "fail"
 final-status-level = "flaky"
 test-threads = "num-cpus"
 
+# ci is what .github/workflows/ci.yml runs (#7259): every non-doc test leg goes
+# through `cargo nextest run --profile ci --no-fail-fast` (doc tests stay on
+# `cargo test --doc`; nextest does not run them).
+#
+# - retries = 0: `cargo test` never retried, so a retry here could turn a red
+#   test green and make the two runners disagree. A flaky test must fail.
+# - slow-timeout: one test is terminated after 120s x 3 = 360s. That is far
+#   stricter than the per-invocation watchdog it sits under (>= 2100s), never
+#   looser.
+# - status-level = "pass": one PASS/FAIL line per test lands in the CI log so
+#   scripts/ci/compare_test_sets.py can diff the executed set against a
+#   `cargo test` log. The JUnit file is the machine-readable twin.
 [profile.ci]
-retries = 2
+retries = 0
 fail-fast = false
 slow-timeout = { period = "120s", terminate-after = 3 }
-status-level = "fail"
+status-level = "pass"
 final-status-level = "flaky"
 test-threads = "num-cpus"
 
 [profile.ci.junit]
 path = "junit.xml"
+
+# The lib tests that touch the shared per-job Postgres database. The sal-postgres
+# legs already pass `--test-threads 1` (translated from `-- --test-threads=1`
+# by scripts/ci/nextest_args.py); this group keeps those tests single-threaded
+# on any profile-only run too. The test names are scripts/ci/lib_pg_prefixes.txt
+# (pinned by scripts/ci/tests/test_nextest_config_7259.py).
+[test-groups]
+pg-lib-serial = { max-threads = 1 }
+
+[[profile.ci.overrides]]
+filter = 'kind(lib) & (test(~store::postgres) | test(~store::update_atomicity_3152_tests) | test(~background::auto_tag_worker) | test(~cli::schema_init) | test(~curator::compaction) | test(~daemon_runtime::cov_boot_degrade_arms_3521::curator_store_handle_connects_postgres_without_an_embedder))'
+test-group = 'pg-lib-serial'
