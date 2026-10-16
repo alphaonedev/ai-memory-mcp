@@ -11,8 +11,12 @@ It NEVER removes the per-runner cargo target ROOT (``--protected-root``,
 ``~/.cache/ai-memory-ci/cargo-target``) nor any path inside it (every runner's
 target, so one runner's prune can never delete a sibling's) or above it; ``is_protected`` is checked on every candidate and
 again immediately before each removal. Symlinks are never followed or deleted
-(each one met is reported as skipped) and every removal must resolve inside the
-work root. Use ``--dry-run`` to list only.
+(each one met is reported as skipped; there is no os.walk, only is_symlink checks
+and shutil.rmtree, which unlinks a symlink met inside a tree without entering it
+and refuses a symlink given as the root) and every removal must resolve inside the
+work root. A protected root whose realpath is outside the work root (a symlinked
+cargo-target on fed runners) is unreachable by a prune confined to the work root,
+so it is logged and ignored, not refused. Use ``--dry-run`` to list only.
 
 Exit codes: 0 ok, 2 bad arguments. A failed removal is reported and counted but
 does not fail the post-job step (exit stays 0): cleanup must never red a job.
@@ -29,6 +33,7 @@ TEMP_DIR_NAME = "_temp"
 INCREMENTAL_RELATIVE = Path("target") / "debug" / "incremental"
 TMP_PREFIX = ".tmp"
 DEFAULT_MAX_AGE_DAYS = 7
+MIN_WORK_ROOT_COMPONENTS = 2
 EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_BAD_ARGS = EXIT_USAGE
@@ -112,10 +117,11 @@ def is_filesystem_root(path):
 def validate_arguments(work_root, workspace, protected_root):
     """Return a refusal reason, or None when the arguments are safe to act on.
 
-    Refused: a work root that is a filesystem root, missing or not a directory;
-    an empty or relative protected root; a protected root neither inside nor
-    beside the work root (no common ancestor below the filesystem root); a
-    workspace that does not resolve inside the work root.
+    Refused: a work root that is a filesystem root, has fewer than two path
+    components, is missing or not a directory; an empty or relative protected
+    root; a protected root that is the work root or one of its ancestors; a
+    workspace that does not resolve inside the work root. A protected root whose
+    realpath is outside the work root is NOT refused (see ``is_out_of_tree``).
     """
     if not str(work_root).strip():
         return "empty work root"
@@ -128,15 +134,19 @@ def validate_arguments(work_root, workspace, protected_root):
         return "empty protected root"
     if not Path(protected_root).is_absolute():
         return "protected root must be an absolute path"
+    if len(root.parts) - 1 < MIN_WORK_ROOT_COMPONENTS:
+        return "work root has fewer than %d path components" % MIN_WORK_ROOT_COMPONENTS
     protected = resolve(protected_root)
-    if is_filesystem_root(protected):
-        return "protected root is a filesystem root"
-    common = [p for p in root.parents if p in protected.parents or p == protected]
-    if not is_within(protected, root) and not any(not is_filesystem_root(p) for p in common):
-        return "protected root is neither inside nor beside the work root"
+    if protected == root or protected in root.parents:
+        return "protected root is the work root or one of its ancestors"
     if not is_within(workspace, root):
         return "workspace is not inside the work root"
     return None
+
+
+def is_out_of_tree(work_root, protected_root):
+    """True if the protected root resolves outside the work root (and is not above it)."""
+    return not is_within(protected_root, work_root)
 
 
 def build_parser():
@@ -158,6 +168,8 @@ def main(argv=None):
     if problem:
         print("prune_runner_artifacts: refusing: %s" % problem, file=sys.stderr)
         return EXIT_USAGE
+    if is_out_of_tree(args.work_root, args.protected_root):
+        print("protected root %s is outside the work root; nothing to protect" % args.protected_root)
     failures = 0
     candidates, skipped = scan(
         args.work_root, args.workspace, args.protected_root, args.max_age_days, time.time()
