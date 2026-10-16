@@ -312,15 +312,15 @@ class Eviction(unittest.TestCase):
         make_target(outside, "r1", 30)
         with redirect_stderr(io.StringIO()):
             rc, _ = self.evict(self.starved, root=outside)
-            self.assertEqual(rc, prune.EXIT_USAGE)
+            self.assertEqual(rc, prune.EXIT_OK)
             self.assertTrue((outside / "r1").exists())
             rc, _ = self.evict(self.starved, root=Path("rel/root"))
-            self.assertEqual(rc, prune.EXIT_USAGE)
+            self.assertEqual(rc, prune.EXIT_OK)
 
     def test_home_itself_or_filesystem_root_is_refused(self):
         with redirect_stderr(io.StringIO()):
-            self.assertEqual(self.evict(self.starved, root=self.home)[0], prune.EXIT_USAGE)
-            self.assertEqual(self.evict(self.starved, root=Path("/"))[0], prune.EXIT_USAGE)
+            self.assertEqual(self.evict(self.starved, root=self.home)[0], prune.EXIT_OK)
+            self.assertEqual(self.evict(self.starved, root=Path("/"))[0], prune.EXIT_OK)
 
     def test_cli_requires_runner_name_with_evict_root(self):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -407,7 +407,7 @@ class Eviction(unittest.TestCase):
         pip = make_target(cache, "pip", 30)
         with redirect_stderr(io.StringIO()) as err:
             rc, _ = self.evict(self.starved, root=cache)
-        self.assertEqual(rc, prune.EXIT_USAGE)
+        self.assertEqual(rc, prune.EXIT_OK)
         self.assertTrue(pip.exists())
         self.assertIn("runner target root", err.getvalue())
 
