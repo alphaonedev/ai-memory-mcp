@@ -51,10 +51,10 @@ use ai_memory::signed_events::{
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
-/// Process-global serialisation for the witness ENV + throttle static.
 #[path = "common/key_dir_sandbox.rs"]
 mod key_dir_sandbox;
 
+/// Process-global serialisation for the witness ENV + throttle static.
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
