@@ -11,7 +11,7 @@ Safety:
   * ``--target`` must resolve (realpath) under ``$GITHUB_WORKSPACE`` unless
     ``--allow-root`` is given (node cron); otherwise exit 2 naming the path.
     ``--allow-root`` REQUIRES ``--within ROOT`` (exit 5 without it, and
-    ``--within`` alone is exit 5 too): the script resolves BOTH the target and
+    ``--within`` alone is exit 5 too; ``--lock`` and ``--lock-timeout`` are covered below): the script resolves BOTH the target and
     the root with ``os.path.realpath`` and exits 2 naming both resolved paths
     unless the resolved target is strictly inside the resolved root (not equal
     to it; the root ``/`` is refused). A symlinked parent such as the f2 runners'
@@ -20,6 +20,16 @@ Safety:
     descriptor walk below then runs on the RESOLVED path exactly as before, so a
     component swapped for a symlink after the resolution still fails closed
     (#7297 S11).
+  * ``--lock FILE`` (the shared_target leg passes ``<root>/.evict.lock``, the
+    flock of #7219's idle-target eviction) takes that lock exclusively while
+    sweeping; ``FILE`` must sit directly in the resolved ``--within`` root and
+    is opened ``O_NOFOLLOW``. If the lock is not taken within ``--lock-timeout``
+    seconds (default 20) or cannot be opened, one ``warning: ... sweep skipped``
+    line is printed and the exit is 0 (the always-run step stays green; the
+    next job sweeps). Nothing outside ``<target>/debug/{deps,incremental,
+    build,.fingerprint}`` is ever read or deleted, so the in-use marker
+    (``<target>/.in-use``), ``<root>/.evict.lock`` and the ``<root>/.evicting-*``
+    directories are never entries of a sweep.
   * ``<target>/debug`` and the four swept directories must not be symlinks:
     otherwise exit 2 naming the path and nothing is deleted. A target path
     component that is not a directory (``--target`` names a regular file) exits
@@ -65,9 +75,11 @@ unreadable, 5 usage error (a missing, unknown or unparsable argument such as
 
 import argparse
 import errno
+import fcntl
 import os
 import stat
 import sys
+import time
 
 DEBUG_DIR_NAME = "debug"
 SWEPT_SUBDIRS = ("deps", "incremental", "build", ".fingerprint")
@@ -91,6 +103,40 @@ OPEN_DIR_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
 # they need search permission only, as a full-path open does (Linux). Without
 # O_PATH (macOS) this equals OPEN_DIR_FLAGS and every parent must be readable.
 PARENT_OPEN_FLAGS = getattr(os, "O_PATH", 0) | os.O_NOFOLLOW | os.O_DIRECTORY
+
+
+LOCK_POLL_SECS = 0.05
+LOCK_FILE_MODE = 0o600
+DEFAULT_LOCK_TIMEOUT_SECS = 20.0
+
+
+def take_lock(path, timeout_secs):
+    """Take the exclusive flock on ``path`` for at most ``timeout_secs``.
+
+    Return the held descriptor, or ``None`` when the lock file cannot be
+    opened or the wait timed out (the caller skips the sweep, fail soft). The
+    file is opened ``O_NOFOLLOW`` so a symlinked lock file is never followed.
+    Same primitive as ``evict_lock`` in scripts/ci/shared_cargo_target.py
+    (#7219): ``LOCK_EX | LOCK_NB`` polled until the deadline.
+    """
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                     LOCK_FILE_MODE)
+    except OSError:
+        return None
+    deadline = time.monotonic() + timeout_secs
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(LOCK_POLL_SECS)
+        except OSError:
+            break
+    os.close(fd)
+    return None
 
 
 class UsageParser(argparse.ArgumentParser):
@@ -441,12 +487,24 @@ def main(argv=None):
     parser.add_argument("--within", default=None, metavar="ROOT",
                         help="with --allow-root: the directory the resolved target must "
                              "lie strictly inside")
+    parser.add_argument("--lock", default=None, metavar="FILE",
+                        help="with --allow-root: flock this file (it must sit directly in "
+                             "the --within root, e.g. <root>/.evict.lock) while sweeping; "
+                             "if it is not taken within --lock-timeout seconds print one "
+                             "warning and skip the sweep with exit 0")
+    parser.add_argument("--lock-timeout", type=float, default=DEFAULT_LOCK_TIMEOUT_SECS,
+                        metavar="SECS", help="longest wait for --lock (default {})".format(
+                            DEFAULT_LOCK_TIMEOUT_SECS))
     parser.add_argument("--dry-run", action="store_true", help="report only; delete nothing")
     args = parser.parse_args(argv)
     if args.allow_root and not args.within:
         parser.error("--allow-root requires --within ROOT")
     if args.within and not args.allow_root:
         parser.error("--within is only valid with --allow-root")
+    if args.lock and not args.allow_root:
+        parser.error("--lock is only valid with --allow-root")
+    if args.lock_timeout < 0:
+        parser.error("--lock-timeout must not be negative")
     if args.max_bytes <= 0:
         print("usage: --max-bytes must be a positive integer, got {}".format(
             args.max_bytes), file=sys.stderr)
@@ -468,6 +526,21 @@ def main(argv=None):
                   "root {}".format(real_target, real_root), file=sys.stderr)
             return EXIT_REFUSED
 
+    lock_fd = None
+    if args.lock:
+        lock_dir, lock_name = os.path.split(os.path.abspath(args.lock))
+        if (not lock_name or lock_name in (".", "..")
+                or os.path.realpath(lock_dir) != real_root):
+            print("refused: --lock {} is not a file directly inside the resolved --within "
+                  "root {}".format(args.lock, real_root), file=sys.stderr)
+            return EXIT_REFUSED
+        lock_fd = take_lock(os.path.join(real_root, lock_name), args.lock_timeout)
+        if lock_fd is None:
+            print("ci-sweep-target: warning: lock {} not taken within {} s; sweep skipped "
+                  "(target uncapped this run)".format(
+                      os.path.join(real_root, lock_name), args.lock_timeout), file=sys.stderr)
+            return EXIT_OK
+
     warnings = []
     handles = []
     try:
@@ -481,6 +554,8 @@ def main(argv=None):
                 os.close(fd)
             except OSError:
                 pass
+        if lock_fd is not None:
+            os.close(lock_fd)  # closing the descriptor releases the flock
     print("ci-sweep-target: target={} cap={} before={} after={} removed={} freed={}{}".format(
         real_target, args.max_bytes, before, remaining, removed, before - remaining,
         " (dry-run)" if args.dry_run else ""))

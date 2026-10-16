@@ -5,6 +5,7 @@ directory, never under a tmpfs path.
 """
 
 import contextlib
+import fcntl
 import importlib.util
 import io
 import os
@@ -13,6 +14,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -511,6 +514,125 @@ class TargetWalkTests(SweepTestCase):
         result = self.run_sweep("--max-bytes", "1500", "--allow-root", "--within",
                                 str(self.workspace), target=canonical)
         self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+
+
+class EvictLockTests(SweepTestCase):
+    """#7297 / #7219: the shared_target sweep coexists with idle-target eviction.
+
+    #7219 keeps ``<root>/.evict.lock`` (flock), ``<root>/.evicting-<name>-<pid>``
+    directories and the in-use marker ``<target>/.in-use`` (beside ``debug``,
+    not inside it). The sweep reads and deletes only the top-level entries of
+    ``<target>/debug/{deps,incremental,build,.fingerprint}``.
+    """
+
+    LOCK_NAME = ".evict.lock"
+
+    def setUp(self):
+        super().setUp()
+        self.cache_root = self.root / "cache" / "cargo-target"
+        self.runner = self.cache_root / "f2-linux-fed"
+        self.deps = self.runner / "debug" / "deps"
+        for idx in range(4):
+            entry = self.deps / "lib{}.rlib".format(idx)
+            write_blob(entry)
+            set_age(entry, idx)
+        self.lock_path = self.cache_root / self.LOCK_NAME
+
+    def sweep(self, *extra):
+        return self.run_sweep("--max-bytes", "1500", "--allow-root", "--within",
+                              str(self.cache_root), *extra, target=self.runner)
+
+    def test_free_lock_sweeps_and_releases_7297_lock(self):
+        result = self.sweep("--lock", str(self.lock_path))
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        self.assertIn("removed=3", result.stdout)
+        self.assertEqual(len(list(self.deps.iterdir())), 1)
+        fd = os.open(str(self.lock_path), os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
+
+    def test_held_lock_skips_with_one_warning_and_rc0_7297_lock(self):
+        self.lock_path.write_bytes(b"")
+        fd = os.open(str(self.lock_path), os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            started = time.monotonic()
+            result = self.sweep("--lock", str(self.lock_path), "--lock-timeout", "1")
+            elapsed = time.monotonic() - started
+        finally:
+            os.close(fd)
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        self.assertEqual(len(list(self.deps.iterdir())), 4)
+        warnings = [ln for ln in result.stderr.splitlines() if "not taken within" in ln]
+        self.assertEqual(len(warnings), 1, result.stderr)
+        self.assertIn("sweep skipped", warnings[0])
+        self.assertNotIn("ci-sweep-target: target=", result.stdout)
+        self.assertLess(elapsed, 15, "the wait must be bounded by --lock-timeout")
+
+    def test_lock_released_while_waiting_lets_the_sweep_run_7297_lock(self):
+        self.lock_path.write_bytes(b"")
+        fd = os.open(str(self.lock_path), os.O_RDWR)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        timer = threading.Timer(0.5, os.close, args=(fd,))
+        timer.start()
+        try:
+            result = self.sweep("--lock", str(self.lock_path), "--lock-timeout", "20")
+        finally:
+            timer.join()
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        self.assertIn("removed=3", result.stdout)
+
+    def test_lock_outside_the_within_root_is_refused_7297_lock(self):
+        stray = self.root / "stray.lock"
+        result = self.sweep("--lock", str(stray))
+        self.assertEqual(result.returncode, EXIT_REFUSED, result.stderr)
+        self.assertEqual(len(list(self.deps.iterdir())), 4)
+        self.assertFalse(stray.exists())
+
+    def test_symlinked_lock_file_is_not_followed_7297_lock(self):
+        victim = self.root / "victim"
+        victim.write_bytes(b"keep")
+        self.lock_path.symlink_to(victim)
+        result = self.sweep("--lock", str(self.lock_path), "--lock-timeout", "1")
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        self.assertIn("sweep skipped", result.stderr)
+        self.assertEqual(victim.read_bytes(), b"keep")
+        self.assertEqual(len(list(self.deps.iterdir())), 4)
+
+    def test_lock_without_allow_root_is_a_usage_error_7297_lock(self):
+        self.make_entries(2)
+        result = self.run_sweep("--max-bytes", "1", "--lock", str(self.lock_path))
+        self.assertEqual(result.returncode, EXIT_USAGE, result.stderr)
+        self.assertEqual(len(list((self.debug / "deps").iterdir())), 2)
+
+    def test_marker_lock_file_and_evicting_dirs_are_never_swept_7297_lock(self):
+        marker = self.runner / ".in-use"
+        marker.write_text("f2-linux-fed 2026-10-16T00:00:00Z\n")
+        self.lock_path.write_bytes(b"")
+        evicting = self.cache_root / ".evicting-f2-linux-fed-2-4242"
+        write_blob(evicting / "debug" / "deps" / "old.rlib")
+        sibling = self.cache_root / "f2-linux-fed-2" / "debug" / "deps" / "keep.rlib"
+        write_blob(sibling)
+        result = self.run_sweep("--max-bytes", "1", "--allow-root", "--within",
+                                str(self.cache_root), "--lock", str(self.lock_path),
+                                target=self.runner)
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        self.assertIn("removed=4", result.stdout)
+        self.assertTrue(marker.exists())
+        self.assertTrue(self.lock_path.exists())
+        self.assertTrue((evicting / "debug" / "deps" / "old.rlib").exists())
+        self.assertTrue(sibling.exists())
+
+    def test_evicting_dir_next_to_a_swept_dir_is_not_an_entry_7297_lock(self):
+        """An eviction-leftover-named directory beside ``debug`` in the target is
+        outside every swept directory, so it is never read or deleted."""
+        evicting = self.runner / ".evicting-x-1"
+        write_blob(evicting / "a")
+        result = self.sweep()
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        self.assertTrue(evicting.exists())
 
 
 def raise_fd_limit(wanted):

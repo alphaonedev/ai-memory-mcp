@@ -1992,13 +1992,15 @@ jobs:
       # resolves both paths and requires the target strictly inside the root
       # (the root may be a symlink to another disk, as on f2; #7297 S11). The
       # prune step above never touches that directory, so this is its only cap.
+      # --lock takes <root>/.evict.lock (the flock of the idle-target eviction)
+      # for the sweep, waits at most 20 s and then skips with one warning and exit 0.
       - name: Sweep target/debug to the size cap (self-hosted)
         if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted' && !matrix.shared_target
         run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
 
       - name: Sweep per-runner cargo target to the size cap (self-hosted, #7160)
         if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted' && matrix.shared_target
-        run: python3 scripts/ci-sweep-target.py --target "${CARGO_TARGET_DIR:?per-runner cargo target not set}" --allow-root --within "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}" --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
+        run: python3 scripts/ci-sweep-target.py --target "${CARGO_TARGET_DIR:?per-runner cargo target not set}" --allow-root --within "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}" --lock "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}/.evict.lock" --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
 
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
   #

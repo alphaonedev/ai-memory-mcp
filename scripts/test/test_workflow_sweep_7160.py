@@ -45,6 +45,7 @@ WORKSPACE_TARGET_ARG = "--target target "
 SHARED_TARGET_ARG = '--target "${CARGO_TARGET_DIR:?'
 ALLOW_ROOT = "--allow-root"
 WITHIN_ARG = '--within "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}"'
+LOCK_ARG = '--lock "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}/.evict.lock"'
 SHARED_FLAG = "matrix.shared_target"
 NOT_SHARED_FLAG = "!matrix.shared_target"
 SELF_HOSTED_GUARD = "runner.environment == 'self-hosted'"
@@ -157,9 +158,9 @@ class CheckJobSweep(unittest.TestCase):
         step = [s for s in self.sweeps if runs_on_leg(s, True)][0]
         run = field(step, "run")
         self.assertIn(SHARED_TARGET_ARG, run)
-        self.assertIn(ALLOW_ROOT + " " + WITHIN_ARG, run)
+        self.assertIn(ALLOW_ROOT + " " + WITHIN_ARG + " " + LOCK_ARG, run)
         self.assertNotIn(WORKSPACE_TARGET_ARG, run)
-        self.assertEqual(run.count(ROOT_ENV), 1, "the cache root is only the --within root")
+        self.assertEqual(run.count(ROOT_ENV), 2, "the cache root is only the --within root and the lock dir")
         self.assertNotIn("--target " + ROOT_ENV, run)
         self.assertNotIn('--target "$' + ROOT_ENV, run)
 
