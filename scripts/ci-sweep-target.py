@@ -10,9 +10,16 @@ oldest-mtime entries until the total is at or under ``--max-bytes``.
 Safety:
   * ``--target`` must resolve (realpath) under ``$GITHUB_WORKSPACE`` unless
     ``--allow-root`` is given (node cron); otherwise exit 2 naming the path.
-    Under ``--allow-root`` the target must already be canonical (it equals its
-    own realpath, no symlink in any component) or exit 2 ``is not a canonical
-    path``.
+    ``--allow-root`` REQUIRES ``--within ROOT`` (exit 5 without it, and
+    ``--within`` alone is exit 5 too): the script resolves BOTH the target and
+    the root with ``os.path.realpath`` and exits 2 naming both resolved paths
+    unless the resolved target is strictly inside the resolved root (not equal
+    to it; the root ``/`` is refused). A symlinked parent such as the f2 runners'
+    ``~/.cache/ai-memory-ci -> /mnt/t9/ai-memory-ci`` is therefore accepted only
+    by containment, and a target resolving outside the root is refused. The
+    descriptor walk below then runs on the RESOLVED path exactly as before, so a
+    component swapped for a symlink after the resolution still fails closed
+    (#7297 S11).
   * ``<target>/debug`` and the four swept directories must not be symlinks:
     otherwise exit 2 naming the path and nothing is deleted. A target path
     component that is not a directory (``--target`` names a regular file) exits
@@ -49,10 +56,11 @@ Safety:
 
 Exit codes: 0 success, 2 refused path (target outside the workspace, a
 symlinked or swapped component, a target path component that is not a
-directory, or a non-canonical ``--allow-root`` target), 3 ``--max-bytes`` is zero or negative,
+directory, or an ``--allow-root`` target not strictly inside ``--within``), 3 ``--max-bytes`` is zero or negative,
 4 nothing could be sized because every swept directory or entry was
 unreadable, 5 usage error (a missing, unknown or unparsable argument such as
-``--max-bytes abc`` or an empty ``--max-bytes``; ``--help`` exits 0).
+``--max-bytes abc`` or an empty ``--max-bytes``; ``--allow-root`` without
+``--within`` or ``--within`` without ``--allow-root``; ``--help`` exits 0).
 """
 
 import argparse
@@ -428,9 +436,17 @@ def main(argv=None):
     parser.add_argument("--target", required=True, help="cargo target directory")
     parser.add_argument("--max-bytes", required=True, type=int, help="size cap in bytes")
     parser.add_argument("--allow-root", action="store_true",
-                        help="permit a target outside $GITHUB_WORKSPACE (node cron)")
+                        help="permit a target outside $GITHUB_WORKSPACE (node cron); "
+                             "requires --within")
+    parser.add_argument("--within", default=None, metavar="ROOT",
+                        help="with --allow-root: the directory the resolved target must "
+                             "lie strictly inside")
     parser.add_argument("--dry-run", action="store_true", help="report only; delete nothing")
     args = parser.parse_args(argv)
+    if args.allow_root and not args.within:
+        parser.error("--allow-root requires --within ROOT")
+    if args.within and not args.allow_root:
+        parser.error("--within is only valid with --allow-root")
     if args.max_bytes <= 0:
         print("usage: --max-bytes must be a positive integer, got {}".format(
             args.max_bytes), file=sys.stderr)
@@ -444,11 +460,13 @@ def main(argv=None):
             print("refused: {} is not under {} (use --allow-root)".format(
                 real_target, WORKSPACE_ENV), file=sys.stderr)
             return EXIT_REFUSED
-    elif real_target != os.path.normpath(os.path.abspath(args.target)):
-        print("refused: {} is not a canonical path (it resolves to {}); pass the "
-              "resolved path with --allow-root".format(args.target, real_target),
-              file=sys.stderr)
-        return EXIT_REFUSED
+    else:
+        real_root = os.path.realpath(args.within)
+        if (real_root == os.sep or real_target == real_root
+                or not is_under(real_target, real_root)):
+            print("refused: resolved target {} is not strictly inside resolved --within "
+                  "root {}".format(real_target, real_root), file=sys.stderr)
+            return EXIT_REFUSED
 
     warnings = []
     handles = []

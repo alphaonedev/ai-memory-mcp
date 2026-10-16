@@ -117,7 +117,8 @@ class SweepTests(SweepTestCase):
         outside = self.root / "elsewhere" / "target"
         victim = outside / "debug" / "deps" / "a.rlib"
         write_blob(victim)
-        res = self.run_sweep("--max-bytes", "1", "--allow-root", target=outside)
+        res = self.run_sweep("--max-bytes", "1", "--allow-root", "--within",
+                             str(self.root / "elsewhere"), target=outside)
         self.assertEqual(res.returncode, EXIT_OK, res.stderr)
         self.assertFalse(victim.exists())
 
@@ -286,7 +287,7 @@ class ScanDeleteRaceTests(SweepTestCase):
         out = io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
             rc = module.main(["--target", str(self.target), "--max-bytes", "1",
-                              "--allow-root"])
+                              "--allow-root", "--within", str(self.workspace)])
         return rc, err.getvalue(), out.getvalue()
 
     def test_swept_dir_swapped_for_symlink_is_refused(self):
@@ -364,20 +365,99 @@ class TargetWalkTests(SweepTestCase):
         self.assertIn("target", err.getvalue())
         self.assertTrue(all(path.exists() for path in outside_files))
 
-    def test_allow_root_refuses_symlinked_target_7160_s4(self):
+    def test_allow_root_refuses_symlink_escaping_the_root_7160_s4(self):
+        """#7297 S11: a symlinked target is no longer refused as such (a symlinked
+        PARENT is the f2 layout); it is refused only when it resolves outside the
+        ``--within`` root. What stays refused: the escape, and (unchanged, no
+        ``--allow-root``) any ``--target`` outside ``$GITHUB_WORKSPACE``."""
         self.make_entries(2)
         outside, outside_files = self.make_outside()
         link = self.root / "linked-target"
         link.symlink_to(outside, target_is_directory=True)
-        result = self.run_sweep("--max-bytes", "1", "--allow-root", target=link)
+        result = self.run_sweep("--max-bytes", "1", "--allow-root", "--within",
+                                str(self.workspace), target=link)
         self.assertEqual(result.returncode, EXIT_REFUSED, result.stderr)
-        self.assertIn("is not a canonical path", result.stderr)
+        self.assertIn("is not strictly inside", result.stderr)
         self.assertTrue(all(path.exists() for path in outside_files))
+
+    def make_symlinked_root(self):
+        """The f2 layout: root R is a symlink to a real directory on 'another disk'."""
+        disk = self.root / "mnt-t9" / "ai-memory-ci"
+        disk.mkdir(parents=True)
+        root = self.root / "home" / ".cache" / "ai-memory-ci"
+        root.parent.mkdir(parents=True)
+        root.symlink_to(disk, target_is_directory=True)
+        return root, disk
+
+    def test_allow_root_within_sweeps_target_under_symlinked_parent_7297_s11(self):
+        root, disk = self.make_symlinked_root()
+        target = root / "cargo-target" / "x"
+        deps = disk / "cargo-target" / "x" / "debug" / "deps"
+        for idx in range(4):
+            write_blob(deps / "lib{}.rlib".format(idx))
+            set_age(deps / "lib{}.rlib".format(idx), idx)
+        sibling = disk / "cargo-target" / "y" / "debug" / "deps" / "keep.rlib"
+        write_blob(sibling)
+        result = self.run_sweep("--max-bytes", "1500", "--allow-root", "--within",
+                                str(root), target=target)
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        self.assertIn("removed=3", result.stdout)
+        self.assertIn("freed=3000", result.stdout)
+        self.assertEqual(len(list(deps.iterdir())), 1)
+        self.assertTrue(sibling.exists())
+
+    def test_allow_root_refuses_target_resolving_outside_root_7297_s11(self):
+        root, disk = self.make_symlinked_root()
+        sibling_dir = self.root / "sibling"
+        victim = sibling_dir / "debug" / "deps" / "a.rlib"
+        write_blob(victim)
+        (disk / "cargo-target").mkdir()
+        (disk / "cargo-target" / "x").symlink_to(sibling_dir, target_is_directory=True)
+        result = self.run_sweep("--max-bytes", "1", "--allow-root", "--within",
+                                str(root), target=root / "cargo-target" / "x")
+        self.assertEqual(result.returncode, EXIT_REFUSED, result.stderr)
+        self.assertIn(str(sibling_dir.resolve()), result.stderr)
+        self.assertIn(str(disk.resolve()), result.stderr)
+        self.assertTrue(victim.exists())
+
+    def test_allow_root_refuses_target_equal_to_root_7297_s11(self):
+        root, disk = self.make_symlinked_root()
+        victim = disk / "debug" / "deps" / "a.rlib"
+        write_blob(victim)
+        result = self.run_sweep("--max-bytes", "1", "--allow-root", "--within",
+                                str(root), target=root)
+        self.assertEqual(result.returncode, EXIT_REFUSED, result.stderr)
+        self.assertTrue(victim.exists())
+
+    def test_allow_root_without_within_is_a_usage_error_7297_s11(self):
+        self.make_entries(2)
+        result = self.run_sweep("--max-bytes", "1", "--allow-root")
+        self.assertEqual(result.returncode, EXIT_USAGE, result.stderr)
+        self.assertIn("--within", result.stderr)
+        self.assertEqual(len(list((self.debug / "deps").iterdir())), 2)
+
+    def test_within_without_allow_root_is_a_usage_error_7297_s11(self):
+        self.make_entries(2)
+        result = self.run_sweep("--max-bytes", "1", "--within", str(self.workspace))
+        self.assertEqual(result.returncode, EXIT_USAGE, result.stderr)
+        self.assertEqual(len(list((self.debug / "deps").iterdir())), 2)
+
+    def test_within_filesystem_root_is_refused_7297_s11(self):
+        self.make_entries(2)
+        result = self.run_sweep("--max-bytes", "1", "--allow-root", "--within", os.sep)
+        self.assertEqual(result.returncode, EXIT_REFUSED, result.stderr)
+        self.assertEqual(len(list((self.debug / "deps").iterdir())), 2)
+
+    def test_workspace_target_without_allow_root_unchanged_7297_s11(self):
+        self.make_entries(3)
+        result = self.run_sweep("--max-bytes", "1")
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        self.assertIn("removed=3", result.stdout)
 
     def test_target_that_is_a_regular_file_says_not_a_directory_7160_s8(self):
         not_dir = self.root / "target-is-a-file"
         not_dir.write_bytes(b"x")
-        for extra in ((), ("--allow-root",)):
+        for extra in ((), ("--allow-root", "--within", str(self.root))):
             workspace = self.root if not extra else None
             result = self.run_sweep("--max-bytes", "1", *extra, target=not_dir,
                                     workspace=workspace)
@@ -404,7 +484,7 @@ class TargetWalkTests(SweepTestCase):
         with mock.patch.object(module.os, "open", recording_open), \
                 contextlib.redirect_stdout(out):
             rc = module.main(["--target", str(self.target), "--max-bytes", "1",
-                              "--allow-root"])
+                              "--allow-root", "--within", str(self.workspace)])
         self.assertEqual(rc, EXIT_OK)
         by_name = dict(opened)
         for parent in (os.sep, "debug") + tuple(
@@ -420,14 +500,16 @@ class TargetWalkTests(SweepTestCase):
         self.workspace.chmod(0o311)
         self.locked.append(self.workspace)
         canonical = Path(os.path.realpath(str(self.target)))
-        result = self.run_sweep("--max-bytes", "1", "--allow-root", target=canonical)
+        result = self.run_sweep("--max-bytes", "1", "--allow-root", "--within",
+                                str(self.workspace), target=canonical)
         self.assertEqual(result.returncode, EXIT_OK, result.stderr)
         self.assertIn("removed=3", result.stdout)
 
     def test_allow_root_accepts_canonical_target(self):
         self.make_entries(3)
         canonical = Path(os.path.realpath(str(self.target)))
-        result = self.run_sweep("--max-bytes", "1500", "--allow-root", target=canonical)
+        result = self.run_sweep("--max-bytes", "1500", "--allow-root", "--within",
+                                str(self.workspace), target=canonical)
         self.assertEqual(result.returncode, EXIT_OK, result.stderr)
 
 
@@ -501,7 +583,7 @@ class DeepTreeTests(SweepTestCase):
             out = io.StringIO()
             with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
                 rc = module.main(["--target", str(self.target), "--max-bytes", "1",
-                                  "--allow-root"])
+                                  "--allow-root", "--within", str(self.workspace)])
             self.assertEqual(rc, EXIT_OK, err.getvalue())
             self.assertIn("warning: cannot", err.getvalue())
             self.assertIn("ci-sweep-target:", out.getvalue())
@@ -679,7 +761,7 @@ class PartialDeleteTests(SweepTestCase):
         with mock.patch.object(os, "unlink", flaky_unlink), \
                 contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
             rc = module.main(["--target", str(self.target), "--max-bytes", "1",
-                              "--allow-root"])
+                              "--allow-root", "--within", str(self.workspace)])
         self.assertEqual(rc, EXIT_OK, err.getvalue())
         self.assertEqual(self.count_files_in(pkg), 11)
         self.assertEqual(summary_field(out.getvalue(), "removed"), 0)

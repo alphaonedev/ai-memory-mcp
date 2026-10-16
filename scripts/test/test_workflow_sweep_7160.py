@@ -10,17 +10,26 @@ guaranteed on every node). Properties:
       step, and a hosted leg runs none (the steps are guarded by
       ``runner.environment == 'self-hosted'``);
   (b) the shared_target leg (#7188, per-runner CARGO_TARGET_DIR outside the
-      workspace) sweeps ``"$CARGO_TARGET_DIR"`` with ``--allow-root``; every
+      workspace) sweeps ``"$CARGO_TARGET_DIR"`` with ``--allow-root --within
+      "$AI_MEMORY_CI_TARGET_ROOT"`` (#7297 S11: the script resolves both and
+      requires the target strictly inside the root, so a symlinked cache
+      parent such as f2's is accepted only by containment); every
       other self-hosted leg sweeps the workspace ``target`` without
       ``--allow-root``;
   (c) the cap literal is the one ``SELF_HOSTED_TARGET_CAP_BYTES`` value, the
       step runs ``always()``, docs-only skips it, and no sweep step may fail
       silently (no ``continue-on-error``);
-  (d) the sweep never names the whole cache root (``AI_MEMORY_CI_TARGET_ROOT``).
+  (d) the sweep never TARGETS the whole cache root: ``AI_MEMORY_CI_TARGET_ROOT``
+      appears only as the ``--within`` containment root.
 
 Run: python3 -m unittest scripts/test/test_workflow_sweep_7160.py
 """
+import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -35,6 +44,7 @@ CAP_ARG = "--max-bytes ${{ env.%s }}" % CAP_ENV
 WORKSPACE_TARGET_ARG = "--target target "
 SHARED_TARGET_ARG = '--target "${CARGO_TARGET_DIR:?'
 ALLOW_ROOT = "--allow-root"
+WITHIN_ARG = '--within "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}"'
 SHARED_FLAG = "matrix.shared_target"
 NOT_SHARED_FLAG = "!matrix.shared_target"
 SELF_HOSTED_GUARD = "runner.environment == 'self-hosted'"
@@ -147,9 +157,51 @@ class CheckJobSweep(unittest.TestCase):
         step = [s for s in self.sweeps if runs_on_leg(s, True)][0]
         run = field(step, "run")
         self.assertIn(SHARED_TARGET_ARG, run)
-        self.assertIn(ALLOW_ROOT, run)
+        self.assertIn(ALLOW_ROOT + " " + WITHIN_ARG, run)
         self.assertNotIn(WORKSPACE_TARGET_ARG, run)
-        self.assertNotIn(ROOT_ENV, run, "the whole cache root must never be swept")
+        self.assertEqual(run.count(ROOT_ENV), 1, "the cache root is only the --within root")
+        self.assertNotIn("--target " + ROOT_ENV, run)
+        self.assertNotIn('--target "$' + ROOT_ENV, run)
+
+    def test_shared_step_executes_on_symlinked_cache_root_7297_s11(self):
+        """Run the exact step line on the f2 layout (``~/.cache/ai-memory-ci`` is a
+        symlink to another disk) with the env the #7188 helper exports: rc 0 and
+        the per-runner directory is capped (the workflow text pins above cannot
+        see a symlinked ancestor)."""
+        scratch = REPO / ".local-runs"
+        scratch.mkdir(exist_ok=True)
+        base = Path(tempfile.mkdtemp(prefix="wf7297-", dir=str(scratch)))
+        try:
+            disk = base / "mnt-t9" / "ai-memory-ci"
+            disk.mkdir(parents=True)
+            home = base / "hm"
+            (home / ".cache").mkdir(parents=True)
+            os.symlink(str(disk), str(home / ".cache" / "ai-memory-ci"))
+            github_env = base / "github_env"
+            github_env.write_text("")
+            helper = subprocess.run(
+                [sys.executable, str(REPO / "scripts" / "ci" / "shared_cargo_target.py"),
+                 "--home", str(home), "--runner-name", "f2-linux-fed",
+                 "--github-env", str(github_env)],
+                capture_output=True, text=True, check=False)
+            self.assertEqual(helper.returncode, 0, helper.stderr)
+            env = dict(os.environ)
+            for line in github_env.read_text().splitlines():
+                key, value = line.split("=", 1)
+                env[key] = value
+            deps = Path(env["CARGO_TARGET_DIR"]) / "debug" / "deps"
+            deps.mkdir(parents=True)
+            for idx in range(4):
+                (deps / ("lib%d.rlib" % idx)).write_bytes(b"x" * 600)
+            step = [s for s in self.sweeps if runs_on_leg(s, True)][0]
+            run = field(step, "run").replace("${{ env.%s }}" % CAP_ENV, "1000")
+            result = subprocess.run(["bash", "-e", "-c", run], cwd=str(REPO), env=env,
+                                    capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("freed=1800", result.stdout)
+            self.assertEqual(len(list(deps.iterdir())), 1)
+        finally:
+            shutil.rmtree(str(base), ignore_errors=True)
 
     def test_workspace_legs_sweep_workspace_target_without_allow_root_7160_s10(self):
         step = [s for s in self.sweeps if runs_on_leg(s, False)][0]
