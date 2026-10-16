@@ -32,6 +32,11 @@
 //!    session, not on the recall hot path. The performance smoke
 //!    test asserts the order of magnitude is correct.
 
+#[path = "common/mcp_wait.rs"]
+mod mcp_wait;
+
+use std::time::Duration;
+
 use ai_memory::identity::keypair::AgentKeypair;
 use ai_memory::mcp::server_identity::{build_signed_identity, verify_signed_identity};
 use ai_memory::storage::migrations::current_schema_version;
@@ -481,22 +486,40 @@ fn single_sign_is_sub_millisecond() {
     );
 }
 
+/// Signs per timed batch in the throughput guard.
+const SIGN_BATCH_SIZE: usize = 1000;
+/// Timed batches per run; the guard uses the FASTEST batch (#7187).
+const SIGN_BATCH_RUNS: usize = 3;
+/// Unscaled wall-clock budget for one batch of [`SIGN_BATCH_SIZE`] signs.
+/// An unloaded debug build takes ~0.3 s, so this is ~16x headroom: loaded
+/// self-hosted runners (2.61 s measured at load ~21, #7187) pass, while an
+/// order-of-magnitude regression (key derivation or hashing in the loop)
+/// still fails. Scaled by `AI_MEMORY_TEST_TIMING_BUDGET_MULT`.
+const SIGN_BATCH_BASE_BUDGET: Duration = Duration::from_secs(5);
+
 #[test]
-fn one_thousand_signs_complete_under_one_second() {
+fn one_thousand_signs_complete_within_load_tolerant_budget() {
     // The MCP initialize handshake fires ONCE per session, not on the
     // recall hot path. But CI may exercise the path many times during
-    // an integration sweep. 1000 iterations should complete well under
-    // 1 second on any reasonable hardware, confirming the per-call cost
-    // is on the order of 10s of µs.
+    // an integration sweep. A batch of 1000 signs confirms the per-call
+    // cost stays on the order of 10s of µs. The fixed 1 s wall-clock limit
+    // flaked under runner load (#7187), so the guard takes the best of
+    // SIGN_BATCH_RUNS batches (a transient load spike cannot fail it; a
+    // real regression slows every batch) against a named, env-scaled budget.
     let kp = keypair_with_signing("ai:nhi@host", 72);
-    let start = std::time::Instant::now();
-    for _ in 0..1000 {
-        let _ = build_signed_identity(Some(&kp), TEST_TIMESTAMP).unwrap();
+    let mut best = Duration::MAX;
+    for _ in 0..SIGN_BATCH_RUNS {
+        let start = std::time::Instant::now();
+        for _ in 0..SIGN_BATCH_SIZE {
+            let _ = build_signed_identity(Some(&kp), TEST_TIMESTAMP).unwrap();
+        }
+        best = best.min(start.elapsed());
     }
-    let elapsed = start.elapsed();
+    let mult = u32::try_from(mcp_wait::timing_budget_mult()).unwrap_or(u32::MAX);
+    let budget = SIGN_BATCH_BASE_BUDGET.saturating_mul(mult);
     assert!(
-        elapsed.as_secs() < 1,
-        "1000 signs must complete under 1s (was {elapsed:?})"
+        best < budget,
+        "{SIGN_BATCH_SIZE} signs must complete under {budget:?} (best of {SIGN_BATCH_RUNS}: {best:?})"
     );
 }
 
