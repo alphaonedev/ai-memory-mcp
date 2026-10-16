@@ -139,6 +139,59 @@ class ParseCargo(unittest.TestCase):
         with self.assertRaises(cts.ParseError):
             cts.parse_cargo_log('')
 
+    def test_byte_order_mark_inside_a_log_line_does_not_drop_the_test(self):
+        # GitHub inserts U+FEFF at log-chunk boundaries, before or between the stamp and the text.
+        log = ('2026-10-16T09:00:00.1Z     Running unittests src/lib.rs (target/debug/deps/ai_memory-0123456789abcdef)\n'
+               '﻿2026-10-16T09:00:00.2Z test bom_first ... ok\n'
+               '2026-10-16T09:00:00.3Z ﻿test bom_second ... ok\n'
+               '﻿test bom_bare ... FAILED\n')
+        self.assertEqual(cts.parse_cargo_log(log), {
+            ('lib', 'bom_first'): cts.PASS, ('lib', 'bom_second'): cts.PASS, ('lib', 'bom_bare'): cts.FAIL})
+
+    def test_example_binary_is_keyed_like_nextest_example_id(self):
+        log = ('     Running unittests examples/fed_issue.rs (target/debug/examples/fed_issue-211019ec7132104f)\n'
+               'test tests::gen_node ... ok\n')
+        self.assertEqual(cts.parse_cargo_log(log), {('example/fed_issue', 'tests::gen_node'): cts.PASS})
+        nextest = '        PASS [   0.1s] ai-memory::example/fed_issue tests::gen_node\n'
+        self.assertEqual(cts.parse_nextest_log(nextest), {('example/fed_issue', 'tests::gen_node'): cts.PASS})
+
+    def test_nested_child_libtest_output_keeps_the_parent_verdict(self):
+        log = ('     Running tests/audit_signature_pin_l4.rs (target/debug/deps/audit_signature_pin_l4-b7778225d1b4dc84)\n'
+               'running 3 tests\n'
+               'test recorder_unenrolled_child_l4 ... ok\n'
+               'test recorder_unenrolled_row_under_pin_dirties_l4 ... \n'
+               'running 1 test\n'
+               'test recorder_unenrolled_child_l4 ... ok\n'
+               '\n'
+               'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.07s\n'
+               '\n'
+               'ok\n'
+               'test sibling_after ... ok\n'
+               '\n'
+               'test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s\n')
+        self.assertEqual(cts.parse_cargo_log(log), {
+            ('audit_signature_pin_l4', 'recorder_unenrolled_child_l4'): cts.PASS,
+            ('audit_signature_pin_l4', 'recorder_unenrolled_row_under_pin_dirties_l4'): cts.PASS,
+            ('audit_signature_pin_l4', 'sibling_after'): cts.PASS})
+
+    def test_nested_child_failure_is_the_parents_failure_only(self):
+        log = ('     Running tests/x.rs (target/debug/deps/x-b7778225d1b4dc84)\n'
+               'test parent ... running 1 test\n'
+               'test child ... FAILED\n'
+               '\n'
+               'test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n'
+               '\n'
+               'ok\n')
+        self.assertEqual(cts.parse_cargo_log(log), {('x', 'parent'): cts.PASS})
+
+    def test_literal_caret_bracket_escapes_are_stripped(self):
+        # `gh run view --log` prints ESC as the two characters ^[ .
+        log = ('2026-10-16T09:00:00.1Z ^[[1m^[[92m     Running^[[0m tests/a.rs (target/debug/deps/a-0123456789abcdef)\n'
+               '2026-10-16T09:00:00.2Z test one ... ok\n')
+        self.assertEqual(cts.parse_cargo_log(log), {('a', 'one'): cts.PASS})
+        nextest = '2026-10-16T09:00:00.3Z ^[[32;1m        PASS^[[0m [   0.1s] ^[[35;1mai-memory::a^[[0m one\n'
+        self.assertEqual(cts.parse_nextest_log(nextest), {('a', 'one'): cts.PASS})
+
 
 class ParseNextest(unittest.TestCase):
     def test_binary_ids_are_normalised_to_the_cargo_keys(self):
