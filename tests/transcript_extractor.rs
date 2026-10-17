@@ -58,8 +58,8 @@ const BIN_COPY_TMP_SUFFIX: &str = ".tmp";
 /// #7342 - a `bin-<pid>` copy older than this is pruned even when its pid
 /// looks alive (pid reuse by an unrelated process). The bound is far above the
 /// longest legitimate lifetime of a test process: `EXTRACTOR_BUILD_BUDGET`
-/// (5 min) plus the nextest slow-timeout (`.config/nextest.toml`, macos
-/// profile 90 s x 3 = 4.5 min) is under 10 min, so 1 h leaves a 6x margin.
+/// (5 min) plus the largest nextest slow-timeout (`.config/nextest.toml`, ci
+/// profile 120 s x 3 = 6 min) is 11 min, so 1 h leaves a 5.4x margin.
 const STALE_BIN_COPY_AGE: std::time::Duration = std::time::Duration::from_hours(1);
 
 /// v1.0.0 #3140 — poll cadence while waiting on a child.
@@ -118,14 +118,29 @@ fn bin_copy_pid(name: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-/// #7342 - `kill -0 <pid>`: true when the process exists. No new dependency.
-fn pid_is_alive(pid: u32) -> bool {
-    Command::new("kill")
+/// #7342 (N1) - `kill -0 <pid>`: `Some(true)` when the process exists,
+/// `Some(false)` when it does not, `None` when the probe itself could not run
+/// (fail closed: the caller must not treat that as dead). No new dependency.
+fn pid_probe(pid: u32) -> Option<bool> {
+    match Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_ok_and(|s| s.success())
+    {
+        Ok(status) => Some(status.success()),
+        Err(e) => {
+            eprintln!("prune: liveness probe for pid {pid} could not run: {e}");
+            None
+        }
+    }
+}
+
+/// #7342 (N1) - prune decision. An unrunnable probe (`None`) counts as ALIVE,
+/// so only the age rule can remove the copy; a live pid's copy is never
+/// deleted on a probe error (ENOENT on spawn is #7342 again).
+fn should_prune(too_old: bool, alive: Option<bool>) -> bool {
+    too_old || !alive.unwrap_or(true)
 }
 
 /// #7342 (M1) - prune stale `bin-<pid>` / `bin-<pid>.tmp` files directly under
@@ -164,7 +179,8 @@ fn prune_stale_bin_copies(dir: &Path) {
             .ok()
             .and_then(|m| m.elapsed().ok())
             .is_some_and(|age| age > STALE_BIN_COPY_AGE);
-        if (too_old || !pid_is_alive(pid))
+        let alive = if too_old { None } else { pid_probe(pid) };
+        if should_prune(too_old, alive)
             && let Err(e) = std::fs::remove_file(&path)
         {
             eprintln!("prune: remove {}: {e}", path.display());
@@ -196,9 +212,11 @@ fn install_private_copy(src: &Path, dir: &Path, pid: u32) -> PathBuf {
         .unwrap_or_else(|e| panic!("create {}: {e}", tmp.display()));
     std::io::copy(&mut input, &mut output)
         .unwrap_or_else(|e| panic!("copy extractor {} to {}: {e}", src.display(), tmp.display()));
-    drop(output);
-    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))
+    // fchmod on the open handle (N2): never re-resolve the temp name by path.
+    output
+        .set_permissions(std::fs::Permissions::from_mode(0o755))
         .unwrap_or_else(|e| panic!("chmod {}: {e}", tmp.display()));
+    drop(output);
     std::fs::rename(&tmp, &bin_copy)
         .unwrap_or_else(|e| panic!("rename {} to {}: {e}", tmp.display(), bin_copy.display()));
     bin_copy
@@ -568,11 +586,57 @@ fn concurrent_builds_never_lose_the_uplifted_binary_7342() {
 /// #7342 - a private test directory under the scratch root. Pruning only
 /// looks at regular files directly under the scratch root, so a real run never
 /// touches it, and the tests never touch a live process's copy.
-fn test_dir_7342(tag: &str) -> PathBuf {
+fn test_dir_7342(tag: &str) -> TestDir7342 {
     let dir = scratch_root().join(format!("test-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
-    dir
+    TestDir7342(dir)
+}
+
+/// #7342 (N4) - RAII guard: the private test directory is removed on drop, so
+/// a failing (panicking) test does not leak it.
+struct TestDir7342(PathBuf);
+
+impl std::ops::Deref for TestDir7342 {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDir7342 {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("cleanup {}: {e}", self.0.display());
+        }
+    }
+}
+
+/// #7342 (N1) - every branch of the prune decision, including a probe that
+/// could not run (`None`), which must never select the destructive branch
+/// for a young copy.
+#[test]
+fn prune_decision_fails_closed_when_probe_unavailable_7342() {
+    assert!(should_prune(false, Some(false)), "dead and young is pruned");
+    assert!(!should_prune(false, Some(true)), "alive and young is kept");
+    assert!(
+        should_prune(true, Some(true)),
+        "alive but too old is pruned"
+    );
+    assert!(
+        should_prune(true, Some(false)),
+        "dead and too old is pruned"
+    );
+    assert!(
+        !should_prune(false, None),
+        "probe unavailable and young is kept"
+    );
+    assert!(
+        should_prune(true, None),
+        "probe unavailable but too old is pruned"
+    );
 }
 
 /// #7342 - the pid of a child that has already exited (dead, not reused yet).
@@ -617,9 +681,13 @@ fn stale_bin_copies_are_pruned_and_live_ones_kept_7342() {
         "stale dead-pid copy kept: {}",
         stale.display()
     );
-    assert!(
-        !stale_tmp.exists(),
-        "stale tmp kept: {}",
+    // N1: a young dead-pid copy goes only when the probe can run; with `kill`
+    // unavailable it is kept (fail closed), never the other way round.
+    let probe_runs = pid_probe(std::os::unix::process::parent_id()).is_some();
+    assert_eq!(
+        stale_tmp.exists(),
+        !probe_runs,
+        "stale tmp (probe runs: {probe_runs}): {}",
         stale_tmp.display()
     );
     assert!(live.exists(), "live pid copy pruned: {}", live.display());
@@ -634,7 +702,6 @@ fn stale_bin_copies_are_pruned_and_live_ones_kept_7342() {
         link.display()
     );
     assert!(copy.is_file(), "own copy missing: {}", copy.display());
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// #7342 (S1) - a symlink planted at the own `bin-<pid>` path is replaced, not
@@ -664,7 +731,6 @@ fn private_copy_never_writes_through_a_planted_symlink_7342() {
     let meta = std::fs::symlink_metadata(&own).expect("own meta");
     assert!(meta.file_type().is_file(), "own copy is not a regular file");
     assert_eq!(meta.permissions().mode() & 0o777, 0o755, "own copy mode");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 // ---------------------------------------------------------------------------
