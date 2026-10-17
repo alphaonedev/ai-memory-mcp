@@ -104,7 +104,7 @@ class CertSandbox(RecaptureBase):
 
 class PerCertBundle4829(CertSandbox):
     def test_each_cert_writes_its_own_bundle_and_fixtures(self):
-        for cert_id, (bundle_dir, header_tail, _rev22) in sorted(CERTS.items()):
+        for cert_id, (_bundle_dir, header_tail, _rev22) in sorted(CERTS.items()):
             with self.subTest(cert=cert_id):
                 done, run_dates = self.run_cert(cert_id)
                 self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
@@ -121,7 +121,7 @@ class PerCertBundle4829(CertSandbox):
                     ['2', '2', '1', '0'])
                 self.assertTrue((self.fixtures(cert_id) / 'peer-attestation.json').is_file())
                 bare = (bundle / 'posture-bare-env.out').read_text()
-                self.assertIn('<repo-root>/.local-runs/' + bundle_dir + '-fixtures/keys', bare)
+                self.assertIn(BASE.SANITIZED_FIXTURE_LABEL + '/keys', bare)
                 self.assertNotIn(str(self.root), bare)
                 self.assertFalse(list(bundle.glob('*.raw')))
 

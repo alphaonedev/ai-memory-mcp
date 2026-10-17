@@ -32,7 +32,9 @@ HEADER_RE = re.compile(
     r'^# posture-legs transcript — recorded exit codes '
     r'\((\d{4}-\d{2}-\d{2}) #3607 re-issue recapture \(22 checks\) @ ([0-9a-f]+)\)$')
 TEMPLATE_DATE = '2026-09-11'
-SANITIZED_FIXTURE_LABEL = '<repo-root>/.local-runs/cert-3607-fixtures'
+# #5039 part B (vote 6def5ab6, memory 94ac022e): the label is generic, not derived from the
+# fixture directory name, so the fixture directory can be renamed without changing bundle bytes.
+SANITIZED_FIXTURE_LABEL = '<repo-root>/.local-runs/<cert-fixtures>'
 
 # A stub `ai-memory`: `rules keygen` writes the operator key pair, `stats` is a
 # no-op, `doctor --posture ...` prints check rows that embed the repo and fixture
@@ -306,6 +308,51 @@ class HeaderSelfCheck5038(unittest.TestCase):
     def test_run_date_is_an_iso_utc_date(self):
         today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
         self.assertIn(self.module.utc_run_date(), {today})
+
+
+class FixtureLabel5039B(unittest.TestCase):
+    """#5039 part B: the fixture label is a generic constant; the swap is a pure function."""
+
+    def setUp(self):
+        self.module = load_script_module()
+
+    def test_the_label_is_the_pinned_generic_constant(self):
+        self.assertEqual(self.module.SANITIZED_FIXTURE_LABEL, SANITIZED_FIXTURE_LABEL)
+
+    def test_the_label_is_not_derived_from_any_cert_directory(self):
+        for cert_id in sorted(self.module.CERT_PROFILES):
+            with self.subTest(cert=cert_id):
+                run = self.module.CertRun(cert_id)
+                self.assertNotIn(run.fix.name, self.module.SANITIZED_FIXTURE_LABEL)
+                self.assertNotIn('cert-', self.module.SANITIZED_FIXTURE_LABEL)
+
+    def test_the_previous_label_of_a_cert_is_named_by_its_directory(self):
+        self.assertEqual(self.module.previous_fixture_label('cert-3607'),
+                         '<repo-root>/.local-runs/cert-3607-fixtures')
+
+    def test_sanitize_collapses_the_fixture_dir_before_the_repo_root(self):
+        run = self.module.CertRun('3607')
+        raw = (str(run.fix) + '/keys and ' + str(self.module.ROOT) + '/x\n').encode()
+        self.assertEqual(self.module.sanitize(raw, run),
+                         (SANITIZED_FIXTURE_LABEL + '/keys and <repo-root>/x\n').encode())
+
+    def test_relabel_swaps_every_occurrence_and_only_the_label(self):
+        data = (SANITIZED_FIXTURE_LABEL + '/keys\n' + SANITIZED_FIXTURE_LABEL
+                + '/p\n<repo-root>/z\n').encode()
+        old = self.module.previous_fixture_label('cert-3607')
+        swapped = self.module.relabel_fixture_label(data, SANITIZED_FIXTURE_LABEL, old)
+        self.assertEqual(swapped, (old + '/keys\n' + old + '/p\n<repo-root>/z\n').encode())
+        self.assertEqual(self.module.relabel_fixture_label(swapped, old, SANITIZED_FIXTURE_LABEL), data)
+
+    def test_new_output_equals_the_old_label_output_after_the_swap(self):
+        run = self.module.CertRun('3607')
+        raw = (str(run.fix) + '/keys HOME=x\n').encode()
+        old_label = self.module.previous_fixture_label('cert-3607')
+        old_style = (old_label + '/keys HOME=x\n').encode()
+        new_style = self.module.sanitize(raw, run)
+        self.assertNotEqual(new_style, old_style)
+        self.assertEqual(
+            self.module.relabel_fixture_label(new_style, SANITIZED_FIXTURE_LABEL, old_label), old_style)
 
 
 class SanitizerBytes5038(RecaptureBase):
