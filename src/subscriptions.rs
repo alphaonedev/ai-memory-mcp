@@ -33,6 +33,7 @@ use crate::models::field_names;
 
 // #3659 — delivery-audit bookkeeping evidence (counters, /metrics, /health).
 pub mod audit_status;
+pub mod scan_failure; // #7366 failed-lookup retry + DLQ record
 // #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
 mod unstarted;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
@@ -959,6 +960,23 @@ pub fn dispatch_event_with_details(
     db_path: &std::path::Path,
     details: Option<serde_json::Value>,
 ) {
+    dispatch_inner(
+        conn, event, memory_id, namespace, agent_id, db_path, details, false,
+    );
+}
+
+/// Body of the dispatcher; `retried` marks the off-lock retry worker (#7410).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_inner(
+    conn: &Connection,
+    event: &str,
+    memory_id: &str,
+    namespace: &str,
+    agent_id: Option<&str>,
+    db_path: &std::path::Path,
+    details: Option<serde_json::Value>,
+    retried: bool,
+) {
     // Dispatch path needs the global view (every tenant's subscriptions
     // for this event), so `None` here is correct — ownership scoping
     // would silently drop matching subscribers belonging to OTHER
@@ -976,11 +994,15 @@ pub fn dispatch_event_with_details(
     let subs = match list_by_event(conn, event) {
         Ok(s) => s,
         Err(e) => {
-            // Loud on list failure (Fable #3242 item 4). This table is
-            // not LIMIT-capped — the 1000-row ordered cliff +
-            // `record_dispatch_scan_truncation` is the pg SAL prefix
-            // scan (`dispatch_event_postgres`), not this path.
-            tracing::warn!("subscription list failed during dispatch: {e}");
+            // #7366/#7410: never drop the event; retries run off-lock.
+            let failure = scan_failure::ScanFailure {
+                event,
+                memory_id,
+                namespace,
+                agent_id,
+                details: details.as_ref(),
+            };
+            scan_failure::on_sqlite_lookup_failure(&e, retried, db_path, &failure);
             return;
         }
     };
