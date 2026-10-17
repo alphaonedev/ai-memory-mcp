@@ -289,6 +289,106 @@ fn post_store_event_falls_through_to_allow() {
 }
 
 // ---------------------------------------------------------------------------
+// #7342 - cross-process serialisation of the nested `cargo build`
+// ---------------------------------------------------------------------------
+
+/// #7342 - number of concurrent test processes the race test launches.
+const CONCURRENT_PROCESSES_7342: usize = 4;
+
+/// #7342 - how long each child polls the binary path after its own build, so a
+/// child that finished early keeps checking while the others still build.
+const CHILD_POLL_WINDOW_7342: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// #7342 - env marker that turns `concurrent_child_7342` from a no-op into the
+/// per-process workload.
+const CHILD_MARKER_ENV_7342: &str = "AI_MEMORY_TRANSCRIPT_EXTRACTOR_7342_CHILD";
+
+/// #7342 - the per-process workload. Under a plain `cargo test` run the marker
+/// is absent and this is a no-op; the parent test below re-executes this test
+/// binary with the marker set, once per child.
+#[test]
+fn concurrent_child_7342() {
+    if std::env::var_os(CHILD_MARKER_ENV_7342).is_none() {
+        return;
+    }
+    let bin = extractor_bin();
+    let envelope = json!({
+        "event": "post_store",
+        "payload": { "namespace": "transcript/agent", "content": "User: x\nAssistant: y" }
+    });
+    let deadline = std::time::Instant::now() + CHILD_POLL_WINDOW_7342;
+    let mut missing = 0_u64;
+    while std::time::Instant::now() < deadline {
+        if !bin.exists() {
+            missing += 1;
+        }
+    }
+    assert_eq!(
+        missing,
+        0,
+        "extractor binary missing at {} on {missing} polls (#7342)",
+        bin.display()
+    );
+    let decision = run_once(bin, &envelope);
+    assert_eq!(decision["action"], "allow");
+}
+
+/// #7342 - `cargo nextest` runs every test in its OWN process, so the
+/// in-process `OnceLock` in `extractor_bin()` serialises nothing: N processes
+/// run the nested `cargo build` against one target dir, and cargo re-uplifts
+/// `debug/transcript-extractor` (remove, then hardlink) on each build, so a
+/// sibling process can see the binary missing or hit ETXTBSY/ENOENT on spawn.
+/// This test launches `CONCURRENT_PROCESSES_7342` such processes at once and
+/// fails if any of them observed a missing or unspawnable binary.
+#[test]
+fn concurrent_builds_never_lose_the_uplifted_binary_7342() {
+    if std::env::var_os(CHILD_MARKER_ENV_7342).is_some() {
+        return;
+    }
+    let exe = std::env::current_exe().expect("current_exe");
+    let capture_root = std::env::current_dir()
+        .expect("cwd")
+        .join(".local-runs")
+        .join("transcript-extractor");
+    std::fs::create_dir_all(&capture_root).expect("create capture root");
+    let mut children = Vec::new();
+    for i in 0..CONCURRENT_PROCESSES_7342 {
+        let log_path = capture_root.join(format!("race-7342-{}-{i}.log", std::process::id()));
+        let log = std::fs::File::create(&log_path).expect("child log");
+        let log_err = log.try_clone().expect("clone child log");
+        let child = Command::new(&exe)
+            .args([
+                "--exact",
+                "concurrent_child_7342",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD_MARKER_ENV_7342, "1")
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_err))
+            .spawn()
+            .expect("spawn child test process");
+        children.push((child, log_path));
+    }
+    let mut failures = Vec::new();
+    for (mut child, log_path) in children {
+        let status = child.wait().expect("wait child");
+        let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        if status.success() {
+            let _ = std::fs::remove_file(&log_path);
+        } else {
+            let tail: Vec<&str> = text.lines().rev().take(12).collect();
+            failures.push(format!("{status}: {tail:?}"));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {CONCURRENT_PROCESSES_7342} processes lost the extractor binary (#7342): {failures:#?}",
+        failures.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Opt-in resolver — exercises the config knob the hook chain consults
 // before it ever fires the extractor.
 // ---------------------------------------------------------------------------
