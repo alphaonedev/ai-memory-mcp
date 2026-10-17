@@ -497,8 +497,22 @@ class CspSourceList7313(unittest.TestCase):
 
 
 class PublicSnapshotHygiene7518(unittest.TestCase):
-    """#7518: nothing under public/ (deployed to the public dashboard) names an internal node or path,
-    and the generators that write state files scrub them and refuse to write what is left."""
+    """#7518/#7547: nothing under public/ (deployed to the public dashboard) names an internal node or path,
+    and the generators that write state files scrub them and refuse to write what is left. No internal
+    hostname is committed: host ids are scrubbed by SHAPE, plus this machine's name and an untracked local list."""
+
+    FAKE_NODE = "zz-fake-node-7547"
+
+    def setUp(self):
+        SCRATCH.mkdir(exist_ok=True)
+        self._tmp = tempfile.TemporaryDirectory(dir=str(SCRATCH))
+        self.addCleanup(self._tmp.cleanup)
+        self.names_file = Path(self._tmp.name) / "hostnames.local"
+        self.names_file.write_text("# fake node list for the test\n%s\n\n" % self.FAKE_NODE, encoding="utf-8")
+        patcher = mock.patch.dict(os.environ, {"CF_DASHBOARD_HOSTNAMES_FILE": str(self.names_file)})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.node = self.FAKE_NODE
 
     def test_no_public_json_names_an_internal_host_or_path(self):
         hostscrub = _load("hostscrub_7518_t", "hostscrub.py")
@@ -507,7 +521,7 @@ class PublicSnapshotHygiene7518(unittest.TestCase):
 
     def test_scrub_replaces_hostnames_and_paths_in_nested_values(self):
         hostscrub = _load("hostscrub_7518_s", "hostscrub.py")
-        node = hostscrub.INTERNAL_HOSTNAMES[0]
+        node = self.node
         record = {"note": '{"agent_id": "host:%s", "from": "ai:x@%s"}' % (node, node.upper()),
                   "run_dir": "/home/someone/run-1", "deep": [{"p": "/mnt/disk1/x"}, "/ai-" + "scratch/y", 3, None]}
         clean = hostscrub.scrub(record)
@@ -517,10 +531,60 @@ class PublicSnapshotHygiene7518(unittest.TestCase):
         self.assertIn("host:" + hostscrub.REDACTED, clean["note"])
         self.assertEqual(clean["deep"][2:], [3, None])
 
+    def test_any_host_id_shape_is_scrubbed_even_for_a_node_nobody_listed(self):
+        hostscrub = _load("hostscrub_7547_shape", "hostscrub.py")
+        text = json.dumps({"a": "host:build-box-7", "b": "ai:agent-1@build-box-7", "host:other-box_2": 1})
+        self.assertNotEqual(hostscrub.find_leaks(text), [])
+        clean = hostscrub.dump_clean({"a": "host:build-box-7", "b": "ai:agent-1@build-box-7", "host:other-box_2": 1})
+        self.assertNotIn("build-box-7", clean)
+        self.assertNotIn("other-box", clean)
+        self.assertIn("host:node", clean)
+        self.assertIn("ai:agent-1@node", clean)
+
+    def test_the_public_placeholder_shapes_are_not_leaks(self):
+        hostscrub = _load("hostscrub_7547_ok", "hostscrub.py")
+        for ok in ("host:node", "ai:fable-validator@node", "4,602 ops/s @256", "email me at x@y"):
+            self.assertEqual(hostscrub.find_leaks(ok), [], ok)
+
+    def test_internal_dns_suffix_shapes_are_scrubbed(self):
+        hostscrub = _load("hostscrub_7547_dns", "hostscrub.py")
+        for shape in ("buildbox.local", "buildbox.lan", "buildbox.internal", "buildbox.home.arpa", "buildbox.corp"):
+            out = hostscrub.dump_clean({"n": "reach " + shape + " now"})
+            self.assertNotIn("buildbox", out, shape)
+
+    def test_this_machines_hostname_is_scrubbed(self):
+        hostscrub = _load("hostscrub_7547_rt", "hostscrub.py")
+        with mock.patch.object(hostscrub.socket, "gethostname", return_value="zz-runtime-7547"):
+            out = hostscrub.dump_clean({"n": "running on zz-runtime-7547_1 and ZZ-RUNTIME-7547.example"})
+            self.assertNotIn("zz-runtime-7547", out.lower())
+
+    def test_names_in_the_local_untracked_file_are_scrubbed_and_comments_ignored(self):
+        hostscrub = _load("hostscrub_7547_file", "hostscrub.py")
+        out = hostscrub.dump_clean({"n": "plain " + self.node + " and a for-test comment"})
+        self.assertNotIn(self.node, out)
+        self.assertIn("for-test", out)
+
+    def test_a_configured_but_unreadable_names_file_fails_closed(self):
+        hostscrub = _load("hostscrub_7547_closed", "hostscrub.py")
+        missing = Path(self._tmp.name) / "no-such-file"
+        with mock.patch.dict(os.environ, {"CF_DASHBOARD_HOSTNAMES_FILE": str(missing)}):
+            with self.assertRaises(hostscrub.LeakError):
+                hostscrub.dump_clean({"n": "anything"})
+            with self.assertRaises(hostscrub.LeakError):
+                hostscrub.find_leaks("anything")
+
+    def test_no_internal_hostname_is_committed_in_hostscrub(self):
+        source = (DASH / "hostscrub.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        for node in tree.body:
+            targets = [t.id for t in getattr(node, "targets", []) if isinstance(t, ast.Name)]
+            self.assertNotIn("INTERNAL_HOSTNAMES", targets, "a committed hostname list")
+        ignore = (DASH / ".gitignore").read_text(encoding="utf-8").split()
+        self.assertIn("hostnames.local", ignore)
+
     def test_mcp_tools_state_generator_scrubs_before_writing(self):
         hostscrub = _load("hostscrub_7518_g", "hostscrub.py")
-        node = hostscrub.INTERNAL_HOSTNAMES[0]
-        SCRATCH.mkdir(exist_ok=True)
+        node = self.node
         with tempfile.TemporaryDirectory(dir=str(SCRATCH)) as tmp:
             run_dir = Path(tmp) / ("run-" + node)
             run_dir.mkdir()
@@ -539,10 +603,8 @@ class PublicSnapshotHygiene7518(unittest.TestCase):
             self.assertEqual(json.loads(text)["total"], 2)
 
     def test_push_state_scrubs_the_live_state_before_writing(self):
-        hostscrub = _load("hostscrub_7518_p", "hostscrub.py")
-        node = hostscrub.INTERNAL_HOSTNAMES[0]
+        node = self.node
         mod = _load("push_state_7518", "push-state.py")
-        SCRATCH.mkdir(exist_ok=True)
         with tempfile.TemporaryDirectory(dir=str(SCRATCH)) as tmp:
             src = Path(tmp) / "in.json"
             src.write_text(json.dumps({"agents": [{"node": node}]}))
