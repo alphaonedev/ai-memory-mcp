@@ -16814,6 +16814,8 @@ mod tests {
     /// archive — gc handler not-dry-run path runs db::gc.
     #[test]
     fn chunkc_archive_gc_real_run_invokes_db_gc() {
+        // #7321: serialise with the tests that latch the process-global audit gate.
+        let _sink = crate::audit::sink_test_lock();
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         // Seed an expired memory so gc has work to do.
         let past = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
@@ -16868,6 +16870,8 @@ mod tests {
     /// Body of `chunkc_archive_gc_dry_run_returns_count`, callable from the
     /// #7321 isolation test on another thread.
     fn chunkc_archive_gc_dry_run_body() {
+        // #7321: serialise with the tests that latch the process-global audit gate.
+        let _sink = crate::audit::sink_test_lock();
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let past = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
         let mem = Memory {
