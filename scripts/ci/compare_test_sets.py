@@ -16,7 +16,8 @@ failed in src/reporter/events.rs; snapshot ``status_line_all_variants``), whatev
 The marker binds ONLY to the immediately preceding ``TRY n PASS`` line (any other status line in between clears
 the binding; non-status lines such as child output do not) and is matched at the END of the cleaned line, so a
 stderr fragment glued in front of it does not hide it. A marker with no such predecessor is refused (exit 2, naming
-the line) rather than guessed.
+the line) rather than guessed, and so are the two shapes nextest never prints: a marker on the same line as a status
+word, and text after the marker on its line.
 ``SETUP ...`` script lines and ``TRY n TRMNTG`` / ``TRY n START`` markers are not results.
 
 Both sides are reduced to ``{(binary, test name): "pass" | "fail"}``. Ignored
@@ -158,7 +159,7 @@ _NEXTEST_SHAPE_RE = re.compile(
 # ``StatusLineKind::Intermediate`` + ``FlakyResult::Fail``, format ``"{:>12} test configured to {} if flaky"``; the
 # failed count is in src/reporter/events.rs; displayer snapshot status_line_all_variants). Without the marker rule a final-status-level of ``none`` would read it as a pass (#7298 S4).
 # The marker binds only to the immediately preceding ``TRY n PASS`` line and is matched at the end of the cleaned
-# line (#7298 R7-1).
+# line (#7298 R7-1); a marker on the same line as a status word, or with text after it, exits 2 (#7298 R8-1).
 _FLAKY_FAIL_MARKER = '- test configured to fail if flaky'
 _NEXTEST_TRY_RE = re.compile(r'TRY\s+\d+\s*$')
 _TRY_PREFIX_RE = re.compile(r'^TRY\s+\d+\s+')
@@ -343,7 +344,13 @@ def scan_nextest_log(text: str) -> Scan:
             total += int(summary.group('run'))
             total_lines += 1
             continue
+        if _FLAKY_FAIL_MARKER in line and not line.endswith(_FLAKY_FAIL_MARKER):
+            raise ParseError('nextest log: line %d: text after the marker %r on the same line (nextest ends the line '
+                             'with it): %r' % (lineno, _FLAKY_FAIL_MARKER, line[:120]))
         if line.endswith(_FLAKY_FAIL_MARKER):
+            if _NEXTEST_RE.search(line[:-len(_FLAKY_FAIL_MARKER)]):
+                raise ParseError('nextest log: line %d: a status word on the same line as the marker %r (nextest '
+                                 'prints the marker on its own line): %r' % (lineno, _FLAKY_FAIL_MARKER, line[:120]))
             if last_try_pass is None:
                 raise ParseError('nextest log: line %d: %r has no immediately preceding "TRY n PASS" result line '
                                  '(flaky-result = "fail" prints it right after the passing attempt)'
@@ -492,8 +499,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--cargo-log', nargs='+', required=True, metavar='FILE', help='baseline: cargo test log(s)')
     parser.add_argument('--nextest-log', nargs='+', default=[], metavar='FILE', help='candidate: nextest output log(s); a TRY n PASS immediately preceding "- test configured to '
                         'fail if flaky" (flaky-result = fail) counts as a failure (the marker binds only to that line, is '
-                        'matched at the end of the line, and a marker with no such predecessor exits 2), SETUP script '
-                        'lines are not tests')
+                        'matched at the end of the line, and a marker with no such predecessor exits 2, as does a marker on the '
+                        'same line as a status word and text after the marker), SETUP script lines are not tests')
     parser.add_argument('--nextest-junit', nargs='+', default=[], metavar='FILE', help='candidate: nextest JUnit XML')
     parser.add_argument('--max-list', type=int, default=DEFAULT_MAX_LIST, help='rows printed per difference list')
     return parser

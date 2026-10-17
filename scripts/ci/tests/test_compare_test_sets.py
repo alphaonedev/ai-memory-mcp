@@ -687,12 +687,35 @@ class NextestRetryAndSetupWords(unittest.TestCase):
             cts.scan_nextest_log(text)
         self.assertIn('line 1', str(ctx.exception))
 
+    def test_a_marker_sharing_a_line_with_a_status_line_is_a_parse_error_7298(self):
+        # R8-1 (N3a): nextest prints the marker on its own line; a status word in front of it on the same physical
+        # line must not be swallowed as a marker bound to the OTHER test's `TRY n PASS` above (was a::f=pass, b::g=fail).
+        text = ('  TRY 2 PASS [   1.000s] (  1/2) nx5 b::g\n'
+                '  TRY 2 PASS [   1.000s] (  2/2) nx5 a::f  - test configured to fail if flaky\n'
+                '       FLAKY 2/3 [   1.000s] nx5 b::g\n'
+                '       FLAKY 2/3 [   1.000s] nx5 a::f\n')
+        with self.assertRaises(cts.ParseError) as ctx:
+            cts.scan_nextest_log(text)
+        self.assertIn('line 2', str(ctx.exception))
+
+    def test_text_glued_behind_the_marker_is_a_parse_error_7298(self):
+        # R8-1 (N3b): the marker must END its line; text behind it is a shape nextest never prints (was a::f=pass).
+        text = ('  TRY 2 PASS [   1.000s] (  1/1) nx5 a::f\n'
+                '           - test configured to fail if flakyglued stdout\n'
+                '       FLAKY 2/3 [   1.000s] nx5 a::f\n')
+        with self.assertRaises(cts.ParseError) as ctx:
+            cts.scan_nextest_log(text)
+        self.assertIn('line 2', str(ctx.exception))
+
     def test_help_text_states_the_flaky_marker_and_status_table_rules_7298(self):
         self.assertIn('configured to fail if flaky', cts.__doc__)
         self.assertIn('SETUP', cts.__doc__)
         self.assertIn('configured to fail if flaky', ' '.join(cts.build_parser().format_help().split()))
         self.assertIn('immediately preceding', cts.__doc__)
         self.assertIn('immediately preceding', ' '.join(cts.build_parser().format_help().split()))
+        self.assertIn('same line as a status', ' '.join(cts.build_parser().format_help().split()))
+        self.assertIn('text after the marker', ' '.join(cts.build_parser().format_help().split()))
+        self.assertIn('same line as a status', cts.__doc__)
 
 
 class ParseJunit(unittest.TestCase):
