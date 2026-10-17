@@ -8,6 +8,7 @@ F3  step 3 domain attach: only the Cloudflare "already exists" error is success.
 F7  the wrangler subprocess has a timeout; a timeout exits non-zero.
 Also: deploy.py --help exits 0 and never uses shell=True. No network: api() and subprocess are mocked.
 """
+import ast
 import contextlib
 import importlib.util
 import io
@@ -608,6 +609,55 @@ class DeployCli7313(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         for name in ("deploy.py", "push-state.py", "cfcommon.py"):
             self.assertNotIn(NO_SHELL, (DASH / name).read_text())
+
+
+SELF_FILE = Path(__file__).resolve()
+HOME_ENV_LITERAL = re.compile("~/" + r"\." + "env")  # built from parts so this file does not hold the literal itself
+SENSITIVE_NAME = re.compile(r"secret|passw|token|credential", re.IGNORECASE)
+FILE_WRITERS = frozenset(("write_text", "write_bytes", "write"))
+
+
+def _pr_python_sources():
+    """Every Python file this PR adds, as (path, text)."""
+    paths = sorted(DASH.glob("*.py")) + [SELF_FILE, SELF_FILE.parent / "cf_origin_7313.py", MCP_PRODUCER]
+    paths += sorted(FIXTURES.glob("*.py"))
+    return [(p, p.read_text(encoding="utf-8")) for p in paths]
+
+
+class SourceHygiene7313(unittest.TestCase):
+    """#7549 (CodeQL py/import-and-import-from), #7553 (CodeQL clear-text storage), #7556 (no literal home env
+    path, no token-line layout in a docstring)."""
+
+    def test_7549_no_module_is_imported_with_import_and_import_from(self):
+        for path, text in _pr_python_sources():
+            tree = ast.parse(text)
+            plain = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+            named = {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom) and n.module}
+            self.assertEqual(plain & named, set(), "%s imports a module both ways" % path.name)
+
+    def test_7553_no_secret_named_value_is_written_to_a_file(self):
+        for path, text in _pr_python_sources():
+            for call in (n for n in ast.walk(ast.parse(text)) if isinstance(n, ast.Call)):
+                func = call.func
+                if not (isinstance(func, ast.Attribute) and func.attr in FILE_WRITERS):
+                    continue
+                names = [s.id for arg in call.args for s in ast.walk(arg) if isinstance(s, ast.Name)]
+                bad = [n for n in names if SENSITIVE_NAME.search(n)]
+                self.assertEqual(bad, [], "%s:%d writes %s to a file" % (path.name, call.lineno, bad))
+
+    def test_7553_the_fake_probe_file_is_owner_only(self):
+        text = SELF_FILE.read_text(encoding="utf-8")
+        self.assertRegex(text, r"os\.open\([^)]*0o600", "the unreadable-env probe must create its file owner-only")
+
+    def test_7556_no_literal_home_env_path_in_code_or_docstrings(self):
+        for path, text in _pr_python_sources():
+            self.assertIsNone(HOME_ENV_LITERAL.search(text), "%s names the home env file literally" % path.name)
+
+    def test_7556_docstrings_do_not_describe_the_token_lines_of_the_env_file(self):
+        for name in ("push-state.py", "deploy.py", "cfcommon.py"):
+            text = (DASH / name).read_text(encoding="utf-8")
+            self.assertIsNone(re.search(r"(?i)\b(two|second|2)\b[^.\n]{0,40}\btoken", text), name)
+            self.assertNotIn("Workers AI", text, name)
 
 
 if __name__ == "__main__":
