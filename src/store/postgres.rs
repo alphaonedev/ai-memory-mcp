@@ -130,6 +130,8 @@ mod lifecycle_tx_3152;
 mod forensic_outage_4199;
 // v1.0.0 #4209/#4210 — one ascending-id lock order for multi-row `memories` locks.
 mod lock_order_4209;
+// #7094 - a permanent statement failure maps to `StoreError::Backend` like sqlite.
+mod permanent_err_7094;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -27835,7 +27837,14 @@ impl MemoryStore for PostgresStore {
             .await;
             match attempt {
                 Ok(v) => break v,
-                Err(e) => retry.consider(e).await?,
+                // #7094 - a permanent statement failure (a rejected attestation
+                // append, a constraint, a trigger fault) is `Backend`, the sqlite
+                // variant; a transient abort stays retryable.
+                Err(e) => {
+                    retry
+                        .consider(permanent_err_7094::permanent_as_backend(e))
+                        .await?
+                }
             }
         };
 
