@@ -430,7 +430,8 @@ class FakePg:
     Every statement is logged in ``log``.
     """
 
-    def __init__(self, existing=None, fail=None, lost=()):
+    def __init__(self, existing=None, fail=None, lost=(), lost_status=2):
+        self.lost_status = lost_status
         self.dbs = dict(existing or {})
         self.fail = dict(fail or {})
         self.lost = tuple(lost)
@@ -460,7 +461,7 @@ class FakePg:
                 return Result(1, '', 'ERROR:  database "%s" is being accessed by other users' % name)
             self.dbs.pop(name, None)
         if sql.startswith(self.lost):
-            return Result(2, '', 'psql: error: connection to server was lost')
+            return Result(self.lost_status, '', 'psql: error: connection to server was lost')
         return Result()
 
     def touched(self, name):
@@ -575,6 +576,21 @@ class TemplateOwnership(unittest.TestCase):
         self.assertIn('teardown', text)
         self.assertIn(self.DB, text)
         self.assertEqual(ctx.exception.returncode, 2)
+
+    def test_signal_killed_or_unexpected_psql_status_is_an_unknown_outcome_7400(self):
+        for status in (-9, -15, 4):
+            with self.subTest(status=status):
+                pg = FakePg(lost=('CREATE DATABASE',), lost_status=status)
+                with self.assertRaises(pib.WrapperError) as ctx:
+                    self.run_setup(pg)
+                text = str(ctx.exception)
+                self.assertFalse([s for s in pg.log if s.startswith(('ALTER', 'DROP', 'CREATE EXT'))])
+                self.assertNotIn('nothing was created', text)
+                self.assertIn('outcome is unknown', text)
+                self.assertIn('may exist', text)
+                self.assertIn(TPL, text)
+                self.assertIn("SELECT 1 FROM pg_database WHERE datname = '%s'" % TPL, text)
+                self.assertIn('teardown', text)
 
     def test_template_limit_counts_utf8_bytes_not_characters_7373(self):
         fits = 'é' * 29 + 'x'      # 29*2 + 1 = 59 bytes, 30 characters
