@@ -641,6 +641,32 @@ class NextestRetryAndSetupWords(unittest.TestCase):
         self.assertEqual(scan.spliced, 0)
 
 
+    def test_a_try_n_pass_followed_by_the_flaky_fail_marker_is_a_failure_7298(self):
+        # flaky-result = "fail": displayer prints `TRY n PASS` then `- test configured to fail if flaky`
+        # (snapshot status_line_all_variants, "flaky fail"); events.rs fail_message counts the test as failed.
+        text = ('  TRY 1 FAIL [   0.010s] (───) ai-memory a::flaky\n'
+                '  TRY 2 PASS [   1.000s] (  8/100) ai-memory a::flaky\n'
+                '           - test configured to fail if flaky\n')
+        scan = cts.scan_nextest_log(text)
+        self.assertEqual(scan.outcomes, {('lib', 'a::flaky'): cts.FAIL})
+
+    def test_the_flaky_fail_marker_beats_a_later_final_pass_line_7298(self):
+        text = ('  TRY 2 PASS [   1.000s] (  8/100) ai-memory a::flaky\n'
+                '           - test configured to fail if flaky\n'
+                '  FLAKY 2/2 [   1.000s] ai-memory a::flaky\n'
+                '        PASS [   0.010s] ai-memory a::other\n')
+        scan = cts.scan_nextest_log(text)
+        self.assertEqual(scan.outcomes, {('lib', 'a::flaky'): cts.FAIL, ('lib', 'a::other'): cts.PASS})
+
+    def test_a_plain_flaky_pass_without_the_marker_stays_a_pass_7298(self):
+        scan = cts.scan_nextest_log('  TRY 2 PASS [   1.000s] ai-memory a::flaky\n')
+        self.assertEqual(scan.outcomes, {('lib', 'a::flaky'): cts.PASS})
+
+    def test_help_text_states_the_flaky_marker_and_status_table_rules_7298(self):
+        self.assertIn('configured to fail if flaky', cts.__doc__)
+        self.assertIn('SETUP', cts.__doc__)
+        self.assertIn('configured to fail if flaky', cts.build_parser().format_help())
+
 
 class ParseJunit(unittest.TestCase):
     def test_junit_matches_the_same_keys_and_skips_skipped_cases(self):

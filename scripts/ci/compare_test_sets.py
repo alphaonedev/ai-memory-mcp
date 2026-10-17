@@ -9,6 +9,10 @@ header). The candidate is a nextest run: its status lines
 name from nextest 0.9.146's status table and an unknown word exits 2. A retried test is its final
 non-``TRY`` line (``PASS``, ``FAIL``, ``FLAKY n/m``, ...); a test that fails every attempt has only
 ``TRY n FAIL`` lines, so a test with only ``TRY`` lines is what its LAST attempt said.
+A test nextest prints as ``TRY n PASS`` followed by the line ``- test configured to fail if flaky``
+(``flaky-result = "fail"``) is a FAILURE: nextest-runner counts it as failed (config/elements/retry_policy.rs
+:120-130 ``fail_message``; snapshot ``status_line_all_variants``), whatever its last status word says.
+``SETUP ...`` script lines and ``TRY n TRMNTG`` / ``TRY n START`` markers are not results.
 
 Both sides are reduced to ``{(binary, test name): "pass" | "fail"}``. Ignored
 and skipped tests are not executed tests and are left out of both sides; doc
@@ -144,6 +148,10 @@ _NEXTEST_SHAPE_RE = re.compile(
 # (PASS / FAIL / FLAKY n/m / LEAK ...); nextest 0.9.146 prints the final line of a test that fails every attempt as
 # ``TRY n FAIL`` with no plain FAIL line (displayer/imp.rs:1810-1826), so a test with only TRY lines is what its
 # LAST attempt said (#7298 R2).
+# With ``flaky-result = "fail"`` nextest prints ``TRY n PASS`` and, on the next line, this marker, and counts the test
+# as failed (nextest-runner 0.124.0 config/elements/retry_policy.rs:120-130 ``fail_message``; displayer snapshot
+# status_line_all_variants). Without the marker rule a final-status-level of ``none`` would read it as a pass (#7298 S4).
+_FLAKY_FAIL_MARKER = '- test configured to fail if flaky'
 _NEXTEST_TRY_RE = re.compile(r'TRY\s+\d+\s*$')
 _TRY_PREFIX_RE = re.compile(r'^TRY\s+\d+\s+')
 _NUMBERS_RE = re.compile(r'\d+/\d+')
@@ -315,6 +323,8 @@ def scan_nextest_log(text: str) -> Scan:
     """``parse_nextest_log`` plus the count of status lines that carried a spliced prefix."""
     out: Outcomes = {}
     attempts: Outcomes = {}  # the last ``TRY n <status>`` line of each test (#7298 R2)
+    flaky_fail = set()  # tests nextest says are configured to fail if flaky (#7298 S4)
+    last_key = None
     spliced = total = total_lines = 0
     for raw in text.splitlines():
         line = _clean(raw)
@@ -324,6 +334,9 @@ def scan_nextest_log(text: str) -> Scan:
         if summary:
             total += int(summary.group('run'))
             total_lines += 1
+            continue
+        if line.strip() == _FLAKY_FAIL_MARKER and last_key is not None:
+            flaky_fail.add(last_key)  # the PASS attempt above it is a failure by configuration
             continue
         shape = _NEXTEST_SHAPE_RE.match(line)
         if shape and shape.group('st').startswith('SETUP '):
@@ -345,11 +358,14 @@ def scan_nextest_log(text: str) -> Scan:
         if kind == _SKIP:
             continue  # a marker or a skipped test: not a result
         key = (_nextest_binary(found.group('bin')), found.group('name'))
+        last_key = key
         if attempt:
             attempts[key] = kind  # last attempt wins; never counted as a spliced line
             continue
         spliced += _spliced(line, found)
         _merge(out, key, kind)
+    for key in flaky_fail:
+        out[key] = FAIL
     for key, kind in attempts.items():
         out.setdefault(key, kind)  # no final PASS/FAIL/FLAKY line: the test is what its last attempt said
     if not out:
@@ -458,7 +474,8 @@ def _load(scanner, paths: List[str]) -> Scan:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     parser.add_argument('--cargo-log', nargs='+', required=True, metavar='FILE', help='baseline: cargo test log(s)')
-    parser.add_argument('--nextest-log', nargs='+', default=[], metavar='FILE', help='candidate: nextest output log(s)')
+    parser.add_argument('--nextest-log', nargs='+', default=[], metavar='FILE', help='candidate: nextest output log(s); a TRY n PASS followed by "- test configured to fail if '
+                        'flaky" (flaky-result = fail) counts as a failure, SETUP script lines are not tests')
     parser.add_argument('--nextest-junit', nargs='+', default=[], metavar='FILE', help='candidate: nextest JUnit XML')
     parser.add_argument('--max-list', type=int, default=DEFAULT_MAX_LIST, help='rows printed per difference list')
     return parser
