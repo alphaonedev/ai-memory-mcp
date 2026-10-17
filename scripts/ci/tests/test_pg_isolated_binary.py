@@ -756,6 +756,111 @@ class TemplateOwnership(unittest.TestCase):
                 pib.psql(BASE, sql, tuples=True)
                 self.assertEqual(rec.calls[0][0][-1], sql)
 
+    def test_psql_guard_lexer_table_7550_7551(self):
+        """The guard tokenises the SQL: quoting forms hide text, comments vanish, escapes decode."""
+        refused = [
+            # comments between the words, in every spelling
+            'RESET/**/ALL', 'RESET /* x */ ALL', 'DISCARD/**/ALL', 'DISCARD -- c\nALL', 'RESET /* a /* nested */ b */ ALL',
+            'SET/**/statement_timeout = 0', 'SET statement_timeout/**/TO 0', 'SET lock_timeout = 0',
+            'SET LOCAL statement_timeout = 0', 'SET SESSION lock_timeout = 0',
+            # quoted and Unicode-escaped names
+            'SET "statement_timeout" = 0', 'SET "Statement_Timeout" = 0', 'SET "lock_timeout" TO 0',
+            'SET U&"statement\\005ftimeout" = 0', 'SET U&"lock!005ftimeout" UESCAPE \'!\' TO 0',
+            'SET U&"statement\\+00005ftimeout" = 0', 'RESET U&"lock\\005ftimeout"',
+            'SELECT U&"set\\005fconfig"(\'statement_timeout\', \'0\', false)',
+            'SELECT "set_config"(\'a\', \'0\', false)', 'SELECT pg_catalog."SET_CONFIG"(\'a\', \'0\', false)',
+            'SELECT pg_catalog . set_config(\'a\', \'0\', false)', 'SELECT SET_CONFIG(\'a\', \'0\', false)',
+            "SELECT set_config('a' || 'b', '0', false)",
+            'ALTER ROLE x SET statement_timeout = 0', 'ALTER DATABASE d SET lock_timeout TO 0',
+            # session-level escapes
+            'RESET ALL', 'reset\n\tall', 'DISCARD ALL', 'discard   all',
+            'SET SESSION AUTHORIZATION postgres', 'SET LOCAL SESSION AUTHORIZATION x', 'SET/**/SESSION/**/AUTHORIZATION x',
+            'RESET SESSION AUTHORIZATION', 'SET ROLE postgres', 'SET LOCAL ROLE x', 'SET SESSION ROLE x', 'RESET ROLE',
+            'SET "role" TO x',
+            # more than one statement, whatever hides the second
+            'SELECT 1; SELECT 2', 'SELECT 1;;', 'SELECT 1; -- c\nSELECT 2', 'SELECT 1 /* a */; /* b */ SELECT 2',
+            "SELECT 'a'; SELECT 2", 'SELECT $q$a$q$; SELECT 2', 'SELECT 1 AS "x"; SELECT 2',
+            ";SELECT 1", "SELECT 'a;b'; SELECT 2",
+            # the dynamic-code carrier cannot be inspected
+            'DO $d$ BEGIN PERFORM 1; END $d$', "do language plpgsql 'begin null; end'",
+            # a payload after a quote the lexer must close exactly where the server does
+            "SELECT E'a\\'; SELECT 2'; SELECT 3", "SELECT E'\\\\'; SET statement_timeout = 0",
+            "SELECT 'a'; SET statement_timeout = 0", "SELECT $a$x$a$; SET lock_timeout=0",
+            # psql meta commands, and anything the lexer cannot tokenise (fail closed)
+            '\\set x 1', "SELECT 'unterminated", 'SELECT "unterminated', 'SELECT 1 /* unterminated',
+            'SELECT 1 /* a /* b */', 'SELECT $q$ unterminated', "SELECT E'unterminated\\'", 'SELECT U&"bad\\zz"',
+            'SELECT U&"bad\\00"', 'SELECT U&"x" UESCAPE \'\'', "SELECT U&'bad\\zz'",
+            # a backslash in a plain literal: refused when the server could read it differently (stdstrings off)
+            "SELECT 'a\\'; SELECT 2'; SELECT 3",
+        ]
+        allowed = [
+            'SELECT 1', 'SELECT 1;', 'SELECT 1 ;  ', '  SELECT 1 ; -- trailing\n', 'SELECT 1; /* trailing */',
+            "SELECT 'statement_timeout'", 'SET search_path = public', 'CREATE DATABASE x',
+            # a ; hidden in each quoting form
+            "SELECT 'a;b'", "SELECT E'a;b'", "SELECT e'a\\';b'", "SELECT 'it''s;'", 'SELECT 1 AS "x;y"', 'SELECT 1 AS "x"";y"',
+            'SELECT $q$a;b$q$', 'SELECT $$a;b$$', 'SELECT $t1$a;$t2$ b;$t1$', "SELECT U&'a;b'", "SELECT U&'\\0041;'",
+            'SELECT 1 AS U&"x\\003by"', 'SELECT 1 AS U&"x!003by" UESCAPE \'!\'',
+            'SELECT 1 -- a;b\n', 'SELECT 1 /* a;b */', 'SELECT 1 /* a /* ; */ ; */', 'SELECT 1; -- ;\n',
+            # text that only looks like an override
+            "SELECT 'RESET ALL'", "SELECT 'DISCARD ALL'", "SELECT 'set_config'", "SELECT 'SET ROLE x'",
+            "SELECT $q$SET statement_timeout = 0$q$", 'SELECT 1 AS "reset all"', 'SELECT 1 /* RESET ALL */',
+            'SELECT 1 -- SET statement_timeout\n', "SELECT E'SET statement_timeout'", "SELECT U&'set_config'",
+            'SELECT 1 AS reset_all', 'SELECT 1 AS discard_all', 'SELECT 1 AS my_set_config', 'SELECT 1 AS "role"',
+            "SELECT 'a\\' || 'b'", 'SELECT $1, $2', 'SELECT 1 AS a$b$c',
+        ]
+        for sql in refused:
+            rec = Recorder(lambda argv, kw: Result(0, '', ''))
+            with self.subTest(refused=sql), unittest.mock.patch.object(pib.subprocess, 'run', rec):
+                with self.assertRaises(pib.WrapperError) as ctx:
+                    pib.psql(BASE, sql)
+                self.assertEqual(rec.calls, [], 'psql was not started')
+                self.assertIn('refus', str(ctx.exception))
+        for sql in allowed:
+            rec = Recorder(lambda argv, kw: Result(0, 'ok', ''))
+            with self.subTest(allowed=sql), unittest.mock.patch.object(pib.subprocess, 'run', rec):
+                pib.psql(BASE, sql, tuples=True)
+                self.assertEqual(rec.calls[0][0][-1], sql)
+
+    def test_role_cell_skips_without_createrole_unless_the_live_flag_is_set_7552(self):
+        cell = LiveEndToEnd('test_role_and_role_in_database_defaults_are_kept_7522')
+        env = {k: v for k, v in os.environ.items() if k != LIVE_REQUIRED_VAR}
+        with unittest.mock.patch.object(pib, 'psql', lambda *a, **k: 'f\n'), \
+                unittest.mock.patch.dict(os.environ, dict(env, **{pib.URL_VAR: BASE}), clear=True):
+            with self.assertRaises(unittest.SkipTest):
+                cell.test_role_and_role_in_database_defaults_are_kept_7522()
+            for value in ('0', ''):
+                with unittest.mock.patch.dict(os.environ, {LIVE_REQUIRED_VAR: value}):
+                    with self.assertRaises(unittest.SkipTest):
+                        cell.test_role_and_role_in_database_defaults_are_kept_7522()
+            with unittest.mock.patch.dict(os.environ, {LIVE_REQUIRED_VAR: '1'}):
+                with self.assertRaises(AssertionError) as ctx:
+                    cell.test_role_and_role_in_database_defaults_are_kept_7522()
+                self.assertNotIsInstance(ctx.exception, unittest.SkipTest)
+                self.assertIn('CREATEROLE', str(ctx.exception))
+
+    def test_connect_budget_refusal_shows_the_floored_timeout_and_a_useful_hint_7554(self):
+        def refusal(url):
+            addrs = [(0, 0, 0, '', ('192.0.2.%d' % n, 5432)) for n in range(1, 181)]
+            with unittest.mock.patch.object(pib.socket, 'getaddrinfo', return_value=addrs):
+                with self.assertRaises(pib.WrapperError) as ctx:
+                    pib.server_caps_sql(pib._pg_env(url))
+            return str(ctx.exception)
+        host = 'postgres://%s@db.example:5432/d'
+        floored = refusal(host % 'u' + '?connect_timeout=1')
+        self.assertIn('connect_timeout 2 s', floored)
+        self.assertIn('floored', floored)
+        self.assertIn('1 s', floored)
+        self.assertIn('sslmode=require', floored)
+        plain = refusal(host % 'u' + '?connect_timeout=5')
+        self.assertNotIn('floored', plain)
+        self.assertIn('sslmode=require', plain)
+        for mode in ('require', 'verify-ca', 'verify-full'):
+            text = refusal(host % 'u' + '?connect_timeout=1&sslmode=' + mode)
+            with self.subTest(sslmode=mode):
+                self.assertNotIn('or set sslmode', text)
+                self.assertIn('sslmode=' + mode, text)
+                self.assertIn('hostaddr', text)
+
     def test_connect_budget_refusal_names_budget_addresses_and_sslmode_7523(self):
         six = [(0, 0, 0, '', ('192.0.2.%d' % n, 5432)) for n in range(1, 7)]
         url = 'postgres://secretuser:hunter2@db.example:5432/d'
