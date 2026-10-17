@@ -1874,6 +1874,7 @@ jobs:
         if: needs.classify.outputs.docs_only != 'true' && matrix.once
         run: |
           cargo install cargo-audit --locked
+          python3 scripts/check-zip-extract-unreachable.py
           cargo audit
 
       # CI-speed: the release build here is only a release-PROFILE compile
