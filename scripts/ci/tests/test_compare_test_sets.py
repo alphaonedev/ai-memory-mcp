@@ -366,6 +366,24 @@ class TotalsCli(unittest.TestCase):
         self.assertEqual(done.returncode, 2)
         self.assertIn('Summary', done.stderr)
 
+    def test_flaky_retry_compares_identical_against_a_plain_pass_baseline_7298(self):
+        # nextest `Summary` counts a retried test once ("1 test run: 1 passed (1 flaky)"), not once per attempt
+        cargo = ('     Running unittests src/lib.rs (target/debug/deps/ai_memory-0123456789abcdef)\n'
+                 'running 1 test\n'
+                 'test a::flaky_one ... ok\n\n'
+                 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n')
+        nextest = ('  TRY 1 FAIL [   0.010s] ai-memory a::flaky_one\n'
+                   '     RETRY 2/2\n'
+                   '  TRY 2 PASS [   0.011s] ai-memory a::flaky_one\n'
+                   '  FLAKY 2/2 [   0.021s] ai-memory a::flaky_one\n'
+                   '     Summary [   0.030s] 1 test run: 1 passed (1 flaky), 0 skipped\n')
+        self.cargo.write_text(cargo)
+        self.nextest.write_text(nextest)
+        done = self.run_cli('--cargo-log', str(self.cargo), '--nextest-log', str(self.nextest))
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn('IDENTICAL', done.stdout)
+        self.assertIn('nextest 1 of 1', done.stdout)
+
     def test_totals_line_is_printed_when_they_agree(self):
         done = self.run_cli('--cargo-log', str(self.cargo), '--nextest-log', str(self.nextest))
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
@@ -410,6 +428,16 @@ class ParseNextest(unittest.TestCase):
         text = ('  TRY 1 FAIL [   0.010s] ai-memory::a flaky_one\n'
                 '        FAIL [   0.010s] ai-memory::a flaky_one\n')
         self.assertEqual(cts.parse_nextest_log(text), {('a', 'flaky_one'): 'fail'})
+
+    def test_flaky_test_fail_then_pass_on_retry_is_a_pass_with_no_spliced_lines_7298(self):
+        text = ('  TRY 1 FAIL [   0.010s] ai-memory::a flaky_one\n'
+                '     RETRY 2/2\n'
+                '  TRY 2 PASS [   0.011s] ai-memory::a flaky_one\n'
+                '  FLAKY 2/2 [   0.021s] ai-memory::a flaky_one\n')
+        scan = cts.scan_nextest_log(text)
+        self.assertEqual(scan.outcomes, {('a', 'flaky_one'): 'pass'})
+        self.assertEqual(scan.spliced, 0)
+        self.assertEqual(scan.parsed, 1)
 
     def test_no_results_is_an_error(self):
         with self.assertRaises(cts.ParseError):

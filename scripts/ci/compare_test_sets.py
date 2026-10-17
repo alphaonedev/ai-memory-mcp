@@ -89,6 +89,9 @@ _NEXTEST_RE = re.compile(
     r'(?P<st>PASS|LEAK-FAIL|LEAK|FAIL|TIMEOUT|ABORT|SIG[A-Z0-9]+|EXEC-?FAIL|FLAKY(?: \d+/\d+)?)'
     r'\s+\[[^\]]*\]\s+(?:\(\s*\d+/\s*\d+\)\s+)?(?P<bin>\S+)\s+(?P<name>.+?)\s*$')
 _NEXTEST_PASS = ('PASS', 'LEAK')
+# A retry prints each attempt as ``TRY n <status> [..] <bin> <name>`` before the final status line. Attempts are
+# not results (the final PASS/FAIL/FLAKY line decides), so a status preceded by ``TRY n`` is skipped (#7298 R1).
+_NEXTEST_TRY_RE = re.compile(r'\bTRY\s+\d+\s*$')
 
 Key = Tuple[str, str]
 Outcomes = Dict[Key, str]
@@ -259,7 +262,7 @@ def scan_nextest_log(text: str) -> Scan:
             total_lines += 1
             continue
         found = _NEXTEST_RE.search(line)
-        if not found:
+        if not found or _NEXTEST_TRY_RE.search(line[:found.start()]):
             continue
         spliced += _spliced(line, found)
         status = found.group('st')
