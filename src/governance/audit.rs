@@ -3111,6 +3111,18 @@ pub fn warn_watermark_skipped_no_genesis() {
     }
 }
 
+/// #7239 / #7604 - emissions skipped because the genesis row could not be READ
+/// (an error, as opposed to an absent genesis). Process-wide.
+static WATERMARK_GENESIS_READ_SKIPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// #7239 / #7604 - how many watermark emissions this process skipped because
+/// the genesis db-id read failed (the append succeeded without an anchor).
+#[must_use]
+pub fn watermark_genesis_read_skips() -> u64 {
+    WATERMARK_GENESIS_READ_SKIPS.load(Ordering::Relaxed)
+}
+
 /// Forensic directory of the live sink, if [`init`] has run.
 fn live_sink_dir() -> Option<PathBuf> {
     let guard = sink().lock().ok()?;

@@ -176,13 +176,12 @@ fn sqlite_store_with_genesis_still_emits_identified_watermark_7228() {
 /// opposed to an absent row).
 const UNREADABLE_GENESIS_HASH: &str = "not-a-blob";
 
-/// #7238 / #7239 - a genesis READ ERROR at an emission-due append fails the
-/// append closed on sqlite exactly as it does on postgres, and never anchors a
-/// db_id-less watermark. Parity decision: propagate (fail closed) over WARN and
-/// skip, because an unreadable genesis means the chain's identity cannot be
-/// proven and the postgres transaction is already aborted by the same error.
+/// #7239 / #7604 (3-agent vote (6def5ab6), Option B) - a genesis READ ERROR at an
+/// emission-due append skips the watermark emission: the append still succeeds,
+/// no db_id-less watermark row is written, the skip is counted (and WARNed), and
+/// the NEXT emission-due append retries. The chain must never stall on it.
 #[test]
-fn sqlite_genesis_read_error_fails_the_append_closed_7239() {
+fn sqlite_genesis_read_error_skips_the_watermark_and_the_append_succeeds_7239() {
     let _g = CELL_LOCK.blocking_lock();
     let fdir = fresh_dir("sqlite-readerr-sink");
     let ddir = fresh_dir("sqlite-readerr-db");
@@ -198,8 +197,8 @@ fn sqlite_genesis_read_error_fails_the_append_closed_7239() {
         genesis_db_id(&conn).is_err(),
         "the corrupted genesis must produce a read ERROR, not an absent row"
     );
+    let skips_before = forensic::watermark_genesis_read_skips();
     let limit = target_head() + 1;
-    let mut failed_at = None;
     let mut n = 0;
     while head(&conn) < limit {
         n += 1;
@@ -214,29 +213,25 @@ fn sqlite_genesis_read_error_fails_the_append_closed_7239() {
             timestamp: chrono::Utc::now().to_rfc3339(),
             ..SignedEvent::default()
         };
-        if append_signed_event(&conn, &ev).is_err() {
-            failed_at = Some(head_before);
-            break;
-        }
+        append_signed_event(&conn, &ev).unwrap_or_else(|e| {
+            panic!("append {n} at head {head_before} must succeed past a genesis read error: {e:#}")
+        });
+        assert_eq!(
+            head(&conn),
+            head_before + 1,
+            "every append must advance the chain head"
+        );
     }
     HIGH_WATER.fetch_max(head(&conn), Ordering::SeqCst);
     forensic::shutdown();
-    let failed_at = failed_at.expect(
-        "an emission-due append with an unreadable genesis must fail closed, as postgres does",
-    );
-    assert_eq!(
-        head(&conn),
-        failed_at,
-        "the failed append must roll back and leave the chain head unchanged"
-    );
     assert!(
-        forensic::watermark_emission_due(failed_at + 1),
-        "the append must fail AT the emission-due sequence (the genesis read), not earlier"
+        forensic::watermark_genesis_read_skips() > skips_before,
+        "the skipped emission must be counted (and WARNed)"
     );
     let rows = watermark_payloads(fdir.path());
     assert!(
         rows.is_empty(),
-        "no watermark may be anchored on a genesis read error; got {rows:?}"
+        "no db_id-less watermark may be anchored on a genesis read error; got {rows:?}"
     );
 }
 
@@ -310,13 +305,14 @@ mod postgres_twin {
         );
     }
 
-    /// #7238 / #7239 - the postgres half of the genesis-read-error parity pin:
-    /// the same scenario as the sqlite cell, the same outcome (the append at
-    /// the emission-due sequence fails closed and anchors nothing). The genesis
+    /// #7239 / #7604 (3-agent vote (6def5ab6), Option B) - the postgres half: the
+    /// same scenario as the sqlite cell with the same outcome. The genesis read
+    /// runs in a SAVEPOINT, so its failure neither aborts the append's
+    /// transaction nor stalls the chain; no watermark is anchored. The genesis
     /// `payload_hash` is set NULL so the read fails to decode.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
-    async fn pg_genesis_read_error_fails_the_append_closed_7239() {
+    async fn pg_genesis_read_error_skips_the_watermark_and_the_append_succeeds_7239() {
         let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
@@ -335,32 +331,30 @@ mod postgres_twin {
             .execute(pg.pool())
             .await
             .expect("corrupt genesis payload_hash");
+        let skips_before = forensic::watermark_genesis_read_skips();
         let limit = target_head() + 1;
-        let mut failed_at = None;
         let mut n = 0;
         while pg_head(&pg).await < limit {
             n += 1;
             let head_before = pg_head(&pg).await;
             pg.emit_spawn_audit(&format!("read-error-{n}"), "7239-watermark")
                 .await;
-            if pg_head(&pg).await == head_before {
-                failed_at = Some(head_before);
-                break;
-            }
+            assert_eq!(
+                pg_head(&pg).await,
+                head_before + 1,
+                "append {n} at head {head_before} must succeed past a genesis read error"
+            );
         }
         HIGH_WATER.fetch_max(pg_head(&pg).await, Ordering::SeqCst);
         forensic::shutdown();
-        let failed_at = failed_at.expect(
-            "an emission-due append with an unreadable genesis must fail closed on postgres",
-        );
         assert!(
-            forensic::watermark_emission_due(failed_at + 1),
-            "the append must fail AT the emission-due sequence (the genesis read), not earlier"
+            forensic::watermark_genesis_read_skips() > skips_before,
+            "the skipped emission must be counted (and WARNed)"
         );
         let rows = watermark_payloads(fdir.path());
         assert!(
             rows.is_empty(),
-            "no watermark may be anchored on a genesis read error; got {rows:?}"
+            "no db_id-less watermark may be anchored on a genesis read error; got {rows:?}"
         );
     }
 
