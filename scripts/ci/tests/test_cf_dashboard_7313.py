@@ -224,6 +224,41 @@ class WranglerTimeout7313(unittest.TestCase):
             self.assertEqual(mod.main(), 1)
 
 
+TAG_RE = re.compile(r"<(?:link|script|img|iframe)\b[^>]*>", re.IGNORECASE)
+ORIGIN_RE = re.compile(r"https://[a-z0-9.-]+", re.IGNORECASE)
+PRECONNECT_RE = re.compile(r"""rel\s*=\s*["']?preconnect""", re.IGNORECASE)
+
+
+def loaded_origins(html):
+    """External https origins a page loads, matched case-insensitively (HTML tag and
+    attribute names are case-insensitive; origins are returned lower-cased)."""
+    found = set()
+    for tag in TAG_RE.findall(html):
+        if PRECONNECT_RE.search(tag):
+            continue
+        head = re.split("data:image", tag, maxsplit=1, flags=re.IGNORECASE)[0]
+        found.update(o.lower() for o in ORIGIN_RE.findall(head))
+    return found
+
+
+class LoadedOriginsCase7313(unittest.TestCase):
+    """CodeQL py/bad-tag-filter: upper/mixed-case tags must not escape the CSP origin check."""
+
+    def test_mixed_case_tags_are_detected(self):
+        page = ('<SCRIPT SRC="https://Evil.Example/x.js"></SCRIPT>'
+                '<Link REL="stylesheet" href="https://css.example/a.css">'
+                '<IMG src="HTTPS://img.example/p.png">'
+                '<LINK REL="PRECONNECT" href="https://pre.example">'
+                '<Img src="DATA:IMAGE/png;base64,AAAA https://skip.example">')
+        self.assertEqual(loaded_origins(page),
+                         {"https://evil.example", "https://css.example", "https://img.example"})
+
+    def test_old_case_sensitive_filter_misses_them(self):
+        page = '<SCRIPT SRC="https://evil.example/x.js"></SCRIPT>'
+        self.assertEqual(re.findall(r"<(?:link|script|img|iframe)\b[^>]*>", page), [])
+        self.assertEqual(loaded_origins(page), {"https://evil.example"})
+
+
 class HtmlAndHeaders7313(unittest.TestCase):
     """F4 (attribute-safe escaping) and F5 (_headers CSP, framing, no duplicate rule)."""
 
@@ -249,10 +284,7 @@ class HtmlAndHeaders7313(unittest.TestCase):
         allowed = set(re.findall(r"https://[a-z0-9.-]+", csp))
         loaded = set()
         for page in sorted(PUBLIC.glob("*.html")):
-            for tag in re.findall(r"<(?:link|script|img|iframe)\b[^>]*>", page.read_text()):
-                if "rel=\"preconnect\"" in tag:
-                    continue
-                loaded.update(re.findall(r"https://[a-z0-9.-]+", tag.split("data:image")[0]))
+            loaded.update(loaded_origins(page.read_text()))
         self.assertTrue(loaded, "expected external stylesheet origins")
         self.assertTrue(loaded <= allowed, "origins loaded but not allowed by CSP: %s" % (loaded - allowed))
         self.assertEqual(allowed - loaded - {"https://fonts.gstatic.com"}, set(), "CSP allows unused origins")
