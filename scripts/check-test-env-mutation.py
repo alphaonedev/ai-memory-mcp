@@ -19,23 +19,31 @@ install_test_operator_key; each holds tests/common ENV_LOCK while it writes), a 
 setter (ensure_no_config_env, permissive_attestation_for_tests), or a pg_isolate writer
 (isolated_url, publish_env_within). Each write site gets a PROTECTION SET: the tokens held at the
 write, that is
-  * locks bound with `let <name> = ...` (not `let _ = ...`) earlier in a block that encloses the
-    write and not released by `drop(<name>)` before it: `ENV_LOCK.lock()`, `.blocking_lock()`,
-    `.lock().await`, `env_lock()`, a same-file helper that returns a guard (also a helper that
-    wraps such a helper), a tests/common guard;
+  * locks bound with `let <name> = ...` (not `let _ = ...`; a `let`-bound struct literal holding the
+    guard counts) earlier in a block that encloses the write and not released before it (a `drop`
+    in any spelling, `.take()` / `mem::take`, a reassignment, or a move out of the binding, see
+    the limits below): `ENV_LOCK.lock()`, `.blocking_lock()`, `.lock().await`, `env_lock()`, a
+    same-file helper that returns a guard (also a helper that wraps such a helper), a
+    tests/common guard;
   * the locks every same-file caller holds at its call, intersected over the callers and followed
     up the whole same-file call graph (the issue_4357 shape: the writer is two calls below the
     test that holds SERIAL);
   * `once:<setter>` for a Once-gated setter: after that setter returns its write never happens
     again, so a caller that ran it first cannot race it;
-  * `#[serial]` for a serial test.
+  * `#[serial]` / `#[serial(<key>)]` for a serial test, one token per key: serial_test excludes a
+    serial test only from other serial tests with the same key, so it protects a reader only when
+    every writer it races is serial with that key too.
+A write site is a direct write in a fn body, or an invocation `name!(..)` of a same-file
+`macro_rules!` whose body writes the environment (or forwards to one that does); the locks that
+macro body binds before its write are part of the site's protection.
 A write site inside an `#[ignore]` test, or reachable only from ignored tests, is skipped: CI runs
 ignored tests one at a time (`--test-threads=1` in postgres-ignored.yml, coverage.yml and
 cert-postgres-age.yml; `--exact` in token-budget.yml; pinned by a unit test).
 
 Rule. In an env-mutating file with at least two non-ignored test fns (a single-test binary has
-nothing to race in-process) that is not marked `// env-mutation-gate: process-isolated -- <reason>`,
-a non-ignored, non-`#[serial]` test fn is VIOLATING when one of its READERS, or one in a same-file
+nothing to race in-process) that is not marked `// env-mutation-gate: process-isolated -- <reason>`
+(a whole-line `//` comment with a non-empty reason; the text inside a string or a block comment
+does not count), a non-ignored test fn is VIOLATING when one of its READERS, or one in a same-file
 fn or method it calls (followed HELPER_DEPTH levels, closures and loops included), is reached
 without holding, at that point, one token of EVERY write site's protection set. Write sites with
 an empty set (an unlocked writer) are not required of the readers, because the unlocked writer is
@@ -53,9 +61,16 @@ Known limits, stated plainly:
     impl), plus the tests/common reader census; code in src/ is judged only by the tokens above;
   * the reader check is a token heuristic; a fn that reaches a C getenv only through code the
     tokens do not name is treated as pure;
-  * a `drop(<guard>)` anywhere between the lock and the reader releases it, even in a branch;
-  * macro-generated test fns and env writes in tests/<dir>/ sub-modules are not seen;
-  * `#[serial]` is trusted without checking its key.
+  * a release (drop, take, reassignment or move) anywhere between the lock and the reader releases
+    it, even in a branch; a guard moved into a `let`-bound struct literal, tuple, array, `vec!`,
+    `Some` / `Ok` / `Err` or `Box::new` follows that binding, and a move anywhere else (a call
+    argument, a field assignment, a temporary) releases it;
+  * a reader behind a runtime branch still counts (the child half of a re-exec test that returns
+    early unless its marker variable is set; a `reqwest` client on a loopback, rustls-only path);
+  * macro-generated test fns and env writes in tests/<dir>/ sub-modules are not seen; a writer
+    macro is followed only when it is a `macro_rules!` of the same file;
+  * a struct literal is told from a block by its head (a CamelCase path after `=`, `(`, `,`, `:`,
+    `|`, `=>` or at a statement start, and no `if`/`while`/`match`/`for` in the statement).
 
 Ratchet. Existing violations live in scripts/qc-allowlists/test-env-mutation-unlocked-baseline.txt,
 one `<path>::<fn>` per line (`<path>::<mod>::<fn>` for a nested module). CI fails on (a) a violating
@@ -80,7 +95,10 @@ BASELINE_REL = "scripts/qc-allowlists/test-env-mutation-unlocked-baseline.txt"
 TESTS_REL = "tests"
 COMMON_REL = "tests/common"
 SRC_REL = "src"
-ISOLATED_MARKER = re.compile(r"^\s*//\s*env-mutation-gate:\s*process-isolated\b", re.M)
+# #7384: matched only at the start of a real `//` line comment, and a reason after `--` is required.
+ISOLATED_MARKER = re.compile(r"//[ \t]*env-mutation-gate:[ \t]*process-isolated[ \t]*--[ \t]*\S")
+# #7383: a raw string, raw byte string (`br`) or raw C string (`cr`) opener.
+RAW_STR_OPEN = re.compile(r'(?:[bc]?r)(#*)"')
 # Direct writers: env::set_var / remove_var, qualified or imported bare (not `fn set_var`, not `.set_var`).
 DIRECT_MUTATION = re.compile(r"(?<![\w.])(?:(?:std::)?env::)?(?:set_var|remove_var)\s*\(")
 ONCE_SETTERS = ("ensure_no_config_env", "permissive_attestation_for_tests")
@@ -93,7 +111,7 @@ PG_ISOLATE_WRITER = "publish_env_within"  # writes under pg_isolate's own env lo
 COMMON_ENV_LOCK = "common::ENV_LOCK"
 PG_ISOLATE_LOCK = COMMON_ENV_LOCK  # pg_isolate::lock_env_bounded try-locks super::ENV_LOCK
 ONCE_PREFIX = "once:"
-SERIAL_TOKEN = "#[serial]"
+SERIAL_TOKEN = "#[serial:%s]"  # one token per serial_test key ("" for a bare #[serial])
 ANY_VAR = "*"
 ONCE_BODY = re.compile(r"\b(?:call_once|get_or_init)\b")
 # STRONG readers reach a C getenv (the crash path): SQLite open (first-open unixTempFileInit),
@@ -136,6 +154,14 @@ PATH_SELF = ("self", "super", "crate")
 MACRO_RULES = re.compile(r"\bmacro_rules\s*!\s*([A-Za-z_]\w*)\s*\{")
 MACRO_CALL = re.compile(r"\b([A-Za-z_]\w*)\s*!\s*[({\[]")
 META_CALL = re.compile(r"\$([A-Za-z_]\w*)\s*\(")
+# #7389: drop / mem::drop / std::mem::drop / core::mem::drop, with or without a turbofish.
+DROP_CALL = r"\bdrop\s*(?:::\s*<[^;{}]*?>\s*)?\(\s*%s\s*\)"
+# #7387: a guard taken out of its Option binding.
+TAKE_CALL = r"(?:\b%s\s*\.\s*take\s*\(|\b(?:take|replace|swap)\s*\(\s*&\s*mut\s+%s\b)"
+BORROW_TAIL = re.compile(r"(?:&\s*(?:mut\s+)?|\*)$")
+BLOCK_KEYWORDS = re.compile(r"\b(?:if|while|match|for|loop|impl|fn|struct|enum|union|trait|mod|where)\b")
+STRUCT_LIT_HEAD = re.compile(
+    r"(?:^|[=(,:\[|]|=>|\breturn)\s*(?:[A-Za-z_]\w*\s*::\s*)*[A-Z]\w*(?:\s*::\s*<[^;{}]*>)?\s*$")
 WORKFLOW_IGNORED = re.compile(r"--(?:include-)?ignored\b")
 HEADER = (
     "# scripts/qc-allowlists/test-env-mutation-unlocked-baseline.txt -- issue #7347 ratchet.\n"
@@ -155,8 +181,13 @@ EMPTY = frozenset()
 EMPTY_SUMMARY = Summary(EMPTY, EMPTY, EMPTY)
 
 
-def scrub(src):
-    """Blank comments, string and char literals (newlines kept) so braces and idents are real."""
+def scrub(src, line_comments=None):
+    """Blank comments, string and char literals (newlines kept) so braces and idents are real.
+
+    Raw strings take every prefix Rust has (`r`, `br`, `cr`, any number of `#`); byte and C strings
+    (`b".."`, `c".."`) and byte chars (`b'.'`) scrub like ordinary ones. When line_comments is a
+    list, the (start, end) span of every real `//` comment is appended to it.
+    """
     out = []
     i, n = 0, len(src)
     while i < n:
@@ -165,6 +196,8 @@ def scrub(src):
         if two == "//":
             j = src.find("\n", i)
             j = n if j < 0 else j
+            if line_comments is not None:
+                line_comments.append((i, j))
             out.append(" " * (j - i))
             i = j
         elif two == "/*":
@@ -180,13 +213,17 @@ def scrub(src):
                     j += 1
             out.append(re.sub(r"[^\n]", " ", src[i:j]))
             i = j
-        elif c == "r" and re.match(r'r#*"', src[i:i + 12]) and (i == 0 or not src[i - 1].isalnum() and src[i - 1] != "_"):
-            hashes = re.match(r"r(#*)\"", src[i:]).group(1)
-            end = '"' + hashes
-            j = src.find(end, i + 2 + len(hashes))
+        elif c in "rbc" and RAW_STR_OPEN.match(src, i) and (i == 0 or not src[i - 1].isalnum() and src[i - 1] != "_"):
+            opener = RAW_STR_OPEN.match(src, i)
+            end = '"' + opener.group(1)
+            j = src.find(end, opener.end())
             j = n if j < 0 else j + len(end)
             out.append(re.sub(r"[^\n]", " ", src[i:j]))
             i = j
+        elif (c == "c" and src[i + 1:i + 2] == '"' or c == "b" and src[i + 1:i + 2] in ('"', "'")) and (
+                i == 0 or not src[i - 1].isalnum() and src[i - 1] != "_"):
+            out.append(" ")  # the b / c prefix of a byte or C literal; the literal scrubs next
+            i += 1
         elif c == '"':
             j = i + 1
             while j < n and src[j] != '"':
@@ -268,6 +305,109 @@ def innermost_open(body, pos):
     return 0
 
 
+def open_of(body, close_idx):
+    """Index of the `{` matched by the `}` at close_idx, or -1."""
+    depth = 0
+    for j in range(close_idx, -1, -1):
+        ch = body[j]
+        if ch == "}":
+            depth += 1
+        elif ch == "{":
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
+
+
+def is_struct_literal(body, brace):
+    """True when the `{` at brace opens a struct literal (`Holder { .. }`), not a block (#7390)."""
+    if brace <= 0:
+        return False
+    prefix = stmt_prefix(body, brace)
+    return not BLOCK_KEYWORDS.search(prefix) and bool(STRUCT_LIT_HEAD.search(prefix))
+
+
+def scope_open(body, pos):
+    """The `{` of the block that scopes a value made at pos: struct literal braces are skipped."""
+    brace = innermost_open(body, pos)
+    while brace > 0 and is_struct_literal(body, brace):
+        brace = innermost_open(body, brace)
+    return brace
+
+
+def binding_prefix(body, pos):
+    """stmt_prefix of pos, reaching out through any struct literals pos sits in (`let h = H { g: ..`)."""
+    k = pos
+    while True:
+        start = max(body.rfind(";", 0, k), body.rfind("{", 0, k), body.rfind("}", 0, k))
+        if start > 0 and body[start] == "{" and is_struct_literal(body, start):
+            k = start
+            continue
+        if start > 0 and body[start] == "}":
+            brace = open_of(body, start)
+            if brace > 0 and is_struct_literal(body, brace):
+                k = brace
+                continue
+        return body[start + 1:pos]
+
+
+def holds_moved_value(body, prefix_start, pos):
+    """True when every bracket open between a `let x =` and pos keeps the value it wraps alive in x:
+    a struct literal, a tuple, an array, `vec![..]`, `Some(..)`, `Ok(..)`, `Err(..)` or `Box::new(..)`.
+    A value passed to any other call may be dropped by it, so it does not qualify."""
+    stack = []
+    for j in range(prefix_start, pos):
+        ch = body[j]
+        if ch in "([{":
+            stack.append(j)
+        elif ch in ")]}" and stack:
+            stack.pop()
+    for j in stack:
+        if body[j] == "{":
+            if not is_struct_literal(body, j):
+                return False
+            continue
+        head = body[prefix_start:j].rstrip()
+        if body[j] == "[" or re.search(r"(?:^|[=(,\[{:]|\bvec!)$", head) or re.search(
+                r"(?<![\w:])(?:Some|Ok|Err|Box\s*::\s*new)$", head):
+            continue
+        return False
+    return True
+
+
+def released(body, name, start, end, depth=0):
+    """True when the guard bound to name is released in body[start:end] (#7387, #7389): a drop in any
+    spelling, `.take()` / `mem::take` / `mem::replace`, a reassignment of the binding, or a move into
+    anything other than a `let`-bound container; a guard moved into one (`let h = Holder { g }`,
+    `let o = Some(g)`, `let h = g`) is released when that binding is."""
+    text = body[start:end]
+    esc = re.escape(name)
+    if re.search(DROP_CALL % esc, text) or re.search(TAKE_CALL % (esc, esc), text):
+        return True
+    if re.search(r"(?<![\w.$])%s\s*=(?![=>])" % esc, text):
+        return True  # the binding is overwritten, which drops what it held
+    for m in re.finditer(r"(?<![\w.$])%s\b" % esc, text):
+        if BORROW_TAIL.search(text[:m.start()].rstrip()):
+            continue  # `&g`, `&mut g`, `*g` borrow the guard
+        after = text[m.end():].lstrip()
+        moved = after[:1] in (",", ")", "]", "}") or (
+            after[:1] == ";" and re.search(r"(?<![=!<>])=\s*$", text[:m.start()]))
+        if not moved:
+            continue
+        pos = start + m.start()
+        prefix = binding_prefix(body, pos)
+        targets = let_names(prefix)
+        eq = prefix.find("=")
+        if not targets or eq < 0 or depth >= HELPER_DEPTH or not holds_moved_value(
+                body, pos - len(prefix) + eq + 1, pos):
+            return True  # moved into a call, a field assignment or a temporary
+        stmt_end = body.find(";", pos)
+        nxt = end if stmt_end < 0 else min(stmt_end + 1, end)
+        if any(released(body, t2, nxt, end, depth + 1) for t2 in targets):
+            return True
+    return False
+
+
 def has_lock_word(ident):
     """True when the identifier carries a `lock` word (snake or CamelCase), not block/clock."""
     for part in ident.split("_"):
@@ -297,8 +437,22 @@ class Fn:
         self.name, self.mods, self.owner, self.attrs, self.body = name, mods, owner, attrs, body
         self.offset = offset
         self.is_test = self._is_test(attrs)
-        self.serial = bool(SERIAL_ATTR.search(attrs))
+        self.serial_tokens = self._serial_tokens(attrs)
+        self.serial = bool(self.serial_tokens)
         self.ignored = self.is_test and bool(IGNORE_ATTR.search(attrs))
+
+    @staticmethod
+    def _serial_tokens(attrs):
+        """One SERIAL_TOKEN per serial_test key of `#[serial]` / `#[serial(a, b)]` (#7386)."""
+        out = set()
+        for m in SERIAL_ATTR.finditer(attrs):
+            rest = attrs[m.end():].lstrip()
+            keys = []
+            if rest.startswith("("):
+                args = rest[1:match_paren(rest, 0) - 1]
+                keys = [k.strip() for k in args.split(",") if k.strip() and "=" not in k]
+            out.update(SERIAL_TOKEN % k for k in (keys or [""]))
+        return frozenset(out)
 
     @staticmethod
     def _is_test(attrs):
@@ -455,7 +609,13 @@ class Source:
         if self.raw is None or open_idx < 0 or open_idx >= len(fn.body) or fn.body[open_idx] != "(":
             return ANY_VAR
         a, b = first_arg_text(fn.body, open_idx)
-        text = self.raw[fn.offset + a:fn.offset + b].strip().lstrip("&").strip()
+        return self.name_in(fn.offset + a, fn.offset + b)
+
+    def name_in(self, a, b):
+        """Env var named by raw[a:b]: a string literal or a const path, else ANY_VAR."""
+        if self.raw is None:
+            return ANY_VAR
+        text = self.raw[a:b].strip().lstrip("&").strip()
         m = STR_LIT.fullmatch(text)
         if m:
             return m.group(1)
@@ -572,6 +732,7 @@ class FileModel:
             for pos, callee, _, method in self.calls(f):
                 self.callers[id(callee)].append((f, pos, method))
         self._macro_callers(scrubbed)
+        self.macro_writers = self._macro_writers(scrubbed)
         for f in self.fns:
             if f.name == "drop" and f.owner:
                 # `impl Drop for T`: the drop runs in the scope that made the T, so the callers of
@@ -633,6 +794,51 @@ class FileModel:
                 if name in free:
                     for tfn, pos in sites:
                         self.callers[id(free[name])].append((tfn, pos, False))
+
+    def _macro_writers(self, scrubbed):
+        """{macro name: (vars, locks)} for same-file `macro_rules!` whose body writes the environment,
+        directly or through another such macro it invokes (#7385). locks are the lock tokens the
+        body binds before its write; an invocation of the macro is a write site holding them."""
+        bodies = {}
+        for m in MACRO_RULES.finditer(scrubbed):
+            start = m.end() - 1
+            bodies.setdefault(m.group(1), (start, scrubbed[start:match_brace(scrubbed, start)]))
+        found = {}
+        for name, (start, body) in bodies.items():
+            writes = list(DIRECT_MUTATION.finditer(body))
+            if not writes:
+                continue
+            names = set()
+            for w in writes:
+                a, b = first_arg_text(body, w.end() - 1)
+                names.add(self.src.name_in(start + a, start + b))
+            first = writes[0].start()
+            locks = set()
+            for lm in LOCK_METHOD.finditer(body, 0, first):
+                if let_bound(stmt_prefix(body, lm.start())):
+                    locks |= lock_tokens(stmt_prefix(body, lm.start()))
+            for cm in CALL.finditer(body, 0, first):
+                if is_lock_fn_name(cm.group(2)) and let_bound(stmt_prefix(body, cm.start())):
+                    locks.add(cm.group(2))
+            found[name] = (frozenset(names), frozenset(locks))
+        changed = True
+        while changed:
+            changed = False
+            for name, (_, body) in bodies.items():
+                if name in found:
+                    continue
+                inner = [found[c.group(1)] for c in MACRO_CALL.finditer(body) if c.group(1) in found]
+                if inner:
+                    names = frozenset().union(*(v for v, _ in inner))
+                    locks = frozenset.intersection(*(lk for _, lk in inner))
+                    found[name] = (names, locks)
+                    changed = True
+        return found
+
+    def macro_writes(self, fn):
+        """[(pos, vars, locks)] for the writer-macro invocations in fn's body."""
+        return [(m.start(),) + self.macro_writers[m.group(1)]
+                for m in MACRO_CALL.finditer(fn.body) if m.group(1) in self.macro_writers]
 
     # ---- call graph -------------------------------------------------------------------------
     def resolve(self, owner, prefix, name):
@@ -710,7 +916,7 @@ class FileModel:
 
         def add(pos, tokens, kind, end=None):
             if tokens:
-                names = let_names(stmt_prefix(body, pos))
+                names = let_names(binding_prefix(body, pos))
                 out.append(Acq(pos, pos if end is None else end, frozenset(tokens), kind, bool(names), names))
 
         for m in LOCK_METHOD.finditer(body):
@@ -771,7 +977,7 @@ class FileModel:
         stmt_end = body.find(";", acq.pos)
         rest = body[stmt_end + 1:] if stmt_end >= 0 else ""
         for name in acq.names:
-            rest_wo_drop = re.sub(r"\bdrop\s*\(\s*%s\s*\)" % re.escape(name), " ", rest)
+            rest_wo_drop = re.sub(DROP_CALL % re.escape(name), " ", rest)
             if re.search(r"(?<![\w.])%s\b(?!\s*:(?!:))" % re.escape(name), rest_wo_drop):
                 return True
         return False
@@ -779,7 +985,7 @@ class FileModel:
     def encloses(self, fn, a, r):
         key = (id(fn), a)
         if key not in self._encl:
-            self._encl[key] = match_brace(fn.body, innermost_open(fn.body, a))
+            self._encl[key] = match_brace(fn.body, scope_open(fn.body, a))
         return r < self._encl[key]
 
     def held_own(self, fn, r, acqs=None):
@@ -795,18 +1001,19 @@ class FileModel:
                 continue
             if a.kind == "once":
                 held |= a.tokens
-            elif a.bound and not any(re.search(r"\bdrop\s*\(\s*%s\s*\)" % re.escape(n), fn.body[a.pos:r])
-                                     for n in a.names):
-                held |= a.tokens
-        if fn.serial:
-            held.add(SERIAL_TOKEN)
+            elif a.bound:
+                stmt_end = fn.body.find(";", a.pos)
+                start = r if stmt_end < 0 else min(stmt_end + 1, r)
+                if not any(released(fn.body, n, start, r) for n in a.names):
+                    held |= a.tokens
+        held |= fn.serial_tokens
         return held
 
     # ---- write sites ------------------------------------------------------------------------
     def ctx(self, fn, stack=()):
         """Tokens every same-file caller holds at its call of fn, up the whole call graph."""
         if fn.is_test:
-            return frozenset({SERIAL_TOKEN}) if fn.serial else EMPTY
+            return fn.serial_tokens
         if id(fn) in self._ctx:
             return self._ctx[id(fn)]
         if id(fn) in stack:
@@ -863,6 +1070,8 @@ class FileModel:
             once = frozenset({ONCE_PREFIX + fn.key}) if id(fn) in self.once_fns else EMPTY
             for m in DIRECT_MUTATION.finditer(fn.body):
                 add(fn, m.start(), once, {self.src.arg_name(fn, m.end() - 1)})
+            for pos, names, locks in self.macro_writes(fn):
+                add(fn, pos, locks, names)
             for pos, kind, token, open_idx, name in self.external(fn):
                 if kind == "guard":
                     if name == "MultiEnvVarGuard":
@@ -888,6 +1097,8 @@ class FileModel:
                 out.append((m.start(), None))
         for m in DIRECT_MUTATION.finditer(body):
             out.append((m.start(), self.site_at.get((id(fn), m.start()))))
+        for pos, _, _ in self.macro_writes(fn):
+            out.append((pos, self.site_at.get((id(fn), pos))))
         for pos, kind, _, _, _ in self.external(fn):
             if kind in ("guard", "once-writer", "writer"):
                 out.append((pos, self.site_at.get((id(fn), pos))))
@@ -943,20 +1154,30 @@ def violating_fns(scrubbed, raw=None, common=None):
         return []
     out = []
     for fn in model.tests:
-        if fn.serial:
-            continue
         if model.violates(fn, model.ctx(fn), HELPER_DEPTH):
             out.append(fn.qual)
-    out.extend(fn.qual for fn in model.tests if id(fn) in model.blamed and not fn.serial)
+    out.extend(fn.qual for fn in model.tests if id(fn) in model.blamed)
     return sorted(set(out))
 
 
 def scan_file(path, common=None):
     """Return the violating test fn names of an env-mutating, non-isolated file."""
     raw = path.read_text(encoding="utf-8", errors="replace")
-    if ISOLATED_MARKER.search(raw):
+    comments = []
+    scrubbed = scrub(raw, comments)
+    if process_isolated(raw, comments):
         return []
-    return violating_fns(scrub(raw), raw, common)
+    return violating_fns(scrubbed, raw, common)
+
+
+def process_isolated(raw, comments):
+    """True when a whole-line `//` comment carries the marker and a reason (#7384)."""
+    for start, end in comments:
+        if raw[raw.rfind("\n", 0, start) + 1:start].strip():
+            continue  # a trailing comment after code
+        if ISOLATED_MARKER.match(raw, start, end):
+            return True
+    return False
 
 
 def scan_tree(root):
@@ -999,7 +1220,7 @@ def read_baseline(path):
     out = set()
     if not path.exists():
         return out
-    for lineno, line in enumerate(path.read_text().splitlines(), 1):
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -1037,7 +1258,7 @@ def main(argv=None):
         return 0
     if args.update_baseline:
         baseline_path.parent.mkdir(parents=True, exist_ok=True)
-        baseline_path.write_text(render(found))
+        baseline_path.write_text(render(found), encoding="utf-8")
         print("wrote %s (%d entries)" % (BASELINE_REL, len(found)))
         return 0
     problems = compare(found, read_baseline(baseline_path))

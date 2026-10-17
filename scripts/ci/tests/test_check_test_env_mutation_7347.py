@@ -10,6 +10,7 @@ import importlib.util
 import shutil
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -83,7 +84,9 @@ class ScanRules(Fixture):
         self.assertEqual(self.flagged(marker + WRITER + UNLOCKED_READER), set())
 
     def test_serial_attribute_counts_as_lock(self):
-        text = WRITER + "#[test]\n#[serial]\nfn reader() { let _c = db::open(\":memory:\"); }\n"
+        # #7386: only when every writer is #[serial] too.
+        text = (WRITER.replace("#[tokio::test]", "#[tokio::test]\n#[serial]")
+                + "#[test]\n#[serial]\nfn reader() { let _c = db::open(\":memory:\"); }\n")
         self.assertEqual(self.flagged(text), set())
 
     def test_lock_word_inside_comment_or_string_is_not_a_lock(self):
@@ -546,6 +549,223 @@ class PrecisionR3(Fixture):
         self.assertEqual(self.flagged(text), set())
         self.assertEqual(self.flagged(text.replace("AI_MEMORY_TEST_POSTGRES_URL", "AI_KNOB")),
                          {"tests/a.rs::reader"})
+
+
+HOLDER = "struct Holder<T> { _g: T }\n"
+MARKER_REASON = "// env-mutation-gate: process-isolated -- one test per process\n"
+FILE_3761 = REPO / "tests" / "mcp_driver_text_closed_3761.rs"
+PG_LOCK_3761 = "    let _env = ENV_LOCK.lock().await;\n"
+
+
+class Issue7361R4(Fixture):
+    """#7361 last item: the PG leg of the 3761 file is fixed, not baselined."""
+
+    def test_3761_file_has_no_violating_fn(self):
+        found = gate.scan_tree(REPO)
+        self.assertEqual([k for k in found if k.startswith("tests/mcp_driver_text_closed_3761.rs::")], [])
+
+    def test_3761_postgres_leg_without_the_file_lock_is_flagged(self):
+        text = FILE_3761.read_text(encoding="utf-8")
+        unlocked = text.replace(PG_LOCK_3761, "")
+        self.assertNotEqual(text, unlocked)
+        self.assertEqual(self.flagged(unlocked), {"tests/a.rs::pg_driver_faults_render_closed_per_funnel_3761"})
+
+
+class Issue7383(Fixture):
+    """#7383: raw byte / raw C strings, byte chars and C strings are scrubbed as literals."""
+
+    LITERALS = ('br"\\"', 'br#"{"k":"v"}"#', 'br##"a"#"b"##', 'cr"\\"', 'cr#"x"y"#', "b'\"'", "b'\\''",
+                'c"\\""', 'b"\\""')
+
+    def test_writer_after_a_byte_or_c_literal_is_seen(self):
+        for lit in self.LITERALS:
+            with self.subTest(lit=lit):
+                text = (test_fn("writer", "let _b = %s;\n    unsafe { std::env::set_var(\"A\", \"1\") };" % lit)
+                        + test_fn("opener", OPEN))
+                self.assertEqual(self.flagged(text), {"tests/a.rs::opener", "tests/a.rs::writer"})
+
+    def test_reader_after_a_byte_or_c_literal_is_seen(self):
+        for lit in self.LITERALS:
+            with self.subTest(lit=lit):
+                self.assertEqual(self.flagged(WRITER + reader("let _b = %s;" % lit)), {"tests/a.rs::reader"})
+
+    def test_scrub_blanks_the_whole_literal(self):
+        for lit in self.LITERALS:
+            with self.subTest(lit=lit):
+                self.assertEqual(gate.scrub("x(%s);" % lit).strip(), "x(%s);" % (" " * len(lit)))
+
+
+class Issue7384(Fixture):
+    """#7384: the process-isolated marker is a real line comment with a reason."""
+
+    def test_marker_with_a_reason_still_exempts_the_file(self):
+        self.assertEqual(self.flagged(MARKER_REASON + WRITER + UNLOCKED_READER), set())
+
+    def test_marker_that_is_not_a_real_line_comment_does_not_exempt(self):
+        for wrap in ('const _M: &str = r"\n%s";\n', 'const _M: &str = "\n%s";\n', "/*\n%s*/\n",
+                     "/* outer /* nested */\n%s*/\n"):
+            with self.subTest(wrap=wrap):
+                text = wrap % MARKER_REASON + WRITER + UNLOCKED_READER
+                self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
+
+    def test_marker_without_a_reason_does_not_exempt(self):
+        for marker in ("// env-mutation-gate: process-isolated\n", "// env-mutation-gate: process-isolated --\n",
+                       "// env-mutation-gate: process-isolated --   \n",
+                       "let _x = 1; // env-mutation-gate: process-isolated -- trailing\n"):
+            with self.subTest(marker=marker):
+                self.assertEqual(self.flagged(marker + WRITER + UNLOCKED_READER), {"tests/a.rs::reader"})
+
+
+MACRO_SETX = 'macro_rules! setx {\n    () => {\n        unsafe { std::env::set_var("A", "1") }\n    };\n}\n'
+MACRO_SETL = ('macro_rules! setl {\n    () => {{\n        let _g = ENV_LOCK.blocking_lock();\n'
+              '        unsafe { std::env::set_var("A", "1") }\n    }};\n}\n')
+MACRO_FWD = "macro_rules! fwd {\n    () => {\n        setx!()\n    };\n}\n"
+
+
+class Issue7385(Fixture):
+    """#7385: an env write in a same-file macro_rules! body is a write site at each invocation."""
+
+    def test_macro_writer_is_a_write_site(self):
+        text = MACRO_SETX + test_fn("writer", "setx!();") + test_fn("opener", OPEN)
+        self.assertEqual(self.flagged(text), {"tests/a.rs::opener", "tests/a.rs::writer"})
+
+    def test_macro_writer_beside_a_locked_writer_is_flagged(self):
+        text = WRITER + MACRO_SETX + test_fn("w2", "setx!();") + LOCKED_READER
+        self.assertEqual(self.flagged(text), {"tests/a.rs::w2"})
+
+    def test_forwarding_macro_is_followed(self):
+        text = WRITER + MACRO_SETX + MACRO_FWD + test_fn("w2", "fwd!();") + LOCKED_READER
+        self.assertEqual(self.flagged(text), {"tests/a.rs::w2"})
+
+    def test_macro_writer_invoked_under_the_lock_passes(self):
+        text = WRITER + MACRO_SETX + test_fn("w2", "let _g = ENV_LOCK.blocking_lock();\n    setx!();") + LOCKED_READER
+        self.assertEqual(self.flagged(text), set())
+
+    def test_macro_that_takes_the_lock_around_its_write_passes(self):
+        text = WRITER + MACRO_SETL + test_fn("w2", "setl!();") + LOCKED_READER
+        self.assertEqual(self.flagged(text), set())
+
+
+class Issue7386(Fixture):
+    """#7386: #[serial] protects only against #[serial] writers with the same key."""
+
+    def test_serial_reader_beside_a_non_serial_writer_is_flagged(self):
+        text = WRITER + test_fn("reader", OPEN, "#[test]\n#[serial]")
+        self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
+
+    def test_serial_reader_beside_serial_writers_passes(self):
+        text = (test_fn("writer", 'unsafe { std::env::set_var("A", "1") };', "#[test]\n#[serial]")
+                + test_fn("reader", OPEN, "#[test]\n#[serial_test::serial]"))
+        self.assertEqual(self.flagged(text), set())
+
+    def test_serial_key_must_match(self):
+        writer = test_fn("writer", 'unsafe { std::env::set_var("A", "1") };', "#[test]\n#[serial(env)]")
+        self.assertEqual(self.flagged(writer + test_fn("reader", OPEN, "#[test]\n#[serial(other)]")),
+                         {"tests/a.rs::reader"})
+        self.assertEqual(self.flagged(writer + test_fn("reader", OPEN, "#[test]\n#[serial(env)]")), set())
+        self.assertEqual(self.flagged(writer + test_fn("reader", OPEN, "#[test]\n#[serial]")),
+                         {"tests/a.rs::reader"})
+
+    def test_non_serial_reader_beside_serial_writers_is_flagged(self):
+        text = (test_fn("writer", 'unsafe { std::env::set_var("A", "1") };', "#[test]\n#[serial]")
+                + test_fn("reader", OPEN))
+        self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
+
+
+class Issue7387(Fixture):
+    """#7387: a guard moved out of its binding is released at the move."""
+
+    def test_guard_moved_away_is_not_held(self):
+        consume = "fn consume<T>(_t: T) {}\n"
+        for prefix in ("let h = Holder { _g: g };\n    drop(h);", "let h = Holder { g };\n    drop(h);",
+                       "consume(g);", "let mut o = Some(g);\n    o.take();", "let h = (g, 1);\n    drop(h);",
+                       "let h = g;\n    drop(h);", "let v = vec![g];\n    drop(v);", "let _w = consume(g);",
+                       "let h = g;\n    let k = Holder { _g: h };\n    std::mem::drop(k);",
+                       "let mut o = Some(g);\n    o = None;"):
+            with self.subTest(prefix=prefix):
+                text = WRITER + HOLDER + consume + reader("let g = ENV_LOCK.blocking_lock();\n    " + prefix)
+                self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
+
+    def test_guard_moved_into_a_live_binding_is_held(self):
+        # The guard lives on in the let-bound container until that container is released
+        # (the FedEnv constructor of tests/signal_recipient_validation_4408.rs has this shape).
+        for prefix in ("let _h = Holder { _g: g };", "let _h = Holder { _g: Some(g) };", "let _v = vec![g];",
+                       "let _o = Some(g);", "let _t = (1, g);", "let h = g;\n    let _k = Holder { _g: h };"):
+            with self.subTest(prefix=prefix):
+                text = WRITER + HOLDER + reader("let g = ENV_LOCK.blocking_lock();\n    " + prefix)
+                self.assertEqual(self.flagged(text), set())
+
+    def test_option_take_releases_the_guard(self):
+        text = WRITER + reader("let mut g = Some(ENV_LOCK.blocking_lock());\n    g.take();")
+        self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
+        text = WRITER + reader("let mut g = Some(ENV_LOCK.blocking_lock());\n    let _ = std::mem::take(&mut g);")
+        self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
+
+    def test_guard_only_borrowed_is_still_held(self):
+        for prefix in ("let _r = &g;", "let _r = &*g;", "let _m = &mut g;"):
+            with self.subTest(prefix=prefix):
+                text = WRITER + reader("let mut g = ENV_LOCK.blocking_lock();\n    " + prefix)
+                self.assertEqual(self.flagged(text), set())
+
+    def test_guard_moved_after_the_open_is_held(self):
+        text = WRITER + HOLDER + reader("let g = ENV_LOCK.blocking_lock();", OPEN + "\n    let _h = Holder { _g: g };")
+        self.assertEqual(self.flagged(text), set())
+
+
+class Issue7389(Fixture):
+    """#7389: every spelling of drop releases the guard."""
+
+    def test_every_drop_spelling_releases_the_guard(self):
+        for call in ("drop::<_>(g)", "drop::<tokio::sync::MutexGuard<'_, ()>>(g)", "std::mem::drop(g)",
+                     "core::mem::drop(g)", "mem::drop(g)", "drop ( g )"):
+            with self.subTest(call=call):
+                text = WRITER + reader("let g = ENV_LOCK.blocking_lock();\n    %s;" % call)
+                self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
+
+
+class Issue7390(Fixture):
+    """#7390: a guard held in a let-bound struct literal lives for the rest of the block."""
+
+    def test_guard_in_a_let_bound_struct_literal_is_held(self):
+        for prefix in ("let _h = Holder { _g: ENV_LOCK.blocking_lock() };",
+                       "let _h = Holder {\n        _g: ENV_LOCK.blocking_lock(),\n    };",
+                       "let _h = Holder { _g: Holder { _g: ENV_LOCK.blocking_lock() } };"):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(self.flagged(WRITER + HOLDER + reader(prefix)), set())
+
+    def test_struct_literal_in_an_inner_block_is_still_scoped_to_it(self):
+        text = WRITER + HOLDER + reader("{ let _h = Holder { _g: ENV_LOCK.blocking_lock() }; }")
+        self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
+
+    def test_struct_literal_dropped_before_the_open_is_not_held(self):
+        text = WRITER + HOLDER + reader("let h = Holder { _g: ENV_LOCK.blocking_lock() };\n    drop(h);")
+        self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
+
+    def test_if_block_is_not_a_struct_literal(self):
+        text = WRITER + reader("if X == Y { let _g = ENV_LOCK.blocking_lock(); }")
+        self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
+
+
+class Issue7391(Fixture):
+    """#7391: the baseline is read and written as UTF-8 whatever the locale says."""
+
+    def test_non_ascii_baseline_round_trip_under_an_ascii_locale(self):
+        name = "reader_été"
+        (SCRATCH / "tests" / "a.rs").write_text(WRITER + UNLOCKED_READER.replace("reader", name),
+                                                encoding="utf-8")
+        real_read, real_write = Path.read_text, Path.write_text
+
+        def ascii_read(self, encoding=None, errors=None):
+            return real_read(self, encoding=encoding or "ascii", errors=errors)
+
+        def ascii_write(self, data, encoding=None, errors=None, **kw):
+            return real_write(self, data, encoding=encoding or "ascii", errors=errors, **kw)
+
+        root = str(SCRATCH)
+        with mock.patch.object(Path, "read_text", ascii_read), mock.patch.object(Path, "write_text", ascii_write):
+            self.assertEqual(gate.main(["--root", root, "--update-baseline"]), 0)
+            self.assertEqual(gate.read_baseline(SCRATCH / gate.BASELINE_REL), {"tests/a.rs::" + name})
+            self.assertEqual(gate.main(["--root", root]), 0)
 
 
 class RealTree(unittest.TestCase):
