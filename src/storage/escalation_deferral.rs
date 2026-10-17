@@ -832,6 +832,23 @@ mod tests {
         leak_and_exit(1, true);
     }
 
+    /// #6540 - with NO tracing sink the open-time report reaches nobody, so
+    /// the frame must stay unreported and the thread-exit line must fire.
+    #[test]
+    fn issue_6540_untraced_loss_is_still_reported_at_thread_exit() {
+        if !is_child() {
+            let (_stdout, stderr) =
+                run_child("issue_6540_untraced_loss_is_still_reported_at_thread_exit");
+            assert!(
+                stderr.contains(THREAD_EXIT_REPORT),
+                "a loss no sink received must still be reported at thread exit:\n{stderr}"
+            );
+            return;
+        }
+        // Deliberately no tracing subscriber in this child.
+        leak_and_exit(1, true);
+    }
+
     /// #6449 - the thread-exit line counts frames and deferred intents
     /// separately: one frame holding two intents is "1 frame(s)", not "2".
     #[test]
