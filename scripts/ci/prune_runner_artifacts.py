@@ -79,6 +79,8 @@ SECS_PER_MINUTE = 60
 # Cap on entries visited when looking for a recent write or ranking a target.
 WALK_ENTRY_CAP = 200_000
 MIN_WORK_ROOT_COMPONENTS = 2
+LOCK_SKIP_SUMMARY = ("eviction summary: %d evicted, %d failed, %d busy skipped, "
+                     "eviction skipped: lock not taken")
 EXIT_OK = 0
 EXIT_USAGE = 2
 EXIT_BAD_ARGS = EXIT_USAGE
@@ -420,6 +422,12 @@ def free_bytes_of(path):
     return shutil.disk_usage(path).free
 
 
+def print_lock_skip_summary(state):
+    """#7295: the summary for an eviction skipped on a lock timeout; returns EXIT_OK."""
+    print(LOCK_SKIP_SUMMARY % (state["evicted"], state["failed"], state["busy"]))
+    return EXIT_OK
+
+
 def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
                        dry_run=False, free_bytes=free_bytes_of,
                        lock_timeout=shared.EVICT_LOCK_TIMEOUT_SECS):
@@ -523,10 +531,7 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
             break
     if state["lock_timeout"]:
         # #7295: eviction was skipped; rank no sibling and do not blame the floor.
-        print("eviction summary: %d evicted, %d failed, %d busy skipped, "
-              "eviction skipped: lock not taken" % (
-                  state["evicted"], state["failed"], state["busy"]))
-        return EXIT_OK
+        return print_lock_skip_summary(state)
     if free_bytes(base) < floor_bytes:
         ranked = []
         for entry in remaining:
@@ -541,6 +546,9 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
             if not dry_run and free_bytes(base) >= floor_bytes:
                 break
             remove(entry, "below the %d GiB free-space floor" % floor_gib)
+        if state["lock_timeout"]:
+            # #7295: the lock timed out in the floor pass; same skip path, no floor warning.
+            return print_lock_skip_summary(state)
         if not dry_run and free_bytes(base) < floor_bytes:
             print("::warning::free space under %s is below the %d GiB floor and no idle "
                   "sibling target is left to evict" % (base, floor_gib))
