@@ -948,6 +948,93 @@ class TemplateOwnership(unittest.TestCase):
         import inspect
         self.assertEqual(list(inspect.signature(pib.effective_timeouts).parameters), ['url'])
 
+    # --- #7615 / #7616 ---------------------------------------------------------------------------------------------
+    GUARD_TIMING_CHILD = (
+        'import importlib.util, sys, time\n'
+        'spec = importlib.util.spec_from_file_location("pib_timing", sys.argv[1])\n'
+        'm = importlib.util.module_from_spec(spec); sys.modules["pib_timing"] = m; spec.loader.exec_module(m)\n'
+        'kind, n = sys.argv[2], int(sys.argv[3])\n'
+        'sql = {"whitespace": "SELECT 1" + " " * n, "quotes": "\'" * n, "comment_open": "/*" * n,\n'
+        '       "dash_cr": "--\\r" * n, "dollar": "$a$" * n,\n'
+        '       "continue_indent": "SELECT \'a\'\\n" + " " * n + "x",\n'
+        '       "continue_comments": "SELECT \'a\'" + " --\\n" * n + "x"}[kind]\n'
+        'start = time.monotonic()\n'
+        'try:\n'
+        '    m._refuse_uncapped_sql(sql)\n'
+        'except m.WrapperError:\n'
+        '    pass\n'
+        'print(time.monotonic() - start)\n')
+    GUARD_TIMING_CASES = [
+        ('whitespace', 10000), ('quotes', 10000), ('comment_open', 10000), ('dash_cr', 10000), ('dollar', 10000),
+        ('continue_indent', 5000), ('continue_comments', 5000),
+    ]
+    GUARD_TIMING_LIMIT_SECS = 1.0
+    GUARD_TIMING_KILL_SECS = 15.0
+
+    def _guard_seconds(self, kind, size):
+        """Seconds the guard takes on one hostile input, measured in a child process the parent can kill: a
+        super-linear regex holds the GIL, so an in-process timer could never fire."""
+        try:
+            done = subprocess.run([sys.executable, '-I', '-c', self.GUARD_TIMING_CHILD, str(SCRIPT), kind, str(size)],
+                                  capture_output=True, text=True, timeout=self.GUARD_TIMING_KILL_SECS, check=False)
+        except subprocess.TimeoutExpired:
+            return float('inf')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return float(done.stdout.strip())
+
+    def test_guard_finishes_hostile_inputs_in_linear_time_7615(self):
+        for kind, size in self.GUARD_TIMING_CASES:
+            with self.subTest(kind=kind, size=size):
+                self.assertLess(self._guard_seconds(kind, size), self.GUARD_TIMING_LIMIT_SECS)
+
+    def test_guard_refuses_sql_over_the_size_cap_before_tokenising_7615(self):
+        cap = pib.GUARD_SQL_MAX_BYTES
+        self.assertGreater(cap, 10000)
+        pib._refuse_uncapped_sql('SELECT 1' + ' ' * (cap - len('SELECT 1')))
+        for over in ('SELECT 1' + ' ' * (cap - len('SELECT 1') + 1), 'SELECT 1 -- ' + 'é' * (cap // 2)):
+            with self.subTest(size=len(over)):
+                outcome, text, rec = self._guard_outcome(over)
+                self.assertEqual(outcome, 'refused')
+                self.assertIn('refus', text)
+                self.assertIn(str(cap), text)
+                self.assertEqual(rec.calls, [], 'psql was not started')
+
+    def test_every_module_regex_is_audited_linear_7615(self):
+        import re as regex
+        patterns = {name: value for name, value in vars(pib).items() if isinstance(value, regex.Pattern)}
+        self.assertEqual(sorted(patterns), sorted([
+            '_ANY_NAME_RE', '_DIGITS_RE', '_DOLLAR_TAG_RE', '_HEX_RE', '_IDENT_BODY_RE', '_IDENT_RE',
+            '_IDENT_START_RE', '_RUN_ID_RE', '_TARGET_RE']))
+        for name, pattern in patterns.items():
+            with self.subTest(pattern=name):
+                self.assertIsNone(regex.search(r'[*+}]\)[*+{]', pattern.pattern), 'a quantified group is quantified')
+        lines = SCRIPT.read_text(encoding='utf-8').splitlines()
+        for number, line in enumerate(lines):
+            if 're.compile(' in line and not line.lstrip().startswith('#'):
+                with self.subTest(line=number + 1):
+                    self.assertTrue(lines[number - 1].startswith('# linear:'), 'no "# linear:" reason above: ' + line)
+
+    def test_no_implicit_string_concatenation_inside_a_list_or_set_7616(self):
+        import tokenize
+        for path in (Path(__file__), SCRIPT):
+            stack, previous, found = [], None, []
+            with open(path, 'rb') as handle:
+                for token in tokenize.tokenize(handle.readline):
+                    if token.type == tokenize.OP and token.string in '([{':
+                        stack.append(token.string)
+                    elif token.type == tokenize.OP and token.string in ')]}' and stack:
+                        stack.pop()
+                    if token.type in (tokenize.NL, tokenize.COMMENT, tokenize.ENCODING):
+                        continue
+                    if token.type == tokenize.NEWLINE:
+                        previous = None
+                        continue
+                    if (token.type == tokenize.STRING and previous is not None and previous.type == tokenize.STRING
+                            and stack and stack[-1] in '[{'):
+                        found.append(token.start[0])
+                    previous = token
+            self.assertEqual(found, [], '%s joins string literals implicitly inside a list or set' % path.name)
+
     def test_unquoted_identifiers_fold_ascii_only_and_whitespace_is_the_scanner_set_7575(self):
         self.assertEqual(pib._tokenise('SELECT K'), [(pib._IDENT, 'select k')])
         self.assertEqual(pib._tokenise('A\f\vB'), [(pib._IDENT, 'a'), (pib._IDENT, 'b')])
