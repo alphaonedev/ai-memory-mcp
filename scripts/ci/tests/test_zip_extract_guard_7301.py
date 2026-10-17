@@ -9,6 +9,7 @@ Fixture trees live under the worktree's `.local-runs/` (never a tmpfs).
 
 Run: python3 -m unittest scripts/ci/tests/test_zip_extract_guard_7301.py
 """
+import os
 import shutil
 import subprocess
 import sys
@@ -26,7 +27,7 @@ BAD_TREE_DEPTH = '0zip v7.2.0\n1candle-core v0.10.2\n1some-other v1.0.0\n'
 MINIMAL_MANIFEST = '[package]\nname = "fixture"\nversion = "0.0.0"\n\n[dependencies]\nserde = "1"\n'
 
 
-class GuardCase(unittest.TestCase):
+class GuardBase(unittest.TestCase):
     """Builds a fixture tree under .local-runs and runs the guard on it."""
 
     def setUp(self):
@@ -46,6 +47,9 @@ class GuardCase(unittest.TestCase):
              '--cargo-tree-file', str(tree_file)],
             capture_output=True, text=True, check=False)
 
+
+
+class GuardCase(GuardBase):
     def test_clean_fixture_passes(self):
         res = self.run_guard()
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
@@ -141,6 +145,92 @@ class GuardCase(unittest.TestCase):
         res = subprocess.run([sys.executable, str(GUARD), '--root', str(self.root / 'missing')],
                              capture_output=True, text=True, check=False)
         self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+
+
+STUB_TEMPLATE = """#!{python}
+import json, sys
+with open({log!r}, 'a') as fh:
+    fh.write(json.dumps(sys.argv[1:]) + '\\n')
+sys.stdout.write({out!r})
+sys.stderr.write({err!r})
+sys.exit({rc})
+"""
+
+LOCK_WITH_ZIP = '[[package]]\nname = "zip"\nversion = "7.2.0"\n'
+LOCK_WITHOUT_ZIP = '[[package]]\nname = "serde"\nversion = "1.0.0"\n'
+NO_MATCH_ERR = 'error: package ID specification `zip` did not match any packages\n'
+
+
+class StubCargoCase(GuardBase):
+    """Runs the guard against a stub `cargo` placed first on PATH."""
+
+    def run_stub(self, out='', err='', rc=0, lock=None):
+        stub_dir = self.root.parent / (self.root.name + '.bin')
+        stub_dir.mkdir()
+        self.addCleanup(shutil.rmtree, str(stub_dir), True)
+        self.argv_log = stub_dir / 'argv.log'
+        stub = stub_dir / 'cargo'
+        stub.write_text(STUB_TEMPLATE.format(
+            python=sys.executable, log=str(self.argv_log), out=out, err=err, rc=rc),
+            encoding='utf-8')
+        stub.chmod(0o755)
+        if lock is not None:
+            (self.root / 'Cargo.lock').write_text(lock, encoding='utf-8')
+        env = dict(os.environ)
+        env['PATH'] = str(stub_dir) + os.pathsep + env.get('PATH', '')
+        return subprocess.run(
+            [sys.executable, str(GUARD), '--root', str(self.root)],
+            capture_output=True, text=True, check=False, env=env)
+
+
+class TreeFailClosed7301(StubCargoCase):
+    """Round 2: dev edges, fail closed, exact parent allowlist."""
+
+    def test_cargo_tree_requests_dev_edges(self):
+        res = self.run_stub(out=GOOD_TREE_DEPTH, lock=LOCK_WITH_ZIP)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn('normal,build,dev', self.argv_log.read_text(encoding='utf-8'))
+
+    def test_empty_stdout_rc0_exits_2(self):
+        res = self.run_stub(out='', err='warning: nothing to print.\n', lock=LOCK_WITH_ZIP)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+
+    def test_unparseable_output_exits_2(self):
+        res = self.run_stub(out='warning: something odd\n', lock=LOCK_WITH_ZIP)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+
+    def test_missing_zip_root_line_exits_2(self):
+        res = self.run_stub(out='0candle-core v0.10.2\n1ai-memory v1.0.0\n', lock=LOCK_WITH_ZIP)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+
+    def test_empty_tree_file_exits_2(self):
+        res = self.run_guard(tree='')
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+
+    def test_cargo_failure_exits_2(self):
+        res = self.run_stub(err='error: no registry\n', rc=101, lock=LOCK_WITH_ZIP)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+
+    def test_zip_absent_from_lock_passes_with_message(self):
+        res = self.run_stub(err=NO_MATCH_ERR, rc=101, lock=LOCK_WITHOUT_ZIP)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn('zip not in graph', res.stdout)
+
+    def test_did_not_match_but_lock_has_zip_exits_2(self):
+        res = self.run_stub(err=NO_MATCH_ERR, rc=101, lock=LOCK_WITH_ZIP)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+
+    def test_did_not_match_without_lock_exits_2(self):
+        res = self.run_stub(err=NO_MATCH_ERR, rc=101)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+
+    def test_candle_look_alike_parents_fail(self):
+        for name in ('candle-zipx', 'candle-evil', 'candle-nn', 'candle-core-ext'):
+            with self.subTest(name=name):
+                tree = '0zip v7.2.0\n1candle-core v0.10.2\n1%s v0.1.0\n' % name
+                res = self.run_guard(tree=tree)
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn(name, res.stdout)
 
 
 if __name__ == '__main__':
