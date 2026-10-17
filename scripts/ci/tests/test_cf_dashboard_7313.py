@@ -227,7 +227,8 @@ class WranglerTimeout7313(unittest.TestCase):
             self.assertEqual(mod.main(), 1)
 
 
-URL_ATTRS = ("src", "href", "data")
+URL_ATTRS = ("src", "href", "data", "poster", "xlink:href")
+NON_LOADING_RELS = frozenset(("preconnect", "dns-prefetch"))
 ORIGIN_RE = re.compile(r"^(?:https:)?//([a-z0-9.-]+)", re.IGNORECASE)
 
 
@@ -235,7 +236,8 @@ class _OriginParser(HTMLParser):
     """Collect external https origins from resource-loading tags with a real HTML parser
     (tag and attribute names arrive lower-cased, attribute values are entity-unescaped)."""
 
-    TAGS = frozenset(("link", "script", "img", "iframe", "source", "video", "audio", "embed", "object"))
+    TAGS = frozenset(("link", "script", "img", "iframe", "source", "video", "audio", "embed", "object",
+                      "track", "input", "image"))
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -244,14 +246,21 @@ class _OriginParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
         if tag not in self.TAGS:
             return
-        attrs = {k: (v or "") for k, v in attrs}
-        if tag == "link" and "preconnect" in attrs.get("rel", "").lower().split():
+        found = {}
+        for k, v in attrs:
+            found.setdefault(k, v or "")  # the HTML parser keeps the FIRST duplicate attribute
+        attrs = found
+        rels = set(attrs.get("rel", "").lower().split())
+        if tag == "link" and rels and rels <= NON_LOADING_RELS:
             return
         values = [attrs[k] for k in URL_ATTRS if k in attrs]
-        if "srcset" in attrs:
-            values.extend(c.split()[0] for c in attrs["srcset"].split(",") if c.split())
+        for key in ("srcset", "imagesrcset"):
+            if key in attrs:
+                values.extend(c.split()[0] for c in attrs[key].split(",") if c.split())
         for value in values:
-            m = ORIGIN_RE.match(value.strip())
+            # WHATWG URL parsing: strip ASCII tab/LF/CR, treat backslash as slash
+            value = re.sub(r"[\t\n\r]", "", value).strip().replace("\\", "/")
+            m = ORIGIN_RE.match(value)
             if m:
                 self.found.add("https://" + m.group(1).lower())
 
@@ -312,10 +321,43 @@ class LoadedOriginsCase7313(unittest.TestCase):
                                                 "https://o.example", "https://set.example",
                                                 "https://set2.example"})
 
-    def test_preconnect_and_data_uri_and_relative_are_skipped(self):
-        page = ('<link rel="preconnect stylesheet" href="https://pre.example">'
+    def test_preconnect_with_loading_rel_still_loads(self):
+        self.assertEqual(loaded_origins('<link rel="preconnect stylesheet" href="https://pcs.example/a.css">'),
+                         {"https://pcs.example"})
+
+    def test_pure_preconnect_data_uri_and_relative_are_skipped(self):
+        page = ('<link rel="preconnect" href="https://pre.example">'
+                '<link rel="dns-prefetch preconnect" href="https://pre2.example">'
                 '<img src="data:image/png;base64,AAAA"><script src="/local.js"></script>')
         self.assertEqual(loaded_origins(page), set())
+
+    def test_poster(self):
+        self.assertEqual(loaded_origins('<video poster="https://poster.example/p.png"></video>'), {"https://poster.example"})
+
+    def test_imagesrcset(self):
+        self.assertEqual(loaded_origins('<link rel="preload" as="image" imagesrcset="https://pre3.example/a.png 1x">'),
+                         {"https://pre3.example"})
+
+    def test_track_src(self):
+        self.assertEqual(loaded_origins('<video><track src="https://trk.example/a.vtt"></video>'), {"https://trk.example"})
+
+    def test_input_image_src(self):
+        self.assertEqual(loaded_origins('<input type="image" src="https://inp.example/b.png">'), {"https://inp.example"})
+
+    def test_svg_image_href_and_xlink(self):
+        self.assertEqual(loaded_origins('<svg><image href="https://svg.example/i.png"/>'
+                                        '<image xlink:href="https://svgx.example/i.png"/></svg>'),
+                         {"https://svg.example", "https://svgx.example"})
+
+    def test_url_whitespace_and_backslash_normalised(self):
+        self.assertEqual(loaded_origins('<img src="ht\ntps://nl.example/p.png">'), {"https://nl.example"})
+        self.assertEqual(loaded_origins('<img src="https://ta\tb.example/p.png">'), {"https://tab.example"})
+        self.assertEqual(loaded_origins('<img src="https:\\\\bs.example/p.png">'), {"https://bs.example"})
+        self.assertEqual(loaded_origins('<img src="\\\\bs2.example/p.png">'), {"https://bs2.example"})
+
+    def test_duplicate_attribute_first_wins(self):
+        self.assertEqual(loaded_origins('<img src="https://first.example/a.png" src="https://second.example/b.png">'),
+                         {"https://first.example"})
 
 
 class HtmlAndHeaders7313(unittest.TestCase):
