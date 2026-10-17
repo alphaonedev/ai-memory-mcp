@@ -10806,7 +10806,16 @@ pub fn consolidate_with_expected_versions(
                     }
                 }
                 None => {
-                    // #962 typed envelope.
+                    // #7091 — `get` folds a hidden lifecycle state
+                    // (quarantined / contaminated / tombstoned) into
+                    // `None`, so tell "absent" from "hidden" with the
+                    // unfiltered authz read: a hidden source is the typed
+                    // `InvalidTransition` refusal postgres returns (the
+                    // same shape the tombstone guard below uses), an absent
+                    // one the #962 typed `MemoryNotFound`.
+                    if get_any(conn, id)?.is_some() {
+                        return Err(consolidate_source_hidden(id).into());
+                    }
                     return Err(anyhow::Error::new(StorageError::MemoryNotFound {
                         id: id.to_string(),
                         role: None,

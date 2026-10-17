@@ -2554,12 +2554,26 @@ impl MemoryStore for SqliteStore {
             ctx.bypass_visibility,
             expected_versions,
         )
-        .map_err(
-            |e| match e.downcast_ref::<crate::storage::VersionConflict>() {
-                Some(vc) => super::consolidation_version_conflict(&vc.id, vc.expected, vc.current),
-                None => box_err(e),
-            },
-        )
+        .map_err(|e| {
+            // #7091 — typed refusals, mirroring the postgres twin (ERRORS-15):
+            // a version mismatch, a hidden source (`InvalidTransition`) and a
+            // missing source (`NotFound`) keep their variant instead of
+            // flattening to `Backend`.
+            if let Some(vc) = e.downcast_ref::<crate::storage::VersionConflict>() {
+                return super::consolidation_version_conflict(&vc.id, vc.expected, vc.current);
+            }
+            if let Some(it) = e.downcast_ref::<crate::storage::InvalidTransition>() {
+                return StoreError::InvalidTransition {
+                    detail: it.to_string(),
+                };
+            }
+            if let Some(crate::storage::StorageError::MemoryNotFound { id, .. }) =
+                e.downcast_ref::<crate::storage::StorageError>()
+            {
+                return StoreError::NotFound { id: id.clone() };
+            }
+            box_err(e)
+        })
     }
 
     async fn set_row_metadata(
