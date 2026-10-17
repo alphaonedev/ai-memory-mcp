@@ -27,7 +27,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from run_cert import BINS, LIBS, PG_BIN, PG_LIB  # noqa: E402  (one source for the leg set)
+from run_cert import BINS, LIBS, PG_BIN, PG_LIB, REPO_ROOT, run_tmpdir  # noqa: E402  (one source for the leg set)
 
 RECAPTURE_CANDIDATES = ("scripts/recapture-cert-3607-posture.py", "scripts/recapture-cert-3607-posture.sh")
 EVIDENCE_FILES = (
@@ -40,8 +40,9 @@ EVIDENCE_FILES = (
     "peer-attestation.json",
 )
 # Host path prefixes the leak scan refuses in any captured file. Built from parts so this script itself carries no
-# agent-scratch or tmpfs path literal (#5040); the set is unchanged from the attested generator.
-HOST_PATH_PREFIXES = tuple("/" + part for part in ("mnt/", "home/", "ai-scratch", "tmp/", "var/tmp", "private/tmp"))
+# agent-scratch or tmpfs path literal (#5040). The attested generator's set plus the macOS and root host roots (#7415).
+HOST_PATH_PREFIXES = tuple("/" + part for part in (
+    "mnt/", "home/", "ai-scratch", "tmp/", "var/tmp", "private/tmp", "Users/", "Volumes/", "var/folders/", "root/"))
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 RESULT = re.compile(r"test result: \w+\. \d+ passed; .*$")
 
@@ -103,28 +104,41 @@ FAIL_ROWS = tuple(re.compile(p) for p in (
     r"^\s+posture copy retarget failed ",
 ))
 CHAIN_DONE = re.compile(r"^CHAIN_DONE aggregate_failures=(\d+)\b")
+SECTION_START = re.compile(r"^== CERT LEGS ")
+# Every aggregate row the runner writes (#7419): a nonzero one anywhere refuses the run.
+AGG_DONE = re.compile(r"^(CHAIN|BATTERY|PG|RP|BCG)_DONE aggregate_failures=(\d+)\b")
+EXIT_ROW = re.compile(r"^EXIT=(\d+) leg=")
 
 
 def check_run(outd):
-    """Refuse unless the chain section of legs.log is green; return its COUNT_DIFF notes.
+    """Refuse unless EVERY chain section of legs.log is green; return its COUNT_DIFF notes.
 
-    The chain section is every line up to and including the first `CHAIN_DONE aggregate_failures=<n>` row (#5042).
-    That row must say 0. Failure rows (FAIL_ROWS) are refused in the chain section and also after it, so a failing
-    gates row appended to an older shared legs.log still refuses; a PASSING gates row never does.
+    A chain section starts at a `== CERT LEGS` row (the whole file is one section when there is none). Each section
+    needs exactly one `CHAIN_DONE aggregate_failures=0` row (#5042, #7419), so a chain that was started and crashed or
+    was killed after a green one is refused. Independent of the sections, the run is refused on any nonzero
+    `<LEG>_DONE aggregate_failures=<n>` row, any `EXIT=<n> leg=` row with n > 0, and any failure row (FAIL_ROWS) before
+    or after the chain, so a failing gates row appended to an older shared legs.log still refuses; a PASSING gates row
+    never does. A re-run after a failure must use a fresh --outd.
     """
     log = outd / "legs.log"
     if not log.exists():
         raise Fatal(f"{log} missing")
     lines = read(log).splitlines()
-    done = next((i for i, l in enumerate(lines) if CHAIN_DONE.match(l)), None)
-    if done is None:
+    if not any(CHAIN_DONE.match(l) for l in lines):
         raise Fatal("legs.log has no `CHAIN_DONE aggregate_failures=0` line")
     bad = [l for l in lines if any(r.search(l) for r in FAIL_ROWS)]
+    bad += [l for l in lines if (m := AGG_DONE.match(l)) and m.group(2) != "0"]
+    bad += [l for l in lines if (m := EXIT_ROW.match(l)) and m.group(1) != "0"]
     if bad:
         raise Fatal("run is not green:\n  " + "\n  ".join(bad))
-    if CHAIN_DONE.match(lines[done]).group(1) != "0":
-        raise Fatal(f"chain is not green: {lines[done]}")
-    return [l.strip() for l in lines[: done + 1] if "COUNT_DIFF" in l]
+    starts = [i for i, l in enumerate(lines) if SECTION_START.match(l)] or [0]
+    for start, end in zip(starts, starts[1:] + [len(lines)]):
+        dones = [l for l in lines[start:end] if CHAIN_DONE.match(l)]
+        if len(dones) != 1 or CHAIN_DONE.match(dones[0]).group(1) != "0":
+            raise Fatal(f"chain section at line {start + 1} needs exactly one `CHAIN_DONE aggregate_failures=0` row, "
+                        f"found {dones or 'none'} (a crashed or killed chain; re-run with a fresh --outd)")
+    last = max(i for i, l in enumerate(lines) if CHAIN_DONE.match(l))
+    return [l.strip() for l in lines[: last + 1] if "COUNT_DIFF" in l]
 
 
 def test_results(outd, short, date):
@@ -175,8 +189,11 @@ def recapture_copy(wt, tip, short):
     return rel, src, body
 
 
-def leak_patterns(wt, outd):
-    pats = {str(wt), str(outd), str(Path.home()), *HOST_PATH_PREFIXES}
+def leak_patterns(wt, outd, unresolved=()):
+    """Host strings refused in any captured file: the prefixes, the checkout, the home dir, the tmp dir the run used,
+    and both the resolved and the as-typed forms of --wt / --outd (#7415)."""
+    pats = {str(wt), str(outd), str(Path.home()), str(REPO_ROOT), str(run_tmpdir()), *HOST_PATH_PREFIXES,
+            *(str(p) for p in unresolved)}
     host = socket.gethostname()
     if host and len(host) > 3:
         pats.add(host)
@@ -201,6 +218,7 @@ def main():
         if not re.fullmatch(r"[0-9a-f]{40}", a.tip):
             raise Fatal("--tip must be a full 40-hex sha")
         wt, outd, short = Path(a.wt).resolve(), Path(a.outd).resolve(), a.tip[:9]
+        typed = (os.path.abspath(a.wt), os.path.abspath(a.outd))
         head = git(wt, "rev-parse", "HEAD").strip()
         if head != a.tip:
             raise Fatal(f"worktree HEAD {head} != tip {a.tip}")
@@ -248,7 +266,7 @@ def main():
         files[recap_name] = recap.encode()
         files["SANITIZATION.md"] = san.encode()
 
-        pats = leak_patterns(wt, outd)
+        pats = leak_patterns(wt, outd, unresolved=typed)
         leaks = []
         for name, data in files.items():
             h = hits(data.decode("utf-8", "replace"), pats)

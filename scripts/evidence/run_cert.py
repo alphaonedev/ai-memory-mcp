@@ -19,6 +19,7 @@ import argparse
 import datetime
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -55,15 +56,71 @@ RESULT_RE = re.compile(r"^test result: (\w+)\. (\d+) passed; (\d+) failed", re.M
 
 
 RECAPTURE_CANDIDATES = ("scripts/recapture-cert-3607-posture.py", "scripts/recapture-cert-3607-posture.sh")
+EXPIRY_PY = "scripts/check_cert_expiry.py"
+EXPIRY_SH = "scripts/check-cert-expiry.sh"
+# Built from parts so this script carries no tmpfs path literal (#5040).
+TMP_ROOTS = tuple("/" + part for part in ("tmp", "var/tmp", "private/tmp"))
 
 
-def pick_recapture(wt):
-    """The posture recapture script of the gated worktree: the Python port first, the shell script second (#7399)."""
+class ConfigError(Exception):
+    """A CERT_* / option value the runner refuses (exit 64)."""
+
+
+def anchored(p):
+    """A configured path as an absolute path: relative values resolve against this checkout, never the caller's cwd
+    or the gated worktree (#7421)."""
+    q = Path(os.path.expanduser(str(p)))
+    return q if q.is_absolute() else REPO_ROOT / q
+
+
+def is_tmpfs_path(path, mounts=None):
+    """True for /tmp, /var/tmp, /private/tmp and anything on a tmpfs/ramfs mount (project rule: no tmpfs scratch)."""
+    p = os.path.realpath(os.path.normpath(str(path)))
+    if any(p == r or p.startswith(r + "/") for r in TMP_ROOTS):
+        return True
+    if mounts is None:
+        try:
+            mounts = Path("/proc/mounts").read_text()
+        except OSError:  # no /proc (macOS): the prefix rule above is all that can be checked
+            return False
+    best = None
+    for line in mounts.splitlines():
+        f = line.split()
+        if len(f) >= 3 and (p == f[1] or p.startswith(f[1].rstrip("/") + "/")) and (best is None or len(f[1]) >= len(best[0])):
+            best = (f[1], f[2])
+    return best is not None and best[1] in ("tmpfs", "ramfs")
+
+
+def run_tmpdir():
+    """The TMPDIR a run uses: $CERT_TMPDIR (anchored) else the repo-local default."""
+    return anchored(os.environ.get("CERT_TMPDIR") or DEFAULT_TMPDIR)
+
+
+def tracked_at(wt, rev, rel):
+    return subprocess.run(["git", "-C", str(wt), "cat-file", "-e", f"{rev}:{rel}"], capture_output=True).returncode == 0
+
+
+def pick_recapture(wt, tip):
+    """The posture recapture script of the TIP TREE: the Python port first, the shell script second (#7399). An
+    untracked or modified file on disk can never stand in for the tip's (#7411)."""
     for rel in RECAPTURE_CANDIDATES:
-        if (Path(wt) / rel).is_file():
-            return Path(wt) / rel
-    raise FileNotFoundError("no recapture script in the gated worktree; looked for "
-                            + " then ".join(RECAPTURE_CANDIDATES))
+        if tracked_at(wt, tip, rel):
+            return rel
+    raise FileNotFoundError("no recapture script at the tip; looked for " + " then ".join(RECAPTURE_CANDIDATES))
+
+
+def recapture_source(wt, tip):
+    """(relpath, source) of the tip's recapture script, read from the tip blob, not the disk."""
+    rel = pick_recapture(wt, tip)
+    r = subprocess.run(["git", "-C", str(wt), "show", f"{tip}:{rel}"], capture_output=True, check=True)
+    return rel, r.stdout.decode("utf-8")
+
+
+def retarget_shell(src, ev, fix):
+    """Retarget the two $ROOT-relative assignments of the shell recapture script; the values are shell-quoted (#7412)."""
+    body, n_out = re.subn(r'^OUT="\$ROOT/[^"\n]*"$', lambda _m: f"OUT={shlex.quote(str(ev))}", src, flags=re.M)
+    body, n_fix = re.subn(r'^FIX="\$ROOT/[^"\n]*"$', lambda _m: f"FIX={shlex.quote(str(fix))}", body, flags=re.M)
+    return body, n_out, n_fix
 
 
 class Run:
@@ -71,15 +128,21 @@ class Run:
         self.tip = a.tip
         self.wt = Path(a.wt)
         self.outd = Path(a.outd)
-        self.outd.mkdir(parents=True, exist_ok=True)
         # #5042: the gates leg runs after the chain and writes its own artifact, so the RUN-RECORD legs-log hash and
         # the bundle builder's chain gate read the chain's rows alone.
         self.log = self.outd / ("gates.log" if a.leg == "gates" else "legs.log")
-        self.targets = Path(getattr(a, "targets", None) or os.environ.get("CERT_TARGETS") or DEFAULT_TARGETS)
-        self.tmpdir = Path(getattr(a, "tmpdir", None) or os.environ.get("CERT_TMPDIR") or DEFAULT_TMPDIR)
+        # #7421: every configured path resolves against this checkout; #7413: none may sit on a tmpfs.
+        self.targets = anchored(getattr(a, "targets", None) or os.environ.get("CERT_TARGETS") or DEFAULT_TARGETS)
+        self.tmpdir = anchored(getattr(a, "tmpdir", None) or os.environ.get("CERT_TMPDIR") or DEFAULT_TMPDIR)
+        for what, path in (("--targets / CERT_TARGETS", self.targets), ("--tmpdir / CERT_TMPDIR", self.tmpdir)):
+            if is_tmpfs_path(path):
+                raise ConfigError(f"{what} = {path} is on a tmpfs or under a tmp root; choose a persistent disk path")
         slot = getattr(a, "cargo_slot", None) or os.environ.get("CERT_CARGO_SLOT") or ""
-        self.cargo = [slot, "cargo"] if slot else ["cargo"]
-        self.slot_lock = getattr(a, "slot_lock", None) or os.environ.get("CERT_SLOT_LOCK") or ""
+        self.cargo_slot = str(anchored(slot)) if slot else ""
+        self.cargo = [self.cargo_slot, "cargo"] if slot else ["cargo"]
+        lock = getattr(a, "slot_lock", None) or os.environ.get("CERT_SLOT_LOCK") or ""
+        self.slot_lock = str(anchored(lock)) if lock else ""
+        self.outd.mkdir(parents=True, exist_ok=True)
         self.targets.mkdir(parents=True, exist_ok=True)
         self.tmpdir.mkdir(parents=True, exist_ok=True)
         self.bad = 0
@@ -103,6 +166,11 @@ class Run:
     def fail(self, line):
         self.bad += 1
         self.note(line)
+
+    def config_row(self):
+        """The wrapper and paths actually used, one row per invocation (#7413)."""
+        return (f"CONFIG cargo_slot={self.cargo_slot or 'none'} slot_lock={self.slot_lock or 'none'} "
+                f"targets={self.targets} tmpdir={self.tmpdir}")
 
     def git(self, *args):
         return subprocess.run(["git", *args], cwd=self.wt, capture_output=True, text=True).stdout.strip()
@@ -136,9 +204,16 @@ class Run:
             return 75
         env = dict(self.env)
         env.update(extra_env or {})
-        with open(out, "wb") as f:
-            return subprocess.run(argv, cwd=cwd or self.wt, env=env, stdout=f, stderr=subprocess.STDOUT,
-                                  stdin=subprocess.DEVNULL).returncode
+        try:
+            with open(out, "wb") as f:
+                return subprocess.run(argv, cwd=cwd or self.wt, env=env, stdout=f, stderr=subprocess.STDOUT,
+                                      stdin=subprocess.DEVNULL).returncode
+        except OSError as e:  # a missing wrapper, flock or timeout (#7420): a RED row and 127, never a traceback
+            print(f"run_cert: cannot start {argv[0]!r}: {e.strerror or e}. Check that --cargo-slot / CERT_CARGO_SLOT "
+                  "names an executable wrapper and that flock, nice and timeout are installed.", file=sys.stderr)
+            Path(out).write_text(f"NOT RUN: cannot start {argv[0]}: {e}\n")
+            self.fail(f"  RED launch {argv[0]}: {e.strerror or e}")
+            return 127
 
     def low_priority(self, timeout_secs, script):
         """argv running a repo gate script at low priority, under the optional slot flock (--slot-lock)."""
@@ -147,6 +222,10 @@ class Run:
         if shutil.which("ionice"):  # Linux only; the macOS node has no ionice
             argv += ["ionice", "-c3"]
         return [*argv, "timeout", timeout_secs, "bash", script]
+
+    def priority_desc(self):
+        """What low_priority really applies, for the cert-alone.out header (#7425)."""
+        return "nice 15" + (" ionice -c3" if shutil.which("ionice") else "")
 
     def last_result(self, path):
         hits = RESULT_RE.findall(Path(path).read_bytes().decode("utf-8", "replace"))
@@ -199,22 +278,20 @@ class Run:
 
     def posture(self, dbin, sbin):
         try:
-            script = pick_recapture(self.wt)
-        except FileNotFoundError as e:
+            rel, src = recapture_source(self.wt, self.tip)
+        except (FileNotFoundError, subprocess.CalledProcessError, UnicodeDecodeError) as e:
             self.fail(f"  RED posture recapture script: {e}")
             return
-        src = script.read_text()
+        self.note(f"posture script {rel} (tip blob)")
         ev, fix = self.outd / "evidence", self.outd / "fix"
-        if script.suffix == ".py":
+        if rel.endswith(".py"):
             # Python form (#7378): ROOT derives from __file__; retarget the two assignments, nothing else.
             body, n_out = re.subn(r"^OUT = ROOT / .*$", lambda _m: f"OUT = Path({str(ev)!r})", src, flags=re.M)
             body, n_fix = re.subn(r"^FIX = ROOT / .*$", lambda _m: f"FIX = Path({str(fix)!r})", body, flags=re.M)
             ok = (n_out, n_fix) == (1, 1)
             tmp, argv = self.wt / "scripts/.recapture-cert7.py", [sys.executable]
         else:
-            # Retarget only the two $ROOT-relative assignments; the column-0 FIX="$FIX" line must stay untouched.
-            body, n_out = re.subn(r'^OUT="\$ROOT/[^"\n]*"$', f'OUT="{ev}"', src, flags=re.M)
-            body, n_fix = re.subn(r'^FIX="\$ROOT/[^"\n]*"$', f'FIX="{fix}"', body, flags=re.M)
+            body, n_out, n_fix = retarget_shell(src, ev, fix)
             ok = (n_out, n_fix) == (1, 1) and 'FIX="$FIX"' in body
             tmp, argv = self.wt / "scripts/.recapture-cert7.sh", ["bash"]
         if not ok:
@@ -274,7 +351,7 @@ class Run:
             self.fail("  removal-proof header does not name the tip")
         with (self.outd / "cert-alone.out").open("w") as f:
             f.write(f"# f2h (ai:rehearsal-f2h) standalone removal proof; worktree {self.wt}; host {os.uname().sysname} "
-                    f"{os.uname().release}; flock {self.slot_lock or 'none'}; nice 15 ionice -c3 CARGO_BUILD_JOBS=2\n")
+                    f"{os.uname().release}; flock {self.slot_lock or 'none'}; {self.priority_desc()} CARGO_BUILD_JOBS=2\n")
             f.write(f"SHA={self.git('rev-parse', 'HEAD')}\nSTARTED={started}\n{text}")
             f.write(f"PROVEN={proven}/15\nCERT_EXIT={rc}\n")
         self.run(["bash", "scripts/check-cert-removal-proof.sh", "--force-restore"], self.outd / "force-restore.log",
@@ -334,8 +411,7 @@ class Run:
         gl = self.outd / "g"
         # The expiry gate was ported from check-cert-expiry.sh to check_cert_expiry.py (#6137); a gated worktree
         # older than the port still has the shell script.
-        expiry = ([sys.executable, "scripts/check_cert_expiry.py"] if (self.wt / "scripts/check_cert_expiry.py").is_file()
-                  else ["bash", "scripts/check-cert-expiry.sh"])
+        expiry = self.pick_expiry()
         checks = [
             ("cert-expiry-upstream", expiry, {}),
             (f"cert-expiry-{prior_bind[:9]}", expiry, {"CERT_EXPIRY_BASE": prior_bind}),
@@ -364,11 +440,28 @@ class Run:
             self.fail("  RED signature")
         self.note(f"GATES head={head} fails={self.bad}")
         if self.bad == 0 and push_branch:
-            r = subprocess.run(["git", "push", "-q", "origin", f"HEAD:refs/heads/{push_branch}"], cwd=self.wt,
-                               capture_output=True, text=True, env=self.env)
-            self.note(f"PUSH rc={r.returncode} {r.stderr.strip()[:200]}")
-            self.note(self.git("ls-remote", "origin", f"refs/heads/{push_branch}"))
+            self.push_gated(head, push_branch)
         return self.bad
+
+    def pick_expiry(self):
+        """The cert-expiry gate of the gated commit's TREE: the Python port when HEAD tracks it, else the shell script.
+        The tree is clean (dirty_tracked), so the tracked file on disk is the blob; an untracked look-alike is never
+        chosen (#7411)."""
+        if tracked_at(self.wt, "HEAD", EXPIRY_PY):
+            return [sys.executable, EXPIRY_PY]
+        return ["bash", EXPIRY_SH]
+
+    def push_gated(self, head, branch):
+        """Push the gated commit; a failed push, or a remote ref that is not the gated head, is a failure (#7422)."""
+        r = subprocess.run(["git", "push", "-q", "origin", f"HEAD:refs/heads/{branch}"], cwd=self.wt,
+                           capture_output=True, text=True, env=self.env)
+        self.note(f"PUSH rc={r.returncode} {r.stderr.strip()[:200]}")
+        remote = self.git("ls-remote", "origin", f"refs/heads/{branch}")
+        self.note(remote)
+        if r.returncode != 0:
+            self.fail("  RED push: git push failed")
+        elif not remote.startswith(head):
+            self.fail("  RED push: the remote ref is not the gated head")
 
 
 def main():
@@ -392,7 +485,12 @@ def main():
     if not re.fullmatch(r"[0-9a-f]{40}", a.tip):
         print("--tip must be a full 40-hex sha", file=sys.stderr)
         return 64
-    r = Run(a)
+    try:
+        r = Run(a)
+    except ConfigError as e:
+        print(f"run_cert: {e}", file=sys.stderr)
+        return 64
+    r.note(r.config_row())
     if a.leg == "gates":
         bad_ids = [s for s in a.also_evidence if not re.fullmatch(r"[0-9a-f]{9}", s)]
         if bad_ids:

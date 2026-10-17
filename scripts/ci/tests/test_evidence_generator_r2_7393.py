@@ -228,6 +228,7 @@ class TipTreeScripts7411(ScratchCase):
     def test_nothing_at_the_tip_is_a_file_not_found_naming_both_paths_7411(self):
         rc = load("run_cert")
         wt, tip = make_repo(self.dir / "repo")
+        (wt / "scripts").mkdir()
         (wt / RECAPTURE_PY).write_text("print('untracked')\n")
         with self.assertRaises(FileNotFoundError) as cm:
             rc.pick_recapture(wt, tip)

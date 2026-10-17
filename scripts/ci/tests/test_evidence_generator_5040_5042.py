@@ -153,10 +153,13 @@ class Vendored5040(unittest.TestCase):
                         self.fail(f"{name}: absolute default left: {line}")
                 self.assertNotIn('default=Path("/', text)
 
-    def test_leak_scan_prefix_set_is_unchanged_5040(self):
+    def test_leak_scan_prefix_set_is_the_attested_set_plus_7415_roots_5040(self):
+        # decision: the pin grows by the macOS and root host roots (#7415) over staying frozen at the attested set
+        # because the scan must catch those roots; the attested six stay and are asserted first.
         bb = load("build_bundle")
-        self.assertEqual(set(bb.HOST_PATH_PREFIXES),
-                         {"/" + p for p in ("mnt/", "home/", "ai-scratch", "tmp/", "var/tmp", "private/tmp")})
+        attested = {"/" + p for p in ("mnt/", "home/", "ai-scratch", "tmp/", "var/tmp", "private/tmp")}
+        self.assertTrue(attested <= set(bb.HOST_PATH_PREFIXES))
+        self.assertEqual(set(bb.HOST_PATH_PREFIXES) - attested, {"/Users/", "/Volumes/", "/var/folders/", "/root/"})
         self.assertTrue(set(bb.HOST_PATH_PREFIXES) <= set(bb.leak_patterns(Path("/wt-x"), Path("/out-x"))))
 
     def test_prep_runs_against_the_default_repo_5040(self):

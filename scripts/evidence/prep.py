@@ -2,7 +2,7 @@
 """Measure the §7 watched federation-wire delta between the prior cert bind and a candidate cert tip.
 
 Cargo-free and read-only. Reports, for BASE..TIP:
-  * every watched path that changed (same predicate as scripts/check-cert-expiry.sh is_watched_path),
+  * every watched path that changed (same predicate as scripts/check_cert_expiry.py is_watched_path),
     with +/- line counts and the code-line count (git diff -U0, blank and // comment lines stripped);
   * the non-merge commits that touched a watched path;
   * the AI_MEMORY_FED_* identifier set under src/ at both ends (added/removed);
@@ -16,7 +16,9 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-FED_ID =re.compile(r"AI_MEMORY_FED_[A-Z0-9_]+")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from run_cert import anchored  # noqa: E402  (one anchoring rule for every CERT_* path)
+FED_ID = re.compile(r"AI_MEMORY_FED_[A-Z0-9_]+")
 HANDLER_WATCH = ("src/handlers/federation_receive.rs", "src/handlers/federation_signing_check.rs")
 
 
@@ -45,15 +47,24 @@ def code_lines(repo, base, tip, path):
     return n
 
 
+def default_repo():
+    """$CERT_PREP_REPO anchored to this checkout (never the caller's cwd), else this checkout (#7421)."""
+    env = os.environ.get("CERT_PREP_REPO")
+    return anchored(env) if env else REPO_ROOT
+
+
 def fed_ids(repo, rev):
-    out = subprocess.run(["git", "-C", str(repo), "grep", "-ohE", FED_ID.pattern, rev, "--", "src/"],
-                         capture_output=True, text=True).stdout
-    return set(FED_ID.findall(out))
+    r = subprocess.run(["git", "-C", str(repo), "grep", "-ohE", FED_ID.pattern, rev, "--", "src/"],
+                       capture_output=True, text=True)
+    if r.returncode not in (0, 1):  # 1 = no match; anything else is an error, never "0 ids" (#7423)
+        sys.stderr.write(f"git grep failed rc={r.returncode}: {r.stderr}")
+        sys.exit(3)
+    return set(FED_ID.findall(r.stdout))
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--repo", type=Path, default=Path(os.environ.get("CERT_PREP_REPO") or REPO_ROOT),
+    ap.add_argument("--repo", type=Path, default=default_repo(),
                     help="git checkout to measure (default: $CERT_PREP_REPO, else this checkout: %(default)s)")
     ap.add_argument("--base", default="385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5")
     ap.add_argument("--tip", required=True)
