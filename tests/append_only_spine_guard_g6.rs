@@ -138,6 +138,20 @@ fn is_fn_decl_line(line: &str) -> bool {
     before_ok && ident_ok && line.contains('(')
 }
 
+/// Strip one leading visibility qualifier: `pub `, or any restricted form
+/// `pub(crate) ` / `pub(super) ` / `pub(self) ` / `pub(in path) ` (#7563).
+fn strip_pub_qualifier(t: &str) -> &str {
+    if let Some(rest) = t.strip_prefix("pub ") {
+        return rest;
+    }
+    if let Some(rest) = t.strip_prefix("pub(")
+        && let Some(close) = rest.find(") ")
+    {
+        return &rest[close + 2..];
+    }
+    t
+}
+
 /// Does the line open a module-scope `static` / `const` item (`static NAME:`
 /// after optional `pub` qualifiers)? #3690 — the sqlite `memories` upsert
 /// statements are `LazyLock<String>` STATICS built once per process, so the
@@ -146,8 +160,7 @@ fn is_fn_decl_line(line: &str) -> bool {
 /// statement it IS, and the fn that runs it carries its own.
 fn is_static_decl_line(line: &str) -> bool {
     let t = line.trim_start();
-    let t = t.strip_prefix("pub ").unwrap_or(t);
-    let t = t.strip_prefix("pub(crate) ").unwrap_or(t);
+    let t = strip_pub_qualifier(t);
     (t.starts_with("static ") || t.starts_with("const ")) && t.contains(':')
 }
 
@@ -743,4 +756,27 @@ fn p4_matches_the_real_insert_inner_and_pg_store_are_sanctioned() {
          upsert, #2948) AND the federation newer-wins CASE merge (sqlite \
          `insert_if_newer` + pg `apply_remote_memory`, #2954); found {p4_total}"
     );
+}
+
+#[test]
+fn restricted_visibility_static_carries_the_sanction_marker_7563() {
+    // #7563: a `pub(super) static` statement holder is an enclosing item, so
+    // its marker sanctions the SQL; the same static WITHOUT the marker is
+    // still flagged (the guard stays load-bearing).
+    for vis in ["pub ", "pub(crate) ", "pub(super) ", "pub(in crate::storage) "] {
+        let marked = format!(
+            "{vis}static S: LazyLock<String> = LazyLock::new(|| {{\n    // APPEND-ONLY-SANCTIONED (test)\n    format!(\"x DO UPDATE SET content = excluded.content\")\n}});"
+        );
+        let lines: Vec<&str> = marked.lines().collect();
+        assert!(
+            enclosing_fn_has_marker(&lines, 2),
+            "marker must sanction a `{vis}static`"
+        );
+        let bare = marked.replace("APPEND-ONLY-SANCTIONED", "no marker here");
+        let lines: Vec<&str> = bare.lines().collect();
+        assert!(
+            !enclosing_fn_has_marker(&lines, 2),
+            "an unmarked `{vis}static` must stay flagged"
+        );
+    }
 }
