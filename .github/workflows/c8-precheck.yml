@@ -1412,6 +1412,22 @@ jobs:
         # shell expansion, the schema-init allowlist.
         run: python3 scripts/check-docs-no-argv-secrets.py --self-test
 
+  test-env-mutation-gate:
+    # #7347: a test binary runs its tests as threads of one process, so a test
+    # that reads the environment (db::open, config) while a sibling writes it
+    # races getenv against setenv and can SIGSEGV. Every test fn of a tests/*.rs
+    # that calls env::set_var / env::remove_var must hold that file's env lock.
+    # Existing violations are a ratchet baseline that may only shrink.
+    name: Test env-mutation lock gate (#7347)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Run env-mutation lock gate
+        run: python3 scripts/check-test-env-mutation.py
+      - name: Env-mutation lock gate unit tests
+        run: python3 -m unittest scripts/ci/tests/test_check_test_env_mutation_7347.py
+
   sqlite-write-txn-immediate-gate:
     # #5084 / #5241: a rusqlite DEFERRED transaction that reads then writes
     # fails with SQLITE_BUSY_SNAPSHOT (517), which busy_timeout never retries.

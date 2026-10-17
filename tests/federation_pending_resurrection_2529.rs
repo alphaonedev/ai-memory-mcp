@@ -289,6 +289,10 @@ async fn control_fresh_pending_still_applies_2529() {
 
 #[test]
 fn upsert_sql_does_not_clobber_decided_status_2529() {
+    // #7347: `db::open` reads the process environment while the sibling
+    // tests mutate it; hold the same lock so libtest cannot race getenv
+    // against setenv (CONCURRENCY-02).
+    let _lock = ENV_LOCK.blocking_lock();
     let conn = ai_memory::db::open(std::path::Path::new(":memory:")).unwrap();
     let mut pa = ai_memory::models::PendingAction {
         id: "pa-sql-2529".into(),
