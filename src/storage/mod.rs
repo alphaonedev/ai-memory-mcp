@@ -895,6 +895,7 @@ pub use merge_inbound_authorized_4023::{
 mod federation_by_id_4447;
 // #4206 — the title-slot pre-merge archive snapshot helpers (qual_10 split).
 mod consolidate_dest;
+mod link_savepoint;
 mod title_slot_archive;
 pub use federation_by_id_4447::{
     ByIdNamespaceAuthorizer, InboundByIdNamespaceRefused, archive_memory_authorized,
@@ -10097,6 +10098,7 @@ pub fn create_link_signed_with_window(
     // entirely, so a caller-supplied expiry could never land), and
     // `created_at` / `valid_from` bind SEPARATE parameters instead of sharing
     // `?4` — the postgres twin has always bound all three independently.
+    let savepoint = link_savepoint::LinkSavepoint::open(conn)?; // #7559
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO memory_links \
             (source_id, target_id, relation, created_at, valid_from, valid_until, signature, attest_level, observed_by, source_cid, target_cid) \
@@ -10208,6 +10210,7 @@ pub fn create_link_signed_with_window(
     // what is ACTUALLY STORED instead. Fail closed: an unreadable, missing, or
     // unrecognised column reports `unsigned` — the weakest honest claim — and
     // never the stronger computed one.
+    savepoint.release()?;
     if inserted == 0 {
         return Ok(stored_link_attest_level(
             conn, source_id, target_id, relation,
