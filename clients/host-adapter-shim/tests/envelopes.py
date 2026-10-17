@@ -162,7 +162,7 @@ IS_ERROR_LINE = json.dumps(
 )
 
 INIT_LINE = json.dumps(
-    {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-03-26"}}
+    {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2024-11-05"}}
 )
 
 # ── the conformance table ─────────────────────────────────────────────────

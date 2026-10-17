@@ -49,7 +49,7 @@ fn run(db: &Path, sync: &str, args: &[&str], input: &str) -> String {
 
 fn tool(db: &Path, sync: &str, name: &str, arguments: &Value) -> Value {
     let frames = [
-        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"receipt-agent-3555","version":"1"}}}),
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"receipt-agent-3555","version":"1"}}}),
         json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
         json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":name,"arguments":arguments}}),
     ].map(|frame| frame.to_string()).join("\n") + "\n";

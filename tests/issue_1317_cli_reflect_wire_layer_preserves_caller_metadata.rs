@@ -222,7 +222,7 @@ fn initialize(stdin: &mut ChildStdin, rx: &mpsc::Receiver<String>) {
             "id": 0,
             "method": "initialize",
             "params": {
-                "protocolVersion": "2025-03-26",
+                "protocolVersion": "2024-11-05",
                 "capabilities": {},
                 "clientInfo": {"name": "issue-1317-cli-test", "version": "1.0"}
             }

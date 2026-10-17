@@ -108,7 +108,7 @@ Post-v0.7.0 #987 (D1.6) the source-of-truth lives in `registered_tools()` — a 
 - Notification handling: all JSON-RPC notifications (requests without an `id` field) are correctly skipped without sending a response, per the JSON-RPC 2.0 specification
 - `run_mcp_server()` -- main loop: reads lines from stdin, parses JSON-RPC, dispatches, writes responses to stdout
 
-Protocol version: `2024-11-05`. All tool responses are wrapped in MCP content blocks (`{"content": [{"type": "text", "text": "..."}]}`). The protocol is AI-agnostic -- any MCP client can connect.
+Protocol version: negotiated at `initialize` against `SUPPORTED_PROTOCOL_REVISIONS` (`src/mcp/jsonrpc.rs`), currently `["2024-11-05"]`. A client `protocolVersion` in that list is echoed back; an unsupported, missing or non-string value is answered with the newest supported revision (the spec's downgrade) and a stderr `MCP initialize downgrade` diagnostic. Later revisions (the next one requires JSON-RPC batch receipt, which the stdio loop does not implement) are listed only once every delta is implemented (#6157). All tool responses are wrapped in MCP content blocks (`{"content": [{"type": "text", "text": "..."}]}`). The protocol is AI-agnostic -- any MCP client can connect.
 
 **MCP Prompts:** The server exposes 2 prompts via `prompts/list`:
 - **recall-first** -- System prompt with 8 behavioral rules for proactive memory use. Supports an optional `namespace` argument for scoped recall.
