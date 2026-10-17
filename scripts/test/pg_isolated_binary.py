@@ -89,11 +89,17 @@ CONNECT_TIMEOUT_SECS = '30'
 # decision: one psql call (CREATE ... TEMPLATE copies a database, DROP waits on sessions) gets 300 s, well above
 # any healthy statement, so only a stalled server or a held lock trips it (#7429).
 PSQL_TIMEOUT_SECS = 300.0
-# decision: the server cancels its own statement at 90% of the client wall time (statement_timeout and
-# lock_timeout through PGOPTIONS) over Popen+SIGINT, because the server cap still fires when psql is killed,
-# hung or cut off, while a cancel request needs a live client; the margin keeps the server error ahead of the
-# client kill so a timed-out statement cannot commit late (#7447).
-PSQL_SERVER_FRACTION = 0.9
+# decision: the server cancels its own statement (statement_timeout and lock_timeout through PGOPTIONS) over
+# Popen+SIGINT, because the server cap still fires when psql is killed, hung or cut off, while a cancel request
+# needs a live client (#7447). The statement cap is the client wall time minus the effective connect timeout
+# (the clock starts before the connection exists) minus a fixed margin, so it always fires before the client
+# kill; lock_timeout sits a fixed gap below it so a lock wait reports as a lock timeout, not a statement one
+# (#7453). A tighter caller value for either setting is kept (#7454).
+PSQL_CAP_MARGIN_SECS = 10.0
+PSQL_LOCK_GAP_SECS = 5.0
+_CAPPED_SETTINGS = ('statement_timeout', 'lock_timeout')
+_TIMEOUT_UNIT_MS = {'us': 0.001, 'ms': 1.0, 's': 1000.0, 'min': 60000.0, 'h': 3600000.0, 'd': 86400000.0}
+_TIMEOUT_RE = re.compile(r'^\s*([0-9]+(?:\.[0-9]+)?)\s*([a-z]*)\s*$')
 IN_USE_TEXT = 'being accessed by other users'
 EXIT_USAGE = 2
 EXIT_MINT = 3
@@ -277,21 +283,93 @@ def libpq_env(url: str) -> Dict[str, str]:
         var = _QUERY_TO_ENV.get(key)
         if var is None:
             raise WrapperError('unsupported URL query key %r' % key)
+        if key == 'options' and (len(value) - len(value.rstrip('\\'))) % 2:
+            raise WrapperError('the URL query key \'options\' ends in an unescaped backslash; end it with a '
+                               'value character or double the backslash')
         env[var] = value
     return env
+
+
+def _timeout_ms(value: str) -> Optional[float]:
+    """A postgres timeout value (bare number = ms, or with a unit) in ms; None when unparsable."""
+    found = _TIMEOUT_RE.match(value)
+    if not found:
+        return None
+    factor = _TIMEOUT_UNIT_MS.get(found.group(2) or 'ms')
+    return None if factor is None else float(found.group(1)) * factor
+
+
+def _option_tokens(options: str) -> List[str]:
+    """Split a PGOPTIONS string on unescaped whitespace, resolving backslash escapes."""
+    tokens: List[str] = []
+    cur: List[str] = []
+    escaped = False
+    for ch in options:
+        if escaped:
+            cur.append(ch)
+            escaped = False
+        elif ch == '\\':
+            escaped = True
+        elif ch.isspace():
+            if cur:
+                tokens.append(''.join(cur))
+                cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        tokens.append(''.join(cur))
+    return tokens
+
+
+def _caller_timeouts(options: str) -> Dict[str, Optional[float]]:
+    """The caller's last statement_timeout / lock_timeout from an options string (ms; None = unparsable)."""
+    found: Dict[str, Optional[float]] = {}
+    tokens = _option_tokens(options)
+    for i, tok in enumerate(tokens):
+        assignment = None
+        if tok == '-c' and i + 1 < len(tokens):
+            assignment = tokens[i + 1]
+        elif tok.startswith('-c') and len(tok) > 2:
+            assignment = tok[2:]
+        elif tok.startswith('--'):
+            assignment = tok[2:]
+        if assignment and '=' in assignment:
+            name, value = assignment.split('=', 1)
+            name = name.strip().replace('-', '_')
+            if name in _CAPPED_SETTINGS:
+                found[name] = _timeout_ms(value)
+    return found
+
+
+def _tighter(caller: Optional[float], cap_ms: int) -> int:
+    """min(caller, cap) in whole ms; 0 (unlimited) and an unparsable value take the cap."""
+    if not caller or caller <= 0:
+        return cap_ms
+    return min(cap_ms, max(1, int(caller + 0.999)))
 
 
 def _pg_env(url: str, bounded: bool = False) -> Dict[str, str]:
     """The process env with inherited PG* removed and this URL's libpq vars.
 
     ``bounded`` appends the server-side statement and lock timeouts to PGOPTIONS (keeping a URL ``options``
-    value), so a statement outlives neither the client wall time nor a killed client (#7447).
+    value and any tighter caller timeout), so a statement outlives neither the client wall time nor a killed
+    client (#7447, #7453, #7454).
     """
     env = {k: v for k, v in os.environ.items() if not k.startswith('PG')}
     env.update(libpq_env(url))
     if bounded:
-        millis = max(1, int(PSQL_TIMEOUT_SECS * 1000 * PSQL_SERVER_FRACTION))
-        caps = '-c statement_timeout=%dms -c lock_timeout=%dms' % (millis, millis)
+        connect = env.get('PGCONNECT_TIMEOUT', '')
+        if not connect.isdigit() or int(connect) <= 0:
+            raise WrapperError('connect_timeout %r must be a positive whole number of seconds so the server-side '
+                               'statement cap can be sized under the psql limit' % connect)
+        cap_ms = int((PSQL_TIMEOUT_SECS - int(connect) - PSQL_CAP_MARGIN_SECS) * 1000)
+        lock_ms = cap_ms - int(PSQL_LOCK_GAP_SECS * 1000)
+        if lock_ms <= 0:
+            raise WrapperError('connect_timeout=%s leaves no room for a server-side statement cap under the %g s '
+                               'psql limit' % (connect, PSQL_TIMEOUT_SECS))
+        caller = _caller_timeouts(env.get('PGOPTIONS', ''))
+        caps = '-c statement_timeout=%dms -c lock_timeout=%dms' % (
+            _tighter(caller.get('statement_timeout'), cap_ms), _tighter(caller.get('lock_timeout'), lock_ms))
         env['PGOPTIONS'] = ('%s %s' % (env['PGOPTIONS'], caps)) if env.get('PGOPTIONS') else caps
     return env
 
@@ -372,7 +450,11 @@ def session_count(admin_url: str, name: str) -> int:
 
 def open_hold(clone_url: str) -> 'subprocess.Popen[str]':
     """A keepalive psql session on the clone: while it lives, no sweep can drop
-    the clone. It waits on stdin; closing stdin ends it."""
+    the clone. It waits on stdin; closing stdin ends it.
+
+    It runs no statement and its whole life is the clone guard, so it deliberately gets NO server-side
+    statement_timeout or lock_timeout (``_pg_env`` without ``bounded``): a cap would only end the guard early
+    (#7456)."""
     return subprocess.Popen(['psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1'], stdin=subprocess.PIPE,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             env=_pg_env(clone_url), text=True)

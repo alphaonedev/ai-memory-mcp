@@ -632,7 +632,10 @@ class TemplateOwnership(unittest.TestCase):
             stub.chmod(0o755)
             env = dict(os.environ, PATH=d + os.pathsep + os.environ.get('PATH', ''))
             with unittest.mock.patch.dict(os.environ, env, clear=True), \
-                    unittest.mock.patch.object(pib, 'PSQL_TIMEOUT_SECS', 0.3):
+                    unittest.mock.patch.object(pib, 'PSQL_TIMEOUT_SECS', 2.0), \
+                    unittest.mock.patch.object(pib, 'CONNECT_TIMEOUT_SECS', '1'), \
+                    unittest.mock.patch.object(pib, 'PSQL_CAP_MARGIN_SECS', 0.5), \
+                    unittest.mock.patch.object(pib, 'PSQL_LOCK_GAP_SECS', 0.25):
                 started = time.monotonic()
                 with self.assertRaises(pib.WrapperError) as ctx:
                     pib.psql(BASE, 'SELECT 1')
@@ -644,24 +647,79 @@ class TemplateOwnership(unittest.TestCase):
                 self.assertFalse(absent)
                 self.assertIn('the existence check itself failed: psql timed out', why)
 
+    def _bounded_options(self, options=None):
+        url = BASE if options is None else BASE + '&options=' + options
+        return pib._pg_env(url, bounded=True)['PGOPTIONS']
+
+    @staticmethod
+    def _ms(options, name):
+        return int(re.findall(r'-c %s=(\d+)ms' % name, options)[-1])
+
     def test_psql_env_carries_server_timeouts_and_keeps_url_options_7447(self):
         seen = []
 
         def answer(argv, kw):
             seen.append(kw['env'])
             return Result(0, '', '')
-        url = BASE + ('&' if '?' in BASE else '?') + 'options=-c%20search_path%3Dpublic'
+        url = BASE + '&options=-c%20search_path%3Dpublic'
         with unittest.mock.patch.object(pib.subprocess, 'run', Recorder(answer)):
             pib.psql(url, 'SELECT 1')
-        options = seen[0]['PGOPTIONS']
-        millis = int(pib.PSQL_TIMEOUT_SECS * 1000 * pib.PSQL_SERVER_FRACTION)
-        self.assertIn('-c search_path=public', options)
-        self.assertIn('-c statement_timeout=%dms' % millis, options)
-        self.assertIn('-c lock_timeout=%dms' % millis, options)
-        self.assertLess(millis, pib.PSQL_TIMEOUT_SECS * 1000)
-        with unittest.mock.patch.object(pib.subprocess, 'run', Recorder(answer)):
             pib.psql(BASE, 'SELECT 1')
+        self.assertIn('-c search_path=public', seen[0]['PGOPTIONS'])
+        self.assertIn('-c statement_timeout=', seen[0]['PGOPTIONS'])
+        self.assertIn('-c lock_timeout=', seen[0]['PGOPTIONS'])
         self.assertIn('statement_timeout', seen[1]['PGOPTIONS'])
+
+    def test_server_caps_fire_before_the_client_kill_and_lock_before_statement_7453(self):
+        for connect in ('30', '5'):
+            with self.subTest(connect=connect), unittest.mock.patch.object(pib, 'CONNECT_TIMEOUT_SECS', connect):
+                options = self._bounded_options()
+                statement, lock = self._ms(options, 'statement_timeout'), self._ms(options, 'lock_timeout')
+                self.assertLess(lock, statement)
+                self.assertLessEqual(statement + int(connect) * 1000 + int(pib.PSQL_CAP_MARGIN_SECS * 1000),
+                                     int(pib.PSQL_TIMEOUT_SECS * 1000))
+        # a URL connect_timeout counts, and one that leaves no positive cap is refused
+        slow = pib._pg_env(BASE + '&connect_timeout=100', bounded=True)['PGOPTIONS']
+        self.assertEqual(self._ms(slow, 'statement_timeout') + 100000 + 10000, 300000)
+        for bad in ('300', '0', 'x'):
+            with self.subTest(bad=bad), self.assertRaises(pib.WrapperError):
+                pib._pg_env(BASE + '&connect_timeout=' + bad, bounded=True)
+
+    def test_caller_timeouts_are_never_loosened_7454(self):
+        base = self._bounded_options()
+        cap_s, cap_l = self._ms(base, 'statement_timeout'), self._ms(base, 'lock_timeout')
+        tighter = self._bounded_options('-c%20statement_timeout%3D500ms%20-c%20lock_timeout%3D2s')
+        self.assertEqual((self._ms(tighter, 'statement_timeout'), self._ms(tighter, 'lock_timeout')), (500, 2000))
+        looser = self._bounded_options('-c%20statement_timeout%3D1d%20-c%20lock_timeout%3D2h')
+        self.assertEqual((self._ms(looser, 'statement_timeout'), self._ms(looser, 'lock_timeout')), (cap_s, cap_l))
+        zero = self._bounded_options('-c%20statement_timeout%3D0%20-c%20lock_timeout%3D0')
+        self.assertEqual((self._ms(zero, 'statement_timeout'), self._ms(zero, 'lock_timeout')), (cap_s, cap_l))
+        units = self._bounded_options('-cstatement_timeout%3D1min%20--lock-timeout%3D3s')
+        self.assertEqual((self._ms(units, 'statement_timeout'), self._ms(units, 'lock_timeout')), (60000, 3000))
+        # the caller's own text is kept and the tighter value is the last, winning one
+        self.assertIn('statement_timeout=500ms', tighter)
+
+    def test_options_ending_in_a_backslash_are_refused_7455(self):
+        for value in ('-c%20search_path%3Dab%5C', '%5C%5C%5C'):
+            with self.subTest(value=value), self.assertRaises(pib.WrapperError) as ctx:
+                pib._pg_env(BASE + '&options=' + value, bounded=True)
+            self.assertIn("'options'", str(ctx.exception))
+            self.assertIn('backslash', str(ctx.exception))
+        # an escaped (doubled) trailing backslash is fine
+        pib._pg_env(BASE + '&options=-c%20search_path%3Dab%5C%5C', bounded=True)
+        called = []
+        with unittest.mock.patch.object(pib.subprocess, 'run', Recorder(lambda a, k: called.append(a) or Result())):
+            with self.assertRaises(pib.WrapperError):
+                pib.psql(BASE + '&options=ab%5C', 'SELECT 1')
+        self.assertEqual(called, [], 'refused before psql runs')
+
+    def test_hold_session_has_no_server_caps_7456(self):
+        with Patched():
+            hold = pib.open_hold(BASE)
+        self.assertNotIn('statement_timeout', hold.kw['env'].get('PGOPTIONS', ''))
+        self.assertNotIn('lock_timeout', hold.kw['env'].get('PGOPTIONS', ''))
+        self.assertIn('statement_timeout', pib._pg_env(BASE, bounded=True)['PGOPTIONS'])
+        self.assertIn('NO server-side', pib.open_hold.__doc__)
 
     def test_unknown_reason_wording_7448(self):
         refused = {'CREATE DATABASE': 'ERROR:  permission denied to create database'}
@@ -991,6 +1049,25 @@ def _live_url():
 @unittest.skipUnless(_live_url() and shutil.which('psql'), 'AI_MEMORY_TEST_POSTGRES_URL unset (live e2e)')
 class LiveEndToEnd(unittest.TestCase):
     """C1 end to end: the real script, a real server, a probe, /bin/true."""
+
+    def test_server_cap_cancels_a_slow_statement_and_leaves_no_backend_7457(self):
+        url = _live_url()
+        tag = 'r8cap' + uuid.uuid4().hex[:10]
+        with unittest.mock.patch.object(pib, 'PSQL_TIMEOUT_SECS', 8.0), \
+                unittest.mock.patch.object(pib, 'CONNECT_TIMEOUT_SECS', '1'), \
+                unittest.mock.patch.object(pib, 'PSQL_CAP_MARGIN_SECS', 1.0), \
+                unittest.mock.patch.object(pib, 'PSQL_LOCK_GAP_SECS', 0.5):
+            started = time.monotonic()
+            with self.assertRaises(pib.WrapperError) as ctx:
+                pib.psql(url, 'SELECT pg_sleep(60) /* %s */' % tag)
+            elapsed = time.monotonic() - started
+        self.assertEqual(ctx.exception.returncode, 1, str(ctx.exception))
+        self.assertIn('canceling statement due to statement timeout', str(ctx.exception))
+        self.assertLess(elapsed, 8.0, 'the server cancelled before the client limit')
+        time.sleep(1.5)
+        left = pib.psql(url, "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '%%%s%%' "
+                        "AND pid <> pg_backend_pid()" % tag, tuples=True).strip()
+        self.assertEqual(left, '0', 'no backend still runs the capped statement')
 
     def test_setup_run_teardown_creates_and_drops_a_clone(self):
         url = _live_url()
