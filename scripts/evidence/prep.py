@@ -9,12 +9,14 @@ Cargo-free and read-only. Reports, for BASE..TIP:
   * the range size (all commits / non-merge).
 """
 import argparse
+import os
 import re
 import subprocess
 import sys
 from pathlib import Path
 
-FED_ID = re.compile(r"AI_MEMORY_FED_[A-Z0-9_]+")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+FED_ID =re.compile(r"AI_MEMORY_FED_[A-Z0-9_]+")
 HANDLER_WATCH = ("src/handlers/federation_receive.rs", "src/handlers/federation_signing_check.rs")
 
 
@@ -51,7 +53,8 @@ def fed_ids(repo, rev):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--repo", type=Path, default=Path("/mnt/t9/v07/v09-dev"))
+    ap.add_argument("--repo", type=Path, default=Path(os.environ.get("CERT_PREP_REPO") or REPO_ROOT),
+                    help="git checkout to measure (default: $CERT_PREP_REPO, else this checkout: %(default)s)")
     ap.add_argument("--base", default="385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5")
     ap.add_argument("--tip", required=True)
     a = ap.parse_args()

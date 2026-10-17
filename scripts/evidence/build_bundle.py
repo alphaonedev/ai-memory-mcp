@@ -2,7 +2,9 @@
 """Build the §7 cert evidence bundle docs/compliance/evidence/cert-<short>/ from a run_cert.py chain run (ai:rehearsal-f2h).
 
 Modelled on cert-385da3a05 (commit 9f68ea41a). Steps, each fatal on failure:
-  1. the run is green: OUTD/legs.log has `CHAIN_DONE aggregate_failures=0` and no RED / VACUOUS / WRONG-HEAD line
+  1. the run is green: OUTD/legs.log has `CHAIN_DONE aggregate_failures=0` and no failure row in the runner's row
+     grammar (`  RED <name>`, `  VACUOUS ...`, `... WRONG-HEAD/DIRTY ...`, see FAIL_ROWS); a passing row whose text
+     contains the word RED is not a failure row (#5042)
   2. the worktree HEAD is --tip and the bundle dir does not exist yet
   3. copies an ALLOWLIST only (never a glob): the 4 posture .out files, the exit-code transcript and the 2 peer fixtures
      from OUTD/evidence; removal-proof-full.log verbatim; bootstrap-cert-gate.log with the worktree path -> <repo-root>
@@ -37,6 +39,9 @@ EVIDENCE_FILES = (
     "peer-fingerprints.txt",
     "peer-attestation.json",
 )
+# Host path prefixes the leak scan refuses in any captured file. Built from parts so this script itself carries no
+# agent-scratch or tmpfs path literal (#5040); the set is unchanged from the attested generator.
+HOST_PATH_PREFIXES = tuple("/" + part for part in ("mnt/", "home/", "ai-scratch", "tmp/", "var/tmp", "private/tmp"))
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 RESULT = re.compile(r"test result: \w+\. \d+ passed; .*$")
 
@@ -81,19 +86,45 @@ def last_result(path):
     return hits[-1]
 
 
+# The failure rows run_cert.py writes (Run.fail() and the notes that mirror one), in the runner's OWN row grammar
+# (#5042). Every pattern is anchored to the start of the row, so a passing row whose free text merely contains RED
+# (the cert-expiry self-test summary reads "... watched-path violation RED with ...") never matches, and neither
+# does the `CERT-RED=0` summary.
+FAIL_ROWS = tuple(re.compile(p) for p in (
+    r"^\s+(RED|VACUOUS)\s+\S",  # self.fail("  RED <name>") and ("  VACUOUS <name> (0 passed)")
+    r"^[A-Z]+ WRONG-HEAD/DIRTY ",  # assert_tree
+    r"^RESTORE FAILED ",
+    r"^BCG left \d+ tracked ",
+    r"^DISK-FLOOR STOP ",
+    r"^GATES (DIRTY|: HEAD\^ is not )",
+    r"^\s+\S+ MISSING$",  # "  posture-legs-exit-codes.txt MISSING"
+    r"^\s+header: MISSING ",
+    r"^\s+removal-proof header does not name the tip$",
+    r"^\s+posture copy retarget failed ",
+))
+CHAIN_DONE = re.compile(r"^CHAIN_DONE aggregate_failures=(\d+)\b")
+
+
 def check_run(outd):
+    """Refuse unless the chain section of legs.log is green; return its COUNT_DIFF notes.
+
+    The chain section is every line up to and including the first `CHAIN_DONE aggregate_failures=<n>` row (#5042).
+    That row must say 0. Failure rows (FAIL_ROWS) are refused in the chain section and also after it, so a failing
+    gates row appended to an older shared legs.log still refuses; a PASSING gates row never does.
+    """
     log = outd / "legs.log"
     if not log.exists():
         raise Fatal(f"{log} missing")
-    text = read(log)
-    # The failure lines run_cert.py writes; `(^|\s)RED\s` so the `CERT-RED=0` summary does not match.
-    bad = [l for l in text.splitlines() if re.search(
-        r"(^|\s)RED\s|VACUOUS|WRONG-HEAD|RESTORE FAILED|MISSING|does not name the tip|left \d+ tracked|retarget failed", l)]
+    lines = read(log).splitlines()
+    done = next((i for i, l in enumerate(lines) if CHAIN_DONE.match(l)), None)
+    if done is None:
+        raise Fatal("legs.log has no `CHAIN_DONE aggregate_failures=0` line")
+    bad = [l for l in lines if any(r.search(l) for r in FAIL_ROWS)]
     if bad:
         raise Fatal("run is not green:\n  " + "\n  ".join(bad))
-    if not re.search(r"^CHAIN_DONE aggregate_failures=0\b", text, re.M):
-        raise Fatal("legs.log has no `CHAIN_DONE aggregate_failures=0` line")
-    return [l.strip() for l in text.splitlines() if "COUNT_DIFF" in l]
+    if CHAIN_DONE.match(lines[done]).group(1) != "0":
+        raise Fatal(f"chain is not green: {lines[done]}")
+    return [l.strip() for l in lines[: done + 1] if "COUNT_DIFF" in l]
 
 
 def test_results(outd, short, date):
@@ -130,7 +161,7 @@ def recapture_copy(wt, tip, short):
 
 
 def leak_patterns(wt, outd):
-    pats = {str(wt), str(outd), str(Path.home()), "/mnt/", "/home/", "/ai-scratch", "/tmp/", "/var/tmp", "/private/tmp"}
+    pats = {str(wt), str(outd), str(Path.home()), *HOST_PATH_PREFIXES}
     host = socket.gethostname()
     if host and len(host) > 3:
         pats.add(host)

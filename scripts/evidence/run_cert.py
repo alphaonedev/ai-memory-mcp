@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""§7 enterprise-federation cert re-issue runner (ai:rehearsal-f2h). Python port of /ai-scratch/f2h/certv2/*.sh.
+"""§7 enterprise-federation cert re-issue runner (ai:rehearsal-f2h). Python port of the certv2 shell harness.
 
 Subcommands (every one asserts the worktree HEAD == --tip and a clean tracked tree first):
   battery    release builds (default; --no-default-features sqlcipher,sal), posture recapture (4 legs),
@@ -12,7 +12,8 @@ Subcommands (every one asserts the worktree HEAD == --tip and a clean tracked tr
   gates      on the CERT COMMIT (HEAD = one commit on top of --tip): the cargo-free gates, the scope gate
              (only the cert doc + its evidence dir), %G? = G; pushes --push-branch only when fails == 0
 
-Every outcome is a line in OUTD/legs.log; exit status is the aggregate (0 = every leg green).
+Every outcome is a line in OUTD/legs.log (the gates leg: OUTD/gates.log, #5042); exit status is the aggregate
+(0 = every leg green). Paths default to the checkout (.local-runs/); see the --cargo-slot/--slot-lock/--targets/--tmpdir options.
 """
 import argparse
 import datetime
@@ -23,12 +24,18 @@ import subprocess
 import sys
 from pathlib import Path
 
-CARGO_SLOT = "/ai-scratch/deputy/cargo-slot.py"
-SLOT3_LOCK = "/ai-scratch/deputy/cargo-slot-3.lock"
-TMPDIR = "/mnt/t9/tmp/f2h"
-TARGETS = Path("/ai-scratch/f2h/targets")
+REPO_ROOT = Path(__file__).resolve().parents[2]
+# Repo-relative defaults (#5040). Each is overridable by an argument or an environment variable:
+#   --cargo-slot / CERT_CARGO_SLOT  optional cargo semaphore wrapper (unset: plain `cargo`)
+#   --slot-lock  / CERT_SLOT_LOCK    optional flock file serialising the removal-proof and bootstrap legs (unset: no flock)
+#   --targets    / CERT_TARGETS      cargo target dirs (default: <repo>/.local-runs/cert-targets)
+#   --tmpdir     / CERT_TMPDIR       TMPDIR for every leg (default: <repo>/.local-runs/cert-tmp; never a tmpfs)
+DEFAULT_TARGETS = REPO_ROOT / ".local-runs" / "cert-targets"
+DEFAULT_TMPDIR = REPO_ROOT / ".local-runs" / "cert-tmp"
 CERT_DOC = "docs/compliance/ENTERPRISE-FEDERATION-CERTIFICATION.md"
-FLOORS_GIB = {"/mnt/t9": 120, "/": 60}  # GiB, statvfs f_bavail; /mnt/t9 floor per GOD 7caf919e
+# GiB free required (statvfs f_bavail) on the build volume (holds the target dirs) and on the root volume; GOD 7caf919e.
+FLOOR_BUILD_GIB = 120
+FLOOR_ROOT_GIB = 60
 
 # Batch-6 baseline (cert-385da3a05/test-results.txt). A difference is logged as COUNT_DIFF, never silently accepted.
 BINS = {
@@ -53,7 +60,16 @@ class Run:
         self.wt = Path(a.wt)
         self.outd = Path(a.outd)
         self.outd.mkdir(parents=True, exist_ok=True)
-        self.log = self.outd / "legs.log"
+        # #5042: the gates leg runs after the chain and writes its own artifact, so the RUN-RECORD legs-log hash and
+        # the bundle builder's chain gate read the chain's rows alone.
+        self.log = self.outd / ("gates.log" if a.leg == "gates" else "legs.log")
+        self.targets = Path(getattr(a, "targets", None) or os.environ.get("CERT_TARGETS") or DEFAULT_TARGETS)
+        self.tmpdir = Path(getattr(a, "tmpdir", None) or os.environ.get("CERT_TMPDIR") or DEFAULT_TMPDIR)
+        slot = getattr(a, "cargo_slot", None) or os.environ.get("CERT_CARGO_SLOT") or ""
+        self.cargo = [slot, "cargo"] if slot else ["cargo"]
+        self.slot_lock = getattr(a, "slot_lock", None) or os.environ.get("CERT_SLOT_LOCK") or ""
+        self.targets.mkdir(parents=True, exist_ok=True)
+        self.tmpdir.mkdir(parents=True, exist_ok=True)
         self.bad = 0
         self.floor_tripped = False
         os.umask(0o022)
@@ -61,7 +77,7 @@ class Run:
         for k in ("XDG_CONFIG_HOME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL", "AI_MEMORY_AGENT_ID",
                   "AI_MEMORY_BIN", "AI_MEMORY_BIN_PG", "CARGO_TARGET_DIR", "CARGO_BUILD_JOBS"):
             self.env.pop(k, None)
-        self.env.update(AI_MEMORY_NO_CONFIG="1", TMPDIR=TMPDIR)
+        self.env.update(AI_MEMORY_NO_CONFIG="1", TMPDIR=str(self.tmpdir))
 
     @staticmethod
     def now(fmt="%H:%MZ"):
@@ -93,7 +109,7 @@ class Run:
         """GOD 7caf919e: df before every cargo leg, stop below the floor. Once tripped, nothing else runs."""
         if self.floor_tripped:
             return False
-        for mount, floor in FLOORS_GIB.items():
+        for mount, floor in ((self.targets, FLOOR_BUILD_GIB), (Path("/"), FLOOR_ROOT_GIB)):
             st = os.statvfs(mount)
             free = st.f_bavail * st.f_frsize / 2**30
             if free < floor:
@@ -111,6 +127,14 @@ class Run:
         with open(out, "wb") as f:
             return subprocess.run(argv, cwd=cwd or self.wt, env=env, stdout=f, stderr=subprocess.STDOUT,
                                   stdin=subprocess.DEVNULL).returncode
+
+    def low_priority(self, timeout_secs, script):
+        """argv running a repo gate script at low priority, under the optional slot flock (--slot-lock)."""
+        argv = ["flock", self.slot_lock] if self.slot_lock else []
+        argv += ["nice", "-n", "15"]
+        if shutil.which("ionice"):  # Linux only; the macOS node has no ionice
+            argv += ["ionice", "-c3"]
+        return [*argv, "timeout", timeout_secs, "bash", script]
 
     def last_result(self, path):
         hits = RESULT_RE.findall(Path(path).read_bytes().decode("utf-8", "replace"))
@@ -133,13 +157,13 @@ class Run:
             return self.bad
         st = os.stat(self.wt).st_mode & 0o777
         self.note(f"== CERT LEGS {self.now()} HEAD={self.tip} host={' '.join(os.uname()[0:3:2])} umask 022 wt={st:o}")
-        td_def, td_sql = TARGETS / "cert7-default", TARGETS / "cert7-sqlc"
+        td_def, td_sql = self.targets / "cert7-default", self.targets / "cert7-sqlc"
         for tag, td, extra, out in (
             ("BUILD_DEFAULT", td_def, [], "build-default.log"),
             ("BUILD_SQLCIPHER", td_sql, ["--no-default-features", "--features", "sqlcipher,sal"], "build-sqlcipher.log"),
         ):
             self.note(f"== {tag} {self.now()}")
-            rc = self.run([CARGO_SLOT, "cargo", "build", "-j", "6", "--release", *extra], self.outd / out,
+            rc = self.run([*self.cargo, "build", "-j", "6", "--release", *extra], self.outd / out,
                           {"CARGO_TARGET_DIR": str(td)})
             self.note(f"{tag}_EXIT {rc} {self.now()}")
             if rc != 0:
@@ -152,11 +176,11 @@ class Run:
         self.posture(dbin, sbin)
         for name, exp in BINS.items():
             out = self.outd / f"test-{name}.log"
-            rc = self.run([CARGO_SLOT, "cargo", "test", "-j", "6", "--test", name], out, {"CARGO_TARGET_DIR": str(td_def)})
+            rc = self.run([*self.cargo, "test", "-j", "6", "--test", name], out, {"CARGO_TARGET_DIR": str(td_def)})
             self.check_test("TEST", name, rc, out, exp)
         for name, exp in LIBS.items():
             out = self.outd / f"lib-{name.replace(':', '_')}.log"
-            rc = self.run([CARGO_SLOT, "cargo", "test", "-j", "6", "--lib", name], out, {"CARGO_TARGET_DIR": str(td_def)})
+            rc = self.run([*self.cargo, "test", "-j", "6", "--lib", name], out, {"CARGO_TARGET_DIR": str(td_def)})
             self.check_test("LIB", name, rc, out, exp)
         self.note(f"BATTERY_DONE aggregate_failures={self.bad} {self.now()}")
         return self.bad
@@ -194,12 +218,12 @@ class Run:
     def pg(self):
         if not self.assert_tree(self.tip, "PG"):
             return self.bad
-        env = {"CARGO_TARGET_DIR": str(TARGETS / "cert7-pg")}
+        env = {"CARGO_TARGET_DIR": str(self.targets / "cert7-pg")}
         out = self.outd / f"test-pg-{PG_BIN[0]}.log"
-        rc = self.run([CARGO_SLOT, "cargo", "test", "-j", "6", "--features", "sal-postgres", "--test", PG_BIN[0]], out, env)
+        rc = self.run([*self.cargo, "test", "-j", "6", "--features", "sal-postgres", "--test", PG_BIN[0]], out, env)
         self.check_test("PGTEST", f"{PG_BIN[0]} [sal-postgres]", rc, out, PG_BIN[1])
         out = self.outd / f"lib-pg-{PG_LIB[0]}.log"
-        rc = self.run([CARGO_SLOT, "cargo", "test", "-j", "6", "--features", "sal-postgres", "--lib", PG_LIB[0]], out, env)
+        rc = self.run([*self.cargo, "test", "-j", "6", "--features", "sal-postgres", "--lib", PG_LIB[0]], out, env)
         self.check_test("PGLIB", f"{PG_LIB[0]} [sal-postgres]", rc, out, PG_LIB[1])
         self.note(f"PG_DONE aggregate_failures={self.bad} {self.now()}")
         return self.bad
@@ -210,10 +234,9 @@ class Run:
         started = self.now("%Y-%m-%dT%H:%M:%SZ")
         self.note(f"== removal proof {self.now()} cargo={shutil.which('cargo')}")
         full = self.outd / "removal-proof-full.log"
-        env = {"CARGO_TARGET_DIR": str(TARGETS / "cert7-sal"), "CARGO_BUILD_JOBS": "2",
-               "AI_MEMORY_BIN": str(TARGETS / "cert7-default/release/ai-memory")}
-        rc = self.run(["flock", SLOT3_LOCK, "nice", "-n", "15", "ionice", "-c3", "timeout", "14400",
-                       "bash", "scripts/check-cert-removal-proof.sh"], full, env)
+        env = {"CARGO_TARGET_DIR": str(self.targets / "cert7-sal"), "CARGO_BUILD_JOBS": "2",
+               "AI_MEMORY_BIN": str(self.targets / "cert7-default/release/ai-memory")}
+        rc = self.run(self.low_priority("14400", "scripts/check-cert-removal-proof.sh"), full, env)
         text = full.read_bytes().decode("utf-8", "replace")
         overall = [l for l in text.splitlines() if "overall:" in l]
         proven, red = text.count("[PROVEN]"), text.count("CERT-RED]")
@@ -226,7 +249,7 @@ class Run:
             self.fail("  removal-proof header does not name the tip")
         with (self.outd / "cert-alone.out").open("w") as f:
             f.write(f"# f2h (ai:rehearsal-f2h) standalone removal proof; worktree {self.wt}; host {os.uname().sysname} "
-                    f"{os.uname().release}; flock {SLOT3_LOCK}; nice 15 ionice -c3 CARGO_BUILD_JOBS=2\n")
+                    f"{os.uname().release}; flock {self.slot_lock or 'none'}; nice 15 ionice -c3 CARGO_BUILD_JOBS=2\n")
             f.write(f"SHA={self.git('rev-parse', 'HEAD')}\nSTARTED={started}\n{text}")
             f.write(f"PROVEN={proven}/15\nCERT_EXIT={rc}\n")
         self.run(["bash", "scripts/check-cert-removal-proof.sh", "--force-restore"], self.outd / "force-restore.log",
@@ -244,8 +267,7 @@ class Run:
             return self.bad
         self.note(f"== bootstrap-cert-gate (self-build) {self.now()}")
         out = self.outd / "bootstrap-cert-gate.log"
-        rc = self.run(["flock", SLOT3_LOCK, "nice", "-n", "15", "ionice", "-c3", "timeout", "7200",
-                       "bash", "scripts/check-bootstrap-cert-gate.sh"], out, {"CARGO_BUILD_JOBS": "2"})
+        rc = self.run(self.low_priority("7200", "scripts/check-bootstrap-cert-gate.sh"), out, {"CARGO_BUILD_JOBS": "2"})
         lines = [l for l in out.read_bytes().decode("utf-8", "replace").splitlines() if l.strip()]
         self.note(f"BOOTSTRAP_CERT_GATE_EXIT {rc} :: {lines[-1][:200] if lines else 'EMPTY'}")
         if rc != 0:
@@ -285,10 +307,14 @@ class Run:
         if stray or CERT_DOC not in touched:
             self.fail("  RED scope: the cert commit may touch only the cert doc and its own evidence dir")
         gl = self.outd / "g"
+        # The expiry gate was ported from check-cert-expiry.sh to check_cert_expiry.py (#6137); a gated worktree
+        # older than the port still has the shell script.
+        expiry = ([sys.executable, "scripts/check_cert_expiry.py"] if (self.wt / "scripts/check_cert_expiry.py").is_file()
+                  else ["bash", "scripts/check-cert-expiry.sh"])
         checks = [
-            ("cert-expiry-upstream", ["bash", "scripts/check-cert-expiry.sh"], {}),
-            (f"cert-expiry-{prior_bind[:9]}", ["bash", "scripts/check-cert-expiry.sh"], {"CERT_EXPIRY_BASE": prior_bind}),
-            ("cert-expiry-selftest", ["bash", "scripts/check-cert-expiry.sh", "--self-test"], {}),
+            ("cert-expiry-upstream", expiry, {}),
+            (f"cert-expiry-{prior_bind[:9]}", expiry, {"CERT_EXPIRY_BASE": prior_bind}),
+            ("cert-expiry-selftest", [*expiry, "--self-test"], {}),
             ("removal-proof-header-selftest", ["bash", "scripts/check-cert-removal-proof.sh", "--self-test-header"], {}),
             ("docs-vs-ssot", ["bash", "scripts/check-docs-vs-ssot.sh"], {}),
             ("doc-anchors", ["bash", "scripts/check-doc-symbol-anchors.sh"], {}),
@@ -326,6 +352,12 @@ def main():
     ap.add_argument("--tip", required=True, help="full 40-hex CERT TIP FINAL sha")
     ap.add_argument("--wt", required=True)
     ap.add_argument("--outd", required=True)
+    ap.add_argument("--cargo-slot", default="", help="cargo semaphore wrapper, run as `<wrapper> cargo ...` "
+                    "(default: $CERT_CARGO_SLOT, else plain cargo)")
+    ap.add_argument("--slot-lock", default="", help="flock file serialising the removal-proof and bootstrap legs "
+                    "(default: $CERT_SLOT_LOCK, else no flock)")
+    ap.add_argument("--targets", default="", help=f"cargo target dirs (default: $CERT_TARGETS, else {DEFAULT_TARGETS})")
+    ap.add_argument("--tmpdir", default="", help=f"TMPDIR for every leg (default: $CERT_TMPDIR, else {DEFAULT_TMPDIR})")
     ap.add_argument("--prior-bind", default="385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5")
     ap.add_argument("--push-branch", default="", help="gates only: branch to push when fails == 0")
     ap.add_argument("--parent", default="", help="gates only: expected HEAD^ for a follow-up on the cert commit (default: --tip)")
