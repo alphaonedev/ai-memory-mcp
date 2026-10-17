@@ -100,10 +100,23 @@ class ClassifyTests(Base):
         self.assertEqual(self.cls('ser', '#[serial]\nfn t() {}').cls, 'a')
         self.assertEqual(self.cls('ser2', 'use serial_test::serial;').cls, 'a')
 
-    def test_federat_name_is_a(self):
+    def test_federat_name_alone_is_b_7343(self):
+        # #7343: a federation_* name with no Postgres / #[serial] / fixed-port
+        # evidence is self-contained (own tempdir, port 0), so the name alone no
+        # longer forces the serial shard.
         e = self.cls('federation_scale', 'fn x() {}')
-        self.assertEqual(e.cls, 'a')
-        self.assertIn('name:federat', e.reasons)
+        self.assertEqual((e.cls, e.reasons), ('b', []))
+
+    def test_federat_name_with_evidence_stays_a_7343(self):
+        bodies = ['use sqlx::query;', '#[serial]\nfn t() {}', 'use serial_test::serial;']
+        for i, body in enumerate(bodies):
+            e = self.cls('federation_ev%d' % i, body)
+            self.assertEqual(e.cls, 'a', body)
+            self.assertNotIn('name:federat', e.reasons)
+
+    def test_federat_name_with_fixed_port_shares_a_half_7343(self):
+        e = self.cls('federation_port', 'let a = "127.0.0.1:9077";')
+        self.assertEqual((e.cls, e.shared), ('b', ['port']))
 
     def test_unknown_source_is_a(self):
         e = pt.Exe('test', 'ghost', str(SCRATCH / 'tests' / 'ghost.rs'), '/x/ghost')
@@ -152,7 +165,7 @@ class PartitionTests(Base):
         return w
 
     def test_disjoint_and_complete(self):
-        exes = self.build({'a1': 'PgPool', 'b1': '', 'b2': '', 'b3': '', 'federation_x': ''})
+        exes = self.build({'a1': 'PgPool', 'b1': '', 'b2': '', 'b3': '', 'federation_x': 'PgPool'})
         serial, h1, h2, has_lib, totals, _ = pt.partition(
             exes, self.weights(a1=1, b1=40, b2=30, b3=20, federation_x=2), ['store::postgres'])
         pt.write_lists(SCRATCH / 'out', serial, h1, h2, has_lib)

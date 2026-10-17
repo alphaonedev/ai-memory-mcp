@@ -5,7 +5,7 @@ Input is the stdout of ``cargo test --no-run --message-format=json`` (or
 ``json-render-diagnostics``), read from ``--build-json`` or stdin, plus the
 repository sources. Output is written to ``--out-dir``:
 
-* ``serial.txt``      class (a): Postgres / ``#[serial]`` / ``federat`` in the name /
+* ``serial.txt``      class (a): Postgres / ``#[serial]`` evidence (#7343: not the name alone) /
                       unknown source. Run at ``--test-threads=1`` in ONE process.
                       Also carries ``--lib`` (the lib unittests filtered to the
                       Postgres test-name prefixes).
@@ -58,7 +58,6 @@ PG_RE = re.compile(
     r'|pg_barrier|lane_db|pg_sources|pg_blocking_pids'
 )
 SERIAL_RE = re.compile(r'serial_test|#\[serial')
-FEDERAT_RE = re.compile(r'federat', re.IGNORECASE)
 # Class (b) binaries carrying these run in the SAME half so two of them never
 # run in different processes at once.
 PORT_RE = re.compile(r'(?:127\.0\.0\.1|localhost|0\.0\.0\.0):(?!0\b)\d{2,5}\b')
@@ -634,8 +633,10 @@ def classify(exe, index=None):
         reasons.append('serial')
     elif 'serial' in inherited:
         reasons.append('serial-helper:' + inherited['serial'])
-    if FEDERAT_RE.search(exe.name):
-        reasons.append('name:federat')
+    # #7343: a federat* NAME is no longer evidence by itself. 45 of the federation
+    # binaries carry no Postgres / #[serial] / fixed-port evidence (own tempdir,
+    # 127.0.0.1:0 listeners, per-process env), so the evidence rules above and the
+    # shared-port grouping below decide, exactly as for every other binary.
     if unresolved:
         reasons.append('unresolved-mod')
     if reasons:
