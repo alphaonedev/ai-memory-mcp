@@ -338,11 +338,16 @@ def server_caps_sql(env: Dict[str, str]) -> str:
     lock_cap_ms = cap_ms - gap_ms
     if lock_cap_ms <= 0:
         each, addresses, passes = _connect_plan(env)
+        asked = env.get('PGCONNECT_TIMEOUT', '')
+        used = '%d s' % each if str(each) == asked else '%d s, floored from %s s' % (each, asked)
+        mode = env.get('PGSSLMODE', 'prefer')
+        fix = ('lower connect_timeout, reduce the resolved addresses (hostaddr) or set sslmode=require'
+               if passes == 2 else
+               'lower connect_timeout or reduce the resolved addresses (set hostaddr)')
         raise WrapperError(
-            'the connect budget (%d s = connect_timeout %d s x %d address(es) x %d sslmode pass(es), '
-            'sslmode=%s) leaves no room for a server-side statement cap under the %g s psql limit; lower '
-            'connect_timeout or set sslmode=require' % (budget, each, addresses, passes,
-                                                        env.get('PGSSLMODE', 'prefer'), PSQL_TIMEOUT_SECS))
+            'the connect budget (%d s = connect_timeout %s x %d address(es) x %d sslmode pass(es), '
+            'sslmode=%s) leaves no room for a server-side statement cap under the %g s psql limit; %s'
+            % (budget, used, addresses, passes, mode, PSQL_TIMEOUT_SECS, fix))
     return (
         "DO $cap$ DECLARE s bigint; l bigint; BEGIN "
         "PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true); "
@@ -356,24 +361,174 @@ def server_caps_sql(env: Dict[str, str]) -> str:
         "END $cap$" % {'cap': cap_ms, 'lock': lock_cap_ms, 'gap': gap_ms, 'twice': 2 * gap_ms})
 
 
-# Caller SQL that would undo the server cap or run outside it: SET/RESET of the two timeouts (also inside ALTER
-# ROLE/DATABASE ... SET), RESET ALL and DISCARD ALL (both reset them), any set_config (its name argument can be
-# built at run time), and a second statement (the cap bounds each statement, not the whole -c string, #7521).
-_CAP_OVERRIDE_RE = re.compile(
-    r'\b(?:set|reset)\b[^;]*?\b(?:statement_timeout|lock_timeout)\b|\breset\s+all\b|\bdiscard\s+all\b'
-    r'|\bset_config\b', re.IGNORECASE)
+# Caller SQL that would undo the server cap or run outside it (#7521, #7550, #7551): a second statement (the cap
+# bounds each statement, not the whole -c string), SET/RESET of statement_timeout or lock_timeout in any
+# spelling (also inside ALTER ROLE/DATABASE ... SET), RESET ALL, DISCARD ALL, SET/RESET [SESSION] AUTHORIZATION,
+# SET/RESET ROLE, any set_config (its name argument can be built at run time) and DO (its dollar-quoted body is
+# code the guard cannot inspect). The SQL is tokenised first, so text inside a literal, a quoted identifier, a
+# dollar quote or a comment never counts, and a Unicode-escaped name is decoded before it is compared.
+_IDENT_START_RE = re.compile(r'[A-Za-z_\x80-\U0010ffff]')
+_IDENT_BODY_RE = re.compile(r'[A-Za-z0-9_$\x80-\U0010ffff]*')
+_DOLLAR_TAG_RE = re.compile(r'\$(?:[A-Za-z_\x80-\U0010ffff][A-Za-z0-9_\x80-\U0010ffff]*)?\$')
+_HEX_RE = re.compile(r'[0-9A-Fa-f]+')
+_TIMEOUT_NAMES = frozenset(('statement_timeout', 'lock_timeout'))
+_STR, _IDENT, _SEMI, _OTHER = 'str', 'ident', ';', 'other'
+
+
+def _unicode_unescape(body: str, escape: str) -> str:
+    """Decode the ``\\XXXX`` / ``\\+XXXXXX`` / doubled-escape forms of a ``U&`` literal or identifier."""
+    out: List[str] = []
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch != escape:
+            out.append(ch)
+            i += 1
+        elif body[i + 1:i + 2] == escape:
+            out.append(escape)
+            i += 2
+        else:
+            width = 6 if body[i + 1:i + 2] == '+' else 4
+            digits = body[i + 1 + (width == 6):i + 1 + (width == 6) + width]
+            if len(digits) != width or _HEX_RE.fullmatch(digits) is None:
+                raise WrapperError('refusing SQL with a malformed Unicode escape (%r)' % body[:40])
+            try:
+                out.append(chr(int(digits, 16)))
+            except (ValueError, OverflowError):
+                raise WrapperError('refusing SQL with an invalid Unicode code point (%r)' % body[:40])
+            i += 1 + (width == 6) + width
+    return ''.join(out)
+
+
+def _quoted_end(sql: str, i: int, quote: str, backslash: bool) -> int:
+    """Index just past the closing ``quote`` of the quoted run whose opening quote is at ``sql[i]``; a doubled
+    quote is an escaped one. Raises on an unterminated run (fail closed)."""
+    i += 1
+    while i < len(sql):
+        ch = sql[i]
+        if backslash and ch == '\\':
+            i += 2
+        elif ch == quote:
+            if sql[i + 1:i + 2] == quote:
+                i += 2
+            else:
+                return i + 1
+        else:
+            i += 1
+    raise WrapperError('refusing SQL the guard cannot tokenise: unterminated quote (%r)' % sql[:60])
+
+
+def _tokenise(sql: str) -> List[Tuple[str, str]]:
+    """``(kind, value)`` tokens of one SQL text: identifiers lower-cased and decoded, every literal and dollar
+    quote one opaque ``str`` token, comments dropped (``/* */`` nests). Raises ``WrapperError`` on anything it
+    cannot tokenise, including a plain literal whose end differs depending on standard_conforming_strings."""
+    tokens: List[Tuple[str, str]] = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        nxt = sql[i + 1:i + 2]
+        if ch.isspace():
+            i += 1
+        elif ch == '-' and nxt == '-':
+            newline = sql.find('\n', i)
+            i = n if newline < 0 else newline + 1
+        elif ch == '/' and nxt == '*':
+            depth, i = 1, i + 2
+            while depth:
+                if i >= n:
+                    raise WrapperError('refusing SQL the guard cannot tokenise: unterminated comment (%r)' % sql[:60])
+                if sql.startswith('/*', i):
+                    depth, i = depth + 1, i + 2
+                elif sql.startswith('*/', i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        elif ch == ';':
+            tokens.append((_SEMI, ';'))
+            i += 1
+        elif ch == '\\':
+            raise WrapperError('refusing SQL with a backslash outside a literal (a psql meta-command?) (%r)'
+                               % sql[:60])
+        elif ch == "'":
+            end = _quoted_end(sql, i, "'", False)
+            if '\\' in sql[i:end] and _quoted_end(sql, i, "'", True) != end:
+                raise WrapperError('refusing SQL whose string literal ends differently under '
+                                   'standard_conforming_strings=off (%r)' % sql[:60])
+            tokens.append((_STR, sql[i + 1:end - 1]))
+            i = end
+        elif ch == '"':
+            end = _quoted_end(sql, i, '"', False)
+            tokens.append((_IDENT, sql[i + 1:end - 1].replace('""', '"').lower()))
+            i = end
+        elif ch == '$' and _DOLLAR_TAG_RE.match(sql, i):
+            tag = _DOLLAR_TAG_RE.match(sql, i).group(0)
+            close = sql.find(tag, i + len(tag))
+            if close < 0:
+                raise WrapperError('refusing SQL the guard cannot tokenise: unterminated dollar quote (%r)'
+                                   % sql[:60])
+            tokens.append((_STR, sql[i + len(tag):close]))
+            i = close + len(tag)
+        elif _IDENT_START_RE.match(ch):
+            end = i + 1 + len(_IDENT_BODY_RE.match(sql, i + 1).group(0))
+            word = sql[i:end]
+            lowered = word.lower()
+            if lowered == 'e' and sql[end:end + 1] == "'":
+                close = _quoted_end(sql, end, "'", True)
+                tokens.append((_STR, sql[end + 1:close - 1]))
+                i = close
+            elif lowered in ('b', 'x', 'n') and sql[end:end + 1] == "'":
+                close = _quoted_end(sql, end, "'", False)
+                tokens.append((_STR, sql[end + 1:close - 1]))
+                i = close
+            elif lowered == 'u' and sql[end:end + 2] in ("&'", '&"'):
+                quote = sql[end + 1]
+                close = _quoted_end(sql, end + 1, quote, False)
+                body = sql[end + 2:close - 1]
+                escape, i = '\\', close
+                uescape = re.compile(r'\s*uescape\s*\'(.?)\'', re.IGNORECASE).match(sql, close)
+                if uescape is not None:
+                    escape, i = uescape.group(1), uescape.end()
+                    if not escape or escape in '+\'"' or escape.isspace() or _HEX_RE.fullmatch(escape):
+                        raise WrapperError('refusing SQL with an invalid UESCAPE character (%r)' % sql[:60])
+                if quote == '"':
+                    body = body.replace('""', '"')
+                    tokens.append((_IDENT, _unicode_unescape(body, escape).lower()))
+                else:
+                    _unicode_unescape(body.replace("''", "'"), escape)
+                    tokens.append((_STR, body))
+            else:
+                tokens.append((_IDENT, lowered))
+                i = end
+        else:
+            tokens.append((_OTHER, ch))
+            i += 1
+    return tokens
 
 
 def _refuse_uncapped_sql(sql: str) -> None:
-    body = sql.strip()
-    if body.endswith(';'):
-        body = body[:-1]
-    if ';' in body:
+    tokens = _tokenise(sql)
+    if tokens and tokens[-1][0] == _SEMI:
+        tokens = tokens[:-1]
+    if any(kind == _SEMI for kind, _ in tokens):
         raise WrapperError('refusing SQL with more than one statement: the server cap bounds one statement '
                            'per psql call (%r)' % sql[:80])
-    if _CAP_OVERRIDE_RE.search(body):
-        raise WrapperError('refusing SQL that sets or resets statement_timeout or lock_timeout: the server cap '
-                           'must stay in force (%r)' % sql[:80])
+    words = [(kind == _IDENT, value) for kind, value in tokens]
+    for index, (is_word, value) in enumerate(words):
+        if not is_word:
+            continue
+        ahead = [v for w, v in words[index + 1:index + 4] if w]
+        while ahead[:1] in (['session'], ['local']) and ahead[1:2] not in ([], ['authorization']):
+            ahead = ahead[1:]
+        bad = (
+            value in ('set_config', 'do')
+            or (value in ('reset', 'discard') and ahead[:1] == ['all'])
+            or (value in ('set', 'reset') and (
+                ahead[:1] in (['role'], ['authorization']) or ahead[:2] == ['session', 'authorization']
+                or any(w and v in _TIMEOUT_NAMES for w, v in words[index + 1:]))))
+        if bad:
+            raise WrapperError('refusing SQL that sets or resets statement_timeout or lock_timeout, the role or '
+                               'the session, or runs code the guard cannot read: the server cap must stay in '
+                               'force (%r)' % sql[:80])
 
 
 def psql(url: str, sql: str, tuples: bool = False) -> str:
