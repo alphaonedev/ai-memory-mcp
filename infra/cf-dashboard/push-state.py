@@ -7,30 +7,21 @@ Pages-only model: writes public/state.json next to this file and redeploys the P
   push-state.py path/to/state.json      # update from a file
   push-state.py -                       # read state JSON from stdin
 
-~/.env carries TWO CLOUDFLARE_API_TOKEN lines; the SECOND is a Workers AI token with no Pages edit
-permission, so the FIRST line is taken explicitly (never `source` the file).
+Credentials follow cfcommon.py (same precedence as deploy.py): process env first, then the FIRST
+~/.env line. ~/.env carries TWO CLOUDFLARE_API_TOKEN lines; the SECOND is a Workers AI token with no
+Pages edit permission, so the file is never sourced.
 """
 import argparse
 import datetime
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cfcommon  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
-PROJECT = "agenticmem-test"
-
-
-def env_first(name):
-    """First `name=` line of ~/.env, quotes and spaces stripped; empty string when absent."""
-    try:
-        for ln in (Path.home() / ".env").read_text().splitlines():
-            if ln.startswith(name + "="):
-                return ln.split("=", 1)[1].strip().strip("\"' ")
-    except OSError:
-        pass
-    return ""
 
 
 def main():
@@ -53,16 +44,18 @@ def main():
     (HERE / "public").mkdir(exist_ok=True)
     (HERE / "public" / "state.json").write_text(text + "\n")
 
-    token = env_first("CLOUDFLARE_API_TOKEN")
-    if not token:
-        print("push-state: CLOUDFLARE_API_TOKEN missing from ~/.env", file=sys.stderr)
+    try:
+        token, acct = cfcommon.load_credentials(require_account=False)
+    except cfcommon.CredentialError as e:
+        print("push-state: " + str(e), file=sys.stderr)
         return 1
     env = dict(os.environ, CLOUDFLARE_API_TOKEN=token)
-    acct = env_first("CLOUDFLARE_ACCOUNT_ID")
     if acct:
         env["CLOUDFLARE_ACCOUNT_ID"] = acct
-    p = subprocess.run(["wrangler", "pages", "deploy", "public", "--project-name", PROJECT, "--branch", "main",
-                        "--commit-dirty=true"], cwd=str(HERE), env=env, capture_output=True, text=True)
+    p = cfcommon.run_wrangler(env, str(HERE))
+    if p is None:
+        print("push-state: wrangler pages deploy timed out", file=sys.stderr)
+        return 1
     lines = [ln for ln in (p.stdout + p.stderr).splitlines()
              if any(k in ln.lower() for k in ("deploy", "http", "view", "uploaded"))]
     print("\n".join(lines[-5:]))

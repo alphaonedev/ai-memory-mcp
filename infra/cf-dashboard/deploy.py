@@ -3,49 +3,27 @@
 
 Port of the former deploy.sh (#7313). Pages-only (no KV/Workers scope needed). Idempotent-ish.
 
-Credentials (never committed; wrangler.toml carries no account id): CLOUDFLARE_API_TOKEN and
-CLOUDFLARE_ACCOUNT_ID are read from the process environment, falling back to the FIRST matching
-line of ~/.env (the file may carry a second, unrelated token line, so it is never sourced).
+Credentials (never committed; wrangler.toml carries no account id): see cfcommon.py. Process env
+first, then the FIRST matching ~/.env line; the account id must be 32 lowercase hex characters.
 
 Exit codes: 0 ok, 1 missing credentials or an API/deploy failure.
 """
 import argparse
 import json
 import os
-import subprocess
 import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cfcommon  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
-PROJECT = "agenticmem-test"
+PROJECT = cfcommon.PROJECT
 DOMAIN = "test.agenticmem.co"
 API = "https://api.cloudflare.com/client/v4"
-
-# Per-page state files the external publisher pushes next to the live public/state.json.
-PAGE_STATE_FILES = (
-    "northstar-state.json",
-    "security-state.json",
-    "mcp-tools-state.json",
-    "swarm-tools-state.json",
-    "datatier-state.json",
-    "federation-state.json",
-)
-
-
-def env_first(name):
-    """Process env value, else the first `name=` line of ~/.env; empty string when absent."""
-    if os.environ.get(name):
-        return os.environ[name]
-    try:
-        for ln in (Path.home() / ".env").read_text().splitlines():
-            if ln.startswith(name + "="):
-                return ln.split("=", 1)[1].strip().strip("\"' ")
-    except OSError:
-        pass
-    return ""
-
+ALREADY_EXISTS = "already exists"
 
 def api(token, method, path, body=None):
     """Call the Cloudflare API; return (http_ok, parsed_json_or_None)."""
@@ -66,13 +44,29 @@ def api(token, method, path, body=None):
         return False, None
 
 
+def attach_domain(token, acct):
+    """Attach the custom domain; only the Cloudflare "already exists" error counts as success."""
+    ok, d = api(token, "POST", "/accounts/%s/pages/projects/%s/domains" % (acct, PROJECT), {"name": DOMAIN})
+    if ok and d:
+        r = d.get("result") or {}
+        print("  domain:", r.get("name"), "-", r.get("status") or d.get("errors"))
+        return 0
+    errors = (d or {}).get("errors") or []
+    if any(ALREADY_EXISTS in str(e.get("message", "")).lower() for e in errors if isinstance(e, dict)):
+        print("  (domain already attached)")
+        return 0
+    codes = [e.get("code") for e in errors if isinstance(e, dict)]
+    print("deploy: custom domain attach failed (error codes: %s)" % (codes or "none"), file=sys.stderr)
+    return 1
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.parse_args()
-    token = env_first("CLOUDFLARE_API_TOKEN")
-    acct = env_first("CLOUDFLARE_ACCOUNT_ID")
-    if not token or not acct:
-        print("deploy: CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are required", file=sys.stderr)
+    try:
+        token, acct = cfcommon.load_credentials(require_account=True)
+    except cfcommon.CredentialError as e:
+        print("deploy: " + str(e), file=sys.stderr)
         return 1
 
     print("== 0. verify token (account-scoped) ==")
@@ -96,8 +90,10 @@ def main():
 
     print("== 2. deploy static dashboard + state.json ==")
     env = dict(os.environ, CLOUDFLARE_API_TOKEN=token, CLOUDFLARE_ACCOUNT_ID=acct)
-    p = subprocess.run(["wrangler", "pages", "deploy", "public", "--project-name", PROJECT, "--branch", "main",
-                        "--commit-dirty=true"], cwd=str(HERE), env=env, capture_output=True, text=True)
+    p = cfcommon.run_wrangler(env, str(HERE))
+    if p is None:
+        print("deploy: wrangler pages deploy timed out", file=sys.stderr)
+        return 1
     keys = ("deploy", "http", "view", "uploaded", "success")
     lines = [ln for ln in (p.stdout + p.stderr).splitlines() if any(k in ln.lower() for k in keys)]
     print("\n".join(lines[-8:]))
@@ -106,12 +102,9 @@ def main():
         return 1
 
     print("== 3. custom domain %s ==" % DOMAIN)
-    ok, d = api(token, "POST", "/accounts/%s/pages/projects/%s/domains" % (acct, PROJECT), {"name": DOMAIN})
-    if ok and d:
-        r = d.get("result") or {}
-        print("  domain:", r.get("name"), "-", r.get("status") or d.get("errors"))
-    else:
-        print("  (domain may already be attached)")
+    rc = attach_domain(token, acct)
+    if rc != 0:
+        return rc
 
     print()
     print("DONE - https://" + DOMAIN)
