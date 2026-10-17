@@ -84,6 +84,61 @@ trait AuditProbe {
     async fn install_audit_fault(&self);
     /// Remove the fault again.
     async fn remove_audit_fault(&self);
+    /// The `created_at` stamp of the stored `src -> dst derived_from` edge,
+    /// rendered the way the backend re-reads it (the sqlite stored string; the
+    /// postgres `timestamptz` re-rendered as RFC 3339).
+    async fn stored_edge_created_at(&self, src: &str, dst: &str) -> String;
+    /// Is there a `memory_link.created` audit row with this `payload_hash`?
+    async fn link_audit_has_payload_hash(&self, hash: &[u8]) -> bool;
+}
+
+/// #7565 scenario C: the `memory_link.created` audit pre-image of every
+/// consolidated edge re-derives from the STORED edge row. The audit hashes the
+/// edge's `created_at` / `valid_from`; if the writer hashed a finer instant than
+/// the column keeps (nanoseconds vs `timestamptz` microseconds), the hash could
+/// not be re-derived from the persisted edge.
+async fn audit_pre_image_rederives_from_stored_edge(
+    store: &dyn MemoryStore,
+    probe: &impl AuditProbe,
+) {
+    enable_tombstone_path();
+    let ns = unique_ns("rederive");
+    let ctx = CallerContext::for_agent(OWNER.to_string());
+    let a = row(&ns, "a rederive");
+    let b = row(&ns, "b rederive");
+    store.store(&ctx, &a).await.expect("seed a");
+    store.store(&ctx, &b).await.expect("seed b");
+    let summary_id = store
+        .consolidate(
+            &ctx,
+            &[a.id.clone(), b.id.clone()],
+            "summary rederive",
+            "merged",
+            &ns,
+            &Tier::Long,
+            "consolidation",
+            OWNER,
+        )
+        .await
+        .expect("a visible cluster consolidates");
+    for src in [&a.id, &b.id] {
+        let stamp = probe.stored_edge_created_at(&summary_id, src).await;
+        let signable = ai_memory::identity::sign::SignableLink {
+            src_id: &summary_id,
+            dst_id: src,
+            relation: "derived_from",
+            observed_by: None,
+            created_at: Some(&stamp),
+            valid_from: Some(&stamp),
+            valid_until: None,
+        };
+        let cbor = ai_memory::identity::sign::canonical_cbor(&signable).expect("canonical cbor");
+        let hash = ai_memory::signed_events::payload_hash(&cbor);
+        assert!(
+            probe.link_audit_has_payload_hash(&hash).await,
+            "#7565: the audit pre-image for edge {summary_id}->{src} must re-derive from the stored edge (stamp {stamp})"
+        );
+    }
 }
 
 /// #7092 scenario A: consolidating two visible sources on the tombstone path
@@ -196,6 +251,29 @@ impl AuditProbe for SqliteProbe<'_> {
             .execute_batch("DROP TRIGGER IF EXISTS x7092_audit_fault;")
             .expect("drop fault trigger");
     }
+
+    async fn stored_edge_created_at(&self, src: &str, dst: &str) -> String {
+        self.conn()
+            .query_row(
+                "SELECT created_at FROM memory_links WHERE source_id = ?1 AND target_id = ?2 \
+                 AND relation = 'derived_from'",
+                [src, dst],
+                |r| r.get(0),
+            )
+            .expect("read stored edge")
+    }
+
+    async fn link_audit_has_payload_hash(&self, hash: &[u8]) -> bool {
+        let n: i64 = self
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM signed_events WHERE event_type = ?1 AND payload_hash = ?2",
+                rusqlite::params![LINK_CREATED, hash],
+                |r| r.get(0),
+            )
+            .expect("count audit rows by hash");
+        n > 0
+    }
 }
 
 fn sqlite_store() -> (tempfile::TempDir, SqliteStore, std::path::PathBuf) {
@@ -217,6 +295,13 @@ async fn sqlite_consolidate_audit_failure_aborts_cluster_7092() {
     let _serial = SERIAL.lock().await;
     let (_dir, store, path) = sqlite_store();
     audit_failure_aborts_cluster(&store, &SqliteProbe { path: &path }).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sqlite_consolidate_audit_pre_image_rederives_7565() {
+    let _serial = SERIAL.lock().await;
+    let (_dir, store, path) = sqlite_store();
+    audit_pre_image_rederives_from_stored_edge(&store, &SqliteProbe { path: &path }).await;
 }
 
 #[cfg(feature = "sal-postgres")]
@@ -263,6 +348,31 @@ impl AuditProbe for PgProbe {
             .await
             .expect("drop fault trigger");
     }
+
+    async fn stored_edge_created_at(&self, src: &str, dst: &str) -> String {
+        let stored: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
+            "SELECT created_at FROM memory_links WHERE source_id = $1 AND target_id = $2 \
+             AND relation = 'derived_from'",
+        )
+        .bind(src)
+        .bind(dst)
+        .fetch_one(&self.pool)
+        .await
+        .expect("read stored edge");
+        stored.to_rfc3339()
+    }
+
+    async fn link_audit_has_payload_hash(&self, hash: &[u8]) -> bool {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM signed_events WHERE event_type = $1 AND payload_hash = $2",
+        )
+        .bind(LINK_CREATED)
+        .bind(hash)
+        .fetch_one(&self.pool)
+        .await
+        .expect("count audit rows by hash");
+        n > 0
+    }
 }
 
 #[cfg(feature = "sal-postgres")]
@@ -300,4 +410,14 @@ async fn postgres_consolidate_audit_failure_aborts_cluster_7092() {
         return;
     };
     audit_failure_aborts_cluster(&store, &probe).await;
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn postgres_consolidate_audit_pre_image_rederives_7565() {
+    let _serial = SERIAL.lock().await;
+    let Some((store, probe)) = pg_parts().await else {
+        return;
+    };
+    audit_pre_image_rederives_from_stored_edge(&store, &probe).await;
 }

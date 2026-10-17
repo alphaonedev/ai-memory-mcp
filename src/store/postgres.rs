@@ -28549,6 +28549,11 @@ impl MemoryStore for PostgresStore {
                 // cid mirror, and flip `lifecycle_state` to `tombstoned`.
                 // The source's own inbound provenance edges survive (no
                 // delete, no CASCADE), so multi-hop lineage stays walkable.
+                // #7565 — truncate ONCE to the column's microsecond precision
+                // and use that instant for both the bind and the audit
+                // pre-image, so the hash re-derives from the stored edge
+                // (#3291 class; same fixpoint as `link_internal`).
+                let edge_now = truncate_to_microseconds(now);
                 let edge_inserted = sqlx::query(
                     "INSERT INTO memory_links
                          (source_id, target_id, relation, created_at, valid_from,
@@ -28559,7 +28564,7 @@ impl MemoryStore for PostgresStore {
                 .bind(&new_id)
                 .bind(id)
                 .bind(crate::models::MemoryLinkRelation::DerivedFrom.as_str())
-                .bind(now)
+                .bind(edge_now)
                 .bind(crate::models::AttestLevel::Unsigned.as_str())
                 .bind(new_row_cid.as_deref())
                 .bind(source_cid.as_deref())
@@ -28574,7 +28579,8 @@ impl MemoryStore for PostgresStore {
                 // summary, no edge and no audit row commit) and fold the
                 // off-table anchor into the one emitted after the COMMIT.
                 if edge_inserted > 0 {
-                    let created_at_owned = now.to_rfc3339();
+                    let created_at_owned =
+                        crate::identity::attest::canonical_created_at_stamp(edge_now);
                     let created_at_str = created_at_owned.as_str();
                     let signable = crate::identity::sign::SignableLink {
                         src_id: &new_id,
