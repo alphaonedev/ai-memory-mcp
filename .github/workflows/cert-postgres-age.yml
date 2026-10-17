@@ -180,6 +180,9 @@ jobs:
             if [ -d "$d" ]; then
               echo "$d" >> "$GITHUB_PATH"
               PATH="$d:$PATH"
+              # #7130/#7324: the AGE lock-leak cell races on a private
+              # postmaster built from THIS install, never on the shared tier.
+              echo "AI_MEMORY_TEST_PG_BINDIR=$d" >> "$GITHUB_ENV"
             fi
           done
           export PATH
