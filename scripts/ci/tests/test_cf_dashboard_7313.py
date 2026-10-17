@@ -902,37 +902,44 @@ function renderAll(D) { if (!Array.isArray(D.dimensions)) throw new TypeError("s
         self.assertTrue(out["recovered"].startswith("connected"), out)
         self.assertTrue(out["recoveredAfterTick"].startswith("connected"), out)
 
-    # the Google Fonts stylesheet (style-src) names font files on fonts.gstatic.com: a font load no page tag shows
-    INDIRECT_LOADS = (("font", "https://fonts.gstatic.com", "/s/font.woff2"),)
-
     def test_headers_csp_matches_loaded_origins(self):
         headers = (PUBLIC / "_headers").read_text()
-        csp = re.search(r"Content-Security-Policy: (.*)", headers)
-        self.assertIsNotNone(csp, "no Content-Security-Policy")
-        csp = csp.group(1)
-        self.assertIn("frame-ancestors 'none'", csp)
+        self.assertIsNotNone(re.search(r"Content-Security-Policy: (.*)", headers), "no Content-Security-Policy")
+        self.assertIn("frame-ancestors 'none'", headers)
         self.assertIn("X-Frame-Options: DENY", headers)
         self.assertEqual(headers.count("/state.json"), 0, "redundant /state.json rule (covered by /*.json)")
-        policy = origin_mod.parse_policy(csp)
-        self.assertEqual(policy.invalid, [], "invalid CSP source expressions (browsers ignore them)")
-        loads = []
+        loads, seen = [], {}
         for page in sorted(PUBLIC.glob("*.html")):
-            loads.extend(origin_mod.loaded_resources(page.read_text()))
-        loads.extend(origin_mod.Load(kind, origin, path, "") for kind, origin, path in self.INDIRECT_LOADS)
-        self.assertTrue([ld for ld in loads if ld.kind == "style"], "expected external stylesheet loads")
-        for load in loads:
-            self.assertIsNotNone(origin_mod.effective_directive(policy, load.kind), "no directive governs %s" % (load,))
-        # each resource is checked against the directive that governs ITS kind (CSP3 fallback, no merging)
-        blocked = [ld for ld in loads if not origin_mod.load_allowed(policy, ld)]
-        self.assertEqual(blocked, [], "loads not allowed by their own CSP directive (or unparsed): %s" % blocked)
+            html = page.read_text(encoding="utf-8")
+            page_loads = origin_mod.page_loads(html)
+            loads.extend(page_loads + origin_mod.derived_loads(page_loads))
+            # every policy the page gets (each header line of every matching rule, each meta policy) is enforced
+            # independently: a load must pass all of them (#7591)
+            for path in origin_mod.served_paths(page.name):
+                lines = origin_mod.header_policies(headers, path)
+                self.assertTrue(lines, "no Content-Security-Policy applies to %s" % path)
+                policies = origin_mod.policies_of(html, lines)
+                for policy in policies:
+                    self.assertEqual(policy.invalid, [], "invalid CSP source expressions (browsers ignore them)")
+                    seen.setdefault(id(policy), policy)
+                every = page_loads + origin_mod.derived_loads(page_loads)
+                for load in every:
+                    self.assertTrue(any(origin_mod.effective_directive(p, load.kind) for p in policies),
+                                    "no directive governs %s" % (load,))
+                blocked = [ld for ld in every if not all(origin_mod.load_allowed(p, ld) for p in policies)]
+                self.assertEqual(blocked, [], "%s: loads not allowed by every policy of the page: %s" % (path, blocked))
+        self.assertTrue([ld for ld in loads if ld.kind == "style" and ld.origin.startswith("https://")],
+                        "expected external stylesheet loads")
+        # a host source no load of its directive uses is a needless allowance
         unused = []
-        for name, entries in policy.directives.items():
-            for kind, value in entries:
-                if kind != "host":
-                    continue
-                users = [ld for ld in loads if origin_mod.effective_directive(policy, ld.kind) == name]
-                if not any(origin_mod.source_allows(value, ld.origin, ld.path) for ld in users):
-                    unused.append((name, value))
+        for policy in seen.values():
+            for name, entries in policy.directives.items():
+                for kind, value in entries:
+                    if kind != "host":
+                        continue
+                    users = [ld for ld in loads if origin_mod.effective_directive(policy, ld.kind) == name]
+                    if not any(origin_mod.source_allows(value, ld.origin, ld.path) for ld in users):
+                        unused.append((name, value))
         self.assertEqual(unused, [], "CSP allows origins no resource of that directive uses")
 
 

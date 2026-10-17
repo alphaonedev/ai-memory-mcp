@@ -41,11 +41,11 @@ CASES = (
     ("style import url() allowed", ["style-src 'unsafe-inline' https://ok.example"],
      '<style>@import url(https://ok.example/a.css);</style>', False),
     ("style body url foreign img", ["img-src 'self'; style-src 'unsafe-inline'"],
-     '<style>div{background:url(https://evil.example/i.png)}</style>', True),
+     '<style>div{background:url(https://evil.example/i.png)}</style><div>x</div>', True),
     ("style body font-face foreign font", ["font-src 'self'; style-src 'unsafe-inline'"],
-     '<style>@font-face{font-family:x;src:url(https://f.example/a.woff2)}</style>', True),
+     '<style>@font-face{font-family:x;src:url(https://f.example/a.woff2)}</style><p style="font-family:x">t</p>', True),
     ("style body font-face allowed font", ["font-src https://f.example; style-src 'unsafe-inline'"],
-     '<style>@font-face{font-family:x;src:url(https://f.example/a.woff2)}</style>', False),
+     '<style>@font-face{font-family:x;src:url(https://f.example/a.woff2)}</style><p style="font-family:x">t</p>', False),
     ("body background attr foreign", ["img-src 'self'"], '<body background="https://evil.example/i.png"></body>', True),
     ("table background attr same-origin vs none", ["img-src 'none'"],
      '<table background="/i.png"><tr><td>x</td></tr></table>', True),
@@ -143,6 +143,8 @@ class ChromiumAgreement7589(unittest.TestCase):
             page.route("**/*", route)
             page.goto(PAGE_URL)
             page.wait_for_timeout(250)
+            page.evaluate("document.querySelectorAll('button').forEach(function(b){b.click()})")  # compile handlers
+            page.wait_for_timeout(100)
             return page.evaluate("window.__v")
         finally:
             page.close()
