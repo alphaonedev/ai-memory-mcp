@@ -459,6 +459,57 @@ mod reclassify_txn_5084_tests;
 // `memory_lease_*` handlers, which hold a bare Connection). Referenced below
 // as `crate::actions::{LEASE_SELECT_BY_ID_SQL, row_to_lease, lease_*}`.
 
+/// #7090 — group a batch by `(quota agent, namespace)` and record one quota
+/// increment per group inside the caller's open transaction. Mirrors the
+/// postgres `store_batch` grouping: every input row counts (in-batch
+/// duplicates included, each was a caller-requested write); the agent is the
+/// row's `metadata.agent_id`, else the caller's; bytes are title + content.
+/// Tenant callers get the in-transaction ceiling guard, admin contexts stay
+/// record-only (per ERRORS-15 the typed quota refusal maps to
+/// `StoreError::QuotaExceeded`).
+fn record_batch_quota(
+    conn: &rusqlite::Connection,
+    ctx: &CallerContext,
+    memories: &[Memory],
+) -> StoreResult<()> {
+    let mut groups: std::collections::BTreeMap<(String, String), (i64, i64)> =
+        std::collections::BTreeMap::new();
+    for memory in memories {
+        let owner = match crate::storage::memory_agent_id(memory) {
+            "" => ctx.agent_id.clone(),
+            claimed => claimed.to_string(),
+        };
+        let bytes = i64::try_from(memory.title.len().saturating_add(memory.content.len()))
+            .unwrap_or(i64::MAX);
+        let entry = groups
+            .entry((owner, memory.namespace.clone()))
+            .or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 = entry.1.saturating_add(bytes);
+    }
+    for ((agent_id, namespace), (count, bytes)) in &groups {
+        quotas::record_memory_batch_in_tx(
+            conn,
+            agent_id,
+            namespace,
+            *count,
+            *bytes,
+            !ctx.bypass_visibility,
+        )
+        .map_err(|e| match e {
+            quotas::QuotaCheckError::Quota(q) => StoreError::QuotaExceeded {
+                agent_id: q.agent_id,
+                namespace: q.namespace,
+                limit: q.limit.as_str().to_string(),
+                current: q.current,
+                max: q.max,
+            },
+            quotas::QuotaCheckError::Sql(e) => box_err(e),
+        })?;
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl MemoryStore for SqliteStore {
     async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
@@ -607,7 +658,7 @@ impl MemoryStore for SqliteStore {
         } else {
             None
         };
-        let batch = (|| -> anyhow::Result<Vec<String>> {
+        let batch = (|| -> StoreResult<Vec<String>> {
             let mut ids = Vec::with_capacity(memories.len());
             for memory in memories {
                 // #2110 — same authenticated-origin why_trace stamp `store`
@@ -616,11 +667,14 @@ impl MemoryStore for SqliteStore {
                 if ctx.bypass_visibility {
                     let mut stamped = memory.clone();
                     crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
-                    ids.push(db::insert(&conn, &stamped)?);
+                    ids.push(db::insert(&conn, &stamped).map_err(box_err)?);
                 } else {
-                    ids.push(db::insert(&conn, memory)?);
+                    ids.push(db::insert(&conn, memory).map_err(box_err)?);
                 }
             }
+            // #7090 — record the quota in the SAME transaction, so a batch
+            // that rolls back charges nothing (postgres parity).
+            record_batch_quota(&conn, ctx, memories)?;
             Ok(ids)
         })();
         match batch {
@@ -634,7 +688,7 @@ impl MemoryStore for SqliteStore {
                 if let Some(txn) = write_txn {
                     txn.rollback();
                 }
-                Err(box_err(e))
+                Err(e)
             }
         }
     }
