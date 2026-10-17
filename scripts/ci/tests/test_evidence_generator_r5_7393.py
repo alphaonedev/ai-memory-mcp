@@ -20,6 +20,7 @@ import argparse
 import contextlib
 import io
 import os
+import re
 import subprocess
 import sys
 import unittest
@@ -370,6 +371,171 @@ class ExpiryCopyCreation7532(GatesRun):
         self.assertTrue(live.exists())
         self.assertTrue(keep.exists())
         r.drop_expiry()
+
+
+class RunWasBuilt(Exception):
+    pass
+
+
+class PlanOnlyOptionsRefused7535(ScratchCase):
+    def run_main(self, leg, *extra):
+        rc = load("run_cert")
+        self.n = getattr(self, "n", 0) + 1
+        wt, tip = make_repo(self.dir / f"repo{self.n}")
+        outd = self.dir / "o"
+        argv = ["run_cert.py", leg, "--tip", tip, "--wt", str(wt), "--outd", str(outd), "--targets", str(self.dir / "t"),
+                "--tmpdir", str(self.dir / "tmp"), *extra]
+        err = io.StringIO()
+        # a Run that is built means the option was accepted: stop there, never start a leg
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(rc, "Run", side_effect=RunWasBuilt), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            try:
+                code = rc.main()
+            except RunWasBuilt:
+                code = "accepted"
+        return code, err.getvalue(), outd
+
+    def test_push_branch_and_parent_are_a_usage_error_on_every_other_leg_7535(self):
+        for leg in ("battery", "pg", "removal", "bootstrap", "chain"):
+            for opt, val in (("--push-branch", "some-branch"), ("--parent", "a" * 40)):
+                with self.subTest(leg=leg, option=opt):
+                    code, err, outd = self.run_main(leg, opt, val)
+                    self.assertEqual(code, 64)
+                    self.assertIn(opt, err)
+                    self.assertIn("gates", err)
+                    self.assertFalse(outd.exists(), "refused before a Run is built")
+
+    def test_the_same_options_are_not_refused_on_gates_7535(self):
+        class Reached(Exception):
+            pass
+        rc = load("run_cert")
+        wt, tip = make_repo(self.dir / "repo")
+        argv = ["run_cert.py", "gates", "--tip", tip, "--wt", str(wt), "--outd", str(self.dir / "o"), "--parent", "a" * 40,
+                "--push-branch", "b"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(rc, "Run", side_effect=Reached):
+            with self.assertRaises(Reached):  # past the usage checks and into Run: not refused
+                rc.main()
+
+
+FAKE_SPELLINGS = (  # (label, function(root, scratch_dir) -> spelling) for the runner's tmp-root refusal (#7534)
+    ("exact", lambda root, d: root),
+    ("trailing slash", lambda root, d: root + "/"),
+    ("child", lambda root, d: root + "/x"),
+    ("child with trailing slash", lambda root, d: root + "/x/"),
+    ("double slash inside", lambda root, d: root.replace("/", "//")),
+    ("double slash before child", lambda root, d: root + "//x"),
+    ("dot segment", lambda root, d: root + "/./x"),
+    ("dot-dot segment", lambda root, d: str(d / "x" / "..") + "/" + Path(root).name + "/x"),
+    ("upper case", lambda root, d: root.upper()),
+    ("mixed case", lambda root, d: root[:-1] + root[-1].swapcase() + "/x"),
+    ("through a symlink", lambda root, d: str(d / "link-to-root") + "/x"),
+)
+
+
+class TmpRootGuard7534(ScratchCase):
+    def setUp(self):
+        super().setUp()
+        self.rc = load("run_cert")
+        self.root = os.path.realpath(self.dir / "fake-root")
+        os.mkdir(self.root)
+        os.symlink(self.root, self.dir / "link-to-root")
+        patcher = mock.patch.object(self.rc, "TMP_ROOTS", (self.root,))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def refused(self, **kw):
+        with self.assertRaises(self.rc.ConfigError):
+            self.rc.Run(argparse.Namespace(tip="a" * 40, wt=str(self.dir), outd=str(self.dir / "o"), leg="chain", **kw))
+
+    def test_every_spelling_of_a_tmp_root_is_refused_7534(self):
+        self.assertGreaterEqual(len(FAKE_SPELLINGS), 11)
+        for label, spell in FAKE_SPELLINGS:
+            for field in ("targets", "tmpdir"):
+                with self.subTest(spelling=label, field=field):
+                    self.refused(**{field: spell(self.root, self.dir)})
+
+    def test_the_environment_spelling_is_refused_7534(self):
+        with mock.patch.dict(os.environ, {"CERT_TMPDIR": self.root.upper() + "//x"}):
+            self.refused()
+
+    def test_a_sibling_that_only_shares_the_prefix_is_not_a_tmp_root_7534(self):
+        self.assertFalse(self.rc.is_tmpfs_path(self.root + "x/y", ""))
+        self.assertFalse(self.rc.is_tmpfs_path(str(self.dir / "other"), ""))
+
+
+def folded(node, env):
+    """The constant string a simple expression spells (a literal, a + of folded strings, a Path(x) / y, or a module-level
+    name bound to one), else None. A call to join() or chr() is deliberately not folded: that is how this file spells a
+    forbidden path without being flagged by its own guard."""
+    import ast
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return env.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Div)):
+        left, right = folded(node.left, env), folded(node.right, env)
+        if left is None or right is None:
+            return None
+        return left + right if isinstance(node.op, ast.Add) else left.rstrip("/") + "/" + right.lstrip("/")
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "Path" and len(node.args) == 1:
+        return folded(node.args[0], env)
+    return None
+
+
+FORBIDDEN_ROOTS = tuple("/".join(["", *p.split(".")]) for p in ("tmp", "var.tmp", "dev.shm", "run"))
+
+
+def tmp_root_strings(source):
+    """Every folded string in `source` that names a tmp root or a path under one, after normalising case, repeated
+    slashes, dot and dot-dot segments and the /private prefix; and every string that starts with $TMPDIR (#7534)."""
+    import ast
+    import posixpath
+    tree = ast.parse(source)
+    env = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            value = folded(node.value, env)
+            if value is not None:
+                env[node.targets[0].id] = value
+    found = []
+    for node in ast.walk(tree):
+        value = folded(node, env) if isinstance(node, (ast.Constant, ast.BinOp, ast.Name, ast.Call)) else None
+        if not value or not (value.startswith("/") or value.startswith("$")):
+            continue
+        if re.match(r"\$\{?TMPDIR\}?(/|$)", value):
+            found.append(value)
+            continue
+        norm = posixpath.normpath("/" + value.lower().lstrip("/"))
+        if norm.startswith("/private/"):
+            norm = norm[len("/private"):]
+        if any(norm == r or norm.startswith(r + "/") for r in FORBIDDEN_ROOTS):
+            found.append(value)
+    return found
+
+
+class AstGuard7534(unittest.TestCase):
+    def test_no_evidence_test_file_names_a_tmp_root_path_7534(self):
+        files = sorted(TESTS.glob("test_evidence_generator_*.py"))
+        self.assertGreaterEqual(len(files), 5)
+        for f in files:
+            with self.subTest(file=f.name):
+                self.assertEqual(tmp_root_strings(f.read_text()), [])
+
+    def test_the_guard_sees_every_spelling_it_must_7534(self):
+        t = "".join(["t", "mp"])
+        spellings = [f'x = "/{t}/a"', f'x = "/{t}"', f'x = "/{t}/"', f'x = "//{t}/a"', f'x = "/{t.upper()}/a"',
+                     f'x = "/private/{t}/a"', f'x = "/var/{t}/a"', f'x = "/var//{t}"', f'x = "/a/../{t}/a"',
+                     f'x = "/{t}/./a"', 'x = "$TMPDIR/a"', 'x = "${TMPDIR}/a"', f'TMP = "/" + "{t}"\ny = TMP + "/a"',
+                     f'p = "/var" + "/{t}"', f'p = Path("/") / "{t}" / "a"', 'x = "/dev/shm/a"', 'x = "/run/user/1"']
+        for src in spellings:
+            with self.subTest(src=src):
+                self.assertTrue(tmp_root_strings(src), src)
+
+    def test_the_guard_leaves_honest_paths_alone_7534(self):
+        t = "".join(["t", "mp"])
+        for src in ('x = "/home/a/tmp-notes"', f'x = "/data/{t}"', f'x = "/{t}x/a"', 'x = "TMPDIR"', 'x = ".local-runs/a"'):
+            with self.subTest(src=src):
+                self.assertEqual(tmp_root_strings(src), [])
 
 
 if __name__ == "__main__":
