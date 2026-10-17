@@ -9,10 +9,10 @@ Modelled on cert-385da3a05 (commit 9f68ea41a). Steps, each fatal on failure:
   3. copies an ALLOWLIST only (never a glob): the 4 posture .out files, the exit-code transcript and the 2 peer fixtures
      from OUTD/evidence; removal-proof-full.log verbatim; bootstrap-cert-gate.log with the worktree path -> <repo-root>
   4. writes test-results.txt from the per-leg logs (the LAST `test result:` line of each)
-  5. writes recapture-posture.sh: the tip's scripts/recapture-cert-3607-posture.sh with only ROOT/OUT/FIX retargeted
+  5. writes recapture-posture.py (else .sh): the tip's scripts/recapture-cert-3607-posture.py (else .sh) with only ROOT/OUT/FIX retargeted
   6. copies --sanitization (author prose, no {{placeholders}} left)
   7. leak scan: no worktree / run-dir / home / mount / scratch / tmp path and no host name in any captured file;
-     recapture-posture.sh may carry only the hits the shipped script itself carries (its *_BIN fallback lines)
+     recapture-posture.py (or .sh) may carry only the hits the shipped script itself carries (its *_BIN fallback lines)
   8. MANIFEST.sha256 LAST, then re-verified from disk
 Nothing is staged or committed. Exit 0 only when every step passed.
 """
@@ -29,7 +29,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from run_cert import BINS, LIBS, PG_BIN, PG_LIB  # noqa: E402  (one source for the leg set)
 
-RECAPTURE = "scripts/recapture-cert-3607-posture.sh"
+RECAPTURE_CANDIDATES = ("scripts/recapture-cert-3607-posture.py", "scripts/recapture-cert-3607-posture.sh")
 EVIDENCE_FILES = (
     "posture-bare-env.out",
     "posture-hardened-env.out",
@@ -143,21 +143,36 @@ def test_results(outd, short, date):
 
 
 def recapture_copy(wt, tip, short):
-    src = git(wt, "show", f"{tip}:{RECAPTURE}")
-    subs = (
-        (r'^ROOT="\$\(cd "\$\(dirname "\$0"\)/\.\." && pwd\)"$', 'ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"'),
-        (r'^OUT="\$ROOT/[^"\n]*"$', f'OUT="$ROOT/docs/compliance/evidence/cert-{short}"'),
-        (r'^FIX="\$ROOT/[^"\n]*"$', f'FIX="$ROOT/.local-runs/cert-{short}-fixtures"'),
-    )
+    """Returns (relpath, shipped source, retargeted copy). Resolves the .py first, the .sh second (#7399)."""
+    rel = next((c for c in RECAPTURE_CANDIDATES
+                if subprocess.run(["git", "-C", str(wt), "cat-file", "-e", f"{tip}:{c}"],
+                                  capture_output=True).returncode == 0), None)
+    if rel is None:
+        raise Fatal(f"no recapture script at {tip}; looked for " + " then ".join(RECAPTURE_CANDIDATES)
+                    + ". Check the tip is a cert chain commit that carries the posture recapture script.")
+    src = git(wt, "show", f"{tip}:{rel}")
+    if rel.endswith(".py"):
+        subs = (
+            (r"^ROOT = Path\(os\.path\.abspath\(__file__\)\)\.parent\.parent(?:  #.*)?$",
+             "ROOT = Path(os.path.abspath(__file__))" + ".parent" * 5),
+            (r"^OUT = ROOT / .*$", f'OUT = ROOT / "docs" / "compliance" / "evidence" / "cert-{short}"'),
+            (r"^FIX = ROOT / .*$", f'FIX = ROOT / ".local-runs" / "cert-{short}-fixtures"'),
+        )
+    else:
+        subs = (
+            (r'^ROOT="\$\(cd "\$\(dirname "\$0"\)/\.\." && pwd\)"$', 'ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"'),
+            (r'^OUT="\$ROOT/[^"\n]*"$', f'OUT="$ROOT/docs/compliance/evidence/cert-{short}"'),
+            (r'^FIX="\$ROOT/[^"\n]*"$', f'FIX="$ROOT/.local-runs/cert-{short}-fixtures"'),
+        )
     body = src
     for pat, rep in subs:
         body, n = re.subn(pat, lambda _m, rep=rep: rep, body, flags=re.M)
         if n != 1:
             raise Fatal(f"recapture retarget: pattern {pat!r} matched {n} times (want 1)")
-    changed = [(a, b) for a, b in zip(src.splitlines(), body.splitlines()) if a != b]
+    changed = [(x, y) for x, y in zip(src.splitlines(), body.splitlines()) if x != y]
     if len(changed) != 3 or len(src.splitlines()) != len(body.splitlines()):
         raise Fatal(f"recapture retarget changed {len(changed)} lines (want exactly 3)")
-    return src, body
+    return rel, src, body
 
 
 def leak_patterns(wt, outd):
@@ -228,15 +243,16 @@ def main():
             raise Fatal("bootstrap-cert-gate.log has no `CERT-BOOTSTRAP GATE: PASS`")
         files["bootstrap-cert-gate.log"] = bcg.replace(str(wt), "<repo-root>").encode()
         files["test-results.txt"] = test_results(outd, short, a.date).encode()
-        shipped, recap = recapture_copy(wt, a.tip, short)
-        files["recapture-posture.sh"] = recap.encode()
+        recap_rel, shipped, recap = recapture_copy(wt, a.tip, short)
+        recap_name = "recapture-posture" + Path(recap_rel).suffix
+        files[recap_name] = recap.encode()
         files["SANITIZATION.md"] = san.encode()
 
         pats = leak_patterns(wt, outd)
         leaks = []
         for name, data in files.items():
             h = hits(data.decode("utf-8", "replace"), pats)
-            if name == "recapture-posture.sh":
+            if name == recap_name:
                 allowed = hits(shipped, pats)
                 h = [x for x in h if x not in allowed]
             if name == "removal-proof-full.log":
@@ -249,7 +265,7 @@ def main():
         dest.mkdir(parents=True)
         for name, data in files.items():
             (dest / name).write_bytes(data)
-            (dest / name).chmod(0o755 if name.endswith(".sh") else 0o644)
+            (dest / name).chmod(0o755 if name.endswith((".sh", ".py")) else 0o644)
         (dest / "MANIFEST.sha256").write_text(manifest)
         (dest / "MANIFEST.sha256").chmod(0o644)
 

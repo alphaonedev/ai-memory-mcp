@@ -54,6 +54,18 @@ PG_LIB = ("enterprise_federation_posture", 39)
 RESULT_RE = re.compile(r"^test result: (\w+)\. (\d+) passed; (\d+) failed", re.M)
 
 
+RECAPTURE_CANDIDATES = ("scripts/recapture-cert-3607-posture.py", "scripts/recapture-cert-3607-posture.sh")
+
+
+def pick_recapture(wt):
+    """The posture recapture script of the gated worktree: the Python port first, the shell script second (#7399)."""
+    for rel in RECAPTURE_CANDIDATES:
+        if (Path(wt) / rel).is_file():
+            return Path(wt) / rel
+    raise FileNotFoundError("no recapture script in the gated worktree; looked for "
+                            + " then ".join(RECAPTURE_CANDIDATES))
+
+
 class Run:
     def __init__(self, a):
         self.tip = a.tip
@@ -186,18 +198,31 @@ class Run:
         return self.bad
 
     def posture(self, dbin, sbin):
-        src = (self.wt / "scripts/recapture-cert-3607-posture.sh").read_text()
+        try:
+            script = pick_recapture(self.wt)
+        except FileNotFoundError as e:
+            self.fail(f"  RED posture recapture script: {e}")
+            return
+        src = script.read_text()
         ev, fix = self.outd / "evidence", self.outd / "fix"
-        # Retarget only the two $ROOT-relative assignments; the column-0 FIX="$FIX" line must stay untouched.
-        body, n_out = re.subn(r'^OUT="\$ROOT/[^"\n]*"$', f'OUT="{ev}"', src, flags=re.M)
-        body, n_fix = re.subn(r'^FIX="\$ROOT/[^"\n]*"$', f'FIX="{fix}"', body, flags=re.M)
-        if (n_out, n_fix) != (1, 1) or 'FIX="$FIX"' not in body:
+        if script.suffix == ".py":
+            # Python form (#7378): ROOT derives from __file__; retarget the two assignments, nothing else.
+            body, n_out = re.subn(r"^OUT = ROOT / .*$", lambda _m: f"OUT = Path({str(ev)!r})", src, flags=re.M)
+            body, n_fix = re.subn(r"^FIX = ROOT / .*$", lambda _m: f"FIX = Path({str(fix)!r})", body, flags=re.M)
+            ok = (n_out, n_fix) == (1, 1)
+            tmp, argv = self.wt / "scripts/.recapture-cert7.py", [sys.executable]
+        else:
+            # Retarget only the two $ROOT-relative assignments; the column-0 FIX="$FIX" line must stay untouched.
+            body, n_out = re.subn(r'^OUT="\$ROOT/[^"\n]*"$', f'OUT="{ev}"', src, flags=re.M)
+            body, n_fix = re.subn(r'^FIX="\$ROOT/[^"\n]*"$', f'FIX="{fix}"', body, flags=re.M)
+            ok = (n_out, n_fix) == (1, 1) and 'FIX="$FIX"' in body
+            tmp, argv = self.wt / "scripts/.recapture-cert7.sh", ["bash"]
+        if not ok:
             self.fail(f"  posture copy retarget failed OUT={n_out} FIX={n_fix}")
             return
-        tmp = self.wt / "scripts/.recapture-cert7.sh"
         tmp.write_text(body)
         try:
-            rc = self.run(["bash", str(tmp)], self.outd / "posture.log",
+            rc = self.run([*argv, str(tmp)], self.outd / "posture.log",
                           {"DEFAULT_BIN": str(dbin), "SQLCIPHER_BIN": str(sbin), "FIX": str(fix)})
         finally:
             tmp.unlink()
