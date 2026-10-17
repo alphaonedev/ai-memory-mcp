@@ -240,6 +240,8 @@ async fn bulk_emits_one_store_audit_row_per_persisted_row_2724() {
 /// webhook is invoked once per committed row and never for a rejected one.
 #[tokio::test]
 async fn bulk_dispatches_memory_store_event_per_persisted_row_2724() {
+    pin_serial_dispatch();
+    let _cell = DISPATCH_CELL_LOCK.lock().await;
     // The receiver binds loopback; the SSRF guard rejects loopback by
     // default. #3705 — it serves TLS (every `http://` target is refused,
     // loopback included) and the dispatcher trusts the fixture leaf. The
@@ -309,5 +311,130 @@ async fn bulk_dispatches_memory_store_event_per_persisted_row_2724() {
         "#2724 F2: the subscriber must receive exactly one memory_store \
          dispatch per committed row (3), never for the rejected row \
          (observed {delivered} during poll, {final_count} final): {v}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #7320 - the dispatch wait must cover the asynchronous delivery budget.
+// ---------------------------------------------------------------------------
+
+/// #7320 - webhook delivery is asynchronous relative to the committed rows
+/// (`dispatch_event_to_subs` spawns one bounded worker per subscriber). The
+/// wait on the receiver therefore cannot be a short fixed window.
+const DISPATCH_WAIT_WINDOW: Duration = Duration::from_secs(10);
+
+/// Poll interval while waiting for deliveries to land.
+const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Settle time so a spurious extra delivery would surface after the count is met.
+const DISPATCH_SETTLE: Duration = Duration::from_millis(300);
+
+/// Serialised dispatch (one worker permit) used by the slow-receiver cell.
+const SERIAL_DISPATCH_PERMITS: usize = 1;
+
+/// Per-delivery ack delay for the slow-receiver cell: under one permit the
+/// k-th delivery reaches the receiver k * delay after the first, which pushes
+/// the later deliveries beyond the old fixed window while every one of them
+/// is still inside the product's own per-attempt ack budget.
+const SLOW_ACK_DELAY: Duration = Duration::from_millis(4900);
+
+/// Rows in the slow-receiver batch (the fourth arrives at ~3 * 4.9s = 14.7s).
+const SLOW_BATCH_ROWS: usize = 4;
+
+/// The dispatch semaphore is process-wide: with one permit a slow cell would
+/// starve a concurrent cell's deliveries, so the dispatch cells run one at a
+/// time (each cell's wait window starts only once it holds the lock).
+static DISPATCH_CELL_LOCK: Mutex<()> = Mutex::const_new(());
+
+/// Pin the process-wide dispatch concurrency before any dispatch runs; the
+/// first caller wins, so every dispatch cell in this binary calls it.
+fn pin_serial_dispatch() {
+    let _ =
+        ai_memory::subscriptions::override_dispatch_concurrency_for_tests(SERIAL_DISPATCH_PERMITS);
+}
+
+/// Count the DISTINCT memory ids the receiver saw (a retry of one delivery
+/// repeats its id and must not be counted as another row's dispatch).
+async fn distinct_dispatched_ids(server: &common::tls_receiver::TlsReceiver) -> usize {
+    let reqs = server.received_requests().await.unwrap_or_default();
+    reqs.iter()
+        .filter_map(|r| {
+            serde_json::from_slice::<Value>(&r.body).ok().and_then(|v| {
+                v.get("memory_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
+/// Wait (bounded) until `expected` distinct rows were dispatched, then settle
+/// and return the final distinct count.
+async fn wait_for_dispatches(server: &common::tls_receiver::TlsReceiver, expected: usize) -> usize {
+    let deadline = std::time::Instant::now() + DISPATCH_WAIT_WINDOW;
+    while std::time::Instant::now() < deadline {
+        if distinct_dispatched_ids(server).await >= expected {
+            break;
+        }
+        tokio::time::sleep(DISPATCH_POLL_INTERVAL).await;
+    }
+    tokio::time::sleep(DISPATCH_SETTLE).await;
+    distinct_dispatched_ids(server).await
+}
+
+/// #7320 - a slow (but within-budget) receiver delays later deliveries past
+/// the old fixed window; every committed row must still be dispatched.
+#[tokio::test]
+async fn bulk_dispatch_waits_for_slow_receiver_deliveries_7320() {
+    pin_serial_dispatch();
+    let _cell = DISPATCH_CELL_LOCK.lock().await;
+    set_allow_loopback_webhooks(true);
+    let tls = common::tls_receiver::dispatch_tls(&std::env::temp_dir());
+    let server = common::tls_receiver::TlsReceiver::start_with(
+        tls,
+        common::tls_receiver::ack_echo_slow(SLOW_ACK_DELAY),
+    )
+    .await;
+
+    let (_dir, db_path) = fresh_db();
+    let hook_url = format!("{}/hook", server.uri());
+    {
+        let conn = Connection::open(&db_path).expect("open");
+        subscriptions::insert(
+            &conn,
+            &NewSubscription {
+                url: &hook_url,
+                events: "*",
+                secret: Some("bulk-7320-secret"),
+                namespace_filter: None,
+                agent_filter: None,
+                created_by: None,
+                event_types: None,
+            },
+        )
+        .expect("insert subscription");
+    }
+
+    let router = build_router(&db_path);
+    let ns = "dispatch-7320";
+    let batch = Value::Array(
+        (0..SLOW_BATCH_ROWS)
+            .map(|i| row(ns, &format!("s{i}"), "slow"))
+            .collect(),
+    );
+    let (status, v) = post(&router, "/api/v1/memories/bulk", &batch).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(
+        db_row_count(&db_path, ns),
+        i64::try_from(SLOW_BATCH_ROWS).unwrap(),
+        "all rows committed: {v}"
+    );
+
+    let dispatched = wait_for_dispatches(&server, SLOW_BATCH_ROWS).await;
+    assert_eq!(
+        dispatched, SLOW_BATCH_ROWS,
+        "#7320: every committed row must be dispatched to a slow receiver \
+         (saw {dispatched} of {SLOW_BATCH_ROWS}): {v}"
     );
 }
