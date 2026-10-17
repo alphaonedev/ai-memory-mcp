@@ -24,6 +24,7 @@ SCRATCH = REPO / '.local-runs'
 GOOD_TREE = 'zip v7.2.0\n'
 GOOD_TREE_DEPTH = '0zip v7.2.0\n1candle-core v0.10.2\n'
 BAD_TREE_DEPTH = '0zip v7.2.0\n1candle-core v0.10.2\n1some-other v1.0.0\n'
+PACKAGE_ONLY = '[package]\nname = "fixture"\nversion = "0.0.0"\n\n'
 MINIMAL_MANIFEST = '[package]\nname = "fixture"\nversion = "0.0.0"\n\n[dependencies]\nserde = "1"\n'
 
 
@@ -285,7 +286,7 @@ class ManifestForms7301(GuardBase):
 
     def run_manifest(self, body, parser, top=''):
         (self.root / 'Cargo.toml').write_text(
-            top + MINIMAL_MANIFEST + body, encoding='utf-8')
+            top + PACKAGE_ONLY + body, encoding='utf-8')
         tree_file = self.root.parent / (self.root.name + '.tree')
         tree_file.write_text(GOOD_TREE_DEPTH, encoding='utf-8')
         self.addCleanup(lambda: tree_file.unlink() if tree_file.exists() else None)
@@ -349,7 +350,7 @@ class ManifestForms7301(GuardBase):
             self.skipTest('python3.9 not installed')
         for name, body in ZIP_MANIFEST_FORMS.items():
             with self.subTest(form=name):
-                (self.root / 'Cargo.toml').write_text(MINIMAL_MANIFEST + body, encoding='utf-8')
+                (self.root / 'Cargo.toml').write_text(PACKAGE_ONLY + body, encoding='utf-8')
                 tree_file = self.root.parent / (self.root.name + '.tree')
                 tree_file.write_text(GOOD_TREE_DEPTH, encoding='utf-8')
                 self.addCleanup(lambda: tree_file.unlink() if tree_file.exists() else None)

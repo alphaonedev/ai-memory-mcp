@@ -62,11 +62,6 @@ FORBIDDEN = (
 EXTRACT_CALL = re.compile(r'\.\s*extract\s*\(')
 ZIP_CONTEXT = re.compile(r'\bzip\b|\bZip\w*|\barchive\b|\bArchive\b')
 
-DEP_SECTION = re.compile(r'^\s*\[\s*(?:[\w.\-"\' ]+\.)?(dependencies|dev-dependencies|build-dependencies)\s*\]\s*$')
-DEP_TABLE_ZIP = re.compile(r'^\s*\[\s*(?:[\w.\-"\' ]+\.)?(?:dependencies|dev-dependencies|build-dependencies)\.zip\s*\]\s*$')
-ANY_SECTION = re.compile(r'^\s*\[')
-ZIP_KEY = re.compile(r'^\s*zip\s*(?:=|\.)')
-ZIP_PACKAGE = re.compile(r'\bpackage\s*=\s*["\']zip["\']')
 
 
 def escape_text(text):
@@ -138,21 +133,157 @@ def check_tree(tree_text):
     return problems
 
 
-def check_manifest(root):
+DEP_KINDS = ('dependencies', 'dev-dependencies', 'build-dependencies')
+KEY_SEGMENT = re.compile(r'\s*(?:"((?:[^"\\]|\\.)*)"|\'([^\']*)\'|([A-Za-z0-9_\-]+))\s*')
+KEY_LINE_END = re.compile(r'\s*=')
+HEADER_END = re.compile(r'\s*(\]\]?)\s*(?:#.*)?$')
+ZIP_IN_VALUE = re.compile(r'(?<![\w\-])["\']?zip["\']?\s*[=.]')
+PACKAGE_ZIP = re.compile(r'\bpackage\s*=\s*["\']zip["\']')
+PACKAGE_VALUE_ZIP = re.compile(r'^\s*["\']zip["\']\s*(?:#.*)?$')
+
+
+def parse_key(text, pos=0):
+    """Parse a TOML dotted key at `pos`. Returns (segments, end_pos); raises ValueError."""
+    parts = []
+    while True:
+        match = KEY_SEGMENT.match(text, pos)
+        if not match:
+            raise ValueError('not a key')
+        if match.group(1) is not None:
+            parts.append(match.group(1).replace('\\"', '"').replace('\\\\', '\\'))
+        elif match.group(2) is not None:
+            parts.append(match.group(2))
+        else:
+            parts.append(match.group(3))
+        pos = match.end()
+        if pos < len(text) and text[pos] == '.':
+            pos += 1
+            continue
+        return parts, pos
+
+
+def dependency_rest(path):
+    """Segments after the dependency-kind segment of a TOML path, or None.
+
+    A path is dependency-rooted at `<kind>`, `target.<cfg>.<kind>` or
+    `workspace.dependencies`, wherever the dotted key or table header split it.
+    """
+    if len(path) >= 1 and path[0] in DEP_KINDS:
+        return list(path[1:])
+    if len(path) >= 3 and path[0] == 'target' and path[2] in DEP_KINDS:
+        return list(path[3:])
+    if len(path) >= 2 and path[0] == 'workspace' and path[1] == 'dependencies':
+        return list(path[2:])
+    return None
+
+
+def fallback_manifest_hits(text):
+    """Line-level TOML reader for Python 3.9 / 3.10 (no tomllib).
+
+    Tracks the current table path from `[a.b."c(d)".e]` headers (quoted
+    segments, cfg() expressions), joins it with each key line's dotted key and
+    applies `dependency_rest`. Skips multi-line string bodies. Returns
+    (line_number, detail) pairs.
+    """
+    hits = []
+    table = []
+    in_multiline = None
+    for number, line in enumerate(text.splitlines(), 1):
+        if in_multiline is not None:
+            if in_multiline in line:
+                in_multiline = None
+            continue
+        stripped = line.strip()
+        if not stripped or stripped.startswith('#'):
+            continue
+        if stripped.startswith('['):
+            array = stripped.startswith('[[')
+            try:
+                parts, end = parse_key(stripped, 2 if array else 1)
+            except ValueError:
+                continue
+            if not HEADER_END.match(stripped, end):
+                continue
+            table = [] if array else parts
+            rest = None if array else dependency_rest(table)
+            if rest and rest[0] == ZIP_CRATE:
+                hits.append((number, 'direct zip dependency table'))
+            continue
+        try:
+            parts, end = parse_key(stripped)
+        except ValueError:
+            continue
+        eq = KEY_LINE_END.match(stripped, end)
+        if not eq:
+            continue
+        value = stripped[eq.end():]
+        for quote in ('"""', "'''"):
+            if value.count(quote) % 2 == 1:
+                in_multiline = quote
+        rest = dependency_rest(table + parts)
+        if rest is None:
+            continue
+        if rest and rest[0] == ZIP_CRATE:
+            hits.append((number, 'direct zip dependency'))
+        elif len(rest) == 1 and PACKAGE_ZIP.search(value):
+            hits.append((number, 'dependency renamed to package zip'))
+        elif len(rest) == 2 and rest[1] == 'package' and PACKAGE_VALUE_ZIP.match(value):
+            hits.append((number, 'dependency renamed to package zip'))
+        elif not rest and (ZIP_IN_VALUE.search(value) or PACKAGE_ZIP.search(value)):
+            hits.append((number, 'direct zip dependency (inline table)'))
+    return hits
+
+
+def guess_line(text, name_pattern):
+    for number, line in enumerate(text.splitlines(), 1):
+        if re.search(name_pattern, line):
+            return number
+    return 1
+
+
+def tomllib_manifest_hits(text):
+    """Structural check with tomllib (Python 3.11+). Raises ToolError on invalid TOML."""
+    try:
+        import tomllib
+    except ImportError:
+        raise ToolError('--manifest-parser tomllib needs Python 3.11+')
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ToolError('Cargo.toml is not valid TOML: %s' % exc)
+    tables = []
+    for kind in DEP_KINDS:
+        tables.append((kind, data.get(kind)))
+    for cfg, body in (data.get('target') or {}).items():
+        for kind in DEP_KINDS:
+            if isinstance(body, dict):
+                tables.append(('target.%s.%s' % (cfg, kind), body.get(kind)))
+    workspace = data.get('workspace')
+    if isinstance(workspace, dict):
+        tables.append(('workspace.dependencies', workspace.get('dependencies')))
+    hits = []
+    line_hint = r'^\s*(?:\[.*\bzip\b.*\]|["\']?zip["\']?\s*[=.]|.*\bpackage\s*=\s*["\']zip["\'])'
+    for label, table in tables:
+        if not isinstance(table, dict):
+            continue
+        for name, spec in table.items():
+            renamed = isinstance(spec, dict) and spec.get('package') == ZIP_CRATE
+            if name == ZIP_CRATE or renamed:
+                hits.append((guess_line(text, line_hint), 'direct zip dependency in [%s]' % label))
+    return hits
+
+
+def check_manifest(root, parser='auto'):
     manifest = root / 'Cargo.toml'
-    problems = []
-    in_deps = False
-    for number, line in enumerate(manifest.read_text(encoding='utf-8', errors='replace').splitlines(), 1):
-        if DEP_TABLE_ZIP.match(line):
-            problems.append(violation('Cargo.toml:%d' % number, 'direct zip dependency'))
-            in_deps = False
-            continue
-        if ANY_SECTION.match(line):
-            in_deps = bool(DEP_SECTION.match(line))
-            continue
-        if in_deps and (ZIP_KEY.match(line) or ZIP_PACKAGE.search(line)):
-            problems.append(violation('Cargo.toml:%d' % number, 'direct zip dependency'))
-    return problems
+    text = manifest.read_text(encoding='utf-8')
+    if parser == 'auto':
+        try:
+            import tomllib  # noqa: F401
+            parser = 'tomllib'
+        except ImportError:
+            parser = 'fallback'
+    hits = tomllib_manifest_hits(text) if parser == 'tomllib' else fallback_manifest_hits(text)
+    return [violation('Cargo.toml:%d' % number, detail) for number, detail in hits]
 
 
 def iter_sources(root):
@@ -214,6 +345,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--root', default=str(Path(__file__).resolve().parents[1]),
                         help='repository root (default: this checkout)')
+    parser.add_argument('--manifest-parser', choices=('auto', 'tomllib', 'fallback'), default='auto',
+                        help='Cargo.toml reader: tomllib (Python 3.11+), the built-in fallback, or auto')
     parser.add_argument('--cargo-tree-file',
                         help='read `cargo tree -i zip` output from this file instead of running cargo')
     args = parser.parse_args(argv)
@@ -239,7 +372,7 @@ def main(argv=None):
             tree_problems = []
         else:
             tree_problems = check_tree(tree_text)
-        problems = tree_problems + check_manifest(root) + check_sources(root)
+        problems = tree_problems + check_manifest(root, args.manifest_parser) + check_sources(root)
     except (OSError, ValueError, ToolError) as exc:
         print('error: %s' % escape_text(exc), file=sys.stderr)
         return EXIT_USAGE
