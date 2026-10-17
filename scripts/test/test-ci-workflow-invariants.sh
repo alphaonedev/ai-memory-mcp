@@ -808,6 +808,15 @@ fi
 # ===========================================================================
 if python3 "$ROOT/scripts/ci/check_pg_isolate_invariants.py" --root "$ROOT" --ci-yml "$CI_YML"; then ok "G: #6383 pg-isolation invariants (opt-in, run-scoped, no URL argv, selected prebuild, watchdog, logs)"; else bad "G: #6383 pg-isolation invariants failed" "see output above"; fi
 
+# SECTION H (#6339): the AGE self-heal helper reads the tier URL file and builds
+# PGPASSWORD, so ci.yml must run it as `python3 -I` (no sys.path[0], no PYTHON* env).
+if python3 "$ROOT/scripts/test/test_ci_age_helper_isolated_6339.py" >"$SCRATCH/h-6339.out" 2>&1; then
+    ok "H: ci.yml runs the AGE self-heal helper with python3 -I (#6339)"
+else
+    bad "H: AGE helper isolation pin failed (#6339)" \
+        "$(grep -E '^FAIL|^ERROR|AssertionError' "$SCRATCH/h-6339.out" | head -12)"
+fi
+
 echo ""
 if [ "$FAIL" -eq 0 ]; then
     echo "ci.yml invariants: $PASS/$PASS PASS"
