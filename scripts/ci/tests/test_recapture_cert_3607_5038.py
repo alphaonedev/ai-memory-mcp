@@ -27,8 +27,8 @@ import sys
 import tempfile
 import time
 import unicodedata
-import unittest
-from unittest import mock
+import unittest.mock
+import urllib.parse
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -52,6 +52,7 @@ if args[:2] == ['rules', 'keygen']:
     kd = env['AI_MEMORY_KEY_DIR']
     open(os.path.join(kd, 'operator.key'), 'w').write('k\\n')
     open(os.path.join(kd, 'operator.key.pub'), 'w').write('PUBKEY\\n')
+    open('ai-memory.db', 'w').write('store made by keygen\\n')  # the real one does (#7648)
     sys.exit(0)
 if args[:1] == ['stats']:
     sys.exit(0)
@@ -63,6 +64,9 @@ if args[:1] == ['doctor'] and '--posture' not in args:
     sys.exit(1)
 fails = 10 if not hard else (0 if sqlcipher else 2)
 print('[PASS] sample ' + env['AI_MEMORY_KEY_DIR'] + ' HOME=' + env['HOME'])
+# like the real doctor: any ai-memory.db in the cwd is "observed" (#7648)
+print('live PRAGMA synchronous agrees' if os.path.exists('ai-memory.db')
+      else 'live pragma not observed')
 for i in range(fails):
     print('[FAIL] check %%d' %% i)
 tail = 'overall: ' + ('FAIL' if fails else 'PASS')
@@ -173,14 +177,14 @@ class RecaptureBase(unittest.TestCase):
                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
 
     def run_recapture(self, sqlcipher_bin=None, args=None, extra_env=None, default_bin=None,
-                      cwd=None):
+                      cwd=None, script_root=None):
         env = self.base_env(sqlcipher_bin, extra_env, default_bin)
-        script = self.root / 'scripts' / SCRIPT_NAME
+        script = (script_root or self.root) / 'scripts' / SCRIPT_NAME
         cmd = ['bash', str(script)] if script.suffix == '.sh' else [sys.executable, str(script)]
         cmd += list(args or [])
         before = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
-        done = subprocess.run(cmd, env=env, cwd=str(cwd or self.root), capture_output=True,
-                              text=True)
+        done = subprocess.run(cmd, env=env, cwd=str(cwd or script_root or self.root),
+                              capture_output=True, text=True)
         after = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
         return done, {before, after}
 
@@ -547,9 +551,9 @@ class ExecFailure7432(RecaptureBase):
     def test_non_not_found_exec_error_maps_to_126(self):
         module = load_script_module()
         raw = self.root / 'leg.out.raw'
-        module.SANDBOX_CWD = self.root / 'sbx'  # the children's cwd must exist
-        module.SANDBOX_CWD.mkdir()
-        status = module.run_capture(self.root, [], {}, raw, self.root / 'leg.out')
+        cwd = self.root / 'sbx'  # the child's cwd must exist
+        cwd.mkdir()
+        status = module.run_capture(self.root, [], {}, raw, self.root / 'leg.out', cwd)
         self.assertEqual(status, 126)
         self.assertFalse(raw.exists())
 
@@ -949,29 +953,29 @@ class HomeValidation7510(RecaptureBase):
         module.HOME = home
         return module
 
-    def test_home_is_replaced_only_on_component_boundaries(self):
+    def test_home_is_replaced_at_every_occurrence(self):
         module = self.patched('/home/a')
         raw = (b"/home/a/k /home/ab/y /home/a /home/a. 'open /home/a' x/home/a/z "
                b"/home/a.txt path=/home/a/q")
-        want = (b"<home>/k /home/ab/y <home> <home>. 'open <home>' x/home/a/z "
-                b"/home/a.txt path=<home>/q")
+        want = (b"<home>/k <home>b/y <home> <home>. 'open <home>' x<home>/z "
+                b"<home>.txt path=<home>/q")
         self.assertEqual(module.sanitize(raw), want)
 
     def test_trailing_slash_home_is_normalised(self):
         module = self.patched('/home/a/')
-        self.assertEqual(module.sanitize(b'/home/a/k /home/ab'), b'<home>/k /home/ab')
+        self.assertEqual(module.sanitize(b'/home/a/k /home/ab'), b'<home>/k <home>b')
 
-    def test_repo_root_is_replaced_only_on_component_boundaries(self):
+    def test_repo_root_is_replaced_at_every_occurrence(self):
         module = self.patched('/home/a')
         self.assertEqual(module.sanitize(b'/mnt/x/repo/a /mnt/x/repo-other/b /mnt/x/repo'),
-                         b'<repo-root>/a /mnt/x/repo-other/b <repo-root>')
+                         b'<repo-root>/a <repo-root>-other/b <repo-root>')
 
     def test_docstring_and_usage_state_the_home_rule(self):
         module = load_script_module()
         self.assertIn('absolute', ' '.join(module.USAGE_EPILOG.split()))
         self.assertIn('HOME', module.USAGE_EPILOG)
         self.assertIn('HOME', module.__doc__)
-        self.assertIn('component', module.sanitize.__doc__)
+        self.assertIn('every occurrence', ' '.join(module.sanitize.__doc__.split()))
 
     def test_docstring_and_usage_state_the_new_home_refusals(self):
         module = load_script_module()
@@ -997,107 +1001,161 @@ class HomeValidation7510(RecaptureBase):
                 self.assertIsNone(module.home_problem(value))
 
 
-class SanitizerBoundaries7538(RecaptureBase):
-    """#7538 #7571 #7572 #7573: a HOME, repo-root or fixtures path is rewritten only when BOTH
-    ends are a boundary from an explicit allowlist of delimiter characters."""
+def value_forms(value):
+    """Every form a sensitive path takes in captured output: raw, JSON-escaped (with and
+    without the `\\/` slash escape, once and twice) and percent-encoded (upper and lower hex)."""
+    forms = {value, value.replace('/', '\\/')}
+    once = json.dumps(value)[1:-1]
+    twice = json.dumps(once)[1:-1]
+    for text in (once, twice):
+        forms.update({text, text.replace('/', '\\/')})
+    for safe in ('', '/'):
+        quoted = urllib.parse.quote(value, safe=safe)
+        forms.update({quoted, re.sub(r'%[0-9A-F]{2}', lambda m: m.group(0).lower(), quoted)})
+    return forms
 
+
+class SanitizerEveryOccurrence7651(RecaptureBase):
+    """#7538 #7571 #7572 #7573 #7612 #7651: every occurrence of HOME, the repo root and the
+    fixtures root is replaced, longest value first, in its raw, JSON-escaped and percent-encoded
+    forms. There is no delimiter allowlist; a longer path that shares the prefix is over-redacted."""
+
+    MARK = '\u00a7'  # stands for the path in a form
     ROOTS = (
-        # name, path, label, what the path looks like after the repo-root rewrite alone
-        ('home', b'/home/a', b'<home>', b'/home/a'),
-        ('root', b'/mnt/x/repo', b'<repo-root>', b'/mnt/x/repo'),
-        ('fix', b'/mnt/x/repo/.local-runs/cert-3607-fixtures',
-         b'<repo-root>/.local-runs/cert-3607-fixtures',
-         b'<repo-root>/.local-runs/cert-3607-fixtures'),
+        ('home', '/home/probeuser', '<home>'),
+        ('root', '/mnt/x/repo', '<repo-root>'),
+        ('fix', '/mnt/x/repo/.local-runs/cert-3607-fixtures',
+         '<repo-root>/.local-runs/cert-3607-fixtures'),
     )
-    REWRITTEN = (
-        b'{P}', b'{P}/x', b'"{P}"', b"'{P}'", b'`{P}`', b'({P})', b'[{P}]', b'<{P}>',
-        b'={P}', b':{P}', b'{P}:', b',{P}', b'{{P}}', b'${{P}}', b'${{P}}/x', b'{{P}/x}',
-        b'{{P}, y}', b'{k: {P}}', b'a,{P}', b'{P},{P}', b'[{P},{P}]', b'--dirs={P},{P}/x',
-        b'{{P}}.', b'{{P}}\n', b'({{P}})', b'"{{P}}"', b'{"p":"{P}"}', b'{x,{P}}', b'{{{P}}}',
-        b'{P}}', b'{{{P}', b'{P};', b'{P},', b'{P} x', b'a {P}', b'{P}\n', b'{P}\t',
-        b'{P}.', b'{P}. x', b'{P}.\n', b'KEY={P}:/bin', b'{P}) x', b'{P}] x', b'{P}> x',
-        b'{P}, x', b'{P}: x', b'{P}; x', b'\t{P}', b'\n{P}', b' {P}/y z',
-    )
-    KEPT_END = (
-        b'./x', b'..b', b'..', b'.txt', b'.b', b'.+', b'.)', b'.:x', b'.;', b'.,', b'.]',
-        b'+b', b'~', b'@x', b'%20', b'#1', b'$x', b'&b', b'|b', b'!', b'(x', b'{x',
-        b'[x', b'ab', b'_b', b'-b', b'=1', b'*', b'?', b'^', b'\\x', b'\xc3\xa9', b'\xc3\xa9/x',
-        b'\xe2\x80\xa8', b'\x00', b'<x', b'\x01',
-    )
-    KEPT_START = (
-        b'~', b'x+', b'x', b'@', b'%', b'+', b'#', b'$', b'&', b'|', b'!', b'}',
-        b'\\', b'.', b'-', b'_', b'\xc3\xa9', b'*', b'?', b'^', b';', b')', b']', b'>',
-        b'/', b'a.', b'\x00', b'\xe2\x80\xa8', b'1', b'a}', b'}}',
+    # 66 forms: the r9 probe shapes plus pipe, backslash, quotes, brackets and escapes.
+    PROBE_FORMS = (
+        '\u00a7', '\u00a7/x', '"\u00a7"', "'\u00a7'", '`\u00a7`', '(\u00a7)', '[\u00a7]', '<\u00a7>',
+        '=\u00a7', ':\u00a7', '\u00a7:', ',\u00a7', '{\u00a7}', '${\u00a7}', 'a,\u00a7', '\u00a7,\u00a7',
+        '[\u00a7,\u00a7]', '--dirs=\u00a7,\u00a7/x', '{"p":"\u00a7"}', '{"p": "\u00a7"}', '|\u00a7',
+        '\u00a7|', 'x|\u00a7|y', '&\u00a7', '\u00a7&', 'a&&\u00a7', '!\u00a7', '\u00a7!', '#\u00a7',
+        '\u00a7#', '?\u00a7', '\u00a7?', '*\u00a7', '\u00a7*', '%\u00a7', '\u00a7%', '\u00a7=', '=\u00a7=',
+        '\u00a7..', '..\u00a7', '\u00a7...', '\u00a7.txt', '\u00a7.', '\u00a7\\', '\\\u00a7', '\\"\u00a7\\"',
+        '\u00a7\\n', '\u00a7\\"', '$(\u00a7)', '$\u00a7', '~\u00a7', '@\u00a7', '^\u00a7', '\u00a7^', ';\u00a7;',
+        '\u00a7\t', '\t\u00a7', '\u00a7\r\n', '\u00a7+x', 'x+\u00a7', '\u00a7-x', '\u00a7_x', '\u00a70',
+        '0\u00a7', '\u00a7\u00a7', '\u00a7 \u00a7', '\u00a7/\u00a7', '\u00a7/../\u00a7',
     )
 
-    def patched(self):
+    def patched(self, home='/home/probeuser'):
         module = load_script_module()
         module.ROOT = Path('/mnt/x/repo')
         module.FIX = module.ROOT / '.local-runs' / 'cert-3607-fixtures'
-        module.HOME = '/home/a'
+        module.HOME = home
         return module
 
-    def test_rewrite_table_for_every_root(self):
-        module = self.patched()
-        for name, path, label, _ in self.ROOTS:
-            for template in self.REWRITTEN:
-                with self.subTest(root=name, raw=template):
-                    raw = template.replace(b'{P}', path)
-                    want = template.replace(b'{P}', label)
-                    self.assertEqual(module.sanitize(raw), want)
+    def test_the_probe_table_has_at_least_55_forms(self):
+        self.assertGreaterEqual(len(self.PROBE_FORMS), 55)
+        self.assertEqual(len(set(self.PROBE_FORMS)), len(self.PROBE_FORMS))
 
-    def test_end_boundary_kept_table_for_every_root(self):
+    def test_every_probe_form_is_rewritten_for_every_root(self):
         module = self.patched()
-        for name, path, _, after_root in self.ROOTS:
-            for suffix in self.KEPT_END:
-                with self.subTest(root=name, suffix=suffix):
-                    self.assertEqual(module.sanitize(path + suffix), after_root + suffix)
+        for name, path, label in self.ROOTS:
+            for form in self.PROBE_FORMS:
+                with self.subTest(root=name, form=form):
+                    raw = form.replace(self.MARK, path)
+                    got = module.sanitize(raw.encode()).decode()
+                    self.assertEqual(got, form.replace(self.MARK, label))
+                    self.assertNotIn(path, got)
 
-    def test_start_boundary_kept_table_for_every_root(self):
+    def test_every_printable_character_before_and_after_the_path(self):
         module = self.patched()
-        for name, path, _, _ in self.ROOTS:
-            for prefix in self.KEPT_START:
-                for tail in (b'', b'/x', b' y'):
-                    with self.subTest(root=name, prefix=prefix, tail=tail):
-                        raw = prefix + path + tail
-                        self.assertEqual(module.sanitize(raw), raw)
+        for name, path, label in self.ROOTS:
+            for code in range(0x20, 0x7f):
+                char = chr(code)
+                for raw, want in ((char + path, char + label), (path + char, label + char)):
+                    with self.subTest(root=name, raw=raw):
+                        self.assertEqual(module.sanitize(raw.encode()).decode(), want)
 
-    def test_reviewer_shapes_for_every_root(self):
+    def test_json_escaped_and_percent_encoded_forms_are_rewritten(self):
+        for home in ('/home/probeuser', '/home/a\\b"c', '/home/a b', "/home/a'b&c|d"):
+            module = self.patched(home)
+            for name, path, label in self.ROOTS if home == '/home/probeuser' else self.ROOTS[:1]:
+                value = home if name == 'home' else path
+                for form in sorted(value_forms(value)):
+                    for template in ('%s', '"p":"%s"', '{"p":"%s/x"}', '\\/%s', '%s\\/x', 'a|%s|b',
+                                     '?u=%s&v=1', '%s\\u0026', 'x\\\\%s'):
+                        raw = template % form
+                        with self.subTest(root=name, raw=raw):
+                            got = module.sanitize(raw.encode()).decode()
+                            for leaked in value_forms(value):
+                                self.assertNotIn(leaked.lower(), got.lower())
+
+    def test_the_slash_escape_and_doubled_backslashes_are_rewritten(self):
+        module = self.patched('/home/a\\b')
+        self.assertEqual(module.sanitize(b'{"h":"\\/home\\/a\\\\b"}'), b'{"h":"<home>"}')
+        self.assertEqual(module.sanitize(b'{"h":"/home/a\\\\b"}'), b'{"h":"<home>"}')
+        self.assertEqual(module.sanitize(b'/home/a\\b'), b'<home>')
+        self.assertEqual(module.sanitize(b'%2Fhome%2Fa%5Cb'), b'<home>')
+        self.assertEqual(module.sanitize(b'%2fhome%2fa%5cb/x'), b'<home>/x')
+
+    def test_percent_encoded_roots_are_rewritten(self):
         module = self.patched()
-        for name, path, label, after_root in self.ROOTS:
-            with self.subTest(root=name):
-                self.assertEqual(module.sanitize(path + b'./x'), after_root + b'./x')
-                self.assertEqual(module.sanitize(b'~' + path + b'/x'), b'~' + path + b'/x')
-                self.assertEqual(module.sanitize(b'x+' + path + b'/x'), b'x+' + path + b'/x')
-                self.assertEqual(module.sanitize(b',' + path), b',' + label)
-                self.assertEqual(module.sanitize(b'{' + path + b'}'), b'{' + label + b'}')
-                self.assertEqual(module.sanitize(b'@' + path), b'@' + path)
-                self.assertEqual(module.sanitize(b'%' + path), b'%' + path)
-                self.assertEqual(module.sanitize(path), label)
-                self.assertEqual(module.sanitize(path + b'/x'), label + b'/x')
-                self.assertEqual(module.sanitize(b'"' + path + b'"'), b'"' + label + b'"')
-                self.assertEqual(module.sanitize(b'(' + path + b')'), b'(' + label + b')')
-                self.assertEqual(module.sanitize(b'=' + path), b'=' + label)
-                self.assertEqual(module.sanitize(path + b'.'), label + b'.')
+        self.assertEqual(module.sanitize(b'file%3A%2F%2F%2Fmnt%2Fx%2Frepo%2Fa'),
+                         b'file%3A%2F%2F<repo-root>%2Fa')
+        self.assertEqual(module.sanitize(b'%2Fhome%2Fprobeuser'), b'<home>')
 
-    def test_two_paths_in_one_line_are_each_decided_on_their_own(self):
+    def test_longer_paths_that_share_the_prefix_are_over_redacted(self):
         module = self.patched()
-        self.assertEqual(module.sanitize(b'/home/a,/home/a x/home/a /home/a'),
-                         b'<home>,<home> x/home/a <home>')
+        self.assertEqual(module.sanitize(b'/home/probeuser2/x'), b'<home>2/x')
+        self.assertEqual(module.sanitize(b'/mnt/x/repo-other/y'), b'<repo-root>-other/y')
+        self.assertEqual(module.sanitize(b'x/home/probeuser/z'), b'x<home>/z')
 
-    def test_docstring_describes_an_explicit_allowlist(self):
+    def test_longest_value_goes_first(self):
+        module = self.patched('/mnt/x')  # HOME is a prefix of the repo root
+        self.assertEqual(module.sanitize(b'/mnt/x/repo/a /mnt/x/b'), b'<repo-root>/a <home>/b')
+        self.assertEqual(
+            module.sanitize(b'/mnt/x/repo/.local-runs/cert-3607-fixtures/k'),
+            b'<repo-root>/.local-runs/cert-3607-fixtures/k')
+
+    def test_child_homes_are_rewritten_to_home(self):
+        module = self.patched()
+        child = module.SANDBOX / 'leg1' / 'home'
+        module.CHILD_HOMES.append(child)
+        self.assertEqual(module.sanitize(('HOME=%s/.cache' % child).encode()), b'HOME=<home>/.cache')
+
+    def test_a_document_with_every_form_has_no_residue(self):
+        module = self.patched()
+        document = '\n'.join(form.replace(self.MARK, path)
+                             for _, path, _ in self.ROOTS for form in self.PROBE_FORMS)
+        document += '\n' + '\n'.join(sorted(value_forms('/home/probeuser')))
+        got = module.sanitize(document.encode()).decode()
+        for _, path, _ in self.ROOTS:
+            for leaked in value_forms(path):
+                self.assertNotIn(leaked.lower(), got.lower())
+
+    def test_leakscan_over_a_sanitized_bundle_exits_zero(self):
+        leakscan = Path(os.environ.get('LEAKSCAN_PY', 'leakscan-not-installed.py'))
+        if not leakscan.is_file():
+            self.skipTest('set LEAKSCAN_PY to the leak scanner to run this check')
+        home, root = '/home/' + 'fate' + '_two', '/mnt/' + 't9' + '/v07/repo'
+        module = self.patched(home)
+        module.ROOT = Path(root)
+        module.FIX = module.ROOT / '.local-runs' / 'cert-3607-fixtures'
+        document = '\n'.join(form.replace(self.MARK, path)
+                             for path in (home, root) for form in self.PROBE_FORMS)
+        document += '\n' + '\n'.join(sorted(value_forms(home) | value_forms(root)))
+        bundle = self.root / 'leakscan-bundle.txt'
+        bundle.write_bytes(module.sanitize(document.encode()))
+        done = subprocess.run([sys.executable, str(leakscan), 'probe', str(bundle)],
+                              capture_output=True, text=True)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    def test_docstring_states_every_occurrence_and_over_redaction(self):
         module = load_script_module()
         doc = ' '.join(module.sanitize.__doc__.split())
-        self.assertIn('BOTH ends', doc)
-        self.assertIn('explicit allowlist of delimiter characters', doc)
-        self.assertIn('not a list of illegal filename bytes', doc)
-        self.assertIn('Start boundary', doc)
-        self.assertIn('End boundary', doc)
-        self.assertIn('comma', doc)
-        self.assertIn('`,` or `{`', doc)
-        self.assertIn('`}`', doc)
+        self.assertIn('every occurrence', doc)
+        self.assertIn('longest value first', doc)
+        self.assertIn('JSON-escaped', doc)
+        self.assertIn('percent-encoded', doc)
+        self.assertIn('over-redact', doc)
+        self.assertIn('fails closed', doc)
         source = (REPO / 'scripts' / SCRIPT_NAME).read_text()
-        self.assertNotIn('legal filename character', source)
+        self.assertNotIn('PATH_START', source)
+        self.assertNotIn('PATH_END', source)
 
 
 def walk_modes(base):
@@ -1554,7 +1612,7 @@ class WorkDirs7609(SymlinkBase):
             calls.append(path)
             return Fake(len(calls))
 
-        with mock.patch.object(module.os, 'stat', fake):
+        with unittest.mock.patch.object(module.os, 'stat', fake):
             self.assertIn('filesystem', module.device_problem(self.root, self.home))
         self.assertIs(os.stat, real)
 
@@ -1881,12 +1939,14 @@ class BraceComma7612(RecaptureBase):
         self.assertEqual(got.count(self.HOME_PATH), 0, got)
         self.assertEqual(got.count('/home/other'), 1, got)
 
-    def test_forms_that_are_other_paths_stay(self):
+    def test_forms_that_continue_the_path_are_over_redacted(self):
         module = self.patched()
         for form in ('{P-x}', '{Px}', '{P.txt}', '$P', 'xP', '{P+x}', '{P@x}', '{P%x}'):
             raw = form.replace('P', self.HOME_PATH)
             with self.subTest(raw=raw):
-                self.assertEqual(module.sanitize(raw.encode()).decode(), raw)
+                got = module.sanitize(raw.encode()).decode()
+                self.assertNotIn(self.HOME_PATH, got)
+                self.assertEqual(got, form.replace('P', '<home>'))
 
 
 class HomeCharacters7613(unittest.TestCase):
@@ -1986,3 +2046,341 @@ class SwapReplaceDocs7539(SymlinkBase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class ChildCwd7648(SymlinkBase):
+    """#7648: every child (keygen, the seed, each leg, git) runs in its OWN fresh empty 0700
+    cwd with HOME inside the same per-child sandbox; keygen creates ai-memory.db in its cwd
+    (as the real one does) and no leg ever sees it, so a rerun gives byte-identical captures."""
+
+    BUNDLE_OUT = ('posture-bare-env.out', 'posture-hardened-env.out',
+                  'posture-hardened-boot-refusal.out', 'posture-sqlcipher-pass.out')
+
+    def make_cwd_stub(self, name, log):
+        head, rest = STUB.split('\n', 1)
+        path = self.root / name
+        path.write_text(head + CWD_HOOK % {'log': str(log)} + rest)
+        path.chmod(0o755)
+        return path
+
+    def bundle(self):
+        evidence = self.root / OUT_REL
+        return {p.name: p.read_bytes() for p in sorted(evidence.iterdir()) if p.is_file()}
+
+    def test_every_child_has_its_own_fresh_empty_cwd_and_home(self):
+        log = self.home / 'cwd.log'
+        default = self.make_cwd_stub('cwd-default', log)
+        sqlcipher = self.make_cwd_stub('cwd-sqlcipher', log)
+        done, _ = self.run_recapture(default_bin=default, sqlcipher_bin=sqlcipher)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(len(records), 6, [r['argv'] for r in records])  # keygen, 4 legs, seed
+        cwds = [record['cwd'] for record in records]
+        self.assertEqual(len(set(cwds)), len(cwds), 'a cwd was shared: %s' % cwds)
+        homes = [record['home'] for record in records]
+        self.assertEqual(len(set(homes)), len(homes), 'a HOME was shared: %s' % homes)
+        runs = (self.root / '.local-runs').resolve()
+        for record in records:
+            with self.subTest(argv=record['argv']):
+                self.assertEqual(record['ls'], [], 'the cwd was not empty')
+                self.assertFalse(record['store'])
+                self.assertEqual(record['mode'], 0o700)
+                self.assertIn(runs, Path(record['home']).resolve().parents)
+                self.assertEqual(Path(record['home']).resolve().parent,
+                                 Path(record['cwd']).resolve().parent)
+
+    def test_keygen_store_is_made_in_keygens_own_cwd_and_no_capture_names_a_store(self):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        for name in self.BUNDLE_OUT:
+            text = (self.root / OUT_REL / name).read_text()
+            with self.subTest(file=name):
+                self.assertNotIn('agrees', text)
+                self.assertNotIn('ai-memory.db', text)
+                self.assertIn('live pragma not observed', text)
+
+    def test_a_leg_never_finds_a_store_through_its_cwd(self):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse((self.root / '.local-runs' / 'cert-3607-sandbox').exists())
+        stray = [p for p in self.root.rglob('ai-memory.db')]
+        self.assertEqual(stray, [])  # keygen's store died with its sandbox
+
+    def test_two_consecutive_runs_give_byte_identical_bundles(self):
+        first, _ = self.run_recapture()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        before = self.bundle()
+        self.assertTrue((self.root / '.local-runs' / 'cert-3607-fixtures' / 'keys'
+                         / 'operator.key').is_file())  # the second run skips keygen
+        second, _ = self.run_recapture()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        after = self.bundle()
+        self.assertEqual(sorted(after), sorted(before))
+        for name in before:
+            with self.subTest(file=name):
+                self.assertEqual(after[name], before[name])
+
+    def test_a_run_with_the_key_present_matches_a_run_that_makes_it(self):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        made = self.bundle()
+        keys = self.root / '.local-runs' / 'cert-3607-fixtures' / 'keys'
+        for name in ('operator.key', 'operator.key.pub'):
+            (keys / name).unlink()  # the third run makes the pair again
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.bundle(), made)
+
+    def test_every_subprocess_runs_in_a_per_child_directory(self):
+        tree = ast.parse((REPO / 'scripts' / SCRIPT_NAME).read_text())
+        text = (REPO / 'scripts' / SCRIPT_NAME).read_text()
+        self.assertNotIn('SANDBOX_CWD', text)
+        self.assertNotIn('SANDBOX_HOME', text)
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and ast.unparse(node.func).startswith('subprocess.')]
+        for node in calls:
+            keywords = {keyword.arg: ast.unparse(keyword.value) for keyword in node.keywords}
+            with self.subTest(line=node.lineno):
+                self.assertIn('cwd', keywords)
+                self.assertNotIn('SANDBOX', keywords['cwd'])
+
+    def test_docstring_states_exactly_what_holds(self):
+        doc = ' '.join(load_script_module().__doc__.split())
+        self.assertIn('its own fresh empty 0700 cwd', doc)
+        self.assertIn('byte-identical', doc)
+        self.assertIn('explicit path', doc)
+        self.assertNotIn('one cwd', doc)
+
+
+class ManifestVerify7649(RecaptureBase):
+    """#7649: an existing bundle is verified against its committed manifest before anything is
+    published, and a mismatch refuses the run; a new manifest is computed only over the files
+    this run freshly captured, every other line is kept verbatim."""
+
+    def evidence(self):
+        return self.root / OUT_REL
+
+    def snapshot(self):
+        return {str(p.relative_to(self.evidence())): p.read_bytes()
+                for p in sorted(self.evidence().rglob('*')) if p.is_file()}
+
+    def seed(self):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        (self.evidence() / 'test-results.txt').write_bytes(b'test result: ok. 3 passed\n')
+        (self.evidence() / 'SANITIZATION.md').write_bytes(b'note\n')
+        write_manifest(self.evidence())
+        return self.snapshot()
+
+    def lines(self):
+        return {line.split('  ', 1)[1]: line for line in
+                (self.evidence() / 'MANIFEST.sha256').read_text().splitlines()}
+
+    def assert_untouched(self, before):
+        self.assertEqual(self.snapshot(), before)
+        work = self.root / '.local-runs' / 'cert-3607-work'
+        left = [p.name for p in work.iterdir()] if work.is_dir() else []
+        self.assertEqual([n for n in left if n != '.lock'], [], left)
+
+    def test_a_clean_rerun_passes_and_the_manifest_verifies(self):
+        before = self.seed()
+        old_lines = self.lines()
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(manifest_problems(self.evidence()), [])
+        new_lines = self.lines()
+        for name in ('test-results.txt', 'SANITIZATION.md'):
+            self.assertEqual(new_lines[name], old_lines[name])
+            self.assertEqual((self.evidence() / name).read_bytes(), before[name])
+        self.assertEqual(sorted(new_lines), sorted(old_lines))
+
+    def test_an_edited_test_results_file_makes_the_run_refuse(self):
+        self.seed()
+        log = self.home / 'ran.log'
+        default = self.make_logging_stub(self.root / 'logging-default', log)
+        with open(str(self.evidence() / 'test-results.txt'), 'ab') as handle:
+            handle.write(b'test result: ok. 999 passed\n')
+        before = self.snapshot()
+        done, _ = self.run_recapture(default_bin=default)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('test-results.txt', done.stderr)
+        self.assertNotIn('Traceback', done.stderr)
+        self.assertFalse(log.exists(), 'a binary ran although the bundle failed verification')
+        self.assert_untouched(before)
+
+    def test_an_edited_captured_file_makes_the_run_refuse(self):
+        self.seed()
+        with open(str(self.evidence() / 'posture-bare-env.out'), 'ab') as handle:
+            handle.write(b'tampered\n')
+        before = self.snapshot()
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('posture-bare-env.out', done.stderr)
+        self.assert_untouched(before)
+
+    def test_a_missing_listed_file_makes_the_run_refuse(self):
+        self.seed()
+        (self.evidence() / 'SANITIZATION.md').unlink()
+        before = self.snapshot()
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('SANITIZATION.md', done.stderr)
+        self.assert_untouched(before)
+
+    def test_a_manifest_line_that_does_not_parse_makes_the_run_refuse(self):
+        self.seed()
+        with open(str(self.evidence() / 'MANIFEST.sha256'), 'a') as handle:
+            handle.write('not a manifest line\n')
+        before = self.snapshot()
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('MANIFEST.sha256', done.stderr)
+        self.assert_untouched(before)
+
+    def test_a_listed_name_with_a_slash_makes_the_run_refuse(self):
+        self.seed()
+        with open(str(self.evidence() / 'MANIFEST.sha256'), 'a') as handle:
+            handle.write('%s  ../escape\n' % ('0' * 64))
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('../escape', done.stderr)
+
+    def test_the_manifest_after_a_missing_leg_lists_no_stale_capture(self):
+        self.seed()
+        done, _ = self.run_recapture(sqlcipher_bin=self.root / 'no-such-binary')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotIn('posture-sqlcipher-pass.out', self.lines())
+        self.assertEqual(manifest_problems(self.evidence()), [])
+        self.assertIn('test-results.txt', self.lines())
+
+    def test_a_first_run_without_a_manifest_writes_none(self):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse((self.evidence() / 'MANIFEST.sha256').exists())
+
+    def test_refresh_manifest_never_rehashes_a_file_it_did_not_write(self):
+        module = load_script_module()
+        bundle = self.root / 'bundle'
+        bundle.mkdir()
+        (bundle / 'foreign.txt').write_bytes(b'original\n')
+        (bundle / 'mine.out').write_bytes(b'v1\n')
+        write_manifest(bundle)
+        old = (bundle / 'MANIFEST.sha256').read_text()
+        (bundle / 'foreign.txt').write_bytes(b'tampered\n')
+        (bundle / 'mine.out').write_bytes(b'v2\n')
+        module.refresh_manifest(bundle, {'mine.out'})
+        new = {line.split('  ', 1)[1]: line.split('  ', 1)[0]
+               for line in (bundle / 'MANIFEST.sha256').read_text().splitlines()}
+        old_lines = {line.split('  ', 1)[1]: line.split('  ', 1)[0] for line in old.splitlines()}
+        self.assertEqual(new['foreign.txt'], old_lines['foreign.txt'])  # verbatim, not re-hashed
+        self.assertEqual(new['mine.out'], sha256_hex(bundle / 'mine.out'))
+
+    def test_docstring_states_the_verification(self):
+        doc = ' '.join(load_script_module().__doc__.split())
+        self.assertIn('verified against its committed manifest', doc)
+        self.assertIn('never re-hashes', doc)
+
+
+class RealPaths7650(RecaptureBase):
+    """#7650: every guarded path is resolved with os.path.realpath before any relative_to or
+    parent walk, no ValueError is suppressed, and a path that cannot be placed fails closed."""
+
+    def world_writable(self, relative):
+        path = self.root / '.local-runs' / relative
+        path.mkdir(parents=True)
+        path.chmod(0o777)
+        return path
+
+    def test_the_real_root_refuses_a_world_writable_tmpdir(self):
+        target = self.world_writable('r9ww')
+        done, _ = self.run_recapture(extra_env={'TMPDIR': str(target)})
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('world writable', done.stderr)
+
+    def test_a_symlinked_repo_root_refuses_a_world_writable_tmpdir(self):
+        link = self.home / 'rootlink'
+        link.symlink_to(self.root)
+        self.world_writable('r9ww')
+        done, _ = self.run_recapture(extra_env={'TMPDIR': str(link / '.local-runs' / 'r9ww')},
+                                     script_root=link)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('world writable', done.stderr)
+        self.assertIn('r9ww', done.stderr)
+        self.assertFalse((self.root / OUT_REL).exists())
+
+    def test_a_symlinked_repo_root_refuses_a_world_writable_tmpdir_ancestor(self):
+        link = self.home / 'rootlink2'
+        link.symlink_to(self.root)
+        self.world_writable('ww-parent')
+        child = self.root / '.local-runs' / 'ww-parent' / 'inner'
+        child.mkdir()
+        child.chmod(0o700)
+        done, _ = self.run_recapture(
+            extra_env={'TMPDIR': str(link / '.local-runs' / 'ww-parent' / 'inner')},
+            script_root=link)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('ww-parent', done.stderr)
+
+    def test_a_symlinked_tmpdir_parent_refuses_a_world_writable_target(self):
+        runs = self.root / '.local-runs'
+        runs.mkdir(exist_ok=True)
+        real = runs / 'realdir'
+        real.mkdir()
+        real.chmod(0o700)
+        (runs / 'alias').symlink_to(real)
+        sub = real / 'sub'
+        sub.mkdir()
+        sub.chmod(0o777)
+        done, _ = self.run_recapture(extra_env={'TMPDIR': str(runs / 'alias' / 'sub')})
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('world writable', done.stderr)
+
+    def test_a_symlinked_repo_root_with_safe_directories_still_succeeds(self):
+        link = self.home / 'rootlink3'
+        link.symlink_to(self.root)
+        done, _ = self.run_recapture(script_root=link)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue((self.root / OUT_REL / 'posture-bare-env.out').is_file())
+
+    def test_a_path_that_cannot_be_placed_fails_closed(self):
+        module = load_script_module()
+        elsewhere = Path(tempfile.mkdtemp(prefix='recapture-5038-elsewhere-', dir=str(SCRATCH)))
+        self.addCleanup(shutil.rmtree, str(elsewhere), True)
+        with self.assertRaises(OSError):
+            module.guarded_dirs(elsewhere)
+
+    def test_no_value_error_is_suppressed_in_the_script(self):
+        tree = ast.parse((REPO / 'scripts' / SCRIPT_NAME).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and ast.unparse(node.func).endswith('suppress'):
+                with self.subTest(line=node.lineno):
+                    self.assertNotIn('ValueError', ast.unparse(node))
+            if isinstance(node, ast.ExceptHandler) and node.type is not None:
+                with self.subTest(line=node.lineno):
+                    handled = ast.unparse(node.type)
+                    if 'ValueError' in handled:
+                        body = [ast.unparse(item) for item in node.body]
+                        self.assertNotEqual(body, ['pass'])
+
+    def test_the_script_does_not_use_resolve_on_guarded_paths(self):
+        text = (REPO / 'scripts' / SCRIPT_NAME).read_text()
+        self.assertNotIn('.resolve()', text)
+        self.assertIn('os.path.realpath', text)
+
+
+class ImportStyle7652(unittest.TestCase):
+    """#7652 (CodeQL py/import-and-import-from): no module is imported both ways."""
+
+    def test_no_test_or_script_module_imports_a_module_both_ways(self):
+        for path in (REPO / 'scripts' / SCRIPT_NAME,
+                     REPO / 'scripts' / 'ci' / 'tests' / Path(__file__).name):
+            tree = ast.parse(path.read_text())
+            plain, named = set(), set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    plain.update(alias.name.split('.')[0] for alias in node.names)
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    named.add(node.module.split('.')[0])
+            with self.subTest(path=path.name):
+                self.assertEqual(sorted(plain & named), [])
