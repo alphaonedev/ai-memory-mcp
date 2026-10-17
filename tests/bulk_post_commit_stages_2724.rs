@@ -295,7 +295,7 @@ async fn bulk_dispatches_memory_store_event_per_persisted_row_2724() {
     // #7320 - bounded wait on the DISTINCT dispatched-row count (never a
     // single sample): exactly 3, one per committed row, zero for the rejected
     // row (the settle inside the helper surfaces a spurious extra).
-    let final_count = wait_for_dispatches(&server, 3).await;
+    let final_count = wait_for_dispatches(&server, 3).await.rows;
     let total_requests = server.received_count().await;
     assert_eq!(
         final_count, 3,
@@ -353,34 +353,75 @@ fn pin_serial_dispatch() {
         ai_memory::subscriptions::override_dispatch_concurrency_for_tests(SERIAL_DISPATCH_PERMITS);
 }
 
-/// Count the DISTINCT memory ids the receiver saw (a retry of one delivery
-/// repeats its id and must not be counted as another row's dispatch).
-async fn distinct_dispatched_ids(server: &common::tls_receiver::TlsReceiver) -> usize {
+/// What the receiver saw, reduced to the exactly-once invariant (#7367).
+#[derive(Debug, PartialEq, Eq)]
+struct DispatchSummary {
+    /// Distinct `memory_id`s delivered.
+    rows: usize,
+    /// Distinct `correlation_id`s delivered (a retry shares its id).
+    correlations: usize,
+}
+
+/// Reduce `(memory_id, correlation_id)` pairs to a [`DispatchSummary`].
+fn summarise_dispatches(deliveries: &[(String, String)]) -> DispatchSummary {
+    let rows: std::collections::HashSet<&str> = deliveries.iter().map(|d| d.0.as_str()).collect();
+    DispatchSummary {
+        rows: rows.len(),
+        correlations: rows.len(),
+    }
+}
+
+/// Read the `(memory_id, correlation_id)` of every request the receiver saw.
+async fn received_deliveries(server: &common::tls_receiver::TlsReceiver) -> Vec<(String, String)> {
     let reqs = server.received_requests().await.unwrap_or_default();
     reqs.iter()
         .filter_map(|r| {
-            serde_json::from_slice::<Value>(&r.body).ok().and_then(|v| {
-                v.get("memory_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
+            let v = serde_json::from_slice::<Value>(&r.body).ok()?;
+            let field = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
+            Some((field("memory_id")?, field("correlation_id")?))
         })
-        .collect::<std::collections::HashSet<_>>()
-        .len()
+        .collect()
 }
 
 /// Wait (bounded) until `expected` distinct rows were dispatched, then settle
-/// and return the final distinct count.
-async fn wait_for_dispatches(server: &common::tls_receiver::TlsReceiver, expected: usize) -> usize {
+/// and return the final summary.
+async fn wait_for_dispatches(
+    server: &common::tls_receiver::TlsReceiver,
+    expected: usize,
+) -> DispatchSummary {
     let deadline = std::time::Instant::now() + dispatch_wait_window();
     while std::time::Instant::now() < deadline {
-        if distinct_dispatched_ids(server).await >= expected {
+        if summarise_dispatches(&received_deliveries(server).await).rows >= expected {
             break;
         }
         tokio::time::sleep(DISPATCH_POLL_INTERVAL).await;
     }
     tokio::time::sleep(DISPATCH_SETTLE).await;
-    distinct_dispatched_ids(server).await
+    summarise_dispatches(&received_deliveries(server).await)
+}
+
+/// #7367 - a second dispatch of one row (new correlation id) must be visible.
+#[test]
+fn duplicate_dispatch_of_one_row_is_detected_7367() {
+    let pair = |m: &str, c: &str| (m.to_owned(), c.to_owned());
+    let dup = [pair("m1", "c1"), pair("m2", "c2"), pair("m2", "c3")];
+    assert_eq!(
+        summarise_dispatches(&dup),
+        DispatchSummary {
+            rows: 2,
+            correlations: 3
+        },
+        "a duplicate dispatch of m2 must add a correlation id"
+    );
+    // A retry of one delivery shares its correlation id: not a duplicate.
+    let retry = [pair("m1", "c1"), pair("m1", "c1")];
+    assert_eq!(
+        summarise_dispatches(&retry),
+        DispatchSummary {
+            rows: 1,
+            correlations: 1
+        }
+    );
 }
 
 /// #7320 - a slow (but within-budget) receiver delays later deliveries past
@@ -431,7 +472,7 @@ async fn bulk_dispatch_waits_for_slow_receiver_deliveries_7320() {
         "all rows committed: {v}"
     );
 
-    let dispatched = wait_for_dispatches(&server, SLOW_BATCH_ROWS).await;
+    let dispatched = wait_for_dispatches(&server, SLOW_BATCH_ROWS).await.rows;
     assert_eq!(
         dispatched, SLOW_BATCH_ROWS,
         "#7320: every committed row must be dispatched to a slow receiver \
