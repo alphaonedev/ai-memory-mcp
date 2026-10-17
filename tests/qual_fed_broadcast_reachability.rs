@@ -27,6 +27,9 @@
 //! R-203: this test FAILS at the parent of the #2391 fix commit (one
 //! unreachable fn) and PASSES after the HTTP resolve surface is wired.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -75,9 +78,11 @@ fn collect_production_sources(dir: &Path, out: &mut Vec<String>) {
 
 #[test]
 fn issue_2391_every_broadcast_quorum_fn_has_a_production_caller() {
-    let sync_src = fs::read_to_string("src/federation/sync.rs")
-        .expect("read src/federation/sync.rs")
-        .replace("\r\n", "\n");
+    let sync_src = fs::read_to_string(pathpin::pin_file(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/federation/sync.rs"),
+    ))
+    .expect("read src/federation/sync.rs")
+    .replace("\r\n", "\n");
 
     // Harvest every outbound fanout entry point by its declaration.
     let mut broadcasts: BTreeSet<String> = BTreeSet::new();
@@ -105,7 +110,13 @@ fn issue_2391_every_broadcast_quorum_fn_has_a_production_caller() {
     );
 
     let mut production = Vec::new();
-    collect_production_sources(Path::new("src"), &mut production);
+    collect_production_sources(
+        &pathpin::pin_rs_root(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            pathpin::SRC_RS_MIN,
+        ),
+        &mut production,
+    );
     assert!(
         !production.is_empty(),
         "no production sources scanned — the test must run from the crate root"

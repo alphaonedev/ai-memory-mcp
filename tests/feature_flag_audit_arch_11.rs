@@ -20,6 +20,9 @@
 //!   `scripts/run-session-boot-lifetime-tests.sh` per the
 //!   Cargo.toml comment; the script-based consumer is honoured.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::fs;
 use std::path::Path;
 
@@ -43,7 +46,9 @@ fn walk(root: &Path, ext: &str) -> Vec<std::path::PathBuf> {
 
 #[test]
 fn arch_11_every_feature_flag_has_a_consumer_or_is_carve_out() {
-    let cargo = fs::read_to_string("Cargo.toml").expect("read Cargo.toml");
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cargo = fs::read_to_string(pathpin::pin_file(manifest.join("Cargo.toml")))
+        .expect("read Cargo.toml");
 
     // Parse the [features] section: every line of the shape
     // `<name> = ...` between `[features]` and the next `[section]`.
@@ -88,13 +93,16 @@ fn arch_11_every_feature_flag_has_a_consumer_or_is_carve_out() {
     // Build a haystack of every src/ + tests/ .rs file content so
     // the substring search runs once over the corpus.
     let mut haystack = String::new();
-    for path in walk(Path::new("src"), "rs") {
+    for path in walk(
+        &pathpin::pin_rs_root(manifest.join("src"), pathpin::SRC_RS_MIN),
+        "rs",
+    ) {
         if let Ok(s) = fs::read_to_string(&path) {
             haystack.push_str(&s);
             haystack.push('\n');
         }
     }
-    for path in walk(Path::new("tests"), "rs") {
+    for path in walk(&pathpin::pin_rs_root(manifest.join("tests"), 1), "rs") {
         if let Ok(s) = fs::read_to_string(&path) {
             haystack.push_str(&s);
             haystack.push('\n');

@@ -64,6 +64,9 @@
 //! production call site, rather than passing vacuously on today's tree
 //! (M-TAUTOLOGICAL-TESTS).
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::path::{Path, PathBuf};
 
 /// The `cfg` attribute both halves of the seam must carry, verbatim.
@@ -267,8 +270,9 @@ fn arming_call_sites(rel: &str, source: &str) -> Vec<String> {
 /// `cargo build --release` compiles neither.
 #[test]
 fn seam_is_cfg_gated_to_test_builds_3523() {
-    let source = std::fs::read_to_string(manifest_dir().join(SEAM_DEFINITION_FILE))
-        .unwrap_or_else(|e| panic!("read {SEAM_DEFINITION_FILE}: {e}"));
+    let source =
+        std::fs::read_to_string(pathpin::pin_file(manifest_dir().join(SEAM_DEFINITION_FILE)))
+            .unwrap_or_else(|e| panic!("read {SEAM_DEFINITION_FILE}: {e}"));
 
     for needle in [SEAM_MODULE_DECL, SEAM_CONSULT] {
         let gated = line_is_cfg_gated(&source, needle).unwrap_or_else(|| {
@@ -297,7 +301,10 @@ fn seam_is_cfg_gated_to_test_builds_3523() {
 fn no_production_code_arms_the_agent_id_seam_3523() {
     let manifest = manifest_dir();
     let mut files = Vec::new();
-    collect_rs_files(&manifest.join("src"), &mut files);
+    collect_rs_files(
+        &pathpin::pin_rs_root(manifest.join("src"), pathpin::SRC_RS_MIN),
+        &mut files,
+    );
     assert!(!files.is_empty(), "no src/**/*.rs files found");
 
     let mut violations = Vec::new();
@@ -334,7 +341,7 @@ fn no_production_code_arms_the_agent_id_seam_3523() {
 /// call to it.
 #[test]
 fn probe_free_ctor_is_cfg_gated_to_test_builds_3523() {
-    let path = manifest_dir().join(PROBE_FREE_DEFINITION_FILE);
+    let path = pathpin::pin_file(manifest_dir().join(PROBE_FREE_DEFINITION_FILE));
     let source =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     assert!(
@@ -360,7 +367,10 @@ fn probe_free_ctor_is_cfg_gated_to_test_builds_3523() {
 fn no_production_code_calls_the_probe_free_ctor_3523() {
     let manifest = manifest_dir();
     let mut files = Vec::new();
-    collect_rs_files(&manifest.join("src"), &mut files);
+    collect_rs_files(
+        &pathpin::pin_rs_root(manifest.join("src"), pathpin::SRC_RS_MIN),
+        &mut files,
+    );
     assert!(!files.is_empty(), "no src/**/*.rs files found");
 
     let mut violations = Vec::new();

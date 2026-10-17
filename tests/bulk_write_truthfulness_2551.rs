@@ -35,6 +35,9 @@
 //! the database. A counter-only assertion is precisely how #2551 hid: the
 //! envelope was self-consistent and wrong.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -535,9 +538,12 @@ fn bulk_write_funnel_embeds_2594() {
     // path-keyed assertion would silently start reading the post-fix file the
     // moment one exists, which is exactly how this cell first passed against
     // the parent tree.
-    let handlers = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/handlers"));
+    let handlers = pathpin::pin_rs_root(
+        std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/handlers")),
+        1,
+    );
     let mut funnel: Option<(String, String)> = None;
-    for entry in std::fs::read_dir(handlers).expect("src/handlers") {
+    for entry in std::fs::read_dir(&handlers).expect("src/handlers") {
         let path = entry.expect("dir entry").path();
         if path.extension().is_none_or(|e| e != "rs") {
             continue;

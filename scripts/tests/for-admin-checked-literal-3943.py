@@ -19,7 +19,7 @@
 #         by scripts/lib/production-lines.sh, line numbers preserved).
 # Argv  : argv[1] = repo-root-relative path, for the finding line.
 # Output: one `path:lineno: ...` finding per literal second argument.
-#         Exit 0 always — the caller (qc-codegraph-precheck.sh) decides the
+#         Exit 0 always — the caller (qc-codegraph-precheck.py) decides the
 #         HARD-BLOCK; this tool only reports.
 #
 # Requirements it satisfies (f2r 3943 pre-review §5 + addendum):

@@ -22,6 +22,9 @@
 // the `all_param_names_length_pins_v070_census` test in
 // `src/mcp/param_names.rs` is the gate for unused-allowlist creep.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use ai_memory::mcp::param_names::ALL_PARAM_NAMES;
 use std::collections::HashSet;
 use std::fs;
@@ -122,9 +125,9 @@ fn is_snake_case_param(s: &str) -> bool {
 
 #[test]
 fn every_production_mcp_param_literal_in_allowlist() {
-    let mcp_root = Path::new("src/mcp");
+    let mcp_root = pathpin::pin_rs_root(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mcp"), 10);
     let mut files = Vec::new();
-    walk_rs_files(mcp_root, &mut files);
+    walk_rs_files(&mcp_root, &mut files);
     assert!(
         !files.is_empty(),
         "expected to find production .rs files under src/mcp"

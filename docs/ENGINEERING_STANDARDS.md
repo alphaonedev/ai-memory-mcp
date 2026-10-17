@@ -91,7 +91,7 @@ Every PR must pass these gates before merge:
 | `AI_MEMORY_NO_CONFIG=1 cargo test` | All passing, 0 failures |
 | `cargo audit` | 0 vulnerabilities (warnings acceptable if transitive) |
 | `scripts/check-vendor-literals.sh` | Zero violations — vendor-monoculture + `SECS_PER_*` magic-number HARD-BLOCK ([#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200)) |
-| `scripts/qc-codegraph-precheck.sh` | Zero violations — C8 caller-context allowlist + structural-drift HARD-BLOCK ([#923](https://github.com/alphaonedev/ai-memory-mcp/issues/923)) |
+| `scripts/qc-codegraph-precheck.py` | Zero violations — C8 caller-context allowlist + structural-drift HARD-BLOCK ([#923](https://github.com/alphaonedev/ai-memory-mcp/issues/923)) |
 | `scripts/check-l3-boundary.sh` | Zero violations — L3-boundary perma-ban HARD-BLOCK (§25.3 S5 / RQ-10, [#1853](https://github.com/alphaonedev/ai-memory-mcp/issues/1853)) |
 | `scripts/check-hardcoded-literals.sh` | Zero violations — hardcoded-literal duplication ratchet (pm-v3.1) |
 | `scripts/check-docs-vs-ssot.sh` | Zero violations — docs-vs-SSOT drift HARD-BLOCK (operator directive 2026-05-31) |
@@ -173,7 +173,7 @@ cargo clippy -- -D warnings -D clippy::all -D clippy::pedantic
 AI_MEMORY_NO_CONFIG=1 cargo test
 cargo audit
 scripts/check-vendor-literals.sh        # vendor-monoculture + SECS_PER_* HARD-BLOCK (#1200)
-scripts/qc-codegraph-precheck.sh        # C8 caller-context allowlist + structural drift (#923)
+scripts/qc-codegraph-precheck.py        # C8 caller-context allowlist + structural drift (#923)
 scripts/check-l3-boundary.sh            # L3-boundary perma-ban HARD-BLOCK (§25.3 S5 / RQ-10, #1853)
 scripts/check-hardcoded-literals.sh     # hardcoded-literal duplication ratchet (pm-v3.1)
 scripts/check-docs-vs-ssot.sh           # docs-vs-SSOT drift HARD-BLOCK (operator directive 2026-05-31)

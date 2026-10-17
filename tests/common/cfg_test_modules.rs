@@ -639,7 +639,10 @@ pub fn production_sources(root: &std::path::Path) -> Vec<(String, String)> {
         }
     }
     let mut paths = Vec::new();
-    walk(&root.join("src"), &mut paths);
+    walk(
+        &crate::pathpin::pin_rs_root(root.join("src"), crate::pathpin::SRC_RS_MIN),
+        &mut paths,
+    );
     paths.sort();
     assert!(
         paths.len() > 100,

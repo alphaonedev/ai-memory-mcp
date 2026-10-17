@@ -9,12 +9,17 @@ import tempfile
 
 
 
+def gate_command(path):
+    """Run a Python gate with this interpreter and a shell gate with bash (#7260)."""
+    return [sys.executable if path.suffix == '.py' else 'bash', str(path)]
+
+
 def exemption_constants(gate_path):
     """Read the exemption constants from the gate file itself (#5884)."""
     text = gate_path.read_text()
     out = {}
     for key in ('C8_EXEMPT_FILE', 'C8_EXEMPT_FN', 'C8_EXEMPT_LINE'):
-        m = re.search(r"^" + key + r"='([^']*)'$", text, re.M)
+        m = re.search(r"^" + key + r" = '([^']*)'$", text, re.M)
         if not m:
             raise SystemExit(f'gate constant {key} not found')
         out[key] = m.group(1)
@@ -22,7 +27,7 @@ def exemption_constants(gate_path):
 
 
 root = pathlib.Path(__file__).resolve().parents[2]
-gates = sys.argv[1:] or ['check-hardcoded-literals.sh', 'check-vendor-literals.sh', 'qc-codegraph-precheck.sh']
+gates = sys.argv[1:] or ['check-hardcoded-literals.sh', 'check-vendor-literals.sh', 'qc-codegraph-precheck.py']
 failures = 0
 count = 0
 for gate in gates:
@@ -59,7 +64,7 @@ for gate in gates:
             ('config.rs', '#[cfg(test)]\nmod helper;\n' + body, True),
             ('config.rs', '#[cfg(test)]\nfn helper() {\n    consume("ignored");\n}\n' + body, True),
         ]
-        if gate == 'qc-codegraph-precheck.sh':
+        if gate == 'qc-codegraph-precheck.py':
             marker = 'GOVERNANCE_INTERNAL'
             # #5884: the exemption layout comes from the constants the gate
             # itself uses, never from a copied line number or line text.
@@ -123,7 +128,7 @@ for gate in gates:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(text + '\n')
                 paths.append(path)
-            run = subprocess.run(['bash', str(tree / 'scripts' / gate)], capture_output=True, text=True)
+            run = subprocess.run(gate_command(tree / 'scripts' / gate), capture_output=True, text=True)
             for path in paths:
                 path.unlink()
             output = run.stdout + run.stderr
@@ -134,11 +139,11 @@ for gate in gates:
             print(f'{"PASS" if ok else "FAIL"} #3623 {gate} case {i + 1}: {name} expected {"blocked" if blocked else "clean"}', flush=True)
             if not ok:
                 print(output)
-if 'qc-codegraph-precheck.sh' in gates:
+if 'qc-codegraph-precheck.py' in gates:
     # #5884: the constants must name the REAL site. Prove it against the real
     # source file: exactly one line, inside the anchor function, and the gate
     # accepts it as the exemption (no exemption diagnostic).
-    consts = exemption_constants(root / 'scripts' / 'qc-codegraph-precheck.sh')
+    consts = exemption_constants(root / 'scripts' / 'qc-codegraph-precheck.py')
     real_text = (root / consts['C8_EXEMPT_FILE']).read_text().splitlines()
     hits = [i for i, l in enumerate(real_text) if l == consts['C8_EXEMPT_LINE']]
     anchors = [i for i, l in enumerate(real_text) if re.match(r'\s*(pub(\([^)]*\))?\s+)?(async\s+)?fn\s+' + consts['C8_EXEMPT_FN'] + r'\b', l)]
@@ -152,10 +157,10 @@ if 'qc-codegraph-precheck.sh' in gates:
         dest = tree / consts['C8_EXEMPT_FILE']
         dest.parent.mkdir(parents=True)
         shutil.copyfile(root / consts['C8_EXEMPT_FILE'], dest)
-        run = subprocess.run(['bash', str(tree / 'scripts' / 'qc-codegraph-precheck.sh')], capture_output=True, text=True)
+        run = subprocess.run(gate_command(tree / 'scripts' / 'qc-codegraph-precheck.py'), capture_output=True, text=True)
         ok = ok and 'needs exactly 1' not in run.stdout + run.stderr
     count += 1
     failures += not ok
-    print(f'{"PASS" if ok else "FAIL"} #3623 qc-codegraph-precheck.sh real {consts["C8_EXEMPT_FILE"]}: one exempt site in fn {consts["C8_EXEMPT_FN"]}', flush=True)
+    print(f'{"PASS" if ok else "FAIL"} #3623 qc-codegraph-precheck.py real {consts["C8_EXEMPT_FILE"]}: one exempt site in fn {consts["C8_EXEMPT_FN"]}', flush=True)
 print(f'#3623: {count} tests, {failures} failures')
 sys.exit(bool(failures))

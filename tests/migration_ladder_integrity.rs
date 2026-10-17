@@ -15,6 +15,9 @@
 //! The migration TEXT is the durable truth; enforcing that its ladder is
 //! unambiguous is a first-order guardrail on that truth.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::PathBuf;
@@ -55,7 +58,7 @@ const EXPECTED_CONST_ARMS_POSTGRES: usize = 1;
 
 /// Read a repo-relative source file (the migration ladder sources) to a String.
 fn read_src(rel: &str) -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+    let path = pathpin::pin_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel));
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
@@ -126,6 +129,13 @@ fn migrate_fn_versions(src: &str) -> Vec<i64> {
 const KNOWN_PREFIX_GAPS: &[(&str, i64)] = &[("sqlite", 48)];
 
 fn migrations_dir(backend: &str) -> PathBuf {
+    pathpin::pin_files(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("migrations")
+            .join(backend),
+        "*.sql",
+        1,
+    );
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("migrations")
         .join(backend)

@@ -35,6 +35,9 @@
 
 #![allow(clippy::missing_panics_doc, clippy::doc_markdown)]
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 // #4023: ONE shared loader reads `postgres.rs` AND every child module under

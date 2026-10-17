@@ -28,6 +28,9 @@
 //! Stale allowlist entries fail too, so the lists cannot rot — including a
 //! PENDING entry whose test has since been guarded (#4327).
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -289,7 +292,10 @@ fn check_install(
 fn every_lib_tracing_capture_runs_in_an_isolated_child_4090() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
-    walk_rs(&root.join("src"), &mut files);
+    walk_rs(
+        &pathpin::pin_rs_root(root.join("src"), pathpin::SRC_RS_MIN),
+        &mut files,
+    );
     files.sort();
 
     let mut failures = Vec::new();

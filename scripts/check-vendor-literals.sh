@@ -36,7 +36,7 @@
 #       (with or without underscore separators) is a HARD-BLOCK.
 #
 # Production-vs-test boundary heuristic (mirrors
-# `scripts/qc-codegraph-precheck.sh`):
+# `scripts/qc-codegraph-precheck.py`):
 #   - Test files (basename `*test*.rs` or `tests.rs`) are skipped entirely.
 #   - Per-file, the first occurrence of `mod tests {` (or
 #     `pub mod tests {`) starts the test region; lines at or below that
@@ -147,7 +147,7 @@ scan_production_lines () {
     # (exit 133) under macOS system bash 3.2.57 on arm64 once enough
     # sub-processes fork; the here-string is behaviour-identical and
     # runs the loop in the current shell. Mirrors the same fix applied
-    # to scripts/qc-codegraph-precheck.sh (#1486 / 941b5a706).
+    # to scripts/qc-codegraph-precheck.py (#1486 / 941b5a706).
     local matches
     local production
     production="$(production_lines "$f")"

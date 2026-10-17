@@ -46,6 +46,9 @@
 //! named `params` / `arguments` (so `metadata.get(...)` and
 //! `row.get(...)` are ignored), and comments are stripped first.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -292,11 +295,11 @@ fn module_unit(root: &Path, file: &Path) -> String {
 fn handler_param_reads_are_declared_in_the_tool_schema_3171() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let param_names = const_map(
-        &std::fs::read_to_string(manifest.join("src/mcp/param_names.rs"))
+        &std::fs::read_to_string(pathpin::pin_file(manifest.join("src/mcp/param_names.rs")))
             .expect("param_names.rs must be readable"),
     );
     let tool_names = const_map(
-        &std::fs::read_to_string(manifest.join("src/mcp/registry.rs"))
+        &std::fs::read_to_string(pathpin::pin_file(manifest.join("src/mcp/registry.rs")))
             .expect("registry.rs must be readable"),
     );
     assert!(
@@ -326,7 +329,7 @@ fn handler_param_reads_are_declared_in_the_tool_schema_3171() {
         props.len()
     );
 
-    let tools_root = manifest.join("src/mcp/tools");
+    let tools_root = pathpin::pin_rs_root(manifest.join("src/mcp/tools"), 10);
     let allowed_star: BTreeSet<&str> = ALLOWED_READS
         .iter()
         .filter(|(unit, _, _)| *unit == "*")
@@ -364,7 +367,7 @@ fn handler_param_reads_are_declared_in_the_tool_schema_3171() {
 
     // #3171 Fable MED (5) — dispatcher-owned handlers live in src/mcp/mod.rs
     // (`memory_offload` / `memory_deref` `arguments.get(AGENT_ID)`).
-    let dispatcher = manifest.join("src/mcp/mod.rs");
+    let dispatcher = pathpin::pin_file(manifest.join("src/mcp/mod.rs"));
     let dispatcher_src = std::fs::read_to_string(&dispatcher).expect("mcp/mod.rs readable");
     let dispatcher_cleaned = strip_comments(&dispatcher_src);
     unit_reads

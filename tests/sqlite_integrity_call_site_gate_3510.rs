@@ -47,6 +47,9 @@
 //! constructs the exact damage the partial check skips — unreferenced pages —
 //! against a REAL migrated corpus and asserts the verdict is a refusal.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::path::{Path, PathBuf};
 
 /// The literal this gate polices: the PRAGMA text at the START of a Rust
@@ -174,7 +177,10 @@ fn raw_pragma_sites(rel_path: &str, source: &str) -> Vec<String> {
 fn every_integrity_check_call_site_is_the_shared_helper_3510() {
     let root = repo_root();
     let mut files = Vec::new();
-    collect_rs_files(&root.join("src"), &mut files);
+    collect_rs_files(
+        &pathpin::pin_rs_root(root.join("src"), pathpin::SRC_RS_MIN),
+        &mut files,
+    );
     assert!(!files.is_empty(), "no src/**/*.rs files found");
 
     let mut violations = Vec::new();
@@ -217,8 +223,8 @@ fn every_integrity_check_call_site_is_the_shared_helper_3510() {
 fn the_two_converted_surfaces_cite_the_shared_helper_3510() {
     let root = repo_root();
     for rel in ["src/cli/backup.rs", "src/recover/durability.rs"] {
-        let source =
-            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        let source = std::fs::read_to_string(pathpin::pin_file(root.join(rel)))
+            .unwrap_or_else(|e| panic!("read {rel}: {e}"));
         assert!(
             source.contains("sqlite_integrity::"),
             "{rel} must route its integrity verdict through \

@@ -37,6 +37,9 @@
 
 // #4023: ONE shared loader reads `postgres.rs` AND every child module under
 // `src/store/postgres/` (fail closed on an empty / short file set).
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 #[path = "common/pg_sources.rs"]
 mod pg_sources;
 

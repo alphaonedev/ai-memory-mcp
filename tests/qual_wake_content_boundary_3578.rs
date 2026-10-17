@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 #[path = "support/wake_source_3578.rs"]
 mod wake_source;
 use wake_source::{group_end, production_tokens, tokens};
@@ -56,8 +59,10 @@ fn fingerprint(source: &str, mode: &str) -> String {
 }
 
 fn source(path: &str) -> String {
-    fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(path))
-        .expect("every reviewed boundary source exists")
+    fs::read_to_string(pathpin::pin_file(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(path),
+    ))
+    .expect("every reviewed boundary source exists")
 }
 
 fn collect_rust(dir: &Path, paths: &mut BTreeSet<PathBuf>) {
@@ -77,7 +82,7 @@ fn reviewed_boundary_inventory_and_sources_are_exact() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut actual = BTreeSet::new();
     for dir in ["src/wake_hub", "src/wake_client", "src/wake_sink"] {
-        collect_rust(&root.join(dir), &mut actual);
+        collect_rust(&pathpin::pin_rs_root(root.join(dir), 1), &mut actual);
     }
     for path in [
         "src/cli/wake_listen.rs",

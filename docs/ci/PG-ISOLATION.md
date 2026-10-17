@@ -33,7 +33,8 @@ after another. With the lane on (flag `1`, kill switch not `1`, tier
    `--test`/`--bin` it mints `ai_memory_t_<run id>_<unix seconds>_<8 hex>`,
    holds a keepalive session on it, points `AI_MEMORY_TEST_POSTGRES_URL` (and
    `AI_MEMORY_TEST_AGE_URL` when set) at it, runs
-   `cargo test --no-fail-fast --test <bin> -- --test-threads=1`, then releases
+   `cargo nextest run --profile ci --no-fail-fast --test <bin> --test-threads 1` (#7259; the wrapper
+   maps `--test-arg=--test-threads=1` through `scripts/ci/nextest_args.py`), then releases
    the hold and drops the clone. The width is 8, reduced to what the live
    budget allows. Each binary writes its own log under
    `$RUNNER_TEMP/ci-shard/iso-logs/<bin>.log`. A failing binary's last 200

@@ -25,6 +25,9 @@
 //! should drop in the same PR so the discipline ratchets toward
 //! the longer-term re-split goal.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::fs;
 
 /// Per-file ceiling. `(path, max_lines)` rows. A file's actual LOC
@@ -1689,16 +1692,20 @@ const MODULE_SIZE_CEILINGS: &[(&str, usize)] = &[
     ("src/llm.rs", 7_200),
 ];
 
+/// A ceiling-table path resolved against the crate root (not the cwd).
+fn manifest_path(rel: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
+}
+
 #[test]
 fn qual_10_no_module_exceeds_size_ceiling() {
     let mut violations: Vec<String> = Vec::new();
     for (path, ceiling) in MODULE_SIZE_CEILINGS {
-        let Ok(content) = fs::read_to_string(path) else {
-            // Missing files imply a refactor split — that's OK,
-            // remove the row from the table on the next contributor's
-            // pass. Don't error here.
-            continue;
-        };
+        // A row whose file is gone is a red (#7260): a moved or split module
+        // must drop or rename its row in the same change, never silently
+        // lose its ceiling. `pin_file` panics naming the missing path.
+        let content = fs::read_to_string(pathpin::pin_file(manifest_path(path)))
+            .unwrap_or_else(|e| panic!("read {path}: {e}"));
         let line_count = content.lines().count();
         if line_count > *ceiling {
             violations.push(format!(
@@ -1724,9 +1731,8 @@ fn qual_10_ceiling_table_is_aspirational_not_ratcheting_up() {
     // gets tightened on every refactor.
     let mut weak_ceilings: Vec<String> = Vec::new();
     for (path, ceiling) in MODULE_SIZE_CEILINGS {
-        let Ok(content) = fs::read_to_string(path) else {
-            continue;
-        };
+        let content = fs::read_to_string(pathpin::pin_file(manifest_path(path)))
+            .unwrap_or_else(|e| panic!("read {path}: {e}"));
         let line_count = content.lines().count();
         // Headroom ratio: ceiling / actual. Tighten when > 1.50
         // (i.e. ceiling > 1.5 * actual). Use integer math to keep

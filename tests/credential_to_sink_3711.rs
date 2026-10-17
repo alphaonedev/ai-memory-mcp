@@ -22,6 +22,9 @@
 #[path = "common/key_dir_sandbox.rs"]
 mod key_dir_sandbox;
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -596,7 +599,10 @@ fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 fn no_production_site_renders_a_url_through_the_userinfo_maskers_3711() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
-    rust_files(&root.join("src"), &mut files);
+    rust_files(
+        &pathpin::pin_rs_root(root.join("src"), pathpin::SRC_RS_MIN),
+        &mut files,
+    );
     let mut offenders = Vec::new();
     for file in files {
         let rel = file

@@ -9,6 +9,9 @@
 #[path = "common/cfg_test_modules.rs"]
 mod cfg_test_modules;
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use cfg_test_modules::{cfg_requires_test, production_sources, strip_cfg_test_inline_mods};
 
 fn root() -> std::path::PathBuf {

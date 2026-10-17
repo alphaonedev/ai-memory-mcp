@@ -22,6 +22,9 @@
 //! the contributor lowers the ceiling in the same commit so the
 //! discipline ratchets toward zero.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::fs;
 use std::path::Path;
 
@@ -44,7 +47,8 @@ fn walk_rs(root: &Path) -> Vec<std::path::PathBuf> {
 }
 
 fn count_matches(root: &Path, needle: &str) -> usize {
-    let files = walk_rs(root);
+    let root = pathpin::pin_rs_root(Path::new(env!("CARGO_MANIFEST_DIR")).join(root), 1);
+    let files = walk_rs(&root);
     let mut count = 0usize;
     for path in &files {
         let Ok(content) = fs::read_to_string(path) else {

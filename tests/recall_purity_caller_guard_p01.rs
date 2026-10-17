@@ -20,12 +20,18 @@
 //! production files are included deliberately (cheap, and a new
 //! callsite anywhere still deserves review).
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
 fn census(pattern: &str, defs: &[&str]) -> BTreeMap<String, usize> {
     let mut out = BTreeMap::new();
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let root = pathpin::pin_rs_root(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        pathpin::SRC_RS_MIN,
+    );
     let mut stack = vec![root.clone()];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).expect("read_dir src") {

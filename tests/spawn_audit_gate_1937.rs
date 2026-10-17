@@ -37,6 +37,9 @@
 //! shape through `PostgresStore::emit_spawn_audit` and asserts the postgres
 //! `verify_audit_trail` twin walks + verifies it.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use ai_memory::signed_events::{event_types::PROCESS_SPAWN_AUDITED, verify_audit_trail};
 use ai_memory::spawn_audit::{
     self, CALLER_CLI_DOCTOR_GPU, CALLER_CLI_NAMESPACE_GIT, CALLER_CLI_WAKE_LISTEN_HOOK,
@@ -54,7 +57,10 @@ const CHOKEPOINT_REL_PATH: &str = "src/spawn_audit.rs";
 const SPAWN_CTOR_TOKEN: &str = "Command::new";
 
 fn repo_src_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    pathpin::pin_rs_root(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        pathpin::SRC_RS_MIN,
+    )
 }
 
 /// Recursively collect every `.rs` file under `dir`.
@@ -118,7 +124,8 @@ fn production_spawn_ctor_lines(path: &Path) -> Vec<usize> {
 #[test]
 fn chokepoint_no_raw_command_new_in_production() {
     let src_dir = repo_src_dir();
-    let chokepoint = Path::new(env!("CARGO_MANIFEST_DIR")).join(CHOKEPOINT_REL_PATH);
+    let chokepoint =
+        pathpin::pin_file(Path::new(env!("CARGO_MANIFEST_DIR")).join(CHOKEPOINT_REL_PATH));
     let mut files = Vec::new();
     collect_rs_files(&src_dir, &mut files);
     assert!(
@@ -197,8 +204,8 @@ fn every_known_production_site_routes_through_the_chokepoint() {
         ),
     ];
     for (rel, helper, caller_const) in cases {
-        let src =
-            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        let src = std::fs::read_to_string(pathpin::pin_file(root.join(rel)))
+            .unwrap_or_else(|e| panic!("read {rel}: {e}"));
         assert!(
             src.contains(helper),
             "{rel} must route its production spawn through `spawn_audit::{helper}`"

@@ -27,6 +27,9 @@ const ALLOWED_EDGES: &[&str] = &[
     "visibility::NAMESPACE_READ_SCOPE_DEPTH",
 ];
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 #[path = "support/wake_source_3578.rs"]
 mod wake_source;
 use wake_source::{group_end, production_tokens, tokens};
@@ -204,7 +207,10 @@ fn walk(dir: &Path, sources: &mut Vec<std::path::PathBuf>) {
 fn hub_production_has_only_reviewed_edges() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut sources = Vec::new();
-    walk(&root.join("src/wake_hub"), &mut sources);
+    walk(
+        &pathpin::pin_rs_root(root.join("src/wake_hub"), 15),
+        &mut sources,
+    );
     assert!(sources.len() >= 15, "empty or truncated source walk");
     let mut seen = BTreeSet::new();
     let mut errors = Vec::new();

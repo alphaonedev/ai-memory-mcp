@@ -58,6 +58,9 @@
 //! admin-twin shapes and SPARE the canonical, delegated and commented-out
 //! ones, rather than passing vacuously on today's tree.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -90,7 +93,10 @@ const CANONICAL_GUARD_TOKENS: [&str; 2] = ["agent_id_env_test_lock", "agent_id_e
 const ALLOWLISTED_SITES: [(&str, &str); 1] = [("src/identity/mod.rs", "drop")];
 
 fn repo_src_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    pathpin::pin_rs_root(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        pathpin::SRC_RS_MIN,
+    )
 }
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -281,7 +287,7 @@ fn caller_identity_env_mutation_is_canonically_locked_3517() {
 fn module_local_env_var_lock_wrappers_delegate_to_the_canonical_lock_3517() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     for rel in ["src/identity/mod.rs", "src/daemon_runtime.rs"] {
-        let source = std::fs::read_to_string(manifest.join(rel))
+        let source = std::fs::read_to_string(pathpin::pin_file(manifest.join(rel)))
             .unwrap_or_else(|e| panic!("read {rel}: {e}"));
         let lines: Vec<&str> = source.lines().collect();
         let start = lines

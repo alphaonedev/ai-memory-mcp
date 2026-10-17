@@ -72,6 +72,9 @@
 //! is proven to CATCH the two-mutex shape and SPARE the delegated one, rather
 //! than passing vacuously on today's tree (M-TAUTOLOGICAL-TESTS).
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -131,7 +134,10 @@ const DELEGATION_CHAIN: [(&str, &str, &str); 3] = [
 ];
 
 fn repo_src_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    pathpin::pin_rs_root(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        pathpin::SRC_RS_MIN,
+    )
 }
 
 fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -249,7 +255,7 @@ fn fn_body(rel: &str, name: &str, lines: &[&str]) -> String {
 fn the_two_process_env_lock_paths_delegate_to_one_mutex_3523() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     for (rel, name, must_cite) in DELEGATION_CHAIN {
-        let source = std::fs::read_to_string(manifest.join(rel))
+        let source = std::fs::read_to_string(pathpin::pin_file(manifest.join(rel)))
             .unwrap_or_else(|e| panic!("read {rel}: {e}"));
         let lines: Vec<&str> = source.lines().collect();
         let body = fn_body(rel, name, &lines);

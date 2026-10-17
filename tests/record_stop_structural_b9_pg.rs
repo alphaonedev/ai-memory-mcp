@@ -25,6 +25,9 @@
 //! FR6: a plain (non-raw) string literal containing a newline followed by
 //! `//` fails closed with a file and offset message; write it as a raw string.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::collections::{HashMap, HashSet};
 
 // #4023: ONE shared loader reads `postgres.rs` AND every child module under

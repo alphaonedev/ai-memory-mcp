@@ -19,6 +19,9 @@
 //! funnel's own internals. There is currently NO allowlist, and adding one
 //! should be a deliberate, justified act.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::path::Path;
 
 /// The single bounded funnel every read-path query embedding crosses.
@@ -46,7 +49,10 @@ fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 /// `embed_query` directly — it must go through the bounded funnel.
 #[test]
 fn every_production_embed_query_goes_through_the_bounded_funnel_2577() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = pathpin::pin_rs_root(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        pathpin::SRC_RS_MIN,
+    );
     let mut files = Vec::new();
     rust_files(&src, &mut files);
     assert!(!files.is_empty(), "no source files found under {src:?}");
@@ -100,7 +106,10 @@ fn every_production_embed_query_goes_through_the_bounded_funnel_2577() {
 /// surface simply stopped embedding at all.
 #[test]
 fn the_recall_surfaces_call_the_funnel_2577() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = pathpin::pin_rs_root(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+        pathpin::SRC_RS_MIN,
+    );
     for surface in [
         "handlers/recall.rs",
         "mcp/tools/recall.rs",
@@ -108,7 +117,7 @@ fn the_recall_surfaces_call_the_funnel_2577() {
         "mcp/tools/load_family.rs",
         "handlers/transport.rs",
     ] {
-        let path = src.join(surface);
+        let path = pathpin::pin_file(src.join(surface));
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         assert!(

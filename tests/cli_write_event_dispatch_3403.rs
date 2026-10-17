@@ -44,6 +44,9 @@
 //! single sqlite path by construction — there is no postgres twin to
 //! cover.
 
+#[path = "common/pathpin.rs"]
+mod pathpin;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -428,7 +431,7 @@ const CLI_WRITE_VERBS: &[(&str, &str)] = &[
 ];
 
 fn read(rel: &str) -> String {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
+    let p = pathpin::pin_file(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel));
     std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
@@ -472,7 +475,10 @@ fn no_cli_file_re_pairs_an_event_name_with_a_details_struct_3403() {
     // `tool_names::MEMORY_PROMOTE` arm next to a `"memory_promote"`
     // literal arm).
     let mut offenders = Vec::new();
-    for entry in walk_rs(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/cli")) {
+    for entry in walk_rs(&pathpin::pin_rs_root(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/cli"),
+        1,
+    )) {
         let rel = entry
             .strip_prefix(env!("CARGO_MANIFEST_DIR"))
             .unwrap_or(&entry)
