@@ -425,14 +425,24 @@ class UnresolvablePaths7284(Fixture):
         (alias_side / "alias").symlink_to(real_root.parent, target_is_directory=True)
         protected = alias_side / "alias" / "root"
         self.loop(protected / "loop-child")
-        with redirect_stderr(io.StringIO()):
+        real_resolve = prune.resolve
+
+        def loop_aware_resolve(path):
+            # Python 3.13+ resolves a loop without raising (#7326); raise as 3.9-3.12
+            # do so the fallback is reached on every interpreter.
+            if "loop-child" in Path(path).parts:
+                raise RuntimeError("Symlink loop from %s" % path)
+            return real_resolve(path)
+
+        unrelated = SCRATCH / "unrelated"
+        with mock.patch.object(prune, "resolve", side_effect=loop_aware_resolve), \
+                redirect_stderr(io.StringIO()):
             self.assertTrue(prune.is_protected(alias_side, protected))
             self.assertFalse(prune.is_protected(SCRATCH / "runner" / "_work" / "_temp" / "x", protected))
-        unrelated = SCRATCH / "unrelated"
-        with mock.patch.object(prune, "_protect_unresolvable_child", return_value=unrelated):
-            self.assertFalse(
-                prune.is_protected(alias_side, protected),
-                "dropping the lexical protection must be caught")
+            with mock.patch.object(prune, "_protect_unresolvable_child", return_value=unrelated):
+                self.assertFalse(
+                    prune.is_protected(alias_side, protected),
+                    "dropping the lexical protection must be caught")
 
     def test_s2_dropped_protected_candidates_are_logged(self):
         protected = self.stale_temp("keep-me")
