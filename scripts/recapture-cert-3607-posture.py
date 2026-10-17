@@ -16,10 +16,14 @@ across re-issues (#5039 part B is a separate, vote-gated decision).
 Environment overrides: DEFAULT_BIN (default <repo>/target/release/ai-memory),
 SQLCIPHER_BIN (default <repo>/target-sqlcipher/release/ai-memory; leg 4 is
 recorded as `missing` when it is absent) and TMPDIR (accepted only when it
-resolves, symlinks followed, under <repo-root>/.local-runs). The shell script's
+resolves, symlinks followed, under <repo-root>/.local-runs; a symlinked
+.local-runs is refused). A binary value containing a slash is taken relative to
+the repo root, a bare name is looked up on the child PATH, and the one resolved
+absolute path is both checked and run. A binary that cannot start records
+`exit: 127` (126 for other exec errors) for its leg. The shell script's
 defaults named build directories of one build host; they are replaced by
 repo-relative ones. Exit codes: 0 success; 1 DEFAULT_BIN is not an executable
-file, TMPDIR is outside <repo-root>/.local-runs, operator keygen failed, the git
+file, TMPDIR (or the default scratch directory) is outside <repo-root>/.local-runs, operator keygen failed, the git
 sha could not be read, or the transcript header date disagrees with the run
 date; 2 unknown arguments.
 """
@@ -29,6 +33,7 @@ import datetime
 import os
 import re
 import secrets
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -41,6 +46,8 @@ SQLCIPHER_BIN_FALLBACK = str(ROOT / "target-sqlcipher" / "release" / "ai-memory"
 HOME = os.environ.get("HOME", "")
 CHILD_PATH = "/usr/bin:/bin:" + HOME + "/.cargo/bin"
 SANITIZED_FIXTURE_LABEL = "<repo-root>/.local-runs/cert-3607-fixtures"
+EXEC_NOT_FOUND = 127
+EXEC_FAILED = 126
 EXIT_CODES_FILE = "posture-legs-exit-codes.txt"
 HEADER_TEMPLATE = (
     "# posture-legs transcript — recorded exit codes "
@@ -60,9 +67,10 @@ DIR_MODE = 0o700
 KEY_FILE_MODE = 0o600
 USAGE_EPILOG = (
     "Environment overrides: DEFAULT_BIN (default <repo>/target/release/ai-memory, must be "
-    "an executable file), SQLCIPHER_BIN (default <repo>/target-sqlcipher/release/ai-memory; "
+    "an executable file; a value with a slash is relative to the repo root, a bare name is "
+    "looked up on the child PATH), SQLCIPHER_BIN (default <repo>/target-sqlcipher/release/ai-memory; "
     "leg 4 is recorded as `missing` when absent), TMPDIR (must resolve under "
-    "<repo>/.local-runs). Exit codes: 0 success; 1 preflight or capture failure; "
+    "<repo>/.local-runs, which must not be a symlink). Exit codes: 0 success; 1 preflight or capture failure; "
     "2 unknown arguments."
 )
 
@@ -89,8 +97,11 @@ def check_header_date(transcript_path, run_date):
 
 
 def sanitize(raw):
-    """Collapse absolute repo, fixture and home paths (same order and bytes as GNU sed:
-    a final line without a newline stays without one)."""
+    """Collapse absolute repo, fixture and home paths, in the order of the shell sed.
+
+    The replacement is literal. The shell sed read each path as a regular expression, so
+    the two are identical for paths without regex metacharacters (the certified runs);
+    line endings, including CRLF and a missing final newline, are preserved exactly."""
     out = raw.replace(str(ROOT).encode(), b"<repo-root>")
     out = out.replace(str(FIX).encode(), SANITIZED_FIXTURE_LABEL.encode())
     if HOME:
@@ -139,17 +150,30 @@ def child_env(tmpdir, extra):
     return env
 
 
+def exec_status(error):
+    """The shell status for a binary that could not start: 127 not found, else 126."""
+    return EXEC_NOT_FOUND if isinstance(error, FileNotFoundError) else EXEC_FAILED
+
+
 def run_capture(binary, args, env, raw_path, sanitized_path):
-    """Run one leg, sanitize its combined output, drop the raw file, return `$?`."""
+    """Run one leg, sanitize its combined output, drop the raw file, return `$?`.
+
+    A binary that cannot start is recorded like the shell did: its error text is the
+    leg output and the status is 127 (126 for other exec errors)."""
     try:
         with open(str(raw_path), "wb") as raw:
-            done = subprocess.run([str(binary)] + args, env=env, stdout=raw,
-                                  stderr=subprocess.STDOUT, check=False)
+            try:
+                status = shell_status(subprocess.run(
+                    [str(binary)] + args, env=env, stdout=raw,
+                    stderr=subprocess.STDOUT, check=False).returncode)
+            except OSError as error:
+                raw.write(("%s: %s\n" % (binary, error.strerror or error)).encode())
+                status = exec_status(error)
         sanitized_path.write_bytes(sanitize(raw_path.read_bytes()))
     finally:
         if raw_path.exists():
             raw_path.unlink()  # the unsanitized capture never outlives this call
-    return shell_status(done.returncode)
+    return status
 
 
 def count_rows(path, marker):
@@ -168,14 +192,33 @@ def parse_args(argv):
 
 
 def resolve_tmpdir(raw):
-    """Return the resolved TMPDIR when it lies under <repo-root>/.local-runs, else None."""
+    """Return (resolved TMPDIR, None) when it lies under <repo-root>/.local-runs, else
+    (None, message). A symlinked .local-runs is refused: the anchor is the lexical
+    <real repo root>/.local-runs, never a resolved symlink target."""
+    label = "TMPDIR %s" % raw if raw else "default scratch directory (TMPDIR unset) %s" % (
+        LOCAL_RUNS / "tmp")
     candidate = Path(raw) if raw else LOCAL_RUNS / "tmp"
+    if LOCAL_RUNS.is_symlink():
+        return None, "%s: %s is a symlink; replace it with a real directory" % (label, LOCAL_RUNS)
     resolved = candidate.resolve()
+    anchor = ROOT.resolve() / ".local-runs"
     try:
-        resolved.relative_to(LOCAL_RUNS.resolve())
+        resolved.relative_to(anchor)
     except ValueError:
-        return None
-    return resolved
+        return None, ("%s resolves to %s, which is not under %s; set TMPDIR to a directory "
+                      "below it or unset it" % (label, resolved, anchor))
+    return resolved, None
+
+
+def resolve_binary(value):
+    """Absolute path of a binary setting, or None when a bare name is not on the child PATH.
+
+    A value containing a slash is relative to the repo root; a bare name is looked up on
+    the PATH the legs run with, so the file checked is the file executed."""
+    if os.sep in value:
+        joined = Path(value) if os.path.isabs(value) else ROOT / value
+        return os.path.normpath(str(joined))
+    return shutil.which(value, path=CHILD_PATH)
 
 
 def ensure_private_dir(directory):
@@ -194,20 +237,21 @@ def is_executable_file(candidate):
 def main(argv=None):
     parse_args(sys.argv[1:] if argv is None else argv)
     run_date = utc_run_date()
-    default_bin = os.environ.get("DEFAULT_BIN", DEFAULT_BIN_FALLBACK)
-    sqlcipher_bin = os.environ.get("SQLCIPHER_BIN", SQLCIPHER_BIN_FALLBACK)
-    raw_tmpdir = os.environ.get("TMPDIR")
-    tmpdir = resolve_tmpdir(raw_tmpdir)
+    default_setting = os.environ.get("DEFAULT_BIN", DEFAULT_BIN_FALLBACK)
+    sqlcipher_setting = os.environ.get("SQLCIPHER_BIN", SQLCIPHER_BIN_FALLBACK)
+    tmpdir, problem = resolve_tmpdir(os.environ.get("TMPDIR"))
     if tmpdir is None:
-        print("TMPDIR %s is not under %s; set TMPDIR to a directory below it or unset it"
-              % (raw_tmpdir, LOCAL_RUNS), file=sys.stderr)
+        print(problem, file=sys.stderr)
         return 1
-    if not is_executable_file(default_bin):
+    default_bin = resolve_binary(default_setting)
+    if default_bin is None or not is_executable_file(default_bin):
         print("DEFAULT_BIN %s is not an executable file; build it (cargo build --release) "
-              "or set DEFAULT_BIN" % default_bin, file=sys.stderr)
+              "or set DEFAULT_BIN" % (default_bin or default_setting), file=sys.stderr)
         return 1
+    sqlcipher_bin = resolve_binary(sqlcipher_setting) or sqlcipher_setting
     OUT.mkdir(parents=True, exist_ok=True)
-    ensure_private_dir(FIX)
+    FIX.mkdir(parents=True, exist_ok=True)
+    os.chmod(FIX, DIR_MODE)  # holds the passphrase and keys: tightened on every run
     ensure_private_dir(tmpdir)
 
     write_fixtures()
@@ -216,12 +260,18 @@ def main(argv=None):
     # carries the operator key pair in the key dir.
     if not (FIX / "keys" / "operator.key").is_file():
         keygen_out = FIX / "keygen.out"
-        with open(str(keygen_out), "wb") as sink:
-            keygen_env = child_env(tmpdir, {})
-            keygen_env.pop("AI_MEMORY_AGENT_ID")
-            done = subprocess.run([default_bin, "rules", "keygen"], env=keygen_env,
-                                  stdout=sink, stderr=subprocess.STDOUT, check=False)
-        if done.returncode != 0:
+        keygen_env = child_env(tmpdir, {})
+        keygen_env.pop("AI_MEMORY_AGENT_ID")
+        try:
+            with open(str(keygen_out), "wb") as sink:
+                keygen_status = subprocess.run(
+                    [default_bin, "rules", "keygen"], env=keygen_env,
+                    stdout=sink, stderr=subprocess.STDOUT, check=False).returncode
+        except OSError as error:
+            print("operator keygen failed: %s: %s" % (default_bin, error.strerror or error),
+                  file=sys.stderr)
+            return 1
+        if keygen_status != 0:
             print("operator keygen failed: " + keygen_out.read_text(errors="replace").rstrip("\n"),
                   file=sys.stderr)
             return 1
@@ -281,8 +331,11 @@ def main(argv=None):
             seed_env = child_env(tmpdir, leg4_env)
             for name in ("AI_MEMORY_AGENT_ID", "AI_MEMORY_KEY_DIR"):
                 seed_env.pop(name)
-            subprocess.run([sqlcipher_bin, "stats", "--json"], env=seed_env,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            try:
+                subprocess.run([sqlcipher_bin, "stats", "--json"], env=seed_env,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            except OSError:
+                pass  # seeding failure is tolerated; the leg records its own exec status
         leg4 = dict(armed)
         leg4.update(leg4_env)
         e4 = run_capture(sqlcipher_bin, POSTURE_ARGS, child_env(tmpdir, leg4),

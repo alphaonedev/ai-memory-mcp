@@ -130,7 +130,23 @@ class RecaptureBase(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def run_recapture(self, sqlcipher_bin=None, args=None, extra_env=None, default_bin=None):
+    def make_logging_stub(self, path, log):
+        """A stub that appends the path it was executed as to log."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        head, rest = STUB.split('\n', 1)
+        path.write_text(head + '\nimport sys as _s\nopen(%r, "a").write(_s.argv[0] + "\\n")\n' % str(log)
+                        + rest)
+        path.chmod(0o755)
+        return path
+
+    def make_broken_stub(self, path):
+        """An executable file whose interpreter does not exist (exec fails with ENOENT)."""
+        path.write_text('#!/nonexistent/interpreter-7432\n')
+        path.chmod(0o755)
+        return path
+
+    def run_recapture(self, sqlcipher_bin=None, args=None, extra_env=None, default_bin=None,
+                      cwd=None):
         env = {
             'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
             'HOME': str(self.home),
@@ -143,7 +159,8 @@ class RecaptureBase(unittest.TestCase):
         cmd = ['bash', str(script)] if script.suffix == '.sh' else [sys.executable, str(script)]
         cmd += list(args or [])
         before = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
-        done = subprocess.run(cmd, env=env, cwd=str(self.root), capture_output=True, text=True)
+        done = subprocess.run(cmd, env=env, cwd=str(cwd or self.root), capture_output=True,
+                              text=True)
         after = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
         return done, {before, after}
 
@@ -348,9 +365,10 @@ class BinaryPreflight7397(RecaptureBase):
     def test_raw_capture_is_removed_when_the_binary_cannot_start(self):
         module = load_script_module()
         raw = self.root / 'leg.out.raw'
-        with self.assertRaises(OSError):
-            module.run_capture(self.root / 'nope', [], {}, raw, self.root / 'leg.out')
+        status = module.run_capture(self.root / 'nope', [], {}, raw, self.root / 'leg.out')
+        self.assertEqual(status, 127)
         self.assertFalse(raw.exists())
+        self.assertIn('nope', (self.root / 'leg.out').read_text())
 
 
 class TmpdirOverride7398(RecaptureBase):
@@ -397,6 +415,7 @@ class SedParity7404(RecaptureBase):
 
     CASES = (
         b'', b'plain', b'plain\n', b'two\nlines', b'two\nlines\n', b'\n', b'a\n\n',
+        b'crlf\r\n', b'crlf\r\nlast', b'\r\n', b'a\r\n\r\nb\r\n',
     )
 
     def test_sanitize_adds_no_final_newline(self):
@@ -426,6 +445,180 @@ class SedParity7404(RecaptureBase):
         self.assertEqual(done.returncode, 0, done.stderr)
         data = (self.root / OUT_REL / 'posture-bare-env.out').read_bytes()
         self.assertTrue(data.endswith(b'overall: FAIL'), data[-40:])
+
+
+class BinaryResolution7431(RecaptureBase):
+    """#7431: the binary that is checked is the binary that is executed."""
+
+    NAME = 'ai-memory-r4probe'
+
+    def ran(self, log):
+        return sorted(set(log.read_text().split())) if log.exists() else []
+
+    def test_bare_name_runs_the_child_path_binary_not_the_cwd_lookalike(self):
+        log = self.root / 'ran.log'
+        on_path = self.make_logging_stub(self.home / '.cargo' / 'bin' / self.NAME, log)
+        self.make_logging_stub(self.root / self.NAME, log)
+        done, _ = self.run_recapture(default_bin=self.NAME)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.ran(log), [str(on_path)])
+
+    def test_bare_name_only_in_cwd_is_refused(self):
+        log = self.root / 'ran.log'
+        self.make_logging_stub(self.root / self.NAME, log)
+        done, _ = self.run_recapture(default_bin=self.NAME)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('DEFAULT_BIN', done.stderr)
+        self.assertIn(self.NAME, done.stderr)
+        self.assertEqual(self.ran(log), [])
+
+    def test_slash_value_is_relative_to_the_repo_root_not_the_cwd(self):
+        log = self.root / 'ran.log'
+        in_root = self.make_logging_stub(self.root / 'sub' / self.NAME, log)
+        self.make_logging_stub(self.home / 'sub' / self.NAME, log)
+        done, _ = self.run_recapture(default_bin='sub/' + self.NAME, cwd=self.home)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.ran(log), [str(in_root)])
+
+    def test_sqlcipher_bare_name_runs_the_child_path_binary(self):
+        log = self.root / 'ran.log'
+        name = 'ai-memory-sqlcipher-r4probe'
+        on_path = self.make_logging_stub(self.home / '.cargo' / 'bin' / name, log)
+        self.make_logging_stub(self.root / name, log)
+        done, _ = self.run_recapture(sqlcipher_bin=name)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.ran(log), [str(on_path)])
+        self.assertEqual(re.findall(r'^exit: (\S+)$', self.out('posture-legs-exit-codes.txt'), re.M),
+                         ['2', '2', '1', '0'])
+
+
+class ExecFailure7432(RecaptureBase):
+    """#7432: a binary that passes the check but cannot start records exit 127 (the shell did)."""
+
+    def exits(self):
+        return re.findall(r'^exit: (\S+)$', self.out('posture-legs-exit-codes.txt'), re.M)
+
+    def test_unstartable_sqlcipher_leg_records_127_and_finishes(self):
+        broken = self.make_broken_stub(self.root / 'broken-sqlcipher')
+        done, _ = self.run_recapture(sqlcipher_bin=broken)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotIn('Traceback', done.stderr)
+        self.assertEqual(self.exits(), ['2', '2', '1', '127'])
+        self.assertEqual(list((self.root / OUT_REL).glob('*.raw')), [])
+
+    def test_unstartable_default_bin_refreshes_the_whole_bundle(self):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        broken = self.make_broken_stub(self.root / 'broken-default')
+        done, _ = self.run_recapture(default_bin=broken)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotIn('Traceback', done.stderr)
+        self.assertEqual(self.exits(), ['127', '127', '127', '0'])
+        self.assertIn('broken-default', self.out('posture-bare-env.out'))
+
+    def test_unstartable_default_bin_fails_keygen_without_a_traceback(self):
+        broken = self.make_broken_stub(self.root / 'broken-default')
+        done, _ = self.run_recapture(default_bin=broken)
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('operator keygen failed', done.stderr)
+        self.assertNotIn('Traceback', done.stderr)
+        self.assertFalse((self.root / OUT_REL / 'posture-legs-exit-codes.txt').exists())
+
+    def test_non_not_found_exec_error_maps_to_126(self):
+        module = load_script_module()
+        raw = self.root / 'leg.out.raw'
+        status = module.run_capture(self.root, [], {}, raw, self.root / 'leg.out')
+        self.assertEqual(status, 126)
+        self.assertFalse(raw.exists())
+
+
+class FixtureDirMode7433(RecaptureBase):
+    """#7433: the fixtures directory (passphrase, keys, store) is tightened on every run."""
+
+    def test_pre_existing_loose_fixture_dir_ends_0700(self):
+        fix = self.root / '.local-runs' / 'cert-3607-fixtures'
+        fix.mkdir(parents=True)
+        fix.chmod(0o755)
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(fix.stat().st_mode & 0o777, 0o700)
+
+
+class LocalRunsSymlink7434(RecaptureBase):
+    """#7434: a symlinked .local-runs cannot launder out-of-tree scratch past the containment check."""
+
+    def link_local_runs(self):
+        outside = self.home / 'outside'
+        outside.mkdir()
+        (self.root / '.local-runs').symlink_to(outside)
+        return outside
+
+    def test_symlinked_local_runs_is_refused_with_tmpdir_unset(self):
+        outside = self.link_local_runs()
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('symlink', done.stderr)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_symlinked_local_runs_is_refused_with_tmpdir_set(self):
+        outside = self.link_local_runs()
+        done, _ = self.run_recapture(extra_env={'TMPDIR': str(outside / 't')})
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse((self.root / 'docs').exists())
+
+
+class TmpdirMessage7435(RecaptureBase):
+    """#7435: the refusal names the real scratch path, never `None`."""
+
+    def test_default_scratch_dir_refusal_names_the_default_and_its_target(self):
+        outside = self.home / 'outside'
+        outside.mkdir()
+        (self.root / '.local-runs').mkdir()
+        (self.root / '.local-runs' / 'tmp').symlink_to(outside)
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertNotIn('None', done.stderr)
+        self.assertIn('default', done.stderr)
+        self.assertIn(str(outside), done.stderr)
+        self.assertIn('.local-runs', done.stderr)
+
+    def test_explicit_tmpdir_refusal_names_the_value_and_its_target(self):
+        outside = self.home / 'shared-tmp'
+        outside.mkdir()
+        done, _ = self.run_recapture(extra_env={'TMPDIR': str(outside)})
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertNotIn('None', done.stderr)
+        self.assertIn(str(outside), done.stderr)
+
+
+class SedLiteral7436(RecaptureBase):
+    """#7436: the replacement is literal; it equals the sed for paths without regex metacharacters."""
+
+    def dotted(self):
+        module = load_script_module()
+        module.ROOT = Path('/x.y/repo')
+        module.FIX = module.ROOT / '.local-runs' / 'cert-3607-fixtures'
+        return module
+
+    def test_root_containing_a_dot_is_replaced_literally(self):
+        module = self.dotted()
+        raw = b'/x.y/repo/a /xAy/repo/b\r\n'
+        self.assertEqual(module.sanitize(raw), b'<repo-root>/a /xAy/repo/b\r\n')
+
+    @unittest.skipUnless(shutil.which('sed'), 'sed not available')
+    def test_dotted_root_matches_sed_with_the_dot_escaped(self):
+        module = self.dotted()
+        sed_args = ['-e', r's|/x\.y/repo|<repo-root>|g',
+                    '-e', r's|/x\.y/repo/\.local-runs/cert-3607-fixtures|%s|g' % SANITIZED_FIXTURE_LABEL]
+        for raw in (b'/x.y/repo/a\r\n', b'/x.y/repo/.local-runs/cert-3607-fixtures/k', b'plain\r\n'):
+            done = subprocess.run(['sed'] + sed_args, input=raw, capture_output=True, check=True)
+            self.assertEqual(module.sanitize(raw), done.stdout, raw)
+
+    def test_docstrings_do_not_claim_unqualified_sed_identity(self):
+        module = load_script_module()
+        self.assertIn('literal', module.sanitize.__doc__)
+        self.assertIn('metacharacters', module.sanitize.__doc__)
 
 
 if __name__ == '__main__':
