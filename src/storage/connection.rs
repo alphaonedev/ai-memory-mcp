@@ -221,7 +221,24 @@ impl<'c> WriteTxn<'c> {
         // Only a SUCCESSFUL commit disarms the guard. On the error path we
         // fall through with `finished == false` so `Drop` rolls back.
         self.finished = true;
-        let _settled = super::escalation_deferral::settle_frame(self.conn, self.frame_id);
+        let _settled = super::escalation_deferral::settle_frame(self.conn, self.frame_id, true);
+        Ok(())
+    }
+
+    /// #7241 - commit, then record the off-table audit anchors that the
+    /// signed-event appends of this transaction produced. A failed COMMIT
+    /// returns its error with the guard still armed (the drop rolls back) and
+    /// drops the anchors unrecorded, so a rolled-back append never anchors.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the `rusqlite` error from `COMMIT`, as [`WriteTxn::commit`].
+    pub fn commit_and_emit(
+        self,
+        anchor: crate::governance::audit::PendingAuditAnchor,
+    ) -> rusqlite::Result<()> {
+        self.commit()?;
+        anchor.emit_after_commit();
         Ok(())
     }
 
@@ -269,11 +286,11 @@ impl<'c> WriteTxn<'c> {
         // a fatal statement error. Issuing ROLLBACK there would only log a
         // spurious "cannot rollback - no transaction is active".
         if self.conn.is_autocommit() {
-            return super::escalation_deferral::settle_frame(self.conn, self.frame_id);
+            return super::escalation_deferral::settle_frame(self.conn, self.frame_id, false);
         }
         let rolled_back = self.conn.execute_batch(SQL_ROLLBACK);
         // #4116 — queue deferred escalations (refused unless the lock is released).
-        let outcomes = super::escalation_deferral::settle_frame(self.conn, self.frame_id);
+        let outcomes = super::escalation_deferral::settle_frame(self.conn, self.frame_id, false);
         if let Err(e) = rolled_back {
             tracing::error!(
                 target: TXN_GUARD_TRACE_TARGET,
