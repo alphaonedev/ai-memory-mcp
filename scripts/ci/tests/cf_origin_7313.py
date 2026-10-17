@@ -116,6 +116,22 @@ def _ipv6(inner):
     return "[" + "".join(out) + "]"
 
 
+_LABEL_DOTS = re.compile("[.\u3002\uff0e\uff61]")
+_UNASSIGNED = frozenset(("Cn", "Co", "Cs"))
+
+
+def _check_labels(unicode_host):
+    """UTS 46 validity the IDNA2003 codec does not enforce (#7546): a label must not begin with a combining mark
+    (general category M) and must not contain an unassigned, private-use or surrogate code point. Applied to
+    typed Unicode labels and to the decoded form of every `xn--` label. Unassigned is judged by this Python's
+    Unicode data, which can be older than the browser's: that errs towards `unparsed`, never towards a host."""
+    for label in _LABEL_DOTS.split(unicode_host):
+        if label and unicodedata.category(label[0]).startswith("M"):
+            raise UnparsedURL("host label begins with a combining mark")
+        if any(unicodedata.category(ch) in _UNASSIGNED for ch in label):
+            raise UnparsedURL("host label contains an unassigned code point")
+
+
 def _domain(raw):
     """Percent-decode, lower-case and IDNA-encode a host, reject forbidden code points, canonicalise IPv4."""
     try:
@@ -125,8 +141,10 @@ def _domain(raw):
     if not host.isascii():
         if _IDNA_DIVERGENT & set(host):
             raise UnparsedURL("host uses a character whose IDNA mapping differs between UTS 46 and IDNA 2003")
+        host = unicodedata.normalize("NFKC", host).lower()
+        _check_labels(host)
         try:
-            host = unicodedata.normalize("NFKC", host).lower().encode("idna").decode("ascii")
+            host = host.encode("idna").decode("ascii")
         except UnicodeError as exc:
             raise UnparsedURL("host is not valid IDNA") from exc
     host = host.lower()
@@ -136,9 +154,10 @@ def _domain(raw):
         raise UnparsedURL("host contains a forbidden code point")
     if any(label.startswith("xn--") for label in host.split(".")):
         try:
-            host.encode("ascii").decode("idna")
+            decoded = host.encode("ascii").decode("idna")
         except UnicodeError as exc:
             raise UnparsedURL("host has an invalid punycode label") from exc
+        _check_labels(decoded)
     if _ends_in_number(host):
         return _ipv4(host)
     return host
