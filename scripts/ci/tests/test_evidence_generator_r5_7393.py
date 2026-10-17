@@ -275,7 +275,7 @@ class OSErrorEndsTheGatesLeg7530(GatesRun):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = rc.main()  # an uncaught OSError would raise here
-        return code, out.getvalue(), (self.dir / "o2" / "legs.log").read_text()
+        return code, out.getvalue(), (self.dir / "o2" / "gates.log").read_text()
 
     def test_a_regular_file_at_the_scratch_path_is_a_failure_with_an_exit_row_7530(self):
         rc, r, wt, tip = self.make()

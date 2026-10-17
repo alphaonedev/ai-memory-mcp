@@ -183,11 +183,10 @@ class ExpiryCopyIsPrivate7489(ScratchCase):
         copy = Path(argv[1])
         self.assertNotEqual(copy, wt / "scripts" / ".cert-expiry-gate.py")
         self.assertEqual(copy.read_text(), "BLOB = 1\n")
-        self.assertEqual(copy.parent.parent, wt / ".local-runs")
-        self.assertEqual(copy.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(copy.parent, wt / ".local-runs")  # so the gate's REPO_ROOT (parent.parent) is the checkout (#7531)
         self.assertEqual(copy.stat().st_mode & 0o777, 0o600)
         r.drop_expiry()
-        self.assertFalse(copy.parent.exists())
+        self.assertFalse(copy.exists())
         self.assertTrue((wt / ".local-runs").exists())
 
     def test_a_tracked_symlink_at_the_old_fixed_path_is_never_written_through_7489(self):
@@ -220,7 +219,7 @@ class ExpiryCopyIsPrivate7489(ScratchCase):
         with mock.patch.object(r, "_gates", side_effect=boom):
             with self.assertRaises(RuntimeError):
                 r.gates("0" * 40, "", "")
-        self.assertTrue(seen and not seen[0].exists() and not seen[0].parent.exists())
+        self.assertTrue(seen and not seen[0].exists())
 
 
 class RowsMatchTheCode7490(ScratchCase):
