@@ -318,6 +318,12 @@ async fn bulk_dispatches_memory_store_event_per_persisted_row_2724() {
          dispatch (one correlation id) per committed row (3), never for the \
          rejected row ({seen:?}, {total_requests} requests): {v}"
     );
+    // #7396 - no request was silently dropped from the summary.
+    assert!(
+        seen.malformed.is_empty(),
+        "#7396: every received request must be a well-formed dispatch;          malformed (request index, body length): {:?}",
+        seen.malformed
+    );
     // #7395 - the delivered ids ARE the committed ids, not just as many.
     assert_eq!(
         id_mismatch(&seen, &db_committed_ids(&db_path, ns)),
@@ -406,6 +412,35 @@ struct DispatchSummary {
     correlations: usize,
     /// The distinct `memory_id`s themselves (#7395).
     memory_ids: BTreeSet<String>,
+    /// Requests that lacked `memory_id` or `correlation_id`, or whose body was
+    /// not JSON (#7396), as (request index, body length). Must be empty: such a request is never silently dropped.
+    malformed: Vec<(usize, usize)>,
+}
+
+/// One request the receiver saw, after classification (#7396).
+#[derive(Debug, PartialEq, Eq)]
+enum Delivery {
+    /// A well-formed dispatch: `(memory_id, correlation_id)`.
+    Valid(String, String),
+    /// A request that is not a well-formed dispatch. Carries the request index
+    /// and body length only, never the body (it may hold row content).
+    Malformed { index: usize, body_len: usize },
+}
+
+/// Classify one received request body (#7396).
+fn classify_delivery(index: usize, body: &[u8]) -> Delivery {
+    let malformed = Delivery::Malformed {
+        index,
+        body_len: body.len(),
+    };
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return malformed;
+    };
+    let field = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
+    match (field("memory_id"), field("correlation_id")) {
+        (Some(m), Some(c)) => Delivery::Valid(m, c),
+        _ => malformed,
+    }
 }
 
 /// Describe how the delivered ids differ from the committed ids (#7395), or
@@ -423,26 +458,33 @@ fn id_mismatch(seen: &DispatchSummary, committed: &BTreeSet<String>) -> Option<S
 }
 
 /// Reduce `(memory_id, correlation_id)` pairs to a [`DispatchSummary`].
-fn summarise_dispatches(deliveries: &[(String, String)]) -> DispatchSummary {
-    let rows: BTreeSet<String> = deliveries.iter().map(|d| d.0.clone()).collect();
-    let correlations: std::collections::HashSet<&str> =
-        deliveries.iter().map(|d| d.1.as_str()).collect();
+fn summarise_dispatches(deliveries: &[Delivery]) -> DispatchSummary {
+    let mut rows: BTreeSet<String> = BTreeSet::new();
+    let mut correlations: BTreeSet<&str> = BTreeSet::new();
+    let mut malformed: Vec<(usize, usize)> = Vec::new();
+    for d in deliveries {
+        match d {
+            Delivery::Valid(m, c) => {
+                rows.insert(m.clone());
+                correlations.insert(c.as_str());
+            }
+            Delivery::Malformed { index, body_len } => malformed.push((*index, *body_len)),
+        }
+    }
     DispatchSummary {
         rows: rows.len(),
         correlations: correlations.len(),
         memory_ids: rows,
+        malformed,
     }
 }
 
-/// Read the `(memory_id, correlation_id)` of every request the receiver saw.
-async fn received_deliveries(server: &common::tls_receiver::TlsReceiver) -> Vec<(String, String)> {
+/// Classify every request the receiver saw; none is dropped (#7396).
+async fn received_deliveries(server: &common::tls_receiver::TlsReceiver) -> Vec<Delivery> {
     let reqs = server.received_requests().await.unwrap_or_default();
     reqs.iter()
-        .filter_map(|r| {
-            let v = serde_json::from_slice::<Value>(&r.body).ok()?;
-            let field = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_owned);
-            Some((field("memory_id")?, field("correlation_id")?))
-        })
+        .enumerate()
+        .map(|(i, r)| classify_delivery(i, &r.body))
         .collect()
 }
 
@@ -466,7 +508,7 @@ async fn wait_for_dispatches(
 /// #7367 - a second dispatch of one row (new correlation id) must be visible.
 #[test]
 fn duplicate_dispatch_of_one_row_is_detected_7367() {
-    let pair = |m: &str, c: &str| (m.to_owned(), c.to_owned());
+    let pair = |m: &str, c: &str| Delivery::Valid(m.to_owned(), c.to_owned());
     let dup = [pair("m1", "c1"), pair("m2", "c2"), pair("m2", "c3")];
     let dup_seen = summarise_dispatches(&dup);
     assert_eq!(
@@ -480,11 +522,42 @@ fn duplicate_dispatch_of_one_row_is_detected_7367() {
     assert_eq!((retry_seen.rows, retry_seen.correlations), (1, 1));
 }
 
+/// #7396 - a request without `memory_id`/`correlation_id`, or with an
+/// unparsable or empty body, is counted as malformed, never dropped.
+#[test]
+fn malformed_requests_are_counted_not_dropped_7396() {
+    const GOOD: &[u8] = br#"{"memory_id":"m1","correlation_id":"c1"}"#;
+    const NO_MEMORY_ID: &[u8] = br#"{"correlation_id":"c1"}"#;
+    const NO_CORRELATION_ID: &[u8] = br#"{"memory_id":"m1"}"#;
+    const NOT_JSON: &[u8] = b"not json";
+    const EMPTY: &[u8] = b"";
+    let bodies = [GOOD, NO_MEMORY_ID, NO_CORRELATION_ID, NOT_JSON, EMPTY];
+    let classified: Vec<Delivery> = bodies
+        .iter()
+        .enumerate()
+        .map(|(i, b)| classify_delivery(i, b))
+        .collect();
+    let seen = summarise_dispatches(&classified);
+    assert_eq!(
+        seen.malformed,
+        vec![(1, 23), (2, 18), (3, 8), (4, 0)],
+        "{seen:?}"
+    );
+    assert_eq!((seen.rows, seen.correlations), (1, 1));
+    assert_eq!(
+        classified[4],
+        Delivery::Malformed {
+            index: 4,
+            body_len: 0
+        }
+    );
+}
+
 /// #7395 - same counts, wrong ids: a foreign id plus a missing committed row
 /// keeps both counts at N and must still be reported.
 #[test]
 fn delivered_ids_must_equal_committed_ids_7395() {
-    let pair = |m: &str, c: &str| (m.to_owned(), c.to_owned());
+    let pair = |m: &str, c: &str| Delivery::Valid(m.to_owned(), c.to_owned());
     let committed: BTreeSet<String> = ["m1", "m2"].iter().map(|m| (*m).to_owned()).collect();
     let good = summarise_dispatches(&[pair("m1", "c1"), pair("m2", "c2")]);
     assert_eq!(id_mismatch(&good, &committed), None);
@@ -548,6 +621,12 @@ async fn bulk_dispatch_waits_for_slow_receiver_deliveries_7320() {
         (SLOW_BATCH_ROWS, SLOW_BATCH_ROWS),
         "#7320/#7367: every committed row must be dispatched exactly once to \
          a slow receiver ({seen:?}, expected {SLOW_BATCH_ROWS}): {v}"
+    );
+    // #7396 - no request was silently dropped from the summary.
+    assert!(
+        seen.malformed.is_empty(),
+        "#7396: every received request must be a well-formed dispatch;          malformed (request index, body length): {:?}",
+        seen.malformed
     );
     // #7395 - the delivered ids ARE the committed ids, not just as many.
     assert_eq!(
