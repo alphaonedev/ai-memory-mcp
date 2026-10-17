@@ -539,8 +539,22 @@ class TemplateOwnership(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             self.run_setup(pg)
         self.assertEqual(pg.dbs, {}, 'the template this run created is dropped on interrupt')
-        self.assertTrue([s for s in pg.log if s.startswith('DROP DATABASE IF EXISTS')])
+        self.assertEqual([s for s in pg.log if s.startswith('DROP DATABASE IF EXISTS')],
+                         ['DROP DATABASE IF EXISTS "%s"' % TPL])
         self.assertFalse([s for s in pg.log if 'FORCE' in s])
+
+    def test_failed_cleanup_drop_does_not_replace_the_original_error_7372(self):
+        pg = FakePg(fail={'CREATE EXTENSION': 'ERROR:  extension "age" is not available',
+                          'DROP DATABASE': 'ERROR:  cleanup-drop-refused'})
+        with unittest.mock.patch.object(pib, 'log') as logged:
+            with self.assertRaises(pib.WrapperError) as ctx:
+                self.run_setup(pg)
+        self.assertIn('extension "age" is not available', str(ctx.exception))
+        self.assertNotIn('cleanup-drop-refused', str(ctx.exception))
+        warned = [c.args[0] for c in logged.call_args_list if c.args and c.args[0].startswith('WARN')]
+        self.assertEqual(len(warned), 1)
+        self.assertIn(TPL, warned[0])
+        self.assertIn('cleanup-drop-refused', warned[0])
 
     def test_fake_sql_errors_use_psql_status_one_7376(self):
         pg = FakePg({TPL: {'template': True, 'sessions': 0}}, fail={'ALTER DATABASE': 'ERROR:  boom'})
@@ -551,9 +565,16 @@ class TemplateOwnership(unittest.TestCase):
 
     def test_lost_connection_after_a_committed_create_refuses_without_alter_or_drop_7376(self):
         pg = FakePg(lost=('CREATE DATABASE',))
-        with self.assertRaises(pib.WrapperError):
+        with self.assertRaises(pib.WrapperError) as ctx:
             self.run_setup(pg)
         self.assertFalse([s for s in pg.log if s.startswith(('ALTER', 'DROP', 'CREATE EXT'))])
+        text = str(ctx.exception)
+        self.assertNotIn('nothing was created', text)
+        self.assertIn('may exist', text)
+        self.assertIn(TPL, text)
+        self.assertIn('teardown', text)
+        self.assertIn(self.DB, text)
+        self.assertEqual(ctx.exception.returncode, 2)
 
     def test_template_limit_counts_utf8_bytes_not_characters_7373(self):
         fits = 'é' * 29 + 'x'      # 29*2 + 1 = 59 bytes, 30 characters
@@ -562,7 +583,9 @@ class TemplateOwnership(unittest.TestCase):
         self.assertEqual(pib.template_name(fits), fits + '_tpl')
         with self.assertRaises(pib.WrapperError) as ctx:
             pib.template_name(over)
-        self.assertIn('63 bytes', str(ctx.exception))
+        text = str(ctx.exception)
+        self.assertIn('is 60 bytes', text)
+        self.assertIn('63-byte identifier limit', text)
 
     def test_owned_setup_then_teardown_leaves_nothing(self):
         pg = FakePg()
