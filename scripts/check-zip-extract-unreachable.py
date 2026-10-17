@@ -70,8 +70,11 @@ SCAN_FILES = ('build.rs',)
 CARGO_TREE_ARGS = (
     'tree', '-i', ZIP_CRATE, '--edges', 'normal,build,dev', '--depth', '1',
     '--prefix', 'depth', '--target', 'all', '--all-features', '--workspace',
-    '--offline', '--locked',
+    '--locked',
 )
+# No --offline: `--target all` needs every platform's crates and a clean runner has
+# fetched only its own. --locked keeps Cargo.lock authoritative; cargo may download
+# the lockfile-pinned sources it is missing.
 
 # Direct zip use, plus the candle code paths that open a zip archive.
 # Loader names come from candle-core / candle-nn 0.10.2 (npy.rs, pickle.rs,
