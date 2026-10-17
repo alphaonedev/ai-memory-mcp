@@ -112,9 +112,16 @@ async fn existing_destination_is_upserted(store: &dyn MemoryStore) {
         )
         .await
         .expect("#7111: consolidate onto an existing same-owner title upserts");
-    assert_eq!(id, dest.id, "#7111: the surviving destination id is returned");
+    assert_eq!(
+        id, dest.id,
+        "#7111: the surviving destination id is returned"
+    );
     let rows = rows_in_ns(store, &ctx, &ns).await;
-    assert_eq!(rows.len(), 1, "#7111: one destination row, sources consumed");
+    assert_eq!(
+        rows.len(),
+        1,
+        "#7111: one destination row, sources consumed"
+    );
     assert_eq!(rows[0].title, "dest upsert");
     assert_eq!(
         rows[0].content, "merged upsert",

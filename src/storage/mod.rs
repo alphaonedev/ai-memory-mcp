@@ -10246,7 +10246,9 @@ pub fn create_link_signed_with_window(
                     // anchor rides the owner's frame and is emitted only
                     // after its COMMIT.
                     let anchor = crate::signed_events::append_signed_event_no_tx(conn, &event)
-                        .context("append memory_link.created audit row in the caller transaction")?;
+                        .context(
+                            "append memory_link.created audit row in the caller transaction",
+                        )?;
                     crate::storage::escalation_deferral::defer_audit_anchor(conn, anchor);
                 }
             }
@@ -11125,12 +11127,29 @@ pub fn consolidate_with_expected_versions(
         // place and its surviving id returned; a hidden holder that landed
         // after the admission probe updates NOTHING (merge backstop) and
         // surfaces as the typed unnamed conflict.
-        let inserted_id: String = match conn
-            .prepare_cached(&CONSOLIDATE_UPSERT_SQL)?
-            .query_row(
-                params![new_id, tier.as_str(), namespace, title, content_to_store, tags_json, max_priority, source, total_access, now, candidate.effective_expires_at(), metadata_json, candidate.confidence_source.as_str(), cid_stamp.cid, cid_stamp.genesis, encrypted_envelope, min_confidence, candidate.memory_kind.as_str()],
-                |r| r.get(0),
-            ) {
+        let inserted_id: String = match conn.prepare_cached(&CONSOLIDATE_UPSERT_SQL)?.query_row(
+            params![
+                new_id,
+                tier.as_str(),
+                namespace,
+                title,
+                content_to_store,
+                tags_json,
+                max_priority,
+                source,
+                total_access,
+                now,
+                candidate.effective_expires_at(),
+                metadata_json,
+                candidate.confidence_source.as_str(),
+                cid_stamp.cid,
+                cid_stamp.genesis,
+                encrypted_envelope,
+                min_confidence,
+                candidate.memory_kind.as_str()
+            ],
+            |r| r.get(0),
+        ) {
             Ok(id) => id,
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 return Err(ConflictError {
