@@ -177,6 +177,7 @@ class SweepTests(SweepTestCase):
             self.assertIn("--max-bytes", res.stderr)
             self.assertTrue(entry.exists())
 
+    @unittest.skipIf(os.geteuid() == 0, "root can read a mode-000 directory")
     def test_unreadable_dir_warns_without_traceback(self):
         deps = self.debug / "deps"
         write_blob(deps / "a.rlib")
@@ -187,6 +188,7 @@ class SweepTests(SweepTestCase):
         self.assertNotIn("Traceback", res.stderr)
         self.assertIn(str(deps), res.stderr)
 
+    @unittest.skipIf(os.geteuid() == 0, "root can read a mode-000 directory")
     def test_unreadable_dir_does_not_stop_other_dirs(self):
         deps = self.debug / "deps"
         write_blob(deps / "a.rlib")
@@ -831,6 +833,12 @@ class LineBreakInjectionTests(SweepTestCase):
         self.assertEqual(result.returncode, EXIT_REFUSED, result.stderr)
         self.assertEqual(self.command_lines(result.stderr), [], result.stderr)
         self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+
+    def test_usage_error_is_one_escaped_line_7297_r8(self):
+        result = self.run_sweep("--max-bytes", "1500", "extra\n::error::injected")
+        self.assertEqual(result.returncode, EXIT_USAGE, result.stderr)
+        self.assertEqual(self.command_lines(result.stderr), [], result.stderr)
+        self.assertIn("extra%0A::error::injected", result.stderr)
 
     def test_escape_line_rule_7297_r7(self):
         module = load_script_module()

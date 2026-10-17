@@ -220,7 +220,7 @@ class UsageParser(argparse.ArgumentParser):
 
     def error(self, message):
         self.print_usage(sys.stderr)
-        self.exit(EXIT_USAGE, "{}: error: {}\n".format(self.prog, message))
+        self.exit(EXIT_USAGE, "{}: error: {}\n".format(self.prog, escape_line(message)))
 
 
 class Refused(Exception):
