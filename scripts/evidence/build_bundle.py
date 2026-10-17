@@ -151,7 +151,10 @@ def parse_rows(lines):
 
 def check_block(lines, start, rows):
     """One run_cert.py invocation (a `CONFIG ` row up to the next one): it must state its PLAN, and every planned leg
-    must have its section, its _DONE row, and the invocation its one EXIT=0 row (#7437)."""
+    must have its section, its _DONE row, and the invocation its one EXIT=0 row (#7437). The EXIT row is the
+    invocation's last row: nothing after it is accepted, not even a passing gates row (#7527). Its sections and _DONE
+    rows must be exactly the planned ones, in plan order (the runner's own order); an unplanned, unfinished,
+    duplicated or out-of-order section is refused (#7527)."""
     at = f"invocation at line {start + 1}"
     plans = [(i, l) for i, l in enumerate(lines) if l.startswith("PLAN ")]
     if len(plans) != 1 or plans[0][0] != 1 or not PLAN_ROW.match(plans[0][1]):
@@ -200,6 +203,11 @@ class RunNotes(list):
         super().__init__(notes)
         self.rule = rule
 
+    def __eq__(self, other):  # the rule is a label of the list, not part of its value
+        return list.__eq__(self, other)
+
+    __hash__ = None
+
 
 def check_run(outd):
     """Refuse unless EVERY invocation of legs.log is green and complete; return its COUNT_DIFF notes (a RunNotes
@@ -212,7 +220,10 @@ def check_run(outd):
     exactly one `CHAIN_DONE aggregate_failures=0` row (#5042, #7419). Independent of both, the run is refused on a
     malformed EXIT / _DONE row (#7438), a nonzero `<LEG>_DONE` or `EXIT=` value (negative included) and any failure
     row (FAIL_ROWS), before or after the chain, so a failing gates row appended to an older shared legs.log still
-    refuses; a PASSING gates row never does. A re-run after a failure must use a fresh --outd.
+    refuses. In a log with CONFIG rows nothing may follow an invocation's EXIT row, so a PASSING gates row after
+    it is refused too ("has rows after its EXIT row", #7527), and each invocation's legs must be in plan order. Only
+    a log with no CONFIG row (the legacy rule) accepts a passing gates row after the chain. A re-run after a failure
+    must use a fresh --outd.
     """
     log = outd / "legs.log"
     if not log.exists():

@@ -25,11 +25,11 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from unittest import mock
+import unittest.mock as mock
 
-from test_evidence_generator_5040_5042 import EVIDENCE, ScratchCase, load
-from test_evidence_generator_r2_7393 import GIT, make_repo
-from test_evidence_generator_r3_7393 import CHAIN_LEGS, CONFIG, DONE, GREEN_CHAIN, SEC, block, leg_text
+from test_evidence_generator_5040_5042 import ScratchCase, load
+from test_evidence_generator_r2_7393 import make_repo
+from test_evidence_generator_r3_7393 import CHAIN_LEGS, DONE, GREEN_CHAIN, SEC, block, leg_text
 
 TESTS = Path(__file__).resolve().parent
 EXIT_PG = "EXIT=0 leg=pg aggregate_failures=0 12:00Z\n"
@@ -304,7 +304,7 @@ class OSErrorEndsTheGatesLeg7530(GatesRun):
 class ExpiryCopyLayout7531(GatesRun):
     def test_the_gate_sees_the_checkout_as_its_repo_root_7531(self):
         rc, r, wt, tip = self.make()
-        copy = Path(r.pick_expiry()[1])
+        copy = Path(r.pick_expiry()[-1])
         self.assertEqual(copy.resolve().parent.parent, wt.resolve(), "the gate derives REPO_ROOT as parent.parent")
         r.drop_expiry()
 
@@ -327,13 +327,13 @@ class ExpiryCopyCreation7532(GatesRun):
         flags = []
         real = os.open
 
-        def spy(path, fl, mode=0o777, *a, **k):
+        def spy(path, fl, mode=0o600, *a, **k):
             flags.append((str(path), fl, mode))
             return real(path, fl, mode, *a, **k)
         with mock.patch("os.open", side_effect=spy):
             r.pick_expiry()
         r.drop_expiry()
-        mine = [f for f in flags if os.path.basename(f[0]).startswith(".expiry-")]
+        mine = [f for f in flags if os.path.basename(f[0]).startswith(".expiry-") and f[1] & os.O_CREAT]
         self.assertTrue(mine, flags)
         _p, fl, mode = mine[-1]
         for flag in ("O_EXCL", "O_NOFOLLOW", "O_CREAT", "O_WRONLY"):

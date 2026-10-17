@@ -21,7 +21,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from unittest import mock
+import unittest.mock as mock
 
 from test_evidence_generator_5040_5042 import EVIDENCE, ScratchCase, load
 from test_evidence_generator_r2_7393 import GIT, make_repo
@@ -180,7 +180,7 @@ class ExpiryCopyIsPrivate7489(ScratchCase):
     def test_copy_is_in_a_private_directory_not_a_fixed_in_tree_path_7489(self):
         rc, r, wt = self.make()
         argv = r.pick_expiry()
-        copy = Path(argv[1])
+        copy = Path(argv[-1])
         self.assertNotEqual(copy, wt / "scripts" / ".cert-expiry-gate.py")
         self.assertEqual(copy.read_text(), "BLOB = 1\n")
         self.assertEqual(copy.parent, wt / ".local-runs")  # so the gate's REPO_ROOT (parent.parent) is the checkout (#7531)
@@ -214,7 +214,7 @@ class ExpiryCopyIsPrivate7489(ScratchCase):
         seen = []
 
         def boom(*a, **k):
-            seen.append(Path(r.pick_expiry()[1]))
+            seen.append(Path(r.pick_expiry()[-1]))
             raise RuntimeError("boom")
         with mock.patch.object(r, "_gates", side_effect=boom):
             with self.assertRaises(RuntimeError):

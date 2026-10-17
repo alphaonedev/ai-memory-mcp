@@ -21,6 +21,7 @@ CONFIG and PLAN rows, a `RED preflight` row and an `EXIT=64` row are written, an
 that could not start (a RED launch row). Paths default to the checkout (.local-runs/); see the --cargo-slot/--slot-lock/--targets/--tmpdir options.
 """
 import argparse
+import contextlib
 import datetime
 import os
 import re
@@ -204,7 +205,8 @@ class Run:
         self.cargo_slot = str(slot) if slot else ""
         self.cargo = [self.cargo_slot, "cargo"] if slot else ["cargo"]
         self.slot_lock = str(lock) if lock else ""
-        self.expiry_copy = None
+        self.expiry_copy = self.expiry_dfd = self.expiry_name = self.expiry_data = None
+        self.expiry_ident = self.expiry_dir_ident = None
         self.outd.mkdir(parents=True, exist_ok=True)
         self.targets.mkdir(parents=True, exist_ok=True)
         self.tmpdir.mkdir(parents=True, exist_ok=True)
@@ -519,6 +521,12 @@ class Run:
             ("ftc", ["bash", "scripts/check-foreign-text-to-caller.sh"], {}),
         ]
         for name, argv, extra in checks:
+            if name.startswith("cert-expiry"):
+                try:
+                    self.check_expiry_copy()  # #7581: the path must still name the copy that was made
+                except ValueError as e:
+                    self.fail(f"  RED expiry gate copy: {e}")
+                    continue
             out = Path(f"{gl}.{name}.log")
             rc = self.run(argv, out, extra)
             lines = [l for l in out.read_text(errors="replace").splitlines() if l.strip()]
@@ -535,13 +543,19 @@ class Run:
         return self.bad
 
     def pick_expiry(self):
-        """argv of the cert-expiry gate, run from a copy of HEAD's blob of scripts/check_cert_expiry.py (#7439). No shell
-        fallback; a missing or non-regular (symlink) entry raises. The gate sets REPO_ROOT to its own path's
-        parent.parent, so the copy is a file named .expiry-<pid>-<random>.py directly inside <wt>/.local-runs: its
-        parent.parent is then the checkout, and the gate's own scratch is the one <wt>/.local-runs (no nested
-        .local-runs/.local-runs). .local-runs is opened O_DIRECTORY|O_NOFOLLOW and the copy is created relative to that
-        directory fd with O_EXCL|O_NOFOLLOW, mode 0600, so a symlink swapped in at any point is refused (#7489, #7532).
-        Copies left by a killed run (their pid is gone) are swept first. drop_expiry() removes the copy."""
+        """argv of the cert-expiry gate, run as `python -I <copy>` from a copy of HEAD's blob of scripts/check_cert_expiry.py
+        (#7439, #7581). No shell fallback; a missing or non-regular (symlink) entry raises. The gate sets REPO_ROOT to
+        its own path's parent.parent, so the copy is a file named .expiry-<pid>-<random>.py directly inside
+        <wt>/.local-runs: its parent.parent is then the checkout, and the gate's own scratch is the one
+        <wt>/.local-runs (no nested .local-runs/.local-runs, #7531). That layout is why the copy is not put in a
+        private subdirectory; isolated mode (-I) keeps the copy's own directory off sys.path, so a module planted
+        beside it never replaces the gate (#7581).
+        What is enforced: .local-runs is opened once, O_DIRECTORY|O_NOFOLLOW; the copy is created relative to that
+        directory fd with O_EXCL|O_NOFOLLOW, mode 0600; the sweep of stale copies (their pid is gone) and the removal
+        of the copy go through the same directory fd and never follow a symlink (#7532, #7582). The gate is started
+        from the path, so before each run check_expiry_copy() confirms that the path still names the same directory
+        and the same file (device and inode) and that the bytes are the blob's; a mismatch is refused. The window
+        between that check and the exec is not closed, only narrowed. drop_expiry() removes the copy."""
         sha, data = blob_bytes(self.wt, "HEAD", EXPIRY_PY)
         scratch = self.wt / ".local-runs"
         try:
@@ -554,24 +568,75 @@ class Run:
             if scratch.is_symlink():
                 raise ValueError(f"{scratch} is a symlink; the expiry gate copy is not written through it") from e
             raise
+        name = f".expiry-{os.getpid()}-{secrets.token_hex(6)}.py"
         try:
-            self.sweep_expiry(dfd, scratch)
-            name = f".expiry-{os.getpid()}-{secrets.token_hex(6)}.py"
+            self.sweep_expiry(dfd)
             fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=dfd)
-        finally:
+        except BaseException:
             os.close(dfd)
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        dest = scratch / name
-        self.expiry_copy = dest
+            raise
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+                f.flush()
+                ident = os.fstat(f.fileno())
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(name, dir_fd=dfd)
+            os.close(dfd)
+            raise
+        self.expiry_dfd, self.expiry_name, self.expiry_data = dfd, name, data
+        self.expiry_ident, self.expiry_dir_ident = (ident.st_dev, ident.st_ino), os.fstat(dfd)
+        self.expiry_copy = scratch / name
+        try:
+            self.check_expiry_copy()
+        except ValueError:
+            self.drop_expiry()
+            raise
         self.note(f"{EXPIRY_PY} blob={sha} (HEAD tree; run from a copy of the blob)")
-        return [sys.executable, str(dest)]
+        return [sys.executable, "-I", str(self.expiry_copy)]
+
+    def check_expiry_copy(self):
+        """Raise ValueError unless the copy's path still names the directory fd opened by pick_expiry and the very file
+        it created (same device and inode, a regular file, the blob's bytes). Called before every run of the gate."""
+        if self.expiry_copy is None:
+            raise ValueError("no expiry gate copy was made")
+        try:
+            dst = os.lstat(self.expiry_copy.parent)
+            dev, ino = self.expiry_dir_ident.st_dev, self.expiry_dir_ident.st_ino
+            if not stat.S_ISDIR(dst.st_mode) or (dst.st_dev, dst.st_ino) != (dev, ino):
+                raise ValueError(f"{self.expiry_copy.parent} no longer names the directory the copy was made in")
+            fd = os.open(self.expiry_copy, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except OSError as e:
+            raise ValueError(f"the expiry gate copy {self.expiry_copy} cannot be re-opened: {e}") from e
+        with os.fdopen(fd, "rb") as f:
+            st = os.fstat(f.fileno())
+            if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != self.expiry_ident:
+                raise ValueError(f"the expiry gate copy {self.expiry_copy} is not the file that was created")
+            if f.read() != self.expiry_data:
+                raise ValueError(f"the expiry gate copy {self.expiry_copy} was modified after it was created")
 
     @staticmethod
-    def sweep_expiry(dfd, scratch):
-        """Remove .expiry-* entries a killed run left in the scratch directory: those whose pid is gone, and any entry
-        of the older directory layout. A live run's copy (its pid is alive) is not touched (#7532)."""
-        for name in os.listdir(dfd):
+    def remove_at(dfd, name):
+        """Remove the entry `name` of the directory fd `dfd` without following a symlink: a directory is emptied through
+        its own fd (O_DIRECTORY|O_NOFOLLOW), a symlink or file is unlinked itself (#7582)."""
+        if stat.S_ISDIR(os.stat(name, dir_fd=dfd, follow_symlinks=False).st_mode):
+            sub = os.open(name, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dfd)
+            try:
+                for entry in [e.name for e in os.scandir(sub)]:
+                    Run.remove_at(sub, entry)
+            finally:
+                os.close(sub)
+            os.rmdir(name, dir_fd=dfd)
+        else:
+            os.unlink(name, dir_fd=dfd)
+
+    @staticmethod
+    def sweep_expiry(dfd):
+        """Remove .expiry-* entries a killed run left in the scratch directory `dfd`: those whose pid is gone, and any
+        entry of the older directory layout. A live run's copy (its pid is alive) is not touched. Every call is
+        relative to the directory fd, so a path swapped for a symlink cannot redirect it (#7532, #7582)."""
+        for name in [e.name for e in os.scandir(dfd)]:
             if not name.startswith(".expiry-"):
                 continue
             m = re.match(r"\.expiry-(\d+)-", name)
@@ -584,21 +649,17 @@ class Run:
                     pass
                 except PermissionError:
                     continue  # alive, another user
-            try:
-                if stat.S_ISDIR(os.stat(name, dir_fd=dfd, follow_symlinks=False).st_mode):
-                    shutil.rmtree(scratch / name, ignore_errors=True)
-                else:
-                    os.unlink(name, dir_fd=dfd)
-            except OSError:
-                pass  # best effort: a leftover never blocks the run
+            with contextlib.suppress(OSError):  # best effort: a leftover never blocks the run
+                Run.remove_at(dfd, name)
 
     def drop_expiry(self):
-        if self.expiry_copy is not None:
-            try:
-                self.expiry_copy.unlink()
-            except OSError:
-                pass
-            self.expiry_copy = None
+        """Remove the copy through the directory fd (never the path) and close the fd."""
+        if self.expiry_dfd is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(self.expiry_name, dir_fd=self.expiry_dfd)
+            with contextlib.suppress(OSError):
+                os.close(self.expiry_dfd)
+        self.expiry_copy = self.expiry_dfd = self.expiry_name = self.expiry_data = None
 
     def push_gated(self, head, branch):
         """Push the gated commit; a failed push, or a remote ref that is not the gated head, is a failure (#7422)."""

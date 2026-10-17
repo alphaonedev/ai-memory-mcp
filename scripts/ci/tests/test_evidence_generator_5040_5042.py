@@ -158,9 +158,9 @@ class Vendored5040(unittest.TestCase):
         # because the scan must catch those roots; the attested six stay and are asserted first.
         bb = load("build_bundle")
         attested = {"/" + p for p in ("mnt/", "home/", "ai-scratch", "tmp/", "var/tmp", "private/tmp")}
-        self.assertTrue(attested <= set(bb.HOST_PATH_PREFIXES))
+        self.assertLessEqual(attested, set(bb.HOST_PATH_PREFIXES))
         self.assertEqual(set(bb.HOST_PATH_PREFIXES) - attested, {"/Users/", "/Volumes/", "/var/folders/", "/root/"})
-        self.assertTrue(set(bb.HOST_PATH_PREFIXES) <= set(bb.leak_patterns(Path("/wt-x"), Path("/out-x"))))
+        self.assertLessEqual(set(bb.HOST_PATH_PREFIXES), set(bb.leak_patterns(Path("/wt-x"), Path("/out-x"))))
 
     def test_prep_runs_against_the_default_repo_5040(self):
         r = subprocess.run([sys.executable, "-I", str(EVIDENCE / "prep.py"), "--base", "HEAD", "--tip", "HEAD"],

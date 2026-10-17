@@ -23,7 +23,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from unittest import mock
+import unittest.mock as mock
 
 from test_evidence_generator_5040_5042 import CHAIN_SECTION, EVIDENCE, TIP, ScratchCase, load
 from test_evidence_generator_r2_7393 import EXPIRY_PY, EXPIRY_SH, GIT, make_repo
@@ -208,11 +208,11 @@ class ExpiryFromTheBlob7439(ScratchCase):
         self.assertEqual(r.dirty_tracked(), [])  # the hiding the review reproduced
         argv = r.pick_expiry()
         self.assertEqual(argv[0], sys.executable)
-        self.assertEqual(Path(argv[1]).read_text(), "BLOB = 1\n")
+        self.assertEqual(Path(argv[-1]).read_text(), "BLOB = 1\n")
         blob = subprocess.run(["git", "rev-parse", f"HEAD:{EXPIRY_PY}"], cwd=wt, capture_output=True, text=True).stdout.strip()
         self.assertIn(f"{EXPIRY_PY} blob={blob}", (self.dir / "o" / "gates.log").read_text())
         r.drop_expiry()
-        self.assertFalse(Path(argv[1]).exists())
+        self.assertFalse(Path(argv[-1]).exists())
 
     def test_recapture_symlink_is_refused_and_the_blob_sha_is_returned_7439(self):
         rc = load("run_cert")

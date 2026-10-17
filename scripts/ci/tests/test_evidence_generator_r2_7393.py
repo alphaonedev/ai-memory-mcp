@@ -25,7 +25,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from unittest import mock
+import unittest.mock as mock
 
 from test_evidence_generator_5040_5042 import CHAIN_SECTION, EVIDENCE, REPO, TIP, ScratchCase, load
 
@@ -259,7 +259,7 @@ class TipTreeScripts7411(ScratchCase):
                                       targets=str(self.dir / "t"), tmpdir=str(self.dir / "tmp")))
         argv = r.pick_expiry()
         self.assertEqual(argv[0], sys.executable)
-        self.assertEqual(Path(argv[1]).read_text(), "x = 1\n")  # #7439: a copy of the blob
+        self.assertEqual(Path(argv[-1]).read_text(), "x = 1\n")  # #7439: a copy of the blob
         r.drop_expiry()
 
 
