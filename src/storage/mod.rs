@@ -9064,16 +9064,21 @@ pub fn promote_to_namespace(
     // arm cannot drift on which promotions are legal or on the clone's shape.
     validate_promotion_target(&source, to_namespace)?;
     let clone = build_promotion_clone(&source, to_namespace, promoted_by);
-    let actual_id = insert(conn, &clone)?;
-    // Clone → source: derived_from. Safe to ignore if the link layer
-    // short-circuits on self-link (impossible here — distinct IDs).
-    create_link(
-        conn,
-        &actual_id,
-        source_id,
-        crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
-    )?;
-    Ok(actual_id)
+    // #7093 — the clone and its provenance link commit together: one write
+    // transaction (joining the caller's, when open), so a link failure
+    // leaves no orphan clone in the destination namespace.
+    in_write_txn(conn, || {
+        let actual_id = insert(conn, &clone)?;
+        // Clone → source: derived_from. Safe to ignore if the link layer
+        // short-circuits on self-link (impossible here — distinct IDs).
+        create_link(
+            conn,
+            &actual_id,
+            source_id,
+            crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+        )?;
+        Ok(actual_id)
+    })
 }
 
 /// v0.6.3.1 P2 (G6) — quick existence check for `(title, namespace)`. Used by
@@ -10096,7 +10101,10 @@ pub fn create_link_signed_with_window(
     // entirely, so a caller-supplied expiry could never land), and
     // `created_at` / `valid_from` bind SEPARATE parameters instead of sharing
     // `?4` — the postgres twin has always bound all three independently.
-    let inserted = conn.execute(
+    // #7095 — the link row and its `memory_link.created` audit row commit
+    // together: one write transaction (joining the caller's, when open).
+    let inserted = in_write_txn(conn, || {
+        let inserted = conn.execute(
         "INSERT OR IGNORE INTO memory_links \
             (source_id, target_id, relation, created_at, valid_from, valid_until, signature, attest_level, observed_by, source_cid, target_cid) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
@@ -10115,70 +10123,58 @@ pub fn create_link_signed_with_window(
         ],
     )?;
 
-    // v0.7.0 S4-INFO2 — append a `memory_link.created` row to
-    // `signed_events` so the audit ledger reflects every new link
-    // (signed or unsigned). The `payload_hash` binds to the same
-    // canonical CBOR that the H2 signer hashed (or would have, for
-    // unsigned rows) so an auditor can re-derive the bytes and check
-    // them against the row.
-    //
-    // Best-effort: a failure here logs a warn but does NOT roll back
-    // the link insert. Cratering a legitimate write because the
-    // append-only ledger had a transient SQLite error would punish
-    // the caller for a substrate problem they cannot fix — same
-    // discipline as `invalidate_link`'s `memory_link.invalidated`
-    // emit (see also A2's pattern on `execute_pending_action`).
-    //
-    // We only emit when the INSERT actually wrote a row.
-    // `INSERT OR IGNORE` returns `Ok(0)` on a uniqueness-conflict
-    // replay of an existing `(source_id, target_id, relation)`; in
-    // that case the audit row was already appended on the original
-    // create call, and re-appending would generate a misleading
-    // duplicate-create event.
-    if inserted > 0 {
-        let agent_for_event = observed_by_col
-            .map(str::to_string)
-            .unwrap_or_else(|| "unknown".to_string());
-        let signable = crate::identity::sign::SignableLink {
-            src_id: source_id,
-            dst_id: target_id,
-            relation,
-            observed_by: observed_by_col,
-            created_at: Some(created_at_str.as_str()),
-            // #3178 — the audit pre-image must be re-derivable from the ROW,
-            // so it commits to the persisted window, not to `now`/`None`.
-            valid_from: Some(valid_from_str.as_str()),
-            valid_until: valid_until_str.as_deref(),
-        };
-        match crate::identity::sign::canonical_cbor(&signable) {
-            Ok(cbor) => {
-                let event = crate::signed_events::SignedEvent {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    agent_id: agent_for_event,
-                    event_type: crate::signed_events::event_types::MEMORY_LINK_CREATED.to_string(),
-                    payload_hash: crate::signed_events::payload_hash(&cbor),
-                    signature: signature.clone(),
-                    attest_level: attest_level.to_string(),
-                    timestamp: Utc::now().to_rfc3339(),
-                    ..crate::signed_events::SignedEvent::default()
-                };
-                if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
-                    tracing::warn!(
-                        target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
-                        source_id, target_id, relation,
-                        "failed to append memory_link.created audit row: {e}"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
-                    source_id, target_id, relation,
-                    "failed to encode canonical CBOR for memory_link.created audit: {e}"
-                );
-            }
+        // v0.7.0 S4-INFO2 — append a `memory_link.created` row to
+        // `signed_events` so the audit ledger reflects every new link
+        // (signed or unsigned). The `payload_hash` binds to the same
+        // canonical CBOR that the H2 signer hashed (or would have, for
+        // unsigned rows) so an auditor can re-derive the bytes and check
+        // them against the row.
+        //
+        // Fail closed (#7095, per ERRORS-02 / ERRORS-19): the append runs in
+        // the SAME transaction as the INSERT, so an append or encode error
+        // rolls the link back and is returned. Pre-fix this was best-effort
+        // (warn and keep the link), which left a signed-ledger gap and
+        // differed from the postgres twin. The audit anchor is handed to the
+        // transaction owner, which records it after COMMIT (#7241).
+        //
+        // We only emit when the INSERT actually wrote a row.
+        // `INSERT OR IGNORE` returns `Ok(0)` on a uniqueness-conflict
+        // replay of an existing `(source_id, target_id, relation)`; in
+        // that case the audit row was already appended on the original
+        // create call, and re-appending would generate a misleading
+        // duplicate-create event.
+        if inserted > 0 {
+            let agent_for_event = observed_by_col
+                .map(str::to_string)
+                .unwrap_or_else(|| "unknown".to_string());
+            let signable = crate::identity::sign::SignableLink {
+                src_id: source_id,
+                dst_id: target_id,
+                relation,
+                observed_by: observed_by_col,
+                created_at: Some(created_at_str.as_str()),
+                // #3178 — the audit pre-image must be re-derivable from the ROW,
+                // so it commits to the persisted window, not to `now`/`None`.
+                valid_from: Some(valid_from_str.as_str()),
+                valid_until: valid_until_str.as_deref(),
+            };
+            let cbor = crate::identity::sign::canonical_cbor(&signable)
+                .map_err(|e| anyhow::anyhow!("encode memory_link.created audit pre-image: {e}"))?;
+            let event = crate::signed_events::SignedEvent {
+                id: uuid::Uuid::new_v4().to_string(),
+                agent_id: agent_for_event,
+                event_type: crate::signed_events::event_types::MEMORY_LINK_CREATED.to_string(),
+                payload_hash: crate::signed_events::payload_hash(&cbor),
+                signature: signature.clone(),
+                attest_level: attest_level.to_string(),
+                timestamp: Utc::now().to_rfc3339(),
+                ..crate::signed_events::SignedEvent::default()
+            };
+            let anchor = crate::signed_events::append_signed_event_no_tx(conn, &event)?;
+            crate::storage::escalation_deferral::defer_audit_anchor(conn, anchor);
         }
-    }
+        Ok(inserted)
+    })?;
 
     // v1.0.0 #3051 (R-405) — `INSERT OR IGNORE` wrote NOTHING when the
     // `(source_id, target_id, relation)` edge already existed, yet we were
@@ -17790,8 +17786,12 @@ fn purge_archive_matching(
     sql_params: &[&dyn rusqlite::types::ToSql],
 ) -> Result<usize> {
     let Some(store) = crate::erasure::archive_sync::store_if_dir_present(conn) else {
+        // #7097 - one write transaction with or without a cold tier, like the
+        // postgres purge: the DELETE settles as a unit and joins a caller's tx.
         let sql = format!("DELETE FROM archived_memories WHERE {where_clause}");
-        return Ok(conn.execute(&sql, sql_params)?);
+        return crate::storage::connection::in_write_txn(conn, || {
+            Ok(conn.execute(&sql, sql_params)?)
+        });
     };
     // Lock acquisition precedes BEGIN IMMEDIATE. Detached sweep/reconcile code
     // uses a dedicated connection and never waits on the handler mutex while
@@ -33876,11 +33876,11 @@ mod tests {
     }
 
     #[test]
-    fn test_create_link_signed_emit_failure_does_not_roll_back() {
+    fn test_create_link_signed_emit_failure_rolls_back_link_7095() {
         // Drop the signed_events table to simulate a substrate
         // problem (schema drift, disk error mapped to a SQL
-        // failure). The link create must still commit and the
-        // function must return Ok — the audit emit is best-effort.
+        // failure). #7095: the audit row is part of the link
+        // transaction, so the create fails closed and no link persists.
         let conn = test_db();
         let src = make_memory("s4info2-fail-src", "test", Tier::Long, 5);
         let tgt = make_memory("s4info2-fail-tgt", "test", Tier::Long, 5);
@@ -33892,11 +33892,11 @@ mod tests {
 
         let result = create_link_signed(&conn, &src.id, &tgt.id, "related_to", None);
         assert!(
-            result.is_ok(),
-            "audit emit failure must not crater the link create: {result:?}"
+            result.is_err(),
+            "audit emit failure must fail the link create: {result:?}"
         );
 
-        // The link itself must have persisted.
+        // The link itself must have rolled back.
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM memory_links \
@@ -33906,8 +33906,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            count, 1,
-            "link row must have committed despite audit failure"
+            count, 0,
+            "link row must roll back with its failed audit row"
         );
     }
 

@@ -357,6 +357,11 @@ pub mod msg {
     /// four MCP mutation handlers (the HTTP twin lives in
     /// `handlers::parity::require_caller_owns_memory`).
     pub const CALLER_DOES_NOT_OWN_MEMORY: &str = "caller does not own this memory";
+    /// #3193 / #7596 - the archive-verb refusal reason for a live row with
+    /// no `agent_id` stamp. The one SSOT both SAL adapters
+    /// (`archive_by_ids`) refuse with; refusing leaves the row live.
+    pub const REASON_UNSTAMPED_TENANT_ARCHIVE: &str =
+        "memory has no agent_id stamp; tenant archives refused (use admin path)";
     /// #939 / #3426 — the symmetric link-DELETE owner-gate refusal (either
     /// endpoint's owner may sever an edge; a caller owning neither is
     /// refused). Hoisted from the two `DELETE /api/v1/links` branches so the

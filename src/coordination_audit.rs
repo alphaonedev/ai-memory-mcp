@@ -138,6 +138,37 @@ pub fn emit(conn: &rusqlite::Connection, event_type: &str, actor: &str, identity
     }
 }
 
+/// Append one coordination audit row INSIDE the caller's open write
+/// transaction, failing closed (#7098).
+///
+/// Unlike [`emit`], which runs after the op committed and swallows an append
+/// error, this variant is for a mutation whose audit row must commit or roll
+/// back with it: the caller owns a `WriteTxn` (or an outer transaction) and
+/// the row is appended with `append_signed_event_no_tx`, so a failed append
+/// surfaces as `Err` and the caller's mutation rolls back. The off-table
+/// audit anchor is handed to the transaction owner, which records it only
+/// after a successful COMMIT (#7241).
+///
+/// # Errors
+/// Propagates the chain-head read or the `signed_events` INSERT error.
+pub fn emit_in_tx(
+    conn: &rusqlite::Connection,
+    event_type: &str,
+    actor: &str,
+    identity_parts: &[&str],
+) -> anyhow::Result<()> {
+    let event = crate::signed_events::SignedEvent::with_daemon_signature(
+        coordination_payload_hash(identity_parts),
+        actor.to_string(),
+        event_type.to_string(),
+        chrono::Utc::now().to_rfc3339(),
+        None,
+    );
+    let anchor = crate::signed_events::append_signed_event_no_tx(conn, &event)?;
+    crate::storage::escalation_deferral::defer_audit_anchor(conn, anchor);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

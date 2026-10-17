@@ -666,25 +666,64 @@ pub fn lease_acquire(
     // DIFFERENT holder fails the guard, the update is a no-op, and
     // `changes()` is 0 — the same disposition the old `exp > now && h != holder`
     // branch produced, now evaluated atomically inside the single statement.
-    let changed = conn.execute(
-        "INSERT INTO leases \
-            (action_id, holder, acquired_at, expires_at, heartbeat_at) \
-         VALUES (?1, ?2, ?3, ?4, ?3) \
-         ON CONFLICT(action_id) DO UPDATE SET \
-            holder = excluded.holder, \
-            acquired_at = excluded.acquired_at, \
-            expires_at = excluded.expires_at, \
-            heartbeat_at = excluded.heartbeat_at \
-         WHERE leases.expires_at <= ?3 OR leases.holder = ?2",
-        params![action_id, holder, now, expires_at],
-    )?;
-    if changed == 0 {
-        // A non-expired lease is held by a different holder: the `DO UPDATE`
-        // guard rejected the acquire (no row inserted, no row updated).
-        return Ok(LeaseAcquire::Conflict);
+    // #7098 - one write transaction: the upsert and its audit row commit or
+    // roll back together (`in_write_txn` joins a caller's transaction).
+    in_lease_txn(conn, || {
+        let changed = conn.execute(
+            "INSERT INTO leases \
+                (action_id, holder, acquired_at, expires_at, heartbeat_at) \
+             VALUES (?1, ?2, ?3, ?4, ?3) \
+             ON CONFLICT(action_id) DO UPDATE SET \
+                holder = excluded.holder, \
+                acquired_at = excluded.acquired_at, \
+                expires_at = excluded.expires_at, \
+                heartbeat_at = excluded.heartbeat_at \
+             WHERE leases.expires_at <= ?3 OR leases.holder = ?2",
+            params![action_id, holder, now, expires_at],
+        )?;
+        if changed == 0 {
+            // A non-expired lease is held by a different holder: the `DO UPDATE`
+            // guard rejected the acquire (no row inserted, no row updated).
+            return Ok(LeaseAcquire::Conflict);
+        }
+        let lease = conn.query_row(LEASE_SELECT_BY_ID_SQL, params![action_id], row_to_lease)?;
+        lease_audit_in_tx(
+            conn,
+            crate::coordination_audit::LEASE_ACQUIRE,
+            action_id,
+            holder,
+        )?;
+        Ok(LeaseAcquire::Acquired(lease))
+    })
+}
+
+/// #7098 - run one lease mutation and its audit row in a single write
+/// transaction. Opens `BEGIN IMMEDIATE` when the connection is in autocommit;
+/// joins the caller's transaction otherwise (sqlite has no nested
+/// transactions). An `Err` from `unit` drops the guard, which rolls back.
+fn in_lease_txn<T>(
+    conn: &Connection,
+    unit: impl FnOnce() -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    if !conn.is_autocommit() {
+        return unit();
     }
-    let lease = conn.query_row(LEASE_SELECT_BY_ID_SQL, params![action_id], row_to_lease)?;
-    Ok(LeaseAcquire::Acquired(lease))
+    let tx = crate::storage::connection::WriteTxn::begin(conn)?;
+    let out = unit()?;
+    tx.commit()?;
+    Ok(out)
+}
+
+/// #7098 - append the lease-lifecycle audit row inside the open lease
+/// transaction, failing closed: an append error rolls the lease mutation back.
+fn lease_audit_in_tx(
+    conn: &Connection,
+    event_type: &str,
+    action_id: &str,
+    holder: &str,
+) -> rusqlite::Result<()> {
+    crate::coordination_audit::emit_in_tx(conn, event_type, holder, &[action_id, holder])
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))
 }
 
 /// Heartbeat-renew an owned lease (`expires_at` + `heartbeat_at` bump). Returns
@@ -701,16 +740,24 @@ pub fn lease_renew(
     expires_at: i64,
 ) -> rusqlite::Result<Option<crate::models::Lease>> {
     gate_record_stop_actions(conn)?;
-    let n = conn.execute(
-        "UPDATE leases SET expires_at = ?1, heartbeat_at = ?2 \
-          WHERE action_id = ?3 AND holder = ?4",
-        params![expires_at, now, action_id, holder],
-    )?;
-    if n == 0 {
-        return Ok(None);
-    }
-    let lease = conn.query_row(LEASE_SELECT_BY_ID_SQL, params![action_id], row_to_lease)?;
-    Ok(Some(lease))
+    in_lease_txn(conn, || {
+        let n = conn.execute(
+            "UPDATE leases SET expires_at = ?1, heartbeat_at = ?2 \
+              WHERE action_id = ?3 AND holder = ?4",
+            params![expires_at, now, action_id, holder],
+        )?;
+        if n == 0 {
+            return Ok(None);
+        }
+        let lease = conn.query_row(LEASE_SELECT_BY_ID_SQL, params![action_id], row_to_lease)?;
+        lease_audit_in_tx(
+            conn,
+            crate::coordination_audit::LEASE_RENEW,
+            action_id,
+            holder,
+        )?;
+        Ok(Some(lease))
+    })
 }
 
 /// Release an owned lease. Returns `true` when a row was deleted, `false` when
@@ -720,11 +767,22 @@ pub fn lease_renew(
 /// Propagates the `rusqlite` delete error.
 pub fn lease_release(conn: &Connection, action_id: &str, holder: &str) -> rusqlite::Result<bool> {
     gate_record_stop_actions(conn)?;
-    let n = conn.execute(
-        "DELETE FROM leases WHERE action_id = ?1 AND holder = ?2",
-        params![action_id, holder],
-    )?;
-    Ok(n > 0)
+    in_lease_txn(conn, || {
+        let n = conn.execute(
+            "DELETE FROM leases WHERE action_id = ?1 AND holder = ?2",
+            params![action_id, holder],
+        )?;
+        if n == 0 {
+            return Ok(false);
+        }
+        lease_audit_in_tx(
+            conn,
+            crate::coordination_audit::LEASE_RELEASE,
+            action_id,
+            holder,
+        )?;
+        Ok(true)
+    })
 }
 
 /// Read the lease on an action. `None` when no lease row exists.
@@ -888,6 +946,23 @@ fn sweep_expired_leases_reclaim(
     let mut out = Vec::with_capacity(expired.len());
     for (action_id, holder) in expired {
         let requeued = requeue_claimed_after_lease_expiry(conn, &action_id, now)?;
+        // #7098 - the FORCED-revocation audit rows ride the same transaction
+        // as the DELETE and the requeue, failing closed: an append error
+        // returns `Err` here and the guard rolls the whole sweep back.
+        lease_audit_in_tx(
+            conn,
+            crate::coordination_audit::LEASE_SWEEP_RECLAIM,
+            &action_id,
+            &holder,
+        )?;
+        if requeued {
+            lease_audit_in_tx(
+                conn,
+                crate::coordination_audit::ACTION_LEASE_EXPIRE_REQUEUE,
+                &action_id,
+                &holder,
+            )?;
+        }
         out.push((action_id, holder, requeued));
     }
     tx.commit()?;
@@ -925,9 +1000,10 @@ pub fn sweep_expired_leases(
 /// ([`crate::coordination_audit::LEASE_SWEEP_RECLAIM`]), attributed to the
 /// reclaimed `holder` (the entity losing coordination authority) with the same
 /// `[action_id, holder]` identity the voluntary lease ops use. Returns the
-/// reclaimed count. The audit append is best-effort (#1722): the DELETE has
-/// already committed, so a rare append failure is WARN-logged inside
-/// [`crate::coordination_audit::emit`], never propagated.
+/// reclaimed count. Since #7098 the audit append is FAIL-CLOSED: the rows are
+/// written inside the reclaim transaction, so an append failure rolls the
+/// DELETE and the requeue back and the error is propagated (the lease stays
+/// reclaimable on the next sweep).
 ///
 /// #2419 — an action that the reclaim also requeued `claimed -> pending`
 /// additionally emits [`crate::coordination_audit::ACTION_LEASE_EXPIRE_REQUEUE`].
@@ -946,24 +1022,11 @@ pub fn sweep_expired_leases_audited(conn: &Connection, now: i64) -> rusqlite::Re
     // ungated lease-reclaim DELETE). ERRORS-09.
     gate_record_stop_actions(conn)?;
     let reclaimed = sweep_expired_leases_reclaim(conn, now)?;
-    let mut requeued_count = 0usize;
-    for (action_id, holder, requeued) in &reclaimed {
-        crate::coordination_audit::emit(
-            conn,
-            crate::coordination_audit::LEASE_SWEEP_RECLAIM,
-            holder,
-            &[action_id.as_str(), holder.as_str()],
-        );
-        if *requeued {
-            requeued_count += 1;
-            crate::coordination_audit::emit(
-                conn,
-                crate::coordination_audit::ACTION_LEASE_EXPIRE_REQUEUE,
-                holder,
-                &[action_id.as_str(), holder.as_str()],
-            );
-        }
-    }
+    // #7098 - the audit rows were appended inside the reclaim transaction.
+    let requeued_count = reclaimed
+        .iter()
+        .filter(|(_, _, requeued)| *requeued)
+        .count();
     if requeued_count > 0 {
         // obs-structured-fields: the count is a discrete queryable field, not
         // text baked into the message, so a fleet aggregator can alert on a
