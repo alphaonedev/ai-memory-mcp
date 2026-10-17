@@ -132,6 +132,8 @@ mod forensic_outage_4199;
 mod lock_order_4209;
 // #7094 - a permanent statement failure maps to `StoreError::Backend` like sqlite.
 mod permanent_err_7094;
+// #7098 - the lease-lifecycle audit row, appended inside the lease transaction.
+mod lease_audit_7098;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -15209,48 +15211,6 @@ impl PostgresStore {
             );
         }
     }
-
-    /// #2371 — postgres twin of the sqlite `crate::coordination_audit::emit`
-    /// for a FORCED lease-lifecycle event. Builds the row from the SAME
-    /// [`crate::coordination_audit::coordination_payload_hash`] pre-image
-    /// (`[action_id, holder]` joined by 0x1F) and the SAME `with_daemon_signature`
-    /// idiom, attributed to the reclaimed `holder`, so the row persists +
-    /// verifies identically on both backends (K3 parity). Best-effort: an
-    /// append failure is WARN-logged and swallowed — the sweep transaction
-    /// already committed.
-    ///
-    /// #2419 generalised the hard-coded event type into the `event_type`
-    /// parameter so the `claimed -> pending` requeue
-    /// ([`crate::coordination_audit::ACTION_LEASE_EXPIRE_REQUEUE`]) rides the
-    /// same append path as [`crate::coordination_audit::LEASE_SWEEP_RECLAIM`]
-    /// instead of duplicating the builder.
-    async fn emit_coordination_lease_audit(&self, event_type: &str, action_id: &str, holder: &str) {
-        let ts = Utc::now();
-        let event = crate::signed_events::SignedEvent::with_daemon_signature(
-            crate::coordination_audit::coordination_payload_hash(&[action_id, holder]),
-            holder.to_string(),
-            event_type.to_string(),
-            ts.to_rfc3339(),
-            None,
-        );
-        let insert_row = PgSignedEventInsert {
-            id: &event.id,
-            agent_id: &event.agent_id,
-            event_type: &event.event_type,
-            payload_hash: &event.payload_hash,
-            signature: event.signature.as_deref(),
-            attest_level: &event.attest_level,
-            timestamp: ts,
-            cause_hash: None,
-        };
-        if let Err(e) = pg_append_signed_event_with_chain(&self.pool, insert_row).await {
-            tracing::warn!(
-                target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
-                action_id, holder, event_type,
-                "failed to append coordination lease audit row: {e}"
-            );
-        }
-    }
 }
 
 /// Caller-supplied fields for [`pg_append_signed_event_with_chain`].
@@ -29439,7 +29399,18 @@ impl MemoryStore for PostgresStore {
             .await
             .map_err(|e| to_store_err("lease_acquire refetch", e))?;
         let lease = pg_row_to_lease(&row)?;
-        tx.commit()
+        // #7098 - the audit row commits with the lease, failing closed.
+        let anchor = lease_audit_7098::append_lease_audit_in_tx(
+            &mut tx,
+            crate::coordination_audit::LEASE_ACQUIRE,
+            action_id,
+            holder,
+        )
+        .await
+        .map_err(|e| {
+            permanent_err_7094::permanent_as_backend(to_store_err("lease_acquire audit", e))
+        })?;
+        pg_commit_and_emit(tx, anchor)
             .await
             .map_err(|e| to_store_err("commit lease_acquire", e))?;
         Ok(lease)
@@ -29454,6 +29425,12 @@ impl MemoryStore for PostgresStore {
         expires_at: i64,
     ) -> StoreResult<crate::models::Lease> {
         self.gate_record_stop().await?;
+        // #7098 - one transaction: the UPDATE, the refetch and the audit row.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin lease_renew tx", e))?;
         let n = sqlx::query(
             "UPDATE leases SET expires_at = $1, heartbeat_at = $2 \
               WHERE action_id = $3 AND holder = $4",
@@ -29462,7 +29439,7 @@ impl MemoryStore for PostgresStore {
         .bind(now)
         .bind(action_id)
         .bind(holder)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("lease_renew", e))?
         .rows_affected();
@@ -29473,10 +29450,24 @@ impl MemoryStore for PostgresStore {
         }
         let row = sqlx::query(PG_LEASE_SELECT_BY_ID)
             .bind(action_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| to_store_err("lease_renew refetch", e))?;
-        pg_row_to_lease(&row)
+        let lease = pg_row_to_lease(&row)?;
+        let anchor = lease_audit_7098::append_lease_audit_in_tx(
+            &mut tx,
+            crate::coordination_audit::LEASE_RENEW,
+            action_id,
+            holder,
+        )
+        .await
+        .map_err(|e| {
+            permanent_err_7094::permanent_as_backend(to_store_err("lease_renew audit", e))
+        })?;
+        pg_commit_and_emit(tx, anchor)
+            .await
+            .map_err(|e| to_store_err("commit lease_renew", e))?;
+        Ok(lease)
     }
 
     async fn lease_release(
@@ -29486,14 +29477,37 @@ impl MemoryStore for PostgresStore {
         holder: &str,
     ) -> StoreResult<bool> {
         self.gate_record_stop().await?;
+        // #7098 - one transaction: the DELETE and (when a row was removed) the
+        // audit row.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin lease_release tx", e))?;
         let n = sqlx::query("DELETE FROM leases WHERE action_id = $1 AND holder = $2")
             .bind(action_id)
             .bind(holder)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("lease_release", e))?
             .rows_affected();
-        Ok(n > 0)
+        if n == 0 {
+            return Ok(false);
+        }
+        let anchor = lease_audit_7098::append_lease_audit_in_tx(
+            &mut tx,
+            crate::coordination_audit::LEASE_RELEASE,
+            action_id,
+            holder,
+        )
+        .await
+        .map_err(|e| {
+            permanent_err_7094::permanent_as_backend(to_store_err("lease_release audit", e))
+        })?;
+        pg_commit_and_emit(tx, anchor)
+            .await
+            .map_err(|e| to_store_err("commit lease_release", e))?;
+        Ok(true)
     }
 
     async fn lease_get(
@@ -29574,27 +29588,46 @@ impl MemoryStore for PostgresStore {
                 );
             }
         }
-        tx.commit()
-            .await
-            .map_err(|e| to_store_err("lease_sweep_expired.commit", e))?;
-        // Best-effort audit append per reclaimed lease (the DELETE already
-        // committed): a failure is WARN-logged, never cratering the sweep.
+        // #7098 - the audit rows (one reclaim row per lease, plus a requeue row
+        // when the action went back to pending) are appended inside the sweep
+        // transaction, failing closed: an append error drops `tx`, rolling the
+        // DELETE and the requeue back, so no lease is revoked untraced.
+        let mut anchor = crate::governance::audit::PendingAuditAnchor::none();
         for (action_id, holder) in &reclaimed {
-            self.emit_coordination_lease_audit(
+            let reclaim_anchor = lease_audit_7098::append_lease_audit_in_tx(
+                &mut tx,
                 crate::coordination_audit::LEASE_SWEEP_RECLAIM,
                 action_id,
                 holder,
             )
-            .await;
+            .await
+            .map_err(|e| {
+                permanent_err_7094::permanent_as_backend(to_store_err(
+                    "lease_sweep_expired.audit",
+                    e,
+                ))
+            })?;
+            anchor = anchor.merge(reclaim_anchor);
             if requeued.iter().any(|id| id == action_id) {
-                self.emit_coordination_lease_audit(
+                let requeue_anchor = lease_audit_7098::append_lease_audit_in_tx(
+                    &mut tx,
                     crate::coordination_audit::ACTION_LEASE_EXPIRE_REQUEUE,
                     action_id,
                     holder,
                 )
-                .await;
+                .await
+                .map_err(|e| {
+                    permanent_err_7094::permanent_as_backend(to_store_err(
+                        "lease_sweep_expired.audit",
+                        e,
+                    ))
+                })?;
+                anchor = anchor.merge(requeue_anchor);
             }
         }
+        pg_commit_and_emit(tx, anchor)
+            .await
+            .map_err(|e| to_store_err("lease_sweep_expired.commit", e))?;
         if !requeued.is_empty() {
             // obs-structured-fields — same field shape as the sqlite twin so one
             // aggregator query covers both backends.

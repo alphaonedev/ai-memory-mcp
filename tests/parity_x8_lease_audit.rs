@@ -81,7 +81,13 @@ async fn voluntary_ops_write_one_row_each<S: MemoryStore, P: Probe>(store: &S, p
     seed(store).await;
     let ctx = CallerContext::for_agent(CALLER);
     store
-        .lease_acquire(&ctx, ACTION_ID, HOLDER, ACQUIRED_AT, ACQUIRED_AT + LEASE_TTL_SECS)
+        .lease_acquire(
+            &ctx,
+            ACTION_ID,
+            HOLDER,
+            ACQUIRED_AT,
+            ACQUIRED_AT + LEASE_TTL_SECS,
+        )
         .await
         .expect("acquire");
     assert_eq!(probe.events(LEASE_ACQUIRE).await, 1, "acquire audit row");
@@ -104,7 +110,11 @@ async fn voluntary_ops_write_one_row_each<S: MemoryStore, P: Probe>(store: &S, p
             .await
             .expect("second release")
     );
-    assert_eq!(probe.events(LEASE_RELEASE).await, 1, "no-op release: no row");
+    assert_eq!(
+        probe.events(LEASE_RELEASE).await,
+        1,
+        "no-op release: no row"
+    );
 }
 
 /// X8b: the sweep writes a reclaim row for the lease it removed.
@@ -138,7 +148,11 @@ async fn acquire_audit_fault_rolls_back<S: MemoryStore, P: Probe>(store: &S, pro
         )
         .await
         .expect_err("acquire must fail when its audit row is refused");
-    assert_eq!(probe.lease_expiry().await, None, "no lease without its audit");
+    assert_eq!(
+        probe.lease_expiry().await,
+        None,
+        "no lease without its audit"
+    );
 }
 
 /// X8c: a refused renew audit leaves the old expiry.
@@ -167,7 +181,13 @@ async fn release_audit_fault_rolls_back<S: MemoryStore, P: Probe>(store: &S, pro
     seed(store).await;
     let ctx = CallerContext::for_agent(CALLER);
     store
-        .lease_acquire(&ctx, ACTION_ID, HOLDER, ACQUIRED_AT, ACQUIRED_AT + LEASE_TTL_SECS)
+        .lease_acquire(
+            &ctx,
+            ACTION_ID,
+            HOLDER,
+            ACQUIRED_AT,
+            ACQUIRED_AT + LEASE_TTL_SECS,
+        )
         .await
         .expect("acquire");
     probe.refuse_audit(LEASE_RELEASE).await;
@@ -334,7 +354,11 @@ mod pg {
 
     async fn open_pg(
         name: &str,
-    ) -> Option<(common::postgres_env::PostgresTestEnv, PostgresStore, PgProbe)> {
+    ) -> Option<(
+        common::postgres_env::PostgresTestEnv,
+        PostgresStore,
+        PgProbe,
+    )> {
         common::permissive_attestation_for_tests();
         let Some(env) = common::postgres_env::PostgresTestEnv::new(name).await else {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
