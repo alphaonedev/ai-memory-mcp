@@ -12,6 +12,10 @@ non-``TRY`` line (``PASS``, ``FAIL``, ``FLAKY n/m``, ...); a test that fails eve
 A test nextest prints as ``TRY n PASS`` followed by the line ``- test configured to fail if flaky``
 (``flaky-result = "fail"``) is a FAILURE: nextest-runner counts it as failed (config/elements/retry_policy.rs
 :120-130 ``fail_message``; snapshot ``status_line_all_variants``), whatever its last status word says.
+The marker binds ONLY to the immediately preceding ``TRY n PASS`` line (any other status line in between clears
+the binding; non-status lines such as child output do not) and is matched at the END of the cleaned line, so a
+stderr fragment glued in front of it does not hide it. A marker with no such predecessor is refused (exit 2, naming
+the line) rather than guessed.
 ``SETUP ...`` script lines and ``TRY n TRMNTG`` / ``TRY n START`` markers are not results.
 
 Both sides are reduced to ``{(binary, test name): "pass" | "fail"}``. Ignored
@@ -151,6 +155,8 @@ _NEXTEST_SHAPE_RE = re.compile(
 # With ``flaky-result = "fail"`` nextest prints ``TRY n PASS`` and, on the next line, this marker, and counts the test
 # as failed (nextest-runner 0.124.0 config/elements/retry_policy.rs:120-130 ``fail_message``; displayer snapshot
 # status_line_all_variants). Without the marker rule a final-status-level of ``none`` would read it as a pass (#7298 S4).
+# The marker binds only to the immediately preceding ``TRY n PASS`` line and is matched at the end of the cleaned
+# line (#7298 R7-1).
 _FLAKY_FAIL_MARKER = '- test configured to fail if flaky'
 _NEXTEST_TRY_RE = re.compile(r'TRY\s+\d+\s*$')
 _TRY_PREFIX_RE = re.compile(r'^TRY\s+\d+\s+')
@@ -324,9 +330,9 @@ def scan_nextest_log(text: str) -> Scan:
     out: Outcomes = {}
     attempts: Outcomes = {}  # the last ``TRY n <status>`` line of each test (#7298 R2)
     flaky_fail = set()  # tests nextest says are configured to fail if flaky (#7298 S4)
-    last_key = None
+    last_try_pass = None  # key of the previous result line, only when that line was a ``TRY n PASS`` (#7298 R7-1)
     spliced = total = total_lines = 0
-    for raw in text.splitlines():
+    for lineno, raw in enumerate(text.splitlines(), 1):
         line = _clean(raw)
         if _is_runner_notice(line):
             continue
@@ -335,11 +341,17 @@ def scan_nextest_log(text: str) -> Scan:
             total += int(summary.group('run'))
             total_lines += 1
             continue
-        if line.strip() == _FLAKY_FAIL_MARKER and last_key is not None:
-            flaky_fail.add(last_key)  # the PASS attempt above it is a failure by configuration
+        if line.endswith(_FLAKY_FAIL_MARKER):
+            if last_try_pass is None:
+                raise ParseError('nextest log: line %d: %r has no immediately preceding "TRY n PASS" result line '
+                                 '(flaky-result = "fail" prints it right after the passing attempt)'
+                                 % (lineno, _FLAKY_FAIL_MARKER))
+            flaky_fail.add(last_try_pass)  # the PASS attempt above it is a failure by configuration
+            last_try_pass = None
             continue
         shape = _NEXTEST_SHAPE_RE.match(line)
         if shape and shape.group('st').startswith('SETUP '):
+            last_try_pass = None
             continue  # a setup-script line (SETUP SLOW / PASS / LEAK / LKFAIL / <status>): a script, not a test
         if shape:
             word = _TRY_PREFIX_RE.sub('', shape.group('st'))
@@ -355,12 +367,14 @@ def scan_nextest_log(text: str) -> Scan:
         if kind is None:
             raise ParseError('nextest log: status %r is not valid in this position (nextest 0.9.146 status table); '
                              'line: %r' % (found.group('st'), line[:120]))
+        last_try_pass = None  # any other result line clears the binding
         if kind == _SKIP:
             continue  # a marker or a skipped test: not a result
         key = (_nextest_binary(found.group('bin')), found.group('name'))
-        last_key = key
         if attempt:
             attempts[key] = kind  # last attempt wins; never counted as a spliced line
+            if kind == PASS:
+                last_try_pass = key
             continue
         spliced += _spliced(line, found)
         _merge(out, key, kind)
@@ -474,8 +488,10 @@ def _load(scanner, paths: List[str]) -> Scan:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     parser.add_argument('--cargo-log', nargs='+', required=True, metavar='FILE', help='baseline: cargo test log(s)')
-    parser.add_argument('--nextest-log', nargs='+', default=[], metavar='FILE', help='candidate: nextest output log(s); a TRY n PASS followed by "- test configured to fail if '
-                        'flaky" (flaky-result = fail) counts as a failure, SETUP script lines are not tests')
+    parser.add_argument('--nextest-log', nargs='+', default=[], metavar='FILE', help='candidate: nextest output log(s); a TRY n PASS immediately preceding "- test configured to '
+                        'fail if flaky" (flaky-result = fail) counts as a failure (the marker binds only to that line, is '
+                        'matched at the end of the line, and a marker with no such predecessor exits 2), SETUP script '
+                        'lines are not tests')
     parser.add_argument('--nextest-junit', nargs='+', default=[], metavar='FILE', help='candidate: nextest JUnit XML')
     parser.add_argument('--max-list', type=int, default=DEFAULT_MAX_LIST, help='rows printed per difference list')
     return parser

@@ -662,10 +662,37 @@ class NextestRetryAndSetupWords(unittest.TestCase):
         scan = cts.scan_nextest_log('  TRY 2 PASS [   1.000s] ai-memory a::flaky\n')
         self.assertEqual(scan.outcomes, {('lib', 'a::flaky'): cts.PASS})
 
+    def test_a_marker_after_an_interleaved_status_line_is_a_parse_error_7298(self):
+        # R7-1 (N2): the marker binds only to the immediately preceding `TRY n PASS`; another test's PASS line in
+        # between clears it, so the marker has no predecessor and the log is refused (exit 2) instead of guessed.
+        text = ('  TRY 2 PASS [   1.000s] (  1/2) nx5 a::f\n'
+                '        PASS [   0.010s] (  2/2) nx5 a::p\n'
+                '           - test configured to fail if flaky\n')
+        with self.assertRaises(cts.ParseError) as ctx:
+            cts.scan_nextest_log(text)
+        self.assertIn('test configured to fail if flaky', str(ctx.exception))
+
+    def test_a_marker_glued_behind_a_stderr_fragment_still_fails_the_test_7298(self):
+        text = ('  TRY 2 PASS [   1.000s] (  1/2) nx5 a::f\n'
+                'partial stderr frag- test configured to fail if flaky\n'
+                '        PASS [   0.010s] (  2/2) nx5 a::p\n')
+        scan = cts.scan_nextest_log(text)
+        self.assertEqual(scan.outcomes, {('lib', 'a::f'): cts.FAIL, ('lib', 'a::p'): cts.PASS})
+
+    def test_a_marker_without_a_try_n_pass_predecessor_is_a_parse_error_7298(self):
+        text = ('           - test configured to fail if flaky\n'
+                '  TRY 2 PASS [   1.000s] (  1/2) nx5 a::f\n'
+                '        PASS [   0.010s] (  2/2) nx5 a::p\n')
+        with self.assertRaises(cts.ParseError) as ctx:
+            cts.scan_nextest_log(text)
+        self.assertIn('line 1', str(ctx.exception))
+
     def test_help_text_states_the_flaky_marker_and_status_table_rules_7298(self):
         self.assertIn('configured to fail if flaky', cts.__doc__)
         self.assertIn('SETUP', cts.__doc__)
-        self.assertIn('configured to fail if flaky', cts.build_parser().format_help())
+        self.assertIn('configured to fail if flaky', ' '.join(cts.build_parser().format_help().split()))
+        self.assertIn('immediately preceding', cts.__doc__)
+        self.assertIn('immediately preceding', ' '.join(cts.build_parser().format_help().split()))
 
 
 class ParseJunit(unittest.TestCase):
