@@ -16862,6 +16862,12 @@ mod tests {
     /// `handle_gc(..., archive=false)`.
     #[test]
     fn chunkc_archive_gc_dry_run_returns_count() {
+        chunkc_archive_gc_dry_run_body();
+    }
+
+    /// Body of `chunkc_archive_gc_dry_run_returns_count`, callable from the
+    /// #7321 isolation test on another thread.
+    fn chunkc_archive_gc_dry_run_body() {
         let conn = db::open(std::path::Path::new(":memory:")).unwrap();
         let past = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
         let mem = Memory {
@@ -16903,6 +16909,32 @@ mod tests {
         let payload = i4_decode_response_payload(&resp);
         assert_eq!(payload["dry_run"], true);
         assert!(payload["collected"].as_u64().unwrap() >= 1);
+    }
+
+    /// #7321 - the gc dry-run test must not observe a sibling's latched audit
+    /// trail. A sibling holds `sink_test_lock` and latches the fail-closed gate
+    /// (as `a_latched_audit_trail_refuses_mcp_writes_but_not_reads_4400` does);
+    /// the gc test runs on another thread meanwhile and must still pass, which
+    /// it can only do by waiting for the same lock.
+    #[test]
+    fn chunkc_archive_gc_dry_run_ignores_sibling_latch_7321() {
+        const SIBLING_HOLD: std::time::Duration = std::time::Duration::from_millis(500);
+        let sink = crate::audit::sink_test_lock();
+        let latch = crate::audit::fail_closed_latch_for_test();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(chunkc_archive_gc_dry_run_returns_count);
+            let _ = done_tx.send(());
+            outcome
+        });
+        let finished_while_latched = done_rx.recv_timeout(SIBLING_HOLD).is_ok();
+        drop(latch);
+        drop(sink);
+        let outcome = worker.join().expect("worker thread joins");
+        assert!(
+            outcome.is_ok(),
+            "gc dry-run test failed under a sibling's latch (finished while latched: {finished_while_latched})"
+        );
     }
 
     /// #1050 regression — every tool registered in `registered_tools()`
