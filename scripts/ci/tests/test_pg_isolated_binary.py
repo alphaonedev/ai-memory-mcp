@@ -701,8 +701,8 @@ class TemplateOwnership(unittest.TestCase):
                 pib.server_caps_sql(pib._pg_env(BASE + '&connect_timeout=' + bad))
 
     def test_connect_budget_counts_addresses_floor_and_ssl_retry_7482(self):
-        two = [(0, 0, 0, '', ('10.0.0.1', 5432)), (0, 0, 0, '', ('10.0.0.2', 5432))]
-        named = 'postgres://u@db.example:5432/d?%s'
+        two = [(0, 0, 0, '', ('192.0.2.1', 5432)), (0, 0, 0, '', ('192.0.2.2', 5432))]
+        named = 'postgres://db.example:5432/d?%s'
         with unittest.mock.patch.object(pib.socket, 'getaddrinfo', return_value=two):
             env = pib._pg_env(named % 'sslmode=verify-full&connect_timeout=30')
             self.assertEqual(pib._connect_budget_secs(env), 60)
