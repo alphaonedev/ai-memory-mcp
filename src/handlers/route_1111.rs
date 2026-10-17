@@ -1848,14 +1848,19 @@ pub async fn handle_subscription_dlq_list_http(
         Err(e) => return err_response(e),
     };
     let lock = app.db.lock().await;
-    // #7501: the header-bound caller and the operator allowlist of this
-    // daemon; admins see every failed-lookup row, everyone else their own.
-    let result = crate::mcp::handle_subscription_dlq_list_for(
-        &lock.0,
-        &body,
-        &caller,
-        &app.admin_agent_ids,
-    );
+    // #7501 / #7542: admins see every failed-lookup row, everyone else their
+    // own. The widening is a privilege grant, so it needs the TRUSTED admin
+    // predicate (allowlisted name AND request authn or explicit header trust
+    // AND key attestation under `enforce`), never the bare allowlist match: the
+    // X-Agent-Id header is self-asserted on a keyless daemon (#1582).
+    let admin_ids: Vec<String> =
+        if crate::handlers::admin_role::is_admin_caller_trusted(&app, &headers, &caller) {
+            vec![caller.clone()]
+        } else {
+            Vec::new()
+        };
+    let result =
+        crate::mcp::handle_subscription_dlq_list_for(&lock.0, &body, &caller, &admin_ids);
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
