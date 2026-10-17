@@ -7,9 +7,14 @@ no candle release outside zip >= 9 can leave. The ignores in
 `.cargo/audit.toml` are therefore sound only while that path is unreachable.
 This guard fails (exit 1) when any of these holds:
 
-  (a) `cargo tree -i zip --edges normal,build,dev` shows a direct parent that
-      is not candle-core (the exact crate that depends on zip today);
-  (b) the root Cargo.toml declares a direct `zip` dependency in any form:
+  (a) `cargo tree -i zip --edges normal,build,dev --workspace` shows a direct
+      parent that is not registry candle-core 0.10.x (a path or git source, any
+      other version, or any other crate fails), or Cargo.lock lists candle-core
+      with another version or a source other than crates.io;
+  (b) the root Cargo.toml declares a direct `zip` dependency in any form,
+      patches or replaces candle-core or zip, or declares workspace members
+      (their manifests and sources are not scanned, so a member must extend the
+      guard first); direct zip dependency forms are:
       [dependencies], [dev-dependencies], [build-dependencies], any
       [target.<cfg>.*] table, [workspace.dependencies], [dependencies.zip],
       top-level dotted keys, or a rename with `package = "zip"`;
@@ -53,14 +58,19 @@ EXIT_USAGE = 2
 ZIP_CRATE = 'zip'
 # Exact crates that depend on zip today (candle-nn / candle-transformers 0.10.2
 # have no zip dependency). Widening this set needs an edit here and in audit.toml.
-ALLOWED_PARENTS = frozenset({'candle-core'})
+# The audited parent: crates.io candle-core 0.10.x. A tree line for it carries no
+# `(<source>)` suffix (path and git packages print one); `(*)` marks a repeat.
+ALLOWED_PARENT_LINE = re.compile(r'^candle-core v0\.10\.\d+(?: \(\*\))?$')
+LOCK_REGISTRY = 'registry+https://github.com/rust-lang/crates.io-index'
+PINNED_PACKAGES = ('candle-core', ZIP_CRATE)
 SCAN_DIRS = ('src', 'tests', 'benches', 'examples')
 SCAN_FILES = ('build.rs',)
 # Dev edges are included so a zip dev-dependency (also under a target-cfg table)
 # is seen; `all` is not used because it adds `zip feature` lines.
 CARGO_TREE_ARGS = (
     'tree', '-i', ZIP_CRATE, '--edges', 'normal,build,dev', '--depth', '1',
-    '--prefix', 'depth', '--target', 'all', '--all-features', '--offline', '--locked',
+    '--prefix', 'depth', '--target', 'all', '--all-features', '--workspace',
+    '--offline', '--locked',
 )
 
 # Direct zip use, plus the candle code paths that open a zip archive.
@@ -79,10 +89,20 @@ FORBIDDEN = (
 )
 EXTRACT_CALL = re.compile(r'\.\s*extract\s*\(')
 ZIP_CONTEXT = re.compile(r'\bzip\b|\bZip\w*|\barchive\b|\bArchive\b')
+# `.zip(..)`, `iter::zip(..)` and `zip(..)` are Iterator::zip calls, not the crate.
+ZIP_CALL = re.compile(r'(?:\.\s*|::\s*)?\bzip\s*\(')
+# Keywords that can sit before `!` (`if !(x)`) and so are not macro names.
+NOT_MACRO = frozenset({'if', 'while', 'return', 'match', 'in', 'else', 'let', 'for', 'loop', 'break',
+                       'mut', 'as', 'move', 'await', 'where', 'unsafe', 'yield', 'ref', 'box'})
+# A local binding named zip: `let zip`, a `zip:` parameter or field pattern,
+# `for zip in`, or a closure parameter.
+ZIP_BINDING = re.compile(
+    r'\blet\s+(?:mut\s+|ref\s+)*zip\b|(?<![\w:.])zip\s*:(?!:)|\bfor\s+zip\b|\|[^|\n]*\bzip\b[^|\n]*\|')
+FN_KEYWORD = re.compile(r'\bfn\b')
 # A bare `zip` token that is neither a method call (`.zip(`), a path segment
 # (`iter::zip`) nor a call (`zip(a, b)`): in macro input it can be the crate.
 MACRO_ZIP = re.compile(r'(?<![\w.:])zip\b(?!\s*(?:\(|::))')
-MACRO_OPEN = re.compile(r'\b[A-Za-z_]\w*\s*!\s*([(\[{])')
+MACRO_OPEN = re.compile(r'\b([A-Za-z_]\w*)\s*!\s*([(\[{])')
 # Matched on the masked text (comments and string bodies blanked), so a quoted
 # `#[path = ..]` in test code is not mistaken for an attribute; the literal is
 # then read from the raw text at the same offset.
@@ -141,11 +161,11 @@ def parse_tree(tree_text):
         depth_match = DEPTH_LINE.match(line)
         if depth_match:
             if int(depth_match.group(1)) == 1:
-                parents.append(depth_match.group(2).split()[0])
+                parents.append(depth_match.group(2).strip())
             continue
         drawn = DRAWN_LINE.match(line)
         if drawn:
-            parents.append(drawn.group(1).split()[0])
+            parents.append(drawn.group(1).strip())
             continue
         raise ToolError('cannot parse cargo tree line: %r' % line[:120])
     if not root_seen:
@@ -155,10 +175,38 @@ def parse_tree(tree_text):
 
 def check_tree(tree_text):
     problems = []
-    for name in parse_tree(tree_text):
-        if name not in ALLOWED_PARENTS:
+    for parent in parse_tree(tree_text):
+        if not ALLOWED_PARENT_LINE.match(parent):
             problems.append(violation(
-                'cargo-tree', 'zip parent %s is not one of: %s' % (name, ', '.join(sorted(ALLOWED_PARENTS)))))
+                'cargo-tree', 'zip parent %r is not registry candle-core 0.10.x (no path or git source)' % parent))
+    return problems
+
+
+def lock_packages(root):
+    """Cargo.lock packages as {name: [(version, source or None), ...]}; unreadable is a tool error."""
+    lock = root / 'Cargo.lock'
+    try:
+        text = lock.read_text(encoding='utf-8')
+    except (OSError, ValueError) as exc:
+        raise ToolError('cannot read %s: %s' % (lock, exc))
+    packages = {}
+    for block in text.split('[[package]]')[1:]:
+        fields = dict(re.findall(r'^(name|version|source)\s*=\s*"([^"]*)"\s*$', block, re.MULTILINE))
+        if 'name' in fields:
+            packages.setdefault(fields['name'], []).append((fields.get('version', ''), fields.get('source')))
+    return packages
+
+
+def check_lock(root):
+    """candle-core in Cargo.lock must be crates.io 0.10.x, the code the audit rationale covers."""
+    entries = lock_packages(root).get('candle-core', [])
+    if not entries:
+        return [violation('Cargo.lock', 'candle-core is the audited zip parent but has no lock entry')]
+    problems = []
+    for version, source in entries:
+        if source != LOCK_REGISTRY or not re.match(r'0\.10\.\d+$', version):
+            problems.append(violation(
+                'Cargo.lock', 'candle-core %s source %s is not crates.io 0.10.x' % (version, source)))
     return problems
 
 
@@ -206,6 +254,37 @@ def dependency_rest(path):
     return None
 
 
+def open_multiline_quote(value):
+    """The triple quote that opens a multi-line string left open at the end of `value`, or None.
+
+    Walks the value as TOML does: a complete one-line `"..."` or `'...'` string
+    (and a same-line `\"\"\"..\"\"\"`) is skipped whole, so a triple quote inside
+    one cannot toggle the multi-line state; a `#` ends the scan.
+    """
+    i, n = 0, len(value)
+    while i < n:
+        ch = value[i]
+        if value.startswith('"""', i) or value.startswith("'''", i):
+            quote = value[i:i + 3]
+            end = value.find(quote, i + 3)
+            if end < 0:
+                return quote
+            i = end + 3
+        elif ch == '"':
+            i += 1
+            while i < n and value[i] != '"':
+                i += 2 if value[i] == '\\' else 1
+            i += 1
+        elif ch == "'":
+            end = value.find("'", i + 1)
+            i = n if end < 0 else end + 1
+        elif ch == '#':
+            return None
+        else:
+            i += 1
+    return None
+
+
 def iter_manifest_entries(text):
     """Yield ('header', n, table_path, '') and ('key', n, full_key_path, value) per line.
 
@@ -243,16 +322,39 @@ def iter_manifest_entries(text):
         if not eq:
             continue
         value = stripped[eq.end():]
-        for quote in ('"""', "'''"):
-            if value.count(quote) % 2 == 1:
-                in_multiline = quote
+        in_multiline = open_multiline_quote(value)
         yield 'key', number, table + parts, value
+
+
+REPLACE_KEY = re.compile(r'(?:^|[#/])(candle-core|zip)(?::|$)')
+PACKAGE_PINNED = re.compile(r'\bpackage\s*=\s*["\'](candle-core|zip)["\']')
+PACKAGE_PINNED_VALUE = re.compile(r'^\s*["\'](candle-core|zip)["\']\s*(?:#.*)?$')
+WORKSPACE_DETAIL = 'workspace members are not scanned by this guard (extend it before adding one)'
+
+
+def override_detail(kind, path, value):
+    """Detail when this manifest entry redirects candle-core or zip, or declares workspace members."""
+    if path[:2] == ['workspace', 'members'] and kind == 'key' and value.strip() not in ('[]', ''):
+        return WORKSPACE_DETAIL
+    if path[0] == 'patch' and len(path) >= 3:
+        if path[2] in PINNED_PACKAGES:
+            return '[patch] of %s' % path[2]
+        if len(path) == 3 and kind == 'key' and PACKAGE_PINNED.search(value):
+            return '[patch] of a renamed pinned package'
+        if len(path) == 4 and path[3] == 'package' and PACKAGE_PINNED_VALUE.match(value):
+            return '[patch] of a renamed pinned package'
+    if path[0] == 'replace' and len(path) >= 2 and REPLACE_KEY.search(path[1]):
+        return '[replace] of %s' % path[1]
+    return None
 
 
 def fallback_manifest_hits(text):
     """Dependency-table check on the line-level reader. Returns (line, detail) pairs."""
     hits = []
     for kind, number, path, value in iter_manifest_entries(text):
+        detail = override_detail(kind, path, value)
+        if detail:
+            hits.append((number, detail))
         rest = dependency_rest(path)
         if rest is None:
             continue
@@ -295,6 +397,19 @@ def tomllib_manifest_hits(text):
     if isinstance(workspace, dict):
         tables.append(('workspace.dependencies', workspace.get('dependencies')))
     hits = []
+    if isinstance(workspace, dict) and workspace.get('members'):
+        hits.append((guess_line(text, r'^\s*(?:workspace\.)?members\s*='), WORKSPACE_DETAIL))
+    patch = data.get('patch')
+    for source, body in (patch.items() if isinstance(patch, dict) else ()):
+        for name, spec in (body.items() if isinstance(body, dict) else ()):
+            renamed = spec.get('package') if isinstance(spec, dict) else None
+            for pinned in (name, renamed):
+                if pinned in PINNED_PACKAGES:
+                    hits.append((guess_line(text, r'\b%s\b' % re.escape(name)), '[patch] of %s' % pinned))
+    replace = data.get('replace')
+    for key in (replace if isinstance(replace, dict) else ()):
+        if REPLACE_KEY.search(key):
+            hits.append((guess_line(text, re.escape(key)), '[replace] of %s' % key))
     line_hint = r'^\s*(?:\[.*\bzip\b.*\]|["\']?zip["\']?\s*[=.]|.*\bpackage\s*=\s*["\']zip["\'])'
     for label, table in tables:
         if not isinstance(table, dict):
@@ -318,6 +433,10 @@ def check_manifest(manifest_text, parser='auto'):
     else:
         hits = fallback_manifest_hits(manifest_text)
     return [violation('Cargo.toml:%d' % number, detail) for number, detail in hits]
+
+
+# A raw string opener with its optional byte (`b`) or C (`c`) prefix: r"..", br#".."#, cr"..".
+RAW_OPEN = re.compile(r'[bc]?r(#*)"')
 
 
 def mask_rust(text):
@@ -347,9 +466,10 @@ def mask_rust(text):
                     j += 1
             out.append(re.sub(r'[^\n]', ' ', text[i:j]))
             i = j
-        elif ch == 'r' and re.match(r'r#*"', text[i:i + 40]) and (i == 0 or not text[i - 1].isalnum()):
-            hashes = len(re.match(r'r(#*)"', text[i:]).group(1))
-            end = text.find('"' + '#' * hashes, i + 2 + hashes)
+        elif ch in 'rbc' and RAW_OPEN.match(text, i) and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == '_')):
+            raw = RAW_OPEN.match(text, i)
+            hashes = len(raw.group(1))
+            end = text.find('"' + '#' * hashes, raw.end())
             j = n if end < 0 else end + 1 + hashes
             out.append(re.sub(r'[^\n]', ' ', text[i:j]))
             i = j
@@ -373,7 +493,10 @@ def mask_rust(text):
 def macro_input_hits(text, masked):
     """Line numbers where a bare `zip` token sits inside a macro invocation."""
     lines = set()
+    fn_starts = [m.start() for m in FN_KEYWORD.finditer(masked)]
     for opener in MACRO_OPEN.finditer(masked):
+        if opener.group(1) in NOT_MACRO:
+            continue
         depth, j = 0, opener.end() - 1
         start = j
         while j < len(masked):
@@ -385,6 +508,11 @@ def macro_input_hits(text, masked):
                     break
             j += 1
         for hit in MACRO_ZIP.finditer(masked, start, j):
+            # A zip bound in the enclosing fn (parameter or let) is a local, not the crate.
+            before = [pos for pos in fn_starts if pos < hit.start()]
+            scope_start = before[-1] if before else 0
+            if ZIP_BINDING.search(masked, scope_start, hit.start()):
+                continue
             lines.add(masked.count('\n', 0, hit.start()) + 1)
     return sorted(lines)
 
@@ -457,15 +585,17 @@ def check_sources(root, manifest_text=''):
             problems.append(violation(str(path), 'source outside the repository'))
             continue
         text = read_source(path, rel)
-        zip_context = bool(ZIP_CONTEXT.search(text))
-        for number, line in enumerate(text.splitlines(), 1):
+        # Code patterns run on the masked text: comments and string bodies are
+        # not code, so a doc comment naming `zip::ZipArchive` is not a use.
+        masked = mask_rust(text)
+        zip_context = bool(ZIP_CONTEXT.search(ZIP_CALL.sub(' ', masked)))
+        for number, line in enumerate(masked.split('\n'), 1):
             where = '%s:%d' % (rel, number)
             for label, pattern in FORBIDDEN:
                 if pattern.search(line):
                     problems.append(violation(where, label))
             if zip_context and EXTRACT_CALL.search(line):
                 problems.append(violation(where, 'zip-flavoured extract call'))
-        masked = mask_rust(text)
         for attr in PATH_ATTR.finditer(masked):
             number = masked.count('\n', 0, attr.start()) + 1
             where = '%s:%d' % (rel, number)
@@ -552,7 +682,7 @@ def main(argv=None):
                   'remove this guard and the audit ignores (#7302)')
             tree_problems = []
         else:
-            tree_problems = check_tree(tree_text)
+            tree_problems = check_tree(tree_text) + check_lock(root)
         manifest_text = read_source(root / 'Cargo.toml', 'Cargo.toml')
         problems = (tree_problems + check_manifest(manifest_text, args.manifest_parser)
                     + check_sources(root, manifest_text))
