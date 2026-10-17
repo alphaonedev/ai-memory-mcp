@@ -26,9 +26,51 @@ use serde_json::json;
 #[cfg(feature = "sal")]
 mod common;
 
-fn open_mem() -> rusqlite::Connection {
+/// #7361: the tests below write the process environment (`open_mem` and
+/// `namespace_ownership_refusal_passes_through_3761`) and open SQLite, whose
+/// first open calls C `getenv`; the PG leg resolves a URL and connects. All of
+/// them run as threads of one test binary, so every test holds this lock for
+/// its whole body. The PG leg takes it before `common::postgres_url`, whose
+/// isolated-URL publish takes the `tests/common` `ENV_LOCK` inside it (lock
+/// order: this lock, then that one; nothing here takes them the other way).
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The variables the tests of this file change (#7476).
+const RESTORED_VARS: [&str; 2] = ["AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "AI_MEMORY_AGENT_ID"];
+
+/// #7476: a snapshot of environment variables that puts each one back (its
+/// value, or its absence) on drop. Declare it after the `ENV_LOCK` guard, so
+/// it restores while the lock is still held.
+struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+impl EnvRestore {
+    fn capture(keys: &[&'static str]) -> Self {
+        Self(keys.iter().map(|&k| (k, std::env::var_os(k))).collect())
+    }
+}
+
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        for (key, prev) in self.0.drain(..) {
+            // SAFETY: the owner holds ENV_LOCK (declared before this guard),
+            // and every test of this binary takes it before it touches the
+            // environment.
+            match prev {
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+    }
+}
+
+/// An in-memory db with `AI_MEMORY_AGENT_ID` unset until the returned
+/// restore guard drops (bind it before the connection, after `ENV_LOCK`).
+fn open_mem() -> (EnvRestore, rusqlite::Connection) {
+    let restore = EnvRestore::capture(&["AI_MEMORY_AGENT_ID"]);
+    // SAFETY: the caller holds ENV_LOCK.
     unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
-    ai_memory::db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
+    let conn = ai_memory::db::open(std::path::Path::new(":memory:")).expect("open in-memory db");
+    (restore, conn)
 }
 
 fn action_params(namespace: &str) -> serde_json::Value {
@@ -43,7 +85,8 @@ fn action_params(namespace: &str) -> serde_json::Value {
 
 #[test]
 fn action_create_driver_fault_renders_closed_3761() {
-    let conn = open_mem();
+    let _env = ENV_LOCK.blocking_lock();
+    let (_restore, conn) = open_mem();
     conn.execute_batch("DROP TABLE actions")
         .expect("drop actions");
     let err = ai_memory::mcp::handle_action_create(&conn, &action_params("_act"))
@@ -57,7 +100,8 @@ fn action_create_driver_fault_renders_closed_3761() {
 
 #[test]
 fn action_create_validation_refusal_passes_through_3761() {
-    let conn = open_mem();
+    let _env = ENV_LOCK.blocking_lock();
+    let (_restore, conn) = open_mem();
     let err = ai_memory::mcp::handle_action_create(&conn, &action_params(""))
         .expect_err("an empty namespace must be refused");
     assert_ne!(
@@ -87,7 +131,8 @@ fn seed_memory(conn: &rusqlite::Connection, title: &str) -> String {
 
 #[test]
 fn lineage_driver_fault_renders_closed_3761() {
-    let conn = open_mem();
+    let _env = ENV_LOCK.blocking_lock();
+    let (_restore, conn) = open_mem();
     let a = seed_memory(&conn, "src 3761");
     let b = seed_memory(&conn, "dst 3761");
     ai_memory::db::create_link(&conn, &a, &b, "related_to").expect("seed edge");
@@ -103,7 +148,8 @@ fn lineage_driver_fault_renders_closed_3761() {
 
 #[test]
 fn lineage_depth_refusal_passes_through_3761() {
-    let conn = open_mem();
+    let _env = ENV_LOCK.blocking_lock();
+    let (_restore, conn) = open_mem();
     let a = seed_memory(&conn, "src 3761");
     let err = ai_memory::mcp::handle_lineage(&conn, &json!({"id": a, "max_depth": 0}), None)
         .expect_err("max_depth=0 must be refused");
@@ -119,7 +165,8 @@ fn lineage_depth_refusal_passes_through_3761() {
 
 #[test]
 fn namespace_bind_read_fault_refuses_closed_3761() {
-    let conn = open_mem();
+    let _env = ENV_LOCK.blocking_lock();
+    let (_restore, conn) = open_mem();
     conn.execute_batch("DROP TABLE namespace_meta")
         .expect("drop");
     let err = ai_memory::mcp::handle_namespace_set_standard(
@@ -139,6 +186,15 @@ fn namespace_bind_read_fault_refuses_closed_3761() {
 
 #[test]
 fn namespace_ownership_refusal_passes_through_3761() {
+    let _env = ENV_LOCK.blocking_lock();
+    namespace_ownership_refusal_body();
+}
+
+/// The body of `namespace_ownership_refusal_passes_through_3761`; the
+/// caller holds `ENV_LOCK`.
+fn namespace_ownership_refusal_body() {
+    let _restore = EnvRestore::capture(&RESTORED_VARS);
+    // SAFETY: the caller holds ENV_LOCK; `_restore` puts both back on return.
     unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") };
     unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
     let dir = tempfile::NamedTempFile::new().expect("tempfile");
@@ -186,6 +242,38 @@ fn namespace_ownership_refusal_passes_through_3761() {
     );
 }
 
+/// #7476: the ownership test and `open_mem` put back every variable they
+/// change, whether it was set or unset before, so the next test of this
+/// binary sees the environment it started with.
+#[test]
+fn env_writers_restore_the_original_values_7476() {
+    let _env = ENV_LOCK.blocking_lock();
+    let originals: [Option<&str>; 2] = [Some("sentinel-7476"), None];
+    for original in originals {
+        for key in RESTORED_VARS {
+            // SAFETY: ENV_LOCK is held, and every test of this binary takes
+            // it before it touches the environment.
+            match original {
+                Some(v) => unsafe { std::env::set_var(key, v) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+        namespace_ownership_refusal_body();
+        drop(open_mem());
+        for key in RESTORED_VARS {
+            assert_eq!(
+                std::env::var(key).ok().as_deref(),
+                original,
+                "#7476: {key} must be back to its original value after the env writers"
+            );
+        }
+    }
+    for key in RESTORED_VARS {
+        // SAFETY: as above; leave the variables unset, as a fresh binary has them.
+        unsafe { std::env::remove_var(key) };
+    }
+}
+
 /// PG LEG (measured on the build host; self-skips on f1): every funnel's
 /// MCP error text renders a live `sqlx` driver fault as the same closed
 /// class. The handlers themselves hold a bare `rusqlite::Connection`, so
@@ -194,6 +282,7 @@ fn namespace_ownership_refusal_passes_through_3761() {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn pg_driver_faults_render_closed_per_funnel_3761() {
+    let _env = ENV_LOCK.lock().await;
     let Some(url) = common::postgres_url() else {
         return;
     };
