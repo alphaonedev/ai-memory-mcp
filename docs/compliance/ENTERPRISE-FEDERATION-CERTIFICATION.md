@@ -293,7 +293,7 @@ certification and triggers re-cert** (see §7).
 > certify. Every figure below was measured on this SHA.
 >
 > **§5.4(2) posture legs** (evidence: `docs/compliance/evidence/cert-eae99be43/`;
-> reproducible with `scripts/recapture-cert-3607-posture.sh`, whose header
+> reproducible with `scripts/recapture-cert-3607-posture.py`, whose header
 > declares the 22 checks): leg 1 bare — exit **2**, 12 PASS /
 > 10 FAIL; leg 2 hardened, gate unarmed — exit **2**, 20 /
 > 2; leg 3 hardened, gate ARMED — exit **1**, refuses boot; leg 4
@@ -1894,7 +1894,7 @@ captures in `docs/compliance/evidence/cert-3607/`. Cargo `--no-fail-fast`.
 exit 1, refuses to boot. Certified configuration (sqlcipher, encrypt-at-rest,
 boot gate, `AI_MEMORY_DB_SYNCHRONOUS=FULL`, operator key pair): **exit 0,
 22 PASS / 0 FAIL**. Recorded in `cert-3607/posture-legs-exit-codes.txt`;
-reproducible with `scripts/recapture-cert-3607-posture.sh`.
+reproducible with `scripts/recapture-cert-3607-posture.py`.
 
 **Re-cert trigger — FIRED by #3204 (`src/handlers/federation_receive.rs`,
 `src/handlers/federation_signing_check.rs`, `src/identity/sign.rs` — the far-endpoint
@@ -1935,7 +1935,7 @@ pg database created for the run; raw named-test listing and the posture captures
 exit 1, refuses to boot. Certified configuration (sqlcipher, encrypt-at-rest,
 boot gate, `AI_MEMORY_DB_SYNCHRONOUS=FULL`, operator key pair): **exit 0,
 22 PASS / 0 FAIL**. Recorded in `cert-3607/posture-legs-exit-codes.txt`;
-reproducible with `scripts/recapture-cert-3607-posture.sh`.
+reproducible with `scripts/recapture-cert-3607-posture.py`.
 
 ---
 

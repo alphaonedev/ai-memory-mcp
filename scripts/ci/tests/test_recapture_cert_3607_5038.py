@@ -13,6 +13,7 @@ header whose date disagrees with the run date is refused.
 Run: python3 -m unittest scripts/ci/tests/test_recapture_cert_3607_5038.py
 """
 import datetime
+import importlib.util
 import os
 import re
 import shutil
@@ -23,7 +24,7 @@ import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
-SCRIPT_NAME = 'recapture-cert-3607-posture.sh'
+SCRIPT_NAME = 'recapture-cert-3607-posture.py'
 SCRATCH = REPO / '.local-runs'
 OUT_REL = Path('docs') / 'compliance' / 'evidence' / 'cert-3607'
 HEADER_RE = re.compile(
@@ -101,7 +102,7 @@ class RecaptureBase(unittest.TestCase):
         self.git('init', '-q')
         (self.root / 'seed.txt').write_text('seed\n')
         self.git('add', 'seed.txt')
-        self.git('-c', 'user.name=t', '-c', 'user.email=t@example.invalid',
+        self.git('-c', 'user.name=t', '-c', 'user.email=sandbox@localhost',
                  '-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'seed')
         self.sha = self.git('rev-parse', '--short', 'HEAD').strip()
         self.default_bin = self.make_stub('ai-memory-default')
@@ -175,6 +176,49 @@ class HeaderDate5038(RecaptureBase):
         text = self.out('posture-legs-exit-codes.txt')
         self.assertEqual(re.findall(r'^exit: (\S+)$', text, re.M), ['2', '2', '1', 'missing'])
         self.assertIn('leg4 skipped', done.stdout)
+
+
+def load_script_module():
+    """Import the hyphen-named script as a module (its main() is not run)."""
+    spec = importlib.util.spec_from_file_location(
+        'recapture_cert_3607_posture', str(REPO / 'scripts' / SCRIPT_NAME))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class HeaderSelfCheck5038(unittest.TestCase):
+    """The script refuses a transcript whose header date is not the run date."""
+
+    def setUp(self):
+        SCRATCH.mkdir(exist_ok=True)
+        self.dir = Path(tempfile.mkdtemp(prefix='recapture-5038-check-', dir=str(SCRATCH)))
+        self.addCleanup(shutil.rmtree, str(self.dir), True)
+        self.module = load_script_module()
+
+    def write(self, first_line):
+        path = self.dir / 'posture-legs-exit-codes.txt'
+        path.write_text(first_line + '\n# each leg\n')
+        return path
+
+    def test_matching_date_is_accepted(self):
+        path = self.write(self.module.header_line('2026-10-17', 'abc1234'))
+        self.assertIsNone(self.module.check_header_date(path, '2026-10-17'))
+
+    def test_template_date_is_refused(self):
+        path = self.write(self.module.header_line(TEMPLATE_DATE, 'abc1234'))
+        problem = self.module.check_header_date(path, '2026-10-17')
+        self.assertIsNotNone(problem)
+        self.assertIn(TEMPLATE_DATE, problem)
+        self.assertIn('2026-10-17', problem)
+
+    def test_malformed_header_is_refused(self):
+        path = self.write('# something else entirely')
+        self.assertIsNotNone(self.module.check_header_date(path, '2026-10-17'))
+
+    def test_run_date_is_an_iso_utc_date(self):
+        today = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+        self.assertIn(self.module.utc_run_date(), {today})
 
 
 class SanitizerBytes5038(RecaptureBase):
