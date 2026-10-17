@@ -445,6 +445,9 @@ class FakePg:
         for prefix, text in self.fail.items():
             if sql.startswith(prefix):
                 return Result(1, '', text)
+        probe = re.match(r"SELECT 1 FROM pg_database WHERE datname = '([^']+)'$", sql)
+        if probe:
+            return Result(0, '1\n' if probe.group(1) in self.dbs else '')
         found = re.search(r'DATABASE (?:IF EXISTS )?"([^"]+)"', sql)
         name = found.group(1) if found else None
         if sql.startswith('CREATE DATABASE'):
@@ -591,6 +594,37 @@ class TemplateOwnership(unittest.TestCase):
                 self.assertIn(TPL, text)
                 self.assertIn("SELECT 1 FROM pg_database WHERE datname = '%s'" % TPL, text)
                 self.assertIn('teardown', text)
+                self.assertEqual(ctx.exception.returncode, status)
+
+    def test_status_one_is_proved_by_a_pg_database_check_7405(self):
+        refused = {'CREATE DATABASE': 'ERROR:  permission denied to create database'}
+        # status 1 and the check finds no row: refused, nothing created
+        pg = FakePg(fail=refused)
+        with self.assertRaises(pib.WrapperError) as empty:
+            self.run_setup(pg)
+        self.assertIn('nothing was created or changed', str(empty.exception))
+        self.assertIn("SELECT 1 FROM pg_database WHERE datname = '%s'" % TPL, pg.log)
+        # status 1 but the check finds a row: unknown
+        pg = FakePg({TPL: {'template': False, 'sessions': 0}}, fail=refused)
+        with self.assertRaises(pib.WrapperError) as row:
+            self.run_setup(pg)
+        self.assertNotIn('nothing was created', str(row.exception))
+        self.assertIn('outcome is unknown', str(row.exception))
+        # status 1 and the check itself fails: unknown
+        pg = FakePg(fail=dict(refused, **{'SELECT 1 FROM pg_database': 'ERROR:  check-failed'}))
+        with self.assertRaises(pib.WrapperError) as failed:
+            self.run_setup(pg)
+        self.assertNotIn('nothing was created', str(failed.exception))
+        self.assertIn('outcome is unknown', str(failed.exception))
+        self.assertEqual(failed.exception.returncode, 1)
+        self.assertFalse([s for s in pg.log if s.startswith(('ALTER', 'DROP', 'CREATE EXT'))])
+
+    def test_empty_stderr_is_spelled_out_7406(self):
+        silent = lambda argv, kw: Result(-9, '', '')
+        with unittest.mock.patch.object(pib.subprocess, 'run', Recorder(silent)):
+            with self.assertRaises(pib.WrapperError) as ctx:
+                pib.psql(BASE, 'SELECT 1')
+        self.assertEqual(str(ctx.exception), 'psql failed (-9): no stderr')
 
     def test_template_limit_counts_utf8_bytes_not_characters_7373(self):
         fits = 'é' * 29 + 'x'      # 29*2 + 1 = 59 bytes, 30 characters
