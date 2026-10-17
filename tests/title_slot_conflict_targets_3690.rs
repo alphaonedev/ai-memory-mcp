@@ -328,6 +328,10 @@ fn reviewed_consumers() -> BTreeMap<(&'static str, &'static str), &'static str> 
             "#4045 optimistic-concurrency VERSION conflict (a consolidation source's stored version moved after it was summarized); carries only the memory id, never a (title, namespace) slot, so no title-slot admission decision is involved",
         ),
         (
+            ("src/storage/mod.rs", "consolidate_with_expected_versions"),
+            "#7111 the destination admission runs in `consolidate_dest::admit_destination` (via `title_slot_holder` + `title_slot_disposition`) BEFORE any source is touched; this function only turns a no-row `RETURNING` of the guarded upsert (a slot taken by a hidden holder between probe and write) into the same unnamed refusal",
+        ),
+        (
             ("src/store/sqlite.rs", "slot_conflict_or_backend"),
             "#7099 / #7111 mapper of the typed `ConflictError` that the routed `insert_inner` / consolidate destination admission already decided onto `StoreError::Conflict`; the id is carried verbatim (empty for a hidden holder), nothing is decided here",
         ),
