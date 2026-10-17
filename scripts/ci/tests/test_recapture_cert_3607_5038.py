@@ -871,7 +871,7 @@ class SwapDuringRun7509(SymlinkBase):
         target = self.root / 'a' / 'f'
         target.parent.mkdir()
         target.write_bytes(b'old')
-        module.write_file(target, b'new', 0o600)
+        module.write_file(target, b'new')
         self.assertEqual(target.read_bytes(), b'new')
         self.assertEqual(target.stat().st_mode & 0o777, 0o600)
 
@@ -882,11 +882,11 @@ class SwapDuringRun7509(SymlinkBase):
         existing = self.root / 'pass'
         existing.write_bytes(b'keep')
         with self.assertRaises(OSError):
-            module.write_file(existing, b'new', 0o600, replace=False)
+            module.write_file(existing, b'new', replace=False)
         self.assertEqual(existing.read_bytes(), b'keep')
         (self.root / 'dangling').symlink_to(outside / 'f')
         with self.assertRaises(OSError):
-            module.write_file(self.root / 'dangling', b'new', 0o600, replace=False)
+            module.write_file(self.root / 'dangling', b'new', replace=False)
         self.assertEqual(list(outside.iterdir()), [])
 
     def test_read_file_refuses_a_symlink(self):
@@ -904,7 +904,10 @@ class HomeValidation7510(RecaptureBase):
 
     def test_unusable_home_is_refused_before_any_write(self):
         for value in ('.', 'rel', '', '/', 'a:b', '/abs:/other', '/.', '/..', '/./', '/home/a/',
-                      '/home//a', '/home/a/.', '/home/a/../b', '//', '/home/./a'):
+                      '/home//a', '/home/a/.', '/home/a/../b', '//', '/home/./a',
+                      '//home/a', '///home/a', '//home//a', '/home/a//', '/home/a\n',
+                      '/home/a\t', '/home/a\x01', '/home/a\x1f', '/home/a\x7f',
+                      '\n/home/a', '/home\n/a', '/home/a\r'):
             with self.subTest(home=value):
                 done, _ = self.run_recapture(extra_env={'HOME': value})
                 self.assertEqual(done.returncode, 1, done.stderr)
@@ -947,97 +950,346 @@ class HomeValidation7510(RecaptureBase):
         self.assertIn('HOME', module.__doc__)
         self.assertIn('component', module.sanitize.__doc__)
 
+    def test_docstring_and_usage_state_the_new_home_refusals(self):
+        module = load_script_module()
+        doc = ' '.join(module.__doc__.split())
+        self.assertIn("not starting with `//`", doc)
+        self.assertIn('control byte', doc)
+        self.assertIn('0x00-0x1f, 0x7f', doc)
+        self.assertIn("starting with '//'", module.USAGE_EPILOG)
+        self.assertIn('control byte', module.USAGE_EPILOG)
 
-class SanitizerTerminators7538(RecaptureBase):
-    """#7538: a path is replaced only before end of input, `/`, whitespace or a closing
-    character; every other legal filename character keeps the path a different one."""
+    def test_home_problem_unit_table(self):
+        module = load_script_module()
+        for value in ('//home/a', '///home/a', '/home//a', '/home/a\n', '/home/a\x00',
+                      '/home/a\x1f', '/home/a\x7f', '/ho\tme/a'):
+            with self.subTest(home=value):
+                self.assertIsNotNone(module.home_problem(value))
+        for value in ('/home/a', '/home/a b', '/home/\u00e9', '/Users/x.y', '/a'):
+            with self.subTest(home=value):
+                self.assertIsNone(module.home_problem(value))
 
-    def patched(self, home):
+
+class SanitizerBoundaries7538(RecaptureBase):
+    """#7538 #7571 #7572 #7573: a HOME, repo-root or fixtures path is rewritten only when BOTH
+    ends are a boundary from an explicit allowlist of delimiter characters."""
+
+    ROOTS = (
+        # name, path, label, what the path looks like after the repo-root rewrite alone
+        ('home', b'/home/a', b'<home>', b'/home/a'),
+        ('root', b'/mnt/x/repo', b'<repo-root>', b'/mnt/x/repo'),
+        ('fix', b'/mnt/x/repo/.local-runs/cert-3607-fixtures',
+         b'<repo-root>/.local-runs/cert-3607-fixtures',
+         b'<repo-root>/.local-runs/cert-3607-fixtures'),
+    )
+    REWRITTEN = (
+        b'{P}', b'{P}/x', b'"{P}"', b"'{P}'", b'`{P}`', b'({P})', b'[{P}]', b'<{P}>',
+        b'={P}', b':{P}', b'{P}:', b'{P};', b'{P},', b'{P} x', b'a {P}', b'{P}\n', b'{P}\t',
+        b'{P}.', b'{P}. x', b'{P}.\n', b'KEY={P}:/bin', b'{P}) x', b'{P}] x', b'{P}> x',
+        b'{P}, x', b'{P}: x', b'{P}; x', b'\t{P}', b'\n{P}', b' {P}/y z',
+    )
+    KEPT_END = (
+        b'./x', b'..b', b'..', b'.txt', b'.b', b'.+', b'.)', b'.:x', b'.;', b'.,', b'.]',
+        b'+b', b'~', b'@x', b'%20', b'#1', b'$x', b'&b', b'|b', b'!', b'(x', b'{x', b'}',
+        b'[x', b'ab', b'_b', b'-b', b'=1', b'*', b'?', b'^', b'\\x', b'\xc3\xa9', b'\xc3\xa9/x',
+        b'\xe2\x80\xa8', b'\x00', b'<x', b'\x01',
+    )
+    KEPT_START = (
+        b'~', b'x+', b'x', b',', b'@', b'%', b'+', b'#', b'$', b'&', b'|', b'!', b'{', b'}',
+        b'\\', b'.', b'-', b'_', b'\xc3\xa9', b'*', b'?', b'^', b';', b')', b']', b'>',
+        b'/', b'a.', b'\x00', b'\xe2\x80\xa8', b'a,', b'1',
+    )
+
+    def patched(self):
         module = load_script_module()
         module.ROOT = Path('/mnt/x/repo')
         module.FIX = module.ROOT / '.local-runs' / 'cert-3607-fixtures'
-        module.HOME = home
+        module.HOME = '/home/a'
         return module
 
-    def test_home_terminator_table(self):
-        module = self.patched('/home/a')
-        rewritten = [
-            (b'/home/a', b'<home>'), (b'/home/a/x', b'<home>/x'), (b'"/home/a"', b'"<home>"'),
-            (b"'/home/a'", b"'<home>'"), (b'/home/a)', b'<home>)'), (b'(/home/a)', b'(<home>)'),
-            (b'[/home/a]', b'[<home>]'), (b'{/home/a}', b'{<home>}'), (b'</home/a>', b'<<home>>'),
-            (b'/home/a:', b'<home>:'), (b'/home/a;', b'<home>;'), (b'/home/a ', b'<home> '),
-            (b'/home/a\n', b'<home>\n'), (b'/home/a\t', b'<home>\t'), (b'`/home/a`', b'`<home>`'),
-            (b'HOME=/home/a:/bin', b'HOME=<home>:/bin'), (b'/home/a.', b'<home>.'),
-            (b'/home/a. x', b'<home>. x'), (b'/home/a.)', b'<home>.)'), (b'/home/a./x', b'<home>./x'),
-        ]
-        kept = [
-            b'/home/a+b', b'/home/a..b', b'/home/a~', b'/home/a@x', b'/home/a%20', b'/home/a=1',
-            b'/home/a#1', b'/home/a,b', b'/home/a,', b'/home/a$x', b'/home/a&b', b'/home/a|b',
-            b'/home/a!', b'/home/a(x', b'/home/a{x', b'/home/ab', b'/home/a.txt', b'/home/a.b',
-            b'/home/a_b', b'/home/a-b', b'/home/a..', b'/home/a.+', b'x/home/a',
-            b'/home/a\xc3\xa9',
-        ]
-        for raw, want in rewritten:
-            with self.subTest(raw=raw):
-                self.assertEqual(module.sanitize(raw), want)
-        for raw in kept:
-            with self.subTest(raw=raw):
-                self.assertEqual(module.sanitize(raw), raw)
+    def test_rewrite_table_for_every_root(self):
+        module = self.patched()
+        for name, path, label, _ in self.ROOTS:
+            for template in self.REWRITTEN:
+                with self.subTest(root=name, raw=template):
+                    raw = template.replace(b'{P}', path)
+                    want = template.replace(b'{P}', label)
+                    self.assertEqual(module.sanitize(raw), want)
 
-    def test_repo_and_fixture_paths_use_the_same_terminators(self):
-        module = self.patched('/home/a')
-        fix = b'/mnt/x/repo/.local-runs/cert-3607-fixtures'
-        self.assertEqual(module.sanitize(b'/mnt/x/repo+b /mnt/x/repo@x /mnt/x/repo)'),
-                         b'/mnt/x/repo+b /mnt/x/repo@x <repo-root>)')
-        label = b'<repo-root>/.local-runs/cert-3607-fixtures'
-        self.assertEqual(module.sanitize(fix + b'+x ' + fix + b'/k "' + fix + b'"'),
-                         label + b'+x ' + label + b'/k "' + label + b'"')
-        self.assertEqual(module.sanitize(b'/mnt/x/repo/.local-runs/cert-3607-fixtures2'),
-                         b'<repo-root>/.local-runs/cert-3607-fixtures2')
+    def test_end_boundary_kept_table_for_every_root(self):
+        module = self.patched()
+        for name, path, _, after_root in self.ROOTS:
+            for suffix in self.KEPT_END:
+                with self.subTest(root=name, suffix=suffix):
+                    self.assertEqual(module.sanitize(path + suffix), after_root + suffix)
 
-    def test_docstring_documents_the_terminator_set(self):
+    def test_start_boundary_kept_table_for_every_root(self):
+        module = self.patched()
+        for name, path, _, _ in self.ROOTS:
+            for prefix in self.KEPT_START:
+                for tail in (b'', b'/x', b' y'):
+                    with self.subTest(root=name, prefix=prefix, tail=tail):
+                        raw = prefix + path + tail
+                        self.assertEqual(module.sanitize(raw), raw)
+
+    def test_reviewer_shapes_for_every_root(self):
+        module = self.patched()
+        for name, path, label, after_root in self.ROOTS:
+            with self.subTest(root=name):
+                self.assertEqual(module.sanitize(path + b'./x'), after_root + b'./x')
+                self.assertEqual(module.sanitize(b'~' + path + b'/x'), b'~' + path + b'/x')
+                self.assertEqual(module.sanitize(b'x+' + path + b'/x'), b'x+' + path + b'/x')
+                self.assertEqual(module.sanitize(b',' + path), b',' + path)
+                self.assertEqual(module.sanitize(b'@' + path), b'@' + path)
+                self.assertEqual(module.sanitize(b'%' + path), b'%' + path)
+                self.assertEqual(module.sanitize(path), label)
+                self.assertEqual(module.sanitize(path + b'/x'), label + b'/x')
+                self.assertEqual(module.sanitize(b'"' + path + b'"'), b'"' + label + b'"')
+                self.assertEqual(module.sanitize(b'(' + path + b')'), b'(' + label + b')')
+                self.assertEqual(module.sanitize(b'=' + path), b'=' + label)
+                self.assertEqual(module.sanitize(path + b'.'), label + b'.')
+
+    def test_two_paths_in_one_line_are_each_decided_on_their_own(self):
+        module = self.patched()
+        self.assertEqual(module.sanitize(b'/home/a,/home/a x/home/a /home/a'),
+                         b'<home>,/home/a x/home/a <home>')
+
+    def test_docstring_describes_an_explicit_allowlist(self):
         module = load_script_module()
         doc = ' '.join(module.sanitize.__doc__.split())
-        self.assertIn('terminator', doc)
+        self.assertIn('BOTH ends', doc)
+        self.assertIn('explicit allowlist of delimiter characters', doc)
+        self.assertIn('not a list of illegal filename bytes', doc)
+        self.assertIn('Start boundary', doc)
+        self.assertIn('End boundary', doc)
         self.assertIn('comma', doc)
+        source = (REPO / 'scripts' / SCRIPT_NAME).read_text()
+        self.assertNotIn('legal filename character', source)
 
 
-class PublicFileMode7536(SymlinkBase):
-    """#7536: evidence and fixture files are created 0644 and are never world-writable."""
+def walk_modes(base):
+    """(files, dirs) under base as {relative path: permission bits}, without following links."""
+    files, dirs = {}, {}
+    for path in sorted(base.rglob('*')):
+        mode = path.lstat().st_mode
+        rel = str(path.relative_to(base))
+        if path.is_symlink():
+            continue
+        (dirs if path.is_dir() else files)[rel] = mode & 0o777
+    return files, dirs
 
-    def test_public_mode_has_no_group_or_world_write_bit(self):
+
+class EvidenceModes7568(SymlinkBase):
+    """#7568 #7569: the bundle is local operator evidence: every file the script creates is
+    0600 and every directory it creates is 0700, whatever the umask."""
+
+    UMASKS = (0, 0o022, 0o077)
+
+    def test_public_file_mode_is_gone_and_the_file_mode_is_owner_only(self):
         module = load_script_module()
-        self.assertEqual(module.PUBLIC_FILE_MODE, 0o644)
-        self.assertEqual(module.PUBLIC_FILE_MODE & 0o022, 0)
+        self.assertFalse(hasattr(module, 'PUBLIC_FILE_MODE'))
+        self.assertEqual(module.FILE_MODE, 0o600)
+        text = (REPO / 'scripts' / SCRIPT_NAME).read_text()
+        self.assertNotIn('0o644', text)
+        self.assertNotIn('PUBLIC_FILE_MODE', text)
 
-    def test_default_write_is_not_writable_by_others_under_umask_zero(self):
+    def test_write_file_is_0600_under_every_umask(self):
+        module = load_script_module()
+        module.ROOT = self.root
+        for umask in self.UMASKS:
+            with self.subTest(umask=oct(umask)):
+                old = os.umask(umask)
+                try:
+                    target = self.root / ('f%o' % umask)
+                    module.write_file(target, b'x')
+                finally:
+                    os.umask(old)
+                self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_whole_run_creates_only_0600_files_and_0700_dirs_under_every_umask(self):
+        for umask in self.UMASKS:
+            with self.subTest(umask=oct(umask)):
+                old = os.umask(umask)
+                try:
+                    done, _ = self.run_recapture()
+                finally:
+                    os.umask(old)
+                self.assertEqual(done.returncode, 0, done.stderr)
+                seen = 0
+                for top in ('docs', '.local-runs'):
+                    files, dirs = walk_modes(self.root / top)
+                    for rel, mode in dirs.items():
+                        seen += 1
+                        self.assertEqual(mode, 0o700, '%s/%s dir %o' % (top, rel, mode))
+                    for rel, mode in files.items():
+                        # operator.key and operator.key.pub are written by the child binary
+                        # (the stub), not by the script
+                        if rel.rsplit('/', 1)[-1].startswith('operator.key'):
+                            continue
+                        seen += 1
+                        self.assertEqual(mode, 0o600, '%s/%s file %o' % (top, rel, mode))
+                for top in ('docs', 'docs/compliance', 'docs/compliance/evidence',
+                            'docs/compliance/evidence/cert-3607', '.local-runs'):
+                    mode = (self.root / top).stat().st_mode & 0o777
+                    self.assertEqual(mode, 0o700, '%s is %o' % (top, mode))
+                self.assertGreater(seen, 15)
+                shutil.rmtree(str(self.root / 'docs'))
+                shutil.rmtree(str(self.root / '.local-runs'))
+
+    def test_a_directory_that_exists_is_not_retightened_except_the_fixtures_dir(self):
+        (self.root / 'docs').mkdir()
+        (self.root / 'docs').chmod(0o755)
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((self.root / 'docs').stat().st_mode & 0o777, 0o755)
+        self.assertEqual((self.root / 'docs' / 'compliance').stat().st_mode & 0o777, 0o700)
+
+    def test_ensure_dirs_makes_every_missing_level_0700_under_umask_zero(self):
         module = load_script_module()
         module.ROOT = self.root
         old = os.umask(0)
         self.addCleanup(os.umask, old)
-        target = self.root / 'f'
-        module.write_file(target, b'x')
-        self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+        module.ensure_dirs(self.root / 'a' / 'b' / 'c')
+        for rel in ('a', 'a/b', 'a/b/c'):
+            self.assertEqual((self.root / rel).stat().st_mode & 0o777, 0o700, rel)
 
-    def test_whole_run_under_umask_zero_writes_no_world_writable_file(self):
-        old = os.umask(0)
-        self.addCleanup(os.umask, old)
+    def test_ensure_dirs_refuses_a_symlinked_level(self):
+        module = load_script_module()
+        module.ROOT = self.root
+        outside = self.outside()
+        (self.root / 'ln').symlink_to(outside)
+        with self.assertRaises(OSError):
+            module.ensure_dirs(self.root / 'ln' / 'sub')
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_a_world_writable_existing_directory_is_refused_before_any_write(self):
+        for rel in ('.local-runs', '.local-runs/cert-3607-fixtures', 'docs/compliance/evidence/cert-3607'):
+            with self.subTest(directory=rel):
+                target = self.root / rel
+                target.mkdir(parents=True, exist_ok=True)
+                target.chmod(0o777)
+                done, _ = self.run_recapture()
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertIn('writable', done.stderr)
+                self.assertIn(rel.rsplit('/', 1)[-1], done.stderr)
+                self.assertFalse((self.root / 'docs' / 'compliance' / 'evidence' / 'cert-3607'
+                                  / 'posture-bare-env.out').exists())
+                shutil.rmtree(str(self.root / '.local-runs'), True)
+                shutil.rmtree(str(self.root / 'docs'), True)
+
+    def test_a_group_writable_existing_directory_is_accepted(self):
+        runs = self.root / '.local-runs'
+        runs.mkdir()
+        runs.chmod(0o775)
         done, _ = self.run_recapture()
         self.assertEqual(done.returncode, 0, done.stderr)
-        # operator.key and operator.key.pub are created by the child binary (the stub), not
-        # by the script, so their mode is the child's.
-        found = [p for base in (self.root / OUT_REL, self.fix()) for p in base.rglob('*')
-                 if p.is_file() and p.stat().st_mode & 0o022
-                 and not p.name.startswith('operator.key')]
-        self.assertEqual(found, [])
 
-    def test_evidence_mode_under_the_default_umask_is_unchanged(self):
-        old = os.umask(0o022)
-        self.addCleanup(os.umask, old)
+    def test_a_directory_owned_by_another_uid_is_refused(self):
+        module = load_script_module()
+        module.ROOT = self.root
+        module.LOCAL_RUNS = self.root / '.local-runs'
+        module.LOCAL_RUNS.mkdir()
+        real = os.geteuid
+        try:
+            os.geteuid = lambda: real() + 1
+            self.assertIn('owned', module.dir_problem(module.LOCAL_RUNS))
+        finally:
+            os.geteuid = real
+        self.assertIsNone(module.dir_problem(module.LOCAL_RUNS))
+        self.assertIsNone(module.dir_problem(self.root / 'absent'))
+
+    def test_docstring_states_the_modes_and_the_refusal(self):
+        module = load_script_module()
+        doc = ' '.join(module.__doc__.split())
+        self.assertIn('every file the script creates is 0600', doc)
+        self.assertIn('every directory it creates', doc)
+        self.assertIn('is 0700', doc)
+        self.assertIn('world writable or owned by another uid is refused', doc)
+
+
+class StagedBundle7574(SymlinkBase):
+    """#7574: a run never leaves a mixed bundle: the previous bundle survives a failed run
+    byte-identical and no staging directory is left."""
+
+    def evidence(self):
+        return self.root / OUT_REL
+
+    def snapshot(self):
+        return {str(p.relative_to(self.evidence())): (p.read_bytes(), p.stat().st_mode & 0o777)
+                for p in sorted(self.evidence().rglob('*')) if p.is_file()}
+
+    def make_failing_stub(self, path, marker):
+        """Prints marker in every posture leg and plants a symlink in the key dir at leg 3."""
+        head, rest = STUB.split('\n', 1)
+        hook = (
+            '\nimport os as _o, sys as _s\n'
+            'if _s.argv[1:2] == ["doctor"] and "--posture" in _s.argv:\n'
+            '    print(%r)\n'
+            'if _s.argv[1:2] == ["doctor"] and "--posture" not in _s.argv:\n'
+            '    _t = _o.path.join(_o.environ["AI_MEMORY_KEY_DIR"], "planted")\n'
+            '    if not _o.path.lexists(_t):\n'
+            '        _o.symlink("/nonexistent-7574", _t)\n' % marker)
+        path.write_text(head + hook + rest)
+        path.chmod(0o755)
+        return path
+
+    def assert_no_staging(self):
+        names = sorted(p.name for p in self.evidence().parent.iterdir())
+        self.assertEqual([n for n in names if n != 'cert-3607'], [], names)
+
+    def test_a_run_that_fails_at_leg_four_leaves_the_previous_bundle_untouched(self):
         done, _ = self.run_recapture()
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual((self.root / OUT_REL / 'posture-bare-env.out').stat().st_mode & 0o777,
-                         0o644)
+        before = self.snapshot()
+        self.assertIn('posture-sqlcipher-pass.out', before)
+        failing = self.make_failing_stub(self.root / 'failing-default', 'run-two-marker')
+        done, _ = self.run_recapture(default_bin=failing)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('symlink', done.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertNotIn(b'run-two-marker', b''.join(data for data, _ in self.snapshot().values()))
+        self.assert_no_staging()
+
+    def test_a_failed_first_run_creates_no_bundle_and_no_staging_directory(self):
+        failing = self.make_failing_stub(self.root / 'failing-default', 'run-one-marker')
+        done, _ = self.run_recapture(default_bin=failing)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertFalse(self.evidence().exists())
+        self.assert_no_staging()
+
+    def test_a_successful_run_replaces_the_bundle_and_keeps_other_files(self):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        (self.evidence() / 'SANITIZATION.md').write_bytes(b'kept\n')
+        (self.evidence() / 'sub').mkdir()
+        (self.evidence() / 'sub' / 'n.txt').write_bytes(b'nested\n')
+        (self.evidence() / 'stale.raw').write_bytes(b'raw leftover\n')
+        marker = self.make_logging_stub(self.root / 'marker-default', self.home / 'calls.log')
+        done, _ = self.run_recapture(default_bin=marker)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((self.evidence() / 'SANITIZATION.md').read_bytes(), b'kept\n')
+        self.assertEqual((self.evidence() / 'sub' / 'n.txt').read_bytes(), b'nested\n')
+        self.assertFalse((self.evidence() / 'stale.raw').exists())
+        self.assertEqual(self.evidence().stat().st_mode & 0o777, 0o700)
+        self.assert_no_staging()
+
+    def test_a_symlink_in_the_previous_bundle_is_not_copied_into_the_new_one(self):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        outside = self.outside()
+        (self.evidence() / 'leak').symlink_to(outside)
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse((self.evidence() / 'leak').exists())
+        self.assertFalse((self.evidence() / 'leak').is_symlink())
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assert_no_staging()
+
+    def test_docstring_describes_the_staging(self):
+        module = load_script_module()
+        doc = ' '.join(module.__doc__.split())
+        self.assertIn('staging directory', doc)
+        self.assertIn('never mixes legs of two runs', doc)
 
 
 class EmptyExcept7537(unittest.TestCase):
