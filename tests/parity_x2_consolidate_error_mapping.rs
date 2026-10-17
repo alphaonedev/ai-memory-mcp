@@ -54,6 +54,9 @@ fn enable_tombstone_path() {
 async fn titles_in_ns(store: &dyn MemoryStore, ctx: &CallerContext, ns: &str) -> Vec<String> {
     let mut filter = Filter::new();
     filter.namespace = Some(ns.to_string());
+    // `Filter::new()` carries limit 0, which both adapters clamp to ONE row,
+    // so without this the single-title assertions could not see a second row.
+    filter.limit = 100;
     let mut titles: Vec<String> = store
         .list(ctx, &filter)
         .await

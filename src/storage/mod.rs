@@ -10162,12 +10162,27 @@ pub fn create_link_signed_with_window(
                     timestamp: Utc::now().to_rfc3339(),
                     ..crate::signed_events::SignedEvent::default()
                 };
-                if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
-                    tracing::warn!(
-                        target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
-                        source_id, target_id, relation,
-                        "failed to append memory_link.created audit row: {e}"
-                    );
+                if conn.is_autocommit() {
+                    if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
+                        tracing::warn!(
+                            target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                            source_id, target_id, relation,
+                            "failed to append memory_link.created audit row: {e}"
+                        );
+                    }
+                } else {
+                    // #7092 — inside a caller-owned transaction (the
+                    // consolidate tombstone edge) `append_signed_event`
+                    // cannot open its own `BEGIN IMMEDIATE`: the nested
+                    // BEGIN failed and the warn-drop above lost the audit
+                    // row. Append on the caller's transaction instead and
+                    // fail CLOSED: the error unwinds the owner, so a link
+                    // never commits without its audit row. The off-table
+                    // anchor rides the owner's frame and is emitted only
+                    // after its COMMIT.
+                    let anchor = crate::signed_events::append_signed_event_no_tx(conn, &event)
+                        .context("append memory_link.created audit row in the caller transaction")?;
+                    crate::storage::escalation_deferral::defer_audit_anchor(conn, anchor);
                 }
             }
             Err(e) => {

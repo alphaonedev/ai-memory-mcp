@@ -28509,6 +28509,7 @@ impl MemoryStore for PostgresStore {
         } else {
             None
         };
+        let mut link_audit_anchor = crate::governance::audit::PendingAuditAnchor::none();
         for (id, source_cid) in ids.iter().zip(source_cids.iter()) {
             if id == &new_id {
                 continue;
@@ -28548,7 +28549,7 @@ impl MemoryStore for PostgresStore {
                 // cid mirror, and flip `lifecycle_state` to `tombstoned`.
                 // The source's own inbound provenance edges survive (no
                 // delete, no CASCADE), so multi-hop lineage stays walkable.
-                sqlx::query(
+                let edge_inserted = sqlx::query(
                     "INSERT INTO memory_links
                          (source_id, target_id, relation, created_at, valid_from,
                           attest_level, source_cid, target_cid)
@@ -28564,7 +28565,50 @@ impl MemoryStore for PostgresStore {
                 .bind(source_cid.as_deref())
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| to_store_err("consolidate insert derived_from edge", e))?;
+                .map_err(|e| to_store_err("consolidate insert derived_from edge", e))?
+                .rows_affected();
+                // #7092 — the sqlite twin appends one `memory_link.created`
+                // audit row per NEW edge inside the consolidate transaction;
+                // postgres wrote the edge with no audit row at all. Append
+                // in this same tx (fail closed: the error drops `tx`, so no
+                // summary, no edge and no audit row commit) and fold the
+                // off-table anchor into the one emitted after the COMMIT.
+                if edge_inserted > 0 {
+                    let created_at_owned = now.to_rfc3339();
+                    let created_at_str = created_at_owned.as_str();
+                    let signable = crate::identity::sign::SignableLink {
+                        src_id: &new_id,
+                        dst_id: id,
+                        relation: crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+                        observed_by: None,
+                        created_at: Some(created_at_str),
+                        valid_from: Some(created_at_str),
+                        valid_until: None,
+                    };
+                    let cbor = crate::identity::sign::canonical_cbor(&signable).map_err(|e| {
+                        StoreError::IntegrityFailed {
+                            detail: format!("consolidate link audit canonical_cbor: {e}"),
+                        }
+                    })?;
+                    let payload_hash = crate::signed_events::payload_hash(&cbor);
+                    let event_id = uuid::Uuid::new_v4().to_string();
+                    let appended = pg_append_signed_event_with_chain_in_tx(
+                        &mut tx,
+                        PgSignedEventInsert {
+                            id: &event_id,
+                            agent_id: "unknown",
+                            event_type: crate::signed_events::event_types::MEMORY_LINK_CREATED,
+                            payload_hash: &payload_hash,
+                            signature: None,
+                            attest_level: crate::models::AttestLevel::Unsigned.as_str(),
+                            timestamp: chrono::Utc::now(),
+                            cause_hash: None,
+                        },
+                    )
+                    .await
+                    .map_err(|e| to_store_err("consolidate append memory_link.created", e))?;
+                    link_audit_anchor = std::mem::take(&mut link_audit_anchor).merge(appended);
+                }
                 // #3691 — GUARDED tombstone (sqlite twin in `storage::consolidate`):
                 // a source quarantined / contaminated since the snapshot read keeps
                 // its security state; zero rows affected aborts the whole cluster
@@ -28689,7 +28733,7 @@ impl MemoryStore for PostgresStore {
             }
         }
 
-        tx.commit()
+        crate::store::postgres::pg_commit_and_emit(tx, link_audit_anchor)
             .await
             .map_err(|e| to_store_err("consolidate commit", e))?;
         Ok(new_id)
