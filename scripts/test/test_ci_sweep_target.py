@@ -840,7 +840,9 @@ class LineBreakInjectionTests(SweepTestCase):
     def test_helper_covers_a_monkeypatched_path_7297_r7(self):
         module = load_script_module()
         err = io.StringIO()
-        with mock.patch("os.path.realpath", return_value="/x\n::error::y"):
+        # CI sets GITHUB_WORKSPACE; an empty value makes the workspace check refuse.
+        with mock.patch("os.path.realpath", return_value="/x\n::error::y"), \
+                mock.patch.dict(os.environ, {"GITHUB_WORKSPACE": ""}):
             with contextlib.redirect_stderr(err):
                 code = module.main(["--target", "t", "--max-bytes", "5"])
         self.assertEqual(code, EXIT_REFUSED)
