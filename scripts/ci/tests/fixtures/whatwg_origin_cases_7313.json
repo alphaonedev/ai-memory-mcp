@@ -1107,6 +1107,91 @@
    "group": "extra",
    "input": "https://DASH.example:443/x",
    "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "https://\u0301.example/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://\u0301abc.example/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://a.\u0301b.example/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://\u0903x.example/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://\u20ddx.example/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://a\u0301.example/x",
+   "browser": "https://xn--1ca.example"
+  },
+  {
+   "group": "extra",
+   "input": "https://xn--lsa.example/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://xn--a-wbb.example/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://xn--0x-7tb/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://a.xn--lsa/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://xn--2560a.example/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://xn--a.example/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://xn--xn--256-sge/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://\u0378.example/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://a\u0378b.example/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://XN--LSA.example/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://b\u00fccher.example/x",
+   "browser": "https://xn--bcher-kva.example"
   }
  ]
 }

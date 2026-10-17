@@ -64,6 +64,14 @@ EXTRA_CASES = [
     "data:text/html,//x.example", "javascript:alert(1)", "mailto:a" + AT + "b.example", "about:blank",
     "", "   ", "#frag", "?q=1", "./x", "../x", "https://dash.example/x", "//dash.example/x",
     "https://dash.example:8443/x", "https://DASH.example:443/x",
+    # #7546: a label that starts with a combining mark, punycode that decodes to a mark / an unassigned code
+    # point / nothing valid, and control shapes the browser accepts (written as escapes: the marks are invisible)
+    "https://\u0301.example/x", "https://\u0301abc.example/x", "https://a.\u0301b.example/x",
+    "https://\u0903x.example/x", "https://\u20ddx.example/x", "https://a\u0301.example/x",
+    "https://xn--lsa.example/x", "https://xn--a-wbb.example/x", "https://xn--0x-7tb/x", "https://a.xn--lsa/x",
+    "https://xn--2560a.example/x", "https://xn--a.example/x", "https://xn--xn--256-sge/x",
+    "https://\u0378.example/x", "https://a\u0378b.example/x",
+    "https://XN--LSA.example/x", "https://b\u00fccher.example/x",
 ]
 
 ALL_CASES = [("review", v) for v in REVIEW_CASES] + [("extra", v) for v in EXTRA_CASES]
