@@ -10,7 +10,8 @@ Modelled on cert-385da3a05 (commit 9f68ea41a). Steps, each fatal on failure:
      from OUTD/evidence; removal-proof-full.log verbatim; bootstrap-cert-gate.log with the worktree path -> <repo-root>
   4. writes test-results.txt from the per-leg logs (the LAST `test result:` line of each)
   5. writes recapture-posture.py (else .sh): the tip's scripts/recapture-cert-3607-posture.py (else .sh) with only ROOT/OUT/FIX retargeted
-  6. copies --sanitization (author prose, no {{placeholders}} left)
+  6. copies --sanitization (author prose, no {{placeholders}} left) and appends one `legs.log rule:` line naming the rule
+     (CONFIG, legacy or both) that judged legs.log (#7529)
   7. leak scan: no worktree / run-dir / home / mount / scratch / tmp path and no host name in any captured file;
      recapture-posture.py (or .sh) may carry only the hits the shipped script itself carries (its *_BIN fallback lines)
   8. MANIFEST.sha256 LAST, then re-verified from disk
@@ -186,8 +187,23 @@ def check_block(lines, start, rows):
                     "(an unplanned or unfinished section, or legs out of order); re-run with a fresh --outd")
 
 
+# Which rule judged legs.log, recorded in the bundle's SANITIZATION.md so a reader knows how strictly the run was held (#7529).
+RULE_CONFIG = "CONFIG rows: every invocation held to its PLAN, its sections, its _DONE rows and its one EXIT row"
+RULE_LEGACY = "legacy (an older shared log with no per-invocation header rows): each chain section needs one green CHAIN_DONE and each leg section its own _DONE row"
+RULE_MIXED = RULE_CONFIG + "; rows before the first CONFIG row held to the legacy rule"
+
+
+class RunNotes(list):
+    """The COUNT_DIFF notes of a green legs.log (a list, as before) plus the `rule` that judged it (#7529)."""
+
+    def __init__(self, notes, rule):
+        super().__init__(notes)
+        self.rule = rule
+
+
 def check_run(outd):
-    """Refuse unless EVERY invocation of legs.log is green and complete; return its COUNT_DIFF notes.
+    """Refuse unless EVERY invocation of legs.log is green and complete; return its COUNT_DIFF notes (a RunNotes
+    list whose `.rule` names the rule that judged the log: CONFIG, legacy or both, #7529).
 
     A log written by this runner has one `CONFIG ` row per invocation, followed by its `PLAN` row; each invocation must
     show a section row and a `<LEG>_DONE aggregate_failures=0` row for every planned leg and exactly one `EXIT=0 leg=`
@@ -212,16 +228,19 @@ def check_run(outd):
     if bad:
         raise Fatal("run is not green:\n  " + "\n  ".join(bad))
     cfg = [i for i, l in enumerate(lines) if l.startswith("CONFIG ")]
+    rule = RULE_LEGACY
     if cfg:
+        rule = RULE_CONFIG
         legacy = lines[: cfg[0]]  # rows an older runner wrote before the first CONFIG row (#7488)
         if legacy:
             check_legacy(legacy, 0, chain=any(SECTION_START.match(l) for l in legacy))
+            rule = RULE_MIXED
         for start, end in zip(cfg, cfg[1:] + [len(lines)]):
             check_block(lines[start:end], start, [(i - start, k, v) for i, k, v in rows if start <= i < end])
     else:
         check_legacy(lines, 0, chain=True)
     last = max(i for i, l in enumerate(lines) if CHAIN_DONE.match(l))
-    return [l.strip() for l in lines[: last + 1] if "COUNT_DIFF" in l]
+    return RunNotes([l.strip() for l in lines[: last + 1] if "COUNT_DIFF" in l], rule)
 
 
 ANY_SECTION = re.compile(r"^(== CERT LEGS|== removal proof|== pg coverage|== bootstrap-cert-gate)")
@@ -403,7 +422,7 @@ def main():
         recap_rel, shipped, recap = recapture_copy(wt, a.tip, short)
         recap_name = "recapture-posture" + Path(recap_rel).suffix
         files[recap_name] = recap.encode()
-        files["SANITIZATION.md"] = san.encode()
+        files["SANITIZATION.md"] = (san.rstrip("\n") + f"\n\nlegs.log rule: {diffs.rule}\n").encode()
 
         pats = leak_patterns(wt, outd, unresolved=typed, config=run_paths)
         leaks = []
