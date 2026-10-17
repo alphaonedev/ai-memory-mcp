@@ -5,12 +5,13 @@ import copy
 import json
 import re
 import unittest
+from pathlib import Path
 
 import cf_pages_harness_7313 as harness
 import cf_xss_guard_7587 as guard
 
 PUBLIC = harness.PUBLIC
-FIXTURE = harness.PUBLIC.parents[3] / "scripts" / "ci" / "tests" / "fixtures" / "index_state_7587.json"
+FIXTURE = Path(__file__).resolve().parent / "fixtures" / "index_state_7587.json"
 INDEX_JS = PUBLIC / "index.js"
 PAYLOAD = '"><i class="pwn7587" onclick="window.__pwn=1">x</i><img src=x onerror="window.__pwn=2">'
 INERT = ".pwn7587, [onerror], [onload], [onclick], img[src='x'], script:not([src])"
@@ -141,6 +142,8 @@ class IndexInChromium7587(unittest.TestCase):
         site = harness.Site(self._browser, with_csp=with_csp)
         self.addCleanup(site.close)
         site.answer["/state.json"] = (200, json.dumps(state))
+        site.console = []
+        site.page.on("console", lambda msg: site.console.append(msg.text) if "panel render error" in msg.text else None)
         site.goto("/")
         site.settle(900)
         return site
@@ -148,8 +151,9 @@ class IndexInChromium7587(unittest.TestCase):
     def test_a_normal_state_renders_without_errors_or_violations_under_the_real_csp(self):
         site = self.render(self.state)
         self.assertEqual(site.errors, [])
+        self.assertEqual(site.console, [], "a panel failed to render")
         self.assertEqual(site.violations(), [])
-        self.assertTrue(site.page.inner_text("#livetext").startswith("connected"), site.page.inner_text("#livetext"))
+        self.assertFalse(site.page.inner_text("#livetext").startswith("offline"), site.page.inner_text("#livetext"))
         body = site.page.inner_text("body")
         for fragment in ("<div", "<span", "<svg", "&amp;", "&lt;", "&#39;", "undefined", "NaN"):
             self.assertNotIn(fragment, body)

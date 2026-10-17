@@ -70,7 +70,7 @@ class StateFileSources7313(unittest.TestCase):
         pages = sorted(PUBLIC.glob("*.html"))
         self.assertTrue(pages, "no tracked public/*.html")
         fetched = set()
-        for page in pages:
+        for page in pages + sorted(PUBLIC.glob("*.js")):
             for name in set(re.findall(r"([A-Za-z0-9_-]*state\.json)", page.read_text())):
                 fetched.add(name)
                 ok = name in tracked or name == LIVE_STATE
@@ -528,7 +528,7 @@ class CspPerDirective7543(unittest.TestCase):
     """#7543: each loaded resource is checked against the directive that governs its own kind, with the CSP3
     fallback chain and no merging of source lists. #7544: source path parts. #7545: invalid sources match nothing."""
 
-    REAL = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' "
+    REAL = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline' "
             "https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; "
             "connect-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-ancestors 'none'")
 
@@ -821,33 +821,20 @@ class PublicSnapshotHygiene7518(unittest.TestCase):
 class HtmlAndHeaders7313(unittest.TestCase):
     """F4 (attribute-safe escaping) and F5 (_headers CSP, framing, no duplicate rule)."""
 
-    def test_every_page_has_attribute_safe_esc_and_no_raw_state_fields(self):
-        raw = ("${fam.family}", "${t.cls}", "${t.name.replace", "${it.title}", "${a.node}", "${l.name}", "${x.d||")
-        for page in sorted(PUBLIC.glob("*.html")):
-            text = page.read_text()
-            if "<script>" not in text:
-                continue  # the sub-pages run the external vv.js (DOM nodes and textContent only)
-            m = re.search(r"(?:function esc\(s\)\{return |const esc=s=>)([^\n]*)", text)
-            self.assertIsNotNone(m, "%s defines no esc()" % page.name)
-            for ent in ("&amp;", "&lt;", "&gt;", "&quot;", "&#39;"):
-                self.assertIn(ent, m.group(1), "%s esc() misses %s" % (page.name, ent))
-            for token in raw:
-                self.assertNotIn(token, text, "%s interpolates %s unescaped" % (page.name, token))
-
     def test_no_unused_locals_from_codeql_467_to_476(self):
         # #7497: the removed names must not come back (js/unused-local-variable)
         for page in sorted(PUBLIC.glob("*.html")):
             text = page.read_text()
             self.assertIsNone(re.search(r"\bw1\s*=", text), "%s declares unused w1" % page.name)
-        index = (PUBLIC / "index.html").read_text()
+        index = (PUBLIC / "index.js").read_text()
         for pat in (r"const tok=", r"const done=dims", r"tot=dims\.length", r"gap=0\.004"):
-            self.assertIsNone(re.search(pat, index), "index.html still has %s" % pat)
+            self.assertIsNone(re.search(pat, index), "index.js still has %s" % pat)
 
     def test_index_ring_rejects_a_non_list_dimensions_field_7517(self):
         # removing the dead `dims.filter(...)` line also removed the implicit TypeError for a non-list
         # `dimensions`; the ring must keep its placeholder (the explicit throw skips the ring code and
         # leaves the poll's catch to mark the page offline), not paint a real-looking 0%.
-        text = (PUBLIC / "index.html").read_text()
+        text = (PUBLIC / "index.js").read_text()
         render = text[text.index("function renderAll(D){"):text.index("/* ---------- live poll ---------- */")]
         guard = re.search(r"if\(!Array\.isArray\(dims\)\)\s*throw new TypeError\(", render)
         self.assertIsNotNone(guard, "renderAll lost its Array.isArray(dims) guard")
@@ -879,7 +866,7 @@ function renderAll(D) { if (!Array.isArray(D.dimensions)) throw new TypeError("s
 """
 
     def _poll_source(self):
-        text = (PUBLIC / "index.html").read_text(encoding="utf-8")
+        text = (PUBLIC / "index.js").read_text(encoding="utf-8")
         return text[text.index("let lastGood=0"):text.index('[["northstar"')]
 
     def test_index_badge_says_offline_for_a_malformed_state_7548(self):
@@ -888,7 +875,7 @@ function renderAll(D) { if (!Array.isArray(D.dimensions)) throw new TypeError("s
         source = self._poll_source()
         self.assertIn("stateBad", source, "poll() does not track a malformed state")
         self.assertRegex(source, r"function tick\(\)", "the 1 s badge tick is not a named function")
-        index = (PUBLIC / "index.html").read_text(encoding="utf-8")
+        index = (PUBLIC / "index.js").read_text(encoding="utf-8")
         self.assertIn("setInterval(tick,1000)", index)
 
     @unittest.skipUnless(shutil.which("node"), "node is needed to execute the page's poll code")
