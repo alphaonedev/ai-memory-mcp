@@ -66,6 +66,11 @@ IDLE_TARGET_DAYS = 7
 FREE_FLOOR_GIB = 200
 BYTES_PER_GIB = 1024 ** 3
 BUSY_MTIME_MINUTES = 30
+# #7294: the strict busy walk runs under the eviction lock, which a job start
+# waits for at most shared.JOB_START_LOCK_TIMEOUT_SECS before proceeding without
+# it. The walk is cut off sooner, so the lock hold is below that timeout by
+# construction; a cut-off walk counts as busy.
+EVICT_BUSY_WALK_DEADLINE_SECS = 30
 # #7292: under the eviction lock a target is renamed to
 # <root>/.evicting-<name>-<pid> and deleted there; a leftover of a killed
 # eviction is swept once its mtime is older than BUSY_MTIME_MINUTES.
@@ -313,7 +318,7 @@ class WalkIncomplete(RuntimeError):
     """A strict walk stopped at WALK_ENTRY_CAP before it saw every entry."""
 
 
-def newest_mtime(path, newer_than=None, max_entries=None, strict=False):
+def newest_mtime(path, newer_than=None, max_entries=None, strict=False, deadline=None):
     """Newest mtime under ``path`` (symlinks never followed, only lstat'd).
 
     With ``newer_than`` the walk stops early and returns as soon as one entry
@@ -323,6 +328,9 @@ def newest_mtime(path, newer_than=None, max_entries=None, strict=False):
     ``strict`` (#7289) is for the busy check: an unreadable directory or entry
     re-raises the OSError, and a walk that reaches ``max_entries`` raises
     WalkIncomplete, so the caller can treat an unknown state as busy.
+
+    ``deadline`` (#7294) is an absolute ``time.monotonic()`` value; a walk that
+    reaches it raises WalkIncomplete.
     """
     newest = os.lstat(path).st_mtime
     if newer_than is not None and newest > newer_than:
@@ -340,6 +348,8 @@ def newest_mtime(path, newer_than=None, max_entries=None, strict=False):
             continue  # unreadable directory: skip it, the caller treats the rest as is
         for entry in entries:
             seen += 1
+            if deadline is not None and time.monotonic() >= deadline:
+                raise WalkIncomplete("walk of %s passed its deadline" % path)
             if max_entries is not None and seen > max_entries:
                 if strict:
                     raise WalkIncomplete("more than %d entries under %s" % (max_entries, path))
@@ -392,6 +402,8 @@ def sweep_stale_evicting(base, now, dry_run=False):
         try:
             if entry.is_symlink() or not entry.is_dir() or entry.lstat().st_mtime > cutoff:
                 continue
+            if shared.marker_is_fresh(entry, now):
+                continue  # #7293: a live target must never be swept
             if dry_run:
                 print("would sweep stale %s" % entry)
                 continue
@@ -440,7 +452,8 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
             if shared.marker_is_fresh(path, now):
                 return True
             return newest_mtime(
-                path, newer_than=busy_cutoff, max_entries=WALK_ENTRY_CAP, strict=True) > busy_cutoff
+                path, newer_than=busy_cutoff, max_entries=WALK_ENTRY_CAP, strict=True,
+                deadline=time.monotonic() + EVICT_BUSY_WALK_DEADLINE_SECS) > busy_cutoff
         except (OSError, RuntimeError):
             return True
 
@@ -472,6 +485,12 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
                 state["busy"] += 1
                 print("skipped busy %s" % path)
                 return
+            # #7294: a marker written since the walk began (a job start that gave
+            # up on the lock) is seen here, immediately before the rename.
+            if shared.marker_is_fresh(path, now):
+                state["busy"] += 1
+                print("skipped busy %s" % path)
+                return
             try:
                 os.rename(path, renamed)
                 os.utime(renamed)
@@ -500,6 +519,14 @@ def evict_idle_targets(evict_root, runner_name, home, idle_days, floor_gib, now,
             remove(entry, "idle over %d days" % idle_days)
         else:
             remaining.append(entry)
+        if state["lock_timeout"]:
+            break
+    if state["lock_timeout"]:
+        # #7295: eviction was skipped; rank no sibling and do not blame the floor.
+        print("eviction summary: %d evicted, %d failed, %d busy skipped, "
+              "eviction skipped: lock not taken" % (
+                  state["evicted"], state["failed"], state["busy"]))
+        return EXIT_OK
     if free_bytes(base) < floor_bytes:
         ranked = []
         for entry in remaining:
