@@ -59,6 +59,12 @@ fn wait_for_rows(path: &std::path::Path, want: usize) -> Vec<ai_memory::subscrip
     }
 }
 
+/// The durable DLQ rows right now (no waiting).
+fn durable_rows(path: &std::path::Path) -> Vec<ai_memory::subscriptions::DlqEntry> {
+    let conn = ai_memory::db::open(path).expect("open for read");
+    list_dlq(&conn, None).expect("list_dlq")
+}
+
 fn faulted_db(dir: &tempfile::TempDir) -> (std::path::PathBuf, rusqlite::Connection) {
     let path = dir.path().join("dispatch.db");
     let conn = ai_memory::db::open(&path).expect("open");
@@ -94,6 +100,18 @@ fn a_sqlite_lookup_failure_leaves_a_durable_dlq_record_7366() {
         "dispatch must not sleep the ladder while the caller holds the lock; took {returned_after:?}"
     );
 
+    // #7498: the durable record exists the moment the call returns, BEFORE the
+    // detached ladder runs, so a process exit in the ~6 s window loses nothing.
+    let at_return = durable_rows(&path);
+    assert_eq!(
+        at_return.len(),
+        1,
+        "the record must exist when the dispatch call returns (before the ladder), got {at_return:?}"
+    );
+    // Let the exhausted ladder finish: it must leave the single record in place.
+    std::thread::sleep(
+        (ladder_floor() + Duration::from_secs(1)).saturating_sub(started.elapsed()),
+    );
     let rows = wait_for_rows(&path, 1);
     let elapsed = started.elapsed();
     assert_eq!(
@@ -135,6 +153,42 @@ fn a_sqlite_lookup_failure_leaves_a_durable_dlq_record_7366() {
     assert!(
         !ai_memory::subscriptions::scan_failure::scan_failure_visible_to(row, &other),
         "another caller must not see the writer's record"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CELL E — #7498: a recovery on the LAST retry removes the record.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e_sqlite_recovery_on_the_last_retry_removes_the_record_7498() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("recover.db");
+    let conn = ai_memory::db::open(&path).expect("open");
+    conn.execute_batch("ALTER TABLE subscriptions RENAME TO subscriptions_held;")
+        .expect("hide subscriptions to inject the lookup fault");
+
+    let started = Instant::now();
+    dispatch_event_with_details(&conn, EVENT, MEMORY_ID, NAMESPACE, None, &path, None);
+    let at_return = durable_rows(&path).len();
+    assert_eq!(at_return, 1, "the record exists when the call returns");
+
+    // Heal the table just before the LAST retry (the ladder floor is the
+    // time of the final attempt).
+    let heal_at = ladder_floor().saturating_sub(Duration::from_millis(700));
+    std::thread::sleep(heal_at.saturating_sub(started.elapsed()));
+    conn.execute_batch("ALTER TABLE subscriptions_held RENAME TO subscriptions;")
+        .expect("heal subscriptions");
+
+    let deadline = Instant::now() + ladder_floor() + Duration::from_secs(20);
+    let mut left = durable_rows(&path).len();
+    while left != 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+        left = durable_rows(&path).len();
+    }
+    assert_eq!(
+        left, 0,
+        "a retry that recovers must delete the durable record it replaces"
     );
 }
 
@@ -255,6 +309,9 @@ mod postgres_funnel {
     struct LookupFaultStore {
         inner: SqliteStore,
         scans: AtomicUsize,
+        /// The 1-based scan number from which the lookup succeeds again
+        /// (`usize::MAX` = never recovers).
+        recover_at: usize,
     }
 
     #[async_trait::async_trait]
@@ -288,7 +345,10 @@ mod postgres_funnel {
             _prefix: &str,
             _limit: usize,
         ) -> StoreResult<Vec<Memory>> {
-            self.scans.fetch_add(1, Ordering::SeqCst);
+            let n = self.scans.fetch_add(1, Ordering::SeqCst) + 1;
+            if n >= self.recover_at {
+                return Ok(Vec::new());
+            }
             Err(StoreError::BackendUnavailable {
                 backend: "postgres".to_string(),
                 sqlstate: Some("XX000".to_string()),
@@ -381,6 +441,7 @@ mod postgres_funnel {
         let double = Arc::new(LookupFaultStore {
             inner,
             scans: AtomicUsize::new(0),
+            recover_at: usize::MAX,
         });
         let (state, sqlite_path) = make_state(double.clone());
 
@@ -394,7 +455,27 @@ mod postgres_funnel {
             Some(serde_json::json!({"note": "details-survive"})),
         )
         .await;
+        let returned_after = started.elapsed();
+        // #7500: the ladder pauses must not run on the request future.
+        assert!(
+            returned_after < ladder_floor(),
+            "the postgres dispatch must not sleep the ladder on the request future; took {returned_after:?}"
+        );
+        // #7499: the record exists when the call returns.
+        assert_eq!(
+            durable_rows(&sqlite_path).len(),
+            1,
+            "the record must exist when the dispatch call returns"
+        );
+        // The detached worker finishes the ladder: 1 + RETRY_BACKOFFS.len() scans.
+        let deadline = Instant::now() + ladder_floor() + Duration::from_secs(20);
+        while double.scans.load(Ordering::SeqCst) < RETRY_BACKOFFS.len() + 1
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         let elapsed = started.elapsed();
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         let conn = ai_memory::db::open(&sqlite_path).expect("reopen audit db");
         let rows = list_dlq(&conn, None).expect("list_dlq");
@@ -421,6 +502,82 @@ mod postgres_funnel {
         );
     }
 
+    fn faulted(recover_at: usize) -> (Arc<LookupFaultStore>, AppState, std::path::PathBuf) {
+        let store_dir = tempfile::tempdir().expect("store tempdir");
+        let inner = SqliteStore::open(store_dir.path().join("store.db")).expect("open store");
+        std::mem::forget(store_dir);
+        let double = Arc::new(LookupFaultStore {
+            inner,
+            scans: AtomicUsize::new(0),
+            recover_at,
+        });
+        let (state, path) = make_state(double.clone());
+        (double, state, path)
+    }
+
+    /// #7499: a cancelled request future (client disconnect, handler
+    /// timeout) must still leave exactly one durable record.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn f_postgres_cancelled_request_future_still_leaves_one_record_7499() {
+        let (_double, state, path) = faulted(usize::MAX);
+        let _ = tokio::time::timeout(
+            Duration::from_millis(500),
+            dispatch_event_postgres(&state, EVENT, MEMORY_ID, NAMESPACE, Some(WRITER), None),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let rows = durable_rows(&path);
+        assert_eq!(
+            rows.len(),
+            1,
+            "a cancelled dispatch future must still leave one durable record, got {rows:?}"
+        );
+    }
+
+    /// #7498 (postgres funnel): recovery on the LAST retry deletes the record.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn g_postgres_recovery_on_the_last_retry_removes_the_record_7498() {
+        // Scan 1 + one per backoff step; the final scan succeeds.
+        let (double, state, path) = faulted(RETRY_BACKOFFS.len() + 1);
+        dispatch_event_postgres(&state, EVENT, MEMORY_ID, NAMESPACE, Some(WRITER), None).await;
+        assert_eq!(
+            durable_rows(&path).len(),
+            1,
+            "the record exists when the call returns"
+        );
+        let deadline = Instant::now() + ladder_floor() + Duration::from_secs(20);
+        while Instant::now() < deadline
+            && (double.scans.load(Ordering::SeqCst) < RETRY_BACKOFFS.len() + 1
+                || !durable_rows(&path).is_empty())
+        {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            durable_rows(&path).len(),
+            0,
+            "a retry that recovers must delete the durable record it replaces"
+        );
+    }
+
+    /// #7500: three committed rows (a bulk write) must not run the ladder
+    /// three times in sequence on the request future.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn h_postgres_bulk_of_three_returns_well_under_one_ladder_7500() {
+        let (_double, state, path) = faulted(usize::MAX);
+        let started = Instant::now();
+        for i in 0..3 {
+            let id = format!("{MEMORY_ID}-{i}");
+            dispatch_event_postgres(&state, EVENT, &id, NAMESPACE, Some(WRITER), None).await;
+        }
+        let took = started.elapsed();
+        eprintln!("7500 measured: 3 rows dispatched in {took:?} (ladder floor {:?})", ladder_floor());
+        assert!(
+            took < ladder_floor() / 4,
+            "3 postgres dispatches must return well under one ladder; took {took:?}"
+        );
+        assert_eq!(durable_rows(&path).len(), 3, "each failed row has its record");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn d_postgres_inventing_namespaces_cannot_exceed_the_total_cap_7430() {
         let store_dir = tempfile::tempdir().expect("store tempdir");
@@ -428,6 +585,7 @@ mod postgres_funnel {
         let double = Arc::new(LookupFaultStore {
             inner,
             scans: AtomicUsize::new(0),
+            recover_at: usize::MAX,
         });
         let (state, sqlite_path) = make_state(double);
         let conn = ai_memory::db::open(&sqlite_path).expect("open audit db");
