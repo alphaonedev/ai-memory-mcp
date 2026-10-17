@@ -203,9 +203,11 @@ def parse_target_line(line: str) -> List[str]:
 def template_name(db_name: str) -> str:
     """``<db>_tpl``. A name too long to take the suffix is refused, never
     truncated: truncation maps two different names onto one template (#7127)."""
-    if len(db_name.encode('utf-8')) + len(TEMPLATE_SUFFIX) > IDENT_MAX:
-        raise WrapperError('refusing database name %r: %s would exceed %d bytes and be truncated onto '
-                           'another template' % (db_name, TEMPLATE_SUFFIX, IDENT_MAX))
+    size = len(db_name.encode('utf-8'))
+    if size + len(TEMPLATE_SUFFIX) > IDENT_MAX:
+        raise WrapperError('database name %r is %d bytes; with %s the template name would exceed the %d-byte '
+                           'identifier limit and be truncated onto another template'
+                           % (db_name, size, TEMPLATE_SUFFIX, IDENT_MAX))
     return db_name + TEMPLATE_SUFFIX
 
 
