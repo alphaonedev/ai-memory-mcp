@@ -664,13 +664,27 @@ impl MemoryStore for SqliteStore {
                 // #2110 — same authenticated-origin why_trace stamp `store`
                 // applies, so a batch write and a single write are governed
                 // identically.
-                if ctx.bypass_visibility {
+                // #7099 — the slot admission runs as THIS caller (as `store`
+                // does, #3696), so a `(title, namespace)` holder the caller
+                // cannot read is refused instead of overwritten, and the
+                // typed `ConflictError` maps to `StoreError::Conflict`
+                // (empty id for a hidden holder) like the postgres twin
+                // rather than flattening to `Backend`.
+                let inserted = if ctx.bypass_visibility {
                     let mut stamped = memory.clone();
                     crate::storage::stamp_substrate_why_trace(&mut stamped.metadata);
-                    ids.push(db::insert(&conn, &stamped).map_err(box_err)?);
+                    db::insert(&conn, &stamped)
                 } else {
-                    ids.push(db::insert(&conn, memory).map_err(box_err)?);
-                }
+                    db::insert_as(&conn, memory, Some(ctx.agent_id.as_str()))
+                };
+                ids.push(inserted.map_err(|e| {
+                    match e.downcast_ref::<crate::storage::ConflictError>() {
+                        Some(c) => StoreError::Conflict {
+                            id: c.existing_id.clone(),
+                        },
+                        None => box_err(e),
+                    }
+                })?);
             }
             // #7090 — record the quota in the SAME transaction, so a batch
             // that rolls back charges nothing (postgres parity).
