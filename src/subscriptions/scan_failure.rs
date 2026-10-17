@@ -49,6 +49,11 @@ pub const SCAN_FAILURE_MAX_PER_NAMESPACE: i64 = 1_000;
 /// the total.
 pub const SCAN_FAILURE_MAX_TOTAL: i64 = super::MAX_SUBSCRIPTION_DLQ_ROWS;
 
+/// Most failed-lookup rows one writer (`agent_id`; every anonymous writer
+/// shares one bucket) may retain across ALL its namespaces (#7503). Below the
+/// total cap, so one writer inventing namespaces cannot starve another tenant.
+pub const SCAN_FAILURE_MAX_PER_WRITER: i64 = 2_500;
+
 /// Most detached sqlite lookup-retry workers alive at once (#7410). Past it a
 /// failure is recorded at once, without the ladder, instead of spawning.
 pub const MAX_BACKGROUND_LOOKUP_RETRIES: usize = 32;
@@ -527,7 +532,11 @@ fn insert_capped(
          SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7 \
          WHERE (SELECT COUNT(*) FROM subscription_dlq WHERE subscription_id = ?1) < ?8 \
            AND (SELECT COUNT(*) FROM subscription_dlq \
-                WHERE substr(subscription_id, 1, ?9) = ?10) < ?11",
+                WHERE substr(subscription_id, 1, ?9) = ?10) < ?11 \
+           AND (SELECT COUNT(*) FROM subscription_dlq \
+                WHERE CASE WHEN substr(subscription_id, 1, ?9) = ?10 \
+                           THEN COALESCE(json_extract(payload, '$.agent_id'), '') END \
+                      = COALESCE(json_extract(?4, '$.agent_id'), '')) < ?12",
         rusqlite::params![
             sub_id,
             correlation_id,
@@ -540,12 +549,13 @@ fn insert_capped(
             prefix_len,
             DISPATCH_SCAN_FAILED_SUB_ID,
             SCAN_FAILURE_MAX_TOTAL,
+            SCAN_FAILURE_MAX_PER_WRITER,
         ],
     )?;
     if inserted == 0 {
         crate::metrics::record_subscription_dlq_overflow();
         anyhow::bail!(
-            "failed-lookup DLQ at cap (per-namespace {SCAN_FAILURE_MAX_PER_NAMESPACE}, total {SCAN_FAILURE_MAX_TOTAL})"
+            "failed-lookup DLQ at cap (per-namespace {SCAN_FAILURE_MAX_PER_NAMESPACE}, per-writer {SCAN_FAILURE_MAX_PER_WRITER}, total {SCAN_FAILURE_MAX_TOTAL})"
         );
     }
     Ok(conn.last_insert_rowid())
