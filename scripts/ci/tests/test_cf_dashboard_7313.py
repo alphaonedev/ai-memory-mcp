@@ -989,6 +989,43 @@ function renderAll(D) { if (!Array.isArray(D.dimensions)) throw new TypeError("s
         self.assertTrue(out["recovered"].startswith("connected"), out)
         self.assertTrue(out["recoveredAfterTick"].startswith("connected"), out)
 
+    LASTUPDATED_HARNESS = """
+const els = {};
+const document = {getElementById: id => els[id] || (els[id] = {className: "", textContent: ""})};
+let nextBody = null;
+function fetch() { return Promise.resolve({ok: true, json: () => Promise.resolve(nextBody)}); }
+function renderAll(D) {}
+(async () => {
+  %(SOURCE)s
+  const out = {};
+  const snap = () => ({text: els.livetext.textContent, cls: els.livebadge.className});
+  for (const bad of ["not a date", "2026-13-45T99:99:99Z", {}, "NaN", "0000-00-00"]) {
+    nextBody = {dimensions: [], lastUpdated: bad};
+    await poll(); out[JSON.stringify(bad)] = snap();
+  }
+  nextBody = {dimensions: [], lastUpdated: new Date(Date.now() - 5000).toISOString()};
+  await poll(); out.good = snap();
+  nextBody = {dimensions: []};
+  await poll(); out.absent = snap();
+  console.log(JSON.stringify(out));
+})();
+"""
+
+    @unittest.skipUnless(shutil.which("node"), "node is needed to execute the page's poll code")
+    def test_7640_an_unparsable_lastupdated_is_a_stale_badge_never_nan(self):
+        js = self.LASTUPDATED_HARNESS % {"SOURCE": self._poll_source()}
+        done = subprocess.run(["node", "-"], input=js, capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        out = json.loads(done.stdout)
+        for key, snap in out.items():
+            self.assertNotIn("NaN", snap["text"], key)
+            self.assertNotIn("undefined", snap["text"], key)
+        for key in [k for k in out if k not in ("good", "absent")]:
+            self.assertEqual(out[key]["text"], "stale \u00b7 state time unknown", key)
+            self.assertIn("stale", out[key]["cls"], key)
+        self.assertTrue(out["good"]["text"].startswith("connected"), out["good"])
+        self.assertTrue(out["absent"]["text"].startswith("connected"), out["absent"])
+
     def test_headers_csp_matches_loaded_origins(self):
         headers = (PUBLIC / "_headers").read_text()
         self.assertIsNotNone(re.search(r"Content-Security-Policy: (.*)", headers), "no Content-Security-Policy")
@@ -1028,6 +1065,132 @@ function renderAll(D) { if (!Array.isArray(D.dimensions)) throw new TypeError("s
                     if not any(origin_mod.source_allows(value, ld.origin, ld.path) for ld in users):
                         unused.append((name, value))
         self.assertEqual(unused, [], "CSP allows origins no resource of that directive uses")
+
+
+VV_JS = PUBLIC / "vv.js"
+MCP_SNAPSHOT = PUBLIC / "mcp-tools-state.json"
+MCP_CLASSES = REPO / "scripts" / "evidence" / "mcp-tools-classes.json"
+TOOL_CLASSES = {"validated", "failclosed", "refining"}
+
+
+class McpToolsState7644(unittest.TestCase):
+    """#7644: the committed mcp-tools snapshot is the OFFICIAL producer's output (groups, run_id, source_commit),
+    the page renders that shape, and vv.js derives pct from the counts when the state has none (index.js:555)."""
+
+    VV_HARNESS = """
+const els = {};
+class El {
+  constructor(){ this.children = []; this.style = {}; this.className = ""; this.textContent = ""; this.listeners = {}; }
+  appendChild(c){ this.children.push(c); return c; }
+  addEventListener(){} setAttribute(){} getAttribute(){ return "x-state.json"; } prepend(){}
+  closest(){ return this; } classList = {toggle(){}, remove(){}};
+}
+const document = {
+  body: new El(),
+  getElementById: id => els[id] || (els[id] = new El()),
+  createElement: () => new El(),
+  querySelectorAll: () => [],
+  addEventListener(){},
+  fullscreenElement: null,
+};
+document.body.getAttribute = () => "x-state.json";
+const setInterval = () => 0;
+let body = null;
+const fetch = () => Promise.resolve({ok: true, json: () => Promise.resolve(body)});
+const out = {};
+(async () => {
+  for (const [key, b] of Object.entries(%(CASES)s)) {
+    body = b; els.pct = new El();
+    (function(){ %(SOURCE)s })();
+    await new Promise(r => setTimeout(r, 20));
+    out[key] = els.pct.textContent;
+  }
+  console.log(JSON.stringify(out));
+})();
+"""
+
+    def _producer(self):
+        spec = importlib.util.spec_from_file_location("mcp_tools_state_7644", MCP_PRODUCER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _run_producer(self, tools, classes=None):
+        mod = self._producer()
+        SCRATCH.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(SCRATCH)) as tmp:
+            run_dir = Path(tmp) / "run-a"
+            run_dir.mkdir()
+            (run_dir / "tools-list.json").write_text(json.dumps(tools))
+            argv = ["mcp-tools-state.py", "--run-dir", str(run_dir), "--out", str(Path(tmp) / "o" / "s.json")]
+            if classes is not None:
+                (Path(tmp) / "classes.json").write_text(json.dumps(classes))
+                argv += ["--classes", str(Path(tmp) / "classes.json")]
+            with mock.patch.object(mod, "git", return_value="a" * 40), \
+                    mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(mod.main(), 0)
+            return json.loads((Path(tmp) / "o" / "s.json").read_text(encoding="utf-8"))
+
+    def test_7644_producer_emits_groups_with_run_id_and_source_commit(self):
+        tools = [{"name": "memory_skill_get", "description": "Get a skill. More text follows."},
+                 {"name": "memory_skill_list", "description": "List skills"},
+                 {"name": "memory_store", "description": "Store a memory"},
+                 {"name": "memory_atomise", "description": "Atomise"}]
+        rec = self._run_producer(tools, {"failclosed": {"memory_skill_get": "skill not found"},
+                                         "refining": {"memory_atomise": "memory not found"}})
+        self.assertEqual((rec["total"], rec["validated"], rec["failclosed"], rec["refining"], rec["functional"]),
+                         (4, 2, 1, 1, 3))
+        self.assertEqual(rec["source_commit"], "a" * 40)
+        self.assertTrue(rec["run_id"])
+        self.assertNotIn("pct", rec)
+        groups = {g["family"]: g["tools"] for g in rec["groups"]}
+        self.assertEqual(sorted(groups), ["atomise", "skill", "store"])
+        get = [t for t in groups["skill"] if t["name"] == "memory_skill_get"][0]
+        self.assertEqual((get["cls"], get["status"], get["desc"], get["note"]),
+                         ("failclosed", "refusal", "Get a skill", "skill not found"))
+        self.assertEqual(groups["atomise"][0]["cls"], "refining")
+        self.assertEqual(groups["store"][0]["cls"], "validated")
+
+    def test_7644_committed_snapshot_is_the_producer_output_the_page_can_render(self):
+        rec = json.loads(MCP_SNAPSHOT.read_text(encoding="utf-8"))
+        self.assertEqual(rec["producer_id"], "mcp-tools-state")
+        self.assertRegex(rec["source_commit"], r"^[0-9a-f]{40}$")
+        self.assertTrue(rec["run_id"])
+        self.assertIsNotNone(rec.get("lastUpdated"))
+        self.assertNotIn("pct", rec, "the producer never emits pct; the page derives it from the counts")
+        tools = [t for g in rec["groups"] for t in g["tools"]]
+        self.assertEqual(len(tools), rec["total"])
+        self.assertEqual(sorted(t["name"] for t in tools), rec["names"])
+        self.assertEqual({t["cls"] for t in tools} - TOOL_CLASSES, set(), "a class the page has no CSS for")
+        counts = {c: len([t for t in tools if t["cls"] == c]) for c in TOOL_CLASSES}
+        self.assertEqual((counts["validated"], counts["failclosed"], counts["refining"]),
+                         (rec["validated"], rec["failclosed"], rec["refining"]))
+        self.assertEqual(rec["functional"], rec["total"] - rec["refining"])
+        page = (PUBLIC / "mcp-tools.html").read_text(encoding="utf-8")
+        for cls in TOOL_CLASSES:
+            self.assertIn(".tool.%s" % cls, page)
+
+    def test_7644_the_classes_file_names_only_captured_tools(self):
+        classes = json.loads(MCP_CLASSES.read_text(encoding="utf-8"))
+        names = set(json.loads(MCP_SNAPSHOT.read_text(encoding="utf-8"))["names"])
+        for key in ("failclosed", "refining"):
+            self.assertLessEqual(set(classes[key]), names, key)
+        self.assertFalse(set(classes["failclosed"]) & set(classes["refining"]))
+
+    @unittest.skipUnless(shutil.which("node"), "node is needed to execute vv.js")
+    def test_7644_vv_js_derives_pct_from_the_counts_like_index_js(self):
+        cases = {"derived": {"total": 100, "validated": 70, "failclosed": 25, "refining": 5, "groups": []},
+                 "explicit": {"total": 100, "validated": 70, "failclosed": 25, "pct": 50, "groups": []},
+                 "nototal": {"validated": 1, "failclosed": 1, "groups": []},
+                 "zero": {"total": 0, "validated": 0, "failclosed": 0, "groups": []}}
+        js = self.VV_HARNESS % {"CASES": json.dumps(cases), "SOURCE": VV_JS.read_text(encoding="utf-8")}
+        done = subprocess.run(["node", "-"], input=js, capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        out = json.loads(done.stdout)
+        self.assertEqual(out["derived"], "95")
+        self.assertEqual(out["explicit"], "50")
+        self.assertEqual(out["nototal"], "\u2014")
+        self.assertEqual(out["zero"], "\u2014")
 
 
 class DeployCli7313(unittest.TestCase):
