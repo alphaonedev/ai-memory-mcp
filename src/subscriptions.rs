@@ -35,11 +35,10 @@ use crate::models::field_names;
 pub mod audit_status;
 // #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
 mod unstarted;
-// #7366 - a failed subscriber lookup is retried, then recorded to the DLQ.
 mod scan_failure;
 pub use scan_failure::{
-    DISPATCH_SCAN_FAILED_SUB_ID, ScanFailure, classify_sqlite_error, classify_sqlstate,
-    record_dispatch_scan_failure, retry_lookup, retry_lookup_async, scan_failure_visible_to,
+    DISPATCH_SCAN_FAILED_SUB_ID, ScanFailure, classify_sqlstate, is_scan_failure_sub_id,
+    record_dispatch_scan_failure, retry_lookup_async, scan_failure_sub_id, scan_failure_visible_to,
 };
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::str::FromStr;
@@ -965,6 +964,23 @@ pub fn dispatch_event_with_details(
     db_path: &std::path::Path,
     details: Option<serde_json::Value>,
 ) {
+    dispatch_inner(
+        conn, event, memory_id, namespace, agent_id, db_path, details, false,
+    );
+}
+
+/// Body of the dispatcher; `retried` marks the off-lock retry worker (#7410).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_inner(
+    conn: &Connection,
+    event: &str,
+    memory_id: &str,
+    namespace: &str,
+    agent_id: Option<&str>,
+    db_path: &std::path::Path,
+    details: Option<serde_json::Value>,
+    retried: bool,
+) {
     // Dispatch path needs the global view (every tenant's subscriptions
     // for this event), so `None` here is correct — ownership scoping
     // would silently drop matching subscribers belonging to OTHER
@@ -979,28 +995,18 @@ pub fn dispatch_event_with_details(
     // filter moves into SQL. At 100 subscribers the write-event
     // fanout cost drops from O(N) to whatever fraction actually
     // subscribes to the fired event type.
-    let subs = match retry_lookup(RETRY_BACKOFFS, || list_by_event(conn, event)) {
+    let subs = match list_by_event(conn, event) {
         Ok(s) => s,
         Err(e) => {
-            // v1.0.0 #7366: the lookup failed on every attempt of the
-            // RETRY_BACKOFFS ladder. Dropping the event here lost it with no
-            // durable record; record it to the DLQ for re-dispatch instead.
-            let class = classify_sqlite_error(&e);
-            tracing::warn!(
-                error_class = class,
-                "subscription list failed during dispatch: {e}"
-            );
-            record_dispatch_scan_failure(
-                db_path,
-                &ScanFailure {
-                    event,
-                    memory_id,
-                    namespace,
-                    agent_id,
-                    details: details.as_ref(),
-                },
-                class,
-            );
+            // #7366/#7410: never drop the event; retries run off-lock.
+            let failure = ScanFailure {
+                event,
+                memory_id,
+                namespace,
+                agent_id,
+                details: details.as_ref(),
+            };
+            scan_failure::on_sqlite_lookup_failure(&e, retried, db_path, &failure);
             return;
         }
     };

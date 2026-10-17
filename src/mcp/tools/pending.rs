@@ -189,7 +189,7 @@ pub fn handle_subscription_dlq_list(
 
     let rows_all = crate::subscriptions::list_dlq(conn, subscription_id)
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resolve_agent_id", e))?;
-    let rows: Vec<_> = if subscription_id == Some(crate::subscriptions::DISPATCH_SCAN_FAILED_SUB_ID)
+    let rows: Vec<_> = if subscription_id.is_some_and(crate::subscriptions::is_scan_failure_sub_id)
     {
         // v1.0.0 #7366: failed-lookup records belong to no subscription, so
         // the owner gate cannot apply; they are attributed to the writer.
