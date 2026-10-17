@@ -20254,11 +20254,10 @@ fn resolve_quota_agent_id(ctx: &CallerContext, metadata: &serde_json::Value) -> 
 }
 
 /// v0.7.0.1 G1 — bytes counted toward a memory's storage cap. Mirrors
-/// `quotas::storage_bytes_for_memory` (title + content UTF-8 length —
+/// `quotas::memory_charge_bytes` (title + content UTF-8 length —
 /// ignoring tags/metadata, which is the SQLite parity contract).
 fn memory_storage_bytes(memory: &Memory) -> i64 {
-    let raw = memory.title.len().saturating_add(memory.content.len());
-    i64::try_from(raw).unwrap_or(i64::MAX)
+    crate::quotas::memory_charge_bytes(memory)
 }
 
 /// v0.7.0.1 G1 / v0.7.0 #1156 — increment

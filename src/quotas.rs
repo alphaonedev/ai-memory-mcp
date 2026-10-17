@@ -550,6 +550,15 @@ pub fn check_memory_quota(
     Ok(())
 }
 
+/// #7561 — the single storage charge for one memory: the UTF-8 byte length of
+/// its title plus its content (tags and metadata are not charged), clamped to
+/// `i64::MAX` instead of wrapping (per PERF-03, PERF-07). Every backend's batch
+/// charge calls this so the sqlite and postgres byte accounting cannot drift.
+#[must_use]
+pub fn memory_charge_bytes(memory: &crate::models::Memory) -> i64 {
+    i64::try_from(memory.title.len().saturating_add(memory.content.len())).unwrap_or(i64::MAX)
+}
+
 /// #7090 — in-transaction, multi-row sibling of [`check_and_record`]: the
 /// sqlite twin of `PostgresStore::record_memory_quota_batch_in_tx`, backing
 /// [`crate::store::MemoryStore::store_batch`] on the sqlite adapter.
@@ -1445,6 +1454,20 @@ mod tests {
         ))
         .expect("apply v50 per-namespace migration");
         conn
+    }
+
+    // #7561 — the shared batch charge is title + content UTF-8 bytes only.
+    #[test]
+    fn memory_charge_bytes_counts_title_and_content_only_7561() {
+        let memory: crate::models::Memory = serde_json::from_value(serde_json::json!({
+            "id": "m", "tier": "mid", "namespace": "ns", "title": "héllo",
+            "content": "abc", "tags": ["a-long-tag-not-charged"], "priority": 5,
+            "confidence": 1.0, "source": "t", "access_count": 0,
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
+        }))
+        .expect("minimal memory");
+        // "héllo" is 6 UTF-8 bytes, "abc" is 3.
+        assert_eq!(memory_charge_bytes(&memory), 9);
     }
 
     // FBL-12 (v1.0.0 pre-ship 3x7) — charge_update_growth charges only the

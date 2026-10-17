@@ -493,12 +493,11 @@ fn record_batch_quota(
             "" => ctx.agent_id.clone(),
             claimed => claimed.to_string(),
         };
-        let bytes = i64::try_from(memory.title.len().saturating_add(memory.content.len()))
-            .unwrap_or(i64::MAX);
+        let bytes = crate::quotas::memory_charge_bytes(memory);
         let entry = groups
             .entry((owner, memory.namespace.clone()))
             .or_insert((0, 0));
-        entry.0 += 1;
+        entry.0 = entry.0.saturating_add(1);
         entry.1 = entry.1.saturating_add(bytes);
     }
     for ((agent_id, namespace), (count, bytes)) in &groups {
