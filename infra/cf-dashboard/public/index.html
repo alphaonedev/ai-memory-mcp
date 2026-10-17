@@ -770,7 +770,7 @@ function renderAll(D){
   _S(()=>security("secpanel", D.security));
   _S(()=>continuity("cycpanel", D.continuity));
   _S(()=>board(dims)); _S(()=>feed(D.events||[]));
-  // a non-list `dimensions` is a malformed state: skip the ring (placeholder stays) and let poll() keep the badge honest
+  // a non-list `dimensions` is a malformed state: skip the ring (placeholder stays); poll() catches the throw, sets stateBad and the badge reads offline
   if(!Array.isArray(dims)) throw new TypeError("state.dimensions is not a list");
   // 2026-09-18: the ring shows the V&V VALIDATED share (items measured green / items in scope), not the
   // count of fully-green dimensions - a dimension only turns green when its LAST item lands, so the
@@ -823,17 +823,25 @@ function setLive(state){
   const old=ago>30*60000; b.className="live"+(old?" stale":"");
   t.textContent=(old?"stale · ":"connected · ")+"state generated "+rel;
 }
+// stateBad: the last state.json arrived but could not be used (unparsable body, or renderAll rejected its shape,
+// e.g. a non-list `dimensions`). The badge then reads offline at once, not after the 15 s network grace, and the
+// 1 s tick does not repaint it "connected" from lastGood alone. A network failure keeps the 15 s grace.
+let stateBad=false;
 async function poll(){
+  let res;
   try{
-    const res=await fetch("/state.json?t="+Date.now(),{cache:"no-store"});
+    res=await fetch("/state.json?t="+Date.now(),{cache:"no-store"});
     if(!res.ok)throw new Error("http "+res.status);
-    const D=await res.json(); lastGood=Date.now(); lastUpdated=D.lastUpdated||null;
-    renderAll(D); setLive("live");
-  }catch(e){ if(Date.now()-lastGood>15000)setLive("err"); }
+  }catch(e){ if(Date.now()-lastGood>15000)setLive("err"); return; }
+  try{
+    const D=await res.json(); lastUpdated=D.lastUpdated||null;
+    renderAll(D); stateBad=false; lastGood=Date.now(); setLive("live");
+  }catch(e){ stateBad=true; setLive("err"); }
 }
+function tick(){ if(lastGood||stateBad)setLive(stateBad||Date.now()-lastGood>15000?"err":"live"); }
 [["northstar","northstar-state.json"],["security","security-state.json"],["mcp","mcp-tools-state.json"],["swarm","swarm-tools-state.json"],["datatier","datatier-state.json"],["federation","federation-state.json"]].forEach(([k,f])=>fetch("/"+f+"?t="+Date.now(),{cache:"no-store"}).then(r=>r.json()).then(d=>{const e=document.getElementById("nav-"+k);if(e){const p=d.pct!=null?d.pct:Math.round((d.validated+d.failclosed)/d.total*100);e.textContent=p+"%";e.style.color=p>=100?"var(--good)":"var(--warn)";}}).catch(()=>{}));
 poll(); setInterval(poll,3000);
-setInterval(()=>{ if(lastGood)setLive(Date.now()-lastGood>15000?"err":"live"); },1000);
+setInterval(tick,1000);
 function toggleCardFS(card){
   // Fullscreen API when available (Esc exits natively); otherwise a fixed overlay with Esc/click-to-close.
   const canFS=!!(card.requestFullscreen||card.webkitRequestFullscreen);
