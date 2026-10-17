@@ -1239,6 +1239,87 @@ class TemplateOwnership(unittest.TestCase):
             with self.subTest(good=text):
                 self.assertEqual(nested_quantifier_flaws(text), [], 'wrongly flagged: ' + text)
 
+    REGEX_TIMING_CHILD = (
+        'import importlib.util, sys, time\n'
+        'spec = importlib.util.spec_from_file_location("pib_regex_timing", sys.argv[1])\n'
+        'm = importlib.util.module_from_spec(spec); sys.modules["pib_regex_timing"] = m; spec.loader.exec_module(m)\n'
+        'pattern = getattr(m, sys.argv[2])\n'
+        'text = sys.stdin.buffer.read().decode("utf-8")\n'
+        'worst = 0.0\n'
+        'for method in ("match", "search", "fullmatch"):\n'
+        '    start = time.monotonic()\n'
+        '    getattr(pattern, method)(text)\n'
+        '    worst = max(worst, time.monotonic() - start)\n'
+        'print(worst)\n')
+    REGEX_TIMING_BUDGET_SECS = 0.25
+    REGEX_TIMING_KILL_SECS = 15.0
+
+    def _regex_seconds(self, name, text):
+        # Worst seconds over match, search and fullmatch of one module regex on one input, measured in a child
+        # process the parent can kill (a super-linear regex holds the GIL, so an in-process timer could never fire).
+        try:
+            done = subprocess.run([sys.executable, '-I', '-c', self.REGEX_TIMING_CHILD, str(SCRIPT), name],
+                                  input=text.encode('utf-8'), capture_output=True, timeout=self.REGEX_TIMING_KILL_SECS,
+                                  check=False)
+        except subprocess.TimeoutExpired:
+            return float('inf')
+        self.assertEqual(done.returncode, 0, done.stderr.decode('utf-8', 'replace'))
+        return float(done.stdout.decode('utf-8').strip())
+
+    def _module_patterns(self):
+        return {name: value for name, value in vars(pib).items() if isinstance(value, re.Pattern)}
+
+    def test_module_regexes_equal_the_pinned_table_7615_7653(self):
+        """The regexes of pg_isolated_binary.py are PINNED, not detected: the set of (pattern, flags) must equal
+        PINNED_REGEXES, so a new, changed or removed regex fails until a reviewer updates the table and its linearity
+        reason. This test pins and times regexes; it does not claim to detect super-linearity in general."""
+        source = SCRIPT.read_text(encoding='utf-8')
+        self.assertEqual(regex_audit_problems(source, self._module_patterns(), PINNED_REGEXES), [])
+
+    def test_each_pinned_regex_finishes_its_worst_case_input_under_budget_7615_7653(self):
+        by_key = {(p.pattern, p.flags): name for name, p in self._module_patterns().items()}
+        for pattern, flags, reason, generator in PINNED_REGEXES:
+            with self.subTest(pattern=pattern):
+                self.assertTrue(reason.strip(), 'a pinned regex needs a one-line linearity reason')
+                text = generator(pib.GUARD_SQL_MAX_BYTES)
+                self.assertLessEqual(len(text.encode('utf-8', 'surrogatepass')), 4 * pib.GUARD_SQL_MAX_BYTES)
+                self.assertLess(self._regex_seconds(by_key[(pattern, flags)], text), self.REGEX_TIMING_BUDGET_SECS)
+
+    def test_a_regex_added_without_a_table_row_fails_the_pin_7653(self):
+        source = SCRIPT.read_text(encoding='utf-8')
+        patterns = self._module_patterns()
+        added_source = source + "\n_NEW_RE = re.compile(r'(a+)+$')\n"
+        added_patterns = dict(patterns, _NEW_RE=re.compile(r'(a+)+$'))
+        problems = regex_audit_problems(added_source, added_patterns, PINNED_REGEXES)
+        self.assertTrue(any('not pinned' in p and '(a+)+$' in p for p in problems), problems)
+        changed = dict(patterns, _HEX_RE=re.compile(r'[0-9A-Fa-f]+', re.IGNORECASE))
+        self.assertNotEqual(regex_audit_problems(source, changed, PINNED_REGEXES), [])
+        removed = {k: v for k, v in patterns.items() if k != '_HEX_RE'}
+        self.assertTrue(any('pinned but absent' in p for p in regex_audit_problems(source, removed, PINNED_REGEXES)))
+
+    def test_regex_calls_outside_a_module_level_compile_fail_the_pin_7653(self):
+        source = SCRIPT.read_text(encoding='utf-8')
+        patterns = self._module_patterns()
+        for extra in ("def helper(x):\n    return re.match(r'a', x)\n", "def helper(x):\n    return re.compile('a')\n",
+                      "from re import compile as c\n", "import re as regex\n",
+                      "_P = [re.compile('a')]\n"):
+            with self.subTest(extra=extra):
+                self.assertNotEqual(regex_audit_problems(source + '\n' + extra, patterns, PINNED_REGEXES), [])
+
+    def test_test_files_import_no_regex_internals_7653(self):
+        import ast
+        for name in ('test_pg_isolated_binary.py', 'test_check_pg_isolate_invariants.py'):
+            tree = ast.parse((Path(__file__).parent / name).read_text(encoding='utf-8'))
+            for node in ast.walk(tree):
+                with self.subTest(file=name, line=getattr(node, 'lineno', 0)):
+                    if isinstance(node, ast.Import):
+                        for alias in node.names:
+                            self.assertFalse(alias.name.startswith('sre_') or alias.name.startswith('re.'), alias.name)
+                            self.assertFalse(alias.name == 're' and alias.asname, 'import re as ' + str(alias.asname))
+                    if isinstance(node, ast.ImportFrom):
+                        self.assertFalse(node.module == 're' or (node.module or '').startswith(('re.', 'sre_')),
+                                         'from %s import ...' % node.module)
+
     CONCAT_SAMPLES_7633 = (
         ("X = ['a' 'b']\n", [1]),
         ("X = [f'a' f'b']\n", [1]),
