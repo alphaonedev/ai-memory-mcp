@@ -8844,8 +8844,93 @@ enabled = true
         );
     }
 
+    const SELECTOR_FIXTURE_KEY_7071: &str = "fixture-key-3860";
+
     #[tokio::test(flavor = "multi_thread")]
     async fn llm_reachability_selector_gate_blocks_credentials_3860() {
+        const EXACT_TEST: &str =
+            "cli::doctor::tests::llm_reachability_selector_gate_blocks_credentials_3860";
+        const CHILD_ROLE: &str = "AI_MEMORY_TEST_DOCTOR_SELECTOR_7071";
+        if std::env::var(CHILD_ROLE).as_deref() != Ok("child") {
+            // Copy spawn_test_child's clean-child precedent without its Unix
+            // cfg: this test remains executable on every target. Also retain
+            // run_env_isolated_child_or_spawn's non-vacuity check (#2905).
+            let output = crate::spawn_audit::audited_command(
+                std::env::current_exe().expect("selector test executable"),
+                "doctor::selector_gate_7071",
+            )
+            .args(["--exact", EXACT_TEST, "--test-threads=1", "--nocapture"])
+            .env_clear()
+            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
+            .env("TMPDIR", std::env::temp_dir())
+            .env("AI_MEMORY_NO_CONFIG", "1")
+            .env("AI_MEMORY_LLM_API_KEY", SELECTOR_FIXTURE_KEY_7071)
+            .env(CHILD_ROLE, "child")
+            .output()
+            .expect("spawn selector test child");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "selector child failed:\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains("1 passed") && !stdout.contains("0 passed"),
+                "selector child must run exactly one test:\n{stdout}"
+            );
+            return;
+        }
+
+        // Positive contamination control: the delayed request actually reaches
+        // the next pooled fixture. Exact-process isolation makes reuse
+        // deterministic even when the surrounding library suite is parallel.
+        let mut delayed = delayed_selector_connection_7071().await;
+        let pooled = wiremock::MockServer::start().await;
+        finish_delayed_selector_request_7071(&mut delayed).await;
+        assert_eq!(
+            pooled.received_requests().await.unwrap().len(),
+            1,
+            "the adversarial client must contaminate a pooled fixture"
+        );
+        drop(pooled);
+        assert_selector_gate_cases_7071().await;
+    }
+
+    async fn delayed_selector_connection_7071() -> tokio::net::TcpStream {
+        let previous = wiremock::MockServer::start().await;
+        let connection = tokio::net::TcpStream::connect(previous.address())
+            .await
+            .expect("connect to previous pooled fixture");
+        drop(previous);
+        connection
+    }
+
+    async fn finish_delayed_selector_request_7071(connection: &mut tokio::net::TcpStream) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        const REQUEST: &[u8] =
+            b"GET /foreign-request-7071 HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+        const RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+        let response = tokio::time::timeout(RESPONSE_TIMEOUT, async {
+            connection
+                .write_all(REQUEST)
+                .await
+                .expect("write delayed request");
+            let mut response = Vec::new();
+            connection
+                .read_to_end(&mut response)
+                .await
+                .expect("read delayed response");
+            response
+        })
+        .await
+        .expect("delayed request completes before counts are checked");
+        assert!(
+            response.starts_with(b"HTTP/1.1 404"),
+            "delayed request was served"
+        );
+    }
+
+    async fn assert_selector_gate_cases_7071() {
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -8856,7 +8941,11 @@ enabled = true
             (crate::llm::BACKEND_OPENAI_COMPATIBLE, true, true),
             (crate::llm::BACKEND_VLLM, true, true),
         ] {
-            let server = MockServer::start().await;
+            let mut delayed = delayed_selector_connection_7071().await;
+            // Own the listener: a pooled socket can deliver an old fixture's
+            // delayed request into a new fixture's counts (#7071).
+            let server = MockServer::builder().start().await;
+            finish_delayed_selector_request_7071(&mut delayed).await;
             Mock::given(method("GET"))
                 .and(path("/models"))
                 .and(header("authorization", "Bearer fixture-key-3860"))
@@ -8864,22 +8953,15 @@ enabled = true
                 .expect(u64::from(allowed))
                 .mount(&server)
                 .await;
-            let resolved = {
-                // Hold both existing test locks only while resolving, never
-                // across await. Restore the fixture key before network I/O.
-                let _config = crate::config::test_env_lock();
-                let _reach = reach_env_lock().lock().unwrap_or_else(|e| e.into_inner());
-                let _scope = EnvScope::set(&[
-                    ("AI_MEMORY_LLM_API_KEY", "fixture-key-3860"),
-                    ("AI_MEMORY_LLM_BASE_URL", ""),
-                ]);
-                crate::config::AppConfig::default().resolve_llm(
-                    Some(backend),
-                    Some("fixture-model"),
-                    explicit_url.then_some(server.uri()).as_deref(),
-                )
-            };
-            assert!(resolved.api_key().is_some());
+            // The exact-test child receives its fixture environment at spawn:
+            // no process-env writes or blocking locks across await (UNSAFE-01/04,
+            // CONCURRENCY-20).
+            let resolved = crate::config::AppConfig::default().resolve_llm(
+                Some(backend),
+                Some("fixture-model"),
+                explicit_url.then_some(server.uri()).as_deref(),
+            );
+            assert_eq!(resolved.api_key(), Some(SELECTOR_FIXTURE_KEY_7071));
             if !explicit_url {
                 assert!(resolved.base_url.is_empty());
             }
@@ -8897,7 +8979,11 @@ enabled = true
                 }
             );
             let requests = server.received_requests().await.unwrap();
-            assert_eq!(requests.len(), usize::from(allowed));
+            assert_eq!(
+                requests.len(),
+                usize::from(allowed),
+                "all requests: backend={backend}, explicit_url={explicit_url}, allowed={allowed}"
+            );
             if !allowed {
                 let reason = if backend == crate::llm::BACKEND_OPENAI_COMPATIBLE {
                     "no default URL"
