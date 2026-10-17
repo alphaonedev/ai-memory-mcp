@@ -194,23 +194,37 @@ fn forced_failure() -> bool {
     false
 }
 
+/// Report an older frame on `conn`'s database that still holds deferred
+/// escalations (#4116), BEFORE the caller issues `BEGIN`.
+///
+/// #6541: the debug-build `debug_assert!` below unwinds. Run after `BEGIN` and
+/// before any guard exists, that unwind stranded the connection inside an open
+/// write transaction holding the SQLite write lock. Reporting first means an
+/// unwind leaves the connection in autocommit (ERRORS-08, OWNERSHIP-24).
+pub(super) fn report_stale_frames(conn: &Connection) {
+    let db_path = conn.path().filter(|p| !p.is_empty()).map(str::to_string);
+    let stale = TXN_FRAMES.with(|frames| {
+        frames
+            .borrow()
+            .0
+            .iter()
+            .any(|f| f.db_path == db_path && db_path.is_some() && !f.deferred.is_empty())
+    });
+    if stale {
+        tracing::error!(
+            "#4116: a WriteTxn opened while an older frame on the same database still \
+             holds deferred escalations (leaked or unsettled transaction)"
+        );
+        debug_assert!(false, "#4116: stale escalation frame on this database");
+    }
+}
+
 /// Register a frame for a write transaction just opened on `conn`.
 pub(super) fn open_frame(conn: &Connection) -> u64 {
     let id = NEXT_FRAME_ID.fetch_add(1, Ordering::Relaxed);
     let db_path = conn.path().filter(|p| !p.is_empty()).map(str::to_string);
     TXN_FRAMES.with(|frames| {
         let mut frames = frames.borrow_mut();
-        let stale = frames
-            .0
-            .iter()
-            .any(|f| f.db_path == db_path && db_path.is_some() && !f.deferred.is_empty());
-        if stale {
-            tracing::error!(
-                "#4116: a WriteTxn opened while an older frame on the same database still \
-                 holds deferred escalations (leaked or unsettled transaction)"
-            );
-            debug_assert!(false, "#4116: stale escalation frame on this database");
-        }
         frames.0.push(TxnFrame {
             id,
             db_path,
