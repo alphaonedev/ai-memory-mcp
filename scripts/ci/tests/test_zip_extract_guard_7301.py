@@ -9,6 +9,7 @@ Fixture trees live under the worktree's `.local-runs/` (never a tmpfs).
 
 Run: python3 -m unittest scripts/ci/tests/test_zip_extract_guard_7301.py
 """
+import json
 import os
 import shutil
 import subprocess
@@ -64,7 +65,7 @@ class GuardCase(GuardBase):
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
     def test_real_repo_passes_with_real_cargo_tree(self):
-        """Runs the real `cargo tree` (offline, locked) against this checkout."""
+        """Runs the real `cargo tree` (locked) against this checkout."""
         if shutil.which('cargo') is None:
             self.skipTest('cargo is not installed')
         res = subprocess.run([sys.executable, str(GUARD), '--root', str(REPO)],
@@ -190,6 +191,15 @@ sys.stderr.write({err!r})
 sys.exit({rc})
 """
 
+OFFLINE_REFUSING_STUB = """#!{python}
+import sys
+if '--offline' in sys.argv:
+    sys.stderr.write('error: failed to download `anstyle-wincon v3.0.11`\\n'
+                     'Caused by: attempting to make an HTTP request, but --offline was specified\\n')
+    sys.exit(101)
+sys.stdout.write({out!r})
+"""
+
 LOCK_WITH_ZIP = CANDLE_LOCK + '[[package]]\nname = "zip"\nversion = "7.2.0"\n'
 LOCK_WITHOUT_ZIP = '[[package]]\nname = "serde"\nversion = "1.0.0"\n'
 NO_MATCH_ERR = 'error: package ID specification `zip` did not match any packages\n'
@@ -215,6 +225,45 @@ class StubCargoCase(GuardBase):
         return subprocess.run(
             [sys.executable, str(GUARD), '--root', str(self.root)],
             capture_output=True, text=True, check=False, env=env)
+
+
+class CleanCargoHome7301(StubCargoCase):
+    """Round 4 (CI): the guard must work on a runner that has not fetched every target."""
+
+    def argv_of_run(self):
+        res = self.run_stub(out=GOOD_TREE_DEPTH, lock=LOCK_WITH_ZIP)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        lines = self.argv_log.read_text(encoding='utf-8').splitlines()
+        self.assertEqual(len(lines), 1, lines)
+        return json.loads(lines[0])
+
+    def test_cargo_tree_argv_has_no_offline_flag(self):
+        self.assertNotIn('--offline', self.argv_of_run())
+
+    def test_cargo_tree_argv_keeps_locked_and_all_targets(self):
+        argv = self.argv_of_run()
+        self.assertIn('--locked', argv)
+        self.assertIn('all', argv)
+
+    def test_download_needed_is_not_refused_by_guard_flags(self):
+        """A cargo that refuses to download under --offline: the guard must not pass that flag."""
+        stub_dir = self.root.parent / (self.root.name + '.bin')
+        stub_dir.mkdir()
+        self.addCleanup(shutil.rmtree, str(stub_dir), True)
+        stub = stub_dir / 'cargo'
+        stub.write_text(OFFLINE_REFUSING_STUB.format(
+            python=sys.executable, out=GOOD_TREE_DEPTH), encoding='utf-8')
+        stub.chmod(0o755)
+        (self.root / 'Cargo.lock').write_text(LOCK_WITH_ZIP, encoding='utf-8')
+        env = dict(os.environ)
+        env['PATH'] = str(stub_dir) + os.pathsep + env.get('PATH', '')
+        res = subprocess.run([sys.executable, str(GUARD), '--root', str(self.root)],
+                             capture_output=True, text=True, check=False, env=env)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_download_failure_still_fails_closed(self):
+        res = self.run_stub(err='error: failed to download `x v1.0.0`\n', rc=101, lock=LOCK_WITH_ZIP)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
 
 
 class TreeFailClosed7301(StubCargoCase):
