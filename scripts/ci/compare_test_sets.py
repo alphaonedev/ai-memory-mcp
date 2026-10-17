@@ -10,8 +10,9 @@ name from nextest 0.9.146's status table and an unknown word exits 2. A retried 
 non-``TRY`` line (``PASS``, ``FAIL``, ``FLAKY n/m``, ...); a test that fails every attempt has only
 ``TRY n FAIL`` lines, so a test with only ``TRY`` lines is what its LAST attempt said.
 A test nextest prints as ``TRY n PASS`` followed by the line ``- test configured to fail if flaky``
-(``flaky-result = "fail"``) is a FAILURE: nextest-runner counts it as failed (config/elements/retry_policy.rs
-:120-130 ``fail_message``; snapshot ``status_line_all_variants``), whatever its last status word says.
+(``flaky-result = "fail"``) is a FAILURE: nextest-runner 0.124.0 prints the marker in src/reporter/displayer/imp.rs
+:1675-1690 (``write_status_line``, ``StatusLineKind::Intermediate`` + ``FlakyResult::Fail``) and counts the test as
+failed in src/reporter/events.rs; snapshot ``status_line_all_variants``), whatever its last status word says.
 The marker binds ONLY to the immediately preceding ``TRY n PASS`` line (any other status line in between clears
 the binding; non-status lines such as child output do not) and is matched at the END of the cleaned line, so a
 stderr fragment glued in front of it does not hide it. A marker with no such predecessor is refused (exit 2, naming
@@ -153,8 +154,9 @@ _NEXTEST_SHAPE_RE = re.compile(
 # ``TRY n FAIL`` with no plain FAIL line (displayer/imp.rs:1810-1826), so a test with only TRY lines is what its
 # LAST attempt said (#7298 R2).
 # With ``flaky-result = "fail"`` nextest prints ``TRY n PASS`` and, on the next line, this marker, and counts the test
-# as failed (nextest-runner 0.124.0 config/elements/retry_policy.rs:120-130 ``fail_message``; displayer snapshot
-# status_line_all_variants). Without the marker rule a final-status-level of ``none`` would read it as a pass (#7298 S4).
+# as failed (nextest-runner 0.124.0 src/reporter/displayer/imp.rs:1675-1690 ``write_status_line``,
+# ``StatusLineKind::Intermediate`` + ``FlakyResult::Fail``, format ``"{:>12} test configured to {} if flaky"``; the
+# failed count is in src/reporter/events.rs; displayer snapshot status_line_all_variants). Without the marker rule a final-status-level of ``none`` would read it as a pass (#7298 S4).
 # The marker binds only to the immediately preceding ``TRY n PASS`` line and is matched at the end of the cleaned
 # line (#7298 R7-1).
 _FLAKY_FAIL_MARKER = '- test configured to fail if flaky'
