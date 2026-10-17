@@ -23,12 +23,16 @@
 
 use std::time::{Duration, Instant};
 
-use ai_memory::subscriptions::{RETRY_BACKOFFS, dispatch_event_with_details, list_dlq};
+use ai_memory::subscriptions::{
+    DISPATCH_SCAN_FAILED_SUB_ID, RETRY_BACKOFFS, dispatch_event_with_details, list_dlq,
+};
 
 const EVENT: &str = "memory_store";
 const MEMORY_ID: &str = "mem-7366";
 const NAMESPACE: &str = "team/ops";
+#[cfg(feature = "sal")]
 const WRITER: &str = "ai:writer-7366";
+const MCP_CLIENT: &str = "writer-7366";
 
 /// The least wall-clock a bounded retry on the ladder can take.
 fn ladder_floor() -> Duration {
@@ -48,13 +52,16 @@ fn a_sqlite_lookup_failure_leaves_a_durable_dlq_record_7366() {
     conn.execute_batch("DROP TABLE subscriptions;")
         .expect("drop subscriptions to inject the lookup fault");
 
+    // The MCP caller id the DLQ inspector will resolve for MCP client `writer-7366`.
+    let writer = ai_memory::identity::resolve_agent_id(None, Some(MCP_CLIENT))
+        .expect("resolve the writer id");
     let started = Instant::now();
     dispatch_event_with_details(
         &conn,
         EVENT,
         MEMORY_ID,
         NAMESPACE,
-        Some(WRITER),
+        Some(&writer),
         &path,
         Some(serde_json::json!({"note": "details-survive"})),
     );
@@ -71,10 +78,35 @@ fn a_sqlite_lookup_failure_leaves_a_durable_dlq_record_7366() {
     let payload: serde_json::Value = serde_json::from_str(&row.payload).expect("payload is json");
     assert_eq!(payload["memory_id"], MEMORY_ID);
     assert_eq!(payload["namespace"], NAMESPACE);
-    assert_eq!(payload["agent_id"], WRITER);
+    assert_eq!(payload["agent_id"], writer.as_str());
     assert!(
         elapsed >= ladder_floor(),
         "the lookup must be retried on the RETRY_BACKOFFS ladder first; took {elapsed:?}"
+    );
+    assert_eq!(row.subscription_id, DISPATCH_SCAN_FAILED_SUB_ID);
+
+    // A fresh connection: the DLQ list reads the durable record.
+    let conn = ai_memory::db::open(&path).expect("reopen");
+    // Surfaced: the writer sees the record in the DLQ list; another caller
+    // does not.
+    let listed = ai_memory::mcp::handle_subscription_dlq_list(
+        &conn,
+        &serde_json::json!({}),
+        Some(MCP_CLIENT),
+    )
+    .expect("dlq list for the writer");
+    assert_eq!(
+        listed["count"], 1,
+        "the writer must see the record: {listed}"
+    );
+    let other = ai_memory::identity::resolve_agent_id(None, Some("someone-else-7366"))
+        .expect("resolve another caller");
+    assert!(ai_memory::subscriptions::scan_failure_visible_to(
+        row, &writer
+    ));
+    assert!(
+        !ai_memory::subscriptions::scan_failure_visible_to(row, &other),
+        "another caller must not see the writer's record"
     );
 }
 
@@ -196,9 +228,7 @@ mod postgres_funnel {
             store,
             llm: Arc::new(ai_memory::reload::SwappableLlm::new(None)),
             auto_tag_model: Arc::new(None),
-            llm_call_timeout: Duration::from_secs(
-                ai_memory::config::DEFAULT_LLM_CALL_TIMEOUT_SECS,
-            ),
+            llm_call_timeout: Duration::from_secs(ai_memory::config::DEFAULT_LLM_CALL_TIMEOUT_SECS),
             replay_cache: Arc::new(ai_memory::identity::replay::ReplayCache::new()),
             verify_require_nonce: false,
             federation_nonce_cache: Arc::new(

@@ -35,6 +35,12 @@ use crate::models::field_names;
 pub mod audit_status;
 // #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
 mod unstarted;
+// #7366 - a failed subscriber lookup is retried, then recorded to the DLQ.
+mod scan_failure;
+pub use scan_failure::{
+    DISPATCH_SCAN_FAILED_SUB_ID, ScanFailure, classify_sqlite_error, classify_sqlstate,
+    record_dispatch_scan_failure, retry_lookup, retry_lookup_async, scan_failure_visible_to,
+};
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -973,14 +979,28 @@ pub fn dispatch_event_with_details(
     // filter moves into SQL. At 100 subscribers the write-event
     // fanout cost drops from O(N) to whatever fraction actually
     // subscribes to the fired event type.
-    let subs = match list_by_event(conn, event) {
+    let subs = match retry_lookup(RETRY_BACKOFFS, || list_by_event(conn, event)) {
         Ok(s) => s,
         Err(e) => {
-            // Loud on list failure (Fable #3242 item 4). This table is
-            // not LIMIT-capped — the 1000-row ordered cliff +
-            // `record_dispatch_scan_truncation` is the pg SAL prefix
-            // scan (`dispatch_event_postgres`), not this path.
-            tracing::warn!("subscription list failed during dispatch: {e}");
+            // v1.0.0 #7366: the lookup failed on every attempt of the
+            // RETRY_BACKOFFS ladder. Dropping the event here lost it with no
+            // durable record; record it to the DLQ for re-dispatch instead.
+            let class = classify_sqlite_error(&e);
+            tracing::warn!(
+                error_class = class,
+                "subscription list failed during dispatch: {e}"
+            );
+            record_dispatch_scan_failure(
+                db_path,
+                &ScanFailure {
+                    event,
+                    memory_id,
+                    namespace,
+                    agent_id,
+                    details: details.as_ref(),
+                },
+                class,
+            );
             return;
         }
     };
