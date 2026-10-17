@@ -43,14 +43,34 @@ fn ladder_floor() -> Duration {
 // CELL A — SQLite: a failing `list_by_event` leaves a durable, replayable row.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn a_sqlite_lookup_failure_leaves_a_durable_dlq_record_7366() {
-    let dir = tempfile::tempdir().expect("tempdir");
+/// Poll the durable DLQ until it holds `want` rows (the sqlite retry runs off
+/// the caller's thread, so the record lands after the ladder, not before the
+/// dispatch call returns).
+fn wait_for_rows(path: &std::path::Path, want: usize) -> Vec<ai_memory::subscriptions::DlqEntry> {
+    let deadline = Instant::now() + ladder_floor() + Duration::from_secs(20);
+    loop {
+        let conn = ai_memory::db::open(path).expect("open for poll");
+        let rows = list_dlq(&conn, None).expect("list_dlq");
+        if rows.len() >= want || Instant::now() > deadline {
+            return rows;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn faulted_db(dir: &tempfile::TempDir) -> (std::path::PathBuf, rusqlite::Connection) {
     let path = dir.path().join("dispatch.db");
     let conn = ai_memory::db::open(&path).expect("open");
     // The injected fault: `list_by_event` prepares a SELECT on `subscriptions`.
     conn.execute_batch("DROP TABLE subscriptions;")
         .expect("drop subscriptions to inject the lookup fault");
+    (path, conn)
+}
+
+#[test]
+fn a_sqlite_lookup_failure_leaves_a_durable_dlq_record_7366() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (path, conn) = faulted_db(&dir);
 
     // The MCP caller id the DLQ inspector will resolve for MCP client `writer-7366`.
     let writer = ai_memory::identity::resolve_agent_id(None, Some(MCP_CLIENT))
@@ -65,9 +85,16 @@ fn a_sqlite_lookup_failure_leaves_a_durable_dlq_record_7366() {
         &path,
         Some(serde_json::json!({"note": "details-survive"})),
     );
-    let elapsed = started.elapsed();
+    let returned_after = started.elapsed();
+    // #7410: the caller holds the connection lock while it dispatches; the
+    // ladder pauses must not run on the caller's thread.
+    assert!(
+        returned_after < ladder_floor(),
+        "dispatch must not sleep the ladder while the caller holds the lock; took {returned_after:?}"
+    );
 
-    let rows = list_dlq(&conn, None).expect("list_dlq");
+    let rows = wait_for_rows(&path, 1);
+    let elapsed = started.elapsed();
     assert_eq!(
         rows.len(),
         1,
@@ -83,30 +110,59 @@ fn a_sqlite_lookup_failure_leaves_a_durable_dlq_record_7366() {
         elapsed >= ladder_floor(),
         "the lookup must be retried on the RETRY_BACKOFFS ladder first; took {elapsed:?}"
     );
-    assert_eq!(row.subscription_id, DISPATCH_SCAN_FAILED_SUB_ID);
+    assert!(
+        row.subscription_id.starts_with(DISPATCH_SCAN_FAILED_SUB_ID),
+        "the record sits under the failed-lookup sentinel: {}",
+        row.subscription_id
+    );
 
     // A fresh connection: the DLQ list reads the durable record.
     let conn = ai_memory::db::open(&path).expect("reopen");
-    // Surfaced: the writer sees the record in the DLQ list; another caller
-    // does not.
-    let listed = ai_memory::mcp::handle_subscription_dlq_list(
-        &conn,
-        &serde_json::json!({}),
-        Some(MCP_CLIENT),
-    )
-    .expect("dlq list for the writer");
-    assert_eq!(
-        listed["count"], 1,
-        "the writer must see the record: {listed}"
-    );
+    let listed =
+        ai_memory::mcp::handle_subscription_dlq_list(&conn, &serde_json::json!({}), Some(MCP_CLIENT))
+            .expect("dlq list for the writer");
+    assert_eq!(listed["count"], 1, "the writer must see the record: {listed}");
     let other = ai_memory::identity::resolve_agent_id(None, Some("someone-else-7366"))
         .expect("resolve another caller");
-    assert!(ai_memory::subscriptions::scan_failure_visible_to(
-        row, &writer
-    ));
+    assert!(ai_memory::subscriptions::scan_failure_visible_to(row, &writer));
     assert!(
         !ai_memory::subscriptions::scan_failure_visible_to(row, &other),
         "another caller must not see the writer's record"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CELL C — #7409: one namespace's flood cannot starve another namespace.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn c_a_flooded_namespace_does_not_starve_another_namespace_7409() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (path, conn) = faulted_db(&dir);
+    // Fill to the per-id cap every bucket a failure for team/flooded could use
+    // (the legacy global sentinel and the per-namespace one).
+    for sub in [
+        DISPATCH_SCAN_FAILED_SUB_ID.to_string(),
+        format!("{DISPATCH_SCAN_FAILED_SUB_ID}:team/flooded"),
+    ] {
+        conn.execute(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2) \
+             INSERT INTO subscription_dlq \
+             (subscription_id, correlation_id, event_type, payload, retry_count, last_error, \
+              first_failed_at, last_failed_at) \
+             SELECT ?1, 'flood-' || i, 'memory_store', '{}', 0, 'flood', 'now', 'now' FROM n",
+            rusqlite::params![sub, ai_memory::subscriptions::MAX_SUBSCRIPTION_DLQ_ROWS],
+        )
+        .expect("fill the bucket to its cap");
+    }
+    let before = list_dlq(&conn, None).expect("list").len();
+
+    dispatch_event_with_details(&conn, EVENT, MEMORY_ID, "team/other", None, &path, None);
+
+    let rows = wait_for_rows(&path, before + 1);
+    assert!(
+        rows.iter().any(|r| r.payload.contains("team/other")),
+        "another namespace's failure must still be recorded while team/flooded is at its cap"
     );
 }
 
