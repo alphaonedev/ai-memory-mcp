@@ -154,6 +154,28 @@ class Credentials7313(unittest.TestCase):
         for bad in ("", "../x", GOOD_ACCT.upper(), GOOD_ACCT + "0", "a/b?c=d" + GOOD_ACCT[:24]):
             self.assertFalse(self.cf.valid_account_id(bad), bad)
 
+    def test_7593_a_non_utf8_home_env_file_is_a_one_line_refusal_with_a_nonzero_exit(self):
+        (self.home / ".env").write_bytes(b"CLOUDFLARE_API_TOKEN=\xff\xfe\x80\n")
+        for script, name, argv in (("deploy.py", "deploy_7593", ["deploy.py"]),
+                                   ("push-state.py", "push_state_7593", ["push-state.py", str(self.home / "in.json")])):
+            (self.home / "in.json").write_text("{}", encoding="utf-8")
+            mod = _load(name, script)
+            err = io.StringIO()
+            with mock.patch.object(mod, "HERE", self.home, create=True), mock.patch.object(sys, "argv", argv), \
+                    contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = mod.main()
+            lines = [ln for ln in err.getvalue().splitlines() if ln]
+            self.assertNotEqual(rc, 0, script)
+            self.assertEqual(len(lines), 1, "%s: %r" % (script, err.getvalue()))
+            self.assertNotIn("Traceback", err.getvalue())
+            self.assertIn("UTF-8", lines[0])
+
+    def test_7593_the_home_env_file_is_read_as_utf8_whatever_the_locale(self):
+        (self.home / ".env").write_bytes("CLOUDFLARE_API_TOKEN=caf\u00e9\n".encode("utf-8"))
+        with mock.patch("locale.getpreferredencoding", return_value="ascii"), \
+                mock.patch.dict(os.environ, {"PYTHONUTF8": "0", "LC_ALL": "C"}):
+            self.assertEqual(self.cf.credential("CLOUDFLARE_API_TOKEN"), "caf\u00e9")
+
     def _run_main(self, script, name, argv):
         mod = _load(name, script)
         err = io.StringIO()
@@ -703,11 +725,38 @@ class PublicSnapshotHygiene7518(unittest.TestCase):
             out = hostscrub.dump_clean({"n": "reach " + shape + " now"})
             self.assertNotIn("buildbox", out, shape)
 
-    def test_this_machines_hostname_is_scrubbed(self):
-        hostscrub = _load("hostscrub_7547_rt", "hostscrub.py")
-        with mock.patch.object(hostscrub.socket, "gethostname", return_value="zz-runtime-7547"):
-            out = hostscrub.dump_clean({"n": "running on zz-runtime-7547_1 and ZZ-RUNTIME-7547.example"})
-            self.assertNotIn("zz-runtime-7547", out.lower())
+    def test_7592_scrub_and_leak_verdict_do_not_depend_on_the_machine_hostname(self):
+        hostscrub = _load("hostscrub_7592_a", "hostscrub.py")
+        record = {"n": "running on zz-runtime-7547 with ai-memory and the memory of a hostname",
+                  "s": "host:build-box-7"}
+        verdicts = []
+        for fake in ("zz-runtime-7547", "ai", "memory", "node", "localhost", "a"):
+            with mock.patch("socket.gethostname", return_value=fake):
+                verdicts.append((hostscrub.dump_clean(record), hostscrub.find_leaks(json.dumps(record)),
+                                 hostscrub.find_leaks("running on zz-runtime-7547")))
+        self.assertEqual(len(set(map(repr, verdicts))), 1, "the output depends on socket.gethostname")
+        out = verdicts[0][0]
+        self.assertIn("ai-memory", out)
+        self.assertIn("the memory of a hostname", out)
+        self.assertIn("zz-runtime-7547", out)  # not a listed name and not a host-id shape: not this module rule
+
+    def test_7592_a_hostname_that_is_a_substring_of_a_common_word_does_not_corrupt_text(self):
+        hostscrub = _load("hostscrub_7592_b", "hostscrub.py")
+        text = "ai-memory Main maintains the daemon; domain remainder; a node named ai"
+        for fake in ("main", "ai", "mem", "node"):
+            with mock.patch("socket.gethostname", return_value=fake):
+                self.assertEqual(hostscrub.scrub_text(text), text, fake)
+                self.assertEqual(hostscrub.find_leaks(text), [], fake)
+
+    def test_7592_a_listed_name_matches_whole_host_tokens_only(self):
+        self.names_file.write_text("ai\nbox\n", encoding="utf-8")
+        hostscrub = _load("hostscrub_7592_c", "hostscrub.py")
+        for untouched in ("ai-memory", "mailbox", "boxes", "box_2", "x-box", "ai2", "main"):
+            self.assertEqual(hostscrub.scrub_text("see " + untouched + " now"), "see " + untouched + " now", untouched)
+        for token in ("ai", "AI", "box"):
+            self.assertEqual(hostscrub.scrub_text("on %s." % token), "on node.", token)
+            self.assertEqual(hostscrub.scrub_text("(%s)" % token), "(node)", token)
+            self.assertEqual(hostscrub.scrub_text("by %s, then" % token), "by node, then", token)
 
     def test_names_in_the_local_untracked_file_are_scrubbed_and_comments_ignored(self):
         hostscrub = _load("hostscrub_7547_file", "hostscrub.py")
