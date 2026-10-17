@@ -1144,12 +1144,14 @@ jobs:
             exit 1
           fi
           base_url="$(cat "$url_file")"
-          # Unique db name: valid pg identifier (lowercase, [a-z0-9_], <=63
-          # chars). run_id+attempt make it unique across concurrent runs; the
+          # Unique db name: valid pg identifier (lowercase, [a-z0-9_], <=59
+          # bytes: 63 minus the `_tpl` suffix, i.e. IDENT_MAX - len(TEMPLATE_SUFFIX)
+          # in scripts/test/pg_isolated_binary.py, which refuses longer names).
+          # run_id+attempt make it unique across concurrent runs; the
           # sanitised matrix leg keeps the two enterprise-fed legs distinct and
           # never sharing a name with the cert-postgres-age job.
           leg_sanitized="$(printf '%s' "$LEG" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '_')"
-          CI_FED_DB="$(printf '%s' "ai_memory_test_ci_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${leg_sanitized}" | cut -c1-63)"
+          CI_FED_DB="$(printf '%s' "ai_memory_test_ci_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${leg_sanitized}" | cut -c1-59)"
           # Compute-once, pass to the cleanup step via $GITHUB_ENV so create
           # and drop use the byte-identical name.
           echo "CI_FED_DB=$CI_FED_DB" >> "$GITHUB_ENV"
@@ -1192,6 +1194,19 @@ jobs:
             AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB" --jobs 8 --emit-env >> "$GITHUB_ENV"
             echo "::notice::[#6383] per-binary Postgres isolation ON: template ${CI_FED_DB}_tpl"
           fi
+
+      # #7485 / #7457 — the LiveEndToEnd cells of the Postgres isolation wrapper need a real server, and
+      # this leg is the one that has AI_MEMORY_TEST_POSTGRES_URL (minted above). The flag turns a missing
+      # URL or psql into a failure instead of a silent skip.
+      - name: Run the pg_isolated_binary live cells (enterprise-fed legs only)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.tier == 'enterprise-fed'
+        shell: bash
+        env:
+          AI_MEMORY_TEST_PG_LIVE_REQUIRED: "1"
+        run: |
+          set -euo pipefail
+          cd scripts/ci/tests
+          python3 -m unittest -v test_pg_isolated_binary.LiveEndToEnd
 
       # Isolation shot after e380ca5d: mold + debuginfo=0 linked and RAN
       # the sqlite suite, then `hot_swap_llm_2166` SIGSEGV'd. That binary
