@@ -777,5 +777,172 @@ class SanitizeDocstring7465(unittest.TestCase):
         self.assertIn('`.`', doc)
 
 
+class SymlinkBase(RecaptureBase):
+    """Helpers for the fixture-symlink classes: an outside dir and a swapping stub."""
+
+    def outside(self):
+        outside = self.home / 'outside-fix'
+        outside.mkdir()
+        return outside
+
+    def fix(self):
+        return self.root / '.local-runs' / 'cert-3607-fixtures'
+
+    def make_swap_stub(self, path, trigger, outside):
+        """A stub that, on the trigger invocation, plants db-passphrase as a symlink."""
+        head, rest = STUB.split('\n', 1)
+        hook = (
+            '\nimport os as _o, sys as _s\n'
+            'def _swap():\n'
+            '    _t = _o.path.join(_o.environ["AI_MEMORY_KEY_DIR"], "..", "db-passphrase")\n'
+            '    _o.symlink(%r, _t)\n'
+            'if %s:\n'
+            '    _swap()\n' % (str(outside / 'stolen'), trigger))
+        path.write_text(head + hook + rest)
+        path.chmod(0o755)
+        return path
+
+    def assert_failed_closed(self, done, outside):
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('symlink', done.stderr)
+        self.assertEqual(list(outside.iterdir()), [])
+
+
+class OperatorKeySymlinks7508(SymlinkBase):
+    """#7508: the operator key pair that keygen writes is covered by the symlink check."""
+
+    def test_symlinked_operator_key_is_refused(self):
+        for name in ('operator.key', 'operator.key.pub'):
+            with self.subTest(name=name):
+                outside = self.outside()
+                keys = self.fix() / 'keys'
+                keys.mkdir(parents=True)
+                (keys / name).symlink_to(outside / name)
+                done, _ = self.run_recapture()
+                self.assert_failed_closed(done, outside)
+                (keys / name).unlink()
+                outside.rmdir()
+
+    def test_any_symlink_below_the_fixture_dir_is_refused(self):
+        outside = self.outside()
+        keys = self.fix() / 'keys'
+        keys.mkdir(parents=True)
+        (keys / 'extra-entry').symlink_to(outside / 'x')
+        done, _ = self.run_recapture()
+        self.assert_failed_closed(done, outside)
+
+
+class SwapDuringRun7509(SymlinkBase):
+    """#7509: a symlink swapped in after the first check fails closed with exit 1."""
+
+    def test_swap_during_keygen_does_not_leak_the_passphrase(self):
+        outside = self.outside()
+        swap = self.make_swap_stub(self.root / 'swap-default',
+                                   '_s.argv[1:3] == ["rules", "keygen"]', outside)
+        done, _ = self.run_recapture(default_bin=swap)
+        self.assert_failed_closed(done, outside)
+
+    def test_swap_during_a_posture_leg_does_not_leak_the_passphrase(self):
+        outside = self.outside()
+        swap = self.make_swap_stub(self.root / 'swap-default',
+                                   '_s.argv[1:2] == ["doctor"] and "--posture" not in _s.argv', outside)
+        done, _ = self.run_recapture(default_bin=swap)
+        self.assert_failed_closed(done, outside)
+
+    def test_write_file_refuses_a_final_symlink_and_a_symlinked_parent(self):
+        module = load_script_module()
+        module.ROOT = self.root
+        outside = self.outside()
+        (self.root / 'd').mkdir()
+        (self.root / 'd' / 'link').symlink_to(outside / 'f')
+        (self.root / 'plink').symlink_to(outside)
+        with self.assertRaises(OSError):
+            module.write_file(self.root / 'd' / 'link', b'secret')
+        with self.assertRaises(OSError):
+            module.write_file(self.root / 'plink' / 'f', b'secret')
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_write_file_replaces_a_regular_file_with_the_requested_mode(self):
+        module = load_script_module()
+        module.ROOT = self.root
+        target = self.root / 'a' / 'f'
+        target.parent.mkdir()
+        target.write_bytes(b'old')
+        module.write_file(target, b'new', 0o600)
+        self.assertEqual(target.read_bytes(), b'new')
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_create_only_never_replaces_or_follows(self):
+        module = load_script_module()
+        module.ROOT = self.root
+        outside = self.outside()
+        existing = self.root / 'pass'
+        existing.write_bytes(b'keep')
+        with self.assertRaises(OSError):
+            module.write_file(existing, b'new', 0o600, replace=False)
+        self.assertEqual(existing.read_bytes(), b'keep')
+        (self.root / 'dangling').symlink_to(outside / 'f')
+        with self.assertRaises(OSError):
+            module.write_file(self.root / 'dangling', b'new', 0o600, replace=False)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_read_file_refuses_a_symlink(self):
+        module = load_script_module()
+        module.ROOT = self.root
+        (self.root / 'real').write_bytes(b'x')
+        (self.root / 'ln').symlink_to(self.root / 'real')
+        self.assertEqual(module.read_file(self.root / 'real'), b'x')
+        with self.assertRaises(OSError):
+            module.read_file(self.root / 'ln')
+
+
+class HomeValidation7510(RecaptureBase):
+    """#7510: HOME must be absolute and non-empty; the sanitizer replaces whole path components."""
+
+    def test_unusable_home_is_refused_before_any_write(self):
+        for value in ('.', 'rel', '', '/', 'a:b', '/abs:/other'):
+            with self.subTest(home=value):
+                done, _ = self.run_recapture(extra_env={'HOME': value})
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertIn('HOME', done.stderr)
+                self.assertFalse((self.root / 'docs').exists())
+                self.assertFalse((self.root / '.local-runs').exists())
+
+    def test_help_does_not_need_a_usable_home(self):
+        done, _ = self.run_recapture(args=['--help'], extra_env={'HOME': 'rel'})
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def patched(self, home):
+        module = load_script_module()
+        module.ROOT = Path('/mnt/x/repo')
+        module.FIX = module.ROOT / '.local-runs' / 'cert-3607-fixtures'
+        module.HOME = home
+        return module
+
+    def test_home_is_replaced_only_on_component_boundaries(self):
+        module = self.patched('/home/a')
+        raw = (b"/home/a/k /home/ab/y /home/a /home/a. 'open /home/a' x/home/a/z "
+               b"/home/a.txt path=/home/a/q")
+        want = (b"<home>/k /home/ab/y <home> <home>. 'open <home>' x/home/a/z "
+                b"/home/a.txt path=<home>/q")
+        self.assertEqual(module.sanitize(raw), want)
+
+    def test_trailing_slash_home_is_normalised(self):
+        module = self.patched('/home/a/')
+        self.assertEqual(module.sanitize(b'/home/a/k /home/ab'), b'<home>/k /home/ab')
+
+    def test_repo_root_is_replaced_only_on_component_boundaries(self):
+        module = self.patched('/home/a')
+        self.assertEqual(module.sanitize(b'/mnt/x/repo/a /mnt/x/repo-other/b /mnt/x/repo'),
+                         b'<repo-root>/a /mnt/x/repo-other/b <repo-root>')
+
+    def test_docstring_and_usage_state_the_home_rule(self):
+        module = load_script_module()
+        self.assertIn('absolute', ' '.join(module.USAGE_EPILOG.split()))
+        self.assertIn('HOME', module.USAGE_EPILOG)
+        self.assertIn('HOME', module.__doc__)
+        self.assertIn('component', module.sanitize.__doc__)
+
+
 if __name__ == '__main__':
     unittest.main()
