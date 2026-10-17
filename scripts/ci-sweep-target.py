@@ -25,11 +25,17 @@ Safety:
     sweeping; ``FILE`` must sit directly in the resolved ``--within`` root and
     is opened ``O_NOFOLLOW``. If the lock is not taken within ``--lock-timeout``
     seconds (default 20; a finite number >= 0, ``0`` is one attempt) or cannot
-    be opened (the lock path is a symlink or a directory, the root is not
-    writable or is missing), one ``::warning::`` GitHub Actions annotation
-    naming the real cause and its errno is printed on stdout, the summary line
-    reads ``sweep skipped (<reason>)``, and the exit is 0 (the always-run step
-    stays green; the next job sweeps). The summary line also reports
+    be opened or taken, one ``::warning::`` GitHub Actions annotation naming
+    the real cause is printed on stdout, the summary line reads
+    ``sweep skipped (<reason>)``, and the exit is 0 (the always-run step stays
+    green; the next job sweeps). The reasons, verbatim: ``lock <path> not taken
+    within <S> s (held by another process)`` (contention timeout, no errno);
+    ``lock path is a symlink (not followed)``, ``lock path is a directory``,
+    ``lock root is missing``, ``lock root or file is not writable`` and the
+    fallback ``lock file cannot be opened``, each followed by ``: <path>
+    [Errno N] <strerror>``; and ``lock <path> cannot be taken: [Errno N]
+    <strerror>`` when the flock call itself fails. Every printed path and
+    reason is escaped (``%``, CR, LF) so it stays on one line. The summary line also reports
     ``lock_wait=<s> lock_held=<s>`` (0.00 without ``--lock``); the lock is
     taken right before the walk and released right after the delete.
     Non-UTF-8 path bytes print as backslash escapes (no traceback). Nothing outside ``<target>/debug/{deps,incremental,
