@@ -88,5 +88,93 @@ class BlockOrderAndExit7527(ScratchCase):
         self.assertIn("after its EXIT row", text)
 
 
+RECAPTURE_PY = (
+    "import os\nfrom pathlib import Path\n"
+    "ROOT = Path(os.path.abspath(__file__)).parent.parent\n"
+    'OUT = ROOT / "docs" / "x"\n'
+    'FIX = ROOT / "fixtures"\n')
+CERT_BOOT = "CERT-BOOTSTRAP GATE: PASS\n"
+
+
+class BundleFixture(ScratchCase):
+    """A complete green run directory and a worktree whose HEAD is the tip: bb.main() builds a real bundle from it."""
+
+    def setUp(self):
+        super().setUp()
+        self.bb = load("build_bundle")
+        self.rc = load("run_cert")
+        self.wt, self.tip = make_repo(self.dir / "repo", {"scripts/recapture-cert-3607-posture.py": RECAPTURE_PY})
+        self.outd = self.dir / "run"
+        (self.outd / "evidence").mkdir(parents=True)
+        for f in self.bb.EVIDENCE_FILES:
+            (self.outd / "evidence" / f).write_text("x\n")
+        header = (f"CERT-PROOF: tip={self.tip} short={self.tip[:9]} branch=b worktree={self.wt.resolve()} dirty=0 "
+                  "controls=15 started=now")
+        (self.outd / "removal-proof-full.log").write_text(
+            header + "\n" + "[PROVEN]\n" * 15 + header + "\noverall: PASS\n")
+        self.boot("")
+        ok = "test result: ok. 3 passed; 0 failed; 0 ignored\n"
+        for n in self.rc.BINS:
+            (self.outd / f"test-{n}.log").write_text(ok)
+        for n in self.rc.LIBS:
+            (self.outd / ("lib-" + n.replace(":", "_") + ".log")).write_text(ok)
+        (self.outd / f"test-pg-{self.rc.PG_BIN[0]}.log").write_text(ok)
+        (self.outd / f"lib-pg-{self.rc.PG_LIB[0]}.log").write_text(ok)
+        (self.outd / "legs.log").write_text(GREEN_CHAIN)
+        self.san = self.dir / "SANITIZATION.md"
+        self.san.write_text("# Sanitization\nauthor prose\n")
+
+    def boot(self, extra):
+        (self.outd / "bootstrap-cert-gate.log").write_text(CERT_BOOT + extra)
+
+    def build(self):
+        argv = ["build_bundle.py", "--tip", self.tip, "--wt", str(self.wt), "--outd", str(self.outd),
+                "--sanitization", str(self.san), "--date", "2026-10-17"]
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = self.bb.main()
+        return code, out.getvalue() + err.getvalue()
+
+    def bundle_file(self, name):
+        return (self.wt / "docs/compliance/evidence" / f"cert-{self.tip[:9]}" / name).read_text()
+
+
+class RuleRecorded7529(BundleFixture):
+    def rule_line(self):
+        lines = [l for l in self.bundle_file("SANITIZATION.md").splitlines() if l.startswith("legs.log rule: ")]
+        self.assertEqual(len(lines), 1, lines)
+        return lines[0]
+
+    def test_check_run_returns_the_rule_that_judged_the_log_7529(self):
+        legacy = "".join(leg_text(l) for l in CHAIN_LEGS[:-1]) + CHAIN_DONE_ROW
+        rules = {}
+        for name, text in (("config", GREEN_CHAIN), ("legacy", legacy), ("mixed", legacy + GREEN_CHAIN)):
+            rules[name] = self.bb.check_run(self.legs(text)).rule
+        self.assertEqual(len(set(rules.values())), 3, rules)
+        self.assertIn("CONFIG", rules["config"])
+        self.assertNotIn("legacy", rules["config"])
+        self.assertIn("legacy", rules["legacy"])
+        self.assertNotIn("CONFIG", rules["legacy"])
+        self.assertIn("CONFIG", rules["mixed"])
+        self.assertIn("legacy", rules["mixed"])
+
+    def test_check_run_still_returns_the_count_diff_notes_7529(self):
+        self.assertEqual(list(self.bb.check_run(self.legs(GREEN_CHAIN))), [])
+
+    def test_sanitization_md_records_the_config_rule_7529(self):
+        code, text = self.build()
+        self.assertEqual(code, 0, text)
+        self.assertEqual(self.rule_line(), "legs.log rule: " + self.bb.check_run(self.outd).rule)
+        self.assertIn("CONFIG", self.rule_line())
+        self.assertIn("author prose", self.bundle_file("SANITIZATION.md"))
+
+    def test_sanitization_md_records_the_legacy_rule_7529(self):
+        (self.outd / "legs.log").write_text("".join(leg_text(l) for l in CHAIN_LEGS[:-1]) + CHAIN_DONE_ROW)
+        code, text = self.build()
+        self.assertEqual(code, 0, text)
+        self.assertIn("legacy", self.rule_line())
+        self.assertNotIn("CONFIG", self.rule_line())
+
+
 if __name__ == "__main__":
     unittest.main()
