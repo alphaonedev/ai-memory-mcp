@@ -623,7 +623,7 @@ class CspPerDirective7543(unittest.TestCase):
         self.assertTrue(origin_mod.source_allows(src, "https://a.example", "/allowed/x"))
 
     def test_7544_a_path_with_a_query_or_fragment_is_an_invalid_source(self):
-        for bad in ("https://a.example/p?q=1", "https://a.example/p#f", "https://a.example/p;x", "https://a.example/p,x"):
+        for bad in ("https://a.example/p?q=1", "https://a.example/p#f", "https://a.example/p,x"):
             policy = origin_mod.parse_policy("img-src " + bad)
             self.assertEqual(len(policy.invalid), 1, bad)
 

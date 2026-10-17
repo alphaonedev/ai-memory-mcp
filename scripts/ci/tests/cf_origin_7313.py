@@ -169,10 +169,32 @@ def normalise_url(value):
     return re.sub(r"[\t\n\r]", "", value).replace("\\", "/")
 
 
-def parse_origin(value):
-    """Origin (`scheme://host[:port]`, lower-case, default port dropped) of an http(s) or protocol-relative
-    URL, or None for anything that loads nothing from another network origin (page-relative, `data:`,
-    `javascript:`, any non-http(s) scheme). Raises UnparsedURL for a network URL that does not parse."""
+def _resolve_path(path):
+    """Resolve `.` and `..` segments (also their `%2e` spellings) like the WHATWG path state."""
+    segments = path.split("/")[1:]
+    out = []
+    for index, segment in enumerate(segments):
+        last = index == len(segments) - 1
+        low = segment.lower()
+        if low in (".", "%2e"):
+            if last:
+                out.append("")
+            continue
+        if low in ("..", ".%2e", "%2e.", "%2e%2e"):
+            if out:
+                out.pop()
+            if last:
+                out.append("")
+            continue
+        out.append(segment)
+    return "/" + "/".join(out)
+
+
+def parse_url(value):
+    """(origin, path) of an http(s) or protocol-relative URL, or None for anything that loads nothing from
+    another network origin (page-relative, `data:`, `javascript:`, any non-http(s) scheme). The origin is
+    `scheme://host[:port]` (lower-case, default port dropped); the path has dot segments resolved and no
+    query or fragment (`/` when empty). Raises UnparsedURL for a network URL that does not parse."""
     text = normalise_url(value)
     match = _SCHEME_RE.match(text)
     if match:
@@ -188,6 +210,8 @@ def parse_origin(value):
         return None
     rest = rest.lstrip("/")  # the special-authority states skip every leading slash
     authority = rest[:re.search(r"[/?#]|$", rest).start()]
+    target = re.split(r"[?#]", rest[len(authority):], maxsplit=1)[0]
+    path = _resolve_path(target if target.startswith("/") else "/" + target)
     hostport = authority[authority.rfind(chr(64)) + 1:]  # userinfo ends at the LAST at-sign
     if hostport.startswith("["):
         close = hostport.find("]")
@@ -206,21 +230,98 @@ def parse_origin(value):
     if port and int(port) > MAX_PORT:
         raise UnparsedURL("port out of range")
     suffix = "" if not port or port == DEFAULT_PORTS[scheme] else ":" + port
-    return "%s://%s%s" % (scheme, host, suffix)
+    return "%s://%s%s" % (scheme, host, suffix), path
 
 
-class _OriginParser(HTMLParser):
-    """Collect external http(s) origins from resource-loading tags with a real HTML parser
-    (tag and attribute names arrive lower-cased, attribute values are entity-unescaped)."""
+def parse_origin(value):
+    """Origin of a URL as `parse_url` reads it, or None when it loads nothing from another network origin."""
+    parsed = parse_url(value)
+    return parsed[0] if parsed else None
+
+
+# A loaded resource: `kind` is the fetch kind the browser checks (a key of CHAINS), `origin` is the normalised
+# origin (or `unparsed:<value>`), `path` the resolved URL path, `nonce` the element's nonce attribute.
+Load = collections.namedtuple("Load", "kind origin path nonce")
+
+# kind -> the CSP3 fallback chain of fetch directives; the FIRST directive present in the policy governs
+CHAINS = {
+    "script": ("script-src-elem", "script-src", "default-src"),
+    "style": ("style-src-elem", "style-src", "default-src"),
+    "img": ("img-src", "default-src"),
+    "font": ("font-src", "default-src"),
+    "media": ("media-src", "default-src"),
+    "frame": ("frame-src", "child-src", "default-src"),
+    "worker": ("worker-src", "child-src", "script-src", "default-src"),
+    "object": ("object-src", "default-src"),
+    "manifest": ("manifest-src", "default-src"),
+    "connect": ("connect-src", "default-src"),
+    "default": ("default-src",),
+}
+_PRELOAD_AS = {"script": "script", "style": "style", "font": "font", "image": "img", "fetch": "connect",
+               "audio": "media", "video": "media", "track": "media", "worker": "worker", "sharedworker": "worker",
+               "document": "frame", "embed": "object", "object": "object"}
+_ICON_RELS = frozenset(("icon", "shortcut", "apple-touch-icon", "apple-touch-icon-precomposed", "mask-icon"))
+_PREFETCH_RELS = frozenset(("prefetch", "prerender", "next"))
+
+
+def _link_kind(attrs):
+    rels = set(attrs.get("rel", "").lower().split())
+    if "stylesheet" in rels:
+        return "style"
+    if rels & _ICON_RELS:
+        return "img"
+    if "manifest" in rels:
+        return "manifest"
+    if "modulepreload" in rels:
+        return "script"
+    if "preload" in rels:
+        return _PRELOAD_AS.get(attrs.get("as", "").lower(), "default")
+    if rels & _PREFETCH_RELS:
+        return "connect"
+    return "default"  # an unknown rel is judged by default-src alone
+
+
+def _attr_kind(tag, attr, attrs, context):
+    if attr in ("srcset", "imagesrcset", "poster"):
+        return "img"
+    if tag == "script":
+        return "script"
+    if tag == "link":
+        return _link_kind(attrs)
+    if tag in ("img", "image", "input"):
+        return "img"
+    if tag == "iframe":
+        return "frame"
+    if tag in ("embed", "object"):
+        return "object"
+    if tag in ("video", "audio", "track"):
+        return "media"
+    if tag == "source":
+        return "media" if context in ("video", "audio") else "img"
+    return "default"
+
+
+class _ResourceParser(HTMLParser):
+    """Collect external http(s) loads from resource-loading tags with a real HTML parser (tag and attribute
+    names arrive lower-cased, attribute values are entity-unescaped). Each load carries its fetch kind."""
 
     TAGS = frozenset(("link", "script", "img", "iframe", "source", "video", "audio", "embed", "object",
                       "track", "input", "image"))
+    CONTEXTS = ("video", "audio", "picture")
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
-        self.found = set()
+        self.loads = []
+        self._open = []  # the enclosing video / audio / picture elements
+
+    def handle_endtag(self, tag):
+        if tag in self.CONTEXTS and tag in self._open:
+            del self._open[len(self._open) - 1 - self._open[::-1].index(tag):]
 
     def handle_starttag(self, tag, attrs):
+        context = self._open[-1] if self._open else ""
+        if tag in self.CONTEXTS:
+            self._open.append(tag)
         if tag not in self.TAGS:
             return
         found = {}
@@ -230,61 +331,123 @@ class _OriginParser(HTMLParser):
         rels = set(attrs.get("rel", "").lower().split())
         if tag == "link" and rels and rels <= NON_LOADING_RELS:
             return
-        values = [attrs[k] for k in URL_ATTRS if k in attrs]
+        values = [(k, attrs[k]) for k in URL_ATTRS if k in attrs]
         for key in ("srcset", "imagesrcset"):
             if key in attrs:
-                values.extend(c.split()[0] for c in attrs[key].split(",") if c.split())
-        for value in values:
+                values.extend((key, c.split()[0]) for c in attrs[key].split(",") if c.split())
+        nonce = attrs.get("nonce", "")
+        for attr, value in values:
+            kind = _attr_kind(tag, attr, attrs, context)
             try:
-                origin = parse_origin(value)
+                parsed = parse_url(value)
             except UnparsedURL:
-                self.found.add(UNPARSED_PREFIX + value)  # fail closed: never in an allow-set, so the guard goes red
+                # fail closed: never allowed by any policy, so the guard goes red
+                self.loads.append(Load(kind, UNPARSED_PREFIX + value, "", nonce))
                 continue
-            if origin:
-                self.found.add(origin)
+            if parsed:
+                self.loads.append(Load(kind, parsed[0], parsed[1], nonce))
+
+
+def loaded_resources(html):
+    """External http(s) loads of a page as Load tuples (protocol-relative //host counts as https); a URL that
+    cannot be parsed has the origin `unparsed:<value>` so the guard fails instead of dropping it."""
+    parser = _ResourceParser()
+    parser.feed(html)
+    parser.close()
+    return parser.loads
 
 
 def loaded_origins(html):
-    """External http(s) origins a page loads (protocol-relative //host counts as https); a URL that cannot
-    be parsed is returned as `unparsed:<value>` so the guard fails instead of dropping it."""
-    parser = _OriginParser()
-    parser.feed(html)
-    parser.close()
-    return parser.found
+    """The distinct origins of `loaded_resources`."""
+    return {load.origin for load in loaded_resources(html)}
 
 
-Source = collections.namedtuple("Source", "scheme host port")
+Source = collections.namedtuple("Source", "scheme host port path")
+Policy = collections.namedtuple("Policy", "directives invalid")
+# CSP3 host-source: [scheme "://"] host [":" port] [path]; host-char is ALPHA / DIGIT / "-" only, so IPv6
+# literals and underscores are NOT valid sources (browsers ignore them); a path has no ? # ; or ,
 _CSP_HOST_SOURCE = re.compile(
-    r"^(?:(?P<scheme>[a-z][a-z0-9+.\-]*)://)?(?P<host>\*|(?:\*\.)?[a-z0-9_.\-]+|\[[0-9a-f:.]+\])"
-    r"(?::(?P<port>[0-9]+|\*))?(?:/[^\s;,]*)?$", re.IGNORECASE)
+    r"^(?:(?P<scheme>[a-z][a-z0-9+.\-]*)://)?(?P<host>\*|(?:\*\.)?[a-z0-9\-]+(?:\.[a-z0-9\-]+)*)"
+    r"(?::(?P<port>[0-9]+|\*))?(?P<path>/[^\s;,?#]*)?$", re.IGNORECASE)
 _CSP_SCHEME_SOURCE = re.compile(r"^([a-z][a-z0-9+.\-]*):$", re.IGNORECASE)
+_NONCE = re.compile(r"^nonce-([A-Za-z0-9+/_\-]+=*)$")
+_HASH = re.compile(r"^(?:sha256|sha384|sha512)-[A-Za-z0-9+/_\-]+=*$", re.IGNORECASE)
+_KEYWORDS = frozenset(("self", "none", "unsafe-inline", "unsafe-eval", "unsafe-hashes", "strict-dynamic",
+                       "report-sample", "wasm-unsafe-eval", "inline-speculation-rules", "trusted-types-eval",
+                       "unsafe-allow-redirects"))
+_SOURCE_LIST_DIRECTIVES = frozenset(d for chain in CHAINS.values() for d in chain) | frozenset((
+    "script-src-attr", "style-src-attr", "prefetch-src", "base-uri", "form-action", "frame-ancestors", "navigate-to"))
+_STRICT_DYNAMIC_DIRECTIVES = frozenset(("script-src", "script-src-elem", "default-src"))
+_ASCII_SPACE = re.compile("[ \t\n\r\f]+")
+
+
+def _classify(token):
+    """One CSP source expression as (kind, value), or None when it is invalid (browsers ignore it)."""
+    if len(token) > 1 and token.startswith("'") and token.endswith("'"):
+        inner = token[1:-1]
+        if inner.lower() in _KEYWORDS:
+            return "keyword", inner.lower()
+        nonce = _NONCE.match(inner)
+        if nonce:
+            return "nonce", nonce.group(1)
+        if _HASH.match(inner):
+            return "hash", inner
+        return None
+    scheme_only = _CSP_SCHEME_SOURCE.match(token)
+    if scheme_only:
+        return "scheme", Source(scheme_only.group(1).lower(), "", "", "")
+    m = _CSP_HOST_SOURCE.match(token)
+    if not m:
+        return None
+    scheme = (m.group("scheme") or PAGE_SCHEME).lower()
+    port = m.group("port") or ""
+    if port != "*" and port:
+        if int(port) > MAX_PORT:
+            return None
+        port = str(int(port))
+        port = "" if port == DEFAULT_PORTS.get(scheme) else port
+    return "host", Source(scheme, m.group("host").lower(), port, m.group("path") or "")
+
+
+def parse_policy(csp):
+    """Policy(directives, invalid): directive name (lower-case; the FIRST occurrence of a duplicate wins) mapped
+    to its classified source expressions, and the (directive, token) pairs that are invalid and so match
+    nothing. Directives that are not source lists (sandbox, report-uri, ...) are kept as raw tokens."""
+    directives, invalid = {}, []
+    for part in csp.split(";"):
+        tokens = [t for t in _ASCII_SPACE.split(part) if t]
+        if not tokens:
+            continue
+        name = tokens[0].lower()
+        if not re.fullmatch(r"[a-z0-9\-]+", name) or name in directives:
+            continue
+        entries = []
+        for token in tokens[1:]:
+            if name not in _SOURCE_LIST_DIRECTIVES:
+                entries.append(("raw", token))
+                continue
+            entry = _classify(token)
+            if entry is None:
+                invalid.append((name, token))
+            else:
+                entries.append(entry)
+        directives[name] = entries
+    return Policy(directives, invalid)
 
 
 def csp_sources(csp):
-    """Source expressions of a CSP value as Source(scheme, host, port); scheme-only sources have host ''.
-    Scheme and host are case-insensitive, `:*` is kept as the explicit wildcard port, the default port is
-    dropped. Keywords and directive names are skipped; an unrecognised expression raises ValueError."""
+    """Flat view of a CSP value: every valid scheme / host source of every directive as Source(scheme, host, port,
+    path); scheme-only sources have host ''. Scheme and host are case-insensitive, `:*` is the explicit wildcard
+    port, the default port is dropped. Invalid expressions are left out (they match nothing). Where
+    'strict-dynamic' is present in a script directive (or default-src) its host and scheme sources are ignored by
+    browsers and are left out too. The guard itself uses `load_allowed`, which does not flatten."""
+    policy = parse_policy(csp)
     sources = []
-    for directive in csp.split(";"):
-        tokens = directive.split()
-        for token in tokens[1:]:  # tokens[0] is the directive name
-            if token.startswith("'") and token.endswith("'") and len(token) > 1:
-                continue
-            scheme_only = _CSP_SCHEME_SOURCE.match(token)
-            if scheme_only:
-                sources.append(Source(scheme_only.group(1).lower(), "", ""))
-                continue
-            m = _CSP_HOST_SOURCE.match(token)
-            if not m:
-                raise ValueError("unrecognised CSP source expression: %r" % token)
-            scheme = (m.group("scheme") or PAGE_SCHEME).lower()
-            if scheme not in DEFAULT_PORTS:
-                raise ValueError("unsupported CSP source scheme: %r" % token)
-            port = m.group("port") or ""
-            if port != "*" and port:
-                port = str(int(port))
-                port = "" if port == DEFAULT_PORTS[scheme] else port
-            sources.append(Source(scheme, m.group("host").lower(), port))
+    for name, entries in policy.directives.items():
+        strict = name in _STRICT_DYNAMIC_DIRECTIVES and ("keyword", "strict-dynamic") in entries
+        for kind, value in entries:
+            if kind in ("scheme", "host") and not strict:
+                sources.append(value)
     return sources
 
 
@@ -297,15 +460,53 @@ def _split_origin(origin):
     return scheme, host, port
 
 
-def source_allows(source, origin):
-    """True when the CSP host-source admits the loaded origin string (`scheme://host[:port]`)."""
+def _path_matches(source_path, path):
+    """CSP3 path-part matching: exact, or a prefix when the source path ends in a slash; both percent-decoded."""
+    want = urllib.parse.unquote_to_bytes(source_path)
+    got = urllib.parse.unquote_to_bytes(path)
+    return got.startswith(want) if want.endswith(b"/") else got == want
+
+
+def source_allows(source, origin, path=None):
+    """True when the CSP scheme / host source admits the loaded origin string (`scheme://host[:port]`) and URL
+    path. A source with a path part cannot admit a check that supplies no path (`path=None`): fail closed."""
     scheme, host, port = _split_origin(origin)
-    if source.scheme != scheme or not source.host:
-        return False
+    if source.scheme != scheme and not (source.scheme == "http" and scheme == "https"):
+        return False  # a scheme-part matches the same scheme, and http: also matches https:
+    if not source.host:
+        return True  # a scheme source
     if source.host == "*":
         host_ok = True
     elif source.host.startswith("*."):
-        host_ok = host.endswith(source.host[1:])
+        host_ok = host.endswith(source.host[1:]) and len(host) > len(source.host) - 1
     else:
         host_ok = host == source.host
-    return host_ok and (source.port == "*" or source.port == port)
+    if not host_ok or not (source.port == "*" or source.port == port):
+        return False
+    if source.path:
+        return path is not None and _path_matches(source.path, path)
+    return True
+
+
+def effective_directive(policy, kind):
+    """The directive that governs a resource kind (CSP3 fallback chain), or None when none is present, which
+    leaves the load unrestricted."""
+    for name in CHAINS.get(kind, CHAINS["default"]):
+        if name in policy.directives:
+            return name
+    return None
+
+
+def load_allowed(policy, load):
+    """True when the load passes the source list of ITS governing directive; source lists are never merged."""
+    if load.origin.startswith(UNPARSED_PREFIX):
+        return False
+    name = effective_directive(policy, load.kind)
+    if name is None:
+        return True
+    entries = policy.directives[name]
+    if load.kind in ("script", "style") and load.nonce and ("nonce", load.nonce) in entries:
+        return True
+    if load.kind == "script" and ("keyword", "strict-dynamic") in entries:
+        return False  # 'strict-dynamic' makes browsers ignore host and scheme sources for scripts
+    return any(kind in ("scheme", "host") and source_allows(value, load.origin, load.path) for kind, value in entries)
