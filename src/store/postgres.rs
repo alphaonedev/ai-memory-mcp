@@ -30766,18 +30766,26 @@ impl MemoryStore for PostgresStore {
         let caller = ctx.effective_principal();
         let bypass = ctx.bypass_visibility;
 
+        // #7097 - one transaction around the purge, matching the sqlite
+        // purge (`BEGIN IMMEDIATE` with or without a cold tier): the delete
+        // settles as a unit and a failure leaves every archived row.
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin archive_purge tx", e))?;
         let res = match (cutoff, bypass) {
             // Admin path — full owner-blind purge. The route's role
             // gate ensures only admin callers can reach this branch.
             (Some(cutoff), true) => {
                 sqlx::query("DELETE FROM archived_memories WHERE archived_at < $1")
                     .bind(cutoff)
-                    .execute(&self.pool)
+                    .execute(&mut *tx)
                     .await
                     .map_err(|e| to_store_err("archive_purge admin", e))?
             }
             (None, true) => sqlx::query("DELETE FROM archived_memories")
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("archive_purge admin all", e))?,
             // Owner-scoped path — narrow to rows the caller owns
@@ -30793,7 +30801,7 @@ impl MemoryStore for PostgresStore {
             )
             .bind(cutoff)
             .bind(caller)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("archive_purge owner", e))?,
             (None, false) => sqlx::query(
@@ -30803,10 +30811,13 @@ impl MemoryStore for PostgresStore {
                    (metadata->>'target_agent_id') = $1",
             )
             .bind(caller)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| to_store_err("archive_purge owner all", e))?,
         };
+        tx.commit()
+            .await
+            .map_err(|e| to_store_err("archive_purge commit tx", e))?;
         Ok(usize::try_from(res.rows_affected()).unwrap_or(0))
     }
 

@@ -17790,8 +17790,12 @@ fn purge_archive_matching(
     sql_params: &[&dyn rusqlite::types::ToSql],
 ) -> Result<usize> {
     let Some(store) = crate::erasure::archive_sync::store_if_dir_present(conn) else {
+        // #7097 - one write transaction with or without a cold tier, like the
+        // postgres purge: the DELETE settles as a unit and joins a caller's tx.
         let sql = format!("DELETE FROM archived_memories WHERE {where_clause}");
-        return Ok(conn.execute(&sql, sql_params)?);
+        return crate::storage::connection::in_write_txn(conn, || {
+            Ok(conn.execute(&sql, sql_params)?)
+        });
     };
     // Lock acquisition precedes BEGIN IMMEDIATE. Detached sweep/reconcile code
     // uses a dedicated connection and never waits on the handler mutex while
