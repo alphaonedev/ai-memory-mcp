@@ -11,5 +11,8 @@
 # FORMAT: <leg-id> <min-executed>
 # Whole-line `#` comments and blanks ignored.
 #
-cert-postgres-age 152
+# cert-postgres-age raised 152 -> 166 (#7130 / #7324 review LOW-2): run
+# 39012008175 executed 164 with the #7130 cell, plus the cell's two
+# preload-parser unit tests.
+cert-postgres-age 166
 postgres-ignored 154
