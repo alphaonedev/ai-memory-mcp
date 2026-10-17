@@ -224,6 +224,40 @@ class WranglerTimeout7313(unittest.TestCase):
             self.assertEqual(mod.main(), 1)
 
 
+class HtmlAndHeaders7313(unittest.TestCase):
+    """F4 (attribute-safe escaping) and F5 (_headers CSP, framing, no duplicate rule)."""
+
+    def test_every_page_has_attribute_safe_esc_and_no_raw_state_fields(self):
+        raw = ("${fam.family}", "${t.cls}", "${t.name.replace", "${it.title}", "${a.node}", "${l.name}", "${x.d||")
+        for page in sorted(PUBLIC.glob("*.html")):
+            text = page.read_text()
+            m = re.search(r"(?:function esc\(s\)\{return |const esc=s=>)([^\n]*)", text)
+            self.assertIsNotNone(m, "%s defines no esc()" % page.name)
+            for ent in ("&amp;", "&lt;", "&gt;", "&quot;", "&#39;"):
+                self.assertIn(ent, m.group(1), "%s esc() misses %s" % (page.name, ent))
+            for token in raw:
+                self.assertNotIn(token, text, "%s interpolates %s unescaped" % (page.name, token))
+
+    def test_headers_csp_matches_loaded_origins(self):
+        headers = (PUBLIC / "_headers").read_text()
+        csp = re.search(r"Content-Security-Policy: (.*)", headers)
+        self.assertIsNotNone(csp, "no Content-Security-Policy")
+        csp = csp.group(1)
+        self.assertIn("frame-ancestors 'none'", csp)
+        self.assertIn("X-Frame-Options: DENY", headers)
+        self.assertEqual(headers.count("/state.json"), 0, "redundant /state.json rule (covered by /*.json)")
+        allowed = set(re.findall(r"https://[a-z0-9.-]+", csp))
+        loaded = set()
+        for page in sorted(PUBLIC.glob("*.html")):
+            for tag in re.findall(r"<(?:link|script|img|iframe)\b[^>]*>", page.read_text()):
+                if "rel=\"preconnect\"" in tag:
+                    continue
+                loaded.update(re.findall(r"https://[a-z0-9.-]+", tag.split("data:image")[0]))
+        self.assertTrue(loaded, "expected external stylesheet origins")
+        self.assertTrue(loaded <= allowed, "origins loaded but not allowed by CSP: %s" % (loaded - allowed))
+        self.assertEqual(allowed - loaded - {"https://fonts.gstatic.com"}, set(), "CSP allows unused origins")
+
+
 class DeployCli7313(unittest.TestCase):
     def test_deploy_help_and_no_shell_true(self):
         p = subprocess.run([sys.executable, str(DASH / "deploy.py"), "--help"],
