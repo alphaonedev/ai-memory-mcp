@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
 OUT="$ROOT/docs/compliance/evidence/cert-385da3a05"
-FIX="$ROOT/.local-runs/cert-385da3a05-fixtures"
+export FIX="$ROOT/.local-runs/cert-385da3a05-fixtures"
 DEFAULT_BIN="${DEFAULT_BIN:-/mnt/t9/v07/cargo-target-gate-tip/release/ai-memory}"
 SQLCIPHER_BIN="${SQLCIPHER_BIN:-/mnt/t9/v07/cargo-target-gate-live/release/ai-memory}"
 export TMPDIR="${TMPDIR:-$ROOT/.local-runs/tmp}"
@@ -18,7 +18,7 @@ import os, base64
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, PrivateFormat, NoEncryption
 
-fix = Path(os.environ.get("FIX") or Path.cwd() / ".local-runs/cert-3607-fixtures")
+fix = Path(os.environ["FIX"])
 fix.mkdir(parents=True, exist_ok=True)
 keys = fix / "keys"
 keys.mkdir(mode=0o700, exist_ok=True)
@@ -122,14 +122,34 @@ if [[ ! -x "$SQLCIPHER_BIN" ]]; then
   e4=missing
 else
   # #3553 check #21 observes the LIVE pragma on the store the sqlcipher build can open only with a passphrase.
-  [[ -f "$FIX/db-passphrase" ]] || { umask 077; od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$FIX/db-passphrase"; }
+  # #4830: the passphrase travels in the child's environment only, set by a wrapper that reads POSTURE_PASSFILE;
+  # it is never an argv word of env, bash or the binary.
+  POSTURE_PASSFILE="$FIX/db-passphrase"
+  export POSTURE_PASSFILE
+  [[ -f "$POSTURE_PASSFILE" ]] || { umask 077; od -An -N32 -tx1 /dev/urandom | tr -d ' \n' > "$POSTURE_PASSFILE"; }
+  [[ -s "$POSTURE_PASSFILE" ]] || exit 70
+  WRAP="$FIX/with-passphrase.py"
+  cat >"$WRAP" <<'WRAPPER'
+#!/usr/bin/env python3
+import os, sys
+try:
+    value = open(os.environ["POSTURE_PASSFILE"]).read().replace("\n", "")
+except OSError:
+    value = ""
+if not value:
+    sys.exit(70)
+os.environ["AI_MEMORY_DB_PASSPHRASE"] = value
+os.execv(os.environ["POSTURE_BIN"], [os.environ["POSTURE_BIN"]] + sys.argv[1:])
+WRAPPER
+  chmod 0700 "$WRAP"
   # doctor opens the store read-only and refuses to create it: seed the encrypted fixture store first (schema-init).
   [[ -f "$FIX/leg4-sqlcipher.db" ]] || env -i PATH="/usr/bin:/bin:$HOME/.cargo/bin" HOME="$HOME" TMPDIR="$TMPDIR" AI_MEMORY_NO_CONFIG=1 \
-    AI_MEMORY_DB="$FIX/leg4-sqlcipher.db" AI_MEMORY_DB_PASSPHRASE="$(cat "$FIX/db-passphrase")" "$SQLCIPHER_BIN" stats --json >/dev/null 2>&1 || true
+    AI_MEMORY_DB="$FIX/leg4-sqlcipher.db" POSTURE_PASSFILE="$POSTURE_PASSFILE" POSTURE_BIN="$SQLCIPHER_BIN" "$WRAP" stats --json >/dev/null 2>&1 || true
   set +e
-  run_posture "$SQLCIPHER_BIN" "${HARD[@]}" \
+  run_posture "$WRAP" "${HARD[@]}" \
     AI_MEMORY_DB="$FIX/leg4-sqlcipher.db" \
-    AI_MEMORY_DB_PASSPHRASE="$(cat "$FIX/db-passphrase")" \
+    POSTURE_PASSFILE="$POSTURE_PASSFILE" \
+    POSTURE_BIN="$SQLCIPHER_BIN" \
     AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE=1 \
     >"$OUT/posture-sqlcipher-pass.out.raw" 2>&1
   e4=$?
