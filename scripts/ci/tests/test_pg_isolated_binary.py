@@ -9,6 +9,7 @@ SQL order, child environments and exit codes. ``LiveEndToEnd`` additionally
 runs the real script against the Postgres named by
 ``AI_MEMORY_TEST_POSTGRES_URL`` and skips when that is unset.
 """
+import ast
 import importlib.util
 import os
 import re
@@ -164,182 +165,70 @@ def runner(env=None, log_dir=None, width=2):
                       log_dir=log_dir or scratch_dir(), width=width)
 
 
-try:
-    from re import _constants as sre_constants, _parser as sre_parse
-except ImportError:  # Python 3.9 and 3.10
-    import sre_constants
-    import sre_parse
-
-_REPEAT_OPS = frozenset(
-    getattr(sre_constants, name) for name in ('MAX_REPEAT', 'MIN_REPEAT', 'POSSESSIVE_REPEAT')
-    if hasattr(sre_constants, name))
-# Sample code points standing in for every class a category or a negated set can reach.
-_CHAR_UNIVERSE = tuple(range(256)) + (0x2003, 0x4E00, 0x10FFFF)
+def _pad(prefix, filler, suffix=''):
+    return lambda n: prefix + filler * (n - len(prefix) - len(suffix)) + suffix
 
 
-def _category_chars(name):
-    word = lambda c: chr(c).isalnum() or c == 0x5F  # noqa: E731
-    space = lambda c: chr(c).isspace()  # noqa: E731
-    digit = lambda c: chr(c).isdigit()  # noqa: E731
-    tests = {
-        'CATEGORY_DIGIT': digit, 'CATEGORY_NOT_DIGIT': lambda c: not digit(c),
-        'CATEGORY_SPACE': space, 'CATEGORY_NOT_SPACE': lambda c: not space(c),
-        'CATEGORY_WORD': word, 'CATEGORY_NOT_WORD': lambda c: not word(c),
-    }
-    test = tests.get(name)
-    return frozenset(c for c in _CHAR_UNIVERSE if test is None or test(c))
+# Every regex of pg_isolated_binary.py, PINNED (#7615, #7653): (pattern, flags, one-line linearity reason, worst-case
+# input generator taking a size in characters). The test compares this set with the module, so a new, changed or
+# removed regex fails until a reviewer edits this table. Each regex is also timed against its generator at
+# GUARD_SQL_MAX_BYTES; the size cap, not any detector, is the real bound. Flags 32 is re.UNICODE, the str default.
+PINNED_REGEXES = (
+    (r'[0-9]+', re.UNICODE,
+     'one quantified class and nothing after it: nothing to give back', _pad('', '0', '!')),
+    (r'^[a-z0-9]{1,20}$', re.UNICODE,
+     'one bounded class repetition between anchors', _pad('', 'a')),
+    (r'^ai_memory_t_([a-z0-9]{1,20})_([0-9]{10})_([0-9a-f]{8})$', re.UNICODE,
+     'bounded class repetitions separated by fixed underscores: no two quantifiers overlap',
+     _pad('ai_memory_t_', 'a')),
+    (r'^[A-Za-z0-9_]{1,63}$', re.UNICODE,
+     'one bounded class repetition between anchors', _pad('', 'a')),
+    (r'^--(test|bin) ([A-Za-z0-9_-]+)$', re.UNICODE,
+     'fixed prefix, a literal space, then one class repetition to the anchor', _pad('--test ', 'a', '!')),
+    (r'[A-Za-z_\x80-\U0010ffff]', re.UNICODE,
+     'one character class, matched at one index', _pad('', '1')),
+    (r'[A-Za-z0-9_$\x80-\U0010ffff]*', re.UNICODE,
+     'one quantified class and nothing after it: nothing to give back', _pad('', 'a', '-')),
+    (r'\$(?:[A-Za-z_\x80-\U0010ffff][A-Za-z0-9_\x80-\U0010ffff]*)?\$', re.UNICODE,
+     'a start class then one quantified class disjoint from the closing dollar, tried once per dollar',
+     _pad('$', 'a')),
+    (r'[0-9A-Fa-f]+', re.UNICODE,
+     'one quantified class and nothing after it: nothing to give back', _pad('', 'f', 'g')),
+)
 
 
-def _node_chars(node, fold):
-    """Code points a single parsed node can consume (zero-width nodes consume none)."""
-    op, arg = node
-    name = str(op)
-    universe = frozenset(_CHAR_UNIVERSE)
-    if name == 'LITERAL':
-        chars = {arg}
-        if fold and chr(arg).swapcase() != chr(arg):
-            chars.add(ord(chr(arg).swapcase()))
-        return frozenset(chars)
-    if name == 'NOT_LITERAL':
-        return universe - {arg}
-    if name == 'ANY':
-        return universe - {10}
-    if name == 'CATEGORY':
-        return _category_chars(str(arg))
-    if name == 'IN':
-        chars, negate = set(), False
-        for item_op, item_arg in arg:
-            item_name = str(item_op)
-            if item_name == 'NEGATE':
-                negate = True
-            elif item_name == 'RANGE':
-                chars.update(c for c in _CHAR_UNIVERSE if item_arg[0] <= c <= item_arg[1])
-            else:
-                chars.update(_node_chars((item_op, item_arg), fold))
-        return universe - chars if negate else frozenset(chars)
-    if name in ('AT', 'ASSERT', 'ASSERT_NOT'):
-        return frozenset()
-    if name == 'SUBPATTERN':
-        return _seq_chars(arg[3], fold)
-    if name == 'ATOMIC_GROUP':
-        return _seq_chars(arg, fold)
-    if name == 'BRANCH':
-        return frozenset().union(*(_seq_chars(branch, fold) for branch in arg[1]))
-    if op in _REPEAT_OPS:
-        return _seq_chars(arg[2], fold)
-    return universe  # GROUPREF and anything unknown: assume it overlaps everything
+def regex_audit_problems(source, patterns, pinned):
+    """Return the ways the regexes of a module differ from the pinned table (#7653). Fail closed, no detection.
 
-
-def _seq_chars(sequence, fold):
-    return frozenset().union(*(_node_chars(node, fold) for node in sequence))
-
-
-def _branches_in(sequence):
-    """Every alternation (list of branch sequences) found anywhere under a sequence."""
-    found = []
-    for node in sequence:
-        if str(node[0]) == 'BRANCH':
-            found.append(list(node[1][1]))
-        for child in _children(node):
-            found.extend(_branches_in(child))
-    return found
-
-
-def _nullable(node):
-    op, arg = node
-    name = str(op)
-    if name in ('AT', 'ASSERT', 'ASSERT_NOT'):
-        return True
-    if op in _REPEAT_OPS:
-        return arg[0] == 0 or all(_nullable(inner) for inner in arg[2])
-    if name == 'SUBPATTERN':
-        return all(_nullable(inner) for inner in arg[3])
-    if name == 'ATOMIC_GROUP':
-        return all(_nullable(inner) for inner in arg)
-    if name == 'BRANCH':
-        return any(all(_nullable(inner) for inner in branch) for branch in arg[1])
-    return False
-
-
-def _first_chars(sequence, fold):
-    """Code points a match of the sequence can start with."""
-    chars = set()
-    for node in sequence:
-        name = str(node[0])
-        if name == 'BRANCH':
-            for branch in node[1][1]:
-                chars |= _first_chars(branch, fold)
-        elif name == 'SUBPATTERN':
-            chars |= _first_chars(node[1][3], fold)
-        elif name == 'ATOMIC_GROUP':
-            chars |= _first_chars(node[1], fold)
-        elif node[0] in _REPEAT_OPS:
-            chars |= _first_chars(node[1][2], fold)
-        else:
-            chars |= _node_chars(node, fold)
-        if not _nullable(node):
-            break
-    return frozenset(chars)
-
-
-def _unbounded(node):
-    return node[0] in _REPEAT_OPS and node[1][1] > 1
-
-
-def _walk_sequence(sequence, fold, flaws):
-    nodes = list(sequence)
-    for index, node in enumerate(nodes):
-        op, arg = node
-        if _unbounded(node):
-            body = arg[2]
-            if any(_contains_unbounded(inner) for inner in body):
-                flaws.append('a repeated group contains another repeat')
-            for branches in _branches_in(body):
-                firsts = [_first_chars(branch, fold) for branch in branches]
-                empties = [all(_nullable(inner) for inner in branch) for branch in branches]
-                for left in range(len(firsts)):
-                    if any(firsts[left] & firsts[right] or (empties[left] and empties[right])
-                           for right in range(left + 1, len(firsts))):
-                        flaws.append('a repeated alternation has overlapping branches')
-            if index + 1 < len(nodes) and _unbounded(nodes[index + 1]):
-                if _seq_chars(body, fold) & _seq_chars(nodes[index + 1][1][2], fold):
-                    flaws.append('adjacent repeats can match the same characters')
-        for child in _children(node):
-            _walk_sequence(child, fold, flaws)
-
-
-def _children(node):
-    op, arg = node
-    name = str(op)
-    if name == 'SUBPATTERN':
-        return [arg[3]]
-    if name == 'ATOMIC_GROUP':
-        return [arg]
-    if name == 'BRANCH':
-        return list(arg[1])
-    if op in _REPEAT_OPS:
-        return [arg[2]]
-    if name in ('ASSERT', 'ASSERT_NOT'):
-        return [arg[1]]
-    return []
-
-
-def _contains_unbounded(node):
-    if _unbounded(node):
-        return True
-    return any(_contains_unbounded(inner) for child in _children(node) for inner in child)
-
-
-def nested_quantifier_flaws(pattern_text, flags=0):
-    """Return reasons a regex could backtrack super-linearly (#7615, #7632).
-
-    Walks the parsed pattern: a repeat above one that holds another such repeat, a repeated alternation whose
-    branches can start with the same character, and two adjacent repeats whose bodies share a character.
+    `source` is the module text, `patterns` its compiled module attributes. A problem is reported for: any use of
+    `re.<name>` or an alias/from-import of re outside a module-level `NAME = re.compile(...)`; a compiled pattern whose
+    (pattern, flags) is not pinned; a pinned row with no matching pattern; a compile call that is not stored as an
+    attribute. It pins and times regexes; it does not claim to detect super-linearity in general.
     """
-    parsed = sre_parse.parse(pattern_text, flags)
-    flaws = []
-    _walk_sequence(parsed, bool(flags & re.IGNORECASE), flaws)
-    return sorted(set(flaws))
+    tree = ast.parse(source)
+    allowed = set()
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == 'compile'
+                and isinstance(node.value.func.value, ast.Name) and node.value.func.value.id == 're'):
+            allowed.add(id(node.value.func))
+    problems, compiles = [], len(allowed)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == 're':
+            if id(node) not in allowed:
+                problems.append('line %d: re.%s outside a module-level NAME = re.compile(...)' % (node.lineno, node.attr))
+        elif isinstance(node, ast.ImportFrom) and (node.module or '').split('.')[0] == 're':
+            problems.append('line %d: from %s import ...' % (node.lineno, node.module))
+        elif isinstance(node, ast.Import):
+            problems.extend('line %d: import %s as %s' % (node.lineno, a.name, a.asname)
+                            for a in node.names if a.name.split('.')[0] == 're' and (a.asname or '.' in a.name))
+    if compiles != len(patterns):
+        problems.append('%d module-level compile calls but %d compiled module attributes' % (compiles, len(patterns)))
+    pins = {(pattern, flags) for pattern, flags, _reason, _generator in pinned}
+    found = {(value.pattern, value.flags) for value in patterns.values()}
+    problems.extend('not pinned: %r flags %d' % key for key in sorted(found - pins))
+    problems.extend('pinned but absent: %r flags %d' % key for key in sorted(pins - found))
+    return problems
 
 
 def implicit_concat_lines(source_bytes):
@@ -1210,35 +1099,6 @@ class TemplateOwnership(unittest.TestCase):
                 self.assertIn(str(cap), text)
                 self.assertEqual(rec.calls, [], 'psql was not started')
 
-    def test_every_module_regex_is_audited_linear_7615(self):
-        import re as regex
-        patterns = {name: value for name, value in vars(pib).items() if isinstance(value, regex.Pattern)}
-        self.assertEqual(sorted(patterns), sorted([
-            '_ANY_NAME_RE', '_DIGITS_RE', '_DOLLAR_TAG_RE', '_HEX_RE', '_IDENT_BODY_RE', '_IDENT_RE',
-            '_IDENT_START_RE', '_RUN_ID_RE', '_TARGET_RE']))
-        for name, pattern in patterns.items():
-            with self.subTest(pattern=name):
-                self.assertEqual(nested_quantifier_flaws(pattern.pattern, pattern.flags), [])
-        lines = SCRIPT.read_text(encoding='utf-8').splitlines()
-        for number, line in enumerate(lines):
-            if 're.compile(' in line and not line.lstrip().startswith('#'):
-                with self.subTest(line=number + 1):
-                    self.assertTrue(lines[number - 1].startswith('# linear:'), 'no "# linear:" reason above: ' + line)
-
-    BAD_REGEX_SHAPES_7632 = (
-        r"[\n\r](?:[ \t\n\r\f\v]+|--[^\n\r]*[\n\r])*'",
-        r'(a+)+', r'(a*)*', r'(a|a)*', r'\s*\s*', r'(?:x|\s)*\s*', r'(a+b)*', r'(?:a+|b)+', r'a*a*',
-    )
-    GOOD_REGEX_SHAPES_7632 = (r'a+b', r'[a-z]+\d*', r'(?:a|b)*', r'[A-Za-z_][A-Za-z0-9_]*', r'\d+\.\d+', r'(?:ab)+c')
-
-    def test_regex_audit_flags_the_nested_and_adjacent_overlapping_families_7632(self):
-        for text in self.BAD_REGEX_SHAPES_7632:
-            with self.subTest(bad=text):
-                self.assertNotEqual(nested_quantifier_flaws(text), [], 'not flagged: ' + text)
-        for text in self.GOOD_REGEX_SHAPES_7632:
-            with self.subTest(good=text):
-                self.assertEqual(nested_quantifier_flaws(text), [], 'wrongly flagged: ' + text)
-
     REGEX_TIMING_CHILD = (
         'import importlib.util, sys, time\n'
         'spec = importlib.util.spec_from_file_location("pib_regex_timing", sys.argv[1])\n'
@@ -1307,7 +1167,6 @@ class TemplateOwnership(unittest.TestCase):
                 self.assertNotEqual(regex_audit_problems(source + '\n' + extra, patterns, PINNED_REGEXES), [])
 
     def test_test_files_import_no_regex_internals_7653(self):
-        import ast
         for name in ('test_pg_isolated_binary.py', 'test_check_pg_isolate_invariants.py'):
             tree = ast.parse((Path(__file__).parent / name).read_text(encoding='utf-8'))
             for node in ast.walk(tree):
