@@ -33,8 +33,8 @@ the host.
 
 The header reads `2026-09-11 #3607 re-issue recapture (22 checks) @ eba96b307`.
 The date/issue label is the FIXED header string of the recapture script that
-produced the legs (`scripts/recapture-cert-eba96b307-posture.sh`, a copy of
-`scripts/recapture-cert-3607-posture.sh` with only its OUT/FIX directories
+produced the legs (`scripts/recapture-cert-eba96b307-posture.sh` (since ported to `scripts/recapture-cert-3607-posture.py --cert eba96b307`, #4829), a copy of
+`scripts/recapture-cert-3607-posture.sh` (since ported to `scripts/recapture-cert-3607-posture.py`, PR #7378) with only its OUT/FIX directories
 retargeted, whose own header declares the 22-check set); the `@ eba96b307` is
 that script's `git rev-parse --short HEAD` of the worktree it ran in, recorded
 verbatim, and it equals the bound SHA. The label is left as the script emitted

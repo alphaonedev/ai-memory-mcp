@@ -66,8 +66,9 @@ No secret material is recorded here.
 
 ## Reproducing
 
-`scripts/recapture-cert-9220-posture.sh` (committed alongside this bundle) is
-the retargeted sibling of `scripts/recapture-cert-f32c-posture.sh` and drives
+`scripts/recapture-cert-9220-posture.sh` (since ported to `scripts/recapture-cert-3607-posture.py --cert 92209ad91`, #4829) (committed alongside this
+bundle) is the retargeted sibling of `scripts/recapture-cert-f32c-posture.sh`
+(since ported to `scripts/recapture-cert-3607-posture.py --cert f32c18dad`, #4829) and drives
 the four legs. It needs `DEFAULT_BIN` and `SQLCIPHER_BIN` pointing at the two
 release binaries described above, `umask 022`, `XDG_CONFIG_HOME` unset, and a
 `TMPDIR` off `$HOME`.

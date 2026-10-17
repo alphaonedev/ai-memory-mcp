@@ -37,7 +37,7 @@ not re-run on the host.
 
 ## Reproduce
 
-`scripts/recapture-cert-f32c-posture.sh` regenerates the four posture legs
+`scripts/recapture-cert-f32c-posture.sh` (since ported to `scripts/recapture-cert-3607-posture.py --cert f32c18dad`, #4829) regenerates the four posture legs
 (point `DEFAULT_BIN` / `SQLCIPHER_BIN` at release builds of `f32c18dad`); the
 acceptance battery is `cargo test --test <name>` for the eight named binaries
 and three SEPARATE `cargo test --lib <filter>` invocations (never one
