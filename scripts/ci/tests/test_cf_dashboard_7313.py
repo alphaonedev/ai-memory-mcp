@@ -15,6 +15,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -651,6 +652,56 @@ class HtmlAndHeaders7313(unittest.TestCase):
         self.assertIsNotNone(guard, "renderAll lost its Array.isArray(dims) guard")
         self.assertLess(guard.start(), render.index('getElementById("ringpct")'))
         self.assertLess(render.index("_S(()=>board(dims))"), guard.start(), "panels must render before the guard")
+
+    BADGE_HARNESS = """
+const els = {};
+const document = {getElementById: id => els[id] || (els[id] = {className: "", textContent: ""})};
+let nextBody = null;
+function fetch() {
+  return Promise.resolve({ok: true, json: () => nextBody instanceof Error ? Promise.reject(nextBody) : Promise.resolve(nextBody)});
+}
+function renderAll(D) { if (!Array.isArray(D.dimensions)) throw new TypeError("state.dimensions is not a list"); }
+(async () => {
+  %(SOURCE)s
+  const out = {};
+  const text = () => els.livetext.textContent;
+  nextBody = {dimensions: [], lastUpdated: new Date().toISOString()};
+  await poll(); out.good = text();
+  nextBody = {dimensions: "not-a-list"};
+  await poll(); out.malformed = text(); tick(); out.malformedAfterTick = text();
+  nextBody = new SyntaxError("bad json");
+  await poll(); out.unparsable = text();
+  nextBody = {dimensions: [], lastUpdated: new Date().toISOString()};
+  await poll(); out.recovered = text(); tick(); out.recoveredAfterTick = text();
+  console.log(JSON.stringify(out));
+})();
+"""
+
+    def _poll_source(self):
+        text = (PUBLIC / "index.html").read_text(encoding="utf-8")
+        return text[text.index("let lastGood=0"):text.index('[["northstar"')]
+
+    def test_index_badge_says_offline_for_a_malformed_state_7548(self):
+        # renderAll throws on a non-list `dimensions`; the badge must not keep reading "connected" while the
+        # page shows a half-rendered state (the 1 s tick used to repaint "live" from lastGood alone)
+        source = self._poll_source()
+        self.assertIn("stateBad", source, "poll() does not track a malformed state")
+        self.assertRegex(source, r"function tick\(\)", "the 1 s badge tick is not a named function")
+        index = (PUBLIC / "index.html").read_text(encoding="utf-8")
+        self.assertIn("setInterval(tick,1000)", index)
+
+    @unittest.skipUnless(shutil.which("node"), "node is needed to execute the page's poll code")
+    def test_index_badge_behaviour_for_a_malformed_state_7548(self):
+        js = self.BADGE_HARNESS % {"SOURCE": self._poll_source()}
+        done = subprocess.run(["node", "-"], input=js, capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        out = json.loads(done.stdout)
+        self.assertTrue(out["good"].startswith("connected"), out)
+        self.assertTrue(out["malformed"].startswith("offline"), out)
+        self.assertTrue(out["malformedAfterTick"].startswith("offline"), out)
+        self.assertTrue(out["unparsable"].startswith("offline"), out)
+        self.assertTrue(out["recovered"].startswith("connected"), out)
+        self.assertTrue(out["recoveredAfterTick"].startswith("connected"), out)
 
     def test_headers_csp_matches_loaded_origins(self):
         headers = (PUBLIC / "_headers").read_text()
