@@ -70,7 +70,7 @@ ISOLATED_PREFIX = 'ai_memory_t'
 TEMPLATE_SUFFIX = '_tpl'
 ALREADY_EXISTS = 'already exists'  # psql detail of a CREATE DATABASE onto an occupied name
 IDENT_MAX = 63
-PSQL_CONNECTION_LOST = 2  # psql exit status: 1 = SQL error, 2 = connection lost
+PSQL_SQL_ERROR = 1  # psql exit status for a refused statement; every other status leaves the outcome unknown
 RUN_ID_MAX_LEN = 20
 MAX_JOBS = 8
 PER_BINARY_CONNECTIONS = 18
@@ -405,13 +405,16 @@ def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
                                'leftover of your own earlier run, run `pg_isolated_binary.py teardown --db %s '
                                '--run-id <run id>` first, otherwise choose a different --db'
                                % (tpl, exc, db_name))
-        if exc.returncode == PSQL_CONNECTION_LOST:
-            # The server may have committed the CREATE before the link dropped. Whether
-            # the template is ours is unknown, so setup neither claims it nor DROPs it (#7388).
-            raise WrapperError('CREATE DATABASE %s lost the server connection; the outcome is unknown and the '
-                               'template may exist with no owner record: %s; check pg_database and, if it is '
+        if exc.returncode != PSQL_SQL_ERROR:
+            # Status 1 means the server refused the statement. Any other status (2 lost
+            # connection, a negative signal status such as -9, None, an unexpected code)
+            # may follow a committed CREATE. Whether the template is ours is unknown, so
+            # setup neither claims it nor DROPs it (#7388, #7400).
+            check = "SELECT 1 FROM pg_database WHERE datname = '%s'" % tpl.replace("'", "''")
+            raise WrapperError('CREATE DATABASE %s ended without a clean answer; the outcome is unknown and the '
+                               'template may exist with no owner record: %s; check with `%s` and, if it is '
                                'from this run, run `pg_isolated_binary.py teardown --db %s --run-id <run id>`'
-                               % (tpl, exc, db_name), exc.returncode)
+                               % (tpl, exc, check, db_name), exc.returncode)
         raise WrapperError('CREATE DATABASE %s was refused; nothing was created or changed: %s' % (tpl, exc))
     try:
         psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')
