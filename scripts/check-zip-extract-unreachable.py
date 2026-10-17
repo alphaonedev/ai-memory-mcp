@@ -35,11 +35,15 @@ EXIT_VIOLATION = 1
 EXIT_USAGE = 2
 
 ZIP_CRATE = 'zip'
-ALLOWED_PARENT_PREFIX = 'candle-'
+# Exact crates that depend on zip today (candle-nn / candle-transformers 0.10.2
+# have no zip dependency). Widening this set needs an edit here and in audit.toml.
+ALLOWED_PARENTS = frozenset({'candle-core'})
 SCAN_DIRS = ('src', 'tests', 'benches')
 SCAN_FILES = ('build.rs',)
+# Dev edges are included so a zip dev-dependency (also under a target-cfg table)
+# is seen; `all` is not used because it adds `zip feature` lines.
 CARGO_TREE_ARGS = (
-    'tree', '-i', ZIP_CRATE, '--edges', 'normal,build', '--depth', '1',
+    'tree', '-i', ZIP_CRATE, '--edges', 'normal,build,dev', '--depth', '1',
     '--prefix', 'depth', '--target', 'all', '--all-features', '--offline', '--locked',
 )
 
@@ -84,36 +88,53 @@ def violation(location, message):
     return 'violation: %s: %s' % (escape_text(location), escape_text(message))
 
 
-def parse_parents(tree_text):
+class ToolError(RuntimeError):
+    """A tool or input problem: the guard cannot decide, so it exits 2 (fail closed)."""
+
+
+ROOT_LINE = re.compile(r'^0?zip v\S+')
+DEPTH_LINE = re.compile(r'^(\d+)(\S.*)$')
+DRAWN_LINE = re.compile(r'^(?:[|`+\-│├└─ ]{3,})(\S.*)$')
+
+
+def parse_tree(tree_text):
     """Direct parents of zip from `cargo tree -i zip --depth 1` output.
 
-    Accepts the `--prefix depth` form (`1candle-core v0.10.2`) and the default
-    drawn form (`+-- name`, `|-- name`, box characters).
+    Accepts the `--prefix depth` form (`0zip v7.2.0`, `1candle-core v0.10.2`)
+    and the default drawn form (`+-- name`, box characters). Requires the zip
+    root line and rejects any line it cannot place: a tree that is empty or not
+    understood is a tool error, never a pass.
     """
+    root_seen = False
     parents = []
     for raw in tree_text.splitlines():
         line = raw.rstrip()
         if not line.strip():
             continue
-        depth_match = re.match(r'^(\d+)(\S.*)$', line)
+        if ROOT_LINE.match(line):
+            root_seen = True
+            continue
+        depth_match = DEPTH_LINE.match(line)
         if depth_match:
-            if int(depth_match.group(1)) != 1:
-                continue
-            body = depth_match.group(2)
-        else:
-            drawn = re.match(r'^(?:[|`+\-│├└─ ]{3,})(\S.*)$', line)
-            if not drawn:
-                continue
-            body = drawn.group(1)
-        parents.append(body.split()[0])
+            if int(depth_match.group(1)) == 1:
+                parents.append(depth_match.group(2).split()[0])
+            continue
+        drawn = DRAWN_LINE.match(line)
+        if drawn:
+            parents.append(drawn.group(1).split()[0])
+            continue
+        raise ToolError('cannot parse cargo tree line: %r' % line[:120])
+    if not root_seen:
+        raise ToolError('cargo tree output has no zip root line (empty or unrecognised)')
     return parents
 
 
 def check_tree(tree_text):
     problems = []
-    for name in parse_parents(tree_text):
-        if not name.startswith(ALLOWED_PARENT_PREFIX):
-            problems.append(violation('cargo-tree', 'zip parent %s is not a candle-* crate' % name))
+    for name in parse_tree(tree_text):
+        if name not in ALLOWED_PARENTS:
+            problems.append(violation(
+                'cargo-tree', 'zip parent %s is not one of: %s' % (name, ', '.join(sorted(ALLOWED_PARENTS)))))
     return problems
 
 
@@ -162,14 +183,31 @@ def check_sources(root):
     return problems
 
 
+NO_MATCH = 'did not match any packages'
+
+
+def lock_has_zip(root):
+    """True when Cargo.lock lists a package named zip. An unreadable lock is a tool error."""
+    lock = root / 'Cargo.lock'
+    try:
+        text = lock.read_text(encoding='utf-8')
+    except (OSError, ValueError) as exc:
+        raise ToolError('cannot read %s: %s' % (lock, exc))
+    return re.search(r'^name\s*=\s*"zip"\s*$', text, re.MULTILINE) is not None
+
+
 def cargo_tree_output(root):
-    result = subprocess.run(
-        ['cargo', *CARGO_TREE_ARGS], cwd=str(root), capture_output=True, text=True, check=False)
-    if result.returncode != 0 and 'did not match any packages' in result.stderr:
-        return ''  # zip left the graph entirely: nothing to guard
+    """Run cargo tree. Returns (stdout, absent); absent means zip is not in the graph."""
+    try:
+        result = subprocess.run(
+            ['cargo', *CARGO_TREE_ARGS], cwd=str(root), capture_output=True, text=True, check=False)
+    except OSError as exc:
+        raise ToolError('cannot run cargo: %s' % exc)
+    if result.returncode != 0 and NO_MATCH in result.stderr:
+        return '', True
     if result.returncode != 0:
-        raise RuntimeError('cargo tree failed rc=%d: %s' % (result.returncode, result.stderr.strip()[-400:]))
-    return result.stdout
+        raise ToolError('cargo tree failed rc=%d: %s' % (result.returncode, result.stderr.strip()[-400:]))
+    return result.stdout, False
 
 
 def main(argv=None):
@@ -186,12 +224,25 @@ def main(argv=None):
     try:
         if args.cargo_tree_file:
             tree_text = Path(args.cargo_tree_file).read_text(encoding='utf-8')
+            absent = False
         else:
-            tree_text = cargo_tree_output(root)
-    except (OSError, RuntimeError) as exc:
+            tree_text, absent = cargo_tree_output(root)
+        if absent:
+            # decision: pass with an explicit message over exit 2 because once zip
+            # leaves the graph the advisories are moot and the guard plus ignores
+            # are to be removed (#7302), not to break CI; cross-checked against
+            # Cargo.lock so a cargo that merely fails to see zip cannot pass.
+            if lock_has_zip(root):
+                raise ToolError('cargo tree says zip is absent but Cargo.lock lists it')
+            print('check-zip-extract-unreachable: zip not in graph (nothing to guard); '
+                  'remove this guard and the audit ignores (#7302)')
+            tree_problems = []
+        else:
+            tree_problems = check_tree(tree_text)
+        problems = tree_problems + check_manifest(root) + check_sources(root)
+    except (OSError, ValueError, ToolError) as exc:
         print('error: %s' % escape_text(exc), file=sys.stderr)
         return EXIT_USAGE
-    problems = check_tree(tree_text) + check_manifest(root) + check_sources(root)
     for problem in problems:
         print(problem)
     if problems:
