@@ -1,0 +1,66 @@
+{
+  "lastUpdated": "2026-10-01T10:00:00Z",
+  "run_active": true,
+  "last_run_ended": "2026-09-30",
+  "newest_event": "2026-10-01",
+  "roles": {"line": "conductor and coders", "fix_flow": "file, fix, retest"},
+  "tip": "abc1234",
+  "phase": "acceptance",
+  "kpis": [
+    {"label": "blockers closed", "state": "done", "value": 12, "of": 20, "suffix": "%", "sub": "of the scope"},
+    {"label": "fixed on a branch", "state": "run", "value": 3, "of": 20, "sub": "awaiting merge"},
+    {"label": "GA readiness", "state": "run", "value": 61.5, "sub": "measured"},
+    {"label": "GA stage gates", "state": "pend", "value": 4, "of": 9, "sub": "gates"},
+    {"label": "not measured", "state": "pend", "value": null, "sub": "n/a"}
+  ],
+  "dimensions": [
+    {"n": "feature coverage", "s": "done", "d": "all tools", "m": "104/104"},
+    {"n": "cert posture", "s": "run", "d": "certs", "m": "in progress"},
+    {"n": "capacity", "s": "stale", "d": "knee", "m": "old"},
+    {"n": "continuity", "s": "fail", "d": "restart", "m": "1 failed"}
+  ],
+  "federation": {"legs": [
+    {"enc": "mTLS", "label": "agent to daemon", "status": "operational", "up": true},
+    {"enc": "verify-full TLS", "label": "daemon to database", "status": "operational", "up": true},
+    {"enc": "mTLS federation", "label": "node to node", "status": "9/9 A2A", "up": false}
+  ]},
+  "a2a": {"rate": 12.5, "total": 123456, "types": {"store": 400, "recall": 250}},
+  "boot": {"mcp_ready_ms": 850, "cold_ms": 900, "warm_ms": 400, "phases": [{"name": "open", "ms": 100}, {"name": "migrate", "ms": 300}], "note": "backfill runs in the background"},
+  "oplatency": [{"op": "store", "p50": 3, "p95": 8, "p99": 15}, {"op": "recall", "p50": 5, "p95": 12, "p99": 20}],
+  "hardware": {
+    "nodes": [{"id": "node-a", "os": "Linux", "role": "primary", "status": "up", "gpu": "none", "ram_used": 12, "ram_total": 64, "disk_free": 300, "disk_total": 1000, "datatier": "PostgreSQL", "memories": 1500}],
+    "link": {"proto": "TLS 1.3", "status": "up"}
+  },
+  "cloud": {"credit_usd": 200, "used_usd": 12.5, "droplet_limit": 15, "region": "nyc1", "status": "armed",
+    "droplets": [{"status": "up", "name": "d1"}], "configs": [{"name": "small", "desc": "2 vcpu", "status": "ready"}]},
+  "comms": {"legs": [
+    {"name": "Agent to daemon (loopback)", "enc": "mTLS", "ms": 4, "rate": 120, "req": 5000, "note": "pinned"},
+    {"name": "Agent to daemon (cross-host)", "enc": "mTLS", "ms": null},
+    {"name": "ai-memory to OpenRouter (embed)", "enc": "TLS", "ms": 90, "rate": 0.5, "live": {"usd_per_hour": 0.12}},
+    {"name": "Daemon to PostgreSQL", "enc": "TLS verify-full", "ms": 2, "rate": 300}
+  ]},
+  "issues": [{"num": 7313, "title": "dashboard", "stage": "code-review", "note": "in review"}, {"num": 7314, "title": "pr", "stage": "verified"}],
+  "agents": [{"node": "node-a", "agent": "coder-1", "model": "sonnet", "sector": "dashboard", "state": "active", "quiet_min": 5},
+             {"node": "node-a", "agent": "coder-2", "model": "sonnet", "sector": "docs", "state": "gone", "quiet_min": 130}],
+  "agentsAsOf": "2026-10-01", "agentsStale": false,
+  "ga_campaigns": {"gate": "GA gate", "closed": 1, "total": 2, "cells_done": 3, "cells_total": 6, "campaigns": [
+    {"letter": "A", "url": "https://github.com/alphaonedev/ai-memory-mcp/issues/1", "n": 1, "title": "campaign", "state": "OPEN",
+     "summary": {"cells_done": 3, "cells_total": 6, "findings_open": 1, "findings_closed": 2},
+     "findings": [{"url": "https://github.com/alphaonedev/ai-memory-mcp/issues/2", "title": "finding", "number": 2, "state": "OPEN"}],
+     "cells": [{"id": "A1", "text": "cell", "backend": "sqlite", "state": "done", "findings": []}]}
+  ]},
+  "config": "# a comment\n[server]\nport = 9077 # trailing\nname = \"x\"\n",
+  "swarm": {"model": "model-x", "live": true, "working": 3, "total": 5, "run": "run-1", "asOf": "2026-10-01T10:00:00Z",
+    "modules": [{"id": "f2", "agents": 5, "working": 3, "calls": 1000, "writes": 200, "active": true}, {"id": "f1", "agents": 0, "working": 0, "calls": null, "writes": null, "active": false}]},
+  "throughputSeries": [{"ops": 10}, {"ops": 20}, {"ops": 15}],
+  "capacity": [{"agents": 10, "ops": 100}, {"agents": 20, "ops": 180}, {"agents": 30, "ops": 181}],
+  "writePath": [{"agents": 10, "ops": 50}, {"agents": 20, "ops": 90}],
+  "scaling": [{"modules": 1, "agents": 100}, {"modules": 2, "agents": 190}],
+  "coverage": {"covered": 90, "total": 104},
+  "latency": {"p50": 3, "p95": 8, "p99": 15, "budget": 20},
+  "aiUsage": {"runs": [{"run": "r1", "ts": "2026-10-01T09:00:00Z", "duration_s": 60, "cost_usd": 0.5}], "usage_today_usd": 1.5, "usage_week_usd": 5.5, "usage_total_usd": 20, "credits_total_usd": 100, "asOf": "2026-10-01T10:00:00Z", "note": "snapshot"},
+  "security": {"injected": 50, "infections": 0, "blocked": 50, "cascades": 0},
+  "continuity": [{"cycle": 1, "retained": true, "resume_ms": 800}, {"cycle": 2, "retained": false, "resume_ms": null}],
+  "events": [{"t": "2026-10-01T09:59:00Z", "k": "info", "x": "an event"}],
+  "ga": {"denom": 200, "shipped": 100, "fixed": 20, "ticked": 10, "remaining": 70, "ready_pct": 65.0, "release_pct": 50.0}
+}
