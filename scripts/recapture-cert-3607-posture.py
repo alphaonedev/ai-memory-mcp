@@ -64,12 +64,20 @@ the evidence directory is missing or incomplete (complete = MANIFEST.sha256 pres
 file it lists matches) and removed when the evidence directory is complete, several asides
 are refused, and leftover staging and raw directories are removed, including the
 `.cert-3607.*` names an older version left next to the evidence directory (#7610). When the
-evidence directory has a MANIFEST.sha256 the run refreshes the lines of the files it wrote, so
-a bundle it publishes is complete by that definition. Every child process runs with cwd set
-to a fresh, empty 0700 sandbox directory under .local-runs, with HOME inside the sandbox and
-AI_MEMORY_NO_CONFIG=1, so no leg can open a database it did not create (`doctor --posture`
-opens a relative ai-memory.db in its cwd); the sandbox home is labelled `<home>` in the
-evidence and the sandbox is removed at exit (#7608). HOME must be an absolute path that is
+evidence directory has a MANIFEST.sha256 it is verified against its committed manifest before
+anything is built or published: a listed file that is missing, has another digest or a line
+that does not parse refuses the run (exit 1, naming the file) and no binary runs (#7649). A
+new manifest is computed only over the files this run freshly captured; every other line is
+kept verbatim, and the run never re-hashes a file it did not write, so an edited
+`test-results.txt` is never blessed by a rerun. Every child process (keygen, the store seed,
+each leg, git) runs in its own fresh empty 0700 cwd, with HOME in a sibling directory of
+the same per-child sandbox under .local-runs and AI_MEMORY_NO_CONFIG=1; there is no shared
+cwd. A store a leg needs is passed by explicit path (AI_MEMORY_DB), never found through the
+cwd, so a store that keygen makes in its own cwd is never seen by a leg. What holds (#7608,
+#7648): two consecutive runs give byte-identical captures, and no capture names a store. The
+per-child homes are labelled `<home>` in the evidence and the sandbox is removed at exit.
+`AI_MEMORY_NO_CONFIG=1` still lets the product write a config.toml under HOME (#7192, a
+product issue, not fixed here); the per-child HOME keeps it inside the sandbox. HOME must be an absolute path that is
 already in normal form (os.path.normpath(HOME) == HOME, so no `.`, `..`, `//` or trailing `/`
 component), not `/`, without a `:`, not starting with `//` and without a control byte
 (0x00-0x1f, 0x7f) or any non-ASCII character: a relative or empty HOME would turn the HOME
@@ -79,7 +87,11 @@ character rule is "printable ASCII only", chosen over a category list: it refuse
 character str.splitlines splits on (U+0085, U+2028, U+2029 and the C0 separators) and every
 unicodedata category Cc, Cf, Zl and Zp character in one test, the sanitizer and the evidence
 are byte-oriented, and a category list can lag Unicode (#7613); the run is refused with
-exit 1 before any write. The sanitizer replaces whole path components only (#7538). The shell script's
+exit 1 before any write. The sanitizer replaces every occurrence of each sensitive value (HOME,
+the repo root, the fixtures root and the per-child homes), longest value first, in its raw,
+JSON-escaped and percent-encoded forms; there is no delimiter allowlist, so a longer path
+that shares the prefix is over-redacted, which fails closed (#7538, #7651). Every guarded
+path is resolved with os.path.realpath before any containment test (#7650). The shell script's
 defaults named build directories of one build host; they are replaced by
 repo-relative ones. Exit codes: 0 success; 1 DEFAULT_BIN is not an executable
 file, TMPDIR (or the default scratch directory) is outside <repo-root>/.local-runs, HOME is
@@ -94,6 +106,7 @@ import datetime
 import errno
 import fcntl
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -101,6 +114,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import urllib.parse
 from pathlib import Path
 
 ROOT = Path(os.path.abspath(__file__)).parent.parent  # logical path, like `cd .. && pwd`
@@ -131,9 +145,8 @@ PASSPHRASE_BYTES = 32
 LOCAL_RUNS = ROOT / ".local-runs"
 # Work directories live under .local-runs, never under docs/ (#7609 #7610 #7611).
 WORK = LOCAL_RUNS / "cert-3607-work"
-SANDBOX = LOCAL_RUNS / "cert-3607-sandbox"  # the cwd and HOME of every child (#7608)
-SANDBOX_CWD = SANDBOX / "cwd"
-SANDBOX_HOME = SANDBOX / "home"
+SANDBOX = LOCAL_RUNS / "cert-3607-sandbox"  # one <label>/{cwd,home} pair per child (#7608 #7648)
+CHILD_HOMES = []  # the HOME of every child started in this run, labelled <home> in the evidence
 LOCK_NAME = ".lock"
 MANIFEST_NAME = "MANIFEST.sha256"
 STAGING_PREFIX = "staging-"
@@ -145,27 +158,14 @@ BUNDLE_FILES = ("posture-bare-env.out", "posture-hardened-env.out",
 MANIFEST_LINE_RE = re.compile(r"^([0-9a-f]{64})  (.+)$")
 DIR_MODE = 0o700
 FILE_MODE = 0o600  # every file the script creates: local operator evidence (#7568)
-# Explicit allowlists of delimiter characters (#7538, #7571-#7573). They are the
-# characters that, in the captured output, separate a path from the text around it. They
-# are not a list of illegal filename bytes: a path that continues with any other byte is a
-# different path and is left alone.
-# A path starts at the start of input or after whitespace, a quote or backtick, `(`, `[`,
-# `<`, `=`, `:`, `,` or `{`. The comma and the brace are start delimiters (#7612): in a list
-# (`a,/home/a`), a mapping (`{k: /home/a}`) or a shell-style expansion (`${/home/a}`) they
-# are what precedes the exact path, and leaving it would leak it.
-PATH_START = rb"(?:\A|(?<=[\s'\"`(\[<=:,{]))"
-# A path ends at the end of input, `/`, whitespace, a quote or backtick, `)`, `]`, `>`,
-# `:`, `;`, `,` or `}`, or at a `.` that is itself the end of input or is followed by
-# whitespace (a sentence full stop); `/home/a./x` and `/home/a..b` are other paths.
-PATH_END = rb"(?=\Z|/|[\s'\"`)\]>:;,}]|\.(?:\Z|\s))"
 USAGE_EPILOG = (
     "Environment overrides: DEFAULT_BIN (default <repo>/target/release/ai-memory, must be "
     "an executable file; a value with a slash is relative to the repo root, a bare name is "
     "looked up on the child PATH), SQLCIPHER_BIN (default <repo>/target-sqlcipher/release/ai-memory; "
     "leg 4 is recorded as `missing` when absent), TMPDIR (must resolve under "
     "<repo>/.local-runs, which must not be a symlink). HOME must be an absolute path in normal form (not /, no ':', not starting with '//', no control byte, no . or .. components) "
-    "of printable ASCII only (any non-ASCII character is refused). Every child runs in a fresh empty sandbox "
-    "directory under <repo>/.local-runs with HOME inside it; staging, aside and raw capture directories also "
+    "of printable ASCII only (any non-ASCII character is refused). Every child runs in its own fresh empty 0700 "
+    "cwd in a per-child sandbox under <repo>/.local-runs with HOME beside it (no shared cwd; a store is passed by explicit path); staging, aside and raw capture directories also "
     "live under <repo>/.local-runs (cert-3607-work), never under docs/. "
     "Fixtures and evidence are never written through a symlink. Exit codes: 0 success; "
     "1 preflight or capture failure; 2 unknown arguments."
@@ -194,42 +194,65 @@ def check_header_date(transcript_path, run_date):
 
 
 def sanitize(raw):
-    """Collapse absolute repo, fixture and home paths, in the order of the shell sed.
+    """Replace every occurrence of each sensitive value, longest value first.
 
-    The replacement is literal. The shell sed read each path as a regular expression and
-    fixture and worktree paths do contain a `.` (for example `.local-runs`). For every
-    literal occurrence of a path the two agree; they differ only where the sed also
-    rewrote a regex near-miss (a different character where the path has a `.`), which
-    real output does not produce. Line endings, including CRLF and a missing final
-    newline, are preserved exactly.
+    The sensitive values are the per-child homes (labelled `<home>`), the fixtures root, the
+    repo root and HOME (`<home>`), each as given and as its os.path.realpath. For each one
+    every form it takes in captured output is replaced: the raw text, the JSON-escaped text
+    (with and without the `\\/` slash escape, once and twice) and the percent-encoded text
+    (upper and lower hex, with and without an encoded slash). All the forms of all the values
+    are replaced in one pass over the forms sorted by length, longest first, so a value that is
+    a prefix of another (HOME inside the repo root) never splits it. The replacement is a plain
+    byte replacement of every literal occurrence: there is no delimiter allowlist, so any
+    character may precede or follow the path. A longer path that shares the prefix
+    (`/home/a` inside `/home/ab`) is over-redacted (`<home>b`); that is the accepted price and
+    it fails closed: the evidence never keeps a sensitive value, at most it loses some
+    detail. A `.` after a path (a sentence full stop) is replaced like any other character,
+    and so is a `.` inside it. The sed the shell script used read each path as a regular expression; for every
+    literal occurrence the two agree, and real output has no near-miss of a path. Line endings,
+    including CRLF and a missing final newline, are preserved exactly (#7510, #7538, #7571,
+    #7572, #7573, #7612, #7651)."""
+    replacements = {}
+    for value, label in sensitive_values():
+        for form in value_forms(value):
+            replacements.setdefault(form.encode("utf-8"), label)
+    for form in sorted(replacements, key=len, reverse=True):  # longest first; ties keep order
+        raw = raw.replace(form, replacements[form])
+    return raw
 
-    A path is replaced only as a whole run of path components, and only when BOTH ends are
-    a boundary, each an explicit allowlist of delimiter characters (not a list of illegal
-    filename bytes). Start boundary: start of input, or the previous byte is whitespace, a
-    quote or backtick, `(`, `[`, `<`, `=`, `:`, `,` or `{`. End boundary: end of input, `/`,
-    or the next byte is whitespace, a quote or backtick, `)`, `]`, `>`, `:`, `;`, `,` or `}`;
-    a `.` counts as an end only when it is itself at end of input or followed by whitespace.
-    The comma is both a start and an end delimiter (a list separator), `{` is a start and
-    `}` an end delimiter (a mapping or a `${...}` expansion). So `/home/a` never rewrites
-    `/home/ab`, `/home/a.txt`, `/home/a./x`, `/home/a+b`, `/home/a..b`, `~/home/a/x`,
-    `x+/home/a/x`, `@/home/a`, `%/home/a` or `$/home/a`, and `{k: /home/a}`, `${/home/a}`,
-    `x,/home/a` and `/home/a,/home/a` are rewritten (#7510, #7538, #7571, #7572, #7573,
-    #7612). The sandbox home every child runs with is labelled `<home>` first."""
-    out = _replace_component(raw, str(SANDBOX_HOME), b"<home>")
-    out = _replace_component(out, str(ROOT), b"<repo-root>")
-    out = _replace_component(out, str(FIX), SANITIZED_FIXTURE_LABEL.encode())
+
+def sensitive_values():
+    """(text, label) of every sensitive value: the per-child homes, the fixtures root, the repo
+    root and HOME, each as given and as its realpath. Trailing slashes are dropped; an empty
+    value is skipped."""
+    pairs = [(home, b"<home>") for home in CHILD_HOMES]
+    pairs.append((FIX, SANITIZED_FIXTURE_LABEL.encode()))
+    pairs.append((ROOT, b"<repo-root>"))
     if HOME:
-        out = _replace_component(out, HOME, b"<home>")
-    return out
+        pairs.append((HOME, b"<home>"))
+    result = []
+    for value, label in pairs:
+        for text in (str(value), os.path.realpath(str(value))):
+            text = text.rstrip("/")
+            if text:
+                result.append((text, label))
+    return result
 
 
-def _replace_component(raw, path, label):
-    """Replace path in raw by label where it is a whole run of path components."""
-    path = path.rstrip("/")
-    if not path:
-        return raw
-    pattern = re.compile(PATH_START + re.escape(path.encode()) + PATH_END)
-    return pattern.sub(lambda _match: label, raw)
+def value_forms(value):
+    """Every form value takes in captured output: raw, JSON-escaped (with and without the
+    `\\/` slash escape, once and twice) and percent-encoded (upper and lower hex, with and
+    without an encoded slash)."""
+    forms = {value, value.replace("/", "\\/")}
+    once = json.dumps(value)[1:-1]
+    twice = json.dumps(once)[1:-1]
+    for text in (once, twice):
+        forms.update({text, text.replace("/", "\\/")})
+    for safe in ("", "/"):
+        quoted = urllib.parse.quote(value, safe=safe)
+        forms.update({quoted, re.sub(r"%[0-9A-F]{2}", lambda m: m.group(0).lower(), quoted)})
+    forms.discard("")
+    return forms
 
 
 def home_problem(home):
@@ -252,9 +275,23 @@ def shell_status(returncode):
     return 128 - returncode if returncode < 0 else returncode
 
 
+def is_under(path, base):
+    """True when path is base or lies below it (a string test on normalised paths; nothing is
+    resolved here, so callers pass paths that already went through os.path.realpath)."""
+    return path == base or base in path.parents
+
+
+def real(path):
+    """os.path.realpath of path as a Path: every symlink in it followed."""
+    return Path(os.path.realpath(str(path)))
+
+
 def open_parent(path):
     """(directory fd, name) for path, walking from ROOT without following any symlink."""
-    relative = Path(os.path.abspath(str(path))).relative_to(ROOT)
+    absolute = Path(os.path.abspath(str(path)))
+    if not is_under(absolute, ROOT):
+        raise OSError(errno.EINVAL, "path is not under the repo root", str(path))
+    relative = absolute.relative_to(ROOT)
     fd = os.open(str(ROOT), os.O_RDONLY | os.O_DIRECTORY)
     try:
         for part in relative.parts[:-1]:
@@ -340,13 +377,13 @@ def write_fixtures():
     print("fixtures ok", keys)
 
 
-def child_env(tmpdir, extra):
-    """The scrubbed environment every binary invocation runs in (env -i). HOME is the sandbox
-    home and AI_MEMORY_NO_CONFIG=1 is set, with the sandbox cwd, so no leg opens a store it
-    did not create (#7608)."""
+def child_env(tmpdir, extra, home):
+    """The scrubbed environment every binary invocation runs in (env -i). HOME is the child's
+    own home (beside its cwd) and AI_MEMORY_NO_CONFIG=1 is set, so no leg opens a store it
+    did not create (#7608, #7648)."""
     env = {
         "PATH": CHILD_PATH,
-        "HOME": str(SANDBOX_HOME),
+        "HOME": str(home),
         "TMPDIR": str(tmpdir),
         "AI_MEMORY_NO_CONFIG": "1",
         "AI_MEMORY_AGENT_ID": "ai-memory",
@@ -356,13 +393,27 @@ def child_env(tmpdir, extra):
     return env
 
 
+def child_dir(label):
+    """A fresh empty 0700 cwd and a home beside it for one child: (cwd, home). Nothing is shared
+    between children and a store a child makes dies with its directory (#7648). The home is
+    registered so the sanitizer labels it `<home>`."""
+    base = SANDBOX / label
+    remove_tree(base)
+    if os.path.lexists(str(base)):
+        raise OSError(errno.EEXIST, "cannot remove the old child directory", str(base))
+    ensure_dirs(base / "cwd")
+    ensure_dirs(base / "home")
+    CHILD_HOMES.append(base / "home")
+    return base / "cwd", base / "home"
+
+
 def exec_status(error):
     """The shell status for a binary that could not start: 127 not found, else 126."""
     return EXEC_NOT_FOUND if isinstance(error, FileNotFoundError) else EXEC_FAILED
 
 
-def run_capture(binary, args, env, raw_path, sanitized_path):
-    """Run one leg, sanitize its combined output, drop the raw file, return `$?`.
+def run_capture(binary, args, env, raw_path, sanitized_path, cwd):
+    """Run one leg in cwd, sanitize its combined output, drop the raw file, return `$?`.
 
     A binary that cannot start has its error text as the leg output and status 127 when
     the file or its interpreter is missing (as the shell did), 126 for other exec errors
@@ -371,7 +422,7 @@ def run_capture(binary, args, env, raw_path, sanitized_path):
         with os.fdopen(open_new(raw_path), "wb") as raw:
             try:
                 status = shell_status(subprocess.run(
-                    [str(binary)] + args, env=env, stdout=raw, cwd=str(SANDBOX_CWD),
+                    [str(binary)] + args, env=env, stdout=raw, cwd=str(cwd),
                     stderr=subprocess.STDOUT, check=False).returncode)
             except OSError as error:
                 raw.write(("%s: %s\n" % (binary, error.strerror or error)).encode())
@@ -407,11 +458,9 @@ def resolve_tmpdir(raw):
     candidate = Path(raw) if raw else LOCAL_RUNS / "tmp"
     if LOCAL_RUNS.is_symlink():
         return None, "%s: %s is a symlink; replace it with a real directory" % (label, LOCAL_RUNS)
-    resolved = candidate.resolve()
-    anchor = ROOT.resolve() / ".local-runs"
-    try:
-        resolved.relative_to(anchor)
-    except ValueError:
+    resolved = real(candidate)
+    anchor = real(ROOT) / ".local-runs"
+    if not is_under(resolved, anchor):
         return None, ("%s resolves to %s, which is not under %s; set TMPDIR to a directory "
                       "below it or unset it" % (label, resolved, anchor))
     return resolved, None
@@ -441,7 +490,7 @@ def child_path_dirs():
 
 def fixture_symlink_problem():
     """A message when .local-runs, the fixtures dir or anything under it is a symlink, else None."""
-    anchor = ROOT.resolve() / ".local-runs"
+    anchor = real(ROOT) / ".local-runs"
     candidates = [LOCAL_RUNS, FIX]
     if FIX.is_dir() and not FIX.is_symlink():
         # every existing entry, so the key pair keygen writes (#7508) and anything else is covered
@@ -450,9 +499,7 @@ def fixture_symlink_problem():
     for candidate in candidates:
         if candidate.is_symlink():
             return "%s is a symlink; fixtures hold keys and must stay inside %s" % (candidate, anchor)
-    try:
-        FIX.resolve().relative_to(anchor)
-    except ValueError:
+    if not is_under(real(FIX), anchor):
         return "fixture directory %s resolves outside %s" % (FIX, anchor)
     return None
 
@@ -464,7 +511,7 @@ def ensure_dirs(path):
     by os.mkdir and then fchmod'ed, so no umask widens it (#7569); a level that already
     exists is left as it is."""
     absolute = Path(os.path.abspath(str(path)))
-    for base in (ROOT, ROOT.resolve()):
+    for base in (ROOT, real(ROOT)):
         if absolute == base or base in absolute.parents:
             break
     else:
@@ -570,14 +617,31 @@ def publish_bundle(stage, suffix):
 
 
 def guarded_dirs(tmpdir):
-    """Every directory the script reads or writes through, outermost first."""
-    chain = [ROOT]
-    chain.extend(ROOT / part for part in
-                 _prefixes(OUT.parent.relative_to(ROOT).parts))
-    chain.extend([OUT, LOCAL_RUNS, WORK, FIX, FIX / "keys"])
-    with contextlib.suppress(ValueError):
-        chain.extend(LOCAL_RUNS / part for part in
-                     _prefixes(Path(tmpdir).relative_to(LOCAL_RUNS).parts))
+    """Every directory the script reads or writes through, outermost first.
+
+    Each path is placed with os.path.realpath (its parent resolved, its last component kept so
+    a symlink there is still seen as one) and must lie under the real repo root; one that
+    cannot be placed raises OSError (fails closed). The TMPDIR chain is walked from the real
+    .local-runs, so a symlinked repo root or a symlinked TMPDIR parent cannot hide a directory
+    (#7650)."""
+    root = real(ROOT)
+
+    def place(path):
+        path = Path(os.path.abspath(str(path)))
+        placed = real(path.parent) / path.name if path != path.parent else path
+        if not is_under(placed, root):
+            raise OSError(errno.EINVAL, "guarded path is not under the real repo root", str(path))
+        return placed
+
+    out_parent = place(OUT.parent)
+    chain = [root]
+    chain.extend(root / part for part in _prefixes(out_parent.relative_to(root).parts))
+    chain.extend(place(path) for path in (OUT, LOCAL_RUNS, WORK, FIX, FIX / "keys"))
+    runs = place(LOCAL_RUNS)
+    tmp = real(tmpdir)
+    if not is_under(tmp, runs):
+        raise OSError(errno.EINVAL, "TMPDIR is not under the real .local-runs", str(tmpdir))
+    chain.extend(runs / part for part in _prefixes(tmp.relative_to(runs).parts))
     seen, ordered = set(), []
     for candidate in chain:
         if str(candidate) not in seen:
@@ -619,12 +683,56 @@ def acquire_lock():
 
 
 def make_sandbox():
-    """A fresh, empty 0700 cwd and home for the children (#7608); an old one is removed."""
+    """An empty sandbox root for the per-child directories (#7608, #7648); an old one is removed."""
     remove_tree(SANDBOX)
     if os.path.lexists(str(SANDBOX)):
         raise OSError(errno.EEXIST, "cannot remove the old sandbox", str(SANDBOX))
-    ensure_dirs(SANDBOX_CWD)
-    ensure_dirs(SANDBOX_HOME)
+    del CHILD_HOMES[:]
+    ensure_dirs(SANDBOX)
+
+
+def read_manifest(bundle):
+    """(entries, problem) of bundle's MANIFEST.sha256: entries is a list of (sha256, name), or
+    None when the bundle has no manifest; problem is a message naming the manifest line when it
+    cannot be read or a line does not parse (a name with a slash is refused)."""
+    try:
+        text = read_file(bundle / MANIFEST_NAME).decode("utf-8")
+    except FileNotFoundError:
+        return None, None
+    except (OSError, UnicodeDecodeError) as error:
+        return None, "%s cannot be read: %s" % (MANIFEST_NAME, error)
+    entries = []
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.strip():
+            continue
+        match = MANIFEST_LINE_RE.match(line)
+        if match is None:
+            return None, "%s line %d does not parse: %r" % (MANIFEST_NAME, number, line)
+        if "/" in match.group(2) or match.group(2) in (".", ".."):
+            return None, "%s line %d lists %r, which is not a plain file name" % (
+                MANIFEST_NAME, number, match.group(2))
+        entries.append((match.group(1), match.group(2)))
+    return entries, None
+
+
+def manifest_problem(bundle):
+    """A message naming the file when bundle does not match its committed MANIFEST.sha256, else
+    None (also None when the bundle has no manifest). A listed file that is missing, is not a
+    regular file or has another digest is a mismatch, and so is a manifest that lists nothing."""
+    entries, problem = read_manifest(bundle)
+    if problem is not None or entries is None:
+        return problem
+    if not entries:
+        return "%s lists no file" % MANIFEST_NAME
+    for digest, name in entries:
+        try:
+            data = read_file(bundle / name)
+        except OSError as error:
+            return "%s is listed in %s but cannot be read: %s" % (
+                name, MANIFEST_NAME, error.strerror or error)
+        if hashlib.sha256(data).hexdigest() != digest:
+            return "%s does not match its digest in %s" % (name, MANIFEST_NAME)
+    return None
 
 
 def bundle_complete(bundle):
@@ -633,46 +741,38 @@ def bundle_complete(bundle):
     try:
         if not stat.S_ISDIR(os.lstat(str(bundle)).st_mode):
             return False
-        lines = read_file(bundle / MANIFEST_NAME).decode("utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
+    except OSError:
         return False
-    listed = 0
-    for line in lines:
-        if not line.strip():
-            continue
-        match = MANIFEST_LINE_RE.match(line)
-        if match is None or "/" in match.group(2) or match.group(2) in (".", ".."):
-            return False
-        try:
-            data = read_file(bundle / match.group(2))
-        except OSError:
-            return False
-        if hashlib.sha256(data).hexdigest() != match.group(1):
-            return False
-        listed += 1
-    return listed > 0
+    entries, problem = read_manifest(bundle)
+    return entries is not None and problem is None and manifest_problem(bundle) is None
 
 
-def refresh_manifest(bundle):
-    """Update the lines of MANIFEST.sha256 for the files this run wrote, when the bundle has
-    one: a listed file that is gone is dropped, a written file that is not listed is added."""
-    manifest = bundle / MANIFEST_NAME
-    try:
-        old = read_file(manifest).decode("utf-8").splitlines()
-    except FileNotFoundError:
+def refresh_manifest(bundle, written):
+    """Update MANIFEST.sha256 for the files this run freshly wrote, when the bundle has one.
+
+    Only the names in written are hashed. Every other listed line is kept verbatim: this
+    never re-hashes a file it did not write (#7649). A listed or written file that is gone is
+    dropped, a written file that is not listed is added."""
+    entries, problem = read_manifest(bundle)
+    if problem is not None:
+        raise OSError(errno.EINVAL, problem, str(bundle / MANIFEST_NAME))
+    if entries is None:
         return
-    names = []
-    for line in old:
-        match = MANIFEST_LINE_RE.match(line)
-        if match is not None and match.group(2) not in names:
-            names.append(match.group(2))
-    names.extend(name for name in BUNDLE_FILES if name not in names)
+    digests = {}
+    for digest, name in entries:
+        digests.setdefault(name, digest)
+    names = list(digests)
+    names.extend(name for name in BUNDLE_FILES if name in written and name not in digests)
+    names.extend(sorted(name for name in written if name not in digests and name not in BUNDLE_FILES))
     lines = []
     for name in names:
-        if not (bundle / name).is_file() or (bundle / name).is_symlink():
+        path = bundle / name
+        if not path.is_file() or path.is_symlink():
             continue
-        lines.append("%s  %s\n" % (hashlib.sha256(read_file(bundle / name)).hexdigest(), name))
-    write_file(manifest, "".join(lines).encode("utf-8"))
+        digest = (hashlib.sha256(read_file(path)).hexdigest() if name in written
+                  else digests[name])
+        lines.append("%s  %s\n" % (digest, name))
+    write_file(bundle / MANIFEST_NAME, "".join(lines).encode("utf-8"))
 
 
 def _leftovers(directory, prefix):
@@ -781,6 +881,12 @@ def recapture_locked(tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting, run_
     if problem is not None:
         print(problem, file=sys.stderr)
         return 1
+    if OUT.is_dir() and not OUT.is_symlink():
+        problem = manifest_problem(OUT)  # before any binary runs and before anything is built
+        if problem is not None:
+            print("refusing to publish over a bundle that does not match its committed "
+                  "manifest: %s (%s)" % (problem, OUT), file=sys.stderr)
+            return 1
     ensure_dirs(FIX)
     chmod_dir(FIX)  # holds the passphrase and keys: tightened on every run
     ensure_dirs(tmpdir)
@@ -796,6 +902,11 @@ def recapture_locked(tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting, run_
         make_sandbox()
         if OUT.is_dir() and not OUT.is_symlink():
             copy_bundle(OUT, stage)
+            problem = manifest_problem(stage)  # the copy must verify too: nothing changed since
+            if problem is not None:
+                print("refusing to publish: the staged copy of the bundle does not match its "
+                      "committed manifest: %s (%s)" % (problem, OUT), file=sys.stderr)
+                return 1
         legs = capture_legs(stage, raw_dir, tmpdir, default_bin, sqlcipher_bin,
                             sqlcipher_setting, run_date)
         if isinstance(legs, int):
@@ -819,12 +930,13 @@ def capture_legs(out, raw_dir, tmpdir, default_bin, sqlcipher_bin, sqlcipher_set
     # carries the operator key pair in the key dir.
     if not (FIX / "keys" / "operator.key").is_file():
         keygen_out = FIX / "keygen.out"
-        keygen_env = child_env(tmpdir, {})
+        keygen_cwd, keygen_home = child_dir("keygen")
+        keygen_env = child_env(tmpdir, {}, keygen_home)
         keygen_env.pop("AI_MEMORY_AGENT_ID")
         try:
             with os.fdopen(open_new(keygen_out), "wb") as sink:
                 keygen_status = subprocess.run(
-                    [default_bin, "rules", "keygen"], env=keygen_env, cwd=str(SANDBOX_CWD),
+                    [default_bin, "rules", "keygen"], env=keygen_env, cwd=str(keygen_cwd),
                     stdout=sink, stderr=subprocess.STDOUT, check=False).returncode
         except OSError as error:
             print("operator keygen failed: %s: %s" % (default_bin, error.strerror or error),
@@ -842,10 +954,13 @@ def capture_legs(out, raw_dir, tmpdir, default_bin, sqlcipher_bin, sqlcipher_set
     op_pub = read_file(op_pub_file).decode().replace("\n", "")
     attest = read_file(FIX / "peer-attestation.json").decode().rstrip("\n")
 
-    posture_env = child_env(tmpdir, {})
+    written = {"posture-bare-env.out", "posture-hardened-env.out",
+               "posture-hardened-boot-refusal.out", EXIT_CODES_FILE, "peer-fingerprints.txt",
+               "peer-attestation.json"}
     # --- leg 1: bare ---
-    e1 = run_capture(default_bin, POSTURE_ARGS, posture_env,
-                     raw_dir / "posture-bare-env.out.raw", out / "posture-bare-env.out")
+    cwd, home = child_dir("leg1")
+    e1 = run_capture(default_bin, POSTURE_ARGS, child_env(tmpdir, {}, home),
+                     raw_dir / "posture-bare-env.out.raw", out / "posture-bare-env.out", cwd)
 
     hard = {
         "AI_MEMORY_SECURITY_PROFILE": "asi-hard",
@@ -858,17 +973,20 @@ def capture_legs(out, raw_dir, tmpdir, default_bin, sqlcipher_bin, sqlcipher_set
         "AI_MEMORY_DB_SYNCHRONOUS": "FULL",
     }
     # --- leg 2: hardened non-sqlcipher, boot gate NOT armed ---
-    e2 = run_capture(default_bin, POSTURE_ARGS, child_env(tmpdir, hard),
-                     raw_dir / "posture-hardened-env.out.raw", out / "posture-hardened-env.out")
+    cwd, home = child_dir("leg2")
+    e2 = run_capture(default_bin, POSTURE_ARGS, child_env(tmpdir, hard, home),
+                     raw_dir / "posture-hardened-env.out.raw", out / "posture-hardened-env.out",
+                     cwd)
 
     # --- leg 3: hardened non-sqlcipher, boot gate ARMED ---
     # Boot refuse is NOT doctor --posture (that subcommand bypasses the gate):
     # a plain `doctor` goes through main.
     armed = dict(hard)
     armed["AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE"] = "1"
-    e3 = run_capture(default_bin, ["doctor"], child_env(tmpdir, armed),
+    cwd, home = child_dir("leg3")
+    e3 = run_capture(default_bin, ["doctor"], child_env(tmpdir, armed, home),
                      raw_dir / "posture-hardened-boot-refusal.out.raw",
-                     out / "posture-hardened-boot-refusal.out")
+                     out / "posture-hardened-boot-refusal.out", cwd)
 
     # --- leg 4: sqlcipher + encrypt + boot gate ---
     if sqlcipher_bin is None or not is_executable_file(sqlcipher_bin):
@@ -894,22 +1012,29 @@ def capture_legs(out, raw_dir, tmpdir, default_bin, sqlcipher_bin, sqlcipher_set
         if not store.is_file():
             # doctor opens the store read-only and refuses to create it: seed
             # the encrypted fixture store first (schema-init). Failure tolerated.
-            seed_env = child_env(tmpdir, leg4_env)
+            seed_cwd, seed_home = child_dir("seed")
+            seed_env = child_env(tmpdir, leg4_env, seed_home)
             for name in ("AI_MEMORY_AGENT_ID", "AI_MEMORY_KEY_DIR"):
                 seed_env.pop(name)
             try:
                 subprocess.run([sqlcipher_bin, "stats", "--json"], env=seed_env,
-                               cwd=str(SANDBOX_CWD), stdout=subprocess.DEVNULL,
+                               cwd=str(seed_cwd), stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, check=False)
             except OSError:
                 pass  # seeding failure is tolerated; the leg records its own exec status
         leg4 = dict(armed)
         leg4.update(leg4_env)
-        e4 = run_capture(sqlcipher_bin, POSTURE_ARGS, child_env(tmpdir, leg4),
-                         raw_dir / "posture-sqlcipher-pass.out.raw", out / "posture-sqlcipher-pass.out")
+        cwd, home = child_dir("leg4")
+        e4 = run_capture(sqlcipher_bin, POSTURE_ARGS, child_env(tmpdir, leg4, home),
+                         raw_dir / "posture-sqlcipher-pass.out.raw",
+                         out / "posture-sqlcipher-pass.out", cwd)
+        written.add(SQLCIPHER_OUT_FILE)
 
+    git_cwd, git_home = child_dir("git")
+    git_env = dict(os.environ, HOME=str(git_home))
     sha_done = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
-                              cwd=str(SANDBOX_CWD), capture_output=True, text=True, check=False)
+                              env=git_env, cwd=str(git_cwd), capture_output=True, text=True,
+                              check=False)
     sha = sha_done.stdout.strip()
     if sha_done.returncode != 0 or not sha:
         print("cannot read the git sha of " + str(ROOT), file=sys.stderr)
@@ -936,7 +1061,7 @@ def capture_legs(out, raw_dir, tmpdir, default_bin, sqlcipher_bin, sqlcipher_set
 
     for name in ("peer-fingerprints.txt", "peer-attestation.json"):
         write_file(out / name, read_file(FIX / name))
-    refresh_manifest(out)
+    refresh_manifest(out, written)
 
     return e1, e2, e3, e4
 

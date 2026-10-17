@@ -383,13 +383,14 @@ class BinaryPreflight7397(RecaptureBase):
         module.sanitize = boom
         with self.assertRaises(RuntimeError):
             module.run_capture(self.default_bin, ['doctor'], {'PATH': os.environ.get('PATH', '')},
-                               raw, self.root / 'leg.out')
+                               raw, self.root / 'leg.out', self.root)
         self.assertFalse(raw.exists())
 
     def test_raw_capture_is_removed_when_the_binary_cannot_start(self):
         module = load_script_module()
         raw = self.root / 'leg.out.raw'
-        status = module.run_capture(self.root / 'nope', [], {}, raw, self.root / 'leg.out')
+        status = module.run_capture(self.root / 'nope', [], {}, raw, self.root / 'leg.out',
+                                    self.root)
         self.assertEqual(status, 127)
         self.assertFalse(raw.exists())
         self.assertIn('nope', (self.root / 'leg.out').read_text())
@@ -2097,7 +2098,8 @@ class ChildCwd7648(SymlinkBase):
             with self.subTest(file=name):
                 self.assertNotIn('agrees', text)
                 self.assertNotIn('ai-memory.db', text)
-                self.assertIn('live pragma not observed', text)
+                if name != 'posture-hardened-boot-refusal.out':  # a refusal prints no checks
+                    self.assertIn('live pragma not observed', text)
 
     def test_a_leg_never_finds_a_store_through_its_cwd(self):
         done, _ = self.run_recapture()
@@ -2347,8 +2349,14 @@ class RealPaths7650(RecaptureBase):
         module = load_script_module()
         elsewhere = Path(tempfile.mkdtemp(prefix='recapture-5038-elsewhere-', dir=str(SCRATCH)))
         self.addCleanup(shutil.rmtree, str(elsewhere), True)
+        module.ROOT = elsewhere  # OUT and .local-runs stay in the repo: not under this root
         with self.assertRaises(OSError):
-            module.guarded_dirs(elsewhere)
+            module.guarded_dirs(elsewhere / '.local-runs' / 'tmp')
+
+    def test_a_tmpdir_outside_the_real_local_runs_fails_closed(self):
+        module = load_script_module()
+        with self.assertRaises(OSError):
+            module.guarded_dirs(REPO / 'docs')
 
     def test_no_value_error_is_suppressed_in_the_script(self):
         tree = ast.parse((REPO / 'scripts' / SCRIPT_NAME).read_text())

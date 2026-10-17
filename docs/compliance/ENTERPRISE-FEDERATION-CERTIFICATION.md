@@ -1894,7 +1894,11 @@ captures in `docs/compliance/evidence/cert-3607/`. Cargo `--no-fail-fast`.
 exit 1, refuses to boot. Certified configuration (sqlcipher, encrypt-at-rest,
 boot gate, `AI_MEMORY_DB_SYNCHRONOUS=FULL`, operator key pair): **exit 0,
 22 PASS / 0 FAIL**. Recorded in `cert-3607/posture-legs-exit-codes.txt`;
-reproducible with `scripts/recapture-cert-3607-posture.py`.
+recapturable with `scripts/recapture-cert-3607-posture.py`: every child runs in its
+own fresh empty cwd, so two consecutive runs of the script give byte-identical
+captures, and the run refuses to publish over a bundle that does not match its
+committed `MANIFEST.sha256`. The committed bundle stays bound to the build that
+produced it (not recaptured here).
 
 **Re-cert trigger — FIRED by #3204 (`src/handlers/federation_receive.rs`,
 `src/handlers/federation_signing_check.rs`, `src/identity/sign.rs` — the far-endpoint
@@ -1935,7 +1939,11 @@ pg database created for the run; raw named-test listing and the posture captures
 exit 1, refuses to boot. Certified configuration (sqlcipher, encrypt-at-rest,
 boot gate, `AI_MEMORY_DB_SYNCHRONOUS=FULL`, operator key pair): **exit 0,
 22 PASS / 0 FAIL**. Recorded in `cert-3607/posture-legs-exit-codes.txt`;
-reproducible with `scripts/recapture-cert-3607-posture.py`.
+recapturable with `scripts/recapture-cert-3607-posture.py`: every child runs in its
+own fresh empty cwd, so two consecutive runs of the script give byte-identical
+captures, and the run refuses to publish over a bundle that does not match its
+committed `MANIFEST.sha256`. The committed bundle stays bound to the build that
+produced it (not recaptured here).
 
 ---
 
