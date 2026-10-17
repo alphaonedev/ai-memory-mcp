@@ -25,6 +25,8 @@ GOOD_TREE = 'zip v7.2.0\n'
 GOOD_TREE_DEPTH = '0zip v7.2.0\n1candle-core v0.10.2\n'
 BAD_TREE_DEPTH = '0zip v7.2.0\n1candle-core v0.10.2\n1some-other v1.0.0\n'
 PACKAGE_ONLY = '[package]\nname = "fixture"\nversion = "0.0.0"\n\n'
+CANDLE_LOCK = ('[[package]]\nname = "candle-core"\nversion = "0.10.2"\n'
+               'source = "registry+https://github.com/rust-lang/crates.io-index"\n')
 MINIMAL_MANIFEST = '[package]\nname = "fixture"\nversion = "0.0.0"\n\n[dependencies]\nserde = "1"\n'
 
 
@@ -38,14 +40,15 @@ class GuardBase(unittest.TestCase):
         (self.root / 'src').mkdir()
         (self.root / 'Cargo.toml').write_text(MINIMAL_MANIFEST, encoding='utf-8')
         (self.root / 'src' / 'lib.rs').write_text('pub fn ok() {}\n', encoding='utf-8')
+        (self.root / 'Cargo.lock').write_text(CANDLE_LOCK, encoding='utf-8')
 
-    def run_guard(self, tree=GOOD_TREE_DEPTH, root=None):
+    def run_guard(self, tree=GOOD_TREE_DEPTH, root=None, extra=()):
         tree_file = self.root.parent / (self.root.name + '.tree')
         tree_file.write_text(tree, encoding='utf-8')
         self.addCleanup(lambda: tree_file.unlink() if tree_file.exists() else None)
         return subprocess.run(
             [sys.executable, str(GUARD), '--root', str(root or self.root),
-             '--cargo-tree-file', str(tree_file)],
+             '--cargo-tree-file', str(tree_file)] + list(extra),
             capture_output=True, text=True, check=False)
 
 
@@ -187,7 +190,7 @@ sys.stderr.write({err!r})
 sys.exit({rc})
 """
 
-LOCK_WITH_ZIP = '[[package]]\nname = "zip"\nversion = "7.2.0"\n'
+LOCK_WITH_ZIP = CANDLE_LOCK + '[[package]]\nname = "zip"\nversion = "7.2.0"\n'
 LOCK_WITHOUT_ZIP = '[[package]]\nname = "serde"\nversion = "1.0.0"\n'
 NO_MATCH_ERR = 'error: package ID specification `zip` did not match any packages\n'
 
@@ -252,6 +255,7 @@ class TreeFailClosed7301(StubCargoCase):
         self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
 
     def test_did_not_match_without_lock_exits_2(self):
+        (self.root / 'Cargo.lock').unlink()
         res = self.run_stub(err=NO_MATCH_ERR, rc=101)
         self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
 
@@ -493,6 +497,10 @@ class ManifestForms7301(GuardBase):
             self.skipTest('tomllib needs Python 3.11+')
         res = self.run_manifest('[dependencies\n', 'tomllib')
         self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        # An argparse usage error also exits 2: pin the reason so a guard that
+        # merely rejects the flag cannot satisfy this test.
+        self.assertIn('not valid TOML', res.stderr)
+        self.assertNotIn('unrecognized arguments', res.stderr)
 
     def test_tomllib_requested_but_missing_exits_2(self):
         if HAVE_TOMLLIB:
@@ -513,6 +521,202 @@ class ManifestForms7301(GuardBase):
                     [str(PY39), str(GUARD), '--root', str(self.root), '--cargo-tree-file', str(tree_file)],
                     capture_output=True, text=True, check=False)
                 self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+
+
+BR_EVIL = 'pub fn e() { Tensor::read_npz(p); }\n'
+BOTH_PARSERS = ['fallback'] + (['tomllib'] if HAVE_TOMLLIB else [])
+
+
+class Workspace7301(StubCargoCase):
+    """Round 3 (N1): a workspace member that depends on zip must not pass."""
+
+    def test_cargo_tree_requests_workspace(self):
+        res = self.run_stub(out=GOOD_TREE_DEPTH, lock=LOCK_WITH_ZIP)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn('--workspace', self.argv_log.read_text(encoding='utf-8'))
+
+    def test_workspace_member_zip_parent_fails(self):
+        tree = '0zip v7.2.0\n1candle-core v0.10.2\n1zipper v0.1.0 (/w/crates/zipper)\n'
+        res = self.run_guard(tree=tree)
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('zipper', res.stdout)
+
+    def test_workspace_members_declared_fail_on_both_parsers(self):
+        manifest = MINIMAL_MANIFEST + '\n[workspace]\nmembers = ["crates/zipper"]\n'
+        for parser in BOTH_PARSERS:
+            with self.subTest(parser=parser):
+                (self.root / 'Cargo.toml').write_text(manifest, encoding='utf-8')
+                res = self.run_guard(extra=('--manifest-parser', parser))
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('workspace', res.stdout)
+
+
+class ParentPin7301(GuardBase):
+    """Round 3 (N2, code L1): the zip parent is registry candle-core 0.10.x only."""
+
+    def test_bad_parent_lines_fail(self):
+        lines = (
+            '1candle-core v0.10.2 (/w/vendor/candle-core)',
+            '1candle-core v0.10.2 (https://github.com/x/candle?rev=1#abc)',
+            '1candle-core v0.11.0',
+            '1candle-core v0.9.9',
+            '1candle-core v0.100.0',
+        )
+        for line in lines:
+            with self.subTest(line=line):
+                res = self.run_guard(tree='0zip v7.2.0\n%s\n' % line)
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('candle-core', res.stdout)
+
+    def test_bad_parent_in_drawn_form_fails(self):
+        res = self.run_guard(tree='zip v7.2.0\n`-- candle-core v0.10.2 (/w/x)\n')
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+
+    def test_registry_candle_core_0_10_x_passes(self):
+        for line in ('1candle-core v0.10.2', '1candle-core v0.10.9', '1candle-core v0.10.2 (*)'):
+            with self.subTest(line=line):
+                res = self.run_guard(tree='0zip v7.2.0\n%s\n' % line)
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_lock_entry_must_be_registry_0_10(self):
+        registry = 'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+        head = '[[package]]\nname = "candle-core"\n'
+        locks = {
+            'no-source': head + 'version = "0.10.2"\n',
+            'git': head + 'version = "0.10.2"\nsource = "git+https://github.com/x/candle#abc"\n',
+            'other-registry': head + 'version = "0.10.2"\nsource = "registry+https://example.com/index"\n',
+            'version-0.11': head + 'version = "0.11.0"\n' + registry,
+            'second-entry': CANDLE_LOCK + head + 'version = "0.11.0"\n' + registry,
+            'absent': LOCK_WITHOUT_ZIP,
+        }
+        for name, lock in locks.items():
+            with self.subTest(lock=name):
+                (self.root / 'Cargo.lock').write_text(lock, encoding='utf-8')
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('Cargo.lock', res.stdout)
+
+    def test_missing_lock_exits_2(self):
+        (self.root / 'Cargo.lock').unlink()
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+
+    def test_patch_and_replace_of_candle_or_zip_fail(self):
+        forms = {
+            'patch-inline': '[patch.crates-io]\ncandle-core = { path = "../c" }\n',
+            'patch-dotted': '[patch.crates-io]\ncandle-core.path = "../c"\n',
+            'patch-table': '[patch.crates-io.candle-core]\npath = "../c"\n',
+            'patch-git-source': "[patch.'https://github.com/x/candle']\ncandle-core = { git = 'https://github.com/y/c' }\n",
+            'patch-zip': '[patch.crates-io]\nzip = { path = "../z" }\n',
+            'replace': '[replace]\n"candle-core:0.10.2" = { path = "../c" }\n',
+        }
+        for parser in BOTH_PARSERS:
+            for name, body in forms.items():
+                with self.subTest(parser=parser, form=name):
+                    (self.root / 'Cargo.toml').write_text(MINIMAL_MANIFEST + '\n' + body, encoding='utf-8')
+                    res = self.run_guard(extra=('--manifest-parser', parser))
+                    self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                    self.assertIn('Cargo.toml', res.stdout)
+
+    def test_unrelated_patch_passes(self):
+        for parser in BOTH_PARSERS:
+            with self.subTest(parser=parser):
+                (self.root / 'Cargo.toml').write_text(
+                    MINIMAL_MANIFEST + '\n[patch.crates-io]\nserde = { path = "../s" }\n', encoding='utf-8')
+                res = self.run_guard(extra=('--manifest-parser', parser))
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+
+class FallbackQuotes7301(GuardBase):
+    """Round 3 (N3, code L2): triple quotes inside one-line strings do not desync the fallback."""
+
+    DEP = '[dependencies]\nzip = "7"\n'
+
+    def test_triple_quote_in_single_line_string_does_not_hide_zip(self):
+        notes = (
+            'note = "\'\'\'"',
+            "note = '\"\"\"'",
+            'description = "x\'\'\'y"',
+            "description = 'x\"\"\"y'",
+            'note = """abc"""',
+            "note = '''abc'''",
+            'note = "a" # \'\'\'',
+        )
+        for note in notes:
+            with self.subTest(note=note):
+                (self.root / 'Cargo.toml').write_text(
+                    PACKAGE_ONLY + '[package.metadata.n]\n' + note + '\n' + self.DEP, encoding='utf-8')
+                res = self.run_guard(extra=('--manifest-parser', 'fallback'))
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('Cargo.toml', res.stdout)
+
+    def test_real_multiline_strings_still_hide_their_bodies(self):
+        body = ('[package.metadata]\nnote = \'\'\'\n[dependencies]\nzip = "7"\n\'\'\'\n'
+                'other = """\nzip = "8"\n"""\n')
+        (self.root / 'Cargo.toml').write_text(PACKAGE_ONLY + body, encoding='utf-8')
+        res = self.run_guard(extra=('--manifest-parser', 'fallback'))
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+
+class MaskAndFalsePositives7301(GuardBase):
+    """Round 3 (code L3, N5, code L4): raw-string prefixes and benign forms."""
+
+    def write(self, rel, text):
+        target = self.root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding='utf-8')
+
+    def test_prefixed_raw_strings_do_not_hide_path_attribute(self):
+        for prefix in ('br', 'cr', 'r'):
+            with self.subTest(prefix=prefix):
+                self.write('gen/evil.rs', BR_EVIL)
+                self.write('src/lib.rs', (
+                    'const A: &[u8] = %s"\\"; #[path = "../gen/evil.rs"] mod evil; // ";\n' % prefix))
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('gen/evil.rs:1', res.stdout)
+
+    def test_prefixed_raw_string_body_is_not_scanned(self):
+        self.write('src/lib.rs', 'const A: &[u8] = br"zip::ZipArchive";\nconst B: &str = cr#"read_npz"#;\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_benign_forms_pass(self):
+        cases = {
+            'doc-comment': '/// unlike zip::ZipArchive this is fine\nfn f() {}\n',
+            'inner-doc': '//! Reads ZipArchive-free data.\nfn f() {}\n',
+            'block-comment': '/* zip::x and read_npz in a comment */\nfn f() {}\n',
+            'zip-param-in-macro': 'pub fn f(zip: u8) { println!("{}", zip); }\n',
+            'zip-let-in-macro': 'fn f() {\n    let zip = 1;\n    assert_eq!(zip, 1);\n}\n',
+            'if-not-zip': 'pub fn f(zip: bool) { if !(zip) { return; } }\n',
+            'while-not-zip': 'pub fn f(zip: bool) { while !(zip) { break; } }\n',
+            'regex-extract-with-iter-zip': (
+                'fn f(c: Captures, a: &[u8], b: &[u8]) {\n'
+                '    let _ = c.extract();\n    let _ = a.iter().zip(b);\n}\n'),
+            'string-literal': 'const A: &str = "zip::ZipArchive read_npz";\n',
+        }
+        for name, body in cases.items():
+            with self.subTest(case=name):
+                self.write('src/lib.rs', body)
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_real_uses_still_fail_next_to_benign_forms(self):
+        cases = {
+            'crate-path-with-local-zip': 'fn f() {\n    let zip = 1;\n    let _ = zip::ZipArchive::new;\n}\n',
+            'macro-input-in-other-fn': (
+                'fn f(zip: u8) { println!("{}", zip); }\nfn g() { my_macro!(zip); }\n'),
+            'archive-extract-with-iter-zip': (
+                'fn f(ar: Archive, a: &[u8], b: &[u8]) {\n    ar.extract(p);\n    let _ = a.iter().zip(b);\n}\n'),
+            'type-after-doc-comment': '/// docs\nfn f(a: ZipArchive) {}\n',
+            'use-after-comment': '// zip\nuse zip::read;\n',
+        }
+        for name, body in cases.items():
+            with self.subTest(case=name):
+                self.write('src/lib.rs', body)
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('src/lib.rs:', res.stdout)
 
 
 if __name__ == '__main__':
