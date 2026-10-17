@@ -727,6 +727,43 @@ class NextestRetryAndSetupWords(unittest.TestCase):
             cts.scan_nextest_log(text)
         self.assertIn('line 2', str(ctx.exception))
 
+    def test_the_marker_is_driven_through_every_continue_branch_of_scan_nextest_log_7298(self):
+        # R9-1 amendment: close the marker-placement CLASS by a test. Every `continue` of scan_nextest_log, in source
+        # order: (1) runner notice, (2) Summary, (3) the marker branch, (4) SETUP script line, (5) a line with no
+        # status word, (6) SKIP, (7) a `TRY n <status>` attempt line. The marker is glued onto a line of each shape.
+        import inspect
+        self.assertEqual(inspect.getsource(cts.scan_nextest_log).count('continue'), 7,
+                         'a continue branch was added or removed: add its row to this table')
+        marker = '- test configured to fail if flaky'
+        head = '  TRY 2 PASS [   1.000s] (  1/1) nx5 a::f\n'
+        tail = '       FLAKY 2/3 [   1.000s] nx5 a::f\n'
+        branch_lines = {
+            'summary': '     Summary [   1.000s] 1 tests run: 1 passed, 0 skipped  ',
+            'marker': '           ',
+            'setup': '  SETUP PASS [   1.000s] db-setup: ./setup.sh  ',
+            'skip': '        SKIP [         ] nx5 a::s  ',
+            'try_attempt': '  TRY 2 PASS [   1.000s] (  1/1) nx5 b::g  ',
+        }
+        for branch, front in branch_lines.items():
+            for back, label in ((marker + ' x', 'text after'), (marker, 'at the end')):
+                if branch == 'marker' and back == marker:
+                    continue  # the marker on its own line IS the legitimate shape
+                with self.subTest(branch=branch, marker=label):
+                    with self.assertRaises(cts.ParseError) as ctx:
+                        cts.scan_nextest_log(head + front + back + '\n' + tail)
+                    self.assertIn('line 2', str(ctx.exception))
+        # a line with no status word: text after the marker is refused; the marker at the end is the real marker line
+        with self.assertRaises(cts.ParseError) as ctx:
+            cts.scan_nextest_log(head + 'child output ' + marker + ' x\n' + tail)
+        self.assertIn('line 2', str(ctx.exception))
+        self.assertEqual(cts.scan_nextest_log(head + 'child output ' + marker + '\n' + tail).outcomes,
+                         {('lib', 'a::f'): cts.FAIL})
+        # the one exemption: a runner notice line is skipped whole (the watchdog's progress mirror, never a result),
+        # so the marker on it is not read and the later FLAKY line decides.
+        for glued in ('##[notice]progress ' + marker, '::notice::' + marker + ' tail'):
+            with self.subTest(branch='runner_notice', line=glued):
+                self.assertEqual(cts.scan_nextest_log(head + glued + '\n' + tail).outcomes, {('lib', 'a::f'): cts.PASS})
+
     def test_help_text_states_the_flaky_marker_and_status_table_rules_7298(self):
         self.assertIn('configured to fail if flaky', cts.__doc__)
         self.assertIn('SETUP', cts.__doc__)
