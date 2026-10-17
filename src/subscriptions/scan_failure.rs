@@ -570,8 +570,20 @@ fn insert_capped(
 /// row is not this function's business (`false`).
 #[must_use]
 pub fn scan_failure_visible_to(row: &DlqEntry, caller: &str) -> bool {
-    is_scan_failure_sub_id(&row.subscription_id)
-        && serde_json::from_str::<serde_json::Value>(&row.payload)
+    scan_failure_visible(row, caller, &[])
+}
+
+/// [`scan_failure_visible_to`] plus the operator view (#7501): a member of the
+/// admin allowlist (`AppState.admin_agent_ids`, or the process allowlist on
+/// MCP/CLI) sees EVERY failed-lookup row, anonymous ones included; everyone
+/// else keeps the owner-scoped view. Only failed-lookup rows are widened.
+#[must_use]
+pub fn scan_failure_visible(row: &DlqEntry, caller: &str, admin_ids: &[String]) -> bool {
+    if !is_scan_failure_sub_id(&row.subscription_id) {
+        return false;
+    }
+    crate::identity::is_admin_agent_in(caller, admin_ids)
+        || serde_json::from_str::<serde_json::Value>(&row.payload)
             .ok()
             .and_then(|p| {
                 p.get("agent_id")

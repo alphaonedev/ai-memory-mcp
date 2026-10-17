@@ -176,7 +176,7 @@ pub fn handle_subscription_dlq_list_for(
     conn: &rusqlite::Connection,
     params: &Value,
     caller: &str,
-    _admin_ids: &[String],
+    admin_ids: &[String],
 ) -> Result<Value, String> {
     let subscription_id = params[param_names::SUBSCRIPTION_ID].as_str();
     let limit = params["limit"]
@@ -212,7 +212,9 @@ pub fn handle_subscription_dlq_list_for(
         // the owner gate cannot apply; they are attributed to the writer.
         rows_all
             .into_iter()
-            .filter(|r| crate::subscriptions::scan_failure::scan_failure_visible_to(r, caller))
+            .filter(|r| {
+                crate::subscriptions::scan_failure::scan_failure_visible(r, caller, admin_ids)
+            })
             .collect()
     } else if let Some(sid) = subscription_id {
         let owner = crate::subscriptions::get_owner(conn, sid)
@@ -239,7 +241,7 @@ pub fn handle_subscription_dlq_list_for(
             std::collections::HashMap::new();
         let mut out = Vec::with_capacity(rows_all.len());
         for row in rows_all {
-            if crate::subscriptions::scan_failure::scan_failure_visible_to(&row, caller) {
+            if crate::subscriptions::scan_failure::scan_failure_visible(&row, caller, admin_ids) {
                 // v1.0.0 #7366: a failed-lookup record, shown to its writer.
                 out.push(row);
                 continue;

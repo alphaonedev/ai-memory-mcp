@@ -1848,7 +1848,14 @@ pub async fn handle_subscription_dlq_list_http(
         Err(e) => return err_response(e),
     };
     let lock = app.db.lock().await;
-    let result = crate::mcp::handle_subscription_dlq_list(&lock.0, &body, Some(&caller));
+    // #7501: the header-bound caller and the operator allowlist of this
+    // daemon; admins see every failed-lookup row, everyone else their own.
+    let result = crate::mcp::handle_subscription_dlq_list_for(
+        &lock.0,
+        &body,
+        &caller,
+        &app.admin_agent_ids,
+    );
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
