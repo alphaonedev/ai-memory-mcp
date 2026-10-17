@@ -118,22 +118,17 @@ fn bin_copy_pid(name: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-/// #7342 (N1) - `kill -0 <pid>`: `Some(true)` when the process exists,
-/// `Some(false)` when it does not, `None` when the probe itself could not run
-/// (fail closed: the caller must not treat that as dead). No new dependency.
-fn pid_probe(pid: u32) -> Option<bool> {
-    match Command::new("kill")
+/// #7342 (N1) - `kill -0 <pid>`: `Ok(true)` when the process exists,
+/// `Ok(false)` when it does not, `Err` when the probe itself could not run
+/// (fail closed: the caller must not treat that as dead). The caller logs the
+/// error with the copy path (ERRORS-07). No new dependency.
+fn pid_probe(pid: u32) -> std::io::Result<bool> {
+    Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-    {
-        Ok(status) => Some(status.success()),
-        Err(e) => {
-            eprintln!("prune: liveness probe for pid {pid} could not run: {e}");
-            None
-        }
-    }
+        .map(|status| status.success())
 }
 
 /// #7342 (N1) - prune decision. An unrunnable probe (`None`) counts as ALIVE,
@@ -157,6 +152,7 @@ fn prune_stale_bin_copies(dir: &Path) {
             return;
         }
     };
+    let mut probe_failure_logged = false;
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(pid) = path
@@ -179,7 +175,24 @@ fn prune_stale_bin_copies(dir: &Path) {
             .ok()
             .and_then(|m| m.elapsed().ok())
             .is_some_and(|age| age > STALE_BIN_COPY_AGE);
-        let alive = if too_old { None } else { pid_probe(pid) };
+        let alive = if too_old {
+            None
+        } else {
+            match pid_probe(pid) {
+                Ok(alive) => Some(alive),
+                Err(e) => {
+                    // Only the first failure of a prune pass is logged (ERRORS-07: names the copy).
+                    if !probe_failure_logged {
+                        probe_failure_logged = true;
+                        eprintln!(
+                            "prune: liveness probe for pid {pid} ({}) could not run: {e}",
+                            path.display()
+                        );
+                    }
+                    None
+                }
+            }
+        };
         if should_prune(too_old, alive)
             && let Err(e) = std::fs::remove_file(&path)
         {
@@ -683,7 +696,7 @@ fn stale_bin_copies_are_pruned_and_live_ones_kept_7342() {
     );
     // N1: a young dead-pid copy goes only when the probe can run; with `kill`
     // unavailable it is kept (fail closed), never the other way round.
-    let probe_runs = pid_probe(std::os::unix::process::parent_id()).is_some();
+    let probe_runs = pid_probe(std::os::unix::process::parent_id()).is_ok();
     assert_eq!(
         stale_tmp.exists(),
         !probe_runs,
