@@ -86,6 +86,9 @@ MIN_SWEEP_AGE_SECS = 600
 TERM_GRACE_SECS = 5.0
 LOG_TAIL_LINES = 200
 CONNECT_TIMEOUT_SECS = '30'
+# decision: one psql call (CREATE ... TEMPLATE copies a database, DROP waits on sessions) gets 300 s, well above
+# any healthy statement, so only a stalled server or a held lock trips it (#7429).
+PSQL_TIMEOUT_SECS = 300.0
 IN_USE_TEXT = 'being accessed by other users'
 EXIT_USAGE = 2
 EXIT_MINT = 3
@@ -286,7 +289,10 @@ def psql(url: str, sql: str, tuples: bool = False) -> str:
     if tuples:
         argv.append('-At')
     argv += ['-c', sql]
-    done = subprocess.run(argv, capture_output=True, text=True, env=_pg_env(url))
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, env=_pg_env(url), timeout=PSQL_TIMEOUT_SECS)
+    except subprocess.TimeoutExpired:
+        raise WrapperError('psql timed out after %g s' % PSQL_TIMEOUT_SECS, None)
     if done.returncode != 0:
         raise WrapperError('psql failed (%d): %s' % (done.returncode, (done.stderr or '').strip() or 'no stderr'),
                            done.returncode)
@@ -384,12 +390,15 @@ def close_hold(hold: Optional['subprocess.Popen[str]']) -> None:
 
 # --- tier steps -----------------------------------------------------------
 
-def _proved_absent(url: str, check: str) -> bool:
-    """True only when the read-only existence check succeeds and returns no row (#7405)."""
+def _proved_absent(url: str, check: str) -> Tuple[bool, str]:
+    """``(absent, reason)``: absent only when the read-only check succeeds with no row (#7405, #7427)."""
     try:
-        return not psql(url, check, tuples=True).strip()
-    except WrapperError:
-        return False
+        found = psql(url, check, tuples=True).strip()
+    except WrapperError as exc:
+        return False, 'the existence check itself failed: %s' % exc
+    if found:
+        return False, 'the existence check found a database with this name'
+    return True, ''
 
 
 def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
@@ -414,15 +423,19 @@ def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
                                '--run-id <run id>` first, otherwise choose a different --db'
                                % (tpl, exc, db_name))
         check = "SELECT 1 FROM pg_database WHERE datname = '%s'" % tpl.replace("'", "''")
-        if exc.returncode != PSQL_SQL_ERROR or not _proved_absent(url, check):
-            # Status 1 refuses the statement only when the check below proves no database. Any other status (2 lost
-            # connection, a negative signal status such as -9, None, an unexpected code)
-            # may follow a committed CREATE. Whether the template is ours is unknown, so
-            # setup neither claims it nor DROPs it (#7388, #7400).
+        absent, why = False, 'psql ended with status %s, not a plain SQL error' % exc.returncode
+        if exc.returncode == PSQL_SQL_ERROR:
+            absent, why = _proved_absent(url, check)
+        if not absent:
+            # Status 1 means refused only when the existence check run just above succeeds with no row. A row, a
+            # failed check or any other status (2 lost connection, a negative signal status such as -9, None, an
+            # unexpected code) may follow a committed CREATE, so the outcome is unknown: setup neither claims the
+            # template nor DROPs it (#7388, #7400, #7427, #7428).
             raise WrapperError('CREATE DATABASE %s ended without a clean answer; the outcome is unknown and the '
-                               'template may exist with no owner record: %s; check with `%s` and, if it is '
-                               'from this run, run `pg_isolated_binary.py teardown --db %s --run-id <run id>`'
-                               % (tpl, exc, check, db_name), exc.returncode)
+                               'template may exist with no owner record: %s; %s; to check by hand run `%s` and, if '
+                               'the template is from this run, run `pg_isolated_binary.py teardown --db %s '
+                               '--run-id <run id>`'
+                               % (tpl, exc, why, check, db_name), exc.returncode)
         raise WrapperError('CREATE DATABASE %s was refused; nothing was created or changed: %s' % (tpl, exc))
     try:
         psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')

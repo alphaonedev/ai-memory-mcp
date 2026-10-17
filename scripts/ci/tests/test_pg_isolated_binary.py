@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest.mock
 import uuid
 from pathlib import Path
@@ -610,14 +611,38 @@ class TemplateOwnership(unittest.TestCase):
             self.run_setup(pg)
         self.assertNotIn('nothing was created', str(row.exception))
         self.assertIn('outcome is unknown', str(row.exception))
+        self.assertIn('the existence check found a database with this name', str(row.exception))
+        self.assertNotIn('check itself failed', str(row.exception))
         # status 1 and the check itself fails: unknown
         pg = FakePg(fail=dict(refused, **{'SELECT 1 FROM pg_database': 'ERROR:  check-failed'}))
         with self.assertRaises(pib.WrapperError) as failed:
             self.run_setup(pg)
         self.assertNotIn('nothing was created', str(failed.exception))
         self.assertIn('outcome is unknown', str(failed.exception))
+        self.assertIn('the existence check itself failed', str(failed.exception))
+        self.assertIn('check-failed', str(failed.exception))
+        self.assertNotIn('found a database', str(failed.exception))
         self.assertEqual(failed.exception.returncode, 1)
         self.assertFalse([s for s in pg.log if s.startswith(('ALTER', 'DROP', 'CREATE EXT'))])
+
+    def test_psql_wall_time_is_bounded_7429(self):
+        with tempfile.TemporaryDirectory(dir=str(Path(__file__).resolve().parent)) as d:
+            stub = Path(d) / 'psql'
+            stub.write_text('#!/usr/bin/env python3\nimport time\ntime.sleep(60)\n')
+            stub.chmod(0o755)
+            env = dict(os.environ, PATH=d + os.pathsep + os.environ.get('PATH', ''))
+            with unittest.mock.patch.dict(os.environ, env, clear=True), \
+                    unittest.mock.patch.object(pib, 'PSQL_TIMEOUT_SECS', 0.3):
+                started = time.monotonic()
+                with self.assertRaises(pib.WrapperError) as ctx:
+                    pib.psql(BASE, 'SELECT 1')
+                self.assertLess(time.monotonic() - started, 20)
+                self.assertIn('timed out', str(ctx.exception))
+                self.assertIsNone(ctx.exception.returncode)
+                # the existence check timing out is "unknown", never "proved absent"
+                absent, why = pib._proved_absent(BASE, 'SELECT 1')
+                self.assertFalse(absent)
+                self.assertIn('the existence check itself failed: psql timed out', why)
 
     def test_empty_stderr_is_spelled_out_7406(self):
         silent = lambda argv, kw: Result(-9, '', '')
