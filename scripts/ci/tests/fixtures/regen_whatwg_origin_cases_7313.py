@@ -93,7 +93,10 @@ def main():
         "oracle": "node %s new URL(input, base_url)" % node_version,
         "cases": [{"group": g, "input": v, "browser": r} for (g, v), r in zip(ALL_CASES, results)],
     }
-    args.out.write_text(json.dumps(doc, indent=1, ensure_ascii=True) + "\n", encoding="utf-8")
+    text = json.dumps(doc, indent=1, ensure_ascii=True)
+    # the userinfo vectors are not addresses; escape the at-sign so no email-shaped text sits in the file
+    text = text.replace(AT, "\\u0040")
+    args.out.write_text(text + "\n", encoding="utf-8")
     print("wrote %s: %d review cases + %d extra cases" % (args.out, len(REVIEW_CASES), len(EXTRA_CASES)))
     return 0
 

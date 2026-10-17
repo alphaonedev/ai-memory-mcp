@@ -83,7 +83,7 @@
           "desc": "Create a coordination action",
           "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"action\": {\n    \"agent_id\": \"host:pop-os\",\n    \"claimed_by\": null,\n    \"created_at\": 1788271780,\n    \"id\": \"4969d218-0e3e-4080-91ef-4bc0"
+          "note": "{\n  \"action\": {\n    \"agent_id\": \"host:node\",\n    \"claimed_by\": null,\n    \"created_at\": 1788271780,\n    \"id\": \"4969d218-0e3e-4080-91ef-4bc0"
         },
         {
           "name": "memory_action_get",
@@ -104,7 +104,7 @@
           "desc": "List coordination actions by",
           "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"actions\": [\n    {\n      \"agent_id\": \"host:pop-os\",\n      \"claimed_by\": null,\n      \"created_at\": 1788271780,\n      \"id\": \"4969d218-0e3e"
+          "note": "{\n  \"actions\": [\n    {\n      \"agent_id\": \"host:node\",\n      \"claimed_by\": null,\n      \"created_at\": 1788271780,\n      \"id\": \"4969d218-0e3e"
         },
         {
           "name": "memory_action_add_edge",
@@ -125,14 +125,14 @@
           "desc": "Rank the UNBLOCKED",
           "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"actions\": [\n    {\n      \"agent_id\": \"host:pop-os\",\n      \"claimed_by\": null,\n      \"created_at\": 1788271767,\n      \"id\": \"155f0491-2802"
+          "note": "{\n  \"actions\": [\n    {\n      \"agent_id\": \"host:node\",\n      \"claimed_by\": null,\n      \"created_at\": 1788271767,\n      \"id\": \"155f0491-2802"
         },
         {
           "name": "memory_action_next",
           "desc": "Return the top UNBLOCKED",
           "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"action\": {\n    \"agent_id\": \"host:pop-os\",\n    \"claimed_by\": null,\n    \"created_at\": 1788271767,\n    \"id\": \"155f0491-2802-4204-b058-c6cc"
+          "note": "{\n  \"action\": {\n    \"agent_id\": \"host:node\",\n    \"claimed_by\": null,\n    \"created_at\": 1788271767,\n    \"id\": \"155f0491-2802-4204-b058-c6cc"
         }
       ]
     },
@@ -144,7 +144,7 @@
           "desc": "Create a draft routine \u2014 a",
           "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"id\": \"841ee515-d308-47d3-a75b-ee0205e34f4a\",\n  \"routine\": {\n    \"created_at\": 1788271780,\n    \"created_by\": \"host:pop-os\",\n    \"frozen_"
+          "note": "{\n  \"id\": \"841ee515-d308-47d3-a75b-ee0205e34f4a\",\n  \"routine\": {\n    \"created_at\": 1788271780,\n    \"created_by\": \"host:node\",\n    \"frozen_"
         },
         {
           "name": "memory_routine_freeze",
@@ -172,7 +172,7 @@
           "desc": "List a namespace's routines by",
           "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"routines\": [\n    {\n      \"created_at\": 1788271780,\n      \"created_by\": \"host:pop-os\",\n      \"frozen_at\": null,\n      \"id\": \"841ee515-d3"
+          "note": "{\n  \"routines\": [\n    {\n      \"created_at\": 1788271780,\n      \"created_by\": \"host:node\",\n      \"frozen_at\": null,\n      \"id\": \"841ee515-d3"
         }
       ]
     },
@@ -257,7 +257,7 @@
           "desc": "Create a pending",
           "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"checkpoint\": {\n    \"condition\": {},\n    \"condition_type\": \"approval\",\n    \"created_at\": 1788271780,\n    \"created_by\": \"host:pop-os\",\n  "
+          "note": "{\n  \"checkpoint\": {\n    \"condition\": {},\n    \"condition_type\": \"approval\",\n    \"created_at\": 1788271780,\n    \"created_by\": \"host:node\",\n  "
         },
         {
           "name": "memory_checkpoint_resolve",
@@ -800,7 +800,7 @@
           "desc": "Send a message from the caller",
           "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"delivered_at\": \"2026-09-01T14:09:52.724625496+00:00\",\n  \"from\": \"ai:fable-validator@pop-os\",\n  \"id\": \"62b1dacf-6801-4577-834d-e8e2b5806"
+          "note": "{\n  \"delivered_at\": \"2026-09-01T14:09:52.724625496+00:00\",\n  \"from\": \"ai:fable-validator@node\",\n  \"id\": \"62b1dacf-6801-4577-834d-e8e2b5806"
         }
       ]
     },
@@ -920,7 +920,7 @@
           "desc": "Share a memory with another",
           "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"from_agent_id\": \"ai:fable-validator@pop-os\",\n  \"shared_memory_id\": \"ff10130e-ace5-4bf1-b141-7a08190d71e8\",\n  \"source_memory_id\": \"ac236"
+          "note": "{\n  \"from_agent_id\": \"ai:fable-validator@node\",\n  \"shared_memory_id\": \"ff10130e-ace5-4bf1-b141-7a08190d71e8\",\n  \"source_memory_id\": \"ac236"
         }
       ]
     },
@@ -956,7 +956,7 @@
           "desc": "Store a memory",
           "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"agent_id\": \"ai:fable-validator@pop-os\",\n  \"atomise_mode\": \"off\",\n  \"atomise_outcome\": \"skipped_policy_disabled\",\n  \"id\": \"6863a387-aed4"
+          "note": "{\n  \"agent_id\": \"ai:fable-validator@node\",\n  \"atomise_mode\": \"off\",\n  \"atomise_outcome\": \"skipped_policy_disabled\",\n  \"id\": \"6863a387-aed4"
         }
       ]
     },

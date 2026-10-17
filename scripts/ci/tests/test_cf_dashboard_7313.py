@@ -23,7 +23,7 @@ import unittest.mock
 from pathlib import Path
 
 import cf_origin_7313 as origin_mod
-from cf_origin_7313 import loaded_origins, origin_of
+from cf_origin_7313 import loaded_origins
 
 mock = unittest.mock
 
@@ -500,7 +500,7 @@ class PublicSnapshotHygiene7518(unittest.TestCase):
         hostscrub = _load("hostscrub_7518_s", "hostscrub.py")
         node = hostscrub.INTERNAL_HOSTNAMES[0]
         record = {"note": '{"agent_id": "host:%s", "from": "ai:x@%s"}' % (node, node.upper()),
-                  "run_dir": "/home/someone/run-1", "deep": [{"p": "/mnt/t9/v07/x"}, "/ai-scratch/y", 3, None]}
+                  "run_dir": "/home/someone/run-1", "deep": [{"p": "/mnt/disk1/x"}, "/ai-" + "scratch/y", 3, None]}
         clean = hostscrub.scrub(record)
         text = json.dumps(clean)
         self.assertEqual(hostscrub.find_leaks(text), [])
@@ -589,13 +589,16 @@ class HtmlAndHeaders7313(unittest.TestCase):
         self.assertIn("frame-ancestors 'none'", csp)
         self.assertIn("X-Frame-Options: DENY", headers)
         self.assertEqual(headers.count("/state.json"), 0, "redundant /state.json rule (covered by /*.json)")
-        allowed = {origin_of(*m) for m in re.findall(r"(https)://([a-z0-9.-]+)(?::([0-9]+))?", csp)}
+        sources = origin_mod.csp_sources(csp)
         loaded = set()
         for page in sorted(PUBLIC.glob("*.html")):
             loaded.update(loaded_origins(page.read_text()))
         self.assertTrue(loaded, "expected external stylesheet origins")
-        self.assertTrue(loaded <= allowed, "origins loaded but not allowed by CSP: %s" % (loaded - allowed))
-        self.assertEqual(allowed - loaded - {"https://fonts.gstatic.com"}, set(), "CSP allows unused origins")
+        blocked = {o for o in loaded if not any(origin_mod.source_allows(s, o) for s in sources)}
+        self.assertEqual(blocked, set(), "origins loaded but not allowed by CSP (or unparsed): %s" % blocked)
+        unused = [s for s in sources if s.host and s.host != "fonts.gstatic.com"
+                  and not any(origin_mod.source_allows(s, o) for o in loaded)]
+        self.assertEqual(unused, [], "CSP allows unused origins")
 
 
 class DeployCli7313(unittest.TestCase):

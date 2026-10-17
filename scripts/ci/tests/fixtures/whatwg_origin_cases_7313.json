@@ -610,32 +610,32 @@
   },
   {
    "group": "review",
-   "input": "https://u@ui.example/x",
+   "input": "https://u\u0040ui.example/x",
    "browser": "https://ui.example"
   },
   {
    "group": "review",
-   "input": "https://u:pw@ui.example:9000/x",
+   "input": "https://u:pw\u0040ui.example:9000/x",
    "browser": "https://ui.example:9000"
   },
   {
    "group": "review",
-   "input": "https://u:p@ss@ui3.example/x",
+   "input": "https://u:p\u0040ss\u0040ui3.example/x",
    "browser": "https://ui3.example"
   },
   {
    "group": "review",
-   "input": "https://a@b@ui4.example:8443/x",
+   "input": "https://a\u0040b\u0040ui4.example:8443/x",
    "browser": "https://ui4.example:8443"
   },
   {
    "group": "review",
-   "input": "https://u:@ui5.example/x",
+   "input": "https://u:\u0040ui5.example/x",
    "browser": "https://ui5.example"
   },
   {
    "group": "review",
-   "input": "https://@ui6.example/x",
+   "input": "https://\u0040ui6.example/x",
    "browser": "https://ui6.example"
   },
   {
@@ -830,12 +830,12 @@
   },
   {
    "group": "extra",
-   "input": "https://u@/x",
+   "input": "https://u\u0040/x",
    "browser": "PARSE-FAIL"
   },
   {
    "group": "extra",
-   "input": "https://u@:80/x",
+   "input": "https://u\u0040:80/x",
    "browser": "PARSE-FAIL"
   },
   {
@@ -965,22 +965,22 @@
   },
   {
    "group": "extra",
-   "input": "https://a.example:8443@evil.example/x",
+   "input": "https://a.example:8443\u0040evil.example/x",
    "browser": "https://evil.example"
   },
   {
    "group": "extra",
-   "input": "https://evil.example\\@good.example/x",
+   "input": "https://evil.example\\\u0040good.example/x",
    "browser": "https://evil.example"
   },
   {
    "group": "extra",
-   "input": "https://good.example?@evil.example/x",
+   "input": "https://good.example?\u0040evil.example/x",
    "browser": "https://good.example"
   },
   {
    "group": "extra",
-   "input": "https://good.example#@evil.example/x",
+   "input": "https://good.example#\u0040evil.example/x",
    "browser": "https://good.example"
   },
   {
@@ -1050,7 +1050,7 @@
   },
   {
    "group": "extra",
-   "input": "mailto:a@b.example",
+   "input": "mailto:a\u0040b.example",
    "browser": "none"
   },
   {

@@ -20,6 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import cfcommon  # noqa: E402
+import hostscrub  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
 
@@ -40,7 +41,11 @@ def main():
         return 2
     # stamp lastUpdated (ISO-8601 UTC) so the "updated Xs ago" clock is authoritative
     body["lastUpdated"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    text = json.dumps(body)
+    try:
+        text = hostscrub.dump_clean(body)  # the state is published: no internal hostname or local path (#7518)
+    except hostscrub.LeakError as e:
+        print(f"push-state: {e}", file=sys.stderr)
+        return 2
     (HERE / "public").mkdir(exist_ok=True)
     (HERE / "public" / "state.json").write_text(text + "\n")
 

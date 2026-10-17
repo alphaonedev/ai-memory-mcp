@@ -23,6 +23,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
+sys.path.insert(0, str(REPO / "infra" / "cf-dashboard"))
+import hostscrub  # noqa: E402  (internal hostnames and local paths must never reach the public dashboard, #7518)
 
 
 def git(*args: str) -> str:
@@ -112,7 +114,12 @@ def main() -> int:
         record["daemon_binary_sha256"] = digest
         record["addressed_exe_sha256"] = digest
     args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    try:
+        text = hostscrub.dump_clean(record, indent=2, sort_keys=True)
+    except hostscrub.LeakError as exc:
+        print(f"FATAL: {exc}", file=sys.stderr)
+        return 2
+    args.out.write_text(text + "\n", encoding="utf-8")
     print(
         f"[mcp-tools-state] wrote {args.out} total={record['total']} "
         f"validated={record['validated']} failclosed={record['failclosed']}"

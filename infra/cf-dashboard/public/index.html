@@ -770,6 +770,8 @@ function renderAll(D){
   _S(()=>security("secpanel", D.security));
   _S(()=>continuity("cycpanel", D.continuity));
   _S(()=>board(dims)); _S(()=>feed(D.events||[]));
+  // a non-list `dimensions` is a malformed state: skip the ring (placeholder stays) and let poll() keep the badge honest
+  if(!Array.isArray(dims)) throw new TypeError("state.dimensions is not a list");
   // 2026-09-18: the ring shows the V&V VALIDATED share (items measured green / items in scope), not the
   // count of fully-green dimensions - a dimension only turns green when its LAST item lands, so the
   // dimension count sat at 1/6 while 160/195 items were validated. The dimension count is the subtitle.
