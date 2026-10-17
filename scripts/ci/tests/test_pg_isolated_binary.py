@@ -748,8 +748,7 @@ class TemplateOwnership(unittest.TestCase):
                     pib.psql(BASE, sql)
                 self.assertEqual(rec.calls, [], 'psql was not started')
                 self.assertIn('refus', str(ctx.exception))
-        allowed = ['SELECT 1', 'SELECT 1;', 'SELECT 1 ;  ', "SELECT 'statement_timeout'", 'SET search_path = public',
-                   'CREATE DATABASE x']
+        allowed = ['SELECT 1', 'SELECT 1;', 'SELECT 1 ;  ', 'SET search_path = public', 'CREATE DATABASE x']
         for sql in allowed:
             rec = Recorder(lambda argv, kw: Result(0, 'ok', ''))
             with self.subTest(sql=sql), unittest.mock.patch.object(pib.subprocess, 'run', rec):
@@ -795,17 +794,17 @@ class TemplateOwnership(unittest.TestCase):
         ]
         allowed = [
             'SELECT 1', 'SELECT 1;', 'SELECT 1 ;  ', '  SELECT 1 ; -- trailing\n', 'SELECT 1; /* trailing */',
-            "SELECT 'statement_timeout'", 'SET search_path = public', 'CREATE DATABASE x',
+            'SET search_path = public', 'CREATE DATABASE x',
             # a ; hidden in each quoting form
             "SELECT 'a;b'", "SELECT E'a;b'", "SELECT e'a\\';b'", "SELECT 'it''s;'", 'SELECT 1 AS "x;y"', 'SELECT 1 AS "x"";y"',
             'SELECT $q$a;b$q$', 'SELECT $$a;b$$', 'SELECT $t1$a;$t2$ b;$t1$', "SELECT U&'a;b'", "SELECT U&'\\0041;'",
             'SELECT 1 AS U&"x\\003by"', 'SELECT 1 AS U&"x!003by" UESCAPE \'!\'',
             'SELECT 1 -- a;b\n', 'SELECT 1 /* a;b */', 'SELECT 1 /* a /* ; */ ; */', 'SELECT 1; -- ;\n',
             # text that only looks like an override
-            "SELECT 'RESET ALL'", "SELECT 'DISCARD ALL'", "SELECT 'set_config'", "SELECT 'SET ROLE x'",
+            "SELECT 'RESET ALL'", "SELECT 'DISCARD ALL'", "SELECT 'SET ROLE x'",
             "SELECT $q$SET statement_timeout = 0$q$", 'SELECT 1 AS "reset all"', 'SELECT 1 /* RESET ALL */',
-            'SELECT 1 -- SET statement_timeout\n', "SELECT E'SET statement_timeout'", "SELECT U&'set_config'",
-            'SELECT 1 AS reset_all', 'SELECT 1 AS discard_all', 'SELECT 1 AS my_set_config', 'SELECT 1 AS "role"',
+            'SELECT 1 -- SET statement_timeout\n', "SELECT E'SET statement_timeout'",
+            'SELECT 1 AS reset_all', 'SELECT 1 AS discard_all', 'SELECT 1 AS my_set_config',
             'SELECT $1, $2', 'SELECT 1 AS a$b$c',
         ]
         for sql in refused:
@@ -820,6 +819,141 @@ class TemplateOwnership(unittest.TestCase):
             with self.subTest(allowed=sql), unittest.mock.patch.object(pib.subprocess, 'run', rec):
                 pib.psql(BASE, sql, tuples=True)
                 self.assertEqual(rec.calls[0][0][-1], sql)
+
+    # ---- round 12: refuse any MENTION, not a list of spellings (#7575-#7579) --------------------------------
+    MENTION_REFUSED = [
+        # #7575: a line comment ends at \r as well as \n, so the statement after it is visible
+        "SELECT 1 -- c\r; SET statement_timeout = 0; SELECT current_setting('statement_timeout')",
+        'SELECT 1 --c\r;SELECT 2', 'SELECT 1 -- c\r\n; SELECT 2', 'SELECT 1 -- c\r SET statement_timeout = 0',
+        # non-ASCII spaces are identifier bytes to the server: the second statement is still a second statement
+        'SELECT 1 ; SET statement_timeout = 0', 'SELECT 1; SELECT 2', 'SELECT 1; SELECT 2',
+        # #7576: whitespace and comments between a U& token and UESCAPE
+        'SET U&"statement!005ftimeout" /**/ UESCAPE \'!\' = 0', 'SET U&"statement!005ftimeout" -- c\n UESCAPE \'!\' = 0',
+        'SET U&"lock!005ftimeout" /* a */ /* b */ UESCAPE \'!\' TO 0',
+        "SELECT U&\"set!005fconfig\" /**/ UESCAPE '!' ('statement_timeout', '0', false)",
+        "SELECT U&\"set!005fconfig\"\n\t UESCAPE '!' ('x', '0', false)",
+        "SELECT U&'statement!005ftimeout' /**/ UESCAPE '!'",
+        'SELECT U&"x" /**/ UESCAPE \'\'', 'SELECT U&"x" UESCAPE "!"', 'SELECT U&"x" UESCAPE 1',
+        # #7577: every literal prefix whose end depends on standard_conforming_strings
+        "SELECT N'\\' ; SELECT 'second statement ran'; --'", "SELECT n'a\\'; SELECT 2'; SELECT 3",
+        "SELECT 'a\\'; SELECT 2'; SELECT 3", "SELECT E'a\\'; SELECT 2'; SELECT 3",
+        "SELECT U&'a\\'; SELECT 2'; SELECT 3'", "SELECT N'a'\n'\\'; SELECT 2'; SELECT 3",
+        # #7578: the parameter spelling of SET SESSION AUTHORIZATION / SET ROLE
+        "SET session_authorization = 'postgres'", 'RESET session_authorization', 'SET "session_authorization" TO DEFAULT',
+        'SET LOCAL Session_Authorization TO x', 'SET U&"session!005fauthorization" UESCAPE \'!\' TO x',
+        "SELECT 1 AS session_authorization", 'SET role = x', 'RESET role', "SELECT 'role'", 'ALTER ROLE x SET role = y',
+        # #7579: pg_settings is writable through its rules
+        "UPDATE pg_catalog.pg_settings SET setting = '0' WHERE name = 'statement_timeout'",
+        "UPDATE pg_settings SET setting = '0'", 'SELECT * FROM "PG_SETTINGS"', 'SELECT * FROM pg_catalog."pg_settings"',
+        'SELECT U&"pg!005fsettings" UESCAPE \'!\'', 'SELECT pg_reload_conf()', 'SELECT pg_catalog.pg_reload_conf()',
+        'ALTER SYSTEM SET statement_timeout = 0', 'ALTER SYSTEM RESET ALL', 'alter/**/system set x = 1',
+        "ALTER SYSTEM SET work_mem = '1GB'", 'ALTER "SYSTEM" RESET x',
+        # the whole timeout family, in every identifier spelling, and as a string
+        'SET idle_in_transaction_session_timeout = 0', 'SET idle_session_timeout TO 0', 'SET transaction_timeout = 0',
+        'RESET "Transaction_Timeout"', 'ALTER ROLE x SET idle_session_timeout = 0',
+        'ALTER DATABASE d SET transaction_timeout TO 0', "SELECT 'statement_timeout'", "SELECT 'LOCK_TIMEOUT'",
+        "SELECT E'statement\\x5ftimeout'", "SELECT E'statement\\137timeout'", "SELECT E'statement\\u005ftimeout'",
+        "SELECT 'statement\\137timeout'", "SELECT U&'statement\\005ftimeout'", 'SELECT $$lock_timeout$$',
+        'SELECT $t$transaction_timeout$t$', "SELECT 'statement_'\n'timeout'", "SELECT 'statement_' -- c\n 'timeout'",
+        "SELECT E'statement_'\n'timeout'", "SELECT current_setting('statement_timeout')",
+        "SELECT set_config('idle_session_timeout', '0', false)", "SELECT 'set_config'", "SELECT U&'set_config'",
+        'SELECT 1 AS "role"', 'SELECT 1 AS "Role"',
+        # DISCARD in any form, DO, RESET ALL
+        'DISCARD TEMP', 'DISCARD PLANS', 'discard/**/sequences', 'DISCARD -- c\r ALL', 'RESET -- c\r ALL',
+        'DO $$ BEGIN NULL; END $$', 'SET SESSION AUTHORIZATION postgres', 'SET LOCAL SESSION AUTHORIZATION x',
+        # E strings continue in E mode: the escaped quote hides nothing, the real end is the last quote
+        "SELECT E'a'\n'b\\'; SELECT 2'; SELECT 3",
+    ]
+    MENTION_ALLOWED = [
+        # server-rejected spellings that are not bypasses (non-ASCII spaces are identifier bytes)
+        'SET search_path = public', 'SELECT 1 AS statement_timeout', 'SET statement_timeout = 0',
+        "SELECT 'statement_' 'timeout'", "SELECT 'statement' || '_timeout' AS x_timeout",
+        'SELECT 1 AS statement_timeouts', 'SELECT 1 AS my_role', 'SELECT 1 AS roles', 'SELECT 1 AS pg_settings2',
+        # literal forms: B'' and X'' end at the first quote (no doubling, no backslash escape, scan.l xb/xh)
+        "SELECT B'0101'", "SELECT X'1f'", "SELECT B'0''1'", "SELECT b'1'\n'0'", "SELECT B'0\\'",
+        # quote continuation keeps the mode: an E literal continues as an E literal
+        "SELECT E'a'\n'b\\'c'", "SELECT 'a'\n'b'", "SELECT 'a' -- c\n 'b'", "SELECT N'a'", "SELECT n'it''s'",
+        "SELECT U&'a'\n'b'", 'SELECT 1 -- c\r\nFROM (SELECT 1) t',
+        # the escape character of a U& token is read through whitespace and comments
+        'SELECT U&"x\\0041" /**/ UESCAPE \'!\'', "SELECT U&'d!0061t' UESCAPE '!'",
+        'SELECT 1 AS uescape', 'SELECT 1 AS "uescape"',
+    ]
+    # Every SQL text the module's own callers hand to psql() (connection_budget, mint, drop, session_count,
+    # _proved_absent, setup, _names, teardown, sweep) and the live-test helpers: none may be refused.
+    REAL_CALLER_SHAPES = [
+        "SELECT current_setting('max_connections')::int, current_setting('superuser_reserved_connections')::int, "
+        "coalesce(current_setting('reserved_connections', true)::int, 0), (SELECT count(*) FROM pg_stat_activity)",
+        'CREATE DATABASE "ai_memory_t_r1_2" TEMPLATE "ai_memory_x_tpl"',
+        'DROP DATABASE IF EXISTS "ai_memory_t_r1_2"',
+        "SELECT count(*) FROM pg_stat_activity WHERE datname = 'ai_memory_t_r1_2'",
+        "SELECT 1 FROM pg_database WHERE datname = 'ai_memory_x_tpl'",
+        'CREATE DATABASE "ai_memory_x_tpl"',
+        'CREATE EXTENSION IF NOT EXISTS age', 'CREATE EXTENSION IF NOT EXISTS vector',
+        'ALTER DATABASE "ai_memory_x_tpl" WITH IS_TEMPLATE true ALLOW_CONNECTIONS false',
+        'ALTER DATABASE "ai_memory_x_tpl" WITH IS_TEMPLATE false',
+        "SELECT datname FROM pg_database WHERE starts_with(datname, 'ai_memory_t_r1_')",
+        'SELECT extract(epoch FROM now())::bigint',
+        "SELECT d.datname FROM pg_database d WHERE starts_with(d.datname, 'ai_memory_t_') "
+        "AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)",
+        'SELECT rolsuper OR rolcreaterole FROM pg_catalog.pg_roles WHERE rolname = current_user',
+        'SELECT pg_sleep(60) /* r8cap0123456789 */',
+        "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '%r8cap0123456789%' AND pid <> pg_backend_pid()",
+        "SELECT count(*) FROM pg_catalog.pg_locks WHERE locktype = 'advisory' AND objid = 7519001 AND granted",
+        'SELECT pg_advisory_lock(7519001)', 'SELECT current_database()',
+        "SELECT count(*) FROM pg_database WHERE starts_with(datname, 'ai_memory_t_r1_')",
+        "SELECT count(*) FROM pg_database WHERE datname = 'ai_memory_x_tpl'",
+    ]
+
+    def _guard_outcome(self, sql):
+        rec = Recorder(lambda argv, kw: Result(0, 'ok', ''))
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
+            try:
+                pib.psql(BASE, sql, tuples=True)
+            except pib.WrapperError as exc:
+                return 'refused', str(exc), rec
+        return 'ran', '', rec
+
+    def test_psql_guard_refuses_any_mention_of_a_cap_control_7575_7576_7577_7578_7579(self):
+        for sql in self.MENTION_REFUSED:
+            with self.subTest(refused=sql):
+                outcome, text, rec = self._guard_outcome(sql)
+                self.assertEqual(outcome, 'refused')
+                self.assertIn('refus', text)
+                self.assertEqual(rec.calls, [], 'psql was not started')
+
+    def test_psql_guard_allows_what_the_server_reads_as_harmless_7575_7576_7577(self):
+        for sql in self.MENTION_ALLOWED:
+            with self.subTest(allowed=sql):
+                outcome, text, rec = self._guard_outcome(sql)
+                self.assertEqual((outcome, text), ('ran', ''))
+                self.assertEqual(rec.calls[0][0][-1], sql)
+
+    def test_psql_guard_allows_every_real_caller_shape_7578_7579(self):
+        for sql in self.REAL_CALLER_SHAPES:
+            with self.subTest(real=sql[:60]):
+                outcome, text, rec = self._guard_outcome(sql)
+                self.assertEqual((outcome, text), ('ran', ''))
+                self.assertEqual(rec.calls[0][0][-1], sql)
+
+    def test_effective_timeouts_helper_is_argument_fixed_and_not_a_guard_hole_7579(self):
+        # the one read that names pg_settings and the timeouts: psql() refuses it, the helper runs it
+        with self.assertRaises(pib.WrapperError):
+            pib._refuse_uncapped_sql(pib._EFFECTIVE_TIMEOUTS_SQL)
+        rec = Recorder(lambda argv, kw: Result(0, '290000/285000\n', ''))
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
+            self.assertEqual(pib.effective_timeouts(BASE), ('290000', '285000'))
+        argv = rec.calls[0][0]
+        self.assertEqual(argv[-1], pib._EFFECTIVE_TIMEOUTS_SQL)
+        self.assertIn('DO $cap$', argv[argv.index('-c') + 1] if '-c' in argv else '')
+        import inspect
+        self.assertEqual(list(inspect.signature(pib.effective_timeouts).parameters), ['url'])
+
+    def test_unquoted_identifiers_fold_ascii_only_and_whitespace_is_the_scanner_set_7575(self):
+        self.assertEqual(pib._tokenise('SELECT K'), [(pib._IDENT, 'select k')])
+        self.assertEqual(pib._tokenise('A\f\vB'), [(pib._IDENT, 'a'), (pib._IDENT, 'b')])
+        self.assertEqual(pib._tokenise('a --x\rb'), [(pib._IDENT, 'a'), (pib._IDENT, 'b')])
+        self.assertEqual(pib._tokenise('a --x\nb'), [(pib._IDENT, 'a'), (pib._IDENT, 'b')])
+        self.assertEqual(pib._tokenise('K'), [(pib._IDENT, 'K')])
 
     def test_role_cell_skips_without_createrole_unless_the_live_flag_is_set_7552(self):
         cell = LiveEndToEnd('test_role_and_role_in_database_defaults_are_kept_7522')
@@ -860,6 +994,39 @@ class TemplateOwnership(unittest.TestCase):
                 self.assertNotIn('or set sslmode', text)
                 self.assertIn('sslmode=' + mode, text)
                 self.assertIn('hostaddr', text)
+
+    def test_connect_budget_hint_floors_only_below_two_seconds_and_stops_offering_a_useless_lower_7580(self):
+        def refusal(query):
+            addrs = [(0, 0, 0, '', ('192.0.2.%d' % n, 5432)) for n in range(1, 181)]
+            with unittest.mock.patch.object(pib.socket, 'getaddrinfo', return_value=addrs):
+                with self.assertRaises(pib.WrapperError) as ctx:
+                    pib.server_caps_sql(pib._pg_env('postgres://u' + '\x40' + 'db.example:5432/d?' + query))
+            return str(ctx.exception)
+        padded = refusal('connect_timeout=05')
+        self.assertIn('connect_timeout 5 s', padded)
+        self.assertNotIn('floored', padded)
+        self.assertNotIn('05', padded)
+        one = refusal('connect_timeout=1')
+        self.assertIn('connect_timeout 2 s, floored from 1 s', one)
+        self.assertNotIn('lower connect_timeout', one)
+        self.assertIn('hostaddr', one)
+        self.assertIn('sslmode=require', one)
+        zero_padded_one = refusal('connect_timeout=01')
+        self.assertIn('floored from 1 s', zero_padded_one)
+        self.assertNotIn('lower connect_timeout', zero_padded_one)
+        at_floor = refusal('connect_timeout=2')
+        self.assertNotIn('floored', at_floor)
+        self.assertNotIn('lower connect_timeout', at_floor)
+        self.assertIn('hostaddr', at_floor)
+        for mode, passes_two in (('allow', True), ('prefer', True), ('disable', False)):
+            above = refusal('connect_timeout=5&sslmode=' + mode)
+            floor = refusal('connect_timeout=1&sslmode=' + mode)
+            with self.subTest(sslmode=mode):
+                self.assertIn('lower connect_timeout', above)
+                self.assertNotIn('lower connect_timeout', floor)
+                self.assertIn('hostaddr', floor)
+                self.assertEqual('or set sslmode=require' in floor, passes_two)
+                self.assertEqual('or set sslmode=require' in above, passes_two)
 
     def test_connect_budget_refusal_names_budget_addresses_and_sslmode_7523(self):
         six = [(0, 0, 0, '', ('192.0.2.%d' % n, 5432)) for n in range(1, 7)]
@@ -1258,9 +1425,7 @@ class LiveEndToEnd(unittest.TestCase):
         target = pib.with_database(url, db) if db else url
         if options is not None:
             target += ('&' if '?' in target else '?') + 'options=' + urllib.parse.quote(options)
-        return pib.psql(target, "SELECT (SELECT setting FROM pg_catalog.pg_settings WHERE name = 'statement_timeout') "
-                        "|| '/' || (SELECT setting FROM pg_catalog.pg_settings WHERE name = 'lock_timeout')",
-                        tuples=True).strip().split('/')
+        return list(pib.effective_timeouts(target))
 
     @staticmethod
     def _admin(url, *statements):
@@ -1308,6 +1473,43 @@ class LiveEndToEnd(unittest.TestCase):
             self.assertLess(int(lock), 1000)
         finally:
             pib.psql(url, 'DROP DATABASE IF EXISTS %s' % db)
+
+    def _session_cap_after(self, url, sql):
+        """Run ``sql`` as the middle statement of a three-statement psql session (the wrapper's own cap first, the
+        statement, then a read of the cap), keeping going past a server error, and return the cap psql ended with.
+        Used only for statements the guard ALLOWS: this is the proof that none of them loosens the cap."""
+        argv = ['psql', '-X', '-q', '-At', '-v', 'ON_ERROR_STOP=0', '-c', pib.server_caps_sql(pib._pg_env(url)),
+                '-c', sql, '-c', "SELECT 'CAP=' || setting FROM pg_catalog.pg_settings WHERE name = 'statement_timeout'"]
+        done = subprocess.run(argv, capture_output=True, text=True, env=pib._pg_env(url), timeout=60)
+        return [ln for ln in done.stdout.splitlines() if ln.startswith('CAP=')][-1]
+
+    def test_guard_rows_live_allowed_rows_keep_the_cap_and_refused_rows_never_reach_the_server_7575_7579(self):
+        url = _live_url()
+        cap, _ = TemplateOwnership._caps(url)
+        for sql in TemplateOwnership.MENTION_ALLOWED:
+            with self.subTest(allowed=sql):
+                pib._refuse_uncapped_sql(sql)                       # the guard allows it
+                self.assertEqual(self._session_cap_after(url, sql), 'CAP=%d' % cap)
+        reached = []
+        real_run = subprocess.run
+
+        def watch(argv, *a, **k):
+            reached.append(argv)
+            return real_run(argv, *a, **k)
+        with unittest.mock.patch.object(pib.subprocess, 'run', watch):
+            for sql in TemplateOwnership.MENTION_REFUSED:
+                with self.subTest(refused=sql):
+                    with self.assertRaises(pib.WrapperError) as ctx:
+                        pib.psql(url, sql)
+                    self.assertIn('refus', str(ctx.exception))
+        self.assertEqual(reached, [], 'a refused statement reached the server')
+        # B'' and X'' end at the first quote: the doubled quote is not an escape, the server reads two tokens
+        with self.assertRaises(pib.WrapperError) as ctx:
+            pib.psql(url, "SELECT B'0''1'")
+        self.assertIn('syntax error', str(ctx.exception))
+        # and every real caller shape the guard allows is accepted by the server through psql() itself
+        self.assertEqual(pib.psql(url, 'SELECT current_database()', tuples=True).strip(),
+                         pib._pg_env(url)['PGDATABASE'])
 
     def test_small_statement_timeout_still_leaves_a_real_lock_wait_7519(self):
         url = _live_url()
