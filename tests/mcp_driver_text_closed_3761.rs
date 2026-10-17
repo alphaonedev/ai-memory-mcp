@@ -26,6 +26,15 @@ use serde_json::json;
 #[cfg(feature = "sal")]
 mod common;
 
+/// #7361: the tests below write the process environment (`open_mem` and
+/// `namespace_ownership_refusal_passes_through_3761`) and open SQLite, whose
+/// first open calls C `getenv`; the PG leg resolves a URL and connects. All of
+/// them run as threads of one test binary, so every test holds this lock for
+/// its whole body. The PG leg takes it before `common::postgres_url`, whose
+/// isolated-URL publish takes the `tests/common` `ENV_LOCK` inside it (lock
+/// order: this lock, then that one; nothing here takes them the other way).
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 fn open_mem() -> rusqlite::Connection {
     unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
     ai_memory::db::open(std::path::Path::new(":memory:")).expect("open in-memory db")
@@ -43,6 +52,7 @@ fn action_params(namespace: &str) -> serde_json::Value {
 
 #[test]
 fn action_create_driver_fault_renders_closed_3761() {
+    let _env = ENV_LOCK.blocking_lock();
     let conn = open_mem();
     conn.execute_batch("DROP TABLE actions")
         .expect("drop actions");
@@ -57,6 +67,7 @@ fn action_create_driver_fault_renders_closed_3761() {
 
 #[test]
 fn action_create_validation_refusal_passes_through_3761() {
+    let _env = ENV_LOCK.blocking_lock();
     let conn = open_mem();
     let err = ai_memory::mcp::handle_action_create(&conn, &action_params(""))
         .expect_err("an empty namespace must be refused");
@@ -87,6 +98,7 @@ fn seed_memory(conn: &rusqlite::Connection, title: &str) -> String {
 
 #[test]
 fn lineage_driver_fault_renders_closed_3761() {
+    let _env = ENV_LOCK.blocking_lock();
     let conn = open_mem();
     let a = seed_memory(&conn, "src 3761");
     let b = seed_memory(&conn, "dst 3761");
@@ -103,6 +115,7 @@ fn lineage_driver_fault_renders_closed_3761() {
 
 #[test]
 fn lineage_depth_refusal_passes_through_3761() {
+    let _env = ENV_LOCK.blocking_lock();
     let conn = open_mem();
     let a = seed_memory(&conn, "src 3761");
     let err = ai_memory::mcp::handle_lineage(&conn, &json!({"id": a, "max_depth": 0}), None)
@@ -119,6 +132,7 @@ fn lineage_depth_refusal_passes_through_3761() {
 
 #[test]
 fn namespace_bind_read_fault_refuses_closed_3761() {
+    let _env = ENV_LOCK.blocking_lock();
     let conn = open_mem();
     conn.execute_batch("DROP TABLE namespace_meta")
         .expect("drop");
@@ -139,6 +153,7 @@ fn namespace_bind_read_fault_refuses_closed_3761() {
 
 #[test]
 fn namespace_ownership_refusal_passes_through_3761() {
+    let _env = ENV_LOCK.blocking_lock();
     unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") };
     unsafe { std::env::remove_var("AI_MEMORY_AGENT_ID") };
     let dir = tempfile::NamedTempFile::new().expect("tempfile");
@@ -194,6 +209,7 @@ fn namespace_ownership_refusal_passes_through_3761() {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn pg_driver_faults_render_closed_per_funnel_3761() {
+    let _env = ENV_LOCK.lock().await;
     let Some(url) = common::postgres_url() else {
         return;
     };
