@@ -166,5 +166,88 @@ class Vendored5040(unittest.TestCase):
         self.assertIn("WATCHED_TOTAL files=0", r.stdout)
 
 
+RECAPTURE_PY = "scripts/recapture-cert-3607-posture.py"
+RECAPTURE_SH = "scripts/recapture-cert-3607-posture.sh"
+PY_BODY = (
+    "#!/usr/bin/env python3\n"
+    "import os\n"
+    "from pathlib import Path\n"
+    "ROOT = Path(os.path.abspath(__file__)).parent.parent  # logical path\n"
+    'OUT = ROOT / "docs" / "compliance" / "evidence" / "cert-3607"\n'
+    'FIX = ROOT / ".local-runs" / "cert-3607-fixtures"\n'
+    "print(OUT, FIX)\n"
+)
+SH_BODY = (
+    "#!/usr/bin/env bash\n"
+    'ROOT="$(cd "$(dirname "$0")/.." && pwd)"\n'
+    'OUT="$ROOT/docs/compliance/evidence/cert-3607"\n'
+    'FIX="$ROOT/.local-runs/cert-3607-fixtures"\n'
+    'echo "$OUT" "$FIX"\n'
+)
+
+
+class RecaptureResolution7399(ScratchCase):
+    """The recapture script is resolved .py first, .sh second; neither is an actionable refusal (#7399)."""
+
+    def make_repo(self, files):
+        wt = self.dir / "repo"
+        wt.mkdir()
+        git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"]
+        subprocess.run([*git, "init", "-q"], cwd=wt, check=True)
+        (wt / "README").write_text("x\n")
+        for rel, body in files.items():
+            (wt / rel).parent.mkdir(parents=True, exist_ok=True)
+            (wt / rel).write_text(body)
+        subprocess.run([*git, "add", "-A"], cwd=wt, check=True)
+        subprocess.run([*git, "commit", "-q", "-m", "fixture"], cwd=wt, check=True)
+        tip = subprocess.run(["git", "rev-parse", "HEAD"], cwd=wt, capture_output=True, text=True, check=True).stdout.strip()
+        return wt, tip
+
+    def test_py_only_is_retargeted_in_python_form_7399(self):
+        bb = load("build_bundle")
+        wt, tip = self.make_repo({RECAPTURE_PY: PY_BODY})
+        rel, src, body = bb.recapture_copy(wt, tip, "abcdef123")
+        self.assertEqual(rel, RECAPTURE_PY)
+        self.assertEqual(src, PY_BODY)
+        self.assertIn('OUT = ROOT / "docs" / "compliance" / "evidence" / "cert-abcdef123"', body)
+        self.assertIn('FIX = ROOT / ".local-runs" / "cert-abcdef123-fixtures"', body)
+        self.assertIn(".parent.parent.parent.parent.parent", body)
+
+    def test_sh_only_still_works_7399(self):
+        bb = load("build_bundle")
+        wt, tip = self.make_repo({RECAPTURE_SH: SH_BODY})
+        rel, _src, body = bb.recapture_copy(wt, tip, "abcdef123")
+        self.assertEqual(rel, RECAPTURE_SH)
+        self.assertIn('OUT="$ROOT/docs/compliance/evidence/cert-abcdef123"', body)
+
+    def test_py_wins_when_both_exist_7399(self):
+        bb = load("build_bundle")
+        wt, tip = self.make_repo({RECAPTURE_PY: PY_BODY, RECAPTURE_SH: SH_BODY})
+        self.assertEqual(bb.recapture_copy(wt, tip, "abcdef123")[0], RECAPTURE_PY)
+
+    def test_neither_is_an_actionable_refusal_7399(self):
+        bb = load("build_bundle")
+        wt, tip = self.make_repo({})
+        with self.assertRaises(bb.Fatal) as cm:
+            bb.recapture_copy(wt, tip, "abcdef123")
+        msg = str(cm.exception)
+        self.assertIn(RECAPTURE_PY, msg)
+        self.assertIn(RECAPTURE_SH, msg)
+        self.assertIn(tip, msg)
+
+    def test_run_cert_resolves_the_same_order_7399(self):
+        rc = load("run_cert")
+        wt = self.dir / "wt"
+        (wt / "scripts").mkdir(parents=True)
+        with self.assertRaises(FileNotFoundError) as cm:
+            rc.pick_recapture(wt)
+        self.assertIn(RECAPTURE_PY, str(cm.exception))
+        self.assertIn(RECAPTURE_SH, str(cm.exception))
+        (wt / RECAPTURE_SH).write_text(SH_BODY)
+        self.assertEqual(rc.pick_recapture(wt), wt / RECAPTURE_SH)
+        (wt / RECAPTURE_PY).write_text(PY_BODY)
+        self.assertEqual(rc.pick_recapture(wt), wt / RECAPTURE_PY)
+
+
 if __name__ == "__main__":
     unittest.main()
