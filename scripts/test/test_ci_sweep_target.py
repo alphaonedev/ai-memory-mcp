@@ -782,6 +782,71 @@ class LockHardeningTests(SweepTestCase):
         self.assertRegex(result.stderr, r"bad-\\(xff|udcff)-name")
 
 
+class LineBreakInjectionTests(SweepTestCase):
+    """#7297 round 7 (F4/S15): a CR or LF in a root or target name must not split
+    a printed line, so it can never start a second workflow command."""
+
+    NAME = "evil\n::error::injected"
+
+    def setUp(self):
+        super().setUp()
+        self.cache_root = self.root / "cache" / self.NAME
+        self.runner = self.cache_root / "runner"
+        self.deps = self.runner / "debug" / "deps"
+        for idx in range(4):
+            entry = self.deps / "lib{}.rlib".format(idx)
+            write_blob(entry)
+            set_age(entry, idx)
+
+    def sweep(self, *extra):
+        return self.run_sweep("--max-bytes", "1500", "--allow-root", "--within",
+                              str(self.cache_root), *extra, target=self.runner)
+
+    def command_lines(self, text):
+        return [ln for ln in text.splitlines() if ln.startswith("::")]
+
+    def test_swept_summary_is_one_line_7297_r7(self):
+        result = self.sweep()
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        self.assertIn("removed=3", result.stdout)
+        self.assertEqual(self.command_lines(result.stdout), [], result.stdout)
+        self.assertEqual(self.command_lines(result.stderr), [], result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 1, result.stdout)
+
+    def test_skip_lines_are_single_lines_7297_r7(self):
+        lock_path = self.cache_root / ".evict.lock"
+        lock_path.mkdir()
+        result = self.sweep("--lock", str(lock_path))
+        self.assertEqual(result.returncode, EXIT_OK, result.stderr)
+        commands = self.command_lines(result.stdout)
+        self.assertEqual(len(commands), 1, result.stdout)
+        self.assertTrue(commands[0].startswith("::warning::"), commands)
+        self.assertEqual(self.command_lines(result.stderr), [], result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 2, result.stdout)
+
+    def test_refusal_lines_are_single_lines_7297_r7(self):
+        outside = self.root / self.NAME / "target"
+        outside.mkdir(parents=True)
+        result = self.run_sweep("--max-bytes", "1500", target=outside)
+        self.assertEqual(result.returncode, EXIT_REFUSED, result.stderr)
+        self.assertEqual(self.command_lines(result.stderr), [], result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+
+    def test_escape_line_rule_7297_r7(self):
+        module = load_script_module()
+        self.assertEqual(module.escape_line("a%b\rc\nd"), "a%25b%0Dc%0Ad")
+        self.assertEqual(module.escape_line("plain/path"), "plain/path")
+
+    def test_helper_covers_a_monkeypatched_path_7297_r7(self):
+        module = load_script_module()
+        err = io.StringIO()
+        with mock.patch("os.path.realpath", return_value="/x\n::error::y"):
+            with contextlib.redirect_stderr(err):
+                code = module.main(["--target", "t", "--max-bytes", "5"])
+        self.assertEqual(code, EXIT_REFUSED)
+        self.assertEqual(self.command_lines(err.getvalue()), [])
+
+
 def raise_fd_limit(wanted):
     """Raise the soft descriptor limit to ``wanted``; return the old limits or None."""
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)

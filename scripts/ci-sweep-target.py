@@ -117,6 +117,9 @@ PARENT_OPEN_FLAGS = getattr(os, "O_PATH", 0) | os.O_NOFOLLOW | os.O_DIRECTORY
 
 
 LOCK_POLL_SECS = 0.05
+# One rule for every printed path or reason (#7297 R7-1): '%' first, then the
+# line breaks, so a name can never split a line or start a workflow command.
+LINE_ESCAPES = (("%", "%25"), ("\r", "%0D"), ("\n", "%0A"))
 LOCK_FILE_MODE = 0o600
 DEFAULT_LOCK_TIMEOUT_SECS = 20.0
 
@@ -185,10 +188,17 @@ def lock_timeout_arg(text):
     return value
 
 
+def escape_line(text):
+    """Escape ``%``, CR and LF (the Actions annotation rule) so ``text`` stays on one line."""
+    text = str(text)
+    for raw, escaped in LINE_ESCAPES:
+        text = text.replace(raw, escaped)
+    return text
+
+
 def annotate_warning(message):
     """Print a GitHub Actions ``::warning::`` annotation on stdout (one line)."""
-    escaped = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-    print("::warning::ci-sweep-target: {}".format(escaped))
+    print("::warning::ci-sweep-target: {}".format(escape_line(message)))
 
 
 def configure_output():
@@ -508,7 +518,7 @@ def sweep(real_target, args, warnings, handles):
     """Scan, then delete oldest first; return (exit_code_or_None, before, remaining, removed)."""
     entries = collect_entries(real_target, warnings, handles)
     for line in warnings:
-        print("warning: {}".format(line), file=sys.stderr)
+        print("warning: {}".format(escape_line(line)), file=sys.stderr)
     before = sum(item[4] for item in entries)
     remaining = before
     removed = 0
@@ -528,7 +538,7 @@ def sweep(real_target, args, warnings, handles):
             except (OSError, RecursionError) as exc:
                 remaining -= freed[0]
                 print("warning: cannot remove {}: {} ({} bytes of it were deleted)".format(
-                    path, exc, freed[0]), file=sys.stderr)
+                    escape_line(path), escape_line(exc), freed[0]), file=sys.stderr)
                 continue
         remaining -= size
         removed += 1
@@ -576,14 +586,15 @@ def main(argv=None):
         real_ws = os.path.realpath(workspace) if workspace else None
         if real_ws is None or not is_under(real_target, real_ws):
             print("refused: {} is not under {} (use --allow-root)".format(
-                real_target, WORKSPACE_ENV), file=sys.stderr)
+                escape_line(real_target), WORKSPACE_ENV), file=sys.stderr)
             return EXIT_REFUSED
     else:
         real_root = os.path.realpath(args.within)
         if (real_root == os.sep or real_target == real_root
                 or not is_under(real_target, real_root)):
             print("refused: resolved target {} is not strictly inside resolved --within "
-                  "root {}".format(real_target, real_root), file=sys.stderr)
+                  "root {}".format(escape_line(real_target), escape_line(real_root)),
+                  file=sys.stderr)
             return EXIT_REFUSED
 
     lock_fd = None
@@ -595,7 +606,8 @@ def main(argv=None):
         if (not lock_name or lock_name in (".", "..")
                 or os.path.realpath(lock_dir) != real_root):
             print("refused: --lock {} is not a file directly inside the resolved --within "
-                  "root {}".format(args.lock, real_root), file=sys.stderr)
+                  "root {}".format(escape_line(args.lock), escape_line(real_root)),
+                  file=sys.stderr)
             return EXIT_REFUSED
         wait_started = time.monotonic()
         lock_fd, skip_reason = take_lock(os.path.join(real_root, lock_name),
@@ -605,7 +617,8 @@ def main(argv=None):
         if lock_fd is None:
             annotate_warning("{}; sweep skipped, target uncapped this run".format(skip_reason))
             print("ci-sweep-target: sweep skipped ({}) target={} lock_wait={:.2f} "
-                  "lock_held=0.00".format(skip_reason, real_target, lock_wait))
+                  "lock_held=0.00".format(escape_line(skip_reason), escape_line(real_target),
+                                     lock_wait))
             return EXIT_OK
 
     warnings = []
@@ -613,7 +626,7 @@ def main(argv=None):
     try:
         code, before, remaining, removed = sweep(real_target, args, warnings, handles)
     except Refused as exc:
-        print("refused: {}".format(exc), file=sys.stderr)
+        print("refused: {}".format(escape_line(exc)), file=sys.stderr)
         return EXIT_REFUSED
     finally:
         for fd in handles:
@@ -626,7 +639,7 @@ def main(argv=None):
             lock_held = time.monotonic() - lock_taken_at
     print("ci-sweep-target: target={} cap={} before={} after={} removed={} freed={} "
           "lock_wait={:.2f} lock_held={:.2f}{}".format(
-              real_target, args.max_bytes, before, remaining, removed, before - remaining,
+              escape_line(real_target), args.max_bytes, before, remaining, removed, before - remaining,
               lock_wait, lock_held, " (dry-run)" if args.dry_run else ""))
     return code
 
