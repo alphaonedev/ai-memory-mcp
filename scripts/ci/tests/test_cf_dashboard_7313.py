@@ -825,6 +825,8 @@ class HtmlAndHeaders7313(unittest.TestCase):
         raw = ("${fam.family}", "${t.cls}", "${t.name.replace", "${it.title}", "${a.node}", "${l.name}", "${x.d||")
         for page in sorted(PUBLIC.glob("*.html")):
             text = page.read_text()
+            if "<script>" not in text:
+                continue  # the sub-pages run the external vv.js (DOM nodes and textContent only)
             m = re.search(r"(?:function esc\(s\)\{return |const esc=s=>)([^\n]*)", text)
             self.assertIsNotNone(m, "%s defines no esc()" % page.name)
             for ent in ("&amp;", "&lt;", "&gt;", "&quot;", "&#39;"):
