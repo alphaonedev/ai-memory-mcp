@@ -28,7 +28,7 @@
 
 use std::time::Duration;
 
-use super::{DlqEntry, RETRY_BACKOFFS, record_dlq};
+use super::{DlqEntry, RETRY_BACKOFFS};
 
 /// Prefix of the reserved `subscription_dlq.subscription_id` under which a
 /// failed subscriber lookup is recorded. Not a real subscription id: the
@@ -38,6 +38,14 @@ use super::{DlqEntry, RETRY_BACKOFFS, record_dlq};
 /// per-id depth cap bounds each namespace on its own and a flood from one
 /// cannot starve another's records.
 pub const DISPATCH_SCAN_FAILED_SUB_ID: &str = "_dispatch_scan_failed";
+
+/// Most failed-lookup rows one namespace may retain (#7409).
+pub const SCAN_FAILURE_MAX_PER_NAMESPACE: i64 = 1_000;
+
+/// Most failed-lookup rows retained across ALL namespaces (#7430): the
+/// namespace is writer-chosen, so the per-namespace cap alone does not bound
+/// the total.
+pub const SCAN_FAILURE_MAX_TOTAL: i64 = super::MAX_SUBSCRIPTION_DLQ_ROWS;
 
 /// Most detached sqlite lookup-retry workers alive at once (#7410). Past it a
 /// failure is recorded at once, without the ladder, instead of spawning.
@@ -191,18 +199,17 @@ pub fn record_dispatch_scan_failure(
         "error_class": error_class,
     })
     .to_string();
-    if let Err(e) = record_dlq(
+    let last_error = format!(
+        "subscriber lookup failed after {attempts} attempts ({error_class}); \
+         event deferred for re-dispatch (#7366)"
+    );
+    if let Err(e) = insert_capped(
         db_path,
         &scan_failure_sub_id(failure.namespace),
         &correlation_id,
         failure.event,
         &payload,
-        i64::try_from(attempts).unwrap_or(i64::MAX),
-        &format!(
-            "subscriber lookup failed after {attempts} attempts ({error_class}); \
-             event deferred for re-dispatch (#7366)"
-        ),
-        &now,
+        &last_error,
         &now,
     ) {
         tracing::error!(
@@ -326,6 +333,51 @@ pub(super) fn retry_off_lock(db_path: &std::path::Path, failure: &ScanFailure<'_
         tracing::warn!(error = %e, "could not spawn the lookup-retry worker; recording at once (#7410)");
         record_dispatch_scan_failure(db_path, failure, class);
     }
+}
+
+/// Insert one failed-lookup row, refusing it past the per-namespace cap or the
+/// total cap. Both compares live INSIDE the single `INSERT ... SELECT ...
+/// WHERE`, so a concurrent writer cannot race past either (#7430).
+fn insert_capped(
+    db_path: &std::path::Path,
+    sub_id: &str,
+    correlation_id: &str,
+    event: &str,
+    payload: &str,
+    last_error: &str,
+    now: &str,
+) -> anyhow::Result<()> {
+    let conn = rusqlite::Connection::open(db_path)?;
+    let prefix_len = i64::try_from(DISPATCH_SCAN_FAILED_SUB_ID.len()).unwrap_or(i64::MAX);
+    let inserted = conn.execute(
+        "INSERT INTO subscription_dlq \
+         (subscription_id, correlation_id, event_type, payload, retry_count, last_error, \
+          first_failed_at, last_failed_at) \
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7 \
+         WHERE (SELECT COUNT(*) FROM subscription_dlq WHERE subscription_id = ?1) < ?8 \
+           AND (SELECT COUNT(*) FROM subscription_dlq \
+                WHERE substr(subscription_id, 1, ?9) = ?10) < ?11",
+        rusqlite::params![
+            sub_id,
+            correlation_id,
+            event,
+            payload,
+            i64::try_from(lookup_attempts()).unwrap_or(i64::MAX),
+            last_error,
+            now,
+            SCAN_FAILURE_MAX_PER_NAMESPACE,
+            prefix_len,
+            DISPATCH_SCAN_FAILED_SUB_ID,
+            SCAN_FAILURE_MAX_TOTAL,
+        ],
+    )?;
+    if inserted == 0 {
+        crate::metrics::record_subscription_dlq_overflow();
+        anyhow::bail!(
+            "failed-lookup DLQ at cap (per-namespace {SCAN_FAILURE_MAX_PER_NAMESPACE}, total {SCAN_FAILURE_MAX_TOTAL})"
+        );
+    }
+    Ok(())
 }
 
 /// Whether `row` may be shown to `caller` by the DLQ inspector.

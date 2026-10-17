@@ -33,13 +33,9 @@ use crate::models::field_names;
 
 // #3659 — delivery-audit bookkeeping evidence (counters, /metrics, /health).
 pub mod audit_status;
-mod scan_failure; // #7366 failed-lookup retry + DLQ record
+pub mod scan_failure; // #7366 failed-lookup retry + DLQ record
 // #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
 mod unstarted;
-pub use scan_failure::{
-    DISPATCH_SCAN_FAILED_SUB_ID, ScanFailure, classify_sqlstate, is_scan_failure_sub_id,
-    record_dispatch_scan_failure, retry_lookup_async, scan_failure_sub_id, scan_failure_visible_to,
-};
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -999,7 +995,7 @@ fn dispatch_inner(
         Ok(s) => s,
         Err(e) => {
             // #7366/#7410: never drop the event; retries run off-lock.
-            let failure = ScanFailure {
+            let failure = scan_failure::ScanFailure {
                 event,
                 memory_id,
                 namespace,

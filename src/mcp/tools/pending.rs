@@ -189,13 +189,14 @@ pub fn handle_subscription_dlq_list(
 
     let rows_all = crate::subscriptions::list_dlq(conn, subscription_id)
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resolve_agent_id", e))?;
-    let rows: Vec<_> = if subscription_id.is_some_and(crate::subscriptions::is_scan_failure_sub_id)
+    let rows: Vec<_> = if subscription_id
+        .is_some_and(crate::subscriptions::scan_failure::is_scan_failure_sub_id)
     {
         // v1.0.0 #7366: failed-lookup records belong to no subscription, so
         // the owner gate cannot apply; they are attributed to the writer.
         rows_all
             .into_iter()
-            .filter(|r| crate::subscriptions::scan_failure_visible_to(r, &caller))
+            .filter(|r| crate::subscriptions::scan_failure::scan_failure_visible_to(r, &caller))
             .collect()
     } else if let Some(sid) = subscription_id {
         let owner = crate::subscriptions::get_owner(conn, sid)
@@ -222,7 +223,7 @@ pub fn handle_subscription_dlq_list(
             std::collections::HashMap::new();
         let mut out = Vec::with_capacity(rows_all.len());
         for row in rows_all {
-            if crate::subscriptions::scan_failure_visible_to(&row, &caller) {
+            if crate::subscriptions::scan_failure::scan_failure_visible_to(&row, &caller) {
                 // v1.0.0 #7366: a failed-lookup record, shown to its writer.
                 out.push(row);
                 continue;

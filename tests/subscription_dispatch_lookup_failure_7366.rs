@@ -24,7 +24,8 @@
 use std::time::{Duration, Instant};
 
 use ai_memory::subscriptions::{
-    DISPATCH_SCAN_FAILED_SUB_ID, RETRY_BACKOFFS, dispatch_event_with_details, list_dlq,
+    RETRY_BACKOFFS, dispatch_event_with_details, list_dlq,
+    scan_failure::DISPATCH_SCAN_FAILED_SUB_ID,
 };
 
 const EVENT: &str = "memory_store";
@@ -130,11 +131,9 @@ fn a_sqlite_lookup_failure_leaves_a_durable_dlq_record_7366() {
     );
     let other = ai_memory::identity::resolve_agent_id(None, Some("someone-else-7366"))
         .expect("resolve another caller");
-    assert!(ai_memory::subscriptions::scan_failure_visible_to(
-        row, &writer
-    ));
+    assert!(ai_memory::subscriptions::scan_failure::scan_failure_visible_to(row, &writer));
     assert!(
-        !ai_memory::subscriptions::scan_failure_visible_to(row, &other),
+        !ai_memory::subscriptions::scan_failure::scan_failure_visible_to(row, &other),
         "another caller must not see the writer's record"
     );
 }
@@ -147,22 +146,19 @@ fn a_sqlite_lookup_failure_leaves_a_durable_dlq_record_7366() {
 fn c_a_flooded_namespace_does_not_starve_another_namespace_7409() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (path, conn) = faulted_db(&dir);
-    // Fill to the per-id cap every bucket a failure for team/flooded could use
-    // (the legacy global sentinel and the per-namespace one).
-    for sub in [
-        DISPATCH_SCAN_FAILED_SUB_ID.to_string(),
-        format!("{DISPATCH_SCAN_FAILED_SUB_ID}:team/flooded"),
-    ] {
-        conn.execute(
-            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2) \
-             INSERT INTO subscription_dlq \
-             (subscription_id, correlation_id, event_type, payload, retry_count, last_error, \
-              first_failed_at, last_failed_at) \
-             SELECT ?1, 'flood-' || i, 'memory_store', '{}', 0, 'flood', 'now', 'now' FROM n",
-            rusqlite::params![sub, ai_memory::subscriptions::MAX_SUBSCRIPTION_DLQ_ROWS],
-        )
-        .expect("fill the bucket to its cap");
-    }
+    // Fill team/flooded's own bucket to its per-namespace cap.
+    conn.execute(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2) \
+         INSERT INTO subscription_dlq \
+         (subscription_id, correlation_id, event_type, payload, retry_count, last_error, \
+          first_failed_at, last_failed_at) \
+         SELECT ?1, 'flood-' || i, 'memory_store', '{}', 0, 'flood', 'now', 'now' FROM n",
+        rusqlite::params![
+            format!("{DISPATCH_SCAN_FAILED_SUB_ID}:team/flooded"),
+            ai_memory::subscriptions::scan_failure::SCAN_FAILURE_MAX_PER_NAMESPACE
+        ],
+    )
+    .expect("fill the bucket to its cap");
     let before = list_dlq(&conn, None).expect("list").len();
 
     dispatch_event_with_details(&conn, EVENT, MEMORY_ID, "team/other", None, &path, None);
@@ -214,9 +210,9 @@ fn d_inventing_namespaces_cannot_exceed_the_total_cap_7430() {
     fill_distinct_namespaces(&conn, cap);
     assert_eq!(failed_lookup_rows(&conn), cap);
 
-    ai_memory::subscriptions::record_dispatch_scan_failure(
+    ai_memory::subscriptions::scan_failure::record_dispatch_scan_failure(
         &path,
-        &ai_memory::subscriptions::ScanFailure {
+        &ai_memory::subscriptions::scan_failure::ScanFailure {
             event: EVENT,
             memory_id: MEMORY_ID,
             namespace: "team/one-more",

@@ -1140,12 +1140,14 @@ pub async fn dispatch_event_postgres(
     let fetch_limit = SUBSCRIPTION_DISPATCH_LIMIT.saturating_add(1);
     // v1.0.0 #7366: retry the prefix scan on the RETRY_BACKOFFS ladder; a
     // final failure is recorded durably instead of dropping the event.
-    let scan =
-        crate::subscriptions::retry_lookup_async(crate::subscriptions::RETRY_BACKOFFS, || {
+    let scan = crate::subscriptions::scan_failure::retry_lookup_async(
+        crate::subscriptions::RETRY_BACKOFFS,
+        || {
             app.store
                 .list_by_namespace_prefix(&ctx, SUBSCRIPTION_NS_PREFIX, fetch_limit)
-        })
-        .await;
+        },
+    )
+    .await;
     let memories = match scan {
         Ok(rows) => rows,
         Err(e) => {
@@ -1153,7 +1155,7 @@ pub async fn dispatch_event_postgres(
                 crate::store::StoreError::BackendUnavailable { sqlstate, .. } => sqlstate.clone(),
                 _ => None,
             };
-            let class = crate::subscriptions::classify_sqlstate(sqlstate.as_deref());
+            let class = crate::subscriptions::scan_failure::classify_sqlstate(sqlstate.as_deref());
             tracing::warn!(
                 error_class = %class,
                 "dispatch_event_postgres: SAL prefix-list failed: {e}; \
@@ -1171,9 +1173,9 @@ pub async fn dispatch_event_postgres(
             let agent_id = agent_id.map(str::to_string);
             let details = details.clone();
             if let Err(join) = tokio::task::spawn_blocking(move || {
-                crate::subscriptions::record_dispatch_scan_failure(
+                crate::subscriptions::scan_failure::record_dispatch_scan_failure(
                     &db_path,
-                    &crate::subscriptions::ScanFailure {
+                    &crate::subscriptions::scan_failure::ScanFailure {
                         event: &event,
                         memory_id: &memory_id,
                         namespace: &namespace,
