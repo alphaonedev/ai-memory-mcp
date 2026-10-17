@@ -15,6 +15,7 @@ import datetime
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -29,7 +30,15 @@ def main():
     ap.add_argument("src", nargs="?", default="-", help="state JSON file, or - for stdin (default)")
     args = ap.parse_args()
 
-    raw = sys.stdin.read() if args.src == "-" else Path(args.src).read_text()
+    try:
+        data = sys.stdin.buffer.read() if args.src == "-" else Path(args.src).read_bytes()
+        raw = data.decode("utf-8")
+    except UnicodeError:
+        print("push-state: the state is not valid UTF-8 text", file=sys.stderr)
+        return 2
+    except OSError:
+        print("push-state: the state file cannot be read", file=sys.stderr)
+        return 2
     try:
         body = json.loads(raw)
     except ValueError as e:
@@ -45,13 +54,21 @@ def main():
     except hostscrub.LeakError as e:
         print(f"push-state: {e}", file=sys.stderr)
         return 2
-    (HERE / "public").mkdir(exist_ok=True)
-    (HERE / "public" / "state.json").write_text(text + "\n")
-
-    try:
+    try:  # credentials first: a run that cannot deploy must not touch public/state.json (#7643)
         token, acct = cfcommon.load_credentials(require_account=False)
     except cfcommon.CredentialError as e:
         print("push-state: " + str(e), file=sys.stderr)
+        return 1
+    public = HERE / "public"
+    public.mkdir(exist_ok=True)
+    try:  # atomic: a reader or an interrupted run never sees a half-written state.json
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(public), prefix=".state-",
+                                         suffix=".tmp", delete=False) as fh:
+            tmp_name = fh.name
+            fh.write(text + "\n")
+        os.replace(tmp_name, public / "state.json")
+    except OSError:
+        print("push-state: public/state.json cannot be written", file=sys.stderr)
         return 1
     env = dict(os.environ, CLOUDFLARE_API_TOKEN=token)
     if acct:

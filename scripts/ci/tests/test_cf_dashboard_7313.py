@@ -867,8 +867,15 @@ class PublicSnapshotHygiene7518(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=str(SCRATCH)) as tmp:
             src = Path(tmp) / "in.json"
             src.write_bytes(json.dumps({"n": "caf\u00e9 \u2713"}, ensure_ascii=False).encode("utf-8"))
+            real_read_text = Path.read_text
+
+            def guarded(self, *a, **k):
+                if self.name == "in.json":
+                    raise AssertionError("locale read_text used for the state file")
+                return real_read_text(self, *a, **k)
+
             with mock.patch("locale.getpreferredencoding", return_value="ANSI_X3.4-1968"), \
-                    mock.patch.object(mod.Path, "read_text", side_effect=AssertionError("locale read_text used")):
+                    mock.patch.object(Path, "read_text", guarded):
                 rc, err = self._push(mod, tmp, str(src))
             self.assertEqual((rc, err), (0, ""))
             self.assertIn("caf", (Path(tmp) / "public" / "state.json").read_text(encoding="utf-8"))

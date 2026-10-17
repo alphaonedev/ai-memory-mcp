@@ -10,8 +10,11 @@ No internal hostname is committed here. Hosts are recognised by SHAPE (a positiv
 suffix. On top of that the names in an UNTRACKED local file (one name per line, `#` comments; default
 `hostnames.local` next to this module, or the path in CF_DASHBOARD_HOSTNAMES_FILE) are scrubbed. Nothing
 depends on the hostname of the machine running the producer (#7592): the verdict and the output are the same
-on every machine. A listed name matches only as a whole host token (bounded by characters that cannot be part
-of a host id), so `ai-memory` is never rewritten by a listed name `ai`. A configured names file that cannot be
+on every machine. A listed name matches as a whole host token (bounded by characters that cannot be part
+of a host id), and so does a listed name followed by host-id suffix characters (`box-07`, `box_2`, `ai2`, #7641):
+those derivatives are reported by find_leaks and scrubbed. Tokens that merely CONTAIN a listed name (`mailbox`,
+`x-box`) are untouched, and the explicit exception list NAME_EXCEPTIONS (the product name `ai-memory`) is never
+treated as a derivative. A configured names file that cannot be
 read fails closed (LeakError); an unconfigured, absent default file is simply empty.
 """
 import json
@@ -23,6 +26,9 @@ REDACTED = "node"
 REDACTED_PATH = "<redacted-path>"
 NAMES_ENV = "CF_DASHBOARD_HOSTNAMES_FILE"
 DEFAULT_NAMES_FILE = Path(__file__).resolve().parent / "hostnames.local"
+
+# a derivative of a listed name that is NOT a host (#7641): tokens that start with one of these are left alone
+NAME_EXCEPTIONS = ("ai-memory",)
 
 _PATH_TAIL = r"""[^\s"'\\,;)\]}]*"""
 _PATH_PATTERNS = (
@@ -82,9 +88,19 @@ def _name_re():
     names = configured_hostnames()
     if not names:
         return None
-    # whole host tokens only: a name inside a longer host id ("ai-memory", "mailbox") is not that host
-    return re.compile(r"(?<![A-Za-z0-9_-])(?:%s)(?![A-Za-z0-9_-])" % "|".join(re.escape(n) for n in names),
-                      re.IGNORECASE)
+    # a whole host token: a listed name, optionally followed by [-_0-9] host characters (#7641). A name inside a
+    # longer host id ("mailbox", "x-box") does not match: the lookbehind demands a token start.
+    return re.compile(r"(?<![A-Za-z0-9_-])(?:%s)(?:[-_0-9][A-Za-z0-9_-]*)?(?![A-Za-z0-9_-])"
+                      % "|".join(re.escape(n) for n in names), re.IGNORECASE)
+
+
+def _name_hits(text):
+    """Matches of the listed names (and their suffix derivatives), minus the NAME_EXCEPTIONS tokens."""
+    name_re = _name_re()
+    if name_re is None:
+        return []
+    return [m for m in name_re.finditer(text)
+            if not m.group(0).lower().startswith(NAME_EXCEPTIONS)]
 
 
 def find_leaks(text):
@@ -92,9 +108,7 @@ def find_leaks(text):
     found = [m.group(0) for m in _HOST_SHAPE_RE.finditer(text)]
     found += [m.group(0) for m in _AGENT_SHAPE_RE.finditer(text)]
     found += [m.group(0) for m in _DNS_RE.finditer(text)]
-    name_re = _name_re()
-    if name_re is not None:
-        found += [m.group(0) for m in name_re.finditer(text)]
+    found += [m.group(0) for m in _name_hits(text)]
     return found + [m.group(0) for m in _PATH_RE.finditer(text)]
 
 
@@ -103,8 +117,9 @@ def scrub_text(text):
     text = _HOST_SHAPE_RE.sub(lambda m: m.group(1) + REDACTED, text)
     text = _AGENT_SHAPE_RE.sub(lambda m: m.group(1) + REDACTED, text)
     text = _DNS_RE.sub(REDACTED, text)
-    name_re = _name_re()
-    return name_re.sub(REDACTED, text) if name_re is not None else text
+    for m in reversed(_name_hits(text)):
+        text = text[:m.start()] + REDACTED + text[m.end():]
+    return text
 
 
 def scrub(obj):
@@ -114,7 +129,13 @@ def scrub(obj):
     if isinstance(obj, list):
         return [scrub(v) for v in obj]
     if isinstance(obj, dict):
-        return {scrub_text(k) if isinstance(k, str) else k: scrub(v) for k, v in obj.items()}
+        out = {}
+        for k, v in obj.items():
+            key = scrub_text(k) if isinstance(k, str) else k
+            if key in out:  # two keys scrubbed to one: the dict would silently drop a value (#7642)
+                raise LeakError("refusing to write: two keys collapse to the same scrubbed key")
+            out[key] = scrub(v)
+        return out
     return obj
 
 
