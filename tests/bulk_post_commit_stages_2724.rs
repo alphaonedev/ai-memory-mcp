@@ -292,25 +292,16 @@ async fn bulk_dispatches_memory_store_event_per_persisted_row_2724() {
     assert_eq!(status, StatusCode::MULTI_STATUS, "{v}");
     assert_eq!(db_row_count(&db_path, ns), 3, "3 committed rows: {v}");
 
-    // Poll until the fire-and-forget deliveries land. Exactly 3 — one per
-    // committed row, zero for the rejected row.
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let mut delivered = 0usize;
-    while std::time::Instant::now() < deadline {
-        delivered = server.received_requests().await.map_or(0, |r| r.len());
-        if delivered >= 3 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    // Small settle so a spurious 4th (e.g. from the rejected row) would surface.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    let final_count = server.received_requests().await.map_or(0, |r| r.len());
+    // #7320 - bounded wait on the DISTINCT dispatched-row count (never a
+    // single sample): exactly 3, one per committed row, zero for the rejected
+    // row (the settle inside the helper surfaces a spurious extra).
+    let final_count = wait_for_dispatches(&server, 3).await;
+    let total_requests = server.received_count().await;
     assert_eq!(
         final_count, 3,
         "#2724 F2: the subscriber must receive exactly one memory_store \
          dispatch per committed row (3), never for the rejected row \
-         (observed {delivered} during poll, {final_count} final): {v}"
+         ({final_count} distinct rows, {total_requests} requests): {v}"
     );
 }
 
@@ -320,8 +311,17 @@ async fn bulk_dispatches_memory_store_event_per_persisted_row_2724() {
 
 /// #7320 - webhook delivery is asynchronous relative to the committed rows
 /// (`dispatch_event_to_subs` spawns one bounded worker per subscriber). The
-/// wait on the receiver therefore cannot be a short fixed window.
-const DISPATCH_WAIT_WINDOW: Duration = Duration::from_secs(10);
+/// wait on the receiver therefore cannot be a short fixed window: it is the
+/// product's worst-case budget for one delivery (every attempt timing out plus
+/// the retry backoffs) plus a margin for queueing behind other deliveries.
+const DISPATCH_WAIT_MARGIN: Duration = Duration::from_secs(10);
+
+/// Upper bound the wait loop honours (it returns as soon as the count is met).
+fn dispatch_wait_window() -> Duration {
+    use ai_memory::subscriptions::{ACK_TIMEOUT, RETRY_BACKOFFS};
+    let attempts = u32::try_from(RETRY_BACKOFFS.len() + 1).expect("small attempt count");
+    ACK_TIMEOUT * attempts + RETRY_BACKOFFS.iter().sum::<Duration>() + DISPATCH_WAIT_MARGIN
+}
 
 /// Poll interval while waiting for deliveries to land.
 const DISPATCH_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -372,7 +372,7 @@ async fn distinct_dispatched_ids(server: &common::tls_receiver::TlsReceiver) -> 
 /// Wait (bounded) until `expected` distinct rows were dispatched, then settle
 /// and return the final distinct count.
 async fn wait_for_dispatches(server: &common::tls_receiver::TlsReceiver, expected: usize) -> usize {
-    let deadline = std::time::Instant::now() + DISPATCH_WAIT_WINDOW;
+    let deadline = std::time::Instant::now() + dispatch_wait_window();
     while std::time::Instant::now() < deadline {
         if distinct_dispatched_ids(server).await >= expected {
             break;
