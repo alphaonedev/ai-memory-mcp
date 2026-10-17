@@ -28377,6 +28377,14 @@ impl MemoryStore for PostgresStore {
                         THEN EXCLUDED.tier
                     ELSE memories.tier
                 END,
+                -- #7557 — a long-tier result never expires (GC deletes on
+                -- `expires_at < now`); otherwise the later expiry wins. Mirrors
+                -- the sqlite arm in `storage::consolidate_dest`.
+                expires_at = CASE
+                    WHEN EXCLUDED.tier = 'long' OR memories.tier = 'long' THEN NULL
+                    ELSE GREATEST(EXCLUDED.expires_at, memories.expires_at)
+                END,
+                version = memories.version + 1,
                 content = EXCLUDED.content,
                 -- #2292 — content + envelope move together (store() parity).
                 encrypted_envelope = EXCLUDED.encrypted_envelope,

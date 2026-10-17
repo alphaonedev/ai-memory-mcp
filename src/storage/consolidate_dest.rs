@@ -15,13 +15,16 @@ use super::{ConflictError, InsertConflictArm, title_slot_holder};
 /// #7111 — the consolidation summary's upsert statement: the raw `INSERT`
 /// `consolidate_with_expected_versions` always ran, plus the postgres-parity
 /// `ON CONFLICT` arm so an occupied destination `(title, namespace)` merges in
-/// place instead of failing with a UNIQUE violation. The arm mirrors the
-/// postgres consolidate upsert (content, envelope, tags, priority, confidence,
-/// kind, source, access count and `updated_at` move to the summary; the
-/// genesis `cid` pair, the lifecycle state and the existing row's provenance
-/// metadata keys survive) and shares the conflict target and the in-statement
-/// merge backstop with every other create funnel, so a hidden holder is never
-/// updated.
+/// place instead of failing with a UNIQUE violation. Both backends now do the
+/// same on the surviving row: content, envelope, tags, priority, confidence,
+/// kind, source, access count and `updated_at` move to the summary; `version`
+/// is bumped by one; the tier only moves up the ladder and a long-tier result
+/// clears `expires_at` (otherwise the later expiry wins); the genesis `cid`
+/// pair, the lifecycle state and the existing row's provenance metadata keys
+/// survive. The postgres upsert gained the version bump and the expiry clear in
+/// #7557 (it carried neither, so a promoted row still expired). The arm shares
+/// the conflict target and the in-statement merge backstop with every other
+/// create funnel, so a hidden holder is never updated.
 pub(super) static CONSOLIDATE_UPSERT_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(
     || {
         // APPEND-ONLY-SANCTIONED (#1823 G6 / #2948 / #7111) — the destination
