@@ -41,6 +41,15 @@ use common::tls::{
     TestTls, local_ca_client,
 };
 
+/// #7469: `doctor_reports_transit_encryption_section_3705` writes the process
+/// environment (the `common::permissive_attestation_for_tests` `Once`) and then
+/// opens SQLite, whose first open calls C `getenv`; the tests that build a
+/// reqwest client or spawn the daemon read the environment too. All of them
+/// run as threads of one test binary, so each of them holds this lock for its
+/// whole body (the same file-lock shape as `mcp_driver_text_closed_3761`;
+/// nothing here takes the `tests/common` `ENV_LOCK`, so there is one lock order).
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The doctor section the #3705 fix adds to the DEFAULT report.
 const SECTION_TRANSIT: &str = "Transit encryption (#3705)";
 
@@ -413,6 +422,7 @@ fn fresh_install_serves_tls_with_zero_config_3709() {
 /// (`boot_until_exit` times out).
 #[test]
 fn fleet_shape_without_certs_refuses_never_mints_3709() {
+    let _env = ENV_LOCK.blocking_lock();
     let root = tempfile::tempdir().unwrap();
     let port = free_port();
     let mut cmd = command_with_config(root.path(), Some("[deployment]\nshape = \"team\"\n"));
@@ -513,6 +523,7 @@ fn provision_daemon_signing_key(root: &Path) {
 #[cfg(unix)]
 #[test]
 fn unwritable_key_dir_refuses_never_plaintext_3709() {
+    let _env = ENV_LOCK.blocking_lock();
     use std::os::unix::fs::PermissionsExt as _;
     let root = tempfile::tempdir().unwrap();
     let port = free_port();
@@ -564,6 +575,7 @@ fn unwritable_key_dir_refuses_never_plaintext_3709() {
 /// kept as the explicit-pair twin of the zero-config test.
 #[test]
 fn explicit_pair_serves_health_over_https_3705() {
+    let _env = ENV_LOCK.blocking_lock();
     let root = tempfile::tempdir().unwrap();
     let tls = TestTls::generate(&root.path().join("tls-3705"));
     let port = free_port();
@@ -777,6 +789,7 @@ fn plaintext_mcp_forward_url_refused_3705() {
 /// FAILS ON THE PARENT: the section is absent.
 #[test]
 fn doctor_reports_transit_encryption_section_3705() {
+    let _env = ENV_LOCK.blocking_lock();
     let root = tempfile::tempdir().unwrap();
     common::permissive_attestation_for_tests();
     let _ = ai_memory::db::open(&root.path().join("store.db")).expect("open store");
@@ -836,6 +849,7 @@ fn boot_budget_scales_with_the_timing_multiplier_7341() {
 /// (status and stderr), not after the boot budget.
 #[test]
 fn ca_wait_reports_a_dead_child_immediately_7341() {
+    let _env = ENV_LOCK.blocking_lock();
     let root = tempfile::tempdir().unwrap();
     let mut cmd = command(root.path());
     cmd.arg("--definitely-not-a-flag-7341");
