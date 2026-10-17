@@ -281,6 +281,94 @@ fn d_inventing_namespaces_cannot_exceed_the_total_cap_7430() {
 }
 
 // ---------------------------------------------------------------------------
+// CELL H2 — #7503: one writer cannot fill the total cap and starve a victim.
+// ---------------------------------------------------------------------------
+
+fn fill_writer_rows(conn: &rusqlite::Connection, n: i64, namespaces: i64, writer: &str) {
+    conn.execute(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2) \
+         INSERT INTO subscription_dlq \
+         (subscription_id, correlation_id, event_type, payload, retry_count, last_error, \
+          first_failed_at, last_failed_at) \
+         SELECT ?1 || ':flood-' || (i % ?3), 'fw-' || i, 'memory_store', \
+                json_object('agent_id', ?4), 0, 'x', 'now', 'now' \
+         FROM n",
+        rusqlite::params![DISPATCH_SCAN_FAILED_SUB_ID, n, namespaces, writer],
+    )
+    .expect("fill one writer");
+}
+
+fn writer_rows(conn: &rusqlite::Connection, writer: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM subscription_dlq \
+         WHERE substr(subscription_id, 1, ?1) = ?2 AND json_extract(payload, '$.agent_id') = ?3",
+        rusqlite::params![
+            i64::try_from(DISPATCH_SCAN_FAILED_SUB_ID.len()).expect("len"),
+            DISPATCH_SCAN_FAILED_SUB_ID,
+            writer
+        ],
+        |r| r.get(0),
+    )
+    .expect("count writer rows")
+}
+
+fn record_for(path: &std::path::Path, namespace: &str, agent: Option<&str>) {
+    ai_memory::subscriptions::scan_failure::record_dispatch_scan_failure(
+        path,
+        &ai_memory::subscriptions::scan_failure::ScanFailure {
+            event: EVENT,
+            memory_id: MEMORY_ID,
+            namespace,
+            agent_id: agent,
+            details: None,
+        },
+        "sqlite_error",
+    );
+}
+
+#[test]
+fn h2_one_writer_cannot_fill_the_total_cap_and_starve_a_victim_7503() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("writer-cap.db");
+    let conn = ai_memory::db::open(&path).expect("open");
+    let cap = ai_memory::subscriptions::MAX_SUBSCRIPTION_DLQ_ROWS;
+    // The r1 probe: a ten-namespace writer floods through the recorder.
+    // Pre-seed 9_000 rows directly (the recorder cannot get past its caps
+    // faster than one open per call), then drive the recorder to its refusal.
+    fill_writer_rows(&conn, 9_000, 10, "ai:flooder");
+    let mut calls = 0;
+    while writer_rows(&conn, "ai:flooder") < cap && calls < 2_000 {
+        let before = writer_rows(&conn, "ai:flooder");
+        record_for(&path, &format!("team/flood-{}", calls % 10), Some("ai:flooder"));
+        calls += 1;
+        if writer_rows(&conn, "ai:flooder") == before {
+            break; // refused: the writer is at its cap
+        }
+    }
+    eprintln!(
+        "7503 flooder rows={} total={} recorder calls={calls}",
+        writer_rows(&conn, "ai:flooder"),
+        failed_lookup_rows(&conn)
+    );
+
+    record_for(&path, "team/victim", Some("ai:victim"));
+    assert_eq!(
+        writer_rows(&conn, "ai:victim"),
+        1,
+        "another tenant's failure must still be recorded while one writer holds the total cap"
+    );
+
+    // The flooder, already past its own cap, is refused.
+    let before = writer_rows(&conn, "ai:flooder");
+    record_for(&path, "team/ns-extra", Some("ai:flooder"));
+    assert_eq!(
+        writer_rows(&conn, "ai:flooder"),
+        before,
+        "a writer past its own cap is refused"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // CELL B — postgres funnel: a failing SAL prefix scan leaves a durable row.
 // ---------------------------------------------------------------------------
 
