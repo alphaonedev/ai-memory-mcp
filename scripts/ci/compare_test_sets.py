@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+"""Compare the tests two runners executed, and how each one ended (#7259).
+
+Proves a runner swap (``cargo test`` -> ``cargo nextest run``) ran the same
+tests with the same outcomes. The baseline is a ``cargo test`` log (libtest
+``test <name> ... ok|FAILED|ignored`` lines grouped under their ``Running``
+header). The candidate is a nextest run: its status lines
+(``PASS [ 0.011s] <binary id> <name>``) and/or its JUnit XML. Every status word is mapped by its whole
+name from nextest 0.9.146's status table and an unknown word exits 2. A retried test is its final
+non-``TRY`` line (``PASS``, ``FAIL``, ``FLAKY n/m``, ...); a test that fails every attempt has only
+``TRY n FAIL`` lines, so a test with only ``TRY`` lines is what its LAST attempt said.
+A test nextest prints as ``TRY n PASS`` followed by the line ``- test configured to fail if flaky``
+(``flaky-result = "fail"``) is a FAILURE: nextest-runner 0.124.0 prints the marker in src/reporter/displayer/imp.rs
+:1675-1690 (``write_status_line``, ``StatusLineKind::Intermediate`` + ``FlakyResult::Fail``) and counts the test as
+failed in src/reporter/events.rs; snapshot ``status_line_all_variants``), whatever its last status word says.
+The marker binds ONLY to the immediately preceding ``TRY n PASS`` line (any other status line in between clears
+the binding; non-status lines such as child output do not) and is matched at the END of the cleaned line, so a
+stderr fragment glued in front of it does not hide it. A marker with no such predecessor is refused (exit 2, naming
+the line) rather than guessed, and so are the two shapes nextest never prints: a marker on the same line as a status
+word, and text after the marker on its line.
+``SETUP ...`` script lines and ``TRY n TRMNTG`` / ``TRY n START`` markers are not results.
+
+Both sides are reduced to ``{(binary, test name): "pass" | "fail"}``. Ignored
+and skipped tests are not executed tests and are left out of both sides; doc
+tests are left out too (nextest does not run them, they stay on
+``cargo test --doc``). Binary names are normalised so ``ai-memory`` (the lib),
+``ai-memory::bin/ai-memory`` and ``ai-memory::recall_basic`` line up with the
+``Running unittests src/lib.rs`` / ``src/main.rs`` / ``tests/recall_basic.rs``
+headers.
+
+Usage::
+
+    compare_test_sets.py --cargo-log A.log [B.log ...] \\
+        (--nextest-log C.log [...] | --nextest-junit junit.xml [...])
+
+Totals reconciliation (#7298 F2). Each log also carries its runner's own total, and the
+tool refuses (exit 2) a log whose parsed per-test lines disagree with it, so a line lost
+the same way on both sides can never read as IDENTICAL:
+
+* cargo: the sum of ``passed`` + ``failed`` of the LAST top-level ``test result: ok|FAILED.
+  N passed; M failed; ...`` line of each non-doc-test binary (ignored tests are not
+  executed tests; doc tests are not parsed; a test that re-executes its own test binary
+  prints child ``running 1 test`` / ``test result:`` blocks into the parent's log before the
+  parent's closing line, so earlier result lines of the same binary are not its total).
+* nextest: the sum of ``N`` over ``Summary [ ... ] N tests run: P passed, ...`` lines.
+
+The unique (binary, test) keys parsed from a side must equal its total. A log with no totals
+line at all (an older format, a truncated log) is refused with a message naming the missing
+total. A JUnit-only candidate has no totals line and is not reconciled. The step log prints
+``totals: cargo N of N, nextest N of N`` when both agree.
+
+Exit codes: 0 identical sets AND identical outcomes, 1 they differ (a readable
+diff is printed), 2 unusable input: an empty, missing, unparseable or
+total-inconsistent file is a failure, never a pass (fail closed). Standard
+library only, Python 3.9+.
+"""
+import argparse
+import re
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from typing import Dict, List, NamedTuple, Optional, Tuple
+
+EXIT_IDENTICAL = 0
+EXIT_DIFFERENT = 1
+EXIT_UNUSABLE = 2
+PASS = 'pass'
+FAIL = 'fail'
+LIB_KEY = 'lib'
+BIN_PREFIX = 'bin/'
+EXAMPLE_PREFIX = 'example/'
+EXAMPLE_SRC_PREFIX = 'examples/'
+DEFAULT_MAX_LIST = 40
+
+# ESC, or the two characters ^[ that `gh run view --log` prints in its place.
+_ANSI_RE = re.compile(r'(?:\x1b|\^\[)\[[0-9;]*[A-Za-z]')
+# GitHub inserts a byte-order mark at log-chunk boundaries, anywhere in a line.
+_BOM = '\ufeff'
+_STAMP_RE = re.compile(r'^\d{4}-\d{2}-\d{2}T[\d:.]+Z ?')
+# `gh run view --log` puts `<job>\t<step>\t` in front of every line's timestamp (#7298 F1); a tab pair is
+# only a prefix when a timestamp follows it, so tabs inside ordinary test output are left alone.
+_GH_PREFIX_RE = re.compile(r'^[^\t]*\t[^\t]*\t(?=\d{4}-\d{2}-\d{2}T[\d:.]+Z)')
+_RUNNING_RE = re.compile(r'^\s*Running (?:(?P<unit>unittests) )?(?P<src>\S+)(?: \((?P<exe>[^)]+)\))?\s*$')
+_DOCTEST_RE = re.compile(r'^\s*Doc-tests\b')
+# libtest prints ``test <name> - should panic ... ok`` for #[should_panic] tests; the suffix is
+# not part of the name nextest reports. A test that logs mid-line leaves the verdict either glued
+# to the noise (``ok<noise>``) or alone on a later line (``test <name> ... <noise>`` then ``ok``).
+# Another thread's unterminated stderr write can land in front of a result line (#7299), so the
+# result is searched for anywhere in the line; a non-blank prefix is counted as a spliced line.
+_CARGO_TEST_RE = re.compile(
+    r'test (?P<name>\S+)(?: - should panic)? \.\.\. (?P<res>ok|FAILED|ignored)(?![A-Za-z])')
+_CARGO_OPEN_RE = re.compile(r'^test (?P<name>.+?)(?: - should panic)? \.\.\.(?: |$)')
+_CARGO_VERDICT_RE = re.compile(r'^(?P<res>ok|FAILED|ignored)(?![A-Za-z])')
+_HASH_RE = re.compile(r'-[0-9a-f]{16}$')
+# A test that spawns its own libtest child prints a nested `running N test(s)` block (inline after
+# `test <name> ... ` or on its own line) that ends with its own `test result:` line.
+_NESTED_START_RE = re.compile(r'(?:^|\s)running \d+ tests?$')
+_RESULT_RE = re.compile(r'^test result: ')
+_TOTAL_RE = re.compile(r'^test result: (?:ok|FAILED)\. (?P<passed>\d+) passed; (?P<failed>\d+) failed;')
+_SUMMARY_RE = re.compile(r'Summary \[[^\]]*\]\s+(?P<run>\d+) tests? run:')
+# nextest 0.9.146 (nextest-runner 0.124.0) status vocabulary, read from src/reporter/displayer/imp.rs:
+# `write_status_line_prefix` (:1694-1830: SLOW / SLOW + LEAK / SLOW+TMPASS finals :1707-1728, FLAKY n/m
+# :1778-1790, FLKY-FL n/m :1792-1804, `TRY n <short>` for a failed attempt after the first :1810-1826),
+# `write_skip_line` (:1556, SKIP), `status_str` (:2573-2623, the full names), `short_status_str`
+# (:2625-2672, the names after ``TRY n``), `TRY n TRMNTG` (:866-875) and `TRY n START` (:978-990); the
+# ``SETUP <status>`` script lines (:743, :1578-1593) are not tests and are skipped as whole lines, and the signal names of `signal_str` (helpers.rs:881-899).
+# Every status word is mapped explicitly, by exact name (no partial matching). A word the table does not
+# list is unusable input: the tool exits 2 naming the line (#7298 S1, fail closed).
+_SIGNALS = ('HUP', 'INT', 'QUIT', 'ILL', 'TRAP', 'ABRT', 'FPE', 'KILL', 'SEGV', 'PIPE', 'ALRM', 'TERM')
+_SKIP = 'skip'  # not a result: a marker line or a skipped test
+# ``N/M`` stands for ``\d+/\d+`` and a trailing ``SIG N`` for an unnamed signal number.
+_STATUS_FULL: Dict[str, str] = {
+    'PASS': PASS, 'LEAK': PASS, 'TIMEOUT-PASS': PASS, 'SLOW + LEAK': PASS, 'SLOW+TMPASS': PASS, 'FLAKY N/M': PASS,
+    'FAIL': FAIL, 'FAIL + LEAK': FAIL, 'LEAK-FAIL': FAIL, 'TIMEOUT': FAIL, 'XFAIL': FAIL, 'ABORT': FAIL,
+    'ABORT SIG N': FAIL, 'FLKY-FL N/M': FAIL,
+    'SLOW': _SKIP, 'SKIP': _SKIP, 'START': _SKIP, 'TERMINATING': _SKIP, 'DELAY N/M': _SKIP,
+}
+_STATUS_FULL.update({'SIG' + name: FAIL for name in _SIGNALS})
+# The words that follow ``TRY n`` (one attempt of a retried test).
+_STATUS_TRY: Dict[str, str] = {
+    'PASS': PASS, 'LEAK': PASS, 'TMPASS': PASS,
+    'FAIL': FAIL, 'FL+LK': FAIL, 'LKFAIL': FAIL, 'TMT': FAIL, 'XFAIL': FAIL, 'ABORT': FAIL, 'SIG N': FAIL,
+    'SLOW': _SKIP,
+    # `TRY n TRMNTG`: a slow test being terminated while retries remain (displayer/imp.rs:866-875, TestSlow);
+    # `TRY n START`: a retry attempt starting, printed with --no-capture or verbose (imp.rs:978-990,
+    # TestRetryStarted). Neither carries a result.
+    'TRMNTG': _SKIP, 'START': _SKIP,
+}
+_STATUS_TRY.update({name: FAIL for name in _SIGNALS})
+
+
+def _word_pattern(word: str) -> str:
+    return re.escape(word).replace('N/M', r'\d+/\d+').replace(r'SIG\ N', r'SIG\ \d+')
+
+
+def _status_pattern(words: 'set[str]') -> str:
+    return '|'.join(_word_pattern(w) for w in sorted(words, key=len, reverse=True))
+
+
+_NEXTEST_RE = re.compile(
+    # The status is a whole token: no word character, ``+`` or ``-`` is joined in front of it, it is not the
+    # tail of ``FAIL + LEAK`` / ``SLOW + LEAK``, and the timing column follows it (``[ 0.010s]``, ``[> 60.000s]``,
+    # blank for SKIP), then the optional ``(12/34)`` / ``(---)`` counter, the binary id and the test name.
+    r'(?<![A-Za-z0-9_+\-])(?<!\+ )(?P<st>%s)\s+\[[^\]]*\]\s+(?:\([^)]*\)\s+)?(?P<bin>\S+)\s+(?P<name>.+?)\s*$'
+    % _status_pattern(set(_STATUS_FULL) | set(_STATUS_TRY)))
+# A line SHAPED like a status line at its start (uppercase word(s), a timing column, a binary id and a name)
+# whose word the table does not know fails closed: a new nextest status must be mapped above, never guessed.
+_NEXTEST_SHAPE_RE = re.compile(
+    r'^\s*(?P<st>[A-Z][A-Z0-9]*(?:(?: \+ |[ +\-/])[A-Z0-9]+)*)\s+\[[ >0-9.smh]*\]\s+\S+\s+\S')
+# A retry prints each attempt as ``TRY n <status> [..] <bin> <name>`` (a failed attempt after the first; the counter
+# is ``(---)`` until the test is final): the text in front of the matched status ends in ``TRY n`` for those, and
+# the status is then read from the short table. The check is made on the recovered tail, so an attempt glued with
+# no space behind a stderr fragment is still an attempt. The result of a retried test is its final non-TRY line
+# (PASS / FAIL / FLAKY n/m / LEAK ...); nextest 0.9.146 prints the final line of a test that fails every attempt as
+# ``TRY n FAIL`` with no plain FAIL line (displayer/imp.rs:1810-1826), so a test with only TRY lines is what its
+# LAST attempt said (#7298 R2).
+# With ``flaky-result = "fail"`` nextest prints ``TRY n PASS`` and, on the next line, this marker, and counts the test
+# as failed (nextest-runner 0.124.0 src/reporter/displayer/imp.rs:1675-1690 ``write_status_line``,
+# ``StatusLineKind::Intermediate`` + ``FlakyResult::Fail``, format ``"{:>12} test configured to {} if flaky"``; the
+# failed count is in src/reporter/events.rs; displayer snapshot status_line_all_variants). Without the marker rule a final-status-level of ``none`` would read it as a pass (#7298 S4).
+# The marker binds only to the immediately preceding ``TRY n PASS`` line and is matched at the end of the cleaned
+# line (#7298 R7-1); a marker on the same line as a status word, or with text after it, exits 2 (#7298 R8-1).
+_FLAKY_FAIL_MARKER = '- test configured to fail if flaky'
+_NEXTEST_TRY_RE = re.compile(r'TRY\s+\d+\s*$')
+_TRY_PREFIX_RE = re.compile(r'^TRY\s+\d+\s+')
+_NUMBERS_RE = re.compile(r'\d+/\d+')
+_SIGNUM_RE = re.compile(r'SIG \d+$')
+
+
+def _classify(status: str, attempt: bool) -> Optional[str]:
+    """pass | fail | skip for one status word, or None when the table does not list it."""
+    key = _SIGNUM_RE.sub('SIG N', _NUMBERS_RE.sub('N/M', status))
+    return (_STATUS_TRY if attempt else _STATUS_FULL).get(key)
+
+
+Key = Tuple[str, str]
+Outcomes = Dict[Key, str]
+
+
+class ParseError(Exception):
+    """Unusable input: empty, unparseable or contradictory (fail closed)."""
+
+
+class Scan(NamedTuple):
+    """One log parsed: the outcomes, how many result lines carried a spliced prefix (#7299), the
+    unique per-test keys parsed, and the runner's own total (summed) with the number of totals lines."""
+    outcomes: Outcomes
+    spliced: int
+    parsed: int
+    total: int
+    total_lines: int
+
+
+class Report(NamedTuple):
+    baseline: Outcomes
+    candidate: Outcomes
+    only_baseline: List[Key]
+    only_candidate: List[Key]
+    outcome_diffs: List[Tuple[Key, str, str]]
+
+    @property
+    def identical(self) -> bool:
+        return not (self.only_baseline or self.only_candidate or self.outcome_diffs)
+
+
+def _clean(line: str) -> str:
+    return _STAMP_RE.sub('', _GH_PREFIX_RE.sub('', _ANSI_RE.sub('', line.replace(_BOM, '')))).rstrip()
+
+
+def _is_runner_notice(line: str) -> bool:
+    """GitHub workflow commands (``##[notice]``, ``::notice::``): the watchdog's progress mirror repeats
+    the tail of in-flight ``test ... ok`` lines, which are not results of their own."""
+    return line.startswith(('##[', '::'))
+
+
+def _spliced(line: str, found: 're.Match[str]') -> bool:
+    """True when non-blank text was glued in front of the matched result."""
+    return bool(line[:found.start()].strip())
+
+
+def _norm(name: str) -> str:
+    return name.replace('-', '_')
+
+
+def _merge(into: Outcomes, key: Key, outcome: str) -> None:
+    if into.get(key) == FAIL:
+        return  # a failure is never overwritten by a later pass
+    into[key] = outcome
+
+
+def _cargo_binary(match: 're.Match[str]') -> str:
+    exe = (match.group('exe') or match.group('src')).strip()
+    stem = _norm(_HASH_RE.sub('', Path(exe).name))
+    if match.group('unit'):
+        src = match.group('src').strip()
+        if src.endswith('lib.rs'):
+            return LIB_KEY
+        if src.startswith(EXAMPLE_SRC_PREFIX):
+            return EXAMPLE_PREFIX + stem  # nextest id `<package>::example/<name>`
+        return BIN_PREFIX + stem
+    return stem
+
+
+def parse_cargo_log(text: str) -> Outcomes:
+    """``cargo test`` log -> ``{(binary, test): pass|fail}`` (ignored tests and doc tests excluded)."""
+    return scan_cargo_log(text).outcomes
+
+
+def _close_section(total: int, total_lines: int, section_total: Optional[int]) -> Tuple[int, int]:
+    """Add the finished binary's own total (if it printed one) to the running sums."""
+    if section_total is None:
+        return total, total_lines
+    return total + section_total, total_lines + 1
+
+
+def scan_cargo_log(text: str) -> Scan:
+    """``parse_cargo_log`` plus the count of result lines that carried a spliced prefix."""
+    out: Outcomes = {}
+    spliced = total = total_lines = 0
+    section_total: Optional[int] = None  # passed + failed of the last top-level result of this binary
+    current: Optional[str] = None
+    pending: Optional[str] = None
+    parents: List[Optional[str]] = []  # parent verdicts waiting while a nested child block runs
+    in_doc = False
+    for raw in text.splitlines():
+        line = _clean(raw)
+        if _is_runner_notice(line):
+            continue
+        running = _RUNNING_RE.match(line)
+        if running and (running.group('src').endswith('.rs') or '/deps/' in running.group('src')):
+            total, total_lines = _close_section(total, total_lines, section_total)
+            section_total = None
+            current, in_doc, pending, parents = _cargo_binary(running), False, None, []
+            continue
+        if _DOCTEST_RE.match(line):
+            total, total_lines = _close_section(total, total_lines, section_total)
+            section_total = None
+            current, in_doc, pending, parents = None, True, None, []
+            continue
+        if parents or (pending and _NESTED_START_RE.search(line)):
+            # inside a child libtest block: its lines are not tests of this binary
+            if _NESTED_START_RE.search(line):
+                parents.append(pending)
+                pending = None
+            elif _RESULT_RE.match(line):
+                pending = parents.pop()
+            continue
+        totals = _TOTAL_RE.match(line)
+        if totals:
+            pending = None
+            if not in_doc:
+                section_total = int(totals.group('passed')) + int(totals.group('failed'))
+            continue
+        found = _CARGO_TEST_RE.search(line)
+        if found:
+            name, res, pending = found.group('name'), found.group('res'), None
+            spliced += _spliced(line, found)
+        else:
+            verdict = _CARGO_VERDICT_RE.match(line) if pending else None
+            if verdict:
+                name, res, pending = pending, verdict.group('res'), None
+            else:
+                opened = _CARGO_OPEN_RE.match(line)
+                if opened:
+                    pending = opened.group('name')
+                    if _NESTED_START_RE.search(line):  # child block opens on the same line
+                        parents.append(pending)
+                        pending = None
+                continue
+        if in_doc or res == 'ignored':
+            continue
+        if current is None:
+            raise ParseError('cargo log: test line %r before any "Running" header' % line[:80])
+        _merge(out, (current, name), PASS if res == 'ok' else FAIL)
+    total, total_lines = _close_section(total, total_lines, section_total)
+    if not out:
+        raise ParseError('cargo log: no executed tests found')
+    return Scan(out, spliced, len(out), total, total_lines)
+
+
+def _nextest_binary(binary_id: str) -> str:
+    rest = binary_id.split('::', 1)[1] if '::' in binary_id else ''
+    return _norm(rest) if rest else LIB_KEY
+
+
+def parse_nextest_log(text: str) -> Outcomes:
+    """nextest status lines -> ``{(binary, test): pass|fail}`` (skips excluded; a retried test is its final line, else its last attempt)."""
+    return scan_nextest_log(text).outcomes
+
+
+def scan_nextest_log(text: str) -> Scan:
+    """``parse_nextest_log`` plus the count of status lines that carried a spliced prefix."""
+    out: Outcomes = {}
+    attempts: Outcomes = {}  # the last ``TRY n <status>`` line of each test (#7298 R2)
+    flaky_fail = set()  # tests nextest says are configured to fail if flaky (#7298 S4)
+    last_try_pass = None  # key of the previous result line, only when that line was a ``TRY n PASS`` (#7298 R7-1)
+    spliced = total = total_lines = 0
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        line = _clean(raw)
+        if _is_runner_notice(line):
+            continue
+        if _FLAKY_FAIL_MARKER in line and not line.endswith(_FLAKY_FAIL_MARKER):
+            raise ParseError('nextest log: line %d: text after the marker %r on the same line (nextest ends the line '
+                             'with it): %r' % (lineno, _FLAKY_FAIL_MARKER, line[:120]))
+        if line.endswith(_FLAKY_FAIL_MARKER) and (_NEXTEST_RE.search(line[:-len(_FLAKY_FAIL_MARKER)])
+                                                  or _SUMMARY_RE.search(line[:-len(_FLAKY_FAIL_MARKER)])):
+            raise ParseError('nextest log: line %d: a status word or Summary line on the same line as the marker %r '
+                             '(nextest prints the marker on its own line): %r' % (lineno, _FLAKY_FAIL_MARKER, line[:120]))
+        summary = _SUMMARY_RE.search(line)
+        if summary:
+            total += int(summary.group('run'))
+            total_lines += 1
+            continue
+        if line.endswith(_FLAKY_FAIL_MARKER):
+            if last_try_pass is None:
+                raise ParseError('nextest log: line %d: %r has no immediately preceding "TRY n PASS" result line '
+                                 '(flaky-result = "fail" prints it right after the passing attempt)'
+                                 % (lineno, _FLAKY_FAIL_MARKER))
+            flaky_fail.add(last_try_pass)  # the PASS attempt above it is a failure by configuration
+            last_try_pass = None
+            continue
+        shape = _NEXTEST_SHAPE_RE.match(line)
+        if shape and shape.group('st').startswith('SETUP '):
+            last_try_pass = None
+            continue  # a setup-script line (SETUP SLOW / PASS / LEAK / LKFAIL / <status>): a script, not a test
+        if shape:
+            word = _TRY_PREFIX_RE.sub('', shape.group('st'))
+            if _classify(word, _TRY_PREFIX_RE.match(shape.group('st')) is not None) is None:
+                raise ParseError('nextest log: status %r is not in the nextest 0.9.146 status table; map it in '
+                                 'compare_test_sets.py (line: %r)' % (shape.group('st'), line[:120]))
+        found = _NEXTEST_RE.search(line)
+        if not found:
+            continue
+        prefix = line[:found.start()]
+        attempt = _NEXTEST_TRY_RE.search(prefix)
+        kind = _classify(found.group('st'), attempt is not None)
+        if kind is None:
+            raise ParseError('nextest log: status %r is not valid in this position (nextest 0.9.146 status table); '
+                             'line: %r' % (found.group('st'), line[:120]))
+        last_try_pass = None  # any other result line clears the binding
+        if kind == _SKIP:
+            continue  # a marker or a skipped test: not a result
+        key = (_nextest_binary(found.group('bin')), found.group('name'))
+        if attempt:
+            attempts[key] = kind  # last attempt wins; never counted as a spliced line
+            if kind == PASS:
+                last_try_pass = key
+            continue
+        spliced += _spliced(line, found)
+        _merge(out, key, kind)
+    for key in flaky_fail:
+        out[key] = FAIL
+    for key, kind in attempts.items():
+        out.setdefault(key, kind)  # no final PASS/FAIL/FLAKY line: the test is what its last attempt said
+    if not out:
+        raise ParseError('nextest log: no PASS/FAIL result lines found')
+    return Scan(out, spliced, len(out), total, total_lines)
+
+
+def check_totals(label: str, scan: Scan) -> None:
+    """Refuse a side whose parsed per-test lines disagree with its runner's own total (#7298 F2)."""
+    missing = {'cargo': "no top-level 'test result: ok|FAILED. N passed; M failed' totals line",
+               'nextest': "no 'Summary [ ... ] N tests run:' totals line"}[label]
+    if not scan.total_lines:
+        raise ParseError('%s log: %s found, so the %d parsed test lines cannot be reconciled with the '
+                         "runner's own total" % (label, missing, scan.parsed))
+    if scan.parsed != scan.total:
+        raise ParseError("%s log: parsed %d per-test lines but the runner reports %d executed tests "
+                         "(%d totals lines); a result line was lost or merged" %
+                         (label, scan.parsed, scan.total, scan.total_lines))
+
+
+def parse_junit(text: str) -> Outcomes:
+    """nextest JUnit XML -> ``{(binary, test): pass|fail}`` (skipped cases excluded)."""
+    if '<!DOCTYPE' in text.upper():
+        raise ParseError('junit: DOCTYPE is refused')
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        raise ParseError('junit: not well-formed XML: %s' % exc)
+    out: Outcomes = {}
+    for suite in root.iter('testsuite'):
+        for case in suite.iter('testcase'):
+            tags = {child.tag for child in case}
+            if 'skipped' in tags:
+                continue
+            binary = _nextest_binary(case.get('classname') or suite.get('name') or '')
+            failed = bool(tags & {'failure', 'error'})  # flakyFailure = a retried attempt, the final result passed
+            _merge(out, (binary, case.get('name') or ''), FAIL if failed else PASS)
+    if not out:
+        raise ParseError('junit: no executed test cases found')
+    return out
+
+
+def compare(baseline: Outcomes, candidate: Outcomes) -> Report:
+    """Set and outcome difference; an empty side is refused."""
+    if not baseline or not candidate:
+        raise ParseError('refusing to compare an empty test set (baseline=%d candidate=%d)'
+                         % (len(baseline), len(candidate)))
+    only_base = sorted(set(baseline) - set(candidate))
+    only_cand = sorted(set(candidate) - set(baseline))
+    diffs = [(k, baseline[k], candidate[k]) for k in sorted(set(baseline) & set(candidate))
+             if baseline[k] != candidate[k]]
+    return Report(baseline, candidate, only_base, only_cand, diffs)
+
+
+def _count(outcomes: Outcomes, which: str) -> int:
+    return sum(1 for v in outcomes.values() if v == which)
+
+
+def _section(title: str, rows: List[str], max_list: int) -> List[str]:
+    lines = ['%s: %d' % (title, len(rows))]
+    lines += ['  ' + r for r in rows[:max_list]]
+    if len(rows) > max_list:
+        lines.append('  ... and %d more' % (len(rows) - max_list))
+    return lines
+
+
+def render(report: Report, max_list: int = DEFAULT_MAX_LIST) -> str:
+    """Readable summary and diff."""
+    b, c = report.baseline, report.candidate
+    lines = ['executed tests: baseline=%d candidate=%d' % (len(b), len(c)),
+             'outcomes: baseline pass=%d fail=%d | candidate pass=%d fail=%d'
+             % (_count(b, PASS), _count(b, FAIL), _count(c, PASS), _count(c, FAIL))]
+    lines += _section('only in baseline (cargo test)', ['%s %s' % k for k in report.only_baseline], max_list)
+    lines += _section('only in candidate (nextest)', ['%s %s' % k for k in report.only_candidate], max_list)
+    lines += _section('outcome differences', ['%s %s: %s -> %s' % (k[0], k[1], was, now)
+                                              for k, was, now in report.outcome_diffs], max_list)
+    lines.append('RESULT: %s' % ('IDENTICAL (same executed set, same outcomes)' if report.identical else 'DIFFERENT'))
+    return '\n'.join(lines)
+
+
+def _read(paths: List[str]) -> List[str]:
+    texts = []
+    for path in paths:
+        try:
+            texts.append(Path(path).read_text(encoding='utf-8', errors='replace'))
+        except OSError as exc:
+            raise ParseError('cannot read %s: %s' % (path, exc))
+    return texts
+
+
+def _load(scanner, paths: List[str]) -> Scan:
+    """Merge every log of one side: outcomes merged, counters and totals summed over the logs."""
+    merged: Outcomes = {}
+    spliced = parsed = total = total_lines = 0
+    for text in _read(paths):
+        scan = scanner(text)
+        spliced += scan.spliced
+        parsed += scan.parsed
+        total += scan.total
+        total_lines += scan.total_lines
+        for key, outcome in scan.outcomes.items():
+            _merge(merged, key, outcome)
+    return Scan(merged, spliced, parsed, total, total_lines)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
+    parser.add_argument('--cargo-log', nargs='+', required=True, metavar='FILE', help='baseline: cargo test log(s)')
+    parser.add_argument('--nextest-log', nargs='+', default=[], metavar='FILE', help='candidate: nextest output log(s); a TRY n PASS immediately preceding "- test configured to '
+                        'fail if flaky" (flaky-result = fail) counts as a failure (the marker binds only to that line, is '
+                        'matched at the end of the line, and a marker with no such predecessor exits 2, as does a marker on the '
+                        'same line as a status word and text after the marker), SETUP script lines are not tests')
+    parser.add_argument('--nextest-junit', nargs='+', default=[], metavar='FILE', help='candidate: nextest JUnit XML')
+    parser.add_argument('--max-list', type=int, default=DEFAULT_MAX_LIST, help='rows printed per difference list')
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    try:
+        args = build_parser().parse_args(argv)
+    except SystemExit as exc:
+        return exc.code if isinstance(exc.code, int) else EXIT_UNUSABLE
+    try:
+        if not (args.nextest_log or args.nextest_junit):
+            raise ParseError('a candidate is required: --nextest-log and/or --nextest-junit')
+        base_scan = _load(scan_cargo_log, args.cargo_log)
+        cand_scan = _load(scan_nextest_log, args.nextest_log)
+        check_totals('cargo', base_scan)
+        if args.nextest_log:
+            check_totals('nextest', cand_scan)
+        baseline, candidate = base_scan.outcomes, cand_scan.outcomes
+        for text in _read(args.nextest_junit):
+            for key, outcome in parse_junit(text).items():
+                _merge(candidate, key, outcome)
+        report = compare(baseline, candidate)
+    except ParseError as exc:
+        print('compare_test_sets: %s' % exc, file=sys.stderr)
+        return EXIT_UNUSABLE
+    print(render(report, max(args.max_list, 0)))
+    print('totals: cargo %d of %d, nextest %s (parsed per-test lines of the runners\' own totals)'
+          % (base_scan.parsed, base_scan.total,
+             ('%d of %d' % (cand_scan.parsed, cand_scan.total)) if args.nextest_log else 'junit only, no totals'))
+    print('spliced result lines (stderr glued in front, still counted): baseline=%d candidate=%d'
+          % (base_scan.spliced, cand_scan.spliced))
+    return EXIT_IDENTICAL if report.identical else EXIT_DIFFERENT
+
+
+if __name__ == '__main__':
+    sys.exit(main())

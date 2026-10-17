@@ -153,6 +153,10 @@ env:
   # Declaring it at workflow level also means no job depends on the runner
   # `.env` supplying it.
   CARGO_INCREMENTAL: "0"
+  # #7259 — the ONE place the cargo-nextest pin is written. scripts/ci/install_nextest.py
+  # reads it; scripts/ci/tests/test_nextest_config_7259.py pins that this literal
+  # appears once in this file.
+  NEXTEST_VERSION: "0.9.146"
 
 jobs:
   # Classify the diff so docs-only PRs can short-circuit the heavy Rust
@@ -1055,6 +1059,9 @@ jobs:
           # cache (slower, never wrong). rust-cache@v2 is the repo's existing
           # house action — no new/unpinned Action is introduced.
           save-if: ${{ github.event_name == 'push' }}
+          # #7259 — also restore the cargo-nextest root (scripts/ci/install_nextest.py):
+          # a hit makes `cargo install` a no-op, a miss builds it once (~10 min).
+          cache-directories: ${{ runner.temp }}/cargo-nextest
 
       # v0.9.0 pre-GA (#1853) — e1 macOS anti-flake. The
       # tests/e1_orchestration_dry_run.rs harness historically ran a NESTED
@@ -1263,6 +1270,17 @@ jobs:
       - name: Load gate (#6795)
         if: needs.classify.outputs.docs_only != 'true' && contains(matrix.runner, 'self-hosted')
         run: python3 -I scripts/ci/load_gate.py --label "${{ matrix.node }}/${{ matrix.tier }}"
+
+      # #7259 — cargo-nextest, from crates.io only, pinned (NEXTEST_VERSION) and
+      # locked, built into a root THIS JOB owns ($RUNNER_TEMP/cargo-nextest, put on
+      # PATH through GITHUB_PATH). Never ~/.cargo/bin: some self-hosted runners keep
+      # it write-protected, and a binary an earlier job left there is not trusted.
+      # Hosted runners restore the root through the rust-cache step above
+      # (`cache-directories`). Doc tests stay on `cargo test --doc` because nextest
+      # does not run them.
+      - name: Install cargo-nextest (#7259)
+        if: needs.classify.outputs.docs_only != 'true'
+        run: python3 -I scripts/ci/install_nextest.py
 
       - name: Run tests (impact-aware)
         if: needs.classify.outputs.docs_only != 'true'
@@ -1513,6 +1531,21 @@ jobs:
             left=$(job_left)
             if [ "$left" -lt "$want" ]; then echo "$left"; else echo "$want"; fi
           }
+          # #7259 — integration and lib tests run under cargo-nextest. The
+          # libtest tail the call sites already build (`-- --test-threads=N`,
+          # `--skip X`, name filters) is translated by ONE script,
+          # scripts/ci/nextest_args.py, into a `cargo nextest run` argument list
+          # (nextest rejects `--test-threads` after `--`). The result lands in
+          # NX_ARGS. Unknown libtest flags and `--doc` fail closed (exit 2).
+          nextest_translate() {
+            NX_ARGS=()
+            local out line
+            out="$(python3 scripts/ci/nextest_args.py -- "$@")" || return "$?"
+            while IFS= read -r line; do
+              if [ -n "$line" ]; then NX_ARGS+=("$line"); fi
+            done <<< "$out"
+            return 0
+          }
           run_tests() {
             local label="$1"; shift
             local rc=0
@@ -1535,6 +1568,8 @@ jobs:
             # still bounds the build. A genuine runtime hang still trips the
             # $WATCHDOG_SECS cap below.
             cargo test --no-run "$@" || return "$?"
+            # #7259: nextest reuses the artifacts the prebuild above produced.
+            nextest_translate "$@" || return "$?"
             # `--no-fail-fast` (#2500) — see the identical rationale on
             # `pg_test` in the postgres-feature job below. Cargo otherwise
             # exits after the FIRST failing test executable, so on the
@@ -1549,9 +1584,9 @@ jobs:
             # exact `... "$@" ...` shape the #2657 / #2500 invariant gates pin.
             started=$(date +%s)
             if [ -n "$TIMEOUT_BIN" ]; then
-              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" cargo test --no-fail-fast "$@" || rc=$?
+              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" cargo nextest run --profile ci --no-fail-fast ${NX_ARGS[@]+"${NX_ARGS[@]}"} || rc=$?
             else
-              cargo test --no-fail-fast "$@" || rc=$?
+              cargo nextest run --profile ci --no-fail-fast ${NX_ARGS[@]+"${NX_ARGS[@]}"} || rc=$?
             fi
             elapsed=$(( $(date +%s) - started ))
             # #6202 — make the margin visible in EVERY green run so the budget
@@ -1642,9 +1677,9 @@ jobs:
             cargo test --no-run "$@" "${sel[@]}" || return "$?"
             started=$(date +%s)
             if [ -n "$TIMEOUT_BIN" ]; then
-              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" python3 scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --no-fail-fast "$@" || rc=$?
+              "$TIMEOUT_BIN" --signal=TERM --kill-after=60 "$WATCHDOG_SECS" python3 scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo nextest run --profile ci --no-fail-fast "$@" || rc=$?
             else
-              python3 scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo test --no-fail-fast "$@" || rc=$?
+              python3 scripts/test/pg_isolated_binary.py run --jobs 8 --log-dir "$sd/iso-logs" --targets-file "$sd/iso_targets.txt" --residual-file "$sd/iso_residual.txt" --test-arg=--test-threads=1 -- cargo nextest run --profile ci --no-fail-fast "$@" || rc=$?
             fi
             elapsed=$(( $(date +%s) - started ))
             echo "::notice::[#6383] '${label}' ran ${elapsed}s of the ${WATCHDOG_SECS}s per-invocation watchdog budget (tier=${TIER:-sqlite} node=${CI_NODE:-unknown})"
@@ -1803,9 +1838,9 @@ jobs:
               # word-split into `--features sal-postgres` before and
               # `-- --test-threads=1` after "$@"; on sqlite both are empty.
               if [ "${TIER:-sqlite}" = "enterprise-fed" ]; then
-                run_sharded "full suite (sharded cargo test)" 1
+                run_sharded "full suite (sharded cargo nextest)" 1
               else
-                run_tests "full suite (cargo test)" $FEAT $TAIL
+                run_tests "full suite (cargo nextest)" $FEAT $TAIL
               fi
               ;;
             *)
@@ -1819,7 +1854,7 @@ jobs:
                 done
                 run_sharded "impact-selected (sharded: ${TEST_IMPACT})" 0 "${ARGS[@]}"
               else
-                run_tests "cargo test --lib" $FEAT --lib $TAIL
+                run_tests "cargo nextest --lib" $FEAT --lib $TAIL
                 # Dispatch each impacted tests/*.rs binary
                 ARGS=()
                 for t in $TEST_IMPACT; do
@@ -1842,10 +1877,11 @@ jobs:
 
       # Durable audit-history artifact (#4). Uploaded on success AND failure so
       # a red leg's full output is retrievable long after the log view expires.
-      # A real JUnit XML would require swapping the runner to cargo-nextest —
-      # deliberately avoided here so the #1492 watchdog + #2500 --no-fail-fast +
-      # impact-aware dispatch invariants keep their exact `cargo test` shape;
-      # the captured log is the honest durable record of what ran.
+      # #7259: the runner is cargo-nextest (`--profile ci`, .config/nextest.toml);
+      # the #1492 watchdog, #2500
+      # --no-fail-fast and impact-aware dispatch keep their shape around the
+      # `cargo nextest run` lines. The captured log (one PASS/FAIL line per
+      # test) stays the durable record that scripts/ci/compare_test_sets.py reads.
       - name: Upload test results (durable audit history)
         if: needs.classify.outputs.docs_only != 'true' && always() && env.TEST_RESULT_LOG != ''
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -2253,6 +2289,8 @@ jobs:
       # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
+        with:
+          cache-directories: ${{ runner.temp }}/cargo-nextest
 
       - name: Clippy (sal feature)
         run: cargo clippy --features sal -- -D warnings -D clippy::all -D clippy::pedantic
@@ -2260,10 +2298,13 @@ jobs:
       - name: Build release (sal feature)
         run: cargo build --release --features sal
 
+      - name: Install cargo-nextest (#7259)
+        run: python3 -I scripts/ci/install_nextest.py
+
       - name: Run lib tests (sal feature)
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: cargo test --features sal --lib
+        run: cargo nextest run --profile ci --no-fail-fast --features sal --lib
 
   # v1.0.0 #2257 — vectorlite OPT-IN feature gate. The `vectorlite` cargo
   # feature (#1860/#2219; `rusqlite/load_extension` + `src/vectorlite.rs`)
@@ -2307,19 +2348,24 @@ jobs:
       # export — is now declared in the workflow `env:` block above.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: runner.environment == 'github-hosted'
+        with:
+          cache-directories: ${{ runner.temp }}/cargo-nextest
 
       - name: Clippy (vectorlite feature, all targets)
         run: cargo clippy --all-targets --features vectorlite -- -D warnings -D clippy::all -D clippy::pedantic
 
+      - name: Install cargo-nextest (#7259)
+        run: python3 -I scripts/ci/install_nextest.py
+
       - name: Run vectorlite no-native-lib seam tests (#1860)
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: cargo test --features vectorlite --test vectorlite_1860
+        run: cargo nextest run --profile ci --no-fail-fast --features vectorlite --test vectorlite_1860
 
       - name: Run config-precedence under vectorlite (#2256 feature-gated pin)
         env:
           AI_MEMORY_NO_CONFIG: "1"
-        run: cargo test --features vectorlite --test config_precedence
+        run: cargo nextest run --profile ci --no-fail-fast --features vectorlite --test config_precedence
 
   # v0.6.5 — Dockerfile-build smoke. Runs on EVERY push to main / develop /
   # release/** AND on EVERY PR that touches code. Builds the Docker image;

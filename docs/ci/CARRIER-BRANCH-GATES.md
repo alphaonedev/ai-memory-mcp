@@ -1,7 +1,8 @@
 # CI hang-watchdog budgets by tier (#1492, #6202, #6344)
 
-The full-suite step in `.github/workflows/ci.yml` ("full suite (cargo test)")
-runs `cargo test --no-fail-fast` under GNU `timeout --signal=TERM
+The full-suite step in `.github/workflows/ci.yml` ("full suite (cargo nextest)")
+runs `cargo nextest run --profile ci --no-fail-fast` (#7259; doc tests stay on
+`cargo test --doc`) under GNU `timeout --signal=TERM
 --kill-after=60 $WATCHDOG_SECS`. On tier `enterprise-fed` the suite runs as
 three concurrent shards and `$WATCHDOG_SECS` bounds each shard's whole chain
 (see [Sharded enterprise-fed suite (#6344)](#sharded-enterprise-fed-suite-6344)). The watchdog exists to catch a hung test and
@@ -58,8 +59,8 @@ budget whenever a measured full run comes within 20 % of it.
 ## Not done here
 
 A per-test-binary budget (for example 1200 s per binary) was proposed in #6202
-item 2. It needs the suite split into one `cargo test` call per binary, which
-breaks the single `cargo test --no-fail-fast "$@"` shape the #2500/#2657
+item 2. It needs the suite split into one `cargo nextest run` call per binary, which
+breaks the single `cargo nextest run --profile ci --no-fail-fast` shape the #2500/#2657
 invariant gates pin, so it is tracked separately.
 
 ## Sharded enterprise-fed suite (#6344)

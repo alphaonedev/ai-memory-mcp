@@ -20,7 +20,7 @@ re-issue at `b0483115`, the 2026-09-11 #3595 re-issue at `ad60bead` and the orig
 mint `e22bc93c` remain as historical records. Any change to the federation wire path or the `AI_MEMORY_FED_*` surface **voids this
 certification and triggers re-cert** (see §7).
 
-> ## STATUS — **EXPIRED as of 2026-10-07** (§7 fired: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
+> ## STATUS — **VOID as of 2026-10-16** (EXPIRED since 2026-10-07; §7 fired again on test-only edits to `src/federation/mod.rs`, see the third amendment; §7 fired originally: 4 watched federation-wire files changed after the `385da3a05` bind; re-measurement and re-issue pending under WP-B1, #6063; the last LIVE claim was the 2026-10-02 re-issue at `385da3a05`)
 >
 > **Amendment (2026-10-07, #6063 WP-B1 — §7 EXPIRY RECORD, certification EXPIRED).**
 > The federation certification **expired** per §7 when four §7-watched
@@ -49,6 +49,29 @@ certification and triggers re-cert** (see §7).
 > stays EXPIRED, and the re-measurement and re-issue stay under WP-B1
 > ([#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063)); re-binding
 > without that re-measurement is forbidden (#3899).
+>
+> **Amendment (2026-10-16, #7259 - third §7 record for test-only edits).**
+> One §7-watched federation-wire file, `src/federation/mod.rs`, gained three
+> `crate::governance::wire_check::ensure_installed_for_test()` calls (+11 lines
+> including their comments, near lines 567, 2578 and 2629) in the PR that moves
+> the test runner to cargo-nextest (#7259). All three sit inside the file's
+> `#[cfg(test)] mod tests`; each makes a lib test install the one-shot governance
+> hook itself instead of relying on a sibling test in the same process. No
+> production code, no `AI_MEMORY_FED_*` identifier and no wire behaviour changed.
+> This record does **not** re-measure anything and does **not** re-bind. The
+> certification makes no live claim, and the re-measurement and re-issue stay
+> under WP-B1 ([#6063](https://github.com/alphaonedev/ai-memory-mcp/issues/6063));
+> re-binding without that re-measurement is forbidden (#3899).
+>
+> Rule (B) of the §7 gate (#3556) accepts a cert-doc edit only when the STATUS
+> word or the bound SHA differs from the merge-base ("a voiding record flips
+> STATUS"), and self-test case (o) judges the same change against
+> `origin/release/v1.0.0`, which reads EXPIRED bound to `385da3a05`. The carrier
+> reads "EXPIRED -", so restoring the marker would satisfy one comparison and
+> void the other. This record therefore flips the single STATUS line to VOID, the
+> voiding record the gate defines: it differs from both comparison points, makes
+> no live claim (rule (C) never fails VOID), re-binds no SHA and re-measures
+> nothing. WP-B1 (#6063) replaces the STATUS when it re-issues LIVE.
 >
 > Re-validated and re-bound against `f32c18dadf8a659567960747cc2802186bac9de9`
 > at the v1.0.0 promotion tip on 2026-09-21: §5.4(2) posture legs re-measured at 22 checks

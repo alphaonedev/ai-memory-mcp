@@ -65,10 +65,8 @@ fn build_detector_once() -> PathBuf {
         .join(".local-runs")
         .join("g11-auto-link-detector");
     std::fs::create_dir_all(&scratch_root).ok();
-    let target_dir = scratch_root.join(format!(
-        "ai-memory-auto-link-detector-target-{}",
-        std::process::id()
-    ));
+    // #7259 — one stable dir, not one per process (nextest = process per test).
+    let target_dir = scratch_root.join("ai-memory-auto-link-detector-target");
 
     let status = Command::new("cargo")
         .args([

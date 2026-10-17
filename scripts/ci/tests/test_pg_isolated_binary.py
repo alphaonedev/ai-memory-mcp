@@ -644,6 +644,95 @@ class MainRun(unittest.TestCase):
                 self.assertEqual(pib.main(argv), pib.EXIT_USAGE, missing)
 
 
+class NextestRunner(unittest.TestCase):
+    """#7259: the wrapper drives `cargo nextest run` as well as `cargo test`."""
+
+    NEXTEST = ['cargo', 'nextest', 'run', '--profile', 'ci', '--no-fail-fast']
+
+    def nextest_runner(self, test_args=None):
+        env = {pib.URL_VAR: BASE, pib.FLAG_VAR: '1', pib.TEMPLATE_VAR: TPL}
+        return pib.Runner(cargo=list(self.NEXTEST),
+                          test_args=['--test-threads=1'] if test_args is None else test_args,
+                          env=env, tpl=TPL, run_id=RUN, admin=BASE, log_dir=scratch_dir(), width=2)
+
+    def write_targets(self, *names):
+        d = scratch_dir()
+        p = Path(d) / 'targets-nextest.txt'
+        p.write_text(''.join('--test %s\n' % n for n in names))
+        return d, p
+
+    def test_threads_flag_is_mapped_instead_of_passed_to_libtest(self):
+        r = self.nextest_runner()
+        with Patched():
+            rc = r.run_one(['--test', 'foo_7259'], isolate=True)
+        self.assertEqual(rc, 0)
+        cargo = FakePopen.cargo()
+        self.assertEqual(len(cargo), 1)
+        self.assertEqual(cargo[0].argv, self.NEXTEST + ['--test', 'foo_7259', '--test-threads', '1'])
+        self.assertNotIn('--', cargo[0].argv, 'nextest rejects --test-threads after the separator')
+
+    def test_clone_is_still_minted_held_and_dropped_per_binary(self):
+        r = self.nextest_runner()
+        with Patched() as rec:
+            r.run_one(['--test', 'foo_7259'], isolate=True)
+        cargo = FakePopen.cargo()[0]
+        minted = pib.database_name(cargo.kw['env'][pib.URL_VAR])
+        self.assertIsNotNone(pib.parse_isolated_name(minted, RUN), minted)
+        self.assertEqual(len([p for p in FakePopen.instances if p.is_hold]), 1)
+        sql = rec.sql()
+        self.assertTrue(sql[0].startswith('CREATE DATABASE'))
+        self.assertEqual(sql[-1], 'DROP DATABASE IF EXISTS "%s"' % minted)
+
+    def test_exit_code_of_nextest_is_propagated(self):
+        r = self.nextest_runner()
+        with Patched():
+            FakePopen.cargo_rc = 100
+            rc = r.run_one(['--test', 'foo_7259'], isolate=True)
+        self.assertEqual(rc, 100)
+
+    def test_main_run_accepts_the_nextest_runner(self):
+        d, targets = self.write_targets('one', 'two')
+        with Patched() as rec, unittest.mock.patch.dict(os.environ, {pib.FLAG_VAR: '1'}), \
+                unittest.mock.patch.object(pib.signal, 'signal'):
+            rc = pib.main(['run', '--url', BASE, '--run-id', RUN, '--template', TPL,
+                           '--targets-file', str(targets), '--log-dir', d, '--jobs', '2',
+                           '--test-arg=--test-threads=1', '--'] + self.NEXTEST)
+        self.assertEqual(rc, 0)
+        argvs = sorted(p.argv for p in FakePopen.cargo())
+        self.assertEqual(argvs, [self.NEXTEST + ['--test', 'one', '--test-threads', '1'],
+                                 self.NEXTEST + ['--test', 'two', '--test-threads', '1']])
+        self.assertEqual(len([s for s in rec.sql() if s.startswith('CREATE DATABASE')]), 2)
+
+    def test_main_run_refuses_a_runner_that_is_neither_cargo_test_nor_nextest(self):
+        d, targets = self.write_targets('one')
+        for runner_argv in (['echo', 'hi'], ['cargo', 'build'], ['cargo', 'nextest', 'list']):
+            with Patched() as rec, unittest.mock.patch.dict(os.environ, {pib.FLAG_VAR: '1'}), \
+                    unittest.mock.patch.object(pib.signal, 'signal'):
+                rc = pib.main(['run', '--url', BASE, '--run-id', RUN, '--template', TPL,
+                               '--targets-file', str(targets), '--log-dir', d, '--'] + runner_argv)
+            self.assertEqual(rc, pib.EXIT_USAGE, runner_argv)
+            self.assertEqual(FakePopen.instances, [], runner_argv)
+            self.assertEqual([s for s in rec.sql() if s.startswith('CREATE DATABASE')], [], runner_argv)
+
+    def test_untranslatable_test_arg_is_refused_before_any_clone_is_minted(self):
+        d, targets = self.write_targets('one')
+        with Patched() as rec, unittest.mock.patch.dict(os.environ, {pib.FLAG_VAR: '1'}), \
+                unittest.mock.patch.object(pib.signal, 'signal'):
+            rc = pib.main(['run', '--url', BASE, '--run-id', RUN, '--template', TPL,
+                           '--targets-file', str(targets), '--log-dir', d, '--test-arg=--shuffle',
+                           '--'] + self.NEXTEST)
+        self.assertEqual(rc, pib.EXIT_USAGE)
+        self.assertEqual([s for s in rec.sql() if s.startswith('CREATE DATABASE')], [])
+        self.assertEqual(FakePopen.instances, [])
+
+    def test_cargo_test_runner_keeps_the_libtest_separator(self):
+        r = runner()
+        with Patched():
+            r.run_one(['--test', 'foo_7259'], isolate=True)
+        self.assertEqual(FakePopen.cargo()[0].argv,
+                         ['cargo', 'test', '--no-fail-fast', '--test', 'foo_7259', '--', '--test-threads=1'])
+
+
 class NoShell(unittest.TestCase):
     def test_source_never_uses_shell_true_or_tmp(self):
         src = SCRIPT.read_text()
