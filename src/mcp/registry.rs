@@ -1346,7 +1346,61 @@ pub(crate) fn strip_docs_from_tools(tools: &mut Vec<Value>) {
                     strip_description_recursively(prop_value);
                 }
             }
+            // v0.10.1 — inline every `$ref: "#/definitions/<Name>"` and drop
+            // the `definitions` map. Schemars emits `$ref` + `definitions` for
+            // `#[serde(untagged)]` enums (e.g. `KindsFilter` on `memory_recall`),
+            // but OpenAI/Anthropic-style function-calling gateways reject
+            // `$ref`/`definitions` and require a fully inlined schema.
+            inline_schema_definitions(input_schema);
         }
+    }
+}
+
+/// Inline every `$ref: "#/definitions/<Name>"` in `input_schema` using the
+/// sibling `definitions` map, then remove `definitions`. Schemars derives
+/// `#[serde(untagged)]` enums (e.g. `KindsFilter` on `memory_recall`) as a
+/// `definitions/<Type>` entry referenced by `$ref`, but LLM function-calling
+/// gateways reject `$ref`/`definitions` and require a fully inlined schema.
+fn inline_schema_definitions(input_schema: &mut serde_json::Map<String, Value>) {
+    let defs = input_schema
+        .remove("definitions")
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    for value in input_schema.values_mut() {
+        inline_refs_recursive(value, &defs);
+    }
+}
+
+/// Recursively replace `$ref` nodes pointing into `defs` with the referenced
+/// definition. A definition may itself contain further `$ref`s (nested enums),
+/// so a substituted node is re-walked after replacement.
+fn inline_refs_recursive(node: &mut Value, defs: &serde_json::Map<String, Value>) {
+    let resolved: Option<Value> = match node {
+        Value::Object(map) => map
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|reference| reference.strip_prefix("#/definitions/"))
+            .and_then(|name| defs.get(name))
+            .cloned(),
+        _ => None,
+    };
+    if let Some(definition) = resolved {
+        *node = definition;
+        inline_refs_recursive(node, defs);
+        return;
+    }
+    match node {
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                inline_refs_recursive(value, defs);
+            }
+        }
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                inline_refs_recursive(item, defs);
+            }
+        }
+        _ => {}
     }
 }
 
