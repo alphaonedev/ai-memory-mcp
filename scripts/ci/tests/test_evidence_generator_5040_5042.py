@@ -237,16 +237,18 @@ class RecaptureResolution7399(ScratchCase):
 
     def test_run_cert_resolves_the_same_order_7399(self):
         rc = load("run_cert")
-        wt = self.dir / "wt"
-        (wt / "scripts").mkdir(parents=True)
+        # #7411: the script is resolved in the tip TREE (git), not on disk, so each case is its own tip.
+        wt, tip = self.make_repo({})
         with self.assertRaises(FileNotFoundError) as cm:
-            rc.pick_recapture(wt)
+            rc.pick_recapture(wt, tip)
         self.assertIn(RECAPTURE_PY, str(cm.exception))
         self.assertIn(RECAPTURE_SH, str(cm.exception))
-        (wt / RECAPTURE_SH).write_text(SH_BODY)
-        self.assertEqual(rc.pick_recapture(wt), wt / RECAPTURE_SH)
-        (wt / RECAPTURE_PY).write_text(PY_BODY)
-        self.assertEqual(rc.pick_recapture(wt), wt / RECAPTURE_PY)
+        shutil.rmtree(wt)
+        wt, tip = self.make_repo({RECAPTURE_SH: SH_BODY})
+        self.assertEqual(rc.pick_recapture(wt, tip), RECAPTURE_SH)
+        shutil.rmtree(wt)
+        wt, tip = self.make_repo({RECAPTURE_SH: SH_BODY, RECAPTURE_PY: PY_BODY})
+        self.assertEqual(rc.pick_recapture(wt, tip), RECAPTURE_PY)
 
 
 if __name__ == "__main__":
