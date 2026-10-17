@@ -12,6 +12,7 @@ header whose date disagrees with the run date is refused.
 
 Run: python3 -m unittest scripts/ci/tests/test_recapture_cert_3607_5038.py
 """
+import ast
 import datetime
 import importlib.util
 import os
@@ -833,7 +834,8 @@ class OperatorKeySymlinks7508(SymlinkBase):
 
 
 class SwapDuringRun7509(SymlinkBase):
-    """#7509: a symlink swapped in after the first check fails closed with exit 1."""
+    """#7509: a symlink swapped in at a protected path fails closed with exit 1; one at a
+    replaceable path is removed and never followed (#7539)."""
 
     def test_swap_during_keygen_does_not_leak_the_passphrase(self):
         outside = self.outside()
@@ -849,7 +851,7 @@ class SwapDuringRun7509(SymlinkBase):
         done, _ = self.run_recapture(default_bin=swap)
         self.assert_failed_closed(done, outside)
 
-    def test_write_file_refuses_a_final_symlink_and_a_symlinked_parent(self):
+    def test_write_file_replaces_a_final_symlink_and_refuses_a_symlinked_parent(self):
         module = load_script_module()
         module.ROOT = self.root
         outside = self.outside()
@@ -901,7 +903,8 @@ class HomeValidation7510(RecaptureBase):
     """#7510: HOME must be absolute and non-empty; the sanitizer replaces whole path components."""
 
     def test_unusable_home_is_refused_before_any_write(self):
-        for value in ('.', 'rel', '', '/', 'a:b', '/abs:/other'):
+        for value in ('.', 'rel', '', '/', 'a:b', '/abs:/other', '/.', '/..', '/./', '/home/a/',
+                      '/home//a', '/home/a/.', '/home/a/../b', '//', '/home/./a'):
             with self.subTest(home=value):
                 done, _ = self.run_recapture(extra_env={'HOME': value})
                 self.assertEqual(done.returncode, 1, done.stderr)
@@ -943,6 +946,140 @@ class HomeValidation7510(RecaptureBase):
         self.assertIn('HOME', module.USAGE_EPILOG)
         self.assertIn('HOME', module.__doc__)
         self.assertIn('component', module.sanitize.__doc__)
+
+
+class SanitizerTerminators7538(RecaptureBase):
+    """#7538: a path is replaced only before end of input, `/`, whitespace or a closing
+    character; every other legal filename character keeps the path a different one."""
+
+    def patched(self, home):
+        module = load_script_module()
+        module.ROOT = Path('/mnt/x/repo')
+        module.FIX = module.ROOT / '.local-runs' / 'cert-3607-fixtures'
+        module.HOME = home
+        return module
+
+    def test_home_terminator_table(self):
+        module = self.patched('/home/a')
+        rewritten = [
+            (b'/home/a', b'<home>'), (b'/home/a/x', b'<home>/x'), (b'"/home/a"', b'"<home>"'),
+            (b"'/home/a'", b"'<home>'"), (b'/home/a)', b'<home>)'), (b'(/home/a)', b'(<home>)'),
+            (b'[/home/a]', b'[<home>]'), (b'{/home/a}', b'{<home>}'), (b'</home/a>', b'<<home>>'),
+            (b'/home/a:', b'<home>:'), (b'/home/a;', b'<home>;'), (b'/home/a ', b'<home> '),
+            (b'/home/a\n', b'<home>\n'), (b'/home/a\t', b'<home>\t'), (b'`/home/a`', b'`<home>`'),
+            (b'HOME=/home/a:/bin', b'HOME=<home>:/bin'), (b'/home/a.', b'<home>.'),
+            (b'/home/a. x', b'<home>. x'), (b'/home/a.)', b'<home>.)'), (b'/home/a./x', b'<home>./x'),
+        ]
+        kept = [
+            b'/home/a+b', b'/home/a..b', b'/home/a~', b'/home/a@x', b'/home/a%20', b'/home/a=1',
+            b'/home/a#1', b'/home/a,b', b'/home/a,', b'/home/a$x', b'/home/a&b', b'/home/a|b',
+            b'/home/a!', b'/home/a(x', b'/home/a{x', b'/home/ab', b'/home/a.txt', b'/home/a.b',
+            b'/home/a_b', b'/home/a-b', b'/home/a..', b'/home/a.+', b'x/home/a',
+            b'/home/a\xc3\xa9',
+        ]
+        for raw, want in rewritten:
+            with self.subTest(raw=raw):
+                self.assertEqual(module.sanitize(raw), want)
+        for raw in kept:
+            with self.subTest(raw=raw):
+                self.assertEqual(module.sanitize(raw), raw)
+
+    def test_repo_and_fixture_paths_use_the_same_terminators(self):
+        module = self.patched('/home/a')
+        fix = b'/mnt/x/repo/.local-runs/cert-3607-fixtures'
+        self.assertEqual(module.sanitize(b'/mnt/x/repo+b /mnt/x/repo@x /mnt/x/repo)'),
+                         b'/mnt/x/repo+b /mnt/x/repo@x <repo-root>)')
+        label = b'<repo-root>/.local-runs/cert-3607-fixtures'
+        self.assertEqual(module.sanitize(fix + b'+x ' + fix + b'/k "' + fix + b'"'),
+                         label + b'+x ' + label + b'/k "' + label + b'"')
+        self.assertEqual(module.sanitize(b'/mnt/x/repo/.local-runs/cert-3607-fixtures2'),
+                         b'<repo-root>/.local-runs/cert-3607-fixtures2')
+
+    def test_docstring_documents_the_terminator_set(self):
+        module = load_script_module()
+        doc = ' '.join(module.sanitize.__doc__.split())
+        self.assertIn('terminator', doc)
+        self.assertIn('comma', doc)
+
+
+class PublicFileMode7536(SymlinkBase):
+    """#7536: evidence and fixture files are created 0644 and are never world-writable."""
+
+    def test_public_mode_has_no_group_or_world_write_bit(self):
+        module = load_script_module()
+        self.assertEqual(module.PUBLIC_FILE_MODE, 0o644)
+        self.assertEqual(module.PUBLIC_FILE_MODE & 0o022, 0)
+
+    def test_default_write_is_not_writable_by_others_under_umask_zero(self):
+        module = load_script_module()
+        module.ROOT = self.root
+        old = os.umask(0)
+        self.addCleanup(os.umask, old)
+        target = self.root / 'f'
+        module.write_file(target, b'x')
+        self.assertEqual(target.stat().st_mode & 0o777, 0o644)
+
+    def test_whole_run_under_umask_zero_writes_no_world_writable_file(self):
+        old = os.umask(0)
+        self.addCleanup(os.umask, old)
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        # operator.key and operator.key.pub are created by the child binary (the stub), not
+        # by the script, so their mode is the child's.
+        found = [p for base in (self.root / OUT_REL, self.fix()) for p in base.rglob('*')
+                 if p.is_file() and p.stat().st_mode & 0o022
+                 and not p.name.startswith('operator.key')]
+        self.assertEqual(found, [])
+
+    def test_evidence_mode_under_the_default_umask_is_unchanged(self):
+        old = os.umask(0o022)
+        self.addCleanup(os.umask, old)
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((self.root / OUT_REL / 'posture-bare-env.out').stat().st_mode & 0o777,
+                         0o644)
+
+
+class EmptyExcept7537(unittest.TestCase):
+    def test_open_new_has_no_empty_except_clause(self):
+        text = (REPO / 'scripts' / SCRIPT_NAME).read_text()
+        empty = [node.lineno for node in ast.walk(ast.parse(text))
+                 if isinstance(node, ast.ExceptHandler)
+                 and ast.unparse(node.type) == 'FileNotFoundError'
+                 and all(isinstance(stmt, ast.Pass) for stmt in node.body)]
+        self.assertEqual(empty, [])
+        self.assertIn('contextlib.suppress(FileNotFoundError)', text)
+
+
+class SwapReplaceDocs7539(SymlinkBase):
+    def test_a_link_at_a_replaceable_path_is_replaced_and_the_run_succeeds(self):
+        outside = self.outside()
+        head, rest = STUB.split('\n', 1)
+        swap = self.root / 'swap-replaceable'
+        swap.write_text(
+            head + '\nimport os as _o, sys as _s\n'
+            'if _s.argv[1:2] == ["doctor"] and "--posture" in _s.argv:\n'
+            '    _t = _o.path.join(_o.getcwd(), "docs", "compliance", "evidence", "cert-3607",\n'
+            '                      "posture-bare-env.out")\n'
+            '    _o.makedirs(_o.path.dirname(_t), exist_ok=True)\n'
+            '    if not _o.path.lexists(_t):\n'
+            '        _o.symlink(%r, _t)\n'
+            '        open(%r, "w").close()\n' % (str(outside / 'stolen'), str(self.home / 'planted'))
+            + rest)
+        swap.chmod(0o755)
+        done, _ = self.run_recapture(default_bin=swap)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue((self.home / 'planted').exists())
+        target = self.root / OUT_REL / 'posture-bare-env.out'
+        self.assertFalse(target.is_symlink())
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_docstring_describes_replace_versus_fail_closed(self):
+        module = load_script_module()
+        doc = ' '.join(module.__doc__.split())
+        self.assertIn('A symlink at a replaceable path is removed and replaced, never followed', doc)
+        self.assertNotIn('so a link swapped in mid-run fails closed with exit 1', doc)
+        self.assertIn('symlinked parent, a symlink at the passphrase', doc)
 
 
 if __name__ == '__main__':
