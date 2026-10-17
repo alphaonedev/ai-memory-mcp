@@ -80,25 +80,26 @@ h1{font-family:var(--disp);font-weight:700;font-size:26px;margin:10px 0 4px;lett
 function famFS(el){const c=el.closest(".fam");try{if(c.requestFullscreen){if(document.fullscreenElement===c)document.exitFullscreen();else c.requestFullscreen();return;}}catch(_){}c.classList.toggle("maximized");}
 document.addEventListener("keydown",e=>{if(e.key==="Escape")document.querySelectorAll(".fam.maximized").forEach(c=>c.classList.remove("maximized"));});
 const SRC="security-state.json";
+const esc=s=>String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 const el=(t,c,h)=>{const e=document.createElement(t);if(c)e.className=c;if(h!=null)e.innerHTML=h;return e;};
 function render(d){
   document.getElementById("sub").innerHTML=document.getElementById("sub").innerHTML;
   const pct=d.pct;
-  document.getElementById("pct").innerHTML=pct+'<span class="u">%</span>';
+  document.getElementById("pct").innerHTML=esc(pct)+'<span class="u">%</span>';
   document.getElementById("pct").style.color = pct>=100?"var(--good)":pct>=90?"var(--good)":"var(--warn)";
   document.getElementById("herostats").innerHTML=[
     ["validated",d.validated,"var(--good)"],["fail-closed",d.failclosed,"var(--run)"],
     ["refining",d.refining,"var(--warn)"],["total tools",d.total,"var(--ink)"]
-  ].map(([l,v,c])=>`<div class="hstat"><div class="v" style="color:${c}">${v}</div><div class="l">${l}</div></div>`).join("");
+  ].map(([l,v,c])=>`<div class="hstat"><div class="v" style="color:${c}">${esc(v)}</div><div class="l">${esc(l)}</div></div>`).join("");
   const g=d.validated+d.failclosed, w1=g/d.total*100, w2=d.refining/d.total*100;
   document.getElementById("bar").innerHTML=`<i style="width:${(d.validated/d.total*100).toFixed(1)}%;background:var(--good)"></i><i style="width:${(d.failclosed/d.total*100).toFixed(1)}%;background:var(--run)"></i><i style="width:${w2.toFixed(1)}%;background:var(--warn)"></i>`;
   const host=document.getElementById("families");host.innerHTML="";
   (d.groups||[]).forEach(fam=>{
     const card=el("div","fam");
     const ok=fam.tools.filter(t=>t.status!=='fail').length, tot=fam.tools.length;
-    const tools=fam.tools.map(t=>`<div class="tool ${t.cls}" title="${(t.desc||'').replace(/"/g,'&quot;')}${t.note?' — '+(t.note||'').replace(/"/g,'&quot;'):''}">
-      <span class="tn">${t.name.replace('memory_','')}</span><span class="ti ${t.cls}">${t.cls==='validated'?'✓':t.cls==='failclosed'?'⇥':'…'}</span></div>`).join("");
-    card.innerHTML=`<div class="famhdr"><span class="famname">${fam.family}</span><span class="famcount">${ok}/${tot}</span><button class="fsbtn" onclick="famFS(this)" title="expand this block to full screen (Esc to close)">⛶</button>
+    const tools=fam.tools.map(t=>`<div class="tool ${esc(t.cls)}" title="${esc((t.desc||'')+(t.note?' — '+t.note:''))}">
+      <span class="tn">${esc(t.name.replace('memory_',''))}</span><span class="ti ${esc(t.cls)}">${t.cls==='validated'?'✓':t.cls==='failclosed'?'⇥':'…'}</span></div>`).join("");
+    card.innerHTML=`<div class="famhdr"><span class="famname">${esc(fam.family)}</span><span class="famcount">${ok}/${tot}</span><button class="fsbtn" onclick="famFS(this)" title="expand this block to full screen (Esc to close)">⛶</button>
       <span class="fambar"><i style="width:${ok/tot*100}%;height:100%;background:${ok===tot?'var(--good)':'var(--warn)'}"></i></span></div>
       <div class="tools">${tools}</div>`;
     host.appendChild(card);

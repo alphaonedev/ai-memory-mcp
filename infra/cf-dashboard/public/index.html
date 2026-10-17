@@ -345,7 +345,7 @@ function renderKpis(list){
   const host=document.getElementById("kpis");
   if(host.childElementCount!==list.length){ host.innerHTML=""; list.forEach((k,i)=>{
     const c=el("div","kpi "+(k.state||"pend"));
-    c.innerHTML=`<div class="lab">${k.label}</div><div class="val ${k.value==null?'pend':''}" id="kv${i}">—</div><div class="sub">${k.sub||""}</div>`;
+    c.innerHTML=`<div class="lab">${esc(k.label)}</div><div class="val ${k.value==null?'pend':''}" id="kv${i}">—</div><div class="sub">${esc(k.sub||"")}</div>`;
     host.appendChild(c);
   });}
   list.forEach((k,i)=>{
@@ -356,7 +356,7 @@ function renderKpis(list){
     if(k.value==null){ vEl.className="val pend"; vEl.textContent="—"; kpiAnim[i]=null; return; }
     vEl.className="val";
     const tgt=k.value, from=(kpiAnim[i]==null?0:kpiAnim[i]); kpiAnim[i]=tgt;
-    const of=k.of!=null?` <span class="of">/ ${fmt(k.of)}</span>`:""; const su=k.suffix?`<span class="su">${k.suffix}</span>`:"";
+    const of=k.of!=null?` <span class="of">/ ${fmt(k.of)}</span>`:""; const su=k.suffix?`<span class="su">${esc(k.suffix)}</span>`:"";
     const t0=performance.now(),dur=700;
     (function step(now){ const p=Math.min(1,(now-t0)/dur), e=1-Math.pow(1-p,3), cur=from+(tgt-from)*e;
       vEl.innerHTML=fmt(cur)+su+of; if(p<1)requestAnimationFrame(step); })(t0);
@@ -367,7 +367,8 @@ function renderKpis(list){
 let swarmState=null;
 const swCanvas=document.getElementById("swarm");
 const SCOL={working:'--good',idle:'--run',recovered:'--viol',error:'--bad'};
-function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
+function safeUrl(u){return /^https:\/\//.test(String(u||''))?String(u):'#';}
 function swarmFabric(sw){
   sw=sw||{}; const D=window.__D||{}; const legs=((D.comms||{}).legs)||[];
   const model=sw.model||"GLM-5.3-Flash";
@@ -396,12 +397,12 @@ function swarmFabric(sw){
   <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--soft)"/></marker>
   <marker id="at" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="var(--soft)"/></marker>
   <style>.flow{animation:dash 1s linear infinite}@keyframes dash{to{stroke-dashoffset:-36}}</style></defs>`;
-  svg+=box(OR.x,OR.y,OR.w,OR.h,"OpenRouter",[`${model} decide calls`,`gemini-embedding-2 embeds · gemini-3.7-flash LLM`,embedLeg.live&&embedLeg.live.usd_per_hour!=null?`$${embedLeg.live.usd_per_hour}/h live spend`:null],live,"var(--p3,#c8a2ff)");
-  svg+=box(AG.x,AG.y,AG.w,AG.h,"AI agents (NHIs)",[`${total} ${model} agents`,`${working} working · ${total-working} idle`,fit(sw.run||'',40),`Ed25519-signed writes · own namespace`],live&&working>0,"var(--good)");
-  svg+=box(AM2.x,AM2.y,AM2.w,AM2.h,"ai-memory · f2 (Linux)",[`TLS 1.3 + pinned mTLS + API key`,`${f2.agents} agents · ${f2.working} working`,f2.calls!=null?`${Number(f2.calls).toLocaleString()} calls this run`:null],f2.active,"var(--acc)");
-  svg+=box(AM1.x,AM1.y,AM1.w,AM1.h,"ai-memory · f1 (macOS)",[`TLS 1.3 + pinned mTLS + API key`,`${f1.agents} agents · ${f1.working} working`,f1.calls!=null?`${Number(f1.calls).toLocaleString()} calls this run`:null],f1.active,"var(--acc)");
-  svg+=box(DT2.x,DT2.y,DT2.w,DT2.h,"data tier · f2",[`PostgreSQL 18.6 · Apache AGE 1.8.0`,`pgvector 0.8.6 · TLS verify-full · ${fmt(rate(pgLeg),'tx/s')}`,f2.writes!=null?`${f2.writes} signed rows this run`:null],f2.active,"var(--p2,#ffb86b)");
-  svg+=box(DT1.x,DT1.y,DT1.w,DT1.h,"data tier · f1",[`PostgreSQL 18.6 · Apache AGE 1.8.0`,`pgvector 0.8.6 · TLS verify-full`,f1.writes!=null?`${f1.writes} signed rows this run`:null],f1.active,"var(--p2,#ffb86b)");
+  svg+=box(OR.x,OR.y,OR.w,OR.h,"OpenRouter",[`${esc(model)} decide calls`,`gemini-embedding-2 embeds · gemini-3.7-flash LLM`,embedLeg.live&&embedLeg.live.usd_per_hour!=null?`$${embedLeg.live.usd_per_hour}/h live spend`:null],live,"var(--p3,#c8a2ff)");
+  svg+=box(AG.x,AG.y,AG.w,AG.h,"AI agents (NHIs)",[`${total} ${esc(model)} agents`,`${working} working · ${total-working} idle`,fit(sw.run||'',40),`Ed25519-signed writes · own namespace`],live&&working>0,"var(--good)");
+  svg+=box(AM2.x,AM2.y,AM2.w,AM2.h,"ai-memory · f2 (Linux)",[`TLS 1.3 + pinned mTLS + API key`,`${esc(f2.agents)} agents · ${esc(f2.working)} working`,f2.calls!=null?`${Number(f2.calls).toLocaleString()} calls this run`:null],f2.active,"var(--acc)");
+  svg+=box(AM1.x,AM1.y,AM1.w,AM1.h,"ai-memory · f1 (macOS)",[`TLS 1.3 + pinned mTLS + API key`,`${esc(f1.agents)} agents · ${esc(f1.working)} working`,f1.calls!=null?`${Number(f1.calls).toLocaleString()} calls this run`:null],f1.active,"var(--acc)");
+  svg+=box(DT2.x,DT2.y,DT2.w,DT2.h,"data tier · f2",[`PostgreSQL 18.6 · Apache AGE 1.8.0`,`pgvector 0.8.6 · TLS verify-full · ${fmt(rate(pgLeg),'tx/s')}`,f2.writes!=null?`${esc(f2.writes)} signed rows this run`:null],f2.active,"var(--p2,#ffb86b)");
+  svg+=box(DT1.x,DT1.y,DT1.w,DT1.h,"data tier · f1",[`PostgreSQL 18.6 · Apache AGE 1.8.0`,`pgvector 0.8.6 · TLS verify-full`,f1.writes!=null?`${esc(f1.writes)} signed rows this run`:null],f1.active,"var(--p2,#ffb86b)");
   // flows anchored on box EDGES (never crossing a box)
   svg+=flow(AG.x+AG.w/2, AG.y, OR.x+OR.w/2, OR.y+OR.h, "decide (prompt → tool call)", live&&working>0, "var(--p3,#c8a2ff)", false);
   svg+=flow(AG.x+AG.w, AG.y+50, AM2.x, AM2.y+AM2.h-10, `mTLS · ${fmt(rate(loopLeg),'/s')}`, f2.active, "var(--good)");
@@ -461,7 +462,7 @@ function donut(mount, cov){
     <circle r="${r}" fill="none" stroke="var(--line)" stroke-width="14"/>
     <circle r="${r}" fill="none" stroke="var(--good)" stroke-width="14" stroke-linecap="round" stroke-dasharray="${c}" stroke-dashoffset="${(c*(1-pct)).toFixed(1)}" transform="rotate(-90)"/>
     <text y="-1" text-anchor="middle" font-size="24" fill="var(--ink)" font-family="var(--disp)" font-weight="700">${Math.round(pct*100)}%</text>
-    <text y="17" text-anchor="middle" font-size="10" fill="var(--soft)">${cov.covered}/${cov.total} tools</text></g></svg>`;
+    <text y="17" text-anchor="middle" font-size="10" fill="var(--soft)">${esc(cov.covered)}/${esc(cov.total)} tools</text></g></svg>`;
 }
 function latency(mount, L){
   const host=document.getElementById(mount);
@@ -469,7 +470,7 @@ function latency(mount, L){
   const rows=[["p50",L.p50],["p95",L.p95],["p99",L.p99]];const max=Math.max(L.budget,L.p99)*1.1;
   host.innerHTML='<div style="padding:8px 2px 2px">'+rows.map(([k,v])=>{
     const w=Math.min(100,v/max*100),bw=L.budget/max*100,col=v<=L.budget?"var(--good)":"var(--bad)";
-    return `<div style="margin:11px 0"><div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;color:var(--soft)"><span>${k}</span><span style="color:${col}">${v} ms</span></div>
+    return `<div style="margin:11px 0"><div style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;color:var(--soft)"><span>${esc(k)}</span><span style="color:${col}">${esc(v)} ms</span></div>
       <div style="position:relative;height:10px;background:var(--raise);border-radius:5px;margin-top:3px">
       <div style="position:absolute;left:${bw}%;top:-3px;bottom:-3px;width:2px;background:var(--warn)"></div>
       <div style="width:${w}%;height:100%;background:${col};border-radius:5px"></div></div></div>`;
@@ -482,10 +483,10 @@ function security(mount, s){
   host.innerHTML=`<div class="shield">
     <div class="shieldbig" style="color:${clean?'var(--good)':'var(--bad)'}">${clean?'0':s.infections}</div>
     <div class="shieldrows">
-      <div class="shrow"><span>infections that spread</span><b style="color:${clean?'var(--good)':'var(--bad)'}">${s.infections}${clean?' ✓':''}</b></div>
-      <div class="shrow"><span>poisoned memories injected</span><b>${s.injected}</b></div>
-      <div class="shrow"><span>convicted / quarantined</span><b>${s.blocked}</b></div>
-      <div class="shrow"><span>groupthink cascades</span><b style="color:${(s.cascades||0)===0?'var(--good)':'var(--bad)'}">${s.cascades||0}</b></div>
+      <div class="shrow"><span>infections that spread</span><b style="color:${clean?'var(--good)':'var(--bad)'}">${esc(s.infections)}${clean?' ✓':''}</b></div>
+      <div class="shrow"><span>poisoned memories injected</span><b>${esc(s.injected)}</b></div>
+      <div class="shrow"><span>convicted / quarantined</span><b>${esc(s.blocked)}</b></div>
+      <div class="shrow"><span>groupthink cascades</span><b style="color:${(s.cascades||0)===0?'var(--good)':'var(--bad)'}">${esc(s.cascades||0)}</b></div>
     </div></div>`;
 }
 function continuity(mount, cyc){
@@ -493,15 +494,15 @@ function continuity(mount, cyc){
   if(!cyc||!cyc.length){host.innerHTML='<div class="await">awaiting hard kill cycles<br>· resume-from-cold test ·</div>';return;}
   const ok=cyc.filter(c=>c.retained).length;
   host.innerHTML=`<div style="font-family:var(--mono);font-size:12px;color:var(--soft);margin-bottom:8px">${ok}/${cyc.length} cold restarts recovered mission + resumed exactly where it left off</div>
-  <div class="cyc">`+cyc.map(c=>`<div class="cyccell"><div class="n">cycle ${c.cycle}</div><div class="ck">${c.retained?'✓':'✕'}</div><div class="ms">${c.resume_ms!=null?c.resume_ms+'ms':''}</div></div>`).join("")+`</div>`;
+  <div class="cyc">`+cyc.map(c=>`<div class="cyccell"><div class="n">cycle ${esc(c.cycle)}</div><div class="ck">${c.retained?'✓':'✕'}</div><div class="ms">${esc(c.resume_ms!=null?c.resume_ms+'ms':'')}</div></div>`).join("")+`</div>`;
 }
 function campaignsPanel(g){
   const host=document.getElementById("campaignsPanel"); if(!host) return;
   if(!g||!g.campaigns){host.innerHTML='<p class="cap">campaign data not measurable this pass</p>';return;}
-  const fl=fs=>(fs||[]).map(f=>`<a href="${esc(f.url)}" title="${esc(f.title)}">#${f.number}${f.state==="OPEN"?"":" (closed)"}</a>`).join(" ");
+  const fl=fs=>(fs||[]).map(f=>`<a href="${esc(safeUrl(f.url))}" title="${esc(f.title)}">#${esc(f.number)}${f.state==="OPEN"?"":" (closed)"}</a>`).join(" ");
   let h=`<p style="margin:0 0 10px"><b style="color:${g.closed>=g.total?"var(--good)":"var(--warn)"}">${esc(g.gate)}</b> &middot; cells ticked ${g.cells_done}/${g.cells_total}</p>`;
   g.campaigns.forEach(r=>{const s=r.summary||{};
-    h+=`<h4 style="margin:14px 0 4px">Campaign ${esc(r.letter)} &mdash; <a href="${esc(r.url)}">#${r.n}</a> ${esc(r.title)}</h4>`+
+    h+=`<h4 style="margin:14px 0 4px">Campaign ${esc(r.letter)} &mdash; <a href="${esc(safeUrl(r.url))}">#${esc(r.n)}</a> ${esc(r.title)}</h4>`+
        `<p class="cap" style="margin:0 0 6px">state <b>${esc(r.state)}</b> &middot; cells ${s.cells_done}/${s.cells_total} &middot; findings open ${s.findings_open} / closed ${s.findings_closed}${(r.findings||[]).length?" &middot; campaign-level findings: "+fl(r.findings):""}</p>`;
     h+=`<table class="agents"><thead><tr><th>cell</th><th>test</th><th>backend</th><th>state</th><th>findings</th></tr></thead><tbody>`+
        (r.cells||[]).map(c=>`<tr><td><code>${esc(c.id)}</code></td><td>${esc(c.text)}</td><td>${esc(c.backend)}</td><td style="font-weight:600;color:${c.state==="done"?"var(--good)":"var(--warn)"}">${esc(c.state)}</td><td>${fl(c.findings)}</td></tr>`).join("")+`</tbody></table>`;});
@@ -511,14 +512,14 @@ function board(dims){
   const b=document.getElementById("board"); b.innerHTML="";
   dims.forEach(x=>{const cls=x.s==="done"?"done":x.s==="run"?"run":x.s==="stale"?"stale":x.s==="fail"?"fail":"";
     const card=el("div","dim "+cls);
-    card.innerHTML=`<div class="dimhead"><h3>${x.n}</h3><span class="st ${x.s}">${LABEL[x.s]||x.s}</span></div><div class="d">${x.d||""}</div><div class="m">${x.m||""}</div>`;
+    card.innerHTML=`<div class="dimhead"><h3>${esc(x.n)}</h3><span class="st ${esc(x.s)}">${esc(LABEL[x.s]||x.s)}</span></div><div class="d">${esc(x.d||"")}</div><div class="m">${esc(x.m||"")}</div>`;
     b.appendChild(card);});
 }
 function feed(evs){
   const f=document.getElementById("feed");f.innerHTML="";
   evs.slice().sort((a,b)=>(b.t||"").localeCompare(a.t||"")).slice(0,40).forEach(e=>{
     const row=el("div","ev");const tm=(e.t||"").replace("T"," ").replace("Z","").slice(5,16);
-    row.innerHTML=`<time>${tm}</time><span class="k ${e.k||'info'}">${(e.k||'info').toUpperCase()}</span><span>${e.x||""}</span>`;
+    row.innerHTML=`<time>${esc(tm)}</time><span class="k ${esc(e.k||'info')}">${esc((e.k||'info').toUpperCase())}</span><span>${esc(e.x||"")}</span>`;
     f.appendChild(row);});
 }
 
@@ -533,13 +534,13 @@ function hardwareMonitor(hw){
   host.innerHTML='<div class="hwnodes">'+hw.nodes.map(n=>{
     const led=n.status==='up'?'var(--good)':n.status==='pressure'?'var(--warn)':'var(--bad)';
     return `<div class="hwnode">
-      <div class="hwtop"><span class="hwled" style="background:${led}"></span><b>${n.id}</b><span class="hwos">${n.os}</span><span class="hwrole">${n.role}</span></div>
-      ${n.gpu?`<div class="hwgpu">⚡ ${n.gpu}</div>`:`<div class="hwgpu off">CPU-only · no GPU/NPU</div>`}
+      <div class="hwtop"><span class="hwled" style="background:${led}"></span><b>${esc(n.id)}</b><span class="hwos">${esc(n.os)}</span><span class="hwrole">${esc(n.role)}</span></div>
+      ${n.gpu?`<div class="hwgpu">⚡ ${esc(n.gpu)}</div>`:`<div class="hwgpu off">CPU-only · no GPU/NPU</div>`}
       <div class="hwmetric"><span class="hwk">RAM</span>${hwBar(n.ram_used,n.ram_total)}<span class="hwv">${n.ram_used}/${n.ram_total} GB</span></div>
       <div class="hwmetric"><span class="hwk">Disk</span>${hwBar(n.disk_total-n.disk_free,n.disk_total)}<span class="hwv">${n.disk_free} GB free</span></div>
-      <div class="hwfoot"><span class="hwchip">✓ ${n.datatier}</span><span class="hwmem">${(n.memories||0).toLocaleString()} mem</span></div>
+      <div class="hwfoot"><span class="hwchip">✓ ${esc(n.datatier)}</span><span class="hwmem">${(n.memories||0).toLocaleString()} mem</span></div>
     </div>`;
-  }).join('')+'</div>'+(hw.link?`<div class="hwlink">🔒 ${hw.link.proto}${hw.link.status?' · '+hw.link.status:''}</div>`:'');
+  }).join('')+'</div>'+(hw.link?`<div class="hwlink">🔒 ${esc(hw.link.proto)}${esc(hw.link.status?' · '+hw.link.status:'')}</div>`:'');
 }
 /* ---------- DigitalOcean cloud monitor ---------- */
 function cloudMonitor(cloud){
@@ -550,10 +551,10 @@ function cloudMonitor(cloud){
   host.innerHTML=`<div class="dostats">
       <div class="dostat"><div class="dov">$${(cloud.credit_usd-(cloud.used_usd||0)).toFixed(2)}</div><div class="dol">credit of $${cloud.credit_usd}</div></div>
       <div class="dostat"><div class="dov">${drops.length}/${lim}</div><div class="dol">droplets active</div></div>
-      <div class="dostat"><div class="dov">${cloud.region||'—'}</div><div class="dol">region</div></div>
+      <div class="dostat"><div class="dov">${esc(cloud.region||'—')}</div><div class="dol">region</div></div>
     </div>
-    <div class="doconfigs">`+(cloud.configs||[]).map(c=>`<div class="docfg ${c.status}"><span class="docn">${c.name}</span><span class="docd">${c.desc}</span><span class="docs">${c.status}</span></div>`).join('')+`</div>`
-    +(drops.length?`<div class="dodroplets">`+drops.map(d=>`<div class="dodrop ${d.status||'up'}" title="${d.name||''}"></div>`).join('')+`</div>`
+    <div class="doconfigs">`+(cloud.configs||[]).map(c=>`<div class="docfg ${esc(c.status)}"><span class="docn">${esc(c.name)}</span><span class="docd">${esc(c.desc)}</span><span class="docs">${esc(c.status)}</span></div>`).join('')+`</div>`
+    +(drops.length?`<div class="dodroplets">`+drops.map(d=>`<div class="dodrop ${esc(d.status||'up')}" title="${esc(d.name||'')}"></div>`).join('')+`</div>`
                   :`<div class="doidle">no droplets provisioned — DO phase runs after hardware testing</div>`);
 }
 
@@ -565,9 +566,9 @@ function comms(c){
   host.innerHTML='<div class="comms">'+c.legs.map(l=>{
     const has=l.ms!=null,w=has?Math.max(3,l.ms/max*100):0;
     return `<div class="crow">
-      <div class="cinfo"><span class="cname">${l.name}</span><span class="cenc">🔒 ${l.enc}</span>${l.note?`<span class="cnote">${l.note}</span>`:''}</div>
+      <div class="cinfo"><span class="cname">${esc(l.name)}</span><span class="cenc">🔒 ${esc(l.enc)}</span>${l.note?`<span class="cnote">${esc(l.note)}</span>`:''}</div>
       <div class="ctrack"><div class="cbar" style="width:${w.toFixed(0)}%;background:${has?'var(--good)':'var(--dim)'}"></div></div>
-      <div class="cval" style="color:${has?'var(--ink)':'var(--dim)'}">${has?l.ms+' ms':'not wired'}${l.rate!=null?`<div style="font-size:11px;color:${l.rate>0?'var(--good)':'var(--soft)'}">${l.rate>0?'● ':'○ '}${l.rate}${l.name.indexOf('OpenRouter')>=0?' $/h':' /s'} live</div>`:''}${l.req!=null?`<div style="font-size:10px;color:var(--soft)">${Number(l.req).toLocaleString()} total</div>`:''}</div></div>`;
+      <div class="cval" style="color:${has?'var(--ink)':'var(--dim)'}">${esc(has?l.ms+' ms':'not wired')}${l.rate!=null?`<div style="font-size:11px;color:${l.rate>0?'var(--good)':'var(--soft)'}">${l.rate>0?'● ':'○ '}${esc(l.rate)}${l.name.indexOf('OpenRouter')>=0?' $/h':' /s'} live</div>`:''}${l.req!=null?`<div style="font-size:10px;color:var(--soft)">${Number(l.req).toLocaleString()} total</div>`:''}</div></div>`;
   }).join('')+'</div>';
 }
 
@@ -581,9 +582,9 @@ function issues(list){
     const pipe=ISTAGES.map((s,i)=>`<span class="pstage ${i<si?'done':i===si?'cur':''}"><em>${s}</em></span>`).join('');
     const done=it.stage==="verified";
     return `<div class="issue">
-      <div class="ihead"><a href="https://github.com/alphaonedev/ai-memory-mcp/issues/${it.num}" target="_blank" rel="noopener">#${it.num}</a>
-        <span class="ititle">${it.title}</span><span class="istage ${done?'ok':''}">${it.stage}</span></div>
-      <div class="pipe">${pipe}</div>${it.note?`<div class="inote">${it.note}</div>`:''}</div>`;
+      <div class="ihead"><a href="https://github.com/alphaonedev/ai-memory-mcp/issues/${esc(it.num)}" target="_blank" rel="noopener">#${esc(it.num)}</a>
+        <span class="ititle">${esc(it.title)}</span><span class="istage ${done?'ok':''}">${esc(it.stage)}</span></div>
+      <div class="pipe">${pipe}</div>${it.note?`<div class="inote">${esc(it.note)}</div>`:''}</div>`;
   }).join('')+'</div>';
 }
 
@@ -603,10 +604,10 @@ function agentsPanel(list, asOf, stale){
     if(m===null||m===undefined) return `<span style="color:var(--soft)">not measured</span>`;
     const c = m>=120 ? "var(--bad)" : (m>=45 ? "var(--warn,#c80)" : "var(--soft)");
     const t = m<1 ? "just now" : (m<60 ? m+"m ago" : Math.floor(m/60)+"h "+(m%60)+"m ago");
-    return `<span style="color:${c}">${t}</span>`;
+    return `<span style="color:${c}">${esc(t)}</span>`;
   };
-  const rows=list.map(a=>`<tr><td>${a.node}</td><td><code>${a.agent}</code></td><td>${a.model}</td><td>${a.sector}</td>`
-    +`<td style="color:${col[a.state]||"var(--soft)"};font-weight:600">${a.state}</td>`
+  const rows=list.map(a=>`<tr><td>${esc(a.node)}</td><td><code>${esc(a.agent)}</code></td><td>${esc(a.model)}</td><td>${esc(a.sector)}</td>`
+    +`<td style="color:${esc(col[a.state]||"var(--soft)")};font-weight:600">${esc(a.state)}</td>`
     +`<td>${quiet(a.quiet_min)}</td></tr>`).join("");
   host.innerHTML=`<table class="agents"><thead><tr><th>node</th><th>agent</th><th>model</th><th>sector of work</th><th>state</th><th>last wrote</th></tr></thead><tbody>${rows}</tbody></table>`
     +`<div class="ringsub" style="margin-top:6px">node, state and last-wrote measured live; sector maintained by the conductor, <b${stale?' style="color:var(--warn)"':''}>${asOf?("as of "+esc(asOf)+(stale?" \u2014 STALE (older than 7 days)":"")):"no dated evidence"}</b>. "last wrote" is the newest file mtime under that lane's scratch directory &mdash; a lane doing work writes logs. It is not available for f1, which is a separate host.</div>`;
@@ -637,7 +638,7 @@ function renderPillars(dims){
   const cells=PILLARS.map(p=>{const mine=dims.filter(d=>p.keys.some(k=>d.n.toLowerCase().includes(k)));
     const green=mine.filter(d=>d.s==="done").length,tot=mine.length||1;return {name:p.name,green,tot,frac:green/tot};});
   if(host.childElementCount!==cells.length){host.innerHTML=""; cells.forEach((c,i)=>{
-    const b=el("div","pgauge"); b.innerHTML=`<div class="pname">${c.name}</div><svg width="100" height="58" viewBox="0 0 100 58" id="pg${i}"></svg><div class="psub" id="pgs${i}"></div>`;
+    const b=el("div","pgauge"); b.innerHTML=`<div class="pname">${esc(c.name)}</div><svg width="100" height="58" viewBox="0 0 100 58" id="pg${i}"></svg><div class="psub" id="pgs${i}"></div>`;
     host.appendChild(b);});}
   cells.forEach((c,i)=>{const pct=Math.round(c.frac*100),r=38,cx=50,cy=50,circ=Math.PI*r,off=circ*(1-c.frac);
     const color=c.frac>=1?"var(--good)":c.frac>0?"var(--run)":"var(--dim)";
@@ -682,8 +683,8 @@ function federation(f){
   Object.values(N).forEach(nd=>{nodes+=`<g transform="translate(${nd.x},${nd.y})">
     <circle r="25" fill="none" stroke="var(--good)" stroke-width="1.5" opacity="${window.__RUN===true?'.28':'0'}"><animate attributeName="r" from="25" to="33" dur="2.6s" repeatCount="indefinite"/><animate attributeName="opacity" from=".28" to="0" dur="2.6s" repeatCount="indefinite"/></circle>
     <circle r="25" fill="var(--panel2)" stroke="var(--good)" stroke-width="2"/>
-    <text y="-2" text-anchor="middle" font-size="9.5" font-weight="700" fill="var(--ink)" font-family="var(--disp)">${nd.label}</text>
-    <text y="9" text-anchor="middle" font-size="7.5" fill="var(--soft)" font-family="var(--mono)">${nd.sub}</text></g>`;});
+    <text y="-2" text-anchor="middle" font-size="9.5" font-weight="700" fill="var(--ink)" font-family="var(--disp)">${esc(nd.label)}</text>
+    <text y="9" text-anchor="middle" font-size="7.5" fill="var(--soft)" font-family="var(--mono)">${esc(nd.sub)}</text></g>`;});
   const opCount=legs.filter(l=>l.up!==false).length;
   const legend=`<text x="10" y="${H-7}" font-size="9" fill="var(--good)" font-family="var(--mono)">🔒 ${opCount}/3 encrypted legs operational · all data in transit encrypted</text>`;
   host.innerHTML=`<svg viewBox="0 0 ${W} ${H}" width="100%">${links}${pulses}${badges}${nodes}${legend}</svg>`;
@@ -697,7 +698,7 @@ function a2aflow(a){
      <span style="font-family:var(--disp);font-weight:700;font-size:30px;color:var(--acc)">${fmt(a.rate)}</span>
      <span style="font-family:var(--mono);font-size:12px;color:var(--soft)">msg/s · ${fmt(a.total)} total</span></div>`
    +types.map(([k,v])=>`<div style="margin:7px 0;font-family:var(--mono);font-size:11px">
-      <div style="display:flex;justify-content:space-between;color:var(--soft)"><span>${k}</span><span style="color:var(--ink)">${fmt(v)}</span></div>
+      <div style="display:flex;justify-content:space-between;color:var(--soft)"><span>${esc(k)}</span><span style="color:var(--ink)">${fmt(v)}</span></div>
       <div style="height:7px;background:var(--raise);border-radius:4px;margin-top:2px"><div style="width:${(v/max*100).toFixed(0)}%;height:100%;background:var(--acc);border-radius:4px"></div></div></div>`).join("");
 }
 /* ---------- startup / boot latency ---------- */
@@ -706,20 +707,20 @@ function bootPanel(b){
   if(!b||b.mcp_ready_ms==null){host.innerHTML='<div class="await">awaiting boot measurement</div>';return;}
   const phases=b.phases||[],tot=phases.reduce((s,p)=>s+p.ms,0)||b.mcp_ready_ms,cols=['var(--good)','var(--run)','var(--viol)','var(--warn)'];
   host.innerHTML=`<div class="boot">
-    <div class="bootbig"><span class="n">${b.mcp_ready_ms}</span><span class="u">ms to MCP-ready</span>
-      <span class="lb">cold ${b.cold_ms!=null?b.cold_ms+'ms':'—'}<br>warm ${b.warm_ms!=null?b.warm_ms+'ms':'—'}</span></div>
+    <div class="bootbig"><span class="n">${esc(b.mcp_ready_ms)}</span><span class="u">ms to MCP-ready</span>
+      <span class="lb">cold ${esc(b.cold_ms!=null?b.cold_ms+'ms':'—')}<br>warm ${esc(b.warm_ms!=null?b.warm_ms+'ms':'—')}</span></div>
     <div class="bootbar">${phases.map((p,i)=>`<i style="width:${(p.ms/tot*100).toFixed(1)}%;background:${cols[i%cols.length]}"></i>`).join('')}</div>
-    ${phases.map((p,i)=>`<div class="bootrow"><span style="color:${cols[i%cols.length]}">■</span><span style="flex:1;margin-left:6px">${p.name}</span><b>${p.ms} ms</b></div>`).join('')}
-    <div class="bootrow"><span style="flex:1;color:var(--good)">${b.note||'backfill runs in background — never blocks init (#3329)'}</span></div></div>`;
+    ${phases.map((p,i)=>`<div class="bootrow"><span style="color:${cols[i%cols.length]}">■</span><span style="flex:1;margin-left:6px">${esc(p.name)}</span><b>${esc(p.ms)} ms</b></div>`).join('')}
+    <div class="bootrow"><span style="flex:1;color:var(--good)">${esc(b.note||'backfill runs in background — never blocks init (#3329)')}</span></div></div>`;
 }
 /* ---------- operation latency ---------- */
 function opLatency(ops){
   const host=document.getElementById("oplatpanel");
   if(!ops||!ops.length){host.innerHTML='<div class="await">awaiting bench<br>· store · recall · search · embed · rerank · sign ·</div>';return;}
   const max=Math.max(...ops.map(o=>o.p99))*1.1||1;
-  host.innerHTML='<div class="oplat">'+ops.map(o=>`<div class="row"><span class="nm">${o.op}</span>
+  host.innerHTML='<div class="oplat">'+ops.map(o=>`<div class="row"><span class="nm">${esc(o.op)}</span>
      <span class="track"><i class="p99" style="width:${(o.p99/max*100).toFixed(0)}%"></i><i class="p95" style="width:${(o.p95/max*100).toFixed(0)}%"></i><i class="p50" style="width:${(o.p50/max*100).toFixed(0)}%"></i></span>
-     <span class="vv">${o.p50}/${o.p95}/${o.p99}</span></div>`).join('')
+     <span class="vv">${esc(o.p50)}/${esc(o.p95)}/${esc(o.p99)}</span></div>`).join('')
    +'<div style="font-family:var(--mono);font-size:10px;color:var(--soft);margin-top:8px">ms · p50 / p95 / p99 · green p50 · blue p95 · amber p99</div></div>';
 }
 
@@ -727,8 +728,8 @@ function opLatency(ops){
 function aiUsage(mount, u){
   const host=document.getElementById(mount); if(!host) return;
   if(!u){host.innerHTML='<div class="await">awaiting usage snapshots</div>';return;}
-  const rows=(u.runs||[]).slice().sort((a,b)=>(b.ts||"").localeCompare(a.ts||"")).slice(0,8).map(r=>`<div class="row" style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;padding:3px 0;border-bottom:1px solid var(--line)"><span>${r.run}</span><span>${r.duration_s!=null?r.duration_s+'s':''}</span><span style="color:${r.cost_usd==null?'var(--soft)':'var(--ink)'}">${r.cost_usd==null?'n/a':'$'+r.cost_usd.toFixed(3)}</span></div>`).join("");
-  host.innerHTML=`<div style="font-family:var(--mono);font-size:12px;color:var(--soft);margin-bottom:6px">today <b style="color:var(--ink)">$${(u.usage_today_usd||0).toFixed(2)}</b> · week $${(u.usage_week_usd||0).toFixed(2)} · lifetime $${(u.usage_total_usd||0).toFixed(2)} of ${u.credits_total_usd} credits · as of ${(u.asOf||'').replace('T',' ')}</div>${rows}<div style="font-family:var(--mono);font-size:10px;color:var(--soft);margin-top:8px">${u.note||''}</div>`;
+  const rows=(u.runs||[]).slice().sort((a,b)=>(b.ts||"").localeCompare(a.ts||"")).slice(0,8).map(r=>`<div class="row" style="display:flex;justify-content:space-between;font-family:var(--mono);font-size:11px;padding:3px 0;border-bottom:1px solid var(--line)"><span>${esc(r.run)}</span><span>${esc(r.duration_s!=null?r.duration_s+'s':'')}</span><span style="color:${r.cost_usd==null?'var(--soft)':'var(--ink)'}">${r.cost_usd==null?'n/a':'$'+r.cost_usd.toFixed(3)}</span></div>`).join("");
+  host.innerHTML=`<div style="font-family:var(--mono);font-size:12px;color:var(--soft);margin-bottom:6px">today <b style="color:var(--ink)">$${(u.usage_today_usd||0).toFixed(2)}</b> · week $${(u.usage_week_usd||0).toFixed(2)} · lifetime $${(u.usage_total_usd||0).toFixed(2)} of ${esc(u.credits_total_usd)} credits · as of ${esc((u.asOf||'').replace('T',' '))}</div>${rows}<div style="font-family:var(--mono);font-size:10px;color:var(--soft);margin-top:8px">${esc(u.note||'')}</div>`;
 }
 
 /* ---------- top-level render ---------- */
