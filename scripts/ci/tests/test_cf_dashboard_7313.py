@@ -18,8 +18,11 @@ import subprocess as sp
 import sys
 import tempfile
 import unittest
+import unittest.mock
+from html.parser import HTMLParser
 from pathlib import Path
-from unittest import mock
+
+mock = unittest.mock
 
 REPO = Path(__file__).resolve().parents[3]
 DASH = REPO / "infra" / "cf-dashboard"
@@ -224,25 +227,47 @@ class WranglerTimeout7313(unittest.TestCase):
             self.assertEqual(mod.main(), 1)
 
 
-TAG_RE = re.compile(r"<(?:link|script|img|iframe)\b[^>]*>", re.IGNORECASE)
-ORIGIN_RE = re.compile(r"https://[a-z0-9.-]+", re.IGNORECASE)
-PRECONNECT_RE = re.compile(r"""rel\s*=\s*["']?preconnect""", re.IGNORECASE)
+URL_ATTRS = ("src", "href", "data")
+ORIGIN_RE = re.compile(r"^(?:https:)?//([a-z0-9.-]+)", re.IGNORECASE)
+
+
+class _OriginParser(HTMLParser):
+    """Collect external https origins from resource-loading tags with a real HTML parser
+    (tag and attribute names arrive lower-cased, attribute values are entity-unescaped)."""
+
+    TAGS = frozenset(("link", "script", "img", "iframe", "source", "video", "audio", "embed", "object"))
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.found = set()
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in self.TAGS:
+            return
+        attrs = {k: (v or "") for k, v in attrs}
+        if tag == "link" and "preconnect" in attrs.get("rel", "").lower().split():
+            return
+        values = [attrs[k] for k in URL_ATTRS if k in attrs]
+        if "srcset" in attrs:
+            values.extend(c.split()[0] for c in attrs["srcset"].split(",") if c.split())
+        for value in values:
+            m = ORIGIN_RE.match(value.strip())
+            if m:
+                self.found.add("https://" + m.group(1).lower())
 
 
 def loaded_origins(html):
-    """External https origins a page loads, matched case-insensitively (HTML tag and
-    attribute names are case-insensitive; origins are returned lower-cased)."""
-    found = set()
-    for tag in TAG_RE.findall(html):
-        if PRECONNECT_RE.search(tag):
-            continue
-        head = re.split("data:image", tag, maxsplit=1, flags=re.IGNORECASE)[0]
-        found.update(o.lower() for o in ORIGIN_RE.findall(head))
-    return found
+    """External https origins a page loads (protocol-relative //host counts as https)."""
+    parser = _OriginParser()
+    parser.feed(html)
+    parser.close()
+    return parser.found
 
 
 class LoadedOriginsCase7313(unittest.TestCase):
-    """CodeQL py/bad-tag-filter: upper/mixed-case tags must not escape the CSP origin check."""
+    """CodeQL py/bad-tag-filter: no tag regex; mixed-case and odd-shape tags must not escape the CSP check.
+    Red-first: the reviewer ran test_mixed_case_tags_are_detected against the pre-fix helper in a
+    throwaway worktree and it failed there (REVIEW-7314-combined-r2, red_green.py)."""
 
     def test_mixed_case_tags_are_detected(self):
         page = ('<SCRIPT SRC="https://Evil.Example/x.js"></SCRIPT>'
@@ -253,10 +278,44 @@ class LoadedOriginsCase7313(unittest.TestCase):
         self.assertEqual(loaded_origins(page),
                          {"https://evil.example", "https://css.example", "https://img.example"})
 
-    def test_old_case_sensitive_filter_misses_them(self):
-        page = '<SCRIPT SRC="https://evil.example/x.js"></SCRIPT>'
-        self.assertEqual(re.findall(r"<(?:link|script|img|iframe)\b[^>]*>", page), [])
-        self.assertEqual(loaded_origins(page), {"https://evil.example"})
+    def test_quoted_gt_before_src(self):
+        self.assertEqual(loaded_origins('<script data-x="a>b" src="https://gt.example/a.js"></script>'),
+                         {"https://gt.example"})
+
+    def test_data_rel_preconnect_does_not_skip(self):
+        self.assertEqual(loaded_origins('<script data-rel="preconnect" src="https://dr.example/a.js"></script>'),
+                         {"https://dr.example"})
+
+    def test_rel_preconnect_in_url_does_not_skip(self):
+        self.assertEqual(loaded_origins('<link href="https://q.example/a.css?rel=preconnect">'),
+                         {"https://q.example"})
+
+    def test_data_image_text_before_src(self):
+        self.assertEqual(loaded_origins('<img alt="data:image" src="https://alt.example/p.png">'),
+                         {"https://alt.example"})
+
+    def test_entity_encoded_colon(self):
+        self.assertEqual(loaded_origins('<script src="https&#58;//enc.example/a.js"></script>'),
+                         {"https://enc.example"})
+
+    def test_protocol_relative_host(self):
+        self.assertEqual(loaded_origins('<script src="//rel.example/a.js"></script>'),
+                         {"https://rel.example"})
+
+    def test_media_and_embed_tags(self):
+        page = ('<video src="https://v.example/a.mp4"><source src="https://s.example/a.mp4"></video>'
+                '<audio src="https://a.example/a.ogg"></audio><embed src="https://e.example/a">'
+                '<object data="https://o.example/a"></object>'
+                '<img srcset="https://set.example/1.png 1x, //set2.example/2.png 2x">')
+        self.assertEqual(loaded_origins(page), {"https://v.example", "https://s.example",
+                                                "https://a.example", "https://e.example",
+                                                "https://o.example", "https://set.example",
+                                                "https://set2.example"})
+
+    def test_preconnect_and_data_uri_and_relative_are_skipped(self):
+        page = ('<link rel="preconnect stylesheet" href="https://pre.example">'
+                '<img src="data:image/png;base64,AAAA"><script src="/local.js"></script>')
+        self.assertEqual(loaded_origins(page), set())
 
 
 class HtmlAndHeaders7313(unittest.TestCase):
