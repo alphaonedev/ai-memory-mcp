@@ -129,6 +129,10 @@ struct TxnFrame {
     /// stable and unique for the frame's whole life.
     conn_addr: usize,
     deferred: Vec<DeferredEscalation>,
+    /// #6132 - the loss of this frame's `deferred` intents was already
+    /// reported (open-time stale-frame report); the thread-exit report skips
+    /// it so one lost write is reported once.
+    reported: bool,
     /// #7241 - the off-table audit anchors of signed-event appends made by
     /// nested funnels inside this transaction: emitted when it COMMITS,
     /// dropped unrecorded when it rolls back.
@@ -141,7 +145,12 @@ struct Frames(Vec<TxnFrame>);
 
 impl Drop for Frames {
     fn drop(&mut self) {
-        let lost: usize = self.0.iter().map(|f| f.deferred.len()).sum();
+        let lost: usize = self
+            .0
+            .iter()
+            .filter(|f| !f.reported)
+            .map(|f| f.deferred.len())
+            .sum();
         if lost > 0 {
             // No debug_assert here: a panic in a TLS destructor aborts. This
             // runs at thread exit, in thread-local destructor order (reverse
@@ -204,11 +213,15 @@ fn forced_failure() -> bool {
 pub(super) fn report_stale_frames(conn: &Connection) {
     let db_path = conn.path().filter(|p| !p.is_empty()).map(str::to_string);
     let stale = TXN_FRAMES.with(|frames| {
-        frames
-            .borrow()
-            .0
-            .iter()
-            .any(|f| f.db_path == db_path && db_path.is_some() && !f.deferred.is_empty())
+        let mut stale = false;
+        for f in &mut frames.borrow_mut().0 {
+            if f.db_path == db_path && db_path.is_some() && !f.deferred.is_empty() {
+                // #6132 - this report covers the frame; thread exit skips it.
+                f.reported = true;
+                stale = true;
+            }
+        }
+        stale
     });
     if stale {
         tracing::error!(
@@ -230,6 +243,7 @@ pub(super) fn open_frame(conn: &Connection) -> u64 {
             db_path,
             conn_addr: std::ptr::from_ref(conn).addr(),
             deferred: Vec::new(),
+            reported: false,
             anchor: crate::governance::audit::PendingAuditAnchor::none(),
         });
     });
