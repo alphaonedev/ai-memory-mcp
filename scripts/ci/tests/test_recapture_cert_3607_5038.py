@@ -816,7 +816,7 @@ class OperatorKeySymlinks7508(SymlinkBase):
             with self.subTest(name=name):
                 outside = self.outside()
                 keys = self.fix() / 'keys'
-                keys.mkdir(parents=True)
+                keys.mkdir(parents=True, exist_ok=True)
                 (keys / name).symlink_to(outside / name)
                 done, _ = self.run_recapture()
                 self.assert_failed_closed(done, outside)
@@ -856,8 +856,9 @@ class SwapDuringRun7509(SymlinkBase):
         (self.root / 'd').mkdir()
         (self.root / 'd' / 'link').symlink_to(outside / 'f')
         (self.root / 'plink').symlink_to(outside)
-        with self.assertRaises(OSError):
-            module.write_file(self.root / 'd' / 'link', b'secret')
+        module.write_file(self.root / 'd' / 'link', b'secret')  # the link is replaced, not followed
+        self.assertFalse((self.root / 'd' / 'link').is_symlink())
+        self.assertEqual((self.root / 'd' / 'link').read_bytes(), b'secret')
         with self.assertRaises(OSError):
             module.write_file(self.root / 'plink' / 'f', b'secret')
         self.assertEqual(list(outside.iterdir()), [])

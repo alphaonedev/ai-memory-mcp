@@ -29,12 +29,24 @@ shell ran it through /bin/sh, this script fails closed instead (#7464). When leg
 `missing`, a `posture-sqlcipher-pass.out` left by an earlier run is removed and the
 summary says so; the shell left the stale file in the bundle and counted it
 (deliberate divergence, #7463; decision: a bundle must never carry a leg-4 capture
-that this run did not produce). A symlinked .local-runs, fixtures directory, keys
-directory or fixture file is refused before anything is written (#7462). The shell script's
+that this run did not produce). A symlink anywhere under .local-runs/cert-3607-fixtures (the keys
+directory, the operator key pair keygen writes, any fixture file) or at .local-runs itself
+is refused before anything is written (#7462, #7508) and again after keygen and before
+leg 4 (#7509). Every file the script writes (fixtures, the db passphrase, captures,
+evidence) is created fresh with O_NOFOLLOW|O_EXCL, walking the path from the repo root
+without following a symlink, so a link swapped in mid-run fails closed with exit 1
+instead of redirecting the write; the passphrase is created 0600 and never replaced
+(decision: unlink-then-create-exclusive over truncating in place, because O_EXCL cannot
+truncate through a link; secrets are 0600, evidence files take the umask default as the
+shell redirect did). HOME must be an absolute path, not `/`, without a `:`: a relative
+or empty HOME would turn the HOME sanitizer pattern into a substring rewrite of the
+evidence and a colon would add a cwd entry to the child PATH (#7510); the run is refused
+with exit 1 before any write. The sanitizer replaces whole path components only. The shell script's
 defaults named build directories of one build host; they are replaced by
 repo-relative ones. Exit codes: 0 success; 1 DEFAULT_BIN is not an executable
-file, TMPDIR (or the default scratch directory) is outside <repo-root>/.local-runs, operator keygen failed, the git
-sha could not be read, or the transcript header date disagrees with the run
+file, TMPDIR (or the default scratch directory) is outside <repo-root>/.local-runs, HOME is
+not a usable absolute path, a fixture path is or became a symlink, operator keygen failed,
+the git sha could not be read, or the transcript header date disagrees with the run
 date; 2 unknown arguments.
 """
 import argparse
@@ -76,13 +88,16 @@ PASSPHRASE_BYTES = 32
 LOCAL_RUNS = ROOT / ".local-runs"
 DIR_MODE = 0o700
 KEY_FILE_MODE = 0o600
+PUBLIC_FILE_MODE = 0o666  # before the umask, like a shell redirect
+PATH_CHARS = rb"A-Za-z0-9_\-\x80-\xff"
 USAGE_EPILOG = (
     "Environment overrides: DEFAULT_BIN (default <repo>/target/release/ai-memory, must be "
     "an executable file; a value with a slash is relative to the repo root, a bare name is "
     "looked up on the child PATH), SQLCIPHER_BIN (default <repo>/target-sqlcipher/release/ai-memory; "
     "leg 4 is recorded as `missing` when absent), TMPDIR (must resolve under "
-    "<repo>/.local-runs, which must not be a symlink). Exit codes: 0 success; 1 preflight or capture failure; "
-    "2 unknown arguments."
+    "<repo>/.local-runs, which must not be a symlink). HOME must be an absolute path (not /, no ':'). "
+    "Fixtures and evidence are never written through a symlink. Exit codes: 0 success; "
+    "1 preflight or capture failure; 2 unknown arguments."
 )
 
 
@@ -115,17 +130,106 @@ def sanitize(raw):
     literal occurrence of a path the two agree; they differ only where the sed also
     rewrote a regex near-miss (a different character where the path has a `.`), which
     real output does not produce. Line endings, including CRLF and a missing final
-    newline, are preserved exactly."""
-    out = raw.replace(str(ROOT).encode(), b"<repo-root>")
-    out = out.replace(str(FIX).encode(), SANITIZED_FIXTURE_LABEL.encode())
+    newline, are preserved exactly.
+
+    A path is replaced only as a whole run of path components: not when a path character
+    (letter, digit, `_`, `-`, `.`) directly precedes it, and not when a path character
+    or a `.` plus a path character follows it, so `/home/a` never rewrites `/home/ab`
+    or `/home/a.txt` (#7510). A trailing `/` on HOME is ignored."""
+    out = _replace_component(raw, str(ROOT), b"<repo-root>")
+    out = _replace_component(out, str(FIX), SANITIZED_FIXTURE_LABEL.encode())
     if HOME:
-        out = out.replace(HOME.encode(), b"<home>")
+        out = _replace_component(out, HOME, b"<home>")
     return out
+
+
+def _replace_component(raw, path, label):
+    """Replace path in raw by label where it is a whole run of path components."""
+    path = path.rstrip("/")
+    if not path:
+        return raw
+    pattern = re.compile(
+        rb"(?<![" + PATH_CHARS + rb"." + rb"])" + re.escape(path.encode())
+        + rb"(?![" + PATH_CHARS + rb"]|\.[" + PATH_CHARS + rb"])")
+    return pattern.sub(lambda _match: label, raw)
+
+
+def home_problem(home):
+    """A message when home cannot be a sanitizer pattern or a child PATH entry, else None."""
+    if not home:
+        return "HOME is empty or unset; set it to an absolute path"
+    if not os.path.isabs(home) or ":" in home or not home.rstrip("/"):
+        return ("HOME %s must be an absolute path that is not / and has no ':'; a relative or "
+                "empty HOME would rewrite substrings of the evidence" % home)
+    return None
 
 
 def shell_status(returncode):
     """Map a subprocess return code to the shell's `$?` (128+n for signals)."""
     return 128 - returncode if returncode < 0 else returncode
+
+
+def open_parent(path):
+    """(directory fd, name) for path, walking from ROOT without following any symlink."""
+    relative = Path(os.path.abspath(str(path))).relative_to(ROOT)
+    fd = os.open(str(ROOT), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in relative.parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+    except OSError:
+        os.close(fd)
+        raise
+    return fd, relative.name
+
+
+def open_new(path, mode=PUBLIC_FILE_MODE, replace=True):
+    """A write fd for a file created by this call (O_CREAT|O_EXCL|O_NOFOLLOW).
+
+    With replace, an existing entry is unlinked first (a symlink is removed, never
+    followed); a path swapped back in between the unlink and the create fails O_EXCL."""
+    parent, name = open_parent(path)
+    try:
+        if replace:
+            try:
+                os.unlink(name, dir_fd=parent)
+            except FileNotFoundError:
+                pass
+        return os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode,
+                       dir_fd=parent)
+    finally:
+        os.close(parent)
+
+
+def write_file(path, data, mode=PUBLIC_FILE_MODE, replace=True):
+    """Write data to a file this call creates; raises OSError instead of following a symlink."""
+    with os.fdopen(open_new(path, mode, replace), "wb") as handle:
+        handle.write(data)
+
+
+def read_file(path):
+    """The bytes of a regular file; raises OSError (ELOOP) for a symlink in any component."""
+    parent, name = open_parent(path)
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=parent)
+    finally:
+        os.close(parent)
+    with os.fdopen(fd, "rb") as handle:
+        return handle.read()
+
+
+def chmod_dir(path, mode=DIR_MODE):
+    """chmod a directory that is not a symlink, through a descriptor (no path swap window)."""
+    parent, name = open_parent(path)
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+    finally:
+        os.close(parent)
+    try:
+        os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
 
 
 def write_fixtures():
@@ -136,17 +240,16 @@ def write_fixtures():
 
     keys = FIX / "keys"
     keys.mkdir(parents=True, exist_ok=True)
-    os.chmod(keys, DIR_MODE)
+    chmod_dir(keys)
     signing_key = Ed25519PrivateKey.generate()
     priv = signing_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
     pub = signing_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    (keys / "ai-memory.priv").write_bytes(priv)
-    (keys / "ai-memory.pub").write_bytes(pub)
-    os.chmod(keys / "ai-memory.priv", KEY_FILE_MODE)
-    os.chmod(keys / "ai-memory.pub", KEY_FILE_MODE)
-    (FIX / "operator.pub.b64").write_text(base64.b64encode(pub).decode() + "\n")
-    (FIX / "peer-fingerprints.txt").write_text("peer-a.fleet.example " + PEER_FINGERPRINT + "\n")
-    (FIX / "peer-attestation.json").write_text(PEER_ATTESTATION)
+    write_file(keys / "ai-memory.priv", priv, KEY_FILE_MODE)
+    write_file(keys / "ai-memory.pub", pub, KEY_FILE_MODE)
+    write_file(FIX / "operator.pub.b64", (base64.b64encode(pub).decode() + "\n").encode())
+    write_file(FIX / "peer-fingerprints.txt",
+               ("peer-a.fleet.example " + PEER_FINGERPRINT + "\n").encode())
+    write_file(FIX / "peer-attestation.json", PEER_ATTESTATION.encode())
     print("fixtures ok", keys)
 
 
@@ -176,7 +279,7 @@ def run_capture(binary, args, env, raw_path, sanitized_path):
     the file or its interpreter is missing (as the shell did), 126 for other exec errors
     such as ENOEXEC (the shell ran those through /bin/sh; this script refuses them)."""
     try:
-        with open(str(raw_path), "wb") as raw:
+        with os.fdopen(open_new(raw_path), "wb") as raw:
             try:
                 status = shell_status(subprocess.run(
                     [str(binary)] + args, env=env, stdout=raw,
@@ -184,7 +287,7 @@ def run_capture(binary, args, env, raw_path, sanitized_path):
             except OSError as error:
                 raw.write(("%s: %s\n" % (binary, error.strerror or error)).encode())
                 status = exec_status(error)
-        sanitized_path.write_bytes(sanitize(raw_path.read_bytes()))
+        write_file(sanitized_path, sanitize(read_file(raw_path)))
     finally:
         if raw_path.exists():
             raw_path.unlink()  # the unsanitized capture never outlives this call
@@ -248,12 +351,13 @@ def child_path_dirs():
 
 
 def fixture_symlink_problem():
-    """A message when the fixture tree has a symlink between ROOT and a fixture file, else None."""
+    """A message when .local-runs, the fixtures dir or anything under it is a symlink, else None."""
     anchor = ROOT.resolve() / ".local-runs"
-    candidates = [LOCAL_RUNS, FIX, FIX / "keys"] + [
-        FIX / "keys" / "ai-memory.priv", FIX / "keys" / "ai-memory.pub",
-        FIX / "operator.pub.b64", FIX / "peer-fingerprints.txt", FIX / "peer-attestation.json",
-        FIX / "keygen.out", FIX / "db-passphrase", FIX / "leg4-sqlcipher.db"]
+    candidates = [LOCAL_RUNS, FIX]
+    if FIX.is_dir() and not FIX.is_symlink():
+        # every existing entry, so the key pair keygen writes (#7508) and anything else is covered
+        for directory, names, files in os.walk(str(FIX)):
+            candidates.extend(Path(directory) / name for name in names + files)
     for candidate in candidates:
         if candidate.is_symlink():
             return "%s is a symlink; fixtures hold keys and must stay inside %s" % (candidate, anchor)
@@ -278,7 +382,30 @@ def is_executable_file(candidate):
 
 
 def main(argv=None):
+    """Run the recapture; an OS error from a refused write (a symlink) is exit 1, not a traceback."""
     parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        return recapture()
+    except OSError as error:
+        print("refusing to continue: %s: %s; fixtures and evidence must be regular files, "
+              "never reached through a symlink, under %s" % (
+                  error.filename or "", error.strerror or error, ROOT), file=sys.stderr)
+        return 1
+
+
+def fixtures_clean():
+    """True when no fixture path is a symlink; otherwise the problem is printed."""
+    problem = fixture_symlink_problem()
+    if problem is not None:
+        print(problem, file=sys.stderr)
+    return problem is None
+
+
+def recapture():
+    problem = home_problem(HOME)
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return 1
     run_date = utc_run_date()
     default_setting = os.environ.get("DEFAULT_BIN") or DEFAULT_BIN_FALLBACK
     sqlcipher_setting = os.environ.get("SQLCIPHER_BIN") or SQLCIPHER_BIN_FALLBACK
@@ -292,13 +419,11 @@ def main(argv=None):
               "or set DEFAULT_BIN" % (default_bin or default_setting), file=sys.stderr)
         return 1
     sqlcipher_bin = resolve_binary(sqlcipher_setting)
-    problem = fixture_symlink_problem()
-    if problem is not None:
-        print(problem, file=sys.stderr)
+    if not fixtures_clean():
         return 1
     OUT.mkdir(parents=True, exist_ok=True)
     FIX.mkdir(parents=True, exist_ok=True)
-    os.chmod(FIX, DIR_MODE)  # holds the passphrase and keys: tightened on every run
+    chmod_dir(FIX)  # holds the passphrase and keys: tightened on every run
     ensure_private_dir(tmpdir)
 
     write_fixtures()
@@ -310,7 +435,7 @@ def main(argv=None):
         keygen_env = child_env(tmpdir, {})
         keygen_env.pop("AI_MEMORY_AGENT_ID")
         try:
-            with open(str(keygen_out), "wb") as sink:
+            with os.fdopen(open_new(keygen_out), "wb") as sink:
                 keygen_status = subprocess.run(
                     [default_bin, "rules", "keygen"], env=keygen_env,
                     stdout=sink, stderr=subprocess.STDOUT, check=False).returncode
@@ -319,14 +444,16 @@ def main(argv=None):
                   file=sys.stderr)
             return 1
         if keygen_status != 0:
-            print("operator keygen failed: " + keygen_out.read_text(errors="replace").rstrip("\n"),
-                  file=sys.stderr)
+            print("operator keygen failed: "
+                  + read_file(keygen_out).decode(errors="replace").rstrip("\n"), file=sys.stderr)
             return 1
+    if not fixtures_clean():  # keygen ran with the key dir: nothing may have been swapped (#7509)
+        return 1
     op_pub_file = FIX / "keys" / "operator.key.pub"
     if not op_pub_file.is_file():
         op_pub_file = FIX / "operator.pub.b64"
-    op_pub = op_pub_file.read_text().replace("\n", "")
-    attest = (FIX / "peer-attestation.json").read_text().rstrip("\n")
+    op_pub = read_file(op_pub_file).decode().replace("\n", "")
+    attest = read_file(FIX / "peer-attestation.json").decode().rstrip("\n")
 
     posture_env = child_env(tmpdir, {})
     # --- leg 1: bare ---
@@ -365,14 +492,16 @@ def main(argv=None):
         if stale.is_file() or stale.is_symlink():
             stale.unlink()  # never ship the previous run's leg-4 capture (#7463)
     else:
+        if not fixtures_clean():  # the three legs above ran binaries in the fixture tree
+            return 1
         # #3553 check #21 observes the LIVE pragma on the store the sqlcipher
         # build can open only with a passphrase.
         passphrase_file = FIX / "db-passphrase"
-        if not passphrase_file.is_file():
-            fd = os.open(str(passphrase_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as handle:
-                handle.write(secrets.token_hex(PASSPHRASE_BYTES))
-        passphrase = passphrase_file.read_text().replace("\n", "")
+        try:
+            passphrase = read_file(passphrase_file).decode().replace("\n", "")
+        except FileNotFoundError:
+            passphrase = secrets.token_hex(PASSPHRASE_BYTES)
+            write_file(passphrase_file, passphrase.encode(), KEY_FILE_MODE, replace=False)
         store = FIX / "leg4-sqlcipher.db"
         leg4_env = {"AI_MEMORY_DB": str(store), "AI_MEMORY_DB_PASSPHRASE": passphrase}
         if not store.is_file():
@@ -411,14 +540,14 @@ def main(argv=None):
         "exit: %s" % e4,
         "",
     ])
-    (OUT / EXIT_CODES_FILE).write_text(transcript, encoding="utf-8")
+    write_file(OUT / EXIT_CODES_FILE, transcript.encode("utf-8"))
     problem = check_header_date(OUT / EXIT_CODES_FILE, run_date)
     if problem is not None:
         print(problem, file=sys.stderr)
         return 1
 
     for name in ("peer-fingerprints.txt", "peer-attestation.json"):
-        (OUT / name).write_bytes((FIX / name).read_bytes())
+        write_file(OUT / name, read_file(FIX / name))
 
     print("exits e1=%s e2=%s e3=%s e4=%s" % (e1, e2, e3, e4))
     print("FAIL/PASS counts:")
