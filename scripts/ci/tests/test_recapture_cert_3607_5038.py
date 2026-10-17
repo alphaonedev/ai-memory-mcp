@@ -1849,7 +1849,7 @@ class WorldWritableAncestors7611(SymlinkBase):
 class BraceComma7612(RecaptureBase):
     """#7612: a path after `,` or `{` and before `}` is rewritten like any other whole path."""
 
-    HOME_PATH = '/home/fateprobe'
+    HOME_PATH = '/home/probeuser'
 
     def patched(self):
         module = load_script_module()
