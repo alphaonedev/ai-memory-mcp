@@ -424,12 +424,16 @@ class FakePg:
     """A tiny stateful server behind psql: databases, template flag, sessions.
 
     Understands exactly the statements setup/teardown issue. ``fail`` maps a
-    SQL prefix to an error text (rc 2). Every statement is logged in ``log``.
+    SQL prefix to an error text (rc 1: PostgreSQL 18.6 psql returns 1 for a SQL
+    error and reserves 2 for a lost connection). ``lost`` lists SQL prefixes
+    that commit on the server but whose psql then reports rc 2.
+    Every statement is logged in ``log``.
     """
 
-    def __init__(self, existing=None, fail=None):
+    def __init__(self, existing=None, fail=None, lost=()):
         self.dbs = dict(existing or {})
         self.fail = dict(fail or {})
+        self.lost = tuple(lost)
         self.log = []
 
     def __call__(self, argv, kw):
@@ -439,22 +443,24 @@ class FakePg:
         self.log.append(sql)
         for prefix, text in self.fail.items():
             if sql.startswith(prefix):
-                return Result(2, '', text)
+                return Result(1, '', text)
         found = re.search(r'DATABASE (?:IF EXISTS )?"([^"]+)"', sql)
         name = found.group(1) if found else None
         if sql.startswith('CREATE DATABASE'):
             if name in self.dbs:
-                return Result(2, '', 'ERROR:  database "%s" already exists' % name)
+                return Result(1, '', 'ERROR:  database "%s" already exists' % name)
             self.dbs[name] = {'template': False, 'sessions': 0}
         elif sql.startswith('ALTER DATABASE'):
             if name not in self.dbs:
-                return Result(2, '', 'ERROR:  database "%s" does not exist' % name)
+                return Result(1, '', 'ERROR:  database "%s" does not exist' % name)
             self.dbs[name]['template'] = 'IS_TEMPLATE true' in sql
         elif sql.startswith('DROP DATABASE'):
             db = self.dbs.get(name)
             if db and db['sessions']:
-                return Result(2, '', 'ERROR:  database "%s" is being accessed by other users' % name)
+                return Result(1, '', 'ERROR:  database "%s" is being accessed by other users' % name)
             self.dbs.pop(name, None)
+        if sql.startswith(self.lost):
+            return Result(2, '', 'psql: error: connection to server was lost')
         return Result()
 
     def touched(self, name):
@@ -505,6 +511,58 @@ class TemplateOwnership(unittest.TestCase):
         self.assertIn('permission denied', str(ctx.exception))
         self.assertEqual(pg.dbs, {})
         self.assertFalse([s for s in pg.log if s.startswith(('ALTER', 'DROP', 'CREATE EXT'))])
+
+    def test_collision_message_names_teardown_and_permission_message_does_not_7371(self):
+        pg = FakePg({TPL: {'template': True, 'sessions': 0}})
+        with self.assertRaises(pib.WrapperError) as taken:
+            self.run_setup(pg)
+        self.assertIn('teardown', str(taken.exception))
+        self.assertIn('your own earlier run', str(taken.exception))
+        self.assertIn('already exists', str(taken.exception))
+        denied = FakePg(fail={'CREATE DATABASE': 'ERROR:  permission denied to create database'})
+        with self.assertRaises(pib.WrapperError) as refused:
+            self.run_setup(denied)
+        self.assertNotIn('teardown', str(refused.exception))
+        self.assertNotIn('not created by this run', str(refused.exception))
+        self.assertIn('nothing was created or changed', str(refused.exception))
+        self.assertIn('permission denied', str(refused.exception))
+
+    def test_interrupt_after_create_drops_the_template_and_reraises_7372(self):
+        class Interrupted(FakePg):
+            def __call__(self, argv, kw):
+                sql = argv[argv.index('-c') + 1] if '-c' in argv else ''
+                if sql.startswith('CREATE EXTENSION'):
+                    self.log.append(sql)
+                    raise KeyboardInterrupt
+                return FakePg.__call__(self, argv, kw)
+        pg = Interrupted()
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_setup(pg)
+        self.assertEqual(pg.dbs, {}, 'the template this run created is dropped on interrupt')
+        self.assertTrue([s for s in pg.log if s.startswith('DROP DATABASE IF EXISTS')])
+        self.assertFalse([s for s in pg.log if 'FORCE' in s])
+
+    def test_fake_sql_errors_use_psql_status_one_7376(self):
+        pg = FakePg({TPL: {'template': True, 'sessions': 0}}, fail={'ALTER DATABASE': 'ERROR:  boom'})
+        taken = pg(['psql', '-c', 'CREATE DATABASE "%s"' % TPL], {})
+        self.assertEqual(taken.returncode, 1)
+        injected = pg(['psql', '-c', 'ALTER DATABASE "%s" WITH IS_TEMPLATE true' % TPL], {})
+        self.assertEqual(injected.returncode, 1)
+
+    def test_lost_connection_after_a_committed_create_refuses_without_alter_or_drop_7376(self):
+        pg = FakePg(lost=('CREATE DATABASE',))
+        with self.assertRaises(pib.WrapperError):
+            self.run_setup(pg)
+        self.assertFalse([s for s in pg.log if s.startswith(('ALTER', 'DROP', 'CREATE EXT'))])
+
+    def test_template_limit_counts_utf8_bytes_not_characters_7373(self):
+        fits = 'é' * 29 + 'x'      # 29*2 + 1 = 59 bytes, 30 characters
+        over = 'é' * 30            # 60 bytes, 30 characters
+        self.assertEqual(len(fits.encode('utf-8')), 59)
+        self.assertEqual(pib.template_name(fits), fits + '_tpl')
+        with self.assertRaises(pib.WrapperError) as ctx:
+            pib.template_name(over)
+        self.assertIn('63 bytes', str(ctx.exception))
 
     def test_owned_setup_then_teardown_leaves_nothing(self):
         pg = FakePg()
