@@ -297,7 +297,10 @@ async fn promotion_to_long_bumps_version_and_clears_expiry(store: &dyn MemorySto
     dest.expires_at = Some((chrono::Utc::now() + chrono::Duration::days(3)).to_rfc3339());
     store.store(&ctx, &a).await.expect("seed a");
     store.store(&ctx, &b).await.expect("seed b");
-    store.store(&ctx, &dest).await.expect("seed mid destination");
+    store
+        .store(&ctx, &dest)
+        .await
+        .expect("seed mid destination");
     let before = store.get(&ctx, &dest.id).await.expect("read before");
     assert_eq!(before.tier, Tier::Mid);
     assert!(before.expires_at.is_some(), "the mid destination expires");

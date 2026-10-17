@@ -763,7 +763,12 @@ fn restricted_visibility_static_carries_the_sanction_marker_7563() {
     // #7563: a `pub(super) static` statement holder is an enclosing item, so
     // its marker sanctions the SQL; the same static WITHOUT the marker is
     // still flagged (the guard stays load-bearing).
-    for vis in ["pub ", "pub(crate) ", "pub(super) ", "pub(in crate::storage) "] {
+    for vis in [
+        "pub ",
+        "pub(crate) ",
+        "pub(super) ",
+        "pub(in crate::storage) ",
+    ] {
         let marked = format!(
             "{vis}static S: LazyLock<String> = LazyLock::new(|| {{\n    // APPEND-ONLY-SANCTIONED (test)\n    format!(\"x DO UPDATE SET content = excluded.content\")\n}});"
         );

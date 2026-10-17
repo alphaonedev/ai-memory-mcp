@@ -43,8 +43,7 @@ fn count(conn: &Connection, sql: &str) -> i64 {
 }
 
 const LINKS: &str = "SELECT COUNT(*) FROM memory_links";
-const AUDITS: &str =
-    "SELECT COUNT(*) FROM signed_events WHERE event_type = 'memory_link.created'";
+const AUDITS: &str = "SELECT COUNT(*) FROM signed_events WHERE event_type = 'memory_link.created'";
 
 #[test]
 fn swallowed_audit_failure_in_a_transaction_commits_neither_row_7559() {
@@ -59,14 +58,12 @@ fn swallowed_audit_failure_in_a_transaction_commits_neither_row_7559() {
     .expect("install fault");
     conn.execute_batch("BEGIN IMMEDIATE").expect("begin");
     // The synthesis callers log this error and keep going; so does this cell.
-    let outcome = db::create_link_signed(
-        &conn,
-        &a,
-        &b,
-        MemoryLinkRelation::Supersedes.as_str(),
-        None,
+    let outcome =
+        db::create_link_signed(&conn, &a, &b, MemoryLinkRelation::Supersedes.as_str(), None);
+    assert!(
+        outcome.is_err(),
+        "the audit failure must surface: {outcome:?}"
     );
-    assert!(outcome.is_err(), "the audit failure must surface: {outcome:?}");
     conn.execute_batch("COMMIT").expect("commit after swallow");
     assert_eq!(
         count(&conn, LINKS),
