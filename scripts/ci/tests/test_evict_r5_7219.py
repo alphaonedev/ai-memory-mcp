@@ -297,6 +297,16 @@ class UnresolvablePaths7284(Fixture):
         path.symlink_to(path)
         return path
 
+    def test_resolve_raises_on_a_symlink_loop_on_every_python_7326(self):
+        """#7326: Python 3.13 made non-strict ``Path.resolve()`` return the partly
+        resolved path on a symlink loop instead of raising, so ``resolve()`` itself
+        must raise (OSError or RuntimeError) for the guards in the callers to fire."""
+        looped = self.loop(self.home / "direct-loop")
+        with self.assertRaises((OSError, RuntimeError)):
+            prune.resolve(looped)
+        with self.assertRaises((OSError, RuntimeError)):
+            prune.resolve(looped / "child")
+
     def run_main(self, protected, evict=None):
         work = SCRATCH / "runner" / "_work"
         workspace = work / "repo" / "repo"
