@@ -25,6 +25,7 @@ workflow command. Every violation line starts with `violation:`.
 Remove this guard, and the audit ignores, when candle supports zip >= 9.
 """
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -38,7 +39,7 @@ ZIP_CRATE = 'zip'
 # Exact crates that depend on zip today (candle-nn / candle-transformers 0.10.2
 # have no zip dependency). Widening this set needs an edit here and in audit.toml.
 ALLOWED_PARENTS = frozenset({'candle-core'})
-SCAN_DIRS = ('src', 'tests', 'benches')
+SCAN_DIRS = ('src', 'tests', 'benches', 'examples')
 SCAN_FILES = ('build.rs',)
 # Dev edges are included so a zip dev-dependency (also under a target-cfg table)
 # is seen; `all` is not used because it adds `zip feature` lines.
@@ -52,8 +53,10 @@ CARGO_TREE_ARGS = (
 # var_builder.rs).
 FORBIDDEN = (
     ('zip-path', re.compile(r'\bzip\s*::')),
-    ('zip-use', re.compile(r'\b(?:use|extern\s+crate)\s+zip\b')),
+    ('zip-use', re.compile(r'\b(?:use|extern\s+crate)\s+(?:::)?zip\b')),
+    ('zip-use-brace', re.compile(r'\buse\s+(?:::)?\{[^}]*(?<![\w:])zip\b(?!\s*::)')),
     ('zip-type', re.compile(r'\b(?:ZipStreamReader|ZipArchive|ZipWriter|ZipFile)\b')),
+    ('zip-extract-unwrapped', re.compile(r'\bextract_unwrapped_root_dir\b')),
     ('candle-loader', re.compile(
         r'\b(?:read_npz\w*|read_npy|write_npz|write_npy|read_pth\w*|from_pth\w*|'
         r'from_npz|NpzTensors|PthTensors|read_all_with_key)\b')),
@@ -61,7 +64,18 @@ FORBIDDEN = (
 )
 EXTRACT_CALL = re.compile(r'\.\s*extract\s*\(')
 ZIP_CONTEXT = re.compile(r'\bzip\b|\bZip\w*|\barchive\b|\bArchive\b')
-
+# A bare `zip` token that is neither a method call (`.zip(`), a path segment
+# (`iter::zip`) nor a call (`zip(a, b)`): in macro input it can be the crate.
+MACRO_ZIP = re.compile(r'(?<![\w.:])zip\b(?!\s*(?:\(|::))')
+MACRO_OPEN = re.compile(r'\b[A-Za-z_]\w*\s*!\s*([(\[{])')
+# Matched on the masked text (comments and string bodies blanked), so a quoted
+# `#[path = ..]` in test code is not mistaken for an attribute; the literal is
+# then read from the raw text at the same offset.
+PATH_ATTR = re.compile(r'#\s*!?\[[^\]]*?\bpath\s*=')
+PATH_LITERAL = re.compile(r'\s*"([^"]+)"')
+INCLUDE_ANY = re.compile(r'\binclude\s*!\s*[(\[{]')
+INCLUDE_LITERAL = re.compile(r'\binclude\s*!\s*\(\s*"([^"]+)"\s*\)')
+CLOSERS = {'(': ')', '[': ']', '{': '}'}
 
 
 def escape_text(text):
@@ -177,15 +191,14 @@ def dependency_rest(path):
     return None
 
 
-def fallback_manifest_hits(text):
-    """Line-level TOML reader for Python 3.9 / 3.10 (no tomllib).
+def iter_manifest_entries(text):
+    """Yield ('header', n, table_path, '') and ('key', n, full_key_path, value) per line.
 
-    Tracks the current table path from `[a.b."c(d)".e]` headers (quoted
-    segments, cfg() expressions), joins it with each key line's dotted key and
-    applies `dependency_rest`. Skips multi-line string bodies. Returns
-    (line_number, detail) pairs.
+    A line-level TOML reader for Python 3.9 / 3.10 (no tomllib). It tracks the
+    current table path from `[a.b."c(d)".e]` and `[[bin]]` headers (quoted
+    segments, cfg() expressions), joins it with each key line's dotted key, and
+    skips multi-line string bodies. Lines it cannot place are ignored.
     """
-    hits = []
     table = []
     in_multiline = None
     for number, line in enumerate(text.splitlines(), 1):
@@ -204,10 +217,8 @@ def fallback_manifest_hits(text):
                 continue
             if not HEADER_END.match(stripped, end):
                 continue
-            table = [] if array else parts
-            rest = None if array else dependency_rest(table)
-            if rest and rest[0] == ZIP_CRATE:
-                hits.append((number, 'direct zip dependency table'))
+            table = parts
+            yield 'header', number, parts, ''
             continue
         try:
             parts, end = parse_key(stripped)
@@ -220,16 +231,23 @@ def fallback_manifest_hits(text):
         for quote in ('"""', "'''"):
             if value.count(quote) % 2 == 1:
                 in_multiline = quote
-        rest = dependency_rest(table + parts)
+        yield 'key', number, table + parts, value
+
+
+def fallback_manifest_hits(text):
+    """Dependency-table check on the line-level reader. Returns (line, detail) pairs."""
+    hits = []
+    for kind, number, path, value in iter_manifest_entries(text):
+        rest = dependency_rest(path)
         if rest is None:
             continue
         if rest and rest[0] == ZIP_CRATE:
             hits.append((number, 'direct zip dependency'))
-        elif len(rest) == 1 and PACKAGE_ZIP.search(value):
+        elif kind == 'key' and len(rest) == 1 and PACKAGE_ZIP.search(value):
             hits.append((number, 'dependency renamed to package zip'))
-        elif len(rest) == 2 and rest[1] == 'package' and PACKAGE_VALUE_ZIP.match(value):
+        elif kind == 'key' and len(rest) == 2 and rest[1] == 'package' and PACKAGE_VALUE_ZIP.match(value):
             hits.append((number, 'dependency renamed to package zip'))
-        elif not rest and (ZIP_IN_VALUE.search(value) or PACKAGE_ZIP.search(value)):
+        elif kind == 'key' and not rest and (ZIP_IN_VALUE.search(value) or PACKAGE_ZIP.search(value)):
             hits.append((number, 'direct zip dependency (inline table)'))
     return hits
 
@@ -273,44 +291,192 @@ def tomllib_manifest_hits(text):
     return hits
 
 
-def check_manifest(root, parser='auto'):
-    manifest = root / 'Cargo.toml'
-    text = manifest.read_text(encoding='utf-8')
+def check_manifest(manifest_text, parser='auto'):
     if parser == 'auto':
         try:
             import tomllib  # noqa: F401
             parser = 'tomllib'
         except ImportError:
             parser = 'fallback'
-    hits = tomllib_manifest_hits(text) if parser == 'tomllib' else fallback_manifest_hits(text)
+    if parser == 'tomllib':
+        hits = tomllib_manifest_hits(manifest_text)
+    else:
+        hits = fallback_manifest_hits(manifest_text)
     return [violation('Cargo.toml:%d' % number, detail) for number, detail in hits]
 
 
-def iter_sources(root):
+def mask_rust(text):
+    """Blank out comments, string and char literal bodies; newlines are kept.
+
+    Keeps columns and line numbers stable so the macro scan can report the
+    original line.
+    """
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        two = text[i:i + 2]
+        if two == '//':
+            j = text.find('\n', i)
+            j = n if j < 0 else j
+            out.append(' ' * (j - i))
+            i = j
+        elif two == '/*':
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text[j:j + 2] == '/*':
+                    depth, j = depth + 1, j + 2
+                elif text[j:j + 2] == '*/':
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            out.append(re.sub(r'[^\n]', ' ', text[i:j]))
+            i = j
+        elif ch == 'r' and re.match(r'r#*"', text[i:i + 40]) and (i == 0 or not text[i - 1].isalnum()):
+            hashes = len(re.match(r'r(#*)"', text[i:]).group(1))
+            end = text.find('"' + '#' * hashes, i + 2 + hashes)
+            j = n if end < 0 else end + 1 + hashes
+            out.append(re.sub(r'[^\n]', ' ', text[i:j]))
+            i = j
+        elif ch == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == '\\' else 1
+            j = min(j + 1, n)
+            out.append(re.sub(r'[^\n]', ' ', text[i:j]))
+            i = j
+        elif ch == "'" and re.match(r"'(?:\\.[^']*|[^\\'])'", text[i:i + 12]):
+            j = i + len(re.match(r"'(?:\\.[^']*|[^\\'])'", text[i:i + 12]).group(0))
+            out.append(' ' * (j - i))
+            i = j
+        else:
+            out.append(ch)
+            i += 1
+    return ''.join(out)
+
+
+def macro_input_hits(text, masked):
+    """Line numbers where a bare `zip` token sits inside a macro invocation."""
+    lines = set()
+    for opener in MACRO_OPEN.finditer(masked):
+        depth, j = 0, opener.end() - 1
+        start = j
+        while j < len(masked):
+            if masked[j] in '([{':
+                depth += 1
+            elif masked[j] in ')]}':
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        for hit in MACRO_ZIP.finditer(masked, start, j):
+            lines.add(masked.count('\n', 0, hit.start()) + 1)
+    return sorted(lines)
+
+
+def manifest_source_paths(manifest_text):
+    """Source files Cargo.toml declares outside src/: package.build and target `path` keys."""
+    paths = []
+    for kind, _number, parts, value in iter_manifest_entries(manifest_text):
+        if kind != 'key':
+            continue
+        literal = re.match(r'\s*(?:"([^"]*)"|\'([^\']*)\')', value)
+        if not literal:
+            continue
+        text = literal.group(1) if literal.group(1) is not None else literal.group(2)
+        if parts in (['package', 'build'], ['build']) or (
+                parts[-1] == 'path' and parts[0] in ('lib', 'bin', 'example', 'test', 'bench')):
+            paths.append(text)
+    return paths
+
+
+def read_source(path, rel):
+    try:
+        return path.read_text(encoding='utf-8')
+    except (OSError, ValueError) as exc:
+        raise ToolError('cannot read %s: %s' % (rel, exc))
+
+
+def seed_sources(root, manifest_text):
+    seeds = []
     for name in SCAN_FILES:
-        path = root / name
-        if path.is_file():
-            yield path
+        seeds.append(root / name)
     for directory in SCAN_DIRS:
         base = root / directory
         if base.is_dir():
-            for path in sorted(base.rglob('*.rs')):
-                if path.is_file():
-                    yield path
+            seeds.extend(sorted(base.rglob('*.rs')))
+    for declared in manifest_source_paths(manifest_text):
+        seeds.append(root / declared)
+    return seeds
 
 
-def check_sources(root):
+def resolve_target(root, source, value, is_path_attr):
+    """Resolve a #[path] / include! target; returns (path or None, problem or None)."""
+    candidates = [source.parent / value]
+    if is_path_attr:
+        candidates.append(source.parent / source.stem / value)
+    for candidate in candidates:
+        resolved = Path(os.path.realpath(str(candidate)))
+        if resolved.is_file():
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                return None, 'target %s is outside the repository' % value
+            return resolved, None
+    return None, 'target %s does not resolve to a file' % value
+
+
+def check_sources(root, manifest_text=''):
+    root = Path(os.path.realpath(str(root)))
     problems = []
-    for path in iter_sources(root):
-        rel = path.relative_to(root).as_posix()
-        text = path.read_text(encoding='utf-8', errors='replace')
+    queue = [Path(os.path.realpath(str(p))) for p in seed_sources(root, manifest_text)]
+    seen = set()
+    while queue:
+        path = queue.pop(0)
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        try:
+            rel = path.relative_to(root).as_posix()
+        except ValueError:
+            problems.append(violation(str(path), 'source outside the repository'))
+            continue
+        text = read_source(path, rel)
         zip_context = bool(ZIP_CONTEXT.search(text))
         for number, line in enumerate(text.splitlines(), 1):
+            where = '%s:%d' % (rel, number)
             for label, pattern in FORBIDDEN:
                 if pattern.search(line):
-                    problems.append(violation('%s:%d' % (rel, number), label))
+                    problems.append(violation(where, label))
             if zip_context and EXTRACT_CALL.search(line):
-                problems.append(violation('%s:%d' % (rel, number), 'zip-flavoured extract call'))
+                problems.append(violation(where, 'zip-flavoured extract call'))
+        masked = mask_rust(text)
+        for attr in PATH_ATTR.finditer(masked):
+            number = masked.count('\n', 0, attr.start()) + 1
+            where = '%s:%d' % (rel, number)
+            literal = PATH_LITERAL.match(text, attr.end())
+            if not literal:
+                problems.append(violation(where, '#[path] with a non-literal value cannot be followed'))
+                continue
+            target, problem = resolve_target(root, path, literal.group(1), True)
+            if problem:
+                problems.append(violation(where, '#[path] ' + problem))
+            else:
+                queue.append(target)
+        for include in INCLUDE_ANY.finditer(masked):
+            number = masked.count('\n', 0, include.start()) + 1
+            where = '%s:%d' % (rel, number)
+            literal = INCLUDE_LITERAL.match(text, include.start())
+            if not literal:
+                problems.append(violation(where, 'include! with a non-literal path cannot be followed'))
+                continue
+            target, problem = resolve_target(root, path, literal.group(1), False)
+            if problem:
+                problems.append(violation(where, 'include! ' + problem))
+            else:
+                queue.append(target)
+        for number in macro_input_hits(text, masked):
+            problems.append(violation('%s:%d' % (rel, number), 'zip named in macro input'))
     return problems
 
 
@@ -372,7 +538,9 @@ def main(argv=None):
             tree_problems = []
         else:
             tree_problems = check_tree(tree_text)
-        problems = tree_problems + check_manifest(root, args.manifest_parser) + check_sources(root)
+        manifest_text = read_source(root / 'Cargo.toml', 'Cargo.toml')
+        problems = (tree_problems + check_manifest(manifest_text, args.manifest_parser)
+                    + check_sources(root, manifest_text))
     except (OSError, ValueError, ToolError) as exc:
         print('error: %s' % escape_text(exc), file=sys.stderr)
         return EXIT_USAGE
