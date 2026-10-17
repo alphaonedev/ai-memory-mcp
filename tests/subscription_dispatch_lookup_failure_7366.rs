@@ -171,9 +171,10 @@ fn e_sqlite_recovery_on_the_last_retry_removes_the_record_7498() {
     let at_return = durable_rows(&path).len();
     assert_eq!(at_return, 1, "the record exists when the call returns");
 
-    // Heal the table just before the LAST retry (the ladder floor is the
-    // time of the final attempt).
-    let heal_at = ladder_floor().saturating_sub(Duration::from_millis(700));
+    // Heal the table after the second retry failed (1.2 s) and well before the
+    // LAST retry (the ladder floor is the time of the final attempt), so a
+    // loaded host that delays this thread by seconds still heals in time.
+    let heal_at = ladder_floor().saturating_sub(Duration::from_secs(3));
     std::thread::sleep(heal_at.saturating_sub(started.elapsed()));
     conn.execute_batch("ALTER TABLE subscriptions_held RENAME TO subscriptions;")
         .expect("heal subscriptions");
