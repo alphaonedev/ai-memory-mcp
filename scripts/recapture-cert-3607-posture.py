@@ -34,14 +34,19 @@ directory, the operator key pair keygen writes, any fixture file) or at .local-r
 is refused before anything is written (#7462, #7508) and again after keygen and before
 leg 4 (#7509). Every file the script writes (fixtures, the db passphrase, captures,
 evidence) is created fresh with O_NOFOLLOW|O_EXCL, walking the path from the repo root
-without following a symlink, so a link swapped in mid-run fails closed with exit 1
-instead of redirecting the write; the passphrase is created 0600 and never replaced
-(decision: unlink-then-create-exclusive over truncating in place, because O_EXCL cannot
-truncate through a link; secrets are 0600, evidence files take the umask default as the
-shell redirect did). HOME must be an absolute path, not `/`, without a `:`: a relative
-or empty HOME would turn the HOME sanitizer pattern into a substring rewrite of the
-evidence and a colon would add a cwd entry to the child PATH (#7510); the run is refused
-with exit 1 before any write. The sanitizer replaces whole path components only. The shell script's
+without following a symlink. A symlink at a replaceable path is removed and replaced,
+never followed, and the run goes on (exit 0): the unlink is relative to the parent
+directory descriptor and a link planted again before the create fails O_EXCL. A symlinked
+parent, a symlink at the passphrase (created 0600 and never replaced) or one found by a
+re-check fails closed with exit 1 (#7539). Decision: unlink-then-create-exclusive over
+truncating in place, because O_EXCL cannot truncate through a link. Secrets are 0600 and
+evidence files are 0644 (never group or world writable, whatever the umask, #7536; the
+shell redirect gave 0644 under the usual 022 umask). HOME must be an absolute path that is
+already in normal form (os.path.normpath(HOME) == HOME, so no `.`, `..`, `//` or trailing `/`
+component), not `/`, without a `:`: a relative or empty HOME would turn the HOME
+sanitizer pattern into a substring rewrite of the evidence and a colon would add a cwd
+entry to the child PATH (#7510, #7540); the run is refused with exit 1 before any write.
+The sanitizer replaces whole path components only (#7538). The shell script's
 defaults named build directories of one build host; they are replaced by
 repo-relative ones. Exit codes: 0 success; 1 DEFAULT_BIN is not an executable
 file, TMPDIR (or the default scratch directory) is outside <repo-root>/.local-runs, HOME is
@@ -51,6 +56,7 @@ date; 2 unknown arguments.
 """
 import argparse
 import base64
+import contextlib
 import datetime
 import os
 import re
@@ -88,14 +94,18 @@ PASSPHRASE_BYTES = 32
 LOCAL_RUNS = ROOT / ".local-runs"
 DIR_MODE = 0o700
 KEY_FILE_MODE = 0o600
-PUBLIC_FILE_MODE = 0o666  # before the umask, like a shell redirect
+PUBLIC_FILE_MODE = 0o644  # evidence and fixtures: never group or world writable (#7536)
 PATH_CHARS = rb"A-Za-z0-9_\-\x80-\xff"
+# What may follow a path for it to count as the whole path (#7538): end of input,
+# `/`, whitespace, a quote, a closing bracket or `>`, `:` or `;`. A comma is a legal
+# filename character, so it is not a terminator.
+PATH_END = rb"[/\s'\"`)\]}>:;]"
 USAGE_EPILOG = (
     "Environment overrides: DEFAULT_BIN (default <repo>/target/release/ai-memory, must be "
     "an executable file; a value with a slash is relative to the repo root, a bare name is "
     "looked up on the child PATH), SQLCIPHER_BIN (default <repo>/target-sqlcipher/release/ai-memory; "
     "leg 4 is recorded as `missing` when absent), TMPDIR (must resolve under "
-    "<repo>/.local-runs, which must not be a symlink). HOME must be an absolute path (not /, no ':'). "
+    "<repo>/.local-runs, which must not be a symlink). HOME must be an absolute path in normal form (not /, no ':', no . or .. components). "
     "Fixtures and evidence are never written through a symlink. Exit codes: 0 success; "
     "1 preflight or capture failure; 2 unknown arguments."
 )
@@ -133,9 +143,12 @@ def sanitize(raw):
     newline, are preserved exactly.
 
     A path is replaced only as a whole run of path components: not when a path character
-    (letter, digit, `_`, `-`, `.`) directly precedes it, and not when a path character
-    or a `.` plus a path character follows it, so `/home/a` never rewrites `/home/ab`
-    or `/home/a.txt` (#7510). A trailing `/` on HOME is ignored."""
+    (letter, digit, `_`, `-`, `.`) directly precedes it, and only when end of input or an
+    explicit terminator follows it: `/`, whitespace, a quote or backtick, `)`, `]`, `}`,
+    `>`, `:` or `;`, or a `.` followed by end of input or one of those. Every other byte
+    is a legal filename character, so `/home/a` never rewrites `/home/ab`, `/home/a.txt`,
+    `/home/a+b`, `/home/a~`, `/home/a@x`, `/home/a%20`, `/home/a=1`, `/home/a#1` or
+    `/home/a..b` (#7510, #7538). A comma is not a terminator: `/home/a,b` is another path."""
     out = _replace_component(raw, str(ROOT), b"<repo-root>")
     out = _replace_component(out, str(FIX), SANITIZED_FIXTURE_LABEL.encode())
     if HOME:
@@ -150,7 +163,7 @@ def _replace_component(raw, path, label):
         return raw
     pattern = re.compile(
         rb"(?<![" + PATH_CHARS + rb"." + rb"])" + re.escape(path.encode())
-        + rb"(?![" + PATH_CHARS + rb"]|\.[" + PATH_CHARS + rb"])")
+        + rb"(?=\Z|" + PATH_END + rb"|\.(?:\Z|" + PATH_END + rb"))")
     return pattern.sub(lambda _match: label, raw)
 
 
@@ -158,9 +171,11 @@ def home_problem(home):
     """A message when home cannot be a sanitizer pattern or a child PATH entry, else None."""
     if not home:
         return "HOME is empty or unset; set it to an absolute path"
-    if not os.path.isabs(home) or ":" in home or not home.rstrip("/"):
-        return ("HOME %s must be an absolute path that is not / and has no ':'; a relative or "
-                "empty HOME would rewrite substrings of the evidence" % home)
+    if (not os.path.isabs(home) or ":" in home or not home.rstrip("/")
+            or os.path.normpath(home) in ("/", "//") or os.path.normpath(home) != home):
+        return ("HOME %s must be an absolute path in normal form (no '.', '..', '//' or trailing "
+                "'/' component) that is not / and has no ':'; a relative or empty HOME would "
+                "rewrite substrings of the evidence" % home)
     return None
 
 
@@ -192,10 +207,8 @@ def open_new(path, mode=PUBLIC_FILE_MODE, replace=True):
     parent, name = open_parent(path)
     try:
         if replace:
-            try:
+            with contextlib.suppress(FileNotFoundError):  # no entry yet is the first-run case
                 os.unlink(name, dir_fd=parent)
-            except FileNotFoundError:
-                pass
         return os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode,
                        dir_fd=parent)
     finally:
