@@ -254,7 +254,7 @@ fn wait_local_ca_client(
 /// Poll `probe` until it succeeds. Order per iteration: probe, dead-child
 /// check (returns the exit status and stderr at once), then the budget. The
 /// pre-listen budget applies until the daemon's listen line, logged just before
-/// the bind (src/daemon_runtime.rs:8307), shows on the captured stderr; from
+/// the bind (`src/daemon_runtime.rs:8307`), shows on the captured stderr; from
 /// the first sighting only `after_listen` remains.
 fn try_wait_healthy(
     spawned: &mut Spawned,
