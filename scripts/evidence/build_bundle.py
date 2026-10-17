@@ -116,6 +116,8 @@ PLAN_ROW = re.compile(r"^PLAN leg=([a-z]+) legs=([a-z]+(?:,[a-z]+)*)$")
 LEG_SECTION = {"battery": "== CERT LEGS", "removal": "== removal proof", "pg": "== pg coverage",
                "bootstrap": "== bootstrap-cert-gate"}
 LEG_DONE = {"battery": "BATTERY", "removal": "RP", "pg": "PG", "bootstrap": "BCG", "chain": "CHAIN"}
+DONE_LEG = {v: k for k, v in LEG_DONE.items()}
+SECTION_LEG = {v: k for k, v in LEG_SECTION.items()}
 # What each legs.log invocation promises: equal to run_cert.PLANS minus `gates` (its rows go to gates.log); a test pins
 # the two tables equal, and the PLAN row is held to this table, never trusted as declared (#7487).
 PLANS = {"battery": ("battery",), "pg": ("pg",), "removal": ("removal",), "bootstrap": ("bootstrap",),
@@ -162,6 +164,10 @@ def check_block(lines, start, rows):
     if len(exits) != 1 or exits[0][2][1] != leg or exits[0][2][0] != "0":
         raise Fatal(f"{at} (`{leg}`) needs exactly one `EXIT=0 leg={leg}` row, found "
                     f"{[(r[2][0], r[2][1]) for r in exits] or 'none'}: the leg was killed or crashed before it finished")
+    after = [l.strip()[:120] for l in lines[exits[0][0] + 1:] if l.strip()]
+    if after:  # #7527: the EXIT row is the invocation's last row; anything after it is another writer's
+        raise Fatal(f"{at} (`{leg}`) has rows after its EXIT row (an older or concurrent runner appended to this "
+                    f"legs.log): {after[:3]}; re-run with a fresh --outd")
     for name in legs:
         sect = [i for i, l in enumerate(lines) if name in LEG_SECTION and l.startswith(LEG_SECTION[name])]
         done = [r for r in rows if r[1] == LEG_DONE[name]]
@@ -170,6 +176,14 @@ def check_block(lines, start, rows):
             raise Fatal(f"{at}: planned leg `{name}` needs one section row and one `{LEG_DONE[name]}_DONE "
                         f"aggregate_failures=0` row after it (found {len(sect)} section / {len(done)} done); "
                         "re-run with a fresh --outd")
+    # #7527: exactly the planned sections and _DONE rows, in the plan's order (the runner's own order), nothing else
+    want = [(kind, name) for name in legs for kind in ("section", "done") if kind == "done" or name in LEG_SECTION]
+    seen = [(i, ("section", SECTION_LEG[m.group(1)])) for i, l in enumerate(lines) if (m := ANY_SECTION.match(l))]
+    seen += [(i, ("done", DONE_LEG[k])) for i, k, _v in rows if k != "EXIT"]
+    got = [e for _i, e in sorted(seen)]
+    if got != want:
+        raise Fatal(f"{at} (`{leg}`): its sections and _DONE rows are {got}, in the runner's order they must be {want} "
+                    "(an unplanned or unfinished section, or legs out of order); re-run with a fresh --outd")
 
 
 def check_run(outd):
