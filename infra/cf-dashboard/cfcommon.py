@@ -9,6 +9,7 @@ messages are fixed strings and never echo a credential value.
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 TOKEN_VAR = "CLOUDFLARE_API_TOKEN"
@@ -44,8 +45,11 @@ def credential(name):
             key, sep, rest = ln.partition("=")
             if sep and key.strip() == name:
                 return _unquote(rest)
-    except OSError:
-        pass
+    except FileNotFoundError:
+        return ""  # no env file is the normal case
+    except OSError as exc:
+        # fixed message: the exception type only, never a path or a credential value
+        print("warning: home env file is unreadable (%s)" % type(exc).__name__, file=sys.stderr)
     return ""
 
 

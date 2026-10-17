@@ -33,6 +33,7 @@ LIVE_STATE = "state.json"
 MCP_PRODUCER = REPO / "scripts" / "evidence" / "mcp-tools-state.py"
 GOOD_ACCT = "0123456789abcdef0123456789abcdef"
 SECRET_TOKEN = "tok-SENTINEL-VALUE-7313"
+AT = chr(64)  # userinfo separator, built so no literal email-shaped string appears
 
 
 def _load(name, filename):
@@ -103,6 +104,20 @@ class Credentials7313(unittest.TestCase):
         self._envfile("export CLOUDFLARE_API_TOKEN='quoted'\n  CLOUDFLARE_ACCOUNT_ID = \"" + GOOD_ACCT + "\"\n")
         self.assertEqual(self.cf.credential("CLOUDFLARE_API_TOKEN"), "quoted")
         self.assertEqual(self.cf.credential("CLOUDFLARE_ACCOUNT_ID"), GOOD_ACCT)
+
+    def test_unreadable_env_file_is_reported_not_swallowed(self):
+        # CodeQL 482 py/empty-except: an unreadable home env file (here a directory) is logged with a fixed
+        # message, never silently passed; an absent file stays silent; no path content is echoed.
+        (self.home / ".env").mkdir()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.cf.credential("CLOUDFLARE_API_TOKEN"), "")
+        self.assertIn("unreadable", err.getvalue())
+        (self.home / ".env").rmdir()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.cf.credential("CLOUDFLARE_API_TOKEN"), "")
+        self.assertEqual(err.getvalue(), "")
 
     def test_account_id_validation(self):
         self.assertTrue(self.cf.valid_account_id(GOOD_ACCT))
@@ -229,7 +244,17 @@ class WranglerTimeout7313(unittest.TestCase):
 
 URL_ATTRS = ("src", "href", "data", "poster", "xlink:href")
 NON_LOADING_RELS = frozenset(("preconnect", "dns-prefetch"))
-ORIGIN_RE = re.compile(r"^(?:https:)?//([a-z0-9.-]+)", re.IGNORECASE)
+ORIGIN_RE = re.compile(r"^(?:(https?):)?//(?:[^/@?#]*@)?([a-z0-9.-]+)(?::([0-9]+))?", re.IGNORECASE)
+DEFAULT_PORTS = {"https": "443", "http": "80"}
+C0_AND_SPACE = "".join(chr(i) for i in range(0x21))
+
+
+def origin_of(scheme, host, port):
+    """scheme://host[:port], lower-cased, the scheme's default port dropped."""
+    scheme = (scheme or "https").lower()
+    port = (port or "").lstrip("0")
+    suffix = "" if not port or port == DEFAULT_PORTS[scheme] else ":" + port
+    return "%s://%s%s" % (scheme, host.lower(), suffix)
 
 
 class _OriginParser(HTMLParser):
@@ -258,11 +283,13 @@ class _OriginParser(HTMLParser):
             if key in attrs:
                 values.extend(c.split()[0] for c in attrs[key].split(",") if c.split())
         for value in values:
-            # WHATWG URL parsing: strip ASCII tab/LF/CR, treat backslash as slash
-            value = re.sub(r"[\t\n\r]", "", value).strip().replace("\\", "/")
+            # WHATWG URL parsing: strip leading/trailing C0 controls and space, drop tab/LF/CR,
+            # treat backslash as slash
+            value = value.strip(C0_AND_SPACE)
+            value = re.sub(r"[\t\n\r]", "", value).replace("\\", "/")
             m = ORIGIN_RE.match(value)
             if m:
-                self.found.add("https://" + m.group(1).lower())
+                self.found.add(origin_of(m.group(1), m.group(2), m.group(3)))
 
 
 def loaded_origins(html):
@@ -360,6 +387,27 @@ class LoadedOriginsCase7313(unittest.TestCase):
                          {"https://first.example"})
 
 
+    def test_c0_controls_at_both_ends_are_stripped(self):
+        # review r4 NOTE 1 (#7493): WHATWG strips every leading/trailing U+0000..U+0020
+        self.assertEqual(loaded_origins('<img src="\x01https://c0.example/p.png">'), {"https://c0.example"})
+        self.assertEqual(loaded_origins('<img src="\x1f\x00//c1.example/p.png\x02">'), {"https://c1.example"})
+
+    def test_explicit_port_is_part_of_the_origin(self):
+        # review r4 NOTE 2 (#7494): a host-source without a port matches only the default port
+        self.assertEqual(loaded_origins('<img src="https://port.example:8443/p.png">'),
+                         {"https://port.example:8443"})
+        self.assertEqual(loaded_origins('<img src="https://dflt.example:443/p.png">'), {"https://dflt.example"})
+        self.assertEqual(loaded_origins('<img src="http://plain.example:80/p.png">'), {"http://plain.example"})
+        self.assertEqual(loaded_origins('<img src="http://alt.example:8080/p.png">'),
+                         {"http://alt.example:8080"})
+
+    def test_userinfo_is_not_the_host(self):
+        # review r4 NOTE 3 (#7495)
+        self.assertEqual(loaded_origins('<img src="https://u' + AT + 'ui.example/p.png">'), {"https://ui.example"})
+        self.assertEqual(loaded_origins('<img src="https://u:pw' + AT + 'ui2.example:9000/p.png">'),
+                         {"https://ui2.example:9000"})
+
+
 class HtmlAndHeaders7313(unittest.TestCase):
     """F4 (attribute-safe escaping) and F5 (_headers CSP, framing, no duplicate rule)."""
 
@@ -374,6 +422,15 @@ class HtmlAndHeaders7313(unittest.TestCase):
             for token in raw:
                 self.assertNotIn(token, text, "%s interpolates %s unescaped" % (page.name, token))
 
+    def test_no_unused_locals_from_codeql_467_to_476(self):
+        # #7497: the removed names must not come back (js/unused-local-variable)
+        for page in sorted(PUBLIC.glob("*.html")):
+            text = page.read_text()
+            self.assertIsNone(re.search(r"\bw1\s*=", text), "%s declares unused w1" % page.name)
+        index = (PUBLIC / "index.html").read_text()
+        for pat in (r"const tok=", r"const done=dims", r"tot=dims\.length", r"gap=0\.004"):
+            self.assertIsNone(re.search(pat, index), "index.html still has %s" % pat)
+
     def test_headers_csp_matches_loaded_origins(self):
         headers = (PUBLIC / "_headers").read_text()
         csp = re.search(r"Content-Security-Policy: (.*)", headers)
@@ -382,7 +439,7 @@ class HtmlAndHeaders7313(unittest.TestCase):
         self.assertIn("frame-ancestors 'none'", csp)
         self.assertIn("X-Frame-Options: DENY", headers)
         self.assertEqual(headers.count("/state.json"), 0, "redundant /state.json rule (covered by /*.json)")
-        allowed = set(re.findall(r"https://[a-z0-9.-]+", csp))
+        allowed = {origin_of(*m) for m in re.findall(r"(https)://([a-z0-9.-]+)(?::([0-9]+))?", csp)}
         loaded = set()
         for page in sorted(PUBLIC.glob("*.html")):
             loaded.update(loaded_origins(page.read_text()))

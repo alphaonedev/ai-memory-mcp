@@ -91,7 +91,7 @@ function render(d){
     ["validated",d.validated,"var(--good)"],["fail-closed",d.failclosed,"var(--run)"],
     ["refining",d.refining,"var(--warn)"],["total tools",d.total,"var(--ink)"]
   ].map(([l,v,c])=>`<div class="hstat"><div class="v" style="color:${c}">${esc(v)}</div><div class="l">${esc(l)}</div></div>`).join("");
-  const g=d.validated+d.failclosed, w1=g/d.total*100, w2=d.refining/d.total*100;
+  const w2=d.refining/d.total*100;
   document.getElementById("bar").innerHTML=`<i style="width:${(d.validated/d.total*100).toFixed(1)}%;background:var(--good)"></i><i style="width:${(d.failclosed/d.total*100).toFixed(1)}%;background:var(--run)"></i><i style="width:${w2.toFixed(1)}%;background:var(--warn)"></i>`;
   const host=document.getElementById("families");host.innerHTML="";
   (d.groups||[]).forEach(fam=>{

@@ -392,7 +392,6 @@ function swarmFabric(sw){
   const fmt=(v,u)=>v==null?'—':(v+' '+u);
   const W=1240,H=640;
   const OR={x:30,y:40,w:290,h:96}, AG={x:30,y:330,w:290,h:170}, AM2={x:470,y:70,w:300,h:118}, AM1={x:470,y:400,w:300,h:118}, DT2={x:900,y:70,w:320,h:118}, DT1={x:900,y:400,w:320,h:118};
-  const tok=(D.aiUsage&&D.aiUsage.runs&&D.aiUsage.runs[0])?D.aiUsage.runs[0]:null;
   let svg=`<svg viewBox="0 0 ${W} ${H}" width="100%" preserveAspectRatio="xMidYMid meet" style="max-height:80vh;display:block">
   <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="var(--soft)"/></marker>
   <marker id="at" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M10,0 L0,5 L10,10 z" fill="var(--soft)"/></marker>
@@ -771,7 +770,6 @@ function renderAll(D){
   _S(()=>security("secpanel", D.security));
   _S(()=>continuity("cycpanel", D.continuity));
   _S(()=>board(dims)); _S(()=>feed(D.events||[]));
-  const done=dims.filter(d=>d.s==="done").length, tot=dims.length||1;
   // 2026-09-18: the ring shows the V&V VALIDATED share (items measured green / items in scope), not the
   // count of fully-green dimensions - a dimension only turns green when its LAST item lands, so the
   // dimension count sat at 1/6 while 160/195 items were validated. The dimension count is the subtitle.
@@ -795,7 +793,7 @@ function renderAll(D){
   const G=D.ga;
   const r=41,c=2*Math.PI*r;
   if(G&&G.denom){
-    const sh=G.shipped/G.denom, fx=(G.fixed+G.ticked)/G.denom, gap=0.004;
+    const sh=G.shipped/G.denom, fx=(G.fixed+G.ticked)/G.denom;
     const arc=(from,len,col)=>len<=0?"":`<circle cx="47" cy="47" r="${r}" fill="none" stroke="${col}" stroke-width="8" stroke-dasharray="${Math.max(0,c*len-1).toFixed(1)} ${c.toFixed(1)}" stroke-dashoffset="${(-c*from).toFixed(1)}" transform="rotate(-90 47 47)"/>`;
     document.getElementById("ringpct").textContent=G.ready_pct.toFixed(1)+"%";
     document.getElementById("ringcnt").textContent="GA readiness · on release "+G.release_pct.toFixed(1)+"% · shipped "+G.shipped+" · carrier "+G.fixed+" · remaining "+G.remaining+(gates?" · gates "+gates.value+"/"+gates.of:"");
