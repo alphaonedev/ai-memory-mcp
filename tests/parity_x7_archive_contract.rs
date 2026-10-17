@@ -134,7 +134,7 @@ async fn sqlite_foreign_case(foreign: usize) {
 async fn sqlite_archive_by_ids_missing_id_is_skipped_7097() {
     common::permissive_attestation_for_tests();
     let dir = tempfile::tempdir().expect("tempdir");
-    let store = SqliteStore::open(&dir.path().join("x7m.db")).expect("open");
+    let store = SqliteStore::open(dir.path().join("x7m.db")).expect("open");
     let admin = CallerContext::for_admin(ADMIN);
     store
         .store(&admin, &row(0, NO_FOREIGN))

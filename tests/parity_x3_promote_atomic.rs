@@ -117,6 +117,9 @@ impl SqliteProbe {
     }
 }
 
+// The probe trait is async for the postgres implementation; the sqlite one
+// has nothing to await.
+#[allow(clippy::unused_async_trait_impl)]
 impl Probe for SqliteProbe {
     async fn queue_pending(&self) {
         self.raw()

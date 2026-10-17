@@ -147,10 +147,10 @@ async fn postgres_forget_permanent_failure_is_backend_and_atomic_7094() {
     .execute(&pool)
     .await
     .expect("fn");
-    sqlx::query(&format!(
+    sqlx::query(
         "CREATE TRIGGER x4_fault BEFORE DELETE ON memories FOR EACH ROW \
-         EXECUTE FUNCTION x4_fault()"
-    ))
+         EXECUTE FUNCTION x4_fault()",
+    )
     .execute(&pool)
     .await
     .expect("trigger");
