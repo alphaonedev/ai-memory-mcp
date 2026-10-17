@@ -75,10 +75,27 @@ use tempfile::TempDir;
 /// deliberately distinct from 1 so an orchestrator can branch on it.
 const EXIT_INCOMPLETE: i32 = 3;
 
+/// Directory name, beside the databases, of the per-test forensic sink.
+const SINK_DIR: &str = "audit-sink";
+
+/// The per-test forensic sink for databases under `db`'s directory (#7218).
+fn sink_dir(db: &Path) -> std::path::PathBuf {
+    db.parent()
+        .expect("db path has a parent directory")
+        .join(SINK_DIR)
+}
+
 fn ai_memory(db: &Path) -> Command {
     let mut cmd = Command::cargo_bin("ai-memory").expect("ai-memory binary");
+    // #7218 - pin the forensic sink to the test's own directory. Without it the
+    // CLI resolves the HOST-shared default sink, and an unattributable
+    // (db_id-less, pre-#2955) watermark left there by any other process on the
+    // machine out-ranks the freshly imported chain, so the importer's
+    // fail-closed spine gate refuses a perfectly valid bundle. The outcome of a
+    // round-trip must not depend on what else ran on the host.
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
+        .env("AI_MEMORY_AUDIT_DIR", sink_dir(db))
         .args(["--db", db.to_str().expect("utf-8 db path")]);
     cmd
 }
@@ -180,9 +197,10 @@ fn import(db: &Path, payload: &str, extra: &[&str]) -> (i32, serde_json::Value, 
         .assert();
     let out = assert.get_output();
     let code = out.status.code().expect("import exits with a code");
-    let report: serde_json::Value =
-        serde_json::from_slice(&out.stdout).expect("import --json emits a JSON report");
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!("import --json emits a JSON report (exit {code}, parse error {e}); stderr: {stderr}")
+    });
     (code, report, stderr)
 }
 
@@ -310,6 +328,97 @@ fn full_envelope_round_trips_a_store_with_tombstones_and_links_3405() {
         report["links_skipped_missing_endpoint"].as_u64(),
         Some(0),
         "a producer-side-consistent envelope leaves no unresolvable edge"
+    );
+}
+
+// ── 1b. #7218 - the spine gate stays fail-closed against a stale anchor ──
+
+/// Plant one forensic watermark row in `db`'s per-test sink. `db_id = None`
+/// is the legacy (pre-#2955) shape that cannot be attributed to any database.
+fn plant_watermark(db: &Path, head_sequence: i64, db_id: Option<&str>) {
+    let dir = sink_dir(db);
+    std::fs::create_dir_all(&dir).expect("create the per-test sink");
+    let mut payload = serde_json::json!({
+        "v": 1,
+        "head_sequence": head_sequence,
+        "head_canonical_hash": "ab".repeat(32),
+    });
+    if let Some(id) = db_id {
+        payload["db_id"] = serde_json::Value::String(id.to_string());
+    }
+    let row = serde_json::json!({
+        "ts": "2020-01-01T00:00:00Z",
+        "actor": "test",
+        "decision": "anchor",
+        "kind": "audit_watermark",
+        "rule_id": "",
+        "payload": payload,
+        "prev_hash": "",
+        "sig": "",
+    });
+    std::fs::write(dir.join("forensic-2020-01-01.jsonl"), format!("{row}\n"))
+        .expect("write the planted watermark");
+}
+
+/// Count the live memory rows in `db` (0 when the file was never created).
+fn memory_rows(db: &Path) -> i64 {
+    if !db.exists() {
+        return 0;
+    }
+    let conn = rusqlite::Connection::open(db).expect("open destination db");
+    conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+        .unwrap_or(0)
+}
+
+/// #7218 - a watermark that outranks the imported chain and cannot be
+/// attributed to a different database (legacy, no `db_id`) is still treated as
+/// tail-truncation evidence: the import is refused, loudly, with the reason on
+/// stderr, and NOTHING is applied. This pins the fail-closed posture so the
+/// hermetic sink in the round-trip test cannot be read as a relaxation.
+#[test]
+fn import_still_refuses_when_a_legacy_watermark_outranks_the_chain_7218() {
+    let tmp = TempDir::new().expect("tempdir");
+    let src = tmp.path().join("src.db");
+    let dst = tmp.path().join("dst.db");
+    let _ = seed_tombstoned_corpus(&src);
+    let (code, envelope, stderr) = export(&src, &["--full"]);
+    assert_eq!(code, 0, "export --full; {stderr}");
+    let payload = serde_json::to_string(&envelope).expect("re-serialize envelope");
+
+    plant_watermark(&dst, 448, None);
+    let assert = ai_memory(&dst)
+        .arg("--json")
+        .arg("import")
+        .write_stdin(payload)
+        .assert();
+    let out = assert.get_output();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(out.status.code(), Some(0), "the import must be refused");
+    assert!(
+        err.contains("REJECTED (fail-closed)") && err.contains("Detected"),
+        "the refusal names its reason, got: {err}"
+    );
+    assert_eq!(memory_rows(&dst), 0, "all-or-nothing: no row was applied");
+}
+
+/// #7218 - the #2955 per-database scoping holds: a watermark that names a
+/// DIFFERENT, identified database is a sibling's anchor and never convicts the
+/// imported chain.
+#[test]
+fn import_ignores_a_sibling_databases_watermark_7218() {
+    let tmp = TempDir::new().expect("tempdir");
+    let src = tmp.path().join("src.db");
+    let dst = tmp.path().join("dst.db");
+    let _ = seed_tombstoned_corpus(&src);
+    let (code, envelope, stderr) = export(&src, &["--full"]);
+    assert_eq!(code, 0, "export --full; {stderr}");
+    let payload = serde_json::to_string(&envelope).expect("re-serialize envelope");
+
+    plant_watermark(&dst, 448, Some(&"cd".repeat(32)));
+    let (code, report, stderr) = import(&dst, &payload, &[]);
+    assert_eq!(
+        code, 0,
+        "a sibling's watermark must not convict this chain; report={report}, stderr={stderr}"
     );
 }
 

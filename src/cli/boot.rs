@@ -70,7 +70,7 @@ pub const MIN_SUPPORTED_SCHEMA: u32 = 16;
 /// `docs/MIGRATION_v0.7.md` for the per-version column inventory and
 /// `migrations/{sqlite,postgres}/` for the SQL.
 ///
-/// **Current value: tracks `current_schema_version()` (v54 at v0.7.0
+/// **Current value: tracks `current_schema_version()` (v57 at v0.7.0
 /// release).** The const auto-resolves from the SSOT at
 /// `crate::storage::migrations::CURRENT_SCHEMA_VERSION`; this docstring
 /// names the v0.7.0-release tip for narrative continuity but the value
@@ -879,8 +879,8 @@ fn render_clustered_for_emit(
 /// **Format (text/toon)** — multi-line manifest, every field labelled:
 /// ```text
 /// # ai-memory boot: ok
-/// #   version:    0.6.3+patch.1
-/// #   db:         /home/u/.claude/ai-memory.db (schema=v19, 161 memories)
+/// #   version:    <crate version>
+/// #   db:         /home/u/.claude/ai-memory.db (schema=v<db schema_version>, 161 memories)
 /// #   tier:       autonomous (embedder=..., reranker=..., llm=...)
 /// #   latency:    12ms
 /// #   namespace:  ns-x (loaded 3 memories)

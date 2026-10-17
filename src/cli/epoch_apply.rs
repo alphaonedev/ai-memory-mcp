@@ -243,10 +243,11 @@ pub fn run(
         timestamp: chrono::Utc::now().to_rfc3339(),
         ..crate::signed_events::SignedEvent::default()
     };
-    crate::signed_events::append_signed_event_no_tx(&tx, &event)
+    let anchor = crate::signed_events::append_signed_event_no_tx(&tx, &event)
         .context("epoch-apply: append epoch.manifest_applied audit row")?;
 
-    tx.commit().context("epoch-apply: commit triple anchor")?;
+    crate::signed_events::commit_and_emit(tx, anchor)
+        .context("epoch-apply: commit triple anchor")?;
 
     let payload = serde_json::json!({
         "epoch_seq": doc.body.epoch_seq,

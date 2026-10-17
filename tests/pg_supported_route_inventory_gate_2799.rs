@@ -72,7 +72,7 @@ use ai_memory::handlers::{path_is_registered_route, postgres_endpoint_supported}
 
 /// Every production `/api/v1` URL-path const, referenced by name so a
 /// renamed/removed const breaks compilation here (router SSOT binding).
-/// This IS the 80-unique-path inventory the CLAUDE.md architecture note
+/// This IS the 80-unique-path inventory the `ARCHITECTURE_REFERENCE.md` architecture note
 /// pins; keep it in lockstep with `src/handlers/routes.rs`.
 fn all_registered_paths() -> Vec<&'static str> {
     vec![

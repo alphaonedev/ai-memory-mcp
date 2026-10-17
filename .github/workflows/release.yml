@@ -45,9 +45,12 @@ on:
         type: boolean
         default: true
 
+# #4719 - `packages: write` (GHCR push) is granted to the `docker` job only;
+# jobs without their own `permissions:` (supply-chain, crates-io) get
+# `contents: write` and nothing else. scripts/check_release_features.py pins
+# this block and every job's `permissions:`.
 permissions:
   contents: write
-  packages: write
 
 concurrency:
   # One release at a time, per tag.
@@ -149,8 +152,7 @@ jobs:
           # Refetch the tag ref itself so the verified object is the remote's
           # current one, not a local leftover.
           git fetch --no-tags --force origin "refs/tags/$TAG:refs/tags/$TAG"
-          bash scripts/release/verify-tag.sh --repo . --tag "$TAG" \
-            --signers scripts/qc-allowlists/release-tag-signers.txt
+          bash scripts/release/verify-tag.sh --repo . --tag "$TAG" --signers scripts/qc-allowlists/release-tag-signers.txt
 
       - name: Refuse a tag that is not on the dispatch branch
         shell: bash
@@ -206,9 +208,7 @@ jobs:
           SHA: ${{ needs.preflight.outputs.sha }}
         run: |
           set -euo pipefail
-          python3 scripts/release/qualify-sha.py --fetch --repo "$REPO" --sha "$SHA" \
-            --contexts scripts/qc-allowlists/required-contexts-release.txt \
-            --carriers-from scripts/check-required-contexts.sh
+          python3 scripts/release/qualify-sha.py --fetch --repo "$REPO" --sha "$SHA" --contexts scripts/qc-allowlists/required-contexts-release.txt --carriers-from scripts/check-required-contexts.sh
 
   # --------------------------------------------------------------------
   # #2895 (§3C release-pipeline supply-chain) — run the SAME supply-chain
@@ -275,8 +275,7 @@ jobs:
     # is the GitHub-native application of that SAME OIDC → Sigstore/Rekor
     # mechanism to raw binary artifacts (which have no package-registry
     # trusted publisher). `contents: write` is retained for the GitHub
-    # Release upload; the top-level `packages: write` is dropped for this
-    # job because it publishes no package.
+    # Release upload; no `packages: write` (only the docker job has it).
     permissions:
       contents: write
       id-token: write
@@ -294,7 +293,10 @@ jobs:
             artifact: ai-memory
             nfpm_arch: arm64
           - target: x86_64-apple-darwin
-            os: macos-latest
+            # macos-15-intel is GitHub's last x86_64 macOS image; it retires
+            # in Aug 2027. Replace this leg before then.
+            # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+            os: macos-15-intel
             artifact: ai-memory
           - target: aarch64-apple-darwin
             os: macos-latest
@@ -308,8 +310,9 @@ jobs:
         # Pin to the rust-toolchain.toml channel (1.98.0). The build below
         # resolves the toolchain from rust-toolchain.toml, so the cross
         # target std must be installed onto THAT toolchain — installing it
-        # onto `stable` left non-host targets (e.g. x86_64-apple-darwin on
-        # the arm64 macOS runner) without `core`, failing with E0463.
+        # onto `stable` left the target without `core` (E0463). Every leg
+        # now builds natively on its own runner (no cross-build), but the
+        # target std is still installed onto the pinned toolchain.
         uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           toolchain: 1.98.0
@@ -345,58 +348,17 @@ jobs:
         run: |
           set -euo pipefail
           bin="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
-          target="${{ matrix.target }}"
           REQUIRE_FLAGS="$(bash scripts/release-features.sh --require-flags)"
           test -n "$REQUIRE_FLAGS"
-          # #2728 — the release matrix cross-builds x86_64-apple-darwin on an
-          # arm64 `macos-latest` runner. `ai-memory features` self-report is an
-          # EXECUTING assertion; running the x86_64 binary on arm64 needs
-          # Rosetta 2 (NOT guaranteed on GitHub arm64 macOS images), and a
-          # Rosetta miss would fail this job only during a real tag cut. So:
-          # execute the feature self-report ONLY when the target is natively
-          # runnable on this host; for a non-native target, verify the built
-          # artifact's ARCHITECTURE WITHOUT running it. The compiled feature
-          # set is identical across both darwin targets (same
-          # `cargo build --release --features <release-features.sh>` above), so the
-          # native aarch64-apple-darwin job's feature assertion already covers
-          # the feature contract; the x86_64 job additionally confirms the
-          # cross-build actually emitted an x86_64 Mach-O, not a silent
-          # host-arch binary.
-          target_arch="${target%%-*}"
-          case "$target_arch" in
-            arm64) target_arch="aarch64" ;;
-          esac
-          host_arch="$(uname -m)"
-          case "$host_arch" in
-            arm64) host_arch="aarch64" ;;
-            amd64) host_arch="x86_64" ;;
-          esac
-          if [[ "$target_arch" == "$host_arch" ]]; then
-            # Native target — safe to execute; the script invokes the
-            # `features` subcommand via the path.
-            echo "native target ($target on $host_arch): executing feature self-report assertion"
-            # shellcheck disable=SC2086 # word-splitting the --require flags is intended
-            bash scripts/assert-compiled-features.sh "$bin" --strict $REQUIRE_FLAGS
-          else
-            echo "non-native target ($target on $host_arch): verifying arch WITHOUT executing (#2728)"
-            # Expected Mach-O / `file` architecture token for the target CPU.
-            case "$target_arch" in
-              x86_64)  want="x86_64" ;;
-              aarch64) want="arm64" ;;   # lipo / Mach-O name aarch64 as arm64
-              *)       want="$target_arch" ;;
-            esac
-            if command -v lipo >/dev/null 2>&1; then
-              info="$(lipo -info "$bin")"
-            else
-              info="$(file "$bin")"
-            fi
-            echo "  artifact: $info"
-            if ! printf '%s' "$info" | grep -qiw "$want"; then
-              echo "assert: arch verification FAILED — expected '$want' in: $info" >&2
-              exit 1
-            fi
-            echo "assert: arch verification OK ($bin is $want; non-exec #2728)"
-          fi
+          # #2728 / #4719 — EVERY release target runs the strict exact-set
+          # `ai-memory features` self-report, on a runner that executes the
+          # artifact natively (x86_64-apple-darwin builds on the Intel
+          # `macos-15-intel` runner, not cross-built on arm64 where Rosetta 2
+          # is not guaranteed). There is no skip branch: a binary that cannot
+          # run on its runner fails this step (fail closed), and
+          # scripts/check_release_features.py refuses a conditional assert.
+          # shellcheck disable=SC2086 # word-splitting the --require flags is intended
+          bash scripts/assert-compiled-features.sh "$bin" --strict $REQUIRE_FLAGS
 
       - name: Package binary
         run: |
@@ -531,8 +493,7 @@ jobs:
           TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
           SHA: ${{ needs.preflight.outputs.sha }}
         run: |
-          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" \
-            --tag-object "$TAG_OBJECT" --sha "$SHA"
+          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" --tag-object "$TAG_OBJECT" --sha "$SHA"
 
       - name: Create GitHub Release
         if: github.event.inputs.dry_run == 'false'
@@ -642,8 +603,7 @@ jobs:
           TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
           SHA: ${{ needs.preflight.outputs.sha }}
         run: |
-          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" \
-            --tag-object "$TAG_OBJECT" --sha "$SHA"
+          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" --tag-object "$TAG_OBJECT" --sha "$SHA"
 
       - name: Upload to GitHub Release
         if: github.event.inputs.dry_run == 'false'
@@ -727,13 +687,7 @@ jobs:
           set -euo pipefail
           for TARGET in aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios; do
             echo "::group::cargo build --target $TARGET"
-            cargo build \
-              --locked \
-              --release \
-              --target "$TARGET" \
-              --no-default-features \
-              --features sqlite-bundled \
-              --lib
+            cargo build --locked --release --target "$TARGET" --no-default-features --features sqlite-bundled --lib
             echo "::endgroup::"
             test -f "target/$TARGET/release/libai_memory.a" || {
               echo "::error::libai_memory.a not produced for $TARGET"
@@ -769,14 +723,8 @@ jobs:
           # -library args ("equivalent library definitions"). lipo them into
           # one fat simulator lib first, then pass device + fat-sim.
           mkdir -p target/ios-sim-universal/release
-          lipo -create \
-            target/aarch64-apple-ios-sim/release/libai_memory.a \
-            target/x86_64-apple-ios/release/libai_memory.a \
-            -output target/ios-sim-universal/release/libai_memory.a
-          xcodebuild -create-xcframework \
-            -library target/aarch64-apple-ios/release/libai_memory.a -headers dist/headers \
-            -library target/ios-sim-universal/release/libai_memory.a -headers dist/headers \
-            -output dist/AiMemory.xcframework
+          lipo -create target/aarch64-apple-ios-sim/release/libai_memory.a target/x86_64-apple-ios/release/libai_memory.a -output target/ios-sim-universal/release/libai_memory.a
+          xcodebuild -create-xcframework -library target/aarch64-apple-ios/release/libai_memory.a -headers dist/headers -library target/ios-sim-universal/release/libai_memory.a -headers dist/headers -output dist/AiMemory.xcframework
           ls -la dist/AiMemory.xcframework/
 
       - name: Tar + sha256 the xcframework
@@ -804,8 +752,7 @@ jobs:
           TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
           SHA: ${{ needs.preflight.outputs.sha }}
         run: |
-          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" \
-            --tag-object "$TAG_OBJECT" --sha "$SHA"
+          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" --tag-object "$TAG_OBJECT" --sha "$SHA"
 
       - name: Upload to GitHub Release
         if: github.event.inputs.dry_run == 'false'
@@ -921,13 +868,7 @@ jobs:
           for TARGET in aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android; do
             ABI="${ABI_OF[$TARGET]}"
             echo "::group::cargo build --target $TARGET ($ABI)"
-            cargo build \
-              --locked \
-              --release \
-              --target "$TARGET" \
-              --no-default-features \
-              --features sqlite-bundled \
-              --lib
+            cargo build --locked --release --target "$TARGET" --no-default-features --features sqlite-bundled --lib
             echo "::endgroup::"
             mkdir -p "dist/aar/jniLibs/$ABI"
             cp "target/$TARGET/release/libai_memory.so" "dist/aar/jniLibs/$ABI/"
@@ -983,8 +924,7 @@ jobs:
           TAG_OBJECT: ${{ needs.preflight.outputs.tag_object }}
           SHA: ${{ needs.preflight.outputs.sha }}
         run: |
-          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" \
-            --tag-object "$TAG_OBJECT" --sha "$SHA"
+          bash scripts/release/assert-tag-unmoved.sh --remote "$REMOTE" --tag "$TAG" --tag-object "$TAG_OBJECT" --sha "$SHA"
 
       - name: Upload to GitHub Release
         if: github.event.inputs.dry_run == 'false'
@@ -1125,9 +1065,7 @@ jobs:
             # match proves only that both were uploaded together. Also require
             # the build provenance the release job attached (#2487): it binds
             # the asset to release.yml in this repository at this run's commit.
-            gh attestation verify "$ASSET" --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-              --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+            gh attestation verify "$ASSET" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
 
             SAFE=$(echo "$TARGET" | tr '-' '_')
             echo "sha_${SAFE}=${ACTUAL}" >> "$GITHUB_OUTPUT"
@@ -1382,9 +1320,7 @@ jobs:
             # #3546 — require the release job's build provenance too (see the
             # homebrew job): a matching .sha256 from the same place as the
             # asset proves nothing about who built it.
-            gh attestation verify ~/rpmbuild/SOURCES/"$ASSET" --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-              --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
+            gh attestation verify ~/rpmbuild/SOURCES/"$ASSET" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" --source-digest "$GITHUB_SHA" --deny-self-hosted-runners
             # The .sha256 is not a spec Source, so keep SOURCES/ clean.
             rm -f ~/rpmbuild/SOURCES/"${ASSET}.sha256"
           done
@@ -1401,13 +1337,9 @@ jobs:
           echo "RPM Version: $RPM_VERSION"
           echo "RPM Release: $RPM_RELEASE"
 
-          sed -e "s/^Version:.*/Version:        ${RPM_VERSION}/" \
-              -e "s/^Release:.*/Release:        ${RPM_RELEASE}/" \
-              ai-memory.spec > ~/rpmbuild/SPECS/ai-memory.spec
+          sed -e "s/^Version:.*/Version:        ${RPM_VERSION}/" -e "s/^Release:.*/Release:        ${RPM_RELEASE}/" ai-memory.spec > ~/rpmbuild/SPECS/ai-memory.spec
 
-          rpmbuild -bs ~/rpmbuild/SPECS/ai-memory.spec \
-            --define "_sourcedir $HOME/rpmbuild/SOURCES" \
-            --define "_srcrpmdir $HOME/rpmbuild/SRPMS"
+          rpmbuild -bs ~/rpmbuild/SPECS/ai-memory.spec --define "_sourcedir $HOME/rpmbuild/SOURCES" --define "_srcrpmdir $HOME/rpmbuild/SRPMS"
 
           ls -la ~/rpmbuild/SRPMS/
 

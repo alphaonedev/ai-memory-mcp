@@ -14,5 +14,4 @@
 # #3649, #3667, #3674). Rule (f) (#2636) audits jobs that EXIST; a script with
 # no job was invisible to it. Every gate here is a dated decision, not a gap.
 #
-check-count-assertion-declared.sh 2026-09-26 #3967 reds on the promotion range a1403c742..HEAD for two already-landed carrier commits (7bf6d358a #3946, d478016b7 #3941) that carry no Count: trailer and cannot be rewritten; wire it (PR range = merge-base..head) once promotion 4 resets the range
 check-shared-namespace-claims.sh 2026-09-26 #3967 needs an explicit --base and scans the origin candidate queue (not a PR-shaped input); reports FAIL on the #3806 dup-branch finding until that queue resolves — wire advisory-first or with a fixed --base once the queue is empty

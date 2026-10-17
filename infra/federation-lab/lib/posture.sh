@@ -3,41 +3,41 @@
 # infra/federation-lab/lib/posture.sh — the lab's asi-hard security posture.
 # =============================================================================
 # SSOT for the hardened posture is `src/security_profile.rs::KNOBS` (rendered
-# for operators as `docs/deploy/asi-hard.env`). That table has SEVENTEEN pinned
-# knobs and a NO-DISABLE contract: under `AI_MEMORY_SECURITY_PROFILE=asi-hard`
+# for operators as `docs/deploy/asi-hard.env`). That table pins every knob it lists
+# (the count is read from the table, never written here) under a NO-DISABLE contract: under `AI_MEMORY_SECURITY_PROFILE=asi-hard`
 # each knob is pinned to its hard floor, and setting any of them BELOW that
 # floor REFUSES boot.
 #
-# THE LAB RUNS 16 OF THE 17 — and does NOT set
+# THE LAB RUNS EVERY PINNED KNOB AT ITS HARD FLOOR — but does NOT set
 # `AI_MEMORY_SECURITY_PROFILE=asi-hard`. Why, stated plainly:
 #
-#   The 17th knob, AI_MEMORY_REQUIRE_ROLLBACK_CHECK, cannot COLD-BOOT a fresh
-#   node. In require-mode the open-time rollback-evidence check treats an
-#   ABSENT off-table head anchor as refuse-to-open, and that anchor is emitted
-#   only by the witness watermark cadence over the `signed_events` chain —
-#   which is empty on a brand-new database. Fresh DB => no anchor => exit 75.
-#   Tracked as issue #2942 (OPEN as of 2026-08-15).
+#   The profile knob's contract is pin-and-refuse, so a lab that must also UNSET
+#   permissive hatches itself and report each knob by name sets every pinned knob to
+#   its hard-floor value DIRECTLY (LAB_POSTURE_SET below) instead of delegating to the
+#   profile. The result is the same pinned set the profile enforces, and the drift
+#   guard below proves the lab's list is exactly src/security_profile.rs::KNOBS.
 #
-#   Because the profile knob's contract is pin-and-refuse, we cannot say
-#   "asi-hard, but with rollback-check off": setting the profile AND lowering
-#   one pin is exactly the case the profile refuses. So the lab sets the 16
-#   satisfiable knobs to their hard-floor values DIRECTLY and leaves
-#   REQUIRE_ROLLBACK_CHECK at its safe default (emit-evidence-and-continue).
-#   This is the same 16/17 shape a persistent hive node runs today.
+#   History (issue #2942, CLOSED, fixed by PR #3096): AI_MEMORY_REQUIRE_ROLLBACK_CHECK
+#   used to be left out because, in require-mode, the open-time rollback-evidence
+#   check treated an ABSENT off-table head anchor as refuse-to-open, and a brand-new
+#   database has none (exit 75). On a current build a fresh cold boot succeeds under
+#   the full profile, so the lab now sets the knob like every other (issue #4938).
 #
-#   The caveat probe (on by default; disable with `run.sh --no-caveat-probe`)
-#   DEMONSTRATES the caveat rather than asserting it: it cold-boots one
-#   throwaway node under the full 17-knob profile and records the actual exit
-#   code and stderr.
+#   The cold-boot probe (on by default; disable with `run.sh --no-caveat-probe`)
+#   keeps that fix honest: it cold-boots one throwaway node on a fresh database
+#   under the FULL asi-hard profile and requires it to come up listening. A boot that
+#   REFUSES is a FAIL (a regression of #2942 or a new refusal), never a documented
+#   caveat. `run.sh --probe-mutation` re-runs the probe with the knob lowered below
+#   its floor and requires the probe to go red, proving the probe can fail.
 #
-# Two of the seventeen are PERMISSIVE hatches whose hard floor is "unset"
-# (AI_MEMORY_ALLOW_SCHEMA_AHEAD #2445, AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS
-# #2477). The lab actively UNSETS them rather than leaving whatever the
+# The PERMISSIVE hatches have a hard floor of "unset" (LAB_POSTURE_UNSET
+# below, e.g. AI_MEMORY_ALLOW_SCHEMA_AHEAD #2445 and
+# AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS #2477). The lab actively UNSETS them rather than leaving whatever the
 # operator's shell happened to export — an inherited hatch is exactly the
 # silent weakening the posture exists to prevent.
 # =============================================================================
 
-# The 14 knobs the lab SETS to their hard-floor value.
+# The knobs the lab SETS to their hard-floor value.
 # Format: NAME=VALUE. Order mirrors src/security_profile.rs::KNOBS.
 LAB_POSTURE_SET=(
   "AI_MEMORY_SECRET_SCREEN_MODE=refuse"
@@ -48,28 +48,39 @@ LAB_POSTURE_SET=(
   "AI_MEMORY_FED_REQUIRE_CHECKPOINT_SIG=1"
   "AI_MEMORY_FED_QUARANTINE_UNATTRIBUTED=1"
   "AI_MEMORY_CID_ENFORCE=1"
+  "AI_MEMORY_REQUIRE_ROLLBACK_CHECK=1"
   "AI_MEMORY_REQUIRE_WITNESS=1"
   "AI_MEMORY_REQUIRE_CAUSE_BINDING=1"
   "AI_MEMORY_REQUIRE_ROLE_SEPARATION=1"
   "AI_MEMORY_REQUIRE_IDENTITY_LINEAGE=1"
   "AI_MEMORY_FED_REQUIRE_SERVER_VERIFY=1"
   "AI_MEMORY_DB_SYNCHRONOUS=FULL"
+  "AI_MEMORY_FED_REQUIRE_SIG=1"
+  "AI_MEMORY_FED_REQUIRE_NONCE=1"
+  "AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT=1"
+  "AI_MEMORY_FED_REQUIRE_PUSH_NAMESPACE_SCOPE=1"
+  "AI_MEMORY_MIGRATION_REQUIRE_CORE_TABLES=1"
+  "AI_MEMORY_PERMISSIONS_MODE=enforce"
+  "AI_MEMORY_FED_REQUIRE_POLICY_CURRENT=1"
+  "AI_MEMORY_FED_CERT_PEER_BINDING=enforce"
+  "AI_MEMORY_UNSTAMPED_MUTATION=refuse"
+  "AI_MEMORY_REQUIRE_FORENSIC_SINK=1"
 )
 
-# The 2 PERMISSIVE hatches whose hard floor is "not in force" — unset them.
+# The PERMISSIVE hatches whose hard floor is "not in force" — unset them.
 LAB_POSTURE_UNSET=(
   "AI_MEMORY_ALLOW_SCHEMA_AHEAD"
   "AI_MEMORY_FED_ALLOW_PLAINTEXT_PEERS"
+  "AI_MEMORY_GOVERNANCE_FAIL_OPEN_ON_ERROR"
+  "AI_MEMORY_FED_ALLOW_UNENROLLED_PEERS"
+  "AI_MEMORY_STORE_URL_FILE_ALLOW_LAX_PERMS"
+  "AI_MEMORY_AGENT_API_KEY_FILE_ALLOW_LAX_PERMS"
 )
 
-# The 1 knob deliberately NOT at its hard floor (issue #2942).
-LAB_POSTURE_OMITTED="AI_MEMORY_REQUIRE_ROLLBACK_CHECK"
-LAB_POSTURE_OMITTED_ISSUE="2942"
-
-# lab_posture_count — 14 set + 2 unset = 16 of the 17 pinned knobs.
+# lab_posture_count — the knobs at their hard floor: every SET plus every UNSET entry.
 lab_posture_count() { echo $(( ${#LAB_POSTURE_SET[@]} + ${#LAB_POSTURE_UNSET[@]} )); }
 
-# lab_posture_export — apply the 16/17 posture to the CURRENT shell.
+# lab_posture_export — apply the lab posture to the CURRENT shell.
 # Callers run each daemon in a subshell so the posture never leaks between
 # steps (the seeding phase deliberately runs WITHOUT it — see run.sh).
 lab_posture_export() {
@@ -80,7 +91,6 @@ lab_posture_export() {
   for kv in "${LAB_POSTURE_UNSET[@]}"; do
     unset "$kv"
   done
-  unset "$LAB_POSTURE_OMITTED"
 }
 
 # lab_posture_render — one `NAME=VALUE` per line, for the run manifest and
@@ -89,63 +99,223 @@ lab_posture_render() {
   printf '%s\n' "${LAB_POSTURE_SET[@]}"
   local k
   for k in "${LAB_POSTURE_UNSET[@]}"; do printf '%s=<unset — permissive hatch NOT in force>\n' "$k"; done
-  printf '%s=<left at default — see issue #%s>\n' "$LAB_POSTURE_OMITTED" "$LAB_POSTURE_OMITTED_ISSUE"
 }
 
 # lab_posture_ssot_check <repo-root> — DRIFT GUARD.
 #
 # Re-derives the pinned-knob set from the Rust SSOT and asserts the lab's
-# list is exactly it, minus the one documented omission. Runs only when the
+# list is exactly it. Runs only when the
 # source tree is present (the kit also works from a release tarball). Echoes
 # a one-line verdict; returns 0 on agreement, 1 on drift, 2 on "cannot check".
 #
-# Only the literal `env: "AI_MEMORY_…"` rows are machine-comparable; three
-# KNOBS rows name a Rust const instead of a literal, so their env NAMES are
-# resolved from the const definitions. If a future row uses a shape this
-# cannot resolve, the check reports "cannot check" rather than passing —
-# a drift guard that silently degrades to green is worse than none.
+# Both the env NAME and the hard VALUE of every KNOBS row are compared (#5078):
+# a SET entry must equal the row's hard value, an UNSET entry must be a row whose
+# hard value is "". Rows may name a Rust const instead of a literal (`env: crate::…::NAME`,
+# `hard_value: crate::…::MODE_REFUSE`); those are resolved from the const definitions
+# (`pub const` and `pub(crate) const`, the value on the same line or the next one).
+# If a future row uses a shape this cannot resolve, the check reports "cannot
+# check" rather than passing — a drift guard that silently degrades to green is
+# worse than none. `run.sh --posture-selftest` proves the guard can fail.
+# _lab_posture_const <root> <CONST_NAME> [<module/path>] — the string literal of
+# `pub const NAME: &str` (also `pub(crate)`, value on the same line or the next), or
+# empty if unresolvable. The file the KNOBS row names (`crate::a::b::NAME` is
+# src/a/b.rs or src/a/b/mod.rs) is searched first; only when the const is not
+# defined there (a re-export, or an associated const) is all of src searched. Either way
+# more than one DISTINCT value is refused as unresolvable (#5124): a shadowing duplicate
+# must never be picked by file order.
+_lab_posture_const() {
+  local root="$1" name="$2" modp="${3:-}" files=() f vals=""
+  if [ -n "$modp" ]; then
+    for f in "$root/src/$modp.rs" "$root/src/$modp/mod.rs"; do [ -f "$f" ] && files+=("$f"); done
+  fi
+  if [ "${#files[@]}" -gt 0 ]; then vals="$(_lab_posture_const_vals "$name" "${files[@]}")"; fi
+  if [ -z "$vals" ]; then vals="$(_lab_posture_const_vals "$name" -R "$root/src")"; fi
+  [ -n "$vals" ] || return 0
+  [ "$(printf '%s\n' "$vals" | wc -l)" -eq 1 ] || return 0
+  printf '%s' "$vals"
+}
+
+# _lab_posture_const_vals <NAME> <grep file args...> — the distinct literals, one per line.
+_lab_posture_const_vals() {
+  local name="$1"; shift
+  grep -hzoE "pub(\(crate\))? const $name: &str =[[:space:]]*\"[^\"]*\"" "$@" 2>/dev/null \
+    | tr '\0\n' '  ' | grep -oE '"[^"]*"' | sed 's/^"//; s/"$//' | sort -u
+}
+
+# _lab_posture_expr <root> <expr> — resolve one KNOBS field expression: a string
+# literal ("refuse") or a `crate::path::CONST` reference. Echoes the value (which
+# may be the empty string); returns 1 if a const cannot be resolved.
+_lab_posture_expr() {
+  local root="$1" expr="$2" cname val modp
+  case "$expr" in
+    \"*\") printf '%s' "$expr" | sed -n 's/^"\(.*\)"$/\1/p'; return 0 ;;
+    crate::*)
+      cname="$(printf '%s' "$expr" | sed -n 's/.*::\([A-Z0-9_]*\)$/\1/p')"
+      [ -n "$cname" ] || return 1
+      # Module path of the const: `crate::a::b::NAME` -> a/b, `crate::tls::NAME` -> tls; a
+      # type segment (`AppConfig::NAME`) is dropped so the file that owns the type is
+      # searched. Every row prints a path (#4511-R6: `p` must not depend on a `::` left).
+      modp="$(printf '%s' "$expr" | sed -n 's/^crate:://; s/::[A-Z0-9_]*$//; s/::[A-Z][A-Za-z0-9]*$//; s|::|/|g; p')"
+      val="$(_lab_posture_const "$root" "$cname" "$modp")"
+      [ -n "$val" ] || return 1
+      printf '%s' "$val"; return 0 ;;
+  esac
+  return 1
+}
+
 lab_posture_ssot_check() {
   local root="$1" src="$1/src/security_profile.rs"
   [ -f "$src" ] || { echo "skip: no source tree at $root (release-tarball mode)"; return 2; }
 
-  local knobs_block ssot=() resolved
+  local knobs_block
   knobs_block="$(awk '/^const KNOBS: &\[KnobSpec\] = &\[/,/^\];/' "$src")"
   [ -n "$knobs_block" ] || { echo "cannot check: KNOBS table not found in $src"; return 2; }
 
-  while IFS= read -r line; do
-    case "$line" in
-      *'env: "'*)
-        ssot+=("$(printf '%s' "$line" | sed -n 's/.*env: "\([^"]*\)".*/\1/p')" )
-        ;;
-      *'env: crate::'*)
-        # `env: crate::path::CONST_NAME,` — resolve CONST_NAME's literal.
-        local cname
-        cname="$(printf '%s' "$line" | sed -n 's/.*env: crate::.*::\([A-Z0-9_]*\),.*/\1/p')"
-        [ -n "$cname" ] || { echo "cannot check: unparseable KNOBS row: $line"; return 2; }
-        resolved="$(grep -rhoE "pub const ${cname}: &str = \"[^\"]*\"" "$root/src" \
-                    | head -1 | sed -n 's/.*= "\([^"]*\)".*/\1/p')"
-        [ -n "$resolved" ] || { echo "cannot check: could not resolve const $cname"; return 2; }
-        ssot+=("$resolved")
-        ;;
-    esac
-  done <<<"$knobs_block"
+  # One `env-expr<TAB>hard-value-expr` pair per KnobSpec row, then resolve both
+  # sides (#4938/#5078: the NAME and the hard VALUE are both compared).
+  local pairs ssot=() ssot_val=() line envx valx name val
+  pairs="$(printf '%s\n' "$knobs_block" | awk '
+    /^[[:space:]]*env:/        { sub(/^[[:space:]]*env:[[:space:]]*/, ""); sub(/,[[:space:]]*$/, ""); e = $0 }
+    /^[[:space:]]*hard_value:/ { sub(/^[[:space:]]*hard_value:[[:space:]]*/, ""); sub(/,[[:space:]]*$/, ""); printf "%s\t%s\n", e, $0 }')"
+  while IFS=$'\t' read -r envx valx; do
+    [ -n "$envx" ] || continue
+    name="$(_lab_posture_expr "$root" "$envx")" \
+      || { echo "cannot check: could not resolve KNOBS env expression $envx"; return 2; }
+    [ -n "$name" ] || { echo "cannot check: could not resolve KNOBS env expression $envx"; return 2; }
+    val="$(_lab_posture_expr "$root" "$valx")" \
+      || { echo "cannot check: could not resolve KNOBS hard_value expression $valx (knob $name)"; return 2; }
+    ssot+=("$name"); ssot_val+=("$val")
+  done <<<"$pairs"
 
   [ "${#ssot[@]}" -gt 0 ] || { echo "cannot check: KNOBS table parsed to zero rows"; return 2; }
 
-  # lab set = SET names + UNSET names + the documented omission
+  # lab set = SET names + UNSET names
   local lab=() kv
   for kv in "${LAB_POSTURE_SET[@]}"; do lab+=("${kv%%=*}"); done
-  lab+=("${LAB_POSTURE_UNSET[@]}" "$LAB_POSTURE_OMITTED")
+  lab+=("${LAB_POSTURE_UNSET[@]}")
 
   local a b
   a="$(printf '%s\n' "${ssot[@]}" | sort)"
   b="$(printf '%s\n' "${lab[@]}" | sort)"
-  if [ "$a" = "$b" ]; then
-    echo "ok: lab posture covers all ${#ssot[@]} SSOT knobs ($(lab_posture_count)/${#ssot[@]} at hard floor, 1 omitted per #$LAB_POSTURE_OMITTED_ISSUE)"
-    return 0
+  if [ "$a" != "$b" ]; then
+    echo "DRIFT: lab posture list disagrees with src/security_profile.rs::KNOBS"
+    echo "  only in SSOT: $(comm -23 <(printf '%s\n' "$a") <(printf '%s\n' "$b") | tr '\n' ' ')"
+    echo "  only in lab:  $(comm -13 <(printf '%s\n' "$a") <(printf '%s\n' "$b") | tr '\n' ' ')"
+    return 1
   fi
-  echo "DRIFT: lab posture list disagrees with src/security_profile.rs::KNOBS"
-  echo "  only in SSOT: $(comm -23 <(printf '%s\n' "$a") <(printf '%s\n' "$b") | tr '\n' ' ')"
-  echo "  only in lab:  $(comm -13 <(printf '%s\n' "$a") <(printf '%s\n' "$b") | tr '\n' ' ')"
-  return 1
+
+  # Value check: a SET entry must equal the knob's hard value (and the hard
+  # value must be non-empty); an UNSET entry must be a knob whose hard floor is
+  # the empty string (permissive hatch not in force).
+  local i k want drift=0
+  for kv in "${LAB_POSTURE_SET[@]}"; do
+    k="${kv%%=*}"; val="${kv#*=}"; want=""
+    for i in "${!ssot[@]}"; do [ "${ssot[$i]}" = "$k" ] && want="${ssot_val[$i]}"; done
+    if [ -z "$want" ] || [ "$val" != "$want" ]; then
+      echo "DRIFT: $k value '$val' != hard value '$want' in src/security_profile.rs::KNOBS"; drift=1
+    fi
+  done
+  for k in "${LAB_POSTURE_UNSET[@]}"; do
+    for i in "${!ssot[@]}"; do
+      if [ "${ssot[$i]}" = "$k" ] && [ -n "${ssot_val[$i]}" ]; then
+        echo "DRIFT: $k is unset in the lab but its hard value is '${ssot_val[$i]}' in src/security_profile.rs::KNOBS"; drift=1
+      fi
+    done
+  done
+  [ "$drift" -eq 0 ] || return 1
+
+  echo "ok: lab posture covers all ${#ssot[@]} SSOT knobs ($(lab_posture_count) of ${#ssot[@]} at hard floor, names and values compared)"
+  return 0
+}
+
+# #5155: true when a boot refusal in <file> names the lowered rollback-check knob.
+# One awk pass reads the whole file: no pipe (a `grep -q` reader closing early returns 141
+# under pipefail) and no here-string (bash spills a large one to a temp file under $TMPDIR,
+# /tmp when unset; #5197). Lines naming INFO are the profile's pin line, never a refusal.
+# The trailing colon pins the whole knob name. An unreadable file is "not detected".
+lab_probe_refusal_names_knob() {
+  awk 'index($0, "INFO") == 0 && index($0, "refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK:") { f = 1 }
+       END { exit (f ? 0 : 1) }' "$1" 2>/dev/null
+}
+
+# lab_posture_selftest <repo-root> — prove the drift guard can fail (#5078).
+# 16 legs. Five mutate the lab posture arrays in a subshell and the check must go red: a weakened
+# value (plain, boolean and const-valued), a dropped name, a SET knob moved to UNSET. The other 11
+# leave the arrays alone (#5262): the control (must pass), three const-shadow legs (a duplicate
+# const in a scratch src tree), five probe-matcher legs (lab_probe_refusal_names_knob against
+# generated logs), one structural leg (the matcher has no here-string, here-document or pipe)
+# and one layout leg (this comment sits directly on the function).
+# Prints one line per leg; returns 0 only if every leg behaved.
+lab_posture_selftest() {
+  local root="$1" bad=0 rc name want
+  _leg() {  # <name> <want-rc> — runs the check in the CURRENT subshell's arrays
+    local out; out="$(lab_posture_ssot_check "$root")"; rc=$?
+    if [ "$rc" -eq "$2" ]; then echo "  PASS $1 (rc=$rc)"; else echo "  FAIL $1: rc=$rc, wanted $2: $out"; return 1; fi
+  }
+  ( _leg "control: lab posture equals the SSOT names and values" 0 ) || bad=1
+  ( LAB_POSTURE_SET=("${LAB_POSTURE_SET[@]/AI_MEMORY_PERMISSIONS_MODE=enforce/AI_MEMORY_PERMISSIONS_MODE=advisory}")
+    _leg "weakened value AI_MEMORY_PERMISSIONS_MODE=advisory is refused" 1 ) || bad=1
+  ( LAB_POSTURE_SET=("${LAB_POSTURE_SET[@]/AI_MEMORY_CID_ENFORCE=1/AI_MEMORY_CID_ENFORCE=0}")
+    _leg "weakened boolean AI_MEMORY_CID_ENFORCE=0 is refused" 1 ) || bad=1
+  ( LAB_POSTURE_SET=("${LAB_POSTURE_SET[@]/AI_MEMORY_UNSTAMPED_MUTATION=refuse/AI_MEMORY_UNSTAMPED_MUTATION=warn}")
+    _leg "weakened const-valued knob AI_MEMORY_UNSTAMPED_MUTATION=warn is refused" 1 ) || bad=1
+  ( LAB_POSTURE_SET=("${LAB_POSTURE_SET[@]/AI_MEMORY_REQUIRE_FORENSIC_SINK=1}")
+    _leg "dropped knob name is refused" 1 ) || bad=1
+  ( LAB_POSTURE_SET=("${LAB_POSTURE_SET[@]/AI_MEMORY_CID_ENFORCE=1}")
+    LAB_POSTURE_UNSET+=("AI_MEMORY_CID_ENFORCE")
+    _leg "a pinned knob moved to the unset list is refused" 1 ) || bad=1
+  # #5124: a const resolves from the file the KNOBS row names; a shadowing duplicate elsewhere
+  # in src must neither change a named-path result nor be picked by file order when the
+  # const has to be found by name alone (then two distinct values are "cannot check", rc 2).
+  local shadow; shadow="$(mktemp -d "${TMPDIR:-.}/posture-shadow.XXXXXX")" || return 1
+  mkdir -p "$shadow/src" && local e
+  for e in "$root"/src/*; do ln -s "$e" "$shadow/src/$(basename "$e")"; done
+  printf 'pub const MODE_REFUSE: &str = "warn";\n' > "$shadow/src/aaa_shadow.rs"
+  local real_root="$root"; root="$shadow"
+  ( _leg "a shadow duplicate of a path-named const does not change the result" 0 ) || bad=1
+  printf 'pub const FED_CERT_PEER_BINDING_ENV: &str = "SHADOW_ENV";\n' >> "$shadow/src/aaa_shadow.rs"
+  ( _leg "a shadow duplicate of a single-module path-named const (crate::tls) does not change the result" 0 ) || bad=1
+  # ENV_DB_SYNCHRONOUS is a re-export (`crate::storage` does not define it), so it is found by name.
+  printf 'pub const ENV_DB_SYNCHRONOUS: &str = "SHADOW_ENV";\n' >> "$shadow/src/aaa_shadow.rs"
+  ( _leg "a name-only const with two distinct values is cannot-check, not first-match" 2 ) || bad=1
+  root="$real_root"; rm -rf "$shadow"
+  # #5155: the probe-mutation matcher names the knob WITH its trailing colon, ignores INFO pin
+  # lines, and reads the whole log (a large log must not turn a detection into "inconclusive").
+  local plog; plog="$(mktemp -d "${TMPDIR:-.}/probe-matcher.XXXXXX")" || return 1
+  printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1\n' > "$plog/ok.log"
+  printf 'fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK_STRICT: nope\n' > "$plog/other-knob.log"
+  printf 'boot\nINFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\n' > "$plog/info-only.log"
+  printf 'INFO refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: pinned\nfatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1\n' > "$plog/info-then-refusal.log"
+  awk 'BEGIN { print "fatal: refuses to disable AI_MEMORY_REQUIRE_ROLLBACK_CHECK: floor 1"
+               for (i = 0; i < 200000; i++) print "filler line to fill the pipe buffer" }' > "$plog/big.log"
+  ( lab_probe_refusal_names_knob "$plog/ok.log" ) \
+    && echo "  PASS probe matcher: refusal naming the knob is detected" \
+    || { echo "  FAIL probe matcher: refusal naming the knob not detected"; bad=1; }
+  ( lab_probe_refusal_names_knob "$plog/other-knob.log" ) \
+    && { echo "  FAIL probe matcher: a refusal for a longer knob name was counted"; bad=1; } \
+    || echo "  PASS probe matcher: a refusal for a longer knob name is not counted"
+  ( lab_probe_refusal_names_knob "$plog/info-only.log" ) \
+    && { echo "  FAIL probe matcher: an INFO pin line was counted"; bad=1; } \
+    || echo "  PASS probe matcher: an INFO pin line is not counted"
+  ( lab_probe_refusal_names_knob "$plog/info-then-refusal.log" ) \
+    && echo "  PASS probe matcher: a refusal after an INFO line naming the knob is detected" \
+    || { echo "  FAIL probe matcher: a refusal after an INFO line naming the knob not detected"; bad=1; }
+  ( set -o pipefail; lab_probe_refusal_names_knob "$plog/big.log" ) \
+    && echo "  PASS probe matcher: detection in a large log survives pipefail" \
+    || { echo "  FAIL probe matcher: detection in a large log lost"; bad=1; }
+  # #5197, #5259: the matcher must not feed the log through a here-string or a here-document (bash
+  # spills a large one to a temp file under $TMPDIR, /tmp when unset) or a pipe (SIGPIPE under pipefail).
+  case "$(declare -f lab_probe_refusal_names_knob)" in
+    *'<<'*|*' | '*) echo "  FAIL probe matcher: reads the log through a here-string, a here-document or a pipe"; bad=1 ;;
+    *) echo "  PASS probe matcher: reads the log without a here-string, a here-document or a pipe" ;;
+  esac
+  rm -rf "$plog"
+  # #5198: the doc comment sits on the function it describes (a helper between them is drift).
+  if [ "$(grep -B1 '^lab_posture_selftest() {' "${BASH_SOURCE[0]}" | head -n 1)" = "# Prints one line per leg; returns 0 only if every leg behaved." ]; then
+    echo "  PASS doc comment: lab_posture_selftest is documented by the comment directly above it"
+  else
+    echo "  FAIL doc comment: another function sits between the lab_posture_selftest comment and the function"; bad=1
+  fi
+  unset -f _leg
+  return "$bad"
 }

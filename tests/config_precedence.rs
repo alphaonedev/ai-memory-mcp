@@ -4,7 +4,7 @@
 //! Wave 2 Tier-A7 (issue #855) — pin the canonical environment-variable
 //! precedence ladder + secret-classification invariant.
 //!
-//! CLAUDE.md §"Environment Variables" enumerates the production
+//! `docs/reference/ARCHITECTURE_REFERENCE.md` §"Environment Variables" enumerates the production
 //! `AI_MEMORY_*` env vars and asserts the ladder:
 //!
 //! ```text

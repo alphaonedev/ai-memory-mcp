@@ -87,6 +87,7 @@ appear on `/api/v1/monitoring/metrics`.
 | `ai_memory_age_projection_failed_total` | counter | — | Monotonic count of deferred AGE-projection drain attempts that errored (MERGE failed; row attempt_count bumped, retried until quarantine). Pillar-4 4.C (#1735). |
 | `ai_memory_age_projection_pending_depth` | gauge | — | Current depth of the kg_projection_outbox (pending deferred AGE projections, projected_at IS NULL), refreshed each cold-drainer tick. Sustained non-zero = AGE graph lagging the relational memory_links truth (Pillar-4 4.C, #1735). Non-zero in SYNC mode too: an inline projection failure records a pending row here and the drainer reconciles it, so this is NOT always 0 in sync mode (#3883). |
 | `ai_memory_age_projection_quarantined_total` | counter | — | Monotonic count of kg_projection_outbox rows that hit the drain attempt ceiling and were quarantined (relational edge exists but never reached the AGE graph). Pillar-4 4.C (#1735). |
+| `ai_memory_audit_anchor_frameless_drop_total` | counter | — | Monotonic count of audit anchors dropped unrecorded because the append ran in a raw transaction with no `WriteTxn` frame (#7281). Under-emission only, never a false verdict; the next due append re-anchors the head. Non-zero names a caller to move onto `WriteTxn`. |
 | `ai_memory_atomise_applied_total` | counter | — | Monotonic counter of auto-atomise passes that landed atoms — the synchronous MCP path or a drained background job (#2986). |
 | `ai_memory_atomise_degraded_total` | counter | — | Monotonic counter of auto-atomise passes that FAILED (curator error, db-open failure) (#2986). A DEGRADE, never data loss — the durable source row is untouched on every failure arm. |
 | `ai_memory_atomise_dropped_total` | counter | — | Monotonic counter of auto-atomise jobs DROPPED because the bounded queue (AI_MEMORY_ATOMISE_QUEUE_CAPACITY) was full or no worker was wired (#2986). The durable write always succeeds regardless — a DEGRADE (no atoms; `memory_atomise` recovers it), never a write failure. Alert on a sustained increment rate. |
@@ -207,7 +208,7 @@ periodic `ai-memory doctor --remote <url> --json` sweep (exit 2 = critical).
   `info` when done.
 - **Never paste configuration or environment dumps.** Several knobs are
   secrets (API keys, store URLs with passwords, passphrases); see the
-  classification column of the environment-variable table in `CLAUDE.md`.
+  classification column of the environment-variable table in `docs/reference/ARCHITECTURE_REFERENCE.md`.
 - **Do not enable test-only knobs** (`AI_MEMORY_TEST_*`,
   `AI_MEMORY_AUTO_EXPORT_INJECT_PANIC`) on a production process.
 - **Do not "fix" the store while diagnosing it.** Take an

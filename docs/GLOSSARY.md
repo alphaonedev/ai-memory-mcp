@@ -20,7 +20,7 @@ identity (not attested). Follows the regex
 `^[A-Za-z0-9_\-:@./]{1,128}$`. Resolution precedence: explicit flag →
 env var → MCP client info → process-stable host fallback →
 anonymous. Once stored, immutable across update / upsert / import /
-sync / consolidate. See `CLAUDE.md` § "Agent Identity (NHI)".
+sync / consolidate. See `docs/reference/ARCHITECTURE_REFERENCE.md` § "Agent Identity (NHI)".
 
 ## Archive
 

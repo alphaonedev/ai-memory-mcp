@@ -626,7 +626,7 @@ d_scan() {
             continue
         fi
         prebuild="$(awk -v a="$opener" -v b="$w" '
-            NR > a && NR < b && /cargo test --no-run "\$@" \|\| return "\$\?"/ { n = NR }
+            NR > a && NR < b && /cargo test --no-run "\$@"( "\$\{sel\[@\]\}")? \|\| return "\$\?"/ { n = NR }
             END { print n + 0 }' "$file")"
         if [ "$prebuild" -eq 0 ]; then
             bad=$((bad + 1))
@@ -657,7 +657,7 @@ fi
 # the repo (never system /tmp), trap-cleaned by the SCRATCH dir above.
 if [ "$d_total" -gt 0 ]; then
     D_MUT="$SCRATCH/ci-2657-mutant.yml"
-    grep -v 'cargo test --no-run "\$@" || return "\$?"' "$CI_YML" > "$D_MUT"
+    grep -vE 'cargo test --no-run "\$@"( "\$\{sel\[@\]\}")? \|\| return "\$\?"' "$CI_YML" > "$D_MUT"
     d_mut_result="$(d_scan "$D_MUT" 2>/dev/null)"
     d_mut_bad="${d_mut_result%%/*}"
     if [ "$d_mut_bad" -eq "$d_total" ]; then
@@ -790,6 +790,23 @@ if coverage_sequence_ok "$E_MUT"; then
 else
     ok "E regression: --no-clean + --no-report mutant is rejected"
 fi
+
+# SECTION F (#5447): pull_request / push branch-filter pins across every
+# workflow. rehearsal/** must gate PRs (pull_request.branches) and must never
+# overlap push.branches (#2506, #2523, #2508). Closed-world, stdlib-only reader.
+if python3 "$ROOT/scripts/test/test_workflow_pr_triggers_5447.py" >"$SCRATCH/f-5447.out" 2>&1; then
+    ok "F: every workflow pins rehearsal/** in pull_request.branches and never in push.branches (#5447)"
+else
+    bad "F: workflow trigger pin failed (#5447)" \
+        "$(grep -E 'R-(PR|PUSH|SHAPE)|^FAIL|^ERROR' "$SCRATCH/f-5447.out" | head -12)"
+fi
+
+# ===========================================================================
+# SECTION G — #6383 / #6386: the opt-in per-binary Postgres isolation lane.
+# The checks live in Python (review r1 L1): scripts/ci/check_pg_isolate_invariants.py,
+# unit-tested with one mutant per check in scripts/ci/tests/.
+# ===========================================================================
+if python3 "$ROOT/scripts/ci/check_pg_isolate_invariants.py" --root "$ROOT" --ci-yml "$CI_YML"; then ok "G: #6383 pg-isolation invariants (opt-in, run-scoped, no URL argv, selected prebuild, watchdog, logs)"; else bad "G: #6383 pg-isolation invariants failed" "see output above"; fi
 
 echo ""
 if [ "$FAIL" -eq 0 ]; then

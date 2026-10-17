@@ -188,8 +188,12 @@ fn display_url_value(value: &str) -> Option<String> {
     if !trimmed.contains("://") {
         return None;
     }
-    if trimmed.starts_with(crate::store_url::SQLITE_URL_SCHEME)
-        || crate::store_url::is_postgres_url(trimmed)
+    // #6102: the scheme is case-insensitive (RFC 3986 section 3.1), so
+    // `POSTGRES://` is a store URL too; routing it to `url_origin` printed
+    // the credential bytes of an ambiguous DSN.
+    let folded = trimmed.to_ascii_lowercase();
+    if folded.starts_with(crate::store_url::SQLITE_URL_SCHEME)
+        || crate::store_url::is_postgres_url(&folded)
     {
         return Some(crate::url_display::store_url_display(trimmed));
     }

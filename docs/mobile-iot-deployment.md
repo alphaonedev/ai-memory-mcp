@@ -468,7 +468,7 @@ that emit one memory row per hour, drones that only consult memory
 at waypoints, wearables that wake every few minutes.
 
 The CLI path opens a fresh SQLite connection per call (see
-`CLAUDE.md` §Architecture connection-topology notes), so concurrent
+`docs/reference/ARCHITECTURE_REFERENCE.md` §Architecture connection-topology notes), so concurrent
 ephemeral invocations are safe as long as the WAL contention stays
 modest.
 

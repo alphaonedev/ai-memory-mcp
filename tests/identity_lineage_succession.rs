@@ -35,8 +35,7 @@
 mod common;
 
 #[cfg(feature = "sal-postgres")]
-#[path = "common/pg_barrier.rs"]
-mod pg_barrier;
+use common::pg_barrier;
 
 use ai_memory::db;
 use ai_memory::identity::keypair::{self, AgentKeypair};

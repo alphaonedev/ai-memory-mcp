@@ -14950,7 +14950,7 @@ async fn http_create_memory_invalid_x_agent_id_header_returns_400() {
 
 /// L11 (v0.7.0.1) — `metadata.agent_id` must be honoured as an
 /// explicit-caller source in the HTTP precedence chain, matching the
-/// MCP path (`crate::mcp::handle_store` (NHI precedence)) and the CLAUDE.md §Agent Identity
+/// MCP path (`crate::mcp::handle_store` (NHI precedence)) and the `docs/reference/ARCHITECTURE_REFERENCE.md` §Agent Identity
 /// contract.
 ///
 /// Regression scenario (NHI-D-fed-agentid-mutation): a peer reposts a
@@ -17445,7 +17445,7 @@ fn a_latched_audit_trail_refuses_sync_push_on_both_backends_4400() {
             #[cfg(not(feature = "sal"))]
             let backends = [StorageBackend::Sqlite];
             for backend in backends {
-                crate::audit::fail_closed_latch_for_test();
+                let _latch = crate::audit::fail_closed_latch_for_test();
                 let mut app_state = test_app_state(test_state());
                 app_state.storage_backend = backend;
                 let app = Router::new()
@@ -17491,7 +17491,6 @@ fn a_latched_audit_trail_refuses_sync_push_on_both_backends_4400() {
                     .await
                     .unwrap();
                 let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
-                crate::audit::fail_closed_force_on_for_test(false);
                 assert_eq!(
                     status,
                     StatusCode::SERVICE_UNAVAILABLE,

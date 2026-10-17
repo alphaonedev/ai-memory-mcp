@@ -88,6 +88,7 @@ mod tx_retry;
 // qual_10 budget reason as `parity_3064` above.
 mod bootstrap_ddl;
 mod governance_chain_4477; // #4477 one chain builder, #4492 bind depth (qual_10 budget)
+pub use governance_chain_4477::list_over_depth_chains_pg; // #4715 doctor census
 mod ns_standard_ancestor_4356; // #4356 bind gate (own module: qual_10 budget)
 mod ns_standard_bind; // #4478 SET body, caller + federated gate (qual_10 budget)
 // v1.0.0 #3614 — the lineage walk (recursive CTE + AGE Cypher + the backend
@@ -8622,19 +8623,20 @@ impl PostgresStore {
         // overwrites it, under archive_reason='in_place_edit', SAME
         // memory_id (no fork). DELETE+INSERT mirrors sqlite's
         // `INSERT OR REPLACE`, keeping the MOST-RECENT pre-edit snapshot
-        // (the "immediately-prior content"). The DELETE only ever removes
-        // a prior in_place_edit snapshot of this id: supersede forks a new
-        // id + deletes the old live row, GC deletes the live row, and
-        // restore removes the archive row on success — so a live,
-        // in-place-editable row can never collide with a different
-        // archive_reason's record. Runs inside the tx; a 0-row UPDATE
-        // below rolls it back.
+        // (the "immediately-prior content"). The per-id archive slot holds
+        // ONE pre-image regardless of reason: a `federation_merge` snapshot
+        // of this id (written by src/store/postgres/merge_inbound_4023.rs:219, the
+        // #1773/#3961 same-id lane, and by the title-slot lane at
+        // postgres.rs ~25062, #4206) can occupy it, so this DELETE may
+        // remove that record too. The newest pre-image is the one kept;
+        // per-reason retention is tracked under #6048. Runs inside the tx;
+        // a 0-row UPDATE below rolls it back.
         if content_changed {
             sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
                 .bind(id)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| to_store_err("clear prior in_place_edit snapshot", e))?;
+                .map_err(|e| to_store_err("clear prior archive record for this id", e))?;
             sqlx::query(SQL_ARCHIVE_SNAPSHOT_LIVE_ROW)
                 .bind(id)
                 .bind(crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT)
@@ -12563,13 +12565,16 @@ impl PostgresStore {
         // supersession — which is exactly how the pre-fix gap would have been
         // reintroduced had only the CTE branch been repaired. The AGE branch
         // keeps its OWN `previous_valid_until` (read from the graph above), so
-        // the helper's return is deliberately discarded here.
-        let _ = pg_invalidate_link_relational_in_tx(
+        // only the helper's audit anchor is kept here (#7241: emitted after
+        // the COMMIT).
+        let anchor = pg_invalidate_link_relational_in_tx(
             &mut tx, source_id, target_id, relation, &stamp, actor,
         )
-        .await?;
+        .await?
+        .map(|(_, _, anchor)| anchor)
+        .unwrap_or_default();
 
-        tx.commit()
+        pg_commit_and_emit(tx, anchor)
             .await
             .map_err(|e| to_store_err(CTX_COMMIT_AGE_TX, e))?;
 
@@ -12616,7 +12621,7 @@ impl PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin kg_invalidate tx", e))?;
-        let Some((prior, _)) = pg_invalidate_link_relational_in_tx(
+        let Some((prior, _, anchor)) = pg_invalidate_link_relational_in_tx(
             &mut tx, source_id, target_id, relation, &stamp, actor,
         )
         .await?
@@ -12628,7 +12633,7 @@ impl PostgresStore {
                 previous_valid_until: None,
             });
         };
-        tx.commit()
+        pg_commit_and_emit(tx, anchor)
             .await
             .map_err(|e| to_store_err("commit kg_invalidate tx", e))?;
         Ok(KgInvalidateRow {
@@ -15295,8 +15300,22 @@ async fn pg_append_signed_event_with_chain(
     row: PgSignedEventInsert<'_>,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    pg_append_signed_event_with_chain_in_tx(&mut tx, row).await?;
+    let anchor = pg_append_signed_event_with_chain_in_tx(&mut tx, row).await?;
+    pg_commit_and_emit(tx, anchor).await
+}
+
+/// #7241 - the single postgres commit helper for a transaction that appended
+/// signed events: COMMIT first, then record the off-table audit anchors the
+/// appends produced. A failed commit (including a deferred constraint that
+/// raises at COMMIT) returns its error and drops the anchors unrecorded, so a
+/// rolled-back append never anchors a head that does not exist and never
+/// claims the watermark throttle.
+pub(crate) async fn pg_commit_and_emit(
+    tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    anchor: crate::governance::audit::PendingAuditAnchor,
+) -> Result<(), sqlx::Error> {
     tx.commit().await?;
+    anchor.emit_after_commit();
     Ok(())
 }
 
@@ -15330,12 +15349,20 @@ async fn pg_append_signed_event_with_chain(
 /// row (P2, #628 agent-3 — the sqlite twin's posture, verbatim).
 ///
 /// Returns `None` when the `(source, target, relation)` triple does not exist
-/// (nothing is written), else `Some((prior_valid_until, new_valid_until))`.
+/// (nothing is written), else `Some((prior_valid_until, new_valid_until,
+/// anchor))`; the caller emits the audit `anchor` after its COMMIT (#7241).
 ///
 /// # Errors
 ///
 /// Any sqlx failure, or `StoreError::IntegrityFailed` when the audit
 /// pre-image cannot be canonicalised.
+/// `(prior_valid_until, new_valid_until, pending audit anchor)` (#7241).
+type PgLinkInvalidation = (
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    crate::governance::audit::PendingAuditAnchor,
+);
+
 async fn pg_invalidate_link_relational_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     source_id: &str,
@@ -15343,7 +15370,7 @@ async fn pg_invalidate_link_relational_in_tx(
     relation: &str,
     stamp: &str,
     actor: Option<&str>,
-) -> StoreResult<Option<(Option<DateTime<Utc>>, Option<DateTime<Utc>>)>> {
+) -> StoreResult<Option<PgLinkInvalidation>> {
     let prior_row: Option<(
         Option<DateTime<Utc>>,
         Option<Vec<u8>>,
@@ -15388,7 +15415,7 @@ async fn pg_invalidate_link_relational_in_tx(
         .await
         .map_err(|e| to_store_err("cte kg_invalidate", e))?;
 
-    if was_signed {
+    let anchor = if was_signed {
         let valid_from_str = prior_valid_from.map(|t| t.to_rfc3339());
         let created_at_str = truncate_to_microseconds(prior_created_at).to_rfc3339();
         // #3281 — hash the CANONICAL `stamp` (already
@@ -15441,10 +15468,12 @@ async fn pg_invalidate_link_relational_in_tx(
             },
         )
         .await
-        .map_err(|e| to_store_err("kg_invalidate append signed_event", e))?;
-    }
+        .map_err(|e| to_store_err("kg_invalidate append signed_event", e))?
+    } else {
+        crate::governance::audit::PendingAuditAnchor::none()
+    };
 
-    Ok(Some((prior, now_until)))
+    Ok(Some((prior, now_until, anchor)))
 }
 
 /// Transaction-scoped twin of [`pg_append_signed_event_with_chain`].
@@ -15453,10 +15482,14 @@ async fn pg_invalidate_link_relational_in_tx(
 /// `capture_turn_idempotent` path, #1416) can append the audit row in
 /// the SAME transaction as the data rows — the chain never lags the
 /// data, and a rollback discards both. The caller owns BEGIN/COMMIT.
+///
+/// #7241 - returns the [`PendingAuditAnchor`](crate::governance::audit::PendingAuditAnchor)
+/// of this append; the owner of the transaction records it only after the
+/// commit succeeded ([`pg_commit_and_emit`]).
 pub(crate) async fn pg_append_signed_event_with_chain_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     row: PgSignedEventInsert<'_>,
-) -> Result<(), sqlx::Error> {
+) -> Result<crate::governance::audit::PendingAuditAnchor, sqlx::Error> {
     // Every field is `Copy`, so this reads the row without consuming it —
     // `row` is handed to the #3527 allocation funnel below by reference.
     let PgSignedEventInsert {
@@ -15529,24 +15562,34 @@ pub(crate) async fn pg_append_signed_event_with_chain_in_tx(
     // write is a FILE write (never touches this pg tx), so it is safe
     // fire-and-forget.
     //
+    // #7241 - the watermark is only COMPUTED here and returned pending; the
+    // transaction owner records it after COMMIT (`pg_commit_and_emit`). A
+    // rolled-back append must neither anchor nor claim the throttle (sqlite
+    // parity).
+    //
     // v1.0.0 #2955 — stamp this database's genesis-derived identity (the SAME
     // stable stored columns as the witness lane below, never a TIMESTAMPTZ
     // readback) so the shared on-host watermark filters per database. The
     // (query-bearing) genesis fetch is gated behind the cheap emission-due peek
     // so it stays off the 63-of-64 non-emitting appends (K3 parity with sqlite).
+    let mut anchor = crate::governance::audit::PendingAuditAnchor::none();
     if crate::governance::audit::watermark_emission_due(next_seq) {
         let genesis: Option<(String, String, Vec<u8>)> =
             sqlx::query_as(crate::signed_events::GENESIS_ROW_SQL)
                 .fetch_optional(&mut **tx)
                 .await?;
-        let db_id = genesis.map(|(gid, gagent, gpayload)| {
-            crate::signed_events::db_id_from_genesis_parts(&gid, &gagent, &gpayload)
-        });
-        crate::governance::audit::maybe_record_audit_watermark(
-            next_seq,
-            &head_hash_hex,
-            db_id.as_deref(),
-        );
+        // #7228 — never anchor a db_id-less (legacy) watermark (sqlite parity):
+        // an absent genesis skips the emission with a single WARN.
+        if let Some((gid, gagent, gpayload)) = genesis {
+            let db_id = crate::signed_events::db_id_from_genesis_parts(&gid, &gagent, &gpayload);
+            anchor = crate::governance::audit::PendingAuditAnchor::watermark(
+                next_seq,
+                &head_hash_hex,
+                &db_id,
+            );
+        } else {
+            crate::governance::audit::warn_watermark_skipped_no_genesis();
+        }
     }
 
     // v0.9.0 G5b (#1822, item 6) — INDEPENDENT dual-chain audit-head witness
@@ -15555,10 +15598,14 @@ pub(crate) async fn pg_append_signed_event_with_chain_in_tx(
     // (no-op unless a witness key is enrolled). Unlike sqlite's swallow, a
     // genuine DB error propagates: postgres aborts the tx on any statement
     // error, so the atomic append fails rather than committing a half-written
-    // pair — the correct fail-closed posture.
-    pg_emit_audit_head_witness_in_tx(tx, next_seq, &head_hash_hex).await?;
+    // pair — the correct fail-closed posture. #7241 - the checkpoint row is
+    // inserted here (atomic with the head); its OFF-TABLE head-anchor mirror
+    // rides the pending anchor and is written after commit.
+    if let Some(cp) = pg_emit_audit_head_witness_in_tx(tx, next_seq, &head_hash_hex).await? {
+        anchor = anchor.with_head_anchor(cp);
+    }
 
-    Ok(())
+    Ok(anchor)
 }
 
 /// v0.9.0 G5b (#1822) — postgres twin of `signed_events`'
@@ -15566,29 +15613,30 @@ pub(crate) async fn pg_append_signed_event_with_chain_in_tx(
 /// dual-chain [`crate::models::ConditionType::AuditHeadWitness`] checkpoint in
 /// the caller's transaction. Cheap boundary pre-check FIRST (no key I/O off
 /// the hot path), then load the witness key, claim the slot (CAS), and INSERT
-/// the signed anchor.
+/// the signed anchor. #7241 - returns the inserted checkpoint so the caller
+/// mirrors it OFF-TABLE only after the transaction commits.
 async fn pg_emit_audit_head_witness_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     signed_head_seq: i64,
     signed_head_hash: &str,
-) -> Result<(), sqlx::Error> {
+) -> Result<Option<crate::models::Checkpoint>, sqlx::Error> {
     use crate::governance::audit as witness;
     if !witness::witness_interval_reached(signed_head_seq) {
-        return Ok(());
+        return Ok(None);
     }
     let keypair = match witness::load_witness_signing_key() {
         Ok(Some(kp)) => kp,
-        Ok(None) => return Ok(()),
+        Ok(None) => return Ok(None),
         Err(e) => {
             tracing::warn!(
                 target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
                 "audit-witness key load failed (pg, swallowed): {e:#}"
             );
-            return Ok(());
+            return Ok(None);
         }
     };
     if !witness::witness_claim_slot(signed_head_seq, false) {
-        return Ok(());
+        return Ok(None);
     }
     let (mem_seq, mem_hash_hex) = pg_read_revision_head_in_tx(tx).await?;
     let dual = witness::WitnessDualHead {
@@ -15640,10 +15688,10 @@ async fn pg_emit_audit_head_witness_in_tx(
     .bind(cp.metadata.to_string())
     .execute(&mut **tx)
     .await?;
-    // v1.0.0 #1946 B — mirror the signed anchor OFF-TABLE (fire-and-forget) so
-    // the pg-backed daemon also seeds the open-time rollback high-water mark.
-    witness::append_head_anchor(&cp);
-    Ok(())
+    // v1.0.0 #1946 B — the signed anchor is mirrored OFF-TABLE (fire-and-forget)
+    // so the pg-backed daemon also seeds the open-time rollback high-water mark.
+    // #7241 - the caller writes that mirror after COMMIT, never in this tx.
+    Ok(Some(cp))
 }
 
 /// v0.9.0 G5b (#1822) — read the pg `memory_revisions` chain head as
@@ -16413,7 +16461,7 @@ async fn pg_append_revision_leaf_in_tx(
 async fn pg_sever_namespace_standards_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: &str,
-) -> Result<u64, sqlx::Error> {
+) -> Result<(u64, crate::governance::audit::PendingAuditAnchor), sqlx::Error> {
     // Name the affected namespaces BEFORE the UPDATE — afterwards the
     // `standard_id = $1` predicate matches nothing and the evidence is gone.
     let severed: Vec<String> = sqlx::query_scalar(SQL_SELECT_NAMESPACES_BY_STANDARD_ID)
@@ -16424,7 +16472,7 @@ async fn pg_sever_namespace_standards_in_tx(
         // The overwhelmingly common case: the reaped memory is nobody's
         // standard. Byte-identical to the pre-#2503 no-op DELETE — no UPDATE,
         // no WARN, no signed event, no extra write.
-        return Ok(0);
+        return Ok((0, crate::governance::audit::PendingAuditAnchor::none()));
     }
     let now = chrono::Utc::now();
     let now_str = now.to_rfc3339();
@@ -16460,7 +16508,8 @@ async fn pg_sever_namespace_standards_in_tx(
         now_str,
         None,
     );
-    pg_append_signed_event_with_chain_in_tx(
+    // #7241 - the caller emits the anchor after its COMMIT.
+    let anchor = pg_append_signed_event_with_chain_in_tx(
         tx,
         PgSignedEventInsert {
             id: &event.id,
@@ -16474,7 +16523,7 @@ async fn pg_sever_namespace_standards_in_tx(
         },
     )
     .await?;
-    Ok(changed)
+    Ok((changed, anchor))
 }
 
 /// #3192 — sqlite [`crate::storage::evict_tombstone_and_erase`] /
@@ -16486,7 +16535,7 @@ async fn pg_sever_namespace_standards_in_tx(
 async fn pg_hard_delete_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: &str,
-) -> Result<u64, sqlx::Error> {
+) -> Result<(u64, crate::governance::audit::PendingAuditAnchor), sqlx::Error> {
     // #1642 / #2493 / #2503 / #3272 C-1 — SEVER `namespace_meta`
     // UNCONDITIONALLY, BEFORE (and regardless of) the row-existence probe. An
     // inbound federated `deletions[]` (via `apply_remote_deletion`) naming an
@@ -16506,10 +16555,11 @@ async fn pg_hard_delete_in_tx(
     // WARN + signed `SUBSTRATE_NAMESPACE_STANDARD_SEVERED` event, at parity with
     // the sqlite `sever_namespace_standards` twin (previously a bare, silent
     // UPDATE).
-    pg_sever_namespace_standards_in_tx(tx, id).await?;
+    // #7241 - both audit anchors are returned for emission after the COMMIT.
+    let (_, sever_anchor) = pg_sever_namespace_standards_in_tx(tx, id).await?;
     let leaf = pg_tombstone_and_erase_in_tx(tx, id).await?;
-    let Some((ref ns, ver)) = leaf else {
-        return Ok(0);
+    let Some((ref ns, ver, erase_anchor)) = leaf else {
+        return Ok((0, sever_anchor));
     };
     // No-op when the append-only spine is OFF (the helper itself gates).
     pg_emit_revision_leaf_if_enabled(
@@ -16527,7 +16577,7 @@ async fn pg_hard_delete_in_tx(
         .execute(&mut **tx)
         .await?
         .rows_affected();
-    Ok(rows)
+    Ok((rows, sever_anchor.merge(erase_anchor)))
 }
 
 /// #3192 — sqlite `tombstone_and_erase` parity for one live row: crypto-erase
@@ -16538,7 +16588,7 @@ async fn pg_hard_delete_in_tx(
 async fn pg_tombstone_and_erase_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: &str,
-) -> Result<Option<(String, i64)>, sqlx::Error> {
+) -> Result<Option<(String, i64, crate::governance::audit::PendingAuditAnchor)>, sqlx::Error> {
     let row: Option<(String, i64, Option<String>)> =
         sqlx::query_as(SQL_SELECT_NS_VERSION_AGENT_BY_ID)
             .bind(id)
@@ -16594,7 +16644,8 @@ async fn pg_tombstone_and_erase_in_tx(
         now_str.clone(),
         None,
     );
-    pg_append_signed_event_with_chain_in_tx(
+    // #7241 - the caller emits the anchor after its COMMIT.
+    let anchor = pg_append_signed_event_with_chain_in_tx(
         tx,
         PgSignedEventInsert {
             id: &event.id,
@@ -16608,7 +16659,7 @@ async fn pg_tombstone_and_erase_in_tx(
         },
     )
     .await?;
-    Ok(Some((ns, ver)))
+    Ok(Some((ns, ver, anchor)))
 }
 
 /// #3286 — purge the two NON-cascaded crypto-erase remanence tables
@@ -16997,6 +17048,9 @@ struct PgFederationMergePreimage {
     content: String,
     /// The stored at-rest ciphertext envelope (NULL when encryption is off).
     encrypted_envelope: Option<Vec<u8>>,
+    /// #4206 — the row's `metadata.agent_id`, the identity its envelope is
+    /// sealed to (`""` for an unowned / legacy row).
+    owner_agent_id: String,
 }
 
 /// v1.0.0 #2954 — probe the `(title, namespace)` row
@@ -17005,17 +17059,18 @@ struct PgFederationMergePreimage {
 /// upsert are ONE atomic unit under READ COMMITTED (the row lock blocks a
 /// concurrent writer from slipping between the probe and the upsert, so the
 /// Rust-side won-and-changed predicate cannot diverge from the SQL `CASE`).
-/// `None` when the append-only spine is OFF (default → no probe, byte-identical)
-/// or when no prior row exists (a fresh INSERT destroys nothing). MUST run in
-/// the SAME tx as the upsert (caller-held).
+/// `None` when no live row holds the slot (a fresh INSERT destroys nothing).
+/// Always read (#4206: the pre-merge archive snapshot needs it whether or not
+/// the append-only spine is armed; the SUPERSEDE leaf itself stays gated inside
+/// [`pg_emit_revision_leaf_if_enabled`]). The row filter is the title-slot
+/// index predicate, so the probed row is exactly the one the partial
+/// `ON CONFLICT` target resolves to. MUST run in the SAME tx as the upsert
+/// (caller-held).
 async fn pg_probe_federation_merge_preimage(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     title: &str,
     namespace: &str,
 ) -> Result<Option<PgFederationMergePreimage>, sqlx::Error> {
-    if !crate::config::append_only_enabled() {
-        return Ok(None);
-    }
     // #2954 — serialize concurrent same-`(title, namespace)` applies WITHIN the
     // caller's tx so a FRESH-INSERT race cannot silently drop a leaf. The
     // `FOR UPDATE` below only locks an EXISTING row; when NO row holds the key
@@ -17024,13 +17079,15 @@ async fn pg_probe_federation_merge_preimage(
     // place with NO pre-image → no supersede leaf (the sqlite path is immune —
     // its `BEGIN IMMEDIATE` RESERVED lock already spans probe→upsert). Exactly
     // ONE key is locked per apply (a single memory), so there is no
-    // lock-ordering deadlock. Only taken on the armed path (this fn already
-    // returned above when the spine is off), so the default apply is unchanged.
+    // lock-ordering deadlock. #4206: taken on every apply, because the
+    // pre-merge archive snapshot needs the same race-free pre-image.
     pg_advisory_lock_title_namespace(tx, title, namespace).await?;
-    let row = sqlx::query(
-        "SELECT updated_at, id, version, content, encrypted_envelope \
-         FROM memories WHERE title = $1 AND namespace = $2 FOR UPDATE",
-    )
+    let row = sqlx::query(&format!(
+        "SELECT updated_at, id, version, content, encrypted_envelope, \
+                COALESCE(metadata->>'agent_id', '') AS owner_agent_id \
+         FROM memories WHERE title = $1 AND namespace = $2 AND {} FOR UPDATE",
+        crate::models::TITLE_SLOT_INDEX_PREDICATE
+    ))
     .bind(title)
     .bind(namespace)
     .fetch_optional(&mut **tx)
@@ -17044,7 +17101,24 @@ async fn pg_probe_federation_merge_preimage(
         version: row.try_get("version")?,
         content: row.try_get("content")?,
         encrypted_envelope: row.try_get(field_names::ENCRYPTED_ENVELOPE)?,
+        owner_agent_id: row.try_get("owner_agent_id")?,
     }))
+}
+
+/// #4206 — the inbound row wins the title-slot LWW tiebreak, byte-for-byte the
+/// `ON CONFLICT … CASE` arm of `apply_remote_memory` (`timestamptz` at
+/// MICROSECOND resolution, then `id`). `inbound_updated_at` is truncated to µs
+/// so a sub-µs tie cannot disagree with the SQL (#2954 FIX 4).
+fn pg_inbound_wins(
+    pre: &PgFederationMergePreimage,
+    inbound_updated_at: DateTime<Utc>,
+    inbound_id: &str,
+) -> bool {
+    use chrono::DurationRound;
+    let inbound_us = inbound_updated_at
+        .duration_trunc(chrono::Duration::microseconds(1))
+        .unwrap_or(inbound_updated_at);
+    inbound_us > pre.updated_at || (inbound_us == pre.updated_at && inbound_id > pre.id.as_str())
 }
 
 /// v0.9.0 G13-mem (#1859, COND 1) — the postgres half of the SINGLE
@@ -20522,14 +20596,14 @@ impl PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("pending_action audit begin tx", e))?;
-        crate::store::postgres_parity::emit_pending_action_event_in_tx(
+        let anchor = crate::store::postgres_parity::emit_pending_action_event_in_tx(
             &mut tx,
             pa,
             event_type,
             decided_by_override,
         )
         .await?;
-        tx.commit()
+        pg_commit_and_emit(tx, anchor)
             .await
             .map_err(|e| to_store_err("pending_action audit commit", e))
     }
@@ -20996,7 +21070,7 @@ impl MemoryStore for PostgresStore {
             now.to_rfc3339(),
             Some(&cause),
         );
-        pg_append_signed_event_with_chain_in_tx(
+        let anchor = pg_append_signed_event_with_chain_in_tx(
             &mut tx,
             PgSignedEventInsert {
                 id: &event.id,
@@ -21011,7 +21085,7 @@ impl MemoryStore for PostgresStore {
         )
         .await
         .map_err(|e| to_store_err("operator_dequarantine append signed_event", e))?;
-        tx.commit()
+        crate::store::postgres::pg_commit_and_emit(tx, anchor)
             .await
             .map_err(|e| to_store_err("operator_dequarantine commit", e))?;
         // #2402 — the SAME observability the sqlite funnel emits, at the same
@@ -22570,7 +22644,7 @@ impl MemoryStore for PostgresStore {
         // signed_events chain row in the SAME tx (#1415) so audit can
         // prove L4 caught the turn and never lags the data.
         let ev = &write.signed_event;
-        pg_append_signed_event_with_chain_in_tx(
+        let anchor = pg_append_signed_event_with_chain_in_tx(
             &mut tx,
             PgSignedEventInsert {
                 id: &ev.id,
@@ -22587,7 +22661,7 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err("capture_turn append signed_event", e))?;
 
-        tx.commit()
+        crate::store::postgres::pg_commit_and_emit(tx, anchor)
             .await
             .map_err(|e| to_store_err("commit capture_turn tx", e))?;
 
@@ -23701,17 +23775,17 @@ impl MemoryStore for PostgresStore {
         // #1799 — DELETE+INSERT the prior content into `archived_memories`
         // under archive_reason='in_place_edit', SAME memory_id (no fork),
         // copying the exact 37-column list from the optimistic path's
-        // snapshot block (~L3722). The DELETE only ever removes a stale
-        // in_place_edit snapshot of this id (supersede forks a new id +
-        // deletes the old live row; GC deletes the live row; restore
-        // removes the archive row on success — so a live, in-place-
-        // editable row can never collide with a different archive_reason).
+        // snapshot block (~L3722). The per-id slot holds ONE
+        // pre-image regardless of reason: a `federation_merge` snapshot
+        // (#1773/#3961 same-id lane, #4206 title-slot lane) can occupy it,
+        // so this DELETE may remove that record too. The newest pre-image
+        // is the one kept; per-reason retention is tracked under #6048.
         if content_changed {
             sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
                 .bind(id)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| to_store_err("clear prior in_place_edit snapshot", e))?;
+                .map_err(|e| to_store_err("clear prior archive record for this id", e))?;
             sqlx::query(SQL_ARCHIVE_SNAPSHOT_LIVE_ROW)
                 .bind(id)
                 .bind(crate::models::field_names::ARCHIVE_REASON_IN_PLACE_EDIT)
@@ -24052,13 +24126,13 @@ impl MemoryStore for PostgresStore {
                     false,
                 )
                 .await?;
-                let rows = pg_hard_delete_in_tx(&mut tx, id)
+                let (rows, anchor) = pg_hard_delete_in_tx(&mut tx, id)
                     .await
                     .map_err(|e| to_store_err("delete", e))?;
                 if rows == 0 {
                     return Err(StoreError::NotFound { id: id.to_string() });
                 }
-                tx.commit()
+                pg_commit_and_emit(tx, anchor)
                     .await
                     .map_err(|e| to_store_err("delete commit tx", e))?;
                 Ok(())
@@ -24997,16 +25071,47 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("begin apply_remote_memory tx", e))?;
-        // #2954 — armed-only pre-image of the `(title, namespace)` row this
-        // upsert may overwrite, `SELECT … FOR UPDATE` inside this tx so the
-        // probe and the newer-wins upsert are atomic under READ COMMITTED (the
-        // row lock is load-bearing: it stops a concurrent writer from changing
-        // the row between the probe and the upsert whose verdict it mirrors).
-        // `None` when the spine is OFF (byte-identical) or no prior row exists.
+        // #2954 / #4206 — pre-image of the `(title, namespace)` row this upsert
+        // may overwrite, `SELECT … FOR UPDATE` inside this tx so the probe, the
+        // pre-merge snapshot and the newer-wins upsert are atomic under READ
+        // COMMITTED (the row lock is load-bearing: it stops a concurrent writer
+        // from changing the row between the probe and the upsert whose verdict
+        // it mirrors). `None` when no live row holds the slot.
         let merge_preimage =
             pg_probe_federation_merge_preimage(&mut tx, &memory.title, &memory.namespace)
                 .await
                 .map_err(|e| to_store_err("apply_remote_memory merge pre-image probe", e))?;
+        // #4206 (the title-slot half of #1773 / #3961) — when the inbound row
+        // wins the tiebreak AND its plaintext differs from the stored text,
+        // snapshot the pre-merge row into `archived_memories`
+        // (`federation_merge`, keyed by the LOCAL id) BEFORE the in-place
+        // rewrite, in this same tx, so the overwritten text stays recoverable.
+        // Compared on plaintext, before sealing (a fresh seal never matches), so
+        // a no-change replay leaves the earlier snapshot in place; an envelope
+        // that cannot be opened counts as changed. DELETE + INSERT keeps the
+        // most-recent snapshot (the sqlite `INSERT OR REPLACE` semantics).
+        if let Some(pre) = merge_preimage.as_ref()
+            && pg_inbound_wins(pre, updated_at, &memory.id)
+            && crate::storage::preimage_plaintext(
+                &pre.content,
+                pre.encrypted_envelope.as_deref(),
+                &pre.owner_agent_id,
+            )
+            .as_deref()
+                != Some(memory.content.as_str())
+        {
+            sqlx::query(SQL_DELETE_ARCHIVED_MEMORY_BY_ID)
+                .bind(&pre.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("apply_remote_memory clear prior snapshot", e))?;
+            sqlx::query(SQL_ARCHIVE_SNAPSHOT_LIVE_ROW)
+                .bind(&pre.id)
+                .bind(crate::models::field_names::ARCHIVE_REASON_FEDERATION_MERGE)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("apply_remote_memory pre-merge snapshot", e))?;
+        }
         // Sealed to the identity the SURVIVING row RETAINS: the newer-wins arm
         // takes the INBOUND envelope while the metadata overlay keeps the LOCAL
         // row's `agent_id` (#1784), so a peer-keyed seal left a row nothing
@@ -25343,8 +25448,8 @@ impl MemoryStore for PostgresStore {
         // this same tx, gated on that same won-and-changed predicate — computed
         // against the `FOR UPDATE` pre-image so it cannot diverge from the live
         // `CASE`. Postgres twin of the sqlite `insert_if_newer` #2954 wiring;
-        // the superseded pre-merge content lives only in the row it replaced,
-        // never in the leaf.
+        // the leaf is identity-only — the superseded pre-merge text is
+        // recoverable from the #4206 `federation_merge` snapshot taken above.
         if let Some(pre) = merge_preimage.as_ref() {
             // #2954 (FIX 4) — the SQL `CASE` compares `EXCLUDED.updated_at` and
             // `memories.updated_at` as `timestamptz`, whose resolution is
@@ -25355,12 +25460,7 @@ impl MemoryStore for PostgresStore {
             // sub-µs tie where the id-tiebreak favours the LOCAL row can no
             // longer emit a spurious leaf. `duration_trunc` cannot fail for a
             // 1µs unit; the fallback is defensive only.
-            use chrono::DurationRound;
-            let inbound_us = updated_at
-                .duration_trunc(chrono::Duration::microseconds(1))
-                .unwrap_or(updated_at);
-            let inbound_won = inbound_us > pre.updated_at
-                || (inbound_us == pre.updated_at && memory.id.as_str() > pre.id.as_str());
+            let inbound_won = pg_inbound_wins(pre, updated_at, &memory.id);
             let content_changed = remote_content != pre.content.as_str()
                 || remote_envelope.map(Vec::as_slice) != pre.encrypted_envelope.as_deref();
             if inbound_won && content_changed {
@@ -25971,6 +26071,8 @@ impl MemoryStore for PostgresStore {
         // S5-M2 parity: emit ONLY on a landed DENY transition. An APPROVE emits
         // later, from `execute_pending_action`, so its audit row captures the
         // POST-execute state — the sqlite ordering, preserved exactly.
+        // #7241 - the audit anchor is emitted only after the COMMIT below.
+        let mut anchor = crate::governance::audit::PendingAuditAnchor::none();
         if rows_affected > 0 && !approve {
             // Re-read INSIDE the tx so the audited row is the POST-update one
             // (`status = "rejected"`, `decided_by`/`decided_at` populated) —
@@ -25978,7 +26080,7 @@ impl MemoryStore for PostgresStore {
             // the pre-update row would commit a payload hash for a `pending`
             // status that no longer exists.
             if let Some(pa) = pg_get_pending_in_tx(&mut tx, id).await? {
-                crate::store::postgres_parity::emit_pending_action_event_in_tx(
+                anchor = crate::store::postgres_parity::emit_pending_action_event_in_tx(
                     &mut tx,
                     &pa,
                     "pending_action.denied",
@@ -25987,7 +26089,7 @@ impl MemoryStore for PostgresStore {
                 .await?;
             }
         }
-        tx.commit()
+        pg_commit_and_emit(tx, anchor)
             .await
             .map_err(|e| to_store_err("pending_decide commit", e))?;
         Ok(rows_affected > 0)
@@ -27194,7 +27296,7 @@ impl MemoryStore for PostgresStore {
                 crate::signed_events::event_types::IDENTITY_LINEAGE_REVOCATION
             }
         };
-        pg_append_signed_event_with_chain_in_tx(
+        let anchor = pg_append_signed_event_with_chain_in_tx(
             &mut tx,
             PgSignedEventInsert {
                 id: &witness_id,
@@ -27210,7 +27312,7 @@ impl MemoryStore for PostgresStore {
         .await
         .map_err(|e| to_store_err("append_lineage_record witness", e))?;
 
-        tx.commit()
+        crate::store::postgres::pg_commit_and_emit(tx, anchor)
             .await
             .map_err(|e| to_store_err("append_lineage_record commit tx", e))?;
         Ok(())
@@ -27614,6 +27716,8 @@ impl MemoryStore for PostgresStore {
                 // leaks (`federation_push_dlq` cleartext, `transcript_line_dedup`
                 // hash-oracle) AND record a FORGET tombstone per deleted id, all in
                 // THIS tx. 5-agent vote 4d3ea1c5.
+                // #7241 - audit anchors are emitted only after the COMMIT.
+                let mut anchor = crate::governance::audit::PendingAuditAnchor::none();
                 if !deleted.is_empty() {
                     let ids: Vec<String> = deleted.iter().map(|(id, _, _)| id.clone()).collect();
                     // #3286 — route through the shared SSOT so this forget reap and the
@@ -27681,7 +27785,7 @@ impl MemoryStore for PostgresStore {
                             erase_ts_str.clone(),
                             None,
                         );
-                        pg_append_signed_event_with_chain_in_tx(
+                        let appended = pg_append_signed_event_with_chain_in_tx(
                             &mut tx,
                             PgSignedEventInsert {
                                 id: &event.id,
@@ -27696,6 +27800,7 @@ impl MemoryStore for PostgresStore {
                         )
                         .await
                         .map_err(|e| to_store_err("forget crypto_erase attestation", e))?;
+                        anchor = anchor.merge(appended);
                     }
 
                     // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
@@ -27722,7 +27827,7 @@ impl MemoryStore for PostgresStore {
                     }
                 }
 
-                tx.commit()
+                pg_commit_and_emit(tx, anchor)
                     .await
                     .map_err(|e| to_store_err("forget commit tx", e))?;
                 Ok(deleted.len())
@@ -30287,10 +30392,13 @@ impl MemoryStore for PostgresStore {
                 // The victim set is read `FOR UPDATE` (ascending id, #4330) at the top
                 // of this transaction and every statement below is pinned to it, so the
                 // erased + tombstoned set and the deleted set cannot diverge.
-                if !archive {
+                // #7241 - the audit anchor is emitted only after the COMMIT below.
+                let anchor = if archive {
+                    crate::governance::audit::PendingAuditAnchor::none()
+                } else {
                     crate::store::postgres_parity::evict_tombstone_and_erase_in_tx(&mut tx, &victims, now)
-                        .await?;
-                }
+                        .await?
+                };
 
                 // #1783 — RETURNING id so the TTL-evicted set is known for AGE
                 // unprojection in THIS tx. gc is the most common delete path; the
@@ -30352,7 +30460,7 @@ impl MemoryStore for PostgresStore {
                     }
                 }
 
-                tx.commit()
+                pg_commit_and_emit(tx, anchor)
                     .await
                     .map_err(|e| to_store_err("gc commit", e))?;
                 Ok(evicted.len())
@@ -30496,6 +30604,8 @@ impl MemoryStore for PostgresStore {
                         .await
                         .map_err(|e| to_store_err("size_gc begin tx", e))?;
 
+                    // #7241 - the audit anchor is emitted only after the COMMIT below.
+                    let mut anchor = crate::governance::audit::PendingAuditAnchor::none();
                     if archive {
                         sqlx::query(&format!(
                             "INSERT INTO archived_memories (
@@ -30549,7 +30659,7 @@ impl MemoryStore for PostgresStore {
                                 .map_err(|e| to_store_err("size_gc read evict agent", e))?
                                 .flatten();
                         let victim = [(id.clone(), namespace.to_string(), evict_agent)];
-                        crate::store::postgres_parity::evict_tombstone_and_erase_in_tx(
+                        anchor = crate::store::postgres_parity::evict_tombstone_and_erase_in_tx(
                             &mut tx,
                             &victim,
                             chrono::Utc::now(),
@@ -30586,7 +30696,7 @@ impl MemoryStore for PostgresStore {
                         unproject_memory_from_age(&mut tx, &id).await?;
                     }
 
-                    tx.commit()
+                    pg_commit_and_emit(tx, anchor)
                         .await
                         .map_err(|e| to_store_err("size_gc commit", e))?;
                     Ok(())
@@ -32807,7 +32917,7 @@ impl MemoryStore for PostgresStore {
             now.to_rfc3339(),
             Some(&cause),
         );
-        pg_append_signed_event_with_chain_in_tx(
+        let anchor = pg_append_signed_event_with_chain_in_tx(
             &mut tx,
             PgSignedEventInsert {
                 id: &event.id,
@@ -32823,7 +32933,7 @@ impl MemoryStore for PostgresStore {
         )
         .await
         .map_err(|e| to_store_err("reclassify_memory_kind append signed_event", e))?;
-        tx.commit()
+        crate::store::postgres::pg_commit_and_emit(tx, anchor)
             .await
             .map_err(|e| to_store_err("reclassify_memory_kind commit", e))?;
         Ok(true)
@@ -33057,7 +33167,7 @@ impl MemoryStore for PostgresStore {
             .begin()
             .await
             .map_err(|e| to_store_err("undo: begin audit tx", e))?;
-        pg_append_signed_event_with_chain_in_tx(
+        let anchor = pg_append_signed_event_with_chain_in_tx(
             &mut tx,
             PgSignedEventInsert {
                 id: &event.id,
@@ -33075,7 +33185,7 @@ impl MemoryStore for PostgresStore {
         )
         .await
         .map_err(|e| to_store_err("undo: append signed_event", e))?;
-        tx.commit()
+        crate::store::postgres::pg_commit_and_emit(tx, anchor)
             .await
             .map_err(|e| to_store_err("undo: commit audit tx", e))?;
 

@@ -286,7 +286,7 @@ human approval.
 Before requesting human review, run all ten gates locally and paste the results into
 the PR description. The set is **four cargo gates** + **six script gates** — the two
 introduced by [#1200](https://github.com/alphaonedev/ai-memory-mcp/pull/1200) for the
-substrate-canonical-discipline campaign, plus the four added since (CLAUDE.md §"Lint
+substrate-canonical-discipline campaign, plus the four added since (docs/reference/CODE_STYLE.md §"Lint
 gates (issue #1174 PR10)" is the canonical contract).
 
 ```bash
