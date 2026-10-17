@@ -36,6 +36,14 @@ const EXTRACTOR_BUILD_BUDGET: std::time::Duration = std::time::Duration::from_mi
 /// milliseconds.
 const EXTRACTOR_RUN_BUDGET: std::time::Duration = std::time::Duration::from_mins(1);
 
+/// #7342 - lock file, under the scratch root, that serialises the nested
+/// `cargo build` + existence check + binary copy ACROSS processes.
+const BUILD_LOCK_FILE: &str = "build.lock";
+
+/// #7342 - prefix of the per-process copy of the uplifted binary
+/// (`bin-<pid>`); the tests spawn the copy, never cargo's uplifted file.
+const BIN_COPY_PREFIX: &str = "bin-";
+
 /// v1.0.0 #3140 — poll cadence while waiting on a child.
 const CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
@@ -61,8 +69,13 @@ static RUN_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// The fix is a process-wide `OnceLock`: the first test thread to
 /// reach `extractor_bin()` builds the binary; every other thread
 /// blocks on the `OnceLock`, then re-uses the cached `PathBuf`.
-/// All subsequent spawns observe a fully-linked, immutable
-/// executable.
+///
+/// #7342 - under `cargo nextest` every test is its own process, so the
+/// `OnceLock` serialises nothing across processes and cargo's re-uplift of
+/// `debug/transcript-extractor` (remove, then hardlink) races every other
+/// process. The returned path is therefore a per-process COPY made while an
+/// exclusive cross-process file lock is held around build + exists + copy;
+/// no later cargo build can touch it.
 fn extractor_bin() -> &'static PathBuf {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(build_extractor_once)
@@ -95,6 +108,20 @@ fn build_extractor_once() -> PathBuf {
         .join("transcript-extractor");
     std::fs::create_dir_all(&scratch_root).ok();
     let target_dir = scratch_root.join("ai-memory-transcript-extractor-target");
+
+    // #7342 - exclusive cross-process lock around the WHOLE sequence (build,
+    // existence check, copy). `File::lock` is stable since Rust 1.89; the
+    // lock is released by `unlock` below or by drop on any panic path.
+    let lock_path = scratch_root.join(BUILD_LOCK_FILE);
+    let build_lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .unwrap_or_else(|e| panic!("open build lock {}: {e}", lock_path.display()));
+    build_lock
+        .lock()
+        .unwrap_or_else(|e| panic!("lock build lock {}: {e}", lock_path.display()));
 
     // v1.0.0 #3140 — bounded. A nested `cargo build` blocks on the OUTER
     // cargo's package-cache lock, so an unbounded `.status()` here can park
@@ -135,7 +162,22 @@ fn build_extractor_once() -> PathBuf {
         "extractor binary missing at {}",
         bin.display()
     );
-    bin
+
+    // #7342 - spawn a private copy: cargo may re-uplift `bin` the moment the
+    // lock is released. `fs::copy` keeps the executable mode bits. The copy is
+    // left under `.local-runs/` (no safe exit hook; the dir is gitignored).
+    let bin_copy = scratch_root.join(format!("{BIN_COPY_PREFIX}{}", std::process::id()));
+    std::fs::copy(&bin, &bin_copy).unwrap_or_else(|e| {
+        panic!(
+            "copy extractor {} to {}: {e}",
+            bin.display(),
+            bin_copy.display()
+        )
+    });
+    build_lock
+        .unlock()
+        .unwrap_or_else(|e| panic!("unlock build lock {}: {e}", lock_path.display()));
+    bin_copy
 }
 
 /// Pipe `envelope` to the extractor in one-shot mode and return
