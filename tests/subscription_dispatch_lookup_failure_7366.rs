@@ -109,9 +109,7 @@ fn a_sqlite_lookup_failure_leaves_a_durable_dlq_record_7366() {
         "the record must exist when the dispatch call returns (before the ladder), got {at_return:?}"
     );
     // Let the exhausted ladder finish: it must leave the single record in place.
-    std::thread::sleep(
-        (ladder_floor() + Duration::from_secs(1)).saturating_sub(started.elapsed()),
-    );
+    std::thread::sleep((ladder_floor() + Duration::from_secs(1)).saturating_sub(started.elapsed()));
     let rows = wait_for_rows(&path, 1);
     let elapsed = started.elapsed();
     assert_eq!(
@@ -570,12 +568,19 @@ mod postgres_funnel {
             dispatch_event_postgres(&state, EVENT, &id, NAMESPACE, Some(WRITER), None).await;
         }
         let took = started.elapsed();
-        eprintln!("7500 measured: 3 rows dispatched in {took:?} (ladder floor {:?})", ladder_floor());
+        eprintln!(
+            "7500 measured: 3 rows dispatched in {took:?} (ladder floor {:?})",
+            ladder_floor()
+        );
         assert!(
             took < ladder_floor() / 4,
             "3 postgres dispatches must return well under one ladder; took {took:?}"
         );
-        assert_eq!(durable_rows(&path).len(), 3, "each failed row has its record");
+        assert_eq!(
+            durable_rows(&path).len(),
+            3,
+            "each failed row has its record"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

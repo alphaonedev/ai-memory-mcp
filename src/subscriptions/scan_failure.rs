@@ -14,11 +14,13 @@
 //!
 //! The fix has two steps, shared by both funnels:
 //!
-//! 1. [`retry_lookup`] / [`retry_lookup_async`] retry the lookup on the
-//!    existing [`super::RETRY_BACKOFFS`] ladder (bounded: one initial attempt
-//!    plus one retry per step);
-//! 2. when the final attempt still fails, [`record_dispatch_scan_failure`]
-//!    writes a durable `subscription_dlq` row under
+//! 1. the first failure is recorded at once ([`record_scan_failure_first`],
+//!    #7498/#7499), then the lookup is retried on the existing
+//!    [`super::RETRY_BACKOFFS`] ladder off the request path (bounded: one
+//!    initial attempt plus one retry per step); a recovered retry dispatches
+//!    and deletes the record ([`clear_scan_failure`]);
+//! 2. when the final attempt still fails, [`settle_scan_failure`] updates the
+//!    durable `subscription_dlq` row under
 //!    [`DISPATCH_SCAN_FAILED_SUB_ID`] that carries everything needed to
 //!    re-dispatch the event (event, memory id, namespace, writer, details).
 //!
@@ -125,37 +127,38 @@ pub fn classify_sqlstate(sqlstate: Option<&str>) -> String {
     }
 }
 
-/// Run `op`, retrying a failure on `backoffs` with a `tokio::time::sleep`
-/// pause (the executor thread is never blocked). Returns the last error once
-/// the ladder is exhausted.
+/// The first lookup attempt already failed with `first`: pause on `backoffs`
+/// with a `tokio::time::sleep` (the executor thread is never blocked) and
+/// retry `op` once per step. Returns the first success, or the error of the
+/// final attempt once the ladder is exhausted.
 ///
 /// # Errors
 ///
-/// The error of the final attempt.
-pub async fn retry_lookup_async<T, E, F, Fut>(backoffs: &[Duration], mut op: F) -> Result<T, E>
+/// The error of the final attempt (`first` when `backoffs` is empty).
+pub async fn retry_after_failure_async<T, E, F, Fut>(
+    backoffs: &[Duration],
+    first: E,
+    mut op: F,
+) -> Result<T, E>
 where
     E: std::fmt::Display,
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
 {
-    let mut retried = 0;
-    loop {
+    let mut last = first;
+    for (n, pause) in backoffs.iter().enumerate() {
+        tracing::warn!(
+            attempt = n + 1,
+            error = %last,
+            "subscriber lookup failed during dispatch; retrying (#7366)"
+        );
+        tokio::time::sleep(*pause).await;
         match op().await {
             Ok(v) => return Ok(v),
-            Err(e) => match backoffs.get(retried) {
-                Some(pause) => {
-                    tracing::warn!(
-                        attempt = retried + 1,
-                        error = %e,
-                        "subscriber lookup failed during dispatch; retrying (#7366)"
-                    );
-                    tokio::time::sleep(*pause).await;
-                    retried += 1;
-                }
-                None => return Err(e),
-            },
+            Err(e) => last = e,
         }
     }
+    Err(last)
 }
 
 /// The dispatch inputs of the event whose lookup failed. Everything here is
@@ -172,21 +175,48 @@ pub struct ScanFailure<'a> {
 /// durable `subscription_dlq` row under [`DISPATCH_SCAN_FAILED_SUB_ID`].
 ///
 /// Best-effort and never panics: a DLQ write failure is itself logged at
-/// ERROR; the WARN fires regardless.
+/// ERROR; the WARN fires regardless. The row is final: it states that the
+/// whole retry ladder was spent. See [`record_scan_failure_first`] for the
+/// record written BEFORE the ladder.
 pub fn record_dispatch_scan_failure(
     db_path: &std::path::Path,
     failure: &ScanFailure<'_>,
     error_class: &str,
 ) {
-    let attempts = lookup_attempts();
+    let _ = write_record(db_path, failure, error_class, lookup_attempts());
+}
+
+/// Record-first (#7498, #7499): write the durable row for a lookup that has
+/// failed ONCE, before the retry ladder runs, so a process exit or a cancelled
+/// future inside the ladder window never loses the event. Returns the row id
+/// to hand to [`clear_scan_failure`] (a retry recovered) or
+/// [`settle_scan_failure`] (the ladder was spent or skipped); `None` when the
+/// row could not be written (already logged at ERROR).
+#[must_use]
+pub fn record_scan_failure_first(
+    db_path: &std::path::Path,
+    failure: &ScanFailure<'_>,
+    error_class: &str,
+) -> Option<i64> {
+    write_record(db_path, failure, error_class, 1)
+}
+
+fn write_record(
+    db_path: &std::path::Path,
+    failure: &ScanFailure<'_>,
+    error_class: &str,
+    attempts: usize,
+) -> Option<i64> {
+    let ladder_spent = attempts >= lookup_attempts();
     tracing::warn!(
         event_type = %failure.event,
         memory_id = %failure.memory_id,
         namespace = %failure.namespace,
         error_class = %error_class,
         attempts = attempts,
-        "subscriber lookup FAILED after retries; the event was recorded to the \
-         subscription DLQ for re-dispatch instead of being dropped (#7366)"
+        ladder_spent = ladder_spent,
+        "subscriber lookup FAILED; the event is recorded to the subscription \
+         DLQ for re-dispatch instead of being dropped (#7366)"
     );
     let now = chrono::Utc::now().to_rfc3339();
     let correlation_id = uuid::Uuid::new_v4().to_string();
@@ -199,11 +229,8 @@ pub fn record_dispatch_scan_failure(
         "error_class": error_class,
     })
     .to_string();
-    let last_error = format!(
-        "subscriber lookup failed after {attempts} attempts ({error_class}); \
-         event deferred for re-dispatch (#7366)"
-    );
-    if let Err(e) = insert_capped(
+    let last_error = settled_text(attempts, error_class);
+    match insert_capped(
         db_path,
         &scan_failure_sub_id(failure.namespace),
         &correlation_id,
@@ -211,17 +238,96 @@ pub fn record_dispatch_scan_failure(
         &payload,
         &last_error,
         &now,
+        attempts,
     ) {
-        tracing::error!(
-            correlation_id = %correlation_id,
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::error!(
+                correlation_id = %correlation_id,
+                error = %e,
+                "could not record the failed-lookup DLQ row: the event is lost (#7366)"
+            );
+            None
+        }
+    }
+}
+
+/// The stored `last_error` of a failed-lookup row after `attempts` attempts.
+fn settled_text(attempts: usize, error_class: &str) -> String {
+    if attempts >= lookup_attempts() {
+        format!(
+            "subscriber lookup failed after {attempts} attempts ({error_class}); \
+             event deferred for re-dispatch (#7366)"
+        )
+    } else {
+        format!(
+            "subscriber lookup failed ({error_class}); recorded before the retry \
+             ladder, removed if a retry recovers (#7366)"
+        )
+    }
+}
+
+/// A retry recovered and the event was dispatched: delete the record that
+/// [`record_scan_failure_first`] wrote. Logged, never panics; a row that stays
+/// behind is a stale record, never a lost event.
+pub fn clear_scan_failure(db_path: &std::path::Path, row_id: i64) {
+    let prefix_len = i64::try_from(DISPATCH_SCAN_FAILED_SUB_ID.len()).unwrap_or(i64::MAX);
+    let cleared = crate::db::open(db_path)
+        .map_err(anyhow::Error::from)
+        .and_then(|conn| {
+            conn.execute(
+                "DELETE FROM subscription_dlq \
+                 WHERE id = ?1 AND substr(subscription_id, 1, ?2) = ?3",
+                rusqlite::params![row_id, prefix_len, DISPATCH_SCAN_FAILED_SUB_ID],
+            )
+            .map_err(anyhow::Error::from)
+        });
+    if let Err(e) = cleared {
+        tracing::warn!(
+            row_id = row_id,
             error = %e,
-            "could not record the failed-lookup DLQ row: the event is lost (#7366)"
+            "could not delete the recovered failed-lookup DLQ row; it stays as a stale record (#7498)"
         );
     }
 }
 
-/// Owned copy of a [`ScanFailure`], movable onto a worker thread.
-struct OwnedFailure {
+/// The ladder was spent (`attempts` = [`lookup_attempts`]) or skipped
+/// (`attempts` = 1, no worker available): update the record written by
+/// [`record_scan_failure_first`] so it states what actually happened.
+pub fn settle_scan_failure(
+    db_path: &std::path::Path,
+    row_id: i64,
+    attempts: usize,
+    error_class: &str,
+) {
+    let text = if attempts >= lookup_attempts() {
+        settled_text(attempts, error_class)
+    } else {
+        format!(
+            "subscriber lookup failed ({error_class}); no retry worker was available, \
+             event deferred for re-dispatch (#7366)"
+        )
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let attempts = i64::try_from(attempts).unwrap_or(i64::MAX);
+    let settled = crate::db::open(db_path)
+        .map_err(anyhow::Error::from)
+        .and_then(|conn| {
+            conn.execute(
+                "UPDATE subscription_dlq \
+                 SET retry_count = ?2, last_error = ?3, last_failed_at = ?4 WHERE id = ?1",
+                rusqlite::params![row_id, attempts, text, now],
+            )
+            .map_err(anyhow::Error::from)
+        });
+    if let Err(e) = settled {
+        tracing::warn!(row_id = row_id, error = %e, "could not settle the failed-lookup DLQ row (#7498)");
+    }
+}
+
+/// Owned copy of a [`ScanFailure`], movable onto a worker thread or task.
+#[derive(Clone)]
+pub struct OwnedFailure {
     event: String,
     memory_id: String,
     namespace: String,
@@ -230,7 +336,27 @@ struct OwnedFailure {
 }
 
 impl OwnedFailure {
-    fn of(f: &ScanFailure<'_>) -> Self {
+    /// Build the owned copy from the dispatch inputs.
+    #[must_use]
+    pub fn new(
+        event: &str,
+        memory_id: &str,
+        namespace: &str,
+        agent_id: Option<&str>,
+        details: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            event: event.to_string(),
+            memory_id: memory_id.to_string(),
+            namespace: namespace.to_string(),
+            agent_id: agent_id.map(str::to_string),
+            details,
+        }
+    }
+
+    /// Copy `f` so it can move onto a worker.
+    #[must_use]
+    pub fn of(f: &ScanFailure<'_>) -> Self {
         Self {
             event: f.event.to_string(),
             memory_id: f.memory_id.to_string(),
@@ -240,7 +366,9 @@ impl OwnedFailure {
         }
     }
 
-    fn borrowed(&self) -> ScanFailure<'_> {
+    /// Borrow the copy back as a [`ScanFailure`].
+    #[must_use]
+    pub fn borrowed(&self) -> ScanFailure<'_> {
         ScanFailure {
             event: &self.event,
             memory_id: &self.memory_id,
@@ -252,7 +380,7 @@ impl OwnedFailure {
 }
 
 /// Releases a [`BACKGROUND_RETRIES`] slot when the worker ends.
-struct Slot;
+pub struct Slot;
 
 impl Drop for Slot {
     fn drop(&mut self) {
@@ -260,7 +388,9 @@ impl Drop for Slot {
     }
 }
 
-fn take_slot() -> Option<Slot> {
+/// Claim one of the [`MAX_BACKGROUND_LOOKUP_RETRIES`] worker slots.
+#[must_use]
+pub fn take_slot() -> Option<Slot> {
     let taken = BACKGROUND_RETRIES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if taken >= MAX_BACKGROUND_LOOKUP_RETRIES {
         BACKGROUND_RETRIES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -297,8 +427,10 @@ pub(super) fn on_sqlite_lookup_failure(
 /// recovers and records the failure when the ladder is exhausted. With every
 /// worker slot busy, or the worker unspawnable, record at once.
 pub(super) fn retry_off_lock(db_path: &std::path::Path, failure: &ScanFailure<'_>, class: &str) {
+    // Record-first (#7498): the durable row exists before the ladder starts.
+    let row = record_scan_failure_first(db_path, failure, class);
     let Some(slot) = take_slot() else {
-        record_dispatch_scan_failure(db_path, failure, class);
+        settle_or_record(db_path, failure, class, row, 1);
         return;
     };
     let owned = OwnedFailure::of(failure);
@@ -308,7 +440,17 @@ pub(super) fn retry_off_lock(db_path: &std::path::Path, failure: &ScanFailure<'_
         .name("dispatch-lookup-retry".to_string())
         .spawn(move || {
             let _slot = slot;
-            let conn = crate::db::open(&path).ok();
+            let conn = match crate::db::open(&path) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    tracing::error!(
+                        path = %path.display(),
+                        error = %e,
+                        "lookup-retry worker could not open the database; the failed-lookup record stays (#7505)"
+                    );
+                    None
+                }
+            };
             for pause in RETRY_BACKOFFS {
                 std::thread::sleep(*pause);
                 let Some(c) = conn.as_ref() else { continue };
@@ -324,14 +466,42 @@ pub(super) fn retry_off_lock(db_path: &std::path::Path, failure: &ScanFailure<'_
                         owned.details.clone(),
                         true,
                     );
+                    // Dispatched first, then the record goes: a crash in
+                    // between leaves a stale record, never a lost event.
+                    if let Some(id) = row {
+                        clear_scan_failure(&path, id);
+                    }
                     return;
                 }
             }
-            record_dispatch_scan_failure(&path, &owned.borrowed(), &class_owned);
+            settle_or_record(
+                &path,
+                &owned.borrowed(),
+                &class_owned,
+                row,
+                lookup_attempts(),
+            );
         });
     if let Err(e) = spawned {
-        tracing::warn!(error = %e, "could not spawn the lookup-retry worker; recording at once (#7410)");
-        record_dispatch_scan_failure(db_path, failure, class);
+        tracing::warn!(error = %e, "could not spawn the lookup-retry worker; settling the record at once (#7410)");
+        settle_or_record(db_path, failure, class, row, 1);
+    }
+}
+
+/// The ladder is spent or was skipped: settle the record written first, or
+/// write it now when the first write failed.
+pub fn settle_or_record(
+    db_path: &std::path::Path,
+    failure: &ScanFailure<'_>,
+    class: &str,
+    row: Option<i64>,
+    attempts: usize,
+) {
+    match row {
+        Some(id) => settle_scan_failure(db_path, id, attempts, class),
+        None => {
+            let _ = write_record(db_path, failure, class, attempts);
+        }
     }
 }
 
@@ -346,8 +516,9 @@ fn insert_capped(
     payload: &str,
     last_error: &str,
     now: &str,
-) -> anyhow::Result<()> {
-    let conn = rusqlite::Connection::open(db_path)?;
+    attempts: usize,
+) -> anyhow::Result<i64> {
+    let conn = crate::db::open(db_path)?;
     let prefix_len = i64::try_from(DISPATCH_SCAN_FAILED_SUB_ID.len()).unwrap_or(i64::MAX);
     let inserted = conn.execute(
         "INSERT INTO subscription_dlq \
@@ -362,7 +533,7 @@ fn insert_capped(
             correlation_id,
             event,
             payload,
-            i64::try_from(lookup_attempts()).unwrap_or(i64::MAX),
+            i64::try_from(attempts).unwrap_or(i64::MAX),
             last_error,
             now,
             SCAN_FAILURE_MAX_PER_NAMESPACE,
@@ -377,7 +548,7 @@ fn insert_capped(
             "failed-lookup DLQ at cap (per-namespace {SCAN_FAILURE_MAX_PER_NAMESPACE}, total {SCAN_FAILURE_MAX_TOTAL})"
         );
     }
-    Ok(())
+    Ok(conn.last_insert_rowid())
 }
 
 /// Whether `row` may be shown to `caller` by the DLQ inspector.
@@ -405,28 +576,31 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn retry_lookup_async_is_bounded_and_recovers_7366() {
+    async fn retry_after_failure_async_is_bounded_and_recovers_7366() {
         let calls = std::sync::atomic::AtomicUsize::new(0);
-        let got: Result<u32, String> = retry_lookup_async(&[Duration::ZERO; 2], || {
-            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-            async move {
-                if n < 2 {
-                    Err("boom".to_string())
-                } else {
-                    Ok(1)
+        let got: Result<u32, String> =
+            retry_after_failure_async(&[Duration::ZERO; 2], "first".to_string(), || {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                async move {
+                    if n < 2 {
+                        Err("boom".to_string())
+                    } else {
+                        Ok(1)
+                    }
                 }
-            }
-        })
-        .await;
+            })
+            .await;
         assert_eq!(got, Ok(1));
         let calls = std::sync::atomic::AtomicUsize::new(0);
-        let got: Result<u32, String> = retry_lookup_async(&[Duration::ZERO; 2], || {
-            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async { Err("down".to_string()) }
-        })
-        .await;
+        let got: Result<u32, String> =
+            retry_after_failure_async(&[Duration::ZERO; 2], "first".to_string(), || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Err("down".to_string()) }
+            })
+            .await;
         assert!(got.is_err());
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        // The first failure was already taken by the caller: one retry per pause.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
