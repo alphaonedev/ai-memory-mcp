@@ -445,17 +445,7 @@ pub(super) fn retry_off_lock(db_path: &std::path::Path, failure: &ScanFailure<'_
         .name("dispatch-lookup-retry".to_string())
         .spawn(move || {
             let _slot = slot;
-            let conn = match crate::db::open(&path) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    tracing::error!(
-                        path = %path.display(),
-                        error = %e,
-                        "lookup-retry worker could not open the database; the failed-lookup record stays (#7505)"
-                    );
-                    None
-                }
-            };
+            let conn = open_for_retry(&path);
             for pause in RETRY_BACKOFFS {
                 std::thread::sleep(*pause);
                 let Some(c) = conn.as_ref() else { continue };
@@ -491,6 +481,11 @@ pub(super) fn retry_off_lock(db_path: &std::path::Path, failure: &ScanFailure<'_
         tracing::warn!(error = %e, "could not spawn the lookup-retry worker; settling the record at once (#7410)");
         settle_or_record(db_path, failure, class, row, 1);
     }
+}
+
+/// The retry worker's own connection.
+fn open_for_retry(path: &std::path::Path) -> Option<rusqlite::Connection> {
+    crate::db::open(path).ok()
 }
 
 /// The ladder is spent or was skipped: settle the record written first, or
@@ -623,6 +618,110 @@ mod tests {
         assert!(got.is_err());
         // The first failure was already taken by the caller: one retry per pause.
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    /// Captures tracing output so a test can assert what an ERROR line carries.
+    #[derive(Clone, Default)]
+    struct Capture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Ok(mut g) = self.0.lock() {
+                g.extend_from_slice(buf);
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn captured<F: FnOnce()>(f: F) -> String {
+        let cap = Capture::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(cap.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        tracing::subscriber::with_default(sub, f);
+        let bytes = cap.0.lock().map(|g| g.clone()).unwrap_or_default();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    fn double_failure_error_names_the_event_and_never_the_payload_7504() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The directory does not exist, so the sqlite open fails: both the
+        // lookup and its record failed.
+        let path = dir.path().join("missing-dir").join("x.db");
+        let details = serde_json::json!({"secret": "PAYLOAD-SECRET-7504"});
+        let out = captured(|| {
+            record_dispatch_scan_failure(
+                &path,
+                &ScanFailure {
+                    event: "memory_store",
+                    memory_id: "mem-7504",
+                    namespace: "team/ns-7504",
+                    agent_id: Some("ai:writer"),
+                    details: Some(&details),
+                },
+                "sqlite_error",
+            );
+        });
+        let line = out
+            .lines()
+            .find(|l| l.contains("ERROR"))
+            .unwrap_or_default()
+            .to_string();
+        assert!(line.contains("mem-7504"), "memory_id on the ERROR line: {line}");
+        assert!(line.contains("memory_store"), "event kind on the ERROR line: {line}");
+        assert!(line.contains("team/ns-7504"), "namespace on the ERROR line: {line}");
+        assert!(
+            !out.contains("PAYLOAD-SECRET-7504"),
+            "the payload must never be logged"
+        );
+    }
+
+    #[test]
+    fn worker_open_failure_is_logged_at_error_with_the_path_7505() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing-dir").join("w.db");
+        let out = captured(|| {
+            assert!(open_for_retry(&path).is_none());
+        });
+        let line = out
+            .lines()
+            .find(|l| l.contains("ERROR"))
+            .unwrap_or_default()
+            .to_string();
+        assert!(line.contains("w.db"), "the path on the ERROR line: {line}");
+    }
+
+    #[test]
+    fn recorder_migrates_a_fresh_database_through_the_open_funnel_7507() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fresh.db");
+        // A file with no schema at all: the raw open this replaced failed
+        // with "no such table: subscription_dlq".
+        let id = record_scan_failure_first(
+            &path,
+            &ScanFailure {
+                event: "memory_store",
+                memory_id: "m",
+                namespace: "team/x",
+                agent_id: None,
+                details: None,
+            },
+            "sqlite_error",
+        );
+        assert!(id.is_some(), "the funnel opens and migrates the database");
     }
 
     #[test]
