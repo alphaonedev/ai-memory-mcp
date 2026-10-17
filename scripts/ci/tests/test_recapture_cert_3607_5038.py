@@ -41,6 +41,13 @@ STUB = '''#!%(python)s
 import os, sys
 args = sys.argv[1:]
 env = os.environ
+# Log each start: the argv, and the passphrase env (#4829: never on an argv).
+with open(sys.argv[0] + '.log', 'a') as log:
+    log.write('ARGV ' + repr(args) + '\\n')
+    if 'AI_MEMORY_DB_PASSPHRASE' in env:
+        log.write('PASSENV ' + env['AI_MEMORY_DB_PASSPHRASE'] + '\\n')
+    log.write('ENVSEEN sync=' + env.get('AI_MEMORY_DB_SYNCHRONOUS', '-')
+              + ' db=' + env.get('AI_MEMORY_DB', '-') + '\\n')
 if args[:2] == ['rules', 'keygen']:
     kd = env['AI_MEMORY_KEY_DIR']
     open(os.path.join(kd, 'operator.key'), 'w').write('k\\n')
@@ -148,7 +155,7 @@ class RecaptureBase(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def run_recapture(self, sqlcipher_bin=None):
+    def run_recapture(self, sqlcipher_bin=None, extra_args=(), cwd=None, extra_env=None):
         env = {
             'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
             'HOME': str(self.home),
@@ -156,10 +163,12 @@ class RecaptureBase(unittest.TestCase):
             'DEFAULT_BIN': str(self.default_bin),
             'SQLCIPHER_BIN': str(sqlcipher_bin or self.sqlcipher_bin),
         }
+        env.update(extra_env or {})
         script = self.root / 'scripts' / SCRIPT_NAME
         cmd = ['bash', str(script)] if script.suffix == '.sh' else [sys.executable, str(script)]
+        cmd = cmd + list(extra_args)
         before = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
-        done = subprocess.run(cmd, env=env, cwd=str(self.root), capture_output=True, text=True)
+        done = subprocess.run(cmd, env=env, cwd=str(cwd or self.root), capture_output=True, text=True)
         after = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
         return done, {before, after}
 
