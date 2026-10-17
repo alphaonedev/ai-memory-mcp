@@ -100,10 +100,23 @@ class ClassifyTests(Base):
         self.assertEqual(self.cls('ser', '#[serial]\nfn t() {}').cls, 'a')
         self.assertEqual(self.cls('ser2', 'use serial_test::serial;').cls, 'a')
 
-    def test_federat_name_is_a(self):
+    def test_federat_name_alone_is_b_7343(self):
+        # #7343: a federation_* name with no Postgres / #[serial] / fixed-port
+        # evidence is self-contained (own tempdir, port 0), so the name alone no
+        # longer forces the serial shard.
         e = self.cls('federation_scale', 'fn x() {}')
-        self.assertEqual(e.cls, 'a')
-        self.assertIn('name:federat', e.reasons)
+        self.assertEqual((e.cls, e.reasons), ('b', []))
+
+    def test_federat_name_with_evidence_stays_a_7343(self):
+        bodies = ['use sqlx::query;', '#[serial]\nfn t() {}', 'use serial_test::serial;']
+        for i, body in enumerate(bodies):
+            e = self.cls('federation_ev%d' % i, body)
+            self.assertEqual(e.cls, 'a', body)
+            self.assertNotIn('name:federat', e.reasons)
+
+    def test_federat_name_with_fixed_port_shares_a_half_7343(self):
+        e = self.cls('federation_port', 'let a = "127.0.0.1:9077";')
+        self.assertEqual((e.cls, e.shared), ('b', ['port']))
 
     def test_unknown_source_is_a(self):
         e = pt.Exe('test', 'ghost', str(SCRATCH / 'tests' / 'ghost.rs'), '/x/ghost')
@@ -152,7 +165,7 @@ class PartitionTests(Base):
         return w
 
     def test_disjoint_and_complete(self):
-        exes = self.build({'a1': 'PgPool', 'b1': '', 'b2': '', 'b3': '', 'federation_x': ''})
+        exes = self.build({'a1': 'PgPool', 'b1': '', 'b2': '', 'b3': '', 'federation_x': 'PgPool'})
         serial, h1, h2, has_lib, totals, _ = pt.partition(
             exes, self.weights(a1=1, b1=40, b2=30, b3=20, federation_x=2), ['store::postgres'])
         pt.write_lists(SCRATCH / 'out', serial, h1, h2, has_lib)
@@ -378,6 +391,68 @@ class SharedHelperTests6344B1(Base):
     def test_pure_shared_unit_test_naming_a_postgres_url_stays_parallel_6344(self):
         got = self.run_part({'one': 'mod common;\nfn t() {}\n', 'two': 'mod common;\nfn t() {}\n'})
         self.assertEqual((got['one'].cls, got['two'].cls), ('b', 'b'), (got['one'].reasons, got['two'].reasons))
+
+
+class GenericHelperNames7352(Base):
+    """A helper's NAME is not evidence: only a real call of the helper is (#7352)."""
+
+    def setUp(self):
+        super().setUp()
+        fx('tests/common/mod.rs',
+           'pub mod pg_isolate;\n'
+           'pub fn plain() -> u8 { 1 }\n'
+           "pub fn shared_client() -> &'static reqwest::Client { client_for(1) }\n"
+           'pub struct Wire;\n'
+           'impl Wire { pub fn open(&self) { self.sock.connect(addr); } }\n'
+           'pub fn wait_ready() { Wire.open(); }\n')
+        fx('tests/common/pg_isolate.rs',
+           'pub fn connect(url: &str) -> sqlx::PgConnection { sqlx::PgConnection::connect(url) }\n'
+           'pub fn plan(url: &str) -> u8 { let _ = connect(url); 1 }\n'
+           'pub fn resolve() -> u8 { plan("x") }\n')
+
+    def run_part(self, bins):
+        lines = [artifact(['test'], n, fx('tests/%s.rs' % n, body)) for n, body in bins.items()]
+        exes = pt.parse_build_json(lines)
+        pt.partition(exes, {}, [])
+        return {e.name: e for e in exes}
+
+    def test_lifetime_static_is_not_an_item_7352(self):
+        rf = pt.walk_crate(str(SCRATCH / 'tests/common/mod.rs'))[0][0][0]
+        names = [n for n, _a, _b in pt.top_level_items(rf)]
+        self.assertNotIn('reqwest', names)
+        self.assertIn('shared_client', names)
+
+    def test_same_word_without_a_call_is_not_inherited_7352(self):
+        # a local `plan`, a field `.resolve`, a method call `.connect(`, an associated fn
+        # `Stream::connect(` and an own `fn connect(` are not the helper free fns
+        got = self.run_part({
+            'words': 'mod common;\n#[test]\nfn t() {\n let plan = common::plain();\n'
+                     ' let r = cfg.resolve + plan; let _ = sock.connect(addr);\n'
+                     ' let _ = Stream::connect(path); let _ = r; }\n'
+                     'fn connect(x: u8) -> u8 { x }\n',
+            'calls_generic_helpers': 'mod common;\n#[test]\nfn t() { common::wait_ready(); let _ = common::shared_client(); }\n',
+        })
+        self.assertEqual(got['words'].cls, 'b', got['words'].reasons)
+        self.assertEqual(got['calls_generic_helpers'].cls, 'b', got['calls_generic_helpers'].reasons)
+
+    def test_real_call_use_import_and_path_still_inherit_7352(self):
+        got = self.run_part({
+            'call_path': 'mod common;\n#[test]\nfn t() { let _ = common::pg_isolate::connect("u"); }\n',
+            'call_use': 'mod common;\nuse common::pg_isolate::plan;\n#[test]\nfn t() { let _ = plan("u"); }\n',
+            'call_use_list': 'mod common;\nuse common::pg_isolate::{resolve};\n#[test]\nfn t() { let _ = resolve(); }\n',
+            'value_ref': 'mod common;\n#[test]\nfn t() { let f = common::pg_isolate::resolve; let _ = f(); }\n',
+        })
+        for name, e in got.items():
+            self.assertEqual(e.cls, 'a', (name, e.reasons))
+            self.assertTrue(any(r.startswith('pg-helper:') for r in e.reasons), (name, e.reasons))
+
+    def test_type_and_const_names_still_match_as_words_7352(self):
+        fx('tests/common/mod.rs',
+           'pub struct PgBox;\nimpl PgBox { pub fn new() -> Self { let _ = sqlx::query("x"); PgBox } }\n'
+           'pub const PG_FLAG: &str = "postgres://";\n')
+        got = self.run_part({'ty': 'mod common;\n#[test]\nfn t() { let _b: Option<common::PgBox> = None; }\n',
+                                'other': 'mod common;\nfn t() {}\n'})
+        self.assertEqual(got['ty'].cls, 'a', got['ty'].reasons)
 
 
 class LibGateBypassTests6344B2(Base):
