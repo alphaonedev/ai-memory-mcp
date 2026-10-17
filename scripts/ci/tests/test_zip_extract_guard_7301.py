@@ -233,5 +233,131 @@ class TreeFailClosed7301(StubCargoCase):
                 self.assertIn(name, res.stdout)
 
 
+try:
+    import tomllib  # noqa: F401  (Python 3.11+)
+    HAVE_TOMLLIB = True
+except ImportError:
+    HAVE_TOMLLIB = False
+
+PY39 = Path.home() / '.local' / 'bin' / 'python3.9'
+
+# Every manifest form that declares a direct zip dependency.
+ZIP_MANIFEST_FORMS = {
+    'target-normal': "[target.'cfg(unix)'.dependencies]\nzip = \"7\"\n",
+    'target-dev': "[target.'cfg(unix)'.dev-dependencies]\nzip = { version = \"7\" }\n",
+    'target-build': "[target.'cfg(windows)'.build-dependencies]\nzip = \"7\"\n",
+    'target-complex-cfg': (
+        "[target.'cfg(all(unix, target_pointer_width = \"64\"))'.dev-dependencies]\n"
+        "zip = { version = \"7\", default-features = false }\n"),
+    'target-dq-cfg': (
+        "[target.\"cfg(target_os = \\\"linux\\\")\".dependencies]\nzip = \"7\"\n"),
+    'target-triple': "[target.x86_64-unknown-linux-gnu.dependencies]\nzip = \"7\"\n",
+    'target-table-zip': "[target.'cfg(unix)'.dependencies.zip]\nversion = \"7\"\n",
+    'dependencies-table-zip': "[dependencies.zip]\nversion = \"7\"\n",
+    'dev-table-zip': "[dev-dependencies.zip]\nversion = \"7\"\n",
+    'build-table-zip': "[build-dependencies.zip]\nversion = \"7\"\n",
+    'renamed-table': "[dependencies.z]\npackage = \"zip\"\nversion = \"7\"\n",
+    'renamed-dotted': "[dependencies]\nz.package = \"zip\"\nz.version = \"7\"\n",
+    'renamed-inline': "[dependencies]\nz = { package = \"zip\", version = \"7\" }\n",
+    'quoted-key': "[dependencies]\n\"zip\" = \"7\"\n",
+    'dotted-in-dependencies': "[dependencies]\nzip.version = \"7\"\n",
+    'workspace-dependencies': "[workspace.dependencies]\nzip = \"7\"\n",
+    'target-dotted-in-target-table': "[target.'cfg(unix)']\ndependencies.zip = \"7\"\n",
+}
+# Forms whose dotted key sits before any table header (top of the file).
+ZIP_TOPLEVEL_FORMS = {
+    'toplevel-dotted': 'dependencies.zip = "7"\n',
+    'toplevel-dotted-dev': 'dev-dependencies.zip = "7"\n',
+    'toplevel-dotted-build': 'build-dependencies.zip = "7"\n',
+    'toplevel-dotted-target': "target.'cfg(unix)'.dependencies.zip = \"7\"\n",
+}
+CLEAN_MANIFEST_FORMS = {
+    'zipper-lookalike': "[dependencies]\nzipper = \"1\"\nzip-extra = \"1\"\n",
+    'feature-named-zip': "[features]\nzip = []\n",
+    'zip-in-description': "[package.metadata]\ndescription = \"zip\"\n[target.'cfg(unix)'.dependencies]\nserde = \"1\"\n",
+    'metadata-table': "[package.metadata.zip]\nlevel = 1\n",
+    'multiline-string': "[package.metadata]\nnote = '''\n[dependencies]\nzip = \"7\"\n'''\n",
+}
+
+
+class ManifestForms7301(GuardBase):
+    """Round 2: the manifest check recognises every dependency-table form."""
+
+    def run_manifest(self, body, parser, top=''):
+        (self.root / 'Cargo.toml').write_text(
+            top + MINIMAL_MANIFEST + body, encoding='utf-8')
+        tree_file = self.root.parent / (self.root.name + '.tree')
+        tree_file.write_text(GOOD_TREE_DEPTH, encoding='utf-8')
+        self.addCleanup(lambda: tree_file.unlink() if tree_file.exists() else None)
+        return subprocess.run(
+            [sys.executable, str(GUARD), '--root', str(self.root), '--cargo-tree-file', str(tree_file),
+             '--manifest-parser', parser], capture_output=True, text=True, check=False)
+
+    def parsers(self):
+        out = ['fallback']
+        if HAVE_TOMLLIB:
+            out.append('tomllib')
+        return out
+
+    def test_every_zip_form_fails(self):
+        for parser in self.parsers():
+            for name, body in ZIP_MANIFEST_FORMS.items():
+                with self.subTest(parser=parser, form=name):
+                    res = self.run_manifest(body, parser)
+                    self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                    self.assertIn('Cargo.toml', res.stdout)
+
+    def test_toplevel_dotted_forms_fail(self):
+        for parser in self.parsers():
+            for name, top in ZIP_TOPLEVEL_FORMS.items():
+                with self.subTest(parser=parser, form=name):
+                    res = self.run_manifest('', parser, top=top)
+                    self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+
+    def test_clean_forms_pass(self):
+        for parser in self.parsers():
+            for name, body in CLEAN_MANIFEST_FORMS.items():
+                with self.subTest(parser=parser, form=name):
+                    res = self.run_manifest(body, parser)
+                    self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_real_manifest_passes_with_each_parser(self):
+        for parser in self.parsers():
+            with self.subTest(parser=parser):
+                tree_file = self.root.parent / (self.root.name + '.tree')
+                tree_file.write_text(GOOD_TREE_DEPTH, encoding='utf-8')
+                self.addCleanup(lambda: tree_file.unlink() if tree_file.exists() else None)
+                res = subprocess.run(
+                    [sys.executable, str(GUARD), '--root', str(REPO), '--cargo-tree-file', str(tree_file),
+                     '--manifest-parser', parser], capture_output=True, text=True, check=False)
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_invalid_toml_exits_2_with_tomllib(self):
+        if not HAVE_TOMLLIB:
+            self.skipTest('tomllib needs Python 3.11+')
+        res = self.run_manifest('[dependencies\n', 'tomllib')
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+
+    def test_tomllib_requested_but_missing_exits_2(self):
+        if HAVE_TOMLLIB:
+            self.skipTest('tomllib is available here')
+        res = self.run_manifest('', 'tomllib')
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+
+    def test_python39_default_parser_catches_every_form(self):
+        if not PY39.is_file():
+            self.skipTest('python3.9 not installed')
+        for name, body in ZIP_MANIFEST_FORMS.items():
+            with self.subTest(form=name):
+                (self.root / 'Cargo.toml').write_text(MINIMAL_MANIFEST + body, encoding='utf-8')
+                tree_file = self.root.parent / (self.root.name + '.tree')
+                tree_file.write_text(GOOD_TREE_DEPTH, encoding='utf-8')
+                self.addCleanup(lambda: tree_file.unlink() if tree_file.exists() else None)
+                res = subprocess.run(
+                    [str(PY39), str(GUARD), '--root', str(self.root), '--cargo-tree-file', str(tree_file)],
+                    capture_output=True, text=True, check=False)
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+
+
 if __name__ == '__main__':
     unittest.main()
