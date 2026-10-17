@@ -2,9 +2,8 @@
 """PR #7393 round 6: gate fixtures for the delta r5 review findings (#7581-#7586) on the vendored certification
 evidence generator.
 
-  #7581  the expiry gate copy runs in isolated mode (`python -I`), so a module planted beside it never replaces the gate
-  #7582  the sweep, the identity check and the removal of the copy go through the scratch directory fd, never a path
-  #7583  the tmp-root AST guard catches every construction: literals, f-strings, joins, TMP_ROOTS reads, tempfile calls
+  #7581, #7582  (the expiry gate copy and its sweep: superseded in r7, which runs the gate from memory)
+  #7583  the tmp-root AST guard flags the static constructions it lists (see tmp_root_findings; r7 widened it, #7619)
   #7584  an OSError from the posture recapture is a counted failure with a RED row
   #7585  the tmp-root comparison also resolves each configured root (a root that is itself a symlink)
   #7586  the check_run / check_block docstrings describe the rules the code enforces
@@ -24,7 +23,9 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
-from unittest import mock
+
+from tmp_runtime_guard_7393 import GuardedCase
+import unittest.mock as mock
 
 from test_evidence_generator_5040_5042 import CHAIN_SECTION, PASSING_GATES, ScratchCase, load
 from test_evidence_generator_r3_7393 import GREEN_CHAIN
@@ -42,161 +43,6 @@ def dead_pid():
     p = subprocess.Popen([sys.executable, "-c", "pass"])
     p.wait()
     return p.pid
-
-
-class IsolatedGate7581(GatesRun):
-    def test_the_argv_carries_the_isolated_flag_7581(self):
-        rc, r, wt, tip = self.make()
-        argv = r.pick_expiry()
-        r.drop_expiry()
-        self.assertEqual(argv[:2], [sys.executable, "-I"], "CI runs the gate as `python3 -I`; so must the runner")
-        self.assertEqual(len(argv), 3)
-
-    def test_a_stdlib_named_module_beside_the_copy_does_not_replace_the_gate_7581(self):
-        rc, r, wt, tip = self.make({"scripts/check_cert_expiry.py": REAL_GATE})
-        (wt / ".local-runs").mkdir(exist_ok=True)
-        (wt / ".local-runs" / "json.py").write_text(PLANTED)
-        argv = r.pick_expiry()
-        out = subprocess.run(argv, cwd=wt, capture_output=True, text=True)
-        r.drop_expiry()
-        self.assertIn("REAL-GATE", out.stdout, out.stderr)
-        self.assertNotIn("PLANTED-MODULE-RAN", out.stdout)
-
-    def test_the_gates_leg_runs_the_gate_isolated_end_to_end_7581(self):
-        rc, r, wt, tip = self.make({"scripts/check_cert_expiry.py": REAL_GATE})
-        (wt / ".local-runs").mkdir(exist_ok=True)
-        (wt / ".local-runs" / "json.py").write_text(PLANTED)
-        seen = []
-        real = r.run
-
-        def spy(argv, out, extra=None):
-            if "-I" in argv or any(str(a).endswith(".py") for a in argv):
-                seen.append(list(argv))
-            return real(argv, out, extra or {})
-        with mock.patch.object(r, "run", side_effect=spy):
-            r.gates("0" * 40, "")
-        expiry_runs = [a for a in seen if a[0] == sys.executable]
-        self.assertEqual(len(expiry_runs), 3)
-        self.assertTrue(all(a[1] == "-I" for a in expiry_runs))
-        self.assertNotIn("PLANTED-MODULE-RAN", "".join(p.read_text(errors="replace") for p in (self.dir / "o").rglob("*.log")))
-
-
-class CopyIdentity7581(GatesRun):
-    def test_a_copy_replaced_after_creation_is_refused_before_exec_7581(self):
-        rc, r, wt, tip = self.make()
-        argv = r.pick_expiry()
-        r.check_expiry_copy()  # the untouched copy passes
-        copy = Path(argv[-1])
-        copy.unlink()
-        copy.write_text("print('SWAPPED')\n")
-        with self.assertRaises(ValueError):
-            r.check_expiry_copy()
-        r.drop_expiry()
-
-    def test_the_gates_leg_reports_a_replaced_copy_as_red_and_does_not_run_it_7581(self):
-        rc = load("run_cert")
-        wt, tip = self._repo()
-        real_pick = rc.Run.pick_expiry
-
-        def pick_then_swap(self_):
-            argv = real_pick(self_)
-            Path(argv[-1]).unlink()
-            Path(argv[-1]).write_text("print('SWAPPED-RAN')\n")
-            return argv
-        argv = ["run_cert.py", "gates", "--tip", tip, "--wt", str(wt), "--outd", str(self.dir / "o2"),
-                "--targets", str(self.dir / "t"), "--tmpdir", str(self.dir / "tmp")]
-        out = io.StringIO()
-        with mock.patch.object(rc.Run, "pick_expiry", pick_then_swap), mock.patch.object(sys, "argv", argv), \
-                contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-            code = rc.main()
-        self.assertEqual(code, 1)
-        self.assertIn("RED expiry gate copy", out.getvalue())
-        self.assertNotIn("SWAPPED-RAN", out.getvalue())
-        self.assertNotIn("Traceback", out.getvalue())
-
-    def _repo(self):
-        from test_evidence_generator_r2_7393 import make_repo
-        return make_repo(self.dir / "repo2", {"scripts/check_cert_expiry.py": "BLOB = 1\n"})
-
-
-class FdRelativeWork7582(GatesRun):
-    def swap_scratch_for_link(self, wt, victim):
-        """Move the real scratch directory aside and put a symlink to `victim` at its path."""
-        real = wt / ".local-runs"
-        real.rename(wt / ".local-runs-real")
-        os.symlink(victim, real)
-
-    def test_a_scratch_path_swapped_for_a_symlink_mid_sweep_deletes_nothing_outside_7582(self):
-        rc, r, wt, tip = self.make()
-        scratch = wt / ".local-runs"
-        scratch.mkdir(exist_ok=True)
-        gone = dead_pid()
-        name = f".expiry-{gone}-aaaa"
-        (scratch / name).mkdir()
-        (scratch / name / "inner.txt").write_text("real stale\n")
-        victim = self.dir / "victim"
-        (victim / name).mkdir(parents=True)
-        (victim / name / "keep.txt").write_text("victim data\n")
-        (victim / f"{name}.py").write_text("victim file\n")
-        swapped = []
-        real_kill = os.kill
-
-        def kill_and_swap(pid, sig):
-            if not swapped:
-                swapped.append(1)
-                self.swap_scratch_for_link(wt, victim)
-            return real_kill(pid, sig)
-        with mock.patch("os.kill", side_effect=kill_and_swap):
-            with self.assertRaises(ValueError):  # the path no longer names the directory the fd holds
-                r.pick_expiry()
-        self.assertEqual((victim / name / "keep.txt").read_text(), "victim data\n")
-        self.assertEqual((victim / f"{name}.py").read_text(), "victim file\n")
-        self.assertEqual(sorted(p.name for p in victim.iterdir()), sorted([name, f"{name}.py"]))
-        self.assertFalse((wt / ".local-runs-real" / name).exists(), "the stale entry of the real directory is removed through the fd")
-        self.assertEqual(sorted(p.name for p in (wt / ".local-runs-real").iterdir()), [], "no copy left behind")
-
-    def test_a_stale_directory_with_a_symlink_inside_is_removed_without_following_it_7582(self):
-        rc, r, wt, tip = self.make()
-        scratch = wt / ".local-runs"
-        scratch.mkdir(exist_ok=True)
-        outside = self.dir / "outside"
-        outside.mkdir()
-        (outside / "precious.txt").write_text("keep\n")
-        stale = scratch / ".expiry-oldlayout"
-        (stale / "sub").mkdir(parents=True)
-        (stale / "sub" / "f.txt").write_text("x\n")
-        os.symlink(outside, stale / "link")
-        os.symlink(outside / "precious.txt", stale / "filelink")
-        r.pick_expiry()
-        r.drop_expiry()
-        self.assertFalse(stale.exists())
-        self.assertEqual((outside / "precious.txt").read_text(), "keep\n")
-
-    def test_dropping_the_copy_after_a_path_swap_removes_only_the_real_copy_7582(self):
-        rc, r, wt, tip = self.make()
-        argv = r.pick_expiry()
-        name = Path(argv[-1]).name
-        victim = self.dir / "victim2"
-        victim.mkdir()
-        (victim / name).write_text("victim file\n")
-        self.swap_scratch_for_link(wt, victim)
-        r.drop_expiry()
-        self.assertEqual((victim / name).read_text(), "victim file\n")
-        self.assertFalse((wt / ".local-runs-real" / name).exists())
-
-    def test_a_scratch_path_swapped_before_the_run_is_not_followed_7582(self):
-        rc, r, wt, tip = self.make()
-        (self.dir / "elsewhere").mkdir()
-        os.symlink(self.dir / "elsewhere", wt / ".local-runs")
-        with self.assertRaises(ValueError):
-            r.pick_expiry()
-        self.assertEqual(list((self.dir / "elsewhere").iterdir()), [])
-
-    def test_the_docstring_claims_only_what_is_enforced_7581_7582(self):
-        doc = load("run_cert").Run.pick_expiry.__doc__
-        self.assertIn("-I", doc)
-        self.assertIn("same directory", doc)
-        self.assertNotIn("at any point", doc)
 
 
 class PosturePermissionError7584(GatesRun):
@@ -260,63 +106,254 @@ class CheckRunDocstrings7586(ScratchCase):
         self.assertEqual(len(self.bb.check_run(self.legs(CHAIN_SECTION + PASSING_GATES))), 1)  # a log with no CONFIG row
 
 
-# ---- the tmp-root AST guard (#7534, #7583) -----------------------------------------------------------------------
+# ---- the tmp-root AST guard (#7534, #7583, #7619) ----------------------------------------------------------------
 TEMPFILE_DIR_POS = {"mkdtemp": 2, "mkstemp": 2, "TemporaryDirectory": 2, "NamedTemporaryFile": 6,
                     "SpooledTemporaryFile": 7, "TemporaryFile": 6}
-TEMPFILE_ALWAYS = ("gettempdir", "gettempdirb")
+TEMPFILE_ALWAYS = ("tempfile.gettempdir", "tempfile.gettempdirb")
+ENV_NAMES = ("TMPDIR", "TMP", "TEMP")
 FORBIDDEN_ROOTS = tuple("/".join(["", *p.split(".")]) for p in (T, f"var.{T}", "dev.shm", "run"))
 UNKNOWN = "\x00"
+PATH_CLASSES = ("Path", "PurePath", "PurePosixPath", "PosixPath", "str", "fspath")
+SEQ_BUILDERS = ("tuple", "list", "set", "frozenset", "sorted", "reversed")
+CHR_NAMES = ("chr", "builtins.chr")
+PATH_JOINS = ("os.path.join", "posixpath.join", "ntpath.join", "path.join")
+SEP_NAMES = ("os.sep", "os.path.sep", "posixpath.sep")
+MISSING = object()
 
 
-def _is_pathjoin(func):
+def leaf(func):
     if isinstance(func, ast.Name):
-        return func.id == "join"
-    return isinstance(func, ast.Attribute) and func.attr == "join" and (
-        (isinstance(func.value, ast.Name) and func.value.id in ("posixpath", "ntpath", "path"))
-        or (isinstance(func.value, ast.Attribute) and func.value.attr == "path"))
+        return func.id
+    return func.attr if isinstance(func, ast.Attribute) else None
 
 
-def fold(node, env):
-    """The constant string an expression spells, or None. Folds literals, f-strings, `+`, pathlib `/`, Path(...) with
-    several parts, str(...), os.path.join / posixpath.join, joinpath and "<sep>".join([constants])."""
-    if isinstance(node, ast.Constant):
-        return node.value if isinstance(node.value, str) else None
-    if isinstance(node, ast.Name):
-        return env.get(node.id)
-    if isinstance(node, ast.JoinedStr):
-        parts = []
-        for v in node.values:
-            if isinstance(v, ast.Constant):
-                parts.append(str(v.value))
-            else:
-                inner = fold(v.value, env) if isinstance(v, ast.FormattedValue) else None
-                parts.append(UNKNOWN if inner is None else inner)
-        return "".join(parts)
-    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Div)):
-        left, right = fold(node.left, env), fold(node.right, env)
-        if left is None or right is None:
+class Names:
+    """Import aliases and plain name aliases of one module. `canon(node)` resolves a Name, an Attribute chain, a
+    getattr(x, "name") call or an importlib.import_module("m") / __import__("m") call to its dotted real name."""
+
+    def __init__(self, tree):
+        self.alias = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    if a.asname:
+                        self.alias[a.asname] = a.name
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                for a in node.names:
+                    self.alias[a.asname or a.name] = f"{node.module}.{a.name}"
+        for _ in range(3):  # `m = tempfile.mkdtemp` makes m an alias too
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                    real = self.canon(node.value)
+                    if real and real != node.targets[0].id and "." in real:
+                        self.alias[node.targets[0].id] = real
+
+    def canon(self, node):
+        if isinstance(node, ast.Name):
+            return self.alias.get(node.id, node.id)
+        if isinstance(node, ast.Attribute):
+            base = self.canon(node.value)
+            return f"{base}.{node.attr}" if base else None
+        if isinstance(node, ast.Call) and node.args and not node.keywords:
+            real = self.canon(node.func)
+            first = node.args[0]
+            if real in ("getattr", "builtins.getattr") and len(node.args) >= 2:
+                base, attr = self.canon(first), node.args[1]
+                if base and isinstance(attr, ast.Constant) and isinstance(attr.value, str):
+                    return f"{base}.{attr.value}"
+            if real in ("importlib.import_module", "__import__", "builtins.__import__"):
+                if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                    return first.value
+        return None
+
+
+class Folder:
+    """Folds an expression to the constant string it spells (or None): literals, bytes, f-strings, `+`, pathlib `/`,
+    `%` and str.format, chr(), "".join over constants, comprehensions over constants, reversed slices, .encode() /
+    .decode(), os.sep, Path anchors, Path(...) / str(...) / os.path.join / joinpath, names bound by `=`, `+=` and
+    tuple unpacking."""
+
+    def __init__(self, names):
+        self.names = names
+        self.env = {}
+
+    def num(self, node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+            return node.value
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            inner = self.num(node.operand)
+            return None if inner is None else -inner
+        if isinstance(node, ast.Name) and isinstance(self.env.get(node.id), int):
+            return self.env[node.id]
+        return None
+
+    def raw(self, node):
+        number = self.num(node)
+        return number if number is not None else self.fold(node)
+
+    def values(self, node):
+        """The list of constants a sequence expression yields, or None."""
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            items = [self.raw(e) for e in node.elts]
+            return None if any(i is None for i in items) else items
+        if isinstance(node, ast.Call) and not node.keywords and not any(isinstance(a, ast.Starred) for a in node.args):
+            name = leaf(node.func)
+            if name == "range" and node.args and all(self.num(a) is not None for a in node.args):
+                return list(range(*[self.num(a) for a in node.args]))
+            if name == "map" and len(node.args) == 2 and self.names.canon(node.args[0]) in CHR_NAMES:
+                nums = self.values(node.args[1])
+                return None if nums is None or not all(isinstance(n, int) for n in nums) else [chr(n) for n in nums]
+            if name in SEQ_BUILDERS and len(node.args) == 1:
+                inner = self.values(node.args[0])
+                if inner is None:
+                    return None
+                return inner[::-1] if name == "reversed" else (sorted(inner) if name == "sorted" else inner)
+        if isinstance(node, (ast.ListComp, ast.GeneratorExp, ast.SetComp)) and len(node.generators) == 1:
+            gen = node.generators[0]
+            if gen.ifs or gen.is_async or not isinstance(gen.target, ast.Name):
+                return None
+            source = self.values(gen.iter)
+            if source is None:
+                return None
+            saved, out = self.env.get(gen.target.id, MISSING), []
+            try:
+                for item in source:
+                    self.env[gen.target.id] = item
+                    value = self.raw(node.elt)
+                    if value is None:
+                        return None
+                    out.append(value)
+            finally:
+                if saved is MISSING:
+                    self.env.pop(gen.target.id, None)
+                else:
+                    self.env[gen.target.id] = saved
+            return out
+        return None
+
+    def strings(self, node):
+        items = self.values(node)
+        return None if items is None or not all(isinstance(i, str) for i in items) else items
+
+    def fold(self, node):
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bytes):
+                return node.value.decode("latin-1")
+            return node.value if isinstance(node.value, str) else None
+        if isinstance(node, ast.Name):
+            value = self.env.get(node.id)
+            if isinstance(value, str):
+                return value
+            return "/" if self.names.canon(node) in SEP_NAMES else None
+        if isinstance(node, ast.Attribute):
+            if node.attr in ("anchor", "root") and isinstance(node.value, ast.Call):
+                return "/"  # an absolute path's anchor
+            return "/" if self.names.canon(node) in SEP_NAMES else None
+        if isinstance(node, ast.JoinedStr):
+            parts = []
+            for v in node.values:
+                if isinstance(v, ast.Constant):
+                    parts.append(str(v.value))
+                else:
+                    inner = self.fold(v.value) if isinstance(v, ast.FormattedValue) else None
+                    parts.append(UNKNOWN if inner is None else inner)
+            return "".join(parts)
+        if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+            last = None
+            for v in node.values:
+                last = self.fold(v)
+                if last is None:
+                    return None
+                if last:
+                    return last
+            return last
+        if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Slice):
+            base = self.fold(node.value)
+            given = (node.slice.lower, node.slice.upper, node.slice.step)
+            bounds = [None if p is None else self.num(p) for p in given]
+            if base is None or any(b is None and p is not None for b, p in zip(bounds, given)):
+                return None
+            return base[slice(*bounds)]
+        if isinstance(node, ast.BinOp):
+            left = self.fold(node.left)
+            if left is None:
+                return None
+            if isinstance(node.op, ast.Mod):
+                if isinstance(node.right, ast.Tuple):
+                    items = [self.fold(e) for e in node.right.elts]
+                    operand = None if any(i is None for i in items) else tuple(items)
+                else:
+                    operand = self.fold(node.right)
+                try:
+                    return None if operand is None else left % operand
+                except (TypeError, ValueError):
+                    return None
+            if isinstance(node.op, (ast.Add, ast.Div)):
+                right = self.fold(node.right)
+                if right is None:
+                    return None
+                return left + right if isinstance(node.op, ast.Add) else posixpath.join(left, right)
             return None
-        return left + right if isinstance(node.op, ast.Add) else posixpath.join(left, right)
-    if isinstance(node, ast.Call):
+        if isinstance(node, ast.Call):
+            return self.fold_call(node)
+        return None
+
+    def fold_call(self, node):
         func, args = node.func, node.args
-        if any(isinstance(a, ast.Starred) for a in args) or node.keywords:
+        name, real = leaf(func), self.names.canon(func)
+        if any(isinstance(a, ast.Starred) for a in args):
             return None
-        if isinstance(func, ast.Name) and func.id in ("Path", "PurePath", "PurePosixPath", "str", "fspath") or \
-                (isinstance(func, ast.Attribute) and func.attr == "fspath"):
-            parts = [fold(a, env) for a in args]
+        if real in CHR_NAMES and len(args) == 1 and self.num(args[0]) is not None:
+            try:
+                return chr(self.num(args[0]))
+            except (ValueError, OverflowError):
+                return None
+        if isinstance(func, ast.Attribute) and name in ("encode", "decode") and not args:
+            return self.fold(func.value)
+        if isinstance(func, ast.Attribute) and name == "format":
+            fmt = self.fold(func.value)
+            pos = [self.fold(a) for a in args]
+            kw = {k.arg: self.fold(k.value) for k in node.keywords}
+            if fmt is None or None in pos or None in kw or any(v is None for v in kw.values()):
+                return None
+            try:
+                return fmt.format(*pos, **kw)
+            except (IndexError, KeyError, ValueError):
+                return None
+        if node.keywords:
+            return None
+        if name in PATH_CLASSES or real in PATH_JOINS:
+            parts = [self.fold(a) for a in args]
             return None if not parts or None in parts else posixpath.join(*parts)
-        if _is_pathjoin(func):
-            parts = [fold(a, env) for a in args]
-            return None if not parts or None in parts else posixpath.join(*parts)
-        if isinstance(func, ast.Attribute) and func.attr == "joinpath":
-            base = fold(func.value, env)
-            parts = [fold(a, env) for a in args]
+        if isinstance(func, ast.Attribute) and name == "joinpath":
+            base = self.fold(func.value)
+            parts = [self.fold(a) for a in args]
             return None if base is None or None in parts else posixpath.join(base, *parts)
-        if isinstance(func, ast.Attribute) and func.attr == "join" and len(args) == 1 and isinstance(args[0], (ast.List, ast.Tuple)):
-            sep = fold(func.value, env)
-            items = [fold(e, env) for e in args[0].elts]
-            return None if sep is None or None in items else sep.join(items)
-    return None
+        if isinstance(func, ast.Attribute) and name == "join" and len(args) == 1:
+            sep, items = self.fold(func.value), self.strings(args[0])
+            return None if sep is None or items is None else sep.join(items)
+        return None
+
+    def bind(self, stmt):
+        if isinstance(stmt, ast.AugAssign):
+            if isinstance(stmt.op, ast.Add) and isinstance(stmt.target, ast.Name):
+                cur, add = self.env.get(stmt.target.id), self.fold(stmt.value)
+                if isinstance(cur, str) and add is not None:
+                    self.env[stmt.target.id] = cur + add
+            return
+        if len(stmt.targets) != 1:
+            return
+        target = stmt.targets[0]
+        if isinstance(target, ast.Name):
+            value = self.raw(stmt.value)
+            if value is not None:
+                self.env[target.id] = value
+        elif isinstance(target, ast.Tuple) and isinstance(stmt.value, (ast.Tuple, ast.List)) and \
+                len(target.elts) == len(stmt.value.elts):
+            for t, v in zip(target.elts, stmt.value.elts):
+                value = self.raw(v)
+                if isinstance(t, ast.Name) and value is not None:
+                    self.env[t.id] = value
 
 
 def names_a_tmp_root(value):
@@ -330,48 +367,70 @@ def names_a_tmp_root(value):
     return any(norm == r or norm.startswith(r + "/") for r in FORBIDDEN_ROOTS)
 
 
-def _tempfile_name(func):
-    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "tempfile":
-        return func.attr
-    if isinstance(func, ast.Name):
-        return func.id
-    return None
-
-
 def tmp_root_findings(source, own_roots=False):
-    """Every construction in `source` of a tmp-root path or of a call that defaults to one: a folded string (literal,
-    f-string, join, concatenation) naming a tmp root or starting with $TMPDIR, any read of TMP_ROOTS (name, attribute
-    or subscript), tempfile.gettempdir / gettempdirb / tempdir, and a mkdtemp / mkstemp / TemporaryDirectory /
-    NamedTemporaryFile / SpooledTemporaryFile / TemporaryFile call without a dir= argument (#7534, #7583). The runner
-    itself (own_roots=True) owns TMP_ROOTS and may read it; a test may only name it inside mock.patch.object."""
+    """A STATIC check of one Python source for the constructions that name a tmp root or default to one. It reports:
+    a string the file spells as a tmp-root path or `$TMPDIR/...` (constants only: literals, bytes, f-strings, `+`,
+    `/`, `%` and str.format, chr, join and comprehensions over constants, reversed slices, os.sep, Path anchors, `=`,
+    `+=` and tuple unpacking); a read of TMP_ROOTS by name, attribute, subscript or getattr; a read of the TMPDIR /
+    TMP / TEMP environment variable; a use or an assignment of tempfile.tempdir; tempfile.gettempdir / gettempdirb;
+    and a mkdtemp / mkstemp / TemporaryDirectory / NamedTemporaryFile / SpooledTemporaryFile / TemporaryFile call
+    without a dir= argument, through import aliases, `x = tempfile.f`, getattr, importlib.import_module and
+    __import__. With own_roots=True (the runner, which builds TMP_ROOTS) reads of TMP_ROOTS and comprehensions are
+    allowed. It cannot see a value known only at run time (an argument, a file, another process's output): the audit
+    hook in tmp_runtime_guard_7393 covers that while the tests run, and only for the events that module lists."""
     tree = ast.parse(source)
-    env = {}
+    names = Names(tree)
+    folder = Folder(names)
+    stmts = sorted((n for n in ast.walk(tree) if isinstance(n, (ast.Assign, ast.AugAssign))),
+                   key=lambda n: (n.lineno, n.col_offset))
     for _ in range(3):  # a name bound from another name settles in a few passes
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
-                value = fold(node.value, env)
-                if value is not None:
-                    env[node.targets[0].id] = value
+        for st in stmts:
+            if isinstance(st, ast.Assign):
+                folder.bind(st)
+    for st in stmts:  # then source order, for `+=`
+        folder.bind(st)
     found = []
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Constant, ast.JoinedStr, ast.BinOp, ast.Name, ast.Call)):
-            value = fold(node, env)
+        if isinstance(node, (ast.Constant, ast.JoinedStr, ast.BinOp, ast.Name, ast.Call, ast.Subscript, ast.Attribute)):
+            value = folder.fold(node)
             if names_a_tmp_root(value):
                 found.append(f"path {value!r}")
-        if own_roots:
-            pass
-        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr == "TMP_ROOTS":
-            found.append("TMP_ROOTS read")
-        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == "TMP_ROOTS":
-            found.append("TMP_ROOTS read")
-        if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr == "tempdir" and \
-                isinstance(node.value, ast.Name) and node.value.id == "tempfile":
-            found.append("tempfile.tempdir read")
+        if isinstance(node, (ast.ListComp, ast.GeneratorExp, ast.SetComp)) and not own_roots:
+            for item in folder.strings(node) or []:
+                if names_a_tmp_root(item):
+                    found.append(f"comprehension path {item!r}")
+        if not own_roots:
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load) and node.attr == "TMP_ROOTS":
+                found.append("TMP_ROOTS read")
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == "TMP_ROOTS":
+                found.append("TMP_ROOTS read")
+            elif isinstance(node, ast.Subscript) and folder.fold(node.slice) == "TMP_ROOTS":
+                found.append("TMP_ROOTS subscript")
+        if isinstance(node, (ast.Attribute, ast.Name)):
+            real = names.canon(node)
+            if real == "tempfile.tempdir":
+                found.append("tempfile.tempdir used")
+            elif real in TEMPFILE_ALWAYS:
+                found.append(f"{real}")
+        if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load) and \
+                names.canon(node.value) == "os.environ" and folder.fold(node.slice) in ENV_NAMES:
+            found.append(f"environ[{folder.fold(node.slice)!r}] read")
         if isinstance(node, ast.Call):
-            name = _tempfile_name(node.func)
-            if name in TEMPFILE_ALWAYS:
-                found.append(f"{name}()")
-            elif name in TEMPFILE_DIR_POS:
+            real = names.canon(node.func)
+            first = folder.fold(node.args[0]) if node.args else None
+            if real in ("os.environ.get", "os.getenv", "os.environ.__getitem__") and first in ENV_NAMES:
+                found.append(f"{real}({first!r})")
+            if real in ("getattr", "builtins.getattr") and len(node.args) >= 2:
+                second = folder.fold(node.args[1])
+                if second == "TMP_ROOTS" and not own_roots:
+                    found.append("TMP_ROOTS via getattr")
+                if second == "tempdir" and names.canon(node.args[0]) == "tempfile":
+                    found.append("tempfile.tempdir via getattr")
+            if real in ("setattr", "builtins.setattr") and len(node.args) >= 2 and \
+                    names.canon(node.args[0]) == "tempfile" and folder.fold(node.args[1]) == "tempdir":
+                found.append("tempfile.tempdir via setattr")
+            if real and real.startswith("tempfile.") and real[len("tempfile."):] in TEMPFILE_DIR_POS:
+                name = real[len("tempfile."):]
                 kw = {k.arg: k.value for k in node.keywords if k.arg}
                 dirv = kw.get("dir")
                 if dirv is None and len(node.args) > TEMPFILE_DIR_POS[name]:
@@ -446,7 +505,7 @@ MUST_KEEP = (
 )
 
 
-class AstGuard7534(unittest.TestCase):
+class AstGuard7534(GuardedCase):
     def test_no_evidence_test_file_constructs_a_tmp_root_7583(self):
         files = sorted(TESTS.glob("test_evidence_generator_*.py"))
         self.assertGreaterEqual(len(files), 6)

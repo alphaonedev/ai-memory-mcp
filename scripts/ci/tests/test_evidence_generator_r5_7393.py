@@ -25,6 +25,8 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+
+from tmp_runtime_guard_7393 import GuardedCase
 import unittest.mock as mock
 
 from test_evidence_generator_5040_5042 import ScratchCase, load
@@ -202,7 +204,7 @@ KEPT = (  # different paths: never rewritten (#7533)
     "/data/t-old", "/data/t_x", "/data/t+x", "/data/t@x", "/data/t%x", "/data/t=x", "a/data/t", "x./data/t")
 
 
-class SanitizeBoundary7533(unittest.TestCase):
+class SanitizeBoundary7533(GuardedCase):
     def setUp(self):
         self.bb = load("build_bundle")
 
@@ -513,7 +515,7 @@ def tmp_root_strings(source):
     return found
 
 
-class AstGuard7534(unittest.TestCase):
+class AstGuard7534(GuardedCase):
     def test_no_evidence_test_file_names_a_tmp_root_path_7534(self):
         files = sorted(TESTS.glob("test_evidence_generator_*.py"))
         self.assertGreaterEqual(len(files), 5)

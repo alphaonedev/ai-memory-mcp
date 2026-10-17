@@ -21,6 +21,8 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+
+from tmp_runtime_guard_7393 import GuardedCase
 import unittest.mock as mock
 
 from test_evidence_generator_5040_5042 import EVIDENCE, ScratchCase, load
@@ -253,7 +255,7 @@ class RowsMatchTheCode7490(ScratchCase):
         self.assertIn("RED preflight", doc)
 
 
-class PathBoundary7491(unittest.TestCase):
+class PathBoundary7491(GuardedCase):
     def test_a_longer_sibling_path_is_not_rewritten_7491(self):
         bb = load("build_bundle")
         out = bb.sanitize_paths("/data/tt /data/t/x /data/t\n(/data/t) 'a/data/t' /data/t,", [], ["/data/t"])

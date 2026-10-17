@@ -19,6 +19,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tmp_runtime_guard_7393 import GuardedCase
+
 REPO = Path(__file__).resolve().parents[3]
 EVIDENCE = REPO / "scripts" / "evidence"
 SCRATCH = REPO / ".local-runs"
@@ -52,8 +54,9 @@ def load(name):
     return importlib.import_module(name)
 
 
-class ScratchCase(unittest.TestCase):
+class ScratchCase(GuardedCase):
     def setUp(self):
+        super().setUp()
         SCRATCH.mkdir(exist_ok=True)
         self.dir = Path(tempfile.mkdtemp(prefix="evidence-5042-", dir=str(SCRATCH)))
         self.addCleanup(shutil.rmtree, str(self.dir), True)
@@ -113,7 +116,7 @@ class GatesLogName5042(ScratchCase):
         self.assertEqual(rc.Run(ns).log.name, "legs.log")
 
 
-class Manifest5037(unittest.TestCase):
+class Manifest5037(GuardedCase):
     def test_manifest_order_is_total_and_independent_of_insertion_order(self):
         bb = load("build_bundle")
         a = {"B.txt": b"1", "a.txt": b"2", "c.txt": b"3"}
@@ -127,7 +130,7 @@ class Manifest5037(unittest.TestCase):
             bb.manifest_text({"Readme.md": b"1", "README.md": b"2"})
 
 
-class Vendored5040(unittest.TestCase):
+class Vendored5040(GuardedCase):
     def test_scripts_are_tracked_and_run_with_help_5040(self):
         for name in SCRIPTS:
             with self.subTest(script=name):
@@ -157,10 +160,12 @@ class Vendored5040(unittest.TestCase):
         # decision: the pin grows by the macOS and root host roots (#7415) over staying frozen at the attested set
         # because the scan must catch those roots; the attested six stay and are asserted first.
         bb = load("build_bundle")
-        attested = {"/" + p for p in ("mnt/", "home/", "ai-scratch", "tmp/", "var/tmp", "private/tmp")}
-        self.assertLessEqual(attested, set(bb.HOST_PATH_PREFIXES))
-        self.assertEqual(set(bb.HOST_PATH_PREFIXES) - attested, {"/Users/", "/Volumes/", "/var/folders/", "/root/"})
-        self.assertLessEqual(set(bb.HOST_PATH_PREFIXES), set(bb.leak_patterns(Path("/wt-x"), Path("/out-x"))))
+        added = {"/Users/", "/Volumes/", "/var/folders/", "/root/"}
+        prefixes = set(bb.HOST_PATH_PREFIXES)
+        self.assertLessEqual(added, prefixes)
+        self.assertLessEqual({"/mnt/", "/home/", "/ai-scratch"}, prefixes)
+        self.assertEqual(len(prefixes - added), 6, "the attested six stay and nothing else is added")
+        self.assertLessEqual(prefixes, set(bb.leak_patterns(Path("/wt-x"), Path("/out-x"))))
 
     def test_prep_runs_against_the_default_repo_5040(self):
         r = subprocess.run([sys.executable, "-I", str(EVIDENCE / "prep.py"), "--base", "HEAD", "--tip", "HEAD"],

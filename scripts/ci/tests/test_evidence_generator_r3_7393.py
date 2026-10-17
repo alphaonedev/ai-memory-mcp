@@ -23,6 +23,8 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+
+from tmp_runtime_guard_7393 import GuardedCase
 import unittest.mock as mock
 
 from test_evidence_generator_5040_5042 import CHAIN_SECTION, EVIDENCE, TIP, ScratchCase, load
@@ -351,7 +353,7 @@ class Preflight7441(ScratchCase):
             bb.check_run(outd)
 
 
-class MountEscapes7442(unittest.TestCase):
+class MountEscapes7442(GuardedCase):
     def test_octal_escaped_mount_point_is_decoded_7442(self):
         rc = load("run_cert")
         mounts = "tmpfs /mnt/my\\040ram tmpfs rw 0 0\n/dev/sda1 / ext4 rw 0 0\n"
@@ -428,7 +430,7 @@ class Sanitize7444(ScratchCase):
         self.assertNotIn("none", cfg)
 
 
-class Docstring7446(unittest.TestCase):
+class Docstring7446(GuardedCase):
     def test_docstring_is_accurate_7446(self):
         doc = (EVIDENCE / "run_cert.py").read_text().split('"""')[1]
         self.assertIn("ionice -c3 when installed", doc)

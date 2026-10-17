@@ -25,6 +25,8 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+
+from tmp_runtime_guard_7393 import GuardedCase
 import unittest.mock as mock
 
 from test_evidence_generator_5040_5042 import CHAIN_SECTION, EVIDENCE, REPO, TIP, ScratchCase, load
@@ -282,7 +284,7 @@ class ShellRetarget7412(ScratchCase):
         self.assertEqual((n_out, n_fix), (1, 1))
 
 
-class LeakScan7415(unittest.TestCase):
+class LeakScan7415(GuardedCase):
     def test_host_roots_are_in_the_prefix_set_7415(self):
         bb = load("build_bundle")
         for prefix in ("/Users/", "/Volumes/", "/var/folders/", "/root/"):
@@ -346,7 +348,7 @@ class AloneHeader7425(ScratchCase):
             self.assertIn("ionice", r.low_priority("1", "x.sh"))
 
 
-class PrepText7417(unittest.TestCase):
+class PrepText7417(GuardedCase):
     def test_docstring_names_the_python_expiry_gate_and_spacing_is_restored_7417(self):
         text = (EVIDENCE / "prep.py").read_text()
         self.assertNotIn("check-cert-expiry.sh", text)
