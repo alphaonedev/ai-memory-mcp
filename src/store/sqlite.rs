@@ -2572,6 +2572,13 @@ impl MemoryStore for SqliteStore {
             {
                 return StoreError::NotFound { id: id.clone() };
             }
+            // #7111 — a hidden holder of the summary's title slot is the
+            // typed, unnamed conflict (postgres parity), not `Backend`.
+            if let Some(c) = e.downcast_ref::<crate::storage::ConflictError>() {
+                return StoreError::Conflict {
+                    id: c.existing_id.clone(),
+                };
+            }
             box_err(e)
         })
     }
