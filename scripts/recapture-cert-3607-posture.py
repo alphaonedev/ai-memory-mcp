@@ -15,12 +15,22 @@ across re-issues (#5039 part B is a separate, vote-gated decision).
 
 Environment overrides: DEFAULT_BIN (default <repo>/target/release/ai-memory),
 SQLCIPHER_BIN (default <repo>/target-sqlcipher/release/ai-memory; leg 4 is
-recorded as `missing` when it is absent) and TMPDIR (accepted only when it
+recorded as `missing` when it is absent or a bare name is not on the child PATH;
+an empty value takes the default, as `:-` did) and TMPDIR (accepted only when it
 resolves, symlinks followed, under <repo-root>/.local-runs; a symlinked
 .local-runs is refused). A binary value containing a slash is taken relative to
 the repo root, a bare name is looked up on the child PATH, and the one resolved
-absolute path is both checked and run. A binary that cannot start records
-`exit: 127` (126 for other exec errors) for its leg. The shell script's
+absolute path is both checked and run. The lookup uses only the absolute,
+non-empty entries of the child PATH (relative and empty entries mean the cwd and are
+dropped). A binary that cannot start records `exit: 127` for its leg when the file or
+its interpreter is missing, as the shell did. A file the kernel refuses to execute
+(ENOEXEC, an executable with no shebang) is refused and recorded as `exit: 126`; the
+shell ran it through /bin/sh, this script fails closed instead (#7464). When leg 4 is
+`missing`, a `posture-sqlcipher-pass.out` left by an earlier run is removed and the
+summary says so; the shell left the stale file in the bundle and counted it
+(deliberate divergence, #7463; decision: a bundle must never carry a leg-4 capture
+that this run did not produce). A symlinked .local-runs, fixtures directory, keys
+directory or fixture file is refused before anything is written (#7462). The shell script's
 defaults named build directories of one build host; they are replaced by
 repo-relative ones. Exit codes: 0 success; 1 DEFAULT_BIN is not an executable
 file, TMPDIR (or the default scratch directory) is outside <repo-root>/.local-runs, operator keygen failed, the git
@@ -60,6 +70,7 @@ PEER_ATTESTATION = (
     '{"peer-a":{"allowed_sender_agent_ids":["agent-a"],'
     '"allowed_namespaces":["team-x/ops","team-x/shared"]}}\n'
 )
+SQLCIPHER_OUT_FILE = "posture-sqlcipher-pass.out"
 SUMMARY_FILES = ("posture-bare-env.out", "posture-hardened-env.out", "posture-sqlcipher-pass.out")
 PASSPHRASE_BYTES = 32
 LOCAL_RUNS = ROOT / ".local-runs"
@@ -99,9 +110,12 @@ def check_header_date(transcript_path, run_date):
 def sanitize(raw):
     """Collapse absolute repo, fixture and home paths, in the order of the shell sed.
 
-    The replacement is literal. The shell sed read each path as a regular expression, so
-    the two are identical for paths without regex metacharacters (the certified runs);
-    line endings, including CRLF and a missing final newline, are preserved exactly."""
+    The replacement is literal. The shell sed read each path as a regular expression and
+    fixture and worktree paths do contain a `.` (for example `.local-runs`). For every
+    literal occurrence of a path the two agree; they differ only where the sed also
+    rewrote a regex near-miss (a different character where the path has a `.`), which
+    real output does not produce. Line endings, including CRLF and a missing final
+    newline, are preserved exactly."""
     out = raw.replace(str(ROOT).encode(), b"<repo-root>")
     out = out.replace(str(FIX).encode(), SANITIZED_FIXTURE_LABEL.encode())
     if HOME:
@@ -158,8 +172,9 @@ def exec_status(error):
 def run_capture(binary, args, env, raw_path, sanitized_path):
     """Run one leg, sanitize its combined output, drop the raw file, return `$?`.
 
-    A binary that cannot start is recorded like the shell did: its error text is the
-    leg output and the status is 127 (126 for other exec errors)."""
+    A binary that cannot start has its error text as the leg output and status 127 when
+    the file or its interpreter is missing (as the shell did), 126 for other exec errors
+    such as ENOEXEC (the shell ran those through /bin/sh; this script refuses them)."""
     try:
         with open(str(raw_path), "wb") as raw:
             try:
@@ -214,11 +229,39 @@ def resolve_binary(value):
     """Absolute path of a binary setting, or None when a bare name is not on the child PATH.
 
     A value containing a slash is relative to the repo root; a bare name is looked up on
-    the PATH the legs run with, so the file checked is the file executed."""
+    the PATH the legs run with, so the file checked is the file executed. Only absolute,
+    non-empty PATH entries are searched: a relative or empty entry (for example from a
+    HOME that is relative or contains a colon) would mean the cwd. The legs execute the
+    returned absolute path, never a name.
+    decision: drop such entries over failing the run, because the remaining entries are
+    still a valid, absolute search path and the result is checked to be absolute."""
     if os.sep in value:
         joined = Path(value) if os.path.isabs(value) else ROOT / value
         return os.path.normpath(str(joined))
-    return shutil.which(value, path=CHILD_PATH)
+    found = shutil.which(value, path=os.pathsep.join(child_path_dirs()))
+    return found if found and os.path.isabs(found) else None
+
+
+def child_path_dirs():
+    """The absolute, non-empty entries of the child PATH."""
+    return [entry for entry in CHILD_PATH.split(os.pathsep) if entry and os.path.isabs(entry)]
+
+
+def fixture_symlink_problem():
+    """A message when the fixture tree has a symlink between ROOT and a fixture file, else None."""
+    anchor = ROOT.resolve() / ".local-runs"
+    candidates = [LOCAL_RUNS, FIX, FIX / "keys"] + [
+        FIX / "keys" / "ai-memory.priv", FIX / "keys" / "ai-memory.pub",
+        FIX / "operator.pub.b64", FIX / "peer-fingerprints.txt", FIX / "peer-attestation.json",
+        FIX / "keygen.out", FIX / "db-passphrase", FIX / "leg4-sqlcipher.db"]
+    for candidate in candidates:
+        if candidate.is_symlink():
+            return "%s is a symlink; fixtures hold keys and must stay inside %s" % (candidate, anchor)
+    try:
+        FIX.resolve().relative_to(anchor)
+    except ValueError:
+        return "fixture directory %s resolves outside %s" % (FIX, anchor)
+    return None
 
 
 def ensure_private_dir(directory):
@@ -237,8 +280,8 @@ def is_executable_file(candidate):
 def main(argv=None):
     parse_args(sys.argv[1:] if argv is None else argv)
     run_date = utc_run_date()
-    default_setting = os.environ.get("DEFAULT_BIN", DEFAULT_BIN_FALLBACK)
-    sqlcipher_setting = os.environ.get("SQLCIPHER_BIN", SQLCIPHER_BIN_FALLBACK)
+    default_setting = os.environ.get("DEFAULT_BIN") or DEFAULT_BIN_FALLBACK
+    sqlcipher_setting = os.environ.get("SQLCIPHER_BIN") or SQLCIPHER_BIN_FALLBACK
     tmpdir, problem = resolve_tmpdir(os.environ.get("TMPDIR"))
     if tmpdir is None:
         print(problem, file=sys.stderr)
@@ -248,7 +291,11 @@ def main(argv=None):
         print("DEFAULT_BIN %s is not an executable file; build it (cargo build --release) "
               "or set DEFAULT_BIN" % (default_bin or default_setting), file=sys.stderr)
         return 1
-    sqlcipher_bin = resolve_binary(sqlcipher_setting) or sqlcipher_setting
+    sqlcipher_bin = resolve_binary(sqlcipher_setting)
+    problem = fixture_symlink_problem()
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return 1
     OUT.mkdir(parents=True, exist_ok=True)
     FIX.mkdir(parents=True, exist_ok=True)
     os.chmod(FIX, DIR_MODE)  # holds the passphrase and keys: tightened on every run
@@ -310,10 +357,13 @@ def main(argv=None):
                      OUT / "posture-hardened-boot-refusal.out")
 
     # --- leg 4: sqlcipher + encrypt + boot gate ---
-    if not is_executable_file(sqlcipher_bin):
-        print("sqlcipher binary missing: " + sqlcipher_bin, file=sys.stderr)
+    if sqlcipher_bin is None or not is_executable_file(sqlcipher_bin):
+        print("sqlcipher binary missing: " + (sqlcipher_bin or sqlcipher_setting), file=sys.stderr)
         print("leg4 skipped")
         e4 = "missing"
+        stale = OUT / SQLCIPHER_OUT_FILE
+        if stale.is_file() or stale.is_symlink():
+            stale.unlink()  # never ship the previous run's leg-4 capture (#7463)
     else:
         # #3553 check #21 observes the LIVE pragma on the store the sqlcipher
         # build can open only with a passphrase.
@@ -372,6 +422,8 @@ def main(argv=None):
 
     print("exits e1=%s e2=%s e3=%s e4=%s" % (e1, e2, e3, e4))
     print("FAIL/PASS counts:")
+    if e4 == "missing":
+        print("%s MISSING (leg 4 skipped, no capture in the bundle)" % SQLCIPHER_OUT_FILE)
     for name in SUMMARY_FILES:
         path = OUT / name
         if path.is_file():

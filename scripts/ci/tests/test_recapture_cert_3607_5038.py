@@ -618,7 +618,163 @@ class SedLiteral7436(RecaptureBase):
     def test_docstrings_do_not_claim_unqualified_sed_identity(self):
         module = load_script_module()
         self.assertIn('literal', module.sanitize.__doc__)
-        self.assertIn('metacharacters', module.sanitize.__doc__)
+        self.assertIn('near-miss', module.sanitize.__doc__)
+
+
+class SqlcipherMissing7459(RecaptureBase):
+    """#7459: a bare SQLCIPHER_BIN off the child PATH is `missing`, never run by name."""
+
+    def test_bare_name_only_in_cwd_records_missing(self):
+        log = self.root / 'ran.log'
+        self.make_logging_stub(self.root / 'ai-memory-sqlcipher-r5probe', log)
+        done, _ = self.run_recapture(sqlcipher_bin='ai-memory-sqlcipher-r5probe')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(re.findall(r'^exit: (\S+)$', self.out('posture-legs-exit-codes.txt'), re.M),
+                         ['2', '2', '1', 'missing'])
+        self.assertFalse(log.exists())
+        self.assertIn('ai-memory-sqlcipher-r5probe', done.stderr)
+
+
+class ChildPathEntries7460(RecaptureBase):
+    """#7460: only absolute, non-empty child PATH entries are searched."""
+
+    NAME = 'ai-memory-r5probe'
+
+    def test_colon_home_does_not_search_the_cwd(self):
+        log = self.root / 'ran.log'
+        self.make_logging_stub(self.root / self.NAME, log)
+        done, _ = self.run_recapture(default_bin=self.NAME, extra_env={'HOME': ':'})
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertFalse(log.exists())
+
+    def test_relative_home_does_not_search_a_relative_entry(self):
+        log = self.root / 'ran.log'
+        self.make_logging_stub(self.root / 'rel' / '.cargo' / 'bin' / self.NAME, log)
+        done, _ = self.run_recapture(default_bin=self.NAME, extra_env={'HOME': 'rel'})
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertFalse(log.exists())
+
+    def test_home_containing_a_colon_still_resolves_an_absolute_entry(self):
+        log = self.root / 'ran.log'
+        self.make_logging_stub(self.root / 'abs-dir' / self.NAME, log)
+        module = load_script_module()
+        module.CHILD_PATH = ':rel/x::%s:%s' % (self.root / 'abs-dir', '.')
+        found = module.resolve_binary(self.NAME)
+        self.assertEqual(found, str(self.root / 'abs-dir' / self.NAME))
+        self.assertTrue(os.path.isabs(found))
+
+    def test_relative_and_empty_entries_never_resolve(self):
+        module = load_script_module()
+        self.make_logging_stub(self.root / self.NAME, self.root / 'ran.log')
+        module.CHILD_PATH = ':.:rel'
+        previous = os.getcwd()
+        os.chdir(str(self.root))
+        try:
+            self.assertIsNone(module.resolve_binary(self.NAME))
+        finally:
+            os.chdir(previous)
+
+
+class EmptyBinarySetting7461(RecaptureBase):
+    """#7461: an empty DEFAULT_BIN or SQLCIPHER_BIN takes the default, as `:-` did."""
+
+    def test_empty_settings_take_the_repo_defaults(self):
+        log = self.root / 'ran.log'
+        default = self.make_logging_stub(self.root / 'target' / 'release' / 'ai-memory', log)
+        cipher = self.make_logging_stub(
+            self.root / 'target-sqlcipher' / 'release' / 'ai-memory', log)
+        done, _ = self.run_recapture(extra_env={'DEFAULT_BIN': '', 'SQLCIPHER_BIN': ''})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(sorted(set(log.read_text().split())), sorted([str(default), str(cipher)]))
+        self.assertEqual(re.findall(r'^exit: (\S+)$', self.out('posture-legs-exit-codes.txt'), re.M),
+                         ['2', '2', '1', '0'])
+
+
+class FixtureSymlinks7462(RecaptureBase):
+    """#7462: a symlink between ROOT and a fixture file is refused before anything is written."""
+
+    def outside(self):
+        outside = self.home / 'outside-fix'
+        outside.mkdir()
+        return outside
+
+    def assert_refused(self, outside):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('symlink', done.stderr)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertFalse((self.root / 'docs').exists())
+
+    def test_symlinked_fixture_dir_is_refused(self):
+        outside = self.outside()
+        (self.root / '.local-runs').mkdir()
+        (self.root / '.local-runs' / 'cert-3607-fixtures').symlink_to(outside)
+        self.assert_refused(outside)
+
+    def test_symlinked_keys_dir_is_refused(self):
+        outside = self.outside()
+        fix = self.root / '.local-runs' / 'cert-3607-fixtures'
+        fix.mkdir(parents=True)
+        (fix / 'keys').symlink_to(outside)
+        self.assert_refused(outside)
+
+    def test_symlinked_fixture_file_is_refused(self):
+        outside = self.outside()
+        fix = self.root / '.local-runs' / 'cert-3607-fixtures'
+        fix.mkdir(parents=True)
+        (fix / 'db-passphrase').symlink_to(outside / 'target-file')
+        self.assert_refused(outside)
+
+
+class StaleLeg4Capture7463(RecaptureBase):
+    """#7463: a missing leg 4 never leaves the previous run's capture in the bundle."""
+
+    def test_second_run_without_sqlcipher_removes_the_stale_capture(self):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue((self.root / OUT_REL / 'posture-sqlcipher-pass.out').exists())
+        done, _ = self.run_recapture(sqlcipher_bin=self.root / 'no-such-binary')
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse((self.root / OUT_REL / 'posture-sqlcipher-pass.out').exists())
+        self.assertIn('posture-sqlcipher-pass.out MISSING', done.stdout)
+        self.assertEqual(re.findall(r'^exit: (\S+)$', self.out('posture-legs-exit-codes.txt'), re.M),
+                         ['2', '2', '1', 'missing'])
+
+
+class Enoexec7464(RecaptureBase):
+    """#7464: an executable with no shebang is refused and recorded as 126, not run via /bin/sh."""
+
+    def make_no_shebang(self, name):
+        path = self.root / name
+        path.write_text('echo hi\n')
+        path.chmod(0o755)
+        return path
+
+    def test_no_shebang_sqlcipher_records_126(self):
+        done, _ = self.run_recapture(sqlcipher_bin=self.make_no_shebang('no-shebang-sqlcipher'))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(re.findall(r'^exit: (\S+)$', self.out('posture-legs-exit-codes.txt'), re.M),
+                         ['2', '2', '1', '126'])
+
+    def test_no_shebang_default_bin_fails_keygen(self):
+        done, _ = self.run_recapture(default_bin=self.make_no_shebang('no-shebang-default'))
+        self.assertEqual(done.returncode, 1)
+        self.assertIn('operator keygen failed', done.stderr)
+        self.assertNotIn('Traceback', done.stderr)
+
+    def test_docstrings_state_the_refusal(self):
+        module = load_script_module()
+        self.assertIn('ENOEXEC', module.__doc__)
+        self.assertIn('/bin/sh', module.__doc__)
+
+
+class SanitizeDocstring7465(unittest.TestCase):
+    def test_docstring_states_the_facts(self):
+        doc = load_script_module().sanitize.__doc__
+        self.assertIn('near-miss', doc)
+        self.assertIn('literal occurrence', ' '.join(doc.split()))
+        self.assertNotIn('certified runs', doc)
+        self.assertIn('`.`', doc)
 
 
 if __name__ == '__main__':
