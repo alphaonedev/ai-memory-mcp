@@ -193,8 +193,12 @@ def parse_target_line(line: str) -> List[str]:
 
 
 def template_name(db_name: str) -> str:
-    """``<db>_tpl``, trimmed so the result is a valid identifier length."""
-    return db_name[:IDENT_MAX - len(TEMPLATE_SUFFIX)] + TEMPLATE_SUFFIX
+    """``<db>_tpl``. A name too long to take the suffix is refused, never
+    truncated: truncation maps two different names onto one template (#7127)."""
+    if len(db_name) + len(TEMPLATE_SUFFIX) > IDENT_MAX:
+        raise WrapperError('refusing database name %r: %s would exceed %d bytes and be truncated onto '
+                           'another template' % (db_name, TEMPLATE_SUFFIX, IDENT_MAX))
+    return db_name + TEMPLATE_SUFFIX
 
 
 def _checked_ident(name: str) -> str:
@@ -379,14 +383,24 @@ def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
         raise WrapperError('only %d free connection slots (max_connections=%d, reserved=%d, open now=%d); '
                            '%d needed for %d parallel binaries' % (available, most, reserved, now, need, jobs))
     q = quote_ident(tpl)
+    # Ownership comes only from a successful CREATE. An occupied name (a foreign
+    # or leftover template) or a missing privilege refuses: this function never
+    # ALTERs or DROPs a database it did not create (#7127).
     try:
-        psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE false' % q)
-    except WrapperError:
-        pass  # no leftover template from an earlier attempt
-    psql(url, 'DROP DATABASE IF EXISTS %s' % q)
-    psql(url, 'CREATE DATABASE %s' % q)
-    psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')
-    psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE true ALLOW_CONNECTIONS false' % q)
+        psql(url, 'CREATE DATABASE %s' % q)
+    except WrapperError as exc:
+        raise WrapperError('refusing to use template %s, it was not created by this run: %s' % (tpl, exc))
+    try:
+        psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')
+        psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE true ALLOW_CONNECTIONS false' % q)
+    except BaseException:
+        # The template is ours now and nothing else will drop it: plain DROP,
+        # never FORCE; the primary error stays the one raised.
+        try:
+            psql(url, 'DROP DATABASE IF EXISTS %s' % q)
+        except WrapperError as cleanup:
+            log('WARN could not drop the half-built template %s: %s' % (tpl, cleanup))
+        raise
     log('template %s ready (%d free connection slots, need %d)' % (tpl, available, need))
     return tpl
 

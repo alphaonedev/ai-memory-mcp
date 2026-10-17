@@ -440,7 +440,7 @@ class FakePg:
         for prefix, text in self.fail.items():
             if sql.startswith(prefix):
                 return Result(2, '', text)
-        found = re.search(r'DATABASE "([^"]+)"', sql)
+        found = re.search(r'DATABASE (?:IF EXISTS )?"([^"]+)"', sql)
         name = found.group(1) if found else None
         if sql.startswith('CREATE DATABASE'):
             if name in self.dbs:
