@@ -37,7 +37,8 @@ TARGET_ROOT_RELATIVE = Path(".cache") / "ai-memory-ci" / "cargo-target"
 ENV_NAME = "CARGO_TARGET_DIR"
 ROOT_ENV_NAME = "AI_MEMORY_CI_TARGET_ROOT"
 RUNNER_NAME_PATTERN = re.compile(r"\A[A-Za-z0-9._-]+\Z")
-DOT_NAMES = (".", "..")
+# #7293: a leading dot is the reserved namespace of .evict.lock / .evicting-*.
+RESERVED_NAME_PREFIX = "."
 # In-use marker (#7199): written into this runner's target at job start and
 # removed by the post-job prune step. Eviction in a sibling runner skips a
 # target whose marker is younger than IN_USE_MARKER_MAX_AGE_SECS, so a crashed
@@ -132,8 +133,13 @@ def target_root_dir(home):
 
 
 def valid_runner_name(name):
-    """True for a non-empty name of ``[A-Za-z0-9._-]`` that is not ``.``/``..``."""
-    return bool(name) and name not in DOT_NAMES and bool(RUNNER_NAME_PATTERN.match(name))
+    """True for a non-empty name of ``[A-Za-z0-9._-]`` that does not start with ``.``.
+
+    A leading dot (which also covers ``.``/``..``) is the reserved namespace of
+    ``.evict.lock`` and ``.evicting-*`` under the target root (#7293).
+    """
+    return (bool(name) and not name.startswith(RESERVED_NAME_PREFIX)
+            and bool(RUNNER_NAME_PATTERN.match(name)))
 
 
 def runner_target_dir(home, runner_name):
@@ -146,7 +152,7 @@ def runner_target_dir(home, runner_name):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--home", default=str(Path.home()), help="runner user home")
-    parser.add_argument("--runner-name", default=None, help="runner name (required)")
+    parser.add_argument("--runner-name", default=None, help="runner name (required; [A-Za-z0-9._-], must not start with a dot)")
     parser.add_argument(
         "--github-env", help="append CARGO_TARGET_DIR and the root to this $GITHUB_ENV file"
     )
