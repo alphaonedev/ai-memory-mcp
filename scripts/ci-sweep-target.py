@@ -639,6 +639,7 @@ def main(argv=None):
             try:
                 os.close(fd)
             except OSError:
+                # Best-effort cleanup: a descriptor that is already closed or invalid needs no further action.
                 pass
         if lock_fd is not None:
             os.close(lock_fd)  # closing the descriptor releases the flock

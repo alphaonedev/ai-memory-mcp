@@ -18,7 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest import mock
+import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -363,7 +363,7 @@ class TargetWalkTests(SweepTestCase):
         err = io.StringIO()
         out = io.StringIO()
         env = {module.WORKSPACE_ENV: str(self.workspace)}
-        with mock.patch.dict(os.environ, env), \
+        with unittest.mock.patch.dict(os.environ, env), \
                 contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
             rc = module.main(["--target", str(self.target), "--max-bytes", "1"])
         self.assertEqual(rc, EXIT_REFUSED, err.getvalue())
@@ -487,7 +487,7 @@ class TargetWalkTests(SweepTestCase):
             return real_open(path, flags, *args, **kwargs)
 
         out = io.StringIO()
-        with mock.patch.object(module.os, "open", recording_open), \
+        with unittest.mock.patch.object(module.os, "open", recording_open), \
                 contextlib.redirect_stdout(out):
             rc = module.main(["--target", str(self.target), "--max-bytes", "1",
                               "--allow-root", "--within", str(self.workspace)])
@@ -577,14 +577,15 @@ class EvictLockTests(SweepTestCase):
 
     def test_lock_released_while_waiting_lets_the_sweep_run_7297_lock(self):
         self.lock_path.write_bytes(b"")
-        fd = os.open(str(self.lock_path), os.O_RDWR)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        timer = threading.Timer(0.5, os.close, args=(fd,))
-        timer.start()
-        try:
-            result = self.sweep("--lock", str(self.lock_path), "--lock-timeout", "20")
-        finally:
-            timer.join()
+        with open(str(self.lock_path), "r+b") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            # close() is idempotent: the timer releases the lock, the with block backs it up.
+            timer = threading.Timer(0.5, lock_fh.close)
+            timer.start()
+            try:
+                result = self.sweep("--lock", str(self.lock_path), "--lock-timeout", "20")
+            finally:
+                timer.join()
         self.assertEqual(result.returncode, EXIT_OK, result.stderr)
         self.assertIn("removed=3", result.stdout)
 
@@ -749,14 +750,15 @@ class LockHardeningTests(SweepTestCase):
 
     def test_wait_is_measured_when_the_lock_is_released_late_7297_r6(self):
         self.lock_path.write_bytes(b"")
-        fd = os.open(str(self.lock_path), os.O_RDWR)
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        timer = threading.Timer(0.6, os.close, args=(fd,))
-        timer.start()
-        try:
-            result = self.sweep("--lock", str(self.lock_path), "--lock-timeout", "20")
-        finally:
-            timer.join()
+        with open(str(self.lock_path), "r+b") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            # close() is idempotent: the timer releases the lock, the with block backs it up.
+            timer = threading.Timer(0.6, lock_fh.close)
+            timer.start()
+            try:
+                result = self.sweep("--lock", str(self.lock_path), "--lock-timeout", "20")
+            finally:
+                timer.join()
         self.assertEqual(result.returncode, EXIT_OK, result.stderr)
         match = re.search(r"lock_wait=(\d+\.\d\d)", result.stdout)
         self.assertIsNotNone(match, result.stdout)
@@ -849,8 +851,8 @@ class LineBreakInjectionTests(SweepTestCase):
         module = load_script_module()
         err = io.StringIO()
         # CI sets GITHUB_WORKSPACE; an empty value makes the workspace check refuse.
-        with mock.patch("os.path.realpath", return_value="/x\n::error::y"), \
-                mock.patch.dict(os.environ, {"GITHUB_WORKSPACE": ""}):
+        with unittest.mock.patch("os.path.realpath", return_value="/x\n::error::y"), \
+                unittest.mock.patch.dict(os.environ, {"GITHUB_WORKSPACE": ""}):
             with contextlib.redirect_stderr(err):
                 code = module.main(["--target", "t", "--max-bytes", "5"])
         self.assertEqual(code, EXIT_REFUSED)
@@ -870,42 +872,50 @@ def raise_fd_limit(wanted):
 
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+# Fixture files are only ever read back by the same user, so owner-only is the minimum the test needs.
+FIXTURE_FILE_MODE = 0o600
+
+
+@contextlib.contextmanager
+def opened_fd(path, flags, dir_fd=None):
+    """Open ``path`` with os.open and always close the descriptor on exit."""
+    fd = os.open(path, flags, FIXTURE_FILE_MODE, dir_fd=dir_fd)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
 
 
 def make_deep_chain(parent, name, depth):
     """Create ``parent/name/d/d/...`` ``depth`` levels deep using dir_fd-relative calls."""
     os.makedirs(str(parent / name))
-    fd = os.open(str(parent / name), DIR_FLAGS)
-    for _ in range(depth):
-        os.mkdir("d", dir_fd=fd)
-        child = os.open("d", DIR_FLAGS, dir_fd=fd)
-        os.close(fd)
-        fd = child
-    os.close(fd)
+    with contextlib.ExitStack() as stack:
+        fd = stack.enter_context(opened_fd(str(parent / name), DIR_FLAGS))
+        for _ in range(depth):
+            os.mkdir("d", dir_fd=fd)
+            fd = stack.enter_context(opened_fd("d", DIR_FLAGS, dir_fd=fd))
 
 
 def remove_deep_chain(parent, name, depth):
     """Remove whatever is left of the chain made by make_deep_chain, without recursion."""
-    try:
-        fds = [os.open(str(parent / name), DIR_FLAGS)]
-    except FileNotFoundError:
-        return
-    try:
+    with contextlib.ExitStack() as stack:
+        try:
+            fds = [stack.enter_context(opened_fd(str(parent / name), DIR_FLAGS))]
+        except FileNotFoundError:
+            return
         while len(fds) <= depth:
             try:
-                fds.append(os.open("d", DIR_FLAGS, dir_fd=fds[-1]))
+                fds.append(stack.enter_context(opened_fd("d", DIR_FLAGS, dir_fd=fds[-1])))
             except FileNotFoundError:
                 break
         for idx in range(len(fds) - 1, -1, -1):
             try:
                 os.unlink("f", dir_fd=fds[idx])
             except FileNotFoundError:
+                # No file at this level: chains made by make_deep_chain hold none, so nothing to remove.
                 pass
             if idx:
                 os.rmdir("d", dir_fd=fds[idx - 1])
-    finally:
-        for fd in fds:
-            os.close(fd)
     os.rmdir(str(parent / name))
 
 
@@ -939,37 +949,32 @@ class DeepTreeTests(SweepTestCase):
 def make_deep_chain_with_files(parent, name, depth):
     """Like make_deep_chain, with one small file at every level; returns the file count."""
     os.makedirs(str(parent / name))
-    fd = os.open(str(parent / name), DIR_FLAGS)
     count = 0
-    for _ in range(depth):
-        file_fd = os.open("f", os.O_WRONLY | os.O_CREAT, 0o644, dir_fd=fd)
-        os.write(file_fd, b"0123456789")
-        os.close(file_fd)
-        count += 1
-        os.mkdir("d", dir_fd=fd)
-        child = os.open("d", DIR_FLAGS, dir_fd=fd)
-        os.close(fd)
-        fd = child
-    os.close(fd)
+    with contextlib.ExitStack() as stack:
+        fd = stack.enter_context(opened_fd(str(parent / name), DIR_FLAGS))
+        for _ in range(depth):
+            with opened_fd("f", os.O_WRONLY | os.O_CREAT, dir_fd=fd) as file_fd:
+                os.write(file_fd, b"0123456789")
+            count += 1
+            os.mkdir("d", dir_fd=fd)
+            fd = stack.enter_context(opened_fd("d", DIR_FLAGS, dir_fd=fd))
     return count
 
 
 def count_files(root):
     """Count regular files under ``root`` iteratively, by descriptor (no path limit)."""
     total = 0
-    stack = [os.open(str(root), DIR_FLAGS)]
-    while stack:
-        fd = stack.pop()
-        try:
+    with contextlib.ExitStack() as holder:
+        stack = [holder.enter_context(opened_fd(str(root), DIR_FLAGS))]
+        while stack:
+            fd = stack.pop()
             with os.scandir(fd) as it:
                 children = list(it)
             for child in children:
                 if child.is_dir(follow_symlinks=False):
-                    stack.append(os.open(child.name, DIR_FLAGS, dir_fd=fd))
+                    stack.append(holder.enter_context(opened_fd(child.name, DIR_FLAGS, dir_fd=fd)))
                 else:
                     total += 1
-        finally:
-            os.close(fd)
     return total
 
 
@@ -1102,7 +1107,7 @@ class PartialDeleteTests(SweepTestCase):
 
         out = io.StringIO()
         err = io.StringIO()
-        with mock.patch.object(os, "unlink", flaky_unlink), \
+        with unittest.mock.patch.object(os, "unlink", flaky_unlink), \
                 contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
             rc = module.main(["--target", str(self.target), "--max-bytes", "1",
                               "--allow-root", "--within", str(self.workspace)])
