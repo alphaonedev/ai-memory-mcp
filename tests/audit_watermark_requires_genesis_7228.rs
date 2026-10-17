@@ -178,7 +178,7 @@ const UNREADABLE_GENESIS_HASH: &str = "not-a-blob";
 
 /// #7239 / #7604 (3-agent vote (6def5ab6), Option B) - a genesis READ ERROR at an
 /// emission-due append skips the watermark emission: the append still succeeds,
-/// no db_id-less watermark row is written, the skip is counted (and WARNed), and
+/// no db_id-less watermark row is written, the skip is counted (and logged), and
 /// the NEXT emission-due append retries. The chain must never stall on it.
 #[test]
 fn sqlite_genesis_read_error_skips_the_watermark_and_the_append_succeeds_7239() {
@@ -226,7 +226,7 @@ fn sqlite_genesis_read_error_skips_the_watermark_and_the_append_succeeds_7239() 
     forensic::shutdown();
     assert!(
         forensic::watermark_genesis_read_skips() > skips_before,
-        "the skipped emission must be counted (and WARNed)"
+        "the skipped emission must be counted (and logged)"
     );
     let rows = watermark_payloads(fdir.path());
     assert!(
@@ -349,7 +349,7 @@ mod postgres_twin {
         forensic::shutdown();
         assert!(
             forensic::watermark_genesis_read_skips() > skips_before,
-            "the skipped emission must be counted (and WARNed)"
+            "the skipped emission must be counted (and logged)"
         );
         let rows = watermark_payloads(fdir.path());
         assert!(
