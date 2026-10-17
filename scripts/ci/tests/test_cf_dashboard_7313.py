@@ -492,9 +492,159 @@ class CspSourceList7313(unittest.TestCase):
         sources = origin_mod.csp_sources("default-src 'self'; img-src 'self' data:; script-src 'unsafe-inline'")
         self.assertEqual([s for s in sources if s.host], [])
 
-    def test_unrecognised_source_expression_fails_closed(self):
-        with self.assertRaises(ValueError):
-            origin_mod.csp_sources("img-src https://a.example:abc")
+    def test_unrecognised_source_expression_matches_nothing_and_is_reported(self):
+        # browsers ignore an invalid source expression (CSP3 3.1); it must never admit a load, and the guard
+        # reports it so a typo in _headers goes red
+        self.assertEqual(origin_mod.csp_sources("img-src https://a.example:abc"), [])
+        policy = origin_mod.parse_policy("img-src https://a.example:abc")
+        self.assertEqual(policy.invalid, [("img-src", "https://a.example:abc")])
+        load = origin_mod.Load("img", "https://a.example", "/x.png", "")
+        self.assertFalse(origin_mod.load_allowed(policy, load))
+
+
+class CspPerDirective7543(unittest.TestCase):
+    """#7543: each loaded resource is checked against the directive that governs its own kind, with the CSP3
+    fallback chain and no merging of source lists. #7544: source path parts. #7545: invalid sources match nothing."""
+
+    REAL = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' "
+            "https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; "
+            "connect-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'; frame-ancestors 'none'")
+
+    def allowed(self, csp, kind, origin, path="/x", nonce=""):
+        policy = origin_mod.parse_policy(csp)
+        return origin_mod.load_allowed(policy, origin_mod.Load(kind, origin, path, nonce))
+
+    def test_a_host_allowed_for_one_kind_does_not_admit_another_kind(self):
+        gapi, gstatic = "https://fonts.googleapis.com", "https://fonts.gstatic.com"
+        self.assertTrue(self.allowed(self.REAL, "style", gapi, "/css2"))
+        self.assertFalse(self.allowed(self.REAL, "script", gapi, "/x.js"))
+        self.assertFalse(self.allowed(self.REAL, "frame", gapi, "/"))
+        self.assertFalse(self.allowed(self.REAL, "img", gstatic, "/p.png"))
+        self.assertTrue(self.allowed(self.REAL, "font", gstatic, "/s/f.woff2"))
+        self.assertFalse(self.allowed(self.REAL, "style", gstatic, "/x.css"))
+
+    def test_source_lists_are_never_merged_across_directives(self):
+        csp = "default-src 'none'; img-src https://a.example"
+        self.assertTrue(self.allowed(csp, "img", "https://a.example"))
+        for kind in ("script", "style", "font", "media", "frame", "object", "manifest", "connect", "worker"):
+            self.assertFalse(self.allowed(csp, kind, "https://a.example"), kind)
+
+    def test_fallback_chains(self):
+        eff = lambda csp, kind: origin_mod.effective_directive(origin_mod.parse_policy(csp), kind)
+        self.assertEqual(eff("default-src 'self'", "script"), "default-src")
+        self.assertEqual(eff("default-src 'self'; script-src 'self'", "script"), "script-src")
+        self.assertEqual(eff("script-src 'self'; script-src-elem https://s.example", "script"), "script-src-elem")
+        self.assertEqual(eff("style-src 'self'; style-src-elem https://s.example", "style"), "style-src-elem")
+        self.assertEqual(eff("default-src 'self'; child-src 'none'", "frame"), "child-src")
+        self.assertEqual(eff("default-src 'self'; child-src 'none'; frame-src 'self'", "frame"), "frame-src")
+        self.assertEqual(eff("default-src 'self'; child-src 'none'", "worker"), "child-src")
+        self.assertEqual(eff("default-src 'self'; script-src 'self'", "worker"), "script-src")
+        self.assertEqual(eff("img-src 'self'", "img"), "img-src")
+        self.assertEqual(eff("img-src 'self'", "font"), None)  # nothing governs a font: unrestricted
+        self.assertEqual(eff("default-src 'self'", "connect"), "default-src")
+        self.assertEqual(eff("default-src 'self'", "manifest"), "default-src")
+
+    def test_first_occurrence_of_a_duplicate_directive_wins_and_names_are_case_insensitive(self):
+        csp = "IMG-SRC https://a.example; img-src https://b.example"
+        self.assertTrue(self.allowed(csp, "img", "https://a.example"))
+        self.assertFalse(self.allowed(csp, "img", "https://b.example"))
+
+    def test_none_with_nothing_else_matches_nothing(self):
+        self.assertFalse(self.allowed("img-src 'none'", "img", "https://a.example"))
+        self.assertFalse(self.allowed("img-src", "img", "https://a.example"))
+
+    def test_scheme_sources_and_the_http_to_https_upgrade(self):
+        self.assertTrue(self.allowed("img-src https:", "img", "https://a.example"))
+        self.assertFalse(self.allowed("img-src https:", "img", "http://a.example"))
+        self.assertTrue(self.allowed("img-src http:", "img", "https://a.example"))
+        self.assertTrue(self.allowed("img-src http://a.example", "img", "https://a.example"))
+        self.assertFalse(self.allowed("img-src https://a.example", "img", "http://a.example"))
+
+    def test_strict_dynamic_ignores_hosts_and_wants_a_matching_nonce(self):
+        csp = "script-src 'strict-dynamic' https://s.example 'nonce-abc123'"
+        self.assertFalse(self.allowed(csp, "script", "https://s.example", "/x.js"))
+        self.assertFalse(self.allowed(csp, "script", "https://s.example", "/x.js", nonce="other"))
+        self.assertTrue(self.allowed(csp, "script", "https://s.example", "/x.js", nonce="abc123"))
+        self.assertEqual(origin_mod.csp_sources(csp), [])  # the flat view drops the ignored hosts too
+        self.assertTrue(self.allowed("script-src https://s.example", "script", "https://s.example"))
+
+    def test_loaded_resources_carry_the_kind_the_browser_checks(self):
+        html = (
+            '<link rel="stylesheet" href="https://s.example/a.css"><script src="https://s.example/a.js" nonce="n1"></script>'
+            '<link rel="icon" href="https://i.example/i.png"><link rel="preload" as="font" href="https://f.example/f.woff2">'
+            '<link rel="preload" as="script" href="https://p.example/p.js"><link rel="manifest" href="https://m.example/m.json">'
+            '<img src="https://img.example/a.png" srcset="https://img.example/b.png 2x"><iframe src="https://fr.example/"></iframe>'
+            '<video poster="https://v.example/p.png"><source src="https://v.example/v.mp4"></video>'
+            '<picture><source srcset="https://pic.example/s.png"></picture><object data="https://o.example/o"></object>'
+            '<embed src="https://e.example/e"><audio src="https://au.example/a.mp3"></audio>')
+        got = {(ld.kind, ld.origin) for ld in origin_mod.loaded_resources(html)}
+        self.assertEqual(got, {
+            ("style", "https://s.example"), ("script", "https://s.example"), ("img", "https://i.example"),
+            ("font", "https://f.example"), ("script", "https://p.example"), ("manifest", "https://m.example"),
+            ("img", "https://img.example"), ("frame", "https://fr.example"), ("img", "https://v.example"),
+            ("media", "https://v.example"), ("img", "https://pic.example"), ("object", "https://o.example"),
+            ("object", "https://e.example"), ("media", "https://au.example")})
+        script = [ld for ld in origin_mod.loaded_resources(html) if ld.kind == "script" and ld.origin == "https://s.example"]
+        self.assertEqual(script[0].nonce, "n1")
+        self.assertEqual(script[0].path, "/a.js")
+
+    def test_an_unparsed_url_is_never_allowed(self):
+        (load,) = origin_mod.loaded_resources('<img src="https://exa%mple/x">')
+        self.assertTrue(load.origin.startswith("unparsed:"))
+        self.assertFalse(origin_mod.load_allowed(origin_mod.parse_policy("img-src *"), load))
+
+    # ---- #7544: path parts
+    def test_7544_source_path_is_exact_or_a_prefix_when_it_ends_with_a_slash(self):
+        exact = "img-src https://a.example/allowed/one.png"
+        self.assertTrue(self.allowed(exact, "img", "https://a.example", "/allowed/one.png"))
+        self.assertFalse(self.allowed(exact, "img", "https://a.example", "/allowed/one.png/more"))
+        self.assertFalse(self.allowed(exact, "img", "https://a.example", "/other.png"))
+        prefix = "img-src https://a.example/allowed/"
+        self.assertTrue(self.allowed(prefix, "img", "https://a.example", "/allowed/x/y.png"))
+        self.assertFalse(self.allowed(prefix, "img", "https://a.example", "/other.png"))
+        self.assertFalse(self.allowed(prefix, "img", "https://a.example", "/allowed"))
+        self.assertFalse(self.allowed(prefix, "img", "https://a.example", "/ALLOWED/x.png"))
+        self.assertTrue(self.allowed("img-src https://a.example", "img", "https://a.example", "/anything/at/all"))
+
+    def test_7544_path_matching_decodes_percent_escapes_and_resolves_dot_segments(self):
+        prefix = "img-src https://a.example/allowed/"
+        self.assertTrue(self.allowed(prefix, "img", "https://a.example", "/%61llowed/x.png"))
+        (load,) = origin_mod.loaded_resources('<img src="https://a.example/allowed/../other.png?q=1#f">')
+        self.assertEqual(load.path, "/other.png")
+        self.assertFalse(origin_mod.load_allowed(origin_mod.parse_policy(prefix), load))
+        (load,) = origin_mod.loaded_resources('<img src="https://a.example/allowed/%2e%2e/other.png">')
+        self.assertEqual(load.path, "/other.png")
+        (load,) = origin_mod.loaded_resources('<img src="https://a.example">')
+        self.assertEqual(load.path, "/")
+
+    def test_7544_a_path_source_cannot_admit_a_bare_origin_check(self):
+        (src,) = origin_mod.csp_sources("img-src https://a.example/allowed/")
+        self.assertFalse(origin_mod.source_allows(src, "https://a.example"))
+        self.assertTrue(origin_mod.source_allows(src, "https://a.example", "/allowed/x"))
+
+    def test_7544_a_path_with_a_query_or_fragment_is_an_invalid_source(self):
+        for bad in ("https://a.example/p?q=1", "https://a.example/p#f", "https://a.example/p;x", "https://a.example/p,x"):
+            policy = origin_mod.parse_policy("img-src " + bad)
+            self.assertEqual(len(policy.invalid), 1, bad)
+
+    # ---- #7545: invalid host sources
+    def test_7545_ipv6_and_underscore_host_sources_are_invalid_and_match_nothing(self):
+        for source, origin in (("https://[::1]", "https://[::1]"), ("https://[::1]:8443", "https://[::1]:8443"),
+                               ("https://a_b.example", "https://a_b.example"), ("https://*.a_b.example", "https://x.a_b.example"),
+                               ("[::1]", "https://[::1]")):
+            policy = origin_mod.parse_policy("img-src " + source)
+            self.assertEqual(policy.invalid, [("img-src", source)], source)
+            self.assertEqual(origin_mod.csp_sources("img-src " + source), [], source)
+            self.assertFalse(origin_mod.load_allowed(policy, origin_mod.Load("img", origin, "/x.png", "")), source)
+
+    def test_7545_valid_shapes_stay_valid(self):
+        for source in ("https://a.example", "https://*.a.example:*", "*", "https://1.2.3.4:8443", "HTTPS://A-B.Example/p/",
+                       "https:", "'self'", "'nonce-QUJD'", "'sha256-abc+/='", "data:", "wss://ws.example"):
+            policy = origin_mod.parse_policy("img-src " + source)
+            self.assertEqual(policy.invalid, [], source)
+
+    def test_the_real_policy_has_no_invalid_source(self):
+        self.assertEqual(origin_mod.parse_policy(self.REAL).invalid, [])
 
 
 class PublicSnapshotHygiene7518(unittest.TestCase):
@@ -703,6 +853,9 @@ function renderAll(D) { if (!Array.isArray(D.dimensions)) throw new TypeError("s
         self.assertTrue(out["recovered"].startswith("connected"), out)
         self.assertTrue(out["recoveredAfterTick"].startswith("connected"), out)
 
+    # the Google Fonts stylesheet (style-src) names font files on fonts.gstatic.com: a font load no page tag shows
+    INDIRECT_LOADS = (("font", "https://fonts.gstatic.com", "/s/font.woff2"),)
+
     def test_headers_csp_matches_loaded_origins(self):
         headers = (PUBLIC / "_headers").read_text()
         csp = re.search(r"Content-Security-Policy: (.*)", headers)
@@ -711,16 +864,27 @@ function renderAll(D) { if (!Array.isArray(D.dimensions)) throw new TypeError("s
         self.assertIn("frame-ancestors 'none'", csp)
         self.assertIn("X-Frame-Options: DENY", headers)
         self.assertEqual(headers.count("/state.json"), 0, "redundant /state.json rule (covered by /*.json)")
-        sources = origin_mod.csp_sources(csp)
-        loaded = set()
+        policy = origin_mod.parse_policy(csp)
+        self.assertEqual(policy.invalid, [], "invalid CSP source expressions (browsers ignore them)")
+        loads = []
         for page in sorted(PUBLIC.glob("*.html")):
-            loaded.update(origin_mod.loaded_origins(page.read_text()))
-        self.assertTrue(loaded, "expected external stylesheet origins")
-        blocked = {o for o in loaded if not any(origin_mod.source_allows(s, o) for s in sources)}
-        self.assertEqual(blocked, set(), "origins loaded but not allowed by CSP (or unparsed): %s" % blocked)
-        unused = [s for s in sources if s.host and s.host != "fonts.gstatic.com"
-                  and not any(origin_mod.source_allows(s, o) for o in loaded)]
-        self.assertEqual(unused, [], "CSP allows unused origins")
+            loads.extend(origin_mod.loaded_resources(page.read_text()))
+        loads.extend(origin_mod.Load(kind, origin, path, "") for kind, origin, path in self.INDIRECT_LOADS)
+        self.assertTrue([ld for ld in loads if ld.kind == "style"], "expected external stylesheet loads")
+        for load in loads:
+            self.assertIsNotNone(origin_mod.effective_directive(policy, load.kind), "no directive governs %s" % (load,))
+        # each resource is checked against the directive that governs ITS kind (CSP3 fallback, no merging)
+        blocked = [ld for ld in loads if not origin_mod.load_allowed(policy, ld)]
+        self.assertEqual(blocked, [], "loads not allowed by their own CSP directive (or unparsed): %s" % blocked)
+        unused = []
+        for name, entries in policy.directives.items():
+            for kind, value in entries:
+                if kind != "host":
+                    continue
+                users = [ld for ld in loads if origin_mod.effective_directive(policy, ld.kind) == name]
+                if not any(origin_mod.source_allows(value, ld.origin, ld.path) for ld in users):
+                    unused.append((name, value))
+        self.assertEqual(unused, [], "CSP allows origins no resource of that directive uses")
 
 
 class DeployCli7313(unittest.TestCase):
