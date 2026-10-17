@@ -299,49 +299,87 @@ def _pg_env(url: str) -> Dict[str, str]:
     return env
 
 
-def _connect_budget_secs(env: Dict[str, str]) -> int:
-    """Worst-case seconds libpq may spend connecting: connect_timeout (floored at 2 s) per resolved address,
-    doubled when sslmode may retry without TLS (#7482). Raises on a value that is not a plain positive number."""
+def _connect_plan(env: Dict[str, str]) -> Tuple[int, int, int]:
+    """``(connect_timeout_secs, addresses, passes)`` libpq may spend connecting: connect_timeout floored at 2 s,
+    per resolved address, with a second pass when sslmode may retry without TLS (#7482). Raises on a value that
+    is not a plain positive number."""
     connect = env.get('PGCONNECT_TIMEOUT', '')
     if _DIGITS_RE.fullmatch(connect) is None or int(connect) <= 0:
         raise WrapperError('connect_timeout %r must be a positive whole number of seconds so the server-side '
                            'statement cap can be sized under the psql limit' % connect)
+    each = max(int(connect), LIBPQ_MIN_CONNECT_SECS)
     host = env.get('PGHOST', '')
     if env.get('PGHOSTADDR') or not host or host.startswith('/'):
-        return max(int(connect), LIBPQ_MIN_CONNECT_SECS)
+        return each, 1, 1
     try:
         port = int(env.get('PGPORT') or 5432)
         addresses = len({info[4] for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)}) or 1
     except (OSError, ValueError):
         addresses = 1
-    tries = 2 if env.get('PGSSLMODE', 'prefer') in ('prefer', 'allow') else 1
-    return max(int(connect), LIBPQ_MIN_CONNECT_SECS) * addresses * tries
+    return each, addresses, 2 if env.get('PGSSLMODE', 'prefer') in ('prefer', 'allow') else 1
+
+
+def _connect_budget_secs(env: Dict[str, str]) -> int:
+    """Worst-case seconds libpq may spend connecting (see ``_connect_plan``)."""
+    each, addresses, passes = _connect_plan(env)
+    return each * addresses * passes
 
 
 def server_caps_sql(env: Dict[str, str]) -> str:
     """A ``DO`` statement setting session statement_timeout and lock_timeout to the least non-zero of the
     value the server already resolved for this session (startup options, role and database defaults) and the
-    wrapper cap; lock_timeout is clamped a gap below the effective statement_timeout (#7453, #7480, #7484)."""
-    cap_ms = int((PSQL_TIMEOUT_SECS - _connect_budget_secs(env) - PSQL_CAP_MARGIN_SECS) * 1000)
+    wrapper cap; lock_timeout is clamped below the effective statement_timeout (#7453, #7480, #7484, #7519).
+
+    The body pins search_path and names pg_catalog objects, so a caller ``options=-c search_path=...`` naming a
+    schema with a shadow ``pg_settings`` or ``set_config`` cannot skip the cap (#7520)."""
+    budget = _connect_budget_secs(env)
+    cap_ms = int((PSQL_TIMEOUT_SECS - budget - PSQL_CAP_MARGIN_SECS) * 1000)
     gap_ms = int(PSQL_LOCK_GAP_SECS * 1000)
     lock_cap_ms = cap_ms - gap_ms
     if lock_cap_ms <= 0:
-        raise WrapperError('the connect budget leaves no room for a server-side statement cap under the %g s '
-                           'psql limit' % PSQL_TIMEOUT_SECS)
+        each, addresses, passes = _connect_plan(env)
+        raise WrapperError(
+            'the connect budget (%d s = connect_timeout %d s x %d address(es) x %d sslmode pass(es), '
+            'sslmode=%s) leaves no room for a server-side statement cap under the %g s psql limit; lower '
+            'connect_timeout or set sslmode=require' % (budget, each, addresses, passes,
+                                                        env.get('PGSSLMODE', 'prefer'), PSQL_TIMEOUT_SECS))
     return (
         "DO $cap$ DECLARE s bigint; l bigint; BEGIN "
-        "SELECT setting::bigint INTO s FROM pg_settings WHERE name = 'statement_timeout'; "
-        "SELECT setting::bigint INTO l FROM pg_settings WHERE name = 'lock_timeout'; "
+        "PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true); "
+        "SELECT setting::bigint INTO s FROM pg_catalog.pg_settings WHERE name = 'statement_timeout'; "
+        "SELECT setting::bigint INTO l FROM pg_catalog.pg_settings WHERE name = 'lock_timeout'; "
         "IF s = 0 OR s > %(cap)d THEN s := %(cap)d; END IF; "
         "IF l = 0 OR l > %(lock)d THEN l := %(lock)d; END IF; "
-        "IF l >= s THEN l := greatest(s - %(gap)d, 1); END IF; "
-        "PERFORM set_config('statement_timeout', s::text || 'ms', false); "
-        "PERFORM set_config('lock_timeout', l::text || 'ms', false); "
-        "END $cap$" % {'cap': cap_ms, 'lock': lock_cap_ms, 'gap': gap_ms})
+        "IF l >= s THEN l := CASE WHEN s > %(twice)d THEN s - %(gap)d ELSE greatest(s / 2, 1) END; END IF; "
+        "PERFORM pg_catalog.set_config('statement_timeout', s::text || 'ms', false); "
+        "PERFORM pg_catalog.set_config('lock_timeout', l::text || 'ms', false); "
+        "END $cap$" % {'cap': cap_ms, 'lock': lock_cap_ms, 'gap': gap_ms, 'twice': 2 * gap_ms})
+
+
+# Caller SQL that would undo the server cap or run outside it: SET/RESET of the two timeouts (also inside ALTER
+# ROLE/DATABASE ... SET), RESET ALL and DISCARD ALL (both reset them), any set_config (its name argument can be
+# built at run time), and a second statement (the cap bounds each statement, not the whole -c string, #7521).
+_CAP_OVERRIDE_RE = re.compile(
+    r'\b(?:set|reset)\b[^;]*?\b(?:statement_timeout|lock_timeout)\b|\breset\s+all\b|\bdiscard\s+all\b'
+    r'|\bset_config\b', re.IGNORECASE)
+
+
+def _refuse_uncapped_sql(sql: str) -> None:
+    body = sql.strip()
+    if body.endswith(';'):
+        body = body[:-1]
+    if ';' in body:
+        raise WrapperError('refusing SQL with more than one statement: the server cap bounds one statement '
+                           'per psql call (%r)' % sql[:80])
+    if _CAP_OVERRIDE_RE.search(body):
+        raise WrapperError('refusing SQL that sets or resets statement_timeout or lock_timeout: the server cap '
+                           'must stay in force (%r)' % sql[:80])
 
 
 def psql(url: str, sql: str, tuples: bool = False) -> str:
-    """Run one statement through psql; returns stdout, raises on failure."""
+    """Run one statement through psql; returns stdout, raises on failure. Refuses SQL that holds more than one
+    statement or would undo the server-side caps (#7521)."""
+    _refuse_uncapped_sql(sql)
     argv = ['psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1']
     if tuples:
         argv.append('-At')
