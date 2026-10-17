@@ -160,6 +160,24 @@ pub fn handle_subscription_dlq_list(
     params: &Value,
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
+    let caller = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
+    handle_subscription_dlq_list_for(
+        conn,
+        params,
+        &caller,
+        &crate::identity::admin_agent_ids(),
+    )
+}
+
+/// [`handle_subscription_dlq_list`] for an already-resolved `caller` and an
+/// explicit operator allowlist. The HTTP surface passes its header-bound
+/// caller and `AppState.admin_agent_ids` (#7501).
+pub fn handle_subscription_dlq_list_for(
+    conn: &rusqlite::Connection,
+    params: &Value,
+    caller: &str,
+    _admin_ids: &[String],
+) -> Result<Value, String> {
     let subscription_id = params[param_names::SUBSCRIPTION_ID].as_str();
     let limit = params["limit"]
         .as_u64()
@@ -185,8 +203,6 @@ pub fn handle_subscription_dlq_list(
     //     to only those whose subscription owner == caller. This
     //     preserves the per-tenant operator inventory use-case while
     //     refusing to leak cross-tenant payloads.
-    let caller = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
-
     let rows_all = crate::subscriptions::list_dlq(conn, subscription_id)
         .map_err(|e| crate::mcp::error_text::mcp_foreign_err("resolve_agent_id", e))?;
     let rows: Vec<_> = if subscription_id
@@ -196,12 +212,12 @@ pub fn handle_subscription_dlq_list(
         // the owner gate cannot apply; they are attributed to the writer.
         rows_all
             .into_iter()
-            .filter(|r| crate::subscriptions::scan_failure::scan_failure_visible_to(r, &caller))
+            .filter(|r| crate::subscriptions::scan_failure::scan_failure_visible_to(r, caller))
             .collect()
     } else if let Some(sid) = subscription_id {
         let owner = crate::subscriptions::get_owner(conn, sid)
             .map_err(|e| crate::mcp::error_text::mcp_foreign_err("list_dlq", e))?;
-        if owner.as_deref() != Some(caller.as_str()) {
+        if owner.as_deref() != Some(caller) {
             // Identical wire shape to "no DLQ entries since the
             // subscription rolled over". Cannot distinguish from
             // not-found.
@@ -223,7 +239,7 @@ pub fn handle_subscription_dlq_list(
             std::collections::HashMap::new();
         let mut out = Vec::with_capacity(rows_all.len());
         for row in rows_all {
-            if crate::subscriptions::scan_failure::scan_failure_visible_to(&row, &caller) {
+            if crate::subscriptions::scan_failure::scan_failure_visible_to(&row, caller) {
                 // v1.0.0 #7366: a failed-lookup record, shown to its writer.
                 out.push(row);
                 continue;
@@ -238,7 +254,7 @@ pub fn handle_subscription_dlq_list(
                     o
                 }
             };
-            if owner.as_deref() == Some(caller.as_str()) {
+            if owner.as_deref() == Some(caller) {
                 out.push(row);
             }
         }
@@ -845,6 +861,62 @@ mod tests {
         let resp_unfiltered =
             handle_subscription_dlq_list(&conn, &json!({}), Some("ai:bob-client")).expect("ok");
         assert_eq!(resp_unfiltered["count"].as_u64(), Some(0));
+    }
+
+    // #7501 — failed-lookup rows: an admin sees every writer's rows and the
+    // anonymous ones; a non-admin sees only its own.
+    fn seed_failed_lookup_rows(conn: &rusqlite::Connection) {
+        for (i, payload) in [
+            r#"{"agent_id":"ai:alice"}"#,
+            r#"{"agent_id":null}"#,
+            r#"{"agent_id":"ai:carol"}"#,
+        ]
+        .iter()
+        .enumerate()
+        {
+            conn.execute(
+                "INSERT INTO subscription_dlq \
+                 (subscription_id, correlation_id, event_type, payload, retry_count, last_error, \
+                  first_failed_at, last_failed_at) \
+                 VALUES (?1, ?2, 'memory_store', ?3, 4, 'x', 'now', 'now')",
+                rusqlite::params![
+                    format!(
+                        "{}:team/ns{i}",
+                        crate::subscriptions::scan_failure::DISPATCH_SCAN_FAILED_SUB_ID
+                    ),
+                    format!("c{i}"),
+                    payload
+                ],
+            )
+            .expect("seed failed-lookup row");
+        }
+    }
+
+    #[test]
+    fn dlq_list_admin_sees_every_failed_lookup_row_7501() {
+        let conn = fresh_conn();
+        seed_failed_lookup_rows(&conn);
+        let admins = vec!["ai:root".to_string()];
+        let resp =
+            handle_subscription_dlq_list_for(&conn, &json!({}), "ai:root", &admins).expect("ok");
+        assert_eq!(
+            resp["count"].as_u64(),
+            Some(3),
+            "an admin sees other writers' rows and the anonymous row"
+        );
+    }
+
+    #[test]
+    fn dlq_list_non_admin_non_owner_sees_none_7501() {
+        let conn = fresh_conn();
+        seed_failed_lookup_rows(&conn);
+        let admins = vec!["ai:root".to_string()];
+        let bob =
+            handle_subscription_dlq_list_for(&conn, &json!({}), "ai:bob", &admins).expect("ok");
+        assert_eq!(bob["count"].as_u64(), Some(0), "a non-owner sees nothing");
+        let alice =
+            handle_subscription_dlq_list_for(&conn, &json!({}), "ai:alice", &admins).expect("ok");
+        assert_eq!(alice["count"].as_u64(), Some(1), "the owner sees only its own");
     }
 
     // handle_pending_list — happy + count.
