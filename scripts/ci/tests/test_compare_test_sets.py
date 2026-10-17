@@ -384,6 +384,30 @@ class TotalsCli(unittest.TestCase):
         self.assertIn('IDENTICAL', done.stdout)
         self.assertIn('nextest 1 of 1', done.stdout)
 
+    def pass_baseline(self):
+        return ('     Running unittests src/lib.rs (target/debug/deps/ai_memory-0123456789abcdef)\n'
+                'running 1 test\n'
+                'test a::t ... ok\n\n'
+                'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n')
+
+    def test_fail_plus_leak_against_a_passing_baseline_is_different_not_identical_7298(self):
+        # nextest prints a test that failed AND leaked as `FAIL + LEAK`; it must not read as a pass
+        self.cargo.write_text(self.pass_baseline())
+        self.nextest.write_text(' FAIL + LEAK [   0.010s] ai-memory a::t\n'
+                                '     Summary [   0.030s] 1 test run: 0 passed, 1 failed, 0 skipped\n')
+        done = self.run_cli('--cargo-log', str(self.cargo), '--nextest-log', str(self.nextest))
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn('DIFFERENT', done.stdout)
+        self.assertIn('a::t: pass -> fail', done.stdout)
+
+    def test_unknown_nextest_status_exits_two_naming_the_line_7298(self):
+        self.cargo.write_text(self.pass_baseline())
+        self.nextest.write_text('  QUARANTINE [   0.010s] ai-memory a::t\n'
+                                '     Summary [   0.030s] 1 test run: 1 passed, 0 skipped\n')
+        done = self.run_cli('--cargo-log', str(self.cargo), '--nextest-log', str(self.nextest))
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertIn('QUARANTINE', done.stderr)
+
     def test_totals_line_is_printed_when_they_agree(self):
         done = self.run_cli('--cargo-log', str(self.cargo), '--nextest-log', str(self.nextest))
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
@@ -444,6 +468,68 @@ class ParseNextest(unittest.TestCase):
             cts.parse_nextest_log('    Starting 0 tests across 0 binaries\n')
         with self.assertRaises(cts.ParseError):
             cts.parse_nextest_log('')
+
+
+class NextestStatusTable(unittest.TestCase):
+    """#7298 S1: every nextest 0.9.146 status word is mapped by its WHOLE name; an unknown word exits 2."""
+
+    @staticmethod
+    def one(status, name='t'):
+        return '%12s [   0.010s] ai-memory a::%s\n' % (status, name)
+
+    def outcome(self, status):
+        return cts.parse_nextest_log(self.one(status))[('lib', 'a::t')]
+
+    def test_the_full_status_table_maps_pass_and_fail_by_whole_word_7298(self):
+        passes = ['PASS', 'LEAK', 'TIMEOUT-PASS', 'SLOW + LEAK', 'SLOW+TMPASS', 'FLAKY 2/3']
+        fails = ['FAIL', 'FAIL + LEAK', 'LEAK-FAIL', 'TIMEOUT', 'XFAIL', 'ABORT', 'ABORT SIG 31', 'SIGSEGV',
+                 'SIGABRT', 'SIGKILL', 'FLKY-FL 2/2']
+        for status in passes:
+            self.assertEqual(self.outcome(status), cts.PASS, status)
+        for status in fails:
+            self.assertEqual(self.outcome(status), cts.FAIL, status)
+
+    def test_a_whole_word_status_is_never_read_out_of_a_longer_one_7298(self):
+        scan = cts.scan_nextest_log(self.one('FAIL + LEAK', 't') + self.one('TIMEOUT-PASS', 'u')
+                                    + self.one('XFAIL', 'v'))
+        self.assertEqual(scan.outcomes, {('lib', 'a::t'): cts.FAIL, ('lib', 'a::u'): cts.PASS,
+                                         ('lib', 'a::v'): cts.FAIL})
+        self.assertEqual(scan.spliced, 0)
+
+    def test_marker_and_skip_lines_are_not_results_7298(self):
+        text = (self.one('SLOW', 'a') + self.one('SKIP', 'b') + self.one('START', 'c') + self.one('TERMINATING', 'd')
+                + self.one('DELAY 2/3', 'e') + self.one('PASS', 'f'))
+        scan = cts.scan_nextest_log(text)
+        self.assertEqual(scan.outcomes, {('lib', 'a::f'): cts.PASS})
+        self.assertEqual(scan.spliced, 0)
+
+    def test_retry_attempt_words_are_read_from_the_short_table_7298(self):
+        for short in ['FAIL', 'FL+LK', 'LKFAIL', 'TMT', 'XFAIL', 'ABORT', 'SIG 31', 'SEGV', 'PASS', 'LEAK', 'TMPASS',
+                      'SLOW']:
+            text = '  TRY 1 %s [   0.010s] ai-memory a::flaky\n  FLAKY 2/2 [   0.011s] ai-memory a::flaky\n' % short
+            scan = cts.scan_nextest_log(text)
+            self.assertEqual(scan.outcomes, {('lib', 'a::flaky'): cts.PASS}, short)
+            self.assertEqual(scan.spliced, 0, short)
+
+    def test_a_failed_leaky_retry_attempt_does_not_make_a_flaky_pass_a_failure_7298(self):
+        text = ('  TRY 1 FAIL [   0.010s] ai-memory a::flaky\n'
+                ' TRY 2 LKFAIL [   0.010s] ai-memory a::flaky\n'
+                '  TRY 3 PASS [   0.011s] ai-memory a::flaky\n'
+                '  FLAKY 3/3 [   0.031s] ai-memory a::flaky\n')
+        scan = cts.scan_nextest_log(text)
+        self.assertEqual(scan.outcomes, {('lib', 'a::flaky'): cts.PASS})
+        self.assertEqual(scan.spliced, 0)
+
+    def test_an_unknown_status_word_exits_two_naming_the_line_7298(self):
+        for bogus in ['QUARANTINE', 'FAIL + OOM', 'PASS-ISH', 'EXECFAIL']:
+            with self.assertRaises(cts.ParseError) as ctx:
+                cts.scan_nextest_log(self.one('PASS', 'ok') + self.one(bogus, 'weird'))
+            self.assertIn(bogus, str(ctx.exception))
+            self.assertIn('a::weird', str(ctx.exception))
+        with self.assertRaises(cts.ParseError):
+            cts.scan_nextest_log('  TRY 2 FAIL + LEAK [   0.010s] ai-memory a::x\n')
+        with self.assertRaises(cts.ParseError):
+            cts.scan_nextest_log('  TRY 2 NEWWORD [   0.010s] ai-memory a::x\n')
 
 
 class ParseJunit(unittest.TestCase):

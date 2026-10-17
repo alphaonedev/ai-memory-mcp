@@ -85,13 +85,63 @@ _NESTED_START_RE = re.compile(r'(?:^|\s)running \d+ tests?$')
 _RESULT_RE = re.compile(r'^test result: ')
 _TOTAL_RE = re.compile(r'^test result: (?:ok|FAILED)\. (?P<passed>\d+) passed; (?P<failed>\d+) failed;')
 _SUMMARY_RE = re.compile(r'Summary \[[^\]]*\]\s+(?P<run>\d+) tests? run:')
+# nextest 0.9.146 (nextest-runner 0.124.0) status vocabulary, read from src/reporter/displayer/imp.rs:
+# `write_status_line_prefix` (:1694-1830: SLOW / SLOW + LEAK / SLOW+TMPASS finals :1707-1728, FLAKY n/m
+# :1778-1790, FLKY-FL n/m :1792-1804, `TRY n <short>` for a failed attempt after the first :1810-1826),
+# `write_skip_line` (:1556, SKIP), `status_str` (:2573-2623, the full names), `short_status_str`
+# (:2625-2672, the names after ``TRY n``), and the signal names of `signal_str` (helpers.rs:881-899).
+# Every status word is mapped explicitly, by exact name (no partial matching). A word the table does not
+# list is unusable input: the tool exits 2 naming the line (#7298 S1, fail closed).
+_SIGNALS = ('HUP', 'INT', 'QUIT', 'ILL', 'TRAP', 'ABRT', 'FPE', 'KILL', 'SEGV', 'PIPE', 'ALRM', 'TERM')
+_SKIP = 'skip'  # not a result: a marker line or a skipped test
+# ``N/M`` stands for ``\d+/\d+`` and a trailing ``SIG N`` for an unnamed signal number.
+_STATUS_FULL: Dict[str, str] = {
+    'PASS': PASS, 'LEAK': PASS, 'TIMEOUT-PASS': PASS, 'SLOW + LEAK': PASS, 'SLOW+TMPASS': PASS, 'FLAKY N/M': PASS,
+    'FAIL': FAIL, 'FAIL + LEAK': FAIL, 'LEAK-FAIL': FAIL, 'TIMEOUT': FAIL, 'XFAIL': FAIL, 'ABORT': FAIL,
+    'ABORT SIG N': FAIL, 'FLKY-FL N/M': FAIL,
+    'SLOW': _SKIP, 'SKIP': _SKIP, 'START': _SKIP, 'TERMINATING': _SKIP, 'DELAY N/M': _SKIP,
+}
+_STATUS_FULL.update({'SIG' + name: FAIL for name in _SIGNALS})
+# The words that follow ``TRY n`` (one attempt of a retried test).
+_STATUS_TRY: Dict[str, str] = {
+    'PASS': PASS, 'LEAK': PASS, 'TMPASS': PASS,
+    'FAIL': FAIL, 'FL+LK': FAIL, 'LKFAIL': FAIL, 'TMT': FAIL, 'XFAIL': FAIL, 'ABORT': FAIL, 'SIG N': FAIL,
+    'SLOW': _SKIP,
+}
+_STATUS_TRY.update({name: FAIL for name in _SIGNALS})
+
+
+def _word_pattern(word: str) -> str:
+    return re.escape(word).replace('N/M', r'\d+/\d+').replace(r'SIG\ N', r'SIG\ \d+')
+
+
+def _status_pattern(words: 'set[str]') -> str:
+    return '|'.join(_word_pattern(w) for w in sorted(words, key=len, reverse=True))
+
+
 _NEXTEST_RE = re.compile(
-    r'(?P<st>PASS|LEAK-FAIL|LEAK|FAIL|TIMEOUT|ABORT|SIG[A-Z0-9]+|EXEC-?FAIL|FLAKY(?: \d+/\d+)?)'
-    r'\s+\[[^\]]*\]\s+(?:\(\s*\d+/\s*\d+\)\s+)?(?P<bin>\S+)\s+(?P<name>.+?)\s*$')
-_NEXTEST_PASS = ('PASS', 'LEAK')
-# A retry prints each attempt as ``TRY n <status> [..] <bin> <name>`` before the final status line. Attempts are
-# not results (the final PASS/FAIL/FLAKY line decides), so a status preceded by ``TRY n`` is skipped (#7298 R1).
-_NEXTEST_TRY_RE = re.compile(r'\bTRY\s+\d+\s*$')
+    # The status is a whole token: no word character, ``+`` or ``-`` is joined in front of it, it is not the
+    # tail of ``FAIL + LEAK`` / ``SLOW + LEAK``, and the timing column follows it (``[ 0.010s]``, ``[> 60.000s]``,
+    # blank for SKIP), then the optional ``(12/34)`` / ``(---)`` counter, the binary id and the test name.
+    r'(?<![A-Za-z0-9_+\-])(?<!\+ )(?P<st>%s)\s+\[[^\]]*\]\s+(?:\([^)]*\)\s+)?(?P<bin>\S+)\s+(?P<name>.+?)\s*$'
+    % _status_pattern(set(_STATUS_FULL) | set(_STATUS_TRY)))
+# A line SHAPED like a status line at its start (uppercase word(s), a timing column, a binary id and a name)
+# whose word the table does not know fails closed: a new nextest status must be mapped above, never guessed.
+_NEXTEST_SHAPE_RE = re.compile(
+    r'^\s*(?P<st>[A-Z][A-Z0-9]*(?:(?: \+ |[ +\-/])[A-Z0-9]+)*)\s+\[[ >0-9.smh]*\]\s+\S+\s+\S')
+# A retry prints each attempt as ``TRY n <status> [..] <bin> <name>``: the text in front of the matched status
+# ends in ``TRY n`` for those, and the status is then read from the short table.
+_NEXTEST_TRY_RE = re.compile(r'TRY\s+\d+\s*$')
+_TRY_PREFIX_RE = re.compile(r'^TRY\s+\d+\s+')
+_NUMBERS_RE = re.compile(r'\d+/\d+')
+_SIGNUM_RE = re.compile(r'SIG \d+$')
+
+
+def _classify(status: str, attempt: bool) -> Optional[str]:
+    """pass | fail | skip for one status word, or None when the table does not list it."""
+    key = _SIGNUM_RE.sub('SIG N', _NUMBERS_RE.sub('N/M', status))
+    return (_STATUS_TRY if attempt else _STATUS_FULL).get(key)
+
 
 Key = Tuple[str, str]
 Outcomes = Dict[Key, str]
@@ -261,13 +311,25 @@ def scan_nextest_log(text: str) -> Scan:
             total += int(summary.group('run'))
             total_lines += 1
             continue
+        shape = _NEXTEST_SHAPE_RE.match(line)
+        if shape:
+            word = _TRY_PREFIX_RE.sub('', shape.group('st'))
+            if _classify(word, _TRY_PREFIX_RE.match(shape.group('st')) is not None) is None:
+                raise ParseError('nextest log: status %r is not in the nextest 0.9.146 status table; map it in '
+                                 'compare_test_sets.py (line: %r)' % (shape.group('st'), line[:120]))
         found = _NEXTEST_RE.search(line)
-        if not found or _NEXTEST_TRY_RE.search(line[:found.start()]):
+        if not found:
             continue
+        prefix = line[:found.start()]
+        attempt = _NEXTEST_TRY_RE.search(prefix)
+        kind = _classify(found.group('st'), attempt is not None)
+        if kind is None:
+            raise ParseError('nextest log: status %r is not valid in this position (nextest 0.9.146 status table); '
+                             'line: %r' % (found.group('st'), line[:120]))
+        if attempt or kind == _SKIP:
+            continue  # an attempt of a retried test, or a marker / skipped test: not a result
         spliced += _spliced(line, found)
-        status = found.group('st')
-        ok = status in _NEXTEST_PASS or status.startswith('FLAKY')
-        _merge(out, (_nextest_binary(found.group('bin')), found.group('name')), PASS if ok else FAIL)
+        _merge(out, (_nextest_binary(found.group('bin')), found.group('name')), kind)
     if not out:
         raise ParseError('nextest log: no PASS/FAIL result lines found')
     return Scan(out, spliced, len(out), total, total_lines)
