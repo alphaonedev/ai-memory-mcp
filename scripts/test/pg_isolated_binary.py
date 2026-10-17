@@ -338,12 +338,14 @@ def server_caps_sql(env: Dict[str, str]) -> str:
     lock_cap_ms = cap_ms - gap_ms
     if lock_cap_ms <= 0:
         each, addresses, passes = _connect_plan(env)
-        asked = env.get('PGCONNECT_TIMEOUT', '')
-        used = '%d s' % each if str(each) == asked else '%d s, floored from %s s' % (each, asked)
+        asked = int(env.get('PGCONNECT_TIMEOUT', ''))
+        # "floored" only when libpq really raised the value (asked < 2 s); at the floor lowering it changes nothing (#7580)
+        used = '%d s, floored from %d s' % (each, asked) if asked < LIBPQ_MIN_CONNECT_SECS else '%d s' % each
         mode = env.get('PGSSLMODE', 'prefer')
-        fix = ('lower connect_timeout, reduce the resolved addresses (hostaddr) or set sslmode=require'
+        lower = 'lower connect_timeout, ' if each > LIBPQ_MIN_CONNECT_SECS else ''
+        fix = (lower + 'reduce the resolved addresses (hostaddr) or set sslmode=require'
                if passes == 2 else
-               'lower connect_timeout or reduce the resolved addresses (set hostaddr)')
+               ('lower connect_timeout or ' if lower else '') + 'reduce the resolved addresses (set hostaddr)')
         raise WrapperError(
             'the connect budget (%d s = connect_timeout %s x %d address(es) x %d sslmode pass(es), '
             'sslmode=%s) leaves no room for a server-side statement cap under the %g s psql limit; %s'
@@ -361,18 +363,42 @@ def server_caps_sql(env: Dict[str, str]) -> str:
         "END $cap$" % {'cap': cap_ms, 'lock': lock_cap_ms, 'gap': gap_ms, 'twice': 2 * gap_ms})
 
 
-# Caller SQL that would undo the server cap or run outside it (#7521, #7550, #7551): a second statement (the cap
-# bounds each statement, not the whole -c string), SET/RESET of statement_timeout or lock_timeout in any
-# spelling (also inside ALTER ROLE/DATABASE ... SET), RESET ALL, DISCARD ALL, SET/RESET [SESSION] AUTHORIZATION,
-# SET/RESET ROLE, any set_config (its name argument can be built at run time) and DO (its dollar-quoted body is
-# code the guard cannot inspect). The SQL is tokenised first, so text inside a literal, a quoted identifier, a
-# dollar quote or a comment never counts, and a Unicode-escaped name is decoded before it is compared.
+# Caller SQL that would undo the server cap or run outside it (#7521, #7550, #7551, #7575-#7579). Round 12 of a
+# deny-list guard: the deny-list SHAPE was the defect, so the guard now refuses any MENTION. The SQL is tokenised
+# the way the PostgreSQL scanner (src/backend/parser/scan.l, parser.c base_yylex) reads it; then the statement is
+# refused when ANY identifier or string-literal token, anywhere in it, equals a name from _FORBIDDEN_NAMES (after
+# quoted, U&, UESCAPE and E-string decoding and ASCII lower-casing), or when it holds a second statement, DO,
+# DISCARD, RESET ALL, ALTER SYSTEM, SET [SESSION] AUTHORIZATION, or anything the guard cannot tokenise.
+#
+# scan.l rules mirrored here:
+#   space              [ \t\n\r\f\v]  ASCII only; every other byte (a no-break space, U+2003, ...) is part of a token
+#   newline            [\n\r]
+#   comment            "--"{non_newline}*  with non_newline [^\n\r]: a line comment ends at \n OR \r (#7575)
+#   ident_start        [A-Za-z\200-\377_]   ident_cont  [A-Za-z\200-\377_0-9\$]
+#   dolq_start/cont    [A-Za-z\200-\377_]   [A-Za-z\200-\377_0-9]
+#   xq/xus             a doubled quote is a quote; xe also reads backslash escapes; xb/xh (B'' X'') have neither
+#   N'..'              the NCHAR keyword, then an ordinary '..' literal (scan.l xnstart: yyless(1))
+#   quotecontinue      a literal followed by whitespace holding a newline (and `--` comments) and another quote is
+#                      ONE literal read in the SAME mode (E'a'<newline>'\'...' stays an E string)
+#   UESCAPE            parser.c base_yylex reads the token AFTER a U& token, so whitespace and comments may sit
+#                      between (#7576); the escape must be one simple string literal of one ASCII character
+_SPACE = ' \t\n\r\f\v'
 _IDENT_START_RE = re.compile(r'[A-Za-z_\x80-\U0010ffff]')
 _IDENT_BODY_RE = re.compile(r'[A-Za-z0-9_$\x80-\U0010ffff]*')
 _DOLLAR_TAG_RE = re.compile(r'\$(?:[A-Za-z_\x80-\U0010ffff][A-Za-z0-9_\x80-\U0010ffff]*)?\$')
 _HEX_RE = re.compile(r'[0-9A-Fa-f]+')
-_TIMEOUT_NAMES = frozenset(('statement_timeout', 'lock_timeout'))
-_STR, _IDENT, _SEMI, _OTHER = 'str', 'ident', ';', 'other'
+_CONTINUE_RE = re.compile(r"(?:[ \t\f]|--[^\n\r]*)*[\n\r](?:[ \t\n\r\f\v]+|--[^\n\r]*[\n\r])*'")
+_FORBIDDEN_NAMES = frozenset((
+    'statement_timeout', 'lock_timeout', 'idle_in_transaction_session_timeout', 'idle_session_timeout',
+    'transaction_timeout', 'session_authorization', 'role', 'set_config', 'pg_settings', 'pg_reload_conf'))
+_STR, _STR_ALT, _IDENT, _QIDENT, _SEMI, _OTHER = 'str', 'str-alt', 'ident', 'qident', ';', 'other'
+_USTR, _UIDENT = 'ustr', 'uident'          # pass-one only: a U& token whose UESCAPE is not resolved yet
+_E_SIMPLE = {'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t'}
+
+
+def _ascii_lower(text: str) -> str:
+    """Fold A-Z only, as the server does for a UTF-8 identifier (``str.lower`` also folds U+212A and friends)."""
+    return ''.join(chr(ord(c) + 32) if 'A' <= c <= 'Z' else c for c in text)
 
 
 def _unicode_unescape(body: str, escape: str) -> str:
@@ -400,16 +426,83 @@ def _unicode_unescape(body: str, escape: str) -> str:
     return ''.join(out)
 
 
-def _quoted_end(sql: str, i: int, quote: str, backslash: bool) -> int:
-    """Index just past the closing ``quote`` of the quoted run whose opening quote is at ``sql[i]``; a doubled
-    quote is an escaped one. Raises on an unterminated run (fail closed)."""
+def _decode_e(body: str) -> str:
+    """Decode the escapes of an ``E''`` literal body (``\\n``, ``\\101``, ``\\x41``, ``\\u0041``, ``\\U00000041``,
+    ``\\'``; any other escaped character is itself) and a doubled quote. A malformed escape is kept verbatim: the
+    server rejects it, and the raw text is still compared."""
+    out: List[str] = []
+    i, n = 0, len(body)
+    while i < n:
+        ch = body[i]
+        if ch == "'" and body[i + 1:i + 2] == "'":
+            out.append("'")
+            i += 2
+        elif ch != '\\' or i + 1 >= n:
+            out.append(ch)
+            i += 1
+        else:
+            nxt = body[i + 1]
+            if nxt in _E_SIMPLE:
+                out.append(_E_SIMPLE[nxt])
+                i += 2
+            elif nxt in '01234567':
+                j = i + 1
+                while j < n and j < i + 4 and body[j] in '01234567':
+                    j += 1
+                out.append(chr(int(body[i + 1:j], 8)))
+                i = j
+            elif nxt in 'xuU':
+                width = {'x': 2, 'u': 4, 'U': 8}[nxt]
+                j = i + 2
+                while j < n and j < i + 2 + width and body[j] in '0123456789abcdefABCDEF':
+                    j += 1
+                digits = body[i + 2:j]
+                try:
+                    out.append(chr(int(digits, 16)) if digits else nxt)
+                except (ValueError, OverflowError):
+                    out.append(body[i:j])
+                i = j
+            else:
+                out.append(nxt)
+                i += 2
+    return ''.join(out)
+
+
+def _literal(sql: str, i: int, doubling: bool, backslash: bool) -> Tuple[int, str]:
+    """``(end, raw_body)`` of the quoted run whose opening quote is ``sql[i]``, following quote-continuation
+    (a newline between two quotes joins them into one literal read the same way). ``doubling`` is whether ``''``
+    is an escaped quote, ``backslash`` whether a backslash escapes the next character. Raises on an unterminated
+    run (fail closed)."""
+    parts: List[str] = []
+    while True:
+        start = i + 1
+        i = start
+        while True:
+            if i >= len(sql):
+                raise WrapperError('refusing SQL the guard cannot tokenise: unterminated quote (%r)' % sql[:60])
+            ch = sql[i]
+            if backslash and ch == '\\':
+                i += 2
+            elif ch == "'":
+                if doubling and sql[i + 1:i + 2] == "'":
+                    i += 2
+                else:
+                    break
+            else:
+                i += 1
+        parts.append(sql[start:i])
+        joined = _CONTINUE_RE.match(sql, i + 1)
+        if joined is None:
+            return i + 1, ''.join(parts)
+        i = joined.end() - 1
+
+
+def _quoted_ident_end(sql: str, i: int) -> int:
+    """Index just past the closing double quote of the identifier whose opening quote is ``sql[i]``."""
     i += 1
     while i < len(sql):
-        ch = sql[i]
-        if backslash and ch == '\\':
-            i += 2
-        elif ch == quote:
-            if sql[i + 1:i + 2] == quote:
+        if sql[i] == '"':
+            if sql[i + 1:i + 2] == '"':
                 i += 2
             else:
                 return i + 1
@@ -418,20 +511,44 @@ def _quoted_end(sql: str, i: int, quote: str, backslash: bool) -> int:
     raise WrapperError('refusing SQL the guard cannot tokenise: unterminated quote (%r)' % sql[:60])
 
 
+def _plain_literal(sql: str, i: int, raw: List[Tuple[str, str]]) -> int:
+    """Read an ordinary ``'..'`` literal at ``sql[i]``; appends its token(s); returns the index after it.
+
+    Whether a backslash escapes depends on standard_conforming_strings (a session setting the wrapper does not
+    control), so the literal is read both ways: if the two readings end at different places the statement is
+    refused; if they end together but decode differently both values are kept for the name check (#7577)."""
+    end, body = _literal(sql, i, True, False)
+    plain = body.replace("''", "'")
+    if '\\' not in sql[i:end]:
+        raw.append((_STR, plain))
+        return end
+    end_bs, body_bs = _literal(sql, i, True, True)
+    if end_bs != end:
+        raise WrapperError('refusing SQL whose string literal ends differently under '
+                           'standard_conforming_strings=off (%r)' % sql[:60])
+    raw.append((_STR, plain))
+    decoded = _decode_e(body_bs)
+    if decoded != plain:
+        raw.append((_STR_ALT, decoded))
+    return end
+
+
 def _tokenise(sql: str) -> List[Tuple[str, str]]:
-    """``(kind, value)`` tokens of one SQL text: identifiers lower-cased and decoded, every literal and dollar
-    quote one opaque ``str`` token, comments dropped (``/* */`` nests). Raises ``WrapperError`` on anything it
-    cannot tokenise, including a plain literal whose end differs depending on standard_conforming_strings."""
-    tokens: List[Tuple[str, str]] = []
+    """``(kind, value)`` tokens of one SQL text: unquoted identifiers ASCII-lower-cased, quoted ones decoded, every
+    literal and dollar quote one ``str`` token, comments dropped (``/* */`` nests). Raises ``WrapperError`` on
+    anything it cannot tokenise, including a plain literal whose end differs depending on
+    standard_conforming_strings. B'' and X'' literals have no quote escape and no backslash escape in scan.l
+    (xb/xh read ``[^']*``), so they end at the first quote under both settings."""
+    raw: List[Tuple[str, str]] = []
     i, n = 0, len(sql)
     while i < n:
         ch = sql[i]
         nxt = sql[i + 1:i + 2]
-        if ch.isspace():
+        if ch in _SPACE:
             i += 1
         elif ch == '-' and nxt == '-':
-            newline = sql.find('\n', i)
-            i = n if newline < 0 else newline + 1
+            while i < n and sql[i] not in '\n\r':
+                i += 1
         elif ch == '/' and nxt == '*':
             depth, i = 1, i + 2
             while depth:
@@ -444,21 +561,16 @@ def _tokenise(sql: str) -> List[Tuple[str, str]]:
                 else:
                     i += 1
         elif ch == ';':
-            tokens.append((_SEMI, ';'))
+            raw.append((_SEMI, ';'))
             i += 1
         elif ch == '\\':
             raise WrapperError('refusing SQL with a backslash outside a literal (a psql meta-command?) (%r)'
                                % sql[:60])
         elif ch == "'":
-            end = _quoted_end(sql, i, "'", False)
-            if '\\' in sql[i:end] and _quoted_end(sql, i, "'", True) != end:
-                raise WrapperError('refusing SQL whose string literal ends differently under '
-                                   'standard_conforming_strings=off (%r)' % sql[:60])
-            tokens.append((_STR, sql[i + 1:end - 1]))
-            i = end
+            i = _plain_literal(sql, i, raw)
         elif ch == '"':
-            end = _quoted_end(sql, i, '"', False)
-            tokens.append((_IDENT, sql[i + 1:end - 1].replace('""', '"').lower()))
+            end = _quoted_ident_end(sql, i)
+            raw.append((_QIDENT, _ascii_lower(sql[i + 1:end - 1].replace('""', '"'))))
             i = end
         elif ch == '$' and _DOLLAR_TAG_RE.match(sql, i):
             tag = _DOLLAR_TAG_RE.match(sql, i).group(0)
@@ -466,42 +578,63 @@ def _tokenise(sql: str) -> List[Tuple[str, str]]:
             if close < 0:
                 raise WrapperError('refusing SQL the guard cannot tokenise: unterminated dollar quote (%r)'
                                    % sql[:60])
-            tokens.append((_STR, sql[i + len(tag):close]))
+            raw.append((_STR, sql[i + len(tag):close]))
             i = close + len(tag)
         elif _IDENT_START_RE.match(ch):
             end = i + 1 + len(_IDENT_BODY_RE.match(sql, i + 1).group(0))
-            word = sql[i:end]
-            lowered = word.lower()
-            if lowered == 'e' and sql[end:end + 1] == "'":
-                close = _quoted_end(sql, end, "'", True)
-                tokens.append((_STR, sql[end + 1:close - 1]))
+            lowered = _ascii_lower(sql[i:end])
+            quote_next = sql[end:end + 1] == "'"
+            if lowered == 'e' and quote_next:
+                close, body = _literal(sql, end, True, True)
+                raw.append((_STR, _decode_e(body)))
                 i = close
-            elif lowered in ('b', 'x', 'n') and sql[end:end + 1] == "'":
-                close = _quoted_end(sql, end, "'", False)
-                tokens.append((_STR, sql[end + 1:close - 1]))
+            elif lowered in ('b', 'x') and quote_next:
+                close, body = _literal(sql, end, False, False)
+                raw.append((_STR, body))
                 i = close
-            elif lowered == 'u' and sql[end:end + 2] in ("&'", '&"'):
-                quote = sql[end + 1]
-                close = _quoted_end(sql, end + 1, quote, False)
-                body = sql[end + 2:close - 1]
-                escape, i = '\\', close
-                uescape = re.compile(r'\s*uescape\s*\'(.?)\'', re.IGNORECASE).match(sql, close)
-                if uescape is not None:
-                    escape, i = uescape.group(1), uescape.end()
-                    if not escape or escape in '+\'"' or escape.isspace() or _HEX_RE.fullmatch(escape):
-                        raise WrapperError('refusing SQL with an invalid UESCAPE character (%r)' % sql[:60])
-                if quote == '"':
-                    body = body.replace('""', '"')
-                    tokens.append((_IDENT, _unicode_unescape(body, escape).lower()))
-                else:
-                    _unicode_unescape(body.replace("''", "'"), escape)
-                    tokens.append((_STR, body))
+            elif lowered == 'n' and quote_next:
+                i = end                          # NCHAR keyword; the quote is read as an ordinary literal
+            elif lowered == 'u' and sql[end:end + 2] == "&'":
+                close, body = _literal(sql, end + 1, True, False)
+                raw.append((_USTR, body.replace("''", "'")))
+                i = close
+            elif lowered == 'u' and sql[end:end + 2] == '&"':
+                close = _quoted_ident_end(sql, end + 1)
+                raw.append((_UIDENT, sql[end + 2:close - 1].replace('""', '"')))
+                i = close
             else:
-                tokens.append((_IDENT, lowered))
+                raw.append((_IDENT, lowered))
                 i = end
         else:
-            tokens.append((_OTHER, ch))
+            raw.append((_OTHER, ch))
             i += 1
+    return _resolve_uescape(raw)
+
+
+def _resolve_uescape(raw: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """Decode every ``U&`` token with its ``UESCAPE '<c>'`` (comments are already gone, so any whitespace or
+    comment run between the token and UESCAPE is handled) or the default backslash (#7576)."""
+    tokens: List[Tuple[str, str]] = []
+    k = 0
+    while k < len(raw):
+        kind, value = raw[k]
+        if kind not in (_USTR, _UIDENT):
+            tokens.append((kind, value))
+            k += 1
+            continue
+        escape, used = '\\', 1
+        if k + 1 < len(raw) and raw[k + 1] == (_IDENT, 'uescape'):
+            ok = k + 2 < len(raw) and raw[k + 2][0] == _STR and len(raw[k + 2][1]) == 1
+            ok = ok and not (k + 3 < len(raw) and raw[k + 3][0] == _STR_ALT)
+            if not ok:
+                raise WrapperError('refusing SQL with a UESCAPE the guard cannot read: it must be followed by one '
+                                   'simple one-character string literal (%r)' % value[:40])
+            escape, used = raw[k + 2][1], 3
+            if ord(escape) > 127 or escape in '+\'"' or escape in _SPACE or _HEX_RE.fullmatch(escape):
+                raise WrapperError('refusing SQL with an invalid UESCAPE character (%r)' % value[:40])
+        decoded = _unicode_unescape(value, escape)
+        tokens.append((_QIDENT, _ascii_lower(decoded)) if kind == _UIDENT else (_STR, decoded))
+        k += used
     return tokens
 
 
@@ -512,29 +645,27 @@ def _refuse_uncapped_sql(sql: str) -> None:
     if any(kind == _SEMI for kind, _ in tokens):
         raise WrapperError('refusing SQL with more than one statement: the server cap bounds one statement '
                            'per psql call (%r)' % sql[:80])
-    words = [(kind == _IDENT, value) for kind, value in tokens]
-    for index, (is_word, value) in enumerate(words):
-        if not is_word:
-            continue
-        ahead = [v for w, v in words[index + 1:index + 4] if w]
-        while ahead[:1] in (['session'], ['local']) and ahead[1:2] not in ([], ['authorization']):
+    for kind, value in tokens:
+        if kind in (_IDENT, _QIDENT, _STR, _STR_ALT) and _ascii_lower(value) in _FORBIDDEN_NAMES:
+            raise WrapperError('refusing SQL that mentions %s: the server cap must stay in force; a caller that '
+                               'needs it gets its own fixed helper (%r)' % (_ascii_lower(value), sql[:80]))
+    words = [value for kind, value in tokens if kind in (_IDENT, _QIDENT)]
+    for position, value in enumerate(words):
+        ahead = words[position + 1:position + 6]
+        while ahead[:1] in (['session'], ['local']):
             ahead = ahead[1:]
         bad = (
-            value in ('set_config', 'do')
-            or (value in ('reset', 'discard') and ahead[:1] == ['all'])
-            or (value in ('set', 'reset') and (
-                ahead[:1] in (['role'], ['authorization']) or ahead[:2] == ['session', 'authorization']
-                or any(w and v in _TIMEOUT_NAMES for w, v in words[index + 1:]))))
+            value in ('do', 'discard')
+            or (value == 'reset' and ahead[:1] == ['all'])
+            or (value == 'alter' and ahead[:1] == ['system'])
+            or (value in ('set', 'reset') and ahead[:1] == ['authorization']))
         if bad:
-            raise WrapperError('refusing SQL that sets or resets statement_timeout or lock_timeout, the role or '
-                               'the session, or runs code the guard cannot read: the server cap must stay in '
-                               'force (%r)' % sql[:80])
+            raise WrapperError('refusing SQL that resets the session, alters the system, switches authorization or '
+                               'runs code the guard cannot read: the server cap must stay in force (%r)' % sql[:80])
 
 
-def psql(url: str, sql: str, tuples: bool = False) -> str:
-    """Run one statement through psql; returns stdout, raises on failure. Refuses SQL that holds more than one
-    statement or would undo the server-side caps (#7521)."""
-    _refuse_uncapped_sql(sql)
+def _run_psql(url: str, sql: str, tuples: bool) -> str:
+    """Run ``sql`` under the server-side caps; the caller has already vetted it."""
     argv = ['psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1']
     if tuples:
         argv.append('-At')
@@ -549,6 +680,29 @@ def psql(url: str, sql: str, tuples: bool = False) -> str:
         raise WrapperError('psql failed (%d): %s' % (done.returncode, (done.stderr or '').strip() or 'no stderr'),
                            done.returncode)
     return done.stdout or ''
+
+
+def psql(url: str, sql: str, tuples: bool = False) -> str:
+    """Run one statement through psql; returns stdout, raises on failure. Refuses SQL that holds more than one
+    statement or mentions anything that could undo the server-side caps (#7521)."""
+    _refuse_uncapped_sql(sql)
+    return _run_psql(url, sql, tuples)
+
+
+# The one read the guard would refuse (it names pg_settings and the timeout settings): a fixed statement with no
+# caller-supplied text, run under the same server-side caps. It reads, never writes.
+_EFFECTIVE_TIMEOUTS_SQL = (
+    "SELECT (SELECT setting FROM pg_catalog.pg_settings WHERE name = 'statement_timeout') "
+    "|| '/' || (SELECT setting FROM pg_catalog.pg_settings WHERE name = 'lock_timeout')")
+
+
+def effective_timeouts(url: str) -> Tuple[str, str]:
+    """``(statement_timeout, lock_timeout)`` in ms as the server resolved them for a session on ``url``. The only
+    argument is the URL; the SQL is a module constant, so this helper cannot be used to run caller SQL."""
+    parts = _run_psql(url, _EFFECTIVE_TIMEOUTS_SQL, True).strip().split('/')
+    if len(parts) != 2:
+        raise WrapperError('could not read the effective timeouts (got %r)' % parts)
+    return parts[0], parts[1]
 
 
 def connection_budget(url: str) -> Tuple[int, int, int, int]:
