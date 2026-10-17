@@ -121,10 +121,8 @@ async fn list_as(router: &axum::Router, authn: bool, agent: Option<&str>) -> Vec
     let resp = router
         .clone()
         .oneshot(
-            b.body(Body::from(
-                serde_json::json!({}).to_string(),
-            ))
-            .expect("request"),
+            b.body(Body::from(serde_json::json!({}).to_string()))
+                .expect("request"),
         )
         .await
         .expect("response");

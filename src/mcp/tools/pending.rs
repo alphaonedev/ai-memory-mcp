@@ -161,12 +161,7 @@ pub fn handle_subscription_dlq_list(
     mcp_client: Option<&str>,
 ) -> Result<Value, String> {
     let caller = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
-    handle_subscription_dlq_list_for(
-        conn,
-        params,
-        &caller,
-        &crate::identity::admin_agent_ids(),
-    )
+    handle_subscription_dlq_list_for(conn, params, &caller, &crate::identity::admin_agent_ids())
 }
 
 /// [`handle_subscription_dlq_list`] for an already-resolved `caller` and an
@@ -918,7 +913,11 @@ mod tests {
         assert_eq!(bob["count"].as_u64(), Some(0), "a non-owner sees nothing");
         let alice =
             handle_subscription_dlq_list_for(&conn, &json!({}), "ai:alice", &admins).expect("ok");
-        assert_eq!(alice["count"].as_u64(), Some(1), "the owner sees only its own");
+        assert_eq!(
+            alice["count"].as_u64(),
+            Some(1),
+            "the owner sees only its own"
+        );
     }
 
     // handle_pending_list — happy + count.

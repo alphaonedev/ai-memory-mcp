@@ -693,9 +693,18 @@ mod tests {
             .find(|l| l.contains("ERROR"))
             .unwrap_or_default()
             .to_string();
-        assert!(line.contains("mem-7504"), "memory_id on the ERROR line: {line}");
-        assert!(line.contains("memory_store"), "event kind on the ERROR line: {line}");
-        assert!(line.contains("team/ns-7504"), "namespace on the ERROR line: {line}");
+        assert!(
+            line.contains("mem-7504"),
+            "memory_id on the ERROR line: {line}"
+        );
+        assert!(
+            line.contains("memory_store"),
+            "event kind on the ERROR line: {line}"
+        );
+        assert!(
+            line.contains("team/ns-7504"),
+            "namespace on the ERROR line: {line}"
+        );
         assert!(
             !out.contains("PAYLOAD-SECRET-7504"),
             "the payload must never be logged"

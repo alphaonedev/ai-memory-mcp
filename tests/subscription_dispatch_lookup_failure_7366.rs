@@ -339,7 +339,11 @@ fn h2_one_writer_cannot_fill_the_total_cap_and_starve_a_victim_7503() {
     let mut calls = 0;
     while writer_rows(&conn, "ai:flooder") < cap && calls < 2_000 {
         let before = writer_rows(&conn, "ai:flooder");
-        record_for(&path, &format!("team/flood-{}", calls % 10), Some("ai:flooder"));
+        record_for(
+            &path,
+            &format!("team/flood-{}", calls % 10),
+            Some("ai:flooder"),
+        );
         calls += 1;
         if writer_rows(&conn, "ai:flooder") == before {
             break; // refused: the writer is at its cap

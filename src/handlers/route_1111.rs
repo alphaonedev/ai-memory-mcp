@@ -1859,8 +1859,7 @@ pub async fn handle_subscription_dlq_list_http(
         } else {
             Vec::new()
         };
-    let result =
-        crate::mcp::handle_subscription_dlq_list_for(&lock.0, &body, &caller, &admin_ids);
+    let result = crate::mcp::handle_subscription_dlq_list_for(&lock.0, &body, &caller, &admin_ids);
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
