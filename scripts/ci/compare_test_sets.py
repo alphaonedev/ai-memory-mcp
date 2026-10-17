@@ -92,7 +92,8 @@ _SUMMARY_RE = re.compile(r'Summary \[[^\]]*\]\s+(?P<run>\d+) tests? run:')
 # `write_status_line_prefix` (:1694-1830: SLOW / SLOW + LEAK / SLOW+TMPASS finals :1707-1728, FLAKY n/m
 # :1778-1790, FLKY-FL n/m :1792-1804, `TRY n <short>` for a failed attempt after the first :1810-1826),
 # `write_skip_line` (:1556, SKIP), `status_str` (:2573-2623, the full names), `short_status_str`
-# (:2625-2672, the names after ``TRY n``), and the signal names of `signal_str` (helpers.rs:881-899).
+# (:2625-2672, the names after ``TRY n``), `TRY n TRMNTG` (:866-875) and `TRY n START` (:978-990); the
+# ``SETUP <status>`` script lines (:743, :1578-1593) are not tests and are skipped as whole lines, and the signal names of `signal_str` (helpers.rs:881-899).
 # Every status word is mapped explicitly, by exact name (no partial matching). A word the table does not
 # list is unusable input: the tool exits 2 naming the line (#7298 S1, fail closed).
 _SIGNALS = ('HUP', 'INT', 'QUIT', 'ILL', 'TRAP', 'ABRT', 'FPE', 'KILL', 'SEGV', 'PIPE', 'ALRM', 'TERM')
@@ -110,6 +111,10 @@ _STATUS_TRY: Dict[str, str] = {
     'PASS': PASS, 'LEAK': PASS, 'TMPASS': PASS,
     'FAIL': FAIL, 'FL+LK': FAIL, 'LKFAIL': FAIL, 'TMT': FAIL, 'XFAIL': FAIL, 'ABORT': FAIL, 'SIG N': FAIL,
     'SLOW': _SKIP,
+    # `TRY n TRMNTG`: a slow test being terminated while retries remain (displayer/imp.rs:866-875, TestSlow);
+    # `TRY n START`: a retry attempt starting, printed with --no-capture or verbose (imp.rs:978-990,
+    # TestRetryStarted). Neither carries a result.
+    'TRMNTG': _SKIP, 'START': _SKIP,
 }
 _STATUS_TRY.update({name: FAIL for name in _SIGNALS})
 
@@ -321,6 +326,8 @@ def scan_nextest_log(text: str) -> Scan:
             total_lines += 1
             continue
         shape = _NEXTEST_SHAPE_RE.match(line)
+        if shape and shape.group('st').startswith('SETUP '):
+            continue  # a setup-script line (SETUP SLOW / PASS / LEAK / LKFAIL / <status>): a script, not a test
         if shape:
             word = _TRY_PREFIX_RE.sub('', shape.group('st'))
             if _classify(word, _TRY_PREFIX_RE.match(shape.group('st')) is not None) is None:

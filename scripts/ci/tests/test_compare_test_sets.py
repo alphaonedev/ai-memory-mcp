@@ -375,7 +375,6 @@ class TotalsCli(unittest.TestCase):
                  'test a::flaky_one ... ok\n\n'
                  'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n')
         nextest = ('  TRY 1 FAIL [   0.010s] ai-memory a::flaky_one\n'
-                   '     RETRY 2/2\n'
                    '  TRY 2 PASS [   0.011s] ai-memory a::flaky_one\n'
                    '  FLAKY 2/2 [   0.021s] ai-memory a::flaky_one\n'
                    '     Summary [   0.030s] 1 test run: 1 passed (1 flaky), 0 skipped\n')
@@ -476,7 +475,6 @@ class ParseNextest(unittest.TestCase):
 
     def test_a_retried_flaky_test_is_a_pass_counted_once_7298(self):
         text = ('  TRY 1 FAIL [   0.010s] (───) ai-memory::a flaky_one\n'
-                '     RETRY 2/2\n'
                 '  TRY 2 PASS [   0.011s] (1/1) ai-memory::a flaky_one\n'
                 '  FLAKY 2/2 [   0.021s] (1/1) ai-memory::a flaky_one\n')
         scan = cts.scan_nextest_log(text)
@@ -487,7 +485,6 @@ class ParseNextest(unittest.TestCase):
         # nextest 0.9.146 prints the FINAL line of a retried failure as `TRY n FAIL` (displayer/imp.rs:1811-1827)
         # and never a plain `FAIL` line for it; the last attempt's status is the result.
         text = ('  TRY 1 FAIL [   0.010s] (───) ai-memory::a always\n'
-                '     RETRY 2/3\n'
                 '  TRY 2 FAIL [   0.010s] (───) ai-memory::a always\n'
                 '  TRY 3 FAIL [   0.010s] (1/1) ai-memory::a always\n'
                 '     Summary [   0.030s] 1 test run: 0 passed, 1 failed, 0 skipped\n'
@@ -532,7 +529,6 @@ class ParseNextest(unittest.TestCase):
 
     def test_flaky_test_fail_then_pass_on_retry_is_a_pass_with_no_spliced_lines_7298(self):
         text = ('  TRY 1 FAIL [   0.010s] ai-memory::a flaky_one\n'
-                '     RETRY 2/2\n'
                 '  TRY 2 PASS [   0.011s] ai-memory::a flaky_one\n'
                 '  FLAKY 2/2 [   0.021s] ai-memory::a flaky_one\n')
         scan = cts.scan_nextest_log(text)
@@ -607,6 +603,43 @@ class NextestStatusTable(unittest.TestCase):
             cts.scan_nextest_log('  TRY 2 FAIL + LEAK [   0.010s] ai-memory a::x\n')
         with self.assertRaises(cts.ParseError):
             cts.scan_nextest_log('  TRY 2 NEWWORD [   0.010s] ai-memory a::x\n')
+
+
+class NextestRetryAndSetupWords(unittest.TestCase):
+    """#7298 R6: every other word nextest 0.9.146 prints (retry TRMNTG/START, SETUP script lines, the flaky-fail marker)."""
+
+    HANG = ('  TRY 1 FAIL [   1.000s] (───) nx5 a::hangs\n'
+            ' TRY 1 TRMNTG [>  2.000s] (───) nx5 a::hangs\n'
+            '  TRY 2 FAIL [   1.000s] (───) nx5 a::hangs\n')
+
+    def test_try_terminating_line_is_a_marker_not_an_unknown_status_7298(self):
+        # displayer/imp.rs:866-875 (TestSlow while terminating, retries configured)
+        scan = cts.scan_nextest_log(self.HANG)
+        self.assertEqual(scan.outcomes, {('lib', 'a::hangs'): cts.FAIL})
+        self.assertEqual((scan.parsed, scan.spliced), (1, 0))
+
+    def test_try_start_line_is_a_marker_not_an_unknown_status_7298(self):
+        # displayer/imp.rs:978-990 (TestRetryStarted with --no-capture or verbose)
+        text = (' TRY 2 START [         ] (───) nx5 a::aborts\n'
+                '  TRY 2 FAIL [   0.010s] (───) nx5 a::aborts\n'
+                ' TRY 3 START [         ] (───) nx5 a::flaky_one\n'
+                '  TRY 3 PASS [   0.010s] (1/7) nx5 a::flaky_one\n')
+        scan = cts.scan_nextest_log(text)
+        self.assertEqual(scan.outcomes, {('lib', 'a::aborts'): cts.FAIL, ('lib', 'a::flaky_one'): cts.PASS})
+
+    def test_setup_script_lines_are_not_tests_7298(self):
+        # displayer/imp.rs:743 (SETUP SLOW) and :1578-1593 (SETUP PASS / LEAK / LKFAIL / <short status>)
+        text = ('  SETUP SLOW [> 60.000s] my-script: my-program --arg1\n'
+                '  SETUP PASS [   0.100s] my-script: my-program --arg1\n'
+                ' SETUP LEAK [   0.100s] my-script: my-program\n'
+                ' SETUP LKFAIL [   0.100s] my-script: my-program\n'
+                ' SETUP FAIL [   0.100s] my-script: my-program\n'
+                ' SETUP SIG 31 [   0.100s] my-script: my-program\n'
+                '        PASS [   0.010s] ai-memory a::real\n')
+        scan = cts.scan_nextest_log(text)
+        self.assertEqual(scan.outcomes, {('lib', 'a::real'): cts.PASS})
+        self.assertEqual(scan.spliced, 0)
+
 
 
 class ParseJunit(unittest.TestCase):
