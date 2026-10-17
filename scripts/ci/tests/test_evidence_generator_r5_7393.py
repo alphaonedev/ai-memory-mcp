@@ -285,77 +285,43 @@ class OSErrorEndsTheGatesLeg7530(GatesRun):
         (wt / ".local-runs").write_text("not a directory\n")
         code, out, log = self.drive(wt, tip)
         self.assertEqual(code, 1)
-        self.assertIn("RED expiry gate", out)
+        self.assertIn("RED scratch", out)
         self.assertRegex(log, r"EXIT=1 leg=gates aggregate_failures=[1-9]")
         self.assertNotIn("Traceback", out)
 
-    def test_an_unwritable_scratch_directory_is_a_failure_with_an_exit_row_7530(self):
-        if os.geteuid() == 0:
-            self.skipTest("root ignores directory modes")
+    def test_an_oserror_from_the_gate_lookup_is_a_failure_with_an_exit_row_7530(self):
         rc, r, wt, tip = self.make()
-        scratch = wt / ".local-runs"
-        scratch.mkdir(exist_ok=True)
-        scratch.chmod(0o500)
-        self.addCleanup(scratch.chmod, 0o700)
-        code, out, log = self.drive(wt, tip)
+        with mock.patch.object(rc.Run, "expiry_gate", side_effect=PermissionError(13, "Permission denied")):
+            code, out, log = self.drive(wt, tip)
         self.assertEqual(code, 1)
         self.assertIn("RED expiry gate", out)
         self.assertRegex(log, r"EXIT=1 leg=gates aggregate_failures=[1-9]")
 
 
-class ExpiryCopyLayout7531(GatesRun):
+class ExpiryGateLayout7531(GatesRun):
     def test_the_gate_sees_the_checkout_as_its_repo_root_7531(self):
         rc, r, wt, tip = self.make()
-        copy = Path(r.pick_expiry()[-1])
-        self.assertEqual(copy.resolve().parent.parent, wt.resolve(), "the gate derives REPO_ROOT as parent.parent")
-        r.drop_expiry()
+        argv, _data, _sha = r.expiry_gate()
+        path = Path(argv[-1])
+        self.assertEqual(path.resolve().parent.parent, wt.resolve(), "the gate derives REPO_ROOT as parent.parent")
 
-    def test_no_nested_scratch_directory_is_left_7531(self):
+    def test_no_scratch_directory_is_created_by_the_lookup_7531(self):
         rc, r, wt, tip = self.make()
-        r.pick_expiry()
-        r.drop_expiry()
-        self.assertEqual(sorted(p.name for p in (wt / ".local-runs").iterdir()), [])
-        self.assertFalse((wt / ".local-runs" / ".local-runs").exists())
+        r.expiry_gate()
+        self.assertFalse((wt / ".local-runs").exists())
 
-    def test_the_docstrings_state_the_layout_7531(self):
-        doc = load("run_cert").Run.pick_expiry.__doc__
+    def test_the_docstring_states_the_layout_7531(self):
+        doc = load("run_cert").Run.expiry_gate.__doc__
         self.assertIn("REPO_ROOT", doc)
-        self.assertNotIn("0700 directory", doc)
+        self.assertIn("Nothing is written", doc)
 
 
-class ExpiryCopyCreation7532(GatesRun):
-    def test_the_copy_is_opened_exclusive_nofollow_and_private_7532(self):
-        rc, r, wt, tip = self.make()
-        flags = []
-        real = os.open
-
-        def spy(path, fl, mode=0o600, *a, **k):
-            flags.append((str(path), fl, mode))
-            return real(path, fl, mode, *a, **k)
-        with mock.patch("os.open", side_effect=spy):
-            r.pick_expiry()
-        r.drop_expiry()
-        mine = [f for f in flags if os.path.basename(f[0]).startswith(".expiry-") and f[1] & os.O_CREAT]
-        self.assertTrue(mine, flags)
-        _p, fl, mode = mine[-1]
-        for flag in ("O_EXCL", "O_NOFOLLOW", "O_CREAT", "O_WRONLY"):
-            self.assertTrue(fl & getattr(os, flag), flag)
-        self.assertEqual(mode, 0o600)
-        dirs = [f for f in flags if f[1] & getattr(os, "O_DIRECTORY", 0)]
-        self.assertTrue(dirs and all(f[1] & os.O_NOFOLLOW for f in dirs), "the scratch dir is opened O_DIRECTORY|O_NOFOLLOW")
-
-    def test_a_scratch_directory_swapped_for_a_symlink_is_refused_7532(self):
-        rc, r, wt, tip = self.make()
-        (self.dir / "elsewhere").mkdir()
-        os.symlink(self.dir / "elsewhere", wt / ".local-runs")
-        with self.assertRaises(ValueError):
-            r.pick_expiry()
-        self.assertEqual(list((self.dir / "elsewhere").iterdir()), [])
-
+class LegacySweep7532(GatesRun):
     def test_stale_copies_of_a_killed_run_are_swept_on_the_next_run_7532(self):
         rc, r, wt, tip = self.make()
         scratch = wt / ".local-runs"
         scratch.mkdir(exist_ok=True)
+        scratch.chmod(0o755)
         gone = subprocess.Popen([sys.executable, "-c", "pass"])
         gone.wait()
         stale_file = scratch / f".expiry-{gone.pid}-aaaa.py"
@@ -363,16 +329,19 @@ class ExpiryCopyCreation7532(GatesRun):
         stale_file.write_text("x\n")
         stale_dir.mkdir()
         (stale_dir / "check_cert_expiry.py").write_text("x\n")
-        live = scratch / f".expiry-{os.getppid()}-bbbb.py"  # a live process: its copy is not touched
+        live = scratch / f".expiry-{os.getppid()}-bbbb.py"  # a live process: its entry is not touched
         live.write_text("x\n")
         keep = scratch / "keep.txt"
         keep.write_text("keep\n")
-        r.pick_expiry()
+        fd = r.open_scratch()
+        try:
+            r.sweep_legacy(fd)
+        finally:
+            os.close(fd)
         self.assertFalse(stale_file.exists())
         self.assertFalse(stale_dir.exists())
         self.assertTrue(live.exists())
         self.assertTrue(keep.exists())
-        r.drop_expiry()
 
 
 class RunWasBuilt(Exception):

@@ -252,17 +252,16 @@ class TipTreeScripts7411(ScratchCase):
         r = rc.Run(argparse.Namespace(tip=tip, wt=str(wt), outd=str(self.dir / "o"), leg="gates",
                                       targets=str(self.dir / "t"), tmpdir=str(self.dir / "tmp")))
         with self.assertRaises(FileNotFoundError):  # #7439: the tracked .sh is not a fallback either
-            r.pick_expiry()
+            r.expiry_gate()
 
     def test_expiry_gate_prefers_the_tracked_py_7411(self):
         rc = load("run_cert")
         wt, tip = make_repo(self.dir / "repo", {EXPIRY_PY: "x = 1\n", EXPIRY_SH: "exit 0\n"})
         r = rc.Run(argparse.Namespace(tip=tip, wt=str(wt), outd=str(self.dir / "o"), leg="gates",
                                       targets=str(self.dir / "t"), tmpdir=str(self.dir / "tmp")))
-        argv = r.pick_expiry()
-        self.assertEqual(argv[0], sys.executable)
-        self.assertEqual(Path(argv[-1]).read_text(), "x = 1\n")  # #7439: a copy of the blob
-        r.drop_expiry()
+        argv, data, _sha = r.expiry_gate()
+        self.assertEqual(argv[:2], [sys.executable, "-I"])
+        self.assertEqual(data, b"x = 1\n")  # #7439: the HEAD blob, handed over in memory (#7618)
 
 
 class ShellRetarget7412(ScratchCase):

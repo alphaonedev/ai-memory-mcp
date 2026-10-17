@@ -171,7 +171,7 @@ class LogWithoutConfig7488(ScratchCase):
         self.bb.check_run(self.legs(self.legacy + GREEN_CHAIN))
 
 
-class ExpiryCopyIsPrivate7489(ScratchCase):
+class ExpiryGateWritesNothing7489(ScratchCase):
     def make(self, files=None):
         rc = load("run_cert")
         wt, tip = make_repo(self.dir / "repo", files if files is not None else {"scripts/check_cert_expiry.py": "BLOB = 1\n"})
@@ -179,17 +179,14 @@ class ExpiryCopyIsPrivate7489(ScratchCase):
                                       targets=str(self.dir / "t"), tmpdir=str(self.dir / "tmp")))
         return rc, r, wt
 
-    def test_copy_is_in_a_private_directory_not_a_fixed_in_tree_path_7489(self):
+    def test_no_copy_is_written_anywhere_in_the_checkout_7489(self):
         rc, r, wt = self.make()
-        argv = r.pick_expiry()
-        copy = Path(argv[-1])
-        self.assertNotEqual(copy, wt / "scripts" / ".cert-expiry-gate.py")
-        self.assertEqual(copy.read_text(), "BLOB = 1\n")
-        self.assertEqual(copy.parent, wt / ".local-runs")  # so the gate's REPO_ROOT (parent.parent) is the checkout (#7531)
-        self.assertEqual(copy.stat().st_mode & 0o777, 0o600)
-        r.drop_expiry()
-        self.assertFalse(copy.exists())
-        self.assertTrue((wt / ".local-runs").exists())
+        before = sorted(str(p.relative_to(wt)) for p in wt.rglob("*") if ".git" not in p.parts)
+        argv, data, _sha = r.expiry_gate()
+        self.assertEqual(argv[-1], str(wt / "scripts" / "check_cert_expiry.py"))  # so the gate's REPO_ROOT is the checkout
+        self.assertEqual(data, b"BLOB = 1\n")
+        self.assertEqual(sorted(str(p.relative_to(wt)) for p in wt.rglob("*") if ".git" not in p.parts), before)
+        self.assertFalse((wt / ".local-runs").exists(), "the scratch directory is never created")
 
     def test_a_tracked_symlink_at_the_old_fixed_path_is_never_written_through_7489(self):
         rc, r, wt = self.make()
@@ -197,8 +194,7 @@ class ExpiryCopyIsPrivate7489(ScratchCase):
         os.symlink("../victim.txt", wt / "scripts" / ".cert-expiry-gate.py")
         subprocess.run([*GIT, "add", "-A"], cwd=wt, check=True)
         subprocess.run([*GIT, "commit", "-q", "-m", "link"], cwd=wt, check=True)
-        r.pick_expiry()
-        r.drop_expiry()
+        r.expiry_gate()
         self.assertEqual((wt / "victim.txt").read_text(), "keep\n")
         status = subprocess.run(["git", "status", "--porcelain"], cwd=wt, capture_output=True, text=True).stdout
         self.assertEqual(status.strip(), "")
@@ -208,20 +204,15 @@ class ExpiryCopyIsPrivate7489(ScratchCase):
         (self.dir / "elsewhere").mkdir()
         os.symlink(self.dir / "elsewhere", wt / ".local-runs")
         with self.assertRaises(ValueError):
-            r.pick_expiry()
+            r.open_scratch()
         self.assertEqual(list((self.dir / "elsewhere").iterdir()), [])
 
-    def test_the_copy_is_removed_when_the_gates_body_raises_7489(self):
+    def test_nothing_is_left_behind_when_the_gates_body_raises_7489(self):
         rc, r, wt = self.make()
-        seen = []
-
-        def boom(*a, **k):
-            seen.append(Path(r.pick_expiry()[-1]))
-            raise RuntimeError("boom")
-        with mock.patch.object(r, "_gates", side_effect=boom):
+        with mock.patch.object(r, "_gates", side_effect=RuntimeError("boom")):
             with self.assertRaises(RuntimeError):
                 r.gates("0" * 40, "", "")
-        self.assertTrue(seen and not seen[0].exists())
+        self.assertFalse((wt / ".local-runs").exists())
 
 
 class RowsMatchTheCode7490(ScratchCase):

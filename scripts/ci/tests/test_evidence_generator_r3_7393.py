@@ -191,30 +191,28 @@ class ExpiryFromTheBlob7439(ScratchCase):
         (wt / "scripts").mkdir()
         (wt / EXPIRY_SH).write_text("exit 0\n")
         with self.assertRaises(FileNotFoundError):
-            r.pick_expiry()
+            r.expiry_gate()
 
     def test_tracked_sh_alone_is_never_a_fallback_7439(self):
         rc, r, wt = self.make({EXPIRY_SH: "exit 0\n"})
         with self.assertRaises(FileNotFoundError):
-            r.pick_expiry()
+            r.expiry_gate()
 
     def test_tracked_symlink_is_refused_7439(self):
         rc, r, wt = self.make(symlink=EXPIRY_PY)
         with self.assertRaises(ValueError):
-            r.pick_expiry()
+            r.expiry_gate()
 
     def test_skip_worktree_copy_never_runs_the_blob_is_what_runs_7439(self):
         rc, r, wt = self.make({EXPIRY_PY: "BLOB = 1\n"})
         subprocess.run(["git", "update-index", "--skip-worktree", EXPIRY_PY], cwd=wt, check=True)
         (wt / EXPIRY_PY).write_text("BLOB = 'MODIFIED DISK COPY'\n")
         self.assertEqual(r.dirty_tracked(), [])  # the hiding the review reproduced
-        argv = r.pick_expiry()
-        self.assertEqual(argv[0], sys.executable)
-        self.assertEqual(Path(argv[-1]).read_text(), "BLOB = 1\n")
+        argv, data, sha = r.expiry_gate()
+        self.assertEqual(argv[:2], [sys.executable, "-I"])
+        self.assertEqual(data, b"BLOB = 1\n")  # the HEAD blob, not the modified disk copy
         blob = subprocess.run(["git", "rev-parse", f"HEAD:{EXPIRY_PY}"], cwd=wt, capture_output=True, text=True).stdout.strip()
-        self.assertIn(f"{EXPIRY_PY} blob={blob}", (self.dir / "o" / "gates.log").read_text())
-        r.drop_expiry()
-        self.assertFalse(Path(argv[-1]).exists())
+        self.assertEqual(sha, blob)
 
     def test_recapture_symlink_is_refused_and_the_blob_sha_is_returned_7439(self):
         rc = load("run_cert")

@@ -21,12 +21,10 @@ CONFIG and PLAN rows, a `RED preflight` row and an `EXIT=64` row are written, an
 that could not start (a RED launch row). Paths default to the checkout (.local-runs/); see the --cargo-slot/--slot-lock/--targets/--tmpdir options.
 """
 import argparse
-import contextlib
 import datetime
 import os
 import re
 import shlex
-import secrets
 import shutil
 import stat
 import subprocess
@@ -65,6 +63,21 @@ RESULT_RE = re.compile(r"^test result: (\w+)\. (\d+) passed; (\d+) failed", re.M
 
 RECAPTURE_CANDIDATES = ("scripts/recapture-cert-3607-posture.py", "scripts/recapture-cert-3607-posture.sh")
 EXPIRY_PY = "scripts/check_cert_expiry.py"
+# #7617 / #7618: a script of the git tree is never written to disk and run. It is read from its blob and handed to
+# `python -I -c PY_LOADER <checkout path of the script>` on stdin. The loader gives the script the identity it has
+# when run by path: __name__ == "__main__", __file__ the checkout path (so a REPO_ROOT derived from __file__ is the
+# checkout), sys.argv[0] the same path, the script's own arguments after it.
+PY_LOADER = (
+    "import sys\n"
+    "path, src = sys.argv[1], sys.stdin.buffer.read()\n"
+    "sys.argv = sys.argv[1:]\n"
+    "main = sys.modules['__main__']\n"
+    "main.__file__ = path\n"
+    "exec(compile(src, path, 'exec'), main.__dict__)\n"
+)
+MAX_INLINE_SCRIPT = 100_000  # a shell body travels as one argv entry (the kernel limits one to 128 KiB)
+SWEEP_MAX_DEPTH = 100_000  # the deepest legacy scratch tree the sweep descends into
+SCRATCH_BAD_MODE = 0o022  # group- or world-writable
 EXPIRY_SH = "scripts/check-cert-expiry.sh"
 # The legs one invocation promises (the PLAN row); build_bundle.check_run holds each invocation to its plan (#7437).
 PLANS = {"battery": ("battery",), "pg": ("pg",), "removal": ("removal",), "bootstrap": ("bootstrap",),
@@ -205,8 +218,6 @@ class Run:
         self.cargo_slot = str(slot) if slot else ""
         self.cargo = [self.cargo_slot, "cargo"] if slot else ["cargo"]
         self.slot_lock = str(lock) if lock else ""
-        self.expiry_copy = self.expiry_dfd = self.expiry_name = self.expiry_data = None
-        self.expiry_ident = self.expiry_dir_ident = None
         self.outd.mkdir(parents=True, exist_ok=True)
         self.targets.mkdir(parents=True, exist_ok=True)
         self.tmpdir.mkdir(parents=True, exist_ok=True)
@@ -281,7 +292,8 @@ class Run:
                 return False
         return True
 
-    def run(self, argv, out, extra_env=None, cwd=None, gate=True):
+    def run(self, argv, out, extra_env=None, cwd=None, gate=True, stdin_data=None):
+        """Run argv with stdout and stderr in `out`. stdin_data (bytes) is the child's stdin; without it stdin is empty."""
         if gate and not self.floor_ok(" ".join(map(str, argv))[:120]):
             Path(out).write_text("NOT RUN: disk floor tripped\n")
             return 75
@@ -289,8 +301,9 @@ class Run:
         env.update(extra_env or {})
         try:
             with open(out, "wb") as f:
+                feed = {"input": stdin_data} if stdin_data is not None else {"stdin": subprocess.DEVNULL}
                 return subprocess.run(argv, cwd=cwd or self.wt, env=env, stdout=f, stderr=subprocess.STDOUT,
-                                      stdin=subprocess.DEVNULL).returncode
+                                      **feed).returncode
         except OSError as e:  # a missing wrapper, flock or timeout (#7420): a RED row and 127, never a traceback
             print(f"run_cert: cannot start {argv[0]!r}: {e.strerror or e}. Check that --cargo-slot / CERT_CARGO_SLOT "
                   "names an executable wrapper and that flock, nice and timeout are installed.", file=sys.stderr)
@@ -372,20 +385,21 @@ class Run:
             body, n_out = re.subn(r"^OUT = ROOT / .*$", lambda _m: f"OUT = Path({str(ev)!r})", src, flags=re.M)
             body, n_fix = re.subn(r"^FIX = ROOT / .*$", lambda _m: f"FIX = Path({str(fix)!r})", body, flags=re.M)
             ok = (n_out, n_fix) == (1, 1)
-            tmp, argv = self.wt / "scripts/.recapture-cert7.py", [sys.executable]
+            # #7617: isolated, from stdin; __file__ is the checkout path, so ROOT is the checkout. No copy is written.
+            argv, stdin = [sys.executable, "-I", "-c", PY_LOADER, str(self.wt / rel)], body.encode("utf-8")
         else:
             body, n_out, n_fix = retarget_shell(src, ev, fix)
             ok = (n_out, n_fix) == (1, 1) and 'FIX="$FIX"' in body
-            tmp, argv = self.wt / "scripts/.recapture-cert7.sh", ["bash"]
+            # `bash -c BODY <checkout path>`: $0 is the checkout path, so ROOT is the checkout. No copy is written.
+            argv, stdin = ["bash", "-c", body, str(self.wt / rel)], None
+            if len(body.encode("utf-8")) > MAX_INLINE_SCRIPT:
+                self.fail(f"  RED posture recapture script: {rel} is larger than {MAX_INLINE_SCRIPT} bytes")
+                return
         if not ok:
             self.fail(f"  posture copy retarget failed OUT={n_out} FIX={n_fix}")
             return
-        tmp.write_text(body)
-        try:
-            rc = self.run([*argv, str(tmp)], self.outd / "posture.log",
-                          {"DEFAULT_BIN": str(dbin), "SQLCIPHER_BIN": str(sbin), "FIX": str(fix)})
-        finally:
-            tmp.unlink()
+        rc = self.run(argv, self.outd / "posture.log",
+                      {"DEFAULT_BIN": str(dbin), "SQLCIPHER_BIN": str(sbin), "FIX": str(fix)}, stdin_data=stdin)
         self.note(f"POSTURE_EXIT {rc}")
         if rc != 0:
             self.fail("  RED posture recapture")
@@ -477,10 +491,7 @@ class Run:
 
     # ---- cert-commit gates --------------------------------------------------------------------------------
     def gates(self, prior_bind, push_branch, parent="", also_evidence=()):
-        try:
-            return self._gates(prior_bind, push_branch, parent, also_evidence)
-        finally:
-            self.drop_expiry()
+        return self._gates(prior_bind, push_branch, parent, also_evidence)
 
     def _gates(self, prior_bind, push_branch, parent, also_evidence):
         head = self.git("rev-parse", "HEAD")
@@ -499,12 +510,24 @@ class Run:
         if stray or CERT_DOC not in touched:
             self.fail("  RED scope: the cert commit may touch only the cert doc and its own evidence dir")
         gl = self.outd / "g"
-        # The expiry gate is the Python port (#6137), taken from the gated commit's blob, never the disk (#7439).
         try:
-            expiry = self.pick_expiry()
+            sfd = self.open_scratch()
+        except ValueError as e:
+            self.fail(f"  RED scratch {e}")
+            return self.bad
+        if sfd is not None:
+            try:
+                self.sweep_legacy(sfd)
+            finally:
+                os.close(sfd)
+        # The expiry gate is the Python port (#6137), taken from the gated commit's blob, never the disk (#7439), and
+        # run from memory: no copy of it is ever written (#7618).
+        try:
+            expiry, gate_blob, gate_sha = self.expiry_gate()
         except (OSError, ValueError, subprocess.CalledProcessError) as e:
             self.fail(f"  RED expiry gate: {e}")
             return self.bad
+        self.note(f"{EXPIRY_PY} blob={gate_sha} (HEAD tree; run from memory, nothing is written)")
         checks = [
             ("cert-expiry-upstream", expiry, {}),
             (f"cert-expiry-{prior_bind[:9]}", expiry, {"CERT_EXPIRY_BASE": prior_bind}),
@@ -521,14 +544,8 @@ class Run:
             ("ftc", ["bash", "scripts/check-foreign-text-to-caller.sh"], {}),
         ]
         for name, argv, extra in checks:
-            if name.startswith("cert-expiry"):
-                try:
-                    self.check_expiry_copy()  # #7581: the path must still name the copy that was made
-                except ValueError as e:
-                    self.fail(f"  RED expiry gate copy: {e}")
-                    continue
             out = Path(f"{gl}.{name}.log")
-            rc = self.run(argv, out, extra)
+            rc = self.run(argv, out, extra, stdin_data=gate_blob if name.startswith("cert-expiry") else None)
             lines = [l for l in out.read_text(errors="replace").splitlines() if l.strip()]
             self.note(f"{rc} {name} :: {lines[-1][:160] if lines else 'EMPTY'}")
             if rc != 0:
@@ -542,124 +559,113 @@ class Run:
             self.push_gated(head, push_branch)
         return self.bad
 
-    def pick_expiry(self):
-        """argv of the cert-expiry gate, run as `python -I <copy>` from a copy of HEAD's blob of scripts/check_cert_expiry.py
-        (#7439, #7581). No shell fallback; a missing or non-regular (symlink) entry raises. The gate sets REPO_ROOT to
-        its own path's parent.parent, so the copy is a file named .expiry-<pid>-<random>.py directly inside
-        <wt>/.local-runs: its parent.parent is then the checkout, and the gate's own scratch is the one
-        <wt>/.local-runs (no nested .local-runs/.local-runs, #7531). That layout is why the copy is not put in a
-        private subdirectory; isolated mode (-I) keeps the copy's own directory off sys.path, so a module planted
-        beside it never replaces the gate (#7581).
-        What is enforced: .local-runs is opened once, O_DIRECTORY|O_NOFOLLOW; the copy is created relative to that
-        directory fd with O_EXCL|O_NOFOLLOW, mode 0600; the sweep of stale copies (their pid is gone) and the removal
-        of the copy go through the same directory fd and never follow a symlink (#7532, #7582). The gate is started
-        from the path, so before each run check_expiry_copy() confirms that the path still names the same directory
-        and the same file (device and inode) and that the bytes are the blob's; a mismatch is refused. The window
-        between that check and the exec is not closed, only narrowed. drop_expiry() removes the copy."""
+    def expiry_gate(self):
+        """(argv, blob bytes, blob sha) of the cert-expiry gate: HEAD's blob of scripts/check_cert_expiry.py, run as
+        `python -I -c PY_LOADER <checkout path>` with the blob on stdin (#7439, #7581, #7618). Nothing is written, so
+        there is no copy to replace between a check and the exec. The loader sets __file__ to the checkout path, so the
+        gate's REPO_ROOT (the parent of its scripts directory) is the checkout and its own scratch is the checkout's
+        .local-runs. Isolated mode keeps the working directory and the environment's PYTHON* variables off sys.path.
+        No shell fallback; a missing or non-regular (symlink) entry raises."""
         sha, data = blob_bytes(self.wt, "HEAD", EXPIRY_PY)
+        return [sys.executable, "-I", "-c", PY_LOADER, str(self.wt / EXPIRY_PY)], data, sha
+
+    def open_scratch(self):
+        """The checkout's .local-runs opened as a directory fd (O_DIRECTORY|O_NOFOLLOW), or None when it does not exist
+        (it is never created here). ValueError unless it is a plain directory owned by this user that is not group or
+        world writable: the gate's self-test works inside it, so another user must not be able to write there (#7618)."""
         scratch = self.wt / ".local-runs"
         try:
-            scratch.mkdir(exist_ok=True)
-        except FileExistsError:
-            pass  # a symlink, a dangling link or a regular file: the open below decides
-        try:
-            dfd = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+            fd = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+        except FileNotFoundError:
+            return None
         except OSError as e:
-            if scratch.is_symlink():
-                raise ValueError(f"{scratch} is a symlink; the expiry gate copy is not written through it") from e
-            raise
-        name = f".expiry-{os.getpid()}-{secrets.token_hex(6)}.py"
-        try:
-            self.sweep_expiry(dfd)
-            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=dfd)
-        except BaseException:
-            os.close(dfd)
-            raise
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-                f.flush()
-                ident = os.fstat(f.fileno())
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(name, dir_fd=dfd)
-            os.close(dfd)
-            raise
-        self.expiry_dfd, self.expiry_name, self.expiry_data = dfd, name, data
-        self.expiry_ident, self.expiry_dir_ident = (ident.st_dev, ident.st_ino), os.fstat(dfd)
-        self.expiry_copy = scratch / name
-        try:
-            self.check_expiry_copy()
-        except ValueError:
-            self.drop_expiry()
-            raise
-        self.note(f"{EXPIRY_PY} blob={sha} (HEAD tree; run from a copy of the blob)")
-        return [sys.executable, "-I", str(self.expiry_copy)]
-
-    def check_expiry_copy(self):
-        """Raise ValueError unless the copy's path still names the directory fd opened by pick_expiry and the very file
-        it created (same device and inode, a regular file, the blob's bytes). Called before every run of the gate."""
-        if self.expiry_copy is None:
-            raise ValueError("no expiry gate copy was made")
-        try:
-            dst = os.lstat(self.expiry_copy.parent)
-            dev, ino = self.expiry_dir_ident.st_dev, self.expiry_dir_ident.st_ino
-            if not stat.S_ISDIR(dst.st_mode) or (dst.st_dev, dst.st_ino) != (dev, ino):
-                raise ValueError(f"{self.expiry_copy.parent} no longer names the directory the copy was made in")
-            fd = os.open(self.expiry_copy, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        except OSError as e:
-            raise ValueError(f"the expiry gate copy {self.expiry_copy} cannot be re-opened: {e}") from e
-        with os.fdopen(fd, "rb") as f:
-            st = os.fstat(f.fileno())
-            if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != self.expiry_ident:
-                raise ValueError(f"the expiry gate copy {self.expiry_copy} is not the file that was created")
-            if f.read() != self.expiry_data:
-                raise ValueError(f"the expiry gate copy {self.expiry_copy} was modified after it was created")
+            raise ValueError(f"{scratch} is not a plain directory ({e.strerror or e}); remove it or replace it by a "
+                             "directory you own") from e
+        st = os.fstat(fd)
+        if st.st_uid != os.geteuid() or st.st_mode & SCRATCH_BAD_MODE:
+            os.close(fd)
+            raise ValueError(f"{scratch} is owned by uid {st.st_uid} (this run is uid {os.geteuid()}) with mode "
+                             f"{stat.S_IMODE(st.st_mode):04o}; it must be owned by this user and not group or world "
+                             "writable (chmod go-w)")
+        return fd
 
     @staticmethod
-    def remove_at(dfd, name):
-        """Remove the entry `name` of the directory fd `dfd` without following a symlink: a directory is emptied through
-        its own fd (O_DIRECTORY|O_NOFOLLOW), a symlink or file is unlinked itself (#7582)."""
-        if stat.S_ISDIR(os.stat(name, dir_fd=dfd, follow_symlinks=False).st_mode):
-            sub = os.open(name, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dfd)
-            try:
-                for entry in [e.name for e in os.scandir(sub)]:
-                    Run.remove_at(sub, entry)
-            finally:
-                os.close(sub)
-            os.rmdir(name, dir_fd=dfd)
-        else:
+    def remove_tree(dfd, name):
+        """Remove the entry `name` of the directory fd `dfd` without recursion and without following a symlink: files and
+        symlinks are unlinked themselves, directories are descended into by O_DIRECTORY|O_NOFOLLOW open relative to the
+        current fd, and left again through ".." with the parent's device and inode checked. One directory fd is held at a
+        time, so depth costs no stack and no descriptors. ValueError when the tree is deeper than SWEEP_MAX_DEPTH or an
+        entry was swapped under the walk (#7582, #7620)."""
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        top = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        if not stat.S_ISDIR(top.st_mode):
             os.unlink(name, dir_fd=dfd)
+            return
+        chain = [(name, (top.st_dev, top.st_ino))]
+        cur = os.open(name, flags, dir_fd=dfd)
+        try:
+            if (os.fstat(cur).st_dev, os.fstat(cur).st_ino) != chain[0][1]:
+                raise ValueError(f"{name} was replaced while it was opened")
+            while True:
+                child = None
+                for entry in list(os.scandir(cur)):
+                    if entry.is_dir(follow_symlinks=False):
+                        child = entry.name
+                        break
+                    os.unlink(entry.name, dir_fd=cur)
+                if child is not None:
+                    if len(chain) >= SWEEP_MAX_DEPTH:
+                        raise ValueError(f"{name} is nested deeper than {SWEEP_MAX_DEPTH} levels; left in place")
+                    seen = os.stat(child, dir_fd=cur, follow_symlinks=False)
+                    nxt = os.open(child, flags, dir_fd=cur)
+                    now = os.fstat(nxt)
+                    if (now.st_dev, now.st_ino) != (seen.st_dev, seen.st_ino):
+                        os.close(nxt)
+                        raise ValueError(f"{child} was replaced while it was opened")
+                    chain.append((child, (now.st_dev, now.st_ino)))
+                    os.close(cur)
+                    cur = nxt
+                    continue
+                if len(chain) == 1:
+                    break
+                gone, _ident = chain.pop()
+                up = os.open("..", flags, dir_fd=cur)
+                os.close(cur)
+                cur = up
+                here = os.fstat(cur)
+                if (here.st_dev, here.st_ino) != chain[-1][1]:
+                    raise ValueError(f"the parent of {gone} is not the directory the walk came from")
+                os.rmdir(gone, dir_fd=cur)
+        finally:
+            os.close(cur)
+        os.rmdir(name, dir_fd=dfd)
 
-    @staticmethod
-    def sweep_expiry(dfd):
-        """Remove .expiry-* entries a killed run left in the scratch directory `dfd`: those whose pid is gone, and any
-        entry of the older directory layout. A live run's copy (its pid is alive) is not touched. Every call is
-        relative to the directory fd, so a path swapped for a symlink cannot redirect it (#7532, #7582)."""
-        for name in [e.name for e in os.scandir(dfd)]:
-            if not name.startswith(".expiry-"):
-                continue
+    def sweep_legacy(self, dfd):
+        """Remove the .expiry-* entries that earlier runs left in the scratch directory `dfd`: the ones whose pid is gone,
+        and any of the older layout. The gate no longer writes such entries (#7618); this only cleans up. An entry whose
+        pid is alive is left alone. Each failure is a NOTE row, never an exception: a leftover must not end the run
+        (#7620)."""
+        try:
+            names = sorted(e.name for e in os.scandir(dfd) if e.name.startswith(".expiry-"))
+        except OSError as e:
+            self.note(f"NOTE sweep cannot list the scratch directory: {e}")
+            return
+        for name in names:
             m = re.match(r"\.expiry-(\d+)-", name)
             if m:
-                pid = int(m.group(1))
+                alive = True
                 try:
-                    os.kill(pid, 0)
-                    continue  # alive (or ours)
+                    os.kill(int(m.group(1)), 0)
                 except ProcessLookupError:
-                    pass
+                    alive = False
                 except PermissionError:
-                    continue  # alive, another user
-            with contextlib.suppress(OSError):  # best effort: a leftover never blocks the run
-                Run.remove_at(dfd, name)
-
-    def drop_expiry(self):
-        """Remove the copy through the directory fd (never the path) and close the fd."""
-        if self.expiry_dfd is not None:
-            with contextlib.suppress(OSError):
-                os.unlink(self.expiry_name, dir_fd=self.expiry_dfd)
-            with contextlib.suppress(OSError):
-                os.close(self.expiry_dfd)
-        self.expiry_copy = self.expiry_dfd = self.expiry_name = self.expiry_data = None
+                    alive = True  # the process exists under another user
+                if alive:
+                    continue
+            try:
+                self.remove_tree(dfd, name)
+            except Exception as e:  # noqa: BLE001 - any failure of a cleanup is reported, never raised
+                self.note(f"NOTE sweep {name}: {type(e).__name__}: {e}")
 
     def push_gated(self, head, branch):
         """Push the gated commit; a failed push, or a remote ref that is not the gated head, is a failure (#7422)."""
@@ -719,10 +725,14 @@ def main():
         r.fail(f"  RED preflight: {e}")
         r.note(f"EXIT=64 leg={a.leg} aggregate_failures={r.bad} {r.now()}")
         return 64
-    if a.leg == "gates":
-        rc = r.gates(a.prior_bind, a.push_branch, a.parent, tuple(a.also_evidence))
-    else:
-        rc = getattr(r, a.leg)()
+    try:
+        if a.leg == "gates":
+            rc = r.gates(a.prior_bind, a.push_branch, a.parent, tuple(a.also_evidence))
+        else:
+            rc = getattr(r, a.leg)()
+    except Exception as e:  # noqa: BLE001 - a leg never ends the run without its EXIT row (#7620)
+        r.fail(f"  RED internal {type(e).__name__}: {e}")
+        rc = r.bad or 1
     r.note(f"EXIT={1 if rc else 0} leg={a.leg} aggregate_failures={rc} {r.now()}")
     return 1 if rc else 0
 

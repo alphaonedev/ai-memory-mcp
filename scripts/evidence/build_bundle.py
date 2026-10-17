@@ -23,8 +23,10 @@ import hashlib
 import os
 import re
 import socket
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -390,6 +392,62 @@ def hits(text, pats):
     return [(p, l) for l in text.splitlines() for p in pats if (rxs[p].search(l) if p in rxs else p in l)]
 
 
+STAGING_PREFIX = "bundle-stage-"
+SCRATCH_DIR = ".local-runs"
+SCRIPT_SUFFIXES = (".sh", ".py")
+
+
+def stage_write(stage, files, manifest):
+    """Write every bundle file plus MANIFEST.sha256 into the staging directory (#7621)."""
+    for name, data in files.items():
+        (stage / name).write_bytes(data)
+        (stage / name).chmod(0o755 if name.endswith(SCRIPT_SUFFIXES) else 0o644)
+    (stage / "MANIFEST.sha256").write_text(manifest)
+    (stage / "MANIFEST.sha256").chmod(0o644)
+
+
+def stage_verify(stage, files):
+    """Re-verify the staged bundle against its MANIFEST and the expected file set; returns the listing."""
+    for line in (stage / "MANIFEST.sha256").read_text().splitlines():
+        digest, name = line.split("  ", 1)
+        if hashlib.sha256((stage / name).read_bytes()).hexdigest() != digest:
+            raise Fatal(f"manifest re-verify failed for {name}")
+    on_disk = sorted(p.name for p in stage.iterdir())
+    if on_disk != sorted([*files, "MANIFEST.sha256"]):
+        raise Fatal(f"unexpected files in bundle: {on_disk}")
+    return on_disk
+
+
+def discard_stage(stage, scratch):
+    """Remove a staging directory, only ever one directly under the checkout's scratch directory."""
+    if stage.parent != scratch or not stage.name.startswith(STAGING_PREFIX) or stage.is_symlink():
+        raise Fatal(f"refusing to remove {stage}: not a staging directory under {scratch}")
+    shutil.rmtree(stage)
+
+
+def publish_bundle(wt, dest, files, manifest):
+    """Build the bundle in a staging directory under <wt>/.local-runs and publish it with one rename (#7621).
+
+    The cert directory appears only after every write and the re-verify pass; on any failure the staging directory
+    is removed and the tree is untouched. An existing destination is never replaced.
+    """
+    scratch = wt / SCRATCH_DIR
+    scratch.mkdir(exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=scratch))
+    try:
+        stage.chmod(0o755)
+        stage_write(stage, files, manifest)
+        on_disk = stage_verify(stage, files)
+        if dest.exists():
+            raise Fatal(f"{dest} already exists; refusing to overwrite")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(stage, dest)
+    except BaseException:
+        discard_stage(stage, scratch)
+        raise
+    return on_disk
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tip", required=True, help="full 40-hex CERT TIP FINAL sha")
@@ -467,20 +525,7 @@ def main():
             raise Fatal("leak scan found host paths/names:\n  " + "\n  ".join(leaks))
 
         manifest = manifest_text(files)  # before any write: a collision must leave no partial bundle dir
-        dest.mkdir(parents=True)
-        for name, data in files.items():
-            (dest / name).write_bytes(data)
-            (dest / name).chmod(0o755 if name.endswith((".sh", ".py")) else 0o644)
-        (dest / "MANIFEST.sha256").write_text(manifest)
-        (dest / "MANIFEST.sha256").chmod(0o644)
-
-        for line in (dest / "MANIFEST.sha256").read_text().splitlines():
-            digest, name = line.split("  ", 1)
-            if hashlib.sha256((dest / name).read_bytes()).hexdigest() != digest:
-                raise Fatal(f"manifest re-verify failed for {name}")
-        on_disk = sorted(p.name for p in dest.iterdir())
-        if on_disk != sorted([*files, "MANIFEST.sha256"]):
-            raise Fatal(f"unexpected files in bundle: {on_disk}")
+        on_disk = publish_bundle(wt, dest, files, manifest)
         print(f"BUNDLE OK {dest} files={len(on_disk)} (manifest re-verified)")
         print(test_results(outd, short, a.date), end="")
         for d in diffs:

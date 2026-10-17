@@ -55,7 +55,7 @@ RECAPTURE_PY = (
     'OUT = ROOT / "docs" / "posture"\n'
     'FIX = ROOT / "fix"\n'
     "OUT.mkdir(parents=True, exist_ok=True)\n"
-    '(OUT / "posture-a.out").write_text("[PASS] ran as " + __name__ + " from " + Path(__file__).name + " root=" + ROOT.name\n'
+    '(OUT / "posture-a.out").write_text("[PASS] ran as " + __name__ + " root=" + ROOT.name + " argv0=" + Path(sys.argv[0]).parent.name\n'
     '                                    + " bin=" + os.environ["DEFAULT_BIN"] + " json=" + str(Path(json.__file__).name) + "\\n")\n'
     '(OUT / "posture-legs-exit-codes.txt").write_text("a 0\\n")\n'
     "print('JSON-FROM', json.__file__)\n")
@@ -415,7 +415,7 @@ class PostureInMemory7617(ScratchCase):
         self.assertIn("root=repo", (self.dir / "o" / "evidence" / "posture-a.out").read_text()
                       if (self.dir / "o" / "evidence" / "posture-a.out").exists() else "root=repo")
         self.assertEqual(r.bad, 0)
-        self.assertNotEqual(tree(wt), before)  # the retargeted OUT is under outd; nothing else is expected to change
+        self.assertEqual(tree(wt), before)  # the run writes under outd only; the checkout gains no file
         self.assertEqual([p for p in tree(wt) if p.startswith("scripts/.")], [])
 
     def parity(self, rel, body, runner):
