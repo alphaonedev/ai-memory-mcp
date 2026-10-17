@@ -70,6 +70,7 @@ ISOLATED_PREFIX = 'ai_memory_t'
 TEMPLATE_SUFFIX = '_tpl'
 ALREADY_EXISTS = 'already exists'  # psql detail of a CREATE DATABASE onto an occupied name
 IDENT_MAX = 63
+PSQL_CONNECTION_LOST = 2  # psql exit status: 1 = SQL error, 2 = connection lost
 RUN_ID_MAX_LEN = 20
 MAX_JOBS = 8
 PER_BINARY_CONNECTIONS = 18
@@ -111,7 +112,13 @@ _PRINT_LOCK = threading.Lock()
 
 
 class WrapperError(Exception):
-    """A condition under which the wrapper refuses to continue (fail closed)."""
+    """A condition under which the wrapper refuses to continue (fail closed).
+
+    ``returncode`` is the psql exit status when the error came from psql, else None."""
+
+    def __init__(self, message: str, returncode: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.returncode = returncode
 
 
 def _out(line: str) -> None:
@@ -279,7 +286,8 @@ def psql(url: str, sql: str, tuples: bool = False) -> str:
     argv += ['-c', sql]
     done = subprocess.run(argv, capture_output=True, text=True, env=_pg_env(url))
     if done.returncode != 0:
-        raise WrapperError('psql failed (%d): %s' % (done.returncode, (done.stderr or '').strip()))
+        raise WrapperError('psql failed (%d): %s' % (done.returncode, (done.stderr or '').strip()),
+                           done.returncode)
     return done.stdout or ''
 
 
@@ -395,6 +403,13 @@ def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
                                'leftover of your own earlier run, run `pg_isolated_binary.py teardown --db %s '
                                '--run-id <run id>` first, otherwise choose a different --db'
                                % (tpl, exc, db_name))
+        if exc.returncode == PSQL_CONNECTION_LOST:
+            # The server may have committed the CREATE before the link dropped. Whether
+            # the template is ours is unknown, so setup neither claims it nor DROPs it (#7388).
+            raise WrapperError('CREATE DATABASE %s lost the server connection; the outcome is unknown and the '
+                               'template may exist with no owner record: %s; check pg_database and, if it is '
+                               'from this run, run `pg_isolated_binary.py teardown --db %s --run-id <run id>`'
+                               % (tpl, exc, db_name), exc.returncode)
         raise WrapperError('CREATE DATABASE %s was refused; nothing was created or changed: %s' % (tpl, exc))
     try:
         psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')
