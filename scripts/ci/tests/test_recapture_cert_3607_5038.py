@@ -13,15 +13,22 @@ header whose date disagrees with the run date is refused.
 Run: python3 -m unittest scripts/ci/tests/test_recapture_cert_3607_5038.py
 """
 import ast
+import contextlib
 import datetime
+import hashlib
 import importlib.util
+import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
+import unicodedata
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -146,8 +153,7 @@ class RecaptureBase(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def run_recapture(self, sqlcipher_bin=None, args=None, extra_env=None, default_bin=None,
-                      cwd=None):
+    def base_env(self, sqlcipher_bin=None, extra_env=None, default_bin=None):
         env = {
             'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
             'HOME': str(self.home),
@@ -156,6 +162,19 @@ class RecaptureBase(unittest.TestCase):
             'SQLCIPHER_BIN': str(sqlcipher_bin or self.sqlcipher_bin),
         }
         env.update(extra_env or {})
+        return env
+
+    def popen_recapture(self, sqlcipher_bin=None, extra_env=None, default_bin=None, cwd=None):
+        """Start the script in its own session so a test can SIGKILL it mid-run."""
+        env = self.base_env(sqlcipher_bin, extra_env, default_bin)
+        script = self.root / 'scripts' / SCRIPT_NAME
+        return subprocess.Popen([sys.executable, str(script)], env=env,
+                                cwd=str(cwd or self.root), stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, start_new_session=True)
+
+    def run_recapture(self, sqlcipher_bin=None, args=None, extra_env=None, default_bin=None,
+                      cwd=None):
+        env = self.base_env(sqlcipher_bin, extra_env, default_bin)
         script = self.root / 'scripts' / SCRIPT_NAME
         cmd = ['bash', str(script)] if script.suffix == '.sh' else [sys.executable, str(script)]
         cmd += list(args or [])
@@ -907,7 +926,9 @@ class HomeValidation7510(RecaptureBase):
                       '/home//a', '/home/a/.', '/home/a/../b', '//', '/home/./a',
                       '//home/a', '///home/a', '//home//a', '/home/a//', '/home/a\n',
                       '/home/a\t', '/home/a\x01', '/home/a\x1f', '/home/a\x7f',
-                      '\n/home/a', '/home\n/a', '/home/a\r'):
+                      '\n/home/a', '/home\n/a', '/home/a\r', '/home/a\x85', '/home/a\u2028',
+                      '/home/a\u2029', '/home/a\x0b', '/home/a\x0c', '/home/a\x1c',
+                      '/home/a\u200b', '/home/\u00e9', '/home/a\ufeff'):
             with self.subTest(home=value):
                 done, _ = self.run_recapture(extra_env={'HOME': value})
                 self.assertEqual(done.returncode, 1, done.stderr)
@@ -962,10 +983,14 @@ class HomeValidation7510(RecaptureBase):
     def test_home_problem_unit_table(self):
         module = load_script_module()
         for value in ('//home/a', '///home/a', '/home//a', '/home/a\n', '/home/a\x00',
-                      '/home/a\x1f', '/home/a\x7f', '/ho\tme/a'):
+                      '/home/a\x1f', '/home/a\x7f', '/ho\tme/a', '/home/a\x85',
+                      '/home/a\u2028', '/home/a\u2029', '/home/a\x0b', '/home/a\x0c',
+                      '/home/a\x1c', '/home/a\x1d', '/home/a\x1e', '/home/a\u200b',
+                      '/home/a\ufeff', '/home/a\u00ad', '/home/\u00e9', '/h\u00f6me/a',
+                      '/home/\U0001f600', '/home/a\ud800', '/home/a\u00a0'):
             with self.subTest(home=value):
                 self.assertIsNotNone(module.home_problem(value))
-        for value in ('/home/a', '/home/a b', '/home/\u00e9', '/Users/x.y', '/a'):
+        for value in ('/home/a', '/home/a b', '/Users/x.y', '/a', '/home/a_b-c.d+e@f'):
             with self.subTest(home=value):
                 self.assertIsNone(module.home_problem(value))
 
@@ -984,20 +1009,23 @@ class SanitizerBoundaries7538(RecaptureBase):
     )
     REWRITTEN = (
         b'{P}', b'{P}/x', b'"{P}"', b"'{P}'", b'`{P}`', b'({P})', b'[{P}]', b'<{P}>',
-        b'={P}', b':{P}', b'{P}:', b'{P};', b'{P},', b'{P} x', b'a {P}', b'{P}\n', b'{P}\t',
+        b'={P}', b':{P}', b'{P}:', b',{P}', b'{{P}}', b'${{P}}', b'${{P}}/x', b'{{P}/x}',
+        b'{{P}, y}', b'{k: {P}}', b'a,{P}', b'{P},{P}', b'[{P},{P}]', b'--dirs={P},{P}/x',
+        b'{{P}}.', b'{{P}}\n', b'({{P}})', b'"{{P}}"', b'{"p":"{P}"}', b'{x,{P}}', b'{{{P}}}',
+        b'{P}}', b'{{{P}', b'{P};', b'{P},', b'{P} x', b'a {P}', b'{P}\n', b'{P}\t',
         b'{P}.', b'{P}. x', b'{P}.\n', b'KEY={P}:/bin', b'{P}) x', b'{P}] x', b'{P}> x',
         b'{P}, x', b'{P}: x', b'{P}; x', b'\t{P}', b'\n{P}', b' {P}/y z',
     )
     KEPT_END = (
         b'./x', b'..b', b'..', b'.txt', b'.b', b'.+', b'.)', b'.:x', b'.;', b'.,', b'.]',
-        b'+b', b'~', b'@x', b'%20', b'#1', b'$x', b'&b', b'|b', b'!', b'(x', b'{x', b'}',
+        b'+b', b'~', b'@x', b'%20', b'#1', b'$x', b'&b', b'|b', b'!', b'(x', b'{x',
         b'[x', b'ab', b'_b', b'-b', b'=1', b'*', b'?', b'^', b'\\x', b'\xc3\xa9', b'\xc3\xa9/x',
         b'\xe2\x80\xa8', b'\x00', b'<x', b'\x01',
     )
     KEPT_START = (
-        b'~', b'x+', b'x', b',', b'@', b'%', b'+', b'#', b'$', b'&', b'|', b'!', b'{', b'}',
+        b'~', b'x+', b'x', b'@', b'%', b'+', b'#', b'$', b'&', b'|', b'!', b'}',
         b'\\', b'.', b'-', b'_', b'\xc3\xa9', b'*', b'?', b'^', b';', b')', b']', b'>',
-        b'/', b'a.', b'\x00', b'\xe2\x80\xa8', b'a,', b'1',
+        b'/', b'a.', b'\x00', b'\xe2\x80\xa8', b'1', b'a}', b'}}',
     )
 
     def patched(self):
@@ -1039,7 +1067,8 @@ class SanitizerBoundaries7538(RecaptureBase):
                 self.assertEqual(module.sanitize(path + b'./x'), after_root + b'./x')
                 self.assertEqual(module.sanitize(b'~' + path + b'/x'), b'~' + path + b'/x')
                 self.assertEqual(module.sanitize(b'x+' + path + b'/x'), b'x+' + path + b'/x')
-                self.assertEqual(module.sanitize(b',' + path), b',' + path)
+                self.assertEqual(module.sanitize(b',' + path), b',' + label)
+                self.assertEqual(module.sanitize(b'{' + path + b'}'), b'{' + label + b'}')
                 self.assertEqual(module.sanitize(b'@' + path), b'@' + path)
                 self.assertEqual(module.sanitize(b'%' + path), b'%' + path)
                 self.assertEqual(module.sanitize(path), label)
@@ -1052,7 +1081,7 @@ class SanitizerBoundaries7538(RecaptureBase):
     def test_two_paths_in_one_line_are_each_decided_on_their_own(self):
         module = self.patched()
         self.assertEqual(module.sanitize(b'/home/a,/home/a x/home/a /home/a'),
-                         b'<home>,/home/a x/home/a <home>')
+                         b'<home>,<home> x/home/a <home>')
 
     def test_docstring_describes_an_explicit_allowlist(self):
         module = load_script_module()
@@ -1063,6 +1092,8 @@ class SanitizerBoundaries7538(RecaptureBase):
         self.assertIn('Start boundary', doc)
         self.assertIn('End boundary', doc)
         self.assertIn('comma', doc)
+        self.assertIn('`,` or `{`', doc)
+        self.assertIn('`}`', doc)
         source = (REPO / 'scripts' / SCRIPT_NAME).read_text()
         self.assertNotIn('legal filename character', source)
 
@@ -1083,7 +1114,7 @@ class EvidenceModes7568(SymlinkBase):
     """#7568 #7569: the bundle is local operator evidence: every file the script creates is
     0600 and every directory it creates is 0700, whatever the umask."""
 
-    UMASKS = (0, 0o022, 0o077)
+    UMASKS = (0, 0o022, 0o077, 0o002)
 
     def test_public_file_mode_is_gone_and_the_file_mode_is_owner_only(self):
         module = load_script_module()
@@ -1109,6 +1140,11 @@ class EvidenceModes7568(SymlinkBase):
     def test_whole_run_creates_only_0600_files_and_0700_dirs_under_every_umask(self):
         for umask in self.UMASKS:
             with self.subTest(umask=oct(umask)):
+                # a fresh sandbox per umask: no directory survives from an earlier subTest, so
+                # every directory is created under THIS umask (#7614)
+                for top in ('docs', '.local-runs'):
+                    shutil.rmtree(str(self.root / top), True)
+                    self.assertFalse((self.root / top).exists(), top)
                 old = os.umask(umask)
                 try:
                     done, _ = self.run_recapture()
@@ -1133,8 +1169,6 @@ class EvidenceModes7568(SymlinkBase):
                     mode = (self.root / top).stat().st_mode & 0o777
                     self.assertEqual(mode, 0o700, '%s is %o' % (top, mode))
                 self.assertGreater(seen, 15)
-                shutil.rmtree(str(self.root / 'docs'))
-                shutil.rmtree(str(self.root / '.local-runs'))
 
     def test_a_directory_that_exists_is_not_retightened_except_the_fixtures_dir(self):
         (self.root / 'docs').mkdir()
@@ -1292,6 +1326,619 @@ class StagedBundle7574(SymlinkBase):
         self.assertIn('never mixes legs of two runs', doc)
 
 
+def sha256_hex(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def write_manifest(bundle):
+    """Write MANIFEST.sha256 over every regular file of bundle (the shape the cert uses)."""
+    lines = ['%s  %s\n' % (sha256_hex(p), p.name) for p in sorted(Path(bundle).iterdir())
+             if p.is_file() and p.name != 'MANIFEST.sha256']
+    (Path(bundle) / 'MANIFEST.sha256').write_text(''.join(lines))
+
+
+def manifest_problems(bundle):
+    """[] when MANIFEST.sha256 exists and every file it lists is present and matches."""
+    manifest = Path(bundle) / 'MANIFEST.sha256'
+    if not manifest.is_file():
+        return ['MANIFEST.sha256 missing']
+    problems = []
+    for line in manifest.read_text().splitlines():
+        digest, name = line.split('  ', 1)
+        target = Path(bundle) / name
+        if not target.is_file() or sha256_hex(target) != digest:
+            problems.append(name)
+    return problems
+
+
+def tree_names(base, predicate):
+    """Every path under base (links not followed) whose basename satisfies predicate."""
+    found = []
+    for directory, names, files in os.walk(str(base)):
+        found.extend(os.path.join(directory, n) for n in names + files if predicate(n))
+    return found
+
+
+CWD_HOOK = (
+    '\nimport json as _j, os as _o, sys as _s\n'
+    'open(%(log)r, "a").write(_j.dumps({"argv": _s.argv[1:], "cwd": _o.getcwd(),\n'
+    '    "ls": sorted(_o.listdir(".")), "mode": _o.stat(".").st_mode & 0o777,\n'
+    '    "home": _o.environ["HOME"], "noconfig": _o.environ.get("AI_MEMORY_NO_CONFIG"),\n'
+    '    "store": _o.path.exists("ai-memory.db")}) + "\\n")\n')
+
+
+class ChildCwd7608(SymlinkBase):
+    """#7608: every child runs in a fresh empty 0700 sandbox directory under .local-runs with
+    HOME inside it and AI_MEMORY_NO_CONFIG=1, so no leg can open a database it did not create."""
+
+    def make_cwd_stub(self, name, log):
+        head, rest = STUB.split('\n', 1)
+        path = self.root / name
+        path.write_text(head + CWD_HOOK % {'log': str(log)} + rest)
+        path.chmod(0o755)
+        return path
+
+    def test_every_leg_runs_in_an_empty_private_sandbox_and_ignores_a_planted_store(self):
+        log = self.home / 'cwd.log'
+        planted = self.home / 'planted-cwd'
+        planted.mkdir()
+        (planted / 'ai-memory.db').write_bytes(b'a live store')
+        default = self.make_cwd_stub('cwd-default', log)
+        sqlcipher = self.make_cwd_stub('cwd-sqlcipher', log)
+        done, _ = self.run_recapture(default_bin=default, sqlcipher_bin=sqlcipher, cwd=planted)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        kinds = [r['argv'][:1] for r in records]
+        self.assertEqual(kinds.count(['doctor']), 4, kinds)
+        self.assertIn(['rules'], kinds)
+        self.assertIn(['stats'], kinds)
+        runs = (self.root / '.local-runs').resolve()
+        for record in records:
+            with self.subTest(argv=record['argv']):
+                cwd = Path(record['cwd']).resolve()
+                self.assertNotEqual(cwd, planted.resolve())
+                self.assertIn(runs, cwd.parents)
+                self.assertEqual(record['ls'], [])
+                self.assertEqual(record['mode'], 0o700)
+                self.assertFalse(record['store'])
+                self.assertEqual(record['noconfig'], '1')
+                self.assertIn(runs, Path(record['home']).resolve().parents)
+                self.assertNotEqual(record['home'], str(self.home))
+        self.assertEqual(sorted(p.name for p in planted.iterdir()), ['ai-memory.db'])
+        self.assertEqual((planted / 'ai-memory.db').read_bytes(), b'a live store')
+
+    def test_the_evidence_does_not_depend_on_the_callers_cwd(self):
+        outputs = []
+        for index in range(2):
+            caller = self.home / ('caller%d' % index)
+            caller.mkdir()
+            if index:
+                (caller / 'ai-memory.db').write_bytes(b'x')
+            done, _ = self.run_recapture(cwd=caller)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            outputs.append({n: self.out(n) for n in (
+                'posture-bare-env.out', 'posture-hardened-env.out',
+                'posture-hardened-boot-refusal.out', 'posture-sqlcipher-pass.out')})
+        self.assertEqual(outputs[0], outputs[1])
+
+    def test_the_sandbox_is_fresh_every_run_and_removed_afterwards(self):
+        runs = self.root / '.local-runs'
+        stale = runs / 'cert-3607-sandbox' / 'cwd'
+        stale.mkdir(parents=True)
+        (stale / 'ai-memory.db').write_bytes(b'left by someone')
+        log = self.home / 'cwd.log'
+        default = self.make_cwd_stub('cwd-default', log)
+        done, _ = self.run_recapture(default_bin=default)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        for line in log.read_text().splitlines():
+            self.assertEqual(json.loads(line)['ls'], [])
+        self.assertFalse((runs / 'cert-3607-sandbox').exists())
+
+    def test_the_sandbox_home_is_labelled_home_in_the_evidence(self):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn('HOME=<home>', self.out('posture-bare-env.out'))
+        self.assertNotIn('cert-3607-sandbox', self.out('posture-bare-env.out'))
+
+    def test_every_subprocess_call_names_a_cwd(self):
+        tree = ast.parse((REPO / 'scripts' / SCRIPT_NAME).read_text())
+        calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
+                 and ast.unparse(node.func).startswith('subprocess.')]
+        self.assertGreaterEqual(len(calls), 5)
+        missing = [node.lineno for node in calls
+                   if 'cwd' not in {keyword.arg for keyword in node.keywords}]
+        self.assertEqual(missing, [])
+
+    def test_docstring_states_the_sandbox(self):
+        module = load_script_module()
+        doc = ' '.join(module.__doc__.split())
+        self.assertIn('sandbox', doc)
+        self.assertIn('AI_MEMORY_NO_CONFIG=1', doc)
+        self.assertIn('cwd', doc)
+        self.assertIn('sandbox', module.USAGE_EPILOG)
+
+
+class WorkDirs7609(SymlinkBase):
+    """#7609 #7610 #7611: the staging directory, the aside directory and every raw capture
+    live under .local-runs; nothing temporary is ever created under docs/."""
+
+    def evidence(self):
+        return self.root / OUT_REL
+
+    def work(self):
+        return self.root / '.local-runs' / 'cert-3607-work'
+
+    def make_probe_stub(self, name, log):
+        head, rest = STUB.split('\n', 1)
+        hook = (
+            '\nimport json as _j, os as _o, sys as _s\n'
+            'if _s.argv[1:2] == ["doctor"]:\n'
+            '    _r = _o.path.dirname(_o.path.dirname(_o.environ["TMPDIR"]))\n'
+            '    _docs, _raws = [], []\n'
+            '    for _d, _ns, _fs in _o.walk(_o.path.join(_r, "docs")):\n'
+            '        _docs.extend(_o.path.join(_d, _n) for _n in _ns + _fs)\n'
+            '    for _d, _ns, _fs in _o.walk(_o.path.join(_r, ".local-runs")):\n'
+            '        _raws.extend(_o.path.join(_d, _n) for _n in _fs if _n.endswith(".raw"))\n'
+            '    open(%r, "a").write(_j.dumps({"docs": _docs, "raws": _raws}) + "\\n")\n'
+            % str(log))
+        path = self.root / name
+        path.write_text(head + hook + rest)
+        path.chmod(0o755)
+        return path
+
+    def seed(self):
+        """A first run, then SANITIZATION.md and a MANIFEST.sha256 over the bundle."""
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        (self.evidence() / 'SANITIZATION.md').write_bytes(b'kept note\n')
+        (self.evidence() / 'named-tests.txt').write_bytes(b'original named tests\n')
+        write_manifest(self.evidence())
+        return self.snapshot()
+
+    def snapshot(self):
+        return {str(p.relative_to(self.evidence())): p.read_bytes()
+                for p in sorted(self.evidence().rglob('*')) if p.is_file()}
+
+    def assert_complete_and_clean(self):
+        evidence = self.evidence()
+        self.assertEqual(manifest_problems(evidence), [])
+        self.assertEqual((evidence / 'SANITIZATION.md').read_bytes(), b'kept note\n')
+        self.assertTrue((evidence / 'posture-bare-env.out').is_file())
+        self.assertRegex(self.out('posture-legs-exit-codes.txt').split('\n', 1)[0], HEADER_RE)
+        self.assertEqual(sorted(p.name for p in evidence.parent.iterdir()), ['cert-3607'])
+        left = [p.name for p in self.work().iterdir()] if self.work().is_dir() else []
+        self.assertEqual([n for n in left if n != '.lock'], [], left)
+        self.assertEqual(tree_names(self.root / 'docs', lambda n: n.endswith('.raw')
+                                    or n.startswith('.cert-3607.')), [])
+        self.assertEqual(tree_names(self.root / '.local-runs', lambda n: n.endswith('.raw')
+                                    or n.startswith('old-') or n.startswith('staging-')
+                                    or n.startswith('raw-')), [])
+        self.assertFalse((self.root / '.local-runs' / 'cert-3607-sandbox').exists())
+
+    def test_nothing_temporary_is_created_under_docs_and_raws_live_under_local_runs(self):
+        log = self.home / 'probe.log'
+        default = self.make_probe_stub('probe-default', log)
+        sqlcipher = self.make_probe_stub('probe-sqlcipher', log)
+        for _ in range(2):  # the second run has a previous bundle to copy
+            done, _ = self.run_recapture(default_bin=default, sqlcipher_bin=sqlcipher)
+            self.assertEqual(done.returncode, 0, done.stderr)
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(len(records), 8)
+        evidence = str(self.evidence())
+        for record in records:
+            for entry in record['docs']:
+                base = os.path.basename(entry)
+                self.assertFalse(base.startswith('.cert-3607.') or base.endswith('.raw'), entry)
+                self.assertTrue(entry == evidence or entry.startswith(evidence + os.sep)
+                                or entry in {str(self.root / 'docs'),
+                                             str(self.root / 'docs' / 'compliance'),
+                                             str(self.root / 'docs' / 'compliance' / 'evidence')},
+                                entry)
+            self.assertEqual(len(record['raws']), 1, record)
+        self.assertEqual(sorted(p.name for p in self.evidence().parent.iterdir()), ['cert-3607'])
+
+    def test_the_device_check_is_a_function_and_refuses_a_cross_device_pair(self):
+        module = load_script_module()
+        self.assertIsNone(module.device_problem(self.root, self.home))
+        real = os.stat
+
+        class Fake:
+            def __init__(self, dev):
+                self.st_dev = dev
+
+        calls = []
+
+        def fake(path, *args, **kwargs):
+            calls.append(path)
+            return Fake(len(calls))
+
+        with mock.patch.object(module.os, 'stat', fake):
+            self.assertIn('filesystem', module.device_problem(self.root, self.home))
+        self.assertIs(os.stat, real)
+
+    def test_a_cross_device_work_directory_is_refused_before_any_bundle_write(self):
+        prelude = "m.device_problem = lambda first, second: 'forced: not the same filesystem'"
+        done = self.run_driver(prelude)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('same filesystem', done.stderr)
+        self.assertFalse(self.evidence().exists())
+
+    def run_driver(self, prelude):
+        driver = self.home / 'driver.py'
+        driver.write_text(DRIVER)
+        script = self.root / 'scripts' / SCRIPT_NAME
+        return subprocess.run([sys.executable, str(driver), str(script), prelude],
+                              env=self.base_env(), cwd=str(self.root), capture_output=True,
+                              text=True)
+
+    def test_the_gitignore_belt_covers_the_dot_cert_names(self):
+        ignore = REPO / 'docs' / 'compliance' / 'evidence' / '.gitignore'
+        self.assertIn('.cert-3607.*', ignore.read_text().split())
+        done = subprocess.run(['git', '-C', str(REPO), 'check-ignore', '-q',
+                               'docs/compliance/evidence/.cert-3607.staging-0123/x.raw'],
+                              check=False)
+        self.assertEqual(done.returncode, 0)
+
+    # ---- recovery from a leftover aside / staging / raw directory (#7610)
+
+    def new_work(self):
+        self.work().mkdir(parents=True, exist_ok=True)
+        self.work().chmod(0o700)
+        return self.work()
+
+    def test_an_aside_with_a_missing_bundle_is_restored(self):
+        for where in ('work', 'legacy'):
+            with self.subTest(aside=where):
+                shutil.rmtree(str(self.root / 'docs'), True)
+                shutil.rmtree(str(self.root / '.local-runs'), True)
+                self.seed()
+                aside = (self.new_work() / 'old-0123456789abcdef' if where == 'work'
+                         else self.evidence().parent / '.cert-3607.old-0123456789abcdef')
+                os.rename(str(self.evidence()), str(aside))
+                done, _ = self.run_recapture()
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assert_complete_and_clean()
+                self.assertEqual(self.out('named-tests.txt'), 'original named tests\n')
+
+    def test_an_aside_replaces_an_incomplete_bundle(self):
+        self.seed()
+        shutil.copytree(str(self.evidence()), str(self.new_work() / 'old-0123456789abcdef'))
+        (self.evidence() / 'named-tests.txt').unlink()  # listed in the manifest: incomplete
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assert_complete_and_clean()
+        self.assertEqual(self.out('named-tests.txt'), 'original named tests\n')
+
+    def test_an_aside_is_dropped_when_the_bundle_is_complete(self):
+        self.seed()
+        shutil.copytree(str(self.evidence()), str(self.new_work() / 'old-0123456789abcdef'))
+        (self.evidence() / 'newer.txt').write_bytes(b'newer\n')
+        write_manifest(self.evidence())
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assert_complete_and_clean()
+        self.assertEqual(self.out('newer.txt'), 'newer\n')
+
+    def test_two_asides_are_refused_and_left_alone(self):
+        self.seed()
+        work = self.new_work()
+        for name in ('old-0000000000000001', 'old-0000000000000002'):
+            shutil.copytree(str(self.evidence()), str(work / name))
+        before = self.snapshot()
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('old-', done.stderr)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(sorted(p.name for p in work.iterdir() if p.name.startswith('old-')),
+                         ['old-0000000000000001', 'old-0000000000000002'])
+
+    def test_leftover_staging_and_raw_directories_are_removed(self):
+        self.seed()
+        work = self.new_work()
+        (work / 'staging-aaaaaaaaaaaaaaaa').mkdir()
+        (work / 'staging-aaaaaaaaaaaaaaaa' / 'x').write_bytes(b'half a bundle')
+        (work / 'raw-bbbbbbbbbbbbbbbb').mkdir()
+        (work / 'raw-bbbbbbbbbbbbbbbb' / 'posture-bare-env.out.raw').write_bytes(
+            str(self.home).encode())
+        legacy = self.evidence().parent / '.cert-3607.staging-cccccccccccccccc'
+        legacy.mkdir()
+        (legacy / 'posture-bare-env.out.raw').write_bytes(str(self.home).encode())
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assert_complete_and_clean()
+
+    def test_a_leftover_staging_directory_on_a_first_run_is_removed(self):
+        work = self.new_work()
+        (work / 'staging-aaaaaaaaaaaaaaaa').mkdir()
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(sorted(p.name for p in work.iterdir() if p.name != '.lock'), [])
+
+    def test_a_leftover_that_is_a_symlink_is_unlinked_never_followed(self):
+        outside = self.outside()
+        (outside / 'precious').write_bytes(b'keep')
+        work = self.new_work()
+        (work / 'staging-aaaaaaaaaaaaaaaa').symlink_to(outside)
+        (work / 'raw-bbbbbbbbbbbbbbbb').symlink_to(outside)
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual((outside / 'precious').read_bytes(), b'keep')
+        self.assertEqual(sorted(p.name for p in work.iterdir() if p.name != '.lock'), [])
+
+    def test_a_second_concurrent_run_is_refused(self):
+        marker = self.home / 'marker'
+        hang = self.make_hang_stub(self.root / 'hang-default', marker, 1)
+        proc = self.popen_recapture(default_bin=hang)
+        try:
+            self.wait_for(marker)
+            done, _ = self.run_recapture()
+            self.assertEqual(done.returncode, 1, done.stderr)
+            self.assertIn('another', done.stderr)
+        finally:
+            self.kill(proc, marker)
+
+    # ---- SIGKILL at each step, then a rerun (#7609 #7610)
+
+    def make_hang_stub(self, path, marker, nth):
+        """Hangs, after printing a line, in its nth `doctor` invocation (counted in a file)."""
+        head, rest = STUB.split('\n', 1)
+        counter = self.home / ('count-' + path.name)
+        hook = (
+            '\nimport os as _o, sys as _s, time as _t\n'
+            'if _s.argv[1:2] == ["doctor"]:\n'
+            '    _c = %r\n'
+            '    _n = (int(open(_c).read()) if _o.path.exists(_c) else 0) + 1\n'
+            '    open(_c, "w").write(str(_n))\n'
+            '    if _n == %d:\n'
+            '        print("pending capture " + _o.environ["HOME"])\n'
+            '        _s.stdout.flush()\n'
+            '        open(%r, "w").write(str(_o.getpid()))\n'
+            '        _t.sleep(120)\n' % (str(counter), nth, str(marker)))
+        path.write_text(head + hook + rest)
+        path.chmod(0o755)
+        return path
+
+    def wait_for(self, marker):
+        deadline = time.time() + 60
+        while not marker.exists() or not marker.read_text():
+            self.assertLess(time.time(), deadline, 'the hanging leg never started')
+            time.sleep(0.05)
+
+    def kill(self, proc, marker):
+        with contextlib.suppress(OSError, ValueError):
+            os.kill(int(marker.read_text()), signal.SIGKILL)
+        with contextlib.suppress(OSError):
+            os.kill(proc.pid, signal.SIGKILL)
+        proc.communicate()
+
+    def test_sigkill_during_each_leg_then_a_rerun_leaves_a_complete_bundle(self):
+        for leg in (1, 2, 3, 4):
+            with self.subTest(leg=leg):
+                shutil.rmtree(str(self.root / 'docs'), True)
+                shutil.rmtree(str(self.root / '.local-runs'), True)
+                before = self.seed()
+                marker = self.home / ('marker%d' % leg)
+                if leg < 4:
+                    hang = self.make_hang_stub(self.root / ('hang-default%d' % leg), marker, leg)
+                    proc = self.popen_recapture(default_bin=hang)
+                else:
+                    hang = self.make_hang_stub(self.root / 'hang-sqlcipher', marker, 1)
+                    proc = self.popen_recapture(sqlcipher_bin=hang)
+                self.wait_for(marker)
+                # the capture so far is on disk somewhere: never under docs
+                self.assertEqual(tree_names(self.root / 'docs', lambda n: n.endswith('.raw')
+                                            or n.startswith('.cert-3607.')), [])
+                self.kill(proc, marker)
+                self.assertEqual(proc.returncode, -signal.SIGKILL)
+                self.assertEqual(self.snapshot(), before)
+                done, _ = self.run_recapture()
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assert_complete_and_clean()
+
+    def test_sigkill_at_each_publish_step_then_a_rerun_leaves_a_complete_bundle(self):
+        steps = {
+            'after the previous bundle is copied': (
+                "real = m.copy_bundle\n"
+                "def hook(*a, **k):\n"
+                "    real(*a, **k)\n"
+                "    os.kill(os.getpid(), signal.SIGKILL)\n"
+                "m.copy_bundle = hook\n"),
+            'after the old bundle is moved aside': self.replace_hook(1),
+            'after the staged bundle is renamed in': self.replace_hook(2),
+            'before the aside is removed': (
+                "real = m.remove_tree\n"
+                "def hook(path):\n"
+                "    if os.path.basename(str(path)).startswith('old-'):\n"
+                "        os.kill(os.getpid(), signal.SIGKILL)\n"
+                "    real(path)\n"
+                "m.remove_tree = hook\n"),
+        }
+        for step, prelude in steps.items():
+            with self.subTest(step=step):
+                shutil.rmtree(str(self.root / 'docs'), True)
+                shutil.rmtree(str(self.root / '.local-runs'), True)
+                self.seed()
+                done = self.run_driver(prelude)
+                self.assertEqual(done.returncode, -signal.SIGKILL, done.stderr)
+                done, _ = self.run_recapture()
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assert_complete_and_clean()
+
+    def replace_hook(self, nth):
+        return ("real = os.replace\n"
+                "count = [0]\n"
+                "def hook(*a, **k):\n"
+                "    real(*a, **k)\n"
+                "    count[0] += 1\n"
+                "    if count[0] == %d:\n"
+                "        os.kill(os.getpid(), signal.SIGKILL)\n"
+                "os.replace = hook\n" % nth)
+
+    def test_a_kill_between_the_two_renames_leaves_the_aside_the_next_run_restores(self):
+        self.seed()
+        done = self.run_driver(self.replace_hook(1))
+        self.assertEqual(done.returncode, -signal.SIGKILL, done.stderr)
+        self.assertFalse(self.evidence().exists())
+        self.assertEqual([p.name for p in self.work().iterdir() if p.name.startswith('old-')][:1],
+                         [p.name for p in self.work().iterdir() if p.name.startswith('old-')])
+        self.assertEqual(len([p for p in self.work().iterdir() if p.name.startswith('old-')]), 1)
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assert_complete_and_clean()
+
+
+class WorldWritableAncestors7611(SymlinkBase):
+    """#7611: the world-writable and foreign-uid refusal covers every directory the script
+    reads or writes through, evidence parents and the repo root included."""
+
+    def test_a_world_writable_directory_on_any_written_path_is_refused(self):
+        for rel in ('', 'docs', 'docs/compliance', 'docs/compliance/evidence',
+                    '.local-runs/cert-3607-work', '.local-runs/cert-3607-fixtures/keys',
+                    '.local-runs/tmp'):
+            with self.subTest(directory=rel or '<repo root>'):
+                shutil.rmtree(str(self.root / 'docs'), True)
+                shutil.rmtree(str(self.root / '.local-runs'), True)
+                target = self.root / rel if rel else self.root
+                target.mkdir(parents=True, exist_ok=True)
+                target.chmod(0o777)
+                try:
+                    done, _ = self.run_recapture()
+                    self.assertEqual(done.returncode, 1, done.stderr)
+                    self.assertIn('writable', done.stderr)
+                    if rel:
+                        self.assertIn(rel.rsplit('/', 1)[-1], done.stderr)
+                    self.assertFalse((self.root / OUT_REL / 'posture-bare-env.out').exists())
+                finally:
+                    target.chmod(0o700)
+
+    def test_a_sticky_world_writable_directory_is_accepted(self):
+        evidence = self.root / 'docs' / 'compliance' / 'evidence'
+        evidence.mkdir(parents=True)
+        evidence.chmod(0o1777)
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def test_dir_problem_sticky_and_ancestor_units(self):
+        module = load_script_module()
+        module.ROOT = self.root
+        module.OUT = self.root / OUT_REL
+        module.LOCAL_RUNS = self.root / '.local-runs'
+        module.FIX = module.LOCAL_RUNS / 'cert-3607-fixtures'
+        module.WORK = module.LOCAL_RUNS / 'cert-3607-work'
+        names = [str(p) for p in module.guarded_dirs(self.root / '.local-runs' / 'tmp')]
+        for rel in ('', 'docs', 'docs/compliance', 'docs/compliance/evidence', OUT_REL.as_posix(),
+                    '.local-runs', '.local-runs/cert-3607-fixtures', '.local-runs/cert-3607-work',
+                    '.local-runs/tmp'):
+            self.assertIn(str(self.root / rel) if rel else str(self.root), names, rel)
+        sticky = self.root / 'sticky'
+        sticky.mkdir()
+        sticky.chmod(0o1777)
+        self.assertIsNone(module.dir_problem(sticky))
+        sticky.chmod(0o777)
+        self.assertIn('writable', module.dir_problem(sticky))
+
+    def test_docstring_states_the_ancestor_refusal(self):
+        module = load_script_module()
+        doc = ' '.join(module.__doc__.split())
+        self.assertIn('every directory the script reads or writes through', doc)
+        self.assertIn('sticky', doc)
+
+
+class BraceComma7612(RecaptureBase):
+    """#7612: a path after `,` or `{` and before `}` is rewritten like any other whole path."""
+
+    HOME_PATH = '/home/fateprobe'
+
+    def patched(self):
+        module = load_script_module()
+        module.ROOT = Path('/mnt/x/repo')
+        module.FIX = module.ROOT / '.local-runs' / 'cert-3607-fixtures'
+        module.HOME = self.HOME_PATH
+        return module
+
+    FORMS = (
+        '{k: P}', '${P}', '${P}/x', '{P}', '{P/x}', '{P, Q}', 'P,P', 'a,P', '[P,P]',
+        '--dirs=P,P/x', '{"p":"P"}', '{"p": "P"}', '<home>,P', '{{P}}', '{[P]}', '{P}}',
+        '{k: P, j: P}', '{(P)}', 'x={P},y={P}', '${P}:${P}/bin', '${HOME}=P', '{P};', '{P}.',
+    )
+
+    def test_table_of_brace_and_comma_forms(self):
+        module = self.patched()
+        for form in self.FORMS:
+            with self.subTest(form=form):
+                raw = form.replace('Q', '/home/other').replace('P', self.HOME_PATH)
+                got = module.sanitize(raw.encode()).decode()
+                self.assertNotIn(self.HOME_PATH, got)
+                self.assertIn('<home>', got)
+
+    def test_a_bundle_with_the_path_in_every_form_has_no_residue(self):
+        module = self.patched()
+        document = '\n'.join(form.replace('Q', '/home/other').replace('P', self.HOME_PATH)
+                             for form in self.FORMS)
+        got = module.sanitize(document.encode()).decode()
+        self.assertEqual(got.count(self.HOME_PATH), 0, got)
+        self.assertEqual(got.count('/home/other'), 1, got)
+
+    def test_forms_that_are_other_paths_stay(self):
+        module = self.patched()
+        for form in ('{P-x}', '{Px}', '{P.txt}', '$P', 'xP', '{P+x}', '{P@x}', '{P%x}'):
+            raw = form.replace('P', self.HOME_PATH)
+            with self.subTest(raw=raw):
+                self.assertEqual(module.sanitize(raw.encode()).decode(), raw)
+
+
+class HomeCharacters7613(unittest.TestCase):
+    """#7613: HOME may hold only printable ASCII: no character str.splitlines splits on, no
+    Cc/Cf/Zl/Zp character, no non-ASCII character at all."""
+
+    def test_every_character_splitlines_splits_on_is_refused(self):
+        module = load_script_module()
+        splitters = [cp for cp in range(0x110000)
+                     if len(('a' + chr(cp) + 'b').splitlines()) > 1]
+        self.assertIn(0x85, splitters)
+        self.assertIn(0x2028, splitters)
+        self.assertIn(0x1C, splitters)
+        for cp in splitters:
+            self.assertIsNotNone(module.home_problem('/home/a' + chr(cp) + 'b'), hex(cp))
+
+    def test_every_control_format_and_separator_character_is_refused(self):
+        module = load_script_module()
+        for cp in range(0x110000):
+            if unicodedata.category(chr(cp)) in ('Cc', 'Cf', 'Zl', 'Zp'):
+                self.assertIsNotNone(module.home_problem('/home/a' + chr(cp)), hex(cp))
+
+    def test_every_non_ascii_character_is_refused(self):
+        module = load_script_module()
+        for cp in list(range(0x80, 0x3000)) + [0xD7FF, 0xD800, 0xDFFF, 0xE000, 0xFFFD, 0x10000,
+                                               0x1F600, 0x10FFFF]:
+            self.assertIsNotNone(module.home_problem('/home/a' + chr(cp)), hex(cp))
+
+    def test_printable_ascii_stays_usable(self):
+        module = load_script_module()
+        for cp in range(0x20, 0x7F):
+            char = chr(cp)
+            if char in ':':
+                continue
+            self.assertIsNone(module.home_problem('/home/a' + char), hex(cp))
+
+    def test_the_docstring_states_the_choice(self):
+        module = load_script_module()
+        doc = ' '.join(module.__doc__.split())
+        self.assertIn('non-ASCII', doc)
+        self.assertIn('splitlines', doc)
+        self.assertIn('ASCII', module.USAGE_EPILOG)
+
+
+DRIVER = '''
+import importlib.util, os, signal, sys
+spec = importlib.util.spec_from_file_location('recapture_driver', sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+exec(sys.argv[2])
+sys.exit(m.main([]))
+'''
+
+
 class EmptyExcept7537(unittest.TestCase):
     def test_open_new_has_no_empty_except_clause(self):
         text = (REPO / 'scripts' / SCRIPT_NAME).read_text()
@@ -1311,7 +1958,8 @@ class SwapReplaceDocs7539(SymlinkBase):
         swap.write_text(
             head + '\nimport os as _o, sys as _s\n'
             'if _s.argv[1:2] == ["doctor"] and "--posture" in _s.argv:\n'
-            '    _t = _o.path.join(_o.getcwd(), "docs", "compliance", "evidence", "cert-3607",\n'
+            '    _r = _o.path.dirname(_o.path.dirname(_o.environ["TMPDIR"]))\n'
+            '    _t = _o.path.join(_r, "docs", "compliance", "evidence", "cert-3607",\n'
             '                      "posture-bare-env.out")\n'
             '    _o.makedirs(_o.path.dirname(_t), exist_ok=True)\n'
             '    if not _o.path.lexists(_t):\n'
