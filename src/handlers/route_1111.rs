@@ -1863,7 +1863,7 @@ pub async fn handle_subscription_dlq_list_http(
     drop(lock);
     match result {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(e) => err_response(e),
+        Err(e) => err_response(e.to_string()),
     }
 }
 
