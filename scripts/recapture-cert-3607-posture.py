@@ -16,8 +16,16 @@ across re-issues (#5039 part B is a separate, vote-gated decision).
 Environment overrides: DEFAULT_BIN (default <repo>/target/release/ai-memory),
 SQLCIPHER_BIN (default <repo>/target-sqlcipher/release/ai-memory; leg 4 is
 recorded as `missing` when it is absent) and TMPDIR. The shell script's defaults
-named build directories of one build host; they are replaced by repo-relative ones. Exit codes: 0 success; 1 operator keygen failed, the git sha could
-not be read, or the transcript header date disagrees with the run date.
+named build directories of one build host; they are replaced by repo-relative ones.
+
+The run ends by asserting the recorded ladder through scripts/check-posture-ladder.py
+(#5036): legs 2/2/1/0, the exact PASS/FAIL counts, a strictly falling FAIL count,
+a named leg-3 refusal and distinct default/sqlcipher binaries. A skipped leg 4
+(no sqlcipher binary) therefore exits non-zero.
+
+Exit codes: 0 success and ladder asserted green; 1 operator keygen failed, the git
+sha could not be read, the transcript header date disagrees with the run date, or
+the ladder gate found a violation; 2 the ladder gate could not read the evidence.
 """
 import base64
 import datetime
@@ -36,7 +44,8 @@ SQLCIPHER_BIN_FALLBACK = str(ROOT / "target-sqlcipher" / "release" / "ai-memory"
 HOME = os.environ.get("HOME", "")
 CHILD_PATH = "/usr/bin:/bin:" + HOME + "/.cargo/bin"
 SANITIZED_FIXTURE_LABEL = "<repo-root>/.local-runs/cert-3607-fixtures"
-EXIT_CODES_FILE = "posture-legs-exit-codes.txt"
+LADDER_GATE = "check-posture-ladder.py"
+EXIT_CODES_FILE ="posture-legs-exit-codes.txt"
 HEADER_TEMPLATE = (
     "# posture-legs transcript — recorded exit codes "
     "({date} #3607 re-issue recapture (22 checks) @ {sha})"
@@ -138,6 +147,19 @@ def run_capture(binary, args, env, raw_path, sanitized_path):
 def count_rows(path, marker):
     """grep -c: the number of lines containing marker."""
     return sum(1 for line in path.read_text(errors="replace").splitlines() if marker in line)
+
+
+def assert_ladder(default_bin, sqlcipher_bin):
+    """Assert the recorded ladder (#5036); return the gate's exit status.
+
+    The evidence written above is kept whatever the verdict, so a red run can be
+    diagnosed. Both binaries are handed to the gate only when leg 4 could run: a
+    skipped leg 4 (`missing` in the transcript) is itself a violation.
+    """
+    gate_args = [sys.executable, str(ROOT / "scripts" / LADDER_GATE), str(OUT)]
+    if os.path.isfile(sqlcipher_bin) and os.access(sqlcipher_bin, os.X_OK):
+        gate_args += ["--default-bin", default_bin, "--sqlcipher-bin", sqlcipher_bin]
+    return subprocess.run(gate_args, check=False).returncode
 
 
 def main():
@@ -265,7 +287,7 @@ def main():
             for line in path.read_text(errors="replace").splitlines():
                 if "overall:" in line:
                     print(line)
-    return 0
+    return assert_ladder(default_bin, sqlcipher_bin)
 
 
 if __name__ == "__main__":

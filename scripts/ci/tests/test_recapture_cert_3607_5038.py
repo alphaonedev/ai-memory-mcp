@@ -25,6 +25,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT_NAME = 'recapture-cert-3607-posture.py'
+GATE_NAME = 'check-posture-ladder.py'
 SCRATCH = REPO / '.local-runs'
 OUT_REL = Path('docs') / 'compliance' / 'evidence' / 'cert-3607'
 HEADER_RE = re.compile(
@@ -50,11 +51,30 @@ if args[:1] == ['stats']:
 hard = env.get('AI_MEMORY_SECURITY_PROFILE') == 'asi-hard'
 armed = env.get('AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE') == '1'
 sqlcipher = 'sqlcipher' in sys.argv[0]
+# The certified ladder (#5036): bare 12 PASS / 10 FAIL, hardened 20/2, sqlcipher 22/0.
+# A `<stub>.mode` file beside the binary switches the stub to a posture regression.
+try:
+    mode = open(sys.argv[0] + '.mode').read().strip()
+except OSError:
+    mode = 'healthy'
 if args[:1] == ['doctor'] and '--posture' not in args:
-    print('refusing boot: control missing in ' + env['AI_MEMORY_KEY_DIR'])
+    if mode == 'bypass':
+        print('[PASS] boot gate never refuses')
+        sys.exit(0)
+    print('Error: certified posture refuses to boot - 1 required control(s) missing or below floor:')
+    print('  - AI_MEMORY_ENCRYPT_AT_REST: needs sqlcipher, key dir ' + env['AI_MEMORY_KEY_DIR'])
     sys.exit(1)
-fails = 10 if not hard else (0 if sqlcipher else 2)
+if mode == 'bypass':
+    passes, fails = 22, 0
+elif not hard:
+    passes, fails = 12, 10
+elif sqlcipher:
+    passes, fails = 22, 0
+else:
+    passes, fails = (19, 3) if mode == 'drift' else (20, 2)
 print('[PASS] sample ' + env['AI_MEMORY_KEY_DIR'] + ' HOME=' + env['HOME'])
+for i in range(passes - 1):
+    print('[PASS] check %%d' %% i)
 for i in range(fails):
     print('[FAIL] check %%d' %% i)
 print('overall: ' + ('FAIL' if fails else 'PASS'))
@@ -98,7 +118,8 @@ class RecaptureBase(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp(prefix='recapture-5038-', dir=str(SCRATCH)))
         self.addCleanup(shutil.rmtree, str(self.root), True)
         (self.root / 'scripts').mkdir()
-        shutil.copy2(str(REPO / 'scripts' / SCRIPT_NAME), str(self.root / 'scripts' / SCRIPT_NAME))
+        for name in (SCRIPT_NAME, GATE_NAME):
+            shutil.copy2(str(REPO / 'scripts' / name), str(self.root / 'scripts' / name))
         self.git('init', '-q')
         (self.root / 'seed.txt').write_text('seed\n')
         self.git('add', 'seed.txt')
@@ -122,7 +143,8 @@ class RecaptureBase(unittest.TestCase):
 
     def make_stub(self, name):
         path = self.root / name
-        path.write_text(STUB)
+        # Distinct bytes per build: the ladder gate requires distinct binaries (#5036).
+        path.write_text(STUB + '# build: ' + name + '\n')
         path.chmod(0o755)
         return path
 
@@ -170,12 +192,68 @@ class HeaderDate5038(RecaptureBase):
         self.assertEqual(re.findall(r'^exit: (\S+)$', text, re.M), ['2', '2', '1', '0'])
         self.assertIn('exits e1=2 e2=2 e3=1 e4=0', done.stdout)
 
-    def test_missing_sqlcipher_binary_records_missing(self):
+    def test_missing_sqlcipher_binary_records_missing_and_fails_closed(self):
+        # #5036: a skipped leg 4 is still recorded, but the ladder cannot be
+        # asserted, so the run exits non-zero (it used to exit 0).
         done, _ = self.run_recapture(sqlcipher_bin=self.root / 'no-such-binary')
-        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotEqual(done.returncode, 0, done.stdout)
         text = self.out('posture-legs-exit-codes.txt')
         self.assertEqual(re.findall(r'^exit: (\S+)$', text, re.M), ['2', '2', '1', 'missing'])
         self.assertIn('leg4 skipped', done.stdout)
+        self.assertIn('SKIPPED', done.stdout)
+
+
+class PostureLadder5036(RecaptureBase):
+    """The recapture asserts the ladder: a wrong shape must not exit 0 (#5036)."""
+
+    def set_mode(self, mode, *binaries):
+        for binary in binaries:
+            Path(str(binary) + '.mode').write_text(mode + '\n')
+
+    def test_healthy_ladder_is_asserted_green(self):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertIn('LADDER ASSERTED GREEN', done.stdout)
+
+    def test_posture_bypassed_ladder_exits_nonzero(self):
+        self.set_mode('bypass', self.default_bin, self.sqlcipher_bin)
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn('LADDER VIOLATED', done.stdout)
+        self.assertEqual(re.findall(r'^exit: (\S+)$', self.out('posture-legs-exit-codes.txt'), re.M),
+                         ['0', '0', '0', '0'])
+
+    def test_drifted_counts_exit_nonzero(self):
+        self.set_mode('drift', self.default_bin, self.sqlcipher_bin)
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn('posture-hardened-env.out PASS=19 FAIL=3', done.stdout)
+
+    def test_identical_default_and_sqlcipher_binaries_exit_nonzero(self):
+        # leg 4's exit 0 must come from a distinct sqlcipher build.
+        same = self.root / 'ai-memory-sqlcipher-copy'
+        same.write_bytes(self.default_bin.read_bytes())
+        same.chmod(0o755)
+        done, _ = self.run_recapture(sqlcipher_bin=same)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertIn('share sha256', done.stdout)
+
+    def test_evidence_is_kept_when_the_ladder_is_violated(self):
+        self.set_mode('bypass', self.default_bin, self.sqlcipher_bin)
+        self.run_recapture()
+        self.assertTrue((self.root / OUT_REL / 'posture-legs-exit-codes.txt').is_file())
+
+    def test_gate_self_test_rejects_every_mutant(self):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        gate = self.root / 'scripts' / GATE_NAME
+        scratch = self.root / 'selftest'
+        scratch.mkdir()
+        shutil.copytree(str(self.root / OUT_REL), str(scratch / 'evidence'))
+        result = subprocess.run([sys.executable, str(gate), str(scratch / 'evidence'), '--self-test'],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('6/6 mutants rejected', result.stdout)
 
 
 def load_script_module():
