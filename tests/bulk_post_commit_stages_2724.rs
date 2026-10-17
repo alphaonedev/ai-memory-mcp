@@ -21,6 +21,7 @@
 //! stages fire ONCE per DISTINCT persisted row and NEVER for a rejected /
 //! collapsed input row — the partial-failure honesty the North Star requires.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -152,6 +153,19 @@ fn db_row_count(db_path: &Path, namespace: &str) -> i64 {
             |r| r.get(0),
         )
         .expect("count")
+}
+
+/// The ids of the rows committed to `namespace` (#7395): the delivered ids
+/// must equal this set, not merely have the same count.
+fn db_committed_ids(db_path: &Path, namespace: &str) -> BTreeSet<String> {
+    let conn = Connection::open(db_path).expect("open");
+    let mut stmt = conn
+        .prepare("SELECT id FROM memories WHERE namespace = ?1")
+        .expect("prepare");
+    stmt.query_map(params![namespace], |r| r.get::<_, String>(0))
+        .expect("query ids")
+        .collect::<Result<BTreeSet<String>, _>>()
+        .expect("collect ids")
 }
 
 /// Count `AuditAction::Store` NDJSON rows in the audit log whose target
@@ -304,6 +318,12 @@ async fn bulk_dispatches_memory_store_event_per_persisted_row_2724() {
          dispatch (one correlation id) per committed row (3), never for the \
          rejected row ({seen:?}, {total_requests} requests): {v}"
     );
+    // #7395 - the delivered ids ARE the committed ids, not just as many.
+    assert_eq!(
+        id_mismatch(&seen, &db_committed_ids(&db_path, ns)),
+        None,
+        "#7395: delivered memory_ids must equal the committed set"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -384,16 +404,33 @@ struct DispatchSummary {
     rows: usize,
     /// Distinct `correlation_id`s delivered (a retry shares its id).
     correlations: usize,
+    /// The distinct `memory_id`s themselves (#7395).
+    memory_ids: BTreeSet<String>,
+}
+
+/// Describe how the delivered ids differ from the committed ids (#7395), or
+/// `None` when the two sets are equal. Never prints a body, only ids.
+fn id_mismatch(seen: &DispatchSummary, committed: &BTreeSet<String>) -> Option<String> {
+    if &seen.memory_ids == committed {
+        return None;
+    }
+    let missing: Vec<&String> = committed.difference(&seen.memory_ids).collect();
+    let foreign: Vec<&String> = seen.memory_ids.difference(committed).collect();
+    Some(format!(
+        "delivered ids differ from committed ids: committed but never delivered \
+         {missing:?}, delivered but not committed {foreign:?}"
+    ))
 }
 
 /// Reduce `(memory_id, correlation_id)` pairs to a [`DispatchSummary`].
 fn summarise_dispatches(deliveries: &[(String, String)]) -> DispatchSummary {
-    let rows: std::collections::HashSet<&str> = deliveries.iter().map(|d| d.0.as_str()).collect();
+    let rows: BTreeSet<String> = deliveries.iter().map(|d| d.0.clone()).collect();
     let correlations: std::collections::HashSet<&str> =
         deliveries.iter().map(|d| d.1.as_str()).collect();
     DispatchSummary {
         rows: rows.len(),
         correlations: correlations.len(),
+        memory_ids: rows,
     }
 }
 
@@ -431,23 +468,30 @@ async fn wait_for_dispatches(
 fn duplicate_dispatch_of_one_row_is_detected_7367() {
     let pair = |m: &str, c: &str| (m.to_owned(), c.to_owned());
     let dup = [pair("m1", "c1"), pair("m2", "c2"), pair("m2", "c3")];
+    let dup_seen = summarise_dispatches(&dup);
     assert_eq!(
-        summarise_dispatches(&dup),
-        DispatchSummary {
-            rows: 2,
-            correlations: 3
-        },
+        (dup_seen.rows, dup_seen.correlations),
+        (2, 3),
         "a duplicate dispatch of m2 must add a correlation id"
     );
     // A retry of one delivery shares its correlation id: not a duplicate.
     let retry = [pair("m1", "c1"), pair("m1", "c1")];
-    assert_eq!(
-        summarise_dispatches(&retry),
-        DispatchSummary {
-            rows: 1,
-            correlations: 1
-        }
-    );
+    let retry_seen = summarise_dispatches(&retry);
+    assert_eq!((retry_seen.rows, retry_seen.correlations), (1, 1));
+}
+
+/// #7395 - same counts, wrong ids: a foreign id plus a missing committed row
+/// keeps both counts at N and must still be reported.
+#[test]
+fn delivered_ids_must_equal_committed_ids_7395() {
+    let pair = |m: &str, c: &str| (m.to_owned(), c.to_owned());
+    let committed: BTreeSet<String> = ["m1", "m2"].iter().map(|m| (*m).to_owned()).collect();
+    let good = summarise_dispatches(&[pair("m1", "c1"), pair("m2", "c2")]);
+    assert_eq!(id_mismatch(&good, &committed), None);
+    let foreign = summarise_dispatches(&[pair("m1", "c1"), pair("m9", "c2")]);
+    assert_eq!((foreign.rows, foreign.correlations), (2, 2));
+    let why = id_mismatch(&foreign, &committed).expect("a foreign id must be reported");
+    assert!(why.contains("m9") && why.contains("m2"), "{why}");
 }
 
 /// #7320 - a slow (but within-budget) receiver delays later deliveries past
@@ -504,5 +548,11 @@ async fn bulk_dispatch_waits_for_slow_receiver_deliveries_7320() {
         (SLOW_BATCH_ROWS, SLOW_BATCH_ROWS),
         "#7320/#7367: every committed row must be dispatched exactly once to \
          a slow receiver ({seen:?}, expected {SLOW_BATCH_ROWS}): {v}"
+    );
+    // #7395 - the delivered ids ARE the committed ids, not just as many.
+    assert_eq!(
+        id_mismatch(&seen, &db_committed_ids(&db_path, ns)),
+        None,
+        "#7395: delivered memory_ids must equal the committed set"
     );
 }
