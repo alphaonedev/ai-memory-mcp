@@ -16,6 +16,8 @@
 //! whose foreign keys the per-test schema does not carry) and use a unique
 //! namespace per cell. They skip cleanly without the variable.
 
+#![cfg(feature = "sal")]
+
 use ai_memory::models::{LifecycleState, Memory, Tier};
 use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, Filter, MemoryStore, StoreError};

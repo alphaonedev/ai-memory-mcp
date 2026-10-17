@@ -19,6 +19,8 @@
 //! written by one cell at a time (the fault cell installs a trigger that
 //! would refuse another cell's audit row).
 
+#![cfg(feature = "sal")]
+
 use std::path::Path;
 
 use ai_memory::models::{Memory, Tier};
@@ -165,6 +167,9 @@ impl SqliteProbe<'_> {
     }
 }
 
+// The trait is async because the postgres probe awaits sqlx; the sqlite probe
+// is synchronous rusqlite behind the same signature.
+#[allow(clippy::unused_async_trait_impl)]
 impl AuditProbe for SqliteProbe<'_> {
     async fn link_created_count(&self) -> i64 {
         self.conn()

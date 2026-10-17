@@ -13,8 +13,10 @@
 //!
 //! The postgres cells connect to the shared test database named by
 //! `AI_MEMORY_TEST_POSTGRES_URL` (the tombstone path writes `memory_links`,
-//! whose foreign keys the per-test search_path schema does not carry) and use
+//! whose foreign keys the per-test `search_path` schema does not carry) and use
 //! a unique namespace per cell. They skip cleanly without the variable.
+
+#![cfg(feature = "sal")]
 
 use ai_memory::models::{LifecycleState, Memory, Tier};
 use ai_memory::store::sqlite::SqliteStore;

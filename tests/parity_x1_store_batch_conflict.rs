@@ -13,6 +13,8 @@
 //! The postgres cell is gated on `feature = "sal-postgres"` and skips
 //! cleanly without `AI_MEMORY_TEST_POSTGRES_URL`.
 
+#![cfg(feature = "sal")]
+
 use ai_memory::models::{Memory, Tier};
 use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, Filter, MemoryStore, StoreError};
