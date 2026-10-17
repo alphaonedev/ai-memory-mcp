@@ -7,15 +7,16 @@ text that still matches a leak pattern. The committed snapshots are checked with
 
 No internal hostname is committed here. Hosts are recognised by SHAPE (a positive rule): every
 `host:<id>` and `ai:<id>@<host>` other than the public placeholder, and every name ending in a private DNS
-suffix. On top of that the names of the machine running the producer (socket.gethostname) and the names in an
-UNTRACKED local file (one name per line, `#` comments; default `hostnames.local` next to this module, or the
-path in CF_DASHBOARD_HOSTNAMES_FILE) are scrubbed wherever they appear. A configured names file that cannot be
+suffix. On top of that the names in an UNTRACKED local file (one name per line, `#` comments; default
+`hostnames.local` next to this module, or the path in CF_DASHBOARD_HOSTNAMES_FILE) are scrubbed. Nothing
+depends on the hostname of the machine running the producer (#7592): the verdict and the output are the same
+on every machine. A listed name matches only as a whole host token (bounded by characters that cannot be part
+of a host id), so `ai-memory` is never rewritten by a listed name `ai`. A configured names file that cannot be
 read fails closed (LeakError); an unconfigured, absent default file is simply empty.
 """
 import json
 import os
 import re
-import socket
 from pathlib import Path
 
 REDACTED = "node"
@@ -67,17 +68,8 @@ def _names_from_file():
 
 
 def configured_hostnames():
-    """This machine's names first, then the names from the untracked local file (lower-cased, longest first)."""
-    own = []
-    try:
-        full = socket.gethostname().strip()
-    except OSError:
-        full = ""
-    for name in (full, full.split(".")[0]):
-        if name and name.lower() not in own:
-            own.append(name.lower())
-    rest = sorted({n.lower() for n in _names_from_file()} - set(own), key=len, reverse=True)
-    return tuple(own + rest)
+    """The names from the untracked local file (lower-cased, longest first); never the machine hostname."""
+    return tuple(sorted({n.lower() for n in _names_from_file()}, key=len, reverse=True))
 
 
 def __getattr__(name):
@@ -87,14 +79,12 @@ def __getattr__(name):
 
 
 def _name_re():
-    names = sorted(configured_hostnames(), key=len, reverse=True)
+    names = configured_hostnames()
     if not names:
         return None
-    # fail closed: a configured name is scrubbed as a substring too ("<name>2", "x<name>"); a very short name
-    # (under 4 characters) keeps word boundaries so it does not shred ordinary words
-    long_names = [re.escape(n) for n in names if len(n) >= 4]
-    short_names = [r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(n) for n in names if len(n) < 4]
-    return re.compile("|".join(long_names + short_names), re.IGNORECASE)
+    # whole host tokens only: a name inside a longer host id ("ai-memory", "mailbox") is not that host
+    return re.compile(r"(?<![A-Za-z0-9_-])(?:%s)(?![A-Za-z0-9_-])" % "|".join(re.escape(n) for n in names),
+                      re.IGNORECASE)
 
 
 def find_leaks(text):

@@ -38,7 +38,7 @@ def credential(name):
     if os.environ.get(name):
         return os.environ[name]
     try:
-        for ln in (Path.home() / ENV_FILE).read_text().splitlines():
+        for ln in (Path.home() / ENV_FILE).read_text(encoding="utf-8").splitlines():
             ln = ln.strip()
             if ln.startswith(EXPORT_PREFIX):
                 ln = ln[len(EXPORT_PREFIX):].lstrip()
@@ -47,6 +47,8 @@ def credential(name):
                 return _unquote(rest)
     except FileNotFoundError:
         return ""  # no env file is the normal case
+    except UnicodeDecodeError:
+        raise CredentialError("the home env file is not valid UTF-8")  # fixed message: no path, no bytes (#7593)
     except OSError as exc:
         # fixed message: the exception type only, never a path or a credential value
         print("warning: home env file is unreadable (%s)" % type(exc).__name__, file=sys.stderr)
