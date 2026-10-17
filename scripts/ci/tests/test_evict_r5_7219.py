@@ -37,6 +37,7 @@ OTHER = "f2-linux-fed-3"
 STARVED_GIB = 1
 IDLE_AGE_DAYS = 30
 LOCK_TEST_TIMEOUT_SECS = 0.2
+RECENT_AGE_DAYS = 2
 
 
 def make_target(root, name, age_days, files=1):
@@ -246,6 +247,20 @@ class EvictionIsSerialisedAgainstJobStart7292(JobStartHelper):
         ranking = [c for c in walk.call_args_list if c.kwargs.get("max_entries")]
         self.assertEqual(ranking, [], "siblings were ranked after the lock timeout")
 
+    def test_floor_pass_lock_timeout_takes_the_skip_path_7295(self):
+        # #7295 floor-pass path: only a recent sibling (the idle pass never takes
+        # the lock), a starved floor and a lock held by another holder.
+        shutil.rmtree(self.idle)
+        recent = make_target(self.root, "f2-linux-fed-4", RECENT_AGE_DAYS)
+        with shared.evict_lock(self.root, 1.0) as held:
+            self.assertTrue(held)
+            rc, out, err = self.evict(lock_timeout=LOCK_TEST_TIMEOUT_SECS)
+        self.assertEqual(rc, prune.EXIT_OK)
+        self.assertTrue(recent.exists())
+        self.assertIn("skipping eviction:", err)
+        self.assertNotIn("::warning::", out, "the floor warning blamed the wrong cause")
+        self.assertIn("eviction skipped: lock not taken", out)
+
     def test_job_start_never_fails_or_deadlocks_on_the_lock(self):
         with shared.evict_lock(self.root, 1.0) as held:
             self.assertTrue(held)
@@ -345,14 +360,27 @@ class BoundedLockHold7294(Fixture):
         self.assertIn("skipped busy %s" % self.idle, out)
 
     def test_the_marker_is_checked_again_right_before_the_rename(self):
-        calls = []
+        # A marker appears only once the strict busy walk has returned. A check
+        # placed before the walk (a redundant repeat of is_busy's own look)
+        # cannot see it, so only the check right before the rename keeps the
+        # target alive.
+        sequence = []
+        real_walk = prune.newest_mtime
 
-        def fresh_on_the_second_look(_path, _now, *args, **kwargs):
-            calls.append(True)
-            return len(calls) > 1
+        def recording_walk(*args, **kwargs):
+            result = real_walk(*args, **kwargs)
+            if kwargs.get("strict"):
+                sequence.append("walk")
+            return result
 
-        with mock.patch.object(shared, "marker_is_fresh", side_effect=fresh_on_the_second_look):
+        def marker_after_the_walk(_path, _now, *args, **kwargs):
+            sequence.append("marker")
+            return "walk" in sequence
+
+        with mock.patch.object(prune, "newest_mtime", side_effect=recording_walk), \
+                mock.patch.object(shared, "marker_is_fresh", side_effect=marker_after_the_walk):
             _, out, _ = self.evict()
+        self.assertEqual(sequence[-2:], ["walk", "marker"], "the re-check must follow the walk")
         self.assertTrue(self.idle.exists(), "a marker written after the walk was ignored")
         self.assertIn("skipped busy %s" % self.idle, out)
 
