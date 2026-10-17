@@ -2,7 +2,7 @@
 import importlib.util
 import io
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -38,6 +38,33 @@ class MarginTests(unittest.TestCase):
 
     def test_zero_budget_never_fails(self):
         self.assertEqual(run("--label", "s", "--elapsed", "5", "--budget", "0"), (0, ""))
+
+    def test_hostile_label_cannot_inject_a_workflow_command_7350(self):
+        # GitHub escaping for workflow-command data: % -> %25, CR -> %0D, LF -> %0A.
+        hostile = "x\n::error::injected\r::set-output name=a::b 100%"
+        rc, out = run("--label", hostile, "--elapsed", "95", "--budget", "100",
+                      "--tier", "t\n::error::t", "--node", "n\r\n::error::n")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.count("\n"), 1, repr(out))  # exactly one line: the trailing newline only
+        self.assertNotIn("\r", out)
+        self.assertTrue(out.startswith("::warning::[#7343]"))
+        self.assertIn("x%0A::error::injected%0D::set-output name=a::b 100%25", out)
+        self.assertIn("tier=t%0A::error::t", out)
+        self.assertIn("node=n%0D%0A::error::n", out)
+
+    def test_percent_is_escaped_first_7350(self):
+        self.assertEqual(wm.escape_data("%0A\n"), "%250A%0A")
+
+    def test_bad_argument_exits_2_and_zero_budget_is_silent_7351(self):
+        # the docstring states exactly this: argparse usage errors exit 2 (the workflow ignores them
+        # with `|| true`); a zero or negative budget prints nothing and exits 0
+        with self.assertRaises(SystemExit) as cm, redirect_stderr(io.StringIO()):
+            wm.main(["--label", "s", "--elapsed", "oops", "--budget", "100"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertEqual(run("--label", "s", "--elapsed", "5", "--budget", "-3"), (0, ""))
+        doc = wm.__doc__
+        self.assertIn("Exit 2", doc)
+        self.assertNotIn("prints a notice and exits", doc)
 
     def test_threshold_is_configurable(self):
         rc, out = run("--label", "s", "--elapsed", "60", "--budget", "100", "--threshold", "50")
