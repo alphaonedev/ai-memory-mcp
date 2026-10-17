@@ -50,6 +50,17 @@ const EMPTY_ALLOWLIST: &str = "{}";
 const BOOT_DEADLINE: Duration = Duration::from_secs(45);
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Once the daemon logs that its TLS listener is bound, a health 200 is
+/// near-immediate (#7341).
+const POST_LISTEN_BUDGET: Duration = Duration::from_secs(10);
+/// The stderr line the daemon writes when the TLS listener is bound
+/// (`src/daemon_runtime.rs`).
+const LISTEN_SIGNAL: &str = "ai-memory listening on https://";
+/// Same env knob, clamp and default as `tests/integration.rs`
+/// `health_probe_attempts` (#3615).
+const BUDGET_MULT_ENV: &str = "AI_MEMORY_TEST_TIMING_BUDGET_MULT";
+const BUDGET_MULT_MAX: u32 = 100;
+
 fn command(root: &Path) -> Command {
     command_with_config(root, None)
 }
@@ -168,30 +179,63 @@ fn health_url(port: u16) -> String {
     format!("{}/api/v1/health", TestTls::base_url(port))
 }
 
+/// Boot-wait budgets (#7341). RED STUBS: the fixed-budget behaviour of the
+/// base commit, so the new tests below fail for the right reason.
+struct BootBudget {
+    before_listen: Duration,
+    after_listen: Duration,
+}
+
+fn scaled_boot_budget(base: Duration, _raw_mult: Option<&str>) -> Duration {
+    base
+}
+
+fn try_wait_healthy(
+    spawned: &mut Spawned,
+    mut probe: impl FnMut() -> bool,
+    budget: &BootBudget,
+) -> Result<(), String> {
+    let deadline = Instant::now() + budget.before_listen;
+    loop {
+        if probe() {
+            return Ok(());
+        }
+        if let Some(status) = spawned.exited() {
+            return Err(format!(
+                "serve exited ({status}) before /health answered over TLS; stderr:\n{}",
+                spawned.captured()
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "serve never answered /health over TLS within {:?}; stderr:\n{}",
+                budget.before_listen,
+                spawned.captured()
+            ));
+        }
+        std::thread::sleep(PROBE_INTERVAL);
+    }
+}
+
 /// Wait until `client` sees a 200 from the TLS health route, or the child
 /// exits (returning its stderr as the error).
 fn wait_healthy(spawned: &mut Spawned, client: &reqwest::blocking::Client, port: u16) {
-    let deadline = Instant::now() + BOOT_DEADLINE;
-    loop {
-        if client
-            .get(health_url(port))
-            .send()
-            .is_ok_and(|r| r.status().is_success())
-        {
-            return;
-        }
-        if let Some(status) = spawned.exited() {
-            panic!(
-                "serve exited ({status}) before /health answered over TLS; stderr:\n{}",
-                spawned.captured()
-            );
-        }
-        assert!(
-            Instant::now() < deadline,
-            "serve never answered /health over TLS within {BOOT_DEADLINE:?}; stderr:\n{}",
-            spawned.captured()
-        );
-        std::thread::sleep(PROBE_INTERVAL);
+    let budget = BootBudget {
+        before_listen: BOOT_DEADLINE,
+        after_listen: POST_LISTEN_BUDGET,
+    };
+    let url = health_url(port);
+    if let Err(why) = try_wait_healthy(
+        spawned,
+        || {
+            client
+                .get(&url)
+                .send()
+                .is_ok_and(|r| r.status().is_success())
+        },
+        &budget,
+    ) {
+        panic!("{why}");
     }
 }
 
@@ -688,4 +732,70 @@ fn doctor_reports_transit_encryption_section_3705() {
             panic!("doctor section {SECTION_TRANSIT:?} absent (#3705); present: {names:?}")
         });
     assert!(section["facts"].is_array(), "{section}");
+}
+
+// ---------------------------------------------------------------------------
+// #7341 — the readiness wait is not a fixed wall-clock number
+// ---------------------------------------------------------------------------
+
+/// The budget shape mirrors `tests/integration.rs` (#3615): default 1x, a
+/// valid multiplier scales, anything outside 1..=100 or unparsable is 1x.
+#[test]
+fn boot_budget_scales_with_the_timing_multiplier_7341() {
+    let base = Duration::from_secs(7);
+    assert_eq!(scaled_boot_budget(base, None), base);
+    assert_eq!(scaled_boot_budget(base, Some("1")), base);
+    assert_eq!(scaled_boot_budget(base, Some("3")), base * 3);
+    assert_eq!(scaled_boot_budget(base, Some("100")), base * 100);
+    for bad in ["0", "101", "-2", "abc", ""] {
+        assert_eq!(scaled_boot_budget(base, Some(bad)), base, "raw {bad:?}");
+    }
+}
+
+/// A child that dies at once is reported at once, with its status and
+/// stderr, never after the budget.
+#[test]
+fn dead_child_is_reported_immediately_7341() {
+    let root = tempfile::tempdir().unwrap();
+    let mut cmd = command(root.path());
+    cmd.arg("--definitely-not-a-flag-7341");
+    let mut spawned = Spawned::spawn(cmd);
+    let budget = BootBudget {
+        before_listen: Duration::from_secs(60),
+        after_listen: Duration::from_secs(60),
+    };
+    let started = Instant::now();
+    let outcome = try_wait_healthy(&mut spawned, || false, &budget);
+    let elapsed = started.elapsed();
+    let why = outcome.expect_err("a dead child must be an error");
+    assert!(why.contains("serve exited"), "{why}");
+    assert!(
+        elapsed < Duration::from_secs(20),
+        "dead child took {elapsed:?}, budget was 60s"
+    );
+}
+
+/// After the listen line the short post-listen budget applies, not the
+/// long pre-listen one.
+#[cfg(unix)]
+#[test]
+fn listen_signal_switches_to_the_short_budget_7341() {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(format!(
+        "echo '{LISTEN_SIGNAL}127.0.0.1:1' >&2; exec sleep 60"
+    ));
+    let mut spawned = Spawned::spawn(cmd);
+    let budget = BootBudget {
+        before_listen: Duration::from_secs(8),
+        after_listen: Duration::from_millis(500),
+    };
+    let started = Instant::now();
+    let why = try_wait_healthy(&mut spawned, || false, &budget)
+        .expect_err("a listener that never answers must fail");
+    assert!(why.contains("listening"), "{why}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "post-listen budget ignored: {:?}",
+        started.elapsed()
+    );
 }
