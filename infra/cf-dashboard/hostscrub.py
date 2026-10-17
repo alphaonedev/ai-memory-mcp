@@ -1,17 +1,27 @@
-"""Scrub internal node names and local paths out of anything published on the public dashboard (#7518).
+"""Scrub internal node names and local paths out of anything published on the public dashboard (#7518, #7547).
 
 Everything under infra/cf-dashboard/public/ is deployed to a public site. The state producers
 (scripts/evidence/mcp-tools-state.py, push-state.py) call `dump_clean`, which replaces internal
 hostnames and home / mount / scratch paths with fixed tokens and then REFUSES (LeakError) to hand back
 text that still matches a leak pattern. The committed snapshots are checked with `find_leaks`.
+
+No internal hostname is committed here. Hosts are recognised by SHAPE (a positive rule): every
+`host:<id>` and `ai:<id>@<host>` other than the public placeholder, and every name ending in a private DNS
+suffix. On top of that the names of the machine running the producer (socket.gethostname) and the names in an
+UNTRACKED local file (one name per line, `#` comments; default `hostnames.local` next to this module, or the
+path in CF_DASHBOARD_HOSTNAMES_FILE) are scrubbed wherever they appear. A configured names file that cannot be
+read fails closed (LeakError); an unconfigured, absent default file is simply empty.
 """
 import json
+import os
 import re
+import socket
+from pathlib import Path
 
-# built from parts so this source file does not itself contain the names it removes from the public pages
-INTERNAL_HOSTNAMES = ("pop" + "-os", "FROSTY" + "i")
 REDACTED = "node"
 REDACTED_PATH = "<redacted-path>"
+NAMES_ENV = "CF_DASHBOARD_HOSTNAMES_FILE"
+DEFAULT_NAMES_FILE = Path(__file__).resolve().parent / "hostnames.local"
 
 _PATH_TAIL = r"""[^\s"'\\,;)\]}]*"""
 _PATH_PATTERNS = (
@@ -21,23 +31,90 @@ _PATH_PATTERNS = (
 )
 _PATH_RE = re.compile("|".join(_PATH_PATTERNS))
 
+_HOST_ID = r"[A-Za-z0-9](?:[A-Za-z0-9_-]|\.(?=[A-Za-z0-9]))*"
+_NOT_PLACEHOLDER = r"(?!%s(?![A-Za-z0-9_-]))" % REDACTED
+# host:<id> where <id> is not the public placeholder
+_HOST_SHAPE_RE = re.compile(r"(?<![A-Za-z0-9])(host:)" + _NOT_PLACEHOLDER + _HOST_ID, re.IGNORECASE)
+# ai:<agent>@<host> where <host> starts with a letter (so "@256" style text is untouched) and is not the placeholder
+_AGENT_SHAPE_RE = re.compile(r"(?<![A-Za-z0-9])(ai:[A-Za-z0-9._-]+@)" + _NOT_PLACEHOLDER + r"[A-Za-z]" +
+                             r"(?:[A-Za-z0-9_-]|\.(?=[A-Za-z0-9]))*", re.IGNORECASE)
+# a private-DNS-suffixed name
+_DNS_RE = re.compile(r"(?<![A-Za-z0-9.-])[A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)*\."
+                     r"(?:local|lan|internal|home\.arpa|corp|localdomain|intranet)(?![A-Za-z0-9_-])", re.IGNORECASE)
 
-def _hostnames():
-    return sorted({n.lower() for n in INTERNAL_HOSTNAMES}, key=len, reverse=True)
+
+class LeakError(ValueError):
+    """Scrubbed output still names an internal host or path, or the names list could not be read; nothing may be written."""
 
 
-def _host_re():
-    return re.compile(r"(?<![A-Za-z0-9])(?:%s)(?![A-Za-z0-9])" % "|".join(re.escape(n) for n in _hostnames()),
-                      re.IGNORECASE)
+def _names_from_file():
+    configured = os.environ.get(NAMES_ENV)
+    path = Path(configured) if configured else DEFAULT_NAMES_FILE
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if configured:
+            raise LeakError("the configured hostnames file is missing")
+        return []
+    except (OSError, UnicodeError):
+        raise LeakError("the hostnames file cannot be read")
+    names = []
+    for line in raw.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            names.append(line)
+    return names
+
+
+def configured_hostnames():
+    """This machine's names first, then the names from the untracked local file (lower-cased, longest first)."""
+    own = []
+    try:
+        full = socket.gethostname().strip()
+    except OSError:
+        full = ""
+    for name in (full, full.split(".")[0]):
+        if name and name.lower() not in own:
+            own.append(name.lower())
+    rest = sorted({n.lower() for n in _names_from_file()} - set(own), key=len, reverse=True)
+    return tuple(own + rest)
+
+
+def __getattr__(name):
+    if name == "INTERNAL_HOSTNAMES":
+        return configured_hostnames()
+    raise AttributeError(name)
+
+
+def _name_re():
+    names = sorted(configured_hostnames(), key=len, reverse=True)
+    if not names:
+        return None
+    # fail closed: a configured name is scrubbed as a substring too ("<name>2", "x<name>"); a very short name
+    # (under 4 characters) keeps word boundaries so it does not shred ordinary words
+    long_names = [re.escape(n) for n in names if len(n) >= 4]
+    short_names = [r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])" % re.escape(n) for n in names if len(n) < 4]
+    return re.compile("|".join(long_names + short_names), re.IGNORECASE)
 
 
 def find_leaks(text):
     """Every internal hostname or local path left in `text` (an empty list means clean)."""
-    return [m.group(0) for m in _host_re().finditer(text)] + [m.group(0) for m in _PATH_RE.finditer(text)]
+    found = [m.group(0) for m in _HOST_SHAPE_RE.finditer(text)]
+    found += [m.group(0) for m in _AGENT_SHAPE_RE.finditer(text)]
+    found += [m.group(0) for m in _DNS_RE.finditer(text)]
+    name_re = _name_re()
+    if name_re is not None:
+        found += [m.group(0) for m in name_re.finditer(text)]
+    return found + [m.group(0) for m in _PATH_RE.finditer(text)]
 
 
 def scrub_text(text):
-    return _host_re().sub(REDACTED, _PATH_RE.sub(REDACTED_PATH, text))
+    text = _PATH_RE.sub(REDACTED_PATH, text)
+    text = _HOST_SHAPE_RE.sub(lambda m: m.group(1) + REDACTED, text)
+    text = _AGENT_SHAPE_RE.sub(lambda m: m.group(1) + REDACTED, text)
+    text = _DNS_RE.sub(REDACTED, text)
+    name_re = _name_re()
+    return name_re.sub(REDACTED, text) if name_re is not None else text
 
 
 def scrub(obj):
@@ -49,10 +126,6 @@ def scrub(obj):
     if isinstance(obj, dict):
         return {scrub_text(k) if isinstance(k, str) else k: scrub(v) for k, v in obj.items()}
     return obj
-
-
-class LeakError(ValueError):
-    """Scrubbed output still names an internal host or path; nothing may be written."""
 
 
 def dump_clean(obj, **dumps_kwargs):
