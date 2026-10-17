@@ -3,8 +3,8 @@
 
 Subcommands (every one asserts the worktree HEAD == --tip and a clean tracked tree first):
   battery    release builds (default; --no-default-features sqlcipher,sal), posture recapture (4 legs),
-             8 named integration bins + 3 lib slices (default features), each via cargo-slot.sh
-  pg         #4434 coverage leg under --features sal-postgres (1 bin + 1 lib slice), via cargo-slot.sh
+             8 named integration bins + 3 lib slices (default features), each via cargo-slot.py
+  pg         #4434 coverage leg under --features sal-postgres (1 bin + 1 lib slice), via cargo-slot.py
   removal    scripts/check-cert-removal-proof.sh BARE under flock slot-3, nice 15, ionice -c3, CARGO_BUILD_JOBS=2;
              writes cert-alone.out; then --force-restore and a dirty check
   bootstrap  scripts/check-bootstrap-cert-gate.sh self-build path under the same flock slot
@@ -23,7 +23,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-CARGO_SLOT = "/ai-scratch/deputy/cargo-slot.sh"
+CARGO_SLOT = "/ai-scratch/deputy/cargo-slot.py"
 SLOT3_LOCK = "/ai-scratch/deputy/cargo-slot-3.lock"
 TMPDIR = "/mnt/t9/tmp/f2h"
 TARGETS = Path("/ai-scratch/f2h/targets")
@@ -268,17 +268,19 @@ class Run:
         return self.bad
 
     # ---- cert-commit gates --------------------------------------------------------------------------------
-    def gates(self, prior_bind, push_branch):
+    def gates(self, prior_bind, push_branch, parent="", also_evidence=()):
         head = self.git("rev-parse", "HEAD")
         if self.dirty_tracked():
             self.fail("GATES DIRTY")
             return self.bad
-        if self.git("rev-parse", "HEAD^") != self.tip:
-            self.fail(f"GATES: HEAD^ is not the tip (the cert commit must be the ONE commit on {self.tip})")
+        parent = parent or self.tip
+        if self.git("rev-parse", "HEAD^") != parent:
+            self.fail(f"GATES: HEAD^ is not {parent} (the gated commit must be the ONE commit on it)")
         short = self.tip[:9]
-        allowed = (CERT_DOC, f"docs/compliance/evidence/cert-{short}/")
-        touched = self.git("diff", "--name-only", "--no-renames", f"{self.tip}..HEAD").splitlines()
-        stray = [p for p in touched if not (p == CERT_DOC or p.startswith(allowed[1]))]
+        dirs = tuple(f"docs/compliance/evidence/cert-{s}/" for s in (short, *also_evidence))
+        touched = self.git("diff", "--name-only", "--no-renames", f"{parent}..HEAD").splitlines()
+        stray = [p for p in touched if not (p == CERT_DOC or p.startswith(dirs))]
+        self.note(f"SCOPE allowed={[CERT_DOC, *dirs]}")
         self.note(f"SCOPE touched={len(touched)} stray={stray}")
         if stray or CERT_DOC not in touched:
             self.fail("  RED scope: the cert commit may touch only the cert doc and its own evidence dir")
@@ -295,7 +297,7 @@ class Run:
             ("vendor", ["bash", "scripts/check-vendor-literals.sh"], {}),
             ("c8", ["bash", "scripts/qc-codegraph-precheck.sh"], {}),
             ("envlock", ["bash", "scripts/check-test-env-lock.sh"], {}),
-            ("count", ["bash", "scripts/check-count-assertion-declared.sh", "--range", f"{self.tip}..HEAD"], {}),
+            ("count", ["bash", "scripts/check-count-assertion-declared.sh", "--range", f"{parent}..HEAD"], {}),
             ("ftc", ["bash", "scripts/check-foreign-text-to-caller.sh"], {}),
         ]
         for name, argv, extra in checks:
@@ -326,13 +328,20 @@ def main():
     ap.add_argument("--outd", required=True)
     ap.add_argument("--prior-bind", default="385da3a054c4f82bcdfd51ec2d8f07ca4947f9a5")
     ap.add_argument("--push-branch", default="", help="gates only: branch to push when fails == 0")
+    ap.add_argument("--parent", default="", help="gates only: expected HEAD^ for a follow-up on the cert commit (default: --tip)")
+    ap.add_argument("--also-evidence", action="append", default=[], metavar="SHORT9",
+                    help="gates only: an earlier cert's 9-hex evidence-dir id the commit may also touch (repeatable)")
     a = ap.parse_args()
     if not re.fullmatch(r"[0-9a-f]{40}", a.tip):
         print("--tip must be a full 40-hex sha", file=sys.stderr)
         return 64
     r = Run(a)
     if a.leg == "gates":
-        rc = r.gates(a.prior_bind, a.push_branch)
+        bad_ids = [s for s in a.also_evidence if not re.fullmatch(r"[0-9a-f]{9}", s)]
+        if bad_ids:
+            print(f"--also-evidence must be 9-hex ids: {bad_ids}", file=sys.stderr)
+            return 64
+        rc = r.gates(a.prior_bind, a.push_branch, a.parent, tuple(a.also_evidence))
     else:
         rc = getattr(r, a.leg)()
     r.note(f"EXIT={1 if rc else 0} leg={a.leg} aggregate_failures={rc} {r.now()}")

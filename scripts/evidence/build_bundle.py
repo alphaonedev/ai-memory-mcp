@@ -45,6 +45,24 @@ class Fatal(Exception):
     pass
 
 
+def manifest_text(files):
+    """MANIFEST.sha256 body for {name: bytes}; refuses a case-colliding name set (#5037).
+
+    Refusal rationale: f1-macos-fed, the node that must verify these bundles, has a case-insensitive filesystem by
+    default. A bundle holding two names that differ only in case cannot be faithfully extracted there: one entry
+    silently overwrites the other, so the MANIFEST would describe a file set that cannot exist on that node. An
+    instrument whose output is attested must refuse to produce such a bundle.
+    The sort key is also made total, (n.lower(), n), so ordering never depends on insertion order.
+    """
+    seen = {}
+    for n in files:
+        seen.setdefault(n.lower(), []).append(n)
+    clashes = sorted(sorted(v) for v in seen.values() if len(v) > 1)
+    if clashes:
+        raise Fatal(f"case-colliding bundle names (cannot be extracted on a case-insensitive filesystem): {clashes}")
+    return "".join(f"{hashlib.sha256(files[n]).hexdigest()}  {n}\n" for n in sorted(files, key=lambda n: (n.lower(), n)))
+
+
 def git(wt, *args):
     r = subprocess.run(["git", *args], cwd=wt, capture_output=True, text=True)
     if r.returncode != 0:
@@ -196,11 +214,11 @@ def main():
         if leaks:
             raise Fatal("leak scan found host paths/names:\n  " + "\n  ".join(leaks))
 
+        manifest = manifest_text(files)  # before any write: a collision must leave no partial bundle dir
         dest.mkdir(parents=True)
         for name, data in files.items():
             (dest / name).write_bytes(data)
             (dest / name).chmod(0o755 if name.endswith(".sh") else 0o644)
-        manifest = "".join(f"{hashlib.sha256(files[n]).hexdigest()}  {n}\n" for n in sorted(files, key=str.lower))
         (dest / "MANIFEST.sha256").write_text(manifest)
         (dest / "MANIFEST.sha256").chmod(0o644)
 
