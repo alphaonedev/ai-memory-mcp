@@ -38,9 +38,12 @@ print(json.dumps({"as": resource.getrlimit(resource.RLIMIT_AS), "fsize": resourc
                   "lowered": lowered}))
 ''' % LOWERED_HARD_DIVISOR
 PROBE = '''
-import resource, sys
+import importlib.util, resource, sys
+spec = importlib.util.spec_from_file_location("compare_7336", sys.argv[1])
+compare = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(compare)
 try:
-    resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))
+    resource.setrlimit(resource.RLIMIT_AS, (compare.MAX_GIT_MEMORY_BYTES, compare.MAX_GIT_MEMORY_BYTES))
 except ValueError:
     sys.exit(3)
 '''
@@ -54,7 +57,7 @@ def run_child(program, *args):
 
 def kernel_lowers_rlimit_as():
     """True where the kernel lets a process lower RLIMIT_AS (Linux); False on macOS."""
-    return run_child(PROBE).returncode == 0
+    return run_child(PROBE, str(SCRIPT)).returncode == 0
 
 
 class GitLimitsTests(unittest.TestCase):
@@ -63,7 +66,7 @@ class GitLimitsTests(unittest.TestCase):
     def limits(self, mode):
         result = run_child(CHILD, str(SCRIPT), mode)
         if result.returncode == 3:
-            self.skipTest('kernel refuses to lower RLIMIT_AS')
+            self.skipTest('kernel refuses to lower RLIMIT_AS to MAX_GIT_MEMORY_BYTES')
         self.assertEqual(result.returncode, 0, result.stderr[-400:])
         return json.loads(result.stdout)
 
@@ -76,9 +79,9 @@ class GitLimitsTests(unittest.TestCase):
 
     def test_address_space_limit_applied_where_the_kernel_allows_it(self):
         if not kernel_lowers_rlimit_as():
-            self.skipTest('kernel refuses to lower RLIMIT_AS (macOS)')
+            self.skipTest('kernel refuses to lower RLIMIT_AS to MAX_GIT_MEMORY_BYTES')
         report = self.limits('plain')
-        self.assertEqual(report['as'][0], report['want_as'])
+        self.assertEqual(report['as'], [report['want_as'], report['want_as']])  # soft AND hard
 
     def test_requested_limit_is_clamped_to_a_lower_hard_limit(self):
         report = self.limits('lower')
