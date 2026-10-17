@@ -171,6 +171,75 @@ fn sqlite_store_with_genesis_still_emits_identified_watermark_7228() {
     }
 }
 
+/// A text value in the genesis row's BLOB `payload_hash` column: SQLite stores
+/// it as-is, and the genesis read then fails to decode it (a read ERROR, as
+/// opposed to an absent row).
+const UNREADABLE_GENESIS_HASH: &str = "not-a-blob";
+
+/// #7238 / #7239 - a genesis READ ERROR at an emission-due append fails the
+/// append closed on sqlite exactly as it does on postgres, and never anchors a
+/// db_id-less watermark. Parity decision: propagate (fail closed) over WARN and
+/// skip, because an unreadable genesis means the chain's identity cannot be
+/// proven and the postgres transaction is already aborted by the same error.
+#[test]
+fn sqlite_genesis_read_error_fails_the_append_closed_7239() {
+    let _g = CELL_LOCK.blocking_lock();
+    let fdir = fresh_dir("sqlite-readerr-sink");
+    let ddir = fresh_dir("sqlite-readerr-db");
+    forensic::init(fdir.path(), None).expect("forensic init");
+    let conn = open_db(ddir.path());
+    drive_sqlite(&conn, ROWS_BEFORE_GENESIS_REMOVAL);
+    conn.execute(
+        "UPDATE signed_events SET payload_hash = ?1 WHERE sequence = ?2",
+        rusqlite::params![UNREADABLE_GENESIS_HASH, GENESIS_SEQUENCE],
+    )
+    .expect("corrupt genesis payload_hash");
+    assert!(
+        genesis_db_id(&conn).is_err(),
+        "the corrupted genesis must produce a read ERROR, not an absent row"
+    );
+    let limit = target_head() + 1;
+    let mut failed_at = None;
+    let mut n = 0;
+    while head(&conn) < limit {
+        n += 1;
+        let head_before = head(&conn);
+        let ev = SignedEvent {
+            id: uuid::Uuid::new_v4().to_string(),
+            agent_id: "alice".to_string(),
+            event_type: "memory_link.created".to_string(),
+            payload_hash: payload_hash(format!("read-error-{n}").as_bytes()),
+            signature: None,
+            attest_level: "unsigned".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            ..SignedEvent::default()
+        };
+        if append_signed_event(&conn, &ev).is_err() {
+            failed_at = Some(head_before);
+            break;
+        }
+    }
+    HIGH_WATER.fetch_max(head(&conn), Ordering::SeqCst);
+    forensic::shutdown();
+    let failed_at = failed_at.expect(
+        "an emission-due append with an unreadable genesis must fail closed, as postgres does",
+    );
+    assert_eq!(
+        head(&conn),
+        failed_at,
+        "the failed append must roll back and leave the chain head unchanged"
+    );
+    assert!(
+        forensic::watermark_emission_due(failed_at + 1),
+        "the append must fail AT the emission-due sequence (the genesis read), not earlier"
+    );
+    let rows = watermark_payloads(fdir.path());
+    assert!(
+        rows.is_empty(),
+        "no watermark may be anchored on a genesis read error; got {rows:?}"
+    );
+}
+
 #[cfg(feature = "sal-postgres")]
 #[path = "common/pg_barrier.rs"]
 mod pg_barrier;
@@ -238,6 +307,60 @@ mod postgres_twin {
         assert!(
             rows.is_empty(),
             "a genesis-less pg store must not emit an unattributable watermark; got {rows:?}"
+        );
+    }
+
+    /// #7238 / #7239 - the postgres half of the genesis-read-error parity pin:
+    /// the same scenario as the sqlite cell, the same outcome (the append at
+    /// the emission-due sequence fails closed and anchors nothing). The genesis
+    /// `payload_hash` is set NULL so the read fails to decode.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+    async fn pg_genesis_read_error_fails_the_append_closed_7239() {
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let _g = CELL_LOCK.lock().await;
+        let (_scratch, pg) = scratch_store(&url).await;
+        let fdir = fresh_dir("pg-readerr-sink");
+        forensic::init(fdir.path(), None).expect("forensic init");
+        drive_pg(&pg, ROWS_BEFORE_GENESIS_REMOVAL).await;
+        sqlx::query("ALTER TABLE signed_events ALTER COLUMN payload_hash DROP NOT NULL")
+            .execute(pg.pool())
+            .await
+            .expect("relax payload_hash");
+        sqlx::query("UPDATE signed_events SET payload_hash = NULL WHERE sequence = $1")
+            .bind(GENESIS_SEQUENCE)
+            .execute(pg.pool())
+            .await
+            .expect("corrupt genesis payload_hash");
+        let limit = target_head() + 1;
+        let mut failed_at = None;
+        let mut n = 0;
+        while pg_head(&pg).await < limit {
+            n += 1;
+            let head_before = pg_head(&pg).await;
+            pg.emit_spawn_audit(&format!("read-error-{n}"), "7239-watermark")
+                .await;
+            if pg_head(&pg).await == head_before {
+                failed_at = Some(head_before);
+                break;
+            }
+        }
+        HIGH_WATER.fetch_max(pg_head(&pg).await, Ordering::SeqCst);
+        forensic::shutdown();
+        let failed_at = failed_at.expect(
+            "an emission-due append with an unreadable genesis must fail closed on postgres",
+        );
+        assert!(
+            forensic::watermark_emission_due(failed_at + 1),
+            "the append must fail AT the emission-due sequence (the genesis read), not earlier"
+        );
+        let rows = watermark_payloads(fdir.path());
+        assert!(
+            rows.is_empty(),
+            "no watermark may be anchored on a genesis read error; got {rows:?}"
         );
     }
 
