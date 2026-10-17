@@ -122,7 +122,7 @@ class MissingWrapper7420(ScratchCase):
         self.assertIn("no-such-wrapper", output)  # actionable: names the wrapper that could not start
         text = (outd / "legs.log").read_text()
         self.assertIn("  RED ", text)
-        self.assertIn("EXIT=1 leg=chain", text)
+        self.assertIn("EXIT=64 leg=chain", text)  # #7490
         self.assertIn(f"CONFIG cargo_slot={missing}", text)  # #7413: the wrapper actually used is recorded
         bb = load("build_bundle")
         with self.assertRaises(bb.Fatal):

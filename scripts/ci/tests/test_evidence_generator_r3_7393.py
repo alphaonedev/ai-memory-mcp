@@ -26,7 +26,7 @@ from pathlib import Path
 from unittest import mock
 
 from test_evidence_generator_5040_5042 import CHAIN_SECTION, EVIDENCE, TIP, ScratchCase, load
-from test_evidence_generator_r2_7393 import EXPIRY_PY, EXPIRY_SH, GIT, TMP, make_repo
+from test_evidence_generator_r2_7393 import EXPIRY_PY, EXPIRY_SH, GIT, make_repo
 
 CONFIG = ("CONFIG cargo_slot=none slot_lock=none targets=/data/cert-t tmpdir=/data/cert-d outd=/data/cert-o "
           "sources=cargo_slot:default,slot_lock:default,targets:arg,tmpdir:arg,outd:arg")
@@ -239,11 +239,13 @@ class OutdAndConfig7440(ScratchCase):
 
     def test_outd_on_a_tmp_root_is_refused_and_nothing_is_written_7440(self):
         rc = load("run_cert")
-        for bad in (TMP + "/r3-outd", "/var" + TMP + "/r3-outd", "/private" + TMP + "/r3-outd"):
-            with self.subTest(path=bad):
-                with self.assertRaises(rc.ConfigError):
-                    rc.Run(self.ns(outd=bad))
-                self.assertFalse(Path(bad).exists())
+        fake = self.dir / "faketmp"  # #7492: a fake tmp root inside the scratch dir, never a real one
+        with mock.patch.object(rc, "TMP_ROOTS", (str(fake),)):
+            for bad in (fake / "r3-outd", fake / "deeper" / "r3-outd"):
+                with self.subTest(path=str(bad)):
+                    with self.assertRaises(rc.ConfigError):
+                        rc.Run(self.ns(outd=str(bad)))
+                    self.assertFalse(bad.exists())
 
     def test_outd_on_a_tmpfs_mount_is_refused_7440(self):
         rc = load("run_cert")
@@ -253,11 +255,13 @@ class OutdAndConfig7440(ScratchCase):
 
     def test_main_exits_64_for_a_tmp_outd_7440(self):
         rc = load("run_cert")
-        argv = ["run_cert.py", "chain", "--tip", TIP, "--wt", str(self.dir), "--outd", TMP + "/r3-outd-main",
+        fake = self.dir / "faketmp"
+        argv = ["run_cert.py", "chain", "--tip", TIP, "--wt", str(self.dir), "--outd", str(fake / "r3-outd-main"),
                 "--targets", str(self.dir / "t"), "--tmpdir", str(self.dir / "tmp")]
-        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stderr(io.StringIO()):
+        with mock.patch.object(rc, "TMP_ROOTS", (str(fake),)), mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(rc.main(), 64)
-        self.assertFalse(Path(TMP + "/r3-outd-main").exists())
+        self.assertFalse((fake / "r3-outd-main").exists())
 
 
 class Preflight7441(ScratchCase):
@@ -340,7 +344,7 @@ class Preflight7441(ScratchCase):
         self.assertIn("no-such-wrapper", err.getvalue())
         text = (outd / "legs.log").read_text()
         self.assertIn("  RED preflight", text)
-        self.assertIn("EXIT=1 leg=chain", text)
+        self.assertIn("EXIT=64 leg=chain", text)  # #7490: the row records the exit code the process returns
         self.assertNotIn("\n== ", text)  # no leg started
         bb = load("build_bundle")
         with self.assertRaises(bb.Fatal):

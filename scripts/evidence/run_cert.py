@@ -15,9 +15,10 @@ Subcommands (every one asserts the worktree HEAD == --tip and a clean tracked tr
 Every outcome is a line in OUTD/legs.log (the gates leg: OUTD/gates.log, #5042); each invocation starts with a CONFIG
 row (the paths used and where each came from) and a PLAN row (the legs it promises) and ends with an EXIT row, so a
 killed invocation is visible to build_bundle.check_run (#7437). Exit status: 0 = every leg green, 1 = a leg failed,
-exit 64 = a refused configuration (a bad option, a path under a tmp root or on a tmpfs, a missing wrapper, flock or
-timeout: a RED preflight row and an EXIT row are written and no leg starts), 127 = a leg command that could not
-start (a RED launch row). Paths default to the checkout (.local-runs/); see the --cargo-slot/--slot-lock/--targets/--tmpdir options.
+exit 64 = a refused configuration. A bad option or a path under a tmp root or on a tmpfs is refused before the run
+exists: such refusals write nothing (stderr only). A missing wrapper, flock or timeout is refused by the preflight: the
+CONFIG and PLAN rows, a `RED preflight` row and an `EXIT=64` row are written, and no leg starts. 127 = a leg command
+that could not start (a RED launch row). Paths default to the checkout (.local-runs/); see the --cargo-slot/--slot-lock/--targets/--tmpdir options.
 """
 import argparse
 import datetime
@@ -27,6 +28,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -64,7 +66,7 @@ EXPIRY_PY = "scripts/check_cert_expiry.py"
 EXPIRY_SH = "scripts/check-cert-expiry.sh"
 # The legs one invocation promises (the PLAN row); build_bundle.check_run holds each invocation to its plan (#7437).
 PLANS = {"battery": ("battery",), "pg": ("pg",), "removal": ("removal",), "bootstrap": ("bootstrap",),
-         "chain": ("battery", "removal", "pg", "bootstrap", "chain")}
+         "chain": ("battery", "removal", "pg", "bootstrap", "chain"), "gates": ("gates",)}
 CARGO_LEGS = ("battery", "pg", "chain")
 LOW_PRIORITY_LEGS = ("removal", "bootstrap", "chain")
 # Built from parts so this script carries no tmpfs path literal (#5040).
@@ -531,18 +533,26 @@ class Run:
 
     def pick_expiry(self):
         """argv of the cert-expiry gate, run from a copy of HEAD's blob of scripts/check_cert_expiry.py (#7439). No shell
-        fallback; a missing or non-regular (symlink) entry raises. The copy lives beside the checkout's scripts because
-        the gate derives its repo root from its own path; it is untracked and removed by drop_expiry()."""
+        fallback; a missing or non-regular (symlink) entry raises. The gate derives its repo root from its own path, so
+        the copy sits in a private 0700 directory directly under <wt>/.local-runs (created O_EXCL, O_NOFOLLOW, mode
+        0600; a symlinked .local-runs is refused) and drop_expiry() removes it, never a fixed in-tree path (#7489)."""
         sha, data = blob_bytes(self.wt, "HEAD", EXPIRY_PY)
-        dest = self.wt / "scripts" / ".cert-expiry-gate.py"
-        dest.write_bytes(data)
-        self.expiry_copy = dest
+        scratch = self.wt / ".local-runs"
+        if scratch.is_symlink():
+            raise ValueError(f"{scratch} is a symlink; the expiry gate copy is not written through it")
+        scratch.mkdir(exist_ok=True)
+        private = Path(tempfile.mkdtemp(prefix=".expiry-", dir=str(scratch)))
+        self.expiry_copy = private
+        dest = private / "check_cert_expiry.py"
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
         self.note(f"{EXPIRY_PY} blob={sha} (HEAD tree; run from a copy of the blob)")
         return [sys.executable, str(dest)]
 
     def drop_expiry(self):
         if self.expiry_copy is not None:
-            self.expiry_copy.unlink(missing_ok=True)
+            shutil.rmtree(self.expiry_copy, ignore_errors=True)
             self.expiry_copy = None
 
     def push_gated(self, head, branch):
@@ -579,6 +589,10 @@ def main():
     if not re.fullmatch(r"[0-9a-f]{40}", a.tip):
         print("--tip must be a full 40-hex sha", file=sys.stderr)
         return 64
+    bad_ids = [s for s in a.also_evidence if not re.fullmatch(r"[0-9a-f]{9}", s)]
+    if bad_ids or (a.also_evidence and a.leg != "gates"):
+        print(f"--also-evidence must be 9-hex ids and is a gates-only option: {a.also_evidence}", file=sys.stderr)
+        return 64
     try:
         r = Run(a)
     except ConfigError as e:
@@ -591,13 +605,9 @@ def main():
     except ConfigError as e:
         print(f"run_cert: {e}", file=sys.stderr)
         r.fail(f"  RED preflight: {e}")
-        r.note(f"EXIT=1 leg={a.leg} aggregate_failures={r.bad} {r.now()}")
+        r.note(f"EXIT=64 leg={a.leg} aggregate_failures={r.bad} {r.now()}")
         return 64
     if a.leg == "gates":
-        bad_ids = [s for s in a.also_evidence if not re.fullmatch(r"[0-9a-f]{9}", s)]
-        if bad_ids:
-            print(f"--also-evidence must be 9-hex ids: {bad_ids}", file=sys.stderr)
-            return 64
         rc = r.gates(a.prior_bind, a.push_branch, a.parent, tuple(a.also_evidence))
     else:
         rc = getattr(r, a.leg)()

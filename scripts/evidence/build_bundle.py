@@ -116,6 +116,10 @@ PLAN_ROW = re.compile(r"^PLAN leg=([a-z]+) legs=([a-z]+(?:,[a-z]+)*)$")
 LEG_SECTION = {"battery": "== CERT LEGS", "removal": "== removal proof", "pg": "== pg coverage",
                "bootstrap": "== bootstrap-cert-gate"}
 LEG_DONE = {"battery": "BATTERY", "removal": "RP", "pg": "PG", "bootstrap": "BCG", "chain": "CHAIN"}
+# What each legs.log invocation promises: equal to run_cert.PLANS minus `gates` (its rows go to gates.log); a test pins
+# the two tables equal, and the PLAN row is held to this table, never trusted as declared (#7487).
+PLANS = {"battery": ("battery",), "pg": ("pg",), "removal": ("removal",), "bootstrap": ("bootstrap",),
+         "chain": ("battery", "removal", "pg", "bootstrap", "chain")}
 
 
 def int_field(line, value):
@@ -147,13 +151,13 @@ def check_block(lines, start, rows):
     must have its section, its _DONE row, and the invocation its one EXIT=0 row (#7437)."""
     at = f"invocation at line {start + 1}"
     plans = [(i, l) for i, l in enumerate(lines) if l.startswith("PLAN ")]
-    if len(plans) != 1 or not PLAN_ROW.match(plans[0][1]):
-        raise Fatal(f"{at} needs exactly one well-formed `PLAN leg=<leg> legs=<a,b>` row, found {[l for _i, l in plans] or 'none'}")
-    leg, legs = PLAN_ROW.match(plans[0][1]).groups()
-    legs = legs.split(",")
-    unknown = [x for x in legs if x not in LEG_DONE]
-    if unknown or leg not in legs:
-        raise Fatal(f"{at}: PLAN names unknown legs {unknown} or omits its own leg {leg!r}")
+    if len(plans) != 1 or plans[0][0] != 1 or not PLAN_ROW.match(plans[0][1]):
+        raise Fatal(f"{at} needs exactly one well-formed `PLAN leg=<leg> legs=<a,b>` row right after its CONFIG row, "
+                    f"found {[(i, l) for i, l in plans] or 'none'}")
+    leg, declared = PLAN_ROW.match(plans[0][1]).groups()
+    legs = declared.split(",")
+    if leg not in PLANS or tuple(legs) != PLANS[leg]:
+        raise Fatal(f"{at}: PLAN `{plans[0][1]}` is not the runner's plan for `{leg}` ({','.join(PLANS.get(leg, ()))})")
     exits = [r for r in rows if r[1] == "EXIT"]
     if len(exits) != 1 or exits[0][2][1] != leg or exits[0][2][0] != "0":
         raise Fatal(f"{at} (`{leg}`) needs exactly one `EXIT=0 leg={leg}` row, found "
@@ -195,19 +199,40 @@ def check_run(outd):
         raise Fatal("run is not green:\n  " + "\n  ".join(bad))
     cfg = [i for i, l in enumerate(lines) if l.startswith("CONFIG ")]
     if cfg:
-        legacy = lines[: cfg[0]]
-        if any(SECTION_START.match(l) for l in legacy):  # rows an older runner wrote before the first CONFIG row
-            check_sections(legacy, 0)
+        legacy = lines[: cfg[0]]  # rows an older runner wrote before the first CONFIG row (#7488)
+        if legacy:
+            check_legacy(legacy, 0, chain=any(SECTION_START.match(l) for l in legacy))
         for start, end in zip(cfg, cfg[1:] + [len(lines)]):
             check_block(lines[start:end], start, [(i - start, k, v) for i, k, v in rows if start <= i < end])
     else:
-        check_sections(lines, 0)
+        check_legacy(lines, 0, chain=True)
     last = max(i for i, l in enumerate(lines) if CHAIN_DONE.match(l))
     return [l.strip() for l in lines[: last + 1] if "COUNT_DIFF" in l]
 
 
+ANY_SECTION = re.compile(r"^(== CERT LEGS|== removal proof|== pg coverage|== bootstrap-cert-gate)")
+LEG_ROW = {"== removal proof": "RP", "== pg coverage": "PG", "== bootstrap-cert-gate": "BCG"}
+
+
+def check_legacy(lines, offset, chain):
+    """Rows with no CONFIG row in front (an older shared legs.log): each `== CERT LEGS` section needs exactly one green
+    CHAIN_DONE row (#5042, #7419), and every removal / pg / bootstrap section needs its own green _DONE row before the
+    next section starts, so an unfinished section is refused (#7488)."""
+    if chain:
+        check_sections(lines, offset)
+    marks = [i for i, l in enumerate(lines) if ANY_SECTION.match(l)]
+    for start, end in zip(marks, marks[1:] + [len(lines)]):
+        head = ANY_SECTION.match(lines[start]).group(1)
+        if head not in LEG_ROW:
+            continue
+        done = [l for l in lines[start:end] if re.match(rf"^{LEG_ROW[head]}_DONE aggregate_failures=0\b", l)]
+        if len(done) != 1:
+            raise Fatal(f"section `{head}` at line {offset + start + 1} has no `{LEG_ROW[head]}_DONE aggregate_failures=0` "
+                        "row before the next section: the leg was killed or crashed (re-run with a fresh --outd)")
+
+
 def check_sections(lines, offset):
-    """The pre-CONFIG rule: each `== CERT LEGS` section (the whole file when there is none) has one green CHAIN_DONE."""
+    """The chain rule: each `== CERT LEGS` section (the whole file when there is none) has one green CHAIN_DONE."""
     starts = [i for i, l in enumerate(lines) if SECTION_START.match(l)] or [0]
     for start, end in zip(starts, starts[1:] + [len(lines)]):
         dones = [l for l in lines[start:end] if CHAIN_DONE.match(l)]
@@ -232,10 +257,11 @@ def config_paths(outd):
 
 def sanitize_paths(text, wt_forms, run_paths):
     """Replace the worktree (typed and resolved forms) with <repo-root> and every recorded run path with <run-path>,
-    longest first, so no prefix is left behind (#7444)."""
+    longest first, at a path boundary only, so no prefix is left behind and no longer name is cut (#7444, #7491)."""
     pairs = [(p, "<repo-root>") for p in wt_forms if p] + [(p, "<run-path>") for p in run_paths if p]
     for p, rep in sorted(set(pairs), key=lambda x: len(x[0]), reverse=True):
-        text = text.replace(p, rep)
+        # a path is replaced only at a path boundary: not inside a longer name on either side (#7491)
+        text = re.sub(r"(?<![\w.\-/])" + re.escape(p) + r"(?=/|[\s\"':,;)\]]|$)", lambda _m, rep=rep: rep, text)
     return text
 
 
