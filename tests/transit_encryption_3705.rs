@@ -523,8 +523,8 @@ fn provision_daemon_signing_key(root: &Path) {
 #[cfg(unix)]
 #[test]
 fn unwritable_key_dir_refuses_never_plaintext_3709() {
-    let _env = ENV_LOCK.blocking_lock();
     use std::os::unix::fs::PermissionsExt as _;
+    let _env = ENV_LOCK.blocking_lock();
     let root = tempfile::tempdir().unwrap();
     let port = free_port();
     // #3354 generates the daemon SIGNING key before #3705 generates the TLS
