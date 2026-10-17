@@ -1,17 +1,26 @@
-"""Structural XSS guard for the cf-dashboard pages (#7587).
+"""Static guard for the cf-dashboard scripts (#7587, #7634, #7635): an ALLOWLIST over a small JavaScript lexer.
 
-A small JavaScript lexer (strings, template literals with nested interpolations, regex literals, comments) used by
-the page tests. It replaces a denylist of known-bad tokens with a rule over every page: no inline script or event
-handler anywhere, no markup sink except the one typed helper, and every `${...}` of every template literal wrapped
-in the escaping helper (`esc(`) or the numeric formatter (`nf(`).
+A deny-list of known-bad names cannot be complete (`e['inner'+'HTML']`, `Range.createContextualFragment`,
+`DOMParser`, `setHTMLUnsafe`, string `setTimeout` all reach the DOM without the name such a list would look for).
+The browser enforces the real rule (Trusted Types, see public/_headers); this guard pins the SHAPE of the one place
+that is allowed to talk to Trusted Types and refuses every deviation from it:
+
+- the helper block `const { markup, cat, put } = (() => { ... })();` is the only code that names `Html`,
+  `createPolicy`, `createHTML` or `innerHTML`;
+- inside it, `put` holds exactly one `createPolicy("dash", ...)` and exactly one `.createHTML(` call, and the
+  policy's `createHTML` rule escapes (it names `escText`);
+- every other `markup` token tags a template literal (`markup` followed by a template), never a call;
+- a script that is not index.js names none of those tokens.
+
+The lexer handles strings, template literals with nested interpolations, regex literals and comments, so a quote in
+a regex or a name in a comment never moves a boundary.
 """
 import re
 
-WRAPPERS = ("esc", "nf")
 REGEX_AFTER_PUNCT = set("(,=:[!&|?{};+-*%<>~^")
 REGEX_AFTER_WORDS = {"return", "typeof", "case", "in", "of", "void", "delete", "throw", "else", "do"}
-SINK_NAMES = ("innerHTML", "outerHTML", "insertAdjacentHTML", "srcdoc")
-FORBIDDEN_CALLS = ("eval", "Function", "write", "writeln")
+POLICY_NAME = "dash"
+GUARDED_NAMES = ("Html", "createPolicy", "createHTML", "innerHTML")
 ID_START = re.compile(r"[A-Za-z_$]")
 ID_BODY = re.compile(r"[A-Za-z0-9_$]*")
 NUMBER = re.compile(r"[0-9][0-9A-Za-z_.]*")
@@ -143,82 +152,45 @@ def walk(tokens):
                 yield inner
 
 
-def is_wrapped(expr):
-    """True when the whole expression is one call of an approved wrapper."""
-    if len(expr) < 3 or expr[0].kind != "id" or expr[0].value not in WRAPPERS or not expr[1].is_punct("("):
-        return False
+def _match(tokens, i, open_ch, close_ch):
+    """Index of the token that closes the bracket opened at tokens[i]."""
     depth = 0
-    for index, token in enumerate(expr[1:], 1):
-        if token.is_punct("("):
+    for j in range(i, len(tokens)):
+        if tokens[j].is_punct(open_ch):
             depth += 1
-        elif token.is_punct(")"):
+        elif tokens[j].is_punct(close_ch):
             depth -= 1
             if depth == 0:
-                return index == len(expr) - 1
-    return False
+                return j
+    raise ValueError("unbalanced %s at token %d" % (open_ch, i))
 
 
-def unwrapped_interpolations(src, tokens=None):
-    """Source text of every `${...}` not wrapped in esc( or nf(."""
-    tokens = lex(src)[0] if tokens is None else tokens
-    bad = []
-    for token in walk(tokens):
-        for expr in token.exprs:
-            if not expr or not is_wrapped(expr):
-                bad.append(src[(expr[0].start if expr else token.start):(expr[-1].end if expr else token.end)])
-    return bad
+def _statement_end(tokens, i):
+    """Index of the `;` that ends the top-level statement starting at tokens[i]."""
+    depth = 0
+    for j in range(i, len(tokens)):
+        t = tokens[j]
+        if t.kind == "p" and t.value in "({[":
+            depth += 1
+        elif t.kind == "p" and t.value in ")}]":
+            depth -= 1
+        elif t.is_punct(";") and depth == 0:
+            return j
+    raise ValueError("unterminated statement")
 
 
-def sink_problems(src, allowed_sinks=0, allowed_new_html=0):
-    """Markup sinks and dynamic-code calls outside the single typed helper."""
-    tokens = lex(src)[0]
-    flat = list(walk(tokens))
-    problems = []
-    sinks = [t for t in flat if t.kind == "id" and t.value in SINK_NAMES]
-    if len(sinks) != allowed_sinks:
-        problems.append("%d markup sink(s) (%s), allowed %d" % (len(sinks), ", ".join(t.value for t in sinks), allowed_sinks))
-    for t in flat:
-        if t.kind == "str" and any(name in t.value for name in SINK_NAMES):
-            problems.append("a string names a markup sink: %s" % t.value)
-        if t.kind == "str" and "javascript:" in t.value.lower():
-            problems.append("javascript: URL in a string")
-    for index, t in enumerate(flat):
-        if t.kind == "id" and t.value in FORBIDDEN_CALLS:
-            after = flat[index + 1] if index + 1 < len(flat) else None
-            before = flat[index - 1] if index else None
-            if after is not None and (after.is_punct("(") or t.value == "Function") and (
-                    t.value in ("eval", "Function") or (before is not None and before.is_punct("."))):
-                problems.append("dynamic code or document.write: %s" % t.value)
-    made = [i for i, t in enumerate(flat) if t.is_id("new") and i + 1 < len(flat) and flat[i + 1].is_id("Html")]
-    if len(made) != allowed_new_html:
-        problems.append("%d `new Html(` sites, allowed %d" % (len(made), allowed_new_html))
-    # markup( takes only literals joined by +: static text with wrapped interpolations
-    for index, t in enumerate(flat):
-        if t.is_id("markup") and index + 1 < len(flat) and flat[index + 1].is_punct("(") and not (
-                index and flat[index - 1].is_id("const")):
-            direct = _direct_args(tokens, t)
-            if direct is not None and not all(u.kind in ("tpl", "str") or u.is_punct("+") for u in direct):
-                problems.append("markup() takes only string literals at offset %d" % t.start)
-    return problems
+def _find(tokens, shape, start=0):
+    """First index at or after start where the token values equal `shape` (a list of strings), else -1."""
+    for i in range(start, len(tokens) - len(shape) + 1):
+        if all(tokens[i + k].value == shape[k] for k in range(len(shape))):
+            return i
+    return -1
 
 
-def _direct_args(tokens, call_id):
-    """The tokens between the parentheses of `markup(...)` at the same nesting level as call_id, or None."""
-    for token_list in _token_lists(tokens):
-        for index, t in enumerate(token_list):
-            if t is call_id and index + 1 < len(token_list) and token_list[index + 1].is_punct("("):
-                depth, out = 0, []
-                for u in token_list[index + 1:]:
-                    if u.is_punct("("):
-                        depth += 1
-                        if depth == 1:
-                            continue
-                    elif u.is_punct(")"):
-                        depth -= 1
-                        if depth == 0:
-                            return out
-                    out.append(u)
-    return None
+def _call_sites(flat, name):
+    """Tokens of the identifier `name` used as a member call: `.name(`."""
+    return [t for i, t in enumerate(flat) if t.is_id(name) and i and flat[i - 1].is_punct(".")
+            and i + 1 < len(flat) and flat[i + 1].is_punct("(")]
 
 
 def _token_lists(tokens):
@@ -229,22 +201,72 @@ def _token_lists(tokens):
                 yield lst
 
 
-SCRIPT_TAG = re.compile(r"<script\b([^>]*)>(.*?)</script\s*>", re.IGNORECASE | re.DOTALL)
-EVENT_ATTR = re.compile(r"""[\s"'/]on[a-z]+\s*=""", re.IGNORECASE)
-HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
-
-
-def html_problems(html):
-    """Inline scripts, event-handler attributes and javascript: URLs in a static page."""
-    text = HTML_COMMENT.sub("", html)
+def js_problems(src, helper_allowed):
+    """Allowlist violations of one script. `helper_allowed` is True only for the dashboard renderer (index.js)."""
+    tokens = lex(src)[0]
+    flat = list(walk(tokens))
     problems = []
-    for attrs, body in SCRIPT_TAG.findall(text):
-        if "src=" not in attrs.lower():
-            problems.append("inline <script> without src")
-        elif body.strip():
-            problems.append("<script src> with an inline body")
-    if EVENT_ATTR.search(text):
-        problems.append("event-handler attribute (on...=)")
-    if re.search(r"javascript\s*:", text, re.IGNORECASE):
-        problems.append("javascript: URL")
+    helper_lo = helper_hi = put_lo = put_hi = -1
+    helper = _find(tokens, ["const", "{", "markup", ",", "cat", ",", "put", "}", "="])
+    if helper >= 0:
+        helper_lo, helper_hi = tokens[helper].start, tokens[_statement_end(tokens, helper)].end
+        inner = [t for t in flat if helper_lo <= t.start < helper_hi]
+        put_at = _find(inner, ["const", "put", "="])
+        if put_at >= 0:
+            put_lo, put_hi = inner[put_at].start, inner[_statement_end(inner, put_at)].end
+
+    def inside(token, lo, hi):
+        return lo <= token.start < hi
+
+    if not helper_allowed and helper >= 0:
+        problems.append("a helper block outside the dashboard renderer")
+    if helper_allowed and helper < 0:
+        problems.append("the helper block `const { markup, cat, put } = (() => {...})();` is missing")
+    for name in GUARDED_NAMES:
+        outside = [t for t in flat if t.is_id(name) and not inside(t, helper_lo, helper_hi)]
+        if outside:
+            problems.append("%s used outside the helper block (offset %d)" % (name, outside[0].start))
+    policies = [t for t in flat if t.is_id("createPolicy")]
+    if helper_allowed:
+        if len(policies) != 1 or not inside(policies[0], put_lo, put_hi):
+            problems.append("expected exactly one createPolicy, inside put(); found %d" % len(policies))
+        else:
+            at = flat.index(policies[0])
+            argument = flat[at + 2] if at + 2 < len(flat) else None
+            if not (argument is not None and argument.kind == "str" and argument.value[1:-1] == POLICY_NAME):
+                problems.append('the policy must be named "%s"' % POLICY_NAME)
+        calls = _call_sites(flat, "createHTML")
+        if len(calls) != 1 or not inside(calls[0], put_lo, put_hi):
+            problems.append("expected exactly one .createHTML( call, inside put(); found %d" % len(calls))
+        keys = [i for i, t in enumerate(flat) if t.is_id("createHTML") and i + 1 < len(flat) and flat[i + 1].is_punct(":")]
+        if len(keys) != 1:
+            problems.append("expected exactly one createHTML rule")
+        else:
+            body, depth = [], 0
+            for t in flat[keys[0] + 2:]:
+                if t.kind == "p" and t.value in "({[":
+                    depth += 1
+                elif t.kind == "p" and t.value in ")}]":
+                    depth -= 1
+                    if depth < 0:
+                        break
+                elif t.is_punct(",") and depth == 0:
+                    break
+                body.append(t.value)
+            if "escText" not in body:
+                problems.append("the createHTML rule must escape (it must name escText)")
+        sinks = [t for t in flat if t.is_id("innerHTML")]
+        if len(sinks) != 1 or not inside(sinks[0], put_lo, put_hi):
+            problems.append("expected exactly one innerHTML, inside put(); found %d" % len(sinks))
+    else:
+        for name in ("createPolicy", "createHTML", "innerHTML"):
+            if any(t.is_id(name) for t in flat):
+                problems.append("%s in a script that is not the dashboard renderer" % name)
+    for token_list in _token_lists(tokens):
+        for i, t in enumerate(token_list):
+            if not t.is_id("markup") or inside(t, helper_lo, helper_hi):
+                continue
+            after = token_list[i + 1] if i + 1 < len(token_list) else None
+            if after is None or after.kind != "tpl":
+                problems.append("markup at offset %d does not tag a template literal" % t.start)
     return problems
