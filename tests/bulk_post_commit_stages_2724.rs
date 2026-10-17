@@ -295,13 +295,14 @@ async fn bulk_dispatches_memory_store_event_per_persisted_row_2724() {
     // #7320 - bounded wait on the DISTINCT dispatched-row count (never a
     // single sample): exactly 3, one per committed row, zero for the rejected
     // row (the settle inside the helper surfaces a spurious extra).
-    let final_count = wait_for_dispatches(&server, 3).await.rows;
+    let seen = wait_for_dispatches(&server, 3).await;
     let total_requests = server.received_count().await;
     assert_eq!(
-        final_count, 3,
+        (seen.rows, seen.correlations),
+        (3, 3),
         "#2724 F2: the subscriber must receive exactly one memory_store \
-         dispatch per committed row (3), never for the rejected row \
-         ({final_count} distinct rows, {total_requests} requests): {v}"
+         dispatch (one correlation id) per committed row (3), never for the \
+         rejected row ({seen:?}, {total_requests} requests): {v}"
     );
 }
 
@@ -316,11 +317,28 @@ async fn bulk_dispatches_memory_store_event_per_persisted_row_2724() {
 /// the retry backoffs) plus a margin for queueing behind other deliveries.
 const DISPATCH_WAIT_MARGIN: Duration = Duration::from_secs(10);
 
-/// Upper bound the wait loop honours (it returns as soon as the count is met).
-fn dispatch_wait_window() -> Duration {
+/// Deliveries that can hold the single dispatch permit ahead of a cell's own
+/// rows: the previous cell's last delivery may still hold it after
+/// `DISPATCH_CELL_LOCK` is released (#7369).
+const LEFTOVER_DELIVERIES: usize = 1;
+
+/// Worst-case time for ONE delivery: every attempt times out plus the retry
+/// backoffs, `ACK_TIMEOUT * (RETRY_BACKOFFS.len() + 1) + sum(RETRY_BACKOFFS)`
+/// = 5 s * 4 + (0.2 + 1 + 5) s = 26.2 s.
+fn delivery_budget() -> Duration {
     use ai_memory::subscriptions::{ACK_TIMEOUT, RETRY_BACKOFFS};
     let attempts = u32::try_from(RETRY_BACKOFFS.len() + 1).expect("small attempt count");
-    ACK_TIMEOUT * attempts + RETRY_BACKOFFS.iter().sum::<Duration>() + DISPATCH_WAIT_MARGIN
+    ACK_TIMEOUT * attempts + RETRY_BACKOFFS.iter().sum::<Duration>()
+}
+
+/// Upper bound the wait loop honours (it returns as soon as the count is met).
+/// With `SERIAL_DISPATCH_PERMITS` = 1 the deliveries run one at a time, so the
+/// worst case is every one of `rows` plus `LEFTOVER_DELIVERIES` burning its
+/// whole budget in turn: `(rows + 1) * 26.2 s + DISPATCH_WAIT_MARGIN` (#7369),
+/// e.g. 4 rows = 5 * 26.2 + 10 = 141 s.
+fn dispatch_wait_window(rows: usize) -> Duration {
+    let serialised = u32::try_from(rows + LEFTOVER_DELIVERIES).expect("small row count");
+    delivery_budget() * serialised + DISPATCH_WAIT_MARGIN
 }
 
 /// Poll interval while waiting for deliveries to land.
@@ -336,14 +354,20 @@ const SERIAL_DISPATCH_PERMITS: usize = 1;
 /// k-th delivery reaches the receiver k * delay after the first, which pushes
 /// the later deliveries beyond the old fixed window while every one of them
 /// is still inside the product's own per-attempt ack budget.
-const SLOW_ACK_DELAY: Duration = Duration::from_millis(4900);
+const SLOW_ACK_MARGIN: Duration = Duration::from_secs(1);
 
-/// Rows in the slow-receiver batch (the fourth arrives at ~3 * 4.9s = 14.7s).
+/// Ack delay: `ACK_TIMEOUT` (which also covers the TLS handshake) minus
+/// `SLOW_ACK_MARGIN`, so the ack stays inside the attempt budget (#7370).
+const SLOW_ACK_DELAY: Duration =
+    ai_memory::subscriptions::ACK_TIMEOUT.saturating_sub(SLOW_ACK_MARGIN);
+
+/// Rows in the slow-receiver batch (the fourth arrives at ~3 * 4 s = 12 s).
 const SLOW_BATCH_ROWS: usize = 4;
 
 /// The dispatch semaphore is process-wide: with one permit a slow cell would
 /// starve a concurrent cell's deliveries, so the dispatch cells run one at a
-/// time (each cell's wait window starts only once it holds the lock).
+/// time. The lock does not drain the previous cell's last delivery, which can
+/// still hold the permit; `LEFTOVER_DELIVERIES` in the wait window covers it.
 static DISPATCH_CELL_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Pin the process-wide dispatch concurrency before any dispatch runs; the
@@ -365,9 +389,11 @@ struct DispatchSummary {
 /// Reduce `(memory_id, correlation_id)` pairs to a [`DispatchSummary`].
 fn summarise_dispatches(deliveries: &[(String, String)]) -> DispatchSummary {
     let rows: std::collections::HashSet<&str> = deliveries.iter().map(|d| d.0.as_str()).collect();
+    let correlations: std::collections::HashSet<&str> =
+        deliveries.iter().map(|d| d.1.as_str()).collect();
     DispatchSummary {
         rows: rows.len(),
-        correlations: rows.len(),
+        correlations: correlations.len(),
     }
 }
 
@@ -389,7 +415,7 @@ async fn wait_for_dispatches(
     server: &common::tls_receiver::TlsReceiver,
     expected: usize,
 ) -> DispatchSummary {
-    let deadline = std::time::Instant::now() + dispatch_wait_window();
+    let deadline = std::time::Instant::now() + dispatch_wait_window(expected);
     while std::time::Instant::now() < deadline {
         if summarise_dispatches(&received_deliveries(server).await).rows >= expected {
             break;
@@ -472,10 +498,11 @@ async fn bulk_dispatch_waits_for_slow_receiver_deliveries_7320() {
         "all rows committed: {v}"
     );
 
-    let dispatched = wait_for_dispatches(&server, SLOW_BATCH_ROWS).await.rows;
+    let seen = wait_for_dispatches(&server, SLOW_BATCH_ROWS).await;
     assert_eq!(
-        dispatched, SLOW_BATCH_ROWS,
-        "#7320: every committed row must be dispatched to a slow receiver \
-         (saw {dispatched} of {SLOW_BATCH_ROWS}): {v}"
+        (seen.rows, seen.correlations),
+        (SLOW_BATCH_ROWS, SLOW_BATCH_ROWS),
+        "#7320/#7367: every committed row must be dispatched exactly once to \
+         a slow receiver ({seen:?}, expected {SLOW_BATCH_ROWS}): {v}"
     );
 }
