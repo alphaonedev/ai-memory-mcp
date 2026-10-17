@@ -3078,8 +3078,12 @@ pub fn append_signed_event_no_tx(
     if crate::governance::audit::watermark_emission_due(next_seq) {
         // #7228 — never anchor a db_id-less (legacy) watermark: the reader counts
         // it against EVERY opener of the shared sink. An absent genesis skips the
-        // emission (one WARN); a genesis read error is WARNed and skipped, never
-        // silently dropped (ERRORS-19), mirroring the witness lane's swallow.
+        // emission (one WARN). A genesis read error fails the append closed.
+        // decision (#7238): sqlite propagates the read error exactly as
+        // postgres does (`pg_append_signed_event_with_chain_in_tx`): a store
+        // whose genesis cannot be read is corrupt and must not keep appending
+        // unanchored. The postgres behaviour is the precedent, so no crossroads
+        // vote is needed (ERRORS-19).
         match genesis_db_id(conn) {
             Ok(Some(db_id)) => {
                 anchor = crate::governance::audit::PendingAuditAnchor::watermark(
@@ -3089,10 +3093,7 @@ pub fn append_signed_event_no_tx(
                 );
             }
             Ok(None) => crate::governance::audit::warn_watermark_skipped_no_genesis(),
-            Err(e) => tracing::warn!(
-                target: SIGNED_EVENTS_TRACE_TARGET,
-                "audit watermark skipped: genesis db-id read failed: {e:#}"
-            ),
+            Err(e) => return Err(e.context("audit watermark: genesis db-id read failed")),
         }
     }
 

@@ -15574,6 +15574,9 @@ pub(crate) async fn pg_append_signed_event_with_chain_in_tx(
     // so it stays off the 63-of-64 non-emitting appends (K3 parity with sqlite).
     let mut anchor = crate::governance::audit::PendingAuditAnchor::none();
     if crate::governance::audit::watermark_emission_due(next_seq) {
+        // decision (#7238): a genesis read error fails the append closed (`?`),
+        // and sqlite now propagates it identically. In this transaction a failed
+        // statement aborts it anyway, so skipping was never an option here.
         let genesis: Option<(String, String, Vec<u8>)> =
             sqlx::query_as(crate::signed_events::GENESIS_ROW_SQL)
                 .fetch_optional(&mut **tx)
