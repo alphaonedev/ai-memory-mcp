@@ -288,13 +288,26 @@ def config_paths(outd):
     return sorted(found)
 
 
+_NAME = r"\w\-+~@%="          # characters that continue a path component
+_SOFT = r".,:;)\]'\""          # punctuation that ends a sentence or a list item, or is part of a name
+# a run path ends at the end of text, a slash, whitespace, a character that is neither a name nor soft punctuation, or
+# soft punctuation that is itself followed by one of the first three (#7533)
+_RIGHT = r"(?=/|\s|\Z|[" + _SOFT + r"]+(?:/|\s|\Z)|[^" + _NAME + _SOFT + r"/\s])"
+
+
+def path_regex(p, strict_left=True):
+    """Regex for a path at a real path-component boundary on the right and, when strict_left, on the left (#7533, #7491).
+    The leak scan passes strict_left=False: a path glued to a leading name character stays a leak (fail closed)."""
+    return re.compile((r"(?<![\w.])" if strict_left else "") + re.escape(p) + _RIGHT)
+
+
 def sanitize_paths(text, wt_forms, run_paths):
     """Replace the worktree (typed and resolved forms) with <repo-root> and every recorded run path with <run-path>,
-    longest first, at a path boundary only, so no prefix is left behind and no longer name is cut (#7444, #7491)."""
+    longest first, at a path-component boundary on both sides, so no prefix is left behind and a different path that
+    only shares a prefix (/data/t,v /data/t:old /data/t.bak /data/tt) is never cut (#7444, #7491, #7533)."""
     pairs = [(p, "<repo-root>") for p in wt_forms if p] + [(p, "<run-path>") for p in run_paths if p]
     for p, rep in sorted(set(pairs), key=lambda x: len(x[0]), reverse=True):
-        # a path is replaced only at a path boundary: not inside a longer name on either side (#7491)
-        text = re.sub(r"(?<![\w.\-/])" + re.escape(p) + r"(?=/|[\s\"':,;)\]]|$)", lambda _m, rep=rep: rep, text)
+        text = path_regex(p).sub(lambda _m, rep=rep: rep, text)
     return text
 
 
@@ -358,7 +371,12 @@ def leak_patterns(wt, outd, unresolved=(), config=()):
 
 
 def hits(text, pats):
-    return [(p, l) for l in text.splitlines() for p in pats if p in l]
+    """Every (pattern, line) still present. A path pattern uses the same right boundary as sanitize_paths, so a
+    different path sharing its prefix is not a leak; a host prefix, a host name and a prefix ending in a slash stay plain
+    substrings, and the left side stays lenient so a glued path fails closed (#7533)."""
+    rxs = {p: path_regex(p, strict_left=False) for p in pats
+           if p.startswith("/") and not p.endswith("/") and p not in HOST_PATH_PREFIXES}
+    return [(p, l) for l in text.splitlines() for p in pats if (rxs[p].search(l) if p in rxs else p in l)]
 
 
 def main():
