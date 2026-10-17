@@ -1,0 +1,8 @@
+/state.json
+  Cache-Control: no-store, max-age=0
+/*.json
+  Cache-Control: no-store, max-age=0
+/
+  Cache-Control: no-store, max-age=0
+/*.html
+  Cache-Control: no-store, max-age=0
