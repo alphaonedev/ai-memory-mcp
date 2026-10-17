@@ -13123,6 +13123,34 @@ impl PostgresStore {
         keypair: Option<&crate::identity::keypair::AgentKeypair>,
     ) -> StoreResult<&'static str> {
         self.gate_record_stop().await?;
+        let tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("begin link tx", e))?;
+        let (tx, attest_level, audit_anchor) = self.link_in_tx(tx, ctx, link, keypair).await?;
+        pg_commit_and_emit(tx, audit_anchor)
+            .await
+            .map_err(|e| to_store_err("commit link tx", e))?;
+        Ok(attest_level)
+    }
+
+    /// The link write on a caller-opened transaction (#7093): every gate, the
+    /// INSERT, the #7095 audit row and the AGE projection ride `tx`. Returns
+    /// the transaction (still open) with the attest level and the audit
+    /// anchor the owner records after COMMIT. An `Err` drops `tx`, rolling
+    /// back everything the caller did on it.
+    async fn link_in_tx<'c>(
+        &self,
+        mut tx: sqlx::Transaction<'c, sqlx::Postgres>,
+        ctx: &CallerContext,
+        link: &MemoryLink,
+        keypair: Option<&crate::identity::keypair::AgentKeypair>,
+    ) -> StoreResult<(
+        sqlx::Transaction<'c, sqlx::Postgres>,
+        &'static str,
+        crate::governance::audit::PendingAuditAnchor,
+    )> {
         // #1568 (H1 residual) — run the same pre-link gates the sqlite
         // `db::create_link_signed` path runs (reflects_on cycle
         // invariant + K9 governance) BEFORE any FK pre-flight or write.
@@ -13130,11 +13158,7 @@ impl PostgresStore {
         // are the CALLER, not the discarded `_ctx` / daemon keypair.
         // Fable #3243 item 2: begin the write tx FIRST so the owner
         // probe is FOR UPDATE on the same snapshot the INSERT commits.
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("begin link tx", e))?;
+        // (The caller opens `tx`, #7093.)
         // #4210 — both endpoints in ascending id order BEFORE the gate's source
         // `FOR UPDATE` and the INSERT's FK key-share on the target.
         let ends = lock_order_4209::link_endpoint_locks(&link.source_id, &link.target_id);
@@ -13151,7 +13175,7 @@ impl PostgresStore {
         let source_exists: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM memories WHERE id = $1)")
                 .bind(&link.source_id)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("check source memory", e))?;
         if !source_exists {
@@ -13162,7 +13186,7 @@ impl PostgresStore {
         let target_exists: bool =
             sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM memories WHERE id = $1)")
                 .bind(&link.target_id)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await
                 .map_err(|e| to_store_err("check target memory", e))?;
         if !target_exists {
@@ -13263,13 +13287,13 @@ impl PostgresStore {
                 (
                     sqlx::query_scalar::<_, Option<String>>(SQL_SELECT_CID_BY_ID)
                         .bind(&link.source_id)
-                        .fetch_optional(&self.pool)
+                        .fetch_optional(&mut *tx)
                         .await
                         .map_err(|e| to_store_err("read source cid", e))?
                         .flatten(),
                     sqlx::query_scalar::<_, Option<String>>(SQL_SELECT_CID_BY_ID)
                         .bind(&link.target_id)
-                        .fetch_optional(&self.pool)
+                        .fetch_optional(&mut *tx)
                         .await
                         .map_err(|e| to_store_err("read target cid", e))?
                         .flatten(),
@@ -13500,11 +13524,7 @@ impl PostgresStore {
             }
         }
 
-        pg_commit_and_emit(tx, audit_anchor)
-            .await
-            .map_err(|e| to_store_err("commit link tx", e))?;
-
-        Ok(attest_level)
+        Ok((tx, attest_level, audit_anchor))
     }
 
     /// #1735 (Pillar-4 4.C) — max AGE-projection drain attempts before a
@@ -20868,307 +20888,17 @@ impl PostgresStore {
         }
     }
 
-    /// v1.0.0 #3259 — postgres twin of `storage::promote_to_namespace`. Clones
-    /// `source_id` into `to_namespace` (already validated as a proper ancestor
-    /// by the SHARED [`crate::storage::validate_promotion_target`]), attributing
-    /// the clone to `promoted_by` while preserving the origin under
-    /// `promoted_from*`, then records the clone→source `derived_from` edge. The
-    /// clone's 30+-field shape comes from the SHARED
-    /// [`crate::storage::build_promotion_clone`] so it cannot drift from the
-    /// sqlite primitive. The clone is persisted through the standard
-    /// [`MemoryStore::store`] funnel (fresh embedding re-derived from the
-    /// durable TEXT — the North-Star "derived artifacts are regenerable" rule).
-    async fn pg_promote_to_namespace(
+    /// #7093 — the `store` funnel with an optional provenance edge: when
+    /// `derived_from` names a source memory, the stored row's `derived_from`
+    /// link to it is created in the SAME transaction (and its
+    /// `memory_link.created` audit row, #7095), so a vertical promotion
+    /// commits the clone and its link together or not at all.
+    async fn store_inner(
         &self,
         ctx: &CallerContext,
-        source_id: &str,
-        to_namespace: &str,
-        promoted_by: Option<&str>,
+        memory: &Memory,
+        derived_from: Option<&str>,
     ) -> StoreResult<String> {
-        // `get` returns `StoreError::NotFound` when the source is gone — the
-        // twin of the sqlite `MemoryNotFound` bail.
-        let source = self.get(ctx, source_id).await?;
-        crate::storage::validate_promotion_target(&source, to_namespace).map_err(|e| {
-            StoreError::InvalidInput {
-                detail: e.to_string(),
-            }
-        })?;
-        let clone = crate::storage::build_promotion_clone(&source, to_namespace, promoted_by);
-        let clone_id = self.store(ctx, &clone).await?;
-        // Clone → source: derived_from. Distinct ids (fresh uuid), so the link
-        // layer's self-link short-circuit can never fire.
-        self.link(
-            ctx,
-            &MemoryLink {
-                source_id: clone_id.clone(),
-                target_id: source_id.to_string(),
-                relation: crate::models::MemoryLinkRelation::DerivedFrom,
-                created_at: Utc::now().to_rfc3339(),
-                signature: None,
-                observed_by: None,
-                valid_from: None,
-                valid_until: None,
-                attest_level: None,
-                source_cid: None,
-                target_cid: None,
-            },
-        )
-        .await?;
-        Ok(clone_id)
-    }
-}
-
-#[async_trait]
-impl MemoryStore for PostgresStore {
-    async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
-        let (fsync, synchronous_commit): (String, String) = sqlx::query_as(
-            "SELECT current_setting('fsync'), current_setting('synchronous_commit')",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|error| to_store_err("read PostgreSQL commit durability", error))?;
-        crate::write_receipt::WriteDurability::postgres(&fsync, &synchronous_commit)
-            .map_err(|error| StoreError::Backend(super::BoxBackendError::new(error.to_string())))
-    }
-
-    /// #1955 R45 — engage/release the record-stop on postgres.
-    async fn record_stop(
-        &self,
-        _ctx: &CallerContext,
-        engage: bool,
-        issued_by: &str,
-        scope: &str,
-    ) -> StoreResult<bool> {
-        self.pg_actuate_record_stop(engage, issued_by, scope).await
-    }
-
-    /// #1955 R45 — current record-stop status on postgres.
-    ///
-    /// v1.0.0 #3175 — re-derives the state from the PERSISTED `signed_events`
-    /// chain before answering, then reports the reconciled cache.
-    ///
-    /// Pre-#3175 this returned `self.record_stop.status()` — the
-    /// PROCESS-LOCAL cache — which is seeded exactly once, at
-    /// `PostgresStore::connect`. On the multi-pool deployment postgres exists
-    /// for, a stop engaged by ANOTHER daemon (or by this one before a restart
-    /// of a peer) left every other pool answering RUNNING while the chain said
-    /// STOPPED: the operator asking "is the record plane stopped?" got a
-    /// confident wrong answer about a safety control. The sqlite twin
-    /// (`record_stop::status_sqlite`) has always derived from the chain,
-    /// seeding via `seed_from_conn` when the flag was never touched.
-    ///
-    /// Reusing `seed_record_stop` (rather than a read-only probe) is
-    /// deliberate: it also RECONCILES this pool's hot-path gate cache, so a
-    /// stop engaged elsewhere starts refusing this pool's writes from the next
-    /// status read onward — self-healing in the fail-closed direction. A chain
-    /// read error is non-fatal there (WARN, cache untouched), so a transient
-    /// DB hiccup degrades to the last known state and never wedges the status
-    /// surface — but it also never silently downgrades a cached STOPPED to
-    /// RUNNING.
-    async fn record_stop_status(
-        &self,
-        _ctx: &CallerContext,
-    ) -> StoreResult<crate::store::record_stop::RecordStopStatus> {
-        self.seed_record_stop().await;
-        Ok(self.record_stop.status())
-    }
-
-    fn capabilities(&self) -> Capabilities {
-        Capabilities::TRANSACTIONS
-            | Capabilities::NATIVE_VECTOR
-            | Capabilities::FULLTEXT
-            | Capabilities::DURABLE
-            | Capabilities::STRONG_CONSISTENCY
-            | Capabilities::ATOMIC_MULTI_WRITE
-    }
-
-    /// PR-C pg-parity (5-agent vote `4d3ea1c5`) — surface the AGE-vs-CTE
-    /// posture this pool resolved at connect time (the inherent
-    /// [`PostgresStore::kg_backend`] field accessor) through the SAL trait
-    /// so `/api/v1/capabilities.kg_backend` reports `age` on an
-    /// AGE-enabled postgres daemon and `cte` otherwise, instead of the
-    /// pre-PR-C `None` (field omitted).
-    fn kg_backend(&self) -> KgBackend {
-        self.kg_backend
-    }
-
-    /// v1.0.0 R19/A3 (#1948) — route-OUT dequarantine (delegates to the
-    /// inherent [`PostgresStore::dequarantine_raw`]).
-    async fn dequarantine(&self, id: &str) -> StoreResult<bool> {
-        // Wave-2 B8 — sqlite twin gates at the trait method (ERRORS-09).
-        self.gate_record_stop().await?;
-        self.dequarantine_raw(id).await
-    }
-
-    /// v1.0.0 #2402 — the AUDITED operator release (postgres twin). ONE
-    /// transaction carries the guarded `UPDATE` out of `quarantined` and the
-    /// `memory.dequarantined` chain row, so this backend cannot silently ship
-    /// the state change without the audit — the #1552 SAL-port-fanout failure
-    /// mode this method is explicitly written against.
-    ///
-    /// Boids item 3 R2.5 (#3266): a CONTAMINATED row is released too — the
-    /// path is chosen by the state observed under `SELECT ... FOR UPDATE`,
-    /// never by the caller (sqlite `operator_dequarantine` twin); see
-    /// [`PostgresStore::release_contaminated_pg`].
-    async fn operator_dequarantine(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
-        self.gate_record_stop().await?;
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| to_store_err("operator_dequarantine begin", e))?;
-        let observed: Option<(String, Option<serde_json::Value>)> =
-            sqlx::query_as(swarm_rewind::SELECT_STATE_METADATA_FOR_UPDATE)
-                .bind(id)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(|e| to_store_err("operator_dequarantine read", e))?;
-        match observed {
-            Some((st, _)) if st == crate::models::LifecycleState::Quarantined.as_str() => {}
-            Some((st, meta)) if st == crate::models::LifecycleState::Contaminated.as_str() => {
-                return self.release_contaminated_pg(tx, ctx, id, meta).await;
-            }
-            _ => return Ok(false),
-        }
-        let changed = sqlx::query(
-            "UPDATE memories SET lifecycle_state = $1, updated_at = NOW(), \
-             version = version + 1 WHERE id = $2 AND lifecycle_state = $3",
-        )
-        .bind(crate::models::LifecycleState::Open.as_str())
-        .bind(id)
-        .bind(crate::models::LifecycleState::Quarantined.as_str())
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| to_store_err("operator_dequarantine update", e))?
-        .rows_affected();
-        if changed == 0 {
-            return Ok(false);
-        }
-        let now = chrono::Utc::now();
-        let action_kind = crate::signed_events::event_types::MEMORY_DEQUARANTINED;
-        let ph = crate::signed_events::payload_hash(
-            format!("{action_kind}|{id}|{}", ctx.agent_id).as_bytes(),
-        );
-        let cause = crate::signed_events::compute_cause_hash(&ctx.agent_id, action_kind, id, id);
-        let event = crate::signed_events::SignedEvent::with_daemon_signature(
-            ph,
-            ctx.agent_id.clone(),
-            action_kind.to_string(),
-            now.to_rfc3339(),
-            Some(&cause),
-        );
-        let anchor = pg_append_signed_event_with_chain_in_tx(
-            &mut tx,
-            PgSignedEventInsert {
-                id: &event.id,
-                agent_id: &event.agent_id,
-                event_type: &event.event_type,
-                payload_hash: &event.payload_hash,
-                signature: event.signature.as_deref(),
-                attest_level: &event.attest_level,
-                timestamp: now,
-                cause_hash: event.cause_hash.as_deref(),
-            },
-        )
-        .await
-        .map_err(|e| to_store_err("operator_dequarantine append signed_event", e))?;
-        crate::store::postgres::pg_commit_and_emit(tx, anchor)
-            .await
-            .map_err(|e| to_store_err("operator_dequarantine commit", e))?;
-        // #2402 — the SAME observability the sqlite funnel emits, at the same
-        // point (post-commit, release-only). Emitted from the backend primitive
-        // so neither surface nor backend can skip it — the #1552 SAL-port-fanout
-        // failure mode applied to the observability half.
-        tracing::warn!(
-            target: crate::storage::decontaminate::QUARANTINE_TRACE_TARGET,
-            memory_id = %id,
-            operator = %ctx.agent_id,
-            "quarantine.operator_release: an operator RELEASED a quarantined memory back to \
-             lifecycle_state=open, overriding the #1948 federation containment decision; a \
-             memory.dequarantined signed-chain row was appended in the same transaction (#2402)"
-        );
-        crate::metrics::inc_operator_dequarantined();
-        Ok(true)
-    }
-
-    /// v1.0.0 #2402 — operator quarantine listing (postgres twin of
-    /// [`crate::storage::list_quarantined`]). Identifying metadata only; the
-    /// `content` column is deliberately not projected (it may be an at-rest
-    /// seal sentinel, and a quarantined row is untrusted input).
-    async fn list_quarantined(
-        &self,
-        namespace: Option<&str>,
-        limit: i64,
-    ) -> StoreResult<Vec<crate::models::QuarantinedMemory>> {
-        let rows: Vec<(
-            String,
-            String,
-            String,
-            String,
-            String,
-            DateTime<Utc>,
-            DateTime<Utc>,
-        )> = match namespace {
-            Some(ns) => {
-                sqlx::query_as(
-                    "SELECT id, namespace, title, source, memory_kind, created_at, updated_at \
-                       FROM memories WHERE lifecycle_state = $1 AND namespace = $2 \
-                      ORDER BY updated_at DESC LIMIT $3",
-                )
-                .bind(crate::models::LifecycleState::Quarantined.as_str())
-                .bind(ns)
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await
-            }
-            None => {
-                sqlx::query_as(
-                    "SELECT id, namespace, title, source, memory_kind, created_at, updated_at \
-                       FROM memories WHERE lifecycle_state = $1 \
-                      ORDER BY updated_at DESC LIMIT $2",
-                )
-                .bind(crate::models::LifecycleState::Quarantined.as_str())
-                .bind(limit)
-                .fetch_all(&self.pool)
-                .await
-            }
-        }
-        .map_err(|e| to_store_err("list quarantined memories", e))?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(id, namespace, title, source, memory_kind, created_at, updated_at)| {
-                    crate::models::QuarantinedMemory {
-                        id,
-                        namespace,
-                        title,
-                        source,
-                        memory_kind,
-                        created_at: created_at.to_rfc3339(),
-                        updated_at: updated_at.to_rfc3339(),
-                    }
-                },
-            )
-            .collect())
-    }
-
-    /// v0.7.0.1 S75 — read `MAX(version)` from the live `schema_version`
-    /// table so the `/api/v1/capabilities.db_schema_version` field
-    /// reflects the actual applied migration ladder rather than a
-    /// hard-coded constant. Returns `0` when the table is empty (a
-    /// fresh schema-init that didn't stamp any rows yet); callers
-    /// that need "unknown" semantics MUST treat `0` as such. The query
-    /// is a single scalar lookup so the lock window stays sub-
-    /// millisecond — capability polling is fine to do per-request.
-    async fn schema_version(&self) -> StoreResult<i64> {
-        let v: Option<i32> = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| to_store_err("read schema_version max", e))?;
-        Ok(i64::from(v.unwrap_or(0)))
-    }
-
-    async fn store(&self, ctx: &CallerContext, memory: &Memory) -> StoreResult<String> {
         self.gate_record_stop().await?;
         // v0.8.1 W1 (#1821 / gap G29) — credential REDACT backstop (postgres
         // parity with the sqlite db::insert funnel). No-op unless screening
@@ -21606,7 +21336,31 @@ impl MemoryStore for PostgresStore {
         )
         .await?;
 
-        tx.commit()
+        // #7093 — a promotion's provenance edge rides THIS tx (clone -> source,
+        // `derived_from`), so a link failure rolls the clone back with it. The
+        // link (and its #7095 audit row) runs last, after every statement that
+        // depends on the configured schema (#7101).
+        let mut audit_anchor = crate::governance::audit::PendingAuditAnchor::none();
+        if let Some(source_id) = derived_from {
+            let edge = MemoryLink {
+                source_id: id.clone(),
+                target_id: source_id.to_string(),
+                relation: crate::models::MemoryLinkRelation::DerivedFrom,
+                created_at: Utc::now().to_rfc3339(),
+                signature: None,
+                observed_by: None,
+                valid_from: None,
+                valid_until: None,
+                attest_level: None,
+                source_cid: None,
+                target_cid: None,
+            };
+            let (linked_tx, _attest, anchor) = self.link_in_tx(tx, ctx, &edge, None).await?;
+            tx = linked_tx;
+            audit_anchor = anchor;
+        }
+
+        pg_commit_and_emit(tx, audit_anchor)
             .await
             .map_err(|e| to_store_err("commit store tx", e))?;
         // #3323 — advisory per-lineage + per-namespace token/cost accounting,
@@ -21617,6 +21371,294 @@ impl MemoryStore for PostgresStore {
         // data, never the memory truth (North Star).
         crate::cost::postgres::record_write_pg(&self.pool, memory, &id).await;
         Ok(id)
+    }
+
+    /// v1.0.0 #3259 — postgres twin of `storage::promote_to_namespace`. Clones
+    /// `source_id` into `to_namespace` (already validated as a proper ancestor
+    /// by the SHARED [`crate::storage::validate_promotion_target`]), attributing
+    /// the clone to `promoted_by` while preserving the origin under
+    /// `promoted_from*`, then records the clone→source `derived_from` edge. The
+    /// clone's 30+-field shape comes from the SHARED
+    /// [`crate::storage::build_promotion_clone`] so it cannot drift from the
+    /// sqlite primitive. The clone is persisted through the standard
+    /// [`MemoryStore::store`] funnel (fresh embedding re-derived from the
+    /// durable TEXT — the North-Star "derived artifacts are regenerable" rule).
+    async fn pg_promote_to_namespace(
+        &self,
+        ctx: &CallerContext,
+        source_id: &str,
+        to_namespace: &str,
+        promoted_by: Option<&str>,
+    ) -> StoreResult<String> {
+        // `get` returns `StoreError::NotFound` when the source is gone — the
+        // twin of the sqlite `MemoryNotFound` bail.
+        let source = self.get(ctx, source_id).await?;
+        crate::storage::validate_promotion_target(&source, to_namespace).map_err(|e| {
+            StoreError::InvalidInput {
+                detail: e.to_string(),
+            }
+        })?;
+        let clone = crate::storage::build_promotion_clone(&source, to_namespace, promoted_by);
+        // #7093 — clone → source `derived_from` is created inside the clone's
+        // own store transaction: both commit, or neither does. Distinct ids
+        // (fresh uuid), so the link layer's self-link short-circuit can never
+        // fire.
+        self.store_inner(ctx, &clone, Some(source_id)).await
+    }
+}
+
+#[async_trait]
+impl MemoryStore for PostgresStore {
+    async fn write_durability(&self) -> StoreResult<crate::write_receipt::WriteDurability> {
+        let (fsync, synchronous_commit): (String, String) = sqlx::query_as(
+            "SELECT current_setting('fsync'), current_setting('synchronous_commit')",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| to_store_err("read PostgreSQL commit durability", error))?;
+        crate::write_receipt::WriteDurability::postgres(&fsync, &synchronous_commit)
+            .map_err(|error| StoreError::Backend(super::BoxBackendError::new(error.to_string())))
+    }
+
+    /// #1955 R45 — engage/release the record-stop on postgres.
+    async fn record_stop(
+        &self,
+        _ctx: &CallerContext,
+        engage: bool,
+        issued_by: &str,
+        scope: &str,
+    ) -> StoreResult<bool> {
+        self.pg_actuate_record_stop(engage, issued_by, scope).await
+    }
+
+    /// #1955 R45 — current record-stop status on postgres.
+    ///
+    /// v1.0.0 #3175 — re-derives the state from the PERSISTED `signed_events`
+    /// chain before answering, then reports the reconciled cache.
+    ///
+    /// Pre-#3175 this returned `self.record_stop.status()` — the
+    /// PROCESS-LOCAL cache — which is seeded exactly once, at
+    /// `PostgresStore::connect`. On the multi-pool deployment postgres exists
+    /// for, a stop engaged by ANOTHER daemon (or by this one before a restart
+    /// of a peer) left every other pool answering RUNNING while the chain said
+    /// STOPPED: the operator asking "is the record plane stopped?" got a
+    /// confident wrong answer about a safety control. The sqlite twin
+    /// (`record_stop::status_sqlite`) has always derived from the chain,
+    /// seeding via `seed_from_conn` when the flag was never touched.
+    ///
+    /// Reusing `seed_record_stop` (rather than a read-only probe) is
+    /// deliberate: it also RECONCILES this pool's hot-path gate cache, so a
+    /// stop engaged elsewhere starts refusing this pool's writes from the next
+    /// status read onward — self-healing in the fail-closed direction. A chain
+    /// read error is non-fatal there (WARN, cache untouched), so a transient
+    /// DB hiccup degrades to the last known state and never wedges the status
+    /// surface — but it also never silently downgrades a cached STOPPED to
+    /// RUNNING.
+    async fn record_stop_status(
+        &self,
+        _ctx: &CallerContext,
+    ) -> StoreResult<crate::store::record_stop::RecordStopStatus> {
+        self.seed_record_stop().await;
+        Ok(self.record_stop.status())
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::TRANSACTIONS
+            | Capabilities::NATIVE_VECTOR
+            | Capabilities::FULLTEXT
+            | Capabilities::DURABLE
+            | Capabilities::STRONG_CONSISTENCY
+            | Capabilities::ATOMIC_MULTI_WRITE
+    }
+
+    /// PR-C pg-parity (5-agent vote `4d3ea1c5`) — surface the AGE-vs-CTE
+    /// posture this pool resolved at connect time (the inherent
+    /// [`PostgresStore::kg_backend`] field accessor) through the SAL trait
+    /// so `/api/v1/capabilities.kg_backend` reports `age` on an
+    /// AGE-enabled postgres daemon and `cte` otherwise, instead of the
+    /// pre-PR-C `None` (field omitted).
+    fn kg_backend(&self) -> KgBackend {
+        self.kg_backend
+    }
+
+    /// v1.0.0 R19/A3 (#1948) — route-OUT dequarantine (delegates to the
+    /// inherent [`PostgresStore::dequarantine_raw`]).
+    async fn dequarantine(&self, id: &str) -> StoreResult<bool> {
+        // Wave-2 B8 — sqlite twin gates at the trait method (ERRORS-09).
+        self.gate_record_stop().await?;
+        self.dequarantine_raw(id).await
+    }
+
+    /// v1.0.0 #2402 — the AUDITED operator release (postgres twin). ONE
+    /// transaction carries the guarded `UPDATE` out of `quarantined` and the
+    /// `memory.dequarantined` chain row, so this backend cannot silently ship
+    /// the state change without the audit — the #1552 SAL-port-fanout failure
+    /// mode this method is explicitly written against.
+    ///
+    /// Boids item 3 R2.5 (#3266): a CONTAMINATED row is released too — the
+    /// path is chosen by the state observed under `SELECT ... FOR UPDATE`,
+    /// never by the caller (sqlite `operator_dequarantine` twin); see
+    /// [`PostgresStore::release_contaminated_pg`].
+    async fn operator_dequarantine(&self, ctx: &CallerContext, id: &str) -> StoreResult<bool> {
+        self.gate_record_stop().await?;
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| to_store_err("operator_dequarantine begin", e))?;
+        let observed: Option<(String, Option<serde_json::Value>)> =
+            sqlx::query_as(swarm_rewind::SELECT_STATE_METADATA_FOR_UPDATE)
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| to_store_err("operator_dequarantine read", e))?;
+        match observed {
+            Some((st, _)) if st == crate::models::LifecycleState::Quarantined.as_str() => {}
+            Some((st, meta)) if st == crate::models::LifecycleState::Contaminated.as_str() => {
+                return self.release_contaminated_pg(tx, ctx, id, meta).await;
+            }
+            _ => return Ok(false),
+        }
+        let changed = sqlx::query(
+            "UPDATE memories SET lifecycle_state = $1, updated_at = NOW(), \
+             version = version + 1 WHERE id = $2 AND lifecycle_state = $3",
+        )
+        .bind(crate::models::LifecycleState::Open.as_str())
+        .bind(id)
+        .bind(crate::models::LifecycleState::Quarantined.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| to_store_err("operator_dequarantine update", e))?
+        .rows_affected();
+        if changed == 0 {
+            return Ok(false);
+        }
+        let now = chrono::Utc::now();
+        let action_kind = crate::signed_events::event_types::MEMORY_DEQUARANTINED;
+        let ph = crate::signed_events::payload_hash(
+            format!("{action_kind}|{id}|{}", ctx.agent_id).as_bytes(),
+        );
+        let cause = crate::signed_events::compute_cause_hash(&ctx.agent_id, action_kind, id, id);
+        let event = crate::signed_events::SignedEvent::with_daemon_signature(
+            ph,
+            ctx.agent_id.clone(),
+            action_kind.to_string(),
+            now.to_rfc3339(),
+            Some(&cause),
+        );
+        let anchor = pg_append_signed_event_with_chain_in_tx(
+            &mut tx,
+            PgSignedEventInsert {
+                id: &event.id,
+                agent_id: &event.agent_id,
+                event_type: &event.event_type,
+                payload_hash: &event.payload_hash,
+                signature: event.signature.as_deref(),
+                attest_level: &event.attest_level,
+                timestamp: now,
+                cause_hash: event.cause_hash.as_deref(),
+            },
+        )
+        .await
+        .map_err(|e| to_store_err("operator_dequarantine append signed_event", e))?;
+        crate::store::postgres::pg_commit_and_emit(tx, anchor)
+            .await
+            .map_err(|e| to_store_err("operator_dequarantine commit", e))?;
+        // #2402 — the SAME observability the sqlite funnel emits, at the same
+        // point (post-commit, release-only). Emitted from the backend primitive
+        // so neither surface nor backend can skip it — the #1552 SAL-port-fanout
+        // failure mode applied to the observability half.
+        tracing::warn!(
+            target: crate::storage::decontaminate::QUARANTINE_TRACE_TARGET,
+            memory_id = %id,
+            operator = %ctx.agent_id,
+            "quarantine.operator_release: an operator RELEASED a quarantined memory back to \
+             lifecycle_state=open, overriding the #1948 federation containment decision; a \
+             memory.dequarantined signed-chain row was appended in the same transaction (#2402)"
+        );
+        crate::metrics::inc_operator_dequarantined();
+        Ok(true)
+    }
+
+    /// v1.0.0 #2402 — operator quarantine listing (postgres twin of
+    /// [`crate::storage::list_quarantined`]). Identifying metadata only; the
+    /// `content` column is deliberately not projected (it may be an at-rest
+    /// seal sentinel, and a quarantined row is untrusted input).
+    async fn list_quarantined(
+        &self,
+        namespace: Option<&str>,
+        limit: i64,
+    ) -> StoreResult<Vec<crate::models::QuarantinedMemory>> {
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            DateTime<Utc>,
+            DateTime<Utc>,
+        )> = match namespace {
+            Some(ns) => {
+                sqlx::query_as(
+                    "SELECT id, namespace, title, source, memory_kind, created_at, updated_at \
+                       FROM memories WHERE lifecycle_state = $1 AND namespace = $2 \
+                      ORDER BY updated_at DESC LIMIT $3",
+                )
+                .bind(crate::models::LifecycleState::Quarantined.as_str())
+                .bind(ns)
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query_as(
+                    "SELECT id, namespace, title, source, memory_kind, created_at, updated_at \
+                       FROM memories WHERE lifecycle_state = $1 \
+                      ORDER BY updated_at DESC LIMIT $2",
+                )
+                .bind(crate::models::LifecycleState::Quarantined.as_str())
+                .bind(limit)
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(|e| to_store_err("list quarantined memories", e))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(id, namespace, title, source, memory_kind, created_at, updated_at)| {
+                    crate::models::QuarantinedMemory {
+                        id,
+                        namespace,
+                        title,
+                        source,
+                        memory_kind,
+                        created_at: created_at.to_rfc3339(),
+                        updated_at: updated_at.to_rfc3339(),
+                    }
+                },
+            )
+            .collect())
+    }
+
+    /// v0.7.0.1 S75 — read `MAX(version)` from the live `schema_version`
+    /// table so the `/api/v1/capabilities.db_schema_version` field
+    /// reflects the actual applied migration ladder rather than a
+    /// hard-coded constant. Returns `0` when the table is empty (a
+    /// fresh schema-init that didn't stamp any rows yet); callers
+    /// that need "unknown" semantics MUST treat `0` as such. The query
+    /// is a single scalar lookup so the lock window stays sub-
+    /// millisecond — capability polling is fine to do per-request.
+    async fn schema_version(&self) -> StoreResult<i64> {
+        let v: Option<i32> = sqlx::query_scalar("SELECT MAX(version) FROM schema_version")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| to_store_err("read schema_version max", e))?;
+        Ok(i64::from(v.unwrap_or(0)))
+    }
+
+    async fn store(&self, ctx: &CallerContext, memory: &Memory) -> StoreResult<String> {
+        self.store_inner(ctx, memory, None).await
     }
 
     /// #1481 — single multi-row upsert for the bulk-ingest path. Mirrors

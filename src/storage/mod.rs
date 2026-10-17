@@ -9064,16 +9064,21 @@ pub fn promote_to_namespace(
     // arm cannot drift on which promotions are legal or on the clone's shape.
     validate_promotion_target(&source, to_namespace)?;
     let clone = build_promotion_clone(&source, to_namespace, promoted_by);
-    let actual_id = insert(conn, &clone)?;
-    // Clone → source: derived_from. Safe to ignore if the link layer
-    // short-circuits on self-link (impossible here — distinct IDs).
-    create_link(
-        conn,
-        &actual_id,
-        source_id,
-        crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
-    )?;
-    Ok(actual_id)
+    // #7093 — the clone and its provenance link commit together: one write
+    // transaction (joining the caller's, when open), so a link failure
+    // leaves no orphan clone in the destination namespace.
+    in_write_txn(conn, || {
+        let actual_id = insert(conn, &clone)?;
+        // Clone → source: derived_from. Safe to ignore if the link layer
+        // short-circuits on self-link (impossible here — distinct IDs).
+        create_link(
+            conn,
+            &actual_id,
+            source_id,
+            crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
+        )?;
+        Ok(actual_id)
+    })
 }
 
 /// v0.6.3.1 P2 (G6) — quick existence check for `(title, namespace)`. Used by
