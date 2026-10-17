@@ -1,12 +1,15 @@
-"""#7587 no untyped value reaches innerHTML and the CSP needs no 'unsafe-inline' for scripts; #7588 text is escaped
-exactly once. A structural rule over every page replaces the old list of known-bad tokens, and a hostile state with
-markup in every field is rendered in headless Chromium."""
+"""#7587 no untyped value reaches innerHTML; #7588 text is escaped exactly once; #7634 #7645 the static guard is an
+ALLOWLIST (one Trusted Types policy `dash`, one `.createHTML(` site, both inside `put()`; `markup` only as a template
+tag; `Html` only in the helper block) with one red test per refused shape, and index.js must be among the scripts it
+checks. The browser-enforced half is test_cf_browser_7634.py; a hostile state rendered in Playwright Chromium (skipped
+where Playwright is absent) stays here."""
 import copy
 import json
 import re
 import unittest
 from pathlib import Path
 
+import cf_csp_allowlist_7313 as csp
 import cf_pages_harness_7313 as harness
 import cf_xss_guard_7587 as guard
 
@@ -21,90 +24,148 @@ def page_scripts():
     return sorted(PUBLIC.glob("*.js"))
 
 
-class GuardLexer7587(unittest.TestCase):
-    """The guard itself: it must catch the shapes it exists to catch."""
+HELPER_END = "function num(v){"
 
-    def bad(self, src):
-        return guard.unwrapped_interpolations(src)
 
-    def test_a_bare_interpolation_is_reported(self):
-        self.assertEqual(self.bad("x = `<b>${a.b}</b>`"), ["a.b"])
+def helper_source():
+    src = INDEX_JS.read_text(encoding="utf-8")
+    return src[:src.index(HELPER_END)]
 
-    def test_an_escaped_or_formatted_interpolation_passes(self):
-        self.assertEqual(self.bad("x = `<b>${esc(a.b)}${nf(c, 1)}</b>`"), [])
 
-    def test_a_wrapper_followed_by_more_code_is_reported(self):
-        self.assertEqual(self.bad("x = `${esc(a)+b}`"), ["esc(a)+b"])
-        self.assertEqual(self.bad("x = `${esc(a),b}`"), ["esc(a),b"])
+def real_index():
+    return INDEX_JS.read_text(encoding="utf-8")
 
-    def test_a_wrapper_named_like_one_but_a_method_is_reported(self):
-        self.assertEqual(self.bad("x = `${o.esc(a)}`"), ["o.esc(a)"])
 
-    def test_nested_templates_are_each_checked(self):
-        self.assertEqual(self.bad("x = `${esc(c?`<i>${v}</i>`:'')}`"), ["v"])
-        self.assertEqual(self.bad("x = `${esc(c?`<i>${esc(v)}</i>`:'')}`"), [])
+class GuardAllowlist7634(unittest.TestCase):
+    """#7634 #7635: the static guard is an allowlist of one helper shape. Every refused shape has its own test; each
+    is the real index.js (or its helper block) with one deviation, so a refusal is a real deviation and not a typo."""
 
-    def test_regex_literals_and_comments_with_quotes_do_not_confuse_it(self):
-        src = "a = s.replace(/\"/g,'&quot;').replace(/'/g,'&#39;'); // `${x}\n/* `${y}` */ b = `${z}`"
-        self.assertEqual(self.bad(src), ["z"])
+    def problems(self, src, helper_allowed=True):
+        return guard.js_problems(src, helper_allowed)
 
-    def test_dollar_before_an_interpolation_is_a_literal_dollar(self):
-        self.assertEqual(self.bad("x = `$${nf(a, 2)} of $${nf(b)}`"), [])
-        self.assertEqual(self.bad("x = `$${a}`"), ["a"])
+    def mutated(self, old, new, count=1):
+        src = real_index()
+        self.assertEqual(src.count(old), count, old)
+        return src.replace(old, new)
 
-    def test_sinks_are_reported(self):
-        self.assertTrue(guard.sink_problems("e.innerHTML = s"))
-        self.assertTrue(guard.sink_problems("e.outerHTML = s"))
-        self.assertTrue(guard.sink_problems("e.insertAdjacentHTML('beforeend', s)"))
-        self.assertTrue(guard.sink_problems("e['innerHTML'] = s"))
-        self.assertTrue(guard.sink_problems("document.write(s)"))
-        self.assertTrue(guard.sink_problems("eval(s)"))
-        self.assertTrue(guard.sink_problems("x = new Html(s)"))
-        self.assertEqual(guard.sink_problems("host.innerHTML = h.s", 1), [])
+    def appended(self, extra):
+        return real_index() + "\n" + extra + "\n"
 
-    def test_markup_takes_only_literals(self):
-        self.assertTrue(guard.sink_problems("m = markup(a + b)"))
-        self.assertTrue(guard.sink_problems("m = markup(String(a))"))
-        self.assertEqual(guard.sink_problems("m = markup(`<b>${esc(a)}</b>` + '<i></i>')"), [])
-        self.assertEqual(guard.sink_problems("const markup = s => s"), [])
+    def refused(self, src, fragment, helper_allowed=True):
+        found = self.problems(src, helper_allowed)
+        self.assertTrue(any(fragment in p for p in found), (fragment, found))
 
-    def test_html_checks(self):
-        self.assertTrue(guard.html_problems("<script>alert(1)</script>"))
-        self.assertTrue(guard.html_problems('<button onclick="f()">x</button>'))
-        self.assertTrue(guard.html_problems('<a href="javascript:f()">x</a>'))
-        self.assertEqual(guard.html_problems('<script src="/a.js" defer></script><!-- <script>x</script> -->'), [])
+    def test_the_real_renderer_and_the_other_scripts_are_accepted(self):
+        self.assertEqual(self.problems(real_index()), [])
+        for path in page_scripts():
+            if path != INDEX_JS:
+                self.assertEqual(self.problems(path.read_text(encoding="utf-8"), False), [], path.name)
+
+    def test_a_second_createpolicy_is_refused(self):
+        self.refused(self.appended('const second = window.trustedTypes.createPolicy("other", { createHTML: s => s });'),
+                     "exactly one createPolicy")
+
+    def test_a_createpolicy_outside_put_is_refused(self):
+        src = self.mutated('const dash = window.trustedTypes ? window.trustedTypes.createPolicy("dash", rules) : rules;',
+                           'const dash = rules;') + '\nconst p = window.trustedTypes.createPolicy("dash", {});\n'
+        self.refused(src, "exactly one createPolicy")
+
+    def test_a_policy_with_another_name_is_refused(self):
+        self.refused(self.mutated('createPolicy("dash", rules)', 'createPolicy("everything", rules)'), 'must be named "dash"')
+
+    def test_a_second_createhtml_call_is_refused(self):
+        self.refused(self.appended('const trusted = dash.createHTML("", s);'), "exactly one .createHTML( call")
+
+    def test_a_createhtml_call_outside_put_is_refused(self):
+        src = self.mutated('host.innerHTML = dash.createHTML("", h);', 'host.innerHTML = h.s;')
+        self.refused(src + '\nconst t = window.trustedTypes.defaultPolicy.createHTML(s);\n', "exactly one .createHTML( call")
+
+    def test_a_pass_through_createhtml_rule_is_refused(self):
+        self.refused(self.mutated("h instanceof Html ? h.s : escText(s)", "s"), "must escape")
+        self.refused(self.mutated("h instanceof Html ? h.s : escText(s)", "h instanceof Html ? h.s : s"), "must escape")
+
+    def test_an_innerhtml_outside_put_is_refused(self):
+        self.refused(self.appended("el.innerHTML = s;"), "innerHTML used outside the helper block")
+        self.refused("el.innerHTML = s;", "innerHTML", helper_allowed=False)
+
+    def test_a_second_innerhtml_inside_put_is_refused(self):
+        self.refused(self.mutated("host.innerHTML = dash.createHTML(\"\", h);",
+                                  "host.innerHTML = dash.createHTML(\"\", h); host.innerHTML = h.s;"), "exactly one innerHTML")
+
+    def test_markup_called_as_a_function_is_refused(self):
+        self.refused(self.appended('const m = markup("<b>" + s + "</b>");'), "does not tag a template literal")
+        self.refused(self.appended("const m = markup(`<b>x</b>`);"), "does not tag a template literal")
+
+    def test_markup_passed_around_or_aliased_is_refused(self):
+        self.refused(self.appended("const m = markup;"), "does not tag a template literal")
+        self.refused(self.appended("const all = [markup];"), "does not tag a template literal")
+        self.refused(self.appended("list.map(markup);"), "does not tag a template literal")
+
+    def test_markup_inside_an_interpolation_is_checked_too(self):
+        self.refused(self.appended("const m = markup`<i>${markup(s)}</i>`;"), "does not tag a template literal")
+        self.assertEqual(self.problems(self.appended("const m = markup`<i>${markup`<b></b>`}</i>`;")), [])
+
+    def test_html_named_outside_the_helper_block_is_refused(self):
+        self.refused(self.appended("const h = new Html(s);"), "Html used outside the helper block")
+        self.refused(self.appended("const ok = v instanceof Html;"), "Html used outside the helper block")
+
+    def test_a_missing_helper_block_is_refused(self):
+        src = real_index()
+        self.refused(src.replace("const { markup, cat, put } =", "const helpers ="), "helper block")
+
+    def test_a_script_that_is_not_the_renderer_names_none_of_it(self):
+        for text in ("x.innerHTML = s;", 'trustedTypes.createPolicy("dash", {});', "p.createHTML(s);", "new Html(s);",
+                     "markup(s);"):
+            self.assertTrue(self.problems(text, False), text)
+        self.refused("const { markup, cat, put } = (() => ({}))();", "outside the dashboard renderer", False)
+
+    def test_names_in_comments_and_regex_literals_do_not_confuse_the_lexer(self):
+        extra = '/* el.innerHTML = s; createPolicy markup( Html */ // innerHTML\nconst r = /"innerHTML`/g;\n'
+        self.assertEqual(self.problems(self.appended(extra)), [])
+
+    def test_the_old_deny_list_machinery_is_gone(self):
+        for name in ("sink_problems", "unwrapped_interpolations", "is_wrapped", "_direct_args", "SINK_NAMES",
+                     "FORBIDDEN_CALLS", "html_problems", "SCRIPT_TAG", "EVENT_ATTR"):
+            self.assertFalse(hasattr(guard, name), name)
+        self.assertTrue(hasattr(guard, "js_problems"))
+
+
+def shipped_policy():
+    headers = (PUBLIC / "_headers").read_text(encoding="utf-8")
+    values = csp.header_csp_values(headers, "/index.html")
+    assert len(values) == 1, values
+    return values[0]
 
 
 class EveryPage7587(unittest.TestCase):
     def test_no_page_has_an_inline_script_a_handler_or_a_javascript_url(self):
         pages = sorted(PUBLIC.glob("*.html"))
         self.assertGreaterEqual(len(pages), 7)
+        policy = shipped_policy()
         for page in pages:
-            self.assertEqual(guard.html_problems(page.read_text(encoding="utf-8")), [], page.name)
+            self.assertEqual(csp.check_page(page.read_text(encoding="utf-8"), policy), [], page.name)
 
-    def test_every_interpolation_of_every_script_is_escaped_or_formatted(self):
+    def test_7645_index_js_is_among_the_scripts_and_each_passes_the_allowlist(self):
         scripts = page_scripts()
-        self.assertTrue(INDEX_JS in scripts)
+        self.assertIn(INDEX_JS, scripts)
         for path in scripts:
-            src = path.read_text(encoding="utf-8")
-            self.assertEqual(guard.unwrapped_interpolations(src), [], path.name)
+            self.assertEqual(guard.js_problems(path.read_text(encoding="utf-8"), path == INDEX_JS), [], path.name)
 
     def test_the_only_markup_sink_is_the_typed_put_helper(self):
-        for path in page_scripts():
-            src = path.read_text(encoding="utf-8")
-            if path == INDEX_JS:
-                self.assertEqual(guard.sink_problems(src, allowed_sinks=1, allowed_new_html=2), [], path.name)
-                self.assertRegex(src, r"function put\(host, h\)\{\s*if\(!\(h instanceof Html\)\) throw[^\n]*\s*host\.innerHTML = h\.s;")
-            else:
-                self.assertEqual(guard.sink_problems(src), [], path.name)
+        src = real_index()
+        self.assertRegex(src, r'host\.innerHTML = dash\.createHTML\("", h\);')
+        self.assertRegex(src, r'if\(!\(h instanceof Html\)\) throw new TypeError\("put\(\) takes markup, not a string"\);')
+        self.assertEqual(src.count("innerHTML"), 2, "one assignment plus the header comment")
 
-    def test_esc_escapes_all_five_entities_once(self):
-        src = INDEX_JS.read_text(encoding="utf-8")
-        m = re.search(r"function esc\(v\)\{(.*?)\n\}", src, re.DOTALL)
+    def test_escText_escapes_all_five_entities_once_7588(self):
+        src = real_index()
+        m = re.search(r"const escText = v => (.*?);\n", src)
         self.assertIsNotNone(m)
         for ent in ("&amp;", "&lt;", "&gt;", "&quot;", "&#39;"):
             self.assertIn(ent, m.group(1))
-        self.assertIn("instanceof Html", m.group(1))
+        part = re.search(r"const part = v => (.*?);\n", src).group(1)
+        self.assertIn("instanceof Html", part)
+        self.assertIn("escText(v)", part)
 
     def test_script_src_has_no_unsafe_inline_in_any_policy_line(self):
         headers = (PUBLIC / "_headers").read_text(encoding="utf-8")
