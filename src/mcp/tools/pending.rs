@@ -162,7 +162,18 @@ pub fn handle_subscription_dlq_list(
 ) -> Result<Value, String> {
     let caller = crate::identity::resolve_agent_id(None, mcp_client).map_err(|e| e.to_string())?;
     handle_subscription_dlq_list_for(conn, params, &caller, &crate::identity::admin_agent_ids())
-        .map_err(|e| e.to_string())
+        .map_err(String::from)
+}
+
+/// Caller-facing failure text of [`handle_subscription_dlq_list_for`]; the
+/// message is already the redacted MCP error text.
+#[derive(Debug)]
+pub struct DlqListError(String);
+
+impl From<DlqListError> for String {
+    fn from(e: DlqListError) -> Self {
+        e.0
+    }
 }
 
 /// [`handle_subscription_dlq_list`] for an already-resolved `caller` and an
@@ -173,7 +184,7 @@ pub fn handle_subscription_dlq_list_for(
     params: &Value,
     caller: &str,
     admin_ids: &[String],
-) -> anyhow::Result<Value> {
+) -> Result<Value, DlqListError> {
     let subscription_id = params[param_names::SUBSCRIPTION_ID].as_str();
     let limit = params["limit"]
         .as_u64()
@@ -200,9 +211,9 @@ pub fn handle_subscription_dlq_list_for(
     //     preserves the per-tenant operator inventory use-case while
     //     refusing to leak cross-tenant payloads.
     let rows_all = crate::subscriptions::list_dlq(conn, subscription_id).map_err(|e| {
-        anyhow::anyhow!(crate::mcp::error_text::mcp_foreign_err(
+        DlqListError(crate::mcp::error_text::mcp_foreign_err(
             "resolve_agent_id",
-            e
+            e,
         ))
     })?;
     let rows: Vec<_> = if subscription_id
@@ -218,7 +229,7 @@ pub fn handle_subscription_dlq_list_for(
             .collect()
     } else if let Some(sid) = subscription_id {
         let owner = crate::subscriptions::get_owner(conn, sid)
-            .map_err(|e| anyhow::anyhow!(crate::mcp::error_text::mcp_foreign_err("list_dlq", e)))?;
+            .map_err(|e| DlqListError(crate::mcp::error_text::mcp_foreign_err("list_dlq", e)))?;
         if owner.as_deref() != Some(caller) {
             // Identical wire shape to "no DLQ entries since the
             // subscription rolled over". Cannot distinguish from
@@ -251,7 +262,7 @@ pub fn handle_subscription_dlq_list_for(
                 Some(o) => o.clone(),
                 None => {
                     let o = crate::subscriptions::get_owner(conn, &sid).map_err(|e| {
-                        anyhow::anyhow!(crate::mcp::error_text::mcp_foreign_err("get_owner", e))
+                        DlqListError(crate::mcp::error_text::mcp_foreign_err("get_owner", e))
                     })?;
                     owners.insert(sid.clone(), o.clone());
                     o
