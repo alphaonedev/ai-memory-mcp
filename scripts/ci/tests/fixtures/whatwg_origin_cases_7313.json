@@ -1,0 +1,1112 @@
+{
+ "base_url": "https://dash.example/page.html",
+ "page_origin": "https://dash.example",
+ "oracle": "node v22.23.3 new URL(input, base_url)",
+ "cases": [
+  {
+   "group": "review",
+   "input": "\u0000https://c00.example/p",
+   "browser": "https://c00.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0001https://c01.example/p",
+   "browser": "https://c01.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0002https://c02.example/p",
+   "browser": "https://c02.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0003https://c03.example/p",
+   "browser": "https://c03.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0004https://c04.example/p",
+   "browser": "https://c04.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0005https://c05.example/p",
+   "browser": "https://c05.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0006https://c06.example/p",
+   "browser": "https://c06.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0007https://c07.example/p",
+   "browser": "https://c07.example"
+  },
+  {
+   "group": "review",
+   "input": "\bhttps://c08.example/p",
+   "browser": "https://c08.example"
+  },
+  {
+   "group": "review",
+   "input": "\thttps://c09.example/p",
+   "browser": "https://c09.example"
+  },
+  {
+   "group": "review",
+   "input": "\nhttps://c0a.example/p",
+   "browser": "https://c0a.example"
+  },
+  {
+   "group": "review",
+   "input": "\u000bhttps://c0b.example/p",
+   "browser": "https://c0b.example"
+  },
+  {
+   "group": "review",
+   "input": "\fhttps://c0c.example/p",
+   "browser": "https://c0c.example"
+  },
+  {
+   "group": "review",
+   "input": "\rhttps://c0d.example/p",
+   "browser": "https://c0d.example"
+  },
+  {
+   "group": "review",
+   "input": "\u000ehttps://c0e.example/p",
+   "browser": "https://c0e.example"
+  },
+  {
+   "group": "review",
+   "input": "\u000fhttps://c0f.example/p",
+   "browser": "https://c0f.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0010https://c10.example/p",
+   "browser": "https://c10.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0011https://c11.example/p",
+   "browser": "https://c11.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0012https://c12.example/p",
+   "browser": "https://c12.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0013https://c13.example/p",
+   "browser": "https://c13.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0014https://c14.example/p",
+   "browser": "https://c14.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0015https://c15.example/p",
+   "browser": "https://c15.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0016https://c16.example/p",
+   "browser": "https://c16.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0017https://c17.example/p",
+   "browser": "https://c17.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0018https://c18.example/p",
+   "browser": "https://c18.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0019https://c19.example/p",
+   "browser": "https://c19.example"
+  },
+  {
+   "group": "review",
+   "input": "\u001ahttps://c1a.example/p",
+   "browser": "https://c1a.example"
+  },
+  {
+   "group": "review",
+   "input": "\u001bhttps://c1b.example/p",
+   "browser": "https://c1b.example"
+  },
+  {
+   "group": "review",
+   "input": "\u001chttps://c1c.example/p",
+   "browser": "https://c1c.example"
+  },
+  {
+   "group": "review",
+   "input": "\u001dhttps://c1d.example/p",
+   "browser": "https://c1d.example"
+  },
+  {
+   "group": "review",
+   "input": "\u001ehttps://c1e.example/p",
+   "browser": "https://c1e.example"
+  },
+  {
+   "group": "review",
+   "input": "\u001fhttps://c1f.example/p",
+   "browser": "https://c1f.example"
+  },
+  {
+   "group": "review",
+   "input": " https://c20.example/p",
+   "browser": "https://c20.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e00.example/p\u0000",
+   "browser": "https://e00.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e01.example/p\u0001",
+   "browser": "https://e01.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e02.example/p\u0002",
+   "browser": "https://e02.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e03.example/p\u0003",
+   "browser": "https://e03.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e04.example/p\u0004",
+   "browser": "https://e04.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e05.example/p\u0005",
+   "browser": "https://e05.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e06.example/p\u0006",
+   "browser": "https://e06.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e07.example/p\u0007",
+   "browser": "https://e07.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e08.example/p\b",
+   "browser": "https://e08.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e09.example/p\t",
+   "browser": "https://e09.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e0a.example/p\n",
+   "browser": "https://e0a.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e0b.example/p\u000b",
+   "browser": "https://e0b.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e0c.example/p\f",
+   "browser": "https://e0c.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e0d.example/p\r",
+   "browser": "https://e0d.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e0e.example/p\u000e",
+   "browser": "https://e0e.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e0f.example/p\u000f",
+   "browser": "https://e0f.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e10.example/p\u0010",
+   "browser": "https://e10.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e11.example/p\u0011",
+   "browser": "https://e11.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e12.example/p\u0012",
+   "browser": "https://e12.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e13.example/p\u0013",
+   "browser": "https://e13.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e14.example/p\u0014",
+   "browser": "https://e14.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e15.example/p\u0015",
+   "browser": "https://e15.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e16.example/p\u0016",
+   "browser": "https://e16.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e17.example/p\u0017",
+   "browser": "https://e17.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e18.example/p\u0018",
+   "browser": "https://e18.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e19.example/p\u0019",
+   "browser": "https://e19.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e1a.example/p\u001a",
+   "browser": "https://e1a.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e1b.example/p\u001b",
+   "browser": "https://e1b.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e1c.example/p\u001c",
+   "browser": "https://e1c.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e1d.example/p\u001d",
+   "browser": "https://e1d.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e1e.example/p\u001e",
+   "browser": "https://e1e.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e1f.example/p\u001f",
+   "browser": "https://e1f.example"
+  },
+  {
+   "group": "review",
+   "input": "https://e20.example/p ",
+   "browser": "https://e20.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0000//r00.example/p\u0000",
+   "browser": "https://r00.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0001//r01.example/p\u0001",
+   "browser": "https://r01.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0002//r02.example/p\u0002",
+   "browser": "https://r02.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0003//r03.example/p\u0003",
+   "browser": "https://r03.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0004//r04.example/p\u0004",
+   "browser": "https://r04.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0005//r05.example/p\u0005",
+   "browser": "https://r05.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0006//r06.example/p\u0006",
+   "browser": "https://r06.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0007//r07.example/p\u0007",
+   "browser": "https://r07.example"
+  },
+  {
+   "group": "review",
+   "input": "\b//r08.example/p\b",
+   "browser": "https://r08.example"
+  },
+  {
+   "group": "review",
+   "input": "\t//r09.example/p\t",
+   "browser": "https://r09.example"
+  },
+  {
+   "group": "review",
+   "input": "\n//r0a.example/p\n",
+   "browser": "https://r0a.example"
+  },
+  {
+   "group": "review",
+   "input": "\u000b//r0b.example/p\u000b",
+   "browser": "https://r0b.example"
+  },
+  {
+   "group": "review",
+   "input": "\f//r0c.example/p\f",
+   "browser": "https://r0c.example"
+  },
+  {
+   "group": "review",
+   "input": "\r//r0d.example/p\r",
+   "browser": "https://r0d.example"
+  },
+  {
+   "group": "review",
+   "input": "\u000e//r0e.example/p\u000e",
+   "browser": "https://r0e.example"
+  },
+  {
+   "group": "review",
+   "input": "\u000f//r0f.example/p\u000f",
+   "browser": "https://r0f.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0010//r10.example/p\u0010",
+   "browser": "https://r10.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0011//r11.example/p\u0011",
+   "browser": "https://r11.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0012//r12.example/p\u0012",
+   "browser": "https://r12.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0013//r13.example/p\u0013",
+   "browser": "https://r13.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0014//r14.example/p\u0014",
+   "browser": "https://r14.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0015//r15.example/p\u0015",
+   "browser": "https://r15.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0016//r16.example/p\u0016",
+   "browser": "https://r16.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0017//r17.example/p\u0017",
+   "browser": "https://r17.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0018//r18.example/p\u0018",
+   "browser": "https://r18.example"
+  },
+  {
+   "group": "review",
+   "input": "\u0019//r19.example/p\u0019",
+   "browser": "https://r19.example"
+  },
+  {
+   "group": "review",
+   "input": "\u001a//r1a.example/p\u001a",
+   "browser": "https://r1a.example"
+  },
+  {
+   "group": "review",
+   "input": "\u001b//r1b.example/p\u001b",
+   "browser": "https://r1b.example"
+  },
+  {
+   "group": "review",
+   "input": "\u001c//r1c.example/p\u001c",
+   "browser": "https://r1c.example"
+  },
+  {
+   "group": "review",
+   "input": "\u001d//r1d.example/p\u001d",
+   "browser": "https://r1d.example"
+  },
+  {
+   "group": "review",
+   "input": "\u001e//r1e.example/p\u001e",
+   "browser": "https://r1e.example"
+  },
+  {
+   "group": "review",
+   "input": "\u001f//r1f.example/p\u001f",
+   "browser": "https://r1f.example"
+  },
+  {
+   "group": "review",
+   "input": " //r20.example/p ",
+   "browser": "https://r20.example"
+  },
+  {
+   "group": "review",
+   "input": "https://p.example:443/x",
+   "browser": "https://p.example"
+  },
+  {
+   "group": "review",
+   "input": "https://p.example:8443/x",
+   "browser": "https://p.example:8443"
+  },
+  {
+   "group": "review",
+   "input": "http://p.example:80/x",
+   "browser": "http://p.example"
+  },
+  {
+   "group": "review",
+   "input": "http://p.example:8080/x",
+   "browser": "http://p.example:8080"
+  },
+  {
+   "group": "review",
+   "input": "http://p.example:443/x",
+   "browser": "http://p.example:443"
+  },
+  {
+   "group": "review",
+   "input": "https://p.example:80/x",
+   "browser": "https://p.example:80"
+  },
+  {
+   "group": "review",
+   "input": "https://p.example:0/x",
+   "browser": "https://p.example:0"
+  },
+  {
+   "group": "review",
+   "input": "https://p.example:00443/x",
+   "browser": "https://p.example"
+  },
+  {
+   "group": "review",
+   "input": "https://p.example:0080/x",
+   "browser": "https://p.example:80"
+  },
+  {
+   "group": "review",
+   "input": "https://p.example:08443/x",
+   "browser": "https://p.example:8443"
+  },
+  {
+   "group": "review",
+   "input": "https://p.example:/x",
+   "browser": "https://p.example"
+  },
+  {
+   "group": "review",
+   "input": "http://p.example:/x",
+   "browser": "http://p.example"
+  },
+  {
+   "group": "review",
+   "input": "https://p.example:65536/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "review",
+   "input": "https://p.example:99999/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "review",
+   "input": "//p.example:8443/x",
+   "browser": "https://p.example:8443"
+  },
+  {
+   "group": "review",
+   "input": "//p.example:443/x",
+   "browser": "https://p.example"
+  },
+  {
+   "group": "review",
+   "input": "https://[::1]/x",
+   "browser": "https://[::1]"
+  },
+  {
+   "group": "review",
+   "input": "https://[::1]:8443/x",
+   "browser": "https://[::1]:8443"
+  },
+  {
+   "group": "review",
+   "input": "http://[2001:db8::1]:80/x",
+   "browser": "http://[2001:db8::1]"
+  },
+  {
+   "group": "review",
+   "input": "//[::1]:9000/x",
+   "browser": "https://[::1]:9000"
+  },
+  {
+   "group": "review",
+   "input": "https://127.0.0.1:8443/x",
+   "browser": "https://127.0.0.1:8443"
+  },
+  {
+   "group": "review",
+   "input": "https://0x7f.1/x",
+   "browser": "https://127.0.0.1"
+  },
+  {
+   "group": "review",
+   "input": "https://u@ui.example/x",
+   "browser": "https://ui.example"
+  },
+  {
+   "group": "review",
+   "input": "https://u:pw@ui.example:9000/x",
+   "browser": "https://ui.example:9000"
+  },
+  {
+   "group": "review",
+   "input": "https://u:p@ss@ui3.example/x",
+   "browser": "https://ui3.example"
+  },
+  {
+   "group": "review",
+   "input": "https://a@b@ui4.example:8443/x",
+   "browser": "https://ui4.example:8443"
+  },
+  {
+   "group": "review",
+   "input": "https://u:@ui5.example/x",
+   "browser": "https://ui5.example"
+  },
+  {
+   "group": "review",
+   "input": "https://@ui6.example/x",
+   "browser": "https://ui6.example"
+  },
+  {
+   "group": "review",
+   "input": "HTTPS://UP.EXAMPLE/x",
+   "browser": "https://up.example"
+  },
+  {
+   "group": "review",
+   "input": "HTTP://UP.EXAMPLE:8080/x",
+   "browser": "http://up.example:8080"
+  },
+  {
+   "group": "review",
+   "input": "HtTpS://Mx.Example:443/x",
+   "browser": "https://mx.example"
+  },
+  {
+   "group": "review",
+   "input": "https://%65xample.com/x",
+   "browser": "https://example.com"
+  },
+  {
+   "group": "review",
+   "input": "https://a_b.example/x",
+   "browser": "https://a_b.example"
+  },
+  {
+   "group": "review",
+   "input": "https://ex\u00e4mple.com/x",
+   "browser": "https://xn--exmple-cua.com"
+  },
+  {
+   "group": "review",
+   "input": "https://host.example./x",
+   "browser": "https://host.example."
+  },
+  {
+   "group": "review",
+   "input": "http:noslash.example/x",
+   "browser": "http://noslash.example"
+  },
+  {
+   "group": "review",
+   "input": "https:noslash.example/x",
+   "browser": "none"
+  },
+  {
+   "group": "review",
+   "input": "https:/one.example/x",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "https:///triple.example/x",
+   "browser": "https://triple.example"
+  },
+  {
+   "group": "extra",
+   "input": "http:///triple2.example/x",
+   "browser": "http://triple2.example"
+  },
+  {
+   "group": "extra",
+   "input": "///slashes.example/x",
+   "browser": "https://slashes.example"
+  },
+  {
+   "group": "extra",
+   "input": "http:\\\\bs.example/x",
+   "browser": "http://bs.example"
+  },
+  {
+   "group": "extra",
+   "input": "https:\\/mixed.example/x",
+   "browser": "https://mixed.example"
+  },
+  {
+   "group": "extra",
+   "input": "\\/mixed2.example/x",
+   "browser": "https://mixed2.example"
+  },
+  {
+   "group": "extra",
+   "input": "/path//x.example",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "foo//x.example",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "x.example/p",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "https://[::1/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://[::1]x/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://[::FFFF:1.2.3.4]/x",
+   "browser": "https://[::ffff:102:304]"
+  },
+  {
+   "group": "extra",
+   "input": "https://[1:0:0:2:0:0:0:3]/x",
+   "browser": "https://[1:0:0:2::3]"
+  },
+  {
+   "group": "extra",
+   "input": "https://[0:0:0:0:0:0:0:0]:81/x",
+   "browser": "https://[::]:81"
+  },
+  {
+   "group": "extra",
+   "input": "https://[::1%25eth0]/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://[zz]/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://[::1]:/x",
+   "browser": "https://[::1]"
+  },
+  {
+   "group": "extra",
+   "input": "https://[::1]:99999/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://[]/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://[1:2:3:4:5:6:7:8]:443/x",
+   "browser": "https://[1:2:3:4:5:6:7:8]"
+  },
+  {
+   "group": "extra",
+   "input": "https://[1::2:3]:8080/x",
+   "browser": "https://[1::2:3]:8080"
+  },
+  {
+   "group": "extra",
+   "input": "https://ho[st.example/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://host.example:80a/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://host.example:+80/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://host.example:80:90/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://:80/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https:///",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "http://",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://u@/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://u@:80/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://127.1/x",
+   "browser": "https://127.0.0.1"
+  },
+  {
+   "group": "extra",
+   "input": "https://0177.0.0.1/x",
+   "browser": "https://127.0.0.1"
+  },
+  {
+   "group": "extra",
+   "input": "https://1.2.3.4.5/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://256.1.1.1/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://1.2.3/x",
+   "browser": "https://1.2.0.3"
+  },
+  {
+   "group": "extra",
+   "input": "https://4294967295/x",
+   "browser": "https://255.255.255.255"
+  },
+  {
+   "group": "extra",
+   "input": "https://4294967296/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://0x/x",
+   "browser": "https://0.0.0.0"
+  },
+  {
+   "group": "extra",
+   "input": "https://0xG/x",
+   "browser": "https://0xg"
+  },
+  {
+   "group": "extra",
+   "input": "https://1.2.3.4./x",
+   "browser": "https://1.2.3.4"
+  },
+  {
+   "group": "extra",
+   "input": "https://a.0x1/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://09/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://foo.09/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://0X7F.0.0.1/x",
+   "browser": "https://127.0.0.1"
+  },
+  {
+   "group": "extra",
+   "input": "https://1.2.3.4:8443/x",
+   "browser": "https://1.2.3.4:8443"
+  },
+  {
+   "group": "extra",
+   "input": "https://FOO.Example%2E/x",
+   "browser": "https://foo.example."
+  },
+  {
+   "group": "extra",
+   "input": "https://exa%mple/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://a b.example/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://a<b.example/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://xn--/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://xn--exmple-cua.com/x",
+   "browser": "https://xn--exmple-cua.com"
+  },
+  {
+   "group": "extra",
+   "input": "https://EX\u00c4MPLE.com/x",
+   "browser": "https://xn--exmple-cua.com"
+  },
+  {
+   "group": "extra",
+   "input": "https://ex%C3%A4mple.com/x",
+   "browser": "https://xn--exmple-cua.com"
+  },
+  {
+   "group": "extra",
+   "input": "https://exa\u3002mple.com/x",
+   "browser": "https://exa.mple.com"
+  },
+  {
+   "group": "extra",
+   "input": "https://a%00b.example/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "https://a.example:8443@evil.example/x",
+   "browser": "https://evil.example"
+  },
+  {
+   "group": "extra",
+   "input": "https://evil.example\\@good.example/x",
+   "browser": "https://evil.example"
+  },
+  {
+   "group": "extra",
+   "input": "https://good.example?@evil.example/x",
+   "browser": "https://good.example"
+  },
+  {
+   "group": "extra",
+   "input": "https://good.example#@evil.example/x",
+   "browser": "https://good.example"
+  },
+  {
+   "group": "extra",
+   "input": "https://good.example:443?x",
+   "browser": "https://good.example"
+  },
+  {
+   "group": "extra",
+   "input": "https://good.example#frag",
+   "browser": "https://good.example"
+  },
+  {
+   "group": "extra",
+   "input": "https://good.example",
+   "browser": "https://good.example"
+  },
+  {
+   "group": "extra",
+   "input": "http:good.example:8080/x",
+   "browser": "http://good.example:8080"
+  },
+  {
+   "group": "extra",
+   "input": "https:good.example/x",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "https:/good.example/x",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "HTTPS:\\\\UP2.example/x",
+   "browser": "https://up2.example"
+  },
+  {
+   "group": "extra",
+   "input": "  //lead.example/x",
+   "browser": "https://lead.example"
+  },
+  {
+   "group": "extra",
+   "input": "//x.example:abc/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "//x.example:65535/x",
+   "browser": "https://x.example:65535"
+  },
+  {
+   "group": "extra",
+   "input": "//x.example:65536/x",
+   "browser": "PARSE-FAIL"
+  },
+  {
+   "group": "extra",
+   "input": "data:text/html,//x.example",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "javascript:alert(1)",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "mailto:a@b.example",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "about:blank",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "   ",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "#frag",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "?q=1",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "./x",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "../x",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "https://dash.example/x",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "//dash.example/x",
+   "browser": "none"
+  },
+  {
+   "group": "extra",
+   "input": "https://dash.example:8443/x",
+   "browser": "https://dash.example:8443"
+  },
+  {
+   "group": "extra",
+   "input": "https://DASH.example:443/x",
+   "browser": "none"
+  }
+ ]
+}

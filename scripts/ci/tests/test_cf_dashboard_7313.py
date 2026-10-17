@@ -11,6 +11,7 @@ Also: deploy.py --help exits 0 and never uses shell=True. No network: api() and 
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import re
 import subprocess
@@ -21,6 +22,7 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
+import cf_origin_7313 as origin_mod
 from cf_origin_7313 import loaded_origins, origin_of
 
 mock = unittest.mock
@@ -34,6 +36,7 @@ LIVE_STATE = "state.json"
 MCP_PRODUCER = REPO / "scripts" / "evidence" / "mcp-tools-state.py"
 GOOD_ACCT = "0123456789abcdef0123456789abcdef"
 SECRET_TOKEN = "tok-SENTINEL-VALUE-7313"
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 AT = chr(64)  # userinfo separator, built so no literal email-shaped string appears
 
 
@@ -106,19 +109,35 @@ class Credentials7313(unittest.TestCase):
         self.assertEqual(self.cf.credential("CLOUDFLARE_API_TOKEN"), "quoted")
         self.assertEqual(self.cf.credential("CLOUDFLARE_ACCOUNT_ID"), GOOD_ACCT)
 
+    def _unreadable_log(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.cf.credential("CLOUDFLARE_API_TOKEN"), "")
+        return err.getvalue()
+
     def test_unreadable_env_file_is_reported_not_swallowed(self):
-        # CodeQL 482 py/empty-except: an unreadable home env file (here a directory) is logged with a fixed
-        # message, never silently passed; an absent file stays silent; no path content is echoed.
+        # CodeQL 482 py/empty-except: an unreadable home env file is logged with a fixed message
+        # (exception type only), never silently passed; an absent file stays silent.
+        # #7516: the log carries neither the path nor any credential value.
         (self.home / ".env").mkdir()
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            self.assertEqual(self.cf.credential("CLOUDFLARE_API_TOKEN"), "")
-        self.assertIn("unreadable", err.getvalue())
+        log = self._unreadable_log()
+        self.assertEqual(log, "warning: home env file is unreadable (IsADirectoryError)\n")
+        self.assertNotIn(str(self.home), log)
         (self.home / ".env").rmdir()
-        err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            self.assertEqual(self.cf.credential("CLOUDFLARE_API_TOKEN"), "")
-        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(self._unreadable_log(), "")
+
+    def test_unreadable_env_file_log_omits_path_and_secret_7516(self):
+        env_file = self.home / ".env"
+        env_file.write_text("CLOUDFLARE_API_TOKEN=" + SECRET_TOKEN + "\n")
+        env_file.chmod(0)
+        self.addCleanup(env_file.chmod, 0o600)
+        if os.access(env_file, os.R_OK):
+            self.skipTest("a privileged user reads a mode-0 file; the directory case covers the path")
+        log = self._unreadable_log()
+        self.assertEqual(log, "warning: home env file is unreadable (PermissionError)\n")
+        self.assertNotIn(str(self.home), log)
+        self.assertNotIn(".env", log)
+        self.assertNotIn(SECRET_TOKEN, log)
 
     def test_account_id_validation(self):
         self.assertTrue(self.cf.valid_account_id(GOOD_ACCT))
@@ -351,6 +370,183 @@ class LoadedOriginsCase7313(unittest.TestCase):
                          {"https://ui2.example:9000"})
 
 
+def _expected_for(browser):
+    """The helper-side expectation for one recorded browser result."""
+    if browser == "PARSE-FAIL":
+        return "unparsed"
+    return None if browser == "none" else browser
+
+
+class WhatwgOriginTable7313(unittest.TestCase):
+    """#7512-#7515: the origin helper agrees with the recorded WHATWG `URL` result for every case.
+    The 137 review r5 cases plus extra shapes; node is only needed to regenerate the fixture."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.doc = json.loads((FIXTURES / "whatwg_origin_cases_7313.json").read_text(encoding="utf-8"))
+        cls.page_origin = cls.doc["page_origin"]
+
+    def test_fixture_has_the_137_review_cases(self):
+        groups = [c["group"] for c in self.doc["cases"]]
+        self.assertEqual(groups.count("review"), 137)
+        self.assertGreaterEqual(groups.count("extra"), 80)
+
+    def _check(self, group):
+        cases = [c for c in self.doc["cases"] if c["group"] == group]
+        self.assertTrue(cases)
+        for case in cases:
+            value, browser = case["input"], case["browser"]
+            want = _expected_for(browser)
+            with self.subTest(value=value, browser=browser):
+                try:
+                    got = origin_mod.parse_origin(value)
+                except origin_mod.UnparsedURL:
+                    got = "unparsed"
+                if got == self.page_origin:
+                    got = None  # the helper does not know the page's own origin; same origin loads nothing external
+                self.assertEqual(got, want)
+                found = loaded_origins('<img src="%s">' % value.replace("&", "&amp;").replace('"', "&quot;"))
+                if want == "unparsed":
+                    self.assertEqual(len(found), 1, found)
+                    self.assertTrue(next(iter(found)).startswith("unparsed:"), found)
+                else:
+                    self.assertEqual(found - {self.page_origin}, set() if want is None else {want})
+
+    def test_all_137_review_cases_match_the_browser(self):
+        self._check("review")
+
+    def test_extra_cases_match_the_browser(self):
+        self._check("extra")
+
+
+class FailClosedUrlForms7313(unittest.TestCase):
+    """One assertion per form named by review r5 (#7512-#7515)."""
+
+    def _one(self, value):
+        return loaded_origins('<img src="%s">' % value)
+
+    def test_7512_ipv6_percent_encoded_slashless_underscore_idn(self):
+        self.assertEqual(self._one("https://[::1]:8443/x"), {"https://[::1]:8443"})
+        self.assertEqual(self._one("https://[::1]/x"), {"https://[::1]"})
+        self.assertEqual(self._one("http://[2001:db8::1]:80/x"), {"http://[2001:db8::1]"})
+        self.assertEqual(self._one("//[::1]:9000/x"), {"https://[::1]:9000"})
+        self.assertEqual(self._one("https://%65xample.com/x"), {"https://example.com"})
+        self.assertEqual(self._one("http:noslash.example/x"), {"http://noslash.example"})
+        self.assertEqual(self._one("https://a_b.example/x"), {"https://a_b.example"})
+        self.assertEqual(self._one("https://ex\u00e4mple.com/x"), {"https://xn--exmple-cua.com"})
+
+    def test_7512_unparseable_authority_is_a_guard_failure_not_a_silent_drop(self):
+        for value in ("https://[::1/x", "https://exa%mple/x", "https://:80/x", "//x.example:abc/x"):
+            found = self._one(value)
+            self.assertEqual(found, {"unparsed:" + value}, value)
+
+    def test_7513_port_zero_is_a_real_port(self):
+        self.assertEqual(self._one("https://p.example:0/x"), {"https://p.example:0"})
+        self.assertEqual(self._one("https://p.example:00443/x"), {"https://p.example"})
+
+    def test_7514_userinfo_ends_at_the_last_at_sign(self):
+        self.assertEqual(self._one("https://u:p" + AT + "ss" + AT + "ui3.example/x"), {"https://ui3.example"})
+        self.assertEqual(self._one("https://a" + AT + "b" + AT + "ui4.example:8443/x"), {"https://ui4.example:8443"})
+
+    def test_7515_out_of_range_port_and_numeric_hosts(self):
+        for value in ("https://p.example:65536/x", "https://p.example:99999/x"):
+            self.assertEqual(self._one(value), {"unparsed:" + value}, value)
+        self.assertEqual(self._one("https://0x7f.1/x"), {"https://127.0.0.1"})
+        self.assertEqual(self._one("https://0177.0.0.1:8443/x"), {"https://127.0.0.1:8443"})
+
+
+class CspSourceList7313(unittest.TestCase):
+    """#7515: CSP host-sources are parsed case-insensitively on the scheme, http sources are read, and a
+    `:*` port is an explicit wildcard that the subset check honours."""
+
+    def test_scheme_and_host_are_case_insensitive(self):
+        sources = origin_mod.csp_sources("style-src 'self' HTTPS://Fonts.GoogleAPIs.com; font-src Http://f.example:8080")
+        self.assertEqual([(s.scheme, s.host, s.port) for s in sources],
+                         [("https", "fonts.googleapis.com", ""), ("http", "f.example", "8080")])
+
+    def test_default_port_is_normalised(self):
+        (src,) = origin_mod.csp_sources("img-src https://a.example:443")
+        self.assertEqual(src.port, "")
+
+    def test_port_wildcard_matches_any_port_but_a_plain_source_only_the_default(self):
+        (wild,) = origin_mod.csp_sources("img-src https://a.example:*")
+        (plain,) = origin_mod.csp_sources("img-src https://a.example")
+        self.assertEqual(wild.port, "*")
+        for origin in ("https://a.example", "https://a.example:8443"):
+            self.assertTrue(origin_mod.source_allows(wild, origin), origin)
+        self.assertTrue(origin_mod.source_allows(plain, "https://a.example"))
+        self.assertFalse(origin_mod.source_allows(plain, "https://a.example:8443"))
+        self.assertFalse(origin_mod.source_allows(plain, "http://a.example"))
+
+    def test_keywords_directive_names_and_scheme_sources_are_not_hosts(self):
+        sources = origin_mod.csp_sources("default-src 'self'; img-src 'self' data:; script-src 'unsafe-inline'")
+        self.assertEqual([s for s in sources if s.host], [])
+
+    def test_unrecognised_source_expression_fails_closed(self):
+        with self.assertRaises(ValueError):
+            origin_mod.csp_sources("img-src https://a.example:abc")
+
+
+class PublicSnapshotHygiene7518(unittest.TestCase):
+    """#7518: nothing under public/ (deployed to the public dashboard) names an internal node or path,
+    and the generators that write state files scrub them and refuse to write what is left."""
+
+    def test_no_public_json_names_an_internal_host_or_path(self):
+        hostscrub = _load("hostscrub_7518_t", "hostscrub.py")
+        for path in sorted(PUBLIC.glob("*.json")):
+            self.assertEqual(hostscrub.find_leaks(path.read_text(encoding="utf-8")), [], path.name)
+
+    def test_scrub_replaces_hostnames_and_paths_in_nested_values(self):
+        hostscrub = _load("hostscrub_7518_s", "hostscrub.py")
+        node = hostscrub.INTERNAL_HOSTNAMES[0]
+        record = {"note": '{"agent_id": "host:%s", "from": "ai:x@%s"}' % (node, node.upper()),
+                  "run_dir": "/home/someone/run-1", "deep": [{"p": "/mnt/t9/v07/x"}, "/ai-scratch/y", 3, None]}
+        clean = hostscrub.scrub(record)
+        text = json.dumps(clean)
+        self.assertEqual(hostscrub.find_leaks(text), [])
+        self.assertNotIn(node, text.lower())
+        self.assertIn("host:" + hostscrub.REDACTED, clean["note"])
+        self.assertEqual(clean["deep"][2:], [3, None])
+
+    def test_mcp_tools_state_generator_scrubs_before_writing(self):
+        hostscrub = _load("hostscrub_7518_g", "hostscrub.py")
+        node = hostscrub.INTERNAL_HOSTNAMES[0]
+        SCRATCH.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(SCRATCH)) as tmp:
+            run_dir = Path(tmp) / ("run-" + node)
+            run_dir.mkdir()
+            (run_dir / "tools-list.json").write_text(json.dumps([{"name": "memory_a"}, {"name": "memory_b"}]))
+            out = Path(tmp) / "out" / "mcp-tools-state.json"
+            spec = importlib.util.spec_from_file_location("mcp_tools_state_7518", MCP_PRODUCER)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            with mock.patch.object(mod, "git", return_value="0" * 40), \
+                    mock.patch.object(sys, "argv", ["mcp-tools-state.py", "--run-dir", str(run_dir), "--out", str(out)]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(mod.main(), 0)
+            text = out.read_text(encoding="utf-8")
+            self.assertEqual(hostscrub.find_leaks(text), [])
+            self.assertNotIn(node, text.lower())
+            self.assertEqual(json.loads(text)["total"], 2)
+
+    def test_push_state_scrubs_the_live_state_before_writing(self):
+        hostscrub = _load("hostscrub_7518_p", "hostscrub.py")
+        node = hostscrub.INTERNAL_HOSTNAMES[0]
+        mod = _load("push_state_7518", "push-state.py")
+        SCRATCH.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=str(SCRATCH)) as tmp:
+            src = Path(tmp) / "in.json"
+            src.write_text(json.dumps({"agents": [{"node": node}]}))
+            (Path(tmp) / "public").mkdir()
+            with mock.patch.object(mod, "HERE", Path(tmp)), \
+                    mock.patch.object(mod.cfcommon, "load_credentials", side_effect=mod.cfcommon.CredentialError("none")), \
+                    mock.patch.object(sys, "argv", ["push-state.py", str(src)]), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                mod.main()
+            written = (Path(tmp) / "public" / "state.json").read_text(encoding="utf-8")
+            self.assertNotIn(node, written.lower())
+
+
 class HtmlAndHeaders7313(unittest.TestCase):
     """F4 (attribute-safe escaping) and F5 (_headers CSP, framing, no duplicate rule)."""
 
@@ -373,6 +569,17 @@ class HtmlAndHeaders7313(unittest.TestCase):
         index = (PUBLIC / "index.html").read_text()
         for pat in (r"const tok=", r"const done=dims", r"tot=dims\.length", r"gap=0\.004"):
             self.assertIsNone(re.search(pat, index), "index.html still has %s" % pat)
+
+    def test_index_ring_rejects_a_non_list_dimensions_field_7517(self):
+        # removing the dead `dims.filter(...)` line also removed the implicit TypeError for a non-list
+        # `dimensions`; the ring must keep its placeholder (the explicit throw skips the ring code and
+        # leaves the poll's catch to mark the page offline), not paint a real-looking 0%.
+        text = (PUBLIC / "index.html").read_text()
+        render = text[text.index("function renderAll(D){"):text.index("/* ---------- live poll ---------- */")]
+        guard = re.search(r"if\(!Array\.isArray\(dims\)\)\s*throw new TypeError\(", render)
+        self.assertIsNotNone(guard, "renderAll lost its Array.isArray(dims) guard")
+        self.assertLess(guard.start(), render.index('getElementById("ringpct")'))
+        self.assertLess(render.index("_S(()=>board(dims))"), guard.start(), "panels must render before the guard")
 
     def test_headers_csp_matches_loaded_origins(self):
         headers = (PUBLIC / "_headers").read_text()
