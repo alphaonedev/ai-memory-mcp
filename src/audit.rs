@@ -956,9 +956,39 @@ pub(crate) fn gapped_trail_for_test() -> Vec<u8> {
 #[cfg(test)]
 pub(crate) fn sink_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    let me = std::thread::current().id();
+    sink_test_lock_waiters()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
+        .push(me);
+    let guard = LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    sink_test_lock_waiters()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|t| *t != me);
+    guard
+}
+
+/// Threads currently blocked inside [`sink_test_lock`] (test-only registry).
+#[cfg(test)]
+fn sink_test_lock_waiters() -> &'static std::sync::Mutex<Vec<std::thread::ThreadId>> {
+    static WAITERS: std::sync::OnceLock<std::sync::Mutex<Vec<std::thread::ThreadId>>> =
+        std::sync::OnceLock::new();
+    WAITERS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Test-only (#7382): `true` while `thread` is waiting on [`sink_test_lock`].
+/// Lets a test prove, by observation and not by elapsed time, that code on
+/// another thread takes the lock.
+#[cfg(test)]
+pub(crate) fn sink_test_lock_is_waited_on_by(thread: std::thread::ThreadId) -> bool {
+    sink_test_lock_waiters()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains(&thread)
 }
 
 /// Test-only helper to remove the active sink so subsequent emissions
