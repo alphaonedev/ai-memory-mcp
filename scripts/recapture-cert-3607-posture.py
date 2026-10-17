@@ -15,10 +15,15 @@ across re-issues (#5039 part B is a separate, vote-gated decision).
 
 Environment overrides: DEFAULT_BIN (default <repo>/target/release/ai-memory),
 SQLCIPHER_BIN (default <repo>/target-sqlcipher/release/ai-memory; leg 4 is
-recorded as `missing` when it is absent) and TMPDIR. The shell script's defaults
-named build directories of one build host; they are replaced by repo-relative ones. Exit codes: 0 success; 1 operator keygen failed, the git sha could
-not be read, or the transcript header date disagrees with the run date.
+recorded as `missing` when it is absent) and TMPDIR (accepted only when it
+resolves, symlinks followed, under <repo-root>/.local-runs). The shell script's
+defaults named build directories of one build host; they are replaced by
+repo-relative ones. Exit codes: 0 success; 1 DEFAULT_BIN is not an executable
+file, TMPDIR is outside <repo-root>/.local-runs, operator keygen failed, the git
+sha could not be read, or the transcript header date disagrees with the run
+date; 2 unknown arguments.
 """
+import argparse
 import base64
 import datetime
 import os
@@ -50,6 +55,16 @@ PEER_ATTESTATION = (
 )
 SUMMARY_FILES = ("posture-bare-env.out", "posture-hardened-env.out", "posture-sqlcipher-pass.out")
 PASSPHRASE_BYTES = 32
+LOCAL_RUNS = ROOT / ".local-runs"
+DIR_MODE = 0o700
+KEY_FILE_MODE = 0o600
+USAGE_EPILOG = (
+    "Environment overrides: DEFAULT_BIN (default <repo>/target/release/ai-memory, must be "
+    "an executable file), SQLCIPHER_BIN (default <repo>/target-sqlcipher/release/ai-memory; "
+    "leg 4 is recorded as `missing` when absent), TMPDIR (must resolve under "
+    "<repo>/.local-runs). Exit codes: 0 success; 1 preflight or capture failure; "
+    "2 unknown arguments."
+)
 
 
 def utc_run_date():
@@ -74,13 +89,12 @@ def check_header_date(transcript_path, run_date):
 
 
 def sanitize(raw):
-    """Collapse absolute repo, fixture and home paths (same order as the shell sed)."""
+    """Collapse absolute repo, fixture and home paths (same order and bytes as GNU sed:
+    a final line without a newline stays without one)."""
     out = raw.replace(str(ROOT).encode(), b"<repo-root>")
     out = out.replace(str(FIX).encode(), SANITIZED_FIXTURE_LABEL.encode())
     if HOME:
         out = out.replace(HOME.encode(), b"<home>")
-    if out and not out.endswith(b"\n"):
-        out += b"\n"  # sed terminates the final line
     return out
 
 
@@ -97,14 +111,14 @@ def write_fixtures():
 
     keys = FIX / "keys"
     keys.mkdir(parents=True, exist_ok=True)
-    os.chmod(keys, 0o700)
+    os.chmod(keys, DIR_MODE)
     signing_key = Ed25519PrivateKey.generate()
     priv = signing_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
     pub = signing_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
     (keys / "ai-memory.priv").write_bytes(priv)
     (keys / "ai-memory.pub").write_bytes(pub)
-    os.chmod(keys / "ai-memory.priv", 0o600)
-    os.chmod(keys / "ai-memory.pub", 0o644)
+    os.chmod(keys / "ai-memory.priv", KEY_FILE_MODE)
+    os.chmod(keys / "ai-memory.pub", KEY_FILE_MODE)
     (FIX / "operator.pub.b64").write_text(base64.b64encode(pub).decode() + "\n")
     (FIX / "peer-fingerprints.txt").write_text("peer-a.fleet.example " + PEER_FINGERPRINT + "\n")
     (FIX / "peer-attestation.json").write_text(PEER_ATTESTATION)
@@ -127,11 +141,14 @@ def child_env(tmpdir, extra):
 
 def run_capture(binary, args, env, raw_path, sanitized_path):
     """Run one leg, sanitize its combined output, drop the raw file, return `$?`."""
-    with open(str(raw_path), "wb") as raw:
-        done = subprocess.run([str(binary)] + args, env=env, stdout=raw,
-                              stderr=subprocess.STDOUT, check=False)
-    sanitized_path.write_bytes(sanitize(raw_path.read_bytes()))
-    raw_path.unlink()
+    try:
+        with open(str(raw_path), "wb") as raw:
+            done = subprocess.run([str(binary)] + args, env=env, stdout=raw,
+                                  stderr=subprocess.STDOUT, check=False)
+        sanitized_path.write_bytes(sanitize(raw_path.read_bytes()))
+    finally:
+        if raw_path.exists():
+            raw_path.unlink()  # the unsanitized capture never outlives this call
     return shell_status(done.returncode)
 
 
@@ -140,15 +157,58 @@ def count_rows(path, marker):
     return sum(1 for line in path.read_text(errors="replace").splitlines() if marker in line)
 
 
-def main():
+def parse_args(argv):
+    """Parse the command line; --help and unknown arguments have no side effects."""
+    parser = argparse.ArgumentParser(
+        prog="recapture-cert-3607-posture.py",
+        description="Recapture the #3607 four-leg `doctor --posture enterprise-federation` "
+                    "evidence into docs/compliance/evidence/cert-3607 (docs/evidence only).",
+        epilog=USAGE_EPILOG)
+    return parser.parse_args(argv)
+
+
+def resolve_tmpdir(raw):
+    """Return the resolved TMPDIR when it lies under <repo-root>/.local-runs, else None."""
+    candidate = Path(raw) if raw else LOCAL_RUNS / "tmp"
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(LOCAL_RUNS.resolve())
+    except ValueError:
+        return None
+    return resolved
+
+
+def ensure_private_dir(directory):
+    """Create directory (and parents) and chmod 0700 it only when this call created it."""
+    existed = directory.exists()
+    directory.mkdir(parents=True, exist_ok=True)
+    if not existed:
+        os.chmod(directory, DIR_MODE)
+
+
+def is_executable_file(candidate):
+    """True when candidate is a regular file the current user can execute."""
+    return os.path.isfile(candidate) and os.access(candidate, os.X_OK)
+
+
+def main(argv=None):
+    parse_args(sys.argv[1:] if argv is None else argv)
     run_date = utc_run_date()
     default_bin = os.environ.get("DEFAULT_BIN", DEFAULT_BIN_FALLBACK)
     sqlcipher_bin = os.environ.get("SQLCIPHER_BIN", SQLCIPHER_BIN_FALLBACK)
-    tmpdir = Path(os.environ.get("TMPDIR") or str(ROOT / ".local-runs" / "tmp"))
-    for directory in (OUT, FIX, tmpdir):
-        directory.mkdir(parents=True, exist_ok=True)
-    os.chmod(FIX, 0o700)
-    os.chmod(tmpdir, 0o700)
+    raw_tmpdir = os.environ.get("TMPDIR")
+    tmpdir = resolve_tmpdir(raw_tmpdir)
+    if tmpdir is None:
+        print("TMPDIR %s is not under %s; set TMPDIR to a directory below it or unset it"
+              % (raw_tmpdir, LOCAL_RUNS), file=sys.stderr)
+        return 1
+    if not is_executable_file(default_bin):
+        print("DEFAULT_BIN %s is not an executable file; build it (cargo build --release) "
+              "or set DEFAULT_BIN" % default_bin, file=sys.stderr)
+        return 1
+    OUT.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(FIX)
+    ensure_private_dir(tmpdir)
 
     write_fixtures()
 
@@ -162,7 +222,8 @@ def main():
             done = subprocess.run([default_bin, "rules", "keygen"], env=keygen_env,
                                   stdout=sink, stderr=subprocess.STDOUT, check=False)
         if done.returncode != 0:
-            print("operator keygen failed: " + keygen_out.read_text(errors="replace"), file=sys.stderr)
+            print("operator keygen failed: " + keygen_out.read_text(errors="replace").rstrip("\n"),
+                  file=sys.stderr)
             return 1
     op_pub_file = FIX / "keys" / "operator.key.pub"
     if not op_pub_file.is_file():
@@ -199,7 +260,7 @@ def main():
                      OUT / "posture-hardened-boot-refusal.out")
 
     # --- leg 4: sqlcipher + encrypt + boot gate ---
-    if not (os.path.isfile(sqlcipher_bin) and os.access(sqlcipher_bin, os.X_OK)):
+    if not is_executable_file(sqlcipher_bin):
         print("sqlcipher binary missing: " + sqlcipher_bin, file=sys.stderr)
         print("leg4 skipped")
         e4 = "missing"

@@ -57,7 +57,11 @@ fails = 10 if not hard else (0 if sqlcipher else 2)
 print('[PASS] sample ' + env['AI_MEMORY_KEY_DIR'] + ' HOME=' + env['HOME'])
 for i in range(fails):
     print('[FAIL] check %%d' %% i)
-print('overall: ' + ('FAIL' if fails else 'PASS'))
+tail = 'overall: ' + ('FAIL' if fails else 'PASS')
+if os.path.exists(os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'no-final-newline')):
+    sys.stdout.write(tail)
+else:
+    print(tail)
 sys.exit(2 if fails else 0)
 ''' % {'python': sys.executable}
 
@@ -126,16 +130,18 @@ class RecaptureBase(unittest.TestCase):
         path.chmod(0o755)
         return path
 
-    def run_recapture(self, sqlcipher_bin=None):
+    def run_recapture(self, sqlcipher_bin=None, args=None, extra_env=None, default_bin=None):
         env = {
             'PATH': os.environ.get('PATH', '/usr/bin:/bin'),
             'HOME': str(self.home),
             'PYTHONPATH': str(self.pystubs),
-            'DEFAULT_BIN': str(self.default_bin),
+            'DEFAULT_BIN': str(default_bin or self.default_bin),
             'SQLCIPHER_BIN': str(sqlcipher_bin or self.sqlcipher_bin),
         }
+        env.update(extra_env or {})
         script = self.root / 'scripts' / SCRIPT_NAME
         cmd = ['bash', str(script)] if script.suffix == '.sh' else [sys.executable, str(script)]
+        cmd += list(args or [])
         before = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
         done = subprocess.run(cmd, env=env, cwd=str(self.root), capture_output=True, text=True)
         after = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
@@ -244,6 +250,182 @@ class SanitizerBytes5038(RecaptureBase):
         self.assertIn('peer-fingerprints.txt', names)
         self.assertIn('peer-attestation.json', names)
         self.assertIn('posture-sqlcipher-pass.out', names)
+
+
+SED_SCRIPT = ['-e', 's|%(root)s|<repo-root>|g', '-e', 's|%(fix)s|%(label)s|g']
+
+
+class FixtureMode7394(RecaptureBase):
+    """#7394: no fixture key file is group or world accessible."""
+
+    def test_public_key_fixture_is_owner_only(self):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        keys = self.root / '.local-runs' / 'cert-3607-fixtures' / 'keys'
+        for name in ('ai-memory.priv', 'ai-memory.pub'):
+            mode = (keys / name).stat().st_mode & 0o777
+            self.assertEqual(mode, 0o600, '%s is %o' % (name, mode))
+
+
+class Argparse7402(RecaptureBase):
+    """#7402: --help and unknown arguments exit before any directory or file is touched."""
+
+    def snapshot(self):
+        return sorted(str(p.relative_to(self.root)) for p in self.root.rglob('*')
+                      if '.git' not in p.parts and 'pystubs' not in p.parts)
+
+    def test_help_prints_usage_and_has_no_side_effects(self):
+        before = self.snapshot()
+        done, _ = self.run_recapture(args=['--help'])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn('usage:', done.stdout)
+        self.assertIn('DEFAULT_BIN', done.stdout)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_unknown_argument_exits_2_with_no_side_effects(self):
+        before = self.snapshot()
+        done, _ = self.run_recapture(args=['--bogus'])
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn('usage:', done.stderr)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_existing_evidence_bytes_survive_help(self):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        out_dir = self.root / OUT_REL
+        before = {p.name: p.read_bytes() for p in out_dir.iterdir()}
+        done, _ = self.run_recapture(args=['--help'])
+        self.assertEqual(done.returncode, 0, done.stderr)
+        done, _ = self.run_recapture(args=['--bogus'])
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertEqual({p.name: p.read_bytes() for p in out_dir.iterdir()}, before)
+
+
+class BinaryPreflight7397(RecaptureBase):
+    """#7397: a bad DEFAULT_BIN is refused up front; no .raw capture survives any exit."""
+
+    def assert_refused(self, binary):
+        done, _ = self.run_recapture(default_bin=binary)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('DEFAULT_BIN', done.stderr)
+        self.assertIn(str(binary), done.stderr)
+        self.assertNotIn('Traceback', done.stderr)
+        self.assertFalse((self.root / 'docs').exists(), 'evidence dir was created')
+        self.assertEqual(list(self.root.rglob('*.raw')), [])
+
+    def test_missing_default_bin_is_refused(self):
+        self.assert_refused(self.root / 'no-such-default')
+
+    def test_non_executable_default_bin_is_refused(self):
+        plain = self.root / 'not-executable'
+        plain.write_text('x\n')
+        plain.chmod(0o644)
+        self.assert_refused(plain)
+
+    def test_directory_default_bin_is_refused(self):
+        self.assert_refused(self.root)
+
+    def test_missing_default_bin_with_prekeyed_fixtures_leaves_no_raw(self):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        done, _ = self.run_recapture(default_bin=self.root / 'no-such-default')
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertEqual(list(self.root.rglob('*.raw')), [])
+
+    def test_raw_capture_is_removed_when_sanitizing_fails(self):
+        module = load_script_module()
+        raw = self.root / 'leg.out.raw'
+
+        def boom(_raw):
+            raise RuntimeError('sanitizer failed')
+
+        module.sanitize = boom
+        with self.assertRaises(RuntimeError):
+            module.run_capture(self.default_bin, ['doctor'], {'PATH': os.environ.get('PATH', '')},
+                               raw, self.root / 'leg.out')
+        self.assertFalse(raw.exists())
+
+    def test_raw_capture_is_removed_when_the_binary_cannot_start(self):
+        module = load_script_module()
+        raw = self.root / 'leg.out.raw'
+        with self.assertRaises(OSError):
+            module.run_capture(self.root / 'nope', [], {}, raw, self.root / 'leg.out')
+        self.assertFalse(raw.exists())
+
+
+class TmpdirOverride7398(RecaptureBase):
+    """#7398: TMPDIR is honoured only under <repo-root>/.local-runs; foreign dirs keep their mode."""
+
+    def test_directory_outside_local_runs_is_refused_and_untouched(self):
+        outside = self.home / 'shared-tmp'
+        outside.mkdir()
+        outside.chmod(0o755)
+        done, _ = self.run_recapture(extra_env={'TMPDIR': str(outside)})
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('TMPDIR', done.stderr)
+        self.assertIn('.local-runs', done.stderr)
+        self.assertEqual(outside.stat().st_mode & 0o777, 0o755)
+        self.assertFalse((self.root / 'docs').exists())
+
+    def test_symlink_escaping_local_runs_is_refused(self):
+        outside = self.home / 'shared-tmp'
+        outside.mkdir()
+        outside.chmod(0o755)
+        (self.root / '.local-runs').mkdir()
+        (self.root / '.local-runs' / 'link').symlink_to(outside)
+        done, _ = self.run_recapture(extra_env={'TMPDIR': str(self.root / '.local-runs' / 'link')})
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertEqual(outside.stat().st_mode & 0o777, 0o755)
+
+    def test_new_directory_under_local_runs_is_created_private(self):
+        target = self.root / '.local-runs' / 'my-tmp'
+        done, _ = self.run_recapture(extra_env={'TMPDIR': str(target)})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+
+    def test_existing_directory_under_local_runs_keeps_its_mode(self):
+        target = self.root / '.local-runs' / 'existing-tmp'
+        target.mkdir(parents=True)
+        target.chmod(0o755)
+        done, _ = self.run_recapture(extra_env={'TMPDIR': str(target)})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+
+
+class SedParity7404(RecaptureBase):
+    """#7404: sanitize() is byte-identical to GNU sed, including the missing final newline."""
+
+    CASES = (
+        b'', b'plain', b'plain\n', b'two\nlines', b'two\nlines\n', b'\n', b'a\n\n',
+    )
+
+    def test_sanitize_adds_no_final_newline(self):
+        module = load_script_module()
+        for raw in self.CASES:
+            self.assertEqual(module.sanitize(raw), raw, raw)
+
+    def test_sanitize_collapses_paths_without_touching_line_endings(self):
+        module = load_script_module()
+        raw = (str(module.ROOT) + '/x\n' + str(module.FIX) + '/y').encode()
+        self.assertEqual(module.sanitize(raw),
+                         b'<repo-root>/x\n' + SANITIZED_FIXTURE_LABEL.encode() + b'/y')
+
+    @unittest.skipUnless(shutil.which('sed'), 'sed not available')
+    def test_matches_sed_bytes(self):
+        module = load_script_module()
+        sed_args = [a % {'root': str(module.ROOT), 'fix': str(module.FIX),
+                         'label': SANITIZED_FIXTURE_LABEL} for a in SED_SCRIPT]
+        for raw in self.CASES + ((str(module.ROOT) + '/p').encode(),
+                                 (str(module.FIX) + '/q\n').encode()):
+            done = subprocess.run(['sed'] + sed_args, input=raw, capture_output=True, check=True)
+            self.assertEqual(module.sanitize(raw), done.stdout, raw)
+
+    def test_captured_output_without_final_newline_stays_without_one(self):
+        (self.root / 'no-final-newline').write_text('')
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        data = (self.root / OUT_REL / 'posture-bare-env.out').read_bytes()
+        self.assertTrue(data.endswith(b'overall: FAIL'), data[-40:])
 
 
 if __name__ == '__main__':
