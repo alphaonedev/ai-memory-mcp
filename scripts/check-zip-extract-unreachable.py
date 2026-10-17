@@ -7,17 +7,32 @@ no candle release outside zip >= 9 can leave. The ignores in
 `.cargo/audit.toml` are therefore sound only while that path is unreachable.
 This guard fails (exit 1) when any of these holds:
 
-  (a) `cargo tree -i zip` shows a direct parent that is not a `candle-*` crate;
-  (b) the root Cargo.toml declares a direct `zip` dependency;
-  (c) src/, tests/, benches/ or build.rs use zip directly, or call a candle
-      npy / npz / pth loader (the only candle code that opens a zip archive).
+  (a) `cargo tree -i zip --edges normal,build,dev` shows a direct parent that
+      is not candle-core (the exact crate that depends on zip today);
+  (b) the root Cargo.toml declares a direct `zip` dependency in any form:
+      [dependencies], [dev-dependencies], [build-dependencies], any
+      [target.<cfg>.*] table, [workspace.dependencies], [dependencies.zip],
+      top-level dotted keys, or a rename with `package = "zip"`;
+  (c) src/, tests/, benches/, examples/, build.rs, the declared build script
+      or any declared target path use zip directly, name zip in macro input,
+      call a candle npy / npz / pth loader (the only candle code that opens a
+      zip archive), or pull in other files with `#[path]` / `include!` (those
+      files are followed and scanned; an unresolvable one is a violation).
+
+Fail closed: if cargo tree exits 0 but prints nothing parseable or no zip root
+line, or any scanned file is unreadable or not UTF-8, the guard exits 2.
+If zip is absent from the graph and from Cargo.lock it exits 0 with a
+"zip not in graph" message: the guard and the ignores are then to be removed.
+The Cargo.toml reader is tomllib on Python 3.11+, else a built-in line reader
+(--manifest-parser forces one).
 
 Exit codes: 0 pass, 1 violation, 2 usage or tool error.
 
 Pattern scope for `.extract(`: a bare `.extract(` is flagged only in a file
 that also names zip or an archive type, so unrelated uses (regex, iterators)
-cannot false-positive. Measured on the base: zero `.extract(` hits in src/,
-tests/, benches/ and build.rs.
+cannot false-positive. `extract_unwrapped_root_dir` is flagged everywhere.
+Measured on the base: zero `.extract(` hits in src/, tests/, benches/ and
+build.rs.
 
 Printed paths escape CR and LF so a hostile file name cannot inject a GitHub
 workflow command. Every violation line starts with `violation:`.

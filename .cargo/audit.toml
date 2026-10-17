@@ -19,13 +19,16 @@
 # extraction advisories, pulled in via candle-core 0.10.2 (#7301).
 # All three apply only to zip's extract() / ZipStreamReader::extract(); they
 # are patched only in zip >= 9.0.0. Each ignore below shares this record:
-#   - reached only via candle-core npy.rs (ZipArchive::new / by_name /
-#     ZipWriter), never via extract;
+#   - reached only via candle-core npy.rs and pickle.rs (ZipArchive::new /
+#     by_name / ZipWriter), never via extract;
 #   - no candle release supports zip >= 9 (candle-core 0.10.x needs ^7.2.0,
 #     0.11.0 needs ^8.6.0);
 #   - remove when candle moves to zip >= 9 (tracked by #7302);
 #   - guarded by scripts/check-zip-extract-unreachable.py, which runs before
 #     `cargo audit` in CI and fails if zip becomes reachable from our code.
+# zip 7.2.0 is also yanked on crates.io: `cargo audit` reports it as an allowed
+# warning (not a failure); the yank is tracked by #7302 as well and ends with
+# the same removal.
 # Decision: 3-agent vote (6def5ab6), memory 34425e02.
 ignore = [
     "RUSTSEC-2026-0097",
