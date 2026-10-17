@@ -122,7 +122,17 @@ struct TxnFrame {
     /// `Connection::path()` of the transaction's connection (`None` for an
     /// in-memory / temp database, which no other connection can share).
     db_path: Option<String>,
+    /// #7241 - the address of the transaction's own connection. Audit
+    /// anchors are deferred to the transaction of the SAME connection (the
+    /// one their append wrote into), never to a sibling connection on the
+    /// same file. The `WriteTxn` borrows the connection, so the address is
+    /// stable and unique for the frame's whole life.
+    conn_addr: usize,
     deferred: Vec<DeferredEscalation>,
+    /// #7241 - the off-table audit anchors of signed-event appends made by
+    /// nested funnels inside this transaction: emitted when it COMMITS,
+    /// dropped unrecorded when it rolls back.
+    anchor: crate::governance::audit::PendingAuditAnchor,
 }
 
 /// The per-thread frame stack. Its destructor (thread exit) reports frames
@@ -204,7 +214,9 @@ pub(super) fn open_frame(conn: &Connection) -> u64 {
         frames.0.push(TxnFrame {
             id,
             db_path,
+            conn_addr: std::ptr::from_ref(conn).addr(),
             deferred: Vec::new(),
+            anchor: crate::governance::audit::PendingAuditAnchor::none(),
         });
     });
     id
@@ -213,12 +225,20 @@ pub(super) fn open_frame(conn: &Connection) -> u64 {
 /// Pop frame `frame_id` and queue its deferred escalations on `conn`, whose
 /// transaction has just ENDED; return each queue write's REAL outcome.
 ///
+/// #7241 - `committed` is `true` only when the transaction's COMMIT
+/// succeeded: the frame's deferred audit anchors are then emitted; on every
+/// other end (rollback, failed commit, unwind) they are dropped unrecorded.
+///
 /// Infallible (it may run from `WriteTxn`'s `Drop`): every deferred write was
 /// already REFUSED to its caller, so a failure loses only the pending (ERROR
 /// log) and never admits the write. Nothing is queued during a panic unwind or
 /// while `conn` is still inside a transaction (a failed ROLLBACK) — never write
 /// into a foreign transaction; those intents report `Err`.
-pub(super) fn settle_frame(conn: &Connection, frame_id: u64) -> Vec<SettledEscalation> {
+pub(super) fn settle_frame(
+    conn: &Connection,
+    frame_id: u64,
+    committed: bool,
+) -> Vec<SettledEscalation> {
     let frame = TXN_FRAMES.with(|frames| {
         let mut frames = frames.borrow_mut();
         frames
@@ -232,6 +252,11 @@ pub(super) fn settle_frame(conn: &Connection, frame_id: u64) -> Vec<SettledEscal
         debug_assert!(false, "#4116: settle of an unknown escalation frame");
         return Vec::new();
     };
+    if committed {
+        frame.anchor.emit_after_commit();
+    } else {
+        frame.anchor.discard();
+    }
     let mut outcomes = Vec::with_capacity(frame.deferred.len());
     let blocked = std::thread::panicking() || !conn.is_autocommit();
     for intent in frame.deferred {
@@ -304,6 +329,74 @@ pub fn defer_to_open_txn(
             None => Err(intent),
         }
     })
+}
+
+/// #7241 - hand a signed-event append's pending audit anchor to the owner of
+/// the transaction it was appended in, for a funnel that runs INSIDE a
+/// transaction it does not own (so it cannot commit, and must not record an
+/// anchor of a head the owner may still roll back).
+///
+/// - `conn` is inside a [`super::connection::WriteTxn`] on this thread: the
+///   anchor joins that transaction's frame and is emitted after its COMMIT
+///   (dropped on rollback).
+/// - `conn` is in autocommit: the append already committed, so the anchor is
+///   emitted now.
+/// - `conn` is inside a transaction this thread has no frame for (a raw
+///   `rusqlite::Transaction` owner): the anchor is dropped unrecorded. That is
+///   under-emission only, never a false verdict: the watermark throttle was
+///   not claimed, so the next due append anchors the head again.
+pub fn defer_audit_anchor(conn: &Connection, anchor: crate::governance::audit::PendingAuditAnchor) {
+    if anchor.is_empty() {
+        anchor.discard();
+        return;
+    }
+    let conn_addr = std::ptr::from_ref(conn).addr();
+    let unowned = TXN_FRAMES.with(|frames| {
+        let mut frames = frames.borrow_mut();
+        match frames.0.iter_mut().rev().find(|f| f.conn_addr == conn_addr) {
+            Some(frame) => {
+                frame.anchor = std::mem::take(&mut frame.anchor).merge(anchor);
+                None
+            }
+            None => Some(anchor),
+        }
+    });
+    let Some(anchor) = unowned else {
+        return;
+    };
+    if conn.is_autocommit() {
+        anchor.emit_after_commit();
+    } else {
+        // Count first so the drop is recorded even when the debug assertion
+        // below unwinds (#7281, ERRORS-19).
+        FRAMELESS_ANCHOR_DROPS.fetch_add(FRAMELESS_DROP_INCREMENT, Ordering::Relaxed);
+        crate::metrics::inc_audit_anchor_frameless_drop();
+        // A new raw-transaction caller of a deferring funnel would under-anchor
+        // silently: fail loudly in debug and test builds, warn in release.
+        debug_assert!(
+            false,
+            "#7241: audit anchor dropped: its append ran in a transaction with no WriteTxn frame"
+        );
+        tracing::warn!(
+            "#7241: audit anchor dropped: its append ran in a transaction with no WriteTxn \
+             frame on this thread; the next due append re-anchors the head"
+        );
+        anchor.discard();
+    }
+}
+
+/// Step of the monotonic frameless-drop counter.
+const FRAMELESS_DROP_INCREMENT: u64 = 1;
+
+/// #7281 - audit anchors dropped unrecorded because their append ran in a raw
+/// transaction with no `WriteTxn` frame (monotonic, process-wide).
+static FRAMELESS_ANCHOR_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// #7281 - how many audit anchors the frameless-drop branch has discarded.
+/// Mirrored to `ai_memory_audit_anchor_frameless_drop_total`.
+#[must_use]
+pub fn frameless_anchor_drop_count() -> u64 {
+    FRAMELESS_ANCHOR_DROPS.load(Ordering::Relaxed)
 }
 
 /// `true` when `pending_id` is deferred in a frame still open on this thread.
@@ -411,6 +504,46 @@ pub fn insert_pending_action_row(
 
 #[cfg(test)]
 mod tests {
+    /// #7241 L1 - an anchor handed to a funnel that runs in a raw transaction
+    /// with no `WriteTxn` frame is dropped; a debug or test build must trip a
+    /// `debug_assert!` so a new raw-transaction caller cannot under-anchor
+    /// silently (ERRORS-19).
+    #[test]
+    fn frameless_raw_transaction_anchor_drop_trips_debug_assert_7241() {
+        /// Head sequence of the pending watermark the funnel hands over.
+        const HEAD_SEQUENCE: i64 = 64;
+        let conn = rusqlite::Connection::open_in_memory().expect("open in-memory");
+        conn.execute_batch("BEGIN").expect("raw transaction");
+        let anchor = crate::governance::audit::PendingAuditAnchor::watermark(
+            HEAD_SEQUENCE,
+            "head-hash",
+            "db-id",
+        );
+        let before = super::frameless_anchor_drop_count();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            super::defer_audit_anchor(&conn, anchor);
+        }));
+        if cfg!(debug_assertions) {
+            let payload = outcome.expect_err("debug build must trip the assertion");
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            assert!(
+                message.contains("no WriteTxn frame"),
+                "panic text: {message}"
+            );
+        } else {
+            assert!(outcome.is_ok(), "release build must not panic");
+        }
+        assert_eq!(
+            super::frameless_anchor_drop_count(),
+            before + 1,
+            "the frameless drop must be counted (#7281)"
+        );
+    }
+
     /// Vote item 5(a) — a leaked `WriteTxn` whose frame still holds a deferred
     /// escalation is detected when the next transaction opens on the database.
     #[test]
