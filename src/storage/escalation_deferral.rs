@@ -777,7 +777,9 @@ mod tests {
     /// Leak a frame holding `intents` deferred escalations on a thread, then
     /// (when `open_second`) open a second `WriteTxn` on the same database so
     /// the open-time stale-frame report fires; the thread then exits.
-    fn leak_and_exit(intents: usize, open_second: bool) {
+    /// `late_intents` more intents are routed into the leaked frame AFTER that
+    /// open-time report (#7605).
+    fn leak_and_exit(intents: usize, open_second: bool, late_intents: usize) {
         std::thread::spawn(move || {
             let dir = tempfile::Builder::new()
                 .prefix("issue-4116-report-")
@@ -806,6 +808,18 @@ mod tests {
                     super::super::connection::WriteTxn::begin(&conn).map(drop)
                 }));
                 drop(opened);
+                for n in 0..late_intents {
+                    let intent = super::DeferredEscalation {
+                        pending_id: format!("late-{n}"),
+                        action: crate::models::GovernedAction::Store,
+                        namespace: "gov4116/report".to_string(),
+                        memory_id: None,
+                        requested_by: "ai:worker".to_string(),
+                        rule_id: "R-late".to_string(),
+                        payload: serde_json::json!({}),
+                    };
+                    assert!(super::defer_to_open_txn(conn.path(), intent).is_ok());
+                }
             }
         })
         .join()
@@ -814,6 +828,8 @@ mod tests {
 
     /// Marker of the open-time stale-frame report (a `tracing` ERROR event).
     const OPEN_TIME_REPORT: &str = "#4116: a WriteTxn opened while an older frame";
+    /// Marker of the open-time report on the raw stderr channel (#7606).
+    const OPEN_TIME_RAW_REPORT: &str = "ERROR #4116: a WriteTxn opened while an older frame";
     /// Marker of the thread-exit leak report (raw stderr).
     const THREAD_EXIT_REPORT: &str = "ERROR #4116: thread exited with";
 
@@ -828,6 +844,11 @@ mod tests {
                 1,
                 "the open-time report must reach the sink once:\n{stderr}"
             );
+            assert_eq!(
+                stderr.matches(OPEN_TIME_RAW_REPORT).count(),
+                1,
+                "the raw open-time line must be written once:\n{stderr}"
+            );
             assert!(
                 !stderr.contains(THREAD_EXIT_REPORT),
                 "the thread-exit report repeats the open-time one:\n{stderr}"
@@ -835,7 +856,7 @@ mod tests {
             return;
         }
         crate::logging::init_console_tracing(&[]);
-        leak_and_exit(1, true);
+        leak_and_exit(1, true, 0);
     }
 
     /// #6540 - with NO tracing sink the open-time report reaches nobody, so
@@ -852,7 +873,49 @@ mod tests {
             return;
         }
         // Deliberately no tracing subscriber in this child.
-        leak_and_exit(1, true);
+        leak_and_exit(1, true, 0);
+    }
+
+    /// #7606 (#6540 case 3) - an installed sink that DROPS the event (the lossy
+    /// non-blocking pipeline) must not suppress the report: the open-time report
+    /// is also written on the raw stderr channel.
+    #[test]
+    fn issue_7606_dropped_tracing_event_is_still_reported_on_stderr() {
+        if !is_child() {
+            let (_stdout, stderr) =
+                run_child("issue_7606_dropped_tracing_event_is_still_reported_on_stderr");
+            assert!(
+                stderr.contains(OPEN_TIME_RAW_REPORT) || stderr.contains(THREAD_EXIT_REPORT),
+                "a tracing event the sink dropped must still reach stderr:\n{stderr}"
+            );
+            return;
+        }
+        // An ERROR-enabled subscriber whose writer discards every line.
+        let _ = tracing_subscriber::fmt()
+            .with_writer(std::io::sink)
+            .with_max_level(tracing::Level::ERROR)
+            .try_init();
+        leak_and_exit(1, true, 0);
+    }
+
+    /// #7605 - an intent routed into a leaked frame AFTER the open-time report
+    /// was never reported by that report, so thread exit must name it.
+    #[test]
+    fn issue_7605_intent_deferred_after_the_open_time_report_is_reported_at_exit() {
+        if !is_child() {
+            let (_stdout, stderr) = run_child(
+                "issue_7605_intent_deferred_after_the_open_time_report_is_reported_at_exit",
+            );
+            assert!(
+                stderr.contains(
+                    "thread exited with 1 unsettled escalation frame(s) holding 1 deferred intent(s)"
+                ),
+                "the late intent must be named at thread exit:\n{stderr}"
+            );
+            return;
+        }
+        crate::logging::init_console_tracing(&[]);
+        leak_and_exit(1, true, 1);
     }
 
     /// #6449 - the thread-exit line counts frames and deferred intents
@@ -868,6 +931,6 @@ mod tests {
             );
             return;
         }
-        leak_and_exit(2, false);
+        leak_and_exit(2, false, 0);
     }
 }
