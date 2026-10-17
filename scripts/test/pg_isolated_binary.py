@@ -68,6 +68,7 @@ RUN_ID_VAR = 'AI_MEMORY_TEST_PG_RUN_ID'
 KILL_VAR = 'CI_PG_ISOLATE_OFF'
 ISOLATED_PREFIX = 'ai_memory_t'
 TEMPLATE_SUFFIX = '_tpl'
+ALREADY_EXISTS = 'already exists'  # psql detail of a CREATE DATABASE onto an occupied name
 IDENT_MAX = 63
 RUN_ID_MAX_LEN = 20
 MAX_JOBS = 8
@@ -195,7 +196,7 @@ def parse_target_line(line: str) -> List[str]:
 def template_name(db_name: str) -> str:
     """``<db>_tpl``. A name too long to take the suffix is refused, never
     truncated: truncation maps two different names onto one template (#7127)."""
-    if len(db_name) + len(TEMPLATE_SUFFIX) > IDENT_MAX:
+    if len(db_name.encode('utf-8')) + len(TEMPLATE_SUFFIX) > IDENT_MAX:
         raise WrapperError('refusing database name %r: %s would exceed %d bytes and be truncated onto '
                            'another template' % (db_name, TEMPLATE_SUFFIX, IDENT_MAX))
     return db_name + TEMPLATE_SUFFIX
@@ -389,7 +390,12 @@ def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
     try:
         psql(url, 'CREATE DATABASE %s' % q)
     except WrapperError as exc:
-        raise WrapperError('refusing to use template %s, it was not created by this run: %s' % (tpl, exc))
+        if ALREADY_EXISTS in str(exc):
+            raise WrapperError('refusing to use template %s, it was not created by this run: %s; if it is a '
+                               'leftover of your own earlier run, run `pg_isolated_binary.py teardown --db %s '
+                               '--run-id <run id>` first, otherwise choose a different --db'
+                               % (tpl, exc, db_name))
+        raise WrapperError('CREATE DATABASE %s was refused; nothing was created or changed: %s' % (tpl, exc))
     try:
         psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')
         psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE true ALLOW_CONNECTIONS false' % q)
