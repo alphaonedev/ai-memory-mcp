@@ -328,6 +328,10 @@ fn reviewed_consumers() -> BTreeMap<(&'static str, &'static str), &'static str> 
             "#4045 optimistic-concurrency VERSION conflict (a consolidation source's stored version moved after it was summarized); carries only the memory id, never a (title, namespace) slot, so no title-slot admission decision is involved",
         ),
         (
+            ("src/store/sqlite.rs", "slot_conflict_or_backend"),
+            "#7099 / #7111 mapper of the typed `ConflictError` that the routed `insert_inner` / consolidate destination admission already decided onto `StoreError::Conflict`; the id is carried verbatim (empty for a hidden holder), nothing is decided here",
+        ),
+        (
             ("src/store/postgres.rs", "lease_acquire"),
             "a `leases` row conflict, not a `memories` title collision",
         ),

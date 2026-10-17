@@ -210,6 +210,20 @@ fn box_err<E: std::fmt::Display>(e: E) -> StoreError {
     StoreError::Backend(BoxBackendError::new(e.to_string()))
 }
 
+/// #7099 / #7111 — map the typed `(title, namespace)` slot refusal a routed
+/// create funnel returns (`insert_inner`, the consolidate destination
+/// admission) onto the SAL `Conflict` the postgres adapter returns. The id is
+/// carried verbatim, so a hidden holder (empty id) is never named; anything
+/// else stays a backend detail. It DECIDES nothing: the admission already ran.
+fn slot_conflict_or_backend(e: anyhow::Error) -> StoreError {
+    match e.downcast_ref::<crate::storage::ConflictError>() {
+        Some(c) => StoreError::Conflict {
+            id: c.existing_id.clone(),
+        },
+        None => box_err(e),
+    }
+}
+
 /// #4447 — map the typed in-transaction by-id refusal onto the ONE
 /// `PermissionDenied` envelope the postgres adapter returns (error parity);
 /// anything else stays a backend detail.
@@ -677,14 +691,7 @@ impl MemoryStore for SqliteStore {
                 } else {
                     db::insert_as(&conn, memory, Some(ctx.agent_id.as_str()))
                 };
-                ids.push(inserted.map_err(|e| {
-                    match e.downcast_ref::<crate::storage::ConflictError>() {
-                        Some(c) => StoreError::Conflict {
-                            id: c.existing_id.clone(),
-                        },
-                        None => box_err(e),
-                    }
-                })?);
+                ids.push(inserted.map_err(slot_conflict_or_backend)?);
             }
             // #7090 — record the quota in the SAME transaction, so a batch
             // that rolls back charges nothing (postgres parity).
@@ -2574,12 +2581,7 @@ impl MemoryStore for SqliteStore {
             }
             // #7111 — a hidden holder of the summary's title slot is the
             // typed, unnamed conflict (postgres parity), not `Backend`.
-            if let Some(c) = e.downcast_ref::<crate::storage::ConflictError>() {
-                return StoreError::Conflict {
-                    id: c.existing_id.clone(),
-                };
-            }
-            box_err(e)
+            slot_conflict_or_backend(e)
         })
     }
 
