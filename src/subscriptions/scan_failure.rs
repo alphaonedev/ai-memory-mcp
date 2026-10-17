@@ -249,6 +249,9 @@ fn write_record(
         Err(e) => {
             tracing::error!(
                 correlation_id = %correlation_id,
+                memory_id = %failure.memory_id,
+                event_type = %failure.event,
+                namespace = %failure.namespace,
                 error = %e,
                 "could not record the failed-lookup DLQ row: the event is lost (#7366)"
             );
@@ -485,7 +488,17 @@ pub(super) fn retry_off_lock(db_path: &std::path::Path, failure: &ScanFailure<'_
 
 /// The retry worker's own connection.
 fn open_for_retry(path: &std::path::Path) -> Option<rusqlite::Connection> {
-    crate::db::open(path).ok()
+    match crate::db::open(path) {
+        Ok(conn) => Some(conn),
+        Err(e) => {
+            tracing::error!(
+                path = %path.display(),
+                error = %e,
+                "lookup-retry worker could not open the database; the retry ladder is skipped and the record stays (#7505)"
+            );
+            None
+        }
+    }
 }
 
 /// The ladder is spent or was skipped: settle the record written first, or
