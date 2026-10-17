@@ -176,5 +176,87 @@ class RuleRecorded7529(BundleFixture):
         self.assertNotIn("CONFIG", self.rule_line())
 
 
+REWRITTEN = (  # (text, expected): a real run path /data/t at a real path-component boundary (#7533, #7491)
+    ("see /data/t.", "see <run-path>."),
+    ("see /data/t. Next", "see <run-path>. Next"),
+    ("`/data/t`", "`<run-path>`"),
+    ("/data/t<x>", "<run-path><x>"),
+    ("{/data/t}", "{<run-path>}"),
+    ("a|/data/t|b", "a|<run-path>|b"),
+    ("wrote /data/t!", "wrote <run-path>!"),
+    ("is /data/t?", "is <run-path>?"),
+    ("//data/t", "/<run-path>"),
+    ("x -/data/t y", "x -<run-path> y"),
+    ("--out=/data/t", "--out=<run-path>"),
+    ("PATH=/data/t:/usr/bin", "PATH=<run-path>:/usr/bin"),
+    ("/data/t, /data/u", "<run-path>, /data/u"),
+    ("(/data/t).", "(<run-path>)."),
+    ("'/data/t'", "'<run-path>'"),
+    ("/data/t\n", "<run-path>\n"),
+    ("/data/t/x/y", "<run-path>/x/y"),
+    ("at /data/t", "at <run-path>"),
+)
+KEPT = (  # different paths: never rewritten (#7533)
+    "/data/t,v", "/data/t:old", "/data/t;1", "/data/t)x", "/data/t]x", "/data/t'x", "/data/t.bak", "/data/tt",
+    "/data/t-old", "/data/t_x", "/data/t+x", "/data/t@x", "/data/t%x", "/data/t=x", "a/data/t", "x./data/t")
+
+
+class SanitizeBoundary7533(unittest.TestCase):
+    def setUp(self):
+        self.bb = load("build_bundle")
+
+    def test_real_run_paths_are_rewritten_7533(self):
+        for text, want in REWRITTEN:
+            with self.subTest(text=text):
+                self.assertEqual(self.bb.sanitize_paths(text, [], ["/data/t"]), want)
+
+    def test_different_paths_are_kept_7533(self):
+        for text in KEPT:
+            with self.subTest(text=text):
+                self.assertEqual(self.bb.sanitize_paths(f"see {text} end", [], ["/data/t"]), f"see {text} end")
+
+    def test_the_worktree_forms_follow_the_same_rule_7533(self):
+        out = self.bb.sanitize_paths("`/w/repo`, /w/repo.bak /w/repo2/a /w/repo/a.", ["/w/repo"], [])
+        self.assertEqual(out, "`<repo-root>`, /w/repo.bak /w/repo2/a <repo-root>/a.")
+
+    def test_the_longest_path_is_replaced_first_7533(self):
+        out = self.bb.sanitize_paths("/data/t/sub. /data/t.", [], ["/data/t", "/data/t/sub"])
+        self.assertEqual(out, "<run-path>. <run-path>.")
+
+    def test_the_leak_scan_uses_the_same_boundary_on_the_right_7533(self):
+        pats = ["/data/t", "/mnt/"]
+        for text, _want in REWRITTEN:
+            with self.subTest(text=text):
+                self.assertTrue(self.bb.hits(text, pats), text)
+        for text in KEPT:
+            if text.startswith(("a/", "x.")):
+                continue  # a path with a leading name character stays a leak: the left side fails closed
+            with self.subTest(text=text):
+                self.assertEqual(self.bb.hits(f"see {text} end", pats), [])
+        self.assertTrue(self.bb.hits("see a/data/t end", pats))
+        self.assertTrue(self.bb.hits("under /mnt/whatever", pats), "a host prefix is still a plain substring")
+
+
+class BuildKeepsSiblings7533(BundleFixture):
+    SIBLINGS = ("/data/cert-t.bak", "/data/cert-tt", "/data/cert-t-old", "/data/cert-t,v", "/data/cert-t:old",
+                "/data/cert-t)x")
+
+    def test_a_kept_sibling_does_not_fail_the_build_and_a_real_path_is_rewritten_7533(self):
+        self.boot("".join(f"kept {s}\n" for s in self.SIBLINGS) + "wrote /data/cert-t.\nfrom `/data/cert-d` and /data/cert-o/x\n")
+        code, text = self.build()
+        self.assertEqual(code, 0, text)
+        log = self.bundle_file("bootstrap-cert-gate.log")
+        for s in self.SIBLINGS:
+            self.assertIn(f"kept {s}\n", log)
+        self.assertIn("wrote <run-path>.\n", log)
+        self.assertIn("from `<run-path>` and <run-path>/x\n", log)
+
+    def test_a_run_path_that_cannot_be_rewritten_still_fails_the_build_7533(self):
+        self.boot("under a/data/cert-t/x\n")  # a leading name character: not rewritten, still a leak
+        code, text = self.build()
+        self.assertEqual(code, 1)
+        self.assertIn("leak scan", text)
+
+
 if __name__ == "__main__":
     unittest.main()
