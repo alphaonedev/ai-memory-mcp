@@ -4,7 +4,7 @@
 Port of the former deploy.sh (#7313). Pages-only (no KV/Workers scope needed). Idempotent-ish.
 
 Credentials (never committed; wrangler.toml carries no account id): see cfcommon.py. Process env
-first, then the FIRST matching ~/.env line; the account id must be 32 lowercase hex characters.
+first, then the FIRST matching line of the home env file (cfcommon.ENV_FILE); the account id must be 32 lowercase hex characters.
 
 Exit codes: 0 ok, 1 missing credentials or an API/deploy failure.
 """

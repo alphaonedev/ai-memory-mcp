@@ -1,7 +1,7 @@
 """cfcommon.py - shared credential lookup and wrangler runner for deploy.py and push-state.py (#7313).
 
 Credential precedence (one rule for both scripts): the process environment first, then the FIRST
-matching line of ~/.env (the file may carry a second, unrelated token line, so it is never sourced).
+matching line of the home env file (cfcommon.ENV_FILE; the file is never sourced).
 A line may start with an optional `export ` and the value may carry one matching quote pair.
 The account id must be 32 lowercase hex characters before it is placed in any URL. Failure
 messages are fixed strings and never echo a credential value.
@@ -34,7 +34,7 @@ def _unquote(value):
 
 
 def credential(name):
-    """Process env value, else the first `name=` line of ~/.env; empty string when absent."""
+    """Process env value, else the first `name=` line of the home env file; empty string when absent."""
     if os.environ.get(name):
         return os.environ[name]
     try:
@@ -62,10 +62,10 @@ def load_credentials(require_account):
     """Return (token, account_id); raise CredentialError (fixed message) on a missing/invalid value."""
     token = credential(TOKEN_VAR)
     if not token:
-        raise CredentialError("%s is missing (process env or ~/.env)" % TOKEN_VAR)
+        raise CredentialError("%s is missing (process env or the home env file)" % TOKEN_VAR)
     acct = credential(ACCOUNT_VAR)
     if require_account and not acct:
-        raise CredentialError("%s is missing (process env or ~/.env)" % ACCOUNT_VAR)
+        raise CredentialError("%s is missing (process env or the home env file)" % ACCOUNT_VAR)
     if acct and not valid_account_id(acct):
         raise CredentialError("%s is not a 32-character lowercase hex id" % ACCOUNT_VAR)
     return token, acct

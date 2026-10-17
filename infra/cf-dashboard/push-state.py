@@ -8,8 +8,7 @@ Pages-only model: writes public/state.json next to this file and redeploys the P
   push-state.py -                       # read state JSON from stdin
 
 Credentials follow cfcommon.py (same precedence as deploy.py): process env first, then the FIRST
-~/.env line. ~/.env carries TWO CLOUDFLARE_API_TOKEN lines; the SECOND is a Workers AI token with no
-Pages edit permission, so the file is never sourced.
+matching line of the home env file (cfcommon.ENV_FILE); the file is never sourced.
 """
 import argparse
 import datetime

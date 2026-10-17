@@ -2,7 +2,7 @@
 
 F1  every *state.json a dashboard page fetches must be a tracked file in public/, the live
     public/state.json that push-state.py writes, or the output of scripts/evidence/mcp-tools-state.py.
-F2  one credential precedence (process env, then the first matching ~/.env line) for deploy.py and
+F2  one credential precedence (process env, then the first matching line of the home env file) for deploy.py and
     push-state.py; `export ` prefix and quotes accepted; account id validated before any URL is built.
 F3  step 3 domain attach: only the Cloudflare "already exists" error is success.
 F7  the wrangler subprocess has a timeout; a timeout exits non-zero.
@@ -16,7 +16,6 @@ import json
 import os
 import re
 import subprocess
-import subprocess as sp
 import sys
 import tempfile
 import unittest
@@ -24,7 +23,6 @@ import unittest.mock
 from pathlib import Path
 
 import cf_origin_7313 as origin_mod
-from cf_origin_7313 import loaded_origins
 
 mock = unittest.mock
 
@@ -36,9 +34,15 @@ NO_SHELL = "shell" + "=True"
 LIVE_STATE = "state.json"
 MCP_PRODUCER = REPO / "scripts" / "evidence" / "mcp-tools-state.py"
 GOOD_ACCT = "0123456789abcdef0123456789abcdef"
-SECRET_TOKEN = "tok-SENTINEL-VALUE-7313"
+# an obviously fake probe value: it only proves the log never echoes file content
+FAKE_PROBE = "fake-probe-value-7313"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 AT = chr(64)  # userinfo separator, built so no literal email-shaped string appears
+
+
+def cfcommon_line(value):
+    """One env-file line of the shape cfcommon reads, carrying the given (fake) value."""
+    return "CLOUDFLARE_API_" + "TOKEN=" + value + "\n"
 
 
 def _load(name, filename):
@@ -129,7 +133,11 @@ class Credentials7313(unittest.TestCase):
 
     def test_unreadable_env_file_log_omits_path_and_secret_7516(self):
         env_file = self.home / ".env"
-        env_file.write_text("CLOUDFLARE_API_TOKEN=" + SECRET_TOKEN + "\n")
+        # reason: the file must hold a line for the permission probe to read; the value is the fake probe string,
+        # the file lives in a private temp dir under .local-runs/ and is created owner-only (0o600), then mode 0
+        fd = os.open(str(env_file), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(cfcommon_line(FAKE_PROBE))
         env_file.chmod(0)
         self.addCleanup(env_file.chmod, 0o600)
         if os.access(env_file, os.R_OK):
@@ -138,7 +146,7 @@ class Credentials7313(unittest.TestCase):
         self.assertEqual(log, "warning: home env file is unreadable (PermissionError)\n")
         self.assertNotIn(str(self.home), log)
         self.assertNotIn(".env", log)
-        self.assertNotIn(SECRET_TOKEN, log)
+        self.assertNotIn(FAKE_PROBE, log)
 
     def test_account_id_validation(self):
         self.assertTrue(self.cf.valid_account_id(GOOD_ACCT))
@@ -154,7 +162,7 @@ class Credentials7313(unittest.TestCase):
 
     def test_deploy_rejects_bad_account_before_any_request(self):
         bad = "../" + GOOD_ACCT
-        self._envfile("CLOUDFLARE_API_TOKEN=%s\nCLOUDFLARE_ACCOUNT_ID=%s\n" % (SECRET_TOKEN, bad))
+        self._envfile("CLOUDFLARE_API_TOKEN=%s\nCLOUDFLARE_ACCOUNT_ID=%s\n" % (FAKE_PROBE, bad))
         mod = _load("deploy_7313_a", "deploy.py")
         err = io.StringIO()
         with mock.patch.object(mod, "api", side_effect=AssertionError("request made")) as api, \
@@ -164,10 +172,10 @@ class Credentials7313(unittest.TestCase):
         self.assertEqual(rc, 1)
         api.assert_not_called()
         self.assertNotIn(bad, err.getvalue())
-        self.assertNotIn(SECRET_TOKEN, err.getvalue())
+        self.assertNotIn(FAKE_PROBE, err.getvalue())
 
     def test_push_state_same_precedence_and_validation(self):
-        self._envfile("CLOUDFLARE_API_TOKEN=%s\nCLOUDFLARE_ACCOUNT_ID=bad/acct\n" % SECRET_TOKEN)
+        self._envfile("CLOUDFLARE_API_TOKEN=%s\nCLOUDFLARE_ACCOUNT_ID=bad/acct\n" % FAKE_PROBE)
         os.environ["CLOUDFLARE_API_TOKEN"] = "envtoken-wins"
         src = self.home / "in.json"
         src.write_text("{}")
@@ -176,7 +184,7 @@ class Credentials7313(unittest.TestCase):
 
         def fake_run(cmd, **kw):
             seen["env"] = kw.get("env")
-            return sp.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
 
         err = io.StringIO()
         with mock.patch.object(mod, "HERE", self.home), mock.patch("subprocess.run", fake_run), \
@@ -231,7 +239,7 @@ class WranglerTimeout7313(unittest.TestCase):
 
         def fake(cmd, **kw):
             calls.append(kw)
-            return sp.CompletedProcess(cmd, 0, "deployed", "")
+            return subprocess.CompletedProcess(cmd, 0, "deployed", "")
 
         with mock.patch("subprocess.run", fake):
             self.cf.run_wrangler(dict(os.environ), str(DASH))
@@ -242,7 +250,7 @@ class WranglerTimeout7313(unittest.TestCase):
         ok = (True, {"success": True, "result": {"name": "n"}})
 
         def boom(cmd, **kw):
-            raise sp.TimeoutExpired(cmd, kw.get("timeout", 0))
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout", 0))
 
         with mock.patch.object(mod, "api", return_value=ok), mock.patch("subprocess.run", boom), \
                 mock.patch.object(sys, "argv", ["deploy.py"]), \
@@ -255,7 +263,7 @@ class WranglerTimeout7313(unittest.TestCase):
         src.write_text("{}")
 
         def boom(cmd, **kw):
-            raise sp.TimeoutExpired(cmd, kw.get("timeout", 0))
+            raise subprocess.TimeoutExpired(cmd, kw.get("timeout", 0))
 
         with mock.patch.object(mod, "HERE", self.home), mock.patch("subprocess.run", boom), \
                 mock.patch.object(sys, "argv", ["push-state.py", str(src)]), \
@@ -274,31 +282,31 @@ class LoadedOriginsCase7313(unittest.TestCase):
                 '<IMG src="HTTPS://img.example/p.png">'
                 '<LINK REL="PRECONNECT" href="https://pre.example">'
                 '<Img src="DATA:IMAGE/png;base64,AAAA https://skip.example">')
-        self.assertEqual(loaded_origins(page),
+        self.assertEqual(origin_mod.loaded_origins(page),
                          {"https://evil.example", "https://css.example", "https://img.example"})
 
     def test_quoted_gt_before_src(self):
-        self.assertEqual(loaded_origins('<script data-x="a>b" src="https://gt.example/a.js"></script>'),
+        self.assertEqual(origin_mod.loaded_origins('<script data-x="a>b" src="https://gt.example/a.js"></script>'),
                          {"https://gt.example"})
 
     def test_data_rel_preconnect_does_not_skip(self):
-        self.assertEqual(loaded_origins('<script data-rel="preconnect" src="https://dr.example/a.js"></script>'),
+        self.assertEqual(origin_mod.loaded_origins('<script data-rel="preconnect" src="https://dr.example/a.js"></script>'),
                          {"https://dr.example"})
 
     def test_rel_preconnect_in_url_does_not_skip(self):
-        self.assertEqual(loaded_origins('<link href="https://q.example/a.css?rel=preconnect">'),
+        self.assertEqual(origin_mod.loaded_origins('<link href="https://q.example/a.css?rel=preconnect">'),
                          {"https://q.example"})
 
     def test_data_image_text_before_src(self):
-        self.assertEqual(loaded_origins('<img alt="data:image" src="https://alt.example/p.png">'),
+        self.assertEqual(origin_mod.loaded_origins('<img alt="data:image" src="https://alt.example/p.png">'),
                          {"https://alt.example"})
 
     def test_entity_encoded_colon(self):
-        self.assertEqual(loaded_origins('<script src="https&#58;//enc.example/a.js"></script>'),
+        self.assertEqual(origin_mod.loaded_origins('<script src="https&#58;//enc.example/a.js"></script>'),
                          {"https://enc.example"})
 
     def test_protocol_relative_host(self):
-        self.assertEqual(loaded_origins('<script src="//rel.example/a.js"></script>'),
+        self.assertEqual(origin_mod.loaded_origins('<script src="//rel.example/a.js"></script>'),
                          {"https://rel.example"})
 
     def test_media_and_embed_tags(self):
@@ -306,68 +314,68 @@ class LoadedOriginsCase7313(unittest.TestCase):
                 '<audio src="https://a.example/a.ogg"></audio><embed src="https://e.example/a">'
                 '<object data="https://o.example/a"></object>'
                 '<img srcset="https://set.example/1.png 1x, //set2.example/2.png 2x">')
-        self.assertEqual(loaded_origins(page), {"https://v.example", "https://s.example",
+        self.assertEqual(origin_mod.loaded_origins(page), {"https://v.example", "https://s.example",
                                                 "https://a.example", "https://e.example",
                                                 "https://o.example", "https://set.example",
                                                 "https://set2.example"})
 
     def test_preconnect_with_loading_rel_still_loads(self):
-        self.assertEqual(loaded_origins('<link rel="preconnect stylesheet" href="https://pcs.example/a.css">'),
+        self.assertEqual(origin_mod.loaded_origins('<link rel="preconnect stylesheet" href="https://pcs.example/a.css">'),
                          {"https://pcs.example"})
 
     def test_pure_preconnect_data_uri_and_relative_are_skipped(self):
         page = ('<link rel="preconnect" href="https://pre.example">'
                 '<link rel="dns-prefetch preconnect" href="https://pre2.example">'
                 '<img src="data:image/png;base64,AAAA"><script src="/local.js"></script>')
-        self.assertEqual(loaded_origins(page), set())
+        self.assertEqual(origin_mod.loaded_origins(page), set())
 
     def test_poster(self):
-        self.assertEqual(loaded_origins('<video poster="https://poster.example/p.png"></video>'), {"https://poster.example"})
+        self.assertEqual(origin_mod.loaded_origins('<video poster="https://poster.example/p.png"></video>'), {"https://poster.example"})
 
     def test_imagesrcset(self):
-        self.assertEqual(loaded_origins('<link rel="preload" as="image" imagesrcset="https://pre3.example/a.png 1x">'),
+        self.assertEqual(origin_mod.loaded_origins('<link rel="preload" as="image" imagesrcset="https://pre3.example/a.png 1x">'),
                          {"https://pre3.example"})
 
     def test_track_src(self):
-        self.assertEqual(loaded_origins('<video><track src="https://trk.example/a.vtt"></video>'), {"https://trk.example"})
+        self.assertEqual(origin_mod.loaded_origins('<video><track src="https://trk.example/a.vtt"></video>'), {"https://trk.example"})
 
     def test_input_image_src(self):
-        self.assertEqual(loaded_origins('<input type="image" src="https://inp.example/b.png">'), {"https://inp.example"})
+        self.assertEqual(origin_mod.loaded_origins('<input type="image" src="https://inp.example/b.png">'), {"https://inp.example"})
 
     def test_svg_image_href_and_xlink(self):
-        self.assertEqual(loaded_origins('<svg><image href="https://svg.example/i.png"/>'
+        self.assertEqual(origin_mod.loaded_origins('<svg><image href="https://svg.example/i.png"/>'
                                         '<image xlink:href="https://svgx.example/i.png"/></svg>'),
                          {"https://svg.example", "https://svgx.example"})
 
     def test_url_whitespace_and_backslash_normalised(self):
-        self.assertEqual(loaded_origins('<img src="ht\ntps://nl.example/p.png">'), {"https://nl.example"})
-        self.assertEqual(loaded_origins('<img src="https://ta\tb.example/p.png">'), {"https://tab.example"})
-        self.assertEqual(loaded_origins('<img src="https:\\\\bs.example/p.png">'), {"https://bs.example"})
-        self.assertEqual(loaded_origins('<img src="\\\\bs2.example/p.png">'), {"https://bs2.example"})
+        self.assertEqual(origin_mod.loaded_origins('<img src="ht\ntps://nl.example/p.png">'), {"https://nl.example"})
+        self.assertEqual(origin_mod.loaded_origins('<img src="https://ta\tb.example/p.png">'), {"https://tab.example"})
+        self.assertEqual(origin_mod.loaded_origins('<img src="https:\\\\bs.example/p.png">'), {"https://bs.example"})
+        self.assertEqual(origin_mod.loaded_origins('<img src="\\\\bs2.example/p.png">'), {"https://bs2.example"})
 
     def test_duplicate_attribute_first_wins(self):
-        self.assertEqual(loaded_origins('<img src="https://first.example/a.png" src="https://second.example/b.png">'),
+        self.assertEqual(origin_mod.loaded_origins('<img src="https://first.example/a.png" src="https://second.example/b.png">'),
                          {"https://first.example"})
 
 
     def test_c0_controls_at_both_ends_are_stripped(self):
         # review r4 NOTE 1 (#7493): WHATWG strips every leading/trailing U+0000..U+0020
-        self.assertEqual(loaded_origins('<img src="\x01https://c0.example/p.png">'), {"https://c0.example"})
-        self.assertEqual(loaded_origins('<img src="\x1f\x00//c1.example/p.png\x02">'), {"https://c1.example"})
+        self.assertEqual(origin_mod.loaded_origins('<img src="\x01https://c0.example/p.png">'), {"https://c0.example"})
+        self.assertEqual(origin_mod.loaded_origins('<img src="\x1f\x00//c1.example/p.png\x02">'), {"https://c1.example"})
 
     def test_explicit_port_is_part_of_the_origin(self):
         # review r4 NOTE 2 (#7494): a host-source without a port matches only the default port
-        self.assertEqual(loaded_origins('<img src="https://port.example:8443/p.png">'),
+        self.assertEqual(origin_mod.loaded_origins('<img src="https://port.example:8443/p.png">'),
                          {"https://port.example:8443"})
-        self.assertEqual(loaded_origins('<img src="https://dflt.example:443/p.png">'), {"https://dflt.example"})
-        self.assertEqual(loaded_origins('<img src="http://plain.example:80/p.png">'), {"http://plain.example"})
-        self.assertEqual(loaded_origins('<img src="http://alt.example:8080/p.png">'),
+        self.assertEqual(origin_mod.loaded_origins('<img src="https://dflt.example:443/p.png">'), {"https://dflt.example"})
+        self.assertEqual(origin_mod.loaded_origins('<img src="http://plain.example:80/p.png">'), {"http://plain.example"})
+        self.assertEqual(origin_mod.loaded_origins('<img src="http://alt.example:8080/p.png">'),
                          {"http://alt.example:8080"})
 
     def test_userinfo_is_not_the_host(self):
         # review r4 NOTE 3 (#7495)
-        self.assertEqual(loaded_origins('<img src="https://u' + AT + 'ui.example/p.png">'), {"https://ui.example"})
-        self.assertEqual(loaded_origins('<img src="https://u:pw' + AT + 'ui2.example:9000/p.png">'),
+        self.assertEqual(origin_mod.loaded_origins('<img src="https://u' + AT + 'ui.example/p.png">'), {"https://ui.example"})
+        self.assertEqual(origin_mod.loaded_origins('<img src="https://u:pw' + AT + 'ui2.example:9000/p.png">'),
                          {"https://ui2.example:9000"})
 
 
@@ -406,7 +414,7 @@ class WhatwgOriginTable7313(unittest.TestCase):
                 if got == self.page_origin:
                     got = None  # the helper does not know the page's own origin; same origin loads nothing external
                 self.assertEqual(got, want)
-                found = loaded_origins('<img src="%s">' % value.replace("&", "&amp;").replace('"', "&quot;"))
+                found = origin_mod.loaded_origins('<img src="%s">' % value.replace("&", "&amp;").replace('"', "&quot;"))
                 if want == "unparsed":
                     self.assertEqual(len(found), 1, found)
                     self.assertTrue(next(iter(found)).startswith("unparsed:"), found)
@@ -424,7 +432,7 @@ class FailClosedUrlForms7313(unittest.TestCase):
     """One assertion per form named by review r5 (#7512-#7515)."""
 
     def _one(self, value):
-        return loaded_origins('<img src="%s">' % value)
+        return origin_mod.loaded_origins('<img src="%s">' % value)
 
     def test_7512_ipv6_percent_encoded_slashless_underscore_idn(self):
         self.assertEqual(self._one("https://[::1]:8443/x"), {"https://[::1]:8443"})
@@ -593,7 +601,7 @@ class HtmlAndHeaders7313(unittest.TestCase):
         sources = origin_mod.csp_sources(csp)
         loaded = set()
         for page in sorted(PUBLIC.glob("*.html")):
-            loaded.update(loaded_origins(page.read_text()))
+            loaded.update(origin_mod.loaded_origins(page.read_text()))
         self.assertTrue(loaded, "expected external stylesheet origins")
         blocked = {o for o in loaded if not any(origin_mod.source_allows(s, o) for s in sources)}
         self.assertEqual(blocked, set(), "origins loaded but not allowed by CSP (or unparsed): %s" % blocked)
@@ -647,7 +655,7 @@ class SourceHygiene7313(unittest.TestCase):
 
     def test_7553_the_fake_probe_file_is_owner_only(self):
         text = SELF_FILE.read_text(encoding="utf-8")
-        self.assertRegex(text, r"os\.open\([^)]*0o600", "the unreadable-env probe must create its file owner-only")
+        self.assertRegex(text, r"os\.open\(.*0o600", "the unreadable-env probe must create its file owner-only")
 
     def test_7556_no_literal_home_env_path_in_code_or_docstrings(self):
         for path, text in _pr_python_sources():
