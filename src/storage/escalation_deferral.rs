@@ -640,4 +640,65 @@ mod tests {
         .join()
         .expect("leaking thread must not abort or panic");
     }
+
+    /// Leak one write transaction on `leaker` that still holds one deferred
+    /// escalation (`mem::forget`), then release `leaker`'s write lock by the
+    /// caller dropping it; the frame stays on this thread's stack.
+    fn leak_one_intent(leaker: &rusqlite::Connection, pending_id: &str) {
+        let leaked = super::super::connection::WriteTxn::begin(leaker).expect("begin leaker");
+        let intent = super::DeferredEscalation {
+            pending_id: pending_id.to_string(),
+            action: crate::models::GovernedAction::Store,
+            namespace: "gov4116/leak-helper".to_string(),
+            memory_id: None,
+            requested_by: "ai:worker".to_string(),
+            rule_id: "R-leak-helper".to_string(),
+            payload: serde_json::json!({}),
+        };
+        assert!(super::defer_to_open_txn(leaker.path(), intent).is_ok());
+        std::mem::forget(leaked);
+    }
+
+    /// #6541 - a stale-frame report that unwinds (debug builds) must not leave
+    /// the connection inside the `BEGIN IMMEDIATE` it had just issued. The
+    /// connection must be in autocommit afterwards, and a second `WriteTxn`
+    /// opened on the SAME connection must commit.
+    #[test]
+    fn issue_6541_failed_open_leaves_connection_outside_a_transaction() {
+        std::thread::spawn(|| {
+            let dir = tempfile::Builder::new()
+                .prefix("issue-6541-")
+                .tempdir()
+                .expect("tempdir");
+            let path = dir.path().join("ai-memory.db");
+            let leaker = crate::db::open(&path).expect("open leaker");
+            let conn = crate::db::open(&path).expect("open conn");
+            leak_one_intent(&leaker, "begin-6541");
+            drop(leaker);
+            let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::super::connection::WriteTxn::begin(&conn).map(drop)
+            }));
+            drop(first);
+            assert!(
+                conn.is_autocommit(),
+                "a failed WriteTxn::begin must leave the connection outside any transaction"
+            );
+            // The second open must not fail with "cannot start a transaction
+            // within a transaction": the stale frame may unwind again (debug
+            // builds), but the BEGIN is never reached or is rolled back.
+            let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::super::connection::WriteTxn::begin(&conn)
+                    .map(|txn| txn.commit().expect("second WriteTxn commits"))
+            }));
+            if let Ok(opened) = second {
+                opened.expect("a second WriteTxn must open on the same connection");
+            }
+            assert!(
+                conn.is_autocommit(),
+                "the second open must also leave the connection outside any transaction"
+            );
+        })
+        .join()
+        .expect("test thread must not abort or panic");
+    }
 }
