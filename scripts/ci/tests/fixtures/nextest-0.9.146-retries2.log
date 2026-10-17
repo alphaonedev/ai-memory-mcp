@@ -1,0 +1,86 @@
+────────────
+ Nextest run ID cebdb17d-9b38-46b7-95c6-6f8f60f52096 with nextest profile: default
+    Starting 3 tests across 1 binary
+  TRY 1 FAIL [   0.010s] (───) nxt a::always_fails
+  stdout ───
+
+    running 1 test
+    test a::always_fails ... FAILED
+
+    failures:
+
+    failures:
+        a::always_fails
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'a::always_fails' (117066588) panicked at src/lib.rs:17:9:
+    always
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  TRY 1 FAIL [   0.015s] (───) nxt a::flaky_one
+  stdout ───
+
+    running 1 test
+    test a::flaky_one ... FAILED
+
+    failures:
+
+    failures:
+        a::flaky_one
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'a::flaky_one' (117066594) panicked at src/lib.rs:12:13:
+    first attempt fails
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  TRY 2 FAIL [   0.013s] (───) nxt a::always_fails
+  stdout ───
+
+    running 1 test
+    test a::always_fails ... FAILED
+
+    failures:
+
+    failures:
+        a::always_fails
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'a::always_fails' (117066610) panicked at src/lib.rs:17:9:
+    always
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+  TRY 2 PASS [   0.013s] (1/3) nxt a::flaky_one
+        PASS [   0.011s] (2/3) nxt a::plain_pass
+  TRY 3 FAIL [   0.014s] (3/3) nxt a::always_fails
+  stdout ───
+
+    running 1 test
+    test a::always_fails ... FAILED
+
+    failures:
+
+    failures:
+        a::always_fails
+
+    test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+  stderr ───
+
+    thread 'a::always_fails' (117066632) panicked at src/lib.rs:17:9:
+    always
+    note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+────────────
+     Summary [   0.043s] 3 tests run: 2 passed (1 flaky), 1 failed, 0 skipped
+   FLAKY 2/3 [   0.013s] (1/3) nxt a::flaky_one
+  TRY 3 FAIL [   0.014s] (3/3) nxt a::always_fails
+error: test run failed

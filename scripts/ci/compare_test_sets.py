@@ -5,7 +5,10 @@ Proves a runner swap (``cargo test`` -> ``cargo nextest run``) ran the same
 tests with the same outcomes. The baseline is a ``cargo test`` log (libtest
 ``test <name> ... ok|FAILED|ignored`` lines grouped under their ``Running``
 header). The candidate is a nextest run: its status lines
-(``PASS [ 0.011s] <binary id> <name>``) and/or its JUnit XML.
+(``PASS [ 0.011s] <binary id> <name>``) and/or its JUnit XML. Every status word is mapped by its whole
+name from nextest 0.9.146's status table and an unknown word exits 2. A retried test is its final
+non-``TRY`` line (``PASS``, ``FAIL``, ``FLAKY n/m``, ...); a test that fails every attempt has only
+``TRY n FAIL`` lines, so a test with only ``TRY`` lines is what its LAST attempt said.
 
 Both sides are reduced to ``{(binary, test name): "pass" | "fail"}``. Ignored
 and skipped tests are not executed tests and are left out of both sides; doc
@@ -129,8 +132,13 @@ _NEXTEST_RE = re.compile(
 # whose word the table does not know fails closed: a new nextest status must be mapped above, never guessed.
 _NEXTEST_SHAPE_RE = re.compile(
     r'^\s*(?P<st>[A-Z][A-Z0-9]*(?:(?: \+ |[ +\-/])[A-Z0-9]+)*)\s+\[[ >0-9.smh]*\]\s+\S+\s+\S')
-# A retry prints each attempt as ``TRY n <status> [..] <bin> <name>``: the text in front of the matched status
-# ends in ``TRY n`` for those, and the status is then read from the short table.
+# A retry prints each attempt as ``TRY n <status> [..] <bin> <name>`` (a failed attempt after the first; the counter
+# is ``(---)`` until the test is final): the text in front of the matched status ends in ``TRY n`` for those, and
+# the status is then read from the short table. The check is made on the recovered tail, so an attempt glued with
+# no space behind a stderr fragment is still an attempt. The result of a retried test is its final non-TRY line
+# (PASS / FAIL / FLAKY n/m / LEAK ...); nextest 0.9.146 prints the final line of a test that fails every attempt as
+# ``TRY n FAIL`` with no plain FAIL line (displayer/imp.rs:1810-1826), so a test with only TRY lines is what its
+# LAST attempt said (#7298 R2).
 _NEXTEST_TRY_RE = re.compile(r'TRY\s+\d+\s*$')
 _TRY_PREFIX_RE = re.compile(r'^TRY\s+\d+\s+')
 _NUMBERS_RE = re.compile(r'\d+/\d+')
@@ -294,13 +302,14 @@ def _nextest_binary(binary_id: str) -> str:
 
 
 def parse_nextest_log(text: str) -> Outcomes:
-    """nextest status lines -> ``{(binary, test): pass|fail}`` (retry attempts and skips excluded)."""
+    """nextest status lines -> ``{(binary, test): pass|fail}`` (skips excluded; a retried test is its final line, else its last attempt)."""
     return scan_nextest_log(text).outcomes
 
 
 def scan_nextest_log(text: str) -> Scan:
     """``parse_nextest_log`` plus the count of status lines that carried a spliced prefix."""
     out: Outcomes = {}
+    attempts: Outcomes = {}  # the last ``TRY n <status>`` line of each test (#7298 R2)
     spliced = total = total_lines = 0
     for raw in text.splitlines():
         line = _clean(raw)
@@ -326,10 +335,16 @@ def scan_nextest_log(text: str) -> Scan:
         if kind is None:
             raise ParseError('nextest log: status %r is not valid in this position (nextest 0.9.146 status table); '
                              'line: %r' % (found.group('st'), line[:120]))
-        if attempt or kind == _SKIP:
-            continue  # an attempt of a retried test, or a marker / skipped test: not a result
+        if kind == _SKIP:
+            continue  # a marker or a skipped test: not a result
+        key = (_nextest_binary(found.group('bin')), found.group('name'))
+        if attempt:
+            attempts[key] = kind  # last attempt wins; never counted as a spliced line
+            continue
         spliced += _spliced(line, found)
-        _merge(out, (_nextest_binary(found.group('bin')), found.group('name')), kind)
+        _merge(out, key, kind)
+    for key, kind in attempts.items():
+        out.setdefault(key, kind)  # no final PASS/FAIL/FLAKY line: the test is what its last attempt said
     if not out:
         raise ParseError('nextest log: no PASS/FAIL result lines found')
     return Scan(out, spliced, len(out), total, total_lines)
