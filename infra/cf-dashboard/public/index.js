@@ -530,7 +530,9 @@ function setLive(state){
   const b=document.getElementById("livebadge"),t=document.getElementById("livetext");
   b.className="live"+(state==="stale"?" stale":state==="err"?" err":"");
   if(state==="err"){t.textContent="offline — retrying";return;}
-  const ago=lastUpdated?Math.max(0,Date.now()-new Date(lastUpdated).getTime()):0;
+  const stamp=lastUpdated?new Date(lastUpdated).getTime():0;
+  if(!Number.isFinite(stamp)){b.className="live stale";t.textContent="stale · state time unknown";return;}
+  const ago=lastUpdated?Math.max(0,Date.now()-stamp):0;
   const m=Math.floor(ago/60000),h=Math.floor(m/60);
   const rel=h>0?h+"h "+(m%60)+"m ago":m>0?m+"m ago":Math.floor(ago/1000)+"s ago";
   const old=ago>30*60000; b.className="live"+(old?" stale":"");

@@ -1,77 +1,74 @@
 {
-  "surface": "MCP (localhost \u00b7 ai-memory mcp --profile full)",
-  "total": 104,
-  "validated": 79,
+  "addressed_exe_sha256": "f142df2642fd2d34ff1116fb7849fe6433e85f8d91a9f1b48bb249ed3f2cc01b",
+  "daemon_binary_sha256": "f142df2642fd2d34ff1116fb7849fe6433e85f8d91a9f1b48bb249ed3f2cc01b",
   "failclosed": 20,
-  "refining": 5,
   "functional": 99,
-  "pct": 95,
   "groups": [
     {
       "family": "skill",
       "tools": [
         {
-          "name": "memory_skill_register",
-          "desc": "Register an agentskills",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "SKILL.md must begin with a '---' YAML frontmatter fence"
-        },
-        {
-          "name": "memory_skill_list",
-          "desc": "List current (non-superseded)",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"count\": 0,\n  \"skills\": []\n}"
-        },
-        {
-          "name": "memory_skill_get",
-          "desc": "Get full skill activation",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "skill not found: validator"
-        },
-        {
-          "name": "memory_skill_resource",
-          "desc": "Fetch + digest-verify a skill",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "resource not found: skill_id=validator path=validator"
-        },
-        {
-          "name": "memory_skill_export",
-          "desc": "Export a skill to a folder",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "skill not found: validator"
-        },
-        {
-          "name": "memory_skill_promote_from_reflection",
-          "desc": "Promote a Reflection into a",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "reflection not found: validator"
-        },
-        {
-          "name": "memory_skill_retire",
-          "desc": "Retire (hide + block",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"action\": \"retire\",\n  \"affected\": 0,\n  \"name\": \"tv-skill\",\n  \"namespace\": \"toolval\",\n  \"retired\": true,\n  \"retired_at\": 1788271792,\n  \"r"
-        },
-        {
-          "name": "memory_skill_delete",
-          "desc": "Hard-purge an entire skill",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "skill not found: toolval/tv-skill"
-        },
-        {
+          "cls": "failclosed",
+          "desc": "Skill body + composes_with_reflections (bounded by max_reflection_depth)",
           "name": "memory_skill_compositional_context",
-          "desc": "Skill body +",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "skill not found: validator"
+          "note": "skill not found: validator",
+          "status": "refusal"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Hard-purge an entire skill",
+          "name": "memory_skill_delete",
+          "note": "skill not found: toolval/tv-skill",
+          "status": "refusal"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Export a skill to a folder",
+          "name": "memory_skill_export",
+          "note": "skill not found: validator",
+          "status": "refusal"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Get full skill activation",
+          "name": "memory_skill_get",
+          "note": "skill not found: validator",
+          "status": "refusal"
+        },
+        {
+          "cls": "validated",
+          "desc": "List current (non-superseded)",
+          "name": "memory_skill_list",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Promote a Reflection into a reusable Agent Skill",
+          "name": "memory_skill_promote_from_reflection",
+          "note": "reflection not found: validator",
+          "status": "refusal"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Register an agentskills",
+          "name": "memory_skill_register",
+          "note": "SKILL.md must begin with a '---' YAML frontmatter fence",
+          "status": "refusal"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Fetch + digest-verify a skill",
+          "name": "memory_skill_resource",
+          "note": "resource not found: skill_id=validator path=validator",
+          "status": "refusal"
+        },
+        {
+          "cls": "validated",
+          "desc": "Retire (hide + block",
+          "name": "memory_skill_retire",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -79,60 +76,60 @@
       "family": "action",
       "tools": [
         {
-          "name": "memory_action_create",
-          "desc": "Create a coordination action",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"action\": {\n    \"agent_id\": \"host:node\",\n    \"claimed_by\": null,\n    \"created_at\": 1788271780,\n    \"id\": \"4969d218-0e3e-4080-91ef-4bc0"
-        },
-        {
-          "name": "memory_action_get",
-          "desc": "Fetch a coordination action by",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"action\": null\n}"
-        },
-        {
-          "name": "memory_action_transition",
-          "desc": "State-guarded transition of a",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "invalid state"
-        },
-        {
-          "name": "memory_action_list",
-          "desc": "List coordination actions by",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"actions\": [\n    {\n      \"agent_id\": \"host:node\",\n      \"claimed_by\": null,\n      \"created_at\": 1788271780,\n      \"id\": \"4969d218-0e3e"
-        },
-        {
+          "cls": "failclosed",
+          "desc": "Add a typed DAG edge between two coordination actions (#1709)",
           "name": "memory_action_add_edge",
-          "desc": "Add a typed DAG edge between",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "invalid edge_type"
+          "note": "invalid edge_type",
+          "status": "refusal"
         },
         {
+          "cls": "validated",
+          "desc": "Create a coordination action",
+          "name": "memory_action_create",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "List DAG edges for a coordination action (#1709)",
           "name": "memory_action_edges",
-          "desc": "List DAG edges for a",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"edges\": []\n}"
+          "note": "",
+          "status": "ok"
         },
         {
-          "name": "memory_action_frontier",
+          "cls": "validated",
           "desc": "Rank the UNBLOCKED",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"actions\": [\n    {\n      \"agent_id\": \"host:node\",\n      \"claimed_by\": null,\n      \"created_at\": 1788271767,\n      \"id\": \"155f0491-2802"
+          "name": "memory_action_frontier",
+          "note": "",
+          "status": "ok"
         },
         {
-          "name": "memory_action_next",
-          "desc": "Return the top UNBLOCKED",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"action\": {\n    \"agent_id\": \"host:node\",\n    \"claimed_by\": null,\n    \"created_at\": 1788271767,\n    \"id\": \"155f0491-2802-4204-b058-c6cc"
+          "desc": "Fetch a coordination action by id (#1709)",
+          "name": "memory_action_get",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "List coordination actions by namespace/state (#1709)",
+          "name": "memory_action_list",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Return the top UNBLOCKED",
+          "name": "memory_action_next",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "State-guarded transition of a coordination action (#1709)",
+          "name": "memory_action_transition",
+          "note": "invalid state",
+          "status": "refusal"
         }
       ]
     },
@@ -140,39 +137,39 @@
       "family": "routine",
       "tools": [
         {
+          "cls": "validated",
+          "desc": "Create a draft routine \u2014 a parameterised action+edge template (#1709)",
           "name": "memory_routine_create",
-          "desc": "Create a draft routine \u2014 a",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"id\": \"841ee515-d308-47d3-a75b-ee0205e34f4a\",\n  \"routine\": {\n    \"created_at\": 1788271780,\n    \"created_by\": \"host:node\",\n    \"frozen_"
+          "note": "",
+          "status": "ok"
         },
         {
-          "name": "memory_routine_freeze",
+          "cls": "failclosed",
           "desc": "Freeze a routine (draft ->",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "routine not found: ac23639a-807c-42a0-af8a-11b6d6bd0098"
+          "name": "memory_routine_freeze",
+          "note": "routine not found: ac23639a-807c-42a0-af8a-11b6d6bd0098",
+          "status": "refusal"
         },
         {
-          "name": "memory_routine_run",
-          "desc": "Run a frozen routine \u2014",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "arguments is required (a JSON object of {{param}} -> value)"
-        },
-        {
-          "name": "memory_routine_status",
-          "desc": "Fetch a routine run by id, with",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"run\": null\n}"
-        },
-        {
+          "desc": "List a namespace's routines by state, newest-first (#1709)",
           "name": "memory_routine_list",
-          "desc": "List a namespace's routines by",
-          "status": "ok",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Run a frozen routine \u2014",
+          "name": "memory_routine_run",
+          "note": "arguments is required (a JSON object of {{param}} -> value)",
+          "status": "refusal"
+        },
+        {
           "cls": "validated",
-          "note": "{\n  \"routines\": [\n    {\n      \"created_at\": 1788271780,\n      \"created_by\": \"host:node\",\n      \"frozen_at\": null,\n      \"id\": \"841ee515-d3"
+          "desc": "Fetch a routine run by id, with its state and created action ids (#1709)",
+          "name": "memory_routine_status",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -180,39 +177,39 @@
       "family": "signal",
       "tools": [
         {
-          "name": "memory_signal_send",
-          "desc": "Send a typed, optionally",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"attest_level\": \"unsigned\",\n  \"id\": \"b3e7163c-bef4-4e82-9646-c753f5b3aa9f\",\n  \"signal\": {\n    \"acknowledged_at\": null,\n    \"body\": null,"
-        },
-        {
-          "name": "memory_signal_read",
-          "desc": "Read one signal by id, mark it",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"signal\": null\n}"
-        },
-        {
-          "name": "memory_signal_inbox",
-          "desc": "List UNACKED signals for a",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"signals\": [\n    {\n      \"acknowledged_at\": null,\n      \"body\": null,\n      \"correlation_id\": null,\n      \"created_at\": 1788271780,\n    "
-        },
-        {
-          "name": "memory_signal_thread",
-          "desc": "List a signal correlation",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"signals\": []\n}"
-        },
-        {
-          "name": "memory_signal_ack",
           "desc": "Acknowledge a signal by id",
-          "status": "ok",
+          "name": "memory_signal_ack",
+          "note": "",
+          "status": "ok"
+        },
+        {
           "cls": "validated",
-          "note": "{\n  \"acknowledged\": false\n}"
+          "desc": "List UNACKED signals for a namespace/recipient \u2014 direct + broadcast (#1709)",
+          "name": "memory_signal_inbox",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Read one signal by id, mark it",
+          "name": "memory_signal_read",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Send a typed, optionally",
+          "name": "memory_signal_send",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "List a signal correlation",
+          "name": "memory_signal_thread",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -220,32 +217,32 @@
       "family": "archive",
       "tools": [
         {
-          "name": "memory_archive_list",
+          "cls": "validated",
           "desc": "List archived (expired)",
-          "status": "ok",
+          "name": "memory_archive_list",
+          "note": "",
+          "status": "ok"
+        },
+        {
           "cls": "validated",
-          "note": "{\n  \"archived\": [\n    {\n      \"access_count\": 0,\n      \"archive_reason\": \"in_place_edit\",\n      \"archived_at\": \"2026-09-01T14:09:32.92991746"
-        },
-        {
-          "name": "memory_archive_restore",
-          "desc": "Restore an archived memory back",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "cannot restore: memory ac23639a-807c-42a0-af8a-11b6d6bd0098 already exists in active table (would overwrite)"
-        },
-        {
-          "name": "memory_archive_purge",
           "desc": "Permanently delete archived",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"owner_scope\": \"caller\",\n  \"purged\": 0\n}"
+          "name": "memory_archive_purge",
+          "note": "",
+          "status": "ok"
         },
         {
-          "name": "memory_archive_stats",
-          "desc": "Show archive statistics (total",
-          "status": "ok",
+          "cls": "failclosed",
+          "desc": "Restore an archived memory back",
+          "name": "memory_archive_restore",
+          "note": "cannot restore: memory ac23639a-807c-42a0-af8a-11b6d6bd0098 already exists in active table (would overwrite)",
+          "status": "refusal"
+        },
+        {
           "cls": "validated",
-          "note": "{\n  \"archived_total\": 1,\n  \"by_namespace\": [\n    {\n      \"count\": 1,\n      \"namespace\": \"toolval\"\n    }\n  ]\n}"
+          "desc": "Show archive statistics (total",
+          "name": "memory_archive_stats",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -253,32 +250,32 @@
       "family": "checkpoint",
       "tools": [
         {
-          "name": "memory_checkpoint_create",
+          "cls": "validated",
           "desc": "Create a pending",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"checkpoint\": {\n    \"condition\": {},\n    \"condition_type\": \"approval\",\n    \"created_at\": 1788271780,\n    \"created_by\": \"host:node\",\n  "
+          "name": "memory_checkpoint_create",
+          "note": "",
+          "status": "ok"
         },
         {
-          "name": "memory_checkpoint_resolve",
-          "desc": "Resolve a checkpoint",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"attest_level\": \"unsigned\",\n  \"checkpoint\": {\n    \"condition\": {},\n    \"condition_type\": \"approval\",\n    \"created_at\": 1788271767,\n    \""
-        },
-        {
+          "desc": "Query checkpoints by namespace/condition_type/state, newest-first (#1709)",
           "name": "memory_checkpoint_query",
-          "desc": "Query checkpoints by",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"checkpoints\": [\n    {\n      \"condition\": {},\n      \"condition_type\": \"approval\",\n      \"created_at\": 1788271780,\n      \"created_by\": \"h"
+          "note": "",
+          "status": "ok"
         },
         {
-          "name": "memory_checkpoint_verify",
-          "desc": "Fetch a checkpoint by id and",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"checkpoint\": null,\n  \"verified\": false\n}"
+          "desc": "Resolve a checkpoint",
+          "name": "memory_checkpoint_resolve",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Fetch a checkpoint by id and verify its attested resolution (#1709)",
+          "name": "memory_checkpoint_verify",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -286,32 +283,32 @@
       "family": "lease",
       "tools": [
         {
-          "name": "memory_lease_acquire",
+          "cls": "validated",
           "desc": "Acquire a single-holder lease",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"lease\": {\n    \"acquired_at\": 1788271780,\n    \"action_id\": \"155f0491-2802-4204-b058-c6cceb53a3da\",\n    \"expires_at\": 1788272380,\n    \"he"
+          "name": "memory_lease_acquire",
+          "note": "",
+          "status": "ok"
         },
         {
-          "name": "memory_lease_renew",
-          "desc": "Heartbeat-renew an owned lease",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"lease\": {\n    \"acquired_at\": 1788271767,\n    \"action_id\": \"0ea0c752-687b-42da-adb0-f4c0409715e1\",\n    \"expires_at\": 1788272380,\n    \"he"
-        },
-        {
-          "name": "memory_lease_release",
-          "desc": "Release an owned lease on a",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"released\": true\n}"
-        },
-        {
+          "desc": "Read the lease on a coordination action (#1709)",
           "name": "memory_lease_get",
-          "desc": "Read the lease on a",
-          "status": "ok",
+          "note": "",
+          "status": "ok"
+        },
+        {
           "cls": "validated",
-          "note": "{\n  \"lease\": {\n    \"acquired_at\": 1788271767,\n    \"action_id\": \"0ea0c752-687b-42da-adb0-f4c0409715e1\",\n    \"expires_at\": 1788272380,\n    \"he"
+          "desc": "Release an owned lease on a coordination action (#1709)",
+          "name": "memory_lease_release",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Heartbeat-renew an owned lease",
+          "name": "memory_lease_renew",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -319,25 +316,25 @@
       "family": "get",
       "tools": [
         {
-          "name": "memory_get_taxonomy",
-          "desc": "Return a hierarchical tree of",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"total_count\": 6,\n  \"tree\": {\n    \"children\": [\n      {\n        \"children\": [],\n        \"count\": 1,\n        \"name\": \"global\",\n        \"n"
-        },
-        {
+          "desc": "Get a specific memory by ID",
           "name": "memory_get",
-          "desc": "Get a specific memory by ID,",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"access_count\": 0,\n  \"cid\": \"b3:bf8ad97c77c8590befd956fded7d4ebd21c0769f4dad67ebd6787bb36049de79\",\n  \"citations\": [],\n  \"confidence\": 1."
+          "note": "",
+          "status": "ok"
         },
         {
-          "name": "memory_get_links",
-          "desc": "Get all links for a memory",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"count\": 2,\n  \"links\": [\n    {\n      \"attest_level\": \"unsigned\",\n      \"created_at\": \"2026-09-01T14:09:27.412175+00:00\",\n      \"relation"
+          "desc": "Get all links for a memory",
+          "name": "memory_get_links",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Return a hierarchical tree of namespaces with memory counts",
+          "name": "memory_get_taxonomy",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -345,25 +342,25 @@
       "family": "kg",
       "tools": [
         {
-          "name": "memory_kg_timeline",
-          "desc": "Ordered fact timeline for an",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"count\": 1,\n  \"events\": [\n    {\n      \"observed_by\": null,\n      \"relation\": \"related_to\",\n      \"target_id\": \"7adb7056-7105-4d60-8154-9"
-        },
-        {
+          "desc": "Mark a KG link as superseded by setting its valid_until column",
           "name": "memory_kg_invalidate",
-          "desc": "Mark a KG link as superseded by",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"found\": true,\n  \"previous_valid_until\": null,\n  \"relation\": \"related_to\",\n  \"source_id\": \"ac23639a-807c-42a0-af8a-11b6d6bd0098\",\n  \"tar"
+          "note": "",
+          "status": "ok"
         },
         {
-          "name": "memory_kg_query",
-          "desc": "Outbound KG traversal from a",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"count\": 0,\n  \"max_depth\": 1,\n  \"memories\": [],\n  \"paths\": [],\n  \"source_id\": \"ac23639a-807c-42a0-af8a-11b6d6bd0098\"\n}"
+          "desc": "Outbound KG traversal from a source memory (<=5 hops)",
+          "name": "memory_kg_query",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Ordered fact timeline for an entity (outbound KG links by valid_from)",
+          "name": "memory_kg_timeline",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -371,25 +368,25 @@
       "family": "namespace",
       "tools": [
         {
-          "name": "memory_namespace_set_standard",
-          "desc": "Set a memory as the",
-          "status": "fail",
-          "cls": "refining",
-          "note": "memory not found: ac23639a-807c-42a0-af8a-11b6d6bd0098"
-        },
-        {
-          "name": "memory_namespace_get_standard",
-          "desc": "Get the standard/policy memory",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"namespace\": \"toolval\",\n  \"standard_id\": null\n}"
-        },
-        {
+          "desc": "Clear the standard/policy for a namespace",
           "name": "memory_namespace_clear_standard",
-          "desc": "Clear the standard/policy for a",
-          "status": "ok",
+          "note": "",
+          "status": "ok"
+        },
+        {
           "cls": "validated",
-          "note": "{\n  \"cleared\": false,\n  \"namespace\": \"toolval\"\n}"
+          "desc": "Get the standard/policy memory",
+          "name": "memory_namespace_get_standard",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "refining",
+          "desc": "Set a memory as the standard/policy for a namespace",
+          "name": "memory_namespace_set_standard",
+          "note": "memory not found: ac23639a-807c-42a0-af8a-11b6d6bd0098",
+          "status": "fail"
         }
       ]
     },
@@ -397,25 +394,25 @@
       "family": "pending",
       "tools": [
         {
-          "name": "memory_pending_list",
-          "desc": "List pending governance-queued",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"count\": 0,\n  \"pending\": []\n}"
-        },
-        {
-          "name": "memory_pending_approve",
+          "cls": "failclosed",
           "desc": "Approve a pending action",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "pending action not found: ac23639a-807c-42a0-af8a-11b6d6bd0098"
+          "name": "memory_pending_approve",
+          "note": "pending action not found: ac23639a-807c-42a0-af8a-11b6d6bd0098",
+          "status": "refusal"
         },
         {
-          "name": "memory_pending_reject",
+          "cls": "validated",
+          "desc": "List pending governance-queued",
+          "name": "memory_pending_list",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "failclosed",
           "desc": "Reject a pending action",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "pending action not found or already decided: ac23639a-807c-42a0-af8a-11b6d6bd0098"
+          "name": "memory_pending_reject",
+          "note": "pending action not found or already decided: ac23639a-807c-42a0-af8a-11b6d6bd0098",
+          "status": "refusal"
         }
       ]
     },
@@ -423,18 +420,18 @@
       "family": "agent",
       "tools": [
         {
-          "name": "memory_agent_register",
-          "desc": "Register an agent in the",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "invalid agent_type 'validator' \u2014 must be one of: ai:claude-opus-4.6, ai:claude-opus-4.7, ai:codex-5.4, ai:grok-4.2, human, system (or any ai"
+          "cls": "validated",
+          "desc": "List every registered agent",
+          "name": "memory_agent_list",
+          "note": "",
+          "status": "ok"
         },
         {
-          "name": "memory_agent_list",
-          "desc": "List every registered agent.",
-          "status": "ok",
-          "cls": "validated",
-          "note": "{\n  \"agents\": [],\n  \"count\": 0\n}"
+          "cls": "failclosed",
+          "desc": "Register an agent in the reserved _agents namespace",
+          "name": "memory_agent_register",
+          "note": "invalid agent_type 'validator' \u2014 must be one of: ai:claude-opus-4.6, ai:claude-opus-4.7, ai:codex-5.4, ai:grok-4.2, human, system (or any ai",
+          "status": "refusal"
         }
       ]
     },
@@ -442,18 +439,18 @@
       "family": "check",
       "tools": [
         {
-          "name": "memory_check_duplicate",
-          "desc": "Pre-write near-duplicate check",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"candidates_scanned\": 5,\n  \"is_duplicate\": false,\n  \"nearest\": {\n    \"id\": \"ac23639a-807c-42a0-af8a-11b6d6bd0098\",\n    \"namespace\": \"too"
+          "desc": "Check action vs",
+          "name": "memory_check_agent_action",
+          "note": "",
+          "status": "ok"
         },
         {
-          "name": "memory_check_agent_action",
-          "desc": "Check action vs",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"agent_id\": \"anonymous:mcp\",\n  \"decision\": {\n    \"decision\": \"allow\"\n  },\n  \"kind\": \"process_spawn\"\n}"
+          "desc": "Pre-write near-duplicate check",
+          "name": "memory_check_duplicate",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -461,18 +458,18 @@
       "family": "entity",
       "tools": [
         {
-          "name": "memory_entity_register",
-          "desc": "Register an entity (canonical",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"aliases\": [\n    \"Toolval Entity\",\n    \"tv\"\n  ],\n  \"canonical_name\": \"Toolval Entity\",\n  \"created\": false,\n  \"entity_id\": \"d19a4d20-7b28"
+          "desc": "Resolve an alias to its",
+          "name": "memory_entity_get_by_alias",
+          "note": "",
+          "status": "ok"
         },
         {
-          "name": "memory_entity_get_by_alias",
-          "desc": "Resolve an alias to its",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"aliases\": [],\n  \"canonical_name\": null,\n  \"entity_id\": null,\n  \"found\": false,\n  \"namespace\": null\n}"
+          "desc": "Register an entity (canonical",
+          "name": "memory_entity_register",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -480,18 +477,18 @@
       "family": "list",
       "tools": [
         {
-          "name": "memory_list",
-          "desc": "List memories, optionally",
-          "status": "ok",
           "cls": "validated",
-          "note": "count:0\nmemories[id|title|tier|namespace|priority|score|tags|agent_id]:\n"
+          "desc": "List memories, optionally",
+          "name": "memory_list",
+          "note": "",
+          "status": "ok"
         },
         {
-          "name": "memory_list_subscriptions",
-          "desc": "List active webhook",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"count\": 0,\n  \"subscriptions\": []\n}"
+          "desc": "List active webhook",
+          "name": "memory_list_subscriptions",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -499,18 +496,18 @@
       "family": "persona",
       "tools": [
         {
-          "name": "memory_persona",
-          "desc": "Fetch the latest Persona",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"persona\": null\n}"
+          "desc": "Fetch the latest Persona",
+          "name": "memory_persona",
+          "note": "",
+          "status": "ok"
         },
         {
-          "name": "memory_persona_generate",
+          "cls": "failclosed",
           "desc": "Generate/regen a Persona",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "no reflections found for entity 'validator' in namespace '<any namespace>'"
+          "name": "memory_persona_generate",
+          "note": "no reflections found for entity 'validator' in namespace '<any namespace>'",
+          "status": "refusal"
         }
       ]
     },
@@ -518,18 +515,18 @@
       "family": "recall",
       "tools": [
         {
-          "name": "memory_recall",
-          "desc": "Recall memories relevant to a",
-          "status": "ok",
           "cls": "validated",
-          "note": "count:5|mode:hybrid+rerank|tokens_used:43\nmemories[id|title|tier|namespace|priority|score|tags|agent_id]:\nac23639a-807c-42a0-af8a-11b6d6bd00"
+          "desc": "Recall memories relevant to a context (ranked)",
+          "name": "memory_recall",
+          "note": "",
+          "status": "ok"
         },
         {
-          "name": "memory_recall_observations",
-          "desc": "List recall_observations (#886).",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"count\": 5,\n  \"observations\": [\n    {\n      \"consumed\": false,\n      \"folded\": false,\n      \"memory_id\": \"51d8e85d-890c-4981-b1d5-62f968"
+          "desc": "List recall_observations (#886)",
+          "name": "memory_recall_observations",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -537,18 +534,18 @@
       "family": "subscription",
       "tools": [
         {
-          "name": "memory_subscription_replay",
-          "desc": "Replay subscription_events",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"count\": 0,\n  \"events\": [],\n  \"since\": \"validator\",\n  \"subscription_id\": \"validator\"\n}"
+          "desc": "List subscription_dlq rows",
+          "name": "memory_subscription_dlq_list",
+          "note": "",
+          "status": "ok"
         },
         {
-          "name": "memory_subscription_dlq_list",
-          "desc": "List subscription_dlq rows",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"count\": 0,\n  \"entries\": [],\n  \"limit\": 1,\n  \"subscription_id\": null\n}"
+          "desc": "Replay subscription_events",
+          "name": "memory_subscription_replay",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -556,11 +553,11 @@
       "family": "atomise",
       "tools": [
         {
-          "name": "memory_atomise",
-          "desc": "Decompose a memory into 2-10",
-          "status": "fail",
           "cls": "refining",
-          "note": "MEMORY_NOT_FOUND: ac23639a-807c-42a0-af8a-11b6d6bd0098"
+          "desc": "Decompose a memory into 2-10",
+          "name": "memory_atomise",
+          "note": "MEMORY_NOT_FOUND: ac23639a-807c-42a0-af8a-11b6d6bd0098",
+          "status": "fail"
         }
       ]
     },
@@ -568,11 +565,11 @@
       "family": "auto",
       "tools": [
         {
-          "name": "memory_auto_tag",
-          "desc": "LLM-generate tags for a memory",
-          "status": "fail",
           "cls": "refining",
-          "note": "memory not found"
+          "desc": "LLM-generate tags for a memory",
+          "name": "memory_auto_tag",
+          "note": "memory not found",
+          "status": "fail"
         }
       ]
     },
@@ -580,11 +577,11 @@
       "family": "calibrate",
       "tools": [
         {
-          "name": "memory_calibrate_confidence",
-          "desc": "Scan",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"report\": {\n    \"baselines\": [],\n    \"total_observations\": 0,\n    \"window_days\": 30\n  }\n}"
+          "desc": "Calibrate confidence baselines",
+          "name": "memory_calibrate_confidence",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -592,11 +589,11 @@
       "family": "capabilities",
       "tools": [
         {
-          "name": "memory_capabilities",
-          "desc": "Discover runtime capabilities",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"approval\": {\n    \"pending_requests\": 0\n  },\n  \"atomisation\": {\n    \"auto\": \"implemented\",\n    \"cli\": \"implemented\",\n    \"curator\": \"imp"
+          "desc": "Discover runtime capabilities; full per-tool docs: verbose=true",
+          "name": "memory_capabilities",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -604,11 +601,11 @@
       "family": "capture",
       "tools": [
         {
-          "name": "memory_capture_turn",
-          "desc": "L4 host-volunteered turn",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"attest_level\": \"self_signed\",\n  \"dedup_hit\": false,\n  \"elapsed_ms\": 0,\n  \"layer\": \"L4\",\n  \"memory_id\": \"8ab3b92b-2940-4437-94cf-2df20a3"
+          "desc": "L4 host-volunteered turn",
+          "name": "memory_capture_turn",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -616,11 +613,11 @@
       "family": "consolidate",
       "tools": [
         {
-          "name": "memory_consolidate",
-          "desc": "Consolidate multiple memories",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"auto_summary\": true,\n  \"consolidated\": 2,\n  \"id\": \"a184a728-2299-4a10-b0f3-0d860f7159a1\",\n  \"summary_preview\": \"The validator seed memo"
+          "desc": "Consolidate multiple memories",
+          "name": "memory_consolidate",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -628,11 +625,11 @@
       "family": "delete",
       "tools": [
         {
-          "name": "memory_delete",
-          "desc": "Delete a memory by ID.",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"deleted\": true\n}"
+          "desc": "Delete a memory by ID",
+          "name": "memory_delete",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -640,11 +637,11 @@
       "family": "dependents",
       "tools": [
         {
-          "name": "memory_dependents_of_invalidated",
-          "desc": "List dependents flagged by the",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"count\": 2,\n  \"dependents\": [\n    {\n      \"id\": \"51d8e85d-890c-4981-b1d5-62f968ae4c46\",\n      \"namespace\": \"toolval\"\n    },\n    {\n      "
+          "desc": "List dependents flagged by the L2-3 invalidation walker",
+          "name": "memory_dependents_of_invalidated",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -652,11 +649,11 @@
       "family": "deref",
       "tools": [
         {
-          "name": "memory_deref",
-          "desc": "Dereference a memory_offload",
-          "status": "fail",
           "cls": "refining",
-          "note": "offloaded blob ac23639a-807c-42a0-af8a-11b6d6bd0098 not found"
+          "desc": "Dereference a memory_offload",
+          "name": "memory_deref",
+          "note": "offloaded blob ac23639a-807c-42a0-af8a-11b6d6bd0098 not found",
+          "status": "fail"
         }
       ]
     },
@@ -664,11 +661,11 @@
       "family": "detect",
       "tools": [
         {
-          "name": "memory_detect_contradiction",
-          "desc": "LLM-check whether two memories",
-          "status": "fail",
           "cls": "refining",
-          "note": "memory A not found"
+          "desc": "LLM-check whether two memories",
+          "name": "memory_detect_contradiction",
+          "note": "memory A not found",
+          "status": "fail"
         }
       ]
     },
@@ -676,11 +673,11 @@
       "family": "expand",
       "tools": [
         {
-          "name": "memory_expand_query",
-          "desc": "LLM-expand a search query into",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"expanded_terms\": [\n    \"Uptime Institute tier certification\",\n    \"Tier 4 certified data center\",\n    \"Tier 3 data center standards\",\n "
+          "desc": "LLM-expand a search query into related terms (smart/autonomous tier)",
+          "name": "memory_expand_query",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -688,11 +685,11 @@
       "family": "export",
       "tools": [
         {
-          "name": "memory_export_reflection",
-          "desc": "Render a single reflection",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"content\": \"---\\nmemory_id: 51d8e85d-890c-4981-b1d5-62f968ae4c46\\nnamespace: toolval\\ntitle: toolval-reflection\\nreflection_depth: 1\\nat"
+          "desc": "Render a single reflection",
+          "name": "memory_export_reflection",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -700,11 +697,11 @@
       "family": "find",
       "tools": [
         {
-          "name": "memory_find_paths",
-          "desc": "Enumerate up to N paths through",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"count\": 1,\n  \"paths\": [\n    [\n      \"ac23639a-807c-42a0-af8a-11b6d6bd0098\",\n      \"51d8e85d-890c-4981-b1d5-62f968ae4c46\",\n      \"7adb70"
+          "desc": "Enumerate up to N paths through",
+          "name": "memory_find_paths",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -712,11 +709,11 @@
       "family": "forget",
       "tools": [
         {
-          "name": "memory_forget",
-          "desc": "Bulk delete memories matching a",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"dry_run\": true,\n  \"rows\": [],\n  \"truncated\": false,\n  \"would_delete\": 0\n}"
+          "desc": "Bulk delete memories matching a pattern",
+          "name": "memory_forget",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -724,11 +721,11 @@
       "family": "gc",
       "tools": [
         {
-          "name": "memory_gc",
-          "desc": "Trigger garbage collection on",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"archived\": true,\n  \"collected\": 0,\n  \"dry_run\": true\n}"
+          "desc": "Trigger garbage collection on expired memories (archives first WHEN ENABLED)",
+          "name": "memory_gc",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -736,11 +733,11 @@
       "family": "inbox",
       "tools": [
         {
-          "name": "memory_inbox",
-          "desc": "List messages sent to an agent",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"agent_id\": \"validator\",\n  \"count\": 1,\n  \"messages\": [\n    {\n      \"access_count\": 0,\n      \"created_at\": \"2026-09-01T14:09:52.724625496"
+          "desc": "List messages sent to an agent",
+          "name": "memory_inbox",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -748,11 +745,11 @@
       "family": "ingest",
       "tools": [
         {
-          "name": "memory_ingest_multistep",
-          "desc": "Form 3 multi-step ingest:",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"distinct_cache_keys\": [\n    \"2a323080f9af3cc185b0111b0d035ee36135ea637d09a4536ba905cbee53fef0\"\n  ],\n  \"final_output\": {\n    \"raw\": \"```"
+          "desc": "Form 3 multi-step ingest",
+          "name": "memory_ingest_multistep",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -760,11 +757,11 @@
       "family": "lineage",
       "tools": [
         {
-          "name": "memory_lineage",
-          "desc": "Walk a memory's derivation",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"count\": 0,\n  \"direction\": \"ancestors\",\n  \"id\": \"ac23639a-807c-42a0-af8a-11b6d6bd0098\",\n  \"nodes\": [],\n  \"propagated_trust\": \"claimed\"\n}"
+          "desc": "Walk a memory's derivation",
+          "name": "memory_lineage",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -772,11 +769,11 @@
       "family": "link",
       "tools": [
         {
-          "name": "memory_link",
+          "cls": "failclosed",
           "desc": "Create a typed link between two",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "invalid relation 'supports' \u2014 must be one of: related_to, supersedes, contradicts, derived_from, reflects_on, derives_from, decomposes_into,"
+          "name": "memory_link",
+          "note": "invalid relation 'supports' \u2014 must be one of: related_to, supersedes, contradicts, derived_from, reflects_on, derives_from, decomposes_into,",
+          "status": "refusal"
         }
       ]
     },
@@ -784,11 +781,11 @@
       "family": "load",
       "tools": [
         {
+          "cls": "failclosed",
+          "desc": "Load top-k recent + high-priority memories from a Family",
           "name": "memory_load_family",
-          "desc": "Load top-k recent +",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "unknown profile or family 'validator'. Valid profiles: core, graph, admin, power, full. Valid families: core, lifecycle, graph, governance, "
+          "note": "unknown profile or family 'validator'. Valid profiles: core, graph, admin, power, full. Valid families: core, lifecycle, graph, governance, ",
+          "status": "refusal"
         }
       ]
     },
@@ -796,11 +793,11 @@
       "family": "notify",
       "tools": [
         {
-          "name": "memory_notify",
-          "desc": "Send a message from the caller",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"delivered_at\": \"2026-09-01T14:09:52.724625496+00:00\",\n  \"from\": \"ai:fable-validator@node\",\n  \"id\": \"62b1dacf-6801-4577-834d-e8e2b5806"
+          "desc": "Send a message from the caller",
+          "name": "memory_notify",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -808,11 +805,11 @@
       "family": "offload",
       "tools": [
         {
-          "name": "memory_offload",
-          "desc": "Offload verbatim content",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"content_sha256\": \"e34bf8cd11bc48d875ec7b36ae437d5fb0951b3a16ee16b1b68f7f578621fe5c\",\n  \"namespace\": \"auto\",\n  \"ref_id\": \"ofl_4NF7RTIRXR"
+          "desc": "Offload verbatim content",
+          "name": "memory_offload",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -820,11 +817,11 @@
       "family": "promote",
       "tools": [
         {
-          "name": "memory_promote",
-          "desc": "Promote a memory to long (or",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"id\": \"ac23639a-807c-42a0-af8a-11b6d6bd0098\",\n  \"mode\": \"tier\",\n  \"promoted\": true,\n  \"tier\": \"long\"\n}"
+          "desc": "Promote a memory to long (or",
+          "name": "memory_promote",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -832,11 +829,11 @@
       "family": "quota",
       "tools": [
         {
-          "name": "memory_quota_status",
-          "desc": "Report per-agent +",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"agent_id\": \"validator\",\n  \"namespace\": \"_global\",\n  \"quota\": {\n    \"agent_id\": \"validator\",\n    \"created_at\": \"2026-09-01T14:09:27.4145"
+          "desc": "Report per-agent + per-namespace quota usage (read-only)",
+          "name": "memory_quota_status",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -844,11 +841,11 @@
       "family": "reflect",
       "tools": [
         {
-          "name": "memory_reflect",
-          "desc": "Persist a reflection memory",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"id\": \"24a0e1b2-cd20-4a60-a8aa-cc064edd7910\",\n  \"namespace\": \"toolval\",\n  \"reflection_depth\": 1,\n  \"reflects_on\": [\n    \"ac23639a-807c-4"
+          "desc": "Persist a reflection memory",
+          "name": "memory_reflect",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -856,11 +853,11 @@
       "family": "reflection",
       "tools": [
         {
-          "name": "memory_reflection_origin",
-          "desc": "Inspect the cross-peer",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"is_reflection\": true,\n  \"local_depth_at_arrival\": null,\n  \"memory_id\": \"51d8e85d-890c-4981-b1d5-62f968ae4c46\",\n  \"original_depth\": 1,\n "
+          "desc": "Inspect the cross-peer",
+          "name": "memory_reflection_origin",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -868,11 +865,11 @@
       "family": "replay",
       "tools": [
         {
-          "name": "memory_replay",
-          "desc": "Reconstruct the conversation",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"count\": 0,\n  \"memory_id\": \"ac23639a-807c-42a0-af8a-11b6d6bd0098\",\n  \"transcripts\": []\n}"
+          "desc": "Reconstruct the conversation",
+          "name": "memory_replay",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -880,11 +877,11 @@
       "family": "rule",
       "tools": [
         {
-          "name": "memory_rule_list",
-          "desc": "List substrate-level",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"count\": 4,\n  \"rules\": [\n    {\n      \"attest_level\": \"unsigned\",\n      \"created_at\": 0,\n      \"created_by\": \"system:seed\",\n      \"enable"
+          "desc": "List substrate-level",
+          "name": "memory_rule_list",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -892,11 +889,11 @@
       "family": "search",
       "tools": [
         {
-          "name": "memory_search",
-          "desc": "Search memories by exact",
-          "status": "ok",
           "cls": "validated",
-          "note": "count:0\nmemories[id|title|tier|namespace|priority|score|tags|agent_id]:\n"
+          "desc": "Search memories by exact",
+          "name": "memory_search",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -904,11 +901,11 @@
       "family": "session",
       "tools": [
         {
-          "name": "memory_session_start",
-          "desc": "Auto-recall recent memories on",
-          "status": "ok",
           "cls": "validated",
-          "note": "count:7|mode:session_start\nmemories[id|title|tier|namespace|priority|score|tags|agent_id]:\nd19a4d20-7b28-43e5-aac1-aa346ef2c71b|Toolval Enti"
+          "desc": "Auto-recall recent memories on session start",
+          "name": "memory_session_start",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -916,11 +913,11 @@
       "family": "share",
       "tools": [
         {
-          "name": "memory_share",
-          "desc": "Share a memory with another",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"from_agent_id\": \"ai:fable-validator@node\",\n  \"shared_memory_id\": \"ff10130e-ace5-4bf1-b141-7a08190d71e8\",\n  \"source_memory_id\": \"ac236"
+          "desc": "Share a memory with another",
+          "name": "memory_share",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -928,11 +925,11 @@
       "family": "smart",
       "tools": [
         {
-          "name": "memory_smart_load",
-          "desc": "Intent-routed loader: free-text",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"chosen_family\": \"governance\",\n  \"chosen_family_source\": \"embedder\",\n  \"count\": 0,\n  \"intent\": \"validator\",\n  \"k\": 20,\n  \"memories\": [],"
+          "desc": "Intent-routed loader: free-text",
+          "name": "memory_smart_load",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -940,11 +937,11 @@
       "family": "stats",
       "tools": [
         {
-          "name": "memory_stats",
-          "desc": "Get memory store statistics",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"by_namespace\": [\n    {\n      \"count\": 4,\n      \"namespace\": \"toolval\"\n    },\n    {\n      \"count\": 1,\n      \"namespace\": \"global\"\n    }\n"
+          "desc": "Get memory store statistics",
+          "name": "memory_stats",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -952,11 +949,11 @@
       "family": "store",
       "tools": [
         {
-          "name": "memory_store",
-          "desc": "Store a memory",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"agent_id\": \"ai:fable-validator@node\",\n  \"atomise_mode\": \"off\",\n  \"atomise_outcome\": \"skipped_policy_disabled\",\n  \"id\": \"6863a387-aed4"
+          "desc": "Store a memory",
+          "name": "memory_store",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -964,11 +961,11 @@
       "family": "subscribe",
       "tools": [
         {
-          "name": "memory_subscribe",
+          "cls": "failclosed",
           "desc": "Register a webhook subscription",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "HMAC secret required: configure per-subscription `hmac_secret` or server-wide `[security] hmac_secret`. Pass `secret: <value>` in the tool c"
+          "name": "memory_subscribe",
+          "note": "HMAC secret required: configure per-subscription `hmac_secret` or server-wide `[security] hmac_secret`. Pass `secret: <value>` in the tool c",
+          "status": "refusal"
         }
       ]
     },
@@ -976,11 +973,11 @@
       "family": "swarm",
       "tools": [
         {
-          "name": "memory_swarm_rewind",
+          "cls": "failclosed",
           "desc": "Atomically intercept and unwind",
-          "status": "refusal",
-          "cls": "fail-closed",
-          "note": "swarm_rewind: target validator not found"
+          "name": "memory_swarm_rewind",
+          "note": "swarm_rewind: target validator not found",
+          "status": "refusal"
         }
       ]
     },
@@ -988,11 +985,11 @@
       "family": "unsubscribe",
       "tools": [
         {
-          "name": "memory_unsubscribe",
-          "desc": "Delete a subscription by id.",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"id\": \"ac23639a-807c-42a0-af8a-11b6d6bd0098\",\n  \"removed\": false\n}"
+          "desc": "Delete a subscription by id",
+          "name": "memory_unsubscribe",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -1000,11 +997,11 @@
       "family": "update",
       "tools": [
         {
-          "name": "memory_update",
-          "desc": "Update an existing memory by ID",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"edit_source\": \"agent\",\n  \"memory\": {\n    \"access_count\": 0,\n    \"cid\": \"b3:bf8ad97c77c8590befd956fded7d4ebd21c0769f4dad67ebd6787bb36049"
+          "desc": "Update an existing memory by ID",
+          "name": "memory_update",
+          "note": "",
+          "status": "ok"
         }
       ]
     },
@@ -1012,14 +1009,129 @@
       "family": "verify",
       "tools": [
         {
-          "name": "memory_verify",
-          "desc": "Re-verify a stored memory_links",
-          "status": "ok",
           "cls": "validated",
-          "note": "{\n  \"attest_level\": \"unsigned\",\n  \"signature_verified\": false,\n  \"signed_at\": null,\n  \"signed_by\": null\n}"
+          "desc": "Re-verify a stored memory_links",
+          "name": "memory_verify",
+          "note": "",
+          "status": "ok"
         }
       ]
     }
   ],
-  "lastUpdated": null
+  "lastUpdated": "2026-10-17T23:39:15Z",
+  "names": [
+    "memory_action_add_edge",
+    "memory_action_create",
+    "memory_action_edges",
+    "memory_action_frontier",
+    "memory_action_get",
+    "memory_action_list",
+    "memory_action_next",
+    "memory_action_transition",
+    "memory_agent_list",
+    "memory_agent_register",
+    "memory_archive_list",
+    "memory_archive_purge",
+    "memory_archive_restore",
+    "memory_archive_stats",
+    "memory_atomise",
+    "memory_auto_tag",
+    "memory_calibrate_confidence",
+    "memory_capabilities",
+    "memory_capture_turn",
+    "memory_check_agent_action",
+    "memory_check_duplicate",
+    "memory_checkpoint_create",
+    "memory_checkpoint_query",
+    "memory_checkpoint_resolve",
+    "memory_checkpoint_verify",
+    "memory_consolidate",
+    "memory_delete",
+    "memory_dependents_of_invalidated",
+    "memory_deref",
+    "memory_detect_contradiction",
+    "memory_entity_get_by_alias",
+    "memory_entity_register",
+    "memory_expand_query",
+    "memory_export_reflection",
+    "memory_find_paths",
+    "memory_forget",
+    "memory_gc",
+    "memory_get",
+    "memory_get_links",
+    "memory_get_taxonomy",
+    "memory_inbox",
+    "memory_ingest_multistep",
+    "memory_kg_invalidate",
+    "memory_kg_query",
+    "memory_kg_timeline",
+    "memory_lease_acquire",
+    "memory_lease_get",
+    "memory_lease_release",
+    "memory_lease_renew",
+    "memory_lineage",
+    "memory_link",
+    "memory_list",
+    "memory_list_subscriptions",
+    "memory_load_family",
+    "memory_namespace_clear_standard",
+    "memory_namespace_get_standard",
+    "memory_namespace_set_standard",
+    "memory_notify",
+    "memory_offload",
+    "memory_pending_approve",
+    "memory_pending_list",
+    "memory_pending_reject",
+    "memory_persona",
+    "memory_persona_generate",
+    "memory_promote",
+    "memory_quota_status",
+    "memory_recall",
+    "memory_recall_observations",
+    "memory_reflect",
+    "memory_reflection_origin",
+    "memory_replay",
+    "memory_routine_create",
+    "memory_routine_freeze",
+    "memory_routine_list",
+    "memory_routine_run",
+    "memory_routine_status",
+    "memory_rule_list",
+    "memory_search",
+    "memory_session_start",
+    "memory_share",
+    "memory_signal_ack",
+    "memory_signal_inbox",
+    "memory_signal_read",
+    "memory_signal_send",
+    "memory_signal_thread",
+    "memory_skill_compositional_context",
+    "memory_skill_delete",
+    "memory_skill_export",
+    "memory_skill_get",
+    "memory_skill_list",
+    "memory_skill_promote_from_reflection",
+    "memory_skill_register",
+    "memory_skill_resource",
+    "memory_skill_retire",
+    "memory_smart_load",
+    "memory_stats",
+    "memory_store",
+    "memory_subscribe",
+    "memory_subscription_dlq_list",
+    "memory_subscription_replay",
+    "memory_swarm_rewind",
+    "memory_unsubscribe",
+    "memory_update",
+    "memory_verify"
+  ],
+  "note": "percentage is not emitted; consumers must derive it from total/validated/failclosed of THIS run_id",
+  "producer_id": "mcp-tools-state",
+  "refining": 5,
+  "run_id": "mcp-tools-7644-20261017",
+  "source_commit": "c9de4e680c9fa64fa267d3ade9c1305a6ca9f4b0",
+  "source_tree_sha": "3020cd7039b2e3da6182333dd75e9dec61869a77",
+  "surface": "MCP (localhost \u00b7 ai-memory mcp --profile full)",
+  "total": 104,
+  "validated": 79
 }

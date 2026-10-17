@@ -20,6 +20,14 @@
     if (a === null || b === null || b <= 0) { return 0; }
     return Math.max(0, Math.min(100, a / b * 100));
   }
+  /* The state's own pct when it has one, else derived from the counts exactly as index.js does for the nav badge. */
+  function pctOf(d) {
+    var own = num(d.pct);
+    if (own !== null) { return own; }
+    var done = num(d.validated), fc = num(d.failclosed), whole = num(d.total);
+    if (done === null || fc === null || whole === null || whole <= 0) { return null; }
+    return Math.round((done + fc) / whole * 100);
+  }
   function token(v) { return typeof v === "string" && /^[a-z][a-z-]*$/.test(v) ? v : "unknown"; }
   function node(tag, cls, text) {
     var e = document.createElement(tag);
@@ -52,7 +60,7 @@
     if (d === null || typeof d !== "object") { throw fail("render"); }
     var groups = d.groups == null ? [] : d.groups;
     if (!Array.isArray(groups)) { throw fail("render"); }
-    var view = { pct: num(d.pct), total: d.total, stats: [], bar: [], cards: [], updated: "" };
+    var view = { pct: pctOf(d), total: d.total, stats: [], bar: [], cards: [], updated: "" };
     view.stats = [["validated", d.validated, "var(--good)"], ["fail-closed", d.failclosed, "var(--run)"],
                   ["refining", d.refining, "var(--warn)"], ["total tools", d.total, "var(--ink)"]];
     view.bar = [[share(d.validated, d.total), "var(--good)"], [share(d.failclosed, d.total), "var(--run)"],
