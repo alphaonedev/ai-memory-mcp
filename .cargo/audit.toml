@@ -26,8 +26,10 @@
 #   - remove when candle moves to zip >= 9 (tracked by #7302);
 #   - guarded by scripts/check-zip-extract-unreachable.py, which runs before
 #     `cargo audit` in CI and fails if zip becomes reachable from our code.
-# zip 7.2.0 is also yanked on crates.io: `cargo audit` reports it as an allowed
-# warning (not a failure); the yank is tracked by #7302 as well and ends with
+# zip 7.2.0 was yanked on crates.io when this record was written (2026-10-17):
+# `cargo audit` printed it as an allowed "yanked" warning, never a failure. The
+# crates.io index later listed 7.2.0 as not yanked; either state leaves
+# `cargo audit` at rc 0. The yank note is tracked by #7302 as well and ends with
 # the same removal.
 # Decision: 3-agent vote (6def5ab6), memory 34425e02.
 ignore = [
