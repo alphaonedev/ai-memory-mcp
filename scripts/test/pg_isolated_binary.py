@@ -288,7 +288,7 @@ def psql(url: str, sql: str, tuples: bool = False) -> str:
     argv += ['-c', sql]
     done = subprocess.run(argv, capture_output=True, text=True, env=_pg_env(url))
     if done.returncode != 0:
-        raise WrapperError('psql failed (%d): %s' % (done.returncode, (done.stderr or '').strip()),
+        raise WrapperError('psql failed (%d): %s' % (done.returncode, (done.stderr or '').strip() or 'no stderr'),
                            done.returncode)
     return done.stdout or ''
 
@@ -384,6 +384,14 @@ def close_hold(hold: Optional['subprocess.Popen[str]']) -> None:
 
 # --- tier steps -----------------------------------------------------------
 
+def _proved_absent(url: str, check: str) -> bool:
+    """True only when the read-only existence check succeeds and returns no row (#7405)."""
+    try:
+        return not psql(url, check, tuples=True).strip()
+    except WrapperError:
+        return False
+
+
 def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
     """Check the live budget, then create the locked template. Returns its name."""
     _checked_ident(db_name)
@@ -405,12 +413,12 @@ def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
                                'leftover of your own earlier run, run `pg_isolated_binary.py teardown --db %s '
                                '--run-id <run id>` first, otherwise choose a different --db'
                                % (tpl, exc, db_name))
-        if exc.returncode != PSQL_SQL_ERROR:
-            # Status 1 means the server refused the statement. Any other status (2 lost
+        check = "SELECT 1 FROM pg_database WHERE datname = '%s'" % tpl.replace("'", "''")
+        if exc.returncode != PSQL_SQL_ERROR or not _proved_absent(url, check):
+            # Status 1 refuses the statement only when the check below proves no database. Any other status (2 lost
             # connection, a negative signal status such as -9, None, an unexpected code)
             # may follow a committed CREATE. Whether the template is ours is unknown, so
             # setup neither claims it nor DROPs it (#7388, #7400).
-            check = "SELECT 1 FROM pg_database WHERE datname = '%s'" % tpl.replace("'", "''")
             raise WrapperError('CREATE DATABASE %s ended without a clean answer; the outcome is unknown and the '
                                'template may exist with no owner record: %s; check with `%s` and, if it is '
                                'from this run, run `pg_isolated_binary.py teardown --db %s --run-id <run id>`'
