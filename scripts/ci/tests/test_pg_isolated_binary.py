@@ -691,7 +691,8 @@ class TemplateOwnership(unittest.TestCase):
         slow = self._caps(BASE + '&connect_timeout=100')
         self.assertEqual(slow[0] + 100000 + 10000, 300000)
         sql = pib.server_caps_sql(pib._pg_env(BASE))
-        self.assertIn('IF l >= s THEN l := greatest(s - 5000, 1); END IF', sql)
+        self.assertIn('IF l >= s THEN l := CASE WHEN s > 10000 THEN s - 5000 ELSE greatest(s / 2, 1) END; END IF',
+                      sql)
         self.assertIn('IF s = 0 OR s > ', sql)
         self.assertIn('IF l = 0 OR l > ', sql)
 
@@ -716,6 +717,56 @@ class TemplateOwnership(unittest.TestCase):
             self.assertEqual(pib._connect_budget_secs(pib._pg_env(named % 'sslmode=require&connect_timeout=30')), 30)
         sock = {'PGCONNECT_TIMEOUT': '1', 'PGHOST': '/var/run/postgresql'}
         self.assertEqual(pib._connect_budget_secs(sock), 2)
+
+    def test_lock_clamp_keeps_a_useful_lock_wait_under_a_small_statement_timeout_7519(self):
+        sql = pib.server_caps_sql(pib._pg_env(BASE))
+        # above twice the gap the lock sits the gap below; at or under it the lock is half, never 1 ms
+        self.assertIn('CASE WHEN s > 10000 THEN s - 5000 ELSE greatest(s / 2, 1) END', sql)
+        self.assertNotIn('greatest(s - 5000, 1)', sql)
+
+    def test_cap_statement_does_not_resolve_names_through_the_search_path_7520(self):
+        sql = pib.server_caps_sql(pib._pg_env(BASE))
+        body = sql.split('BEGIN', 1)[1]
+        self.assertTrue(body.lstrip().startswith("PERFORM pg_catalog.set_config('search_path', "
+                                                 "'pg_catalog, pg_temp', true);"), body[:120])
+        self.assertEqual(re.findall(r"(?<![\w.])set_config\(", sql), [])
+        self.assertEqual(re.findall(r"(?<![\w.])pg_settings\b", sql), [])
+        self.assertEqual(sql.count('pg_catalog.pg_settings'), 2)
+        self.assertEqual(sql.count("pg_catalog.set_config('statement_timeout'"), 1)
+        self.assertEqual(sql.count("pg_catalog.set_config('lock_timeout'"), 1)
+
+    def test_psql_refuses_more_than_one_statement_and_any_timeout_override_7521(self):
+        refused = ['SELECT 1; SELECT 2', 'SELECT pg_sleep(3); SELECT pg_sleep(3)', 'SELECT 1;;',
+                   'SET statement_timeout = 0', 'set  LOCAL lock_timeout TO 0', 'RESET statement_timeout',
+                   'RESET ALL', 'DISCARD ALL', "SELECT set_config('statement_timeout', '0', false)",
+                   "SELECT pg_catalog.set_config('lock_timeout', '0', false)",
+                   'ALTER ROLE x SET statement_timeout = 0', 'SET\tstatement_timeout=0']
+        for sql in refused:
+            rec = Recorder(lambda argv, kw: Result(0, '', ''))
+            with self.subTest(sql=sql), unittest.mock.patch.object(pib.subprocess, 'run', rec):
+                with self.assertRaises(pib.WrapperError) as ctx:
+                    pib.psql(BASE, sql)
+                self.assertEqual(rec.calls, [], 'psql was not started')
+                self.assertIn('refus', str(ctx.exception))
+        allowed = ['SELECT 1', 'SELECT 1;', 'SELECT 1 ;  ', "SELECT 'statement_timeout'", 'SET search_path = public',
+                   'CREATE DATABASE x']
+        for sql in allowed:
+            rec = Recorder(lambda argv, kw: Result(0, 'ok', ''))
+            with self.subTest(sql=sql), unittest.mock.patch.object(pib.subprocess, 'run', rec):
+                pib.psql(BASE, sql, tuples=True)
+                self.assertEqual(rec.calls[0][0][-1], sql)
+
+    def test_connect_budget_refusal_names_budget_addresses_and_sslmode_7523(self):
+        six = [(0, 0, 0, '', ('192.0.2.%d' % n, 5432)) for n in range(1, 7)]
+        url = 'postgres://secretuser:hunter2@db.example:5432/d'
+        with unittest.mock.patch.object(pib.socket, 'getaddrinfo', return_value=six):
+            with self.assertRaises(pib.WrapperError) as ctx:
+                pib.server_caps_sql(pib._pg_env(url))
+        text = str(ctx.exception)
+        for needle in ('360', 'connect_timeout 30', '6 address', 'sslmode=prefer', 'sslmode=require'):
+            self.assertIn(needle, text)
+        for secret in ('hunter2', 'secretuser', 'db.example', '192.0.2'):
+            self.assertNotIn(secret, text)
 
     def test_options_ending_in_a_backslash_are_refused_7455(self):
         for value in ('-c%20search_path%3Dab%5C', '%5C%5C%5C'):
@@ -1101,9 +1152,25 @@ class LiveEndToEnd(unittest.TestCase):
         target = pib.with_database(url, db) if db else url
         if options is not None:
             target += ('&' if '?' in target else '?') + 'options=' + urllib.parse.quote(options)
-        return pib.psql(target, "SELECT (SELECT setting FROM pg_settings WHERE name = 'statement_timeout') "
-                        "|| '/' || (SELECT setting FROM pg_settings WHERE name = 'lock_timeout')",
+        return pib.psql(target, "SELECT (SELECT setting FROM pg_catalog.pg_settings WHERE name = 'statement_timeout') "
+                        "|| '/' || (SELECT setting FROM pg_catalog.pg_settings WHERE name = 'lock_timeout')",
                         tuples=True).strip().split('/')
+
+    @staticmethod
+    def _admin(url, *statements):
+        """Setup DDL outside psql(): the wrapper refuses SET and multi-statement SQL on purpose (#7521)."""
+        for sql in statements:
+            done = subprocess.run(['psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-c', sql], capture_output=True,
+                                  text=True, env=pib._pg_env(url), timeout=60)
+            if done.returncode != 0:
+                raise AssertionError('%s -> %s' % (sql, done.stderr.strip()))
+
+    @staticmethod
+    def _as_role(url, role, password):
+        parts = urllib.parse.urlsplit(url)
+        host = parts.netloc.rpartition('@')[2]
+        netloc = '%s:%s@%s' % (urllib.parse.quote(role, safe=''), urllib.parse.quote(password, safe=''), host)
+        return urllib.parse.urlunsplit(parts._replace(netloc=netloc))
 
     def test_server_resolves_caller_and_default_timeouts_7477_7478_7479_7480_7484(self):
         url = _live_url()
@@ -1129,12 +1196,73 @@ class LiveEndToEnd(unittest.TestCase):
         db = 'ai_memory_cap_%s' % uuid.uuid4().hex[:8]
         pib.psql(url, 'CREATE DATABASE %s' % db)
         try:
-            pib.psql(url, "ALTER DATABASE %s SET statement_timeout = '1s'" % db)
+            self._admin(url, "ALTER DATABASE %s SET statement_timeout = '1s'" % db)
             statement, lock = self._live_setting(url, db=db)
             self.assertEqual(statement, '1000')
             self.assertLess(int(lock), 1000)
         finally:
             pib.psql(url, 'DROP DATABASE IF EXISTS %s' % db)
+
+    def test_small_statement_timeout_still_leaves_a_real_lock_wait_7519(self):
+        url = _live_url()
+        key = 7519000 + int(uuid.uuid4().hex[:4], 16)
+        statement, lock = self._live_setting(url, '-c statement_timeout=3s')
+        self.assertEqual(statement, '3000')
+        self.assertEqual(lock, '1500')               # half, not 1 ms
+        holder = subprocess.Popen(
+            ['psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1', '-c',
+             'SELECT pg_advisory_lock(%d), pg_sleep(1.5)' % key],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, env=pib._pg_env(url))
+        try:
+            deadline = time.monotonic() + 20
+            while pib.psql(url, "SELECT count(*) FROM pg_catalog.pg_locks WHERE locktype = 'advisory' "
+                           "AND objid = %d AND granted" % key, tuples=True).strip() == '0':
+                self.assertLess(time.monotonic(), deadline, 'the holder never took the lock')
+                time.sleep(0.05)
+            # a 5 s cap, a ~300 ms wait for the lock: it must succeed, not die on a 1 ms lock_timeout
+            pib.psql(url + ('&' if '?' in url else '?') + 'options=' +
+                              urllib.parse.quote('-c statement_timeout=5s'),
+                              'SELECT pg_advisory_lock(%d)' % key, tuples=True)
+        finally:
+            holder.communicate(timeout=30)
+
+    def test_shadow_schema_ahead_of_pg_catalog_does_not_skip_the_cap_7520(self):
+        url = _live_url()
+        cap, lock_cap = TemplateOwnership._caps(url)
+        schema = 'r7520_' + uuid.uuid4().hex[:8]
+        self._admin(
+            url,
+            'CREATE SCHEMA %s' % schema,
+            "CREATE VIEW %s.pg_settings AS SELECT 'x'::text AS name, '0'::text AS setting" % schema,
+            "CREATE FUNCTION %s.set_config(text, text, boolean) RETURNS text LANGUAGE sql AS 'SELECT $2'" % schema)
+        try:
+            got = self._live_setting(url, '-c search_path=%s,pg_catalog' % schema)
+            self.assertEqual(got, [str(cap), str(lock_cap)])
+        finally:
+            self._admin(url, 'DROP SCHEMA %s CASCADE' % schema)
+
+    def test_role_and_role_in_database_defaults_are_kept_7522(self):
+        url = _live_url()
+        allowed = pib.psql(url, 'SELECT rolsuper OR rolcreaterole FROM pg_catalog.pg_roles '
+                           'WHERE rolname = current_user', tuples=True).strip()
+        if allowed != 't':
+            self.fail('the live role needs CREATEROLE for the role-level cells (%s=1)' % LIVE_REQUIRED_VAR)
+        role = 'r7522_' + uuid.uuid4().hex[:8]
+        password = uuid.uuid4().hex
+        db = 'ai_memory_cap_%s' % uuid.uuid4().hex[:8]
+        self._admin(url, "CREATE ROLE %s LOGIN PASSWORD '%s'" % (role, password), 'CREATE DATABASE %s' % db)
+        try:
+            self._admin(url, "ALTER ROLE %s SET statement_timeout = '1s'" % role,
+                        "ALTER ROLE %s IN DATABASE %s SET statement_timeout = '4s'" % (role, db),
+                        "ALTER ROLE %s IN DATABASE %s SET lock_timeout = '1s'" % (role, db))
+            as_role = self._as_role(url, role, password)
+            statement, lock = self._live_setting(as_role)
+            self.assertEqual(statement, '1000')              # role level, tighter than the wrapper cap
+            self.assertEqual(lock, '500')
+            statement, lock = self._live_setting(as_role, db=db)
+            self.assertEqual((statement, lock), ('4000', '1000'))   # role-in-database wins, lock kept
+        finally:
+            self._admin(url, 'DROP DATABASE IF EXISTS %s' % db, 'DROP ROLE IF EXISTS %s' % role)
 
     def test_required_flag_turns_a_missing_url_into_a_failure_7485(self):
         env = {k: v for k, v in os.environ.items() if k != pib.URL_VAR}
