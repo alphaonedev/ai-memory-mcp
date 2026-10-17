@@ -16915,29 +16915,43 @@ mod tests {
         assert!(payload["collected"].as_u64().unwrap() >= 1);
     }
 
-    /// #7321 - the gc dry-run test must not observe a sibling's latched audit
-    /// trail. A sibling holds `sink_test_lock` and latches the fail-closed gate
-    /// (as `a_latched_audit_trail_refuses_mcp_writes_but_not_reads_4400` does);
-    /// the gc test runs on another thread meanwhile and must still pass, which
-    /// it can only do by waiting for the same lock.
+    /// #7321 / #7379 / #7382 - the gc dry-run test must serialise with the
+    /// tests that latch the process-global audit gate. The proof is structural
+    /// and involves no latch and no wall-clock hold: this thread holds
+    /// `sink_test_lock`, the gc test runs on a worker, and the worker must be
+    /// seen blocked on that lock (observed through the lock's waiter registry)
+    /// before it has finished. A gc test that skips the lock finishes without
+    /// waiting, which fails the assertion (rust-1-98 TEST-01/TEST-02).
     #[test]
     fn chunkc_archive_gc_dry_run_ignores_sibling_latch_7321() {
-        const SIBLING_HOLD: std::time::Duration = std::time::Duration::from_millis(500);
         let sink = crate::audit::sink_test_lock();
-        let latch = crate::audit::fail_closed_latch_for_test();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let worker = std::thread::spawn(move || {
             let outcome = std::panic::catch_unwind(chunkc_archive_gc_dry_run_returns_count);
             let _ = done_tx.send(());
             outcome
         });
-        let finished_while_latched = done_rx.recv_timeout(SIBLING_HOLD).is_ok();
-        drop(latch);
+        let worker_id = worker.thread().id();
+        // Deterministic handshake: spin until the worker is either blocked on
+        // the lock (serialised) or finished (not serialised). No sleep, no timeout.
+        let finished_without_waiting = loop {
+            if crate::audit::sink_test_lock_is_waited_on_by(worker_id) {
+                break false;
+            }
+            if done_rx.try_recv().is_ok() {
+                break true;
+            }
+            std::thread::yield_now();
+        };
         drop(sink);
         let outcome = worker.join().expect("worker thread joins");
         assert!(
+            !finished_without_waiting,
+            "gc dry-run test ran to completion without taking sink_test_lock"
+        );
+        assert!(
             outcome.is_ok(),
-            "gc dry-run test failed under a sibling's latch (finished while latched: {finished_while_latched})"
+            "gc dry-run test failed once it obtained the lock"
         );
     }
 
