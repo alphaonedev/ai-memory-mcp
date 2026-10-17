@@ -307,6 +307,42 @@ class UnresolvablePaths7284(Fixture):
         with self.assertRaises((OSError, RuntimeError)):
             prune.resolve(looped / "child")
 
+    def chain(self, hops):
+        """A chain of ``hops`` symlinks that ends at a real directory."""
+        base = self.home / ("chain-%d" % hops)
+        target = base / "target"
+        target.mkdir(parents=True)
+        previous = target
+        for number in range(hops, 0, -1):
+            link = base / ("l%d" % number)
+            link.symlink_to(previous)
+            previous = link
+        return previous, target
+
+    def test_resolve_enforces_the_symlink_hop_cap_7326(self):
+        """#7326 review r1: a chain of exactly ``MAX_SYMLINK_HOPS`` links resolves
+        and one more raises. Only our walk is exercised: it raises before the kernel
+        is asked, and the resolving side uses lstat/readlink, not the kernel's own
+        32-link macOS limit, so both sides hold on Linux and macOS."""
+        head, target = self.chain(prune.MAX_SYMLINK_HOPS)
+        self.assertEqual(prune.resolve(head), target.resolve())
+        over, _ = self.chain(prune.MAX_SYMLINK_HOPS + 1)
+        with self.assertRaises(RuntimeError):
+            prune.resolve(over)
+
+    def test_resolve_keeps_an_absolute_path_off_a_deleted_cwd_7326(self):
+        """#7326 review r1: an absolute path never needs the working directory, so a
+        deleted cwd must not make resolve() raise for an existing absolute path."""
+        existing = self.home / "absolute-target"
+        existing.mkdir(parents=True)
+        doomed = SCRATCH / "doomed-cwd"
+        doomed.mkdir(parents=True)
+        saved = os.getcwd()
+        self.addCleanup(os.chdir, saved)
+        os.chdir(doomed)
+        os.rmdir(doomed)
+        self.assertEqual(prune.resolve(existing), Path(existing).resolve())
+
     def run_main(self, protected, evict=None):
         work = SCRATCH / "runner" / "_work"
         workspace = work / "repo" / "repo"
