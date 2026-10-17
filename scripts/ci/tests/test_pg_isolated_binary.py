@@ -164,6 +164,33 @@ def runner(env=None, log_dir=None, width=2):
                       log_dir=log_dir or scratch_dir(), width=width)
 
 
+def nested_quantifier_flaws(pattern_text, flags=0):
+    """Return reasons a regex could backtrack super-linearly (#7615, #7632)."""
+    return ['a quantified group is quantified'] if re.search(r'[*+}]\)[*+{]', pattern_text) else []
+
+
+def implicit_concat_lines(source_bytes):
+    """Return line numbers where two string literals join implicitly inside a list or set (#7616, #7633)."""
+    import io
+    import tokenize
+    stack, previous, found = [], None, []
+    for token in tokenize.tokenize(io.BytesIO(source_bytes).readline):
+        if token.type == tokenize.OP and token.string in '([{':
+            stack.append(token.string)
+        elif token.type == tokenize.OP and token.string in ')]}' and stack:
+            stack.pop()
+        if token.type in (tokenize.NL, tokenize.COMMENT, tokenize.ENCODING):
+            continue
+        if token.type == tokenize.NEWLINE:
+            previous = None
+            continue
+        if (token.type == tokenize.STRING and previous is not None and previous.type == tokenize.STRING
+                and stack and stack[-1] in '[{'):
+            found.append(token.start[0])
+        previous = token
+    return found
+
+
 class NameAndUrl(unittest.TestCase):
     def test_database_name_ignores_query(self):
         self.assertEqual(pib.database_name(BASE), 'ai_memory_test_ci_9_1_x')
@@ -1007,32 +1034,48 @@ class TemplateOwnership(unittest.TestCase):
             '_IDENT_START_RE', '_RUN_ID_RE', '_TARGET_RE']))
         for name, pattern in patterns.items():
             with self.subTest(pattern=name):
-                self.assertIsNone(regex.search(r'[*+}]\)[*+{]', pattern.pattern), 'a quantified group is quantified')
+                self.assertEqual(nested_quantifier_flaws(pattern.pattern, pattern.flags), [])
         lines = SCRIPT.read_text(encoding='utf-8').splitlines()
         for number, line in enumerate(lines):
             if 're.compile(' in line and not line.lstrip().startswith('#'):
                 with self.subTest(line=number + 1):
                     self.assertTrue(lines[number - 1].startswith('# linear:'), 'no "# linear:" reason above: ' + line)
 
+    BAD_REGEX_SHAPES_7632 = (
+        r"[\n\r](?:[ \t\n\r\f\v]+|--[^\n\r]*[\n\r])*'",
+        r'(a+)+', r'(a*)*', r'(a|a)*', r'\s*\s*', r'(?:x|\s)*\s*', r'(a+b)*', r'(?:a+|b)+', r'a*a*', r'(?:a|ab)*',
+    )
+    GOOD_REGEX_SHAPES_7632 = (r'a+b', r'[a-z]+\d*', r'(?:a|b)*', r'[A-Za-z_][A-Za-z0-9_]*', r'\d+\.\d+', r'(?:ab)+c')
+
+    def test_regex_audit_flags_the_nested_and_adjacent_overlapping_families_7632(self):
+        for text in self.BAD_REGEX_SHAPES_7632:
+            with self.subTest(bad=text):
+                self.assertNotEqual(nested_quantifier_flaws(text), [], 'not flagged: ' + text)
+        for text in self.GOOD_REGEX_SHAPES_7632:
+            with self.subTest(good=text):
+                self.assertEqual(nested_quantifier_flaws(text), [], 'wrongly flagged: ' + text)
+
+    CONCAT_SAMPLES_7633 = (
+        ("X = ['a' 'b']\n", [1]),
+        ("X = [f'a' f'b']\n", [1]),
+        ("X = [f'a' 'b']\n", [1]),
+        ("X = ['a' f'b']\n", [1]),
+        ("X = {f'a{1}' f'b'}\n", [1]),
+        ("X = [\n    f'a'\n    f'b'\n]\n", [3]),
+        ("X = [f'a', f'b']\n", []),
+        ("X = (f'a' f'b')\n", []),
+        ("X = [f'{1}', 'b']\n", []),
+        ("X = [f'{1 + 2}']\n", []),
+    )
+
+    def test_implicit_concatenation_scan_sees_f_strings_7633(self):
+        for source, expected in self.CONCAT_SAMPLES_7633:
+            with self.subTest(source=source):
+                self.assertEqual(implicit_concat_lines(source.encode('utf-8')), expected)
+
     def test_no_implicit_string_concatenation_inside_a_list_or_set_7616(self):
-        import tokenize
         for path in (Path(__file__), SCRIPT):
-            stack, previous, found = [], None, []
-            with open(path, 'rb') as handle:
-                for token in tokenize.tokenize(handle.readline):
-                    if token.type == tokenize.OP and token.string in '([{':
-                        stack.append(token.string)
-                    elif token.type == tokenize.OP and token.string in ')]}' and stack:
-                        stack.pop()
-                    if token.type in (tokenize.NL, tokenize.COMMENT, tokenize.ENCODING):
-                        continue
-                    if token.type == tokenize.NEWLINE:
-                        previous = None
-                        continue
-                    if (token.type == tokenize.STRING and previous is not None and previous.type == tokenize.STRING
-                            and stack and stack[-1] in '[{'):
-                        found.append(token.start[0])
-                    previous = token
+            found = implicit_concat_lines(path.read_bytes())
             self.assertEqual(found, [], '%s joins string literals implicitly inside a list or set' % path.name)
 
     def test_unquoted_identifiers_fold_ascii_only_and_whitespace_is_the_scanner_set_7575(self):
