@@ -232,6 +232,10 @@ jobs:
         run: python3 scripts/test/test_workflow_concurrency_6340.py
       - name: Shard partition and wiring unit tests (#6344)
         run: python3 -m unittest discover -s scripts/ci/tests
+      - name: Shared test database reference gate unit tests (#7031)
+        run: python3 -m unittest scripts/test/test_check_shared_test_db_refs_7031.py
+      - name: Refuse shared test database references (#7031)
+        run: python3 scripts/ci/check_shared_test_db_refs.py --root .
       - id: cls
         shell: bash
         env:
