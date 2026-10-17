@@ -321,7 +321,8 @@ async fn bulk_dispatches_memory_store_event_per_persisted_row_2724() {
     // #7396 - no request was silently dropped from the summary.
     assert!(
         seen.malformed.is_empty(),
-        "#7396: every received request must be a well-formed dispatch;          malformed (request index, body length): {:?}",
+        "#7396: every received request must be a well-formed dispatch; \
+         malformed (request index, body length): {:?}",
         seen.malformed
     );
     // #7395 - the delivered ids ARE the committed ids, not just as many.
@@ -413,7 +414,8 @@ struct DispatchSummary {
     /// The distinct `memory_id`s themselves (#7395).
     memory_ids: BTreeSet<String>,
     /// Requests that lacked `memory_id` or `correlation_id`, or whose body was
-    /// not JSON (#7396), as (request index, body length). Must be empty: such a request is never silently dropped.
+    /// not JSON (#7396), as (request index, body length). Must be empty: such
+    /// a request is never silently dropped.
     malformed: Vec<(usize, usize)>,
 }
 
@@ -625,7 +627,8 @@ async fn bulk_dispatch_waits_for_slow_receiver_deliveries_7320() {
     // #7396 - no request was silently dropped from the summary.
     assert!(
         seen.malformed.is_empty(),
-        "#7396: every received request must be a well-formed dispatch;          malformed (request index, body length): {:?}",
+        "#7396: every received request must be a well-formed dispatch; \
+         malformed (request index, body length): {:?}",
         seen.malformed
     );
     // #7395 - the delivered ids ARE the committed ids, not just as many.
