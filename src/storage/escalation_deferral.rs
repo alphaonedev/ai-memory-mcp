@@ -715,4 +715,122 @@ mod tests {
         .join()
         .expect("test thread must not abort or panic");
     }
+
+    /// Env var naming the child scenario a re-executed test binary runs.
+    const CHILD_ROLE_VAR: &str = "AI_MEMORY_TEST_4116_REPORT_CHILD";
+    /// Value of [`CHILD_ROLE_VAR`] in the re-executed child.
+    const CHILD_ROLE: &str = "child";
+    /// Fully-qualified test path prefix for `--exact` child runs.
+    const TEST_PATH_PREFIX: &str = "storage::escalation_deferral::tests::";
+
+    /// Re-execute this test binary on `test_name` as the child, returning its
+    /// (stdout, stderr); the child must exit 0 and have run exactly that test.
+    fn run_child(test_name: &str) -> (String, String) {
+        let path = format!("{TEST_PATH_PREFIX}{test_name}");
+        let out = crate::spawn_audit::audited_command(
+            std::env::current_exe().expect("current_exe"),
+            "escalation_deferral::report_child",
+        )
+        .args(["--exact", path.as_str(), "--nocapture", "--test-threads=1"])
+        .env(CHILD_ROLE_VAR, CHILD_ROLE)
+        .output()
+        .expect("spawn child");
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            out.status.success(),
+            "child must exit 0, got {:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            out.status
+        );
+        assert!(
+            stdout.contains("1 passed") && !stdout.contains("0 passed"),
+            "child did not run:\n{stdout}"
+        );
+        (stdout, stderr)
+    }
+
+    /// True inside the re-executed child.
+    fn is_child() -> bool {
+        std::env::var(CHILD_ROLE_VAR).as_deref() == Ok(CHILD_ROLE)
+    }
+
+    /// Leak a frame holding `intents` deferred escalations on a thread, then
+    /// (when `open_second`) open a second `WriteTxn` on the same database so
+    /// the open-time stale-frame report fires; the thread then exits.
+    fn leak_and_exit(intents: usize, open_second: bool) {
+        std::thread::spawn(move || {
+            let dir = tempfile::Builder::new()
+                .prefix("issue-4116-report-")
+                .tempdir()
+                .expect("tempdir");
+            let path = dir.path().join("ai-memory.db");
+            let leaker = crate::db::open(&path).expect("open leaker");
+            let leaked = super::super::connection::WriteTxn::begin(&leaker).expect("begin");
+            for n in 0..intents {
+                let intent = super::DeferredEscalation {
+                    pending_id: format!("report-{n}"),
+                    action: crate::models::GovernedAction::Store,
+                    namespace: "gov4116/report".to_string(),
+                    memory_id: None,
+                    requested_by: "ai:worker".to_string(),
+                    rule_id: "R-report".to_string(),
+                    payload: serde_json::json!({}),
+                };
+                assert!(super::defer_to_open_txn(leaker.path(), intent).is_ok());
+            }
+            std::mem::forget(leaked);
+            if open_second {
+                drop(leaker);
+                let conn = crate::db::open(&path).expect("open conn");
+                let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    super::super::connection::WriteTxn::begin(&conn).map(drop)
+                }));
+                drop(opened);
+            }
+        })
+        .join()
+        .expect("leaking thread must not abort or panic");
+    }
+
+    /// Marker of the open-time stale-frame report (a `tracing` ERROR event).
+    const OPEN_TIME_REPORT: &str = "#4116: a WriteTxn opened while an older frame";
+    /// Marker of the thread-exit leak report (raw stderr).
+    const THREAD_EXIT_REPORT: &str = "ERROR #4116: thread exited with";
+
+    /// #6132 - a lost-write that the open-time report already surfaced through
+    /// a live tracing sink must not be reported a second time at thread exit.
+    #[test]
+    fn issue_6132_stale_frame_is_reported_once() {
+        if !is_child() {
+            let (_stdout, stderr) = run_child("issue_6132_stale_frame_is_reported_once");
+            assert_eq!(
+                stderr.matches(OPEN_TIME_REPORT).count(),
+                1,
+                "the open-time report must reach the sink once:\n{stderr}"
+            );
+            assert!(
+                !stderr.contains(THREAD_EXIT_REPORT),
+                "the thread-exit report repeats the open-time one:\n{stderr}"
+            );
+            return;
+        }
+        crate::logging::init_console_tracing(&[]);
+        leak_and_exit(1, true);
+    }
+
+    /// #6449 - the thread-exit line counts frames and deferred intents
+    /// separately: one frame holding two intents is "1 frame(s)", not "2".
+    #[test]
+    fn issue_6449_thread_exit_line_labels_frames_and_intents_apart() {
+        if !is_child() {
+            let (_stdout, stderr) =
+                run_child("issue_6449_thread_exit_line_labels_frames_and_intents_apart");
+            assert!(
+                stderr.contains("thread exited with 1 unsettled escalation frame(s) holding 2 deferred intent(s)"),
+                "the exit line must name frames and intents separately:\n{stderr}"
+            );
+            return;
+        }
+        leak_and_exit(2, false);
+    }
 }
