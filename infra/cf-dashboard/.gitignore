@@ -1,0 +1,4 @@
+.wrangler/
+*.bak*
+public/state.json
+hostnames.local

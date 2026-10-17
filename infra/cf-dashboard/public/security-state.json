@@ -1,0 +1,167 @@
+{
+  "surface": "Security E2E \u00b7 encryption + every security feature, molecular\u2192atomic",
+  "total": 20,
+  "validated": 15,
+  "failclosed": 2,
+  "refining": 3,
+  "functional": 17,
+  "pct": 85,
+  "groups": [
+    {
+      "family": "A \u00b7 MCP security features",
+      "tools": [
+        {
+          "name": "attestation-required writes",
+          "desc": "MCP writes fail-closed unless signed (verified)",
+          "status": "ok",
+          "cls": "validated",
+          "note": "MCP writes fail-closed unless signed (verified)"
+        },
+        {
+          "name": "admin-gated provisioning",
+          "desc": "register_agent / bind_agent_pubkey admin-only (verified)",
+          "status": "ok",
+          "cls": "validated",
+          "note": "register_agent / bind_agent_pubkey admin-only (verified)"
+        },
+        {
+          "name": "tool-surface profile confinement",
+          "desc": "--profile core/graph/admin/full scopes exposed tools",
+          "status": "ok",
+          "cls": "validated",
+          "note": "--profile core/graph/admin/full scopes exposed tools"
+        },
+        {
+          "name": "capability (macaroon) tokens",
+          "desc": "cap1: tokens flip governance within caveats",
+          "status": "refusal",
+          "cls": "failclosed",
+          "note": "cap1: tokens flip governance within caveats"
+        },
+        {
+          "name": "HMAC-gated /approve /reject",
+          "desc": "approval endpoints HMAC-signed regardless of api_key",
+          "status": "ok",
+          "cls": "validated",
+          "note": "approval endpoints HMAC-signed regardless of api_key"
+        },
+        {
+          "name": "key-authenticated IDOR gates",
+          "desc": "read/mutate gated to key-derived identity",
+          "status": "ok",
+          "cls": "validated",
+          "note": "read/mutate gated to key-derived identity"
+        }
+      ]
+    },
+    {
+      "family": "B \u00b7 AI Agent security features",
+      "tools": [
+        {
+          "name": "per-agent Ed25519 keys",
+          "desc": "each NHI signs under its OWN key, never shared (verified)",
+          "status": "ok",
+          "cls": "validated",
+          "note": "each NHI signs under its OWN key, never shared (verified)"
+        },
+        {
+          "name": "agent-id + pubkey binding",
+          "desc": "identity bound before any attested write",
+          "status": "ok",
+          "cls": "validated",
+          "note": "identity bound before any attested write"
+        },
+        {
+          "name": "namespace confinement",
+          "desc": "agent tools fail-closed outside allowed namespaces",
+          "status": "ok",
+          "cls": "validated",
+          "note": "agent tools fail-closed outside allowed namespaces"
+        },
+        {
+          "name": "owner isolation",
+          "desc": "cannot read another agent's private memory (verified)",
+          "status": "ok",
+          "cls": "validated",
+          "note": "cannot read another agent's private memory (verified)"
+        },
+        {
+          "name": "fail-closed defaults",
+          "desc": "a decide/tool error stops the step, never fabricates",
+          "status": "ok",
+          "cls": "validated",
+          "note": "a decide/tool error stops the step, never fabricates"
+        },
+        {
+          "name": "UUID agent identities",
+          "desc": "deterministic uuid5 per agent",
+          "status": "ok",
+          "cls": "validated",
+          "note": "deterministic uuid5 per agent"
+        }
+      ]
+    },
+    {
+      "family": "C \u00b7 All other security features",
+      "tools": [
+        {
+          "name": "mTLS federation identity gate",
+          "desc": "fingerprint-allowlisted client certs only",
+          "status": "ok",
+          "cls": "validated",
+          "note": "fingerprint-allowlisted client certs only"
+        },
+        {
+          "name": "PostgreSQL verify-full TLS",
+          "desc": "data in transit encrypted to the tier",
+          "status": "ok",
+          "cls": "validated",
+          "note": "data in transit encrypted to the tier"
+        },
+        {
+          "name": "encrypted-envelope at-rest rows",
+          "desc": "ChaCha20-Poly1305 per-record envelopes",
+          "status": "ok",
+          "cls": "validated",
+          "note": "ChaCha20-Poly1305 per-record envelopes"
+        },
+        {
+          "name": "LUKS at-rest (data tier)",
+          "desc": "kernel dm-crypt on the cert stack",
+          "status": "fail",
+          "cls": "refining",
+          "note": "kernel dm-crypt on the cert stack"
+        },
+        {
+          "name": "replay / anti-forgery guard",
+          "desc": "replayed signed write refused (verified)",
+          "status": "ok",
+          "cls": "validated",
+          "note": "replayed signed write refused (verified)"
+        },
+        {
+          "name": "poison quarantine / no cascade",
+          "desc": "bad memory quarantined, no groupthink",
+          "status": "fail",
+          "cls": "refining",
+          "note": "bad memory quarantined, no groupthink"
+        },
+        {
+          "name": "capability attenuation",
+          "desc": "tokens narrow, never widen, authority",
+          "status": "refusal",
+          "cls": "failclosed",
+          "note": "tokens narrow, never widen, authority"
+        },
+        {
+          "name": "tenant-scope leak resistance",
+          "desc": "cross-tenant read attempts refused",
+          "status": "fail",
+          "cls": "refining",
+          "note": "cross-tenant read attempts refused"
+        }
+      ]
+    }
+  ],
+  "lastUpdated": null
+}
