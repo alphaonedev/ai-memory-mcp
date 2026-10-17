@@ -21,8 +21,8 @@ setter (ensure_no_config_env, permissive_attestation_for_tests), or a pg_isolate
 write, that is
   * locks bound with `let <name> = ...` (not `let _ = ...`; a `let`-bound struct literal holding the
     guard counts) earlier in a block that encloses the write and not released before it (a `drop`
-    in any spelling, `.take()` / `mem::take`, a reassignment, or a move out of the binding, see
-    the limits below): `ENV_LOCK.lock()`, `.blocking_lock()`, `.lock().await`, `env_lock()`, a
+    in any spelling, `.take()` / `mem::take` / `mem::replace` / `mem::swap`, a reassignment, a
+    capture by a `move` closure, or a move out of the binding, see the limits below): `ENV_LOCK.lock()`, `.blocking_lock()`, `.lock().await`, `env_lock()`, a
     same-file helper that returns a guard (also a helper that wraps such a helper), a
     tests/common guard;
   * the locks every same-file caller holds at its call, intersected over the callers and followed
@@ -48,11 +48,15 @@ fn or method it calls (followed HELPER_DEPTH levels, closures and loops included
 without holding, at that point, one token of EVERY write site's protection set. Write sites with
 an empty set (an unlocked writer) are not required of the readers, because the unlocked writer is
 itself flagged; when no write site has any protection, every reader is flagged. Readers are:
-  * strong (a C getenv or a write): SQLite / store / router / config open, `reqwest`, `sqlx`,
+  * strong (a C getenv or a write): SQLite / store / router / config open (`AppConfig::` except a
+    derived `AppConfig::default()`), a `cli::<cmd>::run*` command, `reqwest`, `sqlx`,
     `PgPool`, `postgres_url()`, DNS (`ToSocketAddrs`), `Local::now`, a tests/common helper that
     reaches one of those (computed from tests/common), and every write site;
-  * weak (a Rust env read, a logical race): `env::var*` of a variable some write site writes
-    (literal or a same-file `const`; an unknown name counts). `use` items are not readers.
+  * weak (a Rust env read, a logical race): `env::var*` of a variable some write site writes.
+    A variable name is a literal or a same-file `const`, or a parameter, a `for` variable over a
+    parameter or a `self.<field>` set from a parameter, resolved through every same-file call
+    (a `.name(..)` method call never reaches an associated fn without `self`); an unknown name
+    counts as every variable. `use` items are not readers.
 A token is held when it is acquired before the reader in a block that encloses it; a lock helper
 that holds the lock while it works (`with_env_lock(|| ..)`) covers only its own call.
 
@@ -61,10 +65,17 @@ Known limits, stated plainly:
     impl), plus the tests/common reader census; code in src/ is judged only by the tokens above;
   * the reader check is a token heuristic; a fn that reaches a C getenv only through code the
     tokens do not name is treated as pure;
-  * a release (drop, take, reassignment or move) anywhere between the lock and the reader releases
-    it, even in a branch; a guard moved into a `let`-bound struct literal, tuple, array, `vec!`,
-    `Some` / `Ok` / `Err` or `Box::new` follows that binding, and a move anywhere else (a call
-    argument, a field assignment, a temporary) releases it;
+  * a release (drop, take / replace / swap, reassignment, a call of a closure binding, or move)
+    anywhere between the lock and the reader releases it, even in a branch; a shadowing `let` of
+    the same name is not a reassignment, and the old binding is not followed past it;
+  * a guard moved into a `let`-bound struct literal, tuple, array, `vec!`, `Some` / `Ok` / `Err`,
+    `Box::new`, another binding, or the value of an `if` / `match` / block initialiser follows that
+    binding: it is released when the binding is (the same rules, nested), when the binding is
+    emptied (`clear`, `pop*`, `truncate`, `drain`, `remove`, `swap_remove`, `retain*`, `split_off`,
+    `dedup*`, `take`, `replace`, `insert`, `get_or_insert_with`), or when the binding's block ends
+    before the reader; a guard captured by a `move` closure or an `async move` block is moved into
+    that value and follows the same rules when the closure is `let`-bound, and is released
+    otherwise; a move anywhere else (a call argument, a field assignment, a temporary) releases it;
   * a reader behind a runtime branch still counts (the child half of a re-exec test that returns
     early unless its marker variable is set; a `reqwest` client on a loopback, rustls-only path);
   * macro-generated test fns and env writes in tests/<dir>/ sub-modules are not seen; a writer
@@ -120,7 +131,8 @@ ONCE_BODY = re.compile(r"\b(?:call_once|get_or_init)\b")
 STRONG_READER = re.compile(
     r"\b(?:db|storage)\s*::\s*open\w*|\bConnection\s*::\s*open\w*|\bopen_(?:db|store|conn|unmigrated)\w*|"
     r"\bSqliteStore\s*::|\bfresh_(?:conn|db)\w*|\bdb_at\b|"
-    r"\bAppConfig\s*::|\bConfig\s*::\s*load\w*|\bbuild_router\w*|\brouter\s*\(|"
+    r"\bAppConfig\s*::(?!\s*default\s*\()|\bConfig\s*::\s*load\w*|"
+    r"\bcli\s*::\s*(?:[A-Za-z_]\w*\s*::\s*)*run\w*\s*\(|\bbuild_router\w*|\brouter\s*\(|"
     r"\breqwest\b|\bsqlx\s*::\s*(?:[A-Za-z_]\w*\s*::\s*)*(?:Pg\w*|connect\w*)|\bPgPool\w*|\b(?:PostgresStore|PgConnection)\s*::\s*connect\w*|\btokio_postgres\s*::\s*connect\w*|"
     r"\bpostgres_url\s*\(|\bToSocketAddrs\b|\bLocal\s*::\s*now\b")
 WEAK_READER = re.compile(r"\benv\s*::\s*var\w*")
@@ -156,8 +168,16 @@ MACRO_CALL = re.compile(r"\b([A-Za-z_]\w*)\s*!\s*[({\[]")
 META_CALL = re.compile(r"\$([A-Za-z_]\w*)\s*\(")
 # #7389: drop / mem::drop / std::mem::drop / core::mem::drop, with or without a turbofish.
 DROP_CALL = r"\bdrop\s*(?:::\s*<[^;{}]*?>\s*)?\(\s*%s\s*\)"
-# #7387: a guard taken out of its Option binding.
-TAKE_CALL = r"(?:\b%s\s*\.\s*take\s*\(|\b(?:take|replace|swap)\s*\(\s*&\s*mut\s+%s\b)"
+# #7387, #7472: a guard taken out of its Option binding, or any `&mut` argument of mem::take/replace/swap.
+TAKE_CALL = r"(?:\b%s\s*\.\s*take\s*\(|\b(?:take|replace|swap)\s*\([^;]*?&\s*mut\s+%s\b)"
+# #7472: a container binding emptied (or rewritten) in place drops the guard it held.
+EMPTY_CALL = (r"\b%s\s*\.\s*(?:clear|pop|pop_front|pop_back|truncate|drain|remove|swap_remove|retain|retain_mut|"
+              r"replace|insert|get_or_insert_with|split_off|dedup\w*)\s*\(")
+# #7471: a closure or async block that takes its captures by value.
+MOVE_HEAD = re.compile(r"(?:\basync\s+)?\bmove\b\s*(?:\|[^|]*\|\s*(?:->\s*[^{;]+?)?)?")
+# #7473: the head of a block whose value is the initialiser (`= if ..`, `= match ..`, `else`, `=>`, `= {`).
+VALUE_BLOCK_HEAD = re.compile(
+    r"^\s*(?:else\s+)?(?:let\s+(?:mut\s+)?[A-Za-z_]\w*\s*(?::[^=]*)?=(?!=)\s*)?(?:if|match)\b|(?:\belse|=>|[^=!<>]=)\s*$")
 BORROW_TAIL = re.compile(r"(?:&\s*(?:mut\s+)?|\*)$")
 BLOCK_KEYWORDS = re.compile(r"\b(?:if|while|match|for|loop|impl|fn|struct|enum|union|trait|mod|where)\b")
 STRUCT_LIT_HEAD = re.compile(
@@ -327,6 +347,14 @@ def is_struct_literal(body, brace):
     return not BLOCK_KEYWORDS.search(prefix) and bool(STRUCT_LIT_HEAD.search(prefix))
 
 
+def is_value_block(body, brace):
+    """True when the `{` at brace opens a block whose value is an initialiser or an arm (#7473):
+    `let x = if c {`, `} else {`, `match v {`, `pat => {`, `let x = {`."""
+    if brace <= 0 or body[brace] != "{":
+        return False
+    return bool(VALUE_BLOCK_HEAD.search(stmt_prefix(body, brace)))
+
+
 def scope_open(body, pos):
     """The `{` of the block that scopes a value made at pos: struct literal braces are skipped."""
     brace = innermost_open(body, pos)
@@ -340,12 +368,14 @@ def binding_prefix(body, pos):
     k = pos
     while True:
         start = max(body.rfind(";", 0, k), body.rfind("{", 0, k), body.rfind("}", 0, k))
-        if start > 0 and body[start] == "{" and is_struct_literal(body, start):
+        own_stmt = re.match(r"\s*let\b", body[start + 1:k])  # a `let` inside the block binds there
+        if start > 0 and body[start] == "{" and (
+                is_struct_literal(body, start) or (not own_stmt and is_value_block(body, start))):
             k = start
             continue
         if start > 0 and body[start] == "}":
             brace = open_of(body, start)
-            if brace > 0 and is_struct_literal(body, brace):
+            if brace > 0 and (is_struct_literal(body, brace) or (not own_stmt and is_value_block(body, brace))):
                 k = brace
                 continue
         return body[start + 1:pos]
@@ -364,7 +394,7 @@ def holds_moved_value(body, prefix_start, pos):
             stack.pop()
     for j in stack:
         if body[j] == "{":
-            if not is_struct_literal(body, j):
+            if not (is_struct_literal(body, j) or is_value_block(body, j)):
                 return False
             continue
         head = body[prefix_start:j].rstrip()
@@ -375,35 +405,96 @@ def holds_moved_value(body, prefix_start, pos):
     return True
 
 
-def released(body, name, start, end, depth=0):
-    """True when the guard bound to name is released in body[start:end] (#7387, #7389): a drop in any
-    spelling, `.take()` / `mem::take` / `mem::replace`, a reassignment of the binding, or a move into
-    anything other than a `let`-bound container; a guard moved into one (`let h = Holder { g }`,
-    `let o = Some(g)`, `let h = g`) is released when that binding is."""
-    text = body[start:end]
+def expr_end(body, pos):
+    """Index where the expression starting at pos ends: a `,` / `;` or an unmatched closer at depth 0."""
+    depth = 0
+    for j in range(pos, len(body)):
+        ch = body[j]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                return j
+            depth -= 1
+        elif ch in ",;" and depth == 0:
+            return j
+    return len(body)
+
+
+def move_closure_at(body, pos, start):
+    """(head, end) of the outermost `move` closure or `async move` block made in body[start:pos] whose
+    body contains pos (#7471), else None."""
+    for m in MOVE_HEAD.finditer(body, start, pos):
+        j = m.end()
+        while j < len(body) and body[j].isspace():
+            j += 1
+        end = match_brace(body, j) if j < len(body) and body[j] == "{" else expr_end(body, j)
+        if j <= pos < end:
+            return m.start(), end
+    return None
+
+
+def shadow_mask(body, name, start, end):
+    """body[start:end] with every region where a shadowing `let name` hides the binding blanked (#7473):
+    from the end of that `let` statement to the end of its block."""
+    text = list(body[start:end])
+    for m in re.compile(r"\blet\s+(?:mut\s+)?%s\b" % re.escape(name)).finditer(body, start, end):
+        semi = body.find(";", m.end())
+        a = end if semi < 0 else min(semi + 1, end)
+        b = min(match_brace(body, innermost_open(body, m.start())), end)
+        for j in range(a, b):
+            text[j - start] = " "
+    return "".join(text)
+
+
+def released(body, name, start, end, depth=0, container=False):
+    """True when the guard bound to name is released in body[start:end] (#7387, #7389, #7470-#7473):
+    a drop in any spelling, `.take()` / `mem::take` / `mem::replace` / `mem::swap`, a reassignment of
+    the binding (a shadowing `let` is not one), a call of it (a closure), emptying it when it is a
+    container (`clear`, `pop`, `truncate`, `drain`, `remove`, ...), a capture by a `move` closure or an
+    `async move` block, or a move into anything other than a `let`-bound container. A guard moved into
+    one (`let h = Holder { g }`, `let o = Some(g)`, `let h = g`, `let c = move || ..g..`, also through an
+    `if` / `match` initialiser) is released when that binding is, or when that binding's block ends."""
+    text = shadow_mask(body, name, start, end)
     esc = re.escape(name)
     if re.search(DROP_CALL % esc, text) or re.search(TAKE_CALL % (esc, esc), text):
         return True
-    if re.search(r"(?<![\w.$])%s\s*=(?![=>])" % esc, text):
-        return True  # the binding is overwritten, which drops what it held
+    if (container or depth > 0) and re.search(EMPTY_CALL % esc, text):
+        return True
+    for m in re.finditer(r"(?<![\w.$])%s\s*=(?![=>])" % esc, text):
+        if not re.search(r"\blet\s+(?:mut\s+)?$", text[:m.start()]):
+            return True  # the binding is overwritten, which drops what it held
+    if re.search(r"(?<![\w.$:])%s\s*\(" % esc, text):
+        return True  # a closure called: an FnOnce consumes what it captured (fail closed for an Fn)
+    skip = start
     for m in re.finditer(r"(?<![\w.$])%s\b" % esc, text):
-        if BORROW_TAIL.search(text[:m.start()].rstrip()):
-            continue  # `&g`, `&mut g`, `*g` borrow the guard
-        after = text[m.end():].lstrip()
-        moved = after[:1] in (",", ")", "]", "}") or (
-            after[:1] == ";" and re.search(r"(?<![=!<>])=\s*$", text[:m.start()]))
-        if not moved:
-            continue
         pos = start + m.start()
-        prefix = binding_prefix(body, pos)
+        if pos < skip:
+            continue
+        closure = move_closure_at(body, pos, start)
+        if closure is not None:
+            head, skip = closure  # the guard moved into the closure value made at head
+            value_end = skip
+        else:
+            if BORROW_TAIL.search(text[:m.start()].rstrip()):
+                continue  # `&g`, `&mut g`, `*g` borrow the guard
+            after = text[m.end():].lstrip()
+            moved = after[:1] in (",", ")", "]", "}") or (
+                after[:1] == ";" and re.search(r"(?<![=!<>])=\s*$", text[:m.start()]))
+            if not moved:
+                continue
+            head, value_end = pos, pos
+        prefix = binding_prefix(body, head)
         targets = let_names(prefix)
         eq = prefix.find("=")
-        if not targets or eq < 0 or depth >= HELPER_DEPTH or not holds_moved_value(
-                body, pos - len(prefix) + eq + 1, pos):
+        stmt_start = head - len(prefix)
+        if not targets or eq < 0 or depth >= HELPER_DEPTH or not holds_moved_value(body, stmt_start + eq + 1, head):
             return True  # moved into a call, a field assignment or a temporary
-        stmt_end = body.find(";", pos)
+        if match_brace(body, scope_open(body, stmt_start)) <= end:
+            return True  # #7470: the container's own block ends before end
+        stmt_end = body.find(";", value_end)
         nxt = end if stmt_end < 0 else min(stmt_end + 1, end)
-        if any(released(body, t2, nxt, end, depth + 1) for t2 in targets):
+        if any(released(body, t2, nxt, end, depth + 1, True) for t2 in targets):
             return True
     return False
 
@@ -1004,10 +1095,124 @@ class FileModel:
             elif a.bound:
                 stmt_end = fn.body.find(";", a.pos)
                 start = r if stmt_end < 0 else min(stmt_end + 1, r)
-                if not any(released(fn.body, n, start, r) for n in a.names):
+                prefix = binding_prefix(fn.body, a.pos)
+                wrapped = bool(re.search(r"[(\[{]", prefix[prefix.find("=") + 1:]))  # `Some(LOCK.lock())`
+                if not any(released(fn.body, n, start, r, 0, wrapped) for n in a.names):
                     held |= a.tokens
         held |= fn.serial_tokens
         return held
+
+    # ---- env var names ----------------------------------------------------------------------
+    def params(self, fn):
+        """Parameter names of fn in order (`self` for a receiver), from its signature."""
+        text = self.src.scrubbed
+        if text is None:
+            return []
+        heads = list(re.compile(r"\bfn\s+%s\b" % re.escape(fn.name)).finditer(text, 0, fn.offset))
+        if not heads:
+            return []
+        paren = text.find("(", heads[-1].end(), fn.offset)
+        if paren < 0:
+            return []
+        inner = text[paren + 1:match_paren(text, paren) - 1]
+        out, depth, cur = [], 0, []
+        for ch in inner + ",":
+            if ch in "([{<":
+                depth += 1
+            elif ch in ")]}>":
+                depth -= 1
+            if ch == "," and depth == 0:
+                part = "".join(cur).strip()
+                cur = []
+                if part:
+                    m = re.match(r"(?:&\s*(?:'\w+\s+)?)?(?:mut\s+)?([A-Za-z_]\w*)", part)
+                    out.append(m.group(1) if m else "")
+                continue
+            cur.append(ch)
+        return out
+
+    def key_names(self, fn, a, b, depth=0):
+        """Env var names the key expression body[a:b] of fn can take (#7475): a literal or a const, a
+        parameter (resolved at every same-file call), a `for` variable over a parameter, or a `self`
+        field set from a parameter of the type's fns; anything else is ANY_VAR."""
+        name = self.src.name_in(fn.offset + a, fn.offset + b)
+        if name != ANY_VAR or depth >= HELPER_DEPTH or self.src.raw is None:
+            return {name}
+        text = self.src.raw[fn.offset + a:fn.offset + b].strip().lstrip("&*").strip()
+        field = re.fullmatch(r"self\s*\.\s*([A-Za-z_]\w*)", text)
+        if field and fn.owner:
+            out, found = set(), False
+            for g in self.fns:
+                if g.owner == fn.owner and field.group(1) in self.params(g):
+                    found = True
+                    out |= self.param_names(g, field.group(1), depth + 1)
+            return out if found else {ANY_VAR}
+        if not IDENT.fullmatch(text):
+            return {ANY_VAR}
+        for loop in re.compile(r"\bfor\s+(\([^)]*\)|[A-Za-z_]\w*)\s+in\s+&?\s*(?:mut\s+)?([A-Za-z_]\w*)"
+                               ).finditer(fn.body, 0, a):
+            if text in IDENT.findall(loop.group(1)):
+                text = loop.group(2)
+        if text in self.params(fn):
+            return self.param_names(fn, text, depth + 1)
+        return {ANY_VAR}
+
+    def param_names(self, fn, pname, depth):
+        """Env var names parameter pname of fn can take: the union over every same-file call of fn."""
+        params = self.params(fn)
+        calls = self.callers[id(fn)] if fn.name != "drop" else []
+        if pname not in params or not calls:
+            return {ANY_VAR}
+        out = set()
+        for caller, pos, method in calls:
+            if method and params[0] != "self":
+                continue  # `x.set(..)` on another type: an associated fn without `self` is never a method call
+            idx = params.index(pname) - (1 if params and params[0] == "self" and method else 0)
+            body = caller.body
+            open_idx = body.find("(", pos)
+            close = match_paren(body, open_idx) - 1 if open_idx >= 0 else -1
+            args, depth_b, s = [], 0, open_idx + 1
+            for j in range(open_idx + 1, max(close, open_idx + 1)):
+                ch = body[j]
+                if ch in "([{":
+                    depth_b += 1
+                elif ch in ")]}":
+                    depth_b -= 1
+                elif ch == "," and depth_b == 0:
+                    args.append((s, j))
+                    s = j + 1
+            if close > s or (close == s and args):
+                args.append((s, close))
+            if open_idx < 0 or not 0 <= idx < len(args):
+                return {ANY_VAR}
+            out |= self.arg_names(caller, args[idx][0], args[idx][1], depth)
+        return out
+
+    def arg_names(self, fn, a, b, depth):
+        """Env var names in a call argument body[a:b]: one key expression, or the literals and consts
+        of a compound (`&[(KEY, "1")]`); an identifier that is not a const or a parameter is ANY_VAR."""
+        whole = self.key_names(fn, a, b, depth)
+        if ANY_VAR not in whole:
+            return whole
+        raw = self.src.raw[fn.offset + a:fn.offset + b]
+        out = set(STR_LIT.findall(raw))
+        for m in re.finditer(r"(?:[A-Za-z_]\w*\s*::\s*)*([A-Za-z_]\w*)", fn.body[a:b]):
+            ident = m.group(1)
+            if ident in self.src.consts:
+                out.add(self.src.consts[ident])
+            elif ident in self.params(fn):
+                out |= self.param_names(fn, ident, depth + 1)
+            else:
+                return {ANY_VAR}
+        return out
+
+    def write_names(self, fn, open_idx):
+        """Env var names written by the call whose `(` is at open_idx (its first argument)."""
+        name = self.src.arg_name(fn, open_idx)
+        if name != ANY_VAR or open_idx < 0 or open_idx >= len(fn.body) or fn.body[open_idx] != "(":
+            return {name}
+        a, b = first_arg_text(fn.body, open_idx)
+        return self.key_names(fn, a, b)
 
     # ---- write sites ------------------------------------------------------------------------
     def ctx(self, fn, stack=()):
@@ -1069,7 +1274,7 @@ class FileModel:
                 continue
             once = frozenset({ONCE_PREFIX + fn.key}) if id(fn) in self.once_fns else EMPTY
             for m in DIRECT_MUTATION.finditer(fn.body):
-                add(fn, m.start(), once, {self.src.arg_name(fn, m.end() - 1)})
+                add(fn, m.start(), once, self.write_names(fn, m.end() - 1))
             for pos, names, locks in self.macro_writes(fn):
                 add(fn, pos, locks, names)
             for pos, kind, token, open_idx, name in self.external(fn):
@@ -1077,7 +1282,7 @@ class FileModel:
                     if name == "MultiEnvVarGuard":
                         names = self.src.literals(fn, open_idx)
                     elif name in COMMON_GUARD_METHODS:
-                        names = {self.src.arg_name(fn, open_idx)}
+                        names = self.write_names(fn, open_idx)
                     else:
                         names = self.common.written_vars(name)
                     add(fn, pos, frozenset({token}), names)
@@ -1108,8 +1313,8 @@ class FileModel:
             j = m.end()
             while j < len(body) and body[j].isspace():
                 j += 1
-            name = ANY_VAR if m.group(0).endswith(("vars", "vars_os")) else self.src.arg_name(fn, j)
-            if name == ANY_VAR or ANY_VAR in self.written or name in self.written:
+            names = {ANY_VAR} if m.group(0).endswith(("vars", "vars_os")) else self.write_names(fn, j)
+            if ANY_VAR in names or ANY_VAR in self.written or names & self.written:
                 out.append((m.start(), None))
         return out
 
