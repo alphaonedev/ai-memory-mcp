@@ -39,14 +39,25 @@ never followed, and the run goes on (exit 0): the unlink is relative to the pare
 directory descriptor and a link planted again before the create fails O_EXCL. A symlinked
 parent, a symlink at the passphrase (created 0600 and never replaced) or one found by a
 re-check fails closed with exit 1 (#7539). Decision: unlink-then-create-exclusive over
-truncating in place, because O_EXCL cannot truncate through a link. Secrets are 0600 and
-evidence files are 0644 (never group or world writable, whatever the umask, #7536; the
-shell redirect gave 0644 under the usual 022 umask). HOME must be an absolute path that is
+truncating in place, because O_EXCL cannot truncate through a link. The evidence bundle is local
+operator evidence, not a published artefact (git records the mode as 100644 whatever the
+working-tree mode): every file the script creates is 0600 and every directory it creates
+(.local-runs, the evidence directory and each parent it makes) is 0700, passed to
+os.open/os.mkdir and then enforced with fchmod, so no umask (not even 0) widens one
+(#7568, #7569). An existing .local-runs, fixtures directory or evidence directory that is
+world writable or owned by another uid is refused before any write; a group-writable one
+is accepted (a umask 002 checkout makes every directory 0775). The bundle is built in a
+sibling staging directory (0700) seeded with a copy of the previous bundle and replaces the
+evidence directory only when every leg and the header self-check succeeded (the old
+directory is moved aside, the staging directory renamed into place, then the old one
+removed); a run that fails leaves the previous bundle untouched and no staging directory
+behind, so a bundle never mixes legs of two runs (#7574). HOME must be an absolute path that is
 already in normal form (os.path.normpath(HOME) == HOME, so no `.`, `..`, `//` or trailing `/`
-component), not `/`, without a `:`: a relative or empty HOME would turn the HOME
-sanitizer pattern into a substring rewrite of the evidence and a colon would add a cwd
-entry to the child PATH (#7510, #7540); the run is refused with exit 1 before any write.
-The sanitizer replaces whole path components only (#7538). The shell script's
+component), not `/`, without a `:`, not starting with `//` and without a control byte
+(0x00-0x1f, 0x7f): a relative or empty HOME would turn the HOME sanitizer pattern into a
+substring rewrite of the evidence, a colon would add a cwd entry to the child PATH, and a
+control byte would split a captured line (#7510, #7540, #7570); the run is refused with
+exit 1 before any write. The sanitizer replaces whole path components only (#7538). The shell script's
 defaults named build directories of one build host; they are replaced by
 repo-relative ones. Exit codes: 0 success; 1 DEFAULT_BIN is not an executable
 file, TMPDIR (or the default scratch directory) is outside <repo-root>/.local-runs, HOME is
@@ -58,10 +69,12 @@ import argparse
 import base64
 import contextlib
 import datetime
+import errno
 import os
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -93,19 +106,25 @@ SUMMARY_FILES = ("posture-bare-env.out", "posture-hardened-env.out", "posture-sq
 PASSPHRASE_BYTES = 32
 LOCAL_RUNS = ROOT / ".local-runs"
 DIR_MODE = 0o700
-KEY_FILE_MODE = 0o600
-PUBLIC_FILE_MODE = 0o644  # evidence and fixtures: never group or world writable (#7536)
-PATH_CHARS = rb"A-Za-z0-9_\-\x80-\xff"
-# What may follow a path for it to count as the whole path (#7538): end of input,
-# `/`, whitespace, a quote, a closing bracket or `>`, `:` or `;`. A comma is a legal
-# filename character, so it is not a terminator.
-PATH_END = rb"[/\s'\"`)\]}>:;]"
+FILE_MODE = 0o600  # every file the script creates: local operator evidence (#7568)
+# Explicit allowlists of delimiter characters (#7538, #7571-#7573). They are the
+# characters that, in the captured output, separate a path from the text around it. They
+# are not a list of illegal filename bytes: a path that continues with any other byte is a
+# different path and is left alone.
+# A path starts at the start of input or after whitespace, a quote or backtick, `(`, `[`,
+# `<`, `=` or `:`. A comma is not a start delimiter: `,/home/a` is a list item glued to
+# a path, not a path (decision: leave it, because the previous byte is not in the allowlist).
+PATH_START = rb"(?:\A|(?<=[\s'\"`(\[<=:]))"
+# A path ends at the end of input, `/`, whitespace, a quote or backtick, `)`, `]`, `>`,
+# `:`, `;` or `,`, or at a `.` that is itself the end of input or is followed by whitespace
+# (a sentence full stop); `/home/a./x` and `/home/a..b` are other paths.
+PATH_END = rb"(?=\Z|/|[\s'\"`)\]>:;,]|\.(?:\Z|\s))"
 USAGE_EPILOG = (
     "Environment overrides: DEFAULT_BIN (default <repo>/target/release/ai-memory, must be "
     "an executable file; a value with a slash is relative to the repo root, a bare name is "
     "looked up on the child PATH), SQLCIPHER_BIN (default <repo>/target-sqlcipher/release/ai-memory; "
     "leg 4 is recorded as `missing` when absent), TMPDIR (must resolve under "
-    "<repo>/.local-runs, which must not be a symlink). HOME must be an absolute path in normal form (not /, no ':', no . or .. components). "
+    "<repo>/.local-runs, which must not be a symlink). HOME must be an absolute path in normal form (not /, no ':', not starting with '//', no control byte, no . or .. components). "
     "Fixtures and evidence are never written through a symlink. Exit codes: 0 success; "
     "1 preflight or capture failure; 2 unknown arguments."
 )
@@ -142,13 +161,16 @@ def sanitize(raw):
     real output does not produce. Line endings, including CRLF and a missing final
     newline, are preserved exactly.
 
-    A path is replaced only as a whole run of path components: not when a path character
-    (letter, digit, `_`, `-`, `.`) directly precedes it, and only when end of input or an
-    explicit terminator follows it: `/`, whitespace, a quote or backtick, `)`, `]`, `}`,
-    `>`, `:` or `;`, or a `.` followed by end of input or one of those. Every other byte
-    is a legal filename character, so `/home/a` never rewrites `/home/ab`, `/home/a.txt`,
-    `/home/a+b`, `/home/a~`, `/home/a@x`, `/home/a%20`, `/home/a=1`, `/home/a#1` or
-    `/home/a..b` (#7510, #7538). A comma is not a terminator: `/home/a,b` is another path."""
+    A path is replaced only as a whole run of path components, and only when BOTH ends are
+    a boundary, each an explicit allowlist of delimiter characters (not a list of illegal
+    filename bytes). Start boundary: start of input, or the previous byte is whitespace, a
+    quote or backtick, `(`, `[`, `<`, `=` or `:`. End boundary: end of input, `/`, or the
+    next byte is whitespace, a quote or backtick, `)`, `]`, `>`, `:`, `;` or `,`; a `.`
+    counts as an end only when it is itself at end of input or followed by whitespace. The
+    comma is an end delimiter (a list separator after a path) but not a start delimiter.
+    So `/home/a` never rewrites `/home/ab`, `/home/a.txt`, `/home/a./x`, `/home/a+b`,
+    `/home/a..b`, `~/home/a/x`, `x+/home/a/x`, `,/home/a`, `@/home/a` or `%/home/a`
+    (#7510, #7538, #7571, #7572, #7573)."""
     out = _replace_component(raw, str(ROOT), b"<repo-root>")
     out = _replace_component(out, str(FIX), SANITIZED_FIXTURE_LABEL.encode())
     if HOME:
@@ -161,9 +183,7 @@ def _replace_component(raw, path, label):
     path = path.rstrip("/")
     if not path:
         return raw
-    pattern = re.compile(
-        rb"(?<![" + PATH_CHARS + rb"." + rb"])" + re.escape(path.encode())
-        + rb"(?=\Z|" + PATH_END + rb"|\.(?:\Z|" + PATH_END + rb"))")
+    pattern = re.compile(PATH_START + re.escape(path.encode()) + PATH_END)
     return pattern.sub(lambda _match: label, raw)
 
 
@@ -172,10 +192,12 @@ def home_problem(home):
     if not home:
         return "HOME is empty or unset; set it to an absolute path"
     if (not os.path.isabs(home) or ":" in home or not home.rstrip("/")
+            or home.startswith("//") or "//" in home
+            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in home)
             or os.path.normpath(home) in ("/", "//") or os.path.normpath(home) != home):
-        return ("HOME %s must be an absolute path in normal form (no '.', '..', '//' or trailing "
-                "'/' component) that is not / and has no ':'; a relative or empty HOME would "
-                "rewrite substrings of the evidence" % home)
+        return ("HOME %r must be an absolute path in normal form (no '.', '..', '//' or trailing "
+                "'/' component, no control byte) that is not / and has no ':'; a relative or "
+                "empty HOME would rewrite substrings of the evidence" % home)
     return None
 
 
@@ -199,7 +221,7 @@ def open_parent(path):
     return fd, relative.name
 
 
-def open_new(path, mode=PUBLIC_FILE_MODE, replace=True):
+def open_new(path, replace=True):
     """A write fd for a file created by this call (O_CREAT|O_EXCL|O_NOFOLLOW).
 
     With replace, an existing entry is unlinked first (a symlink is removed, never
@@ -209,15 +231,21 @@ def open_new(path, mode=PUBLIC_FILE_MODE, replace=True):
         if replace:
             with contextlib.suppress(FileNotFoundError):  # no entry yet is the first-run case
                 os.unlink(name, dir_fd=parent)
-        return os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode,
-                       dir_fd=parent)
+        fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, FILE_MODE,
+                     dir_fd=parent)
+        try:
+            os.fchmod(fd, FILE_MODE)  # whatever the umask (#7568)
+        except OSError:
+            os.close(fd)
+            raise
+        return fd
     finally:
         os.close(parent)
 
 
-def write_file(path, data, mode=PUBLIC_FILE_MODE, replace=True):
+def write_file(path, data, replace=True):
     """Write data to a file this call creates; raises OSError instead of following a symlink."""
-    with os.fdopen(open_new(path, mode, replace), "wb") as handle:
+    with os.fdopen(open_new(path, replace), "wb") as handle:
         handle.write(data)
 
 
@@ -252,13 +280,13 @@ def write_fixtures():
         Encoding, NoEncryption, PrivateFormat, PublicFormat)
 
     keys = FIX / "keys"
-    keys.mkdir(parents=True, exist_ok=True)
+    ensure_dirs(keys)
     chmod_dir(keys)
     signing_key = Ed25519PrivateKey.generate()
     priv = signing_key.private_bytes(Encoding.Raw, PrivateFormat.Raw, NoEncryption())
     pub = signing_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
-    write_file(keys / "ai-memory.priv", priv, KEY_FILE_MODE)
-    write_file(keys / "ai-memory.pub", pub, KEY_FILE_MODE)
+    write_file(keys / "ai-memory.priv", priv)
+    write_file(keys / "ai-memory.pub", pub)
     write_file(FIX / "operator.pub.b64", (base64.b64encode(pub).decode() + "\n").encode())
     write_file(FIX / "peer-fingerprints.txt",
                ("peer-a.fleet.example " + PEER_FINGERPRINT + "\n").encode())
@@ -381,12 +409,104 @@ def fixture_symlink_problem():
     return None
 
 
-def ensure_private_dir(directory):
-    """Create directory (and parents) and chmod 0700 it only when this call created it."""
-    existed = directory.exists()
-    directory.mkdir(parents=True, exist_ok=True)
-    if not existed:
-        os.chmod(directory, DIR_MODE)
+def ensure_dirs(path):
+    """Create every missing directory of path below the repo root, each mode 0700.
+
+    Walks from the root without following a symlink. A level this call creates is made 0700
+    by os.mkdir and then fchmod'ed, so no umask widens it (#7569); a level that already
+    exists is left as it is."""
+    absolute = Path(os.path.abspath(str(path)))
+    for base in (ROOT, ROOT.resolve()):
+        if absolute == base or base in absolute.parents:
+            break
+    else:
+        raise OSError(errno.EINVAL, "path is not under the repo root", str(path))
+    fd = os.open(str(base), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in absolute.relative_to(base).parts:
+            try:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except FileNotFoundError:
+                os.mkdir(part, DIR_MODE, dir_fd=fd)
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                try:
+                    os.fchmod(child, DIR_MODE)
+                except OSError:
+                    os.close(child)
+                    raise
+            os.close(fd)
+            fd = child
+    finally:
+        os.close(fd)
+
+
+def dir_problem(path):
+    """A message when an existing directory is world writable or owned by another uid, else None.
+
+    Another user could rename a directory they can write to and plant a real one in its
+    place, which passes every symlink check (#7569). Group write is accepted: a umask 002
+    checkout makes every directory 0775."""
+    try:
+        info = os.lstat(str(path))
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        return None  # symlink and non-directory cases have their own refusals
+    if info.st_uid != os.geteuid():
+        return "%s is owned by uid %d, not by the current uid; refusing to write evidence there" % (
+            path, info.st_uid)
+    if info.st_mode & stat.S_IWOTH:
+        return "%s is world writable (mode %o); chmod o-w it before recapturing" % (
+            path, info.st_mode & 0o777)
+    return None
+
+
+def remove_tree(path):
+    """Remove a directory tree (or a lone entry) without following a symlink; ignore a miss."""
+    if os.path.islink(path) or os.path.isfile(path):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
+    else:
+        shutil.rmtree(str(path), ignore_errors=True)
+
+
+def copy_bundle(source, target):
+    """Copy the regular files and directories of source into target (0600 / 0700).
+
+    Symlinks and special files are not copied, and a `.raw` capture left by an interrupted
+    run is dropped: the unsanitized capture never ships. Reads do not follow a link."""
+    with os.scandir(str(source)) as entries:
+        listing = sorted(entries, key=lambda entry: entry.name)
+    for entry in listing:
+        if entry.is_symlink():
+            continue
+        if entry.is_dir(follow_symlinks=False):
+            ensure_dirs(target / entry.name)
+            copy_bundle(source / entry.name, target / entry.name)
+        elif entry.is_file(follow_symlinks=False) and not entry.name.endswith(".raw"):
+            write_file(target / entry.name, read_file(source / entry.name))
+
+
+def publish_bundle(stage):
+    """Make stage the evidence directory: the old one is moved aside, stage is renamed into
+    place, then the old one is removed. When the rename fails the old one is put back."""
+    parent, name = open_parent(OUT)
+    aside = ".%s.old-%s" % (name, secrets.token_hex(8))
+    moved = False
+    try:
+        with contextlib.suppress(FileNotFoundError):  # first run: there is no previous bundle
+            os.replace(name, aside, src_dir_fd=parent, dst_dir_fd=parent)
+            moved = True
+        try:
+            os.replace(stage.name, name, src_dir_fd=parent, dst_dir_fd=parent)
+        except OSError:
+            if moved:
+                os.replace(aside, name, src_dir_fd=parent, dst_dir_fd=parent)
+            raise
+    finally:
+        os.close(parent)
+    if moved:
+        remove_tree(OUT.parent / aside)
 
 
 def is_executable_file(candidate):
@@ -434,11 +554,35 @@ def recapture():
     sqlcipher_bin = resolve_binary(sqlcipher_setting)
     if not fixtures_clean():
         return 1
-    OUT.mkdir(parents=True, exist_ok=True)
-    FIX.mkdir(parents=True, exist_ok=True)
+    for directory in (LOCAL_RUNS, FIX, OUT):
+        problem = dir_problem(directory)
+        if problem is not None:
+            print(problem, file=sys.stderr)
+            return 1
+    ensure_dirs(OUT.parent)
+    ensure_dirs(FIX)
     chmod_dir(FIX)  # holds the passphrase and keys: tightened on every run
-    ensure_private_dir(tmpdir)
+    ensure_dirs(tmpdir)
+    # The bundle is built next to the evidence directory and replaces it only on success, so
+    # a failed run never leaves legs of two runs mixed (#7574).
+    stage = OUT.parent / (".%s.staging-%s" % (OUT.name, secrets.token_hex(8)))
+    ensure_dirs(stage)
+    try:
+        if OUT.is_dir() and not OUT.is_symlink():
+            copy_bundle(OUT, stage)
+        legs = capture_legs(stage, tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting,
+                            run_date)
+        if isinstance(legs, int):
+            return legs
+        publish_bundle(stage)
+    finally:
+        remove_tree(stage)
+    report(*legs)
+    return 0
 
+
+def capture_legs(out, tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting, run_date):
+    """Write the fixtures and the four legs into out; the exit codes (e1, e2, e3, e4), or 1."""
     write_fixtures()
 
     # #3199 check #22 (backup-manifest signing): the certified configuration
@@ -471,7 +615,7 @@ def recapture():
     posture_env = child_env(tmpdir, {})
     # --- leg 1: bare ---
     e1 = run_capture(default_bin, POSTURE_ARGS, posture_env,
-                     OUT / "posture-bare-env.out.raw", OUT / "posture-bare-env.out")
+                     out / "posture-bare-env.out.raw", out / "posture-bare-env.out")
 
     hard = {
         "AI_MEMORY_SECURITY_PROFILE": "asi-hard",
@@ -485,7 +629,7 @@ def recapture():
     }
     # --- leg 2: hardened non-sqlcipher, boot gate NOT armed ---
     e2 = run_capture(default_bin, POSTURE_ARGS, child_env(tmpdir, hard),
-                     OUT / "posture-hardened-env.out.raw", OUT / "posture-hardened-env.out")
+                     out / "posture-hardened-env.out.raw", out / "posture-hardened-env.out")
 
     # --- leg 3: hardened non-sqlcipher, boot gate ARMED ---
     # Boot refuse is NOT doctor --posture (that subcommand bypasses the gate):
@@ -493,15 +637,15 @@ def recapture():
     armed = dict(hard)
     armed["AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE"] = "1"
     e3 = run_capture(default_bin, ["doctor"], child_env(tmpdir, armed),
-                     OUT / "posture-hardened-boot-refusal.out.raw",
-                     OUT / "posture-hardened-boot-refusal.out")
+                     out / "posture-hardened-boot-refusal.out.raw",
+                     out / "posture-hardened-boot-refusal.out")
 
     # --- leg 4: sqlcipher + encrypt + boot gate ---
     if sqlcipher_bin is None or not is_executable_file(sqlcipher_bin):
         print("sqlcipher binary missing: " + (sqlcipher_bin or sqlcipher_setting), file=sys.stderr)
         print("leg4 skipped")
         e4 = "missing"
-        stale = OUT / SQLCIPHER_OUT_FILE
+        stale = out / SQLCIPHER_OUT_FILE
         if stale.is_file() or stale.is_symlink():
             stale.unlink()  # never ship the previous run's leg-4 capture (#7463)
     else:
@@ -514,7 +658,7 @@ def recapture():
             passphrase = read_file(passphrase_file).decode().replace("\n", "")
         except FileNotFoundError:
             passphrase = secrets.token_hex(PASSPHRASE_BYTES)
-            write_file(passphrase_file, passphrase.encode(), KEY_FILE_MODE, replace=False)
+            write_file(passphrase_file, passphrase.encode(), replace=False)
         store = FIX / "leg4-sqlcipher.db"
         leg4_env = {"AI_MEMORY_DB": str(store), "AI_MEMORY_DB_PASSPHRASE": passphrase}
         if not store.is_file():
@@ -531,7 +675,7 @@ def recapture():
         leg4 = dict(armed)
         leg4.update(leg4_env)
         e4 = run_capture(sqlcipher_bin, POSTURE_ARGS, child_env(tmpdir, leg4),
-                         OUT / "posture-sqlcipher-pass.out.raw", OUT / "posture-sqlcipher-pass.out")
+                         out / "posture-sqlcipher-pass.out.raw", out / "posture-sqlcipher-pass.out")
 
     sha_done = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
                               capture_output=True, text=True, check=False)
@@ -553,15 +697,20 @@ def recapture():
         "exit: %s" % e4,
         "",
     ])
-    write_file(OUT / EXIT_CODES_FILE, transcript.encode("utf-8"))
-    problem = check_header_date(OUT / EXIT_CODES_FILE, run_date)
+    write_file(out / EXIT_CODES_FILE, transcript.encode("utf-8"))
+    problem = check_header_date(out / EXIT_CODES_FILE, run_date)
     if problem is not None:
         print(problem, file=sys.stderr)
         return 1
 
     for name in ("peer-fingerprints.txt", "peer-attestation.json"):
-        write_file(OUT / name, read_file(FIX / name))
+        write_file(out / name, read_file(FIX / name))
 
+    return e1, e2, e3, e4
+
+
+def report(e1, e2, e3, e4):
+    """Print the exit codes and the FAIL/PASS counts of the published bundle."""
     print("exits e1=%s e2=%s e3=%s e4=%s" % (e1, e2, e3, e4))
     print("FAIL/PASS counts:")
     if e4 == "missing":
@@ -573,7 +722,6 @@ def recapture():
             for line in path.read_text(errors="replace").splitlines():
                 if "overall:" in line:
                     print(line)
-    return 0
 
 
 if __name__ == "__main__":
