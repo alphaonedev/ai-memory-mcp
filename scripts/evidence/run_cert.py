@@ -93,7 +93,9 @@ def unescape_mount(field):
 def is_tmpfs_path(path, mounts=None):
     """True for /tmp, /var/tmp, /private/tmp and anything on a tmpfs/ramfs mount (project rule: no tmpfs scratch)."""
     p = os.path.realpath(os.path.normpath(str(path)))
-    if any(p == r or p.startswith(r + "/") for r in TMP_ROOTS):
+    folded = p.casefold()  # a case-insensitive filesystem (macOS) reaches the same directory by another spelling (#7534)
+    roots = {x.casefold() for r in TMP_ROOTS for x in (r, os.path.realpath(r))}
+    if any(folded == r or folded.startswith(r.rstrip("/") + "/") for r in roots):
         return True
     if mounts is None:
         try:
@@ -635,6 +637,12 @@ def main():
     bad_ids = [s for s in a.also_evidence if not re.fullmatch(r"[0-9a-f]{9}", s)]
     if bad_ids or (a.also_evidence and a.leg != "gates"):
         print(f"--also-evidence must be 9-hex ids and is a gates-only option: {a.also_evidence}", file=sys.stderr)
+        return 64
+    given = [opt for opt, val in (("--push-branch", a.push_branch), ("--parent", a.parent)) if val]
+    if given and a.leg != "gates":
+        print(f"{' and '.join(given)} {'is a' if len(given) == 1 else 'are'} gates-only option"
+              f"{'' if len(given) == 1 else 's'}; the {a.leg} leg would ignore it. Run the gates leg, or drop the option.",
+              file=sys.stderr)
         return 64
     try:
         r = Run(a)

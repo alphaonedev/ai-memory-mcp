@@ -269,14 +269,7 @@ class PathBoundary7491(unittest.TestCase):
         self.assertEqual(bb.sanitize_paths("at /data/t", [], ["/data/t"]), "at <run-path>")
 
 
-class Hermetic7492(unittest.TestCase):
-    def test_no_test_file_names_a_real_tmp_root_path_7492(self):
-        for name in ("test_evidence_generator_r3_7393.py", "test_evidence_generator_r4_7393.py"):
-            text = (TESTS / name).read_text()
-            for needle in ("TMP" + " + " + chr(34) + "/", chr(34) + "/var" + chr(34) + " + TMP",
-                           chr(34) + "/private" + chr(34) + " + TMP"):
-                with self.subTest(file=name, needle=needle):
-                    self.assertNotIn(needle, text)
+# #7492 / #7534: the tmp-root guard is the AST walk in test_evidence_generator_r5_7393.py (every evidence test file).
 
 
 if __name__ == "__main__":

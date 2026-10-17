@@ -42,7 +42,6 @@ SH_BODY = (
 )
 GIT = ["git", "-c", "user.name=fixture", "-c", "user.email=" + "@".join(("fixture", "fixture.test")),
        "-c", "commit.gpgsign=false"]
-TMP = "/" + "tmp"  # built from parts: the leak scan flags a literal tmpfs path
 
 
 def make_repo(root, files=None):
@@ -170,20 +169,24 @@ class Overrides7421(ScratchCase):
             self.assertEqual(prep.default_repo(), REPO / "some/checkout")
 
     def test_tmpfs_overrides_are_refused_7413(self):
+        """A fake tmp root under the scratch directory with TMP_ROOTS patched: no real tmp-root path is ever used (#7534)."""
         rc = load("run_cert")
-        for bad in (TMP + "/cert", "/var" + TMP + "/cert", "/private" + TMP + "/cert"):
-            for field in ("targets", "tmpdir"):
-                with self.subTest(path=bad, field=field):
-                    with self.assertRaises(rc.ConfigError):
-                        self.make(**{field: bad})
+        root = Path(os.path.realpath(self.dir)) / "fake-tmp-root"
+        root.mkdir()
+        with mock.patch.object(rc, "TMP_ROOTS", (str(root),)):
+            for bad in (root / "cert", root, root / "a" / "b"):
+                for field in ("targets", "tmpdir"):
+                    with self.subTest(path=str(bad), field=field):
+                        with self.assertRaises(rc.ConfigError):
+                            self.make(**{field: str(bad)})
 
     def test_tmpfs_mount_detection_7413(self):
         rc = load("run_cert")
-        mounts = "tmpfs /dev/shm tmpfs rw 0 0\n/dev/sda1 / ext4 rw 0 0\ntmpfs /run tmpfs rw 0 0\n"
-        self.assertTrue(rc.is_tmpfs_path("/dev/shm/x", mounts))
-        self.assertTrue(rc.is_tmpfs_path("/run/user/1000/x", mounts))
+        mounts = "tmpfs /srv/ramdisk tmpfs rw 0 0\n/dev/sda1 / ext4 rw 0 0\nramfs /srv/rammount ramfs rw 0 0\n"
+        self.assertTrue(rc.is_tmpfs_path("/srv/ramdisk/x", mounts))
+        self.assertTrue(rc.is_tmpfs_path("/srv/rammount/user/1000/x", mounts))
         self.assertFalse(rc.is_tmpfs_path("/home/x", mounts))
-        self.assertFalse(rc.is_tmpfs_path("/dev/shmx/y", mounts))
+        self.assertFalse(rc.is_tmpfs_path("/srv/ramdiskx/y", mounts))
 
 
 class PushFailure7422(ScratchCase):
