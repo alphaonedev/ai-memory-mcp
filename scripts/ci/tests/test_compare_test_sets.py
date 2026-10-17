@@ -707,6 +707,26 @@ class NextestRetryAndSetupWords(unittest.TestCase):
             cts.scan_nextest_log(text)
         self.assertIn('line 2', str(ctx.exception))
 
+    def test_a_marker_glued_onto_a_summary_line_is_a_parse_error_7298(self):
+        # R9-1 (N4): the marker checks run before the Summary branch, so a marker (here with text after it) glued onto
+        # a Summary line exits 2 instead of being swallowed there (was a::f=pass).
+        text = ('  TRY 2 PASS [   1.000s] (  1/1) nx5 a::f\n'
+                '     Summary [   1.000s] 1 tests run: 1 passed, 0 skipped  - test configured to fail if flaky x\n'
+                '       FLAKY 2/3 [   1.000s] nx5 a::f\n')
+        with self.assertRaises(cts.ParseError) as ctx:
+            cts.scan_nextest_log(text)
+        self.assertIn('line 2', str(ctx.exception))
+
+    def test_a_marker_ending_a_summary_line_is_a_parse_error_7298(self):
+        # R9-1 (N4): a Summary line is not a status line, so the status-word check alone let `Summary ... <marker>`
+        # through to the Summary branch and the marker was dropped (was a::f=pass).
+        text = ('  TRY 2 PASS [   1.000s] (  1/1) nx5 a::f\n'
+                '     Summary [   1.000s] 1 tests run: 1 passed, 0 skipped  - test configured to fail if flaky\n'
+                '       FLAKY 2/3 [   1.000s] nx5 a::f\n')
+        with self.assertRaises(cts.ParseError) as ctx:
+            cts.scan_nextest_log(text)
+        self.assertIn('line 2', str(ctx.exception))
+
     def test_help_text_states_the_flaky_marker_and_status_table_rules_7298(self):
         self.assertIn('configured to fail if flaky', cts.__doc__)
         self.assertIn('SETUP', cts.__doc__)

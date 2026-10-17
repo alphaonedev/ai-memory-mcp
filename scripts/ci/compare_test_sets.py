@@ -339,18 +339,19 @@ def scan_nextest_log(text: str) -> Scan:
         line = _clean(raw)
         if _is_runner_notice(line):
             continue
+        if _FLAKY_FAIL_MARKER in line and not line.endswith(_FLAKY_FAIL_MARKER):
+            raise ParseError('nextest log: line %d: text after the marker %r on the same line (nextest ends the line '
+                             'with it): %r' % (lineno, _FLAKY_FAIL_MARKER, line[:120]))
+        if line.endswith(_FLAKY_FAIL_MARKER) and (_NEXTEST_RE.search(line[:-len(_FLAKY_FAIL_MARKER)])
+                                                  or _SUMMARY_RE.search(line[:-len(_FLAKY_FAIL_MARKER)])):
+            raise ParseError('nextest log: line %d: a status word or Summary line on the same line as the marker %r '
+                             '(nextest prints the marker on its own line): %r' % (lineno, _FLAKY_FAIL_MARKER, line[:120]))
         summary = _SUMMARY_RE.search(line)
         if summary:
             total += int(summary.group('run'))
             total_lines += 1
             continue
-        if _FLAKY_FAIL_MARKER in line and not line.endswith(_FLAKY_FAIL_MARKER):
-            raise ParseError('nextest log: line %d: text after the marker %r on the same line (nextest ends the line '
-                             'with it): %r' % (lineno, _FLAKY_FAIL_MARKER, line[:120]))
         if line.endswith(_FLAKY_FAIL_MARKER):
-            if _NEXTEST_RE.search(line[:-len(_FLAKY_FAIL_MARKER)]):
-                raise ParseError('nextest log: line %d: a status word on the same line as the marker %r (nextest '
-                                 'prints the marker on its own line): %r' % (lineno, _FLAKY_FAIL_MARKER, line[:120]))
             if last_try_pass is None:
                 raise ParseError('nextest log: line %d: %r has no immediately preceding "TRY n PASS" result line '
                                  '(flaky-result = "fail" prints it right after the passing attempt)'
