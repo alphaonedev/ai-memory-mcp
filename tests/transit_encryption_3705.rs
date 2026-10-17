@@ -47,7 +47,9 @@ const BIND_GUARD_MARKER: &str = "without an API key";
 /// A valid, EMPTY peer allowlist so the #3582 gate is satisfied.
 const EMPTY_ALLOWLIST: &str = "{}";
 
-const BOOT_DEADLINE: Duration = Duration::from_secs(45);
+/// Base boot budget, aligned to the 60 s `tests/integration.rs` ceiling
+/// (#3615); [`boot_budget`] scales it on loaded hosts.
+const BOOT_DEADLINE: Duration = Duration::from_secs(60);
 const PROBE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Once the daemon logs that its TLS listener is bound, a health 200 is
@@ -179,23 +181,43 @@ fn health_url(port: u16) -> String {
     format!("{}/api/v1/health", TestTls::base_url(port))
 }
 
-/// Boot-wait budgets (#7341). RED STUBS: the fixed-budget behaviour of the
-/// base commit, so the new tests below fail for the right reason.
+/// The two boot-wait budgets (#7341): `before_listen` bounds the daemon's
+/// bring-up (CA and leaf generation, key load) and is load-scaled;
+/// `after_listen` applies once the listener-bound line is on stderr.
 struct BootBudget {
     before_listen: Duration,
     after_listen: Duration,
 }
 
-fn scaled_boot_budget(base: Duration, _raw_mult: Option<&str>) -> Duration {
-    base
+/// Scale `base` by the raw `AI_MEMORY_TEST_TIMING_BUDGET_MULT` value, parsed
+/// exactly like `tests/integration.rs::health_probe_attempts` (#3615): a
+/// `u32` in `1..=BUDGET_MULT_MAX`, otherwise 1x. The value is a parameter so
+/// tests never mutate the process environment shared with parallel tests.
+fn scaled_boot_budget(base: Duration, raw_mult: Option<&str>) -> Duration {
+    let mult = raw_mult
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|n| (1..=BUDGET_MULT_MAX).contains(n))
+        .unwrap_or(1);
+    base.saturating_mul(mult)
 }
 
+/// [`scaled_boot_budget`] with the one production read of the environment.
+fn boot_budget() -> Duration {
+    let raw = std::env::var(BUDGET_MULT_ENV).ok();
+    scaled_boot_budget(BOOT_DEADLINE, raw.as_deref())
+}
+
+/// Poll `probe` until it succeeds. Order per iteration: probe, dead-child
+/// check (returns the exit status and stderr at once), then the budget. The
+/// pre-listen budget applies until the daemon's listener-bound line shows on
+/// the captured stderr; from the first sighting only `after_listen` remains.
 fn try_wait_healthy(
     spawned: &mut Spawned,
     mut probe: impl FnMut() -> bool,
     budget: &BootBudget,
 ) -> Result<(), String> {
-    let deadline = Instant::now() + budget.before_listen;
+    let mut deadline = Instant::now() + budget.before_listen;
+    let mut listening = false;
     loop {
         if probe() {
             return Ok(());
@@ -206,10 +228,18 @@ fn try_wait_healthy(
                 spawned.captured()
             ));
         }
+        if !listening && spawned.captured().contains(LISTEN_SIGNAL) {
+            listening = true;
+            deadline = Instant::now() + budget.after_listen;
+        }
         if Instant::now() >= deadline {
+            let (phase, waited) = if listening {
+                ("after logging its TLS listener", budget.after_listen)
+            } else {
+                ("before logging its TLS listener", budget.before_listen)
+            };
             return Err(format!(
-                "serve never answered /health over TLS within {:?}; stderr:\n{}",
-                budget.before_listen,
+                "serve never answered /health over TLS within {waited:?} {phase}; stderr:\n{}",
                 spawned.captured()
             ));
         }
@@ -221,7 +251,7 @@ fn try_wait_healthy(
 /// exits (returning its stderr as the error).
 fn wait_healthy(spawned: &mut Spawned, client: &reqwest::blocking::Client, port: u16) {
     let budget = BootBudget {
-        before_listen: BOOT_DEADLINE,
+        before_listen: boot_budget(),
         after_listen: POST_LISTEN_BUDGET,
     };
     let url = health_url(port);
@@ -242,7 +272,8 @@ fn wait_healthy(spawned: &mut Spawned, client: &reqwest::blocking::Client, port:
 /// Run a boot that is expected to EXIT on its own; returns (status, stderr).
 fn boot_until_exit(cmd: Command) -> (std::process::ExitStatus, String) {
     let mut spawned = Spawned::spawn(cmd);
-    let deadline = Instant::now() + BOOT_DEADLINE;
+    let budget = boot_budget();
+    let deadline = Instant::now() + budget;
     loop {
         if let Some(status) = spawned.exited() {
             let err = spawned.finish();
@@ -251,9 +282,7 @@ fn boot_until_exit(cmd: Command) -> (std::process::ExitStatus, String) {
         if Instant::now() >= deadline {
             // Reap BEFORE panicking so the daemon never outlives the test.
             let err = spawned.finish();
-            panic!(
-                "serve did not exit within {BOOT_DEADLINE:?} (a refusal was expected); stderr:\n{err}"
-            );
+            panic!("serve did not exit within {budget:?} (a refusal was expected); stderr:\n{err}");
         }
         std::thread::sleep(PROBE_INTERVAL);
     }
@@ -289,7 +318,7 @@ fn fresh_install_serves_tls_with_zero_config_3709() {
     cmd.args(["serve", "--port", &port.to_string()]);
     let mut spawned = Spawned::spawn(cmd);
 
-    let client = local_ca_client(&key_dir(root.path()), BOOT_DEADLINE).unwrap_or_else(|| {
+    let client = local_ca_client(&key_dir(root.path()), boot_budget()).unwrap_or_else(|| {
         panic!(
             "#3709: first boot must generate tls/local-ca.pem in the key dir; stderr:\n{}",
             spawned.captured()
@@ -376,7 +405,7 @@ fn observed_fleet_signals_never_promote_out_of_zero_config_3709() {
     cmd.env("AI_MEMORY_FED_PEER_ATTESTATION", EMPTY_ALLOWLIST)
         .args(["serve", "--port", &port.to_string()]);
     let mut spawned = Spawned::spawn(cmd);
-    let client = local_ca_client(&key_dir(root.path()), BOOT_DEADLINE).unwrap_or_else(|| {
+    let client = local_ca_client(&key_dir(root.path()), boot_budget()).unwrap_or_else(|| {
         panic!(
             "#3700 ruling: an observed fleet signal must not stop a declared singleton from \
              minting its local CA; stderr:\n{}",
