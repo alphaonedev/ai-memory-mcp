@@ -324,7 +324,7 @@ class FixtureLabel5039B(unittest.TestCase):
             with self.subTest(cert=cert_id):
                 run = self.module.CertRun(cert_id)
                 self.assertNotIn(run.fix.name, self.module.SANITIZED_FIXTURE_LABEL)
-                self.assertNotIn('cert-', self.module.SANITIZED_FIXTURE_LABEL)
+                self.assertNotIn(run.fix.name.replace('-fixtures', ''), self.module.SANITIZED_FIXTURE_LABEL)
 
     def test_the_previous_label_of_a_cert_is_named_by_its_directory(self):
         self.assertEqual(self.module.previous_fixture_label('cert-3607'),

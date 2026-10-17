@@ -20,9 +20,13 @@ script, with these deliberate changes:
 - The leg-4 database passphrase reaches the child through its environment only;
   it is on no argv. A passphrase file that cannot be read or is empty exits 70
   before the child runs.
-- The fixture-path sanitizer label of each bundle is unchanged on purpose: the
-  cert certifies the sanitized fixtures byte-identical across re-issues (#5039
-  part B changes the label for the next re-issue).
+- #5039 part B (3-agent vote 6def5ab6, memory 94ac022e): the fixture path in the
+  sanitized output is the generic SANITIZED_FIXTURE_LABEL, not a label derived
+  from the fixture directory name. The fixture directory is collapsed BEFORE the
+  repository root (the old order made that replacement a no-op, so the label was
+  the directory name). No existing bundle byte changes; the new label first
+  appears in the next re-issue, whose 12/12 sanitized-fixture check runs as
+  relabel_fixture_label (new label back to previous_fixture_label) then compare.
 
 Environment overrides: DEFAULT_BIN (default <repo>/target/release/ai-memory),
 SQLCIPHER_BIN (default <repo>/target-sqlcipher/release/ai-memory; leg 4 is
@@ -61,6 +65,7 @@ HOME = os.environ.get("HOME", "")
 CHILD_PATH = "/usr/bin:/bin:" + HOME + "/.cargo/bin"
 LADDER_GATE = "check-posture-ladder.py"
 EXIT_CODES_FILE = "posture-legs-exit-codes.txt"
+SANITIZED_FIXTURE_LABEL = "<repo-root>/.local-runs/<cert-fixtures>"
 HEADER_TEMPLATE = (
     "# posture-legs transcript — recorded exit codes "
     "({date} {label} @ {sha})"
@@ -99,7 +104,6 @@ class CertRun(object):
         profile = CERT_PROFILES[CERT_ALIASES.get(cert_id, cert_id)]
         self.out = EVIDENCE_DIR / profile.cert_dir
         self.fix = FIXTURE_PARENT / (profile.cert_dir + "-fixtures")
-        self.label = "<repo-root>/.local-runs/" + profile.cert_dir + "-fixtures"
         self.header_label = profile.header_label
         self.rev22 = profile.rev22
 
@@ -125,10 +129,24 @@ def check_header_date(transcript_path, run_date):
     return None
 
 
+def previous_fixture_label(cert_dir):
+    """The label the existing bundles carry: it was the fixture directory name."""
+    return "<repo-root>/.local-runs/" + cert_dir + "-fixtures"
+
+
+def relabel_fixture_label(data, old_label, new_label):
+    """Swap one fixture label for another in sanitized bytes (re-issue byte-identity check)."""
+    return data.replace(old_label.encode(), new_label.encode())
+
+
 def sanitize(raw, run):
-    """Collapse absolute repo, fixture and home paths (same order as the shell sed)."""
-    out = raw.replace(str(ROOT).encode(), b"<repo-root>")
-    out = out.replace(str(run.fix).encode(), run.label.encode())
+    """Collapse absolute fixture, repo and home paths, the fixture directory first.
+
+    The fixture directory lives under the repository root, so replacing the root
+    first would leave nothing for the generic fixture label to replace.
+    """
+    out = raw.replace(str(run.fix).encode(), SANITIZED_FIXTURE_LABEL.encode())
+    out = out.replace(str(ROOT).encode(), b"<repo-root>")
     if HOME:
         out = out.replace(HOME.encode(), b"<home>")
     if out and not out.endswith(b"\n"):
