@@ -15,8 +15,6 @@
 use anyhow::Result;
 use rusqlite::Connection;
 
-const SAVEPOINT: &str = "link_audit_7559";
-
 /// Guard over `SAVEPOINT link_audit_7559`; inert in autocommit mode.
 pub(super) struct LinkSavepoint<'c> {
     conn: &'c Connection,
@@ -32,7 +30,7 @@ impl<'c> LinkSavepoint<'c> {
     pub(super) fn open(conn: &'c Connection) -> Result<Self> {
         let armed = !conn.is_autocommit();
         if armed {
-            conn.execute_batch(&format!("SAVEPOINT {SAVEPOINT}"))?;
+            conn.execute_batch("SAVEPOINT link_audit_7559")?;
         }
         Ok(Self { conn, armed })
     }
@@ -46,7 +44,7 @@ impl<'c> LinkSavepoint<'c> {
     pub(super) fn release(mut self) -> Result<()> {
         if self.armed {
             self.conn
-                .execute_batch(&format!("RELEASE SAVEPOINT {SAVEPOINT}"))?;
+                .execute_batch("RELEASE SAVEPOINT link_audit_7559")?;
             self.armed = false;
         }
         Ok(())
@@ -59,9 +57,9 @@ impl Drop for LinkSavepoint<'_> {
             // Best effort: the owner's transaction is already unwinding on this
             // path, and a failed rollback leaves the owner's own ROLLBACK to
             // discard the work.
-            let _ = self.conn.execute_batch(&format!(
-                "ROLLBACK TO SAVEPOINT {SAVEPOINT}; RELEASE SAVEPOINT {SAVEPOINT}"
-            ));
+            let _ = self.conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT link_audit_7559; RELEASE SAVEPOINT link_audit_7559",
+            );
         }
     }
 }
