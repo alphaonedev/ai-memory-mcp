@@ -751,12 +751,33 @@ class PublicSnapshotHygiene7518(unittest.TestCase):
     def test_7592_a_listed_name_matches_whole_host_tokens_only(self):
         self.names_file.write_text("ai\nbox\n", encoding="utf-8")
         hostscrub = _load("hostscrub_7592_c", "hostscrub.py")
-        for untouched in ("ai-memory", "mailbox", "boxes", "box_2", "x-box", "ai2", "main"):
+        for untouched in ("ai-memory", "mailbox", "boxes", "x-box", "main"):
             self.assertEqual(hostscrub.scrub_text("see " + untouched + " now"), "see " + untouched + " now", untouched)
         for token in ("ai", "AI", "box"):
             self.assertEqual(hostscrub.scrub_text("on %s." % token), "on node.", token)
             self.assertEqual(hostscrub.scrub_text("(%s)" % token), "(node)", token)
             self.assertEqual(hostscrub.scrub_text("by %s, then" % token), "by node, then", token)
+
+    def test_7641_a_listed_name_with_a_host_suffix_is_reported_and_scrubbed(self):
+        self.names_file.write_text("ai\nbox\n", encoding="utf-8")
+        hostscrub = _load("hostscrub_7641", "hostscrub.py")
+        for derived in ("box_2", "ai2", "box-07", "ai-3", "BOX-prod_1"):
+            self.assertEqual(hostscrub.find_leaks("on " + derived + " now"), [derived], derived)
+            self.assertEqual(hostscrub.scrub_text("on " + derived + " now"), "on node now", derived)
+            self.assertNotIn(derived.lower(), hostscrub.dump_clean({"n": "on " + derived}).lower())
+        # the explicit exception list keeps the product name readable; look-alikes stay untouched
+        for ok in ("ai-memory", "ai-memory-mcp", "mailbox", "boxes", "x-box", "main"):
+            self.assertEqual(hostscrub.find_leaks("see " + ok), [], ok)
+            self.assertEqual(hostscrub.scrub_text("see " + ok), "see " + ok, ok)
+
+    def test_7642_two_keys_that_scrub_to_the_same_key_are_refused(self):
+        hostscrub = _load("hostscrub_7642", "hostscrub.py")
+        node = self.node
+        with self.assertRaises(hostscrub.LeakError):
+            hostscrub.scrub({"host:%s" % node: 1, "host:node": 2})
+        with self.assertRaises(hostscrub.LeakError):
+            hostscrub.dump_clean({"x": {"host:aa-1": 1, "host:bb-2": 2}})
+        self.assertEqual(hostscrub.scrub({"host:node": 1, "other": 2}), {"host:node": 1, "other": 2})
 
     def test_names_in_the_local_untracked_file_are_scrubbed_and_comments_ignored(self):
         hostscrub = _load("hostscrub_7547_file", "hostscrub.py")
@@ -802,20 +823,90 @@ class PublicSnapshotHygiene7518(unittest.TestCase):
             self.assertNotIn(node, text.lower())
             self.assertEqual(json.loads(text)["total"], 2)
 
+    def _push(self, mod, tmp, src_arg, creds=("tok", None), wrangler_rc=0):
+        """Run push-state.main with credentials and wrangler stubbed; returns (rc, stderr)."""
+        err = io.StringIO()
+        fake = mock.Mock(returncode=wrangler_rc, stdout="deployed", stderr="")
+        if creds is None:
+            load = mock.patch.object(mod.cfcommon, "load_credentials",
+                                     side_effect=mod.cfcommon.CredentialError("none"))
+        else:
+            load = mock.patch.object(mod.cfcommon, "load_credentials", return_value=creds)
+        with mock.patch.object(mod, "HERE", Path(tmp)), load, \
+                mock.patch.object(mod.cfcommon, "run_wrangler", return_value=fake), \
+                mock.patch.object(sys, "argv", ["push-state.py", src_arg]), \
+                contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = mod.main()
+        return rc, err.getvalue()
+
     def test_push_state_scrubs_the_live_state_before_writing(self):
         node = self.node
         mod = _load("push_state_7518", "push-state.py")
         with tempfile.TemporaryDirectory(dir=str(SCRATCH)) as tmp:
             src = Path(tmp) / "in.json"
             src.write_text(json.dumps({"agents": [{"node": node}]}))
-            (Path(tmp) / "public").mkdir()
-            with mock.patch.object(mod, "HERE", Path(tmp)), \
-                    mock.patch.object(mod.cfcommon, "load_credentials", side_effect=mod.cfcommon.CredentialError("none")), \
-                    mock.patch.object(sys, "argv", ["push-state.py", str(src)]), \
-                    contextlib.redirect_stderr(io.StringIO()):
-                mod.main()
+            rc, _ = self._push(mod, tmp, str(src))
+            self.assertEqual(rc, 0)
             written = (Path(tmp) / "public" / "state.json").read_text(encoding="utf-8")
             self.assertNotIn(node, written.lower())
+
+    def test_7643_push_state_bad_input_exits_2_with_a_fixed_message_and_no_traceback(self):
+        mod = _load("push_state_7643_a", "push-state.py")
+        with tempfile.TemporaryDirectory(dir=str(SCRATCH)) as tmp:
+            bad = Path(tmp) / "latin1.json"
+            bad.write_bytes(b'{"n": "caf\xe9"}')
+            rc, err = self._push(mod, tmp, str(bad))
+            self.assertEqual((rc, err), (2, "push-state: the state is not valid UTF-8 text\n"))
+            rc, err = self._push(mod, tmp, str(Path(tmp) / "missing.json"))
+            self.assertEqual((rc, err), (2, "push-state: the state file cannot be read\n"))
+            self.assertFalse((Path(tmp) / "public" / "state.json").exists())
+            self.assertNotIn("Traceback", err)
+
+    def test_7643_push_state_reads_utf8_regardless_of_the_locale(self):
+        mod = _load("push_state_7643_b", "push-state.py")
+        with tempfile.TemporaryDirectory(dir=str(SCRATCH)) as tmp:
+            src = Path(tmp) / "in.json"
+            src.write_bytes(json.dumps({"n": "caf\u00e9 \u2713"}, ensure_ascii=False).encode("utf-8"))
+            with mock.patch("locale.getpreferredencoding", return_value="ANSI_X3.4-1968"), \
+                    mock.patch.object(mod.Path, "read_text", side_effect=AssertionError("locale read_text used")):
+                rc, err = self._push(mod, tmp, str(src))
+            self.assertEqual((rc, err), (0, ""))
+            self.assertIn("caf", (Path(tmp) / "public" / "state.json").read_text(encoding="utf-8"))
+
+    def test_7643_push_state_loads_credentials_before_writing_anything(self):
+        mod = _load("push_state_7643_c", "push-state.py")
+        with tempfile.TemporaryDirectory(dir=str(SCRATCH)) as tmp:
+            src = Path(tmp) / "in.json"
+            src.write_text(json.dumps({"agents": []}))
+            rc, err = self._push(mod, tmp, str(src), creds=None)
+            self.assertEqual(rc, 1)
+            self.assertIn("push-state:", err)
+            self.assertFalse((Path(tmp) / "public").exists(), "state.json written before credentials were known")
+
+    def test_7643_push_state_writes_atomically_through_os_replace(self):
+        mod = _load("push_state_7643_d", "push-state.py")
+        with tempfile.TemporaryDirectory(dir=str(SCRATCH)) as tmp:
+            src = Path(tmp) / "in.json"
+            src.write_text(json.dumps({"agents": []}))
+            public = Path(tmp) / "public"
+            public.mkdir()
+            target = public / "state.json"
+            target.write_text("OLD\n")
+            real = os.replace
+            seen = []
+
+            def spy(a, b):
+                seen.append((Path(a).name, Path(b).name, target.read_text()))
+                return real(a, b)
+
+            with mock.patch.object(mod.os, "replace", side_effect=spy):
+                rc, _ = self._push(mod, tmp, str(src))
+            self.assertEqual(rc, 0)
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(seen[0][1:], ("state.json", "OLD\n"), "the target was touched before os.replace")
+            self.assertNotEqual(seen[0][0], "state.json")
+            self.assertEqual(sorted(x.name for x in public.iterdir()), ["state.json"], "temp file left behind")
+            self.assertNotEqual(target.read_text(), "OLD\n")
 
 
 class HtmlAndHeaders7313(unittest.TestCase):
