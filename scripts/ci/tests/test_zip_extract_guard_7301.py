@@ -234,6 +234,131 @@ class TreeFailClosed7301(StubCargoCase):
                 self.assertIn(name, res.stdout)
 
 
+class SourceScope7301(GuardBase):
+    """Round 2: scan scope (examples, custom build script, #[path], include!) and patterns."""
+
+    def write(self, rel, text):
+        target = self.root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding='utf-8')
+        return target
+
+    def test_examples_dir_is_scanned(self):
+        self.write('examples/e.rs', 'fn main() { Tensor::read_npz(p); }\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('examples/e.rs:1', res.stdout)
+
+    def test_custom_build_script_is_scanned(self):
+        (self.root / 'Cargo.toml').write_text(
+            MINIMAL_MANIFEST.replace('name = "fixture"', 'name = "fixture"\nbuild = "tools/b.rs"'),
+            encoding='utf-8')
+        self.write('tools/b.rs', 'fn main() { zip::ZipArchive::new(r); }\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('tools/b.rs:1', res.stdout)
+
+    def test_declared_target_paths_are_scanned(self):
+        (self.root / 'Cargo.toml').write_text(
+            MINIMAL_MANIFEST + '\n[[bin]]\nname = "tool"\npath = "gen/tool.rs"\n', encoding='utf-8')
+        self.write('gen/tool.rs', 'fn main() { Tensor::read_npy(p); }\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('gen/tool.rs:1', res.stdout)
+
+    def test_use_leading_colons_fails(self):
+        for i, line in enumerate(('use ::zip as z;', 'use ::zip::ZipArchive;', 'extern crate zip as z;',
+                                  'use {zip, serde};')):
+            with self.subTest(line=line):
+                self.write('src/u%d.rs' % i, line + '\n')
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('src/u%d.rs:1' % i, res.stdout)
+                (self.root / 'src' / ('u%d.rs' % i)).unlink()
+
+    def test_extract_unwrapped_root_dir_fails_without_zip_context(self):
+        self.write('src/x.rs', 'fn f(a: A) { a.extract_unwrapped_root_dir(p, v); }\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('src/x.rs:1', res.stdout)
+
+    def test_zip_named_in_macro_input_fails(self):
+        cases = ('my_macro!(zip);', 'my_macro!(a, zip, b);', 'my_macro![zip];',
+                 'my_macro! { zip }', 'my_macro!(\n    a,\n    zip\n);')
+        for i, body in enumerate(cases):
+            with self.subTest(body=body):
+                self.write('src/m%d.rs' % i, 'fn f() {\n%s\n}\n' % body)
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('src/m%d.rs:' % i, res.stdout)
+                (self.root / 'src' / ('m%d.rs' % i)).unlink()
+
+    def test_iterator_zip_in_macro_does_not_fail(self):
+        self.write('src/ok.rs', (
+            'fn f(a: &[u8], b: &[u8]) {\n'
+            '    let v = vec![a.iter().zip(b)];\n'
+            '    assert_eq!(a.len(), std::iter::zip(a, b).count());\n'
+            '    println!("zip file {}", 1);\n'
+            '}\n'))
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_path_attribute_outside_scanned_roots_is_followed(self):
+        self.write('gen/evil.rs', 'pub fn e() { Tensor::read_npz(p); }\n')
+        self.write('src/lib.rs', '#[path = "../gen/evil.rs"]\nmod evil;\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('gen/evil.rs:1', res.stdout)
+
+    def test_include_macro_outside_scanned_roots_is_followed(self):
+        self.write('gen/evil.rs', 'fn e() { zip::x(); }\n')
+        self.write('src/lib.rs', 'include!("../gen/evil.rs");\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('gen/evil.rs:1', res.stdout)
+
+    def test_unresolvable_path_and_include_fail(self):
+        for i, body in enumerate(('#[path = "../gen/missing.rs"]\nmod m;\n',
+                                  'include!("../gen/missing.rs");\n',
+                                  'include!(concat!(env!("OUT_DIR"), "/g.rs"));\n',
+                                  '#[path = "../../outside.rs"]\nmod m;\n')):
+            with self.subTest(body=body):
+                self.write('src/lib.rs', body)
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('src/lib.rs:', res.stdout)
+
+    def test_path_attribute_inside_scanned_roots_passes(self):
+        self.write('src/sub/inner.rs', 'pub fn i() {}\n')
+        self.write('src/lib.rs', '#[path = "sub/inner.rs"]\nmod inner;\ninclude_str!("a.txt");\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_non_utf8_source_exits_2(self):
+        (self.root / 'src' / 'bin.rs').write_bytes(b'fn f() {}\n\xff\xfe\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn('src/bin.rs', res.stderr)
+        self.assertNotIn('Traceback', res.stderr)
+
+    def test_non_utf8_manifest_exits_2(self):
+        (self.root / 'Cargo.toml').write_bytes(b'[package]\nname = "\xff"\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertNotIn('Traceback', res.stderr)
+
+    def test_unreadable_source_exits_2(self):
+        target = self.write('src/locked.rs', 'fn f() {}\n')
+        target.chmod(0)
+        self.addCleanup(target.chmod, 0o644)
+        if os.access(str(target), os.R_OK):
+            self.skipTest('running as a user that ignores file modes')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn('src/locked.rs', res.stderr)
+        self.assertNotIn('Traceback', res.stderr)
+
+
 try:
     import tomllib  # noqa: F401  (Python 3.11+)
     HAVE_TOMLLIB = True
