@@ -92,9 +92,11 @@ class PlanMustEqualThePlans7487(ScratchCase):
         super().setUp()
         self.bb = load("build_bundle")
 
-    def refused(self, text):
-        with self.assertRaises(self.bb.Fatal):
+    def refused(self, text, reason=None):
+        with self.assertRaises(self.bb.Fatal) as cm:
             self.bb.check_run(self.legs(text))
+        if reason is not None:
+            self.assertIn(reason, str(cm.exception))
 
     def test_plan_table_equals_the_runners_7487(self):
         rc = load("run_cert")
@@ -109,11 +111,25 @@ class PlanMustEqualThePlans7487(ScratchCase):
     def test_reordered_plan_is_refused_7487(self):
         self.refused(GREEN_CHAIN.replace("legs=battery,removal,pg,bootstrap,chain", "legs=chain,battery,removal,pg,bootstrap"))
 
+    # #7528: a green chain in front, then a block whose PLAN is well formed and canonical but is NOT the row right
+    # after CONFIG. Nothing else is wrong with these blocks, so only the position rule can refuse them, and the reason
+    # is pinned: removing `plans[0][0] != 1` from check_block turns each of them red.
+    POSITION = "right after its CONFIG row"
+    PG_EXIT = "EXIT=0 leg=pg aggregate_failures=0 1\n"
+
     def test_plan_after_the_first_section_is_refused_7487(self):
-        self.refused(CONFIG + "\n" + SEC["pg"] + "PLAN leg=pg legs=pg\n" + DONE["pg"] + "EXIT=0 leg=pg aggregate_failures=0 1\n")
+        self.refused(GREEN_CHAIN + CONFIG + "\n" + SEC["pg"] + "PLAN leg=pg legs=pg\n" + DONE["pg"] + self.PG_EXIT,
+                     self.POSITION)
+
+    def test_plan_between_the_done_row_and_exit_is_refused_7487(self):
+        self.refused(GREEN_CHAIN + CONFIG + "\n" + leg_text("pg") + "PLAN leg=pg legs=pg\n" + self.PG_EXIT, self.POSITION)
+
+    def test_plan_two_rows_after_config_is_refused_7487(self):
+        self.refused(GREEN_CHAIN + CONFIG + "\nCOUNT_DIFF note\nPLAN leg=pg legs=pg\n" + leg_text("pg") + self.PG_EXIT,
+                     self.POSITION)
 
     def test_plan_after_the_exit_row_is_refused_7487(self):
-        self.refused(CONFIG + "\n" + leg_text("pg") + "EXIT=0 leg=pg aggregate_failures=0 1\nPLAN leg=pg legs=pg\n")
+        self.refused(GREEN_CHAIN + CONFIG + "\n" + leg_text("pg") + self.PG_EXIT + "PLAN leg=pg legs=pg\n", self.POSITION)
 
     def test_gates_plan_in_legs_log_is_refused_7487(self):
         self.refused(block("gates", ("gates",), ""))
