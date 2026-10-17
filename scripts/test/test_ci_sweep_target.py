@@ -889,33 +889,49 @@ def opened_fd(path, flags, dir_fd=None):
 def make_deep_chain(parent, name, depth):
     """Create ``parent/name/d/d/...`` ``depth`` levels deep using dir_fd-relative calls."""
     os.makedirs(str(parent / name))
-    with contextlib.ExitStack() as stack:
-        fd = stack.enter_context(opened_fd(str(parent / name), DIR_FLAGS))
-        for _ in range(depth):
-            os.mkdir("d", dir_fd=fd)
-            fd = stack.enter_context(opened_fd("d", DIR_FLAGS, dir_fd=fd))
+    fd = os.open(str(parent / name), DIR_FLAGS)
+    for _ in range(depth):
+        os.mkdir("d", dir_fd=fd)
+        child = os.open("d", DIR_FLAGS, dir_fd=fd)
+        os.close(fd)
+        fd = child
+    os.close(fd)
 
 
 def remove_deep_chain(parent, name, depth):
-    """Remove whatever is left of the chain made by make_deep_chain, without recursion."""
-    with contextlib.ExitStack() as stack:
-        try:
-            fds = [stack.enter_context(opened_fd(str(parent / name), DIR_FLAGS))]
-        except FileNotFoundError:
-            return
-        while len(fds) <= depth:
+    """Remove whatever is left of the chain made by make_deep_chain, without recursion.
+
+    Walks down holding one descriptor, then back up through ``..``; two descriptors are open at most.
+    """
+    try:
+        fd = os.open(str(parent / name), DIR_FLAGS)
+    except FileNotFoundError:
+        return
+    levels = 0
+    try:
+        while levels < depth:
             try:
-                fds.append(stack.enter_context(opened_fd("d", DIR_FLAGS, dir_fd=fds[-1])))
+                child = os.open("d", DIR_FLAGS, dir_fd=fd)
             except FileNotFoundError:
                 break
-        for idx in range(len(fds) - 1, -1, -1):
+            os.close(fd)
+            fd = child
+            levels += 1
+        while True:
             try:
-                os.unlink("f", dir_fd=fds[idx])
+                os.unlink("f", dir_fd=fd)
             except FileNotFoundError:
-                # No file at this level: chains made by make_deep_chain hold none, so nothing to remove.
+                # No file at this level: make_deep_chain levels and the deepest make_deep_chain_with_files level hold none.
                 pass
-            if idx:
-                os.rmdir("d", dir_fd=fds[idx - 1])
+            if not levels:
+                break
+            parent_fd = os.open("..", DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = parent_fd
+            os.rmdir("d", dir_fd=fd)
+            levels -= 1
+    finally:
+        os.close(fd)
     os.rmdir(str(parent / name))
 
 
@@ -949,32 +965,53 @@ class DeepTreeTests(SweepTestCase):
 def make_deep_chain_with_files(parent, name, depth):
     """Like make_deep_chain, with one small file at every level; returns the file count."""
     os.makedirs(str(parent / name))
+    fd = os.open(str(parent / name), DIR_FLAGS)
     count = 0
-    with contextlib.ExitStack() as stack:
-        fd = stack.enter_context(opened_fd(str(parent / name), DIR_FLAGS))
-        for _ in range(depth):
-            with opened_fd("f", os.O_WRONLY | os.O_CREAT, dir_fd=fd) as file_fd:
-                os.write(file_fd, b"0123456789")
-            count += 1
-            os.mkdir("d", dir_fd=fd)
-            fd = stack.enter_context(opened_fd("d", DIR_FLAGS, dir_fd=fd))
+    for _ in range(depth):
+        with opened_fd("f", os.O_WRONLY | os.O_CREAT, dir_fd=fd) as file_fd:
+            os.write(file_fd, b"0123456789")
+        count += 1
+        os.mkdir("d", dir_fd=fd)
+        child = os.open("d", DIR_FLAGS, dir_fd=fd)
+        os.close(fd)
+        fd = child
+    os.close(fd)
     return count
 
 
 def count_files(root):
-    """Count regular files under ``root`` iteratively, by descriptor (no path limit)."""
+    """Count regular files under ``root`` iteratively, by descriptor (no path limit).
+
+    One descriptor is held at a time: names still to visit are kept per level, and the walk
+    returns to a parent through ``..``.
+    """
     total = 0
-    with contextlib.ExitStack() as holder:
-        stack = [holder.enter_context(opened_fd(str(root), DIR_FLAGS))]
-        while stack:
-            fd = stack.pop()
+    fd = os.open(str(root), DIR_FLAGS)
+    try:
+        pending = []
+        while True:
             with os.scandir(fd) as it:
                 children = list(it)
+            subdirs = []
             for child in children:
                 if child.is_dir(follow_symlinks=False):
-                    stack.append(holder.enter_context(opened_fd(child.name, DIR_FLAGS, dir_fd=fd)))
+                    subdirs.append(child.name)
                 else:
                     total += 1
+            pending.append(subdirs)
+            while pending and not pending[-1]:
+                pending.pop()
+                if pending:
+                    parent_fd = os.open("..", DIR_FLAGS, dir_fd=fd)
+                    os.close(fd)
+                    fd = parent_fd
+            if not pending:
+                break
+            child_fd = os.open(pending[-1].pop(), DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = child_fd
+    finally:
+        os.close(fd)
     return total
 
 
