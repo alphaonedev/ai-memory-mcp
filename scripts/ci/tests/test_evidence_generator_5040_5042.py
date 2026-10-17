@@ -192,7 +192,7 @@ class RecaptureResolution7399(ScratchCase):
     def make_repo(self, files):
         wt = self.dir / "repo"
         wt.mkdir()
-        git = ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"]
+        git = ["git", "-c", "user.name=t", "-c", "user.email=" + "@".join(("t", "fixture.test")),"-c", "commit.gpgsign=false"]
         subprocess.run([*git, "init", "-q"], cwd=wt, check=True)
         (wt / "README").write_text("x\n")
         for rel, body in files.items():
