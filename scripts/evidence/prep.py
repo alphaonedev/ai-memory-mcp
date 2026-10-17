@@ -95,6 +95,10 @@ def main():
         for l in log.splitlines():
             print(f"COMMIT {l[:140]}")
     b_ids, t_ids = fed_ids(a.repo, base), fed_ids(a.repo, tip)
+    for end, rev, ids in (("base", base, b_ids), ("tip", tip, t_ids)):
+        if not ids:  # the federation surface always carries identifiers: an empty set is a wrong repo, rev or path (#7443)
+            sys.stderr.write(f"no AI_MEMORY_FED_* identifier under src/ at {end} {rev}: wrong repo, rev or path filter\n")
+            sys.exit(3)
     print(f"FED_IDS base={len(b_ids)} tip={len(t_ids)} added={sorted(t_ids - b_ids)} removed={sorted(b_ids - t_ids)}")
     return 0
 

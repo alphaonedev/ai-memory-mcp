@@ -105,40 +105,138 @@ FAIL_ROWS = tuple(re.compile(p) for p in (
 ))
 CHAIN_DONE = re.compile(r"^CHAIN_DONE aggregate_failures=(\d+)\b")
 SECTION_START = re.compile(r"^== CERT LEGS ")
-# Every aggregate row the runner writes (#7419): a nonzero one anywhere refuses the run.
-AGG_DONE = re.compile(r"^(CHAIN|BATTERY|PG|RP|BCG)_DONE aggregate_failures=(\d+)\b")
-EXIT_ROW = re.compile(r"^EXIT=(\d+) leg=")
+# Strict row grammar (#7438). Every row of these shapes must parse exactly, or the run is refused: a value the gate
+# cannot read as an integer is never read as green.
+INT_VALUE = re.compile(r"^-?[0-9]+$")
+AGG_PREFIX = re.compile(r"^(CHAIN|BATTERY|PG|RP|BCG)_DONE\b")
+AGG_ROW = re.compile(r"^(CHAIN|BATTERY|PG|RP|BCG)_DONE aggregate_failures=(\S*)(?: .*)?$")
+EXIT_ROW = re.compile(r"^EXIT=(\S*) leg=(\S+) aggregate_failures=(\S*)(?: .*)?$")
+PLAN_ROW = re.compile(r"^PLAN leg=([a-z]+) legs=([a-z]+(?:,[a-z]+)*)$")
+# The section row and the _DONE row every planned leg writes (#7437). `chain` has no section of its own.
+LEG_SECTION = {"battery": "== CERT LEGS", "removal": "== removal proof", "pg": "== pg coverage",
+               "bootstrap": "== bootstrap-cert-gate"}
+LEG_DONE = {"battery": "BATTERY", "removal": "RP", "pg": "PG", "bootstrap": "BCG", "chain": "CHAIN"}
+
+
+def int_field(line, value):
+    if not INT_VALUE.match(value):
+        raise Fatal(f"malformed row (an integer was expected, found {value!r}): {line.strip()[:120]}")
+    return value
+
+
+def parse_rows(lines):
+    """Strictly parse every EXIT= and <LEG>_DONE row; return [(index, kind, values)]. A row of those shapes that does
+    not match the grammar is refused, never ignored (#7438)."""
+    rows = []
+    for i, l in enumerate(lines):
+        if l.startswith("EXIT="):
+            m = EXIT_ROW.match(l)
+            if not m:
+                raise Fatal(f"malformed EXIT row: {l.strip()[:120]}")
+            rows.append((i, "EXIT", (int_field(l, m.group(1)), m.group(2), int_field(l, m.group(3)))))
+        elif AGG_PREFIX.match(l):
+            m = AGG_ROW.match(l)
+            if not m:
+                raise Fatal(f"malformed aggregate row: {l.strip()[:120]}")
+            rows.append((i, m.group(1), (int_field(l, m.group(2)),)))
+    return rows
+
+
+def check_block(lines, start, rows):
+    """One run_cert.py invocation (a `CONFIG ` row up to the next one): it must state its PLAN, and every planned leg
+    must have its section, its _DONE row, and the invocation its one EXIT=0 row (#7437)."""
+    at = f"invocation at line {start + 1}"
+    plans = [(i, l) for i, l in enumerate(lines) if l.startswith("PLAN ")]
+    if len(plans) != 1 or not PLAN_ROW.match(plans[0][1]):
+        raise Fatal(f"{at} needs exactly one well-formed `PLAN leg=<leg> legs=<a,b>` row, found {[l for _i, l in plans] or 'none'}")
+    leg, legs = PLAN_ROW.match(plans[0][1]).groups()
+    legs = legs.split(",")
+    unknown = [x for x in legs if x not in LEG_DONE]
+    if unknown or leg not in legs:
+        raise Fatal(f"{at}: PLAN names unknown legs {unknown} or omits its own leg {leg!r}")
+    exits = [r for r in rows if r[1] == "EXIT"]
+    if len(exits) != 1 or exits[0][2][1] != leg or exits[0][2][0] != "0":
+        raise Fatal(f"{at} (`{leg}`) needs exactly one `EXIT=0 leg={leg}` row, found "
+                    f"{[(r[2][0], r[2][1]) for r in exits] or 'none'}: the leg was killed or crashed before it finished")
+    for name in legs:
+        sect = [i for i, l in enumerate(lines) if name in LEG_SECTION and l.startswith(LEG_SECTION[name])]
+        done = [r for r in rows if r[1] == LEG_DONE[name]]
+        if (name in LEG_SECTION and len(sect) != 1) or len(done) != 1 or done[0][2][0] != "0" or \
+                (sect and sect[0] > done[0][0]):
+            raise Fatal(f"{at}: planned leg `{name}` needs one section row and one `{LEG_DONE[name]}_DONE "
+                        f"aggregate_failures=0` row after it (found {len(sect)} section / {len(done)} done); "
+                        "re-run with a fresh --outd")
 
 
 def check_run(outd):
-    """Refuse unless EVERY chain section of legs.log is green; return its COUNT_DIFF notes.
+    """Refuse unless EVERY invocation of legs.log is green and complete; return its COUNT_DIFF notes.
 
-    A chain section starts at a `== CERT LEGS` row (the whole file is one section when there is none). Each section
-    needs exactly one `CHAIN_DONE aggregate_failures=0` row (#5042, #7419), so a chain that was started and crashed or
-    was killed after a green one is refused. Independent of the sections, the run is refused on any nonzero
-    `<LEG>_DONE aggregate_failures=<n>` row, any `EXIT=<n> leg=` row with n > 0, and any failure row (FAIL_ROWS) before
-    or after the chain, so a failing gates row appended to an older shared legs.log still refuses; a PASSING gates row
-    never does. A re-run after a failure must use a fresh --outd.
+    A log written by this runner has one `CONFIG ` row per invocation, followed by its `PLAN` row; each invocation must
+    show a section row and a `<LEG>_DONE aggregate_failures=0` row for every planned leg and exactly one `EXIT=0 leg=`
+    row, so a standalone removal, pg or bootstrap leg (or a chain) killed after a green chain is refused (#7437). A log
+    with no `CONFIG ` row (an older shared legs.log) keeps the chain-section rule: each `== CERT LEGS` section needs
+    exactly one `CHAIN_DONE aggregate_failures=0` row (#5042, #7419). Independent of both, the run is refused on a
+    malformed EXIT / _DONE row (#7438), a nonzero `<LEG>_DONE` or `EXIT=` value (negative included) and any failure
+    row (FAIL_ROWS), before or after the chain, so a failing gates row appended to an older shared legs.log still
+    refuses; a PASSING gates row never does. A re-run after a failure must use a fresh --outd.
     """
     log = outd / "legs.log"
     if not log.exists():
         raise Fatal(f"{log} missing")
     lines = read(log).splitlines()
+    rows = parse_rows(lines)
     if not any(CHAIN_DONE.match(l) for l in lines):
         raise Fatal("legs.log has no `CHAIN_DONE aggregate_failures=0` line")
     bad = [l for l in lines if any(r.search(l) for r in FAIL_ROWS)]
-    bad += [l for l in lines if (m := AGG_DONE.match(l)) and m.group(2) != "0"]
-    bad += [l for l in lines if (m := EXIT_ROW.match(l)) and m.group(1) != "0"]
+    for i, kind, vals in rows:
+        if any(v != "0" for v in (vals if kind != "EXIT" else (vals[0], vals[2]))):
+            bad.append(lines[i])
     if bad:
         raise Fatal("run is not green:\n  " + "\n  ".join(bad))
+    cfg = [i for i, l in enumerate(lines) if l.startswith("CONFIG ")]
+    if cfg:
+        legacy = lines[: cfg[0]]
+        if any(SECTION_START.match(l) for l in legacy):  # rows an older runner wrote before the first CONFIG row
+            check_sections(legacy, 0)
+        for start, end in zip(cfg, cfg[1:] + [len(lines)]):
+            check_block(lines[start:end], start, [(i - start, k, v) for i, k, v in rows if start <= i < end])
+    else:
+        check_sections(lines, 0)
+    last = max(i for i, l in enumerate(lines) if CHAIN_DONE.match(l))
+    return [l.strip() for l in lines[: last + 1] if "COUNT_DIFF" in l]
+
+
+def check_sections(lines, offset):
+    """The pre-CONFIG rule: each `== CERT LEGS` section (the whole file when there is none) has one green CHAIN_DONE."""
     starts = [i for i, l in enumerate(lines) if SECTION_START.match(l)] or [0]
     for start, end in zip(starts, starts[1:] + [len(lines)]):
         dones = [l for l in lines[start:end] if CHAIN_DONE.match(l)]
         if len(dones) != 1 or CHAIN_DONE.match(dones[0]).group(1) != "0":
-            raise Fatal(f"chain section at line {start + 1} needs exactly one `CHAIN_DONE aggregate_failures=0` row, "
+            raise Fatal(f"chain section at line {offset + start + 1} needs exactly one `CHAIN_DONE aggregate_failures=0` row, "
                         f"found {dones or 'none'} (a crashed or killed chain; re-run with a fresh --outd)")
-    last = max(i for i, l in enumerate(lines) if CHAIN_DONE.match(l))
-    return [l.strip() for l in lines[: last + 1] if "COUNT_DIFF" in l]
+
+
+CONFIG_PATH = re.compile(r"(cargo_slot|slot_lock|targets|tmpdir|outd)=(.*?)(?= (?:cargo_slot|slot_lock|targets|tmpdir|outd|sources)=|$)")
+
+
+def config_paths(outd):
+    """Every path value of every `CONFIG ` row of legs.log: what the run really used (#7444)."""
+    log = outd / "legs.log"
+    found = set()
+    if log.exists():
+        for l in read(log).splitlines():
+            if l.startswith("CONFIG "):
+                found.update(v.strip() for _k, v in CONFIG_PATH.findall(l) if v.strip() not in ("", "none"))
+    return sorted(found)
+
+
+def sanitize_paths(text, wt_forms, run_paths):
+    """Replace the worktree (typed and resolved forms) with <repo-root> and every recorded run path with <run-path>,
+    longest first, so no prefix is left behind (#7444)."""
+    pairs = [(p, "<repo-root>") for p in wt_forms if p] + [(p, "<run-path>") for p in run_paths if p]
+    for p, rep in sorted(set(pairs), key=lambda x: len(x[0]), reverse=True):
+        text = text.replace(p, rep)
+    return text
 
 
 def test_results(outd, short, date):
@@ -189,11 +287,11 @@ def recapture_copy(wt, tip, short):
     return rel, src, body
 
 
-def leak_patterns(wt, outd, unresolved=()):
+def leak_patterns(wt, outd, unresolved=(), config=()):
     """Host strings refused in any captured file: the prefixes, the checkout, the home dir, the tmp dir the run used,
-    and both the resolved and the as-typed forms of --wt / --outd (#7415)."""
+    both the resolved and the as-typed forms of --wt / --outd (#7415), and every path of the run's CONFIG rows (#7444)."""
     pats = {str(wt), str(outd), str(Path.home()), str(REPO_ROOT), str(run_tmpdir()), *HOST_PATH_PREFIXES,
-            *(str(p) for p in unresolved)}
+            *(str(p) for p in unresolved), *(str(p) for p in config)}
     host = socket.gethostname()
     if host and len(host) > 3:
         pats.add(host)
@@ -259,14 +357,15 @@ def main():
         bcg = read(outd / "bootstrap-cert-gate.log")
         if "CERT-BOOTSTRAP GATE: PASS" not in bcg:
             raise Fatal("bootstrap-cert-gate.log has no `CERT-BOOTSTRAP GATE: PASS`")
-        files["bootstrap-cert-gate.log"] = bcg.replace(str(wt), "<repo-root>").encode()
+        run_paths = config_paths(outd)
+        files["bootstrap-cert-gate.log"] = sanitize_paths(bcg, [str(wt), typed[0]], run_paths).encode()
         files["test-results.txt"] = test_results(outd, short, a.date).encode()
         recap_rel, shipped, recap = recapture_copy(wt, a.tip, short)
         recap_name = "recapture-posture" + Path(recap_rel).suffix
         files[recap_name] = recap.encode()
         files["SANITIZATION.md"] = san.encode()
 
-        pats = leak_patterns(wt, outd, unresolved=typed)
+        pats = leak_patterns(wt, outd, unresolved=typed, config=run_paths)
         leaks = []
         for name, data in files.items():
             h = hits(data.decode("utf-8", "replace"), pats)

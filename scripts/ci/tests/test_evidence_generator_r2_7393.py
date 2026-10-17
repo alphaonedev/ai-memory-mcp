@@ -117,7 +117,7 @@ class MissingWrapper7420(ScratchCase):
         (outd / "legs.log").write_text(CHAIN_SECTION)  # the reviewer's live repro: a green chain first
         missing = self.dir / "no-such-wrapper"
         code, output = self.run_main(outd, wt, tip, "--cargo-slot", str(missing))
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 64)  # #7441: refused by the preflight, before any leg
         self.assertNotIn("Traceback", output)
         self.assertIn("no-such-wrapper", output)  # actionable: names the wrapper that could not start
         text = (outd / "legs.log").read_text()
@@ -246,14 +246,18 @@ class TipTreeScripts7411(ScratchCase):
         (wt / EXPIRY_PY).write_text("raise SystemExit(0)\n")  # untracked look-alike
         r = rc.Run(argparse.Namespace(tip=tip, wt=str(wt), outd=str(self.dir / "o"), leg="gates",
                                       targets=str(self.dir / "t"), tmpdir=str(self.dir / "tmp")))
-        self.assertEqual(r.pick_expiry(), ["bash", EXPIRY_SH])
+        with self.assertRaises(FileNotFoundError):  # #7439: the tracked .sh is not a fallback either
+            r.pick_expiry()
 
     def test_expiry_gate_prefers_the_tracked_py_7411(self):
         rc = load("run_cert")
         wt, tip = make_repo(self.dir / "repo", {EXPIRY_PY: "x = 1\n", EXPIRY_SH: "exit 0\n"})
         r = rc.Run(argparse.Namespace(tip=tip, wt=str(wt), outd=str(self.dir / "o"), leg="gates",
                                       targets=str(self.dir / "t"), tmpdir=str(self.dir / "tmp")))
-        self.assertEqual(r.pick_expiry(), [sys.executable, EXPIRY_PY])
+        argv = r.pick_expiry()
+        self.assertEqual(argv[0], sys.executable)
+        self.assertEqual(Path(argv[1]).read_text(), "x = 1\n")  # #7439: a copy of the blob
+        r.drop_expiry()
 
 
 class ShellRetarget7412(ScratchCase):

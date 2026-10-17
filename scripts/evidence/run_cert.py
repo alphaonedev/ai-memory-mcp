@@ -5,15 +5,19 @@ Subcommands (every one asserts the worktree HEAD == --tip and a clean tracked tr
   battery    release builds (default; --no-default-features sqlcipher,sal), posture recapture (4 legs),
              8 named integration bins + 3 lib slices (default features), each via cargo-slot.py
   pg         #4434 coverage leg under --features sal-postgres (1 bin + 1 lib slice), via cargo-slot.py
-  removal    scripts/check-cert-removal-proof.sh BARE under flock slot-3, nice 15, ionice -c3, CARGO_BUILD_JOBS=2;
-             writes cert-alone.out; then --force-restore and a dirty check
-  bootstrap  scripts/check-bootstrap-cert-gate.sh self-build path under the same flock slot
+  removal    scripts/check-cert-removal-proof.sh BARE under the optional --slot-lock flock, nice 15,
+             ionice -c3 when installed, CARGO_BUILD_JOBS=2; writes cert-alone.out; then --force-restore and a dirty check
+  bootstrap  scripts/check-bootstrap-cert-gate.sh self-build path under the same optional flock
   chain      battery; if green: removal, pg, bootstrap (each runs whatever the previous one returned)
   gates      on the CERT COMMIT (HEAD = one commit on top of --tip): the cargo-free gates, the scope gate
              (only the cert doc + its evidence dir), %G? = G; pushes --push-branch only when fails == 0
 
-Every outcome is a line in OUTD/legs.log (the gates leg: OUTD/gates.log, #5042); exit status is the aggregate
-(0 = every leg green). Paths default to the checkout (.local-runs/); see the --cargo-slot/--slot-lock/--targets/--tmpdir options.
+Every outcome is a line in OUTD/legs.log (the gates leg: OUTD/gates.log, #5042); each invocation starts with a CONFIG
+row (the paths used and where each came from) and a PLAN row (the legs it promises) and ends with an EXIT row, so a
+killed invocation is visible to build_bundle.check_run (#7437). Exit status: 0 = every leg green, 1 = a leg failed,
+exit 64 = a refused configuration (a bad option, a path under a tmp root or on a tmpfs, a missing wrapper, flock or
+timeout: a RED preflight row and an EXIT row are written and no leg starts), 127 = a leg command that could not
+start (a RED launch row). Paths default to the checkout (.local-runs/); see the --cargo-slot/--slot-lock/--targets/--tmpdir options.
 """
 import argparse
 import datetime
@@ -58,6 +62,11 @@ RESULT_RE = re.compile(r"^test result: (\w+)\. (\d+) passed; (\d+) failed", re.M
 RECAPTURE_CANDIDATES = ("scripts/recapture-cert-3607-posture.py", "scripts/recapture-cert-3607-posture.sh")
 EXPIRY_PY = "scripts/check_cert_expiry.py"
 EXPIRY_SH = "scripts/check-cert-expiry.sh"
+# The legs one invocation promises (the PLAN row); build_bundle.check_run holds each invocation to its plan (#7437).
+PLANS = {"battery": ("battery",), "pg": ("pg",), "removal": ("removal",), "bootstrap": ("bootstrap",),
+         "chain": ("battery", "removal", "pg", "bootstrap", "chain")}
+CARGO_LEGS = ("battery", "pg", "chain")
+LOW_PRIORITY_LEGS = ("removal", "bootstrap", "chain")
 # Built from parts so this script carries no tmpfs path literal (#5040).
 TMP_ROOTS = tuple("/" + part for part in ("tmp", "var/tmp", "private/tmp"))
 
@@ -73,6 +82,11 @@ def anchored(p):
     return q if q.is_absolute() else REPO_ROOT / q
 
 
+def unescape_mount(field):
+    """/proc/mounts writes space, tab, newline and backslash in a mount point as \\040, \\011, \\012, \\134 (#7442)."""
+    return re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), field)
+
+
 def is_tmpfs_path(path, mounts=None):
     """True for /tmp, /var/tmp, /private/tmp and anything on a tmpfs/ramfs mount (project rule: no tmpfs scratch)."""
     p = os.path.realpath(os.path.normpath(str(path)))
@@ -86,9 +100,22 @@ def is_tmpfs_path(path, mounts=None):
     best = None
     for line in mounts.splitlines():
         f = line.split()
-        if len(f) >= 3 and (p == f[1] or p.startswith(f[1].rstrip("/") + "/")) and (best is None or len(f[1]) >= len(best[0])):
-            best = (f[1], f[2])
+        if len(f) < 3:
+            continue
+        mp = unescape_mount(f[1])
+        if (p == mp or p.startswith(mp.rstrip("/") + "/")) and (best is None or len(mp) >= len(best[0])):
+            best = (mp, f[2])
     return best is not None and best[1] in ("tmpfs", "ramfs")
+
+
+def choose(arg, env_name, default):
+    """(anchored value, source) for one configured path: the option, else the environment, else the default (#7441).
+    An unset optional value ("" default) stays ""."""
+    if arg:
+        return anchored(arg), "arg"
+    if os.environ.get(env_name):
+        return anchored(os.environ[env_name]), "env"
+    return (anchored(default) if default else ""), "default"
 
 
 def run_tmpdir():
@@ -100,6 +127,27 @@ def tracked_at(wt, rev, rel):
     return subprocess.run(["git", "-C", str(wt), "cat-file", "-e", f"{rev}:{rel}"], capture_output=True).returncode == 0
 
 
+def tree_entry(wt, rev, rel):
+    """(mode, type, sha) of rel in rev's tree, or None when it is not tracked there."""
+    r = subprocess.run(["git", "-C", str(wt), "ls-tree", rev, "--", rel], capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    meta = r.stdout.strip().split("\t", 1)[0].split()
+    return meta[0], meta[1], meta[2]
+
+
+def blob_bytes(wt, rev, rel):
+    """(sha, bytes) of the regular-file blob rev:rel. Never the disk copy: a skip-worktree or assume-unchanged file
+    cannot stand in for it, and a symlink (mode 120000) or submodule is refused (#7439)."""
+    e = tree_entry(wt, rev, rel)
+    if e is None:
+        raise FileNotFoundError(f"{rel} is not tracked at {rev}")
+    mode, kind, sha = e
+    if kind != "blob" or mode not in ("100644", "100755"):
+        raise ValueError(f"{rel} at {rev} is a {kind} of mode {mode}; only a regular tracked file is run")
+    return sha, subprocess.run(["git", "-C", str(wt), "cat-file", "blob", sha], capture_output=True, check=True).stdout
+
+
 def pick_recapture(wt, tip):
     """The posture recapture script of the TIP TREE: the Python port first, the shell script second (#7399). An
     untracked or modified file on disk can never stand in for the tip's (#7411)."""
@@ -109,11 +157,17 @@ def pick_recapture(wt, tip):
     raise FileNotFoundError("no recapture script at the tip; looked for " + " then ".join(RECAPTURE_CANDIDATES))
 
 
-def recapture_source(wt, tip):
-    """(relpath, source) of the tip's recapture script, read from the tip blob, not the disk."""
+def recapture_blob(wt, tip):
+    """(relpath, source, blob sha) of the tip's recapture script, read from the tip blob, not the disk."""
     rel = pick_recapture(wt, tip)
-    r = subprocess.run(["git", "-C", str(wt), "show", f"{tip}:{rel}"], capture_output=True, check=True)
-    return rel, r.stdout.decode("utf-8")
+    sha, data = blob_bytes(wt, tip, rel)
+    return rel, data.decode("utf-8"), sha
+
+
+def recapture_source(wt, tip):
+    """(relpath, source) of the tip's recapture script."""
+    rel, src, _sha = recapture_blob(wt, tip)
+    return rel, src
 
 
 def retarget_shell(src, ev, fix):
@@ -127,21 +181,25 @@ class Run:
     def __init__(self, a):
         self.tip = a.tip
         self.wt = Path(a.wt)
+        self.leg = a.leg
         self.outd = Path(a.outd)
         # #5042: the gates leg runs after the chain and writes its own artifact, so the RUN-RECORD legs-log hash and
         # the bundle builder's chain gate read the chain's rows alone.
         self.log = self.outd / ("gates.log" if a.leg == "gates" else "legs.log")
-        # #7421: every configured path resolves against this checkout; #7413: none may sit on a tmpfs.
-        self.targets = anchored(getattr(a, "targets", None) or os.environ.get("CERT_TARGETS") or DEFAULT_TARGETS)
-        self.tmpdir = anchored(getattr(a, "tmpdir", None) or os.environ.get("CERT_TMPDIR") or DEFAULT_TMPDIR)
-        for what, path in (("--targets / CERT_TARGETS", self.targets), ("--tmpdir / CERT_TMPDIR", self.tmpdir)):
+        # #7421: every configured path resolves against this checkout; #7413 / #7440: none may sit on a tmpfs.
+        self.targets, src_t = choose(getattr(a, "targets", None), "CERT_TARGETS", DEFAULT_TARGETS)
+        self.tmpdir, src_d = choose(getattr(a, "tmpdir", None), "CERT_TMPDIR", DEFAULT_TMPDIR)
+        slot, src_s = choose(getattr(a, "cargo_slot", None), "CERT_CARGO_SLOT", "")
+        lock, src_l = choose(getattr(a, "slot_lock", None), "CERT_SLOT_LOCK", "")
+        self.sources = {"cargo_slot": src_s, "slot_lock": src_l, "targets": src_t, "tmpdir": src_d, "outd": "arg"}
+        for what, path in (("--targets / CERT_TARGETS", self.targets), ("--tmpdir / CERT_TMPDIR", self.tmpdir),
+                           ("--outd", Path(os.path.abspath(self.outd)))):
             if is_tmpfs_path(path):
                 raise ConfigError(f"{what} = {path} is on a tmpfs or under a tmp root; choose a persistent disk path")
-        slot = getattr(a, "cargo_slot", None) or os.environ.get("CERT_CARGO_SLOT") or ""
-        self.cargo_slot = str(anchored(slot)) if slot else ""
+        self.cargo_slot = str(slot) if slot else ""
         self.cargo = [self.cargo_slot, "cargo"] if slot else ["cargo"]
-        lock = getattr(a, "slot_lock", None) or os.environ.get("CERT_SLOT_LOCK") or ""
-        self.slot_lock = str(anchored(lock)) if lock else ""
+        self.slot_lock = str(lock) if lock else ""
+        self.expiry_copy = None
         self.outd.mkdir(parents=True, exist_ok=True)
         self.targets.mkdir(parents=True, exist_ok=True)
         self.tmpdir.mkdir(parents=True, exist_ok=True)
@@ -168,9 +226,27 @@ class Run:
         self.note(line)
 
     def config_row(self):
-        """The wrapper and paths actually used, one row per invocation (#7413)."""
+        """The wrapper and paths actually used and where each came from, one row per invocation (#7413, #7441)."""
+        srcs = ",".join(f"{k}:{v}" for k, v in self.sources.items())
         return (f"CONFIG cargo_slot={self.cargo_slot or 'none'} slot_lock={self.slot_lock or 'none'} "
-                f"targets={self.targets} tmpdir={self.tmpdir}")
+                f"targets={self.targets} tmpdir={self.tmpdir} outd={self.outd} sources={srcs}")
+
+    def plan_row(self, leg):
+        """The legs this invocation promises; check_run holds the log to it (#7437)."""
+        return f"PLAN leg={leg} legs={','.join(PLANS[leg])}"
+
+    def preflight(self):
+        """Fail closed BEFORE any leg runs when a tool the leg needs is unusable (#7441)."""
+        if self.leg != "gates" and self.cargo_slot:
+            w = Path(self.cargo_slot)
+            if not (w.is_file() and os.access(w, os.X_OK)):
+                raise ConfigError(f"--cargo-slot / CERT_CARGO_SLOT = {w} is not an executable file")
+        if self.leg in LOW_PRIORITY_LEGS:
+            for tool in ("timeout", "nice"):
+                if not shutil.which(tool):
+                    raise ConfigError(f"`{tool}` is not installed; the {self.leg} leg runs its gate script under it")
+            if self.slot_lock and not shutil.which("flock"):
+                raise ConfigError(f"`flock` is not installed but --slot-lock / CERT_SLOT_LOCK = {self.slot_lock} is set")
 
     def git(self, *args):
         return subprocess.run(["git", *args], cwd=self.wt, capture_output=True, text=True).stdout.strip()
@@ -278,11 +354,11 @@ class Run:
 
     def posture(self, dbin, sbin):
         try:
-            rel, src = recapture_source(self.wt, self.tip)
-        except (FileNotFoundError, subprocess.CalledProcessError, UnicodeDecodeError) as e:
+            rel, src, blob = recapture_blob(self.wt, self.tip)
+        except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as e:
             self.fail(f"  RED posture recapture script: {e}")
             return
-        self.note(f"posture script {rel} (tip blob)")
+        self.note(f"posture script {rel} blob={blob} (tip blob)")
         ev, fix = self.outd / "evidence", self.outd / "fix"
         if rel.endswith(".py"):
             # Python form (#7378): ROOT derives from __file__; retarget the two assignments, nothing else.
@@ -320,6 +396,7 @@ class Run:
     def pg(self):
         if not self.assert_tree(self.tip, "PG"):
             return self.bad
+        self.note(f"== pg coverage leg {self.now()}")
         env = {"CARGO_TARGET_DIR": str(self.targets / "cert7-pg")}
         out = self.outd / f"test-pg-{PG_BIN[0]}.log"
         rc = self.run([*self.cargo, "test", "-j", "6", "--features", "sal-postgres", "--test", PG_BIN[0]], out, env)
@@ -393,6 +470,12 @@ class Run:
 
     # ---- cert-commit gates --------------------------------------------------------------------------------
     def gates(self, prior_bind, push_branch, parent="", also_evidence=()):
+        try:
+            return self._gates(prior_bind, push_branch, parent, also_evidence)
+        finally:
+            self.drop_expiry()
+
+    def _gates(self, prior_bind, push_branch, parent, also_evidence):
         head = self.git("rev-parse", "HEAD")
         if self.dirty_tracked():
             self.fail("GATES DIRTY")
@@ -409,9 +492,12 @@ class Run:
         if stray or CERT_DOC not in touched:
             self.fail("  RED scope: the cert commit may touch only the cert doc and its own evidence dir")
         gl = self.outd / "g"
-        # The expiry gate was ported from check-cert-expiry.sh to check_cert_expiry.py (#6137); a gated worktree
-        # older than the port still has the shell script.
-        expiry = self.pick_expiry()
+        # The expiry gate is the Python port (#6137), taken from the gated commit's blob, never the disk (#7439).
+        try:
+            expiry = self.pick_expiry()
+        except (FileNotFoundError, ValueError, subprocess.CalledProcessError) as e:
+            self.fail(f"  RED expiry gate: {e}")
+            return self.bad
         checks = [
             ("cert-expiry-upstream", expiry, {}),
             (f"cert-expiry-{prior_bind[:9]}", expiry, {"CERT_EXPIRY_BASE": prior_bind}),
@@ -444,12 +530,20 @@ class Run:
         return self.bad
 
     def pick_expiry(self):
-        """The cert-expiry gate of the gated commit's TREE: the Python port when HEAD tracks it, else the shell script.
-        The tree is clean (dirty_tracked), so the tracked file on disk is the blob; an untracked look-alike is never
-        chosen (#7411)."""
-        if tracked_at(self.wt, "HEAD", EXPIRY_PY):
-            return [sys.executable, EXPIRY_PY]
-        return ["bash", EXPIRY_SH]
+        """argv of the cert-expiry gate, run from a copy of HEAD's blob of scripts/check_cert_expiry.py (#7439). No shell
+        fallback; a missing or non-regular (symlink) entry raises. The copy lives beside the checkout's scripts because
+        the gate derives its repo root from its own path; it is untracked and removed by drop_expiry()."""
+        sha, data = blob_bytes(self.wt, "HEAD", EXPIRY_PY)
+        dest = self.wt / "scripts" / ".cert-expiry-gate.py"
+        dest.write_bytes(data)
+        self.expiry_copy = dest
+        self.note(f"{EXPIRY_PY} blob={sha} (HEAD tree; run from a copy of the blob)")
+        return [sys.executable, str(dest)]
+
+    def drop_expiry(self):
+        if self.expiry_copy is not None:
+            self.expiry_copy.unlink(missing_ok=True)
+            self.expiry_copy = None
 
     def push_gated(self, head, branch):
         """Push the gated commit; a failed push, or a remote ref that is not the gated head, is a failure (#7422)."""
@@ -491,6 +585,14 @@ def main():
         print(f"run_cert: {e}", file=sys.stderr)
         return 64
     r.note(r.config_row())
+    r.note(r.plan_row(a.leg))
+    try:
+        r.preflight()
+    except ConfigError as e:
+        print(f"run_cert: {e}", file=sys.stderr)
+        r.fail(f"  RED preflight: {e}")
+        r.note(f"EXIT=1 leg={a.leg} aggregate_failures={r.bad} {r.now()}")
+        return 64
     if a.leg == "gates":
         bad_ids = [s for s in a.also_evidence if not re.fullmatch(r"[0-9a-f]{9}", s)]
         if bad_ids:
