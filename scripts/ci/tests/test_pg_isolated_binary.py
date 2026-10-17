@@ -420,6 +420,126 @@ class TierSteps(unittest.TestCase):
         self.assertFalse([s for s in rec.sql() if 'FORCE' in s])
 
 
+class FakePg:
+    """A tiny stateful server behind psql: databases, template flag, sessions.
+
+    Understands exactly the statements setup/teardown issue. ``fail`` maps a
+    SQL prefix to an error text (rc 2). Every statement is logged in ``log``.
+    """
+
+    def __init__(self, existing=None, fail=None):
+        self.dbs = dict(existing or {})
+        self.fail = dict(fail or {})
+        self.log = []
+
+    def __call__(self, argv, kw):
+        sql = argv[argv.index('-c') + 1] if '-c' in argv else ''
+        if 'max_connections' in sql:
+            return Result(0, '1000|3|0|10\n')
+        self.log.append(sql)
+        for prefix, text in self.fail.items():
+            if sql.startswith(prefix):
+                return Result(2, '', text)
+        found = re.search(r'DATABASE "([^"]+)"', sql)
+        name = found.group(1) if found else None
+        if sql.startswith('CREATE DATABASE'):
+            if name in self.dbs:
+                return Result(2, '', 'ERROR:  database "%s" already exists' % name)
+            self.dbs[name] = {'template': False, 'sessions': 0}
+        elif sql.startswith('ALTER DATABASE'):
+            if name not in self.dbs:
+                return Result(2, '', 'ERROR:  database "%s" does not exist' % name)
+            self.dbs[name]['template'] = 'IS_TEMPLATE true' in sql
+        elif sql.startswith('DROP DATABASE'):
+            db = self.dbs.get(name)
+            if db and db['sessions']:
+                return Result(2, '', 'ERROR:  database "%s" is being accessed by other users' % name)
+            self.dbs.pop(name, None)
+        return Result()
+
+    def touched(self, name):
+        return [s for s in self.log if '"%s"' % name in s]
+
+
+class TemplateOwnership(unittest.TestCase):
+    """#7127: setup owns a template only by a successful CREATE."""
+
+    DB = 'ai_memory_test_ci_9_1_x'
+
+    def run_setup(self, pg, db=None):
+        with unittest.mock.patch.object(pib.subprocess, 'run', Recorder(pg)):
+            return pib.setup(BASE, db or self.DB, 8)
+
+    def assert_foreign_untouched(self, pg, before):
+        self.assertEqual(pg.dbs, before)
+        self.assertFalse([s for s in pg.log if s.startswith(('ALTER', 'DROP'))],
+                         'no ALTER or DROP may run against a database setup did not create')
+        self.assertFalse([s for s in pg.log if 'FORCE' in s or 'EXTENSION' in s])
+
+    def test_idle_foreign_template_survives_a_name_collision(self):
+        pg = FakePg({TPL: {'template': True, 'sessions': 0}})
+        before = {k: dict(v) for k, v in pg.dbs.items()}
+        with self.assertRaises(pib.WrapperError) as ctx:
+            self.run_setup(pg)
+        self.assertIn('already exists', str(ctx.exception))
+        self.assert_foreign_untouched(pg, before)
+
+    def test_active_foreign_template_survives_a_name_collision(self):
+        pg = FakePg({TPL: {'template': True, 'sessions': 3}})
+        before = {k: dict(v) for k, v in pg.dbs.items()}
+        with self.assertRaises(pib.WrapperError):
+            self.run_setup(pg)
+        self.assert_foreign_untouched(pg, before)
+
+    def test_plain_foreign_database_at_the_name_survives(self):
+        pg = FakePg({TPL: {'template': False, 'sessions': 0}})
+        before = {k: dict(v) for k, v in pg.dbs.items()}
+        with self.assertRaises(pib.WrapperError):
+            self.run_setup(pg)
+        self.assert_foreign_untouched(pg, before)
+
+    def test_permission_refusal_claims_nothing_and_drops_nothing(self):
+        pg = FakePg(fail={'CREATE DATABASE': 'ERROR:  permission denied to create database'})
+        with self.assertRaises(pib.WrapperError) as ctx:
+            self.run_setup(pg)
+        self.assertIn('permission denied', str(ctx.exception))
+        self.assertEqual(pg.dbs, {})
+        self.assertFalse([s for s in pg.log if s.startswith(('ALTER', 'DROP', 'CREATE EXT'))])
+
+    def test_owned_setup_then_teardown_leaves_nothing(self):
+        pg = FakePg()
+        tpl = self.run_setup(pg)
+        self.assertEqual(tpl, TPL)
+        self.assertEqual(pg.dbs, {TPL: {'template': True, 'sessions': 0}})
+        self.assertFalse([s for s in pg.log if s.startswith('DROP')], 'setup never drops on success')
+        with unittest.mock.patch.object(pib.subprocess, 'run', Recorder(pg)):
+            pib.teardown(BASE, self.DB, RUN)
+        self.assertEqual(pg.dbs, {})
+        self.assertFalse([s for s in pg.log if 'FORCE' in s])
+
+    def test_failure_after_create_drops_only_the_template_it_created(self):
+        other = {'template': True, 'sessions': 0}
+        pg = FakePg({'unrelated_tpl': dict(other)}, fail={'CREATE EXTENSION': 'ERROR:  no age'})
+        with self.assertRaises(pib.WrapperError) as ctx:
+            self.run_setup(pg)
+        self.assertIn('no age', str(ctx.exception), 'the primary error is preserved')
+        self.assertEqual(pg.dbs, {'unrelated_tpl': other})
+        self.assertEqual(pg.touched('unrelated_tpl'), [])
+        self.assertFalse([s for s in pg.log if 'FORCE' in s])
+
+    def test_overlong_names_that_would_truncate_onto_one_template_are_refused(self):
+        a = 'x' * 59 + 'A'
+        b = 'x' * 59 + 'B'
+        pg = FakePg()
+        for name in (a, b, 'x' * 63):
+            with self.assertRaises(pib.WrapperError):
+                self.run_setup(pg, name)
+        self.assertEqual(pg.log, [], 'refused before any statement reaches the server')
+        self.assertEqual(pib.template_name('x' * 59), 'x' * 59 + '_tpl')
+        with self.assertRaises(pib.WrapperError):
+            pib.template_name(a)
+
+
 class RunOne(unittest.TestCase):
     def test_cargo_runs_against_held_clone_then_clone_is_dropped(self):
         r = runner()
