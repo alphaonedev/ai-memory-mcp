@@ -1195,6 +1195,19 @@ jobs:
             echo "::notice::[#6383] per-binary Postgres isolation ON: template ${CI_FED_DB}_tpl"
           fi
 
+      # #7485 / #7457 — the LiveEndToEnd cells of the Postgres isolation wrapper need a real server, and
+      # this leg is the one that has AI_MEMORY_TEST_POSTGRES_URL (minted above). The flag turns a missing
+      # URL or psql into a failure instead of a silent skip.
+      - name: Run the pg_isolated_binary live cells (enterprise-fed legs only)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.tier == 'enterprise-fed'
+        shell: bash
+        env:
+          AI_MEMORY_TEST_PG_LIVE_REQUIRED: "1"
+        run: |
+          set -euo pipefail
+          cd scripts/ci/tests
+          python3 -m unittest -v test_pg_isolated_binary.LiveEndToEnd
+
       # Isolation shot after e380ca5d: mold + debuginfo=0 linked and RAN
       # the sqlite suite, then `hot_swap_llm_2166` SIGSEGV'd. That binary
       # does NOT load candle weights (hermetic OllamaClient, #2166/#2172);

@@ -50,6 +50,7 @@ import argparse
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -89,17 +90,18 @@ CONNECT_TIMEOUT_SECS = '30'
 # decision: one psql call (CREATE ... TEMPLATE copies a database, DROP waits on sessions) gets 300 s, well above
 # any healthy statement, so only a stalled server or a held lock trips it (#7429).
 PSQL_TIMEOUT_SECS = 300.0
-# decision: the server cancels its own statement (statement_timeout and lock_timeout through PGOPTIONS) over
-# Popen+SIGINT, because the server cap still fires when psql is killed, hung or cut off, while a cancel request
-# needs a live client (#7447). The statement cap is the client wall time minus the effective connect timeout
-# (the clock starts before the connection exists) minus a fixed margin, so it always fires before the client
-# kill; lock_timeout sits a fixed gap below it so a lock wait reports as a lock timeout, not a statement one
-# (#7453). A tighter caller value for either setting is kept (#7454).
+# decision: the server cancels its own statement over Popen+SIGINT, because a server-side cap still fires when
+# psql is killed, hung or cut off, while a cancel request needs a live client (#7447). The cap is applied by a
+# first `DO` statement in the same psql session (set_config, session level) and NOT through PGOPTIONS, because
+# the server then reads every caller value itself (case, units, hex, octal, fractions, role- and database-level
+# defaults) and the cap is the least non-zero of that value and ours: nothing is parsed here that the server
+# could read differently (#7454, #7477, #7478, #7479, #7484). The statement cap is the client wall time minus
+# the whole connect budget (see _connect_budget_secs) minus a fixed margin, so it fires before the client
+# kill; lock_timeout is clamped a fixed gap below the effective statement_timeout (#7453, #7480).
 PSQL_CAP_MARGIN_SECS = 10.0
 PSQL_LOCK_GAP_SECS = 5.0
-_CAPPED_SETTINGS = ('statement_timeout', 'lock_timeout')
-_TIMEOUT_UNIT_MS = {'us': 0.001, 'ms': 1.0, 's': 1000.0, 'min': 60000.0, 'h': 3600000.0, 'd': 86400000.0}
-_TIMEOUT_RE = re.compile(r'^\s*([0-9]+(?:\.[0-9]+)?)\s*([a-z]*)\s*$')
+LIBPQ_MIN_CONNECT_SECS = 2
+_DIGITS_RE = re.compile(r'[0-9]+')
 IN_USE_TEXT = 'being accessed by other users'
 EXIT_USAGE = 2
 EXIT_MINT = 3
@@ -290,88 +292,52 @@ def libpq_env(url: str) -> Dict[str, str]:
     return env
 
 
-def _timeout_ms(value: str) -> Optional[float]:
-    """A postgres timeout value (bare number = ms, or with a unit) in ms; None when unparsable."""
-    found = _TIMEOUT_RE.match(value)
-    if not found:
-        return None
-    factor = _TIMEOUT_UNIT_MS.get(found.group(2) or 'ms')
-    return None if factor is None else float(found.group(1)) * factor
-
-
-def _option_tokens(options: str) -> List[str]:
-    """Split a PGOPTIONS string on unescaped whitespace, resolving backslash escapes."""
-    tokens: List[str] = []
-    cur: List[str] = []
-    escaped = False
-    for ch in options:
-        if escaped:
-            cur.append(ch)
-            escaped = False
-        elif ch == '\\':
-            escaped = True
-        elif ch.isspace():
-            if cur:
-                tokens.append(''.join(cur))
-                cur = []
-        else:
-            cur.append(ch)
-    if cur:
-        tokens.append(''.join(cur))
-    return tokens
-
-
-def _caller_timeouts(options: str) -> Dict[str, Optional[float]]:
-    """The caller's last statement_timeout / lock_timeout from an options string (ms; None = unparsable)."""
-    found: Dict[str, Optional[float]] = {}
-    tokens = _option_tokens(options)
-    for i, tok in enumerate(tokens):
-        assignment = None
-        if tok == '-c' and i + 1 < len(tokens):
-            assignment = tokens[i + 1]
-        elif tok.startswith('-c') and len(tok) > 2:
-            assignment = tok[2:]
-        elif tok.startswith('--'):
-            assignment = tok[2:]
-        if assignment and '=' in assignment:
-            name, value = assignment.split('=', 1)
-            name = name.strip().replace('-', '_')
-            if name in _CAPPED_SETTINGS:
-                found[name] = _timeout_ms(value)
-    return found
-
-
-def _tighter(caller: Optional[float], cap_ms: int) -> int:
-    """min(caller, cap) in whole ms; 0 (unlimited) and an unparsable value take the cap."""
-    if not caller or caller <= 0:
-        return cap_ms
-    return min(cap_ms, max(1, int(caller + 0.999)))
-
-
-def _pg_env(url: str, bounded: bool = False) -> Dict[str, str]:
-    """The process env with inherited PG* removed and this URL's libpq vars.
-
-    ``bounded`` appends the server-side statement and lock timeouts to PGOPTIONS (keeping a URL ``options``
-    value and any tighter caller timeout), so a statement outlives neither the client wall time nor a killed
-    client (#7447, #7453, #7454).
-    """
+def _pg_env(url: str) -> Dict[str, str]:
+    """The process env with inherited PG* removed and this URL's libpq vars."""
     env = {k: v for k, v in os.environ.items() if not k.startswith('PG')}
     env.update(libpq_env(url))
-    if bounded:
-        connect = env.get('PGCONNECT_TIMEOUT', '')
-        if not connect.isdigit() or int(connect) <= 0:
-            raise WrapperError('connect_timeout %r must be a positive whole number of seconds so the server-side '
-                               'statement cap can be sized under the psql limit' % connect)
-        cap_ms = int((PSQL_TIMEOUT_SECS - int(connect) - PSQL_CAP_MARGIN_SECS) * 1000)
-        lock_ms = cap_ms - int(PSQL_LOCK_GAP_SECS * 1000)
-        if lock_ms <= 0:
-            raise WrapperError('connect_timeout=%s leaves no room for a server-side statement cap under the %g s '
-                               'psql limit' % (connect, PSQL_TIMEOUT_SECS))
-        caller = _caller_timeouts(env.get('PGOPTIONS', ''))
-        caps = '-c statement_timeout=%dms -c lock_timeout=%dms' % (
-            _tighter(caller.get('statement_timeout'), cap_ms), _tighter(caller.get('lock_timeout'), lock_ms))
-        env['PGOPTIONS'] = ('%s %s' % (env['PGOPTIONS'], caps)) if env.get('PGOPTIONS') else caps
     return env
+
+
+def _connect_budget_secs(env: Dict[str, str]) -> int:
+    """Worst-case seconds libpq may spend connecting: connect_timeout (floored at 2 s) per resolved address,
+    doubled when sslmode may retry without TLS (#7482). Raises on a value that is not a plain positive number."""
+    connect = env.get('PGCONNECT_TIMEOUT', '')
+    if _DIGITS_RE.fullmatch(connect) is None or int(connect) <= 0:
+        raise WrapperError('connect_timeout %r must be a positive whole number of seconds so the server-side '
+                           'statement cap can be sized under the psql limit' % connect)
+    host = env.get('PGHOST', '')
+    if env.get('PGHOSTADDR') or not host or host.startswith('/'):
+        return max(int(connect), LIBPQ_MIN_CONNECT_SECS)
+    try:
+        port = int(env.get('PGPORT') or 5432)
+        addresses = len({info[4] for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)}) or 1
+    except (OSError, ValueError):
+        addresses = 1
+    tries = 2 if env.get('PGSSLMODE', 'prefer') in ('prefer', 'allow') else 1
+    return max(int(connect), LIBPQ_MIN_CONNECT_SECS) * addresses * tries
+
+
+def server_caps_sql(env: Dict[str, str]) -> str:
+    """A ``DO`` statement setting session statement_timeout and lock_timeout to the least non-zero of the
+    value the server already resolved for this session (startup options, role and database defaults) and the
+    wrapper cap; lock_timeout is clamped a gap below the effective statement_timeout (#7453, #7480, #7484)."""
+    cap_ms = int((PSQL_TIMEOUT_SECS - _connect_budget_secs(env) - PSQL_CAP_MARGIN_SECS) * 1000)
+    gap_ms = int(PSQL_LOCK_GAP_SECS * 1000)
+    lock_cap_ms = cap_ms - gap_ms
+    if lock_cap_ms <= 0:
+        raise WrapperError('the connect budget leaves no room for a server-side statement cap under the %g s '
+                           'psql limit' % PSQL_TIMEOUT_SECS)
+    return (
+        "DO $cap$ DECLARE s bigint; l bigint; BEGIN "
+        "SELECT setting::bigint INTO s FROM pg_settings WHERE name = 'statement_timeout'; "
+        "SELECT setting::bigint INTO l FROM pg_settings WHERE name = 'lock_timeout'; "
+        "IF s = 0 OR s > %(cap)d THEN s := %(cap)d; END IF; "
+        "IF l = 0 OR l > %(lock)d THEN l := %(lock)d; END IF; "
+        "IF l >= s THEN l := greatest(s - %(gap)d, 1); END IF; "
+        "PERFORM set_config('statement_timeout', s::text || 'ms', false); "
+        "PERFORM set_config('lock_timeout', l::text || 'ms', false); "
+        "END $cap$" % {'cap': cap_ms, 'lock': lock_cap_ms, 'gap': gap_ms})
 
 
 def psql(url: str, sql: str, tuples: bool = False) -> str:
@@ -379,10 +345,11 @@ def psql(url: str, sql: str, tuples: bool = False) -> str:
     argv = ['psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1']
     if tuples:
         argv.append('-At')
-    argv += ['-c', sql]
+    env = _pg_env(url)
+    # One statement per call: the server cap bounds each statement, not the whole -c string (#7481).
+    argv += ['-c', server_caps_sql(env), '-c', sql]
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, env=_pg_env(url, bounded=True),
-                              timeout=PSQL_TIMEOUT_SECS)
+        done = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=PSQL_TIMEOUT_SECS)
     except subprocess.TimeoutExpired:
         raise WrapperError('psql timed out after %g s' % PSQL_TIMEOUT_SECS, None)
     if done.returncode != 0:
@@ -453,7 +420,7 @@ def open_hold(clone_url: str) -> 'subprocess.Popen[str]':
     the clone. It waits on stdin; closing stdin ends it.
 
     It runs no statement and its whole life is the clone guard, so it deliberately gets NO server-side
-    statement_timeout or lock_timeout (``_pg_env`` without ``bounded``): a cap would only end the guard early
+    statement_timeout or lock_timeout (it never goes through ``psql()``): a cap would only end the guard early
     (#7456)."""
     return subprocess.Popen(['psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1'], stdin=subprocess.PIPE,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -538,7 +505,8 @@ def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
                                % (tpl, exc, why, check, db_name), exc.returncode)
         raise WrapperError('CREATE DATABASE %s was refused; nothing was created or changed: %s' % (tpl, exc))
     try:
-        psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')
+        psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS age')
+        psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS vector')
         psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE true ALLOW_CONNECTIONS false' % q)
     except BaseException:
         # The template is ours now and nothing else will drop it: plain DROP,

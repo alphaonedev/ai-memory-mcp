@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import unittest.mock
+import urllib.parse
 import uuid
 from pathlib import Path
 
@@ -51,7 +52,7 @@ class Result:
 
 def default_answer(argv, kw):
     """Plausible psql answers: a roomy budget and one live session per clone."""
-    sql = argv[argv.index('-c') + 1] if '-c' in argv else ''
+    sql = argv[-1] if '-c' in argv else ''
     if 'max_connections' in sql:
         return Result(0, '1000|3|0|10\n')
     if 'count(*)' in sql and 'pg_stat_activity' in sql:
@@ -75,7 +76,7 @@ class Recorder:
         return self.answer(list(argv), kw)
 
     def sql(self):
-        return [a[a.index('-c') + 1] for a, _ in self.calls if '-c' in a]
+        return [a[-1] for a, _ in self.calls if '-c' in a]
 
 
 class FakePopen:
@@ -404,7 +405,7 @@ class TierSteps(unittest.TestCase):
 
     def test_admin_sweep_is_idle_only_aged_and_never_forces(self):
         def answer(argv, kw):
-            sql = argv[argv.index('-c') + 1]
+            sql = argv[-1]
             if 'extract(epoch' in sql:
                 return Result(0, '1700005000\n')
             if sql.startswith('SELECT'):
@@ -439,7 +440,7 @@ class FakePg:
         self.log = []
 
     def __call__(self, argv, kw):
-        sql = argv[argv.index('-c') + 1] if '-c' in argv else ''
+        sql = argv[-1] if '-c' in argv else ''
         if 'max_connections' in sql:
             return Result(0, '1000|3|0|10\n')
         self.log.append(sql)
@@ -535,7 +536,7 @@ class TemplateOwnership(unittest.TestCase):
     def test_interrupt_after_create_drops_the_template_and_reraises_7372(self):
         class Interrupted(FakePg):
             def __call__(self, argv, kw):
-                sql = argv[argv.index('-c') + 1] if '-c' in argv else ''
+                sql = argv[-1] if '-c' in argv else ''
                 if sql.startswith('CREATE EXTENSION'):
                     self.log.append(sql)
                     raise KeyboardInterrupt
@@ -634,6 +635,7 @@ class TemplateOwnership(unittest.TestCase):
             with unittest.mock.patch.dict(os.environ, env, clear=True), \
                     unittest.mock.patch.object(pib, 'PSQL_TIMEOUT_SECS', 2.0), \
                     unittest.mock.patch.object(pib, 'CONNECT_TIMEOUT_SECS', '1'), \
+                    unittest.mock.patch.object(pib, 'LIBPQ_MIN_CONNECT_SECS', 1), \
                     unittest.mock.patch.object(pib, 'PSQL_CAP_MARGIN_SECS', 0.5), \
                     unittest.mock.patch.object(pib, 'PSQL_LOCK_GAP_SECS', 0.25):
                 started = time.monotonic()
@@ -647,66 +649,82 @@ class TemplateOwnership(unittest.TestCase):
                 self.assertFalse(absent)
                 self.assertIn('the existence check itself failed: psql timed out', why)
 
-    def _bounded_options(self, options=None):
-        url = BASE if options is None else BASE + '&options=' + options
-        return pib._pg_env(url, bounded=True)['PGOPTIONS']
-
     @staticmethod
-    def _ms(options, name):
-        return int(re.findall(r'-c %s=(\d+)ms' % name, options)[-1])
+    def _caps(url=BASE):
+        """(statement_ms, lock_ms) the cap statement would set when the server has no stricter value."""
+        sql = pib.server_caps_sql(pib._pg_env(url))
+        return (int(re.search(r's := (\d+); END IF', sql).group(1)),
+                int(re.search(r'l := (\d+); END IF', sql).group(1)))
 
-    def test_psql_env_carries_server_timeouts_and_keeps_url_options_7447(self):
-        seen = []
-
-        def answer(argv, kw):
-            seen.append(kw['env'])
-            return Result(0, '', '')
+    def test_psql_sends_the_cap_statement_first_and_the_sql_alone_7447_7481(self):
+        rec = Recorder(lambda argv, kw: Result(0, '', ''))
         url = BASE + '&options=-c%20search_path%3Dpublic'
-        with unittest.mock.patch.object(pib.subprocess, 'run', Recorder(answer)):
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
             pib.psql(url, 'SELECT 1')
-            pib.psql(BASE, 'SELECT 1')
-        self.assertIn('-c search_path=public', seen[0]['PGOPTIONS'])
-        self.assertIn('-c statement_timeout=', seen[0]['PGOPTIONS'])
-        self.assertIn('-c lock_timeout=', seen[0]['PGOPTIONS'])
-        self.assertIn('statement_timeout', seen[1]['PGOPTIONS'])
+        argv, kw = rec.calls[0]
+        self.assertEqual(argv[-1], 'SELECT 1')
+        self.assertEqual(argv.count('-c'), 2)
+        first = argv[argv.index('-c') + 1]
+        self.assertIn("set_config('statement_timeout'", first)
+        self.assertIn("set_config('lock_timeout'", first)
+        # the caller's options are passed through untouched; the cap is not an option
+        self.assertEqual(kw['env']['PGOPTIONS'], '-c search_path=public')
 
-    def test_server_caps_fire_before_the_client_kill_and_lock_before_statement_7453(self):
+    def test_every_setup_psql_call_carries_one_statement_7481(self):
+        pg = FakePg()
+        rec = Recorder(pg)
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
+            pib.setup(BASE, self.DB, 8)
+        extensions = [a[-1] for a, _ in rec.calls if a[-1].startswith('CREATE EXTENSION')]
+        self.assertEqual(len(extensions), 2)
+        for argv, _ in rec.calls:
+            self.assertNotIn(';', argv[-1].rstrip(';'), argv[-1])
+
+    def test_server_caps_fire_before_the_client_kill_and_lock_before_statement_7453_7480(self):
         for connect in ('30', '5'):
             with self.subTest(connect=connect), unittest.mock.patch.object(pib, 'CONNECT_TIMEOUT_SECS', connect):
-                options = self._bounded_options()
-                statement, lock = self._ms(options, 'statement_timeout'), self._ms(options, 'lock_timeout')
+                statement, lock = self._caps()
+                budget = pib._connect_budget_secs(pib._pg_env(BASE))
                 self.assertLess(lock, statement)
-                self.assertLessEqual(statement + int(connect) * 1000 + int(pib.PSQL_CAP_MARGIN_SECS * 1000),
+                self.assertLessEqual(statement + budget * 1000 + int(pib.PSQL_CAP_MARGIN_SECS * 1000),
                                      int(pib.PSQL_TIMEOUT_SECS * 1000))
-        # a URL connect_timeout counts, and one that leaves no positive cap is refused
-        slow = pib._pg_env(BASE + '&connect_timeout=100', bounded=True)['PGOPTIONS']
-        self.assertEqual(self._ms(slow, 'statement_timeout') + 100000 + 10000, 300000)
-        for bad in ('300', '0', 'x'):
-            with self.subTest(bad=bad), self.assertRaises(pib.WrapperError):
-                pib._pg_env(BASE + '&connect_timeout=' + bad, bounded=True)
+        slow = self._caps(BASE + '&connect_timeout=100')
+        self.assertEqual(slow[0] + 100000 + 10000, 300000)
+        sql = pib.server_caps_sql(pib._pg_env(BASE))
+        self.assertIn('IF l >= s THEN l := greatest(s - 5000, 1); END IF', sql)
+        self.assertIn('IF s = 0 OR s > ', sql)
+        self.assertIn('IF l = 0 OR l > ', sql)
 
-    def test_caller_timeouts_are_never_loosened_7454(self):
-        base = self._bounded_options()
-        cap_s, cap_l = self._ms(base, 'statement_timeout'), self._ms(base, 'lock_timeout')
-        tighter = self._bounded_options('-c%20statement_timeout%3D500ms%20-c%20lock_timeout%3D2s')
-        self.assertEqual((self._ms(tighter, 'statement_timeout'), self._ms(tighter, 'lock_timeout')), (500, 2000))
-        looser = self._bounded_options('-c%20statement_timeout%3D1d%20-c%20lock_timeout%3D2h')
-        self.assertEqual((self._ms(looser, 'statement_timeout'), self._ms(looser, 'lock_timeout')), (cap_s, cap_l))
-        zero = self._bounded_options('-c%20statement_timeout%3D0%20-c%20lock_timeout%3D0')
-        self.assertEqual((self._ms(zero, 'statement_timeout'), self._ms(zero, 'lock_timeout')), (cap_s, cap_l))
-        units = self._bounded_options('-cstatement_timeout%3D1min%20--lock-timeout%3D3s')
-        self.assertEqual((self._ms(units, 'statement_timeout'), self._ms(units, 'lock_timeout')), (60000, 3000))
-        # the caller's own text is kept and the tighter value is the last, winning one
-        self.assertIn('statement_timeout=500ms', tighter)
+    def test_connect_timeout_values_that_are_not_plain_digits_are_refused_7453_7483(self):
+        for bad in ('300', '0', 'x', '%C2%B2', '%D9%A3', '-1', '1.5', ''):
+            with self.subTest(bad=bad), self.assertRaises(pib.WrapperError):
+                pib.server_caps_sql(pib._pg_env(BASE + '&connect_timeout=' + bad))
+
+    def test_connect_budget_counts_addresses_floor_and_ssl_retry_7482(self):
+        two = [(0, 0, 0, '', ('10.0.0.1', 5432)), (0, 0, 0, '', ('10.0.0.2', 5432))]
+        named = 'postgres://u@db.example:5432/d?%s'
+        with unittest.mock.patch.object(pib.socket, 'getaddrinfo', return_value=two):
+            env = pib._pg_env(named % 'sslmode=verify-full&connect_timeout=30')
+            self.assertEqual(pib._connect_budget_secs(env), 60)
+            env = pib._pg_env(named % 'connect_timeout=30')       # sslmode defaults to prefer: a second pass
+            self.assertEqual(pib._connect_budget_secs(env), 120)
+            env = pib._pg_env(named % 'sslmode=verify-full&connect_timeout=1')   # libpq floors at 2 s
+            self.assertEqual(pib._connect_budget_secs(env), 4)
+            with self.assertRaises(pib.WrapperError):
+                pib.server_caps_sql(pib._pg_env(named % 'sslmode=verify-full&connect_timeout=150'))
+        with unittest.mock.patch.object(pib.socket, 'getaddrinfo', side_effect=OSError('no dns')):
+            self.assertEqual(pib._connect_budget_secs(pib._pg_env(named % 'sslmode=require&connect_timeout=30')), 30)
+        sock = {'PGCONNECT_TIMEOUT': '1', 'PGHOST': '/var/run/postgresql'}
+        self.assertEqual(pib._connect_budget_secs(sock), 2)
 
     def test_options_ending_in_a_backslash_are_refused_7455(self):
         for value in ('-c%20search_path%3Dab%5C', '%5C%5C%5C'):
             with self.subTest(value=value), self.assertRaises(pib.WrapperError) as ctx:
-                pib._pg_env(BASE + '&options=' + value, bounded=True)
+                pib._pg_env(BASE + '&options=' + value)
             self.assertIn("'options'", str(ctx.exception))
             self.assertIn('backslash', str(ctx.exception))
         # an escaped (doubled) trailing backslash is fine
-        pib._pg_env(BASE + '&options=-c%20search_path%3Dab%5C%5C', bounded=True)
+        pib._pg_env(BASE + '&options=-c%20search_path%3Dab%5C%5C')
         called = []
         with unittest.mock.patch.object(pib.subprocess, 'run', Recorder(lambda a, k: called.append(a) or Result())):
             with self.assertRaises(pib.WrapperError):
@@ -716,9 +734,14 @@ class TemplateOwnership(unittest.TestCase):
     def test_hold_session_has_no_server_caps_7456(self):
         with Patched():
             hold = pib.open_hold(BASE)
+        self.assertNotIn('-c', hold.argv)
+        self.assertNotIn('statement_timeout', ' '.join(hold.argv))
         self.assertNotIn('statement_timeout', hold.kw['env'].get('PGOPTIONS', ''))
         self.assertNotIn('lock_timeout', hold.kw['env'].get('PGOPTIONS', ''))
-        self.assertIn('statement_timeout', pib._pg_env(BASE, bounded=True)['PGOPTIONS'])
+        rec = Recorder(lambda argv, kw: Result(0, '', ''))
+        with unittest.mock.patch.object(pib.subprocess, 'run', rec):
+            pib.psql(BASE, 'SELECT 1')
+        self.assertIn('statement_timeout', ' '.join(rec.calls[0][0]))
         self.assertIn('NO server-side', pib.open_hold.__doc__)
 
     def test_unknown_reason_wording_7448(self):
@@ -833,7 +856,7 @@ class RunOne(unittest.TestCase):
 
     def test_hold_that_never_appears_fails_closed_without_running_cargo(self):
         def answer(argv, kw):
-            sql = argv[argv.index('-c') + 1]
+            sql = argv[-1]
             if 'count(*)' in sql:
                 return Result(0, '0\n')
             return Result()
@@ -1034,6 +1057,18 @@ class MainRun(unittest.TestCase):
                 self.assertEqual(pib.main(argv), pib.EXIT_USAGE, missing)
 
 
+class CiLiveCells(unittest.TestCase):
+    def test_ci_runs_the_live_cells_on_the_enterprise_fed_leg_7485(self):
+        ci = (SCRIPT.parents[2] / '.github' / 'workflows' / 'ci.yml').read_text()
+        start = ci.index('- name: Run the pg_isolated_binary live cells')
+        step = ci[start:ci.index('\n      - name:', start + 10)]
+        configure = ci.index('- name: Configure enterprise-fed tier')
+        self.assertGreater(start, configure, 'runs after the URL is minted')
+        self.assertIn("matrix.tier == 'enterprise-fed'", step)
+        self.assertIn('AI_MEMORY_TEST_PG_LIVE_REQUIRED: "1"', step)
+        self.assertIn('test_pg_isolated_binary.LiveEndToEnd', step)
+
+
 class NoShell(unittest.TestCase):
     def test_source_never_uses_shell_true_or_tmp(self):
         src = SCRIPT.read_text()
@@ -1046,15 +1081,75 @@ def _live_url():
     return os.environ.get(pib.URL_VAR, '')
 
 
-@unittest.skipUnless(_live_url() and shutil.which('psql'), 'AI_MEMORY_TEST_POSTGRES_URL unset (live e2e)')
+LIVE_REQUIRED_VAR = 'AI_MEMORY_TEST_PG_LIVE_REQUIRED'
+_LIVE_READY = bool(_live_url() and shutil.which('psql'))
+
+
+@unittest.skipUnless(_LIVE_READY or os.environ.get(LIVE_REQUIRED_VAR) == '1',
+                     'AI_MEMORY_TEST_POSTGRES_URL unset (live e2e)')
 class LiveEndToEnd(unittest.TestCase):
-    """C1 end to end: the real script, a real server, a probe, /bin/true."""
+    """C1 end to end: the real script, a real server, a probe, /bin/true.
+
+    With AI_MEMORY_TEST_PG_LIVE_REQUIRED=1 (set by the CI step that runs these, #7485) a missing URL or psql
+    fails the class instead of skipping it."""
+
+    def setUp(self):
+        if not _LIVE_READY:
+            self.fail('%s=1 but %s or psql is missing' % (LIVE_REQUIRED_VAR, pib.URL_VAR))
+
+    def _live_setting(self, url, options=None, db=None):
+        target = pib.with_database(url, db) if db else url
+        if options is not None:
+            target += ('&' if '?' in target else '?') + 'options=' + urllib.parse.quote(options)
+        return pib.psql(target, "SELECT (SELECT setting FROM pg_settings WHERE name = 'statement_timeout') "
+                        "|| '/' || (SELECT setting FROM pg_settings WHERE name = 'lock_timeout')",
+                        tuples=True).strip().split('/')
+
+    def test_server_resolves_caller_and_default_timeouts_7477_7478_7479_7480_7484(self):
+        url = _live_url()
+        cap, lock_cap = TemplateOwnership._caps(url)
+        # no caller value: the wrapper caps
+        self.assertEqual(self._live_setting(url), [str(cap), str(lock_cap)])
+        # mixed case, a tighter value: kept, and the lock is clamped below it
+        statement, lock = self._live_setting(url, '-c Statement_Timeout=500ms')
+        self.assertEqual(statement, '500')
+        self.assertLess(int(lock), 500)
+        # a looser value and 0 (unlimited) take the cap
+        self.assertEqual(self._live_setting(url, '-c statement_timeout=1d')[0], str(cap))
+        self.assertEqual(self._live_setting(url, '-c statement_timeout=0')[0], str(cap))
+        # forms the wrapper never parses: the server reads them, and the result is never looser than the caller
+        for value, limit in (('0x1f4', 500), ('1e3', 1000), ('.5s', 500), ('+500', 500), ('010', 8), ('1.2ms', 1)):
+            with self.subTest(value=value):
+                try:
+                    got = int(self._live_setting(url, '-c statement_timeout=' + value)[0])
+                except pib.WrapperError:
+                    continue            # the server refused the value: fail closed
+                self.assertLessEqual(got, max(limit, 1), value)
+        # a stricter database-level default is kept, never overridden with the looser cap
+        db = 'ai_memory_cap_%s' % uuid.uuid4().hex[:8]
+        pib.psql(url, 'CREATE DATABASE %s' % db)
+        try:
+            pib.psql(url, "ALTER DATABASE %s SET statement_timeout = '1s'" % db)
+            statement, lock = self._live_setting(url, db=db)
+            self.assertEqual(statement, '1000')
+            self.assertLess(int(lock), 1000)
+        finally:
+            pib.psql(url, 'DROP DATABASE IF EXISTS %s' % db)
+
+    def test_required_flag_turns_a_missing_url_into_a_failure_7485(self):
+        env = {k: v for k, v in os.environ.items() if k != pib.URL_VAR}
+        env[LIVE_REQUIRED_VAR] = '1'
+        done = subprocess.run([sys.executable, '-m', 'unittest', 'test_pg_isolated_binary.LiveEndToEnd'],
+                              cwd=str(Path(__file__).resolve().parent), env=env, capture_output=True, text=True)
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn('FAILED', done.stderr)
+        self.assertIn('missing', done.stderr)
 
     def test_server_cap_cancels_a_slow_statement_and_leaves_no_backend_7457(self):
         url = _live_url()
         tag = 'r8cap' + uuid.uuid4().hex[:10]
         with unittest.mock.patch.object(pib, 'PSQL_TIMEOUT_SECS', 8.0), \
-                unittest.mock.patch.object(pib, 'CONNECT_TIMEOUT_SECS', '1'), \
+                unittest.mock.patch.object(pib, '_connect_budget_secs', lambda env: 1), \
                 unittest.mock.patch.object(pib, 'PSQL_CAP_MARGIN_SECS', 1.0), \
                 unittest.mock.patch.object(pib, 'PSQL_LOCK_GAP_SECS', 0.5):
             started = time.monotonic()
