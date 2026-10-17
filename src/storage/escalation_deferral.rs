@@ -48,10 +48,13 @@
 //! the same thread and database, a settle of an unknown frame, and frames
 //! still holding intents when the thread exits (a `mem::forget`-ed
 //! `WriteTxn`) are all reported at ERROR. The first two go through `tracing`
-//! and also trip a `debug_assert!`; the thread-exit case is written directly
-//! to stderr (an `ERROR #4116: ...` line), because the `tracing` fmt layer's
-//! own thread-local buffer may already be destroyed at thread exit and
-//! logging through it would abort the process.
+//! and also trip a `debug_assert!`; the open-time report is ALSO written to
+//! stderr (#7606: a lossy or absent sink cannot drop the only report), and the
+//! thread-exit case is written directly to stderr (an `ERROR #4116: ...`
+//! line), because the `tracing` fmt layer's own thread-local buffer may
+//! already be destroyed at thread exit and logging through it would abort the
+//! process. The open-time report covers the intents the frame held then; an
+//! intent routed into the frame afterwards is named at thread exit (#7605).
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -129,10 +132,11 @@ struct TxnFrame {
     /// stable and unique for the frame's whole life.
     conn_addr: usize,
     deferred: Vec<DeferredEscalation>,
-    /// #6132 - the loss of this frame's `deferred` intents was already
-    /// reported (open-time stale-frame report); the thread-exit report skips
-    /// it so one lost write is reported once.
-    reported: bool,
+    /// #6132 / #7605 - how many of this frame's `deferred` intents the
+    /// open-time stale-frame report already covered; the thread-exit report
+    /// names only the intents beyond that count, so one lost write is reported
+    /// once and an intent routed in AFTER the open-time report is still named.
+    reported: usize,
     /// #7241 - the off-table audit anchors of signed-event appends made by
     /// nested funnels inside this transaction: emitted when it COMMITS,
     /// dropped unrecorded when it rolls back.
@@ -145,15 +149,17 @@ struct Frames(Vec<TxnFrame>);
 
 impl Drop for Frames {
     fn drop(&mut self) {
+        // #7605 - per frame, the intents the open-time report did not cover.
         let unreported = || {
             self.0
                 .iter()
-                .filter(|f| !f.reported && !f.deferred.is_empty())
+                .map(|f| f.deferred.len().saturating_sub(f.reported))
+                .filter(|n| *n > 0)
         };
         // #6449 - frames and deferred intents are different counts: one frame
         // can hold several intents, so the line names each with its own label.
         let frames = unreported().count();
-        let lost: usize = unreported().map(|f| f.deferred.len()).sum();
+        let lost: usize = unreported().sum();
         if lost > 0 {
             // No debug_assert here: a panic in a TLS destructor aborts. This
             // runs at thread exit, in thread-local destructor order (reverse
@@ -215,20 +221,41 @@ fn forced_failure() -> bool {
 /// unwind leaves the connection in autocommit (ERRORS-08, OWNERSHIP-24).
 pub(super) fn report_stale_frames(conn: &Connection) {
     let db_path = conn.path().filter(|p| !p.is_empty()).map(str::to_string);
-    // #6540 - a report only covers a frame when a tracing sink can receive it;
-    // with none installed the frame stays unreported and thread exit speaks.
-    let sink_listening = tracing::enabled!(tracing::Level::ERROR);
-    let stale = TXN_FRAMES.with(|frames| {
+    // #7606 (#6540 Option 1) - the report is also written on the raw stderr
+    // channel, which no subscriber, filter or lossy appender can drop, and an
+    // intent counts as reported only after that write.
+    let (stale, newly_reported) = TXN_FRAMES.with(|frames| {
         let mut stale = false;
+        let mut newly = 0usize;
         for f in &mut frames.borrow_mut().0 {
             if f.db_path == db_path && db_path.is_some() && !f.deferred.is_empty() {
-                // #6132 - a delivered report covers the frame; thread exit skips it.
-                f.reported = sink_listening;
+                newly += f.deferred.len().saturating_sub(f.reported);
                 stale = true;
             }
         }
-        stale
+        (stale, newly)
     });
+    if newly_reported > 0 {
+        // A failed write is discarded on purpose (nothing left to report to;
+        // ERRORS-19); the intents then still count as reported, as at thread exit.
+        let _ = std::io::Write::write_fmt(
+            &mut std::io::stderr(),
+            format_args!(
+                "ERROR #4116: an older escalation frame still holds {newly_reported} deferred \
+                 intent(s) on this database while a new WriteTxn opened (a leaked or unsettled \
+                 transaction); those escalated writes stay REFUSED but were NOT queued\n"
+            ),
+        );
+        // #6132 / #7605 - covered intents are skipped at thread exit; one routed
+        // into the frame later is not covered and is still named there.
+        TXN_FRAMES.with(|frames| {
+            for f in &mut frames.borrow_mut().0 {
+                if f.db_path == db_path && db_path.is_some() && !f.deferred.is_empty() {
+                    f.reported = f.deferred.len();
+                }
+            }
+        });
+    }
     if stale {
         tracing::error!(
             "#4116: a WriteTxn opened while an older frame on the same database still \
@@ -249,7 +276,7 @@ pub(super) fn open_frame(conn: &Connection) -> u64 {
             db_path,
             conn_addr: std::ptr::from_ref(conn).addr(),
             deferred: Vec::new(),
-            reported: false,
+            reported: 0,
             anchor: crate::governance::audit::PendingAuditAnchor::none(),
         });
     });
@@ -829,7 +856,7 @@ mod tests {
     /// Marker of the open-time stale-frame report (a `tracing` ERROR event).
     const OPEN_TIME_REPORT: &str = "#4116: a WriteTxn opened while an older frame";
     /// Marker of the open-time report on the raw stderr channel (#7606).
-    const OPEN_TIME_RAW_REPORT: &str = "ERROR #4116: a WriteTxn opened while an older frame";
+    const OPEN_TIME_RAW_REPORT: &str = "ERROR #4116: an older escalation frame still holds";
     /// Marker of the thread-exit leak report (raw stderr).
     const THREAD_EXIT_REPORT: &str = "ERROR #4116: thread exited with";
 
@@ -859,16 +886,16 @@ mod tests {
         leak_and_exit(1, true, 0);
     }
 
-    /// #6540 - with NO tracing sink the open-time report reaches nobody, so
-    /// the frame must stay unreported and the thread-exit line must fire.
+    /// #6540 - with NO tracing sink the tracing event reaches nobody, so the
+    /// raw stderr line (#7606) must carry the report.
     #[test]
     fn issue_6540_untraced_loss_is_still_reported_at_thread_exit() {
         if !is_child() {
             let (_stdout, stderr) =
                 run_child("issue_6540_untraced_loss_is_still_reported_at_thread_exit");
             assert!(
-                stderr.contains(THREAD_EXIT_REPORT),
-                "a loss no sink received must still be reported at thread exit:\n{stderr}"
+                stderr.contains(OPEN_TIME_RAW_REPORT),
+                "a loss no sink received must still be reported on stderr:\n{stderr}"
             );
             return;
         }
