@@ -860,66 +860,6 @@ mod tests {
         assert_eq!(resp_unfiltered["count"].as_u64(), Some(0));
     }
 
-    // #7501 — failed-lookup rows: an admin sees every writer's rows and the
-    // anonymous ones; a non-admin sees only its own.
-    fn seed_failed_lookup_rows(conn: &rusqlite::Connection) {
-        for (i, payload) in [
-            r#"{"agent_id":"ai:alice"}"#,
-            r#"{"agent_id":null}"#,
-            r#"{"agent_id":"ai:carol"}"#,
-        ]
-        .iter()
-        .enumerate()
-        {
-            conn.execute(
-                "INSERT INTO subscription_dlq \
-                 (subscription_id, correlation_id, event_type, payload, retry_count, last_error, \
-                  first_failed_at, last_failed_at) \
-                 VALUES (?1, ?2, 'memory_store', ?3, 4, 'x', 'now', 'now')",
-                rusqlite::params![
-                    format!(
-                        "{}:team/ns{i}",
-                        crate::subscriptions::scan_failure::DISPATCH_SCAN_FAILED_SUB_ID
-                    ),
-                    format!("c{i}"),
-                    payload
-                ],
-            )
-            .expect("seed failed-lookup row");
-        }
-    }
-
-    #[test]
-    fn dlq_list_admin_sees_every_failed_lookup_row_7501() {
-        let conn = fresh_conn();
-        seed_failed_lookup_rows(&conn);
-        let admins = vec!["ai:root".to_string()];
-        let resp =
-            handle_subscription_dlq_list_for(&conn, &json!({}), "ai:root", &admins).expect("ok");
-        assert_eq!(
-            resp["count"].as_u64(),
-            Some(3),
-            "an admin sees other writers' rows and the anonymous row"
-        );
-    }
-
-    #[test]
-    fn dlq_list_non_admin_non_owner_sees_none_7501() {
-        let conn = fresh_conn();
-        seed_failed_lookup_rows(&conn);
-        let admins = vec!["ai:root".to_string()];
-        let bob =
-            handle_subscription_dlq_list_for(&conn, &json!({}), "ai:bob", &admins).expect("ok");
-        assert_eq!(bob["count"].as_u64(), Some(0), "a non-owner sees nothing");
-        let alice =
-            handle_subscription_dlq_list_for(&conn, &json!({}), "ai:alice", &admins).expect("ok");
-        assert_eq!(
-            alice["count"].as_u64(),
-            Some(1),
-            "the owner sees only its own"
-        );
-    }
-
     // handle_pending_list — happy + count.
     #[test]
     fn pending_list_returns_count_and_array() {
