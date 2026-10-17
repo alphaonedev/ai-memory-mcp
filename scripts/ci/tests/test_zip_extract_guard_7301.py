@@ -55,9 +55,21 @@ class GuardCase(GuardBase):
         res = self.run_guard()
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
-    def test_real_repo_tree_passes(self):
+    def test_real_repo_sources_pass_with_fixture_tree(self):
+        """Fixture test: real repo sources and manifest, canned cargo tree text."""
         res = self.run_guard(root=REPO)
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_real_repo_passes_with_real_cargo_tree(self):
+        """Runs the real `cargo tree` (offline, locked) against this checkout."""
+        if shutil.which('cargo') is None:
+            self.skipTest('cargo is not installed')
+        res = subprocess.run([sys.executable, str(GUARD), '--root', str(REPO)],
+                             capture_output=True, text=True, check=False)
+        if res.returncode == 2 and 'cargo tree failed' in res.stderr:
+            self.skipTest('cargo tree cannot run offline here: ' + res.stderr.strip()[-200:])
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn('check-zip-extract-unreachable: ok', res.stdout)
 
     def test_zip_path_use_fails(self):
         (self.root / 'src' / 'bad.rs').write_text(
@@ -143,9 +155,27 @@ class GuardCase(GuardBase):
         self.assertIn('\\n::error::injected.rs:1', res.stdout)
 
     def test_usage_error_exit_code(self):
+        # The guard must exist: a missing script also exits 2 from the
+        # interpreter, which would make this test green on a base without it.
+        self.assertTrue(GUARD.is_file(), 'guard script missing: %s' % GUARD)
         res = subprocess.run([sys.executable, str(GUARD), '--root', str(self.root / 'missing')],
                              capture_output=True, text=True, check=False)
         self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn('no Cargo.toml', res.stderr)
+
+    def test_unknown_argument_exit_code(self):
+        self.assertTrue(GUARD.is_file(), 'guard script missing: %s' % GUARD)
+        res = subprocess.run([sys.executable, str(GUARD), '--no-such-flag'],
+                             capture_output=True, text=True, check=False)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn('usage:', res.stderr)
+
+    def test_audit_toml_record_names_both_loaders_and_the_yank(self):
+        text = (REPO / '.cargo' / 'audit.toml').read_text(encoding='utf-8')
+        for needle in ('npy.rs', 'pickle.rs', 'yanked', 'RUSTSEC-2026-0367', 'RUSTSEC-2026-0368',
+                       'RUSTSEC-2026-0369', 'check-zip-extract-unreachable.py'):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, text)
 
 
 STUB_TEMPLATE = """#!{python}
