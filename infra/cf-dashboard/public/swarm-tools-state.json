@@ -1,0 +1,193 @@
+{
+ "surface": "Swarm/Hive (agent-driven \u00b7 HTTP over encrypted daemon)",
+ "total": 22,
+ "validated": 22,
+ "failclosed": 0,
+ "refining": 0,
+ "functional": 6,
+ "pct": 100,
+ "groups": [
+  {
+   "family": "agent-driven tool surface",
+   "tools": [
+    {
+     "name": "recall",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "search",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "list_memories",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "get_memory",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "get_links",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "lineage",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "inbox",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "stats",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "namespaces",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "agents",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "health",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "capabilities",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "store",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "update",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "delete",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "promote",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "forget",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "link",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "notify",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "signal_send",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "consolidate",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    },
+    {
+     "name": "reflect",
+     "desc": "agent-driven over encrypted daemon",
+     "status": "ok",
+     "cls": "validated",
+     "ms": 0,
+     "note": "live 22/22 after #3334 (organic + preflight + full-surface sweep)"
+    }
+   ]
+  }
+ ],
+ "lastUpdated": null
+}

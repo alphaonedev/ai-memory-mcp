@@ -1,0 +1,120 @@
+{
+  "surface": "Data tier V&V \u00b7 SQLite (singleton) + PostgreSQL\u00b7AGE\u00b7pgvector (swarm)",
+  "total": 14,
+  "validated": 13,
+  "failclosed": 0,
+  "refining": 1,
+  "functional": 13,
+  "pct": 93,
+  "groups": [
+    {
+      "family": "A \u00b7 SQLite singleton (localhost MCP)",
+      "tools": [
+        {
+          "name": "full tool surface on sqlite",
+          "desc": "79/104 tools validated end-to-end on sqlite (MCP validator)",
+          "status": "ok",
+          "cls": "validated",
+          "note": "79/104 tools validated end-to-end on sqlite (MCP validator)"
+        },
+        {
+          "name": "FTS keyword recall",
+          "desc": "BM25 full-text search path",
+          "status": "ok",
+          "cls": "validated",
+          "note": "BM25 full-text search path"
+        },
+        {
+          "name": "WAL durability",
+          "desc": "write-ahead logging, crash-safe",
+          "status": "ok",
+          "cls": "validated",
+          "note": "write-ahead logging, crash-safe"
+        },
+        {
+          "name": "schema migrations",
+          "desc": "v94 ledger applied cleanly",
+          "status": "ok",
+          "cls": "validated",
+          "note": "v94 ledger applied cleanly"
+        },
+        {
+          "name": "vector recall (sqlite-vss/brute)",
+          "desc": "semantic recall on sqlite",
+          "status": "ok",
+          "cls": "validated",
+          "note": "semantic recall on sqlite"
+        },
+        {
+          "name": "busy/lock handling",
+          "desc": "concurrent writer retries",
+          "status": "ok",
+          "cls": "validated",
+          "note": "concurrent writer retries"
+        }
+      ]
+    },
+    {
+      "family": "B \u00b7 PostgreSQL + Apache AGE + pgvector (AI-agent swarm)",
+      "tools": [
+        {
+          "name": "certified versions",
+          "desc": "PG 18.6 \u00b7 AGE 1.8.0 \u00b7 pgvector 0.8.6 (cert cell green)",
+          "status": "ok",
+          "cls": "validated",
+          "note": "PG 18.6 \u00b7 AGE 1.8.0 \u00b7 pgvector 0.8.6 (cert cell green)"
+        },
+        {
+          "name": "signed writes to pg",
+          "desc": "GLM swarm wrote Ed25519-signed memories to pg (verified)",
+          "status": "ok",
+          "cls": "validated",
+          "note": "GLM swarm wrote Ed25519-signed memories to pg (verified)"
+        },
+        {
+          "name": "pgvector HNSW recall",
+          "desc": "hybrid+rerank over pgvector (verified: mode hybrid+rerank)",
+          "status": "ok",
+          "cls": "validated",
+          "note": "hybrid+rerank over pgvector (verified: mode hybrid+rerank)"
+        },
+        {
+          "name": "Apache AGE knowledge graph",
+          "desc": "kg_query / find_paths / lineage on AGE",
+          "status": "ok",
+          "cls": "validated",
+          "note": "kg_query / find_paths / lineage on AGE"
+        },
+        {
+          "name": "verify-full TLS to pg",
+          "desc": "cert-pinned data-tier connection",
+          "status": "ok",
+          "cls": "validated",
+          "note": "cert-pinned data-tier connection"
+        },
+        {
+          "name": "sqlite<->pg parity",
+          "desc": "#3132 SYSTEM_PRINCIPAL parity verified; shared predicate",
+          "status": "ok",
+          "cls": "validated",
+          "note": "#3132 SYSTEM_PRINCIPAL parity verified; shared predicate"
+        },
+        {
+          "name": "20-check cert posture",
+          "desc": "enterprise-federation cert recapture (cert-55)",
+          "status": "ok",
+          "cls": "validated",
+          "note": "enterprise-federation cert recapture (cert-55)"
+        },
+        {
+          "name": "capacity at scale",
+          "desc": "per-module agent knee on pg tier",
+          "status": "fail",
+          "cls": "refining",
+          "note": "per-module agent knee on pg tier"
+        }
+      ]
+    }
+  ],
+  "lastUpdated": null
+}
