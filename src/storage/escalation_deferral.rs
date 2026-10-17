@@ -145,12 +145,15 @@ struct Frames(Vec<TxnFrame>);
 
 impl Drop for Frames {
     fn drop(&mut self) {
-        let lost: usize = self
-            .0
-            .iter()
-            .filter(|f| !f.reported)
-            .map(|f| f.deferred.len())
-            .sum();
+        let unreported = || {
+            self.0
+                .iter()
+                .filter(|f| !f.reported && !f.deferred.is_empty())
+        };
+        // #6449 - frames and deferred intents are different counts: one frame
+        // can hold several intents, so the line names each with its own label.
+        let frames = unreported().count();
+        let lost: usize = unreported().map(|f| f.deferred.len()).sum();
         if lost > 0 {
             // No debug_assert here: a panic in a TLS destructor aborts. This
             // runs at thread exit, in thread-local destructor order (reverse
@@ -168,8 +171,8 @@ impl Drop for Frames {
             let _ = std::io::Write::write_fmt(
                 &mut std::io::stderr(),
                 format_args!(
-                    "ERROR #4116: thread exited with {lost} unsettled escalation frame(s) \
-                     (a leaked WriteTxn); those escalated writes stay REFUSED but were NOT queued\n"
+                    "ERROR #4116: thread exited with {frames} unsettled escalation frame(s) \
+                     holding {lost} deferred intent(s) (a leaked WriteTxn); those escalated writes stay REFUSED but were NOT queued\n"
                 ),
             );
         }
