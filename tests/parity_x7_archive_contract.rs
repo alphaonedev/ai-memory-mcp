@@ -130,6 +130,94 @@ async fn sqlite_foreign_case(foreign: usize) {
     assert_eq!(archived, 0, "all-or-nothing: nothing archived");
 }
 
+// The postgres refusal cells use the multi-thread flavor: a refused batch drops
+// its transaction and sqlx rolls the connection back on a spawned task, which a
+// current-thread test runtime never polls, so the next cell stalls on the
+// leaked session until a server timeout (#7596 cell timing).
+/// The refusal reason of a `PermissionDenied`, the SSOT string callers match.
+fn denied_reason(e: &StoreError) -> &str {
+    match e {
+        StoreError::PermissionDenied { reason, .. } => reason,
+        other => panic!("expected PermissionDenied, got {other:?}"),
+    }
+}
+
+/// #7596: one live row the caller does not own, one unstamped live row.
+const UNSTAMPED_ID: &str = "x7-unstamped";
+
+#[tokio::test]
+async fn sqlite_archive_by_ids_foreign_reason_is_ssot_7596() {
+    common::permissive_attestation_for_tests();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = SqliteStore::open(dir.path().join("x7r.db")).expect("open");
+    let admin = CallerContext::for_admin(ADMIN);
+    store
+        .store(&admin, &row(0, FOREIGN_FIRST))
+        .await
+        .expect("store");
+    let caller = CallerContext::for_agent(CALLER_AGENT);
+    let err = store
+        .archive_by_ids(&caller, &[row_id(0)], None)
+        .await
+        .expect_err("foreign row must refuse");
+    assert_eq!(
+        denied_reason(&err),
+        ai_memory::errors::msg::CALLER_DOES_NOT_OWN_MEMORY
+    );
+}
+
+/// The unstamped-row refusal needs the `refuse` posture on sqlite (the
+/// default `warn` posture admits a legacy unstamped row, #3124); postgres
+/// refuses in both postures. The env guard is held outside the runtime so
+/// it is never held across an `.await`.
+#[test]
+fn sqlite_archive_by_ids_unstamped_reason_is_ssot_7596() {
+    let _posture = common::EnvVarGuard::set(
+        ai_memory::identity::owner_stamp::ENV_UNSTAMPED_MUTATION,
+        "refuse".to_string(),
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(sqlite_unstamped_reason_case());
+}
+
+async fn sqlite_unstamped_reason_case() {
+    common::permissive_attestation_for_tests();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("x7u.db");
+    let store = SqliteStore::open(&db_path).expect("open");
+    let admin = CallerContext::for_admin(ADMIN);
+    let mut unstamped = row(0, NO_FOREIGN);
+    unstamped.id = UNSTAMPED_ID.to_string();
+    store.store(&admin, &unstamped).await.expect("store");
+    let raw = rusqlite::Connection::open(&db_path).expect("raw");
+    raw.execute(
+        "UPDATE memories SET metadata = '{}' WHERE id = ?1",
+        [UNSTAMPED_ID],
+    )
+    .expect("strip the owner stamp");
+
+    let caller = CallerContext::for_agent(CALLER_AGENT);
+    let err = store
+        .archive_by_ids(&caller, &[UNSTAMPED_ID.to_string()], None)
+        .await
+        .expect_err("unstamped row must refuse");
+    assert_eq!(
+        denied_reason(&err),
+        ai_memory::errors::msg::REASON_UNSTAMPED_TENANT_ARCHIVE
+    );
+    let live: i64 = raw
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE id = ?1",
+            [UNSTAMPED_ID],
+            |r| r.get(0),
+        )
+        .expect("live count");
+    assert_eq!(live, 1, "a refused archive leaves the row live");
+}
+
 #[tokio::test]
 async fn sqlite_archive_by_ids_missing_id_is_skipped_7097() {
     common::permissive_attestation_for_tests();
@@ -220,7 +308,7 @@ async fn pg_store_and_pool(
 }
 
 #[cfg(feature = "sal-postgres")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL (live postgres); run with --include-ignored"]
 async fn postgres_archive_by_ids_foreign_id_refuses_whole_batch_7097() {
     use common::postgres_env::PostgresTestEnv;
@@ -253,6 +341,57 @@ async fn postgres_archive_by_ids_foreign_id_refuses_whole_batch_7097() {
         .expect("archived count");
     assert_eq!(usize::try_from(live).expect("fits"), BATCH_SIZE, "all live");
     assert_eq!(archived, 0, "all-or-nothing: nothing archived");
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL (live postgres); run with --include-ignored"]
+async fn postgres_archive_by_ids_foreign_reason_is_ssot_7596() {
+    use common::postgres_env::PostgresTestEnv;
+
+    common::permissive_attestation_for_tests();
+    let Some(env) = PostgresTestEnv::new("x7_reason_f").await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let (store, _pool) = pg_store_and_pool(&env, FOREIGN_FIRST).await;
+    let caller = CallerContext::for_agent(CALLER_AGENT);
+    let err = store
+        .archive_by_ids(&caller, &[row_id(0)], None)
+        .await
+        .expect_err("foreign row must refuse");
+    assert_eq!(
+        denied_reason(&err),
+        ai_memory::errors::msg::CALLER_DOES_NOT_OWN_MEMORY
+    );
+}
+
+#[cfg(feature = "sal-postgres")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL (live postgres); run with --include-ignored"]
+async fn postgres_archive_by_ids_unstamped_reason_is_ssot_7596() {
+    use common::postgres_env::PostgresTestEnv;
+
+    common::permissive_attestation_for_tests();
+    let Some(env) = PostgresTestEnv::new("x7_reason_u").await else {
+        eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+        return;
+    };
+    let (store, pool) = pg_store_and_pool(&env, NO_FOREIGN).await;
+    sqlx::query("UPDATE memories SET metadata = '{}'::jsonb WHERE id = $1")
+        .bind(row_id(1))
+        .execute(&pool)
+        .await
+        .expect("strip the owner stamp");
+    let caller = CallerContext::for_agent(CALLER_AGENT);
+    let err = store
+        .archive_by_ids(&caller, &[row_id(1)], None)
+        .await
+        .expect_err("unstamped row must refuse");
+    assert_eq!(
+        denied_reason(&err),
+        ai_memory::errors::msg::REASON_UNSTAMPED_TENANT_ARCHIVE
+    );
 }
 
 #[cfg(feature = "sal-postgres")]

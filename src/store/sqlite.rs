@@ -216,13 +216,50 @@ const ARCHIVE_ACTION: &str = "archive";
 
 /// #7097 - does a LIVE row with this id exist? (A missing id is skipped by
 /// `archive_by_ids`; a live row the caller may not touch refuses the batch.)
-const SQL_LIVE_ROW_EXISTS: &str = "SELECT 1 FROM memories WHERE id = ?1";
+const SQL_LIVE_ROW_METADATA: &str = "SELECT metadata FROM memories WHERE id = ?1";
 
-fn live_row_exists(conn: &rusqlite::Connection, id: &str) -> rusqlite::Result<bool> {
+fn live_row_metadata(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> rusqlite::Result<Option<serde_json::Value>> {
     use rusqlite::OptionalExtension;
-    conn.query_row(SQL_LIVE_ROW_EXISTS, [id], |_| Ok(()))
-        .optional()
-        .map(|row| row.is_some())
+    let raw: Option<String> = conn
+        .query_row(SQL_LIVE_ROW_METADATA, [id], |r| r.get(0))
+        .optional()?;
+    // A live row whose metadata cannot be parsed has no provable owner: it
+    // is still a live row, so surface it as an empty object (unstamped).
+    Ok(raw.map(|m| serde_json::from_str(&m).unwrap_or_else(|_| serde_json::json!({}))))
+}
+
+/// #7097 / #7596 - the typed refusal for a LIVE row the caller may not
+/// archive, `None` for an absent id (a silent skip). An unstamped row carries
+/// the postgres reason (`REASON_UNSTAMPED_TENANT_ARCHIVE`); a foreign stamped
+/// row carries the bare `CALLER_DOES_NOT_OWN_MEMORY` and the owner goes only
+/// to the AUTHZ trace (#3426), exactly as the postgres twin does.
+fn archive_refusal(
+    conn: &rusqlite::Connection,
+    id: &str,
+    caller: &str,
+) -> rusqlite::Result<Option<StoreError>> {
+    let Some(metadata) = live_row_metadata(conn, id)? else {
+        return Ok(None);
+    };
+    let stamp = crate::identity::owner_stamp::OwnerStamp::of(&metadata);
+    let reason = if stamp.is_unstamped() {
+        crate::errors::msg::REASON_UNSTAMPED_TENANT_ARCHIVE.to_string()
+    } else {
+        let owner = stamp.owner_for_display();
+        tracing::warn!(
+            target: crate::handlers::AUTHZ_TRACE_TARGET,
+            "sal owner-gate refusal on {ARCHIVE_ACTION}: caller {caller} != owner {owner} (id={id})"
+        );
+        crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.to_string()
+    };
+    Ok(Some(StoreError::PermissionDenied {
+        action: ARCHIVE_ACTION.to_string(),
+        target: id.to_string(),
+        reason,
+    }))
 }
 
 /// #4447 — map the typed in-transaction by-id refusal onto the ONE
@@ -3269,7 +3306,7 @@ impl MemoryStore for SqliteStore {
                     // disagreed on probe-error disposition. The probe maps a
                     // missing row to `Ok(false)`, so the only `Err` here is a
                     // genuine backend fault, which must roll the whole batch
-                    // back (the closure returns `anyhow::Result`).
+                    // back (the closure returns `StoreResult`).
                     let owned = db::caller_may_mutate_live_row(
                         &conn,
                         id,
@@ -3284,12 +3321,10 @@ impl MemoryStore for SqliteStore {
                         // archived); an id with no live row stays a silent
                         // skip (the count-delta contract, not an existence
                         // oracle for absent ids).
-                        if live_row_exists(&conn, id).map_err(box_err)? {
-                            return Err(StoreError::PermissionDenied {
-                                action: ARCHIVE_ACTION.to_string(),
-                                target: id.clone(),
-                                reason: crate::errors::msg::CALLER_DOES_NOT_OWN_MEMORY.to_string(),
-                            });
+                        if let Some(refusal) =
+                            archive_refusal(&conn, id, &caller).map_err(box_err)?
+                        {
+                            return Err(refusal);
                         }
                         continue;
                     }

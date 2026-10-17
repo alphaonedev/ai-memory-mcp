@@ -134,6 +134,7 @@ mod lock_order_4209;
 mod permanent_err_7094;
 // #7098 - the lease-lifecycle audit row, appended inside the lease transaction.
 mod lease_audit_7098;
+// #7095 - the link audit row, appended inside the link transaction.
 mod link_audit_7095;
 
 use crate::models::field_names;
@@ -2603,8 +2604,7 @@ const REASON_UNSTAMPED_TENANT_DELETE: &str =
 /// posture the write/delete verbs take (REFUSE — see #3124 for the
 /// cross-backend policy decision). Refusing leaves the row LIVE, so the
 /// fail-closed arm can never lose data.
-const REASON_UNSTAMPED_TENANT_ARCHIVE: &str =
-    "memory has no agent_id stamp; tenant archives refused (use admin path)";
+const REASON_UNSTAMPED_TENANT_ARCHIVE: &str = crate::errors::msg::REASON_UNSTAMPED_TENANT_ARCHIVE;
 
 /// v0.8.1 W1 (#1821 / gap G29) + #1844 — postgres parity for the sqlite
 /// `db::insert` / `insert_if_newer` credential REDACT backstop. Returns a
