@@ -33,9 +33,9 @@ use crate::models::field_names;
 
 // #3659 — delivery-audit bookkeeping evidence (counters, /metrics, /health).
 pub mod audit_status;
+mod scan_failure; // #7366 failed-lookup retry + DLQ record
 // #3979 — admitted-but-not-started deliveries, DLQ-recorded at the drain deadline.
 mod unstarted;
-mod scan_failure;
 pub use scan_failure::{
     DISPATCH_SCAN_FAILED_SUB_ID, ScanFailure, classify_sqlstate, is_scan_failure_sub_id,
     record_dispatch_scan_failure, retry_lookup_async, scan_failure_sub_id, scan_failure_visible_to,

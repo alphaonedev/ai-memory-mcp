@@ -118,13 +118,21 @@ fn a_sqlite_lookup_failure_leaves_a_durable_dlq_record_7366() {
 
     // A fresh connection: the DLQ list reads the durable record.
     let conn = ai_memory::db::open(&path).expect("reopen");
-    let listed =
-        ai_memory::mcp::handle_subscription_dlq_list(&conn, &serde_json::json!({}), Some(MCP_CLIENT))
-            .expect("dlq list for the writer");
-    assert_eq!(listed["count"], 1, "the writer must see the record: {listed}");
+    let listed = ai_memory::mcp::handle_subscription_dlq_list(
+        &conn,
+        &serde_json::json!({}),
+        Some(MCP_CLIENT),
+    )
+    .expect("dlq list for the writer");
+    assert_eq!(
+        listed["count"], 1,
+        "the writer must see the record: {listed}"
+    );
     let other = ai_memory::identity::resolve_agent_id(None, Some("someone-else-7366"))
         .expect("resolve another caller");
-    assert!(ai_memory::subscriptions::scan_failure_visible_to(row, &writer));
+    assert!(ai_memory::subscriptions::scan_failure_visible_to(
+        row, &writer
+    ));
     assert!(
         !ai_memory::subscriptions::scan_failure_visible_to(row, &other),
         "another caller must not see the writer's record"
