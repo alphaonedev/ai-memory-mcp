@@ -174,6 +174,64 @@ fn c_a_flooded_namespace_does_not_starve_another_namespace_7409() {
     );
 }
 
+/// Fill `subscription_dlq` with one failed-lookup row in each of `n` distinct
+/// namespaces (the cap-defeat vector of #7430: vary the bucket key).
+fn fill_distinct_namespaces(conn: &rusqlite::Connection, n: i64) {
+    conn.execute(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2) \
+         INSERT INTO subscription_dlq \
+         (subscription_id, correlation_id, event_type, payload, retry_count, last_error, \
+          first_failed_at, last_failed_at) \
+         SELECT ?1 || ':invented-' || i, 'inv-' || i, 'memory_store', '{}', 0, 'x', 'now', 'now' \
+         FROM n",
+        rusqlite::params![DISPATCH_SCAN_FAILED_SUB_ID, n],
+    )
+    .expect("fill distinct namespaces");
+}
+
+fn failed_lookup_rows(conn: &rusqlite::Connection) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM subscription_dlq WHERE substr(subscription_id, 1, ?1) = ?2",
+        rusqlite::params![
+            i64::try_from(DISPATCH_SCAN_FAILED_SUB_ID.len()).expect("len"),
+            DISPATCH_SCAN_FAILED_SUB_ID
+        ],
+        |r| r.get(0),
+    )
+    .expect("count failed-lookup rows")
+}
+
+// ---------------------------------------------------------------------------
+// CELL D — #7430: inventing namespaces cannot defeat the retention cap.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn d_inventing_namespaces_cannot_exceed_the_total_cap_7430() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("cap.db");
+    let conn = ai_memory::db::open(&path).expect("open");
+    let cap = ai_memory::subscriptions::MAX_SUBSCRIPTION_DLQ_ROWS;
+    fill_distinct_namespaces(&conn, cap);
+    assert_eq!(failed_lookup_rows(&conn), cap);
+
+    ai_memory::subscriptions::record_dispatch_scan_failure(
+        &path,
+        &ai_memory::subscriptions::ScanFailure {
+            event: EVENT,
+            memory_id: MEMORY_ID,
+            namespace: "team/one-more",
+            agent_id: None,
+            details: None,
+        },
+        "sqlite_error",
+    );
+    assert_eq!(
+        failed_lookup_rows(&conn),
+        cap,
+        "the total of failed-lookup rows must stay bounded however many namespaces are invented"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // CELL B — postgres funnel: a failing SAL prefix scan leaves a durable row.
 // ---------------------------------------------------------------------------
@@ -364,6 +422,36 @@ mod postgres_funnel {
         assert!(
             elapsed >= ladder_floor(),
             "the retries must wait out the ladder; took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn d_postgres_inventing_namespaces_cannot_exceed_the_total_cap_7430() {
+        let store_dir = tempfile::tempdir().expect("store tempdir");
+        let inner = SqliteStore::open(store_dir.path().join("store.db")).expect("open store");
+        let double = Arc::new(LookupFaultStore {
+            inner,
+            scans: AtomicUsize::new(0),
+        });
+        let (state, sqlite_path) = make_state(double);
+        let conn = ai_memory::db::open(&sqlite_path).expect("open audit db");
+        let cap = ai_memory::subscriptions::MAX_SUBSCRIPTION_DLQ_ROWS;
+        fill_distinct_namespaces(&conn, cap);
+
+        dispatch_event_postgres(
+            &state,
+            EVENT,
+            MEMORY_ID,
+            "team/one-more",
+            Some(WRITER),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            failed_lookup_rows(&conn),
+            cap,
+            "the postgres funnel must respect the same bounded total"
         );
     }
 }
