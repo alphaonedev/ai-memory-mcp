@@ -101,6 +101,8 @@ PSQL_TIMEOUT_SECS = 300.0
 PSQL_CAP_MARGIN_SECS = 10.0
 PSQL_LOCK_GAP_SECS = 5.0
 LIBPQ_MIN_CONNECT_SECS = 2
+GUARD_SQL_MAX_BYTES = 65536  # the psql() guard refuses longer SQL unread: its cost is bounded by construction (#7615)
+# linear: one quantified class, no alternation, fullmatch on a short env value
 _DIGITS_RE = re.compile(r'[0-9]+')
 IN_USE_TEXT = 'being accessed by other users'
 EXIT_USAGE = 2
@@ -120,9 +122,13 @@ _QUERY_TO_ENV = {
     'target_session_attrs': 'PGTARGETSESSIONATTRS',
     'options': 'PGOPTIONS',
 }
+# linear: one bounded class repetition between anchors
 _RUN_ID_RE = re.compile(r'^[a-z0-9]{1,%d}$' % RUN_ID_MAX_LEN)
+# linear: bounded class repetitions separated by a fixed underscore, so no two quantifiers can overlap
 _ANY_NAME_RE = re.compile(r'^%s_([a-z0-9]{1,%d})_([0-9]{10})_([0-9a-f]{8})$' % (ISOLATED_PREFIX, RUN_ID_MAX_LEN))
+# linear: one bounded class repetition between anchors
 _IDENT_RE = re.compile(r'^[A-Za-z0-9_]{1,%d}$' % IDENT_MAX)
+# linear: fixed prefix, a literal space, then one class repetition to the anchor
 _TARGET_RE = re.compile(r'^--(test|bin) ([A-Za-z0-9_-]+)$')
 _PRINT_LOCK = threading.Lock()
 
@@ -383,11 +389,14 @@ def server_caps_sql(env: Dict[str, str]) -> str:
 #   UESCAPE            parser.c base_yylex reads the token AFTER a U& token, so whitespace and comments may sit
 #                      between (#7576); the escape must be one simple string literal of one ASCII character
 _SPACE = ' \t\n\r\f\v'
+# linear: one character class, matched at one index
 _IDENT_START_RE = re.compile(r'[A-Za-z_\x80-\U0010ffff]')
+# linear: one quantified class and nothing after it, so there is nothing to give back
 _IDENT_BODY_RE = re.compile(r'[A-Za-z0-9_$\x80-\U0010ffff]*')
+# linear: a start class then one quantified class (disjoint from the closing dollar), tried once per dollar sign
 _DOLLAR_TAG_RE = re.compile(r'\$(?:[A-Za-z_\x80-\U0010ffff][A-Za-z0-9_\x80-\U0010ffff]*)?\$')
+# linear: one quantified class, fullmatch on at most eight characters
 _HEX_RE = re.compile(r'[0-9A-Fa-f]+')
-_CONTINUE_RE = re.compile(r"(?:[ \t\f]|--[^\n\r]*)*[\n\r](?:[ \t\n\r\f\v]+|--[^\n\r]*[\n\r])*'")
 _FORBIDDEN_NAMES = frozenset((
     'statement_timeout', 'lock_timeout', 'idle_in_transaction_session_timeout', 'idle_session_timeout',
     'transaction_timeout', 'session_authorization', 'role', 'set_config', 'pg_settings', 'pg_reload_conf'))
@@ -468,6 +477,37 @@ def _decode_e(body: str) -> str:
     return ''.join(out)
 
 
+def _line_comment_end(sql: str, i: int) -> int:
+    """Index of the first newline or CR at or after ``i`` (``len(sql)`` when the comment runs to the end)."""
+    n = len(sql)
+    while i < n and sql[i] not in '\n\r':
+        i += 1
+    return i
+
+
+def _continuation_quote(sql: str, i: int) -> int:
+    """Index of the quote that continues a literal ending just before ``sql[i]``, or ``-1``. scan.l quotecontinue:
+    blanks and ``--`` comments, a newline, then whitespace (newlines included) and ``--`` comments, then a quote.
+    A plain forward scan, one pass, no backtracking: the regex it replaces backtracked exponentially (#7615)."""
+    n = len(sql)
+    while i < n and (sql[i] in ' \t\f' or sql.startswith('--', i)):
+        i = _line_comment_end(sql, i) if sql[i] == '-' else i + 1
+    if i >= n or sql[i] not in '\n\r':
+        return -1
+    i += 1
+    while i < n:
+        if sql[i] in _SPACE:
+            i += 1
+        elif sql.startswith('--', i):
+            i = _line_comment_end(sql, i)
+            if i >= n:
+                return -1
+            i += 1                               # the comment's own newline
+        else:
+            break
+    return i if i < n and sql[i] == "'" else -1
+
+
 def _literal(sql: str, i: int, doubling: bool, backslash: bool) -> Tuple[int, str]:
     """``(end, raw_body)`` of the quoted run whose opening quote is ``sql[i]``, following quote-continuation
     (a newline between two quotes joins them into one literal read the same way). ``doubling`` is whether ``''``
@@ -491,10 +531,10 @@ def _literal(sql: str, i: int, doubling: bool, backslash: bool) -> Tuple[int, st
             else:
                 i += 1
         parts.append(sql[start:i])
-        joined = _CONTINUE_RE.match(sql, i + 1)
-        if joined is None:
+        joined = _continuation_quote(sql, i + 1)
+        if joined < 0:
             return i + 1, ''.join(parts)
-        i = joined.end() - 1
+        i = joined
 
 
 def _quoted_ident_end(sql: str, i: int) -> int:
@@ -639,6 +679,9 @@ def _resolve_uescape(raw: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
 
 
 def _refuse_uncapped_sql(sql: str) -> None:
+    if len(sql.encode('utf-8', 'surrogatepass')) > GUARD_SQL_MAX_BYTES:
+        raise WrapperError('refusing SQL over the %d-byte guard limit (%d characters): the guard stays bounded '
+                           'whatever the input (%r)' % (GUARD_SQL_MAX_BYTES, len(sql), sql[:60]))
     tokens = _tokenise(sql)
     if tokens and tokens[-1][0] == _SEMI:
         tokens = tokens[:-1]

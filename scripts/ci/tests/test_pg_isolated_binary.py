@@ -881,8 +881,8 @@ class TemplateOwnership(unittest.TestCase):
     # Every SQL text the module's own callers hand to psql() (connection_budget, mint, drop, session_count,
     # _proved_absent, setup, _names, teardown, sweep) and the live-test helpers: none may be refused.
     REAL_CALLER_SHAPES = [
-        "SELECT current_setting('max_connections')::int, current_setting('superuser_reserved_connections')::int, "
-        "coalesce(current_setting('reserved_connections', true)::int, 0), (SELECT count(*) FROM pg_stat_activity)",
+        ("SELECT current_setting('max_connections')::int, current_setting('superuser_reserved_connections')::int, "
+         "coalesce(current_setting('reserved_connections', true)::int, 0), (SELECT count(*) FROM pg_stat_activity)"),
         'CREATE DATABASE "ai_memory_t_r1_2" TEMPLATE "ai_memory_x_tpl"',
         'DROP DATABASE IF EXISTS "ai_memory_t_r1_2"',
         "SELECT count(*) FROM pg_stat_activity WHERE datname = 'ai_memory_t_r1_2'",
@@ -893,8 +893,8 @@ class TemplateOwnership(unittest.TestCase):
         'ALTER DATABASE "ai_memory_x_tpl" WITH IS_TEMPLATE false',
         "SELECT datname FROM pg_database WHERE starts_with(datname, 'ai_memory_t_r1_')",
         'SELECT extract(epoch FROM now())::bigint',
-        "SELECT d.datname FROM pg_database d WHERE starts_with(d.datname, 'ai_memory_t_') "
-        "AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)",
+        ("SELECT d.datname FROM pg_database d WHERE starts_with(d.datname, 'ai_memory_t_') "
+         "AND NOT EXISTS (SELECT 1 FROM pg_stat_activity a WHERE a.datname = d.datname)"),
         'SELECT rolsuper OR rolcreaterole FROM pg_catalog.pg_roles WHERE rolname = current_user',
         'SELECT pg_sleep(60) /* r8cap0123456789 */',
         "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '%r8cap0123456789%' AND pid <> pg_backend_pid()",
