@@ -894,6 +894,8 @@ pub use merge_inbound_authorized_4023::{
 // the same qual_10 reason as `merge_inbound_authorized_4023`.
 mod federation_by_id_4447;
 // #4206 — the title-slot pre-merge archive snapshot helpers (qual_10 split).
+mod consolidate_dest;
+mod link_savepoint;
 mod title_slot_archive;
 pub use federation_by_id_4447::{
     ByIdNamespaceAuthorizer, InboundByIdNamespaceRefused, archive_memory_authorized,
@@ -10096,6 +10098,7 @@ pub fn create_link_signed_with_window(
     // entirely, so a caller-supplied expiry could never land), and
     // `created_at` / `valid_from` bind SEPARATE parameters instead of sharing
     // `?4` — the postgres twin has always bound all three independently.
+    let savepoint = link_savepoint::LinkSavepoint::open(conn)?; // #7559
     let inserted = conn.execute(
         "INSERT OR IGNORE INTO memory_links \
             (source_id, target_id, relation, created_at, valid_from, valid_until, signature, attest_level, observed_by, source_cid, target_cid) \
@@ -10162,12 +10165,29 @@ pub fn create_link_signed_with_window(
                     timestamp: Utc::now().to_rfc3339(),
                     ..crate::signed_events::SignedEvent::default()
                 };
-                if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
-                    tracing::warn!(
-                        target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
-                        source_id, target_id, relation,
-                        "failed to append memory_link.created audit row: {e}"
-                    );
+                if conn.is_autocommit() {
+                    if let Err(e) = crate::signed_events::append_signed_event(conn, &event) {
+                        tracing::warn!(
+                            target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                            source_id, target_id, relation,
+                            "failed to append memory_link.created audit row: {e}"
+                        );
+                    }
+                } else {
+                    // #7092 — inside a caller-owned transaction (the
+                    // consolidate tombstone edge) `append_signed_event`
+                    // cannot open its own `BEGIN IMMEDIATE`: the nested
+                    // BEGIN failed and the warn-drop above lost the audit
+                    // row. Append on the caller's transaction instead and
+                    // fail CLOSED: the error unwinds the owner, so a link
+                    // never commits without its audit row. The off-table
+                    // anchor rides the owner's frame and is emitted only
+                    // after its COMMIT.
+                    let anchor = crate::signed_events::append_signed_event_no_tx(conn, &event)
+                        .context(
+                            "append memory_link.created audit row in the caller transaction",
+                        )?;
+                    crate::storage::escalation_deferral::defer_audit_anchor(conn, anchor);
                 }
             }
             Err(e) => {
@@ -10190,6 +10210,7 @@ pub fn create_link_signed_with_window(
     // what is ACTUALLY STORED instead. Fail closed: an unreadable, missing, or
     // unrecognised column reports `unsigned` — the weakest honest claim — and
     // never the stronger computed one.
+    savepoint.release()?;
     if inserted == 0 {
         return Ok(stored_link_attest_level(
             conn, source_id, target_id, relation,
@@ -10806,7 +10827,16 @@ pub fn consolidate_with_expected_versions(
                     }
                 }
                 None => {
-                    // #962 typed envelope.
+                    // #7091 — `get` folds a hidden lifecycle state
+                    // (quarantined / contaminated / tombstoned) into
+                    // `None`, so tell "absent" from "hidden" with the
+                    // unfiltered authz read: a hidden source is the typed
+                    // `InvalidTransition` refusal postgres returns (the
+                    // same shape the tombstone guard below uses), an absent
+                    // one the #962 typed `MemoryNotFound`.
+                    if get_any(conn, id)?.is_some() {
+                        return Err(consolidate_source_hidden(id).into());
+                    }
                     return Err(anyhow::Error::new(StorageError::MemoryNotFound {
                         id: id.to_string(),
                         role: None,
@@ -10983,9 +11013,25 @@ pub fn consolidate_with_expected_versions(
         // the envelope is NULL — byte-identical to pre-#2301 behaviour.
         // `consolidator_agent_id` is the authoritative NHI owner stamped into
         // `metadata.agent_id` above, so it is the correct seal key.
-        let sealed = seal_content_guarded(conn, summary, consolidator_agent_id)?;
-        let content_to_store = sealed.as_ref().map_or(summary, |(_, ph)| ph.as_str());
-        let encrypted_envelope: Option<&[u8]> = sealed.as_ref().map(|(env, _)| env.as_slice());
+        //
+        // #7111 — the summary can now MERGE into an existing destination row
+        // (postgres parity), so the seal is keyed to the identity the
+        // SURVIVING row retains (#2383), exactly like `insert_inner`, and the
+        // post-write `reconcile_envelope_owner` below repairs a concurrent
+        // first creation.
+        let seal = seal_content_for_upsert(conn, &candidate)?;
+        let content_to_store = seal.content_to_store.as_str();
+        let encrypted_envelope: Option<&[u8]> = seal.envelope_bytes();
+
+        // #7111 — destination slot admission (typed, unnamed refusal of a hidden
+        // holder) and the pre-image version for the #2948 SUPERSEDE leaf.
+        let dest_prior_version = consolidate_dest::admit_destination(
+            conn,
+            title,
+            namespace,
+            &new_id,
+            (!substrate_authored).then_some(consolidator_agent_id),
+        )?;
 
         // v0.7.0 #1466 — consolidate mints a fresh memory via this raw
         // INSERT, so it must carry the tier-default expiry too; otherwise a
@@ -10994,13 +11040,56 @@ pub fn consolidate_with_expected_versions(
         // here matches the `?10` bound below.
         // v1.0.0 #2935 — the `confidence` column binds `?17` (min over the
         // source confidences, captured above), NOT the former hardcoded 1.0.
-        conn.execute(
-            // v1.0.0 #2935 — bind `memory_kind` (?18); the pre-fix INSERT
-            // omitted it so the row fell to the schema default ('observation').
-            "INSERT INTO memories (id, tier, namespace, title, content, tags, priority, confidence, source, access_count, created_at, updated_at, expires_at, metadata, confidence_source, cid, cid_genesis, encrypted_envelope, memory_kind)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?17, ?8, ?9, ?10, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?18)",
-            params![new_id, tier.as_str(), namespace, title, content_to_store, tags_json, max_priority, source, total_access, now, candidate.effective_expires_at(), metadata_json, candidate.confidence_source.as_str(), cid_stamp.cid, cid_stamp.genesis, encrypted_envelope, min_confidence, candidate.memory_kind.as_str()],
-        )?;
+        //
+        // #7111 — `ON CONFLICT` upsert onto the live `(title, namespace)` slot
+        // (postgres parity): an existing visible destination is overwritten in
+        // place and its surviving id returned; a hidden holder that landed
+        // after the admission probe updates NOTHING (merge backstop) and
+        // surfaces as the typed unnamed conflict.
+        let inserted_id: String = match conn
+            .prepare_cached(&consolidate_dest::CONSOLIDATE_UPSERT_SQL)?
+            .query_row(
+                params![
+                    new_id,
+                    tier.as_str(),
+                    namespace,
+                    title,
+                    content_to_store,
+                    tags_json,
+                    max_priority,
+                    source,
+                    total_access,
+                    now,
+                    candidate.effective_expires_at(),
+                    metadata_json,
+                    candidate.confidence_source.as_str(),
+                    cid_stamp.cid,
+                    cid_stamp.genesis,
+                    encrypted_envelope,
+                    min_confidence,
+                    candidate.memory_kind.as_str()
+                ],
+                |r| r.get(0),
+            ) {
+            Ok(id) => id,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                return Err(ConflictError {
+                    existing_id: String::new(),
+                    title: title.to_string(),
+                    namespace: namespace.to_string(),
+                }
+                .into());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        // #2383 (N1) — invariant backstop, same tx.
+        reconcile_envelope_owner(conn, &inserted_id, summary, &seal)?;
+        // The surviving row's id (a fresh row keeps `new_id`).
+        let new_id = inserted_id;
+        // #2948 — a destination overwritten in place is a COW SUPERSEDE
+        // distinct from the per-source CONSOLIDATE leaves; `None` on a fresh
+        // consolidate or with the spine off.
+        emit_upsert_supersede_leaf_if_enabled(conn, dest_prior_version, &new_id, &candidate)?;
 
         // v0.9.0 G13-mem (#1859, COND 1) — the SINGLE consolidate-leaf
         // emission site, shared-predicate-keyed with the Postgres twin
@@ -11032,6 +11121,12 @@ pub fn consolidate_with_expected_versions(
             // multi-hop store -> reflect -> consolidate lineage stays
             // navigable across the consolidation boundary.
             for (id, _cid, _version, _source_ns) in &source_rows {
+                // #7111 — a source that IS the upserted destination row is
+                // the surviving summary itself: never link it to itself or
+                // tombstone it (postgres parity).
+                if id == &new_id {
+                    continue;
+                }
                 // C -> source `derived_from`, routed through the UNSIGNED
                 // `create_link` wrapper -> `create_link_signed(.., None)`
                 // (COND 6): that path populates `source_cid`/`target_cid`.
@@ -11075,6 +11170,9 @@ pub fn consolidate_with_expected_versions(
             // `metadata.derived_from` (non-navigable, plus the cid twin
             // above when the master flag is on) instead.
             for id in ids {
+                if id == &new_id {
+                    continue;
+                }
                 delete(conn, id)?;
             }
         }

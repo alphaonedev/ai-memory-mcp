@@ -75,6 +75,10 @@ src/quotas.rs	refund_op
 src/quotas.rs	check_and_record_storage_only
 src/quotas.rs	refund_storage_only
 src/quotas.rs	record_op
+# #7564: record_memory_batch_in_tx is the store_batch quota charge. Its only caller,
+# SqliteStore::store_batch, runs gate_record_stop() before it opens the transaction, so the
+# gate sits upstream exactly as for the other quotas.rs writers above. Reviewed (#7468 r1).
+src/quotas.rs	record_memory_batch_in_tx
 src/quotas.rs	reset_daily
 # B9 (2026-08-28): postgres.rs methods that write record-plane tables now
 # GATE (reflect_with_hooks, update_embedding, link_internal, charge_update_growth,

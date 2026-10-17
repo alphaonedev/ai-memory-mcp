@@ -59,6 +59,11 @@ ALLOWLIST = {
         "preview arm only: opens read-only (open_read_only) and issues plain "
         "BEGIN for a consistent read; the delete arm is BEGIN IMMEDIATE"
     ),
+    ("src/storage/link_savepoint.rs", "open"): (
+        "#7559 nested savepoint only: it is issued solely when "
+        "`!conn.is_autocommit()` (a caller-owned WriteTxn is already open), so "
+        "it never begins a DEFERRED transaction; autocommit callers skip it"
+    ),
 }
 
 FN = re.compile(r"\bfn\s+([A-Za-z0-9_]+)")
