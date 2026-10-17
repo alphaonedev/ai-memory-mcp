@@ -89,6 +89,11 @@ CONNECT_TIMEOUT_SECS = '30'
 # decision: one psql call (CREATE ... TEMPLATE copies a database, DROP waits on sessions) gets 300 s, well above
 # any healthy statement, so only a stalled server or a held lock trips it (#7429).
 PSQL_TIMEOUT_SECS = 300.0
+# decision: the server cancels its own statement at 90% of the client wall time (statement_timeout and
+# lock_timeout through PGOPTIONS) over Popen+SIGINT, because the server cap still fires when psql is killed,
+# hung or cut off, while a cancel request needs a live client; the margin keeps the server error ahead of the
+# client kill so a timed-out statement cannot commit late (#7447).
+PSQL_SERVER_FRACTION = 0.9
 IN_USE_TEXT = 'being accessed by other users'
 EXIT_USAGE = 2
 EXIT_MINT = 3
@@ -276,10 +281,18 @@ def libpq_env(url: str) -> Dict[str, str]:
     return env
 
 
-def _pg_env(url: str) -> Dict[str, str]:
-    """The process env with inherited PG* removed and this URL's libpq vars."""
+def _pg_env(url: str, bounded: bool = False) -> Dict[str, str]:
+    """The process env with inherited PG* removed and this URL's libpq vars.
+
+    ``bounded`` appends the server-side statement and lock timeouts to PGOPTIONS (keeping a URL ``options``
+    value), so a statement outlives neither the client wall time nor a killed client (#7447).
+    """
     env = {k: v for k, v in os.environ.items() if not k.startswith('PG')}
     env.update(libpq_env(url))
+    if bounded:
+        millis = max(1, int(PSQL_TIMEOUT_SECS * 1000 * PSQL_SERVER_FRACTION))
+        caps = '-c statement_timeout=%dms -c lock_timeout=%dms' % (millis, millis)
+        env['PGOPTIONS'] = ('%s %s' % (env['PGOPTIONS'], caps)) if env.get('PGOPTIONS') else caps
     return env
 
 
@@ -290,7 +303,8 @@ def psql(url: str, sql: str, tuples: bool = False) -> str:
         argv.append('-At')
     argv += ['-c', sql]
     try:
-        done = subprocess.run(argv, capture_output=True, text=True, env=_pg_env(url), timeout=PSQL_TIMEOUT_SECS)
+        done = subprocess.run(argv, capture_output=True, text=True, env=_pg_env(url, bounded=True),
+                              timeout=PSQL_TIMEOUT_SECS)
     except subprocess.TimeoutExpired:
         raise WrapperError('psql timed out after %g s' % PSQL_TIMEOUT_SECS, None)
     if done.returncode != 0:
@@ -423,7 +437,11 @@ def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
                                '--run-id <run id>` first, otherwise choose a different --db'
                                % (tpl, exc, db_name))
         check = "SELECT 1 FROM pg_database WHERE datname = '%s'" % tpl.replace("'", "''")
-        absent, why = False, 'psql ended with status %s, not a plain SQL error' % exc.returncode
+        if exc.returncode is None:
+            why = 'psql timed out, so the server may still commit the statement'
+        else:
+            why = 'psql ended with status %s, not a plain SQL error' % exc.returncode
+        absent = False
         if exc.returncode == PSQL_SQL_ERROR:
             absent, why = _proved_absent(url, check)
         if not absent:

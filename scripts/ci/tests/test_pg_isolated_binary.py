@@ -644,6 +644,62 @@ class TemplateOwnership(unittest.TestCase):
                 self.assertFalse(absent)
                 self.assertIn('the existence check itself failed: psql timed out', why)
 
+    def test_psql_env_carries_server_timeouts_and_keeps_url_options_7447(self):
+        seen = []
+
+        def answer(argv, kw):
+            seen.append(kw['env'])
+            return Result(0, '', '')
+        url = BASE + ('&' if '?' in BASE else '?') + 'options=-c%20search_path%3Dpublic'
+        with unittest.mock.patch.object(pib.subprocess, 'run', Recorder(answer)):
+            pib.psql(url, 'SELECT 1')
+        options = seen[0]['PGOPTIONS']
+        millis = int(pib.PSQL_TIMEOUT_SECS * 1000 * pib.PSQL_SERVER_FRACTION)
+        self.assertIn('-c search_path=public', options)
+        self.assertIn('-c statement_timeout=%dms' % millis, options)
+        self.assertIn('-c lock_timeout=%dms' % millis, options)
+        self.assertLess(millis, pib.PSQL_TIMEOUT_SECS * 1000)
+        with unittest.mock.patch.object(pib.subprocess, 'run', Recorder(answer)):
+            pib.psql(BASE, 'SELECT 1')
+        self.assertIn('statement_timeout', seen[1]['PGOPTIONS'])
+
+    def test_unknown_reason_wording_7448(self):
+        refused = {'CREATE DATABASE': 'ERROR:  permission denied to create database'}
+
+        def text(pg):
+            with self.assertRaises(pib.WrapperError) as ctx:
+                self.run_setup(pg)
+            return str(ctx.exception), ctx.exception.returncode
+
+        # a timed-out CREATE: its own wording, never "status None"
+        inner = FakePg()
+
+        def timing_out(argv, kw):
+            if 'CREATE DATABASE' in argv[-1]:
+                raise subprocess.TimeoutExpired(argv, 1)
+            return inner(argv, kw)
+        with unittest.mock.patch.object(pib.subprocess, 'run', Recorder(timing_out)):
+            with self.assertRaises(pib.WrapperError) as ctx:
+                pib.setup(BASE, self.DB, 8)
+        msg = str(ctx.exception)
+        self.assertIsNone(ctx.exception.returncode)
+        self.assertIn('outcome is unknown', msg)
+        self.assertIn('psql timed out, so the server may still commit the statement', msg)
+        self.assertNotIn('status None', msg)
+        self.assertNotIn('not a plain SQL error', msg)
+        self.assertFalse([s for s in inner.log if s.startswith(('ALTER', 'DROP', 'CREATE EXT'))])
+        for status in (2, 3):
+            with self.subTest(status=status):
+                msg, rc = text(FakePg(lost=('CREATE DATABASE',), lost_status=status))
+                self.assertIn('psql ended with status %d, not a plain SQL error' % status, msg)
+                self.assertEqual(rc, status)
+        msg, _ = text(FakePg({TPL: {'template': False, 'sessions': 0}}, fail=refused))
+        self.assertIn('the existence check found a database with this name', msg)
+        self.assertNotIn('not a plain SQL error', msg)
+        msg, _ = text(FakePg(fail=dict(refused, **{'SELECT 1 FROM pg_database': 'ERROR:  check-failed'})))
+        self.assertIn('the existence check itself failed', msg)
+        self.assertNotIn('not a plain SQL error', msg)
+
     def test_empty_stderr_is_spelled_out_7406(self):
         silent = lambda argv, kw: Result(-9, '', '')
         with unittest.mock.patch.object(pib.subprocess, 'run', Recorder(silent)):
