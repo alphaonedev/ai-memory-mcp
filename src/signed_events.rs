@@ -3044,8 +3044,11 @@ pub fn append_signed_event_no_tx(
     // `db_head < anchored_head` — a tail truncation that a contiguous
     // surviving `1..=(head-N)` chain would otherwise hide as `chain_intact`.
     // The hash binds the anchor to the head row's content (it is exactly
-    // what the NEXT row's `prev_hash` would be). Sink-gated + fire-and-
-    // forget — never fails the append.
+    // what the NEXT row's `prev_hash` would be). Sink-gated. The anchor is
+    // best-effort: when its genesis `db_id` is absent or cannot be READ the
+    // emission is skipped (WARN, and a read error is counted) and the append
+    // still succeeds; the next emission-due append retries (3-agent vote
+    // (6def5ab6), #7604).
     //
     // #7241 - the anchor is only COMPUTED here: it is returned as a pending
     // value and recorded by the committing owner after `COMMIT` succeeded
@@ -3078,8 +3081,14 @@ pub fn append_signed_event_no_tx(
     if crate::governance::audit::watermark_emission_due(next_seq) {
         // #7228 — never anchor a db_id-less (legacy) watermark: the reader counts
         // it against EVERY opener of the shared sink. An absent genesis skips the
-        // emission (one WARN); a genesis read error is WARNed and skipped, never
-        // silently dropped (ERRORS-19), mirroring the witness lane's swallow.
+        // emission (one WARN). A genesis READ ERROR also skips it (a WARN per
+        // skip, counted) and the append still succeeds, so the chain never
+        // stalls and best-effort callers keep their audit row; the throttle is
+        // not claimed, so the next emission-due append retries. decision
+        // (#7238, #7239, #7604): skip over fail closed, 3-agent vote (6def5ab6),
+        // 3-0 for skip, because failing the append stalled the chain permanently
+        // and left best-effort callers committing with no audit row. Postgres
+        // matches (savepoint around the genesis read).
         match genesis_db_id(conn) {
             Ok(Some(db_id)) => {
                 anchor = crate::governance::audit::PendingAuditAnchor::watermark(
@@ -3089,10 +3098,7 @@ pub fn append_signed_event_no_tx(
                 );
             }
             Ok(None) => crate::governance::audit::warn_watermark_skipped_no_genesis(),
-            Err(e) => tracing::warn!(
-                target: SIGNED_EVENTS_TRACE_TARGET,
-                "audit watermark skipped: genesis db-id read failed: {e:#}"
-            ),
+            Err(e) => crate::governance::audit::warn_watermark_skipped_genesis_read_error(&e),
         }
     }
 
@@ -3115,8 +3121,8 @@ pub fn append_signed_event_no_tx(
 /// v0.9.0 G5b (#1822) — emit the dual-chain audit-head witness anchor if a
 /// witness key is enrolled AND the throttle boundary is reached (or `force`
 /// on graceful shutdown). Fire-and-forget: a witness failure is logged and
-/// swallowed — it NEVER fails the signed-events append (mirrors the #1850
-/// watermark). Opt-in: a deployment with no enrolled witness key emits
+/// swallowed — it NEVER fails the signed-events append (like the #1850
+/// watermark, which skips on a genesis read error and appends). Opt-in: a deployment with no enrolled witness key emits
 /// nothing (byte-identical legacy behaviour).
 ///
 /// #7241 - returns the inserted checkpoint so the caller mirrors it OFF-TABLE
