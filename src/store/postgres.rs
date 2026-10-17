@@ -134,6 +134,7 @@ mod lock_order_4209;
 mod permanent_err_7094;
 // #7098 - the lease-lifecycle audit row, appended inside the lease transaction.
 mod lease_audit_7098;
+mod link_audit_7095;
 
 use crate::models::field_names;
 use std::time::Duration;
@@ -13308,14 +13309,38 @@ impl PostgresStore {
         .bind(created_at_dt)
         .bind(valid_from_dt)
         .bind(valid_until_dt)
-        .bind(signature)
+        .bind(signature.as_deref())
         .bind(attest_level)
-        .bind(observed_by_col)
+        .bind(observed_by_col.as_deref())
         .bind(source_cid)
         .bind(target_cid)
         .execute(&mut *tx)
         .await
         .map_err(|e| to_store_err("insert memory_link", e))?;
+        // #7095 — the `memory_link.created` audit row rides THIS tx, fail
+        // closed, and runs BEFORE the AGE projection below (#7101: a
+        // projection `SET LOCAL search_path` would move later statements out
+        // of the configured schema). Only a row actually created is audited;
+        // an idempotent replay wrote nothing (sqlite parity).
+        let audit_anchor = if insert_res.rows_affected() > 0 {
+            link_audit_7095::append_link_created_in_tx(
+                &mut tx,
+                &link_audit_7095::LinkAuditFacts {
+                    source_id: &link.source_id,
+                    target_id: &link.target_id,
+                    relation: link.relation.as_str(),
+                    observed_by: observed_by_col.as_deref(),
+                    created_at: &created_at_str,
+                    valid_from: &valid_from_str,
+                    valid_until: valid_until_str.as_deref(),
+                    attest_level,
+                    signature: signature.as_deref(),
+                },
+            )
+            .await?
+        } else {
+            crate::governance::audit::PendingAuditAnchor::none()
+        };
         // #3051 / Fable #3237 item 2 — ON CONFLICT DO NOTHING preserves the
         // existing row. Returning the freshly COMPUTED `attest_level` on
         // that path would report `unsigned` for a replay of an unsigned
@@ -13475,7 +13500,7 @@ impl PostgresStore {
             }
         }
 
-        tx.commit()
+        pg_commit_and_emit(tx, audit_anchor)
             .await
             .map_err(|e| to_store_err("commit link tx", e))?;
 
