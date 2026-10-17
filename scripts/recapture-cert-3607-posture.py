@@ -44,19 +44,41 @@ operator evidence, not a published artefact (git records the mode as 100644 what
 working-tree mode): every file the script creates is 0600 and every directory it creates
 (.local-runs, the evidence directory and each parent it makes) is 0700, passed to
 os.open/os.mkdir and then enforced with fchmod, so no umask (not even 0) widens one
-(#7568, #7569). An existing .local-runs, fixtures directory or evidence directory that is
-world writable or owned by another uid is refused before any write; a group-writable one
-is accepted (a umask 002 checkout makes every directory 0775). The bundle is built in a
-sibling staging directory (0700) seeded with a copy of the previous bundle and replaces the
-evidence directory only when every leg and the header self-check succeeded (the old
-directory is moved aside, the staging directory renamed into place, then the old one
-removed); a run that fails leaves the previous bundle untouched and no staging directory
-behind, so a bundle never mixes legs of two runs (#7574). HOME must be an absolute path that is
+(#7568, #7569). A check covers every directory the script reads or writes
+through (the repo root and each directory from it down to the evidence directory,
+.local-runs, the work, fixtures and key directories, TMPDIR): one that exists and is
+world writable or owned by another uid is refused before any write; a sticky world-writable
+one is accepted (others cannot rename our entries in it) and so is a group-writable one (a
+umask 002 checkout makes every directory 0775) (#7611). The bundle is built in a staging
+directory (0700) seeded with a copy of the previous bundle and replaces the evidence
+directory only when every leg and the header self-check succeeded (the old directory is
+moved aside, the staging directory renamed into place, then the old one removed); a run that
+fails leaves the previous bundle untouched and no staging directory behind, so a bundle
+never mixes legs of two runs (#7574). The staging directory, the aside directory and every
+raw (unsanitized) capture live in <repo-root>/.local-runs/cert-3607-work, on the same
+filesystem as the evidence directory (checked: a different st_dev is refused, so the
+rename stays atomic); nothing temporary is ever created under docs/ (#7609, #7611). Each
+run holds a lock there, so two runs never recover each other's work. At start-up the run
+recovers from a killed predecessor (SIGKILL, power loss): a leftover aside is put back when
+the evidence directory is missing or incomplete (complete = MANIFEST.sha256 present and every
+file it lists matches) and removed when the evidence directory is complete, several asides
+are refused, and leftover staging and raw directories are removed, including the
+`.cert-3607.*` names an older version left next to the evidence directory (#7610). When the
+evidence directory has a MANIFEST.sha256 the run refreshes the lines of the files it wrote, so
+a bundle it publishes is complete by that definition. Every child process runs with cwd set
+to a fresh, empty 0700 sandbox directory under .local-runs, with HOME inside the sandbox and
+AI_MEMORY_NO_CONFIG=1, so no leg can open a database it did not create (`doctor --posture`
+opens a relative ai-memory.db in its cwd); the sandbox home is labelled `<home>` in the
+evidence and the sandbox is removed at exit (#7608). HOME must be an absolute path that is
 already in normal form (os.path.normpath(HOME) == HOME, so no `.`, `..`, `//` or trailing `/`
 component), not `/`, without a `:`, not starting with `//` and without a control byte
-(0x00-0x1f, 0x7f): a relative or empty HOME would turn the HOME sanitizer pattern into a
-substring rewrite of the evidence, a colon would add a cwd entry to the child PATH, and a
-control byte would split a captured line (#7510, #7540, #7570); the run is refused with
+(0x00-0x1f, 0x7f) or any non-ASCII character: a relative or empty HOME would turn the HOME
+sanitizer pattern into a substring rewrite of the evidence, a colon would add a cwd entry to
+the child PATH, and a control byte would split a captured line (#7510, #7540, #7570). The
+character rule is "printable ASCII only", chosen over a category list: it refuses every
+character str.splitlines splits on (U+0085, U+2028, U+2029 and the C0 separators) and every
+unicodedata category Cc, Cf, Zl and Zp character in one test, the sanitizer and the evidence
+are byte-oriented, and a category list can lag Unicode (#7613); the run is refused with
 exit 1 before any write. The sanitizer replaces whole path components only (#7538). The shell script's
 defaults named build directories of one build host; they are replaced by
 repo-relative ones. Exit codes: 0 success; 1 DEFAULT_BIN is not an executable
@@ -70,6 +92,8 @@ import base64
 import contextlib
 import datetime
 import errno
+import fcntl
+import hashlib
 import os
 import re
 import secrets
@@ -105,6 +129,20 @@ SQLCIPHER_OUT_FILE = "posture-sqlcipher-pass.out"
 SUMMARY_FILES = ("posture-bare-env.out", "posture-hardened-env.out", "posture-sqlcipher-pass.out")
 PASSPHRASE_BYTES = 32
 LOCAL_RUNS = ROOT / ".local-runs"
+# Work directories live under .local-runs, never under docs/ (#7609 #7610 #7611).
+WORK = LOCAL_RUNS / "cert-3607-work"
+SANDBOX = LOCAL_RUNS / "cert-3607-sandbox"  # the cwd and HOME of every child (#7608)
+SANDBOX_CWD = SANDBOX / "cwd"
+SANDBOX_HOME = SANDBOX / "home"
+LOCK_NAME = ".lock"
+MANIFEST_NAME = "MANIFEST.sha256"
+STAGING_PREFIX = "staging-"
+ASIDE_PREFIX = "old-"
+RAW_PREFIX = "raw-"
+BUNDLE_FILES = ("posture-bare-env.out", "posture-hardened-env.out",
+                "posture-hardened-boot-refusal.out", "posture-sqlcipher-pass.out",
+                "posture-legs-exit-codes.txt", "peer-fingerprints.txt", "peer-attestation.json")
+MANIFEST_LINE_RE = re.compile(r"^([0-9a-f]{64})  (.+)$")
 DIR_MODE = 0o700
 FILE_MODE = 0o600  # every file the script creates: local operator evidence (#7568)
 # Explicit allowlists of delimiter characters (#7538, #7571-#7573). They are the
@@ -112,19 +150,23 @@ FILE_MODE = 0o600  # every file the script creates: local operator evidence (#75
 # are not a list of illegal filename bytes: a path that continues with any other byte is a
 # different path and is left alone.
 # A path starts at the start of input or after whitespace, a quote or backtick, `(`, `[`,
-# `<`, `=` or `:`. A comma is not a start delimiter: `,/home/a` is a list item glued to
-# a path, not a path (decision: leave it, because the previous byte is not in the allowlist).
-PATH_START = rb"(?:\A|(?<=[\s'\"`(\[<=:]))"
+# `<`, `=`, `:`, `,` or `{`. The comma and the brace are start delimiters (#7612): in a list
+# (`a,/home/a`), a mapping (`{k: /home/a}`) or a shell-style expansion (`${/home/a}`) they
+# are what precedes the exact path, and leaving it would leak it.
+PATH_START = rb"(?:\A|(?<=[\s'\"`(\[<=:,{]))"
 # A path ends at the end of input, `/`, whitespace, a quote or backtick, `)`, `]`, `>`,
-# `:`, `;` or `,`, or at a `.` that is itself the end of input or is followed by whitespace
-# (a sentence full stop); `/home/a./x` and `/home/a..b` are other paths.
-PATH_END = rb"(?=\Z|/|[\s'\"`)\]>:;,]|\.(?:\Z|\s))"
+# `:`, `;`, `,` or `}`, or at a `.` that is itself the end of input or is followed by
+# whitespace (a sentence full stop); `/home/a./x` and `/home/a..b` are other paths.
+PATH_END = rb"(?=\Z|/|[\s'\"`)\]>:;,}]|\.(?:\Z|\s))"
 USAGE_EPILOG = (
     "Environment overrides: DEFAULT_BIN (default <repo>/target/release/ai-memory, must be "
     "an executable file; a value with a slash is relative to the repo root, a bare name is "
     "looked up on the child PATH), SQLCIPHER_BIN (default <repo>/target-sqlcipher/release/ai-memory; "
     "leg 4 is recorded as `missing` when absent), TMPDIR (must resolve under "
-    "<repo>/.local-runs, which must not be a symlink). HOME must be an absolute path in normal form (not /, no ':', not starting with '//', no control byte, no . or .. components). "
+    "<repo>/.local-runs, which must not be a symlink). HOME must be an absolute path in normal form (not /, no ':', not starting with '//', no control byte, no . or .. components) "
+    "of printable ASCII only (any non-ASCII character is refused). Every child runs in a fresh empty sandbox "
+    "directory under <repo>/.local-runs with HOME inside it; staging, aside and raw capture directories also "
+    "live under <repo>/.local-runs (cert-3607-work), never under docs/. "
     "Fixtures and evidence are never written through a symlink. Exit codes: 0 success; "
     "1 preflight or capture failure; 2 unknown arguments."
 )
@@ -164,14 +206,17 @@ def sanitize(raw):
     A path is replaced only as a whole run of path components, and only when BOTH ends are
     a boundary, each an explicit allowlist of delimiter characters (not a list of illegal
     filename bytes). Start boundary: start of input, or the previous byte is whitespace, a
-    quote or backtick, `(`, `[`, `<`, `=` or `:`. End boundary: end of input, `/`, or the
-    next byte is whitespace, a quote or backtick, `)`, `]`, `>`, `:`, `;` or `,`; a `.`
-    counts as an end only when it is itself at end of input or followed by whitespace. The
-    comma is an end delimiter (a list separator after a path) but not a start delimiter.
-    So `/home/a` never rewrites `/home/ab`, `/home/a.txt`, `/home/a./x`, `/home/a+b`,
-    `/home/a..b`, `~/home/a/x`, `x+/home/a/x`, `,/home/a`, `@/home/a` or `%/home/a`
-    (#7510, #7538, #7571, #7572, #7573)."""
-    out = _replace_component(raw, str(ROOT), b"<repo-root>")
+    quote or backtick, `(`, `[`, `<`, `=`, `:`, `,` or `{`. End boundary: end of input, `/`,
+    or the next byte is whitespace, a quote or backtick, `)`, `]`, `>`, `:`, `;`, `,` or `}`;
+    a `.` counts as an end only when it is itself at end of input or followed by whitespace.
+    The comma is both a start and an end delimiter (a list separator), `{` is a start and
+    `}` an end delimiter (a mapping or a `${...}` expansion). So `/home/a` never rewrites
+    `/home/ab`, `/home/a.txt`, `/home/a./x`, `/home/a+b`, `/home/a..b`, `~/home/a/x`,
+    `x+/home/a/x`, `@/home/a`, `%/home/a` or `$/home/a`, and `{k: /home/a}`, `${/home/a}`,
+    `x,/home/a` and `/home/a,/home/a` are rewritten (#7510, #7538, #7571, #7572, #7573,
+    #7612). The sandbox home every child runs with is labelled `<home>` first."""
+    out = _replace_component(raw, str(SANDBOX_HOME), b"<home>")
+    out = _replace_component(out, str(ROOT), b"<repo-root>")
     out = _replace_component(out, str(FIX), SANITIZED_FIXTURE_LABEL.encode())
     if HOME:
         out = _replace_component(out, HOME, b"<home>")
@@ -194,10 +239,11 @@ def home_problem(home):
     if (not os.path.isabs(home) or ":" in home or not home.rstrip("/")
             or home.startswith("//") or "//" in home
             or any(ord(char) < 0x20 or ord(char) == 0x7F for char in home)
+            or not home.isascii()
             or os.path.normpath(home) in ("/", "//") or os.path.normpath(home) != home):
         return ("HOME %r must be an absolute path in normal form (no '.', '..', '//' or trailing "
-                "'/' component, no control byte) that is not / and has no ':'; a relative or "
-                "empty HOME would rewrite substrings of the evidence" % home)
+                "'/' component, no control byte, printable ASCII only) that is not / and has no ':'; "
+                "a relative or empty HOME would rewrite substrings of the evidence" % home)
     return None
 
 
@@ -295,10 +341,12 @@ def write_fixtures():
 
 
 def child_env(tmpdir, extra):
-    """The scrubbed environment every binary invocation runs in (env -i)."""
+    """The scrubbed environment every binary invocation runs in (env -i). HOME is the sandbox
+    home and AI_MEMORY_NO_CONFIG=1 is set, with the sandbox cwd, so no leg opens a store it
+    did not create (#7608)."""
     env = {
         "PATH": CHILD_PATH,
-        "HOME": HOME,
+        "HOME": str(SANDBOX_HOME),
         "TMPDIR": str(tmpdir),
         "AI_MEMORY_NO_CONFIG": "1",
         "AI_MEMORY_AGENT_ID": "ai-memory",
@@ -323,7 +371,7 @@ def run_capture(binary, args, env, raw_path, sanitized_path):
         with os.fdopen(open_new(raw_path), "wb") as raw:
             try:
                 status = shell_status(subprocess.run(
-                    [str(binary)] + args, env=env, stdout=raw,
+                    [str(binary)] + args, env=env, stdout=raw, cwd=str(SANDBOX_CWD),
                     stderr=subprocess.STDOUT, check=False).returncode)
             except OSError as error:
                 raw.write(("%s: %s\n" % (binary, error.strerror or error)).encode())
@@ -445,7 +493,8 @@ def dir_problem(path):
 
     Another user could rename a directory they can write to and plant a real one in its
     place, which passes every symlink check (#7569). Group write is accepted: a umask 002
-    checkout makes every directory 0775."""
+    checkout makes every directory 0775. A sticky world-writable directory is accepted: the
+    sticky bit stops others from renaming or removing our entries in it (#7611)."""
     try:
         info = os.lstat(str(path))
     except FileNotFoundError:
@@ -455,7 +504,7 @@ def dir_problem(path):
     if info.st_uid != os.geteuid():
         return "%s is owned by uid %d, not by the current uid; refusing to write evidence there" % (
             path, info.st_uid)
-    if info.st_mode & stat.S_IWOTH:
+    if info.st_mode & stat.S_IWOTH and not info.st_mode & stat.S_ISVTX:
         return "%s is world writable (mode %o); chmod o-w it before recapturing" % (
             path, info.st_mode & 0o777)
     return None
@@ -487,26 +536,176 @@ def copy_bundle(source, target):
             write_file(target / entry.name, read_file(source / entry.name))
 
 
-def publish_bundle(stage):
-    """Make stage the evidence directory: the old one is moved aside, stage is renamed into
-    place, then the old one is removed. When the rename fails the old one is put back."""
-    parent, name = open_parent(OUT)
-    aside = ".%s.old-%s" % (name, secrets.token_hex(8))
-    moved = False
+def move(source, target):
+    """Rename source to target through directory descriptors (no symlink is followed)."""
+    source_parent, source_name = open_parent(source)
     try:
-        with contextlib.suppress(FileNotFoundError):  # first run: there is no previous bundle
-            os.replace(name, aside, src_dir_fd=parent, dst_dir_fd=parent)
-            moved = True
+        target_parent, target_name = open_parent(target)
         try:
-            os.replace(stage.name, name, src_dir_fd=parent, dst_dir_fd=parent)
-        except OSError:
-            if moved:
-                os.replace(aside, name, src_dir_fd=parent, dst_dir_fd=parent)
-            raise
+            os.replace(source_name, target_name, src_dir_fd=source_parent,
+                       dst_dir_fd=target_parent)
+        finally:
+            os.close(target_parent)
+    finally:
+        os.close(source_parent)
+
+
+def publish_bundle(stage, suffix):
+    """Make stage the evidence directory: the old one is moved aside (into WORK), stage is
+    renamed into place, then the old one is removed. When the rename fails the old one is put
+    back. A kill between the steps is recovered by recover_leftovers at the next start."""
+    aside = WORK / (ASIDE_PREFIX + suffix)
+    moved = False
+    with contextlib.suppress(FileNotFoundError):  # first run: there is no previous bundle
+        move(OUT, aside)
+        moved = True
+    try:
+        move(stage, OUT)
+    except OSError:
+        if moved:
+            move(aside, OUT)
+        raise
+    if moved:
+        remove_tree(aside)
+
+
+def guarded_dirs(tmpdir):
+    """Every directory the script reads or writes through, outermost first."""
+    chain = [ROOT]
+    chain.extend(ROOT / part for part in
+                 _prefixes(OUT.parent.relative_to(ROOT).parts))
+    chain.extend([OUT, LOCAL_RUNS, WORK, FIX, FIX / "keys"])
+    with contextlib.suppress(ValueError):
+        chain.extend(LOCAL_RUNS / part for part in
+                     _prefixes(Path(tmpdir).relative_to(LOCAL_RUNS).parts))
+    seen, ordered = set(), []
+    for candidate in chain:
+        if str(candidate) not in seen:
+            seen.add(str(candidate))
+            ordered.append(candidate)
+    return ordered
+
+
+def _prefixes(parts):
+    """The cumulative sub-paths of parts: ('a', 'b') gives 'a', 'a/b'."""
+    return [os.path.join(*parts[:count]) for count in range(1, len(parts) + 1)]
+
+
+def device_problem(first, second):
+    """A message when two directories are on different filesystems, else None."""
+    if os.stat(str(first)).st_dev != os.stat(str(second)).st_dev:
+        return ("%s and %s are not on the same filesystem; the evidence directory could not "
+                "be replaced atomically" % (first, second))
+    return None
+
+
+def acquire_lock():
+    """An exclusive, non-blocking flock on WORK/.lock: the fd, or None when a run holds it."""
+    parent, name = open_parent(WORK / LOCK_NAME)
+    try:
+        fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, FILE_MODE, dir_fd=parent)
     finally:
         os.close(parent)
-    if moved:
-        remove_tree(OUT.parent / aside)
+    try:
+        os.fchmod(fd, FILE_MODE)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
+def make_sandbox():
+    """A fresh, empty 0700 cwd and home for the children (#7608); an old one is removed."""
+    remove_tree(SANDBOX)
+    if os.path.lexists(str(SANDBOX)):
+        raise OSError(errno.EEXIST, "cannot remove the old sandbox", str(SANDBOX))
+    ensure_dirs(SANDBOX_CWD)
+    ensure_dirs(SANDBOX_HOME)
+
+
+def bundle_complete(bundle):
+    """True when bundle is a real directory whose MANIFEST.sha256 lists at least one file and
+    every listed file is a regular file with the listed sha256."""
+    try:
+        if not stat.S_ISDIR(os.lstat(str(bundle)).st_mode):
+            return False
+        lines = read_file(bundle / MANIFEST_NAME).decode("utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return False
+    listed = 0
+    for line in lines:
+        if not line.strip():
+            continue
+        match = MANIFEST_LINE_RE.match(line)
+        if match is None or "/" in match.group(2) or match.group(2) in (".", ".."):
+            return False
+        try:
+            data = read_file(bundle / match.group(2))
+        except OSError:
+            return False
+        if hashlib.sha256(data).hexdigest() != match.group(1):
+            return False
+        listed += 1
+    return listed > 0
+
+
+def refresh_manifest(bundle):
+    """Update the lines of MANIFEST.sha256 for the files this run wrote, when the bundle has
+    one: a listed file that is gone is dropped, a written file that is not listed is added."""
+    manifest = bundle / MANIFEST_NAME
+    try:
+        old = read_file(manifest).decode("utf-8").splitlines()
+    except FileNotFoundError:
+        return
+    names = []
+    for line in old:
+        match = MANIFEST_LINE_RE.match(line)
+        if match is not None and match.group(2) not in names:
+            names.append(match.group(2))
+    names.extend(name for name in BUNDLE_FILES if name not in names)
+    lines = []
+    for name in names:
+        if not (bundle / name).is_file() or (bundle / name).is_symlink():
+            continue
+        lines.append("%s  %s\n" % (hashlib.sha256(read_file(bundle / name)).hexdigest(), name))
+    write_file(manifest, "".join(lines).encode("utf-8"))
+
+
+def _leftovers(directory, prefix):
+    """The entries of directory whose name starts with prefix, sorted; none when it is absent."""
+    try:
+        with os.scandir(str(directory)) as entries:
+            return sorted(directory / entry.name for entry in entries
+                          if entry.name.startswith(prefix))
+    except FileNotFoundError:
+        return []
+
+
+def recover_leftovers():
+    """Recover from a killed run: put back or drop a leftover aside, remove leftover staging
+    and raw directories. A message (refusal) when several asides exist, else None."""
+    legacy = "." + OUT.name + "."
+    asides = _leftovers(WORK, ASIDE_PREFIX) + _leftovers(OUT.parent, legacy + ASIDE_PREFIX)
+    if len(asides) > 1:
+        return ("several leftover asides of earlier runs exist (%s); keep the complete one as "
+                "%s and remove the rest" % (", ".join(str(a) for a in asides), OUT))
+    if asides:
+        aside = asides[0]
+        if not os.path.lexists(str(OUT)):
+            move(aside, OUT)
+        elif bundle_complete(OUT) or not bundle_complete(aside):
+            remove_tree(aside)
+        else:
+            remove_tree(OUT)
+            move(aside, OUT)
+    for leftover in (_leftovers(WORK, STAGING_PREFIX) + _leftovers(WORK, RAW_PREFIX)
+                     + _leftovers(OUT.parent, legacy + STAGING_PREFIX)):
+        remove_tree(leftover)
+    return None
 
 
 def is_executable_file(candidate):
@@ -554,35 +753,66 @@ def recapture():
     sqlcipher_bin = resolve_binary(sqlcipher_setting)
     if not fixtures_clean():
         return 1
-    for directory in (LOCAL_RUNS, FIX, OUT):
+    for directory in guarded_dirs(tmpdir):
         problem = dir_problem(directory)
         if problem is not None:
             print(problem, file=sys.stderr)
             return 1
     ensure_dirs(OUT.parent)
+    ensure_dirs(WORK)
+    problem = device_problem(WORK, OUT.parent)
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return 1
+    lock = acquire_lock()
+    if lock is None:
+        print("another recapture run holds the lock in %s; wait for it to finish" % WORK,
+              file=sys.stderr)
+        return 1
+    try:
+        return recapture_locked(tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting, run_date)
+    finally:
+        os.close(lock)
+
+
+def recapture_locked(tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting, run_date):
+    """The part of a run that needs the lock: recovery, the sandbox, the staged bundle."""
+    problem = recover_leftovers()
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return 1
     ensure_dirs(FIX)
     chmod_dir(FIX)  # holds the passphrase and keys: tightened on every run
     ensure_dirs(tmpdir)
-    # The bundle is built next to the evidence directory and replaces it only on success, so
-    # a failed run never leaves legs of two runs mixed (#7574).
-    stage = OUT.parent / (".%s.staging-%s" % (OUT.name, secrets.token_hex(8)))
+    # The bundle is built next to the evidence directory's filesystem (WORK is under
+    # .local-runs, never under docs/) and replaces the evidence directory only on success, so
+    # a failed run never leaves legs of two runs mixed (#7574, #7609).
+    suffix = secrets.token_hex(8)
+    stage = WORK / (STAGING_PREFIX + suffix)
+    raw_dir = WORK / (RAW_PREFIX + suffix)
     ensure_dirs(stage)
+    ensure_dirs(raw_dir)
     try:
+        make_sandbox()
         if OUT.is_dir() and not OUT.is_symlink():
             copy_bundle(OUT, stage)
-        legs = capture_legs(stage, tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting,
-                            run_date)
+        legs = capture_legs(stage, raw_dir, tmpdir, default_bin, sqlcipher_bin,
+                            sqlcipher_setting, run_date)
         if isinstance(legs, int):
             return legs
-        publish_bundle(stage)
+        publish_bundle(stage, suffix)
     finally:
         remove_tree(stage)
+        remove_tree(raw_dir)
+        remove_tree(SANDBOX)
     report(*legs)
     return 0
 
 
-def capture_legs(out, tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting, run_date):
-    """Write the fixtures and the four legs into out; the exit codes (e1, e2, e3, e4), or 1."""
+def capture_legs(out, raw_dir, tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting,
+                 run_date):
+    """Write the fixtures and the four legs into out (raw captures in raw_dir, never in out);
+    the exit codes (e1, e2, e3, e4), or 1."""
     write_fixtures()
 
     # #3199 check #22 (backup-manifest signing): the certified configuration
@@ -594,7 +824,7 @@ def capture_legs(out, tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting, run
         try:
             with os.fdopen(open_new(keygen_out), "wb") as sink:
                 keygen_status = subprocess.run(
-                    [default_bin, "rules", "keygen"], env=keygen_env,
+                    [default_bin, "rules", "keygen"], env=keygen_env, cwd=str(SANDBOX_CWD),
                     stdout=sink, stderr=subprocess.STDOUT, check=False).returncode
         except OSError as error:
             print("operator keygen failed: %s: %s" % (default_bin, error.strerror or error),
@@ -615,7 +845,7 @@ def capture_legs(out, tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting, run
     posture_env = child_env(tmpdir, {})
     # --- leg 1: bare ---
     e1 = run_capture(default_bin, POSTURE_ARGS, posture_env,
-                     out / "posture-bare-env.out.raw", out / "posture-bare-env.out")
+                     raw_dir / "posture-bare-env.out.raw", out / "posture-bare-env.out")
 
     hard = {
         "AI_MEMORY_SECURITY_PROFILE": "asi-hard",
@@ -629,7 +859,7 @@ def capture_legs(out, tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting, run
     }
     # --- leg 2: hardened non-sqlcipher, boot gate NOT armed ---
     e2 = run_capture(default_bin, POSTURE_ARGS, child_env(tmpdir, hard),
-                     out / "posture-hardened-env.out.raw", out / "posture-hardened-env.out")
+                     raw_dir / "posture-hardened-env.out.raw", out / "posture-hardened-env.out")
 
     # --- leg 3: hardened non-sqlcipher, boot gate ARMED ---
     # Boot refuse is NOT doctor --posture (that subcommand bypasses the gate):
@@ -637,7 +867,7 @@ def capture_legs(out, tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting, run
     armed = dict(hard)
     armed["AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE"] = "1"
     e3 = run_capture(default_bin, ["doctor"], child_env(tmpdir, armed),
-                     out / "posture-hardened-boot-refusal.out.raw",
+                     raw_dir / "posture-hardened-boot-refusal.out.raw",
                      out / "posture-hardened-boot-refusal.out")
 
     # --- leg 4: sqlcipher + encrypt + boot gate ---
@@ -669,16 +899,17 @@ def capture_legs(out, tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting, run
                 seed_env.pop(name)
             try:
                 subprocess.run([sqlcipher_bin, "stats", "--json"], env=seed_env,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                               cwd=str(SANDBOX_CWD), stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, check=False)
             except OSError:
                 pass  # seeding failure is tolerated; the leg records its own exec status
         leg4 = dict(armed)
         leg4.update(leg4_env)
         e4 = run_capture(sqlcipher_bin, POSTURE_ARGS, child_env(tmpdir, leg4),
-                         out / "posture-sqlcipher-pass.out.raw", out / "posture-sqlcipher-pass.out")
+                         raw_dir / "posture-sqlcipher-pass.out.raw", out / "posture-sqlcipher-pass.out")
 
     sha_done = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
-                              capture_output=True, text=True, check=False)
+                              cwd=str(SANDBOX_CWD), capture_output=True, text=True, check=False)
     sha = sha_done.stdout.strip()
     if sha_done.returncode != 0 or not sha:
         print("cannot read the git sha of " + str(ROOT), file=sys.stderr)
@@ -705,6 +936,7 @@ def capture_legs(out, tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting, run
 
     for name in ("peer-fingerprints.txt", "peer-attestation.json"):
         write_file(out / name, read_file(FIX / name))
+    refresh_manifest(out)
 
     return e1, e2, e3, e4
 

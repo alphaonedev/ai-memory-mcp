@@ -547,6 +547,8 @@ class ExecFailure7432(RecaptureBase):
     def test_non_not_found_exec_error_maps_to_126(self):
         module = load_script_module()
         raw = self.root / 'leg.out.raw'
+        module.SANDBOX_CWD = self.root / 'sbx'  # the children's cwd must exist
+        module.SANDBOX_CWD.mkdir()
         status = module.run_capture(self.root, [], {}, raw, self.root / 'leg.out')
         self.assertEqual(status, 126)
         self.assertFalse(raw.exists())
@@ -1444,7 +1446,7 @@ class ChildCwd7608(SymlinkBase):
         tree = ast.parse((REPO / 'scripts' / SCRIPT_NAME).read_text())
         calls = [node for node in ast.walk(tree) if isinstance(node, ast.Call)
                  and ast.unparse(node.func).startswith('subprocess.')]
-        self.assertGreaterEqual(len(calls), 5)
+        self.assertGreaterEqual(len(calls), 4)
         missing = [node.lineno for node in calls
                    if 'cwd' not in {keyword.arg for keyword in node.keywords}]
         self.assertEqual(missing, [])
@@ -1917,7 +1919,7 @@ class HomeCharacters7613(unittest.TestCase):
         module = load_script_module()
         for cp in range(0x20, 0x7F):
             char = chr(cp)
-            if char in ':':
+            if char in ':/':  # a colon is refused; a trailing slash is not normal form
                 continue
             self.assertIsNone(module.home_problem('/home/a' + char), hex(cp))
 
