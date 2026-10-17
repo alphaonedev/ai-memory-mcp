@@ -212,12 +212,15 @@ fn forced_failure() -> bool {
 /// unwind leaves the connection in autocommit (ERRORS-08, OWNERSHIP-24).
 pub(super) fn report_stale_frames(conn: &Connection) {
     let db_path = conn.path().filter(|p| !p.is_empty()).map(str::to_string);
+    // #6540 - a report only covers a frame when a tracing sink can receive it;
+    // with none installed the frame stays unreported and thread exit speaks.
+    let sink_listening = tracing::enabled!(tracing::Level::ERROR);
     let stale = TXN_FRAMES.with(|frames| {
         let mut stale = false;
         for f in &mut frames.borrow_mut().0 {
             if f.db_path == db_path && db_path.is_some() && !f.deferred.is_empty() {
-                // #6132 - this report covers the frame; thread exit skips it.
-                f.reported = true;
+                // #6132 - a delivered report covers the frame; thread exit skips it.
+                f.reported = sink_listening;
                 stale = true;
             }
         }
