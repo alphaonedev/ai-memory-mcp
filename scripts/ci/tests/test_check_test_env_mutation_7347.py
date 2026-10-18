@@ -891,7 +891,7 @@ class ReqwestIpOnly7526(Fixture):
         self.assertEqual(self.flagged(text), set())
 
     def test_ip_only_text_verdicts(self):
-        self.assertTrue(gate.ip_only_text('get("http://10.0.0.5:80/a")'))
+        self.assertTrue(gate.ip_only_text('get("http://192.0.2.5:80/a")'))
         self.assertFalse(gate.ip_only_text('get("https://example.com/a")'))
         self.assertFalse(gate.ip_only_text("get(url)"))
         self.assertFalse(gate.ip_only_text(None))
