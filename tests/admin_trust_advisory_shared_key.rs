@@ -22,13 +22,20 @@
 //! `DELETE /api/v1/archive` owner-scope it feeds) are driven per cell.
 
 #![cfg(feature = "sal")]
-#![allow(clippy::missing_panics_doc, clippy::too_many_lines)]
+#![allow(
+    clippy::missing_panics_doc,
+    clippy::too_many_lines,
+    // The forensic sink is process-global; the audit cells serialise on a
+    // std Mutex held across `oneshot` (tests/admin_audit_chain_913.rs precedent).
+    clippy::await_holding_lock
+)]
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
+use ai_memory::governance::audit as forensic;
 use ai_memory::handlers::admin_role::is_admin_caller_trusted;
 use ai_memory::handlers::identity_binding::api_key_sha256_hex;
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
@@ -43,7 +50,11 @@ const BOB_KEY: &str = "bob-per-agent-key";
 const ADMIN_ID: &str = "root-admin";
 const BOB_ID: &str = "bob";
 const CLAIMED_NON_ADMIN: &str = "carol";
-const REFUSAL_ERROR: &str = "attested_identity_required";
+/// #7707 r2 (S1): the ONE generic wire body for every `require_admin` refusal.
+const GENERIC_ADMIN_REFUSAL: &str = r#"{"error":"admin role required"}"#;
+/// Audit outcome that carries the specific reason (never the wire).
+const UNATTESTED_OUTCOME: &str = "rejected_unattested_admin_identity";
+const UNKNOWN_ADMIN_CLAIM: &str = "mallory";
 
 fn fresh_dir() -> TempDir {
     let root = PathBuf::from(".local-runs").join("issue-7707-admin-trust");
@@ -55,6 +66,14 @@ fn fresh_dir() -> TempDir {
 /// per-agent keys (the admin's and `bob`'s) are enrolled; `false` is the keyless
 /// single-operator daemon. `root-admin` is always on the admin allowlist.
 fn build(mode: HttpIdentityMode, enroll_keys: bool) -> (axum::Router, AppState, NamedTempFile) {
+    build_with_shared_key(mode, enroll_keys, Some(SHARED_KEY))
+}
+
+fn build_with_shared_key(
+    mode: HttpIdentityMode,
+    enroll_keys: bool,
+    shared_key: Option<&str>,
+) -> (axum::Router, AppState, NamedTempFile) {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     let f = NamedTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
@@ -114,7 +133,7 @@ fn build(mode: HttpIdentityMode, enroll_keys: bool) -> (axum::Router, AppState, 
         http_identity_mode: mode,
     };
     let api_key_state = ApiKeyState {
-        key: Some(SHARED_KEY.to_string()),
+        key: shared_key.map(str::to_string),
         mtls_enforced: false,
         enrolled_agent_keys: enrolled,
         identity_mode: mode,
@@ -154,6 +173,89 @@ async fn post_gc(
         .await
         .unwrap();
     (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Full-fidelity `POST /api/v1/gc`: status, EVERY header and the body bytes.
+async fn post_gc_full(
+    router: axum::Router,
+    api_key: Option<&str>,
+    agent_id: Option<&str>,
+) -> (StatusCode, HeaderMap, Vec<u8>) {
+    let mut b = Request::builder().method("POST").uri("/api/v1/gc");
+    if let Some(k) = api_key {
+        b = b.header("x-api-key", k);
+    }
+    if let Some(id) = agent_id {
+        b = b.header("x-agent-id", id);
+    }
+    let resp = router
+        .oneshot(b.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (status, headers, bytes.to_vec())
+}
+
+fn forensic_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
+/// Forensic rows of `kind=admin_role` whose line carries `outcome`.
+fn admin_role_rows(dir: &std::path::Path, outcome: &str) -> Vec<String> {
+    use std::io::{BufRead, BufReader};
+    let mut hits = Vec::new();
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let Some(n) = name.to_str() else { continue };
+        if !n.starts_with("forensic-") || !n.to_ascii_lowercase().ends_with(".jsonl") {
+            continue;
+        }
+        let Ok(f) = std::fs::File::open(entry.path()) else {
+            continue;
+        };
+        for line in BufReader::new(f).lines().map_while(Result::ok) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            if v.get("kind").and_then(|k| k.as_str()) == Some("admin_role")
+                && line.contains(outcome)
+            {
+                hits.push(line);
+            }
+        }
+    }
+    hits
+}
+
+/// Assert the two refusals are byte-identical on the wire: status, the full
+/// header map and the body.
+fn assert_indistinguishable(
+    label: &str,
+    unknown: &(StatusCode, HeaderMap, Vec<u8>),
+    admin: &(StatusCode, HeaderMap, Vec<u8>),
+) {
+    assert_eq!(
+        unknown.0,
+        StatusCode::FORBIDDEN,
+        "{label}: unknown id status"
+    );
+    assert_eq!(admin.0, unknown.0, "{label}: status differs");
+    assert_eq!(admin.1, unknown.1, "{label}: header map differs");
+    assert_eq!(
+        String::from_utf8_lossy(&admin.2),
+        String::from_utf8_lossy(&unknown.2),
+        "{label}: body bytes differ"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&admin.2),
+        GENERIC_ADMIN_REFUSAL,
+        "{label}: body is not the generic refusal"
+    );
 }
 
 /// `DELETE /api/v1/archive` — feeds `is_admin_caller_trusted` into the purge
@@ -207,9 +309,28 @@ async fn admin_trust_7707_a_advisory_shared_key_forged_admin_require_admin_is_40
         "#7707: advisory + enrolled per-agent keys must refuse a shared-key caller \
          forging an allowlisted admin X-Agent-Id on a require_admin surface"
     );
+    assert_eq!(
+        body, GENERIC_ADMIN_REFUSAL,
+        "S1: the wire body is the generic refusal, never a distinct reason"
+    );
+}
+
+#[tokio::test]
+async fn admin_trust_7707_a_advisory_forged_admin_refusal_audited_as_unattested() {
+    let _g = forensic_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = fresh_dir();
+    forensic::shutdown();
+    forensic::init(dir.path(), None).expect("init forensic sink");
+    let (router, _app, _f) = build(HttpIdentityMode::Advisory, true);
+    let (status, body) = post_gc(router, SHARED_KEY, Some(ADMIN_ID)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, GENERIC_ADMIN_REFUSAL);
+    forensic::shutdown();
     assert!(
-        body.contains(REFUSAL_ERROR),
-        "the refusal reuses the closed-vocabulary error, body was {body}"
+        !admin_role_rows(dir.path(), UNATTESTED_OUTCOME).is_empty(),
+        "S1: the specific reason is in the audit row {UNATTESTED_OUTCOME}"
     );
 }
 
@@ -258,7 +379,26 @@ async fn admin_trust_7707_b_enforce_shared_key_forged_admin_is_403() {
     assert!(!is_admin_caller_trusted(&app, &shared, ADMIN_ID));
     let (status, body) = post_gc(router, SHARED_KEY, Some(ADMIN_ID)).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
-    assert!(body.contains(REFUSAL_ERROR), "body was {body}");
+    assert_eq!(body, GENERIC_ADMIN_REFUSAL, "S1: generic wire body");
+}
+
+#[tokio::test]
+async fn admin_trust_7707_b_enforce_forged_admin_refusal_audited_as_unattested() {
+    let _g = forensic_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = fresh_dir();
+    forensic::shutdown();
+    forensic::init(dir.path(), None).expect("init forensic sink");
+    let (router, _app, _f) = build(HttpIdentityMode::Enforce, true);
+    let (status, body) = post_gc(router, SHARED_KEY, Some(ADMIN_ID)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, GENERIC_ADMIN_REFUSAL);
+    forensic::shutdown();
+    assert!(
+        !admin_role_rows(dir.path(), UNATTESTED_OUTCOME).is_empty(),
+        "S1: the specific reason is in the audit row {UNATTESTED_OUTCOME}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +489,66 @@ async fn admin_trust_7707_e_off_admin_per_agent_key_still_admitted() {
 }
 
 // ---------------------------------------------------------------------------
+// (s1) #7707 r2 - admin-allowlist enumeration oracle: every refusal is one
+// generic 403, byte-identical for an unknown id and an allowlisted-but-
+// unattested admin.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn admin_trust_7707_s1_shared_key_refusals_identical_in_off_advisory_enforce() {
+    for mode in [
+        HttpIdentityMode::Off,
+        HttpIdentityMode::Advisory,
+        HttpIdentityMode::Enforce,
+    ] {
+        let _dir = fresh_dir();
+        let (r1, _a1, _f1) = build(mode, true);
+        let unknown = post_gc_full(r1, Some(SHARED_KEY), Some(UNKNOWN_ADMIN_CLAIM)).await;
+        let (r2, _a2, _f2) = build(mode, true);
+        let admin = post_gc_full(r2, Some(SHARED_KEY), Some(ADMIN_ID)).await;
+        assert_indistinguishable(&format!("shared key, {mode:?}"), &unknown, &admin);
+    }
+}
+
+#[tokio::test]
+async fn admin_trust_7707_s1_other_agents_key_refusals_identical_in_off() {
+    let _dir = fresh_dir();
+    let (r1, _a1, _f1) = build(HttpIdentityMode::Off, true);
+    let unknown = post_gc_full(r1, Some(BOB_KEY), Some(UNKNOWN_ADMIN_CLAIM)).await;
+    let (r2, _a2, _f2) = build(HttpIdentityMode::Off, true);
+    let admin = post_gc_full(r2, Some(BOB_KEY), Some(ADMIN_ID)).await;
+    assert_indistinguishable("bob's key, Off", &unknown, &admin);
+}
+
+#[tokio::test]
+async fn admin_trust_7707_s1_no_credential_header_trust_refusals_identical() {
+    static TRUST_ONCE: std::sync::Once = std::sync::Once::new();
+    TRUST_ONCE.call_once(|| {
+        // SAFETY: Once-gated, set once and never removed; it only widens the
+        // header-trust admission this cell must still refuse.
+        unsafe {
+            std::env::set_var(ai_memory::handlers::admin_role::ENV_ADMIN_HEADER_TRUST, "1");
+        }
+    });
+    for mode in [
+        HttpIdentityMode::Off,
+        HttpIdentityMode::Advisory,
+        HttpIdentityMode::Enforce,
+    ] {
+        let _dir = fresh_dir();
+        let (r1, _a1, _f1) = build_with_shared_key(mode, true, None);
+        let unknown = post_gc_full(r1, None, Some(UNKNOWN_ADMIN_CLAIM)).await;
+        let (r2, _a2, _f2) = build_with_shared_key(mode, true, None);
+        let admin = post_gc_full(r2, None, Some(ADMIN_ID)).await;
+        assert_indistinguishable(
+            &format!("no credential + header trust, {mode:?}"),
+            &unknown,
+            &admin,
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // (g) Boot signal: which allowlisted admin ids have no enrolled per-agent key.
 // ---------------------------------------------------------------------------
 
@@ -369,6 +569,9 @@ fn admin_trust_7707_g_boot_reason_names_unkeyed_admin_under_advisory_and_off() {
         assert!(reason.contains(ADMIN_ID), "{reason}");
         assert!(!reason.contains("keyed-admin"), "{reason}");
         assert!(reason.contains("agents bind-api-key"), "{reason}");
+        assert!(reason.contains("--agent-id"), "{reason}");
+        assert!(reason.contains("--token-file"), "{reason}");
+        assert!(!reason.contains("--token "), "{reason}");
     }
 }
 

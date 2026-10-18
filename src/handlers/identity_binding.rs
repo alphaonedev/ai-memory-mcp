@@ -456,7 +456,9 @@ pub fn attested_identity_required_response(endpoint: &str) -> Response {
         StatusCode::FORBIDDEN,
         Json(json!({
             "error": "attested_identity_required",
-            "message": "X-Agent-Id is self-asserted; present the agent's                         enrolled per-agent api-key (X-API-Key) to act as                         this principal",
+            "message": "X-Agent-Id is self-asserted; present the agent's \
+                        enrolled per-agent api-key (X-API-Key) to act as \
+                        this principal",
             "endpoint": endpoint,
         })),
     )
@@ -628,6 +630,26 @@ mod tests {
         // Stable across calls.
         assert_eq!(h, api_key_sha256_hex("hunter2"));
         assert_ne!(h, api_key_sha256_hex("hunter3"));
+    }
+
+    #[tokio::test]
+    async fn attested_identity_required_response_message_is_single_spaced() {
+        // #7707 r2 (L1): the wire text must stay the single-spaced base string.
+        let resp = attested_identity_required_response("run_gc");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["message"],
+            "X-Agent-Id is self-asserted; present the agent's enrolled per-agent api-key \
+             (X-API-Key) to act as this principal"
+        );
+        assert!(!v["message"].as_str().unwrap().contains("  "));
+        assert_eq!(v["error"], "attested_identity_required");
+        assert_eq!(v["endpoint"], "run_gc");
+        assert_eq!(bytes.len(), 183, "body length is the base 183 B");
     }
 
     #[test]

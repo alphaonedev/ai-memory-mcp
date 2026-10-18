@@ -141,8 +141,9 @@ pub fn unattested_admin_boot_reason(
         "per-agent api-keys are enrolled but allowlisted admin id(s) [{}] have no enrolled \
          per-agent key, so admin elevation is refused for them in every identity mode (#7707): \
          a shared transport key plus a self-asserted X-Agent-Id no longer grants admin once \
-         keys are enrolled. Run `ai-memory agents bind-api-key <admin-id>` for each listed id; \
-         the live refresh picks it up with no restart.",
+         keys are enrolled. Run `ai-memory agents bind-api-key --agent-id <admin-id> \
+         --token-file <0600 path>` for each listed id; the live refresh picks it up with no \
+         restart.",
         missing.join(", ")
     ))
 }
@@ -501,11 +502,12 @@ pub fn require_admin(
 
     if admitted {
         Ok(caller)
-    } else if name_admitted {
-        // Allowlisted + authn'd name, but only claimed while keys are enrolled:
-        // the closed-vocabulary refusal the `enforce` posture already returns.
-        Err(crate::handlers::identity_binding::attested_identity_required_response(endpoint))
     } else {
+        // #7707 r2 (S1) - ONE generic 403 for EVERY refusal (unknown id, allowlisted
+        // but unattested, unauthenticated header identity): a distinct wire body
+        // would let a caller without an attested credential enumerate the admin
+        // allowlist. The specific reason lives only in the audit outcome above and
+        // the operator WARN.
         Err((
             StatusCode::FORBIDDEN,
             Json(json!({"error": "admin role required"})),
