@@ -96,9 +96,11 @@ pub enum DeploymentShape {
     /// `production` plus peers: every federation gate at its floor, a
     /// peer attestation map, fingerprints, a trust domain, mTLS binding.
     Federated,
-    /// `federated` for N nodes provisioned from ONE artifact: identity is
-    /// generated per node at first boot and enrolled through a join
-    /// token (#3709); a copied key directory is refused.
+    /// `federated` for N nodes provisioned from ONE artifact. Today `hive`
+    /// derives exactly the `federated` settings. Per-node identity
+    /// generation at first boot, enrollment through a join token and
+    /// refusal of a copied key directory are the planned work tracked by
+    /// #3709; none of that enrollment is implemented yet (#7270).
     Hive,
 }
 
@@ -754,6 +756,28 @@ mod tests {
         let team_off = cfg_with(Some(DeploymentShape::Team), Some(false));
         let (report, _) = evaluate_boot(&team_off, None).unwrap();
         assert!(!report.at_rest_pending_escrow && !report.at_rest_on_without_escrow);
+    }
+
+    /// #7270 — `hive` derives exactly what `federated` derives until the
+    /// per-node join-token enrollment (#3709) lands; the doc comment on
+    /// the variant must stay true to this.
+    #[test]
+    fn hive_derives_identically_to_federated_7270() {
+        let federated = DeploymentShape::Federated.derive();
+        let hive = DeploymentShape::Hive.derive();
+        assert_eq!(
+            ShapeDerived {
+                shape: DeploymentShape::Federated,
+                ..hive
+            },
+            federated,
+            "hive must derive the federated settings until #3709 enrollment lands"
+        );
+        assert_eq!(hive.rows(), federated.rows());
+        assert_eq!(
+            DeploymentShape::Hive.is_hardened(),
+            DeploymentShape::Federated.is_hardened()
+        );
     }
 
     #[test]
