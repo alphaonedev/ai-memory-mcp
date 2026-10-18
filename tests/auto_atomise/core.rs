@@ -35,7 +35,9 @@ use std::time::Duration;
 
 use ai_memory::atomisation::curator::{Atom, Curator, CuratorError};
 use ai_memory::atomisation::{Atomiser, AtomiserConfig};
-use ai_memory::background::atomise_worker::AtomiseQueue;
+use ai_memory::background::atomise_worker::{
+    ATOMISE_QUEUE_CAPACITY_DEFAULT, AtomiseQueue, resolve_queue_capacity,
+};
 use ai_memory::config::FeatureTier;
 use ai_memory::hooks::pre_store::auto_atomise::OUTCOME_SKIPPED_POLICY_DISABLED;
 use ai_memory::hooks::pre_store::{
@@ -69,17 +71,21 @@ struct MockState {
     /// Total `decompose` invocations (used by the test asserting
     /// "no atomisation happened").
     calls: usize,
+    /// `max_atom_tokens` of the most recent `decompose` call (#7215 r3
+    /// F-4): lets a cell assert the budget the deferred job carried.
+    last_max_atom_tokens: Option<u32>,
 }
 
 impl Curator for MockCurator {
     fn decompose(
         &self,
         _body: &str,
-        _max_atom_tokens: u32,
+        max_atom_tokens: u32,
         _max_retries: u32,
     ) -> Result<Vec<Atom>, CuratorError> {
         let mut s = self.state.lock().unwrap();
         s.calls += 1;
+        s.last_max_atom_tokens = Some(max_atom_tokens);
         if s.responses.is_empty() {
             return Err(CuratorError::MalformedResponse(
                 "mock: response queue exhausted".into(),
@@ -95,6 +101,7 @@ fn shared_state() -> Arc<Mutex<MockState>> {
         Arc::new(Mutex::new(MockState {
             responses: Vec::new(),
             calls: 0,
+            last_max_atom_tokens: None,
         }))
     })
     .clone()
@@ -187,6 +194,7 @@ fn reset_mock() {
     let mut s = arc.lock().unwrap();
     s.responses.clear();
     s.calls = 0;
+    s.last_max_atom_tokens = None;
 }
 
 /// Read the current mock call count.
@@ -337,6 +345,7 @@ fn private_worker_gated(
     let state = Arc::new(Mutex::new(MockState {
         responses: Vec::new(),
         calls: 0,
+        last_max_atom_tokens: None,
     }));
     let atomiser = Arc::new(Atomiser::new(
         Box::new(MockCurator {
@@ -717,18 +726,21 @@ fn test_auto_atomise_does_not_block_store_response() {
     // call returning `Enqueued` while the gate is closed is the
     // contract; it holds under any host load.
     //
-    // Requirement: `AI_MEMORY_ATOMISE_QUEUE_CAPACITY` (when set) must be
-    // >= CALLS - 1 while the gate is closed, because the parked worker
-    // holds one job and the queue buffer holds the rest. A smaller
-    // capacity makes the hook report `skipped_queue_full`, which is a
-    // different contract, so the cell skips with a message instead.
+    // Requirement: the resolved queue capacity
+    // (`resolve_queue_capacity`, env `AI_MEMORY_ATOMISE_QUEUE_CAPACITY`)
+    // must be >= CALLS - 1 while the gate is closed, because the parked
+    // worker holds one job and the queue buffer holds the rest. Unset, 0
+    // or garbage resolves to `ATOMISE_QUEUE_CAPACITY_DEFAULT` (256), which
+    // always satisfies it. A smaller capacity makes the hook report
+    // `skipped_queue_full`, a different contract, so the cell skips (the
+    // line shows under `--nocapture`). #7215 r3 F-5: the production
+    // resolver is the single source of truth, not a re-implementation.
     const CALLS: usize = 5;
-    if let Ok(raw) = std::env::var("AI_MEMORY_ATOMISE_QUEUE_CAPACITY")
-        && raw.trim().parse::<usize>().is_ok_and(|cap| cap < CALLS - 1)
-    {
+    let capacity = resolve_queue_capacity();
+    if capacity < CALLS - 1 {
         eprintln!(
-            "skipping #7215 cell: AI_MEMORY_ATOMISE_QUEUE_CAPACITY={raw} is below CALLS - 1 ({}) \
-             needed while the worker gate is closed",
+            "skipping #7215 cell: resolved queue capacity {capacity} is below CALLS - 1 ({}) \
+             needed while the worker gate is closed (default {ATOMISE_QUEUE_CAPACITY_DEFAULT})",
             CALLS - 1
         );
         return;
@@ -909,6 +921,13 @@ fn test_auto_atomise_inheritance() {
         curator_state.lock().unwrap().calls,
         1,
         "curator must have been called once"
+    );
+    // #7215 r3 F-4: the budget the DEFERRED JOB carried reached the
+    // curator; the resolver assertion above proves only the resolver.
+    assert_eq!(
+        curator_state.lock().unwrap().last_max_atom_tokens,
+        Some(150),
+        "#7215/F-4: the enqueued job must carry the inherited atom budget (150) to the curator"
     );
 }
 
