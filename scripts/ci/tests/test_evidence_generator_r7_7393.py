@@ -202,12 +202,6 @@ class ScratchRefused7618(GatesRun):
         self.assertNotIn("Traceback", out)
 
     def test_a_world_writable_scratch_directory_is_refused_7618(self):
-        rc, r, wt, tip = self.make()
-        (wt / ".local-runs").mkdir(exist_ok=True)
-        (wt / ".local-runs").chmod(0o777)
-        self.refused(wt, tip)
-
-    def test_a_world_writable_scratch_directory_is_refused_7618(self):
         # #7662: a group-writable one (a umask-0002 checkout, mode 0775) is accepted; only world-writable is refused.
         rc, r, wt, tip = self.make()
         (wt / ".local-runs").mkdir(exist_ok=True)

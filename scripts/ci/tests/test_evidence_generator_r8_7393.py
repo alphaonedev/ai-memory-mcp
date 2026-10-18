@@ -42,7 +42,7 @@ import tmp_runtime_guard_7393 as guard
 from test_evidence_generator_5040_5042 import ScratchCase, load
 from test_evidence_generator_r2_7393 import GIT, make_repo
 from test_evidence_generator_r5_7393 import BundleFixture, GatesRun
-from test_evidence_generator_r7_7393 import GATE_FILE, PLANTED, REAL_GATE, RECAPTURE_SH, tree, write_empty
+from test_evidence_generator_r7_7393 import GATE_FILE, PLANTED, REAL_GATE, RECAPTURE_SH, write_empty
 
 TESTS = Path(__file__).resolve().parent
 EVIDENCE_DIR = TESTS.parent.parent / "evidence"
@@ -175,7 +175,7 @@ class SandboxedChildren7663(RunnerCase):
 
     def test_planted_stdlib_names_are_never_imported_by_a_gate_leg_7665(self):
         rc, r, wt, tip = self.gates_with_probes()
-        code, out, log = self.drive(wt, tip)
+        self.drive(wt, tip)
         logs = self.gate_logs()
         self.assertGreaterEqual(len(logs), 10)
         for name, text in logs.items():
@@ -267,7 +267,6 @@ class ScratchGuard7662(RunnerCase):
 
     def test_the_tracked_scratch_directory_of_a_umask_0002_checkout_runs_the_gates_7662(self):
         """A real repository whose .local-runs is tracked (a .gitkeep) and checked out 0775 under umask 0002."""
-        rc = load("run_cert")
         old = os.umask(0o002)
         try:
             wt, tip = make_repo(self.dir / "repo", {GATE_FILE: REAL_GATE, ".local-runs/.gitkeep": ""})
