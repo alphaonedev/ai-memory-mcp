@@ -1416,7 +1416,9 @@ mod postgres_side {
         let admin_ctx = ai_memory::store::CallerContext::for_admin("parity-test-1728");
         let run = uuid::Uuid::new_v4().simple().to_string();
         let mem = sample_memory(&format!("pg-1728-env-{run}"));
-        let _ = MemoryStore::store(&pg, &admin_ctx, &mem).await;
+        MemoryStore::store(&pg, &admin_ctx, &mem)
+            .await
+            .expect("seed store");
 
         // Stamp a known ciphertext envelope onto the live row.
         let envelope: Vec<u8> = vec![2, 7, 7, 7, 42, 99, 1, 0, 255, 16];
