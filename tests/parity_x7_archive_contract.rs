@@ -130,10 +130,6 @@ async fn sqlite_foreign_case(foreign: usize) {
     assert_eq!(archived, 0, "all-or-nothing: nothing archived");
 }
 
-// The postgres refusal cells use the multi-thread flavor: a refused batch drops
-// its transaction and sqlx rolls the connection back on a spawned task, which a
-// current-thread test runtime never polls, so the next cell stalls on the
-// leaked session until a server timeout (#7596 cell timing).
 /// The refusal reason of a `PermissionDenied`, the SSOT string callers match.
 fn denied_reason(e: &StoreError) -> &str {
     match e {
@@ -307,6 +303,11 @@ async fn pg_store_and_pool(
     (store, pool)
 }
 
+// The postgres refusal cells use the multi-thread flavor: a refused batch drops
+// its transaction, and sqlx rolls the connection back on a spawned task. On a
+// current-thread test runtime that is dropped when the test ends, the task has
+// not run, so the connection stays idle in transaction until a server timeout;
+// the multi-thread runtime lets the rollback run (#7596 cell timing).
 #[cfg(feature = "sal-postgres")]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires AI_MEMORY_TEST_POSTGRES_URL (live postgres); run with --include-ignored"]
