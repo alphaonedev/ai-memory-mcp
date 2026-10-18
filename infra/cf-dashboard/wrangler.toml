@@ -1,0 +1,7 @@
+name = "agenticmem-test"
+compatibility_date = "2026-09-01"
+pages_build_output_dir = "public"
+
+# Pages-only static model: the dashboard polls /state.json (Cache-Control: no-store
+# via public/_headers). The harness updates public/state.json and redeploys each
+# phase — see push-state.py. No KV/Workers scope required (token is Pages-only).

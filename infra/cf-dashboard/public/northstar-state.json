@@ -1,0 +1,207 @@
+{
+  "surface": "North Star tenets · the Fortune-500 / Federal bar",
+  "total": 25,
+  "validated": 22,
+  "failclosed": 1,
+  "refining": 2,
+  "functional": 21,
+  "pct": 92,
+  "groups": [
+    {
+      "family": "◆ Data integrity",
+      "tools": [
+        {
+          "name": "Ed25519 write attestation",
+          "desc": "every write signed under the agent's own key; unsigned refused (ATTESTATION_FAILED verified)",
+          "status": "ok",
+          "cls": "validated",
+          "note": "every write signed under the agent's own key; unsigned refused (ATTESTATION_FAILED verified)"
+        },
+        {
+          "name": "content-addressed CID (blake3)",
+          "desc": "each memory carries a cid content hash",
+          "status": "ok",
+          "cls": "validated",
+          "note": "each memory carries a cid content hash"
+        },
+        {
+          "name": "versioning + optimistic concurrency",
+          "desc": "expected_version / if-match on update",
+          "status": "ok",
+          "cls": "validated",
+          "note": "expected_version / if-match on update"
+        },
+        {
+          "name": "bitemporal validity",
+          "desc": "valid_from/valid_until distinct from transaction time",
+          "status": "ok",
+          "cls": "validated",
+          "note": "valid_from/valid_until distinct from transaction time"
+        },
+        {
+          "name": "hash-chained signed events",
+          "desc": "tamper-evident event ledger",
+          "status": "ok",
+          "cls": "validated",
+          "note": "tamper-evident event ledger"
+        },
+        {
+          "name": "Eq/Hash/Ord consistency (API-29)",
+          "desc": "dedup/sorted logic cannot silently corrupt",
+          "status": "ok",
+          "cls": "validated",
+          "note": "dedup/sorted logic cannot silently corrupt"
+        },
+        {
+          "name": "forget tombstones",
+          "desc": "crypto-erase leaves an auditable tombstone",
+          "status": "ok",
+          "cls": "validated",
+          "note": "crypto-erase leaves an auditable tombstone"
+        },
+        {
+          "name": "embedding vector-space parity",
+          "desc": "f1+f2 both gemini-embedding-2 (cosine-verified distinct spaces)",
+          "status": "ok",
+          "cls": "validated",
+          "note": "f1+f2 both gemini-embedding-2 (cosine-verified distinct spaces)"
+        }
+      ]
+    },
+    {
+      "family": "● Security",
+      "tools": [
+        {
+          "name": "mTLS federation",
+          "desc": "cross-host f1<->f2 9/9 over mutual TLS",
+          "status": "ok",
+          "cls": "validated",
+          "note": "cross-host f1<->f2 9/9 over mutual TLS"
+        },
+        {
+          "name": "PostgreSQL sslmode=verify-full",
+          "desc": "data-tier connection cert-pinned",
+          "status": "ok",
+          "cls": "validated",
+          "note": "data-tier connection cert-pinned"
+        },
+        {
+          "name": "attestation required (fail-closed)",
+          "desc": "unsigned/forged writes convicted",
+          "status": "ok",
+          "cls": "validated",
+          "note": "unsigned/forged writes convicted"
+        },
+        {
+          "name": "owner isolation",
+          "desc": "unidentified caller cannot see agent-owned rows (verified not-found)",
+          "status": "ok",
+          "cls": "validated",
+          "note": "unidentified caller cannot see agent-owned rows (verified not-found)"
+        },
+        {
+          "name": "admin-gated key binding",
+          "desc": "agents cannot self-bind trust; admin only",
+          "status": "ok",
+          "cls": "validated",
+          "note": "agents cannot self-bind trust; admin only"
+        },
+        {
+          "name": "replay guard",
+          "desc": "duplicate signed write refused (ConflictError, verified)",
+          "status": "ok",
+          "cls": "validated",
+          "note": "duplicate signed write refused (ConflictError, verified)"
+        },
+        {
+          "name": "governance deny path",
+          "desc": "operator Deny enforced fail-closed",
+          "status": "refusal",
+          "cls": "failclosed",
+          "note": "operator Deny enforced fail-closed"
+        },
+        {
+          "name": "poison-memory infection resistance",
+          "desc": "red-team: bad memory must not infect swarm",
+          "status": "fail",
+          "cls": "refining",
+          "note": "red-team: bad memory must not infect swarm"
+        }
+      ]
+    },
+    {
+      "family": "▲ Performance",
+      "tools": [
+        {
+          "name": "MCP-ready boot latency",
+          "desc": "cold 120ms / warm 20ms · #3329 non-blocking",
+          "status": "ok",
+          "cls": "validated",
+          "note": "cold 120ms / warm 20ms · #3329 non-blocking"
+        },
+        {
+          "name": "recall latency",
+          "desc": "p50 3ms (keyword) / p99 448ms (semantic, OpenRouter embed)",
+          "status": "ok",
+          "cls": "validated",
+          "note": "p50 3ms (keyword) / p99 448ms (semantic, OpenRouter embed)"
+        },
+        {
+          "name": "per-module capacity knee",
+          "desc": "max NHIs at budget latency",
+          "status": "ok",
+          "cls": "validated",
+          "note": "read 970 ops/s keyword mix · write 134 ops/s · raw JSON on disk; recall concurrency finding #3335 open"
+        },
+        {
+          "name": "module scaling curve",
+          "desc": "federation multiplier",
+          "status": "ok",
+          "cls": "validated",
+          "note": "1→2 modules: 128→256 sustained agents; 4,602 vs 2,936 ops/s @256 (f1 module over mTLS)"
+        }
+      ]
+    },
+    {
+      "family": "■ Reliability",
+      "tools": [
+        {
+          "name": "CI green @ release tip",
+          "desc": "34 of 35 required contexts pass at 7578c655; coverage is the sole failure",
+          "status": "fail",
+          "cls": "refining",
+          "note": "50 successful check-runs, 1 failed coverage check, 1 intentionally skipped benchmark regeneration; #3496 remediation active without lowering floors"
+        },
+        {
+          "name": "certified pg+AGE cell",
+          "desc": "live PG18.6 + AGE1.8.0 + pgvector0.8.6",
+          "status": "ok",
+          "cls": "validated",
+          "note": "live PG18.6 + AGE1.8.0 + pgvector0.8.6"
+        },
+        {
+          "name": "non-blocking boot (#3329)",
+          "desc": "backfill never blocks MCP init",
+          "status": "ok",
+          "cls": "validated",
+          "note": "backfill never blocks MCP init"
+        },
+        {
+          "name": "hard stop/start continuity",
+          "desc": "recovers mission/goals, resumes exactly where left off",
+          "status": "ok",
+          "cls": "validated",
+          "note": "3/3 SIGKILL-under-load cycles retained, resume ~1.0s, 0 acked writes lost"
+        },
+        {
+          "name": "background embedding backfill",
+          "desc": "drains without blocking service",
+          "status": "ok",
+          "cls": "validated",
+          "note": "drains without blocking service"
+        }
+      ]
+    }
+  ],
+  "lastUpdated": null
+}

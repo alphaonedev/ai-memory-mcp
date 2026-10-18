@@ -1,0 +1,32 @@
+{
+  "_comment": "Operator-attested outcome of the tools/call validation sweep, keyed by tool name. A tool in neither list is validated. Input of scripts/evidence/mcp-tools-state.py (--classes); carried over from the hand-made snapshot at 06f529ad, to be re-attested by the next validation sweep.",
+  "failclosed": {
+    "memory_action_add_edge": "invalid edge_type",
+    "memory_action_transition": "invalid state",
+    "memory_agent_register": "invalid agent_type 'validator' — must be one of: ai:claude-opus-4.6, ai:claude-opus-4.7, ai:codex-5.4, ai:grok-4.2, human, system (or any ai",
+    "memory_archive_restore": "cannot restore: memory ac23639a-807c-42a0-af8a-11b6d6bd0098 already exists in active table (would overwrite)",
+    "memory_link": "invalid relation 'supports' — must be one of: related_to, supersedes, contradicts, derived_from, reflects_on, derives_from, decomposes_into,",
+    "memory_load_family": "unknown profile or family 'validator'. Valid profiles: core, graph, admin, power, full. Valid families: core, lifecycle, graph, governance, ",
+    "memory_pending_approve": "pending action not found: ac23639a-807c-42a0-af8a-11b6d6bd0098",
+    "memory_pending_reject": "pending action not found or already decided: ac23639a-807c-42a0-af8a-11b6d6bd0098",
+    "memory_persona_generate": "no reflections found for entity 'validator' in namespace '<any namespace>'",
+    "memory_routine_freeze": "routine not found: ac23639a-807c-42a0-af8a-11b6d6bd0098",
+    "memory_routine_run": "arguments is required (a JSON object of {{param}} -> value)",
+    "memory_skill_compositional_context": "skill not found: validator",
+    "memory_skill_delete": "skill not found: toolval/tv-skill",
+    "memory_skill_export": "skill not found: validator",
+    "memory_skill_get": "skill not found: validator",
+    "memory_skill_promote_from_reflection": "reflection not found: validator",
+    "memory_skill_register": "SKILL.md must begin with a '---' YAML frontmatter fence",
+    "memory_skill_resource": "resource not found: skill_id=validator path=validator",
+    "memory_subscribe": "HMAC secret required: configure per-subscription `hmac_secret` or server-wide `[security] hmac_secret`. Pass `secret: <value>` in the tool c",
+    "memory_swarm_rewind": "swarm_rewind: target validator not found"
+  },
+  "refining": {
+    "memory_atomise": "MEMORY_NOT_FOUND: ac23639a-807c-42a0-af8a-11b6d6bd0098",
+    "memory_auto_tag": "memory not found",
+    "memory_deref": "offloaded blob ac23639a-807c-42a0-af8a-11b6d6bd0098 not found",
+    "memory_detect_contradiction": "memory A not found",
+    "memory_namespace_set_standard": "memory not found: ac23639a-807c-42a0-af8a-11b6d6bd0098"
+  }
+}

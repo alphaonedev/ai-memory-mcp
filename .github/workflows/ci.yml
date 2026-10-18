@@ -232,6 +232,14 @@ jobs:
         run: python3 scripts/test/test_workflow_concurrency_6340.py
       - name: Shard partition and wiring unit tests (#6344)
         run: python3 -m unittest discover -s scripts/ci/tests
+      - name: Dashboard in a real browser, Trusted Types enforced (#7634 #7639)
+        # Hosted ubuntu-latest ships google-chrome; the test drives it over CDP with the standard library only.
+        # CF_DASH_REQUIRE_BROWSER=1 turns "no browser found" into a FAILURE instead of a skip, and -v prints
+        # each test name so the log shows the browser test RAN.
+        working-directory: scripts/ci/tests
+        env:
+          CF_DASH_REQUIRE_BROWSER: "1"
+        run: python3 -m unittest -v test_cf_browser_7634
       - id: cls
         shell: bash
         env:

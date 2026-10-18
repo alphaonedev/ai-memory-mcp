@@ -1,0 +1,87 @@
+{
+  "surface": "Certified enterprise federation \u00b7 100% V&V",
+  "total": 10,
+  "validated": 9,
+  "failclosed": 0,
+  "refining": 1,
+  "functional": 9,
+  "pct": 90,
+  "groups": [
+    {
+      "family": "Federation configuration",
+      "tools": [
+        {
+          "name": "cross-host f1<->f2 acceptance",
+          "desc": "9/9 (T1-T5 + A2A) over live mTLS (verified)",
+          "status": "ok",
+          "cls": "validated",
+          "note": "9/9 (T1-T5 + A2A) over live mTLS (verified)"
+        },
+        {
+          "name": "mTLS peer identity gate",
+          "desc": "fingerprint-allowlisted client certs",
+          "status": "ok",
+          "cls": "validated",
+          "note": "fingerprint-allowlisted client certs"
+        },
+        {
+          "name": "W-of-N write quorum",
+          "desc": "quorum enforced on federated writes",
+          "status": "ok",
+          "cls": "validated",
+          "note": "quorum enforced on federated writes"
+        },
+        {
+          "name": "/sync/push replication",
+          "desc": "signed rows replicate across peers",
+          "status": "ok",
+          "cls": "validated",
+          "note": "signed rows replicate across peers"
+        },
+        {
+          "name": "attestation across nodes",
+          "desc": "signatures verify on the receiving peer",
+          "status": "ok",
+          "cls": "validated",
+          "note": "signatures verify on the receiving peer"
+        },
+        {
+          "name": "replay guard cross-node",
+          "desc": "replayed federated write refused",
+          "status": "ok",
+          "cls": "validated",
+          "note": "replayed federated write refused"
+        },
+        {
+          "name": "vector-space parity",
+          "desc": "f1+f2 share gemini-embedding-2 space (reembed verified)",
+          "status": "ok",
+          "cls": "validated",
+          "note": "f1+f2 share gemini-embedding-2 space (reembed verified)"
+        },
+        {
+          "name": "20-check cert posture (cert-55)",
+          "desc": "recapture on triple 18.6/1.8.0/0.8.6",
+          "status": "ok",
+          "cls": "validated",
+          "note": "recapture on triple 18.6/1.8.0/0.8.6"
+        },
+        {
+          "name": "cert-expiry gate (F7)",
+          "desc": "federation cert-expiry enforced",
+          "status": "ok",
+          "cls": "validated",
+          "note": "federation cert-expiry enforced"
+        },
+        {
+          "name": "DO cloud federation (Config-1..5)",
+          "desc": "cert stack at cloud scale + LUKS",
+          "status": "fail",
+          "cls": "refining",
+          "note": "cert stack at cloud scale + LUKS"
+        }
+      ]
+    }
+  ],
+  "lastUpdated": null
+}

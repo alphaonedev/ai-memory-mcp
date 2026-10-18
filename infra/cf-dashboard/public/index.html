@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Campaign Control · ai-memory</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛰️</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="/index.css">
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div>
+      <h1>ai-memory v1.0.0 · Acceptance Campaign — <span id="titlemode">Last run</span></h1>
+      <div class="meta banner" id="runbanner"></div>
+      <div class="meta">Release <b id="tip">—</b> · certified <b>PostgreSQL 18.6 · Apache AGE 1.8.0 · pgvector 0.8.6</b> · <span id="phase">—</span><br>
+      <span id="rolesline">roles: awaiting state</span> &middot; tag operator-gated &middot; every landing re-measured on the assembled tree (cargo gates + script gates + unfiltered lib suite &times;3, each category stated before the push) &middot; encrypted in transit &mdash; only encrypted data in transit anywhere in the ecosystem, regardless of network or system boundary &middot; honest-by-construction<b>encrypted in transit (mTLS)</b> · honest-by-construction</div>
+      <div class="mt8"><span class="live" id="livebadge"><span class="dot"></span> <span id="livetext">connecting…</span></span></div>
+    </div>
+    <div class="ring">
+      <svg width="94" height="94" viewBox="0 0 94 94" id="ringsvg" aria-label="overall progress"></svg>
+      <div><div class="ringlabel" id="ringpct">—</div><div class="ringsub" id="ringcnt">burn-down</div></div>
+    </div>
+  </div>
+
+  <div class="valnav">
+    <a class="valcard" href="/northstar.html"><span class="vlabel">✦ North Star V&amp;V</span><span class="vsub">integrity · security · performance · reliability — the bet-the-farm bar</span><span class="vpct" id="nav-northstar">—</span></a>
+    <a class="valcard" href="/security.html"><span class="vlabel">🔐 Security E2E V&amp;V</span><span class="vsub">encryption + every security feature, molecular→atomic</span><span class="vpct" id="nav-security">—</span></a>
+    <a class="valcard" href="/mcp-tools.html"><span class="vlabel">🧪 MCP Tool Validation</span><span class="vsub">all 104 tools · localhost <code>mcp --profile full</code></span><span class="vpct" id="nav-mcp">—</span></a>
+    <a class="valcard" href="/swarm-tools.html"><span class="vlabel">🛰️ Swarm/Hive Tool V&amp;V</span><span class="vsub">agent-driven tools over the encrypted daemon</span><span class="vpct" id="nav-swarm">—</span></a>
+    <a class="valcard" href="/datatier.html"><span class="vlabel">🗄️ Data Tier V&amp;V</span><span class="vsub">SQLite singleton + PostgreSQL·AGE·pgvector</span><span class="vpct" id="nav-datatier">—</span></a>
+    <a class="valcard" href="/federation.html"><span class="vlabel">🌐 Federation V&amp;V</span><span class="vsub">certified enterprise federation — cross-host mTLS</span><span class="vpct" id="nav-federation">—</span></a>
+  </div>
+
+  <div class="kpis" id="kpis"></div>
+
+  <div class="sec">North Star · the Fortune-500 / Federal bar</div>
+  <div class="pillars" id="pillars"></div>
+
+  <div class="sec">Environment · infrastructure monitor (as last reported)</div>
+  <div class="cols c2">
+    <div class="card envcard"><div class="envhdr"><h4>Hardware architecture</h4><span class="envtag" id="hwtag">—</span></div>
+      <p class="cap">native certified data-tier nodes · health as last reported</p><div id="hwmon"></div></div>
+    <div class="card envcard"><div class="envhdr"><h4>DigitalOcean cloud</h4><span class="envtag" id="dotag">—</span></div>
+      <p class="cap">certified data tier at cloud scale · droplets as last reported</p><div id="domon"></div></div>
+  </div>
+
+  <div class="sec"><span id="swarmPre">Last run</span> swarm · <span id="swarmModelSec">GLM-5.3-Flash</span> NHIs under test</div>
+  <div class="cols c12">
+    <div class="card" id="swarmwrap">
+      <h4>Agent fabric <button class="fsbtn" id="swarmfs" type="button" title="expand to full screen">⛶ full screen</button></h4>
+      <p class="cap">data flow of the whole architecture · OpenRouter ⇄ <span id="swarmModelCap">GLM-5.3-Flash</span> agents ⇄ ai-memory (f2, f1) ⇄ PostgreSQL + AGE + pgvector · <span id="swarmAnim">animated links = data moving now</span> · every link encrypted</p>
+      <div id="swarm" aria-label="agent fabric"></div>
+      <div class="swlegend swlegendrow"><span><i class="bg-good"></i><span id="swarmLegend">green box / animated link = data moving now</span></span><span>🔒 every leg encrypted (mTLS · TLS verify-full · HTTPS)</span><span>counts = last recorded run · rates = last recorded sample</span></div>
+    </div>
+    <div class="card">
+      <h4>Throughput</h4><p class="cap"><span id="tpcap">ai-memory operations / second — last recorded series</span></p>
+      <div id="tpchart"></div>
+    </div>
+  </div>
+
+  <div class="sec">Federation &amp; coordination</div>
+  <div class="cols c21">
+    <div class="card"><h4>Encrypted topology · 3 legs</h4><p class="cap">every ai-memory data path encrypted in transit — agent→daemon (mTLS), daemon→PostgreSQL (verify-full), node↔node (mTLS federation)</p><div id="fedchart"></div></div>
+    <div class="card"><h4>A2A message flow</h4><p class="cap">agent-to-agent coordination primitives — rate &amp; mix as last recorded</p><div id="a2apanel"></div></div>
+  </div>
+
+  <div class="sec">Runtime performance · ai-memory</div>
+  <div class="cols c12">
+    <div class="card"><h4>Startup latency</h4><p class="cap">MCP-ready time — the #3329 non-blocking-boot guarantee (backfill never blocks init)</p><div id="bootpanel"></div></div>
+    <div class="card"><h4>Operation latency</h4><p class="cap">per-op p50 / p95 / p99 over the certified data tier</p><div id="oplatpanel"></div></div>
+  </div>
+
+  <div class="sec">Encrypted communication pathways · all data in transit</div>
+  <div class="card">
+    <p class="cap">Every ai-memory data path is encrypted — customers encrypt all data in transit, so the test fabric does too. Full-spectrum latency across the 3 encrypted legs plus the OpenRouter API.</p>
+    <div id="commspanel"></div>
+  </div>
+
+  <div class="sec">Performance envelope</div>
+  <div class="cols c2">
+    <div class="card"><h4>Per-module capacity ramp — read path</h4><p class="cap">concurrent NHIs vs sustained throughput — the knee = agents one certified module handles</p><div id="capchart"></div></div>
+    <div class="card"><h4>Write path — signed store + embed</h4><p class="cap">Ed25519-attested stores with synchronous remote embed (OpenRouter) — the honest write ceiling</p><div id="wpchart"></div></div>
+    <div class="card"><h4>AI model usage (OpenRouter)</h4><p class="cap">what the runs cost in model activity — account snapshots per run; per-generation tokens via #3338</p><div id="aiusage"></div></div>
+    <div class="card"><h4>Latency vs budget</h4><p class="cap">p50 / p95 / p99 against PERFORMANCE.md</p><div id="latchart"></div></div>
+  </div>
+  <div class="cols c2 mt14">
+    <div class="card"><h4>Feature coverage</h4><p class="cap">% of the drivable tool surface exercised end-to-end</p><div id="covchart"></div></div>
+    <div class="card"><h4>Module scaling</h4><p class="cap">sustained agents as certified modules are added (federation)</p><div id="scalechart"></div></div>
+  </div>
+
+  <div class="sec">Security &amp; resilience</div>
+  <div class="cols c2">
+    <div class="card"><h4>Memory-poisoning defense</h4><p class="cap">adversarial "bad memories" injected vs infections that spread — red-team</p><div id="secpanel"></div></div>
+    <div class="card"><h4>Hard stop/start continuity</h4><p class="cap">kill cycles → recovered mission·goals·objectives, resumed exactly where it left off</p><div id="cycpanel"></div></div>
+  </div>
+
+  <div class="sec">GA proof campaigns &mdash; hard gate (operator 2026-10-10)</div>
+  <div class="card"><p class="cap">Campaign P (performance under contention), Campaign F (failure injection), Campaign X (cross-backend failure-semantics parity), Campaign H (test-lane hygiene): one row per cell, ticked from the campaign issues #7028&ndash;#7031 on GitHub at every refresh. GA does not occur until all four are closed.</p><div id="campaignsPanel"></div></div>
+
+  <div class="sec">Test dimensions</div>
+  <div class="board" id="board"></div>
+
+  <div class="sec">Issues · capture → fix → re-verify (1:1, nothing dropped)</div>
+  <div class="card">
+    <p class="cap">Every defect is filed as an issue with a stated customer cost, <b id="fixflow">fixed by a dedicated coder lane and reviewed (roles: awaiting state)</b>, assembled in a landing chain and re-measured on the assembled tree (every derived gate plus the unfiltered lib suite in three feature contexts), then <b>landed on <code>rehearsal/audit-wip</code></b> with the remote ref read back; the release merge to <code>release/v1.0.0</code> follows the burn-down.</p>
+    <div id="issuespanel"></div>
+  </div>
+
+  <div class="sec" id="feedTitle">Event feed</div>
+  <div class="feed" id="feed"></div>
+
+  <div class="sec">Configuration under test · every agent mirrors this TOML</div>
+  <div class="card"><h3>Coding agents &mdash; who is running where</h3><div id="agentsPanel"></div></div><div class="card">
+    <p class="cap">Fleet-standard <code>ai-memory</code> configuration — byte-identical on every node &amp; agent wired into ai-memory (only <code>db</code> and key-file paths differ per node). Everything hits OpenRouter; Ollama is not used on any node.</p>
+    <pre id="cfgpre" class="cfg">—</pre>
+  </div>
+
+  <div class="foot">conductor ai:god-f2 · state served via Cloudflare · a dimension turns green only when measured · state pushed by the f2 harness.</div>
+
+  <footer class="legalfoot">
+    <div class="footer-links">
+      <a href="https://github.com/alphaonedev/ai-memory-mcp">Source</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp/issues">Issues</a>
+      <a href="https://github.com/alphaonedev/ai-memory-mcp/blob/main/CHANGELOG.md">Changelog</a>
+      <a href="https://alphaonedev.github.io/ai-memory-mcp/SECURITY.html">Security</a>
+      <a href="https://alphaonedev.github.io/ai-memory-mcp/credits.html">Credits</a>
+    </div>
+    <div>ai-memory &middot; Apache-2.0 &middot; &copy; 2026 <a href="https://alphaonedev.com">AlphaOne LLC</a></div>
+    <div class="legal">Built for AI Non-Human Identity agents that need to remember &mdash; from a phone to a planet.</div>
+    <div class="legal nsa">
+      <strong>NSA non-endorsement.</strong> References to the National Security Agency Cybersecurity Information document on MCP security (U/OO/6030316-26 | PP-26-1834, May 2026 v1.0) describe ai-memory's substrate-level posture relative to NSA-issued guidance. The NSA, the Department of Defense, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product. Full mapping + citation: <a href="https://alphaonedev.github.io/ai-memory-mcp/compliance/nsa-csi-mcp.html">compliance/nsa-csi-mcp.html</a>.
+    </div>
+    <div class="legal disc">
+      This dashboard presents automated test telemetry for the ai-memory v1.0.0 acceptance campaign. Results are provided &ldquo;as is,&rdquo; without warranty of any kind, express or implied, including merchantability, fitness for a particular purpose, and non-infringement. Metrics reflect the specific hardware, configuration, and workloads under test and are not a guarantee of performance in any other environment. Values shown &ldquo;awaiting&rdquo; are not yet measured. &copy; 2026 AlphaOne LLC. All rights reserved. All other marks are the property of their respective owners.
+    </div>
+  </footer>
+</div>
+
+<script src="/index.js" defer></script>
+</body>
+</html>

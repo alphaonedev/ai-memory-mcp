@@ -1,0 +1,1137 @@
+{
+  "addressed_exe_sha256": "f142df2642fd2d34ff1116fb7849fe6433e85f8d91a9f1b48bb249ed3f2cc01b",
+  "daemon_binary_sha256": "f142df2642fd2d34ff1116fb7849fe6433e85f8d91a9f1b48bb249ed3f2cc01b",
+  "failclosed": 20,
+  "functional": 99,
+  "groups": [
+    {
+      "family": "skill",
+      "tools": [
+        {
+          "cls": "failclosed",
+          "desc": "Skill body + composes_with_reflections (bounded by max_reflection_depth)",
+          "name": "memory_skill_compositional_context",
+          "note": "skill not found: validator",
+          "status": "refusal"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Hard-purge an entire skill",
+          "name": "memory_skill_delete",
+          "note": "skill not found: toolval/tv-skill",
+          "status": "refusal"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Export a skill to a folder",
+          "name": "memory_skill_export",
+          "note": "skill not found: validator",
+          "status": "refusal"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Get full skill activation",
+          "name": "memory_skill_get",
+          "note": "skill not found: validator",
+          "status": "refusal"
+        },
+        {
+          "cls": "validated",
+          "desc": "List current (non-superseded)",
+          "name": "memory_skill_list",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Promote a Reflection into a reusable Agent Skill",
+          "name": "memory_skill_promote_from_reflection",
+          "note": "reflection not found: validator",
+          "status": "refusal"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Register an agentskills",
+          "name": "memory_skill_register",
+          "note": "SKILL.md must begin with a '---' YAML frontmatter fence",
+          "status": "refusal"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Fetch + digest-verify a skill",
+          "name": "memory_skill_resource",
+          "note": "resource not found: skill_id=validator path=validator",
+          "status": "refusal"
+        },
+        {
+          "cls": "validated",
+          "desc": "Retire (hide + block",
+          "name": "memory_skill_retire",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "action",
+      "tools": [
+        {
+          "cls": "failclosed",
+          "desc": "Add a typed DAG edge between two coordination actions (#1709)",
+          "name": "memory_action_add_edge",
+          "note": "invalid edge_type",
+          "status": "refusal"
+        },
+        {
+          "cls": "validated",
+          "desc": "Create a coordination action",
+          "name": "memory_action_create",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "List DAG edges for a coordination action (#1709)",
+          "name": "memory_action_edges",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Rank the UNBLOCKED",
+          "name": "memory_action_frontier",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Fetch a coordination action by id (#1709)",
+          "name": "memory_action_get",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "List coordination actions by namespace/state (#1709)",
+          "name": "memory_action_list",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Return the top UNBLOCKED",
+          "name": "memory_action_next",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "State-guarded transition of a coordination action (#1709)",
+          "name": "memory_action_transition",
+          "note": "invalid state",
+          "status": "refusal"
+        }
+      ]
+    },
+    {
+      "family": "routine",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Create a draft routine \u2014 a parameterised action+edge template (#1709)",
+          "name": "memory_routine_create",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Freeze a routine (draft ->",
+          "name": "memory_routine_freeze",
+          "note": "routine not found: ac23639a-807c-42a0-af8a-11b6d6bd0098",
+          "status": "refusal"
+        },
+        {
+          "cls": "validated",
+          "desc": "List a namespace's routines by state, newest-first (#1709)",
+          "name": "memory_routine_list",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Run a frozen routine \u2014",
+          "name": "memory_routine_run",
+          "note": "arguments is required (a JSON object of {{param}} -> value)",
+          "status": "refusal"
+        },
+        {
+          "cls": "validated",
+          "desc": "Fetch a routine run by id, with its state and created action ids (#1709)",
+          "name": "memory_routine_status",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "signal",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Acknowledge a signal by id",
+          "name": "memory_signal_ack",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "List UNACKED signals for a namespace/recipient \u2014 direct + broadcast (#1709)",
+          "name": "memory_signal_inbox",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Read one signal by id, mark it",
+          "name": "memory_signal_read",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Send a typed, optionally",
+          "name": "memory_signal_send",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "List a signal correlation",
+          "name": "memory_signal_thread",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "archive",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "List archived (expired)",
+          "name": "memory_archive_list",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Permanently delete archived",
+          "name": "memory_archive_purge",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Restore an archived memory back",
+          "name": "memory_archive_restore",
+          "note": "cannot restore: memory ac23639a-807c-42a0-af8a-11b6d6bd0098 already exists in active table (would overwrite)",
+          "status": "refusal"
+        },
+        {
+          "cls": "validated",
+          "desc": "Show archive statistics (total",
+          "name": "memory_archive_stats",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "checkpoint",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Create a pending",
+          "name": "memory_checkpoint_create",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Query checkpoints by namespace/condition_type/state, newest-first (#1709)",
+          "name": "memory_checkpoint_query",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Resolve a checkpoint",
+          "name": "memory_checkpoint_resolve",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Fetch a checkpoint by id and verify its attested resolution (#1709)",
+          "name": "memory_checkpoint_verify",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "lease",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Acquire a single-holder lease",
+          "name": "memory_lease_acquire",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Read the lease on a coordination action (#1709)",
+          "name": "memory_lease_get",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Release an owned lease on a coordination action (#1709)",
+          "name": "memory_lease_release",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Heartbeat-renew an owned lease",
+          "name": "memory_lease_renew",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "get",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Get a specific memory by ID",
+          "name": "memory_get",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Get all links for a memory",
+          "name": "memory_get_links",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Return a hierarchical tree of namespaces with memory counts",
+          "name": "memory_get_taxonomy",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "kg",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Mark a KG link as superseded by setting its valid_until column",
+          "name": "memory_kg_invalidate",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Outbound KG traversal from a source memory (<=5 hops)",
+          "name": "memory_kg_query",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Ordered fact timeline for an entity (outbound KG links by valid_from)",
+          "name": "memory_kg_timeline",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "namespace",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Clear the standard/policy for a namespace",
+          "name": "memory_namespace_clear_standard",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Get the standard/policy memory",
+          "name": "memory_namespace_get_standard",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "refining",
+          "desc": "Set a memory as the standard/policy for a namespace",
+          "name": "memory_namespace_set_standard",
+          "note": "memory not found: ac23639a-807c-42a0-af8a-11b6d6bd0098",
+          "status": "fail"
+        }
+      ]
+    },
+    {
+      "family": "pending",
+      "tools": [
+        {
+          "cls": "failclosed",
+          "desc": "Approve a pending action",
+          "name": "memory_pending_approve",
+          "note": "pending action not found: ac23639a-807c-42a0-af8a-11b6d6bd0098",
+          "status": "refusal"
+        },
+        {
+          "cls": "validated",
+          "desc": "List pending governance-queued",
+          "name": "memory_pending_list",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Reject a pending action",
+          "name": "memory_pending_reject",
+          "note": "pending action not found or already decided: ac23639a-807c-42a0-af8a-11b6d6bd0098",
+          "status": "refusal"
+        }
+      ]
+    },
+    {
+      "family": "agent",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "List every registered agent",
+          "name": "memory_agent_list",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Register an agent in the reserved _agents namespace",
+          "name": "memory_agent_register",
+          "note": "invalid agent_type 'validator' \u2014 must be one of: ai:claude-opus-4.6, ai:claude-opus-4.7, ai:codex-5.4, ai:grok-4.2, human, system (or any ai",
+          "status": "refusal"
+        }
+      ]
+    },
+    {
+      "family": "check",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Check action vs",
+          "name": "memory_check_agent_action",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Pre-write near-duplicate check",
+          "name": "memory_check_duplicate",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "entity",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Resolve an alias to its",
+          "name": "memory_entity_get_by_alias",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Register an entity (canonical",
+          "name": "memory_entity_register",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "list",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "List memories, optionally",
+          "name": "memory_list",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "List active webhook",
+          "name": "memory_list_subscriptions",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "persona",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Fetch the latest Persona",
+          "name": "memory_persona",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "failclosed",
+          "desc": "Generate/regen a Persona",
+          "name": "memory_persona_generate",
+          "note": "no reflections found for entity 'validator' in namespace '<any namespace>'",
+          "status": "refusal"
+        }
+      ]
+    },
+    {
+      "family": "recall",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Recall memories relevant to a context (ranked)",
+          "name": "memory_recall",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "List recall_observations (#886)",
+          "name": "memory_recall_observations",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "subscription",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "List subscription_dlq rows",
+          "name": "memory_subscription_dlq_list",
+          "note": "",
+          "status": "ok"
+        },
+        {
+          "cls": "validated",
+          "desc": "Replay subscription_events",
+          "name": "memory_subscription_replay",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "atomise",
+      "tools": [
+        {
+          "cls": "refining",
+          "desc": "Decompose a memory into 2-10",
+          "name": "memory_atomise",
+          "note": "MEMORY_NOT_FOUND: ac23639a-807c-42a0-af8a-11b6d6bd0098",
+          "status": "fail"
+        }
+      ]
+    },
+    {
+      "family": "auto",
+      "tools": [
+        {
+          "cls": "refining",
+          "desc": "LLM-generate tags for a memory",
+          "name": "memory_auto_tag",
+          "note": "memory not found",
+          "status": "fail"
+        }
+      ]
+    },
+    {
+      "family": "calibrate",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Calibrate confidence baselines",
+          "name": "memory_calibrate_confidence",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "capabilities",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Discover runtime capabilities; full per-tool docs: verbose=true",
+          "name": "memory_capabilities",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "capture",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "L4 host-volunteered turn",
+          "name": "memory_capture_turn",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "consolidate",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Consolidate multiple memories",
+          "name": "memory_consolidate",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "delete",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Delete a memory by ID",
+          "name": "memory_delete",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "dependents",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "List dependents flagged by the L2-3 invalidation walker",
+          "name": "memory_dependents_of_invalidated",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "deref",
+      "tools": [
+        {
+          "cls": "refining",
+          "desc": "Dereference a memory_offload",
+          "name": "memory_deref",
+          "note": "offloaded blob ac23639a-807c-42a0-af8a-11b6d6bd0098 not found",
+          "status": "fail"
+        }
+      ]
+    },
+    {
+      "family": "detect",
+      "tools": [
+        {
+          "cls": "refining",
+          "desc": "LLM-check whether two memories",
+          "name": "memory_detect_contradiction",
+          "note": "memory A not found",
+          "status": "fail"
+        }
+      ]
+    },
+    {
+      "family": "expand",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "LLM-expand a search query into related terms (smart/autonomous tier)",
+          "name": "memory_expand_query",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "export",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Render a single reflection",
+          "name": "memory_export_reflection",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "find",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Enumerate up to N paths through",
+          "name": "memory_find_paths",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "forget",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Bulk delete memories matching a pattern",
+          "name": "memory_forget",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "gc",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Trigger garbage collection on expired memories (archives first WHEN ENABLED)",
+          "name": "memory_gc",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "inbox",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "List messages sent to an agent",
+          "name": "memory_inbox",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "ingest",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Form 3 multi-step ingest",
+          "name": "memory_ingest_multistep",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "lineage",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Walk a memory's derivation",
+          "name": "memory_lineage",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "link",
+      "tools": [
+        {
+          "cls": "failclosed",
+          "desc": "Create a typed link between two",
+          "name": "memory_link",
+          "note": "invalid relation 'supports' \u2014 must be one of: related_to, supersedes, contradicts, derived_from, reflects_on, derives_from, decomposes_into,",
+          "status": "refusal"
+        }
+      ]
+    },
+    {
+      "family": "load",
+      "tools": [
+        {
+          "cls": "failclosed",
+          "desc": "Load top-k recent + high-priority memories from a Family",
+          "name": "memory_load_family",
+          "note": "unknown profile or family 'validator'. Valid profiles: core, graph, admin, power, full. Valid families: core, lifecycle, graph, governance, ",
+          "status": "refusal"
+        }
+      ]
+    },
+    {
+      "family": "notify",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Send a message from the caller",
+          "name": "memory_notify",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "offload",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Offload verbatim content",
+          "name": "memory_offload",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "promote",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Promote a memory to long (or",
+          "name": "memory_promote",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "quota",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Report per-agent + per-namespace quota usage (read-only)",
+          "name": "memory_quota_status",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "reflect",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Persist a reflection memory",
+          "name": "memory_reflect",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "reflection",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Inspect the cross-peer",
+          "name": "memory_reflection_origin",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "replay",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Reconstruct the conversation",
+          "name": "memory_replay",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "rule",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "List substrate-level",
+          "name": "memory_rule_list",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "search",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Search memories by exact",
+          "name": "memory_search",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "session",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Auto-recall recent memories on session start",
+          "name": "memory_session_start",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "share",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Share a memory with another",
+          "name": "memory_share",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "smart",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Intent-routed loader: free-text",
+          "name": "memory_smart_load",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "stats",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Get memory store statistics",
+          "name": "memory_stats",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "store",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Store a memory",
+          "name": "memory_store",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "subscribe",
+      "tools": [
+        {
+          "cls": "failclosed",
+          "desc": "Register a webhook subscription",
+          "name": "memory_subscribe",
+          "note": "HMAC secret required: configure per-subscription `hmac_secret` or server-wide `[security] hmac_secret`. Pass `secret: <value>` in the tool c",
+          "status": "refusal"
+        }
+      ]
+    },
+    {
+      "family": "swarm",
+      "tools": [
+        {
+          "cls": "failclosed",
+          "desc": "Atomically intercept and unwind",
+          "name": "memory_swarm_rewind",
+          "note": "swarm_rewind: target validator not found",
+          "status": "refusal"
+        }
+      ]
+    },
+    {
+      "family": "unsubscribe",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Delete a subscription by id",
+          "name": "memory_unsubscribe",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "update",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Update an existing memory by ID",
+          "name": "memory_update",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    },
+    {
+      "family": "verify",
+      "tools": [
+        {
+          "cls": "validated",
+          "desc": "Re-verify a stored memory_links",
+          "name": "memory_verify",
+          "note": "",
+          "status": "ok"
+        }
+      ]
+    }
+  ],
+  "lastUpdated": "2026-10-17T23:39:15Z",
+  "names": [
+    "memory_action_add_edge",
+    "memory_action_create",
+    "memory_action_edges",
+    "memory_action_frontier",
+    "memory_action_get",
+    "memory_action_list",
+    "memory_action_next",
+    "memory_action_transition",
+    "memory_agent_list",
+    "memory_agent_register",
+    "memory_archive_list",
+    "memory_archive_purge",
+    "memory_archive_restore",
+    "memory_archive_stats",
+    "memory_atomise",
+    "memory_auto_tag",
+    "memory_calibrate_confidence",
+    "memory_capabilities",
+    "memory_capture_turn",
+    "memory_check_agent_action",
+    "memory_check_duplicate",
+    "memory_checkpoint_create",
+    "memory_checkpoint_query",
+    "memory_checkpoint_resolve",
+    "memory_checkpoint_verify",
+    "memory_consolidate",
+    "memory_delete",
+    "memory_dependents_of_invalidated",
+    "memory_deref",
+    "memory_detect_contradiction",
+    "memory_entity_get_by_alias",
+    "memory_entity_register",
+    "memory_expand_query",
+    "memory_export_reflection",
+    "memory_find_paths",
+    "memory_forget",
+    "memory_gc",
+    "memory_get",
+    "memory_get_links",
+    "memory_get_taxonomy",
+    "memory_inbox",
+    "memory_ingest_multistep",
+    "memory_kg_invalidate",
+    "memory_kg_query",
+    "memory_kg_timeline",
+    "memory_lease_acquire",
+    "memory_lease_get",
+    "memory_lease_release",
+    "memory_lease_renew",
+    "memory_lineage",
+    "memory_link",
+    "memory_list",
+    "memory_list_subscriptions",
+    "memory_load_family",
+    "memory_namespace_clear_standard",
+    "memory_namespace_get_standard",
+    "memory_namespace_set_standard",
+    "memory_notify",
+    "memory_offload",
+    "memory_pending_approve",
+    "memory_pending_list",
+    "memory_pending_reject",
+    "memory_persona",
+    "memory_persona_generate",
+    "memory_promote",
+    "memory_quota_status",
+    "memory_recall",
+    "memory_recall_observations",
+    "memory_reflect",
+    "memory_reflection_origin",
+    "memory_replay",
+    "memory_routine_create",
+    "memory_routine_freeze",
+    "memory_routine_list",
+    "memory_routine_run",
+    "memory_routine_status",
+    "memory_rule_list",
+    "memory_search",
+    "memory_session_start",
+    "memory_share",
+    "memory_signal_ack",
+    "memory_signal_inbox",
+    "memory_signal_read",
+    "memory_signal_send",
+    "memory_signal_thread",
+    "memory_skill_compositional_context",
+    "memory_skill_delete",
+    "memory_skill_export",
+    "memory_skill_get",
+    "memory_skill_list",
+    "memory_skill_promote_from_reflection",
+    "memory_skill_register",
+    "memory_skill_resource",
+    "memory_skill_retire",
+    "memory_smart_load",
+    "memory_stats",
+    "memory_store",
+    "memory_subscribe",
+    "memory_subscription_dlq_list",
+    "memory_subscription_replay",
+    "memory_swarm_rewind",
+    "memory_unsubscribe",
+    "memory_update",
+    "memory_verify"
+  ],
+  "note": "percentage is not emitted; consumers must derive it from total/validated/failclosed of THIS run_id",
+  "producer_id": "mcp-tools-state",
+  "refining": 5,
+  "run_id": "mcp-tools-7644-20261017",
+  "source_commit": "c9de4e680c9fa64fa267d3ade9c1305a6ca9f4b0",
+  "source_tree_sha": "3020cd7039b2e3da6182333dd75e9dec61869a77",
+  "surface": "MCP (localhost \u00b7 ai-memory mcp --profile full)",
+  "total": 104,
+  "validated": 79
+}
