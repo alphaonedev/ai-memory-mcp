@@ -20,6 +20,7 @@ use ai_memory::identity::test_key_dir::{TEST_KEY_GUARD_ENV, private_tempdir, res
 use std::process::Command;
 
 const PROBE_ENV: &str = "PRIVATE_TEMPDIR_PROBE_7450";
+const RAN_MARKER: &str = "probe-ran-7450";
 
 #[test]
 fn private_tempdir_probe() {
@@ -43,6 +44,13 @@ fn private_tempdir_probe() {
         "#7450 private_tempdir resolved under HOME: {}",
         canonical_dir.display()
     );
+    // Side effect the parent asserts: a child that ran zero tests exits 0.
+    std::fs::write(
+        std::path::PathBuf::from(std::env::var_os("HOME").expect("#7450 HOME set by parent"))
+            .join(RAN_MARKER),
+        b"ran",
+    )
+    .expect("#7450 write probe marker");
 }
 
 #[test]
@@ -50,7 +58,7 @@ fn private_tempdir_is_off_home_when_tmpdir_is_under_home_7450() {
     let home = tempfile::tempdir().unwrap();
     let tmp = home.path().join("tmp");
     std::fs::create_dir(&tmp).unwrap();
-    let output = Command::new(std::env::current_exe().unwrap())
+    let output = Command::new(std::env::current_exe().expect("#7450 resolve test binary"))
         .args(["--exact", "private_tempdir_probe", "--nocapture"])
         .env(PROBE_ENV, "1")
         .env(TEST_KEY_GUARD_ENV, "1")
@@ -58,7 +66,7 @@ fn private_tempdir_is_off_home_when_tmpdir_is_under_home_7450() {
         .env("TMPDIR", &tmp)
         .env_remove("AI_MEMORY_KEY_DIR")
         .output()
-        .unwrap();
+        .expect("#7450 spawn probe child");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let tail: Vec<&str> = stderr.lines().rev().take(12).collect();
     assert!(
@@ -66,5 +74,9 @@ fn private_tempdir_is_off_home_when_tmpdir_is_under_home_7450() {
         "#7450 child failed ({:?}); stderr tail (newest first):\n{}",
         output.status,
         tail.join("\n")
+    );
+    assert!(
+        home.path().join(RAN_MARKER).is_file(),
+        "#7450 probe child exited 0 without running the probe (renamed or filtered out?)"
     );
 }
