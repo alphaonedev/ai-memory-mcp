@@ -32,6 +32,14 @@ CANDLE_LOCK = ('[[package]]\nname = "candle-core"\nversion = "0.10.2"\n'
 MINIMAL_MANIFEST = '[package]\nname = "fixture"\nversion = "0.0.0"\n\n[dependencies]\nserde = "1"\n'
 
 
+def load_guard_module():
+    """The guard imported as a module (its functions under test)."""
+    spec = importlib.util.spec_from_file_location('zip_guard_under_test', str(GUARD))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def default_meta(root):
     """cargo metadata JSON naming only the fixture root package."""
     return {'packages': [{'name': 'fixture', 'source': None, 'manifest_path': str(Path(root) / 'Cargo.toml'),
@@ -1375,6 +1383,155 @@ class RuleFixtures7305To7312(GuardBase):
         self.write('src/gen.rs', 'pub fn g() {}\n')
         res = self.run_guard()
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_nested_cfg_attr_path_is_a_mod_rs_load_7310(self):
+        """N: `cfg_attr(.., cfg_attr(.., path = ..))` loads a.rs mod-rs; the decoy beside it is not the module."""
+        for depth, attr in ((2, '#[cfg_attr(all(), cfg_attr(all(), path = "a.rs"))]'),
+                            (3, '#[cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), path = "a.rs")))]')):
+            with self.subTest(depth=depth):
+                self.write('src/lib.rs', attr + '\nmod b;\n')
+                self.write('src/b.rs', 'pub fn g() {}\n')
+                self.write('src/a.rs', 'mod gen;\n')
+                self.write('src/a/gen.rs', 'pub fn g() {}\n')
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('src/a.rs:1', res.stdout)
+                self.assertIn('mod gen', res.stdout)
+                self.write('src/gen.rs', 'pub fn g() {}\n')
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+                (self.root / 'src' / 'gen.rs').unlink()
+
+    def test_nested_cfg_attr_predicate_path_adds_no_mod_rs_load_7310(self):
+        self.write('src/lib.rs', 'mod a;\n#[cfg_attr(all(), cfg_attr(not(path = "a.rs"), allow(dead_code)))]\nmod b;\n')
+        self.write('src/b.rs', 'pub fn g() {}\n')
+        self.write('src/a.rs', 'mod gen;\n')
+        self.write('src/gen.rs', 'pub fn g() {}\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('src/a.rs:1', res.stdout)
+
+    def test_path_key_loads_at_every_cfg_attr_depth_7310(self):
+        module = load_guard_module()
+        loads = module.path_key_loads
+        cases = (
+            ('path = "a.rs"', True),
+            ('cfg_attr(unix, path = "a.rs")', True),
+            ('cfg_attr(unix, cfg_attr(unix, path = "a.rs"))', True),
+            ('cfg_attr(unix, cfg_attr(unix, cfg_attr(all(a, b), path = "a.rs")))', True),
+            ('cfg_attr(unix, allow(dead_code), cfg_attr(unix, path = "a.rs"))', True),
+            ('cfg_attr(not(path = "a.rs"), allow(dead_code))', False),
+            ('cfg_attr(unix, cfg_attr(not(path = "a.rs"), allow(dead_code)))', False),
+            ('cfg_attr(unix, allow(path = "a.rs"))', False),
+            ('cfg_attr(unix, doc(hidden), derive(path = "a.rs"))', False),
+            ('doc(path = "a.rs")', False),
+        )
+        for body, expected in cases:
+            with self.subTest(body=body):
+                self.assertEqual(loads(body, body.index('path =')), expected)
+
+    def test_path_in_an_inline_mod_resolves_under_the_inline_dir_7310(self):
+        """H1/H3: the loader sits under y/ (z/); the decoy beside the file is not what rustc loads."""
+        self.write('Cargo.toml', PACKAGE_ONLY + '[lib]\npath = "other/lib.rs"\n')
+        for source, loader, decoy in (('mod y { #[path = "x.rs"] mod m; }\n', 'other/y/x.rs', 'other/x.rs'),
+                                      ('mod y { mod z { #[path = "x.rs"] mod m; } }\n', 'other/y/z/x.rs',
+                                       'other/x.rs')):
+            with self.subTest(loader=loader):
+                self.write('other/lib.rs', source)
+                self.write(loader, self.LOADER)
+                self.write(decoy, 'pub fn g() {}\n')
+                res = self.run_guard(meta=self.meta_targets(['other/lib.rs']))
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn(loader + ':1', res.stdout)
+                self.assertIn('candle-loader', res.stdout)
+
+    def test_clean_path_in_an_inline_mod_passes_7310(self):
+        """H2 (L-b): a correct `#[path]` inside an inline mod is not reported as unresolved."""
+        self.write('src/lib.rs', 'mod y { #[path = "x.rs"] mod m; }\n')
+        self.write('src/y/x.rs', 'pub fn g() {}\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        (self.root / 'src' / 'y' / 'x.rs').unlink()
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('does not resolve to a file', res.stdout)
+
+    def test_mod_declared_inside_a_macro_rules_body_fails_7310(self):
+        """M: a macro-emitted `mod $n;` is resolved where the macro is invoked; the guard cannot follow it."""
+        self.write('Cargo.toml', PACKAGE_ONLY + '[lib]\npath = "other/lib.rs"\n')
+        for body in ('macro_rules! m { ($n:ident) => { mod $n; }; }\nm!(gen);\n',
+                     'macro_rules! m { () => { mod gen; }; }\nm!();\n',
+                     'macro_rules! m ( ($n:ident) => ( pub mod $n; ); )\nm!(gen);\n'):
+            with self.subTest(body=body):
+                self.write('other/lib.rs', body)
+                self.write('other/gen.rs', self.LOADER)
+                res = self.run_guard(meta=self.meta_targets(['other/lib.rs']))
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('other/lib.rs:1', res.stdout)
+                self.assertIn('macro_rules! m', res.stdout)
+
+    def test_macro_rules_without_a_module_passes_7310(self):
+        self.write('src/lib.rs', 'macro_rules! m { () => { fn q() {} }; }\nm!();\nmod gen;\n')
+        self.write('src/gen.rs', 'pub fn g() {}\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def symlink_module(self, link_rel, target_rel):
+        link = self.root / link_rel
+        link.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.symlink(target_rel, str(link))
+        except (OSError, NotImplementedError, AttributeError) as exc:
+            self.skipTest('symlinks unavailable: %s' % exc)
+
+    def test_symlinked_module_bases_come_from_the_logical_path_7310(self):
+        """S1: src/a.rs -> ../lib2/x.rs; rustc wants src/a/gen.rs, not the decoy beside the target."""
+        self.write('src/lib.rs', 'mod a;\n')
+        self.write('lib2/x.rs', 'mod gen;\n')
+        self.write('lib2/x/gen.rs', 'pub fn g() {}\n')
+        self.symlink_module('src/a.rs', '../lib2/x.rs')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('src/a.rs:1', res.stdout)
+        self.assertIn('mod gen', res.stdout)
+        self.write('src/a/gen.rs', 'pub fn g() {}\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_symlinked_module_is_scanned_under_its_logical_base_7310(self):
+        """S2: the loader sits at the logical base, in a crate outside SCAN_DIRS."""
+        self.write('Cargo.toml', PACKAGE_ONLY + '[lib]\npath = "other/lib.rs"\n')
+        self.write('other/lib.rs', 'mod a;\n')
+        self.write('lib2/x.rs', 'mod gen;\n')
+        self.write('lib2/x/gen.rs', 'pub fn g() {}\n')
+        self.write('other/a/gen.rs', self.LOADER)
+        self.symlink_module('other/a.rs', '../lib2/x.rs')
+        res = self.run_guard(meta=self.meta_targets(['other/lib.rs']))
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('other/a/gen.rs:1', res.stdout)
+        self.assertIn('candle-loader', res.stdout)
+
+    def test_cargo_timeout_is_a_tool_error_7310(self):
+        """L-c: a hung cargo ends as ToolError (rc 2) naming the command, and both calls carry a timeout."""
+        module = load_guard_module()
+        seen = []
+
+        def hang(argv, **kwargs):
+            seen.append(kwargs.get('timeout'))
+            raise subprocess.TimeoutExpired(argv, kwargs.get('timeout'))
+
+        real = module.subprocess.run
+        module.subprocess.run = hang
+        try:
+            for call, name in ((module.cargo_tree_output, 'cargo tree'), (module.cargo_metadata_output, 'cargo metadata')):
+                with self.subTest(call=name):
+                    with self.assertRaises(module.ToolError) as caught:
+                        call(self.root)
+                    self.assertIn(name, str(caught.exception))
+                    self.assertIn('timed out', str(caught.exception))
+        finally:
+            module.subprocess.run = real
+        self.assertEqual(seen, [600, 600])
 
     def test_package_without_targets_is_usage_error_7305(self):
         """G1: a local package whose metadata lacks `targets` (or lists none) is a tool error."""

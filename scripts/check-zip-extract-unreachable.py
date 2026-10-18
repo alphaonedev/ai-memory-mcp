@@ -167,8 +167,8 @@ def path_key_loads(body, position):
     """True when the `path =` key at `position` of an attribute body loads a module file.
 
     Only `#[path = ..]` and the arguments after the first one of `#[cfg_attr(<predicate>, .., path = ..)]`
-    do. A `path =` inside a predicate or another attribute's arguments loads nothing, so it must not
-    count as a #[path] load (F2).
+    do, at any `cfg_attr(.., cfg_attr(.., path = ..))` nesting depth (N). A `path =` inside a predicate
+    or another attribute's arguments loads nothing, so it must not count as a #[path] load (F2).
     """
     head = body[:position]
     if not head.strip():
@@ -188,7 +188,13 @@ def path_key_loads(body, position):
                 return False
         elif char == ',' and depth == 1:
             last_comma = index
-    return depth == 1 and last_comma >= 0 and not head[last_comma + 1:].strip()
+    if last_comma < 0:
+        return False
+    tail = head[last_comma + 1:]
+    if not tail.strip():
+        return depth == 1
+    # The key sits in a nested attribute of the argument list: `cfg_attr(.., cfg_attr(.., path = ..))`.
+    return path_key_loads(body[last_comma + 1:], position - (last_comma + 1))
 PATH_LITERAL = re.compile(r'\s*"([^"]+)"')
 INCLUDE_ANY = re.compile(r'\binclude\s*!\s*[(\[{]')
 INCLUDE_LITERAL = re.compile(r'\binclude\s*!\s*\(\s*"([^"]+)"\s*\)')
@@ -691,20 +697,52 @@ def seed_sources(root, manifest_text, targets=()):
     return seeds
 
 
-def resolve_target(root, source, value, is_path_attr):
-    """Resolve a #[path] / include! target; returns (path or None, problem or None)."""
-    candidates = [source.parent / value]
-    if is_path_attr:
-        candidates.append(source.parent / source.stem / value)
-    for candidate in candidates:
-        resolved = Path(os.path.realpath(str(candidate)))
-        if resolved.is_file():
+def lexical(path):
+    """`..` and `.` folded away textually; symlinks are NOT resolved (rustc resolves from this path, S)."""
+    return Path(os.path.normpath(str(path)))
+
+
+def real_of(path):
+    return Path(os.path.realpath(str(path)))
+
+
+def logical_path(root, path):
+    """The path as rustc sees it. One outside the repository (an absolute `cargo metadata` path) is
+    anchored on the real parent directory only, so the file's own name is kept."""
+    path = lexical(path)
+    try:
+        path.relative_to(root)
+        return path
+    except ValueError:
+        return lexical(real_of(path.parent) / path.name)
+
+
+def target_candidates(source, value, is_path_attr, inline=()):
+    """Logical paths a #[path] / include! value can name from `source` (the logical path of the file).
+
+    rustc: a `#[path]` is relative to the directory of the file, plus the names of the enclosing
+    inline `mod y { .. }` blocks (H); in a plain `name.rs` file those sit under `name/`, so both
+    bases are candidates. Over-listing is the fail-closed direction.
+    """
+    if not is_path_attr:
+        return [lexical(source.parent / value)]
+    sub = Path(*inline) if inline else Path()
+    return [lexical(base / sub / value) for base in (source.parent, source.parent / source.stem)]
+
+
+def resolve_target(root, source, value, is_path_attr, inline=()):
+    """Resolve a #[path] / include! target; returns ([logical paths of the existing files], problem or None)."""
+    found = []
+    for candidate in target_candidates(source, value, is_path_attr, inline):
+        if candidate.is_file():
             try:
-                resolved.relative_to(root)
+                real_of(candidate).relative_to(root)
             except ValueError:
-                return None, 'target %s is outside the repository' % value
-            return resolved, None
-    return None, 'target %s does not resolve to a file' % value
+                return [], 'target %s is outside the repository' % value
+            found.append(candidate)
+    if not found:
+        return [], 'target %s does not resolve to a file' % value
+    return found, None
 
 
 PASTE_GROUP = re.compile(r'\[<(.*?)>\]', re.DOTALL)
@@ -715,7 +753,9 @@ PASTE_MODIFIER = re.compile(r':(?:lower|upper|snake|camel|lower_camel|upper_came
 # lists cannot drift (N5, L3).
 PASTE_LOADER_NORMAL = re.compile(loader_alternation(True) + r'\b')
 MOD_DECL = re.compile(r'(?<![\w])mod\s+(?:r#)?([A-Za-z_]\w*)\s*;')
-INLINE_MOD_OR_BRACE = re.compile(r'\bmod\s+(?:r#)?([A-Za-z_]\w*)\s*\{|[{}]')
+MACRO_RULES = re.compile(r'\bmacro_rules\s*!\s*(?:r#)?([A-Za-z_]\w*)\s*(?=[(\[{])')
+MACRO_MOD = re.compile(r'(?<![\w$])mod\s+(?:r#)?\$?\s*[A-Za-z_]\w*\s*;')
+INLINE_MOD_OR_BRACE =re.compile(r'\bmod\s+(?:r#)?([A-Za-z_]\w*)\s*\{|[{}]')
 
 
 def paste_loader_hits(text, masked):
@@ -775,12 +815,13 @@ def load_base(path, mode):
 
 
 def existing_candidates(path, decls, bases):
+    """Logical paths of the module files `mod x;` can resolve to (bases come from the logical path, S)."""
     found = []
     for _line, name, sub in decls:
         for base in bases:
             for candidate in module_candidates(base, sub, name):
                 if candidate.is_file():
-                    found.append(Path(os.path.realpath(str(candidate))))
+                    found.append(lexical(candidate))
     return found
 
 
@@ -805,10 +846,10 @@ def propagate_modes(files, roots, path_targets):
                     for candidate in module_candidates(load_base(path, mode), sub, name):
                         if not candidate.is_file():
                             continue
-                        real = Path(os.path.realpath(str(candidate)))
-                        child = MODE_RS if real.name == 'mod.rs' else MODE_PLAIN
-                        if child not in modes.setdefault(real, set()):
-                            modes[real].add(child)
+                        logical = lexical(candidate)
+                        child = MODE_RS if logical.name == 'mod.rs' else MODE_PLAIN
+                        if child not in modes.setdefault(logical, set()):
+                            modes[logical].add(child)
                             changed = True
     return modes
 
@@ -840,36 +881,126 @@ def crate_roots(root, manifest_text, targets=()):
         if base.is_dir():
             found.update(base.glob('*.rs'))
             found.update(base.glob('*/main.rs'))
-    return {Path(os.path.realpath(str(p))) for p in found}
+    return {logical_path(root, p) for p in found}
+
+
+def macro_mod_hits(masked):
+    """(line, macro name) for each `mod x;` / `mod $x;` inside a `macro_rules!` body (M).
+
+    The module file is looked up where the macro is INVOKED, which the guard cannot follow, so
+    such a declaration is a violation (fail closed) instead of an invisible, unscanned module.
+    """
+    hits = []
+    for macro in MACRO_RULES.finditer(masked):
+        opening = macro.end()
+        closing = match_close(masked, opening)
+        for decl in MACRO_MOD.finditer(masked, opening, closing):
+            hits.append((masked.count('\n', 0, decl.start()) + 1, macro.group(1)))
+    return hits
+
+
+class SourceFile(object):
+    """One scanned file (by realpath) and what it references; each logical path it is reached by is a view."""
+
+    def __init__(self, real, rel, decls, refs):
+        self.real = real
+        self.rel = rel
+        self.decls = decls
+        self.refs = refs
+        self.views = set()
+
+
+def source_refs(text, masked):
+    """(kind, line, value or None, inline mods, loads) for each #[path] attribute and include! (H, N)."""
+    refs = []
+    for offset, body in attribute_bodies(masked):
+        for key in PATH_KEY.finditer(body):
+            number = masked.count('\n', 0, offset + key.start()) + 1
+            literal = PATH_LITERAL.match(text, offset + key.end())
+            inline = tuple(enclosing_inline_mods(masked, offset + key.start()))
+            refs.append(('path', number, literal.group(1) if literal else None, inline,
+                         path_key_loads(body, key.start())))
+    for include in INCLUDE_ANY.finditer(masked):
+        number = masked.count('\n', 0, include.start()) + 1
+        literal = INCLUDE_LITERAL.match(text, include.start())
+        refs.append(('include', number, literal.group(1) if literal else None, (), False))
+    return refs
 
 
 def check_sources(root, manifest_text='', label='', targets=()):
-    """`targets`: (src_path, is_build_script) from `cargo metadata`; covers every TOML form of a target (#7310)."""
-    root = Path(os.path.realpath(str(root)))
+    """`targets`: (src_path, is_build_script) from `cargo metadata`; covers every TOML form of a target (#7310).
+
+    Bases for `mod x;` and `#[path]` come from the LOGICAL path (symlinks unresolved, S); the realpath
+    only keys the seen-set and the escape check.
+    """
+    root = real_of(root)
     builds = build_script_paths(root, manifest_text, targets)
     problems = []
-    queue = [Path(os.path.realpath(str(p))) for p in seed_sources(root, manifest_text, targets)]
+
+    def report(text):
+        if text not in problems:
+            problems.append(text)
+
+    queue = [logical_path(root, p) for p in seed_sources(root, manifest_text, targets)]
     roots = crate_roots(root, manifest_text, targets)
     for declared in list(manifest_source_paths(manifest_text)) + [str(t) for t, _build in targets]:
-        target = Path(os.path.realpath(str(root / declared)))
+        target = real_of(root / declared)
         if not target.is_file():
             try:
                 shown = label + target.relative_to(root).as_posix()
             except ValueError:
                 shown = label + declared
-            problems.append(violation(shown, 'declared target has no file on disk; a build step could generate it'))
-    seen = set()
+            report(violation(shown, 'declared target has no file on disk; a build step could generate it'))
+    seen = {}
     mod_files = []
     path_targets = set()
-    while queue:
-        path = queue.pop(0)
-        if path in seen or not path.is_file():
-            continue
-        seen.add(path)
+
+    def show(logical):
         try:
-            rel = label + path.relative_to(root).as_posix()
+            return label + logical.relative_to(root).as_posix()
         except ValueError:
-            problems.append(violation(str(path), 'source outside the repository'))
+            return label + str(logical)
+
+    def expand(logical, info):
+        """Queue what `info` references, resolved from the logical path `logical`."""
+        rel = show(logical)
+        for kind, number, value, inline, loads in info.refs:
+            where = '%s:%d' % (rel, number)
+            if value is None:
+                what = '#[path] with a non-literal value' if kind == 'path' else 'include! with a non-literal path'
+                report(violation(where, what + ' cannot be followed'))
+                continue
+            found, problem = resolve_target(root, logical, value, kind == 'path', inline)
+            if problem:
+                report(violation(where, ('#[path] ' if kind == 'path' else 'include! ') + problem))
+                continue
+            # Scanned whatever the attribute. Only a real load makes it a mod-rs file: a `path =`
+            # inside a cfg predicate loads nothing and adds no exemption (F2).
+            if loads:
+                path_targets.update(found)
+            queue.extend(found)
+        # Every module file `mod x;` can resolve to is scanned, wherever it sits (E): over-scanning
+        # both bases is the fail-closed direction.
+        queue.extend(existing_candidates(logical, info.decls, (logical.parent, logical.parent / logical.stem)))
+        mod_files.append((logical, rel, info.decls))
+
+    while queue:
+        logical = queue.pop(0)
+        if not logical.is_file():
+            continue
+        path = real_of(logical)
+        known = seen.get(path)
+        if known is not None:
+            if logical not in known.views:
+                known.views.add(logical)
+                expand(logical, known)
+            continue
+        rel = show(logical)
+        try:
+            path.relative_to(root)
+        except ValueError:
+            seen[path] = SourceFile(path, rel, [], [])
+            report(violation(str(path), 'source outside the repository'))
             continue
         text = read_source(path, rel)
         # Code patterns run on the masked text: comments and string bodies are
@@ -883,52 +1014,26 @@ def check_sources(root, manifest_text='', label='', targets=()):
             where = '%s:%d' % (rel, number)
             for rule, pattern in FORBIDDEN:
                 if pattern.search(line):
-                    problems.append(violation(where, rule))
+                    report(violation(where, rule))
             if zip_context and EXTRACT_CALL.search(line):
-                problems.append(violation(where, 'zip-flavoured extract call'))
-        for offset, body in attribute_bodies(masked):
-            for key in PATH_KEY.finditer(body):
-                number = masked.count('\n', 0, offset + key.start()) + 1
-                where = '%s:%d' % (rel, number)
-                literal = PATH_LITERAL.match(text, offset + key.end())
-                if not literal:
-                    problems.append(violation(where, '#[path] with a non-literal value cannot be followed'))
-                    continue
-                target, problem = resolve_target(root, path, literal.group(1), True)
-                if problem:
-                    problems.append(violation(where, '#[path] ' + problem))
-                else:
-                    # Scanned whatever the attribute. Only a real load makes it a mod-rs file: a
-                    # `path =` inside a cfg predicate loads nothing and adds no exemption (F2).
-                    if path_key_loads(body, key.start()):
-                        path_targets.add(target)
-                    queue.append(target)
-        decls = module_decls(masked)
-        # Every module file `mod x;` can resolve to is scanned, wherever it sits (E): over-scanning
-        # both bases is the fail-closed direction.
-        queue.extend(existing_candidates(path, decls, (path.parent, path.parent / path.stem)))
-        mod_files.append((path, rel, decls))
-        for include in INCLUDE_ANY.finditer(masked):
-            number = masked.count('\n', 0, include.start()) + 1
-            where = '%s:%d' % (rel, number)
-            literal = INCLUDE_LITERAL.match(text, include.start())
-            if not literal:
-                problems.append(violation(where, 'include! with a non-literal path cannot be followed'))
-                continue
-            target, problem = resolve_target(root, path, literal.group(1), False)
-            if problem:
-                problems.append(violation(where, 'include! ' + problem))
-            else:
-                queue.append(target)
+                report(violation(where, 'zip-flavoured extract call'))
+        for number, macro in macro_mod_hits(masked):
+            report(violation('%s:%d' % (rel, number),
+                             'mod declared inside macro_rules! %s resolves where the macro is invoked and cannot be '
+                             'followed' % macro))
         for number in macro_input_hits(text, masked):
-            problems.append(violation('%s:%d' % (rel, number), 'zip named in macro input'))
+            report(violation('%s:%d' % (rel, number), 'zip named in macro input'))
         for number in paste_loader_hits(text, masked):
-            problems.append(violation('%s:%d' % (rel, number), 'candle-loader (paste! pieces)'))
+            report(violation('%s:%d' % (rel, number), 'candle-loader (paste! pieces)'))
+        info = SourceFile(path, rel, module_decls(masked), source_refs(text, masked))
+        info.views.add(logical)
+        seen[path] = info
+        expand(logical, info)
     # After the walk: every file's load modes, whatever the visit order.
     modes = propagate_modes(mod_files, roots, path_targets)
-    for path, rel, decls in mod_files:
-        for number, name in missing_mod_hits(path, decls, modes):
-            problems.append(violation(
+    for logical, rel, decls in mod_files:
+        for number, name in missing_mod_hits(logical, decls, modes):
+            report(violation(
                 '%s:%d' % (rel, number), 'mod %s; resolves to no file on disk (a build step could generate it)' % name))
     return problems
 
@@ -998,13 +1103,25 @@ def lock_has_zip(root):
     return re.search(r'^name\s*=\s*"zip"\s*$', text, re.MULTILINE) is not None
 
 
-def cargo_tree_output(root):
-    """Run cargo tree. Returns (stdout, absent); absent means zip is not in the graph."""
+CARGO_TIMEOUT_SECS = 600
+
+
+def run_cargo(args, root):
+    """Run cargo with a timeout; a hang or a missing binary is a tool error (rc 2), never a pass (L-c)."""
+    command = 'cargo ' + ' '.join(args)
     try:
-        result = subprocess.run(
-            ['cargo', *CARGO_TREE_ARGS], cwd=str(root), capture_output=True, text=True, check=False)
+        return subprocess.run(
+            ['cargo', *args], cwd=str(root), capture_output=True, text=True, check=False,
+            timeout=CARGO_TIMEOUT_SECS)
+    except subprocess.TimeoutExpired:
+        raise ToolError('`%s` timed out after %d s' % (command, CARGO_TIMEOUT_SECS))
     except OSError as exc:
         raise ToolError('cannot run cargo: %s' % exc)
+
+
+def cargo_tree_output(root):
+    """Run cargo tree. Returns (stdout, absent); absent means zip is not in the graph."""
+    result = run_cargo(CARGO_TREE_ARGS, root)
     if result.returncode != 0 and NO_MATCH in result.stderr:
         return '', True
     if result.returncode != 0:
@@ -1018,11 +1135,7 @@ CARGO_METADATA_ARGS = ('metadata', '--locked', '--format-version', '1')
 
 
 def cargo_metadata_output(root):
-    try:
-        result = subprocess.run(
-            ['cargo', *CARGO_METADATA_ARGS], cwd=str(root), capture_output=True, text=True, check=False)
-    except OSError as exc:
-        raise ToolError('cannot run cargo: %s' % exc)
+    result = run_cargo(CARGO_METADATA_ARGS, root)
     if result.returncode != 0:
         raise ToolError('cargo metadata failed rc=%d: %s' % (result.returncode, result.stderr.strip()[-400:]))
     return result.stdout
