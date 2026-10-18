@@ -4,6 +4,8 @@
 #
 # A test fn of a tests/*.rs that mutates the process environment must hold the lock its
 # writers use when it can reach an env / C getenv reader (see scripts/check-test-env-mutation.py).
+# The lock is credited only in the canonical shape: `let _guard = <lock>;` directly in the test fn's
+# top-level block, before the first env write, and never mentioned again. Anything else fails closed.
 # An entry that no longer violates must be removed: the list may only shrink.
 # Regenerate with: scripts/check-test-env-mutation.py --update-baseline
 tests/a2a_campaign_round1.rs::a2a_1_local_federation_bidirectional_signature_roundtrip
@@ -76,14 +78,8 @@ tests/cli_sync_coverage.rs::push_skips_invalid_memory
 tests/cli_sync_coverage.rs::restamp_agent_id_with_non_object_metadata_is_safe
 tests/cli_sync_coverage.rs::run_daemon_mtls_with_insecure_skip_is_refused_by_default_2448
 tests/conformance_export_roundtrip_2030.rs::committed_fixture_round_trips_through_production_importer
-tests/cov_ga2_federation.rs::broadcast_archive_quorum_no_peers_ok
-tests/cov_ga2_federation.rs::broadcast_consolidate_quorum_no_peers_ok
-tests/cov_ga2_federation.rs::broadcast_delete_quorum_no_peers_ok
-tests/cov_ga2_federation.rs::broadcast_link_quorum_no_peers_ok
-tests/cov_ga2_federation.rs::broadcast_quorum_with_unreachable_peer_exercises_fanout_fail_arm
 tests/cov_ga2_federation.rs::http_action_transition_single_node
 tests/cov_ga2_federation.rs::http_send_signal_single_node
-tests/cov_ga2_power.rs::consolidate_federated_sqlite_quorum_met_fans_out_2860
 tests/cov_ga2_power.rs::store_failing_embedder_skips_conflict_check
 tests/cov_ga2_power.rs::store_federation_forward_unreachable_is_err
 tests/cov_ga2_power.rs::store_force_bypasses_proactive_conflict
@@ -92,23 +88,6 @@ tests/cov_ga2_power.rs::store_merge_on_conflict_updates_existing
 tests/cov_ga2_power.rs::store_merge_with_embedder_regenerates_embedding
 tests/cov_ga2_power.rs::store_proactive_conflict_refuses_near_duplicate
 tests/cov_ga2_power.rs::store_with_embedder_warms_index
-tests/cov_ga2_r4_federation.rs::broadcast_namespace_meta_clear_quorum_id_drift_does_not_meet_quorum
-tests/cov_ga2_r4_federation.rs::broadcast_namespace_meta_clear_quorum_peer_ack_meets_quorum
-tests/cov_ga2_r4_federation.rs::broadcast_namespace_meta_quorum_id_drift_does_not_meet_quorum
-tests/cov_ga2_r4_federation.rs::broadcast_namespace_meta_quorum_peer_ack_meets_quorum
-tests/cov_ga2_r4_federation.rs::broadcast_pending_decision_quorum_peer_ack_meets_quorum
-tests/cov_ga2_r4_federation.rs::broadcast_pending_decision_quorum_peer_fail_does_not_meet_quorum
-tests/cov_ga2_r4_federation.rs::broadcast_pending_quorum_id_drift_does_not_meet_quorum
-tests/cov_ga2_r4_federation.rs::broadcast_pending_quorum_peer_ack_meets_quorum
-tests/cov_ga2_r4_federation.rs::broadcast_restore_quorum_id_drift_does_not_meet_quorum
-tests/cov_ga2_r4_federation.rs::broadcast_restore_quorum_peer_ack_meets_quorum
-tests/cov_ga2_r4_federation.rs::broadcast_store_no_embedding_meets_quorum_plain_body
-tests/cov_ga2_r4_federation.rs::broadcast_store_partial_quorum_warns_when_one_of_two_peers_silent
-tests/cov_ga2_r4_federation.rs::broadcast_store_with_embedding_ships_vector_and_meets_quorum
-tests/cov_ga2_r4_federation.rs::bulk_catchup_push_empty_inputs_short_circuit
-tests/cov_ga2_r4_federation.rs::bulk_catchup_push_peer_http_error_is_collected
-tests/cov_ga2_r4_federation.rs::bulk_catchup_push_success_returns_no_errors
-tests/cov_ga2_r4_federation.rs::bulk_catchup_push_unreachable_peer_is_collected
 tests/cov_ga2_r4_handlers.rs::admin_bind_pubkey_non_admin_is_403
 tests/cov_ga2_r4_handlers.rs::admin_export_non_admin_is_403
 tests/cov_ga2_r4_handlers.rs::admin_import_non_admin_is_403
@@ -196,7 +175,6 @@ tests/federation_dlq_replay.rs::dlq_dedupes_repeated_failures_via_unique_index
 tests/federation_dlq_replay.rs::enqueue_refreshes_payload_json_and_failed_at_on_conflict_2360
 tests/federation_dlq_replay.rs::mark_replayed_cas_leaves_row_pending_on_concurrent_bump_2360
 tests/federation_dlq_replay.rs::quarantined_head_does_not_starve_take_batch_1578
-tests/federation_dlq_replay.rs::replay_ack_leaves_row_pending_when_snapshot_is_stale_2360
 tests/federation_dlq_replay.rs::replay_drains_dlq_when_peer_recovers
 tests/federation_dlq_replay.rs::replay_max_batch_env_resolver_1579b5
 tests/federation_inbox_wake_3631.rs::postgres_catchup_applied_inbox_row_wakes_a_real_listener_3631

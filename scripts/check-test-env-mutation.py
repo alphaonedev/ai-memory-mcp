@@ -19,12 +19,9 @@ install_test_operator_key; each holds tests/common ENV_LOCK while it writes), a 
 setter (ensure_no_config_env, permissive_attestation_for_tests), or a pg_isolate writer
 (isolated_url, publish_env_within). Each write site gets a PROTECTION SET: the tokens held at the
 write, that is
-  * locks bound with `let <name> = ...` (not `let _ = ...`; a `let`-bound struct literal holding the
-    guard counts) earlier in a block that encloses the write and not released before it (a `drop`
-    in any spelling, `.take()` / `mem::take` / `mem::replace` / `mem::swap`, a reassignment, a
-    capture by a `move` closure, or a move out of the binding, see the limits below): `ENV_LOCK.lock()`, `.blocking_lock()`, `.lock().await`, `env_lock()`, a
-    same-file helper that returns a guard (also a helper that wraps such a helper), a
-    tests/common guard;
+  * locks credited ONLY in the CANONICAL shape (see below), earlier in the fn than the write:
+    `ENV_LOCK.lock()`, `.blocking_lock()`, `.lock().await`, `env_lock()`, a same-file helper that
+    returns a guard (the helper shape below), a tests/common guard;
   * the locks every same-file caller holds at its call, intersected over the callers and followed
     up the whole same-file call graph (the issue_4357 shape: the writer is two calls below the
     test that holds SERIAL);
@@ -49,7 +46,7 @@ without holding, at that point, one token of EVERY write site's protection set. 
 an empty set (an unlocked writer) are not required of the readers, because the unlocked writer is
 itself flagged; when no write site has any protection, every reader is flagged. Readers are:
   * strong (a C getenv or a write): SQLite / store / router / config open (`AppConfig::` except a
-    derived `AppConfig::default()`), a `cli::<cmd>::run*` command, `reqwest`, `sqlx`,
+    derived `AppConfig::default()`), a `cli::<cmd>::run*` command, `reqwest` (unless IP-only), `sqlx`,
     `PgPool`, `postgres_url()`, DNS (`ToSocketAddrs`), `Local::now`, a tests/common helper that
     reaches one of those (computed from tests/common), and every write site;
   * weak (a Rust env read, a logical race): `env::var*` of a variable some write site writes.
@@ -60,24 +57,42 @@ itself flagged; when no write site has any protection, every reader is flagged. 
 A token is held when it is acquired before the reader in a block that encloses it; a lock helper
 that holds the lock while it works (`with_env_lock(|| ..)`) covers only its own call.
 
+Canonical shape (#7623-#7627; the only way a lock is credited, everything else fails closed):
+
+    let [mut] <name> = <KNOWN_LOCK_EXPR>;        // directly in the top-level block of the test fn
+
+where <name> is a plain identifier (`_guard` is fine, a lone `_` is not), the statement comes before
+the first env write, and <name> is NEVER mentioned again anywhere after it: no `drop`, move, match,
+field access, return, shadowing, reassignment or closure capture. KNOWN_LOCK_EXPR is a plain receiver
+path ending in a lock call (`ENV_LOCK.lock().await`, `ENV_LOCK.blocking_lock()`, `env_lock()`,
+`Type::set(..)` of a tests/common guard) followed only by guard-preserving calls (GUARD_CHAIN: `lock`,
+`unwrap`, `expect`, `unwrap_or_else`, `await`). The gate does not model Rust moves or drops: a guard
+the test touches again, a lock in a nested block or a loop body, a tuple pattern, a struct field, a
+guard returned through a binding or a `match` is simply not credited. To restructure such a test, move
+the body of the loop into a fn that takes the lock canonically, or end the lock's life with the fn.
+Two named exceptions exist and nothing else: the tuple helper `let (<key>, <guard>) =
+install_test_operator_key();` (TUPLE_GUARD_SLOTS, judged on the guard slot) and the HELPER shape: a
+non-test fn that does `let <lock> = <KNOWN_LOCK_EXPR>;` at its top level and mentions <lock> exactly
+once more, as a field initialiser of the struct literal that is its tail expression (`Self { prev,
+_lock: lock }`); the caller is credited only through its own canonical `let _g = helper();`.
+In a `macro_rules!` body (a template, not a fn) the statement may sit in any block that encloses the
+macro's first env write.
+
+Reader classification for network clients (#7526). A `reqwest` client with rustls reads only Rust-side
+env, and a request to an IP-literal URL never calls getaddrinfo, so `reqwest` is a strong reader
+only when the file is not IP-only: a file is IP-only when it has IP evidence (`scheme://<ipv4|[ipv6]>`
+or `local_addr()`) and no hostname URL, `localhost`, `.resolve(..)` or resolver word, and no URL whose
+host is a placeholder without a `local_addr()` in the file. Anything unresolved stays a reader.
+
 Known limits, stated plainly:
   * resolution is by name, same file only (free fns, `Type::method`, `.method()` on any same-file
     impl), plus the tests/common reader census; code in src/ is judged only by the tokens above;
   * the reader check is a token heuristic; a fn that reaches a C getenv only through code the
     tokens do not name is treated as pure;
-  * a release (drop, take / replace / swap, reassignment, a call of a closure binding, or move)
-    anywhere between the lock and the reader releases it, even in a branch; a shadowing `let` of
-    the same name is not a reassignment, and the old binding is not followed past it;
-  * a guard moved into a `let`-bound struct literal, tuple, array, `vec!`, `Some` / `Ok` / `Err`,
-    `Box::new`, another binding, or the value of an `if` / `match` / block initialiser follows that
-    binding: it is released when the binding is (the same rules, nested), when the binding is
-    emptied (`clear`, `pop*`, `truncate`, `drain`, `remove`, `swap_remove`, `retain*`, `split_off`,
-    `dedup*`, `take`, `replace`, `insert`, `get_or_insert_with`), or when the binding's block ends
-    before the reader; a guard captured by a `move` closure or an `async move` block is moved into
-    that value and follows the same rules when the closure is `let`-bound, and is released
-    otherwise; a move anywhere else (a call argument, a field assignment, a temporary) releases it;
+  * a held-but-flagged shape stays flagged by design (#7628): a lock the test mentions again is not
+    credited even when the mention is harmless; rewrite it to the canonical shape;
   * a reader behind a runtime branch still counts (the child half of a re-exec test that returns
-    early unless its marker variable is set; a `reqwest` client on a loopback, rustls-only path);
+    early unless its marker variable is set);
   * macro-generated test fns and env writes in tests/<dir>/ sub-modules are not seen; a writer
     macro is followed only when it is a `macro_rules!` of the same file;
   * a struct literal is told from a block by its head (a CamelCase path after `=`, `(`, `,`, `:`,
@@ -133,7 +148,7 @@ STRONG_READER = re.compile(
     r"\bSqliteStore\s*::|\bfresh_(?:conn|db)\w*|\bdb_at\b|"
     r"\bAppConfig\s*::(?!\s*default\s*\()|\bConfig\s*::\s*load\w*|"
     r"\bcli\s*::\s*(?:[A-Za-z_]\w*\s*::\s*)*run\w*\s*\(|\bbuild_router\w*|\brouter\s*\(|"
-    r"\breqwest\b|\bsqlx\s*::\s*(?:[A-Za-z_]\w*\s*::\s*)*(?:Pg\w*|connect\w*)|\bPgPool\w*|\b(?:PostgresStore|PgConnection)\s*::\s*connect\w*|\btokio_postgres\s*::\s*connect\w*|"
+    r"\bsqlx\s*::\s*(?:[A-Za-z_]\w*\s*::\s*)*(?:Pg\w*|connect\w*)|\bPgPool\w*|\b(?:PostgresStore|PgConnection)\s*::\s*connect\w*|\btokio_postgres\s*::\s*connect\w*|"
     r"\bpostgres_url\s*\(|\bToSocketAddrs\b|\bLocal\s*::\s*now\b")
 WEAK_READER = re.compile(r"\benv\s*::\s*var\w*")
 FN_DECL = re.compile(r"\b(?:async\s+)?fn\s+([A-Za-z_]\w*)")
@@ -148,7 +163,6 @@ IDENT = re.compile(r"[A-Za-z_]\w*")
 CALL = re.compile(r"((?:[A-Za-z_]\w*\s*::\s*)*)([A-Za-z_]\w*)\s*\(")
 LOCK_METHOD = re.compile(r"\.\s*(?:blocking_lock|lock_owned|lock)\s*\(")
 LET_BOUND = re.compile(r"^\s*let\s+(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=]*)?=(?!=)")
-LET_TUPLE = re.compile(r"^\s*let\s+\(([^)]*)\)\s*(?::[^=]*)?=(?!=)")
 LET_HEAD = re.compile(r"^\s*let\s+(?:\([^)]*\)|(?:mut\s+)?[A-Za-z_]\w*)\s*(?::[^=]*)?=(?!=)")
 CHAR_LIT = re.compile(r"'(?:\\.[^']{0,8}|[^\\'])'")
 BLOCK_HEADER = re.compile(
@@ -166,19 +180,22 @@ PATH_SELF = ("self", "super", "crate")
 MACRO_RULES = re.compile(r"\bmacro_rules\s*!\s*([A-Za-z_]\w*)\s*\{")
 MACRO_CALL = re.compile(r"\b([A-Za-z_]\w*)\s*!\s*[({\[]")
 META_CALL = re.compile(r"\$([A-Za-z_]\w*)\s*\(")
-# #7389: drop / mem::drop / std::mem::drop / core::mem::drop, with or without a turbofish.
-DROP_CALL = r"\bdrop\s*(?:::\s*<[^;{}]*?>\s*)?\(\s*%s\s*\)"
-# #7387, #7472: a guard taken out of its Option binding, or any `&mut` argument of mem::take/replace/swap.
-TAKE_CALL = r"(?:\b%s\s*\.\s*take\s*\(|\b(?:take|replace|swap)\s*\([^;]*?&\s*mut\s+%s\b)"
-# #7472: a container binding emptied (or rewritten) in place drops the guard it held.
-EMPTY_CALL = (r"\b%s\s*\.\s*(?:clear|pop|pop_front|pop_back|truncate|drain|remove|swap_remove|retain|retain_mut|"
-              r"replace|insert|get_or_insert_with|split_off|dedup\w*)\s*\(")
-# #7471: a closure or async block that takes its captures by value.
-MOVE_HEAD = re.compile(r"(?:\basync\s+)?\bmove\b\s*(?:\|[^|]*\|\s*(?:->\s*[^{;]+?)?)?")
-# #7473: the head of a block whose value is the initialiser (`= if ..`, `= match ..`, `else`, `=>`, `= {`).
-VALUE_BLOCK_HEAD = re.compile(
-    r"^\s*(?:else\s+)?(?:let\s+(?:mut\s+)?[A-Za-z_]\w*\s*(?::[^=]*)?=(?!=)\s*)?(?:if|match)\b|(?:\belse|=>|[^=!<>]=)\s*$")
-BORROW_TAIL = re.compile(r"(?:&\s*(?:mut\s+)?|\*)$")
+# #7623-#7627: the canonical guard binding (see the module docstring). Nothing models moves or drops.
+LET_PAIR = re.compile(r"^\s*let\s+\(\s*(?:mut\s+)?([A-Za-z_]\w*)\s*,\s*(?:mut\s+)?([A-Za-z_]\w*)\s*\)\s*(?::[^=]*)?=(?!=)")
+# The ONE tuple helper shape the tree uses: `let (<key>, <guard>) = install_test_operator_key();`
+# (tests/common returns `(SigningKey, EnvVarGuard)`); the value is the 0-based slot of the guard.
+TUPLE_GUARD_SLOTS = {"install_test_operator_key": 1}
+# Method calls allowed after the lock call in a canonical initialiser: they keep the guard a guard.
+GUARD_CHAIN = frozenset(("lock", "blocking_lock", "lock_owned", "unwrap", "expect", "unwrap_or_else", "await"))
+# What may sit between `=` and the lock call: a plain receiver path (`ENV_LOCK`, `env_lock()`, `a::b().c`).
+RECEIVER_TEXT = re.compile(r"[\w\s:.()]*")
+# #7526: a reqwest client reads only Rust-side env, and a request to an IP-literal URL skips getaddrinfo.
+REQWEST = re.compile(r"\breqwest\b")
+URL_LIT = re.compile(r"\b[a-z][a-z0-9+.-]*://([^/?#\s\"]*)")
+RESOLVER_WORDS = re.compile(r"\.\s*resolve(?:_to_addrs)?\s*\(|\bresolver\b|\bdns_resolver\b|\blocalhost\b", re.IGNORECASE)
+IP_HOST = re.compile(r"\[[0-9a-fA-F:.]+\]|\d{1,3}(?:\.\d{1,3}){3}")
+URL_PLACEHOLDER_HOST = re.compile(r"\{[^{}]*\}")
+LOCAL_ADDR = re.compile(r"\blocal_addr\s*\(")
 BLOCK_KEYWORDS = re.compile(r"\b(?:if|while|match|for|loop|impl|fn|struct|enum|union|trait|mod|where)\b")
 STRUCT_LIT_HEAD = re.compile(
     r"(?:^|[=(,:\[|]|=>|\breturn)\s*(?:[A-Za-z_]\w*\s*::\s*)*[A-Z]\w*(?:\s*::\s*<[^;{}]*>)?\s*$")
@@ -190,6 +207,8 @@ HEADER = (
     "#\n"
     "# A test fn of a tests/*.rs that mutates the process environment must hold the lock its\n"
     "# writers use when it can reach an env / C getenv reader (see scripts/check-test-env-mutation.py).\n"
+    "# The lock is credited only in the canonical shape: `let _guard = <lock>;` directly in the test fn's\n"
+    "# top-level block, before the first env write, and never mentioned again. Anything else fails closed.\n"
     "# An entry that no longer violates must be removed: the list may only shrink.\n"
     "# Regenerate with: scripts/check-test-env-mutation.py --update-baseline\n"
 )
@@ -347,62 +366,12 @@ def is_struct_literal(body, brace):
     return not BLOCK_KEYWORDS.search(prefix) and bool(STRUCT_LIT_HEAD.search(prefix))
 
 
-def is_value_block(body, brace):
-    """True when the `{` at brace opens a block whose value is an initialiser or an arm (#7473):
-    `let x = if c {`, `} else {`, `match v {`, `pat => {`, `let x = {`."""
-    if brace <= 0 or body[brace] != "{":
-        return False
-    return bool(VALUE_BLOCK_HEAD.search(stmt_prefix(body, brace)))
-
-
 def scope_open(body, pos):
     """The `{` of the block that scopes a value made at pos: struct literal braces are skipped."""
     brace = innermost_open(body, pos)
     while brace > 0 and is_struct_literal(body, brace):
         brace = innermost_open(body, brace)
     return brace
-
-
-def binding_prefix(body, pos):
-    """stmt_prefix of pos, reaching out through any struct literals pos sits in (`let h = H { g: ..`)."""
-    k = pos
-    while True:
-        start = max(body.rfind(";", 0, k), body.rfind("{", 0, k), body.rfind("}", 0, k))
-        own_stmt = re.match(r"\s*let\b", body[start + 1:k])  # a `let` inside the block binds there
-        if start > 0 and body[start] == "{" and (
-                is_struct_literal(body, start) or (not own_stmt and is_value_block(body, start))):
-            k = start
-            continue
-        if start > 0 and body[start] == "}":
-            brace = open_of(body, start)
-            if brace > 0 and (is_struct_literal(body, brace) or (not own_stmt and is_value_block(body, brace))):
-                k = brace
-                continue
-        return body[start + 1:pos]
-
-
-def holds_moved_value(body, prefix_start, pos):
-    """True when every bracket open between a `let x =` and pos keeps the value it wraps alive in x:
-    a struct literal, a tuple, an array, `vec![..]`, `Some(..)`, `Ok(..)`, `Err(..)` or `Box::new(..)`.
-    A value passed to any other call may be dropped by it, so it does not qualify."""
-    stack = []
-    for j in range(prefix_start, pos):
-        ch = body[j]
-        if ch in "([{":
-            stack.append(j)
-        elif ch in ")]}" and stack:
-            stack.pop()
-    for j in stack:
-        if body[j] == "{":
-            if not (is_struct_literal(body, j) or is_value_block(body, j)):
-                return False
-            continue
-        head = body[prefix_start:j].rstrip()
-        if body[j] == "[" or re.search(r"(?:^|[=(,\[{:]|\bvec!)$", head) or re.search(
-                r"(?<![\w:])(?:Some|Ok|Err|Box\s*::\s*new)$", head):
-            continue
-        return False
-    return True
 
 
 def expr_end(body, pos):
@@ -419,84 +388,6 @@ def expr_end(body, pos):
         elif ch in ",;" and depth == 0:
             return j
     return len(body)
-
-
-def move_closure_at(body, pos, start):
-    """(head, end) of the outermost `move` closure or `async move` block made in body[start:pos] whose
-    body contains pos (#7471), else None."""
-    for m in MOVE_HEAD.finditer(body, start, pos):
-        j = m.end()
-        while j < len(body) and body[j].isspace():
-            j += 1
-        end = match_brace(body, j) if j < len(body) and body[j] == "{" else expr_end(body, j)
-        if j <= pos < end:
-            return m.start(), end
-    return None
-
-
-def shadow_mask(body, name, start, end):
-    """body[start:end] with every region where a shadowing `let name` hides the binding blanked (#7473):
-    from the end of that `let` statement to the end of its block."""
-    text = list(body[start:end])
-    for m in re.compile(r"\blet\s+(?:mut\s+)?%s\b" % re.escape(name)).finditer(body, start, end):
-        semi = body.find(";", m.end())
-        a = end if semi < 0 else min(semi + 1, end)
-        b = min(match_brace(body, innermost_open(body, m.start())), end)
-        for j in range(a, b):
-            text[j - start] = " "
-    return "".join(text)
-
-
-def released(body, name, start, end, depth=0, container=False):
-    """True when the guard bound to name is released in body[start:end] (#7387, #7389, #7470-#7473):
-    a drop in any spelling, `.take()` / `mem::take` / `mem::replace` / `mem::swap`, a reassignment of
-    the binding (a shadowing `let` is not one), a call of it (a closure), emptying it when it is a
-    container (`clear`, `pop`, `truncate`, `drain`, `remove`, ...), a capture by a `move` closure or an
-    `async move` block, or a move into anything other than a `let`-bound container. A guard moved into
-    one (`let h = Holder { g }`, `let o = Some(g)`, `let h = g`, `let c = move || ..g..`, also through an
-    `if` / `match` initialiser) is released when that binding is, or when that binding's block ends."""
-    text = shadow_mask(body, name, start, end)
-    esc = re.escape(name)
-    if re.search(DROP_CALL % esc, text) or re.search(TAKE_CALL % (esc, esc), text):
-        return True
-    if (container or depth > 0) and re.search(EMPTY_CALL % esc, text):
-        return True
-    for m in re.finditer(r"(?<![\w.$])%s\s*=(?![=>])" % esc, text):
-        if not re.search(r"\blet\s+(?:mut\s+)?$", text[:m.start()]):
-            return True  # the binding is overwritten, which drops what it held
-    if re.search(r"(?<![\w.$:])%s\s*\(" % esc, text):
-        return True  # a closure called: an FnOnce consumes what it captured (fail closed for an Fn)
-    skip = start
-    for m in re.finditer(r"(?<![\w.$])%s\b" % esc, text):
-        pos = start + m.start()
-        if pos < skip:
-            continue
-        closure = move_closure_at(body, pos, start)
-        if closure is not None:
-            head, skip = closure  # the guard moved into the closure value made at head
-            value_end = skip
-        else:
-            if BORROW_TAIL.search(text[:m.start()].rstrip()):
-                continue  # `&g`, `&mut g`, `*g` borrow the guard
-            after = text[m.end():].lstrip()
-            moved = after[:1] in (",", ")", "]", "}") or (
-                after[:1] == ";" and re.search(r"(?<![=!<>])=\s*$", text[:m.start()]))
-            if not moved:
-                continue
-            head, value_end = pos, pos
-        prefix = binding_prefix(body, head)
-        targets = let_names(prefix)
-        eq = prefix.find("=")
-        stmt_start = head - len(prefix)
-        if not targets or eq < 0 or depth >= HELPER_DEPTH or not holds_moved_value(body, stmt_start + eq + 1, head):
-            return True  # moved into a call, a field assignment or a temporary
-        if match_brace(body, scope_open(body, stmt_start)) <= end:
-            return True  # #7470: the container's own block ends before end
-        stmt_end = body.find(";", value_end)
-        nxt = end if stmt_end < 0 else min(stmt_end + 1, end)
-        if any(released(body, t2, nxt, end, depth + 1, True) for t2 in targets):
-            return True
-    return False
 
 
 def has_lock_word(ident):
@@ -609,26 +500,136 @@ def parse_fns(scrubbed):
 
 
 def let_names(prefix):
-    """Non-`_` names bound by a `let <name> = ..` / `let (a, _b) = ..` statement prefix, else ().
+    """[name] for a plain `let [mut] <name> [: T] =` statement prefix, else [].
 
-    `let _ = guard;` drops the guard at once and binds nothing.
+    Only a single identifier counts. A tuple, struct or slice pattern binds nothing here, and neither
+    does `let _ = ..`: that drops the value at the end of the statement (a lone `_` is no binding).
+    `_guard` style names are bindings.
     """
     m = LET_BOUND.match(prefix)
-    if m:
-        return () if m.group(1) == "_" else (m.group(1),)
-    m = LET_TUPLE.match(prefix)
-    if not m:
-        return ()
-    parts = (p.strip().replace("mut ", "").strip() for p in m.group(1).split(","))
-    return tuple(p for p in parts if p not in ("", "_"))
+    if m and m.group(1) != "_":
+        return [m.group(1)]
+    return []
 
 
-def let_bound(prefix):
-    return bool(let_names(prefix))
+def mask_brackets(text):
+    """text with every character inside (), [] or {} blanked, so only depth-0 syntax remains."""
+    out, depth = [], 0
+    for ch in text:
+        if ch in "([{":
+            out.append(ch if depth == 0 else " ")
+            depth += 1
+        elif ch in ")]}":
+            depth = max(depth - 1, 0)
+            out.append(ch if depth == 0 else " ")
+        else:
+            out.append(ch if depth == 0 else " ")
+    return "".join(out)
+
+
+def balanced(text):
+    """True when every bracket opened in text is closed in it."""
+    depth = 0
+    for ch in text:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
+def ip_only_text(raw):
+    """True when raw source text reaches the network only through IP-literal URLs (#7526).
+
+    A reqwest client with rustls reads Rust-side env only, and a request to an IP literal never calls
+    getaddrinfo, so no C getenv is reachable. IP evidence is a `scheme://<ip>` URL or a `local_addr()`
+    call; any hostname URL, `localhost`, a resolver word, or a URL whose host is an unresolved
+    placeholder (no `local_addr()` in the text) keeps the reader.
+    """
+    if raw is None or RESOLVER_WORDS.search(raw):
+        return False
+    ip = bool(LOCAL_ADDR.search(raw))
+    for m in URL_LIT.finditer(raw):
+        host = m.group(1).rsplit("@", 1)[-1]
+        bare = re.sub(r"(?<=\]|\d):\d+$", "", host)
+        if IP_HOST.fullmatch(bare):
+            ip = True
+        elif URL_PLACEHOLDER_HOST.search(host):
+            if not LOCAL_ADDR.search(raw):
+                return False
+        else:
+            return False
+    return ip
+
+
+def canonical_guard(body, pos, call=None, write=None):
+    """[name] when the lock acquisition at pos is the CANONICAL guard binding, else [] (#7623-#7627).
+
+    Canonical: a statement `let [mut] <name> = <lock expr>;` directly in the top-level block of the fn
+    (index 0 of body), where the lock expression is a plain receiver path ending in the lock call
+    (`ENV_LOCK.lock().await`, `ENV_LOCK.blocking_lock()`, `env_lock()`, `EnvVarGuard::set(..)`), followed
+    only by guard-preserving calls (GUARD_CHAIN) and `?`, and where <name> is never mentioned again
+    anywhere after the statement (no move, drop, match, field access, return, shadowing or capture).
+    The one tuple shape is `let (<key>, <guard>) = <call in TUPLE_GUARD_SLOTS>(..);`, judged on the
+    guard slot. Every other shape is not credited, so it fails closed. A `macro_rules!` body is a
+    template, not a fn: there write is the position of its first env write and the statement may sit in
+    any block that encloses it.
+    """
+    prefix = stmt_prefix(body, pos)
+    brace = innermost_open(body, pos - len(prefix))
+    if brace != 0 and (write is None or match_brace(body, brace) <= write):
+        return []
+    slot = TUPLE_GUARD_SLOTS.get(call)
+    head = LET_PAIR.match(prefix) if slot is not None else None
+    if head:
+        names = [head.group(slot + 1)]
+    else:
+        head, names = LET_BOUND.match(prefix), let_names(prefix)
+    if not names or names[0] == "_":
+        return []
+    before = prefix[head.end():]
+    if not RECEIVER_TEXT.fullmatch(before) or not balanced(before):
+        return []
+    end = expr_end(body, pos)
+    if any(n not in GUARD_CHAIN for n in re.findall(r"\.\s*([A-Za-z_]\w*)", mask_brackets(body[pos:end]))):
+        return []
+    if re.search(r"(?<![\w$])%s\b" % re.escape(names[0]), body[end:]):
+        return []
+    return names
 
 
 def depth_at(body, pos):
     return body.count("{", 0, pos) - body.count("}", 0, pos)
+
+
+HELPER_TAIL = re.compile(r"(?s).*[;}]\s*(?:Self|[A-Z]\w*)\s*\{([^{}]*)\}\s*\}\s*")
+
+
+def helper_ret_guard(body, pos):
+    """True for the ONE helper shape that hands its lock to the caller inside a struct (#7623-#7627).
+
+    `let <name> = <lock expr>;` directly in the top-level block of the helper, then <name> appears
+    exactly once afterwards: as a field initialiser (`field: <name>` or shorthand) of the struct
+    literal that is the helper's tail expression (`Self { prev, _lock: lock }`). Any other mention
+    (drop, move, match, a second use) is not this shape. The caller is then credited only through
+    its own canonical `let _g = helper();` binding.
+    """
+    prefix = stmt_prefix(body, pos)
+    head = LET_BOUND.match(prefix)
+    if not head or head.group(1) == "_" or innermost_open(body, pos - len(prefix)) != 0:
+        return False
+    if not RECEIVER_TEXT.fullmatch(prefix[head.end():]) or not balanced(prefix[head.end():]):
+        return False
+    end = expr_end(body, pos)
+    if any(n not in GUARD_CHAIN for n in re.findall(r"\.\s*([A-Za-z_]\w*)", mask_brackets(body[pos:end]))):
+        return False
+    rest, name = body[end:], re.escape(head.group(1))
+    tail = HELPER_TAIL.fullmatch(rest)
+    if not tail or len(re.findall(r"(?<![\w$])%s\b" % name, rest)) != 1:
+        return False
+    return bool(re.search(r"(?:^|,)\s*(?:\w+\s*:\s*)?%s\s*(?:,|$)" % name, tail.group(1)))
 
 
 def stmt_prefix(body, pos):
@@ -770,6 +771,7 @@ class CommonModel:
             return False
         if id(fn) not in self._strong:
             hit = any(IDENT.findall(m.group(0))[-1] not in self.fns for m in STRONG_READER.finditer(fn.body))
+            hit = hit or bool(REQWEST.search(fn.body))  # a shared helper does not know its URL
             hit = hit or any(self.strong(c.key, stack + (id(fn),)) for _, c in self._callees(fn))
             self._strong[id(fn)] = hit
         return self._strong[id(fn)]
@@ -816,7 +818,7 @@ class FileModel:
         self.once_fns = {id(f) for f in self.fns
                          if not f.is_test and ONCE_BODY.search(f.body) and DIRECT_MUTATION.search(f.body)}
         self._calls, self._acq, self._summary, self._ctx, self._live = {}, {}, {}, {}, {}
-        self._encl, self._viol = {}, {}
+        self._encl, self._viol, self._file_ip_only = {}, {}, None
         self.blamed = set()
         self.callers = {id(f): [] for f in self.fns}
         for f in self.fns:
@@ -906,10 +908,10 @@ class FileModel:
             first = writes[0].start()
             locks = set()
             for lm in LOCK_METHOD.finditer(body, 0, first):
-                if let_bound(stmt_prefix(body, lm.start())):
+                if canonical_guard(body, lm.start(), write=first):
                     locks |= lock_tokens(stmt_prefix(body, lm.start()))
             for cm in CALL.finditer(body, 0, first):
-                if is_lock_fn_name(cm.group(2)) and let_bound(stmt_prefix(body, cm.start())):
+                if is_lock_fn_name(cm.group(2)) and canonical_guard(body, cm.start(), write=first):
                     locks.add(cm.group(2))
             found[name] = (frozenset(names), frozenset(locks))
         changed = True
@@ -1005,16 +1007,17 @@ class FileModel:
             return self._acq[id(fn)]
         body, out = fn.body, []
 
-        def add(pos, tokens, kind, end=None):
+        def add(pos, tokens, kind, end=None, call=None):
             if tokens:
-                names = let_names(binding_prefix(body, pos))
-                out.append(Acq(pos, pos if end is None else end, frozenset(tokens), kind, bool(names), names))
+                names = canonical_guard(body, pos, call) if kind == "lock" else []
+                held = bool(names) or (kind == "lock" and helper_ret_guard(body, pos))
+                out.append(Acq(pos, pos if end is None else end, frozenset(tokens), kind, held, names))
 
         for m in LOCK_METHOD.finditer(body):
             add(m.start(), lock_tokens(stmt_prefix(body, m.start())), "lock")
-        for pos, kind, token, _, _ in self.external(fn):
+        for pos, kind, token, _, name in self.external(fn):
             if kind in ("guard", "lock"):
-                add(pos, {token}, "lock")
+                add(pos, {token}, "lock", call=name)
             elif kind in ("once", "once-writer"):
                 add(pos, {token}, "once")
         if id(fn) in self.once_fns:
@@ -1049,29 +1052,18 @@ class FileModel:
             if a.kind == "once":
                 persist |= a.tokens
             elif a.kind == "lock":
-                if not a.bound:
+                if a.bound and not a.names and helper_ret_guard(body, a.pos):
+                    ret |= a.tokens
+                elif not a.bound:
                     expr = LET_HEAD.sub("", stmt_prefix(body, a.pos), count=1)
                     if is_tail(body, a.pos) or re.match(r"\s*return\b", expr) or re.match(r"\s*[A-Za-z_]\w*\s*:(?!:)", expr):
                         ret |= a.tokens
-                elif self._escapes(body, a):
-                    ret |= a.tokens
         last_calls = [m.start() for m in CALL.finditer(body)]
         work_pos = max(last_calls) if last_calls else len(body) - 1
         work = self.held_own(fn, work_pos, acqs)
         s = Summary(frozenset(persist), frozenset(ret), frozenset(work))
         self._summary[id(fn)] = s
         return s
-
-    @staticmethod
-    def _escapes(body, acq):
-        """A bound guard that is used again (moved into a returned struct), not only dropped."""
-        stmt_end = body.find(";", acq.pos)
-        rest = body[stmt_end + 1:] if stmt_end >= 0 else ""
-        for name in acq.names:
-            rest_wo_drop = re.sub(DROP_CALL % re.escape(name), " ", rest)
-            if re.search(r"(?<![\w.])%s\b(?!\s*:(?!:))" % re.escape(name), rest_wo_drop):
-                return True
-        return False
 
     def encloses(self, fn, a, r):
         key = (id(fn), a)
@@ -1093,12 +1085,7 @@ class FileModel:
             if a.kind == "once":
                 held |= a.tokens
             elif a.bound:
-                stmt_end = fn.body.find(";", a.pos)
-                start = r if stmt_end < 0 else min(stmt_end + 1, r)
-                prefix = binding_prefix(fn.body, a.pos)
-                wrapped = bool(re.search(r"[(\[{]", prefix[prefix.find("=") + 1:]))  # `Some(LOCK.lock())`
-                if not any(released(fn.body, n, start, r, 0, wrapped) for n in a.names):
-                    held |= a.tokens
+                held |= a.tokens
         held |= fn.serial_tokens
         return held
 
@@ -1300,6 +1287,8 @@ class FileModel:
         for m in STRONG_READER.finditer(body):
             if IDENT.findall(m.group(0))[-1] not in self.by_key:
                 out.append((m.start(), None))
+        if REQWEST.search(body) and not self.ip_only(fn):
+            out.extend((m.start(), None) for m in REQWEST.finditer(body))
         for m in DIRECT_MUTATION.finditer(body):
             out.append((m.start(), self.site_at.get((id(fn), m.start()))))
         for pos, _, _ in self.macro_writes(fn):
@@ -1317,6 +1306,15 @@ class FileModel:
             if ANY_VAR in names or ANY_VAR in self.written or names & self.written:
                 out.append((m.start(), None))
         return out
+
+    def ip_only(self, fn):
+        """#7526: the whole file reaches the network only through IP-literal URLs (a file-level verdict:
+        the fn that builds the client and the fn that makes the URL need not be the same one)."""
+        if self._file_ip_only is None:
+            raw = self.src.raw
+            text = None if raw is None else re.sub(r"(?m)^[ \t]*//.*$", "", raw)
+            self._file_ip_only = ip_only_text(text)
+        return self._file_ip_only
 
     def satisfied(self, held, site, root):
         ok = True

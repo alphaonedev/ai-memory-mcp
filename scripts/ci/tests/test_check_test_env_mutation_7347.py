@@ -7,11 +7,10 @@ Each rule is proven twice: a clean fixture passes and a mutant that breaks exact
 fails. Fixtures are built in a scratch dir under .local-runs/ (never a tmp dir).
 """
 import importlib.util
-import re
 import shutil
 import sys
 import unittest
-from unittest import mock
+import unittest.mock
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -365,12 +364,17 @@ class FalsePositivesR3(Fixture):
     def test_a_lock_held_two_callers_up_still_flags_an_unlocked_test(self):
         self.assertEqual(self.flagged(SERIAL_4357 + test_fn("bare", OPEN)), {"tests/a.rs::bare"})
 
-    def test_b_lock_taken_inside_a_loop_covers_the_open_in_that_loop(self):
+    def test_b_lock_taken_inside_a_loop_is_not_the_canonical_shape(self):
+        # r6: the gate models no scopes below the top-level block; a loop-body lock fails closed.
         body = "for _ in 0..2 {\n        let _g = ENV_LOCK.blocking_lock();\n        %s\n    }" % OPEN
-        self.assertEqual(self.flagged(WRITER + test_fn("reader", body)), set())
+        self.assertEqual(self.flagged(WRITER + test_fn("reader", body)), {"tests/a.rs::reader"})
 
-    def test_b_lock_taken_inside_a_block_on_closure_covers_the_open_there(self):
+    def test_b_lock_taken_inside_a_block_on_closure_is_not_the_canonical_shape(self):
         body = "rt.block_on(async {\n        let _g = ENV_LOCK.lock().await;\n        %s\n    });" % OPEN
+        self.assertEqual(self.flagged(WRITER + test_fn("reader", body)), {"tests/a.rs::reader"})
+
+    def test_b_lock_hoisted_above_the_loop_is_credited(self):
+        body = "let _g = ENV_LOCK.blocking_lock();\n    for _ in 0..2 {\n        %s\n    }" % OPEN
         self.assertEqual(self.flagged(WRITER + test_fn("reader", body)), set())
 
     def test_b_once_helper_called_in_a_closure_is_followed(self):
@@ -380,10 +384,10 @@ class FalsePositivesR3(Fixture):
                                "        %s\n    });" % OPEN))
         self.assertEqual(self.flagged(text), set())
 
-    def test_b_lock_helper_called_inside_a_loop_is_followed(self):
+    def test_b_lock_helper_called_inside_a_loop_is_not_credited(self):
         helper = "fn take() -> MutexGuard<'static, ()> { ENV_LOCK.blocking_lock() }\n"
         body = "for _ in 0..2 {\n        let _g = take();\n        %s\n    }" % OPEN
-        self.assertEqual(self.flagged(WRITER + helper + test_fn("reader", body)), set())
+        self.assertEqual(self.flagged(WRITER + helper + test_fn("reader", body)), {"tests/a.rs::reader"})
 
     def test_c_file_lock_held_by_every_test_with_common_guard_writes(self):
         text = ("static TEST_LOCK: Mutex<()> = Mutex::new(());\n"
@@ -463,9 +467,10 @@ class FalseNegativesR3(Fixture):
         text = WRITER + reader("let g = ENV_LOCK.blocking_lock();\n    drop(g);")
         self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
 
-    def test_h_guard_dropped_after_the_open_is_held(self):
+    def test_h_guard_dropped_after_the_open_is_flagged_by_design(self):
+        # #7628: the gate does not model drops; a guard the test mentions again is not credited.
         text = WRITER + reader("let g = ENV_LOCK.blocking_lock();", OPEN + "\n    drop(g);")
-        self.assertEqual(self.flagged(text), set())
+        self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
 
     def test_i_a_side_lock_the_writer_takes_outside_its_write_is_not_the_writers_lock(self):
         text = ("static ENV_LOCK: Mutex<()> = Mutex::new(());\nstatic STATE: Mutex<u8> = Mutex::new(0);\n"
@@ -673,102 +678,6 @@ class Issue7386(Fixture):
         self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
 
 
-class Issue7387(Fixture):
-    """#7387: a guard moved out of its binding is released at the move."""
-
-    def test_guard_moved_away_is_not_held(self):
-        consume = "fn consume<T>(_t: T) {}\n"
-        for prefix in ("let h = Holder { _g: g };\n    drop(h);", "let h = Holder { g };\n    drop(h);",
-                       "consume(g);", "let mut o = Some(g);\n    o.take();", "let h = (g, 1);\n    drop(h);",
-                       "let h = g;\n    drop(h);", "let v = vec![g];\n    drop(v);", "let _w = consume(g);",
-                       "let h = g;\n    let k = Holder { _g: h };\n    std::mem::drop(k);",
-                       "let mut o = Some(g);\n    o = None;"):
-            with self.subTest(prefix=prefix):
-                text = WRITER + HOLDER + consume + reader("let g = ENV_LOCK.blocking_lock();\n    " + prefix)
-                self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
-
-    def test_guard_moved_into_a_live_binding_is_held(self):
-        # The guard lives on in the let-bound container until that container is released
-        # (the FedEnv constructor of tests/signal_recipient_validation_4408.rs has this shape).
-        for prefix in ("let _h = Holder { _g: g };", "let _h = Holder { _g: Some(g) };", "let _v = vec![g];",
-                       "let _o = Some(g);", "let _t = (1, g);", "let h = g;\n    let _k = Holder { _g: h };"):
-            with self.subTest(prefix=prefix):
-                text = WRITER + HOLDER + reader("let g = ENV_LOCK.blocking_lock();\n    " + prefix)
-                self.assertEqual(self.flagged(text), set())
-
-    def test_option_take_releases_the_guard(self):
-        text = WRITER + reader("let mut g = Some(ENV_LOCK.blocking_lock());\n    g.take();")
-        self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
-        text = WRITER + reader("let mut g = Some(ENV_LOCK.blocking_lock());\n    let _ = std::mem::take(&mut g);")
-        self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
-
-    def test_guard_only_borrowed_is_still_held(self):
-        for prefix in ("let _r = &g;", "let _r = &*g;", "let _m = &mut g;"):
-            with self.subTest(prefix=prefix):
-                text = WRITER + reader("let mut g = ENV_LOCK.blocking_lock();\n    " + prefix)
-                self.assertEqual(self.flagged(text), set())
-
-    def test_guard_moved_after_the_open_is_held(self):
-        text = WRITER + HOLDER + reader("let g = ENV_LOCK.blocking_lock();", OPEN + "\n    let _h = Holder { _g: g };")
-        self.assertEqual(self.flagged(text), set())
-
-
-DROP_SPELLINGS = ("drop::<_>(g)", "drop::<tokio::sync::MutexGuard<'_, ()>>(g)", "std::mem::drop(g)",
-                  "core::mem::drop(g)", "mem::drop(g)", "drop ( g )", "std::mem::drop::<_>(g)")
-
-
-class Issue7389(Fixture):
-    """#7389, #7474: every spelling of drop releases the guard."""
-
-    def test_every_drop_spelling_releases_the_guard(self):
-        # #7474: `released` also treats `g)` as a move into a call, so the reader verdict alone would
-        # stay green with #7389 reverted; DROP_CALL must name every spelling (both callers use it).
-        for call in DROP_SPELLINGS:
-            with self.subTest(call=call):
-                self.assertTrue(re.search(gate.DROP_CALL % "g", call), call)
-                self.assertFalse(re.search(gate.DROP_CALL % "g", re.sub(r"\bg(?=\s*\)$)", "gx", call)), call)
-                text = WRITER + reader("let g = ENV_LOCK.blocking_lock();\n    %s;" % call)
-                self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
-
-    def test_a_helper_that_drops_its_guard_does_not_return_it(self):
-        # #7474: only DROP_CALL decides here. `_escapes` strips the drop calls before it looks for
-        # a later use of the guard; a turbofish spelling left in place reads as a returned guard,
-        # which credits the caller's `let _x = helper();` with the lock.
-        for call in DROP_SPELLINGS:
-            with self.subTest(call=call):
-                helper = "fn lock_then_drop() {\n    let g = ENV_LOCK.blocking_lock();\n    %s;\n}\n" % call
-                text = WRITER + helper + reader("let _x = lock_then_drop();")
-                self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
-
-    def test_a_helper_that_returns_its_guard_lends_the_lock(self):
-        helper = ("fn lock_guard() -> tokio::sync::MutexGuard<'static, ()> {\n"
-                  "    let g = ENV_LOCK.blocking_lock();\n    g\n}\n")
-        self.assertEqual(self.flagged(WRITER + helper + reader("let _x = lock_guard();")), set())
-
-
-class Issue7390(Fixture):
-    """#7390: a guard held in a let-bound struct literal lives for the rest of the block."""
-
-    def test_guard_in_a_let_bound_struct_literal_is_held(self):
-        for prefix in ("let _h = Holder { _g: ENV_LOCK.blocking_lock() };",
-                       "let _h = Holder {\n        _g: ENV_LOCK.blocking_lock(),\n    };",
-                       "let _h = Holder { _g: Holder { _g: ENV_LOCK.blocking_lock() } };"):
-            with self.subTest(prefix=prefix):
-                self.assertEqual(self.flagged(WRITER + HOLDER + reader(prefix)), set())
-
-    def test_struct_literal_in_an_inner_block_is_still_scoped_to_it(self):
-        text = WRITER + HOLDER + reader("{ let _h = Holder { _g: ENV_LOCK.blocking_lock() }; }")
-        self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
-
-    def test_struct_literal_dropped_before_the_open_is_not_held(self):
-        text = WRITER + HOLDER + reader("let h = Holder { _g: ENV_LOCK.blocking_lock() };\n    drop(h);")
-        self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
-
-    def test_if_block_is_not_a_struct_literal(self):
-        text = WRITER + reader("if X == Y { let _g = ENV_LOCK.blocking_lock(); }")
-        self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
-
-
 class Issue7391(Fixture):
     """#7391: the baseline is read and written as UTF-8 whatever the locale says."""
 
@@ -785,7 +694,8 @@ class Issue7391(Fixture):
             return real_write(self, data, encoding=encoding or "ascii", errors=errors, **kw)
 
         root = str(SCRATCH)
-        with mock.patch.object(Path, "read_text", ascii_read), mock.patch.object(Path, "write_text", ascii_write):
+        with unittest.mock.patch.object(Path, "read_text", ascii_read), \
+                unittest.mock.patch.object(Path, "write_text", ascii_write):
             self.assertEqual(gate.main(["--root", root, "--update-baseline"]), 0)
             self.assertEqual(gate.read_baseline(SCRATCH / gate.BASELINE_REL), {"tests/a.rs::" + name})
             self.assertEqual(gate.main(["--root", root]), 0)
@@ -802,125 +712,189 @@ def writer_with(between):
             "    unsafe { std::env::set_var(\"A\", \"1\") };\n}\n" % between)
 
 
-class WriterSide(Fixture):
-    def assert_writer_unlocked(self, between, extra=""):
-        reference = self.flagged(writer_with("drop(g);") + extra + LOCKED_READER)
-        self.assertIn("tests/a.rs::writer", reference)
-        self.assertEqual(self.flagged(writer_with(between) + extra + LOCKED_READER), reference)
+GUARD_G = "let g = ENV_LOCK.blocking_lock();\n    "
+FLAGGED = {"tests/a.rs::reader"}
 
-    def assert_writer_locked(self, between, extra=""):
-        self.assertEqual(self.flagged(writer_with(between) + extra + LOCKED_READER), set())
+# helper fns the r5 fixtures call; each is a NON-test fn so it is judged only through its caller
+BORROW_HELPER = ("fn peek(g: &MutexGuard<'static, ()>) -> bool { let _r = &g; true }\n"
+                 "fn take_by_ref() -> bool { let g = ENV_LOCK.blocking_lock(); peek(&g) }\n")
+LOG_HELPER = "fn log_it() { let g = ENV_LOCK.blocking_lock(); let _n = format!(\"{:?}\", g); }\n"
+CONSUME_FN = "fn consume<T>(_t: T) {}\n"
 
 
-class Issue7470(WriterSide):
-    """#7470: a guard held in a container is released when the container's own scope ends."""
+class CanonicalShapeR6(Fixture):
+    """#7623-#7627: a lock is credited ONLY for `let <name> = <lock>;` in the top-level block, never
+    mentioned again. The 12 r5 fail-open shapes and 10 more all come out NOT credited."""
 
-    def test_container_whose_block_ended_is_released(self):
-        for prefix in ("{ let _h = Holder { _g: g }; }", "{ let _h = g; }", "{ let _o = Some(g); }",
-                       "{ { let _v = vec![g]; } }", "{\n        let h = g;\n        let _k = Holder { _g: h };\n    }",
-                       "{ let _t = (1, g); }"):
+    R5_SHAPES = {
+        # #7623 a helper that only borrows its guard is not a guard-returning helper
+        "helper_uses_guard_by_ref_returns_bool": (BORROW_HELPER, "let _x = take_by_ref();"),
+        "helper_logs_guard_returns_unit": (LOG_HELPER, "let _x = log_it();"),
+        # #7624 partial move of a field
+        "struct_field_partial_move_then_drop": (HOLDER, "let h = Holder { _g: ENV_LOCK.blocking_lock() };\n"
+                                                         "    let k = h._g;\n    drop(k);"),
+        "struct_field_drop_h_dot_g": (HOLDER, "let h = Holder { _g: ENV_LOCK.blocking_lock() };\n    drop(h._g);"),
+        # #7625 an underscore tuple slot drops the lock at the end of the statement
+        "tuple_underscore_slot": ("", "let (_, _x) = (ENV_LOCK.blocking_lock(), 0u8);"),
+        # #7626 match / if let / for consume the guard
+        "match_guard_binding_arm": ("", GUARD_G + "match Some(g) { Some(_h) => {} None => {} }"),
+        "if_let_some_moves_out": ("", GUARD_G + "if let Some(_h) = Some(g) {}"),
+        "for_in_vec_consumes": ("", GUARD_G + "for _h in vec![g] {}"),
+        # #7627 by-value methods and await
+        "option_unwrap_stmt": ("", "let o = Some(ENV_LOCK.blocking_lock());\n    o.unwrap();"),
+        "option_map_drop": ("", "let o = Some(ENV_LOCK.blocking_lock());\n    drop(o.map(|x| x));"),
+        "vec_into_iter_for_each_drop": ("", "let v = vec![ENV_LOCK.blocking_lock()];\n    v.into_iter().for_each(drop);"),
+        "async_move_awaited": ("", GUARD_G + "let f = async move { let _r = &g; };\n    rt.block_on(f);"),
+    }
+
+    OWN_SHAPES = {
+        "plain_drop": ("", GUARD_G + "drop(g);"),
+        "mem_drop_path": ("", GUARD_G + "std::mem::drop(g);"),
+        "moved_into_a_fn": (CONSUME_FN, GUARD_G + "consume(g);"),
+        "moved_into_a_binding": ("", GUARD_G + "let h = g;"),
+        "mentioned_again_by_ref": ("", GUARD_G + "let _r = &g;"),
+        "shadowed_binding": ("", GUARD_G + "let g = 5;"),
+        "lone_underscore_pattern": ("", "let _ = ENV_LOCK.blocking_lock();"),
+        "bare_statement": ("", "ENV_LOCK.blocking_lock();"),
+        "lock_in_an_inner_block": ("", "{ let _g = ENV_LOCK.blocking_lock(); }"),
+        "lock_in_a_loop_body": ("", "for _ in 0..1 { let _g = ENV_LOCK.blocking_lock(); }"),
+        "lock_in_a_closure": ("", "let c = || { let _g = ENV_LOCK.blocking_lock(); };\n    c();"),
+        "tuple_pattern_unknown_helper": ("", "let (_a, _b) = (ENV_LOCK.blocking_lock(), 1);"),
+        "reassigned": ("", "let mut g = ENV_LOCK.blocking_lock();\n    g = ENV_LOCK.blocking_lock();"),
+    }
+
+    HELD_BUT_FLAGGED = {
+        # #7628: really held in rustc, flagged by design (the gate never models a re-mention)
+        "let_underscore_eq_guard": ("", GUARD_G + "let _ = g;"),
+        "labelled_loop_break_value": ("", "let g = 'l: loop { break 'l ENV_LOCK.blocking_lock(); };"),
+        "mem_forget": ("", GUARD_G + "std::mem::forget(g);"),
+        "let_else_some": ("", "let Some(_g) = Some(ENV_LOCK.blocking_lock()) else { return };"),
+    }
+
+    def verdict(self, helpers, prefix, body=OPEN):
+        return self.flagged(WRITER + (helpers or "") + HOLDER + reader(prefix, body))
+
+    def test_the_canonical_shape_is_credited(self):
+        for prefix in ("let _g = ENV_LOCK.blocking_lock();", "let mut g = ENV_LOCK.blocking_lock();",
+                       "let _guard = ENV_LOCK.lock().await;", "let g = ENV_LOCK.lock().unwrap();"):
             with self.subTest(prefix=prefix):
-                text = WRITER + HOLDER + reader(GUARD + prefix)
-                self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
+                self.assertEqual(self.verdict("", prefix), set())
 
-    def test_container_still_in_scope_is_held(self):
-        for prefix in ("{\n        let _h = Holder { _g: g };\n        %s\n    }" % OPEN,
-                       "let _h = Holder { _g: g };\n    {\n        %s\n    }" % OPEN):
+    def test_the_twelve_r5_fail_open_shapes_are_not_credited(self):
+        self.assertEqual(len(self.R5_SHAPES), 12)
+        for name, (helpers, prefix) in self.R5_SHAPES.items():
+            with self.subTest(shape=name):
+                self.assertEqual(self.verdict(helpers, prefix), FLAGGED)
+
+    def test_ten_more_shapes_are_not_credited(self):
+        self.assertGreaterEqual(len(self.OWN_SHAPES), 10)
+        for name, (helpers, prefix) in self.OWN_SHAPES.items():
+            with self.subTest(shape=name):
+                self.assertEqual(self.verdict(helpers, prefix), FLAGGED)
+
+    def test_a_lock_taken_after_the_open_is_not_credited(self):
+        text = WRITER + reader(OPEN, "let _g = ENV_LOCK.blocking_lock();")
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_the_four_held_but_flagged_shapes_stay_flagged_by_design_7628(self):
+        self.assertEqual(len(self.HELD_BUT_FLAGGED), 4)
+        for name, (helpers, prefix) in self.HELD_BUT_FLAGGED.items():
+            with self.subTest(shape=name):
+                self.assertEqual(self.verdict(helpers, prefix), FLAGGED)
+
+    def test_the_guard_chain_is_credited_but_a_wider_chain_is_not(self):
+        for call, flagged in (("ENV_LOCK.lock().await", False), ("ENV_LOCK.lock().unwrap()", False),
+                              ("ENV_LOCK.lock().expect(\"x\")", False),
+                              ("ENV_LOCK.lock().unwrap().clone()", True),
+                              ("ENV_LOCK.lock().is_ok()", True)):
+            with self.subTest(call=call):
+                got = self.verdict("", "let _g = %s;" % call)
+                self.assertEqual(got, FLAGGED if flagged else set())
+
+    def test_the_tuple_exception_is_judged_on_the_guard_slot(self):
+        writer = test_fn("w", "let (_k, _g) = install_test_operator_key();\n    " + OPEN)
+
+        def scan(prefix):
+            return self.flagged(writer + test_fn("reader", prefix + "\n    " + OPEN))
+
+        self.assertEqual(scan("let (_key, _guard) = install_test_operator_key();"), set())
+        for prefix in ("let (_key, _) = install_test_operator_key();",
+                       "let (_key, g) = install_test_operator_key();\n    drop(g);"):
             with self.subTest(prefix=prefix):
-                self.assertEqual(self.flagged(WRITER + HOLDER + reader(GUARD + prefix, "")), set())
+                self.assertEqual(scan(prefix), FLAGGED)
 
-    def test_writer_whose_container_block_ended_is_unlocked(self):
-        for between in ("{ let _h = Holder { _g: g }; }", "{ let _o = Some(g); }"):
+    def test_the_helper_shape_credits_only_a_canonical_caller(self):
+        helper = ("struct Env { _lock: MutexGuard<'static, ()> }\n"
+                  "impl Env {\n    fn plain() -> Self {\n        let lock = ENV_LOCK.blocking_lock();\n"
+                  "        unsafe { std::env::set_var(\"B\", \"1\") };\n        Self { _lock: lock }\n    }\n}\n")
+        self.assertEqual(self.flagged(WRITER + helper + reader("let _e = Env::plain();")), set())
+        self.assertEqual(self.flagged(WRITER + helper + reader("let _ = Env::plain();")), FLAGGED)
+        self.assertEqual(self.flagged(WRITER + helper + reader("Env::plain();")), FLAGGED)
+
+    def test_a_helper_that_mentions_its_lock_twice_is_not_a_guard_helper(self):
+        helper = ("struct Env { _lock: MutexGuard<'static, ()> }\n"
+                  "impl Env {\n    fn plain() -> Self {\n        let lock = ENV_LOCK.blocking_lock();\n"
+                  "        let _r = &lock;\n        Self { _lock: lock }\n    }\n}\n")
+        self.assertEqual(self.flagged(WRITER + helper + reader("let _e = Env::plain();")), FLAGGED)
+
+    def test_a_writer_that_does_not_hold_the_canonical_lock_is_unprotected(self):
+        for between in ("drop(g);", "let _r = &g;"):
             with self.subTest(between=between):
-                self.assert_writer_unlocked(between, HOLDER)
+                text = writer_with(between) + LOCKED_READER
+                self.assertIn("tests/a.rs::writer", self.flagged(text))
+        self.assertEqual(self.flagged(WRITER + LOCKED_READER), set())
 
-    def test_writer_whose_container_is_live_is_locked(self):
-        self.assert_writer_locked("let _h = Holder { _g: g };", HOLDER)
-
-
-class Issue7471(WriterSide):
-    """#7471: a guard captured by a `move` closure moves into the closure."""
-
-    def test_move_closure_that_is_gone_released_the_guard(self):
-        for prefix in ("let c = move || { let _r = &g; };\n    drop(c);",
-                       "let c = move || { let _h = g; };\n    c();",
-                       "let c = move || drop(g);\n    c();",
-                       "consume(move || { let _r = &g; });",
-                       "std::thread::spawn(move || { let _r = &g; });",
-                       "let _t = tokio::spawn(async move { let _r = &g; });",
-                       "{ let _c = move || { let _r = &g; }; }",
-                       "let c = move |x: u8| { let _r = (&g, x); };\n    consume(c);"):
-            with self.subTest(prefix=prefix):
-                text = WRITER + CONSUME + reader(GUARD + prefix)
-                self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
-
-    def test_live_move_closure_or_borrowing_closure_keeps_the_guard(self):
-        for prefix in ("let _c = move || { let _r = &g; };", "let c = || { let _r = &g; };\n    c();",
-                       "let _h = Holder { _g: move || { let _r = &g; } };", "let _c = move || &g;"):
-            with self.subTest(prefix=prefix):
-                self.assertEqual(self.flagged(WRITER + HOLDER + reader(GUARD + prefix)), set())
-
-    def test_writer_whose_move_closure_is_gone_is_unlocked(self):
-        for between in ("let c = move || { let _r = &g; };\n    drop(c);",
-                        "std::thread::spawn(move || { let _r = &g; });"):
-            with self.subTest(between=between):
-                self.assert_writer_unlocked(between)
-
-    def test_writer_with_a_live_move_closure_is_locked(self):
-        self.assert_writer_locked("let _c = move || { let _r = &g; };")
+    def test_a_macro_body_lock_in_an_enclosing_block_is_credited(self):
+        self.assertEqual(self.flagged(MACRO_SETL + "#[test]\nfn t() { setl!(); }\n"), set())
 
 
-class Issue7472(Fixture):
-    """#7472: emptying the container that holds the guard releases the guard."""
+class ReqwestIpOnly7526(Fixture):
+    """#7526: reqwest to an IP-literal peer reads only Rust-side env; a hostname keeps it a reader."""
 
-    def test_emptied_container_released_the_guard(self):
-        for prefix in ("let mut v = vec![g];\n    v.clear();", "let mut v = vec![g];\n    let _ = v.pop();",
-                       "let mut v = vec![g];\n    v.truncate(0);", "let mut v = vec![g];\n    v.drain(..);",
-                       "let mut v = vec![g];\n    v.remove(0);", "let mut v = vec![g];\n    v.swap_remove(0);",
-                       "let mut v = vec![g];\n    v.retain(|_| false);",
-                       "let mut o = Some(g);\n    let h = OTHER.blocking_lock();\n    let _ = o.replace(h);",
-                       "let mut o = Some(g);\n    let h = OTHER.blocking_lock();\n    o.insert(h);",
-                       "let mut o = Some(g);\n    let _ = std::mem::replace(&mut o, None);",
-                       "let mut v = vec![g];\n    let _ = std::mem::take(&mut v);",
-                       "let mut v = vec![g];\n    std::mem::swap(&mut v, &mut Vec::new());",
-                       "let mut v = vec![g];\n    std::mem::swap(&mut Vec::new(), &mut v);"):
-            with self.subTest(prefix=prefix):
-                text = WRITER + reader(GUARD + prefix)
-                self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
+    CLIENT = "let _c = reqwest::Client::new();\n    let _r = _c.get(%s);"
 
-    def test_container_read_only_keeps_the_guard(self):
-        for prefix in ("let v = vec![g];\n    let _n = v.len();", "let o = Some(g);\n    let _b = o.is_some();",
-                       "let mut g2 = ENV_LOCK.blocking_lock();\n    g2.clear();"):
-            with self.subTest(prefix=prefix):
-                text = WRITER + reader("let g = 1;\n    " + prefix if "g2" in prefix else GUARD + prefix)
-                self.assertEqual(self.flagged(text), set())
+    def reader_with(self, url, extra=""):
+        return WRITER + extra + test_fn("reader", self.CLIENT % url)
 
+    def test_reqwest_to_an_ipv4_literal_is_not_a_reader(self):
+        self.assertEqual(self.flagged(self.reader_with('"http://127.0.0.1:8080/x"')), set())
 
-class Issue7473(Fixture):
-    """#7473: shadowing is not a reassignment; an if / match initialiser can hold the guard."""
+    def test_reqwest_to_an_ipv6_literal_is_not_a_reader(self):
+        self.assertEqual(self.flagged(self.reader_with('"http://[::1]:8080/x"')), set())
 
-    def test_shadowing_let_keeps_the_old_guard(self):
-        for prefix in ("let g = 5;", "let mut g = 5;\n    g += 1;", "let h = g;\n    let h = 5;"):
-            with self.subTest(prefix=prefix):
-                self.assertEqual(self.flagged(WRITER + reader(GUARD + prefix)), set())
+    def test_reqwest_to_a_bound_local_addr_is_not_a_reader(self):
+        text = self.reader_with("&format!(\"http://{}/x\", listener.local_addr().unwrap())")
+        self.assertEqual(self.flagged(text), set())
 
-    def test_if_or_match_initialiser_keeps_the_guard(self):
-        for prefix in ("let _o = if X == Y { Some(g) } else { None };",
-                       "let _o = if X == Y { None } else { Some(g) };",
-                       "let _o = if X == Y { Holder { _g: g } } else { Holder { _g: other() } };",
-                       "let _o = match X { 1 => Some(g), _ => None };",
-                       "let _o = match X {\n        1 => { Some(g) }\n        _ => None,\n    };",
-                       "let _o = { Some(g) };"):
-            with self.subTest(prefix=prefix):
-                self.assertEqual(self.flagged(WRITER + HOLDER + reader(GUARD + prefix)), set())
+    def test_reqwest_to_a_hostname_is_a_reader(self):
+        self.assertEqual(self.flagged(self.reader_with('"http://example.test/x"')), FLAGGED)
 
-    def test_if_initialiser_that_moves_into_a_call_released_the_guard(self):
-        for prefix in ("let _o = if X == Y { consume(g) } else { () };",
-                       "let o = if X == Y { Some(g) } else { None };\n    drop(o);",
-                       "if X == Y { let _o = Some(g); }"):
-            with self.subTest(prefix=prefix):
-                text = WRITER + CONSUME + reader(GUARD + prefix)
-                self.assertEqual(self.flagged(text), {"tests/a.rs::reader"})
+    def test_reqwest_to_localhost_is_a_reader(self):
+        self.assertEqual(self.flagged(self.reader_with('"http://localhost:8080/x"')), FLAGGED)
+
+    def test_reqwest_without_any_ip_evidence_is_a_reader(self):
+        self.assertEqual(self.flagged(self.reader_with("url")), FLAGGED)
+
+    def test_a_placeholder_host_without_local_addr_is_a_reader(self):
+        self.assertEqual(self.flagged(self.reader_with('"http://{}/x"')), FLAGGED)
+
+    def test_one_hostname_url_in_the_file_keeps_every_reqwest_a_reader(self):
+        text = self.reader_with('"http://127.0.0.1:8080/x"', 'const U: &str = "https://example.test/";\n')
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_resolver_word_keeps_the_reader(self):
+        text = self.reader_with('"http://127.0.0.1:8080/x"', "fn r(c: &C) { let _ = c.resolve(\"x\", a); }\n")
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_commented_hostname_does_not_count(self):
+        text = self.reader_with('"http://127.0.0.1:8080/x"', "// see https://example.test/ for the docs\n")
+        self.assertEqual(self.flagged(text), set())
+
+    def test_ip_only_text_verdicts(self):
+        self.assertTrue(gate.ip_only_text('get("http://10.0.0.5:80/a")'))
+        self.assertFalse(gate.ip_only_text('get("https://example.com/a")'))
+        self.assertFalse(gate.ip_only_text("get(url)"))
+        self.assertFalse(gate.ip_only_text(None))
 
 
 PARAM_KEY = """
