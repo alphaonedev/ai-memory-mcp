@@ -198,7 +198,7 @@ async fn bind_star(db: &ai_memory::handlers::Db, governance: Value) {
 }
 
 async fn push_and_count(governance: Value) -> (StatusCode, Value, i64) {
-    let guard = ENV_LOCK.lock().await;
+    let _guard = ENV_LOCK.lock().await;
     reset_env();
     let (router, db) = build_router_with_db();
     bind_star(&db, governance).await;
@@ -215,7 +215,6 @@ async fn push_and_count(governance: Value) -> (StatusCode, Value, i64) {
     )
     .await;
     let n = count_ns(&db, NS).await;
-    drop(guard);
     (status, body, n)
 }
 

@@ -239,26 +239,38 @@ fn sqlite_http_write_receipts_3555() {
     let scratch = tempfile::tempdir_in(root).expect("scratch");
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     for (sync, fsync) in [("NORMAL", "per-checkpoint"), ("FULL", "per-commit")] {
-        let _env = common::MultiEnvVarGuard::apply(&[
-            ("AI_MEMORY_NO_CONFIG", Some("1")),
-            ("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", Some("0")),
-            ("AI_MEMORY_FED_REQUIRE_SIG", Some("0")),
-            ("AI_MEMORY_FED_REQUIRE_WRITE_SIG", Some("0")),
-            ("AI_MEMORY_FED_REQUIRE_POLICY_CURRENT", Some("0")),
-            ("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", Some("0")),
-            (
-                "AI_MEMORY_FED_PEER_ATTESTATION",
-                Some(
-                    r#"{"receipt-agent-3555":{"allowed_namespaces":["receipt3555"],"allowed_sender_agent_ids":["receipt-agent-3555"]}}"#,
-                ),
-            ),
-            ("AI_MEMORY_DB_SYNCHRONOUS", Some(sync)),
-        ]);
-        runtime.block_on(exercise_local(
-            sqlite_app_state(&scratch.path().join(format!("{sync}.db"))),
-            fsync,
-        ));
+        sqlite_receipts_cell(&runtime, scratch.path(), sync, fsync);
     }
+}
+
+/// One `sqlite_http_write_receipts_3555` cell. The env guard is the canonical #7347 binding (a
+/// `let _env = ...;` at the top of the fn, never mentioned again), so each cell takes and drops
+/// the env lock on its own.
+fn sqlite_receipts_cell(
+    runtime: &tokio::runtime::Runtime,
+    scratch: &std::path::Path,
+    sync: &str,
+    fsync: &str,
+) {
+    let _env = common::MultiEnvVarGuard::apply(&[
+        ("AI_MEMORY_NO_CONFIG", Some("1")),
+        ("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", Some("0")),
+        ("AI_MEMORY_FED_REQUIRE_SIG", Some("0")),
+        ("AI_MEMORY_FED_REQUIRE_WRITE_SIG", Some("0")),
+        ("AI_MEMORY_FED_REQUIRE_POLICY_CURRENT", Some("0")),
+        ("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", Some("0")),
+        (
+            "AI_MEMORY_FED_PEER_ATTESTATION",
+            Some(
+                r#"{"receipt-agent-3555":{"allowed_namespaces":["receipt3555"],"allowed_sender_agent_ids":["receipt-agent-3555"]}}"#,
+            ),
+        ),
+        ("AI_MEMORY_DB_SYNCHRONOUS", Some(sync)),
+    ]);
+    runtime.block_on(exercise_local(
+        sqlite_app_state(&scratch.join(format!("{sync}.db"))),
+        fsync,
+    ));
 }
 
 #[cfg(feature = "sal-postgres")]
@@ -369,25 +381,35 @@ fn sqlite_http_quorum_and_backup_receipts_3555() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let _ = ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_| Ok(())));
     for backup in [None, Some("attested")] {
-        let _env = common::MultiEnvVarGuard::apply(&[
-            ("AI_MEMORY_NO_CONFIG", Some("1")),
-            ("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", Some("0")),
-            ("AI_MEMORY_FED_REQUIRE_SIG", Some("0")),
-            ("AI_MEMORY_FED_REQUIRE_WRITE_SIG", Some("0")),
-            ("AI_MEMORY_FED_REQUIRE_POLICY_CURRENT", Some("0")),
-            ("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", Some("0")),
-            (
-                "AI_MEMORY_FED_PEER_ATTESTATION",
-                Some(
-                    r#"{"receipt-agent-3555":{"allowed_namespaces":["receipt3555"],"allowed_sender_agent_ids":["receipt-agent-3555"]}}"#,
-                ),
-            ),
-            ("AI_MEMORY_BACKUP_POSTURE_ATTESTATION", backup),
-        ]);
-        runtime.block_on(exercise_quorum(sqlite_app_state(
-            &scratch.path().join(format!("{}.db", uuid::Uuid::new_v4())),
-        )));
+        sqlite_quorum_cell(&runtime, scratch.path(), backup);
     }
+}
+
+/// One `sqlite_http_quorum_and_backup_receipts_3555` cell (canonical env-guard binding, see
+/// `sqlite_receipts_cell`).
+fn sqlite_quorum_cell(
+    runtime: &tokio::runtime::Runtime,
+    scratch: &std::path::Path,
+    backup: Option<&str>,
+) {
+    let _env = common::MultiEnvVarGuard::apply(&[
+        ("AI_MEMORY_NO_CONFIG", Some("1")),
+        ("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", Some("0")),
+        ("AI_MEMORY_FED_REQUIRE_SIG", Some("0")),
+        ("AI_MEMORY_FED_REQUIRE_WRITE_SIG", Some("0")),
+        ("AI_MEMORY_FED_REQUIRE_POLICY_CURRENT", Some("0")),
+        ("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", Some("0")),
+        (
+            "AI_MEMORY_FED_PEER_ATTESTATION",
+            Some(
+                r#"{"receipt-agent-3555":{"allowed_namespaces":["receipt3555"],"allowed_sender_agent_ids":["receipt-agent-3555"]}}"#,
+            ),
+        ),
+        ("AI_MEMORY_BACKUP_POSTURE_ATTESTATION", backup),
+    ]);
+    runtime.block_on(exercise_quorum(sqlite_app_state(
+        &scratch.join(format!("{}.db", uuid::Uuid::new_v4())),
+    )));
 }
 
 #[cfg(feature = "sal-postgres")]
@@ -401,23 +423,29 @@ fn postgres_http_quorum_and_backup_receipts_3555() {
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let _ = ai_memory::governance::wire_check::GOVERNANCE_PRE_ACTION.set(Box::new(|_| Ok(())));
     for backup in [None, Some("attested")] {
-        let _env = common::MultiEnvVarGuard::apply(&[
-            ("AI_MEMORY_NO_CONFIG", Some("1")),
-            ("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", Some("0")),
-            ("AI_MEMORY_FED_REQUIRE_SIG", Some("0")),
-            ("AI_MEMORY_FED_REQUIRE_WRITE_SIG", Some("0")),
-            ("AI_MEMORY_FED_REQUIRE_POLICY_CURRENT", Some("0")),
-            ("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", Some("0")),
-            (
-                "AI_MEMORY_FED_PEER_ATTESTATION",
-                Some(
-                    r#"{"receipt-agent-3555":{"allowed_namespaces":["receipt3555"],"allowed_sender_agent_ids":["receipt-agent-3555"]}}"#,
-                ),
-            ),
-            ("AI_MEMORY_BACKUP_POSTURE_ATTESTATION", backup),
-        ]);
-        runtime.block_on(async {
-            exercise_quorum(postgres_app_state(&url).await).await;
-        });
+        postgres_quorum_cell(&runtime, &url, backup);
     }
+}
+
+/// One `postgres_http_quorum_and_backup_receipts_3555` cell (canonical env-guard binding).
+#[cfg(feature = "sal-postgres")]
+fn postgres_quorum_cell(runtime: &tokio::runtime::Runtime, url: &str, backup: Option<&str>) {
+    let _env = common::MultiEnvVarGuard::apply(&[
+        ("AI_MEMORY_NO_CONFIG", Some("1")),
+        ("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", Some("0")),
+        ("AI_MEMORY_FED_REQUIRE_SIG", Some("0")),
+        ("AI_MEMORY_FED_REQUIRE_WRITE_SIG", Some("0")),
+        ("AI_MEMORY_FED_REQUIRE_POLICY_CURRENT", Some("0")),
+        ("AI_MEMORY_FED_REQUIRE_PEER_ENROLLMENT", Some("0")),
+        (
+            "AI_MEMORY_FED_PEER_ATTESTATION",
+            Some(
+                r#"{"receipt-agent-3555":{"allowed_namespaces":["receipt3555"],"allowed_sender_agent_ids":["receipt-agent-3555"]}}"#,
+            ),
+        ),
+        ("AI_MEMORY_BACKUP_POSTURE_ATTESTATION", backup),
+    ]);
+    runtime.block_on(async {
+        exercise_quorum(postgres_app_state(url).await).await;
+    });
 }

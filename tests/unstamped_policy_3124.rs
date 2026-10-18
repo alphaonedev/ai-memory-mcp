@@ -205,25 +205,31 @@ mod sal {
     #[test]
     fn malformed_owner_is_refused_in_both_postures() {
         for mode in [MODE_WARN, MODE_REFUSE] {
-            let _p = posture(mode);
-            let (_d, path) = fresh_db_path();
-            let conn = db::open(&path).expect("open");
-            let id = seed(&conn, "malformed", &json!({"agent_id": 123}));
-            drop(conn);
-            runtime().block_on(async {
-                let store = SqliteStore::open(&path).expect("store");
-                // A caller spelled like the malformed value must not match it.
-                let caller = CallerContext::for_agent("123");
-                let err = store
-                    .update(&caller, &id, patch("x"))
-                    .await
-                    .expect_err("DENIED: a malformed owner is never matched");
-                assert!(
-                    matches!(err, StoreError::PermissionDenied { .. }),
-                    "{mode}: {err:?}"
-                );
-            });
+            malformed_owner_is_refused_in_both_postures_cell(mode);
         }
+    }
+
+    /// One `malformed_owner_is_refused_in_both_postures` cell: the canonical #7347 env binding (`let _p = posture(mode);` at the top
+    /// of the fn, never mentioned again), so each cell takes and drops the env lock on its own.
+    fn malformed_owner_is_refused_in_both_postures_cell(mode: &str) {
+        let _p = posture(mode);
+        let (_d, path) = fresh_db_path();
+        let conn = db::open(&path).expect("open");
+        let id = seed(&conn, "malformed", &json!({"agent_id": 123}));
+        drop(conn);
+        runtime().block_on(async {
+            let store = SqliteStore::open(&path).expect("store");
+            // A caller spelled like the malformed value must not match it.
+            let caller = CallerContext::for_agent("123");
+            let err = store
+                .update(&caller, &id, patch("x"))
+                .await
+                .expect_err("DENIED: a malformed owner is never matched");
+            assert!(
+                matches!(err, StoreError::PermissionDenied { .. }),
+                "{mode}: {err:?}"
+            );
+        });
     }
 }
 
@@ -234,59 +240,64 @@ mod sal {
 #[test]
 fn forget_archive_restore_follow_the_posture() {
     for mode in [MODE_WARN, MODE_REFUSE] {
-        let _p = posture(mode);
-        let (_d, path) = fresh_db_path();
-        let conn = db::open(&path).expect("open");
-        let unstamped = seed(&conn, "forget-unstamped", &json!({}));
-        let owned = seed(&conn, "forget-owned", &json!({"agent_id": "ai:bob"}));
-        let foreign = seed(&conn, "forget-foreign", &json!({"agent_id": "ai:alice"}));
+        forget_archive_restore_follow_the_posture_cell(mode);
+    }
+}
 
-        // Preview, count and the delete agree (one predicate, one posture).
-        let preview =
-            db::forget_count_for_caller(&conn, Some(NS), None, None, "ai:bob").expect("count");
-        let removed =
-            db::forget_for_caller(&conn, Some(NS), None, None, true, "ai:bob").expect("forget");
-        assert_eq!(preview, removed, "{mode}: preview == delete");
+/// One `forget_archive_restore_follow_the_posture` cell: the canonical #7347 env binding (`let _p = posture(mode);` at the top
+/// of the fn, never mentioned again), so each cell takes and drops the env lock on its own.
+fn forget_archive_restore_follow_the_posture_cell(mode: &str) {
+    let _p = posture(mode);
+    let (_d, path) = fresh_db_path();
+    let conn = db::open(&path).expect("open");
+    let unstamped = seed(&conn, "forget-unstamped", &json!({}));
+    let owned = seed(&conn, "forget-owned", &json!({"agent_id": "ai:bob"}));
+    let foreign = seed(&conn, "forget-foreign", &json!({"agent_id": "ai:alice"}));
+
+    // Preview, count and the delete agree (one predicate, one posture).
+    let preview =
+        db::forget_count_for_caller(&conn, Some(NS), None, None, "ai:bob").expect("count");
+    let removed =
+        db::forget_for_caller(&conn, Some(NS), None, None, true, "ai:bob").expect("forget");
+    assert_eq!(preview, removed, "{mode}: preview == delete");
+    assert!(
+        db::get(&conn, &owned).expect("get").is_none(),
+        "ALLOWED owned row forgotten"
+    );
+    assert!(
+        db::get(&conn, &foreign).expect("get").is_some(),
+        "foreign row never forgotten"
+    );
+    let unstamped_live = db::get(&conn, &unstamped).expect("get").is_some();
+    if mode == MODE_WARN {
+        assert_eq!(removed, 2, "warn: owned + unstamped");
+        assert!(!unstamped_live, "warn admits the unstamped row");
+    } else {
+        assert_eq!(removed, 1, "refuse: owned only");
         assert!(
-            db::get(&conn, &owned).expect("get").is_none(),
-            "ALLOWED owned row forgotten"
-        );
-        assert!(
-            db::get(&conn, &foreign).expect("get").is_some(),
-            "foreign row never forgotten"
-        );
-        let unstamped_live = db::get(&conn, &unstamped).expect("get").is_some();
-        if mode == MODE_WARN {
-            assert_eq!(removed, 2, "warn: owned + unstamped");
-            assert!(!unstamped_live, "warn admits the unstamped row");
-        } else {
-            assert_eq!(removed, 1, "refuse: owned only");
-            assert!(
-                unstamped_live,
-                "DENIED: refuse leaves the unstamped row live"
-            );
-        }
-
-        // By-id archive.
-        let arch = seed(&conn, "archive-unstamped", &json!({}));
-        let archived =
-            db::archive_memory_for_caller(&conn, &arch, None, "ai:bob").expect("archive");
-        assert_eq!(
-            archived,
-            mode == MODE_WARN,
-            "{mode}: archive of an unstamped row"
-        );
-
-        // Restore of an unstamped archived row.
-        let rest = seed(&conn, "restore-unstamped", &json!({}));
-        assert!(db::archive_memory(&conn, &rest, Some("3124")).expect("admin archive"));
-        let restored = db::restore_archived_for_caller(&conn, &rest, "ai:bob").expect("restore");
-        assert_eq!(
-            restored,
-            mode == MODE_WARN,
-            "{mode}: restore of an unstamped row"
+            unstamped_live,
+            "DENIED: refuse leaves the unstamped row live"
         );
     }
+
+    // By-id archive.
+    let arch = seed(&conn, "archive-unstamped", &json!({}));
+    let archived = db::archive_memory_for_caller(&conn, &arch, None, "ai:bob").expect("archive");
+    assert_eq!(
+        archived,
+        mode == MODE_WARN,
+        "{mode}: archive of an unstamped row"
+    );
+
+    // Restore of an unstamped archived row.
+    let rest = seed(&conn, "restore-unstamped", &json!({}));
+    assert!(db::archive_memory(&conn, &rest, Some("3124")).expect("admin archive"));
+    let restored = db::restore_archived_for_caller(&conn, &rest, "ai:bob").expect("restore");
+    assert_eq!(
+        restored,
+        mode == MODE_WARN,
+        "{mode}: restore of an unstamped row"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -401,61 +412,67 @@ mod http {
     #[test]
     fn put_delete_promote_follow_the_posture() {
         for mode in [MODE_WARN, MODE_REFUSE] {
-            let _p = posture(mode);
-            let (_d, path) = fresh_db_path();
-            let conn = db::open(&path).expect("open");
-            let upd = seed(&conn, "http-upd", &json!({"scope": "collective"}));
-            let del = seed(&conn, "http-del", &json!({"scope": "collective"}));
-            let pro = seed(&conn, "http-pro", &json!({"scope": "collective"}));
-            let owned = seed(&conn, "http-owned", &json!({"agent_id": "ai:bob"}));
-            drop(conn);
-            let app = router(&path);
-            let rt = runtime();
-            let (put, put_body) = rt.block_on(send(
-                &app,
-                "PUT",
-                &format!("/api/v1/memories/{upd}"),
-                Some(json!({"content": "http edit"})),
-                "ai:bob",
-            ));
-            let (delete, _) = rt.block_on(send(
-                &app,
-                "DELETE",
-                &format!("/api/v1/memories/{del}"),
-                None,
-                "ai:bob",
-            ));
-            let (promote, _) = rt.block_on(send(
-                &app,
-                "POST",
-                &format!("/api/v1/memories/{pro}/promote"),
-                None,
-                "ai:bob",
-            ));
-            let (own_put, _) = rt.block_on(send(
-                &app,
-                "PUT",
-                &format!("/api/v1/memories/{owned}"),
-                Some(json!({"content": "own edit"})),
-                "ai:bob",
-            ));
-            assert_eq!(own_put, StatusCode::OK, "{mode}: ALLOWED owned row");
-            if mode == MODE_WARN {
-                assert_eq!(put, StatusCode::OK, "warn PUT: {put_body}");
-                assert_eq!(delete, StatusCode::OK, "warn DELETE");
-                assert_eq!(promote, StatusCode::OK, "warn promote");
-            } else {
-                assert_eq!(put, StatusCode::FORBIDDEN, "refuse PUT: {put_body}");
-                assert_eq!(put_body["reason"], REASON_UNSTAMPED_REFUSED, "{put_body}");
-                assert_eq!(delete, StatusCode::FORBIDDEN, "refuse DELETE");
-                assert_eq!(promote, StatusCode::FORBIDDEN, "refuse promote");
-                let conn = db::open(&path).expect("reopen");
-                assert_eq!(content_of(&conn, &upd).as_deref(), Some("http-upd content"));
-                assert!(
-                    content_of(&conn, &del).is_some(),
-                    "DENIED delete left the row"
-                );
-            }
+            put_delete_promote_follow_the_posture_cell(mode);
+        }
+    }
+
+    /// One `put_delete_promote_follow_the_posture` cell: the canonical #7347 env binding (`let _p = posture(mode);` at the top
+    /// of the fn, never mentioned again), so each cell takes and drops the env lock on its own.
+    fn put_delete_promote_follow_the_posture_cell(mode: &str) {
+        let _p = posture(mode);
+        let (_d, path) = fresh_db_path();
+        let conn = db::open(&path).expect("open");
+        let upd = seed(&conn, "http-upd", &json!({"scope": "collective"}));
+        let del = seed(&conn, "http-del", &json!({"scope": "collective"}));
+        let pro = seed(&conn, "http-pro", &json!({"scope": "collective"}));
+        let owned = seed(&conn, "http-owned", &json!({"agent_id": "ai:bob"}));
+        drop(conn);
+        let app = router(&path);
+        let rt = runtime();
+        let (put, put_body) = rt.block_on(send(
+            &app,
+            "PUT",
+            &format!("/api/v1/memories/{upd}"),
+            Some(json!({"content": "http edit"})),
+            "ai:bob",
+        ));
+        let (delete, _) = rt.block_on(send(
+            &app,
+            "DELETE",
+            &format!("/api/v1/memories/{del}"),
+            None,
+            "ai:bob",
+        ));
+        let (promote, _) = rt.block_on(send(
+            &app,
+            "POST",
+            &format!("/api/v1/memories/{pro}/promote"),
+            None,
+            "ai:bob",
+        ));
+        let (own_put, _) = rt.block_on(send(
+            &app,
+            "PUT",
+            &format!("/api/v1/memories/{owned}"),
+            Some(json!({"content": "own edit"})),
+            "ai:bob",
+        ));
+        assert_eq!(own_put, StatusCode::OK, "{mode}: ALLOWED owned row");
+        if mode == MODE_WARN {
+            assert_eq!(put, StatusCode::OK, "warn PUT: {put_body}");
+            assert_eq!(delete, StatusCode::OK, "warn DELETE");
+            assert_eq!(promote, StatusCode::OK, "warn promote");
+        } else {
+            assert_eq!(put, StatusCode::FORBIDDEN, "refuse PUT: {put_body}");
+            assert_eq!(put_body["reason"], REASON_UNSTAMPED_REFUSED, "{put_body}");
+            assert_eq!(delete, StatusCode::FORBIDDEN, "refuse DELETE");
+            assert_eq!(promote, StatusCode::FORBIDDEN, "refuse promote");
+            let conn = db::open(&path).expect("reopen");
+            assert_eq!(content_of(&conn, &upd).as_deref(), Some("http-upd content"));
+            assert!(
+                content_of(&conn, &del).is_some(),
+                "DENIED delete left the row"
+            );
         }
     }
 
@@ -490,62 +507,68 @@ mod http {
     #[test]
     fn link_create_and_delete_follow_the_posture() {
         for mode in [MODE_WARN, MODE_REFUSE] {
-            let _p = posture(mode);
-            let (_d, path) = fresh_db_path();
-            let conn = db::open(&path).expect("open");
-            let src = seed(&conn, "link-src", &json!({"scope": "collective"}));
-            let dst = seed(&conn, "link-dst", &json!({"scope": "collective"}));
-            let owned = seed(&conn, "link-owned", &json!({"agent_id": "ai:bob"}));
-            drop(conn);
-            let app = router(&path);
-            let rt = runtime();
-            let (create, create_body) = rt.block_on(send(
+            link_create_and_delete_follow_the_posture_cell(mode);
+        }
+    }
+
+    /// One `link_create_and_delete_follow_the_posture` cell: the canonical #7347 env binding (`let _p = posture(mode);` at the top
+    /// of the fn, never mentioned again), so each cell takes and drops the env lock on its own.
+    fn link_create_and_delete_follow_the_posture_cell(mode: &str) {
+        let _p = posture(mode);
+        let (_d, path) = fresh_db_path();
+        let conn = db::open(&path).expect("open");
+        let src = seed(&conn, "link-src", &json!({"scope": "collective"}));
+        let dst = seed(&conn, "link-dst", &json!({"scope": "collective"}));
+        let owned = seed(&conn, "link-owned", &json!({"agent_id": "ai:bob"}));
+        drop(conn);
+        let app = router(&path);
+        let rt = runtime();
+        let (create, create_body) = rt.block_on(send(
+            &app,
+            "POST",
+            "/api/v1/links",
+            Some(json!({"source_id": src, "target_id": dst, "relation": "related_to"})),
+            "ai:bob",
+        ));
+        let (own_create, own_body) = rt.block_on(send(
+            &app,
+            "POST",
+            "/api/v1/links",
+            Some(json!({"source_id": owned, "target_id": dst, "relation": "related_to"})),
+            "ai:bob",
+        ));
+        assert!(
+            own_create.is_success(),
+            "{mode}: ALLOWED owned source: {own_body}"
+        );
+        if mode == MODE_WARN {
+            assert!(create.is_success(), "warn link create: {create_body}");
+            let (del, del_body) = rt.block_on(send(
                 &app,
-                "POST",
+                "DELETE",
                 "/api/v1/links",
-                Some(json!({"source_id": src, "target_id": dst, "relation": "related_to"})),
+                Some(json!({"source_id": src, "target_id": dst})),
                 "ai:bob",
             ));
-            let (own_create, own_body) = rt.block_on(send(
-                &app,
-                "POST",
-                "/api/v1/links",
-                Some(json!({"source_id": owned, "target_id": dst, "relation": "related_to"})),
-                "ai:bob",
-            ));
-            assert!(
-                own_create.is_success(),
-                "{mode}: ALLOWED owned source: {own_body}"
+            assert!(del.is_success(), "warn unlink: {del_body}");
+        } else {
+            assert_eq!(
+                create,
+                StatusCode::FORBIDDEN,
+                "refuse link create: {create_body}"
             );
-            if mode == MODE_WARN {
-                assert!(create.is_success(), "warn link create: {create_body}");
-                let (del, del_body) = rt.block_on(send(
-                    &app,
-                    "DELETE",
-                    "/api/v1/links",
-                    Some(json!({"source_id": src, "target_id": dst})),
-                    "ai:bob",
-                ));
-                assert!(del.is_success(), "warn unlink: {del_body}");
-            } else {
-                assert_eq!(
-                    create,
-                    StatusCode::FORBIDDEN,
-                    "refuse link create: {create_body}"
-                );
-                // Seed the edge through the admin storage funnel, then try to cut it.
-                let conn = db::open(&path).expect("reopen");
-                db::create_link(&conn, &src, &dst, "related_to").expect("admin link");
-                drop(conn);
-                let (del, del_body) = rt.block_on(send(
-                    &app,
-                    "DELETE",
-                    "/api/v1/links",
-                    Some(json!({"source_id": src, "target_id": dst})),
-                    "ai:bob",
-                ));
-                assert_eq!(del, StatusCode::FORBIDDEN, "refuse unlink: {del_body}");
-            }
+            // Seed the edge through the admin storage funnel, then try to cut it.
+            let conn = db::open(&path).expect("reopen");
+            db::create_link(&conn, &src, &dst, "related_to").expect("admin link");
+            drop(conn);
+            let (del, del_body) = rt.block_on(send(
+                &app,
+                "DELETE",
+                "/api/v1/links",
+                Some(json!({"source_id": src, "target_id": dst})),
+                "ai:bob",
+            ));
+            assert_eq!(del, StatusCode::FORBIDDEN, "refuse unlink: {del_body}");
         }
     }
 }

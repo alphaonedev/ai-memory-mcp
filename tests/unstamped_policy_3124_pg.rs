@@ -116,43 +116,49 @@ fn patch(content: &str) -> UpdatePatch {
 #[test]
 fn pg_update_and_delete_refuse_unstamped_in_both_postures() {
     for mode in [MODE_WARN, MODE_REFUSE] {
-        let _p = posture(mode);
-        runtime().block_on(async {
-            let Some(store) = live_pg().await else { return };
-            let ns = ns();
-            let unstamped = seed(&store, &ns, "pg-unstamped", &json!({})).await;
-            let empty = seed(&store, &ns, "pg-empty", &json!({"agent_id": ""})).await;
-            let owned = seed(&store, &ns, "pg-owned", &json!({"agent_id": "ai:bob"})).await;
-            let bob = CallerContext::for_agent("ai:bob");
-            for id in [&unstamped, &empty] {
-                let err = store
-                    .update(&bob, id, patch("must not land"))
-                    .await
-                    .expect_err("DENIED: pg refuses an unstamped row in every posture");
-                assert!(
-                    matches!(err, StoreError::PermissionDenied { .. }),
-                    "{mode}: {err:?}"
-                );
-                let err = store.delete(&bob, id).await.expect_err("DENIED delete");
-                assert!(
-                    matches!(err, StoreError::PermissionDenied { .. }),
-                    "{mode}: {err:?}"
-                );
-            }
-            store
-                .update(&bob, &owned, patch("owner edit"))
-                .await
-                .expect("ALLOWED: an owned row stays mutable");
-            assert_eq!(
-                content_of(&store, &unstamped).await.as_deref(),
-                Some("pg-unstamped content")
-            );
-            assert_eq!(
-                content_of(&store, &owned).await.as_deref(),
-                Some("owner edit")
-            );
-        });
+        pg_update_and_delete_refuse_unstamped_in_both_postures_cell(mode);
     }
+}
+
+/// One `pg_update_and_delete_refuse_unstamped_in_both_postures` cell: the canonical #7347 env binding (`let _p = posture(mode);` at the top
+/// of the fn, never mentioned again), so each cell takes and drops the env lock on its own.
+fn pg_update_and_delete_refuse_unstamped_in_both_postures_cell(mode: &str) {
+    let _p = posture(mode);
+    runtime().block_on(async {
+        let Some(store) = live_pg().await else { return };
+        let ns = ns();
+        let unstamped = seed(&store, &ns, "pg-unstamped", &json!({})).await;
+        let empty = seed(&store, &ns, "pg-empty", &json!({"agent_id": ""})).await;
+        let owned = seed(&store, &ns, "pg-owned", &json!({"agent_id": "ai:bob"})).await;
+        let bob = CallerContext::for_agent("ai:bob");
+        for id in [&unstamped, &empty] {
+            let err = store
+                .update(&bob, id, patch("must not land"))
+                .await
+                .expect_err("DENIED: pg refuses an unstamped row in every posture");
+            assert!(
+                matches!(err, StoreError::PermissionDenied { .. }),
+                "{mode}: {err:?}"
+            );
+            let err = store.delete(&bob, id).await.expect_err("DENIED delete");
+            assert!(
+                matches!(err, StoreError::PermissionDenied { .. }),
+                "{mode}: {err:?}"
+            );
+        }
+        store
+            .update(&bob, &owned, patch("owner edit"))
+            .await
+            .expect("ALLOWED: an owned row stays mutable");
+        assert_eq!(
+            content_of(&store, &unstamped).await.as_deref(),
+            Some("pg-unstamped content")
+        );
+        assert_eq!(
+            content_of(&store, &owned).await.as_deref(),
+            Some("owner edit")
+        );
+    });
 }
 
 /// R2 — a malformed (non-string) owner is never matched, even by a caller
@@ -181,77 +187,88 @@ fn pg_malformed_owner_is_never_matched() {
 #[test]
 fn pg_link_create_follows_the_posture() {
     for mode in [MODE_WARN, MODE_REFUSE] {
-        let _p = posture(mode);
-        runtime().block_on(async {
-            let Some(store) = live_pg().await else { return };
-            let ns = ns();
-            let src = seed(&store, &ns, "pg-link-src", &json!({})).await;
-            let dst = seed(&store, &ns, "pg-link-dst", &json!({})).await;
-            let owned = seed(&store, &ns, "pg-link-own", &json!({"agent_id": "ai:bob"})).await;
-            let bob = CallerContext::for_agent("ai:bob");
-            let link = |source: &str| MemoryLink {
-                source_id: source.to_string(),
-                target_id: dst.clone(),
-                relation: MemoryLinkRelation::RelatedTo,
-                created_at: chrono::Utc::now().to_rfc3339(),
-                signature: None,
-                observed_by: None,
-                valid_from: None,
-                valid_until: None,
-                attest_level: None,
-                source_cid: None,
-                target_cid: None,
-            };
-            let before = ai_memory::metrics::unstamped_mutation_allowed_count("postgres", "link");
-            let result = store.link(&bob, &link(&src)).await;
-            store
-                .link(&bob, &link(&owned))
-                .await
-                .expect("ALLOWED: an owned source stays linkable");
-            if mode == MODE_WARN {
-                result.expect("warn keeps the pre-#3124 pg link outcome");
-                assert!(
-                    ai_memory::metrics::unstamped_mutation_allowed_count("postgres", "link")
-                        > before
-                );
-            } else {
-                let err = result.expect_err("DENIED: refuse refuses the unstamped source");
-                assert!(
-                    matches!(err, StoreError::PermissionDenied { .. }),
-                    "{err:?}"
-                );
-            }
-        });
+        pg_link_create_follows_the_posture_cell(mode);
     }
+}
+
+/// One `pg_link_create_follows_the_posture` cell: the canonical #7347 env binding (`let _p = posture(mode);` at the top
+/// of the fn, never mentioned again), so each cell takes and drops the env lock on its own.
+fn pg_link_create_follows_the_posture_cell(mode: &str) {
+    let _p = posture(mode);
+    runtime().block_on(async {
+        let Some(store) = live_pg().await else { return };
+        let ns = ns();
+        let src = seed(&store, &ns, "pg-link-src", &json!({})).await;
+        let dst = seed(&store, &ns, "pg-link-dst", &json!({})).await;
+        let owned = seed(&store, &ns, "pg-link-own", &json!({"agent_id": "ai:bob"})).await;
+        let bob = CallerContext::for_agent("ai:bob");
+        let link = |source: &str| MemoryLink {
+            source_id: source.to_string(),
+            target_id: dst.clone(),
+            relation: MemoryLinkRelation::RelatedTo,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            signature: None,
+            observed_by: None,
+            valid_from: None,
+            valid_until: None,
+            attest_level: None,
+            source_cid: None,
+            target_cid: None,
+        };
+        let before = ai_memory::metrics::unstamped_mutation_allowed_count("postgres", "link");
+        let result = store.link(&bob, &link(&src)).await;
+        store
+            .link(&bob, &link(&owned))
+            .await
+            .expect("ALLOWED: an owned source stays linkable");
+        if mode == MODE_WARN {
+            result.expect("warn keeps the pre-#3124 pg link outcome");
+            assert!(
+                ai_memory::metrics::unstamped_mutation_allowed_count("postgres", "link") > before
+            );
+        } else {
+            let err = result.expect_err("DENIED: refuse refuses the unstamped source");
+            assert!(
+                matches!(err, StoreError::PermissionDenied { .. }),
+                "{err:?}"
+            );
+        }
+    });
 }
 
 /// The lenient pg archive-restore funnel follows the knob.
 #[test]
 fn pg_archive_restore_follows_the_posture() {
     for mode in [MODE_WARN, MODE_REFUSE] {
-        let _p = posture(mode);
-        runtime().block_on(async {
-            let Some(store) = live_pg().await else { return };
-            let ns = ns();
-            let id = seed(&store, &ns, "pg-restore", &json!({})).await;
-            let admin = CallerContext::for_admin("ai:operator");
-            let moved = store
-                .archive_by_ids(&admin, std::slice::from_ref(&id), Some("3124"))
-                .await
-                .expect("admin archive");
-            assert_eq!(moved, 1);
-            let restored = store
-                .archive_restore(&CallerContext::for_agent("ai:bob"), &id)
-                .await
-                .expect("restore");
-            assert_eq!(
-                restored,
-                mode == MODE_WARN,
-                "{mode}: restore of an unstamped row"
-            );
-            assert_eq!(content_of(&store, &id).await.is_some(), mode == MODE_WARN);
-        });
+        pg_archive_restore_follows_the_posture_cell(mode);
     }
+}
+
+/// One `pg_archive_restore_follows_the_posture` cell: the canonical #7347 env binding (`let _p = posture(mode);` at the top
+/// of the fn, never mentioned again), so each cell takes and drops the env lock on its own.
+fn pg_archive_restore_follows_the_posture_cell(mode: &str) {
+    let _p = posture(mode);
+    runtime().block_on(async {
+        let Some(store) = live_pg().await else { return };
+        let ns = ns();
+        let id = seed(&store, &ns, "pg-restore", &json!({})).await;
+        let admin = CallerContext::for_admin("ai:operator");
+        let moved = store
+            .archive_by_ids(&admin, std::slice::from_ref(&id), Some("3124"))
+            .await
+            .expect("admin archive");
+        assert_eq!(moved, 1);
+        let restored = store
+            .archive_restore(&CallerContext::for_agent("ai:bob"), &id)
+            .await
+            .expect("restore");
+        assert_eq!(
+            restored,
+            mode == MODE_WARN,
+            "{mode}: restore of an unstamped row"
+        );
+        assert_eq!(content_of(&store, &id).await.is_some(), mode == MODE_WARN);
+    });
 }
 
 /// Condition 2 of the Conductor ruling: the pg #1628 refusal on an unstamped
@@ -260,33 +277,39 @@ fn pg_archive_restore_follows_the_posture() {
 #[test]
 fn pg_unstamped_refusal_reason_is_byte_identical_in_both_postures() {
     for mode in [MODE_WARN, MODE_REFUSE] {
-        let _p = posture(mode);
-        runtime().block_on(async {
-            let Some(store) = live_pg().await else { return };
-            let ns = ns();
-            let id = seed(&store, &ns, "pg-reason", &json!({})).await;
-            let bob = CallerContext::for_agent("ai:bob");
-            let err = store
-                .update(&bob, &id, patch("x"))
-                .await
-                .expect_err("DENIED");
-            let StoreError::PermissionDenied { reason, .. } = err else {
-                panic!("expected PermissionDenied");
-            };
-            assert_eq!(
-                reason, "memory has no agent_id stamp; tenant writes refused (use admin path)",
-                "{mode}"
-            );
-            let err = store.delete(&bob, &id).await.expect_err("DENIED");
-            let StoreError::PermissionDenied { reason, .. } = err else {
-                panic!("expected PermissionDenied");
-            };
-            assert_eq!(
-                reason, "memory has no agent_id stamp; tenant deletes refused (use admin path)",
-                "{mode}"
-            );
-        });
+        pg_unstamped_refusal_reason_is_byte_identical_in_both_postures_cell(mode);
     }
+}
+
+/// One `pg_unstamped_refusal_reason_is_byte_identical_in_both_postures` cell: the canonical #7347 env binding (`let _p = posture(mode);` at the top
+/// of the fn, never mentioned again), so each cell takes and drops the env lock on its own.
+fn pg_unstamped_refusal_reason_is_byte_identical_in_both_postures_cell(mode: &str) {
+    let _p = posture(mode);
+    runtime().block_on(async {
+        let Some(store) = live_pg().await else { return };
+        let ns = ns();
+        let id = seed(&store, &ns, "pg-reason", &json!({})).await;
+        let bob = CallerContext::for_agent("ai:bob");
+        let err = store
+            .update(&bob, &id, patch("x"))
+            .await
+            .expect_err("DENIED");
+        let StoreError::PermissionDenied { reason, .. } = err else {
+            panic!("expected PermissionDenied");
+        };
+        assert_eq!(
+            reason, "memory has no agent_id stamp; tenant writes refused (use admin path)",
+            "{mode}"
+        );
+        let err = store.delete(&bob, &id).await.expect_err("DENIED");
+        let StoreError::PermissionDenied { reason, .. } = err else {
+            panic!("expected PermissionDenied");
+        };
+        assert_eq!(
+            reason, "memory has no agent_id stamp; tenant deletes refused (use admin path)",
+            "{mode}"
+        );
+    });
 }
 
 /// The doctor census query counts unstamped / malformed / archived-unstamped

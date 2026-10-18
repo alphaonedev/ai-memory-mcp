@@ -169,7 +169,7 @@ async fn stored_attest_level(db: &ai_memory::handlers::Db, id: &str) -> Option<S
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn write_attestation_claimed_vs_agent_attested() {
-    let guard = ENV_LOCK.lock().await;
+    let _guard = ENV_LOCK.lock().await;
     reset_env();
     let (router, db) = build_router_with_db();
 
@@ -257,7 +257,6 @@ async fn write_attestation_claimed_vs_agent_attested() {
     });
     let (status2, _) = post_push(&router, &claimed_body, author).await;
     assert_eq!(status2, StatusCode::OK, "unsigned relay accepts (claimed)");
-    drop(guard);
 
     assert_eq!(
         stored_attest_level(&db, &signed_id).await.as_deref(),
@@ -400,7 +399,7 @@ async fn policy_refuse_stale_vs_current() {
     );
 
     // Persisted E2E: stale push over HTTP is refused 409 with the typed tag.
-    let guard = ENV_LOCK.lock().await;
+    let _guard = ENV_LOCK.lock().await;
     reset_env();
     let (router, db) = build_router_with_db();
     {
@@ -433,7 +432,6 @@ async fn policy_refuse_stale_vs_current() {
         "dry_run": false,
     });
     let (status, body) = post_push(&router, &stale, sender).await;
-    drop(guard);
     assert_eq!(
         status,
         StatusCode::CONFLICT,

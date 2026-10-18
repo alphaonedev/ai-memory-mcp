@@ -37,7 +37,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use ai_memory::config::{AppConfig, EmbeddingModel, LlmSection, ResolvedEmbeddings};
+use ai_memory::config::{AppConfig, EmbeddingModel, LlmSection, ResolvedEmbeddings, ResolvedLlm};
 use ai_memory::embeddings::Embedder;
 use ai_memory::llm::OllamaClient;
 
@@ -445,6 +445,16 @@ fn config_with_backend(backend: &str) -> AppConfig {
     }
 }
 
+/// Resolve the `[llm]` section under the env lock, in a sync helper so an async test never holds the
+/// std `MutexGuard` across an `.await` (CONCURRENCY-20). The lock is the canonical binding of the
+/// #7347 gate: `let _lock = env_lock();` at the top of the fn, never mentioned again.
+fn resolve_llm_under_env(backend: &str) -> ResolvedLlm {
+    let _lock = env_lock();
+    let _scrub = scrubbed_llm_env();
+    let _key = EnvVarGuard::set("AI_MEMORY_LLM_API_KEY", "test-key-not-a-secret");
+    config_with_backend(backend).resolve_llm(None, None, None)
+}
+
 /// REFUSAL: `[llm].backend = "<retired>"` is rejected at the client
 /// construction funnel.
 ///
@@ -555,12 +565,7 @@ fn embedder_from_resolved_refuses_retired_alias_3627() {
 #[tokio::test]
 async fn build_from_resolved_async_refuses_retired_alias_3627() {
     let retired = retired_alias();
-    let resolved = {
-        let _lock = env_lock();
-        let _scrub = scrubbed_llm_env();
-        let _key = EnvVarGuard::set("AI_MEMORY_LLM_API_KEY", "test-key-not-a-secret");
-        config_with_backend(&retired).resolve_llm(None, None, None)
-    };
+    let resolved = resolve_llm_under_env(&retired);
 
     let Err(err) = OllamaClient::build_from_resolved_async(&resolved).await else {
         panic!("#3627: the async funnel must refuse the retired selector too");
@@ -568,12 +573,7 @@ async fn build_from_resolved_async_refuses_retired_alias_3627() {
     assert_unrecognized_selector_message(&err.to_string(), &retired);
 
     // ----- allowed-path control ---------------------------------------
-    let ok_resolved = {
-        let _lock = env_lock();
-        let _scrub = scrubbed_llm_env();
-        let _key = EnvVarGuard::set("AI_MEMORY_LLM_API_KEY", "test-key-not-a-secret");
-        config_with_backend(SUPPORTED_ALIAS).resolve_llm(None, None, None)
-    };
+    let ok_resolved = resolve_llm_under_env(SUPPORTED_ALIAS);
     assert!(
         OllamaClient::build_from_resolved_async(&ok_resolved)
             .await

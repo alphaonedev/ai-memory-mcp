@@ -472,9 +472,10 @@ struct FedEnv {
 impl FedEnv {
     /// Lock only; the environment is left as found.
     async fn plain() -> Self {
+        let lock = ENV_LOCK.lock().await;
         Self {
             saved: Vec::new(),
-            _lock: ENV_LOCK.lock().await,
+            _lock: lock,
         }
     }
 
@@ -487,7 +488,6 @@ impl FedEnv {
             .into_iter()
             .map(|k| (k, std::env::var_os(k)))
             .collect();
-        let me = Self { saved, _lock: lock };
         // SAFETY: every cell in this binary that reads or writes the process
         // environment holds `ENV_LOCK` for its whole body (all async cells take
         // `FedEnv::plain()` or `relaxed()`), so no other test thread touches the
@@ -505,7 +505,7 @@ impl FedEnv {
             );
             std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
         }
-        me
+        Self { saved, _lock: lock }
     }
 }
 

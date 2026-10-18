@@ -328,6 +328,14 @@ use std::sync::Mutex;
 /// Serializes every test that toggles `AI_MEMORY_ENCRYPT_AT_REST`.
 static ENV_GATE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Toggle the gate OFF. Only called by a test that holds an `EncryptGate`
+/// (bound as `let _gate = EncryptGate::on();`, never mentioned again), so
+/// `ENV_GATE_LOCK` is held across the write for the whole test (#7347).
+fn toggle_gate_off() {
+    // SAFETY: the calling test holds `ENV_GATE_LOCK` through its `EncryptGate`.
+    unsafe { std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST") };
+}
+
 /// RAII guard: sets the gate to `on`, restores the prior value on drop.
 struct EncryptGate {
     prev: Option<String>,
@@ -343,20 +351,6 @@ impl EncryptGate {
         // SAFETY: serialized via ENV_GATE_LOCK; restored on Drop.
         unsafe { std::env::set_var("AI_MEMORY_ENCRYPT_AT_REST", "1") };
         Self { prev, _lock: lock }
-    }
-
-    /// Toggle the gate OFF while the guard is still alive (the caller
-    /// keeps `self` in scope, so `ENV_GATE_LOCK` stays held across the
-    /// toggle — no other gate-mutating test can interleave).
-    // `&self` is intentional: requiring the receiver forces the caller to
-    // keep the live `EncryptGate` (and thus the held lock) in scope across
-    // the toggle. The body doesn't read a field, but the contract is the
-    // borrow itself.
-    #[allow(clippy::unused_self)]
-    fn toggle_off(&self) {
-        // SAFETY: the caller still holds this `EncryptGate`, so the inner
-        // `_lock` MutexGuard keeps ENV_GATE_LOCK acquired across this write.
-        unsafe { std::env::remove_var("AI_MEMORY_ENCRYPT_AT_REST") };
     }
 
     /// Acquire the gate lock with encryption forced OFF for the guard's
@@ -522,7 +516,7 @@ fn commit_b_toggle_off_still_reads_encrypted_rows() {
     // Write a row under encryption ON, then read it with the gate OFF.
     // Decryption is gated on envelope PRESENCE (not the env var), so the
     // row stays readable — toggling the flag off does not strand data.
-    let gate = EncryptGate::on();
+    let _gate = EncryptGate::on();
     let conn = fresh_conn();
 
     let agent = "commit-b-toggle-agent";
@@ -542,7 +536,7 @@ fn commit_b_toggle_off_still_reads_encrypted_rows() {
     assert!(envelope.is_some(), "row must be stored encrypted");
 
     // Now toggle the gate OFF and read — decrypt still fires on presence.
-    gate.toggle_off();
+    toggle_gate_off();
     let fetched = db::get(&conn, &id).expect("get").expect("exists");
     assert_eq!(
         fetched.content, plaintext,

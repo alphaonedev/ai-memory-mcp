@@ -237,7 +237,7 @@ fn install_allowlist_for(peer: &str) {
 
 #[tokio::test]
 async fn peer_cannot_pull_scope_private_row_owned_by_other_agent_948() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     install_allowlist_for("peer-bob");
 
@@ -259,7 +259,6 @@ async fn peer_cannot_pull_scope_private_row_owned_by_other_agent_948() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
     }
-    drop(env_guard);
 
     assert_eq!(
         status,
@@ -287,7 +286,7 @@ async fn peer_cannot_pull_scope_private_row_owned_by_other_agent_948() {
 
 #[tokio::test]
 async fn owner_peer_can_pull_own_scope_private_row_948() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     install_allowlist_for("alice");
 
@@ -307,7 +306,6 @@ async fn owner_peer_can_pull_own_scope_private_row_948() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
     }
-    drop(env_guard);
 
     assert_eq!(status, StatusCode::OK, "#948: status; body={body}");
     let mems = body["memories"].as_array().expect("memories array");
@@ -326,7 +324,7 @@ async fn owner_peer_can_pull_own_scope_private_row_948() {
 
 #[tokio::test]
 async fn inbox_target_can_pull_scope_private_row_948() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     install_allowlist_for("alice");
 
@@ -352,7 +350,6 @@ async fn inbox_target_can_pull_scope_private_row_948() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
     }
-    drop(env_guard);
 
     assert_eq!(status, StatusCode::OK, "#948: status; body={body}");
     let mems = body["memories"].as_array().expect("memories array");
@@ -371,7 +368,7 @@ async fn inbox_target_can_pull_scope_private_row_948() {
 
 #[tokio::test]
 async fn shared_scope_row_unaffected_948() {
-    let env_guard = ENV_LOCK.lock().await;
+    let _env_guard = ENV_LOCK.lock().await;
     reset_env();
     install_allowlist_for("peer-bob");
 
@@ -392,7 +389,6 @@ async fn shared_scope_row_unaffected_948() {
     unsafe {
         std::env::remove_var(ai_memory::federation::peer_attestation::PEER_ATTESTATION_ENV);
     }
-    drop(env_guard);
 
     assert_eq!(status, StatusCode::OK, "#948: status; body={body}");
     let mems = body["memories"].as_array().expect("memories array");
