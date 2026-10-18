@@ -11,8 +11,9 @@
 //!   the storage hook against a real DB with a refuse rule and assert
 //!   the `governance.refusal` audit row lands after the refusal.
 //! - **`drainer_does_not_block_inserts`** — under concurrent insert
-//!   load with refusals interspersed, no insert request takes > 100 ms
-//!   (deadlock regression pin).
+//!   load with refusals interspersed, every audited-path call returns while
+//!   the drainer flush is held closed (deadlock regression pin; no
+//!   wall-clock budget, #7765).
 //! - **`drainer_restarts_after_panic`** — sink-panic supervisor
 //!   behavior; events submitted before panic land, panic counter
 //!   bumps.
@@ -28,8 +29,8 @@
 //! the HTTP-403 round-trip; this suite is dedicated to the audit
 //! chain.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use ai_memory::db;
@@ -164,7 +165,56 @@ async fn refused_storage_insert_lands_in_signed_events_chain() {
 // Test 2 — drainer never blocks the audited-path call (deadlock pin)
 // ---------------------------------------------------------------------------
 
-#[tokio::test]
+/// Gate that holds the drainer's flush closed until the test opens it.
+/// Opening is idempotent and also happens on drop, so a failing assertion
+/// never leaves the drainer parked on the gate.
+#[derive(Clone)]
+struct FlushGate(Arc<(Mutex<bool>, Condvar)>);
+
+impl FlushGate {
+    fn closed() -> Self {
+        Self(Arc::new((Mutex::new(false), Condvar::new())))
+    }
+
+    fn open(&self) {
+        let (lock, cvar) = &*self.0;
+        *lock.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        cvar.notify_all();
+    }
+
+    /// Block until opened; the bounded wait keeps a lost opener from
+    /// wedging the runtime (CONCURRENCY-17).
+    fn wait_open(&self) {
+        let (lock, cvar) = &*self.0;
+        let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        let _ = cvar
+            .wait_timeout_while(guard, Duration::from_secs(60), |open| !*open)
+            .unwrap_or_else(PoisonError::into_inner);
+    }
+}
+
+impl Drop for FlushGate {
+    fn drop(&mut self) {
+        self.open();
+    }
+}
+
+/// Production sink wrapped so every append waits on the gate.
+struct GatedSink {
+    gate: FlushGate,
+    inner: SqliteSignedEventsSink,
+}
+
+impl DeferredAuditSink for GatedSink {
+    fn append(&mut self, event: &DeferredAuditEvent) -> anyhow::Result<AppendOutcome> {
+        self.gate.wait_open();
+        self.inner.append(event)
+    }
+}
+
+// Multi-thread flavor: the gated sink parks a worker thread, and the test
+// body must keep running on another one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drainer_does_not_block_inserts() {
     let (signing, _env_guard) = install_test_operator_key();
     let dir = fresh_tempdir();
@@ -179,29 +229,59 @@ async fn drainer_does_not_block_inserts() {
         "refuse for the no-block test",
     );
 
-    let (queue, supervisor) = install_deferred_audit_drainer(&db_path);
-
-    // Run 50 audited-path calls back-to-back. Time each one and
-    // assert p99 < 100 ms — every call must return without waiting
-    // for the drainer to flush.
-    let conn = db::open(&db_path).expect("open consult conn");
-    let action = refusal_action();
-    let mut elapsed: Vec<Duration> = Vec::with_capacity(50);
-    for _ in 0..50 {
-        let start = Instant::now();
-        let decision =
-            check_agent_action_deferred(&conn, "agent:no-block", &action, &queue).unwrap();
-        elapsed.push(start.elapsed());
-        assert!(decision.is_refusal());
-    }
-    elapsed.sort();
-    // p99 of 50 samples is samples[49] (the max).
-    let p99 = elapsed[49];
-    assert!(
-        p99 < Duration::from_millis(100),
-        "p99 audited-path call must complete < 100ms; got {p99:?}"
+    // #7765 - blocking-independence proof, no wall-clock budget. The
+    // drainer's flush is held CLOSED for all 50 audited-path calls, so a
+    // call that waited on a flush could never return. Every call returning
+    // a refusal while the gate is closed is the deadlock pin, and it holds
+    // under any host load.
+    let gate = FlushGate::closed();
+    let (queue, receiver) = DeferredAuditQueue::new();
+    let metrics = queue.metrics();
+    let db_for_factory = db_path.clone();
+    let metrics_for_factory = metrics.clone();
+    let gate_for_factory = gate.clone();
+    let supervisor = spawn_supervised_drainer(
+        receiver,
+        move || GatedSink {
+            gate: gate_for_factory.clone(),
+            inner: SqliteSignedEventsSink::with_metrics(
+                db_for_factory.clone(),
+                metrics_for_factory.clone(),
+            ),
+        },
+        metrics.clone(),
+        3,
     );
 
+    let conn = db::open(&db_path).expect("open consult conn");
+    let action = refusal_action();
+    // Loose hang guard only: a true deadlock fails fast instead of
+    // hanging CI. It is not a latency budget.
+    let loop_start = Instant::now();
+    for _ in 0..50 {
+        let decision =
+            check_agent_action_deferred(&conn, "agent:no-block", &action, &queue).unwrap();
+        assert!(
+            decision.is_refusal(),
+            "audited-path call must refuse while the drainer flush is closed"
+        );
+        assert!(
+            loop_start.elapsed() < Duration::from_secs(5),
+            "audited-path loop hung while the drainer flush was closed"
+        );
+    }
+    assert_eq!(
+        metrics.submitted_count(),
+        50,
+        "all 50 deferred rows must be queued while the flush is closed"
+    );
+    assert_eq!(
+        metrics.appended_count(),
+        0,
+        "no row may land while the flush gate is closed"
+    );
+
+    gate.open();
     close_and_flush(queue, supervisor).await.unwrap();
 
     // Sanity check — all 50 events landed in the chain.
