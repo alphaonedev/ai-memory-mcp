@@ -398,5 +398,47 @@ mod pg {
                 "AGE and CTE kg_timeline must emit byte-identical valid_from"
             );
         }
+
+        // F10 (review r2): the invalidate wire field `previous_valid_until`
+        // is rendered canonically by BOTH engines. The edge currently holds
+        // CANONICAL_UNTIL (relationally, and in the graph on AGE).
+        let mut age_prior: Option<String> = None;
+        if age {
+            let row = store
+                .kg_invalidate_cypher(&src, &dst, "related_to", Some("2099-02-01T00:00:00Z"), None)
+                .await
+                .expect("second kg_invalidate_cypher");
+            age_prior = row.previous_valid_until;
+            // Put the relational mirror back on the first stamp so the CTE
+            // twin reads the same prior as the graph did.
+            let first = chrono::DateTime::parse_from_rfc3339(CANONICAL_UNTIL)
+                .expect("canonical stamp")
+                .with_timezone(&chrono::Utc);
+            sqlx::query(
+                "UPDATE memory_links SET valid_until = $1 \
+                 WHERE source_id = $2 AND target_id = $3 AND relation = 'related_to'",
+            )
+            .bind(first)
+            .bind(&src)
+            .bind(&dst)
+            .execute(&pool)
+            .await
+            .expect("restore relational valid_until");
+        }
+        let cte_row = store
+            .kg_invalidate_cte(&src, &dst, "related_to", Some("2099-03-01T00:00:00Z"), None)
+            .await
+            .expect("second kg_invalidate_cte");
+        assert_eq!(
+            cte_row.previous_valid_until.as_deref(),
+            Some(CANONICAL_UNTIL),
+            "CTE kg_invalidate previous_valid_until must be the canonical Z stamp"
+        );
+        if age {
+            assert_eq!(
+                age_prior, cte_row.previous_valid_until,
+                "AGE and CTE kg_invalidate must spell previous_valid_until identically"
+            );
+        }
     }
 }

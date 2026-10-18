@@ -299,11 +299,54 @@ fn sqlite_kg_query_temporal_key_stays_primary_3810() {
     assert_eq!(got, want, "sqlite: temporal key first, then the tie-break");
 }
 
+/// F8 (review r2): mixed-case / punctuated ids that tie on every other
+/// timeline key. Byte order is `B a m1 m_2`; a database-locale order is
+/// `a B m_2 m1`, so with a cap of 3 the locale order keeps `m_2` instead of
+/// `m1`. Every backend must return the byte-order page.
+const TIE_SUFFIXES: [&str; 4] = ["B", "a", "m_2", "m1"];
+const TIMELINE_CAP: usize = 3;
+
+fn byte_order_timeline_want(ns: &str) -> Vec<String> {
+    ["B", "a", "m1"]
+        .iter()
+        .map(|s| format!("{ns}-{s}"))
+        .collect()
+}
+
+#[test]
+fn sqlite_kg_timeline_byte_order_tiebreak_under_cap_3810() {
+    let conn = common::fresh_conn();
+    let ns = format!("kg-order-{}", uuid::Uuid::new_v4());
+    let src = format!("{ns}-src");
+    db::insert(&conn, &make_memory(&src, &ns, "src")).expect("insert src");
+    for s in TIE_SUFFIXES {
+        let id = format!("{ns}-{s}");
+        db::insert(&conn, &make_memory(&id, &ns, &id)).expect("insert target");
+        db::create_link(&conn, &src, &id, SURVIVOR).expect("create link");
+    }
+    conn.execute(
+        "UPDATE memory_links SET created_at = ?1, valid_from = ?1",
+        rusqlite::params![SAME_INSTANT],
+    )
+    .expect("stamp links");
+    let got: Vec<String> = db::kg_timeline(&conn, &src, None, None, Some(TIMELINE_CAP))
+        .expect("kg_timeline")
+        .into_iter()
+        .map(|r| r.target_id)
+        .collect();
+    assert_eq!(
+        got,
+        byte_order_timeline_want(&ns),
+        "sqlite kg_timeline: byte order, cap applied after"
+    );
+}
+
 #[cfg(feature = "sal-postgres")]
 mod pg {
     use super::{
-        AGENT, Key, ROW_CAP, Scenario, assert_expected, common, diamond_scenario, make_memory,
-        parallel_scenario, relation_beats_path_scenario,
+        AGENT, Key, ROW_CAP, Scenario, TIE_SUFFIXES, TIMELINE_CAP, assert_expected,
+        byte_order_timeline_want, common, diamond_scenario, make_memory, parallel_scenario,
+        relation_beats_path_scenario,
     };
     use ai_memory::store::postgres::PostgresStore;
     use ai_memory::store::{CallerContext, KgBackend, KgQueryRow, MemoryStore};
@@ -505,5 +548,90 @@ mod pg {
             uuid::Uuid::new_v4()
         )))
         .await;
+    }
+
+    /// F8 (review r2): the AGE timeline tie-break is byte order, like the CTE.
+    #[tokio::test]
+    async fn postgres_kg_timeline_byte_order_tiebreak_under_cap_cte_and_age_3810() {
+        let Some(url) = common::postgres_url().or_else(common::age_url) else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = match PostgresStore::connect(&url).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skip: PostgresStore::connect failed: {e}");
+                return;
+            }
+        };
+        let ctx = CallerContext::for_agent(AGENT);
+        let ns = format!("kg-order-{}", uuid::Uuid::new_v4());
+        let src = format!("{ns}-src");
+        let mut ids = vec![src.clone()];
+        ids.extend(TIE_SUFFIXES.iter().map(|s| format!("{ns}-{s}")));
+        for id in &ids {
+            store
+                .store(&ctx, &make_memory(id, &ns, id))
+                .await
+                .expect("store memory");
+        }
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("pool");
+        let instant = chrono::Utc::now() - chrono::Duration::seconds(1000);
+        for id in ids.iter().skip(1) {
+            sqlx::query(
+                "INSERT INTO memory_links (source_id, target_id, relation, valid_from, \
+                 created_at, observed_by) VALUES ($1, $2, 'related_to', $3, $3, $4)",
+            )
+            .bind(&src)
+            .bind(id)
+            .bind(instant)
+            .bind(AGENT)
+            .execute(&pool)
+            .await
+            .expect("insert link");
+        }
+        let want = byte_order_timeline_want(&ns);
+
+        let cte: Vec<String> = store
+            .kg_timeline_cte(&src, None, None, Some(TIMELINE_CAP))
+            .await
+            .expect("kg_timeline_cte")
+            .into_iter()
+            .map(|r| r.target_id)
+            .collect();
+        assert_eq!(cte, want, "postgres CTE kg_timeline: byte order, then cap");
+
+        if matches!(store.kg_backend(), KgBackend::Age) {
+            let sc = Scenario {
+                label: "timeline",
+                src: src.clone(),
+                nodes: ids.clone(),
+                edges: ids
+                    .iter()
+                    .skip(1)
+                    .map(|t| (src.clone(), t.clone(), "related_to"))
+                    .collect(),
+                depth: 1,
+                want: Vec::new(),
+            };
+            project_into_age(&url, &sc, &instant.to_rfc3339())
+                .await
+                .expect("project into AGE");
+            let age: Vec<String> = store
+                .kg_timeline_cypher(&src, None, None, Some(TIMELINE_CAP))
+                .await
+                .expect("kg_timeline_cypher")
+                .into_iter()
+                .map(|r| r.target_id)
+                .collect();
+            assert_eq!(age, want, "AGE kg_timeline: byte order, then cap");
+            assert_eq!(age, cte, "AGE and CTE return the identical page");
+        } else {
+            eprintln!("note: AGE absent; checked the CTE half only");
+        }
     }
 }

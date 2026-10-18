@@ -12049,10 +12049,15 @@ impl PostgresStore {
                     r.relation AS relation, \
                     r.valid_from AS valid_from, \
                     r.valid_until AS valid_until, \
-                    r.observed_by AS observed_by \
-             ORDER BY r.valid_from ASC, r.created_at ASC, b.id ASC, r.relation ASC \
-             LIMIT {cap}"
+                    r.observed_by AS observed_by, \
+                    r.created_at AS created_at"
         );
+        // #3810 F8 - no ORDER BY / LIMIT inside cypher: AGE sorts agtype
+        // strings by the database locale, the CTE twin and sqlite sort by
+        // bytes, so a cypher-side sort + LIMIT picks different survivors for
+        // ids differing in case or punctuation. The rows of ONE source are
+        // fetched whole (the same fetch-then-sort shape as `kg_query_cypher`),
+        // sorted below in byte order, and only then capped.
 
         // #2511 — bind the params dict as a bare `agtype`-typed `$1`
         // Param (see [`Agtype`]); the pre-#2511 inlined
@@ -12067,10 +12072,10 @@ impl PostgresStore {
         }
         let params = age_params_jsonb(&pairs);
         let sql = format!(
-            "SELECT target_id, relation, valid_from, valid_until, observed_by \
+            "SELECT target_id, relation, valid_from, valid_until, observed_by, created_at \
              FROM cypher('memory_graph', $$ {cypher} $$, $1) AS \
              (target_id agtype, relation agtype, valid_from agtype, \
-              valid_until agtype, observed_by agtype)"
+              valid_until agtype, observed_by agtype, created_at agtype)"
         );
 
         // #1482 — per-call-unique cypher text (since/until predicate +
@@ -12089,7 +12094,7 @@ impl PostgresStore {
         // the display fields from the relational store avoids a
         // class of drift bugs where the AGE projection lags behind
         // a `memories` rename.
-        let mut decoded: Vec<KgTimelineRow> = Vec::with_capacity(rows.len());
+        let mut keyed: Vec<(TimelineSortKey, KgTimelineRow)> = Vec::with_capacity(rows.len());
         for r in &rows {
             // #2511 — every agtype cell reads through `age_cell_text_*`
             // (see that helper: a `String` decode of AGE's BINARY wire
@@ -12111,6 +12116,7 @@ impl PostgresStore {
                 age_cell_text_required(r, field_names::VALID_FROM, READ_VALID_FROM)?;
             let valid_until_raw = age_cell_text_opt(r, field_names::VALID_UNTIL, READ_VALID_UNTIL)?;
             let observed_by_raw = age_cell_text_opt(r, field_names::OBSERVED_BY, READ_OBSERVED_BY)?;
+            let created_at_raw = age_cell_text_opt(r, field_names::CREATED_AT, READ_CREATED_AT)?;
 
             let relation = strip_agtype_quotes(&relation_raw).to_string();
             // #2792 sibling — fail-CLOSED membership guard: the untyped
@@ -12123,25 +12129,46 @@ impl PostgresStore {
                 continue;
             }
 
-            decoded.push(KgTimelineRow {
+            let valid_from = strip_agtype_quotes(&valid_from_raw).to_string();
+            let created_at = created_at_raw.as_deref().and_then(agtype_optional_string);
+            let key = TimelineSortKey {
+                valid_from: timeline_stamp_key(Some(&valid_from)),
+                created_at: timeline_stamp_key(created_at.as_deref()),
                 target_id: strip_agtype_quotes(&target_id_raw).to_string(),
-                relation,
-                valid_from: strip_agtype_quotes(&valid_from_raw).to_string(),
-                // SQL NULL (absent property) and the agtype scalar `null`
-                // both collapse to `None` — the wire shape the CTE twin
-                // returns for a never-invalidated / unobserved edge.
-                // #3809 - canonical `Z` stamp, the byte-identical twin of the
-                // CTE render; an AGE edge written with `+00:00` converges here.
-                valid_until: valid_until_raw
-                    .as_deref()
-                    .and_then(agtype_optional_string)
-                    .map(|raw| crate::storage::canonicalize_valid_until_stamp(Some(&raw))),
-                observed_by: observed_by_raw.as_deref().and_then(agtype_optional_string),
-                // Filled in below by the `memories` join.
-                title: String::new(),
-                target_namespace: String::new(),
-            });
+                relation: relation.clone(),
+            };
+            keyed.push((
+                key,
+                KgTimelineRow {
+                    target_id: strip_agtype_quotes(&target_id_raw).to_string(),
+                    relation,
+                    valid_from,
+                    // SQL NULL (absent property) and the agtype scalar `null`
+                    // both collapse to `None` — the wire shape the CTE twin
+                    // returns for a never-invalidated / unobserved edge.
+                    // #3809 - canonical `Z` stamp, the byte-identical twin of the
+                    // CTE render; an AGE edge written with `+00:00` converges here.
+                    valid_until: valid_until_raw
+                        .as_deref()
+                        .and_then(agtype_optional_string)
+                        .map(|raw| crate::storage::canonicalize_valid_until_stamp(Some(&raw))),
+                    observed_by: observed_by_raw.as_deref().and_then(agtype_optional_string),
+                    // Filled in below by the `memories` join.
+                    title: String::new(),
+                    target_namespace: String::new(),
+                },
+            ));
         }
+
+        // #3810 F8 - byte-order total key (`valid_from`, `created_at`, then
+        // `target_id`, `relation` via `String::cmp`), THEN the cap: the same
+        // order and survivors as the CTE twin (`COLLATE "C"`) and sqlite
+        // (BINARY). decision: Rust byte-order sort then cap over a cypher
+        // COLLATE wrap because kg_query at the :11743 sort is the in-file
+        // precedent.
+        keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        keyed.truncate(cap);
+        let mut decoded: Vec<KgTimelineRow> = keyed.into_iter().map(|(_, row)| row).collect();
 
         // Backfill title + namespace in a single round-trip by
         // pulling the unique target ids and joining server-side.
@@ -12656,7 +12683,9 @@ impl PostgresStore {
         Ok(KgInvalidateRow {
             found: true,
             valid_until: stamp,
-            previous_valid_until: prior.map(|t| t.to_rfc3339()),
+            // #3809 F10 - canonical `Z` wire stamp, the twin of the AGE
+            // branch's stored graph string.
+            previous_valid_until: prior.map(crate::storage::render_valid_until_stamp),
         })
     }
 
@@ -19010,6 +19039,28 @@ const RECALL_FALLBACK_LIMIT_I64: i64 = 10;
 /// crafted call cannot exhaust the connection pool with one giant
 /// fetch. Pulled into a free function so both backend branches share
 /// the same clamping contract.
+/// #3810 F8 - total sort key of one AGE timeline row. Derived `Ord` compares
+/// the fields in declaration order; the strings use byte order, matching the
+/// CTE twin (`COLLATE "C"`) and sqlite (BINARY), never the database locale.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TimelineSortKey {
+    valid_from: (bool, Option<DateTime<Utc>>, String),
+    created_at: (bool, Option<DateTime<Utc>>, String),
+    target_id: String,
+    relation: String,
+}
+
+/// One stamp of a [`TimelineSortKey`]: an absent stamp sorts last (the CTE's
+/// default `NULLS LAST`), a parseable one by instant, then by raw bytes.
+fn timeline_stamp_key(raw: Option<&str>) -> (bool, Option<DateTime<Utc>>, String) {
+    raw.map_or((true, None, String::new()), |s| {
+        let instant = DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|t| t.with_timezone(&Utc));
+        (false, instant, s.to_string())
+    })
+}
+
 fn clamp_timeline_limit(limit: Option<usize>) -> usize {
     limit
         .unwrap_or(KG_TIMELINE_DEFAULT_LIMIT_SAL)
@@ -38235,10 +38286,8 @@ mod tests {
             .find(|l| l.source_id == a_id && l.target_id == b_id)
             .expect("just-inserted edge");
         assert_eq!(row.valid_from.as_deref(), Some("2026-01-01T00:00:00+00:00"));
-        assert_eq!(
-            row.valid_until.as_deref(),
-            Some("2026-12-31T23:59:59+00:00")
-        );
+        // #3809: valid_until is rendered in the canonical `Z` form on read.
+        assert_eq!(row.valid_until.as_deref(), Some("2026-12-31T23:59:59Z"));
         assert_eq!(row.observed_by.as_deref(), Some("ai:tester@host"));
         assert_eq!(row.attest_level.as_deref(), Some("unsigned"));
 

@@ -226,7 +226,12 @@ async fn sqlite_link_signed_persists_caller_window_3178() {
         .find(|l| l.target_id == dst)
         .expect("link present");
     assert_eq!(l.valid_from.as_deref(), Some(VALID_FROM));
-    assert_eq!(l.valid_until.as_deref(), Some(VALID_UNTIL));
+    // #3809: the reader renders valid_until canonically (`Z`); the stored
+    // signed bytes are pinned separately by `read_raw_link` above.
+    assert_eq!(
+        l.valid_until.as_deref(),
+        Some("2027-03-04T05:06:07.111222Z")
+    );
 }
 
 #[tokio::test]
