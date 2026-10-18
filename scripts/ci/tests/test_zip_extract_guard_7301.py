@@ -90,7 +90,13 @@ class GuardCase(GuardBase):
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
     def test_real_repo_passes_with_real_cargo_tree(self):
-        """Runs the real `cargo tree` (locked) against this checkout."""
+        """Runs the real guard (cargo tree, metadata and check) against this checkout.
+
+        The compiler step builds the whole workspace (a cold build takes more than 10 minutes), so
+        this runs only with ZIP_GUARD_REAL_CARGO=1; CI exercises it in the Security audit step.
+        """
+        if os.environ.get('ZIP_GUARD_REAL_CARGO') != '1':
+            self.skipTest('set ZIP_GUARD_REAL_CARGO=1 to run the real cargo check (CI runs the guard itself)')
         if shutil.which('cargo') is None:
             self.skipTest('cargo is not installed')
         res = subprocess.run([sys.executable, str(GUARD), '--root', str(REPO)],
@@ -207,37 +213,92 @@ class GuardCase(GuardBase):
                 self.assertIn(needle, text)
 
 
-STUB_TEMPLATE = """#!{python}
-import json, sys
-with open({log!r}, 'a') as fh:
-    fh.write(json.dumps(sys.argv[1:]) + '\\n')
-if 'metadata' in sys.argv:
-    import json, os
-    sys.stdout.write(json.dumps({{'packages': [{{'name': 'fixture', 'source': None,
-                                                 'manifest_path': os.getcwd() + '/Cargo.toml',
-                                                 'targets': [{{'kind': ['lib'], 'name': 'fixture',
-                                                              'src_path': os.getcwd() + '/src/lib.rs'}}]}}]}}))
-    sys.exit(0)
-sys.stdout.write({out!r})
-sys.stderr.write({err!r})
-sys.exit({rc})
-"""
+STUB_SCRIPT = '''#!PYTHON
+"""PATH cargo shim for the guard tests. Config: JSON file named by ZIP_STUB_CONFIG.
 
-OFFLINE_REFUSING_STUB = """#!{python}
+keys: log (argv log), out/err/rc (tree answer), refuse_offline, metadata_fail, spec (JSON file or null).
+spec: {"check_rc": 0, "check_err": "", "packages": [{"name", "dir", "member", "targets": [{"kind", "name", "src",
+"deps": [raw dep-info tokens], "artifact": true, "dfile": true, "dtext": null}]}]}; `{cwd}` and `{tgt}` in a
+dep token are replaced. Default spec: the fixture lib listing src/lib.rs.
+"""
+import json
+import os
 import sys
-if '--offline' in sys.argv:
+
+config = json.load(open(os.environ['ZIP_STUB_CONFIG']))
+with open(config['log'], 'a') as fh:
+    fh.write(json.dumps(sys.argv[1:]) + '\\n')
+cwd = os.getcwd()
+tgt = cwd + '/.stub-target'
+spec = json.load(open(config['spec'])) if config.get('spec') else {}
+packages = spec.get('packages') or [{'name': 'fixture', 'dir': cwd, 'member': True, 'targets': [
+    {'kind': ['lib'], 'name': 'fixture', 'src': 'src/lib.rs', 'deps': ['src/lib.rs']}]}]
+
+
+def pkg_dir(package):
+    return package['dir'] if os.path.isabs(package['dir']) else os.path.join(cwd, package['dir'])
+
+
+def pkg_id(package):
+    return 'path+file://' + pkg_dir(package) + '#' + package['name'] + '@0.0.0'
+
+
+args = sys.argv[1:]
+if args and args[0] == 'metadata':
+    if config.get('metadata_fail'):
+        sys.stderr.write('error: failed to load manifest\\n')
+        sys.exit(101)
+    docs = []
+    for package in packages:
+        docs.append({'name': package['name'], 'id': pkg_id(package), 'source': None,
+                     'manifest_path': pkg_dir(package) + '/Cargo.toml',
+                     'targets': [{'kind': t['kind'], 'name': t['name'],
+                                  'src_path': os.path.join(pkg_dir(package), t['src'])} for t in package['targets']]})
+    members = [pkg_id(p) for p in packages if p.get('member', True)]
+    sys.stdout.write(json.dumps({'packages': docs, 'workspace_members': members, 'target_directory': tgt}))
+    sys.exit(0)
+if args and args[0] == 'check':
+    if spec.get('check_rc'):
+        sys.stderr.write(spec.get('check_err', 'error: could not compile\\n'))
+        sys.exit(spec['check_rc'])
+    count = 0
+    for package in packages:
+        for target in package['targets']:
+            if not target.get('artifact', True):
+                continue
+            count += 1
+            if 'custom-build' in target['kind']:
+                out_dir = '%s/debug/build/%s-h%d' % (tgt, package['name'], count)
+                out, dfile = out_dir + '/build-script-build', out_dir + '/build_script_build-h%d.d' % count
+            else:
+                out_dir = tgt + '/debug/deps'
+                out = '%s/lib%s_%d-h.rmeta' % (out_dir, target['name'], count)
+                dfile = '%s/%s_%d-h.d' % (out_dir, target['name'], count)
+            os.makedirs(out_dir, exist_ok=True)
+            deps = [d.replace('{cwd}', cwd).replace('{tgt}', tgt) for d in target.get('deps', [])]
+            if target.get('dfile', True):
+                text = target.get('dtext')
+                if text is None:
+                    text = dfile + ': ' + ' '.join(deps) + '\\n' + ''.join(d + ':\\n' for d in deps)
+                else:
+                    text = text.replace('{cwd}', cwd).replace('{tgt}', tgt)
+                with open(dfile, 'w') as handle:
+                    handle.write(text)
+            sys.stdout.write(json.dumps({
+                'reason': 'compiler-artifact', 'package_id': pkg_id(package),
+                'target': {'kind': target['kind'], 'name': target['name'],
+                           'src_path': os.path.join(pkg_dir(package), target['src'])},
+                'filenames': [out], 'fresh': False}) + '\\n')
+    sys.stdout.write('{"reason":"build-finished","success":true}\\n')
+    sys.exit(0)
+if config.get('refuse_offline') and '--offline' in args:
     sys.stderr.write('error: failed to download `anstyle-wincon v3.0.11`\\n'
                      'Caused by: attempting to make an HTTP request, but --offline was specified\\n')
     sys.exit(101)
-if 'metadata' in sys.argv:
-    import json, os
-    sys.stdout.write(json.dumps({{'packages': [{{'name': 'fixture', 'source': None,
-                                                 'manifest_path': os.getcwd() + '/Cargo.toml',
-                                                 'targets': [{{'kind': ['lib'], 'name': 'fixture',
-                                                              'src_path': os.getcwd() + '/src/lib.rs'}}]}}]}}))
-    sys.exit(0)
-sys.stdout.write({out!r})
-"""
+sys.stdout.write(config.get('out', ''))
+sys.stderr.write(config.get('err', ''))
+sys.exit(config.get('rc', 0))
+'''
 
 LOCK_WITH_ZIP = CANDLE_LOCK + ('[[package]]\nname = "zip"\nversion = "7.2.0"\n'
                                'source = "registry+https://github.com/rust-lang/crates.io-index"\n')
@@ -248,20 +309,31 @@ NO_MATCH_ERR = 'error: package ID specification `zip` did not match any packages
 class StubCargoCase(GuardBase):
     """Runs the guard against a stub `cargo` placed first on PATH."""
 
-    def run_stub(self, out='', err='', rc=0, lock=None):
+    def stub_env(self, spec=None, **config):
+        """Install the stub as `cargo` on a PATH dir and return the environment that selects it."""
         stub_dir = self.root.parent / (self.root.name + '.bin')
-        stub_dir.mkdir()
+        stub_dir.mkdir(exist_ok=True)
         self.addCleanup(shutil.rmtree, str(stub_dir), True)
         self.argv_log = stub_dir / 'argv.log'
+        spec_file = None
+        if spec is not None:
+            spec_file = stub_dir / 'spec.json'
+            spec_file.write_text(json.dumps(spec), encoding='utf-8')
+        config.update(log=str(self.argv_log), spec=str(spec_file) if spec_file else None)
+        config_file = stub_dir / 'config.json'
+        config_file.write_text(json.dumps(config), encoding='utf-8')
         stub = stub_dir / 'cargo'
-        stub.write_text(STUB_TEMPLATE.format(
-            python=sys.executable, log=str(self.argv_log), out=out, err=err, rc=rc),
-            encoding='utf-8')
+        stub.write_text(STUB_SCRIPT.replace('#!PYTHON', '#!' + sys.executable, 1), encoding='utf-8')
         stub.chmod(0o755)
-        if lock is not None:
-            (self.root / 'Cargo.lock').write_text(lock, encoding='utf-8')
         env = dict(os.environ)
         env['PATH'] = str(stub_dir) + os.pathsep + env.get('PATH', '')
+        env['ZIP_STUB_CONFIG'] = str(config_file)
+        return env
+
+    def run_stub(self, out='', err='', rc=0, lock=None, spec=None, **config):
+        if lock is not None:
+            (self.root / 'Cargo.lock').write_text(lock, encoding='utf-8')
+        env = self.stub_env(spec=spec, out=out, err=err, rc=rc, **config)
         return subprocess.run(
             [sys.executable, str(GUARD), '--root', str(self.root)],
             capture_output=True, text=True, check=False, env=env)
@@ -288,18 +360,7 @@ class CleanCargoHome7301(StubCargoCase):
 
     def test_download_needed_is_not_refused_by_guard_flags(self):
         """A cargo that refuses to download under --offline: the guard must not pass that flag."""
-        stub_dir = self.root.parent / (self.root.name + '.bin')
-        stub_dir.mkdir()
-        self.addCleanup(shutil.rmtree, str(stub_dir), True)
-        stub = stub_dir / 'cargo'
-        stub.write_text(OFFLINE_REFUSING_STUB.format(
-            python=sys.executable, out=GOOD_TREE_DEPTH), encoding='utf-8')
-        stub.chmod(0o755)
-        (self.root / 'Cargo.lock').write_text(LOCK_WITH_ZIP, encoding='utf-8')
-        env = dict(os.environ)
-        env['PATH'] = str(stub_dir) + os.pathsep + env.get('PATH', '')
-        res = subprocess.run([sys.executable, str(GUARD), '--root', str(self.root)],
-                             capture_output=True, text=True, check=False, env=env)
+        res = self.run_stub(out=GOOD_TREE_DEPTH, lock=LOCK_WITH_ZIP, refuse_offline=True)
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
     def test_download_failure_still_fails_closed(self):
@@ -440,17 +501,6 @@ class SourceScope7301(GuardBase):
         res = self.run_guard()
         self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
         self.assertIn('gen/evil.rs:1', res.stdout)
-
-    def test_unresolvable_path_and_include_fail(self):
-        for i, body in enumerate(('#[path = "../gen/missing.rs"]\nmod m;\n',
-                                  'include!("../gen/missing.rs");\n',
-                                  'include!(concat!(env!("OUT_DIR"), "/g.rs"));\n',
-                                  '#[path = "../../outside.rs"]\nmod m;\n')):
-            with self.subTest(body=body):
-                self.write('src/lib.rs', body)
-                res = self.run_guard()
-                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-                self.assertIn('src/lib.rs:', res.stdout)
 
     def test_path_attribute_inside_scanned_roots_passes(self):
         self.write('src/sub/inner.rs', 'pub fn i() {}\n')
@@ -980,22 +1030,6 @@ class RuleFixtures7305To7312(GuardBase):
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
     # --- #7310: build-time generated modules -----------------------------------------
-    def test_mod_without_a_file_fails_7310(self):
-        cases = {
-            'lib': ('src/lib.rs', 'mod gen;\n'),
-            'pub-crate': ('src/lib.rs', 'pub(crate) mod gen;\n'),
-            'nested-dir': ('src/foo.rs', 'mod gen;\n'),
-        }
-        for name, (rel, body) in cases.items():
-            with self.subTest(case=name):
-                self.write(rel, body)
-                res = self.run_guard()
-                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-                self.assertIn('mod gen', res.stdout)
-                self.assertIn(rel + ':1', res.stdout)
-                (self.root / rel).unlink()
-                self.write('src/lib.rs', 'pub fn ok() {}\n')
-
     def test_build_script_string_with_loader_call_fails_7310(self):
         self.write('build.rs', (
             'fn main() {\n    std::fs::write("src/gen.rs", "fn g() { Tensor::read_npz(p); }").unwrap();\n}\n'))
@@ -1004,18 +1038,6 @@ class RuleFixtures7305To7312(GuardBase):
         res = self.run_guard()
         self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
         self.assertIn('build.rs:2', res.stdout)
-
-    def test_modules_with_files_and_clean_build_script_pass_7310(self):
-        self.write('src/lib.rs', 'mod a;\nmod b;\nmod c { pub fn z() {} }\n#[cfg(test)]\nmod tests;\n')
-        self.write('src/a.rs', 'pub mod inner;\n')
-        self.write('src/a/inner.rs', 'pub fn i() {}\n')
-        self.write('src/b/mod.rs', 'pub fn b() {}\n')
-        self.write('src/tests.rs', 'fn t() {}\n')
-        self.write('build.rs', (
-            '// Tensor::read_npz is only named in this comment\n'
-            'fn main() {\n    println!("cargo:rerun-if-changed=build.rs");\n}\n'))
-        res = self.run_guard()
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
     # --- #7311: [replace] package-ID keys and the registry origin --------------------
     def test_replace_package_id_keys_fail_7311(self):
@@ -1129,59 +1151,6 @@ class RuleFixtures7305To7312(GuardBase):
                 res = self.manifest_rc(body, parser)
                 self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
-    def test_mod_file_must_be_where_cargo_looks_7310(self):
-        """F3a: `mod x;` in a non-root file is `<stem>/x.rs`; in a crate root or mod.rs it is `x.rs`."""
-        cases = {
-            'sibling-of-non-root-file': ('src/foo.rs', 'mod gen;\n', 'src/gen.rs'),
-            'dir-of-crate-root': ('src/lib.rs', 'mod gen;\n', 'src/lib/gen.rs'),
-            'dir-of-mod-rs': ('src/b/mod.rs', 'mod gen;\n', 'src/b/mod/gen.rs'),
-            'sibling-of-bin-root-stem': ('src/bin/t.rs', 'mod gen;\n', 'src/bin/t/gen.rs'),
-        }
-        for name, (rel, body, decoy) in cases.items():
-            with self.subTest(case=name):
-                self.write('src/lib.rs', 'pub fn ok() {}\n')
-                self.write(rel, body)
-                self.write(decoy, 'pub fn g() {}\n')
-                res = self.run_guard()
-                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-                self.assertIn('mod gen', res.stdout)
-                for made in (rel, decoy):
-                    (self.root / made).unlink()
-
-    def test_mod_files_where_cargo_looks_pass_7310(self):
-        cases = {
-            'lib-sibling': {'src/lib.rs': 'mod gen;\n', 'src/gen.rs': 'pub fn g() {}\n'},
-            'mod-rs-sibling': {'src/b/mod.rs': 'mod gen;\n', 'src/b/gen.rs': 'pub fn g() {}\n'},
-            'non-root-subdir': {'src/foo.rs': 'mod gen;\n', 'src/foo/gen.rs': 'pub fn g() {}\n'},
-            'non-root-subdir-mod-rs': {'src/foo.rs': 'mod gen;\n', 'src/foo/gen/mod.rs': 'pub fn g() {}\n'},
-            'bin-root-sibling': {'src/bin/t.rs': 'mod gen;\nfn main() {}\n', 'src/bin/gen.rs': 'pub fn g() {}\n'},
-            'path-attribute': {'src/lib.rs': '#[path = "x.rs"]\nmod gen;\n', 'src/x.rs': 'pub fn g() {}\n'},
-            'path-attribute-one-line': {'src/lib.rs': '#[path = "x.rs"] mod gen;\n', 'src/x.rs': 'pub fn g() {}\n'},
-        }
-        for name, files in cases.items():
-            with self.subTest(case=name):
-                self.write('src/lib.rs', 'pub fn ok() {}\n')
-                for rel, body in files.items():
-                    self.write(rel, body)
-                res = self.run_guard()
-                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-                for rel in files:
-                    (self.root / rel).unlink()
-
-    def test_path_text_inside_another_attribute_does_not_exempt_a_mod_7310(self):
-        """F3b: only a real `#[path = ..]` / `#[cfg_attr(.., path = ..)]` exempts the `mod`."""
-        bodies = {
-            'cfg-not-path': '#[cfg(not(path = "lib.rs"))]\nmod gen;\n',
-            'cfg-not-path-one-line': '#[cfg(not(path = "lib.rs"))] mod gen;\n',
-            'doc-attr': '#[doc = "path = x"]\nmod gen;\n',
-        }
-        for name, body in bodies.items():
-            with self.subTest(case=name):
-                self.write('src/lib.rs', body)
-                res = self.run_guard()
-                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-                self.assertIn('mod gen', res.stdout)
-
     # --- round 3 (r2 review of PR #7777): N1-N4 ----------------------------------------
     def meta_targets(self, root_paths=(), build_paths=(), members=()):
         """cargo metadata JSON whose root package carries `targets`; `members` is (dir, [src paths])."""
@@ -1198,43 +1167,6 @@ class RuleFixtures7305To7312(GuardBase):
                              'targets': [{'kind': ['lib'], 'name': 'm', 'src_path': str(self.root / p)}
                                          for p in paths or ['%s/src/lib.rs' % rel]]})
         return {'packages': packages}
-
-    def test_cfg_attr_path_does_not_exempt_the_default_file_7310(self):
-        """N1: only an unconditional #[path] exempts `mod x;`; a cfg_attr module needs its default file too."""
-        bodies = {
-            'cfg-attr-path': '#[cfg_attr(windows, path = "lib.rs")] mod gen;\n',
-            'cfg-attr-path-in-predicate': '#[cfg_attr(not(path = "lib.rs"), allow(dead_code))] mod gen;\n',
-        }
-        for name, body in bodies.items():
-            with self.subTest(case=name):
-                self.write('src/lib.rs', body)
-                res = self.run_guard()
-                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-                self.assertIn('mod gen', res.stdout)
-
-    def test_cfg_attr_path_module_with_both_files_passes_7310(self):
-        self.write('src/lib.rs', '#[cfg_attr(windows, path = "w.rs")] mod gen;\n')
-        self.write('src/gen.rs', 'pub fn g() {}\n')
-        self.write('src/w.rs', 'pub fn g() {}\n')
-        res = self.run_guard()
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-
-    def test_mod_in_a_path_loaded_file_is_beside_that_file_7310(self):
-        """N2: rustc treats every #[path] file as a mod-rs file; a decoy under `<stem>/` is not the module."""
-        self.write('src/lib.rs', '#[path = "impl_a.rs"]\nmod a;\n')
-        self.write('src/impl_a.rs', 'mod gen;\n')
-        self.write('src/impl_a/gen.rs', 'pub fn g() {}\n')
-        res = self.run_guard()
-        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-        self.assertIn('src/impl_a.rs:1', res.stdout)
-        self.assertIn('mod gen', res.stdout)
-
-    def test_mod_in_a_path_loaded_file_beside_it_passes_7310(self):
-        self.write('src/lib.rs', '#[path = "impl_a.rs"]\nmod a;\n')
-        self.write('src/impl_a.rs', 'mod gen;\n')
-        self.write('src/gen.rs', 'pub fn g() {}\n')
-        res = self.run_guard()
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
     def test_inline_table_and_array_targets_come_from_metadata_7310(self):
         """N3: `lib = { path = .. }` and `bin = [{ .. }]` are read from cargo metadata src_path."""
@@ -1262,12 +1194,6 @@ class RuleFixtures7305To7312(GuardBase):
     def test_inline_table_target_with_a_clean_file_passes_7310(self):
         self.write('Cargo.toml', PACKAGE_ONLY + 'lib = { path = "other/lib.rs" }\n')
         self.write('other/lib.rs', 'pub fn g() {}\n')
-        res = self.run_guard(meta=self.meta_targets(['other/lib.rs']))
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-
-    def test_inline_target_root_looks_for_mod_beside_itself_7310(self):
-        self.write('other/lib.rs', 'mod gen;\n')
-        self.write('other/gen.rs', 'pub fn g() {}\n')
         res = self.run_guard(meta=self.meta_targets(['other/lib.rs']))
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
@@ -1299,319 +1225,6 @@ class RuleFixtures7305To7312(GuardBase):
 
     # --- round 4 (r3 review of PR #7777): E, F, G1, L3 ---------------------------------
     LOADER = 'pub fn f() { Tensor::read_npz(p); }\n'
-
-    def test_module_of_a_declared_target_outside_scan_dirs_is_scanned_7310(self):
-        """E1/E2: `mod m;` in a target outside SCAN_DIRS resolves to a file that is compiled and must be scanned."""
-        cases = {
-            'e1-inline-table-lib': ('lib = { path = "other/lib.rs" }\n', lambda: self.meta_targets(['other/lib.rs'])),
-            'e2-literal-lib-path': ('[lib]\npath = "other/lib.rs"\n', lambda: None),
-        }
-        for name, (decl, meta) in cases.items():
-            with self.subTest(case=name):
-                self.write('Cargo.toml', PACKAGE_ONLY + decl)
-                self.write('other/lib.rs', 'mod m;\n')
-                self.write('other/m.rs', self.LOADER)
-                res = self.run_guard(meta=meta())
-                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-                self.assertIn('other/m.rs:1', res.stdout)
-                self.assertIn('candle-loader', res.stdout)
-
-    def test_module_of_a_path_loaded_file_outside_scan_dirs_is_scanned_7310(self):
-        """E3: `#[path = "../ext/a.rs"] mod a;` and `mod m;` inside ext/a.rs."""
-        self.write('src/lib.rs', '#[path = "../ext/a.rs"]\nmod a;\n')
-        self.write('ext/a.rs', 'mod m;\n')
-        self.write('ext/m.rs', self.LOADER)
-        res = self.run_guard()
-        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-        self.assertIn('ext/m.rs:1', res.stdout)
-        self.assertIn('candle-loader', res.stdout)
-
-    def test_clean_modules_outside_scan_dirs_pass_7310(self):
-        self.write('Cargo.toml', PACKAGE_ONLY + 'lib = { path = "other/lib.rs" }\n')
-        self.write('other/lib.rs', 'mod m;\n')
-        self.write('other/m.rs', 'pub fn g() {}\n')
-        res = self.run_guard(meta=self.meta_targets(['other/lib.rs']))
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-        self.write('Cargo.toml', PACKAGE_ONLY)
-        self.write('src/lib.rs', '#[path = "../ext/a.rs"]\nmod a;\n')
-        self.write('ext/a.rs', 'mod m;\n')
-        self.write('ext/m.rs', 'pub fn g() {}\n')
-        res = self.run_guard()
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-
-    def test_plain_load_of_a_path_loaded_file_keeps_the_plain_base_7310(self):
-        """F1: a.rs is loaded by `mod a;` (plain) and `#[path = "a.rs"]` (mod-rs); `mod gen;` needs src/a/gen.rs too."""
-        self.write('src/lib.rs', 'mod a;\n#[path = "a.rs"]\nmod b;\n')
-        self.write('src/a.rs', 'mod gen;\n')
-        self.write('src/gen.rs', 'pub fn g() {}\n')
-        res = self.run_guard()
-        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-        self.assertIn('src/a.rs:1', res.stdout)
-        self.assertIn('mod gen', res.stdout)
-
-    def test_path_key_in_a_cfg_predicate_adds_no_mod_rs_load_7310(self):
-        """F2: `path =` inside a cfg_attr predicate loads nothing; a.rs stays a plain module."""
-        self.write('src/lib.rs', 'mod a;\n#[cfg_attr(not(path = "a.rs"), allow(dead_code))]\nmod b;\n')
-        self.write('src/a.rs', 'mod gen;\n')
-        self.write('src/gen.rs', 'pub fn g() {}\n')
-        self.write('src/b.rs', 'pub fn g() {}\n')
-        res = self.run_guard()
-        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-        self.assertIn('src/a.rs:1', res.stdout)
-        self.assertIn('mod gen', res.stdout)
-
-    def test_modules_of_a_file_loaded_both_ways_pass_with_both_files_7310(self):
-        self.write('src/lib.rs', 'mod a;\n#[path = "a.rs"]\nmod b;\n')
-        self.write('src/a.rs', 'mod gen;\n')
-        self.write('src/gen.rs', 'pub fn g() {}\n')
-        self.write('src/a/gen.rs', 'pub fn g() {}\n')
-        res = self.run_guard()
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-
-    def test_path_loaded_sibling_only_still_passes_b2_7310(self):
-        """B2: a.rs loaded only through #[path] is mod-rs; the sibling src/gen.rs is the module."""
-        self.write('src/lib.rs', '#[path = "a.rs"]\nmod b;\n')
-        self.write('src/a.rs', 'mod gen;\n')
-        self.write('src/gen.rs', 'pub fn g() {}\n')
-        res = self.run_guard()
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-
-    def test_cfg_attr_second_argument_path_is_a_mod_rs_load_7310(self):
-        self.write('src/lib.rs', '#[cfg_attr(unix, path = "a.rs")]\nmod b;\n')
-        self.write('src/b.rs', 'pub fn g() {}\n')
-        self.write('src/a.rs', 'mod gen;\n')
-        self.write('src/gen.rs', 'pub fn g() {}\n')
-        res = self.run_guard()
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-
-    def test_nested_cfg_attr_path_is_a_mod_rs_load_7310(self):
-        """N: `cfg_attr(.., cfg_attr(.., path = ..))` loads a.rs mod-rs; the decoy beside it is not the module."""
-        for depth, attr in ((2, '#[cfg_attr(all(), cfg_attr(all(), path = "a.rs"))]'),
-                            (3, '#[cfg_attr(all(), cfg_attr(all(), cfg_attr(all(), path = "a.rs")))]')):
-            with self.subTest(depth=depth):
-                self.write('src/lib.rs', attr + '\nmod b;\n')
-                self.write('src/b.rs', 'pub fn g() {}\n')
-                self.write('src/a.rs', 'mod gen;\n')
-                self.write('src/a/gen.rs', 'pub fn g() {}\n')
-                res = self.run_guard()
-                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-                self.assertIn('src/a.rs:1', res.stdout)
-                self.assertIn('mod gen', res.stdout)
-                self.write('src/gen.rs', 'pub fn g() {}\n')
-                res = self.run_guard()
-                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-                (self.root / 'src' / 'gen.rs').unlink()
-
-    def test_nested_cfg_attr_predicate_path_adds_no_mod_rs_load_7310(self):
-        self.write('src/lib.rs', 'mod a;\n#[cfg_attr(all(), cfg_attr(not(path = "a.rs"), allow(dead_code)))]\nmod b;\n')
-        self.write('src/b.rs', 'pub fn g() {}\n')
-        self.write('src/a.rs', 'mod gen;\n')
-        self.write('src/gen.rs', 'pub fn g() {}\n')
-        res = self.run_guard()
-        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-        self.assertIn('src/a.rs:1', res.stdout)
-
-    def test_path_key_loads_at_every_cfg_attr_depth_7310(self):
-        module = load_guard_module()
-        loads = module.path_key_loads
-        cases = (
-            ('path = "a.rs"', True),
-            ('cfg_attr(unix, path = "a.rs")', True),
-            ('cfg_attr(unix, cfg_attr(unix, path = "a.rs"))', True),
-            ('cfg_attr(unix, cfg_attr(unix, cfg_attr(all(a, b), path = "a.rs")))', True),
-            ('cfg_attr(unix, allow(dead_code), cfg_attr(unix, path = "a.rs"))', True),
-            ('cfg_attr(not(path = "a.rs"), allow(dead_code))', False),
-            ('cfg_attr(unix, cfg_attr(not(path = "a.rs"), allow(dead_code)))', False),
-            ('cfg_attr(unix, allow(path = "a.rs"))', False),
-            ('cfg_attr(unix, doc(hidden), derive(path = "a.rs"))', False),
-            ('doc(path = "a.rs")', False),
-        )
-        for body, expected in cases:
-            with self.subTest(body=body):
-                self.assertEqual(loads(body, body.index('path =')), expected)
-
-    def test_path_in_an_inline_mod_resolves_under_the_inline_dir_7310(self):
-        """H1/H3: the loader sits under y/ (z/); the decoy beside the file is not what rustc loads."""
-        self.write('Cargo.toml', PACKAGE_ONLY + '[lib]\npath = "other/lib.rs"\n')
-        for source, loader, decoy in (('mod y { #[path = "x.rs"] mod m; }\n', 'other/y/x.rs', 'other/x.rs'),
-                                      ('mod y { mod z { #[path = "x.rs"] mod m; } }\n', 'other/y/z/x.rs',
-                                       'other/x.rs')):
-            with self.subTest(loader=loader):
-                self.write('other/lib.rs', source)
-                self.write(loader, self.LOADER)
-                self.write(decoy, 'pub fn g() {}\n')
-                res = self.run_guard(meta=self.meta_targets(['other/lib.rs']))
-                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-                self.assertIn(loader + ':1', res.stdout)
-                self.assertIn('candle-loader', res.stdout)
-
-    def test_clean_path_in_an_inline_mod_passes_7310(self):
-        """H2 (L-b): a correct `#[path]` inside an inline mod is not reported as unresolved."""
-        self.write('src/lib.rs', 'mod y { #[path = "x.rs"] mod m; }\n')
-        self.write('src/y/x.rs', 'pub fn g() {}\n')
-        res = self.run_guard()
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-        (self.root / 'src' / 'y' / 'x.rs').unlink()
-        res = self.run_guard()
-        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-        self.assertIn('does not resolve to a file', res.stdout)
-
-    def test_mod_declared_inside_a_macro_rules_body_fails_7310(self):
-        """M: a macro-emitted `mod $n;` is resolved where the macro is invoked; the guard cannot follow it."""
-        self.write('Cargo.toml', PACKAGE_ONLY + '[lib]\npath = "other/lib.rs"\n')
-        for body in ('macro_rules! m { ($n:ident) => { mod $n; }; }\nm!(gen);\n',
-                     'macro_rules! m { () => { mod gen; }; }\nm!();\n',
-                     'macro_rules! m ( ($n:ident) => ( pub mod $n; ); )\nm!(gen);\n'):
-            with self.subTest(body=body):
-                self.write('other/lib.rs', body)
-                self.write('other/gen.rs', self.LOADER)
-                res = self.run_guard(meta=self.meta_targets(['other/lib.rs']))
-                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-                self.assertIn('other/lib.rs:1', res.stdout)
-                self.assertIn('macro_rules! m', res.stdout)
-
-    def test_macro_rules_without_a_module_passes_7310(self):
-        self.write('src/lib.rs', 'macro_rules! m { () => { fn q() {} }; }\nm!();\nmod gen;\n')
-        self.write('src/gen.rs', 'pub fn g() {}\n')
-        res = self.run_guard()
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-
-    def symlink_module(self, link_rel, target_rel):
-        link = self.root / link_rel
-        link.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.symlink(target_rel, str(link))
-        except (OSError, NotImplementedError, AttributeError) as exc:
-            self.skipTest('symlinks unavailable: %s' % exc)
-
-    def test_symlinked_module_bases_come_from_the_logical_path_7310(self):
-        """S1: src/a.rs -> ../lib2/x.rs; rustc wants src/a/gen.rs, not the decoy beside the target."""
-        self.write('src/lib.rs', 'mod a;\n')
-        self.write('lib2/x.rs', 'mod gen;\n')
-        self.write('lib2/x/gen.rs', 'pub fn g() {}\n')
-        self.symlink_module('src/a.rs', '../lib2/x.rs')
-        res = self.run_guard()
-        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-        self.assertIn('src/a.rs:1', res.stdout)
-        self.assertIn('mod gen', res.stdout)
-        self.write('src/a/gen.rs', 'pub fn g() {}\n')
-        res = self.run_guard()
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-
-    def test_symlinked_module_is_scanned_under_its_logical_base_7310(self):
-        """S2: the loader sits at the logical base, in a crate outside SCAN_DIRS."""
-        self.write('Cargo.toml', PACKAGE_ONLY + '[lib]\npath = "other/lib.rs"\n')
-        self.write('other/lib.rs', 'mod a;\n')
-        self.write('lib2/x.rs', 'mod gen;\n')
-        self.write('lib2/x/gen.rs', 'pub fn g() {}\n')
-        self.write('other/a/gen.rs', self.LOADER)
-        self.symlink_module('other/a.rs', '../lib2/x.rs')
-        res = self.run_guard(meta=self.meta_targets(['other/lib.rs']))
-        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-        self.assertIn('other/a/gen.rs:1', res.stdout)
-        self.assertIn('candle-loader', res.stdout)
-
-    def other_crate(self, lib):
-        """A crate root at other/lib.rs (outside SCAN_DIRS), so only a followed load reaches a loader."""
-        self.write('Cargo.toml', PACKAGE_ONLY + '[lib]\npath = "other/lib.rs"\n')
-        self.write('other/lib.rs', lib)
-        return self.meta_targets(['other/lib.rs'])
-
-    def test_dotdot_after_a_symlinked_component_fails_7310(self):
-        """F1 (r5 regression): `link/../x.rs` is lib2/x.rs for the OS, other/x.rs for a textual fold."""
-        for lib in ('#[path = "link/../x.rs"]\nmod x;\n', 'include!("link/../x.rs");\n'):
-            with self.subTest(lib=lib):
-                meta = self.other_crate(lib)
-                self.write('other/x.rs', 'pub fn g() {}\n')
-                self.write('lib2/x.rs', self.LOADER)
-                self.write('lib2/inner/keep', '')
-                self.symlink_module('other/link', '../lib2/inner')
-                res = self.run_guard(meta=meta)
-                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-                self.assertIn("other/lib.rs:1: #[path]/include! target crosses a symlink with '..'", res.stdout)
-                (self.root / 'other' / 'link').unlink()
-
-    def test_dotdot_without_a_symlink_and_symlink_without_dotdot_pass_7310(self):
-        meta = self.other_crate('#[path = "sub/../x.rs"]\nmod x;\n')
-        self.write('other/x.rs', 'pub fn g() {}\n')
-        self.write('other/sub/keep', '')
-        res = self.run_guard(meta=meta)
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-        self.write('other/lib.rs', '#[path = "link/x.rs"]\nmod x;\n')
-        self.write('lib2/inner/x.rs', 'pub fn g() {}\n')
-        self.symlink_module('other/link', '../lib2/inner')
-        res = self.run_guard(meta=meta)
-        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
-
-    def test_crosses_symlink_dotdot_compares_the_os_and_the_folded_path_7310(self):
-        module = load_guard_module()
-        self.write('a/real/x.rs', 'pub fn g() {}\n')
-        self.write('a/real/sub/keep', '')
-        self.write('a/plain/keep', '')
-        self.write('a/x.rs', 'pub fn g() {}\n')
-        self.symlink_module('a/link', 'real/sub')
-        self.assertFalse(module.crosses_symlink_dotdot(self.root / 'a' / 'plain' / '..' / 'x.rs'))
-        self.assertFalse(module.crosses_symlink_dotdot(self.root / 'a' / 'link' / 'keep'))
-        self.assertFalse(module.crosses_symlink_dotdot(self.root / 'a' / 'link' / '..' / 'nothing.rs'))
-        self.assertTrue(module.crosses_symlink_dotdot(self.root / 'a' / 'link' / '..' / 'x.rs'))
-
-    def test_path_on_an_inline_mod_fails_7310(self):
-        """F2: `#[path = "d"] mod y { mod w; }` loads w from d/, not y/; the guard does not model it."""
-        for attr in ('#[path = "d"]', '#[cfg_attr(all(), path = "d")]', '#[allow(dead_code)] #[path = "d"] pub'):
-            with self.subTest(attr=attr):
-                meta = self.other_crate(attr + ' mod y { mod w; }\n')
-                self.write('other/y/w.rs', 'pub fn g() {}\n')
-                self.write('other/d/w.rs', self.LOADER)
-                self.write('other/lib/d', 'pub fn g() {}\n')
-                res = self.run_guard(meta=meta)
-                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-                self.assertIn('other/lib.rs:1: #[path] on an inline mod is not supported', res.stdout)
-                self.assertNotIn('does not resolve', res.stdout)
-
-    def test_clean_path_on_an_inline_mod_names_the_inline_rule_7310(self):
-        """F5: a clean `#[path = "d"] mod y { mod w; }` fails closed with the F2 message."""
-        meta = self.other_crate('#[path = "d"] mod y { mod w; }\n')
-        self.write('other/d/w.rs', 'pub fn g() {}\n')
-        res = self.run_guard(meta=meta)
-        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-        self.assertIn('#[path] on an inline mod is not supported', res.stdout)
-
-    def test_inline_mod_path_rule_has_no_false_positive_7310(self):
-        module = load_guard_module()
-        for source in ('#[cfg(all())] mod y { mod w; }\n', 'mod y { #[path = "x.rs"] mod m; }\n',
-                       '#[path = "x.rs"] mod m;\nmod y { fn f() {} }\n', '#[cfg(feature = "path")] mod y { }\n',
-                       '// #[path = "d"]\nmod y { }\n', 'fn f() { let s = "#[path = \\"d\\"]"; }\nmod y { }\n'):
-            with self.subTest(source=source):
-                self.assertEqual(module.inline_mod_path_keys(module.mask_rust(source)), [])
-        self.assertEqual([line for line, _ in module.inline_mod_path_keys(
-            module.mask_rust('fn a() {}\n#[path = "d"]\nmod y { }\n'))], [2])
-
-    def test_mod_keyword_as_macro_input_fails_7310(self):
-        """F3: `mod` handed to a macro as tokens emits a file module the guard never sees."""
-        for body in ('macro_rules! m { ($k:tt $n:ident) => { $k $n; } }\nm!(mod gen);\n',
-                     'macro_rules! m { ($($t:tt)*) => { $($t)* ; } }\nm!(mod gen);\n'):
-            with self.subTest(body=body):
-                meta = self.other_crate(body)
-                self.write('other/gen.rs', self.LOADER)
-                res = self.run_guard(meta=meta)
-                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
-                self.assertIn('other/lib.rs:2: mod keyword in a form the guard cannot follow', res.stdout)
-
-    def test_mod_keyword_rule_masked_text_and_identifiers_7310(self):
-        module = load_guard_module()
-        hits = module.mod_keyword_hits
-        masked = module.mask_rust
-        for quiet in ('mod gen;\n', 'pub mod a { }\n', 'mod r#type;\n', 'macro_rules! m { ($i:ident) => { mod $i; } }\n',
-                      'macro_rules! m { ($i:ident) => { mod $i { } } }\n', 'let r#mod = 1;\n', 'x::r#mod();\n',
-                      '$crate::mod_fn(1);\n', 'fn mod_fn() {}\n', 'let model = mod_a;\n', 'let s = "mod x y";\n',
-                      '// mod in a comment\n', '/* mod */\n', '/// mod gen\nfn f() {}\n', 'mod\n  gen\n;\n', 'mod $\n n;\n'):
-            with self.subTest(quiet=quiet):
-                self.assertEqual(hits(masked(quiet)), [])
-        for loud, line in (('m!(mod gen);\n', 1), ('fn f() {}\nm!(mod);\n', 2), ('m!(mod, gen);\n', 1),
-                           ('m!(mod $n:ident);\n', 1), ('macro_rules! m { ($k:tt) => { $k gen; } }\nm!(mod);\n', 2),
-                           ('mod 1x;\n', 1), ('mod {}\n', 1)):
-            with self.subTest(loud=loud):
-                self.assertEqual(hits(masked(loud)), [line])
 
     def test_cargo_timeout_is_a_tool_error_7310(self):
         """L-c: a hung cargo ends as ToolError (rc 2) naming the command, and both calls carry a timeout."""
@@ -1663,13 +1276,286 @@ class RuleFixtures7305To7312(GuardBase):
             r'|PthTensors|read_all_with_key)\b')
 
 
-METADATA_FAILING_STUB = """#!{python}
-import sys
-if 'metadata' in sys.argv:
-    sys.stderr.write('error: failed to load manifest\\n')
-    sys.exit(101)
-sys.stdout.write({out!r})
-"""
+class CompilerDepInfo7777R7(StubCargoCase):
+    """Review round 7 (3-agent vote 6def5ab6): rule (c) reachability comes from rustc dep-info.
+
+    The PATH cargo stub answers `cargo check --message-format=json` with one compiler-artifact
+    per declared target and writes the dep-info (.d) file each fixture lists. Every module-
+    resolution bypass of rounds 2 to 6 is now a file the compiler lists.
+    """
+
+    HIDDEN_ZIP = 'fn f() {\n    let _ = zip::ZipArchive::new;\n}\n'
+    HIDDEN_LOADER = 'fn f() {\n    Tensor::read_npz(p);\n}\n'
+
+    def write(self, rel, text):
+        target = self.root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding='utf-8')
+        return target
+
+    def lib_spec(self, deps, **target):
+        entry = {'kind': ['lib'], 'name': 'fixture', 'src': 'src/lib.rs', 'deps': deps}
+        entry.update(target)
+        return {'packages': [{'name': 'fixture', 'dir': str(self.root), 'member': True, 'targets': [entry]}]}
+
+    def run_dep(self, spec, **config):
+        return self.run_stub(out=GOOD_TREE_DEPTH, lock=LOCK_WITH_ZIP, spec=spec, **config)
+
+    def test_clean_tree_passes_and_runs_the_exact_check_command(self):
+        res = self.run_dep(self.lib_spec(['src/lib.rs']))
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn('check-zip-extract-unreachable: ok', res.stdout)
+        calls = [json.loads(line) for line in self.argv_log.read_text(encoding='utf-8').splitlines()]
+        checks = [argv for argv in calls if argv and argv[0] == 'check']
+        self.assertEqual(checks, [['check', '--workspace', '--all-targets', '--all-features', '--locked',
+                                   '--message-format=json']])
+
+    def test_file_listed_by_depinfo_outside_the_scan_dirs_is_scanned(self):
+        """Former resolver bypasses (cfg_attr path, #[path] on a mod-rs root, inner #![path], long attribute
+        look-back, mod inside macro input): the hidden file is whatever the compiler read. The path is
+        built with concat! so the literal rule cannot find it; only the dep-info list can."""
+        forms = (
+            ('cfg-attr-path', '#[cfg_attr(unix, path = concat!("../gen/", "h.rs"))]\nmod h;\n'),
+            ('path-on-mod-rs-root', '#[path = concat!("../gen/", "h.rs")]\nmod h;\n'),
+            ('inner-path-attribute', '#![path = concat!("../gen/", "h.rs")]\n'),
+            ('long-attribute-look-back',
+             '#[cfg_attr(unix, doc = "' + 'x' * 400 + '", path = concat!("../gen/", "h.rs"))]\nmod h;\n'),
+            ('mod-inside-macro-input', 'macro_rules! m { ($n:ident) => { mod $n; }; }\nm!(h);\n'),
+            ('no-hint-in-the-source', 'pub fn ok() {}\n'),
+        )
+        for name, lib in forms:
+            with self.subTest(form=name):
+                self.write('src/lib.rs', lib)
+                self.write('gen/h.rs', self.HIDDEN_ZIP)
+                res = self.run_dep(self.lib_spec(['src/lib.rs', 'gen/h.rs']))
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('violation: gen/h.rs:2', res.stdout)
+
+    def test_inline_table_target_file_listed_by_depinfo_is_scanned(self):
+        self.write('custom/lib.rs', 'mod sub;\n')
+        self.write('custom/sub.rs', self.HIDDEN_LOADER)
+        res = self.run_dep(self.lib_spec(['custom/lib.rs', 'custom/sub.rs'], src='custom/lib.rs'))
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('custom/sub.rs:2', res.stdout)
+
+    def test_symlink_alias_listed_by_depinfo_is_scanned(self):
+        self.write('elsewhere/real.rs', self.HIDDEN_ZIP)
+        (self.root / 'gen').mkdir()
+        os.symlink('../elsewhere/real.rs', str(self.root / 'gen' / 'alias.rs'))
+        res = self.run_dep(self.lib_spec(['src/lib.rs', 'gen/alias.rs']))
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('gen/alias.rs:2', res.stdout)
+
+    def test_missing_module_makes_cargo_check_fail_and_the_guard_exit_2(self):
+        """Former 'mod without a file' violation: now the compiler fails, so the guard cannot decide."""
+        self.write('src/lib.rs', 'mod gen;\n')
+        spec = self.lib_spec(['src/lib.rs'])
+        spec['check_rc'] = 1
+        spec['check_err'] = 'error[E0583]: file not found for module `gen`\n'
+        res = self.run_dep(spec)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn('cargo check failed rc=1', res.stderr)
+        self.assertNotIn('violation:', res.stdout)
+
+    def test_target_without_a_compiler_artifact_exits_2(self):
+        res = self.run_dep(self.lib_spec(['src/lib.rs'], artifact=False))
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn('built no target', res.stderr)
+        self.assertNotIn('violation:', res.stdout)
+
+    def test_missing_depinfo_file_exits_2(self):
+        res = self.run_dep(self.lib_spec(['src/lib.rs'], dfile=False))
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn('no dep-info file', res.stderr)
+
+    def test_malformed_or_empty_depinfo_exits_2(self):
+        for name, text in (('no-colon', 'src/lib.rs src/other.rs\n'), ('empty-rule', 'out.d:\n'), ('blank', '\n')):
+            with self.subTest(case=name):
+                res = self.run_dep(self.lib_spec([], dtext=text))
+                self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+                self.assertIn('dep-info', res.stderr)
+
+    def test_listed_rs_file_that_does_not_exist_exits_2(self):
+        res = self.run_dep(self.lib_spec(['src/lib.rs', 'gen/gone.rs']))
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn('does not exist', res.stderr)
+
+    def test_unreadable_listed_file_exits_2(self):
+        (self.root / 'gen').mkdir()
+        (self.root / 'gen' / 'bin.rs').write_bytes(b'\xff\xfe not utf8\n')
+        res = self.run_dep(self.lib_spec(['src/lib.rs', 'gen/bin.rs']))
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn('cannot read gen/bin.rs', res.stderr)
+
+    def test_makefile_escapes_in_listed_paths_are_read(self):
+        cases = (
+            ('space', 'gen/my\\ dir/a.rs', 'gen/my dir/a.rs'),
+            ('colon', 'gen/a\\:b.rs', 'gen/a:b.rs'),
+            ('backslash', 'gen/c\\\\d.rs', 'gen/c\\d.rs'),
+            ('dollar', 'gen/e$$f.rs', 'gen/e$f.rs'),
+            ('hash', 'gen/g\\#h.rs', 'gen/g#h.rs'),
+            ('space-and-colon', 'gen/i\\ j\\:k.rs', 'gen/i j:k.rs'),
+        )
+        for name, token, real in cases:
+            with self.subTest(escape=name):
+                self.write(real, self.HIDDEN_ZIP)
+                res = self.run_dep(self.lib_spec(['src/lib.rs', token]))
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn(real + ':2', res.stdout)
+
+    def test_depinfo_tokenizer_cases(self):
+        module = load_guard_module()
+        cases = (
+            ('out.d: a.rs b.rs', (['out.d', 'a.rs', 'b.rs'], 1)),
+            ('o\\ ut.d: a\\ b.rs', (['o ut.d', 'a b.rs'], 1)),
+            ('a\\:b.d: c\\:d.rs', (['a:b.d', 'c:d.rs'], 1)),
+            ('x.d: p\\\\q.rs $$z.rs', (['x.d', 'p\\q.rs', '$z.rs'], 1)),
+            ('src/a.rs:', (['src/a.rs'], 1)),
+            ('C:\\dir\\a.rs: b.rs', (['C:\\dir\\a.rs', 'b.rs'], 1)),
+            ('no colon here', (['no', 'colon', 'here'], None)),
+        )
+        for line, expected in cases:
+            with self.subTest(line=line):
+                self.assertEqual(module.depinfo_tokens(line), expected)
+
+    def test_registry_or_git_checkout_path_in_a_local_target_is_a_violation(self):
+        for token in ('/nonexistent/.cargo/registry/src/index.crates.io-abc/foo-1.0.0/src/lib.rs',
+                      '/nonexistent/.cargo/git/checkouts/foo-abc/123456/src/lib.rs'):
+            with self.subTest(token=token):
+                res = self.run_dep(self.lib_spec(['src/lib.rs', token]))
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('local target reads a cargo registry or git checkout source', res.stdout)
+
+    def test_generated_out_dir_file_is_scanned_as_rust(self):
+        out_dir = self.root / '.stub-target' / 'debug' / 'build' / 'fixture-h' / 'out'
+        out_dir.mkdir(parents=True)
+        (out_dir / 'gen.rs').write_text(self.HIDDEN_LOADER, encoding='utf-8')
+        (out_dir / 'gen.inc').write_text('fn f() { zip::read(); }\n', encoding='utf-8')
+        (out_dir / 'blob.bin').write_bytes(b'\xff\xfe\x00\x01')
+        for token, hit in (('{tgt}/debug/build/fixture-h/out/gen.rs', 'gen.rs:2'),
+                           ('{tgt}/debug/build/fixture-h/out/gen.inc', 'gen.inc:1')):
+            with self.subTest(token=token):
+                res = self.run_dep(self.lib_spec(['src/lib.rs', token]))
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn(hit, res.stdout)
+        res = self.run_dep(self.lib_spec(['src/lib.rs', '{tgt}/debug/build/fixture-h/out/blob.bin']))
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_build_script_dep_info_is_found_beside_the_build_script_output(self):
+        self.write('build.rs', 'fn main() {}\n')
+        self.write('gen/b.rs', self.HIDDEN_LOADER)
+        spec = self.lib_spec(['src/lib.rs'])
+        spec['packages'][0]['targets'].append(
+            {'kind': ['custom-build'], 'name': 'build-script-build', 'src': 'build.rs',
+             'deps': ['build.rs', 'gen/b.rs']})
+        res = self.run_dep(spec)
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('gen/b.rs:2', res.stdout)
+
+    def test_non_member_package_needs_artifacts_for_buildable_targets_only(self):
+        self.write('vendor/dep/src/lib.rs', 'pub fn d() {}\n')
+        self.write('vendor/dep/tests/t.rs', 'fn t() {}\n')
+        self.write('vendor/dep/Cargo.toml', PACKAGE_ONLY)
+        dep_targets = [
+            {'kind': ['lib'], 'name': 'dep', 'src': 'src/lib.rs', 'deps': ['vendor/dep/src/lib.rs']},
+            {'kind': ['test'], 'name': 't', 'src': 'tests/t.rs', 'artifact': False, 'deps': []}]
+        spec = self.lib_spec(['src/lib.rs'])
+        spec['packages'].append({'name': 'dep', 'dir': str(self.root / 'vendor' / 'dep'), 'member': False,
+                                 'targets': dep_targets})
+        res = self.run_dep(spec)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        dep_targets[0]['artifact'] = False
+        spec['packages'][1]['targets'] = dep_targets
+        res = self.run_dep(spec)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn('built no target', res.stderr)
+
+    def test_member_test_target_without_an_artifact_exits_2(self):
+        self.write('tests/t.rs', 'fn t() {}\n')
+        spec = self.lib_spec(['src/lib.rs'])
+        spec['packages'][0]['targets'].append(
+            {'kind': ['test'], 'name': 't', 'src': 'tests/t.rs', 'artifact': False, 'deps': []})
+        res = self.run_dep(spec)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+
+    def test_text_scan_still_covers_files_the_compiler_did_not_list(self):
+        """A cfg'd-out file inside src/ is not in dep-info; the directory-wide scan still reads it."""
+        self.write('src/cfgd.rs', self.HIDDEN_LOADER)
+        res = self.run_dep(self.lib_spec(['src/lib.rs']))
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('src/cfgd.rs:2', res.stdout)
+
+    def test_literal_rule_follows_rs_literals_in_attributes_and_includes(self):
+        self.write('gen/via.rs', self.HIDDEN_ZIP)
+        forms = (
+            '#[path = "../gen/via.rs"]\nmod m;\n',
+            '#![cfg_attr(unix, path = "../gen/via.rs")]\n',
+            'include!("../gen/via.rs");\n',
+            'const S: &str = include_str!("../gen/via.rs");\n',
+            'const S: &[u8] = include_bytes!("../gen/via.rs");\n',
+        )
+        for lib in forms:
+            with self.subTest(lib=lib):
+                self.write('src/lib.rs', lib)
+                res = self.run_dep(self.lib_spec(['src/lib.rs']))
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('gen/via.rs:2', res.stdout)
+
+    def test_literal_rule_resolves_against_the_package_root_too(self):
+        self.write('gen/via.rs', self.HIDDEN_ZIP)
+        self.write('src/lib.rs', '#[path = "gen/via.rs"]\nmod m;\n')
+        res = self.run_dep(self.lib_spec(['src/lib.rs']))
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+
+    def test_unresolved_or_non_rs_literals_are_not_violations(self):
+        forms = (
+            '#[path = "nope.rs"]\nmod m;\n',
+            'include!("nope.rs");\n',
+            'include!(concat!(env!("OUT_DIR"), "/g.rs"));\n',
+            'const S: &str = include_str!("../data/readme.txt");\n',
+            '#[doc = "see other.rs"]\npub fn f() {}\n',
+        )
+        for lib in forms:
+            with self.subTest(lib=lib):
+                self.write('src/lib.rs', lib)
+                res = self.run_dep(self.lib_spec(['src/lib.rs']))
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_literal_in_a_string_or_comment_outside_an_attribute_is_ignored(self):
+        self.write('gen/via.rs', self.HIDDEN_ZIP)
+        self.write('src/lib.rs', 'fn f() { let _ = "../gen/via.rs"; } // include!("../gen/via.rs")\n')
+        res = self.run_dep(self.lib_spec(['src/lib.rs']))
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_file_mode_skips_the_compiler_step(self):
+        """The test-input flags never call cargo check (CI never passes them)."""
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_check_timeout_is_its_own_tool_error(self):
+        module = load_guard_module()
+        seen = []
+
+        def hang(argv, **kwargs):
+            seen.append((argv[1], kwargs.get('timeout')))
+            raise subprocess.TimeoutExpired(argv, kwargs.get('timeout'))
+
+        real = module.subprocess.run
+        module.subprocess.run = hang
+        try:
+            with self.assertRaises(module.ToolError) as caught:
+                module.cargo_check_output(self.root)
+        finally:
+            module.subprocess.run = real
+        self.assertIn('timed out', str(caught.exception))
+        self.assertEqual(seen, [('check', 3600)])
+        self.assertGreater(module.CHECK_TIMEOUT_SECS, module.CARGO_TIMEOUT_SECS)
+
+    def test_non_json_check_output_line_exits_2(self):
+        module = load_guard_module()
+        with self.assertRaises(module.ToolError):
+            module.artifact_messages('{"reason": "compiler-artifact"\n')
+        self.assertEqual(module.artifact_messages('Compiling x\n{"reason":"build-finished"}\n'), [])
 
 
 class CargoMetadata7305(StubCargoCase):
@@ -1691,18 +1577,7 @@ class CargoMetadata7305(StubCargoCase):
         self.assertNotIn('--offline', argv)
 
     def test_cargo_metadata_failure_exits_2_7305(self):
-        stub_dir = self.root.parent / (self.root.name + '.bin')
-        stub_dir.mkdir()
-        self.addCleanup(shutil.rmtree, str(stub_dir), True)
-        stub = stub_dir / 'cargo'
-        stub.write_text(METADATA_FAILING_STUB.format(python=sys.executable, out=GOOD_TREE_DEPTH),
-                        encoding='utf-8')
-        stub.chmod(0o755)
-        (self.root / 'Cargo.lock').write_text(LOCK_WITH_ZIP, encoding='utf-8')
-        env = dict(os.environ)
-        env['PATH'] = str(stub_dir) + os.pathsep + env.get('PATH', '')
-        res = subprocess.run([sys.executable, str(GUARD), '--root', str(self.root)],
-                             capture_output=True, text=True, check=False, env=env)
+        res = self.run_stub(out=GOOD_TREE_DEPTH, lock=LOCK_WITH_ZIP, metadata_fail=True)
         self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
 
 

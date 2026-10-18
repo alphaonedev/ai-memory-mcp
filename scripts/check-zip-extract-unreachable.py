@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Guard for the cargo-audit ignores RUSTSEC-2026-0367, -0368 and -0369 (#7301).
+r"""Guard for the cargo-audit ignores RUSTSEC-2026-0367, -0368 and -0369 (#7301).
 
 zip 7.2.0 reaches the build only through candle-core 0.10.x. The three
 advisories need zip's `extract()` / `ZipStreamReader::extract()` path, which
@@ -22,17 +22,53 @@ This guard fails (exit 1) when any of these holds:
       [dependencies], [dev-dependencies], [build-dependencies], any
       [target.<cfg>.*] table, [workspace.dependencies], [dependencies.zip],
       top-level dotted keys, or a rename with `package = "zip"`;
-  (c) src/, tests/, benches/, examples/, build.rs, the declared build script
-      or any declared target path use zip directly, name zip in macro input,
-      call a candle npy / npz / pth loader (the only candle code that opens a
-      zip archive, also when a `paste!` `[< .. >]` group joins its name from
-      pieces; #7307), or pull in other files with `#[path]` / `include!` (those
-      files are followed and scanned; an unresolvable one is a violation);
-      a local zip binding exempts a macro input only inside its own fn body
-      (#7308); a `mod name;` that resolves to no file on disk is a violation
-      because only a build step could create it, and build scripts are also
-      scanned with their string bodies kept, so a loader call written out of a
-      string literal is seen (#7310);
+  (c) a Rust source file the build can reach uses zip directly, names zip in
+      macro input, calls a candle npy / npz / pth loader (the only candle
+      code that opens a zip archive, also when a `paste!` `[< .. >]` group
+      joins its name from pieces; #7307), or calls `.extract(` / names
+      `extract_unwrapped_root_dir` as described below. A local zip binding
+      exempts a macro input only inside its own fn body (#7308), and build
+      scripts are scanned with their string bodies kept, so a loader call
+      written out of a string literal is seen (#7310). Which files are
+      reachable is decided by the compiler, not by this script (review round
+      7; 3-agent vote 6def5ab6, 3-0):
+        1. the text scan: every `.rs` under src/, tests/, benches/, examples/,
+           build.rs, the declared build script and every declared target
+           path, whatever the compiler built (this covers cfg'd-out files in
+           those directories);
+        2. the compiler list: `cargo check --workspace --all-targets
+           --all-features --locked --message-format=json`. Every
+           `compiler-artifact` message of a local package (a `cargo metadata`
+           package with no source) names a first output file; the rustc
+           dep-info file of that target sits beside it
+           (`<target_dir>/<profile>/deps/<stem>.d`, with a leading `lib`
+           dropped from the output file stem; a build script's is
+           `<target_dir>/<profile>/build/<pkg>-<hash>/build_script_build-<hash>.d`)
+           and lists every source file rustc read for that target. Each `.rs`
+           file in it, and every UTF-8 file it lists under the cargo target
+           directory (OUT_DIR output), is added to the scan and goes through
+           the same content rules. Makefile escaping is read (`\ ` space,
+           `\:` colon, `\\` backslash, `\#` hash, `$$` dollar); relative
+           paths resolve against the repository root (cargo's cwd). A file of
+           a local target that sits in a cargo registry or git checkout is a
+           violation (a local target reading a registry source directly).
+           `--all-features` is used because it builds every `required-features`
+           target and measured seconds warm;
+        3. one bounded literal rule: a string literal ending in `.rs` inside
+           an attribute (`#[..]`, `#![..]`) or inside `include!` /
+           `include_str!` / `include_bytes!` input (any literal for
+           `include!`) resolves against the directory of the file that holds
+           it and against the root of the package; a file it names that is
+           not yet scanned is scanned. A literal that resolves to nothing is
+           not a violation: the compiler decides.
+      The compiler step fails closed with exit 2 (no `violation:` line) when
+      cargo check exits non-zero, a workspace-member target of `cargo
+      metadata` (or a library, proc-macro or build-script target of any other
+      local package) has no compiler-artifact message, a dep-info file is
+      missing, unreadable or lists nothing, a listed `.rs` file does not
+      exist, or a file to scan is unreadable or not UTF-8. dep-info reflects
+      one cfg / feature / target-triple combination; the text scan (point 1)
+      and the literal rule (point 3) cover the other cfgs;
   (d) every local package `cargo metadata --locked --format-version 1` lists
       (a path dependency or an implicit workspace member, not only the root)
       is scanned by rule (c) (#7305).
@@ -42,7 +78,9 @@ line, or any scanned file is unreadable or not UTF-8, the guard exits 2.
 If zip is absent from the graph and from Cargo.lock it exits 0 with a
 "zip not in graph" message: the guard and the ignores are then to be removed.
 The Cargo.toml reader is tomllib on Python 3.11+, else a built-in line reader
-(--manifest-parser forces one).
+(--manifest-parser forces one). `--cargo-tree-file` / `--cargo-metadata-file`
+are test inputs for the content rules: with either, the cargo check step is
+skipped (CI never passes them).
 
 Exit codes: 0 pass, 1 violation, 2 usage or tool error.
 
@@ -142,10 +180,9 @@ FN_KEYWORD = re.compile(r'\bfn\b')
 MACRO_ZIP = re.compile(r'(?<![\w.:])zip\b(?!\s*(?:\(|::))')
 MACRO_OPEN = re.compile(r'\b([A-Za-z_]\w*)\s*!\s*([(\[{])')
 # Matched on the masked text (comments and string bodies blanked), so a quoted
-# `#[path = ..]` in test code is not mistaken for an attribute; the literal is
-# then read from the raw text at the same offset.
+# attribute in test code is not mistaken for one; literals are then read from the
+# raw text at the same offsets.
 ATTR_OPEN = re.compile(r'#\s*!?\[')
-PATH_KEY = re.compile(r'\bpath\s*=')
 
 
 def attribute_bodies(masked):
@@ -161,44 +198,6 @@ def attribute_bodies(masked):
                 depth -= 1
             index += 1
         yield opening.end(), masked[opening.end():index - 1 if depth == 0 else index]
-
-
-def path_key_loads(body, position):
-    """True when the `path =` key at `position` of an attribute body loads a module file.
-
-    Only `#[path = ..]` and the arguments after the first one of `#[cfg_attr(<predicate>, .., path = ..)]`
-    do, at any `cfg_attr(.., cfg_attr(.., path = ..))` nesting depth (N). A `path =` inside a predicate
-    or another attribute's arguments loads nothing, so it must not count as a #[path] load (F2).
-    """
-    head = body[:position]
-    if not head.strip():
-        return True
-    opened = re.match(r'\s*cfg_attr\s*\(', head)
-    if not opened:
-        return False
-    depth = 1
-    last_comma = -1
-    for index in range(opened.end(), len(head)):
-        char = head[index]
-        if char in '([{':
-            depth += 1
-        elif char in ')]}':
-            depth -= 1
-            if depth < 1:
-                return False
-        elif char == ',' and depth == 1:
-            last_comma = index
-    if last_comma < 0:
-        return False
-    tail = head[last_comma + 1:]
-    if not tail.strip():
-        return depth == 1
-    # The key sits in a nested attribute of the argument list: `cfg_attr(.., cfg_attr(.., path = ..))`.
-    return path_key_loads(body[last_comma + 1:], position - (last_comma + 1))
-PATH_LITERAL = re.compile(r'\s*"([^"]+)"')
-INCLUDE_ANY = re.compile(r'\binclude\s*!\s*[(\[{]')
-INCLUDE_LITERAL = re.compile(r'\binclude\s*!\s*\(\s*"([^"]+)"\s*\)')
-CLOSERS = {'(': ')', '[': ']', '{': '}'}
 
 
 def escape_text(text):
@@ -697,76 +696,6 @@ def seed_sources(root, manifest_text, targets=()):
     return seeds
 
 
-def lexical(path):
-    """`..` and `.` folded away textually; symlinks are NOT resolved (rustc resolves from this path, S)."""
-    return Path(os.path.normpath(str(path)))
-
-
-def real_of(path):
-    return Path(os.path.realpath(str(path)))
-
-
-def logical_path(root, path):
-    """The path as rustc sees it. One outside the repository (an absolute `cargo metadata` path) is
-    anchored on the real parent directory only, so the file's own name is kept."""
-    path = lexical(path)
-    try:
-        path.relative_to(root)
-        return path
-    except ValueError:
-        return lexical(real_of(path.parent) / path.name)
-
-
-SYMLINK_DOTDOT = "crosses a symlink with '..'"
-
-
-def target_joins(source, value, is_path_attr, inline=()):
-    """The UNFOLDED joins a #[path] / include! value can name from `source` (the logical path of the file).
-
-    rustc: a `#[path]` is relative to the directory of the file, plus the names of the enclosing
-    inline `mod y { .. }` blocks (H); in a plain `name.rs` file those sit under `name/`, so both
-    bases are candidates. Over-listing is the fail-closed direction.
-    """
-    if not is_path_attr:
-        return [source.parent / value]
-    sub = Path(*inline) if inline else Path()
-    return [base / sub / value for base in (source.parent, source.parent / source.stem)]
-
-
-def target_candidates(source, value, is_path_attr, inline=()):
-    """The joins of `target_joins`, with `.` and `..` folded away textually."""
-    return [lexical(join) for join in target_joins(source, value, is_path_attr, inline)]
-
-
-def crosses_symlink_dotdot(join):
-    """True when the OS resolves `join` (a `..` after a symlinked component walks out of the link
-    target) to a different file than the textual fold of it (F1, r5 regression)."""
-    if '..' not in join.parts:
-        return False
-    folded = lexical(join)
-    if not (join.is_file() or folded.is_file()):
-        return False
-    return os.path.realpath(str(join)) != os.path.realpath(str(folded))
-
-
-def resolve_target(root, source, value, is_path_attr, inline=()):
-    """Resolve a #[path] / include! target; returns ([logical paths of the existing files], problem or None)."""
-    for join in target_joins(source, value, is_path_attr, inline):
-        if crosses_symlink_dotdot(join):
-            return [], SYMLINK_DOTDOT
-    found = []
-    for candidate in target_candidates(source, value, is_path_attr, inline):
-        if candidate.is_file():
-            try:
-                real_of(candidate).relative_to(root)
-            except ValueError:
-                return [], 'target %s is outside the repository' % value
-            found.append(candidate)
-    if not found:
-        return [], 'target %s does not resolve to a file' % value
-    return found, None
-
-
 PASTE_GROUP = re.compile(r'\[<(.*?)>\]', re.DOTALL)
 PASTE_MODIFIER = re.compile(r':(?:lower|upper|snake|camel|lower_camel|upper_camel)\b')
 # The candle-loader names of FORBIDDEN with underscores removed and lowercased, without the
@@ -774,41 +703,6 @@ PASTE_MODIFIER = re.compile(r':(?:lower|upper|snake|camel|lower_camel|upper_came
 # prefix them (`[<try_ read_npz>]`). Built from the same LOADER_NAMES tuple, so the two
 # lists cannot drift (N5, L3).
 PASTE_LOADER_NORMAL = re.compile(loader_alternation(True) + r'\b')
-MOD_DECL = re.compile(r'(?<![\w])mod\s+(?:r#)?([A-Za-z_]\w*)\s*;')
-MACRO_RULES = re.compile(r'\bmacro_rules\s*!\s*(?:r#)?([A-Za-z_]\w*)\s*(?=[(\[{])')
-MACRO_MOD = re.compile(r'(?<![\w$])mod\s+(?:r#)?\$?\s*[A-Za-z_]\w*\s*;')
-INLINE_MOD_OR_BRACE = re.compile(r'\bmod\s+(?:r#)?([A-Za-z_]\w*)\s*\{|[{}]')
-INLINE_MOD_OPEN = re.compile(r'\bmod\s+(?:r#)?[A-Za-z_]\w*\s*\{')
-# The `mod` keyword in any form but `mod name;` / `mod name {` / `mod $name;` (F3): handed to a
-# macro as input tokens it emits a file module the guard never sees. `r#mod` and `$mod` are not it.
-MOD_KEYWORD_OTHER = re.compile(r'(?<![\w$#])mod\b(?!\s*(?:r#)?\$?\s*[A-Za-z_]\w*\s*[;{])')
-
-
-def mod_keyword_hits(masked):
-    """Line numbers of a `mod` keyword the guard cannot follow (F3); masked text, so strings and comments are out."""
-    return sorted({masked.count('\n', 0, hit.start()) + 1 for hit in MOD_KEYWORD_OTHER.finditer(masked)})
-
-
-def inline_mod_path_keys(masked):
-    """(line, offset of the `path` key) for each `#[path = ..]` / `cfg_attr(.., path = ..)` ON an inline `mod y { .. }` (F2).
-
-    Such a key moves the directory of the child `mod` loads of `y`, which the guard does not model, so it
-    is a violation (fail closed) instead of an unscanned directory.
-    """
-    hits = []
-    for opener in INLINE_MOD_OPEN.finditer(masked):
-        window_start = max(0, opener.start() - 300)
-        window = masked[window_start:opener.start()]
-        cut = max(window.rfind(sep) for sep in ';{}') + 1
-        before = window[cut:]
-        for offset, body in attribute_bodies(before):
-            for key in PATH_KEY.finditer(body):
-                if path_key_loads(body, key.start()):
-                    absolute = window_start + cut + offset + key.start()
-                    hits.append((masked.count('\n', 0, absolute) + 1, absolute))
-    return hits
-
-
 def paste_loader_hits(text, masked):
     """Line numbers where a `paste!` `[< .. >]` group joins to a candle loader name (#7307)."""
     lines = set()
@@ -821,182 +715,110 @@ def paste_loader_hits(text, masked):
     return sorted(lines)
 
 
-def enclosing_inline_mods(masked, pos):
-    """Names of the inline `mod x { .. }` blocks that enclose `pos`, outermost first."""
-    stack = []
-    for token in INLINE_MOD_OR_BRACE.finditer(masked, 0, pos):
-        if token.group(0) == '}':
-            if stack:
-                stack.pop()
-        else:
-            stack.append(token.group(1))
-    return [name for name in stack if name]
-
-
-MODE_RS = 'mod-rs'
-MODE_PLAIN = 'plain'
-
-
-def module_decls(masked):
-    """(line, name, sub) for each `mod name;` that is not an unconditional #[path] module (#7310).
-
-    `sub` is the directory of the enclosing inline `mod x { .. }` blocks.
-    """
-    decls = []
-    for decl in MOD_DECL.finditer(masked):
-        before = masked[max(0, decl.start() - 300):decl.start()]
-        before = re.split(r'[;{}]', before)[-1]
-        if re.search(r'#\s*\[\s*path\s*=', before):
-            # An UNCONDITIONAL #[path] module: followed (or flagged) by the path-attribute scan.
-            # A cfg_attr(<cond>, path = ..) module is not exempt: when the condition is false
-            # cargo loads the default file, which a build step could generate (#7310).
-            continue
-        inline = enclosing_inline_mods(masked, decl.start())
-        decls.append((masked.count('\n', 0, decl.start()) + 1, decl.group(1), Path(*inline) if inline else Path()))
-    return decls
-
-
-def module_candidates(base, sub, name):
-    return (base / sub / (name + '.rs'), base / sub / name / 'mod.rs')
-
-
-def load_base(path, mode):
-    """rustc: a mod-rs load looks for `mod x;` beside the file, a plain load in a directory named after it."""
-    return path.parent if mode == MODE_RS else path.parent / path.stem
-
-
-def existing_candidates(path, decls, bases):
-    """Logical paths of the module files `mod x;` can resolve to (bases come from the logical path, S)."""
-    found = []
-    for _line, name, sub in decls:
-        for base in bases:
-            for candidate in module_candidates(base, sub, name):
-                if candidate.is_file():
-                    found.append(lexical(candidate))
-    return found
-
-
-def propagate_modes(files, roots, path_targets):
-    """Modes in which each file is loaded, to a fixpoint (F, #7310).
-
-    rustc decides the base per LOAD, not per file: crate roots, `#[path]` targets and `mod.rs`
-    files are loaded mod-rs; a `name.rs` found for `mod name;` is a plain load. One file can be
-    loaded in both modes (`mod a;` plus `#[path = "a.rs"] mod b;`), and its modules must resolve
-    under the base of every mode. Walk order is arbitrary, hence the iteration.
-    """
-    modes = {}
-    for path, _rel, _decls in files:
-        if path in roots or path in path_targets or path.name == 'mod.rs':
-            modes[path] = {MODE_RS}
-    changed = True
-    while changed:
-        changed = False
-        for path, _rel, decls in files:
-            for mode in tuple(modes.get(path, (MODE_PLAIN,))):
-                for _line, name, sub in decls:
-                    for candidate in module_candidates(load_base(path, mode), sub, name):
-                        if not candidate.is_file():
-                            continue
-                        logical = lexical(candidate)
-                        child = MODE_RS if logical.name == 'mod.rs' else MODE_PLAIN
-                        if child not in modes.setdefault(logical, set()):
-                            modes[logical].add(child)
-                            changed = True
-    return modes
-
-
-def missing_mod_hits(path, decls, modes):
-    """(line, name) for each `mod name;` with no file under the base of some mode the file is loaded in (#7310)."""
-    hits = []
-    for line, name, sub in decls:
-        for mode in sorted(modes.get(path, (MODE_PLAIN,))):
-            if not any(c.is_file() for c in module_candidates(load_base(path, mode), sub, name)):
-                hits.append((line, name))
-                break
-    return hits
-
-
 def build_script_paths(root, manifest_text, targets=()):
     names = (list(SCAN_FILES) + manifest_source_paths(manifest_text, builds_only=True)
              + [str(t) for t, is_build in targets if is_build])
     return {Path(os.path.realpath(str(root / name))) for name in names}
 
 
-def crate_roots(root, manifest_text, targets=()):
-    """Files cargo treats as crate roots: `mod x;` beside them is `x.rs`, not `<stem>/x.rs`."""
-    found = {root / 'src' / 'lib.rs', root / 'src' / 'main.rs', root / 'build.rs'}
-    for declared in list(manifest_source_paths(manifest_text)) + [str(t) for t, _build in targets]:
-        found.add(root / declared)
-    for directory in ('src/bin', 'tests', 'benches', 'examples'):
-        base = root / directory
-        if base.is_dir():
-            found.update(base.glob('*.rs'))
-            found.update(base.glob('*/main.rs'))
-    return {logical_path(root, p) for p in found}
+def real_of(path):
+    return Path(os.path.realpath(str(path)))
 
 
-def macro_mod_hits(masked):
-    """(line, macro name) for each `mod x;` / `mod $x;` inside a `macro_rules!` body (M).
-
-    The module file is looked up where the macro is INVOKED, which the guard cannot follow, so
-    such a declaration is a violation (fail closed) instead of an invisible, unscanned module.
-    """
-    hits = []
-    for macro in MACRO_RULES.finditer(masked):
-        opening = macro.end()
-        closing = match_close(masked, opening)
-        for decl in MACRO_MOD.finditer(masked, opening, closing):
-            hits.append((masked.count('\n', 0, decl.start()) + 1, macro.group(1)))
-    return hits
+# Rule (c) literal rule (r7): the only file reference the guard follows itself. A string
+# literal ending in `.rs` inside an attribute, and a literal inside include! / include_str! /
+# include_bytes! input (any literal for include!, `.rs` ones for the other two), resolves
+# against the directory of the file that holds it and against the package root. The compiler
+# list (dep-info) covers everything else; a literal that resolves to nothing is not a violation.
+RS_SUFFIX = '.rs'
+RS_STRING = re.compile(r'"([^"\\\n]+)"')
+INCLUDE_MACRO = re.compile(r'\b(include(?:_str|_bytes)?)\s*!\s*[(\[{]')
 
 
-class SourceFile(object):
-    """One scanned file (by realpath) and what it references; each logical path it is reached by is a view."""
-
-    def __init__(self, real, rel, decls, refs):
-        self.real = real
-        self.rel = rel
-        self.decls = decls
-        self.refs = refs
-        self.views = set()
-
-
-def source_refs(text, masked):
-    """(kind, line, value or None, inline mods, loads) for each #[path] attribute and include! (H, N)."""
-    refs = []
-    on_inline_mod = {absolute for _line, absolute in inline_mod_path_keys(masked)}
+def rs_literals(text, masked):
+    """Literal values the bounded rule follows; structure from the masked text, values from the raw text."""
+    values = []
     for offset, body in attribute_bodies(masked):
-        for key in PATH_KEY.finditer(body):
-            if offset + key.start() in on_inline_mod:
-                continue  # reported as a whole by `inline_mod_path_keys`; its value is a directory, not a file
-            number = masked.count('\n', 0, offset + key.start()) + 1
-            literal = PATH_LITERAL.match(text, offset + key.end())
-            inline = tuple(enclosing_inline_mods(masked, offset + key.start()))
-            refs.append(('path', number, literal.group(1) if literal else None, inline,
-                         path_key_loads(body, key.start())))
-    for include in INCLUDE_ANY.finditer(masked):
-        number = masked.count('\n', 0, include.start()) + 1
-        literal = INCLUDE_LITERAL.match(text, include.start())
-        refs.append(('include', number, literal.group(1) if literal else None, (), False))
-    return refs
+        for literal in RS_STRING.finditer(text, offset, offset + len(body)):
+            if literal.group(1).endswith(RS_SUFFIX):
+                values.append(literal.group(1))
+    for macro in INCLUDE_MACRO.finditer(masked):
+        close = match_close(masked, macro.end() - 1)
+        for literal in RS_STRING.finditer(text, macro.end(), close):
+            if macro.group(1) == 'include' or literal.group(1).endswith(RS_SUFFIX):
+                values.append(literal.group(1))
+    return values
 
 
-def check_sources(root, manifest_text='', label='', targets=()):
-    """`targets`: (src_path, is_build_script) from `cargo metadata`; covers every TOML form of a target (#7310).
+class Scan(object):
+    """State of one guard run: the files scanned (by realpath, one scan each) and the violations."""
 
-    Bases for `mod x;` and `#[path]` come from the LOGICAL path (symlinks unresolved, S); the realpath
-    only keys the seen-set and the escape check.
+    def __init__(self):
+        self.seen = set()
+        self.problems = []
+
+    def report(self, text):
+        if text not in self.problems:
+            self.problems.append(text)
+
+
+def scan_files(scan, pkg_root, label, files, builds):
+    """Run the content rules on `files` and on the `.rs` files their literals name (the literal rule).
+
+    `pkg_root` anchors labels and the second literal base; `builds` holds the realpaths of build
+    scripts, which are scanned with their string bodies kept (#7310). A path that is not a file is skipped.
+    """
+    pkg_root = real_of(pkg_root)
+    queue = list(files)
+    while queue:
+        path = Path(queue.pop(0))
+        real = real_of(path)
+        if real in scan.seen or not real.is_file():
+            continue
+        scan.seen.add(real)
+        rel = label + show_path(path, real, pkg_root)
+        text = read_source(real, rel)
+        # Code patterns run on the masked text: comments and string bodies are
+        # not code, so a doc comment naming `zip::ZipArchive` is not a use.
+        masked = mask_rust(text)
+        zip_context = bool(ZIP_CONTEXT.search(ZIP_CALL.sub(' ', masked)))
+        # A build script can write generated code out of a string literal, so its
+        # string bodies are scanned too (#7310); comments stay masked.
+        code = mask_rust(text, keep_strings=True) if real in builds else masked
+        for number, line in enumerate(code.split('\n'), 1):
+            where = '%s:%d' % (rel, number)
+            for rule, pattern in FORBIDDEN:
+                if pattern.search(line):
+                    scan.report(violation(where, rule))
+            if zip_context and EXTRACT_CALL.search(line):
+                scan.report(violation(where, 'zip-flavoured extract call'))
+        for number in macro_input_hits(text, masked):
+            scan.report(violation('%s:%d' % (rel, number), 'zip named in macro input'))
+        for number in paste_loader_hits(text, masked):
+            scan.report(violation('%s:%d' % (rel, number), 'candle-loader (paste! pieces)'))
+        for value in rs_literals(text, masked):
+            queue.append(path.parent / value)
+            queue.append(pkg_root / value)
+
+
+def show_path(path, real, pkg_root):
+    """The path relative to the package root when it sits under it, else the path as given."""
+    for candidate in (path, real):
+        try:
+            return candidate.relative_to(pkg_root).as_posix()
+        except ValueError:
+            continue
+    return str(path)
+
+
+def check_sources(scan, root, manifest_text='', label='', targets=(), builds=None):
+    """Rule (c) text scan of one package: its source directories, build script and declared targets.
+
+    `targets`: (src_path, is_build_script) from `cargo metadata`; covers every TOML form of a target (#7310).
     """
     root = real_of(root)
-    builds = build_script_paths(root, manifest_text, targets)
-    problems = []
-
-    def report(text):
-        if text not in problems:
-            problems.append(text)
-
-    queue = [logical_path(root, p) for p in seed_sources(root, manifest_text, targets)]
-    roots = crate_roots(root, manifest_text, targets)
+    if builds is None:
+        builds = build_script_paths(root, manifest_text, targets)
     for declared in list(manifest_source_paths(manifest_text)) + [str(t) for t, _build in targets]:
         target = real_of(root / declared)
         if not target.is_file():
@@ -1004,99 +826,15 @@ def check_sources(root, manifest_text='', label='', targets=()):
                 shown = label + target.relative_to(root).as_posix()
             except ValueError:
                 shown = label + declared
-            report(violation(shown, 'declared target has no file on disk; a build step could generate it'))
-    seen = {}
-    mod_files = []
-    path_targets = set()
+            scan.report(violation(shown, 'declared target has no file on disk; a build step could generate it'))
+    scan_files(scan, root, label, seed_sources(root, manifest_text, targets), builds)
 
-    def show(logical):
-        try:
-            return label + logical.relative_to(root).as_posix()
-        except ValueError:
-            return label + str(logical)
 
-    def expand(logical, info):
-        """Queue what `info` references, resolved from the logical path `logical`."""
-        rel = show(logical)
-        for kind, number, value, inline, loads in info.refs:
-            where = '%s:%d' % (rel, number)
-            if value is None:
-                what = '#[path] with a non-literal value' if kind == 'path' else 'include! with a non-literal path'
-                report(violation(where, what + ' cannot be followed'))
-                continue
-            found, problem = resolve_target(root, logical, value, kind == 'path', inline)
-            if problem == SYMLINK_DOTDOT:
-                report(violation(where, '#[path]/include! target ' + problem))
-                continue
-            if problem:
-                report(violation(where, ('#[path] ' if kind == 'path' else 'include! ') + problem))
-                continue
-            # Scanned whatever the attribute. Only a real load makes it a mod-rs file: a `path =`
-            # inside a cfg predicate loads nothing and adds no exemption (F2).
-            if loads:
-                path_targets.update(found)
-            queue.extend(found)
-        # Every module file `mod x;` can resolve to is scanned, wherever it sits (E): over-scanning
-        # both bases is the fail-closed direction.
-        queue.extend(existing_candidates(logical, info.decls, (logical.parent, logical.parent / logical.stem)))
-        mod_files.append((logical, rel, info.decls))
-
-    while queue:
-        logical = queue.pop(0)
-        if not logical.is_file():
-            continue
-        path = real_of(logical)
-        known = seen.get(path)
-        if known is not None:
-            if logical not in known.views:
-                known.views.add(logical)
-                expand(logical, known)
-            continue
-        rel = show(logical)
-        try:
-            path.relative_to(root)
-        except ValueError:
-            seen[path] = SourceFile(path, rel, [], [])
-            report(violation(str(path), 'source outside the repository'))
-            continue
-        text = read_source(path, rel)
-        # Code patterns run on the masked text: comments and string bodies are
-        # not code, so a doc comment naming `zip::ZipArchive` is not a use.
-        masked = mask_rust(text)
-        zip_context = bool(ZIP_CONTEXT.search(ZIP_CALL.sub(' ', masked)))
-        # A build script can write generated code out of a string literal, so its
-        # string bodies are scanned too (#7310); comments stay masked.
-        scan = mask_rust(text, keep_strings=True) if path in builds else masked
-        for number, line in enumerate(scan.split('\n'), 1):
-            where = '%s:%d' % (rel, number)
-            for rule, pattern in FORBIDDEN:
-                if pattern.search(line):
-                    report(violation(where, rule))
-            if zip_context and EXTRACT_CALL.search(line):
-                report(violation(where, 'zip-flavoured extract call'))
-        for number, macro in macro_mod_hits(masked):
-            report(violation('%s:%d' % (rel, number),
-                             'mod declared inside macro_rules! %s resolves where the macro is invoked and cannot be '
-                             'followed' % macro))
-        for number, _absolute in inline_mod_path_keys(masked):
-            report(violation('%s:%d' % (rel, number), '#[path] on an inline mod is not supported'))
-        for number in mod_keyword_hits(masked):
-            report(violation('%s:%d' % (rel, number), 'mod keyword in a form the guard cannot follow'))
-        for number in macro_input_hits(text, masked):
-            report(violation('%s:%d' % (rel, number), 'zip named in macro input'))
-        for number in paste_loader_hits(text, masked):
-            report(violation('%s:%d' % (rel, number), 'candle-loader (paste! pieces)'))
-        info = SourceFile(path, rel, module_decls(masked), source_refs(text, masked))
-        info.views.add(logical)
-        seen[path] = info
-        expand(logical, info)
-    # After the walk: every file's load modes, whatever the visit order.
-    modes = propagate_modes(mod_files, roots, path_targets)
-    for logical, rel, decls in mod_files:
-        for number, name in missing_mod_hits(logical, decls, modes):
-            report(violation(
-                '%s:%d' % (rel, number), 'mod %s; resolves to no file on disk (a build step could generate it)' % name))
-    return problems
+def package_label(directory, root, name):
+    try:
+        return directory.relative_to(root).as_posix() + '/'
+    except ValueError:
+        return name + '/'
 
 
 def metadata_packages(metadata_text, root):
@@ -1135,20 +873,217 @@ def root_targets(metadata_text, root):
     return []
 
 
-def check_local_packages(metadata_text, root):
+def check_local_packages(scan, metadata_text, root):
     """Rule (c) over every local package other than the root: path dependencies and implicit members."""
     root = Path(os.path.realpath(str(root)))
-    problems = []
     for name, directory, targets, is_root in metadata_packages(metadata_text, root):
         if is_root:
             continue
-        try:
-            label = directory.relative_to(root).as_posix() + '/'
-        except ValueError:
-            label = name + '/'
+        label = package_label(directory, root, name)
         manifest = directory / 'Cargo.toml'
-        problems += check_sources(directory, read_source(manifest, label + 'Cargo.toml'), label, targets)
-    return problems
+        check_sources(scan, directory, read_source(manifest, label + 'Cargo.toml'), label, targets)
+
+
+# Rule (c), compiler-derived file list (review round 7; 3-agent vote 6def5ab6, 3-0).
+# `cargo check --message-format=json` prints one `compiler-artifact` message per built
+# target; rustc wrote a dep-info (Makefile-format) file beside its first output file, listing
+# every source file it read for that target.
+BUILDABLE_KINDS = frozenset({'lib', 'rlib', 'dylib', 'cdylib', 'staticlib', 'proc-macro', 'custom-build'})
+BUILD_SCRIPT_DEPINFO = 'build_script_build-*.d'
+REGISTRY_MARKERS = (('registry', 'src'), ('git', 'checkouts'))
+
+
+def artifact_messages(stdout):
+    """The `compiler-artifact` messages of `cargo check --message-format=json` output."""
+    found = []
+    for number, line in enumerate(stdout.splitlines(), 1):
+        if not line.startswith('{'):
+            continue
+        try:
+            message = json.loads(line)
+        except ValueError as exc:
+            raise ToolError('cargo check output line %d is not JSON: %s' % (number, exc))
+        if isinstance(message, dict) and message.get('reason') == 'compiler-artifact':
+            found.append(message)
+    return found
+
+
+def depinfo_tokens(line):
+    """(tokens, number of tokens before the rule colon) of one dep-info line; None when it has no rule colon.
+
+    Makefile escapes: `\\ ` space, `\\:` colon, `\\\\` backslash, `\\#` hash, `$$` dollar. A colon
+    that ends the target is an unescaped one followed by blank or end of line.
+    """
+    tokens, current, started, colon_at, index = [], [], False, None, 0
+    while index < len(line):
+        char = line[index]
+        following = line[index + 1:index + 2]
+        if char == '\\' and following and following in ' :\\#':
+            current.append(following)
+            started = True
+            index += 2
+            continue
+        if char == '$' and following == '$':
+            current.append('$')
+            started = True
+            index += 2
+            continue
+        if char in ' \t' or (char == ':' and (not following or following in ' \t')):
+            if started:
+                tokens.append(''.join(current))
+                current, started = [], False
+            if char == ':' and colon_at is None:
+                colon_at = len(tokens)
+            index += 1
+            continue
+        current.append(char)
+        started = True
+        index += 1
+    if started:
+        tokens.append(''.join(current))
+    return tokens, colon_at
+
+
+def depinfo_sources(dfile):
+    """Source paths a dep-info file lists (rule prerequisites of every rule line); unreadable or empty is a tool error."""
+    try:
+        text = Path(dfile).read_text(encoding='utf-8')
+    except (OSError, ValueError) as exc:
+        raise ToolError('cannot read dep-info %s: %s' % (dfile, exc))
+    sources = []
+    for raw in text.splitlines():
+        if not raw.strip() or raw.startswith('#'):
+            continue
+        tokens, colon_at = depinfo_tokens(raw)
+        if colon_at is None:
+            raise ToolError('dep-info %s has a line without a rule colon' % dfile)
+        for token in tokens[colon_at:]:
+            if token not in sources:
+                sources.append(token)
+    if not sources:
+        raise ToolError('dep-info %s lists no source file' % dfile)
+    return sources
+
+
+def depinfo_files(outputs, kinds):
+    """The dep-info file(s) beside the first output file of an artifact.
+
+    `<dir>/lib<name>-<hash>.rmeta` has `<dir>/<name>-<hash>.d`; a binary or example output has
+    `<stem>.d`; a build script output `build/<pkg>-<hash>/build-script-build` has
+    `build_script_build-<hash>.d` in the same directory.
+    """
+    if not outputs:
+        raise ToolError('compiler-artifact message without an output file')
+    first = Path(str(outputs[0]))
+    names = [first.stem + '.d']
+    if first.stem.startswith('lib'):
+        names.append(first.stem[3:] + '.d')
+    for name in names:
+        if (first.parent / name).is_file():
+            return [first.parent / name]
+    if 'custom-build' in kinds:
+        found = sorted(first.parent.glob(BUILD_SCRIPT_DEPINFO))
+        if found:
+            return found
+    raise ToolError('no dep-info file beside %s' % first)
+
+
+def resolve_listed(token, root, pkg_dir):
+    """Absolute path of a listed source: relative paths are relative to the workspace root (cargo's cwd)."""
+    path = Path(token)
+    if path.is_absolute():
+        return path
+    for base in (root, pkg_dir):
+        if (base / path).exists():
+            return base / path
+    return root / path
+
+
+def in_registry(path):
+    parts = path.parts
+    return any(parts[i:i + 2] == pair for pair in REGISTRY_MARKERS for i in range(len(parts) - 1))
+
+
+def parse_compiler_metadata(metadata_text):
+    """(target directory or None, workspace member ids, {package id: (name, directory, [(src, kinds)])}) of local packages."""
+    try:
+        document = json.loads(metadata_text)
+        target_dir = document.get('target_directory')
+        members = set(document.get('workspace_members') or [])
+        local = {}
+        for package in document['packages']:
+            if package.get('source') is not None:
+                continue
+            targets = [(str(t['src_path']), tuple(t.get('kind') or ())) for t in package['targets']]
+            local[package['id']] = (str(package.get('name', '?')), Path(package['manifest_path']).parent, targets)
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise ToolError('cannot parse cargo metadata output: %s' % exc)
+    return (real_of(target_dir) if target_dir else None), members, local
+
+
+def check_compiler_files(scan, metadata_text, root, check_stdout):
+    """Scan every source file rustc read for a local target, from the `cargo check` JSON output (rule (c) point 2).
+
+    Tool errors (exit 2): a target of a workspace member (or a dependency-buildable target of another
+    local package) without a compiler-artifact message, a missing or unreadable dep-info file, a listed
+    `.rs` file that is missing. A local target reading a registry or git checkout source is a violation.
+    """
+    root = real_of(root)
+    target_dir, members, local = parse_compiler_metadata(metadata_text)
+    got = set()
+    listed = {}
+    for message in artifact_messages(check_stdout):
+        try:
+            package_id = message['package_id']
+            source = str(message['target']['src_path'])
+            kinds = tuple(message['target'].get('kind') or ())
+            outputs = message['filenames']
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise ToolError('malformed compiler-artifact message: %s' % exc)
+        if package_id not in local:
+            continue
+        got.add((package_id, source))
+        files = listed.setdefault(package_id, [])
+        for dfile in depinfo_files(outputs, kinds):
+            for token in depinfo_sources(dfile):
+                path = resolve_listed(token, root, local[package_id][1])
+                if path not in files:
+                    files.append(path)
+    for package_id, (name, _directory, targets) in local.items():
+        for source, kinds in targets:
+            required = package_id in members or any(kind in BUILDABLE_KINDS for kind in kinds)
+            if required and (package_id, source) not in got:
+                raise ToolError('cargo check built no target for %s of package %s' % (source, name))
+    builds = {real_of(source) for _n, _d, targets in local.values() for source, kinds in targets
+              if 'custom-build' in kinds}
+    for package_id, files in listed.items():
+        name, directory, _targets = local[package_id]
+        directory = real_of(directory)
+        label = '' if directory == root else package_label(directory, root, name)
+        to_scan = []
+        for path in files:
+            shown = label + show_path(path, real_of(path), directory)
+            if in_registry(path):
+                scan.report(violation(shown, 'local target reads a cargo registry or git checkout source directly'))
+                continue
+            real = real_of(path)
+            under_target = target_dir is not None and (real == target_dir or target_dir in real.parents)
+            if path.suffix == RS_SUFFIX:
+                if not real.is_file():
+                    raise ToolError('dep-info lists %s, which does not exist' % path)
+                to_scan.append(path)
+            elif under_target and real.is_file() and is_text_file(real):
+                to_scan.append(path)
+        scan_files(scan, directory, label, to_scan, builds)
+
+
+def is_text_file(path):
+    """True when the file decodes as UTF-8; a generated binary is not Rust source."""
+    try:
+        path.read_text(encoding='utf-8')
+        return True
+    except (OSError, ValueError):
+        return False
 
 
 NO_MATCH = 'did not match any packages'
@@ -1165,17 +1100,20 @@ def lock_has_zip(root):
 
 
 CARGO_TIMEOUT_SECS = 600
+# A cold `cargo check` of the whole workspace measured above 10 minutes on the review host
+# (the tree and metadata calls stay at 600 s), so the compiler step has its own limit.
+CHECK_TIMEOUT_SECS = 3600
 
 
-def run_cargo(args, root):
+def run_cargo(args, root, timeout=CARGO_TIMEOUT_SECS):
     """Run cargo with a timeout; a hang or a missing binary is a tool error (rc 2), never a pass (L-c)."""
     command = 'cargo ' + ' '.join(args)
     try:
         return subprocess.run(
             ['cargo', *args], cwd=str(root), capture_output=True, text=True, check=False,
-            timeout=CARGO_TIMEOUT_SECS)
+            timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise ToolError('`%s` timed out after %d s' % (command, CARGO_TIMEOUT_SECS))
+        raise ToolError('`%s` timed out after %d s' % (command, timeout))
     except OSError as exc:
         raise ToolError('cannot run cargo: %s' % exc)
 
@@ -1199,6 +1137,21 @@ def cargo_metadata_output(root):
     result = run_cargo(CARGO_METADATA_ARGS, root)
     if result.returncode != 0:
         raise ToolError('cargo metadata failed rc=%d: %s' % (result.returncode, result.stderr.strip()[-400:]))
+    return result.stdout
+
+
+# --all-features: every `required-features` target is built (the CI leg's default feature set
+# would leave them unbuilt), and it measured seconds warm. --all-targets builds tests, benches
+# and examples; --locked keeps Cargo.lock authoritative.
+CARGO_CHECK_ARGS = ('check', '--workspace', '--all-targets', '--all-features', '--locked',
+                    '--message-format=json')
+
+
+def cargo_check_output(root):
+    """Run the compiler step; a non-zero exit is a tool error (rc 2), never a pass."""
+    result = run_cargo(CARGO_CHECK_ARGS, root, CHECK_TIMEOUT_SECS)
+    if result.returncode != 0:
+        raise ToolError('cargo check failed rc=%d: %s' % (result.returncode, result.stderr.strip()[-400:]))
     return result.stdout
 
 
@@ -1243,9 +1196,14 @@ def main(argv=None):
         else:
             metadata_text = cargo_metadata_output(root)
         manifest_text = read_source(root / 'Cargo.toml', 'Cargo.toml')
-        problems = (tree_problems + check_manifest(manifest_text, args.manifest_parser)
-                    + check_sources(root, manifest_text, '', root_targets(metadata_text, root))
-                    + check_local_packages(metadata_text, root))
+        scan = Scan()
+        check_sources(scan, root, manifest_text, '', root_targets(metadata_text, root))
+        check_local_packages(scan, metadata_text, root)
+        if not (args.cargo_tree_file or args.cargo_metadata_file):
+            # The input files are for the content-rule tests; CI never passes them, so it always
+            # runs the compiler step.
+            check_compiler_files(scan, metadata_text, root, cargo_check_output(root))
+        problems = tree_problems + check_manifest(manifest_text, args.manifest_parser) + scan.problems
     except (OSError, ValueError, ToolError) as exc:
         print('error: %s' % escape_text(exc), file=sys.stderr)
         return EXIT_USAGE
