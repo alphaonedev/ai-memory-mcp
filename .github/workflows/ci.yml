@@ -144,6 +144,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # #7160 - size cap for the persistent self-hosted target/debug build state
+  # (40 GiB); scripts/ci-sweep-target.py reads it via the sweep step below.
+  SELF_HOSTED_TARGET_CAP_BYTES: 42949672960
   # #3128 — EXPLICIT, not inherited. `Swatinem/rust-cache` is what used to export
   # CARGO_INCREMENTAL=0, and it is now skipped on the self-hosted fleet (see the
   # rust-cache guards below), so the value must be declared here. Incremental
@@ -232,6 +235,11 @@ jobs:
         run: python3 scripts/test/test_workflow_concurrency_6340.py
       - name: Shard partition and wiring unit tests (#6344)
         run: python3 -m unittest discover -s scripts/ci/tests
+      # #7160 - scripts/test/ is outside the discovery root above; run the
+      # sweep script tests (including the Linux-only O_PATH test, which this
+      # ubuntu-latest job is where it executes) and the sweep workflow pin.
+      - name: Target sweep unit tests (#7160)
+        run: python3 -m unittest scripts/test/test_ci_sweep_target.py scripts/test/test_workflow_sweep_7160.py
       - id: cls
         shell: bash
         env:
@@ -2009,6 +2017,26 @@ jobs:
         env:
           RUNNER_NAME_ARG: ${{ runner.name }}
         run: python3 scripts/ci/prune_runner_artifacts.py --work-root "$RUNNER_WORKSPACE/.." --workspace "$GITHUB_WORKSPACE" --protected-root "$AI_MEMORY_CI_TARGET_ROOT" --evict-root "$AI_MEMORY_CI_TARGET_ROOT" --runner-name "$RUNNER_NAME_ARG"
+
+      # #7160 - cap the persistent self-hosted target/debug (oldest-mtime
+      # first). Last steps so they never race a running build. Two shapes,
+      # exactly one runs per self-hosted leg: legs that build in the workspace
+      # sweep the workspace `target`; the shared_target leg (#7188) builds into
+      # its own per-runner CARGO_TARGET_DIR outside the workspace, so it sweeps
+      # that one directory (never the whole cache root holding the sibling
+      # runners' targets) with --allow-root --within <cache root>: the script
+      # resolves both paths and requires the target strictly inside the root
+      # (the root may be a symlink to another disk, as on f2; #7297 S11). The
+      # prune step above never touches that directory, so this is its only cap.
+      # --lock takes <root>/.evict.lock (the flock of the idle-target eviction)
+      # for the sweep, waits at most 20 s and then skips with one warning and exit 0.
+      - name: Sweep target/debug to the size cap (self-hosted)
+        if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted' && !matrix.shared_target
+        run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
+
+      - name: Sweep per-runner cargo target to the size cap (self-hosted, #7160)
+        if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted' && matrix.shared_target
+        run: python3 scripts/ci-sweep-target.py --target "${CARGO_TARGET_DIR:?per-runner cargo target not set}" --allow-root --within "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}" --lock "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}/.evict.lock" --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
 
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
   #
