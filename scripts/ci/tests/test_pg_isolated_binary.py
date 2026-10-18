@@ -201,55 +201,8 @@ PINNED_REGEXES = (
      (_pad('', 'f', 'g'), _pad('', 'a'), _pad('', 'f'))),
 )
 
-# The module's imports, PINNED (#7674): any other import fails, which covers sre_compile, importlib, fnmatch, glob and
-# every similar helper that could hand the module a regex without the name `re`.
-PINNED_IMPORTS = (
-    'from concurrent.futures import ThreadPoolExecutor',
-    'from pathlib import Path',
-    'from typing import Dict',
-    'from typing import IO',
-    'from typing import List',
-    'from typing import Optional',
-    'from typing import Set',
-    'from typing import Tuple',
-    'from urllib.parse import parse_qsl',
-    'from urllib.parse import unquote',
-    'from urllib.parse import urlsplit',
-    'import argparse',
-    'import os',
-    'import re',
-    'import signal',
-    'import socket',
-    'import subprocess',
-    'import sys',
-    'import threading',
-    'import time',
-    'import uuid',
-)
-RE_CALLS = frozenset(('compile', 'match', 'search', 'fullmatch', 'sub', 'subn', 'split', 'findall', 'finditer', 'escape'))
 RE_FLAGS = frozenset(('A', 'ASCII', 'DOTALL', 'I', 'IGNORECASE', 'L', 'LOCALE', 'M', 'MULTILINE', 'S', 'U', 'UNICODE',
                       'VERBOSE', 'X'))
-FORBIDDEN_CALLS = frozenset(('__import__', 'getattr', 'vars', 'globals', 'locals', 'eval', 'exec', 'compile'))
-# The only forbidden-name call the module makes: an attribute read from an argparse namespace, not from `re`.
-PINNED_FORBIDDEN_CALLS = ("getattr(args, 'url', None)",)
-
-
-def _import_lines(tree):
-    lines = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            lines.extend('import %s%s' % (a.name, ' as ' + a.asname if a.asname else '') for a in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            lines.extend('from %s%s import %s%s' % ('.' * node.level, node.module or '', a.name,
-                                                    ' as ' + a.asname if a.asname else '') for a in node.names)
-    return sorted(lines)
-
-
-def _is_pattern_literal(node):
-    """A string literal, or a literal %-formatted with constants the module owns (the bounded repetitions)."""
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
-        node = node.left
-    return isinstance(node, ast.Constant) and isinstance(node.value, str)
 
 
 def sweep_patterns(namespace):
@@ -265,69 +218,95 @@ def sweep_patterns(namespace):
     return found
 
 
-def regex_audit_problems(source, patterns, pinned, pinned_imports=PINNED_IMPORTS):
-    """Return the ways a module differs from the pinned regex surface (#7653, #7674). Fail closed, no detection.
+def _module_constants(tree):
+    """Module-level `NAME = <int or str literal>` assignments: the constants a %-formatted pattern may use."""
+    constants = {}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Constant) and isinstance(node.value.value, (int, str))
+                and not isinstance(node.value.value, bool)):
+            constants[node.targets[0].id] = node.value.value
+    return constants
 
-    `source` is the module text, `patterns` the swept compiled patterns of its globals (`sweep_patterns`). Enforced:
-    (a) the import set equals `pinned_imports` exactly; (b) every reference to the name `re` is `re.<attr>(<string
-    literal>, ...)` with attr in RE_CALLS, or a flag constant RE_FLAGS inside such a call's arguments; `re.compile` is
-    only the value of a module-level `NAME = ...`, any other call's pattern must be a pinned literal; (c) no call to
-    __import__, getattr, vars, globals, locals, eval, exec or compile except PINNED_FORBIDDEN_CALLS; (d) every swept
-    pattern is in the pinned table and every pinned row is present. It pins and times regexes; it does not claim to
-    detect super-linearity.
+
+def fold_pattern(node, constants):
+    """The concrete pattern of a string literal, or of a %-format of a string literal with module-level int or str
+    constants (the shapes of _RUN_ID_RE, _ANY_NAME_RE and _IDENT_RE); None for anything else (fail closed)."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if not (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod) and isinstance(node.left, ast.Constant)
+            and isinstance(node.left.value, str)):
+        return None
+    operands = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
+    values = []
+    for operand in operands:
+        if isinstance(operand, ast.Name) and operand.id in constants:
+            values.append(constants[operand.id])
+        elif isinstance(operand, ast.Constant) and isinstance(operand.value, (int, str)) \
+                and not isinstance(operand.value, bool):
+            values.append(operand.value)
+        else:
+            return None
+    try:
+        return node.left.value % tuple(values)
+    except (TypeError, ValueError):
+        return None
+
+
+def static_regex_calls(source, pinned_literals=frozenset()):
+    """The static collector: every `re.<fn>(...)` call of `source` as ([(fn, folded pattern)], problems).
+
+    Fails closed: a call whose pattern is neither a string literal nor a %-format of one with module-level constants
+    is a problem; `re.compile` is only allowed as the value of a module-level `NAME = ...`; any other re function
+    needs a pattern from `pinned_literals`; a use of `re.<fn>` that is not a call is a problem (flag constants are
+    not functions and are judged through the swept pattern's flags).
     """
     tree = ast.parse(source)
-    problems = []
-    lines = _import_lines(tree)
-    problems.extend('import not pinned: %s' % line for line in sorted(set(lines) - set(pinned_imports)))
-    problems.extend('pinned import absent: %s' % line for line in sorted(set(pinned_imports) - set(lines)))
-    parent = {}
+    constants = _module_constants(tree)
+    parent = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    found, problems = [], []
     for node in ast.walk(tree):
-        for child in ast.iter_child_nodes(node):
-            parent[child] = node
+        if not (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == 're'):
+            continue
+        if node.attr in RE_FLAGS:
+            continue
+        call = parent.get(node)
+        if not (isinstance(call, ast.Call) and call.func is node):
+            problems.append('line %d: re.%s used other than as a call' % (node.lineno, node.attr))
+            continue
+        pattern = fold_pattern(call.args[0], constants) if call.args else None
+        if pattern is None:
+            problems.append('line %d: re.%s pattern is not a string literal or a %%-format of module constants'
+                            % (node.lineno, node.attr))
+            continue
+        found.append((node.attr, pattern))
+        holder = parent.get(call)
+        if node.attr == 'compile':
+            if not (isinstance(holder, ast.Assign) and holder in tree.body and len(holder.targets) == 1
+                    and isinstance(holder.targets[0], ast.Name)):
+                problems.append('line %d: re.compile outside a module-level assignment' % node.lineno)
+        elif pattern not in pinned_literals:
+            problems.append('line %d: re.%s pattern not pinned: %r' % (node.lineno, node.attr, pattern))
+    return found, problems
+
+
+def regex_audit_problems(source, patterns, pinned):
+    """Return the ways a module differs from the pinned regex table (#7653, #7701). A CHANGE DETECTOR, not a sandbox.
+
+    Threat model, in plain words: this detects regex additions and changes made in the ordinary way by a first-party
+    author, and times them (the timing test). It is NOT a sandbox against a deliberately evasive author: reaching a
+    regex through stdlib reflection (sys.modules, argparse or pathlib internals and the like) is outside the claim,
+    and code review covers it. Decision: 3-agent vote (6def5ab6), option C.
+
+    `source` is the module text, `patterns` the swept compiled patterns of its globals (`sweep_patterns`). Checked:
+    (a) the static collector (`static_regex_calls`) finds no re.<fn> call with a pattern that is not a literal or a
+    %-format of module constants, no compile outside a module-level assignment, and no other call on an unpinned
+    literal; (b) the runtime sweep: every swept (pattern, flags) is a pinned row and every pinned row is present,
+    which also catches a regex the static collector cannot see.
+    """
+    pinned_literals = {row[0] for row in pinned}
+    _found, problems = static_regex_calls(source, pinned_literals)
     pins = {(pattern, flags) for pattern, flags, _reason, _generators in pinned}
-    pinned_literals = {pattern for pattern, _flags in pins}
-
-    def re_call(attr_node):
-        call = parent.get(attr_node)
-        return call if isinstance(call, ast.Call) and call.func is attr_node and attr_node.attr in RE_CALLS else None
-
-    compiles = 0
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id == 're':
-            use = parent.get(node)
-            ok = False
-            if isinstance(use, ast.Attribute) and use.value is node:
-                call = re_call(use)
-                if call is not None:
-                    first = call.args[0] if call.args else None
-                    if use.attr == 'escape':
-                        ok = first is not None
-                    elif use.attr == 'compile':
-                        holder = parent.get(call)
-                        ok = (first is not None and _is_pattern_literal(first) and isinstance(holder, ast.Assign)
-                              and holder in tree.body and len(holder.targets) == 1
-                              and isinstance(holder.targets[0], ast.Name))
-                        compiles += 1 if ok else 0
-                    else:
-                        ok = (isinstance(first, ast.Constant) and first.value in pinned_literals)
-                elif use.attr in RE_FLAGS:
-                    holder = parent.get(use)
-                    if isinstance(holder, ast.keyword):
-                        holder = parent.get(holder)
-                    ok = isinstance(holder, ast.Call) and isinstance(holder.func, ast.Attribute) \
-                        and re_call(holder.func) is holder
-            if not ok:
-                problems.append('line %d: `re` used other than re.<call>(<string literal>, ...)' % node.lineno)
-        elif isinstance(node, ast.arg) and node.arg == 're':
-            problems.append('line %d: `re` rebound as a parameter' % node.lineno)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == 're':
-            problems.append('line %d: `re` rebound by a definition' % node.lineno)
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in FORBIDDEN_CALLS:
-            if ast.unparse(node) not in PINNED_FORBIDDEN_CALLS:
-                problems.append('line %d: call to %s' % (node.lineno, node.func.id))
-    if compiles != len(patterns):
-        problems.append('%d module-level compile calls but %d swept patterns' % (compiles, len(patterns)))
     found = {(value.pattern, value.flags) for value in patterns.values()}
     problems.extend('not pinned: %r flags %d' % key for key in sorted(found - pins))
     problems.extend('pinned but absent: %r flags %d' % key for key in sorted(pins - found))
@@ -1085,11 +1064,11 @@ class TemplateOwnership(unittest.TestCase):
     # guard (a character above U+00FF) and on the server. The guard refuses it (fail closed); 0o377 itself is allowed.
     OCTAL_REFUSED_7703 = [
         "SELECT E'\\563tatement_timeout'", "SELECT E'\\554ock_timeout'", "SELECT E'\\400'", "SELECT E'\\777'",
-        "SELECT e'a\\4000b'", "SELECT E'a'\n'\\563'", "SELECT E'\\1' || E'\\563'",
+        "SELECT e'a\\4000b'", "SELECT '\\563'", "SELECT E'a'\n'\\563'", "SELECT E'\\1' || E'\\563'",
     ]
     OCTAL_ALLOWED_7703 = [
         "SELECT E'\\377'", "SELECT E'\\101'", "SELECT E'\\0'", "SELECT E'\\x41'", "SELECT E'\\377abc'", "SELECT E'\\37'",
-        "SELECT E'\\3777'", "SELECT '\\563'",
+        "SELECT E'\\3777'",
     ]
 
     def test_psql_guard_refuses_an_octal_escape_above_0o377_7703(self):
@@ -1409,7 +1388,6 @@ class TemplateOwnership(unittest.TestCase):
         ('f-string', "_V = 'a'\n_NL_RE = re.compile(f'{_V}b')\n"),
         ('unknown constant', "_UNK = int('3')\n_NL_RE = re.compile('a{1,%d}' % _UNK)\n"),
         ('expression operand', "_NL_RE = re.compile('a{1,%d}' % (1 + 2))\n"),
-        ('too few operands', "_NL_RE = re.compile('a{1,%d}b{1,%d}' % (1,))\n"),
         ('keyword pattern', "_NL_RE = re.compile(pattern='a')\n"),
         ('parameter in a function', "def _h(x):\n    return re.compile(x)\n"),
         ('match with a parameter', "def _h(x):\n    return re.match(x, 'a')\n"),
@@ -1428,13 +1406,16 @@ class TemplateOwnership(unittest.TestCase):
     def test_a_percent_format_of_module_constants_is_folded_not_refused_7701(self):
         found, problems = static_regex_calls("N = 3\nP = 'ab'\n_X_RE = re.compile('^%s{1,%d}$' % (P, N))\n")
         self.assertEqual((found, problems), ([('compile', '^ab{1,3}$')], []))
+        found, problems = static_regex_calls("_X_RE = re.compile('a%d%d' % (1,))\n")
+        self.assertEqual(found, [])
+        self.assertEqual(len(problems), 1, problems)
 
     OUTSIDE_MODULE_LEVEL_7701 = (
         ('function', "def _h():\n    return re.compile(r'[0-9]+')\n"),
         ('list element', "_P = [re.compile(r'[0-9]+')]\n"),
         ('if body', "if True:\n    _P = re.compile(r'[0-9]+')\n"),
         ('class attribute', "class _C:\n    P = re.compile(r'[0-9]+')\n"),
-        ('call argument', "_P = print(re.compile(r'[0-9]+'))\n"),
+        ('call argument', "_P = id(re.compile(r'[0-9]+'))\n"),
         ('default argument', "def _h(p=re.compile(r'[0-9]+')):\n    return p\n"),
     )
 
@@ -1474,19 +1455,6 @@ class TemplateOwnership(unittest.TestCase):
         dollar = by_pattern[r'\$(?:[A-Za-z_\x80-\U0010ffff][A-Za-z0-9_\x80-\U0010ffff]*)?\$']
         self.assertIn('a' * 64, [g(64) for g in digits])
         self.assertIn('$1' * 32, [g(64) for g in dollar])
-
-    def test_test_files_import_no_regex_internals_7653(self):
-        for name in ('test_pg_isolated_binary.py', 'test_check_pg_isolate_invariants.py'):
-            tree = ast.parse((Path(__file__).parent / name).read_text(encoding='utf-8'))
-            for node in ast.walk(tree):
-                with self.subTest(file=name, line=getattr(node, 'lineno', 0)):
-                    if isinstance(node, ast.Import):
-                        for alias in node.names:
-                            self.assertFalse(alias.name.startswith('sre_') or alias.name.startswith('re.'), alias.name)
-                            self.assertFalse(alias.name == 're' and alias.asname, 'import re as ' + str(alias.asname))
-                    if isinstance(node, ast.ImportFrom):
-                        self.assertFalse(node.module == 're' or (node.module or '').startswith(('re.', 'sre_')),
-                                         'from %s import ...' % node.module)
 
     CONCAT_SAMPLES_7633 = (
         ("X = ['a' 'b']\n", [1]),

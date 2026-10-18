@@ -374,7 +374,9 @@ def server_caps_sql(env: Dict[str, str]) -> str:
 # the way the PostgreSQL scanner (src/backend/parser/scan.l, parser.c base_yylex) reads it; then the statement is
 # refused when ANY identifier or string-literal token, anywhere in it, equals a name from _FORBIDDEN_NAMES (after
 # quoted, U&, UESCAPE and E-string decoding and ASCII lower-casing), or when it holds a second statement, DO,
-# DISCARD, RESET ALL, ALTER SYSTEM, SET [SESSION] AUTHORIZATION, or anything the guard cannot tokenise.
+# DISCARD, RESET ALL, ALTER SYSTEM, SET [SESSION] AUTHORIZATION, CREATE [OR REPLACE] FUNCTION, CREATE [OR REPLACE]
+# PROCEDURE, CALL (a function or procedure body is code the guard cannot read, #7704), an E-string octal escape above
+# \377 (PostgreSQL keeps only the low byte, so the decode could differ, #7703), or anything the guard cannot tokenise.
 #
 # scan.l rules mirrored here:
 #   space              [ \t\n\r\f\v]  ASCII only; every other byte (a no-break space, U+2003, ...) is part of a token
@@ -458,7 +460,13 @@ def _decode_e(body: str) -> str:
                 j = i + 1
                 while j < n and j < i + 4 and body[j] in '01234567':
                     j += 1
-                out.append(chr(int(body[i + 1:j], 8)))
+                value = int(body[i + 1:j], 8)
+                if value > 0o377:
+                    # PostgreSQL keeps only the low byte of an octal escape (scan.l unsigned char), so a value above
+                    # \377 could decode differently here: refuse it (#7703).
+                    raise WrapperError('refusing SQL with an E-string octal escape above \\377 (PostgreSQL keeps only '
+                                       'the low byte; the guard cannot read it the same way) (%r)' % body[:40])
+                out.append(chr(value))
                 i = j
             elif nxt in 'xuU':
                 width = {'x': 2, 'u': 4, 'U': 8}[nxt]
@@ -702,6 +710,17 @@ def _refuse_uncapped_sql(sql: str) -> None:
             or (value == 'reset' and ahead[:1] == ['all'])
             or (value == 'alter' and ahead[:1] == ['system'])
             or (value in ('set', 'reset') and ahead[:1] == ['authorization']))
+        body = None
+        if value == 'create':
+            rest = ahead[2:] if ahead[:2] == ['or', 'replace'] else ahead
+            if rest[:1] in (['function'], ['procedure']):
+                body = 'CREATE ' + rest[0].upper()
+        elif value == 'call' and position == 0 and tokens[0][0] == _IDENT:
+            body = 'CALL'
+        if body is not None:
+            raise WrapperError('refusing %s: the guard cannot read a function or procedure body, so the server cap '
+                               'could be undone out of its sight; a caller that needs one gets its own fixed helper '
+                               '(%r)' % (body, sql[:80]))
         if bad:
             raise WrapperError('refusing SQL that resets the session, alters the system, switches authorization or '
                                'runs code the guard cannot read: the server cap must stay in force (%r)' % sql[:80])
