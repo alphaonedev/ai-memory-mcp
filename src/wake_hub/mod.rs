@@ -205,8 +205,9 @@ impl HubConfig {
 
 /// The injected admission gates.
 ///
-/// Both default to the production choice: same-uid peers only, and NO hello
-/// accepted until the scoped delegation lands in #3468.
+/// Both default to the fail-closed choice: same-uid peers only, and the
+/// `DenyAllVerifier` test fallback (the live hub injects the scoped
+/// delegation verifier, #3468).
 #[derive(Clone)]
 pub struct HubDeps {
     /// Kernel-attested peer-credential gate.
