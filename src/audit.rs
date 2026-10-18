@@ -2208,6 +2208,9 @@ mod verify_snapshot_4332_tests;
 mod fail_closed_4400_tests;
 
 #[cfg(test)]
+mod fail_closed_7381_tests;
+
+#[cfg(test)]
 mod append_only_scratch_5752_tests;
 
 #[cfg(test)]

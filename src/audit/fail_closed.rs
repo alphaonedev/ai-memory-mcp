@@ -96,10 +96,21 @@ pub fn require_audit_trail_enabled() -> bool {
 #[cfg(test)]
 static FORCE_ON_FOR_TEST: AtomicBool = AtomicBool::new(false);
 
+#[cfg(test)]
+thread_local! {
+    /// #7381 - test-only latch scope. The latch is process-global, so a test
+    /// that latched it made every unlocked write-path test on another thread
+    /// refuse. Under `cfg(test)` the gate refuses only on a thread whose scope
+    /// is set by [`force_on_for_test`]`(true)` or [`latch_for_test`]; any other
+    /// thread sees an open gate. Never compiled into a production build.
+    static LATCH_SCOPE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Test-only: force the mode on (or back to the environment) and reset the
 /// latch and retry clock. Callers hold `audit::sink_test_lock`.
 #[cfg(test)]
 pub(crate) fn force_on_for_test(on: bool) {
+    LATCH_SCOPE.set(on);
     FORCE_ON_FOR_TEST.store(on, Ordering::SeqCst);
     reset_for_test();
 }
@@ -151,6 +162,11 @@ impl std::fmt::Display for AuditTrailUnavailable {
 /// [`AuditTrailUnavailable`] while the trail is latched and the retry (or the
 /// rate limit) says it is still not recording.
 pub fn audit_trail_gate() -> Result<(), AuditTrailUnavailable> {
+    #[cfg(test)]
+    if !LATCH_SCOPE.get() {
+        // #7381: a latch is only seen by the thread whose test set it.
+        return Ok(());
+    }
     if !LATCHED.load(Ordering::SeqCst) {
         // The common path: one atomic load, no environment read.
         return Ok(());
@@ -239,6 +255,7 @@ fn probe_trail() -> bool {
 /// behind for the rest of the process.
 #[cfg(test)]
 pub(crate) fn latch_for_test() -> LatchGuard {
+    LATCH_SCOPE.set(true);
     FORCE_ON_FOR_TEST.store(true, Ordering::SeqCst);
     LATCHED.store(true, Ordering::SeqCst);
     LAST_PROBE_MS.store(u64::MAX, Ordering::SeqCst);
