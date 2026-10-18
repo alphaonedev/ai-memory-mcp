@@ -148,7 +148,17 @@ pub fn install() -> &'static Path {
 /// Panics if the directory cannot be allocated or chmodded.
 #[must_use]
 pub fn private_tempdir() -> tempfile::TempDir {
-    let dir = tempfile::tempdir().expect("allocate private temp dir");
+    // #7450 — never `$TMPDIR` directly: it can sit under HOME and trip #3355.
+    private_tempdir_in(&isolated_temp_root())
+}
+
+/// [`private_tempdir`] allocated beneath an explicit `root` (0700).
+///
+/// # Panics
+/// Panics if the directory cannot be allocated or chmodded.
+#[must_use]
+pub fn private_tempdir_in(root: &Path) -> tempfile::TempDir {
+    let dir = tempfile::tempdir_in(root).expect("allocate private temp dir");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -338,6 +348,24 @@ mod tests {
             "#7450 private_tempdir resolved under HOME: {}",
             canonical_dir.display()
         );
+    }
+
+    /// #7450 — `private_tempdir_in` allocates beneath the given root with 0700.
+    #[test]
+    fn private_tempdir_in_allocates_under_root_7450() {
+        let root = isolated_temp_root();
+        let dir = private_tempdir_in(&root);
+        assert!(dir.path().starts_with(&root));
+        assert_isolated(dir.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(dir.path())
+                .expect("stat private dir")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o700, "#7450 private dir mode");
+        }
     }
 
     /// #3584 — `KeyDirEnvBind` restores the captured `AI_MEMORY_KEY_DIR`
