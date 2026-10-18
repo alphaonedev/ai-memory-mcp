@@ -8,21 +8,34 @@ no candle release outside zip >= 9 can leave. The ignores in
 This guard fails (exit 1) when any of these holds:
 
   (a) `cargo tree -i zip --edges normal,build,dev --workspace` shows a direct
-      parent that is not registry candle-core 0.10.x (a path or git source, any
-      other version, or any other crate fails), or Cargo.lock lists candle-core
-      with another version or a source other than crates.io;
+      parent that is not registry candle-core 0.10.2 exactly (a path or git
+      source, any other version including a later 0.10 patch, or any other
+      crate fails; #7309), the zip root line carries a source suffix (#7311),
+      or Cargo.lock lists candle-core with another version or a source other
+      than crates.io, or any zip entry that is not registry zip 7.2.0 (#7311);
   (b) the root Cargo.toml declares a direct `zip` dependency in any form,
-      patches or replaces candle-core or zip, or declares workspace members
-      (their manifests and sources are not scanned, so a member must extend the
-      guard first); direct zip dependency forms are:
+      patches or replaces candle-core or zip (a `[replace]` key may be `name`,
+      `name:version`, `name@version` or a registry package ID ending in
+      `#name@version`; inline-table `workspace` / `patch` values are read too
+      on the fallback reader; #7306, #7311), or declares workspace members;
+      direct zip dependency forms are:
       [dependencies], [dev-dependencies], [build-dependencies], any
       [target.<cfg>.*] table, [workspace.dependencies], [dependencies.zip],
       top-level dotted keys, or a rename with `package = "zip"`;
   (c) src/, tests/, benches/, examples/, build.rs, the declared build script
       or any declared target path use zip directly, name zip in macro input,
       call a candle npy / npz / pth loader (the only candle code that opens a
-      zip archive), or pull in other files with `#[path]` / `include!` (those
-      files are followed and scanned; an unresolvable one is a violation).
+      zip archive, also when a `paste!` `[< .. >]` group joins its name from
+      pieces; #7307), or pull in other files with `#[path]` / `include!` (those
+      files are followed and scanned; an unresolvable one is a violation);
+      a local zip binding exempts a macro input only inside its own fn body
+      (#7308); a `mod name;` that resolves to no file on disk is a violation
+      because only a build step could create it, and build scripts are also
+      scanned with their string bodies kept, so a loader call written out of a
+      string literal is seen (#7310);
+  (d) every local package `cargo metadata --locked --format-version 1` lists
+      (a path dependency or an implicit workspace member, not only the root)
+      is scanned by rule (c) (#7305).
 
 Fail closed: if cargo tree exits 0 but prints nothing parseable or no zip root
 line, or any scanned file is unreadable or not UTF-8, the guard exits 2.
@@ -45,6 +58,7 @@ workflow command. Every violation line starts with `violation:`.
 Remove this guard, and the audit ignores, when candle supports zip >= 9.
 """
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -58,9 +72,15 @@ EXIT_USAGE = 2
 ZIP_CRATE = 'zip'
 # Exact crates that depend on zip today (candle-nn / candle-transformers 0.10.2
 # have no zip dependency). Widening this set needs an edit here and in audit.toml.
-# The audited parent: crates.io candle-core 0.10.x. A tree line for it carries no
-# `(<source>)` suffix (path and git packages print one); `(*)` marks a repeat.
-ALLOWED_PARENT_LINE = re.compile(r'^candle-core v0\.10\.\d+(?: \(\*\))?$')
+# The audited parent: crates.io candle-core 0.10.2, the release the audit record in
+# .cargo/audit.toml covers (#7309); a later patch release needs a new audit and an
+# edit here. A tree line for it carries no `(<source>)` suffix (path and git
+# packages print one); `(*)` marks a repeat.
+AUDITED_CANDLE_VERSION = '0.10.2'
+AUDITED_ZIP_VERSION = '7.2.0'
+ALLOWED_PARENT_LINE = re.compile(r'^candle-core v0\.10\.2(?: \(\*\))?$')
+# The zip root line of the tree: plain, or `(*)`; a `(<path or git>)` suffix is a patched zip.
+ZIP_ROOT_LINE_OK = re.compile(r'^0?zip v\S+(?: \(\*\))?$')
 LOCK_REGISTRY = 'registry+https://github.com/rust-lang/crates.io-index'
 PINNED_PACKAGES = ('candle-core', ZIP_CRATE)
 SCAN_DIRS = ('src', 'tests', 'benches', 'examples')
@@ -181,7 +201,12 @@ def check_tree(tree_text):
     for parent in parse_tree(tree_text):
         if not ALLOWED_PARENT_LINE.match(parent):
             problems.append(violation(
-                'cargo-tree', 'zip parent %r is not registry candle-core 0.10.x (no path or git source)' % parent))
+                'cargo-tree', 'zip parent %r is not registry candle-core %s (no path or git source)'
+                % (parent, AUDITED_CANDLE_VERSION)))
+    for raw in tree_text.splitlines():
+        line = raw.rstrip()
+        if ROOT_LINE.match(line) and not ZIP_ROOT_LINE_OK.match(line):
+            problems.append(violation('cargo-tree', 'zip root %r carries a source suffix (not registry zip)' % line))
     return problems
 
 
@@ -201,15 +226,21 @@ def lock_packages(root):
 
 
 def check_lock(root):
-    """candle-core in Cargo.lock must be crates.io 0.10.x, the code the audit rationale covers."""
-    entries = lock_packages(root).get('candle-core', [])
+    """candle-core in Cargo.lock must be crates.io 0.10.2 and every zip entry crates.io 7.2.0."""
+    packages = lock_packages(root)
+    entries = packages.get('candle-core', [])
     if not entries:
         return [violation('Cargo.lock', 'candle-core is the audited zip parent but has no lock entry')]
     problems = []
     for version, source in entries:
-        if source != LOCK_REGISTRY or not re.match(r'0\.10\.\d+$', version):
+        if source != LOCK_REGISTRY or version != AUDITED_CANDLE_VERSION:
             problems.append(violation(
-                'Cargo.lock', 'candle-core %s source %s is not crates.io 0.10.x' % (version, source)))
+                'Cargo.lock', 'candle-core %s source %s is not crates.io %s'
+                % (version, source, AUDITED_CANDLE_VERSION)))
+    for version, source in packages.get(ZIP_CRATE, []):
+        if source != LOCK_REGISTRY or version != AUDITED_ZIP_VERSION:
+            problems.append(violation(
+                'Cargo.lock', 'zip %s source %s is not crates.io %s' % (version, source, AUDITED_ZIP_VERSION)))
     return problems
 
 
@@ -329,9 +360,15 @@ def iter_manifest_entries(text):
         yield 'key', number, table + parts, value
 
 
-REPLACE_KEY = re.compile(r'(?:^|[#/])(candle-core|zip)(?::|$)')
+# `name`, `name:version`, `name@version`, or a registry package ID `<url>#name@version`.
+REPLACE_KEY = re.compile(r'(?:^|[#/])(candle-core|zip)(?:[:@]|$)')
 PACKAGE_PINNED = re.compile(r'\bpackage\s*=\s*["\'](candle-core|zip)["\']')
 PACKAGE_PINNED_VALUE = re.compile(r'^\s*["\'](candle-core|zip)["\']\s*(?:#.*)?$')
+# Inline-table values the fallback reader sees on one line: `workspace = { members = [..] }` and
+# `crates-io = { zip = { path = ".." } }` (also `patch = { crates-io = { .. } }`).
+INLINE_MEMBERS = re.compile(r'["\']?members["\']?\s*=\s*\[\s*[^\]\s]')
+INLINE_PINNED = re.compile(
+    r'(?<![\w\-])["\']?(?:candle-core|zip)["\']?\s*=|\bpackage\s*=\s*["\'](?:candle-core|zip)["\']')
 WORKSPACE_DETAIL = 'workspace members are not scanned by this guard (extend it before adding one)'
 
 
@@ -339,6 +376,10 @@ def override_detail(kind, path, value):
     """Detail when this manifest entry redirects candle-core or zip, or declares workspace members."""
     if path[:2] == ['workspace', 'members'] and kind == 'key' and value.strip() not in ('[]', ''):
         return WORKSPACE_DETAIL
+    if path == ['workspace'] and kind == 'key' and INLINE_MEMBERS.search(value):
+        return WORKSPACE_DETAIL
+    if path[0] == 'patch' and len(path) <= 2 and kind == 'key' and INLINE_PINNED.search(value):
+        return '[patch] of a pinned package (inline table)'
     if path[0] == 'patch' and len(path) >= 3:
         if path[2] in PINNED_PACKAGES:
             return '[patch] of %s' % path[2]
@@ -442,11 +483,12 @@ def check_manifest(manifest_text, parser='auto'):
 RAW_OPEN = re.compile(r'[bc]?r(#*)"')
 
 
-def mask_rust(text):
+def mask_rust(text, keep_strings=False):
     """Blank out comments, string and char literal bodies; newlines are kept.
 
     Keeps columns and line numbers stable so the macro scan can report the
-    original line.
+    original line. `keep_strings` leaves string bodies in place (comments are
+    still blanked): used for build scripts, whose strings can be generated code.
     """
     out = []
     i, n = 0, len(text)
@@ -474,14 +516,14 @@ def mask_rust(text):
             hashes = len(raw.group(1))
             end = text.find('"' + '#' * hashes, raw.end())
             j = n if end < 0 else end + 1 + hashes
-            out.append(re.sub(r'[^\n]', ' ', text[i:j]))
+            out.append(text[i:j] if keep_strings else re.sub(r'[^\n]', ' ', text[i:j]))
             i = j
         elif ch == '"':
             j = i + 1
             while j < n and text[j] != '"':
                 j += 2 if text[j] == '\\' else 1
             j = min(j + 1, n)
-            out.append(re.sub(r'[^\n]', ' ', text[i:j]))
+            out.append(text[i:j] if keep_strings else re.sub(r'[^\n]', ' ', text[i:j]))
             i = j
         elif ch == "'" and re.match(r"'(?:\\.[^']*|[^\\'])'", text[i:i + 12]):
             j = i + len(re.match(r"'(?:\\.[^']*|[^\\'])'", text[i:i + 12]).group(0))
@@ -493,10 +535,44 @@ def mask_rust(text):
     return ''.join(out)
 
 
+def match_close(masked, open_index):
+    """Index of the bracket that closes the one at `open_index` (the text length if unbalanced)."""
+    depth, j = 0, open_index
+    while j < len(masked):
+        if masked[j] in '([{':
+            depth += 1
+        elif masked[j] in ')]}':
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return j
+
+
+def fn_body_spans(masked):
+    """(start of `fn`, closing brace) for every fn that has a body; a bodyless declaration has none."""
+    spans = []
+    for keyword in FN_KEYWORD.finditer(masked):
+        depth, j = 0, keyword.end()
+        while j < len(masked):
+            ch = masked[j]
+            if ch in '([':
+                depth += 1
+            elif ch in ')]':
+                depth -= 1
+            elif depth <= 0 and ch in ';}':
+                break
+            elif depth <= 0 and ch == '{':
+                spans.append((keyword.start(), match_close(masked, j)))
+                break
+            j += 1
+    return spans
+
+
 def macro_input_hits(text, masked):
     """Line numbers where a bare `zip` token sits inside a macro invocation."""
     lines = set()
-    fn_starts = [m.start() for m in FN_KEYWORD.finditer(masked)]
+    spans = fn_body_spans(masked)
     for opener in MACRO_OPEN.finditer(masked):
         if opener.group(1) in NOT_MACRO:
             continue
@@ -511,16 +587,16 @@ def macro_input_hits(text, masked):
                     break
             j += 1
         for hit in MACRO_ZIP.finditer(masked, start, j):
-            # A zip bound in the enclosing fn (parameter or let) is a local, not the crate.
-            before = [pos for pos in fn_starts if pos < hit.start()]
-            scope_start = before[-1] if before else 0
-            if ZIP_BINDING.search(masked, scope_start, hit.start()):
+            # A zip bound in the enclosing fn (parameter or let) is a local, not the
+            # crate; the exemption covers that fn's body only (#7308).
+            inside = [span for span in spans if span[0] < hit.start() < span[1]]
+            if inside and ZIP_BINDING.search(masked, max(inside)[0], hit.start()):
                 continue
             lines.add(masked.count('\n', 0, hit.start()) + 1)
     return sorted(lines)
 
 
-def manifest_source_paths(manifest_text):
+def manifest_source_paths(manifest_text, builds_only=False):
     """Source files Cargo.toml declares outside src/: package.build and target `path` keys."""
     paths = []
     for kind, _number, parts, value in iter_manifest_entries(manifest_text):
@@ -531,7 +607,7 @@ def manifest_source_paths(manifest_text):
             continue
         text = literal.group(1) if literal.group(1) is not None else literal.group(2)
         if parts in (['package', 'build'], ['build']) or (
-                parts[-1] == 'path' and parts[0] in ('lib', 'bin', 'example', 'test', 'bench')):
+                not builds_only and parts[-1] == 'path' and parts[0] in ('lib', 'bin', 'example', 'test', 'bench')):
             paths.append(text)
     return paths
 
@@ -572,8 +648,71 @@ def resolve_target(root, source, value, is_path_attr):
     return None, 'target %s does not resolve to a file' % value
 
 
-def check_sources(root, manifest_text=''):
+PASTE_OPEN = re.compile(r'\bpaste\s*!\s*[({\[]')
+PASTE_GROUP = re.compile(r'\[<(.*?)>\]', re.DOTALL)
+PASTE_MODIFIER = re.compile(r':(?:lower|upper|snake|camel|lower_camel|upper_camel)\b')
+# The loader names of FORBIDDEN, without the leading word boundary: a paste! piece can
+# prefix them (`[<try_ read_npz>]`).
+PASTE_LOADER = re.compile(
+    r'(?:read_npz\w*|read_npy|write_npz|write_npy|read_pth\w*|from_pth\w*|'
+    r'from_npz|NpzTensors|PthTensors|read_all_with_key)\b')
+MOD_DECL = re.compile(r'(?<![\w])mod\s+(?:r#)?([A-Za-z_]\w*)\s*;')
+INLINE_MOD_OR_BRACE = re.compile(r'\bmod\s+(?:r#)?([A-Za-z_]\w*)\s*\{|[{}]')
+
+
+def paste_loader_hits(text, masked):
+    """Line numbers where a `paste!` `[< .. >]` group joins to a candle loader name (#7307)."""
+    lines = set()
+    for opener in PASTE_OPEN.finditer(masked):
+        end = match_close(masked, opener.end() - 1)
+        for group in PASTE_GROUP.finditer(text, opener.end(), end):
+            joined = PASTE_MODIFIER.sub('', group.group(1))
+            joined = re.sub(r'[\s"\'$]', '', joined)
+            if PASTE_LOADER.search(joined):
+                lines.add(text.count('\n', 0, group.start()) + 1)
+    return sorted(lines)
+
+
+def enclosing_inline_mods(masked, pos):
+    """Names of the inline `mod x { .. }` blocks that enclose `pos`, outermost first."""
+    stack = []
+    for token in INLINE_MOD_OR_BRACE.finditer(masked, 0, pos):
+        if token.group(0) == '}':
+            if stack:
+                stack.pop()
+        else:
+            stack.append(token.group(1))
+    return [name for name in stack if name]
+
+
+def missing_mod_hits(path, masked):
+    """(line, name) for each `mod name;` whose file is on no module path: only a build step could make it (#7310)."""
+    hits = []
+    for decl in MOD_DECL.finditer(masked):
+        before = masked[max(0, decl.start() - 300):decl.start()]
+        before = re.split(r'[;{}]', before)[-1]
+        if re.search(r'\bpath\s*=', before):
+            continue  # a #[path] module: followed (or flagged) by the path-attribute scan
+        sub = Path(*enclosing_inline_mods(masked, decl.start())) if enclosing_inline_mods(masked, decl.start()) else Path()
+        name = decl.group(1)
+        found = False
+        for base in (path.parent, path.parent / path.stem):
+            for candidate in (base / sub / (name + '.rs'), base / sub / name / 'mod.rs'):
+                if candidate.is_file():
+                    found = True
+        if not found:
+            hits.append((masked.count('\n', 0, decl.start()) + 1, name))
+    return hits
+
+
+def build_script_paths(root, manifest_text):
+    names = list(SCAN_FILES) + manifest_source_paths(manifest_text, builds_only=True)
+    return {Path(os.path.realpath(str(root / name))) for name in names}
+
+
+def check_sources(root, manifest_text='', label=''):
     root = Path(os.path.realpath(str(root)))
+    builds = build_script_paths(root, manifest_text)
     problems = []
     queue = [Path(os.path.realpath(str(p))) for p in seed_sources(root, manifest_text)]
     seen = set()
@@ -583,7 +722,7 @@ def check_sources(root, manifest_text=''):
             continue
         seen.add(path)
         try:
-            rel = path.relative_to(root).as_posix()
+            rel = label + path.relative_to(root).as_posix()
         except ValueError:
             problems.append(violation(str(path), 'source outside the repository'))
             continue
@@ -592,7 +731,10 @@ def check_sources(root, manifest_text=''):
         # not code, so a doc comment naming `zip::ZipArchive` is not a use.
         masked = mask_rust(text)
         zip_context = bool(ZIP_CONTEXT.search(ZIP_CALL.sub(' ', masked)))
-        for number, line in enumerate(masked.split('\n'), 1):
+        # A build script can write generated code out of a string literal, so its
+        # string bodies are scanned too (#7310); comments stay masked.
+        scan = mask_rust(text, keep_strings=True) if path in builds else masked
+        for number, line in enumerate(scan.split('\n'), 1):
             where = '%s:%d' % (rel, number)
             for label, pattern in FORBIDDEN:
                 if pattern.search(line):
@@ -625,6 +767,41 @@ def check_sources(root, manifest_text=''):
                 queue.append(target)
         for number in macro_input_hits(text, masked):
             problems.append(violation('%s:%d' % (rel, number), 'zip named in macro input'))
+        for number in paste_loader_hits(text, masked):
+            problems.append(violation('%s:%d' % (rel, number), 'candle-loader (paste! pieces)'))
+        for number, name in missing_mod_hits(path, masked):
+            problems.append(violation(
+                '%s:%d' % (rel, number), 'mod %s; resolves to no file on disk (a build step could generate it)' % name))
+    return problems
+
+
+def local_package_dirs(metadata_text, root):
+    """(name, directory) of every local package except the root, from `cargo metadata` JSON (#7305)."""
+    try:
+        packages = json.loads(metadata_text)['packages']
+        found = []
+        for package in packages:
+            if package.get('source') is not None:
+                continue
+            directory = Path(os.path.realpath(str(Path(package['manifest_path']).parent)))
+            if directory != root:
+                found.append((str(package.get('name', '?')), directory))
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise ToolError('cannot parse cargo metadata output: %s' % exc)
+    return found
+
+
+def check_local_packages(metadata_text, root):
+    """Rule (c) over every local package other than the root: path dependencies and implicit members."""
+    root = Path(os.path.realpath(str(root)))
+    problems = []
+    for name, directory in local_package_dirs(metadata_text, root):
+        try:
+            label = directory.relative_to(root).as_posix() + '/'
+        except ValueError:
+            label = name + '/'
+        manifest = directory / 'Cargo.toml'
+        problems += check_sources(directory, read_source(manifest, label + 'Cargo.toml'), label)
     return problems
 
 
@@ -655,6 +832,22 @@ def cargo_tree_output(root):
     return result.stdout, False
 
 
+CARGO_METADATA_ARGS = ('metadata', '--locked', '--format-version', '1')
+# Not --no-deps: the local packages that matter (path dependencies) are found through the
+# resolved graph; a workspace-only listing would miss one outside the workspace.
+
+
+def cargo_metadata_output(root):
+    try:
+        result = subprocess.run(
+            ['cargo', *CARGO_METADATA_ARGS], cwd=str(root), capture_output=True, text=True, check=False)
+    except OSError as exc:
+        raise ToolError('cannot run cargo: %s' % exc)
+    if result.returncode != 0:
+        raise ToolError('cargo metadata failed rc=%d: %s' % (result.returncode, result.stderr.strip()[-400:]))
+    return result.stdout
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     parser.add_argument('--root', default=str(Path(__file__).resolve().parents[1]),
@@ -663,6 +856,9 @@ def main(argv=None):
                         help='Cargo.toml reader: tomllib (Python 3.11+), the built-in fallback, or auto')
     parser.add_argument('--cargo-tree-file',
                         help='read `cargo tree -i zip` output from this file instead of running cargo')
+    parser.add_argument('--cargo-metadata-file',
+                        help='read `cargo metadata` JSON from this file instead of running cargo '
+                             '(with --cargo-tree-file alone, no local package besides the root is scanned)')
     args = parser.parse_args(argv)
     root = Path(args.root)
     if not (root / 'Cargo.toml').is_file():
@@ -686,9 +882,15 @@ def main(argv=None):
             tree_problems = []
         else:
             tree_problems = check_tree(tree_text) + check_lock(root)
+        if args.cargo_metadata_file:
+            metadata_text = Path(args.cargo_metadata_file).read_text(encoding='utf-8')
+        elif args.cargo_tree_file:
+            metadata_text = '{"packages": []}'
+        else:
+            metadata_text = cargo_metadata_output(root)
         manifest_text = read_source(root / 'Cargo.toml', 'Cargo.toml')
         problems = (tree_problems + check_manifest(manifest_text, args.manifest_parser)
-                    + check_sources(root, manifest_text))
+                    + check_sources(root, manifest_text) + check_local_packages(metadata_text, root))
     except (OSError, ValueError, ToolError) as exc:
         print('error: %s' % escape_text(exc), file=sys.stderr)
         return EXIT_USAGE

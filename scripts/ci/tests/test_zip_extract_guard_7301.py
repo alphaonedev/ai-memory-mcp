@@ -43,13 +43,19 @@ class GuardBase(unittest.TestCase):
         (self.root / 'src' / 'lib.rs').write_text('pub fn ok() {}\n', encoding='utf-8')
         (self.root / 'Cargo.lock').write_text(CANDLE_LOCK, encoding='utf-8')
 
-    def run_guard(self, tree=GOOD_TREE_DEPTH, root=None, extra=()):
+    def run_guard(self, tree=GOOD_TREE_DEPTH, root=None, extra=(), meta=None):
         tree_file = self.root.parent / (self.root.name + '.tree')
         tree_file.write_text(tree, encoding='utf-8')
         self.addCleanup(lambda: tree_file.unlink() if tree_file.exists() else None)
+        extra = list(extra)
+        if meta is not None:
+            meta_file = self.root.parent / (self.root.name + '.meta')
+            meta_file.write_text(json.dumps(meta), encoding='utf-8')
+            self.addCleanup(lambda: meta_file.unlink() if meta_file.exists() else None)
+            extra += ['--cargo-metadata-file', str(meta_file)]
         return subprocess.run(
             [sys.executable, str(GUARD), '--root', str(root or self.root),
-             '--cargo-tree-file', str(tree_file)] + list(extra),
+             '--cargo-tree-file', str(tree_file)] + extra,
             capture_output=True, text=True, check=False)
 
 
@@ -186,6 +192,9 @@ STUB_TEMPLATE = """#!{python}
 import json, sys
 with open({log!r}, 'a') as fh:
     fh.write(json.dumps(sys.argv[1:]) + '\\n')
+if 'metadata' in sys.argv:
+    sys.stdout.write('{{"packages": []}}')
+    sys.exit(0)
 sys.stdout.write({out!r})
 sys.stderr.write({err!r})
 sys.exit({rc})
@@ -197,10 +206,14 @@ if '--offline' in sys.argv:
     sys.stderr.write('error: failed to download `anstyle-wincon v3.0.11`\\n'
                      'Caused by: attempting to make an HTTP request, but --offline was specified\\n')
     sys.exit(101)
+if 'metadata' in sys.argv:
+    sys.stdout.write('{{"packages": []}}')
+    sys.exit(0)
 sys.stdout.write({out!r})
 """
 
-LOCK_WITH_ZIP = CANDLE_LOCK + '[[package]]\nname = "zip"\nversion = "7.2.0"\n'
+LOCK_WITH_ZIP = CANDLE_LOCK + ('[[package]]\nname = "zip"\nversion = "7.2.0"\n'
+                               'source = "registry+https://github.com/rust-lang/crates.io-index"\n')
 LOCK_WITHOUT_ZIP = '[[package]]\nname = "serde"\nversion = "1.0.0"\n'
 NO_MATCH_ERR = 'error: package ID specification `zip` did not match any packages\n'
 
@@ -234,8 +247,9 @@ class CleanCargoHome7301(StubCargoCase):
         res = self.run_stub(out=GOOD_TREE_DEPTH, lock=LOCK_WITH_ZIP)
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
         lines = self.argv_log.read_text(encoding='utf-8').splitlines()
-        self.assertEqual(len(lines), 1, lines)
-        return json.loads(lines[0])
+        trees = [json.loads(line) for line in lines if json.loads(line)[0] == 'tree']
+        self.assertEqual(len(trees), 1, lines)
+        return trees[0]
 
     def test_cargo_tree_argv_has_no_offline_flag(self):
         self.assertNotIn('--offline', self.argv_of_run())
@@ -243,7 +257,7 @@ class CleanCargoHome7301(StubCargoCase):
     def test_cargo_tree_argv_keeps_locked_and_all_targets(self):
         argv = self.argv_of_run()
         self.assertIn('--locked', argv)
-        self.assertIn('all', argv)
+        self.assertEqual(argv[argv.index('--target') + 1], 'all')
 
     def test_download_needed_is_not_refused_by_guard_flags(self):
         """A cargo that refuses to download under --offline: the guard must not pass that flag."""
@@ -622,7 +636,7 @@ class ParentPin7301(GuardBase):
         self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
 
     def test_registry_candle_core_0_10_x_passes(self):
-        for line in ('1candle-core v0.10.2', '1candle-core v0.10.9', '1candle-core v0.10.2 (*)'):
+        for line in ('1candle-core v0.10.2', '1candle-core v0.10.2 (*)'):
             with self.subTest(line=line):
                 res = self.run_guard(tree='0zip v7.2.0\n%s\n' % line)
                 self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
@@ -766,6 +780,326 @@ class MaskAndFalsePositives7301(GuardBase):
                 res = self.run_guard()
                 self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
                 self.assertIn('src/lib.rs:', res.stdout)
+
+
+class RuleFixtures7305To7312(GuardBase):
+    """Eight LOW findings off PR #7303 (#7305-#7312): a fail and a pass fixture per rule."""
+
+    def write(self, rel, text):
+        target = self.root / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding='utf-8')
+        return target
+
+    def meta(self, *dirs):
+        """cargo metadata JSON: the fixture root, local packages at `dirs`, and a registry package."""
+        packages = [{'name': 'fixture', 'source': None, 'manifest_path': str(self.root / 'Cargo.toml')}]
+        for rel in dirs:
+            base = Path(rel) if os.path.isabs(rel) else self.root / rel
+            packages.append({'name': base.name, 'source': None, 'manifest_path': str(base / 'Cargo.toml')})
+        packages.append({'name': 'serde', 'source': 'registry+https://github.com/rust-lang/crates.io-index',
+                         'manifest_path': '/registry/serde/Cargo.toml'})
+        return {'packages': packages}
+
+    def member(self, rel, lib):
+        self.write(rel + '/Cargo.toml', '[package]\nname = "m"\nversion = "0.0.0"\n')
+        self.write(rel + '/src/lib.rs', lib)
+
+    def manifest_rc(self, body, parser, top=''):
+        self.write('Cargo.toml', top + PACKAGE_ONLY + body)
+        return self.run_guard(extra=('--manifest-parser', parser))
+
+    # --- #7305: local path-dependency crates and implicit workspace members ---------
+    def test_path_dependency_crate_is_scanned_7305(self):
+        self.member('crates/loader', 'pub fn f() { candle_core::Tensor::read_npz("m.npz"); }\n')
+        res = self.run_guard(meta=self.meta('crates/loader'))
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('crates/loader/src/lib.rs:1', res.stdout)
+        self.assertIn('candle-loader', res.stdout)
+
+    def test_implicit_workspace_member_is_scanned_7305(self):
+        self.member('crates/loader', 'pub fn f() { VarBuilder::from_pth(p, d, v); }\n')
+        for parser in BOTH_PARSERS:
+            with self.subTest(parser=parser):
+                self.write('Cargo.toml', MINIMAL_MANIFEST + '\n[workspace]\n')
+                res = self.run_guard(meta=self.meta('crates/loader'), extra=('--manifest-parser', parser))
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('crates/loader/src/lib.rs:1', res.stdout)
+
+    def test_path_dependency_outside_the_root_is_scanned_7305(self):
+        outside = self.root.parent / (self.root.name + '.dep')
+        self.addCleanup(shutil.rmtree, str(outside), True)
+        outside.mkdir()
+        self.member(os.path.relpath(str(outside), str(self.root)), 'pub fn f() { zip::ZipArchive::new; }\n')
+        res = self.run_guard(meta=self.meta(str(outside)))
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('src/lib.rs:1', res.stdout)
+
+    def test_clean_path_dependency_passes_7305(self):
+        self.member('crates/clean', 'pub fn f() -> u8 { 1 }\n')
+        res = self.run_guard(meta=self.meta('crates/clean'))
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    # --- #7306: inline-table workspace and patch forms in the fallback reader --------
+    def test_inline_table_workspace_members_fail_7306(self):
+        for parser in BOTH_PARSERS:
+            with self.subTest(parser=parser):
+                res = self.manifest_rc('', parser, top='workspace = { members = ["crates/x"] }\n')
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('workspace', res.stdout)
+
+    def test_inline_table_patch_forms_fail_7306(self):
+        forms = {
+            'patch-crates-io-zip': '[patch]\ncrates-io = { zip = { path = ".." } }\n',
+            'patch-crates-io-candle': '[patch]\ncrates-io = { candle-core = { path = ".." } }\n',
+            'patch-renamed': '[patch]\ncrates-io = { x = { package = "zip", path = ".." } }\n',
+        }
+        for parser in BOTH_PARSERS:
+            for name, body in forms.items():
+                with self.subTest(parser=parser, form=name):
+                    res = self.manifest_rc(body, parser)
+                    self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                    self.assertIn('Cargo.toml', res.stdout)
+
+    def test_toplevel_inline_patch_fails_7306(self):
+        for parser in BOTH_PARSERS:
+            with self.subTest(parser=parser):
+                res = self.manifest_rc('', parser, top='patch = { crates-io = { zip = { path = ".." } } }\n')
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('Cargo.toml', res.stdout)
+
+    def test_inline_table_benign_forms_pass_7306(self):
+        for parser in BOTH_PARSERS:
+            with self.subTest(parser=parser, form='empty-members'):
+                res = self.manifest_rc('', parser, top='workspace = { members = [] }\n')
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            with self.subTest(parser=parser, form='unrelated-patch'):
+                res = self.manifest_rc('[patch]\ncrates-io = { serde = { path = ".." } }\n', parser)
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    # --- #7307: paste! identifier pieces ---------------------------------------------
+    def test_paste_pieces_carry_loader_call_7307(self):
+        calls = {
+            'split-piece': 'paste::paste! { candle_core::Tensor::[<read_ npz>]("m.npz") }\n',
+            'bare-paste': 'paste! { Tensor::[<read_ npy>](p) }\n',
+            'prefixed': 'paste! { Tensor::[<try_ read_npz>](p) }\n',
+            'from-pth': 'paste::paste! { VarBuilder::[<from_ pth>](p) }\n',
+        }
+        for name, body in calls.items():
+            with self.subTest(case=name):
+                self.write('src/lib.rs', body)
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('src/lib.rs:1', res.stdout)
+
+    def test_benign_paste_passes_7307(self):
+        self.write('src/lib.rs', (
+            'paste::paste! {\n    pub fn [<get_ name>]() {}\n    pub fn [<set_ $x>]() {}\n}\n'
+            'pub fn g(a: [u8; 2]) -> u8 { a[0] }\n'))
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    # --- #7308: the zip-binding exemption ends with its fn body ----------------------
+    def test_zip_binding_exemption_ends_at_fn_body_7308(self):
+        cases = {
+            'after-fn': 'pub fn a(zip: u8) -> u8 { zip }\nm!(zip);\n',
+            'after-nested-braces': 'pub fn a(zip: u8) { if zip > 0 { drop(1); } }\nm!(zip);\n',
+            'bodyless-decl': 'trait T { fn g(zip: u8); }\nm!(zip);\n',
+        }
+        for name, body in cases.items():
+            with self.subTest(case=name):
+                self.write('src/lib.rs', body)
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('macro input', res.stdout)
+
+    def test_zip_binding_inside_its_fn_body_passes_7308(self):
+        cases = {
+            'nested-block': 'pub fn f(zip: bool) { if zip { println!("{}", zip); } }\n',
+            'generic-where': 'pub fn f<T>(zip: T) -> T where T: Copy { assert_eq!(1, 1); zip }\n',
+            'let-then-macro': 'fn f() {\n    let zip = 1;\n    { assert_eq!(zip, 1); }\n}\n',
+        }
+        for name, body in cases.items():
+            with self.subTest(case=name):
+                self.write('src/lib.rs', body)
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    # --- #7309: the candle-core parent pin is exactly 0.10.2 -------------------------
+    def test_candle_core_0_10_3_tree_line_fails_7309(self):
+        for line in ('1candle-core v0.10.3', '1candle-core v0.10.9 (*)', '1candle-core v0.10.20'):
+            with self.subTest(line=line):
+                res = self.run_guard(tree='0zip v7.2.0\n%s\n' % line)
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('candle-core', res.stdout)
+
+    def test_candle_core_0_10_3_lock_entry_fails_7309(self):
+        self.write('Cargo.lock', CANDLE_LOCK.replace('0.10.2', '0.10.3'))
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('Cargo.lock', res.stdout)
+
+    def test_candle_core_0_10_2_still_passes_7309(self):
+        res = self.run_guard(tree='0zip v7.2.0\n1candle-core v0.10.2\n')
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    # --- #7310: build-time generated modules -----------------------------------------
+    def test_mod_without_a_file_fails_7310(self):
+        cases = {
+            'lib': ('src/lib.rs', 'mod gen;\n'),
+            'pub-crate': ('src/lib.rs', 'pub(crate) mod gen;\n'),
+            'nested-dir': ('src/foo.rs', 'mod gen;\n'),
+        }
+        for name, (rel, body) in cases.items():
+            with self.subTest(case=name):
+                self.write(rel, body)
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('mod gen', res.stdout)
+                self.assertIn(rel + ':1', res.stdout)
+                (self.root / rel).unlink()
+                self.write('src/lib.rs', 'pub fn ok() {}\n')
+
+    def test_build_script_string_with_loader_call_fails_7310(self):
+        self.write('build.rs', (
+            'fn main() {\n    std::fs::write("src/gen.rs", "fn g() { Tensor::read_npz(p); }").unwrap();\n}\n'))
+        self.write('src/gen.rs', 'pub fn g() {}\n')
+        self.write('src/lib.rs', 'mod gen;\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('build.rs:2', res.stdout)
+
+    def test_modules_with_files_and_clean_build_script_pass_7310(self):
+        self.write('src/lib.rs', 'mod a;\nmod b;\nmod c { pub fn z() {} }\n#[cfg(test)]\nmod tests;\n')
+        self.write('src/a.rs', 'pub mod inner;\n')
+        self.write('src/a/inner.rs', 'pub fn i() {}\n')
+        self.write('src/b/mod.rs', 'pub fn b() {}\n')
+        self.write('src/tests.rs', 'fn t() {}\n')
+        self.write('build.rs', (
+            '// Tensor::read_npz is only named in this comment\n'
+            'fn main() {\n    println!("cargo:rerun-if-changed=build.rs");\n}\n'))
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    # --- #7311: [replace] package-ID keys and the registry origin --------------------
+    def test_replace_package_id_keys_fail_7311(self):
+        keys = ('zip@7.2.0', 'candle-core@0.10.2',
+                'registry+https://github.com/rust-lang/crates.io-index#zip@7.2.0',
+                'registry+https://github.com/rust-lang/crates.io-index#candle-core@0.10.2')
+        for parser in BOTH_PARSERS:
+            for key in keys:
+                with self.subTest(parser=parser, key=key):
+                    res = self.manifest_rc('[replace]\n"%s" = { path = "../c" }\n' % key, parser)
+                    self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                    self.assertIn('[replace]', res.stdout)
+
+    def test_unrelated_replace_keys_pass_7311(self):
+        keys = ('serde@1.0.0', 'zipper@1.0.0', 'registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0')
+        for parser in BOTH_PARSERS:
+            for key in keys:
+                with self.subTest(parser=parser, key=key):
+                    res = self.manifest_rc('[replace]\n"%s" = { path = "../c" }\n' % key, parser)
+                    self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_zip_lock_entry_must_be_registry_7_2_0_7311(self):
+        head = '[[package]]\nname = "zip"\n'
+        registry = 'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+        locks = {
+            'no-source': CANDLE_LOCK + head + 'version = "7.2.0"\n',
+            'git': CANDLE_LOCK + head + 'version = "7.2.0"\nsource = "git+https://github.com/x/zip#abc"\n',
+            'other-registry': CANDLE_LOCK + head + 'version = "7.2.0"\nsource = "registry+https://example.com/index"\n',
+            'other-version': CANDLE_LOCK + head + 'version = "7.2.1"\n' + registry,
+            'second-entry': LOCK_WITH_ZIP + head + 'version = "9.0.0"\n' + registry,
+        }
+        for name, lock in locks.items():
+            with self.subTest(lock=name):
+                self.write('Cargo.lock', lock)
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('Cargo.lock', res.stdout)
+
+    def test_zip_registry_lock_entry_passes_7311(self):
+        self.write('Cargo.lock', LOCK_WITH_ZIP)
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_zip_tree_root_with_source_suffix_fails_7311(self):
+        for root_line in ('0zip v7.2.0 (/w/v/zip)', '0zip v7.2.0 (https://github.com/x/zip#abc)'):
+            with self.subTest(root=root_line):
+                res = self.run_guard(tree='%s\n1candle-core v0.10.2\n' % root_line)
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('zip', res.stdout)
+
+    def test_zip_tree_root_plain_and_repeat_pass_7311(self):
+        for root_line in ('0zip v7.2.0', '0zip v7.2.0 (*)'):
+            with self.subTest(root=root_line):
+                res = self.run_guard(tree='%s\n1candle-core v0.10.2\n' % root_line)
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+
+METADATA_FAILING_STUB = """#!{python}
+import sys
+if 'metadata' in sys.argv:
+    sys.stderr.write('error: failed to load manifest\\n')
+    sys.exit(101)
+sys.stdout.write({out!r})
+"""
+
+
+class CargoMetadata7305(StubCargoCase):
+    """#7305: the guard asks cargo for the local packages, locked, with dependencies."""
+
+    def metadata_argv(self):
+        res = self.run_stub(out=GOOD_TREE_DEPTH, lock=LOCK_WITH_ZIP)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        lines = [json.loads(line) for line in self.argv_log.read_text(encoding='utf-8').splitlines()]
+        metas = [argv for argv in lines if argv and argv[0] == 'metadata']
+        self.assertEqual(len(metas), 1, lines)
+        return metas[0]
+
+    def test_cargo_metadata_argv_is_locked_with_deps_7305(self):
+        argv = self.metadata_argv()
+        self.assertIn('--locked', argv)
+        self.assertEqual(argv[argv.index('--format-version') + 1], '1')
+        self.assertNotIn('--no-deps', argv)
+        self.assertNotIn('--offline', argv)
+
+    def test_cargo_metadata_failure_exits_2_7305(self):
+        stub_dir = self.root.parent / (self.root.name + '.bin')
+        stub_dir.mkdir()
+        self.addCleanup(shutil.rmtree, str(stub_dir), True)
+        stub = stub_dir / 'cargo'
+        stub.write_text(METADATA_FAILING_STUB.format(python=sys.executable, out=GOOD_TREE_DEPTH),
+                        encoding='utf-8')
+        stub.chmod(0o755)
+        (self.root / 'Cargo.lock').write_text(LOCK_WITH_ZIP, encoding='utf-8')
+        env = dict(os.environ)
+        env['PATH'] = str(stub_dir) + os.pathsep + env.get('PATH', '')
+        res = subprocess.run([sys.executable, str(GUARD), '--root', str(self.root)],
+                             capture_output=True, text=True, check=False, env=env)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+
+
+def target_value(argv):
+    """The value after `--target` in a cargo tree argv, or None when the flag or its value is missing."""
+    if '--target' not in argv:
+        return None
+    index = argv.index('--target') + 1
+    return argv[index] if index < len(argv) else None
+
+
+class TargetFlagPosition7312(unittest.TestCase):
+    """#7312: `all` must be the VALUE of --target, not just any token of the argv."""
+
+    def test_all_token_elsewhere_is_not_target_all_7312(self):
+        loose = (['tree', '--all-features', 'all'], ['tree', '--target'],
+                 ['tree', '--target', 'x86_64-unknown-linux-gnu', 'all'], ['tree', 'all', '--target', 'host'])
+        for argv in loose:
+            with self.subTest(argv=argv):
+                self.assertNotEqual(target_value(argv), 'all')
+
+    def test_target_all_value_is_recognised_7312(self):
+        self.assertEqual(target_value(['tree', '--target', 'all', '--locked']), 'all')
 
 
 if __name__ == '__main__':
