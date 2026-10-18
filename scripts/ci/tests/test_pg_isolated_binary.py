@@ -218,13 +218,47 @@ def sweep_patterns(namespace):
     return found
 
 
+def _binding_counts(tree):
+    """name -> how many places bind it anywhere in the tree (assignment, augmented assignment, for/with/except target,
+    walrus, del, def, class, parameter, import, match capture); a name declared global or nonlocal counts twice (#7718)."""
+    counts = {}
+
+    def bump(name, times=1):
+        counts[name] = counts.get(name, 0) + times
+
+    for node in ast.walk(tree):
+        kind = type(node).__name__
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            bump(node.id)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            for name in node.names:
+                bump(name, 2)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bump(node.name)
+        elif isinstance(node, ast.arg):
+            bump(node.arg)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bump(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bump((alias.asname or alias.name).split('.')[0])
+        elif kind in ('MatchAs', 'MatchStar') and node.name:
+            bump(node.name)
+        elif kind == 'MatchMapping' and node.rest:
+            bump(node.rest)
+    return counts
+
+
 def _module_constants(tree):
-    """Module-level `NAME = <int or str literal>` assignments: the constants a %-formatted pattern may use."""
+    """Module-level `NAME = <int or str literal>` assignments whose name is bound exactly once in the whole module and
+    never declared global, augmented, deleted or used as another target: the only constants a %-formatted pattern
+    may use (#7718). Anything else is not folded, so the collector fails closed."""
+    counts = _binding_counts(tree)
     constants = {}
     for node in tree.body:
         if (isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name)
                 and isinstance(node.value, ast.Constant) and isinstance(node.value.value, (int, str))
-                and not isinstance(node.value.value, bool)):
+                and not isinstance(node.value.value, bool) and counts.get(node.targets[0].id) == 1):
             constants[node.targets[0].id] = node.value.value
     return constants
 
@@ -253,18 +287,68 @@ def fold_pattern(node, constants):
         return None
 
 
-def static_regex_calls(source, pinned_literals=frozenset()):
-    """The static collector: every `re.<fn>(...)` call of `source` as ([(fn, folded pattern)], problems).
+# Position of the `flags` parameter in every re.<fn> signature that takes one (#7715).
+FLAGS_SLOT = {'compile': 1, 'match': 2, 'search': 2, 'fullmatch': 2, 'findall': 2, 'finditer': 2, 'split': 3,
+              'sub': 4, 'subn': 4}
+REGEX_INTERNALS = ('sre_compile', 'sre_parse', '_sre')
 
-    Fails closed: a call whose pattern is neither a string literal nor a %-format of one with module-level constants
-    is a problem; `re.compile` is only allowed as the value of a module-level `NAME = ...`; any other re function
-    needs a pattern from `pinned_literals`; a use of `re.<fn>` that is not a call is a problem (flag constants are
-    not functions and are judged through the swept pattern's flags).
-    """
+
+def _fold_flags(node):
+    """The int value of a flags argument built from int literals and re.<FLAG> joined by `|`; None otherwise."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, int) and not isinstance(node.value, bool):
+        return node.value
+    if (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == 're'
+            and node.attr in RE_FLAGS):
+        return int(getattr(re, node.attr))
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        left, right = _fold_flags(node.left), _fold_flags(node.right)
+        return None if left is None or right is None else left | right
+    return None
+
+
+def _call_flags(fn, call):
+    """The constant flags of an `re.<fn>(...)` call read from the positional slot and the keyword: (True, value), or
+    (False, None) when the flags are not a constant (a name, a call, `*args`, `**kwargs`, both slots): fail closed."""
+    if any(isinstance(arg, ast.Starred) for arg in call.args) or any(kw.arg is None for kw in call.keywords):
+        return False, None
+    nodes = [kw.value for kw in call.keywords if kw.arg == 'flags']
+    slot = FLAGS_SLOT.get(fn)
+    if slot is not None and len(call.args) > slot:
+        nodes.append(call.args[slot])
+    if not nodes:
+        return True, 0
+    value = _fold_flags(nodes[0]) if len(nodes) == 1 else None
+    return value is not None, value
+
+
+def _import_problems(tree):
+    """Imports of re other than a plain top-level `import re`, and any import of sre_compile, sre_parse or _sre (#7714)."""
+    problems = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names if alias.name == 're' and alias.asname is None
+                     and node in tree.body]
+            modules = [alias.name for alias in node.names if alias.name not in names]
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            modules = [node.module]
+        else:
+            continue
+        for module in modules:
+            top = module.split('.')[0]
+            if top in REGEX_INTERNALS:
+                problems.append('line %d: import of %s (regex internals)' % (node.lineno, module))
+            elif top == 're':
+                problems.append('line %d: import of re other than a plain top-level `import re`' % node.lineno)
+    return problems
+
+
+def _scan_regex_calls(source, pinned_pairs=frozenset()):
+    """The static collector: ([(fn, folded pattern)], [(pattern, flags) of each re.compile], problems)."""
     tree = ast.parse(source)
     constants = _module_constants(tree)
     parent = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
-    found, problems = [], []
+    pinned_patterns = {pattern for pattern, _flags in pinned_pairs}
+    found, compiled, problems = [], [], _import_problems(tree)
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == 're'):
             continue
@@ -280,13 +364,40 @@ def static_regex_calls(source, pinned_literals=frozenset()):
                             % (node.lineno, node.attr))
             continue
         found.append((node.attr, pattern))
+        known, given = _call_flags(node.attr, call)
+        if not known:
+            problems.append('line %d: re.%s flags is not a constant' % (node.lineno, node.attr))
+            continue
+        try:
+            flags = re.compile(pattern, given).flags
+        except (re.error, ValueError, OverflowError, RecursionError):
+            problems.append('line %d: re.%s pattern or flags do not compile' % (node.lineno, node.attr))
+            continue
         holder = parent.get(call)
         if node.attr == 'compile':
+            compiled.append((pattern, flags))
             if not (isinstance(holder, ast.Assign) and holder in tree.body and len(holder.targets) == 1
                     and isinstance(holder.targets[0], ast.Name)):
                 problems.append('line %d: re.compile outside a module-level assignment' % node.lineno)
-        elif pattern not in pinned_literals:
-            problems.append('line %d: re.%s pattern not pinned: %r' % (node.lineno, node.attr, pattern))
+        elif (pattern, flags) not in pinned_pairs:
+            if pattern in pinned_patterns:
+                problems.append('line %d: re.%s pattern %r not pinned with flags %d' % (node.lineno, node.attr, pattern, flags))
+            else:
+                problems.append('line %d: re.%s pattern not pinned: %r' % (node.lineno, node.attr, pattern))
+    return found, compiled, problems
+
+
+def static_regex_calls(source, pinned_pairs=frozenset()):
+    """The static collector: every `re.<fn>(...)` call of `source` as ([(fn, folded pattern)], problems).
+
+    Fails closed: a call whose pattern is neither a string literal nor a %-format of one with module constants bound
+    exactly once is a problem; so is a flags argument that is not a constant (read from the positional slot and the
+    keyword of every re.<fn> signature); `re.compile` is only allowed as the value of a module-level `NAME = ...`;
+    any other re function needs a (pattern, flags) pair from `pinned_pairs`; a use of `re.<fn>` that is not a call is
+    a problem (flag constants are not functions and are judged through the swept pattern's flags); an import of re
+    other than a plain top-level `import re`, or of sre_compile, sre_parse or _sre, is a problem.
+    """
+    found, _compiled, problems = _scan_regex_calls(source, pinned_pairs)
     return found, problems
 
 
@@ -296,27 +407,39 @@ def regex_audit_problems(source, patterns, pinned):
     Threat model, in plain words: this detects regex additions and changes made in the ordinary way by a first-party
     author, and times them (the timing test). It is NOT a sandbox against a deliberately evasive author: reaching a
     regex through stdlib reflection (sys.modules, argparse or pathlib internals and the like) is outside the claim,
-    and code review covers it. Decision: 3-agent vote (6def5ab6), option C.
+    and code review covers it. The one import rule is plain: any import of re other than a plain top-level
+    `import re` (or of sre_compile, sre_parse, _sre) fails closed, because the collector reads only `re.<fn>`.
+    Decision: 3-agent vote (6def5ab6), option C.
 
-    `source` is the module text, `patterns` the swept compiled patterns of its globals (`sweep_patterns`). Checked:
-    (a) the static collector (`static_regex_calls`) finds no re.<fn> call with a pattern that is not a literal or a
-    %-format of module constants, no compile outside a module-level assignment, and no other call on an unpinned
-    literal; (b) the runtime sweep: every swept (pattern, flags) is a pinned row and every pinned row is present,
-    which also catches a regex the static collector cannot see.
+    `source` is the module text, `patterns` the swept compiled patterns of its globals (`sweep_patterns`). The audit
+    is the union of two views. (a) The static collector (`static_regex_calls`) finds no re.<fn> call with a pattern
+    that is not a literal or a %-format of module constants bound once, no non-constant flags, no compile outside a
+    module-level assignment, and no other call on an unpinned (pattern, flags) pair. (b) The runtime sweep: every
+    swept (pattern, flags) is a pinned row and every pinned row is present, which also catches a regex the static
+    collector cannot see. A static compile whose pair has no pinned row and no swept object (del, overwrite) is
+    reported too (#7716).
     """
-    pinned_literals = {row[0] for row in pinned}
-    _found, problems = static_regex_calls(source, pinned_literals)
     pins = {(pattern, flags) for pattern, flags, _reason, _generators in pinned}
-    found = {(value.pattern, value.flags) for value in patterns.values()}
-    problems.extend('not pinned: %r flags %d' % key for key in sorted(found - pins))
-    problems.extend('pinned but absent: %r flags %d' % key for key in sorted(pins - found))
+    _found, compiled, problems = _scan_regex_calls(source, pins)
+    swept = {(value.pattern, value.flags) for value in patterns.values()}
+    problems.extend('not pinned: %r flags %d' % key for key in sorted(swept - pins))
+    problems.extend('pinned but absent: %r flags %d' % key for key in sorted(pins - swept))
+    problems.extend('compiled but not pinned (not swept): %r flags %d' % key
+                    for key in sorted(set(compiled) - pins - swept))
     return problems
 
 
 def import_form_clashes(source):
     """Modules imported both as `import X` and as `from X import ...` in `source` (CodeQL py/import-and-import-from,
     alert 524, #7653, #7713). A CodeQL-regression pin, not a sandbox."""
-    return []
+    tree = ast.parse(source)
+    plain, named = set(), set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            plain.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            named.add(node.module)
+    return sorted(plain & named)
 
 
 def implicit_concat_lines(source_bytes):
@@ -1577,10 +1700,10 @@ class TemplateOwnership(unittest.TestCase):
                 ('overwrite of an unpinned compile', "_T_RE = re.compile(r'(a+)+$')\n_T_RE = None\n",
                  "compiled but not pinned (not swept): '(a+)+$' flags 32"),
                 ('del of a pinned object', "del _HEX_RE\n",
-                 "compiled but not swept: '[0-9A-Fa-f]+' flags 32")):
+                 "pinned but absent: '[0-9A-Fa-f]+' flags 32")):
             with self.subTest(case=label):
                 module, _path = self._load_copy(source + '\n' + extra)
-                self.assertNotIn('_T_RE' if 'T_RE' in extra else '_HEX_RE', vars(module))
+                self.assertNotIsInstance(vars(module).get('_T_RE' if 'T_RE' in extra else '_HEX_RE'), re.Pattern)
                 problems = regex_audit_problems(source + '\n' + extra, sweep_patterns(vars(module)), PINNED_REGEXES)
                 self.assertIn(expected, problems)
 

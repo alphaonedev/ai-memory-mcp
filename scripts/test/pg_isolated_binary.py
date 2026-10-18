@@ -375,8 +375,10 @@ def server_caps_sql(env: Dict[str, str]) -> str:
 # refused when ANY identifier or string-literal token, anywhere in it, equals a name from _FORBIDDEN_NAMES (after
 # quoted, U&, UESCAPE and E-string decoding and ASCII lower-casing), or when it holds a second statement, DO,
 # DISCARD, RESET ALL, ALTER SYSTEM, SET [SESSION] AUTHORIZATION, CREATE [OR REPLACE] FUNCTION, CREATE [OR REPLACE]
-# PROCEDURE, CALL (a function or procedure body is code the guard cannot read, #7704), an E-string octal escape above
-# \377 (PostgreSQL keeps only the low byte, so the decode could differ, #7703), or anything the guard cannot tokenise.
+# PROCEDURE, CALL (a function or procedure body is code the guard cannot read, #7704), an octal escape above \377 in an
+# E-string, or in a plain literal such as '\563' (whether a backslash escapes there depends on
+# standard_conforming_strings, which the wrapper does not control; PostgreSQL keeps only the low byte, so the decode
+# could differ, #7703, #7717), or anything the guard cannot tokenise.
 #
 # scan.l rules mirrored here:
 #   space              [ \t\n\r\f\v]  ASCII only; every other byte (a no-break space, U+2003, ...) is part of a token
@@ -437,10 +439,11 @@ def _unicode_unescape(body: str, escape: str) -> str:
     return ''.join(out)
 
 
-def _decode_e(body: str) -> str:
+def _decode_e(body: str, literal: str = 'an E-string') -> str:
     """Decode the escapes of an ``E''`` literal body (``\\n``, ``\\101``, ``\\x41``, ``\\u0041``, ``\\U00000041``,
     ``\\'``; any other escaped character is itself) and a doubled quote. A malformed escape is kept verbatim: the
-    server rejects it, and the raw text is still compared."""
+    server rejects it, and the raw text is still compared. An octal escape above ``\\377`` raises ``WrapperError``;
+    ``literal`` names the literal kind in that error ('an E-string' or 'a plain-literal', #7717)."""
     out: List[str] = []
     i, n = 0, len(body)
     while i < n:
@@ -464,8 +467,9 @@ def _decode_e(body: str) -> str:
                 if value > 0o377:
                     # PostgreSQL keeps only the low byte of an octal escape (scan.l unsigned char), so a value above
                     # \377 could decode differently here: refuse it (#7703).
-                    raise WrapperError('refusing SQL with an E-string octal escape above \\377 (PostgreSQL keeps only '
-                                       'the low byte; the guard cannot read it the same way) (%r)' % body[:40])
+                    raise WrapperError('refusing SQL with %s octal escape above \\377 (PostgreSQL keeps only '
+                                       'the low byte; the guard cannot read it the same way) (%r)'
+                                       % (literal, body[:40]))
                 out.append(chr(value))
                 i = j
             elif nxt in 'xuU':
@@ -564,7 +568,8 @@ def _plain_literal(sql: str, i: int, raw: List[Tuple[str, str]]) -> int:
 
     Whether a backslash escapes depends on standard_conforming_strings (a session setting the wrapper does not
     control), so the literal is read both ways: if the two readings end at different places the statement is
-    refused; if they end together but decode differently both values are kept for the name check (#7577)."""
+    refused; if they end together but decode differently both values are kept for the name check (#7577). An octal
+    escape above ``\\377`` in a plain literal such as ``'\\563'`` is refused too, as in an E-string (#7717)."""
     end, body = _literal(sql, i, True, False)
     plain = body.replace("''", "'")
     if '\\' not in sql[i:end]:
@@ -575,7 +580,7 @@ def _plain_literal(sql: str, i: int, raw: List[Tuple[str, str]]) -> int:
         raise WrapperError('refusing SQL whose string literal ends differently under '
                            'standard_conforming_strings=off (%r)' % sql[:60])
     raw.append((_STR, plain))
-    decoded = _decode_e(body_bs)
+    decoded = _decode_e(body_bs, 'a plain-literal')
     if decoded != plain:
         raw.append((_STR_ALT, decoded))
     return end
