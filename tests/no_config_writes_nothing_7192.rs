@@ -63,7 +63,8 @@ fn boot_in_fresh_home(no_config: bool) -> (tempfile::TempDir, PathBuf, Vec<PathB
         .current_dir(dir.path())
         .env_clear()
         .env("HOME", &home)
-        .env("AI_MEMORY_AUDIT_DIR", &audit_dir);
+        .env("AI_MEMORY_AUDIT_DIR", &audit_dir)
+        .env("AI_MEMORY_KEY_DIR", &key_dir);
     if no_config {
         cmd.env("AI_MEMORY_NO_CONFIG", "1");
     } else {
@@ -94,8 +95,11 @@ fn no_config_boot_writes_no_config_toml_7192() {
             p.display()
         );
     }
-    // With the audit directory pinned outside HOME, a NO_CONFIG boot leaves
-    // HOME completely empty on every OS.
+    // `identity generate` is a key-provisioning verb (no boot key ensure,
+    // src/main.rs `is_key_provisioning_verb`) and gets an explicit
+    // `--key-dir`, so with the audit directory pinned outside HOME this
+    // NO_CONFIG boot leaves HOME empty on every OS; other verbs legitimately
+    // create the host signing key under HOME.
     assert!(
         found.is_empty(),
         "#7192: NO_CONFIG boot left entries under {}: {found:?}",
