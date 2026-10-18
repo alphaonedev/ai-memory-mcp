@@ -18,6 +18,7 @@ import datetime
 import hashlib
 import importlib.util
 import json
+import html
 import os
 import re
 import shutil
@@ -35,6 +36,8 @@ REPO = Path(__file__).resolve().parents[3]
 SCRIPT_NAME = 'recapture-cert-3607-posture.py'
 SCRATCH = REPO / '.local-runs'
 OUT_REL = Path('docs') / 'compliance' / 'evidence' / 'cert-3607'
+DOCTOR_STDERR_LINE = ('ai-memory doctor --posture: live PRAGMA synchronous not observed on '
+                      'ai-memory.db: database does not exist; refusing to create (read-only)')
 HEADER_RE = re.compile(
     r'^# posture-legs transcript — recorded exit codes '
     r'\((\d{4}-\d{2}-\d{2}) #3607 re-issue recapture \(22 checks\) @ ([0-9a-f]+)\)$')
@@ -64,9 +67,16 @@ if args[:1] == ['doctor'] and '--posture' not in args:
     sys.exit(1)
 fails = 10 if not hard else (0 if sqlcipher else 2)
 print('[PASS] sample ' + env['AI_MEMORY_KEY_DIR'] + ' HOME=' + env['HOME'])
-# like the real doctor: any ai-memory.db in the cwd is "observed" (#7648)
-print('live PRAGMA synchronous agrees' if os.path.exists('ai-memory.db')
-      else 'live pragma not observed')
+# like the real doctor: any ai-memory.db in the cwd is "observed" (#7648); without one the real
+# binary writes this line to stderr (src/cli/doctor.rs:873 with the reason string of
+# src/storage/connection.rs:1169) and the check row says "live pragma not observed" (#7697)
+if os.path.exists('ai-memory.db'):
+    print('live PRAGMA synchronous agrees')
+else:
+    sys.stderr.write('ai-memory doctor --posture: live PRAGMA synchronous not observed on '
+                     'ai-memory.db: database does not exist; refusing to create (read-only)\\n')
+    sys.stderr.flush()
+    print('live pragma not observed')
 for i in range(fails):
     print('[FAIL] check %%d' %% i)
 tail = 'overall: ' + ('FAIL' if fails else 'PASS')
@@ -136,6 +146,23 @@ class RecaptureBase(unittest.TestCase):
                               capture_output=True, text=True, check=True)
         return done.stdout
 
+    def commit_evidence(self):
+        """Commit the bundle exactly as it stands on disk (#7696: the run trusts git HEAD).
+
+        The manifest is not rewritten, so a test that tampered with a file still shows the
+        tampering to the run; only a bundle that was never committed is made committed."""
+        evidence = self.root / OUT_REL
+        if not evidence.is_dir() or evidence.is_symlink():
+            return
+        if not (evidence / 'MANIFEST.sha256').exists():
+            write_manifest(evidence)  # a first run publishes none; the committed bundle has one
+        subprocess.run(['git', '-C', str(self.root), 'add', '-f', '--', str(OUT_REL)],
+                       capture_output=True, check=False)
+        subprocess.run(['git', '-C', str(self.root), '-c', 'user.name=t',
+                        '-c', 'user.email=sandbox@localhost', '-c', 'commit.gpgsign=false',
+                        'commit', '-q', '--allow-empty', '-m', 'evidence'],
+                       capture_output=True, check=False)
+
     def make_stub(self, name):
         path = self.root / name
         path.write_text(STUB)
@@ -171,14 +198,17 @@ class RecaptureBase(unittest.TestCase):
     def popen_recapture(self, sqlcipher_bin=None, extra_env=None, default_bin=None, cwd=None):
         """Start the script in its own session so a test can SIGKILL it mid-run."""
         env = self.base_env(sqlcipher_bin, extra_env, default_bin)
+        self.commit_evidence()
         script = self.root / 'scripts' / SCRIPT_NAME
         return subprocess.Popen([sys.executable, str(script)], env=env,
                                 cwd=str(cwd or self.root), stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
 
     def run_recapture(self, sqlcipher_bin=None, args=None, extra_env=None, default_bin=None,
-                      cwd=None, script_root=None):
+                      cwd=None, script_root=None, commit=True):
         env = self.base_env(sqlcipher_bin, extra_env, default_bin)
+        if commit:
+            self.commit_evidence()
         script = (script_root or self.root) / 'scripts' / SCRIPT_NAME
         cmd = ['bash', str(script)] if script.suffix == '.sh' else [sys.executable, str(script)]
         cmd += list(args or [])
@@ -334,6 +364,7 @@ class Argparse7402(RecaptureBase):
         done, _ = self.run_recapture()
         self.assertEqual(done.returncode, 0, done.stderr)
         out_dir = self.root / OUT_REL
+        self.commit_evidence()
         before = {p.name: p.read_bytes() for p in out_dir.iterdir()}
         done, _ = self.run_recapture(args=['--help'])
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -1028,7 +1059,7 @@ class SanitizerEveryOccurrence7651(RecaptureBase):
         ('fix', '/mnt/x/repo/.local-runs/cert-3607-fixtures',
          '<repo-root>/.local-runs/cert-3607-fixtures'),
     )
-    # 66 forms: the r9 probe shapes plus pipe, backslash, quotes, brackets and escapes.
+    # 68 forms: the r9 probe shapes plus pipe, backslash, quotes, brackets and escapes.
     PROBE_FORMS = (
         '\u00a7', '\u00a7/x', '"\u00a7"', "'\u00a7'", '`\u00a7`', '(\u00a7)', '[\u00a7]', '<\u00a7>',
         '=\u00a7', ':\u00a7', '\u00a7:', ',\u00a7', '{\u00a7}', '${\u00a7}', 'a,\u00a7', '\u00a7,\u00a7',
@@ -1335,6 +1366,7 @@ class StagedBundle7574(SymlinkBase):
     def test_a_run_that_fails_at_leg_four_leaves_the_previous_bundle_untouched(self):
         done, _ = self.run_recapture()
         self.assertEqual(done.returncode, 0, done.stderr)
+        self.commit_evidence()
         before = self.snapshot()
         self.assertIn('posture-sqlcipher-pass.out', before)
         failing = self.make_failing_stub(self.root / 'failing-default', 'run-two-marker')
@@ -1352,31 +1384,31 @@ class StagedBundle7574(SymlinkBase):
         self.assertFalse(self.evidence().exists())
         self.assert_no_staging()
 
-    def test_a_successful_run_replaces_the_bundle_and_keeps_other_files(self):
+    def test_a_successful_run_replaces_the_bundle_and_keeps_other_listed_files(self):
         done, _ = self.run_recapture()
         self.assertEqual(done.returncode, 0, done.stderr)
-        (self.evidence() / 'SANITIZATION.md').write_bytes(b'kept\n')
-        (self.evidence() / 'sub').mkdir()
-        (self.evidence() / 'sub' / 'n.txt').write_bytes(b'nested\n')
-        (self.evidence() / 'stale.raw').write_bytes(b'raw leftover\n')
+        (self.evidence() / 'SANITIZATION.md').write_bytes(b'kept\n' + SEED_PROVENANCE.encode())
+        (self.evidence() / 'test-results.txt').write_bytes(b'nested\n')
+        write_manifest(self.evidence())
         marker = self.make_logging_stub(self.root / 'marker-default', self.home / 'calls.log')
         done, _ = self.run_recapture(default_bin=marker)
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual((self.evidence() / 'SANITIZATION.md').read_bytes(), b'kept\n')
-        self.assertEqual((self.evidence() / 'sub' / 'n.txt').read_bytes(), b'nested\n')
-        self.assertFalse((self.evidence() / 'stale.raw').exists())
+        self.assertTrue((self.evidence() / 'SANITIZATION.md').read_bytes().startswith(b'kept\n'))
+        self.assertEqual((self.evidence() / 'test-results.txt').read_bytes(), b'nested\n')
+        self.assertEqual(manifest_problems(self.evidence()), [])
         self.assertEqual(self.evidence().stat().st_mode & 0o777, 0o700)
         self.assert_no_staging()
 
-    def test_a_symlink_in_the_previous_bundle_is_not_copied_into_the_new_one(self):
+    def test_a_symlink_in_the_previous_bundle_refuses_and_is_never_followed(self):
         done, _ = self.run_recapture()
         self.assertEqual(done.returncode, 0, done.stderr)
         outside = self.outside()
         (self.evidence() / 'leak').symlink_to(outside)
         done, _ = self.run_recapture()
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertFalse((self.evidence() / 'leak').exists())
-        self.assertFalse((self.evidence() / 'leak').is_symlink())
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('leak', done.stderr)
+        self.assertIn('symlink', done.stderr)
+        self.assertTrue((self.evidence() / 'leak').is_symlink())
         self.assertEqual(list(outside.iterdir()), [])
         self.assert_no_staging()
 
@@ -1385,6 +1417,11 @@ class StagedBundle7574(SymlinkBase):
         doc = ' '.join(module.__doc__.split())
         self.assertIn('staging directory', doc)
         self.assertIn('never mixes legs of two runs', doc)
+
+
+SEED_PROVENANCE = (
+    'Provenance: posture captures recorded at tip `' + '0' * 40 + '` on 2000-01-01 (UTC); '
+    'rewritten by scripts/recapture-cert-3607-posture.py on every recapture.\n')
 
 
 def sha256_hex(path):
@@ -1410,6 +1447,16 @@ def manifest_problems(bundle):
         if not target.is_file() or sha256_hex(target) != digest:
             problems.append(name)
     return problems
+
+
+def scrub_identity(data):
+    """The bundle bytes with the two run-identity fields blanked: the header sha of
+    posture-legs-exit-codes.txt and the SANITIZATION.md provenance line (they name the HEAD
+    the run was made at, which the test commit between two runs changes)."""
+    text = data.decode('utf-8', 'replace')
+    text = re.sub(r'(#3607 re-issue recapture \(22 checks\) @ )[0-9a-f]+', r'\1<sha>', text)
+    text = re.sub(r'^Provenance: .*$', 'Provenance: <line>', text, flags=re.M)
+    return text.encode('utf-8')
 
 
 def tree_names(base, predicate):
@@ -1551,9 +1598,11 @@ class WorkDirs7609(SymlinkBase):
         """A first run, then SANITIZATION.md and a MANIFEST.sha256 over the bundle."""
         done, _ = self.run_recapture()
         self.assertEqual(done.returncode, 0, done.stderr)
-        (self.evidence() / 'SANITIZATION.md').write_bytes(b'kept note\n')
+        (self.evidence() / 'SANITIZATION.md').write_bytes(
+            b'kept note\n' + SEED_PROVENANCE.encode())
         (self.evidence() / 'named-tests.txt').write_bytes(b'original named tests\n')
         write_manifest(self.evidence())
+        self.commit_evidence()
         return self.snapshot()
 
     def snapshot(self):
@@ -1563,7 +1612,7 @@ class WorkDirs7609(SymlinkBase):
     def assert_complete_and_clean(self):
         evidence = self.evidence()
         self.assertEqual(manifest_problems(evidence), [])
-        self.assertEqual((evidence / 'SANITIZATION.md').read_bytes(), b'kept note\n')
+        self.assertTrue((evidence / 'SANITIZATION.md').read_bytes().startswith(b'kept note\n'))
         self.assertTrue((evidence / 'posture-bare-env.out').is_file())
         self.assertRegex(self.out('posture-legs-exit-codes.txt').split('\n', 1)[0], HEADER_RE)
         self.assertEqual(sorted(p.name for p in evidence.parent.iterdir()), ['cert-3607'])
@@ -1627,6 +1676,7 @@ class WorkDirs7609(SymlinkBase):
     def run_driver(self, prelude):
         driver = self.home / 'driver.py'
         driver.write_text(DRIVER)
+        self.commit_evidence()
         script = self.root / 'scripts' / SCRIPT_NAME
         return subprocess.run([sys.executable, str(driver), str(script), prelude],
                               env=self.base_env(), cwd=str(self.root), capture_output=True,
@@ -2045,10 +2095,6 @@ class SwapReplaceDocs7539(SymlinkBase):
         self.assertIn('symlinked parent, a symlink at the passphrase', doc)
 
 
-if __name__ == '__main__':
-    unittest.main()
-
-
 class ChildCwd7648(SymlinkBase):
     """#7648: every child (keygen, the seed, each leg, git) runs in its OWN fresh empty 0700
     cwd with HOME inside the same per-child sandbox; keygen creates ai-memory.db in its cwd
@@ -2097,9 +2143,30 @@ class ChildCwd7648(SymlinkBase):
             text = (self.root / OUT_REL / name).read_text()
             with self.subTest(file=name):
                 self.assertNotIn('agrees', text)
-                self.assertNotIn('ai-memory.db', text)
+                self.assertNotIn('ai-memory.db', text.replace(DOCTOR_STDERR_LINE, ''))
                 if name != 'posture-hardened-boot-refusal.out':  # a refusal prints no checks
                     self.assertIn('live pragma not observed', text)
+                    self.assertIn(DOCTOR_STDERR_LINE, text)  # #7697: the stderr line too
+
+    def test_the_stub_prints_the_doctor_stderr_line_the_real_binary_prints(self):
+        """#7697: the stub's stderr is the doctor line of src/cli/doctor.rs:873, so the test
+        exercises the stderr merge the real capture goes through."""
+        done = subprocess.run([str(self.default_bin), 'doctor', '--posture'], cwd=str(self.home),
+                              env=self.base_env(extra_env={
+                                  'AI_MEMORY_KEY_DIR': str(self.home)}),
+                              capture_output=True, text=True)
+        self.assertEqual(done.stderr, DOCTOR_STDERR_LINE + '\n')
+        self.assertIn('live pragma not observed', done.stdout)
+        self.assertNotIn(DOCTOR_STDERR_LINE, done.stdout)
+
+    def test_docstring_names_the_real_doctor_line_and_the_not_observed_difference(self):
+        doc = ' '.join(load_script_module().__doc__.split())
+        self.assertIn(DOCTOR_STDERR_LINE.replace('ai-memory doctor --posture: ', ''), doc)
+        self.assertIn('posture-bare-env.out:75', doc)
+        self.assertIn('posture-hardened-env.out:68', doc)
+        self.assertIn('agrees', doc)
+        self.assertIn('#7648', doc)
+        self.assertNotIn('prints no stderr', doc)
 
     def test_a_leg_never_finds_a_store_through_its_cwd(self):
         done, _ = self.run_recapture()
@@ -2111,6 +2178,7 @@ class ChildCwd7648(SymlinkBase):
     def test_two_consecutive_runs_give_byte_identical_bundles(self):
         first, _ = self.run_recapture()
         self.assertEqual(first.returncode, 0, first.stderr)
+        self.commit_evidence()
         before = self.bundle()
         self.assertTrue((self.root / '.local-runs' / 'cert-3607-fixtures' / 'keys'
                          / 'operator.key').is_file())  # the second run skips keygen
@@ -2119,19 +2187,27 @@ class ChildCwd7648(SymlinkBase):
         after = self.bundle()
         self.assertEqual(sorted(after), sorted(before))
         for name in before:
+            if name == 'MANIFEST.sha256':
+                continue  # its digests follow the two identity fields below
             with self.subTest(file=name):
-                self.assertEqual(after[name], before[name])
+                self.assertEqual(scrub_identity(after[name]), scrub_identity(before[name]))
 
     def test_a_run_with_the_key_present_matches_a_run_that_makes_it(self):
         done, _ = self.run_recapture()
         self.assertEqual(done.returncode, 0, done.stderr)
+        self.commit_evidence()
         made = self.bundle()
         keys = self.root / '.local-runs' / 'cert-3607-fixtures' / 'keys'
         for name in ('operator.key', 'operator.key.pub'):
             (keys / name).unlink()  # the third run makes the pair again
         done, _ = self.run_recapture()
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(self.bundle(), made)
+        now = self.bundle()
+        self.assertEqual(sorted(now), sorted(made))
+        for name in made:
+            if name != 'MANIFEST.sha256':
+                with self.subTest(file=name):
+                    self.assertEqual(scrub_identity(now[name]), scrub_identity(made[name]))
 
     def test_every_subprocess_runs_in_a_per_child_directory(self):
         tree = ast.parse((REPO / 'scripts' / SCRIPT_NAME).read_text())
@@ -2170,8 +2246,9 @@ class ManifestVerify7649(RecaptureBase):
         done, _ = self.run_recapture()
         self.assertEqual(done.returncode, 0, done.stderr)
         (self.evidence() / 'test-results.txt').write_bytes(b'test result: ok. 3 passed\n')
-        (self.evidence() / 'SANITIZATION.md').write_bytes(b'note\n')
+        (self.evidence() / 'SANITIZATION.md').write_bytes(b'note\n' + SEED_PROVENANCE.encode())
         write_manifest(self.evidence())
+        self.commit_evidence()
         return self.snapshot()
 
     def lines(self):
@@ -2191,9 +2268,12 @@ class ManifestVerify7649(RecaptureBase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(manifest_problems(self.evidence()), [])
         new_lines = self.lines()
-        for name in ('test-results.txt', 'SANITIZATION.md'):
-            self.assertEqual(new_lines[name], old_lines[name])
-            self.assertEqual((self.evidence() / name).read_bytes(), before[name])
+        self.assertEqual(new_lines['test-results.txt'], old_lines['test-results.txt'])
+        self.assertEqual((self.evidence() / 'test-results.txt').read_bytes(),
+                         before['test-results.txt'])
+        # #7699: SANITIZATION.md keeps its prose, but its provenance line is rewritten
+        self.assertNotEqual(new_lines['SANITIZATION.md'], old_lines['SANITIZATION.md'])
+        self.assertTrue((self.evidence() / 'SANITIZATION.md').read_bytes().startswith(b'note\n'))
         self.assertEqual(sorted(new_lines), sorted(old_lines))
 
     def test_an_edited_test_results_file_makes_the_run_refuse(self):
@@ -2280,7 +2360,8 @@ class ManifestVerify7649(RecaptureBase):
 
     def test_docstring_states_the_verification(self):
         doc = ' '.join(load_script_module().__doc__.split())
-        self.assertIn('verified against its committed manifest', doc)
+        self.assertIn('as committed in git HEAD', doc)
+        self.assertIn('git show HEAD:', doc)
         self.assertIn('never re-hashes', doc)
 
 
@@ -2377,6 +2458,429 @@ class RealPaths7650(RecaptureBase):
         self.assertIn('os.path.realpath', text)
 
 
+class CommittedManifest7696(RecaptureBase):
+    """#7696: the trust anchor is MANIFEST.sha256 as COMMITTED (`git show HEAD:<path>`), never
+    the file on disk. Before any run: the manifest exists in HEAD, the working-tree manifest is
+    byte-identical to it, the set of every file and directory under the bundle (recursive, no
+    symlink) equals the manifest set exactly, and every listed digest matches. A refusal exits 1,
+    names the offender, runs no binary and publishes nothing."""
+
+    def evidence(self):
+        return self.root / OUT_REL
+
+    def snapshot(self):
+        found = {}
+        for path in sorted(self.evidence().rglob('*')):
+            rel = str(path.relative_to(self.evidence()))
+            if path.is_symlink():
+                found[rel] = ('link', os.readlink(str(path)))
+            elif path.is_dir():
+                found[rel] = ('dir',)
+            else:
+                found[rel] = ('file', path.read_bytes())
+        return found
+
+    def seed(self):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        (self.evidence() / 'test-results.txt').write_bytes(b'test result: ok. 3 passed\n')
+        (self.evidence() / 'SANITIZATION.md').write_bytes(b'note\n' + SEED_PROVENANCE.encode())
+        write_manifest(self.evidence())
+        self.commit_evidence()
+
+    def refuses(self, tamper, *names):
+        """Seed, tamper, run with a logging binary: the run must refuse and change nothing."""
+        self.seed()
+        log = self.home / 'ran.log'
+        default = self.make_logging_stub(self.root / 'logging-default', log)
+        tamper()
+        before = self.snapshot()
+        done, _ = self.run_recapture(default_bin=default, commit=False)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertNotIn('Traceback', done.stderr)
+        for name in names:
+            self.assertIn(name, done.stderr)
+        self.assertFalse(log.exists(), 'a binary ran although the bundle failed verification')
+        self.assertEqual(self.snapshot(), before)
+        work = self.root / '.local-runs' / 'cert-3607-work'
+        left = [p.name for p in work.iterdir()] if work.is_dir() else []
+        self.assertEqual([n for n in left if n != '.lock'], [], left)
+        return done
+
+    def test_a_dropped_manifest_line_plus_an_edit_refuses(self):
+        def tamper():
+            manifest = self.evidence() / 'MANIFEST.sha256'
+            manifest.write_text(''.join(line for line in manifest.read_text().splitlines(True)
+                                        if not line.endswith('  test-results.txt\n')))
+            with open(str(self.evidence() / 'test-results.txt'), 'ab') as handle:
+                handle.write(b'test result: ok. 999 passed\n')
+        self.refuses(tamper, 'MANIFEST.sha256')
+
+    def test_a_deleted_manifest_plus_an_edit_refuses(self):
+        def tamper():
+            (self.evidence() / 'MANIFEST.sha256').unlink()
+            with open(str(self.evidence() / 'test-results.txt'), 'ab') as handle:
+                handle.write(b'test result: ok. 999 passed\n')
+        self.refuses(tamper, 'MANIFEST.sha256')
+
+    def test_an_extra_file_refuses(self):
+        self.refuses(lambda: (self.evidence() / 'extra.txt').write_bytes(b'planted\n'),
+                     'extra.txt', 'not listed')
+
+    def test_an_extra_empty_subdirectory_refuses(self):
+        self.refuses(lambda: (self.evidence() / 'extra-dir').mkdir(), 'extra-dir', 'not listed')
+
+    def test_an_extra_subdirectory_with_a_file_refuses_naming_both(self):
+        def tamper():
+            (self.evidence() / 'sub').mkdir()
+            (self.evidence() / 'sub' / 'n.txt').write_bytes(b'nested\n')
+        self.refuses(tamper, 'sub', 'sub/n.txt')
+
+    def test_a_symlink_inside_the_bundle_refuses(self):
+        outside = self.root / 'outside-dir'
+        outside.mkdir()
+        self.refuses(lambda: (self.evidence() / 'leak').symlink_to(outside), 'leak', 'symlink')
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_a_symlink_that_replaces_a_listed_file_refuses(self):
+        def tamper():
+            target = self.evidence() / 'test-results.txt'
+            kept = self.root / 'kept-results'
+            kept.write_bytes(target.read_bytes())
+            target.unlink()
+            target.symlink_to(kept)
+        self.refuses(tamper, 'test-results.txt', 'symlink')
+
+    def test_a_working_tree_manifest_edit_refuses_even_when_every_file_matches_it(self):
+        def tamper():
+            manifest = self.evidence() / 'MANIFEST.sha256'
+            manifest.write_text(''.join(reversed(manifest.read_text().splitlines(True))))
+        self.refuses(tamper, 'MANIFEST.sha256', 'committed')
+
+    def test_a_listed_file_edit_and_a_recomputed_manifest_refuses(self):
+        def tamper():
+            with open(str(self.evidence() / 'test-results.txt'), 'ab') as handle:
+                handle.write(b'test result: ok. 999 passed\n')
+            write_manifest(self.evidence())  # the attacker also recomputes the manifest
+        self.refuses(tamper, 'MANIFEST.sha256')
+
+    def test_a_bundle_whose_manifest_is_not_in_head_refuses(self):
+        def tamper():
+            self.git('rm', '-q', '--cached', '--', str(OUT_REL / 'MANIFEST.sha256'))
+            self.git('-c', 'user.name=t', '-c', 'user.email=sandbox@localhost',
+                     '-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'untrack manifest')
+        self.refuses(tamper, 'MANIFEST.sha256', 'not committed')
+
+    def test_a_missing_listed_file_still_refuses_naming_it(self):
+        self.refuses(lambda: (self.evidence() / 'test-results.txt').unlink(), 'test-results.txt')
+
+    def test_a_clean_committed_bundle_passes_and_a_second_commit_is_needed(self):
+        self.seed()
+        done, _ = self.run_recapture(commit=False)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        # the recapture changed the working tree: without a commit it now refuses
+        again, _ = self.run_recapture(commit=False)
+        self.assertEqual(again.returncode, 1, again.stderr)
+        self.assertIn('MANIFEST.sha256', again.stderr)
+        self.commit_evidence()
+        third, _ = self.run_recapture(commit=False)
+        self.assertEqual(third.returncode, 0, third.stderr)
+
+    def test_the_committed_manifest_is_read_from_git_not_the_disk(self):
+        text = (REPO / 'scripts' / SCRIPT_NAME).read_text()
+        self.assertIn('"show", "HEAD:./" + MANIFEST_REL', text)
+
+    def test_docstring_says_committed_manifest_literally(self):
+        doc = ' '.join(load_script_module().__doc__.split())
+        self.assertIn('git show HEAD:', doc)
+        self.assertIn('as committed in git HEAD', doc)
+        self.assertIn('byte-identical to the committed one', doc)
+        self.assertIn('every directory', doc)
+
+    def test_the_cert_doc_says_the_manifest_is_the_one_committed_in_git_head(self):
+        doc = ' '.join((REPO / 'docs' / 'compliance'
+                        / 'ENTERPRISE-FEDERATION-CERTIFICATION.md').read_text().split())
+        self.assertGreaterEqual(doc.count('as committed in git HEAD'), 2)
+        self.assertNotIn('does not match its committed `MANIFEST.sha256`', doc)
+
+
+class DetectorTable7698(RecaptureBase):
+    """#7698: sanitize() makes no completeness claim. After redaction a fail-closed detector
+    builds decoded views of every capture (repeated case-insensitive percent decoding, JSON
+    \\u and \\/ unescaping, html.unescape, text joined across line wraps) and the run refuses,
+    naming the capture and the form, when a sensitive value shows in any of them. Each form
+    below is either redacted or refused; none passes through."""
+
+    HOME = '/home/probe-user_1'
+    ROOT = '/mnt/xq7/r-probe'
+    CORES = ('homeprobeuserx1', 'homeprobeuser1', 'mntxq7rprobe')
+
+    def patched(self):
+        module = load_script_module()
+        module.ROOT = Path(self.ROOT)
+        module.FIX = module.ROOT / '.local-runs' / 'cert-3607-fixtures'
+        module.HOME = self.HOME
+        return module
+
+    @staticmethod
+    def percent(text, upper=True, dash_only=False):
+        out = []
+        for char in text:
+            encode = char in '-_' if dash_only else not char.isalnum()
+            code = '%%%02X' % ord(char)
+            out.append((code if upper else code.lower()) if encode else char)
+        return ''.join(out)
+
+    @staticmethod
+    def unicode_escape(text, upper=False, slash_only_escaped=False):
+        out = []
+        for char in text:
+            if char == '/' and slash_only_escaped:
+                out.append('\\/')
+            else:
+                code = '\\u%04x' % ord(char)
+                out.append(code.upper().replace('\\U', '\\u') if upper else code)
+        return ''.join(out)
+
+    def reviewer_forms(self, path):
+        """The reviewer's 15 forms of path."""
+        half = len(path) // 2
+        return (
+            ('percent mixed case', path.replace('/', '%2F', 1).replace('/', '%2f')),
+            ('percent upper, every non-alphanumeric', self.percent(path)),
+            ('percent lower, every non-alphanumeric', self.percent(path, upper=False)),
+            ('percent of the dash and underscore only', self.percent(path, dash_only=True)),
+            ('json slash escape, other characters u-escaped',
+             self.unicode_escape(path, slash_only_escaped=True)),
+            ('u-escape of every character, lower hex', self.unicode_escape(path)),
+            ('u-escape of every character, upper hex', self.unicode_escape(path, upper=True)),
+            ('html decimal entity for the slash', path.replace('/', '&#47;')),
+            ('html hex entity for the slash', path.replace('/', '&#x2F;')),
+            ('wrapped across a line', path[:half] + '\n' + path[half:]),
+            ('wrapped across a line with indentation', path[:half] + '\n    ' + path[half:]),
+            ('ansi sequence inside', path[:half] + '\x1b[0m' + path[half:]),
+            ('doubled slash', path.replace('/', '//', 1)),
+            ('dot segment', path.replace('/', '/./', 1)),
+            ('double percent', self.percent(path).replace('%', '%25')),
+        )
+
+    def extra_forms(self, path):
+        return (
+            ('json twice', json.dumps(json.dumps(path)[1:-1])[1:-1].replace('/', '\\\\/')),
+            ('percent lower, slash only', path.replace('/', '%2f')),
+        )
+
+    def forms(self):
+        table = []
+        for label, form in self.reviewer_forms(self.HOME):
+            table.append(('reviewer: ' + label, form))
+        for form in SanitizerEveryOccurrence7651.PROBE_FORMS:
+            table.append(('existing: ' + form.encode('unicode_escape').decode(),
+                          form.replace('§', self.HOME)))
+        return table
+
+    @staticmethod
+    def oracle_view(text):
+        """An independent decoding (not the script's): everything but letters and digits is
+        dropped after unquoting, unescaping and removing ANSI sequences, so any rendering of
+        the value that a reader could put back together is found."""
+        for _ in range(6):
+            text = urllib.parse.unquote(text)
+            text = html.unescape(text)
+            text = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), text)
+        text = re.sub(r'\x1b\[[0-9;]*[A-Za-z]', '', text)
+        return re.sub(r'[^a-z0-9]', '', text.lower())
+
+    def test_the_table_has_83_distinct_forms(self):
+        table = self.forms()
+        self.assertEqual(len(table), 15 + 68)
+        self.assertEqual(len(SanitizerEveryOccurrence7651.PROBE_FORMS), 68)
+        self.assertEqual(len(self.reviewer_forms(self.HOME)), 15)
+        self.assertEqual(len({form for _, form in table}), len(table))
+
+    def test_every_form_is_redacted_or_refused_and_none_passes_through(self):
+        module = self.patched()
+        outcomes = []
+        for label, form in self.forms():
+            with self.subTest(form=label):
+                cleaned = module.sanitize(form.encode())
+                leak = module.leak_problem('capture.out', cleaned)
+                if leak is None:
+                    seen = self.oracle_view(cleaned.decode('utf-8', 'replace'))
+                    self.assertNotIn('probeuser', seen, (label, cleaned))
+                    outcomes.append((label, 'redacted'))
+                else:
+                    self.assertIn('capture.out', leak)
+                    self.assertIn('form', leak)
+                    self.assertNotIn(self.HOME, leak)
+                    outcomes.append((label, 'refused: ' + leak.split(' in its ')[1].split(' form')[0]))
+        self.assertEqual(len(outcomes), 83)
+        out = os.environ.get('DETECTOR_TABLE_OUT')
+        if out:
+            Path(out).write_text(''.join('%s | %s\n' % item for item in outcomes))
+
+    def test_the_repo_root_forms_are_redacted_or_refused_too(self):
+        module = self.patched()
+        for label, form in (self.reviewer_forms(self.ROOT) + self.extra_forms(self.ROOT)
+                            + self.extra_forms(self.HOME)):
+            with self.subTest(form=label):
+                cleaned = module.sanitize(form.encode())
+                leak = module.leak_problem('capture.out', cleaned)
+                if leak is None:
+                    self.assertNotIn('mntxq7rprobe', self.oracle_view(cleaned.decode()))
+
+    def test_a_clean_capture_is_not_refused(self):
+        module = self.patched()
+        for text in (b'overall: PASS\n', b'<home>/x <repo-root>\n', b'', b'exit: 2\n'):
+            self.assertIsNone(module.leak_problem('capture.out', text))
+
+    def test_the_message_names_the_capture_and_the_form_but_not_the_value(self):
+        module = self.patched()
+        leak = module.leak_problem('posture-bare-env.out', b'x%2fhome%2Fprobe-user_1')
+        self.assertIsNotNone(leak)
+        self.assertIn('posture-bare-env.out', leak)
+        self.assertIn('percent-encoded', leak)
+        self.assertNotIn('probe-user', leak)
+
+    def test_a_run_whose_capture_wraps_a_home_path_refuses_and_publishes_nothing(self):
+        head, rest = STUB.split('\n', 1)
+        wrapped = self.root / 'wrapping-default'
+        wrapped.write_text(
+            head + '\nimport os as _o, sys as _s\n'
+            'if _s.argv[1:2] == ["doctor"] and "--posture" in _s.argv:\n'
+            '    _h = _o.environ["HOME"]\n'
+            '    print(_h[:len(_h) // 2] + "\\n" + _h[len(_h) // 2:])\n' + rest)
+        wrapped.chmod(0o755)
+        done, _ = self.run_recapture(default_bin=wrapped)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertNotIn('Traceback', done.stderr)
+        self.assertIn('refusing to publish', done.stderr)
+        self.assertIn('posture-bare-env.out', done.stderr)
+        self.assertIn('line-wrapped', done.stderr)
+        self.assertFalse((self.root / OUT_REL).exists())
+        self.assertEqual(sorted(p.name for p in (self.root / OUT_REL).parent.iterdir())
+                         if (self.root / OUT_REL).parent.is_dir() else [], [])
+
+    def test_docstring_states_redacted_or_refused_and_no_completeness_claim(self):
+        doc = ' '.join(load_script_module().sanitize.__doc__.split())
+        self.assertIn('NOT claimed to be complete', doc)
+        self.assertIn('leak_problem', doc)
+        self.assertIn('refuses the run, naming the capture and the form', doc)
+        for phrase in ('mixed-case percent', 'HTML entities', 'wrapped line', 'ANSI'):
+            self.assertIn(phrase, doc)
+        self.assertNotIn('every form is replaced', doc)
+        module_doc = ' '.join(load_script_module().__doc__.split())
+        self.assertIn('redacted or the run refuses', module_doc)
+
+
+class ProvenanceRefresh7699(RecaptureBase):
+    """#7699: SANITIZATION.md is part of the bundle. A recapture rewrites its provenance line
+    (tip sha, date) in staging, so the published manifest covers the updated file, and the
+    committed manifest, the committed bundle files and the committed provenance agree."""
+
+    PROVENANCE = re.compile(r'^Provenance: posture captures recorded at tip `([0-9a-f]{40})` '
+                            r'on (\d{4}-\d{2}-\d{2}) \(UTC\); rewritten by '
+                            r'scripts/recapture-cert-3607-posture\.py on every recapture\.$',
+                            re.M)
+
+    def seed(self, body=b'note\n' + SEED_PROVENANCE.encode()):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        (self.root / OUT_REL / 'SANITIZATION.md').write_bytes(body)
+        write_manifest(self.root / OUT_REL)
+        self.commit_evidence()
+
+    def test_a_recapture_rewrites_the_provenance_to_the_run_head_and_date(self):
+        self.seed()
+        done, dates = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        text = self.out('SANITIZATION.md')
+        match = self.PROVENANCE.search(text)
+        self.assertIsNotNone(match, text)
+        self.assertEqual(match.group(1), self.git('rev-parse', 'HEAD').strip())
+        self.assertIn(match.group(2), dates)
+        header = self.out('posture-legs-exit-codes.txt').split('\n', 1)[0]
+        self.assertTrue(match.group(1).startswith(HEADER_RE.match(header).group(2)))
+        self.assertEqual(HEADER_RE.match(header).group(1), match.group(2))
+        self.assertTrue(text.startswith('note\n'))
+        self.assertEqual(len(self.PROVENANCE.findall(text)), 1)
+
+    def test_the_published_manifest_covers_the_rewritten_file(self):
+        self.seed()
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        evidence = self.root / OUT_REL
+        self.assertEqual(manifest_problems(evidence), [])
+        listed = {line.split('  ', 1)[1]: line.split('  ', 1)[0]
+                  for line in (evidence / 'MANIFEST.sha256').read_text().splitlines()}
+        self.assertEqual(listed['SANITIZATION.md'], sha256_hex(evidence / 'SANITIZATION.md'))
+        self.assertNotEqual(listed['SANITIZATION.md'],
+                            hashlib.sha256(b'note\n' + SEED_PROVENANCE.encode()).hexdigest())
+
+    def refused_sanitization(self, body):
+        self.seed(body)
+        log = self.home / 'ran.log'
+        default = self.make_logging_stub(self.root / 'logging-default', log)
+        before = (self.root / OUT_REL / 'SANITIZATION.md').read_bytes()
+        done, _ = self.run_recapture(default_bin=default, commit=False)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertNotIn('Traceback', done.stderr)
+        self.assertIn('SANITIZATION.md', done.stderr)
+        self.assertIn('Provenance', done.stderr)
+        self.assertEqual((self.root / OUT_REL / 'SANITIZATION.md').read_bytes(), before)
+
+    def test_a_sanitization_file_without_a_provenance_line_is_refused(self):
+        self.refused_sanitization(b'note without a provenance line\n')
+
+    def test_a_sanitization_file_with_two_provenance_lines_is_refused(self):
+        self.refused_sanitization(b'note\n' + SEED_PROVENANCE.encode() * 2)
+
+    def test_a_first_run_without_a_bundle_writes_no_sanitization_file(self):
+        done, _ = self.run_recapture()
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertFalse((self.root / OUT_REL / 'SANITIZATION.md').exists())
+
+    # ---- the committed bundle in this repository
+
+    def test_the_committed_bundle_manifest_files_and_provenance_agree(self):
+        bundle = REPO / OUT_REL
+        manifest = (bundle / 'MANIFEST.sha256').read_text().splitlines()
+        listed = {}
+        for line in manifest:
+            digest, name = line.split('  ', 1)
+            self.assertNotIn(name, listed, 'duplicate manifest line for ' + name)
+            listed[name] = digest
+        on_disk = {p.name for p in bundle.iterdir() if p.name != 'MANIFEST.sha256'}
+        ignored = {'.gitignore'}
+        self.assertEqual(on_disk - ignored, set(listed), 'bundle files and manifest disagree')
+        for name, digest in listed.items():
+            with self.subTest(file=name):
+                self.assertEqual(sha256_hex(bundle / name), digest)
+        self.assertEqual([p for p in bundle.rglob('*') if p.is_dir()], [])
+        self.assertEqual([p for p in bundle.rglob('*') if p.is_symlink()], [])
+        text = (bundle / 'SANITIZATION.md').read_text()
+        match = self.PROVENANCE.search(text)
+        self.assertIsNotNone(match, 'SANITIZATION.md has no provenance line')
+        self.assertEqual(len(self.PROVENANCE.findall(text)), 1)
+        header = (bundle / 'posture-legs-exit-codes.txt').read_text().split('\n', 1)[0]
+        header_match = HEADER_RE.match(header)
+        self.assertIsNotNone(header_match, header)
+        self.assertTrue(match.group(1).startswith(header_match.group(2)),
+                        'provenance tip %s vs header sha %s' % (match.group(1),
+                                                                header_match.group(2)))
+
+    def test_sanitization_md_states_the_over_redaction_and_detector_rules(self):
+        text = ' '.join((REPO / OUT_REL / 'SANITIZATION.md').read_text().split())
+        self.assertIn('over-redact', text)
+        self.assertIn('every occurrence', text)
+        self.assertIn('longest value first', text)
+        self.assertIn('refuses to publish', text)
+        self.assertIn('decoded views', text)
+        self.assertIn('names the capture and the form', text)
+        self.assertIn('test-results.txt', text)
+        self.assertIn('named-tests.txt', text)
+
+
 class ImportStyle7652(unittest.TestCase):
     """#7652 (CodeQL py/import-and-import-from): no module is imported both ways."""
 
@@ -2392,3 +2896,7 @@ class ImportStyle7652(unittest.TestCase):
                     named.add(node.module.split('.')[0])
             with self.subTest(path=path.name):
                 self.assertEqual(sorted(plain & named), [])
+
+
+if __name__ == '__main__':
+    unittest.main()
