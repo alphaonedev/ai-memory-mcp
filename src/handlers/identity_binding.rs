@@ -520,7 +520,7 @@ pub fn inert_enforce_boot_reason(mode: HttpIdentityMode, enrolled_count: usize) 
          self-asserted X-Agent-Id header exactly as it would be with the gate off. \
          Enforcement engages only once at least one per-agent key exists (#1985 — an \
          enforce posture that refused every caller when nobody could be key-attested would \
-         brick the deployment). Enrol keys with `ai-memory agents bind-api-key <agent-id>`, \
+         brick the deployment). Enrol keys with `ai-memory agents bind-api-key --agent-id <agent-id> --token-file <0600 path>`, \
          or set {}=advisory to match the posture you actually have (#3155).",
         crate::config::ENV_HTTP_ATTESTED_IDENTITY,
         crate::config::ENV_HTTP_ATTESTED_IDENTITY,

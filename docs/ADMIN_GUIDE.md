@@ -1419,7 +1419,7 @@ reconfigured:
 
 ```bash
 # sqlite data tier (run on the host holding the database file)
-ai-memory agents bind-api-key --agent-id svc-indexer --token "$TOKEN"
+ai-memory agents bind-api-key --agent-id svc-indexer --token-file <0600 path>
 ai-memory agents revoke-api-key --agent-id svc-indexer
 
 # postgres data tier — prefer the AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE

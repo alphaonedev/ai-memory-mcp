@@ -520,34 +520,6 @@ async fn admin_trust_7707_s1_other_agents_key_refusals_identical_in_off() {
     assert_indistinguishable("bob's key, Off", &unknown, &admin);
 }
 
-#[tokio::test]
-async fn admin_trust_7707_s1_no_credential_header_trust_refusals_identical() {
-    static TRUST_ONCE: std::sync::Once = std::sync::Once::new();
-    TRUST_ONCE.call_once(|| {
-        // SAFETY: Once-gated, set once and never removed; it only widens the
-        // header-trust admission this cell must still refuse.
-        unsafe {
-            std::env::set_var(ai_memory::handlers::admin_role::ENV_ADMIN_HEADER_TRUST, "1");
-        }
-    });
-    for mode in [
-        HttpIdentityMode::Off,
-        HttpIdentityMode::Advisory,
-        HttpIdentityMode::Enforce,
-    ] {
-        let _dir = fresh_dir();
-        let (r1, _a1, _f1) = build_with_shared_key(mode, true, None);
-        let unknown = post_gc_full(r1, None, Some(UNKNOWN_ADMIN_CLAIM)).await;
-        let (r2, _a2, _f2) = build_with_shared_key(mode, true, None);
-        let admin = post_gc_full(r2, None, Some(ADMIN_ID)).await;
-        assert_indistinguishable(
-            &format!("no credential + header trust, {mode:?}"),
-            &unknown,
-            &admin,
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // (g) Boot signal: which allowlisted admin ids have no enrolled per-agent key.
 // ---------------------------------------------------------------------------

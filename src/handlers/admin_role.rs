@@ -148,6 +148,26 @@ pub fn unattested_admin_boot_reason(
     ))
 }
 
+/// #7707 r2 (L2) - the pure boot verdict for an unkeyed admin id. Under the
+/// certified / asi-hard posture (`posture_engaged`) the reason REFUSES boot;
+/// otherwise it is an operator WARN and boot proceeds. `None` always permits.
+///
+/// # Errors
+/// Returns the reason as an error when `posture_engaged` and a reason exists.
+pub(crate) fn unattested_admin_boot_decision(
+    reason: Option<String>,
+    posture_engaged: bool,
+) -> anyhow::Result<()> {
+    let Some(reason) = reason else {
+        return Ok(());
+    };
+    if posture_engaged {
+        anyhow::bail!(reason);
+    }
+    tracing::warn!(target: super::HTTP_AUTH_TRACE_TARGET, "{reason}");
+    Ok(())
+}
+
 /// #3065 (Wave-2 Cluster B) — the LOAD-BEARING boot-refusal decision for the
 /// `ADMIN_HEADER_TRUST` identity gate. Pure (no I/O): the boot caller resolves
 /// the live [`AdminHeaderTrustBootInputs`] and this renders the verdict, so the
@@ -513,5 +533,26 @@ pub fn require_admin(
             Json(json!({"error": "admin role required"})),
         )
             .into_response())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unattested_admin_boot_decision_refuses_under_posture_and_names_admin() {
+        let enrolled = std::collections::HashMap::from([("h".to_string(), "bob".to_string())]);
+        let admins = vec!["root-admin".to_string()];
+        let reason = unattested_admin_boot_reason(
+            crate::config::HttpIdentityMode::Advisory,
+            &enrolled,
+            &admins,
+        );
+        let err = unattested_admin_boot_decision(reason.clone(), true)
+            .expect_err("posture engaged + unkeyed admin must refuse boot");
+        assert!(err.to_string().contains("root-admin"), "{err}");
+        assert!(unattested_admin_boot_decision(reason, false).is_ok());
+        assert!(unattested_admin_boot_decision(None, true).is_ok());
     }
 }
