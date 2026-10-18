@@ -169,62 +169,165 @@ def _pad(prefix, filler, suffix=''):
     return lambda n: prefix + filler * (n - len(prefix) - len(suffix)) + suffix
 
 
-# Every regex of pg_isolated_binary.py, PINNED (#7615, #7653): (pattern, flags, one-line linearity reason, worst-case
-# input generator taking a size in characters). The test compares this set with the module, so a new, changed or
-# removed regex fails until a reviewer edits this table. Each regex is also timed against its generator at
-# GUARD_SQL_MAX_BYTES; the size cap, not any detector, is the real bound. Flags 32 is re.UNICODE, the str default.
+# Every regex of pg_isolated_binary.py, PINNED (#7615, #7653, #7675): (pattern, flags, one-line linearity reason, a
+# TUPLE of hostile-input generators, each taking a size in characters). The test compares this set with the module, so
+# a new, changed or removed regex fails until a reviewer edits this table. Each regex is also timed against every one
+# of its generators at GUARD_SQL_MAX_BYTES and the slowest counts; no generator claims to be the single worst case.
+# The size cap, not any detector, is the real bound. Flags 32 is re.UNICODE, the str default.
 PINNED_REGEXES = (
     (r'[0-9]+', re.UNICODE,
-     'one quantified class and nothing after it: nothing to give back', _pad('', '0', '!')),
+     'one quantified class and nothing after it: nothing to give back',
+     (_pad('', '0', '!'), _pad('', 'a'), _pad('', '0'))),
     (r'^[a-z0-9]{1,20}$', re.UNICODE,
-     'one bounded class repetition between anchors', _pad('', 'a')),
+     'one bounded class repetition between anchors', (_pad('', 'a'), _pad('', 'a', '!'))),
     (r'^ai_memory_t_([a-z0-9]{1,20})_([0-9]{10})_([0-9a-f]{8})$', re.UNICODE,
      'bounded class repetitions separated by fixed underscores: no two quantifiers overlap',
-     _pad('ai_memory_t_', 'a')),
+     (_pad('ai_memory_t_', 'a'), _pad('ai_memory_t_', '_'), _pad('', 'a'))),
     (r'^[A-Za-z0-9_]{1,63}$', re.UNICODE,
-     'one bounded class repetition between anchors', _pad('', 'a')),
+     'one bounded class repetition between anchors', (_pad('', 'a'), _pad('', 'a', '!'))),
     (r'^--(test|bin) ([A-Za-z0-9_-]+)$', re.UNICODE,
-     'fixed prefix, a literal space, then one class repetition to the anchor', _pad('--test ', 'a', '!')),
+     'fixed prefix, a literal space, then one class repetition to the anchor',
+     (_pad('--test ', 'a', '!'), _pad('--test ', 'a'), _pad('--bin ', '-'))),
     (r'[A-Za-z_\x80-\U0010ffff]', re.UNICODE,
-     'one character class, matched at one index', _pad('', '1')),
+     'one character class, matched at one index', (_pad('', '1'), _pad('', 'a'))),
     (r'[A-Za-z0-9_$\x80-\U0010ffff]*', re.UNICODE,
-     'one quantified class and nothing after it: nothing to give back', _pad('', 'a', '-')),
+     'one quantified class and nothing after it: nothing to give back',
+     (_pad('', 'a', '-'), _pad('', 'a'), _pad('', '$'))),
     (r'\$(?:[A-Za-z_\x80-\U0010ffff][A-Za-z0-9_\x80-\U0010ffff]*)?\$', re.UNICODE,
      'a start class then one quantified class disjoint from the closing dollar, tried once per dollar',
-     _pad('$', 'a')),
+     (_pad('$', 'a'), lambda n: '$1' * (n // 2), _pad('', '$'), _pad('$a', 'a'))),
     (r'[0-9A-Fa-f]+', re.UNICODE,
-     'one quantified class and nothing after it: nothing to give back', _pad('', 'f', 'g')),
+     'one quantified class and nothing after it: nothing to give back',
+     (_pad('', 'f', 'g'), _pad('', 'a'), _pad('', 'f'))),
 )
 
+# The module's imports, PINNED (#7674): any other import fails, which covers sre_compile, importlib, fnmatch, glob and
+# every similar helper that could hand the module a regex without the name `re`.
+PINNED_IMPORTS = (
+    'from concurrent.futures import ThreadPoolExecutor',
+    'from pathlib import Path',
+    'from typing import Dict',
+    'from typing import IO',
+    'from typing import List',
+    'from typing import Optional',
+    'from typing import Set',
+    'from typing import Tuple',
+    'from urllib.parse import parse_qsl',
+    'from urllib.parse import unquote',
+    'from urllib.parse import urlsplit',
+    'import argparse',
+    'import os',
+    'import re',
+    'import signal',
+    'import socket',
+    'import subprocess',
+    'import sys',
+    'import threading',
+    'import time',
+    'import uuid',
+)
+RE_CALLS = frozenset(('compile', 'match', 'search', 'fullmatch', 'sub', 'subn', 'split', 'findall', 'finditer', 'escape'))
+RE_FLAGS = frozenset(('A', 'ASCII', 'DOTALL', 'I', 'IGNORECASE', 'L', 'LOCALE', 'M', 'MULTILINE', 'S', 'U', 'UNICODE',
+                      'VERBOSE', 'X'))
+FORBIDDEN_CALLS = frozenset(('__import__', 'getattr', 'vars', 'globals', 'locals', 'eval', 'exec', 'compile'))
+# The only forbidden-name call the module makes: an attribute read from an argparse namespace, not from `re`.
+PINNED_FORBIDDEN_CALLS = ("getattr(args, 'url', None)",)
 
-def regex_audit_problems(source, patterns, pinned):
-    """Return the ways the regexes of a module differ from the pinned table (#7653). Fail closed, no detection.
 
-    `source` is the module text, `patterns` its compiled module attributes. A problem is reported for: any use of
-    `re.<name>` or an alias/from-import of re outside a module-level `NAME = re.compile(...)`; a compiled pattern whose
-    (pattern, flags) is not pinned; a pinned row with no matching pattern; a compile call that is not stored as an
-    attribute. It pins and times regexes; it does not claim to detect super-linearity in general.
+def _import_lines(tree):
+    lines = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            lines.extend('import %s%s' % (a.name, ' as ' + a.asname if a.asname else '') for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            lines.extend('from %s%s import %s%s' % ('.' * node.level, node.module or '', a.name,
+                                                    ' as ' + a.asname if a.asname else '') for a in node.names)
+    return sorted(lines)
+
+
+def _is_pattern_literal(node):
+    """A string literal, or a literal %-formatted with constants the module owns (the bounded repetitions)."""
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+        node = node.left
+    return isinstance(node, ast.Constant) and isinstance(node.value, str)
+
+
+def sweep_patterns(namespace):
+    """Every re.Pattern held by a module global, directly or one container deep (the runtime sweep, #7674)."""
+    found = {}
+    for name, value in namespace.items():
+        items = value.items() if isinstance(value, dict) else enumerate(value) if isinstance(value, (list, tuple, set, frozenset)) else ()
+        if isinstance(value, re.Pattern):
+            found[name] = value
+        for key, inner in items:
+            if isinstance(inner, re.Pattern):
+                found['%s[%s]' % (name, key)] = inner
+    return found
+
+
+def regex_audit_problems(source, patterns, pinned, pinned_imports=PINNED_IMPORTS):
+    """Return the ways a module differs from the pinned regex surface (#7653, #7674). Fail closed, no detection.
+
+    `source` is the module text, `patterns` the swept compiled patterns of its globals (`sweep_patterns`). Enforced:
+    (a) the import set equals `pinned_imports` exactly; (b) every reference to the name `re` is `re.<attr>(<string
+    literal>, ...)` with attr in RE_CALLS, or a flag constant RE_FLAGS inside such a call's arguments; `re.compile` is
+    only the value of a module-level `NAME = ...`, any other call's pattern must be a pinned literal; (c) no call to
+    __import__, getattr, vars, globals, locals, eval, exec or compile except PINNED_FORBIDDEN_CALLS; (d) every swept
+    pattern is in the pinned table and every pinned row is present. It pins and times regexes; it does not claim to
+    detect super-linearity.
     """
     tree = ast.parse(source)
-    allowed = set()
-    for node in tree.body:
-        if (isinstance(node, ast.Assign) and isinstance(node.value, ast.Call)
-                and isinstance(node.value.func, ast.Attribute) and node.value.func.attr == 'compile'
-                and isinstance(node.value.func.value, ast.Name) and node.value.func.value.id == 're'):
-            allowed.add(id(node.value.func))
-    problems, compiles = [], len(allowed)
+    problems = []
+    lines = _import_lines(tree)
+    problems.extend('import not pinned: %s' % line for line in sorted(set(lines) - set(pinned_imports)))
+    problems.extend('pinned import absent: %s' % line for line in sorted(set(pinned_imports) - set(lines)))
+    parent = {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == 're':
-            if id(node) not in allowed:
-                problems.append('line %d: re.%s outside a module-level NAME = re.compile(...)' % (node.lineno, node.attr))
-        elif isinstance(node, ast.ImportFrom) and (node.module or '').split('.')[0] == 're':
-            problems.append('line %d: from %s import ...' % (node.lineno, node.module))
-        elif isinstance(node, ast.Import):
-            problems.extend('line %d: import %s as %s' % (node.lineno, a.name, a.asname)
-                            for a in node.names if a.name.split('.')[0] == 're' and (a.asname or '.' in a.name))
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
+    pins = {(pattern, flags) for pattern, flags, _reason, _generators in pinned}
+    pinned_literals = {pattern for pattern, _flags in pins}
+
+    def re_call(attr_node):
+        call = parent.get(attr_node)
+        return call if isinstance(call, ast.Call) and call.func is attr_node and attr_node.attr in RE_CALLS else None
+
+    compiles = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == 're':
+            use = parent.get(node)
+            ok = False
+            if isinstance(use, ast.Attribute) and use.value is node:
+                call = re_call(use)
+                if call is not None:
+                    first = call.args[0] if call.args else None
+                    if use.attr == 'escape':
+                        ok = first is not None
+                    elif use.attr == 'compile':
+                        holder = parent.get(call)
+                        ok = (first is not None and _is_pattern_literal(first) and isinstance(holder, ast.Assign)
+                              and holder in tree.body and len(holder.targets) == 1
+                              and isinstance(holder.targets[0], ast.Name))
+                        compiles += 1 if ok else 0
+                    else:
+                        ok = (isinstance(first, ast.Constant) and first.value in pinned_literals)
+                elif use.attr in RE_FLAGS:
+                    holder = parent.get(use)
+                    if isinstance(holder, ast.keyword):
+                        holder = parent.get(holder)
+                    ok = isinstance(holder, ast.Call) and isinstance(holder.func, ast.Attribute) \
+                        and re_call(holder.func) is holder
+            if not ok:
+                problems.append('line %d: `re` used other than re.<call>(<string literal>, ...)' % node.lineno)
+        elif isinstance(node, ast.arg) and node.arg == 're':
+            problems.append('line %d: `re` rebound as a parameter' % node.lineno)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == 're':
+            problems.append('line %d: `re` rebound by a definition' % node.lineno)
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in FORBIDDEN_CALLS:
+            if ast.unparse(node) not in PINNED_FORBIDDEN_CALLS:
+                problems.append('line %d: call to %s' % (node.lineno, node.func.id))
     if compiles != len(patterns):
-        problems.append('%d module-level compile calls but %d compiled module attributes' % (compiles, len(patterns)))
-    pins = {(pattern, flags) for pattern, flags, _reason, _generator in pinned}
+        problems.append('%d module-level compile calls but %d swept patterns' % (compiles, len(patterns)))
     found = {(value.pattern, value.flags) for value in patterns.values()}
     problems.extend('not pinned: %r flags %d' % key for key in sorted(found - pins))
     problems.extend('pinned but absent: %r flags %d' % key for key in sorted(pins - found))
@@ -1127,7 +1230,7 @@ class TemplateOwnership(unittest.TestCase):
         return float(done.stdout.decode('utf-8').strip())
 
     def _module_patterns(self):
-        return {name: value for name, value in vars(pib).items() if isinstance(value, re.Pattern)}
+        return sweep_patterns(vars(pib))
 
     def test_module_regexes_equal_the_pinned_table_7615_7653(self):
         """The regexes of pg_isolated_binary.py are PINNED, not detected: the set of (pattern, flags) must equal
@@ -1138,20 +1241,24 @@ class TemplateOwnership(unittest.TestCase):
 
     def test_each_pinned_regex_finishes_its_worst_case_input_under_budget_7615_7653(self):
         by_key = {(p.pattern, p.flags): name for name, p in self._module_patterns().items()}
-        for pattern, flags, reason, generator in PINNED_REGEXES:
+        for pattern, flags, reason, generators in PINNED_REGEXES:
             with self.subTest(pattern=pattern):
                 self.assertTrue(reason.strip(), 'a pinned regex needs a one-line linearity reason')
-                text = generator(pib.GUARD_SQL_MAX_BYTES)
-                self.assertLessEqual(len(text.encode('utf-8', 'surrogatepass')), 4 * pib.GUARD_SQL_MAX_BYTES)
-                self.assertLess(self._regex_seconds(by_key[(pattern, flags)], text), self.REGEX_TIMING_BUDGET_SECS)
+                self.assertGreaterEqual(len(generators), 2, 'a pinned regex needs a list of hostile inputs (#7675)')
+                worst = 0.0
+                for generator in generators:
+                    text = generator(pib.GUARD_SQL_MAX_BYTES)
+                    self.assertLessEqual(len(text.encode('utf-8', 'surrogatepass')), 4 * pib.GUARD_SQL_MAX_BYTES)
+                    worst = max(worst, self._regex_seconds(by_key[(pattern, flags)], text))
+                self.assertLess(worst, self.REGEX_TIMING_BUDGET_SECS)
 
     def test_a_regex_added_without_a_table_row_fails_the_pin_7653(self):
         source = SCRIPT.read_text(encoding='utf-8')
         patterns = self._module_patterns()
-        added_source = source + "\n_NEW_RE = re.compile(r'(a+)+$')\n"
-        added_patterns = dict(patterns, _NEW_RE=re.compile(r'(a+)+$'))
+        added_source = source + "\n_NEW_RE = re.compile(r'zz[0-9]q')\n"
+        added_patterns = dict(patterns, _NEW_RE=re.compile(r'zz[0-9]q'))
         problems = regex_audit_problems(added_source, added_patterns, PINNED_REGEXES)
-        self.assertTrue(any('not pinned' in p and '(a+)+$' in p for p in problems), problems)
+        self.assertTrue(any('not pinned' in p and 'zz[0-9]q' in p for p in problems), problems)
         changed = dict(patterns, _HEX_RE=re.compile(r'[0-9A-Fa-f]+', re.IGNORECASE))
         self.assertNotEqual(regex_audit_problems(source, changed, PINNED_REGEXES), [])
         removed = {k: v for k, v in patterns.items() if k != '_HEX_RE'}
