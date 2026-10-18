@@ -670,6 +670,11 @@ mod tests {
 
     #[test]
     fn double_failure_error_names_the_event_and_never_the_payload_7504() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "subscriptions::scan_failure::tests::double_failure_error_names_the_event_and_never_the_payload_7504",
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().expect("tempdir");
         // The directory does not exist, so the sqlite open fails: both the
         // lookup and its record failed.
@@ -713,6 +718,11 @@ mod tests {
 
     #[test]
     fn worker_open_failure_is_logged_at_error_with_the_path_7505() {
+        if crate::config::run_env_isolated_child_or_spawn(
+            "subscriptions::scan_failure::tests::worker_open_failure_is_logged_at_error_with_the_path_7505",
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("missing-dir").join("w.db");
         let out = captured(|| {
