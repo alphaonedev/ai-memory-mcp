@@ -38,6 +38,17 @@ PANELS = {
     "#cycpanel > *": 2, "#campaignsPanel > *": 4, "#board > *": 4, "#issuespanel > *": 1, "#feed > *": 1,
     "#agentsPanel > *": 2, "#cfgpre > *": 6,
 }
+# the hostile state (every string markup, every number 1e999): a value that is not a finite number is omitted from SVG
+# and shown as the text placeholder elsewhere, so the same panels render, with the same element counts, and nothing is
+# logged (#7687 #7688). Pinned, not "any".
+HOSTILE_PANELS = {
+    "#livebadge > *": 2, "#ringsvg > *": 3, "#kpis > *": 5, "#pillars > *": 4, "#hwmon > *": 2, "#domon > *": 3,
+    "#swarmwrap > *": 4, "#swarm > *": 1, "#tpchart > *": 1, "#fedchart > *": 1, "#a2apanel > *": 6,
+    "#bootpanel > *": 1, "#oplatpanel > *": 1, "#commspanel > *": 1, "#capchart > *": 1, "#wpchart > *": 1,
+    "#aiusage > *": 3, "#latchart > *": 1, "#covchart > *": 1, "#scalechart > *": 1, "#secpanel > *": 1,
+    "#cycpanel > *": 2, "#campaignsPanel > *": 4, "#board > *": 4, "#issuespanel > *": 1, "#feed > *": 1,
+    "#agentsPanel > *": 2, "#cfgpre > *": 9,
+}
 SELECTORS = list(PANELS)
 
 SHAPES_JS = """
@@ -68,6 +79,44 @@ window.__shapes = {};
 CHEAT_SHAPES = ("markup called as a function", "put a string")  # refused by index.js itself, with or without Trusted Types
 NO_TT_SHAPES = {"innerHTML", "computed innerHTML", "outerHTML", "insertAdjacentHTML", "createContextualFragment",
                 "DOMParser", "srcdoc", "setHTMLUnsafe", "script text", "script src"}
+
+
+# #7684: the trusted-markup token cannot be forged. Each attempt builds a host, tries to put raw markup there through a
+# forged token, and records whether anything raw landed. None may, with or without Trusted Types enforcement.
+FORGE_JS = """
+window.__forge = {};
+(function(){
+  const RAW = "<img src=x onerror=window.__pwn=21><b>forged</b>";
+  const attempt = (name, fn) => {
+    const host = document.createElement("div"); document.body.appendChild(host);
+    let how = "ran";
+    try { fn(host); } catch (e) { how = "threw " + e.name; }
+    window.__forge[name] = {how: how, raw: host.querySelector("img, b") !== null, html: host.innerHTML.slice(0, 60)};
+  };
+  attempt("constructor", host => { const H = markup`x`.constructor; put(host, new H(RAW)); });
+  attempt(".s mutation", host => { const t = markup`x`; t.s = RAW; put(host, t); });
+  attempt("prototype set", host => { const f = {s: RAW}; Object.setPrototypeOf(f, Object.getPrototypeOf(markup`x`)); put(host, f); });
+  attempt("Object.create", host => { const f = Object.create(Object.getPrototypeOf(markup`x`)); f.s = RAW; put(host, f); });
+  attempt("__proto__ literal", host => { const f = {__proto__: Object.getPrototypeOf(markup`x`), s: RAW}; put(host, f); });
+  attempt("plain object with s", host => { put(host, {s: RAW}); });
+  attempt("cat of a forged value", host => { put(host, cat([{s: RAW}])); });
+  attempt("markup of a forged value", host => { put(host, markup`<p>${{s: RAW}}</p>`); });
+  attempt("WeakMap methods patched", host => {
+    const has0 = WeakMap.prototype.has, get0 = WeakMap.prototype.get;
+    try { WeakMap.prototype.has = () => true; WeakMap.prototype.get = () => RAW; put(host, markup`<p>${RAW}</p>`); }
+    finally { WeakMap.prototype.has = has0; WeakMap.prototype.get = get0; }
+  });
+})();
+"""
+FORGE_NAMES = ("constructor", ".s mutation", "prototype set", "Object.create", "__proto__ literal", "plain object with s",
+               "cat of a forged value", "markup of a forged value", "WeakMap methods patched")
+
+
+def assert_nothing_forged(testcase, result):
+    forged = result["forge"]
+    testcase.assertEqual(sorted(forged), sorted(FORGE_NAMES))
+    testcase.assertEqual({name: f["html"] for name, f in forged.items() if f["raw"]}, {}, "raw markup landed through a forged token")
+    testcase.assertEqual(result["pwn"], "undefined", "window.__pwn is %s" % result["pwn"])
 
 
 def leaves(value, fn, path=()):
@@ -156,6 +205,8 @@ class DashboardInChrome7634(BrowserCase):
     def test_a_normal_state_renders_every_panel_with_no_violation_and_an_empty_console(self):
         result = self.run_page()
         assert_clean(result, PANELS)
+        self.assertNotIn("'unsafe-inline'", result["csp"], "the shipped CSP must not allow inline style (#7689)")
+        self.assertIn("style-src 'self' https://fonts.googleapis.com;", result["csp"])
         self.assertFalse(result["live"].startswith("offline"), result["live"])
 
     def test_a_hostile_state_in_every_panel_is_inert_and_still_renders(self):
@@ -165,7 +216,7 @@ class DashboardInChrome7634(BrowserCase):
         self.assertIn('"createHTML"', text)
         self.assertIn("javascript:window.__pwn=4", text)
         result = self.run_page(state_text=text)
-        assert_clean(result, {selector: "any" for selector in PANELS}, strict_log=False)
+        assert_clean(result, HOSTILE_PANELS)
         self.assertEqual(result["pwn"], "undefined")
 
     def test_every_string_to_html_sink_a_page_script_could_try_is_refused_by_the_browser(self):
@@ -184,6 +235,70 @@ class DashboardInChrome7634(BrowserCase):
                                          ".defaultPolicy)};")
         self.assertEqual(result["shapes"], {"dash": "undefined", "html": "undefined", "esc": "undefined",
                                             "win": "undefined", "pol": "undefined", "tt": "null"})
+
+
+class TokenForging7684(BrowserCase):
+    """#7684: markup() returns a closure-private brand, not a type. A constructor, a mutated property or a set prototype
+    must insert NOTHING raw, in a Trusted Types browser and in one without."""
+
+    def test_no_forged_token_inserts_raw_markup(self):
+        result = self.run_page(js_append=FORGE_JS)
+        assert_nothing_forged(self, result)
+        self.assertEqual(result["exceptions"], [])
+
+    def test_no_forged_token_inserts_raw_markup_without_trusted_types_either(self):
+        weak = without(HEADERS_TEXT, TT_DIRECTIVES)
+        result = self.run_page(headers_text=weak, init_script=NoTrustedTypes7634.HIDE, js_append=FORGE_JS)
+        self.assertEqual(result["tt"], "undefined")
+        assert_nothing_forged(self, result)
+
+    def test_the_constructor_and_prototype_attempts_throw_and_the_s_mutation_is_inert(self):
+        forged = self.run_page(js_append=FORGE_JS)["forge"]
+        for name in ("constructor", "prototype set", "Object.create", "__proto__ literal", "plain object with s", "cat of a forged value"):
+            self.assertTrue(forged[name]["how"].startswith("threw"), (name, forged[name]))
+        self.assertEqual(forged[".s mutation"]["html"], "x", forged[".s mutation"])
+
+
+class Hardening7690_7691(unittest.TestCase):
+    """#7690: the README claims a hostile `constructor` key and a refused document.write sink; the tests must run both.
+    #7691: a mutation that replaces nothing proves nothing."""
+
+    def test_the_hostile_state_carries_a_constructor_key(self):
+        text = hostile_text({"a": {"b": 1}})
+        self.assertIn('"constructor"', text)
+        self.assertIn('"__proto__"', text)
+
+    def test_document_write_is_one_of_the_refused_sink_shapes(self):
+        self.assertIn("document.write(s);", SHAPES_JS)
+        self.assertIn('t("document.write"', SHAPES_JS)
+
+    def test_the_readme_claims_match_what_the_tests_run(self):
+        readme = (cdp.REPO / "infra" / "cf-dashboard" / "README.md").read_text(encoding="utf-8")
+        claimed = [name for name in ("constructor", "document.write") if name in readme]
+        self.assertEqual(claimed, ["constructor", "document.write"])
+        for name in claimed:
+            self.assertIn(name, SHAPES_JS + hostile_text({"a": 1}) + FORGE_JS, "the README claims %s, no test runs it" % name)
+
+    def test_assert_clean_has_no_allowance_for_rendering_errors(self):
+        import inspect
+        self.assertEqual(list(inspect.signature(assert_clean).parameters), ["result", "counts"])
+        self.assertEqual(assert_clean.__code__.co_consts.count("rendering/error:"), 0)
+
+    def test_every_mutation_helper_refuses_a_replace_that_changes_nothing(self):
+        helper = globals().get("mutate")
+        self.assertIsNotNone(helper, "there is no mutate() helper that asserts its replace applied")
+        with self.assertRaises(AssertionError):
+            helper("abc", "zzz", "y")
+        with self.assertRaises(AssertionError):
+            without("abc", ("zzz",))
+        self.assertEqual(helper("a b a", "a", "c"), "c b c")
+        self.assertEqual(without("x; y; z", ("y",)), "x; z")
+
+    def test_the_sinks_run_test_applies_its_mutation(self):
+        import inspect
+        source = inspect.getsource(MutationProofs7634.test_without_trusted_types_enforcement_the_sinks_run)
+        self.assertNotIn('SHAPES_JS.replace(', source)
+        self.assertIn("mutate(SHAPES_JS", source)
 
 
 class MutationProofs7634(BrowserCase):
@@ -235,7 +350,7 @@ class NoTrustedTypes7634(BrowserCase):
         weak = without(HEADERS_TEXT, TT_DIRECTIVES)
         result = self.run_page(state_text=hostile_text(self.state_json), headers_text=weak, init_script=self.HIDE)
         self.assertEqual(result["tt"], "undefined")
-        assert_clean(result, {selector: "any" for selector in PANELS}, strict_log=False)
+        assert_clean(result, HOSTILE_PANELS)
 
 
 class RequireBrowser7639(unittest.TestCase):

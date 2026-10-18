@@ -123,6 +123,42 @@ class GuardAllowlist7634(unittest.TestCase):
         extra = '/* el.innerHTML = s; createPolicy markup( Html */ // innerHTML\nconst r = /"innerHTML`/g;\n'
         self.assertEqual(self.problems(self.appended(extra)), [])
 
+    def test_token_internals_and_prototype_games_are_refused_outside_the_helper_7684(self):
+        """#7684: the brand lives in a closure-private WeakMap. Outside the helper block nothing may name the internals
+        or reach for the prototype/constructor machinery that a forged token would need."""
+        shapes = {
+            "Object.create": "const f = Object.create(null);",
+            "setPrototypeOf": "Object.setPrototypeOf(f, g);",
+            "__proto__ name": "const f = { __proto__: g };",
+            "__proto__ string": 'const f = o["__proto__"];',
+            ".constructor": "const C = markup`x`.constructor;",
+            "constructor string": 'const C = o["constructor"];',
+            "prototype": "const q = Foo.prototype;",
+            "WeakMap": "const w = new WeakMap();",
+            "Reflect": "Reflect.setPrototypeOf(f, g);",
+            "trusted": "const ok = trusted.has(v);",
+            "mint": "const t = mint('<img>');",
+            "part": "const t = part(v);",
+            "escText": "const t = escText(v);",
+            "Html": "const t = Html;",
+        }
+        for name, extra in shapes.items():
+            found = self.problems(self.appended(extra))
+            self.assertTrue(found, "%s was accepted outside the helper block" % name)
+
+    def test_those_names_are_refused_in_every_other_script_too_7684(self):
+        for extra in ("Object.create(null);", "x.constructor;", "Object.setPrototypeOf(a, b);", "a.__proto__ = b;",
+                      "new WeakMap();"):
+            self.assertTrue(self.problems(extra, False), extra)
+
+    def test_the_helper_is_a_weakmap_brand_not_a_type_7684(self):
+        helper = helper_source()
+        self.assertIn("new WeakMap", helper)
+        self.assertNotIn("instanceof", helper)
+        self.assertNotRegex(helper, r"\bclass\b")
+        self.assertNotRegex(helper, r"\bHtml\b")
+        self.assertNotRegex(helper, r"\.s\b")
+
     def test_the_old_deny_list_machinery_is_gone(self):
         for name in ("sink_problems", "unwrapped_interpolations", "is_wrapped", "_direct_args", "SINK_NAMES",
                      "FORBIDDEN_CALLS", "html_problems", "SCRIPT_TAG", "EVENT_ATTR"):
@@ -132,9 +168,9 @@ class GuardAllowlist7634(unittest.TestCase):
 
 def shipped_policy():
     headers = (PUBLIC / "_headers").read_text(encoding="utf-8")
-    values = csp.header_csp_values(headers, "/index.html")
-    assert len(values) == 1, values
-    return values[0]
+    refusals, value = csp.check_path(headers, "/index.html")
+    assert value is not None, refusals
+    return value
 
 
 class EveryPage7587(unittest.TestCase):
@@ -154,7 +190,8 @@ class EveryPage7587(unittest.TestCase):
     def test_the_only_markup_sink_is_the_typed_put_helper(self):
         src = real_index()
         self.assertRegex(src, r'host\.innerHTML = dash\.createHTML\("", h\);')
-        self.assertRegex(src, r'if\(!\(h instanceof Html\)\) throw new TypeError\("put\(\) takes markup, not a string"\);')
+        self.assertNotIn("instanceof", src)
+        self.assertRegex(src, r'if\(!has\(h\)\) throw new TypeError\("put\(\) takes markup, not a string"\);')
         self.assertEqual(src.count("innerHTML"), 2, "one assignment plus the header comment")
 
     def test_escText_escapes_all_five_entities_once_7588(self):
@@ -164,8 +201,9 @@ class EveryPage7587(unittest.TestCase):
         for ent in ("&amp;", "&lt;", "&gt;", "&quot;", "&#39;"):
             self.assertIn(ent, m.group(1))
         part = re.search(r"const part = v => (.*?);\n", src).group(1)
-        self.assertIn("instanceof Html", part)
+        self.assertIn("has(v)", part)
         self.assertIn("escText(v)", part)
+        self.assertNotIn("instanceof", part)
 
     def test_script_src_has_no_unsafe_inline_in_any_policy_line(self):
         headers = (PUBLIC / "_headers").read_text(encoding="utf-8")
@@ -176,6 +214,28 @@ class EveryPage7587(unittest.TestCase):
                 parts = directive.split()
                 if parts and parts[0] in ("script-src", "script-src-elem", "script-src-attr"):
                     self.assertNotIn("'unsafe-inline'", parts, directive)
+
+
+NUMERIC_SVG_ATTRS = ("x", "y", "x1", "y1", "x2", "y2", "cx", "cy", "r", "rx", "ry", "width", "height", "d", "stroke-width",
+                     "stroke-dashoffset", "stroke-dasharray", "viewBox", "points", "transform", "offset", "dx", "dy")
+
+
+class FiniteSvgNumbers7687(unittest.TestCase):
+    """#7687: a numeric SVG attribute is written only through the finite-number helper, never nf() (which yields the
+    em dash for a non-finite value, a rendering error in an attribute)."""
+
+    def test_no_nf_call_is_interpolated_into_a_numeric_svg_attribute(self):
+        src = real_index()
+        attr = "|".join(re.escape(a) for a in NUMERIC_SVG_ATTRS)
+        found = re.findall(r'(?<![\w-])(?:%s)="[^"]*\$\{nf\(' % attr, src)
+        self.assertEqual(found, [], "numeric SVG attributes must go through sn()/pd()")
+
+    def test_the_finite_helper_exists_and_requires_isfinite(self):
+        src = real_index()
+        m = re.search(r"function sn\(([^)]*)\)\{(.*?)\n\}", src, re.S)
+        self.assertIsNotNone(m, "no sn() helper")
+        self.assertIn("Number.isFinite", m.group(2))
+        self.assertIn("function omit(", src)
 
 
 def leaves(value, fn):

@@ -6,6 +6,7 @@ tests pin that too, because a false refusal is the intended cost of having no em
 import unittest
 from pathlib import Path
 
+import cf_cdp_7313 as cdp
 import cf_csp_allowlist_7313 as csp
 import cf_origin_7313 as origin_mod
 
@@ -14,9 +15,9 @@ HEADERS = (PUBLIC / "_headers").read_text(encoding="utf-8")
 
 
 def shipped():
-    values = csp.header_csp_values(HEADERS, "/index.html")
-    assert len(values) == 1
-    return values[0]
+    refusals, value = csp.check_path(HEADERS, "/index.html")
+    assert value is not None
+    return value
 
 
 def with_directive(name, tokens):
@@ -175,29 +176,110 @@ class RefuseTable7636(unittest.TestCase):
         self.assertTrue(refusals and value is None, refusals)
         two = "/*\n  Content-Security-Policy: %s\n/*.html\n  Content-Security-Policy: %s\n" % (shipped(), shipped())
         refusals, value = csp.check_path(two, "/index.html")
-        self.assertTrue(any("exactly one" in r for r in refusals), refusals)
+        self.assertTrue(any("exactly one" in r and "line 4" in r for r in refusals), refusals)
+        self.assertIsNone(value)
 
     def test_a_wildcard_and_an_own_host_source_are_refused_even_when_safe(self):
         """The documented false refusal: the table has no wildcard and no own-host entry."""
         for token in ("*", "https://dash.example"):
             self.assertTrue(csp.check_policy(with_directive("connect-src", ["'self'", token])), token)
 
-    def test_unsafe_inline_has_one_documented_exception_and_it_is_style_src(self):
-        self.assertEqual(list(csp.DOCUMENTED_EXCEPTIONS), [("style-src", "'unsafe-inline'")])
+    def test_unsafe_inline_has_no_exception_anywhere_7689(self):
+        self.assertEqual(dict(csp.DOCUMENTED_EXCEPTIONS), {})
         for name, tokens in csp.ALLOWED_DIRECTIVES.items():
-            if "'unsafe-inline'" in tokens:
-                self.assertEqual(name, "style-src")
+            self.assertNotIn("'unsafe-inline'", tokens, name)
+        self.assertTrue(csp.check_policy(with_directive("style-src", ["'self'", "'unsafe-inline'"])))
+        self.assertNotIn("'unsafe-inline'", shipped())
 
-    def test_dropping_the_style_exception_while_pages_use_inline_style_is_refused(self):
+    def test_inline_style_is_always_refused_7689(self):
+        """A style attribute and a <style> block are refused whatever the policy says: there is no exception left."""
         tight = with_directive("style-src", ["'self'", "https://fonts.googleapis.com"])
         self.assertEqual(csp.check_policy(tight), [])
-        refused = [p.name for p in sorted(PUBLIC.glob("*.html")) if csp.check_page(p.read_text(encoding="utf-8"), tight)]
-        self.assertTrue(refused, "the pages use inline style, so the exception is still needed")
+        for html in (page('<div style="color:red">x</div>'), page("<p>x</p>", head="<style>a{color:red}</style>"),
+                     page('<svg><text style="fill:red"></text></svg>')):
+            self.assertTrue(csp.check_page(html, tight), html)
+            self.assertTrue(csp.check_page(html, shipped()), html)
+
+    def test_the_real_pages_have_no_inline_style_and_load_a_local_stylesheet_7689(self):
+        for path in sorted(PUBLIC.glob("*.html")):
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("<style", text, path.name)
+            self.assertNotIn(" style=", text, path.name)
+            self.assertIn('rel="stylesheet" href="/', text, path.name)
 
     def test_a_policy_missing_a_directive_a_load_needs_is_refused(self):
         weak = with_directive("img-src", ["'self'"])
         html = page('<img src="data:image/png;base64,AAAA">')
         self.assertTrue(any("img-src" in r and "data:" in r for r in csp.check_page(html, weak)))
+
+
+def policy_file(*rules):
+    """A `_headers` text from (pattern, [header lines]) pairs."""
+    return "".join("%s\n%s" % (pattern, "".join("  %s\n" % h for h in headers)) for pattern, headers in rules)
+
+
+class HeadersFailClosed7685(unittest.TestCase):
+    """#7685 #7686: the `_headers` reader refuses what it cannot prove it understands, with the line number, in the checker
+    and in the browser test server alike."""
+
+    CSP = None
+
+    @classmethod
+    def setUpClass(cls):
+        cls.CSP = "Content-Security-Policy: " + shipped()
+
+    def refused(self, text, line, needle, path="/index.html"):
+        refusals, value = csp.check_path(text, path)
+        self.assertIsNone(value, text)
+        self.assertTrue(any(("line %d" % line) in r and needle in r for r in refusals), (line, needle, refusals))
+
+    def test_a_csp_stripped_with_a_removal_line_is_refused(self):
+        for removal in ("! Content-Security-Policy", "!Content-Security-Policy", "\t! content-security-policy"):
+            text = policy_file(("/*", [self.CSP]), ("/index.html", [removal.strip()]))
+            self.refused(text, 4, "!")
+        self.refused(policy_file(("/*", [self.CSP, "! X-Frame-Options"])), 3, "!")
+
+    def test_a_rule_whose_pattern_is_not_a_plain_path_is_refused(self):
+        for pattern in ("https://dash.example/*", "https://*.example.com/*", "*.example.com/*", "//dash.example/*",
+                        "http://:sub.example.com/*", "dash.example/*", "https://:project.pages.dev/*"):
+            text = policy_file((pattern, [self.CSP]), ("/*", [self.CSP]))
+            self.refused(text, 1, pattern)
+
+    def test_a_non_ascii_byte_anywhere_in_the_file_is_refused(self):
+        for bad in ("\u00a0", "\u2003", "\u3000", "\u0085", "\u200b", "\ufeff", "\u00e9"):
+            text = policy_file(("/*", [self.CSP.replace("script-src 'self'", "script-src" + bad + "'self'")]))
+            self.refused(text, 2, "non-ASCII")
+        self.refused("/*\n  X-Test: a\u00e9\n  " + self.CSP + "\n", 2, "non-ASCII")
+
+    def test_a_no_break_space_inside_a_csp_directive_is_not_a_separator(self):
+        for bad in ("\u00a0", "\u2003", "\u3000", "\u0085", "\x0b", "\x1f"):
+            policy = shipped().replace("script-src 'self'", "script-src" + bad + "'self'")
+            self.assertTrue(csp.check_policy(policy), repr(bad))
+        for good in ("\t", "\n", "\f", "\r", "  "):
+            self.assertEqual(csp.check_policy(shipped().replace("script-src 'self'", "script-src" + good + "'self'")), [])
+
+    def test_a_second_csp_header_is_refused_with_its_line(self):
+        same_block = policy_file(("/*", [self.CSP, self.CSP]))
+        self.refused(same_block, 3, "exactly one")
+        two_rules = policy_file(("/*", [self.CSP]), ("/*.json", [self.CSP]))
+        self.refused(two_rules, 4, "exactly one", "/state.json")
+
+    def test_a_malformed_file_is_refused_not_skipped(self):
+        self.refused("  X-Frame-Options: DENY\n/*\n  " + self.CSP + "\n", 1, "before any rule")
+        self.refused("/*\n  X-Frame-Options\n  " + self.CSP + "\n", 2, "name: value")
+        self.refused("/*\n  # note\n  " + self.CSP + "\n", 2, "comment")
+        self.refused("/*\n  Bad Name: x\n  " + self.CSP + "\n", 2, "header name")
+
+    def test_the_browser_test_server_reads_headers_through_the_same_refusals(self):
+        for text in (policy_file(("/*", [self.CSP]), ("/index.html", ["! Content-Security-Policy"])),
+                     policy_file(("https://dash.example/*", [self.CSP])),
+                     policy_file(("/*", [self.CSP.replace("script-src", "script-src\u00a0")]))):
+            with self.assertRaises(ValueError):
+                cdp.headers_for(text, "/")
+
+    def test_the_shipped_headers_parse_and_are_the_only_policy(self):
+        pairs = cdp.headers_for(HEADERS, "/")
+        self.assertEqual([n for n, _ in pairs].count("Content-Security-Policy"), 1)
 
 
 class AcceptShipped7636(unittest.TestCase):

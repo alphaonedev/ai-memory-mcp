@@ -325,7 +325,7 @@ def load(browser, public_headers, state_text, selectors, js_append="", js_replac
         expression = (
             "(async()=>{const counts={};for(const s of %s){counts[s]=document.querySelectorAll(s).length;}"
             "const r=await fetch('/',{cache:'no-store'});"
-            "return JSON.stringify({v:window.__v,pwn:typeof window.__pwn,counts:counts,shapes:window.__shapes||null,"
+            "return JSON.stringify({v:window.__v,pwn:typeof window.__pwn,counts:counts,shapes:window.__shapes||null,forge:window.__forge||null,"
             "csp:r.headers.get('content-security-policy'),live:(document.getElementById('livetext')||{}).textContent||'',"
             "tt:typeof window.trustedTypes});})()" % json.dumps(list(selectors)))
         result = page.send("Runtime.evaluate", {"expression": expression, "returnByValue": True, "awaitPromise": True})

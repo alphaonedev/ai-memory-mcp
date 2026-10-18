@@ -588,6 +588,19 @@ class PublicSnapshotHygiene7518(unittest.TestCase):
             self.assertEqual(hostscrub.find_leaks("see " + ok), [], ok)
             self.assertEqual(hostscrub.scrub_text("see " + ok), "see " + ok, ok)
 
+    def test_7692_the_product_name_exception_is_an_exact_allowlist_not_a_prefix(self):
+        self.names_file.write_text("ai\nbox\n", encoding="utf-8")
+        hostscrub = _load("hostscrub_7692", "hostscrub.py")
+        for exact in ("ai-memory", "ai-memory-mcp", "AI-Memory", "ai-memory-mcp."):
+            self.assertEqual(hostscrub.find_leaks("see " + exact), [], exact)
+            self.assertEqual(hostscrub.scrub_text("see " + exact), "see " + exact, exact)
+        for derived in ("ai-memory-box", "ai-memory-f2", "ai-memory-mcp-2", "ai-memory2", "ai-memory-mcpx", "AI-MEMORY-BOX"):
+            self.assertEqual(hostscrub.find_leaks("on " + derived + " now"), [derived], derived)
+            self.assertEqual(hostscrub.scrub_text("on " + derived + " now"), "on node now", derived)
+            self.assertNotIn(derived.lower(), hostscrub.dump_clean({"n": "on " + derived}).lower(), derived)
+        self.assertEqual(sorted(hostscrub.NAME_EXCEPTIONS), ["ai-memory", "ai-memory-mcp"])
+        self.assertIsInstance(hostscrub.NAME_EXCEPTIONS, (frozenset, set, tuple))
+
     def test_7642_two_keys_that_scrub_to_the_same_key_are_refused(self):
         hostscrub = _load("hostscrub_7642", "hostscrub.py")
         node = self.node
