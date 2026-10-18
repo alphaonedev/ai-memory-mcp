@@ -92,7 +92,7 @@ pub enum DenyReason {
     },
     /// The platform did not supply a peer pid on an established connection.
     PeerPidUnavailable,
-    /// No identity verifier is wired yet (the shipped default until #3468).
+    /// No identity verifier is wired: returned by the [`DenyAllVerifier`] test fallback and the default [`HelloVerifier::verify_membership`].
     IdentityNotConfigured,
     /// The agent id is not in the derived allowlist cache.
     UnknownAgent,
@@ -147,9 +147,9 @@ impl fmt::Display for DenyReason {
             }
             Self::PeerPidUnavailable => f.write_str("platform supplied no peer pid"),
             Self::IdentityNotConfigured => f.write_str(
-                "no wake-hub identity verifier is configured — the scoped \
-                 a2a-hub/join/v1 delegation lands in #3468; every hello is refused \
-                 until then",
+                "no wake-hub identity verifier is configured; every hello is refused \
+                 (the live hub wires the scoped a2a-hub/join/v1 delegation verifier, \
+                 #3468)",
             ),
             Self::UnknownAgent => f.write_str("agent id is not in the allowlist cache"),
             Self::BadSignature => f.write_str("hello transcript signature did not verify"),
