@@ -245,9 +245,7 @@ fn namespace_ownership_refusal_body() {
 /// #7476: the ownership test and `open_mem` put back every variable they
 /// change, whether it was set or unset before, so the next test of this
 /// binary sees the environment it started with.
-#[test]
-fn env_writers_restore_the_original_values_7476() {
-    let _env = ENV_LOCK.blocking_lock();
+fn run_restore_cycles_7476() {
     let originals: [Option<&str>; 2] = [Some("sentinel-7476"), None];
     for original in originals {
         for key in RESTORED_VARS {
@@ -272,6 +270,38 @@ fn env_writers_restore_the_original_values_7476() {
         // SAFETY: as above; leave the variables unset, as a fresh binary has them.
         unsafe { std::env::remove_var(key) };
     }
+}
+
+#[test]
+fn env_writers_restore_the_original_values_7476() {
+    let _env = ENV_LOCK.blocking_lock();
+    let _restore = EnvRestore::capture(&RESTORED_VARS);
+    run_restore_cycles_7476();
+}
+
+/// #7629: the pinning test above must leave the variables exactly as it found
+/// them. Start with one set to a distinct value and one unset, run the cycles
+/// the way the test does (without its own guard), and check both afterwards.
+#[test]
+fn the_restore_test_leaves_the_starting_values_7629() {
+    let _env = ENV_LOCK.blocking_lock();
+    let _restore = EnvRestore::capture(&RESTORED_VARS);
+    // SAFETY: ENV_LOCK is held, and every test of this binary takes it before it touches the environment.
+    unsafe {
+        std::env::set_var(RESTORED_VARS[0], "start-7629");
+        std::env::remove_var(RESTORED_VARS[1]);
+    }
+    run_restore_cycles_7476();
+    assert_eq!(
+        std::env::var(RESTORED_VARS[0]).ok().as_deref(),
+        Some("start-7629"),
+        "#7629: a variable that was set must keep its starting value"
+    );
+    assert_eq!(
+        std::env::var_os(RESTORED_VARS[1]),
+        None,
+        "#7629: a variable that was unset must stay unset"
+    );
 }
 
 /// PG LEG (measured on the build host; self-skips on f1): every funnel's
