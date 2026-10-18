@@ -386,8 +386,8 @@ fn admin_elevation_attested(
             mode = ?state.http_identity_mode,
             "#7707: allowlisted admin {caller:?} on {endpoint} is only claimed \
              (X-Agent-Id is self-asserted) while per-agent keys are enrolled; admin \
-             elevation refused. Bind a per-agent key to the admin id with \
-             `ai-memory agents bind-api-key`."
+             elevation refused. Run `ai-memory agents bind-api-key \
+             --agent-id <admin-id> --token-file <0600 path>`."
         );
     }
     attested

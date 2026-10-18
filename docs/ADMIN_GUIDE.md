@@ -1425,7 +1425,7 @@ ai-memory agents revoke-api-key --agent-id svc-indexer
 # postgres data tier — prefer the AI_MEMORY_STORE_URL / AI_MEMORY_STORE_URL_FILE
 # channel over --store-url: a URL on argv is world-readable via /proc/<pid>/cmdline
 AI_MEMORY_STORE_URL_FILE=/etc/ai-memory/store-url ai-memory agents bind-api-key \
-  --agent-id svc-indexer --token "$TOKEN"
+  --agent-id svc-indexer --token-file <0600 path>
 ```
 
 You generate the token; the CLI stores only its SHA-256 digest and never the
