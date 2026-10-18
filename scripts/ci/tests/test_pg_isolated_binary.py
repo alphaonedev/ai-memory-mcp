@@ -313,6 +313,12 @@ def regex_audit_problems(source, patterns, pinned):
     return problems
 
 
+def import_form_clashes(source):
+    """Modules imported both as `import X` and as `from X import ...` in `source` (CodeQL py/import-and-import-from,
+    alert 524, #7653, #7713). A CodeQL-regression pin, not a sandbox."""
+    return []
+
+
 def implicit_concat_lines(source_bytes):
     """Return line numbers where two string literals join implicitly inside a list or set (#7616, #7633).
 
@@ -1091,6 +1097,26 @@ class TemplateOwnership(unittest.TestCase):
             pib._decode_e('\\400')
         self.assertIn('octal escape above \\377', str(ctx.exception))
 
+    # #7717: a plain-literal '\563' is refused too (a backslash may escape under standard_conforming_strings=off); the
+    # error says "literal" and names the E-string case only when the literal is an E-string.
+    OCTAL_TEXT_7717 = ('refusing SQL with %s octal escape above \\377 (PostgreSQL keeps only the low byte; the guard '
+                       'cannot read it the same way) (%s)')
+
+    def test_octal_refusal_text_names_the_literal_kind_7717(self):
+        for sql, kind in (("SELECT E'\\563'", 'an E-string'), ("SELECT '\\563'", 'a plain-literal')):
+            with self.subTest(sql=sql):
+                outcome, text, rec = self._guard_outcome(sql)
+                self.assertEqual(outcome, 'refused')
+                self.assertEqual(text, self.OCTAL_TEXT_7717 % (kind, "'\\\\563'"))
+                self.assertEqual(rec.calls, [])
+
+    def test_plain_literal_octal_refusal_is_documented_7717(self):
+        source = SCRIPT.read_text(encoding='utf-8')
+        doc = (SCRIPT.parents[2] / 'docs' / 'ci' / 'PG-ISOLATION.md').read_text(encoding='utf-8')
+        for text in (source, doc):
+            self.assertIn("plain literal such as '\\563'", text)
+        self.assertIn('plain literal', pib._plain_literal.__doc__)
+
     # #7704: the guard cannot read a function or procedure body, so it refuses CREATE [OR REPLACE] FUNCTION,
     # CREATE [OR REPLACE] PROCEDURE and CALL in every case and whitespace form, as it refuses DO.
     BODY_REFUSED_7704 = [
@@ -1393,7 +1419,18 @@ class TemplateOwnership(unittest.TestCase):
         ('match with a parameter', "def _h(x):\n    return re.match(x, 'a')\n"),
         ('computed in a function', "def _h(x):\n    return re.compile('a' + x)\n"),
         ('format of a parameter', "def _h(n):\n    return re.compile('a{1,%d}' % n)\n"),
-    )
+        ('del after the compile (#7718)', "_K = 20\n_NL_RE = re.compile('a{1,%d}' % _K)\ndel _K\n"),
+    ) + tuple(
+        (label, prefix + "_NL_RE = re.compile('a{1,%d}' % _K)\n") for label, prefix in (
+            ('augmented assignment (#7718)', "_K = 20\n_K *= 1000\n"),
+            ('global rebind in a function (#7718)', "_K = 20\ndef _rebind():\n    global _K\n    _K = 20000\n"),
+            ('second module assignment (#7718)', "_K = 20\n_K = 30\n"),
+            ('for target (#7718)', "_K = 20\nfor _K in (1, 2):\n    pass\n"),
+            ('with target (#7718)', "_K = 20\nwith __import__('contextlib').nullcontext(30) as _K:\n    pass\n"),
+            ('except target (#7718)', "_K = 20\ntry:\n    pass\nexcept OSError as _K:\n    pass\n"),
+            ('walrus (#7718)', "_K = 20\n(_K := 5)\n"),
+            ('global only (#7718)', "_K = 20\ndef _g():\n    global _K\n"),
+        ))
 
     def test_a_pattern_that_is_not_a_foldable_literal_fails_closed_7701(self):
         source = self._real_source()
@@ -1441,6 +1478,137 @@ class TemplateOwnership(unittest.TestCase):
                 found, static_problems = static_regex_calls(source + '\n' + extra)
                 self.assertEqual(static_problems, [], 'the static collector must not see it, only the sweep')
                 self.assertEqual(self._audit(source + '\n' + extra), ["not pinned: 'zz[0-9]q' flags 32"])
+
+    # #7714: `from re import ...` and `import re as <alias>` are ordinary spellings of re, so the collector fails closed
+    # on any import of re other than a plain top-level `import re`, and on sre_compile, sre_parse and _sre.
+    IMPORT_REFUSED_7714 = (
+        ('from re import match', "from re import match\ndef _h(s):\n    return match(r'(a+)+$', s)\n"),
+        ('from re import compile', "from re import compile\ndef _h():\n    return compile(r'(a+)+$')\n"),
+        ('from re import compile as c', "from re import compile as c\n_X_RE = c(r'(a+)+$')\n"),
+        ('import re as alias', "import re as _alias\ndef _h(s):\n    return _alias.match(r'(a+)+$', s)\n"),
+        ('import in a function', "def _h():\n    import re\n    return re\n"),
+        ('from re import star', "from re import *\n"),
+        ('import sre_compile', "import sre_compile\n"),
+        ('import sre_parse as sp', "import sre_parse as sp\n"),
+        ('from sre_compile import compile', "from sre_compile import compile\n"),
+        ('import _sre', "import _sre\n"),
+        ('from re.x import y', "from re.x import y\n"),
+    )
+
+    def test_an_import_of_re_other_than_plain_import_re_fails_closed_7714(self):
+        source = self._real_source()
+        for label, extra in self.IMPORT_REFUSED_7714:
+            with self.subTest(spelling=label):
+                _found, problems = static_regex_calls(source + '\n' + extra)
+                self.assertTrue(any(re.fullmatch(r'line \d+: import of (re|sre_compile|sre_parse|_sre)\b.*', p)
+                                    for p in problems), problems)
+
+    def test_a_plain_top_level_import_re_is_accepted_7714(self):
+        found, problems = static_regex_calls("import re\n_X_RE = re.compile('a')\n")
+        self.assertEqual((found, problems), ([('compile', 'a')], []))
+
+    def test_the_reviewer_reproductions_fail_the_audit_7714(self):
+        source = self._real_source()
+        for label, extra in self.IMPORT_REFUSED_7714[:4]:
+            with self.subTest(spelling=label):
+                self.assertNotEqual(regex_audit_problems(source + '\n' + extra, sweep_patterns(vars(pib)), PINNED_REGEXES),
+                                    [])
+
+    # #7715: flags are read from the positional slot and the keyword of every re.<fn> signature; a non-constant flags
+    # argument fails closed; a non-compile call is pinned as a (pattern, flags) pair.
+    FLAGS_REFUSED_7715 = (
+        ('match positional', "def _h(s):\n    return re.match(r'[0-9]+', s, re.VERBOSE)\n"),
+        ('match keyword', "def _h(s):\n    return re.match(r'[0-9]+', s, flags=re.X)\n"),
+        ('search positional', "def _h(s):\n    return re.search(r'[0-9]+', s, re.I)\n"),
+        ('fullmatch keyword', "def _h(s):\n    return re.fullmatch(r'[0-9]+', s, flags=re.M | re.S)\n"),
+        ('findall positional', "def _h(s):\n    return re.findall(r'[0-9]+', s, re.A)\n"),
+        ('finditer keyword', "def _h(s):\n    return re.finditer(r'[0-9]+', s, flags=re.I)\n"),
+        ('sub positional', "def _h(s):\n    return re.sub(r'[0-9]+', '', s, 0, re.I)\n"),
+        ('subn keyword', "def _h(s):\n    return re.subn(r'[0-9]+', '', s, flags=re.I)\n"),
+        ('split positional', "def _h(s):\n    return re.split(r'[0-9]+', s, 0, re.I)\n"),
+        ('integer flags', "def _h(s):\n    return re.match(r'[0-9]+', s, 64)\n"),
+    )
+    FLAGS_NON_CONSTANT_7715 = (
+        ('match name', "def _h(s, f):\n    return re.match(r'[0-9]+', s, f)\n"),
+        ('match keyword name', "def _h(s, f):\n    return re.match(r'[0-9]+', s, flags=f)\n"),
+        ('compile name', "_F = 2\n_X_RE = re.compile(r'zz', _F)\n"),
+        ('compile keyword call', "_X_RE = re.compile(r'zz', flags=int('2'))\n"),
+        ('sub name', "def _h(s, f):\n    return re.sub(r'[0-9]+', '', s, 0, f)\n"),
+        ('star args', "def _h(s, a):\n    return re.match(r'[0-9]+', *a)\n"),
+        ('double star', "def _h(s, k):\n    return re.match(r'[0-9]+', s, **k)\n"),
+    )
+
+    def test_a_non_compile_call_with_unpinned_flags_fails_the_pin_7715(self):
+        source = self._real_source()
+        for label, extra in self.FLAGS_REFUSED_7715:
+            with self.subTest(call=label):
+                problems = self._audit(source + '\n' + extra)
+                self.assertTrue(any(re.fullmatch(r"line \d+: re\.\w+ pattern '\[0-9\]\+' not pinned with flags \d+", p)
+                                    for p in problems), problems)
+
+    def test_the_exact_7702_reproduction_fails_the_pin_7715(self):
+        problems = self._audit(self._real_source() + "\ndef _h(s):\n    return re.match(r'[0-9]+', s, re.VERBOSE)\n")
+        self.assertEqual(len(problems), 1, problems)
+        self.assertRegex(problems[0], r"^line \d+: re\.match pattern '\[0-9\]\+' not pinned with flags 96$")
+
+    def test_a_non_compile_call_on_a_pinned_pair_is_accepted_7715(self):
+        source = self._real_source()
+        for extra in ("def _h(s):\n    return re.match(r'[0-9]+', s)\n",
+                      "def _h(s):\n    return re.match(r'[0-9]+', s, re.UNICODE)\n",
+                      "def _h(s):\n    return re.match(r'[0-9]+', s, flags=re.U)\n"):
+            with self.subTest(extra=extra):
+                self.assertEqual(self._audit(source + '\n' + extra), [])
+
+    def test_a_non_constant_flags_argument_fails_closed_7715(self):
+        source = self._real_source()
+        for label, extra in self.FLAGS_NON_CONSTANT_7715:
+            with self.subTest(call=label):
+                _found, problems = static_regex_calls(source + '\n' + extra)
+                self.assertTrue(any(re.fullmatch(r'line \d+: re\.\w+ flags is not a constant', p) for p in problems),
+                                problems)
+
+    # #7716: the audit is the union of the static collector and the runtime sweep: a static compile with no swept
+    # object (del, overwrite) is reported.
+    def test_a_static_compile_that_the_sweep_no_longer_sees_is_reported_7716(self):
+        source = self._real_source()
+        for label, extra, expected in (
+                ('del of an unpinned compile', "_T_RE = re.compile(r'(a+)+$')\n_t_match = _T_RE.match\ndel _T_RE\n",
+                 "compiled but not pinned (not swept): '(a+)+$' flags 32"),
+                ('overwrite of an unpinned compile', "_T_RE = re.compile(r'(a+)+$')\n_T_RE = None\n",
+                 "compiled but not pinned (not swept): '(a+)+$' flags 32"),
+                ('del of a pinned object', "del _HEX_RE\n",
+                 "compiled but not swept: '[0-9A-Fa-f]+' flags 32")):
+            with self.subTest(case=label):
+                module, _path = self._load_copy(source + '\n' + extra)
+                self.assertNotIn('_T_RE' if 'T_RE' in extra else '_HEX_RE', vars(module))
+                problems = regex_audit_problems(source + '\n' + extra, sweep_patterns(vars(module)), PINNED_REGEXES)
+                self.assertIn(expected, problems)
+
+    # #7713: restore a pin for CodeQL alert 524 (py/import-and-import-from) without regex internals.
+    IMPORT_CLASH_SAMPLES_7713 = (
+        ("import os\nfrom os import path\n", ['os']),
+        ("import os.path\nfrom os.path import join\n", ['os.path']),
+        ("from a import b\ndef f():\n    import a\n", ['a']),
+        ("import os\nfrom pathlib import Path\n", []),
+        ("import unittest.mock\nfrom unittest import mock\n", []),
+        ("import os as o\nfrom os import path\n", ['os']),
+    )
+
+    def test_the_import_form_detector_flags_a_module_imported_both_ways_7713(self):
+        for source, expected in self.IMPORT_CLASH_SAMPLES_7713:
+            with self.subTest(source=source):
+                self.assertEqual(import_form_clashes(source), expected)
+
+    def test_the_test_module_and_the_guard_module_never_import_one_module_both_ways_7653_7713(self):
+        for path in (Path(__file__), SCRIPT):
+            self.assertEqual(import_form_clashes(path.read_text(encoding='utf-8')), [],
+                             '%s imports a module both as `import X` and as `from X import`' % path.name)
+
+    def test_a_copy_of_the_test_module_that_imports_one_module_both_ways_fails_red_7713(self):
+        source = Path(__file__).read_text(encoding='utf-8')
+        self.assertEqual(import_form_clashes(source), [])
+        self.assertEqual(import_form_clashes(source + '\nfrom pathlib import PurePath\nimport pathlib\n'),
+                         ['pathlib'])
 
     def test_a_slow_pattern_is_over_the_timing_budget_7701(self):
         extra = "\n_SLOW_RE = re.compile(r'(a+)+$')\n"
