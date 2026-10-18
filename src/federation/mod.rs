@@ -11,8 +11,10 @@
 //! fans out a 1-memory `/api/v1/sync/push` POST to each peer and counts
 //! 2xx responses as acks. The write returns OK to the HTTP caller only
 //! once the local commit plus `W - 1` peer acks land within the
-//! `--quorum-timeout-ms` deadline. Fewer acks → `503` with body
-//! `{"error":"quorum_not_met", "got":X, "needed":Y, "reason":…}`.
+//! `--quorum-timeout-ms` deadline. Fewer acks → `202 Accepted` with
+//! `quorum_met:false` (`acks`, `needed`, `reason`, `durability:"local"`) via
+//! `handlers::parity::under_replicated_response`; the local row is already
+//! committed and is never rolled back.
 //!
 //! ## Scope of this module
 //!

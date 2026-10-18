@@ -5,9 +5,10 @@
 //!
 //! A profile is a set of tool *families* (`Family`) that the MCP server
 //! advertises in its `tools/list` response. v0.6.4 collapses the default
-//! surface from 43 tools (full) to 5 (core) so eager-loading harnesses
+//! surface from the `full` profile to `core` (`Family::Core.tool_names()`,
+//! 7 tools at v1.0.0) so eager-loading harnesses
 //! stop pre-paying ~6,000 input tokens of tool schemas per request. The
-//! 38 tools outside `core` remain reachable via runtime expansion through
+//! tools outside `core` remain reachable via runtime expansion through
 //! `memory_capabilities --include-schema family=<name>` (Track C —
 //! v0.6.4-006), so no functionality is lost; only the eager prefix cost
 //! goes away.

@@ -261,13 +261,14 @@ pub async fn restore_archive(
     // POST /api/v1/archive/{id}/restore on node-1 leaves node-2..4 with
     // the row still archived, so node-4 never sees M1 re-enter the active
     // set (the testbook-v3 S29 assertion). Same posture as
-    // `archive_by_ids`: on a quorum miss we short-circuit with 503 so
-    // operators can retry.
+    // `archive_by_ids`: on a quorum miss we short-circuit with
+    // `202 Accepted` + `quorum_met:false` (`under_replicated_response`).
     if let Some(fed) = app.federation.as_ref() {
         match crate::federation::broadcast_restore_quorum(fed, &id).await {
             Ok(tracker) => {
                 if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                    // #869 — typed 503 envelope via the shared helper.
+                    // #869 — typed `quorum_not_met` payload; the shared helper
+                    // answers `202 Accepted` + `quorum_met:false`.
                     let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
                     return super::under_replicated_response(&payload);
                 }
@@ -453,8 +454,8 @@ pub struct ArchiveByIdsBody {
 ///      `broadcast_archive_quorum` so peers land in the same terminal
 ///      state (row out of `memories`, row into `archived_memories`).
 ///
-/// On a quorum miss for ANY id, short-circuit with 503 via the shared
-/// `fanout_or_pending`-style payload. This matches the posture of the
+/// On a quorum miss for ANY id, short-circuit with `202 Accepted` +
+/// `quorum_met:false` via `under_replicated_response`. This matches the posture of the
 /// delete + consolidate fanout endpoints.
 ///
 /// Response body:
@@ -671,12 +672,14 @@ pub async fn archive_by_ids(
 
         // Fanout. Mirror the shape used by the other
         // quorum-backed write endpoints (delete, consolidate) — on a
-        // miss, surface the `quorum_not_met` payload with 503 + Retry-After.
+        // miss, surface the `quorum_not_met` payload as `202 Accepted` +
+        // `quorum_met:false` (the local archive is already committed).
         if let Some(fed) = app.federation.as_ref() {
             match crate::federation::broadcast_archive_quorum(fed, id).await {
                 Ok(tracker) => {
                     if let Err(err) = crate::federation::finalise_quorum(&tracker) {
-                        // #869 — typed 503 envelope via the shared helper.
+                        // #869 — typed `quorum_not_met` payload; the shared helper
+                        // answers `202 Accepted` + `quorum_met:false`.
                         let payload = crate::federation::QuorumNotMetPayload::from_err(&err);
                         return super::under_replicated_response(&payload);
                     }
