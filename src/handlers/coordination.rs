@@ -11,7 +11,7 @@
 //! transition is applied, then — when the daemon is federation-configured —
 //! fanned out to peers under W-of-N quorum, mirroring the memory-store write
 //! path (`handlers::create_memory` → `broadcast_store_quorum` → `finalise_quorum`,
-//! 503-on-miss, NO rollback per ADR-0001).
+//! `202 Accepted` + `quorum_met:false` on a miss, NO rollback per ADR-0001).
 //!
 //! Like `create_memory`, the local write is dual-path: the default build writes
 //! through `app.db` + the `crate::actions` free-functions (sqlite), and under
@@ -114,8 +114,9 @@ pub struct CheckpointResolveHttpRequest {
 /// daemon is federation-configured.
 ///
 /// Mirrors [`crate::handlers::create_memory`]: the local write lands FIRST; a
-/// failed quorum returns `503` (typed `QuorumNotMet` envelope) and does NOT roll
-/// back the local write (ADR-0001). With no federation configured, the local
+/// failed quorum returns `202 Accepted` + `quorum_met:false`
+/// (`under_replicated_response`) and does NOT roll back the local write
+/// (ADR-0001). With no federation configured, the local
 /// transition is the whole operation (single-node fast path).
 pub async fn transition_action(
     State(app): State<AppState>,
@@ -199,7 +200,8 @@ pub async fn transition_action(
     });
 
     // Federation fanout (W-of-N) — only when configured. Per ADR-0001 a failed
-    // quorum returns 503 but does NOT roll back the local write above.
+    // quorum returns `202 Accepted` + `quorum_met:false` and does NOT roll back
+    // the local write above.
     if let Some(fed) = app.federation.as_ref() {
         let op = build_signed_transition_op(
             app.active_keypair.as_ref().as_ref(),
@@ -234,8 +236,8 @@ pub async fn transition_action(
 
 /// `POST /api/v1/signals` — send a signal locally, then fan it out to peers
 /// under W-of-N quorum when the daemon is federation-configured. Mirrors
-/// [`transition_action`]: local write FIRST, 503 on a failed quorum (no
-/// rollback, ADR-0001), single-node fast path when no peers. The signal is
+/// [`transition_action`]: local write FIRST, `202 Accepted` +
+/// `quorum_met:false` on a failed quorum (no rollback, ADR-0001), single-node fast path when no peers. The signal is
 /// signed with the daemon's keypair (backend-agnostic) BEFORE insert + broadcast
 /// so the inserted row and the broadcast carry the same verifying signature
 /// (peers apply signals accept-and-flag — see `federation::receive_auth`).
@@ -740,7 +742,8 @@ fn build_signed_transition_op(
 /// mechanism. This route closes that leg.
 ///
 /// Mirrors [`transition_action`] / [`send_signal`] exactly: local write FIRST,
-/// `503` on a failed quorum with NO rollback (ADR-0001), single-node fast path
+/// `202 Accepted` + `quorum_met:false` on a failed quorum with NO rollback
+/// (ADR-0001), single-node fast path
 /// when no peers are configured.
 ///
 /// **Node-granular attestation.** `resolved_by` is the NODE's resolved agent id

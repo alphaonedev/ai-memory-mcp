@@ -266,8 +266,8 @@ async fn gate_consolidate_sources(
 /// disposition (#2860) — so peers converge the consolidation, the source state,
 /// AND the lineage DAG synchronously instead of waiting on async catch-up.
 ///
-/// Returns `Some(response)` when the quorum is NOT met (a typed 503 the caller
-/// must return verbatim), or `None` on success / when federation is disabled
+/// Returns `Some(response)` when the quorum is NOT met (a `202 Accepted` + `quorum_met:false` the
+/// caller must return verbatim), or `None` on success / when federation is disabled
 /// (the single-node no-op path) so the caller proceeds to its 201 envelope.
 async fn consolidate_fanout(
     fed: Option<&crate::federation::FederationConfig>,

@@ -750,7 +750,7 @@ async fn dispatch_bulk_store_events(app: &AppState, committed: &[Memory]) {
 /// pool; then one batched `bulk_catchup_push` per peer to close the
 /// eventual-consistency gap the per-row retry can leave. A quorum miss does NOT
 /// abort the other rows (bulk semantics, deliberately weaker than
-/// `create_memory`'s 503 short-circuit) and lands in `warnings[]`, never
+/// `create_memory`'s `202 Accepted` short-circuit) and lands in `warnings[]`, never
 /// `errors[]` — the local commit is durable (ADR-0001).
 async fn bulk_federation_fanout(
     app: &AppState,

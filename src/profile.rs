@@ -1313,4 +1313,49 @@ mod tests {
             }
         }
     }
+
+    /// #7276 — SSOT gate: a `N tools` total written in a doc comment of
+    /// this file must equal a count the code itself computes (a family's
+    /// `tool_names().len()` or a profile's `expected_tool_count()`), so
+    /// prose such as "from 43 tools (full) to 5 (core)" cannot rot.
+    #[test]
+    fn doc_comment_tool_totals_match_ssot_7276() {
+        let mut allowed: Vec<usize> = Family::all().iter().map(|f| f.tool_names().len()).collect();
+        for p in [
+            Profile::core(),
+            Profile::graph(),
+            Profile::admin(),
+            Profile::power(),
+            Profile::full(),
+        ] {
+            allowed.push(p.expected_tool_count());
+        }
+        // Production half of the file only: the tests below quote stale
+        // totals on purpose.
+        let src = include_str!("profile.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let mut stale: Vec<String> = Vec::new();
+        for (idx, line) in prod.lines().enumerate() {
+            let t = line.trim_start();
+            if !(t.starts_with("//!") || t.starts_with("///")) {
+                continue;
+            }
+            let words: Vec<&str> = t.split_whitespace().collect();
+            for pair in words.windows(2) {
+                let num = pair[0].trim_start_matches(|c: char| !c.is_ascii_digit());
+                if !pair[1].starts_with("tools") || num.is_empty() {
+                    continue;
+                }
+                if let Ok(n) = num.parse::<usize>()
+                    && !allowed.contains(&n)
+                {
+                    stale.push(format!("src/profile.rs:{}: `{n} tools`", idx + 1));
+                }
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "doc comments carry tool totals that match no Family/Profile count {allowed:?}: {stale:?}"
+        );
+    }
 }

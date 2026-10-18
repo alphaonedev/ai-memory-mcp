@@ -1,0 +1,10 @@
+# Burn-down allowlist for scripts/check-comment-quorum-503.py (#7278).
+# These files sit on the enterprise-federation certification section 7 watched
+# surface (scripts/check_cert_expiry.py: src/federation/**). The certification
+# is EXPIRED with no bound SHA, so a comment-only edit there cannot satisfy the
+# section 7 gate without a re-issue or voiding, which a comment fix must not
+# make. Their stale "503" quorum comments (federation/mod.rs:14,
+# federation/quorum.rs:13,24,29) are fixed by the next federation-wire PR, which
+# then deletes the entry: a stale entry FAILS the gate, so the list only shrinks.
+src/federation/mod.rs
+src/federation/quorum.rs

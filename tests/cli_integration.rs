@@ -574,3 +574,34 @@ fn invalid_tier_errors_with_validation_message() {
         .failure()
         .stderr(predicate::str::contains("invalid tier"));
 }
+
+/// #7271 — `serve --help` snapshot: every listener is TLS (#3705), so the
+/// `--tls-cert` text must never say that omitting the flags means "plain
+/// HTTP". The help is whitespace-normalised first so clap's line wrapping
+/// cannot split the phrase; the hyphenated "plain-HTTP listener" denial in
+/// the real text is not the rejected phrase.
+#[test]
+fn serve_help_never_claims_plain_http_7271() {
+    let out = Command::cargo_bin("ai-memory")
+        .unwrap()
+        .env("AI_MEMORY_NO_CONFIG", "1")
+        .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
+        .args(["serve", "--help"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let help = String::from_utf8_lossy(&out)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        help.contains("--tls-cert"),
+        "serve --help must document --tls-cert: {help}"
+    );
+    assert!(
+        !help.to_ascii_lowercase().contains("plain http"),
+        "#7271: serve --help must not say the daemon can run over plain HTTP: {help}"
+    );
+}

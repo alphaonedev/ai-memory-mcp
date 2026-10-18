@@ -1675,8 +1675,8 @@ pub async fn promote_memory(
                 // row at its pre-promote tier and a recall against
                 // `tier=long` on peer-B silently misses it.
                 //
-                // Failure handling: fanout failures surface as 503
-                // with `Retry-After: 2` mirroring sqlite. The local
+                // Failure handling: fanout failures surface as
+                // `202 Accepted` + `quorum_met:false` mirroring sqlite. The local
                 // tier update has already committed — per ADR-0001
                 // we do NOT roll back the local commit on quorum
                 // failure; the sync daemon's eventual-consistency
