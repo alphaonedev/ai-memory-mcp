@@ -1081,6 +1081,81 @@ class TemplateOwnership(unittest.TestCase):
         'SELECT U&"x\\0041" /**/ UESCAPE \'!\'', "SELECT U&'d!0061t' UESCAPE '!'",
         'SELECT 1 AS uescape', 'SELECT 1 AS "uescape"',
     ]
+    # #7703: PostgreSQL keeps only the low byte of an octal escape, so a value above 0o377 can decode differently in the
+    # guard (a character above U+00FF) and on the server. The guard refuses it (fail closed); 0o377 itself is allowed.
+    OCTAL_REFUSED_7703 = [
+        "SELECT E'\\563tatement_timeout'", "SELECT E'\\554ock_timeout'", "SELECT E'\\400'", "SELECT E'\\777'",
+        "SELECT e'a\\4000b'", "SELECT E'a'\n'\\563'", "SELECT E'\\1' || E'\\563'",
+    ]
+    OCTAL_ALLOWED_7703 = [
+        "SELECT E'\\377'", "SELECT E'\\101'", "SELECT E'\\0'", "SELECT E'\\x41'", "SELECT E'\\377abc'", "SELECT E'\\37'",
+        "SELECT E'\\3777'", "SELECT '\\563'",
+    ]
+
+    def test_psql_guard_refuses_an_octal_escape_above_0o377_7703(self):
+        for sql in self.OCTAL_REFUSED_7703:
+            with self.subTest(refused=sql):
+                outcome, text, rec = self._guard_outcome(sql)
+                self.assertEqual(outcome, 'refused')
+                self.assertIn('octal escape above \\377', text)
+                self.assertEqual(rec.calls, [], 'psql was not started')
+
+    def test_psql_guard_allows_octal_escapes_up_to_0o377_7703(self):
+        for sql in self.OCTAL_ALLOWED_7703:
+            with self.subTest(allowed=sql):
+                outcome, text, rec = self._guard_outcome(sql)
+                self.assertEqual((outcome, text), ('ran', ''))
+
+    def test_octal_boundary_values_7703(self):
+        self.assertEqual(pib._decode_e('\\377'), 'ÿ')
+        with self.assertRaises(pib.WrapperError) as ctx:
+            pib._decode_e('\\400')
+        self.assertIn('octal escape above \\377', str(ctx.exception))
+
+    # #7704: the guard cannot read a function or procedure body, so it refuses CREATE [OR REPLACE] FUNCTION,
+    # CREATE [OR REPLACE] PROCEDURE and CALL in every case and whitespace form, as it refuses DO.
+    BODY_REFUSED_7704 = [
+        ('CREATE FUNCTION', 'CREATE FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$'),
+        ('CREATE FUNCTION', 'create function f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$'),
+        ('CREATE FUNCTION', 'Create Or Replace Function public.f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$'),
+        ('CREATE FUNCTION', 'CREATE\n\tOR\r\nREPLACE\fFUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$'),
+        ('CREATE FUNCTION', 'CREATE/**/OR/**/REPLACE/**/FUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$'),
+        ('CREATE FUNCTION', 'CREATE -- c\nFUNCTION f() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$'),
+        ('CREATE PROCEDURE', 'CREATE PROCEDURE p() LANGUAGE sql AS $$ SELECT 1 $$'),
+        ('CREATE PROCEDURE', 'create procedure p() LANGUAGE sql AS $$ SELECT 1 $$'),
+        ('CREATE PROCEDURE', 'CREATE OR REPLACE PROCEDURE p() LANGUAGE sql AS $$ SELECT 1 $$'),
+        ('CREATE PROCEDURE', 'CREATE\nOR\nREPLACE\nPROCEDURE p() LANGUAGE sql AS $$ SELECT 1 $$'),
+        ('CREATE PROCEDURE', 'CREATE/**/PROCEDURE p() LANGUAGE sql AS $$ SELECT 1 $$'),
+        ('CALL', 'CALL p()'),
+        ('CALL', 'call p()'),
+        ('CALL', 'CaLl\np()'),
+        ('CALL', '/* c */ CALL p()'),
+        ('CALL', '-- c\nCALL p()'),
+        ('CALL', 'CALL public.p(1, 2)'),
+        ('CALL', 'CALL\t"p"()'),
+    ]
+    BODY_ALLOWED_7704 = [
+        'CREATE TABLE t (call int, function text, procedure int)', 'SELECT 1 AS call', 'SELECT 1 AS "function"',
+        "SELECT 'CALL p()'", "SELECT 'create function f()'", 'CREATE DATABASE "ai_memory_t_r1_2" TEMPLATE "ai_memory_x_tpl"',
+        'CREATE EXTENSION IF NOT EXISTS age', 'CREATE SCHEMA r7704', 'CREATE VIEW v AS SELECT 1 AS call',
+        'SELECT function, procedure FROM t',
+    ]
+
+    def test_psql_guard_refuses_create_function_create_procedure_and_call_7704(self):
+        for statement, sql in self.BODY_REFUSED_7704:
+            with self.subTest(refused=sql):
+                outcome, text, rec = self._guard_outcome(sql)
+                self.assertEqual(outcome, 'refused')
+                self.assertIn(statement, text)
+                self.assertIn('refus', text)
+                self.assertEqual(rec.calls, [], 'psql was not started')
+
+    def test_psql_guard_allows_what_merely_names_call_function_or_procedure_7704(self):
+        for sql in self.BODY_ALLOWED_7704:
+            with self.subTest(allowed=sql):
+                outcome, text, rec = self._guard_outcome(sql)
+                self.assertEqual((outcome, text), ('ran', ''))
+
     # Every SQL text the module's own callers hand to psql() (connection_budget, mint, drop, session_count,
     # _proved_absent, setup, _names, teardown, sweep) and the live-test helpers: none may be refused.
     REAL_CALLER_SHAPES = [
@@ -1217,11 +1292,17 @@ class TemplateOwnership(unittest.TestCase):
     REGEX_TIMING_BUDGET_SECS = 0.25
     REGEX_TIMING_KILL_SECS = 15.0
 
-    def _regex_seconds(self, name, text):
+    def _worst_over(self, script, name, generators):
+        worst = 0.0
+        for generator in generators:
+            worst = max(worst, self._regex_seconds(name, generator(pib.GUARD_SQL_MAX_BYTES), script))
+        return worst
+
+    def _regex_seconds(self, name, text, script=SCRIPT):
         # Worst seconds over match, search and fullmatch of one module regex on one input, measured in a child
         # process the parent can kill (a super-linear regex holds the GIL, so an in-process timer could never fire).
         try:
-            done = subprocess.run([sys.executable, '-I', '-c', self.REGEX_TIMING_CHILD, str(SCRIPT), name],
+            done = subprocess.run([sys.executable, '-I', '-c', self.REGEX_TIMING_CHILD, str(script), name],
                                   input=text.encode('utf-8'), capture_output=True, timeout=self.REGEX_TIMING_KILL_SECS,
                                   check=False)
         except subprocess.TimeoutExpired:
@@ -1245,58 +1326,147 @@ class TemplateOwnership(unittest.TestCase):
             with self.subTest(pattern=pattern):
                 self.assertTrue(reason.strip(), 'a pinned regex needs a one-line linearity reason')
                 self.assertGreaterEqual(len(generators), 2, 'a pinned regex needs a list of hostile inputs (#7675)')
-                worst = 0.0
                 for generator in generators:
                     text = generator(pib.GUARD_SQL_MAX_BYTES)
                     self.assertLessEqual(len(text.encode('utf-8', 'surrogatepass')), 4 * pib.GUARD_SQL_MAX_BYTES)
-                    worst = max(worst, self._regex_seconds(by_key[(pattern, flags)], text))
+                worst = self._worst_over(SCRIPT, by_key[(pattern, flags)], generators)
                 self.assertLess(worst, self.REGEX_TIMING_BUDGET_SECS)
 
-    def test_a_regex_added_without_a_table_row_fails_the_pin_7653(self):
-        source = SCRIPT.read_text(encoding='utf-8')
-        patterns = self._module_patterns()
-        added_source = source + "\n_NEW_RE = re.compile(r'zz[0-9]q')\n"
-        added_patterns = dict(patterns, _NEW_RE=re.compile(r'zz[0-9]q'))
-        problems = regex_audit_problems(added_source, added_patterns, PINNED_REGEXES)
-        self.assertTrue(any('not pinned' in p and 'zz[0-9]q' in p for p in problems), problems)
-        changed = dict(patterns, _HEX_RE=re.compile(r'[0-9A-Fa-f]+', re.IGNORECASE))
-        self.assertNotEqual(regex_audit_problems(source, changed, PINNED_REGEXES), [])
-        removed = {k: v for k, v in patterns.items() if k != '_HEX_RE'}
-        self.assertTrue(any('pinned but absent' in p for p in regex_audit_problems(source, removed, PINNED_REGEXES)))
+    def _load_copy(self, source):
+        """Write `source` (the module plus a planted change) under the scratch dir, import it as a throwaway module
+        and return (module, path): every red test below changes a COPY of the module, never the module itself."""
+        folder = scratch_dir()
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = Path(folder) / 'pib_copy.py'
+        path.write_text(source, encoding='utf-8')
+        name = 'pib_copy_' + uuid.uuid4().hex
+        spec = importlib.util.spec_from_file_location(name, str(path))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        self.addCleanup(sys.modules.pop, name, None)
+        spec.loader.exec_module(module)
+        return module, path
 
-    def test_regex_calls_outside_a_module_level_compile_fail_the_pin_7653(self):
-        source = SCRIPT.read_text(encoding='utf-8')
-        patterns = self._module_patterns()
-        for extra in ("def helper(x):\n    return re.match(r'a', x)\n", "def helper(x):\n    return re.compile('a')\n",
-                      "from re import compile as c\n", "import re as regex\n",
-                      "_P = [re.compile('a')]\n"):
+    def _audit(self, source):
+        module, _path = self._load_copy(source)
+        return regex_audit_problems(source, sweep_patterns(vars(module)), PINNED_REGEXES)
+
+    def _real_source(self):
+        return SCRIPT.read_text(encoding='utf-8')
+
+    def test_the_unchanged_module_has_no_problem_and_the_collector_folds_the_real_patterns_7701(self):
+        source = self._real_source()
+        self.assertEqual(self._audit(source), [])
+        found, problems = static_regex_calls(source)
+        self.assertEqual(problems, [])
+        folded = {pattern for _attr, pattern in found}
+        self.assertEqual(folded, {p.pattern for p in self._module_patterns().values()})
+        self.assertIn('^ai_memory_t_([a-z0-9]{1,20})_([0-9]{10})_([0-9a-f]{8})$', folded)
+        self.assertIn('^[a-z0-9]{1,20}$', folded)
+        self.assertIn('^[A-Za-z0-9_]{1,63}$', folded)
+
+    def test_a_new_compile_fails_the_pin_7701(self):
+        problems = self._audit(self._real_source() + "\n_NEW_RE = re.compile(r'zz[0-9]q')\n")
+        self.assertEqual(problems, ["not pinned: 'zz[0-9]q' flags 32"])
+
+    def test_a_changed_pattern_fails_the_pin_7701(self):
+        source = self._real_source()
+        old = "_HEX_RE = re.compile(r'[0-9A-Fa-f]+')"
+        self.assertIn(old, source)
+        problems = self._audit(source.replace(old, "_HEX_RE = re.compile(r'[0-9A-Fa-g]+')"))
+        self.assertEqual(problems, ["not pinned: '[0-9A-Fa-g]+' flags 32", "pinned but absent: '[0-9A-Fa-f]+' flags 32"])
+
+    def test_a_changed_flag_fails_the_pin_as_keyword_and_inline_7701(self):
+        source = self._real_source()
+        old = "_HEX_RE = re.compile(r'[0-9A-Fa-f]+')"
+        self.assertIn(old, source)
+        absent = "pinned but absent: '[0-9A-Fa-f]+' flags 32"
+        for label, new, expected in (
+                ('keyword', "_HEX_RE = re.compile(r'[0-9A-Fa-f]+', flags=re.IGNORECASE)", "not pinned: '[0-9A-Fa-f]+' flags 34"),
+                ('positional', "_HEX_RE = re.compile(r'[0-9A-Fa-f]+', re.IGNORECASE)", "not pinned: '[0-9A-Fa-f]+' flags 34"),
+                ('inline', "_HEX_RE = re.compile(r'(?i)[0-9A-Fa-f]+')", "not pinned: '(?i)[0-9A-Fa-f]+' flags 34")):
+            with self.subTest(flag=label):
+                self.assertEqual(self._audit(source.replace(old, new)), [expected, absent])
+
+    def test_a_flag_inside_an_allowed_compile_is_reported_by_the_exact_text_7701(self):
+        source = self._real_source()
+        for extra, expected in (
+                ("_FLAGGED_RE = re.compile(r'zz[0-9]q', re.IGNORECASE)", "not pinned: 'zz[0-9]q' flags 34"),
+                ("_FLAGGED_RE = re.compile(r'zz[0-9]q', re.IGNORECASE | re.MULTILINE)", "not pinned: 'zz[0-9]q' flags 42")):
             with self.subTest(extra=extra):
-                self.assertNotEqual(regex_audit_problems(source + '\n' + extra, patterns, PINNED_REGEXES), [])
+                self.assertEqual(self._audit(source + '\n' + extra + '\n'), [expected])
 
-    PLANTED_ROUTES_7674 = (
-        ('assignment alias', "_rx = re\n"),
-        ('getattr', "_m = getattr(re, 'match')\n"),
-        ('vars', "_m = vars(re)['match']\n"),
-        ('sre_compile import', "import sre_compile\n"),
-        ('__import__', "_r = __import__('re')\n"),
-        ('importlib', "import importlib\n_r = importlib.import_module('re')\n"),
-        ('fnmatch', "import fnmatch\n_t = fnmatch.translate('zz')\n"),
-        ('re passed as a value', "_f = print(re)\n"),
-        ('re rebound by a parameter', "def helper(re):\n    return re\n"),
+    def test_a_removed_row_fails_the_pin_7701(self):
+        source = self._real_source()
+        patterns = self._module_patterns()
+        removed = {k: v for k, v in patterns.items() if k != '_HEX_RE'}
+        self.assertEqual(regex_audit_problems(source, removed, PINNED_REGEXES),
+                         ["pinned but absent: '[0-9A-Fa-f]+' flags 32"])
+
+    NON_LITERAL_7701 = (
+        ('name', "_V = 'a'\n_NL_RE = re.compile(_V)\n"),
+        ('concatenation', "_NL_RE = re.compile('a' + 'b')\n"),
+        ('f-string', "_V = 'a'\n_NL_RE = re.compile(f'{_V}b')\n"),
+        ('unknown constant', "_UNK = int('3')\n_NL_RE = re.compile('a{1,%d}' % _UNK)\n"),
+        ('expression operand', "_NL_RE = re.compile('a{1,%d}' % (1 + 2))\n"),
+        ('too few operands', "_NL_RE = re.compile('a{1,%d}b{1,%d}' % (1,))\n"),
+        ('keyword pattern', "_NL_RE = re.compile(pattern='a')\n"),
+        ('parameter in a function', "def _h(x):\n    return re.compile(x)\n"),
+        ('match with a parameter', "def _h(x):\n    return re.match(x, 'a')\n"),
+        ('computed in a function', "def _h(x):\n    return re.compile('a' + x)\n"),
+        ('format of a parameter', "def _h(n):\n    return re.compile('a{1,%d}' % n)\n"),
     )
 
-    def test_each_route_to_a_regex_fails_the_pin_7674(self):
-        source = SCRIPT.read_text(encoding='utf-8')
-        patterns = self._module_patterns()
-        self.assertEqual(regex_audit_problems(source, patterns, PINNED_REGEXES), [])
-        for route, extra in self.PLANTED_ROUTES_7674:
-            with self.subTest(route=route):
-                self.assertNotEqual(regex_audit_problems(source + '\n' + extra, patterns, PINNED_REGEXES), [])
+    def test_a_pattern_that_is_not_a_foldable_literal_fails_closed_7701(self):
+        source = self._real_source()
+        for label, extra in self.NON_LITERAL_7701:
+            with self.subTest(pattern=label):
+                problems = self._audit(source + '\n' + extra)
+                self.assertTrue(any(re.fullmatch(r'line \d+: re\.(compile|match) pattern is not a string literal or a '
+                                                 r'%-format of module constants', p) for p in problems), problems)
 
-    def test_a_flag_inside_an_allowed_compile_is_not_reported_as_outside_7674(self):
-        source = SCRIPT.read_text(encoding='utf-8') + "\n_FLAGGED_RE = re.compile(r'zz[0-9]q', re.IGNORECASE)\n"
-        problems = regex_audit_problems(source, self._module_patterns(), PINNED_REGEXES)
-        self.assertFalse(any('IGNORECASE' in p or 'outside' in p for p in problems), problems)
+    def test_a_percent_format_of_module_constants_is_folded_not_refused_7701(self):
+        found, problems = static_regex_calls("N = 3\nP = 'ab'\n_X_RE = re.compile('^%s{1,%d}$' % (P, N))\n")
+        self.assertEqual((found, problems), ([('compile', '^ab{1,3}$')], []))
+
+    OUTSIDE_MODULE_LEVEL_7701 = (
+        ('function', "def _h():\n    return re.compile(r'[0-9]+')\n"),
+        ('list element', "_P = [re.compile(r'[0-9]+')]\n"),
+        ('if body', "if True:\n    _P = re.compile(r'[0-9]+')\n"),
+        ('class attribute', "class _C:\n    P = re.compile(r'[0-9]+')\n"),
+        ('call argument', "_P = print(re.compile(r'[0-9]+'))\n"),
+        ('default argument', "def _h(p=re.compile(r'[0-9]+')):\n    return p\n"),
+    )
+
+    def test_a_pattern_compiled_outside_a_module_level_assignment_fails_7701(self):
+        source = self._real_source()
+        for label, extra in self.OUTSIDE_MODULE_LEVEL_7701:
+            with self.subTest(place=label):
+                problems = self._audit(source + '\n' + extra)
+                self.assertTrue(any(re.fullmatch(r'line \d+: re\.compile outside a module-level assignment', p)
+                                    for p in problems), problems)
+
+    def test_a_call_on_an_unpinned_literal_fails_7701(self):
+        problems = self._audit(self._real_source() + "\ndef _h(x):\n    return re.match(r'zz', x)\n")
+        self.assertTrue(any(re.fullmatch(r"line \d+: re\.match pattern not pinned: 'zz'", p) for p in problems), problems)
+
+    def test_a_pattern_held_where_the_static_collector_cannot_see_it_is_caught_by_the_sweep_7701(self):
+        source = self._real_source()
+        for label, extra in (
+                ('plain global', "_HIDDEN = getattr(re, 'comp' + 'ile')(r'zz[0-9]q')\n"),
+                ('list', "_HIDDEN = [getattr(re, 'comp' + 'ile')(r'zz[0-9]q')]\n"),
+                ('dict', "_HIDDEN = {'k': getattr(re, 'comp' + 'ile')(r'zz[0-9]q')}\n")):
+            with self.subTest(held=label):
+                found, static_problems = static_regex_calls(source + '\n' + extra)
+                self.assertEqual(static_problems, [], 'the static collector must not see it, only the sweep')
+                self.assertEqual(self._audit(source + '\n' + extra), ["not pinned: 'zz[0-9]q' flags 32"])
+
+    def test_a_slow_pattern_is_over_the_timing_budget_7701(self):
+        extra = "\n_SLOW_RE = re.compile(r'(a+)+$')\n"
+        _module, path = self._load_copy(self._real_source() + extra)
+        worst = self._worst_over(path, '_SLOW_RE', (lambda _n: 'a' * 26 + '!',))
+        self.assertGreaterEqual(worst, self.REGEX_TIMING_BUDGET_SECS)
+        self.assertLess(self._worst_over(SCRIPT, '_HEX_RE', (_pad('', 'a'),)), self.REGEX_TIMING_BUDGET_SECS)
 
     def test_pinned_rows_carry_lists_of_hostile_inputs_7675(self):
         by_pattern = {row[0]: row[3] for row in PINNED_REGEXES}
