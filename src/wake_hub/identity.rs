@@ -13,12 +13,15 @@
 //!    [`SameUidAuthorizer`] admits only peers whose uid equals this process's
 //!    effective uid, which is what makes the 0600 socket a real boundary rather
 //!    than a hint.
-//! 2. [`HelloVerifier`] — the cryptographic half. The default shipped by this
-//!    issue is [`DenyAllVerifier`]: until #3468 lands the scoped
-//!    `a2a-hub/join/v1` delegation, EVERY hello is refused. That is deliberate.
-//!    A hub that admitted unauthenticated peers "until identity lands" would be
-//!    exactly the fail-open default the North Star forbids; refusing loudly
-//!    costs a wake hint, and the `<=60 s` backstop poll still delivers.
+//! 2. [`HelloVerifier`] — the cryptographic half. The live verifier wired by
+//!    the `ai-memory wake-hub` subcommand is
+//!    [`ScopedDelegationVerifier`](super::delegation_verifier::ScopedDelegationVerifier),
+//!    which checks the scoped `a2a-hub/join/v1` delegation (#3468) against a
+//!    reloading allowlist. [`DenyAllVerifier`] is the test fallback: it refuses
+//!    EVERY hello. That is deliberate. A hub that admitted unauthenticated
+//!    peers "until identity lands" would be exactly the fail-open default the
+//!    North Star forbids; refusing loudly costs a wake hint, and the `<=60 s`
+//!    backstop poll still delivers (#7272).
 //!
 //! # Why a transcript, not a bare nonce
 //!
@@ -372,7 +375,8 @@ pub trait HelloVerifier: Send + Sync + 'static {
     }
 }
 
-/// The verifier the `ai-memory wake-hub` subcommand ships with until #3468.
+/// The test fallback verifier; the live hub uses
+/// [`ScopedDelegationVerifier`](super::delegation_verifier::ScopedDelegationVerifier).
 ///
 /// Refuses every hello. The hub still binds its socket, still asserts its
 /// start-up invariants and still serves metrics, so an operator can verify the
