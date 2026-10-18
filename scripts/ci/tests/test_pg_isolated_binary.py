@@ -1166,6 +1166,38 @@ class TemplateOwnership(unittest.TestCase):
             with self.subTest(extra=extra):
                 self.assertNotEqual(regex_audit_problems(source + '\n' + extra, patterns, PINNED_REGEXES), [])
 
+    PLANTED_ROUTES_7674 = (
+        ('assignment alias', "_rx = re\n"),
+        ('getattr', "_m = getattr(re, 'match')\n"),
+        ('vars', "_m = vars(re)['match']\n"),
+        ('sre_compile import', "import sre_compile\n"),
+        ('__import__', "_r = __import__('re')\n"),
+        ('importlib', "import importlib\n_r = importlib.import_module('re')\n"),
+        ('fnmatch', "import fnmatch\n_t = fnmatch.translate('zz')\n"),
+        ('re passed as a value', "_f = print(re)\n"),
+        ('re rebound by a parameter', "def helper(re):\n    return re\n"),
+    )
+
+    def test_each_route_to_a_regex_fails_the_pin_7674(self):
+        source = SCRIPT.read_text(encoding='utf-8')
+        patterns = self._module_patterns()
+        self.assertEqual(regex_audit_problems(source, patterns, PINNED_REGEXES), [])
+        for route, extra in self.PLANTED_ROUTES_7674:
+            with self.subTest(route=route):
+                self.assertNotEqual(regex_audit_problems(source + '\n' + extra, patterns, PINNED_REGEXES), [])
+
+    def test_a_flag_inside_an_allowed_compile_is_not_reported_as_outside_7674(self):
+        source = SCRIPT.read_text(encoding='utf-8') + "\n_FLAGGED_RE = re.compile(r'zz[0-9]q', re.IGNORECASE)\n"
+        problems = regex_audit_problems(source, self._module_patterns(), PINNED_REGEXES)
+        self.assertFalse(any('IGNORECASE' in p or 'outside' in p for p in problems), problems)
+
+    def test_pinned_rows_carry_lists_of_hostile_inputs_7675(self):
+        by_pattern = {row[0]: row[3] for row in PINNED_REGEXES}
+        digits = by_pattern[r'[0-9]+']
+        dollar = by_pattern[r'\$(?:[A-Za-z_\x80-\U0010ffff][A-Za-z0-9_\x80-\U0010ffff]*)?\$']
+        self.assertIn('a' * 64, [g(64) for g in digits])
+        self.assertIn('$1' * 32, [g(64) for g in dollar])
+
     def test_test_files_import_no_regex_internals_7653(self):
         for name in ('test_pg_isolated_binary.py', 'test_check_pg_isolate_invariants.py'):
             tree = ast.parse((Path(__file__).parent / name).read_text(encoding='utf-8'))
