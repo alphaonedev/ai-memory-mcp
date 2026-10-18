@@ -15603,7 +15603,8 @@ pub(crate) async fn pg_append_signed_event_with_chain_in_tx(
             }
             Err(e) => {
                 savepoint.rollback().await?;
-                crate::governance::audit::warn_watermark_skipped_genesis_read_error(next_seq, &e);
+                crate::governance::audit::warn_watermark_skipped_genesis_read_error(&e);
+                anchor = crate::governance::audit::PendingAuditAnchor::genesis_skip(next_seq);
             }
         }
     }

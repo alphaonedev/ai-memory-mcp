@@ -3021,6 +3021,16 @@ struct PendingWatermark {
 pub struct PendingAuditAnchor {
     watermark: Option<PendingWatermark>,
     head_anchors: Vec<crate::models::Checkpoint>,
+    /// #7746 - genesis-read skips this transaction hit, applied after commit.
+    genesis_skip: Option<PendingGenesisSkip>,
+}
+
+/// #7746 - the genesis-read skips of one transaction: how many there were and
+/// the highest head sequence that hit one (the retry backoff anchor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingGenesisSkip {
+    count: u64,
+    head_sequence: i64,
 }
 
 impl PendingAuditAnchor {
@@ -3039,6 +3049,22 @@ impl PendingAuditAnchor {
                 db_id: db_id.to_string(),
             }),
             head_anchors: Vec::new(),
+            genesis_skip: None,
+        }
+    }
+
+    /// #7746 - the append at `head_sequence` skipped its watermark because the
+    /// genesis db-id could not be read. The counter, the exported metric and
+    /// the retry backoff are applied by
+    /// [`emit_after_commit`](Self::emit_after_commit) only, so a rolled-back
+    /// skip neither counts nor claims the backoff (the #7241 discipline).
+    pub fn genesis_skip(head_sequence: i64) -> Self {
+        Self {
+            genesis_skip: Some(PendingGenesisSkip {
+                count: 1,
+                head_sequence,
+            }),
+            ..Self::default()
         }
     }
 
@@ -3063,13 +3089,20 @@ impl PendingAuditAnchor {
             (a, b) => b.or(a),
         };
         self.head_anchors.extend(later.head_anchors);
+        self.genesis_skip = match (self.genesis_skip.take(), later.genesis_skip) {
+            (Some(a), Some(b)) => Some(PendingGenesisSkip {
+                count: a.count.saturating_add(b.count),
+                head_sequence: a.head_sequence.max(b.head_sequence),
+            }),
+            (a, b) => b.or(a),
+        };
         self
     }
 
     /// `true` when nothing is pending.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.watermark.is_none() && self.head_anchors.is_empty()
+        self.watermark.is_none() && self.head_anchors.is_empty() && self.genesis_skip.is_none()
     }
 
     /// Head sequence of the pending watermark, if one is pending.
@@ -3082,6 +3115,16 @@ impl PendingAuditAnchor {
     /// committed: the watermark claims the throttle here (never in the
     /// transaction), so a rolled-back append neither anchors nor burns it.
     pub fn emit_after_commit(self) {
+        // #7746 - a committed genesis-read skip counts and claims its backoff
+        // here, never in the transaction. `fetch_max` so a concurrent lower
+        // sequence cannot regress the backoff.
+        if let Some(skip) = self.genesis_skip {
+            WATERMARK_GENESIS_READ_SKIPS.fetch_add(skip.count, Ordering::Relaxed);
+            for _ in 0..skip.count {
+                crate::metrics::inc_audit_watermark_genesis_read_skips();
+            }
+            GENESIS_SKIP_BACKOFF_SEQ.fetch_max(skip.head_sequence, Ordering::Relaxed);
+        }
         if let Some(w) = self.watermark {
             maybe_record_audit_watermark(w.head_sequence, &w.head_canonical_hash, &w.db_id);
         }
@@ -3134,18 +3177,14 @@ pub fn watermark_genesis_read_skips() -> u64 {
 static GENESIS_SKIP_BACKOFF_SEQ: AtomicI64 = AtomicI64::new(0);
 
 /// #7239 / #7604 / #7236 - a genesis READ ERROR skips the watermark emission:
-/// count it (process counter and the exported
-/// `ai_memory_audit_watermark_genesis_read_skips_total`, #7676) and WARN. The
-/// skip claims a backoff of one [`WATERMARK_INTERVAL`] from `head_sequence`,
-/// so the WARN fires once per due window; the append that hit it still
-/// succeeds and the retry happens at the next emission-due append.
-pub fn warn_watermark_skipped_genesis_read_error(
-    head_sequence: i64,
-    error: &dyn std::fmt::Display,
-) {
-    WATERMARK_GENESIS_READ_SKIPS.fetch_add(1, Ordering::Relaxed);
-    crate::metrics::inc_audit_watermark_genesis_read_skips();
-    GENESIS_SKIP_BACKOFF_SEQ.store(head_sequence, Ordering::Relaxed);
+/// WARN here, in the transaction. The count (process counter and the exported
+/// `ai_memory_audit_watermark_genesis_read_skips_total`, #7676) and the backoff
+/// of one [`WATERMARK_INTERVAL`] ride the returned
+/// [`PendingAuditAnchor::genesis_skip`] and are applied only once the append
+/// COMMITS (#7746, the #7241 discipline), so the WARN fires once per due
+/// window and a rolled-back skip leaves both untouched; the append that hit it
+/// still succeeds and the retry happens at the next emission-due append.
+pub fn warn_watermark_skipped_genesis_read_error(error: &dyn std::fmt::Display) {
     tracing::warn!(
         "audit watermark skipped: the genesis db-id could not be read ({error:#}); the append \
          succeeded without an anchor and the next emission-due append retries (#7239)"

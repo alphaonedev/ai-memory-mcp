@@ -3114,7 +3114,8 @@ pub fn append_signed_event_no_tx(
                         "genesis read error rolled back the append transaction (audit watermark)",
                     ));
                 }
-                crate::governance::audit::warn_watermark_skipped_genesis_read_error(next_seq, &e);
+                crate::governance::audit::warn_watermark_skipped_genesis_read_error(&e);
+                anchor = crate::governance::audit::PendingAuditAnchor::genesis_skip(next_seq);
             }
         }
     }

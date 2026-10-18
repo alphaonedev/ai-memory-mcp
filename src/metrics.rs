@@ -2454,10 +2454,8 @@ mod tests {
                 .unwrap_or(0)
         }
         let before = sample();
-        crate::governance::audit::warn_watermark_skipped_genesis_read_error(
-            0,
-            &"injected read fault",
-        );
+        // #7746 - the counter bumps when the skip's append commits.
+        crate::governance::audit::PendingAuditAnchor::genesis_skip(0).emit_after_commit();
         let text = render();
         assert!(
             text.contains(&format!("# TYPE {SERIES} counter")),
