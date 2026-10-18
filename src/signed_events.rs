@@ -3083,8 +3083,9 @@ pub fn append_signed_event_no_tx(
         // it against EVERY opener of the shared sink. An absent genesis skips the
         // emission (one WARN). A genesis READ ERROR also skips it (a WARN per
         // skip, counted) and the append still succeeds, so the chain never
-        // stalls and best-effort callers keep their audit row; the throttle is
-        // not claimed, so the next emission-due append retries. decision
+        // stalls and best-effort callers keep their audit row; the skip backs
+        // the retry off one WATERMARK_INTERVAL (one WARN per due window), so
+        // the next emission-due append retries. decision
         // (#7238, #7239, #7604): skip over fail closed, 3-agent vote (6def5ab6),
         // 3-0 for skip, because failing the append stalled the chain permanently
         // and left best-effort callers committing with no audit row. Postgres
@@ -3098,7 +3099,23 @@ pub fn append_signed_event_no_tx(
                 );
             }
             Ok(None) => crate::governance::audit::warn_watermark_skipped_no_genesis(),
-            Err(e) => crate::governance::audit::warn_watermark_skipped_genesis_read_error(&e),
+            Err(e) => {
+                #[cfg(test)]
+                tests::force_rollback_after_genesis_error(conn);
+                // #7678 (ERRORS-19) - an I/O-class error (IOERR / FULL / NOMEM)
+                // can roll the caller's transaction back on its own. The
+                // connection is then in autocommit and the audit row this
+                // function just inserted is gone, so skipping the watermark and
+                // returning Ok would report a write that did not happen: fail
+                // closed. A decode error leaves the transaction intact and keeps
+                // the voted skip.
+                if conn.is_autocommit() {
+                    return Err(e.context(
+                        "genesis read error rolled back the append transaction (audit watermark)",
+                    ));
+                }
+                crate::governance::audit::warn_watermark_skipped_genesis_read_error(next_seq, &e);
+            }
         }
     }
 
@@ -3596,6 +3613,57 @@ mod tests {
             !report.is_clean(),
             "a head-hash Mismatch must dirty is_clean (exit-1 on same-length rewrite)"
         );
+    }
+
+    thread_local! {
+        /// #7678 seam: when set, the genesis-read error arm of
+        /// `append_signed_event_no_tx` first ends the caller's transaction, the
+        /// way an I/O-class SQLite error (IOERR / FULL / NOMEM) does on its own.
+        static ROLLBACK_AFTER_GENESIS_ERROR: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
+    }
+
+    /// #7678 seam body (called from the production arm under `cfg(test)`).
+    pub(super) fn force_rollback_after_genesis_error(conn: &Connection) {
+        if ROLLBACK_AFTER_GENESIS_ERROR.with(std::cell::Cell::get) {
+            conn.execute_batch("ROLLBACK")
+                .expect("end the transaction the way an I/O-class error does");
+        }
+    }
+
+    /// #7678 (ERRORS-19) - a genesis read error that ended the caller's
+    /// transaction must fail the append instead of being skipped: the audit row
+    /// is gone and a skip would return Ok on a connection in autocommit. The
+    /// genesis row is inserted with a TEXT `payload_hash` so the read errors on
+    /// decode; the head sits at a distant sequence so an emission is due.
+    #[test]
+    fn genesis_read_error_that_rolled_back_the_transaction_fails_the_append_7678() {
+        const FAR_HEAD: i64 = 1_000_000_000_000;
+        let conn = fresh_db();
+        conn.execute_batch(
+            "INSERT INTO signed_events (id, agent_id, event_type, payload_hash, \
+             attest_level, timestamp, prev_hash, sequence) VALUES \
+             ('g7678', 'a', 'e', 'not-a-blob', 'unsigned', 't', zeroblob(32), 1)",
+        )
+        .expect("insert unreadable genesis");
+        conn.execute(
+            "INSERT INTO signed_events (id, agent_id, event_type, payload_hash, \
+             attest_level, timestamp, prev_hash, sequence) VALUES \
+             ('h7678', 'a', 'e', x'01', 'unsigned', 't', zeroblob(32), ?1)",
+            [FAR_HEAD],
+        )
+        .expect("insert distant head");
+        assert!(genesis_db_id(&conn).is_err(), "the genesis read must error");
+        conn.execute_batch("BEGIN IMMEDIATE").expect("begin");
+        ROLLBACK_AFTER_GENESIS_ERROR.with(|c| c.set(true));
+        let result = append_signed_event_no_tx(&conn, &fixture("alice", "memory_link.created"));
+        ROLLBACK_AFTER_GENESIS_ERROR.with(|c| c.set(false));
+        let err = result.expect_err("a rolled-back append transaction must fail the append");
+        assert!(
+            format!("{err:#}").contains("rolled back the append transaction"),
+            "unexpected error: {err:#}"
+        );
+        assert!(conn.is_autocommit(), "the seam ended the transaction");
     }
 
     /// In-memory connection with the v25 schema applied. We don't go

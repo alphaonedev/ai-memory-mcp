@@ -330,6 +330,12 @@ pub struct Metrics {
     /// that must move onto `WriteTxn`.
     pub audit_anchor_frameless_drop: IntCounter,
 
+    /// #7676 / #7604 - monotonic count of audit watermark emissions skipped
+    /// because the genesis db-id read failed (the append still succeeded, so
+    /// the chain is unanchored until the read recovers). Non-zero means a
+    /// delayed truncation anchor; check the genesis row and the db-id.
+    pub audit_watermark_genesis_read_skips: IntCounter,
+
     /// v1.0.0 #3699 (5-agent vote 4d3ea1c5) — monotonic count of inbound
     /// federated memories folded into a LOCAL row of a DIFFERENT id by the
     /// newer-wins `(title, namespace)` merge (the inbound id was never
@@ -1144,6 +1150,16 @@ impl Metrics {
             &mut err,
         );
 
+        let audit_watermark_genesis_read_skips = int_counter(
+            &registry,
+            "ai_memory_audit_watermark_genesis_read_skips_total",
+            "Monotonic count of audit watermark emissions skipped because the genesis \
+             db-id could not be read (#7604). The append succeeded without a truncation \
+             anchor; the next emission-due append retries. Non-zero means the chain is \
+             unanchored: check the signed_events genesis row and the database id.",
+            &mut err,
+        );
+
         // v1.0.0 #4199 — the forensic sink was unavailable at boot (no fork).
         let forensic_sink_unavailable = int_counter(
             &registry,
@@ -1599,6 +1615,7 @@ impl Metrics {
             forensic_sink_unavailable,
             forensic_lock_unavailable,
             audit_anchor_frameless_drop,
+            audit_watermark_genesis_read_skips,
             federation_cross_id_title_merge,
             operator_dequarantined,
             hnsw_evictions_total,
@@ -1776,6 +1793,11 @@ pub fn inc_forensic_lock_unavailable() {
 /// #7281 - an audit anchor was dropped unrecorded (frameless raw transaction).
 pub fn inc_audit_anchor_frameless_drop() {
     registry().audit_anchor_frameless_drop.inc();
+}
+
+/// #7676 - an audit watermark emission was skipped on a genesis read error.
+pub fn inc_audit_watermark_genesis_read_skips() {
+    registry().audit_watermark_genesis_read_skips.inc();
 }
 
 /// v1.0.0 #4304 — read [`inc_forensic_lock_unavailable`]'s counter.
@@ -2414,6 +2436,35 @@ mod tests {
         let r2 = registry();
         // Same instance — no double-registration.
         assert!(std::ptr::eq(std::ptr::from_ref(r1), std::ptr::from_ref(r2)));
+    }
+
+    /// #7676 - the genesis read-skip counter (Option B's only detection
+    /// control, #7604) is exported on `/metrics` and increments when the audit
+    /// watermark skips an emission because the genesis db-id read failed.
+    #[test]
+    fn audit_watermark_genesis_read_skips_series_is_exported_7676() {
+        const SERIES: &str = "ai_memory_audit_watermark_genesis_read_skips_total";
+        fn sample() -> u64 {
+            render()
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix(SERIES)
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                })
+                .unwrap_or(0)
+        }
+        let before = sample();
+        crate::governance::audit::warn_watermark_skipped_genesis_read_error(0, &"injected read fault");
+        let text = render();
+        assert!(
+            text.contains(&format!("# TYPE {SERIES} counter")),
+            "/metrics missing the {SERIES} series\n\n{text}"
+        );
+        assert!(
+            sample() > before,
+            "{SERIES} did not increment: {before} -> {}",
+            sample()
+        );
     }
 
     #[test]

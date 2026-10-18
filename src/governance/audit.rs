@@ -2953,7 +2953,10 @@ pub fn watermark_emission_due(head_sequence: i64) -> bool {
         return false;
     }
     let last = LAST_WATERMARKED_SEQ.load(Ordering::Relaxed);
+    // #7236 - a genesis read error backs the retry off by one interval.
+    let skipped = GENESIS_SKIP_BACKOFF_SEQ.load(Ordering::Relaxed);
     head_sequence.saturating_sub(last) >= WATERMARK_INTERVAL
+        && head_sequence.saturating_sub(skipped) >= WATERMARK_INTERVAL
 }
 
 /// #1850 — throttled emitter for the signed-events append hot path.
@@ -3123,12 +3126,26 @@ pub fn watermark_genesis_read_skips() -> u64 {
     WATERMARK_GENESIS_READ_SKIPS.load(Ordering::Relaxed)
 }
 
-/// #7239 / #7604 - a genesis READ ERROR skips the watermark emission: count it
-/// and WARN every time (the fault persists until the genesis row is readable,
-/// and each skip delays the truncation anchor). The append that hit it still
-/// succeeds and the next emission-due append retries.
-pub fn warn_watermark_skipped_genesis_read_error(error: &dyn std::fmt::Display) {
+/// #7236 - head sequence of the last emission skipped on a genesis READ
+/// ERROR. It backs the retry off by one [`WATERMARK_INTERVAL`]
+/// ([`watermark_emission_due`]), so a persistent fault re-reads the genesis
+/// (and WARNs, and on postgres opens a savepoint) once per due window instead
+/// of on every later append.
+static GENESIS_SKIP_BACKOFF_SEQ: AtomicI64 = AtomicI64::new(0);
+
+/// #7239 / #7604 / #7236 - a genesis READ ERROR skips the watermark emission:
+/// count it (process counter and the exported
+/// `ai_memory_audit_watermark_genesis_read_skips_total`, #7676) and WARN. The
+/// skip claims a backoff of one [`WATERMARK_INTERVAL`] from `head_sequence`,
+/// so the WARN fires once per due window; the append that hit it still
+/// succeeds and the retry happens at the next emission-due append.
+pub fn warn_watermark_skipped_genesis_read_error(
+    head_sequence: i64,
+    error: &dyn std::fmt::Display,
+) {
     WATERMARK_GENESIS_READ_SKIPS.fetch_add(1, Ordering::Relaxed);
+    crate::metrics::inc_audit_watermark_genesis_read_skips();
+    GENESIS_SKIP_BACKOFF_SEQ.store(head_sequence, Ordering::Relaxed);
     tracing::warn!(
         "audit watermark skipped: the genesis db-id could not be read ({error:#}); the append \
          succeeded without an anchor and the next emission-due append retries (#7239)"
