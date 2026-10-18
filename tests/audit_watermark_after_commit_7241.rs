@@ -265,6 +265,59 @@ fn sqlite_rolled_back_genesis_skip_neither_counts_nor_claims_backoff_7746() {
     forensic::shutdown();
 }
 
+/// Appends one transaction carries in the #7755 multi-append cells.
+const MULTI_APPENDS: usize = 10;
+
+/// #7755 - inside ONE transaction the genesis-read skip is claimed once per due
+/// window: the first due append re-reads the genesis and records the skip, the
+/// later appends of the same transaction (whose committed backoff is not yet
+/// visible) are suppressed by the tentative in-transaction marker. One genesis
+/// re-read, one counted skip, however many rows the transaction appends.
+#[test]
+fn sqlite_multi_append_tx_counts_one_genesis_skip_7755() {
+    let _g = CELL_LOCK.blocking_lock();
+    let fdir = fresh_dir("sqlite-multi-skip-sink");
+    let ddir = fresh_dir("sqlite-multi-skip-db");
+    forensic::init(fdir.path(), None).expect("forensic init");
+    let conn = open_db(ddir.path());
+    drive_sqlite_until_due(&conn);
+    let survivor = head(&conn);
+    conn.execute(
+        "UPDATE signed_events SET payload_hash = ?1 WHERE sequence = ?2",
+        rusqlite::params![UNREADABLE_GENESIS_HASH, GENESIS_SEQUENCE],
+    )
+    .expect("corrupt genesis payload_hash");
+    assert!(genesis_db_id(&conn).is_err(), "genesis must be unreadable");
+    let skips_before = forensic::watermark_genesis_read_skips();
+
+    let tx = conn.unchecked_transaction().expect("begin multi tx");
+    let mut pending = forensic::PendingAuditAnchor::none();
+    let mut genesis_rereads = 0_usize;
+    for n in 0..MULTI_APPENDS {
+        if forensic::watermark_emission_due(head(&tx) + 1) {
+            genesis_rereads += 1;
+        }
+        let appended = append_signed_event_no_tx(&tx, &row_event(&format!("multi-{n}")))
+            .expect("the skip must not fail the append");
+        pending = pending.merge(appended);
+    }
+    tx.commit().expect("commit multi tx");
+    pending.emit_after_commit();
+
+    let appended_rows = i64::try_from(MULTI_APPENDS).expect("append count fits i64");
+    assert_eq!(head(&conn), survivor + appended_rows);
+    assert_eq!(
+        genesis_rereads, 1,
+        "one genesis re-read per due window inside a transaction (#7236)"
+    );
+    assert_eq!(
+        forensic::watermark_genesis_read_skips(),
+        skips_before + 1,
+        "one counted skip per due window inside a transaction (#7755)"
+    );
+    forensic::shutdown();
+}
+
 #[test]
 fn sqlite_main_write_paths_still_anchor_7241() {
     let _g = CELL_LOCK.blocking_lock();
@@ -401,6 +454,7 @@ mod postgres_twin {
     use ai_memory::models::{Memory, MemoryKind, Tier};
     use ai_memory::store::postgres::PostgresStore;
     use ai_memory::store::{CallerContext, MemoryStore};
+    use ai_memory::wake_hub::delegation_verifier::{ALLOWLIST_FILE_VERSION, AllowlistFile};
 
     /// Scratch database name prefix for this file.
     const SCRATCH_PREFIX: &str = "ai_memory_7241wm";
@@ -631,6 +685,54 @@ mod postgres_twin {
         assert!(
             !forensic::watermark_emission_due(survivor + 2),
             "a committed skip claims the retry backoff for one window (#7236)"
+        );
+        forensic::shutdown();
+    }
+
+    /// #7755 - postgres twin: one transaction that appends several signed
+    /// events (the hub-cache allowlist audit) under a persistent genesis read
+    /// fault counts ONE skip, not one per row past the due point.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+    async fn pg_multi_append_tx_counts_one_genesis_skip_7755() {
+        let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let _g = CELL_LOCK.lock().await;
+        let (scratch, admin) = scratch_store(&url).await;
+        let fdir = fresh_dir("pg-multi-skip-sink");
+        forensic::init(fdir.path(), None).expect("forensic init");
+        drive_pg_until_due(&admin).await;
+        let survivor = pg_head(&admin).await;
+        let pg = inject_genesis_read_fault(&scratch, &admin).await;
+        let skips_before = forensic::watermark_genesis_read_skips();
+
+        let agents: Vec<serde_json::Value> = (0..super::MULTI_APPENDS)
+            .map(|n| {
+                serde_json::json!({
+                    "agent_id": format!("ai:7755-agent-{n}"),
+                    "pubkey_b64": "AAAA",
+                    "bound_at": "2026-10-18T00:00:00+00:00",
+                })
+            })
+            .collect();
+        let next: AllowlistFile = serde_json::from_value(serde_json::json!({
+            "version": ALLOWLIST_FILE_VERSION,
+            "refreshed_at": "2026-10-18T00:00:00+00:00",
+            "agents": agents,
+        }))
+        .expect("allowlist file");
+        pg.audit_hub_cache(None, &next)
+            .await
+            .expect("the skip must not fail the audit transaction");
+
+        let appended_rows = i64::try_from(super::MULTI_APPENDS).expect("append count fits i64");
+        assert_eq!(pg_head(&admin).await, survivor + appended_rows);
+        assert_eq!(
+            forensic::watermark_genesis_read_skips(),
+            skips_before + 1,
+            "one counted skip per due window inside a transaction (#7755)"
         );
         forensic::shutdown();
     }

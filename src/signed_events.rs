@@ -3116,6 +3116,7 @@ pub fn append_signed_event_no_tx(
                 }
                 crate::governance::audit::warn_watermark_skipped_genesis_read_error(&e);
                 anchor = crate::governance::audit::PendingAuditAnchor::genesis_skip(next_seq);
+                crate::governance::audit::note_genesis_skip_in_transaction(next_seq);
             }
         }
     }

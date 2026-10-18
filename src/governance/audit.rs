@@ -2955,8 +2955,15 @@ pub fn watermark_emission_due(head_sequence: i64) -> bool {
     let last = LAST_WATERMARKED_SEQ.load(Ordering::Relaxed);
     // #7236 - a genesis read error backs the retry off by one interval.
     let skipped = GENESIS_SKIP_BACKOFF_SEQ.load(Ordering::Relaxed);
+    // #7755 - a skip recorded by a transaction that has not committed yet
+    // suppresses only the LATER heads of its own window; the re-append of a
+    // rolled-back sequence (head == tentative) is never suppressed (#7746).
+    let tentative = GENESIS_SKIP_TENTATIVE_SEQ.load(Ordering::Relaxed);
+    let in_tentative_window =
+        tentative < head_sequence && head_sequence.saturating_sub(tentative) < WATERMARK_INTERVAL;
     head_sequence.saturating_sub(last) >= WATERMARK_INTERVAL
         && head_sequence.saturating_sub(skipped) >= WATERMARK_INTERVAL
+        && !in_tentative_window
 }
 
 /// #1850 — throttled emitter for the signed-events append hot path.
@@ -3175,6 +3182,23 @@ pub fn watermark_genesis_read_skips() -> u64 {
 /// (and WARNs, and on postgres opens a savepoint) once per due window instead
 /// of on every later append.
 static GENESIS_SKIP_BACKOFF_SEQ: AtomicI64 = AtomicI64::new(0);
+
+/// #7755 - head sequence of the last genesis-read skip recorded INSIDE an
+/// append transaction, before that transaction commits. The committed backoff
+/// ([`GENESIS_SKIP_BACKOFF_SEQ`]) is claimed only after COMMIT (#7746), so
+/// without this marker every later append of the same multi-append transaction
+/// would re-read the genesis, WARN and count again. It suppresses only heads
+/// ABOVE it (and below one interval past it), never the head that recorded it,
+/// so the re-append of a rolled-back sequence still re-reads (#7746).
+static GENESIS_SKIP_TENTATIVE_SEQ: AtomicI64 = AtomicI64::new(0);
+
+/// #7755 - record, inside the appending transaction, that the append at
+/// `head_sequence` skipped its watermark on a genesis read error. Pairs with
+/// [`PendingAuditAnchor::genesis_skip`]; the count and the committed backoff
+/// still apply only in [`PendingAuditAnchor::emit_after_commit`].
+pub fn note_genesis_skip_in_transaction(head_sequence: i64) {
+    GENESIS_SKIP_TENTATIVE_SEQ.fetch_max(head_sequence, Ordering::Relaxed);
+}
 
 /// #7239 / #7604 / #7236 - a genesis READ ERROR skips the watermark emission:
 /// WARN here, in the transaction. The count (process counter and the exported
