@@ -245,7 +245,12 @@ fn namespace_ownership_refusal_body() {
 /// #7476: the ownership test and `open_mem` put back every variable they
 /// change, whether it was set or unset before, so the next test of this
 /// binary sees the environment it started with.
+///
+/// #7629: the cycles put back the exact values they found (set or unset),
+/// also on a panic, through the RAII guard (rust-1-98 OWNERSHIP-24). The
+/// caller holds `ENV_LOCK`.
 fn run_restore_cycles_7476() {
+    let _restore = EnvRestore::capture(&RESTORED_VARS);
     let originals: [Option<&str>; 2] = [Some("sentinel-7476"), None];
     for original in originals {
         for key in RESTORED_VARS {
@@ -266,16 +271,11 @@ fn run_restore_cycles_7476() {
             );
         }
     }
-    for key in RESTORED_VARS {
-        // SAFETY: as above; leave the variables unset, as a fresh binary has them.
-        unsafe { std::env::remove_var(key) };
-    }
 }
 
 #[test]
 fn env_writers_restore_the_original_values_7476() {
     let _env = ENV_LOCK.blocking_lock();
-    let _restore = EnvRestore::capture(&RESTORED_VARS);
     run_restore_cycles_7476();
 }
 
