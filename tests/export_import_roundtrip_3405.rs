@@ -79,6 +79,10 @@ mod key_dir_sandbox;
 /// deliberately distinct from 1 so an orchestrator can branch on it.
 const EXIT_INCOMPLETE: i32 = 3;
 
+/// The head sequence of the planted legacy watermark (#7230): the refusal
+/// must name exactly this `anchored_head`.
+const LEGACY_HEAD: i64 = 448;
+
 /// Directory name, beside the databases, of the per-test forensic sink.
 const SINK_DIR: &str = "audit-sink";
 
@@ -382,15 +386,20 @@ fn memory_rows(db: &Path) -> i64 {
         .unwrap_or_else(|e| panic!("#7229 memory_rows: count query on {}: {e}", db.display()))
 }
 
-/// #7229 - `memory_rows` on a path that exists but is not a readable database
-/// must panic with the query error instead of returning 0.
+/// #7229 - `memory_rows` on a database that opens cleanly but cannot answer
+/// the count (no `memories` table) must panic at the COUNT QUERY with the query
+/// error instead of returning 0. The fixture is a valid SQLite file, so the
+/// open branch is not the one that panics.
 #[test]
-#[should_panic(expected = "#7229 memory_rows")]
-fn memory_rows_panics_on_an_unreadable_database_7229() {
+#[should_panic(expected = "#7229 memory_rows: count query on")]
+fn memory_rows_panics_when_the_count_query_fails_7229() {
     let tmp = TempDir::new().expect("tempdir");
-    // A directory exists, so the never-created shortcut does not apply, yet it
-    // cannot be read as a SQLite database.
-    let _ = memory_rows(tmp.path());
+    let db = tmp.path().join("no_memories_table.db");
+    rusqlite::Connection::open(&db)
+        .expect("create a valid sqlite file")
+        .execute_batch("CREATE TABLE t(x)")
+        .expect("create an unrelated table");
+    let _ = memory_rows(&db);
 }
 
 /// #7232 - a ledger-writing CLI call must use the pinned sandbox key dir and
@@ -401,21 +410,23 @@ fn cli_children_use_the_sandboxed_key_dir_and_leave_home_clean_7232() {
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).expect("create scratch home");
     let db = tmp.path().join("keys.db");
+    let probe_args = [
+        "--json",
+        "store",
+        "--title",
+        "key dir probe",
+        "--content",
+        "a ledger-writing call",
+        "--namespace",
+        "probe",
+        "--tier",
+        "long",
+    ];
+    // The probe under the shared pin: nothing may reach HOME.
     ai_memory(&db)
         .env("HOME", &home)
         .env_remove("XDG_CONFIG_HOME")
-        .args([
-            "--json",
-            "store",
-            "--title",
-            "key dir probe",
-            "--content",
-            "a ledger-writing call",
-            "--namespace",
-            "probe",
-            "--tier",
-            "long",
-        ])
+        .args(probe_args)
         .assert()
         .success();
 
@@ -441,15 +452,28 @@ fn cli_children_use_the_sandboxed_key_dir_and_leave_home_clean_7232() {
         leaked.is_empty(),
         "#7232: key material written outside the sandbox: {leaked:?}"
     );
-    let sandbox = key_dir_sandbox::pin();
-    let in_sandbox = std::fs::read_dir(sandbox)
-        .expect("read the sandbox key dir")
+    // Attributable positive half: the shared `pin()` sandbox is written by
+    // every cell, so a key found there says nothing about THIS call. Run the
+    // same probe against a key dir that only this call can populate; a probe
+    // that stopped signing leaves it empty.
+    let own_keys = tmp.path().join("own-keys");
+    key_dir_sandbox::mkdir_0700(&own_keys);
+    let own_db = tmp.path().join("own-keys.db");
+    ai_memory(&own_db)
+        .env("AI_MEMORY_KEY_DIR", &own_keys)
+        .env("HOME", &home)
+        .env_remove("XDG_CONFIG_HOME")
+        .args(probe_args)
+        .assert()
+        .success();
+    let used_own_dir = std::fs::read_dir(&own_keys)
+        .expect("read this call's key dir")
         .filter_map(Result::ok)
         .any(|e| is_key_file(&e.path()));
     assert!(
-        in_sandbox,
-        "#7232: the binary must have used the sandbox key dir {}",
-        sandbox.display()
+        used_own_dir,
+        "#7232: the probe must create the host key in the key dir it was given, {}",
+        own_keys.display()
     );
 }
 
@@ -468,7 +492,7 @@ fn import_still_refuses_when_a_legacy_watermark_outranks_the_chain_7218() {
     assert_eq!(code, 0, "export --full; {stderr}");
     let payload = serde_json::to_string(&envelope).expect("re-serialize envelope");
 
-    plant_watermark(&dst, 448, None);
+    plant_watermark(&dst, LEGACY_HEAD, None);
     let assert = ai_memory(&dst)
         .arg("--json")
         .arg("import")
@@ -483,11 +507,14 @@ fn import_still_refuses_when_a_legacy_watermark_outranks_the_chain_7218() {
     );
     // #7230 - pin the gate this test was written for: the refusal reason is
     // the legacy watermark's head (#7218 was diagnosed from `anchored_head:
-    // 448`); a refusal for an unrelated reason must not satisfy this test.
+    // 448`); a refusal for an unrelated reason must not satisfy this test. The
+    // trailing comma anchors the number (`Detected { anchored_head: 448, ..`),
+    // so a head such as 4480 does not match.
+    let expected = format!("anchored_head: {LEGACY_HEAD},");
     assert!(
-        err.contains("anchored_head: 448"),
+        err.contains(&expected),
         "#7230 / #7218: the refusal must name the planted legacy head \
-         `anchored_head: 448`, got: {err}"
+         `{expected}`, got: {err}"
     );
     assert_eq!(memory_rows(&dst), 0, "all-or-nothing: no row was applied");
 }
