@@ -382,9 +382,17 @@ async fn native_pg_export_and_501_promotion_preserve_pg_and_scratch() {
             .expect("certified PG connection"),
     );
     assert_eq!(store.kg_backend(), ai_memory::store::KgBackend::Age);
+    // #7334: PG store dedups on (title, namespace); the fixture titles are
+    // fixed, so a second run against one database collapsed onto the first
+    // run's rows and the lineage links pointed at ids that never existed.
+    // Salt only the copies written to PG with a per-run uuid (ids, and the
+    // `f.id(title)` lookup key, stay untouched).
+    let run = uuid::Uuid::new_v4().simple().to_string();
     for memory in &f.memories {
+        let mut salted = memory.clone();
+        salted.title = format!("{}-{run}", memory.title);
         store
-            .store(&CallerContext::for_agent(ALICE), memory)
+            .store(&CallerContext::for_agent(ALICE), &salted)
             .await
             .expect("native PG row");
     }
