@@ -28586,24 +28586,13 @@ impl MemoryStore for PostgresStore {
                 // summary, no edge and no audit row commit) and fold the
                 // off-table anchor into the one emitted after the COMMIT.
                 if edge_inserted > 0 {
-                    let created_at_owned =
-                        crate::identity::attest::canonical_created_at_stamp(edge_now);
-                    let created_at_str = created_at_owned.as_str();
-                    let signable = crate::identity::sign::SignableLink {
-                        src_id: &new_id,
-                        dst_id: id,
-                        relation: crate::models::MemoryLinkRelation::DerivedFrom.as_str(),
-                        observed_by: None,
-                        created_at: Some(created_at_str),
-                        valid_from: Some(created_at_str),
-                        valid_until: None,
-                    };
-                    let cbor = crate::identity::sign::canonical_cbor(&signable).map_err(|e| {
-                        StoreError::IntegrityFailed {
+                    let payload_hash =
+                        crate::identity::attest::consolidate_edge_audit_payload_hash(
+                            &new_id, id, edge_now,
+                        )
+                        .map_err(|e| StoreError::IntegrityFailed {
                             detail: format!("consolidate link audit canonical_cbor: {e}"),
-                        }
-                    })?;
-                    let payload_hash = crate::signed_events::payload_hash(&cbor);
+                        })?;
                     let event_id = uuid::Uuid::new_v4().to_string();
                     let appended = pg_append_signed_event_with_chain_in_tx(
                         &mut tx,

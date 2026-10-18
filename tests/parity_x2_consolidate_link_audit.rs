@@ -421,3 +421,43 @@ async fn postgres_consolidate_audit_pre_image_rederives_7565() {
     };
     audit_pre_image_rederives_from_stored_edge(&store, &probe).await;
 }
+
+/// #7658 — deterministic cell for #7565: an instant with sub-microsecond
+/// nanoseconds, so the result does not depend on the host clock resolution
+/// (macOS already yields microseconds, which hid the defect in the wall-clock
+/// cells above). The hashed pre-image must equal the microsecond-truncated
+/// stamp the edge row keeps, and must differ from the untruncated rendering.
+#[test]
+fn consolidate_edge_audit_pre_image_truncates_nanoseconds_7658() {
+    use ai_memory::identity::sign::{SignableLink, canonical_cbor};
+
+    const SRC: &str = "00000000-0000-4000-8000-000000007658";
+    const DST: &str = "00000000-0000-4000-8000-000000007659";
+    const MICROS: &str = "2026-10-17T12:34:56.123456+00:00";
+    let instant = chrono::DateTime::parse_from_rfc3339("2026-10-17T12:34:56.123456789+00:00")
+        .expect("fixed instant")
+        .with_timezone(&chrono::Utc);
+    let untruncated = instant.to_rfc3339();
+    assert_ne!(untruncated, MICROS, "the fixture must carry nanoseconds");
+
+    let hash_for = |stamp: &str| {
+        let link = SignableLink {
+            src_id: SRC,
+            dst_id: DST,
+            relation: ai_memory::models::MemoryLinkRelation::DerivedFrom.as_str(),
+            observed_by: None,
+            created_at: Some(stamp),
+            valid_from: Some(stamp),
+            valid_until: None,
+        };
+        ai_memory::signed_events::payload_hash(&canonical_cbor(&link).expect("encode"))
+    };
+    let got = ai_memory::identity::attest::consolidate_edge_audit_payload_hash(SRC, DST, instant)
+        .expect("hash");
+    assert_eq!(got, hash_for(MICROS), "pre-image commits to microseconds");
+    assert_ne!(
+        got,
+        hash_for(&untruncated),
+        "never the nanosecond rendering"
+    );
+}
