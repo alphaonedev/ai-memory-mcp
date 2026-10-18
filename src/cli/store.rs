@@ -244,7 +244,9 @@ pub(crate) fn run_with_curator(
     let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
     let resolved_ttl = app_config.effective_ttl();
-    let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
+    if let Err(e) = db::gc_if_needed(&conn, app_config.effective_archive_on_gc()) {
+        tracing::warn!(target: "gc", "opportunistic gc skipped: {e}");
+    }
     // v1.0.0 #3130 — already fail-closed; routed through the shared
     // `Tier::parse_strict` so the refusal wording is single-sourced.
     let tier = Tier::parse_strict(&args.tier).map_err(|e| anyhow::anyhow!(e))?;

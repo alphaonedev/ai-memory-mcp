@@ -1251,7 +1251,9 @@ pub fn mine(
     let db_path = crate::cli::backup::refuse_pg_store(db_path, "mine", out)?;
     let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
-    let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
+    if let Err(e) = db::gc_if_needed(&conn, app_config.effective_archive_on_gc()) {
+        tracing::warn!(target: "gc", "opportunistic gc skipped: {e}");
+    }
     let now = Utc::now();
 
     let mut imported = 0usize;
