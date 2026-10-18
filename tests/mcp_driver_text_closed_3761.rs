@@ -21,14 +21,9 @@
 #![allow(clippy::missing_panics_doc)]
 
 use ai_memory::mcp::error_text::DB_ERROR_TEXT;
-#[cfg(not(feature = "sal"))]
-#[path = "common/tmp_retain.rs"]
-mod tmp_retain;
-#[cfg(feature = "sal")]
 use common::tmp_retain;
 use serde_json::json;
 
-#[cfg(feature = "sal")]
 mod common;
 
 fn open_mem() -> rusqlite::Connection {

@@ -92,7 +92,6 @@ pub mod tls_receiver;
 
 // #6122 — sidecar-clean sqlite temp files; the root of a suite that also needs
 // them directly takes `use common::tmp_retain;` instead of a second copy.
-#[path = "tmp_retain.rs"]
 pub mod tmp_retain;
 
 use std::path::PathBuf;

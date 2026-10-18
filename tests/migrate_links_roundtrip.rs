@@ -26,13 +26,8 @@ use ai_memory::models::ConfidenceSource;
 use ai_memory::models::{Memory, MemoryLink, Tier};
 use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, MemoryStore};
-#[cfg(not(feature = "sal-postgres"))]
-#[path = "common/tmp_retain.rs"]
-mod tmp_retain;
-#[cfg(feature = "sal-postgres")]
 use common::tmp_retain;
 
-#[cfg(feature = "sal-postgres")]
 mod common;
 
 fn ctx() -> CallerContext {

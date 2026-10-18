@@ -80,6 +80,7 @@ fn fresh_dir() -> TempDir {
 /// is precisely the posture in which the sqlite branch never learned the
 /// caller, so the regression is only reachable here.
 fn build_router() -> (axum::Router, SidecarTempFile, PathBuf) {
+    common::permissive_attestation_for_tests();
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
