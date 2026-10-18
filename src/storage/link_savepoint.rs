@@ -15,7 +15,10 @@
 //! A failed `ROLLBACK TO` is never discarded (ERRORS-19, #7660): it is logged
 //! at ERROR and escalated to a `ROLLBACK` of the owner's whole transaction, so
 //! a caller that swallows the link error still cannot `COMMIT` the audit-less
-//! edge (its `COMMIT` then fails because no transaction is active).
+//! edge (its `COMMIT` then fails because no transaction is active). The
+//! connection is then in autocommit, so a caller that swallows the link error
+//! and keeps writing would persist those writes unbatched (#7742): callers
+//! inside a transaction must stop and propagate the error.
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -27,7 +30,7 @@ const SAVEPOINT_NAME: &str = "link_audit_7559";
 thread_local! {
     /// Test seam: make the next `ROLLBACK TO` target a savepoint that does not
     /// exist, so it fails the way a broken connection would (#7660).
-    pub(super) static FAIL_ROLLBACK_TO: Cell<bool> = const { Cell::new(false) };
+    pub(crate) static FAIL_ROLLBACK_TO: Cell<bool> = const { Cell::new(false) };
     /// Test seam: make the audit pre-image encode fail (#7657).
     pub(super) static FAIL_ENCODE: Cell<bool> = const { Cell::new(false) };
 }

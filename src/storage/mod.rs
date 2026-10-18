@@ -895,7 +895,7 @@ pub use merge_inbound_authorized_4023::{
 mod federation_by_id_4447;
 // #4206 — the title-slot pre-merge archive snapshot helpers (qual_10 split).
 mod consolidate_dest;
-mod link_savepoint;
+pub(crate) mod link_savepoint;
 mod title_slot_archive;
 pub use federation_by_id_4447::{
     ByIdNamespaceAuthorizer, InboundByIdNamespaceRefused, archive_memory_authorized,

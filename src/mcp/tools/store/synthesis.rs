@@ -541,12 +541,14 @@ pub(super) fn apply_synthesis_updates_and_deletes(
                     MemoryLinkRelation::Supersedes.as_str(),
                     active_keypair,
                 ) {
-                    tracing::warn!(
-                        target: "synthesis",
-                        "synthesis supersedes link emit failed for {} -> {}: {e}",
-                        provenance_id,
+                    // #7742 — always inside the WriteTxn above, and a failed
+                    // link may have escalated to a ROLLBACK of it (#7660), so
+                    // stop here: continuing would autocommit later writes.
+                    // Dropping `write_txn` rolls the merge back as a unit.
+                    return Err(format!(
+                        "synthesis supersedes link emit failed for {provenance_id} -> {}, merge rolled back: {e:#}",
                         target.id,
-                    );
+                    ));
                 }
             }
             Err(e) => {
@@ -736,6 +738,85 @@ mod tests {
             }),
             ..owned_by(owner)
         }
+    }
+
+    fn seed_7742(conn: &rusqlite::Connection, title: &str) -> String {
+        let now = chrono::Utc::now().to_rfc3339();
+        crate::db::insert(
+            conn,
+            &Memory {
+                id: uuid::Uuid::new_v4().to_string(),
+                tier: crate::models::Tier::Long,
+                namespace: "synthesis-7742".to_string(),
+                title: title.to_string(),
+                content: format!("original {title}"),
+                created_at: now.clone(),
+                updated_at: now,
+                metadata: crate::models::default_metadata(),
+                ..Memory::default()
+            },
+        )
+        .expect("seed")
+    }
+
+    fn content_of(conn: &rusqlite::Connection, id: &str) -> Option<String> {
+        conn.query_row("SELECT content FROM memories WHERE id = ?1", [id], |r| {
+            r.get(0)
+        })
+        .ok()
+    }
+
+    /// #7742 — a failed `ROLLBACK TO` escalates to a full `ROLLBACK`; the
+    /// merge must stop there, not autocommit its later updates and deletes.
+    #[test]
+    fn failed_link_rollback_aborts_the_whole_merge_7742() {
+        struct Fault;
+        impl Drop for Fault {
+            fn drop(&mut self) {
+                crate::storage::link_savepoint::FAIL_ROLLBACK_TO.with(|f| f.set(false));
+            }
+        }
+        let _fault = Fault;
+        let conn = crate::db::open(std::path::Path::new(":memory:")).expect("open");
+        let (p, q, c) = (
+            seed_7742(&conn, "p"),
+            seed_7742(&conn, "q"),
+            seed_7742(&conn, "c"),
+        );
+        conn.execute_batch(
+            "CREATE TRIGGER x7742_audit_fault BEFORE INSERT ON signed_events \
+             WHEN NEW.event_type = 'memory_link.created' \
+             BEGIN SELECT RAISE(ABORT, 'x7742 injected audit fault'); END;",
+        )
+        .expect("install fault");
+        crate::storage::link_savepoint::FAIL_ROLLBACK_TO.with(|f| f.set(true));
+        let existing: Vec<Memory> = [&p, &q, &c]
+            .iter()
+            .map(|id| crate::db::get(&conn, id).expect("get").expect("row"))
+            .collect();
+        let incoming = Memory {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: "incoming".to_string(),
+            ..existing[0].clone()
+        };
+        let outcome = SynthesisOutcome {
+            updates: vec![
+                (p.clone(), "merged p".into()),
+                (q.clone(), "merged q".into()),
+            ],
+            deletes: vec![c.clone()],
+            ..SynthesisOutcome::empty()
+        };
+        let result = apply_synthesis_updates_and_deletes(
+            &conn, &incoming, &existing, None, None, &outcome, None, None,
+        );
+        assert!(
+            result.is_err(),
+            "#7742: a failed link must fail the merge: {result:?}"
+        );
+        assert!(content_of(&conn, &c).is_some(), "#7742: candidate deleted");
+        assert_eq!(content_of(&conn, &p).as_deref(), Some("original p"));
+        assert_eq!(content_of(&conn, &q).as_deref(), Some("original q"));
     }
 
     #[test]
