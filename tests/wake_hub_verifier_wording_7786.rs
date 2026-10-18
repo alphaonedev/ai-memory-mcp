@@ -4,8 +4,9 @@
 //! #7786 — regression: the wake-hub docs in `src/lib.rs`, `src/wake_hub/mod.rs`
 //! and `docs/reference/ARCHITECTURE_REFERENCE.md` must describe the live
 //! identity state (the hub wires the scoped `a2a-hub/join/v1` delegation
-//! verifier; `DenyAllVerifier` is the test fallback and the `HubDeps::default()`
-//! value), not the pre-#3468 "refuses every hello until the delegation lands".
+//! verifier when an allowlist is configured; `DenyAllVerifier` is the fallback
+//! otherwise and in tests, and the `HubDeps::default()` value), not the
+//! pre-#3468 "refuses every hello until the delegation lands".
 
 /// The stale clause the three sites carried before the fix.
 const STALE_CLAUSE: &str = "lands in #3468";
@@ -71,6 +72,7 @@ fn no_site_says_the_delegation_lands_in_3468() {
             .flat_map(str::split_whitespace)
             .collect::<Vec<_>>()
             .join(" ");
+        let collapsed = collapsed.replace("[ ", "[");
         for stale in [STALE_CLAUSE, STALE_CLAUSE_LINKED] {
             assert!(
                 !collapsed.contains(stale),
