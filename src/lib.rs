@@ -1063,8 +1063,9 @@ pub mod visibility;
 /// the ai-memory inbox row is the record, the wake is a hint, and the <=60 s
 /// backstop poll stays the guarantee, so losing the hub degrades wake LATENCY
 /// and nothing else. Identity verification is a trait boundary: the live hub
-/// wires the scoped `a2a-hub/join/v1` delegation verifier (#3468);
-/// `DenyAllVerifier` remains the test fallback.
+/// wires the scoped `a2a-hub/join/v1` delegation verifier (#3468) when an
+/// allowlist is configured; `DenyAllVerifier` is the fallback otherwise and in
+/// tests.
 /// v1.0.0 #3470 (EPIC #3466) — the wake-hub CLIENT half: bundle loading,
 /// one authenticated UDS session, and the state machine that turns a hint
 /// into exactly ONE catch-up inbox read. Loads the scoped delegation

@@ -10,6 +10,9 @@
 /// The stale clause the three sites carried before the fix.
 const STALE_CLAUSE: &str = "lands in #3468";
 
+/// The same clause with the issue number written as a markdown link.
+const STALE_CLAUSE_LINKED: &str = "lands in [#3468]";
+
 /// The fallback verifier both rustdoc sites must name.
 const FALLBACK_VERIFIER: &str = "DenyAllVerifier";
 
@@ -57,6 +60,23 @@ fn no_site_says_the_delegation_lands_in_3468() {
             !text.contains(STALE_CLAUSE),
             "{rel} still contains the stale clause {STALE_CLAUSE:?}"
         );
+        // A doc comment can wrap the clause across lines; collapse it first.
+        let collapsed = text
+            .lines()
+            .map(|l| {
+                l.trim_start()
+                    .trim_start_matches('/')
+                    .trim_start_matches('!')
+            })
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ");
+        for stale in [STALE_CLAUSE, STALE_CLAUSE_LINKED] {
+            assert!(
+                !collapsed.contains(stale),
+                "{rel} still contains the line-broken stale clause {stale:?}"
+            );
+        }
     }
 }
 
