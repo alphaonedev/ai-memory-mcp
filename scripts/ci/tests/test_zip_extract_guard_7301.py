@@ -31,6 +31,11 @@ CANDLE_LOCK = ('[[package]]\nname = "candle-core"\nversion = "0.10.2"\n'
 MINIMAL_MANIFEST = '[package]\nname = "fixture"\nversion = "0.0.0"\n\n[dependencies]\nserde = "1"\n'
 
 
+def default_meta(root):
+    """cargo metadata JSON naming only the fixture root package."""
+    return {'packages': [{'name': 'fixture', 'source': None, 'manifest_path': str(Path(root) / 'Cargo.toml')}]}
+
+
 class GuardBase(unittest.TestCase):
     """Builds a fixture tree under .local-runs and runs the guard on it."""
 
@@ -43,16 +48,19 @@ class GuardBase(unittest.TestCase):
         (self.root / 'src' / 'lib.rs').write_text('pub fn ok() {}\n', encoding='utf-8')
         (self.root / 'Cargo.lock').write_text(CANDLE_LOCK, encoding='utf-8')
 
+    def meta_args(self, root=None, meta=None):
+        """`--cargo-metadata-file <file>`: --cargo-tree-file requires it (#7305)."""
+        meta_file = self.root.parent / (self.root.name + '.meta')
+        meta_file.write_text(json.dumps(meta if meta is not None else default_meta(root or self.root)),
+                             encoding='utf-8')
+        self.addCleanup(lambda: meta_file.unlink() if meta_file.exists() else None)
+        return ['--cargo-metadata-file', str(meta_file)]
+
     def run_guard(self, tree=GOOD_TREE_DEPTH, root=None, extra=(), meta=None):
         tree_file = self.root.parent / (self.root.name + '.tree')
         tree_file.write_text(tree, encoding='utf-8')
         self.addCleanup(lambda: tree_file.unlink() if tree_file.exists() else None)
-        extra = list(extra)
-        if meta is not None:
-            meta_file = self.root.parent / (self.root.name + '.meta')
-            meta_file.write_text(json.dumps(meta), encoding='utf-8')
-            self.addCleanup(lambda: meta_file.unlink() if meta_file.exists() else None)
-            extra += ['--cargo-metadata-file', str(meta_file)]
+        extra = list(extra) + self.meta_args(root, meta)
         return subprocess.run(
             [sys.executable, str(GUARD), '--root', str(root or self.root),
              '--cargo-tree-file', str(tree_file)] + extra,
@@ -257,7 +265,7 @@ class CleanCargoHome7301(StubCargoCase):
     def test_cargo_tree_argv_keeps_locked_and_all_targets(self):
         argv = self.argv_of_run()
         self.assertIn('--locked', argv)
-        self.assertEqual(argv[argv.index('--target') + 1], 'all')
+        self.assertEqual(target_value(argv), 'all')
 
     def test_download_needed_is_not_refused_by_guard_flags(self):
         """A cargo that refuses to download under --offline: the guard must not pass that flag."""
@@ -514,7 +522,7 @@ class ManifestForms7301(GuardBase):
         self.addCleanup(lambda: tree_file.unlink() if tree_file.exists() else None)
         return subprocess.run(
             [sys.executable, str(GUARD), '--root', str(self.root), '--cargo-tree-file', str(tree_file),
-             '--manifest-parser', parser], capture_output=True, text=True, check=False)
+             '--manifest-parser', parser] + self.meta_args(), capture_output=True, text=True, check=False)
 
     def parsers(self):
         out = ['fallback']
@@ -552,7 +560,7 @@ class ManifestForms7301(GuardBase):
                 self.addCleanup(lambda: tree_file.unlink() if tree_file.exists() else None)
                 res = subprocess.run(
                     [sys.executable, str(GUARD), '--root', str(REPO), '--cargo-tree-file', str(tree_file),
-                     '--manifest-parser', parser], capture_output=True, text=True, check=False)
+                     '--manifest-parser', parser] + self.meta_args(REPO), capture_output=True, text=True, check=False)
                 self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
     def test_invalid_toml_exits_2_with_tomllib(self):
@@ -581,7 +589,8 @@ class ManifestForms7301(GuardBase):
                 tree_file.write_text(GOOD_TREE_DEPTH, encoding='utf-8')
                 self.addCleanup(lambda: tree_file.unlink() if tree_file.exists() else None)
                 res = subprocess.run(
-                    [str(PY39), str(GUARD), '--root', str(self.root), '--cargo-tree-file', str(tree_file)],
+                    [str(PY39), str(GUARD), '--root', str(self.root), '--cargo-tree-file', str(tree_file)]
+                    + self.meta_args(),
                     capture_output=True, text=True, check=False)
                 self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
 
@@ -853,6 +862,8 @@ class RuleFixtures7305To7312(GuardBase):
             'patch-crates-io-zip': '[patch]\ncrates-io = { zip = { path = ".." } }\n',
             'patch-crates-io-candle': '[patch]\ncrates-io = { candle-core = { path = ".." } }\n',
             'patch-renamed': '[patch]\ncrates-io = { x = { package = "zip", path = ".." } }\n',
+            'patch-dotted-zip': '[patch]\ncrates-io = { zip.path = ".." }\n',
+            'patch-dotted-candle': '[patch]\ncrates-io = { candle-core.path = ".." }\n',
         }
         for parser in BOTH_PARSERS:
             for name, body in forms.items():
@@ -884,6 +895,9 @@ class RuleFixtures7305To7312(GuardBase):
             'bare-paste': 'paste! { Tensor::[<read_ npy>](p) }\n',
             'prefixed': 'paste! { Tensor::[<try_ read_npz>](p) }\n',
             'from-pth': 'paste::paste! { VarBuilder::[<from_ pth>](p) }\n',
+            'upper-with-lower-modifier': 'paste::paste! { Tensor::[<READ_NPZ:lower>](p) }\n',
+            'camel-with-snake-modifier': 'paste::paste! { Tensor::[<ReadNpz:snake>](p) }\n',
+            'aliased-macro': 'use paste::paste as p; p!{ Tensor::[<read_ npz>](p) }\n',
         }
         for name, body in calls.items():
             with self.subTest(case=name):
@@ -1035,6 +1049,116 @@ class RuleFixtures7305To7312(GuardBase):
             with self.subTest(root=root_line):
                 res = self.run_guard(tree='%s\n1candle-core v0.10.2\n' % root_line)
                 self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    # --- round 2 (r1 review of PR #7777): F1-F6 ----------------------------------------
+    def test_tree_file_without_metadata_file_is_usage_error_7305(self):
+        """F1: no metadata means no local package would be scanned, so the guard refuses to run."""
+        self.member('crates/loader', 'pub fn f() { Tensor::read_npz(p); }\n')
+        tree_file = self.root.parent / (self.root.name + '.tree')
+        tree_file.write_text(GOOD_TREE_DEPTH, encoding='utf-8')
+        self.addCleanup(lambda: tree_file.unlink() if tree_file.exists() else None)
+        res = subprocess.run(
+            [sys.executable, str(GUARD), '--root', str(self.root), '--cargo-tree-file', str(tree_file)],
+            capture_output=True, text=True, check=False)
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn('--cargo-tree-file requires --cargo-metadata-file', res.stderr)
+        self.assertNotIn('check-zip-extract-unreachable: ok', res.stdout)
+
+    def test_tree_file_with_metadata_file_scans_the_path_dependency_7305(self):
+        self.member('crates/loader', 'pub fn f() { Tensor::read_npz(p); }\n')
+        res = self.run_guard(meta=self.meta('crates/loader'))
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+
+    def test_each_scanned_file_keeps_its_own_location_prefix_7305(self):
+        """F4: the rule name never leaks into the location of the next file."""
+        self.member('crates/loader', 'pub fn f() { Tensor::read_npz(p); }\n')
+        self.write('crates/loader/src/b.rs', 'pub fn g() { Tensor::read_npy(p); }\n')
+        self.write('crates/loader/src/c.rs', 'pub fn h() { Tensor::write_npz(p); }\n')
+        res = self.run_guard(meta=self.meta('crates/loader'))
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        lines = res.stdout.splitlines()
+        for name in ('lib', 'b', 'c'):
+            self.assertIn('violation: crates/loader/src/%s.rs:1: candle-loader' % name, lines, res.stdout)
+
+    def test_declared_target_without_a_file_fails_7310(self):
+        """F2: a manifest-declared path with no file on disk could be written by a build step."""
+        forms = {
+            'lib-path': '[lib]\npath = "gen/lib.rs"\n',
+            'bin-path': '[[bin]]\nname = "t"\npath = "gen/t.rs"\n',
+        }
+        for name in ('lib-path', 'bin-path'):
+            with self.subTest(case=name):
+                res = self.manifest_rc(forms[name], 'fallback')
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('declared target has no file on disk; a build step could generate it', res.stdout)
+                self.assertIn('gen/', res.stdout)
+        with self.subTest(case='build'):
+            self.write('Cargo.toml', MINIMAL_MANIFEST.replace('[dependencies]', 'build = "gen/build.rs"\n\n[dependencies]'))
+            res = self.run_guard()
+            self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+            self.assertIn('declared target has no file on disk', res.stdout)
+
+    def test_declared_target_with_a_file_passes_7310(self):
+        self.write('gen/lib.rs', 'pub fn g() {}\n')
+        self.write('gen/t.rs', 'fn main() {}\n')
+        body = '[lib]\npath = "gen/lib.rs"\n[[bin]]\nname = "t"\npath = "gen/t.rs"\n'
+        for parser in BOTH_PARSERS:
+            with self.subTest(parser=parser):
+                res = self.manifest_rc(body, parser)
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_mod_file_must_be_where_cargo_looks_7310(self):
+        """F3a: `mod x;` in a non-root file is `<stem>/x.rs`; in a crate root or mod.rs it is `x.rs`."""
+        cases = {
+            'sibling-of-non-root-file': ('src/foo.rs', 'mod gen;\n', 'src/gen.rs'),
+            'dir-of-crate-root': ('src/lib.rs', 'mod gen;\n', 'src/lib/gen.rs'),
+            'dir-of-mod-rs': ('src/b/mod.rs', 'mod gen;\n', 'src/b/mod/gen.rs'),
+            'sibling-of-bin-root-stem': ('src/bin/t.rs', 'mod gen;\n', 'src/bin/t/gen.rs'),
+        }
+        for name, (rel, body, decoy) in cases.items():
+            with self.subTest(case=name):
+                self.write('src/lib.rs', 'pub fn ok() {}\n')
+                self.write(rel, body)
+                self.write(decoy, 'pub fn g() {}\n')
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('mod gen', res.stdout)
+                for made in (rel, decoy):
+                    (self.root / made).unlink()
+
+    def test_mod_files_where_cargo_looks_pass_7310(self):
+        cases = {
+            'lib-sibling': {'src/lib.rs': 'mod gen;\n', 'src/gen.rs': 'pub fn g() {}\n'},
+            'mod-rs-sibling': {'src/b/mod.rs': 'mod gen;\n', 'src/b/gen.rs': 'pub fn g() {}\n'},
+            'non-root-subdir': {'src/foo.rs': 'mod gen;\n', 'src/foo/gen.rs': 'pub fn g() {}\n'},
+            'non-root-subdir-mod-rs': {'src/foo.rs': 'mod gen;\n', 'src/foo/gen/mod.rs': 'pub fn g() {}\n'},
+            'bin-root-sibling': {'src/bin/t.rs': 'mod gen;\nfn main() {}\n', 'src/bin/gen.rs': 'pub fn g() {}\n'},
+            'path-attribute': {'src/lib.rs': '#[path = "x.rs"]\nmod gen;\n', 'src/x.rs': 'pub fn g() {}\n'},
+            'path-attribute-one-line': {'src/lib.rs': '#[path = "x.rs"] mod gen;\n', 'src/x.rs': 'pub fn g() {}\n'},
+        }
+        for name, files in cases.items():
+            with self.subTest(case=name):
+                self.write('src/lib.rs', 'pub fn ok() {}\n')
+                for rel, body in files.items():
+                    self.write(rel, body)
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+                for rel in files:
+                    (self.root / rel).unlink()
+
+    def test_path_text_inside_another_attribute_does_not_exempt_a_mod_7310(self):
+        """F3b: only a real `#[path = ..]` / `#[cfg_attr(.., path = ..)]` exempts the `mod`."""
+        bodies = {
+            'cfg-not-path': '#[cfg(not(path = "lib.rs"))]\nmod gen;\n',
+            'cfg-not-path-one-line': '#[cfg(not(path = "lib.rs"))] mod gen;\n',
+            'doc-attr': '#[doc = "path = x"]\nmod gen;\n',
+        }
+        for name, body in bodies.items():
+            with self.subTest(case=name):
+                self.write('src/lib.rs', body)
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('mod gen', res.stdout)
 
 
 METADATA_FAILING_STUB = """#!{python}

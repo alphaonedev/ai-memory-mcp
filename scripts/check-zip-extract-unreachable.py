@@ -368,7 +368,7 @@ PACKAGE_PINNED_VALUE = re.compile(r'^\s*["\'](candle-core|zip)["\']\s*(?:#.*)?$'
 # `crates-io = { zip = { path = ".." } }` (also `patch = { crates-io = { .. } }`).
 INLINE_MEMBERS = re.compile(r'["\']?members["\']?\s*=\s*\[\s*[^\]\s]')
 INLINE_PINNED = re.compile(
-    r'(?<![\w\-])["\']?(?:candle-core|zip)["\']?\s*=|\bpackage\s*=\s*["\'](?:candle-core|zip)["\']')
+    r'(?<![\w\-])["\']?(?:candle-core|zip)["\']?\s*[=.]|\bpackage\s*=\s*["\'](?:candle-core|zip)["\']')
 WORKSPACE_DETAIL = 'workspace members are not scanned by this guard (extend it before adding one)'
 
 
@@ -648,7 +648,6 @@ def resolve_target(root, source, value, is_path_attr):
     return None, 'target %s does not resolve to a file' % value
 
 
-PASTE_OPEN = re.compile(r'\bpaste\s*!\s*[({\[]')
 PASTE_GROUP = re.compile(r'\[<(.*?)>\]', re.DOTALL)
 PASTE_MODIFIER = re.compile(r':(?:lower|upper|snake|camel|lower_camel|upper_camel)\b')
 # The loader names of FORBIDDEN, without the leading word boundary: a paste! piece can
@@ -656,6 +655,10 @@ PASTE_MODIFIER = re.compile(r':(?:lower|upper|snake|camel|lower_camel|upper_came
 PASTE_LOADER = re.compile(
     r'(?:read_npz\w*|read_npy|write_npz|write_npy|read_pth\w*|from_pth\w*|'
     r'from_npz|NpzTensors|PthTensors|read_all_with_key)\b')
+# The same names with underscores removed and lowercased: paste! case modifiers and spacing cannot hide them.
+PASTE_LOADER_NORMAL = re.compile(
+    r'(?:readnpz\w*|readnpy|writenpz|writenpy|readpth\w*|frompth\w*|'
+    r'fromnpz|npztensors|pthtensors|readallwithkey)\b')
 MOD_DECL = re.compile(r'(?<![\w])mod\s+(?:r#)?([A-Za-z_]\w*)\s*;')
 INLINE_MOD_OR_BRACE = re.compile(r'\bmod\s+(?:r#)?([A-Za-z_]\w*)\s*\{|[{}]')
 
@@ -663,13 +666,12 @@ INLINE_MOD_OR_BRACE = re.compile(r'\bmod\s+(?:r#)?([A-Za-z_]\w*)\s*\{|[{}]')
 def paste_loader_hits(text, masked):
     """Line numbers where a `paste!` `[< .. >]` group joins to a candle loader name (#7307)."""
     lines = set()
-    for opener in PASTE_OPEN.finditer(masked):
-        end = match_close(masked, opener.end() - 1)
-        for group in PASTE_GROUP.finditer(text, opener.end(), end):
-            joined = PASTE_MODIFIER.sub('', group.group(1))
-            joined = re.sub(r'[\s"\'$]', '', joined)
-            if PASTE_LOADER.search(joined):
-                lines.add(text.count('\n', 0, group.start()) + 1)
+    # Every group, whatever the macro is called or aliased: `[< .. >]` is not Rust syntax elsewhere.
+    for group in PASTE_GROUP.finditer(text):
+        joined = PASTE_MODIFIER.sub('', group.group(1))
+        joined = re.sub(r'[\s"\'$_]', '', joined).lower()
+        if PASTE_LOADER_NORMAL.search(joined):
+            lines.add(text.count('\n', 0, group.start()) + 1)
     return sorted(lines)
 
 
@@ -685,18 +687,20 @@ def enclosing_inline_mods(masked, pos):
     return [name for name in stack if name]
 
 
-def missing_mod_hits(path, masked):
+def missing_mod_hits(path, masked, roots=frozenset()):
     """(line, name) for each `mod name;` whose file is on no module path: only a build step could make it (#7310)."""
     hits = []
     for decl in MOD_DECL.finditer(masked):
         before = masked[max(0, decl.start() - 300):decl.start()]
         before = re.split(r'[;{}]', before)[-1]
-        if re.search(r'\bpath\s*=', before):
+        if re.search(r'#\s*\[\s*(?:path\s*=|cfg_attr\s*\(.*\bpath\s*=)', before, re.S):
             continue  # a #[path] module: followed (or flagged) by the path-attribute scan
         sub = Path(*enclosing_inline_mods(masked, decl.start())) if enclosing_inline_mods(masked, decl.start()) else Path()
         name = decl.group(1)
         found = False
-        for base in (path.parent, path.parent / path.stem):
+        # cargo: a crate root or mod.rs looks beside itself, any other file in its own directory
+        bases = (path.parent,) if path.name == 'mod.rs' or path in roots else (path.parent / path.stem,)
+        for base in bases:
             for candidate in (base / sub / (name + '.rs'), base / sub / name / 'mod.rs'):
                 if candidate.is_file():
                     found = True
@@ -710,11 +714,33 @@ def build_script_paths(root, manifest_text):
     return {Path(os.path.realpath(str(root / name))) for name in names}
 
 
+def crate_roots(root, manifest_text):
+    """Files cargo treats as crate roots: `mod x;` beside them is `x.rs`, not `<stem>/x.rs`."""
+    found = {root / 'src' / 'lib.rs', root / 'src' / 'main.rs', root / 'build.rs'}
+    for declared in manifest_source_paths(manifest_text):
+        found.add(root / declared)
+    for directory in ('src/bin', 'tests', 'benches', 'examples'):
+        base = root / directory
+        if base.is_dir():
+            found.update(base.glob('*.rs'))
+            found.update(base.glob('*/main.rs'))
+    return {Path(os.path.realpath(str(p))) for p in found}
+
+
 def check_sources(root, manifest_text='', label=''):
     root = Path(os.path.realpath(str(root)))
     builds = build_script_paths(root, manifest_text)
     problems = []
     queue = [Path(os.path.realpath(str(p))) for p in seed_sources(root, manifest_text)]
+    roots = crate_roots(root, manifest_text)
+    for declared in manifest_source_paths(manifest_text):
+        target = Path(os.path.realpath(str(root / declared)))
+        if not target.is_file():
+            try:
+                shown = label + target.relative_to(root).as_posix()
+            except ValueError:
+                shown = label + declared
+            problems.append(violation(shown, 'declared target has no file on disk; a build step could generate it'))
     seen = set()
     while queue:
         path = queue.pop(0)
@@ -736,9 +762,9 @@ def check_sources(root, manifest_text='', label=''):
         scan = mask_rust(text, keep_strings=True) if path in builds else masked
         for number, line in enumerate(scan.split('\n'), 1):
             where = '%s:%d' % (rel, number)
-            for label, pattern in FORBIDDEN:
+            for rule, pattern in FORBIDDEN:
                 if pattern.search(line):
-                    problems.append(violation(where, label))
+                    problems.append(violation(where, rule))
             if zip_context and EXTRACT_CALL.search(line):
                 problems.append(violation(where, 'zip-flavoured extract call'))
         for attr in PATH_ATTR.finditer(masked):
@@ -769,7 +795,7 @@ def check_sources(root, manifest_text='', label=''):
             problems.append(violation('%s:%d' % (rel, number), 'zip named in macro input'))
         for number in paste_loader_hits(text, masked):
             problems.append(violation('%s:%d' % (rel, number), 'candle-loader (paste! pieces)'))
-        for number, name in missing_mod_hits(path, masked):
+        for number, name in missing_mod_hits(path, masked, roots):
             problems.append(violation(
                 '%s:%d' % (rel, number), 'mod %s; resolves to no file on disk (a build step could generate it)' % name))
     return problems
@@ -858,8 +884,10 @@ def main(argv=None):
                         help='read `cargo tree -i zip` output from this file instead of running cargo')
     parser.add_argument('--cargo-metadata-file',
                         help='read `cargo metadata` JSON from this file instead of running cargo '
-                             '(with --cargo-tree-file alone, no local package besides the root is scanned)')
+                             '(required with --cargo-tree-file: without it no local package would be scanned)')
     args = parser.parse_args(argv)
+    if args.cargo_tree_file and not args.cargo_metadata_file:
+        parser.error('--cargo-tree-file requires --cargo-metadata-file')
     root = Path(args.root)
     if not (root / 'Cargo.toml').is_file():
         print('error: no Cargo.toml under %s' % escape_text(root), file=sys.stderr)
@@ -884,8 +912,6 @@ def main(argv=None):
             tree_problems = check_tree(tree_text) + check_lock(root)
         if args.cargo_metadata_file:
             metadata_text = Path(args.cargo_metadata_file).read_text(encoding='utf-8')
-        elif args.cargo_tree_file:
-            metadata_text = '{"packages": []}'
         else:
             metadata_text = cargo_metadata_output(root)
         manifest_text = read_source(root / 'Cargo.toml', 'Cargo.toml')
