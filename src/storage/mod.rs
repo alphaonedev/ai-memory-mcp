@@ -10116,7 +10116,8 @@ pub fn create_link_signed_with_window(
             source_cid,
             target_cid
         ],
-    )?;
+    )
+    .map_err(|e| savepoint.abort(e))?;
 
     // v0.7.0 S4-INFO2 — append a `memory_link.created` row to
     // `signed_events` so the audit ledger reflects every new link
@@ -10153,7 +10154,7 @@ pub fn create_link_signed_with_window(
             valid_from: Some(valid_from_str.as_str()),
             valid_until: valid_until_str.as_deref(),
         };
-        match crate::identity::sign::canonical_cbor(&signable) {
+        match link_savepoint::encode_audit_preimage(&signable) {
             Ok(cbor) => {
                 let event = crate::signed_events::SignedEvent {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -10184,19 +10185,18 @@ pub fn create_link_signed_with_window(
                     // anchor rides the owner's frame and is emitted only
                     // after its COMMIT.
                     let anchor = crate::signed_events::append_signed_event_no_tx(conn, &event)
-                        .context(
-                            "append memory_link.created audit row in the caller transaction",
-                        )?;
+                        .context("append memory_link.created audit row in the caller transaction")
+                        .map_err(|e| savepoint.abort(e))?;
                     crate::storage::escalation_deferral::defer_audit_anchor(conn, anchor);
                 }
             }
-            Err(e) => {
-                tracing::warn!(
-                    target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
-                    source_id, target_id, relation,
-                    "failed to encode canonical CBOR for memory_link.created audit: {e}"
-                );
-            }
+            // #7657 - fail closed inside a caller transaction (rolls the link back).
+            Err(e) if !conn.is_autocommit() => return Err(savepoint.abort(e)),
+            Err(e) => tracing::warn!(
+                target: crate::signed_events::SIGNED_EVENTS_TRACE_TARGET,
+                source_id, target_id, relation,
+                "failed to encode canonical CBOR for memory_link.created audit: {e}"
+            ),
         }
     }
 
