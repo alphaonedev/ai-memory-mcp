@@ -212,6 +212,10 @@ async fn destination_held_by_another_agent(store: &dyn MemoryStore) {
         .store(&other_ctx, &holder)
         .await
         .expect("seed private holder");
+    let holder_before = store
+        .get(&other_ctx, &holder.id)
+        .await
+        .expect("read the private holder before the refused merge");
     let err = store
         .consolidate(
             &ctx,
@@ -242,6 +246,29 @@ async fn destination_held_by_another_agent(store: &dyn MemoryStore) {
         vec!["a other-private".to_string(), "b other-private".to_string()],
         "the refused cluster tombstoned no source and the holder stays hidden"
     );
+    let holder_after = store
+        .get(&other_ctx, &holder.id)
+        .await
+        .expect("the private holder survives the refused merge");
+    assert_eq!(
+        (
+            &holder_after.content,
+            &holder_after.title,
+            holder_after.version,
+            &holder_after.tier,
+            &holder_after.metadata,
+            &holder_after.updated_at,
+        ),
+        (
+            &holder_before.content,
+            &holder_before.title,
+            holder_before.version,
+            &holder_before.tier,
+            &holder_before.metadata,
+            &holder_before.updated_at,
+        ),
+        "#7560: the refused merge leaves the private holder row unchanged"
+    );
 
     // Visible holder: merged in place, agent_id kept.
     let ns = unique_ns("other-visible");
@@ -254,6 +281,10 @@ async fn destination_held_by_another_agent(store: &dyn MemoryStore) {
         .store(&other_ctx, &holder)
         .await
         .expect("seed visible holder");
+    let holder_before = store
+        .get(&other_ctx, &holder.id)
+        .await
+        .expect("read the visible holder before the merge");
     let id = store
         .consolidate(
             &ctx,
@@ -279,6 +310,11 @@ async fn destination_held_by_another_agent(store: &dyn MemoryStore) {
         merged.metadata.get("agent_id").and_then(|v| v.as_str()),
         Some(OTHER),
         "#7560: the holder's agent_id survives the merge"
+    );
+    assert_eq!(
+        merged.version,
+        holder_before.version + 1,
+        "#7560: the merge bumps the visible holder's version by one"
     );
 }
 
