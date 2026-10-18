@@ -52,6 +52,15 @@ pub const SCAN_FAILURE_MAX_TOTAL: i64 = super::MAX_SUBSCRIPTION_DLQ_ROWS;
 /// Most failed-lookup rows one writer (`agent_id`; every anonymous writer
 /// shares one bucket) may retain across ALL its namespaces (#7503). Below the
 /// total cap, so one writer inventing namespaces cannot starve another tenant.
+///
+/// This is a fairness heuristic keyed on the CLAIMED writer id (the
+/// `agent_id` the dispatching write carried), not on an attested principal
+/// (`ARCHITECTURE_REFERENCE.md:645-647`). On a keyless daemon a caller can
+/// spray writer ids and move across buckets; the per-namespace cap
+/// ([`SCAN_FAILURE_MAX_PER_NAMESPACE`]) and the total cap
+/// ([`SCAN_FAILURE_MAX_TOTAL`]) bound the table regardless of the id, so the
+/// heuristic never carries the bound on its own. Every anonymous writer shares
+/// one bucket (the empty id). It is not a security control (#7712).
 pub const SCAN_FAILURE_MAX_PER_WRITER: i64 = 2_500;
 
 /// Most detached sqlite lookup-retry workers alive at once (#7410). Past it a
