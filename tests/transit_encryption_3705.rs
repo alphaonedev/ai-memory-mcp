@@ -913,3 +913,37 @@ fn listen_signal_switches_to_the_short_budget_7341() {
         started.elapsed()
     );
 }
+
+/// #7647: the boot budget comes from ONE named constant, an env override is
+/// clamped to a sane range, and the default outlasts a host at load 60 on 14
+/// cores (the r5 run that timed out at the old 60 s).
+#[test]
+fn boot_base_budget_is_one_clamped_constant_7647() {
+    let default = Duration::from_secs(BOOT_BASE_SECS_DEFAULT);
+    assert_eq!(boot_base_from(None), default);
+    assert!(
+        default >= Duration::from_secs(120),
+        "the default must outlast a loaded host: {default:?}"
+    );
+    assert_eq!(boot_base_from(Some("240")), Duration::from_secs(240));
+    assert_eq!(boot_base_from(Some(" 240 ")), Duration::from_secs(240));
+    assert_eq!(
+        boot_base_from(Some("1")),
+        Duration::from_secs(BOOT_BASE_SECS_MIN)
+    );
+    assert_eq!(
+        boot_base_from(Some("0")),
+        Duration::from_secs(BOOT_BASE_SECS_MIN)
+    );
+    assert_eq!(
+        boot_base_from(Some("999999")),
+        Duration::from_secs(BOOT_BASE_SECS_MAX)
+    );
+    for bad in ["", "abc", "-5", "1.5"] {
+        assert_eq!(boot_base_from(Some(bad)), default, "raw {bad:?}");
+    }
+    assert_eq!(
+        post_listen_of(Duration::from_secs(60)),
+        Duration::from_secs(45)
+    );
+}
