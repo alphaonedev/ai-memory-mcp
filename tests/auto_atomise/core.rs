@@ -37,9 +37,7 @@ use ai_memory::atomisation::curator::{Atom, Curator, CuratorError};
 use ai_memory::atomisation::{Atomiser, AtomiserConfig};
 use ai_memory::background::atomise_worker::AtomiseQueue;
 use ai_memory::config::FeatureTier;
-use ai_memory::hooks::pre_store::auto_atomise::{
-    OUTCOME_SKIPPED_POLICY_DISABLED, run_deferred_atomise,
-};
+use ai_memory::hooks::pre_store::auto_atomise::OUTCOME_SKIPPED_POLICY_DISABLED;
 use ai_memory::hooks::pre_store::{
     AtomiseWiring, AutoAtomisationOutcome, maybe_enqueue_auto_atomise,
 };
@@ -718,7 +716,23 @@ fn test_auto_atomise_does_not_block_store_response() {
     // that waited on the worker or the curator could never return. Every
     // call returning `Enqueued` while the gate is closed is the
     // contract; it holds under any host load.
+    //
+    // Requirement: `AI_MEMORY_ATOMISE_QUEUE_CAPACITY` (when set) must be
+    // >= CALLS - 1 while the gate is closed, because the parked worker
+    // holds one job and the queue buffer holds the rest. A smaller
+    // capacity makes the hook report `skipped_queue_full`, which is a
+    // different contract, so the cell skips with a message instead.
     const CALLS: usize = 5;
+    if let Ok(raw) = std::env::var("AI_MEMORY_ATOMISE_QUEUE_CAPACITY")
+        && raw.trim().parse::<usize>().is_ok_and(|cap| cap < CALLS - 1)
+    {
+        eprintln!(
+            "skipping #7215 cell: AI_MEMORY_ATOMISE_QUEUE_CAPACITY={raw} is below CALLS - 1 ({}) \
+             needed while the worker gate is closed",
+            CALLS - 1
+        );
+        return;
+    }
     let gate = ProviderGate::closed();
     let (curator_state, atomiser, queue, worker) = private_worker_gated(Some(gate.clone()));
     for _ in 0..CALLS {
@@ -763,7 +777,8 @@ fn test_auto_atomise_does_not_block_store_response() {
         samples_on.push(t0.elapsed());
         assert!(
             matches!(outcome, AutoAtomisationOutcome::Enqueued { .. }),
-            "hook must hand the job to the worker and return while the worker is closed, got {outcome:?}"
+            "hook must hand the job to the worker and return while the worker is closed \
+             (needs AI_MEMORY_ATOMISE_QUEUE_CAPACITY >= CALLS - 1 while the gate is closed), got {outcome:?}"
         );
         queued_ids.push(m.id);
         queued_calls += 1;
@@ -838,16 +853,16 @@ fn test_auto_atomise_inheritance() {
 
     // Parent has opt-in policy; child has NO standard. The
     // resolver walks leaf -> root and picks up the parent's policy.
-    seed_policy(&conn, &parent, opt_in_policy(500, 200));
+    // Non-default budget (compiled default is 200) so the inherited value
+    // is observable.
+    seed_policy(&conn, &parent, opt_in_policy(500, 150));
 
-    // #7268 - completion, not the clock. The case-private worker is held
-    // closed while the deferred step is driven synchronously through the
-    // production entry point (`run_deferred_atomise`), so the inheritance
-    // assertion never waits on a background thread. The real background
-    // worker is exercised by `test_auto_atomise_above_threshold_triggers`
-    // (drained by join) and the #7215 gate case.
-    let gate = ProviderGate::closed();
-    let (curator_state, atomiser, queue, worker) = private_worker_gated(Some(gate.clone()));
+    // #7268 - completion, not the clock. The enqueued job lands through
+    // the real case-private worker and the cell waits on the worker's
+    // join, never on the clock. The job's own inherited budget (150)
+    // drives the split, and the row the hook named must be the row that
+    // is atomised.
+    let (curator_state, atomiser, queue, worker) = private_worker_gated(None);
     enqueue_atoms_into(
         &curator_state,
         &[
@@ -874,27 +889,22 @@ fn test_auto_atomise_inheritance() {
     );
 
     // The child inherits the parent's resolved policy, including the
-    // atom token budget the job carries.
+    // non-default atom token budget the job carries.
     let resolved = db::resolve_governance_policy_for_optional_feature(&conn, &child);
     assert!(resolved.effective_auto_atomise());
-
-    // Drive the deferred step synchronously with the inherited budget.
-    run_deferred_atomise(
-        shared_db_path(),
-        &atomiser,
-        &mem.id,
+    assert_eq!(
         resolved.effective_auto_atomise_max_atom_tokens(),
-        "ai:test",
+        150,
+        "child must inherit the parent's non-default atom budget"
     );
+
+    // Land the enqueued job through the real worker; join is the
+    // completion condition.
+    await_worker_drain(queue, worker);
     assert!(
         read_atomised_into(&conn, &mem.id).unwrap_or(0) > 0,
         "expected child memory to be atomised via parent policy"
     );
-
-    // Open the gate and drain: the queued job finds the source already
-    // atomised and skips, so the curator ran exactly once.
-    gate.open();
-    await_worker_drain(queue, worker);
     assert_eq!(
         curator_state.lock().unwrap().calls,
         1,
