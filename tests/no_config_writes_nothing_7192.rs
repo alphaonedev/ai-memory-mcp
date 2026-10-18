@@ -39,11 +39,15 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-#[test]
-fn no_config_boot_writes_no_config_toml_7192() {
+/// Run `identity generate` against a fresh scratch layout and return the
+/// fake HOME plus every entry found below it. The audit directory is pinned
+/// OUTSIDE the fake HOME (`AI_MEMORY_AUDIT_DIR`, precedence in
+/// `src/log_paths.rs`), so the walk is identical on macOS and Linux.
+fn boot_in_fresh_home(no_config: bool) -> (tempfile::TempDir, PathBuf, Vec<PathBuf>) {
     let dir = tempfile::tempdir_in(scratch_root()).expect("tempdir under .local-runs");
     let home = dir.path().join("home");
     let key_dir = dir.path().join("keys");
+    let audit_dir = dir.path().join("audit");
     std::fs::create_dir_all(&home).expect("mkdir home");
     std::fs::create_dir_all(&key_dir).expect("mkdir key dir");
     #[cfg(unix)]
@@ -53,15 +57,19 @@ fn no_config_boot_writes_no_config_toml_7192() {
             .expect("chmod 0700 key dir");
     }
 
-    let out = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
-        .args(["identity", "generate", "--agent-id", "x", "--key-dir"])
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
+    cmd.args(["identity", "generate", "--agent-id", "x", "--key-dir"])
         .arg(&key_dir)
         .current_dir(dir.path())
         .env_clear()
         .env("HOME", &home)
-        .env("AI_MEMORY_NO_CONFIG", "1")
-        .output()
-        .expect("spawn ai-memory");
+        .env("AI_MEMORY_AUDIT_DIR", &audit_dir);
+    if no_config {
+        cmd.env("AI_MEMORY_NO_CONFIG", "1");
+    } else {
+        cmd.env_remove("AI_MEMORY_NO_CONFIG");
+    }
+    let out = cmd.output().expect("spawn ai-memory");
     assert!(
         out.status.success(),
         "identity generate exit={:?} stderr={}",
@@ -71,6 +79,12 @@ fn no_config_boot_writes_no_config_toml_7192() {
 
     let mut found = Vec::new();
     walk(&home, &mut found);
+    (dir, home, found)
+}
+
+#[test]
+fn no_config_boot_writes_no_config_toml_7192() {
+    let (_dir, home, found) = boot_in_fresh_home(true);
     if let Some(p) = found
         .iter()
         .find(|p| p.file_name().is_some_and(|n| n == "config.toml"))
@@ -80,28 +94,25 @@ fn no_config_boot_writes_no_config_toml_7192() {
             p.display()
         );
     }
-    // The only entries the subcommand legitimately creates: the (empty)
-    // audit log directory chain `Library/Logs/ai-memory/audit` on macOS.
-    let allowed: [&[&str]; 4] = [
-        &["Library"],
-        &["Library", "Logs"],
-        &["Library", "Logs", "ai-memory"],
-        &["Library", "Logs", "ai-memory", "audit"],
-    ];
-    let unexpected: Vec<&PathBuf> = found
-        .iter()
-        .filter(|p| {
-            let rel: Vec<String> = p
-                .strip_prefix(&home)
-                .map(|r| r.iter().map(|c| c.to_string_lossy().into_owned()).collect())
-                .unwrap_or_default();
-            !allowed
-                .iter()
-                .any(|a| a.len() == rel.len() && a.iter().zip(&rel).all(|(x, y)| x == y))
-        })
-        .collect();
+    // With the audit directory pinned outside HOME, a NO_CONFIG boot leaves
+    // HOME completely empty on every OS.
     assert!(
-        unexpected.is_empty(),
-        "#7192: unexpected entries under HOME: {unexpected:?}"
+        found.is_empty(),
+        "#7192: NO_CONFIG boot left entries under {}: {found:?}",
+        home.display()
+    );
+}
+
+/// #3606 control leg: the same boot WITHOUT the escape hatch creates the
+/// default config, so the test above cannot pass vacuously (a mutant that
+/// drops the writer call entirely fails here).
+#[test]
+fn unflagged_boot_still_writes_default_config_7192() {
+    let (_dir, home, _found) = boot_in_fresh_home(false);
+    let expected = home.join(".config").join("ai-memory").join("config.toml");
+    assert!(
+        expected.exists(),
+        "#7192 control: an unflagged boot must create {}",
+        expected.display()
     );
 }

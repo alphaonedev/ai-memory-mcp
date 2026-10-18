@@ -10424,7 +10424,12 @@ impl AppConfig {
             return Ok(());
         }
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("create config dir {}: {e}", parent.display()),
+                )
+            })?;
         }
         let default_toml = r#"# ai-memory configuration
 # See: https://github.com/alphaonedev/ai-memory-mcp
@@ -11793,6 +11798,10 @@ legacy_scoring = false
         let path = blocker.join("ai-memory").join("config.toml");
         let err = AppConfig::write_default_to(&path).expect_err("must report the failure");
         assert!(!path.exists(), "no config may exist after a failure: {err}");
+        assert!(
+            err.to_string().contains("create config dir"),
+            "the create_dir_all failure must carry its own context: {err}"
+        );
         // The happy path still writes and a second call is a no-op.
         let ok = tmp.path().join("ok").join("config.toml");
         AppConfig::write_default_to(&ok).unwrap();
