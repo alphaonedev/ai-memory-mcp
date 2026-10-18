@@ -99,15 +99,30 @@ CARGO_TREE_ARGS = (
 # Direct zip use, plus the candle code paths that open a zip archive.
 # Loader names come from candle-core / candle-nn 0.10.2 (npy.rs, pickle.rs,
 # var_builder.rs).
+LOADER_NAMES = (
+    'read_npz', 'read_npy', 'write_npz', 'write_npy', 'read_pth', 'from_pth',
+    'from_npz', 'NpzTensors', 'PthTensors', 'read_all_with_key',
+)
+# Loader names that are a prefix of a longer identifier (`read_npz_by_name`).
+LOADER_OPEN_ENDED = frozenset({'read_npz', 'read_pth', 'from_pth'})
+
+
+def loader_alternation(paste_form):
+    """Regex alternation over LOADER_NAMES; the paste! form drops `_` and lowercases (N5, L3)."""
+    parts = []
+    for name in LOADER_NAMES:
+        text = name.replace('_', '').lower() if paste_form else name
+        parts.append(text + (r'\w*' if name in LOADER_OPEN_ENDED else ''))
+    return '(?:' + '|'.join(parts) + ')'
+
+
 FORBIDDEN = (
     ('zip-path', re.compile(r'\bzip\s*::')),
     ('zip-use', re.compile(r'\b(?:use|extern\s+crate)\s+(?:::)?zip\b')),
     ('zip-use-brace', re.compile(r'\buse\s+(?:::)?\{[^}]*(?<![\w:])zip\b(?!\s*::)')),
     ('zip-type', re.compile(r'\b(?:ZipStreamReader|ZipArchive|ZipWriter|ZipFile)\b')),
     ('zip-extract-unwrapped', re.compile(r'\bextract_unwrapped_root_dir\b')),
-    ('candle-loader', re.compile(
-        r'\b(?:read_npz\w*|read_npy|write_npz|write_npy|read_pth\w*|from_pth\w*|'
-        r'from_npz|NpzTensors|PthTensors|read_all_with_key)\b')),
+    ('candle-loader', re.compile(r'\b' + loader_alternation(False) + r'\b')),
     ('candle-pickle', re.compile(r'\bpickle\s*::')),
 )
 EXTRACT_CALL = re.compile(r'\.\s*extract\s*\(')
@@ -129,7 +144,51 @@ MACRO_OPEN = re.compile(r'\b([A-Za-z_]\w*)\s*!\s*([(\[{])')
 # Matched on the masked text (comments and string bodies blanked), so a quoted
 # `#[path = ..]` in test code is not mistaken for an attribute; the literal is
 # then read from the raw text at the same offset.
-PATH_ATTR = re.compile(r'#\s*!?\[[^\]]*?\bpath\s*=')
+ATTR_OPEN = re.compile(r'#\s*!?\[')
+PATH_KEY = re.compile(r'\bpath\s*=')
+
+
+def attribute_bodies(masked):
+    """(offset, body) of every `#[ .. ]` / `#![ .. ]` attribute, brackets balanced (strings are masked)."""
+    for opening in ATTR_OPEN.finditer(masked):
+        depth = 1
+        index = opening.end()
+        while index < len(masked) and depth:
+            char = masked[index]
+            if char == '[':
+                depth += 1
+            elif char == ']':
+                depth -= 1
+            index += 1
+        yield opening.end(), masked[opening.end():index - 1 if depth == 0 else index]
+
+
+def path_key_loads(body, position):
+    """True when the `path =` key at `position` of an attribute body loads a module file.
+
+    Only `#[path = ..]` and the arguments after the first one of `#[cfg_attr(<predicate>, .., path = ..)]`
+    do. A `path =` inside a predicate or another attribute's arguments loads nothing, so it must not
+    count as a #[path] load (F2).
+    """
+    head = body[:position]
+    if not head.strip():
+        return True
+    opened = re.match(r'\s*cfg_attr\s*\(', head)
+    if not opened:
+        return False
+    depth = 1
+    last_comma = -1
+    for index in range(opened.end(), len(head)):
+        char = head[index]
+        if char in '([{':
+            depth += 1
+        elif char in ')]}':
+            depth -= 1
+            if depth < 1:
+                return False
+        elif char == ',' and depth == 1:
+            last_comma = index
+    return depth == 1 and last_comma >= 0 and not head[last_comma + 1:].strip()
 PATH_LITERAL = re.compile(r'\s*"([^"]+)"')
 INCLUDE_ANY = re.compile(r'\binclude\s*!\s*[(\[{]')
 INCLUDE_LITERAL = re.compile(r'\binclude\s*!\s*\(\s*"([^"]+)"\s*\)')
@@ -652,9 +711,9 @@ PASTE_GROUP = re.compile(r'\[<(.*?)>\]', re.DOTALL)
 PASTE_MODIFIER = re.compile(r':(?:lower|upper|snake|camel|lower_camel|upper_camel)\b')
 # The candle-loader names of FORBIDDEN with underscores removed and lowercased, without the
 # leading word boundary: paste! case modifiers and spacing cannot hide them, and a piece can
-# prefix them (`[<try_ read_npz>]`). Derived, so the two lists cannot drift (N5).
-PASTE_LOADER_NORMAL = re.compile(
-    dict(FORBIDDEN)['candle-loader'].pattern.replace('_', '').lower()[len('\\b'):])
+# prefix them (`[<try_ read_npz>]`). Built from the same LOADER_NAMES tuple, so the two
+# lists cannot drift (N5, L3).
+PASTE_LOADER_NORMAL = re.compile(loader_alternation(True) + r'\b')
 MOD_DECL = re.compile(r'(?<![\w])mod\s+(?:r#)?([A-Za-z_]\w*)\s*;')
 INLINE_MOD_OR_BRACE = re.compile(r'\bmod\s+(?:r#)?([A-Za-z_]\w*)\s*\{|[{}]')
 
@@ -683,9 +742,16 @@ def enclosing_inline_mods(masked, pos):
     return [name for name in stack if name]
 
 
-def missing_mod_hits(path, masked, roots=frozenset()):
-    """(line, name) for each `mod name;` whose file is on no module path: only a build step could make it (#7310)."""
-    hits = []
+MODE_RS = 'mod-rs'
+MODE_PLAIN = 'plain'
+
+
+def module_decls(masked):
+    """(line, name, sub) for each `mod name;` that is not an unconditional #[path] module (#7310).
+
+    `sub` is the directory of the enclosing inline `mod x { .. }` blocks.
+    """
+    decls = []
     for decl in MOD_DECL.finditer(masked):
         before = masked[max(0, decl.start() - 300):decl.start()]
         before = re.split(r'[;{}]', before)[-1]
@@ -694,17 +760,67 @@ def missing_mod_hits(path, masked, roots=frozenset()):
             # A cfg_attr(<cond>, path = ..) module is not exempt: when the condition is false
             # cargo loads the default file, which a build step could generate (#7310).
             continue
-        sub = Path(*enclosing_inline_mods(masked, decl.start())) if enclosing_inline_mods(masked, decl.start()) else Path()
-        name = decl.group(1)
-        found = False
-        # cargo: a crate root or mod.rs looks beside itself, any other file in its own directory
-        bases = (path.parent,) if path.name == 'mod.rs' or path in roots else (path.parent / path.stem,)
+        inline = enclosing_inline_mods(masked, decl.start())
+        decls.append((masked.count('\n', 0, decl.start()) + 1, decl.group(1), Path(*inline) if inline else Path()))
+    return decls
+
+
+def module_candidates(base, sub, name):
+    return (base / sub / (name + '.rs'), base / sub / name / 'mod.rs')
+
+
+def load_base(path, mode):
+    """rustc: a mod-rs load looks for `mod x;` beside the file, a plain load in a directory named after it."""
+    return path.parent if mode == MODE_RS else path.parent / path.stem
+
+
+def existing_candidates(path, decls, bases):
+    found = []
+    for _line, name, sub in decls:
         for base in bases:
-            for candidate in (base / sub / (name + '.rs'), base / sub / name / 'mod.rs'):
+            for candidate in module_candidates(base, sub, name):
                 if candidate.is_file():
-                    found = True
-        if not found:
-            hits.append((masked.count('\n', 0, decl.start()) + 1, name))
+                    found.append(Path(os.path.realpath(str(candidate))))
+    return found
+
+
+def propagate_modes(files, roots, path_targets):
+    """Modes in which each file is loaded, to a fixpoint (F, #7310).
+
+    rustc decides the base per LOAD, not per file: crate roots, `#[path]` targets and `mod.rs`
+    files are loaded mod-rs; a `name.rs` found for `mod name;` is a plain load. One file can be
+    loaded in both modes (`mod a;` plus `#[path = "a.rs"] mod b;`), and its modules must resolve
+    under the base of every mode. Walk order is arbitrary, hence the iteration.
+    """
+    modes = {}
+    for path, _rel, _decls in files:
+        if path in roots or path in path_targets or path.name == 'mod.rs':
+            modes[path] = {MODE_RS}
+    changed = True
+    while changed:
+        changed = False
+        for path, _rel, decls in files:
+            for mode in tuple(modes.get(path, (MODE_PLAIN,))):
+                for _line, name, sub in decls:
+                    for candidate in module_candidates(load_base(path, mode), sub, name):
+                        if not candidate.is_file():
+                            continue
+                        real = Path(os.path.realpath(str(candidate)))
+                        child = MODE_RS if real.name == 'mod.rs' else MODE_PLAIN
+                        if child not in modes.setdefault(real, set()):
+                            modes[real].add(child)
+                            changed = True
+    return modes
+
+
+def missing_mod_hits(path, decls, modes):
+    """(line, name) for each `mod name;` with no file under the base of some mode the file is loaded in (#7310)."""
+    hits = []
+    for line, name, sub in decls:
+        for mode in sorted(modes.get(path, (MODE_PLAIN,))):
+            if not any(c.is_file() for c in module_candidates(load_base(path, mode), sub, name)):
+                hits.append((line, name))
+                break
     return hits
 
 
@@ -743,7 +859,8 @@ def check_sources(root, manifest_text='', label='', targets=()):
                 shown = label + declared
             problems.append(violation(shown, 'declared target has no file on disk; a build step could generate it'))
     seen = set()
-    mod_checks = []
+    mod_files = []
+    path_targets = set()
     while queue:
         path = queue.pop(0)
         if path in seen or not path.is_file():
@@ -769,20 +886,28 @@ def check_sources(root, manifest_text='', label='', targets=()):
                     problems.append(violation(where, rule))
             if zip_context and EXTRACT_CALL.search(line):
                 problems.append(violation(where, 'zip-flavoured extract call'))
-        for attr in PATH_ATTR.finditer(masked):
-            number = masked.count('\n', 0, attr.start()) + 1
-            where = '%s:%d' % (rel, number)
-            literal = PATH_LITERAL.match(text, attr.end())
-            if not literal:
-                problems.append(violation(where, '#[path] with a non-literal value cannot be followed'))
-                continue
-            target, problem = resolve_target(root, path, literal.group(1), True)
-            if problem:
-                problems.append(violation(where, '#[path] ' + problem))
-            else:
-                # rustc loads every #[path] file as a mod-rs file: `mod x;` inside it is beside it.
-                roots.add(target)
-                queue.append(target)
+        for offset, body in attribute_bodies(masked):
+            for key in PATH_KEY.finditer(body):
+                number = masked.count('\n', 0, offset + key.start()) + 1
+                where = '%s:%d' % (rel, number)
+                literal = PATH_LITERAL.match(text, offset + key.end())
+                if not literal:
+                    problems.append(violation(where, '#[path] with a non-literal value cannot be followed'))
+                    continue
+                target, problem = resolve_target(root, path, literal.group(1), True)
+                if problem:
+                    problems.append(violation(where, '#[path] ' + problem))
+                else:
+                    # Scanned whatever the attribute. Only a real load makes it a mod-rs file: a
+                    # `path =` inside a cfg predicate loads nothing and adds no exemption (F2).
+                    if path_key_loads(body, key.start()):
+                        path_targets.add(target)
+                    queue.append(target)
+        decls = module_decls(masked)
+        # Every module file `mod x;` can resolve to is scanned, wherever it sits (E): over-scanning
+        # both bases is the fail-closed direction.
+        queue.extend(existing_candidates(path, decls, (path.parent, path.parent / path.stem)))
+        mod_files.append((path, rel, decls))
         for include in INCLUDE_ANY.finditer(masked):
             number = masked.count('\n', 0, include.start()) + 1
             where = '%s:%d' % (rel, number)
@@ -799,10 +924,10 @@ def check_sources(root, manifest_text='', label='', targets=()):
             problems.append(violation('%s:%d' % (rel, number), 'zip named in macro input'))
         for number in paste_loader_hits(text, masked):
             problems.append(violation('%s:%d' % (rel, number), 'candle-loader (paste! pieces)'))
-        mod_checks.append((path, rel, masked))
-    # After the walk: `roots` now holds every #[path]-loaded file whatever the visit order.
-    for path, rel, masked in mod_checks:
-        for number, name in missing_mod_hits(path, masked, roots):
+    # After the walk: every file's load modes, whatever the visit order.
+    modes = propagate_modes(mod_files, roots, path_targets)
+    for path, rel, decls in mod_files:
+        for number, name in missing_mod_hits(path, decls, modes):
             problems.append(violation(
                 '%s:%d' % (rel, number), 'mod %s; resolves to no file on disk (a build step could generate it)' % name))
     return problems
@@ -823,7 +948,10 @@ def metadata_packages(metadata_text, root):
                 continue
             directory = Path(os.path.realpath(str(Path(package['manifest_path']).parent)))
             targets = []
-            for target in package.get('targets') or []:
+            listed = package.get('targets')
+            if not isinstance(listed, list) or not listed:
+                raise ToolError('cargo metadata package %s has no targets' % package.get('name', '?'))
+            for target in listed:
                 targets.append((str(target['src_path']), 'custom-build' in (target.get('kind') or [])))
             has_root = has_root or directory == root
             found.append((str(package.get('name', '?')), directory, targets, directory == root))

@@ -9,6 +9,7 @@ Fixture trees live under the worktree's `.local-runs/` (never a tmpfs).
 
 Run: python3 -m unittest scripts/ci/tests/test_zip_extract_guard_7301.py
 """
+import importlib.util
 import json
 import os
 import shutil
@@ -33,7 +34,9 @@ MINIMAL_MANIFEST = '[package]\nname = "fixture"\nversion = "0.0.0"\n\n[dependenc
 
 def default_meta(root):
     """cargo metadata JSON naming only the fixture root package."""
-    return {'packages': [{'name': 'fixture', 'source': None, 'manifest_path': str(Path(root) / 'Cargo.toml')}]}
+    return {'packages': [{'name': 'fixture', 'source': None, 'manifest_path': str(Path(root) / 'Cargo.toml'),
+                          'targets': [{'kind': ['lib'], 'name': 'fixture',
+                                       'src_path': str(Path(root) / 'src' / 'lib.rs')}]}]}
 
 
 class GuardBase(unittest.TestCase):
@@ -203,7 +206,9 @@ with open({log!r}, 'a') as fh:
 if 'metadata' in sys.argv:
     import json, os
     sys.stdout.write(json.dumps({{'packages': [{{'name': 'fixture', 'source': None,
-                                                 'manifest_path': os.getcwd() + '/Cargo.toml'}}]}}))
+                                                 'manifest_path': os.getcwd() + '/Cargo.toml',
+                                                 'targets': [{{'kind': ['lib'], 'name': 'fixture',
+                                                              'src_path': os.getcwd() + '/src/lib.rs'}}]}}]}}))
     sys.exit(0)
 sys.stdout.write({out!r})
 sys.stderr.write({err!r})
@@ -219,7 +224,9 @@ if '--offline' in sys.argv:
 if 'metadata' in sys.argv:
     import json, os
     sys.stdout.write(json.dumps({{'packages': [{{'name': 'fixture', 'source': None,
-                                                 'manifest_path': os.getcwd() + '/Cargo.toml'}}]}}))
+                                                 'manifest_path': os.getcwd() + '/Cargo.toml',
+                                                 'targets': [{{'kind': ['lib'], 'name': 'fixture',
+                                                              'src_path': os.getcwd() + '/src/lib.rs'}}]}}]}}))
     sys.exit(0)
 sys.stdout.write({out!r})
 """
@@ -806,10 +813,13 @@ class RuleFixtures7305To7312(GuardBase):
 
     def meta(self, *dirs):
         """cargo metadata JSON: the fixture root, local packages at `dirs`, and a registry package."""
-        packages = [{'name': 'fixture', 'source': None, 'manifest_path': str(self.root / 'Cargo.toml')}]
+        packages = [{'name': 'fixture', 'source': None, 'manifest_path': str(self.root / 'Cargo.toml'),
+                     'targets': [{'kind': ['lib'], 'name': 'fixture', 'src_path': str(self.root / 'src' / 'lib.rs')}]}]
         for rel in dirs:
             base = Path(rel) if os.path.isabs(rel) else self.root / rel
-            packages.append({'name': base.name, 'source': None, 'manifest_path': str(base / 'Cargo.toml')})
+            packages.append({'name': base.name, 'source': None, 'manifest_path': str(base / 'Cargo.toml'),
+                             'targets': [{'kind': ['lib'], 'name': base.name,
+                                          'src_path': str(base / 'src' / 'lib.rs')}]})
         packages.append({'name': 'serde', 'source': 'registry+https://github.com/rust-lang/crates.io-index',
                          'manifest_path': '/registry/serde/Cargo.toml'})
         return {'packages': packages}
@@ -1173,12 +1183,12 @@ class RuleFixtures7305To7312(GuardBase):
                       for rel in builds]
             return found
         packages = [{'name': 'fixture', 'source': None, 'manifest_path': str(self.root / 'Cargo.toml'),
-                     'targets': targets(root_paths, build_paths)}]
+                     'targets': targets(root_paths or ['src/lib.rs'], build_paths)}]
         for rel, paths in members:
             packages.append({'name': Path(rel).name, 'source': None,
                              'manifest_path': str(self.root / rel / 'Cargo.toml'),
                              'targets': [{'kind': ['lib'], 'name': 'm', 'src_path': str(self.root / p)}
-                                         for p in paths]})
+                                         for p in paths or ['%s/src/lib.rs' % rel]]})
         return {'packages': packages}
 
     def test_cfg_attr_path_does_not_exempt_the_default_file_7310(self):
@@ -1270,12 +1280,128 @@ class RuleFixtures7305To7312(GuardBase):
         """N4: a metadata document that omits the root manifest scans no local package: refuse it."""
         for name, meta in (('empty', {'packages': []}),
                            ('other-root', {'packages': [{'name': 'x', 'source': None,
-                                                         'manifest_path': '/elsewhere/Cargo.toml'}]})):
+                                                         'manifest_path': '/elsewhere/Cargo.toml',
+                                                         'targets': [{'kind': ['lib'], 'name': 'x',
+                                                                      'src_path': '/elsewhere/src/lib.rs'}]}]})):
             with self.subTest(case=name):
                 res = self.run_guard(meta=meta)
                 self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
                 self.assertIn('no package with manifest_path', res.stderr)
                 self.assertNotIn('check-zip-extract-unreachable: ok', res.stdout)
+
+    # --- round 4 (r3 review of PR #7777): E, F, G1, L3 ---------------------------------
+    LOADER = 'pub fn f() { Tensor::read_npz(p); }\n'
+
+    def test_module_of_a_declared_target_outside_scan_dirs_is_scanned_7310(self):
+        """E1/E2: `mod m;` in a target outside SCAN_DIRS resolves to a file that is compiled and must be scanned."""
+        cases = {
+            'e1-inline-table-lib': ('lib = { path = "other/lib.rs" }\n', lambda: self.meta_targets(['other/lib.rs'])),
+            'e2-literal-lib-path': ('[lib]\npath = "other/lib.rs"\n', lambda: None),
+        }
+        for name, (decl, meta) in cases.items():
+            with self.subTest(case=name):
+                self.write('Cargo.toml', PACKAGE_ONLY + decl)
+                self.write('other/lib.rs', 'mod m;\n')
+                self.write('other/m.rs', self.LOADER)
+                res = self.run_guard(meta=meta())
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('other/m.rs:1', res.stdout)
+                self.assertIn('candle-loader', res.stdout)
+
+    def test_module_of_a_path_loaded_file_outside_scan_dirs_is_scanned_7310(self):
+        """E3: `#[path = "../ext/a.rs"] mod a;` and `mod m;` inside ext/a.rs."""
+        self.write('src/lib.rs', '#[path = "../ext/a.rs"]\nmod a;\n')
+        self.write('ext/a.rs', 'mod m;\n')
+        self.write('ext/m.rs', self.LOADER)
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('ext/m.rs:1', res.stdout)
+        self.assertIn('candle-loader', res.stdout)
+
+    def test_clean_modules_outside_scan_dirs_pass_7310(self):
+        self.write('Cargo.toml', PACKAGE_ONLY + 'lib = { path = "other/lib.rs" }\n')
+        self.write('other/lib.rs', 'mod m;\n')
+        self.write('other/m.rs', 'pub fn g() {}\n')
+        res = self.run_guard(meta=self.meta_targets(['other/lib.rs']))
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.write('Cargo.toml', PACKAGE_ONLY)
+        self.write('src/lib.rs', '#[path = "../ext/a.rs"]\nmod a;\n')
+        self.write('ext/a.rs', 'mod m;\n')
+        self.write('ext/m.rs', 'pub fn g() {}\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_plain_load_of_a_path_loaded_file_keeps_the_plain_base_7310(self):
+        """F1: a.rs is loaded by `mod a;` (plain) and `#[path = "a.rs"]` (mod-rs); `mod gen;` needs src/a/gen.rs too."""
+        self.write('src/lib.rs', 'mod a;\n#[path = "a.rs"]\nmod b;\n')
+        self.write('src/a.rs', 'mod gen;\n')
+        self.write('src/gen.rs', 'pub fn g() {}\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('src/a.rs:1', res.stdout)
+        self.assertIn('mod gen', res.stdout)
+
+    def test_path_key_in_a_cfg_predicate_adds_no_mod_rs_load_7310(self):
+        """F2: `path =` inside a cfg_attr predicate loads nothing; a.rs stays a plain module."""
+        self.write('src/lib.rs', 'mod a;\n#[cfg_attr(not(path = "a.rs"), allow(dead_code))]\nmod b;\n')
+        self.write('src/a.rs', 'mod gen;\n')
+        self.write('src/gen.rs', 'pub fn g() {}\n')
+        self.write('src/b.rs', 'pub fn g() {}\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('src/a.rs:1', res.stdout)
+        self.assertIn('mod gen', res.stdout)
+
+    def test_modules_of_a_file_loaded_both_ways_pass_with_both_files_7310(self):
+        self.write('src/lib.rs', 'mod a;\n#[path = "a.rs"]\nmod b;\n')
+        self.write('src/a.rs', 'mod gen;\n')
+        self.write('src/gen.rs', 'pub fn g() {}\n')
+        self.write('src/a/gen.rs', 'pub fn g() {}\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_path_loaded_sibling_only_still_passes_b2_7310(self):
+        """B2: a.rs loaded only through #[path] is mod-rs; the sibling src/gen.rs is the module."""
+        self.write('src/lib.rs', '#[path = "a.rs"]\nmod b;\n')
+        self.write('src/a.rs', 'mod gen;\n')
+        self.write('src/gen.rs', 'pub fn g() {}\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_cfg_attr_second_argument_path_is_a_mod_rs_load_7310(self):
+        self.write('src/lib.rs', '#[cfg_attr(unix, path = "a.rs")]\nmod b;\n')
+        self.write('src/b.rs', 'pub fn g() {}\n')
+        self.write('src/a.rs', 'mod gen;\n')
+        self.write('src/gen.rs', 'pub fn g() {}\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_package_without_targets_is_usage_error_7305(self):
+        """G1: a local package whose metadata lacks `targets` (or lists none) is a tool error."""
+        base = default_meta(self.root)
+        absent = {'packages': [{key: value for key, value in base['packages'][0].items() if key != 'targets'}]}
+        for name, meta in (('absent', absent),
+                           ('empty', {'packages': [dict(base['packages'][0], targets=[])]}),
+                           ('not-a-list', {'packages': [dict(base['packages'][0], targets='lib')]})):
+            with self.subTest(case=name):
+                res = self.run_guard(meta=meta)
+                self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+                self.assertIn('has no targets', res.stderr)
+                self.assertNotIn('check-zip-extract-unreachable: ok', res.stdout)
+
+    def test_paste_loader_pattern_is_pinned_7307(self):
+        """L3: both loader patterns come from LOADER_NAMES; the paste form is pinned to its literal."""
+        spec = importlib.util.spec_from_file_location('zip_guard_under_test', str(GUARD))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(
+            module.PASTE_LOADER_NORMAL.pattern,
+            r'(?:readnpz\w*|readnpy|writenpz|writenpy|readpth\w*|frompth\w*|fromnpz|npztensors|pthtensors'
+            r'|readallwithkey)\b')
+        self.assertEqual(
+            dict(module.FORBIDDEN)['candle-loader'].pattern,
+            r'\b(?:read_npz\w*|read_npy|write_npz|write_npy|read_pth\w*|from_pth\w*|from_npz|NpzTensors'
+            r'|PthTensors|read_all_with_key)\b')
 
 
 METADATA_FAILING_STUB = """#!{python}
