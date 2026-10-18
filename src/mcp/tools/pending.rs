@@ -210,12 +210,8 @@ pub fn handle_subscription_dlq_list_for(
     //     to only those whose subscription owner == caller. This
     //     preserves the per-tenant operator inventory use-case while
     //     refusing to leak cross-tenant payloads.
-    let rows_all = crate::subscriptions::list_dlq(conn, subscription_id).map_err(|e| {
-        DlqListError(crate::mcp::error_text::mcp_foreign_err(
-            "resolve_agent_id",
-            e,
-        ))
-    })?;
+    let rows_all = crate::subscriptions::list_dlq(conn, subscription_id)
+        .map_err(|e| DlqListError(crate::mcp::error_text::mcp_foreign_err("list_dlq", e)))?;
     let rows: Vec<_> = if subscription_id
         .is_some_and(crate::subscriptions::scan_failure::is_scan_failure_sub_id)
     {
@@ -229,7 +225,7 @@ pub fn handle_subscription_dlq_list_for(
             .collect()
     } else if let Some(sid) = subscription_id {
         let owner = crate::subscriptions::get_owner(conn, sid)
-            .map_err(|e| DlqListError(crate::mcp::error_text::mcp_foreign_err("list_dlq", e)))?;
+            .map_err(|e| DlqListError(crate::mcp::error_text::mcp_foreign_err("get_owner", e)))?;
         if owner.as_deref() != Some(caller) {
             // Identical wire shape to "no DLQ entries since the
             // subscription rolled over". Cannot distinguish from
