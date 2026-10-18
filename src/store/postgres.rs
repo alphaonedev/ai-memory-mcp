@@ -13151,6 +13151,11 @@ impl PostgresStore {
         &'static str,
         crate::governance::audit::PendingAuditAnchor,
     )> {
+        // #7743 - the link INSERT lives here, so the record-stop gate lives
+        // here too (the B7/B9 structural guards pin the writer). Both callers
+        // (`link_internal`, `store_inner`) also gate; the double check is
+        // intended.
+        self.gate_record_stop().await?;
         // #1568 (H1 residual) — run the same pre-link gates the sqlite
         // `db::create_link_signed` path runs (reflects_on cycle
         // invariant + K9 governance) BEFORE any FK pre-flight or write.
@@ -21380,8 +21385,8 @@ impl PostgresStore {
     /// `promoted_from*`, then records the clone→source `derived_from` edge. The
     /// clone's 30+-field shape comes from the SHARED
     /// [`crate::storage::build_promotion_clone`] so it cannot drift from the
-    /// sqlite primitive. The clone is persisted through the standard
-    /// [`MemoryStore::store`] funnel (fresh embedding re-derived from the
+    /// sqlite primitive. The clone is persisted through the
+    /// [`Self::store_inner`] funnel, the body of [`MemoryStore::store`] (fresh embedding re-derived from the
     /// durable TEXT — the North-Star "derived artifacts are regenerable" rule).
     async fn pg_promote_to_namespace(
         &self,
