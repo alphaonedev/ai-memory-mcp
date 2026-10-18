@@ -320,6 +320,26 @@ mod tests {
         );
     }
 
+    /// #7450 — a private key directory lands OUTSIDE `$HOME` even when
+    /// `$TMPDIR` is under it, so a test that binds `AI_MEMORY_KEY_DIR` to it
+    /// passes the #3355 guard. Red on a host whose `TMPDIR` is under HOME while
+    /// `private_tempdir` allocates with `tempfile::tempdir()`.
+    #[test]
+    fn private_tempdir_is_off_home_7450() {
+        // Arm the guard so `assert_isolated` is not the unarmed no-op.
+        let _ = install();
+        let dir = private_tempdir();
+        assert_isolated(dir.path());
+        let home = resolved_home();
+        let canonical_home = home.canonicalize().unwrap_or(home);
+        let canonical_dir = dir.path().canonicalize().expect("canonicalize private dir");
+        assert!(
+            !canonical_dir.starts_with(&canonical_home),
+            "#7450 private_tempdir resolved under HOME: {}",
+            canonical_dir.display()
+        );
+    }
+
     /// #3584 — `KeyDirEnvBind` restores the captured `AI_MEMORY_KEY_DIR`
     /// even when the holder panics (OWNERSHIP-24 / OWNERSHIP-25). The
     /// process-lifetime `OnceLock` bind is not dropped here; this pin
