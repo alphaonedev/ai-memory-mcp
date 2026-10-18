@@ -619,7 +619,7 @@ def read_source(path, rel):
         raise ToolError('cannot read %s: %s' % (rel, exc))
 
 
-def seed_sources(root, manifest_text):
+def seed_sources(root, manifest_text, targets=()):
     seeds = []
     for name in SCAN_FILES:
         seeds.append(root / name)
@@ -627,7 +627,7 @@ def seed_sources(root, manifest_text):
         base = root / directory
         if base.is_dir():
             seeds.extend(sorted(base.rglob('*.rs')))
-    for declared in manifest_source_paths(manifest_text):
+    for declared in list(manifest_source_paths(manifest_text)) + [str(t) for t, _build in targets]:
         seeds.append(root / declared)
     return seeds
 
@@ -650,15 +650,11 @@ def resolve_target(root, source, value, is_path_attr):
 
 PASTE_GROUP = re.compile(r'\[<(.*?)>\]', re.DOTALL)
 PASTE_MODIFIER = re.compile(r':(?:lower|upper|snake|camel|lower_camel|upper_camel)\b')
-# The loader names of FORBIDDEN, without the leading word boundary: a paste! piece can
-# prefix them (`[<try_ read_npz>]`).
-PASTE_LOADER = re.compile(
-    r'(?:read_npz\w*|read_npy|write_npz|write_npy|read_pth\w*|from_pth\w*|'
-    r'from_npz|NpzTensors|PthTensors|read_all_with_key)\b')
-# The same names with underscores removed and lowercased: paste! case modifiers and spacing cannot hide them.
+# The candle-loader names of FORBIDDEN with underscores removed and lowercased, without the
+# leading word boundary: paste! case modifiers and spacing cannot hide them, and a piece can
+# prefix them (`[<try_ read_npz>]`). Derived, so the two lists cannot drift (N5).
 PASTE_LOADER_NORMAL = re.compile(
-    r'(?:readnpz\w*|readnpy|writenpz|writenpy|readpth\w*|frompth\w*|'
-    r'fromnpz|npztensors|pthtensors|readallwithkey)\b')
+    dict(FORBIDDEN)['candle-loader'].pattern.replace('_', '').lower()[len('\\b'):])
 MOD_DECL = re.compile(r'(?<![\w])mod\s+(?:r#)?([A-Za-z_]\w*)\s*;')
 INLINE_MOD_OR_BRACE = re.compile(r'\bmod\s+(?:r#)?([A-Za-z_]\w*)\s*\{|[{}]')
 
@@ -693,8 +689,11 @@ def missing_mod_hits(path, masked, roots=frozenset()):
     for decl in MOD_DECL.finditer(masked):
         before = masked[max(0, decl.start() - 300):decl.start()]
         before = re.split(r'[;{}]', before)[-1]
-        if re.search(r'#\s*\[\s*(?:path\s*=|cfg_attr\s*\(.*\bpath\s*=)', before, re.S):
-            continue  # a #[path] module: followed (or flagged) by the path-attribute scan
+        if re.search(r'#\s*\[\s*path\s*=', before):
+            # An UNCONDITIONAL #[path] module: followed (or flagged) by the path-attribute scan.
+            # A cfg_attr(<cond>, path = ..) module is not exempt: when the condition is false
+            # cargo loads the default file, which a build step could generate (#7310).
+            continue
         sub = Path(*enclosing_inline_mods(masked, decl.start())) if enclosing_inline_mods(masked, decl.start()) else Path()
         name = decl.group(1)
         found = False
@@ -709,15 +708,16 @@ def missing_mod_hits(path, masked, roots=frozenset()):
     return hits
 
 
-def build_script_paths(root, manifest_text):
-    names = list(SCAN_FILES) + manifest_source_paths(manifest_text, builds_only=True)
+def build_script_paths(root, manifest_text, targets=()):
+    names = (list(SCAN_FILES) + manifest_source_paths(manifest_text, builds_only=True)
+             + [str(t) for t, is_build in targets if is_build])
     return {Path(os.path.realpath(str(root / name))) for name in names}
 
 
-def crate_roots(root, manifest_text):
+def crate_roots(root, manifest_text, targets=()):
     """Files cargo treats as crate roots: `mod x;` beside them is `x.rs`, not `<stem>/x.rs`."""
     found = {root / 'src' / 'lib.rs', root / 'src' / 'main.rs', root / 'build.rs'}
-    for declared in manifest_source_paths(manifest_text):
+    for declared in list(manifest_source_paths(manifest_text)) + [str(t) for t, _build in targets]:
         found.add(root / declared)
     for directory in ('src/bin', 'tests', 'benches', 'examples'):
         base = root / directory
@@ -727,13 +727,14 @@ def crate_roots(root, manifest_text):
     return {Path(os.path.realpath(str(p))) for p in found}
 
 
-def check_sources(root, manifest_text='', label=''):
+def check_sources(root, manifest_text='', label='', targets=()):
+    """`targets`: (src_path, is_build_script) from `cargo metadata`; covers every TOML form of a target (#7310)."""
     root = Path(os.path.realpath(str(root)))
-    builds = build_script_paths(root, manifest_text)
+    builds = build_script_paths(root, manifest_text, targets)
     problems = []
-    queue = [Path(os.path.realpath(str(p))) for p in seed_sources(root, manifest_text)]
-    roots = crate_roots(root, manifest_text)
-    for declared in manifest_source_paths(manifest_text):
+    queue = [Path(os.path.realpath(str(p))) for p in seed_sources(root, manifest_text, targets)]
+    roots = crate_roots(root, manifest_text, targets)
+    for declared in list(manifest_source_paths(manifest_text)) + [str(t) for t, _build in targets]:
         target = Path(os.path.realpath(str(root / declared)))
         if not target.is_file():
             try:
@@ -742,6 +743,7 @@ def check_sources(root, manifest_text='', label=''):
                 shown = label + declared
             problems.append(violation(shown, 'declared target has no file on disk; a build step could generate it'))
     seen = set()
+    mod_checks = []
     while queue:
         path = queue.pop(0)
         if path in seen or not path.is_file():
@@ -778,6 +780,8 @@ def check_sources(root, manifest_text='', label=''):
             if problem:
                 problems.append(violation(where, '#[path] ' + problem))
             else:
+                # rustc loads every #[path] file as a mod-rs file: `mod x;` inside it is beside it.
+                roots.add(target)
                 queue.append(target)
         for include in INCLUDE_ANY.finditer(masked):
             number = masked.count('\n', 0, include.start()) + 1
@@ -795,39 +799,61 @@ def check_sources(root, manifest_text='', label=''):
             problems.append(violation('%s:%d' % (rel, number), 'zip named in macro input'))
         for number in paste_loader_hits(text, masked):
             problems.append(violation('%s:%d' % (rel, number), 'candle-loader (paste! pieces)'))
+        mod_checks.append((path, rel, masked))
+    # After the walk: `roots` now holds every #[path]-loaded file whatever the visit order.
+    for path, rel, masked in mod_checks:
         for number, name in missing_mod_hits(path, masked, roots):
             problems.append(violation(
                 '%s:%d' % (rel, number), 'mod %s; resolves to no file on disk (a build step could generate it)' % name))
     return problems
 
 
-def local_package_dirs(metadata_text, root):
-    """(name, directory) of every local package except the root, from `cargo metadata` JSON (#7305)."""
+def metadata_packages(metadata_text, root):
+    """(name, directory, targets, is_root) of every local package in `cargo metadata` JSON (#7305, #7310).
+
+    targets are (src_path, is_build_script) from packages[].targets[].src_path. A document
+    without the root package is a tool error (N4).
+    """
+    root = Path(os.path.realpath(str(root)))
+    found = []
+    has_root = False
     try:
-        packages = json.loads(metadata_text)['packages']
-        found = []
-        for package in packages:
+        for package in json.loads(metadata_text)['packages']:
             if package.get('source') is not None:
                 continue
             directory = Path(os.path.realpath(str(Path(package['manifest_path']).parent)))
-            if directory != root:
-                found.append((str(package.get('name', '?')), directory))
+            targets = []
+            for target in package.get('targets') or []:
+                targets.append((str(target['src_path']), 'custom-build' in (target.get('kind') or [])))
+            has_root = has_root or directory == root
+            found.append((str(package.get('name', '?')), directory, targets, directory == root))
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
         raise ToolError('cannot parse cargo metadata output: %s' % exc)
+    if not has_root:
+        raise ToolError('cargo metadata output has no package with manifest_path %s' % (root / 'Cargo.toml'))
     return found
+
+
+def root_targets(metadata_text, root):
+    for _name, _directory, targets, is_root in metadata_packages(metadata_text, root):
+        if is_root:
+            return targets
+    return []
 
 
 def check_local_packages(metadata_text, root):
     """Rule (c) over every local package other than the root: path dependencies and implicit members."""
     root = Path(os.path.realpath(str(root)))
     problems = []
-    for name, directory in local_package_dirs(metadata_text, root):
+    for name, directory, targets, is_root in metadata_packages(metadata_text, root):
+        if is_root:
+            continue
         try:
             label = directory.relative_to(root).as_posix() + '/'
         except ValueError:
             label = name + '/'
         manifest = directory / 'Cargo.toml'
-        problems += check_sources(directory, read_source(manifest, label + 'Cargo.toml'), label)
+        problems += check_sources(directory, read_source(manifest, label + 'Cargo.toml'), label, targets)
     return problems
 
 
@@ -916,7 +942,8 @@ def main(argv=None):
             metadata_text = cargo_metadata_output(root)
         manifest_text = read_source(root / 'Cargo.toml', 'Cargo.toml')
         problems = (tree_problems + check_manifest(manifest_text, args.manifest_parser)
-                    + check_sources(root, manifest_text) + check_local_packages(metadata_text, root))
+                    + check_sources(root, manifest_text, '', root_targets(metadata_text, root))
+                    + check_local_packages(metadata_text, root))
     except (OSError, ValueError, ToolError) as exc:
         print('error: %s' % escape_text(exc), file=sys.stderr)
         return EXIT_USAGE

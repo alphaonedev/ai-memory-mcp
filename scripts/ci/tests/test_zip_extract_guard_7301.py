@@ -201,7 +201,9 @@ import json, sys
 with open({log!r}, 'a') as fh:
     fh.write(json.dumps(sys.argv[1:]) + '\\n')
 if 'metadata' in sys.argv:
-    sys.stdout.write('{{"packages": []}}')
+    import json, os
+    sys.stdout.write(json.dumps({{'packages': [{{'name': 'fixture', 'source': None,
+                                                 'manifest_path': os.getcwd() + '/Cargo.toml'}}]}}))
     sys.exit(0)
 sys.stdout.write({out!r})
 sys.stderr.write({err!r})
@@ -215,7 +217,9 @@ if '--offline' in sys.argv:
                      'Caused by: attempting to make an HTTP request, but --offline was specified\\n')
     sys.exit(101)
 if 'metadata' in sys.argv:
-    sys.stdout.write('{{"packages": []}}')
+    import json, os
+    sys.stdout.write(json.dumps({{'packages': [{{'name': 'fixture', 'source': None,
+                                                 'manifest_path': os.getcwd() + '/Cargo.toml'}}]}}))
     sys.exit(0)
 sys.stdout.write({out!r})
 """
@@ -1159,6 +1163,119 @@ class RuleFixtures7305To7312(GuardBase):
                 res = self.run_guard()
                 self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
                 self.assertIn('mod gen', res.stdout)
+
+    # --- round 3 (r2 review of PR #7777): N1-N4 ----------------------------------------
+    def meta_targets(self, root_paths=(), build_paths=(), members=()):
+        """cargo metadata JSON whose root package carries `targets`; `members` is (dir, [src paths])."""
+        def targets(paths, builds=()):
+            found = [{'kind': ['lib'], 'name': 't', 'src_path': str(self.root / rel)} for rel in paths]
+            found += [{'kind': ['custom-build'], 'name': 'build-script-build', 'src_path': str(self.root / rel)}
+                      for rel in builds]
+            return found
+        packages = [{'name': 'fixture', 'source': None, 'manifest_path': str(self.root / 'Cargo.toml'),
+                     'targets': targets(root_paths, build_paths)}]
+        for rel, paths in members:
+            packages.append({'name': Path(rel).name, 'source': None,
+                             'manifest_path': str(self.root / rel / 'Cargo.toml'),
+                             'targets': [{'kind': ['lib'], 'name': 'm', 'src_path': str(self.root / p)}
+                                         for p in paths]})
+        return {'packages': packages}
+
+    def test_cfg_attr_path_does_not_exempt_the_default_file_7310(self):
+        """N1: only an unconditional #[path] exempts `mod x;`; a cfg_attr module needs its default file too."""
+        bodies = {
+            'cfg-attr-path': '#[cfg_attr(windows, path = "lib.rs")] mod gen;\n',
+            'cfg-attr-path-in-predicate': '#[cfg_attr(not(path = "lib.rs"), allow(dead_code))] mod gen;\n',
+        }
+        for name, body in bodies.items():
+            with self.subTest(case=name):
+                self.write('src/lib.rs', body)
+                res = self.run_guard()
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('mod gen', res.stdout)
+
+    def test_cfg_attr_path_module_with_both_files_passes_7310(self):
+        self.write('src/lib.rs', '#[cfg_attr(windows, path = "w.rs")] mod gen;\n')
+        self.write('src/gen.rs', 'pub fn g() {}\n')
+        self.write('src/w.rs', 'pub fn g() {}\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_mod_in_a_path_loaded_file_is_beside_that_file_7310(self):
+        """N2: rustc treats every #[path] file as a mod-rs file; a decoy under `<stem>/` is not the module."""
+        self.write('src/lib.rs', '#[path = "impl_a.rs"]\nmod a;\n')
+        self.write('src/impl_a.rs', 'mod gen;\n')
+        self.write('src/impl_a/gen.rs', 'pub fn g() {}\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('src/impl_a.rs:1', res.stdout)
+        self.assertIn('mod gen', res.stdout)
+
+    def test_mod_in_a_path_loaded_file_beside_it_passes_7310(self):
+        self.write('src/lib.rs', '#[path = "impl_a.rs"]\nmod a;\n')
+        self.write('src/impl_a.rs', 'mod gen;\n')
+        self.write('src/gen.rs', 'pub fn g() {}\n')
+        res = self.run_guard()
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_inline_table_and_array_targets_come_from_metadata_7310(self):
+        """N3: `lib = { path = .. }` and `bin = [{ .. }]` are read from cargo metadata src_path."""
+        cases = {
+            'c1-missing-inline-lib': ('lib = { path = "gen/lib.rs" }\n', None, 'declared target has no file on disk'),
+            'c2-loader-inline-lib': ('lib = { path = "other/lib.rs" }\n',
+                                     'pub fn f() { Tensor::read_npz(p); }\n', 'candle-loader'),
+            'c3-loader-bin-array': ('bin = [{ name = "x", path = "other/x.rs" }]\n',
+                                    'fn main() { Tensor::read_npz(p); }\n', 'candle-loader'),
+        }
+        paths = {'c1-missing-inline-lib': 'gen/lib.rs', 'c2-loader-inline-lib': 'other/lib.rs',
+                 'c3-loader-bin-array': 'other/x.rs'}
+        for name, (decl, body, message) in cases.items():
+            with self.subTest(case=name):
+                self.write('Cargo.toml', PACKAGE_ONLY + decl)
+                if body is not None:
+                    self.write(paths[name], body)
+                res = self.run_guard(meta=self.meta_targets([paths[name]]))
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn(message, res.stdout)
+                self.assertIn(paths[name].split('/')[0] + '/', res.stdout)
+                if body is not None:
+                    (self.root / paths[name]).unlink()
+
+    def test_inline_table_target_with_a_clean_file_passes_7310(self):
+        self.write('Cargo.toml', PACKAGE_ONLY + 'lib = { path = "other/lib.rs" }\n')
+        self.write('other/lib.rs', 'pub fn g() {}\n')
+        res = self.run_guard(meta=self.meta_targets(['other/lib.rs']))
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_inline_target_root_looks_for_mod_beside_itself_7310(self):
+        self.write('other/lib.rs', 'mod gen;\n')
+        self.write('other/gen.rs', 'pub fn g() {}\n')
+        res = self.run_guard(meta=self.meta_targets(['other/lib.rs']))
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_local_package_target_outside_src_is_scanned_7310(self):
+        self.member('crates/m', 'pub fn ok() {}\n')
+        self.write('crates/m/other/x.rs', 'fn f() { Tensor::read_npz(p); }\n')
+        res = self.run_guard(meta=self.meta_targets((), (), [('crates/m', ['crates/m/other/x.rs'])]))
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('crates/m/other/x.rs:1', res.stdout)
+
+    def test_build_script_target_from_metadata_scans_its_strings_7310(self):
+        self.write('tools/b.rs', 'fn main() { std::fs::write("g.rs", "fn g() { Tensor::read_npz(p); }").unwrap(); }\n')
+        res = self.run_guard(meta=self.meta_targets((), ['tools/b.rs']))
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('tools/b.rs:1', res.stdout)
+
+    def test_metadata_without_the_root_package_is_usage_error_7305(self):
+        """N4: a metadata document that omits the root manifest scans no local package: refuse it."""
+        for name, meta in (('empty', {'packages': []}),
+                           ('other-root', {'packages': [{'name': 'x', 'source': None,
+                                                         'manifest_path': '/elsewhere/Cargo.toml'}]})):
+            with self.subTest(case=name):
+                res = self.run_guard(meta=meta)
+                self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+                self.assertIn('no package with manifest_path', res.stderr)
+                self.assertNotIn('check-zip-extract-unreachable: ok', res.stdout)
 
 
 METADATA_FAILING_STUB = """#!{python}
