@@ -350,13 +350,13 @@ async fn key_bound_but_unenrolled_admin_has_no_export_bypass() {
 
 #[cfg(feature = "sal-postgres")]
 async fn pg_snapshot(pool: &sqlx::PgPool) -> Vec<(String, Option<Value>)> {
-    let tables:Vec<String>=sqlx::query_scalar("SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY table_name")
+    let tables:Vec<String>=sqlx::query_scalar("SELECT table_name FROM information_schema.tables WHERE table_schema=current_schema() AND table_type='BASE TABLE' ORDER BY table_name")
         .fetch_all(pool).await.expect("PG table census");
     let mut rows = Vec::new();
     for table in tables {
         let quoted = table.replace('"', "\"\"");
         let value: Option<Value> = sqlx::query_scalar(&format!(
-            "SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text) FROM public.\"{quoted}\" t"
+            "SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text) FROM \"{quoted}\" t"
         ))
         .fetch_one(pool)
         .await
@@ -369,12 +369,15 @@ async fn pg_snapshot(pool: &sqlx::PgPool) -> Vec<(String, Option<Value>)> {
 #[cfg(feature = "sal-postgres")]
 #[tokio::test]
 async fn native_pg_export_and_501_promotion_preserve_pg_and_scratch() {
-    let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+    // #7744: the 501 snapshot below compares whole tables, so the PG side runs
+    // in its own schema; a concurrent run on the same database shares no rows.
+    let Some(env) = crate::postgres_env::PostgresTestEnv::new("skill_promote_7334").await else {
         eprintln!(
             "skip: native_pg_export_and_501_promotion_preserve_pg_and_scratch requires certified PG"
         );
         return;
     };
+    let url = env.url().to_owned();
     let f = Fixture::new();
     let store = Arc::new(
         ai_memory::store::postgres::PostgresStore::connect(&url)
