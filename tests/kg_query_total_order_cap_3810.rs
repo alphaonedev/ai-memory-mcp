@@ -20,9 +20,15 @@
 //!   which (`...-200`, the greatest id) carries TWO parallel edges
 //!   (`supersedes` written first, `related_to` second). `relation` decides, and
 //!   `related_to < supersedes` in byte order keeps `related_to`;
-//! * depth-2 diamond: `src -> a -> t` and `src -> b -> t` with the SAME relation
+//! * depth-2 diamond: `src -> x -> t` and `src -> x+ -> t` with the SAME relation
 //!   on the last hop, so the two depth-2 rows tie on `(depth, target_id,
-//!   relation)` and only `path` decides which one the cap keeps (`...-a->t`).
+//!   relation)` and only `path` decides which one the cap keeps. The ids make
+//!   the natural traversal order (`x` first) disagree with the path order
+//!   (`src->x+->t` first), so a missing `path` key keeps the wrong row;
+//! * depth-2 relation beats path: `src -> m1 -> t` (`supersedes`) and
+//!   `src -> m2 -> t` (`related_to`); the rows tie on `(depth, target_id)` and
+//!   `relation` outranks `path`, so the `m2` leg survives although `m1` comes
+//!   first as a target id and in the path.
 //!
 //! The sqlite cells stamp every link with one instant so the temporal key ties
 //! and the appended tie-break is what is under test; a separate sqlite cell pins
@@ -39,8 +45,8 @@ const AGENT: &str = "ai:kg-order-3810";
 /// Distinct depth-1 targets of the parallel-edge fixture; the last one carries
 /// the tied parallel pair.
 const TARGETS: usize = 200;
-/// Depth-1 filler targets of the diamond fixture: with `a` and `b` that is 199
-/// depth-1 rows, so the cap keeps exactly ONE of the two depth-2 rows.
+/// Depth-1 filler targets of the depth-2 fixtures: with the two intermediates
+/// that is 199 depth-1 rows, so the cap keeps exactly ONE of the two depth-2 rows.
 const DIAMOND_FILLERS: usize = 197;
 /// The default `kg_query` row cap on every backend.
 const ROW_CAP: usize = 200;
@@ -115,23 +121,33 @@ fn parallel_scenario(ns: &str) -> Scenario {
     }
 }
 
-/// 201 rows: 199 depth-1 rows plus the two depth-2 rows of the diamond
-/// `src -> a -> t` / `src -> b -> t` (same last-hop relation).
-fn diamond_scenario(ns: &str) -> Scenario {
+/// 201 rows: 199 depth-1 rows plus two depth-2 rows to one target `t` through
+/// two intermediates; the 200-row cap keeps exactly one of them.
+///
+/// `legs` is `(intermediate suffix, last-hop relation)` in the order the cap
+/// must PREFER them: the first leg is the survivor. The intermediates are named
+/// so the natural (unsorted) traversal order differs from the survivor.
+fn two_leg_scenario(
+    ns: &str,
+    label: &'static str,
+    survivor: (&str, &'static str),
+    loser: (&str, &'static str),
+) -> Scenario {
     let src = format!("{ns}-src");
-    let (a, b, t) = (format!("{ns}-a"), format!("{ns}-b"), format!("{ns}-t"));
-    let mut nodes = vec![src.clone(), a.clone(), b.clone(), t.clone()];
+    let t = format!("{ns}-t");
+    let (win, lose) = (format!("{ns}-{}", survivor.0), format!("{ns}-{}", loser.0));
+    let mut nodes = vec![src.clone(), win.clone(), lose.clone(), t.clone()];
     nodes.extend((1..=DIAMOND_FILLERS).map(|n| target_id(ns, n)));
-    // The `b` leg is written FIRST so, without the `path` tie-break, it has the
-    // lowest rowid and would be the survivor.
+    // The loser leg is written FIRST so, whichever tie-break element is
+    // missing, insertion order alone would keep it.
     let mut edges = vec![
-        (b.clone(), t.clone(), SURVIVOR),
-        (a.clone(), t.clone(), SURVIVOR),
-        (src.clone(), b.clone(), SURVIVOR),
-        (src.clone(), a.clone(), SURVIVOR),
+        (lose.clone(), t.clone(), loser.1),
+        (win.clone(), t.clone(), survivor.1),
+        (src.clone(), lose.clone(), SURVIVOR),
+        (src.clone(), win.clone(), SURVIVOR),
     ];
     edges.extend((1..=DIAMOND_FILLERS).map(|n| (src.clone(), target_id(ns, n), SURVIVOR)));
-    let mut depth_one: Vec<String> = vec![a.clone(), b];
+    let mut depth_one: Vec<String> = vec![win.clone(), lose];
     depth_one.extend((1..=DIAMOND_FILLERS).map(|n| target_id(ns, n)));
     depth_one.sort();
     let mut want: Vec<Key> = depth_one
@@ -141,17 +157,37 @@ fn diamond_scenario(ns: &str) -> Scenario {
     want.push((
         2,
         t.clone(),
-        SURVIVOR.to_string(),
-        format!("{src}->{a}->{t}"),
+        survivor.1.to_string(),
+        format!("{src}->{win}->{t}"),
     ));
     Scenario {
-        label: "depth-2 diamond",
+        label,
         src,
         depth: 2,
         nodes,
         edges,
         want,
     }
+}
+
+/// Diamond with the SAME last-hop relation: only `path` decides. The ids are
+/// `x` and `x+`: `x` sorts first as a target id, but its path `src->x->t`
+/// sorts AFTER `src->x+->t` (`-` is 0x2d, `+` is 0x2b), so the traversal's
+/// natural order (target id) and the path order disagree.
+fn diamond_scenario(ns: &str) -> Scenario {
+    two_leg_scenario(ns, "depth-2 diamond", ("x+", SURVIVOR), ("x", SURVIVOR))
+}
+
+/// Two depth-2 rows tie on `(depth, target_id)` and differ in relation AND
+/// path: relation outranks path, so the `related_to` leg through `m2` survives
+/// although `m1` comes first both as a target id and in the path.
+fn relation_beats_path_scenario(ns: &str) -> Scenario {
+    two_leg_scenario(
+        ns,
+        "depth-2 relation beats path",
+        ("m2", SURVIVOR),
+        ("m1", CUT),
+    )
 }
 
 fn assert_expected(backend: &str, sc: &Scenario, got: &[Key]) {
@@ -216,10 +252,19 @@ fn sqlite_kg_query_cap_diamond_path_tiebreak_3810() {
     assert_expected("sqlite", &sc, &got);
     let last = got.last().expect("a page");
     assert!(
-        last.3.contains("-a->"),
-        "sqlite: the diamond survivor must be the `a` path, got {}",
+        last.3.contains("-x+->"),
+        "sqlite: the diamond survivor must be the `x+` path, got {}",
         last.3
     );
+}
+
+#[test]
+fn sqlite_kg_query_cap_relation_outranks_path_3810() {
+    let sc = relation_beats_path_scenario(&format!("kg-order-{}", uuid::Uuid::new_v4()));
+    let got = sqlite_page(&sc);
+    assert_expected("sqlite", &sc, &got);
+    let last = got.last().expect("a page");
+    assert_eq!(last.2, SURVIVOR, "sqlite: `{SURVIVOR}` outranks `{CUT}`");
 }
 
 /// F2 (review r1): the sqlite temporal key is still the PRIMARY order after
@@ -258,7 +303,7 @@ fn sqlite_kg_query_temporal_key_stays_primary_3810() {
 mod pg {
     use super::{
         AGENT, Key, ROW_CAP, Scenario, assert_expected, common, diamond_scenario, make_memory,
-        parallel_scenario,
+        parallel_scenario, relation_beats_path_scenario,
     };
     use ai_memory::store::postgres::PostgresStore;
     use ai_memory::store::{CallerContext, KgBackend, KgQueryRow, MemoryStore};
@@ -447,6 +492,15 @@ mod pg {
     #[tokio::test]
     async fn postgres_kg_query_cap_diamond_path_tiebreak_cte_and_age_3810() {
         run_scenario(&diamond_scenario(&format!(
+            "kg-order-{}",
+            uuid::Uuid::new_v4()
+        )))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_kg_query_cap_relation_outranks_path_cte_and_age_3810() {
+        run_scenario(&relation_beats_path_scenario(&format!(
             "kg-order-{}",
             uuid::Uuid::new_v4()
         )))
