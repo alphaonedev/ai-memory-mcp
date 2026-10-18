@@ -198,6 +198,7 @@ fn sqlite_genesis_read_error_skips_the_watermark_and_the_append_succeeds_7239() 
         "the corrupted genesis must produce a read ERROR, not an absent row"
     );
     let skips_before = forensic::watermark_genesis_read_skips();
+    let head_start = head(&conn);
     let limit = target_head() + 1;
     let mut n = 0;
     while head(&conn) < limit {
@@ -228,10 +229,29 @@ fn sqlite_genesis_read_error_skips_the_watermark_and_the_append_succeeds_7239() 
         forensic::watermark_genesis_read_skips() > skips_before,
         "the skipped emission must be counted (and logged)"
     );
+    // #7236 - a persistent fault backs the retry off to the next emission-due
+    // append: the genesis is re-read (and the WARN fires) once per due window,
+    // not on every later append.
+    assert_skips_bounded_by_due_cadence(
+        forensic::watermark_genesis_read_skips() - skips_before,
+        head(&conn) - head_start,
+    );
     let rows = watermark_payloads(fdir.path());
     assert!(
         rows.is_empty(),
         "no db_id-less watermark may be anchored on a genesis read error; got {rows:?}"
+    );
+}
+
+/// #7236 - `skips` genesis read skips over `appends` appends must not exceed one
+/// per `WATERMARK_INTERVAL` window (plus the window the run started in).
+fn assert_skips_bounded_by_due_cadence(skips: u64, appends: i64) {
+    let windows = u64::try_from(appends / forensic::WATERMARK_INTERVAL).expect("non-negative");
+    assert!(
+        skips >= 1 && skips <= windows + 1,
+        "{skips} genesis read skips over {appends} appends: a persistent fault must retry once \
+         per due window (at most {}), not on every append",
+        windows + 1
     );
 }
 
@@ -309,7 +329,9 @@ mod postgres_twin {
     /// same scenario as the sqlite cell with the same outcome. The genesis read
     /// runs in a SAVEPOINT, so its failure neither aborts the append's
     /// transaction nor stalls the chain; no watermark is anchored. The genesis
-    /// `payload_hash` is set NULL so the read fails to decode.
+    /// read fails on the SERVER (#7677, see
+    /// `inject_server_side_genesis_read_fault`), which aborts a transaction
+    /// that has no savepoint.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
     async fn pg_genesis_read_error_skips_the_watermark_and_the_append_succeeds_7239() {
@@ -318,20 +340,15 @@ mod postgres_twin {
             return;
         };
         let _g = CELL_LOCK.lock().await;
-        let (_scratch, pg) = scratch_store(&url).await;
+        let (scratch, pg) = scratch_store(&url).await;
         let fdir = fresh_dir("pg-readerr-sink");
         forensic::init(fdir.path(), None).expect("forensic init");
         drive_pg(&pg, ROWS_BEFORE_GENESIS_REMOVAL).await;
-        sqlx::query("ALTER TABLE signed_events ALTER COLUMN payload_hash DROP NOT NULL")
-            .execute(pg.pool())
-            .await
-            .expect("relax payload_hash");
-        sqlx::query("UPDATE signed_events SET payload_hash = NULL WHERE sequence = $1")
-            .bind(GENESIS_SEQUENCE)
-            .execute(pg.pool())
-            .await
-            .expect("corrupt genesis payload_hash");
+        let faulted = inject_server_side_genesis_read_fault(&scratch, &pg).await;
+        let _admin = pg;
+        let pg = faulted;
         let skips_before = forensic::watermark_genesis_read_skips();
+        let head_start = pg_head(&pg).await;
         let limit = target_head() + 1;
         let mut n = 0;
         while pg_head(&pg).await < limit {
@@ -351,11 +368,65 @@ mod postgres_twin {
             forensic::watermark_genesis_read_skips() > skips_before,
             "the skipped emission must be counted (and logged)"
         );
+        // #7236 - the retry is backed off to the next emission-due append on pg too.
+        super::assert_skips_bounded_by_due_cadence(
+            forensic::watermark_genesis_read_skips() - skips_before,
+            pg_head(&pg).await - head_start,
+        );
         let rows = watermark_payloads(fdir.path());
         assert!(
             rows.is_empty(),
             "no db_id-less watermark may be anchored on a genesis read error; got {rows:?}"
         );
+    }
+
+    /// #7677 - make the genesis read fail on the SERVER. The scratch database
+    /// shadows the `bigint = integer` operator (the type pair of the literal
+    /// `sequence = 1` in `GENESIS_ROW_SQL`) with a plpgsql function that raises
+    /// for the genesis literal, and pins the database `search_path` so that
+    /// `public` is searched before `pg_catalog`. The genesis statement then
+    /// errors inside the append's transaction, which postgres aborts: without
+    /// the SAVEPOINT around the read, every later statement of the append fails
+    /// ("current transaction is aborted") and the append is lost. The append's
+    /// own head read binds `bigint = bigint` and so is untouched. A client-side
+    /// decode error (a NULL column) never aborts the server transaction and so
+    /// could not pin the savepoint.
+    ///
+    /// The setting applies to NEW sessions, so the returned store is a fresh
+    /// connection. The scratch database is dropped with its objects afterwards.
+    async fn inject_server_side_genesis_read_fault(
+        scratch: &pg_barrier::ScratchDb,
+        admin: &PostgresStore,
+    ) -> PostgresStore {
+        let db = pg_barrier::quote_ident(scratch.name());
+        let statements = [
+            "CREATE FUNCTION public.sequence_eq_7677(bigint, integer) RETURNS boolean \
+             LANGUAGE plpgsql AS $$ BEGIN \
+             IF $2 = 1 THEN RAISE EXCEPTION 'injected genesis read fault 7677'; END IF; \
+             RETURN $1 = $2::bigint; END $$"
+                .to_string(),
+            "CREATE OPERATOR public.= (LEFTARG = bigint, RIGHTARG = integer, \
+             FUNCTION = public.sequence_eq_7677)"
+                .to_string(),
+            format!("ALTER DATABASE {db} SET search_path = public, pg_catalog"),
+        ];
+        for stmt in &statements {
+            sqlx::query(stmt)
+                .execute(admin.pool())
+                .await
+                .unwrap_or_else(|e| panic!("inject genesis read fault ({stmt}): {e}"));
+        }
+        let faulted = PostgresStore::connect(&scratch.url())
+            .await
+            .expect("connect with the genesis read fault active");
+        let probe = sqlx::query(ai_memory::signed_events::GENESIS_ROW_SQL)
+            .fetch_optional(faulted.pool())
+            .await;
+        assert!(
+            probe.is_err(),
+            "the injected fault must make the genesis read fail on the server"
+        );
+        faulted
     }
 
     #[tokio::test(flavor = "multi_thread")]
