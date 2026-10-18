@@ -75,6 +75,10 @@ fn the_latch_still_refuses_on_its_own_thread_7381() {
         "{err:?}"
     );
     drop(latch);
+    assert!(
+        !audit_trail_latched(),
+        "dropping the guard clears the process latch"
+    );
     assert!(audit_trail_gate().is_ok(), "dropping the guard reopens it");
 }
 
