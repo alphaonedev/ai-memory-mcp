@@ -332,7 +332,7 @@ impl sqlx::Encode<'_, sqlx::Postgres> for Agtype {
 // ---------------------------------------------------------------------------
 // Sort helpers — both backends are free to return rows in different
 // orders (AGE has no implicit ORDER BY without `ORDER BY` in the
-// Cypher; the CTE branch sorts by depth ASC, target_id ASC). For
+// Cypher; the CTE branch sorts by depth, target_id, relation, path). For
 // equivalence the test only cares about the multiset of rows.
 // ---------------------------------------------------------------------------
 

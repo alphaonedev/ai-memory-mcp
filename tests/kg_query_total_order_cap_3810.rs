@@ -8,16 +8,27 @@
 //! cap (200) is applied AFTER that sort, so a tied group straddling the cap
 //! returned a different surviving edge per backend and per run.
 //!
-//! The fixture is one source with 200 distinct depth-1 targets, the last of
-//! which (`...-200`, the greatest id) carries TWO parallel edges
-//! (`supersedes` written first, `related_to` second): 201 rows, cap 200, the
-//! cap splits the tied group. The total key `(depth, target_id, relation,
-//! path)` keeps `related_to` (`"related_to" < "supersedes"` in byte order) on
-//! every backend, in the same order, on every run.
+//! Per backend, per the settled #3810 ruling (4d3ea1c5) and #3893:
+//! * sqlite keeps its temporal key `(depth, COALESCE(valid_from, created_at),
+//!   created_at)` and appends the tie-break `(target_id, relation, path)`;
+//! * the postgres CTE and AGE use the total key `(depth, target_id, relation,
+//!   path)` (byte order).
 //!
-//! The sqlite cell always runs. The postgres CTE and AGE cells need
-//! `AI_MEMORY_TEST_POSTGRES_URL` (and AGE for the cypher half) and skip with a
-//! message otherwise.
+//! Two fixtures, each 201 rows against the 200-row cap, so the cap splits a
+//! tied group:
+//! * parallel edges: one source with 200 distinct depth-1 targets, the last of
+//!   which (`...-200`, the greatest id) carries TWO parallel edges
+//!   (`supersedes` written first, `related_to` second). `relation` decides, and
+//!   `related_to < supersedes` in byte order keeps `related_to`;
+//! * depth-2 diamond: `src -> a -> t` and `src -> b -> t` with the SAME relation
+//!   on the last hop, so the two depth-2 rows tie on `(depth, target_id,
+//!   relation)` and only `path` decides which one the cap keeps (`...-a->t`).
+//!
+//! The sqlite cells stamp every link with one instant so the temporal key ties
+//! and the appended tie-break is what is under test; a separate sqlite cell pins
+//! that the temporal key still comes first. The sqlite cells always run. The
+//! postgres CTE and AGE cells need `AI_MEMORY_TEST_POSTGRES_URL` (and AGE for
+//! the cypher half) and skip with a message otherwise.
 
 use ai_memory::db;
 use ai_memory::models::{Memory, MemoryKind, Tier};
@@ -25,12 +36,18 @@ use ai_memory::models::{Memory, MemoryKind, Tier};
 mod common;
 
 const AGENT: &str = "ai:kg-order-3810";
-/// Distinct depth-1 targets; the last one carries the tied parallel pair.
+/// Distinct depth-1 targets of the parallel-edge fixture; the last one carries
+/// the tied parallel pair.
 const TARGETS: usize = 200;
+/// Depth-1 filler targets of the diamond fixture: with `a` and `b` that is 199
+/// depth-1 rows, so the cap keeps exactly ONE of the two depth-2 rows.
+const DIAMOND_FILLERS: usize = 197;
 /// The default `kg_query` row cap on every backend.
 const ROW_CAP: usize = 200;
 const SURVIVOR: &str = "related_to";
 const CUT: &str = "supersedes";
+/// The one instant every sqlite link is stamped with, so the temporal key ties.
+const SAME_INSTANT: &str = "2026-01-01T00:00:00Z";
 
 fn target_id(ns: &str, n: usize) -> String {
     format!("{ns}-mem-{n:03}")
@@ -59,66 +76,189 @@ fn make_memory(id: &str, namespace: &str, title: &str) -> Memory {
 /// `(depth, target_id, relation, path)` — the whole observable row identity.
 type Key = (usize, String, String, String);
 
-fn expected_keys(ns: &str) -> Vec<Key> {
+/// One fixture: memories to store, edges in insertion order, the traversal
+/// depth and the page the 200-row cap must keep.
+struct Scenario {
+    label: &'static str,
+    src: String,
+    depth: usize,
+    /// Every memory id (the source first).
+    nodes: Vec<String>,
+    /// `(from, to, relation)` in insertion order.
+    edges: Vec<(String, String, &'static str)>,
+    want: Vec<Key>,
+}
+
+/// 201 rows: 200 targets, the last with a `supersedes` AND a `related_to` edge.
+fn parallel_scenario(ns: &str) -> Scenario {
     let src = format!("{ns}-src");
-    let mut keys: Vec<Key> = (1..=TARGETS)
+    let mut nodes = vec![src.clone()];
+    nodes.extend((1..=TARGETS).map(|n| target_id(ns, n)));
+    // The cut relation is written FIRST so it has the lowest rowid and (on the
+    // un-stamped fixture) the earliest timestamps: dropping the `relation`
+    // tie-break would keep it.
+    let mut edges = vec![(src.clone(), target_id(ns, TARGETS), CUT)];
+    edges.extend((1..=TARGETS).map(|n| (src.clone(), target_id(ns, n), SURVIVOR)));
+    let want = (1..=TARGETS)
         .map(|n| {
             let t = target_id(ns, n);
             (1, t.clone(), SURVIVOR.to_string(), format!("{src}->{t}"))
         })
         .collect();
-    keys.truncate(ROW_CAP);
-    keys
+    Scenario {
+        label: "parallel edges",
+        src,
+        depth: 1,
+        nodes,
+        edges,
+        want,
+    }
 }
 
-fn assert_expected(label: &str, ns: &str, got: &[Key]) {
-    let want = expected_keys(ns);
-    assert_eq!(got.len(), ROW_CAP, "{label}: the cap must be reached");
-    let tied: Vec<&Key> = got
-        .iter()
-        .filter(|k| k.1 == target_id(ns, TARGETS))
-        .collect();
-    assert_eq!(tied.len(), 1, "{label}: the cap splits the tied pair");
-    assert_eq!(
-        tied[0].2, SURVIVOR,
-        "{label}: the surviving parallel edge must be `{SURVIVOR}`, not `{CUT}`"
-    );
-    assert_eq!(got, want.as_slice(), "{label}: full ordered page");
-}
-
-#[test]
-fn sqlite_kg_query_cap_keeps_total_order_survivor_3810() {
-    let conn = common::fresh_conn();
-    let ns = format!("kg-order-{}", uuid::Uuid::new_v4());
+/// 201 rows: 199 depth-1 rows plus the two depth-2 rows of the diamond
+/// `src -> a -> t` / `src -> b -> t` (same last-hop relation).
+fn diamond_scenario(ns: &str) -> Scenario {
     let src = format!("{ns}-src");
-    db::insert(&conn, &make_memory(&src, &ns, "src")).expect("insert src");
-    for n in 1..=TARGETS {
-        let id = target_id(&ns, n);
-        db::insert(&conn, &make_memory(&id, &ns, &format!("t{n:03}"))).expect("insert target");
+    let (a, b, t) = (format!("{ns}-a"), format!("{ns}-b"), format!("{ns}-t"));
+    let mut nodes = vec![src.clone(), a.clone(), b.clone(), t.clone()];
+    nodes.extend((1..=DIAMOND_FILLERS).map(|n| target_id(ns, n)));
+    // The `b` leg is written FIRST so, without the `path` tie-break, it has the
+    // lowest rowid and would be the survivor.
+    let mut edges = vec![
+        (b.clone(), t.clone(), SURVIVOR),
+        (a.clone(), t.clone(), SURVIVOR),
+        (src.clone(), b.clone(), SURVIVOR),
+        (src.clone(), a.clone(), SURVIVOR),
+    ];
+    edges.extend((1..=DIAMOND_FILLERS).map(|n| (src.clone(), target_id(ns, n), SURVIVOR)));
+    let mut depth_one: Vec<String> = vec![a.clone(), b];
+    depth_one.extend((1..=DIAMOND_FILLERS).map(|n| target_id(ns, n)));
+    depth_one.sort();
+    let mut want: Vec<Key> = depth_one
+        .into_iter()
+        .map(|id| (1, id.clone(), SURVIVOR.to_string(), format!("{src}->{id}")))
+        .collect();
+    want.push((
+        2,
+        t.clone(),
+        SURVIVOR.to_string(),
+        format!("{src}->{a}->{t}"),
+    ));
+    Scenario {
+        label: "depth-2 diamond",
+        src,
+        depth: 2,
+        nodes,
+        edges,
+        want,
     }
-    let last = target_id(&ns, TARGETS);
-    // The cut relation is written FIRST so its created_at/valid_from sort
-    // earlier: the pre-fix sqlite key kept it, the total key must not.
-    db::create_link(&conn, &src, &last, CUT).expect("link cut");
-    for n in 1..=TARGETS {
-        db::create_link(&conn, &src, &target_id(&ns, n), SURVIVOR).expect("link");
+}
+
+fn assert_expected(backend: &str, sc: &Scenario, got: &[Key]) {
+    let label = format!("{backend} / {}", sc.label);
+    assert_eq!(got.len(), ROW_CAP, "{label}: the cap must be reached");
+    assert_eq!(got, sc.want.as_slice(), "{label}: full ordered page");
+}
+
+fn sqlite_page(sc: &Scenario) -> Vec<Key> {
+    let conn = common::fresh_conn();
+    let ns = sc.src.trim_end_matches("-src").to_string();
+    for id in &sc.nodes {
+        db::insert(&conn, &make_memory(id, &ns, id)).expect("insert memory");
     }
+    for (from, to, rel) in &sc.edges {
+        db::create_link(&conn, from, to, rel).expect("create link");
+    }
+    // One instant for every link: the temporal key ties, so the appended
+    // `(target_id, relation, path)` tie-break decides the surviving rows.
+    conn.execute(
+        "UPDATE memory_links SET created_at = ?1, valid_from = ?1",
+        rusqlite::params![SAME_INSTANT],
+    )
+    .expect("stamp links");
     let run = || -> Vec<Key> {
-        db::kg_query(&conn, &src, 1, None, None, Some(ROW_CAP), false)
+        db::kg_query(&conn, &sc.src, sc.depth, None, None, Some(ROW_CAP), false)
             .expect("kg_query")
             .into_iter()
             .map(|r| (r.depth, r.target_id, r.relation, r.path))
             .collect()
     };
     let first = run();
-    assert_expected("sqlite", &ns, &first);
-    assert_eq!(first, run(), "sqlite: order is deterministic across runs");
+    assert_eq!(
+        first,
+        run(),
+        "sqlite / {}: order is deterministic across runs",
+        sc.label
+    );
+    first
+}
+
+#[test]
+fn sqlite_kg_query_cap_keeps_total_order_survivor_3810() {
+    let sc = parallel_scenario(&format!("kg-order-{}", uuid::Uuid::new_v4()));
+    let got = sqlite_page(&sc);
+    let tied: Vec<&Key> = got
+        .iter()
+        .filter(|k| k.1 == target_id(sc.src.trim_end_matches("-src"), TARGETS))
+        .collect();
+    assert_eq!(tied.len(), 1, "sqlite: the cap splits the tied pair");
+    assert_eq!(
+        tied[0].2, SURVIVOR,
+        "sqlite: the surviving parallel edge must be `{SURVIVOR}`, not `{CUT}`"
+    );
+    assert_expected("sqlite", &sc, &got);
+}
+
+#[test]
+fn sqlite_kg_query_cap_diamond_path_tiebreak_3810() {
+    let sc = diamond_scenario(&format!("kg-order-{}", uuid::Uuid::new_v4()));
+    let got = sqlite_page(&sc);
+    assert_expected("sqlite", &sc, &got);
+    let last = got.last().expect("a page");
+    assert!(
+        last.3.contains("-a->"),
+        "sqlite: the diamond survivor must be the `a` path, got {}",
+        last.3
+    );
+}
+
+/// F2 (review r1): the sqlite temporal key is still the PRIMARY order after
+/// the depth; the tie-break only runs behind it (#3893).
+#[test]
+fn sqlite_kg_query_temporal_key_stays_primary_3810() {
+    let conn = common::fresh_conn();
+    let ns = format!("kg-order-{}", uuid::Uuid::new_v4());
+    let src = format!("{ns}-src");
+    db::insert(&conn, &make_memory(&src, &ns, "src")).expect("insert src");
+    let ids: Vec<String> = (1..=3).map(|n| target_id(&ns, n)).collect();
+    for id in &ids {
+        db::insert(&conn, &make_memory(id, &ns, id)).expect("insert target");
+        db::create_link(&conn, &src, id, SURVIVOR).expect("create link");
+    }
+    // The greatest id carries the EARLIEST instant, so a target-id order would
+    // reverse the page.
+    for (n, id) in ids.iter().enumerate() {
+        let stamp = format!("2026-01-0{}T00:00:00Z", 3 - n);
+        conn.execute(
+            "UPDATE memory_links SET created_at = ?1, valid_from = ?1 WHERE target_id = ?2",
+            rusqlite::params![stamp, id],
+        )
+        .expect("stamp link");
+    }
+    let got: Vec<String> = db::kg_query(&conn, &src, 1, None, None, None, false)
+        .expect("kg_query")
+        .into_iter()
+        .map(|r| r.target_id)
+        .collect();
+    let want: Vec<String> = ids.iter().rev().cloned().collect();
+    assert_eq!(got, want, "sqlite: temporal key first, then the tie-break");
 }
 
 #[cfg(feature = "sal-postgres")]
 mod pg {
     use super::{
-        AGENT, CUT, Key, SURVIVOR, TARGETS, assert_expected, common, make_memory, target_id,
+        AGENT, Key, ROW_CAP, Scenario, assert_expected, common, diamond_scenario, make_memory,
+        parallel_scenario,
     };
     use ai_memory::store::postgres::PostgresStore;
     use ai_memory::store::{CallerContext, KgBackend, KgQueryRow, MemoryStore};
@@ -152,12 +292,15 @@ mod pg {
             .collect()
     }
 
-    /// Project every relational edge of `src` into AGE (one node per id, one
-    /// edge per `(target, relation)` carrying the relation as a property).
+    /// Project every relational edge into AGE (one node per id, one edge per
+    /// `(from, to, relation)` carrying the relation as a property).
+    ///
+    /// The fixture SETs `r.created_at` itself because `project_link_into_age`
+    /// never writes it (#3891, consolidated into #6057): the AGE timeline orders
+    /// on it, the `kg_query` readers do not.
     async fn project_into_age(
         url: &str,
-        src: &str,
-        edges: &[(String, &'static str)],
+        sc: &Scenario,
         valid_from: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -170,8 +313,7 @@ mod pg {
             .execute(&mut *tx)
             .await?;
         let node_sql = "SELECT * FROM cypher('memory_graph', $$ MERGE (n {id: $id}) RETURN n $$, $1) AS (n agtype)";
-        let mut ids: Vec<&str> = vec![src];
-        ids.extend(edges.iter().map(|(t, _)| t.as_str()));
+        let mut ids: Vec<&str> = sc.nodes.iter().map(String::as_str).collect();
         ids.sort_unstable();
         ids.dedup();
         for id in ids {
@@ -186,9 +328,9 @@ mod pg {
              RETURN r";
         let edge_sql =
             format!("SELECT * FROM cypher('memory_graph', $$ {cypher} $$, $1) AS (r agtype)");
-        for (dst, rel) in edges {
+        for (from, to, rel) in &sc.edges {
             let params = serde_json::json!({
-                "src": src, "dst": dst, "rel": rel, "vf": valid_from,
+                "src": from, "dst": to, "rel": rel, "vf": valid_from,
             })
             .to_string();
             sqlx::query(&edge_sql)
@@ -200,8 +342,7 @@ mod pg {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn postgres_kg_query_cap_keeps_total_order_survivor_cte_and_age_3810() {
+    async fn run_scenario(sc: &Scenario) {
         let Some(url) = common::postgres_url().or_else(common::age_url) else {
             eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
             return;
@@ -214,36 +355,26 @@ mod pg {
             }
         };
         let ctx = CallerContext::for_agent(AGENT);
-        let ns = format!("kg-order-{}", uuid::Uuid::new_v4());
-        let src = format!("{ns}-src");
-        store
-            .store(&ctx, &make_memory(&src, &ns, "src"))
-            .await
-            .expect("store src");
-        for n in 1..=TARGETS {
-            let id = target_id(&ns, n);
+        let ns = sc.src.trim_end_matches("-src").to_string();
+        for id in &sc.nodes {
             store
-                .store(&ctx, &make_memory(&id, &ns, &format!("t{n:03}")))
+                .store(&ctx, &make_memory(id, &ns, id))
                 .await
-                .expect("store target");
+                .expect("store memory");
         }
-        let last = target_id(&ns, TARGETS);
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)
             .connect(&url)
             .await
             .expect("pool");
         let valid_from = chrono::Utc::now() - chrono::Duration::seconds(1000);
-        // The cut relation first, then every survivor edge.
-        let mut edges: Vec<(String, &'static str)> = vec![(last.clone(), CUT)];
-        edges.extend((1..=TARGETS).map(|n| (target_id(&ns, n), SURVIVOR)));
-        for (dst, rel) in &edges {
+        for (from, to, rel) in &sc.edges {
             sqlx::query(
                 "INSERT INTO memory_links (source_id, target_id, relation, valid_from, observed_by) \
                  VALUES ($1, $2, $3, $4, $5)",
             )
-            .bind(&src)
-            .bind(dst)
+            .bind(from)
+            .bind(to)
             .bind(rel)
             .bind(valid_from)
             .bind(AGENT)
@@ -252,32 +383,73 @@ mod pg {
             .expect("insert link");
         }
 
-        let cte = keys(store.kg_query_cte(&src, 1).await.expect("kg_query_cte"));
-        assert_expected("postgres CTE", &ns, &cte);
-        let cte_again = keys(store.kg_query_cte(&src, 1).await.expect("kg_query_cte"));
-        assert_eq!(cte, cte_again, "postgres CTE: deterministic across runs");
+        let cte = keys(
+            store
+                .kg_query_cte(&sc.src, sc.depth)
+                .await
+                .expect("kg_query_cte"),
+        );
+        assert_expected("postgres CTE", sc, &cte);
+        let cte_again = keys(
+            store
+                .kg_query_cte(&sc.src, sc.depth)
+                .await
+                .expect("kg_query_cte"),
+        );
+        assert_eq!(
+            cte, cte_again,
+            "postgres CTE / {}: deterministic across runs",
+            sc.label
+        );
 
         if matches!(store.kg_backend(), KgBackend::Age) {
-            project_into_age(&url, &src, &edges, &valid_from.to_rfc3339())
+            project_into_age(&url, sc, &valid_from.to_rfc3339())
                 .await
                 .expect("project into AGE");
             let age = keys(
                 store
-                    .kg_query_cypher(&src, 1)
+                    .kg_query_cypher(&sc.src, sc.depth)
                     .await
                     .expect("kg_query_cypher"),
             );
-            assert_expected("AGE cypher", &ns, &age);
-            assert_eq!(age, cte, "AGE and CTE return the identical ordered page");
+            assert_expected("AGE cypher", sc, &age);
+            assert_eq!(
+                age, cte,
+                "AGE and CTE return the identical ordered page ({})",
+                sc.label
+            );
             let age_again = keys(
                 store
-                    .kg_query_cypher(&src, 1)
+                    .kg_query_cypher(&sc.src, sc.depth)
                     .await
                     .expect("kg_query_cypher"),
             );
-            assert_eq!(age, age_again, "AGE: deterministic across runs");
+            assert_eq!(
+                age, age_again,
+                "AGE / {}: deterministic across runs",
+                sc.label
+            );
         } else {
             eprintln!("note: AGE absent; checked the CTE half only");
         }
+        assert_eq!(cte.len(), ROW_CAP);
+    }
+
+    #[tokio::test]
+    async fn postgres_kg_query_cap_keeps_total_order_survivor_cte_and_age_3810() {
+        run_scenario(&parallel_scenario(&format!(
+            "kg-order-{}",
+            uuid::Uuid::new_v4()
+        )))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn postgres_kg_query_cap_diamond_path_tiebreak_cte_and_age_3810() {
+        run_scenario(&diamond_scenario(&format!(
+            "kg-order-{}",
+            uuid::Uuid::new_v4()
+        )))
+        .await;
     }
 }

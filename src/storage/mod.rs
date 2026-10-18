@@ -201,6 +201,15 @@ pub(crate) fn canonicalize_valid_until_stamp(valid_until: Option<&str>) -> Strin
     }
 }
 
+/// Canonical-on-read rule for a stored link `valid_until` (#3809): re-render a
+/// parseable stamp as the canonical `Z` form, pass an unparseable one through,
+/// and keep `None`. The STORED text is untouched, so the H2 signature bytes
+/// stay intact; only the KG reader output is normalised.
+#[must_use]
+pub(crate) fn canonical_valid_until_on_read(stored: Option<String>) -> Option<String> {
+    stored.map(|raw| canonicalize_valid_until_stamp(Some(&raw)))
+}
+
 /// Render an instant as the canonical `valid_until` wire stamp (UTC,
 /// microsecond precision, RFC3339 `Z` suffix). The single renderer shared by
 /// [`canonicalize_valid_until_stamp`] and the postgres KG read paths (#3809),
@@ -10511,7 +10520,7 @@ pub fn get_links(conn: &Connection, id: &str) -> Result<Vec<MemoryLink>> {
             // every existing caller would have to ignore.
             signature: None,
             valid_from: row.get::<_, Option<String>>(4)?,
-            valid_until: row.get::<_, Option<String>>(5)?,
+            valid_until: canonical_valid_until_on_read(row.get::<_, Option<String>>(5)?),
             observed_by: row.get::<_, Option<String>>(6)?,
             // #3171 — COALESCE to `unsigned` in the SQL above. `attest_level`
             // is nullable (`memory_links.attest_level TEXT`, no NOT NULL / no
@@ -12737,7 +12746,7 @@ pub fn kg_timeline(
             target_id: row.get(0)?,
             relation: row.get(1)?,
             valid_from: row.get(2)?,
-            valid_until: row.get(3)?,
+            valid_until: canonical_valid_until_on_read(row.get(3)?),
             observed_by: row.get(4)?,
             title: row.get(5)?,
             target_namespace: row.get(6)?,
@@ -13073,11 +13082,14 @@ pub const KG_QUERY_MAX_SUPPORTED_DEPTH: usize = 5;
 /// agent filters as the anchor — a chain only extends through links
 /// that pass every filter on every hop.
 ///
-/// Ordering is the total key `depth ASC, target_id ASC, relation ASC,
-/// path ASC` (byte order, #3810) — shallower hops first, then a
-/// deterministic order within each level, so the row cap keeps the same
-/// page on sqlite, the postgres CTE and AGE. The `depth` field reflects the
-/// actual hop count and `path` is the full `src->mid->target` chain.
+/// Ordering is `depth ASC, COALESCE(valid_from, created_at) ASC,
+/// created_at ASC` — shallower hops first, then time-ordered within each
+/// level — followed by the deterministic tie-break `target_id ASC,
+/// relation ASC, path ASC` (byte order, #3810, #3893), so a tied group
+/// straddling the row cap keeps the same survivor on every run. The
+/// postgres CTE and AGE readers use their own documented key. The `depth`
+/// field reflects the actual hop count and `path` is the full
+/// `src->mid->target` chain.
 pub fn kg_query(
     conn: &Connection,
     source_id: &str,
@@ -13218,7 +13230,10 @@ pub fn kg_query(
          FROM traversal t \
          JOIN memories m ON m.id = t.target_id \
          WHERE 1=1 {lifecycle_vis} \
-         ORDER BY t.depth ASC, t.target_id ASC, t.relation ASC, path_str ASC \
+         ORDER BY t.depth ASC, \
+                  COALESCE({valid_time_fn}(t.valid_from), {valid_time_fn}(t.link_created_at)) ASC, \
+                  t.link_created_at ASC, \
+                  t.target_id ASC, t.relation ASC, path_str ASC \
          LIMIT ?{limit_ph}",
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
         // general KG graph traversal. (The lineage-DAG walk `lineage_traverse`
@@ -13236,7 +13251,7 @@ pub fn kg_query(
             target_id,
             relation: row.get(1)?,
             valid_from: row.get(2)?,
-            valid_until: row.get(3)?,
+            valid_until: canonical_valid_until_on_read(row.get(3)?),
             observed_by: row.get(4)?,
             title: row.get(5)?,
             target_namespace: row.get(6)?,
@@ -30590,9 +30605,10 @@ mod tests {
         let events = kg_timeline(&conn, &src.id, None, None, None).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].observed_by.as_deref(), Some("agent-pm-1"));
+        // #3809 - the reader emits the canonical `Z` stamp.
         assert_eq!(
             events[0].valid_until.as_deref(),
-            Some("2026-12-31T23:59:59+00:00")
+            Some("2026-12-31T23:59:59Z")
         );
     }
 
@@ -31719,22 +31735,15 @@ mod tests {
 
         let nodes = kg_query(&conn, &src.id, 1, None, None, None, false).unwrap();
         assert_eq!(nodes.len(), 2);
-        // #3810 - the total key is (depth, target_id, relation, path): the
-        // page is ordered by target id, whatever the link timestamps say.
-        let mut ids = [n1.id.clone(), n2.id.clone()];
-        ids.sort();
-        assert_eq!(nodes[0].target_id, ids[0]);
-        assert_eq!(nodes[1].target_id, ids[1]);
-        let first = nodes
-            .iter()
-            .find(|n| n.target_id == n1.id)
-            .expect("kickoff neighbour");
-        assert_eq!(first.title, "kickoff");
-        assert_eq!(first.relation, "related_to");
-        assert_eq!(first.observed_by.as_deref(), Some("agent-1"));
-        assert_eq!(first.depth, 1);
-        assert_eq!(first.path, format!("{}->{}", src.id, n1.id));
-        assert_eq!(first.target_namespace, "kg/projects/alpha");
+        // #3893 - the sqlite temporal key (valid_from) stays the primary order.
+        assert_eq!(nodes[0].target_id, n1.id);
+        assert_eq!(nodes[1].target_id, n2.id);
+        assert_eq!(nodes[0].title, "kickoff");
+        assert_eq!(nodes[0].relation, "related_to");
+        assert_eq!(nodes[0].observed_by.as_deref(), Some("agent-1"));
+        assert_eq!(nodes[0].depth, 1);
+        assert_eq!(nodes[0].path, format!("{}->{}", src.id, n1.id));
+        assert_eq!(nodes[0].target_namespace, "kg/projects/alpha");
     }
 
     #[test]
@@ -31899,7 +31908,12 @@ mod tests {
         .unwrap();
         assert_eq!(timeline.len(), 1);
         assert_eq!(timeline[0].valid_from, signed_start);
-        assert_eq!(timeline[0].valid_until.as_deref(), Some(signed_end));
+        // #3809 - readers emit the canonical `Z` stamp; the stored signed
+        // bytes are asserted unchanged below.
+        assert_eq!(
+            timeline[0].valid_until.as_deref(),
+            Some("2026-01-01T01:00:00Z")
+        );
 
         let (stored_start, stored_end, stored_signature): (String, String, Vec<u8>) = conn
             .query_row(

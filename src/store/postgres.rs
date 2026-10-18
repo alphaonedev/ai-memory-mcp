@@ -9923,7 +9923,7 @@ impl PostgresStore {
                     // every existing caller would have to ignore.
                     signature: None,
                     valid_from: valid_from.map(|t| t.to_rfc3339()),
-                    valid_until: valid_until.map(|t| t.to_rfc3339()),
+                    valid_until: valid_until.map(crate::storage::render_valid_until_stamp),
                     observed_by,
                     attest_level: Some(attest_level),
                     source_cid: None,
@@ -11424,7 +11424,11 @@ impl PostgresStore {
                 .map_err(|e| to_store_err("read edge observed_by (#3424)", e))?;
             edges.insert(
                 (src, tgt, relation),
-                (vf.map(|t| t.to_rfc3339()), vu.map(|t| t.to_rfc3339()), ob),
+                (
+                    vf.map(|t| t.to_rfc3339()),
+                    vu.map(crate::storage::render_valid_until_stamp),
+                    ob,
+                ),
             );
         }
 
@@ -11731,10 +11735,11 @@ impl PostgresStore {
             .collect();
         decoded.retain(|r| visible.contains(&r.target_id));
         // v1.0.0 batch-2 parity — mirror the CTE branch's deterministic order
-        // and row cap so the two postgres branches (and the sqlite SSOT) return
-        // the SAME bounded page for the same traversal. Sorting BEFORE
-        // truncating is what makes the cap a stable prefix rather than an
-        // arbitrary subset: DEGRADE (fewer rows), never WRONG rows.
+        // (`depth, target_id, relation, path`, byte order, #3810) and row cap
+        // so the two postgres branches return the SAME bounded page for the
+        // same traversal. Sorting BEFORE truncating is what makes the cap a
+        // stable prefix rather than an arbitrary subset: DEGRADE (fewer rows),
+        // never WRONG rows. SQLite keeps its own temporal key (#3893).
         decoded.sort_by(|a, b| {
             a.depth
                 .cmp(&b.depth)
@@ -11755,9 +11760,11 @@ impl PostgresStore {
 
     /// Recursive-CTE fallback for `kg_query` on Postgres.
     ///
-    /// Mirrors the SQLite recursive-CTE in `db::kg_query` so deployments
-    /// running vanilla Postgres (no AGE extension) still get the same
-    /// traversal semantics. Returns the shared [`KgQueryRow`] shape —
+    /// Mirrors the traversal semantics of the SQLite recursive-CTE in
+    /// `db::kg_query` so deployments running vanilla Postgres (no AGE
+    /// extension) reach the same rows; the ORDER of the page is per backend
+    /// (here `depth, target_id, relation, path` in byte order; SQLite orders
+    /// by its temporal key first, #3893). Returns the shared [`KgQueryRow`] shape —
     /// the dispatcher in [`Self::kg_query`] doesn't have to care which
     /// branch ran.
     ///
@@ -18951,9 +18958,11 @@ const KG_QUERY_MAX_LIMIT_SAL: usize = 1000;
 /// row cap at all, so a dense graph could materialize every simple path up to
 /// depth 5 (combinatorial) into memory and onto the wire, AND returned a
 /// different result set than sqlite for an identical call. DEGRADE (fewer
-/// rows, deterministic order), never CORRUPT: both branches order by
-/// `(depth ASC, target_id ASC)` before truncating, so the capped page is a
-/// stable prefix of the full result — identical to what sqlite returns.
+/// rows, deterministic order), never CORRUPT: both postgres branches order by
+/// `(depth, target_id, relation, path)` in byte order before truncating, so
+/// the capped page is a stable prefix of the full result. SQLite truncates
+/// after its own temporal key plus the same tie-break (#3893), so the row
+/// COUNT matches and the order is per backend.
 fn kg_query_row_cap(limit: Option<usize>) -> usize {
     limit
         .unwrap_or(KG_QUERY_DEFAULT_LIMIT_SAL)
@@ -24681,7 +24690,7 @@ impl MemoryStore for PostgresStore {
                     signature: None,
                     observed_by,
                     valid_from: valid_from.map(|t| t.to_rfc3339()),
-                    valid_until: valid_until.map(|t| t.to_rfc3339()),
+                    valid_until: valid_until.map(crate::storage::render_valid_until_stamp),
                     attest_level: Some(attest_level),
                     source_cid: None,
                     target_cid: None,

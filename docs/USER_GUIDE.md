@@ -1220,8 +1220,16 @@ accumulated path matching.
 }
 ```
 
-Ordering: the total key `depth ASC, target_id ASC, relation ASC, path ASC`
-(byte order), applied before the row cap on every backend.
+Ordering, per backend, always applied before the row cap:
+
+- SQLite: `depth ASC, COALESCE(valid_from, link_created_at) ASC,
+  link_created_at ASC`, then the deterministic tie-break `target_id ASC,
+  relation ASC, path ASC` (byte order).
+- PostgreSQL (recursive CTE and AGE): the total key `depth ASC, target_id ASC,
+  relation ASC, path ASC` (byte order; `memory_links` has no link id, its
+  key is `(source_id, target_id, relation)`).
+
+`valid_until` is returned in the canonical `Z` form on every backend.
 
 ---
 
