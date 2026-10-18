@@ -1235,8 +1235,8 @@ Response:
 }
 ```
 
-Ordering: `depth ASC, COALESCE(valid_from, link_created_at) ASC,
-link_created_at ASC`.
+Ordering: the total key `depth ASC, target_id ASC, relation ASC, path ASC`
+(byte order), applied before the row cap on every backend.
 
 ### `POST /api/v1/kg/find_paths`
 

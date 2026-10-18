@@ -11739,6 +11739,8 @@ impl PostgresStore {
             a.depth
                 .cmp(&b.depth)
                 .then_with(|| a.target_id.cmp(&b.target_id))
+                .then_with(|| a.relation.cmp(&b.relation))
+                .then_with(|| a.path.cmp(&b.path))
         });
         decoded.truncate(kg_query_row_cap(None));
         // #3424 — hydrate the five display fields on the FINAL, capped set.
@@ -11825,7 +11827,10 @@ impl PostgresStore {
                    array_to_string(nodes, '->') AS path
             FROM traversal
             WHERE EXISTS (SELECT 1 FROM memories m WHERE m.id = traversal.target_id {lifecycle_vis})
-            ORDER BY depth ASC, target_id ASC
+            ORDER BY depth ASC,
+                     target_id COLLATE \"C\" ASC,
+                     relation COLLATE \"C\" ASC,
+                     array_to_string(nodes, '->') COLLATE \"C\" ASC
             LIMIT $3",
             // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
             // general KG graph traversal, matching the SQLite `kg_query`
@@ -11839,7 +11844,7 @@ impl PostgresStore {
         // v1.0.0 batch-2 parity — bound the result set exactly as the sqlite
         // SSOT does (`crate::storage::kg_query` clamps to
         // KG_QUERY_DEFAULT_LIMIT/KG_QUERY_MAX_LIMIT). Applied AFTER the
-        // deterministic `ORDER BY depth ASC, target_id ASC`, so the capped page
+        // total `ORDER BY depth, target_id, relation, path` (#3810; byte order via COLLATE "C"), so the capped page
         // is a stable prefix, never a random subset. PERF-07 — `TryFrom`,
         // never `as`.
         let row_cap = i64::try_from(kg_query_row_cap(None)).unwrap_or(i64::MAX);
@@ -12038,7 +12043,7 @@ impl PostgresStore {
                     r.valid_from AS valid_from, \
                     r.valid_until AS valid_until, \
                     r.observed_by AS observed_by \
-             ORDER BY r.valid_from ASC, r.created_at ASC \
+             ORDER BY r.valid_from ASC, r.created_at ASC, b.id ASC, r.relation ASC \
              LIMIT {cap}"
         );
 
@@ -12118,7 +12123,12 @@ impl PostgresStore {
                 // SQL NULL (absent property) and the agtype scalar `null`
                 // both collapse to `None` — the wire shape the CTE twin
                 // returns for a never-invalidated / unobserved edge.
-                valid_until: valid_until_raw.as_deref().and_then(agtype_optional_string),
+                // #3809 - canonical `Z` stamp, the byte-identical twin of the
+                // CTE render; an AGE edge written with `+00:00` converges here.
+                valid_until: valid_until_raw
+                    .as_deref()
+                    .and_then(agtype_optional_string)
+                    .map(|raw| crate::storage::canonicalize_valid_until_stamp(Some(&raw))),
                 observed_by: observed_by_raw.as_deref().and_then(agtype_optional_string),
                 // Filled in below by the `memories` join.
                 title: String::new(),
@@ -12225,7 +12235,7 @@ impl PostgresStore {
             next_placeholder += 1;
         }
         sql.push_str(&format!(
-            " ORDER BY ml.valid_from ASC, ml.created_at ASC LIMIT ${next_placeholder}"
+            " ORDER BY ml.valid_from ASC, ml.created_at ASC, ml.target_id COLLATE \"C\" ASC, ml.relation COLLATE \"C\" ASC LIMIT ${next_placeholder}"
         ));
 
         let mut q = sqlx::query(&sql).bind(source_id);
@@ -12269,7 +12279,7 @@ impl PostgresStore {
                     target_id,
                     relation,
                     valid_from: valid_from.to_rfc3339(),
-                    valid_until: valid_until.map(|t| t.to_rfc3339()),
+                    valid_until: valid_until.map(crate::storage::render_valid_until_stamp),
                     observed_by,
                     title,
                     target_namespace,

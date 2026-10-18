@@ -195,14 +195,20 @@ pub(crate) fn canonicalize_valid_until_stamp(valid_until: Option<&str>) -> Strin
         // suffix changes (#3322, 2026-08-31).
         Some(raw) => chrono::DateTime::parse_from_rfc3339(raw).map_or_else(
             |_| raw.to_string(),
-            |dt| {
-                truncate_to_microseconds(dt.with_timezone(&Utc))
-                    .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
-            },
+            |dt| render_valid_until_stamp(dt.with_timezone(&Utc)),
         ),
-        None => truncate_to_microseconds(Utc::now())
-            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+        None => render_valid_until_stamp(Utc::now()),
     }
+}
+
+/// Render an instant as the canonical `valid_until` wire stamp (UTC,
+/// microsecond precision, RFC3339 `Z` suffix). The single renderer shared by
+/// [`canonicalize_valid_until_stamp`] and the postgres KG read paths (#3809),
+/// which decode `TIMESTAMPTZ` into a `DateTime<Utc>` and must emit the same
+/// bytes sqlite and AGE emit rather than chrono's `+00:00` default.
+#[must_use]
+pub(crate) fn render_valid_until_stamp(instant: DateTime<Utc>) -> String {
+    truncate_to_microseconds(instant).to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
 }
 
 use crate::models::{
@@ -12719,7 +12725,7 @@ pub fn kg_timeline(
         binds.push(Box::new(u.to_string()));
     }
     sql.push_str(&format!(
-        " ORDER BY {valid_time_fn}(ml.valid_from) ASC, ml.created_at ASC LIMIT ?"
+        " ORDER BY {valid_time_fn}(ml.valid_from) ASC, ml.created_at ASC, ml.target_id ASC, ml.relation ASC LIMIT ?"
     ));
     sql.push_str(&(binds.len() + 1).to_string());
     binds.push(Box::new(i64::try_from(cap).unwrap_or(i64::MAX)));
@@ -13067,11 +13073,11 @@ pub const KG_QUERY_MAX_SUPPORTED_DEPTH: usize = 5;
 /// agent filters as the anchor — a chain only extends through links
 /// that pass every filter on every hop.
 ///
-/// Ordering is `depth ASC, COALESCE(valid_from, created_at) ASC,
-/// created_at ASC` — shallower hops first, then time-ordered within
-/// each level. For depth=1 callers this collapses to the original
-/// time ordering. The `depth` field reflects the actual hop count and
-/// `path` is the full `src->mid->target` chain.
+/// Ordering is the total key `depth ASC, target_id ASC, relation ASC,
+/// path ASC` (byte order, #3810) — shallower hops first, then a
+/// deterministic order within each level, so the row cap keeps the same
+/// page on sqlite, the postgres CTE and AGE. The `depth` field reflects the
+/// actual hop count and `path` is the full `src->mid->target` chain.
 pub fn kg_query(
     conn: &Connection,
     source_id: &str,
@@ -13208,13 +13214,11 @@ pub fn kg_query(
          ) \
          SELECT t.target_id, t.relation, t.valid_from, t.valid_until, \
                 t.observed_by, m.title, m.namespace, t.depth, \
-                (SELECT group_concat(value, '->') FROM json_each(t.path)) \
+                (SELECT group_concat(value, '->') FROM json_each(t.path)) AS path_str \
          FROM traversal t \
          JOIN memories m ON m.id = t.target_id \
          WHERE 1=1 {lifecycle_vis} \
-         ORDER BY t.depth ASC,
-                  COALESCE({valid_time_fn}(t.valid_from), {valid_time_fn}(t.link_created_at)) ASC, \
-                  t.link_created_at ASC \
+         ORDER BY t.depth ASC, t.target_id ASC, t.relation ASC, path_str ASC \
          LIMIT ?{limit_ph}",
         // v1.0.0 R19/A3 (#1948) — fail-closed lifecycle allow-list on the
         // general KG graph traversal. (The lineage-DAG walk `lineage_traverse`
@@ -31715,15 +31719,22 @@ mod tests {
 
         let nodes = kg_query(&conn, &src.id, 1, None, None, None, false).unwrap();
         assert_eq!(nodes.len(), 2);
-        // Ordered by COALESCE(valid_from, created_at) ASC.
-        assert_eq!(nodes[0].target_id, n1.id);
-        assert_eq!(nodes[1].target_id, n2.id);
-        assert_eq!(nodes[0].title, "kickoff");
-        assert_eq!(nodes[0].relation, "related_to");
-        assert_eq!(nodes[0].observed_by.as_deref(), Some("agent-1"));
-        assert_eq!(nodes[0].depth, 1);
-        assert_eq!(nodes[0].path, format!("{}->{}", src.id, n1.id));
-        assert_eq!(nodes[0].target_namespace, "kg/projects/alpha");
+        // #3810 - the total key is (depth, target_id, relation, path): the
+        // page is ordered by target id, whatever the link timestamps say.
+        let mut ids = [n1.id.clone(), n2.id.clone()];
+        ids.sort();
+        assert_eq!(nodes[0].target_id, ids[0]);
+        assert_eq!(nodes[1].target_id, ids[1]);
+        let first = nodes
+            .iter()
+            .find(|n| n.target_id == n1.id)
+            .expect("kickoff neighbour");
+        assert_eq!(first.title, "kickoff");
+        assert_eq!(first.relation, "related_to");
+        assert_eq!(first.observed_by.as_deref(), Some("agent-1"));
+        assert_eq!(first.depth, 1);
+        assert_eq!(first.path, format!("{}->{}", src.id, n1.id));
+        assert_eq!(first.target_namespace, "kg/projects/alpha");
     }
 
     #[test]
