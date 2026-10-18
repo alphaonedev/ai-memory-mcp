@@ -50,8 +50,9 @@ fn past_ttl() -> Duration {
 /// the margin is retried once, not asserted (#6796).
 const WITHIN_TTL_BUDGET_MS: u64 = RECORD_STOP_REFRESH_TTL_MS - TTL_SLACK_MS;
 
-/// One within-TTL attempt: connect a fresh `store_a`, let its seed clock go
-/// stale, then prime the cache with ONE write (the gate re-checks the chain and
+/// One within-TTL attempt: connect a fresh `store_a`, run one warm-up write so
+/// the cold first write (statement prepare, pool warm-up) is paid before the
+/// measured window, let its seed clock go stale, then prime the cache with ONE write (the gate re-checks the chain and
 /// CAS-advances the cache clock), engage the stop from `store_b`, and write
 /// immediately. The window is timed from just BEFORE the priming write, so the
 /// measured elapsed is an upper bound on the cache age even when `connect`
@@ -65,6 +66,12 @@ async fn within_ttl_attempt(
     id: &str,
 ) -> (PostgresStore, bool, String, u128) {
     let store_a = PostgresStore::connect(url).await.expect("connect store_a");
+    let warm_id = format!("{id}-warm");
+    store_a
+        .store(ctx, &mem("ns-3276-warm", &warm_id))
+        .await
+        .expect("warm-up write while the plane is running");
+    purge(store_b, &warm_id).await;
     tokio::time::sleep(past_ttl()).await;
     let primed_at = Instant::now();
     let prime_id = format!("{id}-prime");
