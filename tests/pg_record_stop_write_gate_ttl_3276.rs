@@ -50,11 +50,14 @@ fn past_ttl() -> Duration {
 /// the margin is retried once, not asserted (#6796).
 const WITHIN_TTL_BUDGET_MS: u64 = RECORD_STOP_REFRESH_TTL_MS - TTL_SLACK_MS;
 
-/// One within-TTL attempt: prime a fresh `store_a` (its cache clock starts at
-/// connect), engage the stop from `store_b`, then write immediately. Returns
-/// the store, whether the gate stayed out of the way, the debug form of the
-/// write result, and the milliseconds elapsed since the prime when the write
-/// was issued (#6796).
+/// One within-TTL attempt: connect a fresh `store_a`, let its seed clock go
+/// stale, then prime the cache with ONE write (the gate re-checks the chain and
+/// CAS-advances the cache clock), engage the stop from `store_b`, and write
+/// immediately. The window is timed from just BEFORE the priming write, so the
+/// measured elapsed is an upper bound on the cache age even when `connect`
+/// tail work or a host stall ran before it (#6796). Returns the store, whether
+/// the gate stayed out of the way, the debug form of the write result, and the
+/// milliseconds elapsed since the prime when the write was issued.
 async fn within_ttl_attempt(
     url: &str,
     store_b: &PostgresStore,
@@ -62,13 +65,20 @@ async fn within_ttl_attempt(
     id: &str,
 ) -> (PostgresStore, bool, String, u128) {
     let store_a = PostgresStore::connect(url).await.expect("connect store_a");
+    tokio::time::sleep(past_ttl()).await;
     let primed_at = Instant::now();
+    let prime_id = format!("{id}-prime");
+    store_a
+        .store(ctx, &mem("ns-3276-prime", &prime_id))
+        .await
+        .expect("priming write while the plane is running");
     store_b
         .record_stop(ctx, true, "ai:3276", "record-plane")
         .await
         .expect("engage record-stop from store_b");
     let elapsed_ms = primed_at.elapsed().as_millis();
     let early = store_a.store(ctx, &mem("ns-3276-early", id)).await;
+    purge(store_b, &prime_id).await;
     let not_gated = !matches!(early, Err(StoreError::Stopped { .. }));
     (store_a, not_gated, format!("{early:?}"), elapsed_ms)
 }
