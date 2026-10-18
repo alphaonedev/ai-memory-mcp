@@ -376,8 +376,20 @@ pub fn resolve_auth_level(
     // #3418 — ONE snapshot for this decision. Taking it once (rather than
     // consulting the registry twice) means a concurrent refresh cannot make
     // the emptiness check and the lookup disagree.
-    let enrolled = enrolled.snapshot();
-    if enrolled.is_empty() {
+    let map = enrolled.snapshot();
+    level_from_snapshot(&map, headers, caller)
+}
+
+/// #7707 — the level lookup against ONE already-taken snapshot. An empty map
+/// resolves to [`AuthLevel::Claimed`] (nothing is enrolled, so nothing can be
+/// key-attested); callers that need to distinguish "inert" from "claimed" use
+/// [`attested_level_snapshot`].
+fn level_from_snapshot(
+    map: &std::collections::HashMap<String, String>,
+    headers: &axum::http::HeaderMap,
+    caller: &str,
+) -> AuthLevel {
+    if map.is_empty() {
         return AuthLevel::Claimed;
     }
     let token = headers
@@ -387,10 +399,68 @@ pub fn resolve_auth_level(
         return AuthLevel::Claimed;
     };
     let hash = api_key_sha256_hex(token);
-    match enrolled.get(&hash) {
+    match map.get(&hash) {
         Some(agent_id) if agent_id == caller => AuthLevel::KeyAuthenticated,
         _ => AuthLevel::Claimed,
     }
+}
+
+/// #7707 — emptiness AND level from ONE snapshot of the enrolled map.
+///
+/// Returns `None` when no per-agent key is enrolled (the inert, keyless
+/// single-operator posture) and `Some(level)` otherwise. Because both facts
+/// come from the same `Arc` snapshot, a live refresh that enrols the first keys
+/// mid-request cannot make the emptiness check see an empty map while the level
+/// lookup sees an armed one (or the reverse): the request is decided against
+/// exactly one registry state (#3418).
+#[must_use]
+pub fn attested_level_snapshot(
+    enrolled: &EnrolledAgentKeys,
+    headers: &axum::http::HeaderMap,
+    caller: &str,
+) -> Option<AuthLevel> {
+    let map = enrolled.snapshot();
+    if map.is_empty() {
+        return None;
+    }
+    Some(level_from_snapshot(&map, headers, caller))
+}
+
+/// #7707 (HIGH, authorization) — the ONE decision both admin-admission paths
+/// ([`crate::handlers::admin_role::is_admin_caller_trusted`] and
+/// [`crate::handlers::admin_role::require_admin`]) share.
+///
+/// `true` when admin elevation may be granted on this identity:
+///
+///   * no per-agent key is enrolled (inert, keyless daemon: unchanged), or
+///   * the caller is key-attested ([`AuthLevel::is_key_bound`]).
+///
+/// `false` when keys are enrolled and the caller is only `Claimed`. This is
+/// independent of [`HttpIdentityMode`]: `advisory` keeps its WARN-only
+/// behaviour for ordinary identity decisions, but admin elevation is never
+/// granted on a self-asserted identity once the operator enrolled keys.
+#[must_use]
+pub fn admin_identity_attested(
+    enrolled: &EnrolledAgentKeys,
+    headers: &axum::http::HeaderMap,
+    caller: &str,
+) -> bool {
+    attested_level_snapshot(enrolled, headers, caller).is_none_or(AuthLevel::is_key_bound)
+}
+
+/// #7707 — the closed-vocabulary 403 for an unattested named principal. Shared
+/// by [`enforce_sensitive_identity`] (enforce) and the admin-admission refusal.
+#[must_use]
+pub fn attested_identity_required_response(endpoint: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "attested_identity_required",
+            "message": "X-Agent-Id is self-asserted; present the agent's                         enrolled per-agent api-key (X-API-Key) to act as                         this principal",
+            "endpoint": endpoint,
+        })),
+    )
+        .into_response()
 }
 
 /// #2044 — convenience wrapper: re-derive the caller's [`AuthLevel`] from the
@@ -414,10 +484,8 @@ pub fn enforce_for_request(
     caller: &str,
     endpoint: &str,
 ) -> Option<Response> {
-    if enrolled.is_empty() {
-        return None;
-    }
-    let level = resolve_auth_level(enrolled, headers, caller);
+    // #7707 — emptiness and level from ONE snapshot.
+    let level = attested_level_snapshot(enrolled, headers, caller)?;
     enforce_sensitive_identity(mode, level, caller, endpoint)
 }
 
@@ -543,19 +611,7 @@ pub fn enforce_sensitive_identity(
                 caller,
                 "#2044 enforce: refused unattested named principal {caller:?} on {endpoint}"
             );
-            Some(
-                (
-                    StatusCode::FORBIDDEN,
-                    Json(json!({
-                        "error": "attested_identity_required",
-                        "message": "X-Agent-Id is self-asserted; present the agent's \
-                                    enrolled per-agent api-key (X-API-Key) to act as \
-                                    this principal",
-                        "endpoint": endpoint,
-                    })),
-                )
-                    .into_response(),
-            )
+            Some(attested_identity_required_response(endpoint))
         }
     }
 }
@@ -581,6 +637,76 @@ mod tests {
         assert!(!AuthLevel::Claimed.is_key_bound());
         assert!(AuthLevel::KeyAuthenticated.is_key_bound());
         assert!(AuthLevel::SignatureAttested.is_key_bound());
+    }
+
+    fn headers_with(api_key: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(crate::HEADER_API_KEY, api_key.parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn attested_level_snapshot_reads_emptiness_and_level_from_one_map() {
+        // #7707 (f): empty map is inert (None), never `Some(Claimed)`.
+        let empty = EnrolledAgentKeys::empty();
+        assert_eq!(
+            attested_level_snapshot(&empty, &headers_with("k"), "root"),
+            None
+        );
+        assert!(admin_identity_attested(&empty, &headers_with("k"), "root"));
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(api_key_sha256_hex("root-key"), "root".to_string());
+        let armed = EnrolledAgentKeys::from_map(map);
+        // Bound key for this caller -> key-authenticated.
+        assert_eq!(
+            attested_level_snapshot(&armed, &headers_with("root-key"), "root"),
+            Some(AuthLevel::KeyAuthenticated)
+        );
+        // Shared / unknown key, or another principal's key -> claimed, not attested.
+        assert_eq!(
+            attested_level_snapshot(&armed, &headers_with("shared"), "root"),
+            Some(AuthLevel::Claimed)
+        );
+        assert_eq!(
+            attested_level_snapshot(&armed, &headers_with("root-key"), "other"),
+            Some(AuthLevel::Claimed)
+        );
+        assert_eq!(
+            attested_level_snapshot(&armed, &axum::http::HeaderMap::new(), "root"),
+            Some(AuthLevel::Claimed)
+        );
+        assert!(admin_identity_attested(
+            &armed,
+            &headers_with("root-key"),
+            "root"
+        ));
+        assert!(!admin_identity_attested(
+            &armed,
+            &headers_with("shared"),
+            "root"
+        ));
+    }
+
+    #[test]
+    fn enforce_for_request_follows_the_single_snapshot_decision() {
+        // #7707: empty -> inert in every mode; armed + claimed -> mode decides.
+        let empty = EnrolledAgentKeys::empty();
+        let h = headers_with("shared");
+        for mode in [
+            HttpIdentityMode::Off,
+            HttpIdentityMode::Advisory,
+            HttpIdentityMode::Enforce,
+        ] {
+            assert!(enforce_for_request(&empty, mode, &h, "root", "ep").is_none());
+        }
+        let mut map = std::collections::HashMap::new();
+        map.insert(api_key_sha256_hex("root-key"), "root".to_string());
+        let armed = EnrolledAgentKeys::from_map(map);
+        assert!(
+            enforce_for_request(&armed, HttpIdentityMode::Advisory, &h, "root", "ep").is_none()
+        );
+        assert!(enforce_for_request(&armed, HttpIdentityMode::Enforce, &h, "root", "ep").is_some());
     }
 
     #[test]

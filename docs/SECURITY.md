@@ -582,6 +582,17 @@ Two related hardening knobs:
   `/pending`, `/taxonomy`) via the authn-gated `is_admin_caller_trusted`
   predicate (#1582), so a self-asserted admin header on a keyless
   deployment cannot read other tenants' private rows.
+- Admin elevation under `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY` (#7707) —
+  the `advisory` default (and `off`) keep ordinary identity decisions
+  WARN-only, but admin elevation fails closed as soon as any per-agent key
+  is enrolled: `is_admin_caller_trusted` and `require_admin` admit an
+  allowlisted admin id only when the request presents that admin's own
+  enrolled key, and a shared-key `Claimed` admin is refused with
+  `403 attested_identity_required`. A keyless daemon is unchanged. Bind
+  the admin's key with `ai-memory agents bind-api-key --agent-id <admin>
+  --token <t>` (live, no restart); boot WARNs for every admin id that has
+  no enrolled key and refuses to start under the certified / asi-hard
+  posture.
 
 ### Webhooks (SSRF-hardened)
 
