@@ -341,11 +341,56 @@ fn sqlite_kg_timeline_byte_order_tiebreak_under_cap_3810() {
     );
 }
 
+/// F12 (review r3): links tied on `valid_from` whose `created_at` runs in
+/// REVERSE byte order of `target_id`. The twins order by `created_at`, so the
+/// cap of 2 keeps `c` (oldest) then `b`; ordering by `target_id` alone would
+/// keep `a`, `b`.
+const CREATED_TIE_SUFFIXES: [&str; 3] = ["a", "b", "c"];
+const CREATED_TIE_CAP: usize = 2;
+/// Seconds past the base instant at which each `CREATED_TIE_SUFFIXES` link was
+/// created: `a` newest, `c` oldest.
+const CREATED_TIE_OFFSETS_SECS: [i64; 3] = [30, 20, 10];
+
+fn created_tie_want(ns: &str) -> Vec<String> {
+    ["c", "b"].iter().map(|s| format!("{ns}-{s}")).collect()
+}
+
+#[test]
+fn sqlite_kg_timeline_created_at_tiebreak_under_cap_3810() {
+    let conn = common::fresh_conn();
+    let ns = format!("kg-order-{}", uuid::Uuid::new_v4());
+    let src = format!("{ns}-src");
+    db::insert(&conn, &make_memory(&src, &ns, "src")).expect("insert src");
+    let base = chrono::DateTime::parse_from_rfc3339(SAME_INSTANT).expect("base instant");
+    for (s, off) in CREATED_TIE_SUFFIXES.iter().zip(CREATED_TIE_OFFSETS_SECS) {
+        let id = format!("{ns}-{s}");
+        db::insert(&conn, &make_memory(&id, &ns, &id)).expect("insert target");
+        db::create_link(&conn, &src, &id, SURVIVOR).expect("create link");
+        let created = (base + chrono::Duration::seconds(off)).to_rfc3339();
+        conn.execute(
+            "UPDATE memory_links SET created_at = ?1, valid_from = ?2 WHERE target_id = ?3",
+            rusqlite::params![created, SAME_INSTANT, id],
+        )
+        .expect("stamp link");
+    }
+    let got: Vec<String> = db::kg_timeline(&conn, &src, None, None, Some(CREATED_TIE_CAP))
+        .expect("kg_timeline")
+        .into_iter()
+        .map(|r| r.target_id)
+        .collect();
+    assert_eq!(
+        got,
+        created_tie_want(&ns),
+        "sqlite kg_timeline: created_at breaks the valid_from tie, cap after"
+    );
+}
+
 #[cfg(feature = "sal-postgres")]
 mod pg {
     use super::{
-        AGENT, Key, ROW_CAP, Scenario, TIE_SUFFIXES, TIMELINE_CAP, assert_expected,
-        byte_order_timeline_want, common, diamond_scenario, make_memory, parallel_scenario,
+        AGENT, CREATED_TIE_CAP, CREATED_TIE_OFFSETS_SECS, CREATED_TIE_SUFFIXES, Key, ROW_CAP,
+        Scenario, TIE_SUFFIXES, TIMELINE_CAP, assert_expected, byte_order_timeline_want, common,
+        created_tie_want, diamond_scenario, make_memory, parallel_scenario,
         relation_beats_path_scenario,
     };
     use ai_memory::store::postgres::PostgresStore;
@@ -383,9 +428,10 @@ mod pg {
     /// Project every relational edge into AGE (one node per id, one edge per
     /// `(from, to, relation)` carrying the relation as a property).
     ///
-    /// The fixture SETs `r.created_at` itself because `project_link_into_age`
-    /// never writes it (#3891, consolidated into #6057): the AGE timeline orders
-    /// on it, the `kg_query` readers do not.
+    /// The edge carries ONLY what `project_link_into_age` writes (`relation`,
+    /// `valid_from`, `observed_by`): it never SETs `r.created_at` (the AGE
+    /// timeline joins the relational `created_at` instead, review r3 F12), so
+    /// no fixture can mask a reader that trusts an AGE `created_at`.
     async fn project_into_age(
         url: &str,
         sc: &Scenario,
@@ -412,7 +458,7 @@ mod pg {
         }
         let cypher = "MATCH (a {id: $src}), (b {id: $dst}) \
              MERGE (a)-[r:related_to {relation: $rel}]->(b) \
-             SET r.valid_from = $vf, r.observed_by = 'ai:kg-order-3810', r.created_at = $vf \
+             SET r.valid_from = $vf, r.observed_by = 'ai:kg-order-3810' \
              RETURN r";
         let edge_sql =
             format!("SELECT * FROM cypher('memory_graph', $$ {cypher} $$, $1) AS (r agtype)");
@@ -630,6 +676,101 @@ mod pg {
                 .collect();
             assert_eq!(age, want, "AGE kg_timeline: byte order, then cap");
             assert_eq!(age, cte, "AGE and CTE return the identical page");
+        } else {
+            eprintln!("note: AGE absent; checked the CTE half only");
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_kg_timeline_created_at_tiebreak_under_cap_cte_and_age_3810() {
+        let Some(url) = common::postgres_url().or_else(common::age_url) else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let store = match PostgresStore::connect(&url).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skip: PostgresStore::connect failed: {e}");
+                return;
+            }
+        };
+        let ctx = CallerContext::for_agent(AGENT);
+        let ns = format!("kg-order-{}", uuid::Uuid::new_v4());
+        let src = format!("{ns}-src");
+        let mut ids = vec![src.clone()];
+        ids.extend(CREATED_TIE_SUFFIXES.iter().map(|s| format!("{ns}-{s}")));
+        for id in &ids {
+            store
+                .store(&ctx, &make_memory(id, &ns, id))
+                .await
+                .expect("store memory");
+        }
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("pool");
+        let instant = chrono::Utc::now() - chrono::Duration::seconds(1000);
+        for (id, off) in ids.iter().skip(1).zip(CREATED_TIE_OFFSETS_SECS) {
+            sqlx::query(
+                "INSERT INTO memory_links (source_id, target_id, relation, valid_from, \
+                 created_at, observed_by) VALUES ($1, $2, 'related_to', $3, $4, $5)",
+            )
+            .bind(&src)
+            .bind(id)
+            .bind(instant)
+            .bind(instant + chrono::Duration::seconds(off))
+            .bind(AGENT)
+            .execute(&pool)
+            .await
+            .expect("insert link");
+        }
+        let want = created_tie_want(&ns);
+
+        let cte: Vec<String> = store
+            .kg_timeline_cte(&src, None, None, Some(CREATED_TIE_CAP))
+            .await
+            .expect("kg_timeline_cte")
+            .into_iter()
+            .map(|r| r.target_id)
+            .collect();
+        assert_eq!(cte, want, "postgres CTE kg_timeline: created_at tie, cap");
+
+        if matches!(store.kg_backend(), KgBackend::Age) {
+            let sc = Scenario {
+                label: "timeline-created-at",
+                src: src.clone(),
+                nodes: ids.clone(),
+                edges: ids
+                    .iter()
+                    .skip(1)
+                    .map(|t| (src.clone(), t.clone(), "related_to"))
+                    .collect(),
+                depth: 1,
+                want: Vec::new(),
+            };
+            project_into_age(&url, &sc, &instant.to_rfc3339())
+                .await
+                .expect("project into AGE");
+            let age: Vec<String> = store
+                .kg_timeline_cypher(&src, None, None, Some(CREATED_TIE_CAP))
+                .await
+                .expect("kg_timeline_cypher")
+                .into_iter()
+                .map(|r| r.target_id)
+                .collect();
+            assert_eq!(
+                age, want,
+                "AGE kg_timeline: created_at breaks the valid_from tie, cap after"
+            );
+            assert_eq!(age, cte, "AGE and CTE return the identical page");
+            // F11: a source holding cap + 1 edges yields at most cap rows;
+            // the bound itself is the outer SQL LIMIT bind (the Rust truncate
+            // is redundant), which the row count alone cannot show.
+            assert!(
+                age.len() <= CREATED_TIE_CAP,
+                "AGE fetch bounded by the cap: {age:?}"
+            );
         } else {
             eprintln!("note: AGE absent; checked the CTE half only");
         }

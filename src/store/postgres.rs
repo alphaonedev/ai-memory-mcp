@@ -12045,19 +12045,33 @@ impl PostgresStore {
         let cypher = format!(
             "MATCH (a)-[r]->(b) \
              WHERE {where_sql} \
-             RETURN b.id AS target_id, \
+             RETURN a.id AS source_id, \
+                    b.id AS target_id, \
                     r.relation AS relation, \
                     r.valid_from AS valid_from, \
                     r.valid_until AS valid_until, \
-                    r.observed_by AS observed_by, \
-                    r.created_at AS created_at"
+                    r.observed_by AS observed_by"
         );
         // #3810 F8 - no ORDER BY / LIMIT inside cypher: AGE sorts agtype
         // strings by the database locale, the CTE twin and sqlite sort by
-        // bytes, so a cypher-side sort + LIMIT picks different survivors for
-        // ids differing in case or punctuation. The rows of ONE source are
-        // fetched whole (the same fetch-then-sort shape as `kg_query_cypher`),
-        // sorted below in byte order, and only then capped.
+        // bytes. #3810 F11 - the fetch is still bounded: the outer SQL below
+        // orders on the CTE twin's key (`valid_from` instant, the relational
+        // `created_at`, then `target_id` / `relation` `COLLATE "C"`) and
+        // applies `LIMIT cap`, so at most `cap` rows leave the query layer and
+        // the survivors are the twin's. The Rust sort after it only fixes the
+        // final order. decision: outer SQL ORDER BY ... COLLATE "C" LIMIT over
+        // an unbounded fetch because kg_query at the :11743 sort fetches whole
+        // (a traversal) and has no cap to push down, while the CTE twin at
+        // kg_timeline_cte already orders and caps in SQL.
+        // #3810 F12 - AGE edges carry no `created_at` (project_link_into_age
+        // SETs only valid_from / valid_until), so the tie-break stamp is joined
+        // from `memory_links` on (source, target, relation), the primary key
+        // the CTE twin reads it from. decision: memory_links join over a new
+        // AGE edge property because that keeps the stored graph shape
+        // unchanged and project_link_into_age projects no other column.
+        // Bound caveat: ids / relations are compared in agtype text form, so an
+        // id holding a quote or backslash orders by its escaped spelling in the
+        // pre-cap fetch (uuid-shaped ids never do).
 
         // #2511 — bind the params dict as a bare `agtype`-typed `$1`
         // Param (see [`Agtype`]); the pre-#2511 inlined
@@ -12071,11 +12085,22 @@ impl PostgresStore {
             pairs.push(("until", u));
         }
         let params = age_params_jsonb(&pairs);
+        let cap_i64 = i64::try_from(cap).unwrap_or(i64::MAX);
         let sql = format!(
-            "SELECT target_id, relation, valid_from, valid_until, observed_by, created_at \
+            "SELECT c.target_id, c.relation, c.valid_from, c.valid_until, c.observed_by, \
+                    ml.created_at AS link_created_at \
              FROM cypher('memory_graph', $$ {cypher} $$, $1) AS \
-             (target_id agtype, relation agtype, valid_from agtype, \
-              valid_until agtype, observed_by agtype, created_at agtype)"
+             c(source_id agtype, target_id agtype, relation agtype, valid_from agtype, \
+               valid_until agtype, observed_by agtype) \
+             LEFT JOIN memory_links ml \
+               ON ml.source_id = btrim(c.source_id::text, '\"') \
+              AND ml.target_id = btrim(c.target_id::text, '\"') \
+              AND ml.relation = btrim(c.relation::text, '\"') \
+             ORDER BY btrim(c.valid_from::text, '\"')::timestamptz ASC, \
+                      ml.created_at ASC, \
+                      btrim(c.target_id::text, '\"') COLLATE \"C\" ASC, \
+                      btrim(c.relation::text, '\"') COLLATE \"C\" ASC \
+             LIMIT $2"
         );
 
         // #1482 — per-call-unique cypher text (since/until predicate +
@@ -12083,6 +12108,7 @@ impl PostgresStore {
         // cache and evicts reusable hot statements.
         let rows = sqlx::query(&sql)
             .bind(Agtype(params))
+            .bind(cap_i64)
             .persistent(false)
             .fetch_all(&mut *tx)
             .await
@@ -12116,7 +12142,9 @@ impl PostgresStore {
                 age_cell_text_required(r, field_names::VALID_FROM, READ_VALID_FROM)?;
             let valid_until_raw = age_cell_text_opt(r, field_names::VALID_UNTIL, READ_VALID_UNTIL)?;
             let observed_by_raw = age_cell_text_opt(r, field_names::OBSERVED_BY, READ_OBSERVED_BY)?;
-            let created_at_raw = age_cell_text_opt(r, field_names::CREATED_AT, READ_CREATED_AT)?;
+            let link_created_at: Option<DateTime<Utc>> = r
+                .try_get::<Option<DateTime<Utc>>, _>("link_created_at")
+                .map_err(|e| to_store_err(READ_CREATED_AT, e))?;
 
             let relation = strip_agtype_quotes(&relation_raw).to_string();
             // #2792 sibling — fail-CLOSED membership guard: the untyped
@@ -12130,10 +12158,13 @@ impl PostgresStore {
             }
 
             let valid_from = strip_agtype_quotes(&valid_from_raw).to_string();
-            let created_at = created_at_raw.as_deref().and_then(agtype_optional_string);
             let key = TimelineSortKey {
-                valid_from: timeline_stamp_key(Some(&valid_from)),
-                created_at: timeline_stamp_key(created_at.as_deref()),
+                valid_from: timeline_stamp_key(
+                    DateTime::parse_from_rfc3339(&valid_from)
+                        .ok()
+                        .map(|t| t.with_timezone(&Utc)),
+                ),
+                created_at: timeline_stamp_key(link_created_at),
                 target_id: strip_agtype_quotes(&target_id_raw).to_string(),
                 relation: relation.clone(),
             };
@@ -12160,12 +12191,11 @@ impl PostgresStore {
             ));
         }
 
-        // #3810 F8 - byte-order total key (`valid_from`, `created_at`, then
-        // `target_id`, `relation` via `String::cmp`), THEN the cap: the same
-        // order and survivors as the CTE twin (`COLLATE "C"`) and sqlite
-        // (BINARY). decision: Rust byte-order sort then cap over a cypher
-        // COLLATE wrap because kg_query at the :11743 sort is the in-file
-        // precedent.
+        // #3810 F8 - final byte-order total key (`valid_from`, relational
+        // `created_at`, then `target_id`, `relation` via `String::cmp`). The
+        // SQL above already chose the survivors on the same key as the CTE
+        // twin (`COLLATE "C"`) and sqlite (BINARY); this sort fixes the order
+        // and the truncate is a belt-and-braces cap.
         keyed.sort_by(|a, b| a.0.cmp(&b.0));
         keyed.truncate(cap);
         let mut decoded: Vec<KgTimelineRow> = keyed.into_iter().map(|(_, row)| row).collect();
@@ -19033,34 +19063,30 @@ const LIST_ARCHIVED_SURFACE: &str = "list_archived";
 /// passes `limit == 0` (also the conversion fallback on the same path).
 const RECALL_FALLBACK_LIMIT_I64: i64 = 10;
 
+/// #3810 F8 - total sort key of one AGE timeline row. Derived `Ord` compares
+/// the fields in declaration order; the strings use byte order, matching the
+/// CTE twin (`COLLATE "C"`) and sqlite (BINARY), never the database locale.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct TimelineSortKey {
+    valid_from: (bool, Option<DateTime<Utc>>),
+    created_at: (bool, Option<DateTime<Utc>>),
+    target_id: String,
+    relation: String,
+}
+
+/// One instant of a [`TimelineSortKey`]: an absent one sorts last (the CTE's
+/// default `NULLS LAST`). Two spellings of one instant compare equal, exactly
+/// as the CTE twin compares `TIMESTAMPTZ` values, so no raw-bytes sub-key.
+fn timeline_stamp_key(instant: Option<DateTime<Utc>>) -> (bool, Option<DateTime<Utc>>) {
+    (instant.is_none(), instant)
+}
+
 /// Apply the published timeline page-size policy: default to
 /// [`KG_TIMELINE_DEFAULT_LIMIT_SAL`] when the caller didn't pass a
 /// limit, then clamp to the `[1, KG_TIMELINE_MAX_LIMIT_SAL]` band so a
 /// crafted call cannot exhaust the connection pool with one giant
 /// fetch. Pulled into a free function so both backend branches share
 /// the same clamping contract.
-/// #3810 F8 - total sort key of one AGE timeline row. Derived `Ord` compares
-/// the fields in declaration order; the strings use byte order, matching the
-/// CTE twin (`COLLATE "C"`) and sqlite (BINARY), never the database locale.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct TimelineSortKey {
-    valid_from: (bool, Option<DateTime<Utc>>, String),
-    created_at: (bool, Option<DateTime<Utc>>, String),
-    target_id: String,
-    relation: String,
-}
-
-/// One stamp of a [`TimelineSortKey`]: an absent stamp sorts last (the CTE's
-/// default `NULLS LAST`), a parseable one by instant, then by raw bytes.
-fn timeline_stamp_key(raw: Option<&str>) -> (bool, Option<DateTime<Utc>>, String) {
-    raw.map_or((true, None, String::new()), |s| {
-        let instant = DateTime::parse_from_rfc3339(s)
-            .ok()
-            .map(|t| t.with_timezone(&Utc));
-        (false, instant, s.to_string())
-    })
-}
-
 fn clamp_timeline_limit(limit: Option<usize>) -> usize {
     limit
         .unwrap_or(KG_TIMELINE_DEFAULT_LIMIT_SAL)

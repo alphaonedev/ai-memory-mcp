@@ -383,4 +383,88 @@ mod pg {
             "#2793: non-owner's refused POST must leave the edge valid"
         );
     }
+
+    /// The stamp the first invalidation writes; the second reads it back.
+    const PRIOR: &str = "2099-01-01T00:00:00Z";
+
+    /// F13 (review r3): the wire field `previous_valid_until` is the canonical
+    /// `Z` stamp on the CTE path and byte-identical to the AGE value for the
+    /// same invalidation (a `to_rfc3339()` render would end `+00:00`).
+    #[tokio::test]
+    async fn pg_previous_valid_until_canonical_and_age_equal_2793() {
+        let Some(url) = pg_url() else {
+            eprintln!("skip: AI_MEMORY_TEST_POSTGRES_URL not set");
+            return;
+        };
+        let ns = uniq("kg2793c");
+        let src = uuid::Uuid::new_v4().to_string();
+        let tgt = uuid::Uuid::new_v4().to_string();
+        let store = PostgresStore::connect(&url).await.expect("connect");
+        let ctx = admin_ctx();
+        store
+            .store(&ctx, &owned_memory(&src, "alice", &ns))
+            .await
+            .expect("src");
+        store
+            .store(&ctx, &owned_memory(&tgt, "alice", &ns))
+            .await
+            .expect("tgt");
+        store.link(&ctx, &link(&src, &tgt)).await.expect("link");
+
+        // The first invalidation writes the PRIOR stamp through the engine's
+        // own writer (the graph on AGE, the relational row otherwise), so the
+        // second one reads it back as `previous_valid_until`.
+        let on_age = matches!(store.kg_backend(), ai_memory::store::KgBackend::Age);
+        if on_age {
+            store
+                .kg_invalidate_cypher(&src, &tgt, REL, Some(PRIOR), None)
+                .await
+                .expect("first kg_invalidate_cypher");
+        } else {
+            store
+                .kg_invalidate_cte(&src, &tgt, REL, Some(PRIOR), None)
+                .await
+                .expect("first kg_invalidate_cte");
+        }
+        let mut age_prior: Option<String> = None;
+        if on_age {
+            let row = store
+                .kg_invalidate_cypher(&src, &tgt, REL, Some("2099-02-01T00:00:00Z"), None)
+                .await
+                .expect("kg_invalidate_cypher");
+            age_prior = row.previous_valid_until;
+            // Put the relational mirror back on the prior stamp so the CTE
+            // reads the same prior the graph did.
+            let pool = sqlx::PgPool::connect(&url).await.expect("pool");
+            let first = chrono::DateTime::parse_from_rfc3339(PRIOR)
+                .expect("prior stamp")
+                .with_timezone(&chrono::Utc);
+            sqlx::query(
+                "UPDATE memory_links SET valid_until = $1 \
+                 WHERE source_id = $2 AND target_id = $3 AND relation = $4",
+            )
+            .bind(first)
+            .bind(&src)
+            .bind(&tgt)
+            .bind(REL)
+            .execute(&pool)
+            .await
+            .expect("restore relational valid_until");
+        }
+        let cte = store
+            .kg_invalidate_cte(&src, &tgt, REL, Some("2099-03-01T00:00:00Z"), None)
+            .await
+            .expect("kg_invalidate_cte");
+        let cte_prior = cte.previous_valid_until.expect("CTE previous_valid_until");
+        assert!(
+            cte_prior.ends_with('Z'),
+            "#2793 F13: CTE previous_valid_until must be the canonical Z stamp, got {cte_prior}"
+        );
+        if let Some(age) = age_prior {
+            assert_eq!(
+                age, cte_prior,
+                "#2793 F13: AGE and CTE previous_valid_until must be byte-identical"
+            );
+        }
+    }
 }
