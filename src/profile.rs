@@ -1361,8 +1361,9 @@ mod tests {
                 if let Ok(n) = num.parse::<usize>()
                     && !allowed.contains(&n)
                 {
+                    let profile = if next == "at" { &after } else { &next };
                     stale.push(format!(
-                        "src/profile.rs:{}: `{n}` tied to `{next}`",
+                        "src/profile.rs:{}: `{n}` tied to `{profile}`",
                         idx + 1
                     ));
                 }
