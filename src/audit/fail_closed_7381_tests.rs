@@ -32,12 +32,11 @@ fn memory(title: &str) -> crate::models::Memory {
 }
 
 /// An unlocked write on its own thread: the shape of the 52 inventoried tests.
-fn unlocked_store_on_other_thread() -> Result<(), String> {
+fn unlocked_store_on_other_thread() -> anyhow::Result<()> {
     std::thread::spawn(|| {
-        audit_trail_gate().map_err(|e| e.reason)?;
-        let conn = crate::storage::open(std::path::Path::new(":memory:"))
-            .map_err(|e| format!("open: {e}"))?;
-        crate::storage::insert(&conn, &memory("unlocked-writer")).map_err(|e| e.to_string())?;
+        audit_trail_gate().map_err(|e| anyhow::anyhow!(e.reason))?;
+        let conn = crate::storage::open(std::path::Path::new(":memory:"))?;
+        crate::storage::insert(&conn, &memory("unlocked-writer"))?;
         Ok(())
     })
     .join()
@@ -98,13 +97,28 @@ impl std::io::Write for Failing {
     }
 }
 
+/// Panic-safe cleanup for cell C: a failed assertion must not leave the forced
+/// mode, the latch or the failing sink behind for later tests.
+struct Cleanup;
+
+impl Drop for Cleanup {
+    fn drop(&mut self) {
+        shutdown_for_test();
+        force_on_for_test(false);
+    }
+}
+
 /// Cell C - the production latch path (a real failed append through
 /// `note_failure_for_latch`, not the `latch_for_test` shortcut) still refuses
 /// the thread that turned the mode on, while an unlocked thread is untouched.
+/// "Other threads are spared" is the `cfg(test)` scope only: production refuses
+/// every thread, pinned by `the_production_decision_refuses_every_thread_7381`
+/// in `fail_closed.rs`.
 #[test]
 fn a_real_failed_append_latches_the_owner_and_spares_other_threads_7381() {
     let _g = sink_test_lock();
     force_on_for_test(true);
+    let _cleanup = Cleanup;
     let fail = Arc::new(AtomicBool::new(false));
     init_for_test_with_writer(Box::new(Failing {
         fail: Arc::clone(&fail),
@@ -119,6 +133,4 @@ fn a_real_failed_append_latches_the_owner_and_spares_other_threads_7381() {
     assert!(audit_trail_latched(), "the failed append latched");
     assert!(audit_trail_gate().is_err(), "the owner thread is refused");
     unlocked_store_on_other_thread().expect("another thread is not refused");
-    shutdown_for_test();
-    force_on_for_test(false);
 }
