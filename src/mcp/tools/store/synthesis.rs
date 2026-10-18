@@ -545,8 +545,13 @@ pub(super) fn apply_synthesis_updates_and_deletes(
                     // link may have escalated to a ROLLBACK of it (#7660), so
                     // stop here: continuing would autocommit later writes.
                     // Dropping `write_txn` rolls the merge back as a unit.
+                    tracing::error!(
+                        target: "synthesis",
+                        "synthesis supersedes link emit failed for {provenance_id} -> {}: {e:#}",
+                        target.id,
+                    );
                     return Err(format!(
-                        "synthesis supersedes link emit failed for {provenance_id} -> {}, merge rolled back: {e:#}",
+                        "synthesis supersedes link emit failed for {provenance_id} -> {}, merge rolled back",
                         target.id,
                     ));
                 }
@@ -810,9 +815,13 @@ mod tests {
         let result = apply_synthesis_updates_and_deletes(
             &conn, &incoming, &existing, None, None, &outcome, None, None,
         );
+        let msg = result
+            .as_ref()
+            .expect_err("#7742: a failed link must fail the merge");
+        assert!(msg.contains("merge rolled back"), "{msg}");
         assert!(
-            result.is_err(),
-            "#7742: a failed link must fail the merge: {result:?}"
+            !msg.contains("x7742 injected audit fault"),
+            "#7749: db text leaked to the caller: {msg}"
         );
         assert!(content_of(&conn, &c).is_some(), "#7742: candidate deleted");
         assert_eq!(content_of(&conn, &p).as_deref(), Some("original p"));
