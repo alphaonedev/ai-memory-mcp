@@ -71,6 +71,10 @@ use std::path::Path;
 use assert_cmd::Command;
 use tempfile::TempDir;
 
+// #7232 - the shared keystore sandbox: every CLI child below is pinned to it.
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 /// Exit code for "artifact written / rows applied, but INCOMPLETE" —
 /// deliberately distinct from 1 so an orchestrator can branch on it.
 const EXIT_INCOMPLETE: i32 = 3;
@@ -96,6 +100,9 @@ fn ai_memory(db: &Path) -> Command {
     cmd.env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0")
         .env("AI_MEMORY_AUDIT_DIR", sink_dir(db))
+        // #7232 - pin the keystore too: without it every ledger-writing call
+        // loads (or GENERATES) the invoking user's real host signing key.
+        .env("AI_MEMORY_KEY_DIR", key_dir_sandbox::pin())
         .args(["--db", db.to_str().expect("utf-8 db path")]);
     cmd
 }
@@ -360,14 +367,90 @@ fn plant_watermark(db: &Path, head_sequence: i64, db_id: Option<&str>) {
         .expect("write the planted watermark");
 }
 
-/// Count the live memory rows in `db` (0 when the file was never created).
+/// Count the live memory rows in `db` (0 only when the file was never created).
+///
+/// #7229 - a failed count query PANICS with the query error. It used to be
+/// mapped to 0, so a wrong path, a locked database or a missing table read as
+/// "no row was applied" and the all-or-nothing assertions passed vacuously.
 fn memory_rows(db: &Path) -> i64 {
     if !db.exists() {
         return 0;
     }
-    let conn = rusqlite::Connection::open(db).expect("open destination db");
+    let conn = rusqlite::Connection::open(db)
+        .unwrap_or_else(|e| panic!("#7229 memory_rows: open {}: {e}", db.display()));
     conn.query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
-        .unwrap_or(0)
+        .unwrap_or_else(|e| panic!("#7229 memory_rows: count query on {}: {e}", db.display()))
+}
+
+/// #7229 - `memory_rows` on a path that exists but is not a readable database
+/// must panic with the query error instead of returning 0.
+#[test]
+#[should_panic(expected = "#7229 memory_rows")]
+fn memory_rows_panics_on_an_unreadable_database_7229() {
+    let tmp = TempDir::new().expect("tempdir");
+    // A directory exists, so the never-created shortcut does not apply, yet it
+    // cannot be read as a SQLite database.
+    let _ = memory_rows(tmp.path());
+}
+
+/// #7232 - a ledger-writing CLI call must use the pinned sandbox key dir and
+/// leave NO key material under the caller's HOME.
+#[test]
+fn cli_children_use_the_sandboxed_key_dir_and_leave_home_clean_7232() {
+    let tmp = TempDir::new().expect("tempdir");
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).expect("create scratch home");
+    let db = tmp.path().join("keys.db");
+    ai_memory(&db)
+        .env("HOME", &home)
+        .env_remove("XDG_CONFIG_HOME")
+        .args([
+            "--json",
+            "store",
+            "--title",
+            "key dir probe",
+            "--content",
+            "a ledger-writing call",
+            "--namespace",
+            "probe",
+            "--tier",
+            "long",
+        ])
+        .assert()
+        .success();
+
+    let is_key_file = |path: &Path| {
+        matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("priv" | "pub")
+        )
+    };
+    let mut leaked = Vec::new();
+    let mut stack = vec![home.clone()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read scratch home") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if is_key_file(&path) {
+                leaked.push(path);
+            }
+        }
+    }
+    assert!(
+        leaked.is_empty(),
+        "#7232: key material written outside the sandbox: {leaked:?}"
+    );
+    let sandbox = key_dir_sandbox::pin();
+    let in_sandbox = std::fs::read_dir(sandbox)
+        .expect("read the sandbox key dir")
+        .filter_map(Result::ok)
+        .any(|e| is_key_file(&e.path()));
+    assert!(
+        in_sandbox,
+        "#7232: the binary must have used the sandbox key dir {}",
+        sandbox.display()
+    );
 }
 
 /// #7218 - a watermark that outranks the imported chain and cannot be
@@ -397,6 +480,14 @@ fn import_still_refuses_when_a_legacy_watermark_outranks_the_chain_7218() {
     assert!(
         err.contains("REJECTED (fail-closed)") && err.contains("Detected"),
         "the refusal names its reason, got: {err}"
+    );
+    // #7230 - pin the gate this test was written for: the refusal reason is
+    // the legacy watermark's head (#7218 was diagnosed from `anchored_head:
+    // 448`); a refusal for an unrelated reason must not satisfy this test.
+    assert!(
+        err.contains("anchored_head: 448"),
+        "#7230 / #7218: the refusal must name the planted legacy head \
+         `anchored_head: 448`, got: {err}"
     );
     assert_eq!(memory_rows(&dst), 0, "all-or-nothing: no row was applied");
 }
