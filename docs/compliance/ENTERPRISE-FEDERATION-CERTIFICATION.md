@@ -1897,8 +1897,16 @@ boot gate, `AI_MEMORY_DB_SYNCHRONOUS=FULL`, operator key pair): **exit 0,
 recapturable with `scripts/recapture-cert-3607-posture.py`: every child runs in its
 own fresh empty cwd, so two consecutive runs of the script give byte-identical
 captures, and the run refuses to publish over a bundle that does not match its
-committed `MANIFEST.sha256`. The committed bundle stays bound to the build that
-produced it (not recaptured here).
+`MANIFEST.sha256` as committed in git HEAD (read with `git show HEAD:<path>`, never the file
+on disk): the manifest must be in HEAD, the working-tree manifest must be byte-identical to it,
+the files and directories under the bundle must equal the manifest set exactly (an extra,
+missing or unlisted file or subdirectory, or any symlink, refuses) and every listed digest
+must match. A recapture prints `live pragma not observed` where the committed captures
+(`posture-bare-env.out:75`, `posture-hardened-env.out:68`) print `agrees`: the old shared cwd
+held the store that `rules keygen` made (#7648), while every child now runs in its own empty
+cwd and legs 1 and 2 see no store (#7697). The recapture also refuses to publish a capture in
+which a sensitive path survives redaction in any decoded view (#7698). The committed bundle
+stays bound to the build that produced it (not recaptured here).
 
 **Re-cert trigger — FIRED by #3204 (`src/handlers/federation_receive.rs`,
 `src/handlers/federation_signing_check.rs`, `src/identity/sign.rs` — the far-endpoint
@@ -1942,7 +1950,8 @@ boot gate, `AI_MEMORY_DB_SYNCHRONOUS=FULL`, operator key pair): **exit 0,
 recapturable with `scripts/recapture-cert-3607-posture.py`: every child runs in its
 own fresh empty cwd, so two consecutive runs of the script give byte-identical
 captures, and the run refuses to publish over a bundle that does not match its
-committed `MANIFEST.sha256`. The committed bundle stays bound to the build that
+`MANIFEST.sha256` as committed in git HEAD (the committed file, not the one on disk; see the
+recapture note above). The committed bundle stays bound to the build that
 produced it (not recaptured here).
 
 ---

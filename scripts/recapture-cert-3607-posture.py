@@ -64,18 +64,33 @@ the evidence directory is missing or incomplete (complete = MANIFEST.sha256 pres
 file it lists matches) and removed when the evidence directory is complete, several asides
 are refused, and leftover staging and raw directories are removed, including the
 `.cert-3607.*` names an older version left next to the evidence directory (#7610). When the
-evidence directory has a MANIFEST.sha256 it is verified against its committed manifest before
-anything is built or published: a listed file that is missing, has another digest or a line
-that does not parse refuses the run (exit 1, naming the file) and no binary runs (#7649). A
-new manifest is computed only over the files this run freshly captured; every other line is
-kept verbatim, and the run never re-hashes a file it did not write, so an edited
-`test-results.txt` is never blessed by a rerun. Every child process (keygen, the store seed,
+evidence directory exists it is verified against its manifest as committed in git HEAD
+(`git show HEAD:docs/compliance/evidence/cert-3607/MANIFEST.sha256`, never the file on disk)
+before anything is built or published (#7649, #7696). The run refuses (exit 1, naming every
+offender, no binary runs, nothing is published) unless: (a) the manifest exists in git HEAD;
+(b) the working-tree manifest is byte-identical to the committed one; (c) the set of every
+regular file and every directory under the bundle, recursively, equals the manifest set
+exactly, so a missing, extra or unlisted file or subdirectory refuses, and so does any
+symlink; (d) every listed digest matches. After a recapture the working tree differs from git
+HEAD until the evidence is committed; commit it (or `git checkout` the directory) before the
+next recapture. A new manifest is computed only over the files this run freshly wrote (the
+captures and SANITIZATION.md); every other line is kept verbatim, and the run never re-hashes
+a file it did not write, so an edited `test-results.txt` is never blessed by a rerun.
+SANITIZATION.md is part of the bundle: the run rewrites its one `Provenance:` line (tip sha,
+UTC date) in staging, so the published manifest covers the updated file, and a
+SANITIZATION.md with no such line, or with two, is refused (#7699). Every child process (keygen, the store seed,
 each leg, git) runs in its own fresh empty 0700 cwd, with HOME in a sibling directory of
 the same per-child sandbox under .local-runs and AI_MEMORY_NO_CONFIG=1; there is no shared
 cwd. A store a leg needs is passed by explicit path (AI_MEMORY_DB), never found through the
 cwd, so a store that keygen makes in its own cwd is never seen by a leg. What holds (#7608,
-#7648): two consecutive runs give byte-identical captures, and no capture names a store. The
-per-child homes are labelled `<home>` in the evidence and the sandbox is removed at exit.
+#7648): two consecutive runs give byte-identical captures (only the sha and date of the exit-code
+header and the provenance line differ, because the evidence is committed between the runs). Legs 1 and
+2 run with no store in their cwd and no AI_MEMORY_DB, so the real doctor writes
+`ai-memory doctor --posture: live PRAGMA synchronous not observed on ai-memory.db: database
+does not exist; refusing to create (read-only)` to stderr, which the capture merges, and the
+check row says `live pragma not observed`; the committed captures (posture-bare-env.out:75,
+posture-hardened-env.out:68) say `agrees` because the old shared cwd held the store keygen
+made (#7648, #7697). The captures carry no host path. The per-child homes are labelled `<home>` in the evidence and the sandbox is removed at exit.
 `AI_MEMORY_NO_CONFIG=1` still lets the product write a config.toml under HOME (#7192, a
 product issue, not fixed here); the per-child HOME keeps it inside the sandbox. HOME must be an absolute path that is
 already in normal form (os.path.normpath(HOME) == HOME, so no `.`, `..`, `//` or trailing `/`
@@ -90,14 +105,21 @@ are byte-oriented, and a category list can lag Unicode (#7613); the run is refus
 exit 1 before any write. The sanitizer replaces every occurrence of each sensitive value (HOME,
 the repo root, the fixtures root and the per-child homes), longest value first, in its raw,
 JSON-escaped and percent-encoded forms; there is no delimiter allowlist, so a longer path
-that shares the prefix is over-redacted, which fails closed (#7538, #7651). Every guarded
+that shares the prefix is over-redacted, which fails closed (#7538, #7651). The redaction is
+not claimed to be complete: after it a detector builds decoded views of every capture
+(repeated case-insensitive percent-decoding, JSON \\u and \\/ unescaping, html.unescape, ANSI
+sequences removed, the text joined across line wraps, `//` and `/./` collapsed) and the run
+refuses to publish, naming the capture and the form, when a sensitive value shows in any of
+them (#7698): every input is redacted or the run refuses, none passes through. Every guarded
 path is resolved with os.path.realpath before any containment test (#7650). The shell script's
 defaults named build directories of one build host; they are replaced by
 repo-relative ones. Exit codes: 0 success; 1 DEFAULT_BIN is not an executable
 file, TMPDIR (or the default scratch directory) is outside <repo-root>/.local-runs, HOME is
 not a usable absolute path, a fixture path is or became a symlink, operator keygen failed,
-the git sha could not be read, or the transcript header date disagrees with the run
-date; 2 unknown arguments.
+the git sha could not be read, the existing bundle does not match the manifest committed in
+git HEAD, SANITIZATION.md has no single provenance line, a sensitive value remains in a
+sanitized capture, or the transcript header date disagrees with the run date; 2 unknown
+arguments.
 """
 import argparse
 import base64
@@ -106,6 +128,7 @@ import datetime
 import errno
 import fcntl
 import hashlib
+import html
 import json
 import os
 import re
@@ -149,6 +172,14 @@ SANDBOX = LOCAL_RUNS / "cert-3607-sandbox"  # one <label>/{cwd,home} pair per ch
 CHILD_HOMES = []  # the HOME of every child started in this run, labelled <home> in the evidence
 LOCK_NAME = ".lock"
 MANIFEST_NAME = "MANIFEST.sha256"
+MANIFEST_REL = OUT.relative_to(ROOT).as_posix() + "/" + MANIFEST_NAME  # the path in git HEAD
+SANITIZATION_NAME = "SANITIZATION.md"
+PROVENANCE_PREFIX = "Provenance: posture captures recorded at tip `"
+PROVENANCE_SUFFIX = (" (UTC); rewritten by scripts/recapture-cert-3607-posture.py on every "
+                     "recapture.")
+PROVENANCE_RE = re.compile(
+    r"^" + re.escape(PROVENANCE_PREFIX) + r"([0-9a-f]{40})` on (\d{4}-\d{2}-\d{2})"
+    + re.escape(PROVENANCE_SUFFIX) + r"$", re.MULTILINE)
 STAGING_PREFIX = "staging-"
 ASIDE_PREFIX = "old-"
 RAW_PREFIX = "raw-"
@@ -198,9 +229,15 @@ def sanitize(raw):
 
     The sensitive values are the per-child homes (labelled `<home>`), the fixtures root, the
     repo root and HOME (`<home>`), each as given and as its os.path.realpath. For each one
-    every form it takes in captured output is replaced: the raw text, the JSON-escaped text
-    (with and without the `\\/` slash escape, once and twice) and the percent-encoded text
-    (upper and lower hex, with and without an encoded slash). All the forms of all the values
+    exactly these forms are replaced: the raw text, the JSON-escaped text (with and without
+    the `\\/` slash escape, once and twice) and the percent-encoded text (upper and lower hex,
+    with and without an encoded slash). The replacement is NOT claimed to be complete: a form
+    outside that list (mixed-case percent, `\\uXXXX` escapes of every character, HTML
+    entities, a value split across a wrapped line, ANSI sequences inside it, `//` or `/./`
+    segments) is not replaced here. Completeness comes from the fail-closed detector
+    (leak_problem), which runs on every sanitized capture before anything is written and
+    refuses the run, naming the capture and the form, when a sensitive value shows in any
+    decoded view of it. All the forms of all the values
     are replaced in one pass over the forms sorted by length, longest first, so a value that is
     a prefix of another (HOME inside the repo root) never splits it. The replacement is a plain
     byte replacement of every literal occurrence: there is no delimiter allowlist, so any
@@ -211,7 +248,7 @@ def sanitize(raw):
     and so is a `.` inside it. The sed the shell script used read each path as a regular expression; for every
     literal occurrence the two agree, and real output has no near-miss of a path. Line endings,
     including CRLF and a missing final newline, are preserved exactly (#7510, #7538, #7571,
-    #7572, #7573, #7612, #7651)."""
+    #7572, #7573, #7612, #7651, #7698)."""
     replacements = {}
     for value, label in sensitive_values():
         for form in value_forms(value):
@@ -219,6 +256,82 @@ def sanitize(raw):
     for form in sorted(replacements, key=len, reverse=True):  # longest first; ties keep order
         raw = raw.replace(form, replacements[form])
     return raw
+
+
+class SensitiveValueRemains(Exception):
+    """A sanitized capture still shows a sensitive value in a decoded view: the run refuses."""
+
+
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b[@-Z\\-_]")
+WRAP_RE = re.compile(r"\\?\r?\n[ \t]*")
+NEWLINE_RE = re.compile(r"\r?\n")
+UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+SLASH_RUN_RE = re.compile(r"/{2,}")
+DECODE_ROUNDS = 8  # repeated decoding stops at a fixed point or after this many rounds
+
+
+def _json_unescape(text):
+    """JSON `\\uXXXX` (either hex case), `\\/` and `\\\\` turned back into their characters."""
+    text = UNICODE_ESCAPE_RE.sub(lambda match: chr(int(match.group(1), 16)), text)
+    return text.replace("\\/", "/").replace("\\\\", "\\")
+
+
+def _collapse_slashes(text):
+    """`//` runs and `/./` segments collapsed to one `/`."""
+    text = SLASH_RUN_RE.sub("/", text)
+    while "/./" in text:
+        text = text.replace("/./", "/")
+    return text
+
+
+DECODERS = (
+    ("percent-encoded", urllib.parse.unquote),
+    ("JSON-escaped", _json_unescape),
+    ("HTML-entity", html.unescape),
+    ("ANSI-split", lambda text: ANSI_RE.sub("", text)),
+    ("line-wrapped", lambda text: WRAP_RE.sub("", text)),
+    ("line-wrapped (indentation kept)", lambda text: NEWLINE_RE.sub("", text)),
+    ("doubled-slash", _collapse_slashes),
+)
+
+
+def decoded_views(text):
+    """(form, text) of the capture as it is and under each decoding: repeated, case-insensitive
+    percent-decoding; JSON `\\u` and `\\/` unescaping; html.unescape; ANSI sequences removed; the
+    text joined across line wraps with the wrap characters removed; `//` and `/./` collapsed.
+    Each decoding is applied until it changes nothing; a last view applies all of them
+    together, so a value that is encoded and split at once is still seen."""
+    views = [("raw", text)]
+    for form, decode in DECODERS:
+        view = text
+        for _ in range(DECODE_ROUNDS):
+            decoded = decode(view)
+            if decoded == view:
+                break
+            view = decoded
+        views.append((form, view))
+    view = text
+    for _ in range(DECODE_ROUNDS):
+        before = view
+        for _, decode in DECODERS:
+            view = decode(view)
+        if view == before:
+            break
+    views.append(("combined decodings", view))
+    return views
+
+
+def leak_problem(name, data):
+    """A message naming the capture and the form when a sensitive value is still visible in any
+    decoded view of the sanitized bytes data, else None. The value itself is never printed."""
+    text = data.decode("utf-8", errors="replace")
+    values = sensitive_values()
+    for form, view in decoded_views(text):
+        for value, label in values:
+            if value in view:
+                return ("%s still shows a sensitive value (%s) in its %s form after redaction"
+                        % (name, label.decode(), form))
+    return None
 
 
 def sensitive_values():
@@ -427,7 +540,11 @@ def run_capture(binary, args, env, raw_path, sanitized_path, cwd):
             except OSError as error:
                 raw.write(("%s: %s\n" % (binary, error.strerror or error)).encode())
                 status = exec_status(error)
-        write_file(sanitized_path, sanitize(read_file(raw_path)))
+        clean = sanitize(read_file(raw_path))
+        leak = leak_problem(sanitized_path.name, clean)
+        if leak is not None:
+            raise SensitiveValueRemains(leak)  # nothing is written; the staging dir is dropped
+        write_file(sanitized_path, clean)
     finally:
         if raw_path.exists():
             raw_path.unlink()  # the unsanitized capture never outlives this call
@@ -701,6 +818,11 @@ def read_manifest(bundle):
         return None, None
     except (OSError, UnicodeDecodeError) as error:
         return None, "%s cannot be read: %s" % (MANIFEST_NAME, error)
+    return parse_manifest(text)
+
+
+def parse_manifest(text):
+    """(entries, problem) of manifest text: entries is a list of (sha256, name)."""
     entries = []
     for number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
@@ -716,9 +838,12 @@ def read_manifest(bundle):
 
 
 def manifest_problem(bundle):
-    """A message naming the file when bundle does not match its committed MANIFEST.sha256, else
-    None (also None when the bundle has no manifest). A listed file that is missing, is not a
-    regular file or has another digest is a mismatch, and so is a manifest that lists nothing."""
+    """A message naming the file when bundle does not match the MANIFEST.sha256 on disk in it,
+    else None (also None when the bundle has no manifest). This is a COMPLETENESS test for the
+    recovery of a killed run (bundle_complete); it trusts the file on disk and is not the
+    integrity check: committed_bundle_problem is, against the manifest as committed in git.
+    A listed file that is missing, is not a regular file or has another digest is a mismatch,
+    and so is a manifest that lists nothing."""
     entries, problem = read_manifest(bundle)
     if problem is not None or entries is None:
         return problem
@@ -733,6 +858,113 @@ def manifest_problem(bundle):
         if hashlib.sha256(data).hexdigest() != digest:
             return "%s does not match its digest in %s" % (name, MANIFEST_NAME)
     return None
+
+
+def git_env(home):
+    """The environment for a git child: the caller's, without any GIT_* variable (GIT_DIR,
+    GIT_WORK_TREE and friends could point git at another repository), HOME in the child's home."""
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env["HOME"] = str(home)
+    return env
+
+
+def committed_manifest():
+    """(bytes, None) of MANIFEST.sha256 as committed at git HEAD (`git show HEAD:<path>`), or
+    (None, message) when git cannot give it: this is the trust anchor, never the file on disk."""
+    cwd, home = child_dir("manifest-git")
+    try:
+        done = subprocess.run(["git", "-C", str(ROOT), "show", "HEAD:./" + MANIFEST_REL],
+                              env=git_env(home), cwd=str(cwd), capture_output=True, check=False)
+    except OSError as error:
+        return None, "git cannot be run to read the committed %s: %s" % (
+            MANIFEST_REL, error.strerror or error)
+    if done.returncode != 0:
+        return None, "%s is not committed in git HEAD (%s)" % (
+            MANIFEST_REL, done.stderr.decode(errors="replace").strip())
+    return done.stdout, None
+
+
+def bundle_tree(bundle):
+    """(found, problems) for every entry under bundle, recursively and without following a
+    link: found maps a relative name (a directory ends in `/`) to its kind; problems names each
+    symlink and each entry that is neither a regular file nor a directory."""
+    found, problems = {}, []
+
+    def walk(directory, prefix):
+        try:
+            with os.scandir(str(directory)) as entries:
+                listing = sorted(entries, key=lambda entry: entry.name)
+        except OSError as error:
+            problems.append("%s cannot be listed: %s" % (prefix or ".", error.strerror or error))
+            return
+        for entry in listing:
+            name = prefix + entry.name
+            if entry.is_symlink():
+                problems.append("%s is a symlink" % name)
+            elif entry.is_dir(follow_symlinks=False):
+                found[name + "/"] = "directory"
+                walk(directory / entry.name, name + "/")
+            elif entry.is_file(follow_symlinks=False):
+                found[name] = "file"
+            else:
+                problems.append("%s is neither a regular file nor a directory" % name)
+
+    walk(Path(bundle), "")
+    return found, problems
+
+
+def committed_bundle_problem(bundle, committed):
+    """A message naming every offender when bundle is not exactly what the manifest as committed
+    in git HEAD (the bytes in committed) attests, else None (#7696). Required: the working-tree
+    MANIFEST.sha256 is byte-identical to the committed one; the entries under the bundle,
+    every regular file and every directory, recursively, equal the listed names exactly (a
+    missing, extra or unlisted file or subdirectory refuses, and so does any symlink); every
+    listed digest matches."""
+    try:
+        entries, problem = parse_manifest(committed.decode("utf-8"))
+    except UnicodeDecodeError as error:
+        return "the committed %s is not UTF-8: %s" % (MANIFEST_NAME, error)
+    if problem is not None:
+        return "the committed " + problem
+    if not entries:
+        return "the committed %s lists no file" % MANIFEST_NAME
+    names = [name for _, name in entries]
+    problems = ["%s is listed twice in the committed %s" % (name, MANIFEST_NAME)
+                for name in sorted({n for n in names if names.count(n) > 1})]
+    try:
+        working = read_file(bundle / MANIFEST_NAME)
+    except FileNotFoundError:
+        problems.append("%s is deleted from the working tree but committed in git HEAD"
+                        % MANIFEST_NAME)
+    except OSError as error:
+        problems.append("%s cannot be read: %s" % (MANIFEST_NAME, error.strerror or error))
+    else:
+        if working != committed:
+            old, new = set(committed.splitlines()), set(working.splitlines())
+            changed = sorted({line.decode(errors="replace").split("  ", 1)[-1]
+                              for line in old ^ new})
+            problems.append("the working-tree %s differs from the one committed in git HEAD "
+                            "(changed lines: %s)" % (MANIFEST_NAME, ", ".join(changed) or "bytes"))
+    found, tree_problems = bundle_tree(bundle)
+    problems.extend(tree_problems)
+    listed = set(names)
+    for name in sorted(found):
+        if name != MANIFEST_NAME and name not in listed:
+            problems.append("%s is not listed in the committed %s" % (name, MANIFEST_NAME))
+    for digest, name in entries:
+        if found.get(name) != "file":
+            problems.append("%s is listed in the committed %s but is missing or not a regular "
+                            "file" % (name, MANIFEST_NAME))
+            continue
+        try:
+            data = read_file(bundle / name)
+        except OSError as error:
+            problems.append("%s cannot be read: %s" % (name, error.strerror or error))
+            continue
+        if hashlib.sha256(data).hexdigest() != digest:
+            problems.append("%s does not match its digest in the committed %s"
+                            % (name, MANIFEST_NAME))
+    return "; ".join(problems) or None
 
 
 def bundle_complete(bundle):
@@ -773,6 +1005,33 @@ def refresh_manifest(bundle, written):
                   else digests[name])
         lines.append("%s  %s\n" % (digest, name))
     write_file(bundle / MANIFEST_NAME, "".join(lines).encode("utf-8"))
+
+
+def provenance_line(full_sha, run_date):
+    """The one provenance line of SANITIZATION.md for a recapture at full_sha on run_date."""
+    return "%s%s` on %s%s" % (PROVENANCE_PREFIX, full_sha, run_date, PROVENANCE_SUFFIX)
+
+
+def refresh_provenance(bundle, full_sha, run_date, written):
+    """Rewrite the provenance line (tip sha, UTC date) of the staged SANITIZATION.md to this run
+    and add the file to written, so the published manifest covers the updated file (#7699).
+    A bundle without SANITIZATION.md is left alone; one whose file has no, or more than one,
+    provenance line is refused: a message, else None."""
+    path = bundle / SANITIZATION_NAME
+    if not os.path.lexists(str(path)):
+        return None
+    try:
+        text = read_file(path).decode("utf-8")
+    except (OSError, UnicodeDecodeError) as error:
+        return "%s cannot be read: %s" % (SANITIZATION_NAME, error)
+    if len(PROVENANCE_RE.findall(text)) != 1:
+        return ("%s must hold exactly one line of the form %r (tip sha and date); it holds %d"
+                % (SANITIZATION_NAME, provenance_line("<40 hex>", "YYYY-MM-DD"),
+                   len(PROVENANCE_RE.findall(text))))
+    line = provenance_line(full_sha, run_date)
+    write_file(path, PROVENANCE_RE.sub(lambda _match: line, text).encode("utf-8"))
+    written.add(SANITIZATION_NAME)
+    return None
 
 
 def _leftovers(directory, prefix):
@@ -818,6 +1077,9 @@ def main(argv=None):
     parse_args(sys.argv[1:] if argv is None else argv)
     try:
         return recapture()
+    except SensitiveValueRemains as error:
+        print("refusing to publish: %s; nothing was published" % error, file=sys.stderr)
+        return 1
     except OSError as error:
         print("refusing to continue: %s: %s; fixtures and evidence must be regular files, "
               "never reached through a symlink, under %s" % (
@@ -881,12 +1143,30 @@ def recapture_locked(tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting, run_
     if problem is not None:
         print(problem, file=sys.stderr)
         return 1
-    if OUT.is_dir() and not OUT.is_symlink():
-        problem = manifest_problem(OUT)  # before any binary runs and before anything is built
-        if problem is not None:
-            print("refusing to publish over a bundle that does not match its committed "
-                  "manifest: %s (%s)" % (problem, OUT), file=sys.stderr)
-            return 1
+    committed = None
+    try:
+        make_sandbox()
+        if OUT.is_dir() and not OUT.is_symlink():
+            # before any binary runs and before anything is built: the anchor is the manifest
+            # as committed in git HEAD, never the file on disk (#7696)
+            committed, problem = committed_manifest()
+            if committed is not None:
+                problem = committed_bundle_problem(OUT, committed)
+            if problem is not None:
+                print("refusing to publish over a bundle that does not match its manifest as "
+                      "committed in git HEAD: %s (%s); commit the evidence directory, or "
+                      "restore it with git checkout, before recapturing" % (problem, OUT),
+                      file=sys.stderr)
+                return 1
+        return build_and_publish(tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting,
+                                 run_date, committed)
+    finally:
+        remove_tree(SANDBOX)
+
+
+def build_and_publish(tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting, run_date,
+                      committed):
+    """Build the bundle in a staging directory and publish it when every leg succeeded."""
     ensure_dirs(FIX)
     chmod_dir(FIX)  # holds the passphrase and keys: tightened on every run
     ensure_dirs(tmpdir)
@@ -899,13 +1179,13 @@ def recapture_locked(tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting, run_
     ensure_dirs(stage)
     ensure_dirs(raw_dir)
     try:
-        make_sandbox()
-        if OUT.is_dir() and not OUT.is_symlink():
+        if committed is not None:
             copy_bundle(OUT, stage)
-            problem = manifest_problem(stage)  # the copy must verify too: nothing changed since
+            problem = committed_bundle_problem(stage, committed)  # nothing changed since
             if problem is not None:
                 print("refusing to publish: the staged copy of the bundle does not match its "
-                      "committed manifest: %s (%s)" % (problem, OUT), file=sys.stderr)
+                      "manifest as committed in git HEAD: %s (%s)" % (problem, OUT),
+                      file=sys.stderr)
                 return 1
         legs = capture_legs(stage, raw_dir, tmpdir, default_bin, sqlcipher_bin,
                             sqlcipher_setting, run_date)
@@ -1031,12 +1311,16 @@ def capture_legs(out, raw_dir, tmpdir, default_bin, sqlcipher_bin, sqlcipher_set
         written.add(SQLCIPHER_OUT_FILE)
 
     git_cwd, git_home = child_dir("git")
-    git_env = dict(os.environ, HOME=str(git_home))
     sha_done = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
-                              env=git_env, cwd=str(git_cwd), capture_output=True, text=True,
-                              check=False)
+                              env=git_env(git_home), cwd=str(git_cwd), capture_output=True,
+                              text=True, check=False)
     sha = sha_done.stdout.strip()
-    if sha_done.returncode != 0 or not sha:
+    full_done = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                               env=git_env(git_home), cwd=str(git_cwd), capture_output=True,
+                               text=True, check=False)
+    full_sha = full_done.stdout.strip()
+    if (sha_done.returncode != 0 or not sha or full_done.returncode != 0
+            or not re.fullmatch(r"[0-9a-f]{40}", full_sha) or not full_sha.startswith(sha)):
         print("cannot read the git sha of " + str(ROOT), file=sys.stderr)
         return 1
     transcript = "\n".join([
@@ -1061,6 +1345,10 @@ def capture_legs(out, raw_dir, tmpdir, default_bin, sqlcipher_bin, sqlcipher_set
 
     for name in ("peer-fingerprints.txt", "peer-attestation.json"):
         write_file(out / name, read_file(FIX / name))
+    problem = refresh_provenance(out, full_sha, run_date, written)
+    if problem is not None:
+        print(problem, file=sys.stderr)
+        return 1
     refresh_manifest(out, written)
 
     return e1, e2, e3, e4
