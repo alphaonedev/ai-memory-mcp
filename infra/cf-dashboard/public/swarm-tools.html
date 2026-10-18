@@ -7,48 +7,7 @@
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛰️</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
-<style>
-:root{--bg:#080b11;--panel:#111823;--panel2:#0d131c;--raise:#16202c;--ink:#e8eef6;--soft:#7d8ba0;--dim:#3d4757;--line:#1e2836;
---good:#2ee6a0;--good-bg:#0c2119;--run:#3fb5ff;--run-bg:#0a2233;--bad:#ff5a6a;--bad-bg:#251014;--warn:#ffb547;--warn-bg:#2a1e07;--acc:#3fb5ff;
---disp:'Space Grotesk',system-ui,sans-serif;--sans:'IBM Plex Sans',system-ui,sans-serif;--mono:'IBM Plex Mono',ui-monospace,monospace;}
-@media(prefers-color-scheme:light){:root:not([data-theme="dark"]){--bg:#eef2f7;--panel:#fff;--panel2:#f3f6fa;--raise:#e9eef4;--ink:#101722;--soft:#5a6a7d;--dim:#b3bdc9;--line:#dce3ec;--good:#12a06a;--good-bg:#d9f6ea;--run:#0b83d9;--run-bg:#dcefff;--bad:#d83a4a;--bad-bg:#fbe3e6;--acc:#0b83d9;}}
-*{box-sizing:border-box}html,body{margin:0}body{background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.5;-webkit-font-smoothing:antialiased}
-.wrap{max-width:1200px;margin:0 auto;padding:26px 20px 60px}
-a.back{font-family:var(--mono);font-size:12px;color:var(--acc);text-decoration:none}a.back:hover{text-decoration:underline}
-h1{font-family:var(--disp);font-weight:700;font-size:26px;margin:10px 0 4px;letter-spacing:-.01em}
-.sub{font-family:var(--mono);font-size:12px;color:var(--soft);margin-bottom:18px}
-.hero{display:flex;gap:24px;align-items:center;flex-wrap:wrap;background:linear-gradient(160deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:16px;padding:22px 24px;margin-bottom:8px}
-.pct{font-family:var(--disp);font-weight:700;font-size:60px;line-height:1;font-variant-numeric:tabular-nums}
-.pct .u{font-size:26px;color:var(--soft)}
-.herostats{display:flex;gap:26px;flex-wrap:wrap}
-.hstat .v{font-family:var(--disp);font-weight:700;font-size:24px;font-variant-numeric:tabular-nums}
-.hstat .l{font-family:var(--mono);font-size:10.5px;color:var(--soft);text-transform:uppercase;letter-spacing:.05em}
-.goal{font-family:var(--mono);font-size:12px;margin-left:auto;text-align:right;color:var(--soft)}
-.bar{height:10px;border-radius:6px;background:var(--raise);overflow:hidden;margin:14px 0 4px;display:flex}
-.bar i{height:100%}
-.legend{display:flex;gap:18px;flex-wrap:wrap;font-family:var(--mono);font-size:11px;color:var(--soft);margin:16px 0 22px}
-.legend span{display:inline-flex;align-items:center;gap:6px}.legend i{width:10px;height:10px;border-radius:3px;display:inline-block}
-.fam{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:13px 15px;margin-bottom:11px;position:relative}
-.fsbtn{font-family:var(--mono);font-size:10.5px;color:var(--acc,#6ee7ff);background:var(--raise,rgba(255,255,255,.05));border:1px solid var(--line);border-radius:6px;padding:2px 8px;cursor:pointer;margin-left:8px}
-.fam:fullscreen,.fam.maximized{background:var(--bg,#000);padding:28px 36px;overflow:auto;border-radius:0}
-.fam.maximized{position:fixed;inset:0;z-index:9999}
-.fam:fullscreen .tools,.fam.maximized .tools{font-size:14px}
-.famhdr{display:flex;align-items:center;gap:10px;margin-bottom:10px}
-.famname{font-family:var(--disp);font-weight:600;font-size:15px;text-transform:capitalize}
-.famcount{font-family:var(--mono);font-size:11px;color:var(--soft)}
-.fambar{margin-left:auto;height:6px;width:120px;border-radius:4px;background:var(--raise);overflow:hidden;display:flex}
-.tools{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:7px}
-.tool{display:flex;align-items:center;gap:8px;padding:7px 10px;background:var(--panel2);border:1px solid var(--line);border-radius:8px;border-left-width:3px}
-.tool.validated{border-left-color:var(--good)}.tool.failclosed{border-left-color:var(--run)}.tool.refining{border-left-color:var(--warn)}
-.tool .tn{font-family:var(--mono);font-size:11.5px;color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tool .ti{font-family:var(--mono);font-size:9px;margin-left:auto;padding:1px 5px;border-radius:4px;white-space:nowrap}
-.ti.validated{color:var(--good);background:var(--good-bg)}.ti.failclosed{color:var(--run);background:var(--run-bg)}.ti.refining{color:var(--warn);background:var(--warn-bg)}
-.tool:hover{border-color:var(--acc)}.tool .tn{cursor:help}
-.legalfoot{margin-top:30px;padding-top:20px;border-top:1px solid var(--line);text-align:center;color:var(--soft);font-size:12px;font-family:var(--mono)}
-.legalfoot a{color:var(--acc);text-decoration:none}
-.legalfoot .nsa{font-size:11px;opacity:.85;text-align:left;max-width:64rem;margin:12px auto 0;line-height:1.6}
-.errbar{font-family:var(--mono);font-size:12px;color:var(--warn);background:var(--warn-bg,#2a1e07);border:1px solid var(--warn);border-radius:8px;padding:8px 12px;margin:0 0 12px}
-</style>
+<link rel="stylesheet" href="/vv.css">
 </head>
 <body data-src="swarm-tools-state.json">
 <div class="wrap">
@@ -61,20 +20,20 @@ h1{font-family:var(--disp);font-weight:700;font-size:26px;margin:10px 0 4px;lett
   <div class="hero">
     <div><div class="pct" id="pct">—<span class="u">%</span></div><div class="hstat"><span class="l">functional / total</span></div></div>
     <div class="herostats" id="herostats"></div>
-    <div class="goal">Goal: <b style="color:var(--good)">100%</b><br>every tool &amp; feature<br>validated as designed<span id="upd"></span></div>
+    <div class="goal">Goal: <b class="c-good">100%</b><br>every tool &amp; feature<br>validated as designed<span id="upd"></span></div>
   </div>
   <div class="bar" id="bar"></div>
   <div class="legend">
-    <span><i style="background:var(--good)"></i>validated — returns correct result</span>
-    <span><i style="background:var(--run)"></i>fail-closed by design — correctly enforces its contract (auth / attestation / validation / precondition)</span>
-    <span><i style="background:var(--warn)"></i>refining — harness tightening valid inputs (not a confirmed defect)</span>
+    <span><i class="bg-good"></i>validated — returns correct result</span>
+    <span><i class="bg-run"></i>fail-closed by design — correctly enforces its contract (auth / attestation / validation / precondition)</span>
+    <span><i class="bg-warn"></i>refining — harness tightening valid inputs (not a confirmed defect)</span>
   </div>
 
   <div id="families"></div>
 
   <div class="legalfoot">
     <div>Codex (conductor) · deterministic harness — GLM-5.3-Flash never runs this · a tool is green only when it actually returns what it was designed to return.</div>
-    <div style="margin-top:8px">ai-memory&trade; · Apache-2.0 · &copy; 2026 <a href="https://alphaonedev.com">AlphaOne LLC</a></div>
+    <div class="mt8">ai-memory&trade; · Apache-2.0 · &copy; 2026 <a href="https://alphaonedev.com">AlphaOne LLC</a></div>
     <div class="nsa"><strong>NSA non-endorsement.</strong> References to NSA Cybersecurity Information on MCP security (U/OO/6030316-26 | PP-26-1834, May 2026) describe ai-memory's substrate-level posture relative to NSA-issued guidance. The NSA, the Department of Defense, and the United States Government do not endorse, certify, or recommend ai-memory, AgenticMem, AlphaOne LLC, or any commercial product.</div>
   </div>
 </div>

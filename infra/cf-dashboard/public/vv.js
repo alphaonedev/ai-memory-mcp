@@ -15,8 +15,8 @@
     return isFinite(x) ? x : null;
   }
   function show(v) { var x = num(v); return x === null ? PLACEHOLDER : String(x); }
-  function share(part, whole) {
-    var a = num(part), b = num(whole);
+  function share(portion, whole) {
+    var a = num(portion), b = num(whole);
     if (a === null || b === null || b <= 0) { return 0; }
     return Math.max(0, Math.min(100, a / b * 100));
   }

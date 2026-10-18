@@ -15,7 +15,11 @@ The state file is data from the fleet. `public/index.js` renders it, and the pro
    browser.
 3. **Trusted Types, enforced by the browser.** The CSP carries `require-trusted-types-for 'script'; trusted-types dash`.
    The page creates exactly one policy, `dash`, inside the closure that defines `put`. Its `createHTML` escapes any
-   plain string and passes through only the closure-private `Html` class. A script that assigns a string to
+   plain string and passes through only a token that a closure-private `WeakMap` holds (#7684): `markup` returns a
+   frozen, prototype-less, property-less token and keeps its text in that map, so no constructor, property or
+   prototype game can mint one, and patching `WeakMap.prototype` afterwards changes nothing (the methods are captured
+   at load). The static guard refuses, outside the helper block, any name of the internals and any use of
+   `setPrototypeOf`, `__proto__`, `Object.create` or `.constructor`. A script that assigns a string to
    `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, `srcdoc` and the like is refused by the browser,
    and so is a second `createPolicy`.
 
@@ -24,7 +28,13 @@ The state file is data from the fleet. `public/index.js` renders it, and the pro
 - Chromium-based browsers enforce Trusted Types. The browser test (`scripts/ci/tests/test_cf_browser_7634.py`)
   proves it in a real Chrome: 0 Trusted Types violations, 0 CSP violations, an empty console and every panel
   populated for a normal state; a hostile state in every panel (markup values, the keys `createHTML`, `__proto__`,
-  `toString`, `constructor`, `javascript:` values, `1e999`) executes nothing.
+  `toString`, `constructor`, `javascript:` values, `1e999`) executes nothing, logs nothing (the console and the log
+  are asserted empty with no allowance) and renders pinned element counts. The sink test also runs `document.write`,
+  and three token-forging attempts (a constructor, a mutated property, a set prototype) insert nothing raw.
+- Every number written into an SVG attribute or path goes through one helper (`sn`/`pd`) that requires
+  `Number.isFinite`; a non-finite value omits that element (a text placeholder outside SVG).
+- There is no inline style: the pages link `index.css` / `vv.css`, dynamic widths use `data-w` / `data-left` applied
+  with `style.setProperty`, and the shipped CSP has no `'unsafe-inline'`; the browser test proves 0 CSP violations.
 - Firefox and Safari ignore the Trusted Types directives. They get the escaping (layer 1) and `script-src 'self'`
   (layer 2). That is the whole claim there; the page also loads and renders with `window.trustedTypes` undefined
   (tested).
@@ -55,13 +65,18 @@ tables and refuses the rest; every refusal names the directive, the file to edit
 | --- | --- |
 | `default-src` | `'self'` |
 | `script-src` | `'self'` |
-| `style-src` | `'self'`, `'unsafe-inline'` (the documented exception), `https://fonts.googleapis.com` |
+| `style-src` | `'self'`, `https://fonts.googleapis.com` |
 | `font-src` | `https://fonts.gstatic.com` |
 | `img-src` | `'self'`, `data:` |
 | `connect-src` | `'self'` |
 | `base-uri`, `form-action`, `object-src`, `frame-ancestors` | `'none'` |
 | `require-trusted-types-for` | `'script'` |
 | `trusted-types` | `dash` |
+
+`_headers` is read by ONE parser, `cf_headers_7313.py`, used by the checker, the browser test server and every other
+reader (#7685, #7686). It refuses, with the line number: a `!` removal line, a pattern that is not a plain path (a host
+or scheme rule), a non-ASCII byte, and a second `Content-Security-Policy`. CSP directives split only on ASCII
+whitespace, so a non-breaking space inside a directive is a refusal, not a token.
 
 Required: `default-src`, `script-src`, `object-src`, `base-uri`, `require-trusted-types-for`, `trusted-types`. Also
 refused: a duplicate or empty directive, a comma (a second policy in one value), and anything but exactly one CSP value
@@ -72,11 +87,10 @@ To widen it: change `_headers`, then add the directive or token to `ALLOWED_DIRE
 new shape as accepted, and say why in the commit message. Wildcards and the site's own host name are refused as "not
 in the table"; that is a possible false refusal, not a bug.
 
-### The `style-src 'unsafe-inline'` exception
+### No `'unsafe-inline'` (#7689)
 
-The only documented `'unsafe-inline'`. The pages carry `<style>` blocks and `index.js` sets dynamic style attributes
-(bar widths, colours). Style cannot run script while `script-src` has no `'unsafe-inline'`, and the checker refuses a
-backslash in CSS. Removing it means moving every dynamic style into a stylesheet or the CSSOM.
+`DOCUMENTED_EXCEPTIONS` is empty. The pages carry no `<style>` block and no `style` attribute; the checker refuses
+both, and a local stylesheet a page links is checked under the same policy (it may fetch only what a page may).
 
 ### Page markup rules
 

@@ -8,7 +8,10 @@ REFUSES everything else:
 - a directive not in ALLOWED_DIRECTIVES, a token not listed for its directive, a duplicate directive, a comma
   (several policies in one value), and anything but exactly one Content-Security-Policy value per served path;
 - a missing REQUIRED_DIRECTIVES entry (the Trusted Types pair among them);
-- 'unsafe-inline' anywhere except the one entry of DOCUMENTED_EXCEPTIONS;
+- 'unsafe-inline' anywhere (DOCUMENTED_EXCEPTIONS is empty: no exception remains, inline style is gone), and any page
+  with a `<style>` block or a `style` attribute;
+- a `_headers` file the shared reader (cf_headers_7313.py) cannot prove it understands: a `!` removal line, a host or
+  scheme rule pattern, a non-ASCII byte, a second Content-Security-Policy; the refusal carries the line number;
 - a page that loads from an origin not in LOAD_ALLOW, or from one its own directive does not list;
 - inline script, event-handler attributes, `javascript:` in any spelling, `<base>`, `<meta http-equiv>`, `srcset`,
   a backslash in CSS, frames/objects, and an `<svg>` with content.
@@ -21,6 +24,7 @@ import html as html_lib
 import re
 from html.parser import HTMLParser
 
+import cf_headers_7313 as headers_mod
 import cf_origin_7313 as origin_mod
 
 TABLE_FILE = "scripts/ci/tests/cf_csp_allowlist_7313.py (ALLOWED_DIRECTIVES, LOAD_ALLOW)"
@@ -35,7 +39,7 @@ UNSAFE_INLINE = "'unsafe-inline'"
 ALLOWED_DIRECTIVES = {
     "default-src": frozenset((SELF,)),
     "script-src": frozenset((SELF,)),
-    "style-src": frozenset((SELF, UNSAFE_INLINE, GOOGLE_CSS)),
+    "style-src": frozenset((SELF, GOOGLE_CSS)),
     "font-src": frozenset((GOOGLE_FONTS,)),
     "img-src": frozenset((SELF, "data:")),
     "connect-src": frozenset((SELF,)),
@@ -48,12 +52,10 @@ ALLOWED_DIRECTIVES = {
 }
 REQUIRED_DIRECTIVES = ("default-src", "script-src", "object-src", "base-uri", "require-trusted-types-for",
                        "trusted-types")
-# The single 'unsafe-inline' the policy carries, with the reason. Removing it needs every dynamic style attribute of
-# index.js (bar widths, colours) and every <style> block of the pages moved to a stylesheet or to the CSSOM.
-DOCUMENTED_EXCEPTIONS = {
-    ("style-src", UNSAFE_INLINE): "inline style attributes and <style> blocks of the pages and of index.js (no script "
-                                  "can run through style; script-src carries no 'unsafe-inline')",
-}
+# (directive, token) -> reason, for a token outside ALLOWED_DIRECTIVES that is allowed on purpose. EMPTY (#7689): the
+# only entry was style-src 'unsafe-inline'; every style attribute and <style> block now lives in index.css / vv.css or
+# is set through the CSSOM (style.setProperty), which style-src does not govern.
+DOCUMENTED_EXCEPTIONS = {}
 # kind of load -> origins a page may load it from (origin_mod normalises: SELF_ORIGIN is a page-relative load)
 LOAD_ALLOW = {
     "script": frozenset((origin_mod.SELF_ORIGIN,)),
@@ -70,7 +72,7 @@ LOAD_NEEDS = {
     ("img", origin_mod.SELF_ORIGIN): ("img-src", SELF),
     ("img", origin_mod.DATA_ORIGIN): ("img-src", "data:"),
 }
-ALWAYS_REFUSED_LOADS = ("inline-script", "script-attr")
+ALWAYS_REFUSED_LOADS = ("inline-script", "script-attr", "inline-style", "style-attr")
 REFUSED_TAGS = frozenset(("base", "math", "iframe", "frame", "frameset", "object", "embed", "applet", "form", "portal"))
 URL_LIKE = re.compile(r"[\x00-\x20\x7f​-‏  ﻿]+")
 BAD_SCHEMES = ("javascript:", "vbscript:")
@@ -87,7 +89,7 @@ def check_policy(value):
         return [_where("a comma (several policies in one value is refused)")]
     seen = {}
     for raw in value.split(";"):
-        parts = raw.split()
+        parts = headers_mod.csp_tokens(raw)  # ASCII whitespace only (#7686): a no-break space is not a separator
         if not parts:
             continue
         name, tokens = parts[0].lower(), parts[1:]
@@ -116,30 +118,19 @@ def policy_tokens(value):
     """directive -> set of tokens, for an accepted policy value."""
     out = {}
     for raw in value.split(";"):
-        parts = raw.split()
+        parts = headers_mod.csp_tokens(raw)
         if parts:
             out[parts[0].lower()] = {t.lower() if t.startswith("'") else t for t in parts[1:]}
     return out
 
 
-def header_csp_values(headers_text, path):
-    """The raw Content-Security-Policy values (no comma splitting) of every `_headers` rule matching the path."""
-    values, current = [], None
-    for line in headers_text.splitlines():
-        if not line.strip():
-            continue
-        if line[0] not in " \t":
-            current = origin_mod._pattern_regex(line.strip()).match(path) is not None
-        elif current:
-            name, _, value = line.strip().partition(":")
-            if name.strip().lower() == "content-security-policy":
-                values.append(value.strip())
-    return values
-
-
 def check_path(headers_text, path):
-    """(refusals, policy value or None) for a served path: exactly one policy, and it must pass check_policy."""
-    values = header_csp_values(headers_text, path)
+    """(refusals, policy value or None) for a served path: the file is read by the shared fail-closed reader (a refusal
+    names the line), exactly one policy applies, and it must pass check_policy."""
+    try:
+        values = headers_mod.csp_values(headers_text, path)
+    except headers_mod.HeadersError as exc:
+        return [_where("%s: %s" % (path, exc))], None
     if len(values) != 1:
         return [_where("%s gets %d Content-Security-Policy values, exactly one is allowed" % (path, len(values)))], None
     return check_policy(values[0]), values[0]
@@ -229,15 +220,36 @@ def check_page(html_text, policy_value):
     for load in origin_mod.page_loads(html_text):
         if load.kind in ALWAYS_REFUSED_LOADS:
             refusals.append(_where("%s load" % load.kind))
-        elif load.kind in ("inline-style", "style-attr"):
-            if ("style-src", UNSAFE_INLINE) not in DOCUMENTED_EXCEPTIONS or UNSAFE_INLINE not in tokens.get("style-src", ()):
-                refusals.append(_where("%s needs the documented style-src %s exception" % (load.kind, UNSAFE_INLINE)))
         elif load.origin not in LOAD_ALLOW.get(load.kind, ()):
             refusals.append(_where("%s load from %s (%s) is not in LOAD_ALLOW" % (load.kind, load.origin, load.path)))
         else:
             directive, token = LOAD_NEEDS[(load.kind, load.origin)]
             if token not in tokens.get(directive, ()):
                 refusals.append(_where("%s load from %s needs %s %s in the policy" % (load.kind, load.origin, directive, token)))
+    return refusals
+
+
+def check_stylesheet(css_text, policy_value):
+    """Refusals for one local stylesheet served under the accepted policy value: it may fetch only what a page may."""
+    refusals = []
+    if "\\" in css_text:
+        refusals.append(_where("a backslash in a stylesheet (CSS escapes hide url() targets)"))
+    tokens = policy_tokens(policy_value) if policy_value else {}
+    for kind, value in origin_mod.css_loads(css_text):
+        try:
+            resolved = origin_mod.resolve_load(value)
+        except origin_mod.UnparsedURL:
+            refusals.append(_where("stylesheet %s load of %r does not parse" % (kind, value)))
+            continue
+        if resolved is None:
+            continue
+        origin = resolved[0]
+        if origin not in LOAD_ALLOW.get(kind, ()):
+            refusals.append(_where("stylesheet %s load from %s is not in LOAD_ALLOW" % (kind, origin)))
+        else:
+            directive, token = LOAD_NEEDS[(kind, origin)]
+            if token not in tokens.get(directive, ()):
+                refusals.append(_where("stylesheet %s load from %s needs %s %s in the policy" % (kind, origin, directive, token)))
     return refusals
 
 
@@ -252,4 +264,41 @@ def check_site(public_dir):
             found.extend((path, r) for r in refusals)
             if value is not None and not refusals:
                 found.extend((path, r) for r in check_page(text, value))
+                found.extend((path, r) for r in _local_stylesheets(public_dir, text, value))
     return found
+
+
+class _StylesheetLinks(HTMLParser):
+    """The href of every `<link rel=stylesheet>` of a page, as written."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.hrefs = []
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "link" and "stylesheet" in (a.get("rel") or "").lower().split() and a.get("href") is not None:
+            self.hrefs.append(a["href"])
+
+
+def _local_stylesheets(public_dir, page_text, policy_value):
+    """Refusals for the same-origin stylesheets a page links: moving a <style> block into a file must not hide it.
+    The file must sit directly in the public directory (no subdirectory, no `..`)."""
+    out = []
+    parser = _StylesheetLinks()
+    parser.feed(page_text)
+    parser.close()
+    for href in parser.hrefs:
+        try:
+            resolved = origin_mod.resolve_load(href)
+        except origin_mod.UnparsedURL:
+            continue  # check_page refuses an unparsable load itself
+        if not resolved or resolved[0] != origin_mod.SELF_ORIGIN:
+            continue
+        name = href.split("?", 1)[0].split("#", 1)[0].lstrip("/")
+        target = public_dir / name
+        if "/" in name or not name or not target.is_file():
+            out.append(_where("the stylesheet %s is not a file directly in the public directory" % href))
+        else:
+            out.extend(check_stylesheet(target.read_text(encoding="utf-8"), policy_value))
+    return out

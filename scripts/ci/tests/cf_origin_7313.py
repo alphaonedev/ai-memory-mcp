@@ -462,35 +462,6 @@ def loaded_origins(html):
     return {load.origin for load in loaded_resources(html)}
 
 
-def _policy_lines(values):
-    """Each CSP value split into its policies (a header value joins several with commas)."""
-    return [p.strip() for v in values for p in v.split(",") if p.strip()]
-
-
-def _pattern_regex(pattern):
-    """A Cloudflare `_headers` URL pattern: `*` is a splat, `:name` a placeholder for one path segment."""
-    out = []
-    for part in re.split(r"(\*|:[A-Za-z][A-Za-z0-9_]*)", pattern):
-        out.append(".*" if part == "*" else "[^/]+" if part.startswith(":") and len(part) > 1 else re.escape(part))
-    return re.compile("^" + "".join(out) + "$")
-
-
-def header_policies(headers_text, path):
-    """The Content-Security-Policy values (one per comma-separated policy) of every `_headers` rule whose pattern
-    matches the served path, in file order (Cloudflare adds the headers of all matching rules)."""
-    values, current = [], None
-    for line in headers_text.splitlines():
-        if not line.strip():
-            continue
-        if line[0] not in " \t":
-            current = _pattern_regex(line.strip()).match(path) is not None
-        elif current:
-            name, _, value = line.strip().partition(":")
-            if name.strip().lower() == "content-security-policy":
-                values.append(value.strip())
-    return _policy_lines(values)
-
-
 def served_paths(page_name):
     """The URL paths a page is served at: its file, its extension-less pretty URL, and `/` for the index."""
     stem = page_name[:-len(".html")] if page_name.endswith(".html") else page_name

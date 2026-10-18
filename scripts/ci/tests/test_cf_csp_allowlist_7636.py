@@ -6,7 +6,7 @@ tests pin that too, because a false refusal is the intended cost of having no em
 import unittest
 from pathlib import Path
 
-import cf_cdp_7313 as cdp
+import cf_headers_7313 as headers_mod
 import cf_csp_allowlist_7313 as csp
 import cf_origin_7313 as origin_mod
 
@@ -274,11 +274,11 @@ class HeadersFailClosed7685(unittest.TestCase):
         for text in (policy_file(("/*", [self.CSP]), ("/index.html", ["! Content-Security-Policy"])),
                      policy_file(("https://dash.example/*", [self.CSP])),
                      policy_file(("/*", [self.CSP.replace("script-src", "script-src\u00a0")]))):
-            with self.assertRaises(ValueError):
-                cdp.headers_for(text, "/")
+            with self.assertRaises(headers_mod.HeadersError):
+                headers_mod.headers_for(text, "/")
 
     def test_the_shipped_headers_parse_and_are_the_only_policy(self):
-        pairs = cdp.headers_for(HEADERS, "/")
+        pairs = headers_mod.headers_for(HEADERS, "/")
         self.assertEqual([n for n, _ in pairs].count("Content-Security-Policy"), 1)
 
 

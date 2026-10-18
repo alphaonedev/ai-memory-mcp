@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-import cf_origin_7313 as origin_mod
+import cf_headers_7313 as headers_mod
 
 REPO = Path(__file__).resolve().parents[3]
 PUBLIC = REPO / "infra" / "cf-dashboard" / "public"
@@ -143,11 +143,14 @@ class WebSocket:
                 return b"".join(parts).decode("utf-8") if opcode0 == 0x1 else ""
 
     def close(self):
+        """Send the close frame and close the socket; returns why the frame was not sent, or None (#7694: no empty except)."""
+        reason = None
         try:
             self._frame(0x8, b"")
-        except OSError:
-            pass
+        except OSError as exc:  # the browser already dropped the connection
+            reason = "close frame not sent: %s" % exc
         self.sock.close()
+        return reason
 
 
 class CdpError(RuntimeError):
@@ -218,33 +221,24 @@ class Browser:
             time.sleep(0.1)
         raise RuntimeError("the browser has no page target")
 
-    def close(self):
+    def _signal_group(self, sig):
+        """Signal the browser's process group; returns why it could not be signalled, or None (#7694)."""
         try:
-            os.killpg(self.proc.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
-            pass
+            os.killpg(self.proc.pid, sig)
+        except (ProcessLookupError, PermissionError) as exc:  # already exited, or not ours to signal
+            return "%s not delivered: %s" % (sig.name, exc)
+        return None
+
+    def close(self):
+        """Stop the browser and remove its profile; returns the reasons any step was not needed (empty when all ran)."""
+        notes = [self._signal_group(signal.SIGTERM)]
         try:
             self.proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(self.proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+            notes.append("SIGTERM did not stop the browser within 10 s")
+            notes.append(self._signal_group(signal.SIGKILL))
         shutil.rmtree(self.profile, ignore_errors=True)
-
-
-def headers_for(headers_text, path):
-    """Every (name, value) of every `_headers` rule whose pattern matches the served path, in file order."""
-    out, current = [], None
-    for line in headers_text.splitlines():
-        if not line.strip():
-            continue
-        if line[0] not in " \t":
-            current = origin_mod._pattern_regex(line.strip()).match(path) is not None
-        elif current:
-            name, _, value = line.strip().partition(":")
-            out.append((name.strip(), value.strip()))
-    return out
+        return [n for n in notes if n]
 
 
 class Site:
@@ -263,7 +257,7 @@ class Site:
             def do_GET(self):
                 path = urllib.parse.urlparse(self.path).path
                 status, ctype, body = site.lookup(path)
-                headers = headers_for(site.headers_text, path)
+                headers = headers_mod.headers_for(site.headers_text, path)
                 site.served.append((path, headers))
                 self.send_response(status)
                 self.send_header("Content-Type", ctype)

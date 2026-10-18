@@ -5,8 +5,12 @@ A deny-list of known-bad names cannot be complete (`e['inner'+'HTML']`, `Range.c
 The browser enforces the real rule (Trusted Types, see public/_headers); this guard pins the SHAPE of the one place
 that is allowed to talk to Trusted Types and refuses every deviation from it:
 
-- the helper block `const { markup, cat, put } = (() => { ... })();` is the only code that names `Html`,
-  `createPolicy`, `createHTML` or `innerHTML`;
+- the helper block `const { markup, cat, put } = (() => { ... })();` is the only code that names `createPolicy`,
+  `createHTML`, `innerHTML` or the token internals (`trusted`, `mint`, `part`, `escText`, `WeakMap`, `Reflect`,
+  `Html`), and the only code that may use `Object.create`, `.constructor`, `.prototype`, `__proto__` or
+  `setPrototypeOf` (#7684: trust is a closure-private WeakMap brand, so no prototype game outside the block can
+  matter, and none is accepted);
+- inside the block the brand is a `new WeakMap` and nothing is a type: no `class`, no `instanceof`;
 - inside it, `put` holds exactly one `createPolicy("dash", ...)` and exactly one `.createHTML(` call, and the
   policy's `createHTML` rule escapes (it names `escText`);
 - every other `markup` token tags a template literal (`markup` followed by a template), never a call;
@@ -20,7 +24,12 @@ import re
 REGEX_AFTER_PUNCT = set("(,=:[!&|?{};+-*%<>~^")
 REGEX_AFTER_WORDS = {"return", "typeof", "case", "in", "of", "void", "delete", "throw", "else", "do"}
 POLICY_NAME = "dash"
-GUARDED_NAMES = ("Html", "createPolicy", "createHTML", "innerHTML")
+GUARDED_NAMES = ("Html", "createPolicy", "createHTML", "innerHTML", "trusted", "mint", "part", "escText", "WeakMap",
+                 "Reflect", "setPrototypeOf", "__proto__", "constructor", "prototype")
+# strings that name a prototype or constructor reach outside the block (`o["constructor"]`, `Object["create"]`)
+GUARDED_STRINGS = frozenset(GUARDED_NAMES) | {"create"}
+# inside the block: no type-based trust
+HELPER_REFUSED = ("class", "instanceof", "Html", "constructor", "prototype", "setPrototypeOf", "__proto__", "Reflect")
 ID_START = re.compile(r"[A-Za-z_$]")
 ID_BODY = re.compile(r"[A-Za-z0-9_$]*")
 NUMBER = re.compile(r"[0-9][0-9A-Za-z_.]*")
@@ -226,6 +235,22 @@ def js_problems(src, helper_allowed):
         outside = [t for t in flat if t.is_id(name) and not inside(t, helper_lo, helper_hi)]
         if outside:
             problems.append("%s used outside the helper block (offset %d)" % (name, outside[0].start))
+    for i, t in enumerate(flat):
+        if inside(t, helper_lo, helper_hi):
+            continue
+        if t.is_id("create") and i >= 2 and flat[i - 1].is_punct(".") and flat[i - 2].is_id("Object"):
+            problems.append("Object.create used outside the helper block (offset %d)" % t.start)
+        text = t.value[1:-1] if t.kind == "str" or (t.kind == "tpl" and not t.exprs) else None
+        if text in GUARDED_STRINGS:
+            problems.append("the string %r names a prototype or constructor reach outside the helper block (offset %d)"
+                            % (text, t.start))
+    if helper_allowed and helper >= 0:
+        inner_all = [t for t in flat if inside(t, helper_lo, helper_hi)]
+        if not any(t.is_id("WeakMap") for t in inner_all):
+            problems.append("the helper block must keep trust in a closure-private WeakMap")
+        for name in HELPER_REFUSED:
+            if any(t.is_id(name) for t in inner_all):
+                problems.append("%s inside the helper block: trust is a WeakMap brand, not a type" % name)
     policies = [t for t in flat if t.is_id("createPolicy")]
     if helper_allowed:
         if len(policies) != 1 or not inside(policies[0], put_lo, put_hi):

@@ -958,8 +958,10 @@ const out = {};
                          (rec["validated"], rec["failclosed"], rec["refining"]))
         self.assertEqual(rec["functional"], rec["total"] - rec["refining"])
         page = (PUBLIC / "mcp-tools.html").read_text(encoding="utf-8")
+        self.assertIn('href="/vv.css"', page)  # the page's styles live in the stylesheet it links (#7689)
+        css = (PUBLIC / "vv.css").read_text(encoding="utf-8")
         for cls in TOOL_CLASSES:
-            self.assertIn(".tool.%s" % cls, page)
+            self.assertIn(".tool.%s" % cls, css)
 
     def test_7644_the_classes_file_names_only_captured_tools(self):
         classes = json.loads(MCP_CLASSES.read_text(encoding="utf-8"))

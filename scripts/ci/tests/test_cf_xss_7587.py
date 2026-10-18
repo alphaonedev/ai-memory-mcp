@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 
 import cf_csp_allowlist_7313 as csp
+import cf_headers_7313 as headers_mod
 import cf_pages_harness_7313 as harness
 import cf_xss_guard_7587 as guard
 
@@ -81,8 +82,8 @@ class GuardAllowlist7634(unittest.TestCase):
         self.refused(src + '\nconst t = window.trustedTypes.defaultPolicy.createHTML(s);\n', "exactly one .createHTML( call")
 
     def test_a_pass_through_createhtml_rule_is_refused(self):
-        self.refused(self.mutated("h instanceof Html ? h.s : escText(s)", "s"), "must escape")
-        self.refused(self.mutated("h instanceof Html ? h.s : escText(s)", "h instanceof Html ? h.s : s"), "must escape")
+        self.refused(self.mutated("has(h) ? get(h) : escText(s)", "s"), "must escape")
+        self.refused(self.mutated("has(h) ? get(h) : escText(s)", "has(h) ? get(h) : s"), "must escape")
 
     def test_an_innerhtml_outside_put_is_refused(self):
         self.refused(self.appended("el.innerHTML = s;"), "innerHTML used outside the helper block")
@@ -207,11 +208,12 @@ class EveryPage7587(unittest.TestCase):
 
     def test_script_src_has_no_unsafe_inline_in_any_policy_line(self):
         headers = (PUBLIC / "_headers").read_text(encoding="utf-8")
-        policies = [line.split(":", 1)[1] for line in headers.splitlines() if line.strip().startswith("Content-Security-Policy")]
+        policies = [value for rule in headers_mod.parse(headers) for name, value, _ in rule.headers
+                    if name.lower() == "content-security-policy"]
         self.assertTrue(policies)
         for policy in policies:
             for directive in policy.split(";"):
-                parts = directive.split()
+                parts = headers_mod.csp_tokens(directive)
                 if parts and parts[0] in ("script-src", "script-src-elem", "script-src-attr"):
                     self.assertNotIn("'unsafe-inline'", parts, directive)
 

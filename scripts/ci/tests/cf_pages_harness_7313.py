@@ -10,7 +10,7 @@ import json
 import mimetypes
 from pathlib import Path
 
-import cf_origin_7313 as origin_mod
+import cf_headers_7313 as headers_mod
 
 PUBLIC = Path(__file__).resolve().parents[3] / "infra" / "cf-dashboard" / "public"
 ORIGIN = "https://dash.example"
@@ -79,7 +79,7 @@ class Site:
         if target.suffix == ".js":
             headers["Content-Type"] = "text/javascript; charset=utf-8"
         if self.with_csp:
-            lines = origin_mod.header_policies(self._headers, path)
+            lines = headers_mod.csp_policies(self._headers, path)
             if lines:
                 headers["Content-Security-Policy"] = ", ".join(lines)
         route.fulfill(status=200, body=target.read_bytes(), headers=headers)

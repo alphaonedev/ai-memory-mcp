@@ -9,7 +9,6 @@ window.trustedTypes): it still renders, through the escaping `markup` tag and `s
 
 A missing browser SKIPS the class, except where CF_DASH_REQUIRE_BROWSER=1 (the CI step), where it FAILS.
 """
-import copy
 import json
 import os
 import subprocess
@@ -39,11 +38,13 @@ PANELS = {
     "#agentsPanel > *": 2, "#cfgpre > *": 6,
 }
 # the hostile state (every string markup, every number 1e999): a value that is not a finite number is omitted from SVG
-# and shown as the text placeholder elsewhere, so the same panels render, with the same element counts, and nothing is
-# logged (#7687 #7688). Pinned, not "any".
+# and shown as the text placeholder elsewhere, so the same panels render and nothing is logged (#7687 #7688). Pinned,
+# not "any". Two panels differ from the normal counts, for stated reasons: the ring keeps only its base circle (its
+# two data arcs have non-finite geometry and are omitted), and the A2A panel gains four bars (the hostile keys
+# createHTML, __proto__, toString and constructor are four extra own entries of `types`, each rendered as plain text).
 HOSTILE_PANELS = {
-    "#livebadge > *": 2, "#ringsvg > *": 3, "#kpis > *": 5, "#pillars > *": 4, "#hwmon > *": 2, "#domon > *": 3,
-    "#swarmwrap > *": 4, "#swarm > *": 1, "#tpchart > *": 1, "#fedchart > *": 1, "#a2apanel > *": 6,
+    "#livebadge > *": 2, "#ringsvg > *": 1, "#kpis > *": 5, "#pillars > *": 4, "#hwmon > *": 2, "#domon > *": 3,
+    "#swarmwrap > *": 4, "#swarm > *": 1, "#tpchart > *": 1, "#fedchart > *": 1, "#a2apanel > *": 7,
     "#bootpanel > *": 1, "#oplatpanel > *": 1, "#commspanel > *": 1, "#capchart > *": 1, "#wpchart > *": 1,
     "#aiusage > *": 3, "#latchart > *": 1, "#covchart > *": 1, "#scalechart > *": 1, "#secpanel > *": 1,
     "#cycpanel > *": 2, "#campaignsPanel > *": 4, "#board > *": 4, "#issuespanel > *": 1, "#feed > *": 1,
@@ -74,6 +75,7 @@ window.__shapes = {};
   t("other policy", () => { window.trustedTypes.createPolicy("other", {}); });
   t("markup called as a function", () => { markup("<b>x</b>"); });
   t("put a string", () => { put(host, "<b>x</b>"); });
+  t("document.write", () => { document.write(s); });
 })();
 """
 CHEAT_SHAPES = ("markup called as a function", "put a string")  # refused by index.js itself, with or without Trusted Types
@@ -125,6 +127,7 @@ def leaves(value, fn, path=()):
         out["createHTML"] = PAYLOAD
         out["__proto__"] = {"polluted": PAYLOAD, "createHTML": PAYLOAD}
         out["toString"] = PAYLOAD
+        out["constructor"] = PAYLOAD
         return out
     if isinstance(value, list):
         return [leaves(v, fn, path + (str(i),)) for i, v in enumerate(value)]
@@ -144,10 +147,16 @@ def hostile_text(base):
     return json.dumps(state).replace('"\\u0000INF"', "1e999")
 
 
+def mutate(text, old, new):
+    """text.replace(old, new), refusing a replace that changes nothing (#7691: a no-op mutation proves nothing)."""
+    assert text.count(old) >= 1, "the mutation target %r is not present, so the mutation would be a no-op" % old
+    return text.replace(old, new)
+
+
 def without(headers_text, directives):
     out = headers_text
     for directive in directives:
-        out = out.replace("; " + directive, "")
+        out = mutate(out, "; " + directive, "")
     return out
 
 
@@ -179,16 +188,13 @@ def assert_tt_header(result):
         assert directive in (result["csp"] or ""), "the browser fetched / without `%s`" % directive
 
 
-def assert_clean(result, counts=None, strict_log=True):
-    """0 Trusted Types violations, 0 CSP violations, empty console, no exception, nothing executed, panels rendered."""
+def assert_clean(result, counts=None):
+    """0 Trusted Types violations, 0 CSP violations, empty console, EMPTY log (no allowance for any message, #7688),
+    no exception, nothing executed, panels rendered with the expected element counts."""
     assert result["v"] == [], "violations: %s" % result["v"]
     assert result["exceptions"] == [], "exceptions: %s" % result["exceptions"]
-    if strict_log:
-        assert result["console"] == [], "console: %s" % result["console"]
-        assert result["log"] == [], "log: %s" % result["log"]
-    else:  # 1e999 makes SVG attributes NaN: Chrome logs a rendering error per attribute, which is data validity, not safety
-        stray = [m for m in result["log"] if not m.startswith("rendering/error:")]
-        assert stray == [], "log: %s" % stray
+    assert result["console"] == [], "console: %s" % result["console"]
+    assert result["log"] == [], "log: %s" % result["log"]
     assert result["pwn"] == "undefined", "window.__pwn is %s" % result["pwn"]
     if counts is not None:
         for selector, expected in counts.items():
@@ -254,7 +260,7 @@ class TokenForging7684(BrowserCase):
 
     def test_the_constructor_and_prototype_attempts_throw_and_the_s_mutation_is_inert(self):
         forged = self.run_page(js_append=FORGE_JS)["forge"]
-        for name in ("constructor", "prototype set", "Object.create", "__proto__ literal", "plain object with s", "cat of a forged value"):
+        for name in ("constructor", "prototype set", "Object.create", "__proto__ literal", "plain object with s"):
             self.assertTrue(forged[name]["how"].startswith("threw"), (name, forged[name]))
         self.assertEqual(forged[".s mutation"]["html"], "x", forged[".s mutation"])
 
@@ -328,7 +334,7 @@ class MutationProofs7634(BrowserCase):
 
     def test_without_trusted_types_enforcement_the_sinks_run(self):
         weak = without(HEADERS_TEXT, TT_DIRECTIVES)
-        result = self.run_page(headers_text=weak, js_append=SHAPES_JS.replace("document.write(s);", ""))
+        result = self.run_page(headers_text=weak, js_append=mutate(SHAPES_JS, "document.write(s);", ""))
         ran = {name for name, how in result["shapes"].items() if how == "ran"}
         self.assertTrue({"innerHTML", "computed innerHTML", "insertAdjacentHTML"} <= ran, result["shapes"])
         for name in CHEAT_SHAPES:

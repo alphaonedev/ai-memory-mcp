@@ -13,8 +13,8 @@ depends on the hostname of the machine running the producer (#7592): the verdict
 on every machine. A listed name matches as a whole host token (bounded by characters that cannot be part
 of a host id), and so does a listed name followed by host-id suffix characters (`box-07`, `box_2`, `ai2`, #7641):
 those derivatives are reported by find_leaks and scrubbed. Tokens that merely CONTAIN a listed name (`mailbox`,
-`x-box`) are untouched, and the explicit exception list NAME_EXCEPTIONS (the product name `ai-memory`) is never
-treated as a derivative. A configured names file that cannot be
+`x-box`) are untouched, and the exact allowlist NAME_EXCEPTIONS (the product names `ai-memory` and `ai-memory-mcp`, whole tokens only) is
+never treated as a derivative; `ai-memory-box` is. A configured names file that cannot be
 read fails closed (LeakError); an unconfigured, absent default file is simply empty.
 """
 import json
@@ -27,8 +27,9 @@ REDACTED_PATH = "<redacted-path>"
 NAMES_ENV = "CF_DASHBOARD_HOSTNAMES_FILE"
 DEFAULT_NAMES_FILE = Path(__file__).resolve().parent / "hostnames.local"
 
-# a derivative of a listed name that is NOT a host (#7641): tokens that start with one of these are left alone
-NAME_EXCEPTIONS = ("ai-memory",)
+# a derivative of a listed name that is NOT a host (#7641, #7692): an EXACT allowlist of whole tokens. A prefix rule
+# would also pass `ai-memory-box` or `ai-memory-f2`, which are host-shaped derivatives and must be scrubbed.
+NAME_EXCEPTIONS = frozenset({"ai-memory", "ai-memory-mcp"})
 
 _PATH_TAIL = r"""[^\s"'\\,;)\]}]*"""
 _PATH_PATTERNS = (
@@ -95,12 +96,12 @@ def _name_re():
 
 
 def _name_hits(text):
-    """Matches of the listed names (and their suffix derivatives), minus the NAME_EXCEPTIONS tokens."""
+    """Matches of the listed names (and their suffix derivatives), minus the NAME_EXCEPTIONS whole tokens."""
     name_re = _name_re()
     if name_re is None:
         return []
     return [m for m in name_re.finditer(text)
-            if not m.group(0).lower().startswith(NAME_EXCEPTIONS)]
+            if m.group(0).lower() not in NAME_EXCEPTIONS]
 
 
 def find_leaks(text):
