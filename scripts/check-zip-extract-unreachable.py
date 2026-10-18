@@ -717,21 +717,43 @@ def logical_path(root, path):
         return lexical(real_of(path.parent) / path.name)
 
 
-def target_candidates(source, value, is_path_attr, inline=()):
-    """Logical paths a #[path] / include! value can name from `source` (the logical path of the file).
+SYMLINK_DOTDOT = "crosses a symlink with '..'"
+
+
+def target_joins(source, value, is_path_attr, inline=()):
+    """The UNFOLDED joins a #[path] / include! value can name from `source` (the logical path of the file).
 
     rustc: a `#[path]` is relative to the directory of the file, plus the names of the enclosing
     inline `mod y { .. }` blocks (H); in a plain `name.rs` file those sit under `name/`, so both
     bases are candidates. Over-listing is the fail-closed direction.
     """
     if not is_path_attr:
-        return [lexical(source.parent / value)]
+        return [source.parent / value]
     sub = Path(*inline) if inline else Path()
-    return [lexical(base / sub / value) for base in (source.parent, source.parent / source.stem)]
+    return [base / sub / value for base in (source.parent, source.parent / source.stem)]
+
+
+def target_candidates(source, value, is_path_attr, inline=()):
+    """The joins of `target_joins`, with `.` and `..` folded away textually."""
+    return [lexical(join) for join in target_joins(source, value, is_path_attr, inline)]
+
+
+def crosses_symlink_dotdot(join):
+    """True when the OS resolves `join` (a `..` after a symlinked component walks out of the link
+    target) to a different file than the textual fold of it (F1, r5 regression)."""
+    if '..' not in join.parts:
+        return False
+    folded = lexical(join)
+    if not (join.is_file() or folded.is_file()):
+        return False
+    return os.path.realpath(str(join)) != os.path.realpath(str(folded))
 
 
 def resolve_target(root, source, value, is_path_attr, inline=()):
     """Resolve a #[path] / include! target; returns ([logical paths of the existing files], problem or None)."""
+    for join in target_joins(source, value, is_path_attr, inline):
+        if crosses_symlink_dotdot(join):
+            return [], SYMLINK_DOTDOT
     found = []
     for candidate in target_candidates(source, value, is_path_attr, inline):
         if candidate.is_file():
@@ -755,7 +777,36 @@ PASTE_LOADER_NORMAL = re.compile(loader_alternation(True) + r'\b')
 MOD_DECL = re.compile(r'(?<![\w])mod\s+(?:r#)?([A-Za-z_]\w*)\s*;')
 MACRO_RULES = re.compile(r'\bmacro_rules\s*!\s*(?:r#)?([A-Za-z_]\w*)\s*(?=[(\[{])')
 MACRO_MOD = re.compile(r'(?<![\w$])mod\s+(?:r#)?\$?\s*[A-Za-z_]\w*\s*;')
-INLINE_MOD_OR_BRACE =re.compile(r'\bmod\s+(?:r#)?([A-Za-z_]\w*)\s*\{|[{}]')
+INLINE_MOD_OR_BRACE = re.compile(r'\bmod\s+(?:r#)?([A-Za-z_]\w*)\s*\{|[{}]')
+INLINE_MOD_OPEN = re.compile(r'\bmod\s+(?:r#)?[A-Za-z_]\w*\s*\{')
+# The `mod` keyword in any form but `mod name;` / `mod name {` / `mod $name;` (F3): handed to a
+# macro as input tokens it emits a file module the guard never sees. `r#mod` and `$mod` are not it.
+MOD_KEYWORD_OTHER = re.compile(r'(?<![\w$#])mod\b(?!\s*(?:r#)?\$?\s*[A-Za-z_]\w*\s*[;{])')
+
+
+def mod_keyword_hits(masked):
+    """Line numbers of a `mod` keyword the guard cannot follow (F3); masked text, so strings and comments are out."""
+    return sorted({masked.count('\n', 0, hit.start()) + 1 for hit in MOD_KEYWORD_OTHER.finditer(masked)})
+
+
+def inline_mod_path_keys(masked):
+    """(line, offset of the `path` key) for each `#[path = ..]` / `cfg_attr(.., path = ..)` ON an inline `mod y { .. }` (F2).
+
+    Such a key moves the directory of the child `mod` loads of `y`, which the guard does not model, so it
+    is a violation (fail closed) instead of an unscanned directory.
+    """
+    hits = []
+    for opener in INLINE_MOD_OPEN.finditer(masked):
+        window_start = max(0, opener.start() - 300)
+        window = masked[window_start:opener.start()]
+        cut = max(window.rfind(sep) for sep in ';{}') + 1
+        before = window[cut:]
+        for offset, body in attribute_bodies(before):
+            for key in PATH_KEY.finditer(body):
+                if path_key_loads(body, key.start()):
+                    absolute = window_start + cut + offset + key.start()
+                    hits.append((masked.count('\n', 0, absolute) + 1, absolute))
+    return hits
 
 
 def paste_loader_hits(text, masked):
@@ -913,8 +964,11 @@ class SourceFile(object):
 def source_refs(text, masked):
     """(kind, line, value or None, inline mods, loads) for each #[path] attribute and include! (H, N)."""
     refs = []
+    on_inline_mod = {absolute for _line, absolute in inline_mod_path_keys(masked)}
     for offset, body in attribute_bodies(masked):
         for key in PATH_KEY.finditer(body):
+            if offset + key.start() in on_inline_mod:
+                continue  # reported as a whole by `inline_mod_path_keys`; its value is a directory, not a file
             number = masked.count('\n', 0, offset + key.start()) + 1
             literal = PATH_LITERAL.match(text, offset + key.end())
             inline = tuple(enclosing_inline_mods(masked, offset + key.start()))
@@ -971,6 +1025,9 @@ def check_sources(root, manifest_text='', label='', targets=()):
                 report(violation(where, what + ' cannot be followed'))
                 continue
             found, problem = resolve_target(root, logical, value, kind == 'path', inline)
+            if problem == SYMLINK_DOTDOT:
+                report(violation(where, '#[path]/include! target ' + problem))
+                continue
             if problem:
                 report(violation(where, ('#[path] ' if kind == 'path' else 'include! ') + problem))
                 continue
@@ -1021,6 +1078,10 @@ def check_sources(root, manifest_text='', label='', targets=()):
             report(violation('%s:%d' % (rel, number),
                              'mod declared inside macro_rules! %s resolves where the macro is invoked and cannot be '
                              'followed' % macro))
+        for number, _absolute in inline_mod_path_keys(masked):
+            report(violation('%s:%d' % (rel, number), '#[path] on an inline mod is not supported'))
+        for number in mod_keyword_hits(masked):
+            report(violation('%s:%d' % (rel, number), 'mod keyword in a form the guard cannot follow'))
         for number in macro_input_hits(text, masked):
             report(violation('%s:%d' % (rel, number), 'zip named in macro input'))
         for number in paste_loader_hits(text, masked):

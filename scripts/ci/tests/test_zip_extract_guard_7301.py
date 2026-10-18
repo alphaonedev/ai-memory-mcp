@@ -1511,6 +1511,108 @@ class RuleFixtures7305To7312(GuardBase):
         self.assertIn('other/a/gen.rs:1', res.stdout)
         self.assertIn('candle-loader', res.stdout)
 
+    def other_crate(self, lib):
+        """A crate root at other/lib.rs (outside SCAN_DIRS), so only a followed load reaches a loader."""
+        self.write('Cargo.toml', PACKAGE_ONLY + '[lib]\npath = "other/lib.rs"\n')
+        self.write('other/lib.rs', lib)
+        return self.meta_targets(['other/lib.rs'])
+
+    def test_dotdot_after_a_symlinked_component_fails_7310(self):
+        """F1 (r5 regression): `link/../x.rs` is lib2/x.rs for the OS, other/x.rs for a textual fold."""
+        for lib in ('#[path = "link/../x.rs"]\nmod x;\n', 'include!("link/../x.rs");\n'):
+            with self.subTest(lib=lib):
+                meta = self.other_crate(lib)
+                self.write('other/x.rs', 'pub fn g() {}\n')
+                self.write('lib2/x.rs', self.LOADER)
+                self.write('lib2/inner/keep', '')
+                self.symlink_module('other/link', '../lib2/inner')
+                res = self.run_guard(meta=meta)
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn("other/lib.rs:1: #[path]/include! target crosses a symlink with '..'", res.stdout)
+                (self.root / 'other' / 'link').unlink()
+
+    def test_dotdot_without_a_symlink_and_symlink_without_dotdot_pass_7310(self):
+        meta = self.other_crate('#[path = "sub/../x.rs"]\nmod x;\n')
+        self.write('other/x.rs', 'pub fn g() {}\n')
+        self.write('other/sub/keep', '')
+        res = self.run_guard(meta=meta)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.write('other/lib.rs', '#[path = "link/x.rs"]\nmod x;\n')
+        self.write('lib2/inner/x.rs', 'pub fn g() {}\n')
+        self.symlink_module('other/link', '../lib2/inner')
+        res = self.run_guard(meta=meta)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
+    def test_crosses_symlink_dotdot_compares_the_os_and_the_folded_path_7310(self):
+        module = load_guard_module()
+        self.write('a/real/x.rs', 'pub fn g() {}\n')
+        self.write('a/real/sub/keep', '')
+        self.write('a/plain/keep', '')
+        self.write('a/x.rs', 'pub fn g() {}\n')
+        self.symlink_module('a/link', 'real/sub')
+        self.assertFalse(module.crosses_symlink_dotdot(self.root / 'a' / 'plain' / '..' / 'x.rs'))
+        self.assertFalse(module.crosses_symlink_dotdot(self.root / 'a' / 'link' / 'keep'))
+        self.assertFalse(module.crosses_symlink_dotdot(self.root / 'a' / 'link' / '..' / 'nothing.rs'))
+        self.assertTrue(module.crosses_symlink_dotdot(self.root / 'a' / 'link' / '..' / 'x.rs'))
+
+    def test_path_on_an_inline_mod_fails_7310(self):
+        """F2: `#[path = "d"] mod y { mod w; }` loads w from d/, not y/; the guard does not model it."""
+        for attr in ('#[path = "d"]', '#[cfg_attr(all(), path = "d")]', '#[allow(dead_code)] #[path = "d"] pub'):
+            with self.subTest(attr=attr):
+                meta = self.other_crate(attr + ' mod y { mod w; }\n')
+                self.write('other/y/w.rs', 'pub fn g() {}\n')
+                self.write('other/d/w.rs', self.LOADER)
+                self.write('other/lib/d', 'pub fn g() {}\n')
+                res = self.run_guard(meta=meta)
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('other/lib.rs:1: #[path] on an inline mod is not supported', res.stdout)
+                self.assertNotIn('does not resolve', res.stdout)
+
+    def test_clean_path_on_an_inline_mod_names_the_inline_rule_7310(self):
+        """F5: a clean `#[path = "d"] mod y { mod w; }` fails closed with the F2 message."""
+        meta = self.other_crate('#[path = "d"] mod y { mod w; }\n')
+        self.write('other/d/w.rs', 'pub fn g() {}\n')
+        res = self.run_guard(meta=meta)
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        self.assertIn('#[path] on an inline mod is not supported', res.stdout)
+
+    def test_inline_mod_path_rule_has_no_false_positive_7310(self):
+        module = load_guard_module()
+        for source in ('#[cfg(all())] mod y { mod w; }\n', 'mod y { #[path = "x.rs"] mod m; }\n',
+                       '#[path = "x.rs"] mod m;\nmod y { fn f() {} }\n', '#[cfg(feature = "path")] mod y { }\n',
+                       '// #[path = "d"]\nmod y { }\n', 'fn f() { let s = "#[path = \\"d\\"]"; }\nmod y { }\n'):
+            with self.subTest(source=source):
+                self.assertEqual(module.inline_mod_path_keys(module.mask_rust(source)), [])
+        self.assertEqual([line for line, _ in module.inline_mod_path_keys(
+            module.mask_rust('fn a() {}\n#[path = "d"]\nmod y { }\n'))], [2])
+
+    def test_mod_keyword_as_macro_input_fails_7310(self):
+        """F3: `mod` handed to a macro as tokens emits a file module the guard never sees."""
+        for body in ('macro_rules! m { ($k:tt $n:ident) => { $k $n; } }\nm!(mod gen);\n',
+                     'macro_rules! m { ($($t:tt)*) => { $($t)* ; } }\nm!(mod gen);\n'):
+            with self.subTest(body=body):
+                meta = self.other_crate(body)
+                self.write('other/gen.rs', self.LOADER)
+                res = self.run_guard(meta=meta)
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('other/lib.rs:2: mod keyword in a form the guard cannot follow', res.stdout)
+
+    def test_mod_keyword_rule_masked_text_and_identifiers_7310(self):
+        module = load_guard_module()
+        hits = module.mod_keyword_hits
+        masked = module.mask_rust
+        for quiet in ('mod gen;\n', 'pub mod a { }\n', 'mod r#type;\n', 'macro_rules! m { ($i:ident) => { mod $i; } }\n',
+                      'macro_rules! m { ($i:ident) => { mod $i { } } }\n', 'let r#mod = 1;\n', 'x::r#mod();\n',
+                      '$crate::mod_fn(1);\n', 'fn mod_fn() {}\n', 'let model = mod_a;\n', 'let s = "mod x y";\n',
+                      '// mod in a comment\n', '/* mod */\n', '/// mod gen\nfn f() {}\n', 'mod\n  gen\n;\n', 'mod $\n n;\n'):
+            with self.subTest(quiet=quiet):
+                self.assertEqual(hits(masked(quiet)), [])
+        for loud, line in (('m!(mod gen);\n', 1), ('fn f() {}\nm!(mod);\n', 2), ('m!(mod, gen);\n', 1),
+                           ('m!(mod $n:ident);\n', 1), ('macro_rules! m { ($k:tt) => { $k gen; } }\nm!(mod);\n', 2),
+                           ('mod 1x;\n', 1), ('mod {}\n', 1)):
+            with self.subTest(loud=loud):
+                self.assertEqual(hits(masked(loud)), [line])
+
     def test_cargo_timeout_is_a_tool_error_7310(self):
         """L-c: a hung cargo ends as ToolError (rc 2) naming the command, and both calls carry a timeout."""
         module = load_guard_module()
