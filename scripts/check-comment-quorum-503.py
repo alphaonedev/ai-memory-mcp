@@ -53,7 +53,7 @@ ALLOWLIST = Path("scripts/qc-allowlists/comment-quorum-503-allow.txt")
 
 
 def load_allowlist(root):
-    """Repo-relative paths whose stale comments wait on a cert-gated change."""
+    """Pinned `path:line` entries whose stale comments wait on a cert-gated change."""
     path = Path(root) / ALLOWLIST
     if not path.is_file():
         return set()
@@ -68,9 +68,10 @@ def load_allowlist(root):
 def scan(root):
     """Return a list of 'path:line: message' findings for `root/src`.
 
-    A file on the burn-down allowlist is exempt only while it still has a
-    finding; once its comments are fixed the entry is STALE and fails, so the
-    list can only shrink.
+    A finding pinned on the burn-down allowlist as `path:line` is exempt only
+    while that exact line still carries the stale comment; once it is fixed
+    (or the line moves) the entry is STALE and fails, and a NEW stale comment
+    in the same file is not covered, so the list can only shrink.
     """
     findings = []
     allow = load_allowlist(root)
@@ -89,21 +90,22 @@ def scan(root):
             if HISTORICAL.search(block):
                 continue
             rel = path.relative_to(root).as_posix()
-            if rel in allow:
-                seen_allowed.add(rel)
-                continue
             for offset, line in enumerate(block.splitlines()):
-                if CODE_503.search(line):
-                    findings.append(
-                        "%s:%d: comment pairs a quorum miss with 503 "
-                        "(real contract: 202 Accepted + quorum_met:false via "
-                        "under_replicated_response): %s"
-                        % (path.relative_to(root), first + offset, line.strip())
-                    )
-    for rel in sorted(allow - seen_allowed):
+                if not CODE_503.search(line):
+                    continue
+                pin = "%s:%d" % (rel, first + offset)
+                if pin in allow:
+                    seen_allowed.add(pin)
+                    continue
+                findings.append(
+                    "%s: comment pairs a quorum miss with 503 "
+                    "(real contract: 202 Accepted + quorum_met:false via "
+                    "under_replicated_response): %s" % (pin, line.strip())
+                )
+    for pin in sorted(allow - seen_allowed):
         findings.append(
-            "%s: STALE allowlist entry (no quorum+503 comment left); remove it from %s"
-            % (rel, ALLOWLIST)
+            "%s: STALE allowlist entry (no quorum+503 comment on that line); remove it from %s"
+            % (pin, ALLOWLIST)
         )
     return findings
 
@@ -129,9 +131,18 @@ def self_test():
             print("self-test FAILED: expected exactly stale.rs:1, got %r" % (found,))
             return 2
         (Path(tmp) / ALLOWLIST.parent).mkdir(parents=True)
-        (Path(tmp) / ALLOWLIST).write_text("src/stale.rs\n", encoding="utf-8")
+        (Path(tmp) / ALLOWLIST).write_text("src/stale.rs:1\n", encoding="utf-8")
         if scan(tmp):
-            print("self-test FAILED: an allowlisted stale.rs must pass")
+            print("self-test FAILED: an allowlisted stale.rs:1 must pass")
+            return 2
+        (src / "stale.rs").write_text(
+            "// on a quorum miss we short-circuit with 503 so\n// operators can retry.\nfn a() {}\n"
+            "// a NEW quorum miss answers 503 here.\nfn n() {}\n",
+            encoding="utf-8",
+        )
+        found = scan(tmp)
+        if len(found) != 1 or "stale.rs:4" not in found[0]:
+            print("self-test FAILED: a new stale line next to a pinned one must fail, got %r" % (found,))
             return 2
         (src / "stale.rs").write_text("fn a() {}\n", encoding="utf-8")
         found = scan(tmp)

@@ -1335,21 +1335,36 @@ mod tests {
         let src = include_str!("profile.rs");
         let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
         let mut stale: Vec<String> = Vec::new();
+        let profile_names = ["core", "graph", "admin", "power", "full"];
         for (idx, line) in prod.lines().enumerate() {
             let t = line.trim_start();
             if !(t.starts_with("//!") || t.starts_with("///")) {
                 continue;
             }
             let words: Vec<&str> = t.split_whitespace().collect();
-            for pair in words.windows(2) {
-                let num = pair[0].trim_start_matches(|c: char| !c.is_ascii_digit());
-                if !pair[1].starts_with("tools") || num.is_empty() {
+            let bare = |w: &str| {
+                w.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+                    .to_owned()
+            };
+            for (i, word) in words.iter().enumerate() {
+                // A total is `N tools`, or a number tied to a profile name:
+                // `N (core)` (the #7276 drifted form) or `**N** at core`.
+                let next = words.get(i + 1).map_or_else(String::new, |w| bare(w));
+                let after = words.get(i + 2).map_or_else(String::new, |w| bare(w));
+                let tied = words.get(i + 1).is_some_and(|w| w.starts_with("tools"))
+                    || profile_names.contains(&next.as_str())
+                    || (next == "at" && profile_names.contains(&after.as_str()));
+                let num = bare(word);
+                if !tied || num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
                     continue;
                 }
                 if let Ok(n) = num.parse::<usize>()
                     && !allowed.contains(&n)
                 {
-                    stale.push(format!("src/profile.rs:{}: `{n} tools`", idx + 1));
+                    stale.push(format!(
+                        "src/profile.rs:{}: `{n}` tied to `{next}`",
+                        idx + 1
+                    ));
                 }
             }
         }
