@@ -42,7 +42,7 @@ import tmp_runtime_guard_7393 as guard
 from test_evidence_generator_5040_5042 import ScratchCase, load
 from test_evidence_generator_r2_7393 import GIT, make_repo
 from test_evidence_generator_r5_7393 import BundleFixture, GatesRun
-from test_evidence_generator_r7_7393 import GATE_FILE, PLANTED, REAL_GATE, RECAPTURE_SH, tree
+from test_evidence_generator_r7_7393 import GATE_FILE, PLANTED, REAL_GATE, RECAPTURE_SH, tree, write_empty
 
 TESTS = Path(__file__).resolve().parent
 EVIDENCE_DIR = TESTS.parent.parent / "evidence"
@@ -418,8 +418,8 @@ class PublishNoReplace7667(BundleFixture):
 
 
 class LoaderGlobals7666(ScratchCase):
-    SCRIPT = ("import sys\n"
-              "print('NAMES', sorted(globals()))\n"
+    SCRIPT = ("print('NAMES', sorted(globals()))\n"
+              "import sys\n"
               "print('ARGV', sys.argv)\n"
               "print('FILE', __file__)\n"
               "print('SPEC', __spec__)\n"
@@ -571,7 +571,7 @@ class AstMissedSpellings7670(ScratchCase):
         path = build_path()
         with guard.captured(self.fake) as sink:
             with self.assertRaises(guard.TmpRootViolation):
-                open(path + "/probe.txt", "w")
+                write_empty(path + "/probe.txt")
         self.assertTrue(sink)
         self.assertEqual(list(self.fake.iterdir()), [])
 

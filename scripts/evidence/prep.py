@@ -17,25 +17,45 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(1, str(Path(__file__).resolve().parents[1]))
 from run_cert import anchored  # noqa: E402  (one anchoring rule for every CERT_* path)
+from check_cert_expiry import is_watched_path  # noqa: E402  (#7664: the gate's own predicate, not a copy)
 FED_ID = re.compile(r"AI_MEMORY_FED_[A-Z0-9_]+")
-HANDLER_WATCH = ("src/handlers/federation_receive.rs", "src/handlers/federation_signing_check.rs")
+
+
+def run_git(repo, *args, **kw):
+    """git -C <repo> with the working directory <repo>; a repo that cannot be entered is exit 3, never a traceback."""
+    try:
+        return subprocess.run(["git", "-C", str(repo), *args], cwd=str(repo), **kw)
+    except OSError as e:
+        sys.stderr.write(f"git {' '.join(args)} cannot run in {repo}: {e.strerror or e}\n")
+        sys.exit(3)
 
 
 def git(repo, *args):
-    r = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+    r = run_git(repo, *args, capture_output=True)
     if r.returncode != 0:
-        sys.stderr.write(f"git {' '.join(args)} failed rc={r.returncode}: {r.stderr}")
+        sys.stderr.write(f"git {' '.join(args)} failed rc={r.returncode}: {r.stderr.decode('utf-8', 'replace')}")
         sys.exit(3)
-    return r.stdout
+    return r.stdout.decode("utf-8", "surrogateescape")
 
 
-def is_watched(p):
-    return p == "src/federation" or p.startswith("src/federation/") or p in HANDLER_WATCH
+def numstat(repo, base, tip):
+    """(added, deleted, path) for BASE..TIP from `git diff --numstat -z`: NUL-separated records, paths verbatim (a
+    non-ASCII or space path is never quoted). A binary file reports `-` for both counts and is returned as None/None
+    (#7664, #7669)."""
+    records = git(repo, "diff", "--numstat", "-z", "--no-renames", f"{base}..{tip}").split("\0")
+    rows = []
+    for rec in records:
+        if not rec:
+            continue
+        add, dele, path = rec.split("\t", 2)
+        rows.append((None if add == "-" else int(add), None if dele == "-" else int(dele), path))
+    return rows
 
 
 def code_lines(repo, base, tip, path):
-    out = git(repo, "diff", "-U0", "--no-renames", f"{base}..{tip}", "--", path)
+    out = git(repo, "diff", "-U0", "--no-renames", f"{base}..{tip}", "--", path)  # a binary file: one "Binary files" row
     n = 0
     for line in out.splitlines():
         if line.startswith(("+++", "---")) or not line.startswith(("+", "-")):
@@ -54,8 +74,7 @@ def default_repo():
 
 
 def fed_ids(repo, rev):
-    r = subprocess.run(["git", "-C", str(repo), "grep", "-ohE", FED_ID.pattern, rev, "--", "src/"],
-                       capture_output=True, text=True)
+    r = run_git(repo, "grep", "-ohE", FED_ID.pattern, rev, "--", "src/", capture_output=True, text=True)
     if r.returncode not in (0, 1):  # 1 = no match; anything else is an error, never "0 ids" (#7423)
         sys.stderr.write(f"git grep failed rc={r.returncode}: {r.stderr}")
         sys.exit(3)
@@ -72,7 +91,7 @@ def main():
     base = git(a.repo, "rev-parse", a.base).strip()
     tip = git(a.repo, "rev-parse", a.tip).strip()
     print(f"BASE={base}\nTIP={tip}")
-    if subprocess.run(["git", "-C", str(a.repo), "merge-base", "--is-ancestor", base, tip]).returncode != 0:
+    if run_git(a.repo, "merge-base", "--is-ancestor", base, tip).returncode != 0:
         print("FAIL: base is not an ancestor of tip")
         return 2
     allc = git(a.repo, "rev-list", "--count", f"{base}..{tip}").strip()
@@ -81,14 +100,16 @@ def main():
     total_code = 0
     total_lines = 0
     watched = []
-    for row in git(a.repo, "diff", "--numstat", "--no-renames", f"{base}..{tip}").splitlines():
-        add, dele, p = row.split("\t", 2)
-        if is_watched(p):
+    for add, dele, p in numstat(a.repo, base, tip):
+        if is_watched_path(p):
             c = code_lines(a.repo, base, tip, p)
             watched.append(p)
             total_code += c
-            total_lines += int(add) + int(dele)
-            print(f"WATCHED {p} +{add}/-{dele} code={c}")
+            if add is None:
+                print(f"WATCHED {p} binary code={c}")
+            else:
+                total_lines += add + dele
+                print(f"WATCHED {p} +{add}/-{dele} code={c}")
     print(f"WATCHED_TOTAL files={len(watched)} lines={total_lines} code={total_code}")
     if watched:
         log = git(a.repo, "log", "--no-merges", "--format=%h %s", f"{base}..{tip}", "--", *watched)

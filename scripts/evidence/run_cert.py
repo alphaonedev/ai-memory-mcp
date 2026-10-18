@@ -29,6 +29,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -68,16 +69,57 @@ EXPIRY_PY = "scripts/check_cert_expiry.py"
 # when run by path: __name__ == "__main__", __file__ the checkout path (so a REPO_ROOT derived from __file__ is the
 # checkout), sys.argv[0] the same path, the script's own arguments after it.
 PY_LOADER = (
-    "import sys\n"
-    "path, src = sys.argv[1], sys.stdin.buffer.read()\n"
+    "import sys, types\n"
+    "m = types.ModuleType('__main__')\n"
+    "g = m.__dict__\n"
+    "for k in ('__doc__', '__package__', '__loader__'):\n"
+    "    g.pop(k, None)\n"
+    "g['__file__'] = sys.argv[1]\n"
+    "g['__builtins__'] = __builtins__\n"
+    "src = sys.stdin.buffer.read()\n"
     "sys.argv = sys.argv[1:]\n"
-    "main = sys.modules['__main__']\n"
-    "main.__file__ = path\n"
-    "exec(compile(src, path, 'exec'), main.__dict__)\n"
+    "sys.modules['__main__'] = m\n"
+    "exec(compile(src, g['__file__'], 'exec'), g)\n"
 )
+# #7666: the script runs in the fresh module `m`; its globals hold exactly __name__, __spec__, __file__ and
+# __builtins__, so none of the loader's own names (sys, types, m, g, src) is visible to it, and sys.modules['__main__']
+# is that module, so dataclasses, pickle and typing resolve the script's own classes.
 MAX_INLINE_SCRIPT = 100_000  # a shell body travels as one argv entry (the kernel limits one to 128 KiB)
 SWEEP_MAX_DEPTH = 100_000  # the deepest legacy scratch tree the sweep descends into
-SCRATCH_BAD_MODE = 0o022  # group- or world-writable
+SCRATCH_WORLD_WRITABLE = 0o002  # #7662: a group-writable directory owned by this user is accepted (umask 0002 checkouts)
+# #7663 / #7665: a child never inherits the checkout as its working directory. The Python variables below would let an
+# inner `python3` import from a directory the caller names or from the user site; PYTHONSAFEPATH keeps cwd and the
+# script directory off sys.path (the gate scripts cd to their own root, so the working directory alone is not enough).
+SCRUBBED_PYTHON_ENV = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE")
+SAFE_PYTHON_ENV = {"PYTHONSAFEPATH": "1", "PYTHONNOUSERSITE": "1"}
+
+
+def open_scratch(scratch):
+    """`scratch` opened as a directory fd (O_DIRECTORY|O_NOFOLLOW), or None when it does not exist (it is never created
+    here). ValueError unless it is a plain directory owned by this user that is not world writable. A group-writable
+    directory is accepted: a umask-0002 checkout tracks .local-runs as 0775 (#7662). Shared by run_cert and
+    build_bundle (#7668)."""
+    scratch = Path(scratch)
+    try:
+        fd = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        raise ValueError(f"{scratch} is not a plain directory ({e.strerror or e}); remove it or replace it by a "
+                         "directory you own") from e
+    accepted = False
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.geteuid():
+            raise ValueError(f"{scratch} is owned by uid {st.st_uid} (this run is uid {os.geteuid()}); it must be "
+                             "owned by this user")
+        if st.st_mode & SCRATCH_WORLD_WRITABLE:
+            raise ValueError(f"{scratch} is world writable (mode {stat.S_IMODE(st.st_mode):04o}); chmod o-w")
+        accepted = True
+    finally:
+        if not accepted:
+            os.close(fd)
+    return fd
 EXPIRY_SH = "scripts/check-cert-expiry.sh"
 # The legs one invocation promises (the PLAN row); build_bundle.check_run holds each invocation to its plan (#7437).
 PLANS = {"battery": ("battery",), "pg": ("pg",), "removal": ("removal",), "bootstrap": ("bootstrap",),
@@ -143,12 +185,14 @@ def run_tmpdir():
 
 
 def tracked_at(wt, rev, rel):
-    return subprocess.run(["git", "-C", str(wt), "cat-file", "-e", f"{rev}:{rel}"], capture_output=True).returncode == 0
+    return subprocess.run(["git", "-C", str(wt), "cat-file", "-e", f"{rev}:{rel}"], cwd=str(wt),
+                          capture_output=True).returncode == 0
 
 
 def tree_entry(wt, rev, rel):
     """(mode, type, sha) of rel in rev's tree, or None when it is not tracked there."""
-    r = subprocess.run(["git", "-C", str(wt), "ls-tree", rev, "--", rel], capture_output=True, text=True)
+    r = subprocess.run(["git", "-C", str(wt), "ls-tree", rev, "--", rel], cwd=str(wt),
+                       capture_output=True, text=True)
     if r.returncode != 0 or not r.stdout.strip():
         return None
     meta = r.stdout.strip().split("\t", 1)[0].split()
@@ -164,7 +208,8 @@ def blob_bytes(wt, rev, rel):
     mode, kind, sha = e
     if kind != "blob" or mode not in ("100644", "100755"):
         raise ValueError(f"{rel} at {rev} is a {kind} of mode {mode}; only a regular tracked file is run")
-    return sha, subprocess.run(["git", "-C", str(wt), "cat-file", "blob", sha], capture_output=True, check=True).stdout
+    return sha, subprocess.run(["git", "-C", str(wt), "cat-file", "blob", sha], cwd=str(wt),
+                          capture_output=True, check=True).stdout
 
 
 def pick_recapture(wt, tip):
@@ -218,13 +263,16 @@ class Run:
         self.cargo_slot = str(slot) if slot else ""
         self.cargo = [self.cargo_slot, "cargo"] if slot else ["cargo"]
         self.slot_lock = str(lock) if lock else ""
+        os.umask(0o022)  # #7662: before the first mkdir, so every directory made here is 0755
         self.outd.mkdir(parents=True, exist_ok=True)
         self.targets.mkdir(parents=True, exist_ok=True)
         self.tmpdir.mkdir(parents=True, exist_ok=True)
         self.bad = 0
         self.floor_tripped = False
-        os.umask(0o022)
         self.env = dict(os.environ)
+        for k in SCRUBBED_PYTHON_ENV:
+            self.env.pop(k, None)
+        self.env.update(SAFE_PYTHON_ENV)
         for k in ("XDG_CONFIG_HOME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL", "AI_MEMORY_AGENT_ID",
                   "AI_MEMORY_BIN", "AI_MEMORY_BIN_PG", "CARGO_TARGET_DIR", "CARGO_BUILD_JOBS"):
             self.env.pop(k, None)
@@ -293,16 +341,21 @@ class Run:
         return True
 
     def run(self, argv, out, extra_env=None, cwd=None, gate=True, stdin_data=None):
-        """Run argv with stdout and stderr in `out`. stdin_data (bytes) is the child's stdin; without it stdin is empty."""
+        """Run argv with stdout and stderr in `out`. stdin_data (bytes) is the child's stdin; without it stdin is empty.
+        The child's working directory is a fresh empty 0700 directory under the tmpdir, removed afterwards, unless the
+        caller names `cwd` (#7663: only the cargo legs do, for the checkout's rust-toolchain.toml)."""
         if gate and not self.floor_ok(" ".join(map(str, argv))[:120]):
             Path(out).write_text("NOT RUN: disk floor tripped\n")
             return 75
         env = dict(self.env)
         env.update(extra_env or {})
+        box = None
         try:
+            if cwd is None:
+                box = Path(tempfile.mkdtemp(prefix="child-", dir=str(self.tmpdir)))
             with open(out, "wb") as f:
                 feed = {"input": stdin_data} if stdin_data is not None else {"stdin": subprocess.DEVNULL}
-                return subprocess.run(argv, cwd=cwd or self.wt, env=env, stdout=f, stderr=subprocess.STDOUT,
+                return subprocess.run(argv, cwd=str(box or cwd), env=env, stdout=f, stderr=subprocess.STDOUT,
                                       **feed).returncode
         except OSError as e:  # a missing wrapper, flock or timeout (#7420): a RED row and 127, never a traceback
             print(f"run_cert: cannot start {argv[0]!r}: {e.strerror or e}. Check that --cargo-slot / CERT_CARGO_SLOT "
@@ -310,6 +363,9 @@ class Run:
             Path(out).write_text(f"NOT RUN: cannot start {argv[0]}: {e}\n")
             self.fail(f"  RED launch {argv[0]}: {e.strerror or e}")
             return 127
+        finally:
+            if box is not None:
+                shutil.rmtree(box, ignore_errors=True)
 
     def low_priority(self, timeout_secs, script):
         """argv running a repo gate script at low priority, under the optional slot flock (--slot-lock)."""
@@ -351,23 +407,25 @@ class Run:
         ):
             self.note(f"== {tag} {self.now()}")
             rc = self.run([*self.cargo, "build", "-j", "6", "--release", *extra], self.outd / out,
-                          {"CARGO_TARGET_DIR": str(td)})
+                          {"CARGO_TARGET_DIR": str(td)}, cwd=self.wt)
             self.note(f"{tag}_EXIT {rc} {self.now()}")
             if rc != 0:
                 self.fail(f"  RED {tag}")
                 return self.bad
         dbin, sbin = td_def / "release/ai-memory", td_sql / "release/ai-memory"
-        ver = lambda b: subprocess.run([str(b), "--version"], capture_output=True, text=True, env=self.env).stdout.strip()
-        sha = lambda b: subprocess.run(["sha256sum", str(b)], capture_output=True, text=True).stdout[:16]
+        ver = lambda b: subprocess.run([str(b), "--version"], cwd=str(self.targets), capture_output=True, text=True,
+                                         env=self.env).stdout.strip()
+        sha = lambda b: subprocess.run(["sha256sum", str(b)], cwd=str(self.targets), capture_output=True,
+                                       text=True).stdout[:16]
         self.note(f"bins: {ver(dbin)} / {ver(sbin)} sha256 {sha(dbin)} {sha(sbin)}")
         self.posture(dbin, sbin)
         for name, exp in BINS.items():
             out = self.outd / f"test-{name}.log"
-            rc = self.run([*self.cargo, "test", "-j", "6", "--test", name], out, {"CARGO_TARGET_DIR": str(td_def)})
+            rc = self.run([*self.cargo, "test", "-j", "6", "--test", name], out, {"CARGO_TARGET_DIR": str(td_def)}, cwd=self.wt)
             self.check_test("TEST", name, rc, out, exp)
         for name, exp in LIBS.items():
             out = self.outd / f"lib-{name.replace(':', '_')}.log"
-            rc = self.run([*self.cargo, "test", "-j", "6", "--lib", name], out, {"CARGO_TARGET_DIR": str(td_def)})
+            rc = self.run([*self.cargo, "test", "-j", "6", "--lib", name], out, {"CARGO_TARGET_DIR": str(td_def)}, cwd=self.wt)
             self.check_test("LIB", name, rc, out, exp)
         self.note(f"BATTERY_DONE aggregate_failures={self.bad} {self.now()}")
         return self.bad
@@ -420,10 +478,10 @@ class Run:
         self.note(f"== pg coverage leg {self.now()}")
         env = {"CARGO_TARGET_DIR": str(self.targets / "cert7-pg")}
         out = self.outd / f"test-pg-{PG_BIN[0]}.log"
-        rc = self.run([*self.cargo, "test", "-j", "6", "--features", "sal-postgres", "--test", PG_BIN[0]], out, env)
+        rc = self.run([*self.cargo, "test", "-j", "6", "--features", "sal-postgres", "--test", PG_BIN[0]], out, env, cwd=self.wt)
         self.check_test("PGTEST", f"{PG_BIN[0]} [sal-postgres]", rc, out, PG_BIN[1])
         out = self.outd / f"lib-pg-{PG_LIB[0]}.log"
-        rc = self.run([*self.cargo, "test", "-j", "6", "--features", "sal-postgres", "--lib", PG_LIB[0]], out, env)
+        rc = self.run([*self.cargo, "test", "-j", "6", "--features", "sal-postgres", "--lib", PG_LIB[0]], out, env, cwd=self.wt)
         self.check_test("PGLIB", f"{PG_LIB[0]} [sal-postgres]", rc, out, PG_LIB[1])
         self.note(f"PG_DONE aggregate_failures={self.bad} {self.now()}")
         return self.bad
@@ -436,7 +494,7 @@ class Run:
         full = self.outd / "removal-proof-full.log"
         env = {"CARGO_TARGET_DIR": str(self.targets / "cert7-sal"), "CARGO_BUILD_JOBS": "2",
                "AI_MEMORY_BIN": str(self.targets / "cert7-default/release/ai-memory")}
-        rc = self.run(self.low_priority("14400", "scripts/check-cert-removal-proof.sh"), full, env)
+        rc = self.run(self.low_priority("14400", "scripts/check-cert-removal-proof.sh"), full, env, cwd=self.wt)
         text = full.read_bytes().decode("utf-8", "replace")
         overall = [l for l in text.splitlines() if "overall:" in l]
         proven, red = text.count("[PROVEN]"), text.count("CERT-RED]")
@@ -453,7 +511,7 @@ class Run:
             f.write(f"SHA={self.git('rev-parse', 'HEAD')}\nSTARTED={started}\n{text}")
             f.write(f"PROVEN={proven}/15\nCERT_EXIT={rc}\n")
         self.run(["bash", "scripts/check-cert-removal-proof.sh", "--force-restore"], self.outd / "force-restore.log",
-                 gate=False)  # a restore must never be skipped by the floor
+                 cwd=self.wt, gate=False)  # a restore must never be skipped by the floor
         d = self.dirty_tracked()
         if d:
             self.fail(f"RESTORE FAILED {len(d)} files: {d}")
@@ -467,7 +525,8 @@ class Run:
             return self.bad
         self.note(f"== bootstrap-cert-gate (self-build) {self.now()}")
         out = self.outd / "bootstrap-cert-gate.log"
-        rc = self.run(self.low_priority("7200", "scripts/check-bootstrap-cert-gate.sh"), out, {"CARGO_BUILD_JOBS": "2"})
+        rc = self.run(self.low_priority("7200", "scripts/check-bootstrap-cert-gate.sh"), out, {"CARGO_BUILD_JOBS": "2"},
+                      cwd=self.wt)
         lines = [l for l in out.read_bytes().decode("utf-8", "replace").splitlines() if l.strip()]
         self.note(f"BOOTSTRAP_CERT_GATE_EXIT {rc} :: {lines[-1][:200] if lines else 'EMPTY'}")
         if rc != 0:
@@ -532,20 +591,22 @@ class Run:
             ("cert-expiry-upstream", expiry, {}),
             (f"cert-expiry-{prior_bind[:9]}", expiry, {"CERT_EXPIRY_BASE": prior_bind}),
             ("cert-expiry-selftest", [*expiry, "--self-test"], {}),
-            ("removal-proof-header-selftest", ["bash", "scripts/check-cert-removal-proof.sh", "--self-test-header"], {}),
-            ("docs-vs-ssot", ["bash", "scripts/check-docs-vs-ssot.sh"], {}),
-            ("doc-anchors", ["bash", "scripts/check-doc-symbol-anchors.sh"], {}),
-            ("ci-job-claims", ["bash", "scripts/check-ci-job-claims.sh"], {}),
-            ("hardcoded", ["bash", "scripts/check-hardcoded-literals.sh"], {}),
-            ("vendor", ["bash", "scripts/check-vendor-literals.sh"], {}),
-            ("c8", ["bash", "scripts/qc-codegraph-precheck.sh"], {}),
-            ("envlock", ["bash", "scripts/check-test-env-lock.sh"], {}),
-            ("count", ["bash", "scripts/check-count-assertion-declared.sh", "--range", f"{parent}..HEAD"], {}),
-            ("ftc", ["bash", "scripts/check-foreign-text-to-caller.sh"], {}),
+            ("removal-proof-header-selftest", ["bash", self.script("check-cert-removal-proof.sh"), "--self-test-header"], {}),
+            ("docs-vs-ssot", ["bash", self.script("check-docs-vs-ssot.sh")], {}),
+            ("doc-anchors", ["bash", self.script("check-doc-symbol-anchors.sh")], {}),
+            ("ci-job-claims", ["bash", self.script("check-ci-job-claims.sh")], {}),
+            ("hardcoded", ["bash", self.script("check-hardcoded-literals.sh")], {}),
+            ("vendor", ["bash", self.script("check-vendor-literals.sh")], {}),
+            ("c8", ["bash", self.script("qc-codegraph-precheck.sh")], {}),
+            ("envlock", ["bash", self.script("check-test-env-lock.sh")], {}),
+            ("count", ["bash", self.script("check-count-assertion-declared.sh"), "--range", f"{parent}..HEAD"], {}),
+            ("ftc", ["bash", self.script("check-foreign-text-to-caller.sh")], {}),
         ]
         for name, argv, extra in checks:
             out = Path(f"{gl}.{name}.log")
-            rc = self.run(argv, out, extra, stdin_data=gate_blob if name.startswith("cert-expiry") else None)
+            # no cargo here, so the disk floor does not apply; the child's cwd is a fresh sandbox (#7661, #7665)
+            rc = self.run(argv, out, extra, gate=False,
+                          stdin_data=gate_blob if name.startswith("cert-expiry") else None)
             lines = [l for l in out.read_text(errors="replace").splitlines() if l.strip()]
             self.note(f"{rc} {name} :: {lines[-1][:160] if lines else 'EMPTY'}")
             if rc != 0:
@@ -570,24 +631,12 @@ class Run:
         return [sys.executable, "-I", "-c", PY_LOADER, str(self.wt / EXPIRY_PY)], data, sha
 
     def open_scratch(self):
-        """The checkout's .local-runs opened as a directory fd (O_DIRECTORY|O_NOFOLLOW), or None when it does not exist
-        (it is never created here). ValueError unless it is a plain directory owned by this user that is not group or
-        world writable: the gate's self-test works inside it, so another user must not be able to write there (#7618)."""
-        scratch = self.wt / ".local-runs"
-        try:
-            fd = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
-        except FileNotFoundError:
-            return None
-        except OSError as e:
-            raise ValueError(f"{scratch} is not a plain directory ({e.strerror or e}); remove it or replace it by a "
-                             "directory you own") from e
-        st = os.fstat(fd)
-        if st.st_uid != os.geteuid() or st.st_mode & SCRATCH_BAD_MODE:
-            os.close(fd)
-            raise ValueError(f"{scratch} is owned by uid {st.st_uid} (this run is uid {os.geteuid()}) with mode "
-                             f"{stat.S_IMODE(st.st_mode):04o}; it must be owned by this user and not group or world "
-                             "writable (chmod go-w)")
-        return fd
+        """The checkout's .local-runs through the shared guard (#7662, #7668)."""
+        return open_scratch(self.wt / ".local-runs")
+
+    def script(self, name):
+        """The absolute path of a repository gate script, so it runs from the sandbox cwd (the script cds to its root)."""
+        return str(self.wt / "scripts" / name)
 
     @staticmethod
     def remove_tree(dfd, name):

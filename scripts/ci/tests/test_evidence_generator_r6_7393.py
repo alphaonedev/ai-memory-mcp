@@ -376,8 +376,11 @@ def tmp_root_findings(source, own_roots=False):
     and a mkdtemp / mkstemp / TemporaryDirectory / NamedTemporaryFile / SpooledTemporaryFile / TemporaryFile call
     without a dir= argument, through import aliases, `x = tempfile.f`, getattr, importlib.import_module and
     __import__. With own_roots=True (the runner, which builds TMP_ROOTS) reads of TMP_ROOTS and comprehensions are
-    allowed. It cannot see a value known only at run time (an argument, a file, another process's output): the audit
-    hook in tmp_runtime_guard_7393 covers that while the tests run, and only for the events that module lists."""
+    allowed. It claims only these STATIC literal cases. It cannot see a value known only at run time: bytes(list(...)).decode(),
+    "%c" joins, str.lower() of an upper-case constant, codecs rot13 applied twice, os.environ.copy() or dict(os.environ)
+    lookups, tempfile._get_default_tempdir(), mkdtemp(dir=<a name bound to None>), an argument, a file or another
+    process's output. The audit hook in tmp_runtime_guard_7393 covers those while the tests run, and only for the
+    events that module lists."""
     tree = ast.parse(source)
     names = Names(tree)
     folder = Folder(names)

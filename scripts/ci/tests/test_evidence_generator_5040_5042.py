@@ -164,7 +164,8 @@ class Vendored5040(GuardedCase):
         prefixes = set(bb.HOST_PATH_PREFIXES)
         self.assertLessEqual(added, prefixes)
         self.assertLessEqual({"/mnt/", "/home/"}, prefixes)
-        self.assertTrue(any(x.startswith("/ai-") for x in prefixes), "the scratch root stays in the attested set")
+        scratch_root = "/" + "ai-" + "scratch"  # the exact attested scratch-root prefix (#7671)
+        self.assertIn(scratch_root, prefixes, "the scratch root stays in the attested set")
         self.assertEqual(len(prefixes - added), 6, "the attested six stay and nothing else is added")
         self.assertLessEqual(prefixes, set(bb.leak_patterns(Path("/wt-x"), Path("/out-x"))))
 

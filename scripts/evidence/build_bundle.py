@@ -18,7 +18,10 @@ Modelled on cert-385da3a05 (commit 9f68ea41a). Steps, each fatal on failure:
 Nothing is staged or committed. Exit 0 only when every step passed.
 """
 import argparse
+import ctypes
+import ctypes.util
 import datetime
+import errno
 import hashlib
 import os
 import re
@@ -30,7 +33,7 @@ import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from run_cert import BINS, LIBS, PG_BIN, PG_LIB, REPO_ROOT, run_tmpdir  # noqa: E402  (one source for the leg set)
+from run_cert import BINS, LIBS, PG_BIN, PG_LIB, REPO_ROOT, open_scratch, run_tmpdir  # noqa: E402  (one source for the leg set)
 
 RECAPTURE_CANDIDATES = ("scripts/recapture-cert-3607-posture.py", "scripts/recapture-cert-3607-posture.sh")
 EVIDENCE_FILES = (
@@ -343,7 +346,7 @@ def recapture_copy(wt, tip, short):
     """Returns (relpath, shipped source, retargeted copy). Resolves the .py first, the .sh second (#7399)."""
     rel = next((c for c in RECAPTURE_CANDIDATES
                 if subprocess.run(["git", "-C", str(wt), "cat-file", "-e", f"{tip}:{c}"],
-                                  capture_output=True).returncode == 0), None)
+                                  cwd=str(wt), capture_output=True).returncode == 0), None)
     if rel is None:
         raise Fatal(f"no recapture script at {tip}; looked for " + " then ".join(RECAPTURE_CANDIDATES)
                     + ". Check the tip is a cert chain commit that carries the posture recapture script.")
@@ -425,25 +428,101 @@ def discard_stage(stage, scratch):
     shutil.rmtree(stage)
 
 
+AT_FDCWD = -100
+RENAME_NOREPLACE = 1
+
+
+def load_renameat2():
+    """Linux renameat2(2) through ctypes, or None where libc does not export it (#7667)."""
+    try:
+        fn = ctypes.CDLL(ctypes.util.find_library("c") or None, use_errno=True).renameat2
+    except (OSError, AttributeError):
+        return None
+    fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    fn.restype = ctypes.c_int
+
+    def native(src, dst):
+        if fn(AT_FDCWD, os.fsencode(src), AT_FDCWD, os.fsencode(dst), RENAME_NOREPLACE) != 0:
+            err = ctypes.get_errno()
+            raise OSError(err, os.strerror(err), str(dst))
+    return native
+
+
+rename_noreplace_native = load_renameat2()
+
+
+def rename_noreplace(src, dst):
+    """Rename directory src to dst, never replacing dst: the kernel refuses an existing destination (renameat2
+    RENAME_NOREPLACE). Where that is missing or the filesystem does not support it, dst is claimed with an atomic mkdir
+    first (it fails when dst exists, even empty) and the stage is renamed onto the directory this call made (#7667).
+    Fatal when the destination exists."""
+    native = rename_noreplace_native
+    if native is not None:
+        try:
+            native(src, dst)
+            return
+        except OSError as e:
+            if e.errno in (errno.EEXIST, errno.ENOTEMPTY):
+                raise Fatal(f"{dst} already exists; refusing to overwrite") from e
+            if e.errno not in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
+                raise
+    try:
+        os.mkdir(dst)
+    except FileExistsError as e:
+        raise Fatal(f"{dst} already exists; refusing to overwrite") from e
+    try:
+        os.rename(src, dst)
+    except OSError:
+        os.rmdir(dst)
+        raise
+
+
+def open_stage_scratch(wt):
+    """The checkout's scratch directory through the shared guard (created 0755 when missing); Fatal when it is a
+    symlink, owned by another user or world writable (#7668)."""
+    scratch = wt / SCRATCH_DIR
+    try:
+        fd = open_scratch(scratch)
+        if fd is None:
+            scratch.mkdir(mode=0o755, exist_ok=True)
+            fd = open_scratch(scratch)
+    except ValueError as e:
+        raise Fatal(str(e)) from e
+    if fd is not None:
+        os.close(fd)
+    return scratch
+
+
 def publish_bundle(wt, dest, files, manifest):
     """Build the bundle in a staging directory under <wt>/.local-runs and publish it with one rename (#7621).
 
     The cert directory appears only after every write and the re-verify pass; on any failure the staging directory
-    is removed and the tree is untouched. An existing destination is never replaced.
+    is removed and the tree is untouched. An existing destination is never replaced, also when it appears between the
+    check and the rename (#7667): the rename itself refuses it, and afterwards the destination must be the staged
+    directory (same device and inode) and must match the manifest.
     """
-    scratch = wt / SCRATCH_DIR
-    scratch.mkdir(exist_ok=True)
+    scratch = open_stage_scratch(wt)
+    if dest.exists():
+        raise Fatal(f"{dest} already exists; refusing to overwrite")
     stage = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=scratch))
     try:
         stage.chmod(0o755)
         stage_write(stage, files, manifest)
         on_disk = stage_verify(stage, files)
-        if dest.exists():
-            raise Fatal(f"{dest} already exists; refusing to overwrite")
         dest.parent.mkdir(parents=True, exist_ok=True)
-        os.rename(stage, dest)
+        st = os.stat(stage)
+        rename_noreplace(stage, dest)
+        now = os.stat(dest, follow_symlinks=False)
+        if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+            raise Fatal(f"{dest} is not the staged directory (device/inode differ); not trusting it")
+        try:
+            stage_verify(dest, files)
+        except Fatal:
+            shutil.rmtree(dest)  # the staged directory itself, changed after the rename: do not leave it published
+            raise
     except BaseException:
-        discard_stage(stage, scratch)
+        if stage.exists():
+            discard_stage(stage, scratch)
         raise
     return on_disk
 

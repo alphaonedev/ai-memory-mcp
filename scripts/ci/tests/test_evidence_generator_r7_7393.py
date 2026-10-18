@@ -105,6 +105,12 @@ def make_deep(parent, name, depth):
     os.close(cur)
 
 
+def write_empty(path):
+    """Create an empty file the closing way (py/file-not-closed, #7672)."""
+    with open(path, "w"):
+        pass
+
+
 class Spy:
     """Wraps Run.run, recording every argv and the stdin bytes handed to it."""
 
@@ -201,10 +207,11 @@ class ScratchRefused7618(GatesRun):
         (wt / ".local-runs").chmod(0o777)
         self.refused(wt, tip)
 
-    def test_a_group_writable_scratch_directory_is_refused_7618(self):
+    def test_a_world_writable_scratch_directory_is_refused_7618(self):
+        # #7662: a group-writable one (a umask-0002 checkout, mode 0775) is accepted; only world-writable is refused.
         rc, r, wt, tip = self.make()
         (wt / ".local-runs").mkdir(exist_ok=True)
-        (wt / ".local-runs").chmod(0o775)
+        (wt / ".local-runs").chmod(0o777)
         self.refused(wt, tip)
 
     def test_a_scratch_directory_owned_by_someone_else_is_refused_7618(self):
@@ -339,8 +346,10 @@ class IterativeSweep7620(GatesRun):
         resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, 64), hard))
         self.addCleanup(resource.setrlimit, resource.RLIMIT_NOFILE, (soft, hard))
         dfd = os.open(wt / ".local-runs", os.O_RDONLY | os.O_DIRECTORY)
-        self.addCleanup(os.close, dfd)
-        load("run_cert").Run.remove_tree(dfd, name)
+        try:
+            load("run_cert").Run.remove_tree(dfd, name)
+        finally:
+            os.close(dfd)
         self.assertFalse((wt / ".local-runs" / name).exists())
 
 
@@ -570,9 +579,15 @@ class StagedBundle7621(BundleFixture):
         self.assert_rerun_succeeds()
 
     def test_a_failed_publish_leaves_no_partial_bundle_7621(self):
-        with mock.patch("os.rename", side_effect=OSError(18, "Invalid cross-device link")):
-            code, text = self.build()
-        self.assert_clean_failure(code, text)
+        bb = load("build_bundle")
+        failing = OSError(18, "Invalid cross-device link")
+        # #7667: the publish is renameat2(RENAME_NOREPLACE) where available, else a mkdir claim and os.rename
+        for label, patches in (("renameat2", {"rename_noreplace_native": mock.Mock(side_effect=failing)}),
+                               ("mkdir-claim", {"rename_noreplace_native": None})):
+            with self.subTest(path=label), mock.patch.multiple(bb, **patches), \
+                    mock.patch("os.rename", side_effect=failing):
+                code, text = self.build()
+                self.assert_clean_failure(code, text)
         self.assert_rerun_succeeds()
 
     def test_an_existing_bundle_is_never_touched_by_a_refused_run_7621(self):
@@ -633,7 +648,7 @@ class RuntimeGuard7619(ScratchCase):
     def test_a_live_call_in_each_class_raises_and_is_recorded_7619(self):
         f = self.fake
         calls = {
-            "open": lambda: open(f / "a.txt", "w"),
+            "open": lambda: write_empty(f / "a.txt"),
             "os.mkdir": lambda: os.mkdir(f / "d"),
             "os.rename dst": lambda: os.rename(self.src, f / "moved"),
             "os.rename src": lambda: os.rename(f / "sub", self.dir / "gone"),
@@ -669,7 +684,7 @@ class RuntimeGuard7619(ScratchCase):
         os.symlink(self.fake, link)
         with guard.captured(self.fake) as sink:
             with self.assertRaises(guard.TmpRootViolation):
-                open(link / "x", "w")
+                write_empty(link / "x")
         self.assertTrue(sink)
 
     def test_a_violation_swallowed_by_the_code_still_fails_the_test_7619(self):
@@ -687,7 +702,7 @@ class RuntimeGuard7619(ScratchCase):
         del guard.violations[:]  # the nested run recorded the violation on purpose
 
     def test_the_hook_is_inert_outside_a_guarded_test_7619(self):
-        self.assertEqual(guard._active >= 1, True)  # this very test is guarded
+        self.assertEqual(guard._state_of["active"] >= 1, True)  # this very test is guarded
         self.assertIsNone(guard.finding("open", (str(self.dir / "x"), "w", 0), guard.resolved_roots()))
 
     def test_every_evidence_test_class_derives_from_the_guarded_base_7619(self):
