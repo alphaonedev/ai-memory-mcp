@@ -35,15 +35,18 @@
 // across `oneshot(...)` is the load-bearing serialisation.
 #![allow(clippy::missing_panics_doc, clippy::await_holding_lock)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::governance::audit as forensic;
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::TempDir;
 use tower::ServiceExt as _;
 
 fn forensic_lock() -> &'static Mutex<()> {
@@ -76,9 +79,9 @@ fn permissive_attestation_for_tests() {
     // the process lifetime, set before the caller issues any gated store.
     ONCE.call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
 }
-fn build_router_fixture() -> (axum::Router, NamedTempFile) {
+fn build_router_fixture() -> (axum::Router, SidecarTempFile) {
     permissive_attestation_for_tests();
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
@@ -347,7 +350,7 @@ async fn pending_approve_emits_forensic_audit_entry_mcp() {
     forensic::shutdown();
     forensic::init(dir.path(), None).expect("init forensic sink");
 
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("db::open");
 
     // Queue a pending action so approve has something to flip. Use the
@@ -406,7 +409,7 @@ async fn archive_purge_emits_forensic_audit_entry_mcp() {
     forensic::shutdown();
     forensic::init(dir.path(), None).expect("init forensic sink");
 
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("db::open");
 
     let _ = ai_memory::mcp::handle_archive_purge_for_test(

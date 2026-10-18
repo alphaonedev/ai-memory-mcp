@@ -90,6 +90,11 @@ pub mod lane_db;
 pub mod tls;
 pub mod tls_receiver;
 
+// #6122 — sidecar-clean sqlite temp files; the root of a suite that also needs
+// them directly takes `use common::tmp_retain;` instead of a second copy.
+#[path = "tmp_retain.rs"]
+pub mod tmp_retain;
+
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -98,7 +103,7 @@ use base64::Engine;
 use ed25519_dalek::{Signer, SigningKey};
 use rand_core::OsRng;
 use rusqlite::Connection;
-use tempfile::NamedTempFile;
+pub use tmp_retain::SidecarTempFile;
 
 /// v1.0.0 #3140 — per-request ceiling for [`pg_test_client`].
 ///
@@ -485,7 +490,7 @@ pub fn describe_counts(profile: &ai_memory::profile::Profile) -> (usize, usize) 
     (count_substantive(true), count_substantive(false))
 }
 
-/// `(NamedTempFile, PathBuf)` factory: create a tempfile, open the DB
+/// `(SidecarTempFile, PathBuf)` factory: create a tempfile, open the DB
 /// once so migrations land, drop the connection so the caller can
 /// re-open the path. The returned tempfile must be kept alive for the
 /// duration of the test so its destructor doesn't unlink the DB out
@@ -493,22 +498,22 @@ pub fn describe_counts(profile: &ai_memory::profile::Profile) -> (usize, usize) 
 /// which pass the path repeatedly to `Connection::open` and MCP tool
 /// handlers that take `&Path`.
 #[must_use]
-pub fn fresh_db_tempfile_path() -> (NamedTempFile, PathBuf) {
+pub fn fresh_db_tempfile_path() -> (SidecarTempFile, PathBuf) {
     permissive_attestation_for_tests();
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let p = f.path().to_path_buf();
     let _ = ai_memory::db::open(&p).expect("db::open");
     (f, p)
 }
 
-/// `(NamedTempFile, Connection)` factory: create a tempfile and open
+/// `(SidecarTempFile, Connection)` factory: create a tempfile and open
 /// the DB through `db::open`, keeping the connection live. Used by the
 /// form-4/form-5/atomisation/wt1c suites that need both the live
 /// connection and the tempfile guard.
 #[must_use]
-pub fn fresh_db_tempfile_conn() -> (NamedTempFile, Connection) {
+pub fn fresh_db_tempfile_conn() -> (SidecarTempFile, Connection) {
     permissive_attestation_for_tests();
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SidecarTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(tmp.path()).expect("db::open");
     (tmp, conn)
 }

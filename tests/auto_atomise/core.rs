@@ -334,7 +334,9 @@ fn shared_db_path() -> &'static PathBuf {
             });
         // Ensure parent exists.
         std::fs::create_dir_all(&tmp).ok();
-        tmp.join(format!("wt1d-auto-atomise-{}.db", uuid::Uuid::new_v4()))
+        let p = tmp.join(format!("wt1d-auto-atomise-{}.db", uuid::Uuid::new_v4()));
+        crate::tmp_retain::retain(crate::tmp_retain::DbFiles::new(p.clone()));
+        p
     })
 }
 

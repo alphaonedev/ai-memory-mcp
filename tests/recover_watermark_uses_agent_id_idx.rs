@@ -35,6 +35,8 @@
 //! the query back to `json_extract`, the plan no longer mentions
 //! `idx_memories_agent_id` and the test fails.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use rusqlite::Connection;
 
 /// Bring a fresh DB up to the current schema (v53 at the moment
@@ -50,7 +52,7 @@ fn fresh_db() -> Connection {
     std::fs::create_dir_all(&local_runs).expect("create local-runs dir");
     let tmpdir = tempfile::tempdir_in(&local_runs).expect("tempdir under .local-runs");
     let db_path = tmpdir.path().join("test.db");
-    std::mem::forget(tmpdir);
+    tmp_retain::retain(tmpdir);
     ai_memory::storage::open(&db_path).expect("open fresh db")
 }
 

@@ -32,6 +32,8 @@
 //! level instead of at every test fn.
 #![allow(clippy::await_holding_lock)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use ai_memory::approvals::{
     SyntheticPermissionRule, clear_synthetic_rules_for_test, list_synthetic_rules,
     record_synthetic_rule,
@@ -67,9 +69,9 @@ fn build_router_with_db() -> (axum::Router, ai_memory::handlers::Db) {
     )));
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+        let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile for SqliteStore");
         let p = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        tmp_retain::retain(tmp);
         std::sync::Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
         )

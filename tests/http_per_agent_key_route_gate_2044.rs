@@ -17,17 +17,20 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc, clippy::too_many_lines)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::admin_role::is_admin_caller_trusted;
 use ai_memory::handlers::identity_binding::api_key_sha256_hex;
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::TempDir;
 use tower::ServiceExt as _;
 
 const SHARED_KEY: &str = "shared-transport-key";
@@ -42,9 +45,9 @@ fn fresh_dir() -> TempDir {
 /// Build a router in `enforce` mode with `alice` enrolled both as an admin and
 /// as the owner of the `ALICE_KEY` per-agent api-key. The shared transport key
 /// (`SHARED_KEY`) authenticates transport but resolves to NO per-agent principal.
-fn build_enforce_router() -> (axum::Router, AppState, NamedTempFile) {
+fn build_enforce_router() -> (axum::Router, AppState, SidecarTempFile) {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

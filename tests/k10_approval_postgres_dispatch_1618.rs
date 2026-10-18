@@ -25,6 +25,7 @@
 #![allow(clippy::await_holding_lock)]
 #![allow(clippy::redundant_closure_for_method_calls)]
 
+use common::tmp_retain;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -58,9 +59,9 @@ fn build_disjoint_fake_pg_router() -> (axum::Router, std::path::PathBuf) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+    let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile for SqliteStore");
     let store_path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
+    tmp_retain::retain(tmp);
     let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(
         ai_memory::store::sqlite::SqliteStore::open(&store_path).expect("open SqliteStore"),
     );
@@ -532,11 +533,11 @@ async fn pending_approve_missing_id_returns_404_on_sqlite_1620() {
         // Reuse the harness builder but point the gate at a SQLITE
         // backend: build a plain sqlite router the same way the
         // attestation integration tests do.
-        let f = tempfile::NamedTempFile::new().expect("tempfile");
+        let f = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
         let db_path = f.path().to_path_buf();
         let _ = ai_memory::db::open(&db_path).expect("db::open");
         // Leak the tempfile guard so the DB outlives this block.
-        std::mem::forget(f);
+        tmp_retain::retain(f);
         let conn = ai_memory::db::open(&db_path).expect("reopen");
         let db: ai_memory::handlers::Db = std::sync::Arc::new(tokio::sync::Mutex::new((
             conn,

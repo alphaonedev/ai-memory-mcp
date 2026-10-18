@@ -42,6 +42,8 @@
 // its `let` bindings (mirrors `tests/federation_postgres_fanout.rs`).
 #![allow(clippy::items_after_statements)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -123,8 +125,8 @@ fn build_state(db_path: &std::path::Path, admin_ids: Vec<String>) -> AppState {
 }
 
 /// Default (non-admin) router — empty admin allowlist, no api_key.
-fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile) {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+fn sqlite_router() -> (axum::Router, crate::tmp_retain::SidecarTempFile) {
+    let db_tmp = crate::tmp_retain::SidecarTempFile::new().expect("db tempfile");
     let _ = ai_memory::db::open(db_tmp.path()).expect("db::open");
     let app_state = build_state(db_tmp.path(), Vec::new());
     let api_key_state = ApiKeyState {
@@ -143,13 +145,13 @@ fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile) {
 /// `request_authn_configured` flag is set, so the `require_admin`
 /// gate (`is_admin_caller_trusted`) admits the tester. This lets the
 /// admin-gated `get_taxonomy` / `list_namespaces` success arms run.
-fn admin_router() -> (axum::Router, tempfile::NamedTempFile) {
+fn admin_router() -> (axum::Router, crate::tmp_retain::SidecarTempFile) {
     // #1570 — the admin-role gate honors the self-asserted X-Agent-Id
     // header only when the daemon has request authentication configured.
     // The flag is a process-wide atomic set once at boot; tests model an
     // authenticated deployment by flipping it on.
     ai_memory::handlers::mark_request_authn_configured(true);
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+    let db_tmp = crate::tmp_retain::SidecarTempFile::new().expect("db tempfile");
     let _ = ai_memory::db::open(db_tmp.path()).expect("db::open");
     let app_state = build_state(db_tmp.path(), vec![TESTER_AGENT.to_string()]);
     let api_key_state = ApiKeyState {
@@ -1166,8 +1168,8 @@ fn fed_cfg(peer_urls: &[String], w: usize) -> ai_memory::federation::FederationC
 /// Federated sqlite router — `build_state` with `federation: Some(cfg)`.
 fn fed_router(
     cfg: ai_memory::federation::FederationConfig,
-) -> (axum::Router, tempfile::NamedTempFile) {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+) -> (axum::Router, crate::tmp_retain::SidecarTempFile) {
+    let db_tmp = crate::tmp_retain::SidecarTempFile::new().expect("db tempfile");
     let _ = ai_memory::db::open(db_tmp.path()).expect("db::open");
     let mut app_state = build_state(db_tmp.path(), Vec::new());
     app_state.federation = Arc::new(Some(cfg));

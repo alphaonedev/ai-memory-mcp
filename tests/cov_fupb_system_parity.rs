@@ -20,6 +20,8 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::redundant_closure_for_method_calls)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
@@ -29,10 +31,10 @@ use serde_json::{Value, json};
 use tower::ServiceExt as _;
 
 fn build_sqlite_router() -> axum::Router {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
-    std::mem::forget(f);
+    tmp_retain::retain(f);
     let conn = ai_memory::db::open(&db_path).expect("reopen");
     let db: Db = Arc::new(tokio::sync::Mutex::new((
         conn,

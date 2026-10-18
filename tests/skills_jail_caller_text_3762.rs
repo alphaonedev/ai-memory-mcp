@@ -38,6 +38,8 @@
 //! `PG LEG UNMEASURED ON F1`). On a postgres-backed daemon the skills plane
 //! fails closed with 501 before any jail text could render.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -118,9 +120,9 @@ fn app_state_sqlite(db_path: &Path) -> AppState {
 fn app_state_with_db(db: Db, backend: StorageBackend) -> AppState {
     #[cfg(feature = "sal")]
     let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+        let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile for SqliteStore");
         let store_path = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        tmp_retain::retain(tmp);
         std::sync::Arc::new(
             ai_memory::store::sqlite::SqliteStore::open(&store_path).expect("open SqliteStore"),
         )

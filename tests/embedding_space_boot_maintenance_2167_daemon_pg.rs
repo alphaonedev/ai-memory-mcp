@@ -33,6 +33,7 @@
 
 use ai_memory::config::{AppConfig, EmbeddingsSection};
 use ai_memory::daemon_runtime::{ServeArgs, bootstrap_serve};
+use common::tmp_retain;
 
 mod common;
 
@@ -102,9 +103,9 @@ async fn daemon_bootstrap_runs_pg_embedding_space_boot_maintenance_2179() {
 
     // A throwaway sqlite db path for the (unused-by-pg) local handle; the store
     // is the postgres one selected by `store_url`.
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for local db");
+    let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile for local db");
     let path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
+    tmp_retain::retain(tmp);
     let tls = common::tls::TestTls::generate(&path.with_extension("tls3705"));
 
     let args = serve_args(&url, &tls);
@@ -145,9 +146,9 @@ async fn daemon_bootstrap_skips_pg_boot_maintenance_on_sqlite_backend() {
         return;
     }
 
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for local db");
+    let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile for local db");
     let path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
+    tmp_retain::retain(tmp);
     let tls = common::tls::TestTls::generate(&path.with_extension("tls3705"));
 
     let args = ServeArgs {

@@ -22,9 +22,12 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc, clippy::too_many_lines)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::db;
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
@@ -34,7 +37,7 @@ use ai_memory::models::{
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::TempDir;
 use tower::ServiceExt as _;
 
 fn local_runs_root() -> PathBuf {
@@ -194,7 +197,7 @@ async fn forget_as_admin(router: axum::Router, body: serde_json::Value) -> Statu
 #[tokio::test]
 async fn http_admin_namespace_none_forget_refused_on_governed_ns_1849() {
     let _dir = fresh_dir();
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
 
     let id_held = {
@@ -230,7 +233,7 @@ async fn http_admin_namespace_none_forget_refused_on_governed_ns_1849() {
 #[tokio::test]
 async fn http_admin_namespace_none_forget_allows_ungoverned_1849() {
     let _dir = fresh_dir();
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
 
     let id_open = {
@@ -260,7 +263,7 @@ async fn http_admin_namespace_none_forget_allows_ungoverned_1849() {
 #[tokio::test]
 async fn http_admin_namespace_some_forget_unchanged_1849() {
     let _dir = fresh_dir();
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
 
     {

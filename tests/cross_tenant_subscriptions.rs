@@ -39,14 +39,15 @@
 //!    query is `agent_id=bob` → 403 from the HTTP listing and
 //!    unsubscribe handlers.
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::subscriptions::{self, NewSubscription};
+use common::tmp_retain;
 use rusqlite::Connection;
-use tempfile::NamedTempFile;
 
 mod common;
 use common::fresh_db_tempfile_path as fresh_db;
 
-fn fresh_conn() -> (NamedTempFile, Connection) {
+fn fresh_conn() -> (SidecarTempFile, Connection) {
     let (keep, path) = fresh_db();
     let conn = Connection::open(&path).expect("open db");
     (keep, conn)
@@ -158,8 +159,8 @@ use tower::ServiceExt as _;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 
-fn build_router_fixture() -> (axum::Router, NamedTempFile) {
-    let f = NamedTempFile::new().expect("tempfile");
+fn build_router_fixture() -> (axum::Router, SidecarTempFile) {
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

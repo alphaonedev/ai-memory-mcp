@@ -35,14 +35,16 @@
 //! the database. A counter-only assertion is precisely how #2551 hid: the
 //! envelope was self-consistent and wrong.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -59,9 +61,9 @@ fn permissive_attestation_for_tests() {
     ONCE.call_once(|| unsafe { std::env::set_var("AI_MEMORY_REQUIRE_AGENT_ATTESTATION", "0") });
 }
 
-fn build_test_router() -> (axum::Router, std::path::PathBuf, NamedTempFile) {
+fn build_test_router() -> (axum::Router, std::path::PathBuf, SidecarTempFile) {
     permissive_attestation_for_tests();
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

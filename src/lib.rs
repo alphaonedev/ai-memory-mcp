@@ -931,6 +931,11 @@ pub mod models;
 /// for the process-global `LINEAGE_DAG` atomic (#3577).
 #[cfg(test)]
 mod test_support;
+/// Test-only process-lifetime temp retention that unlinks at exit (#6122); the
+/// same leaf file the integration suites take through `#[path]`.
+#[cfg(test)]
+#[path = "../tests/common/tmp_retain.rs"]
+mod test_tmp_retain;
 // v0.7.0 Form 3 (issue #756) — multi-step ingest orchestrator. Batman
 // closeout: deterministic helpers run first (Jaccard, cosine, FTS
 // classifier), then LLM stages prepend a SHARED PREFIX and consume

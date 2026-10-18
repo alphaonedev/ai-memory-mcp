@@ -39,6 +39,8 @@
 // `dim` is the embedder dimension (768), well within f32 mantissa range.
 #![allow(clippy::cast_precision_loss)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -98,14 +100,14 @@ async fn embed_calls(server: &MockServer) -> usize {
 struct Receiver {
     router: axum::Router,
     db: Db,
-    _db_tmp: tempfile::NamedTempFile,
+    _db_tmp: crate::tmp_retain::SidecarTempFile,
 }
 
 /// Build a receiver `AppState` + production router, optionally wired
 /// with a mock-ollama embedder (768-dim nomic shape). Mirrors the
 /// #922 test fixture.
 fn build_receiver(embedder: Option<Embedder>) -> Receiver {
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+    let db_tmp = crate::tmp_retain::SidecarTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");

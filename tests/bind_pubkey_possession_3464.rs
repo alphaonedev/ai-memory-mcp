@@ -35,13 +35,15 @@
 
 #![allow(clippy::doc_markdown, clippy::missing_panics_doc)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use ai_memory::identity::pubkey_bind::{BindAuthority, PossessionProof, sign_bind_challenge};
 
 const AGENT: &str = "ai:bind-3464";
 const VICTIM: &str = "ai:victim-3464";
 
-fn open_db() -> (tempfile::NamedTempFile, rusqlite::Connection) {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+fn open_db() -> (crate::tmp_retain::SidecarTempFile, rusqlite::Connection) {
+    let f = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("db::open");
     (f, conn)
 }
@@ -752,7 +754,7 @@ fn revoked_identity_cannot_be_reopened_by_candidate_possession_3464() {
 
 #[test]
 fn competing_bootstraps_admit_exactly_one_key_3464() {
-    let file = tempfile::NamedTempFile::new().expect("tempfile");
+    let file = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
     let path = file.path().to_path_buf();
     let seed = ai_memory::db::open(&path).expect("open seed");
     register(&seed, VICTIM);
@@ -1303,7 +1305,7 @@ fn the_issuer_pins_the_candidate_key_3464() {
 /// for two daemons.
 #[test]
 fn a_challenge_issued_on_one_connection_is_consumable_on_another_3464() {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
     let daemon_a = ai_memory::db::open(f.path()).expect("db::open (issuing daemon)");
     let daemon_b = ai_memory::db::open(f.path()).expect("db::open (binding daemon)");
     register(&daemon_a, AGENT);

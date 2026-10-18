@@ -15,6 +15,8 @@
 // degrades to keyword-only instead of hanging the test process.
 
 mod common;
+#[cfg(feature = "sal")]
+use common::tmp_retain;
 use common::{DAEMON_READY_TIMEOUT, bounded_test_client, free_port, wait_for_http_ready};
 
 // #3354/#3198 FIXTURE ISOLATION — this suite previously set NO `HOME` and NO
@@ -9415,9 +9417,9 @@ impl OneshotDaemon {
         )));
         #[cfg(feature = "sal")]
         let store: std::sync::Arc<dyn ai_memory::store::MemoryStore> = {
-            let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+            let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile for SqliteStore");
             let p = tmp.path().to_path_buf();
-            std::mem::forget(tmp);
+            tmp_retain::retain(tmp);
             std::sync::Arc::new(
                 ai_memory::store::sqlite::SqliteStore::open(&p).expect("open SqliteStore"),
             )

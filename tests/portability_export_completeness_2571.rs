@@ -35,6 +35,7 @@
 #![allow(clippy::missing_panics_doc, clippy::uninlined_format_args)]
 
 mod common;
+use common::tmp_retain;
 
 use std::path::PathBuf;
 
@@ -61,7 +62,7 @@ fn fresh_db(tag: &str) -> (PathBuf, Connection) {
         .expect("tempdir under .local-runs");
     let path = dir.path().join("db.sqlite");
     let conn = ai_memory::db::open(&path).expect("init db");
-    std::mem::forget(dir); // keep the file alive for the test's connection
+    tmp_retain::retain(dir); // keep the file alive for the test's connection
     (path, conn)
 }
 

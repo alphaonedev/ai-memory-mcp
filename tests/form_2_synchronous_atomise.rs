@@ -27,6 +27,8 @@
     clippy::redundant_closure_for_method_calls
 )]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -80,7 +82,9 @@ fn shared_db_path() -> &'static PathBuf {
     SHARED.get_or_init(|| {
         let root = local_runs_root();
         std::fs::create_dir_all(&root).ok();
-        root.join(format!("form-2-synchronous-{}.db", uuid::Uuid::new_v4()))
+        let p = root.join(format!("form-2-synchronous-{}.db", uuid::Uuid::new_v4()));
+        tmp_retain::retain(tmp_retain::DbFiles::new(p.clone()));
+        p
     })
 }
 

@@ -51,6 +51,7 @@
 #![allow(clippy::await_holding_lock)]
 #![allow(clippy::doc_markdown)]
 
+use common::tmp_retain;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -137,9 +138,9 @@ fn permissive_attestation_for_tests() {
 /// Production router over a fresh on-disk sqlite DB. The legacy `app.db`
 /// connection and the SAL `SqliteStore` open the SAME path so a seed via
 /// either surface is visible through the other.
-fn sqlite_router() -> (axum::Router, tempfile::NamedTempFile) {
+fn sqlite_router() -> (axum::Router, crate::tmp_retain::SidecarTempFile) {
     permissive_attestation_for_tests();
-    let db_tmp = tempfile::NamedTempFile::new().expect("db tempfile");
+    let db_tmp = crate::tmp_retain::SidecarTempFile::new().expect("db tempfile");
     let db_path = db_tmp.path().to_path_buf();
     let conn = ai_memory::db::open(&db_path).expect("db::open");
     let db: Db = Arc::new(AsyncMutex::new((
@@ -177,9 +178,9 @@ fn fake_pg_router() -> (axum::Router, std::path::PathBuf) {
         ResolvedTtl::default(),
         true,
     )));
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+    let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile for SqliteStore");
     let store_path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
+    tmp_retain::retain(tmp);
     let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(
         ai_memory::store::sqlite::SqliteStore::open(&store_path).expect("open SqliteStore"),
     );

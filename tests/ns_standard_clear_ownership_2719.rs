@@ -32,15 +32,17 @@
 //! - the `namespace_meta` binding survives every refused clear
 //! - CONTROL: the OWNER (`ai:alice`) can still clear their own standard
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::sync::Arc;
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use ai_memory::models::{ConfidenceSource, Memory, MemoryKind, Tier};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
-use tempfile::NamedTempFile;
 use tokio::sync::Mutex;
 use tower::ServiceExt as _;
 
@@ -214,7 +216,7 @@ fn assert_closed_owner_gate_refusal(body: &str, caller: &str) {
 
 #[tokio::test]
 async fn foreign_caller_cannot_clear_owned_standard_2719() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SidecarTempFile::new().expect("tempfile");
     {
         let conn = ai_memory::db::open(tmp.path()).expect("open");
         seed_owned_standard(&conn);
@@ -242,7 +244,7 @@ async fn foreign_caller_cannot_clear_owned_standard_2719() {
 
 #[tokio::test]
 async fn keyless_caller_cannot_clear_owned_standard_2719() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SidecarTempFile::new().expect("tempfile");
     {
         let conn = ai_memory::db::open(tmp.path()).expect("open");
         seed_owned_standard(&conn);
@@ -274,7 +276,7 @@ async fn keyless_caller_cannot_clear_owned_standard_2719() {
 
 #[tokio::test]
 async fn owner_can_still_clear_own_standard_2719() {
-    let tmp = NamedTempFile::new().expect("tempfile");
+    let tmp = SidecarTempFile::new().expect("tempfile");
     {
         let conn = ai_memory::db::open(tmp.path()).expect("open");
         seed_owned_standard(&conn);

@@ -28,6 +28,7 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::await_holding_lock)]
 
+use common::tmp_retain;
 use std::sync::{Arc, Mutex};
 
 use ai_memory::approvals::Decision;
@@ -109,10 +110,10 @@ fn open_db(db_path: &std::path::Path) -> rusqlite::Connection {
 }
 
 fn build_sqlite_router() -> (axum::Router, std::path::PathBuf) {
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
     let db_path = f.path().to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
-    std::mem::forget(f);
+    tmp_retain::retain(f);
     let conn = ai_memory::db::open(&db_path).expect("reopen");
     let db: Db = Arc::new(tokio::sync::Mutex::new((
         conn,
@@ -451,9 +452,9 @@ fn build_fake_pg_router() -> (axum::Router, std::path::PathBuf) {
         ai_memory::config::ResolvedTtl::default(),
         true,
     )));
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile for SqliteStore");
+    let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile for SqliteStore");
     let store_path = tmp.path().to_path_buf();
-    std::mem::forget(tmp);
+    tmp_retain::retain(tmp);
     let store: Arc<dyn ai_memory::store::MemoryStore> = Arc::new(
         ai_memory::store::sqlite::SqliteStore::open(&store_path).expect("open SqliteStore"),
     );

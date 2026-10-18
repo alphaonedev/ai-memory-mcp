@@ -11,6 +11,8 @@
 #![cfg(feature = "sal")]
 #![allow(clippy::missing_panics_doc, clippy::field_reassign_with_default)]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use ai_memory::models::Memory;
 use ai_memory::store::sqlite::SqliteStore;
 use ai_memory::store::{CallerContext, Filter, MemoryStore};
@@ -18,7 +20,7 @@ use ai_memory::store::{CallerContext, Filter, MemoryStore};
 #[tokio::test]
 async fn sqlite_list_clamps_limit_to_list_max_limit_1877() {
     let max = ai_memory::storage::LIST_MAX_LIMIT;
-    let f = tempfile::NamedTempFile::new().expect("tempfile");
+    let f = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(f.path()).expect("db::open");
 
     // Seed LIST_MAX_LIMIT + 25 rows in one namespace via the low-level insert.

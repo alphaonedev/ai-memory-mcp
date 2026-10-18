@@ -15,6 +15,8 @@
 
 #[path = "curator/compaction_test.rs"]
 mod compaction_test;
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 
 // Issue #1548 — `run_reflection_pass` now operates over the SAL
 // `MemoryStore` trait (`SqliteStore`), which is `sal`-gated. Compile the

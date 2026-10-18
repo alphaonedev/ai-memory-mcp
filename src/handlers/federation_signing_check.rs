@@ -3445,9 +3445,9 @@ mod sal_boundary_961_tests {
         // namespace_meta rows exist, so any namespace lookup must
         // return `None` and the call-site's unwrap_or_else fallback
         // fires.
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::test_tmp_retain::SidecarTempFile::new().expect("tempfile");
         let path = tmp.path().to_path_buf();
-        std::mem::forget(tmp);
+        crate::test_tmp_retain::retain(tmp);
         let store = crate::store::sqlite::SqliteStore::open(&path).expect("open SqliteStore");
         let policy_opt = store
             .resolve_governance_policy("any/ns")

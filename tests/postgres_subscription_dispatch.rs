@@ -30,6 +30,7 @@
 
 #![cfg(feature = "sal")]
 
+use common::tmp_retain;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -175,7 +176,7 @@ fn make_test_state() -> (AppState, std::path::PathBuf) {
 
     // Leak the tempdir so the scratch files outlive the test (otherwise
     // the destructor would race the worker thread's audit writes).
-    std::mem::forget(scratch_dir);
+    tmp_retain::retain(scratch_dir);
     (state, sqlite_path)
 }
 

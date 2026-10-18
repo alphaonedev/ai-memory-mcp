@@ -66,15 +66,18 @@
     clippy::cast_precision_loss
 )]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::config::{FeatureTier, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use tempfile::{NamedTempFile, TempDir};
+use tempfile::TempDir;
 use tower::ServiceExt as _;
 
 /// Number of concurrent HTTP requests to fire. 20 is large enough
@@ -113,7 +116,7 @@ fn fresh_dir() -> TempDir {
     tempfile::tempdir_in(&root).expect("tempdir under .local-runs")
 }
 
-fn build_test_router() -> (axum::Router, NamedTempFile, TempDir) {
+fn build_test_router() -> (axum::Router, SidecarTempFile, TempDir) {
     // #1570 — these tests model an AUTHENTICATED deployment (api_key
     // configured at boot), the pre-#1570 implicit posture, so the admin
     // header role-claims they assert keep working. The #1570 secure
@@ -121,7 +124,7 @@ fn build_test_router() -> (axum::Router, NamedTempFile, TempDir) {
     // is pinned by tests/admin_header_trust_1570.rs in its own process.
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
     let tdir = fresh_dir();
-    let f = NamedTempFile::new_in(tdir.path()).expect("tempfile in .local-runs");
+    let f = SidecarTempFile::new_in(tdir.path()).expect("tempfile in .local-runs");
     let db_path = f.path().to_path_buf();
     // Open once to apply migrations, then re-open for the AppState
     // handle. Mirrors the pattern in tests/http_routes_1111.rs.

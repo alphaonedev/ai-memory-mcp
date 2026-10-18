@@ -9,6 +9,8 @@
 //! structural for a server that is already up: a READ tool and a WRITE tool
 //! are refused alike (`-32603`) and the write never lands.
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use ai_memory::identity::test_agent_id::AgentIdOverride;
 use ai_memory::mcp::dispatch_test_hook::handle_request_for_test;
 use serde_json::{Value, json};
@@ -24,8 +26,8 @@ fn call(tool: &str, args: &Value) -> Value {
     })
 }
 
-fn open_db() -> (tempfile::NamedTempFile, rusqlite::Connection) {
-    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+fn open_db() -> (crate::tmp_retain::SidecarTempFile, rusqlite::Connection) {
+    let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
     let conn = ai_memory::db::open(tmp.path()).expect("open db");
     (tmp, conn)
 }

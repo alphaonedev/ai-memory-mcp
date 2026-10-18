@@ -4,6 +4,9 @@
 //! #3638: a tenant may trigger policy enforcement, but may not read its private values.
 #![cfg(feature = "sal")]
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
+use crate::tmp_retain::SidecarTempFile;
 use ai_memory::config::{FeatureTier, HttpIdentityMode, ResolvedScoring, ResolvedTtl};
 use ai_memory::handlers::{ApiKeyState, AppState, Db, StorageBackend};
 use ai_memory::models::{Memory, Tier};
@@ -12,7 +15,6 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use std::sync::Arc;
-use tempfile::NamedTempFile;
 use tower::ServiceExt as _;
 
 const SHARED_KEY: &str = "issue-3638-transport-key";
@@ -23,9 +25,9 @@ fn build_router(
     backend: ai_memory::handlers::StorageBackend,
     supplied_store: Option<Arc<dyn MemoryStore>>,
     supplied_path: Option<&std::path::Path>,
-) -> (axum::Router, NamedTempFile) {
+) -> (axum::Router, SidecarTempFile) {
     ai_memory::handlers::admin_role::mark_request_authn_configured(true);
-    let f = NamedTempFile::new().expect("tempfile");
+    let f = SidecarTempFile::new().expect("tempfile");
     let db_path = supplied_path.unwrap_or(f.path()).to_path_buf();
     let _ = ai_memory::db::open(&db_path).expect("db::open");
     let conn = ai_memory::db::open(&db_path).expect("reopen for AppState");
@@ -261,7 +263,7 @@ async fn exercise_write_admission_precedes_policy_read_3638(
 
 #[tokio::test]
 async fn issue_3638_sqlite_write_admission_precedes_policy_read() {
-    let file = NamedTempFile::new().expect("sqlite file");
+    let file = SidecarTempFile::new().expect("sqlite file");
     let store = Arc::new(ai_memory::store::sqlite::SqliteStore::open(file.path()).expect("sqlite"));
     exercise_write_admission_precedes_policy_read_3638(
         store,
@@ -286,7 +288,7 @@ async fn issue_3638_postgres_write_admission_precedes_policy_read() {
 
 #[tokio::test]
 async fn issue_3638_sqlite_tenant_cannot_read_private_depth_cap() {
-    let file = NamedTempFile::new().expect("sqlite file");
+    let file = SidecarTempFile::new().expect("sqlite file");
     let store = Arc::new(ai_memory::store::sqlite::SqliteStore::open(file.path()).expect("sqlite"));
     exercise_private_policy_3638(store, StorageBackend::Sqlite, Some(file.path())).await;
 }
@@ -308,7 +310,7 @@ async fn issue_3638_postgres_tenant_cannot_read_private_depth_cap() {
 /// Seed a victim standard carrying `governance` at `victim/private` and let the
 /// attacker reflect into it over HTTP; returns the response.
 async fn attacker_reflects_into_victim(governance: serde_json::Value) -> (StatusCode, Value) {
-    let file = NamedTempFile::new().expect("sqlite file");
+    let file = SidecarTempFile::new().expect("sqlite file");
     let store = Arc::new(ai_memory::store::sqlite::SqliteStore::open(file.path()).expect("sqlite"));
     let attacker = CallerContext::for_agent(ATTACKER);
     let victim = CallerContext::for_agent(VICTIM);

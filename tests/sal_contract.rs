@@ -42,6 +42,7 @@
 use ai_memory::models::ConfidenceSource;
 use ai_memory::models::{AgentRegistration, Memory, MemoryLink, Tier};
 use ai_memory::store::{CallerContext, Capabilities, Filter, MemoryStore, StoreError, UpdatePatch};
+use common::tmp_retain;
 
 mod common;
 
@@ -677,16 +678,16 @@ mod sqlite_contract {
     };
     use ai_memory::store::sqlite::SqliteStore;
 
-    /// Each test gets its own `NamedTempFile` to keep the harness clean.
+    /// Each test gets its own `SidecarTempFile` to keep the harness clean.
     /// The file is held alongside the store so it lives long enough.
     struct Fixture {
         store: SqliteStore,
         // RAII: tempfile cleans up on drop. We carry it through.
-        _tmp: tempfile::NamedTempFile,
+        _tmp: crate::tmp_retain::SidecarTempFile,
     }
 
     fn fresh_store() -> Fixture {
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
         let store = SqliteStore::open(tmp.path()).expect("open SqliteStore");
         Fixture { store, _tmp: tmp }
     }
@@ -751,7 +752,7 @@ mod sqlite_contract {
         // + WAL journal mode (set in `db::open`), so concurrent calls
         // serialize but don't drop writes — exactly the contract this
         // test asserts.
-        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let tmp = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
         let store = std::sync::Arc::new(SqliteStore::open(tmp.path()).expect("open"));
         contract_concurrent_writes_no_data_loss(store).await;
         // Hold tmp until the end of the test so the DB file outlives

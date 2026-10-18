@@ -24,6 +24,8 @@
 //! 3. The example using `folder_path` exists (option-1 contract).
 //! 4. NO example uses `skill_folder` (regression guard).
 
+#[path = "common/tmp_retain.rs"]
+mod tmp_retain;
 use ai_memory::mcp::tools::capabilities::tool_examples;
 use serde_json::{Value, json};
 
@@ -125,7 +127,7 @@ fn issue_1327_no_example_uses_legacy_skill_folder_name() {
 #[test]
 fn issue_1327_docstring_example_satisfies_parser_field_gate() {
     use ai_memory::mcp::tools::skill_register::handle_skill_register;
-    let tmp_db = tempfile::NamedTempFile::new().expect("tempfile");
+    let tmp_db = crate::tmp_retain::SidecarTempFile::new().expect("tempfile");
     let conn = ai_memory::storage::open(tmp_db.path()).expect("db::open");
 
     // Build a payload using the canonical folder_path key so the
