@@ -2454,7 +2454,10 @@ mod tests {
                 .unwrap_or(0)
         }
         let before = sample();
-        crate::governance::audit::warn_watermark_skipped_genesis_read_error(0, &"injected read fault");
+        crate::governance::audit::warn_watermark_skipped_genesis_read_error(
+            0,
+            &"injected read fault",
+        );
         let text = render();
         assert!(
             text.contains(&format!("# TYPE {SERIES} counter")),
