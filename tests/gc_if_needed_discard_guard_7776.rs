@@ -43,7 +43,8 @@ fn offenders_in(text: &str) -> Vec<usize> {
         } else {
             t.to_string()
         };
-        if !joined.contains(CALL) || OBSERVED.iter().any(|o| joined.contains(o)) {
+        let code = joined.split("//").next().unwrap_or_default();
+        if !joined.contains(CALL) || OBSERVED.iter().any(|o| code.contains(o)) {
             continue;
         }
         let lo = idx.saturating_sub(2);
