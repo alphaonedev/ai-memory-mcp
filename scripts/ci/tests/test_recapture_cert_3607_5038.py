@@ -2659,8 +2659,8 @@ class DetectorTable7698(RecaptureBase):
             ('wrapped across a line', path[:half] + '\n' + path[half:]),
             ('wrapped across a line with indentation', path[:half] + '\n    ' + path[half:]),
             ('ansi sequence inside', path[:half] + '\x1b[0m' + path[half:]),
-            ('doubled slash', path.replace('/', '//', 1)),
-            ('dot segment', path.replace('/', '/./', 1)),
+            ('doubled slash', path.replace('/', '//')),
+            ('dot segment', path.replace('/', '/./')),
             ('double percent', self.percent(path).replace('%', '%25')),
         )
 
