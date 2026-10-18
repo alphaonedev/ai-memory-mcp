@@ -31,7 +31,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ai_memory::db;
 use ai_memory::governance::agent_action::{AgentAction, Decision, check_agent_action_deferred};
@@ -166,8 +166,10 @@ async fn refused_storage_insert_lands_in_signed_events_chain() {
 // ---------------------------------------------------------------------------
 
 /// Gate that holds the drainer's flush closed until the test opens it.
-/// Opening is idempotent and also happens on drop, so a failing assertion
-/// never leaves the drainer parked on the gate.
+/// Opening is idempotent. Sinks hold plain clones, and dropping a clone
+/// (for example the supervisor rebuilding its sink) never opens the gate;
+/// only the test body's [`OpenOnDrop`] owner opens it on drop, so a failing
+/// assertion never leaves the drainer parked.
 #[derive(Clone)]
 struct FlushGate(Arc<(Mutex<bool>, Condvar)>);
 
@@ -183,19 +185,25 @@ impl FlushGate {
     }
 
     /// Block until opened; the bounded wait keeps a lost opener from
-    /// wedging the runtime (CONCURRENCY-17).
+    /// wedging the runtime (CONCURRENCY-17). The 5 s watchdog on the audited
+    /// loop fires first, so the real worst case for a flush dependency is
+    /// about 5 s; this bound only caps a lost opener at 10 s.
     fn wait_open(&self) {
         let (lock, cvar) = &*self.0;
         let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         let _ = cvar
-            .wait_timeout_while(guard, Duration::from_secs(60), |open| !*open)
+            .wait_timeout_while(guard, Duration::from_secs(10), |open| !*open)
             .unwrap_or_else(PoisonError::into_inner);
     }
 }
 
-impl Drop for FlushGate {
+/// Single owner held by the test body: opens the gate when it goes out of
+/// scope, including on a panic unwind. Deliberately not `Clone`.
+struct OpenOnDrop(FlushGate);
+
+impl Drop for OpenOnDrop {
     fn drop(&mut self) {
-        self.open();
+        self.0.open();
     }
 }
 
@@ -235,6 +243,7 @@ async fn drainer_does_not_block_inserts() {
     // a refusal while the gate is closed is the deadlock pin, and it holds
     // under any host load.
     let gate = FlushGate::closed();
+    let _open_on_drop = OpenOnDrop(gate.clone());
     let (queue, receiver) = DeferredAuditQueue::new();
     let metrics = queue.metrics();
     let db_for_factory = db_path.clone();
@@ -253,23 +262,33 @@ async fn drainer_does_not_block_inserts() {
         3,
     );
 
-    let conn = db::open(&db_path).expect("open consult conn");
-    let action = refusal_action();
-    // Loose hang guard only: a true deadlock fails fast instead of
-    // hanging CI. It is not a latency budget.
-    let loop_start = Instant::now();
-    for _ in 0..50 {
-        let decision =
-            check_agent_action_deferred(&conn, "agent:no-block", &action, &queue).unwrap();
-        assert!(
-            decision.is_refusal(),
-            "audited-path call must refuse while the drainer flush is closed"
-        );
-        assert!(
-            loop_start.elapsed() < Duration::from_secs(5),
-            "audited-path loop hung while the drainer flush was closed"
-        );
-    }
+    // Real watchdog: the loop runs on its own OS thread under a 5 s
+    // timeout, so a flush dependency (or any other hang) fails at 5 s with
+    // this message wherever the audited path blocks. It is not a latency
+    // budget. The thread owns its connection, opened inside the closure.
+    // A detached std thread rather than `spawn_blocking`: the runtime joins
+    // its blocking pool on shutdown, which would hold a failing test open
+    // until the stuck call returned.
+    let loop_db = db_path.clone();
+    let loop_queue = queue.clone();
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+    std::thread::spawn(move || {
+        let conn = db::open(&loop_db).expect("open consult conn");
+        let action = refusal_action();
+        for _ in 0..50 {
+            let decision =
+                check_agent_action_deferred(&conn, "agent:no-block", &action, &loop_queue).unwrap();
+            assert!(
+                decision.is_refusal(),
+                "audited-path call must refuse while the drainer flush is closed"
+            );
+        }
+        let _ = done_tx.send(());
+    });
+    tokio::time::timeout(Duration::from_secs(5), done_rx)
+        .await
+        .expect("audited-path loop hung while the drainer flush was closed")
+        .expect("audited-path loop thread panicked");
     assert_eq!(
         metrics.submitted_count(),
         50,
