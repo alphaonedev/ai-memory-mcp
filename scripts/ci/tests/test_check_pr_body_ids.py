@@ -265,5 +265,78 @@ class ParserOutput7840Tests(unittest.TestCase):
                     self.assertFalse(healthy.closed)
 
 
+class UnavailableStreams7842Tests(unittest.TestCase):
+    def invoke(self, setup, args=(), body=b"", stdout=subprocess.PIPE,
+               stderr=subprocess.PIPE):
+        code = "import os,runpy,sys; " + setup
+        return subprocess.run(
+            [sys.executable, "-c", code, str(HELPER), *args], input=body,
+            stdout=stdout, stderr=stderr, timeout=TIMEOUT_SECONDS,
+        )
+
+    def check_unavailable(self, kind):
+        for stream, args, body, status in (
+            ("stdin", (), b"", 2), ("stdout", (), b"", 2),
+            ("stdout", (), b"12345678901", 2),
+            *(("stdout" if args[0] in ("-h", "--help") else "stderr",
+               args, b"", 2) for args in PARSER_TERMINALS),
+            ("stderr", (), b"\xff", 2),
+            ("stderr", (), b"", 0), ("stdin", ("--help",), b"", 0),
+        ):
+            with self.subTest(kind=kind, stream=stream, args=args, body=body):
+                if kind == "startup":
+                    descriptor = {"stdin": 0, "stdout": 1, "stderr": 2}[stream]
+                    setup = (f"os.close({descriptor}); "
+                             "os.execv(sys.executable,[sys.executable,*sys.argv[1:]])")
+                else:
+                    setup = (f"sys.{stream}.close(); "
+                             "sys.argv=sys.argv[1:]; "
+                             "runpy.run_path(sys.argv[0],run_name='__main__')")
+                result = self.invoke(setup, args, body)
+                self.assertEqual(result.returncode, status, result.stderr)
+                for output in (result.stdout, result.stderr):
+                    self.assertNotIn(b"Traceback", output)
+                    self.assertNotIn(b"Exception ignored", output)
+                if stream == "stderr" and status == 2:
+                    self.assertEqual(result.stdout, b"")
+                if status == 0:
+                    self.assertEqual(result.stderr, b"")
+                    self.assertIn(b"usage:" if args else b"suspected_ids=0", result.stdout)
+
+    def test_7842_actual_startup_closed_descriptors(self):
+        self.check_unavailable("startup")
+
+    def test_7842_closed_wrappers_at_io_boundaries(self):
+        self.check_unavailable("wrapper")
+
+    def check_repeated_failure(self, sink):
+        for args in ((), *PARSER_TERMINALS):
+            with self.subTest(args=args):
+                help_or_body = not args or args[0] in ("-h", "--help")
+                setup = ("helper=runpy.run_path(sys.argv[1]); "
+                         "assert helper['main'](sys.argv[2:]) == 2; "
+                         "sys.exit(helper['main'](sys.argv[2:]))")
+                result = self.invoke(
+                    setup, args, stdout=sink if help_or_body else subprocess.PIPE,
+                    stderr=subprocess.PIPE if help_or_body else sink,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                for output in (result.stdout, result.stderr):
+                    if output is not None:
+                        self.assertNotIn(b"Traceback", output)
+                        self.assertNotIn(b"Exception ignored", output)
+
+    @unittest.skipUnless(Path("/dev/full").exists(), "requires failing device")
+    def test_7842_repeat_after_failing_device(self):
+        with open("/dev/full", "wb", buffering=0) as sink:
+            self.check_repeated_failure(sink)
+
+    def test_7842_repeat_after_closed_pipe(self):
+        reader, writer = os.pipe()
+        os.close(reader)
+        with os.fdopen(writer, "wb", buffering=0) as sink:
+            self.check_repeated_failure(sink)
+
+
 if __name__ == "__main__":
     unittest.main()
