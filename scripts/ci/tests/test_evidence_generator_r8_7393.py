@@ -290,7 +290,12 @@ class ScratchGuard7662(RunnerCase):
     def test_a_foreign_owner_is_refused_with_an_owner_message_7662(self):
         rc, r, wt, tip = self.make({GATE_FILE: REAL_GATE})
         self.scratch(wt, 0o755)
-        with mock.patch("os.geteuid", return_value=os.geteuid() + 1):
+        foreign_uid = os.geteuid() + 1
+        def foreign_scratch():
+            # #7731: keep the simulated owner mismatch on the legacy gate-scratch surface alone.
+            with mock.patch("os.geteuid", return_value=foreign_uid):
+                return rc.open_scratch(wt / ".local-runs")
+        with mock.patch.object(rc.Run, "open_scratch", side_effect=foreign_scratch):
             code, out, log = self.drive(wt, tip)
         self.assertEqual(code, 1)
         self.assertIn("owned by uid", out)

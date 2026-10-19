@@ -37,7 +37,6 @@ import shlex
 import shutil
 import stat
 import subprocess
-import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -103,6 +102,9 @@ SAFE_PYTHON_ENV = {"PYTHONSAFEPATH": "1", "PYTHONNOUSERSITE": "1"}
 SCRUBBED_SHELL_ENV = ("BASH_ENV", "ENV")
 PRIVATE_EXEC_MODE = 0o500
 MAX_SHEBANG_BYTES = 127  # portable kernel shebang bound, including newline
+PRIVATE_DIRECTORY_MODE = 0o700
+PRIVATE_DIRECTORY_ATTEMPTS = 100
+PRIVATE_DIRECTORY_RANDOM_BYTES = 16
 PYTHON_COMMAND = re.compile(r"python(?:3(?:\.\d+)?)?\Z")
 
 
@@ -133,14 +135,14 @@ def isolated_python_environment(env, launcher_dir):
     return env
 
 
-def open_scratch(scratch):
+def open_scratch(scratch, *, dir_fd=None):
     """`scratch` opened as a directory fd (O_DIRECTORY|O_NOFOLLOW), or None when it does not exist (it is never created
     here). ValueError unless it is a plain directory owned by this user that is not world writable. A group-writable
     directory is accepted: a umask-0002 checkout tracks .local-runs as 0775 (#7662). Shared by run_cert and
-    build_bundle (#7668)."""
+    build_bundle (#7668). Optional dir_fd anchors a relative name to an already checked parent (#7731)."""
     scratch = Path(scratch)
     try:
-        fd = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
     except FileNotFoundError:
         return None
     except OSError as e:
@@ -303,9 +305,19 @@ class Run:
         self.cargo = [self.cargo_slot, "cargo"] if slot else ["cargo"]
         self.slot_lock = str(lock) if lock else ""
         os.umask(0o022)  # #7662: before the first mkdir, so every directory made here is 0755
+        self.scratch_identities = {}
+        for path in (self.targets, self.tmpdir):
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                raise ConfigError(f"{path}: cannot create scratch directory: {e}") from e
+            fd = self.guarded_scratch(path)
+            try:
+                st = os.fstat(fd)
+                self.scratch_identities[path] = (st.st_dev, st.st_ino)
+            finally:
+                os.close(fd)
         self.outd.mkdir(parents=True, exist_ok=True)
-        self.targets.mkdir(parents=True, exist_ok=True)
-        self.tmpdir.mkdir(parents=True, exist_ok=True)
         self.bad = 0
         self.floor_tripped = False
         self.env = dict(os.environ)
@@ -388,16 +400,30 @@ class Run:
             return 75
         env = dict(self.env)
         env.update(extra_env or {})
-        box = None
-        launcher_dir = None
+        roots = {}
+        private = []
         try:
-            launcher_dir = Path(tempfile.mkdtemp(prefix="python-", dir=str(self.tmpdir)))
+            # #7731: reapply the shared policy at use and bind mkdir/cleanup to the checked root.
+            for path in (self.targets, self.tmpdir):
+                if path not in roots:
+                    roots[path] = self.guarded_scratch(path)
+            scratch_fd = roots[self.tmpdir]
+            launcher_name, launcher_fd = self.private_directory(scratch_fd, "python-")
+            private.append((launcher_name, launcher_fd))
+            launcher_dir = self.tmpdir / launcher_name
+            self.check_scratch_paths(roots, private)
             env = isolated_python_environment(env, launcher_dir)
             # Direct Python calls also use the selected interpreter, even if a caller supplies another PATH name.
             if PYTHON_COMMAND.fullmatch(Path(str(argv[0])).name) or str(argv[0]) == sys.executable:
                 argv = [sys.executable, "-I", *argv[1:]]
+            box = None
             if cwd is None:
-                box = Path(tempfile.mkdtemp(prefix="child-", dir=str(self.tmpdir)))
+                name, fd = self.private_directory(scratch_fd, "child-")
+                private.append((name, fd))
+                box = self.tmpdir / name
+            # subprocess cwd and launcher lookup remain portable path operations. This check detects replacements
+            # before launch; it is not atomic against concurrent renames by the owner or an accepted group.
+            self.check_scratch_paths(roots, private)
             with open(out, "wb") as f:
                 feed = {"input": stdin_data} if stdin_data is not None else {"stdin": subprocess.DEVNULL}
                 return subprocess.run(argv, cwd=str(box or cwd), env=env, stdout=f, stderr=subprocess.STDOUT,
@@ -409,10 +435,71 @@ class Run:
             self.fail(f"  RED launch {argv[0]}: {e.strerror or e}")
             return 127
         finally:
-            if box is not None:
-                shutil.rmtree(box, ignore_errors=True)
-            if launcher_dir is not None:
-                shutil.rmtree(launcher_dir, ignore_errors=True)
+            try:
+                for name, fd in reversed(private):
+                    try:
+                        seen = os.stat(name, dir_fd=roots[self.tmpdir], follow_symlinks=False)
+                        owned = os.fstat(fd)
+                        if (seen.st_dev, seen.st_ino) != (owned.st_dev, owned.st_ino):
+                            raise ValueError(f"{name} was replaced; left in place")
+                        self.remove_tree(roots[self.tmpdir], name, expected_identity=(owned.st_dev, owned.st_ino))
+                    except (OSError, ValueError) as e:
+                        self.fail(f"  RED private scratch cleanup: {e}")
+                    finally:
+                        os.close(fd)
+            finally:
+                for fd in roots.values():
+                    os.close(fd)
+
+    def guarded_scratch(self, path):
+        """Open a configured root through the shared policy, refusing removal or replacement since setup."""
+        try:
+            fd = open_scratch(path)
+        except ValueError as e:
+            raise ConfigError(str(e)) from e
+        if fd is None:
+            raise ConfigError(f"{path}: scratch directory disappeared")
+        st = os.fstat(fd)
+        expected = self.scratch_identities.get(path)
+        if expected is not None and (st.st_dev, st.st_ino) != expected:
+            os.close(fd)
+            raise ConfigError(f"{path}: scratch directory was replaced")
+        return fd
+
+    @staticmethod
+    def private_directory(scratch_fd, prefix):
+        """Create a collision-safe private child relative to the checked parent, returning its name and held fd."""
+        for _attempt in range(PRIVATE_DIRECTORY_ATTEMPTS):
+            name = prefix + os.urandom(PRIVATE_DIRECTORY_RANDOM_BYTES).hex()
+            try:
+                os.mkdir(name, PRIVATE_DIRECTORY_MODE, dir_fd=scratch_fd)
+            except FileExistsError:
+                continue
+            try:
+                fd = open_scratch(name, dir_fd=scratch_fd)
+            except ValueError as e:
+                raise ConfigError(str(e)) from e
+            if fd is None:
+                raise ConfigError(f"{name}: private directory disappeared")
+            if stat.S_IMODE(os.fstat(fd).st_mode) != PRIVATE_DIRECTORY_MODE:
+                os.close(fd)
+                raise ConfigError(f"{name}: private directory mode changed")
+            return name, fd
+        raise ConfigError("cannot allocate a unique private scratch directory")
+
+    def check_scratch_paths(self, roots, private):
+        """Check current path identities against the descriptors used for creation and subsequent cleanup."""
+        for path in roots:
+            fd = self.guarded_scratch(path)
+            os.close(fd)
+        for name, fd in private:
+            try:
+                seen = os.stat(self.tmpdir / name, follow_symlinks=False)
+            except OSError as e:
+                raise ConfigError(f"{name}: private directory disappeared or became inaccessible") from e
+            owned = os.fstat(fd)
+            if (seen.st_dev, seen.st_ino) != (owned.st_dev, owned.st_ino):
+                raise ConfigError(f"{name}: private directory was replaced")
 
     def low_priority(self, timeout_secs, script):
         """argv running a repo gate script at low priority, under the optional slot flock (--slot-lock)."""
@@ -686,7 +773,7 @@ class Run:
         return str(self.wt / "scripts" / name)
 
     @staticmethod
-    def remove_tree(dfd, name):
+    def remove_tree(dfd, name, *, expected_identity=None):
         """Remove the entry `name` of the directory fd `dfd` without recursion and without following a symlink: files and
         symlinks are unlinked themselves, directories are descended into by O_DIRECTORY|O_NOFOLLOW open relative to the
         current fd, and left again through ".." with the parent's device and inode checked. One directory fd is held at a
@@ -694,6 +781,8 @@ class Run:
         entry was swapped under the walk (#7582, #7620)."""
         flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
         top = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        if expected_identity is not None and (top.st_dev, top.st_ino) != expected_identity:
+            raise ValueError(f"{name} was replaced; left in place")
         if not stat.S_ISDIR(top.st_mode):
             os.unlink(name, dir_fd=dfd)
             return
@@ -734,6 +823,10 @@ class Run:
                 os.rmdir(gone, dir_fd=cur)
         finally:
             os.close(cur)
+        if expected_identity is not None:
+            now = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+            if (now.st_dev, now.st_ino) != expected_identity:
+                raise ValueError(f"{name} was replaced; left in place")
         os.rmdir(name, dir_fd=dfd)
 
     def sweep_legacy(self, dfd):

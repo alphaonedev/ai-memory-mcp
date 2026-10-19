@@ -212,7 +212,12 @@ class ScratchRefused7618(GatesRun):
         rc, r, wt, tip = self.make()
         (wt / ".local-runs").mkdir(exist_ok=True)
         (wt / ".local-runs").chmod(0o700)
-        with mock.patch("os.geteuid", return_value=os.geteuid() + 1):
+        foreign_uid = os.geteuid() + 1
+        def foreign_scratch():
+            # #7731: isolate this older gate-scratch probe from configured-root validation at construction.
+            with mock.patch("os.geteuid", return_value=foreign_uid):
+                return rc.open_scratch(wt / ".local-runs")
+        with mock.patch.object(rc.Run, "open_scratch", side_effect=foreign_scratch):
             self.refused(wt, tip)
 
     def test_a_scratch_symlink_is_refused_7618(self):

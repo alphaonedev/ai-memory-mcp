@@ -13,7 +13,7 @@ import unittest.mock as mock
 
 from test_evidence_generator_5040_5042 import ScratchCase, load
 
-CANONICAL_CWD = Path('/mnt/t9/v07/v07-f5')
+CALLER_CWD = Path.cwd()
 RUNNER = Path(__file__).resolve().parents[2] / 'evidence' / 'run_cert.py'
 TIP = 'a' * 40
 PRIVATE_MODE = 0o700
@@ -101,7 +101,7 @@ class ConfiguredScratch7731(ScratchCase):
             if source == 'arg':
                 command.extend(['--tmpdir', str(self.tmpdir)])
             env = dict(os.environ, CERT_TMPDIR=str(self.tmpdir))
-            result = subprocess.run(command, cwd=CANONICAL_CWD, env=env, capture_output=True, text=True)
+            result = subprocess.run(command, cwd=CALLER_CWD, env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
             self.assertIn('world writable', result.stderr)
             self.assertNotIn('preflight', result.stdout)
@@ -137,6 +137,62 @@ class ConfiguredScratch7731(ScratchCase):
             self.assertEqual(code, 0)
             self.assertEqual(output.read_text().strip(), '0o700')
             self.assertEqual(list(self.tmpdir.iterdir()), [])
+
+    def test_replaced_root_refuses_before_creation_or_launch_7731(self):
+        for root in ('tmpdir', 'targets'):
+            with self.subTest(root=root):
+                runner = self.rc.Run(self.args())
+                path = getattr(self, root)
+                saved = path.with_name(root + '-saved')
+                path.rename(saved)
+                path.mkdir(mode=GROUP_MODE)
+                with self.assertRaisesRegex(self.rc.ConfigError, 'replaced'), \
+                        mock.patch.object(self.rc.subprocess, 'run') as launch:
+                    runner.run(['true'], self.dir / 'child.out', gate=False)
+                launch.assert_not_called()
+                self.assertEqual(list(self.tmpdir.iterdir()), [])
+                path.rmdir()
+                saved.rename(path)
+
+    def test_private_creation_uses_checked_fd_when_root_is_renamed_7731(self):
+        runner = self.rc.Run(self.args())
+        moved = self.dir / 'moved-scratch'
+        real_mkdir = os.mkdir
+        observed = []
+        def swap(path, mode=0o777, *, dir_fd=None):
+            if dir_fd is not None and not observed:
+                self.tmpdir.rename(moved)
+                real_mkdir(self.tmpdir, PRIVATE_MODE)
+                observed.append(os.fstat(dir_fd).st_ino)
+            return real_mkdir(path, mode, dir_fd=dir_fd)
+        with mock.patch.object(os, 'mkdir', side_effect=swap), \
+                mock.patch.object(self.rc.subprocess, 'run') as launch, \
+                self.assertRaisesRegex(self.rc.ConfigError, 'replaced'):
+            runner.run(['true'], self.dir / 'child.out', gate=False)
+        launch.assert_not_called()
+        self.assertEqual(observed, [moved.stat().st_ino])
+        self.assertEqual(list(self.tmpdir.iterdir()), [])
+        self.assertEqual(list(moved.iterdir()), [], 'cleanup stays relative to the original checked root')
+
+    def test_cleanup_leaves_replacement_private_directory_untouched_7731(self):
+        runner = self.rc.Run(self.args())
+        replacement = []
+        real_run = subprocess.run
+        def swap_after_child(*args, **kwargs):
+            result = real_run(*args, **kwargs)
+            box = Path(kwargs['cwd'])
+            box.rename(self.dir / 'original-child')
+            box.mkdir(mode=PRIVATE_MODE)
+            canary = box / 'untouched'
+            canary.write_text('preserve')
+            replacement.append(canary)
+            return result
+        with mock.patch.object(self.rc.subprocess, 'run', side_effect=swap_after_child):
+            self.assertEqual(runner.run(['true'], self.dir / 'child.out', gate=False), 0)
+        self.assertEqual(len(replacement), 1)
+        self.assertEqual(replacement[0].read_text(), 'preserve')
+        self.assertEqual(runner.bad, 1)
+        self.assertIn('was replaced; left in place', runner.log.read_text())
 
 
 if __name__ == '__main__':
