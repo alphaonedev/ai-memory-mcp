@@ -7,6 +7,9 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+mod common;
+use common::serve_test_env;
+
 // #3733 — key dirs MUST be created 0700, not left at the ambient umask (0o775
 // on a umask-0002 host), which the #3198 key-dir guard correctly refuses.
 #[path = "common/key_dir_sandbox.rs"]
@@ -21,8 +24,9 @@ const SCOPED: &str = r#"{"peer":{"allowed_namespaces":["team/**"]}}"#;
 
 fn command(root: &Path, posture: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
-    cmd.env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+    cmd.env_clear();
+    serve_test_env(&mut cmd);
+    cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", root.join("home"))
         .env("XDG_CONFIG_HOME", root.join("home/.config"))
         .env("AI_MEMORY_KEY_DIR", root.join("keys"))

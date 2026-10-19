@@ -39,6 +39,9 @@
 #[path = "common/key_dir_sandbox.rs"]
 mod key_dir_sandbox;
 
+mod common;
+use common::serve_test_env;
+
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -88,11 +91,14 @@ fn serve_boot_lines(needle: &str, budget: Duration) -> Vec<String> {
     key_dir_sandbox::mkdir_0700(&keys);
     let port = free_port().to_string();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ai-memory"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
+    cmd
         // #3582: this is a fresh-node fixture; do not inherit operator peers
         // or enrollment from the host configuration and key directories.
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env_clear();
+    // #4166: no embedder model fetch from the fresh HOME on this boot.
+    serve_test_env(&mut cmd);
+    cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", dir.path().join("home"))
         .env("XDG_CONFIG_HOME", dir.path().join("home/.config"))
         .env("AI_MEMORY_KEY_DIR", dir.path().join("keys"))
@@ -111,9 +117,8 @@ fn serve_boot_lines(needle: &str, budget: Duration) -> Vec<String> {
         .env("AI_MEMORY_SECURITY_PROFILE", "asi-hard")
         .env("AI_MEMORY_WITNESS_KEY_DIR", &keys)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn ai-memory serve");
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn ai-memory serve");
 
     let (tx, rx) = mpsc::channel::<String>();
     for stream in [

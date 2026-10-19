@@ -27,7 +27,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 mod common;
-use common::free_port;
+use common::{free_port, serve_test_env};
 // Shared `AI_MEMORY_TEST_TIMING_BUDGET_MULT` parse (u64 there, same
 // `1..=100` / default-1 contract as `tests/integration.rs`).
 #[path = "common/mcp_wait.rs"]
@@ -91,8 +91,9 @@ fn command_with_config(root: &Path, config_body: Option<&str>) -> Command {
         std::fs::write(dir.join("config.toml"), body).expect("write config.toml");
     }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
-    cmd.env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+    cmd.env_clear();
+    serve_test_env(&mut cmd);
+    cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", root.join("home"))
         .env("XDG_CONFIG_HOME", xdg)
         .env("AI_MEMORY_KEY_DIR", keys)

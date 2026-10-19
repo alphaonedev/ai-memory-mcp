@@ -449,6 +449,20 @@ pub fn free_port() -> u16 {
     listener.local_addr().expect("local_addr").port()
 }
 
+/// Env knobs every `serve`-spawning test must set after its `env_clear()`
+/// (#4166, #3988). With `HOME` on an empty tempdir the embedder would try a
+/// `MiniLM` hub fetch (180 s download timeout) that outlasts a test's boot
+/// deadline and stalls `/health`. Offline, the embedder cannot be built and
+/// `embedder_arc` stays `None` (comment at `src/daemon_runtime.rs:7048-7050`),
+/// so the daemon serves keyword recall and the boot path under test is
+/// unchanged. Sets only these two knobs: `HOME`, `PATH` and the per-test
+/// knobs stay with the caller. The product-side /health starvation (#3988)
+/// is tracked separately; this only stops the test masking it with a fetch.
+pub fn serve_test_env(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd.env("AI_MEMORY_EMBED_OFFLINE", "1")
+        .env("HF_HUB_OFFLINE", "1")
+}
+
 /// Open a fresh `:memory:` `SQLite` connection through the production
 /// `ai_memory::db::open` so migrations land before the test body runs.
 /// Was hand-rolled in 9 capability/governance test files with

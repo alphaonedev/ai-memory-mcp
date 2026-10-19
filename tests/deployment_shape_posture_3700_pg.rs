@@ -29,6 +29,7 @@ use ai_memory::store::{CallerContext, MemoryStore};
 mod common;
 use common::free_port;
 use common::postgres_env::PostgresTestEnv;
+use common::serve_test_env;
 
 const TEAM_LINE: &str = "[deployment] shape = \"team\"";
 const BOOT_DEADLINE: Duration = Duration::from_secs(60);
@@ -64,8 +65,9 @@ fn command(root: &Path, store_url: &str) -> Command {
             .expect("chmod 0700 key sandbox");
     }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
-    cmd.env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+    cmd.env_clear();
+    serve_test_env(&mut cmd);
+    cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", root.join("home"))
         .env("XDG_CONFIG_HOME", root.join("home/.config"))
         .env("AI_MEMORY_KEY_DIR", keys)
@@ -119,7 +121,8 @@ fn boot_on_loopback(root: &Path, store_url: &str) -> BootOutcome {
             }
         })
     });
-    let deadline = Instant::now() + BOOT_DEADLINE;
+    let started = Instant::now();
+    let deadline = started + BOOT_DEADLINE;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             if let Some(h) = reader {
@@ -138,11 +141,19 @@ fn boot_on_loopback(root: &Path, store_url: &str) -> BootOutcome {
             let stderr = buf.lock().unwrap().clone();
             return BootOutcome::Healthy { stderr };
         }
-        assert!(
-            Instant::now() < deadline,
-            "serve neither exited nor became healthy within {BOOT_DEADLINE:?}; stderr:\n{}",
-            buf.lock().unwrap()
-        );
+        if Instant::now() >= deadline {
+            // #4166: never leak the child on the deadline path.
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(h) = reader {
+                let _ = h.join();
+            }
+            panic!(
+                "serve neither exited nor became healthy within {BOOT_DEADLINE:?} (elapsed {:?}); stderr:\n{}",
+                started.elapsed(),
+                buf.lock().unwrap()
+            );
+        }
         std::thread::sleep(PROBE_INTERVAL);
     }
 }
