@@ -836,17 +836,19 @@ class EncodingCleanup7859Tests(unittest.TestCase):
 
     def command(self, diagnostic, pending, ready=None, errors="strict"):
         destination = "stderr" if diagnostic else "stdout"
+        encoding = "undefined" if diagnostic == "input" else "ascii"
         code = ("import os,runpy,sys; h=runpy.run_path(sys.argv[1]); "
                 "sys.argv[0]='résumé'; "
                 f"stream=sys.{destination}; "
-                f"stream.reconfigure(encoding='ascii',errors={errors!r},"
+                f"stream.reconfigure(encoding={encoding!r},errors={errors!r},"
                 "line_buffering=False,write_through=False); "
                 "raw=stream.buffer.raw; original=raw.write; raw.write=original; ")
         if pending:
-            code += "stream.write('caller prefix\\n'); "
+            code += ("stream.buffer.write(b'caller prefix\\n'); " if diagnostic == "input" else
+                     "stream.write('caller prefix\\n'); ")
         if ready is not None:
             code += f"os.write({ready},b'R'); os.close({ready}); "
-        args = ["--unknown"] if diagnostic else ["--help"]
+        args = [] if diagnostic == "input" else ["--unknown"] if diagnostic else ["--help"]
         code += f"status=h['main']({args!r}); "
         if errors == "strict":
             code += "assert stream.closed; "
@@ -859,7 +861,7 @@ class EncodingCleanup7859Tests(unittest.TestCase):
         return [sys.executable, "-c", code, str(HELPER)]
 
     def test_7859_encoding_failure_cleanup_with_pending_caller_output(self):
-        for diagnostic in (False, True):
+        for diagnostic in (False, True, "input"):
             for pending in (False, True):
                 with self.subTest(diagnostic=diagnostic, pending=pending):
                     with self.output_pipe(blocking=True) as (reader, sink, capacity, filled):
@@ -869,7 +871,7 @@ class EncodingCleanup7859Tests(unittest.TestCase):
                         try:
                             child = subprocess.Popen(
                                 self.command(diagnostic, pending, ready_writer),
-                                stdin=subprocess.DEVNULL,
+                                stdin=subprocess.PIPE,
                                 stdout=subprocess.PIPE if diagnostic else sink,
                                 stderr=sink if diagnostic else subprocess.PIPE,
                                 pass_fds=(ready_writer,),
@@ -879,7 +881,8 @@ class EncodingCleanup7859Tests(unittest.TestCase):
                             self.assertTrue(select.select([ready_reader], [], [], TIMEOUT_SECONDS)[0])
                             self.assertEqual(os.read(ready_reader, 1), b"R")
                             try:
-                                stdout, stderr = child.communicate(timeout=ENCODING_CLEANUP_SECONDS)
+                                stdout, stderr = child.communicate(
+                                    input=b"\xff", timeout=ENCODING_CLEANUP_SECONDS)
                             except subprocess.TimeoutExpired:
                                 self.fail("encoding-error cleanup blocked with caller output pending")
                             self.assertEqual(child.returncode, 2, (stdout, stderr))

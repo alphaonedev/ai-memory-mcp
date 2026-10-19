@@ -110,6 +110,8 @@ def checked_raw_output(stream):
     try:
         yield
     except (OSError, UnicodeError):
+        # Encoding can fail before checked_write sees any pending caller bytes.
+        failed = True
         close_failed_stream(stream)  # Keep the latch installed through cleanup.
         raise
     finally:
