@@ -1,9 +1,10 @@
 name: Session-boot lifetime suite
 
 # Issue #487 PR-3 — proves `ai-memory boot` loads on session start across
-# every supported AI / AI-agent recipe, on every supported platform, on a
-# recurring schedule. If a recipe in `docs/integrations/<agent>.md`
-# regresses, this workflow fails on the next nightly run.
+# every supported AI / AI-agent recipe, on every supported platform. It runs
+# nightly on main, on every push to main or a release line, and on every PR
+# into a release, rehearsal or chain base that touches the boot recipe (#7246).
+# If a recipe in `docs/integrations/<agent>.md` regresses, this workflow fails.
 
 on:
   schedule:
@@ -12,7 +13,20 @@ on:
     - cron: '0 4 * * *'
   workflow_dispatch:
   push:
-    branches: [release/v0.6.3.1, main]
+    branches: [main, "release/**"]
+    paths:
+      - 'docs/integrations/**'
+      - 'src/cli/boot.rs'
+      - 'tests/boot_primitive_contract.rs'
+      - 'tests/recipe_contract.rs'
+      - 'tests/boot_lifecycle.rs'
+      - 'scripts/run-session-boot-lifetime-tests.sh'
+      - '.github/workflows/session-boot-lifetime.yml'
+  # #7246 — PRs into a release, rehearsal or chain base. push.branches must
+  # never overlap a PR head (#2506, #2523, #2508), so chain/** lives here only.
+  pull_request:
+    branches: ["release/**", "rehearsal/**", "chain/**"]
+    types: [opened, synchronize, reopened]
     paths:
       - 'docs/integrations/**'
       - 'src/cli/boot.rs'
