@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+"""Report suspected run/job IDs when a PR body must satisfy a no-ID claim.
+
+Policy: ASCII decimal tokens of 11 or more digits, not embedded in Unicode
+alphanumeric/underscore identifiers. This is a suspicion check, not GitHub ID
+verification. The exact SELF_HOSTED_TARGET_CAP_BYTES: 42949672960 assignment
+allows only that numeric occurrence; other numbers on the line still count.
+Input and output are UTF-8. Exit 0: zero suspects; 1: suspects; 2: I/O or usage
+error. Runs entirely locally. Not a blanket gate for every PR body.
+"""
+
+import argparse
+from pathlib import Path
+import re
+import sys
+
+MIN_ID_DIGITS = 11
+SUSPECT_PATTERN = re.compile(r"(?<!\w)[0-9]{" + str(MIN_ID_DIGITS) + r",}(?!\w)")
+CAP_ASSIGNMENT_PATTERN = re.compile(
+    r"(?<!\w)SELF_HOSTED_TARGET_CAP_BYTES: (?P<cap>42949672960)(?!\w)"
+)
+EXIT_OK = 0
+EXIT_SUSPECTS = 1
+EXIT_ERROR = 2
+
+
+def scan_body(body):
+    """Return numbered offending lines and the number of unallowlisted tokens."""
+    offending = []
+    hit_count = 0
+    for number, line in enumerate(body.splitlines(), start=1):
+        allowed = {match.span("cap") for match in CAP_ASSIGNMENT_PATTERN.finditer(line)}
+        hits = sum(match.span() not in allowed for match in SUSPECT_PATTERN.finditer(line))
+        if hits:
+            offending.append(f"{number}: {line}")
+            hit_count += hits
+    return offending, hit_count
+
+
+def main():
+    """Read one body and report exact suspicion counts."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--file", type=Path, help="read UTF-8 body from this file instead of stdin")
+    args = parser.parse_args()
+    try:
+        raw = args.file.read_bytes() if args.file is not None else sys.stdin.buffer.read()
+        body = raw.decode("utf-8")
+    except (OSError, UnicodeError):
+        print("check_pr_body_ids: input error (expected readable UTF-8 body)", file=sys.stderr)
+        return EXIT_ERROR
+    offending, hit_count = scan_body(body)
+    report = offending + [f"suspected_ids={hit_count} offending_lines={len(offending)}"]
+    try:
+        sys.stdout.buffer.write(("\n".join(report) + "\n").encode("utf-8"))
+        sys.stdout.buffer.flush()
+    except OSError:
+        print("check_pr_body_ids: output error", file=sys.stderr)
+        return EXIT_ERROR
+    return EXIT_SUSPECTS if hit_count else EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main())

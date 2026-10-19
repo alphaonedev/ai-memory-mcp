@@ -353,6 +353,18 @@ PRs target `develop`. **Never** target `main`.
 Closes #<n>  (or "Refs #<n>")
 ```
 
+When a task requires a PR body or READY report to make a no-ID claim, save the
+final body as UTF-8 and run `python3 scripts/ci/check_pr_body_ids.py --file BODY`.
+Omit `--file` to read stdin. Quote the command and its exact
+`suspected_ids=N offending_lines=M` output in READY. This opt-in suspicion check
+flags ASCII decimal tokens of 11 or more digits outside alphanumeric/underscore
+identifiers; it does not verify GitHub IDs. It prints each offending line once,
+counts every unallowlisted occurrence, and exits 1 for suspects, 0 for zero, or 2
+for input/output or usage errors. The exact assignment
+`SELF_HOSTED_TARGET_CAP_BYTES: 42949672960` allows only that value occurrence;
+other numbers on the same line still count. Review evidence may legitimately
+include IDs, so this is not a blanket requirement for all PR bodies.
+
 ### 8.3 Draft vs. ready
 
 - **Trivial / Standard:** open as ready for review.
