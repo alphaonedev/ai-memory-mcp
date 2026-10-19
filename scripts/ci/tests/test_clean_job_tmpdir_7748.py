@@ -286,5 +286,93 @@ class Purge(Base):
         self.assertEqual(self.names(), ["other-marker"])
 
 
+class Escaping(Base):
+    """Every print site that embeds a name or a path goes through ``_esc`` (#7748, review r2 F7)."""
+
+    NAME = "x\n::error::y%0A\r"
+    ESCAPED = "x%0A::error::y%250A%0D"
+
+    def lf_dir(self, marked=True):
+        path = self.root / "runner" / ("t" + self.NAME)
+        try:
+            path.mkdir(parents=True)
+        except OSError:
+            self.skipTest("filesystem rejects newline names")
+        if marked:
+            (path / MARKER).write_text("", encoding="utf-8")
+        return path
+
+    def assert_no_injection(self, out, err, needle):
+        text = out + err
+        for line in text.splitlines():
+            if line.startswith("::"):
+                self.assertTrue(line.startswith("::notice::clean_job_tmpdir:"), text)
+        self.assertNotIn("\n::error::", text)
+        self.assertNotIn("\r", text)
+        self.assertIn(needle, text)
+
+    def test_esc_escapes_percent_first_7748(self):
+        self.assertEqual(cjt._esc("a%0A\n"), "a%250A%0A")
+        self.assertEqual(cjt._esc("\r%"), "%0D%25")
+
+    def test_removal_line_escaped_7748(self):
+        self.mark()
+        (self.tmp / self.NAME).write_text("x", encoding="utf-8")
+        rc, out, err = run_main(["--tmpdir", str(self.tmp)], {})
+        self.assertEqual(rc, 0)
+        self.assert_no_injection(out, err, "would remove " + self.ESCAPED)
+
+    def test_failed_removal_line_escaped_7748(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        self.mark()
+        locked = self.tmp / self.NAME
+        (locked / "inner").mkdir(parents=True)
+        (locked / "inner" / "f").write_text("x", encoding="utf-8")
+        os.chmod(str(locked / "inner"), 0o500)
+        rc, out, err = run_main(["--apply", "--tmpdir", str(self.tmp)], {})
+        self.assertEqual(rc, 0)
+        self.assertIn("failed=1", out)
+        self.assert_no_injection(out, err, "failed " + self.ESCAPED + ":")
+
+    def test_noncanonical_notice_escaped_7748(self):
+        real = self.lf_dir()
+        link = self.root / "runner" / ("l" + self.NAME)
+        os.symlink(str(real), str(link))
+        rc, out, err = run_main(["--apply", "--tmpdir", str(link)], {})
+        self.assertEqual(rc, 0)
+        self.assertIn("non-canonical", out)
+        self.assert_no_injection(out, err, "l" + self.ESCAPED)
+        self.assertEqual(sorted(p.name for p in real.iterdir()), [MARKER])
+
+    def test_refusal_notice_escaped_7748(self):
+        path = self.lf_dir(marked=False)
+        rc, out, err = run_main(["--apply", "--tmpdir", str(path)], {})
+        self.assertEqual(rc, 0)
+        self.assertIn("refusing", out)
+        self.assert_no_injection(out, err, "t" + self.ESCAPED)
+
+    def test_summary_line_escaped_7748(self):
+        path = self.lf_dir()
+        (path / "a.db").write_text("x", encoding="utf-8")
+        rc, out, err = run_main(["--apply", "--tmpdir", str(path)], {})
+        self.assertEqual(rc, 0)
+        self.assertIn("removed=1", out)
+        self.assert_no_injection(out, err, "dir=" + cjt._esc(path))
+
+    def test_cannot_list_notice_escaped_7748(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        path = self.lf_dir()
+        os.chmod(str(path), 0o311)
+        try:
+            rc, out, err = run_main(["--apply", "--tmpdir", str(path)], {})
+        finally:
+            os.chmod(str(path), 0o755)
+        self.assertEqual(rc, 0)
+        self.assertIn("cannot list", out)
+        self.assert_no_injection(out, err, "t" + self.ESCAPED)
+
+
 if __name__ == "__main__":
     unittest.main()

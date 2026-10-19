@@ -125,11 +125,13 @@ class PurgeSteps(unittest.TestCase):
                 self.assertEqual(field(step, "continue-on-error"), "")
 
     def test_this_pin_runs_in_ci_7748(self):
-        """The classify job's unittest step lists this file, so a regression fails CI."""
+        """Exactly one unconditional, fail-loud ``classify`` step runs this file (the SweepTestsRunInCi shape, #7160)."""
         me = "scripts/test/test_workflow_tmpdir_purge_7748.py"
-        runs = [ln for ln in read(WORKFLOWS / "ci.yml").splitlines()
-                if ln.strip().startswith("run: python3 -m unittest") and me in ln]
-        self.assertEqual(len(runs), 1, runs)
+        classify = steps(job_lines(read(WORKFLOWS / "ci.yml"), "classify"))
+        found = [s for s in classify if "unittest" in field(s, "run") and me in field(s, "run")]
+        self.assertEqual(len(found), 1, "no single classify step runs %s" % me)
+        self.assertEqual(field(found[0], "if"), "", "the pin must run on every event")
+        self.assertEqual(field(found[0], "continue-on-error"), "")
 
     def test_no_other_workflow_has_an_unpaired_self_hosted_job_7748(self):
         covered = set(wf for wf, _, _ in JOBS)
