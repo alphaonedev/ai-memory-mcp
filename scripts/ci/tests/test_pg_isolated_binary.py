@@ -2526,5 +2526,60 @@ class LiveEndToEnd(unittest.TestCase):
         self.assertEqual(tpl_left, '0', 'teardown dropped the template')
 
 
+
+class ConnectTimeout7866(unittest.TestCase):
+    """Exercise setup's actual CLI boundary with no real PostgreSQL process."""
+
+    def test_oversized_numeric_cli_is_controlled_without_psql_7866(self):
+        directory = Path(scratch_dir())
+        try:
+            marker = directory / 'psql-called'
+            hook = directory / 'sitecustomize.py'
+            # The CLI process is real; only its external psql boundary is replaced.
+            hook.write_text(
+                "import os, subprocess\n"
+                "from pathlib import Path\n"
+                "original_run = subprocess.run\n"
+                "def guarded_run(argv, *args, **kwargs):\n"
+                "    if Path(str(argv[0])).name == 'psql':\n"
+                "        Path(os.environ['PSQL_MARKER_7866']).write_text('called')\n"
+                "        raise AssertionError('unexpected psql invocation')\n"
+                "    return original_run(argv, *args, **kwargs)\n"
+                "subprocess.run = guarded_run\n")
+            for digits in (400, 5000):
+                with self.subTest(digits=digits):
+                    env = {k: v for k, v in os.environ.items()
+                           if not k.startswith(('PG', 'AI_MEMORY_TEST_P', 'CI_PG_'))}
+                    env.update(AI_MEMORY_TEST_PG_ISOLATE='1',
+                               AI_MEMORY_TEST_POSTGRES_URL=BASE + '&connect_timeout=' + '9' * digits,
+                               PYTHONPATH=str(directory), PSQL_MARKER_7866=str(marker))
+                    result = subprocess.run(
+                        [sys.executable, str(SCRIPT), 'setup', '--db', 'issue7866', '--jobs', '1'],
+                        env=env, capture_output=True, text=True, timeout=30)
+                    self.assertFalse(marker.exists(), "refusal must precede psql")
+                    self.assertEqual(result.returncode, 2, result.stderr[:1000])
+                    self.assertNotIn('Traceback', result.stderr)
+                    self.assertIn('connect_timeout', result.stderr)
+                    self.assertLess(len(result.stderr), 1000)
+                    self.assertNotIn('pw', result.stderr)
+                    self.assertNotIn('9' * 100, result.stderr)
+        finally:
+            shutil.rmtree(directory)
+
+    def test_normal_and_long_leading_zero_values_keep_caps_7866(self):
+        for value in ('1', '2', '30', '284'):
+            with self.subTest(value=value):
+                normal = pib._pg_env(BASE + '&connect_timeout=' + value)
+                padded = pib._pg_env(BASE + '&connect_timeout=' + '0' * 5000 + value)
+                self.assertEqual(pib._connect_plan(padded), pib._connect_plan(normal))
+                self.assertEqual(pib.server_caps_sql(padded), pib.server_caps_sql(normal))
+
+    def test_zero_and_cap_boundary_refusals_are_controlled_7866(self):
+        for value in ('0', '0' * 5000, '285', '300', '301', '0' * 5000 + '285'):
+            with self.subTest(value=value[:20]), self.assertRaises(pib.WrapperError) as caught:
+                pib.server_caps_sql(pib._pg_env(BASE + '&connect_timeout=' + value))
+            self.assertLess(len(str(caught.exception)), 1000)
+
+
 if __name__ == '__main__':
     unittest.main()
