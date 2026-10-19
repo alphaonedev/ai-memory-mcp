@@ -363,8 +363,8 @@ class PublishNoReplace7667(BundleFixture):
         """stage_verify that creates the empty destination right after the exists check would have run."""
         real = self.bb.stage_verify
 
-        def verify(stage, files):
-            out = real(stage, files)
+        def verify(stage, files, *args, **kwargs):
+            out = real(stage, files, *args, **kwargs)
             self.dest.mkdir(parents=True, exist_ok=True)
             return out
         return mock.patch.object(self.bb, "stage_verify", side_effect=verify)
@@ -393,14 +393,12 @@ class PublishNoReplace7667(BundleFixture):
                 self.assertEqual((dest / "a.txt").read_bytes(), b"one\n")
 
     def test_a_destination_that_is_not_the_staged_directory_is_refused_7667(self):
-        def swap(stage, dest):
+        def swap(stage, dest, **kwargs):
             """A rename that publishes a different directory with the right bytes."""
-            dest.mkdir(parents=True)
-            for p in stage.iterdir():
-                (dest / p.name).write_bytes(p.read_bytes())
-            for p in stage.iterdir():
-                p.unlink()
-            stage.rmdir()
+            self.dest.mkdir(parents=True)
+            for name, data in self.files.items():
+                (self.dest / name).write_bytes(data)
+            (self.dest / "MANIFEST.sha256").write_text(self.manifest)
         with mock.patch.object(self.bb, "rename_noreplace", side_effect=swap), self.assertRaises(self.bb.Fatal) as cm:
             self.bb.publish_bundle(self.wt, self.dest, self.files, self.manifest)
         self.assertIn("not the staged", str(cm.exception))
@@ -408,9 +406,9 @@ class PublishNoReplace7667(BundleFixture):
     def test_a_published_directory_whose_manifest_no_longer_matches_is_refused_7667(self):
         real = self.bb.rename_noreplace
 
-        def tamper(stage, dest):
-            real(stage, dest)
-            (dest / "a.txt").write_bytes(b"changed\n")
+        def tamper(stage, dest, **kwargs):
+            real(stage, dest, **kwargs)
+            (self.dest / "a.txt").write_bytes(b"changed\n")
         with mock.patch.object(self.bb, "rename_noreplace", side_effect=tamper), self.assertRaises(self.bb.Fatal) as cm:
             self.bb.publish_bundle(self.wt, self.dest, self.files, self.manifest)
         self.assertIn("manifest", str(cm.exception))

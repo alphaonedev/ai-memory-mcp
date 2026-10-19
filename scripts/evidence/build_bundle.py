@@ -18,6 +18,7 @@ Modelled on cert-385da3a05 (commit 9f68ea41a). Steps, each fatal on failure:
 Nothing is staged or committed. Exit 0 only when every step passed.
 """
 import argparse
+import contextlib
 import ctypes
 import ctypes.util
 import datetime
@@ -25,11 +26,11 @@ import errno
 import hashlib
 import os
 import re
+import secrets
 import socket
-import shutil
+import stat
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -395,37 +396,97 @@ def hits(text, pats):
     return [(p, l) for l in text.splitlines() for p in pats if (rxs[p].search(l) if p in rxs else p in l)]
 
 
-STAGING_PREFIX = "bundle-stage-"
+PRIVATE_PREFIX = "bundle-private-"
+STAGE_NAME = "bundle"
+REJECTED_NAME = "rejected"
+MANIFEST_NAME = "MANIFEST.sha256"
+PRIVATE_MODE = 0o700
+DIRECTORY_MODE = 0o755
+FILE_MODE = 0o644
+UNTRUSTED_WRITE = 0o022
+WORLD_WRITE = 0o002
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 SCRATCH_DIR = ".local-runs"
 SCRIPT_SUFFIXES = (".sh", ".py")
 
 
-def stage_write(stage, files, manifest):
-    """Write every bundle file plus MANIFEST.sha256 into the staging directory (#7621)."""
-    for name, data in files.items():
-        (stage / name).write_bytes(data)
-        (stage / name).chmod(0o755 if name.endswith(SCRIPT_SUFFIXES) else 0o644)
-    (stage / "MANIFEST.sha256").write_text(manifest)
-    (stage / "MANIFEST.sha256").chmod(0o644)
+def identity(info):
+    return info.st_dev, info.st_ino
 
 
-def stage_verify(stage, files):
-    """Re-verify the staged bundle against its MANIFEST and the expected file set; returns the listing."""
-    for line in (stage / "MANIFEST.sha256").read_text().splitlines():
-        digest, name = line.split("  ", 1)
-        if hashlib.sha256((stage / name).read_bytes()).hexdigest() != digest:
-            raise Fatal(f"manifest re-verify failed for {name}")
-    on_disk = sorted(p.name for p in stage.iterdir())
-    if on_disk != sorted([*files, "MANIFEST.sha256"]):
+def directory_check(fd, expected=None, private=False, shared=False):
+    """Validate the held directory, never following a replacement pathname."""
+    info = os.fstat(fd)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+            or info.st_mode & (WORLD_WRITE if shared else UNTRUSTED_WRITE)
+            or (private and stat.S_IMODE(info.st_mode) != PRIVATE_MODE)
+            or (expected is not None and identity(info) != expected)):
+        raise Fatal("not the staged directory: unsafe directory identity, owner or mode")
+    return identity(info)
+
+
+def entry_matches(parent_fd, name, expected):
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return identity(info) == expected and not stat.S_ISLNK(info.st_mode) and info.st_uid == os.geteuid()
+
+
+@contextlib.contextmanager
+def directory_handle(parent_fd, name):
+    """Hold a no-follow directory descriptor for the caller's context lifetime."""
+    fd = os.open(name, DIRECTORY_FLAGS, dir_fd=parent_fd)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def stage_file(directory_fd, name, flags, mode):
+    """A no-follow file handle whose descriptor is closed even if wrapping it fails."""
+    fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, FILE_MODE, dir_fd=directory_fd)
+    try:
+        with os.fdopen(fd, mode, closefd=False) as stream:
+            yield stream
+    finally:
+        os.close(fd)
+
+
+def stage_write(stage, files, manifest, *, directory_fd, written):
+    """Exclusively write into the held stage; retain identities for bounded cleanup."""
+    for name, data in {**files, MANIFEST_NAME: manifest.encode()}.items():
+        with stage_file(directory_fd, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, "wb") as stream:
+            written[name] = identity(os.fstat(stream.fileno()))
+            stream.write(data)
+            os.fchmod(stream.fileno(), DIRECTORY_MODE if name.endswith(SCRIPT_SUFFIXES) else FILE_MODE)
+
+
+def stage_verify(stage, files, manifest, *, directory_fd):
+    """Compare every owned regular file with builder bytes, including the manifest."""
+    expected = {**files, MANIFEST_NAME: manifest.encode()}
+    on_disk = sorted(os.listdir(directory_fd))
+    if on_disk != sorted(expected):
         raise Fatal(f"unexpected files in bundle: {on_disk}")
+    for name, data in expected.items():
+        with stage_file(directory_fd, name, os.O_RDONLY, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                    or info.st_mode & UNTRUSTED_WRITE or info.st_size != len(data)
+                    or stream.read(len(data) + 1) != data
+                    or not entry_matches(directory_fd, name, identity(info))):
+                raise Fatal(f"manifest/builder re-verify failed for {name}")
+    if sorted(os.listdir(directory_fd)) != on_disk:
+        raise Fatal("unexpected files appeared in bundle")
     return on_disk
 
 
-def discard_stage(stage, scratch):
-    """Remove a staging directory, only ever one directly under the checkout's scratch directory."""
-    if stage.parent != scratch or not stage.name.startswith(STAGING_PREFIX) or stage.is_symlink():
-        raise Fatal(f"refusing to remove {stage}: not a staging directory under {scratch}")
-    shutil.rmtree(stage)
+def discard_stage(directory_fd, written):
+    """Unlink only files created by this invocation, through its held directory."""
+    for name, expected in written.items():
+        if entry_matches(directory_fd, name, expected):
+            os.unlink(name, dir_fd=directory_fd)
 
 
 AT_FDCWD = -100
@@ -441,8 +502,8 @@ def load_renameat2():
     fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     fn.restype = ctypes.c_int
 
-    def native(src, dst):
-        if fn(AT_FDCWD, os.fsencode(src), AT_FDCWD, os.fsencode(dst), RENAME_NOREPLACE) != 0:
+    def native(src, dst, *, src_dir_fd=AT_FDCWD, dst_dir_fd=AT_FDCWD):
+        if fn(src_dir_fd, os.fsencode(src), dst_dir_fd, os.fsencode(dst), RENAME_NOREPLACE) != 0:
             err = ctypes.get_errno()
             raise OSError(err, os.strerror(err), str(dst))
     return native
@@ -451,30 +512,23 @@ def load_renameat2():
 rename_noreplace_native = load_renameat2()
 
 
-def rename_noreplace(src, dst):
-    """Rename directory src to dst, never replacing dst: the kernel refuses an existing destination (renameat2
-    RENAME_NOREPLACE). Where that is missing or the filesystem does not support it, dst is claimed with an atomic mkdir
-    first (it fails when dst exists, even empty) and the stage is renamed onto the directory this call made (#7667).
-    Fatal when the destination exists."""
+def rename_noreplace(src, dst, *, src_dir_fd, dst_dir_fd, fallback):
+    """Use atomic no-replace rename, or exclusively populate a private destination claim.
+
+    The portable callback never renames onto an existing directory. Its 0700 claim
+    can be visible while being populated; readers gain access only after verification.
+    """
     native = rename_noreplace_native
     if native is not None:
         try:
-            native(src, dst)
+            native(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
             return
-        except OSError as e:
-            if e.errno in (errno.EEXIST, errno.ENOTEMPTY):
-                raise Fatal(f"{dst} already exists; refusing to overwrite") from e
-            if e.errno not in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
+        except OSError as error:
+            if error.errno in (errno.EEXIST, errno.ENOTEMPTY):
+                raise Fatal(f"{dst} already exists; refusing to overwrite") from error
+            if error.errno not in (errno.ENOSYS, errno.EINVAL, errno.ENOTSUP):
                 raise
-    try:
-        os.mkdir(dst)
-    except FileExistsError as e:
-        raise Fatal(f"{dst} already exists; refusing to overwrite") from e
-    try:
-        os.rename(src, dst)
-    except OSError:
-        os.rmdir(dst)
-        raise
+    fallback()
 
 
 def open_stage_scratch(wt):
@@ -488,43 +542,143 @@ def open_stage_scratch(wt):
             fd = open_scratch(scratch)
     except ValueError as e:
         raise Fatal(str(e)) from e
-    if fd is not None:
-        os.close(fd)
-    return scratch
+    if fd is None:
+        raise Fatal("scratch directory disappeared before staging")
+    return scratch, fd
 
 
 def publish_bundle(wt, dest, files, manifest):
-    """Build the bundle in a staging directory under <wt>/.local-runs and publish it with one rename (#7621).
+    """Publish only the builder's held stage and expected bytes (#7729).
 
-    The cert directory appears only after every write and the re-verify pass; on any failure the staging directory
-    is removed and the tree is untouched. An existing destination is never replaced, also when it appears between the
-    check and the rename (#7667): the rename itself refuses it, and afterwards the destination must be the staged
-    directory (same device and inode) and must match the manifest.
+    The group-writable scratch root is unchanged. A private parent protects the stage's
+    name, and all content and rename operations are relative to held directory fds.
+    Native publication moves the verified stage with atomic no-replace rename. The
+    portable path exclusively creates a new 0700 destination, populates it from builder
+    memory, and verifies that separate claim before enabling normal reader access.
+    Replacement objects are never recursively removed. A rejected publication is moved
+    back into the private parent before cleaning only files created by this call.
     """
-    scratch = open_stage_scratch(wt)
-    if dest.exists():
-        raise Fatal(f"{dest} already exists; refusing to overwrite")
-    stage = Path(tempfile.mkdtemp(prefix=STAGING_PREFIX, dir=scratch))
+    files = dict(files)
+    if (any(not name or name in (".", "..", MANIFEST_NAME) or Path(name).name != name for name in files)
+            or manifest != manifest_text(files)):
+        raise Fatal("invalid builder file names or manifest")
+    relative_parent = dest.parent.relative_to(wt)
+    if ".." in relative_parent.parts:
+        raise Fatal("destination must stay beneath the checkout")
+    private_name = PRIVATE_PREFIX + secrets.token_hex(16)
+    scratch, scratch_fd = open_stage_scratch(wt)
+    descriptors = [scratch_fd]
+    claims = contextlib.ExitStack()
+    private_fd = stage_fd = dest_fd = None
+    private_id = stage_id = None
+    output_fd = output_id = None
+    written = {}
+    output_written = written
+    published = False
+    completed = False
     try:
-        stage.chmod(0o755)
-        stage_write(stage, files, manifest)
-        on_disk = stage_verify(stage, files)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        st = os.stat(stage)
-        rename_noreplace(stage, dest)
-        now = os.stat(dest, follow_symlinks=False)
-        if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
-            raise Fatal(f"{dest} is not the staged directory (device/inode differ); not trusting it")
+        if dest.exists() or dest.is_symlink():
+            raise Fatal(f"{dest} already exists; refusing to overwrite")
+        os.mkdir(private_name, mode=PRIVATE_MODE, dir_fd=scratch_fd)
+        private_fd = os.open(private_name, DIRECTORY_FLAGS, dir_fd=scratch_fd)
+        descriptors.append(private_fd)
+        private_id = directory_check(private_fd, private=True)
+        os.mkdir(STAGE_NAME, mode=PRIVATE_MODE, dir_fd=private_fd)
+        stage_fd = os.open(STAGE_NAME, DIRECTORY_FLAGS, dir_fd=private_fd)
+        descriptors.append(stage_fd)
+        stage_id = directory_check(stage_fd, private=True)
+        output_fd, output_id = stage_fd, stage_id
+        stage = scratch / private_name / STAGE_NAME
+        # Walk from the held checkout, refusing symlinks in every component. Keep
+        # each edge pinned so replacing any ancestor cannot redirect publication.
+        dest_fd = os.open(wt, DIRECTORY_FLAGS)
+        descriptors.append(dest_fd)
+        path_edges = [(None, wt, identity(os.fstat(dest_fd)))]
+        for component in relative_parent.parts:
+            try:
+                os.mkdir(component, mode=DIRECTORY_MODE, dir_fd=dest_fd)
+            except FileExistsError:
+                if not stat.S_ISDIR(os.stat(component, dir_fd=dest_fd, follow_symlinks=False).st_mode):
+                    raise Fatal("publication parent is not a plain directory")
+            child_fd = os.open(component, DIRECTORY_FLAGS, dir_fd=dest_fd)
+            descriptors.append(child_fd)
+            info = os.fstat(child_fd)
+            if info.st_uid != os.geteuid():
+                raise Fatal("publication parent is owned by another uid")
+            path_edges.append((dest_fd, component, identity(info)))
+            dest_fd = child_fd
+        directory_check(dest_fd, shared=True)
+        stage_write(stage, files, manifest, directory_fd=stage_fd, written=written)
+        on_disk = stage_verify(stage, files, manifest, directory_fd=stage_fd)
+        directory_check(private_fd, private_id, private=True)
+        directory_check(stage_fd, stage_id, private=True)
+        if (not entry_matches(None, scratch, identity(os.fstat(scratch_fd)))
+                or not entry_matches(scratch_fd, private_name, private_id)
+                or not entry_matches(private_fd, STAGE_NAME, stage_id)):
+            raise Fatal("not the staged directory: stage or private parent was replaced")
+        stage_verify(stage, files, manifest, directory_fd=stage_fd)
+        if not entry_matches(private_fd, STAGE_NAME, stage_id):
+            raise Fatal("not the staged directory: source changed during verification")
+        if not all(entry_matches(*edge) for edge in path_edges):
+            raise Fatal("publication parent path was replaced")
+
+        def claim_destination():
+            nonlocal output_fd, output_id, output_written, published
+            try:
+                os.mkdir(dest.name, mode=PRIVATE_MODE, dir_fd=dest_fd)
+            except FileExistsError as error:
+                raise Fatal(f"{dest} already exists; refusing to overwrite") from error
+            output_fd = claims.enter_context(directory_handle(dest_fd, dest.name))
+            output_id = directory_check(output_fd, private=True)
+            output_written = {}
+            published = True
+            stage_write(dest, files, manifest, directory_fd=output_fd, written=output_written)
+
+        rename_noreplace(STAGE_NAME, dest.name, src_dir_fd=private_fd, dst_dir_fd=dest_fd,
+                         fallback=claim_destination)
+        published = True
+        if not entry_matches(dest_fd, dest.name, output_id):
+            raise Fatal("not the staged directory: published identity differs")
+        directory_check(stage_fd, stage_id, private=True)
+        if output_fd != stage_fd and not entry_matches(private_fd, STAGE_NAME, stage_id):
+            raise Fatal("not the staged directory: source changed during portable publication")
+        directory_check(output_fd, output_id, private=True)
+        stage_verify(dest, files, manifest, directory_fd=output_fd)
+        if (not all(entry_matches(*edge) for edge in path_edges)
+                or not entry_matches(dest_fd, dest.name, output_id)):
+            raise Fatal("not the staged directory: publication path was replaced")
+        os.fchmod(output_fd, DIRECTORY_MODE)
+        directory_check(output_fd, output_id)
+        completed = True
+        return on_disk
+    except (OSError, ValueError) as error:
+        raise Fatal(f"bundle publication failed: {error}") from error
+    finally:
         try:
-            stage_verify(dest, files)
-        except Fatal:
-            shutil.rmtree(dest)  # the staged directory itself, changed after the rename: do not leave it published
-            raise
-    except BaseException:
-        if stage.exists():
-            discard_stage(stage, scratch)
-        raise
-    return on_disk
+            # A failed publication is quarantined through the pinned destination parent.
+            # Keep foreign destinations and unknown entries intact, even on failure.
+            if not completed and published and entry_matches(dest_fd, dest.name, output_id):
+                os.rename(dest.name, REJECTED_NAME, src_dir_fd=dest_fd, dst_dir_fd=private_fd)
+            if not completed and published:
+                discard_stage(output_fd, output_written)
+            if stage_fd is not None and (not completed or output_fd != stage_fd):
+                discard_stage(stage_fd, written)
+            if private_fd is not None:
+                for name, expected in ((STAGE_NAME, stage_id), (REJECTED_NAME, output_id)):
+                    if expected is not None and entry_matches(private_fd, name, expected):
+                        try:
+                            os.rmdir(name, dir_fd=private_fd)
+                        except OSError as error:
+                            print(f"retained private staging data ({name}): {error.strerror}", file=sys.stderr)
+            if private_id is not None and entry_matches(scratch_fd, private_name, private_id):
+                try:
+                    os.rmdir(private_name, dir_fd=scratch_fd)
+                except OSError as error:
+                    print(f"retained private staging parent: {error.strerror}", file=sys.stderr)
+        finally:
+            claims.close()
+            for fd in reversed(descriptors):
+                os.close(fd)
 
 
 def main():

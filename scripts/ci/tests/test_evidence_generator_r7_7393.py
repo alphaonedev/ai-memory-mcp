@@ -508,21 +508,22 @@ class StagedBundle7621(BundleFixture):
         self.assertEqual(self.leftovers(), [])
 
     def test_a_write_failure_leaves_no_partial_bundle_7621(self):
-        real = Path.write_bytes
+        real = os.open
         calls = []
 
-        def flaky(self_, data):
-            calls.append(self_.name)
-            if len(calls) == 3:
-                raise OSError(28, "No space left on device")
-            return real(self_, data)
-        with mock.patch.object(Path, "write_bytes", flaky):
+        def flaky(path, flags, *args, **kwargs):
+            if flags & os.O_CREAT:
+                calls.append(path)
+                if len(calls) == 3:
+                    raise OSError(28, "No space left on device")
+            return real(path, flags, *args, **kwargs)
+        with mock.patch.object(os, "open", flaky):
             code, text = self.build()
         self.assert_clean_failure(code, text)
         self.assert_rerun_succeeds()
 
     def test_a_chmod_failure_leaves_no_partial_bundle_7621(self):
-        real = Path.chmod
+        real = os.fchmod
         count = []
 
         def flaky(self_, mode, *a, **kw):
@@ -530,58 +531,76 @@ class StagedBundle7621(BundleFixture):
             if len(count) == 2:
                 raise PermissionError(1, "Operation not permitted")
             return real(self_, mode, *a, **kw)
-        with mock.patch.object(Path, "chmod", flaky):
+        with mock.patch.object(os, "fchmod", flaky):
             code, text = self.build()
         self.assert_clean_failure(code, text)
         self.assert_rerun_succeeds()
 
     def test_a_manifest_write_failure_leaves_no_partial_bundle_7621(self):
-        real = Path.write_text
+        real = os.open
 
-        def flaky(self_, data, *a, **kw):
-            if self_.name == "MANIFEST.sha256":
+        def flaky(path, flags, *a, **kw):
+            if path == "MANIFEST.sha256" and flags & os.O_CREAT:
                 raise OSError(5, "Input/output error")
-            return real(self_, data, *a, **kw)
-        with mock.patch.object(Path, "write_text", flaky):
+            return real(path, flags, *a, **kw)
+        with mock.patch.object(os, "open", flaky):
             code, text = self.build()
         self.assert_clean_failure(code, text)
         self.assert_rerun_succeeds()
 
     def test_a_reverify_mismatch_leaves_no_partial_bundle_7621(self):
-        real = Path.write_bytes
+        bb = load("build_bundle")
+        real = bb.stage_write
 
-        def corrupting(self_, data):
-            return real(self_, data + b"corrupt" if self_.name == "SANITIZATION.md" else data)
-        with mock.patch.object(Path, "write_bytes", corrupting):
+        def corrupting(stage, *args, **kwargs):
+            real(stage, *args, **kwargs)
+            path = stage / "SANITIZATION.md"
+            path.write_bytes(path.read_bytes() + b"corrupt")
+        with mock.patch.object(bb, "stage_write", corrupting):
             code, text = self.build()
         self.assert_clean_failure(code, text)
         self.assertIn("re-verify", text)
         self.assert_rerun_succeeds()
 
     def test_an_unexpected_file_in_the_bundle_leaves_no_partial_bundle_7621(self):
-        real = Path.write_text
+        bb = load("build_bundle")
+        real = bb.stage_write
+        planted = []
 
-        def extra(self_, data, *a, **kw):
-            out = real(self_, data, *a, **kw)
-            if self_.name == "MANIFEST.sha256":
-                real(self_.parent / "unexpected.txt", "x\n")
-            return out
-        with mock.patch.object(Path, "write_text", extra):
+        def extra(stage, *args, **kwargs):
+            real(stage, *args, **kwargs)
+            path = stage / "unexpected.txt"
+            path.write_text("x\n")
+            planted.append(path)
+        with mock.patch.object(bb, "stage_write", extra):
             code, text = self.build()
-        self.assert_clean_failure(code, text)
+        self.assertEqual(code, 1, text)
+        self.assertFalse(self.final().exists())
         self.assertIn("unexpected", text)
+        # #7729: unknown data stays private, instead of recursive deletion.
+        self.assertEqual(planted[0].read_text(), "x\n")
+        planted[0].unlink()
+        planted[0].parent.rmdir()
+        planted[0].parent.parent.rmdir()
         self.assert_rerun_succeeds()
 
     def test_a_failed_publish_leaves_no_partial_bundle_7621(self):
         bb = load("build_bundle")
         failing = OSError(18, "Invalid cross-device link")
-        # #7667: the publish is renameat2(RENAME_NOREPLACE) where available, else a mkdir claim and os.rename
-        for label, patches in (("renameat2", {"rename_noreplace_native": mock.Mock(side_effect=failing)}),
-                               ("mkdir-claim", {"rename_noreplace_native": None})):
-            with self.subTest(path=label), mock.patch.multiple(bb, **patches), \
-                    mock.patch("os.rename", side_effect=failing):
-                code, text = self.build()
-                self.assert_clean_failure(code, text)
+        with mock.patch.object(bb, "rename_noreplace_native", mock.Mock(side_effect=failing)):
+            code, text = self.build()
+            self.assert_clean_failure(code, text)
+        real = bb.stage_write
+
+        def failed_copy(stage, *args, **kwargs):
+            if stage == self.final():
+                raise OSError(28, "No space left on device")
+            return real(stage, *args, **kwargs)
+        # #7729: portable publication exclusively populates a private claim.
+        with mock.patch.object(bb, "rename_noreplace_native", None), \
+                mock.patch.object(bb, "stage_write", failed_copy):
+            code, text = self.build()
+            self.assert_clean_failure(code, text)
         self.assert_rerun_succeeds()
 
     def test_an_existing_bundle_is_never_touched_by_a_refused_run_7621(self):
