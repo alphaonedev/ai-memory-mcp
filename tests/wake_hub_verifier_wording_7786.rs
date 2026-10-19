@@ -72,7 +72,7 @@ fn no_site_says_the_delegation_lands_in_3468() {
             .flat_map(str::split_whitespace)
             .collect::<Vec<_>>()
             .join(" ");
-        let collapsed = collapsed.replace("[ ", "[");
+        let collapsed = collapsed.replace("[ ", "[").replace(" ]", "]");
         for stale in [STALE_CLAUSE, STALE_CLAUSE_LINKED] {
             assert!(
                 !collapsed.contains(stale),
