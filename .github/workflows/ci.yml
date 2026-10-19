@@ -233,14 +233,17 @@ jobs:
         run: python3 scripts/test/test_ci_test_impact.py
       - name: Workflow concurrency invariants (#6340)
         run: python3 scripts/test/test_workflow_concurrency_6340.py
+      # #7748 - scripts/test/ is outside the discovery root below; run the TMPDIR purge
+      # workflow pin on every event (a separate step: no overlap with the #7160 run line).
+      - name: Runner TMPDIR purge workflow pin (#7748)
+        run: python3 -m unittest scripts/test/test_workflow_tmpdir_purge_7748.py
       - name: Shard partition and wiring unit tests (#6344)
         run: python3 -m unittest discover -s scripts/ci/tests
       # #7160 - scripts/test/ is outside the discovery root above; run the
       # sweep script tests (including the Linux-only O_PATH test, which this
       # ubuntu-latest job is where it executes) and the sweep workflow pin.
-      # #7748 - the TMPDIR purge pin test rides the same step (CI-wired).
-      - name: Target sweep and TMPDIR purge unit tests (#7160, #7748)
-        run: python3 -m unittest scripts/test/test_ci_sweep_target.py scripts/test/test_workflow_sweep_7160.py scripts/test/test_workflow_tmpdir_purge_7748.py
+      - name: Target sweep unit tests (#7160)
+        run: python3 -m unittest scripts/test/test_ci_sweep_target.py scripts/test/test_workflow_sweep_7160.py
       - id: cls
         shell: bash
         env:
