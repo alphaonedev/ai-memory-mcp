@@ -685,7 +685,7 @@ def _live_url():
 
 @unittest.skipUnless(_live_url() and shutil.which('psql'), 'AI_MEMORY_TEST_POSTGRES_URL unset (live e2e)')
 class LiveEndToEnd(unittest.TestCase):
-    """C1 end to end: the real script, a real server, a probe, /bin/true."""
+    """C1 end to end: the real script, a real server, a probe, a silent Python child."""
 
     def test_setup_run_teardown_creates_and_drops_a_clone(self):
         url = _live_url()
@@ -722,7 +722,7 @@ class LiveEndToEnd(unittest.TestCase):
             self.assertIsNotNone(pib.parse_isolated_name(clone, run_id), clone)
             true_run = subprocess.run(
                 [sys.executable, str(SCRIPT), 'run', '--targets-file', str(d / 'targets.txt'),
-                 '--log-dir', str(d / 'logs2'), '--jobs', '1', '--', '/bin/true'],
+                 '--log-dir', str(d / 'logs2'), '--jobs', '1', '--', sys.executable, '-c', 'pass'],
                 env=env, capture_output=True, text=True, timeout=300)
             self.assertEqual(true_run.returncode, 0, true_run.stderr)
             self.assertIn('-> ai_memory_t_%s_' % run_id, true_run.stderr)
