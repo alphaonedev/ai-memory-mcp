@@ -728,7 +728,42 @@ class InterruptedOutput7855Tests(unittest.TestCase):
             code += ("assert not sys.stdout.closed; " if case == "usage" else
                      "assert not sys.stderr.closed; ")
             code += "sys.exit(status)"
-        return [sys.executable, "-u", "-c", code, str(HELPER)]
+        options = ["-u"] if getattr(self, "immediate", True) else []
+        return [sys.executable, *options, "-c", code, str(HELPER)]
+
+    def test_7855_buffered_interrupted_outputs(self):
+        self.immediate = False
+        self.test_7855_interrupted_blocking_outputs()
+
+    def test_7855_preserves_caller_encoder_newlines_and_pending_output(self):
+        spec = importlib.util.spec_from_file_location("body_ids_7855", HELPER)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        SCRATCH.mkdir(exist_ok=True)
+        for encoding, errors in (("utf-16", "strict"), ("iso2022_jp", "xmlcharrefreplace"),
+                                 ("ascii", "xmlcharrefreplace"), ("latin-1", "replace")):
+            with self.subTest(encoding=encoding), tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
+                outputs = []
+                for checked in (False, True):
+                    path = Path(directory) / str(checked)
+                    raw = io.FileIO(path, "w")
+                    stream = io.TextIOWrapper(io.BufferedWriter(raw), encoding=encoding,
+                                              errors=errors, newline="\r\n")
+                    try:
+                        stream.write("caller 日本\n")  # Remains buffered before the boundary.
+                        for text in ("help résumé\n", "usage 日本\n", "diagnostic é\n"):
+                            if checked:
+                                helper.write_output(stream, text)
+                            else:
+                                stream.write(text)
+                                stream.flush()
+                            self.assertFalse(stream.closed)
+                            self.assertNotIn("write", raw.__dict__)
+                        stream.write("caller tail 日本\n")
+                    finally:
+                        stream.close()
+                    outputs.append(path.read_bytes())
+                self.assertEqual(outputs[0], outputs[1])
 
     def test_7855_interrupted_blocking_outputs(self):
         body = b"12345678901 " + b"z" * LARGE_REPORT_BYTES

@@ -12,6 +12,7 @@ error. Runs entirely locally. Not a blanket gate for every PR body.
 """
 
 import argparse
+import contextlib
 import io
 import os
 from pathlib import Path
@@ -78,6 +79,46 @@ def close_failed_stream(stream):
         pass
 
 
+@contextlib.contextmanager
+def checked_raw_output(stream):
+    """Keep the caller's encoder/buffers, checking each underlying raw write."""
+    raw = getattr(stream, "buffer", stream)
+    raw = getattr(raw, "raw", raw)
+    if not isinstance(raw, io.FileIO):
+        if not isinstance(raw, (io.BytesIO, io.StringIO)):
+            raise OSError("unsupported output byte boundary")
+        yield
+        return
+    original = raw.write
+    override = raw.__dict__.get("write")
+    had_override = "write" in raw.__dict__
+    failed = False
+
+    def checked_write(data):
+        nonlocal failed
+        if failed:
+            raise OSError("failed output byte boundary")
+        # Latch before calling: a raised error must also prevent close retries.
+        failed = True
+        count = original(data)
+        if count != len(data):
+            raise OSError("incomplete output byte write")
+        failed = False
+        return count
+
+    raw.write = checked_write
+    try:
+        yield
+    except (OSError, UnicodeError):
+        close_failed_stream(stream)  # Keep the latch installed through cleanup.
+        raise
+    finally:
+        if had_override:
+            raw.write = override
+        else:
+            del raw.write
+
+
 def write_output(stream, payload):
     """Complete one write or fail before claiming a content/help status."""
     require_open_stream(stream)
@@ -90,13 +131,13 @@ def write_output(stream, payload):
         if not isinstance(raw, (io.BytesIO, io.StringIO)):
             raise
     else:
-        # TextIOWrapper can accept all characters after FileIO silently drops
-        # bytes. Refuse that descriptor state before either text or binary IO.
+        # Refuse unsupported descriptor states before either text or binary IO.
         if not os.get_blocking(descriptor):
             raise OSError("output descriptor must be blocking")
-    if stream.write(payload) != len(payload):
-        raise OSError("incomplete output write")
-    stream.flush()
+    with checked_raw_output(stream):
+        if stream.write(payload) != len(payload):
+            raise OSError("incomplete output write")
+        stream.flush()
 
 
 def report_error(message):
