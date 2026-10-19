@@ -379,7 +379,7 @@ class Run:
         return True
 
     def floor_ok(self, what):
-        """GOD 7caf919e: df before every cargo leg, stop below the floor. Once tripped, nothing else runs."""
+        """GOD 7caf919e: df before each Run.run command with gate=True (the default); force-restore and gate checks bypass it with gate=False. Once tripped, gated commands stop."""
         if self.floor_tripped:
             return False
         for mount, floor in ((self.targets, FLOOR_BUILD_GIB), (Path("/"), FLOOR_ROOT_GIB)):
