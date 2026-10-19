@@ -39,8 +39,26 @@ def scan_body(body):
     return offending, hit_count
 
 
+def close_failed_stream(stream):
+    """Release a failed CLI stream so shutdown cannot retry pending bytes."""
+    try:
+        # Buffered IO closes the underlying stream even when its flush fails.
+        # Closing the wrapper also prevents its finalizer from retrying output.
+        stream.close()
+    except OSError:
+        pass
+
+
+def report_error(message):
+    """Attempt one diagnostic; a broken diagnostic destination is also closed."""
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except OSError:
+        close_failed_stream(sys.stderr)
+
+
 def main():
-    """Read one body and report exact suspicion counts."""
+    """Read and report a body; failed standard output streams are closed."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--file", type=Path, help="read UTF-8 body from this file instead of stdin")
     args = parser.parse_args()
@@ -48,7 +66,7 @@ def main():
         raw = args.file.read_bytes() if args.file is not None else sys.stdin.buffer.read()
         body = raw.decode("utf-8")
     except (OSError, UnicodeError):
-        print("check_pr_body_ids: input error (expected readable UTF-8 body)", file=sys.stderr)
+        report_error("check_pr_body_ids: input error (expected readable UTF-8 body)")
         return EXIT_ERROR
     offending, hit_count = scan_body(body)
     report = offending + [f"suspected_ids={hit_count} offending_lines={len(offending)}"]
@@ -56,7 +74,8 @@ def main():
         sys.stdout.buffer.write(("\n".join(report) + "\n").encode("utf-8"))
         sys.stdout.buffer.flush()
     except OSError:
-        print("check_pr_body_ids: output error", file=sys.stderr)
+        close_failed_stream(sys.stdout)
+        report_error("check_pr_body_ids: output error")
         return EXIT_ERROR
     return EXIT_SUSPECTS if hit_count else EXIT_OK
 
