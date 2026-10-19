@@ -26,6 +26,10 @@ LANGUAGES = ("rust", "javascript-typescript", "python", "actions")
 START = "2026-10-19T12:00:00Z"
 CREATED = "2026-10-19T12:01:00Z"
 END = "2026-10-19T12:02:00Z"
+WORKFLOW = ".github/workflows/codeql-rust.yml"
+WORKFLOW_ID = 300
+RUN = 400
+SUITE = 500
 
 
 def fixture():
@@ -40,8 +44,20 @@ def fixture():
     jobs = [dict(aggregate, id=CHECK + offset + 1,
                  name="CodeQL analysis (" + language + ")",
                  app={"slug": "github-actions"},
+                 check_suite={"id": SUITE},
                  output={"title": None, "annotations_count": 3})
             for offset, language in enumerate(LANGUAGES)]
+    run = {
+        "id": RUN, "workflow_id": WORKFLOW_ID, "path": WORKFLOW,
+        "event": "pull_request", "head_sha": HEAD, "run_number": 20,
+        "run_attempt": 1, "check_suite_id": SUITE,
+        "status": "completed", "conclusion": "success",
+        "created_at": START, "run_started_at": START, "updated_at": END,
+        "pull_requests": [{"number": PR, "head": {"sha": HEAD}}],
+    }
+    attempt_jobs = [dict(job, run_id=RUN, run_attempt=1,
+                         check_run_url="https://api.github.com/repos/" + REPO
+                         + "/check-runs/" + str(job["id"])) for job in jobs]
     analyses = [{
         "id": offset + 1, "ref": "refs/pull/17/merge", "commit_sha": MERGE,
         "analysis_key": ".github/workflows/codeql-rust.yml:analyze",
@@ -50,6 +66,12 @@ def fixture():
         "tool": {"name": "CodeQL"},
     } for offset, language in enumerate(LANGUAGES)]
     return {
+        "actions/workflows/codeql-rust.yml": {"id": WORKFLOW_ID, "path": WORKFLOW},
+        "actions/workflows/300/runs": {"total_count": 1, "workflow_runs": [run]},
+        "actions/runs/400": run,
+        "actions/runs/400/attempts/1": run,
+        "actions/runs/400/attempts/1/jobs": {"total_count": len(jobs),
+                                            "jobs": attempt_jobs},
         "pulls/17": {"number": PR, "state": "open", "head": {"sha": HEAD},
                      "base": {"sha": BASE}, "merge_commit_sha": MERGE},
         "commits/" + MERGE: {"sha": MERGE, "parents": [{"sha": BASE}, {"sha": HEAD}]},
