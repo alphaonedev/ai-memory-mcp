@@ -72,6 +72,17 @@ jobs:
             runner: '["self-hosted","macos-fed"]'
     runs-on: ${{ fromJSON(matrix.runner) }}
     steps:
+      # 2026-08-26 rigid-security-controls (precedents: ci.yml:857,
+      # postgres-ignored.yml:55): a fork PR must NEVER have its code checked
+      # out on a self-hosted node. This step fails the self-hosted leg BEFORE
+      # `actions/checkout`; GitHub-hosted legs are unaffected. STEP-level, not
+      # job-level (#2494 wedge class). Added with the pull_request trigger (#7246).
+      - name: Fork-PR refusal (self-hosted legs never run fork code)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && contains(matrix.runner, 'self-hosted')
+        run: |
+          echo "::error::Refusing to run fork PR code on a self-hosted runner (leg ${{ matrix.os }})."
+          exit 1
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable

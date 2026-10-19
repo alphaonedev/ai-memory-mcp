@@ -75,6 +75,27 @@ def check_triggers(text):
     return problems
 
 
+REFUSAL_NAME = 'Fork-PR refusal (self-hosted legs never run fork code)'
+REFUSAL_NEEDLES = ('head.repo.full_name != github.repository', 'self-hosted')
+
+
+def refusal_problems(text):
+    """Return problems with the fork-PR refusal step (must precede checkout, guard self-hosted)."""
+    lines = text.splitlines()
+    named = [i for i, l in enumerate(lines) if l.strip() == '- name: ' + REFUSAL_NAME]
+    checkout = [i for i, l in enumerate(lines) if 'uses: actions/checkout@' in l]
+    if not named or not checkout:
+        return ['refusal step or checkout step missing']
+    problems = []
+    if named[0] > checkout[0]:
+        problems.append('refusal step does not precede checkout')
+    cond = lines[named[0] + 1].strip() if named[0] + 1 < len(lines) else ''
+    if not cond.startswith('if: '):
+        problems.append('refusal step has no if')
+    problems += ['if lacks ' + n for n in REFUSAL_NEEDLES if n not in cond]
+    return problems
+
+
 class SessionBootLifetimeTriggers7246(unittest.TestCase):
     def setUp(self):
         self.text = WORKFLOW.read_text(encoding='utf-8')
@@ -109,6 +130,20 @@ class SessionBootLifetimeTriggers7246(unittest.TestCase):
         problems = check_triggers(copy.read_text(encoding='utf-8'))
         self.assertTrue(any('push.branches' in p for p in problems), problems)
         self.assertTrue(any('versioned release' in p for p in problems), problems)
+
+
+    def test_f_fork_pr_refusal_precedes_checkout(self):
+        self.assertEqual(refusal_problems(self.text), [])
+        lines = self.text.splitlines()
+        start = lines.index('      - name: ' + REFUSAL_NAME)
+        end = start + 1
+        while not lines[end].startswith('      - uses:'):
+            end += 1
+        mutant = '\n'.join(lines[:start] + lines[end:])
+        SCRATCH.mkdir(parents=True, exist_ok=True)
+        copy = SCRATCH / 'session-boot-lifetime.no-refusal.yml'
+        copy.write_text(mutant, encoding='utf-8')
+        self.assertTrue(refusal_problems(copy.read_text(encoding='utf-8')))
 
 
 if __name__ == '__main__':
