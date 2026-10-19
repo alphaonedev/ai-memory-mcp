@@ -45,7 +45,7 @@
     "path": "src/wake_hub/identity.rs",
     "role": "Hub routing and bounded codecs; only public verification/visibility dependencies admitted by the separate zero-authority gate.",
     "mode": "rust-production-tokens",
-    "sha256": "14ed3f5849b15ffa4bd02c95f2e312dcad91d6a62d7117353d9c38339d661e65"
+    "sha256": "2f47cdae0dedcc08774c2d798e69ffae9c9c323ac68025f577ffb9ab22b10cef"
   },
   {
     "path": "src/wake_hub/limits.rs",
