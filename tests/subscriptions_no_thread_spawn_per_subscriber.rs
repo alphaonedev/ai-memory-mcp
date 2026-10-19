@@ -48,11 +48,18 @@ const SUBSCRIBERS: usize = 50;
 /// drains and trips this deadline (the assert then FAILs correctly).
 const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
 
-/// #6794 — a drain that has not finished by the deadline still passes when
-/// the receiver served at least one request in this final window. It exceeds
+/// #6794 — after the deadline a drain that has not finished is a stall only
+/// when the receiver served no request in this final window. It exceeds
 /// the longest idle gap of a healthy retry ladder (5 s last backoff plus one
 /// 5 s `ACK_TIMEOUT` is the worst case before the next request lands).
 const STALL_WINDOW: Duration = Duration::from_secs(11);
+
+/// #6912 — hard upper bound on the whole drain wait. The retry ladder
+/// (`ACK_TIMEOUT` x 4 plus the backoffs, ~190 s worst case for the last
+/// queued delivery) bounds a healthy drain, so progress past
+/// [`DRAIN_DEADLINE`] keeps the loop polling, and this cap guarantees a
+/// regression can never spin the test forever.
+const DRAIN_HARD_CAP: Duration = Duration::from_secs(240);
 
 /// #1475 — poll cadence while waiting for the semaphore to drain.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -157,6 +164,22 @@ async fn dispatch_to_50_subscribers_caps_inflight_at_semaphore_bound() {
     stop.store(1, Ordering::SeqCst);
     let _ = sampler.await;
 
+    // #6915 — primary check: the receiver counts requests concurrently in
+    // flight with an atomic high-water mark, independent of the semaphore's
+    // own permit count, so it can fail when the cap leaks.
+    let high_water = server.high_water();
+    assert!(
+        high_water <= BOUND,
+        "PERF-3 invariant violated: the receiver saw {high_water} concurrent \
+         requests, exceeding bound = {BOUND}. The semaphore is not pinning \
+         in-flight deliveries."
+    );
+    assert!(
+        high_water >= 1,
+        "PERF-3 receiver high-water mark is 0: no request was observed in flight"
+    );
+    // Secondary: the permit-derived sample (`BOUND - available`, which holds
+    // by construction and cannot fail on its own; see #6915).
     let peak = max_inflight.load(Ordering::SeqCst);
     assert!(
         peak <= BOUND,
@@ -178,38 +201,49 @@ async fn dispatch_to_50_subscribers_caps_inflight_at_semaphore_bound() {
     // free after 35 s at host load ~85). The permit snapshot cannot show
     // progress either, because a freed permit is re-taken by the next queued
     // delivery at once. The receiver's served-request count is monotone and
-    // moves on every attempt, so: poll until drained; if the deadline is hit
-    // with permits still held, fail ONLY when the receiver served nothing
-    // during the final `STALL_WINDOW` (a true leak holds permits with no
-    // worker left to send), and print the timeline either way.
+    // moves on every attempt, so: poll until drained. Past `DRAIN_DEADLINE`
+    // progress is only a reason to keep polling (#6912): other deliveries
+    // retrying inside the window must not mask a leaked permit, so the loop
+    // ends on drained, on the stall detector firing (the receiver served
+    // nothing in the final `STALL_WINDOW`), or on `DRAIN_HARD_CAP`. The
+    // timeline is printed on the stall path.
     let started = std::time::Instant::now();
     let mut timeline: Vec<(u128, usize, usize)> = Vec::new();
     let mut idle_avail = dispatch_semaphore_available_permits();
-    let drain_deadline = started + DRAIN_DEADLINE;
-    while idle_avail != BOUND && std::time::Instant::now() < drain_deadline {
+    let mut deadline_noted = false;
+    let mut stalled = false;
+    while idle_avail != BOUND && started.elapsed() < DRAIN_HARD_CAP {
         tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
         idle_avail = dispatch_semaphore_available_permits();
-        timeline.push((
-            started.elapsed().as_millis(),
-            idle_avail,
-            server.received_count().await,
-        ));
+        let elapsed_ms = started.elapsed().as_millis();
+        timeline.push((elapsed_ms, idle_avail, server.received_count().await));
+        if idle_avail != BOUND && started.elapsed() >= DRAIN_DEADLINE {
+            if !deadline_noted {
+                deadline_noted = true;
+                eprintln!(
+                    "PERF-3: drain still in progress at the deadline (available={idle_avail}, \
+                     bound={BOUND}); polling to drained-or-stalled."
+                );
+            }
+            if drain_stalled(&timeline, elapsed_ms, STALL_WINDOW.as_millis()) {
+                stalled = true;
+                break;
+            }
+        }
     }
-    let timeline_text = describe_timeline(&timeline);
     if idle_avail != BOUND {
         let latest = timeline.last().map_or(0, |&(_, _, served)| served);
-        let elapsed_ms = started.elapsed().as_millis();
-        assert!(
-            !drain_stalled(&timeline, elapsed_ms, STALL_WINDOW.as_millis()),
-            "PERF-3 invariant violated: semaphore did not drain and the \
-             receiver served no request in the last {STALL_WINDOW:?} \
-             (available={idle_avail}, bound={BOUND}, served={latest}). \
+        let timeline_text = describe_timeline(&timeline);
+        let why = if stalled {
+            "the receiver served no request in the last stall window"
+        } else {
+            "the hard cap elapsed with permits still held"
+        };
+        panic!(
+            "PERF-3 invariant violated: semaphore did not drain and {why} \
+             (stall window {STALL_WINDOW:?}, hard cap {DRAIN_HARD_CAP:?}, \
+             available={idle_avail}, bound={BOUND}, served={latest}). \
              A permit leak would block subsequent dispatches. \
-             Timeline (ms, available, served): {timeline_text}"
-        );
-        eprintln!(
-            "PERF-3: drain still in progress at the deadline (available={idle_avail}, \
-             bound={BOUND}, served={latest}); progress observed, not a leak. \
              Timeline (ms, available, served): {timeline_text}"
         );
     }
@@ -224,6 +258,9 @@ fn drain_stalled(timeline: &[(u128, usize, usize)], elapsed_ms: u128, window_ms:
         .iter()
         .rev()
         .find(|&&(at_ms, _, _)| at_ms.saturating_add(window_ms) <= elapsed_ms)
+        // #6913 — no sample is old enough: baseline from the FIRST observed
+        // sample, never 0 (a 0 baseline read any late sample as progress).
+        .or_else(|| timeline.first())
         .map_or(0, |&(_, _, served)| served);
     latest <= before
 }
@@ -246,6 +283,42 @@ fn drain_stall_detector_separates_slow_from_leaked_6794() {
     );
     // No samples at all is a stall, not a pass.
     assert!(drain_stalled(&[], 40_000, 11_000));
+    // #6913 — progress that stops partway through the run: served climbs to
+    // 30 by t=20 s, then freezes; the final 11 s window saw nothing.
+    let stops_midway: Vec<(u128, usize, usize)> = (0..40u128)
+        .map(|i| (i * 1_000, 0, 10 + usize::try_from(i.min(20)).unwrap_or(0)))
+        .collect();
+    assert!(
+        drain_stalled(&stops_midway, 40_000, 11_000),
+        "progress that stopped partway through the window read as a pass"
+    );
+    // #6913 — a single sample newer than the window start, with requests
+    // served: nothing older exists to prove growth, so it must read STALLED
+    // (the baseline is the first observed sample, not 0).
+    assert!(
+        drain_stalled(&[(39_000, 0, 5)], 40_000, 11_000),
+        "single late sample with served > 0 failed open"
+    );
+    // #6913 — the exact window boundary. A sample at `elapsed - window` is
+    // old enough (`<=`): baseline 12 equals the latest 12 -> stalled.
+    assert!(
+        drain_stalled(
+            &[(20_000, 0, 5), (29_000, 0, 12), (40_000, 0, 12)],
+            40_000,
+            11_000
+        ),
+        "sample exactly one window old was not used as the baseline"
+    );
+    // One millisecond inside the window it is NOT old enough, so the older
+    // sample (served 5) is the baseline and growth to 12 reads as progress.
+    assert!(
+        !drain_stalled(
+            &[(20_000, 0, 5), (29_001, 0, 12), (40_000, 0, 12)],
+            40_000,
+            11_000
+        ),
+        "sample just inside the window was used as the baseline"
+    );
 }
 
 /// #6794 — compress the drain timeline to at most ~24 evenly spaced points

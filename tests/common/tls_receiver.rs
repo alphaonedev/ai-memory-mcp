@@ -22,6 +22,7 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -87,7 +88,26 @@ impl Respond {
 pub struct TlsReceiver {
     port: u16,
     recorded: Arc<Mutex<Vec<Recorded>>>,
+    /// #6915 — most requests ever in flight at once (entry to response).
+    high_water: Arc<AtomicUsize>,
     handle: axum_server::Handle<std::net::SocketAddr>,
+}
+
+/// #6915 — counts one request as in flight until dropped.
+struct InFlightGuard(Arc<AtomicUsize>);
+
+impl InFlightGuard {
+    fn enter(in_flight: &Arc<AtomicUsize>, high_water: &AtomicUsize) -> Self {
+        let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        high_water.fetch_max(now, Ordering::SeqCst);
+        Self(Arc::clone(in_flight))
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// A responder computed from the request (the `wiremock::Respond` shape the
@@ -147,11 +167,18 @@ impl TlsReceiver {
     pub async fn start_with(tls: &TestTls, responder: Responder) -> Self {
         let recorded: Arc<Mutex<Vec<Recorded>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = recorded.clone();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let high_water = Arc::new(AtomicUsize::new(0));
+        let handler_in_flight = in_flight.clone();
+        let handler_high_water = high_water.clone();
         let app = axum::Router::new().fallback(
             move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| {
                 let sink = sink.clone();
                 let responder = responder.clone();
+                let in_flight = handler_in_flight.clone();
+                let high_water = handler_high_water.clone();
                 async move {
+                    let _in_flight = InFlightGuard::enter(&in_flight, &high_water);
                     // `uri` is the request-target (path + query); the suites
                     // read `req.url.path()` and `req.url`'s origin, so
                     // rebuild an absolute URL from the Host header.
@@ -184,6 +211,7 @@ impl TlsReceiver {
         Self {
             port,
             recorded,
+            high_water,
             handle,
         }
     }
@@ -204,6 +232,13 @@ impl TlsReceiver {
     /// did (`.await.unwrap_or_default()`); it is always `Some`.
     pub async fn received_requests(&self) -> Option<Vec<Recorded>> {
         Some(self.recorded.lock().await.clone())
+    }
+
+    /// #6915 — the most requests this receiver ever held in flight at the
+    /// same moment (incremented on entry, decremented on exit).
+    #[must_use]
+    pub fn high_water(&self) -> usize {
+        self.high_water.load(Ordering::SeqCst)
     }
 
     /// Number of requests received so far.
