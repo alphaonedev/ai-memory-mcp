@@ -95,7 +95,9 @@ def gate(args):
             scaled = raw * ESTIMATE_SCALE[shard]
             if not math.isfinite(raw) or raw < 0 or not math.isfinite(scaled):
                 raise ValueError('not finite and nonnegative after calibration')
-            estimates[shard] = (raw, int(round(scaled)))
+            # Budgets are integer seconds: ceil preserves every fractional overrun
+            # while exact equality still passes, without an epsilon tolerance.
+            estimates[shard] = (raw, math.ceil(scaled))
         except (KeyError, TypeError, ValueError, OverflowError):
             raise BudgetError('manifest %s %s must be numeric, finite and nonnegative '
                               'with finite calibration' % (args.manifest, key))
@@ -103,8 +105,8 @@ def gate(args):
     for shard in SHARDS:
         raw, calibrated = estimates[shard]
         budget = budgets[shard]
-        line = 'shard %s estimate %ds (raw %ds x %.2f) vs budget %ds' % (
-            shard, calibrated, round(raw), ESTIMATE_SCALE[shard], budget)
+        line = 'shard %s estimate %ds (raw %ss x %.2f; ceiling) vs budget %ds' % (
+            shard, calibrated, format(raw, '.17g'), ESTIMATE_SCALE[shard], budget)
         if calibrated > budget:
             failed = True
             print('::error::[#7343 fail-fast] %s: the estimate exceeds the budget; move binaries to a '

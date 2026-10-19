@@ -20,7 +20,7 @@ REPO = HERE.parents[2]
 SCRATCH = REPO / '.local-runs' / 'shard-budget-boundary-7807'
 RAW_EQUAL = 1000
 SHARD_BUDGETS = {'serial': 660, 'parallel_1': 1760, 'parallel_2': 2630}
-OVER_ESTIMATES = (1000.1, math.nextafter(RAW_EQUAL, math.inf))
+OVER_ESTIMATES = (1000.1, math.nextafter(math.nextafter(RAW_EQUAL, math.inf), math.inf))
 UNDER_ESTIMATES = (999.9, math.nextafter(math.nextafter(RAW_EQUAL, -math.inf), -math.inf))
 
 
