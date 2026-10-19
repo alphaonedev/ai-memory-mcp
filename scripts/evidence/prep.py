@@ -95,8 +95,14 @@ def numstat(repo, base, tip):
 def code_lines(repo, base, tip, path):
     out = git(repo, "--literal-pathspecs", "diff", "-U0", "--no-renames", f"{base}..{tip}", "--", path)
     n = 0
+    in_hunk = False
     for line in out.splitlines():
-        if line.startswith(("+++", "---")) or not line.startswith(("+", "-")):
+        if line.startswith("diff --git "):
+            in_hunk = False
+        elif line.startswith("@@ "):
+            in_hunk = True
+        # File headers precede hunks; +++/--- inside a hunk are content (#7733).
+        if not in_hunk or not line.startswith(("+", "-")):
             continue
         body = line[1:].strip()
         if not body or body.startswith("//"):
