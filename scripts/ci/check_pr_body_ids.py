@@ -12,6 +12,8 @@ error. Runs entirely locally. Not a blanket gate for every PR body.
 """
 
 import argparse
+import io
+import os
 from pathlib import Path
 import re
 import sys
@@ -76,10 +78,31 @@ def close_failed_stream(stream):
         pass
 
 
+def write_output(stream, payload):
+    """Complete one write or fail before claiming a content/help status."""
+    require_open_stream(stream)
+    try:
+        descriptor = stream.fileno()
+    except io.UnsupportedOperation:
+        # Only known memory buffers can prove completion without a descriptor.
+        raw = getattr(stream, "buffer", stream)
+        raw = getattr(raw, "raw", raw)
+        if not isinstance(raw, (io.BytesIO, io.StringIO)):
+            raise
+    else:
+        # TextIOWrapper can accept all characters after FileIO silently drops
+        # bytes. Refuse that descriptor state before either text or binary IO.
+        if not os.get_blocking(descriptor):
+            raise OSError("output descriptor must be blocking")
+    if stream.write(payload) != len(payload):
+        raise OSError("incomplete output write")
+    stream.flush()
+
+
 def report_error(message):
     """Attempt one diagnostic; a broken diagnostic destination is also closed."""
     try:
-        print(message, file=require_open_stream(sys.stderr), flush=True)
+        write_output(sys.stderr, message + "\n")
     except (OSError, UnicodeError):
         close_failed_stream(sys.stderr)
 
@@ -97,9 +120,7 @@ class OutputParser(argparse.ArgumentParser):
         if message:
             stream = file
             try:
-                require_open_stream(stream)
-                stream.write(message)
-                stream.flush()
+                write_output(stream, message)
             except (OSError, UnicodeError):
                 close_failed_stream(stream)
                 if stream is not sys.stderr:
@@ -127,8 +148,7 @@ def main(argv=None):
     report = offending + [f"suspected_ids={hit_count} offending_lines={len(offending)}"]
     try:
         output = require_open_stream(sys.stdout).buffer
-        output.write(("\n".join(report) + "\n").encode("utf-8"))
-        output.flush()
+        write_output(output, ("\n".join(report) + "\n").encode("utf-8"))
     except OSError:
         close_failed_stream(sys.stdout)
         report_error("check_pr_body_ids: output error")

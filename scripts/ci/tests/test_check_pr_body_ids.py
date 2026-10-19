@@ -681,6 +681,25 @@ class OutputCompletion7851Tests(unittest.TestCase):
                         expected += f"suspected_ids={status} offending_lines={status}\n".encode()
                         self.assertEqual(output, expected)
 
+    def test_7851_unused_nonblocking_streams_remain_caller_owned(self):
+        for stream, body, args, status in (("stderr", b"", (), 0),
+                                          ("stderr", b"12345678901", (), 1),
+                                          ("stderr", b"", ("--help",), 0),
+                                          ("stdout", b"\xff", (), 2),
+                                          ("stdout", b"", ("--unknown",), 2)):
+            with self.subTest(stream=stream, args=args, status=status):
+                code = ("import os,runpy,sys; h=runpy.run_path(sys.argv[1]); "
+                        f"os.set_blocking(sys.{stream}.fileno(),False); "
+                        "status=h['main'](sys.argv[2:]); "
+                        "assert not any(s.closed for s in (sys.stdin,sys.stdout,sys.stderr)); "
+                        "sys.exit(status)")
+                result = subprocess.run(
+                    [sys.executable, "-u", "-c", code, str(HELPER), *args], input=body,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=TIMEOUT_SECONDS,
+                )
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertNotIn(b"Traceback", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
