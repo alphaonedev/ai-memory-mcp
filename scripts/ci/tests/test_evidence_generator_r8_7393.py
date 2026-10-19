@@ -670,7 +670,7 @@ class CodeQlClasses7672(guard.GuardedCase):
         self.assertEqual(bad, [])
 
     def test_no_global_is_assigned_and_never_read_7672(self):
-        """py/unused-global-variable (alert 525): a module global that functions assign through `global` and nothing reads."""
+        """Retain the unread-global check and pin the runtime guard's no-global policy (#7737)."""
         bad = []
         for f in python_files():
             tree_ = ast.parse(f.read_text())
@@ -679,6 +679,12 @@ class CodeQlClasses7672(guard.GuardedCase):
             for name in sorted(declared - loads):
                 bad.append(f"{f.name}:{name}")
         self.assertEqual(bad, [])
+
+        # Alert 525 flagged _installed despite its read before assignment.
+        # Keep this guard free of global declarations rather than approximate CodeQL.
+        guard_tree = ast.parse((TESTS / "tmp_runtime_guard_7393.py").read_text())
+        self.assertEqual([n.lineno for n in ast.walk(guard_tree) if isinstance(n, ast.Global)], [],
+                         "runtime guard must not reintroduce function globals (#7737)")
 
 
 if __name__ == "__main__":
