@@ -93,7 +93,7 @@ def numstat(repo, base, tip):
 
 
 def code_lines(repo, base, tip, path):
-    out = git(repo, "diff", "-U0", "--no-renames", f"{base}..{tip}", "--", path)  # a binary file: one "Binary files" row
+    out = git(repo, "--literal-pathspecs", "diff", "-U0", "--no-renames", f"{base}..{tip}", "--", path)
     n = 0
     for line in out.splitlines():
         if line.startswith(("+++", "---")) or not line.startswith(("+", "-")):
@@ -150,7 +150,7 @@ def main():
                 print(f"WATCHED {p} +{add}/-{dele} code={c}")
     print(f"WATCHED_TOTAL files={len(watched)} lines={total_lines} code={total_code}")
     if watched:
-        log = git(a.repo, "log", "--no-merges", "--format=%h %s", f"{base}..{tip}", "--", *watched)
+        log = git(a.repo, "--literal-pathspecs", "log", "--no-merges", "--format=%h %s", f"{base}..{tip}", "--", *watched)
         for l in log.splitlines():
             print(f"COMMIT {l[:140]}")
     b_ids, t_ids = fed_ids(a.repo, base), fed_ids(a.repo, tip)
