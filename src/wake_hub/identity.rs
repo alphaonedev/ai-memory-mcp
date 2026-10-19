@@ -15,9 +15,10 @@
 //!    than a hint.
 //! 2. [`HelloVerifier`] — the cryptographic half. The live verifier wired by
 //!    the `ai-memory wake-hub` subcommand is
-//!    [`ScopedDelegationVerifier`](super::delegation_verifier::ScopedDelegationVerifier),
-//!    which checks the scoped `a2a-hub/join/v1` delegation (#3468) against a
-//!    reloading allowlist. [`DenyAllVerifier`] is the test fallback: it refuses
+//!    [`ScopedDelegationVerifier`](super::delegation_verifier::ScopedDelegationVerifier)
+//!    when an allowlist is configured; it checks the scoped `a2a-hub/join/v1`
+//!    delegation (#3468) against a reloading allowlist. [`DenyAllVerifier`] is
+//!    the fallback otherwise (posture `deny-all`) and in tests: it refuses
 //!    EVERY hello. That is deliberate. A hub that admitted unauthenticated
 //!    peers "until identity lands" would be exactly the fail-open default the
 //!    North Star forbids; refusing loudly costs a wake hint, and the `<=60 s`
@@ -92,7 +93,9 @@ pub enum DenyReason {
     },
     /// The platform did not supply a peer pid on an established connection.
     PeerPidUnavailable,
-    /// No identity verifier is wired: returned by the [`DenyAllVerifier`] test fallback and the default [`HelloVerifier::verify_membership`].
+    /// No identity verifier is wired: returned by the [`DenyAllVerifier`]
+    /// fallback (no allowlist configured, and tests) and the default
+    /// [`HelloVerifier::verify_membership`].
     IdentityNotConfigured,
     /// The agent id is not in the derived allowlist cache.
     UnknownAgent,
@@ -375,7 +378,8 @@ pub trait HelloVerifier: Send + Sync + 'static {
     }
 }
 
-/// The test fallback verifier; the live hub uses
+/// The fallback verifier: the hub runs it when no allowlist is configured
+/// (posture `deny-all`) and tests inject it; with an allowlist the hub uses
 /// [`ScopedDelegationVerifier`](super::delegation_verifier::ScopedDelegationVerifier).
 ///
 /// Refuses every hello. The hub still binds its socket, still asserts its
