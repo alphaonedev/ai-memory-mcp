@@ -25,7 +25,7 @@ OLD_PUSH_LINE = '    branches: [release/v0.6.3.1, main]'
 
 
 def read_triggers(text):
-    """Return {trigger: {'branches': [...], 'paths': [...]}} for push and pull_request."""
+    """Return {trigger: {'branches': [...], 'paths': [...], 'types': [...]}} for push and pull_request."""
     found = {}
     trigger = key = None
     for line in text.splitlines():
@@ -89,6 +89,11 @@ REFUSAL_NEEDLES = (
     'head.repo.full_name != github.repository',
     'self-hosted',
 )
+REFUSAL_IF = (
+    "if: github.event_name == 'pull_request' && "
+    'github.event.pull_request.head.repo.full_name != github.repository && '
+    "contains(matrix.runner, 'self-hosted')"
+)
 REFUSAL_RUN_NEEDLES = ('::error::', 'exit 1')
 
 
@@ -106,6 +111,8 @@ def refusal_problems(text):
     if not cond.startswith('if: '):
         problems.append('refusal step has no if')
     problems += ['if lacks ' + n for n in REFUSAL_NEEDLES if n not in cond]
+    if cond != REFUSAL_IF:
+        problems.append('refusal if is %r' % cond)
     end = named[0] + 1
     while end < len(lines) and not lines[end].startswith('      - '):
         end += 1
@@ -211,6 +218,14 @@ class SessionBootLifetimeTriggers7246(unittest.TestCase):
         exit_at = self.text.index('exit 1', refusal)
         mutant = self.text[:exit_at] + 'exit 0' + self.text[exit_at + len('exit 1'):]
         self.assertTrue(refusal_problems(mutant))
+        for old, new in (
+            ('contains(matrix.runner,', 'contains(matrix.os,'),
+            ('contains(matrix.runner,', '!contains(matrix.runner,'),
+            ('github.event.pull_request.head.repo.full_name', 'github.event.head.repo.full_name'),
+        ):
+            at = self.text.index(old, refusal)
+            swapped = self.text[:at] + new + self.text[at + len(old):]
+            self.assertTrue(refusal_problems(swapped))
 
 
 if __name__ == '__main__':
