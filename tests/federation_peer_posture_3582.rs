@@ -31,6 +31,9 @@ fn command(root: &Path, posture: &str) -> Command {
         .env("AI_MEMORY_DB", root.join("store.db"))
         .env("AI_MEMORY_NO_CONFIG", "1")
         .env("AI_MEMORY_SECURITY_PROFILE", posture);
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        cmd.env("LLVM_PROFILE_FILE", profile);
+    }
     cmd
 }
 
@@ -397,7 +400,13 @@ fn unreadable_shared_enrollment_warns_without_refusing_boot_3582_7821() {
         key_dir_sandbox::mkdir_0700(&nested);
         let invalid_key = nested.join("peer.pub");
         std::fs::write(&invalid_key, INVALID_PUBLIC_KEY).unwrap();
+        // Doctor ensures its local signing identity before observing enrollment.
+        // Use the reserved local label so that key is not a valid peer fixture.
         let out = command(root.path(), posture)
+            .env(
+                "AI_MEMORY_AGENT_ID",
+                ai_memory::identity::keypair::DAEMON_KEYPAIR_LABEL,
+            )
             .env("AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE", "1")
             .arg("serve")
             .output()
@@ -412,6 +421,10 @@ fn unreadable_shared_enrollment_warns_without_refusing_boot_3582_7821() {
         assert_eq!(std::fs::read(&invalid_key).unwrap(), INVALID_PUBLIC_KEY);
         assert!(!root.path().join("store.db").exists());
         let out = command(root.path(), posture)
+            .env(
+                "AI_MEMORY_AGENT_ID",
+                ai_memory::identity::keypair::DAEMON_KEYPAIR_LABEL,
+            )
             .args(["doctor", "--json"])
             .output()
             .unwrap();
