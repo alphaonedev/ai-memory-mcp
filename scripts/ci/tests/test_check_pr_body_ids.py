@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """CLI regression tests for the opt-in PR-body suspicion check (#7339)."""
 
+import contextlib
+import importlib.util
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -12,6 +15,13 @@ import unittest
 HELPER = Path(__file__).resolve().parents[1] / "check_pr_body_ids.py"
 SCRATCH = Path(__file__).resolve().parents[3] / ".local-runs"
 TIMEOUT_SECONDS = 10
+PARSER_TERMINALS = (("-h",), ("--help",), ("--unknown",), ("--file",))
+PARSER_BOOTSTRAP = (
+    "import runpy,sys; "
+    "sys.stdout.reconfigure(line_buffering=False,write_through=False); "
+    "sys.stderr.reconfigure(line_buffering=False,write_through=False); "
+    "sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')"
+)
 
 
 class BodyIds7339Tests(unittest.TestCase):
@@ -160,6 +170,74 @@ class OutputStatus7837Tests(unittest.TestCase):
                 self.assertEqual(result.returncode, status, result.stderr)
                 self.assertEqual(result.stdout, output)
                 self.assertEqual(result.stderr, error)
+
+
+class ParserOutput7840Tests(unittest.TestCase):
+    def invoke(self, args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+               immediate=False):
+        options = ["-u"] if immediate else []
+        return subprocess.run(
+            [sys.executable, *options, "-c", PARSER_BOOTSTRAP, str(HELPER), *args],
+            input=b"", stdout=stdout, stderr=stderr, timeout=TIMEOUT_SECONDS,
+        )
+
+    def check_failed_sink(self, sink):
+        for args in PARSER_TERMINALS:
+            for immediate in (False, True):
+                for both in (False, True):
+                    with self.subTest(args=args, immediate=immediate, both=both):
+                        help_output = args[0] in ("-h", "--help")
+                        result = self.invoke(
+                            args, stdout=sink if help_output or both else subprocess.PIPE,
+                            stderr=sink if not help_output or both else subprocess.PIPE,
+                            immediate=immediate,
+                        )
+                        self.assertEqual(result.returncode, 2, result.stderr)
+                        for captured in (result.stdout, result.stderr):
+                            if captured is not None:
+                                self.assertNotIn(b"Traceback", captured)
+                                self.assertNotIn(b"Exception ignored", captured)
+
+    @unittest.skipUnless(Path("/dev/full").exists(), "requires failing device")
+    def test_7840_all_parser_terminals_failing_device(self):
+        with open("/dev/full", "wb", buffering=0) as sink:
+            self.check_failed_sink(sink)
+
+    def test_7840_all_parser_terminals_closed_pipe(self):
+        reader, writer = os.pipe()
+        os.close(reader)
+        with os.fdopen(writer, "wb", buffering=0) as sink:
+            self.check_failed_sink(sink)
+
+    def test_7840_long_usage_write_failure(self):
+        reader, writer = os.pipe()
+        os.close(reader)
+        with os.fdopen(writer, "wb", buffering=0) as sink:
+            result = self.invoke(("--unknown-" + "x" * 20000,), stderr=sink)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+
+    def test_7840_normal_parser_controls(self):
+        for args in PARSER_TERMINALS:
+            with self.subTest(args=args):
+                result = self.invoke(args)
+                help_output = args[0] in ("-h", "--help")
+                self.assertEqual(result.returncode, 0 if help_output else 2)
+                self.assertIn(b"usage:", result.stdout if help_output else result.stderr)
+                self.assertEqual(result.stderr if help_output else result.stdout, b"")
+
+    def test_7840_reusable_main_preserves_healthy_streams(self):
+        spec = importlib.util.spec_from_file_location("body_ids_7840", HELPER)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            for args in PARSER_TERMINALS:
+                self.assertEqual(helper.main(list(args)), 0 if args[0] in ("-h", "--help") else 2)
+        self.assertFalse(stdout.closed)
+        self.assertFalse(stderr.closed)
+        self.assertIn("usage:", stdout.getvalue())
+        self.assertIn("error:", stderr.getvalue())
 
 
 if __name__ == "__main__":
