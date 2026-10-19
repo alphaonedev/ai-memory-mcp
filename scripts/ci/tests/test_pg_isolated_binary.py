@@ -326,9 +326,8 @@ def _import_problems(tree):
     problems = []
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            names = [alias.name for alias in node.names if alias.name == 're' and alias.asname is None
-                     and node in tree.body]
-            modules = [alias.name for alias in node.names if alias.name not in names]
+            modules = [alias.name for alias in node.names
+                       if not (alias.name == 're' and alias.asname is None and node in tree.body)]
         elif isinstance(node, ast.ImportFrom) and node.module:
             modules = [node.module]
         else:
