@@ -9,8 +9,9 @@ raised at the call site and also recorded, so a test that swallows the exception
 
 What it covers: the audit events named above, in this process, while a GuardedCase test is running, however the path
 string was built (bytes decoded at run time, %c joins, rot13, an environment copy, tempfile's default lookup).
-What it does not cover: what a child process does after it starts, an event with a descriptor instead of a path, and a
-path that is only read or computed (the AST guard in test_evidence_generator_r6_7393.py covers the static spellings).
+What it does not cover: what a child process does after it starts, an event with a descriptor instead of a path,
+os.mkfifo / os.mknod (they emit no audit event), and a path that is only read or computed (the AST guard in
+test_evidence_generator_r6_7393.py covers the static spellings).
 
 Every GuardedCase test also runs with the disk floors of run_cert.py set to 0 (#7661): the floors guard the cargo legs
 of a certification run on the certifying host, and a hosted CI runner has far less free disk than that host. The tests
@@ -27,6 +28,7 @@ import threading
 import unittest
 import unittest.mock as mock
 from pathlib import Path
+from urllib.parse import unquote_to_bytes
 
 EVIDENCE_DIR = Path(__file__).resolve().parents[2] / "evidence"
 FLOOR_CONSTANTS = ("FLOOR_BUILD_GIB", "FLOOR_ROOT_GIB")
@@ -73,6 +75,20 @@ def finding(event, args, roots):
         paths = [a for a in args[1:2] if isinstance(a, (str, bytes))]
     elif event == "subprocess.Popen":  # (executable, args, cwd, env)
         paths = [a for a in args[2:3] if isinstance(a, (str, bytes, os.PathLike))]
+    elif event == "sqlite3.connect":
+        paths = []
+        for database in args[:1]:
+            path = os.fsdecode(database)
+            if path.startswith("file:"):
+                # SQLite URI syntax: delimiters precede percent decoding; an encoded NUL ends the filename.
+                path = path[5:].split("?", 1)[0].split("#", 1)[0]
+                if path.startswith("//"):
+                    authority, separator, tail = path[2:].partition("/")
+                    if authority not in ("", "localhost"):
+                        continue  # SQLite refuses a non-local authority.
+                    path = separator + tail
+                path = os.fsdecode(unquote_to_bytes(path).split(b"\x00", 1)[0])
+            paths.append(path)
     elif event in CHECKED_EVENTS:
         paths = args[:2] if event in ("os.rename", "os.replace", "os.symlink", "os.link") else args[:1]
     elif event.startswith(CHECKED_PREFIXES):
