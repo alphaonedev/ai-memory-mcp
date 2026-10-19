@@ -21,6 +21,14 @@
 
 use chrono::Utc;
 
+/// #7776 (ERRORS-19): opportunistic GC on a CLI entry path; a sweep error is
+/// observed, never dropped.
+pub(crate) fn opportunistic_gc(conn: &rusqlite::Connection, archive_on_gc: bool) {
+    if let Err(e) = crate::storage::gc_if_needed(conn, archive_on_gc) {
+        tracing::warn!(target: "gc", "opportunistic gc skipped: {e}");
+    }
+}
+
 /// Truncate an ID to the first 8 bytes, snapping back to the nearest
 /// UTF-8 char boundary so multi-byte chars never split.
 ///
