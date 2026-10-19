@@ -309,10 +309,16 @@ def _connect_plan(env: Dict[str, str]) -> Tuple[int, int, int]:
     """``(connect_timeout_secs, addresses, passes)`` libpq may spend connecting: connect_timeout floored at 2 s,
     per resolved address, with a second pass when sslmode may retry without TLS (#7482). Raises on a value that
     is not a plain positive number."""
-    connect = env.get('PGCONNECT_TIMEOUT', '')
-    if _DIGITS_RE.fullmatch(connect) is None or int(connect) <= 0:
-        raise WrapperError('connect_timeout %r must be a positive whole number of seconds so the server-side '
-                           'statement cap can be sized under the psql limit' % connect)
+    connect = env.get('PGCONNECT_TIMEOUT', '').lstrip('0')
+    if _DIGITS_RE.fullmatch(connect) is None:
+        raise WrapperError('connect_timeout must be a positive whole number of seconds so the server-side '
+                           'statement cap can be sized under the psql limit')
+    # Anything above the whole psql budget is already unusable. Compare decimal text before int/float
+    # arithmetic, after removing padding, so neither Python's integer limit nor float overflow escapes (#7866).
+    limit = str(int(PSQL_TIMEOUT_SECS))
+    if len(connect) > len(limit) or (len(connect) == len(limit) and connect > limit):
+        raise WrapperError('connect_timeout exceeds the psql limit; lower connect_timeout so the server-side '
+                           'statement cap can be sized under the psql limit')
     each = max(int(connect), LIBPQ_MIN_CONNECT_SECS)
     host = env.get('PGHOST', '')
     if env.get('PGHOSTADDR') or not host or host.startswith('/'):
@@ -344,7 +350,7 @@ def server_caps_sql(env: Dict[str, str]) -> str:
     lock_cap_ms = cap_ms - gap_ms
     if lock_cap_ms <= 0:
         each, addresses, passes = _connect_plan(env)
-        asked = int(env.get('PGCONNECT_TIMEOUT', ''))
+        asked = int(env.get('PGCONNECT_TIMEOUT', '').lstrip('0'))
         # "floored" only when libpq really raised the value (asked < 2 s); at the floor lowering it changes nothing (#7580)
         used = '%d s, floored from %d s' % (each, asked) if asked < LIBPQ_MIN_CONNECT_SECS else '%d s' % each
         mode = env.get('PGSSLMODE', 'prefer')
