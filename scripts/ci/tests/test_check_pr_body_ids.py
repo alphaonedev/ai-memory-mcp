@@ -338,5 +338,101 @@ class UnavailableStreams7842Tests(unittest.TestCase):
             self.check_repeated_failure(sink)
 
 
+class Encoding7845Tests(unittest.TestCase):
+    def invoke(self, code, *args, body=b""):
+        return subprocess.run(
+            [sys.executable, "-c", "import runpy,sys; " + code, str(HELPER), *args],
+            input=body, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=TIMEOUT_SECONDS,
+        )
+
+    def assert_clean(self, result, status):
+        self.assertEqual(result.returncode, status, result.stderr)
+        for output in (result.stdout, result.stderr):
+            self.assertNotIn(b"Traceback", output)
+            self.assertNotIn(b"Exception ignored", output)
+
+    def test_7845_non_ascii_cli_help(self):
+        SCRATCH.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
+            alias = Path(directory) / "résumé.py"
+            alias.symlink_to(HELPER)
+            for option in ("-h", "--help"):
+                with self.subTest(option=option):
+                    result = subprocess.run(
+                        [sys.executable, str(alias), option], input=b"",
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        env=dict(os.environ, PYTHONIOENCODING="ascii:strict"),
+                        timeout=TIMEOUT_SECONDS,
+                    )
+                    self.assert_clean(result, 2)
+                    self.assertEqual(result.stdout, b"")
+                    self.assertEqual(result.stderr, b"check_pr_body_ids: output error\n")
+
+    def test_7845_usage_encoding_and_repeated_main(self):
+        for non_ascii_prog in (False, True):
+            with self.subTest(non_ascii_prog=non_ascii_prog):
+                result = self.invoke(
+                    "h=runpy.run_path(sys.argv[1]); "
+                    "sys.stderr.reconfigure(encoding='ascii',errors='strict'); "
+                    + ("sys.argv[0]='résumé'; " if non_ascii_prog else "")
+                    + "status=h['main'](['--résumé']); "
+                    "assert sys.stderr.closed and not sys.stdout.closed; "
+                    "assert h['main'](['--résumé']) == 2; sys.exit(status)"
+                )
+                self.assert_clean(result, 2)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(result.stderr.count(b"usage:"), 0 if non_ascii_prog else 1)
+                self.assertNotIn(b"output error", result.stderr)
+
+    def test_7845_help_failure_and_diagnostic_encoding(self):
+        # The stdlib undefined codec rejects even the ASCII fallback diagnostic.
+        for diagnostic_encoding in ("ascii", "undefined"):
+            with self.subTest(diagnostic_encoding=diagnostic_encoding):
+                result = self.invoke(
+                    "h=runpy.run_path(sys.argv[1]); sys.argv[0]='résumé'; "
+                    "sys.stdout.reconfigure(encoding='ascii',errors='strict'); "
+                    f"sys.stderr.reconfigure(encoding={diagnostic_encoding!r},errors='strict'); "
+                    "status=h['main'](['--help']); "
+                    "assert sys.stdout.closed; "
+                    f"assert sys.stderr.closed == {diagnostic_encoding == 'undefined'}; "
+                    "assert h['main'](['--help']) == 2; sys.exit(status)"
+                )
+                self.assert_clean(result, 2)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(result.stderr, b"check_pr_body_ids: output error\n" * 2
+                                 if diagnostic_encoding == "ascii" else b"")
+
+    def test_7845_input_diagnostic_encoding(self):
+        result = self.invoke(
+            "h=runpy.run_path(sys.argv[1]); "
+            "sys.stderr.reconfigure(encoding='undefined',errors='strict'); "
+            "status=h['main']([]); assert sys.stderr.closed; "
+            "assert not sys.stdin.closed and not sys.stdout.closed; sys.exit(status)",
+            body=b"\xff",
+        )
+        self.assert_clean(result, 2)
+        self.assertEqual((result.stdout, result.stderr), (b"", b""))
+
+    def test_7845_restrictive_encoding_healthy_controls(self):
+        for args, body, status in ((["--help"], b"", 0), (["--file"], b"", 2),
+                                   ([], b"", 0), ([], "résumé 12345678901".encode(), 1)):
+            with self.subTest(args=args, status=status):
+                result = self.invoke(
+                    "h=runpy.run_path(sys.argv[1]); "
+                    "sys.stdout.reconfigure(encoding='ascii',errors='strict'); "
+                    "sys.stderr.reconfigure(encoding='ascii',errors='strict'); "
+                    "status=h['main'](sys.argv[2:]); "
+                    "assert not any(s.closed for s in (sys.stdin,sys.stdout,sys.stderr)); "
+                    "sys.exit(status)", *args, body=body,
+                )
+                self.assert_clean(result, status)
+                if not args:
+                    self.assertEqual(result.stderr, b"")
+                    self.assertEqual(result.stdout, ("1: résumé 12345678901\n"
+                                     "suspected_ids=1 offending_lines=1\n").encode()
+                                     if status == 1 else b"suspected_ids=0 offending_lines=0\n")
+
+
 if __name__ == "__main__":
     unittest.main()
