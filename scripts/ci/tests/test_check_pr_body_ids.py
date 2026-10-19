@@ -3,14 +3,19 @@
 """CLI regression tests for the opt-in PR-body suspicion check (#7339)."""
 
 import contextlib
+import array
+import fcntl
 import importlib.util
 import io
 import os
 from pathlib import Path
 import select
+import signal
 import subprocess
 import sys
 import tempfile
+import termios
+import time
 import unittest
 
 HELPER = Path(__file__).resolve().parents[1] / "check_pr_body_ids.py"
@@ -699,6 +704,95 @@ class OutputCompletion7851Tests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, status, result.stderr)
                 self.assertNotIn(b"Traceback", result.stderr)
+
+
+class InterruptedOutput7855Tests(unittest.TestCase):
+    output_pipe = OutputCompletion7851Tests.output_pipe
+
+    def command(self, case, ready=None):
+        code = (
+            "import os,runpy,signal,sys; h=runpy.run_path(sys.argv[1]); "
+            "signal.signal(signal.SIGUSR1,lambda *_:None); "
+            "sys.argv[0]='résumé'+'x'*20000; "
+        )
+        if ready is not None:
+            code += f"os.write({ready},b'R'); os.close({ready}); "
+        if case == "diagnostic":
+            code += ("h['report_error']('diagnostic '+sys.argv[0]); "
+                     "assert not sys.stdout.closed; "
+                     + ("sys.exit(2 if sys.stderr.closed else 1)" if ready is not None else
+                        "sys.exit(2)"))
+        else:
+            args = {"help": ["--help"], "usage": ["--unknown"], "binary": []}[case]
+            code += f"status=h['main']({args!r}); assert not sys.stdin.closed; "
+            code += ("assert not sys.stdout.closed; " if case == "usage" else
+                     "assert not sys.stderr.closed; ")
+            code += "sys.exit(status)"
+        return [sys.executable, "-u", "-c", code, str(HELPER)]
+
+    def test_7855_interrupted_blocking_outputs(self):
+        body = b"12345678901 " + b"z" * LARGE_REPORT_BYTES
+        for case in ("help", "usage", "diagnostic", "binary"):
+            with self.subTest(case=case):
+                diagnostic = case in ("usage", "diagnostic")
+                normal = subprocess.run(self.command(case), input=body,
+                                        capture_output=True, timeout=TIMEOUT_SECONDS)
+                expected = normal.stderr if diagnostic else normal.stdout
+                self.assertEqual(normal.returncode, 0 if case == "help" else
+                                 1 if case == "binary" else 2, normal.stderr)
+                self.assertGreater(len(expected), select.PIPE_BUF)
+                with self.output_pipe(select.PIPE_BUF, True) as (reader, sink, capacity, filled):
+                    ready_reader, ready_writer = os.pipe()
+                    child = None
+                    try:
+                        child = subprocess.Popen(
+                            self.command(case, ready_writer), stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE if diagnostic else sink,
+                            stderr=sink if diagnostic else subprocess.PIPE,
+                            pass_fds=(ready_writer,),
+                        )
+                        os.close(ready_writer)
+                        ready_writer = None
+                        child.stdin.write(body if case == "binary" else b"")
+                        child.stdin.close()
+                        child.stdin = None
+                        self.assertTrue(select.select([ready_reader], [], [], TIMEOUT_SECONDS)[0])
+                        self.assertEqual(os.read(ready_reader, 1), b"R")
+                        deadline = time.monotonic() + TIMEOUT_SECONDS
+                        while True:
+                            available = array.array("i", [0])
+                            fcntl.ioctl(reader, termios.FIONREAD, available, True)
+                            if available[0] == capacity:
+                                break
+                            self.assertLess(time.monotonic(), deadline, "no measured progress")
+                            time.sleep(0.01)
+                        self.assertIsNone(child.poll())
+                        os.kill(child.pid, signal.SIGUSR1)
+                        try:
+                            stdout, stderr = child.communicate(timeout=TIMEOUT_SECONDS)
+                        except subprocess.TimeoutExpired:
+                            self.fail("interrupted output did not terminate within the bound")
+                        sink.close()  # No reader drained until the child exited.
+                        delivered = bytearray()
+                        while True:
+                            chunk = os.read(reader, capacity)
+                            if not chunk:
+                                break
+                            delivered.extend(chunk)
+                        self.assertEqual(delivered[:filled], b"!" * filled)
+                        self.assertEqual(bytes(delivered[filled:]), expected[:select.PIPE_BUF])
+                        self.assertLess(len(delivered) - filled, len(expected))
+                        self.assertEqual(child.returncode, 2, (stdout, stderr))
+                        self.assertEqual(stdout if diagnostic else stderr,
+                                         b"" if diagnostic else b"check_pr_body_ids: output error\n")
+                    finally:
+                        os.close(ready_reader)
+                        if ready_writer is not None:
+                            os.close(ready_writer)
+                        if child is not None:
+                            if child.poll() is None:
+                                child.kill()
+                            child.communicate()
 
 
 if __name__ == "__main__":
