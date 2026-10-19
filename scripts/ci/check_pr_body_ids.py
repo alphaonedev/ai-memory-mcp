@@ -39,8 +39,17 @@ def scan_body(body):
     return offending, hit_count
 
 
+def require_open_stream(stream):
+    """Treat absent or caller-closed wrappers as an I/O boundary failure."""
+    if stream is None or stream.closed:
+        raise OSError("unavailable standard stream")
+    return stream
+
+
 def close_failed_stream(stream):
     """Release a failed CLI stream so shutdown cannot retry pending bytes."""
+    if stream is None or stream.closed:
+        return
     try:
         # Buffered IO closes the underlying stream even when its flush fails.
         # Closing the wrapper also prevents its finalizer from retrying output.
@@ -52,7 +61,7 @@ def close_failed_stream(stream):
 def report_error(message):
     """Attempt one diagnostic; a broken diagnostic destination is also closed."""
     try:
-        print(message, file=sys.stderr, flush=True)
+        print(message, file=require_open_stream(sys.stderr), flush=True)
     except OSError:
         close_failed_stream(sys.stderr)
 
@@ -60,10 +69,17 @@ def report_error(message):
 class OutputParser(argparse.ArgumentParser):
     """Finish every parser write before argparse can terminate parsing."""
 
+    def error(self, message):
+        # argparse.print_usage(file=None) defaults to stdout. An absent stderr
+        # must instead fail at the intended diagnostic boundary.
+        self._print_message(self.format_usage(), sys.stderr)
+        self.exit(EXIT_ERROR, f"{self.prog}: error: {message}\n")
+
     def _print_message(self, message, file=None):
         if message:
-            stream = file if file is not None else sys.stderr
+            stream = file
             try:
+                require_open_stream(stream)
                 stream.write(message)
                 stream.flush()
             except OSError:
@@ -84,7 +100,8 @@ def main(argv=None):
         # by the caller. Failed wrappers have already been closed before this point.
         return exit_status.code
     try:
-        raw = args.file.read_bytes() if args.file is not None else sys.stdin.buffer.read()
+        raw = (args.file.read_bytes() if args.file is not None
+               else require_open_stream(sys.stdin).buffer.read())
         body = raw.decode("utf-8")
     except (OSError, UnicodeError):
         report_error("check_pr_body_ids: input error (expected readable UTF-8 body)")
@@ -92,8 +109,9 @@ def main(argv=None):
     offending, hit_count = scan_body(body)
     report = offending + [f"suspected_ids={hit_count} offending_lines={len(offending)}"]
     try:
-        sys.stdout.buffer.write(("\n".join(report) + "\n").encode("utf-8"))
-        sys.stdout.buffer.flush()
+        output = require_open_stream(sys.stdout).buffer
+        output.write(("\n".join(report) + "\n").encode("utf-8"))
+        output.flush()
     except OSError:
         close_failed_stream(sys.stdout)
         report_error("check_pr_body_ids: output error")
