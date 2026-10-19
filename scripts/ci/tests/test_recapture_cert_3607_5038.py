@@ -2707,7 +2707,7 @@ class BundleRoot7813(RecaptureBase):
             return ('directory', {path.name: path.read_bytes() for path in evidence.iterdir()})
         if evidence.exists():
             return ('file', evidence.read_bytes())
-        return ('absent',)
+        return ('absent', None)
 
     def test_7813_absent_committed_bundle_root_refuses(self):
         self.seed_committed_bundle()
