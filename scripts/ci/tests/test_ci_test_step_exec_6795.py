@@ -29,7 +29,7 @@ def step_script():
 
 
 class StepExec(unittest.TestCase):
-    def run_step(self, job_t0, impact='__ALL__', tier='sqlite'):
+    def run_step(self, job_t0, impact='__ALL__', tier='sqlite', budget_env=None):
         with tempfile.TemporaryDirectory(dir=str(REPO / '.local-runs') if (REPO / '.local-runs').is_dir() else None) as d:
             d = Path(d)
             calls = d / 'cargo.calls'
@@ -47,6 +47,7 @@ class StepExec(unittest.TestCase):
                 'RUNNER_TEMP': str(d), 'GITHUB_ENV': str(d / 'env'),
                 'TEST_RESULT_LOG': str(d / 'result.log'),
             })
+            env.update(budget_env or {})
             r = subprocess.run(['bash', str(script)], cwd=str(REPO), env=env,
                                capture_output=True, text=True, timeout=120)
             n = len(calls.read_text().splitlines()) if calls.exists() else 0
@@ -76,6 +77,32 @@ class StepExec(unittest.TestCase):
         r, n = self.run_step(str(int(time.time()) - 95 * 60 + 100))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn('60s per-invocation watchdog budget', r.stdout)
+
+    def test_7795_self_hosted_prebuild_cannot_start_underfunded_suite(self):
+        r, n = self.run_step(str(int(time.time()) - 95 * 60 + 400), budget_env={
+            'LOAD_GATE_SELF_HOSTED': 'true', 'LOAD_GATE_MIN_SUITE_SECS': '1500',
+        })
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertEqual(n, 1, 'only prebuild may run, never test execution')
+        self.assertIn('configured suite reserve 1500', r.stdout)
+
+    def test_7795_self_hosted_targeted_subset_keeps_zero_reserve(self):
+        r, n = self.run_step(str(int(time.time()) - 95 * 60 + 400),
+                             impact='some_test', budget_env={
+                                 'LOAD_GATE_SELF_HOSTED': 'true',
+                                 'LOAD_GATE_MIN_SUITE_SECS': '0',
+                             })
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertGreaterEqual(n, 2)
+
+    def test_7795_self_hosted_targeted_subset_refuses_expired_budget(self):
+        r, n = self.run_step(str(int(time.time()) - 95 * 60),
+                             impact='some_test', budget_env={
+                                 'LOAD_GATE_SELF_HOSTED': 'true',
+                                 'LOAD_GATE_MIN_SUITE_SECS': '0',
+                             })
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertEqual(n, 1)
 
 
 if __name__ == '__main__':

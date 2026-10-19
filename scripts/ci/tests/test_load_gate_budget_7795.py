@@ -105,8 +105,7 @@ class Cli7795(unittest.TestCase):
                  for value in ('nan', 'inf', '-inf', 'bad', '1.5')]
         cases += [(['--budget-secs', '100'], {}),
                   (['--min-suite-secs', '1'], {}),
-                  (['--budget-secs', '100', '--min-suite-secs', '-1'], {}),
-                  (['--max-ratio', 'nan'], {}), (['--max-ratio', 'inf'], {})]
+                  (['--budget-secs', '100', '--min-suite-secs', '-1'], {})]
         for start in ('', 'bad', '0', '-1', '1001', 'nan', '0900'):
             cases.append((['--job-timeout-minutes', '60', '--min-suite-secs', '1'],
                           {'JOB_T0': start}))

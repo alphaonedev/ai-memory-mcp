@@ -54,7 +54,13 @@ jobs:
     runs-on: [self-hosted, linux-fed]
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 60
+    env:
+      # #7795 measured passing runtime floor; see CARRIER-BRANCH-GATES.md.
+      LOAD_GATE_MIN_SUITE_SECS: "400"
     steps:
+      - name: Record job start (#7795)
+        run: echo "JOB_T0=$(date +%s)" >> "$GITHUB_ENV"
+
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
@@ -106,6 +112,9 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "::notice::[#3274] ignored pg tests pointed at ephemeral db $CI_FED_DB on $RUNNER_NAME"
 
+      - name: Load gate (#7795)
+        run: python3 -I scripts/ci/load_gate.py --label linux-fed/postgres-ignored --job-timeout-minutes 60 --min-suite-secs "$LOAD_GATE_MIN_SUITE_SECS"
+
       - name: cargo test --features sal-postgres -- --ignored
         run: |
           set -euo pipefail
@@ -117,6 +126,8 @@ jobs:
           TEST_OUT=".local-runs/postgres-ignored-run.txt"
           cargo test --features sal-postgres -- --ignored --list | tee "$LIST_OUT"
           LISTED="$(grep -c ': test$' "$LIST_OUT" || true)"
+          # Listing prebuilds all binaries; charge that time before execution.
+          python3 -I scripts/ci/load_gate.py --label linux-fed/postgres-ignored-pre-test --max-wait-secs 0 --job-timeout-minutes 60 --min-suite-secs "$LOAD_GATE_MIN_SUITE_SECS"
           set +e
           cargo test --features sal-postgres -- --ignored --test-threads=1 2>&1 | tee "$TEST_OUT"
           rc="${PIPESTATUS[0]}"

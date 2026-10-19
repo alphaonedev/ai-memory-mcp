@@ -4,7 +4,8 @@
 Waits (bounded) while the 1-minute load average exceeds ``ratio x cores``, then
 proceeds. It NEVER fails on load alone: after ``--max-wait-secs`` it prints a
 ``::warning::`` and exits 0, so a busy host delays a leg but never turns it red.
-Exit 2 is reserved for bad arguments.
+With a budget, exit 3 refuses admission below the configured suite reserve
+(including on an idle host). Exit 2 is reserved for bad arguments.
 
 Usage: python3 scripts/ci/load_gate.py --label "<os>/<tier>" [--max-ratio 1.5]
        [--max-wait-secs 1200] [--poll-secs 30]
@@ -17,6 +18,9 @@ import sys
 import time
 
 TAG = '[#6795 load gate]'
+SECONDS_PER_MINUTE = 60
+TEARDOWN_RESERVE_SECS = 300
+BUDGET_REFUSED = 3
 
 
 def should_wait(load, cores, ratio):
@@ -37,33 +41,46 @@ def _plain(label, load, cores, ratio, waited):
         TAG, label, load, cores, ratio, waited)
 
 
-def run(label, max_ratio, max_wait_secs, poll_secs, cores, load_fn, sleep_fn):
-    """Poll until the load is acceptable or the wait budget is spent. Always returns 0."""
-    waited = 0
-    try:
-        load = load_fn()
-    except (OSError, AttributeError) as exc:
-        print('::warning::%s %r: cannot read the load average (%s); proceeding without the gate'
-              % (TAG, label, exc), flush=True)
-        return 0
-    print(format_notice(label, load, cores, max_ratio, waited), flush=True)
-    while should_wait(load, cores, max_ratio):
-        if waited >= max_wait_secs:
-            print('::warning::%s %r: load=%.2f still above %s x %d cores after %ds; '
-                  'proceeding anyway (the gate never fails on load alone)'
-                  % (TAG, label, load, max_ratio, cores, waited), flush=True)
-            break
-        step = min(poll_secs, max_wait_secs - waited)
-        sleep_fn(step)
-        waited += step
+def run(label, max_ratio, max_wait_secs, poll_secs, cores, load_fn, sleep_fn,
+        budget_secs=None, min_suite_secs=None, clock_fn=time.monotonic):
+    """Bound waiting by real elapsed time; reserve test time before admission."""
+    started = clock_fn()
+    first = True
+    while True:
+        # Charge load sampling and scheduling delays as well as requested sleep.
+        load_error = None
         try:
             load = load_fn()
         except (OSError, AttributeError) as exc:
-            print('::warning::%s %r: load average became unreadable (%s); proceeding'
-                  % (TAG, label, exc), flush=True)
+            load_error = exc
+        waited = max(0, clock_fn() - started)
+        remaining = None if budget_secs is None else budget_secs - waited
+        if remaining is not None and remaining < min_suite_secs:
+            print('::error::%s %r: remaining budget %d s < configured suite '
+                  'reserve %d s; refusing admission (waited=%.0fs)'
+                  % (TAG, label, int(remaining // 1), min_suite_secs, waited), flush=True)
+            return BUDGET_REFUSED
+        if load_error is not None:
+            print('::warning::%s %r: cannot read the load average (%s); '
+                  'proceeding without the load gate'
+                  % (TAG, label, load_error), flush=True)
             return 0
-        if should_wait(load, cores, max_ratio):
+        if first:
+            print(format_notice(label, load, cores, max_ratio, waited), flush=True)
+            first = False
+        if not should_wait(load, cores, max_ratio):
+            break
+        wait_left = max_wait_secs - waited
+        if remaining is not None:
+            wait_left = min(wait_left, remaining - min_suite_secs)
+        if wait_left <= 0:
+            print('::warning::%s %r: load=%.2f still above %s x %d cores after %.0fs; '
+                  'proceeding anyway (the gate never fails on load alone)'
+                  % (TAG, label, load, max_ratio, cores, waited), flush=True)
+            break
+        if waited:
             print(_plain(label, load, cores, max_ratio, waited), flush=True)
+        sleep_fn(min(poll_secs, wait_left))
     print(format_notice(label, load, cores, max_ratio, waited), flush=True)
     return 0
 
@@ -95,9 +112,31 @@ def main(argv=None):
     p.add_argument('--max-wait-secs', type=_non_negative_int, default=1200)
     p.add_argument('--poll-secs', type=_positive_int, default=30)
     p.add_argument('--label', default='unlabelled')
+    budgets = p.add_mutually_exclusive_group()
+    budgets.add_argument('--budget-secs', type=int,
+                         help='remaining usable seconds at entry, after teardown reserve')
+    budgets.add_argument('--job-timeout-minutes', type=_positive_int,
+                         help='job cap; subtract elapsed JOB_T0 and 300s teardown once')
+    p.add_argument('--min-suite-secs', type=_non_negative_int,
+                   help='evidence-backed admission reserve; zero for targeted subsets')
     args = p.parse_args(argv)  # argparse exits 2 on bad arguments
+    has_budget = args.budget_secs is not None or args.job_timeout_minutes is not None
+    if has_budget != (args.min_suite_secs is not None):
+        p.error('a budget and --min-suite-secs must be supplied together')
+    budget = args.budget_secs
+    if args.job_timeout_minutes is not None:
+        job_start = os.environ.get('JOB_T0', '')
+        if (not job_start.isascii() or not job_start.isdecimal()
+                or job_start.startswith('0')):
+            p.error('JOB_T0 must be positive epoch seconds without a leading zero')
+        elapsed = time.time() - int(job_start)
+        if elapsed < 0:
+            p.error('JOB_T0 cannot be in the future')
+        budget = (args.job_timeout_minutes * SECONDS_PER_MINUTE
+                  - elapsed - TEARDOWN_RESERVE_SECS)
     return run(args.label, args.max_ratio, args.max_wait_secs, args.poll_secs,
-               os.cpu_count(), lambda: os.getloadavg()[0], time.sleep)
+               os.cpu_count(), lambda: os.getloadavg()[0], time.sleep,
+               budget_secs=budget, min_suite_secs=args.min_suite_secs)
 
 
 if __name__ == '__main__':
