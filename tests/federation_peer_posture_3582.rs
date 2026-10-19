@@ -21,7 +21,9 @@ const SCOPED: &str = r#"{"peer":{"allowed_namespaces":["team/**"]}}"#;
 
 fn command(root: &Path, posture: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
-    cmd.env_clear()
+    cmd.current_dir(root)
+        .env_clear()
+        .env("TMPDIR", root)
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", root.join("home"))
         .env("XDG_CONFIG_HOME", root.join("home/.config"))
@@ -382,12 +384,19 @@ fn empty_declaration_allows_boot_but_invalid_config_obeys_posture_3582() {
 }
 
 #[test]
-fn unreadable_shared_enrollment_warns_without_refusing_boot_3582() {
+fn unreadable_shared_enrollment_warns_without_refusing_boot_3582_7821() {
+    const INVALID_PUBLIC_KEY: &[u8] = b"invalid public key";
     for posture in ["standard", "asi-hard"] {
         let root = tempfile::tempdir().unwrap();
         let keys = root.path().join("keys");
         key_dir_sandbox::mkdir_0700(&keys);
-        std::fs::write(keys.join("peer.pub"), b"invalid public key").unwrap();
+        // #7821: scan queued subdirectories after every root-level key. This
+        // makes an unexpected boot-generated enrollment deterministic instead
+        // of depending on the filesystem's directory iteration order.
+        let nested = keys.join("region");
+        key_dir_sandbox::mkdir_0700(&nested);
+        let invalid_key = nested.join("peer.pub");
+        std::fs::write(&invalid_key, INVALID_PUBLIC_KEY).unwrap();
         let out = command(root.path(), posture)
             .env("AI_MEMORY_REQUIRE_ENTERPRISE_FEDERATION_POSTURE", "1")
             .arg("serve")
@@ -400,10 +409,13 @@ fn unreadable_shared_enrollment_warns_without_refusing_boot_3582() {
             "{}",
             stderr(&out)
         );
+        assert_eq!(std::fs::read(&invalid_key).unwrap(), INVALID_PUBLIC_KEY);
+        assert!(!root.path().join("store.db").exists());
         let out = command(root.path(), posture)
             .args(["doctor", "--json"])
             .output()
             .unwrap();
+        assert_eq!(std::fs::read(&invalid_key).unwrap(), INVALID_PUBLIC_KEY);
         let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         let section = report["sections"]
             .as_array()
@@ -415,7 +427,9 @@ fn unreadable_shared_enrollment_warns_without_refusing_boot_3582() {
         let facts = section["facts"].as_array().unwrap();
         assert!(
             facts.iter().any(|fact| fact[0] == "inbound_enrollment"
-                && fact[1] == "unobservable from this process")
+                && fact[1] == "unobservable from this process"),
+            "posture={posture}; facts={facts:?}; stderr={}",
+            stderr(&out)
         );
     }
 }
