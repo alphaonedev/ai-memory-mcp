@@ -3,6 +3,7 @@
 
 import copy
 import unittest
+from urllib.parse import parse_qs, urlsplit
 
 import test_check_codeql_alerts_7337 as original
 
@@ -23,7 +24,7 @@ class CodeQL7833Tests(unittest.TestCase):
     def historical_suite(self):
         """Two successful suites on one head, as observed live on PR 7761."""
         old_run = copy.deepcopy(self.data[RUN_KEY])
-        old_run.update(id=399, run_number=19, check_suite_id=499,
+        old_run.update(id=999, run_number=19, check_suite_id=499,
                        created_at="2026-10-18T12:00:00Z",
                        run_started_at="2026-10-18T12:00:00Z",
                        updated_at="2026-10-18T12:02:00Z")
@@ -76,6 +77,74 @@ class CodeQL7833Tests(unittest.TestCase):
         self.data[RUN_KEY + "/attempts/2"] = self.data[RUN_KEY]
         self.data[RUN_KEY + "/attempts/2/jobs"] = self.data[JOBS_KEY]
         self.refused("attempt")
+
+    def test_7833_complete_second_attempt_clears(self):
+        self.data[RUN_KEY]["run_attempt"] = 2
+        self.data[RUN_KEY + "/attempts/2"] = self.data[RUN_KEY]
+        for job in self.data[JOBS_KEY]["jobs"]:
+            job["run_attempt"] = 2
+        self.data[RUN_KEY + "/attempts/2/jobs"] = self.data[JOBS_KEY]
+        self.run_gate()
+
+    def test_7833_missing_current_attempt_language_cannot_use_green_check(self):
+        self.data[JOBS_KEY]["jobs"].pop()
+        self.data[JOBS_KEY]["total_count"] -= 1
+        self.refused("missing.*attempt job")
+
+    def test_7833_workflow_lookup_requires_configured_path(self):
+        self.data["actions/workflows/codeql-rust.yml"]["path"] = "other.yml"
+        self.refused("workflow")
+
+    def test_7833_missing_or_malformed_workflow_ownership(self):
+        for key, value in (("run_number", True), ("run_attempt", 0),
+                           ("check_suite_id", None), ("pull_requests", []),
+                           ("pull_requests", [{"number": original.PR,
+                                                "head": {"sha": original.OLD}}])):
+            with self.subTest(key=key, value=value):
+                self.data = original.fixture()
+                self.data[RUN_KEY][key] = value
+                with self.assertRaises(self.gate.GateError):
+                    self.run_gate()
+
+    def test_7833_other_pr_run_cannot_supply_current_jobs(self):
+        self.data[RUN_KEY]["pull_requests"][0]["number"] += 1
+        self.refused("missing current workflow")
+
+    def test_7833_run_detail_detects_attempt_queued_after_list_read(self):
+        self.data[RUN_KEY] = dict(self.data[RUN_KEY], run_attempt=2,
+                                  status="queued", conclusion=None)
+        self.refused("workflow.*success")
+
+    def test_7833_attempt_detail_requires_current_identity(self):
+        self.data[ATTEMPT_KEY] = dict(self.data[RUN_KEY], run_attempt=2)
+        self.refused("attempt mismatch")
+
+    def test_7833_job_time_must_belong_to_current_attempt(self):
+        self.data[JOBS_KEY]["jobs"][0]["started_at"] = "2026-10-18T12:00:00Z"
+        self.refused("job outside current workflow attempt")
+
+    def test_7833_job_check_id_must_match_owned_suite(self):
+        self.data[CHECKS_KEY]["check_runs"][1]["id"] += 1
+        self.refused("check ownership")
+
+    def test_7833_workflow_pagination_includes_newer_pending_run(self):
+        api = self.api
+        newer = dict(self.data[RUN_KEY], id=401, run_number=21,
+                     status="queued", conclusion=None)
+        def paginated(endpoint):
+            if "/workflows/300/runs?" in endpoint:
+                page = parse_qs(urlsplit(endpoint).query)["page"][0]
+                if page == "1":
+                    return {"total_count": 2, "workflow_runs": [self.data[RUN_KEY]]}
+                if page == "2":
+                    return {"total_count": 2, "workflow_runs": [newer]}
+                return {"total_count": 2, "workflow_runs": []}
+            # Only the workflow list is paginated in this focused unit probe.
+            return api(endpoint)
+        with original.patch.object(self.gate, "PAGE_SIZE", 1):
+            with self.assertRaisesRegex(self.gate.GateError, "workflow.*success"):
+                self.gate.current_workflow(paginated, "repos/" + original.REPO + "/",
+                                           original.HEAD, original.PR)
 
     def test_7833_wrong_workflow_identity(self):
         for key, value in (("workflow_id", 301), ("path", "other.yml"),

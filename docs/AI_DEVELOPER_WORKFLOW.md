@@ -330,7 +330,7 @@ python3 /absolute/worktree/scripts/ci/check_codeql_alerts.py CHECK_RUN_ID --repo
 
 Use the latest aggregate check named `CodeQL` from `github-advanced-security`,
 not a `CodeQL analysis (language)` Actions job. The helper needs Python 3.9+,
-authenticated `gh` with repository checks and code-scanning read access, and an
+authenticated `gh` with repository Actions, checks and code-scanning read access, and an
 explicit working directory when invoked by an orchestrator. Its `gh` subprocesses
 inherit that directory. Exit 0 means a complete clearance snapshot; exit 1 means
 refused (including API failure), and exit 2 means invalid CLI arguments.
@@ -347,16 +347,29 @@ alert instances do not prove that a fixed head was analyzed. Unexpected workflow
 or categories require reconciling the helper's configured coverage; they fail
 closed. Pagination uses explicit page requests, without `gh --slurp`.
 
-The helper rechecks the PR and jobs before returning. GitHub APIs are not an
+After a reopen, the commit may retain successful language checks from historical
+suites. The helper resolves the configured workflow's ID and selects its greatest
+`run_number` for the exact PR/head. It verifies that run's current `run_attempt`
+through the run and attempt endpoints, requires completion with success, and
+correlates each configured language's attempt job with its exact check ID and
+check-suite ID. Check IDs and timestamps do not select between workflow runs.
+A queued current attempt with no jobs, a failed attempt, missing attempt coverage,
+or ambiguous ownership refuses clearance; historical green jobs cannot substitute.
+The aggregate may be reused by GitHub, but must still be the sole latest aggregate
+and satisfy the title, annotations, app and head checks above.
+
+The helper rechecks the PR, workflow attempt and jobs before returning. GitHub APIs are not an
 atomic snapshot: rerun immediately before landing and after any head/base change
-or CodeQL rerun. This result does not replace independent review or the remaining
-CI gates. External lane-dispatch coder and reviewer templates must carry this
+or CodeQL rerun. This result does not replace independent review, the conductor's
+separate full workflow/attempt gate or the remaining CI gates. External
+lane-dispatch coder and reviewer templates must carry this
 same requirement; the product documentation does not modify installed templates.
 
 Offline regression command (synthetic API fixtures and a mock `gh` executable):
 
 ```text
 python3 /absolute/worktree/scripts/ci/tests/test_check_codeql_alerts_7337.py
+python3 /absolute/worktree/scripts/ci/tests/test_check_codeql_alerts_7833.py
 ```
 
 ---

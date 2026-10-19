@@ -22,6 +22,9 @@ MAX_RESPONSE_CHARS = 16 * 1024 * 1024
 MAX_ERROR_CHARS = 2000
 LANGUAGES = ("rust", "javascript-typescript", "python", "actions")
 ANALYSIS_KEY = ".github/workflows/codeql-rust.yml:analyze"
+WORKFLOW_PATH = ".github/workflows/codeql-rust.yml"
+WORKFLOW_FILE = "codeql-rust.yml"
+API_ROOT = "https://api.github.com/"
 AGGREGATE_NAME = "CodeQL"
 AGGREGATE_APP = "github-advanced-security"
 JOB_APP = "github-actions"
@@ -153,23 +156,106 @@ def aggregate(check, head, check_id):
             "aggregate annotations must be integer zero")
 
 
-def checks(api, prefix, head, check_id):
-    """Require latest aggregate and every configured language job to be green."""
+def positive(value, key):
+    """Require positive GitHub identifiers, ordinals and attempt numbers."""
+    result = field(value, key, int)
+    require(result > 0, "invalid " + key)
+    return result
+
+
+def workflow_identity(run, workflow_id, head):
+    """Check workflow ownership before using its monotonic run number."""
+    require(field(run, "workflow_id", int) == workflow_id
+            and field(run, "path", str) == WORKFLOW_PATH
+            and field(run, "event", str) == "pull_request"
+            and field(run, "head_sha", str) == head, "workflow identity mismatch")
+    for key in ("id", "run_number", "run_attempt", "check_suite_id"):
+        positive(run, key)
+    pulls = field(run, "pull_requests", list)
+    require(pulls, "missing workflow PR ownership")
+    numbers = []
+    for pull in pulls:
+        numbers.append(positive(pull, "number"))
+        require(field(field(pull, "head", dict), "sha", str) == head,
+                "workflow PR head mismatch")
+    require(len(set(numbers)) == len(numbers), "ambiguous workflow PR ownership")
+    return numbers
+
+
+def workflow_snapshot(run, workflow_id, head, pr):
+    """Snapshot current execution, including queued attempts with no jobs yet."""
+    require(pr in workflow_identity(run, workflow_id, head), "workflow PR mismatch")
+    require(field(run, "status", str) == "completed"
+            and field(run, "conclusion", str) == "success",
+            "current workflow attempt must be completed with success")
+    start, end = stamp(run, "run_started_at"), stamp(run, "updated_at")
+    require(stamp(run, "created_at") <= start <= end, "invalid workflow interval")
+    keys = ("id", "workflow_id", "path", "event", "head_sha", "run_number",
+            "run_attempt", "check_suite_id", "status", "conclusion",
+            "created_at", "run_started_at", "updated_at")
+    return {key: run[key] for key in keys}
+
+
+def current_workflow(api, prefix, head, pr):
+    """Resolve the latest PR run and its exact current attempt, never a green fallback."""
+    workflow = api(prefix + "actions/workflows/" + WORKFLOW_FILE)
+    require(field(workflow, "path", str) == WORKFLOW_PATH, "wrong workflow path")
+    workflow_id = positive(workflow, "id")
+    runs = pages(api, prefix + "actions/workflows/" + str(workflow_id) + "/runs",
+                 {"head_sha": head, "event": "pull_request"}, "workflow_runs")
+    applicable = [run for run in runs
+                  if pr in workflow_identity(run, workflow_id, head)]
+    require(applicable, "missing current workflow run")
+    require(len({run["run_number"] for run in applicable}) == len(applicable)
+            and len({run["id"] for run in applicable}) == len(applicable),
+            "ambiguous workflow runs")
+    # run_number increases for each new run of this authenticated workflow;
+    # run_attempt increases within a run. Check IDs and timestamps do not rank runs.
+    run = max(applicable, key=lambda item: item["run_number"])
+    snapshot = workflow_snapshot(run, workflow_id, head, pr)
+    endpoint = prefix + "actions/runs/" + str(run["id"])
+    require(workflow_snapshot(api(endpoint), workflow_id, head, pr) == snapshot,
+            "workflow changed during clearance read")
+    attempt_endpoint = endpoint + "/attempts/" + str(run["run_attempt"])
+    require(workflow_snapshot(api(attempt_endpoint), workflow_id, head, pr) == snapshot,
+            "workflow attempt mismatch")
+    jobs = pages(api, attempt_endpoint + "/jobs", key="jobs")
+    return snapshot, jobs
+
+
+def checks(api, prefix, head, check_id, pr):
+    """Require the aggregate and language checks owned by the current workflow attempt."""
     rows = pages(api, prefix + "commits/" + head + "/check-runs",
                  {"filter": "latest"}, "check_runs")
-    selected = {}
-    for name in (AGGREGATE_NAME,) + tuple("CodeQL analysis (" + lang + ")"
-                                         for lang in LANGUAGES):
-        matching = [row for row in rows if field(row, "name", str) == name]
-        require(len(matching) == 1, "missing or ambiguous check: " + name)
+    aggregates = [row for row in rows if field(row, "name", str) == AGGREGATE_NAME]
+    require(len(aggregates) == 1, "missing or ambiguous check: " + AGGREGATE_NAME)
+    aggregate(aggregates[0], head, check_id)
+    run, jobs = current_workflow(api, prefix, head, pr)
+    selected = {AGGREGATE_NAME: aggregates[0], "workflow_run": run}
+    for lang in LANGUAGES:
+        name = "CodeQL analysis (" + lang + ")"
+        matching = [job for job in jobs if field(job, "name", str) == name]
+        require(len(matching) == 1, "missing or ambiguous attempt job: " + name)
+        job = matching[0]
+        job_id = positive(job, "id")
+        require(field(job, "run_id", int) == run["id"]
+                and field(job, "run_attempt", int) == run["run_attempt"],
+                "job run/attempt ownership mismatch")
+        require(field(job, "check_run_url", str)
+                == API_ROOT + prefix + "check-runs/" + str(job_id),
+                "job check ownership mismatch")
+        start, end = completed(job, head)
+        require(stamp(run, "run_started_at") <= start <= end <= stamp(run, "updated_at"),
+                "job outside current workflow attempt interval")
+        matching = [row for row in rows if field(row, "name", str) == name
+                    and field(field(row, "check_suite", dict), "id", int)
+                    == run["check_suite_id"]]
+        require(len(matching) == 1, "missing or ambiguous check in current suite: " + name)
         check = matching[0]
-        if name == AGGREGATE_NAME:
-            aggregate(check, head, check_id)
-        else:
-            require(field(field(check, "app", dict), "slug", str) == JOB_APP,
-                    "wrong analysis job identity")
-            completed(check, head)
-            require(field(check, "id", int) > 0, "invalid job id")
+        require(field(check, "id", int) == job_id, "check ownership mismatch")
+        require(field(field(check, "app", dict), "slug", str) == JOB_APP,
+                "wrong analysis job identity")
+        require(completed(check, head) == (start, end), "job/check interval mismatch")
         selected[name] = check
     return selected
 
@@ -228,7 +314,7 @@ def check_clearance(api, repo, pr, head, check_id):
     state = pr_state(api(pull_endpoint), pr, head)
     _, base, merge = state
     aggregate(api(prefix + "check-runs/" + str(check_id)), head, check_id)
-    jobs = checks(api, prefix, head, check_id)
+    jobs = checks(api, prefix, head, check_id, pr)
     commit = api(prefix + "commits/" + merge)
     require(field(commit, "sha", str) == merge, "merge commit mismatch")
     parents = field(commit, "parents", list)
@@ -242,7 +328,7 @@ def check_clearance(api, repo, pr, head, check_id):
         analyses(api, prefix, ref, sha, jobs, required=suffix == "merge")
     require(pr_state(api(pull_endpoint), pr, head) == state,
             "PR base/merge changed during clearance read")
-    require(checks(api, prefix, head, check_id) == jobs,
+    require(checks(api, prefix, head, check_id, pr) == jobs,
             "CodeQL checks changed during clearance read")
 
 
