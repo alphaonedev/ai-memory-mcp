@@ -167,6 +167,9 @@ class Vendored5040(GuardedCase):
         scratch_root = "/" + "ai-" + "scratch"  # the exact attested scratch-root prefix (#7671)
         self.assertIn(scratch_root, prefixes, "the scratch root stays in the attested set")
         self.assertEqual(len(prefixes - added), 6, "the attested six stay and nothing else is added")
+        attested = {"/" + part for part in ("mnt/", "home/", "ai-" + "scratch",
+                                           "tmp/", "var/" + "tmp", "private/" + "tmp")}
+        self.assertEqual(prefixes - added, attested, "each attested prefix stays exact (#7736)")
         self.assertLessEqual(prefixes, set(bb.leak_patterns(Path("/wt-x"), Path("/out-x"))))
 
     def test_prep_runs_against_the_default_repo_5040(self):
