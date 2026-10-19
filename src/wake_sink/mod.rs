@@ -53,8 +53,9 @@
 //! A substrate wake is addressed DIRECTLY to the recipient agent id and never
 //! to a `#topic`. The hub's route table is keyed by the identity a hello
 //! authenticated, so a wake for `X` can only ever land on a session that
-//! authenticated AS `X` — the recipient's own inbox, which the delegation verifier
-//! (#3468) always grants; the namespace topics #3505 added are never used by the sink.
+//! authenticated AS `X` — the recipient's own inbox, which the delegation
+//! verifier (#3468) always grants; the namespace topics #3505 added are never
+//! used by the sink.
 //! A topic-shaped, reserved, empty or over-long recipient is REFUSED and
 //! counted, never coerced into something routable.
 //!

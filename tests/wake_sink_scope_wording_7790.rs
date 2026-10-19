@@ -23,7 +23,7 @@ fn read(rel: &str) -> String {
         .unwrap_or_else(|e| panic!("{} must exist ({}): {e}", rel, path.display()))
 }
 
-/// Strip comment prefixes, collapse whitespace and unwrap `[ #n]` link breaks.
+/// Strip comment prefixes, collapse whitespace and unwrap `[ #n` and `#n ]` link breaks.
 fn collapse(text: &str) -> String {
     let joined = text
         .lines()
@@ -37,7 +37,7 @@ fn collapse(text: &str) -> String {
         .flat_map(str::split_whitespace)
         .collect::<Vec<_>>()
         .join(" ");
-    joined.replace("[ ", "[")
+    joined.replace("[ ", "[").replace(" ]", "]")
 }
 
 #[test]
