@@ -434,5 +434,141 @@ class Encoding7845Tests(unittest.TestCase):
                                      if status == 1 else b"suspected_ids=0 offending_lines=0\n")
 
 
+class InputCompletion7848Tests(unittest.TestCase):
+    def test_7848_unbuffered_fileio_caller_control(self):
+        code = (
+            "import io,runpy,sys; h=runpy.run_path(sys.argv[1]); "
+            "original=sys.stdin; sys.stdin=io.TextIOWrapper(io.FileIO(0,closefd=False)); "
+            "assert h['main']([])==1; assert h['main']([])==0; "
+            "assert not any(s.closed for s in (sys.stdin,sys.stdout,sys.stderr))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code, str(HELPER)], input=b"12345678901\n",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=TIMEOUT_SECONDS,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(result.stdout, b"1: 12345678901\nsuspected_ids=1 offending_lines=1\n"
+                         b"suspected_ids=0 offending_lines=0\n")
+
+    def pipe_result(self, body, *, pending=False, blocking=False):
+        reader, writer = os.pipe()
+        try:
+            os.set_blocking(reader, blocking)
+            os.write(writer, body)
+            if not pending:
+                os.close(writer)
+                writer = None
+            return subprocess.run(
+                [sys.executable, str(HELPER)], stdin=reader,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=TIMEOUT_SECONDS,
+            )
+        finally:
+            os.close(reader)
+            if writer is not None:
+                os.close(writer)
+
+    def test_7848_pending_pipe_never_reports_content(self):
+        for body in (b"", b"clean prefix\n", b"12345", b"12345678901\n"):
+            with self.subTest(body=body):
+                result = self.pipe_result(body, pending=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, b"")
+                self.assertEqual(result.stderr,
+                                 b"check_pr_body_ids: input error (expected readable UTF-8 body)\n")
+
+    def test_7848_pipe_eof_controls(self):
+        for blocking in (False, True):
+            for body, status in ((b"", 0), (b"clean\n", 0), (b"12345678901\n", 1)):
+                with self.subTest(blocking=blocking, body=body):
+                    result = self.pipe_result(body, blocking=blocking)
+                    self.assertEqual(result.returncode, status, result.stderr)
+                    self.assertEqual(result.stderr, b"")
+                    self.assertIn(b"suspected_ids=" + str(status).encode(), result.stdout)
+
+    def test_7848_blocking_split_token_waits_for_eof(self):
+        reader, writer = os.pipe()
+        child = None
+        try:
+            os.write(writer, b"12345")
+            child = subprocess.Popen(
+                [sys.executable, str(HELPER)], stdin=reader,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            with self.assertRaises(subprocess.TimeoutExpired):
+                child.communicate(timeout=0.1)
+            os.write(writer, b"678901\n")
+            os.close(writer)
+            writer = None
+            stdout, stderr = child.communicate(timeout=TIMEOUT_SECONDS)
+            self.assertEqual(child.returncode, 1, stderr)
+            self.assertEqual(stdout, b"1: 12345678901\nsuspected_ids=1 offending_lines=1\n")
+            self.assertEqual(stderr, b"")
+        finally:
+            os.close(reader)
+            if writer is not None:
+                os.close(writer)
+            if child is not None:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate()
+
+    @unittest.skipUnless(hasattr(os, "openpty"), "requires a POSIX terminal")
+    def test_7848_terminal_single_eof_and_pending_controls(self):
+        for blocking in (True, False):
+            for body, status in ((b"", 0), (b"clean\n", 0), (b"12345678901\n", 1)):
+                with self.subTest(blocking=blocking, body=body):
+                    master, slave = os.openpty()
+                    try:
+                        os.set_blocking(slave, blocking)
+                        # One canonical EOF after the final newline must suffice.
+                        os.write(master, body + (b"\x04" if blocking else b""))
+                        result = subprocess.run(
+                            [sys.executable, str(HELPER)], stdin=slave,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            timeout=TIMEOUT_SECONDS,
+                        )
+                    finally:
+                        os.close(master)
+                        os.close(slave)
+                    self.assertEqual(result.returncode, status if blocking else 2,
+                                     result.stderr)
+                    if blocking:
+                        self.assertEqual(result.stderr, b"")
+                        self.assertIn(b"suspected_ids=", result.stdout)
+                    else:
+                        self.assertEqual(result.stdout, b"")
+                        self.assertIn(b"input error", result.stderr)
+
+    def test_7848_buffered_utf8_and_repeated_caller_ownership(self):
+        spec = importlib.util.spec_from_file_location("body_ids_7848", HELPER)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        body = (" " * 4095 + "é 12345678901\n").encode("utf-8")
+        stdin = io.TextIOWrapper(io.BufferedReader(io.BytesIO(b"!" + body)))
+        stdout, stderr = io.TextIOWrapper(io.BytesIO()), io.StringIO()
+        original_stdin = sys.stdin
+        try:
+            # Populate BufferedReader before main; remaining bytes belong to the body.
+            self.assertEqual(stdin.buffer.read(1), b"!")
+            sys.stdin = stdin
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                self.assertEqual(helper.main([]), 1)
+                self.assertEqual(helper.main([]), 0)
+            self.assertFalse(stdin.closed)
+            self.assertFalse(stdout.closed)
+            self.assertFalse(stderr.closed)
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(stdout.buffer.getvalue(), b"1: " + body
+                             + b"suspected_ids=1 offending_lines=1\n"
+                             + b"suspected_ids=0 offending_lines=0\n")
+        finally:
+            sys.stdin = original_stdin
+            stdin.close()
+            stdout.close()
+            stderr.close()
+
+
 if __name__ == "__main__":
     unittest.main()
