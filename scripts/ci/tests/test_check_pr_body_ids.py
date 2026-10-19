@@ -24,6 +24,7 @@ TIMEOUT_SECONDS = 10
 PENDING_CHECK_SECONDS = 0.1
 STDIN_BOUNDARY_BYTES = 4096
 LARGE_REPORT_BYTES = 16000
+ENCODING_CLEANUP_SECONDS = 2
 PARSER_TERMINALS = (("-h",), ("--help",), ("--unknown",), ("--file",))
 PARSER_BOOTSTRAP = (
     "import runpy,sys; "
@@ -828,6 +829,91 @@ class InterruptedOutput7855Tests(unittest.TestCase):
                             if child.poll() is None:
                                 child.kill()
                             child.communicate()
+
+
+class EncodingCleanup7859Tests(unittest.TestCase):
+    output_pipe = OutputCompletion7851Tests.output_pipe
+
+    def command(self, diagnostic, pending, ready=None, errors="strict"):
+        destination = "stderr" if diagnostic else "stdout"
+        code = ("import os,runpy,sys; h=runpy.run_path(sys.argv[1]); "
+                "sys.argv[0]='résumé'; "
+                f"stream=sys.{destination}; "
+                f"stream.reconfigure(encoding='ascii',errors={errors!r},"
+                "line_buffering=False,write_through=False); "
+                "raw=stream.buffer.raw; original=raw.write; raw.write=original; ")
+        if pending:
+            code += "stream.write('caller prefix\\n'); "
+        if ready is not None:
+            code += f"os.write({ready},b'R'); os.close({ready}); "
+        args = ["--unknown"] if diagnostic else ["--help"]
+        code += f"status=h['main']({args!r}); "
+        if errors == "strict":
+            code += "assert stream.closed; "
+        else:
+            code += ("assert not stream.closed; assert raw.write is original; "
+                     "stream.write('caller tail\\n'); stream.flush(); ")
+        code += ("assert not sys.stdout.closed; " if diagnostic else
+                 "assert not sys.stderr.closed; ")
+        code += "sys.exit(status)"
+        return [sys.executable, "-c", code, str(HELPER)]
+
+    def test_7859_encoding_failure_cleanup_with_pending_caller_output(self):
+        for diagnostic in (False, True):
+            for pending in (False, True):
+                with self.subTest(diagnostic=diagnostic, pending=pending):
+                    with self.output_pipe(blocking=True) as (reader, sink, capacity, filled):
+                        self.assertEqual(filled, capacity)
+                        ready_reader, ready_writer = os.pipe()
+                        child = None
+                        try:
+                            child = subprocess.Popen(
+                                self.command(diagnostic, pending, ready_writer),
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE if diagnostic else sink,
+                                stderr=sink if diagnostic else subprocess.PIPE,
+                                pass_fds=(ready_writer,),
+                            )
+                            os.close(ready_writer)
+                            ready_writer = None
+                            self.assertTrue(select.select([ready_reader], [], [], TIMEOUT_SECONDS)[0])
+                            self.assertEqual(os.read(ready_reader, 1), b"R")
+                            try:
+                                stdout, stderr = child.communicate(timeout=ENCODING_CLEANUP_SECONDS)
+                            except subprocess.TimeoutExpired:
+                                self.fail("encoding-error cleanup blocked with caller output pending")
+                            self.assertEqual(child.returncode, 2, (stdout, stderr))
+                            self.assertEqual(stdout if diagnostic else stderr,
+                                             b"" if diagnostic else
+                                             b"check_pr_body_ids: output error\n")
+                            available = array.array("i", [0])
+                            fcntl.ioctl(reader, termios.FIONREAD, available, True)
+                            self.assertEqual(available[0], capacity)
+                        finally:
+                            os.close(ready_reader)
+                            if ready_writer is not None:
+                                os.close(ready_writer)
+                            if child is not None:
+                                if child.poll() is None:
+                                    child.kill()
+                                child.communicate()
+
+    def test_7859_healthy_encoding_pending_prefix_tail_and_method_restoration(self):
+        for diagnostic in (False, True):
+            with self.subTest(diagnostic=diagnostic):
+                outputs = []
+                for pending in (False, True):
+                    result = subprocess.run(
+                        self.command(diagnostic, pending, errors="xmlcharrefreplace"),
+                        stdin=subprocess.DEVNULL, capture_output=True, timeout=TIMEOUT_SECONDS,
+                    )
+                    self.assertEqual(result.returncode, 2 if diagnostic else 0, result.stderr)
+                    output = result.stderr if diagnostic else result.stdout
+                    self.assertIn(b"r&#233;sum&#233;", output)
+                    self.assertTrue(output.endswith(b"caller tail\n"))
+                    self.assertEqual(result.stdout if diagnostic else result.stderr, b"")
+                    outputs.append(output)
+                self.assertEqual(outputs[1], b"caller prefix\n" + outputs[0])
 
 
 if __name__ == "__main__":
