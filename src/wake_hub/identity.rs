@@ -150,9 +150,9 @@ impl fmt::Display for DenyReason {
             }
             Self::PeerPidUnavailable => f.write_str("platform supplied no peer pid"),
             Self::IdentityNotConfigured => f.write_str(
-                "no wake-hub identity verifier is configured; every hello is refused \
-                 (the live hub wires the scoped a2a-hub/join/v1 delegation verifier, \
-                 #3468)",
+                "no wake-hub identity verifier is configured (no allowlist: posture deny-all); \
+                 every hello is refused until an allowlist arms the scoped \
+                 a2a-hub/join/v1 delegation verifier (#3468)",
             ),
             Self::UnknownAgent => f.write_str("agent id is not in the allowlist cache"),
             Self::BadSignature => f.write_str("hello transcript signature did not verify"),

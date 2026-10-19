@@ -76,3 +76,54 @@ fn identity_docs_name_the_no_allowlist_fallback_not_only_tests_7791() {
         "src/wake_hub/identity.rs must tie {FALLBACK_VERIFIER} to the `deny-all` posture"
     );
 }
+
+/// #7784 review r3 LOW-B: the `IdentityNotConfigured` refusal text is logged
+/// only when the scoped verifier is NOT wired (no allowlist, posture
+/// `deny-all`), so it must not claim that the live hub wires it.
+#[test]
+fn identity_not_configured_text_names_the_deny_all_posture_7791() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/wake_hub/identity.rs");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "src/wake_hub/identity.rs must exist ({}): {e}",
+            path.display()
+        )
+    });
+    // Join the string-literal `\` line continuations before collapsing.
+    let mut joined = String::new();
+    let mut skip_leading = false;
+    for line in text.lines() {
+        let piece = if skip_leading {
+            line.trim_start()
+        } else {
+            line
+        };
+        if let Some(head) = piece.strip_suffix('\\') {
+            joined.push_str(head);
+            skip_leading = true;
+        } else {
+            joined.push_str(piece);
+            joined.push('\n');
+            skip_leading = false;
+        }
+    }
+    let collapsed = joined
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace("[ ", "[")
+        .replace(" ]", "]");
+    assert!(
+        !collapsed.contains("live hub wires the scoped"),
+        "src/wake_hub/identity.rs IdentityNotConfigured text still claims the live hub wires the scoped verifier"
+    );
+    for needle in [
+        "posture deny-all",
+        "until an allowlist arms the scoped a2a-hub/join/v1 delegation verifier",
+    ] {
+        assert!(
+            collapsed.contains(needle),
+            "src/wake_hub/identity.rs IdentityNotConfigured text must contain {needle:?}"
+        );
+    }
+}
