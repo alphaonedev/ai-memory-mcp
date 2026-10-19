@@ -19,12 +19,14 @@ postgres-ignored, session-boot-lifetime ``lifetime-tests``):
 
 Run: python3 scripts/test/test_workflow_tmpdir_purge_7748.py
 """
+import os
 import re
 import unittest
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
-WORKFLOWS = REPO / ".github" / "workflows"
+# TMPDIR_PURGE_WORKFLOWS points the pins at another copy of the workflows (reviewer RED runs).
+WORKFLOWS = Path(os.environ.get("TMPDIR_PURGE_WORKFLOWS") or str(REPO / ".github" / "workflows"))
 PRE_NAME = "Purge runner TMPDIR leftovers (#7748)"
 POST_NAME = PRE_NAME + " (post-job)"
 RUN = "python3 scripts/ci/clean_job_tmpdir.py --apply"
@@ -33,7 +35,8 @@ GUARD = (
     "github.event.pull_request.head.repo.full_name == github.repository)"
 )
 DOCS_ONLY = "needs.classify.outputs.docs_only != 'true' && "
-# (workflow file, job id, post-step docs-only clause)
+# (workflow file, job id, docs-only clause on BOTH steps: ci.yml `check` needs classify and
+# required-contexts rule (b3) demands the guard on every non-checkout step)
 JOBS = (
     ("ci.yml", "check", DOCS_ONLY),
     ("cert-postgres-age.yml", "cert-postgres-age", ""),
@@ -101,12 +104,12 @@ class PurgeSteps(unittest.TestCase):
             self.assertEqual(len(named(all_steps, POST_NAME)), 1, "%s %s post" % (wf, job))
 
     def test_pre_step_is_first_after_checkout_with_exact_guard_7748(self):
-        for wf, job, _, all_steps in self.each_job():
+        for wf, job, docs, all_steps in self.each_job():
             checkout = [i for i, s in enumerate(all_steps) if "uses: actions/checkout@" in s[0]]
             self.assertEqual(len(checkout), 1, "%s %s checkout" % (wf, job))
             pre = named(all_steps, PRE_NAME)[0]
             self.assertIs(all_steps[checkout[0] + 1], pre, "%s %s pre not right after checkout" % (wf, job))
-            self.assertEqual(field(pre, "if"), GUARD, "%s %s" % (wf, job))
+            self.assertEqual(field(pre, "if"), docs + GUARD, "%s %s" % (wf, job))
 
     def test_post_step_is_last_with_always_guard_7748(self):
         for wf, job, docs, all_steps in self.each_job():

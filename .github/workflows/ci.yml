@@ -866,7 +866,7 @@ jobs:
       # Opt-in by the .ai-memory-ci-purgeable marker the node operator writes; an unmarked
       # or unset TMPDIR is a notice and exit 0. Same-repo only (fork code never runs here).
       - name: Purge runner TMPDIR leftovers (#7748)
-        if: runner.environment == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
         run: python3 scripts/ci/clean_job_tmpdir.py --apply
 
       - name: docs-only short-circuit
