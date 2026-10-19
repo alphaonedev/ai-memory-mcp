@@ -495,9 +495,20 @@ fn test_auto_export_does_not_block_reflect_response() {
         let outcome = db::reflect_with_hooks(&conn, &input, &hooks).expect("reflect");
         tx.send((outcome.id, started.elapsed())).ok();
     });
-    let (id, reflect_elapsed) = rx.recv_timeout(hang_budget).unwrap_or_else(|e| {
-        panic!("reflect_with_hooks blocked on auto-export for {hang_budget:?} ({e})")
-    });
+    let (id, reflect_elapsed) = match rx.recv_timeout(hang_budget) {
+        Ok(v) => v,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+            "reflect_with_hooks blocked on auto-export for {hang_budget:?} (timed out waiting on channel)"
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            // The reflector thread ended without sending: surface its real
+            // panic payload instead of a misleading channel message.
+            match reflector.join() {
+                Err(payload) => std::panic::resume_unwind(payload),
+                Ok(()) => panic!("reflector thread ended without reporting a result"),
+            }
+        }
+    };
     reflector.join().expect("reflector thread");
 
     let f = out_dir.join("nonblock-ns").join(format!("{id}.md"));
@@ -516,7 +527,23 @@ fn test_auto_export_does_not_block_reflect_response() {
         );
         // Release the worker and confirm the export really happens, so
         // the fast path was not fast because the hook was a no-op.
-        let body = std::fs::read_to_string(&f).expect("read export from fifo");
+        // The open blocks until the worker opens the write end, so drain on a
+        // helper thread and bound it: a worker that never writes (no-op or
+        // error path) must fail the test, not hang the suite.
+        let (btx, brx) = std::sync::mpsc::channel();
+        let drain_path = f.clone();
+        std::thread::spawn(move || {
+            btx.send(std::fs::read_to_string(&drain_path)).ok();
+        });
+        let body = brx
+            .recv_timeout(hang_budget)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "auto-export worker never wrote {} within {hang_budget:?} ({e})",
+                    f.display()
+                )
+            })
+            .expect("read export from fifo");
         assert!(body.contains(&format!("memory_id: {id}")), "export payload");
     }
     #[cfg(not(unix))]
@@ -536,7 +563,14 @@ fn test_auto_export_does_not_block_reflect_response() {
         );
     }
 
-    // Wall-clock bound kept only as a load-scaled budget.
+    // Unix: the structural FIFO assertions above are the hard failures; the
+    // wall clock is advisory only (no workflow sets the budget multiplier).
+    #[cfg(unix)]
+    eprintln!(
+        "::warning::reflect_with_hooks took {reflect_elapsed:?}, advisory bound {bound:?} (budget multiplier {mult}x)"
+    );
+    // Non-unix has no structural check, so the load-scaled bound stays hard.
+    #[cfg(not(unix))]
     assert!(
         reflect_elapsed < bound,
         "reflect_with_hooks must not block on auto-export (took {reflect_elapsed:?}, bound {bound:?}, budget multiplier {mult}x)"
@@ -545,9 +579,15 @@ fn test_auto_export_does_not_block_reflect_response() {
 
 #[cfg(unix)]
 fn mkfifo(path: &Path) {
-    let status = std::process::Command::new("mkfifo")
-        .arg(path)
-        .status()
-        .expect("run mkfifo");
-    assert!(status.success(), "mkfifo {}", path.display());
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("fifo path has no NUL");
+    // SAFETY: `c_path` is a valid NUL-terminated C string that outlives the
+    // call; `mkfifo` only reads it and has no other memory preconditions.
+    let rc = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert!(
+        rc == 0,
+        "mkfifo {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
 }
