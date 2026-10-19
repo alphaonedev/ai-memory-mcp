@@ -150,15 +150,19 @@ def main():
             watched.append(p)
             total_code += c
             if add is None:
-                print(f"WATCHED {p} binary code={c}")
+                print(f"WATCHED {repr(p)[1:-1]} binary code={c}")
             else:
                 total_lines += add + dele
-                print(f"WATCHED {p} +{add}/-{dele} code={c}")
+                print(f"WATCHED {repr(p)[1:-1]} +{add}/-{dele} code={c}")
     print(f"WATCHED_TOTAL files={len(watched)} lines={total_lines} code={total_code}")
     if watched:
-        log = git(a.repo, "--literal-pathspecs", "log", "--no-merges", "--format=%h %s", f"{base}..{tip}", "--", *watched)
-        for l in log.splitlines():
-            print(f"COMMIT {l[:140]}")
+        log = git(a.repo, "--literal-pathspecs", "log", "--no-merges", "-z", "--format=%h %s",
+                  f"{base}..{tip}", "--", *watched)
+        # Keep Git record boundaries; subject controls are payload, not separators.
+        # repr payloads escape backslashes too, distinguishing literal escape text.
+        for l in log.split("\0"):
+            if l:
+                print(f"COMMIT {repr(l[:140])[1:-1]}")
     b_ids, t_ids = fed_ids(a.repo, base), fed_ids(a.repo, tip)
     for end, rev, ids in (("base", base, b_ids), ("tip", tip, t_ids)):
         if not ids:  # the federation surface always carries identifiers: an empty set is a wrong repo, rev or path (#7443)
