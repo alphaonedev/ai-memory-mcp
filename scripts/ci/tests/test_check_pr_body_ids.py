@@ -7,6 +7,7 @@ import importlib.util
 import io
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ SCRATCH = Path(__file__).resolve().parents[3] / ".local-runs"
 TIMEOUT_SECONDS = 10
 PENDING_CHECK_SECONDS = 0.1
 STDIN_BOUNDARY_BYTES = 4096
+LARGE_REPORT_BYTES = 16000
 PARSER_TERMINALS = (("-h",), ("--help",), ("--unknown",), ("--file",))
 PARSER_BOOTSTRAP = (
     "import runpy,sys; "
@@ -570,6 +572,114 @@ class InputCompletion7848Tests(unittest.TestCase):
             stdin.close()
             stdout.close()
             stderr.close()
+
+
+class OutputCompletion7851Tests(unittest.TestCase):
+    @contextlib.contextmanager
+    def output_pipe(self, free_bytes=0, blocking=False):
+        reader, writer = os.pipe()
+        try:
+            os.set_blocking(writer, False)
+            capacity = 0
+            while True:
+                try:
+                    capacity += os.write(writer, b"!" * select.PIPE_BUF)
+                except BlockingIOError:
+                    break
+            filled = capacity - min(free_bytes, capacity)
+            if free_bytes:
+                self.assertEqual(len(os.read(reader, capacity - filled)), capacity - filled)
+            os.set_blocking(writer, blocking)
+            with os.fdopen(writer, "wb", buffering=0) as sink:
+                yield reader, sink, capacity, filled
+        finally:
+            os.close(reader)
+
+    def pipe_result(self, body=b"", args=(), *, immediate=True, free_bytes=0,
+                    blocking=False, diagnostic=False, ownership=False):
+        with self.output_pipe(free_bytes, blocking) as (reader, writer, capacity, filled):
+            options = ["-u"] if immediate else []
+            code = "import runpy,sys; h=runpy.run_path(sys.argv[1]); "
+            code += "status=h['main'](sys.argv[2:]); "
+            if ownership:
+                code += ("assert not sys.stdin.closed; "
+                         + ("assert status != 2 or (not sys.stdout.closed and sys.stderr.closed); "
+                            if diagnostic else
+                            "assert status != 2 or (sys.stdout.closed and not sys.stderr.closed); "))
+            code += "sys.exit(status)"
+            result = subprocess.run(
+                [sys.executable, *options, "-c", code, str(HELPER), *args], input=body,
+                stdout=subprocess.PIPE if diagnostic else writer,
+                stderr=writer if diagnostic else subprocess.PIPE, timeout=TIMEOUT_SECONDS,
+            )
+            # The live reader stays idle until the child has exited. Measure only
+            # bytes already delivered, without a consumer draining during writes.
+            writer.close()
+            delivered = bytearray()
+            while True:
+                chunk = os.read(reader, capacity)
+                if not chunk:
+                    break
+                delivered.extend(chunk)
+            self.assertEqual(delivered[:filled], b"!" * filled)
+            return result, bytes(delivered[filled:])
+
+    def test_7851_full_output_pipe_requires_operational_status(self):
+        for immediate in (False, True):
+            for body, args in ((b"", ()), (b"12345678901", ()), (b"", ("--help",))):
+                with self.subTest(immediate=immediate, body=body, args=args):
+                    result, output = self.pipe_result(body, args, immediate=immediate,
+                                                      ownership=True)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(output, b"")
+                    self.assertEqual(result.stderr, b"check_pr_body_ids: output error\n")
+
+    def test_7851_partial_capacity_large_report_requires_operational_status(self):
+        for immediate in (False, True):
+            with self.subTest(immediate=immediate):
+                result, output = self.pipe_result(
+                    b"12345678901 " + b"x" * LARGE_REPORT_BYTES,
+                    immediate=immediate, free_bytes=select.PIPE_BUF,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertNotIn(b"suspected_ids=", output)
+                self.assertEqual(result.stderr, b"check_pr_body_ids: output error\n")
+
+    def test_7851_actual_raw_write_outcomes(self):
+        with self.output_pipe() as (reader, writer, capacity, filled):
+            self.assertEqual(filled, capacity)
+            self.assertIsNone(writer.write(b"positive payload"))
+            self.assertEqual(writer.write(b""), 0)
+            self.assertEqual(len(os.read(reader, select.PIPE_BUF)), select.PIPE_BUF)
+            self.assertEqual(writer.write(b"x" * max(LARGE_REPORT_BYTES, capacity * 2)),
+                             select.PIPE_BUF)
+
+    def test_7851_failed_diagnostics_preserve_status_and_unused_stdout(self):
+        for immediate in (False, True):
+            for body, args in ((b"\xff", ()), (b"", ("--unknown",)), (b"", ("--file",))):
+                with self.subTest(immediate=immediate, body=body, args=args):
+                    result, output = self.pipe_result(body, args, immediate=immediate,
+                                                      diagnostic=True, ownership=True)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(result.stdout, b"")
+                    self.assertEqual(output, b"")
+
+    def test_7851_blocking_buffered_and_unbuffered_controls(self):
+        for immediate in (False, True):
+            for body, args, status in ((b"", (), 0), (b"12345678901", (), 1),
+                                       (b"", ("--help",), 0)):
+                with self.subTest(immediate=immediate, body=body, args=args):
+                    result, output = self.pipe_result(body, args, immediate=immediate,
+                                                      blocking=True, free_bytes=LARGE_REPORT_BYTES)
+                    self.assertEqual(result.returncode, status, result.stderr)
+                    self.assertEqual(result.stderr, b"")
+                    if args:
+                        self.assertIn(b"usage:", output)
+                        self.assertTrue(output.endswith(b"instead of stdin\n"))
+                    else:
+                        expected = (b"1: 12345678901\n" if status else b"")
+                        expected += f"suspected_ids={status} offending_lines={status}\n".encode()
+                        self.assertEqual(output, expected)
 
 
 if __name__ == "__main__":
