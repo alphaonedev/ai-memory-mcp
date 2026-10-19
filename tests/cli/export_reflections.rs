@@ -532,11 +532,21 @@ fn test_auto_export_does_not_block_reflect_response() {
         // error path) must fail the test, not hang the suite.
         let (btx, brx) = std::sync::mpsc::channel();
         let drain_path = f.clone();
-        std::thread::spawn(move || {
+        let drain = std::thread::spawn(move || {
             btx.send(std::fs::read_to_string(&drain_path)).ok();
         });
-        let body = brx
-            .recv_timeout(hang_budget)
+        let received = brx.recv_timeout(hang_budget);
+        if received.is_err() {
+            // Release a reader still blocked in open(2)/read(2) on the FIFO.
+            // A nonblocking write-open never blocks (ENXIO without a reader).
+            use std::os::unix::fs::OpenOptionsExt;
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&f);
+        }
+        let _ = drain.join();
+        let body = received
             .unwrap_or_else(|e| {
                 panic!(
                     "auto-export worker never wrote {} within {hang_budget:?} ({e})",
@@ -566,9 +576,14 @@ fn test_auto_export_does_not_block_reflect_response() {
     // Unix: the structural FIFO assertions above are the hard failures; the
     // wall clock is advisory only (no workflow sets the budget multiplier).
     #[cfg(unix)]
-    eprintln!(
-        "::warning::reflect_with_hooks took {reflect_elapsed:?}, advisory bound {bound:?} (budget multiplier {mult}x)"
-    );
+    if reflect_elapsed >= bound {
+        // Direct handle write: libtest captures print!/eprint!, not this.
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
+            "::warning::reflect_with_hooks took {reflect_elapsed:?}, advisory bound {bound:?} (budget multiplier {mult}x)"
+        );
+    }
     // Non-unix has no structural check, so the load-scaled bound stays hard.
     #[cfg(not(unix))]
     assert!(
