@@ -57,11 +57,32 @@ def report_error(message):
         close_failed_stream(sys.stderr)
 
 
-def main():
+class OutputParser(argparse.ArgumentParser):
+    """Finish every parser write before argparse can terminate parsing."""
+
+    def _print_message(self, message, file=None):
+        if message:
+            stream = file if file is not None else sys.stderr
+            try:
+                stream.write(message)
+                stream.flush()
+            except OSError:
+                close_failed_stream(stream)
+                if stream is not sys.stderr:
+                    report_error("check_pr_body_ids: output error")
+                raise SystemExit(EXIT_ERROR)
+
+
+def main(argv=None):
     """Read and report a body; failed standard output streams are closed."""
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = OutputParser(description=__doc__)
     parser.add_argument("--file", type=Path, help="read UTF-8 body from this file instead of stdin")
-    args = parser.parse_args()
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exit_status:
+        # Return parser terminal statuses to callers; successful streams remain owned
+        # by the caller. Failed wrappers have already been closed before this point.
+        return exit_status.code
     try:
         raw = args.file.read_bytes() if args.file is not None else sys.stdin.buffer.read()
         body = raw.decode("utf-8")

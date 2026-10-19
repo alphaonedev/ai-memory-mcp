@@ -239,6 +239,31 @@ class ParserOutput7840Tests(unittest.TestCase):
         self.assertIn("usage:", stdout.getvalue())
         self.assertIn("error:", stderr.getvalue())
 
+    def test_7840_reusable_main_closes_only_failed_streams(self):
+        spec = importlib.util.spec_from_file_location("body_ids_7840", HELPER)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+
+        class FailedStream(io.StringIO):
+            def write(self, message):
+                if stage == "write":
+                    raise OSError("unavailable output")
+                return super().write(message)
+
+            def flush(self):
+                raise OSError("unavailable output")
+
+        for stage in ("write", "flush"):
+            for args in PARSER_TERMINALS:
+                with self.subTest(stage=stage, args=args):
+                    failed, healthy = FailedStream(), io.StringIO()
+                    help_output = args[0] in ("-h", "--help")
+                    stdout, stderr = (failed, healthy) if help_output else (healthy, failed)
+                    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                        self.assertEqual(helper.main(list(args)), 2)
+                    self.assertTrue(failed.closed)
+                    self.assertFalse(healthy.closed)
+
 
 if __name__ == "__main__":
     unittest.main()
