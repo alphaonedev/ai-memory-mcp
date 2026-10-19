@@ -398,7 +398,6 @@ def hits(text, pats):
 
 PRIVATE_PREFIX = "bundle-private-"
 STAGE_NAME = "bundle"
-REJECTED_NAME = "rejected"
 MANIFEST_NAME = "MANIFEST.sha256"
 PRIVATE_MODE = 0o700
 DIRECTORY_MODE = 0o755
@@ -555,8 +554,9 @@ def publish_bundle(wt, dest, files, manifest):
     Native publication moves the verified stage with atomic no-replace rename. The
     portable path exclusively creates a new 0700 destination, populates it from builder
     memory, and verifies that separate claim before enabling normal reader access.
-    Replacement objects are never recursively removed. A rejected publication is moved
-    back into the private parent before cleaning only files created by this call.
+    Replacement objects are never recursively removed or renamed. Failed output is
+    cleaned through its held fd. Under a shared output parent an empty private claim
+    may remain: POSIX cannot conditionally remove a directory by its held identity.
     """
     files = dict(files)
     if (any(not name or name in (".", "..", MANIFEST_NAME) or Path(name).name != name for name in files)
@@ -655,21 +655,25 @@ def publish_bundle(wt, dest, files, manifest):
         raise Fatal(f"bundle publication failed: {error}") from error
     finally:
         try:
-            # A failed publication is quarantined through the pinned destination parent.
-            # Keep foreign destinations and unknown entries intact, even on failure.
-            if not completed and published and entry_matches(dest_fd, dest.name, output_id):
-                os.rename(dest.name, REJECTED_NAME, src_dir_fd=dest_fd, dst_dir_fd=private_fd)
+            # Clean held objects first. Never move a possibly replaced pathname.
             if not completed and published:
                 discard_stage(output_fd, output_written)
+                if entry_matches(dest_fd, dest.name, output_id):
+                    if os.fstat(dest_fd).st_mode & UNTRUSTED_WRITE:
+                        print("retained private publication claim under shared parent", file=sys.stderr)
+                    else:
+                        try:
+                            os.rmdir(dest.name, dir_fd=dest_fd)
+                        except OSError as error:
+                            print(f"retained private publication data: {error.strerror}", file=sys.stderr)
             if stage_fd is not None and (not completed or output_fd != stage_fd):
                 discard_stage(stage_fd, written)
             if private_fd is not None:
-                for name, expected in ((STAGE_NAME, stage_id), (REJECTED_NAME, output_id)):
-                    if expected is not None and entry_matches(private_fd, name, expected):
-                        try:
-                            os.rmdir(name, dir_fd=private_fd)
-                        except OSError as error:
-                            print(f"retained private staging data ({name}): {error.strerror}", file=sys.stderr)
+                if stage_id is not None and entry_matches(private_fd, STAGE_NAME, stage_id):
+                    try:
+                        os.rmdir(STAGE_NAME, dir_fd=private_fd)
+                    except OSError as error:
+                        print(f"retained private staging data: {error.strerror}", file=sys.stderr)
             if private_id is not None and entry_matches(scratch_fd, private_name, private_id):
                 try:
                     os.rmdir(private_name, dir_fd=scratch_fd)

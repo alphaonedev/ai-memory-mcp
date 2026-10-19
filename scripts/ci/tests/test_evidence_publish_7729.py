@@ -149,7 +149,7 @@ class Publish7729(ScratchCase):
         self.attack(lambda stage: stage.chmod(0o775))
         self.assertFalse(self.dest.exists())
 
-    def test_postpublication_mutation_is_quarantined_both_paths_7729(self):
+    def test_postpublication_mutation_is_removed_both_paths_7729(self):
         real = self.bb.rename_noreplace
         for native in (self.bb.rename_noreplace_native, None):
             with self.subTest(native=native is not None), mock.patch.object(self.bb, "rename_noreplace_native", native):
@@ -343,3 +343,54 @@ class Publish7729(ScratchCase):
                 self.assertEqual((self.dest / "recapture.py").read_bytes(), files["recapture.py"])
                 self.assertEqual(stat.S_IMODE((self.dest / "recapture.py").stat().st_mode), 0o755)
                 self.assertEqual(stat.S_IMODE((self.dest / "a.txt").stat().st_mode), 0o644)
+
+    def test_shared_parent_failed_claim_keeps_only_empty_private_directory_7729(self):
+        self.dest.parent.mkdir()
+        self.dest.parent.chmod(0o775)
+        real = self.bb.rename_noreplace
+        for native in (self.bb.rename_noreplace_native, None):
+            with self.subTest(native=native is not None), mock.patch.object(self.bb, "rename_noreplace_native", native):
+                self.dest = self.dest.with_name("rejected-" + str(native is None))
+
+                def tamper(*args, **kwargs):
+                    real(*args, **kwargs)
+                    self.forge(self.dest)
+                with mock.patch.object(self.bb, "rename_noreplace", side_effect=tamper):
+                    with self.assertRaises(self.bb.Fatal):
+                        self.publish()
+                self.assertEqual(list(self.dest.iterdir()), [])
+                self.assertEqual(stat.S_IMODE(self.dest.stat().st_mode), 0o700)
+                self.assertEqual(stat.S_IMODE(self.dest.parent.stat().st_mode), 0o775)
+
+    def test_cleanup_boundary_replacement_is_never_renamed_or_deleted_7729(self):
+        self.dest.parent.mkdir()
+        self.dest.parent.chmod(0o775)
+        real_publish, real_unlink = self.bb.rename_noreplace, os.unlink
+        output_identity = []
+        swapped = []
+
+        def tamper(*args, **kwargs):
+            real_publish(*args, **kwargs)
+            info = self.dest.stat()
+            output_identity.append((info.st_dev, info.st_ino))
+            self.forge(self.dest)
+
+        def replace(name, *args, **kwargs):
+            result = real_unlink(name, *args, **kwargs)
+            fd = kwargs.get("dir_fd")
+            if fd is not None and name == MANIFEST and output_identity and not swapped:
+                info = os.fstat(fd)
+                if (info.st_dev, info.st_ino) == output_identity[0]:
+                    os.rename(self.dest, self.dest.with_name("cleaned-owned"))
+                    self.dest.mkdir()
+                    self.forge(self.dest)
+                    swapped.append(True)
+            return result
+        with mock.patch.object(self.bb, "rename_noreplace_native", None), \
+                mock.patch.object(self.bb, "rename_noreplace", side_effect=tamper), \
+                mock.patch.object(os, "unlink", side_effect=replace):
+            with self.assertRaises(self.bb.Fatal):
+                self.publish()
+        self.assertEqual(swapped, [True])
+        self.assertEqual((self.dest / "a.txt").read_bytes(), FORGED["a.txt"])
+        self.assertEqual(list(self.dest.with_name("cleaned-owned").iterdir()), [])
