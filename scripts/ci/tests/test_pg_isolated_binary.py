@@ -1637,6 +1637,31 @@ class TemplateOwnership(unittest.TestCase):
                 self.assertNotEqual(regex_audit_problems(source + '\n' + extra, sweep_patterns(vars(pib)), PINNED_REGEXES),
                                     [])
 
+    def test_plain_then_aliased_import_fails_the_full_audit_7805(self):
+        source = self._real_source() + (
+            "\nimport re, re as _alias\ndef _h(s):\n    return _alias.match(r'zz7805', s)\n")
+        self.assertTrue(any('import of re other than a plain top-level' in problem
+                            for problem in self._audit(source)))
+
+    def test_aliased_then_plain_import_fails_the_full_audit_7805(self):
+        source = self._real_source() + (
+            "\nimport re as _alias, re\ndef _h(s):\n    return _alias.match(r'zz7805', s)\n")
+        self.assertTrue(any('import of re other than a plain top-level' in problem
+                            for problem in self._audit(source)))
+
+    def test_plain_combined_imports_pass_the_full_audit_7805(self):
+        for extra in ('import re, os', 'import os, re', 'import re, re'):
+            with self.subTest(spelling=extra):
+                self.assertEqual(self._audit(self._real_source() + '\n' + extra + '\n'), [])
+
+    def test_separate_aliased_imports_fail_the_full_audit_7805(self):
+        for extra in ('import re\nimport re as _alias', 'import re as _alias\nimport re'):
+            with self.subTest(spelling=extra):
+                source = self._real_source() + '\n' + extra + (
+                    "\ndef _h(s):\n    return _alias.match(r'zz7805', s)\n")
+                self.assertTrue(any('import of re other than a plain top-level' in problem
+                                    for problem in self._audit(source)))
+
     # #7715: flags are read from the positional slot and the keyword of every re.<fn> signature; a non-constant flags
     # argument fails closed; a non-compile call is pinned as a (pattern, flags) pair.
     FLAGS_REFUSED_7715 = (
