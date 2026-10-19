@@ -1454,6 +1454,25 @@ class CompilerDepInfo7777R7(StubCargoCase):
         res = self.run_dep(self.lib_spec(['src/lib.rs', 'gen/data.json']))
         self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
+    def test_missing_non_rs_listed_file_is_a_tool_error(self):
+        """Review r8 F1: a listed non-.rs file that does not exist is rc 2, like a missing .rs file."""
+        res = self.run_dep(self.lib_spec(['src/lib.rs', 'gen/x.inc']))
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn('gen/x.inc', res.stdout + res.stderr)
+        self.assertNotIn('Traceback', res.stderr)
+
+    def test_unreadable_non_rs_listed_file_is_a_tool_error(self):
+        """Review r8 F1: a listed non-.rs file that cannot be read (chmod 000) is rc 2, never a skip."""
+        target = self.write('gen/u.inc', self.HIDDEN_LOADER)
+        target.chmod(0)
+        self.addCleanup(target.chmod, 0o644)
+        if os.access(str(target), os.R_OK):
+            self.skipTest('running as a user that ignores file modes')
+        res = self.run_dep(self.lib_spec(['src/lib.rs', 'gen/u.inc']))
+        self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+        self.assertIn('gen/u.inc', res.stdout + res.stderr)
+        self.assertNotIn('Traceback', res.stderr)
+
     def test_generated_out_dir_file_is_scanned_as_rust(self):
         out_dir = self.root / '.stub-target' / 'debug' / 'build' / 'fixture-h' / 'out'
         out_dir.mkdir(parents=True)

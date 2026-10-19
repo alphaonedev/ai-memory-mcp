@@ -48,7 +48,8 @@ This guard fails (exit 1) when any of these holds:
            readable text (UTF-8) file in it, whatever its name or location
            (a `.rs` file, a `#[path]` module or `include!` body with another
            extension, OUT_DIR output), is added to the scan and goes through
-           the same content rules; a listed binary file is skipped. Makefile escaping is read (`\ ` space,
+           the same content rules; a listed binary file is skipped, but a
+           listed file that is missing or unreadable is a tool error. Makefile escaping is read (`\ ` space,
            `\:` colon, `\\` backslash, `\#` hash, `$$` dollar); relative
            paths resolve against the repository root (cargo's cwd). A file of
            a local target that sits in a cargo registry or git checkout is a
@@ -1072,18 +1073,26 @@ def check_compiler_files(scan, metadata_text, root, check_stdout):
                 if not real.is_file():
                     raise ToolError('dep-info lists %s, which does not exist' % path)
                 to_scan.append(path)
-            elif real.is_file() and is_text_file(real):
-                to_scan.append(path)
+            else:
+                if not real.is_file():
+                    raise ToolError('dep-info lists %s, which does not exist' % path)
+                if is_text_file(real):
+                    to_scan.append(path)
         scan_files(scan, directory, label, to_scan, builds)
 
 
 def is_text_file(path):
-    """True when the file decodes as UTF-8; a generated binary is not Rust source."""
+    """True when the file decodes as UTF-8; a generated binary is not Rust source.
+
+    A file that cannot be read at all (OSError) is a tool error, never a skip.
+    """
     try:
         path.read_text(encoding='utf-8')
         return True
-    except (OSError, ValueError):
+    except ValueError:
         return False
+    except OSError as exc:
+        raise ToolError('cannot read %s: %s' % (path, exc))
 
 
 NO_MATCH = 'did not match any packages'
@@ -1103,11 +1112,11 @@ CARGO_TIMEOUT_SECS = 600
 # A cold `cargo check` of the whole workspace measured above 10 minutes on the review host
 # (the tree and metadata calls stay at 600 s), so the compiler step has its own limit.
 # Budget (review r8 M2): the once leg of ci.yml has `timeout: 110` = 6600 s. Its other steps' observed
-# maxima sum to 4135 s (free-disk 160 + tests 2708 + trim 2 + release smoke 1225 + setup/post 40), and
-# `cargo install cargo-audit` plus `cargo audit` took 438 s, so 6600 - 4135 - 438 = 2027 s remain for this
+# maxima sum to 4222 s (free-disk 199 + tests 2708 + trim 3 + release smoke 1272 + setup/post 40), and
+# `cargo install cargo-audit` plus `cargo audit` took 438 s, so 6600 - 4222 - 438 = 1940 s remain for this
 # guard. The measured Security audit step (CI run of head 0c4c884da) took 1142 s, so the guard took about
 # 704 s. 1500 s is 2.1x that and fires, with a named error, before the job timeout could; the tree and
-# metadata calls (seconds in practice) fit in the remaining 527 s.
+# metadata calls (seconds in practice) fit in the remaining 440 s.
 CHECK_TIMEOUT_SECS = 1500
 
 
