@@ -15,6 +15,8 @@ import unittest
 HELPER = Path(__file__).resolve().parents[1] / "check_pr_body_ids.py"
 SCRATCH = Path(__file__).resolve().parents[3] / ".local-runs"
 TIMEOUT_SECONDS = 10
+PENDING_CHECK_SECONDS = 0.1
+STDIN_BOUNDARY_BYTES = 4096
 PARSER_TERMINALS = (("-h",), ("--help",), ("--unknown",), ("--file",))
 PARSER_BOOTSTRAP = (
     "import runpy,sys; "
@@ -497,7 +499,7 @@ class InputCompletion7848Tests(unittest.TestCase):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             with self.assertRaises(subprocess.TimeoutExpired):
-                child.communicate(timeout=0.1)
+                child.communicate(timeout=PENDING_CHECK_SECONDS)
             os.write(writer, b"678901\n")
             os.close(writer)
             writer = None
@@ -545,7 +547,7 @@ class InputCompletion7848Tests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("body_ids_7848", HELPER)
         helper = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(helper)
-        body = (" " * 4095 + "é 12345678901\n").encode("utf-8")
+        body = (" " * (STDIN_BOUNDARY_BYTES - 1) + "é 12345678901\n").encode("utf-8")
         stdin = io.TextIOWrapper(io.BufferedReader(io.BytesIO(b"!" + body)))
         stdout, stderr = io.TextIOWrapper(io.BytesIO()), io.StringIO()
         original_stdin = sys.stdin

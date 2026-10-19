@@ -24,6 +24,7 @@ CAP_ASSIGNMENT_PATTERN = re.compile(
 EXIT_OK = 0
 EXIT_SUSPECTS = 1
 EXIT_ERROR = 2
+STDIN_CHUNK_BYTES = 4096
 
 
 def scan_body(body):
@@ -44,6 +45,23 @@ def require_open_stream(stream):
     if stream is None or stream.closed:
         raise OSError("unavailable standard stream")
     return stream
+
+
+def read_stdin():
+    """Read through EOF; temporary no-data is an operational input failure."""
+    stream = require_open_stream(sys.stdin).buffer
+    # A single raw read preserves terminal EOF and consumes buffered bytes first.
+    # Unbuffered FileIO supports readinto, which also makes only one raw read.
+    read_chunk = getattr(stream, "readinto1", stream.readinto)
+    chunk = bytearray(STDIN_CHUNK_BYTES)
+    body = bytearray()
+    while True:
+        count = read_chunk(chunk)
+        if count is None:
+            raise OSError("stdin has not reached EOF")
+        if count == 0:
+            return body
+        body.extend(chunk[:count])
 
 
 def close_failed_stream(stream):
@@ -100,8 +118,7 @@ def main(argv=None):
         # by the caller. Failed wrappers have already been closed before this point.
         return exit_status.code
     try:
-        raw = (args.file.read_bytes() if args.file is not None
-               else require_open_stream(sys.stdin).buffer.read())
+        raw = args.file.read_bytes() if args.file is not None else read_stdin()
         body = raw.decode("utf-8")
     except (OSError, UnicodeError):
         report_error("check_pr_body_ids: input error (expected readable UTF-8 body)")
