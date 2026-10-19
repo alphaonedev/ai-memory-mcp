@@ -182,7 +182,7 @@ pub(crate) fn handle_subscribe_as_created_by(
             event_types: event_types.as_deref(),
         },
     )
-    .map_err(|e| crate::mcp::error_text::log_foreign("as_deref", e))?;
+    .map_err(|e| crate::mcp::error_text::log_foreign("subscription_insert", e))?;
 
     let mut response = json!({
         "id": id,

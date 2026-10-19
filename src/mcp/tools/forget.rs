@@ -214,7 +214,12 @@ pub(super) fn handle_forget(
             if pattern.is_some() || tier.is_some() {
                 let namespaces =
                     db::forget_distinct_namespaces_for_caller(conn, pattern, tier.as_ref(), caller)
-                        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_ref", e))?;
+                        .map_err(|e| {
+                            crate::mcp::error_text::mcp_foreign_err(
+                                "forget_distinct_namespaces_for_caller",
+                                e,
+                            )
+                        })?;
                 for ns in &namespaces {
                     forget_governance_gate_one_ns(
                         conn,

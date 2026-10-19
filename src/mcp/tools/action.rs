@@ -195,7 +195,7 @@ pub fn handle_action_transition(
     crate::actions::authorize_claimed_by(claimed_by.as_deref(), lease.as_ref(), now, id)?;
 
     match crate::actions::transition(conn, id, to, claimed_by.as_deref(), now)
-        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_deref", e))?
+        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("transition", e))?
     {
         crate::actions::TransitionOutcome::NotFound => Err(format!("action not found: {id}")),
         crate::actions::TransitionOutcome::Illegal { from, to } => {

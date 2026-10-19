@@ -624,8 +624,12 @@ fn handle_store_inner(
             &mem_payload,
             capability.as_ref(),
         )
-        .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_ref", e))?
-        {
+        .map_err(|e| {
+            crate::mcp::error_text::mcp_foreign_err(
+                crate::mcp::error_text::site::ENFORCE_GOVERNANCE,
+                e,
+            )
+        })? {
             GovernanceDecision::Allow => {}
             GovernanceDecision::Deny(refusal) => {
                 return Err(crate::governance::deny_message(
