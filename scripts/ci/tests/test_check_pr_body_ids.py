@@ -112,5 +112,55 @@ class BodyIds7339Tests(unittest.TestCase):
         self.assertNotIn(b"Traceback", result.stderr)
 
 
+class OutputStatus7837Tests(unittest.TestCase):
+    def invoke(self, stdout, stderr=subprocess.PIPE, body=b""):
+        return subprocess.run(
+            [sys.executable, str(HELPER)], input=body,
+            stdout=stdout, stderr=stderr, timeout=TIMEOUT_SECONDS,
+        )
+
+    def assert_output_error(self, result):
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stderr, b"check_pr_body_ids: output error\n")
+
+    @unittest.skipUnless(Path("/dev/full").exists(), "requires failing device")
+    def test_7837_failing_sink_final_status(self):
+        with open("/dev/full", "wb", buffering=0) as sink:
+            self.assert_output_error(self.invoke(sink))
+
+    def test_7837_closed_pipe_final_status(self):
+        reader, writer = os.pipe()
+        os.close(reader)  # No consumer exists before the child is started.
+        with os.fdopen(writer, "wb", buffering=0) as sink:
+            self.assert_output_error(self.invoke(sink))
+
+    @unittest.skipUnless(Path("/dev/full").exists(), "requires failing device")
+    def test_7837_output_and_diagnostic_sink_fail(self):
+        with open("/dev/full", "wb", buffering=0) as sink:
+            result = self.invoke(sink, stderr=sink)
+        self.assertEqual(result.returncode, 2)
+
+    @unittest.skipUnless(Path("/dev/full").exists(), "requires failing device")
+    def test_7837_input_diagnostic_sink_fails(self):
+        with open("/dev/full", "wb", buffering=0) as sink:
+            result = self.invoke(subprocess.PIPE, stderr=sink, body=b"\xff")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, b"")
+
+    def test_7837_normal_stream_controls(self):
+        for body, status, output, error in (
+            (b"", 0, b"suspected_ids=0 offending_lines=0\n", b""),
+            (b"12345678901", 1,
+             b"1: 12345678901\nsuspected_ids=1 offending_lines=1\n", b""),
+            (b"\xff", 2, b"",
+             b"check_pr_body_ids: input error (expected readable UTF-8 body)\n"),
+        ):
+            with self.subTest(status=status):
+                result = self.invoke(subprocess.PIPE, body=body)
+                self.assertEqual(result.returncode, status, result.stderr)
+                self.assertEqual(result.stdout, output)
+                self.assertEqual(result.stderr, error)
+
+
 if __name__ == "__main__":
     unittest.main()
