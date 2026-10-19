@@ -9,6 +9,7 @@ SQL order, child environments and exit codes. ``LiveEndToEnd`` additionally
 runs the real script against the Postgres named by
 ``AI_MEMORY_TEST_POSTGRES_URL`` and skips when that is unset.
 """
+import ast
 import importlib.util
 import os
 import re
@@ -650,6 +651,32 @@ class NoShell(unittest.TestCase):
         self.assertIsNone(re.search(r'shell\s*=\s*True', src))
         self.assertFalse('/tmp' in src, 'no /tmp paths')
         self.assertTrue(src.startswith('#!/usr/bin/env python3'))
+
+
+class PortableLiveCommand(unittest.TestCase):
+    def test_7806_live_silent_child_uses_current_python(self):
+        """The macOS live cell must not depend on a platform's true path."""
+        tree = ast.parse(Path(__file__).read_text())
+        live = next(node for node in tree.body
+                    if isinstance(node, ast.ClassDef) and node.name == 'LiveEndToEnd')
+        command = next(node.value.args[0] for node in ast.walk(live)
+                       if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == 'true_run'
+                               for target in node.targets))
+        separator = next(i for i, node in enumerate(command.elts)
+                         if isinstance(node, ast.Constant) and node.value == '--')
+        child = command.elts[separator + 1:]
+        self.assertIsInstance(child[0], ast.Attribute)
+        self.assertEqual(ast.dump(child[0]), ast.dump(ast.parse('sys.executable', mode='eval').body))
+        argv = [sys.executable] + [ast.literal_eval(node) for node in child[1:]]
+        self.assertEqual(argv, [sys.executable, '-c', 'pass'])
+        for target in ('e2e_probe', 'e2e_true'):
+            with self.subTest(target=target):
+                result = subprocess.run(argv + ['--test', target], capture_output=True,
+                                        text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(result.stderr, '')
 
 
 def _live_url():
