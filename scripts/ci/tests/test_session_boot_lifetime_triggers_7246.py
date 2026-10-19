@@ -16,6 +16,9 @@ WORKFLOW = ROOT / '.github' / 'workflows' / 'session-boot-lifetime.yml'
 SCRATCH = ROOT / '.local-runs' / 'session-boot-7246'
 PUSH_BRANCHES = ['main', 'release/**']
 PR_BRANCHES = ['release/**', 'rehearsal/**', 'chain/**']
+PR_TYPES = ['opened', 'synchronize', 'reopened']
+TYPES_LINE = '    types: [opened, synchronize, reopened]'
+CONCURRENCY_CANCEL = "cancel-in-progress: ${{ github.event_name == 'pull_request' }}"
 REQUIRED_PATHS = ('.github/workflows/session-boot-lifetime.yml', 'src/cli/boot.rs')
 VERSIONED_RELEASE = 'release/v'
 OLD_PUSH_LINE = '    branches: [release/v0.6.3.1, main]'
@@ -31,7 +34,7 @@ def read_triggers(text):
             continue
         if re.match(r'^  (push|pull_request):\s*$', line):
             trigger = line.strip()[:-1]
-            found[trigger] = {'branches': [], 'paths': []}
+            found[trigger] = {'branches': [], 'paths': [], 'types': []}
             key = None
         elif re.match(r'^  \S', line):
             trigger = key = None
@@ -41,6 +44,11 @@ def read_triggers(text):
             body = line.split(':', 1)[1].strip()
             if body.startswith('[') and body.endswith(']'):
                 found[trigger]['branches'] = [i.strip().strip('"\'') for i in body[1:-1].split(',')]
+            key = None
+        elif trigger and line.startswith('    types:'):
+            body = line.split(':', 1)[1].strip()
+            if body.startswith('[') and body.endswith(']'):
+                found[trigger]['types'] = [i.strip().strip('"\'') for i in body[1:-1].split(',')]
             key = None
         elif trigger and key == 'paths' and re.match(r'^      - ', line):
             found[trigger]['paths'].append(line.strip()[2:].strip().strip('"\''))
@@ -76,7 +84,12 @@ def check_triggers(text):
 
 
 REFUSAL_NAME = 'Fork-PR refusal (self-hosted legs never run fork code)'
-REFUSAL_NEEDLES = ('head.repo.full_name != github.repository', 'self-hosted')
+REFUSAL_NEEDLES = (
+    "github.event_name == 'pull_request'",
+    'head.repo.full_name != github.repository',
+    'self-hosted',
+)
+REFUSAL_RUN_NEEDLES = ('::error::', 'exit 1')
 
 
 def refusal_problems(text):
@@ -93,6 +106,34 @@ def refusal_problems(text):
     if not cond.startswith('if: '):
         problems.append('refusal step has no if')
     problems += ['if lacks ' + n for n in REFUSAL_NEEDLES if n not in cond]
+    end = named[0] + 1
+    while end < len(lines) and not lines[end].startswith('      - '):
+        end += 1
+    block = '\n'.join(lines[named[0]:end])
+    problems += ['run lacks ' + n for n in REFUSAL_RUN_NEEDLES if n not in block]
+    return problems
+
+
+def concurrency_problems(text):
+    """Return problems with the top-level concurrency block (fork-safe, event-distinct, PR-only cancel)."""
+    lines = text.splitlines()
+    starts = [i for i, l in enumerate(lines) if l == 'concurrency:']
+    if len(starts) != 1:
+        return ['want exactly one top-level concurrency block, found %d' % len(starts)]
+    body = []
+    for line in lines[starts[0] + 1:]:
+        if not line.startswith('  '):
+            break
+        body.append(line.strip())
+    group = [l for l in body if l.startswith('group:')]
+    cancel = [l for l in body if l.startswith('cancel-in-progress:')]
+    problems = []
+    if len(group) != 1 or 'github.event_name' not in group[0]:
+        problems.append('group lacks github.event_name')
+    if len(group) != 1 or 'github.event.pull_request.head.repo.full_name == github.repository' not in group[0]:
+        problems.append('group lacks the fork-safe key')
+    if cancel != [CONCURRENCY_CANCEL]:
+        problems.append('cancel-in-progress is %r, want %r' % (cancel, CONCURRENCY_CANCEL))
     return problems
 
 
@@ -144,6 +185,32 @@ class SessionBootLifetimeTriggers7246(unittest.TestCase):
         copy = SCRATCH / 'session-boot-lifetime.no-refusal.yml'
         copy.write_text(mutant, encoding='utf-8')
         self.assertTrue(refusal_problems(copy.read_text(encoding='utf-8')))
+
+    def test_g_pull_request_types_exclude_edited(self):
+        self.assertEqual(self.found['pull_request']['types'], PR_TYPES)
+        self.assertIn(TYPES_LINE, self.text)
+        mutant = self.text.replace(TYPES_LINE, TYPES_LINE[:-1] + ', edited]', 1)
+        self.assertNotEqual(mutant, self.text)
+        self.assertNotEqual(read_triggers(mutant)['pull_request']['types'], PR_TYPES)
+
+    def test_h_concurrency_block_is_fork_safe_and_cancels_only_prs(self):
+        self.assertEqual(concurrency_problems(self.text), [])
+        lines = self.text.splitlines()
+        start = lines.index('concurrency:')
+        mutant = '\n'.join(lines[:start] + lines[start + 3:])
+        self.assertTrue(concurrency_problems(mutant))
+        always = self.text.replace(CONCURRENCY_CANCEL, 'cancel-in-progress: true', 1)
+        self.assertNotEqual(always, self.text)
+        self.assertTrue(concurrency_problems(always))
+
+    def test_i_refusal_guard_mutations_are_rejected(self):
+        guard = "github.event_name == 'pull_request' && "
+        self.assertIn(guard, self.text)
+        self.assertTrue(refusal_problems(self.text.replace(guard, '', 1)))
+        refusal = self.text.index(REFUSAL_NAME)
+        exit_at = self.text.index('exit 1', refusal)
+        mutant = self.text[:exit_at] + 'exit 0' + self.text[exit_at + len('exit 1'):]
+        self.assertTrue(refusal_problems(mutant))
 
 
 if __name__ == '__main__':

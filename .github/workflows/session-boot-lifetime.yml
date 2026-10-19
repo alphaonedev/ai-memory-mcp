@@ -41,6 +41,15 @@ on:
 permissions:
   contents: read
 
+# #7246 review r1 F1: a superseded pull_request run must not keep the single
+# self-hosted macos-fed runner queued. Same shape as cert-postgres-age.yml and
+# postgres-ignored.yml: fork-safe key, event name in the group so push, pull_request
+# and schedule runs never share one, cancel only PR runs (#6340: push runs on
+# release/** are never cancelled in progress).
+concurrency:
+  group: session-boot-lifetime-${{ github.event_name }}-${{ github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.head.ref || github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   # #3128 — EXPLICIT, not inherited. `Swatinem/rust-cache` is what used to export
