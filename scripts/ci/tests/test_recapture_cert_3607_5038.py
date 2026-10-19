@@ -2178,6 +2178,43 @@ class ChildCwd7648(SymlinkBase):
                     self.assertIn('live pragma not observed', text)
                     self.assertIn(DOCTOR_STDERR_LINE, text)  # #7697: the stderr line too
 
+    def test_7814_doctor_diagnostic_matches_complete_rust_formatting(self):
+        """Source-derived contract only; this is not a real product capture.
+
+        Pin the argument relationships as well as the format strings, so a
+        changed Rust call fails instead of silently composing an obsolete line.
+        """
+        connection = (REPO / 'src/storage/connection.rs').read_text()
+        doctor = (REPO / 'src/cli/doctor.rs').read_text()
+        refusal = re.search(
+            r'pub const MISSING_DATABASE_REFUSAL: &str =\s*"([^"\n]+)";', connection)
+        missing = re.search(
+            r'pub fn open_existing_read_only\(path: &Path\) -> Result<Connection> \{\s*'
+            r'match path\.try_exists\(\) \{\s*'
+            r'Ok\(false\) => anyhow::bail!\("([^"\n]+)", '
+            r'MISSING_DATABASE_REFUSAL, path\.display\(\)\)', connection)
+        diagnostic = re.search(
+            r'Some\(path\) => match db::open_existing_read_only\(path\)\s*'
+            r'\.and_then\(\|conn\| crate::storage::live_synchronous\(&conn\)\)\s*\{\s*'
+            r'Ok\(level\) => Some\(level\),\s*Err\(e\) => \{\s*'
+            r'writeln!\(\s*out\.stderr,\s*"([^"\n]+)",\s*path\.display\(\)\s*\)\?;',
+            doctor)
+        for match in (refusal, missing, diagnostic):
+            self.assertIsNotNone(match, 'Rust diagnostic relationship changed; review the stub')
+        path = 'ai-memory.db'
+        error = missing.group(1).format(refusal.group(1), path)
+        expected = diagnostic.group(1).replace('{e:#}', error).format(path)
+        done = subprocess.run([str(self.default_bin), 'doctor', '--posture'],
+                              cwd=str(self.home), env=self.base_env(extra_env={
+                                  'AI_MEMORY_KEY_DIR': str(self.home)}),
+                              capture_output=True, text=True)
+        with self.subTest(surface='expected constant'):
+            self.assertEqual(DOCTOR_STDERR_LINE, expected)
+        with self.subTest(surface='executed stub'):
+            self.assertEqual(done.stderr, expected + '\n')
+        with self.subTest(surface='recapture docstring'):
+            self.assertIn(expected, ' '.join(load_script_module().__doc__.split()))
+
     def test_the_stub_prints_the_doctor_stderr_line_the_real_binary_prints(self):
         """#7697: the stub's stderr is the doctor line of src/cli/doctor.rs:873, so the test
         exercises the stderr merge the real capture goes through."""
