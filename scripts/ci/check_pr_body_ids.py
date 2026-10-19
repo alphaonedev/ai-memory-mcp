@@ -54,7 +54,7 @@ def close_failed_stream(stream):
         # Buffered IO closes the underlying stream even when its flush fails.
         # Closing the wrapper also prevents its finalizer from retrying output.
         stream.close()
-    except OSError:
+    except (OSError, UnicodeError):
         pass
 
 
@@ -62,7 +62,7 @@ def report_error(message):
     """Attempt one diagnostic; a broken diagnostic destination is also closed."""
     try:
         print(message, file=require_open_stream(sys.stderr), flush=True)
-    except OSError:
+    except (OSError, UnicodeError):
         close_failed_stream(sys.stderr)
 
 
@@ -82,7 +82,7 @@ class OutputParser(argparse.ArgumentParser):
                 require_open_stream(stream)
                 stream.write(message)
                 stream.flush()
-            except OSError:
+            except (OSError, UnicodeError):
                 close_failed_stream(stream)
                 if stream is not sys.stderr:
                     report_error("check_pr_body_ids: output error")
