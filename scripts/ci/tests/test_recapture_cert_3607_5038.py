@@ -1212,7 +1212,7 @@ class SanitizerEveryOccurrence7651(RecaptureBase):
         self.assertIn('JSON-escaped', doc)
         self.assertIn('percent-encoded', doc)
         self.assertIn('over-redact', doc)
-        self.assertIn('fails closed', doc)
+        self.assertIn('defined decoded views', doc)
         source = (REPO / 'scripts' / SCRIPT_NAME).read_text()
         self.assertNotIn('PATH_START', source)
         self.assertNotIn('PATH_END', source)
@@ -2929,7 +2929,7 @@ class DetectorTable7698(RecaptureBase):
             self.assertIn(phrase, doc)
         self.assertNotIn('every form is replaced', doc)
         module_doc = ' '.join(load_script_module().__doc__.split())
-        self.assertIn('redacted or the run refuses', module_doc)
+        self.assertIn('these defined decoded views', module_doc)
 
 
 class SanitizationScope7815(unittest.TestCase):

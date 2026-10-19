@@ -107,12 +107,14 @@ are byte-oriented, and a category list can lag Unicode (#7613); the run is refus
 exit 1 before any write. The sanitizer replaces every occurrence of each sensitive value (HOME,
 the repo root, the fixtures root and the per-child homes), longest value first, in its raw,
 JSON-escaped and percent-encoded forms; there is no delimiter allowlist, so a longer path
-that shares the prefix is over-redacted, which fails closed (#7538, #7651). The redaction is
+that shares the prefix is over-redacted (#7538, #7651). The redaction is
 not claimed to be complete: after it a detector builds decoded views of every capture
 (repeated case-insensitive percent-decoding, JSON \\u and \\/ unescaping, html.unescape, ANSI
 sequences removed, the text joined across line wraps, `//` and `/./` collapsed) and the run
 refuses to publish, naming the capture and the form, when a sensitive value shows in any of
-them (#7698): every input is redacted or the run refuses, none passes through. Every guarded
+these defined decoded views (#7698). Each decoder and the combined-decoder pass have an
+eight-round bound, stopping earlier at a fixed point. Unsupported representations, including
+base64 and lone-CR splitting, are not guaranteed detected (#7815). Every guarded
 path is resolved with os.path.realpath before any containment test (#7650). The shell script's
 defaults named build directories of one build host; they are replaced by
 repo-relative ones. Exit codes: 0 success; 1 DEFAULT_BIN is not an executable
@@ -236,17 +238,19 @@ def sanitize(raw):
     with and without an encoded slash). The replacement is NOT claimed to be complete: a form
     outside that list (mixed-case percent, `\\uXXXX` escapes of every character, HTML
     entities, a value split across a wrapped line, ANSI sequences inside it, `//` or `/./`
-    segments) is not replaced here. Completeness comes from the fail-closed detector
+    segments) is not replaced here. The detector
     (leak_problem), which runs on every sanitized capture before anything is written and
     refuses the run, naming the capture and the form, when a sensitive value shows in any
-    decoded view of it. All the forms of all the values
+    of its defined decoded views, subject to an eight-round bound for each decoder and the
+    combined-decoder pass (stopping earlier at a fixed point). Unsupported representations,
+    including base64 and lone-CR splitting, are not guaranteed detected (#7815). The listed forms
+    of all the values
     are replaced in one pass over the forms sorted by length, longest first, so a value that is
     a prefix of another (HOME inside the repo root) never splits it. The replacement is a plain
     byte replacement of every literal occurrence: there is no delimiter allowlist, so any
     character may precede or follow the path. A longer path that shares the prefix
     (`/home/a` inside `/home/ab`) is over-redacted (`<home>b`); that is the accepted price and
-    it fails closed: the evidence never keeps a sensitive value, at most it loses some
-    detail. A `.` after a path (a sentence full stop) is replaced like any other character,
+    the evidence can lose detail. A `.` after a path (a sentence full stop) is replaced like any other character,
     and so is a `.` inside it. The sed the shell script used read each path as a regular expression; for every
     literal occurrence the two agree, and real output has no near-miss of a path. Line endings,
     including CRLF and a missing final newline, are preserved exactly (#7510, #7538, #7571,
@@ -301,8 +305,9 @@ def decoded_views(text):
     """(form, text) of the capture as it is and under each decoding: repeated, case-insensitive
     percent-decoding; JSON `\\u` and `\\/` unescaping; html.unescape; ANSI sequences removed; the
     text joined across line wraps with the wrap characters removed; `//` and `/./` collapsed.
-    Each decoding is applied until it changes nothing; a last view applies all of them
-    together, so a value that is encoded and split at once is still seen."""
+    Each decoding stops at a fixed point or after DECODE_ROUNDS (eight rounds); a last view
+    applies all decoders in order, with the same round bound. Combined encodings are detected
+    only when a sensitive value becomes visible within those decoded views."""
     views = [("raw", text)]
     for form, decode in DECODERS:
         view = text
@@ -355,7 +360,7 @@ def sensitive_values():
 
 
 def value_forms(value):
-    """Every form value takes in captured output: raw, JSON-escaped (with and without the
+    """The literal forms selected for replacement: raw, JSON-escaped (with and without the
     `\\/` slash escape, once and twice) and percent-encoded (upper and lower hex, with and
     without an encoded slash)."""
     forms = {value, value.replace("/", "\\/")}

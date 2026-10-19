@@ -56,15 +56,19 @@ recorded by the cargo run of the certification and stay as recorded.
   with and without an encoded slash), longest value first. There is no delimiter allowlist.
 - **Over-redaction is the rule, not a defect.** A longer path that shares a prefix with a
   sensitive value (`/home/a` inside `/home/ab`) is over-redacted (`<home>b`). The evidence may
-  lose detail; it never keeps a sensitive value. Do not "repair" an over-redacted line by hand:
+  lose detail. Do not "repair" an over-redacted line by hand:
   the manifest and the recapture will not accept an edited capture.
-- **The redaction is not claimed to be complete; the detector is the guarantee.** After redaction
+- **Detection is limited to the defined decoded views.** After redaction
   the recapture builds decoded views of every capture: repeated case-insensitive percent decoding,
   JSON `\u` and `\/` unescaping, `html.unescape`, and the text joined across line wraps (with
   and without the indentation of the next line) with the wrap characters and ANSI sequences removed,
   and `//` and `/./` segments collapsed. If a sensitive value appears in **any** decoded view, the
   run refuses to publish, exits non-zero and names the capture and the form (never the value).
-  Every input is therefore either redacted or refused; none passes through.
+  Each decoder stops at a fixed point or after eight rounds; a final combined view applies
+  all decoders in order with the same eight-round bound. Line joining covers LF and CRLF
+  wraps. Unsupported representations, including base64 and lone-CR splitting, and values
+  still hidden after the round bound are not guaranteed detected. A successful run establishes
+  only that no sensitive value was found in these decoded views.
 - **Trust anchor.** The recapture reads `MANIFEST.sha256` as committed in git HEAD
   (`git show HEAD:<path>`), never the file on disk, and refuses unless the working-tree manifest
   is byte-identical to it, the set of every file and directory under this directory equals the
