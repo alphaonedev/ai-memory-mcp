@@ -2284,7 +2284,7 @@ _LIVE_READY = bool(_live_url() and shutil.which('psql'))
 @unittest.skipUnless(_LIVE_READY or os.environ.get(LIVE_REQUIRED_VAR) == '1',
                      'AI_MEMORY_TEST_POSTGRES_URL unset (live e2e)')
 class LiveEndToEnd(unittest.TestCase):
-    """C1 end to end: the real script, a real server, a probe, /bin/true.
+    """C1 end to end: the real script, a real server, a probe, a silent Python child.
 
     With AI_MEMORY_TEST_PG_LIVE_REQUIRED=1 (set by the CI step that runs these, #7485) a missing URL or psql
     fails the class instead of skipping it."""
@@ -2510,7 +2510,7 @@ class LiveEndToEnd(unittest.TestCase):
             self.assertIsNotNone(pib.parse_isolated_name(clone, run_id), clone)
             true_run = subprocess.run(
                 [sys.executable, str(SCRIPT), 'run', '--targets-file', str(d / 'targets.txt'),
-                 '--log-dir', str(d / 'logs2'), '--jobs', '1', '--', '/bin/true'],
+                 '--log-dir', str(d / 'logs2'), '--jobs', '1', '--', sys.executable, '-c', 'pass'],
                 env=env, capture_output=True, text=True, timeout=300)
             self.assertEqual(true_run.returncode, 0, true_run.stderr)
             self.assertIn('-> ai_memory_t_%s_' % run_id, true_run.stderr)
