@@ -8,18 +8,56 @@ Cargo-free and read-only. Reports, for BASE..TIP:
   * the AI_MEMORY_FED_* identifier set under src/ at both ends (added/removed);
   * the range size (all commits / non-merge).
 """
+import sys
+
+# #7730: isolate direct entry before any filesystem-backed import. sys and the OS
+# backend are built-ins; os itself is not frozen/cached on every Python 3.9 startup.
+# This cannot undo interpreter startup hooks that ran before this script began.
+if __name__ == "__main__" and not sys.flags.isolated:
+    __import__("posix" if "posix" in sys.builtin_module_names else "nt").execv(
+        sys.executable, [sys.executable, "-I", *sys.argv])
+
 import argparse
+import importlib.util
 import os
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(1, str(Path(__file__).resolve().parents[1]))
-from run_cert import anchored  # noqa: E402  (one anchoring rule for every CERT_* path)
-from check_cert_expiry import is_watched_path  # noqa: E402  (#7664: the gate's own predicate, not a copy)
+# Load only the trusted sources; neither directory becomes an import search path.
+_RUN_CERT_PATH = str(Path(__file__).resolve().with_name("run_cert.py"))
+_run_cert = sys.modules.get("run_cert")
+if _run_cert is not None:
+    if (getattr(_run_cert, "__file__", None) != _RUN_CERT_PATH
+            or getattr(getattr(_run_cert, "__spec__", None), "origin", None) != _RUN_CERT_PATH):
+        raise ImportError("cached run_cert is not from the expected sibling source")
+else:
+    _RUN_CERT_SPEC = importlib.util.spec_from_file_location("run_cert", _RUN_CERT_PATH)
+    _run_cert = importlib.util.module_from_spec(_RUN_CERT_SPEC)
+    sys.modules["run_cert"] = _run_cert
+    try:
+        _RUN_CERT_SPEC.loader.exec_module(_run_cert)
+    except BaseException:
+        del sys.modules["run_cert"]
+        raise
+anchored = _run_cert.anchored  # one anchoring rule for every CERT_* path
+_EXPIRY_PATH = str(REPO_ROOT / "scripts/check_cert_expiry.py")
+_expiry = sys.modules.get("check_cert_expiry")
+if _expiry is not None:
+    if (getattr(_expiry, "__file__", None) != _EXPIRY_PATH
+            or getattr(getattr(_expiry, "__spec__", None), "origin", None) != _EXPIRY_PATH):
+        raise ImportError("cached check_cert_expiry is not from the expected sibling source")
+else:
+    _EXPIRY_SPEC = importlib.util.spec_from_file_location("check_cert_expiry", _EXPIRY_PATH)
+    _expiry = importlib.util.module_from_spec(_EXPIRY_SPEC)
+    sys.modules["check_cert_expiry"] = _expiry
+    try:
+        _EXPIRY_SPEC.loader.exec_module(_expiry)
+    except BaseException:
+        del sys.modules["check_cert_expiry"]
+        raise
+is_watched_path = _expiry.is_watched_path  # #7664: the gate's own predicate, not a copy
 FED_ID = re.compile(r"AI_MEMORY_FED_[A-Z0-9_]+")
 
 

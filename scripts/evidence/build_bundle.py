@@ -17,6 +17,15 @@ Modelled on cert-385da3a05 (commit 9f68ea41a). Steps, each fatal on failure:
   8. MANIFEST.sha256 LAST, then re-verified from disk
 Nothing is staged or committed. Exit 0 only when every step passed.
 """
+import sys
+
+# #7730: isolate direct entry before any filesystem-backed import. sys and the OS
+# backend are built-ins; os itself is not frozen/cached on every Python 3.9 startup.
+# This cannot undo interpreter startup hooks that ran before this script began.
+if __name__ == "__main__" and not sys.flags.isolated:
+    __import__("posix" if "posix" in sys.builtin_module_names else "nt").execv(
+        sys.executable, [sys.executable, "-I", *sys.argv])
+
 import argparse
 import contextlib
 import ctypes
@@ -24,17 +33,33 @@ import ctypes.util
 import datetime
 import errno
 import hashlib
+import importlib.util
 import os
 import re
 import secrets
 import socket
 import stat
 import subprocess
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from run_cert import BINS, LIBS, PG_BIN, PG_LIB, REPO_ROOT, open_scratch, run_tmpdir  # noqa: E402  (one source for the leg set)
+# Load only the trusted sibling, without exposing its directory to stdlib imports.
+_RUN_CERT_PATH = str(Path(__file__).resolve().with_name("run_cert.py"))
+_run_cert = sys.modules.get("run_cert")
+if _run_cert is not None:
+    if (getattr(_run_cert, "__file__", None) != _RUN_CERT_PATH
+            or getattr(getattr(_run_cert, "__spec__", None), "origin", None) != _RUN_CERT_PATH):
+        raise ImportError("cached run_cert is not from the expected sibling source")
+else:
+    _RUN_CERT_SPEC = importlib.util.spec_from_file_location("run_cert", _RUN_CERT_PATH)
+    _run_cert = importlib.util.module_from_spec(_RUN_CERT_SPEC)
+    sys.modules["run_cert"] = _run_cert
+    try:
+        _RUN_CERT_SPEC.loader.exec_module(_run_cert)
+    except BaseException:
+        del sys.modules["run_cert"]
+        raise
+BINS, LIBS, PG_BIN, PG_LIB = _run_cert.BINS, _run_cert.LIBS, _run_cert.PG_BIN, _run_cert.PG_LIB
+REPO_ROOT, open_scratch, run_tmpdir = _run_cert.REPO_ROOT, _run_cert.open_scratch, _run_cert.run_tmpdir
 
 RECAPTURE_CANDIDATES = ("scripts/recapture-cert-3607-posture.py", "scripts/recapture-cert-3607-posture.sh")
 EVIDENCE_FILES = (

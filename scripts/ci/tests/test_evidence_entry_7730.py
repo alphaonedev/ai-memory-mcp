@@ -4,7 +4,6 @@
 Only disposable test fixtures are published; none is certification evidence.
 Run with unittest discovery on this file under each supported interpreter.
 """
-import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -22,6 +21,70 @@ PLANT_EXIT = 86
 PLANT_SOURCE = "print({!r}, flush=True)\nraise SystemExit({})\n".format(MARKER, PLANT_EXIT)
 CHILD_TIMEOUT = 30
 FIXTURE_DATE = "2026-10-19"
+CACHE_PROBE = """
+import importlib
+import importlib.util
+from pathlib import Path
+import sys
+import types
+
+directory, scenario, first, sibling = Path(sys.argv[1]), *sys.argv[2:]
+before = list(sys.path)
+
+def load(name):
+    spec = importlib.util.spec_from_file_location(name, directory / (name + '.py'))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+if scenario == 'identity':
+    load(first)
+    rc = importlib.import_module('run_cert')
+    bb = sys.modules.get('build_bundle') or load('build_bundle')
+    prep = sys.modules.get('prep') or load('prep')
+    assert bb.open_scratch is rc.open_scratch
+    assert bb.run_tmpdir is rc.run_tmpdir
+    assert prep.anchored is rc.anchored
+    assert prep.is_watched_path is sys.modules['check_cert_expiry'].is_watched_path
+    rc.REPO_ROOT = directory / 'shared-global'
+    assert prep.anchored('child') == rc.REPO_ROOT / 'child'
+    def refused(value):
+        raise rc.ConfigError('shared-class')
+    rc.anchored = refused
+    try:
+        bb.run_tmpdir()
+    except rc.ConfigError as error:
+        assert str(error) == 'shared-class'
+    else:
+        raise AssertionError('shared globals/exception class were lost')
+    assert load('build_bundle').open_scratch is rc.open_scratch
+elif scenario in ('wrong-file', 'wrong-spec'):
+    trusted = directory / 'run_cert.py' if sibling == 'run_cert' else directory.parent / 'check_cert_expiry.py'
+    foreign = str(directory / 'untrusted-source.py')
+    fake = types.ModuleType(sibling)
+    fake.__file__ = foreign if scenario == 'wrong-file' else str(trusted)
+    fake.__spec__ = importlib.util.spec_from_file_location(sibling, foreign if scenario == 'wrong-spec' else trusted)
+    sys.modules[sibling] = fake
+    try:
+        load(first)
+    except ImportError as error:
+        assert 'expected sibling source' in str(error), str(error)
+    else:
+        raise AssertionError('wrong-origin module was accepted')
+elif scenario == 'failure-cleanup':
+    try:
+        load(first)
+    except RuntimeError as error:
+        assert str(error) == 'fixture-import-failure'
+        assert sibling not in sys.modules
+    else:
+        raise AssertionError('failed import was accepted')
+else:
+    raise AssertionError(scenario)
+assert before == sys.path, (before, sys.path)
+print('CACHE-7730-OK')
+"""
 
 
 def invoke(script, flags, arguments):
@@ -38,6 +101,38 @@ class DirectEntry7730(ScratchCase):
         for name in ENTRYPOINTS:
             shutil.copyfile(EVIDENCE / name, self.evidence / name)
         shutil.copyfile(REPO / "scripts/check_cert_expiry.py", self.evidence.parent / "check_cert_expiry.py")
+
+    def probe(self, scenario, first, sibling="run_cert"):
+        result = subprocess.run([sys.executable, "-I", "-c", CACHE_PROBE, str(self.evidence),
+                                 scenario, first, sibling], cwd=Path.cwd(), capture_output=True,
+                                text=True, timeout=CHILD_TIMEOUT)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "CACHE-7730-OK")
+
+    def test_explicit_imports_preserve_shared_globals_and_exception_identity_7730(self):
+        for first in ("run_cert", "build_bundle", "prep"):
+            with self.subTest(first=first):
+                self.probe("identity", first)
+
+    def test_wrong_origin_cached_siblings_are_refused_7730(self):
+        for scenario in ("wrong-file", "wrong-spec"):
+            for first, sibling in (("build_bundle", "run_cert"), ("prep", "run_cert"),
+                                   ("prep", "check_cert_expiry")):
+                with self.subTest(scenario=scenario, first=first, sibling=sibling):
+                    self.probe(scenario, first, sibling)
+
+    def test_failed_sibling_imports_do_not_leave_partial_cache_entries_7730(self):
+        for first, sibling in (("build_bundle", "run_cert"), ("prep", "run_cert"),
+                               ("prep", "check_cert_expiry")):
+            path = (self.evidence / "run_cert.py" if sibling == "run_cert"
+                    else self.evidence.parent / "check_cert_expiry.py")
+            source = path.read_text()
+            try:
+                path.write_text("raise RuntimeError('fixture-import-failure')\n")
+                with self.subTest(first=first, sibling=sibling):
+                    self.probe("failure-cleanup", first, sibling)
+            finally:
+                path.write_text(source)
 
     def test_plain_entrypoints_reject_script_directory_imports_7730(self):
         for entry in ENTRYPOINTS:

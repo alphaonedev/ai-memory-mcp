@@ -20,6 +20,15 @@ exists: such refusals write nothing (stderr only). A missing wrapper, flock or t
 CONFIG and PLAN rows, a `RED preflight` row and an `EXIT=64` row are written, and no leg starts. 127 = a leg command
 that could not start (a RED launch row). Paths default to the checkout (.local-runs/); see the --cargo-slot/--slot-lock/--targets/--tmpdir options.
 """
+import sys
+
+# #7730: isolate direct entry before any filesystem-backed import. sys and the OS
+# backend are built-ins; os itself is not frozen/cached on every Python 3.9 startup.
+# This cannot undo interpreter startup hooks that ran before this script began.
+if __name__ == "__main__" and not sys.flags.isolated:
+    __import__("posix" if "posix" in sys.builtin_module_names else "nt").execv(
+        sys.executable, [sys.executable, "-I", *sys.argv])
+
 import argparse
 import datetime
 import os
@@ -28,7 +37,6 @@ import shlex
 import shutil
 import stat
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
