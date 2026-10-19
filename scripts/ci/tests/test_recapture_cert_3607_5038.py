@@ -146,6 +146,16 @@ class RecaptureBase(unittest.TestCase):
                               capture_output=True, text=True, check=True)
         return done.stdout
 
+    def seed_committed_bundle(self):
+        """Seed a valid historical bundle directly, without a manifest-free recapture (#7813)."""
+        evidence = self.root / OUT_REL
+        evidence.mkdir(parents=True)
+        (evidence / 'test-results.txt').write_bytes(b'historical test results\n')
+        (evidence / 'named-tests.txt').write_bytes(b'historical named tests\n')
+        (evidence / 'SANITIZATION.md').write_bytes(b'fixture note\n' + SEED_PROVENANCE.encode())
+        write_manifest(evidence)
+        self.commit_evidence()
+
     def commit_evidence(self):
         """Commit the bundle exactly as it stands on disk (#7696: the run trusts git HEAD).
 
@@ -2602,6 +2612,92 @@ class CommittedManifest7696(RecaptureBase):
                         / 'ENTERPRISE-FEDERATION-CERTIFICATION.md').read_text().split())
         self.assertGreaterEqual(doc.count('as committed in git HEAD'), 2)
         self.assertNotIn('does not match its committed `MANIFEST.sha256`', doc)
+
+
+class BundleRoot7813(RecaptureBase):
+    """#7813: HEAD inventory and a real bundle root are required before any binary runs."""
+
+    def assert_refused(self, *diagnostics):
+        evidence = self.root / OUT_REL
+        before = self.root_state()
+        log = self.home / 'ran.log'
+        default = self.make_logging_stub(self.root / 'logging-default', log)
+        sqlcipher = self.make_logging_stub(self.root / 'logging-sqlcipher', log)
+        done, _ = self.run_recapture(default_bin=default, sqlcipher_bin=sqlcipher, commit=False)
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
+        self.assertNotIn('Traceback', done.stderr)
+        for diagnostic in diagnostics:
+            self.assertIn(diagnostic, done.stderr)
+        self.assertFalse(log.exists(), 'a binary ran before the inventory gate')
+        self.assertEqual(self.root_state(), before, 'refusal changed the bundle root')
+        self.assertEqual(sorted(path.name for path in evidence.parent.iterdir()),
+                         ['cert-3607'] if os.path.lexists(str(evidence)) else [])
+        work = self.root / '.local-runs' / 'cert-3607-work'
+        self.assertEqual(sorted(path.name for path in work.iterdir()), ['.lock'])
+        self.assertFalse((self.root / '.local-runs' / 'cert-3607-sandbox').exists())
+
+    def root_state(self):
+        evidence = self.root / OUT_REL
+        if evidence.is_symlink():
+            return ('link', os.readlink(str(evidence)))
+        if evidence.is_dir():
+            return ('directory', {path.name: path.read_bytes() for path in evidence.iterdir()})
+        if evidence.exists():
+            return ('file', evidence.read_bytes())
+        return ('absent',)
+
+    def test_7813_absent_committed_bundle_root_refuses(self):
+        self.seed_committed_bundle()
+        shutil.rmtree(str(self.root / OUT_REL))
+        self.assert_refused('cert-3607', 'directory')
+
+    def test_7813_symlink_bundle_root_refuses_and_preserves_target(self):
+        self.seed_committed_bundle()
+        outside = self.home / 'outside'
+        shutil.move(str(self.root / OUT_REL), str(outside))
+        before = {path.name: path.read_bytes() for path in outside.iterdir()}
+        (self.root / OUT_REL).symlink_to(outside, target_is_directory=True)
+        self.assert_refused('cert-3607', 'directory')
+        self.assertEqual({path.name: path.read_bytes() for path in outside.iterdir()}, before)
+
+    def test_7813_dangling_symlink_bundle_root_refuses(self):
+        self.seed_committed_bundle()
+        shutil.rmtree(str(self.root / OUT_REL))
+        target = self.home / 'absent-target'
+        (self.root / OUT_REL).symlink_to(target, target_is_directory=True)
+        self.assert_refused('cert-3607', 'directory')
+        self.assertFalse(target.exists())
+
+    def test_7813_regular_file_bundle_root_refuses(self):
+        self.seed_committed_bundle()
+        shutil.rmtree(str(self.root / OUT_REL))
+        (self.root / OUT_REL).write_bytes(b'keep root entry\n')
+        self.assert_refused('cert-3607', 'directory')
+
+    def test_7813_first_run_without_manifest_in_head_refuses(self):
+        evidence = self.root / OUT_REL
+        evidence.parent.mkdir(parents=True)
+        self.assert_refused('MANIFEST.sha256', 'not committed')
+
+    def test_7813_uncommitted_bundle_cannot_bootstrap_the_anchor(self):
+        self.seed_committed_bundle()
+        self.git('rm', '-q', '--cached', '--', str(OUT_REL / 'MANIFEST.sha256'))
+        self.git('-c', 'user.name=t', '-c', 'user.email=sandbox@localhost',
+                 '-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'untrack manifest')
+        self.assert_refused('MANIFEST.sha256', 'not committed')
+
+    def test_7813_committed_bundle_preserves_history_provenance_and_manifest(self):
+        self.seed_committed_bundle()
+        evidence = self.root / OUT_REL
+        history = {name: (evidence / name).read_bytes()
+                   for name in ('test-results.txt', 'named-tests.txt')}
+        done, _ = self.run_recapture(commit=False)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(manifest_problems(evidence), [])
+        for name, data in history.items():
+            self.assertEqual((evidence / name).read_bytes(), data)
+        self.assertTrue((evidence / 'SANITIZATION.md').read_bytes().startswith(b'fixture note\n'))
+        self.assertIn(self.git('rev-parse', 'HEAD').strip(), self.out('SANITIZATION.md'))
 
 
 class DetectorTable7698(RecaptureBase):
