@@ -13,6 +13,7 @@ header whose date disagrees with the run date is refused.
 Run: python3 -m unittest scripts/ci/tests/test_recapture_cert_3607_5038.py
 """
 import ast
+import base64
 import contextlib
 import datetime
 import hashlib
@@ -2929,6 +2930,56 @@ class DetectorTable7698(RecaptureBase):
         self.assertNotIn('every form is replaced', doc)
         module_doc = ' '.join(load_script_module().__doc__.split())
         self.assertIn('redacted or the run refuses', module_doc)
+
+
+class SanitizationScope7815(unittest.TestCase):
+    """Document the bounded detector using supported and unsupported representations."""
+
+    HOME = '/home/scope-probe_7815'
+    EXPECTED_DECODE_ROUNDS = 8
+
+    def test_7815_measured_limits_are_disclosed(self):
+        module = load_script_module()
+        half = len(self.HOME) // 2
+        unsupported = {
+            'base64': base64.b64encode(self.HOME.encode()),
+            'lone-CR': (self.HOME[:half] + '\r' + self.HOME[half:]).encode(),
+        }
+        with unittest.mock.patch.object(module, 'sensitive_values',
+                                        return_value=[(self.HOME, b'<home>')]):
+            wrapped = (self.HOME[:half] + '\n' + self.HOME[half:]).encode()
+            self.assertIsNotNone(module.leak_problem('supported', module.sanitize(wrapped)))
+            for representation, raw in unsupported.items():
+                with self.subTest(representation=representation):
+                    self.assertEqual(module.sanitize(raw), raw)
+                    self.assertIsNone(module.leak_problem('unsupported', raw))
+        documents = {
+            'guide': (REPO / OUT_REL / 'SANITIZATION.md').read_text(),
+            'module': module.__doc__,
+            'sanitize': module.sanitize.__doc__,
+        }
+        for name, document in documents.items():
+            with self.subTest(document=name):
+                prose = ' '.join(document.split())
+                for representation in unsupported:
+                    self.assertIn(representation, prose)
+                self.assertRegex(prose, r'(eight|8)[ -]round')
+                self.assertIn('decoded views', prose)
+                self.assertNotRegex(prose, r'Completeness comes|never keeps a sensitive value|'
+                                    r'[Ee]very input is (therefore )?(either )?redacted')
+
+    def test_7815_eight_round_percent_boundary(self):
+        module = load_script_module()
+        self.assertEqual(module.DECODE_ROUNDS, self.EXPECTED_DECODE_ROUNDS)
+        encoded = self.HOME.replace('/', '%2F')
+        with unittest.mock.patch.object(module, 'sensitive_values',
+                                        return_value=[(self.HOME, b'<home>')]):
+            for _ in range(self.EXPECTED_DECODE_ROUNDS - 1):
+                encoded = encoded.replace('%', '%25')
+            self.assertIsNotNone(module.leak_problem('at-bound', encoded.encode()))
+            beyond = encoded.replace('%', '%25').encode()
+            self.assertEqual(module.sanitize(beyond), beyond)
+            self.assertIsNone(module.leak_problem('beyond-bound', beyond))
 
 
 class ProvenanceRefresh7699(RecaptureBase):
