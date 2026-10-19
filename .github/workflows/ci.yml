@@ -1574,8 +1574,9 @@ jobs:
           # test set runs as three concurrent shards, each a `run_tests` chain
           # (so the #1492 watchdog, #2500 --no-fail-fast and #2657 prebuild
           # shapes are unchanged):
-          #   serial      class (a): Postgres / #[serial] / federat* / unknown
-          #               source binaries + the lib Postgres test-name prefixes
+          #   serial      class (a): shared Postgres use / #[serial] / unknown
+          #               or unresolved source; federation names alone are not evidence.
+          #               These binaries + the lib Postgres test-name prefixes
           #               + doc tests, --test-threads=1. The ONLY shard that
           #               touches the per-job Postgres database.
           #   parallel_1  lib unittests with --skip of those prefixes, plus a
