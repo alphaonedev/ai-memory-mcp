@@ -88,10 +88,41 @@ MAX_INLINE_SCRIPT = 100_000  # a shell body travels as one argv entry (the kerne
 SWEEP_MAX_DEPTH = 100_000  # the deepest legacy scratch tree the sweep descends into
 SCRATCH_WORLD_WRITABLE = 0o002  # #7662: a group-writable directory owned by this user is accepted (umask 0002 checkouts)
 # #7663 / #7665: a child never inherits the checkout as its working directory. The Python variables below would let an
-# inner `python3` import from a directory the caller names or from the user site; PYTHONSAFEPATH keeps cwd and the
-# script directory off sys.path (the gate scripts cd to their own root, so the working directory alone is not enough).
+# inner `python3` import from a directory the caller names or from the user site. These variables are defense in
+# depth; interpreter -I below supplies the isolation on every supported Python, including 3.9 (#7728).
 SCRUBBED_PYTHON_ENV = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONUSERBASE")
 SAFE_PYTHON_ENV = {"PYTHONSAFEPATH": "1", "PYTHONNOUSERSITE": "1"}
+SCRUBBED_SHELL_ENV = ("BASH_ENV", "ENV")
+PRIVATE_EXEC_MODE = 0o500
+MAX_SHEBANG_BYTES = 127  # portable kernel shebang bound, including newline
+PYTHON_COMMAND = re.compile(r"python(?:3(?:\.\d+)?)?\Z")
+
+
+def isolated_python_environment(env, launcher_dir):
+    """Pin nested gate Python to this interpreter, without trusting PATH or a checkout helper.
+
+    The existing shell gates invoke python3 by name. A private Python launcher starts under -I itself and execs
+    the absolute running interpreter with -I; it never searches PATH (including its own directory). Keep the
+    launcher outside the empty child cwd. No shell gate source or compiler command is rewritten.
+    """
+    executable = os.path.abspath(sys.executable)
+    shebang = f"#!{executable} -I\n"
+    if any(c.isspace() for c in executable) or len(shebang.encode()) > MAX_SHEBANG_BYTES:
+        raise ConfigError("the Python executable path cannot be represented safely in a launcher shebang")
+    source = (shebang + '"""Private isolated interpreter launcher (#7728)."""\n'
+              + "import os, sys\n"
+              + f"os.execv({executable!r}, [{executable!r}, '-I', *sys.argv[1:]])\n")
+    for name in ("python", "python3", f"python{sys.version_info.major}.{sys.version_info.minor}"):
+        launcher = launcher_dir / name
+        with launcher.open("x") as stream:
+            stream.write(source)
+        launcher.chmod(PRIVATE_EXEC_MODE)
+    for key in list(env):
+        if key in (*SCRUBBED_PYTHON_ENV, *SCRUBBED_SHELL_ENV) or key.startswith("BASH_FUNC_"):
+            env.pop(key)
+    env.update(SAFE_PYTHON_ENV)
+    env["PATH"] = str(launcher_dir) + os.pathsep + env.get("PATH", os.defpath)
+    return env
 
 
 def open_scratch(scratch):
@@ -350,7 +381,13 @@ class Run:
         env = dict(self.env)
         env.update(extra_env or {})
         box = None
+        launcher_dir = None
         try:
+            launcher_dir = Path(tempfile.mkdtemp(prefix="python-", dir=str(self.tmpdir)))
+            env = isolated_python_environment(env, launcher_dir)
+            # Direct Python calls also use the selected interpreter, even if a caller supplies another PATH name.
+            if PYTHON_COMMAND.fullmatch(Path(str(argv[0])).name) or str(argv[0]) == sys.executable:
+                argv = [sys.executable, "-I", *argv[1:]]
             if cwd is None:
                 box = Path(tempfile.mkdtemp(prefix="child-", dir=str(self.tmpdir)))
             with open(out, "wb") as f:
@@ -366,6 +403,8 @@ class Run:
         finally:
             if box is not None:
                 shutil.rmtree(box, ignore_errors=True)
+            if launcher_dir is not None:
+                shutil.rmtree(launcher_dir, ignore_errors=True)
 
     def low_priority(self, timeout_secs, script):
         """argv running a repo gate script at low priority, under the optional slot flock (--slot-lock)."""
