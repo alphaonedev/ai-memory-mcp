@@ -22,6 +22,7 @@ Exit codes: 0 ok, 1 ratchet failure, 2 gate failure or unusable input.
 """
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -79,15 +80,28 @@ def gate(args):
     budgets = pairs(args.budget, '--budget', True)
     try:
         est = json.loads(Path(args.manifest).read_text())['estimate_seconds']
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError, TypeError) as exc:
         raise BudgetError('cannot read estimate_seconds from %s: %s' % (args.manifest, exc))
+    if not isinstance(est, dict):
+        raise BudgetError('manifest %s estimate_seconds must be an object' % args.manifest)
+    estimates = {}
+    for shard in SHARDS:
+        key = MANIFEST_KEY[shard]
+        try:
+            value = est[key]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError('not a number')
+            raw = float(value)
+            scaled = raw * ESTIMATE_SCALE[shard]
+            if not math.isfinite(raw) or raw < 0 or not math.isfinite(scaled):
+                raise ValueError('not finite and nonnegative after calibration')
+            estimates[shard] = (raw, int(round(scaled)))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            raise BudgetError('manifest %s %s must be numeric, finite and nonnegative '
+                              'with finite calibration' % (args.manifest, key))
     failed = False
     for shard in SHARDS:
-        try:
-            raw = float(est[MANIFEST_KEY[shard]])
-        except (KeyError, TypeError, ValueError):
-            raise BudgetError('manifest %s has no %s' % (args.manifest, MANIFEST_KEY[shard]))
-        calibrated = int(round(raw * ESTIMATE_SCALE[shard]))
+        raw, calibrated = estimates[shard]
         budget = budgets[shard]
         line = 'shard %s estimate %ds (raw %ds x %.2f) vs budget %ds' % (
             shard, calibrated, round(raw), ESTIMATE_SCALE[shard], budget)

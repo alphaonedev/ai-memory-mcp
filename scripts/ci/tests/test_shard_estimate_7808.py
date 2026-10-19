@@ -22,6 +22,7 @@ INVALID_VALUES = (None, True, False, '', '123', 'bad', 'nan', 'inf', [], {},
                   -1, -0.25, float('nan'), float('inf'), -float('inf'), 10 ** 1000)
 INVALID_CONTAINERS = (None, True, 1, 'bad', [], [{}])
 BUDGET = 1000
+LARGE_FINITE = 1.79e308
 
 
 class ShardEstimate7808(unittest.TestCase):
@@ -95,11 +96,11 @@ class ShardEstimate7808(unittest.TestCase):
             missing = self.valid()
             del missing['estimate_seconds'][key]
             payloads.append(missing)
-            for value in INVALID_VALUES + (1e308,):
+            for value in INVALID_VALUES + (LARGE_FINITE,):
                 payload = self.valid()
                 payload['estimate_seconds'][key] = value
                 payloads.append(payload)
-        # Serial's scale is below one, so 1e308 is finite and fails its budget
+        # Serial's scale is below one, so this stays finite and fails its budget
         # normally; the parallel scales overflow and must fail as bad input.
         for payload in payloads:
             with self.subTest(payload=payload):
@@ -110,7 +111,7 @@ class ShardEstimate7808(unittest.TestCase):
                 self.assertIn('::error::', proc.stderr)
                 self.assertNotIn('Traceback', proc.stderr)
                 serial = payload.get('estimate_seconds', {}) if isinstance(payload, dict) else {}
-                if isinstance(serial, dict) and serial.get(sb.MANIFEST_KEY['serial']) == 1e308:
+                if isinstance(serial, dict) and serial.get(sb.MANIFEST_KEY['serial']) == LARGE_FINITE:
                     self.assertIn('[#7343 fail-fast]', proc.stderr)
                 else:
                     self.assertIn('[#7343 shard-budget]', proc.stderr)
