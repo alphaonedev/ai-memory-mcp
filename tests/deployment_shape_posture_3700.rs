@@ -29,7 +29,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 mod common;
-use common::{free_port, permissive_attestation_for_tests};
+use common::{free_port, permissive_attestation_for_tests, serve_test_env};
 
 /// A valid, EMPTY peer allowlist: federation is CONFIGURED (a `federated`
 /// observed floor) while denying every peer, so the #3582 gate is satisfied
@@ -91,8 +91,9 @@ fn command_with_config(root: &Path, config_body: Option<&str>) -> Command {
         std::fs::write(dir.join("config.toml"), body).expect("write config.toml");
     }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai-memory"));
-    cmd.env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+    cmd.env_clear();
+    serve_test_env(&mut cmd);
+    cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", root.join("home"))
         .env("XDG_CONFIG_HOME", xdg)
         .env("AI_MEMORY_KEY_DIR", keys)
@@ -172,7 +173,8 @@ fn boot_on_loopback(mut cmd: Command) -> BootOutcome {
             }
         })
     });
-    let deadline = Instant::now() + BOOT_DEADLINE;
+    let started = Instant::now();
+    let deadline = started + BOOT_DEADLINE;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             if let Some(h) = reader {
@@ -192,11 +194,19 @@ fn boot_on_loopback(mut cmd: Command) -> BootOutcome {
             let stderr = buf.lock().unwrap().clone();
             return BootOutcome::Healthy { stderr };
         }
-        assert!(
-            Instant::now() < deadline,
-            "serve neither exited nor became healthy within {BOOT_DEADLINE:?}; stderr:\n{}",
-            buf.lock().unwrap()
-        );
+        if Instant::now() >= deadline {
+            // #4166: never leak the child on the deadline path.
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(h) = reader {
+                let _ = h.join();
+            }
+            panic!(
+                "serve neither exited nor became healthy within {BOOT_DEADLINE:?} (elapsed {:?}); stderr:\n{}",
+                started.elapsed(),
+                buf.lock().unwrap()
+            );
+        }
         std::thread::sleep(PROBE_INTERVAL);
     }
 }
