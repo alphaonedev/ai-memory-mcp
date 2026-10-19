@@ -63,11 +63,12 @@ recovers from a killed predecessor (SIGKILL, power loss): a leftover aside is pu
 the evidence directory is missing or incomplete (complete = MANIFEST.sha256 present and every
 file it lists matches) and removed when the evidence directory is complete, several asides
 are refused, and leftover staging and raw directories are removed, including the
-`.cert-3607.*` names an older version left next to the evidence directory (#7610). When the
-evidence directory exists it is verified against its manifest as committed in git HEAD
+`.cert-3607.*` names an older version left next to the evidence directory (#7610). Every run
+requires a real existing evidence directory and verifies its manifest as committed in git HEAD
 (`git show HEAD:docs/compliance/evidence/cert-3607/MANIFEST.sha256`, never the file on disk)
 before anything is built or published (#7649, #7696). The run refuses (exit 1, naming every
-offender, no binary runs, nothing is published) unless: (a) the manifest exists in git HEAD;
+offender, no binary runs, nothing is published) unless: (a) the manifest exists in git HEAD,
+including on a first run, and the bundle root is a real directory (#7813);
 (b) the working-tree manifest is byte-identical to the committed one; (c) the set of every
 regular file and every directory under the bundle, recursively, equals the manifest set
 exactly, so a missing, extra or unlisted file or subdirectory refuses, and so does any
@@ -1143,21 +1144,26 @@ def recapture_locked(tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting, run_
     if problem is not None:
         print(problem, file=sys.stderr)
         return 1
-    committed = None
     try:
         make_sandbox()
-        if OUT.is_dir() and not OUT.is_symlink():
-            # before any binary runs and before anything is built: the anchor is the manifest
-            # as committed in git HEAD, never the file on disk (#7696)
-            committed, problem = committed_manifest()
-            if committed is not None:
-                problem = committed_bundle_problem(OUT, committed)
-            if problem is not None:
-                print("refusing to publish over a bundle that does not match its manifest as "
-                      "committed in git HEAD: %s (%s); commit the evidence directory, or "
-                      "restore it with git checkout, before recapturing" % (problem, OUT),
-                      file=sys.stderr)
-                return 1
+        # HEAD is required even on a first run; an invalid root must never skip the anchor.
+        committed, problem = committed_manifest()
+        if problem is None:
+            try:
+                root_mode = os.lstat(str(OUT)).st_mode
+            except FileNotFoundError:
+                problem = "the bundle root must exist as a real directory"
+            else:
+                if not stat.S_ISDIR(root_mode):
+                    problem = "the bundle root must be a real directory, never a symlink or file"
+        if problem is None:
+            problem = committed_bundle_problem(OUT, committed)
+        if problem is not None:
+            print("refusing to publish over a bundle that does not match its manifest as "
+                  "committed in git HEAD: %s (%s); commit the evidence directory, or "
+                  "restore it with git checkout, before recapturing" % (problem, OUT),
+                  file=sys.stderr)
+            return 1
         return build_and_publish(tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting,
                                  run_date, committed)
     finally:
@@ -1179,14 +1185,13 @@ def build_and_publish(tmpdir, default_bin, sqlcipher_bin, sqlcipher_setting, run
     ensure_dirs(stage)
     ensure_dirs(raw_dir)
     try:
-        if committed is not None:
-            copy_bundle(OUT, stage)
-            problem = committed_bundle_problem(stage, committed)  # nothing changed since
-            if problem is not None:
-                print("refusing to publish: the staged copy of the bundle does not match its "
-                      "manifest as committed in git HEAD: %s (%s)" % (problem, OUT),
-                      file=sys.stderr)
-                return 1
+        copy_bundle(OUT, stage)
+        problem = committed_bundle_problem(stage, committed)  # nothing changed since
+        if problem is not None:
+            print("refusing to publish: the staged copy of the bundle does not match its "
+                  "manifest as committed in git HEAD: %s (%s)" % (problem, OUT),
+                  file=sys.stderr)
+            return 1
         legs = capture_legs(stage, raw_dir, tmpdir, default_bin, sqlcipher_bin,
                             sqlcipher_setting, run_date)
         if isinstance(legs, int):

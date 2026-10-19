@@ -118,6 +118,7 @@ class RecaptureBase(unittest.TestCase):
     """Builds a sandbox repo with the script, stub binaries and a signed-free commit."""
 
     maxDiff = None
+    SEED_BUNDLE = True
 
     def setUp(self):
         SCRATCH.mkdir(exist_ok=True)
@@ -130,6 +131,9 @@ class RecaptureBase(unittest.TestCase):
         self.git('add', 'seed.txt')
         self.git('-c', 'user.name=t', '-c', 'user.email=sandbox@localhost',
                  '-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'seed')
+        if self.SEED_BUNDLE:
+            self.seed_committed_bundle()
+        self.initial_docs = self.docs_snapshot()
         self.sha = self.git('rev-parse', '--short', 'HEAD').strip()
         self.default_bin = self.make_stub('ai-memory-default')
         self.sqlcipher_bin = self.make_stub('ai-memory-sqlcipher')
@@ -146,31 +150,44 @@ class RecaptureBase(unittest.TestCase):
                               capture_output=True, text=True, check=True)
         return done.stdout
 
+    def docs_snapshot(self):
+        """Record every evidence path, byte and mode to detect writes on refusal."""
+        docs = self.root / 'docs'
+        return {str(path.relative_to(docs)): (path.stat().st_mode,
+                                             path.read_bytes() if path.is_file() else None)
+                for path in docs.rglob('*')}
+
+    def assert_seed_untouched(self):
+        self.assertEqual(self.docs_snapshot(), self.initial_docs)
+
     def seed_committed_bundle(self):
         """Seed a valid historical bundle directly, without a manifest-free recapture (#7813)."""
         evidence = self.root / OUT_REL
         evidence.mkdir(parents=True)
+        for directory in (self.root / 'docs', self.root / 'docs/compliance', evidence.parent,
+                          evidence):
+            directory.chmod(0o700)
         (evidence / 'test-results.txt').write_bytes(b'historical test results\n')
         (evidence / 'named-tests.txt').write_bytes(b'historical named tests\n')
         (evidence / 'SANITIZATION.md').write_bytes(b'fixture note\n' + SEED_PROVENANCE.encode())
         write_manifest(evidence)
+        for path in evidence.iterdir():
+            path.chmod(0o600)
         self.commit_evidence()
 
     def commit_evidence(self):
-        """Commit the bundle exactly as it stands on disk (#7696: the run trusts git HEAD).
+        """Commit the fixture bytes as they stand; never synthesize or rewrite its manifest.
 
-        The manifest is not rewritten, so a test that tampered with a file still shows the
-        tampering to the run; only a bundle that was never committed is made committed."""
+        Tests that exercise a difference from HEAD use commit=False when running the script.
+        A missing manifest stays missing, so fixture setup cannot bypass the anchor gate."""
         evidence = self.root / OUT_REL
         if not evidence.is_dir() or evidence.is_symlink():
             return
-        if not (evidence / 'MANIFEST.sha256').exists():
-            write_manifest(evidence)  # a first run publishes none; the committed bundle has one
         subprocess.run(['git', '-C', str(self.root), 'add', '-f', '--', str(OUT_REL)],
                        capture_output=True, check=False)
         subprocess.run(['git', '-C', str(self.root), '-c', 'user.name=t',
                         '-c', 'user.email=sandbox@localhost', '-c', 'commit.gpgsign=false',
-                        'commit', '-q', '--allow-empty', '-m', 'evidence'],
+                        'commit', '-q', '-m', 'evidence'],
                        capture_output=True, check=False)
 
     def make_stub(self, name):
@@ -392,7 +409,7 @@ class BinaryPreflight7397(RecaptureBase):
         self.assertIn('DEFAULT_BIN', done.stderr)
         self.assertIn(str(binary), done.stderr)
         self.assertNotIn('Traceback', done.stderr)
-        self.assertFalse((self.root / 'docs').exists(), 'evidence dir was created')
+        self.assert_seed_untouched()
         self.assertEqual(list(self.root.rglob('*.raw')), [])
 
     def test_missing_default_bin_is_refused(self):
@@ -449,7 +466,7 @@ class TmpdirOverride7398(RecaptureBase):
         self.assertIn('TMPDIR', done.stderr)
         self.assertIn('.local-runs', done.stderr)
         self.assertEqual(outside.stat().st_mode & 0o777, 0o755)
-        self.assertFalse((self.root / 'docs').exists())
+        self.assert_seed_untouched()
 
     def test_symlink_escaping_local_runs_is_refused(self):
         outside = self.home / 'shared-tmp'
@@ -633,7 +650,7 @@ class LocalRunsSymlink7434(RecaptureBase):
         done, _ = self.run_recapture(extra_env={'TMPDIR': str(outside / 't')})
         self.assertEqual(done.returncode, 1, done.stderr)
         self.assertEqual(list(outside.iterdir()), [])
-        self.assertFalse((self.root / 'docs').exists())
+        self.assert_seed_untouched()
 
 
 class TmpdirMessage7435(RecaptureBase):
@@ -771,7 +788,7 @@ class FixtureSymlinks7462(RecaptureBase):
         self.assertEqual(done.returncode, 1, done.stderr)
         self.assertIn('symlink', done.stderr)
         self.assertEqual(list(outside.iterdir()), [])
-        self.assertFalse((self.root / 'docs').exists())
+        self.assert_seed_untouched()
 
     def test_symlinked_fixture_dir_is_refused(self):
         outside = self.outside()
@@ -981,7 +998,7 @@ class HomeValidation7510(RecaptureBase):
                 done, _ = self.run_recapture(extra_env={'HOME': value})
                 self.assertEqual(done.returncode, 1, done.stderr)
                 self.assertIn('HOME', done.stderr)
-                self.assertFalse((self.root / 'docs').exists())
+                self.assert_seed_untouched()
                 self.assertFalse((self.root / '.local-runs').exists())
 
     def test_help_does_not_need_a_usable_home(self):
@@ -1242,11 +1259,12 @@ class EvidenceModes7568(SymlinkBase):
     def test_whole_run_creates_only_0600_files_and_0700_dirs_under_every_umask(self):
         for umask in self.UMASKS:
             with self.subTest(umask=oct(umask)):
-                # a fresh sandbox per umask: no directory survives from an earlier subTest, so
-                # every directory is created under THIS umask (#7614)
+                # A fresh committed bundle per umask; all directories the recapture creates
+                # for fixtures and work are then created under THIS umask (#7614).
                 for top in ('docs', '.local-runs'):
                     shutil.rmtree(str(self.root / top), True)
                     self.assertFalse((self.root / top).exists(), top)
+                self.seed_committed_bundle()
                 old = os.umask(umask)
                 try:
                     done, _ = self.run_recapture()
@@ -1273,7 +1291,6 @@ class EvidenceModes7568(SymlinkBase):
                 self.assertGreater(seen, 15)
 
     def test_a_directory_that_exists_is_not_retightened_except_the_fixtures_dir(self):
-        (self.root / 'docs').mkdir()
         (self.root / 'docs').chmod(0o755)
         done, _ = self.run_recapture()
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -1387,11 +1404,12 @@ class StagedBundle7574(SymlinkBase):
         self.assertNotIn(b'run-two-marker', b''.join(data for data, _ in self.snapshot().values()))
         self.assert_no_staging()
 
-    def test_a_failed_first_run_creates_no_bundle_and_no_staging_directory(self):
+    def test_a_failed_capture_preserves_the_seed_bundle_and_leaves_no_staging(self):
+        before = self.snapshot()
         failing = self.make_failing_stub(self.root / 'failing-default', 'run-one-marker')
         done, _ = self.run_recapture(default_bin=failing)
         self.assertEqual(done.returncode, 1, done.stderr)
-        self.assertFalse(self.evidence().exists())
+        self.assertEqual(self.snapshot(), before)
         self.assert_no_staging()
 
     def test_a_successful_run_replaces_the_bundle_and_keeps_other_listed_files(self):
@@ -1605,7 +1623,9 @@ class WorkDirs7609(SymlinkBase):
         return path
 
     def seed(self):
-        """A first run, then SANITIZATION.md and a MANIFEST.sha256 over the bundle."""
+        """Recapture a valid committed seed, then add historical files and recommit it."""
+        if not self.evidence().exists():
+            self.seed_committed_bundle()
         done, _ = self.run_recapture()
         self.assertEqual(done.returncode, 0, done.stderr)
         (self.evidence() / 'SANITIZATION.md').write_bytes(
@@ -1681,7 +1701,7 @@ class WorkDirs7609(SymlinkBase):
         done = self.run_driver(prelude)
         self.assertEqual(done.returncode, 1, done.stderr)
         self.assertIn('same filesystem', done.stderr)
-        self.assertFalse(self.evidence().exists())
+        self.assert_seed_untouched()
 
     def run_driver(self, prelude):
         driver = self.home / 'driver.py'
@@ -1934,7 +1954,7 @@ class WorldWritableAncestors7611(SymlinkBase):
 
     def test_a_sticky_world_writable_directory_is_accepted(self):
         evidence = self.root / 'docs' / 'compliance' / 'evidence'
-        evidence.mkdir(parents=True)
+        evidence.mkdir(parents=True, exist_ok=True)
         evidence.chmod(0o1777)
         done, _ = self.run_recapture()
         self.assertEqual(done.returncode, 0, done.stderr)
@@ -2346,10 +2366,13 @@ class ManifestVerify7649(RecaptureBase):
         self.assertEqual(manifest_problems(self.evidence()), [])
         self.assertIn('test-results.txt', self.lines())
 
-    def test_a_first_run_without_a_manifest_writes_none(self):
-        done, _ = self.run_recapture()
-        self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertFalse((self.evidence() / 'MANIFEST.sha256').exists())
+    def test_a_missing_working_manifest_refuses_without_recreating_it(self):
+        (self.evidence() / 'MANIFEST.sha256').unlink()
+        before = self.snapshot()
+        done, _ = self.run_recapture(commit=False)
+        self.assertEqual(done.returncode, 1, done.stderr)
+        self.assertIn('MANIFEST.sha256', done.stderr)
+        self.assertEqual(self.snapshot(), before)
 
     def test_refresh_manifest_never_rehashes_a_file_it_did_not_write(self):
         module = load_script_module()
@@ -2400,7 +2423,7 @@ class RealPaths7650(RecaptureBase):
         self.assertEqual(done.returncode, 1, done.stderr)
         self.assertIn('world writable', done.stderr)
         self.assertIn('r9ww', done.stderr)
-        self.assertFalse((self.root / OUT_REL).exists())
+        self.assert_seed_untouched()
 
     def test_a_symlinked_repo_root_refuses_a_world_writable_tmpdir_ancestor(self):
         link = self.home / 'rootlink2'
@@ -2616,6 +2639,8 @@ class CommittedManifest7696(RecaptureBase):
 
 class BundleRoot7813(RecaptureBase):
     """#7813: HEAD inventory and a real bundle root are required before any binary runs."""
+
+    SEED_BUNDLE = False
 
     def assert_refused(self, *diagnostics):
         evidence = self.root / OUT_REL
@@ -2853,9 +2878,9 @@ class DetectorTable7698(RecaptureBase):
         self.assertIn('refusing to publish', done.stderr)
         self.assertIn('posture-bare-env.out', done.stderr)
         self.assertIn('line-wrapped', done.stderr)
-        self.assertFalse((self.root / OUT_REL).exists())
+        self.assert_seed_untouched()
         self.assertEqual(sorted(p.name for p in (self.root / OUT_REL).parent.iterdir())
-                         if (self.root / OUT_REL).parent.is_dir() else [], [])
+                         if (self.root / OUT_REL).parent.is_dir() else [], ['cert-3607'])
 
     def test_docstring_states_redacted_or_refused_and_no_completeness_claim(self):
         doc = ' '.join(load_script_module().sanitize.__doc__.split())
@@ -2931,10 +2956,11 @@ class ProvenanceRefresh7699(RecaptureBase):
     def test_a_sanitization_file_with_two_provenance_lines_is_refused(self):
         self.refused_sanitization(b'note\n' + SEED_PROVENANCE.encode() * 2)
 
-    def test_a_first_run_without_a_bundle_writes_no_sanitization_file(self):
+    def test_a_seeded_bundle_retains_sanitization_on_the_first_capture(self):
         done, _ = self.run_recapture()
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertFalse((self.root / OUT_REL / 'SANITIZATION.md').exists())
+        self.assertTrue((self.root / OUT_REL / 'SANITIZATION.md').exists())
+        self.assertEqual(manifest_problems(self.root / OUT_REL), [])
 
     # ---- the committed bundle in this repository
 
