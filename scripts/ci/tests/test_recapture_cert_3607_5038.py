@@ -37,7 +37,7 @@ SCRIPT_NAME = 'recapture-cert-3607-posture.py'
 SCRATCH = REPO / '.local-runs'
 OUT_REL = Path('docs') / 'compliance' / 'evidence' / 'cert-3607'
 DOCTOR_STDERR_LINE = ('ai-memory doctor --posture: live PRAGMA synchronous not observed on '
-                      'ai-memory.db: database does not exist; refusing to create (read-only)')
+                      'ai-memory.db: database does not exist; refusing to create (read-only): ai-memory.db')
 HEADER_RE = re.compile(
     r'^# posture-legs transcript — recorded exit codes '
     r'\((\d{4}-\d{2}-\d{2}) #3607 re-issue recapture \(22 checks\) @ ([0-9a-f]+)\)$')
@@ -68,13 +68,13 @@ if args[:1] == ['doctor'] and '--posture' not in args:
 fails = 10 if not hard else (0 if sqlcipher else 2)
 print('[PASS] sample ' + env['AI_MEMORY_KEY_DIR'] + ' HOME=' + env['HOME'])
 # like the real doctor: any ai-memory.db in the cwd is "observed" (#7648); without one the real
-# binary writes this line to stderr (src/cli/doctor.rs:873 with the reason string of
-# src/storage/connection.rs:1169) and the check row says "live pragma not observed" (#7697)
+# source-derived diagnostic composes src/cli/doctor.rs with the refusal and path from
+# src/storage/connection.rs; this stub is not a real product capture (#7697, #7814).
 if os.path.exists('ai-memory.db'):
     print('live PRAGMA synchronous agrees')
 else:
     sys.stderr.write('ai-memory doctor --posture: live PRAGMA synchronous not observed on '
-                     'ai-memory.db: database does not exist; refusing to create (read-only)\\n')
+                     'ai-memory.db: database does not exist; refusing to create (read-only): ai-memory.db\\n')
     sys.stderr.flush()
     print('live pragma not observed')
 for i in range(fails):

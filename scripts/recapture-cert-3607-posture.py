@@ -88,10 +88,11 @@ cwd, so a store that keygen makes in its own cwd is never seen by a leg. What ho
 header and the provenance line differ, because the evidence is committed between the runs). Legs 1 and
 2 run with no store in their cwd and no AI_MEMORY_DB, so the real doctor writes
 `ai-memory doctor --posture: live PRAGMA synchronous not observed on ai-memory.db: database
-does not exist; refusing to create (read-only)` to stderr, which the capture merges, and the
+does not exist; refusing to create (read-only): ai-memory.db` to stderr, which the capture merges, and the
 check row says `live pragma not observed`; the committed captures (posture-bare-env.out:75,
 posture-hardened-env.out:68) say `agrees` because the old shared cwd held the store keygen
-made (#7648, #7697). The captures carry no host path. The per-child homes are labelled `<home>` in the evidence and the sandbox is removed at exit.
+made (#7648, #7697). This diagnostic is source-derived; the stub regression is not a real
+product capture (#7814). The captures carry no host path. The per-child homes are labelled `<home>` in the evidence and the sandbox is removed at exit.
 `AI_MEMORY_NO_CONFIG=1` still lets the product write a config.toml under HOME (#7192, a
 product issue, not fixed here); the per-child HOME keeps it inside the sandbox. HOME must be an absolute path that is
 already in normal form (os.path.normpath(HOME) == HOME, so no `.`, `..`, `//` or trailing `/`
