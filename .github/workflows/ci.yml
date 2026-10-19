@@ -238,8 +238,9 @@ jobs:
       # #7160 - scripts/test/ is outside the discovery root above; run the
       # sweep script tests (including the Linux-only O_PATH test, which this
       # ubuntu-latest job is where it executes) and the sweep workflow pin.
-      - name: Target sweep unit tests (#7160)
-        run: python3 -m unittest scripts/test/test_ci_sweep_target.py scripts/test/test_workflow_sweep_7160.py
+      # #7748 - the TMPDIR purge pin test rides the same step (CI-wired).
+      - name: Target sweep and TMPDIR purge unit tests (#7160, #7748)
+        run: python3 -m unittest scripts/test/test_ci_sweep_target.py scripts/test/test_workflow_sweep_7160.py scripts/test/test_workflow_tmpdir_purge_7748.py
       - id: cls
         shell: bash
         env:

@@ -14,24 +14,29 @@ Opt-in: the node operator writes the marker file (``--marker``, default
 ``.ai-memory-ci-purgeable``) at the top level of a runner's TMPDIR once. A
 TMPDIR without the marker is NEVER touched. The tool also refuses (one
 ``::notice::`` line, exit 0, never a red job) when TMPDIR is unset or empty,
-does not exist, is a symlink, has fewer than 3 path components, is ``/``,
-``/tmp``, ``/private/tmp``, ``/var/tmp`` or ``/var/folders`` (or anything under
-them), or is the home directory or any ancestor of it. The check runs on the
-given path and on its parent-resolved form, so ``/tmp`` is caught on macOS where
-it is ``/private/tmp``.
+does not exist, is not canonical (a symlink anywhere in the path, a trailing-slash
+symlink, ``..`` through a link), has fewer than 3 path components, or is, or lies
+under, ``/``, ``/tmp``, ``/private/tmp``, ``/var/tmp`` or ``/var/folders``, or is
+the home directory or any ancestor of it. The path rules run on the canonical
+(realpath) path only, and the forbidden-tree and home checks compare
+``(st_dev, st_ino)`` identities of the path's ancestors (so a case variant on a
+case-insensitive filesystem is caught) next to a plain string comparison.
 
 When permitted it iterates ONLY the top-level entries (os.scandir + lstat),
 skips the marker and entries younger than ``--older-than-minutes`` (default 0:
-none are skipped), unlinks a symlink entry without following it, removes a
-directory entry with shutil.rmtree (which unlinks a symlink met inside the tree
-without entering it) and unlinks a file. The TMPDIR itself and the marker are
-never removed. ``--apply`` removes; the default is a dry run that lists. The
-summary line reports removed / failed / skipped counts and ``bytes`` (the sum of
-the lstat sizes of the regular files freed; directories and symlinks count 0).
+none are skipped; the age is the top-level entry's own lstat mtime, nested
+files are never consulted), unlinks a symlink entry without following it,
+removes a directory entry with shutil.rmtree (which unlinks a symlink met inside
+the tree without entering it) and unlinks a file. The TMPDIR itself and the
+marker are never removed. ``--apply`` removes; the default is a dry run that
+lists. The summary line reports removed / failed / skipped counts and ``bytes``
+(the sum of the lstat sizes of the regular files freed; directories and symlinks
+count 0). Entry names and paths are escaped (``%``, CR, LF) before they are
+printed so a crafted name cannot start a workflow command line.
 
-Exit codes: 0 always for a permitted, refused or partly failed run (cleanup must
-never red a job; a failed removal is reported and counted), 2 for malformed
-arguments. Python 3.9+, standard library only.
+Exit codes: 0 always for a permitted, refused, unlistable or partly failed run
+(cleanup must never red a job; a failed removal is reported and counted), 2 for
+malformed arguments. Python 3.9+, standard library only.
 """
 import argparse
 import os
@@ -46,34 +51,58 @@ FORBIDDEN_TREES = ("/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/var
 MIN_COMPONENTS = 3
 
 
+def _esc(text):
+    """Escape a value for a workflow log line (the GitHub Actions command escapes)."""
+    return str(text).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
 def _under(path, tree):
     return path == tree or path.startswith(tree.rstrip(os.sep) + os.sep)
 
 
-def _forms(path):
-    """The absolute path as given and with its parent resolved (final component untouched)."""
-    absolute = os.path.abspath(path)
-    parent, leaf = os.path.split(absolute)
-    resolved = os.path.join(os.path.realpath(parent), leaf) if leaf else absolute
-    return [absolute] if resolved == absolute else [absolute, resolved]
+def _ancestors(path):
+    """``path`` and every ancestor up to ``/``."""
+    out = []
+    current = path
+    while True:
+        out.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            return out
+        current = parent
+
+
+def _ident(path, follow):
+    try:
+        st = os.stat(path) if follow else os.lstat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
 
 
 def refusal_reason(path, home, forbidden=FORBIDDEN_TREES, marker=DEFAULT_MARKER):
     """Return why ``path`` must not be purged, or None when it may be.
 
-    ``forbidden`` is a parameter so tests exercise the rule without touching real
-    system directories; ``marker=None`` skips the filesystem checks (path rules only).
+    ``path`` is the canonical path (main passes the realpath). ``forbidden`` is a
+    parameter so tests exercise the rule without touching real system
+    directories; ``marker=None`` skips the filesystem checks (path rules only).
     """
-    home_forms = _forms(home) if home else []
-    for form in _forms(path):
-        if len([p for p in form.split(os.sep) if p]) < MIN_COMPONENTS:
-            return "fewer than %d path components: %s" % (MIN_COMPONENTS, form)
-        for tree in forbidden:
-            if _under(form, tree):
-                return "forbidden system path: %s" % form
-        for h in home_forms:
-            if _under(h, form):
-                return "home directory or an ancestor of it: %s" % form
+    path = os.path.abspath(path)
+    if len([p for p in path.split(os.sep) if p]) < MIN_COMPONENTS:
+        return "fewer than %d path components: %s" % (MIN_COMPONENTS, path)
+    for tree in forbidden:
+        if _under(path, tree):
+            return "forbidden system path: %s" % path
+    root = _ident("/", True)
+    forbidden_ids = set(i for i in (_ident(t, True) for t in forbidden) if i and i != root)
+    for anc in _ancestors(path):
+        if _ident(anc, False) in forbidden_ids:
+            return "forbidden system path: %s" % path
+    home_ids = set(i for i in (_ident(h, True) for h in _ancestors(os.path.abspath(home))) if i) if home else set()
+    if _ident(path, False) in home_ids:
+        return "home directory or an ancestor of it: %s" % path
+    if home and _under(os.path.abspath(home), path):
+        return "home directory or an ancestor of it: %s" % path
     if marker is None:
         return None
     try:
@@ -117,8 +146,12 @@ def purge(tmpdir, older_than_minutes, apply, marker, now=None):
     now = time.time() if now is None else now
     cutoff = now - older_than_minutes * 60
     counts = {"removed": 0, "failed": 0, "skipped": 0, "bytes": 0}
-    with os.scandir(tmpdir) as it:
-        names = sorted(entry.name for entry in it)
+    try:
+        with os.scandir(tmpdir) as it:
+            names = sorted(entry.name for entry in it)
+    except OSError as exc:
+        print("::notice::clean_job_tmpdir: cannot list %s: %s" % (_esc(tmpdir), _esc(exc)))
+        return counts
     for name in names:
         if name == marker:
             continue
@@ -133,7 +166,7 @@ def purge(tmpdir, older_than_minutes, apply, marker, now=None):
             continue
         size = _entry_bytes(full, st)
         if not apply:
-            print("would remove %s" % name)
+            print("would remove %s" % _esc(name))
             counts["removed"] += 1
             counts["bytes"] += size
             continue
@@ -151,7 +184,7 @@ def purge(tmpdir, older_than_minutes, apply, marker, now=None):
             errors.append((full, exc))
         if errors or os.path.lexists(full):
             counts["failed"] += 1
-            print("failed %s: %s" % (name, errors[0][1] if errors else "still present"), file=sys.stderr)
+            print("failed %s: %s" % (_esc(name), _esc(errors[0][1] if errors else "still present")), file=sys.stderr)
         else:
             counts["removed"] += 1
             counts["bytes"] += size
@@ -182,15 +215,19 @@ def main(argv=None, environ=None):
     if not tmpdir:
         print("::notice::clean_job_tmpdir: TMPDIR is unset or empty; nothing to purge")
         return 0
-    home = os.path.expanduser("~")
-    reason = refusal_reason(tmpdir, home, FORBIDDEN_TREES, args.marker)
-    if reason:
-        print("::notice::clean_job_tmpdir: refusing, %s" % reason)
+    canonical = os.path.realpath(tmpdir)
+    if os.path.normpath(os.path.abspath(tmpdir.rstrip(os.sep) or os.sep)) != canonical:
+        print("::notice::clean_job_tmpdir: refusing, non-canonical TMPDIR (symlink or `..` through a link): %s" % _esc(tmpdir))
         return 0
-    counts = purge(tmpdir, args.older_than_minutes, args.apply, args.marker)
+    home = os.path.expanduser("~")
+    reason = refusal_reason(canonical, home, FORBIDDEN_TREES, args.marker)
+    if reason:
+        print("::notice::clean_job_tmpdir: refusing, %s" % _esc(reason))
+        return 0
+    counts = purge(canonical, args.older_than_minutes, args.apply, args.marker)
     print("clean_job_tmpdir: mode=%s removed=%d failed=%d skipped=%d bytes=%d dir=%s" % (
         "apply" if args.apply else "dry-run", counts["removed"], counts["failed"],
-        counts["skipped"], counts["bytes"], tmpdir))
+        counts["skipped"], counts["bytes"], _esc(canonical)))
     return 0
 
 

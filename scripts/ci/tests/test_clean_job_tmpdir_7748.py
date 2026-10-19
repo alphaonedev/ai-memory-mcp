@@ -123,6 +123,59 @@ class Refusals(Base):
         self.assertIn("symlink", out)
         self.assertEqual(self.names(), before)
 
+    def test_symlinked_tmpdir_with_trailing_slash_refused_7748(self):
+        self.mark()
+        self.populate()
+        link = self.root / "runner" / "_link"
+        os.symlink(str(self.tmp), str(link))
+        before = self.names()
+        rc, out, _ = run_main(["--apply", "--tmpdir", str(link) + "/"], {})
+        self.assertEqual(rc, 0)
+        self.assertIn("non-canonical", out)
+        self.assertEqual(self.names(), before)
+        self.assertEqual((self.outside / "keep.txt").read_text(encoding="utf-8"), "keep")
+
+    def test_dotdot_through_a_link_refused_7748(self):
+        self.mark()
+        self.populate()
+        (self.root / "a").mkdir()
+        os.symlink(str(self.outside), str(self.root / "a" / "link"))
+        (self.outside / "T").mkdir()
+        (self.outside / "T" / MARKER).write_text("", encoding="utf-8")
+        (self.outside / "T" / "victim").write_text("v", encoding="utf-8")
+        route = str(self.root / "a" / "link" / ".." / "T")
+        rc, out, _ = run_main(["--apply", "--tmpdir", route], {})
+        self.assertEqual(rc, 0)
+        self.assertIn("non-canonical", out)
+        self.assertTrue((self.outside / "T" / "victim").exists())
+
+    def _case_variant(self, real):
+        variant = real.parent / real.name.upper()
+        if not variant.exists() or variant.name == real.name:
+            self.skipTest("case-sensitive filesystem")
+        return variant
+
+    def test_case_variant_of_forbidden_tree_refused_7748(self):
+        sysdir = self.root / "sysdir"
+        (sysdir / "x" / "y").mkdir(parents=True)
+        variant = self._case_variant(sysdir)
+        reason = cjt.refusal_reason(str(variant / "x" / "y"), HOME, forbidden=[str(sysdir)], marker=None)
+        self.assertIn("forbidden", reason or "")
+
+    def test_case_variant_of_home_ancestor_refused_7748(self):
+        homedir = self.root / "homedir"
+        (homedir / "deep" / "user").mkdir(parents=True)
+        variant = self._case_variant(homedir)
+        reason = cjt.refusal_reason(str(variant / "deep"), str(homedir / "deep" / "user"), forbidden=[], marker=None)
+        self.assertIn("home", reason or "")
+
+    def test_trailing_slash_on_real_marked_dir_still_purges_7748(self):
+        self.mark()
+        self.populate()
+        rc, _, _ = run_main(["--apply", "--tmpdir", str(self.tmp) + "/"], {})
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.names(), [MARKER])
+
     def test_bad_arguments_exit_2_7748(self):
         rc, _, _ = run_main(["--older-than-minutes", "nope", "--tmpdir", str(self.tmp)], {})
         self.assertEqual(rc, 2)
@@ -190,6 +243,32 @@ class Purge(Base):
         self.assertTrue((self.tmp / MARKER).exists())
         self.assertFalse((self.tmp / "ok.db").exists())
         self.assertTrue(self.tmp.is_dir())
+
+    def test_unlistable_dir_is_a_notice_not_a_traceback_7748(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        self.mark()
+        os.chmod(str(self.tmp), 0o311)
+        try:
+            rc, out, err = run_main(["--apply", "--tmpdir", str(self.tmp)], {})
+        finally:
+            os.chmod(str(self.tmp), 0o755)
+        self.assertEqual(rc, 0)
+        self.assertIn("cannot list", out)
+        self.assertNotIn("Traceback", out + err)
+
+    def test_entry_name_with_newline_cannot_inject_a_command_7748(self):
+        self.mark()
+        try:
+            (self.tmp / "evil\n::error::boom").write_text("x", encoding="utf-8")
+        except OSError:
+            self.skipTest("filesystem rejects newline names")
+        for flags in ([], ["--apply"]):
+            rc, out, err = run_main(flags + ["--tmpdir", str(self.tmp)], {})
+            self.assertEqual(rc, 0)
+            starts = [ln for ln in (out + err).splitlines() if ln.startswith("::")]
+            self.assertEqual(starts, [], out + err)
+            self.assertNotIn("\n::error::", out + err)
 
     def test_marker_is_never_removed_even_when_old_7748(self):
         self.mark()

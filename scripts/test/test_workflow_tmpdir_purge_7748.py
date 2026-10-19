@@ -124,6 +124,13 @@ class PurgeSteps(unittest.TestCase):
                 self.assertEqual(field(step, "run"), RUN, "%s %s %s" % (wf, job, name))
                 self.assertEqual(field(step, "continue-on-error"), "")
 
+    def test_this_pin_runs_in_ci_7748(self):
+        """The classify job's unittest step lists this file, so a regression fails CI."""
+        me = "scripts/test/test_workflow_tmpdir_purge_7748.py"
+        runs = [ln for ln in read(WORKFLOWS / "ci.yml").splitlines()
+                if ln.strip().startswith("run: python3 -m unittest") and me in ln]
+        self.assertEqual(len(runs), 1, runs)
+
     def test_no_other_workflow_has_an_unpaired_self_hosted_job_7748(self):
         covered = set(wf for wf, _, _ in JOBS)
         for path in sorted(WORKFLOWS.glob("*.yml")):
