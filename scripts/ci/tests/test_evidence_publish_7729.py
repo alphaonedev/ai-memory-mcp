@@ -50,6 +50,7 @@ class Publish7729(ScratchCase):
     def test_stage_swap_after_verify_refuses_both_paths_7729(self):
         for native in (self.bb.rename_noreplace_native, None):
             with self.subTest(native=native is not None), mock.patch.object(self.bb, "rename_noreplace_native", native):
+                self.dest = self.dest.with_name("swap-" + str(native is None))
                 replaced = []
 
                 def swap(stage):
@@ -64,6 +65,7 @@ class Publish7729(ScratchCase):
     def test_matching_forged_manifest_refuses_both_paths_7729(self):
         for native in (self.bb.rename_noreplace_native, None):
             with self.subTest(native=native is not None), mock.patch.object(self.bb, "rename_noreplace_native", native):
+                self.dest = self.dest.with_name("content-" + str(native is None))
                 self.attack(self.forge)
                 self.assertFalse(self.dest.exists())
 
