@@ -463,35 +463,91 @@ fn test_auto_export_does_not_block_reflect_response() {
         agent_id: "ai:test".into(),
         metadata: json!({}),
     };
-    let started = std::time::Instant::now();
-    let outcome = db::reflect_with_hooks(&conn, &input, &hooks).expect("reflect");
-    let reflect_elapsed = started.elapsed();
-
-    // The reflect call must return well before the background thread
-    // finishes its disk write. We use 250ms as a generous CI-safe
-    // ceiling — the actual reflect_with_hooks call should take well
-    // under 50ms; we leave headroom for slow VMs.
-    assert!(
-        reflect_elapsed < std::time::Duration::from_millis(250),
-        "reflect_with_hooks must not block on auto-export (took {reflect_elapsed:?})"
-    );
-
-    // Confirm the disk write does eventually happen so we're sure the
-    // "fast" path wasn't fast because the hook was a no-op.
-    let f = out_dir
-        .join("nonblock-ns")
-        .join(format!("{}.md", outcome.id));
-    let mut found = false;
-    for _ in 0..50 {
-        if f.exists() {
-            found = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    // #2415 structural seam (unix): the hook bundle is wrapped so that,
+    // right before the real hook spawns its worker, the artefact path
+    // `<out_dir>/nonblock-ns/<id>.md` is a FIFO. The worker's write then
+    // blocks in `open` until this test reads the FIFO, so the export is
+    // provably still pending while `reflect_with_hooks` returns; a
+    // synchronous export would never return (caught by the hang budget).
+    // Chosen over a completion-marker poll because the marker can win
+    // the race on a fast host, which makes "absent at return" flaky.
+    let mut hooks = hooks;
+    #[cfg(unix)]
+    {
+        let inner = hooks.post_reflect.take().expect("post_reflect installed");
+        let fifo_dir = out_dir.join("nonblock-ns");
+        hooks.post_reflect = Some(Box::new(move |o| {
+            std::fs::create_dir_all(&fifo_dir).expect("mkdir ns dir");
+            mkfifo(&fifo_dir.join(format!("{}.md", o.id)));
+            inner(o);
+        }));
     }
+
+    // Load-scaled budgets (#2415, multiplier shape from #7345/#3705).
+    let raw = std::env::var(crate::mcp_wait::ENV_TEST_TIMING_BUDGET_MULT).ok();
+    let mult = u32::try_from(crate::mcp_wait::budget_mult_from(raw.as_deref())).unwrap_or(1);
+    let bound = std::time::Duration::from_millis(250).saturating_mul(mult);
+    let hang_budget = std::time::Duration::from_secs(10).saturating_mul(mult);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reflector = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let outcome = db::reflect_with_hooks(&conn, &input, &hooks).expect("reflect");
+        tx.send((outcome.id, started.elapsed())).ok();
+    });
+    let (id, reflect_elapsed) = rx.recv_timeout(hang_budget).unwrap_or_else(|e| {
+        panic!("reflect_with_hooks blocked on auto-export for {hang_budget:?} ({e})")
+    });
+    reflector.join().expect("reflector thread");
+
+    let f = out_dir.join("nonblock-ns").join(format!("{id}.md"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        // Reflect has returned and the worker cannot have completed:
+        // the path is still the FIFO nobody has read yet.
+        let ft = std::fs::symlink_metadata(&f)
+            .expect("fifo present")
+            .file_type();
+        assert!(
+            ft.is_fifo(),
+            "export must still be pending at {}",
+            f.display()
+        );
+        // Release the worker and confirm the export really happens, so
+        // the fast path was not fast because the hook was a no-op.
+        let body = std::fs::read_to_string(&f).expect("read export from fifo");
+        assert!(body.contains(&format!("memory_id: {id}")), "export payload");
+    }
+    #[cfg(not(unix))]
+    {
+        let mut found = false;
+        for _ in 0..50 {
+            if f.exists() {
+                found = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            found,
+            "expected eventual on-disk artefact at {}",
+            f.display()
+        );
+    }
+
+    // Wall-clock bound kept only as a load-scaled budget.
     assert!(
-        found,
-        "expected eventual on-disk artefact at {}",
-        f.display()
+        reflect_elapsed < bound,
+        "reflect_with_hooks must not block on auto-export (took {reflect_elapsed:?}, bound {bound:?}, budget multiplier {mult}x)"
     );
+}
+
+#[cfg(unix)]
+fn mkfifo(path: &Path) {
+    let status = std::process::Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .expect("run mkfifo");
+    assert!(status.success(), "mkfifo {}", path.display());
 }
