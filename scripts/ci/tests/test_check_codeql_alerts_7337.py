@@ -4,8 +4,11 @@
 import copy
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
+import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -92,6 +95,17 @@ class CodeQL7337Tests(unittest.TestCase):
     def test_7337_success_with_alert_title(self):
         self.data["check-runs/100"]["output"]["title"] = "8 new alerts"
         self.refused("No new alerts")
+
+    def test_7337_live_clean_title_and_near_matches(self):
+        output = self.data["check-runs/100"]["output"]
+        output["title"] = "No new alerts in code changed by this pull request"
+        self.run_gate()
+        for title in ("No new alerts ", "No new alerts; 1 existing alert",
+                      "No new alerts in code changed by this pull request: 1 warning",
+                      "no new alerts", "No new alerts\n"):
+            with self.subTest(title=title):
+                output["title"] = title
+                self.refused("No new alerts")
 
     def test_7337_nonzero_or_malformed_annotations(self):
         for value in (1, None, False, "0"):
@@ -216,10 +230,98 @@ class CodeQL7337Tests(unittest.TestCase):
         with self.assertRaisesRegex(self.gate.GateError, "open alerts"):
             self.gate.check_clearance(pages, REPO, PR, HEAD, CHECK)
 
+    def test_7337_pagination_collects_every_page_and_rejects_overflow(self):
+        first = [{"id": index} for index in range(self.gate.PAGE_SIZE)]
+        with patch.object(self.gate, "MAX_PAGES", 2):
+            responses = iter([first, [{"id": 200}]])
+            self.assertEqual(len(self.gate.pages(lambda _: next(responses), "fixture")),
+                             self.gate.PAGE_SIZE + 1)
+            with self.assertRaisesRegex(self.gate.GateError, "pagination exceeds"):
+                self.gate.pages(lambda _: first, "fixture")
+
+    def test_7337_malformed_or_truncated_pages(self):
+        for response in (None, {}, [None], {"check_runs": [], "total_count": 1}):
+            with self.subTest(response=response), self.assertRaises(self.gate.GateError):
+                self.gate.pages(lambda _: response, "fixture",
+                                key="check_runs" if isinstance(response, dict) else None)
+
+    def test_7337_old_aggregate_id_cannot_clear_latest_check(self):
+        checks = copy.deepcopy(self.data["commits/" + HEAD + "/check-runs"])
+        checks["check_runs"][0]["id"] += 1000
+        self.data["commits/" + HEAD + "/check-runs"] = checks
+        self.refused("id mismatch")
+
+    def test_7337_rerun_pending_during_read(self):
+        original = self.api
+        count = 0
+
+        def moving_api(endpoint):
+            nonlocal count
+            result = original(endpoint)
+            if "/check-runs?" in endpoint:
+                count += 1
+                if count > 1:
+                    result["check_runs"][1]["status"] = "queued"
+            return result
+
+        with self.assertRaisesRegex(self.gate.GateError, "completed.*success"):
+            self.gate.check_clearance(moving_api, REPO, PR, HEAD, CHECK)
+
+    def test_7337_wrong_ref_and_unconfigured_analysis(self):
+        for field, value in (("ref", "refs/heads/main"),
+                             ("analysis_key", "other.yml:analyze"),
+                             ("category", "/language:unknown")):
+            with self.subTest(field=field):
+                self.data = fixture()
+                self.data["code-scanning/analyses:merge"][0][field] = value
+                with self.assertRaises(self.gate.GateError):
+                    self.run_gate()
+
+    def test_7337_actual_cli_with_mock_gh(self):
+        scratch = ROOT / ".local-runs" / "codeql-7337-tests"
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory)
+            fake_gh = root / "gh"
+            fake_gh.write_text(
+                "#!" + sys.executable + "\n"
+                "import json, os, sys\n"
+                "from pathlib import Path\n"
+                "from urllib.parse import parse_qs, urlsplit\n"
+                "assert sys.argv[1:4] == ['api', '--method', 'GET']\n"
+                "endpoint = urlsplit(sys.argv[4])\n"
+                "key = endpoint.path.removeprefix('repos/fixture/project/')\n"
+                "if key.startswith('code-scanning/'):\n"
+                "    key += ':' + parse_qs(endpoint.query)['ref'][0].rsplit('/', 1)[1]\n"
+                "data = json.loads(Path(os.environ['CODEQL_FIXTURE']).read_text())\n"
+                "print(json.dumps(data[key]))\n",
+                encoding="utf-8",
+            )
+            fake_gh.chmod(0o700)
+            source = root / "fixture.json"
+            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
+                       CODEQL_FIXTURE=str(source))
+            command = [sys.executable, str(HELPER), str(CHECK), "--repo", REPO,
+                       "--pr", str(PR), "--head", HEAD]
+            for alert, expected in ((False, 0), (True, 1)):
+                with self.subTest(alert=alert):
+                    data = fixture()
+                    if alert:
+                        data["code-scanning/alerts:merge"] = [{"number": 545}]
+                    source.write_text(json.dumps(data), encoding="utf-8")
+                    result = subprocess.run(command, cwd=Path.cwd(), env=env,
+                                            capture_output=True, text=True, timeout=30,
+                                            check=False)
+                    self.assertEqual(result.returncode, expected, result.stderr)
+                    self.assertIn("open alerts" if alert else "CodeQL clear",
+                                  result.stderr if alert else result.stdout)
+
     def test_7337_gh_failure_malformed_json_and_timeout(self):
         client = self.gate.GhApi(Path.cwd())
         failures = [subprocess.CompletedProcess([], 1, "", "HTTP 403 denied"),
-                    subprocess.CompletedProcess([], 0, "not json", "")]
+                    subprocess.CompletedProcess([], 0, "not json", ""),
+                    subprocess.CompletedProcess([], 0, '{"id": 1, "id": 2}', ""),
+                    subprocess.CompletedProcess([], 0, '{"id": NaN}', "")]
         for response in failures:
             with self.subTest(response=response), patch.object(
                     self.gate.subprocess, "run", return_value=response):

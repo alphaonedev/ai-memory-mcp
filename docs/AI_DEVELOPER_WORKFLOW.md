@@ -315,6 +315,50 @@ logs, CORS).
 For documentation-only PRs the ten gates are still required (they should pass without
 changes), but the security checklist may be skipped if no source files changed.
 
+### CodeQL clearance for coder and reviewer lanes (#7337)
+
+Every coder/reviewer prompt naming CodeQL as a gate must require the aggregate
+check output title **`No new alerts` and 0 annotations** (GitHub's exact expanded
+title `No new alerts in code changed by this pull request` is also accepted).
+A workflow or check
+conclusion of `success` alone does not establish clearance. Record the exact head
+and the result of this read-only helper in lane evidence:
+
+```text
+python3 /absolute/worktree/scripts/ci/check_codeql_alerts.py CHECK_RUN_ID --repo OWNER/REPO --pr PR_NUMBER --head FULL_HEAD_SHA
+```
+
+Use the latest aggregate check named `CodeQL` from `github-advanced-security`,
+not a `CodeQL analysis (language)` Actions job. The helper needs Python 3.9+,
+authenticated `gh` with repository checks and code-scanning read access, and an
+explicit working directory when invoked by an orchestrator. Its `gh` subprocesses
+inherit that directory. Exit 0 means a complete clearance snapshot; exit 1 means
+refused (including API failure), and exit 2 means invalid CLI arguments.
+
+The helper requires the current open PR head, a merge commit whose parents match
+the current base and exact head, completed successful jobs, and current merge
+analyses for all four categories in `.github/workflows/codeql-rust.yml`. Each
+analysis must fall within its language job's execution interval. It checks both
+`refs/pull/PR_NUMBER/head` and `refs/pull/PR_NUMBER/merge` for open CodeQL alerts.
+Normal PR runs upload analyses only to the merge ref: an empty head analysis list
+is allowed, but an empty merge list, missing category, stale analysis or pending
+job is not clearance. Any head analyses present must also be current. Historical
+alert instances do not prove that a fixed head was analyzed. Unexpected workflows
+or categories require reconciling the helper's configured coverage; they fail
+closed. Pagination uses explicit page requests, without `gh --slurp`.
+
+The helper rechecks the PR and jobs before returning. GitHub APIs are not an
+atomic snapshot: rerun immediately before landing and after any head/base change
+or CodeQL rerun. This result does not replace independent review or the remaining
+CI gates. External lane-dispatch coder and reviewer templates must carry this
+same requirement; the product documentation does not modify installed templates.
+
+Offline regression command (synthetic API fixtures and a mock `gh` executable):
+
+```text
+python3 /absolute/worktree/scripts/ci/tests/test_check_codeql_alerts_7337.py
+```
+
 ---
 
 ## 8. Pull Request Submission
