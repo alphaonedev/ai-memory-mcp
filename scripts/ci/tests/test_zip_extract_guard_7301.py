@@ -1426,6 +1426,34 @@ class CompilerDepInfo7777R7(StubCargoCase):
                 self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
                 self.assertIn('local target reads a cargo registry or git checkout source', res.stdout)
 
+    def test_non_rs_module_and_include_files_outside_the_target_dir_are_scanned(self):
+        """Review r7 M1: a `#[path = "x.txt"] mod m;` body and an `include!(.../x.inc)` body are compiled,
+        listed in the dep-info and outside the cargo target dir; every listed text file is scanned."""
+        forms = (
+            ('path-module-txt', 'gen/ptxt.txt', '#[path = "../gen/ptxt.txt"]\nmod ptxt;\n'),
+            ('include-inc', 'gen/inc_txt.inc',
+             'include!(concat!(env!("CARGO_MANIFEST_DIR"), "/gen/inc_txt.inc"));\n'),
+        )
+        for name, rel, lib in forms:
+            with self.subTest(form=name):
+                self.write('src/lib.rs', lib)
+                self.write(rel, self.HIDDEN_LOADER)
+                res = self.run_dep(self.lib_spec(['src/lib.rs', rel]))
+                self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+                self.assertIn('violation: ' + rel + ':2', res.stdout)
+
+    def test_binary_non_rs_listed_file_is_skipped_without_error(self):
+        (self.root / 'gen').mkdir()
+        (self.root / 'gen' / 'blob.bin').write_bytes(b'\xff\xfe\x00 not utf8 Tensor::read_npz(p)\n')
+        res = self.run_dep(self.lib_spec(['src/lib.rs', 'gen/blob.bin']))
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertIn('check-zip-extract-unreachable: ok', res.stdout)
+
+    def test_clean_non_rs_listed_file_passes(self):
+        self.write('gen/data.json', '{"a": 1}\n')
+        res = self.run_dep(self.lib_spec(['src/lib.rs', 'gen/data.json']))
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+
     def test_generated_out_dir_file_is_scanned_as_rust(self):
         out_dir = self.root / '.stub-target' / 'debug' / 'build' / 'fixture-h' / 'out'
         out_dir.mkdir(parents=True)
@@ -1548,7 +1576,7 @@ class CompilerDepInfo7777R7(StubCargoCase):
         finally:
             module.subprocess.run = real
         self.assertIn('timed out', str(caught.exception))
-        self.assertEqual(seen, [('check', 3600)])
+        self.assertEqual(seen, [('check', 1500)])
         self.assertGreater(module.CHECK_TIMEOUT_SECS, module.CARGO_TIMEOUT_SECS)
 
     def test_non_json_check_output_line_exits_2(self):

@@ -44,10 +44,11 @@ This guard fails (exit 1) when any of these holds:
            (`<target_dir>/<profile>/deps/<stem>.d`, with a leading `lib`
            dropped from the output file stem; a build script's is
            `<target_dir>/<profile>/build/<pkg>-<hash>/build_script_build-<hash>.d`)
-           and lists every source file rustc read for that target. Each `.rs`
-           file in it, and every UTF-8 file it lists under the cargo target
-           directory (OUT_DIR output), is added to the scan and goes through
-           the same content rules. Makefile escaping is read (`\ ` space,
+           and lists every source file rustc read for that target. Every
+           readable text (UTF-8) file in it, whatever its name or location
+           (a `.rs` file, a `#[path]` module or `include!` body with another
+           extension, OUT_DIR output), is added to the scan and goes through
+           the same content rules; a listed binary file is skipped. Makefile escaping is read (`\ ` space,
            `\:` colon, `\\` backslash, `\#` hash, `$$` dollar); relative
            paths resolve against the repository root (cargo's cwd). A file of
            a local target that sits in a cargo registry or git checkout is a
@@ -1029,7 +1030,7 @@ def check_compiler_files(scan, metadata_text, root, check_stdout):
     `.rs` file that is missing. A local target reading a registry or git checkout source is a violation.
     """
     root = real_of(root)
-    target_dir, members, local = parse_compiler_metadata(metadata_text)
+    _target_dir, members, local = parse_compiler_metadata(metadata_text)
     got = set()
     listed = {}
     for message in artifact_messages(check_stdout):
@@ -1067,12 +1068,11 @@ def check_compiler_files(scan, metadata_text, root, check_stdout):
                 scan.report(violation(shown, 'local target reads a cargo registry or git checkout source directly'))
                 continue
             real = real_of(path)
-            under_target = target_dir is not None and (real == target_dir or target_dir in real.parents)
             if path.suffix == RS_SUFFIX:
                 if not real.is_file():
                     raise ToolError('dep-info lists %s, which does not exist' % path)
                 to_scan.append(path)
-            elif under_target and real.is_file() and is_text_file(real):
+            elif real.is_file() and is_text_file(real):
                 to_scan.append(path)
         scan_files(scan, directory, label, to_scan, builds)
 
@@ -1102,7 +1102,13 @@ def lock_has_zip(root):
 CARGO_TIMEOUT_SECS = 600
 # A cold `cargo check` of the whole workspace measured above 10 minutes on the review host
 # (the tree and metadata calls stay at 600 s), so the compiler step has its own limit.
-CHECK_TIMEOUT_SECS = 3600
+# Budget (review r8 M2): the once leg of ci.yml has `timeout: 110` = 6600 s. Its other steps' observed
+# maxima sum to 4135 s (free-disk 160 + tests 2708 + trim 2 + release smoke 1225 + setup/post 40), and
+# `cargo install cargo-audit` plus `cargo audit` took 438 s, so 6600 - 4135 - 438 = 2027 s remain for this
+# guard. The measured Security audit step (CI run of head 0c4c884da) took 1142 s, so the guard took about
+# 704 s. 1500 s is 2.1x that and fires, with a named error, before the job timeout could; the tree and
+# metadata calls (seconds in practice) fit in the remaining 527 s.
+CHECK_TIMEOUT_SECS = 1500
 
 
 def run_cargo(args, root, timeout=CARGO_TIMEOUT_SECS):
