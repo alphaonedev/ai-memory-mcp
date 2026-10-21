@@ -113,10 +113,12 @@ async fn advance_policy(db: &ai_memory::handlers::Db, n: usize) {
     let signing = kp.private.as_ref().expect("operator private key");
     let lock = db.lock().await;
     for _ in 0..n {
+        // Autocommit connection: the append is committed on return (#7241).
         ai_memory::governance::policy_version::append_policy_advance_no_tx(
             &lock.0, signing, "operator",
         )
-        .expect("append policy advance");
+        .expect("append policy advance")
+        .emit_after_commit();
     }
     let pv =
         ai_memory::governance::policy_version::current_policy_version(&lock.0).expect("read pv");

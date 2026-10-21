@@ -102,6 +102,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # #7160 - size cap for the persistent self-hosted target/debug build state
+  # (40 GiB); scripts/ci-sweep-target.py reads it via the sweep step below.
+  SELF_HOSTED_TARGET_CAP_BYTES: 42949672960
   # #3128 — EXPLICIT, not inherited. `Swatinem/rust-cache` is what used to export
   # CARGO_INCREMENTAL=0, and it is now skipped on the self-hosted fleet (see the
   # rust-cache guards below), so the value must be declared here. Incremental
@@ -404,6 +407,27 @@ jobs:
           AI_MEMORY_BIN_PG="$(pwd)/target/debug/ai-memory" \
             bash scripts/check-bootstrap-cert-gate.sh
 
+      # #7181 — the gate evidence lives in the runner workspace and was lost
+      # with it when LEG B failed. Upload a REDACTED copy only (never the raw
+      # files: scripts/cert_gate_evidence.py masks key material, secrets and
+      # long hex/base64 runs, and skips the LEG A posture outputs, which run
+      # with connection settings in the environment).
+      - name: Redact cert-bootstrap evidence on failure
+        if: failure()
+        run: |
+          python3 scripts/cert_gate_evidence.py \
+            --evidence-dir .local-runs/cert-bootstrap-evidence \
+            --write-redacted .local-runs/cert-bootstrap-evidence-redacted
+
+      - name: Upload cert-bootstrap evidence on failure
+        if: failure()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: cert-bootstrap-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .local-runs/cert-bootstrap-evidence-redacted/
+          if-no-files-found: ignore
+          retention-days: 7
+
       # Drop the per-job ephemeral db (created by "Point at the native
       # enterprise-fed tier" above). always() so a failed/cancelled run still
       # reclaims it. Guarded on CI_FED_DB so it no-ops if the configure step
@@ -436,3 +460,9 @@ jobs:
           else
             echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"
           fi
+
+      # #7160 - cap the persistent self-hosted target/debug (workspace-local,
+      # oldest-mtime first). Last step so it never races a running build.
+      - name: Sweep target/debug to the size cap (self-hosted)
+        if: always() && runner.environment == 'self-hosted'
+        run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}

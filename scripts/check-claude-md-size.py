@@ -1418,11 +1418,12 @@ def run_manifest_cases(fresh) -> bool:
     ok &= raw(root, "F1 a symlinked manifest directory", True, "is a symlink")
     if hasattr(os, "geteuid") and os.geteuid() != 0:
         root = fresh()
+        saved_mode = stat.S_IMODE((root / manifest).stat().st_mode)
         os.chmod(root / manifest, 0)
         try:
             ok &= raw(root, "F1 an unreadable manifest", True, "cannot read")
         finally:
-            os.chmod(root / manifest, 0o644)
+            os.chmod(root / manifest, saved_mode)
     # --update: rewrites the manifest, reports the changed section, refuses a symlinked manifest.
     root = fresh()
     edit(root, "section body x", "section body y")
@@ -1504,11 +1505,12 @@ def run_ref_cases(fresh, arch: str, style: str) -> bool:
             ok &= refs_expect(root, f"R3-F8 {name} {label}", True, want)
         if hasattr(os, "geteuid") and os.geteuid() != 0:
             root = fresh()
+            saved_mode = stat.S_IMODE((root / rel).stat().st_mode)
             os.chmod(root / rel, 0)
             try:
                 ok &= refs_expect(root, f"R3-F8 {name} unreadable (mode 000)", True, "cannot read")
             finally:
-                os.chmod(root / rel, 0o644)
+                os.chmod(root / rel, saved_mode)
     return ok
 
 
@@ -1768,22 +1770,16 @@ COMPARE_WORKFLOW_LINES = (
     "ref: ${{ github.event.pull_request.base.sha }}",
     "fetch-depth: 0",
     "persist-credentials: false",
-    "- name: Fetch the pull request head as git objects (data, never checked out)",
-    "env:",
-    "PR_NUMBER: ${{ github.event.pull_request.number }}",
-    'run: git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"',
     "- name: Comparison self-test (base code)",
     "run: python3 -I scripts/claude-md-rule-compare.py --self-test",
+    "- name: Comparison security regressions (base code)",
+    "run: python3 -I -m unittest discover -s scripts/ci/tests -p test_codeql_6163.py",
     "- name: Compare the head rule sections with the base manifest",
-    "env:",
-    "BASE_SHA: ${{ github.event.pull_request.base.sha }}",
-    "HEAD_SHA: ${{ github.event.pull_request.head.sha }}",
-    'run: python3 -I scripts/claude-md-rule-compare.py --base-root . --repo . --base-sha "$BASE_SHA" '
-    '--head-sha "$HEAD_SHA" --scratch "$RUNNER_TEMP/rule-compare" --summary "$GITHUB_STEP_SUMMARY"',
+    'run: python3 -I scripts/claude-md-rule-compare.py --base-root . --event "$GITHUB_EVENT_PATH" '
+    '--scratch "$RUNNER_TEMP/rule-compare" --summary "$GITHUB_STEP_SUMMARY"',
 )
-# R4 (#4507): the indentation of each meaningful line, so a key moved out of its block (for example
-# `persist-credentials` lifted out of `with:`) is refused although its stripped text is unchanged.
-COMPARE_WORKFLOW_INDENTS = (0, 0, 2, 4, 4, 0, 2, 0, 2, 2, 0, 2, 4, 4, 4, 4, 6, 8, 8, 10, 10, 10, 6, 8, 10, 8, 6, 8, 6, 8, 10, 10, 8)
+# Every indentation level remains independently pinned.
+COMPARE_WORKFLOW_INDENTS = (0, 0, 2, 4, 4, 0, 2, 0, 2, 2, 0, 2, 4, 4, 4, 4, 6, 8, 8, 10, 10, 10, 6, 8, 6, 8, 6, 8)
 COMPARE_DANGER = (
     ("if:", "a condition can skip the comparison"),
     ("paths:", "a paths filter can skip the comparison"),
@@ -2029,7 +2025,7 @@ def run_compare_workflow_cases(repo_root: Path, base: Path) -> bool:
         "differs from the pinned form")
     ok &= case("R3-F3 head repo checked out", good.replace(
         checkout, checkout + "          repository: ${{ github.event.pull_request.head.repo.full_name }}\n", 1), "head.repo")
-    ok &= case("R3-F3 merge ref", good.replace("refs/pull/${PR_NUMBER}/head", "refs/pull/${PR_NUMBER}/merge", 1), "/merge")
+    ok &= case("R3-F3 merge ref", good.replace('--event "$GITHUB_EVENT_PATH"', '--repo refs/pull/1/merge', 1), "/merge")
     ok &= case("R3-F3 write permission", good.replace("  contents: read", "  contents: write", 1), "differs from the pinned form")
     ok &= case("R3-F3 extra permission", good.replace("  contents: read", "  contents: read\n  pull-requests: write", 1),
                "meaningful lines")
@@ -2045,7 +2041,7 @@ def run_compare_workflow_cases(repo_root: Path, base: Path) -> bool:
     ok &= case("R3-F3 swallowed failure", good.replace(
         "--self-test\n", "--self-test\n        continue-on-error: true\n", 1), "continue-on-error")
     ok &= case("R3-F3 secret exposed", good.replace(
-        "          PR_NUMBER:", "          TOKEN: ${{ secrets.GITHUB_TOKEN }}\n          PR_NUMBER:", 1), "secrets.")
+        '        run: python3 -I scripts/claude-md-rule-compare.py --base-root', '        env:\n          TOKEN: ${{ secrets.GITHUB_TOKEN }}\n        run: python3 -I scripts/claude-md-rule-compare.py --base-root', 1), "secrets.")
     ok &= case("R5 edited type removed (a PR edit would not re-run the comparison)", good.replace(
         "types: [opened, synchronize, reopened, edited]", "types: [opened, synchronize, reopened]", 1),
         "differs from the pinned form")

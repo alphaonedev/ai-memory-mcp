@@ -2966,11 +2966,7 @@ pub fn watermark_emission_due(head_sequence: i64) -> bool {
 /// Lock-free throttle via a compare-and-swap on [`LAST_WATERMARKED_SEQ`];
 /// concurrent callers crossing the same interval boundary collapse to a
 /// single emission.
-pub fn maybe_record_audit_watermark(
-    head_sequence: i64,
-    head_canonical_hash: &str,
-    db_id: Option<&str>,
-) {
+pub fn maybe_record_audit_watermark(head_sequence: i64, head_canonical_hash: &str, db_id: &str) {
     if head_sequence <= 0 {
         return;
     }
@@ -2986,7 +2982,133 @@ pub fn maybe_record_audit_watermark(
     {
         return;
     }
-    record_audit_watermark(head_sequence, head_canonical_hash, db_id);
+    record_audit_watermark(head_sequence, head_canonical_hash, Some(db_id));
+}
+
+/// #7241 - one off-table audit watermark that a signed-events append computed
+/// in its transaction, waiting for that transaction to commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingWatermark {
+    head_sequence: i64,
+    head_canonical_hash: String,
+    db_id: String,
+}
+
+/// #7241 - the OFF-TABLE audit anchors a signed-events append produced, held
+/// until the appending transaction COMMITS.
+///
+/// Both append chokepoints (the sqlite `append_signed_event_no_tx` and the
+/// postgres `pg_append_signed_event_with_chain_in_tx`) run inside a caller's
+/// transaction they do not commit. Writing the #1850 forensic watermark (and
+/// claiming its process-wide throttle) or the #1946 head-anchor mirror there
+/// recorded a head that a later ROLLBACK discards: the verifier then saw an
+/// anchor above the surviving head (a false truncation verdict), and the next
+/// append reused the sequence with a different row whose anchor the burned
+/// throttle suppressed (a false head-hash mismatch). The chokepoints therefore
+/// RETURN this value and the committing owner calls
+/// [`emit_after_commit`](Self::emit_after_commit) only once `COMMIT` succeeded,
+/// mirroring the `run_bulk_post_commit` (#2724) post-commit side-effect pattern.
+///
+/// `#[must_use]`: dropping it silently leaves that write path un-anchored (fail
+/// open), so every commit site either emits it after commit, folds it into an
+/// outer pending anchor with [`merge`](Self::merge), or states a rollback with
+/// [`discard`](Self::discard).
+#[must_use = "emit the pending audit anchor after the appending transaction commits (#7241)"]
+#[derive(Debug, Clone, Default)]
+pub struct PendingAuditAnchor {
+    watermark: Option<PendingWatermark>,
+    head_anchors: Vec<crate::models::Checkpoint>,
+}
+
+impl PendingAuditAnchor {
+    /// No anchor is due (the common 63-of-64 append).
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// A watermark for `head_sequence` / `head_canonical_hash` of the database
+    /// identified by `db_id`, to be recorded after commit.
+    pub fn watermark(head_sequence: i64, head_canonical_hash: &str, db_id: &str) -> Self {
+        Self {
+            watermark: Some(PendingWatermark {
+                head_sequence,
+                head_canonical_hash: head_canonical_hash.to_string(),
+                db_id: db_id.to_string(),
+            }),
+            head_anchors: Vec::new(),
+        }
+    }
+
+    /// Add a signed witness checkpoint whose OFF-TABLE head-anchor mirror
+    /// (#1946 B) is written after commit. The checkpoint row itself is
+    /// inserted in the transaction, so a rollback discards both.
+    pub fn with_head_anchor(mut self, cp: crate::models::Checkpoint) -> Self {
+        self.head_anchors.push(cp);
+        self
+    }
+
+    /// Fold the anchor of a LATER append in the same transaction into this one.
+    /// The watermark keeps the highest head (the latest committed state); the
+    /// head-anchor mirrors keep their emission order.
+    pub fn merge(mut self, later: Self) -> Self {
+        self.watermark = match (self.watermark.take(), later.watermark) {
+            (Some(a), Some(b)) => Some(if b.head_sequence >= a.head_sequence {
+                b
+            } else {
+                a
+            }),
+            (a, b) => b.or(a),
+        };
+        self.head_anchors.extend(later.head_anchors);
+        self
+    }
+
+    /// `true` when nothing is pending.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.watermark.is_none() && self.head_anchors.is_empty()
+    }
+
+    /// Head sequence of the pending watermark, if one is pending.
+    #[must_use]
+    pub fn watermark_head(&self) -> Option<i64> {
+        self.watermark.as_ref().map(|w| w.head_sequence)
+    }
+
+    /// Record the pending anchors. Call ONLY after the appending transaction
+    /// committed: the watermark claims the throttle here (never in the
+    /// transaction), so a rolled-back append neither anchors nor burns it.
+    pub fn emit_after_commit(self) {
+        if let Some(w) = self.watermark {
+            maybe_record_audit_watermark(w.head_sequence, &w.head_canonical_hash, &w.db_id);
+        }
+        for cp in &self.head_anchors {
+            append_head_anchor(cp);
+        }
+    }
+
+    /// The appending transaction rolled back (or never committed): the anchors
+    /// describe rows that do not exist, so they are dropped unrecorded.
+    pub fn discard(self) {
+        drop(self);
+    }
+}
+
+/// Set once the "no genesis row, watermark skipped" warning has been logged.
+static WATERMARK_SKIP_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// #7228 - a store with no genesis row has no `db_id`, and a db_id-less
+/// (legacy) watermark is counted against EVERY opener of the shared sink, so
+/// the writers skip the emission instead of anchoring an unattributable head.
+/// Logs a single WARN per process (the skip repeats on every append past the
+/// interval until the genesis row exists).
+pub fn warn_watermark_skipped_no_genesis() {
+    if !WATERMARK_SKIP_WARNED.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            "audit watermark skipped: this database has no genesis row, so the anchor would \
+             carry no db_id (#7228)"
+        );
+    }
 }
 
 /// Forensic directory of the live sink, if [`init`] has run.

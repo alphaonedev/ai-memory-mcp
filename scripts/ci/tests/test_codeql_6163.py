@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+"""Behavioral security regressions for #6163; run with python3 -I -m unittest.
+
+All credential-shaped strings are synthetic canaries, never real credentials.
+The W1/R2 contract is authorized by conductor ruling 274361a0.
+"""
+# Copyright 2026 AlphaOne LLC
+# SPDX-License-Identifier: Apache-2.0
+import argparse
+import contextlib
+import importlib.util
+import io
+import os
+from pathlib import Path
+import shutil
+import stat
+import sys
+import subprocess
+import tempfile
+import unittest.mock
+
+ROOT = Path(__file__).resolve().parents[3]
+SCRATCH = ROOT / '.local-runs' / 'codeql-6163'
+CANARY = 'SYNTHETIC_6163_CONFIDENTIAL_VALUE'
+PRIVATE_MODE = 0o600
+DIRECTORY_MODE = 0o700
+REPOSITORY = 'alphaonedev/ai-memory-mcp'
+DUPLICATE_COUNTS = (32, 64, 128)
+REPORT_TEST_LIMIT = 128 * 1024
+STREAM_TEST_BYTES = 512
+REPORT_BYTE_HOSTILE_COUNT = 900  # fits 1,024 ranges, exceeds 128 KiB of navigation
+HOSTILE_HEADING = '## ' + CANARY + '\nrule\n'
+ISOLATED_FLAGS = argparse.Namespace(**{name: getattr(sys.flags, name) for name in dir(sys.flags)
+                                      if isinstance(getattr(sys.flags, name), int)})
+ISOLATED_FLAGS.isolated = 1
+HISTORICAL_SHAPES = (
+    'password=' + CANARY,
+    'secret: # comment\n  # another comment\n  ' + CANARY,
+    'token: !tag &anchor |2\n  ' + CANARY,
+    'secret: """\n' + CANARY + '\n"""',
+    'https://user:' + CANARY + '/?#@[::1]/',
+    '[link](https://user:' + CANARY + '@host_name).',
+    '-----BEGIN PRIVATE KEY-----\n' + CANARY + '\n-----END PRIVATE KEY-----',
+    '---- BEGIN SSH2 ENCRYPTED PRIVATE KEY ----\n' + CANARY,
+    'AGE-SECRET-KEY-' + CANARY,
+    '{"kty":"oct","k":"' + CANARY + '"}',
+    'password' + (' ' * 9000) + ':\n' + CANARY,
+    'ordinary prose\u2028' + CANARY + '\u2029end',
+)
+
+
+def module(name, relative):
+    """Load only the author checkout's first-party script."""
+    spec = importlib.util.spec_from_file_location(name, ROOT / relative)
+    result = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(result)
+    return result
+
+
+class ComparisonTests(unittest.TestCase):
+    """Exercise actual Git objects and both production output sinks."""
+
+    def setUp(self):
+        SCRATCH.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=SCRATCH)
+        self.addCleanup(self.temp.cleanup)
+        self.work = Path(self.temp.name)
+        self.compare = module('compare_6163', 'scripts/claude-md-rule-compare.py')
+        self.guard = module('guard_6163', 'scripts/check-claude-md-size.py')
+        self.repo = self.work / 'repo'
+        self.base = self.compare.make_repo(self.guard, self.repo)
+        self.base_root = self.work / 'base'
+        shutil.copytree(self.repo, self.base_root, ignore=shutil.ignore_patterns('.git'))
+        shutil.copyfile(ROOT / self.compare.GUARD_REL, self.base_root / self.compare.GUARD_REL)
+
+    def run_head(self, payload, approved=False):
+        """Return verdict and stdout/stderr/summary from the real compare/run path."""
+        path = self.repo / 'CLAUDE.md'
+        path.write_text(path.read_text().replace('The tool limit is 103 tools.', payload, 1))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.guard.update_manifest_quiet(self.repo)
+        message = 'change' + ('\n\nRule-Change-Approved-By: ' + CANARY if approved else '')
+        head = self.compare.commit_all(self.repo, message)
+        args = argparse.Namespace(base_root=str(self.base_root), repo=str(self.repo), base_sha=self.base,
+                                  head_sha=head, scratch=str(self.work / 'data'),
+                                  summary=str(self.work / 'summary'), event=None)
+        compare = self.compare.compare
+
+        def actual(*args):
+            return compare(*args, index_pins=self.guard.fixture_index_pins())
+
+        out, err = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(self.compare, 'compare', side_effect=actual), \
+                unittest.mock.patch.object(self.compare.sys, 'flags', ISOLATED_FLAGS), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            result = self.compare.run(args)
+        return result, out.getvalue() + err.getvalue() + (self.work / 'summary').read_text(), head
+
+    def test_historical_shapes_never_reach_output_but_verdict_and_navigation_do(self):
+        for approved in (False, True):
+            for payload in HISTORICAL_SHAPES:
+                with self.subTest(approved=approved, shape=HISTORICAL_SHAPES.index(payload)):
+                    # Reset only this synthetic file; no branch reset or inherited work is touched.
+                    shutil.copyfile(self.base_root / 'CLAUDE.md', self.repo / 'CLAUDE.md')
+                    (self.work / 'summary').unlink(missing_ok=True)
+                    result, output, head = self.run_head(payload, approved)
+                    self.assertEqual(result, 0 if approved else 1)
+                    self.assertNotIn(CANARY, output)
+                    self.assertIn('RULE TEXT CHANGED', output)
+                    self.assertIn('/blob/' + head + '/CLAUDE.md#L', output)
+                    self.assertIn('section=', output)
+                    self.assertIn('RESULT: PASS' if approved else 'RESULT: FAIL', output)
+
+    def test_healthy_prose_change_retains_verdict_and_navigation(self):
+        result, output, head = self.run_head('The tool limit is changed.')
+        self.assertEqual(result, 1)
+        self.assertIn('RULE TEXT CHANGED', output)
+        self.assertIn('/blob/' + head + '/CLAUDE.md#L', output)
+
+    def reset_report_fixture(self):
+        """Reset only disposable input/output files between real Git comparisons."""
+        shutil.copyfile(self.base_root / 'CLAUDE.md', self.repo / 'CLAUDE.md')
+        (self.work / 'summary').unlink(missing_ok=True)
+
+    def test_duplicate_report_grows_linearly_with_each_range_once(self):
+        previous_size = None
+        for count in DUPLICATE_COUNTS:
+            with self.subTest(count=count):
+                self.reset_report_fixture()
+                result, output, head = self.run_head(HOSTILE_HEADING * count)
+                report = (self.work / 'summary').read_text()
+                self.assertEqual(result, 1)
+                self.assertNotIn(CANARY, output)
+                self.assertEqual(report.count('(duplicated heading):'), 1)
+                locations = [line for line in report.splitlines() if line.startswith('- head:')]
+                self.assertEqual(len(locations), len(set(locations)))
+                self.assertGreaterEqual(len(locations), count)
+                self.assertIn('/blob/' + head + '/CLAUDE.md#L', report)
+                size = len(report.encode('utf-8'))
+                self.assertLessEqual(size, REPORT_TEST_LIMIT)
+                if previous_size is not None:
+                    self.assertLess(size, previous_size * 3)
+                previous_size = size
+
+    def test_duplicate_report_preserves_approved_verdict(self):
+        result, output, head = self.run_head(HOSTILE_HEADING * DUPLICATE_COUNTS[0], approved=True)
+        report = (self.work / 'summary').read_text()
+        self.assertEqual(result, 0)
+        self.assertEqual(report.count('(duplicated heading):'), 1)
+        self.assertIn('approval trailer(s): count=1', report)
+        self.assertIn('/compare/' + self.base + '...' + head, report)
+        self.assertNotIn(CANARY, output)
+
+    def test_section_and_range_budgets_refuse_before_diagnostics(self):
+        text = (self.base_root / 'CLAUDE.md').read_text()
+        ranges = self.compare.section_ranges(self.guard, text)
+        # These totals include base and head; a healthy unchanged pair fits exactly.
+        limits = {'MAX_REPORT_SECTIONS': len(ranges),
+                  'MAX_REPORT_RANGES': 2 * sum(len(items) for items in ranges.values())}
+        for name, limit in limits.items():
+            with self.subTest(budget=name):
+                self.reset_report_fixture()
+                with unittest.mock.patch.object(self.compare, name, limit, create=True):
+                    result, output, _ = self.run_head('The tool limit is 103 tools.')
+                self.assertEqual(result, 0)
+                self.assertIn('no rule section differs', output)
+                self.reset_report_fixture()
+                with unittest.mock.patch.object(self.compare, name, limit, create=True), \
+                        unittest.mock.patch.object(self.compare, 'section_diagnostic',
+                                                  wraps=self.compare.section_diagnostic) as diagnostic:
+                    result, output, _ = self.run_head(HOSTILE_HEADING, approved=True)
+                self.assertEqual(result, 1)
+                self.assertEqual((self.work / 'summary').read_text(), self.compare.FAIL_REPORT)
+                self.assertNotIn(CANARY, output)
+                diagnostic.assert_not_called()
+
+    def test_report_byte_budget_exact_boundary_and_closed_sinks(self):
+        payload = 'The tool limit is changed.'
+        result, _, _ = self.run_head(payload)
+        self.assertEqual(result, 1)
+        measured = len((self.work / 'summary').read_bytes())
+        for budget, closed in ((measured, False), (measured - 1, True)):
+            with self.subTest(budget=budget):
+                self.reset_report_fixture()
+                with unittest.mock.patch.object(self.compare, 'MAX_REPORT_BYTES', budget, create=True):
+                    result, output, _ = self.run_head(payload)
+                self.assertEqual(result, 1)
+                report = (self.work / 'summary').read_text()
+                if closed:
+                    self.assertEqual(report, self.compare.FAIL_REPORT)
+                    self.assertEqual(output, self.compare.FAIL_REPORT + '\n' + self.compare.FAIL_REPORT)
+                else:
+                    self.assertEqual(len(report.encode('utf-8')), measured)
+                    self.assertIn('RULE TEXT CHANGED', report)
+
+    def test_default_report_budgets_close_small_hostile_inputs(self):
+        payloads = (
+            ''.join('## section ' + str(index) + '\nrule\n'
+                    for index in range(self.compare.MAX_REPORT_SECTIONS)),
+            HOSTILE_HEADING * self.compare.MAX_REPORT_RANGES,
+            HOSTILE_HEADING * REPORT_BYTE_HOSTILE_COUNT,
+        )
+        for payload in payloads:
+            with self.subTest(input_bytes=len(payload.encode('utf-8'))):
+                self.reset_report_fixture()
+                result, output, _ = self.run_head(payload, approved=True)
+                self.assertEqual(result, 1)
+                self.assertEqual((self.work / 'summary').read_text(), self.compare.FAIL_REPORT)
+                self.assertNotIn(CANARY, output)
+
+    def test_report_builder_checks_utf8_bytes_before_append(self):
+        line = '\N{SNOWMAN}'
+        budget = len((line + '\n').encode('utf-8'))
+        with unittest.mock.patch.object(self.compare, 'MAX_REPORT_BYTES', budget):
+            report = self.compare.BoundedReport()
+            report.append(line)
+            with self.assertRaises(RuntimeError):
+                report.append('')
+            self.assertEqual(report.render(), line + '\n')
+            self.assertEqual(report.byte_count, budget)
+        # Streaming must stop at refusal, without formatting the remaining ranges.
+        with unittest.mock.patch.object(self.compare, 'MAX_REPORT_BYTES', STREAM_TEST_BYTES), \
+                unittest.mock.patch.object(self.compare, 'review_location',
+                                          wraps=self.compare.review_location) as location:
+            report = self.compare.BoundedReport()
+            with self.assertRaises(RuntimeError):
+                report.extend(self.compare.section_diagnostic(
+                    'RULE TEXT CHANGED', 'added', 1, [], [(1, 1)] * DUPLICATE_COUNTS[-1],
+                    self.base, self.base))
+            self.assertLess(location.call_count, DUPLICATE_COUNTS[0])
+
+    def test_head_heading_and_guard_error_do_not_escape(self):
+        result, output, _ = self.run_head('## ' + CANARY + '\nrule\n## ' + CANARY)
+        self.assertEqual(result, 1)
+        self.assertNotIn(CANARY, output)
+        self.assertIn('BASE GUARD REFUSES THE HEAD', output)
+
+    def test_exception_paths_do_not_echo_untrusted_text(self):
+        for exception in (OSError(CANARY), RuntimeError(CANARY), ValueError(CANARY), SyntaxError(CANARY)):
+            with self.subTest(kind=type(exception).__name__):
+                args = argparse.Namespace(scratch=str(self.work), base_root=str(self.base_root),
+                                          repo=str(self.repo), base_sha=self.base, head_sha=self.base,
+                                          summary=str(self.work / 'summary-error'), event=None)
+                out, err = io.StringIO(), io.StringIO()
+                with unittest.mock.patch.object(self.compare, 'compare', side_effect=exception), \
+                        unittest.mock.patch.object(self.compare.sys, 'flags', ISOLATED_FLAGS), \
+                        contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    self.assertEqual(self.compare.run(args), 1)
+                self.assertNotIn(CANARY, out.getvalue() + err.getvalue() + Path(args.summary).read_text())
+
+    def test_git_environment_cannot_replace_objects(self):
+        changed = self.repo / 'CLAUDE.md'
+        changed.write_text('replacement content')
+        head = self.compare.commit_all(self.repo, 'replacement')
+        subprocess.run(['git', '-C', str(self.repo), 'replace', self.base, head], check=True)
+        with self.assertRaises(RuntimeError):
+            self.compare.compare(self.base_root, self.repo, self.base, self.base,
+                                 self.work / 'data', self.guard.fixture_index_pins())
+
+    def event(self, head=None):
+        """A trusted event binds a PR number, repository and immutable endpoints."""
+        return {'number': 6163, 'repository': {'full_name': REPOSITORY}, 'pull_request': {
+            'number': 6163, 'base': {'sha': self.base, 'repo': {'full_name': REPOSITORY}},
+            'head': {'sha': head or self.base}}}
+
+    def test_w1_private_bare_store_cleanup_and_immutable_binding(self):
+        # Use Git's local transport only inside the test double; production accepts one HTTPS remote.
+        calls = []
+
+        def acquire(repo, base, head, number):
+            calls.append((repo, base, head, number))
+            subprocess.run(['git', '-C', str(repo), 'fetch', '--quiet', str(self.repo),
+                            base, head], check=True)
+
+        with unittest.mock.patch.object(self.compare, 'fetch_objects', side_effect=acquire):
+            with self.compare.isolated_objects(self.repo, self.event(), self.work / 'outside') as objects:
+                self.assertEqual(self.compare.git(objects, 'rev-parse', '--is-bare-repository').strip(), b'true')
+                self.assertNotIn(self.repo, objects.resolve().parents)
+                self.assertEqual(stat.S_IMODE(objects.parent.stat().st_mode), DIRECTORY_MODE)
+                self.assertEqual(self.compare.git(objects, 'rev-parse', self.base).decode().strip(), self.base)
+                self.assertFalse((objects / 'CLAUDE.md').exists())
+            self.assertFalse(objects.exists())
+        self.assertEqual(len(calls), 1)
+
+    def test_w1_rejects_mismatch_and_inside_checkout_before_acquisition(self):
+        for event, scratch in ((self.event('a' * 40), self.repo / 'nested'),
+                               (dict(self.event(), number=True), self.work / 'outside')):
+            with unittest.mock.patch.object(self.compare, 'fetch_objects') as fetch:
+                with self.assertRaises(RuntimeError):
+                    with self.compare.isolated_objects(self.repo, event, scratch):
+                        self.fail('invalid boundary accepted')
+                fetch.assert_not_called()
+
+    def test_w1_missing_objects_fail_closed_and_clean_up(self):
+        outside = self.work / 'outside'
+        with unittest.mock.patch.object(self.compare, 'fetch_objects'):
+            with self.assertRaises(RuntimeError):
+                with self.compare.isolated_objects(self.repo, self.event(), outside):
+                    self.fail('missing objects accepted')
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_git_reads_ignore_hostile_environment_and_global_config(self):
+        """Healthy Git objects remain readable under hostile ambient configuration."""
+        hostile = self.work / 'hostile.gitconfig'
+        hostile.write_text('[include]\npath = /nonexistent/6163\n[core]\nbare = true\n')
+        overrides = {'GIT_CONFIG_GLOBAL': str(hostile), 'GIT_DIR': '/nonexistent/6163',
+                     'GIT_OBJECT_DIRECTORY': '/nonexistent/6163', 'GIT_CONFIG_COUNT': '1',
+                     'GIT_CONFIG_KEY_0': 'core.bare', 'GIT_CONFIG_VALUE_0': 'true',
+                     'GIT_ALTERNATE_OBJECT_DIRECTORIES': '/nonexistent/6163'}
+        with unittest.mock.patch.dict(os.environ, overrides):
+            self.assertEqual(self.compare.git(self.repo, 'rev-parse', 'HEAD').strip(), self.base.encode())
+
+    def test_selftest_git_setup_ignores_ambient_repository_override(self):
+        """The workflow self-test uses the same isolated Git environment as acquisition."""
+        with unittest.mock.patch.dict(os.environ, {'GIT_DIR': '/nonexistent/6163'}):
+            commit = self.compare.make_repo(self.guard, self.work / 'hostile-selftest')
+        self.assertRegex(commit, r'^[0-9a-f]{40}$')
+
+    def test_shallow_and_alternate_history_are_refused(self):
+        """No approval is accepted from a truncated or substituted comparison range."""
+        for relative, payload in (('shallow', self.base + '\n'), ('objects/info/alternates', '/missing\n'),
+                                  ('info/grafts', self.base + '\n')):
+            with self.subTest(kind=relative):
+                path = self.repo / '.git' / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(payload)
+                try:
+                    with self.assertRaises(RuntimeError):
+                        self.compare.compare(self.base_root, self.repo, self.base, self.base,
+                                             self.work / 'data', self.guard.fixture_index_pins())
+                finally:
+                    path.unlink()
+
+    def test_event_endpoints_are_exact_commits_and_repositories(self):
+        """Malformed, stale and cross-repository events never start network acquisition."""
+        events = []
+        for field, value in (('sha', 'HEAD'), ('sha', self.base + '\n'), ('sha', 'f' * 40)):
+            event = self.event()
+            event['pull_request']['base'][field] = value
+            events.append(event)
+        event = self.event()
+        event['repository']['full_name'] = 'outside/repository'
+        events.append(event)
+        for event in events:
+            with unittest.mock.patch.object(self.compare, 'fetch_objects') as fetch:
+                with self.assertRaises(RuntimeError):
+                    with self.compare.isolated_objects(self.repo, event, self.work / 'outside'):
+                        self.fail('invalid event accepted')
+                fetch.assert_not_called()
+
+    def test_fetch_binds_pr_ref_to_event_sha_and_never_uses_checkout(self):
+        """A moved PR ref is refused even when fetching succeeds."""
+        for observed, accepted in ((self.base, True), ('f' * 40, False)):
+            with self.subTest(accepted=accepted):
+                calls = []
+
+                def git(repo, *args, **kwargs):
+                    calls.append((repo, args, kwargs))
+                    return (observed + '\n').encode() if args[0] == 'rev-parse' else b''
+
+                with unittest.mock.patch.object(self.compare, 'git', side_effect=git):
+                    if accepted:
+                        self.compare.fetch_objects(self.work, self.base, self.base, 6163)
+                    else:
+                        with self.assertRaises(RuntimeError):
+                            self.compare.fetch_objects(self.work, self.base, self.base, 6163)
+                fetch = calls[0]
+                self.assertEqual(fetch[0], self.work)
+                self.assertEqual(fetch[1][0], 'fetch')
+                self.assertIn('https://github.com/alphaonedev/ai-memory-mcp.git', fetch[1])
+                self.assertIn('refs/pull/6163/head:refs/compare/head', fetch[1])
+                self.assertNotIn('--depth', fetch[1])
+
+    def test_structured_link_rejects_untrusted_paths_and_ranges(self):
+        """Healthy source links work; headings and negative or huge ranges cannot form metadata."""
+        self.assertIn('/CLAUDE.md#L1-L2', self.compare.review_location(self.base, 'CLAUDE.md', 1, 2))
+        for path, start, end in ((CANARY, 1, 2), ('CLAUDE.md', -1, 2), ('CLAUDE.md', 1, 10**10),
+                                 ('CLAUDE.md', True, 2)):
+            with self.assertRaises(RuntimeError):
+                self.compare.review_location(self.base, path, start, end)
+
+    def test_argument_error_never_echoes_unknown_argument(self):
+        """The CLI's earliest error path follows the same closed diagnostic contract."""
+        result = subprocess.run([sys.executable, '-I', str(ROOT / 'scripts/claude-md-rule-compare.py'),
+                                 '--' + CANARY], capture_output=True, text=True, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn(CANARY, result.stdout + result.stderr)
+
+    def test_selftest_failure_sink_with_healthy_control(self):
+        """Force the real case reporter down both branches; stop after its first diagnostic."""
+        for report, expected in ((CANARY, 'FAIL:'), ('RULE TEXT CHANGED', 'PASS:')):
+            out, err = io.StringIO(), io.StringIO()
+            with unittest.mock.patch.object(self.compare, 'compare', side_effect=[(report, True), SystemExit(1)]), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                with self.assertRaises(SystemExit):
+                    self.compare.self_test()
+            output = out.getvalue() + err.getvalue()
+            self.assertIn(expected, output)
+            self.assertNotIn(CANARY, output)
+
+
+class ResourceTests(unittest.TestCase):
+    """Close every descriptor and restore exact fixture permissions."""
+
+    def setUp(self):
+        SCRATCH.mkdir(parents=True, exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=SCRATCH)
+        self.addCleanup(self.temp.cleanup)
+        self.work = Path(self.temp.name)
+
+    def test_deep_scratch_close_failure_does_not_leak_other_descriptors(self):
+        cert = module('cert_6163', 'scripts/check_cert_expiry.py')
+        opened, closed = [], []
+        real_open, real_close = os.open, os.close
+
+        def record_open(*args, **kwargs):
+            fd = real_open(*args, **kwargs)
+            opened.append(fd)
+            return fd
+
+        def fail_first_close(fd):
+            closed.append(fd)
+            real_close(fd)
+            if len(closed) == 1:
+                raise OSError('synthetic close failure')
+
+        try:
+            with unittest.mock.patch.object(cert.os, 'open', side_effect=record_open), \
+                    unittest.mock.patch.object(cert.os, 'close', side_effect=fail_first_close):
+                with self.assertRaises(OSError):
+                    cert.deep_scratch(self.work, len(os.fsencode(self.work)) + 500)
+            self.assertGreater(len(opened), 1)
+            self.assertEqual(set(closed), set(opened))
+        finally:
+            for fd in set(opened) - set(closed):
+                real_close(fd)
+
+    def test_deep_scratch_healthy_control(self):
+        cert = module('cert_control_6163', 'scripts/check_cert_expiry.py')
+        target = len(os.fsencode(self.work)) + 500
+        base, deepest = cert.deep_scratch(self.work, target)
+        self.assertEqual(len(os.fsencode(deepest)), target)
+        self.assertTrue(deepest.is_dir())
+        shutil.rmtree(base)
+
+    def test_permission_probes_restore_private_modes(self):
+        guard = module('guard_modes_6163', 'scripts/check-claude-md-size.py')
+        guard.FIXTURE_PINS[0] = guard.fixture_index_pins()
+        roots = []
+
+        def fresh():
+            root = self.work / str(len(roots))
+            root.mkdir()
+            guard.build_fixture(root)
+            for relative in (guard.MANIFEST_PATH, 'docs/reference/ARCHITECTURE_REFERENCE.md',
+                             'docs/reference/CODE_STYLE.md'):
+                (root / relative).chmod(PRIVATE_MODE)
+            roots.append(root)
+            return root
+
+        changed = []
+        real_chmod = os.chmod
+
+        def record_chmod(path, mode, **kwargs):
+            changed.append((Path(path), mode))
+            real_chmod(path, mode, **kwargs)
+
+        with unittest.mock.patch.object(guard.os, 'chmod', side_effect=record_chmod), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(guard.run_manifest_cases(fresh))
+            self.assertTrue(guard.run_ref_cases(fresh, 'docs/reference/ARCHITECTURE_REFERENCE.md',
+                                               'docs/reference/CODE_STYLE.md'))
+        restored = [mode for _, mode in changed if mode != 0]
+        self.assertGreaterEqual(len(restored), 3)
+        self.assertEqual(set(restored), {PRIVATE_MODE})
+
+
+if __name__ == '__main__':
+    unittest.main()
