@@ -471,11 +471,13 @@ def directory_handle(parent_fd, name):
 def open_held(stack, name, flags, **kw):
     """os.open whose descriptor is registered on `stack` at once, so one failing closer cannot skip the others (#7871)."""
     fd = os.open(name, flags, **kw)
+    registered = False
     try:
         stack.callback(os.close, fd)
-    except BaseException:
-        os.close(fd)
-        raise
+        registered = True
+    finally:
+        if not registered:
+            os.close(fd)
     return fd
 
 
