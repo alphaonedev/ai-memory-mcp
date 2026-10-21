@@ -407,9 +407,9 @@ class Run:
             # #7731: reapply the shared policy at use and bind mkdir/cleanup to the checked root.
             for path in (self.targets, self.tmpdir):
                 if path not in roots:
-                    root_fd = self.guarded_scratch(path)
-                    opened_roots.append((path, root_fd))
-                    roots[path] = root_fd
+                    root_path, root_fd = self.guarded_root(path)
+                    opened_roots.append((root_path, root_fd))
+                    roots[root_path] = root_fd
             scratch_fd = roots[self.tmpdir]
             launcher_name, launcher_fd = self.private_directory(scratch_fd, "python-")
             private.append((launcher_name, launcher_fd))
@@ -453,6 +453,10 @@ class Run:
             finally:
                 for _path, root_fd in opened_roots:
                     os.close(root_fd)
+
+    def guarded_root(self, path):
+        """(path, descriptor) of a guarded scratch root: the pair form run() records and closes in its finally."""
+        return path, self.guarded_scratch(path)
 
     def guarded_scratch(self, path):
         """Open a configured root through the shared policy, refusing removal or replacement since setup."""
