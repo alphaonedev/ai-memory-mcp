@@ -45,7 +45,7 @@ Encoding: a UTF-8 BOM is stripped; a UTF-16 or UTF-32 BOM exits 2 naming the
 file (it cannot be decoded as text, fail closed); a file with NUL bytes is
 scanned both as is and with the NULs removed.
 
-Out of scope, by design: a static gate cannot follow computed names.  That is
+Not scanned, by design: a static gate cannot follow computed names.  That is
 env indirection (``TARGET=NAME`` then ``psql -d "$TARGET"``),
 string concatenation (``concat!``, string building), an ``_`` escape or a split
 of the name, and a percent-encoded URL.  The runtime refusals (tests/common/lane_db.rs,
@@ -56,13 +56,8 @@ Allowlist lines are ``path:line  # citation``: line-pinned only, a non-empty
 citation is required, a duplicate pin or a whole-file entry exits 2.  The path
 is normalised (``./x`` is ``x``); an absolute path or a ``..`` segment exits 2.  It is a
 ratchet: an entry that no longer matches a hit exits 2, so the baseline may
-only shrink.  The one bounded exception is a citation carrying
-``[landing-order #7088]`` on the seven pins of scripts/ci/tests/test_pg_isolated_binary.py
-(LANDING_ORDER_COUPLED): those lines are added by PR #7088, so such a pin is
-excused only while its line does not exist yet (file absent or pin past EOF).
-Any other PR number or path exits 2; a coupled pin whose line exists but is not
-a hit is stale; a coupled pin that matches a hit prints a ``::warning`` asking
-for the marker's removal.  Remove the constants and markers once #7088 lands.
+only shrink.  There is no landing-order exception: a citation carrying ``[landing-order`` exits 2
+(#7884), so a pin whose line does not exist yet is stale like any other.
 Exit: 0 clean, 1 violations, 2 usage error, bad allowlist or stale entry.
 """
 import argparse
@@ -71,7 +66,7 @@ import os
 import re
 import sys
 from pathlib import Path, PurePosixPath
-from typing import Callable, Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 DB = 'ai_memory' + '_test'
 NAME_CHAR = r'[A-Za-z0-9_]'
@@ -98,13 +93,7 @@ TOKEN_STRIP = '"\'`;,()<>'
 KEY_LOWER = {'pgdatabase', 'dbname', 'db', 'database', 'db_name', 'database_name'}
 KEY_LOWER_SUFFIXES = ('_db', '_dbname', '_db_name', '_database', '_database_name')
 KEY_UPPER_PARTS =('DB', 'DATABASE')
-COUPLED_MARK = re.compile(r'\[landing-order #(\d+)\]')
-# The only PR whose pinned lines may be absent until it lands, the only path it may mark and the exact
-# lines the marker may bind (#7164, #7172).  When #7088 moves a line, move it here with its pin.
-# Remove this constant and the seven markers in the change that lands after #7088.
-LANDING_ORDER_COUPLED = {
-    ('scripts/ci/tests/test_pg_isolated_binary.py', 7088): frozenset({717, 728, 735, 742, 782, 783, 785}),
-}  # type: Dict[Tuple[str, int], FrozenSet[int]]
+RETIRED_MARK = '[landing-order'  # retired coupled-pin marker; a citation carrying it exits 2 (#7884)
 POSITIONAL_COMMANDS = {'psql', 'createdb', 'dropdb', 'pg_dump', 'pg_restore'}
 
 Hit = Tuple[str, int, str]
@@ -326,10 +315,9 @@ class AllowlistError(Exception):
     """A malformed allowlist line (exit 2)."""
 
 
-def load_allowlist(path: Path) -> Tuple[List[Tuple[str, int]], Set[Tuple[str, int]]]:
-    """Return (pins, coupled pins).  A coupled pin names a line another open PR adds."""
+def load_allowlist(path: Path) -> List[Tuple[str, int]]:
+    """Return the line-pinned entries."""
     entries = []  # type: List[Tuple[str, int]]
-    coupled = set()  # type: Set[Tuple[str, int]]
     seen = set()  # type: Set[Tuple[str, int]]
     for number, raw in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
         body, hash_sep, citation = raw.partition('#')
@@ -340,6 +328,8 @@ def load_allowlist(path: Path) -> Tuple[List[Tuple[str, int]], Set[Tuple[str, in
         name, sep, tail = body.rpartition(':')
         if not sep or not name or not tail.isdigit() or int(tail) < 1:
             raise AllowlistError('%s: expected path:line, whole-file entries are not allowed' % where)
+        if RETIRED_MARK in citation:
+            raise AllowlistError('%s: the landing-order marker is retired, pin the plain line' % where)
         if not hash_sep or not citation.strip():
             raise AllowlistError('%s: a non-empty # citation is required' % where)
         pure = PurePosixPath(name)
@@ -351,30 +341,7 @@ def load_allowlist(path: Path) -> Tuple[List[Tuple[str, int]], Set[Tuple[str, in
             raise AllowlistError('%s: duplicate pin' % where)
         seen.add(pin)
         entries.append(pin)
-        marker = COUPLED_MARK.search(citation)
-        if marker:
-            pr_number = int(marker.group(1))
-            bound = LANDING_ORDER_COUPLED.get((name, pr_number))
-            if bound is None:
-                raise AllowlistError('%s: unknown landing-order marker (only %s may carry it)'
-                                     % (where, ', '.join('%s #%d' % pair for pair in sorted(LANDING_ORDER_COUPLED))))
-            if int(tail) not in bound:
-                raise AllowlistError('%s: landing-order marker does not apply to line %d (bound lines: %s)'
-                                     % (where, int(tail), ', '.join(str(n) for n in sorted(bound))))
-            coupled.add(pin)
-    return entries, coupled
-
-
-def line_exists(path: Path, number: int) -> bool:
-    """True when ``path`` is a readable file with at least ``number`` lines (an unreadable file counts as existing)."""
-    try:
-        text = path.read_bytes().decode('utf-8', errors='surrogateescape')
-    except FileNotFoundError:
-        return False
-    except OSError:
-        return True
-    count = text.count('\n') + (0 if text.endswith('\n') or not text else 1)
-    return number <= count
+    return entries
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -390,7 +357,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print('usage: --root %s is not a directory' % root, file=sys.stderr)
         return 2
     try:
-        entries, coupled = load_allowlist(allow_path)
+        entries = load_allowlist(allow_path)
     except (OSError, UnicodeDecodeError) as exc:
         print('usage: cannot read allowlist %s: %s' % (allow_path, exc), file=sys.stderr)
         return 2
@@ -415,11 +382,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     for name, line in entries:
         if args.paths and (root / name).is_file() and name not in scanned:  # narrowed scan only (#7173)
             continue
-        if (name, line) in hit_lines:
-            if (name, line) in coupled:
-                print('::warning file=%s,line=%d::coupled pin now matches a hit; remove its [landing-order] marker'
-                      % (name, line))
-        elif (name, line) not in coupled or line_exists(root / name, line):
+        if (name, line) not in hit_lines:
             stale.append('%s:%d' % (name, line))
     violations = [h for h in hits if (h[0], h[1]) not in pinned]
     for rel, number, rule in violations:

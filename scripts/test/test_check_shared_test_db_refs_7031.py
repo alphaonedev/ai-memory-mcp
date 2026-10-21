@@ -19,8 +19,7 @@ CONTINUATION_SCAN_BUDGET_SECS = 2.0  # one MiB of continuation lines must scan t
 EXIT_CLEAN, EXIT_VIOLATION, EXIT_USAGE = 0, 1, 2
 COUPLED_PATH = 'scripts/ci/tests/test_pg_isolated_binary.py'
 COUPLED_MARK = '[landing-order #7088]'
-LANDING_ORDER_MARKERS_MAX = 7  # the set of coupled pins may only shrink (#7164)
-COUPLED_LINES = (717, 728, 735, 742, 782, 783, 785)  # the only lines the marker may bind (#7172)
+LANDING_ORDER_MARKERS_MAX = 0  # the landing-order exception is retired: no marked pin may exist (#7884)
 
 
 def gate(root: Path, *extra: str, timeout: Optional[float] = None) -> 'subprocess.CompletedProcess[str]':
@@ -105,11 +104,13 @@ class SharedTestDbRefs7031(unittest.TestCase):
         target.write_text('psql -d %s\n' % NAME, encoding='utf-8')
         target.chmod(0)
         self.addCleanup(target.chmod, 0o644)
+        modes_ignored = True
         try:
             target.read_bytes()
-            self.skipTest('running as a user that ignores file modes')
         except OSError:
-            pass
+            modes_ignored = False  # the chmod-0 file is unreadable, which is what the probe needs
+        if modes_ignored:
+            self.skipTest('running as a user that ignores file modes')
         done = gate(self.dir, '--paths', 'locked.txt', '--allowlist', str(self.dir / 'allow.txt'))
         self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
         self.assertIn('::error file=locked.txt', done.stdout)
@@ -321,58 +322,31 @@ class SharedTestDbRefs7031(unittest.TestCase):
         done = self.mutant('clean')
         self.assertEqual(done.returncode, EXIT_USAGE, done.stdout + done.stderr)
 
-    def test_7031_r3_landing_order_positive_cases(self) -> None:
-        # the marker past EOF on the listed path is excused (the coupled PR has not landed)
-        done = self.run_coupled('%s:717  # added by another PR %s\n' % (COUPLED_PATH, COUPLED_MARK))
-        self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout + done.stderr)
-        # the listed file absent is excused too
-        (self.dir / COUPLED_PATH).unlink()
-        done = self.mutant('clean')
-        self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout + done.stderr)
-
-    def test_7031_r3_landing_order_m1_unknown_pr_or_path_exits_2(self) -> None:
-        for allow in ['zz_never.sh:3  # x [landing-order #1]\n',
+    def test_7884_landing_order_marker_is_retired_and_exits_2(self) -> None:
+        for allow in ['%s:717  # added by another PR %s\n' % (COUPLED_PATH, COUPLED_MARK),
+                      'zz_never.sh:3  # x [landing-order #1]\n',
                       '%s:3  # x [landing-order #1]\n' % COUPLED_PATH,
                       'zz_never.sh:3  # x %s\n' % COUPLED_MARK]:
             done = self.run_coupled(allow)
             self.assertEqual(done.returncode, EXIT_USAGE, allow + done.stdout + done.stderr)
             self.assertIn('allowlist line 1', done.stderr)
+            self.assertIn('retired', done.stderr)
 
-    def test_7031_r3_landing_order_m2_existing_non_hit_line_is_stale(self) -> None:
-        done = self.run_coupled('%s:717  # x %s\n' % (COUPLED_PATH, COUPLED_MARK), lines=800)
-        self.assertEqual(done.returncode, EXIT_USAGE, done.stdout + done.stderr)
-        self.assertIn('stale allowlist entry', done.stderr)
-
-    def test_7031_r3_landing_order_m3_marker_cannot_preauthorise_a_hit(self) -> None:
+    def test_7884_marker_cannot_preauthorise_a_hit(self) -> None:
         (self.dir / 'zz_pre.sh').write_text('POSTGRES_DB=%s\n' % NAME, encoding='utf-8')
         self.allow('zz_pre.sh:1  # x %s\n' % COUPLED_MARK)
         done = gate(self.dir, '--paths', 'zz_pre.sh', '--allowlist', str(self.dir / 'allow.txt'))
         self.assertEqual(done.returncode, EXIT_USAGE, done.stdout + done.stderr)
 
-    def test_7031_r3_landing_order_landed_pin_asks_for_marker_removal(self) -> None:
-        pins = ''.join('%s:%d  # x %s\n' % (COUPLED_PATH, n, COUPLED_MARK) for n in COUPLED_LINES[:3])
-        self.coupled_file(800)
-        rows = (self.dir / COUPLED_PATH).read_text(encoding='utf-8').splitlines()
-        for n in COUPLED_LINES[:3]:
-            rows[n - 1] = 'POSTGRES_DB=%s' % NAME
-        (self.dir / COUPLED_PATH).write_text('\n'.join(rows) + '\n', encoding='utf-8')
-        self.allow(pins)
-        done = gate(self.dir, '--paths', COUPLED_PATH, '--allowlist', str(self.dir / 'allow.txt'))
-        self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout + done.stderr)
-        self.assertIn('::warning', done.stdout)
-        self.assertIn('remove', done.stdout)
+    def test_7884_plain_pin_on_a_line_past_eof_is_stale(self) -> None:
+        done = self.run_coupled('%s:717  # plain pin\n' % COUPLED_PATH)
+        self.assertEqual(done.returncode, EXIT_USAGE, done.stdout + done.stderr)
+        self.assertIn('stale allowlist entry', done.stderr)
 
     def test_7031_r3_landing_order_marker_count_only_shrinks(self) -> None:
         text = (ROOT / 'scripts' / 'qc-allowlists' / 'shared-test-db-allow.txt').read_text(encoding='utf-8')
         marked = [raw for raw in text.splitlines() if '[landing-order' in raw]
-        self.assertLessEqual(len(marked), LANDING_ORDER_MARKERS_MAX, marked)
-        for raw in marked:
-            self.assertTrue(raw.startswith(COUPLED_PATH + ':'), raw)
-            self.assertIn(COUPLED_MARK, raw)
-        # The chain rewrote test_pg_isolated_binary.py, so the seven pins are gone from the allowlist;
-        # the marked set may only shrink: every remaining marker must still bind a coupled line.
-        pinned = sorted(int(raw.split(':', 2)[1].split()[0]) for raw in marked)
-        self.assertTrue(set(pinned) <= set(COUPLED_LINES), pinned)
+        self.assertEqual(len(marked), LANDING_ORDER_MARKERS_MAX, marked)
 
     # --- round 3: security r2 S6 (#7165), one cell per form ---
     def assert_clean(self, form: str, name: str = 'm.txt') -> None:
@@ -462,7 +436,7 @@ class SharedTestDbRefs7031(unittest.TestCase):
             self.assertEqual(done.returncode, EXIT_USAGE, bad + done.stdout + done.stderr)
             self.assertIn('allowlist line 1', done.stderr)
 
-    def test_7031_r3_docstring_states_the_out_of_scope_indirection_forms(self) -> None:
+    def test_7031_r3_docstring_states_the_not_scanned_indirection_forms(self) -> None:
         text = GATE.read_text(encoding='utf-8')
         for needle in ['env indirection', 'string concatenation', 'escape', 'percent-encoded']:
             self.assertIn(needle, text, needle)
@@ -493,26 +467,6 @@ class SharedTestDbRefs7031(unittest.TestCase):
             elapsed = time.monotonic() - started
             self.assertEqual(done.returncode, EXIT_CLEAN, label + done.stdout + done.stderr)
             self.assertLess(elapsed, CONTINUATION_SCAN_BUDGET_SECS, '%s took %.2fs' % (label, elapsed))
-
-
-    # --- round 4: code r3 F2 (#7172) ---
-    def test_7172_r4_marker_is_bound_to_the_pinned_line(self) -> None:
-        for line in (9717, 9999, 1, 716):
-            done = self.run_coupled('%s:%d  # moved %s\n' % (COUPLED_PATH, line, COUPLED_MARK))
-            self.assertEqual(done.returncode, EXIT_USAGE, '%d\n%s%s' % (line, done.stdout, done.stderr))
-            self.assertIn('allowlist line 1', done.stderr, line)
-            self.assertIn(str(line), done.stderr, line)
-
-    def test_7172_r4_every_named_line_is_accepted(self) -> None:
-        pins = ''.join('%s:%d  # x %s\n' % (COUPLED_PATH, n, COUPLED_MARK) for n in COUPLED_LINES)
-        done = self.run_coupled(pins)
-        self.assertEqual(done.returncode, EXIT_CLEAN, done.stdout + done.stderr)
-
-    def test_7172_r4_an_eighth_marked_pin_exits_2_naming_its_line(self) -> None:
-        pins = ''.join('%s:%d  # x %s\n' % (COUPLED_PATH, n, COUPLED_MARK) for n in COUPLED_LINES + (9999,))
-        done = self.run_coupled(pins)
-        self.assertEqual(done.returncode, EXIT_USAGE, done.stdout + done.stderr)
-        self.assertIn('allowlist line 8', done.stderr)
 
 
     # --- round 4: code r3 F3 (#7173) ---
