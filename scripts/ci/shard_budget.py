@@ -46,11 +46,21 @@ MAX_ESTIMATE_BITS = 64
 # Longest estimate text echoed into an error line.
 MAX_SHOWN_CHARS = 40
 RC_OK, RC_RATCHET, RC_BAD = 0, 1, 2
+# A character below this code point (or DEL) is a control character: it is
+# escaped in an error line so manifest content cannot start a second line.
+FIRST_PRINTABLE = 0x20
+DEL = 0x7F
 NOTICE_RE = re.compile(r"'\[(?P<shard>\w+)\] [^']*' ran (?P<ran>\d+)s of the (?P<of>\d+)s per-invocation watchdog budget")
 
 
 class BudgetError(Exception):
     """Unusable input; main() prints it as ::error:: and exits 2 (fail closed)."""
+
+
+def one_line(text):
+    """Escape control characters and break '::' so content cannot forge a workflow command (#7878)."""
+    out = ''.join('\\x%02x' % ord(c) if ord(c) < FIRST_PRINTABLE or ord(c) == DEL else c for c in str(text))
+    return out.replace('::', ':\\x3a')
 
 
 def pair(text, what):
@@ -106,9 +116,13 @@ def estimate_of(raw, shard, budget):
 def gate(args):
     budgets = pairs(args.budget, '--budget', True)
     try:
-        est = json.loads(Path(args.manifest).read_text())['estimate_seconds']
-    except (OSError, ValueError, KeyError) as exc:
-        raise BudgetError('cannot read estimate_seconds from %s: %s' % (args.manifest, exc))
+        doc = json.loads(Path(args.manifest).read_text())
+    except (OSError, ValueError, RecursionError) as exc:
+        raise BudgetError('cannot read estimate_seconds from %s: %s' % (args.manifest, type(exc).__name__))
+    if not isinstance(doc, dict) or not isinstance(doc.get('estimate_seconds'), dict):
+        raise BudgetError('manifest %s: top level must be an object holding an estimate_seconds object, got %s'
+                          % (args.manifest, type(doc).__name__))
+    est = doc['estimate_seconds']
     failed = False
     for shard in SHARDS:
         budget = budgets[shard]
@@ -121,8 +135,8 @@ def gate(args):
         # before it. The scale is read as its decimal text (0.66), not its binary value.
         exact = raw * Decimal(str(ESTIMATE_SCALE[shard]))
         calibrated = int(exact.to_integral_value(rounding=ROUND_CEILING))
-        line = 'shard %s estimate %ds (raw %ds x %.2f) vs budget %ds' % (
-            shard, calibrated, round(raw), ESTIMATE_SCALE[shard], budget)
+        line = 'shard %s estimate %ds (raw %ss x %.2f) vs budget %ds' % (
+            shard, calibrated, format(raw, 'f'), ESTIMATE_SCALE[shard], budget)
         if exact > budget:
             failed = True
             print('::error::[#7343 fail-fast] %s: the estimate exceeds the budget; move binaries to a '
@@ -177,7 +191,7 @@ def main(argv=None):
     try:
         return gate(args) if args.cmd == 'gate' else ratchet(args)
     except BudgetError as exc:
-        print('::error::[#7343 shard-budget] %s' % exc, file=sys.stderr)
+        print('::error::[#7343 shard-budget] %s' % one_line(exc), file=sys.stderr)
         return RC_BAD
 
 
