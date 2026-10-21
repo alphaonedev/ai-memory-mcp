@@ -468,6 +468,17 @@ def directory_handle(parent_fd, name):
         os.close(fd)
 
 
+def open_held(stack, name, flags, **kw):
+    """os.open whose descriptor is registered on `stack` at once, so one failing closer cannot skip the others (#7871)."""
+    fd = os.open(name, flags, **kw)
+    try:
+        stack.callback(os.close, fd)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 @contextlib.contextmanager
 def stage_file(directory_fd, name, flags, mode):
     """A no-follow file handle whose descriptor is closed even if wrapping it fails."""
@@ -593,7 +604,8 @@ def publish_bundle(wt, dest, files, manifest):
         raise Fatal("destination must stay beneath the checkout")
     private_name = PRIVATE_PREFIX + secrets.token_hex(16)
     scratch, scratch_fd = open_stage_scratch(wt)
-    descriptors = [scratch_fd]
+    held = contextlib.ExitStack()  # closes every held directory descriptor even if one closer raises (#7871)
+    held.callback(os.close, scratch_fd)
     claims = contextlib.ExitStack()
     private_fd = stage_fd = dest_fd = None
     private_id = stage_id = None
@@ -606,19 +618,16 @@ def publish_bundle(wt, dest, files, manifest):
         if dest.exists() or dest.is_symlink():
             raise Fatal(f"{dest} already exists; refusing to overwrite")
         os.mkdir(private_name, mode=PRIVATE_MODE, dir_fd=scratch_fd)
-        private_fd = os.open(private_name, DIRECTORY_FLAGS, dir_fd=scratch_fd)
-        descriptors.append(private_fd)
+        private_fd = open_held(held, private_name, DIRECTORY_FLAGS, dir_fd=scratch_fd)
         private_id = directory_check(private_fd, private=True)
         os.mkdir(STAGE_NAME, mode=PRIVATE_MODE, dir_fd=private_fd)
-        stage_fd = os.open(STAGE_NAME, DIRECTORY_FLAGS, dir_fd=private_fd)
-        descriptors.append(stage_fd)
+        stage_fd = open_held(held, STAGE_NAME, DIRECTORY_FLAGS, dir_fd=private_fd)
         stage_id = directory_check(stage_fd, private=True)
         output_fd, output_id = stage_fd, stage_id
         stage = scratch / private_name / STAGE_NAME
         # Walk from the held checkout, refusing symlinks in every component. Keep
         # each edge pinned so replacing any ancestor cannot redirect publication.
-        dest_fd = os.open(wt, DIRECTORY_FLAGS)
-        descriptors.append(dest_fd)
+        dest_fd = open_held(held, wt, DIRECTORY_FLAGS)
         path_edges = [(None, wt, identity(os.fstat(dest_fd)))]
         for component in relative_parent.parts:
             try:
@@ -626,8 +635,7 @@ def publish_bundle(wt, dest, files, manifest):
             except FileExistsError:
                 if not stat.S_ISDIR(os.stat(component, dir_fd=dest_fd, follow_symlinks=False).st_mode):
                     raise Fatal("publication parent is not a plain directory")
-            child_fd = os.open(component, DIRECTORY_FLAGS, dir_fd=dest_fd)
-            descriptors.append(child_fd)
+            child_fd = open_held(held, component, DIRECTORY_FLAGS, dir_fd=dest_fd)
             info = os.fstat(child_fd)
             if info.st_uid != os.geteuid():
                 raise Fatal("publication parent is owned by another uid")
@@ -706,9 +714,10 @@ def publish_bundle(wt, dest, files, manifest):
                 except OSError as error:
                     print(f"retained private staging parent: {error.strerror}", file=sys.stderr)
         finally:
-            claims.close()
-            for fd in reversed(descriptors):
-                os.close(fd)
+            try:
+                claims.close()
+            finally:
+                held.close()
 
 
 def main():
