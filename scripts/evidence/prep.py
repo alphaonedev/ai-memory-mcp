@@ -58,6 +58,7 @@ else:
         del sys.modules["check_cert_expiry"]
         raise
 is_watched_path = _expiry.is_watched_path  # #7664: the gate's own predicate, not a copy
+LF = "\n"
 FED_ID = re.compile(r"AI_MEMORY_FED_[A-Z0-9_]+")
 
 
@@ -96,7 +97,8 @@ def code_lines(repo, base, tip, path):
     out = git(repo, "--literal-pathspecs", "diff", "-U0", "--no-renames", f"{base}..{tip}", "--", path)
     n = 0
     in_hunk = False
-    for line in out.splitlines():
+    # #7867: only LF ends a Git record; CR, VT, FF, NEL, U+2028 etc. inside a source line are content.
+    for line in out.split(LF):
         if line.startswith("diff --git "):
             in_hunk = False
         elif line.startswith("@@ "):
