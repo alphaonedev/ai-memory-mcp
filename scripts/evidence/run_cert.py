@@ -401,12 +401,15 @@ class Run:
         env = dict(self.env)
         env.update(extra_env or {})
         roots = {}
+        opened_roots = []  # (path, fd) pairs, the closing loop below owns every descriptor
         private = []
         try:
             # #7731: reapply the shared policy at use and bind mkdir/cleanup to the checked root.
             for path in (self.targets, self.tmpdir):
                 if path not in roots:
-                    roots[path] = self.guarded_scratch(path)
+                    root_fd = self.guarded_scratch(path)
+                    opened_roots.append((path, root_fd))
+                    roots[path] = root_fd
             scratch_fd = roots[self.tmpdir]
             launcher_name, launcher_fd = self.private_directory(scratch_fd, "python-")
             private.append((launcher_name, launcher_fd))
@@ -448,8 +451,8 @@ class Run:
                     finally:
                         os.close(fd)
             finally:
-                for fd in roots.values():
-                    os.close(fd)
+                for _path, root_fd in opened_roots:
+                    os.close(root_fd)
 
     def guarded_scratch(self, path):
         """Open a configured root through the shared policy, refusing removal or replacement since setup."""

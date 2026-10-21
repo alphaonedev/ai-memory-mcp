@@ -6,7 +6,7 @@ import argparse
 import errno
 import os
 import unittest
-from unittest import mock
+import unittest.mock as mock
 
 from test_evidence_generator_5040_5042 import ScratchCase, load
 
@@ -47,7 +47,7 @@ class GuardedScratchDescriptor7870(ScratchCase):
                 mock.patch.object(os, "fstat", side_effect=faulty_fstat):
             try:
                 result = self.runner.guarded_scratch(self.tmpdir)
-            except BaseException as error:  # the test inspects every failure class
+            except (OSError, KeyboardInterrupt, self.rc.ConfigError) as error:
                 raised = error
             else:
                 held.append(result)

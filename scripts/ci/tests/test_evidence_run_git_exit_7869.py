@@ -6,7 +6,7 @@ import ast
 import io
 import unittest
 from contextlib import redirect_stderr
-from unittest import mock
+import unittest.mock as mock
 
 from test_evidence_generator_5040_5042 import EVIDENCE, load
 

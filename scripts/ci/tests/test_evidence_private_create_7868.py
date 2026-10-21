@@ -5,7 +5,7 @@
 import os
 import stat
 import unittest
-from unittest import mock
+import unittest.mock as mock
 
 from test_evidence_generator_5040_5042 import ScratchCase, load
 
@@ -25,10 +25,10 @@ class PrivateCreate7868(ScratchCase):
         created = []
         real_open = os.open
 
-        def recording_open(path, flags, mode=0o777, **kw):
+        def recording_open(path, flags, *rest, **kw):
             if flags & os.O_CREAT:
-                created.append((path, mode))
-            return real_open(path, flags, mode, **kw)
+                created.append((path, rest[0] if rest else kw.get("mode")))
+            return real_open(path, flags, *rest, **kw)
 
         patches = [mock.patch.object(os, "open", side_effect=recording_open)]
         if not native:

@@ -458,27 +458,20 @@ def entry_matches(parent_fd, name, expected):
     return identity(info) == expected and not stat.S_ISLNK(info.st_mode) and info.st_uid == os.geteuid()
 
 
-@contextlib.contextmanager
-def directory_handle(parent_fd, name):
-    """Hold a no-follow directory descriptor for the caller's context lifetime."""
-    fd = os.open(name, DIRECTORY_FLAGS, dir_fd=parent_fd)
-    try:
-        yield fd
-    finally:
-        os.close(fd)
+class HeldDirectory:
+    """A no-follow directory descriptor registered on an ExitStack at open, so one failing closer cannot skip the
+    others (#7871). `fd` is borrowed; the stack owns the close."""
 
-
-def open_held(stack, name, flags, **kw):
-    """os.open whose descriptor is registered on `stack` at once, so one failing closer cannot skip the others (#7871)."""
-    fd = os.open(name, flags, **kw)
-    registered = False
-    try:
-        stack.callback(os.close, fd)
-        registered = True
-    finally:
-        if not registered:
-            os.close(fd)
-    return fd
+    def __init__(self, stack, name, *, dir_fd=None):
+        fd = os.open(name, DIRECTORY_FLAGS, dir_fd=dir_fd)
+        registered = False
+        try:
+            stack.callback(os.close, fd)
+            self.fd = fd
+            registered = True
+        finally:
+            if not registered:
+                os.close(fd)
 
 
 @contextlib.contextmanager
@@ -620,16 +613,16 @@ def publish_bundle(wt, dest, files, manifest):
         if dest.exists() or dest.is_symlink():
             raise Fatal(f"{dest} already exists; refusing to overwrite")
         os.mkdir(private_name, mode=PRIVATE_MODE, dir_fd=scratch_fd)
-        private_fd = open_held(held, private_name, DIRECTORY_FLAGS, dir_fd=scratch_fd)
+        private_fd = HeldDirectory(held, private_name, dir_fd=scratch_fd).fd
         private_id = directory_check(private_fd, private=True)
         os.mkdir(STAGE_NAME, mode=PRIVATE_MODE, dir_fd=private_fd)
-        stage_fd = open_held(held, STAGE_NAME, DIRECTORY_FLAGS, dir_fd=private_fd)
+        stage_fd = HeldDirectory(held, STAGE_NAME, dir_fd=private_fd).fd
         stage_id = directory_check(stage_fd, private=True)
         output_fd, output_id = stage_fd, stage_id
         stage = scratch / private_name / STAGE_NAME
         # Walk from the held checkout, refusing symlinks in every component. Keep
         # each edge pinned so replacing any ancestor cannot redirect publication.
-        dest_fd = open_held(held, wt, DIRECTORY_FLAGS)
+        dest_fd = HeldDirectory(held, wt).fd
         path_edges = [(None, wt, identity(os.fstat(dest_fd)))]
         for component in relative_parent.parts:
             try:
@@ -637,7 +630,7 @@ def publish_bundle(wt, dest, files, manifest):
             except FileExistsError:
                 if not stat.S_ISDIR(os.stat(component, dir_fd=dest_fd, follow_symlinks=False).st_mode):
                     raise Fatal("publication parent is not a plain directory")
-            child_fd = open_held(held, component, DIRECTORY_FLAGS, dir_fd=dest_fd)
+            child_fd = HeldDirectory(held, component, dir_fd=dest_fd).fd
             info = os.fstat(child_fd)
             if info.st_uid != os.geteuid():
                 raise Fatal("publication parent is owned by another uid")
@@ -664,7 +657,7 @@ def publish_bundle(wt, dest, files, manifest):
                 os.mkdir(dest.name, mode=PRIVATE_MODE, dir_fd=dest_fd)
             except FileExistsError as error:
                 raise Fatal(f"{dest} already exists; refusing to overwrite") from error
-            output_fd = claims.enter_context(directory_handle(dest_fd, dest.name))
+            output_fd = HeldDirectory(claims, dest.name, dir_fd=dest_fd).fd
             output_id = directory_check(output_fd, private=True)
             output_written = {}
             published = True

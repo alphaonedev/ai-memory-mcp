@@ -6,7 +6,7 @@ import errno
 import os
 import unittest
 from pathlib import Path
-from unittest import mock
+import unittest.mock as mock
 
 from test_evidence_generator_5040_5042 import ScratchCase, load
 
@@ -31,6 +31,7 @@ class CleanupClose7871(ScratchCase):
         target = victim(checkout.resolve())
         opened = []
         injected = []
+        failures = []
         real_open, real_close = os.open, os.close
 
         def recording_open(*args, **kw):
@@ -50,8 +51,8 @@ class CleanupClose7871(ScratchCase):
                 mock.patch.object(os, "close", side_effect=closing):
             try:
                 bundle.publish_bundle(checkout, checkout / PUBLISHED, FILES, bundle.manifest_text(FILES))
-            except OSError:
-                pass
+            except OSError as error:
+                failures.append(error)
         leaked = []
         for fd in set(opened):
             try:
