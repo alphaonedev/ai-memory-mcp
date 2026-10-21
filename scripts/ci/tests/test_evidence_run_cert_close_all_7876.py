@@ -4,10 +4,11 @@
 The first OSError is kept and re-raised after the loop, mirroring the #7871 pattern in build_bundle.py.
 """
 import argparse
+import contextlib
 import errno
 import os
 import unittest
-from unittest import mock
+import unittest.mock as mock
 
 from test_evidence_generator_5040_5042 import ScratchCase, load
 
@@ -16,19 +17,30 @@ FAIL_INDEX_LAST = 2
 DESCRIPTOR_COUNT = 3
 
 
+REAL_CLOSE = os.close
+
+
 class CloseAll7876(ScratchCase):
     def setUp(self):
         super().setUp()
         self.rc = load('run_cert')
-        self.fds = [os.open(os.devnull, os.O_RDONLY) for _ in range(DESCRIPTOR_COUNT)]
+        self.owned = set()
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        self.fds = [self.open_owned() for _ in range(DESCRIPTOR_COUNT)]
 
-    def tearDown(self):
-        for fd in self.fds:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        super().tearDown()
+    def open_owned(self):
+        """Open a descriptor whose release is registered once; release is idempotent."""
+        fd = os.open(os.devnull, os.O_RDONLY)
+        self.owned.add(fd)
+        self.stack.callback(self.release, fd)
+        return fd
+
+    def release(self, fd):
+        """Close fd with the real os.close only if the test still owns it and it is still open."""
+        if fd in self.owned and not self.closed(fd):
+            REAL_CLOSE(fd)
+        self.owned.discard(fd)
 
     def closed(self, fd):
         try:
