@@ -109,7 +109,7 @@ pub const MCP_RESPONSE_BASE_TIMEOUT: Duration = Duration::from_mins(1);
 /// testable WITHOUT mutating process-global env (`std::env::set_var`
 /// is unsound under concurrent test threads — see the `#1998 → #2115 →
 /// #2127 → #2146` lineage and `scripts/check-test-env-lock.sh`).
-fn budget_mult_from(raw: Option<&str>) -> u64 {
+pub fn budget_mult_from(raw: Option<&str>) -> u64 {
     raw.and_then(|s| s.parse::<u64>().ok())
         .filter(|n| (BUDGET_MULT_MIN..=BUDGET_MULT_MAX).contains(n))
         .unwrap_or(BUDGET_MULT_MIN)

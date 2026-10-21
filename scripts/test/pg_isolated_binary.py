@@ -72,6 +72,7 @@ import json
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -97,7 +98,9 @@ SQL_RELEASE_TEMPLATE = 'ALTER DATABASE %s WITH IS_TEMPLATE false'
 KILL_VAR = 'CI_PG_ISOLATE_OFF'
 ISOLATED_PREFIX = 'ai_memory_t'
 TEMPLATE_SUFFIX = '_tpl'
+ALREADY_EXISTS = 'already exists'  # psql detail of a CREATE DATABASE onto an occupied name
 IDENT_MAX = 63
+PSQL_SQL_ERROR = 1  # psql exit status for a refused statement; every other status leaves the outcome unknown
 RUN_ID_MAX_LEN = 20
 MAX_JOBS = 8
 PER_BINARY_CONNECTIONS = 18
@@ -113,6 +116,23 @@ MIN_SWEEP_AGE_SECS = 600
 TERM_GRACE_SECS = 5.0
 LOG_TAIL_LINES = 200
 CONNECT_TIMEOUT_SECS = '30'
+# decision: one psql call (CREATE ... TEMPLATE copies a database, DROP waits on sessions) gets 300 s, well above
+# any healthy statement, so only a stalled server or a held lock trips it (#7429).
+PSQL_TIMEOUT_SECS = 300.0
+# decision: the server cancels its own statement over Popen+SIGINT, because a server-side cap still fires when
+# psql is killed, hung or cut off, while a cancel request needs a live client (#7447). The cap is applied by a
+# first `DO` statement in the same psql session (set_config, session level) and NOT through PGOPTIONS, because
+# the server then reads every caller value itself (case, units, hex, octal, fractions, role- and database-level
+# defaults) and the cap is the least non-zero of that value and ours: nothing is parsed here that the server
+# could read differently (#7454, #7477, #7478, #7479, #7484). The statement cap is the client wall time minus
+# the whole connect budget (see _connect_budget_secs) minus a fixed margin, so it fires before the client
+# kill; lock_timeout is clamped a fixed gap below the effective statement_timeout (#7453, #7480).
+PSQL_CAP_MARGIN_SECS = 10.0
+PSQL_LOCK_GAP_SECS = 5.0
+LIBPQ_MIN_CONNECT_SECS = 2
+GUARD_SQL_MAX_BYTES = 65536  # the psql() guard refuses longer SQL unread: its cost is bounded by construction (#7615)
+# linear: one quantified class, no alternation, fullmatch on a short env value
+_DIGITS_RE = re.compile(r'[0-9]+')
 IN_USE_TEXT = 'being accessed by other users'
 FAMILY_PROTOCOL = 'ai-memory-pg-family'
 FAMILY_VERSION = 1
@@ -155,16 +175,27 @@ _QUERY_TO_ENV = {
     'target_session_attrs': 'PGTARGETSESSIONATTRS',
     'options': 'PGOPTIONS',
 }
+# linear: one bounded class repetition between anchors
 _RUN_ID_RE = re.compile(r'^[a-z0-9]{1,%d}$' % RUN_ID_MAX_LEN)
+# linear: bounded class repetitions separated by a fixed underscore, so no two quantifiers can overlap
 _ANY_NAME_RE = re.compile(r'^%s_([a-z0-9]{1,%d})_([0-9]{10})_([0-9a-f]{8})$' % (ISOLATED_PREFIX, RUN_ID_MAX_LEN))
+# linear: fixed prefix, one bounded digit class, fixed stamp and suffix, one optional literal suffix
 _MINTED_BASE_RE = re.compile(r'^%s[0-9]+_([0-9]{10})_[0-9a-f]{8}(?:%s)?$' % (MINTED_BASE_PREFIX, TEMPLATE_SUFFIX))
+# linear: one bounded class repetition between anchors
 _IDENT_RE = re.compile(r'^[A-Za-z0-9_]{1,%d}$' % IDENT_MAX)
+# linear: fixed prefix, a literal space, then one class repetition to the anchor
 _TARGET_RE = re.compile(r'^--(test|bin) ([A-Za-z0-9_-]+)$')
 _PRINT_LOCK = threading.Lock()
 
 
 class WrapperError(Exception):
-    """A condition under which the wrapper refuses to continue (fail closed)."""
+    """A condition under which the wrapper refuses to continue (fail closed).
+
+    ``returncode`` is the psql exit status when the error came from psql, else None."""
+
+    def __init__(self, message: str, returncode: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.returncode = returncode
 
 
 def _out(line: str) -> None:
@@ -247,8 +278,14 @@ def parse_target_line(line: str) -> List[str]:
 
 
 def template_name(db_name: str) -> str:
-    """``<db>_tpl``, trimmed so the result is a valid identifier length."""
-    return db_name[:IDENT_MAX - len(TEMPLATE_SUFFIX)] + TEMPLATE_SUFFIX
+    """``<db>_tpl``. A name too long to take the suffix is refused, never
+    truncated: truncation maps two different names onto one template (#7127)."""
+    size = len(db_name.encode('utf-8'))
+    if size + len(TEMPLATE_SUFFIX) > IDENT_MAX:
+        raise WrapperError('database name %r is %d bytes; with %s the template name would exceed the %d-byte '
+                           'identifier limit and be truncated onto another template'
+                           % (db_name, size, TEMPLATE_SUFFIX, IDENT_MAX))
+    return db_name + TEMPLATE_SUFFIX
 
 
 def _checked_ident(name: str) -> str:
@@ -309,6 +346,9 @@ def libpq_env(url: str) -> Dict[str, str]:
         var = _QUERY_TO_ENV.get(key)
         if var is None:
             raise WrapperError('unsupported URL query key %r' % key)
+        if key == 'options' and (len(value) - len(value.rstrip('\\'))) % 2:
+            raise WrapperError('the URL query key \'options\' ends in an unescaped backslash; end it with a '
+                               'value character or double the backslash')
         env[var] = value
     return env
 
@@ -331,17 +371,478 @@ def _pg_env(url: str, app: Optional[str] = None) -> Dict[str, str]:
     return env
 
 
-def psql(url: str, sql: str, tuples: bool = False, app: Optional[str] = None) -> str:
-    """Run one statement through psql; returns stdout, raises on failure. Every
-    call is tagged with this process's application_name (#7179)."""
+def _connect_plan(env: Dict[str, str]) -> Tuple[int, int, int]:
+    """``(connect_timeout_secs, addresses, passes)`` libpq may spend connecting: connect_timeout floored at 2 s,
+    per resolved address, with a second pass when sslmode may retry without TLS (#7482). Raises on a value that
+    is not a plain positive number."""
+    connect = env.get('PGCONNECT_TIMEOUT', '').lstrip('0')
+    if _DIGITS_RE.fullmatch(connect) is None:
+        raise WrapperError('connect_timeout must be a positive whole number of seconds so the server-side '
+                           'statement cap can be sized under the psql limit')
+    # Anything above the whole psql budget is already unusable. Compare decimal text before int/float
+    # arithmetic, after removing padding, so neither Python's integer limit nor float overflow escapes (#7866).
+    limit = str(int(PSQL_TIMEOUT_SECS))
+    if len(connect) > len(limit) or (len(connect) == len(limit) and connect > limit):
+        raise WrapperError('connect_timeout exceeds the psql limit; lower connect_timeout so the server-side '
+                           'statement cap can be sized under the psql limit')
+    each = max(int(connect), LIBPQ_MIN_CONNECT_SECS)
+    host = env.get('PGHOST', '')
+    if env.get('PGHOSTADDR') or not host or host.startswith('/'):
+        return each, 1, 1
+    try:
+        port = int(env.get('PGPORT') or 5432)
+        addresses = len({info[4] for info in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)}) or 1
+    except (OSError, ValueError):
+        addresses = 1
+    return each, addresses, 2 if env.get('PGSSLMODE', 'prefer') in ('prefer', 'allow') else 1
+
+
+def _connect_budget_secs(env: Dict[str, str]) -> int:
+    """Worst-case seconds libpq may spend connecting (see ``_connect_plan``)."""
+    each, addresses, passes = _connect_plan(env)
+    return each * addresses * passes
+
+
+def server_caps_sql(env: Dict[str, str]) -> str:
+    """A ``DO`` statement setting session statement_timeout and lock_timeout to the least non-zero of the
+    value the server already resolved for this session (startup options, role and database defaults) and the
+    wrapper cap; lock_timeout is clamped below the effective statement_timeout (#7453, #7480, #7484, #7519).
+
+    The body pins search_path and names pg_catalog objects, so a caller ``options=-c search_path=...`` naming a
+    schema with a shadow ``pg_settings`` or ``set_config`` cannot skip the cap (#7520)."""
+    budget = _connect_budget_secs(env)
+    cap_ms = int((PSQL_TIMEOUT_SECS - budget - PSQL_CAP_MARGIN_SECS) * 1000)
+    gap_ms = int(PSQL_LOCK_GAP_SECS * 1000)
+    lock_cap_ms = cap_ms - gap_ms
+    if lock_cap_ms <= 0:
+        each, addresses, passes = _connect_plan(env)
+        asked = int(env.get('PGCONNECT_TIMEOUT', '').lstrip('0'))
+        # "floored" only when libpq really raised the value (asked < 2 s); at the floor lowering it changes nothing (#7580)
+        used = '%d s, floored from %d s' % (each, asked) if asked < LIBPQ_MIN_CONNECT_SECS else '%d s' % each
+        mode = env.get('PGSSLMODE', 'prefer')
+        lower = 'lower connect_timeout, ' if each > LIBPQ_MIN_CONNECT_SECS else ''
+        fix = (lower + 'reduce the resolved addresses (hostaddr) or set sslmode=require'
+               if passes == 2 else
+               ('lower connect_timeout or ' if lower else '') + 'reduce the resolved addresses (set hostaddr)')
+        raise WrapperError(
+            'the connect budget (%d s = connect_timeout %s x %d address(es) x %d sslmode pass(es), '
+            'sslmode=%s) leaves no room for a server-side statement cap under the %g s psql limit; %s'
+            % (budget, used, addresses, passes, mode, PSQL_TIMEOUT_SECS, fix))
+    return (
+        "DO $cap$ DECLARE s bigint; l bigint; BEGIN "
+        "PERFORM pg_catalog.set_config('search_path', 'pg_catalog, pg_temp', true); "
+        "SELECT setting::bigint INTO s FROM pg_catalog.pg_settings WHERE name = 'statement_timeout'; "
+        "SELECT setting::bigint INTO l FROM pg_catalog.pg_settings WHERE name = 'lock_timeout'; "
+        "IF s = 0 OR s > %(cap)d THEN s := %(cap)d; END IF; "
+        "IF l = 0 OR l > %(lock)d THEN l := %(lock)d; END IF; "
+        "IF l >= s THEN l := CASE WHEN s > %(twice)d THEN s - %(gap)d ELSE greatest(s / 2, 1) END; END IF; "
+        "PERFORM pg_catalog.set_config('statement_timeout', s::text || 'ms', false); "
+        "PERFORM pg_catalog.set_config('lock_timeout', l::text || 'ms', false); "
+        "END $cap$" % {'cap': cap_ms, 'lock': lock_cap_ms, 'gap': gap_ms, 'twice': 2 * gap_ms})
+
+
+# Caller SQL that would undo the server cap or run outside it (#7521, #7550, #7551, #7575-#7579). Round 12 of a
+# deny-list guard: the deny-list SHAPE was the defect, so the guard now refuses any MENTION. The SQL is tokenised
+# the way the PostgreSQL scanner (src/backend/parser/scan.l, parser.c base_yylex) reads it; then the statement is
+# refused when ANY identifier or string-literal token, anywhere in it, equals a name from _FORBIDDEN_NAMES (after
+# quoted, U&, UESCAPE and E-string decoding and ASCII lower-casing), or when it holds a second statement, DO,
+# DISCARD, RESET ALL, ALTER SYSTEM, SET [SESSION] AUTHORIZATION, CREATE [OR REPLACE] FUNCTION, CREATE [OR REPLACE]
+# PROCEDURE, CALL (a function or procedure body is code the guard cannot read, #7704), an octal escape above \377 in an
+# E-string, or in a plain literal such as '\563' (whether a backslash escapes there depends on
+# standard_conforming_strings, which the wrapper does not control; PostgreSQL keeps only the low byte, so the decode
+# could differ, #7703, #7717), or anything the guard cannot tokenise.
+#
+# scan.l rules mirrored here:
+#   space              [ \t\n\r\f\v]  ASCII only; every other byte (a no-break space, U+2003, ...) is part of a token
+#   newline            [\n\r]
+#   comment            "--"{non_newline}*  with non_newline [^\n\r]: a line comment ends at \n OR \r (#7575)
+#   ident_start        [A-Za-z\200-\377_]   ident_cont  [A-Za-z\200-\377_0-9\$]
+#   dolq_start/cont    [A-Za-z\200-\377_]   [A-Za-z\200-\377_0-9]
+#   xq/xus             a doubled quote is a quote; xe also reads backslash escapes; xb/xh (B'' X'') have neither
+#   N'..'              the NCHAR keyword, then an ordinary '..' literal (scan.l xnstart: yyless(1))
+#   quotecontinue      a literal followed by whitespace holding a newline (and `--` comments) and another quote is
+#                      ONE literal read in the SAME mode (E'a'<newline>'\'...' stays an E string)
+#   UESCAPE            parser.c base_yylex reads the token AFTER a U& token, so whitespace and comments may sit
+#                      between (#7576); the escape must be one simple string literal of one ASCII character
+_SPACE = ' \t\n\r\f\v'
+# linear: one character class, matched at one index
+_IDENT_START_RE = re.compile(r'[A-Za-z_\x80-\U0010ffff]')
+# linear: one quantified class and nothing after it, so there is nothing to give back
+_IDENT_BODY_RE = re.compile(r'[A-Za-z0-9_$\x80-\U0010ffff]*')
+# linear: a start class then one quantified class (disjoint from the closing dollar), tried once per dollar sign
+_DOLLAR_TAG_RE = re.compile(r'\$(?:[A-Za-z_\x80-\U0010ffff][A-Za-z0-9_\x80-\U0010ffff]*)?\$')
+# linear: one quantified class, fullmatch on at most eight characters
+_HEX_RE = re.compile(r'[0-9A-Fa-f]+')
+_FORBIDDEN_NAMES = frozenset((
+    'statement_timeout', 'lock_timeout', 'idle_in_transaction_session_timeout', 'idle_session_timeout',
+    'transaction_timeout', 'session_authorization', 'role', 'set_config', 'pg_settings', 'pg_reload_conf'))
+_STR, _STR_ALT, _IDENT, _QIDENT, _SEMI, _OTHER = 'str', 'str-alt', 'ident', 'qident', ';', 'other'
+_USTR, _UIDENT = 'ustr', 'uident'          # pass-one only: a U& token whose UESCAPE is not resolved yet
+_E_SIMPLE = {'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t'}
+
+
+def _ascii_lower(text: str) -> str:
+    """Fold A-Z only, as the server does for a UTF-8 identifier (``str.lower`` also folds U+212A and friends)."""
+    return ''.join(chr(ord(c) + 32) if 'A' <= c <= 'Z' else c for c in text)
+
+
+def _unicode_unescape(body: str, escape: str) -> str:
+    """Decode the ``\\XXXX`` / ``\\+XXXXXX`` / doubled-escape forms of a ``U&`` literal or identifier."""
+    out: List[str] = []
+    i = 0
+    while i < len(body):
+        ch = body[i]
+        if ch != escape:
+            out.append(ch)
+            i += 1
+        elif body[i + 1:i + 2] == escape:
+            out.append(escape)
+            i += 2
+        else:
+            width = 6 if body[i + 1:i + 2] == '+' else 4
+            digits = body[i + 1 + (width == 6):i + 1 + (width == 6) + width]
+            if len(digits) != width or _HEX_RE.fullmatch(digits) is None:
+                raise WrapperError('refusing SQL with a malformed Unicode escape (%r)' % body[:40])
+            try:
+                out.append(chr(int(digits, 16)))
+            except (ValueError, OverflowError):
+                raise WrapperError('refusing SQL with an invalid Unicode code point (%r)' % body[:40])
+            i += 1 + (width == 6) + width
+    return ''.join(out)
+
+
+def _decode_e(body: str, literal: str = 'an E-string') -> str:
+    """Decode the escapes of an ``E''`` literal body (``\\n``, ``\\101``, ``\\x41``, ``\\u0041``, ``\\U00000041``,
+    ``\\'``; any other escaped character is itself) and a doubled quote. A malformed escape is kept verbatim: the
+    server rejects it, and the raw text is still compared. An octal escape above ``\\377`` raises ``WrapperError``;
+    ``literal`` names the literal kind in that error ('an E-string' or 'a plain-literal', #7717)."""
+    out: List[str] = []
+    i, n = 0, len(body)
+    while i < n:
+        ch = body[i]
+        if ch == "'" and body[i + 1:i + 2] == "'":
+            out.append("'")
+            i += 2
+        elif ch != '\\' or i + 1 >= n:
+            out.append(ch)
+            i += 1
+        else:
+            nxt = body[i + 1]
+            if nxt in _E_SIMPLE:
+                out.append(_E_SIMPLE[nxt])
+                i += 2
+            elif nxt in '01234567':
+                j = i + 1
+                while j < n and j < i + 4 and body[j] in '01234567':
+                    j += 1
+                value = int(body[i + 1:j], 8)
+                if value > 0o377:
+                    # PostgreSQL keeps only the low byte of an octal escape (scan.l unsigned char), so a value above
+                    # \377 could decode differently here: refuse it (#7703).
+                    raise WrapperError('refusing SQL with %s octal escape above \\377 (PostgreSQL keeps only '
+                                       'the low byte; the guard cannot read it the same way) (%r)'
+                                       % (literal, body[:40]))
+                out.append(chr(value))
+                i = j
+            elif nxt in 'xuU':
+                width = {'x': 2, 'u': 4, 'U': 8}[nxt]
+                j = i + 2
+                while j < n and j < i + 2 + width and body[j] in '0123456789abcdefABCDEF':
+                    j += 1
+                digits = body[i + 2:j]
+                try:
+                    out.append(chr(int(digits, 16)) if digits else nxt)
+                except (ValueError, OverflowError):
+                    out.append(body[i:j])
+                i = j
+            else:
+                out.append(nxt)
+                i += 2
+    return ''.join(out)
+
+
+def _line_comment_end(sql: str, i: int) -> int:
+    """Index of the first newline or CR at or after ``i`` (``len(sql)`` when the comment runs to the end)."""
+    n = len(sql)
+    while i < n and sql[i] not in '\n\r':
+        i += 1
+    return i
+
+
+def _continuation_quote(sql: str, i: int) -> int:
+    """Index of the quote that continues a literal ending just before ``sql[i]``, or ``-1``. scan.l quotecontinue:
+    blanks and ``--`` comments, a newline, then whitespace (newlines included) and ``--`` comments, then a quote.
+    A plain forward scan, one pass, no backtracking: the regex it replaces backtracked exponentially (#7615)."""
+    n = len(sql)
+    while i < n and (sql[i] in ' \t\f' or sql.startswith('--', i)):
+        i = _line_comment_end(sql, i) if sql[i] == '-' else i + 1
+    if i >= n or sql[i] not in '\n\r':
+        return -1
+    i += 1
+    while i < n:
+        if sql[i] in _SPACE:
+            i += 1
+        elif sql.startswith('--', i):
+            i = _line_comment_end(sql, i)
+            if i >= n:
+                return -1
+            i += 1                               # the comment's own newline
+        else:
+            break
+    return i if i < n and sql[i] == "'" else -1
+
+
+def _literal(sql: str, i: int, doubling: bool, backslash: bool) -> Tuple[int, str]:
+    """``(end, raw_body)`` of the quoted run whose opening quote is ``sql[i]``, following quote-continuation
+    (a newline between two quotes joins them into one literal read the same way). ``doubling`` is whether ``''``
+    is an escaped quote, ``backslash`` whether a backslash escapes the next character. Raises on an unterminated
+    run (fail closed)."""
+    parts: List[str] = []
+    while True:
+        start = i + 1
+        i = start
+        while True:
+            if i >= len(sql):
+                raise WrapperError('refusing SQL the guard cannot tokenise: unterminated quote (%r)' % sql[:60])
+            ch = sql[i]
+            if backslash and ch == '\\':
+                i += 2
+            elif ch == "'":
+                if doubling and sql[i + 1:i + 2] == "'":
+                    i += 2
+                else:
+                    break
+            else:
+                i += 1
+        parts.append(sql[start:i])
+        joined = _continuation_quote(sql, i + 1)
+        if joined < 0:
+            return i + 1, ''.join(parts)
+        i = joined
+
+
+def _quoted_ident_end(sql: str, i: int) -> int:
+    """Index just past the closing double quote of the identifier whose opening quote is ``sql[i]``."""
+    i += 1
+    while i < len(sql):
+        if sql[i] == '"':
+            if sql[i + 1:i + 2] == '"':
+                i += 2
+            else:
+                return i + 1
+        else:
+            i += 1
+    raise WrapperError('refusing SQL the guard cannot tokenise: unterminated quote (%r)' % sql[:60])
+
+
+def _plain_literal(sql: str, i: int, raw: List[Tuple[str, str]]) -> int:
+    """Read an ordinary ``'..'`` literal at ``sql[i]``; appends its token(s); returns the index after it.
+
+    Whether a backslash escapes depends on standard_conforming_strings (a session setting the wrapper does not
+    control), so the literal is read both ways: if the two readings end at different places the statement is
+    refused; if they end together but decode differently both values are kept for the name check (#7577). An octal
+    escape above ``\\377`` in a plain literal such as ``'\\563'`` is refused too, as in an E-string (#7717)."""
+    end, body = _literal(sql, i, True, False)
+    plain = body.replace("''", "'")
+    if '\\' not in sql[i:end]:
+        raw.append((_STR, plain))
+        return end
+    end_bs, body_bs = _literal(sql, i, True, True)
+    if end_bs != end:
+        raise WrapperError('refusing SQL whose string literal ends differently under '
+                           'standard_conforming_strings=off (%r)' % sql[:60])
+    raw.append((_STR, plain))
+    decoded = _decode_e(body_bs, 'a plain-literal')
+    if decoded != plain:
+        raw.append((_STR_ALT, decoded))
+    return end
+
+
+def _tokenise(sql: str) -> List[Tuple[str, str]]:
+    """``(kind, value)`` tokens of one SQL text: unquoted identifiers ASCII-lower-cased, quoted ones decoded, every
+    literal and dollar quote one ``str`` token, comments dropped (``/* */`` nests). Raises ``WrapperError`` on
+    anything it cannot tokenise, including a plain literal whose end differs depending on
+    standard_conforming_strings. B'' and X'' literals have no quote escape and no backslash escape in scan.l
+    (xb/xh read ``[^']*``), so they end at the first quote under both settings."""
+    raw: List[Tuple[str, str]] = []
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        nxt = sql[i + 1:i + 2]
+        if ch in _SPACE:
+            i += 1
+        elif ch == '-' and nxt == '-':
+            while i < n and sql[i] not in '\n\r':
+                i += 1
+        elif ch == '/' and nxt == '*':
+            depth, i = 1, i + 2
+            while depth:
+                if i >= n:
+                    raise WrapperError('refusing SQL the guard cannot tokenise: unterminated comment (%r)' % sql[:60])
+                if sql.startswith('/*', i):
+                    depth, i = depth + 1, i + 2
+                elif sql.startswith('*/', i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        elif ch == ';':
+            raw.append((_SEMI, ';'))
+            i += 1
+        elif ch == '\\':
+            raise WrapperError('refusing SQL with a backslash outside a literal (a psql meta-command?) (%r)'
+                               % sql[:60])
+        elif ch == "'":
+            i = _plain_literal(sql, i, raw)
+        elif ch == '"':
+            end = _quoted_ident_end(sql, i)
+            raw.append((_QIDENT, _ascii_lower(sql[i + 1:end - 1].replace('""', '"'))))
+            i = end
+        elif ch == '$' and _DOLLAR_TAG_RE.match(sql, i):
+            tag = _DOLLAR_TAG_RE.match(sql, i).group(0)
+            close = sql.find(tag, i + len(tag))
+            if close < 0:
+                raise WrapperError('refusing SQL the guard cannot tokenise: unterminated dollar quote (%r)'
+                                   % sql[:60])
+            raw.append((_STR, sql[i + len(tag):close]))
+            i = close + len(tag)
+        elif _IDENT_START_RE.match(ch):
+            end = i + 1 + len(_IDENT_BODY_RE.match(sql, i + 1).group(0))
+            lowered = _ascii_lower(sql[i:end])
+            quote_next = sql[end:end + 1] == "'"
+            if lowered == 'e' and quote_next:
+                close, body = _literal(sql, end, True, True)
+                raw.append((_STR, _decode_e(body)))
+                i = close
+            elif lowered in ('b', 'x') and quote_next:
+                close, body = _literal(sql, end, False, False)
+                raw.append((_STR, body))
+                i = close
+            elif lowered == 'n' and quote_next:
+                i = end                          # NCHAR keyword; the quote is read as an ordinary literal
+            elif lowered == 'u' and sql[end:end + 2] == "&'":
+                close, body = _literal(sql, end + 1, True, False)
+                raw.append((_USTR, body.replace("''", "'")))
+                i = close
+            elif lowered == 'u' and sql[end:end + 2] == '&"':
+                close = _quoted_ident_end(sql, end + 1)
+                raw.append((_UIDENT, sql[end + 2:close - 1].replace('""', '"')))
+                i = close
+            else:
+                raw.append((_IDENT, lowered))
+                i = end
+        else:
+            raw.append((_OTHER, ch))
+            i += 1
+    return _resolve_uescape(raw)
+
+
+def _resolve_uescape(raw: List[Tuple[str, str]]) -> List[Tuple[str, str]]:
+    """Decode every ``U&`` token with its ``UESCAPE '<c>'`` (comments are already gone, so any whitespace or
+    comment run between the token and UESCAPE is handled) or the default backslash (#7576)."""
+    tokens: List[Tuple[str, str]] = []
+    k = 0
+    while k < len(raw):
+        kind, value = raw[k]
+        if kind not in (_USTR, _UIDENT):
+            tokens.append((kind, value))
+            k += 1
+            continue
+        escape, used = '\\', 1
+        if k + 1 < len(raw) and raw[k + 1] == (_IDENT, 'uescape'):
+            ok = k + 2 < len(raw) and raw[k + 2][0] == _STR and len(raw[k + 2][1]) == 1
+            ok = ok and not (k + 3 < len(raw) and raw[k + 3][0] == _STR_ALT)
+            if not ok:
+                raise WrapperError('refusing SQL with a UESCAPE the guard cannot read: it must be followed by one '
+                                   'simple one-character string literal (%r)' % value[:40])
+            escape, used = raw[k + 2][1], 3
+            if ord(escape) > 127 or escape in '+\'"' or escape in _SPACE or _HEX_RE.fullmatch(escape):
+                raise WrapperError('refusing SQL with an invalid UESCAPE character (%r)' % value[:40])
+        decoded = _unicode_unescape(value, escape)
+        tokens.append((_QIDENT, _ascii_lower(decoded)) if kind == _UIDENT else (_STR, decoded))
+        k += used
+    return tokens
+
+
+def _refuse_uncapped_sql(sql: str) -> None:
+    if len(sql.encode('utf-8', 'surrogatepass')) > GUARD_SQL_MAX_BYTES:
+        raise WrapperError('refusing SQL over the %d-byte guard limit (%d characters): the guard stays bounded '
+                           'whatever the input (%r)' % (GUARD_SQL_MAX_BYTES, len(sql), sql[:60]))
+    tokens = _tokenise(sql)
+    if tokens and tokens[-1][0] == _SEMI:
+        tokens = tokens[:-1]
+    if any(kind == _SEMI for kind, _ in tokens):
+        raise WrapperError('refusing SQL with more than one statement: the server cap bounds one statement '
+                           'per psql call (%r)' % sql[:80])
+    for kind, value in tokens:
+        if kind in (_IDENT, _QIDENT, _STR, _STR_ALT) and _ascii_lower(value) in _FORBIDDEN_NAMES:
+            raise WrapperError('refusing SQL that mentions %s: the server cap must stay in force; a caller that '
+                               'needs it gets its own fixed helper (%r)' % (_ascii_lower(value), sql[:80]))
+    words = [value for kind, value in tokens if kind in (_IDENT, _QIDENT)]
+    for position, value in enumerate(words):
+        ahead = words[position + 1:position + 6]
+        while ahead[:1] in (['session'], ['local']):
+            ahead = ahead[1:]
+        bad = (
+            value in ('do', 'discard')
+            or (value == 'reset' and ahead[:1] == ['all'])
+            or (value == 'alter' and ahead[:1] == ['system'])
+            or (value in ('set', 'reset') and ahead[:1] == ['authorization']))
+        body = None
+        if value == 'create':
+            rest = ahead[2:] if ahead[:2] == ['or', 'replace'] else ahead
+            if rest[:1] in (['function'], ['procedure']):
+                body = 'CREATE ' + rest[0].upper()
+        elif value == 'call' and position == 0 and tokens[0][0] == _IDENT:
+            body = 'CALL'
+        if body is not None:
+            raise WrapperError('refusing %s: the guard cannot read a function or procedure body, so the server cap '
+                               'could be undone out of its sight; a caller that needs one gets its own fixed helper '
+                               '(%r)' % (body, sql[:80]))
+        if bad:
+            raise WrapperError('refusing SQL that resets the session, alters the system, switches authorization or '
+                               'runs code the guard cannot read: the server cap must stay in force (%r)' % sql[:80])
+
+
+def _run_psql(url: str, sql: str, tuples: bool, app: Optional[str] = None) -> str:
+    """Run ``sql`` under the server-side caps; the caller has already vetted it."""
     argv = ['psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1']
     if tuples:
         argv.append('-At')
-    argv += ['-c', sql]
-    done = subprocess.run(argv, capture_output=True, text=True, env=_pg_env(url, app or _APP_NAME))
+    env = _pg_env(url, app or _APP_NAME)
+    # One statement per call: the server cap bounds each statement, not the whole -c string (#7481).
+    argv += ['-c', server_caps_sql(env), '-c', sql]
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=PSQL_TIMEOUT_SECS)
+    except subprocess.TimeoutExpired:
+        raise WrapperError('psql timed out after %g s' % PSQL_TIMEOUT_SECS, None)
     if done.returncode != 0:
-        raise WrapperError('psql failed (%d): %s' % (done.returncode, (done.stderr or '').strip()))
+        raise WrapperError('psql failed (%d): %s' % (done.returncode, (done.stderr or '').strip() or 'no stderr'),
+                           done.returncode)
     return done.stdout or ''
+
+
+def psql(url: str, sql: str, tuples: bool = False, app: Optional[str] = None) -> str:
+    """Run one statement through psql; returns stdout, raises on failure. Every call is tagged with this
+    process's application_name (#7179). Refuses SQL that holds more than one
+    statement or mentions anything that could undo the server-side caps (#7521)."""
+    _refuse_uncapped_sql(sql)
+    return _run_psql(url, sql, tuples, app)
+
+
+# The one read the guard would refuse (it names pg_settings and the timeout settings): a fixed statement with no
+# caller-supplied text, run under the same server-side caps. It reads, never writes.
+_EFFECTIVE_TIMEOUTS_SQL = (
+    "SELECT (SELECT setting FROM pg_catalog.pg_settings WHERE name = 'statement_timeout') "
+    "|| '/' || (SELECT setting FROM pg_catalog.pg_settings WHERE name = 'lock_timeout')")
+
+
+def effective_timeouts(url: str) -> Tuple[str, str]:
+    """``(statement_timeout, lock_timeout)`` in ms as the server resolved them for a session on ``url``. The only
+    argument is the URL; the SQL is a module constant, so this helper cannot be used to run caller SQL."""
+    parts = _run_psql(url, _EFFECTIVE_TIMEOUTS_SQL, True).strip().split('/')
+    if len(parts) != 2:
+        raise WrapperError('could not read the effective timeouts (got %r)' % parts)
+    return parts[0], parts[1]
 
 
 def connection_budget(url: str) -> Tuple[int, int, int, int]:
@@ -403,7 +904,11 @@ def session_count(admin_url: str, name: str) -> int:
 
 def open_hold(clone_url: str) -> 'subprocess.Popen[str]':
     """A keepalive psql session on the clone: while it lives, no sweep can drop
-    the clone. It waits on stdin; closing stdin ends it."""
+    the clone. It waits on stdin; closing stdin ends it.
+
+    It runs no statement and its whole life is the clone guard, so it deliberately gets NO server-side
+    statement_timeout or lock_timeout (it never goes through ``psql()``): a cap would only end the guard early
+    (#7456)."""
     return subprocess.Popen(['psql', '-X', '-q', '-v', 'ON_ERROR_STOP=1'], stdin=subprocess.PIPE,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             env=_pg_env(clone_url), text=True)
@@ -498,7 +1003,8 @@ def mint_base(url: str) -> str:
         # below proves the name gone before it is released.
         psql(url, 'CREATE DATABASE %s' % quote_ident(name))
         new_url = with_database(url, name)
-        psql(new_url, 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')
+        psql(new_url, 'CREATE EXTENSION IF NOT EXISTS age')
+        psql(new_url, 'CREATE EXTENSION IF NOT EXISTS vector')
         log('minted ephemeral base %s' % name)
         initialized = True
         return new_url
@@ -796,6 +1302,17 @@ def resolve_base(url: str, db_arg: Optional[str], allow_reason: Optional[str],
 
 # --- tier steps -----------------------------------------------------------
 
+def _proved_absent(url: str, check: str) -> Tuple[bool, str]:
+    """``(absent, reason)``: absent only when the read-only check succeeds with no row (#7405, #7427)."""
+    try:
+        found = psql(url, check, tuples=True).strip()
+    except WrapperError as exc:
+        return False, 'the existence check itself failed: %s' % exc
+    if found:
+        return False, 'the existence check found a database with this name'
+    return True, ''
+
+
 def require_budget(url: str, jobs: int) -> Tuple[int, int]:
     """Refuse when the server lacks the slots; returns ``(available, need)``."""
     need = required_connections(clamp_jobs(jobs))
@@ -806,6 +1323,7 @@ def require_budget(url: str, jobs: int) -> Tuple[int, int]:
     return available, need
 
 
+# linear: one start class then one quantified class between anchors; the classes never overlap a backtrack point
 _RELATION_RE = re.compile(r'^[a-z_][a-z0-9_]*$')
 
 
@@ -848,22 +1366,44 @@ def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
     available, need = require_budget(url, jobs)
     lineage_precheck(url, db_name)
     q = quote_ident(tpl)
-    try:
-        psql(url, SQL_RELEASE_TEMPLATE % q)
-    except WrapperError:
-        pass  # no leftover template from an earlier attempt
-    psql(url, SQL_DROP_DATABASE % q)
+    # Ownership comes only from a successful CREATE. An occupied name (a foreign
+    # or leftover template) or a missing privilege refuses: this function never
+    # ALTERs or DROPs a database it did not create (#7127).
     _own(tpl)  # before the CREATE (#7179), also on the --db path
     initialized = False
     refused = False
     try:
         try:
             psql(url, 'CREATE DATABASE %s' % q)
-        except WrapperError:
-            refused = True  # a competing template is never claimed or dropped (#7124)
+        except WrapperError as exc:
+            refused = True  # a competing or unproven template is never claimed or dropped (#7124, #7127)
             _disown(tpl)
-            raise
-        psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS age; CREATE EXTENSION IF NOT EXISTS vector')
+            if ALREADY_EXISTS in str(exc):
+                raise WrapperError('refusing to use template %s, it was not created by this run: %s; if it is a '
+                                   'leftover of your own earlier run, run `pg_isolated_binary.py teardown --db %s '
+                                   '--run-id <run id>` first, otherwise choose a different --db'
+                                   % (tpl, exc, db_name))
+            check = "SELECT 1 FROM pg_database WHERE datname = '%s'" % tpl.replace("'", "''")
+            if exc.returncode is None:
+                why = 'psql timed out, so the server may still commit the statement'
+            else:
+                why = 'psql ended with status %s, not a plain SQL error' % exc.returncode
+            absent = False
+            if exc.returncode == PSQL_SQL_ERROR:
+                absent, why = _proved_absent(url, check)
+            if not absent:
+                # Status 1 means refused only when the existence check run just above succeeds with no row. A row,
+                # a failed check or any other status (2 lost connection, a negative signal status such as -9, None,
+                # an unexpected code) may follow a committed CREATE, so the outcome is unknown: setup neither claims
+                # the template nor DROPs it (#7388, #7400, #7427, #7428).
+                raise WrapperError('CREATE DATABASE %s ended without a clean answer; the outcome is unknown and the '
+                                   'template may exist with no owner record: %s; %s; to check by hand run `%s` and, '
+                                   'if the template is from this run, run `pg_isolated_binary.py teardown --db %s '
+                                   '--run-id <run id>`'
+                                   % (tpl, exc, why, check, db_name), exc.returncode)
+            raise WrapperError('CREATE DATABASE %s was refused; nothing was created or changed: %s' % (tpl, exc))
+        psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS age')
+        psql(with_database(url, tpl), 'CREATE EXTENSION IF NOT EXISTS vector')
         psql(url, 'ALTER DATABASE %s WITH IS_TEMPLATE true ALLOW_CONNECTIONS false' % q)
         log('template %s ready (%d free connection slots, need %d)' % (tpl, available, need))
         initialized = True
@@ -871,10 +1411,13 @@ def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
         return tpl
     finally:
         if not initialized and not refused:
+            # An interruption or a failure after the CREATE: the template is this run's own, so remove it, never
+            # FORCE; the primary error stays the one raised (#7127). Cancel this run's backends first and prove the
+            # name gone before releasing it (#7179, #7212).
             primary = sys.exc_info()[1]
             try:
                 with _sigterm_deferred():
-                    if not settle_backends(url):  # #7179: the CREATE commits after psql is gone
+                    if not settle_backends(url):  # #7179: a statement can commit after psql is gone
                         # #7212: never disown a name a live backend may still create.
                         raise WrapperError('template %s: backends of this run are still alive after %ds'
                                            % (tpl, int(SETTLE_SECS)))
@@ -888,10 +1431,13 @@ def setup(url: str, db_name: str, jobs: int = MAX_JOBS) -> str:
                     _disown(tpl)
             except _Terminated:
                 raise
-            except BaseException:
+            except BaseException as cleanup:
                 if primary is None:
                     raise
-                log('WARN owned template cleanup also failed; manual cleanup required')
+                # A WrapperError carries only psql's own words; any other type is named, never quoted.
+                detail = str(cleanup) if isinstance(cleanup, WrapperError) else type(cleanup).__name__
+                log('WARN could not drop the half-built template %s: %s; cleanup failed, manual cleanup required'
+                    % (tpl, detail))
 
 
 def _names(url: str, sql: str) -> List[str]:

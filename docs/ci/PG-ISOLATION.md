@@ -127,6 +127,13 @@ unset.
   `PGSSLMODE`, ...). ci.yml passes the URL through the environment, never with
   `--url` (invariant `G3-no-url-argv`). A URL query key the wrapper does not
   know fails closed.
+* **Caller SQL guard.** `psql()` refuses SQL it cannot read the way the server
+  does. That includes an octal escape above `\377` in an E-string and in a
+  plain literal such as '\563': whether a backslash escapes inside a plain
+  literal depends on `standard_conforming_strings`, which the wrapper does not
+  control, and PostgreSQL keeps only the low byte of an octal escape. The error
+  text says "an E-string" or "a plain-literal" to match the literal (#7703,
+  #7717).
 
 ## Budgets left unchanged
 

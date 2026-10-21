@@ -53,6 +53,9 @@ use ai_memory::signed_events::{
 use rusqlite::{Connection, params};
 use sha2::{Digest, Sha256};
 
+#[path = "common/key_dir_sandbox.rs"]
+mod key_dir_sandbox;
+
 /// Process-global serialisation for the witness ENV + throttle static.
 fn env_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -71,11 +74,13 @@ fn fresh_dir(label: &str) -> tempfile::TempDir {
         .unwrap_or_else(|_| PathBuf::from("."))
         .join(".local-runs")
         .join("issue-1822-witness");
-    std::fs::create_dir_all(&root).ok();
+    // #7241 (G4): create the fixture directories owner-only, whatever the host
+    // umask, so the key-dir guard (#3198) sees 0700 and not 0775.
+    key_dir_sandbox::mkdir_0700(&root);
     let prefix = format!("{label}-");
     let mut builder = tempfile::Builder::new();
     builder.prefix(&prefix);
-    // #7158 / #7161 — the witness key directory must satisfy the #3198
+    // #7158 / #7161 - the witness key directory must satisfy the #3198
     // key-directory gate whatever the process umask, so the mode is set on
     // the builder and the directory never exists in a umask-derived mode.
     #[cfg(unix)]
@@ -83,9 +88,11 @@ fn fresh_dir(label: &str) -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
         builder.permissions(std::fs::Permissions::from_mode(0o700));
     }
-    builder
+    let dir = builder
         .tempdir_in(&root)
-        .expect("tempdir under .local-runs")
+        .expect("tempdir under .local-runs");
+    key_dir_sandbox::mkdir_0700(dir.path());
+    dir
 }
 
 /// #7158 / #7161 — the fixture key directory is private whatever the process
@@ -631,10 +638,35 @@ fn pg_append_chokepoint_references_witness_and_watermark_emitters() {
         "/src/store/postgres.rs"
     ))
     .expect("read postgres.rs");
-    // The pg chokepoint must wire the #1850 watermark (item 7) ...
+    // The pg chokepoint must wire the #1850 watermark (item 7) ... #7241: it
+    // builds a pending anchor in the tx, and the commit helper records it
+    // only AFTER the COMMIT succeeds (never for a rolled-back append).
     assert!(
-        src.contains("maybe_record_audit_watermark"),
-        "pg chokepoint must call maybe_record_audit_watermark (item 7 parity)"
+        src.contains("PendingAuditAnchor::watermark("),
+        "pg chokepoint must build the watermark anchor (item 7 parity)"
+    );
+    let commit_helper = src
+        .split("pub(crate) async fn pg_commit_and_emit(")
+        .nth(1)
+        .expect("pg_commit_and_emit must exist (#7241)");
+    let commit_at = commit_helper
+        .find("tx.commit().await?")
+        .expect("helper commits");
+    let emit_at = commit_helper
+        .find("anchor.emit_after_commit()")
+        .expect("helper emits the anchor");
+    assert!(
+        commit_at < emit_at,
+        "the watermark anchor must be recorded only after the COMMIT (#7241)"
+    );
+    let audit_src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/governance/audit.rs"
+    ))
+    .expect("read audit.rs");
+    assert!(
+        audit_src.contains("maybe_record_audit_watermark(w.head_sequence"),
+        "the post-commit emit must reach maybe_record_audit_watermark (item 7 parity)"
     );
     // ... and the #1822 dual-chain witness emitter (item 6).
     assert!(

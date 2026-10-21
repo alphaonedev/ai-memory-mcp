@@ -293,7 +293,7 @@ certification and triggers re-cert** (see §7).
 > certify. Every figure below was measured on this SHA.
 >
 > **§5.4(2) posture legs** (evidence: `docs/compliance/evidence/cert-eae99be43/`;
-> reproducible with `scripts/recapture-cert-3607-posture.sh`, whose header
+> reproducible with `scripts/recapture-cert-3607-posture.py`, whose header
 > declares the 22 checks): leg 1 bare — exit **2**, 12 PASS /
 > 10 FAIL; leg 2 hardened, gate unarmed — exit **2**, 20 /
 > 2; leg 3 hardened, gate ARMED — exit **1**, refuses boot; leg 4
@@ -1894,7 +1894,19 @@ captures in `docs/compliance/evidence/cert-3607/`. Cargo `--no-fail-fast`.
 exit 1, refuses to boot. Certified configuration (sqlcipher, encrypt-at-rest,
 boot gate, `AI_MEMORY_DB_SYNCHRONOUS=FULL`, operator key pair): **exit 0,
 22 PASS / 0 FAIL**. Recorded in `cert-3607/posture-legs-exit-codes.txt`;
-reproducible with `scripts/recapture-cert-3607-posture.sh`.
+recapturable with `scripts/recapture-cert-3607-posture.py`: every child runs in its
+own fresh empty cwd, so two consecutive runs of the script give byte-identical
+captures, and the run refuses to publish over a bundle that does not match its
+`MANIFEST.sha256` as committed in git HEAD (read with `git show HEAD:<path>`, never the file
+on disk): the manifest must be in HEAD, the working-tree manifest must be byte-identical to it,
+the files and directories under the bundle must equal the manifest set exactly (an extra,
+missing or unlisted file or subdirectory, or any symlink, refuses) and every listed digest
+must match. A recapture prints `live pragma not observed` where the committed captures
+(`posture-bare-env.out:75`, `posture-hardened-env.out:68`) print `agrees`: the old shared cwd
+held the store that `rules keygen` made (#7648), while every child now runs in its own empty
+cwd and legs 1 and 2 see no store (#7697). The recapture also refuses to publish a capture in
+which a sensitive path survives redaction in any decoded view (#7698). The committed bundle
+stays bound to the build that produced it (not recaptured here).
 
 **Re-cert trigger — FIRED by #3204 (`src/handlers/federation_receive.rs`,
 `src/handlers/federation_signing_check.rs`, `src/identity/sign.rs` — the far-endpoint
@@ -1935,7 +1947,12 @@ pg database created for the run; raw named-test listing and the posture captures
 exit 1, refuses to boot. Certified configuration (sqlcipher, encrypt-at-rest,
 boot gate, `AI_MEMORY_DB_SYNCHRONOUS=FULL`, operator key pair): **exit 0,
 22 PASS / 0 FAIL**. Recorded in `cert-3607/posture-legs-exit-codes.txt`;
-reproducible with `scripts/recapture-cert-3607-posture.sh`.
+recapturable with `scripts/recapture-cert-3607-posture.py`: every child runs in its
+own fresh empty cwd, so two consecutive runs of the script give byte-identical
+captures, and the run refuses to publish over a bundle that does not match its
+`MANIFEST.sha256` as committed in git HEAD (the committed file, not the one on disk; see the
+recapture note above). The committed bundle stays bound to the build that
+produced it (not recaptured here).
 
 ---
 
