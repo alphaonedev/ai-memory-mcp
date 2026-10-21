@@ -459,11 +459,14 @@ class Run:
             raise ConfigError(str(e)) from e
         if fd is None:
             raise ConfigError(f"{path}: scratch directory disappeared")
-        st = os.fstat(fd)
-        expected = self.scratch_identities.get(path)
-        if expected is not None and (st.st_dev, st.st_ino) != expected:
+        try:  # #7870: ownership passes to the caller only after validation; any failure closes the descriptor here
+            st = os.fstat(fd)
+            expected = self.scratch_identities.get(path)
+            if expected is not None and (st.st_dev, st.st_ino) != expected:
+                raise ConfigError(f"{path}: scratch directory was replaced")
+        except BaseException:
             os.close(fd)
-            raise ConfigError(f"{path}: scratch directory was replaced")
+            raise
         return fd
 
     @staticmethod
