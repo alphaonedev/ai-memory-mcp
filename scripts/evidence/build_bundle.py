@@ -427,6 +427,7 @@ MANIFEST_NAME = "MANIFEST.sha256"
 PRIVATE_MODE = 0o700
 DIRECTORY_MODE = 0o755
 FILE_MODE = 0o644
+PRIVATE_FILE_MODE = 0o600  # #7868: creation mode; fchmod widens a verified file to its published mode
 UNTRUSTED_WRITE = 0o022
 WORLD_WRITE = 0o002
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -470,7 +471,7 @@ def directory_handle(parent_fd, name):
 @contextlib.contextmanager
 def stage_file(directory_fd, name, flags, mode):
     """A no-follow file handle whose descriptor is closed even if wrapping it fails."""
-    fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, FILE_MODE, dir_fd=directory_fd)
+    fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, PRIVATE_FILE_MODE, dir_fd=directory_fd)
     try:
         with os.fdopen(fd, mode, closefd=False) as stream:
             yield stream
