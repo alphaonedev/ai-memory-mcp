@@ -117,6 +117,56 @@ class Gate(Fixture):
         rc, _, _ = self.run_main(self.args(m, 660, 4099, 4099))
         self.assertEqual(rc, 0)
 
+    def gate_rc(self, serial, budget=4099):
+        m = self.write(serial, 1, 1)
+        return self.run_main(self.args(m, budget, 4099, 4099))
+
+    def test_fractional_overrun_fails_7807(self):
+        # raw 1000.1 x 0.66 = 660.066 s is above a 660 s budget; rounding hid it
+        rc, _, err = self.gate_rc(1000.1, 660)
+        self.assertEqual(rc, 2)
+        self.assertIn('::error::[#7343 fail-fast] shard serial', err)
+        self.assertIn('budget 660s', err)
+
+    def test_equality_still_passes_7807(self):
+        self.assertEqual(self.gate_rc(1000, 660)[0], 0)
+
+    def test_negative_estimate_fails_closed_7808(self):
+        rc, _, err = self.gate_rc(-1)
+        self.assertEqual(rc, 2)
+        self.assertIn('::error::', err)
+        self.assertIn('shard serial', err)
+        self.assertIn('-1', err)
+        self.assertIn('budget 4099s', err)
+
+    def test_nan_estimate_fails_closed_7808(self):
+        rc, _, err = self.gate_rc(float('nan'))
+        self.assertEqual(rc, 2)
+        self.assertIn('::error::', err)
+        self.assertIn('shard serial', err)
+        self.assertIn('nan', err)
+
+    def test_infinite_estimates_fail_closed_7808(self):
+        for bad in (float('inf'), float('-inf')):
+            rc, _, err = self.gate_rc(bad)
+            self.assertEqual(rc, 2, bad)
+            self.assertIn('::error::', err)
+            self.assertIn('shard serial', err)
+
+    def test_boolean_string_and_container_estimates_fail_closed_7808(self):
+        for bad in (True, False, 'abc', '12', [1], {'a': 1}, None):
+            rc, _, err = self.gate_rc(bad)
+            self.assertEqual(rc, 2, bad)
+            self.assertIn('::error::', err)
+
+    def test_zero_estimate_still_passes_7808(self):
+        self.assertEqual(self.gate_rc(0)[0], 0)
+
+    def test_oversized_integer_estimate_fails_closed_7808(self):
+        rc, _, err = self.gate_rc(10 ** 400)
+        self.assertEqual(rc, 2)
+        self.assertIn('::error::', err)
+
     def test_missing_manifest_or_budget_fails_closed(self):
         rc, _, err = self.run_main(['gate', '--manifest', str(SCRATCH / 'nope.json'), '--budget', 'serial=1'])
         self.assertEqual(rc, 2)
