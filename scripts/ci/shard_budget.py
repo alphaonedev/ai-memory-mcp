@@ -22,8 +22,10 @@ Exit codes: 0 ok, 1 ratchet failure, 2 gate failure or unusable input.
 """
 import argparse
 import json
+import math
 import re
 import sys
+from decimal import ROUND_CEILING, Decimal
 from pathlib import Path
 
 SHARDS = ('serial', 'parallel_1', 'parallel_2')
@@ -38,6 +40,11 @@ ESTIMATE_SCALE = {'serial': 0.66, 'parallel_1': 1.76, 'parallel_2': 2.63}
 WARN_FRACTION = 0.85
 FAIL_FRACTION = 0.95
 PERCENT = 100
+# An estimate wider than this many bits cannot be a real shard weight; reject it
+# rather than risk a float overflow or a huge Decimal.
+MAX_ESTIMATE_BITS = 64
+# Longest estimate text echoed into an error line.
+MAX_SHOWN_CHARS = 40
 RC_OK, RC_RATCHET, RC_BAD = 0, 1, 2
 NOTICE_RE = re.compile(r"'\[(?P<shard>\w+)\] [^']*' ran (?P<ran>\d+)s of the (?P<of>\d+)s per-invocation watchdog budget")
 
@@ -75,6 +82,27 @@ def percent(used, budget):
     return int(used * PERCENT / budget + 0.5)
 
 
+def estimate_of(raw, shard, budget):
+    """Return the raw estimate as an exact Decimal, or fail closed (#7808).
+
+    Only a finite, non-negative int or float is a usable estimate. Booleans
+    (an int subclass), strings, containers, None, NaN, infinities and integers
+    too large for a float are all rejected with the structured BudgetError.
+    """
+    usable = isinstance(raw, (int, float)) and not isinstance(raw, bool)
+    if usable and isinstance(raw, float):
+        usable = math.isfinite(raw)
+    if usable and isinstance(raw, int):
+        usable = raw.bit_length() <= MAX_ESTIMATE_BITS
+    # repr() of a float is its shortest round-trip form, so Decimal(repr) keeps
+    # the manifest's own decimal digits instead of the binary approximation.
+    if not usable or Decimal(repr(raw)) < 0:
+        shown = repr(raw) if len(repr(raw)) <= MAX_SHOWN_CHARS else repr(raw)[:MAX_SHOWN_CHARS] + '...'
+        raise BudgetError('shard %s: estimate %s is not a finite non-negative number (budget %ds)'
+                          % (shard, shown, budget))
+    return Decimal(repr(raw))
+
+
 def gate(args):
     budgets = pairs(args.budget, '--budget', True)
     try:
@@ -83,15 +111,19 @@ def gate(args):
         raise BudgetError('cannot read estimate_seconds from %s: %s' % (args.manifest, exc))
     failed = False
     for shard in SHARDS:
-        try:
-            raw = float(est[MANIFEST_KEY[shard]])
-        except (KeyError, TypeError, ValueError):
-            raise BudgetError('manifest %s has no %s' % (args.manifest, MANIFEST_KEY[shard]))
-        calibrated = int(round(raw * ESTIMATE_SCALE[shard]))
         budget = budgets[shard]
+        try:
+            value = est[MANIFEST_KEY[shard]]
+        except (KeyError, TypeError):
+            raise BudgetError('manifest %s has no %s' % (args.manifest, MANIFEST_KEY[shard]))
+        raw = estimate_of(value, shard, budget)
+        # Exact comparison: a fractional overrun must fail, so nothing is rounded
+        # before it. The scale is read as its decimal text (0.66), not its binary value.
+        exact = raw * Decimal(str(ESTIMATE_SCALE[shard]))
+        calibrated = int(exact.to_integral_value(rounding=ROUND_CEILING))
         line = 'shard %s estimate %ds (raw %ds x %.2f) vs budget %ds' % (
             shard, calibrated, round(raw), ESTIMATE_SCALE[shard], budget)
-        if calibrated > budget:
+        if exact > budget:
             failed = True
             print('::error::[#7343 fail-fast] %s: the estimate exceeds the budget; move binaries to a '
                   'parallel shard (scripts/ci/serial_to_parallel_moves.txt) instead of raising it' % line,
