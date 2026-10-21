@@ -33,11 +33,4 @@ tests/common/lane_db.rs:153   # refusal predicate case (lane_database_predicate_
 scripts/bench/wake_bench_env.sh:199   # refusal guard: the bench harness rejects the shared database name (quoted literal, R6)
 infra/lan-parity-test/init-age.sql:41   # LAN parity dev compose init GRANT on the shared database (parity Pass 1 rework burns this down, R7)
 infra/lan-parity-test/run-parity-tests.sh:67   # PG_PASS: the dev compose password value equals the database name, not a database reference (R6)
-scripts/ci/tests/test_pg_isolated_binary.py:717   # refusal probe of pg_isolated_binary setup/teardown against the shared name (R6) [landing-order #7088]
-scripts/ci/tests/test_pg_isolated_binary.py:728   # refusal probe of pg_isolated_binary setup/teardown against the shared name (R6) [landing-order #7088]
-scripts/ci/tests/test_pg_isolated_binary.py:735   # refusal probe of pg_isolated_binary setup/teardown against the shared name (R6) [landing-order #7088]
-scripts/ci/tests/test_pg_isolated_binary.py:742   # refusal probe of pg_isolated_binary setup/teardown against the shared name (R6) [landing-order #7088]
-scripts/ci/tests/test_pg_isolated_binary.py:782   # refusal probe of pg_isolated_binary setup/teardown against the shared name (R6) [landing-order #7088]
-scripts/ci/tests/test_pg_isolated_binary.py:783   # refusal probe of pg_isolated_binary setup/teardown against the shared name (R6) [landing-order #7088]
-scripts/ci/tests/test_pg_isolated_binary.py:785   # assert the shared database is never dropped by teardown (R6) [landing-order #7088]
 docs/v0.7.0/regression-runs/2026-05-31-final-baseline/README.md:80  # historical regression-run record of the 2026-05-31 baseline URL; the record is not rewritten (R1)
