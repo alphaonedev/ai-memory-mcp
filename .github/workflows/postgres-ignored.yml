@@ -41,6 +41,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # #7160 - size cap for the persistent self-hosted target/debug build state
+  # (40 GiB); scripts/ci-sweep-target.py reads it via the sweep step below.
+  SELF_HOSTED_TARGET_CAP_BYTES: 42949672960
   CARGO_INCREMENTAL: "0"
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
@@ -145,3 +148,9 @@ jobs:
           else
             echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"
           fi
+
+      # #7160 - cap the persistent self-hosted target/debug (workspace-local,
+      # oldest-mtime first). Last step so it never races a running build.
+      - name: Sweep target/debug to the size cap (self-hosted)
+        if: always() && runner.environment == 'self-hosted'
+        run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
