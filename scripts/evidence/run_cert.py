@@ -108,6 +108,23 @@ PRIVATE_DIRECTORY_RANDOM_BYTES = 16
 PYTHON_COMMAND = re.compile(r"python(?:3(?:\.\d+)?)?\Z")
 
 
+def close_all(fds):
+    """Close every descriptor; keep the first OSError and re-raise it after the loop (#7876, as #7871).
+
+    decision: an identical small helper lives here and in build_bundle.py (which uses ExitStack) because both
+    scripts run as standalone files with no shared package to import from.
+    """
+    first = None
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError as e:
+            if first is None:
+                first = e
+    if first is not None:
+        raise first
+
+
 def isolated_python_environment(env, launcher_dir):
     """Pin nested gate Python to this interpreter, without trusting PATH or a checkout helper.
 
@@ -448,11 +465,9 @@ class Run:
                         self.remove_tree(roots[self.tmpdir], name, expected_identity=(owned.st_dev, owned.st_ino))
                     except (OSError, ValueError) as e:
                         self.fail(f"  RED private scratch cleanup: {e}")
-                    finally:
-                        os.close(fd)
             finally:
-                for _path, root_fd in opened_roots:
-                    os.close(root_fd)
+                # #7876: one failing close must not leak the rest; private directories close before the roots.
+                close_all([fd for _name, fd in reversed(private)] + [fd for _path, fd in opened_roots])
 
     def guarded_root(self, path):
         """(path, descriptor) of a guarded scratch root: the pair form run() records and closes in its finally."""

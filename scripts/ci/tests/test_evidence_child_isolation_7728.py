@@ -30,11 +30,11 @@ SHELL_CHILDREN = (
     'check-ci-job-claims.sh', 'check-hardcoded-literals.sh', 'check-vendor-literals.sh',
     'qc-codegraph-precheck.sh', 'check-test-env-lock.sh', 'check-count-assertion-declared.sh',
     'check-foreign-text-to-caller.sh', 'check-bootstrap-cert-gate.sh',
-    'recapture-cert-3607-posture.sh', 'check-migration-ladder.sh', 'lib/production-lines.sh',
+    'check-migration-ladder.sh', 'lib/production-lines.sh',
 )
 PYTHON_CHILDREN = (
     'check-claude-md-size.py', 'check-foreign-text-to-caller.py', 'check-sqlite-write-txn-immediate.py',
-    'cert_gate_evidence.py', 'tests/gate-production-3623.py', 'tests/for-admin-checked-literal-3943.py',
+    'cert_gate_evidence.py', 'recapture-cert-3607-posture.py', 'tests/gate-production-3623.py', 'tests/for-admin-checked-literal-3943.py',
 )
 
 
