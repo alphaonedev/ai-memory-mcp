@@ -68,7 +68,7 @@ def run_git(repo, *args, **kw):
         return subprocess.run(["git", "-C", str(repo), *args], cwd=str(repo), **kw)
     except OSError as e:
         sys.stderr.write(f"git {' '.join(args)} cannot run in {repo}: {e.strerror or e}\n")
-        sys.exit(3)
+        raise SystemExit(3) from e  # #7869: a raise, not a sys.exit() call, so the function has one return type
 
 
 def git(repo, *args):
