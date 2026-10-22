@@ -473,13 +473,14 @@ fn identical_inputs_produce_identical_signatures() {
 /// Single-sign samples per run of the latency guard; the guard uses the
 /// FASTEST sample (#7244).
 const SINGLE_SIGN_SAMPLES: usize = 9;
-/// Unscaled wall-clock budget for one single sign + serialize. An unloaded
-/// debug build takes ~0.3 ms, so 50 ms sits ~160x above it (a sample of 13.8 ms
-/// measured under load, #7244, passes) while a hot-path regression (key
-/// derivation or hashing per call, ~100 ms class) fails every sample and so
-/// fails the best-of-[`SINGLE_SIGN_SAMPLES`] minimum. Scaled by
-/// `AI_MEMORY_TEST_TIMING_BUDGET_MULT`.
-const SINGLE_SIGN_BASE_BUDGET: Duration = Duration::from_millis(50);
+/// Unscaled wall-clock budget for one single sign + serialize. The best
+/// sample measured under load (~23) in a debug build is ~0.32 ms (319.95 us),
+/// so 5 ms sits ~15x above it: a one-off scheduling stall (13.8 ms, #7244) no
+/// longer fails because the guard takes the best of
+/// [`SINGLE_SIGN_SAMPLES`], while a per-call slowdown of ~15x or more (key
+/// derivation or hashing per call) fails every sample and so fails the
+/// minimum. Scaled by `AI_MEMORY_TEST_TIMING_BUDGET_MULT`.
+const SINGLE_SIGN_BASE_BUDGET: Duration = Duration::from_millis(5);
 
 #[test]
 fn single_sign_completes_within_load_tolerant_budget() {
@@ -547,11 +548,11 @@ const NO_KEYPAIR_BATCH_SIZE: usize = 10_000;
 /// Timed batches per run; the guard uses the FASTEST batch (#7244).
 const NO_KEYPAIR_BATCH_RUNS: usize = 5;
 /// Unscaled wall-clock budget for one batch of [`NO_KEYPAIR_BATCH_SIZE`]
-/// no-keypair calls. An unloaded debug build takes ~0.2 ms (183 us measured), so 100 ms
-/// leaves >= 10x headroom, while a per-call cost of even 10 us (key
-/// derivation or hashing, 100 ms per batch) fails every batch. Scaled by
-/// `AI_MEMORY_TEST_TIMING_BUDGET_MULT`.
-const NO_KEYPAIR_BASE_BUDGET: Duration = Duration::from_millis(100);
+/// no-keypair calls. The best batch measured under load (~23) in a debug build
+/// is ~0.18 ms (182.867 us), so 10 ms sits ~55x above it, while a per-call
+/// cost of 1 us or more (key derivation or hashing, 10 ms per batch) fails
+/// every batch. Scaled by `AI_MEMORY_TEST_TIMING_BUDGET_MULT`.
+const NO_KEYPAIR_BASE_BUDGET: Duration = Duration::from_millis(10);
 
 #[test]
 fn no_keypair_path_completes_within_load_tolerant_budget() {
