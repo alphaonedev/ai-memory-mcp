@@ -2059,11 +2059,76 @@ def ratchet_problems(committed, current):
     return problems
 
 
+BASE_REF_ENV = "CERT_MANIFEST_BASE_REF"  # explicit base ref for the anchored ratchet
+GITHUB_BASE_ENV = "GITHUB_BASE_REF"  # the pull-request base branch CI provides
+DEFAULT_BASE_REFS = ("origin/chain/promo6-ssh-r2", "origin/release/v1.0.0")
+GIT_QUERY_TIMEOUT_S = 60
+
+
+def base_ref_candidates(environ):
+    """Refs to try for the merge-base manifest, most specific first."""
+    refs = []
+    if environ.get(BASE_REF_ENV):
+        refs.append(environ[BASE_REF_ENV])
+    if environ.get(GITHUB_BASE_ENV):
+        refs.append("origin/" + environ[GITHUB_BASE_ENV])
+    refs.extend(DEFAULT_BASE_REFS)
+    return refs
+
+
+def base_manifest(repo, refs):
+    """{name: verdict} from the manifest at the merge-base of HEAD and the first
+    usable ref, or None when no ref resolves or the base has no manifest (shallow
+    clone, or a base that predates the manifest). The base copy cannot be edited by
+    the change under review, which is the point (#7976)."""
+    rel = MANIFEST_FILE.relative_to(HARNESS_ROOT).as_posix()
+    for ref in refs:
+        mb = subprocess.run(["git", "merge-base", "HEAD", ref], cwd=str(repo),
+                            capture_output=True, text=True, timeout=GIT_QUERY_TIMEOUT_S)
+        if mb.returncode != 0 or not mb.stdout.strip():
+            continue
+        show = subprocess.run(["git", "show", f"{mb.stdout.strip()}:{rel}"], cwd=str(repo),
+                              capture_output=True, text=True, timeout=GIT_QUERY_TIMEOUT_S)
+        if show.returncode != 0:
+            continue
+        out = {}
+        for raw in show.stdout.splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#"):
+                fields = line.split()
+                if len(fields) == 2 and fields[1] in (GREEN, RED):
+                    out[fields[0]] = fields[1]
+        return out
+    return None
+
+
+def base_ratchet_problems(base, current):
+    """Ratchet against the merge-base manifest: no name the base holds may vanish
+    and no base GREEN may become RED. Growth and RED -> GREEN are allowed."""
+    problems = []
+    for name in sorted(base):
+        if name not in current:
+            problems.append(f"{name}: deleted since the merge-base (the manifest never shrinks)")
+        elif base[name] == GREEN and current[name] == RED:
+            problems.append(f"{name}: flipped GREEN -> RED since the merge-base")
+    return problems
+
+
 class Ratchet(unittest.TestCase):
-    """The V6 guard: the corpus can grow and RED can become GREEN, nothing else."""
+    """The V6 guard: the corpus can grow and RED can become GREEN, nothing else. Anchored to
+    the merge-base manifest when reachable (#7976); the in-tree comparison is the weaker fallback."""
 
     def test_manifest_ratchet(self):
         problems = ratchet_problems(read_manifest(MANIFEST_FILE), MANIFEST)
+        base = base_manifest(HARNESS_ROOT, base_ref_candidates(os.environ))
+        if base is None:
+            # WEAKER: both files live in the change under review, so one identical edit
+            # to both passes. Taken only when no base manifest is reachable (shallow
+            # clone, or a base that predates the manifest).
+            print("NOTE: manifest ratchet ran in-tree only (weaker): no base manifest reachable",
+                  file=sys.stderr)
+        else:
+            problems += base_ratchet_problems(base, MANIFEST)
         self.assertEqual(problems, [], "\n".join(problems))
 
     def test_every_case_is_registered(self):
@@ -2084,6 +2149,36 @@ class Ratchet(unittest.TestCase):
         self.assertIn("manifest records RED", " ".join(ratchet_problems(committed, unrecorded)))
         grown = dict(committed, case_3_new=RED)
         self.assertIn("not recorded", " ".join(ratchet_problems(committed, grown)))
+
+
+    def test_base_anchor_rejects_same_edit_in_both(self):
+        """#7976: deleting a case from the corpus AND from the in-tree manifest passes
+        the in-tree comparison; the merge-base manifest still catches it."""
+        tmp = Path(tempfile.mkdtemp(prefix=CASE_SCRATCH_PREFIX, dir=str(SCRATCH_ROOT)))
+        try:
+            repo = tmp / "r"
+            rel = MANIFEST_FILE.relative_to(HARNESS_ROOT)
+            (repo / rel.parent).mkdir(parents=True)
+            base_names = {"cell_x": GREEN, "case_1_y": RED, "case_2_z": GREEN}
+            (repo / rel).write_text("".join(f"{n} {v}\n" for n, v in sorted(base_names.items())), encoding="utf-8")
+            git = ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid", "-c", "commit.gpgsign=false"]
+            for argv in (["init", "-q"], ["add", str(rel)], ["commit", "-q", "-m", "base"],
+                         ["update-ref", "refs/remotes/origin/basecand", "HEAD"]):
+                subprocess.run(git + argv, cwd=str(repo), check=True, capture_output=True)
+            edited = {k: v for k, v in base_names.items() if k != "cell_x"}
+            (repo / rel).write_text("".join(f"{n} {v}\n" for n, v in sorted(edited.items())), encoding="utf-8")
+            self.assertEqual(ratchet_problems(read_manifest(repo / rel), edited), [],
+                             "the in-tree comparison is expected to be blind to the identical edit")
+            base = base_manifest(repo, ["origin/basecand"])
+            self.assertEqual(base, base_names)
+            self.assertIn("deleted", " ".join(base_ratchet_problems(base, edited)))
+            weakened = dict(base_names, case_2_z=RED)
+            self.assertIn("GREEN -> RED", " ".join(base_ratchet_problems(base, weakened)))
+            grown = dict(base_names, case_3_new=RED, case_1_y=GREEN)
+            self.assertEqual(base_ratchet_problems(base, grown), [])
+            self.assertIsNone(base_manifest(repo, ["origin/nosuchref"]))
+        finally:
+            shutil.rmtree(str(tmp), ignore_errors=True)
 
 
 FILTER_ENV = "CERT_CORPUS_FILTER"  # comma-separated name prefixes; a debugging and nesting knob
