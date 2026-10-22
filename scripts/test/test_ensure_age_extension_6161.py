@@ -257,8 +257,13 @@ def load_module():
     return mod
 
 
+TEST_UMASK = 0o022  # the fixtures' file modes must not depend on the caller's umask (#7981, #7984)
+
+
 class TestEnsureAgeExtension6161(unittest.TestCase):
     def setUp(self):
+        old_umask = os.umask(TEST_UMASK)
+        self.addCleanup(os.umask, old_umask)
         scratch_root = ROOT / ".local-runs" / "tmp"
         scratch_root.mkdir(parents=True, exist_ok=True)
         self.tmp = tempfile.TemporaryDirectory(prefix="age-6161-", dir=str(scratch_root))
