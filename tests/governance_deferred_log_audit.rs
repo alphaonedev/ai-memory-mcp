@@ -33,6 +33,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::Duration;
 
+/// Hang watchdog on the audited-path loop in `drainer_does_not_block_inserts`;
+/// fires only when a call blocks on the drainer flush, it is not a latency budget.
+const DRAINER_WATCHDOG: Duration = Duration::from_secs(5);
+/// Upper bound on how long `FlushGate::wait_open` parks when no opener arrives.
+const GATE_LOST_OPENER_BOUND: Duration = Duration::from_secs(10);
+/// Audited-path calls issued while the drainer flush is held closed.
+const NO_BLOCK_CALLS: u64 = 50;
+/// Restart budget handed to the supervised drainer in the no-block test.
+const NO_BLOCK_MAX_RESTARTS: u32 = 3;
+
+// The watchdog must fire before the gate releases a stuck call, otherwise a
+// blocking regression would pass once the gate bound frees it.
+const _: () = assert!(DRAINER_WATCHDOG.as_millis() < GATE_LOST_OPENER_BOUND.as_millis());
+
 use ai_memory::db;
 use ai_memory::governance::agent_action::{AgentAction, Decision, check_agent_action_deferred};
 use ai_memory::governance::deferred_audit::{
@@ -192,7 +206,7 @@ impl FlushGate {
         let (lock, cvar) = &*self.0;
         let guard = lock.lock().unwrap_or_else(PoisonError::into_inner);
         let _ = cvar
-            .wait_timeout_while(guard, Duration::from_secs(10), |open| !*open)
+            .wait_timeout_while(guard, GATE_LOST_OPENER_BOUND, |open| !*open)
             .unwrap_or_else(PoisonError::into_inner);
     }
 }
@@ -259,7 +273,7 @@ async fn drainer_does_not_block_inserts() {
             ),
         },
         metrics.clone(),
-        3,
+        NO_BLOCK_MAX_RESTARTS,
     );
 
     // Real watchdog: the loop runs on its own OS thread under a 5 s
@@ -275,7 +289,7 @@ async fn drainer_does_not_block_inserts() {
     std::thread::spawn(move || {
         let conn = db::open(&loop_db).expect("open consult conn");
         let action = refusal_action();
-        for _ in 0..50 {
+        for _ in 0..NO_BLOCK_CALLS {
             let decision =
                 check_agent_action_deferred(&conn, "agent:no-block", &action, &loop_queue).unwrap();
             assert!(
@@ -285,13 +299,13 @@ async fn drainer_does_not_block_inserts() {
         }
         let _ = done_tx.send(());
     });
-    tokio::time::timeout(Duration::from_secs(5), done_rx)
+    tokio::time::timeout(DRAINER_WATCHDOG, done_rx)
         .await
         .expect("audited-path loop hung while the drainer flush was closed")
         .expect("audited-path loop thread panicked");
     assert_eq!(
         metrics.submitted_count(),
-        50,
+        NO_BLOCK_CALLS,
         "all 50 deferred rows must be queued while the flush is closed"
     );
     assert_eq!(
@@ -312,7 +326,11 @@ async fn drainer_does_not_block_inserts() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(count, 50, "every refusal must chain-log");
+    assert_eq!(
+        u64::try_from(count).unwrap(),
+        NO_BLOCK_CALLS,
+        "every refusal must chain-log"
+    );
 }
 
 // ---------------------------------------------------------------------------
