@@ -34,7 +34,10 @@
 #[path = "common/pg_barrier.rs"]
 mod pg_barrier;
 
-use std::time::{Duration, Instant};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash as _, Hasher as _};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ai_memory::store::postgres::PostgresStore;
 use sqlx::Connection as _;
@@ -216,12 +219,113 @@ async fn stale_scratch_database_is_swept_and_lookalikes_are_kept_4489() {
     sweep_cycle_4489(&url, &run_prefix(), false).await;
 }
 
-/// The fixed prefix every run used before #7904.
-const LEGACY_SWEEP_PREFIX: &str = "ai_memory_4489sweep";
+/// Fixed head of every sweep-cell fixture prefix; the per-run suffix follows (#7904).
+const SWEEP_PREFIX_HEAD: &str = "ai_memory_4489s";
 
-/// Prefix of this run's fixture databases (#7904).
+/// Lowercase hex characters in the per-run suffix.
+const RUN_SUFFIX_HEX: usize = 8;
+
+/// Bound on the guard's own connect and drop, so an unreachable host cannot hang
+/// a panicking test for the OS TCP timeout.
+const FIXTURE_IO_BOUND: Duration = Duration::from_secs(20);
+
+/// Distinguishes two prefixes minted in the same process within one clock tick.
+static RUN_PREFIX_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Prefix of this run's fixture databases (#7904): `ai_memory_4489s` + 8 lowercase
+/// hex characters derived from the process id and a nanosecond timestamp, so two
+/// concurrent jobs (or a rerun after a killed one) never share a fixture name. The
+/// result keeps the exact `<prefix>_<10 digits>_<8 hex>` scratch shape the sweep
+/// matches, and stays short enough for the longest lookalike under 63 bytes.
 fn run_prefix() -> String {
-    LEGACY_SWEEP_PREFIX.to_string()
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let mut hasher = DefaultHasher::new();
+    (
+        std::process::id(),
+        nanos,
+        RUN_PREFIX_SEQ.fetch_add(1, Ordering::Relaxed),
+    )
+        .hash(&mut hasher);
+    let tag = hasher.finish();
+    format!(
+        "{SWEEP_PREFIX_HEAD}{:0width$x}",
+        tag & ((1_u64 << (RUN_SUFFIX_HEX * 4)) - 1),
+        width = RUN_SUFFIX_HEX
+    )
+}
+
+/// Drops every registered fixture database when it goes out of scope, including on
+/// a panic unwind. Names are registered BEFORE their CREATE, so a panic anywhere
+/// (even mid-CREATE) drops whatever exists; the drop is `IF EXISTS` and runs on its
+/// own thread and runtime so it works while the test runtime is unwinding.
+struct FixtureGuard {
+    admin_url: String,
+    names: Vec<String>,
+}
+
+impl FixtureGuard {
+    fn new(admin_url: &str) -> Self {
+        Self {
+            admin_url: admin_url.to_string(),
+            names: Vec::new(),
+        }
+    }
+
+    fn register(&mut self, name: &str) {
+        self.names.push(name.to_string());
+    }
+}
+
+impl Drop for FixtureGuard {
+    fn drop(&mut self) {
+        let (url, names) = (self.admin_url.clone(), std::mem::take(&mut self.names));
+        // A panic while unwinding aborts: nothing here may panic.
+        let spawned = std::thread::Builder::new()
+            .name("fixture-db-drop".to_string())
+            .spawn(move || drop_fixture_dbs_blocking(&url, &names));
+        match spawned {
+            Ok(handle) => {
+                if handle.join().is_err() {
+                    eprintln!("WARN: fixture database drop thread panicked");
+                }
+            }
+            Err(e) => eprintln!("WARN: could not spawn a thread to drop fixture databases: {e}"),
+        }
+    }
+}
+
+fn drop_fixture_dbs_blocking(url: &str, names: &[String]) {
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        eprintln!("WARN: could not build a runtime to drop fixture databases");
+        return;
+    };
+    rt.block_on(async {
+        let connected =
+            tokio::time::timeout(FIXTURE_IO_BOUND, sqlx::PgConnection::connect(url)).await;
+        let Ok(Ok(mut conn)) = connected else {
+            eprintln!("WARN: could not connect to drop fixture databases");
+            return;
+        };
+        for name in names {
+            let dropped = tokio::time::timeout(
+                FIXTURE_IO_BOUND,
+                sqlx::query(&format!(
+                    "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+                    pg_barrier::quote_ident(name)
+                ))
+                .execute(&mut conn),
+            )
+            .await;
+            if !matches!(dropped, Ok(Ok(_))) {
+                eprintln!("WARN: could not drop fixture database {name}");
+            }
+        }
+    });
 }
 
 /// One full fixture cycle: create the stale, fresh and lookalike databases under
@@ -253,10 +357,19 @@ async fn sweep_cycle_4489(url: &str, prefix: &str, panic_after_create: bool) {
         format!("{prefix}_{old}_q\";CREATE TABLE zz_inj();--"),
         format!("{prefix}_notatimestamp_deadbeef"),
     ];
+    let mut guard = FixtureGuard::new(url);
     for db in std::iter::once(&stale)
         .chain(std::iter::once(&fresh))
         .chain(keep.iter())
     {
+        guard.register(db);
+        sqlx::query(&format!(
+            "DROP DATABASE IF EXISTS {} WITH (FORCE)",
+            pg_barrier::quote_ident(db)
+        ))
+        .execute(&admin)
+        .await
+        .unwrap_or_else(|e| panic!("pre-drop fixture database {db:?}: {e}"));
         sqlx::query(&format!("CREATE DATABASE {}", pg_barrier::quote_ident(db)))
             .execute(&admin)
             .await
