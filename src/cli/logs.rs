@@ -588,11 +588,25 @@ fn follow_from(
 }
 
 fn run_tail(dir: &Path, filters: &Filters, args: &TailArgs, out: &mut CliOutput<'_>) -> Result<()> {
+    run_tail_with(dir, filters, args, out, || {})
+}
+
+/// `run_tail` with a hook that runs right after the tail pass read the file
+/// (a no-op in production; tests append there to inject the #7945 race through
+/// the whole hand-off, not just the seam).
+fn run_tail_with(
+    dir: &Path,
+    filters: &Filters,
+    args: &TailArgs,
+    out: &mut CliOutput<'_>,
+    after_read: impl FnOnce(),
+) -> Result<()> {
     let files = enumerate_log_files(dir)?;
     let Some(latest) = files.last().cloned() else {
         return Ok(());
     };
-    let (initial, offset, id, file) = tail_then_offset_with(&latest, args.lines, filters, args.follow, || {})?;
+    let (initial, offset, id, file) =
+        tail_then_offset_with(&latest, args.lines, filters, args.follow, after_read)?;
     for line in &initial {
         emit_line(line, filters, out)?;
     }
@@ -836,7 +850,7 @@ mod tests {
         TailArgs {
             lines: 10,
             follow: true,
-            follow_interval_ms: 20,
+            follow_interval_ms: 0,
             max_polls,
         }
     }
@@ -846,20 +860,12 @@ mod tests {
         write!(f, "{text}").unwrap();
     }
 
-    fn follow_to_string(dir: &Path, state: &mut FollowState, max_polls: u64) -> String {
-        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
-        {
-            let mut out = output(&mut stdout, &mut stderr);
-            follow_from(
-                dir,
-                state,
-                &Filters::default(),
-                &follow_args(max_polls),
-                &mut out,
-            )
-            .unwrap();
-        }
-        String::from_utf8(stdout).unwrap()
+    /// Cursor on `path` at `offset` with a real open handle and inode, as
+    /// `run_tail` builds it after the tail pass.
+    fn open_state(path: &Path, offset: u64) -> FollowState {
+        let file = fs::File::open(path).unwrap();
+        let id = file.metadata().ok().as_ref().and_then(file_id);
+        FollowState::new(path.to_path_buf(), offset, id, file)
     }
 
     /// #7945 - a line appended after the tail pass read the file but before the
@@ -874,16 +880,34 @@ mod tests {
         })
         .unwrap();
         assert_eq!(initial, vec!["first".to_string()]);
-        let mut state = FollowState {
-            path: path.clone(),
-            offset,
-            id,
-            file: Some(file),
-            fingerprint: Vec::new(),
-        };
-        let s = follow_to_string(dir.path(), &mut state, 2);
-        assert_eq!(s.matches("second").count(), 1, "got: {s:?}");
-        assert!(!s.contains("first"), "no duplicate of tail pass: {s:?}");
+        let mut state = FollowState::new(path.clone(), offset, id, file);
+        let (s, _) = poll_once(dir.path(), &mut state);
+        let (again, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "second\n", "got: {s:?}");
+        assert_eq!(again, "", "no duplicate on the next poll: {again:?}");
+    }
+
+    /// #7949 review r1 (#7967) - the same race through `run_tail`, so a
+    /// baseline recomputed from `metadata().len()` in the hand-off (the
+    /// original #7945 bug) is caught, not just a broken seam.
+    #[test]
+    fn logs_tail_run_tail_follow_prints_line_appended_before_baseline_7967() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\n");
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        {
+            let mut out = output(&mut stdout, &mut stderr);
+            run_tail_with(
+                dir.path(),
+                &Filters::default(),
+                &follow_args(2),
+                &mut out,
+                || append(&path, "second\n"),
+            )
+            .unwrap();
+        }
+        let s = String::from_utf8(stdout).unwrap();
+        assert_eq!(s, "first\nsecond\n", "each line exactly once: {s:?}");
     }
 
     /// #7946 - rotation by name: a newer-named file appears; the old file's
@@ -892,23 +916,13 @@ mod tests {
     fn logs_tail_follow_survives_name_rotation_7946() {
         let dir = tempfile::tempdir().unwrap();
         let a = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\n");
-        let mut state = FollowState {
-            path: a.clone(),
-            offset: 6,
-            id: None,
-            file: None,
-            fingerprint: Vec::new(),
-        };
+        let mut state = open_state(&a, 6);
         append(&a, "late-a\n");
-        let dir_path = dir.path().to_path_buf();
-        let h = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            fs::write(dir_path.join("ai-memory.log.2026-05-01"), "new-b\n").unwrap();
-        });
-        let s = follow_to_string(dir.path(), &mut state, 8);
-        h.join().unwrap();
-        assert_eq!(s.matches("late-a").count(), 1, "got: {s:?}");
-        assert_eq!(s.matches("new-b").count(), 1, "got: {s:?}");
+        let (s1, _) = poll_once(dir.path(), &mut state);
+        make_log(dir.path(), "ai-memory.log.2026-05-01", "new-b\n");
+        let (s2, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "late-a\n", "got: {s1:?}");
+        assert_eq!(s2, "new-b\n", "got: {s2:?}");
     }
 
     /// #7946 - truncation of the followed file restarts from offset 0.
@@ -916,21 +930,11 @@ mod tests {
     fn logs_tail_follow_survives_truncation_7946() {
         let dir = tempfile::tempdir().unwrap();
         let a = make_log(dir.path(), "ai-memory.log.2026-04-30", "aaaa\nbbbb\n");
-        let mut state = FollowState {
-            path: a.clone(),
-            offset: 10,
-            id: None,
-            file: None,
-            fingerprint: Vec::new(),
-        };
-        let a2 = a.clone();
-        let h = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            fs::write(&a2, "c\n").unwrap();
-        });
-        let s = follow_to_string(dir.path(), &mut state, 8);
-        h.join().unwrap();
-        assert_eq!(s.matches("c\n").count(), 1, "got: {s:?}");
+        let mut state = open_state(&a, 10);
+        fs::write(&a, "c\n").unwrap();
+        let (s, e) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "c\n", "got: {s:?}");
+        assert!(e.contains("rotated or truncated"), "stderr note: {e:?}");
     }
 
     /// #7946 - rename-and-recreate under the same name (new inode, larger file).
@@ -939,22 +943,11 @@ mod tests {
     fn logs_tail_follow_survives_rename_recreate_7946() {
         let dir = tempfile::tempdir().unwrap();
         let a = make_log(dir.path(), "ai-memory.log", "old-line-one\n");
-        let mut state = FollowState {
-            path: a.clone(),
-            offset: 13,
-            id: None,
-            file: None,
-            fingerprint: Vec::new(),
-        };
-        let dir_path = dir.path().to_path_buf();
-        let h = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            fs::rename(dir_path.join("ai-memory.log"), dir_path.join("old.zst")).unwrap();
-            fs::write(dir_path.join("ai-memory.log"), "longer-new-line\nz\n").unwrap();
-        });
-        let s = follow_to_string(dir.path(), &mut state, 8);
-        h.join().unwrap();
-        assert_eq!(s.matches("longer-new-line").count(), 1, "got: {s:?}");
+        let mut state = open_state(&a, 13);
+        fs::rename(&a, dir.path().join("old.zst")).unwrap();
+        fs::write(&a, "longer-new-line\nz\n").unwrap();
+        let (s, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "longer-new-line\nz\n", "got: {s:?}");
     }
 
     /// #7950 - the writer appends to the RENAMED old file before it reopens the
@@ -962,32 +955,18 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn logs_tail_follow_drains_renamed_old_file_before_switch_7950() {
-        use std::os::unix::fs::MetadataExt as _;
         let dir = tempfile::tempdir().unwrap();
         let a = make_log(dir.path(), "ai-memory.log", "first\n");
-        let handle = fs::File::open(&a).unwrap();
-        let ino = handle.metadata().unwrap().ino();
-        let mut state = FollowState {
-            path: a.clone(),
-            offset: 6,
-            id: Some(ino),
-            file: Some(handle),
-            fingerprint: Vec::new(),
-        };
-        let dir_path = dir.path().to_path_buf();
-        let h = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            let old = dir_path.join("old.zst");
-            fs::rename(dir_path.join("ai-memory.log"), &old).unwrap();
-            append(&old, "late-old\n");
-            fs::write(dir_path.join("ai-memory.log"), "fresh-new\n").unwrap();
-        });
-        let s = follow_to_string(dir.path(), &mut state, 8);
-        h.join().unwrap();
-        let late = s.find("late-old").expect("renamed-file line printed");
-        let fresh = s.find("fresh-new").expect("new-file line printed");
-        assert!(late < fresh, "old tail must precede new file: {s:?}");
-        assert_eq!(s.matches("late-old").count(), 1, "got: {s:?}");
+        let mut state = open_state(&a, 6);
+        let old = dir.path().join("old.zst");
+        fs::rename(&a, &old).unwrap();
+        append(&old, "late-old\n");
+        fs::write(&a, "fresh-new\n").unwrap();
+        let (s, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(
+            s, "late-old\nfresh-new\n",
+            "old tail precedes new file: {s:?}"
+        );
     }
 
     /// One `follow_poll` against `dir`, returning (stdout, stderr). No sleeps,
