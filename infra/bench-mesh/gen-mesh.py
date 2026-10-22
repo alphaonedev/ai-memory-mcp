@@ -348,9 +348,9 @@ def generate(n_nodes: int, run_dir: str, binary: str, catchup_secs: int,
 def write_key_sidecar(run_dir: str, api_key: str) -> str:
     """Write the run's API key to `<run_dir>/api-key` and return its path."""
     key_path = os.path.join(run_dir, KEY_SIDECAR_NAME)
-    with open(key_path, "w", encoding="utf-8") as fh:
+    fd = os.open(key_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, KEY_SIDECAR_MODE)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(api_key)
-    os.chmod(key_path, 0o600)
     return key_path
 
 
