@@ -152,6 +152,30 @@ class Semaphore(unittest.TestCase):
                 except (ProcessLookupError, ValueError):
                     pass
 
+    def test_tolerated_signal_errors_are_recorded_on_stderr_7929(self):
+        sys.path.insert(0, str(SCRIPT.parent))
+        try:
+            import host_semaphore as hs
+        finally:
+            sys.path.pop(0)
+        import contextlib
+        import io
+        from unittest import mock
+        for exc, needle in ((ProcessLookupError(), 'already gone'), (PermissionError(), 'not permitted')):
+            err = io.StringIO()
+            with mock.patch.object(hs.os, 'killpg', side_effect=exc), contextlib.redirect_stderr(err):
+                hs._signal_group(4242, signal.SIGTERM)
+            self.assertIn('[#7914 semaphore] note:', err.getvalue())
+            self.assertIn(needle, err.getvalue())
+            self.assertIn('4242', err.getvalue())
+
+    def test_slow_child_is_polled_not_swallowed_7929(self):
+        """A child that outlives one wait slice is still waited for and its code returned."""
+        p = start(self.root, ['--name', 'n', '--slots', '1'],
+                  [sys.executable, '-c', 'import time, sys; time.sleep(2.5); sys.exit(5)'])
+        out, _ = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 5, out)
+
     def test_bad_arguments_exit_2(self):
         p = start(self.root, ['--name', 'n', '--slots', '0'], ['true'])
         p.communicate(timeout=30)

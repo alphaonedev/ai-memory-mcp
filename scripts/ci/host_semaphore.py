@@ -81,11 +81,18 @@ def acquire(slot_dir, slots, label, max_wait, poll, sleep_fn=time.sleep):
         print('%s %r: waiting for a slot of %d, waited=%ds' % (TAG, label, slots, waited), flush=True)
 
 
+def _note(message):
+    """Record a tolerated condition on stderr (#7929), never silently."""
+    print('%s note: %s' % (TAG, message), file=sys.stderr, flush=True)
+
+
 def _signal_group(pgid, sig):
     try:
         os.killpg(pgid, sig)
-    except (ProcessLookupError, PermissionError):
-        pass
+    except ProcessLookupError:
+        _note('process group %d already gone before signal %d (child exited); nothing to signal' % (pgid, sig))
+    except PermissionError:
+        _note('not permitted to signal process group %d with signal %d; leaving it to the kernel' % (pgid, sig))
 
 
 def run_child(command):
@@ -108,9 +115,10 @@ def run_child(command):
         while True:
             try:
                 rc = proc.wait(timeout=1)
-                break
             except subprocess.TimeoutExpired:
-                pass
+                rc = None  # still running: fall through to the signal/deadline checks
+            if rc is not None:
+                break
             if got and deadline is None:
                 deadline = time.time() + KILL_GRACE_SECS
             if deadline is not None and time.time() > deadline:
