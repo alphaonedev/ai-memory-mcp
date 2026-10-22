@@ -1331,6 +1331,33 @@ class Issue7999(unittest.TestCase):
         self.assertNotIn("neither does `let _ = ..`: that drops the value", doc)
 
 
+class Issue8034(Fixture):
+    """#8034: "Only an awaited guard expression counts" -- an `async fn` lock helper called without
+    `.await` returns a future and holds nothing, so `let _g = env_lock();` is not a held lock."""
+
+    HELPER = ("use tokio::sync::MutexGuard;\n"
+              "async fn env_lock() -> MutexGuard<'static, ()> {\n    ENV_LOCK.lock().await\n}\n")
+
+    def reader_text(self, call):
+        return (WRITER + self.HELPER
+                + "#[tokio::test]\nasync fn reader() {\n    let _g = %s;\n    let _c = db::open(\":memory:\");\n}\n" % call)
+
+    def test_an_unawaited_async_lock_helper_is_flagged(self):
+        self.assertEqual(self.flagged(self.reader_text("env_lock()")), FLAGGED)
+
+    def test_the_awaited_async_lock_helper_is_credited(self):
+        self.assertEqual(self.flagged(self.reader_text("env_lock().await")), set())
+
+    def test_an_unawaited_async_helper_with_a_question_mark_is_flagged(self):
+        self.assertEqual(self.flagged(self.reader_text("env_lock()?")), FLAGGED)
+
+    def test_a_sync_lock_helper_called_without_await_is_still_credited(self):
+        helper = "fn env_lock() -> MutexGuard<'static, ()> {\n    ENV_LOCK.blocking_lock()\n}\n"
+        text = (WRITER + "use tokio::sync::MutexGuard;\n" + helper
+                + "#[test]\nfn reader() {\n    let _g = env_lock();\n    let _c = db::open(\":memory:\");\n}\n")
+        self.assertEqual(self.flagged(text), set())
+
+
 class RealTree(unittest.TestCase):
     def test_repo_matches_its_baseline(self):
         found = gate.scan_tree(REPO)

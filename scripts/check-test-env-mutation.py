@@ -448,8 +448,9 @@ def is_lock_fn_name(name):
 class Fn:
     """One fn item: qualified name, owner type, attrs and the scrubbed body (starting at `{`)."""
 
-    def __init__(self, name, mods, owner, attrs, body, offset):
+    def __init__(self, name, mods, owner, attrs, body, offset, is_async=False):
         self.name, self.mods, self.owner, self.attrs, self.body = name, mods, owner, attrs, body
+        self.is_async = is_async
         self.offset = offset
         self.is_test = self._is_test(attrs)
         self.serial_tokens = self._serial_tokens(attrs)
@@ -528,7 +529,7 @@ def parse_fns(scrubbed):
         mods = [b[3] for b in blocks if b[2] == "mod" and b[0] < m.start() < b[1]]
         owners = [b[3] for b in blocks if b[2] == "impl" and b[0] < m.start() < b[1]]
         fns.append(Fn(m.group(1), mods, owners[-1] if owners else None, attrs,
-                      scrubbed[brace:match_brace(scrubbed, brace)], brace))
+                      scrubbed[brace:match_brace(scrubbed, brace)], brace, m.group(0).startswith("async")))
     return fns
 
 
@@ -676,6 +677,22 @@ def guard_materialised(body, pos, end):
         return True
     names = set(re.findall(r"\.\s*([A-Za-z_]\w*)", mask_brackets(text)))
     return bool(names & AWAIT_OR_UNWRAP) or text.rstrip().endswith("?")
+
+
+AWAITED = re.compile(r"\s*\.\s*await\b")
+
+
+def unawaited_async(body, pos, async_names):
+    """True when the call at pos names an `async fn` and is not followed by `.await` (#8034).
+
+    An async lock helper called without `.await` returns a future, not a guard: `let _g = env_lock();`
+    holds nothing. Only an awaited call earns lock credit. A name that is not a known async fn (a sync
+    helper, a method) is judged by the other rules.
+    """
+    m = CALL.match(body, pos)
+    if not m or m.group(2) not in async_names:
+        return False
+    return not AWAITED.match(body, match_paren(body, m.end() - 1))
 
 
 def canonical_guard(body, pos, call=None, write=None):
@@ -1000,6 +1017,7 @@ class FileModel:
         self.src = (Source(raw, self.common.src_consts) if raw is not None and len(raw) == len(scrubbed)
                     else Source(None))
         self.fns = parse_fns(scrubbed)
+        self.async_names = {f.name for f in self.fns if f.is_async} | {n for n, f in self.common.fns.items() if f.is_async}
         self.tests = [f for f in self.fns if f.is_test and not f.ignored]
         self.mod_names = {m for f in self.fns for m in f.mods}
         self.by_key, self.by_method = {}, {}
@@ -1109,7 +1127,8 @@ class FileModel:
                 if canonical_guard(body, lm.start(), write=first):
                     locks |= lock_tokens(stmt_prefix(body, lm.start()))
             for cm in CALL.finditer(body, 0, first):
-                if is_lock_fn_name(cm.group(2)) and canonical_guard(body, cm.start(), write=first):
+                if (is_lock_fn_name(cm.group(2)) and not unawaited_async(body, cm.start(), self.async_names)
+                        and canonical_guard(body, cm.start(), write=first)):
                     locks.add(cm.group(2))
             found[name] = (frozenset(names), frozenset(locks))
         changed = True
@@ -1208,6 +1227,8 @@ class FileModel:
         def add(pos, tokens, kind, end=None, call=None, stmt=True):
             if kind == "once" and stmt and not statement_call(body, pos):
                 return  # #7995: only a call that certainly ran earns the one-time credit
+            if kind == "lock" and unawaited_async(body, pos, self.async_names):
+                return  # #8034: an async helper called without .await returns a future and holds nothing
             if tokens:
                 names = canonical_guard(body, pos, call) if kind == "lock" else []
                 held = bool(names) or (kind == "lock" and helper_ret_guard(body, pos))
