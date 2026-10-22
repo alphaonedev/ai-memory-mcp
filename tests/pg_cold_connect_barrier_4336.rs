@@ -270,12 +270,12 @@ fn run_prefix() -> String {
 /// #7916: the sliced suffix is byte-identical to the former masked-shift form.
 #[test]
 fn run_suffix_matches_former_mask_form_7916() {
+    // checked_shl yields None at the full 64-bit width, where the mask is all ones.
+    let mask = 1_u64
+        .checked_shl(u32::try_from(RUN_SUFFIX_HEX).unwrap() * HEX_DIGIT_BITS)
+        .map_or(u64::MAX, |bit| bit - 1);
     for tag in [0_u64, 1, 0xdead_beef_cafe_f00d, u64::MAX, 0xab_cdef] {
-        let former = format!(
-            "{:0width$x}",
-            tag & ((1_u64 << (u32::try_from(RUN_SUFFIX_HEX).unwrap() * HEX_DIGIT_BITS)) - 1),
-            width = RUN_SUFFIX_HEX
-        );
+        let former = format!("{:0width$x}", tag & mask, width = RUN_SUFFIX_HEX);
         assert_eq!(run_suffix(tag), former);
         assert_eq!(run_suffix(tag).len(), RUN_SUFFIX_HEX);
     }
