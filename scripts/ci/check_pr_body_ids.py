@@ -71,12 +71,10 @@ def close_failed_stream(stream):
     """Release a failed CLI stream so shutdown cannot retry pending bytes."""
     if stream is None or stream.closed:
         return
-    try:
-        # Buffered IO closes the underlying stream even when its flush fails.
-        # Closing the wrapper also prevents its finalizer from retrying output.
+    # Buffered IO closes the underlying stream even when its flush fails.
+    # Closing the wrapper also prevents its finalizer from retrying output.
+    with contextlib.suppress(OSError, UnicodeError):
         stream.close()
-    except (OSError, UnicodeError):
-        pass
 
 
 @contextlib.contextmanager
