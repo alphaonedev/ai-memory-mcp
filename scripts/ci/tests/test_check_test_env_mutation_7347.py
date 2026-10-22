@@ -890,12 +890,20 @@ class ReqwestIpOnly7526(Fixture):
     def test_a_placeholder_host_without_local_addr_is_a_reader(self):
         self.assertEqual(self.flagged(self.reader_with('"http://{}/x"')), FLAGGED)
 
-    def test_one_hostname_url_in_the_file_keeps_every_reqwest_a_reader(self):
-        text = self.reader_with('"http://127.0.0.1:8080/x"', 'const U: &str = "https://example.test/";\n')
+    def reader_calling(self, helper):
+        body = self.CLIENT % '"http://127.0.0.1:8080/x"' + "\n    other();"
+        return WRITER + helper + test_fn("reader", body)
+
+    def test_one_hostname_url_in_a_called_fn_keeps_the_reader(self):
+        text = self.reader_calling('fn other() { let _u = "https://example.test/"; }\n')
         self.assertEqual(self.flagged(text), FLAGGED)
 
-    def test_a_resolver_word_keeps_the_reader(self):
-        text = self.reader_with('"http://127.0.0.1:8080/x"', "fn r(c: &C) { let _ = c.resolve(\"x\", a); }\n")
+    def test_a_hostname_url_in_an_unrelated_fn_does_not_matter(self):
+        text = self.reader_with('"http://127.0.0.1:8080/x"', 'const U: &str = "https://example.test/";\n')
+        self.assertEqual(self.flagged(text), set())
+
+    def test_a_resolver_word_in_a_called_fn_keeps_the_reader(self):
+        text = self.reader_calling('fn other() { let _ = c.resolve("x", a); }\n')
         self.assertEqual(self.flagged(text), FLAGGED)
 
     def test_commented_hostname_does_not_count(self):
@@ -907,6 +915,56 @@ class ReqwestIpOnly7526(Fixture):
         self.assertFalse(gate.ip_only_text('get("https://example.com/a")'))
         self.assertFalse(gate.ip_only_text("get(url)"))
         self.assertFalse(gate.ip_only_text(None))
+
+
+class Issue7997(Fixture):
+    """#7997: "A URL literal whose host is a `{..}` placeholder is accepted as IP-only whenever `local_addr(`
+    appears ANYWHERE in the text ... any other placeholder, a URL with no literal scheme, or a URL from env
+    keeps the reader" / "`local_addr(` alone is not IP evidence"."""
+
+    OTHER_FN_ADDR = "fn bind_peer(l: &L) -> A { l.local_addr().unwrap() }\n"
+
+    def reader_text(self, body, extra=OTHER_FN_ADDR):
+        return WRITER + extra + test_fn("reader", "let _c = reqwest::Client::new();\n    " + body)
+
+    READERS = {
+        "param_host_with_local_addr_in_another_fn": 'let host = "peer.example";\n    let _r = _c.get(format!("http://{}/x", host));',
+        "named_inline_host": 'let host = "peer.example";\n    let _r = _c.get(format!("http://{host}:9/x"));',
+        "const_host": 'const H: &str = "peer.example";\n    let _r = _c.get(format!("http://{H}/x"));',
+        "scheme_placeholder": 'let _r = _c.get(format!("{}://{}/x", scheme, host));',
+        "env_url": 'let _r = _c.get(std::env::var("PEER_URL").unwrap());',
+        "named_arg_hostname": 'let _r = _c.get(format!("http://{h}/x", h = "peer.example"));',
+        "mixed_host": 'let _r = _c.get(format!("http://{}.example/x", name));',
+        "positional_second_arg_is_the_host": 'let _r = _c.get(format!("http://{}/{}", "peer.example", l.local_addr().unwrap()));',
+    }
+
+    def test_hostname_placeholders_and_unknown_urls_stay_readers(self):
+        for name, body in self.READERS.items():
+            with self.subTest(shape=name):
+                self.assertEqual(self.flagged(self.reader_text(body)), FLAGGED)
+
+    IP_ONLY = {
+        "named_inline_local_addr": 'let addr = l.local_addr().unwrap();\n    let _r = _c.get(format!("http://{addr}/x"));',
+        "named_arg_local_addr": 'let _r = _c.get(format!("http://{a}/x", a = l.local_addr().unwrap()));',
+        "positional_local_addr": 'let _r = _c.get(format!("http://{}/x", l.local_addr().unwrap()));',
+        "let_chain": 'let a = l.local_addr().unwrap();\n    let b = a;\n    let _r = _c.get(format!("http://{b}/x"));',
+        "ip_literal_binding": 'let h = "127.0.0.1";\n    let _r = _c.get(format!("http://{h}:9/x"));',
+    }
+
+    def test_data_flow_from_local_addr_or_an_ip_literal_is_not_a_reader(self):
+        for name, body in self.IP_ONLY.items():
+            with self.subTest(shape=name):
+                text = self.reader_text(body, "")
+                self.assertEqual(self.flagged(text), set())
+
+    def test_a_call_result_is_not_traced_and_fails_closed(self):
+        body = 'let addr = bind_peer(&l);\n    let _r = _c.get(format!("http://{addr}/x"));'
+        self.assertEqual(self.flagged(self.reader_text(body)), FLAGGED)
+
+    def test_ip_only_text_verdicts(self):
+        self.assertFalse(gate.ip_only_text('let h = "x.test"; let u = format!("http://{h}/", h); l.local_addr()'))
+        self.assertFalse(gate.ip_only_text("get(l.local_addr().unwrap())"))
+        self.assertTrue(gate.ip_only_text('get(format!("http://{}/", l.local_addr().unwrap()))'))
 
 
 PARAM_KEY = """

@@ -575,28 +575,88 @@ def balanced(text):
     return depth == 0
 
 
+PLACEHOLDER = re.compile(r"\{([^{}:]*)(?::[^{}]*)?\}")
+LET_INIT = r"\blet\s+(?:mut\s+)?%s\b[^=;]*=\s*([^;]*);"
+IP_STR = re.compile(r"\"(\[[0-9a-fA-F:.]+\]|\d{1,3}(?:\.\d{1,3}){3})\"")
+
+
+def format_args(text, end):
+    """Top-level comma-separated args of the macro call whose literal closes just before `end`."""
+    depth, cur, out, i = 1, [], [], end
+    while i < len(text) and depth:
+        ch = text[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if not depth:
+                break
+        if ch == "," and depth == 1:
+            out.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    out.append("".join(cur).strip())
+    return [a for a in out if a]
+
+
+def ip_expr(expr, text, depth=0):
+    """True when expr is an IP literal, a `local_addr()` call, or a same-text `let` bound to one (#7997)."""
+    expr = expr.strip().lstrip("&").strip()
+    if LOCAL_ADDR.search(expr) or IP_STR.fullmatch(expr):
+        return True
+    if depth < 4 and re.fullmatch(r"[A-Za-z_]\w*", expr):
+        inits = re.findall(LET_INIT % re.escape(expr), text)
+        return bool(inits) and all(ip_expr(i, text, depth + 1) for i in inits)
+    return False
+
+
+def url_host_is_ip(text, m):
+    """True when the URL literal matched at m names an IP host: an IP literal, or one placeholder that data
+    flows from `local_addr()` or an IP literal (#7997). Anything else fails closed."""
+    host = m.group(1).rsplit("@", 1)[-1]
+    bare = re.sub(r"(?<=\]|\d|\}):\d+$", "", host)
+    if IP_HOST.fullmatch(bare):
+        return True
+    ph = PLACEHOLDER.fullmatch(bare)
+    if not ph:
+        return False
+    open_q = text.rfind('"', 0, m.start())
+    close = text.find('"', m.end())
+    if open_q < 0 or close < 0:
+        return False
+    args = format_args(text, close + 1)
+    literal = text[open_q + 1:close]
+    name = ph.group(1).strip()
+    if name == "" or name.isdigit():
+        if name:
+            index = int(name)
+        else:
+            before = literal[:m.start() - (open_q + 1)]
+            index = len([p for p in PLACEHOLDER.finditer(before) if p.group(1).strip() == ""])
+        return index < len(args) and ip_expr(args[index], text)
+    for arg in args:
+        named = re.fullmatch(r"%s\s*=\s*(.*)" % re.escape(name), arg, re.DOTALL)
+        if named:
+            return ip_expr(named.group(1), text)
+    return ip_expr(name, text)
+
+
 def ip_only_text(raw):
-    """True when raw source text reaches the network only through IP-literal URLs (#7526).
+    """True when raw source text (one fn) reaches the network only through IP hosts (#7526, #7997).
 
     A reqwest client with rustls reads Rust-side env only, and a request to an IP literal never calls
-    getaddrinfo, so no C getenv is reachable. IP evidence is a `scheme://<ip>` URL or a `local_addr()`
-    call; any hostname URL, `localhost`, a resolver word, or a URL whose host is an unresolved
-    placeholder (no `local_addr()` in the text) keeps the reader.
+    getaddrinfo, so no C getenv is reachable. Every URL literal must name an IP host: an IP literal, or a
+    single `{..}` placeholder whose value (a positional or named format argument, or a same-text `let`)
+    comes from `local_addr()` or an IP literal. `local_addr(` elsewhere in the text is not evidence. No URL
+    literal at all, a hostname, `localhost`, a resolver word, a scheme placeholder or any other host shape
+    keeps the reader.
     """
     if raw is None or RESOLVER_WORDS.search(raw):
         return False
-    ip = bool(LOCAL_ADDR.search(raw))
-    for m in URL_LIT.finditer(raw):
-        host = m.group(1).rsplit("@", 1)[-1]
-        bare = re.sub(r"(?<=\]|\d):\d+$", "", host)
-        if IP_HOST.fullmatch(bare):
-            ip = True
-        elif URL_PLACEHOLDER_HOST.search(host):
-            if not LOCAL_ADDR.search(raw):
-                return False
-        else:
-            return False
-    return ip
+    urls = list(URL_LIT.finditer(raw))
+    return bool(urls) and all(url_host_is_ip(raw, m) for m in urls)
 
 
 AWAIT_OR_UNWRAP = frozenset(("await", "unwrap", "expect", "unwrap_or_else"))
@@ -953,7 +1013,7 @@ class FileModel:
                          if not f.is_test and ONCE_BODY.search(f.body) and self.dm.search(f.body)}
         self._calls, self._acq, self._summary, self._ctx, self._live = {}, {}, {}, {}, {}
         self._detached = {}
-        self._encl, self._viol, self._file_ip_only = {}, {}, None
+        self._encl, self._viol, self._ip_only = {}, {}, {}
         self.blamed = set()
         self.callers = {id(f): [] for f in self.fns}
         for f in self.fns:
@@ -1442,13 +1502,13 @@ class FileModel:
         return sites
 
     # ---- readers ----------------------------------------------------------------------------
-    def readers(self, fn):
+    def readers(self, fn, root=None):
         """[(pos, site or None)] of strong readers and of weak reads of a written var in fn."""
         body, out = fn.body, []
         for m in STRONG_READER.finditer(body):
             if IDENT.findall(m.group(0))[-1] not in self.by_key:
                 out.append((m.start(), None))
-        if REQWEST.search(body) and not self.ip_only(fn):
+        if REQWEST.search(body) and not self.ip_only(fn if root is None else root):
             out.extend((m.start(), None) for m in REQWEST.finditer(body))
         for m in self.dm.finditer(body):
             out.append((m.start(), self.site_at.get((id(fn), m.start()))))
@@ -1468,14 +1528,39 @@ class FileModel:
                 out.append((m.start(), None))
         return out
 
-    def ip_only(self, fn):
-        """#7526: the whole file reaches the network only through IP-literal URLs (a file-level verdict:
-        the fn that builds the client and the fn that makes the URL need not be the same one)."""
-        if self._file_ip_only is None:
-            raw = self.src.raw
-            text = None if raw is None else re.sub(r"(?m)^[ \t]*//.*$", "", raw)
-            self._file_ip_only = ip_only_text(text)
-        return self._file_ip_only
+    def fn_raw(self, fn):
+        """Raw text of fn with its `//` comments blanked (length preserved)."""
+        raw = self.src.raw
+        if raw is None:
+            return None
+        text = raw[fn.offset:fn.offset + len(fn.body)]
+        spans = []
+        scrub(text, spans)
+        for x, y in spans:
+            text = text[:x] + " " * (y - x) + text[y:]
+        return text
+
+    def tree_fns(self, root):
+        """root and every same-file fn it calls within HELPER_DEPTH (the data-flow unit of #7997)."""
+        seen, todo = {id(root): root}, [(root, HELPER_DEPTH)]
+        while todo:
+            fn, depth = todo.pop()
+            if depth <= 0:
+                continue
+            for _, callee, _, _ in self.calls(fn):
+                if id(callee) not in seen:
+                    seen[id(callee)] = callee
+                    todo.append((callee, depth - 1))
+        return list(seen.values())
+
+    def ip_only(self, root):
+        """#7526, #7997: this test fn, with the same-file fns it calls, reaches the network only through IP
+        hosts. The verdict is per root test fn, so a `local_addr()` in an unrelated fn is no evidence."""
+        key = id(root)
+        if key not in self._ip_only:
+            texts = [self.fn_raw(f) for f in self.tree_fns(root)]
+            self._ip_only[key] = None not in texts and ip_only_text(chr(10).join(texts))
+        return self._ip_only[key]
 
     def satisfied(self, held, site, root):
         ok = True
@@ -1494,7 +1579,7 @@ class FileModel:
         if key in self._viol:
             return self._viol[key]
         res = False
-        for pos, site in self.readers(fn):
+        for pos, site in self.readers(fn, root):
             held = set(self.inherit(fn, pos, ctx)) | self.held_own(fn, pos) | (site.base if site else EMPTY)
             if not self.satisfied(held, site, root):
                 res = True
