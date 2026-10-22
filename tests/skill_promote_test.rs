@@ -577,5 +577,11 @@ fn skills_ref_validates_promoted_skill_if_installed() {
     }
 }
 
+// Only the per-test schema helper, not the whole `common` tree: pulling
+// `common` in would add its unrelated unit tests to this target.
+#[cfg(feature = "sal-postgres")]
+#[path = "common/postgres_env.rs"]
+mod postgres_env;
+
 #[path = "skill_promote_visibility_3551/mod.rs"]
 mod visibility_3551;
