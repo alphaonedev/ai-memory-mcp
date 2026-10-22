@@ -372,6 +372,19 @@ python3 /absolute/worktree/scripts/ci/tests/test_check_codeql_alerts_7337.py
 python3 /absolute/worktree/scripts/ci/tests/test_check_codeql_alerts_7833.py
 ```
 
+### Remote lanes on a peer node (#7953)
+
+A lane may run on a peer node instead of the local one. The conductor tooling `remote_lane.py` drives it over ssh
+with argument lists only (no shell strings from the local side). Peer facts (ssh alias, PATH prefix, lane root,
+worktree and target roots, cores, free-disk floor, per-host lane cap) live in `peer-hosts.json`, keyed by host alias,
+never in `fleet.json`. `check --host H` is the gate: it refuses (exit 3) when the load exceeds the core count, free
+disk on `/` or the lane volume is below `min_free_gb`, or the running lanes (lane directories without an `EXIT`
+sentinel) reach `max_lanes`; an ssh failure is exit 2. `dispatch` repeats the check, copies the prompt and a launcher
+to the peer, and starts the launcher detached so the lane outlives the ssh session; `status` prints `EXIT <code>` or
+`running` plus the log tail; `pull` copies back `LANE-*-READY.md`, `LANE-*-BLOCKED.md` and `REVIEW-*.md`. The
+supervisor records the peer in the optional row column `host`. Never bind-mount a peer worktree volume
+into Docker.
+
 ---
 
 ## 8. Pull Request Submission
