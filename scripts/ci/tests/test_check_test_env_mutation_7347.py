@@ -761,6 +761,9 @@ class CanonicalShapeR6(Fixture):
         "lock_in_a_closure": ("", "let c = || { let _g = ENV_LOCK.blocking_lock(); };\n    c();"),
         "tuple_pattern_unknown_helper": ("", "let (_a, _b) = (ENV_LOCK.blocking_lock(), 1);"),
         "reassigned": ("", "let mut g = ENV_LOCK.blocking_lock();\n    g = ENV_LOCK.blocking_lock();"),
+        # #8001 / #7389 / #7474: the turbofish call form of drop is a mention of the guard like any other
+        "turbofish_drop": ("", GUARD_G + "drop::<_>(g);"),
+        "turbofish_mem_drop": ("", GUARD_G + "std::mem::drop::<_>(g);"),
     }
 
     HELD_BUT_FLAGGED = {
