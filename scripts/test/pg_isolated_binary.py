@@ -47,6 +47,7 @@ could not be minted or held, 143 terminated, otherwise the worst exit code of
 the cargo runs. Standard library only, Python 3.9+.
 """
 import argparse
+import contextlib
 import os
 import re
 import signal
@@ -1044,10 +1045,8 @@ class Runner:
         with self._lock:
             pids = list(self._children)
         for pid in pids:
-            try:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(pid, sig)
-            except (ProcessLookupError, PermissionError):
-                pass
 
     def _spawn(self, argv: List[str], env: Dict[str, str], out: IO[str]) -> 'subprocess.Popen[str]':
         with self._lock:
