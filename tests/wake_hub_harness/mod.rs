@@ -562,3 +562,22 @@ mod lane_db;
 pub use lane_db::{
     SHARED_LIVE_STORE_PORT, assert_lane_database, database_name, is_shared_live_store, port_of,
 };
+
+/// `AI_MEMORY_TEST_TIMING_BUDGET_MULT` (env #68), parsed like
+/// `tests/common/mcp_wait.rs::budget_mult_from`: an integer in `1..=100`,
+/// otherwise 1 (#7952 class, #7959). Hub tests scale every wall-clock poll
+/// through [`scaled_timing`] so a saturated host stretches them uniformly.
+#[must_use]
+pub fn timing_budget_mult() -> u32 {
+    std::env::var("AI_MEMORY_TEST_TIMING_BUDGET_MULT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .filter(|n| (1..=100).contains(n))
+        .unwrap_or(1)
+}
+
+/// `base` multiplied by [`timing_budget_mult`].
+#[must_use]
+pub fn scaled_timing(base: std::time::Duration) -> std::time::Duration {
+    base.saturating_mul(timing_budget_mult())
+}

@@ -27,7 +27,7 @@ use ai_memory::wake_hub::identity::SameUidAuthorizer;
 use ai_memory::wake_hub::limits::{DRAIN_DEADLINE_MS, SLOW_CONSUMER_PERCENT};
 use ai_memory::wake_hub::{HubConfig, startup};
 use ed25519_dalek::SigningKey;
-use wake_hub_harness::{Harness, TestVerifier};
+use wake_hub_harness::{Harness, TestVerifier, scaled_timing};
 
 fn key(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
@@ -342,8 +342,9 @@ async fn an_overflowing_recipient_names_the_bound_that_refused_it() {
             // Drain our own error queue after EVERY wake so it cannot fill
             // and get the sender disconnected before the signal is seen.
             while let Ok(Some(_)) =
-                tokio::time::timeout(SENDER_DRAIN_POLL, sender.read_frame()).await
-            {}
+                tokio::time::timeout(scaled_timing(SENDER_DRAIN_POLL), sender.read_frame()).await
+            {
+            }
         }
 
         // `overflow` is a monotone counter: once refused, always refused.
@@ -435,10 +436,46 @@ async fn an_overflowing_recipient_names_the_bound_that_refused_it() {
     hub.stop().await;
 }
 
-/// Upper bound on the wakes the no-drain regression sends. The hub drains the
-/// sender's refusals into the kernel socket buffer (~200 KB on Linux) before
-/// its own 8 KiB egress queue can fill, and a refusal is ~500 B, so the close
-/// needs well under a thousand unread refusals; four thousand is a wide margin.
+/// The sender's own egress cap in the no-drain test (`cfg.queue_bytes`).
+const NO_DRAIN_QUEUE_BYTES: usize = 8 * 1_024;
+
+/// The `reason` text `conn.rs` puts in the `error/507` it queues for a refused
+/// wake (copied from the `send_error(ErrorCode::Overflow, ..)` call in
+/// `Conn::route_wake`).
+const REFUSAL_507_REASON: &str = "recipient queue or hub egress budget full";
+
+/// Encoded size of one `error/507` refusal addressed to `sender_id`, exactly
+/// the bytes `Conn::send` hands `try_enqueue`.
+fn refusal_507_len(hub_id: &str, sender_id: &str) -> usize {
+    Frame::new(
+        Kind::Error,
+        hub_id,
+        sender_id,
+        ai_memory::wake_hub::frame::encode_error(
+            ai_memory::wake_hub::frame::ErrorCode::Overflow,
+            REFUSAL_507_REASON,
+        ),
+    )
+    .encode()
+    .expect("encode 507")
+    .len()
+}
+
+/// Fewest unread refusals that can fill the sender's `NO_DRAIN_QUEUE_BYTES`
+/// egress queue: the hub closes only when a refusal does not fit, so at least
+/// `queue_bytes / refusal_len` must have been queued unread first. A hub that
+/// hangs up on the FIRST 507 (#7956 mutant) closes below this.
+fn min_refusals_before_close(hub_id: &str, sender_id: &str) -> usize {
+    NO_DRAIN_QUEUE_BYTES / refusal_507_len(hub_id, sender_id)
+}
+
+/// Upper bound on the wakes the no-drain regression sends. Measured, not
+/// guessed (#7958): with the 8 KiB queue and 120-byte ids the hub closed the
+/// sender at wake 104 (reviewer run of `cargo test --test wake_hub_ops_3471`
+/// with a probe printing `closed_after`); the hub drains refusals into the
+/// kernel socket buffer first, so the exact point is platform-dependent. 4000
+/// is ~38x the measurement and still bounded, so a hub that never closes fails
+/// the run instead of hanging it.
 const NO_DRAIN_WAKE_BOUND: usize = 4_000;
 
 /// How long the flood waits for one more frame of the sender's own refusals
@@ -473,7 +510,7 @@ async fn a_sender_that_never_reads_its_refusals_is_disconnected_not_a_panic_7951
         |cfg: &mut HubConfig| {
             cfg.rate_per_sec = 1_000_000;
             cfg.rate_burst = 1_000_000;
-            cfg.queue_bytes = 8 * 1_024;
+            cfg.queue_bytes = NO_DRAIN_QUEUE_BYTES;
             cfg.global_egress_bytes = 32 * 1_024;
         },
         Arc::new(verifier_allowing(&[
@@ -503,10 +540,28 @@ async fn a_sender_that_never_reads_its_refusals_is_disconnected_not_a_panic_7951
             break;
         }
     }
+    let closed_after = closed_after.unwrap_or_else(|| {
+        panic!(
+            "{NO_DRAIN_WAKE_BOUND} unread refusals must overflow the sender's own \
+             egress queue and make the hub close its session"
+        )
+    });
+    // #7956 lower bound: the hub must not hang up on the first 507. It may only
+    // close once the sender's queue could not take another refusal.
+    let floor = min_refusals_before_close(ai_memory::wake_hub::DEFAULT_HUB_ID, &sender_id);
     assert!(
-        closed_after.is_some(),
-        "{NO_DRAIN_WAKE_BOUND} unread refusals must overflow the sender's own \
-         egress queue and make the hub close its session"
+        closed_after >= floor,
+        "closed after {closed_after} wakes, before {floor} unread refusals could fill the \
+         {NO_DRAIN_QUEUE_BYTES} B queue: a 507 must not close the session on its own"
+    );
+    // The wake count alone is weak (the deaf peer's socket buffer delays the
+    // first refusal), so also bound the REFUSALS the hub issued: a hub closing
+    // on the first 507 has refused once, a correct one at least `floor` times.
+    let refused = hub.metrics.snapshot(0).overflow;
+    assert!(
+        refused >= u64::try_from(floor).unwrap_or(u64::MAX),
+        "the hub closed the sender after only {refused} refusals, before {floor} unread \
+         refusals could fill its queue"
     );
 
     hub.stop().await;
