@@ -2373,30 +2373,63 @@ def base_ref_candidates(environ):
     return refs
 
 
+CANONICAL_MANIFEST_PATH = "scripts/qc-allowlists/cert-expiry-corpus-manifest.txt"  # where the base tree is read
+CANONICAL_HARNESS_PATH = "scripts/ci/tests/test_check_cert_expiry_corpus.py"
+ALLOW_INTREE_ENV = "CERT_MANIFEST_ALLOW_INTREE"  # explicit opt-in to the weaker in-tree-only ratchet
+BASE_OK, BASE_NONE, BASE_ABSENT, BASE_ERROR = "ok", "no-ref", "absent", "error"
+
+
+def git_query(repo, argv):
+    """(returncode, stdout) of one git query in `repo`; a launch failure is (127, message)."""
+    try:
+        r = subprocess.run(["git"] + argv, cwd=str(repo), capture_output=True, text=True,
+                           timeout=GIT_QUERY_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, f"{type(e).__name__}: {e}"
+    return r.returncode, r.stdout if r.returncode == 0 else (r.stderr or r.stdout)
+
+
+def parse_manifest_text(text):
+    out = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#"):
+            fields = line.split()
+            if len(fields) == 2 and fields[1] in (GREEN, RED):
+                out[fields[0]] = fields[1]
+    return out
+
+
 def base_manifest(repo, refs):
-    """{name: verdict} from the manifest at the merge-base of HEAD and the first
-    usable ref, or None when no ref resolves or the base has no manifest (shallow
-    clone, or a base that predates the manifest). The base copy cannot be edited by
-    the change under review, which is the point (#7976)."""
-    rel = MANIFEST_FILE.relative_to(HARNESS_ROOT).as_posix()
+    """(status, payload) for the manifest at the merge-base of HEAD and the first ref that resolves.
+
+    The path read from the base tree is CANONICAL_MANIFEST_PATH, never the path of the tree under review, so moving
+    the manifest in a change cannot hide it from the base lookup (#7987). BASE_OK carries {name: verdict};
+    BASE_NONE means no ref resolved; BASE_ABSENT means the base predates both the harness and the manifest (the
+    first introduction); BASE_ERROR carries a message naming the path, and covers every git failure and the case
+    of a base that holds the harness but not the manifest."""
+    mb = ""
     for ref in refs:
-        mb = subprocess.run(["git", "merge-base", "HEAD", ref], cwd=str(repo),
-                            capture_output=True, text=True, timeout=GIT_QUERY_TIMEOUT_S)
-        if mb.returncode != 0 or not mb.stdout.strip():
-            continue
-        show = subprocess.run(["git", "show", f"{mb.stdout.strip()}:{rel}"], cwd=str(repo),
-                              capture_output=True, text=True, timeout=GIT_QUERY_TIMEOUT_S)
-        if show.returncode != 0:
-            continue
-        out = {}
-        for raw in show.stdout.splitlines():
-            line = raw.strip()
-            if line and not line.startswith("#"):
-                fields = line.split()
-                if len(fields) == 2 and fields[1] in (GREEN, RED):
-                    out[fields[0]] = fields[1]
-        return out
-    return None
+        rc, out = git_query(repo, ["merge-base", "HEAD", ref])
+        if rc == 0 and out.strip():
+            mb = out.strip()
+            break
+    if not mb:
+        return BASE_NONE, None
+    rc, listing = git_query(repo, ["ls-tree", "-r", "--name-only", mb, "--",
+                                   CANONICAL_MANIFEST_PATH, CANONICAL_HARNESS_PATH])
+    if rc != 0:
+        return BASE_ERROR, f"cannot list {CANONICAL_MANIFEST_PATH} at base {mb}: {listing.strip()}"
+    names = listing.split()
+    if CANONICAL_MANIFEST_PATH not in names:
+        if CANONICAL_HARNESS_PATH in names:
+            return BASE_ERROR, (f"the base {mb} holds {CANONICAL_HARNESS_PATH} but not "
+                                f"{CANONICAL_MANIFEST_PATH}; the ratchet baseline is missing")
+        return BASE_ABSENT, mb
+    rc, text = git_query(repo, ["cat-file", "blob", f"{mb}:{CANONICAL_MANIFEST_PATH}"])
+    if rc != 0:
+        return BASE_ERROR, f"cannot read {CANONICAL_MANIFEST_PATH} at base {mb}: {text.strip()}"
+    return BASE_OK, parse_manifest_text(text)
 
 
 def base_ratchet_problems(base, current):
@@ -2411,21 +2444,41 @@ def base_ratchet_problems(base, current):
     return problems
 
 
+def ratchet_decision(repo, current, committed, environ):
+    """(problems, notes) for the whole ratchet. The in-tree comparison always runs. The base-anchored one runs
+    whenever a base ref resolves and fails closed on any error reading it. With no base ref at all the ratchet
+    is refused unless ALLOW_INTREE_ENV is set, and then it says loudly that it is the weaker check (#7987)."""
+    problems = ratchet_problems(committed, current)
+    notes = []
+    status, payload = base_manifest(repo, base_ref_candidates(environ))
+    if status == BASE_OK:
+        problems += base_ratchet_problems(payload, current)
+    elif status == BASE_ERROR:
+        problems.append(f"ratchet baseline unreadable: {payload}")
+    elif status == BASE_ABSENT:
+        notes.append(f"NOTE: the merge-base {payload} predates the corpus manifest; first introduction, no baseline")
+    else:
+        shallow = git_query(repo, ["rev-parse", "--is-shallow-repository"])[1].strip() == "true"
+        prefix = "::warning::" if shallow else ""
+        refs = ", ".join(base_ref_candidates(environ))
+        if environ.get(ALLOW_INTREE_ENV):
+            notes.append(f"{prefix}WARNING: no base ref resolves ({refs}); {ALLOW_INTREE_ENV} is set, so the "
+                         "WEAKER in-tree-only ratchet ran: one identical edit to the corpus and the manifest passes it")
+        else:
+            problems.append(f"{prefix}no base ref resolves ({refs}), so the base-anchored ratchet cannot run; "
+                            f"fetch the base branch (git fetch --no-tags --depth=1 origin BASE), set {BASE_REF_ENV}, "
+                            f"or set {ALLOW_INTREE_ENV}=1 to accept the weaker in-tree-only check")
+    return problems, notes
+
+
 class Ratchet(unittest.TestCase):
     """The V6 guard: the corpus can grow and RED can become GREEN, nothing else. Anchored to
     the merge-base manifest when reachable (#7976); the in-tree comparison is the weaker fallback."""
 
     def test_manifest_ratchet(self):
-        problems = ratchet_problems(read_manifest(MANIFEST_FILE), MANIFEST)
-        base = base_manifest(HARNESS_ROOT, base_ref_candidates(os.environ))
-        if base is None:
-            # WEAKER: both files live in the change under review, so one identical edit
-            # to both passes. Taken only when no base manifest is reachable (shallow
-            # clone, or a base that predates the manifest).
-            print("NOTE: manifest ratchet ran in-tree only (weaker): no base manifest reachable",
-                  file=sys.stderr)
-        else:
-            problems += base_ratchet_problems(base, MANIFEST)
+        problems, notes = ratchet_decision(HARNESS_ROOT, MANIFEST, read_manifest(MANIFEST_FILE), os.environ)
+        for note in notes:
+            print(note, file=sys.stderr)
         self.assertEqual(problems, [], "\n".join(problems))
 
     def test_every_case_is_registered(self):
@@ -2448,34 +2501,108 @@ class Ratchet(unittest.TestCase):
         self.assertIn("not recorded", " ".join(ratchet_problems(committed, grown)))
 
 
-    def test_base_anchor_rejects_same_edit_in_both(self):
-        """#7976: deleting a case from the corpus AND from the in-tree manifest passes
-        the in-tree comparison; the merge-base manifest still catches it."""
+    BASE_NAMES = {"cell_x": GREEN, "case_1_y": RED, "case_2_z": GREEN}
+    SCENE_GIT = ["git", "-c", "user.name=t", "-c", "user.email=selftest@localhost", "-c", "commit.gpgsign=false"]
+    MOVED_MANIFEST = "elsewhere/relocated-manifest.txt"
+
+    def scene(self, tmp, manifest_at_base=True, harness_at_base=True, base_ref=True):
+        """A scratch repo: a base commit (the canonical manifest and harness paths, as asked) and a HEAD commit on top.
+        Returns (repo, environ). With base_ref the ref origin/basecand names the base commit."""
+        repo = tmp / "r"
+        repo.mkdir()
+        text = "".join(f"{n} {v}\n" for n, v in sorted(self.BASE_NAMES.items()))
+        adds = []
+        if manifest_at_base:
+            (repo / CANONICAL_MANIFEST_PATH).parent.mkdir(parents=True)
+            (repo / CANONICAL_MANIFEST_PATH).write_text(text, encoding="utf-8")
+            adds.append(CANONICAL_MANIFEST_PATH)
+        if harness_at_base:
+            (repo / CANONICAL_HARNESS_PATH).parent.mkdir(parents=True, exist_ok=True)
+            (repo / CANONICAL_HARNESS_PATH).write_text("# harness\n", encoding="utf-8")
+            adds.append(CANONICAL_HARNESS_PATH)
+        if not adds:
+            (repo / "README").write_text("base\n", encoding="utf-8")
+            adds.append("README")
+        steps = [["init", "-q"], ["add"] + adds, ["commit", "-q", "-m", "base"]]
+        if base_ref:
+            steps.append(["update-ref", "refs/remotes/origin/basecand", "HEAD"])
+        steps.append(["commit", "-q", "--allow-empty", "-m", "change under review"])
+        for argv in steps:
+            subprocess.run(self.SCENE_GIT + argv, cwd=str(repo), check=True, capture_output=True)
+        return repo, ({BASE_REF_ENV: "origin/basecand"} if base_ref else {})
+
+    def decide(self, tmp, current, base_ref, relocate=False, **scene_kw):
+        """ratchet_decision for the tree under review: `current` is the corpus and the in-tree manifest alike (the
+        both-file edit); with relocate the in-tree manifest also lives at another path than the canonical one."""
+        repo, environ = self.scene(tmp, base_ref=base_ref, **scene_kw)
+        committed = dict(current)
+        if relocate:
+            moved = repo / self.MOVED_MANIFEST
+            moved.parent.mkdir(parents=True, exist_ok=True)
+            moved.write_text("".join(f"{n} {v}\n" for n, v in sorted(current.items())), encoding="utf-8")
+            committed = parse_manifest_text(moved.read_text(encoding="utf-8"))
+        return ratchet_decision(repo, current, committed, environ)
+
+    def scratch_dir(self):
         tmp = Path(tempfile.mkdtemp(prefix=CASE_SCRATCH_PREFIX, dir=str(SCRATCH_ROOT)))
-        try:
-            repo = tmp / "r"
-            rel = MANIFEST_FILE.relative_to(HARNESS_ROOT)
-            (repo / rel.parent).mkdir(parents=True)
-            base_names = {"cell_x": GREEN, "case_1_y": RED, "case_2_z": GREEN}
-            (repo / rel).write_text("".join(f"{n} {v}\n" for n, v in sorted(base_names.items())), encoding="utf-8")
-            git = ["git", "-c", "user.name=t", "-c", "user.email=selftest@localhost", "-c", "commit.gpgsign=false"]
-            for argv in (["init", "-q"], ["add", str(rel)], ["commit", "-q", "-m", "base"],
-                         ["update-ref", "refs/remotes/origin/basecand", "HEAD"]):
-                subprocess.run(git + argv, cwd=str(repo), check=True, capture_output=True)
-            edited = {k: v for k, v in base_names.items() if k != "cell_x"}
-            (repo / rel).write_text("".join(f"{n} {v}\n" for n, v in sorted(edited.items())), encoding="utf-8")
-            self.assertEqual(ratchet_problems(read_manifest(repo / rel), edited), [],
-                             "the in-tree comparison is expected to be blind to the identical edit")
-            base = base_manifest(repo, ["origin/basecand"])
-            self.assertEqual(base, base_names)
-            self.assertIn("deleted", " ".join(base_ratchet_problems(base, edited)))
-            weakened = dict(base_names, case_2_z=RED)
-            self.assertIn("GREEN -> RED", " ".join(base_ratchet_problems(base, weakened)))
-            grown = dict(base_names, case_3_new=RED, case_1_y=GREEN)
-            self.assertEqual(base_ratchet_problems(base, grown), [])
-            self.assertIsNone(base_manifest(repo, ["origin/nosuchref"]))
-        finally:
-            shutil.rmtree(str(tmp), ignore_errors=True)
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        return tmp
+
+    def test_base_anchor_refuses_both_file_edits(self):
+        """#7976 and #7987: R1 (relocate the manifest, then delete a RED case in the corpus and the manifest) and
+        E1/E2 (the same flip or delete in both files) are refused in a repo with a base ref (by the base manifest) and
+        in a repo without one (the ratchet cannot run, so it fails closed)."""
+        deleted_red = {k: v for k, v in self.BASE_NAMES.items() if k != "case_1_y"}
+        deleted_green = {k: v for k, v in self.BASE_NAMES.items() if k != "cell_x"}
+        flipped = dict(self.BASE_NAMES, case_2_z=RED)
+        cases = (("R1", deleted_red, True, "deleted"), ("E1", flipped, False, "GREEN -> RED"),
+                 ("E2", deleted_green, False, "deleted"))
+        for label, current, relocate, want in cases:
+            with self.subTest(label=label, mode="with-base-ref"):
+                problems, _notes = self.decide(self.scratch_dir(), current, True, relocate=relocate)
+                self.assertIn(want, " ".join(problems), f"{label} not refused with a base ref")
+            with self.subTest(label=label, mode="no-base-ref"):
+                problems, _notes = self.decide(self.scratch_dir(), current, False, relocate=relocate)
+                self.assertIn("no base ref resolves", " ".join(problems), f"{label} not refused without a base ref")
+
+    def test_base_anchor_fails_closed_on_missing_base_manifest(self):
+        """#7987: a base that holds the harness but not the manifest, or any failure reading it, is a failure that
+        names the canonical manifest path; a base with neither is the first introduction and is only noted."""
+        problems, _notes = self.decide(self.scratch_dir(), dict(self.BASE_NAMES), True, manifest_at_base=False)
+        self.assertIn(CANONICAL_MANIFEST_PATH, " ".join(problems))
+        self.assertIn("baseline", " ".join(problems))
+        problems, notes = self.decide(self.scratch_dir(), dict(self.BASE_NAMES), True,
+                                      manifest_at_base=False, harness_at_base=False)
+        self.assertEqual(problems, [])
+        self.assertIn("first introduction", " ".join(notes))
+        repo, _environ = self.scene(self.scratch_dir())
+        status, payload = base_manifest(repo, ["origin/basecand"])
+        self.assertEqual((status, payload), (BASE_OK, self.BASE_NAMES))
+        broken = repo / ".git" / "objects"
+        for sub in broken.iterdir():
+            if len(sub.name) == 2:
+                shutil.rmtree(str(sub))
+        status, payload = base_manifest(repo, ["origin/basecand"])
+        self.assertIn(status, (BASE_ERROR, BASE_NONE))
+        self.assertNotEqual(status, BASE_OK)
+
+    def test_no_base_ref_needs_the_explicit_opt_in(self):
+        """#7987: with no base ref the in-tree-only check runs only when ALLOW_INTREE_ENV is set, with a loud note."""
+        repo, environ = self.scene(self.scratch_dir(), base_ref=False)
+        problems, notes = ratchet_decision(repo, dict(self.BASE_NAMES), dict(self.BASE_NAMES), environ)
+        self.assertIn(ALLOW_INTREE_ENV, " ".join(problems))
+        problems, notes = ratchet_decision(repo, dict(self.BASE_NAMES), dict(self.BASE_NAMES),
+                                           dict(environ, **{ALLOW_INTREE_ENV: "1"}))
+        self.assertEqual(problems, [])
+        self.assertIn("WEAKER", " ".join(notes))
+
+    def test_base_anchor_allows_growth_and_red_to_green(self):
+        repo, environ = self.scene(self.scratch_dir())
+        grown = dict(self.BASE_NAMES, case_3_new=RED, case_1_y=GREEN)
+        problems, _notes = ratchet_decision(repo, grown, dict(grown), environ)
+        self.assertEqual(problems, [])
+        status, _payload = base_manifest(repo, ["origin/nosuchref"])
+        self.assertEqual(status, BASE_NONE)
 
 
 FILTER_ENV = "CERT_CORPUS_FILTER"  # comma-separated name prefixes; a debugging and nesting knob
