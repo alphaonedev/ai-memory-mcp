@@ -76,6 +76,7 @@ case_7618_check_to_exec_window RED
 case_7620_deep_stale_sweep RED
 case_7665_cwd_stdlib_shadow RED
 case_7793_sidecar_clean_rebind RED
+case_7975_selftest_fail_closed GREEN
 cell_a_watched_path_red GREEN
 cell_b_watched_path_with_reissue_green GREEN
 cell_c_identifier_add_red GREEN

@@ -804,11 +804,47 @@ MAX_FAILURES_SHOWN = 20
 SELF_TEST_OK = "check-cert-expiry self-test OK: {summary}; corpus {harness}"
 
 
-def self_test():
+CORPUS_ENV_PREFIX = "CERT_CORPUS_"  # the harness's debugging knobs; never inherited by the self-test
+CORPUS_FILTER_ENV = "CERT_CORPUS_FILTER"
+CORPUS_NESTED_ENV = "CERT_CORPUS_NESTED"
+CORPUS_MIN_CASES = 130  # a full run executes at least this many cases (127 corpus cases + 3 ratchet tests)
+SUBSET_MIN_CASES = 1
+SUMMARY_RAN_RE = re.compile(r"\bran=(\d+)\b")
+SUMMARY_FAILED_RE = re.compile(r"\bfailed=(\d+)\b")
+
+
+def corpus_child_env(environ, subset=""):
+    """The child's environment: every inherited CERT_CORPUS_* knob is dropped, so an
+    ambient filter can never shrink the run (#7975). Only an explicit `subset` (the
+    --self-test-subset flag) sets the filter, and it also marks the run nested."""
+    env = {k: v for k, v in environ.items() if not k.startswith(CORPUS_ENV_PREFIX)}
+    if subset:
+        env[CORPUS_FILTER_ENV] = subset
+        env[CORPUS_NESTED_ENV] = "1"
+    return env
+
+
+def corpus_size_problem(summary, subset=""):
+    """None when the corpus summary shows enough executed cases and zero failures, else
+    the reason. A full run must execute at least CORPUS_MIN_CASES cases; a subset run
+    at least SUBSET_MIN_CASES; ran=0 is never a pass (#7975)."""
+    ran = SUMMARY_RAN_RE.search(summary)
+    failed = SUMMARY_FAILED_RE.search(summary)
+    if ran is None or failed is None:
+        return f"unreadable corpus summary {summary!r}"
+    needed = SUBSET_MIN_CASES if subset else CORPUS_MIN_CASES
+    if int(ran.group(1)) < needed:
+        return f"only {ran.group(1)} corpus cases ran, expected at least {needed}"
+    return None
+
+
+def self_test(subset=""):
     """Run the external corpus (scripts/ci/tests/test_check_cert_expiry_corpus.py)
     in a child interpreter, one scratch repository per case, and report each failing
     case by name. rc 0 when every case holds, 2 otherwise. The child's traceback is
-    never relayed: a crashing case is a named failure and the rest still run."""
+    never relayed: a crashing case is a named failure and the rest still run. The
+    run is fail-closed on size: fewer cases than CORPUS_MIN_CASES (or none) is a
+    failure, and inherited CERT_CORPUS_* variables are ignored (#7975)."""
     harness = Path(__file__).resolve().parent.parent / CORPUS_HARNESS
     if not harness.is_file():
         print(f"check-cert-expiry self-test FAILED (corpus missing: {CORPUS_HARNESS})",
@@ -818,6 +854,7 @@ def self_test():
         proc = subprocess.run(
             [sys.executable, "-I", str(harness), "--machine"],
             capture_output=True, timeout=CORPUS_TIMEOUT_S, check=False,
+            env=corpus_child_env(os.environ, subset),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"check-cert-expiry self-test FAILED (corpus could not run: {exc})",
@@ -827,13 +864,16 @@ def self_test():
     failed = [ln[len(CORPUS_FAIL_PREFIX):] for ln in lines if ln.startswith(CORPUS_FAIL_PREFIX)]
     summary = [ln[len(CORPUS_SUMMARY_PREFIX):] for ln in lines
                if ln.startswith(CORPUS_SUMMARY_PREFIX)]
-    if failed or proc.returncode != 0 or not summary:
+    size_problem = corpus_size_problem(summary[-1], subset) if summary else None
+    if failed or proc.returncode != 0 or not summary or size_problem:
+        if size_problem:
+            print(f"self-test FAILED ({size_problem})", file=sys.stderr)
         for entry in failed[:MAX_FAILURES_SHOWN]:
             print(f"self-test FAILED ({entry})", file=sys.stderr)
         if len(failed) > MAX_FAILURES_SHOWN:
             print(f"self-test FAILED (+{len(failed) - MAX_FAILURES_SHOWN} more cases)",
                   file=sys.stderr)
-        if not failed:
+        if not failed and not size_problem:
             print(f"self-test FAILED (corpus exited {proc.returncode} without a summary)",
                   file=sys.stderr)
         print("check-cert-expiry self-test: FAIL", file=sys.stderr)
@@ -847,6 +887,9 @@ def main(argv=None):
         description="Enterprise-federation certification section 7 expiry gate.")
     parser.add_argument("--self-test", action="store_true",
                         help="run the external corpus (one scratch repository per case)")
+    parser.add_argument("--self-test-subset", default="", metavar="PREFIXES",
+                        help="run only the corpus cases whose names start with one of the "
+                             "comma-separated PREFIXES (used by the corpus's own nested run)")
     args = parser.parse_args(argv)
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -854,8 +897,8 @@ def main(argv=None):
         except (AttributeError, ValueError):
             # StringIO and closed streams cannot reconfigure; keep their existing encoding.
             continue
-    if args.self_test:
-        return self_test()
+    if args.self_test or args.self_test_subset:
+        return self_test(args.self_test_subset)
     rc, out, err = run_gate(REPO_ROOT, dict(os.environ))
     if out:
         print(out)

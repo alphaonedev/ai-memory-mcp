@@ -1640,14 +1640,49 @@ class Corpus(CorpusBase):
         shutil.copy(str(Path(__file__).resolve()),
                     str(copy / "scripts" / "ci" / "tests" / Path(__file__).name))
         (copy / "scripts" / "qc-allowlists").mkdir(parents=True)
-        env = dict(os.environ, **{NESTED_ENV: "1", FILTER_ENV: "cell_a_,cell_b_"})
+        env = dict(os.environ)
         proc = subprocess.run(
-            [sys.executable, "-I", str(copy / "scripts" / "check_cert_expiry.py"), "--self-test"],
+            [sys.executable, "-I", str(copy / "scripts" / "check_cert_expiry.py"), "--self-test-subset", "cell_a_,cell_b_"],
             cwd=str(copy), env=env, capture_output=True, text=True, timeout=CHILD_TIMEOUT_S)
         out = proc.stdout + proc.stderr
         self.assertEqual(proc.returncode, SELF_TEST_FAIL_RC, out[-600:])
         self.assertNotIn("Traceback", out, "a missing production helper crashed the runner")
         self.assertIn("self-test FAILED", out)
+
+    def stub_gate_tree(self, stub_body):
+        """A scratch tree holding the real gate and a stub corpus harness."""
+        self.stub_count = getattr(self, "stub_count", 0) + 1
+        copy = self.tmp / f"stub{self.stub_count}"
+        (copy / "scripts" / "ci" / "tests").mkdir(parents=True)
+        shutil.copy(str(GATE_PATH), str(copy / "scripts" / "check_cert_expiry.py"))
+        (copy / "scripts" / "ci" / "tests" / Path(__file__).name).write_text(stub_body, encoding="utf-8")
+        return copy
+
+    def run_stub_self_test(self, copy, extra_args=(), **env_extra):
+        env = dict(os.environ, **env_extra)
+        proc = subprocess.run(
+            [sys.executable, "-I", str(copy / "scripts" / "check_cert_expiry.py"), "--self-test", *extra_args],
+            cwd=str(copy), env=env, capture_output=True, text=True, timeout=CHILD_TIMEOUT_S)
+        return proc.returncode, proc.stdout + proc.stderr
+
+    @expect(GREEN)
+    def case_7975_selftest_fail_closed(self):
+        env_aware = ("import os\n"
+                     "ran = 0 if os.environ.get('CERT_CORPUS_FILTER') or os.environ.get('CERT_CORPUS_NESTED') else 1000\n"
+                     "print('CORPUS-SUMMARY ran=%d failed=0' % ran)\n")
+        rc, out = self.run_stub_self_test(self.stub_gate_tree(env_aware),
+                                          CERT_CORPUS_FILTER="zzz_nothing", CERT_CORPUS_NESTED="1")
+        self.assertEqual(rc, 0, "an inherited CERT_CORPUS_* knob changed the self-test: " + out[-300:])
+        self.assertIn("ran=1000", out, "the self-test ran with the inherited filter")
+        zero = "print('CORPUS-SUMMARY ran=0 failed=0')\n"
+        rc, out = self.run_stub_self_test(self.stub_gate_tree(zero))
+        self.assertEqual(rc, SELF_TEST_FAIL_RC, "a corpus that ran zero cases reported OK: " + out[-300:])
+        self.assertIn("self-test FAILED", out)
+        few = "print('CORPUS-SUMMARY ran=3 failed=0')\n"
+        rc, out = self.run_stub_self_test(self.stub_gate_tree(few))
+        self.assertEqual(rc, SELF_TEST_FAIL_RC, "a corpus below the expected size reported OK: " + out[-300:])
+        rc, out = self.run_stub_self_test(self.stub_gate_tree(few), extra_args=("--self-test-subset", "cell_a_"))
+        self.assertEqual(rc, 0, "an explicit subset run needs only one case: " + out[-300:])
 
     # ---- section 7 evasions: the per-file multiset and the funnel (P1, P3) --
 
