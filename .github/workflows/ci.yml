@@ -233,6 +233,10 @@ jobs:
         run: python3 scripts/test/test_ci_test_impact.py
       - name: Workflow concurrency invariants (#6340)
         run: python3 scripts/test/test_workflow_concurrency_6340.py
+      # #7748 - scripts/test/ is outside the discovery root below; run the TMPDIR purge
+      # workflow pin on every event (a separate step: no overlap with the #7160 run line).
+      - name: Runner TMPDIR purge workflow pin (#7748)
+        run: python3 -m unittest scripts/test/test_workflow_tmpdir_purge_7748.py
       - name: Shard partition and wiring unit tests (#6344)
         run: python3 -m unittest discover -s scripts/ci/tests
       # #7160 - scripts/test/ is outside the discovery root above; run the
@@ -860,6 +864,14 @@ jobs:
           echo "::error::Refusing to run fork PR code on a self-hosted runner (leg ${{ matrix.leg }})."
           exit 1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # #7748 - pre-job purge of the marked runner TMPDIR: one job runs per runner at a
+      # time, so anything left there is a leftover of a failed, killed or cancelled job.
+      # Opt-in by the .ai-memory-ci-purgeable marker the node operator writes; an unmarked
+      # or unset TMPDIR is a notice and exit 0. Same-repo only (fork code never runs here).
+      - name: Purge runner TMPDIR leftovers (#7748)
+        if: needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        run: python3 scripts/ci/clean_job_tmpdir.py --apply
 
       - name: docs-only short-circuit
         if: needs.classify.outputs.docs_only == 'true'
@@ -2052,6 +2064,11 @@ jobs:
       - name: Sweep per-runner cargo target to the size cap (self-hosted, #7160)
         if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted' && matrix.shared_target
         run: python3 scripts/ci-sweep-target.py --target "${CARGO_TARGET_DIR:?per-runner cargo target not set}" --allow-root --within "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}" --lock "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}/.evict.lock" --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
+
+      # #7748 - post-job purge of the marked runner TMPDIR (see the pre-job step). Last step.
+      - name: Purge runner TMPDIR leftovers (#7748) (post-job)
+        if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        run: python3 scripts/ci/clean_job_tmpdir.py --apply
 
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
   #

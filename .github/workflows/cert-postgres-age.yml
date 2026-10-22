@@ -147,6 +147,14 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      # #7748 - pre-job purge of the marked runner TMPDIR: one job runs per runner at a
+      # time, so anything left there is a leftover of a failed, killed or cancelled job.
+      # Opt-in by the .ai-memory-ci-purgeable marker the node operator writes; an unmarked
+      # or unset TMPDIR is a notice and exit 0. Same-repo only (fork code never runs here).
+      - name: Purge runner TMPDIR leftovers (#7748)
+        if: runner.environment == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        run: python3 scripts/ci/clean_job_tmpdir.py --apply
+
       # FAIL CLOSED if rustup is missing on a self-hosted node — see the
       # `lint` job in ci.yml for the full rationale (#3128 / restore #3293).
       - name: Assert rustup is provisioned (self-hosted; fail-closed #3128)
@@ -466,3 +474,8 @@ jobs:
       - name: Sweep target/debug to the size cap (self-hosted)
         if: always() && runner.environment == 'self-hosted'
         run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
+
+      # #7748 - post-job purge of the marked runner TMPDIR (see the pre-job step). Last step.
+      - name: Purge runner TMPDIR leftovers (#7748) (post-job)
+        if: always() && runner.environment == 'self-hosted' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        run: python3 scripts/ci/clean_job_tmpdir.py --apply

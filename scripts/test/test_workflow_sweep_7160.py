@@ -228,7 +228,13 @@ class CheckJobSweep(unittest.TestCase):
         self.assertEqual(len(prune), 1)
         self.assertEqual(len(sweep), 2)
         self.assertGreater(min(sweep), prune[0])
-        self.assertEqual(max(sweep), len(all_steps) - 1, "the sweep steps are the last steps")
+        # #7748: the post-job TMPDIR purge is the only step allowed after the sweeps.
+        trailing = [s for s in all_steps[max(sweep) + 1:]]
+        self.assertEqual(
+            [field(s, "name") for s in trailing],
+            ["Purge runner TMPDIR leftovers (#7748) (post-job)"],
+            "the sweep steps are the last steps except the #7748 post-job purge",
+        )
 
 
 class CapLiteral(unittest.TestCase):
