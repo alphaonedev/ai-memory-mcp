@@ -510,6 +510,8 @@ fn smart_load_scenario(branch: Branch) {
 
 fn update_scenario() {
     let label = "update Sqlite";
+    // #7995: the one-time env write completes here, as a statement of this fn, before any reader.
+    common::permissive_attestation_for_tests();
     one_worker_runtime().block_on(async {
         let fx = fixture("update", Branch::Sqlite, None)
             .await
@@ -530,6 +532,8 @@ fn update_scenario() {
 
 fn reflect_scenario() {
     let label = "reflect Sqlite";
+    // #7995: the one-time env write completes here, as a statement of this fn, before any reader.
+    common::permissive_attestation_for_tests();
     one_worker_runtime().block_on(async {
         let fx = fixture("reflect", Branch::Sqlite, None)
             .await
@@ -672,6 +676,8 @@ fn real_postgres_embeds_off_the_worker_4089() {
 /// blocking-pool unit that tokio runs to completion regardless.
 #[test]
 fn update_regeneration_survives_a_dropped_request_4089() {
+    // #7995: the one-time env write completes here, as a statement of this fn, before any reader.
+    common::permissive_attestation_for_tests();
     one_worker_runtime().block_on(async {
         let fx = fixture("update-drop", Branch::Sqlite, None)
             .await

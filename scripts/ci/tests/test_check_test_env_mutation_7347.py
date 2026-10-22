@@ -1176,6 +1176,50 @@ class Issue7994(Fixture):
         self.assertEqual(self.flagged(text), set())
 
 
+class Issue7995(Fixture):
+    """#7995: "A call to a Once-gated setter earns the fn a `once:<setter>` credit ... Two shapes earn it
+    without the call ever running before the reader: an unbraced uncalled closure:
+    `let _c = || permissive_attestation_for_tests();` / a cfg-disabled call:
+    `#[cfg(any())] permissive_attestation_for_tests();`" / "credit a Once setter only as a statement-level
+    call in the fn's top-level block ... and skip any statement preceded by a `#[cfg(` attribute".
+    """
+
+    FIRST = test_fn("a", "permissive_attestation_for_tests();\n    " + OPEN)
+    SETUP = "fn setup() { permissive_attestation_for_tests(); }\n"
+    NOT_RUN = {
+        "unbraced_closure": "let _c = || %s;",
+        "cfg_disabled": "#[cfg(any())]\n    %s;",
+        "cfg_not_test": "#[cfg(not(test))]\n    %s;",
+        "closure_passed_on": "run(|| %s);",
+        "short_circuit": "let _ = false && %s.is_ok();",
+    }
+    RAN = {
+        "statement": "%s;",
+        "let_wildcard": "let _ = %s;",
+        "let_named": "let _r = %s;",
+    }
+
+    def _flagged_b(self, shape, call, setup=""):
+        text = self.FIRST + setup + test_fn("b", (shape % call) + "\n    " + OPEN)
+        return self.flagged(text)
+
+    def test_a_setter_call_that_never_ran_is_not_credited(self):
+        for name, shape in self.NOT_RUN.items():
+            with self.subTest(shape=name):
+                self.assertEqual(self._flagged_b(shape, "permissive_attestation_for_tests()"), {"tests/a.rs::b"})
+
+    def test_a_helper_that_persists_the_setter_is_not_credited_when_never_called(self):
+        for name, shape in self.NOT_RUN.items():
+            with self.subTest(shape=name):
+                self.assertEqual(self._flagged_b(shape, "setup()", self.SETUP), {"tests/a.rs::b"})
+
+    def test_a_setter_call_that_certainly_ran_is_credited(self):
+        for name, shape in self.RAN.items():
+            with self.subTest(shape=name):
+                self.assertEqual(self._flagged_b(shape, "permissive_attestation_for_tests()"), set())
+                self.assertEqual(self._flagged_b(shape, "setup()", self.SETUP), set())
+
+
 class Issue7999(unittest.TestCase):
     """#7628: "The `let_names` docstring at scripts/check-test-env-mutation.py:612-614 also states that
     `let _ = guard;` drops the guard. That is wrong for a named place: `let _ = g;` does not move g

@@ -79,7 +79,9 @@ once more, as a field initialiser of the struct literal that is its tail express
 _lock: lock }`) or, as the second named helper shape (#7993), a non-test fn whose whole top-level tail or
 `return` value IS the lock expression (`fn env_lock() -> MutexGuard<..> { LOCK.get_or_init(..).lock()
 .unwrap_or_else(..) }`); the caller is credited only through its own canonical `let _g = helper();`.
-A closure or async block handed to `spawn` / `spawn_blocking` (#7994) runs detached: it inherits no
+A Once setter (or a same-file fn that persists one) is credited only as a statement, or the whole initialiser
+of a `let`, of its block (#7995): not inside an unbraced closure, behind `#[cfg(..)]` or in
+any wrapping expression. A closure or async block handed to `spawn` / `spawn_blocking` (#7994) runs detached: it inherits no
 lock of the spawner, of its callers or of `#[serial]`. Open the connection or read the env before the
 spawn, on the test thread, and move the result into the closure.
 In a `macro_rules!` body (a template, not a fn) the statement may sit in any block that encloses the
@@ -730,6 +732,18 @@ def tail_guard(body, pos):
     return bool((RETURN_TAIL if ret else BODY_END).fullmatch(body[end:]))
 
 
+ONCE_STMT_HEAD = re.compile(r"\s*(?:let\s+[^=;{}|]*=\s*)?")
+
+
+def statement_call(body, pos):
+    """True when the call at pos is a statement, or the whole initialiser of a plain `let`, of its block (#7995):
+    the call certainly runs before every later statement of that block, and `encloses` keeps its credit inside
+    the block. An unbraced closure (`let _c = || call();`), a `#[cfg(..)]`-attributed statement, a match arm or
+    any wrapping expression is not a statement call.
+    """
+    return ONCE_STMT_HEAD.fullmatch(stmt_prefix(body, pos)) is not None
+
+
 def stmt_prefix(body, pos):
     """Text of the statement containing pos, from the previous `;`/`{`/`}` up to pos."""
     start = max(body.rfind(";", 0, pos), body.rfind("{", 0, pos), body.rfind("}", 0, pos)) + 1
@@ -1106,7 +1120,9 @@ class FileModel:
             return self._acq[id(fn)]
         body, out = fn.body, []
 
-        def add(pos, tokens, kind, end=None, call=None):
+        def add(pos, tokens, kind, end=None, call=None, stmt=True):
+            if kind == "once" and stmt and not statement_call(body, pos):
+                return  # #7995: only a call that certainly ran earns the one-time credit
             if tokens:
                 names = canonical_guard(body, pos, call) if kind == "lock" else []
                 held = bool(names) or (kind == "lock" and helper_ret_guard(body, pos))
@@ -1123,7 +1139,7 @@ class FileModel:
             m = ONCE_BODY.search(body)
             paren = body.find("(", m.end())
             if paren >= 0:
-                add(match_paren(body, paren), {ONCE_PREFIX + fn.key}, "once")
+                add(match_paren(body, paren), {ONCE_PREFIX + fn.key}, "once", stmt=False)
         inner = stack + (id(fn),)
         for pos, callee, end, _ in self.calls(fn):
             if id(callee) in inner:
