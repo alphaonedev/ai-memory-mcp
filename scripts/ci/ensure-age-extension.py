@@ -28,7 +28,7 @@ Behaviour:
      another runner has verified.
   4. Re-check health; exit 0 when healthy, else one stderr line and non-zero.
 
-The tier URL is read from a file.  It must carry exactly one ``sslmode=verify-full`` and a non-empty
+The tier URL is read from a file.  It must carry exactly one ``sslmode=verify-full`` and exactly one non-empty
 ``sslrootcert`` (#7982): any other TLS shape is refused with exit 2 before any restore or psql call.  Its password is passed to psql through the
 ``PGPASSWORD`` environment variable and removed from the URL psql receives, so
 the password never appears on a process argv.  ONLY the password is moved off
@@ -717,9 +717,11 @@ def require_verified_tls(target):
     modes = [value for key, value in pairs if key == TLS_MODE_KEY]
     if modes != [TLS_REQUIRED_MODE]:
         raise HelperError(f"tier URL file must set exactly one {TLS_MODE_KEY}={TLS_REQUIRED_MODE}", EXIT_BAD_INPUT)
-    if not any(key == TLS_ROOT_KEY and value for key, value in pairs):
-        raise HelperError(f"tier URL file must set a non-empty {TLS_ROOT_KEY} with {TLS_MODE_KEY}={TLS_REQUIRED_MODE}",
-                          EXIT_BAD_INPUT)
+    roots = [value for key, value in pairs if key == TLS_ROOT_KEY]
+    if len(roots) != 1 or not roots[0]:
+        # libpq reads the LAST value, so a repeated key could end empty (#8018, #8022)
+        raise HelperError(f"tier URL file must set exactly one non-empty {TLS_ROOT_KEY} with "
+                          f"{TLS_MODE_KEY}={TLS_REQUIRED_MODE}", EXIT_BAD_INPUT)
 
 
 def read_url(url_file):

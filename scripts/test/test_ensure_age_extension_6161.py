@@ -577,6 +577,9 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             "duplicated sslmode": f"{base}?sslmode=disable&sslmode=verify-full&sslrootcert={TLS_ROOT_CERT}",
             "verify-full without sslrootcert": f"{base}?sslmode=verify-full",
             "verify-full with an empty sslrootcert": f"{base}?sslmode=verify-full&sslrootcert=",
+            "non-empty then empty sslrootcert": f"{base}?sslmode=verify-full&sslrootcert={TLS_ROOT_CERT}&sslrootcert=",
+            "empty then non-empty sslrootcert": f"{base}?sslmode=verify-full&sslrootcert=&sslrootcert={TLS_ROOT_CERT}",
+            "two non-empty sslrootcert": f"{base}?sslmode=verify-full&sslrootcert={TLS_ROOT_CERT}&sslrootcert={TLS_ROOT_CERT}",
         }
         for label, url in refused.items():
             with self.subTest(label):
