@@ -25,8 +25,8 @@ SHARD_ESTIMATE_SECS = 3913
 SHARD_WATCHDOG_SECS = 7800
 JOB_TIMEOUT_MIN = 160
 # #7914: the self-hosted linux-fed leg waits for a host-local semaphore slot
-# (counted against the cap) and is 240; the macOS leg keeps JOB_TIMEOUT_MIN.
-JOB_TIMEOUT_MIN_BY_LEG = {'linux-fed,enterprise-fed': 240, 'macos-fed,enterprise-fed': JOB_TIMEOUT_MIN}
+# (counted against the cap) and is 300; the macOS leg keeps JOB_TIMEOUT_MIN.
+JOB_TIMEOUT_MIN_BY_LEG = {'linux-fed,enterprise-fed': 300, 'macos-fed,enterprise-fed': JOB_TIMEOUT_MIN}
 # #6411: compile + database setup measured at about 28 min in review r2; this
 # runs before the per-shard watchdog starts, so the job cap must cover it plus
 # a 2 min teardown/upload margin on top of the watchdog.
@@ -77,7 +77,7 @@ class ShardBudgetTests(unittest.TestCase):
         for needle in ('56 %', '2x', 'unmeasured', 'first green'):
             self.assertIn(needle, block, 'the F1 derivation must say: ' + needle)
 
-    def test_enterprise_fed_leg_caps_keep_the_ratio_rule_160_macos_240_linux(self):
+    def test_enterprise_fed_leg_caps_keep_the_ratio_rule_160_macos_300_linux(self):
         text = ci_text()
         secs, _ = enterprise_fed_watchdog(text)
         caps = enterprise_fed_timeouts(text)
@@ -170,7 +170,7 @@ class ShardDocsTests(unittest.TestCase):
         row = [l for l in doc.splitlines() if l.startswith('| `linux-fed,enterprise-fed`')]
         self.assertEqual(len(row), 1)
         self.assertIn('7800 s (130 min)', row[0])
-        self.assertIn('| 240 (#7914) |', row[0])
+        self.assertIn('| 300 (#7914) |', row[0])
 
     def test_docs_and_workflow_agree_on_the_shard_budget(self):
         doc = DOC.read_text()
