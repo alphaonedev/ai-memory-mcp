@@ -37,6 +37,7 @@ OTHER = "f2-linux-fed-3"
 STARVED_GIB = 1
 IDLE_AGE_DAYS = 30
 LOCK_TEST_TIMEOUT_SECS = 0.2
+RECENT_AGE_DAYS = 2
 
 
 def make_target(root, name, age_days, files=1):
@@ -227,15 +228,38 @@ class EvictionIsSerialisedAgainstJobStart7292(JobStartHelper):
         self.assertIn("skipped busy %s" % self.idle, out)
 
     def test_eviction_skips_when_the_lock_cannot_be_taken_in_time(self):
+        # #7295: a recent sibling is left for the floor pass to rank, and the
+        # floor is starved, so the old code walked it and blamed the floor.
+        make_target(self.root, "f2-linux-fed-4", 0)
+        real_walk = prune.newest_mtime
         with shared.evict_lock(self.root, 1.0) as held:
             self.assertTrue(held)
             started = time.monotonic()
-            rc, _, err = self.evict(lock_timeout=LOCK_TEST_TIMEOUT_SECS)
+            with mock.patch.object(prune, "newest_mtime", side_effect=real_walk) as walk:
+                rc, out, err = self.evict(lock_timeout=LOCK_TEST_TIMEOUT_SECS)
             elapsed = time.monotonic() - started
         self.assertEqual(rc, prune.EXIT_OK)
         self.assertTrue(self.idle.exists())
         self.assertIn("skipping eviction:", err)
         self.assertLess(elapsed, 5)
+        self.assertNotIn("::warning::", out, "the floor warning blamed the wrong cause")
+        self.assertIn("eviction skipped: lock not taken", out)
+        ranking = [c for c in walk.call_args_list if c.kwargs.get("max_entries")]
+        self.assertEqual(ranking, [], "siblings were ranked after the lock timeout")
+
+    def test_floor_pass_lock_timeout_takes_the_skip_path_7295(self):
+        # #7295 floor-pass path: only a recent sibling (the idle pass never takes
+        # the lock), a starved floor and a lock held by another holder.
+        shutil.rmtree(self.idle)
+        recent = make_target(self.root, "f2-linux-fed-4", RECENT_AGE_DAYS)
+        with shared.evict_lock(self.root, 1.0) as held:
+            self.assertTrue(held)
+            rc, out, err = self.evict(lock_timeout=LOCK_TEST_TIMEOUT_SECS)
+        self.assertEqual(rc, prune.EXIT_OK)
+        self.assertTrue(recent.exists())
+        self.assertIn("skipping eviction:", err)
+        self.assertNotIn("::warning::", out, "the floor warning blamed the wrong cause")
+        self.assertIn("eviction skipped: lock not taken", out)
 
     def test_job_start_never_fails_or_deadlocks_on_the_lock(self):
         with shared.evict_lock(self.root, 1.0) as held:
@@ -289,6 +313,76 @@ class EvictionIsSerialisedAgainstJobStart7292(JobStartHelper):
         self.assertTrue(fresh.exists(), "a recent leftover may belong to a running eviction")
         self.assertTrue(link.is_symlink())
         self.assertTrue((outside / "keep").exists())
+
+
+class LeadingDotRunnerNames7293(Fixture):
+    """#7293 (N1): the leading-dot namespace under the root is reserved."""
+
+    def test_a_leading_dot_name_is_not_a_valid_runner_name(self):
+        for name in (".evicting-x", ".evict.lock", ".hidden", ".", ".."):
+            self.assertFalse(shared.valid_runner_name(name), name)
+        self.assertTrue(shared.valid_runner_name("f2-linux-fed-1.x_y"))
+
+    def test_job_start_refuses_a_leading_dot_runner_name(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = shared.main(["--home", str(self.home), "--runner-name", ".evicting-x"])
+        self.assertEqual(rc, shared.EXIT_USAGE)
+        self.assertFalse((self.root / ".evicting-x").exists())
+
+    def test_a_fresh_marker_keeps_an_evicting_directory_from_being_swept(self):
+        live = make_target(self.root, ".evicting-live-7", IDLE_AGE_DAYS)
+        shared.write_in_use_marker(live, "live")
+        old = time.time() - IDLE_AGE_DAYS * DAY
+        os.utime(live, (old, old))  # a running build writes below the top level, not in it
+        gone = make_target(self.root, ".evicting-dead-8", IDLE_AGE_DAYS)
+        with redirect_stdout(io.StringIO()):
+            prune.sweep_stale_evicting(self.root, time.time())
+        self.assertTrue(live.exists(), "a directory with a fresh in-use marker was swept")
+        self.assertFalse(gone.exists())
+
+
+class BoundedLockHold7294(Fixture):
+    """#7294 (C1): the under-lock busy walk is bounded below the job-start timeout."""
+
+    def test_the_walk_deadline_is_below_the_job_start_lock_timeout(self):
+        self.assertGreater(prune.EVICT_BUSY_WALK_DEADLINE_SECS, 0)
+        self.assertLess(prune.EVICT_BUSY_WALK_DEADLINE_SECS, shared.JOB_START_LOCK_TIMEOUT_SECS)
+
+    def test_a_walk_past_its_deadline_raises_walk_incomplete(self):
+        with self.assertRaises(prune.WalkIncomplete):
+            prune.newest_mtime(self.idle, strict=True, deadline=time.monotonic() - 1)
+
+    def test_a_walk_that_exceeds_the_deadline_leaves_the_target_as_busy(self):
+        with mock.patch.object(prune, "EVICT_BUSY_WALK_DEADLINE_SECS", 0, create=True):
+            _, out, _ = self.evict()
+        self.assertTrue(self.idle.exists(), "a slow busy walk must count as busy")
+        self.assertIn("skipped busy %s" % self.idle, out)
+
+    def test_the_marker_is_checked_again_right_before_the_rename(self):
+        # A marker appears only once the strict busy walk has returned. A check
+        # placed before the walk (a redundant repeat of is_busy's own look)
+        # cannot see it, so only the check right before the rename keeps the
+        # target alive.
+        sequence = []
+        real_walk = prune.newest_mtime
+
+        def recording_walk(*args, **kwargs):
+            result = real_walk(*args, **kwargs)
+            if kwargs.get("strict"):
+                sequence.append("walk")
+            return result
+
+        def marker_after_the_walk(_path, _now, *args, **kwargs):
+            sequence.append("marker")
+            return "walk" in sequence
+
+        with mock.patch.object(prune, "newest_mtime", side_effect=recording_walk), \
+                mock.patch.object(shared, "marker_is_fresh", side_effect=marker_after_the_walk):
+            _, out, _ = self.evict()
+        self.assertEqual(sequence[-2:], ["walk", "marker"], "the re-check must follow the walk")
+        self.assertTrue(self.idle.exists(), "a marker written after the walk was ignored")
+        self.assertIn("skipped busy %s" % self.idle, out)
 
 
 class UnresolvablePaths7284(Fixture):
@@ -345,9 +439,38 @@ class UnresolvablePaths7284(Fixture):
         self.assertIn("protected root child unresolvable: %s" % (self.root / "loop-child"), err)
 
     def test_s2_an_unresolvable_child_is_protected_by_its_lexical_path(self):
-        looped = self.loop(self.root / "loop-child")
-        self.assertTrue(prune.is_protected(looped, self.root))
-        self.assertFalse(prune.is_protected(SCRATCH / "runner" / "_work" / "_temp" / "x", self.root))
+        # #7296: the protected root is reached through a symlinked ancestor, so
+        # the loop child's lexical path (<alias>/root/loop-child) differs from the
+        # resolved root. The candidate resolves cleanly and is an ancestor of the
+        # lexical path only, so just the lexical fallback can protect it. (The
+        # loop child itself would be protected by the outer except, which proves
+        # nothing about the fallback.)
+        lexical_parent = SCRATCH / "lexical"
+        real_root = lexical_parent / "real-side" / "real" / "root"
+        real_root.mkdir(parents=True)
+        alias_side = lexical_parent / "alias-side"
+        alias_side.mkdir()
+        (alias_side / "alias").symlink_to(real_root.parent, target_is_directory=True)
+        protected = alias_side / "alias" / "root"
+        self.loop(protected / "loop-child")
+        real_resolve = prune.resolve
+
+        def loop_aware_resolve(path):
+            # Python 3.13+ resolves a loop without raising (#7326); raise as 3.9-3.12
+            # do so the fallback is reached on every interpreter.
+            if "loop-child" in Path(path).parts:
+                raise RuntimeError("Symlink loop from %s" % path)
+            return real_resolve(path)
+
+        unrelated = SCRATCH / "unrelated"
+        with mock.patch.object(prune, "resolve", side_effect=loop_aware_resolve), \
+                redirect_stderr(io.StringIO()):
+            self.assertTrue(prune.is_protected(alias_side, protected))
+            self.assertFalse(prune.is_protected(SCRATCH / "runner" / "_work" / "_temp" / "x", protected))
+            with mock.patch.object(prune, "_protect_unresolvable_child", return_value=unrelated):
+                self.assertFalse(
+                    prune.is_protected(alias_side, protected),
+                    "dropping the lexical protection must be caught")
 
     def test_s2_dropped_protected_candidates_are_logged(self):
         protected = self.stale_temp("keep-me")
