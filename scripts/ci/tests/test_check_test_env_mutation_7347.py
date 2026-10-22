@@ -769,6 +769,10 @@ class CanonicalShapeR6(Fixture):
         "labelled_loop_break_value": ("", "let g = 'l: loop { break 'l ENV_LOCK.blocking_lock(); };"),
         "mem_forget": ("", GUARD_G + "std::mem::forget(g);"),
         "let_else_some": ("", "let Some(_g) = Some(ENV_LOCK.blocking_lock()) else { return };"),
+        # #7390 asked for the opposite ("a fixture with the literal-bound guard before db::open that must
+        # not be flagged"). The canonical shape (#7623-#7627) does not model a struct field as a guard, so
+        # the shape stays flagged by design; #7390 stays open and PR #7349 no longer closes it (#7998).
+        "struct_literal_bound_guard": (HOLDER, "let _h = Holder { _g: ENV_LOCK.blocking_lock() };"),
     }
 
     def verdict(self, helpers, prefix, body=OPEN):
@@ -796,8 +800,8 @@ class CanonicalShapeR6(Fixture):
         text = WRITER + reader(OPEN, "let _g = ENV_LOCK.blocking_lock();")
         self.assertEqual(self.flagged(text), FLAGGED)
 
-    def test_the_four_held_but_flagged_shapes_stay_flagged_by_design_7628(self):
-        self.assertEqual(len(self.HELD_BUT_FLAGGED), 4)
+    def test_the_five_held_but_flagged_shapes_stay_flagged_by_design_7628_7998(self):
+        self.assertEqual(len(self.HELD_BUT_FLAGGED), 5)
         for name, (helpers, prefix) in self.HELD_BUT_FLAGGED.items():
             with self.subTest(shape=name):
                 self.assertEqual(self.verdict(helpers, prefix), FLAGGED)
