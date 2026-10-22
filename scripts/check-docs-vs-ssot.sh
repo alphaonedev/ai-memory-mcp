@@ -1685,10 +1685,72 @@ PY
     fi
 }
 
+# READ_PATH_SIDE_EFFECTS (#3566) - the recall purity kill-test
+# (tests/recall_purity_p01.rs) cites the doc section that declares the
+# read-path side-effect set in its assertion message. The citation must
+# resolve: the cited heading must exist in the cited doc, and the section
+# body must name every member of the declared set, so the test message
+# cannot point at a heading that was renamed or emptied. Only the --self-test
+# fixture tree (AI_MEMORY_DOCS_GATE_ROOT set) may lack the test file and skip;
+# a real checkout without it FAILS, so a renamed or deleted test cannot switch
+# the rule off (#3566 r2).
+check_read_path_side_effects_rule() {
+    local rule_name="READ_PATH_SIDE_EFFECTS"
+    local test_rs="$REPO_ROOT/tests/recall_purity_p01.rs"
+    if [[ ! -f "$test_rs" ]]; then
+        [[ -n "${AI_MEMORY_DOCS_GATE_ROOT:-}" ]] && return 0
+        printf 'FAIL: %s: tests/recall_purity_p01.rs missing: READ_PATH_SIDE_EFFECTS cannot resolve its citation\n' "$rule_name" >&2
+        fail_count=$((fail_count + 1))
+        return 0
+    fi
+    local out rc=0
+    out="$(python3 - "$REPO_ROOT" <<'RPSEPY'
+import re
+import sys
+
+root = sys.argv[1]
+test_src = open(f"{root}/tests/recall_purity_p01.rs", encoding="utf-8").read()
+cite = re.search(r"docs/[A-Za-z0-9_./-]+\.md, section '([^']+)'", test_src)
+if not cite:
+    print("tests/recall_purity_p01.rs cites no \"<doc>, section '<heading>'\" for the read-path side-effect set")
+    sys.exit(1)
+doc = re.search(r"(docs/[A-Za-z0-9_./-]+\.md), section '", cite.group(0)).group(1)
+heading = cite.group(1)
+try:
+    lines = open(f"{root}/{doc}", encoding="utf-8").read().splitlines()
+except OSError as exc:
+    print(f"cannot read {doc}: {exc}")
+    sys.exit(1)
+body, found, level = [], False, 0
+for line in lines:
+    m = re.match(r"^(#{1,6})\s+(.*?)\s*$", line)
+    if found:
+        if m and len(m.group(1)) <= level:
+            break
+        body.append(line)
+    elif m and m.group(2) == heading:
+        found, level = True, len(m.group(1))
+if not found:
+    print(f"{doc} has no heading '{heading}' that tests/recall_purity_p01.rs cites")
+    sys.exit(1)
+text = "\n".join(body)
+missing = [t for t in ("gc_if_needed", "record_recall_observations", "fold_recall_accesses", "EXPECTED_REFUSAL") if t not in text]
+if missing:
+    print(f"{doc} section '{heading}' does not name: {', '.join(missing)}")
+    sys.exit(1)
+RPSEPY
+)" || rc=$?
+    if [[ "$rc" != 0 ]]; then
+        printf 'FAIL: %s: %s\n' "$rule_name" "$out" >&2
+        fail_count=$((fail_count + 1))
+    fi
+}
+
 run_all_rules() {
     fail_count=0
     check_schema_version_rule
     check_env_var_census_rule
+    check_read_path_side_effects_rule
     # asi-hard pinned-knob count (#3113). The count is quoted in PROSE across
     # six files that cannot derive it; the module doc table sat two rows behind
     # `KNOBS` for a full release with nothing failing. Set equality of the
@@ -3268,6 +3330,26 @@ HTMLSTAMPFROZEN
     echo "PASS: self-test #4507 R3-F7 — a symlinked docs/reference FAILS CLOSED (rc=$_rc)"
     rm -f "$tmpdir/docs/reference"
     mv "$tmpdir/docs/reference.aside" "$tmpdir/docs/reference"
+
+    # ---- #3566 r2: READ_PATH_SIDE_EFFECTS resolves the purity test's doc citation.
+    mkdir -p "$tmpdir/tests"
+    printf '%s\n' "const D: &str = \"docs/RPSE_FIXTURE.md, section 'Read-path side effects'\";" \
+        > "$tmpdir/tests/recall_purity_p01.rs"
+    printf '# Doc\n\n## Other heading\n\ngc_if_needed record_recall_observations fold_recall_accesses EXPECTED_REFUSAL\n' \
+        > "$tmpdir/docs/RPSE_FIXTURE.md"
+    rpse_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 || true)
+    grep -q "READ_PATH_SIDE_EFFECTS: docs/RPSE_FIXTURE.md has no heading 'Read-path side effects'" <<<"$rpse_out" || {
+        echo "FAIL: self-test #3566 r2 - a cited heading missing from the doc was not REJECTED" >&2
+        cd "$REPO_ROOT"; exit 1; }
+    printf '# Doc\n\n## Read-path side effects\n\ngc_if_needed record_recall_observations fold_recall_accesses EXPECTED_REFUSAL\n' \
+        > "$tmpdir/docs/RPSE_FIXTURE.md"
+    rpse_out=$(AI_MEMORY_DOCS_GATE_ROOT="$tmpdir" "$GATE_SELF" 2>&1 || true)
+    if grep -q "READ_PATH_SIDE_EFFECTS" <<<"$rpse_out"; then
+        echo "FAIL: self-test #3566 r2 - the cited heading with all member tokens was still REJECTED" >&2
+        cd "$REPO_ROOT"; exit 1
+    fi
+    rm -rf "$tmpdir/tests" "$tmpdir/docs/RPSE_FIXTURE.md"
+    echo "PASS: self-test #3566 r2 - READ_PATH_SIDE_EFFECTS: a cited heading missing from the doc is REJECTED; the heading with all member tokens is ACCEPTED"
 
     cd "$REPO_ROOT"
 }

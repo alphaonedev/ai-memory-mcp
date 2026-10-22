@@ -42,6 +42,12 @@ use ai_memory::models::{Memory, Tier};
 use rusqlite::Connection;
 use serde_json::json;
 
+/// The doc section that names the declared read-path side-effect set
+/// (`gc_if_needed` probe, `recall_observations` append, background fold
+/// of recall accesses). `scripts/check-docs-vs-ssot.sh` resolves this
+/// citation against the heading in `docs/USER_GUIDE.md` (#3566).
+const READ_PATH_SIDE_EFFECTS_DOC: &str = "docs/USER_GUIDE.md, section 'Read-path side effects'";
+
 /// Process-global env serialization: every test in this binary that
 /// reads OR writes `AI_MEMORY_CONFIDENCE_DECAY` /
 /// `AI_MEMORY_ACCESS_FOLD_INTERVAL_SECS` takes this lock.
@@ -396,7 +402,8 @@ fn purity_pure_default_all_sqlite_entry_paths() {
     let post_dump = dump_all_but_ledger(&conn);
     assert_eq!(
         pre_dump, post_dump,
-        "PURITY VIOLATION: recall mutated a table other than recall_observations"
+        "PURITY VIOLATION: recall mutated a table other than recall_observations \
+         (declared read-path side-effect set: {READ_PATH_SIDE_EFFECTS_DOC})"
     );
     // (c) Ledger grew by exactly the returned-row total of the
     // ledger-writing entry paths, all rows unfolded (pure default).
@@ -533,7 +540,8 @@ async fn purity_pure_default_http_entry_path() {
     let post_dump = dump_all_but_ledger(&conn);
     assert_eq!(
         pre_dump, post_dump,
-        "PURITY VIOLATION: HTTP recall mutated a table other than recall_observations"
+        "PURITY VIOLATION: HTTP recall mutated a table other than recall_observations \
+         (declared read-path side-effect set: {READ_PATH_SIDE_EFFECTS_DOC})"
     );
     assert_eq!(ledger_count(&conn) - pre_ledger, expected_growth);
     assert_eq!(unfolded_count(&conn), expected_growth);

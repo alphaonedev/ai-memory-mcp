@@ -204,6 +204,15 @@ pub fn run(
         validate::validate_rfc3339_timestamp("until", v)?;
     }
     let mut conn = db::open(db_path)?;
+    // Intentional discard (rust-1.98 ERRORS-19: "Never silently drop a
+    // `Result`; handle it, propagate with `?`, or discard with an explicit
+    // `let _ =` only when intentional"). A failed opportunistic sweep must not
+    // fail the read. `gc_if_needed` already swallows its own expiry-probe error
+    // (`unwrap_or(false)`); a missed sweep degrades to "expired rows linger
+    // until the next gc tick", never corrupts. Same reasoning as the MCP recall
+    // site in `src/mcp/tools/recall.rs`; this is the `gc_if_needed` member of
+    // the declared read-path side-effect set (`docs/USER_GUIDE.md` section
+    // "Read-path side effects").
     let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
 
     // Resolve feature tier
