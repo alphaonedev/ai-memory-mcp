@@ -268,8 +268,9 @@ pub(super) fn parse_and_build_memory(
             // typed and unnamed.
             let viewer = crate::identity::resolve_read_visibility_caller();
             if let Some(existing_id) =
-                db::find_by_title_namespace(conn, title, &namespace, viewer.as_deref())
-                    .map_err(|e| crate::mcp::error_text::mcp_foreign_err("as_deref", e))?
+                db::find_by_title_namespace(conn, title, &namespace, viewer.as_deref()).map_err(
+                    |e| crate::mcp::error_text::mcp_foreign_err("find_by_title_namespace", e),
+                )?
             {
                 return Err(conflict_error_message(title, &namespace, &existing_id));
             }
