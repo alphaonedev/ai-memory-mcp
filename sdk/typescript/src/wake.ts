@@ -495,6 +495,33 @@ function checkBundleStat(path: string, st: Stats): void {
 }
 
 /**
+ * Test seam for {@link readOwnerOnlyWindows}: `betweenCheckAndRead` runs after
+ * the permission check and before the read, so a test can swap the path the
+ * way a local attacker would.
+ */
+export interface WindowsReadHooks {
+  betweenCheckAndRead?: () => void;
+  afterOpen?: () => void;
+}
+
+/**
+ * The Windows leg of {@link readOwnerOnly}, split out so it is testable on any
+ * platform (it uses only `node:fs` calls that exist everywhere).
+ */
+export function readOwnerOnlyWindows(path: string, hooks: WindowsReadHooks = {}): string {
+  const st = lstatSync(path);
+  if (st.isSymbolicLink()) {
+    throw new WakeError(
+      `${path} is a symlink: a credential reached through a link is one whose ` +
+        "permissions were checked on the wrong file",
+    );
+  }
+  checkBundleStat(path, st);
+  hooks.betweenCheckAndRead?.();
+  return readFileSync(path, "utf8");
+}
+
+/**
  * Read a credential no other local user could read or replace, through ONE
  * descriptor (#3780).
  *
@@ -523,16 +550,8 @@ function readOwnerOnly(path: string): string {
   const noFollow = fsConstants.O_NOFOLLOW;
   const nonBlock = fsConstants.O_NONBLOCK;
   if (typeof noFollow !== "number" || typeof nonBlock !== "number") {
-    // Windows. Documented above: the pre-#3780 shape, verbatim.
-    const st = lstatSync(path);
-    if (st.isSymbolicLink()) {
-      throw new WakeError(
-        `${path} is a symlink: a credential reached through a link is one whose ` +
-          "permissions were checked on the wrong file",
-      );
-    }
-    checkBundleStat(path, st);
-    return readFileSync(path, "utf8");
+    // Windows: no O_NOFOLLOW / O_NONBLOCK. See readOwnerOnlyWindows.
+    return readOwnerOnlyWindows(path);
   }
 
   let fd: number;
