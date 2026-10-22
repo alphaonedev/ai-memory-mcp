@@ -9,11 +9,11 @@ case_6174_attr_hides_drift GREEN
 case_6177_duplicate_required_context RED
 case_6228_yaml_nel_ls_ps_break RED
 case_6304_unicode_ws_comment RED
-case_6357_cell_isolation GREEN
 case_6370_removed_id_named_elsewhere RED
 case_6427_offset_count RED
 case_6442_new_def_known_name RED
 case_6445_base_nameerror GREEN
+case_6445_cell_isolation GREEN
 case_6683_bidi_zero_width RED
 case_6838_rust_ws_class RED
 case_6839_module_shebang RED

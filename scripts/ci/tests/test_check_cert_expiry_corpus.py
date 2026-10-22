@@ -10,7 +10,7 @@ runner over this file (#6445).
 ISOLATION. Every case builds its OWN scratch git repository under a
 private directory of its own (`CorpusBase.setUp`), so no case can lean on a
 commit, ref, branch or file an earlier case left behind, and the cases pass in
-any order. `case_6357_cell_isolation` pins that.
+any order. `case_6445_cell_isolation` pins that.
 
 NAMED FAILURES (#6445). A case that calls a production helper the gate under
 test does not have fails with a named error, never a traceback that hides every
@@ -1850,6 +1850,22 @@ def prefix_replay_report(repo, scratch):
     return lines, wrong, unreadable
 
 
+# #7990: issues this change does not satisfy. A GREEN manifest entry named for one claims it is fixed.
+OPEN_ISSUES = {
+    "6357": "fence cells f7b, f10b and f10d live on the unlanded fix/6124-promo6-ssh-r2 branch",
+}
+
+
+def open_issue_claims(manifest):
+    """Names of GREEN cases whose number is an issue this change leaves open (#7990)."""
+    claims = []
+    for name, state in sorted(manifest.items()):
+        m = re.match(r"case_(\d+)_", name)
+        if state == GREEN and m and m.group(1) in OPEN_ISSUES:
+            claims.append(f"{name} is GREEN but #{m.group(1)} stays open: {OPEN_ISSUES[m.group(1)]}")
+    return claims
+
+
 def probe_wiring_problems(source, needles, replay, no_standin, manifest):
     """#7988 ratchet over this file's own text: every generator_file(rel, why) call names a
     probe that has a pre-fix replay, or is listed as having none and then must stay RED; no
@@ -2037,7 +2053,8 @@ class Corpus(CorpusBase):
         self.assertIn("AI_MEMORY_FED_HIDDEN_KNOB", out)
 
     @expect(GREEN)
-    def case_6357_cell_isolation(self):
+    def case_6445_cell_isolation(self):
+        """#6445: the cells pass in reverse order, so none leans on a repository an earlier one built."""
         src = GATE_PATH.read_text(encoding="utf-8")
         for needle in ("class Fixture", "def _self_test"):
             self.assertNotIn(needle, src, f"the gate still carries its linear corpus ({needle})")
@@ -2679,6 +2696,11 @@ class Ratchet(unittest.TestCase):
         for note in notes:
             print(note, file=sys.stderr)
         self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_manifest_never_claims_an_open_issue(self):
+        self.assertEqual(open_issue_claims(MANIFEST), [])
+        self.assertTrue(open_issue_claims({"case_6357_x": GREEN}), "a GREEN case named for an open issue passed")
+        self.assertEqual(open_issue_claims({"case_6357_x": RED, "case_6445_y": GREEN}), [])
 
     def test_probe_wiring_ratchet(self):
         """#7988: a RED case cannot become GREEN while its probe is an unreplayed token check."""
