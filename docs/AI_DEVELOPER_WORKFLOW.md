@@ -255,9 +255,14 @@ Every store must set `--source` accurately:
 
 | Source value | Use when |
 |--------------|----------|
-| `claude` (or specific agent) | The AI authored the memory unprompted |
+| `nhi` | The AI authored the memory unprompted |
 | `user` | The user dictated or corrected the content |
-| `derived` | Aggregated/consolidated from other memories |
+| `consolidation` | Aggregated/consolidated from other memories |
+
+Set `agent_id` separately to the specific agent identity, for example
+`ai:codex-god-f2`. `source` is a validated provenance category, not an agent
+identifier; use the values in `src/validate.rs::VALID_SOURCES` rather than model
+or vendor names.
 
 User corrections take precedence over agent-authored memories on the same topic. When
 they conflict, write the user version with priority 9–10 and link the prior agent
