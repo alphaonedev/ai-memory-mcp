@@ -26,7 +26,7 @@ PUBLISH = ROOT / ".github" / "workflows" / "publish-ci-image.yml"
 
 # One entry per issue this PR closes. SELF_CHECK below requires every issue to
 # have at least one pinned case and the count to equal this list.
-CLOSES = (6289, 6290, 6904, 8002, 8020, 8021, 8023, 8030, 8039)
+CLOSES = (6289, 6290, 6904, 8002, 8020, 8021, 8023, 8030, 8031, 8039)
 PINNED_CASES = {}  # issue number -> list of test method names, filled by pins()
 
 
@@ -94,8 +94,8 @@ class Controls(unittest.TestCase):
         self.assertEqual(errors_shape(read(SHAPE)), [])
 
     def test_self_check_pinned_case_count_equals_closes(self):
-        """The pinned-case count equals the Closes count (9)."""
-        self.assertEqual(len(CLOSES), 9)
+        """The pinned-case count equals the Closes count (10)."""
+        self.assertEqual(len(CLOSES), 10)
         self.assertEqual(sorted(PINNED_CASES), sorted(CLOSES))
         for issue in CLOSES:
             self.assertTrue(PINNED_CASES[issue], "no pinned case for #%d" % issue)
@@ -464,6 +464,33 @@ class Survivors8039(unittest.TestCase):
                 rcs = list(pool.map(lambda m: (m[0], self.self_test_rc(tmp, "m%d.py" % abs(hash(m[0])), m[1].decode("utf-8"))),
                                     mutants))
         self.assertEqual([name for name, rc in rcs if rc == 0], [], "mutants the self-test accepts")
+
+
+class Numbered8031(unittest.TestCase):
+    """#8031: a `uses:` refusal numbers the step 1-based, as the #6290 `steps.N` messages do."""
+
+    @pins(8031)
+    def test_first_step_is_step_1(self):
+        """#8031: the first step of publish-ci-image.yml is `step 1` (was `step 0`)."""
+        rep = G.Report()
+        doc = G.parse_yaml(first_use_to_tag(read(PUBLISH)), "publish-ci-image.yml", rep)
+        G.check_uses_pinned(doc, "publish-ci-image.yml", rep)
+        self.assertEqual(len(rep.errors), 1, rep.errors)
+        self.assertIn("job `publish-ci-image` step 1:", rep.errors[0])
+        self.assertNotIn("step 0", rep.errors[0])
+
+    @pins(8031)
+    def test_every_step_is_numbered_by_its_position(self):
+        """#8031: each tag-pinned `uses:` of publish-ci-image.yml reports the 1-based position of its step."""
+        text = read(PUBLISH)
+        for m in SHA_USES.finditer(text):
+            steps_at = text.rindex("    steps:", 0, m.start())
+            position = len(re.findall(r"(?m)^      - ", text[steps_at:m.start()]))
+            mut = text[:m.start(3)] + "v4" + text[m.end(3):]
+            rep = G.Report()
+            G.check_uses_pinned(G.parse_yaml(mut, "publish-ci-image.yml", rep), "publish-ci-image.yml", rep)
+            self.assertEqual(len(rep.errors), 1, rep.errors)
+            self.assertIn(" step %d" % position, rep.errors[0], (position, rep.errors[0][:120]))
 
 
 class Named8021(unittest.TestCase):

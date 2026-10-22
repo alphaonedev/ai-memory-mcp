@@ -1234,7 +1234,7 @@ def uses_where(doc: Node, path: Tuple[str, ...]) -> str:
     if len(path) >= 2 and path[0] == "jobs":
         where = f"job `{path[1]}`"
         if len(path) >= 5 and path[2] == "steps" and path[3].isdigit():
-            where += f" step {path[3]}"
+            where += f" step {int(path[3]) + 1}"  # #8031: 1-based, as the #6290 `steps.N` messages
             jobs = doc.get("jobs")
             job = jobs.get(path[1]) if jobs is not None else None
             steps = job.get("steps") if job is not None else None
@@ -2361,7 +2361,7 @@ MESSAGE_CASES: Dict[str, Tuple[List[Edit], int, str]] = {
     "message: a non-mapping step is refused twice (kind, then the pinned list)": ([(SHAPE, "", _shape_scalar_step, False)], 2,
                                                                                   "must be a mapping"),
     "message: tag-pinned uses names the job and step": ([(PUBLISH, "", _first_use_to_tag, False)], 1,
-                                                        "job `publish-ci-image` step 0"),
+                                                        "job `publish-ci-image` step 1"),
     "message: build unit drift names WF_BUILD": ([_rel(REL_BUILD_CMD, REL_BUILD_CMD + " --verbose")], 2,
                                                  "update WF_BUILD in scripts/check_release_features.py"),
 }
