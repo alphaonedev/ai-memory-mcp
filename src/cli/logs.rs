@@ -284,38 +284,86 @@ fn emit_line(line: &str, filters: &Filters, out: &mut CliOutput<'_>) -> Result<(
     Ok(())
 }
 
+/// Followed-file cursor: the path being followed and the byte offset up to
+/// which every line has been printed.
+struct FollowState {
+    path: PathBuf,
+    offset: u64,
+}
+
+/// Tail pass: read the last `n` matching lines of `path` and return them with
+/// the offset the follow phase starts from. `after_read` runs between the read
+/// and the offset capture (a no-op in production; tests append there to inject
+/// the race deterministically).
+fn tail_then_offset_with(
+    path: &Path,
+    n: usize,
+    filters: &Filters,
+    after_read: impl FnOnce(),
+) -> Result<(Vec<String>, u64)> {
+    let initial = read_tail_n(path, n, filters)?;
+    after_read();
+    let offset = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    Ok((initial, offset))
+}
+
+/// Directory-aware follow entry. Base behaviour: follows `state.path` only.
+fn follow_dir(
+    _dir: &Path,
+    state: &mut FollowState,
+    filters: &Filters,
+    args: &TailArgs,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    follow_from(state, filters, args, out)
+}
+
+/// Poll loop of `logs tail --follow`, resuming at `state.offset`.
+fn follow_from(
+    state: &mut FollowState,
+    filters: &Filters,
+    args: &TailArgs,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    let mut polls: u64 = 0;
+    loop {
+        std::thread::sleep(Duration::from_millis(args.follow_interval_ms));
+        polls += 1;
+        let cur_size = fs::metadata(&state.path)
+            .map(|m| m.len())
+            .unwrap_or(state.offset);
+        if cur_size > state.offset {
+            let new_lines = read_lines_after_offset(&state.path, state.offset)?;
+            for line in new_lines {
+                if line_matches(&line, filters) {
+                    emit_line(&line, filters, out)?;
+                }
+            }
+            state.offset = cur_size;
+        }
+        if args.max_polls > 0 && polls >= args.max_polls {
+            return Ok(());
+        }
+    }
+}
+
 fn run_tail(dir: &Path, filters: &Filters, args: &TailArgs, out: &mut CliOutput<'_>) -> Result<()> {
     let files = enumerate_log_files(dir)?;
     let Some(latest) = files.last().cloned() else {
         return Ok(());
     };
-    // Read the tail-N matching lines.
-    let initial = read_tail_n(&latest, args.lines, filters)?;
+    let (initial, offset) = tail_then_offset_with(&latest, args.lines, filters, || {})?;
     for line in &initial {
         emit_line(line, filters, out)?;
     }
     if !args.follow {
         return Ok(());
     }
-    let mut last_size = fs::metadata(&latest).map(|m| m.len()).unwrap_or(0);
-    let mut polls: u64 = 0;
-    loop {
-        std::thread::sleep(Duration::from_millis(args.follow_interval_ms));
-        polls += 1;
-        let cur_size = fs::metadata(&latest).map(|m| m.len()).unwrap_or(last_size);
-        if cur_size > last_size {
-            let new_lines = read_lines_after_offset(&latest, last_size)?;
-            for line in new_lines {
-                if line_matches(&line, filters) {
-                    emit_line(&line, filters, out)?;
-                }
-            }
-            last_size = cur_size;
-        }
-        if args.max_polls > 0 && polls >= args.max_polls {
-            return Ok(());
-        }
-    }
+    let mut state = FollowState {
+        path: latest,
+        offset,
+    };
+    follow_dir(dir, &mut state, filters, args, out)
 }
 
 fn read_tail_n(path: &Path, n: usize, filters: &Filters) -> Result<Vec<String>> {
@@ -576,6 +624,119 @@ mod tests {
         let s = std::str::from_utf8(&stdout).unwrap();
         assert!(s.contains("first"), "got: {s}");
         assert!(s.contains("second"), "expected appended line: {s}");
+    }
+
+    fn follow_args(max_polls: u64) -> TailArgs {
+        TailArgs {
+            lines: 10,
+            follow: true,
+            follow_interval_ms: 20,
+            max_polls,
+        }
+    }
+
+    fn append(path: &Path, text: &str) {
+        let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
+        write!(f, "{text}").unwrap();
+    }
+
+    fn follow_to_string(dir: &Path, state: &mut FollowState, max_polls: u64) -> String {
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        {
+            let mut out = output(&mut stdout, &mut stderr);
+            follow_dir(
+                dir,
+                state,
+                &Filters::default(),
+                &follow_args(max_polls),
+                &mut out,
+            )
+            .unwrap();
+        }
+        String::from_utf8(stdout).unwrap()
+    }
+
+    /// #7945 - a line appended after the tail pass read the file but before the
+    /// follow offset was captured must still be printed, exactly once.
+    #[test]
+    fn logs_tail_follow_prints_line_appended_before_baseline_7945() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\n");
+        let filters = Filters::default();
+        let (initial, offset) = tail_then_offset_with(&path, 10, &filters, || {
+            append(&path, "second\n");
+        })
+        .unwrap();
+        assert_eq!(initial, vec!["first".to_string()]);
+        let mut state = FollowState {
+            path: path.clone(),
+            offset,
+        };
+        let s = follow_to_string(dir.path(), &mut state, 2);
+        assert_eq!(s.matches("second").count(), 1, "got: {s:?}");
+        assert!(!s.contains("first"), "no duplicate of tail pass: {s:?}");
+    }
+
+    /// #7946 - rotation by name: a newer-named file appears; the old file's
+    /// remaining tail is drained first, then the new file prints from offset 0.
+    #[test]
+    fn logs_tail_follow_survives_name_rotation_7946() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\n");
+        let mut state = FollowState {
+            path: a.clone(),
+            offset: 6,
+        };
+        append(&a, "late-a\n");
+        let dir_path = dir.path().to_path_buf();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            fs::write(dir_path.join("ai-memory.log.2026-05-01"), "new-b\n").unwrap();
+        });
+        let s = follow_to_string(dir.path(), &mut state, 8);
+        h.join().unwrap();
+        assert_eq!(s.matches("late-a").count(), 1, "got: {s:?}");
+        assert_eq!(s.matches("new-b").count(), 1, "got: {s:?}");
+    }
+
+    /// #7946 - truncation of the followed file restarts from offset 0.
+    #[test]
+    fn logs_tail_follow_survives_truncation_7946() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-04-30", "aaaa\nbbbb\n");
+        let mut state = FollowState {
+            path: a.clone(),
+            offset: 10,
+        };
+        let a2 = a.clone();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            fs::write(&a2, "c\n").unwrap();
+        });
+        let s = follow_to_string(dir.path(), &mut state, 8);
+        h.join().unwrap();
+        assert_eq!(s.matches("c\n").count(), 1, "got: {s:?}");
+    }
+
+    /// #7946 - rename-and-recreate under the same name (new inode, larger file).
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_survives_rename_recreate_7946() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "old-line-one\n");
+        let mut state = FollowState {
+            path: a.clone(),
+            offset: 13,
+        };
+        let dir_path = dir.path().to_path_buf();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            fs::rename(dir_path.join("ai-memory.log"), dir_path.join("old.zst")).unwrap();
+            fs::write(dir_path.join("ai-memory.log"), "longer-new-line\nz\n").unwrap();
+        });
+        let s = follow_to_string(dir.path(), &mut state, 8);
+        h.join().unwrap();
+        assert_eq!(s.matches("longer-new-line").count(), 1, "got: {s:?}");
     }
 
     #[test]
