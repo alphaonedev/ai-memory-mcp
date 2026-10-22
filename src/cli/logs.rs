@@ -457,8 +457,13 @@ fn follow_poll(
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
     let newest = enumerate_log_files(dir)?.pop();
+    // decision: compare newest against the followed path with the module's own
+    // ordering (`enumerate_log_files` sorts by path, the rolling appender's
+    // date suffix) over keeping a set of seen paths, because `>` needs no
+    // extra state and an older file can never win once the followed newest
+    // file is renamed away or removed (#7964).
     if let Some(newest) = newest
-        && newest != state.path
+        && newest > state.path
     {
         // Rotation by name: finish the old file, then follow the new one from 0.
         drain_followed(state, filters, out, true)?;
@@ -955,6 +960,28 @@ mod tests {
         let (plain, _, _, _) =
             tail_then_offset_with(&plain_frag, 10, &Filters::default(), false, || {}).unwrap();
         assert_eq!(plain, vec!["only".to_string(), "frag".to_string()]);
+    }
+
+    /// #7964 - the followed newest file is renamed away while an older log
+    /// exists: keep the old handle, never go back to the older file.
+    #[test]
+    fn logs_tail_follow_keeps_handle_when_newest_renamed_away_7964() {
+        let dir = tempfile::tempdir().unwrap();
+        make_log(dir.path(), "ai-memory.log.2026-04-29", "older-line\n");
+        let newest = make_log(dir.path(), "ai-memory.log.2026-04-30", "x\n");
+        let file = fs::File::open(&newest).unwrap();
+        let mut state = FollowState {
+            path: newest.clone(),
+            offset: 2,
+            id: file.metadata().ok().as_ref().and_then(file_id),
+            file: Some(file),
+        };
+        let moved = dir.path().join("ai-memory.log.2026-04-30.zst");
+        fs::rename(&newest, &moved).unwrap();
+        append(&moved, "late\n");
+        let (s, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "late\n", "old handle drained, older file not reprinted");
+        assert_eq!(state.path, newest, "still following the renamed file");
     }
 
     #[test]
