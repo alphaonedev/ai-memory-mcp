@@ -3,6 +3,7 @@
 Real subprocesses against a scratch lock root; nothing here touches the
 operator's ~/.cache. Python 3.9+, standard library only.
 """
+import contextlib
 import os
 import signal
 import subprocess
@@ -147,10 +148,8 @@ class Semaphore(unittest.TestCase):
             self.assertEqual(b.returncode, 0, 'second wrapper must acquire after released: ' + out_b)
         finally:
             if pidfile.exists():
-                try:
+                with contextlib.suppress(ProcessLookupError, ValueError):
                     os.kill(int(pidfile.read_text()), signal.SIGKILL)
-                except (ProcessLookupError, ValueError):
-                    pass
 
     def test_tolerated_signal_errors_are_recorded_on_stderr_7929(self):
         sys.path.insert(0, str(SCRIPT.parent))
@@ -158,7 +157,6 @@ class Semaphore(unittest.TestCase):
             import host_semaphore as hs
         finally:
             sys.path.pop(0)
-        import contextlib
         import io
         from unittest import mock
         for exc, needle in ((ProcessLookupError(), 'already gone'), (PermissionError(), 'not permitted')):
