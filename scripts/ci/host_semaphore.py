@@ -88,9 +88,14 @@ def _signal_group(pgid, sig):
         pass
 
 
-def run_child(command, fd):
-    """Run COMMAND in its own process group holding the slot fd; return its exit code."""
-    proc = subprocess.Popen(command, start_new_session=True, pass_fds=(fd,))
+def run_child(command):
+    """Run COMMAND in its own process group; return its exit code.
+
+    The slot lock fd stays in this wrapper only (#7927): Popen closes every fd above 2
+    in the child (close_fds=True, the default), so a surviving descendant never keeps
+    the host-wide slot after the wrapper prints ``released``.
+    """
+    proc = subprocess.Popen(command, start_new_session=True)
     got = []
 
     def forward(signum, _frame):
@@ -162,7 +167,7 @@ def main(argv=None):
         load, cores = load_and_cores()
         print("::notice::%s %r: slot %d of %d acquired after %ds (load=%.2f cores=%d)"
               % (TAG, args.label, index, args.slots, waited, load, cores), flush=True)
-        return run_child(command, fd)
+        return run_child(command)
     finally:
         os.close(fd)
         print("%s %r: slot %d of %d released" % (TAG, args.label, index, args.slots), flush=True)

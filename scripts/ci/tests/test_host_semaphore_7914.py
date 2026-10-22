@@ -128,6 +128,30 @@ class Semaphore(unittest.TestCase):
         out, _ = b.communicate(timeout=30)
         self.assertEqual(b.returncode, 0, out)
 
+    def test_detached_descendant_does_not_keep_the_slot_7927(self):
+        """#7927: the lock fd stays in the wrapper; a surviving descendant must not hold the slot."""
+        pidfile = self.root / 'sleeper.pid'
+        code = ('import subprocess, sys\n'
+                'p = subprocess.Popen(["sleep", "30"], start_new_session=True, close_fds=False,\n'
+                '                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
+                'open(%r, "w").write(str(p.pid))\n' % str(pidfile))
+        a = start(self.root, ['--name', 'n', '--slots', '1'], [sys.executable, '-c', code])
+        try:
+            out, _ = a.communicate(timeout=30)
+            self.assertEqual(a.returncode, 0, out)
+            self.assertIn('slot 0 of 1 released', out)
+            self.assertTrue(pidfile.exists(), out)
+            b = start(self.root, ['--name', 'n', '--slots', '1', '--max-wait-secs', '1', '--poll-secs', '1'],
+                      [sys.executable, '-c', 'pass'])
+            out_b, _ = b.communicate(timeout=30)
+            self.assertEqual(b.returncode, 0, 'second wrapper must acquire after released: ' + out_b)
+        finally:
+            if pidfile.exists():
+                try:
+                    os.kill(int(pidfile.read_text()), signal.SIGKILL)
+                except (ProcessLookupError, ValueError):
+                    pass
+
     def test_bad_arguments_exit_2(self):
         p = start(self.root, ['--name', 'n', '--slots', '0'], ['true'])
         p.communicate(timeout=30)
