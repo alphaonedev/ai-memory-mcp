@@ -1459,6 +1459,43 @@ class Issue8037(Fixture):
 WRITER_HEAD = "use tokio::sync::Mutex;\nstatic ENV_LOCK: Mutex<()> = Mutex::const_new(());\n"
 
 
+class Issue8038(Fixture):
+    """#8038: "a same-file fn named as a value (an identifier argument not followed by `(`) is live and is
+    judged with an EMPTY caller context (fail closed)" and "a `macro_rules!` body whose expansion contains
+    a DETACH call makes the macro's invocation arguments detached spans"."""
+
+    OPEN = 'let _c = db::open(":memory:");'
+    LOCKED = "#[test]\nfn reader() {\n    let _l = ENV_LOCK.blocking_lock();\n    %s\n}\n"
+
+    def test_a_fn_item_handed_to_spawn_by_name_runs_detached(self):
+        text = WRITER + "fn work() { %s }\n" % self.OPEN + self.LOCKED % "std::thread::spawn(work).join().unwrap();"
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_path_to_a_fn_item_handed_to_spawn_runs_detached(self):
+        text = (WRITER + "mod jobs { pub fn work() { %s } }\n" % self.OPEN
+                + self.LOCKED % "std::thread::spawn(jobs::work).join().unwrap();")
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_the_same_fn_called_directly_under_the_lock_is_covered(self):
+        text = WRITER + "fn work() { %s }\n" % self.OPEN + self.LOCKED % "work();"
+        self.assertEqual(self.flagged(text), set())
+
+    BG = "macro_rules! bg {\n    ($e:expr) => { std::thread::spawn($e) };\n}\n"
+
+    def test_the_arguments_of_a_spawning_macro_run_detached(self):
+        text = WRITER + self.BG + self.LOCKED % "bg!(move || { %s }).join().unwrap();" % self.OPEN
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_fn_item_handed_to_a_spawning_macro_runs_detached(self):
+        text = WRITER + self.BG + "fn work() { %s }\n" % self.OPEN + self.LOCKED % "bg!(work).join().unwrap();"
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_macro_that_does_not_spawn_keeps_the_lock(self):
+        text = (WRITER + "macro_rules! twice {\n    ($e:expr) => { $e; $e };\n}\n"
+                + self.LOCKED % ("twice!(%s);" % self.OPEN))
+        self.assertEqual(self.flagged(text), set())
+
+
 class RealTree(unittest.TestCase):
     def test_repo_matches_its_baseline(self):
         found = gate.scan_tree(REPO)

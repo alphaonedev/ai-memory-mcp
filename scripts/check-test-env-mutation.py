@@ -219,6 +219,7 @@ LOCK_TYPE_NAMES = frozenset((
     "PoisonError"))
 PATH_SELF = ("self", "super", "crate")
 MACRO_RULES = re.compile(r"\bmacro_rules\s*!\s*([A-Za-z_]\w*)\s*\{")
+FN_VALUE = re.compile(r"\s*((?:[A-Za-z_]\w*\s*::\s*)*)([A-Za-z_]\w*)\s*,?\s*")
 MACRO_CALL = re.compile(r"\b([A-Za-z_]\w*)\s*!\s*[({\[]")
 META_CALL = re.compile(r"\$([A-Za-z_]\w*)\s*\(")
 # #7623-#7627: the canonical guard binding (see the module docstring). Nothing models moves or drops.
@@ -1062,6 +1063,9 @@ class FileModel:
                     else Source(None))
         self.fns = parse_fns(scrubbed)
         self.async_names = {f.name for f in self.fns if f.is_async} | {n for n, f in self.common.fns.items() if f.is_async}
+        # #8038: a macro_rules! whose body spawns detaches the arguments of every invocation of it
+        self.detach_macros = {m.group(1) for m in re.finditer(r"\bmacro_rules\s*!\s*([A-Za-z_]\w*)\s*\{", scrubbed)
+                              if DETACH.search(scrubbed, m.end(), match_brace(scrubbed, m.end() - 1))}
         self.tests = [f for f in self.fns if f.is_test and not f.ignored]
         self.mod_names = {m for f in self.fns for m in f.mods}
         self.by_key, self.by_method = {}, {}
@@ -1226,6 +1230,13 @@ class FileModel:
             for c in cands:
                 if c is not fn:
                     out.append((m.start(), c, end, method))
+        for a, b in self.spawn_spans(fn):
+            # #8038: a fn item handed to spawn by name (`spawn(work)`) runs detached: it is reached from here
+            # with the context of its position inside the spawn argument, which is empty (fail closed).
+            v = FN_VALUE.fullmatch(body, a, b)
+            hit = self.resolve(fn.owner, v.group(1), v.group(2)) if v else None
+            if hit is not None and hit is not fn:
+                out.append((v.start(2), hit, b, False))
         self._calls[id(fn)] = out
         return out
 
@@ -1337,13 +1348,23 @@ class FileModel:
             self._encl[key] = match_brace(fn.body, scope_open(fn.body, a))
         return r < self._encl[key]
 
+    def spawn_spans(self, fn):
+        """[(start, end)] of every argument list of fn that runs detached (#7994, #8038): a `spawn(..)` call,
+        or an invocation of a macro_rules! whose body spawns."""
+        body, spans = fn.body, []
+        for m in DETACH.finditer(body):
+            spans.append((m.end(), match_paren(body, m.end() - 1) - 1))
+        for m in MACRO_CALL.finditer(body):
+            if m.group(1) in self.detach_macros:
+                spans.append((m.end(), match_paren(body, m.end() - 1) - 1))
+        return spans
+
     def detached(self, fn, r):
         """(start, end) of the innermost spawn argument of fn that contains body position r, else None (#7994)."""
         spans = self._detached.get(id(fn))
         if spans is None:
             spans = []
-            for m in DETACH.finditer(fn.body):
-                spans.append((m.end(), match_paren(fn.body, m.end() - 1) - 1))
+            spans = self.spawn_spans(fn)
             self._detached[id(fn)] = spans
         inside = [s for s in spans if s[0] <= r < s[1]]
         return min(inside, key=lambda s: s[1] - s[0]) if inside else None
