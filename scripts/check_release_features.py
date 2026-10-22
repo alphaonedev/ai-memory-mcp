@@ -308,6 +308,23 @@ RELEASE_JOB_PERMISSIONS: Dict[str, Optional[Dict[str, Spec]]] = {
     "docker": dict(DOCKER_JOB["permissions"]),  # type: ignore[arg-type]
     "copr": dict(_READ_ATTEST),
 }
+# Every job's `needs:` edges, pinned (#6289): a publish job that dropped its
+# supply-chain / release gate would run before (or without) it. preflight is the
+# root and carries no `needs:`; docker reuses its whole-job pin.
+_PQS = Flow("preflight, qualify, supply-chain")
+_PQR = Flow("preflight, qualify, release")
+RELEASE_JOB_NEEDS: Dict[str, Spec] = {
+    "qualify": "preflight",
+    "supply-chain": Flow("preflight, qualify"),
+    "release": _PQS,
+    "sbom": _PQS,
+    "mobile-ios": _PQS,
+    "mobile-android": _PQS,
+    "crates-io": _PQR,
+    "homebrew": _PQR,
+    "docker": DOCKER_JOB["needs"],
+    "copr": _PQR,
+}
 # The only secrets release.yml may read: a new credential (a registry token in
 # another job) is refused until it is added here on purpose.
 RELEASE_SECRETS = ("GITHUB_TOKEN", "CARGO_REGISTRY_TOKEN", "HOMEBREW_TAP_TOKEN", "COPR_CONFIG")
@@ -1050,6 +1067,20 @@ def check_docker_job(jobs: Node, rep: Report) -> None:
             rep.bad(msg)
 
 
+def check_job_needs(name: str, job: Node, rep: Report) -> None:
+    """#6289: the job's `needs:` is exactly RELEASE_JOB_NEEDS[name]; the root job has none."""
+    needs = RELEASE_JOB_NEEDS.get(name)
+    if needs is None:
+        if job.get("needs") is not None:
+            rep.bad(pin_message("release.yml", f"`jobs.{name}` carries a `needs:` and is pinned to have none (#6289)",
+                                "RELEASE_JOB_NEEDS"))
+        return
+    why = pin_problem(job.get("needs"), needs, f"jobs.{name}.needs")
+    if why:
+        rep.bad(pin_message("release.yml", why + " (a dropped edge lets the job run before its gate, #6289)",
+                            "RELEASE_JOB_NEEDS"))
+
+
 def check_release_permissions(doc: Node, jobs: Node, rep: Report) -> None:
     """The job set and every job's `permissions:` are pinned; `packages: write`
     is the docker job's alone (#4719 SR-8)."""
@@ -1067,6 +1098,7 @@ def check_release_permissions(doc: Node, jobs: Node, rep: Report) -> None:
             continue
         if job.get("uses") is not None:
             rep.bad(f"release.yml: `jobs.{name}` calls a reusable workflow (`uses:`), which the guard cannot read")
+        check_job_needs(name, job, rep)
         perms = job.get("permissions")
         if want is None:
             if perms is not None:
