@@ -350,6 +350,76 @@ SHAPE_JOB: Dict[str, Spec] = {
     "runs-on": "ubuntu-latest",
     "timeout-minutes": "60",
 }
+
+
+class Unit(str):
+    """A SHAPE_STEPS slot filled by a statement-list unit (SHAPE_BUILD / SHAPE_PROOF)."""
+
+
+# #6290: the release-shape job's ordered step list is pinned WHOLE. The build and
+# proof slots are the statement-list units; every other step is compared key by
+# key, so no step carries an `if:`, `continue-on-error:` or `timeout-minutes:` the
+# list does not pin (only the cleanup step runs `if: always()`), and none can be
+# added, dropped or reordered.
+SHAPE_STEPS: List[Spec] = [
+    {"uses": CHECKOUT_USES},
+    {"name": "Install Rust 1.98.0 (matches rust-toolchain.toml pin)", "uses": "dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0"},
+    {"uses": "Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6"},
+    {"name": "Release feature declaration guard", "run": "python3 scripts/check_release_features.py"},
+    Unit("build"),
+    {"name": "No OpenSSL / libpq / native-tls in the shipped dependency graph", "shell": "bash",
+     "run": Block((
+         'set -euo pipefail',
+         'FEATURES="$(bash scripts/release-features.sh)"',
+         'test -n "$FEATURES"',
+         'tree="$(cargo tree --locked -e normal --target all --features "$FEATURES")"',
+         'if printf \'%s\\n\' "$tree" | grep -E \'(^|[^a-z-])(openssl-sys|native-tls|openssl |libpq)\'; then',
+         '  echo "::error::the release feature set pulls a native TLS / libpq dependency (#4480 requires pure-Rust rustls)"',
+         '  exit 1',
+         'fi',
+         'echo "no openssl-sys / native-tls / libpq in the release dependency graph"',
+     ))},
+    {"name": "Start a TLS PostgreSQL service (throwaway CA, hostssl-only)", "shell": "bash",
+     "run": Block((
+         'set -euo pipefail',
+         'd="$RUNNER_TEMP/pgtls"',
+         'mkdir -p "$d"',
+         'cd "$d"',
+         'openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=release-shape-ca" -keyout ca.key -out ca.crt',
+         'openssl req -newkey rsa:2048 -nodes -subj "/CN=127.0.0.1" -keyout server.key -out server.csr',
+         "printf 'subjectAltName=IP:127.0.0.1,DNS:localhost\\n' > san.ext",
+         'openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -days 1 -extfile san.ext -out server.crt',
+         '# hostssl ONLY on TCP: a plaintext login cannot succeed, so a green',
+         '# round trip proves the session was TLS.',
+         "printf 'local all all trust\\nhostssl all all all scram-sha-256\\n' > pg_hba.conf",
+         'sudo chown 999:999 server.key server.crt pg_hba.conf',
+         'sudo chmod 600 server.key',
+         'pw="$(openssl rand -hex 16)"',
+         'echo "::add-mask::$pw"',
+         'echo "PGTLS_DIR=$d" >> "$GITHUB_ENV"',
+         'echo "PGTLS_PW=$pw" >> "$GITHUB_ENV"',
+         '# Image: pgvector/pgvector 0.8.6-pg18 (canonical PostgreSQL 18.6 + pgvector 0.8.6',
+         '# stack of the repo SSOT), pinned by digest; no Apache AGE in this image.',
+         'docker run -d --name release-shape-pg -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD="$pw" -e POSTGRES_DB=proof -v "$d:/certs:ro" pgvector/pgvector@sha256:2ba9ca5f2e7daa0f0e7723cba1ee9167bab54efd3640516a44ac1a928dd67e7a -c ssl=on -c ssl_cert_file=/certs/server.crt -c ssl_key_file=/certs/server.key -c hba_file=/certs/pg_hba.conf',
+         'for _ in $(seq 1 60); do',
+         '  if docker exec release-shape-pg pg_isready -U postgres -d proof >/dev/null 2>&1; then',
+         '    ready=1; break',
+         '  fi',
+         '  sleep 2',
+         'done',
+         'if [ "${ready:-0}" != 1 ]; then',
+         '  docker logs release-shape-pg || true',
+         '  echo "::error::the TLS PostgreSQL service did not become ready (the proof must not pass vacuously)"',
+         '  exit 1',
+         'fi',
+         "docker exec release-shape-pg psql -U postgres -d proof -v ON_ERROR_STOP=1 -c 'CREATE EXTENSION IF NOT EXISTS vector;'",
+     ))},
+    Unit("proof"),
+    {"name": "Stop the PostgreSQL service", "if": "always()", "shell": "bash",
+     "run": "docker rm -f release-shape-pg >/dev/null 2>&1 || true"},
+]
+SHAPE_STEP_ROLES = ("checkout", "toolchain", "build cache", "feature declaration guard", "release-shaped build",
+                    "native TLS check", "TLS PostgreSQL service", "PG proof", "PostgreSQL cleanup")
 # #4480 ruled the release-shape job ADVISORY until its first green run on main; #4720
 # tracks the flip to required. While True the job must carry exactly the plain
 # `continue-on-error: true`; the #4720 fix sets this to False in the same commit
@@ -1368,6 +1438,30 @@ def check_shape(text: str, rep: Report, advisory: Optional[bool] = None) -> None
                       rep, "SHAPE_PROOF", _shape_norm)
     if builds and proofs and proofs[0] < builds[0]:
         rep.bad("release-shape.yml: the pg proof must run after the release-shaped build, in the same job")
+    # #6290: the whole ordered step list is pinned (SHAPE_STEPS).
+    items = [st for _, st in steps]
+    raw = job.get("steps")
+    if raw is None or raw.kind != "seq" or not isinstance(raw.value, list) or len(items) != len(raw.value):
+        rep.bad(pin_message("release-shape.yml", "`jobs.release-shape.steps` is missing, not a sequence or holds a "
+                            "non-mapping step", "SHAPE_STEPS"))
+        return
+    if len(items) != len(SHAPE_STEPS):
+        rep.bad(pin_message("release-shape.yml", f"the release-shape job has {len(items)} steps, the pinned list has "
+                            f"{len(SHAPE_STEPS)} (an extra step can replace the proven binary or the proof script; a "
+                            "missing one skips a control)", "SHAPE_STEPS"))
+        return
+    units = {"build": builds, "proof": proofs}
+    for n, (step, spec) in enumerate(zip(items, SHAPE_STEPS)):
+        if isinstance(spec, Unit):
+            if units[str(spec)] != [n]:
+                rep.bad(pin_message("release-shape.yml", f"`jobs.release-shape.steps.{n + 1}` must be the {spec} unit "
+                                    f"({SHAPE_STEP_ROLES[n]}); the proof runs after the build, in the same job",
+                                    "SHAPE_STEPS"))
+            continue
+        why = pin_problem(step, spec, f"jobs.release-shape.steps.{n + 1} ({SHAPE_STEP_ROLES[n]})")
+        if why:
+            rep.bad(pin_message("release-shape.yml", why + " (#6290: no step may carry an unpinned `if:`, "
+                                "`continue-on-error:` or `timeout-minutes:`)", "SHAPE_STEPS"))
 
 
 def check_install(text: str, rep: Report) -> None:
