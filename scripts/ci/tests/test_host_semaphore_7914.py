@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'host_semaphore.py'
@@ -158,10 +159,9 @@ class Semaphore(unittest.TestCase):
         finally:
             sys.path.pop(0)
         import io
-        from unittest import mock
         for exc, needle in ((ProcessLookupError(), 'already gone'), (PermissionError(), 'not permitted')):
             err = io.StringIO()
-            with mock.patch.object(hs.os, 'killpg', side_effect=exc), contextlib.redirect_stderr(err):
+            with unittest.mock.patch.object(hs.os, 'killpg', side_effect=exc), contextlib.redirect_stderr(err):
                 hs._signal_group(4242, signal.SIGTERM)
             self.assertIn('[#7914 semaphore] note:', err.getvalue())
             self.assertIn(needle, err.getvalue())
