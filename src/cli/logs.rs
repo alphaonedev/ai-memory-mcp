@@ -327,12 +327,17 @@ fn advance_offset(offset: u64, read: usize) -> Result<u64> {
 /// the byte offset the follow phase must start from. The offset is the number
 /// of bytes this very read consumed (not a later `metadata` length), so every
 /// byte after it is printed by the follow phase exactly once (#7945).
+/// With `hold_tail` an unterminated final fragment is neither returned nor
+/// counted in the offset: the follow phase reads it whole once its newline
+/// arrives, so a line is never printed in two halves (#7963). Without it (a
+/// plain tail, nothing follows) the fragment is returned as a line.
 /// `after_read` runs after the read (a no-op in production; tests append there
 /// to inject the race deterministically).
 fn tail_then_offset_with(
     path: &Path,
     n: usize,
     filters: &Filters,
+    hold_tail: bool,
     after_read: impl FnOnce(),
 ) -> Result<(Vec<String>, u64, Option<u64>, fs::File)> {
     let f = fs::File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
@@ -344,7 +349,7 @@ fn tail_then_offset_with(
     loop {
         raw.clear();
         let read = reader.read_line(&mut raw)?;
-        if read == 0 {
+        if read == 0 || (hold_tail && !raw.ends_with('\n')) {
             break;
         }
         offset = advance_offset(offset, read)?;
@@ -511,7 +516,7 @@ fn run_tail(dir: &Path, filters: &Filters, args: &TailArgs, out: &mut CliOutput<
     let Some(latest) = files.last().cloned() else {
         return Ok(());
     };
-    let (initial, offset, id, file) = tail_then_offset_with(&latest, args.lines, filters, || {})?;
+    let (initial, offset, id, file) = tail_then_offset_with(&latest, args.lines, filters, args.follow, || {})?;
     for line in &initial {
         emit_line(line, filters, out)?;
     }
@@ -793,7 +798,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\n");
         let filters = Filters::default();
-        let (initial, offset, id, file) = tail_then_offset_with(&path, 10, &filters, || {
+        let (initial, offset, id, file) = tail_then_offset_with(&path, 10, &filters, true, || {
             append(&path, "second\n");
         })
         .unwrap();
@@ -907,6 +912,49 @@ mod tests {
         let fresh = s.find("fresh-new").expect("new-file line printed");
         assert!(late < fresh, "old tail must precede new file: {s:?}");
         assert_eq!(s.matches("late-old").count(), 1, "got: {s:?}");
+    }
+
+    /// One `follow_poll` against `dir`, returning (stdout, stderr). No sleeps,
+    /// no threads: every test drives the poll seam directly.
+    fn poll_once(dir: &Path, state: &mut FollowState) -> (String, String) {
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        {
+            let mut out = output(&mut stdout, &mut stderr);
+            follow_poll(dir, state, &Filters::default(), &mut out).unwrap();
+        }
+        (
+            String::from_utf8(stdout).unwrap(),
+            String::from_utf8(stderr).unwrap(),
+        )
+    }
+
+    /// #7963 - an unterminated final fragment at the tail pass is not printed
+    /// as a line; the follow phase prints it whole once its newline arrives.
+    #[test]
+    fn logs_tail_follow_holds_partial_last_line_7963() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\npart");
+        let (initial, offset, id, file) =
+            tail_then_offset_with(&path, 10, &Filters::default(), true, || {}).unwrap();
+        assert_eq!(initial, vec!["first".to_string()], "fragment must be held");
+        assert_eq!(offset, 6, "offset stops before the fragment");
+        let mut state = FollowState {
+            path: path.clone(),
+            offset,
+            id,
+            file: Some(file),
+        };
+        append(&path, "ial\n");
+        let (s, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "partial\n", "line printed whole, once: {s:?}");
+        // A plain tail (nothing follows) still prints the unterminated line.
+        let (plain, _, _, _) =
+            tail_then_offset_with(&path, 10, &Filters::default(), false, || {}).unwrap();
+        assert_eq!(plain, vec!["first".to_string(), "partial".to_string()]);
+        let plain_frag = make_log(dir.path(), "ai-memory.log.2026-05-01", "only\nfrag");
+        let (plain, _, _, _) =
+            tail_then_offset_with(&plain_frag, 10, &Filters::default(), false, || {}).unwrap();
+        assert_eq!(plain, vec!["only".to_string(), "frag".to_string()]);
     }
 
     #[test]
