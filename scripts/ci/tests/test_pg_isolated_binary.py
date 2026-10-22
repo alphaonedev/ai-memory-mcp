@@ -10,6 +10,8 @@ runs the real script against the Postgres named by
 ``AI_MEMORY_TEST_POSTGRES_URL`` and skips when that is unset.
 """
 import ast
+import contextlib
+import io
 import importlib.util
 import os
 import re
@@ -2167,6 +2169,27 @@ class Termination(unittest.TestCase):
         drops = [s for s in rec.sql() if s.startswith('DROP DATABASE')]
         self.assertEqual(len(creates), 1)
         self.assertEqual(len(drops), 1, 'the running clone is dropped before exit')
+
+    def test_signal_children_permission_error_is_visible_7892(self):
+        r = runner(width=1)
+        r._children[4242] = object()
+        err = io.StringIO()
+        with unittest.mock.patch.object(pib.os, 'killpg', side_effect=PermissionError(1, 'denied')), \
+                contextlib.redirect_stderr(err):
+            r._signal_children(signal.SIGTERM)
+        self.assertIn('4242', err.getvalue())
+        self.assertIn('SIGTERM', err.getvalue())
+
+    def test_signal_children_process_lookup_error_is_silent_7892(self):
+        r = runner(width=1)
+        r._children[4242] = object()
+        r._children[4243] = object()
+        err = io.StringIO()
+        with unittest.mock.patch.object(pib.os, 'killpg', side_effect=ProcessLookupError()) as kp, \
+                contextlib.redirect_stderr(err):
+            r._signal_children(signal.SIGTERM)
+        self.assertEqual(err.getvalue(), '')
+        self.assertEqual(kp.call_count, 2, 'the best-effort loop continues')
 
     def test_main_installs_term_and_int_handlers_for_run(self):
         src = SCRIPT.read_text()

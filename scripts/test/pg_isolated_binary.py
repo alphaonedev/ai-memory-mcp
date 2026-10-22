@@ -47,7 +47,6 @@ could not be minted or held, 143 terminated, otherwise the worst exit code of
 the cargo runs. Standard library only, Python 3.9+.
 """
 import argparse
-import contextlib
 import os
 import re
 import signal
@@ -1045,8 +1044,14 @@ class Runner:
         with self._lock:
             pids = list(self._children)
         for pid in pids:
-            with contextlib.suppress(ProcessLookupError, PermissionError):
+            try:
                 os.killpg(pid, sig)
+            except ProcessLookupError:
+                continue  # the group already exited: nothing to signal
+            except PermissionError as exc:
+                # A group the wrapper may not signal can leak: say so (#7892).
+                sys.stderr.write("pg_isolated_binary: cannot signal child group %d with %s: %s\n"
+                                 % (pid, signal.Signals(sig).name, exc.strerror or exc))
 
     def _spawn(self, argv: List[str], env: Dict[str, str], out: IO[str]) -> 'subprocess.Popen[str]':
         with self._lock:
