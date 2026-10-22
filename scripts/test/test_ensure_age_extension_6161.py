@@ -1049,6 +1049,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             try:
                 os.kill(child, signal.SIGKILL)
             except ProcessLookupError:
+                # the process already exited: nothing left to kill
                 pass
             proc.kill()
             proc.communicate()
@@ -1123,6 +1124,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
+                    # the process already exited: nothing left to kill
                     pass
 
         self.addCleanup(reap)
@@ -1241,6 +1243,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                 try:
                     os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
+                    # the process already exited: nothing left to kill
                     pass
             if w is not None:
                 os.close(w)
@@ -1354,6 +1357,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         try:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
+            # the process already exited: nothing left to kill
             pass
 
     def install_snapshot(self):
@@ -1442,6 +1446,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             try:
                 os.kill(child, signal.SIGKILL)
             except ProcessLookupError:
+                # the process already exited: nothing left to kill
                 pass
 
         self.addCleanup(reap)

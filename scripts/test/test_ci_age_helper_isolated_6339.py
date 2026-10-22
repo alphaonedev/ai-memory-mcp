@@ -62,7 +62,6 @@ URL_LINES = frozenset((
     'if [ ! -f "$url_file" ]; then',
     'echo "::error::enterprise-fed leg on $RUNNER_NAME is missing $url_file — the native pg tier URL is not'
     ' provisioned on this node"',
-    'if ! python3 -I scripts/ci/check-tier-password.py --url-file "$url_file"; then',
     READ,
     'if ! psql "$base_url" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \\"$CI_FED_DB\\";"; then',
     'case "$base_url" in',

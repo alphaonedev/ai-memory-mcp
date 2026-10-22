@@ -913,7 +913,7 @@ jobs:
         # own frozen-pre-fix-mirror regression leg at
         # scripts/test/fixtures/required-contexts-prefix-2494.txt.
         run: bash scripts/test/test-ci-workflow-invariants.sh
-      - name: Workflow invariants for the AGE self-heal and tier password check (#6161 #6181)
+      - name: Workflow invariants for the AGE self-heal and tier password check (#6161 #6339)
         # Python port seed of the shell invariants above (the shell file is not edited: python-not-shell).
         run: python3 -I scripts/test/test_ci_workflow_invariants_6161.py
       - name: Release workflow invariants (#3546)
