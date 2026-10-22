@@ -228,7 +228,10 @@ URL_LIT = re.compile(r"\b[a-z][a-z0-9+.-]*://([^/?#\s\"]*)")
 RESOLVER_WORDS = re.compile(r"\.\s*resolve(?:_to_addrs)?\s*\(|\bresolver\b|\bdns_resolver\b|\blocalhost\b", re.IGNORECASE)
 IP_HOST = re.compile(r"\[[0-9a-fA-F:.]+\]|\d{1,3}(?:\.\d{1,3}){3}")
 URL_PLACEHOLDER_HOST = re.compile(r"\{[^{}]*\}")
-LOCAL_ADDR = re.compile(r"\blocal_addr\s*\(")
+# #8036: the one canonical `local_addr()` shape: `<path>.local_addr()` plus `.unwrap()`, `.expect(..)` or `?`.
+LOCAL_ADDR_CALL = re.compile(
+    r"[A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*\s*\.\s*local_addr\s*\(\s*\)"
+    r"(?:\s*\?|\s*\.\s*unwrap\s*\(\s*\)|\s*\.\s*expect\s*\([^()]*\))*")
 BLOCK_KEYWORDS = re.compile(r"\b(?:if|while|match|for|loop|impl|fn|struct|enum|union|trait|mod|where)\b")
 STRUCT_LIT_HEAD = re.compile(
     r"(?:^|[=(,:\[|]|=>|\breturn)\s*(?:[A-Za-z_]\w*\s*::\s*)*[A-Z]\w*(?:\s*::\s*<[^;{}]*>)?\s*$")
@@ -624,7 +627,7 @@ def ip_expr(expr, text, at=0, sig="", depth=0):
     """True when expr is an IP literal, the canonical `local_addr()` call, or a `let` of the same fn that
     precedes the use at `at` and is bound to one (#7997, #8035, #8036). Anything else fails closed."""
     expr = expr.strip().lstrip("&").strip()
-    if LOCAL_ADDR.search(expr) or IP_STR.fullmatch(expr):
+    if LOCAL_ADDR_CALL.fullmatch(expr) or IP_STR.fullmatch(expr):
         return True
     if depth < 4 and re.fullmatch(r"[A-Za-z_]\w*", expr):
         if rebound(text, expr, sig):

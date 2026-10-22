@@ -1396,6 +1396,40 @@ class Issue8035(Fixture):
         self.assertFalse(gate.ip_only_text(text, "fn helper(host: &str) "))
 
 
+class Issue8036(Fixture):
+    """#8036: "ip_expr accepts any expression merely CONTAINING `local_addr(`" -- require the canonical
+    shape: assigned from `<x>.local_addr()` optionally followed by `.unwrap()`, `.expect(..)` or `?`."""
+
+    def reader_with(self, host):
+        body = 'let c = reqwest::Client::new();\n    let _r = c.get(format!("http://{}/x", %s));' % host
+        return WRITER + test_fn("reader", body)
+
+    WRAPPED = {
+        "resolver_wrapper": "resolve_name(l.local_addr().unwrap())",
+        "method_after_the_addr": "l.local_addr().unwrap().to_string() + peer_suffix()",
+        "call_in_a_block": "{ other(); l.local_addr().unwrap() }",
+        "not_a_method_call": "local_addr()",
+        "string_concat": 'format!("peer.example/{}", l.local_addr().unwrap())',
+    }
+
+    def test_a_wrapped_local_addr_keeps_the_reader(self):
+        for name, host in self.WRAPPED.items():
+            with self.subTest(shape=name):
+                self.assertEqual(self.flagged(self.reader_with(host)), FLAGGED)
+
+    CANONICAL = {
+        "unwrap": "l.local_addr().unwrap()",
+        "expect": 'l.local_addr().expect("bound")',
+        "question_mark": "l.local_addr()?",
+        "field_receiver": "self.listener.local_addr().unwrap()",
+    }
+
+    def test_the_canonical_local_addr_shapes_are_ip_only(self):
+        for name, host in self.CANONICAL.items():
+            with self.subTest(shape=name):
+                self.assertEqual(self.flagged(self.reader_with(host)), set())
+
+
 class RealTree(unittest.TestCase):
     def test_repo_matches_its_baseline(self):
         found = gate.scan_tree(REPO)
