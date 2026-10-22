@@ -82,6 +82,32 @@ fn the_latch_still_refuses_on_its_own_thread_7381() {
     assert!(audit_trail_gate().is_ok(), "dropping the guard reopens it");
 }
 
+/// Cell D (#8048) - pins the scope reset in `impl Drop for LatchGuard`
+/// (`LATCH_SCOPE.set(false)`, `fail_closed.rs`). After this thread drops its own
+/// guard, a sibling thread that holds a latch must not refuse this thread: the
+/// drop cleared the scope. Mutant M1 (the reset line deleted) leaves the scope
+/// set, so the gate below refuses and the cell fails. Channels order the steps.
+#[test]
+fn dropping_the_guard_clears_the_thread_scope_so_a_sibling_latch_is_not_seen_8048() {
+    let _g = sink_test_lock();
+    drop(latch_for_test());
+    let (latched_tx, latched_rx) = std::sync::mpsc::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let sibling = std::thread::spawn(move || {
+        let _latch = latch_for_test();
+        latched_tx.send(()).expect("signal latched");
+        release_rx.recv().expect("wait for release");
+    });
+    latched_rx.recv().expect("sibling latched");
+    let seen = audit_trail_gate();
+    release_tx.send(()).expect("release sibling");
+    sibling.join().expect("sibling panicked");
+    assert!(
+        seen.is_ok(),
+        "a dropped guard must clear the scope; this thread saw the sibling latch"
+    );
+}
+
 /// A sink whose writes fail while `fail` is set.
 struct Failing {
     fail: Arc<AtomicBool>,
