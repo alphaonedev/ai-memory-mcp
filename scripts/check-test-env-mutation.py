@@ -84,6 +84,12 @@ of a `let`, of its block (#7995): not inside an unbraced closure, behind `#[cfg(
 any wrapping expression. A closure or async block handed to `spawn` / `spawn_blocking` (#7994) runs detached: it inherits no
 lock of the spawner, of its callers or of `#[serial]`. Open the connection or read the env before the
 spawn, on the test thread, and move the result into the closure.
+A same-file fn that hands one of its parameters to a spawn (#8044), directly, through a closure it binds, or
+through another such fn, is a detaching helper: the argument of every call of it runs detached.
+A closure variable or fn item rebound with `let g = f;` before the spawn is followed to a fixpoint (#8045),
+bounded by MAX_REBIND_HOPS; a longer chain is flagged, never cleared.
+A macro_rules! whose body invokes a spawning macro, or a detaching helper, detaches too (#8046): the
+forwarding is closed transitively.
 In a `macro_rules!` body (a template, not a fn) the statement may sit in any block that encloses the
 macro's first env write.
 
@@ -224,6 +230,10 @@ CLOSURE_LET = r"\blet\s+(?:mut\s+)?%s\b[^=;]*=\s*(?:async\b\s*(?:move\b\s*)?|mov
 FN_VALUE = re.compile(r"\s*((?:[A-Za-z_]\w*\s*::\s*)*)([A-Za-z_]\w*)\s*,?\s*")
 MACRO_CALL = re.compile(r"\b([A-Za-z_]\w*)\s*!\s*[({\[]")
 META_CALL = re.compile(r"\$([A-Za-z_]\w*)\s*\(")
+# #8045: `let [mut] <name> [: T] = [&] [path::]<ident>;` -- a plain rebinding of a closure variable or fn item
+REBIND_LET = r"\blet\s+(?:mut\s+)?%s\b\s*(?::[^=;]*)?=\s*(?:&\s*)?((?:[A-Za-z_]\w*\s*::\s*)*)([A-Za-z_]\w*)\s*;"
+MAX_REBIND_HOPS = 8  # #8045: rebinding steps followed from a spawn argument; a longer chain flags the whole fn
+ANY_CLOSURE_LET = CLOSURE_LET % r"[A-Za-z_]\w*"  # every closure or async-block `let` initialiser of a fn
 # #7623-#7627: the canonical guard binding (see the module docstring). Nothing models moves or drops.
 LET_PAIR = re.compile(r"^\s*let\s+\(\s*(?:mut\s+)?([A-Za-z_]\w*)\s*,\s*(?:mut\s+)?([A-Za-z_]\w*)\s*\)\s*(?::[^=]*)?=(?!=)")
 # The ONE tuple helper shape the tree uses: `let (<key>, <guard>) = install_test_operator_key();`
@@ -482,6 +492,7 @@ class Fn:
         self.name, self.mods, self.owner, self.attrs, self.body = name, mods, owner, attrs, body
         self.is_async = is_async
         self.offset = offset
+        self.params, self.has_self = (), False  # #8044: parameter names (None = pattern), receiver apart
         self.is_test = self._is_test(attrs)
         self.serial_tokens = self._serial_tokens(attrs)
         self.serial = bool(self.serial_tokens)
@@ -558,9 +569,69 @@ def parse_fns(scrubbed):
             continue
         mods = [b[3] for b in blocks if b[2] == "mod" and b[0] < m.start() < b[1]]
         owners = [b[3] for b in blocks if b[2] == "impl" and b[0] < m.start() < b[1]]
-        fns.append(Fn(m.group(1), mods, owners[-1] if owners else None, attrs,
-                      scrubbed[brace:match_brace(scrubbed, brace)], brace, m.group(0).startswith("async")))
+        fn = Fn(m.group(1), mods, owners[-1] if owners else None, attrs,
+                scrubbed[brace:match_brace(scrubbed, brace)], brace, m.group(0).startswith("async"))
+        fn.params, fn.has_self = fn_params(scrubbed, m.end(), brace)
+        fns.append(fn)
     return fns
+
+
+def split_top_level(text, start, end):
+    """[(start, end)] of the comma separated items of text[start:end] at bracket depth 0 (#8044). A `|..|`
+    closure parameter list that opens an item is skipped whole; the `>` of `->` is not a bracket."""
+    out, depth, j, first = [], 0, start, start
+    while j < end:
+        ch = text[j]
+        if ch == "-" and text[j + 1:j + 2] == ">":
+            j += 1
+        elif ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth -= 1
+        elif ch == "|" and depth == 0 and (not text[first:j].strip() or re.search(r"\bmove\s*$", text[first:j])):
+            j = text.find("|", j + 1)
+            if j < 0:
+                break
+        elif ch == "," and depth == 0:
+            out.append((first, j))
+            first = j + 1
+        j += 1
+    if text[first:end].strip():
+        out.append((first, end))
+    return out
+
+
+def fn_params(text, name_end, brace):
+    """((names), has_self) of the fn whose name ends at name_end and whose body opens at brace (#8044)."""
+    k = name_end
+    while k < brace and text[k].isspace():
+        k += 1
+    if text[k:k + 1] == "<":
+        depth = 0
+        while k < brace:
+            if text[k] == "-" and text[k + 1:k + 2] == ">":
+                k += 1
+            elif text[k] == "<":
+                depth += 1
+            elif text[k] == ">":
+                depth -= 1
+                if not depth:
+                    k += 1
+                    break
+            k += 1
+    while k < brace and text[k].isspace():
+        k += 1
+    if text[k:k + 1] != "(":
+        return (), False
+    names, has_self = [], False
+    for a, b in split_top_level(text, k + 1, match_paren(text, k) - 1):
+        piece = text[a:b]
+        if re.match(r"\s*(?:&\s*(?:'\w+\s*)?)?(?:mut\s+)?self\b", piece):
+            has_self = True
+            continue
+        m = re.match(r"\s*(?:mut\s+)?([A-Za-z_]\w*)\s*:", piece)
+        names.append(m.group(1) if m else None)
+    return tuple(names), has_self
 
 
 def let_names(prefix):
@@ -1082,8 +1153,10 @@ class FileModel:
         self.fns = parse_fns(scrubbed)
         self.async_names = {f.name for f in self.fns if f.is_async} | {n for n, f in self.common.fns.items() if f.is_async}
         # #8038: a macro_rules! whose body spawns detaches the arguments of every invocation of it
-        self.detach_macros = {m.group(1) for m in re.finditer(r"\bmacro_rules\s*!\s*([A-Za-z_]\w*)\s*\{", scrubbed)
-                              if DETACH.search(scrubbed, m.end(), match_brace(scrubbed, m.end() - 1))}
+        macro_bodies = {m.group(1): scrubbed[m.end():match_brace(scrubbed, m.end() - 1)]
+                        for m in re.finditer(r"\bmacro_rules\s*!\s*([A-Za-z_]\w*)\s*\{", scrubbed)}
+        self.detach_macros = {n for n, b in macro_bodies.items() if DETACH.search(b)}
+        self.helpers = {}  # #8044: id(fn) -> indices of the parameters the fn hands to a spawn
         self.tests = [f for f in self.fns if f.is_test and not f.ignored]
         self.mod_names = {m for f in self.fns for m in f.mods}
         self.by_key, self.by_method = {}, {}
@@ -1098,6 +1171,7 @@ class FileModel:
         self._calls, self._acq, self._summary, self._ctx, self._live = {}, {}, {}, {}, {}
         self._detached = {}
         self._encl, self._viol, self._ip_only = {}, {}, {}
+        self._close_detachers(macro_bodies)
         self.blamed = set()
         self.callers = {id(f): [] for f in self.fns}
         for f in self.fns:
@@ -1248,13 +1322,18 @@ class FileModel:
             for c in cands:
                 if c is not fn:
                     out.append((m.start(), c, end, method))
-        for a, b in self.spawn_spans(fn):
+        for a, b in self.spawn_roots(fn):
             # #8038: a fn item handed to spawn by name (`spawn(work)`) runs detached: it is reached from here
             # with the context of its position inside the spawn argument, which is empty (fail closed).
+            # #8045: the same through a chain of `let g = f;` rebindings; past the hop bound every fn is reached.
             v = FN_VALUE.fullmatch(body, a, b)
-            hit = self.resolve(fn.owner, v.group(1), v.group(2)) if v else None
-            if hit is not None and hit is not fn:
-                out.append((v.start(2), hit, b, False))
+            if not v:
+                continue
+            _, chain, over = self.expand(body, a, b)
+            hits = list(self.by_key.values()) if over else [self.resolve(fn.owner, p, n) for p, n in chain]
+            for hit in hits:
+                if hit is not None and hit is not fn:
+                    out.append((v.start(2), hit, b, False))
         self._calls[id(fn)] = out
         return out
 
@@ -1366,22 +1445,111 @@ class FileModel:
             self._encl[key] = match_brace(fn.body, scope_open(fn.body, a))
         return r < self._encl[key]
 
-    def spawn_spans(self, fn):
-        """[(start, end)] of every argument list of fn that runs detached (#7994, #8038): a `spawn(..)` call,
-        or an invocation of a macro_rules! whose body spawns."""
-        body, spans = fn.body, []
+    def spawn_roots(self, fn):
+        """[(start, end)] of every argument that fn hands to another thread directly (#7994, #8038, #8044): a
+        `spawn(..)` call, an invocation of a spawning macro_rules!, or the argument a same-file detaching
+        helper hands to its own spawn (`fn bg<F>(f: F) { spawn(f); }`)."""
+        body, out = fn.body, []
         for m in DETACH.finditer(body):
-            spans.append((m.end(), match_paren(body, m.end() - 1) - 1))
+            out.append((m.end(), match_paren(body, m.end() - 1) - 1))
         for m in MACRO_CALL.finditer(body):
             if m.group(1) in self.detach_macros:
-                spans.append((m.end(), match_paren(body, m.end() - 1) - 1))
+                out.append((m.end(), match_paren(body, m.end() - 1) - 1))
+        for m in CALL.finditer(body):
+            before = body[max(0, m.start() - CALL_WINDOW):m.start()].rstrip()
+            if re.search(r"\bfn$", before):
+                continue
+            method = before.endswith(".")
+            if method:
+                cands = self.by_method.get(m.group(2), [])
+            else:
+                hit = self.resolve(fn.owner, m.group(1), m.group(2))
+                cands = [hit] if hit is not None else []
+            args = None
+            for c in cands:
+                for i in self.helpers.get(id(c), ()):
+                    args = split_top_level(body, m.end(), match_paren(body, m.end() - 1) - 1) if args is None else args
+                    j = i + (0 if method or not c.has_self else 1)
+                    if j < len(args):
+                        out.append(args[j])
+        return out
+
+    def expand(self, body, a, b):
+        """(spans, chain, overflow) for the spawn argument body[a:b] (#8033, #8045): spans are the closure or
+        async-block initialisers of the variables the argument resolves to through `let g = f;` rebindings,
+        chain is every (path prefix, name) reached, overflow says MAX_REBIND_HOPS was hit. On overflow every
+        closure initialiser of the fn is a span: a long chain is flagged, never cleared."""
+        v = FN_VALUE.fullmatch(body, a, b)
+        if not v:
+            return [], [], False
+        chain, frontier = [(v.group(1), v.group(2))], ([v.group(2)] if not v.group(1) else [])
+        for _ in range(MAX_REBIND_HOPS):
+            nxt = []
+            for name in frontier:
+                for lm in re.compile(REBIND_LET % re.escape(name)).finditer(body, 0, a):
+                    tgt = (lm.group(1), lm.group(2))
+                    if tgt not in chain:
+                        chain.append(tgt)
+                        if not tgt[0]:
+                            nxt.append(tgt[1])
+            frontier = nxt
+            if not frontier:
+                break
+        over = bool(frontier)
+        spans = []
+        if over:
+            spans = [(lm.end(), stmt_end(body, lm.end())) for lm in re.compile(ANY_CLOSURE_LET).finditer(body)]
+        else:
+            for prefix, name in chain:
+                if not prefix:
+                    spans += [(lm.end(), stmt_end(body, lm.end()))
+                              for lm in re.compile(CLOSURE_LET % re.escape(name)).finditer(body, 0, a)]
+        return spans, chain, over
+
+    def spawn_spans(self, fn):
+        """[(start, end)] of every argument list of fn that runs detached (#7994, #8038, #8044, #8045): the
+        roots, plus the closures the variables among them (through rebinding) hold (#8033)."""
+        spans = self.spawn_roots(fn)
         for a, b in list(spans):
-            # #8033: `let work = move || { .. }; spawn(work)` -- the closure the variable holds runs detached
-            v = FN_VALUE.fullmatch(body, a, b)
-            if v and not v.group(1):
-                for lm in re.compile(CLOSURE_LET % re.escape(v.group(2))).finditer(body, 0, a):
-                    spans.append((lm.end(), stmt_end(body, lm.end())))
+            spans += self.expand(fn.body, a, b)[0]
         return spans
+
+    def _spawned_params(self, fn):
+        """Indices of the parameters of fn that reach a spawn: named in a spawn argument, in a closure a spawn
+        argument variable holds, or in the argument of a call to another detaching helper (#8044)."""
+        roots = self.spawn_roots(fn)
+        if not roots:
+            return set()
+        texts, names, over = [], set(), False
+        for a, b in roots:
+            spans, chain, ov = self.expand(fn.body, a, b)
+            texts += [fn.body[x:y] for x, y in [(a, b)] + spans]
+            names |= {n for prefix, n in chain if not prefix}
+            over = over or ov
+        return {i for i, pn in enumerate(fn.params)
+                if over or pn is None or pn in names or any(re.search(r"\b%s\b" % re.escape(pn), t) for t in texts)}
+
+    def _close_detachers(self, macro_bodies):
+        """Close the detach model to a fixpoint (#8044, #8046): a macro whose body invokes a detaching macro or
+        a detaching helper detaches; a fn that hands a parameter to a spawn, a detaching macro or a detaching
+        helper is itself a detaching helper. The sets only grow, so the loop ends."""
+        changed = True
+        while changed:
+            changed = False
+            helper_names = {f.name for f in self.fns if self.helpers.get(id(f))}
+            for name, body in macro_bodies.items():
+                if name not in self.detach_macros and (
+                        any(c.group(1) in self.detach_macros for c in MACRO_CALL.finditer(body))
+                        or any(c.group(2) in helper_names for c in CALL.finditer(body))):
+                    self.detach_macros.add(name)
+                    changed = True
+            for f in self.fns:
+                if f.is_test or not f.params:
+                    continue
+                idxs = self._spawned_params(f)
+                if idxs - self.helpers.get(id(f), set()):
+                    self.helpers[id(f)] = idxs | self.helpers.get(id(f), set())
+                    changed = True
 
     def detached(self, fn, r):
         """(start, end) of the innermost spawn argument of fn that contains body position r, else None (#7994)."""

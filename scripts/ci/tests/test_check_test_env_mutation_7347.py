@@ -1525,6 +1525,103 @@ class Issue8033(Fixture):
         self.assertEqual(self.flagged(text), set())
 
 
+class Issue8044(Fixture):
+    """#8044: a same-file helper fn that spawns its parameter detaches the argument of every call of it."""
+
+    OPEN = 'let _c = db::open(":memory:");'
+    LOCKED = "#[test]\nfn reader() {\n    let _l = ENV_LOCK.blocking_lock();\n    %s\n}\n"
+    BG = "fn bg<F: FnOnce() + Send + 'static>(f: F) { std::thread::spawn(f).join().unwrap(); }\n"
+
+    def test_a_closure_handed_to_a_spawning_helper_runs_detached(self):
+        text = WRITER + self.BG + self.LOCKED % ("bg(move || { %s });" % self.OPEN)
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_variable_handed_to_a_spawning_helper_runs_detached(self):
+        text = WRITER + self.BG + self.LOCKED % ("let work = move || { %s };\n    bg(work);" % self.OPEN)
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_fn_item_handed_to_a_spawning_helper_runs_detached(self):
+        text = WRITER + self.BG + "fn work() { %s }\n" % self.OPEN + self.LOCKED % "bg(work);"
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_helper_that_forwards_its_parameter_to_a_spawning_helper_detaches(self):
+        text = (WRITER + self.BG + "fn outer<F: FnOnce() + Send + 'static>(g: F) { bg(g); }\n"
+                + self.LOCKED % ("outer(move || { %s });" % self.OPEN))
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_method_helper_that_spawns_its_parameter_detaches(self):
+        text = (WRITER + "struct P;\nimpl P {\n    fn bg<F: FnOnce() + Send + 'static>(&self, f: F) { std::thread::spawn(f); }\n}\n"
+                + self.LOCKED % ("P.bg(move || { %s });" % self.OPEN))
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_helper_that_runs_its_parameter_on_the_same_thread_keeps_the_lock(self):
+        text = (WRITER + "fn run<F: FnOnce()>(f: F) { f() }\n"
+                + self.LOCKED % ("run(move || { %s });" % self.OPEN))
+        self.assertEqual(self.flagged(text), set())
+
+    def test_a_helper_that_spawns_something_else_keeps_the_lock(self):
+        text = (WRITER + "fn run<F: FnOnce()>(f: F) { std::thread::spawn(|| {}); f() }\n"
+                + self.LOCKED % ("run(move || { %s });" % self.OPEN))
+        self.assertEqual(self.flagged(text), set())
+
+
+class Issue8045(Fixture):
+    """#8045: a closure variable rebound before it is spawned is resolved to a fixpoint, bounded by
+    MAX_REBIND_HOPS, and a chain past the bound is flagged, never cleared."""
+
+    OPEN = 'let _c = db::open(":memory:");'
+    LOCKED = "#[test]\nfn reader() {\n    let _l = ENV_LOCK.blocking_lock();\n    %s\n}\n"
+
+    def test_a_rebound_closure_variable_runs_detached(self):
+        body = "let f = move || { %s };\n    let g = f;\n    std::thread::spawn(g).join().unwrap();" % self.OPEN
+        self.assertEqual(self.flagged(WRITER + self.LOCKED % body), FLAGGED)
+
+    def test_a_twice_rebound_closure_variable_runs_detached(self):
+        body = ("let f = move || { %s };\n    let g = f;\n    let h = g;\n"
+                "    std::thread::spawn(h).join().unwrap();" % self.OPEN)
+        self.assertEqual(self.flagged(WRITER + self.LOCKED % body), FLAGGED)
+
+    def test_a_rebound_fn_item_runs_detached(self):
+        text = (WRITER + "fn work() { %s }\n" % self.OPEN
+                + self.LOCKED % "let g = work;\n    std::thread::spawn(g).join().unwrap();")
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_chain_past_the_hop_bound_is_flagged_not_cleared(self):
+        hops = gate.MAX_REBIND_HOPS + 2
+        lets = "".join("let v%d = v%d;\n    " % (i + 1, i) for i in range(hops))
+        body = ("let v0 = move || { %s };\n    %sstd::thread::spawn(v%d).join().unwrap();" % (self.OPEN, lets, hops))
+        self.assertEqual(self.flagged(WRITER + self.LOCKED % body), FLAGGED)
+
+    def test_a_rebound_closure_variable_that_is_only_called_keeps_the_lock(self):
+        body = "let f = move || { %s };\n    let g = f;\n    g();" % self.OPEN
+        self.assertEqual(self.flagged(WRITER + self.LOCKED % body), set())
+
+
+class Issue8046(Fixture):
+    """#8046: a macro whose body invokes a detaching macro detaches the arguments of its own invocations."""
+
+    OPEN = 'let _c = db::open(":memory:");'
+    LOCKED = "#[test]\nfn reader() {\n    let _l = ENV_LOCK.blocking_lock();\n    %s\n}\n"
+    INNER = "macro_rules! inner {\n    ($e:expr) => { std::thread::spawn($e) };\n}\n"
+    OUTER = "macro_rules! outer {\n    ($e:expr) => { inner!($e) };\n}\n"
+
+    def test_a_macro_forwarding_to_a_spawning_macro_detaches(self):
+        text = WRITER + self.INNER + self.OUTER + self.LOCKED % ("outer!(move || { %s }).join().unwrap();" % self.OPEN)
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_the_forwarding_chain_is_closed_over_two_levels(self):
+        top = "macro_rules! top {\n    ($e:expr) => { outer!($e) };\n}\n"
+        text = (WRITER + top + self.OUTER + self.INNER
+                + self.LOCKED % ("top!(move || { %s }).join().unwrap();" % self.OPEN))
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_macro_forwarding_to_a_macro_that_does_not_spawn_keeps_the_lock(self):
+        text = (WRITER + "macro_rules! twice {\n    ($e:expr) => { $e; $e };\n}\n"
+                + "macro_rules! outer {\n    ($e:expr) => { twice!($e) };\n}\n"
+                + self.LOCKED % ("outer!(%s);" % self.OPEN))
+        self.assertEqual(self.flagged(text), set())
+
+
 class RealTree(unittest.TestCase):
     def test_repo_matches_its_baseline(self):
         found = gate.scan_tree(REPO)
