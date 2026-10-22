@@ -205,7 +205,12 @@ if [[ "${1:-}" == "--self-test" ]]; then
     # Always remove the planted files, including on a kill: a leftover
     # contrived .rs under src/ would break the build for everyone.
     self_test_cleanup () { rm -f "$probe_dup" "$probe_mb"; }
-    trap self_test_cleanup EXIT INT TERM
+    # #7920: INT/TERM clean up then re-raise so the run dies of the signal
+    # instead of resuming (an EXIT INT TERM handler that returns lets the
+    # interrupted self-test finish).
+    trap self_test_cleanup EXIT
+    trap 'self_test_cleanup; trap - INT; kill -INT $$' INT
+    trap 'self_test_cleanup; trap - TERM; kill -TERM $$' TERM
 
     # Probe A — a brand-new magic string on 3 production sites (absent from baseline).
     cat > "$probe_dup" <<'EOF'
