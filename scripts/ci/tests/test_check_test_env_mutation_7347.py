@@ -764,6 +764,11 @@ class CanonicalShapeR6(Fixture):
         # #8001 / #7389 / #7474: the turbofish call form of drop is a mention of the guard like any other
         "turbofish_drop": ("", GUARD_G + "drop::<_>(g);"),
         "turbofish_mem_drop": ("", GUARD_G + "std::mem::drop::<_>(g);"),
+        # #7993: a helper whose tail only contains a lock call hands the caller no guard
+        "helper_tail_drops_guard": ("fn h() { drop(ENV_LOCK.blocking_lock()) }\n", "let _x = h();"),
+        "helper_tail_measures_guard": (
+            "fn h() -> usize { std::mem::size_of_val(&ENV_LOCK.blocking_lock()) }\n", "let _x = h();"),
+        "helper_tail_unawaited_future": ("fn h() { ENV_LOCK.lock() }\n", "let _x = h();"),
     }
 
     HELD_BUT_FLAGGED = {
@@ -1076,6 +1081,46 @@ class Issue7992(Fixture):
         text = WRITER + macro + test_fn("w2", "setl!();") + LOCKED_READER
         # the macro write is unprotected: the other writers and the reader race it
         self.assertEqual(self.flagged(text), {"tests/a.rs::reader", "tests/a.rs::writer", "tests/a.rs::w2"})
+
+
+class Issue7993(Fixture):
+    """#7993: a helper whose tail, `return` or field initialiser merely CONTAINS an unbound lock call is
+    not a guard-returning helper (module docstring: "guards returned from fns NOT credited"; the #7623
+    class). Only the struct helper shape (helper_ret_guard) hands a lock to its caller."""
+
+    HELPERS = {
+        "tail_drops_the_guard": "fn h() { drop(ENV_LOCK.blocking_lock()) }\n",
+        "tail_measures_the_guard": "fn h() -> usize { std::mem::size_of_val(&ENV_LOCK.blocking_lock()) }\n",
+        "tail_is_an_unawaited_future": "fn h() { ENV_LOCK.lock() }\n",
+        "field_init_tail": "fn h() -> Holder<MutexGuard<'static, ()>> { Holder { _g: ENV_LOCK.blocking_lock() } }\n",
+    }
+
+    def test_a_helper_that_only_contains_a_lock_call_is_not_credited(self):
+        for name, helper in self.HELPERS.items():
+            with self.subTest(helper=name):
+                text = WRITER + HOLDER + helper + reader("let _x = h();")
+                self.assertEqual(self.flagged(text), FLAGGED)
+
+    WHOLE_VALUE = {
+        "plain_guard_returning_tail": "fn h() -> MutexGuard<'static, ()> { ENV_LOCK.blocking_lock() }\n",
+        "plain_guard_returning_return": "fn h() -> MutexGuard<'static, ()> { return ENV_LOCK.blocking_lock(); }\n",
+        "get_or_init_tail": ("fn h() -> MutexGuard<'static, ()> {\n"
+                             "    ENV_LOCK.get_or_init(|| Mutex::new(()))\n"
+                             "        .lock()\n        .unwrap_or_else(std::sync::PoisonError::into_inner)\n}\n"),
+    }
+
+    def test_a_lock_call_that_is_the_whole_returned_value_is_credited(self):
+        # #7993 Proposed fix: "add it as a second named helper shape that requires the lock expression
+        # (lock call plus GUARD_CHAIN only) to BE the whole tail".
+        for name, helper in self.WHOLE_VALUE.items():
+            with self.subTest(helper=name):
+                self.assertEqual(self.flagged(WRITER + HOLDER + helper + reader("let _x = h();")), set())
+
+    def test_the_struct_helper_shape_is_still_credited(self):
+        helper = ("struct Env { _lock: MutexGuard<'static, ()> }\n"
+                  "impl Env {\n    fn plain() -> Self {\n        let lock = ENV_LOCK.blocking_lock();\n"
+                  "        unsafe { std::env::set_var(\"B\", \"1\") };\n        Self { _lock: lock }\n    }\n}\n")
+        self.assertEqual(self.flagged(WRITER + helper + reader("let _e = Env::plain();")), set())
 
 
 class Issue7999(unittest.TestCase):

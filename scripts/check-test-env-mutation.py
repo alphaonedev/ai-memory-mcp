@@ -659,6 +659,68 @@ def helper_ret_guard(body, pos):
     return bool(re.search(r"(?:^|,)\s*(?:\w+\s*:\s*)?%s\s*(?:,|$)" % name, tail.group(1)))
 
 
+RETURN_HEAD = re.compile(r"\s*return\b\s*")
+RETURN_TAIL = re.compile(r"\s*;\s*\}\s*")
+BODY_END = re.compile(r"\s*\}\s*")
+
+
+def plain_receiver(text):
+    """True when text is a plain receiver path: `a`, `a::b`, `a.b()`, `LOCK.get_or_init(|| M::new(()))`.
+
+    Identifier segments joined by `.` or `::`, each optionally followed by one balanced `(..)` argument
+    list that is skipped whole. No keyword, operator, `&`, `*`, `:` (a struct field) or lone word fits.
+    """
+    i, n = 0, len(text)
+    while True:
+        while i < n and text[i].isspace():
+            i += 1
+        m = IDENT.match(text, i)
+        if not m:
+            return False
+        i = m.end()
+        j = i
+        while j < n and text[j].isspace():
+            j += 1
+        if j < n and text[j] == "(":
+            i = match_paren(text, j)
+            j = i
+            while j < n and text[j].isspace():
+                j += 1
+        if j >= n:
+            return True
+        if text.startswith("::", j):
+            i = j + 2
+        elif text[j] == ".":
+            i = j + 1
+        else:
+            return False
+
+
+def tail_guard(body, pos):
+    """True when the lock acquisition at pos IS the whole value a helper returns (#7993).
+
+    The second named helper shape beside helper_ret_guard: a non-test fn whose top-level tail expression
+    (or its last statement `return <expr>;`) is exactly <receiver>.lock-call(..) plus GUARD_CHAIN calls, or
+    a lock-fn call such as `env_lock()`. The guard then leaves the fn as its return value, so the caller's
+    canonical `let _g = helper();` really holds it. A lock call wrapped in `drop(..)` or `size_of_val(&..)`,
+    a field initialiser, a branch, a `match` scrutinee, an unawaited tokio future or anything after the
+    chain is not this shape.
+    """
+    prefix = stmt_prefix(body, pos)
+    if innermost_open(body, pos - len(prefix)) != 0 or not balanced(prefix):
+        return False
+    ret = RETURN_HEAD.match(prefix)
+    receiver = prefix[ret.end():] if ret else prefix
+    if body[pos] == "." and not plain_receiver(receiver) or body[pos] != "." and receiver.strip():
+        return False
+    end = expr_end(body, pos)
+    if any(n not in GUARD_CHAIN for n in re.findall(r"\.\s*([A-Za-z_]\w*)", mask_brackets(body[pos:end]))):
+        return False
+    if not guard_materialised(body, pos, end):
+        return False
+    return bool((RETURN_TAIL if ret else BODY_END).fullmatch(body[end:]))
+
+
 def stmt_prefix(body, pos):
     """Text of the statement containing pos, from the previous `;`/`{`/`}` up to pos."""
     start = max(body.rfind(";", 0, pos), body.rfind("{", 0, pos), body.rfind("}", 0, pos)) + 1
@@ -1079,12 +1141,13 @@ class FileModel:
             if a.kind == "once":
                 persist |= a.tokens
             elif a.kind == "lock":
+                # #7993: two named helper shapes hand a lock to the caller: the struct helper
+                # (helper_ret_guard) and a lock call that IS the whole returned value (tail_guard).
+                # A tail, `return` or field initialiser that merely contains a lock call is not credited.
                 if a.bound and not a.names and helper_ret_guard(body, a.pos):
                     ret |= a.tokens
-                elif not a.bound:
-                    expr = LET_HEAD.sub("", stmt_prefix(body, a.pos), count=1)
-                    if is_tail(body, a.pos) or re.match(r"\s*return\b", expr) or re.match(r"\s*[A-Za-z_]\w*\s*:(?!:)", expr):
-                        ret |= a.tokens
+                elif not a.bound and tail_guard(body, a.pos):
+                    ret |= a.tokens
         last_calls = [m.start() for m in CALL.finditer(body)]
         work_pos = max(last_calls) if last_calls else len(body) - 1
         work = self.held_own(fn, work_pos, acqs)
