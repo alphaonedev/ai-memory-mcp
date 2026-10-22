@@ -519,14 +519,31 @@ export interface WindowsReadHooks {
  *           `O_NONBLOCK` protections of the POSIX leg of `readOwnerOnly`.
  */
 export function readOwnerOnlyWindows(path: string, hooks: WindowsReadHooks = {}): string {
+  const missing = (err: unknown): unknown =>
+    (err as NodeJS.ErrnoException).code === "ENOENT"
+      ? new WakeError(`${path} does not exist: the credential file is missing`)
+      : err;
+  // Look at what the path names BEFORE opening it (#8053): a link or a
+  // non-regular file is refused without ever being opened. The checks after the
+  // open still close the swap race that remains after this one.
+  let before;
+  try {
+    before = lstatSync(path, { bigint: true });
+  } catch (err) {
+    throw missing(err);
+  }
+  if (before.isSymbolicLink()) {
+    throw new WakeError(
+      `${path} is a symlink: a credential reached through a link is one whose ` +
+        "permissions were checked on the wrong file",
+    );
+  }
+  if (!before.isFile()) throw new WakeError(`${path} is not a regular file`);
   let fd: number;
   try {
     fd = openSync(path, fsConstants.O_RDONLY);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      throw new WakeError(`${path} does not exist: the credential file is missing`);
-    }
-    throw err;
+    throw missing(err);
   }
   try {
     const opened = fstatSync(fd, { bigint: true });

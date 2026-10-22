@@ -8,7 +8,10 @@
  * hook swaps the path exactly where a local attacker would.
  */
 
+import { jest } from "@jest/globals";
+import fs from "node:fs";
 import {
+  mkdirSync,
   mkdtempSync,
   rmSync,
   writeFileSync,
@@ -69,5 +72,42 @@ describe("readOwnerOnlyWindows (#7890)", () => {
 
   it("reports a missing credential file", () => {
     expect(() => readOwnerOnlyWindows(join(dir, "nope.json"))).toThrow(/nope\.json/);
+  });
+
+  describe("pre-open check (#8053)", () => {
+    // The check on what the path names runs BEFORE the open: a spy on the
+    // real `openSync` proves nothing was opened for a refused path.
+    let openSpy: ReturnType<typeof jest.spyOn>;
+    beforeEach(() => {
+      openSpy = jest.spyOn(fs, "openSync");
+    });
+    afterEach(() => openSpy.mockRestore());
+    const read = readOwnerOnlyWindows;
+    const Err = WakeError;
+
+    it("the spy sees the open of a regular file (control)", () => {
+      const p = cred("ctl.json");
+      openSpy.mockClear(); // writeFileSync opened the file too
+      expect(read(p)).toBe(SECRET);
+      expect(openSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("refuses a directory before opening it", () => {
+            const d = join(dir, "adir");
+      mkdirSync(d);
+      expect(() => read(d)).toThrow(Err);
+      expect(() => read(d)).toThrow(/is not a regular file/);
+      expect(openSpy).not.toHaveBeenCalled();
+    });
+
+    it("refuses a symlink before opening it", () => {
+            const target = cred("real2.json");
+      const link = join(dir, "link2.json");
+      symlinkSync(target, link);
+      openSpy.mockClear(); // writeFileSync opened the target
+      expect(() => read(link)).toThrow(Err);
+      expect(() => read(link)).toThrow(/is a symlink/);
+      expect(openSpy).not.toHaveBeenCalled();
+    });
   });
 });
