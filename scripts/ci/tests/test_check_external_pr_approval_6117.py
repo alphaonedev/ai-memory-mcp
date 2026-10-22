@@ -13,8 +13,8 @@ Run: python3 -I -m unittest scripts.ci.tests.test_check_external_pr_approval_611
 Standard library only; Python 3.9+. Scratch lives under .local-runs/, never /tmp.
 """
 import ast
+import contextlib
 import importlib.util
-import json
 import os
 import re
 import shutil
@@ -112,9 +112,10 @@ class Issue6227MergeGroupIsJudged(unittest.TestCase):
 class Issue6229MultiPrQueueGroup(unittest.TestCase):
     """#6229: "merge_group judges only the PR named by head_ref, not every PR in a multi-PR queue group".
 
-    Acceptance (Proposed fix): "pin the merge-queue group size to 1 in the ruleset and add a ...
-    assertion that says so ... fail closed if the mapping is ambiguous." The gate reads the
-    base branch's merge_queue rule and passes only when max_entries_to_merge is exactly 1.
+    Acceptance (Proposed fix, option 1): "either pin the merge-queue group size to 1 in the
+    ruleset and add a check-required-contexts / docs assertion that says so". The gate asserts
+    that at run time: it reads the base branch's merge_queue rule and passes only when
+    max_entries_to_merge is exactly 1 (option 2, mapping every PR in a group, is not taken).
     """
 
     def approved_run(self, rules):
@@ -144,9 +145,12 @@ class Issue6229MultiPrQueueGroup(unittest.TestCase):
 class Issue6242QueueRefBinding(unittest.TestCase):
     """#6242: "External-PR approval gate: merge_group arm does not bind the queue ref sha to the judged PR head sha".
 
-    Acceptance (Proposed fix): "capture the sha group, require it to equal ... (else GateError,
-    fail closed); add the mismatch cell". GitHub names the queue ref after the queue commit's
-    parent, merge_group.base_sha (#6325), so the ref sha must equal base_sha.
+    Acceptance (Proposed fix): "capture the sha group, require it to equal the PR's `head.sha`
+    (else GateError, fail closed); add the mismatch cell to the decision table and self-test".
+    The literal sentence cannot hold: GitHub names the queue ref after the queue commit's
+    parent, merge_group.base_sha (#6325), so the ref sha must equal base_sha. That binding is
+    pinned here, but the residual (the gate judges the PR's current head, which may differ from
+    the queued head) stays open, so the PR says Refs #6242 and does not close it.
     """
 
     def judged(self, event):
@@ -248,10 +252,8 @@ class InterruptDiesOfSignal(unittest.TestCase):
 
     def tearDown(self):
         if self.pidfile.exists():
-            try:
+            with contextlib.suppress(OSError, ValueError):
                 os.kill(int(self.pidfile.read_text()), signal.SIGKILL)
-            except (OSError, ValueError):
-                pass
         shutil.rmtree(self.dir, ignore_errors=True)
 
     def alive(self, pid):

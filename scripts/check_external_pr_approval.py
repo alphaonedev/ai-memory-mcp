@@ -44,6 +44,7 @@ Standard library only; Python 3.9+.
 """
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -113,6 +114,11 @@ def redact(message):
     return text if urllib.parse.unquote(decoded) == decoded else REDACTED_WHOLE
 
 
+# Control characters replaced by "?" (#8007): written as raw regex escapes, so the class holds
+# exactly C0 minus TAB/LF/CR, DEL, NEL, LS and PS. Tab, LF and CR are handled (or kept) below.
+CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x85\u2028\u2029]")
+
+
 def workflow_error(message):
     """One ``::error::`` workflow command whose data cannot start another command (#6243).
 
@@ -120,7 +126,7 @@ def workflow_error(message):
     percent-encoded exactly as the runner decodes workflow-command data.
     """
     text = redact(message)
-    text = re.sub("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x85\u2028\u2029]", "?", text)
+    text = CONTROL_RE.sub("?", text)
     text = text.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
     return "::error::" + text
 
@@ -176,14 +182,11 @@ def gh_api(path):
 
 def _kill_group(child):
     """SIGKILL the child's process group and reap it; never raises."""
-    try:
+    # The group may already be gone (ESRCH) or the pipes closed; neither is actionable.
+    with contextlib.suppress(OSError):
         os.killpg(child.pid, signal.SIGKILL)
-    except OSError:
-        pass
-    try:
+    with contextlib.suppress(OSError, ValueError, subprocess.TimeoutExpired):
         child.communicate(timeout=10)
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        pass
 
 
 def _head(pr):
@@ -486,18 +489,18 @@ def entry():
     """Run main() under the exit contract; return the exit code (never raises, except Interrupted).
 
     An uncaught Exception, including one raised by the output path, is exit 2 with one stderr
-    line, never a traceback and never a pass. The FIRST non-zero status is latched: a failing
-    verdict is returned as-is even when printing it fails.
+    line, never a traceback and never a pass. A print failure turns a verdict of 1 into exit 2
+    (never 0): the status stays non-zero, so the gate still fails closed, but the finding is
+    reported as undecidable because its output could not be delivered.
     """
     for signum in INTERRUPT_SIGNALS:
         signal.signal(signum, _raise_interrupted)
     try:
         return main()
     except Exception as exc:  # noqa: BLE001 - the gate must turn every failure into exit 2
-        try:
+        # The diagnostic is best effort: a closed stderr must not change the exit code.
+        with contextlib.suppress(Exception):
             sys.stderr.write(redact(f"external-pr-approval: internal error ({type(exc).__name__}: {exc})") + "\n")
-        except Exception:  # noqa: BLE001 - the diagnostic is best effort
-            pass
         return EXIT_UNDECIDABLE
 
 
