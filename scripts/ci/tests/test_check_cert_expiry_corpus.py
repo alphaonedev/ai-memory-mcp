@@ -40,6 +40,7 @@ import importlib.util
 import inspect
 import io
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -1564,82 +1565,172 @@ def repo_text(rel):
     return (HARNESS_ROOT / rel).read_text(encoding="utf-8", errors="replace")
 
 
+# #7988: every entry is a tuple of regular expressions searched (re.MULTILINE) in the comment-stripped text of the
+# file; a leading ! means the pattern must NOT match. Each tuple was chosen to FAIL on the real pre-fix file of the
+# fix commit and to PASS on the fixed file (PREFIX_REPLAY below replays that), so a probe is no longer a bare
+# token that an unfixed generator also carries.
+# #7988: every entry is a tuple of regular expressions searched (re.MULTILINE) in the comment-stripped text of the
+# file; a leading ! means the pattern must NOT match. Each tuple was chosen to FAIL on the real pre-fix file of the
+# fix commit and to PASS on the fixed file (PREFIX_REPLAY below replays that), so a probe is no longer a bare
+# token that an unfixed generator also carries.
 GENERATOR_NEEDLES = {
-    ('../ci/tests/test_evidence_fixture_identity.py', 'the fixture byte-identity test the cert procedure cites'):
-        ('def test_', 'identity'),
-    ('../ci/tests/test_evidence_generator_r2_7393.py', 'the tmp-root guard covers every spelling'):
-        ('def test_', 'tmp'),
-    ('../ci/tests/test_evidence_generator_r3_7393.py', 'tests write under the scratch root only'):
-        ('def test_', 'scratch'),
-    ('../ci/tests/test_evidence_generator_r5_7393.py', 'the AST guard checks tempfile and folds join'):
-        ('def test_', 'ast', 'tempfile'),
-    ('../ci/tests/test_evidence_generator_r5_7393.py', 'the posture OSError widening is pinned'):
-        ('def test_', 'OSError'),
-    ('../ci/tests/test_evidence_generator_r5_7393.py', 'the realpath comparison is pinned'):
-        ('def test_', 'realpath'),
-    ('build_bundle.py', 'check_run rejects a later crashed chain run'):
-        ('def check_run',),
-    ('build_bundle.py', 'recapture lookup must find the .py'):
-        ('recapture', '.py'),
-    ('prep.py', 'a git grep error is an error, never an empty FED id set'):
-        ('grep', 'returncode'),
-    ('prep.py', 'an empty FED id set at either end is an error'):
-        ('FED', 'empty'),
-    ('prep.py', 'commit-1 bytes hash-qualified, docstring true'):
-        ('hashlib',),
-    ('run_cert.py', 'CERT_ env overrides validated and logged'):
-        ('CERT_', 'environ'),
-    ('run_cert.py', 'O_EXCL and O_NOFOLLOW pinned; a killed run is swept'):
-        ('O_EXCL', 'O_NOFOLLOW'),
-    ('run_cert.py', 'PLANS has a gates entry'):
-        ('PLANS', 'gates'),
-    ('run_cert.py', 'a deeply nested stale dir does not crash the gates leg'):
-        ('OSError', 'stale'),
-    ('run_cert.py', 'a failed cert commit push fails the gates leg'):
-        ('push', 'gates'),
-    ('run_cert.py', 'a missing wrapper writes a RED and an EXIT row'):
-        ('EXIT', 'RED'),
-    ('run_cert.py', 'a relocated gate copy resolves its repo root to the checkout'):
-        ('realpath', 'repo'),
-    ('run_cert.py', 'an OSError creating the gate copy writes an EXIT row'):
-        ('OSError', 'EXIT'),
-    ('run_cert.py', 'an output dir on tmpfs or under a tmp root is refused'):
-        ('tmpfs', 'tmp'),
-    ('run_cert.py', 'cert-alone.out records ionice only when it was used'):
-        ('ionice', 'cert-alone.out'),
-    ('run_cert.py', 'is_tmpfs_path decodes proc-mounts octal escapes'):
-        ('def is_tmpfs_path', 'mounts'),
-    ('run_cert.py', 'pick_expiry refuses look-alike, symlink and skip-worktree copies'):
-        ('def pick_expiry', 'skip-worktree'),
-    ('run_cert.py', 'push-branch and parent refused on legs that ignore them'):
-        ('push-branch', 'parent'),
-    ('run_cert.py', 'relative CERT_TARGETS and CERT_TMPDIR refused or resolved'):
-        ('CERT_TARGETS', 'CERT_TMPDIR'),
-    ('run_cert.py', 'repo gate scripts run with an empty cwd'):
-        ('cwd', 'gate'),
-    ('run_cert.py', 'scripts picked from the tip tree, never the worktree'):
-        ('ls-tree', 'tip'),
-    ('run_cert.py', 'the docstring states ionice conditionally and exit 64'):
-        ('ionice', '64'),
-    ('run_cert.py', 'the expiry gate copy never follows a symlink'):
-        ('O_NOFOLLOW', 'expiry'),
-    ('run_cert.py', 'the gate copy has no check-to-exec window'):
-        ('O_NOFOLLOW', 'exec'),
-    ('run_cert.py', 'the gate copy runs under python3 -I'):
-        ('-I',),
-    ('run_cert.py', 'the output dir must be quoted in generated bash'):
-        ('shlex.quote',),
-    ('run_cert.py', 'the posture copy is never written through a symlink'):
-        ('O_NOFOLLOW', 'posture'),
-    ('run_cert.py', 'the preflight EXIT row says 64 where the exit is 64'):
-        ('EXIT', '64'),
-    ('run_cert.py', 'the sweep goes through the directory fd'):
-        ('dir_fd',),
-    ('run_cert.py', 'wrapper, flock and timeout validated; CONFIG row names the source'):
-        ('flock', 'timeout', 'CONFIG'),
+    (r"../ci/tests/test_evidence_fixture_identity.py", r"the fixture byte-identity test the cert procedure cites"):
+        (r"def test_", r"identity", r"read_bytes\(\)|sha256|hashlib",),
+    (r"build_bundle.py", r"recapture lookup must find the .py"):
+        (r"RECAPTURE_CANDIDATES", 'endswith\\(\\s*"\\.py"\\s*\\)',),
+    (r"run_cert.py", r"scripts picked from the tip tree, never the worktree"):
+        (r"def pick_recapture\(", r"def tracked_at\(",),
+    (r"run_cert.py", r"the output dir must be quoted in generated bash"):
+        (r"OUT=\{shlex\.quote\(",),
+    (r"run_cert.py", r"CERT_ env overrides validated and logged"):
+        (r"class ConfigError", r"def anchored\(", r"def config_row\(",),
+    (r"prep.py", r"commit-1 bytes hash-qualified, docstring true"):
+        (r"scripts/check_cert_expiry\.py", r"^FED_ID = re\.compile\(", r"!check-cert-expiry\.sh",),
+    (r"build_bundle.py", r"check_run rejects a later crashed chain run"):
+        (r"SECTION_START", r"needs exactly one",),
+    (r"run_cert.py", r"a missing wrapper writes a RED and an EXIT row"):
+        (r"except OSError", r"RED launch", r"return 127",),
+    (r"run_cert.py", r"relative CERT_TARGETS and CERT_TMPDIR refused or resolved"):
+        (r"def anchored\(", r"os\.path\.isabs|is_absolute\(\)",),
+    (r"run_cert.py", r"a failed cert commit push fails the gates leg"):
+        (r"def push_gated\(", r"RED push",),
+    (r"prep.py", r"a git grep error is an error, never an empty FED id set"):
+        (r"returncode not in \(0, 1\)", r"sys\.exit\(3\)",),
+    (r"run_cert.py", r"cert-alone.out records ionice only when it was used"):
+        ('shutil\\.which\\("ionice"\\)', r"def priority_desc\(",),
+    (r"run_cert.py", r"pick_expiry refuses look-alike, symlink and skip-worktree copies"):
+        (r"def blob_bytes\(", r"100644", r"100755",),
+    (r"run_cert.py", r"an output dir on tmpfs or under a tmp root is refused"):
+        ('\\("--outd", Path\\(os\\.path\\.abspath\\(self\\.outd\\)\\)\\)',),
+    (r"run_cert.py", r"wrapper, flock and timeout validated; CONFIG row names the source"):
+        (r"def choose\(", r"def preflight\(",),
+    (r"run_cert.py", r"is_tmpfs_path decodes proc-mounts octal escapes"):
+        (r"def unescape_mount\(",),
+    (r"prep.py", r"an empty FED id set at either end is an error"):
+        (r"no AI_MEMORY_FED_\* identifier",),
+    (r"run_cert.py", r"the docstring states ionice conditionally and exit 64"):
+        (r"exit 64 = a refused configuration", r"ionice -c3 when installed",),
+    (r"run_cert.py", r"PLANS has a gates entry"):
+        ('"gates": \\("gates",\\)',),
+    (r"run_cert.py", r"the expiry gate copy never follows a symlink"):
+        (r"run from memory, nothing is written",),
+    (r"run_cert.py", r"the preflight EXIT row says 64 where the exit is 64"):
+        (r"EXIT=64 leg=",),
+    (r"../ci/tests/test_evidence_generator_r3_7393.py", r"tests write under the scratch root only"):
+        ('mock\\.patch\\.object\\(rc, "TMP_ROOTS"', r"!TMP \+",),
+    (r"run_cert.py", r"an OSError creating the gate copy writes an EXIT row"):
+        (r"expiry, gate_blob, gate_sha = self\.expiry_gate\(\)",),
+    (r"run_cert.py", r"a relocated gate copy resolves its repo root to the checkout"):
+        (r"PY_LOADER", r"__file__",),
+    (r"run_cert.py", r"O_EXCL and O_NOFOLLOW pinned; a killed run is swept"):
+        (r"def sweep_legacy\(", r"os\.kill\(int\(m\.group\(1\)\), 0\)",),
+    (r"../ci/tests/test_evidence_generator_r2_7393.py", r"the tmp-root guard covers every spelling"):
+        ('mock\\.patch\\.object\\(rc, "TMP_ROOTS"', r"fake-tmp-root",),
+    (r"run_cert.py", r"push-branch and parent refused on legs that ignore them"):
+        (r"given = \[", r"return 64",),
+    (r"run_cert.py", r"the gate copy runs under python3 -I"):
+        ('\\[sys\\.executable, "-I"',),
+    (r"run_cert.py", r"the sweep goes through the directory fd"):
+        (r"def remove_tree\(dfd, name\)", r"dir_fd=dfd",),
+    (r"../ci/tests/test_evidence_generator_r6_7393.py", r"the AST guard checks tempfile and folds join"):
+        (r"TEMPFILE_ALWAYS", r"TMP_ROOTS subscript", r"PATH_JOINS", r"without dir=",),
+    (r"../ci/tests/test_evidence_generator_r6_7393.py", r"the posture OSError widening is pinned"):
+        ('recapture_blob", side_effect=PermissionError', r"RED posture recapture script",),
+    (r"../ci/tests/test_evidence_generator_r6_7393.py", r"the realpath comparison is pinned"):
+        ('"TMP_ROOTS", \\(str\\(self\\.link\\),\\)',),
+    (r"run_cert.py", r"the posture copy is never written through a symlink"):
+        (r"PY_LOADER", '\\"bash\\", \\"-c\\", body',),
+    (r"run_cert.py", r"the gate copy has no check-to-exec window"):
+        (r"stdin_data=gate_blob",),
+    (r"run_cert.py", r"a deeply nested stale dir does not crash the gates leg"):
+        (r"def remove_tree\(", r"def sweep_legacy\(", r"SWEEP_MAX_DEPTH",),
+    (r"run_cert.py", r"repo gate scripts run with an empty cwd"):
+        (r"SCRUBBED_PYTHON_ENV", r"PYTHONSAFEPATH",),
 }
 
+# Pre-fix stand-ins: (commit, path) read with `git show <commit>:<path>` on PR 7393 (#7988). A probe must fail on
+# each one that can be read; case_7988_prefix_replay replays them.
+PREFIX_REPLAY = {
+    (r"build_bundle.py", r"recapture lookup must find the .py"):  # case_7399
+        ((r"ba50174474d6731f9039ca85a42b5fd28342ebed", r"scripts/evidence/build_bundle.py"),),
+    (r"run_cert.py", r"scripts picked from the tip tree, never the worktree"):  # case_7411
+        ((r"99cd91ae087dba4feb1bbb7b8d77e4a81587fb60", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"the output dir must be quoted in generated bash"):  # case_7412
+        ((r"99cd91ae087dba4feb1bbb7b8d77e4a81587fb60", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"CERT_ env overrides validated and logged"):  # case_7413
+        ((r"99cd91ae087dba4feb1bbb7b8d77e4a81587fb60", r"scripts/evidence/run_cert.py"),),
+    (r"prep.py", r"commit-1 bytes hash-qualified, docstring true"):  # case_7417
+        ((r"99cd91ae087dba4feb1bbb7b8d77e4a81587fb60", r"scripts/evidence/prep.py"),),
+    (r"build_bundle.py", r"check_run rejects a later crashed chain run"):  # case_7419
+        ((r"99cd91ae087dba4feb1bbb7b8d77e4a81587fb60", r"scripts/evidence/build_bundle.py"),),
+    (r"run_cert.py", r"a missing wrapper writes a RED and an EXIT row"):  # case_7420
+        ((r"99cd91ae087dba4feb1bbb7b8d77e4a81587fb60", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"relative CERT_TARGETS and CERT_TMPDIR refused or resolved"):  # case_7421
+        ((r"99cd91ae087dba4feb1bbb7b8d77e4a81587fb60", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"a failed cert commit push fails the gates leg"):  # case_7422
+        ((r"99cd91ae087dba4feb1bbb7b8d77e4a81587fb60", r"scripts/evidence/run_cert.py"),),
+    (r"prep.py", r"a git grep error is an error, never an empty FED id set"):  # case_7423
+        ((r"99cd91ae087dba4feb1bbb7b8d77e4a81587fb60", r"scripts/evidence/prep.py"),),
+    (r"run_cert.py", r"cert-alone.out records ionice only when it was used"):  # case_7425
+        ((r"99cd91ae087dba4feb1bbb7b8d77e4a81587fb60", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"pick_expiry refuses look-alike, symlink and skip-worktree copies"):  # case_7439
+        ((r"259115d99ace54535a77710111297b36af1a1ae5", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"an output dir on tmpfs or under a tmp root is refused"):  # case_7440
+        ((r"259115d99ace54535a77710111297b36af1a1ae5", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"wrapper, flock and timeout validated; CONFIG row names the source"):  # case_7441
+        ((r"259115d99ace54535a77710111297b36af1a1ae5", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"is_tmpfs_path decodes proc-mounts octal escapes"):  # case_7442
+        ((r"259115d99ace54535a77710111297b36af1a1ae5", r"scripts/evidence/run_cert.py"),),
+    (r"prep.py", r"an empty FED id set at either end is an error"):  # case_7443
+        ((r"259115d99ace54535a77710111297b36af1a1ae5", r"scripts/evidence/prep.py"),),
+    (r"run_cert.py", r"the docstring states ionice conditionally and exit 64"):  # case_7446
+        ((r"259115d99ace54535a77710111297b36af1a1ae5", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"PLANS has a gates entry"):  # case_7486
+        ((r"6fd1fc8aa60a12d235bb15c51d57a28dd4535b65", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"the expiry gate copy never follows a symlink"):  # case_7489
+        ((r"6fd1fc8aa60a12d235bb15c51d57a28dd4535b65", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"the preflight EXIT row says 64 where the exit is 64"):  # case_7490
+        ((r"6fd1fc8aa60a12d235bb15c51d57a28dd4535b65", r"scripts/evidence/run_cert.py"),),
+    (r"../ci/tests/test_evidence_generator_r3_7393.py", r"tests write under the scratch root only"):  # case_7492
+        ((r"6fd1fc8aa60a12d235bb15c51d57a28dd4535b65", r"scripts/ci/tests/test_evidence_generator_r3_7393.py"),),
+    (r"run_cert.py", r"an OSError creating the gate copy writes an EXIT row"):  # case_7530
+        ((r"1786e49f4b48cc728a009f86191b2905a9beab8b", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"a relocated gate copy resolves its repo root to the checkout"):  # case_7531
+        ((r"1786e49f4b48cc728a009f86191b2905a9beab8b", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"O_EXCL and O_NOFOLLOW pinned; a killed run is swept"):  # case_7532
+        ((r"1786e49f4b48cc728a009f86191b2905a9beab8b", r"scripts/evidence/run_cert.py"),),
+    (r"../ci/tests/test_evidence_generator_r2_7393.py", r"the tmp-root guard covers every spelling"):  # case_7534
+        ((r"2a9ca1b3ccea2a97d9c9bb18dc848066de9eec6a", r"scripts/ci/tests/test_evidence_generator_r2_7393.py"),),
+    (r"run_cert.py", r"push-branch and parent refused on legs that ignore them"):  # case_7535
+        ((r"2a9ca1b3ccea2a97d9c9bb18dc848066de9eec6a", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"the gate copy runs under python3 -I"):  # case_7581
+        ((r"c5729ab839950fd2351a0898cf16db70eb37e4be", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"the sweep goes through the directory fd"):  # case_7582
+        ((r"c5729ab839950fd2351a0898cf16db70eb37e4be", r"scripts/evidence/run_cert.py"),),
+    (r"../ci/tests/test_evidence_generator_r6_7393.py", r"the AST guard checks tempfile and folds join"):  # case_7583
+        ((r"61d78887b4f8757a9a0a62aca4be66fb195b8c34", r"scripts/ci/tests/test_evidence_generator_r5_7393.py"),),
+    (r"../ci/tests/test_evidence_generator_r6_7393.py", r"the posture OSError widening is pinned"):  # case_7584
+        ((r"61d78887b4f8757a9a0a62aca4be66fb195b8c34", r"scripts/ci/tests/test_evidence_generator_r5_7393.py"),),
+    (r"../ci/tests/test_evidence_generator_r6_7393.py", r"the realpath comparison is pinned"):  # case_7585
+        ((r"61d78887b4f8757a9a0a62aca4be66fb195b8c34", r"scripts/ci/tests/test_evidence_generator_r5_7393.py"),),
+    (r"run_cert.py", r"the posture copy is never written through a symlink"):  # case_7617
+        ((r"618d83b3c2723810e661ef0d5c3abd8bd0785097", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"the gate copy has no check-to-exec window"):  # case_7618
+        ((r"618d83b3c2723810e661ef0d5c3abd8bd0785097", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"a deeply nested stale dir does not crash the gates leg"):  # case_7620
+        ((r"618d83b3c2723810e661ef0d5c3abd8bd0785097", r"scripts/evidence/run_cert.py"),),
+    (r"run_cert.py", r"repo gate scripts run with an empty cwd"):  # case_7665
+        ((r"33a0535cc46439926f16afd3ab614bc32f3b2ef2", r"scripts/evidence/run_cert.py"),),
+}
+NO_PREFIX_STANDIN = {
+    ("../ci/tests/test_evidence_fixture_identity.py", "the fixture byte-identity test the cert procedure cites"):
+        "the file is on no ref this checkout can read, so no pre-fix stand-in exists; the case stays RED",
+}
+FIXED_REF = "f049ee0e4ec91ccd4ebc5273dfaa495f139cfcb4"  # PR 7393 tip the probes were verified against; pinned, so deleting the branch cannot move it
+
 MIN_PROBE_BYTES = 120  # a stand-in shorter than this cannot carry the named acceptance
+# #7988: the id must sit inside an assert macro of a #[test] body, so a bare mention beside assert!(true) fails.
+LIVENESS_ASSERT_RE = re.compile(r"\bassert(?:_eq|_ne)?!\s*\([^;]*" + re.escape(LIVE_ID))
 YAML_COMMENT_RE = re.compile(r"(^|\s)#.*$")
 JOB_HEADER_RE = re.compile(r"^  [\w-]+:\s*$")
 BASE_TRUST_RE = re.compile(r"github\.event\.pull_request\.base\.(sha|ref)")
@@ -1676,6 +1767,8 @@ def liveness_problems(root):
         problems.append("no #[test] function")
     if LIVE_ID not in code:
         problems.append(f"does not exercise {LIVE_ID}")
+    elif not any(LIVENESS_ASSERT_RE.search(chunk) for chunk in code.split("#[test]")[1:]):
+        problems.append(f"no #[test] asserts on the behaviour of {LIVE_ID}")
     wf = root / WORKFLOW
     wired = wf.is_file() and "cert_fed_identifier_liveness" in wf.read_text(encoding="utf-8", errors="replace")
     if not wired:
@@ -1704,8 +1797,85 @@ def generator_problems(root, rel, needles):
                 isinstance(n, ast.FunctionDef) and n.name.startswith("test") for n in ast.walk(tree)):
             problems.append(f"{rel} defines no test function")
     for needle in needles:
-        if needle not in code:
-            problems.append(f"{rel} lacks {needle!r} outside comments")
+        wanted = not needle.startswith("!")
+        if (re.search(needle if wanted else needle[1:], code, re.MULTILINE) is not None) != wanted:
+            verb = "lacks" if wanted else "still carries"
+            problems.append(f"{rel} {verb} /{needle.lstrip('!')}/ outside comments")
+    return problems
+
+
+REPLAY_FETCH_FLAG = "--print-replay-shas"
+
+
+def replay_objects():
+    """Every commit the replay reads: each pre-fix stand-in and the fixed ref (#7988)."""
+    shas = []
+    for stands in PREFIX_REPLAY.values():
+        for sha, _path in stands:
+            if sha not in shas:
+                shas.append(sha)
+    return shas + [FIXED_REF]
+
+
+def git_show(repo, rev, path):
+    """(True, text) when `git show rev:path` reads, else (False, reason)."""
+    rc, out = git_query(repo, ["show", f"{rev}:{path}"])
+    return rc == 0, out
+
+
+def prefix_replay_report(repo, scratch):
+    """Replay every probe against the real pre-fix file and the fixed file (#7988). Returns
+    (lines, wrong, unreadable): `lines` is one result per replay; `wrong` names every probe that
+    PASSED a pre-fix stand-in or FAILED the fixed file; `unreadable` names every object missing."""
+    lines, wrong, unreadable = [], [], []
+    for key, stands in sorted(PREFIX_REPLAY.items()):
+        rel, _why = key
+        target = Path(scratch) / GEN_DIR / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        replays = [(f"pre-fix {sha[:9]}", sha, path, True) for sha, path in stands]
+        replays.append(("fixed", FIXED_REF, posixpath.normpath(f"{GEN_DIR}/{rel}"), False))
+        for label, rev, path, want_fail in replays:
+            ok, text = git_show(repo, rev, path)
+            if not ok:
+                unreadable.append(f"{rev}:{path}")
+                lines.append(f"UNREADABLE {rel} {label}")
+                continue
+            target.write_text(text, encoding="utf-8")
+            problems = generator_problems(scratch, rel, GENERATOR_NEEDLES[key])
+            verdict = "fails" if problems else "passes"
+            good = bool(problems) == want_fail
+            lines.append(f"{'ok ' if good else 'BAD'} {rel} {label}: probe {verdict}")
+            if not good:
+                wrong.append(f"{rel} {label}: probe {verdict}")
+    return lines, wrong, unreadable
+
+
+def probe_wiring_problems(source, needles, replay, no_standin, manifest):
+    """#7988 ratchet over this file's own text: every generator_file(rel, why) call names a
+    probe that has a pre-fix replay, or is listed as having none and then must stay RED; no
+    probe is unreferenced, and a case whose probe cannot be replayed cannot be GREEN."""
+    tree = ast.parse(source)
+    problems, called = [], {}
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "generator_file" and len(node.args) == 2
+                    and all(isinstance(a, ast.Constant) and isinstance(a.value, str) for a in node.args)):
+                called[(node.args[0].value, node.args[1].value)] = fn.name
+    for key, case in sorted(called.items(), key=lambda kv: kv[1]):
+        if key not in needles:
+            problems.append(f"{case}: no GENERATOR_NEEDLES entry for {key[0]}")
+        if key in replay:
+            continue
+        if key not in no_standin:
+            problems.append(f"{case}: probe for {key[0]} has no PREFIX_REPLAY stand-in and no recorded reason")
+        elif manifest.get(case) != RED:
+            problems.append(f"{case}: probe for {key[0]} was never replayed against a pre-fix file, so the case must stay RED")
+    for key in needles:
+        if key not in called:
+            problems.append(f"GENERATOR_NEEDLES entry {key[0]} is used by no case")
     return problems
 
 
@@ -1954,6 +2124,12 @@ class Corpus(CorpusBase):
             self.assertTrue(liveness_problems(root), "a stand-in liveness test satisfied #6911")
         (root / WORKFLOW).write_text("run: cargo test --test cert_fed_identifier_liveness\n", encoding="utf-8")
         live.write_text("#[test]\nfn documented_id_is_live() {\n    let _ = \"" + LIVE_ID + "\";\n}\n", encoding="utf-8")
+        self.assertTrue(liveness_problems(root), "a vacuous test that only names the id passed #6911")
+        live.write_text("#[test]\nfn documented_id_is_live() {\n    let _ = \"" + LIVE_ID + "\";\n    assert!(true);\n}\n",
+                        encoding="utf-8")
+        self.assertTrue(liveness_problems(root), "assert!(true) beside a bare mention passed #6911")
+        live.write_text("#[test]\nfn documented_id_is_live() {\n    assert!(SRC.contains(\"" + LIVE_ID + "\"));\n}\n",
+                        encoding="utf-8")
         self.assertEqual(liveness_problems(root), [])
         live.write_text("", encoding="utf-8")
         self.assertTrue(liveness_problems(root), "an empty liveness test passed with the workflow wired")
@@ -1972,6 +2148,18 @@ class Corpus(CorpusBase):
         self.assertTrue(rebind_problems("# rebind\n"))
         self.assertTrue(sidecar_problems("std::mem::forget(tmp);\n"))
         self.assertTrue(ladder_problems("ladder\n", "# ladder\n"))
+
+    @expect(GREEN)
+    def case_7988_prefix_replay(self):
+        """#7988: every RED probe is replayed against the real pre-fix file of its fix commit
+        (it must fail there) and against the fixed ref (it must pass), so no probe is a token that
+        an unfixed generator also carries. An unreadable object fails the case; the CI step that
+        runs this fetches them with --print-replay-shas."""
+        lines, wrong, unreadable = prefix_replay_report(HARNESS_ROOT, self.tmp)
+        print("\n".join(lines), file=sys.stderr)
+        self.assertEqual(unreadable, [], "replay objects are missing from this checkout: " + "; ".join(unreadable))
+        self.assertEqual(wrong, [], "probes that do not discriminate: " + "; ".join(wrong))
+        self.assertGreaterEqual(len(lines), 2 * len(PREFIX_REPLAY))
 
     # ---- section 7 evasions: the per-file multiset and the funnel (P1, P3) --
 
@@ -2263,15 +2451,15 @@ class Corpus(CorpusBase):
 
     @expect(RED, REASON_GENERATOR)
     def case_7583_ast_guard_tempfile_join(self):
-        self.generator_file("../ci/tests/test_evidence_generator_r5_7393.py", "the AST guard checks tempfile and folds join")
+        self.generator_file("../ci/tests/test_evidence_generator_r6_7393.py", "the AST guard checks tempfile and folds join")
 
     @expect(RED, REASON_GENERATOR)
     def case_7584_posture_oserror_pin(self):
-        self.generator_file("../ci/tests/test_evidence_generator_r5_7393.py", "the posture OSError widening is pinned")
+        self.generator_file("../ci/tests/test_evidence_generator_r6_7393.py", "the posture OSError widening is pinned")
 
     @expect(RED, REASON_GENERATOR)
     def case_7585_realpath_pin(self):
-        self.generator_file("../ci/tests/test_evidence_generator_r5_7393.py", "the realpath comparison is pinned")
+        self.generator_file("../ci/tests/test_evidence_generator_r6_7393.py", "the realpath comparison is pinned")
 
     @expect(RED, REASON_GENERATOR)
     def case_7617_posture_copy_symlink(self):
@@ -2481,6 +2669,21 @@ class Ratchet(unittest.TestCase):
             print(note, file=sys.stderr)
         self.assertEqual(problems, [], "\n".join(problems))
 
+    def test_probe_wiring_ratchet(self):
+        """#7988: a RED case cannot become GREEN while its probe is an unreplayed token check."""
+        src = Path(__file__).read_text(encoding="utf-8")
+        self.assertEqual(probe_wiring_problems(src, GENERATOR_NEEDLES, PREFIX_REPLAY, NO_PREFIX_STANDIN, MANIFEST), [])
+        key = ("x.py", "why")
+        call = "class C:\n    def case_1_x(self):\n        self.generator_file('x.py', 'why')\n"
+        self.assertEqual(probe_wiring_problems(call, {key: ("a",)}, {key: (("s", "p"),)}, {}, {"case_1_x": GREEN}), [])
+        self.assertTrue(probe_wiring_problems(call, {key: ("a",)}, {}, {}, {"case_1_x": RED}),
+                        "a probe with no replay and no recorded reason passed")
+        self.assertTrue(probe_wiring_problems(call, {key: ("a",)}, {}, {key: "no file"}, {"case_1_x": GREEN}),
+                        "an unreplayed probe was allowed to be GREEN")
+        self.assertEqual(probe_wiring_problems(call, {key: ("a",)}, {}, {key: "no file"}, {"case_1_x": RED}), [])
+        self.assertTrue(probe_wiring_problems("x = 1\n", {key: ("a",)}, {key: (("s", "p"),)}, {}, {}),
+                        "an unreferenced probe passed")
+
     def test_every_case_is_registered(self):
         found = set()
         for cls in (Cells, Corpus):
@@ -2637,6 +2840,9 @@ def main(argv=None):
     failing case and a `CORPUS-SUMMARY` line, with no traceback, for the gate's thin
     `--self-test` runner (#6445)."""
     args = list(sys.argv[1:] if argv is None else argv)
+    if REPLAY_FETCH_FLAG in args:
+        print("\n".join(replay_objects()))
+        return 0
     machine = "--machine" in args
     suite = load_tests(unittest.defaultTestLoader, None, None)
     stream = io.StringIO() if machine else sys.stderr

@@ -250,6 +250,9 @@ jobs:
           else
             echo "CERT_MANIFEST_BASE_REF=HEAD^" >> "$GITHUB_ENV"
           fi
+      # #7988: case_7988_prefix_replay reads the PR 7393 commits the probes were verified against.
+      - name: Fetch the corpus replay objects (#7988)
+        run: python3 -I scripts/ci/tests/test_check_cert_expiry_corpus.py --print-replay-shas | xargs git fetch --no-tags --depth=1 origin
       - name: Shard partition and wiring unit tests (#6344)
         run: python3 -m unittest discover -s scripts/ci/tests
       # #7160 - scripts/test/ is outside the discovery root above; run the
