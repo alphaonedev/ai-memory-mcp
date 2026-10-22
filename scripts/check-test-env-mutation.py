@@ -135,7 +135,27 @@ ISOLATED_MARKER = re.compile(r"//[ \t]*env-mutation-gate:[ \t]*process-isolated[
 # #7383: a raw string, raw byte string (`br`) or raw C string (`cr`) opener.
 RAW_STR_OPEN = re.compile(r'(?:[bc]?r)(#*)"')
 # Direct writers: env::set_var / remove_var, qualified or imported bare (not `fn set_var`, not `.set_var`).
-DIRECT_MUTATION = re.compile(r"(?<![\w.])(?:(?:std::)?env::)?(?:set_var|remove_var)\s*\(")
+# #7996: also the libc writers, a turbofish (`set_var::<&str, &str>(..)`) and a bare mention of the fn as a
+# value (`let f = set_var;`, no call parenthesis): such a pointer can be called anywhere, so it is a write of
+# an unknown var. `use .. set_var as sv;` aliases are added per file by mutation_re.
+MUTATION_NAMES = ("set_var", "remove_var", "setenv", "unsetenv", "putenv", "clearenv")
+
+
+def mutation_re(aliases=()):
+    names = "|".join(re.escape(n) for n in MUTATION_NAMES + tuple(sorted(aliases)))
+    return re.compile(r"(?<![\w.])(?:(?:std::)?env::|libc::)?(?:%s)\b(?:\s*::\s*<[^;{}]*?>)?(?:\s*\()?" % names)
+
+
+def use_aliases(scrubbed):
+    """Names a file imports a writer under: `use std::env::set_var as sv;` / `{remove_var as rv, ..}`."""
+    out = set()
+    for item in USE_ITEM.finditer(scrubbed):
+        out.update(m.group(1) for m in MUTATION_ALIAS.finditer(item.group(0)))
+    return out
+
+
+MUTATION_ALIAS = re.compile(r"\b(?:%s)\s+as\s+([A-Za-z_]\w*)" % "|".join(MUTATION_NAMES))
+DIRECT_MUTATION = mutation_re()
 # #7994: a call that hands its argument to another thread or task. The closure or async block it takes
 # runs outside the spawner's guard scope (the handle may outlive the guard), so it never inherits a lock.
 DETACH = re.compile(r"(?<![\w])(?<!fn )(?:spawn|spawn_blocking|spawn_local|spawn_on|spawn_pinned|"
@@ -805,6 +825,7 @@ class Source:
     def __init__(self, raw, fallback=None):
         self.raw = raw
         self.scrubbed = blank_use_items(scrub(raw)) if raw is not None else None
+        self.dm = mutation_re(use_aliases(scrub(raw))) if raw is not None else DIRECT_MUTATION
         self.consts = dict(fallback or {})
         self.consts.update(CONST_STR.findall(raw) if raw is not None else ())
 
@@ -897,12 +918,12 @@ class CommonModel:
             return set()
         if id(fn) not in self._vars:
             src, out = self.sources[id(fn)], set()
-            for m in DIRECT_MUTATION.finditer(fn.body):
+            for m in src.dm.finditer(fn.body):
                 out.add(src.arg_name(fn, m.end() - 1))
             for m, callee in self._callees(fn):
                 if callee.owner in COMMON_GUARD_METHODS:
                     out.add(src.arg_name(fn, m.end() - 1))
-                elif DIRECT_MUTATION.search(callee.body) or callee.owner is None:
+                elif self.sources[id(callee)].dm.search(callee.body) or callee.owner is None:
                     out |= self.written_vars(callee.key, stack + (id(fn),))
             self._vars[id(fn)] = out
         return self._vars[id(fn)] or {ANY_VAR}
@@ -914,6 +935,7 @@ class FileModel:
     def __init__(self, scrubbed, raw=None, common=None):
         self.common = common if common is not None else CommonModel()
         self.imports, self.glob = common_imports(scrubbed)
+        self.dm = mutation_re(use_aliases(scrubbed))
         scrubbed = blank_use_items(scrubbed)
         self.src = (Source(raw, self.common.src_consts) if raw is not None and len(raw) == len(scrubbed)
                     else Source(None))
@@ -928,7 +950,7 @@ class FileModel:
             if f.owner:
                 self.by_method.setdefault(f.name, []).append(f)
         self.once_fns = {id(f) for f in self.fns
-                         if not f.is_test and ONCE_BODY.search(f.body) and DIRECT_MUTATION.search(f.body)}
+                         if not f.is_test and ONCE_BODY.search(f.body) and self.dm.search(f.body)}
         self._calls, self._acq, self._summary, self._ctx, self._live = {}, {}, {}, {}, {}
         self._detached = {}
         self._encl, self._viol, self._file_ip_only = {}, {}, None
@@ -1011,11 +1033,14 @@ class FileModel:
             bodies.setdefault(m.group(1), (start, scrubbed[start:match_brace(scrubbed, start)]))
         found = {}
         for name, (start, body) in bodies.items():
-            writes = list(DIRECT_MUTATION.finditer(body))
+            writes = list(self.dm.finditer(body))
             if not writes:
                 continue
             names = set()
             for w in writes:
+                if body[w.end() - 1] != "(":
+                    names.add(ANY_VAR)  # a pointer mention: called somewhere unknown
+                    continue
                 a, b = first_arg_text(body, w.end() - 1)
                 names.add(self.src.name_in(start + a, start + b))
             first = writes[0].start()
@@ -1396,7 +1421,7 @@ class FileModel:
             if not self.live(fn):
                 continue
             once = frozenset({ONCE_PREFIX + fn.key}) if id(fn) in self.once_fns else EMPTY
-            for m in DIRECT_MUTATION.finditer(fn.body):
+            for m in self.dm.finditer(fn.body):
                 add(fn, m.start(), once, self.write_names(fn, m.end() - 1))
             for pos, names, locks in self.macro_writes(fn):
                 add(fn, pos, locks, names)
@@ -1425,7 +1450,7 @@ class FileModel:
                 out.append((m.start(), None))
         if REQWEST.search(body) and not self.ip_only(fn):
             out.extend((m.start(), None) for m in REQWEST.finditer(body))
-        for m in DIRECT_MUTATION.finditer(body):
+        for m in self.dm.finditer(body):
             out.append((m.start(), self.site_at.get((id(fn), m.start()))))
         for pos, _, _ in self.macro_writes(fn):
             out.append((pos, self.site_at.get((id(fn), pos))))

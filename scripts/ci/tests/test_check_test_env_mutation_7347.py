@@ -1220,6 +1220,45 @@ class Issue7995(Fixture):
                 self.assertEqual(self._flagged_b(shape, "setup()", self.SETUP), set())
 
 
+class Issue7996(Fixture):
+    """#7996: "`DIRECT_MUTATION` ... only matches `set_var(` / `remove_var(` ... Three env-writing forms are
+    not seen as writers: an aliased import: `use std::env::set_var as sv;` then `sv("A", "1")` / a turbofish
+    fn pointer: `let f = std::env::set_var::<&str, &str>; f("A", "1");` / the libc writers `libc::setenv(` /
+    `libc::unsetenv(` / `libc::putenv(`" / "one fixture per form, each must create a write site".
+    """
+
+    FORMS = {
+        "alias": ("use std::env::set_var as sv;\n", "unsafe { sv(\"A\", \"1\") };"),
+        "alias_in_braces": ("use std::env::{remove_var as rv, set_var as sv};\n", "unsafe { rv(\"A\") };"),
+        "alias_remove": ("use std::env::remove_var as rv;\n", "unsafe { rv(\"A\") };"),
+        "turbofish_call": ("", "unsafe { std::env::set_var::<&str, &str>(\"A\", \"1\") };"),
+        "turbofish_pointer": ("", "let f = std::env::set_var::<&str, &str>;\n    unsafe { f(\"A\", \"1\") };"),
+        "bare_pointer": ("use std::env::set_var;\n", "let f = set_var;\n    unsafe { f(\"A\", \"1\") };"),
+        "libc_setenv": ("", "unsafe { libc::setenv(c\"A\".as_ptr(), c\"1\".as_ptr(), 1) };"),
+        "libc_unsetenv": ("", "unsafe { libc::unsetenv(c\"A\".as_ptr()) };"),
+        "libc_putenv": ("", "unsafe { libc::putenv(buf.as_mut_ptr()) };"),
+        "libc_clearenv": ("", "unsafe { libc::clearenv() };"),
+    }
+
+    def text(self, header, body, locked):
+        lock = "let _g = ENV_LOCK.blocking_lock();\n    " if locked else ""
+        return header + LOCK_HEAD + LOCKED_READER + test_fn("w", lock + body)
+
+    def test_every_form_is_a_write_site_that_must_hold_the_lock(self):
+        for name, (header, body) in self.FORMS.items():
+            with self.subTest(form=name):
+                self.assertIn("tests/a.rs::w", self.flagged(self.text(header, body, False)))
+
+    def test_every_form_is_clean_under_the_lock(self):
+        for name, (header, body) in self.FORMS.items():
+            with self.subTest(form=name):
+                self.assertEqual(self.flagged(self.text(header, body, True)), set())
+
+    def test_a_method_or_longer_name_is_not_a_writer(self):
+        body = "let _x = cfg.setenv(1); let _y = my_setenv(2); let _z = unsetenv_all(3);"
+        self.assertEqual(self.flagged(self.text("", body, False)), set())
+
+
 class Issue7999(unittest.TestCase):
     """#7628: "The `let_names` docstring at scripts/check-test-env-mutation.py:612-614 also states that
     `let _ = guard;` drops the guard. That is wrong for a named place: `let _ = g;` does not move g
