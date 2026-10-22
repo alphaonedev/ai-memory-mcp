@@ -26,7 +26,7 @@ PUBLISH = ROOT / ".github" / "workflows" / "publish-ci-image.yml"
 
 # One entry per issue this PR closes. SELF_CHECK below requires every issue to
 # have at least one pinned case and the count to equal this list.
-CLOSES = (6289, 6290, 6904, 8002, 8020, 8021, 8023, 8030, 8031, 8039)
+CLOSES = (6289, 6290, 6904, 8002, 8020, 8021, 8023, 8030, 8031, 8032, 8039)
 PINNED_CASES = {}  # issue number -> list of test method names, filled by pins()
 
 
@@ -94,8 +94,8 @@ class Controls(unittest.TestCase):
         self.assertEqual(errors_shape(read(SHAPE)), [])
 
     def test_self_check_pinned_case_count_equals_closes(self):
-        """The pinned-case count equals the Closes count (10)."""
-        self.assertEqual(len(CLOSES), 10)
+        """The pinned-case count equals the Closes count (11)."""
+        self.assertEqual(len(CLOSES), 11)
         self.assertEqual(sorted(PINNED_CASES), sorted(CLOSES))
         for issue in CLOSES:
             self.assertTrue(PINNED_CASES[issue], "no pinned case for #%d" % issue)
@@ -311,18 +311,21 @@ class Walked8002(unittest.TestCase):
         found = list(SHA_USES.finditer(text))
         self.assertGreater(len(found), 3, label)
         survivors = []
-        for m in found:
-            mut = text[:m.start(3)] + "v4" + text[m.end(3):]
-            rep = G.Report()
-            doc = G.parse_yaml(mut, label, rep)
-            G.check_uses_pinned(doc, label, rep)
-            if not rep.errors:
-                survivors.append(text.count("\n", 0, m.start()) + 1)
+        # #8032: through run_guard (the wiring that was broken at e7ceaddbf), not check_uses_pinned alone
+        with tempfile.TemporaryDirectory(dir=scratch()) as tmp:
+            root = FailClosed().make_tree(tmp)
+            target = root / (".github/workflows/" + label)
+            for m in found:
+                target.write_bytes((text[:m.start(3)] + "v4" + text[m.end(3):]).encode("utf-8"))
+                errors, _ = G.run_guard(root)
+                if not any(label in e and "#6904" in e for e in errors):
+                    survivors.append(text.count("\n", 0, m.start()) + 1)
         self.assertEqual(survivors, [], label)
 
+    @pins(8032)
     @pins(8002)
     def test_c8_precheck_every_use_refused_by_the_walk(self):
-        """#8002: every `uses:` of c8-precheck.yml repointed to a tag is refused by check_uses_pinned."""
+        """#8002: every `uses:` of c8-precheck.yml repointed to a tag is refused by run_guard."""
         self.every_use(C8, "c8-precheck.yml")
 
     @pins(8002)
@@ -333,9 +336,10 @@ class Walked8002(unittest.TestCase):
             errors, _ = G.run_guard(root)
             self.assertTrue(any("c8-precheck.yml" in e and "#6904" in e for e in errors), errors)
 
+    @pins(8032)
     @pins(8020)
     def test_publish_ci_every_use_refused_by_the_walk(self):
-        """#8020: every `uses:` of publish-ci-image.yml repointed to a tag is refused by check_uses_pinned."""
+        """#8020: every `uses:` of publish-ci-image.yml repointed to a tag is refused by run_guard."""
         self.every_use(PUBLISH, "publish-ci-image.yml")
 
     @pins(8020)
