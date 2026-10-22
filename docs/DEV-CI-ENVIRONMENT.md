@@ -186,9 +186,6 @@ pg_ctl -D <pg-age-stack>/pgdata start|stop
 # rebuild: operator-local f1-tier-init.sh equivalent
 ```
 
-**AGE helper database and environment (#6181, #6871, #6676).** The AGE
-self-heal passes the database name to psql through `PGDATABASE`, so its argv carries no path component. A tier URL that names no database is refused with exit 2 before any restore or psql call (the database is read as libpq reads it: the last `dbname` query value wins over the path, so `/db?dbname=` names none, #6871), and psql's environment is an allowlist: `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_*` and `TZ` from the caller, then the helper's own `PGPASSWORD`, `PGDATABASE` and `PGCONNECT_TIMEOUT`; no caller `PG*` variable reaches psql (redirect `PGHOST` `PGHOSTADDR` `PGPORT` `PGLOADBALANCEHOSTS`; transport `PGSSLMODE` `PGREQUIRESSL` `PGGSSENCMODE` `PGCHANNELBINDING` `PGSSLROOTCERT` `PGSSLCRL` `PGSSLNEGOTIATION` `PGREQUIREAUTH` `PGMINPROTOCOLVERSION` `PGMAXPROTOCOLVERSION`; credentials `PGUSER` `PGPASSWORD` `PGPASSFILE` `PGSSLCERT` `PGSSLKEY`; target `PGDATABASE` `PGOPTIONS` `PGTARGETSESSIONATTRS`) (#6676). The tier URL must carry exactly one `sslmode=verify-full` and a non-empty `sslrootcert`; any other value, a missing or repeated `sslmode`, or a missing `sslrootcert` is refused with exit 2 before any restore or psql call, so the tier password is never sent without certificate and hostname verification (#7982). The refusal names the key only, never a value or the URL.
-
 **AGE self-heal (#6161).** The hand-built AGE 1.8.0 files originally lived inside
 Homebrew's `postgresql@18` share/lib trees, which `brew upgrade` relinks, dropping
 them (CI then fails with `extension "age" is not available`). A brew-independent
@@ -262,6 +259,8 @@ before `CREATE EXTENSION`:
   also when it arrives while it is being spawned (#6337, #6504), and exits 1 with one
   `ensure-age-extension: interrupted` line. Only a `0` or `1` answer counts: a psql that exits
   non-zero or prints anything else fails the run with no restore (#6677). A supervisor killed by a signal is reported as `the psql supervisor was killed by signal N` (#6728).
+
+- **Database, TLS and psql environment (#6181, #6871, #6676, #7982).** The helper passes the database name to psql through `PGDATABASE`, so its argv carries no path component. A tier URL that names no database is refused with exit 2 before any restore or psql call (the database is read as libpq reads it: the last `dbname` query value wins over the path, so `/db?dbname=` names none, #6871), and psql's environment is an allowlist: `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_*` and `TZ` from the caller, then the helper's own `PGPASSWORD`, `PGDATABASE` and `PGCONNECT_TIMEOUT`; no caller `PG*` variable reaches psql (redirect `PGHOST` `PGHOSTADDR` `PGPORT` `PGLOADBALANCEHOSTS`; transport `PGSSLMODE` `PGREQUIRESSL` `PGGSSENCMODE` `PGCHANNELBINDING` `PGSSLROOTCERT` `PGSSLCRL` `PGSSLNEGOTIATION` `PGREQUIREAUTH` `PGMINPROTOCOLVERSION` `PGMAXPROTOCOLVERSION`; credentials `PGUSER` `PGPASSWORD` `PGPASSFILE` `PGSSLCERT` `PGSSLKEY`; target `PGDATABASE` `PGOPTIONS` `PGTARGETSESSIONATTRS`) (#6676). The tier URL must carry exactly one `sslmode=verify-full` and a non-empty `sslrootcert`; any other value, a missing or repeated `sslmode`, or a missing `sslrootcert` is refused with exit 2 before any restore or psql call, so the tier password is never sent without certificate and hostname verification. The refusal names the key only, never a value or the URL.
 
 It is a no-op when AGE is healthy. `--age-dir` exists for the unit tests only;
 CI always uses the default node path, and there is no environment override.

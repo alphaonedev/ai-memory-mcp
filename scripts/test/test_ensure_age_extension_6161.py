@@ -544,6 +544,24 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                 self.assertFalse((self.base / "psql.log").exists(), "psql must never be called")
 
     # ---- URL shapes libpq parses differently from urllib (R3-F1, F-R3-1) --
+    def test_docs_describe_the_helper_inside_the_self_heal_list_7986(self):
+        # #7986: the database/environment text was an orphan paragraph ahead of the paragraph that introduces the
+        # AGE self-heal; it belongs in that list, after the intro and before the closing no-op sentence.
+        docs = (ROOT / "docs/DEV-CI-ENVIRONMENT.md").read_text()
+        intro = docs.index("**AGE self-heal (#6161).**")
+        bullet = docs.index("- **Database, TLS and psql environment (#6181, #6871, #6676, #7982).**")
+        closing = docs.index("It is a no-op when AGE is healthy.")
+        self.assertTrue(intro < bullet < closing, (intro, bullet, closing))
+        self.assertNotIn("**AGE helper database and environment", docs)
+        # the bullet sits in the list: every earlier list item starts with "- **" and no heading intervenes
+        self.assertNotIn("\n#", docs[intro:closing])
+        # sentence-to-step: the self-heal runs before CREATE EXTENSION in the "Configure enterprise-fed tier" step
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        step = ci.index("- name: Configure enterprise-fed tier")
+        helper_call = ci.index("scripts/ci/ensure-age-extension.py", step)
+        create_ext = ci.index("CREATE EXTENSION IF NOT EXISTS age", step)
+        self.assertLess(helper_call, create_ext)
+
     # ---- TLS: verify-full is required (#7982) -----------------------------
     def test_tls_url_must_be_verify_full_with_a_root_cert_7982(self):
         base = "postgres://ciuser:" + PW_MARKER + "@127.0.0.1:5445/cidb"
