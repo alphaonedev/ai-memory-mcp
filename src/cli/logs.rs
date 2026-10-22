@@ -298,6 +298,9 @@ struct FollowState {
     /// past `offset` between two polls leaves the length looking like growth,
     /// but these bytes no longer match (#7965).
     fingerprint: Vec<u8>,
+    /// Newer log file that could not be opened (reported once, retried on
+    /// every poll while the old file keeps being followed, #8005).
+    unreadable: Option<PathBuf>,
 }
 
 /// How many bytes before the cursor are kept to tell a truncate-then-regrow
@@ -316,6 +319,7 @@ impl FollowState {
             id,
             file: Some(file),
             fingerprint,
+            unreadable: None,
         }
     }
 
@@ -353,6 +357,18 @@ fn read_fingerprint(file: &fs::File, offset: u64) -> Vec<u8> {
         buf.clear();
     }
     buf
+}
+
+/// True when the file now at `state.path` has other bytes before the cursor
+/// than the ones last seen there (a fresh open, not the held handle).
+fn path_fingerprint_differs(state: &FollowState) -> bool {
+    if state.fingerprint.is_empty() {
+        return false;
+    }
+    match fs::File::open(&state.path) {
+        Ok(file) => read_fingerprint(&file, state.offset) != state.fingerprint,
+        Err(_) => false,
+    }
 }
 
 /// Stable identity of the file behind `meta`: the inode on unix, `None` where
@@ -405,15 +421,16 @@ fn tail_then_offset_with(
     let mut reader = BufReader::new(f);
     let mut keep: Vec<String> = Vec::with_capacity(n);
     let mut offset: u64 = 0;
-    let mut raw = String::new();
+    let mut raw: Vec<u8> = Vec::new();
     loop {
         raw.clear();
-        let read = reader.read_line(&mut raw)?;
-        if read == 0 || (hold_tail && !raw.ends_with('\n')) {
+        let read = reader.read_until(b'\n', &mut raw)?;
+        if read == 0 || (hold_tail && raw.last() != Some(&b'\n')) {
             break;
         }
         offset = advance_offset(offset, read)?;
-        let line = strip_line_end(&raw);
+        let decoded = String::from_utf8_lossy(&raw);
+        let line = strip_line_end(&decoded);
         if !line_matches(line, filters) {
             continue;
         }
@@ -442,15 +459,19 @@ fn read_lines_from_handle(
     let mut reader = BufReader::new(file);
     let mut lines = Vec::new();
     let mut end = offset;
-    let mut raw = String::new();
+    let mut raw: Vec<u8> = Vec::new();
     loop {
         raw.clear();
-        let read = reader.read_line(&mut raw)?;
-        if read == 0 || (!raw.ends_with('\n') && !flush_tail) {
+        let read = reader.read_until(b'\n', &mut raw)?;
+        if read == 0 || (raw.last() != Some(&b'\n') && !flush_tail) {
             break;
         }
         end = advance_offset(end, read)?;
-        lines.push(strip_line_end(&raw).to_string());
+        // decision: lossy decode of a COMPLETE line over `read_line`, because
+        // `read_line` validates UTF-8 before the held-fragment check and a
+        // fragment ending inside a multi-byte character would abort the
+        // command (#8006); bytes are decoded only once the newline is in.
+        lines.push(strip_line_end(&String::from_utf8_lossy(&raw)).to_string());
     }
     Ok((lines, end))
 }
@@ -497,9 +518,10 @@ fn drain_followed(
     Ok(())
 }
 
-/// Switch the cursor to `path` at offset 0 with a fresh handle.
-fn switch_to(state: &mut FollowState, path: PathBuf) {
-    let file = open_followed(&path).ok();
+/// Switch the cursor to `path` at offset 0 with a fresh handle (`opened` when
+/// the caller already holds one).
+fn switch_to(state: &mut FollowState, path: PathBuf, opened: Option<fs::File>) {
+    let file = opened.or_else(|| open_followed(&path).ok());
     state.id = file
         .as_ref()
         .and_then(|f| f.metadata().ok())
@@ -509,6 +531,7 @@ fn switch_to(state: &mut FollowState, path: PathBuf) {
     state.path = path;
     state.offset = 0;
     state.fingerprint.clear();
+    state.unreadable = None;
 }
 
 /// One poll of `logs tail --follow`: handle rotation (a newer-named file, a
@@ -530,11 +553,40 @@ fn follow_poll(
         && newest > state.path
     {
         // Rotation by name: finish the old file, then follow the new one from 0.
-        drain_followed(state, filters, out, true)?;
-        switch_to(state, newest);
+        // decision: open the newer file BEFORE leaving the old one over
+        // switching blind, because an unreadable newer file would otherwise
+        // blind the follower for good (`newest > state.path` never moves
+        // back); the failure is reported once and the old file keeps being
+        // followed while the open is retried each poll (#8005, ERRORS-02).
+        match open_followed(&newest) {
+            Ok(file) => {
+                drain_followed(state, filters, out, true)?;
+                switch_to(state, newest, Some(file));
+            }
+            Err(err) => {
+                if state.unreadable.as_ref() != Some(&newest) {
+                    writeln!(
+                        out.stderr,
+                        "logs: cannot open {}: {err:#}; still following {}",
+                        newest.display(),
+                        state.path.display()
+                    )?;
+                    state.unreadable = Some(newest);
+                }
+            }
+        }
     } else if let Ok(meta) = fs::metadata(&state.path) {
         let id = file_id(&meta);
-        let replaced = state.id.is_some() && id.is_some() && state.id != id;
+        let replaced = if state.id.is_some() && id.is_some() {
+            state.id != id
+        } else {
+            // decision: without inode identity compare the bytes the path
+            // holds NOW before the cursor with the ones the open handle still
+            // holds over trusting the handle alone, because the handle keeps
+            // the renamed-away inode and so can never see a replacement
+            // (#8027). A replacement identical in those bytes is missed.
+            state.fingerprint_holds() && path_fingerprint_differs(state)
+        };
         if replaced {
             // Rename-and-recreate: the writer may still have appended to the
             // renamed file, which only the old handle can reach.
@@ -545,7 +597,7 @@ fn follow_poll(
                 state.path.display()
             )?;
             let path = state.path.clone();
-            switch_to(state, path);
+            switch_to(state, path, None);
         } else if meta.len() < state.offset || !state.fingerprint_holds() {
             // decision: a short prefix fingerprint of the bytes before the
             // cursor over mtime+len or a content hash, because it costs one
@@ -814,36 +866,30 @@ mod tests {
         assert_eq!(lines.last().unwrap(), &"line 100");
     }
 
+    /// `run_tail --follow` prints lines appended after the tail pass. The
+    /// append happens in the `after_read` hook (a deterministic handshake: no
+    /// thread, no sleep), so the follow phase must pick both lines up.
     #[test]
     fn logs_tail_follows_appended_lines() {
         let dir = tempfile::tempdir().unwrap();
         let path = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\n");
-        let path_clone = path.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(60));
-            let mut f = fs::OpenOptions::new()
-                .append(true)
-                .open(&path_clone)
-                .unwrap();
-            writeln!(f, "second").unwrap();
-            writeln!(f, "third").unwrap();
-        });
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         {
             let mut out = output(&mut stdout, &mut stderr);
-            let filters = Filters::default();
-            let args = TailArgs {
-                lines: 10,
-                follow: true,
-                follow_interval_ms: 30,
-                max_polls: 6,
-            };
-            run_tail(dir.path(), &filters, &args, &mut out).unwrap();
+            run_tail_with(
+                dir.path(),
+                &Filters::default(),
+                &follow_args(2),
+                &mut out,
+                || {
+                    append(&path, "second\n");
+                    append(&path, "third\n");
+                },
+            )
+            .unwrap();
         }
-        let s = std::str::from_utf8(&stdout).unwrap();
-        assert!(s.contains("first"), "got: {s}");
-        assert!(s.contains("second"), "expected appended line: {s}");
+        let s = String::from_utf8(stdout).unwrap();
+        assert_eq!(s, "first\nsecond\nthird\n", "got: {s:?}");
     }
 
     fn follow_args(max_polls: u64) -> TailArgs {
@@ -925,6 +971,98 @@ mod tests {
         assert_eq!(s2, "new-b\n", "got: {s2:?}");
     }
 
+    /// #8028 - name rotation flushes the old file's unterminated final
+    /// fragment as a line (contract of changelog.d/7950.fixed.md), before the
+    /// new file's first line.
+    #[test]
+    fn logs_tail_follow_rotation_flushes_unterminated_old_fragment_8028() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\n");
+        let mut state = open_state(&a, 6);
+        append(&a, "frag");
+        let (held, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(
+            held, "",
+            "fragment held while the file is current: {held:?}"
+        );
+        make_log(dir.path(), "ai-memory.log.2026-05-01", "new-b\n");
+        let (s, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(
+            s, "frag\nnew-b\n",
+            "fragment flushed before new file: {s:?}"
+        );
+    }
+
+    /// #8027 - with no inode identity, a rename-and-recreate larger than the
+    /// read position is still seen (bytes now at the path differ from the ones
+    /// before the cursor), and the renamed file's late append is drained first.
+    #[test]
+    fn logs_tail_follow_detects_replace_without_inode_8027() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-04-30", "old-one\nold-two\n");
+        let mut state = open_state(&a, 16);
+        state.id = None;
+        fs::rename(&a, dir.path().join("ai-memory.log.2026-04-30.zst")).unwrap();
+        make_log(
+            dir.path(),
+            "ai-memory.log.2026-04-30",
+            "new-one\nnew-two\nnew-three\nnew-four\n",
+        );
+        let (s, e) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "new-one\nnew-two\nnew-three\nnew-four\n", "got: {s:?}");
+        assert!(e.contains("rotated or truncated"), "note: {e:?}");
+    }
+
+    /// #8005 - a newer file that cannot be opened is reported once and the
+    /// old file keeps being followed; once readable the follower switches.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_survives_unreadable_newer_file_8005() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\n");
+        let mut state = open_state(&a, 6);
+        let b = make_log(dir.path(), "ai-memory.log.2026-05-01", "new-b\n");
+        fs::set_permissions(&b, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(&b).is_ok() {
+            return; // privileged user: the permission bits do not bite.
+        }
+        append(&a, "a2\n");
+        let (s1, e1) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "a2\n", "old file still followed: {s1:?}");
+        assert!(e1.contains("cannot open"), "reported: {e1:?}");
+        append(&a, "a3\n");
+        let (s2, e2) = poll_once(dir.path(), &mut state);
+        assert_eq!(s2, "a3\n", "{s2:?}");
+        assert_eq!(e2, "", "reported once: {e2:?}");
+        fs::set_permissions(&b, fs::Permissions::from_mode(0o644)).unwrap();
+        append(&a, "a4\n");
+        let (s3, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s3, "a4\nnew-b\n", "drained old, switched: {s3:?}");
+        assert_eq!(state.path, b);
+    }
+
+    /// #8006 - a fragment that ends inside a multi-byte character is held,
+    /// not an error; once its newline arrives the line prints whole. A
+    /// complete line of invalid UTF-8 prints lossily.
+    #[test]
+    fn logs_tail_follow_holds_partial_utf8_8006() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ai-memory.log.2026-04-30");
+        fs::write(&path, b"caf\xC3").unwrap();
+        let mut state = open_state(&path, 0);
+        let (held, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(held, "", "fragment held: {held:?}");
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"\xA9\nbad\xFF\n").unwrap();
+        let (s, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "caf\u{e9}\nbad\u{fffd}\n", "got: {s:?}");
+        let (initial, offset, _, _) =
+            tail_then_offset_with(&path, 10, &Filters::default(), true, || {}).unwrap();
+        assert_eq!(initial.len(), 2);
+        assert_eq!(offset, 11);
+    }
+
     /// #7946 - truncation of the followed file restarts from offset 0.
     #[test]
     fn logs_tail_follow_survives_truncation_7946() {
@@ -999,6 +1137,7 @@ mod tests {
             id,
             file: Some(file),
             fingerprint: Vec::new(),
+            unreadable: None,
         };
         append(&path, "ial\n");
         let (s, _) = poll_once(dir.path(), &mut state);
@@ -1027,6 +1166,7 @@ mod tests {
             id: file.metadata().ok().as_ref().and_then(file_id),
             file: Some(file),
             fingerprint: Vec::new(),
+            unreadable: None,
         };
         let moved = dir.path().join("ai-memory.log.2026-04-30.zst");
         fs::rename(&newest, &moved).unwrap();

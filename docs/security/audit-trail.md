@@ -612,8 +612,11 @@ when a newer log file appears it drains the old one and continues with the
 new one, and a truncated file (shrunk, or rewritten so the bytes before the
 read position changed) or a replaced file (new inode, detected on unix only)
 is re-read from the start with a note on stderr. On platforms without inode
-identity a rename-and-recreate that is larger than the read position is
-detected by the same bytes-before-the-position check. Accepts the global
+identity a rename-and-recreate is detected by comparing the bytes before
+the read position with the file now at the path (a replacement whose bytes
+there are identical, or one seen before any byte was read, is not told
+apart). A newer log file that cannot be opened is reported once on stderr
+and the old file keeps being followed until the newer one is readable. Accepts the global
 `--log-dir <PATH>` override. See the **Log directory resolution**
 section above for the full precedence ladder.
 
