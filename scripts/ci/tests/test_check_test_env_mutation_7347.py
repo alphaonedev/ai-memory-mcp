@@ -1033,6 +1033,20 @@ class Issue7475(Fixture):
         self.assertEqual(self.flagged(ONCE_AFTER_READER), {"tests/a.rs::a", "tests/a.rs::b"})
 
 
+class Issue7999(unittest.TestCase):
+    """#7628: "The `let_names` docstring at scripts/check-test-env-mutation.py:612-614 also states that
+    `let _ = guard;` drops the guard. That is wrong for a named place: `let _ = g;` does not move g
+    (drop probe: held=true). Only `let _ = LOCK.call();` drops a temporary." / "Correct the let_names docstring."
+    """
+
+    def test_let_names_docstring_tells_a_place_from_a_temporary(self):
+        doc = " ".join(gate.let_names.__doc__.split())
+        self.assertIn("place", doc)
+        self.assertIn("temporary", doc)
+        self.assertIn("`let _ = g;`", doc)
+        self.assertNotIn("neither does `let _ = ..`: that drops the value", doc)
+
+
 class RealTree(unittest.TestCase):
     def test_repo_matches_its_baseline(self):
         found = gate.scan_tree(REPO)

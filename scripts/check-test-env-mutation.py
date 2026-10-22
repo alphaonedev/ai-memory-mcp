@@ -502,9 +502,11 @@ def parse_fns(scrubbed):
 def let_names(prefix):
     """[name] for a plain `let [mut] <name> [: T] =` statement prefix, else [].
 
-    Only a single identifier counts. A tuple, struct or slice pattern binds nothing here, and neither
-    does `let _ = ..`: that drops the value at the end of the statement (a lone `_` is no binding).
-    `_guard` style names are bindings.
+    Only a single identifier counts. A tuple, struct or slice pattern binds nothing here. A lone `_`
+    is no binding, and what it does depends on the right-hand side (#7628): `let _ = LOCK.call();`
+    drops a temporary at the end of the statement, but `let _ = g;` names a place, does not move
+    `g` and leaves the guard held (the gate still does not credit it, because `g` is mentioned
+    again). `_guard` style names are bindings.
     """
     m = LET_BOUND.match(prefix)
     if m and m.group(1) != "_":
