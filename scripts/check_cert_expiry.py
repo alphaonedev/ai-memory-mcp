@@ -271,7 +271,14 @@ def changed_paths(repo, frm, to):
 
 def extract_fed_ids(repo, tree):
     """Unique AI_MEMORY_FED_* identifiers in src/ at TREE (set of str)."""
-    proc = run_git(repo, "grep", "-h", "-I", "-E", FED_ID_PATTERN, tree, "--", "src")
+    # -a scans every blob as text: -I would take its binary/text decision from
+    # attributes (a head's .gitattributes `binary` line could hide a new id,
+    # #6174). The attributes file is also neutralised and textconv is off, so
+    # the match is on the raw tree-object bytes only.
+    proc = run_git(
+        repo, "-c", "core.attributesFile=/dev/null", "grep", "-h", "-a", "--no-textconv",
+        "-E", FED_ID_PATTERN, tree, "--", "src",
+    )
     if proc.returncode == 1:  # no match
         return set()
     if proc.returncode != 0:
