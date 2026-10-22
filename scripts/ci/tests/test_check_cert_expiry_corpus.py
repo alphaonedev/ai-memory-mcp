@@ -35,7 +35,9 @@ lexer shapes, the generator under scripts/evidence, the per-file FED multiset)
 are real callable cases: a lexer-shape case runs its Rust patch through the
 current section 7 drift check and asserts the verdict the finished design gives.
 """
+import ast
 import importlib.util
+import inspect
 import io
 import os
 import re
@@ -1562,6 +1564,259 @@ def repo_text(rel):
     return (HARNESS_ROOT / rel).read_text(encoding="utf-8", errors="replace")
 
 
+GENERATOR_NEEDLES = {
+    ('../ci/tests/test_evidence_fixture_identity.py', 'the fixture byte-identity test the cert procedure cites'):
+        ('def test_', 'identity'),
+    ('../ci/tests/test_evidence_generator_r2_7393.py', 'the tmp-root guard covers every spelling'):
+        ('def test_', 'tmp'),
+    ('../ci/tests/test_evidence_generator_r3_7393.py', 'tests write under the scratch root only'):
+        ('def test_', 'scratch'),
+    ('../ci/tests/test_evidence_generator_r5_7393.py', 'the AST guard checks tempfile and folds join'):
+        ('def test_', 'ast', 'tempfile'),
+    ('../ci/tests/test_evidence_generator_r5_7393.py', 'the posture OSError widening is pinned'):
+        ('def test_', 'OSError'),
+    ('../ci/tests/test_evidence_generator_r5_7393.py', 'the realpath comparison is pinned'):
+        ('def test_', 'realpath'),
+    ('build_bundle.py', 'check_run rejects a later crashed chain run'):
+        ('def check_run',),
+    ('build_bundle.py', 'recapture lookup must find the .py'):
+        ('recapture', '.py'),
+    ('prep.py', 'a git grep error is an error, never an empty FED id set'):
+        ('grep', 'returncode'),
+    ('prep.py', 'an empty FED id set at either end is an error'):
+        ('FED', 'empty'),
+    ('prep.py', 'commit-1 bytes hash-qualified, docstring true'):
+        ('hashlib',),
+    ('run_cert.py', 'CERT_ env overrides validated and logged'):
+        ('CERT_', 'environ'),
+    ('run_cert.py', 'O_EXCL and O_NOFOLLOW pinned; a killed run is swept'):
+        ('O_EXCL', 'O_NOFOLLOW'),
+    ('run_cert.py', 'PLANS has a gates entry'):
+        ('PLANS', 'gates'),
+    ('run_cert.py', 'a deeply nested stale dir does not crash the gates leg'):
+        ('OSError', 'stale'),
+    ('run_cert.py', 'a failed cert commit push fails the gates leg'):
+        ('push', 'gates'),
+    ('run_cert.py', 'a missing wrapper writes a RED and an EXIT row'):
+        ('EXIT', 'RED'),
+    ('run_cert.py', 'a relocated gate copy resolves its repo root to the checkout'):
+        ('realpath', 'repo'),
+    ('run_cert.py', 'an OSError creating the gate copy writes an EXIT row'):
+        ('OSError', 'EXIT'),
+    ('run_cert.py', 'an output dir on tmpfs or under a tmp root is refused'):
+        ('tmpfs', 'tmp'),
+    ('run_cert.py', 'cert-alone.out records ionice only when it was used'):
+        ('ionice', 'cert-alone.out'),
+    ('run_cert.py', 'is_tmpfs_path decodes proc-mounts octal escapes'):
+        ('def is_tmpfs_path', 'mounts'),
+    ('run_cert.py', 'pick_expiry refuses look-alike, symlink and skip-worktree copies'):
+        ('def pick_expiry', 'skip-worktree'),
+    ('run_cert.py', 'push-branch and parent refused on legs that ignore them'):
+        ('push-branch', 'parent'),
+    ('run_cert.py', 'relative CERT_TARGETS and CERT_TMPDIR refused or resolved'):
+        ('CERT_TARGETS', 'CERT_TMPDIR'),
+    ('run_cert.py', 'repo gate scripts run with an empty cwd'):
+        ('cwd', 'gate'),
+    ('run_cert.py', 'scripts picked from the tip tree, never the worktree'):
+        ('ls-tree', 'tip'),
+    ('run_cert.py', 'the docstring states ionice conditionally and exit 64'):
+        ('ionice', '64'),
+    ('run_cert.py', 'the expiry gate copy never follows a symlink'):
+        ('O_NOFOLLOW', 'expiry'),
+    ('run_cert.py', 'the gate copy has no check-to-exec window'):
+        ('O_NOFOLLOW', 'exec'),
+    ('run_cert.py', 'the gate copy runs under python3 -I'):
+        ('-I',),
+    ('run_cert.py', 'the output dir must be quoted in generated bash'):
+        ('shlex.quote',),
+    ('run_cert.py', 'the posture copy is never written through a symlink'):
+        ('O_NOFOLLOW', 'posture'),
+    ('run_cert.py', 'the preflight EXIT row says 64 where the exit is 64'):
+        ('EXIT', '64'),
+    ('run_cert.py', 'the sweep goes through the directory fd'):
+        ('dir_fd',),
+    ('run_cert.py', 'wrapper, flock and timeout validated; CONFIG row names the source'):
+        ('flock', 'timeout', 'CONFIG'),
+}
+
+MIN_PROBE_BYTES = 120  # a stand-in shorter than this cannot carry the named acceptance
+YAML_COMMENT_RE = re.compile(r"(^|\s)#.*$")
+JOB_HEADER_RE = re.compile(r"^  [\w-]+:\s*$")
+BASE_TRUST_RE = re.compile(r"github\.event\.pull_request\.base\.(sha|ref)")
+GATE_JOB_NAME = "cert-expiry-gate"
+PLAIN_WORKFLOW = "name: x\non: [push]\njobs: {}\n"
+WORKFLOW_BAD = (("CR", "\r"), ("NEL", "\u0085"), ("LS", "\u2028"), ("PS", "\u2029"),
+                ("NBSP", "\u00a0"), ("EM SPACE", "\u2003"), ("IDEOGRAPHIC SPACE", "\u3000"),
+                ("ZWSP", "\u200b"))
+LOG_SAFE_SAMPLES = {
+    "bidi": ("a\u202eb", "x\u2066y\u2069", "p\u200bq", "m\u200fn"),
+    "ignorable": ("a\u00adb", "a\u034fb", "a\u115fb", "a\ufe0fb", "a\u2060b", "a\U000e0100b"),
+    "unassigned": ("a\u0378b", "a\U0010fffeb", "a\u0530b"),
+}
+LOG_SAFE_ONE_TO_ONE = ("\\u202e", "\u202e", "\\\\", "\\", "A", "\\x41", "a\\b")
+
+
+def code_lines(text, comment_prefix):
+    return "\n".join(ln for ln in text.splitlines()
+                     if ln.strip() and not ln.strip().startswith(comment_prefix))
+
+
+def liveness_problems(root):
+    """#6911: the compiled liveness test exists, holds real test code that exercises the
+    documented id, and the workflow runs it. Empty or comment-only files fail."""
+    root = Path(root)
+    path = root / LIVENESS_TEST
+    if not path.is_file():
+        return [f"{LIVENESS_TEST} is absent"]
+    code = code_lines(path.read_text(encoding="utf-8", errors="replace"), "//")
+    problems = []
+    if len(code.splitlines()) < 3:
+        problems.append("no code beyond comments")
+    if "#[test]" not in code:
+        problems.append("no #[test] function")
+    if LIVE_ID not in code:
+        problems.append(f"does not exercise {LIVE_ID}")
+    wf = root / WORKFLOW
+    wired = wf.is_file() and "cert_fed_identifier_liveness" in wf.read_text(encoding="utf-8", errors="replace")
+    if not wired:
+        problems.append(f"{WORKFLOW} does not run cert_fed_identifier_liveness")
+    return problems
+
+
+def generator_problems(root, rel, needles):
+    """A vendored generator or its test: present, non-trivial, parses, and holds the
+    named tokens outside comments (and a test function when it is a test file)."""
+    path = Path(root) / GEN_DIR / rel
+    if not path.is_file():
+        return [f"{rel} is absent"]
+    text = path.read_text(encoding="utf-8", errors="replace")
+    problems = []
+    if len(text.strip()) < MIN_PROBE_BYTES:
+        problems.append(f"{rel} is trivially small")
+    code = text
+    if path.suffix == ".py":
+        code = code_lines(text, "#")
+        try:
+            tree = ast.parse(text)
+        except SyntaxError as exc:
+            return problems + [f"{rel} does not parse: {exc.msg}"]
+        if path.name.startswith("test_") and not any(
+                isinstance(n, ast.FunctionDef) and n.name.startswith("test") for n in ast.walk(tree)):
+            problems.append(f"{rel} defines no test function")
+    for needle in needles:
+        if needle not in code:
+            problems.append(f"{rel} lacks {needle!r} outside comments")
+    return problems
+
+
+def workflow_text_problems(fn, labels=None):
+    """Behavioural probe of the workflow-text check: plain text passes, every named
+    non-printable-ASCII byte is refused (truthy return or ValueError/GateError)."""
+    def flags(text):
+        try:
+            return bool(fn(text))
+        except (ValueError, GateError):
+            return True
+    problems = []
+    if flags(PLAIN_WORKFLOW):
+        problems.append("plain printable-ASCII LF text was refused")
+    for label, ch in WORKFLOW_BAD:
+        if (labels is None or label in labels) and not flags(f"name: x\n# a{ch}b\nrun: 'true'\n"):
+            problems.append(f"{label} was accepted")
+    return problems
+
+
+def log_safe_problems(fn, aspects=None):
+    """Behavioural probe of log_safe: printable-ASCII output, changed input escaped,
+    no interpreter-table dependence, backslash doubling and one-to-one output."""
+    def printable(text):
+        return isinstance(text, str) and all(0x20 <= ord(c) <= 0x7E for c in text)
+    problems = []
+    for aspect, samples in LOG_SAFE_SAMPLES.items():
+        if aspects is not None and aspect not in aspects:
+            continue
+        for sample in samples:
+            out = fn(sample)
+            if not printable(out) or out == sample:
+                problems.append(f"{aspect}: {sample!r} printed as {out!r}")
+        if aspect == "unassigned":
+            try:
+                if "unicodedata" in inspect.getsource(fn):
+                    problems.append("unassigned: escaping depends on unicodedata tables")
+            except (OSError, TypeError):
+                pass
+    if aspects is None or "backslash" in aspects:
+        if fn("a\\b") != "a\\\\b":
+            problems.append("backslash is not doubled")
+        outs = [fn(x) for x in LOG_SAFE_ONE_TO_ONE]
+        if len(set(outs)) != len(outs) or not all(printable(o) for o in outs):
+            problems.append("escaping is not one-to-one printable ASCII")
+    return problems
+
+
+def trusted_copy_problems(text):
+    """#6140: pull_request_target is configured and the cert-expiry-gate job runs a copy
+    taken from the base ref, not the pull request's own."""
+    lines = [YAML_COMMENT_RE.sub("", ln) for ln in text.splitlines()]
+    if "pull_request_target" not in "\n".join(lines):
+        return ["pull_request_target is not configured"]
+    marks = [i for i, ln in enumerate(lines) if ln.strip() == f"name: {GATE_JOB_NAME}"]
+    if not marks:
+        return [f"no job named {GATE_JOB_NAME}"]
+    start = marks[0]
+    while start > 0 and not JOB_HEADER_RE.match(lines[start]):
+        start -= 1
+    end = marks[0] + 1
+    while end < len(lines) and not JOB_HEADER_RE.match(lines[end]):
+        end += 1
+    if not BASE_TRUST_RE.search("\n".join(lines[start:end])):
+        return [f"{GATE_JOB_NAME} does not take its gate copy from the base ref"]
+    return []
+
+
+def named_test_with_assert(text, fragments, *tokens):
+    """True when a test function whose name holds every fragment mentions every token
+    in its body and asserts something."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test") \
+                and all(f in node.name for f in fragments):
+            body = ast.get_source_segment(text, node) or ""
+            asserts = any(isinstance(n, ast.Assert) or (isinstance(n, ast.Call) and
+                          getattr(n.func, "attr", "").startswith("assert")) for n in ast.walk(node))
+            if asserts and all(t in body for t in tokens):
+                return True
+    return False
+
+
+def rebind_problems(test_text):
+    if named_test_with_assert(test_text, ("rebind",), "ENV_SHA_RE"):
+        return []
+    return ["no rebind test that asserts on ENV_SHA_RE"]
+
+
+def sidecar_problems(rust_text):
+    code = code_lines(rust_text, "//")
+    problems = []
+    if "mem::forget" in code:
+        problems.append("mem::forget leaks the test database")
+    if "remove_file" not in code or not ("-wal" in code or "-shm" in code):
+        problems.append("no removal of the -wal/-shm sidecars")
+    return problems
+
+
+def ladder_problems(script_text, test_text):
+    problems = []
+    if "ladder" not in code_lines(script_text, "#"):
+        problems.append("the recapture script does not mention the ladder")
+    if not named_test_with_assert(test_text, ("ladder",)):
+        problems.append("no ladder test that asserts")
+    return problems
+
+
 class Corpus(CorpusBase):
     def need(self, obj, name, why):
         self.assertTrue(hasattr(obj, name), f"{name} is absent from the gate: {why}")
@@ -1575,7 +1830,8 @@ class Corpus(CorpusBase):
                          f" dead while it stays named once: {out[:200]}")
 
     def generator_file(self, rel, why):
-        self.require_path(f"{GEN_DIR}/{rel}", why)
+        problems = generator_problems(HARNESS_ROOT, rel, GENERATOR_NEEDLES[(rel, why)])
+        self.assertEqual(problems, [], f"{GEN_DIR}/{rel}: {why}: " + "; ".join(problems))
 
     # ---- the four members this batch fixes (expected GREEN) ----------------
 
@@ -1684,6 +1940,39 @@ class Corpus(CorpusBase):
         rc, out = self.run_stub_self_test(self.stub_gate_tree(few), extra_args=("--self-test-subset", "cell_a_"))
         self.assertEqual(rc, 0, "an explicit subset run needs only one case: " + out[-300:])
 
+    @expect(GREEN)
+    def case_7977_probe_mutants(self):
+        """#7977: a RED probe must check the issue acceptance, not that a name exists.
+        Empty, comment-only and unparsable stand-ins must keep every probe failing."""
+        root = self.tmp / "mutroot"
+        for rel in (Path(LIVENESS_TEST).parent, Path(GEN_DIR), Path(GEN_DIR) / ".." / "ci" / "tests",
+                    Path(WORKFLOW).parent):
+            (root / rel).mkdir(parents=True, exist_ok=True)
+        live = root / LIVENESS_TEST
+        for body in ("", "// cert_fed_identifier_liveness AI_MEMORY_FED_REQUIRE_SIG\n" * 30):
+            live.write_text(body, encoding="utf-8")
+            self.assertTrue(liveness_problems(root), "a stand-in liveness test satisfied #6911")
+        (root / WORKFLOW).write_text("run: cargo test --test cert_fed_identifier_liveness\n", encoding="utf-8")
+        live.write_text("#[test]\nfn documented_id_is_live() {\n    let _ = \"" + LIVE_ID + "\";\n}\n", encoding="utf-8")
+        self.assertEqual(liveness_problems(root), [])
+        live.write_text("", encoding="utf-8")
+        self.assertTrue(liveness_problems(root), "an empty liveness test passed with the workflow wired")
+        self.assertGreaterEqual(len(GENERATOR_NEEDLES), 36)
+        for (rel, _why), needles in GENERATOR_NEEDLES.items():
+            target = root / GEN_DIR / rel
+            for body in ("", "# " + " ".join(needles) + "\n" * 3, "def broken(:\n" + " ".join(needles)):
+                target.write_text(body, encoding="utf-8")
+                self.assertTrue(generator_problems(root, rel, needles),
+                                f"a stand-in {rel} satisfied its probe: {body[:30]!r}")
+        identity = lambda text: text
+        self.assertTrue(log_safe_problems(identity), "an identity log_safe passed the escaping probes")
+        self.assertTrue(workflow_text_problems(lambda text: None), "a workflow check that accepts everything passed")
+        self.assertTrue(workflow_text_problems(lambda text: "bad"), "a workflow check that rejects everything passed")
+        self.assertTrue(trusted_copy_problems("on:\n  pull_request_target:  # not used\njobs: {}\n"))
+        self.assertTrue(rebind_problems("# rebind\n"))
+        self.assertTrue(sidecar_problems("std::mem::forget(tmp);\n"))
+        self.assertTrue(ladder_problems("ladder\n", "# ladder\n"))
+
     # ---- section 7 evasions: the per-file multiset and the funnel (P1, P3) --
 
     def base_with_second_mention(self):
@@ -1718,13 +2007,14 @@ class Corpus(CorpusBase):
 
     @expect(RED, "the compiled-liveness test tests/cert_fed_identifier_liveness.rs does not exist (#6911)")
     def case_6911_closed_denominator(self):
-        self.require_path(LIVENESS_TEST, "one behavioural test per documented FED id")
+        problems = liveness_problems(HARNESS_ROOT)
+        self.assertEqual(problems, [], "one behavioural test per documented FED id: " + "; ".join(problems))
 
     # ---- gate integrity, log_safe, docs ------------------------------------
 
     @expect(RED, "the gate runs the pull request's own copy: no base-ref (pull_request_target) trusted copy")
     def case_6140_pr_edits_gate_copy(self):
-        self.assertIn("pull_request_target", repo_text(WORKFLOW))
+        self.assertEqual(trusted_copy_problems(repo_text(WORKFLOW)), [])
 
     @expect(RED, "the compliance standard and ballot docs still name the deleted check-cert-expiry.sh")
     def case_6141_docs_name_deleted_sh(self):
@@ -1734,31 +2024,37 @@ class Corpus(CorpusBase):
 
     @expect(RED, "no printable-ASCII/LF-only check for c8-precheck.yml (I3): YAML CR NEL LS PS breaks")
     def case_6228_yaml_nel_ls_ps_break(self):
-        self.need(cert, "workflow_text_violation", "refuse any workflow byte outside printable ASCII and LF")
+        fn = self.need(cert, "workflow_text_violation", "refuse any workflow byte outside printable ASCII and LF")
+        self.assertEqual(workflow_text_problems(fn, ("CR", "NEL", "LS", "PS")), [])
 
     @expect(RED, "no printable-ASCII/LF-only check for c8-precheck.yml (I3): Unicode whitespace")
     def case_6304_unicode_ws_comment(self):
-        self.need(cert, "workflow_text_violation", "refuse any workflow byte outside printable ASCII and LF")
+        fn = self.need(cert, "workflow_text_violation", "refuse any workflow byte outside printable ASCII and LF")
+        self.assertEqual(workflow_text_problems(fn, ("NBSP", "EM SPACE", "IDEOGRAPHIC SPACE", "ZWSP")), [])
 
     @expect(RED, "log_safe is not on the chain tip (6140 branch only); allow-list escaping (I4) absent")
     def case_6683_bidi_zero_width(self):
-        self.need(cert, "log_safe", "bidi and zero-width characters must print escaped")
+        fn = self.need(cert, "log_safe", "bidi and zero-width characters must print escaped")
+        self.assertEqual(log_safe_problems(fn, ("bidi",)), [])
 
     @expect(RED, "log_safe is not on the chain tip; default-ignorable code points must print escaped")
     def case_6917_default_ignorable(self):
-        self.need(cert, "log_safe", "default-ignorable non-Cf code points must print escaped")
+        fn = self.need(cert, "log_safe", "default-ignorable non-Cf code points must print escaped")
+        self.assertEqual(log_safe_problems(fn, ("ignorable",)), [])
 
     @expect(RED, "log_safe is not on the chain tip; escaping must not depend on interpreter tables")
     def case_6918_unassigned_cn(self):
-        self.need(cert, "log_safe", "an allow-list of 0x20-0x7E, everything else escaped")
+        fn = self.need(cert, "log_safe", "an allow-list of 0x20-0x7E, everything else escaped")
+        self.assertEqual(log_safe_problems(fn, ("unassigned",)), [])
 
     @expect(RED, "log_safe is not on the chain tip; backslash doubling and one-to-one escaping unpinned")
     def case_6921_backslash_one_to_one(self):
-        self.need(cert, "log_safe", "a printed name must be reversible")
+        fn = self.need(cert, "log_safe", "a printed name must be reversible")
+        self.assertEqual(log_safe_problems(fn, ("backslash",)), [])
 
     @expect(RED, "test_codeql_6163.py pins ENV_SHA_RE by name only: no pin against a rebinding")
     def case_6882_env_sha_rebind(self):
-        self.assertIn("rebind", repo_text("scripts/ci/tests/test_codeql_6163.py"))
+        self.assertEqual(rebind_problems(repo_text("scripts/ci/tests/test_codeql_6163.py")), [])
 
     # ---- the 6560 lexer-evasion family: Rust patches that make the id dead --
 
@@ -1842,8 +2138,8 @@ class Corpus(CorpusBase):
 
     @expect(RED, "the cert procedure, T4 and the fixture byte-identity test are on PR 7393 only")
     def case_7392_procedure_cites_commit(self):
-        self.require_path("scripts/ci/tests/test_evidence_fixture_identity.py",
-                          "the fixture byte-identity test the cert procedure cites")
+        self.generator_file("../ci/tests/test_evidence_fixture_identity.py",
+                            "the fixture byte-identity test the cert procedure cites")
 
     @expect(RED, REASON_GENERATOR)
     def case_7399_recapture_py_lookup(self):
@@ -1997,8 +2293,9 @@ class Corpus(CorpusBase):
 
     @expect(RED, "the 3607 posture ladder is recorded but no test or script step asserts it")
     def case_5036_ladder_asserted(self):
-        both = repo_text(RECAPTURE_PY) + repo_text("scripts/ci/tests/test_recapture_cert_3607_5038.py")
-        self.assertRegex(both, r"(?i)ladder")
+        problems = ladder_problems(repo_text(RECAPTURE_PY),
+                                   repo_text("scripts/ci/tests/test_recapture_cert_3607_5038.py"))
+        self.assertEqual(problems, [])
 
     @expect(RED, "check-required-contexts.sh accepts two jobs that report the same required context")
     def case_6177_duplicate_required_context(self):
@@ -2018,7 +2315,7 @@ class Corpus(CorpusBase):
 
     @expect(RED, "federation_signing_check.rs still leaks the sqlite sidecars of its test database")
     def case_7793_sidecar_clean_rebind(self):
-        self.assertNotIn("std::mem::forget(tmp)", repo_text(SIGNING_CHECK_RS))
+        self.assertEqual(sidecar_problems(repo_text(SIGNING_CHECK_RS)), [])
 
 
 # ---------------------------------------------------------------------------
