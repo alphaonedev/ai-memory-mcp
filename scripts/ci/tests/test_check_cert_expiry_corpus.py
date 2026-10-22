@@ -5,9 +5,9 @@
 
 Run with `python3 -I -m unittest scripts/ci/tests/test_check_cert_expiry_corpus.py`
 or through `python3 -I scripts/check_cert_expiry.py --self-test`, which is a thin
-runner over this file (#6357, #6445).
+runner over this file (#6445).
 
-ISOLATION (#6357). Every case builds its OWN scratch git repository under a
+ISOLATION. Every case builds its OWN scratch git repository under a
 private directory of its own (`CorpusBase.setUp`), so no case can lean on a
 commit, ref, branch or file an earlier case left behind, and the cases pass in
 any order. `case_6357_cell_isolation` pins that.
@@ -83,7 +83,7 @@ globals().update({k: v for k, v in vars(cert).items() if not k.startswith("__")}
 
 
 # ---------------------------------------------------------------------------
-# Helpers moved verbatim from the gate former in-script self-test (#6357)
+# Helpers moved verbatim from the gate former in-script self-test
 # ---------------------------------------------------------------------------
 
 
@@ -2508,7 +2508,7 @@ class CorpusResult(unittest.TextTestResult):
 def main(argv=None):
     """Run the corpus. `--machine` prints one `CORPUS-FAIL <name>: <reason>` line per
     failing case and a `CORPUS-SUMMARY` line, with no traceback, for the gate's thin
-    `--self-test` runner (#6357, #6445)."""
+    `--self-test` runner (#6445)."""
     args = list(sys.argv[1:] if argv is None else argv)
     machine = "--machine" in args
     suite = load_tests(unittest.defaultTestLoader, None, None)

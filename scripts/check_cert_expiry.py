@@ -100,7 +100,7 @@ Usage:
   scripts/check_cert_expiry.py              # against the resolved range
   scripts/check_cert_expiry.py --self-test  # runs the external corpus (below)
 
-External corpus and ratchet (#6357, #6445). The plant-a-violation cells and one
+External corpus and ratchet (#6445). The plant-a-violation cells and one
 case per member of the cert-expiry defect class live OUTSIDE this gate, in
 scripts/ci/tests/test_check_cert_expiry_corpus.py. Every case builds its own
 scratch git repository, so no case can depend on another, and a crash in one is
@@ -792,7 +792,7 @@ def deep_scratch(tmp, target_len):
 
 
 # ---------------------------------------------------------------------------
-# Self-test: a thin runner over the external corpus (#6357, #6445)
+# Self-test: a thin runner over the external corpus (#6445)
 # ---------------------------------------------------------------------------
 
 CORPUS_HARNESS = Path("scripts") / "ci" / "tests" / "test_check_cert_expiry_corpus.py"
