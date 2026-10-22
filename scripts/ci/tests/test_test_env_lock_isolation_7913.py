@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """#7913: the Test-env HOME-lock gate census is isolated from its self-tests."""
 
+import contextlib
+import errno
 import importlib.util
+import io
+import os
 import re
 from pathlib import Path
 import shutil
@@ -191,6 +195,47 @@ class SignalCleanupTest(TreeCase):
 
     def test_sigint_mid_selftest_removes_the_copy(self):
         self._interrupt(signal.SIGINT)
+
+
+class KillGroupFailureTest(unittest.TestCase):
+    """#7926: a failed killpg is recorded on stderr, never swallowed or masking."""
+
+    def _run(self, kill_error):
+        h = load()
+
+        class FakeProc:
+            pid = 424242
+
+            def __init__(self):
+                self.calls = 0
+
+            def wait(self):
+                self.calls += 1
+                if self.calls == 1:
+                    raise h.Interrupted(143)
+                return 0
+
+        def failing_killpg(pgid, sig):
+            raise kill_error
+
+        h.subprocess = type("S", (), {"Popen": staticmethod(lambda *a, **k: FakeProc())})
+        h.os = type("O", (), {"killpg": staticmethod(failing_killpg)})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(h.Interrupted) as ctx:
+                h._run_child(["true"], ".")
+        return ctx.exception.code, err.getvalue()
+
+    def test_killpg_failure_is_noted_and_keeps_the_exit_code(self):
+        code, note = self._run(OSError(errno.EPERM, os.strerror(errno.EPERM)))
+        self.assertEqual(code, 143)
+        self.assertIn("424242", note)
+        self.assertIn("errno %d" % errno.EPERM, note)
+
+    def test_already_exited_group_is_noted_too(self):
+        code, note = self._run(ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH)))
+        self.assertEqual(code, 143)
+        self.assertIn("errno %d" % errno.ESRCH, note)
 
 
 FAKE_GATE = "scripts/fake-selftest-gate.sh"

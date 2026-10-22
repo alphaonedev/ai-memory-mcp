@@ -130,6 +130,11 @@ def _raise_interrupted(signum, _frame):
     raise Interrupted(128 + signum)
 
 
+def _stderr_note(message):
+    """Write one ``NOTE:`` line to stderr (looked up at call time, so it can be captured)."""
+    print("NOTE: %s" % message, file=sys.stderr)
+
+
 def _run_child(argv, cwd):
     """Run ``argv`` in its own process group; kill the whole group on any raise."""
     proc = subprocess.Popen(argv, cwd=cwd, start_new_session=True)
@@ -138,8 +143,11 @@ def _run_child(argv, cwd):
     except BaseException:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
-        except OSError:
-            pass
+        except OSError as err:
+            # Record it; the original exception still propagates below, so the
+            # exit code is never masked (#7926).
+            _stderr_note("could not kill process group %d: errno %s (%s)"
+                         % (proc.pid, err.errno, err.strerror))
         proc.wait()
         raise
 
