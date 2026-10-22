@@ -38,7 +38,10 @@ use common::free_port;
 use rusqlite::params;
 use tempfile::TempDir;
 
-const SPAWN_TIMEOUT: Duration = Duration::from_secs(15);
+/// Readiness budget for the spawned `serve` child: the shared daemon budget
+/// (`common::DAEMON_READY_TIMEOUT`, 5 min) rather than a private 15 s ceiling
+/// that a loaded CI host can exceed (#7935).
+const SPAWN_TIMEOUT: Duration = common::DAEMON_READY_TIMEOUT;
 
 /// Number of times [`spawn_serve`] re-rolls the ephemeral port when the
 /// daemon child loses the `free_port()` TOCTOU race and exits with a bind
