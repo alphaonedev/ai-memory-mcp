@@ -12,6 +12,7 @@ pre-fix replay used to prove each case is red on the real pre-fix code).
 Run: python3 -I -m unittest scripts.ci.tests.test_check_external_pr_approval_6117
 Standard library only; Python 3.9+. Scratch lives under .local-runs/, never /tmp.
 """
+import ast
 import importlib.util
 import json
 import os
@@ -292,10 +293,164 @@ class InterruptDiesOfSignal(unittest.TestCase):
         self.assertFalse(self.alive(child), "the gh child outlived the gate (orphan)")
 
 
-# One row per Closes line of the PR: (issue, test class). #6117 is the parent and is NOT closed.
+class Round2StaticPins(unittest.TestCase):
+    """Source-level pins for the round-2 review findings (#8007 #8008 #8009 #8012 #8014 #8015 #8016 #8017)."""
+
+    @staticmethod
+    def tree(path):
+        return ast.parse(Path(path).read_text(encoding="utf-8"))
+
+    def test_8008_8016_no_empty_except_in_gate_or_tests(self):
+        """#8008 / #8016 (py/empty-except): every except body does something besides ``pass``."""
+        for path in (GATE, Path(__file__)):
+            for node in ast.walk(self.tree(path)):
+                if isinstance(node, ast.ExceptHandler):
+                    self.assertFalse(all(isinstance(stmt, ast.Pass) for stmt in node.body),
+                                     f"{path.name}:{node.lineno} is an empty except")
+
+    def test_8009_8017_no_unused_import_in_test_module(self):
+        """#8009 / #8017 (py/unused-import): every imported name in this module is used."""
+        tree = self.tree(Path(__file__))
+        imported = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    imported[(alias.asname or alias.name).split(".")[0]] = node.lineno
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    imported[alias.asname or alias.name] = node.lineno
+        used = {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        unused = sorted(name for name in imported if name not in used)
+        self.assertEqual(unused, [], f"unused imports: {unused}")
+
+    def test_8007_8015_control_char_class_is_a_raw_regex(self):
+        """#8007 / #8015 (py/overly-large-range): the control-character class is a raw regex constant."""
+        pattern = getattr(gate, "CONTROL_RE", None)
+        self.assertIsNotNone(pattern, "scripts/check_external_pr_approval.py has no CONTROL_RE")
+        self.assertIn("\\x0e-\\x1f", pattern.pattern, "the class must be spelled as raw escapes")
+        for char in ("\x00", "\x08", "\x0b", "\x0c", "\x0e", "\x1f", "\x7f", "\x85", "\u2028", "\u2029"):
+            self.assertEqual(gate.workflow_error("a" + char + "b"), "::error::a?b", repr(char))
+        for char in ("\t", " ", "~", "\xa0", "\u2027", "\u202a"):
+            self.assertEqual(gate.workflow_error("a" + char + "b"), "::error::a" + char + "b", repr(char))
+
+    def test_8014_entry_docstring_states_that_a_print_failure_becomes_exit_2(self):
+        """#8014: entry() must not claim a failing verdict survives a print failure as-is."""
+        doc = " ".join((gate.entry.__doc__ or "").split()) if hasattr(gate, "entry") else ""
+        self.assertNotIn("returned as-is", doc)
+        self.assertIn("print failure turns", doc)
+        self.assertIn("exit 2", doc)
+
+    def test_8012_6229_docstring_does_not_splice_the_two_options(self):
+        """#8012: the #6229 acceptance quote is option 1 only; option 2's sentence is not spliced in."""
+        doc = " ".join((Issue6229MultiPrQueueGroup.__doc__ or "").split())
+        self.assertNotIn("fail closed if the mapping is ambiguous", doc)
+        self.assertNotIn("assertion that says so ... fail closed", doc)
+        self.assertIn("option 1", doc)
+
+    def test_8011_6242_docstring_is_refs_not_closes(self):
+        """#8011: the #6242 class says the residual stays open and the PR only references the issue."""
+        doc = " ".join((Issue6242QueueRefBinding.__doc__ or "").split())
+        self.assertIn("Refs #6242", doc)
+        self.assertIn("stays open", doc)
+
+
+class Round2RulesRead(unittest.TestCase):
+    """#8013: the rules read is merge_group only, and every gh failure on it is exit 2."""
+
+    def paths_read(self, event_name, event, sha):
+        seen = []
+        base = make_api([pr(1, A)], {1: [APPROVED]})
+
+        def api(path):
+            seen.append(path)
+            return base(path)
+
+        rc = run(event_name, event, sha, api)
+        return rc, seen
+
+    def test_8013_push_never_reads_the_rules_endpoint(self):
+        rc, seen = self.paths_read("push", {}, A)
+        self.assertEqual(rc, 0)
+        self.assertTrue(seen)
+        self.assertFalse([p for p in seen if "/rules/" in p], seen)
+
+    def test_8013_pull_request_never_reads_the_rules_endpoint(self):
+        event = {"pull_request": pr(1, A)}
+        rc, seen = self.paths_read("pull_request", event, A)
+        self.assertEqual(rc, 0)
+        self.assertTrue(seen)
+        self.assertFalse([p for p in seen if "/rules/" in p], seen)
+
+    def test_8013_merge_group_reads_the_rules_of_the_base_branch(self):
+        rc, seen = self.paths_read("merge_group", queue_event(), C)
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen[0], f"repos/{REPO_NAME}/rules/branches/release/v1.0.0")
+
+    def run_with_failing_gh(self, stderr_text):
+        """Drive the REAL gh_api through a fake `gh` that exits 1 on the rules read."""
+        scratch = SCRATCH / f"b5-rules-{os.getpid()}"
+        shutil.rmtree(scratch, ignore_errors=True)
+        scratch.mkdir(parents=True)
+        self.addCleanup(shutil.rmtree, scratch, True)
+        fake = scratch / "gh"
+        fake.write_text("#!%s\nimport sys\nsys.stderr.write(%r)\nsys.exit(1)\n" % (sys.executable, stderr_text))
+        fake.chmod(0o755)
+        event_file = scratch / "event.json"
+        event_file.write_text(gate.json.dumps(queue_event()), encoding="utf-8")
+        env = dict(os.environ, PATH=f"{scratch}{os.pathsep}{os.environ['PATH']}",
+                   GITHUB_EVENT_NAME="merge_group", GITHUB_EVENT_PATH=str(event_file),
+                   GITHUB_REPOSITORY=REPO_NAME, GITHUB_SHA=C, OPERATOR_LOGIN=OP)
+        return subprocess.run([sys.executable, "-I", str(GATE)], env=env, capture_output=True,
+                              text=True, timeout=60, check=False)
+
+    def test_8013_rules_read_http_403_is_exit_2(self):
+        proc = self.run_with_failing_gh("gh: Resource not accessible (HTTP 403)\n")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("Failing closed", proc.stdout)
+
+    def test_8013_rules_read_http_404_is_exit_2(self):
+        proc = self.run_with_failing_gh("gh: Not Found (HTTP 404)\n")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+
+    def test_8013_rules_read_network_failure_is_exit_2(self):
+        proc = self.run_with_failing_gh("error connecting to api.github.com\n")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+
+    def test_8014_print_failure_on_a_failing_verdict_is_exit_2_not_0(self):
+        """A finding (exit 1) whose output path breaks becomes exit 2: still non-zero, never a pass."""
+        real_print, real_argv = print, sys.argv
+        real_gh_api, real_env = gate.gh_api, dict(os.environ)
+        real_handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+
+        def broken(*_a, **_k):
+            raise BrokenPipeError("stdout closed")
+
+        import builtins
+        os.environ.update(GITHUB_EVENT_NAME="push", GITHUB_SHA=A, GITHUB_REPOSITORY=REPO_NAME,
+                          OPERATOR_LOGIN=OP)
+        sys.argv = [str(GATE)]
+        gate.gh_api = make_api([pr(1, A)])
+        builtins.print = broken
+        try:
+            rc = gate.entry()
+        finally:
+            builtins.print = real_print
+            gate.gh_api, sys.argv = real_gh_api, real_argv
+            os.environ.clear()
+            os.environ.update(real_env)
+            for sig, handler in real_handlers.items():
+                signal.signal(sig, handler)
+        self.assertEqual(rc, 2)
+
+
+# One row per issue the PR closes by a pinned behaviour case: (issue, test class).
+# The CodeQL and review issues (#8007-#8009, #8011-#8017) are pinned by the Round2 classes below.
 CLOSES = [
     (6227, Issue6227MergeGroupIsJudged),
     (6229, Issue6229MultiPrQueueGroup),
+]
+# Pinned but NOT closed (the residual stays open), and the parent: #6117 is Refs only.
+REFS = [
     (6242, Issue6242QueueRefBinding),
 ]
 
@@ -306,14 +461,15 @@ class PinnedCaseCount(unittest.TestCase):
     def test_every_closes_issue_has_pinned_cases(self):
         issues = [issue for issue, _cls in CLOSES]
         self.assertEqual(len(issues), len(set(issues)), "duplicate row in CLOSES")
-        for issue, cls in CLOSES:
+        self.assertFalse({6117, 6242} & set(issues), "#6117 and #6242 are Refs, never Closes")
+        for issue, cls in CLOSES + REFS:
             names = [n for n in dir(cls) if n.startswith(f"test_{issue}_")]
             self.assertTrue(names, f"issue {issue} has no pinned test_{issue}_* case")
             self.assertEqual(sorted(re.findall(r"#(\d+)", (cls.__doc__ or "").split(":")[0])),
                              [str(issue)], f"{cls.__name__} docstring must open with #{issue}")
 
     def test_no_unlisted_issue_class(self):
-        listed = {cls for _issue, cls in CLOSES}
+        listed = {cls for _issue, cls in CLOSES + REFS}
         for name, obj in globals().items():
             if isinstance(obj, type) and name.startswith("Issue") and issubclass(obj, unittest.TestCase):
                 self.assertIn(obj, listed, f"{name} pins an issue that is not in CLOSES")
