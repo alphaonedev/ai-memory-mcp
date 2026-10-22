@@ -823,7 +823,7 @@ class Scene:
         fx = self.fx = Fixture(self.repo)
         fx.g("init", "-q", "-b", "main")
         fx.g("config", "user.name", "Cert Expiry Selftest")
-        fx.g("config", "user.email", "selftest@invalid.example")
+        fx.g("config", "user.email", "selftest@localhost")
         fx.g("config", "commit.gpgsign", "false")
         fx.write(MOD_RS, "fn federation_mod() {}\n")
         fx.write("src/handlers/federation_receive.rs", "fn receive() {}\n")
