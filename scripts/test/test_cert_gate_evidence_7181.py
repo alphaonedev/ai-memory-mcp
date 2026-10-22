@@ -259,6 +259,29 @@ class HelperRedactsAndBounds(unittest.TestCase):
             (ev / "bring-up.out").write_text("hello\n", encoding="utf-8")
             self.assertEqual(mod.finalize(state, ev, TAIL_LINES, Broken()), 0)
 
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root removes anything")
+    def test_finalize_reports_unremovable_cleanup_paths_7894(self):
+        mod = _load_helper()
+        with _scratch() as td:
+            td = Path(td)
+            ev, state, locked = td / "ev", td / "state", td / "locked"
+            ev.mkdir()
+            state.mkdir()
+            locked.mkdir()
+            stuck = locked / "stuck.txt"
+            stuck.write_text("x", encoding="utf-8")
+            locked.chmod(0o500)
+            (state / "cleanup-list").write_text("%s\n" % stuck, encoding="utf-8")
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err):
+                    rc = mod.finalize(state, ev, TAIL_LINES, io.StringIO())
+            finally:
+                locked.chmod(0o700)
+        self.assertEqual(rc, 0)
+        self.assertIn("could not remove 1 cleanup paths", err.getvalue())
+        self.assertIn(str(stuck), err.getvalue())
+
     def test_tail_is_bounded_with_header(self):
         mod = _load_helper()
         with _scratch() as td:

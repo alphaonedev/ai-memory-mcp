@@ -18,7 +18,6 @@ Exit codes: 0 done, 2 usage or unreadable evidence directory (the offending
 argument is never echoed).
 """
 import argparse
-import contextlib
 import json
 import re
 import shutil
@@ -345,6 +344,14 @@ def _note_unavailable(stream: IO[str], exc: OSError) -> None:
         return  # the stream itself is gone: the trap must still keep the gate's exit status
 
 
+def _stderr_note(text: str) -> None:
+    """Best-effort stderr line for the EXIT trap: a closed stderr cannot raise (#7894)."""
+    try:
+        sys.stderr.write(text)
+    except (OSError, ValueError):
+        return
+
+
 def finalize(state_dir: Path, evidence_dir: Path, tail_lines: int, stream: IO[str]) -> int:
     """EXIT-trap body of the gate: report LEG B evidence on a LEG B failure, then clean up.
 
@@ -369,9 +376,14 @@ def finalize(state_dir: Path, evidence_dir: Path, tail_lines: int, stream: IO[st
         paths = listing.read_text(encoding="utf-8", errors="replace").splitlines() if listing.is_file() else []
     except OSError:
         paths = []
+    failed: List[str] = []
     for raw in paths:
-        with contextlib.suppress(OSError):
+        try:
             _safe_remove(raw.strip())
+        except OSError:
+            failed.append(raw.strip())
+    if failed:  # residue on the runner must be detectable (#7894)
+        _stderr_note("could not remove %d cleanup paths (first: %s)\n" % (len(failed), failed[0]))
     shutil.rmtree(str(state_dir), ignore_errors=True)
     return 0
 
