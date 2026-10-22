@@ -66,7 +66,9 @@ the first env write, and <name> is NEVER mentioned again anywhere after it: no `
 field access, return, shadowing, reassignment or closure capture. KNOWN_LOCK_EXPR is a plain receiver
 path ending in a lock call (`ENV_LOCK.lock().await`, `ENV_LOCK.blocking_lock()`, `env_lock()`,
 `Type::set(..)` of a tests/common guard) followed only by guard-preserving calls (GUARD_CHAIN: `lock`,
-`unwrap`, `expect`, `unwrap_or_else`, `await`). The gate does not model Rust moves or drops: a guard
+`unwrap`, `expect`, `unwrap_or_else`, `await`); a `lock()` / `lock_owned()` must go on with `.await` (tokio) or an
+unwrap / expect / `?` (std), because an unawaited tokio lock is a future and holds nothing (#7992). The
+gate does not model Rust moves or drops: a guard
 the test touches again, a lock in a nested block or a loop body, a tuple pattern, a struct field, a
 guard returned through a binding or a `match` is simply not credited. To restructure such a test, move
 the body of the loop into a fn that takes the lock canonically, or end the lock's life with the fn.
@@ -566,6 +568,25 @@ def ip_only_text(raw):
     return ip
 
 
+AWAIT_OR_UNWRAP = frozenset(("await", "unwrap", "expect", "unwrap_or_else"))
+
+
+def guard_materialised(body, pos, end):
+    """False for a tokio `.lock()` / `.lock_owned()` that is never awaited (#7992).
+
+    On a tokio mutex `lock` and `lock_owned` return a future: `let _g = ENV_LOCK.lock();` binds the
+    future and holds nothing. The initialiser must go on with `.await` (tokio) or `.unwrap()` /
+    `.expect(..)` / `.unwrap_or_else(..)` / `?` (a std lock). `blocking_lock` and a lock fn call
+    (`env_lock()`) are not affected.
+    """
+    text = body[pos:end]
+    first = re.match(r"\.\s*([A-Za-z_]\w*)", text)
+    if not first or first.group(1) not in ("lock", "lock_owned"):
+        return True
+    names = set(re.findall(r"\.\s*([A-Za-z_]\w*)", mask_brackets(text)))
+    return bool(names & AWAIT_OR_UNWRAP) or text.rstrip().endswith("?")
+
+
 def canonical_guard(body, pos, call=None, write=None):
     """[name] when the lock acquisition at pos is the CANONICAL guard binding, else [] (#7623-#7627).
 
@@ -597,6 +618,8 @@ def canonical_guard(body, pos, call=None, write=None):
     end = expr_end(body, pos)
     if any(n not in GUARD_CHAIN for n in re.findall(r"\.\s*([A-Za-z_]\w*)", mask_brackets(body[pos:end]))):
         return []
+    if not guard_materialised(body, pos, end):
+        return []
     if re.search(r"(?<![\w$])%s\b" % re.escape(names[0]), body[end:]):
         return []
     return names
@@ -626,6 +649,8 @@ def helper_ret_guard(body, pos):
         return False
     end = expr_end(body, pos)
     if any(n not in GUARD_CHAIN for n in re.findall(r"\.\s*([A-Za-z_]\w*)", mask_brackets(body[pos:end]))):
+        return False
+    if not guard_materialised(body, pos, end):
         return False
     rest, name = body[end:], re.escape(head.group(1))
     tail = HELPER_TAIL.fullmatch(rest)

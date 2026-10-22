@@ -1040,6 +1040,44 @@ class Issue7475(Fixture):
         self.assertEqual(self.flagged(ONCE_AFTER_READER), {"tests/a.rs::a", "tests/a.rs::b"})
 
 
+class Issue7992(Fixture):
+    """#7992: a tokio `lock()` / `lock_owned()` is a future; without `.await` no lock is held, so
+    `let _g = ENV_LOCK.lock();` must not be credited (in a test, a helper tail or a macro body)."""
+
+    HELPER = ("struct Env { _lock: MutexGuard<'static, ()> }\n"
+              "impl Env {\n    fn plain() -> Self {\n        let lock = %s;\n"
+              "        unsafe { std::env::set_var(\"B\", \"1\") };\n        Self { _lock: lock }\n    }\n}\n")
+
+    def verdict(self, prefix):
+        return self.flagged(WRITER + reader(prefix))
+
+    def test_an_unawaited_tokio_lock_is_not_credited(self):
+        for prefix in ("let _g = ENV_LOCK.lock();", "let _g = ENV_LOCK.lock_owned();",
+                       "let mut g = ENV_LOCK.lock();"):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(self.verdict(prefix), FLAGGED)
+
+    def test_the_awaited_and_unwrapped_forms_are_credited(self):
+        for prefix in ("let _g = ENV_LOCK.lock().await;", "let _g = ENV_LOCK.lock_owned().await;",
+                       "let _g = ENV_LOCK.lock().unwrap();", "let _g = ENV_LOCK.lock().expect(\"x\");",
+                       "let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());",
+                       "let _g = ENV_LOCK.blocking_lock();"):
+            with self.subTest(prefix=prefix):
+                self.assertEqual(self.verdict(prefix), set())
+
+    def test_an_unawaited_lock_in_a_guard_helper_is_not_credited(self):
+        helper = self.HELPER % "ENV_LOCK.lock()"
+        self.assertEqual(self.flagged(WRITER + helper + reader("let _e = Env::plain();")), FLAGGED)
+        helper = self.HELPER % "ENV_LOCK.lock().await"
+        self.assertEqual(self.flagged(WRITER + helper + reader("let _e = Env::plain();")), set())
+
+    def test_an_unawaited_lock_in_a_macro_body_is_not_credited(self):
+        macro = MACRO_SETL.replace("ENV_LOCK.blocking_lock()", "ENV_LOCK.lock()")
+        text = WRITER + macro + test_fn("w2", "setl!();") + LOCKED_READER
+        # the macro write is unprotected: the other writers and the reader race it
+        self.assertEqual(self.flagged(text), {"tests/a.rs::reader", "tests/a.rs::writer", "tests/a.rs::w2"})
+
+
 class Issue7999(unittest.TestCase):
     """#7628: "The `let_names` docstring at scripts/check-test-env-mutation.py:612-614 also states that
     `let _ = guard;` drops the guard. That is wrong for a named place: `let _ = g;` does not move g
