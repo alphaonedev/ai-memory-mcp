@@ -207,6 +207,9 @@ class GateScriptContract(unittest.TestCase):
         old = {k: os.environ.get(k) for k in env}
         os.environ.update(env)
         real_gh_api = gate.gh_api
+        real_argv = sys.argv
+        real_handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+        sys.argv = [str(GATE)]
         gate.gh_api = make_api([pr(1, A)])
         try:
             import builtins
@@ -217,6 +220,9 @@ class GateScriptContract(unittest.TestCase):
                 builtins.print = real_print
         finally:
             gate.gh_api = real_gh_api
+            sys.argv = real_argv
+            for sig, handler in real_handlers.items():
+                signal.signal(sig, handler)
             for key, value in old.items():
                 if value is None:
                     os.environ.pop(key, None)
