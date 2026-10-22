@@ -207,28 +207,34 @@ pwd > "@RECORD@"
 
 
 class SelftestIsolationTest(TreeCase):
-    """#7919: observe WHERE ``selftest`` runs, not just that helpers exist."""
+    """#7919, #7925: observe WHERE every isolated mode runs, not just that helpers exist."""
 
-    def _fake_gate(self):
-        gate = self.root / FAKE_GATE
-        record = str(self.tmp / "record")
-        gate.write_text(FAKE_GATE_BODY.replace("@RECORD@", record))
+    def _script_for(self, mode):
+        """Path (relative to the tree) of the script ``mode`` executes."""
+        return {"selftest": FAKE_GATE, "interrupt": self.h.INTERRUPT_HARNESS}[mode]
+
+    def _fake_scripts(self, mode):
+        record = str(self.tmp / ("record-" + mode))
+        for rel in {FAKE_GATE, self._script_for(mode)}:
+            path = self.root / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(FAKE_GATE_BODY.replace("@RECORD@", record))
         git(self.root, "add", "-A")
-        git(self.root, "commit", "-q", "-m", "fake gate")
+        git(self.root, "commit", "-q", "-m", "fake scripts " + mode)
+        return Path(record)
 
     def _snapshot(self):
         return sorted(str(p.relative_to(self.root)) for p in self.root.rglob("*")
                       if p.is_file() and ".git" not in p.parts)
 
-    def observe_selftest(self):
-        """Run ``selftest`` through ``main`` on the census tree; return violations."""
-        self._fake_gate()
-        record = self.tmp / "record"
+    def observe(self, mode):
+        """Run ``mode`` through ``main`` on the census tree; return violations."""
+        record = self._fake_scripts(mode)
         before = self._snapshot()
-        rc = self.h.main(["selftest", "--root", str(self.root), "--gate", FAKE_GATE])
+        rc = self.h.main([mode, "--root", str(self.root), "--gate", FAKE_GATE])
         problems = []
         if rc != 0:
-            problems.append("selftest rc=%d" % rc)
+            problems.append("%s rc=%d" % (mode, rc))
         ran_in = Path(record.read_text().strip()).resolve()
         if ran_in == self.root.resolve():
             problems.append("self-test ran in the census checkout %s" % ran_in)
@@ -240,19 +246,30 @@ class SelftestIsolationTest(TreeCase):
             problems.append("census tree changed during the self-test")
         return problems
 
-    def test_selftest_never_touches_the_census_checkout(self):
-        self.assertEqual(self.observe_selftest(), [])
+    def test_every_isolated_mode_is_covered(self):
+        """A new isolated mode in the helper must get a script mapping here."""
+        for mode in self.h.ISOLATED_MODES:
+            self.assertTrue(self._script_for(mode), mode)
+
+    def test_modes_never_touch_the_census_checkout(self):
+        for mode in self.h.ISOLATED_MODES:
+            with self.subTest(mode=mode):
+                self.assertEqual(self.observe(mode), [])
 
     def test_in_place_helper_is_caught_by_the_observation(self):
-        """Red proof: a helper that runs the self-test in place must FAIL here."""
+        """Red proof: a helper that runs ANY mode in place must FAIL here."""
         def in_place(root, argv_for, tag):
             return subprocess.run(argv_for(Path(root)), cwd=str(root),
                                   check=False).returncode
 
-        self.h.run_isolated = in_place
-        problems = self.observe_selftest()
-        self.assertTrue(any("census checkout" in p for p in problems), problems)
-        self.assertTrue(any("probe files" in p for p in problems), problems)
+        for mode in self.h.ISOLATED_MODES:
+            with self.subTest(mode=mode):
+                self.h.run_isolated = in_place
+                problems = self.observe(mode)
+                self.assertTrue(any("ran in the census checkout" in p for p in problems),
+                                problems)
+                self.assertTrue(any("probe files" in p for p in problems), problems)
+                self.h = load()  # restore the real run_isolated
 
 
 if __name__ == "__main__":

@@ -40,6 +40,9 @@ EXIT_FAIL = 1
 EXIT_ENV = 2
 EXIT_FIXTURE = 3
 
+# Every sub-command main() dispatches; ISOLATED_MODES run in a private copy (#7925).
+ISOLATED_MODES = ("selftest", "interrupt")
+MODES = ("census",) + ISOLATED_MODES
 GATE = "scripts/check-test-env-lock.sh"
 INTERRUPT_HARNESS = "scripts/test/test-gate-selftest-interrupt-cleanup.sh"
 SELFTEST_DIR = Path(".local-runs") / "test-env-lock-selftest"
@@ -171,7 +174,7 @@ def run_isolated(root, argv_for, tag):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("command", choices=("census", "selftest", "interrupt"))
+    ap.add_argument("command", choices=MODES)
     ap.add_argument("--root", default=str(Path(__file__).resolve().parents[2]))
     ap.add_argument("--gate", default=GATE,
                     help="gate script relative to --root (the workflow names it so "
