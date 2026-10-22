@@ -225,6 +225,21 @@ const SWEEP_PREFIX_HEAD: &str = "ai_memory_4489s";
 /// Lowercase hex characters in the per-run suffix.
 const RUN_SUFFIX_HEX: usize = 8;
 
+/// Bits carried by one lowercase hex digit.
+const HEX_DIGIT_BITS: u32 = 4;
+
+/// Hex digits in a fully formatted `u64` tag; the suffix is its low digits, so the
+/// suffix width can never exceed it (#7916, rust-1-98 PERF-01).
+const TAG_HEX_WIDTH: usize = (u64::BITS / HEX_DIGIT_BITS) as usize;
+
+const _: () = assert!(RUN_SUFFIX_HEX <= TAG_HEX_WIDTH);
+
+/// Low `RUN_SUFFIX_HEX` hex digits of `tag`, zero padded; no shift, so it cannot overflow.
+fn run_suffix(tag: u64) -> String {
+    let full = format!("{tag:0TAG_HEX_WIDTH$x}");
+    full[TAG_HEX_WIDTH - RUN_SUFFIX_HEX..].to_owned()
+}
+
 /// Bound on the guard's own connect and drop, so an unreachable host cannot hang
 /// a panicking test for the OS TCP timeout.
 const FIXTURE_IO_BOUND: Duration = Duration::from_secs(20);
@@ -249,11 +264,22 @@ fn run_prefix() -> String {
     )
         .hash(&mut hasher);
     let tag = hasher.finish();
-    format!(
-        "{SWEEP_PREFIX_HEAD}{:0width$x}",
-        tag & ((1_u64 << (RUN_SUFFIX_HEX * 4)) - 1),
-        width = RUN_SUFFIX_HEX
-    )
+    format!("{SWEEP_PREFIX_HEAD}{}", run_suffix(tag))
+}
+
+/// #7916: the sliced suffix is byte-identical to the former masked-shift form.
+#[test]
+fn run_suffix_matches_former_mask_form_7916() {
+    for tag in [0_u64, 1, 0xdead_beef_cafe_f00d, u64::MAX, 0xab_cdef] {
+        let former = format!(
+            "{:0width$x}",
+            tag & ((1_u64 << (u32::try_from(RUN_SUFFIX_HEX).unwrap() * HEX_DIGIT_BITS)) - 1),
+            width = RUN_SUFFIX_HEX
+        );
+        assert_eq!(run_suffix(tag), former);
+        assert_eq!(run_suffix(tag).len(), RUN_SUFFIX_HEX);
+    }
+    assert_eq!(run_suffix(0xdead_beef_cafe_f00d), "cafef00d");
 }
 
 /// Drops every registered fixture database when it goes out of scope, including on
