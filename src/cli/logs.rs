@@ -284,42 +284,164 @@ fn emit_line(line: &str, filters: &Filters, out: &mut CliOutput<'_>) -> Result<(
     Ok(())
 }
 
-/// Followed-file cursor: the path being followed and the byte offset up to
-/// which every line has been printed.
+/// Followed-file cursor: the path being followed, the byte offset up to which
+/// every line has been printed, and (unix) the inode seen at that offset, so a
+/// rename-and-recreate of the same path is told apart from plain growth.
 struct FollowState {
     path: PathBuf,
     offset: u64,
+    id: Option<u64>,
+}
+
+/// Stable identity of the file behind `meta`: the inode on unix, `None` where
+/// the platform exposes none (size shrink still detects truncation there).
+#[cfg(unix)]
+fn file_id(meta: &fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some(meta.ino())
+}
+
+#[cfg(not(unix))]
+fn file_id(_meta: &fs::Metadata) -> Option<u64> {
+    None
+}
+
+/// Strip one trailing `\n` and one preceding `\r`, the same framing
+/// `BufRead::lines` applies.
+fn strip_line_end(raw: &str) -> &str {
+    let line = raw.strip_suffix('\n').unwrap_or(raw);
+    line.strip_suffix('\r').unwrap_or(line)
+}
+
+/// Add `read` bytes to `offset` with a checked conversion (PERF-02, PERF-07).
+fn advance_offset(offset: u64, read: usize) -> Result<u64> {
+    u64::try_from(read)
+        .ok()
+        .and_then(|r| offset.checked_add(r))
+        .ok_or_else(|| anyhow!("log offset overflow"))
 }
 
 /// Tail pass: read the last `n` matching lines of `path` and return them with
-/// the offset the follow phase starts from. `after_read` runs between the read
-/// and the offset capture (a no-op in production; tests append there to inject
-/// the race deterministically).
+/// the byte offset the follow phase must start from. The offset is the number
+/// of bytes this very read consumed (not a later `metadata` length), so every
+/// byte after it is printed by the follow phase exactly once (#7945).
+/// `after_read` runs after the read (a no-op in production; tests append there
+/// to inject the race deterministically).
 fn tail_then_offset_with(
     path: &Path,
     n: usize,
     filters: &Filters,
     after_read: impl FnOnce(),
-) -> Result<(Vec<String>, u64)> {
-    let initial = read_tail_n(path, n, filters)?;
+) -> Result<(Vec<String>, u64, Option<u64>)> {
+    let f = fs::File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
+    let id = f.metadata().ok().as_ref().and_then(file_id);
+    let mut reader = BufReader::new(f);
+    let mut keep: Vec<String> = Vec::with_capacity(n);
+    let mut offset: u64 = 0;
+    let mut raw = String::new();
+    loop {
+        raw.clear();
+        let read = reader.read_line(&mut raw)?;
+        if read == 0 {
+            break;
+        }
+        offset = advance_offset(offset, read)?;
+        let line = strip_line_end(&raw);
+        if !line_matches(line, filters) {
+            continue;
+        }
+        keep.push(line.to_string());
+        if keep.len() > n {
+            keep.remove(0);
+        }
+    }
     after_read();
-    let offset = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    Ok((initial, offset))
+    Ok((keep, offset, id))
 }
 
-/// Directory-aware follow entry. Base behaviour: follows `state.path` only.
-fn follow_dir(
-    _dir: &Path,
+/// Read the COMPLETE lines at or after `offset`; a trailing fragment without
+/// its newline is left for the next poll so no line is printed in two halves.
+/// Returns the lines and the offset just past the last line consumed.
+fn read_complete_lines_from(path: &Path, offset: u64) -> Result<(Vec<String>, u64)> {
+    use std::io::Seek as _;
+    use std::io::SeekFrom;
+    let mut f =
+        fs::File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
+    f.seek(SeekFrom::Start(offset))?;
+    let mut reader = BufReader::new(f);
+    let mut lines = Vec::new();
+    let mut end = offset;
+    let mut raw = String::new();
+    loop {
+        raw.clear();
+        let read = reader.read_line(&mut raw)?;
+        if read == 0 || !raw.ends_with('\n') {
+            break;
+        }
+        end = advance_offset(end, read)?;
+        lines.push(strip_line_end(&raw).to_string());
+    }
+    Ok((lines, end))
+}
+
+/// Print every complete line the followed file gained since `state.offset`.
+fn drain_followed(
     state: &mut FollowState,
     filters: &Filters,
-    args: &TailArgs,
     out: &mut CliOutput<'_>,
 ) -> Result<()> {
-    follow_from(state, filters, args, out)
+    let Ok(meta) = fs::metadata(&state.path) else {
+        return Ok(());
+    };
+    if meta.len() <= state.offset {
+        return Ok(());
+    }
+    let (lines, end) = read_complete_lines_from(&state.path, state.offset)?;
+    for line in lines {
+        if line_matches(&line, filters) {
+            emit_line(&line, filters, out)?;
+        }
+    }
+    state.offset = end;
+    Ok(())
+}
+
+/// One poll of `logs tail --follow`: handle rotation (a newer-named file, a
+/// new inode under the same name, or a shrunk file), then print new lines.
+fn follow_poll(
+    dir: &Path,
+    state: &mut FollowState,
+    filters: &Filters,
+    out: &mut CliOutput<'_>,
+) -> Result<()> {
+    let newest = enumerate_log_files(dir)?.pop();
+    if let Some(newest) = newest
+        && newest != state.path
+    {
+        // Rotation by name: finish the old file, then follow the new one from 0.
+        drain_followed(state, filters, out)?;
+        state.id = fs::metadata(&newest).ok().as_ref().and_then(file_id);
+        state.path = newest;
+        state.offset = 0;
+    } else if let Ok(meta) = fs::metadata(&state.path) {
+        let id = file_id(&meta);
+        let replaced = state.id.is_some() && id.is_some() && state.id != id;
+        if replaced || meta.len() < state.offset {
+            writeln!(
+                out.stderr,
+                "logs: {} was rotated or truncated; following from the start",
+                state.path.display()
+            )?;
+            state.offset = 0;
+        }
+        state.id = id;
+    }
+    drain_followed(state, filters, out)
 }
 
 /// Poll loop of `logs tail --follow`, resuming at `state.offset`.
 fn follow_from(
+    dir: &Path,
     state: &mut FollowState,
     filters: &Filters,
     args: &TailArgs,
@@ -329,18 +451,7 @@ fn follow_from(
     loop {
         std::thread::sleep(Duration::from_millis(args.follow_interval_ms));
         polls += 1;
-        let cur_size = fs::metadata(&state.path)
-            .map(|m| m.len())
-            .unwrap_or(state.offset);
-        if cur_size > state.offset {
-            let new_lines = read_lines_after_offset(&state.path, state.offset)?;
-            for line in new_lines {
-                if line_matches(&line, filters) {
-                    emit_line(&line, filters, out)?;
-                }
-            }
-            state.offset = cur_size;
-        }
+        follow_poll(dir, state, filters, out)?;
         if args.max_polls > 0 && polls >= args.max_polls {
             return Ok(());
         }
@@ -352,7 +463,7 @@ fn run_tail(dir: &Path, filters: &Filters, args: &TailArgs, out: &mut CliOutput<
     let Some(latest) = files.last().cloned() else {
         return Ok(());
     };
-    let (initial, offset) = tail_then_offset_with(&latest, args.lines, filters, || {})?;
+    let (initial, offset, id) = tail_then_offset_with(&latest, args.lines, filters, || {})?;
     for line in &initial {
         emit_line(line, filters, out)?;
     }
@@ -362,39 +473,9 @@ fn run_tail(dir: &Path, filters: &Filters, args: &TailArgs, out: &mut CliOutput<
     let mut state = FollowState {
         path: latest,
         offset,
+        id,
     };
-    follow_dir(dir, &mut state, filters, args, out)
-}
-
-fn read_tail_n(path: &Path, n: usize, filters: &Filters) -> Result<Vec<String>> {
-    let f = fs::File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
-    let buf = BufReader::new(f);
-    let mut keep: Vec<String> = Vec::with_capacity(n);
-    for line in buf.lines() {
-        let line = line?;
-        if !line_matches(&line, filters) {
-            continue;
-        }
-        keep.push(line);
-        if keep.len() > n {
-            keep.remove(0);
-        }
-    }
-    Ok(keep)
-}
-
-fn read_lines_after_offset(path: &Path, offset: u64) -> Result<Vec<String>> {
-    use std::io::Seek as _;
-    use std::io::SeekFrom;
-    let mut f =
-        fs::File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
-    f.seek(SeekFrom::Start(offset))?;
-    let buf = BufReader::new(f);
-    let mut out = Vec::new();
-    for line in buf.lines() {
-        out.push(line?);
-    }
-    Ok(out)
+    follow_from(dir, &mut state, filters, args, out)
 }
 
 /// Convert a file's mtime into a `DateTime<Utc>`, degrading to `None`
@@ -644,7 +725,7 @@ mod tests {
         let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
         {
             let mut out = output(&mut stdout, &mut stderr);
-            follow_dir(
+            follow_from(
                 dir,
                 state,
                 &Filters::default(),
@@ -663,7 +744,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\n");
         let filters = Filters::default();
-        let (initial, offset) = tail_then_offset_with(&path, 10, &filters, || {
+        let (initial, offset, id) = tail_then_offset_with(&path, 10, &filters, || {
             append(&path, "second\n");
         })
         .unwrap();
@@ -671,6 +752,7 @@ mod tests {
         let mut state = FollowState {
             path: path.clone(),
             offset,
+            id,
         };
         let s = follow_to_string(dir.path(), &mut state, 2);
         assert_eq!(s.matches("second").count(), 1, "got: {s:?}");
@@ -686,6 +768,7 @@ mod tests {
         let mut state = FollowState {
             path: a.clone(),
             offset: 6,
+            id: None,
         };
         append(&a, "late-a\n");
         let dir_path = dir.path().to_path_buf();
@@ -707,6 +790,7 @@ mod tests {
         let mut state = FollowState {
             path: a.clone(),
             offset: 10,
+            id: None,
         };
         let a2 = a.clone();
         let h = std::thread::spawn(move || {
@@ -727,6 +811,7 @@ mod tests {
         let mut state = FollowState {
             path: a.clone(),
             offset: 13,
+            id: None,
         };
         let dir_path = dir.path().to_path_buf();
         let h = std::thread::spawn(move || {

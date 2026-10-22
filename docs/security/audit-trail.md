@@ -606,7 +606,11 @@ ai-memory audit re-anchor
 
 ### `ai-memory logs tail [--follow]`
 
-Tail and (optionally) stream operational logs. Accepts the global
+Tail and (optionally) stream operational logs. `--follow` prints every
+line appended after the tail pass exactly once and survives log rotation:
+when a newer log file appears it drains the old one and continues with the
+new one, and a truncated or replaced (new inode) file is re-read from the
+start with a note on stderr. Accepts the global
 `--log-dir <PATH>` override. See the **Log directory resolution**
 section above for the full precedence ladder.
 
