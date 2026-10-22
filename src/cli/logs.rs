@@ -334,7 +334,7 @@ fn tail_then_offset_with(
     n: usize,
     filters: &Filters,
     after_read: impl FnOnce(),
-) -> Result<(Vec<String>, u64, Option<u64>)> {
+) -> Result<(Vec<String>, u64, Option<u64>, fs::File)> {
     let f = fs::File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
     let id = f.metadata().ok().as_ref().and_then(file_id);
     let mut reader = BufReader::new(f);
@@ -358,26 +358,30 @@ fn tail_then_offset_with(
         }
     }
     after_read();
-    Ok((keep, offset, id))
+    Ok((keep, offset, id, reader.into_inner()))
 }
 
-/// Read the COMPLETE lines at or after `offset`; a trailing fragment without
-/// its newline is left for the next poll so no line is printed in two halves.
-/// Returns the lines and the offset just past the last line consumed.
-fn read_complete_lines_from(path: &Path, offset: u64) -> Result<(Vec<String>, u64)> {
+/// Read the lines at or after `offset` from an open handle. A trailing
+/// fragment without its newline is left for the next poll so no line is printed
+/// in two halves, unless `flush_tail` is set (the file is being abandoned, so
+/// no newline will ever follow). Returns the lines and the offset just past the
+/// last byte consumed.
+fn read_lines_from_handle(
+    file: &mut fs::File,
+    offset: u64,
+    flush_tail: bool,
+) -> Result<(Vec<String>, u64)> {
     use std::io::Seek as _;
     use std::io::SeekFrom;
-    let mut f =
-        fs::File::open(path).with_context(|| crate::errors::msg::opening(path.display()))?;
-    f.seek(SeekFrom::Start(offset))?;
-    let mut reader = BufReader::new(f);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut reader = BufReader::new(file);
     let mut lines = Vec::new();
     let mut end = offset;
     let mut raw = String::new();
     loop {
         raw.clear();
         let read = reader.read_line(&mut raw)?;
-        if read == 0 || !raw.ends_with('\n') {
+        if read == 0 || (!raw.ends_with('\n') && !flush_tail) {
             break;
         }
         end = advance_offset(end, read)?;
@@ -386,19 +390,36 @@ fn read_complete_lines_from(path: &Path, offset: u64) -> Result<(Vec<String>, u6
     Ok((lines, end))
 }
 
-/// Print every complete line the followed file gained since `state.offset`.
+/// Open `path` as the followed handle.
+fn open_followed(path: &Path) -> Result<fs::File> {
+    fs::File::open(path).with_context(|| crate::errors::msg::opening(path.display()))
+}
+
+/// Print every line the followed file gained since `state.offset`, reading the
+/// OPEN handle (it stays valid after the path is renamed away, #7950). With
+/// `flush_tail` an unterminated final fragment is printed too.
 fn drain_followed(
     state: &mut FollowState,
     filters: &Filters,
     out: &mut CliOutput<'_>,
+    flush_tail: bool,
 ) -> Result<()> {
-    let Ok(meta) = fs::metadata(&state.path) else {
+    if state.file.is_none() {
+        let Ok(file) = open_followed(&state.path) else {
+            return Ok(());
+        };
+        state.file = Some(file);
+    }
+    let Some(file) = state.file.as_mut() else {
+        return Ok(());
+    };
+    let Ok(meta) = file.metadata() else {
         return Ok(());
     };
     if meta.len() <= state.offset {
         return Ok(());
     }
-    let (lines, end) = read_complete_lines_from(&state.path, state.offset)?;
+    let (lines, end) = read_lines_from_handle(file, state.offset, flush_tail)?;
     for line in lines {
         if line_matches(&line, filters) {
             emit_line(&line, filters, out)?;
@@ -408,8 +429,22 @@ fn drain_followed(
     Ok(())
 }
 
+/// Switch the cursor to `path` at offset 0 with a fresh handle.
+fn switch_to(state: &mut FollowState, path: PathBuf) {
+    let file = open_followed(&path).ok();
+    state.id = file
+        .as_ref()
+        .and_then(|f| f.metadata().ok())
+        .as_ref()
+        .and_then(file_id);
+    state.file = file;
+    state.path = path;
+    state.offset = 0;
+}
+
 /// One poll of `logs tail --follow`: handle rotation (a newer-named file, a
-/// new inode under the same name, or a shrunk file), then print new lines.
+/// new inode under the same name, or a shrunk file), then print new lines. The
+/// old handle is always read to EOF before the cursor moves to a new file.
 fn follow_poll(
     dir: &Path,
     state: &mut FollowState,
@@ -421,14 +456,23 @@ fn follow_poll(
         && newest != state.path
     {
         // Rotation by name: finish the old file, then follow the new one from 0.
-        drain_followed(state, filters, out)?;
-        state.id = fs::metadata(&newest).ok().as_ref().and_then(file_id);
-        state.path = newest;
-        state.offset = 0;
+        drain_followed(state, filters, out, true)?;
+        switch_to(state, newest);
     } else if let Ok(meta) = fs::metadata(&state.path) {
         let id = file_id(&meta);
         let replaced = state.id.is_some() && id.is_some() && state.id != id;
-        if replaced || meta.len() < state.offset {
+        if replaced {
+            // Rename-and-recreate: the writer may still have appended to the
+            // renamed file, which only the old handle can reach.
+            drain_followed(state, filters, out, true)?;
+            writeln!(
+                out.stderr,
+                "logs: {} was rotated or truncated; following from the start",
+                state.path.display()
+            )?;
+            let path = state.path.clone();
+            switch_to(state, path);
+        } else if meta.len() < state.offset {
             writeln!(
                 out.stderr,
                 "logs: {} was rotated or truncated; following from the start",
@@ -436,9 +480,11 @@ fn follow_poll(
             )?;
             state.offset = 0;
         }
-        state.id = id;
+        if state.id.is_none() {
+            state.id = id;
+        }
     }
-    drain_followed(state, filters, out)
+    drain_followed(state, filters, out, false)
 }
 
 /// Poll loop of `logs tail --follow`, resuming at `state.offset`.
@@ -465,7 +511,7 @@ fn run_tail(dir: &Path, filters: &Filters, args: &TailArgs, out: &mut CliOutput<
     let Some(latest) = files.last().cloned() else {
         return Ok(());
     };
-    let (initial, offset, id) = tail_then_offset_with(&latest, args.lines, filters, || {})?;
+    let (initial, offset, id, file) = tail_then_offset_with(&latest, args.lines, filters, || {})?;
     for line in &initial {
         emit_line(line, filters, out)?;
     }
@@ -476,7 +522,7 @@ fn run_tail(dir: &Path, filters: &Filters, args: &TailArgs, out: &mut CliOutput<
         path: latest,
         offset,
         id,
-        file: None,
+        file: Some(file),
     };
     follow_from(dir, &mut state, filters, args, out)
 }
@@ -747,7 +793,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = make_log(dir.path(), "ai-memory.log.2026-04-30", "first\n");
         let filters = Filters::default();
-        let (initial, offset, id) = tail_then_offset_with(&path, 10, &filters, || {
+        let (initial, offset, id, file) = tail_then_offset_with(&path, 10, &filters, || {
             append(&path, "second\n");
         })
         .unwrap();
@@ -756,7 +802,7 @@ mod tests {
             path: path.clone(),
             offset,
             id,
-            file: None,
+            file: Some(file),
         };
         let s = follow_to_string(dir.path(), &mut state, 2);
         assert_eq!(s.matches("second").count(), 1, "got: {s:?}");
