@@ -74,6 +74,12 @@ DEFAULT_QUOTA_BYTES = 10_737_418_240
 # mesh, W = ceil((N+1)/2) above that. Passing this rather than a constant
 # means the ramp measures the CONFIGURATION THE DOCS PRESCRIBE at each
 # mesh size, not an artificially cheap one.
+KEY_SIDECAR_NAME = "api-key"
+KEY_SIDECAR_MODE = 0o600
+FILE_MODE_MASK = 0o777
+SIDECAR_TEST_KEY = "test-key-placeholder"
+
+
 def quorum_width(n_nodes: int) -> int:
     if n_nodes <= 3:
         return 2
@@ -335,11 +341,17 @@ def generate(n_nodes: int, run_dir: str, binary: str, catchup_secs: int,
         json.dump(manifest, fh, indent=2)
     # The API key is a run secret: it goes to a mode-0600 sidecar the
     # ramp driver reads, NEVER into the manifest that lands in evidence.
-    key_path = os.path.join(run_dir, "api-key")
+    write_key_sidecar(run_dir, api_key)
+    return manifest
+
+
+def write_key_sidecar(run_dir: str, api_key: str) -> str:
+    """Write the run's API key to `<run_dir>/api-key` and return its path."""
+    key_path = os.path.join(run_dir, KEY_SIDECAR_NAME)
     with open(key_path, "w", encoding="utf-8") as fh:
         fh.write(api_key)
     os.chmod(key_path, 0o600)
-    return manifest
+    return key_path
 
 
 def self_test() -> int:
@@ -383,6 +395,25 @@ def self_test() -> int:
                      if not ln.lstrip().startswith("#"))
     check(".priv" not in code,
           "cross-enrollment code must never reference a .priv file")
+
+    # The key sidecar is created exclusively at mode 0600 (#7891): the mode is
+    # set at creation, and a second create must refuse rather than reuse.
+    scratch_root = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        ".local-runs")
+    os.makedirs(scratch_root, exist_ok=True)
+    scratch = tempfile.mkdtemp(prefix="gen-mesh-sidecar-", dir=scratch_root)
+    try:
+        sidecar = write_key_sidecar(scratch, SIDECAR_TEST_KEY)
+        check(os.stat(sidecar).st_mode & FILE_MODE_MASK == KEY_SIDECAR_MODE,
+              "key sidecar must be mode 0600")
+        try:
+            write_key_sidecar(scratch, SIDECAR_TEST_KEY)
+            check(False, "second sidecar create must raise FileExistsError")
+        except FileExistsError:
+            pass
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
     with tempfile.TemporaryDirectory() as td:
         check(os.path.isdir(td), "tempdir sanity")
