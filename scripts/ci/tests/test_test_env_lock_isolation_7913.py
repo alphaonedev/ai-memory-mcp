@@ -197,6 +197,42 @@ class SignalCleanupTest(TreeCase):
         self._interrupt(signal.SIGINT)
 
 
+class ParentRmdirNoteTest(TreeCase):
+    """#7930: a failed parent.rmdir() is noted on stderr, never swallowed or masking."""
+
+    def _run_with_sibling(self):
+        def runner(copy):
+            (copy.parent / "sibling-run").mkdir()  # another run still uses the parent
+            return ["bash", "-c", "exit 7"]
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = self.h.run_isolated(self.root, runner, "rmdircase")
+        return rc, err.getvalue()
+
+    def test_nonempty_parent_is_noted_and_keeps_the_exit_code(self):
+        rc, note = self._run_with_sibling()
+        self.assertEqual(rc, 7)
+        self.assertIn("NOTE:", note)
+        self.assertIn(str(self.root / self.h.SELFTEST_DIR), note)
+        self.assertIn("errno %d" % errno.ENOTEMPTY, note)
+        self._other_errors_are_not_swallowed()
+
+    def _other_errors_are_not_swallowed(self):
+        real = Path.rmdir
+
+        def denied(path):
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES))
+
+        Path.rmdir = denied
+        self.addCleanup(setattr, Path, "rmdir", real)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(PermissionError):
+                self.h.run_isolated(self.root, lambda copy: ["true"], "denycase")
+        self.assertIn("errno %d" % errno.EACCES, err.getvalue())
+
+
 class KillGroupFailureTest(unittest.TestCase):
     """#7926: a failed killpg is recorded on stderr, never swallowed or masking."""
 

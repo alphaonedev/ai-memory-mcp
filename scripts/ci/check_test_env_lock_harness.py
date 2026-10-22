@@ -27,6 +27,7 @@ error, 3 a self-test fixture is present in the census tree.
 """
 
 import argparse
+import errno
 import fnmatch
 import os
 from pathlib import Path
@@ -176,8 +177,11 @@ def run_isolated(root, argv_for, tag):
         shutil.rmtree(str(copy), ignore_errors=True)
         try:
             parent.rmdir()  # only when no sibling run still uses it
-        except OSError:
-            pass
+        except OSError as err:
+            _stderr_note("could not remove %s: errno %s (%s)"
+                         % (parent, err.errno, err.strerror))
+            if err.errno != errno.ENOTEMPTY:
+                raise
 
 
 def main(argv=None):
