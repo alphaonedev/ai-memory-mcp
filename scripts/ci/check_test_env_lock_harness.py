@@ -172,6 +172,8 @@ def run_isolated(root, argv_for, tag):
         make_copy(root, copy)
         return _run_child(argv_for(copy), str(copy))
     finally:
+        # An interrupt or exception already propagating keeps its exit code (#7933).
+        in_flight = sys.exc_info()[1]
         for sig, handler in previous.items():
             signal.signal(sig, handler)
         shutil.rmtree(str(copy), ignore_errors=True)
@@ -180,7 +182,7 @@ def run_isolated(root, argv_for, tag):
         except OSError as err:
             _stderr_note("could not remove %s: errno %s (%s)"
                          % (parent, err.errno, err.strerror))
-            if err.errno != errno.ENOTEMPTY:
+            if err.errno != errno.ENOTEMPTY and in_flight is None:
                 raise
 
 

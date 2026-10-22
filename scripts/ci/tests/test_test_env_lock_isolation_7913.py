@@ -233,6 +233,29 @@ class ParentRmdirNoteTest(TreeCase):
         self.assertIn("errno %d" % errno.EACCES, err.getvalue())
 
 
+class InterruptBeatsRmdirFailureTest(TreeCase):
+    """#7933: an interrupt (143) is never replaced by a failed parent.rmdir()."""
+
+    def test_interrupt_exit_code_wins_over_a_non_enotempty_rmdir_failure(self):
+        real = Path.rmdir
+
+        def denied(path):
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES))
+
+        def interrupted(copy):
+            raise self.h.Interrupted(143)
+
+        Path.rmdir = denied
+        self.addCleanup(setattr, Path, "rmdir", real)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as ctx:
+                self.h.run_isolated(self.root, interrupted, "intcase")
+        self.assertEqual(ctx.exception.code, 143)
+        self.assertIn("NOTE:", err.getvalue())
+        self.assertIn("errno %d" % errno.EACCES, err.getvalue())
+
+
 class KillGroupFailureTest(unittest.TestCase):
     """#7926: a failed killpg is recorded on stderr, never swallowed or masking."""
 
