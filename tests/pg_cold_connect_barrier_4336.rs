@@ -213,11 +213,24 @@ async fn stale_scratch_database_is_swept_and_lookalikes_are_kept_4489() {
         );
         return;
     };
-    // A prefix of its own so this cell never races the cold-backend cell's sweep.
-    let prefix = "ai_memory_4489sweep";
+    sweep_cycle_4489(&url, &run_prefix(), false).await;
+}
+
+/// The fixed prefix every run used before #7904.
+const LEGACY_SWEEP_PREFIX: &str = "ai_memory_4489sweep";
+
+/// Prefix of this run's fixture databases (#7904).
+fn run_prefix() -> String {
+    LEGACY_SWEEP_PREFIX.to_string()
+}
+
+/// One full fixture cycle: create the stale, fresh and lookalike databases under
+/// `prefix`, sweep, assert, drop. `panic_after_create` plants a panic between the
+/// first CREATE and the DROP loop (the #7904 failure mode).
+async fn sweep_cycle_4489(url: &str, prefix: &str, panic_after_create: bool) {
     let admin = PgPoolOptions::new()
         .max_connections(1)
-        .connect(&url)
+        .connect(url)
         .await
         .expect("connect admin pool");
     let now = pg_barrier::server_unix(&admin).await.expect("server clock");
@@ -249,6 +262,10 @@ async fn stale_scratch_database_is_swept_and_lookalikes_are_kept_4489() {
             .await
             .unwrap_or_else(|e| panic!("create fixture database {db:?}: {e}"));
     }
+    assert!(
+        !panic_after_create,
+        "planted panic between CREATE and DROP (#7904)"
+    );
     let swept = pg_barrier::sweep_stale_scratch_dbs(&admin, prefix, now).await;
     let exists = |db: String| {
         let admin = admin.clone();
@@ -299,6 +316,51 @@ async fn stale_scratch_database_is_swept_and_lookalikes_are_kept_4489() {
         "lookalike names must never be dropped: {dropped_lookalikes:?}"
     );
     assert!(!injected, "a catalog name must never be run as SQL");
+}
+
+async fn leftover_fixture_dbs(url: &str, prefix: &str) -> Vec<String> {
+    let admin = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(url)
+        .await
+        .expect("connect admin pool");
+    let left: Vec<String> =
+        sqlx::query_scalar("SELECT datname::text FROM pg_database WHERE starts_with(datname, $1)")
+            .bind(prefix)
+            .fetch_all(&admin)
+            .await
+            .expect("catalog listing");
+    admin.close().await;
+    left
+}
+
+/// #7904: a run that panics between the first CREATE and the DROP loop must leave
+/// nothing behind, and two runs (concurrent or consecutive) must not collide.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "live postgres: AI_MEMORY_TEST_POSTGRES_URL (postgres-ignored tier)"]
+async fn fixture_cycles_do_not_collide_and_panic_leaves_nothing_7904() {
+    let Ok(url) = std::env::var("AI_MEMORY_TEST_POSTGRES_URL") else {
+        eprintln!(
+            "skip: AI_MEMORY_TEST_POSTGRES_URL not set (fixture_cycles_do_not_collide_and_panic_leaves_nothing_7904)"
+        );
+        return;
+    };
+    let panic_prefix = run_prefix();
+    let (u, pp) = (url.clone(), panic_prefix.clone());
+    let joined = tokio::spawn(async move { sweep_cycle_4489(&u, &pp, true).await }).await;
+    assert!(joined.is_err(), "the planted panic must unwind the cycle");
+    let left = leftover_fixture_dbs(&url, &panic_prefix).await;
+    assert!(
+        left.is_empty(),
+        "a panicking cycle must drop every fixture database: {left:?}"
+    );
+    let (pa, pb) = (run_prefix(), run_prefix());
+    assert_ne!(pa, pb, "two runs must not share a fixture prefix");
+    let (ua, ub) = (url.clone(), url.clone());
+    let a = tokio::spawn(async move { sweep_cycle_4489(&ua, &pa, false).await });
+    let b = tokio::spawn(async move { sweep_cycle_4489(&ub, &pb, false).await });
+    let (ra, rb) = tokio::join!(a, b);
+    assert!(ra.is_ok() && rb.is_ok(), "concurrent cycles must both pass");
 }
 
 #[test]
