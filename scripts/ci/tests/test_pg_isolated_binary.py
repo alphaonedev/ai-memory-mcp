@@ -2180,6 +2180,21 @@ class Termination(unittest.TestCase):
         self.assertIn('4242', err.getvalue())
         self.assertIn('SIGTERM', err.getvalue())
 
+    def test_signal_children_broken_stderr_keeps_signalling_7915(self):
+        r = runner(width=1)
+        r._children[4242] = object()
+        r._children[4243] = object()
+
+        class BrokenStderr:
+            def write(self, text):
+                raise BrokenPipeError(32, 'broken pipe')
+
+        with unittest.mock.patch.object(pib.os, 'killpg', side_effect=PermissionError(1, 'denied')) as kp, \
+                unittest.mock.patch.object(pib.sys, 'stderr', BrokenStderr()):
+            r._signal_children(signal.SIGTERM)
+        self.assertEqual(kp.call_count, 2, 'a dead stderr must not skip the remaining children')
+        self.assertEqual([c.args[0] for c in kp.call_args_list], [4242, 4243])
+
     def test_signal_children_process_lookup_error_is_silent_7892(self):
         r = runner(width=1)
         r._children[4242] = object()

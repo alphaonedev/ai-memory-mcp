@@ -1012,6 +1012,14 @@ def _tail(path: Path, lines: int) -> List[str]:
         return ['(could not read %s: %s)' % (path, exc)]
 
 
+def _stderr_note(text: str) -> None:
+    """Best-effort stderr line: a closed stderr must not stop the signal loop (#7915)."""
+    try:
+        sys.stderr.write(text)
+    except (OSError, ValueError):
+        return
+
+
 class Runner:
     """Runs binaries against held clones; ``terminate`` stops everything."""
 
@@ -1050,8 +1058,8 @@ class Runner:
                 continue  # the group already exited: nothing to signal
             except PermissionError as exc:
                 # A group the wrapper may not signal can leak: say so (#7892).
-                sys.stderr.write("pg_isolated_binary: cannot signal child group %d with %s: %s\n"
-                                 % (pid, signal.Signals(sig).name, exc.strerror or exc))
+                _stderr_note("pg_isolated_binary: cannot signal child group %d with %s: %s\n"
+                             % (pid, signal.Signals(sig).name, exc.strerror or exc))
 
     def _spawn(self, argv: List[str], env: Dict[str, str], out: IO[str]) -> 'subprocess.Popen[str]':
         with self._lock:
