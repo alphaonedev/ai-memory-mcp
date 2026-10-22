@@ -2,7 +2,6 @@
 """#7913: the Test-env HOME-lock gate census is isolated from its self-tests."""
 
 import importlib.util
-import os
 from pathlib import Path
 import shutil
 import subprocess
