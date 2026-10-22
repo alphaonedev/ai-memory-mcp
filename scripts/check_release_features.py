@@ -1227,15 +1227,38 @@ USES_PINNED_RE = re.compile(r"\./[A-Za-z0-9_./-]+|docker://[a-z0-9][a-z0-9_./:-]
                             r"|[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_./-]+@[0-9a-f]{40}")
 
 
+def uses_where(doc: Node, path: Tuple[str, ...]) -> str:
+    """#8021: the job and the step a `uses:` at ``path`` belongs to (never only a line number)."""
+    if len(path) >= 2 and path[0] == "jobs":
+        where = f"job `{path[1]}`"
+        if len(path) >= 5 and path[2] == "steps" and path[3].isdigit():
+            where += f" step {path[3]}"
+            jobs = doc.get("jobs")
+            job = jobs.get(path[1]) if jobs is not None else None
+            steps = job.get("steps") if job is not None else None
+            if steps is not None and steps.kind == "seq" and isinstance(steps.value, list):
+                idx = int(path[3])
+                step = steps.value[idx] if idx < len(steps.value) else None
+                label = step.get("name") if step is not None else None
+                if label is not None and label.kind == "scalar":
+                    where += f" ({label.text().strip()[:50]})"
+        return where
+    return "path `" + ".".join(path) + "`"
+
+
 def check_uses_pinned(doc: Node, name: str, rep: Report) -> None:
-    """#6904: every `uses:` of every job and step is pinned (USES_PINNED_RE)."""
+    """#6904: every `uses:` of every job and step is pinned (USES_PINNED_RE).
+
+    Called for release.yml, release-shape.yml, c8-precheck.yml and
+    publish-ci-image.yml (#8002, #8020): each refusal names the job and step."""
     for path, node in walk(doc):
         if not path or path[-1] != "uses":
             continue
         ref = node.text().strip()
         if node.kind != "scalar" or not USES_PINNED_RE.fullmatch(ref):
-            rep.bad(f"{name}: line {node.line + 1}: `uses: {ref[:70]}` is not pinned to a full 40-hex commit sha "
-                    "(#6904: a tag, branch or short ref can be re-pointed)" + pin_hint("USES_PINNED_RE"))
+            rep.bad(f"{name}: {uses_where(doc, path)}: line {node.line + 1}: `uses: {ref[:70]}` is not pinned to a "
+                    "full 40-hex commit sha (#6904: a tag, branch or short ref can be re-pointed)"
+                    + pin_hint("USES_PINNED_RE"))
 
 
 def check_release_yml(text: str, rep: Report) -> None:
@@ -1478,6 +1501,8 @@ def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], s
     feat = load(root / "scripts" / "release-features.sh", "scripts/release-features.sh", rep, False)
     rel = load(root / ".github" / "workflows" / "release.yml", ".github/workflows/release.yml", rep, True)
     shape = load(root / ".github" / "workflows" / "release-shape.yml", ".github/workflows/release-shape.yml (no release-shaped proof)", rep, True)
+    c8 = load(root / ".github" / "workflows" / "c8-precheck.yml", ".github/workflows/c8-precheck.yml (#8002)", rep, True)
+    publish = load(root / ".github" / "workflows" / "publish-ci-image.yml", ".github/workflows/publish-ci-image.yml (#8020)", rep, True)
     docker = load(root / "Dockerfile", "Dockerfile", rep, True)
     install = load(root / "docs" / "INSTALL.md", "docs/INSTALL.md", rep, False)
 
@@ -1502,6 +1527,11 @@ def run_guard(root: Path, advisory: Optional[bool] = None) -> Tuple[List[str], s
         check_release_yml(rel, rep)
     if docker is not None:
         check_dockerfile(docker, rep)
+    for wf_name, wf_text in (("c8-precheck.yml", c8), ("publish-ci-image.yml", publish)):
+        if wf_text is not None:
+            wf_doc = parse_yaml(wf_text, wf_name, rep)
+            if wf_doc is not None:
+                check_uses_pinned(wf_doc, wf_name, rep)
     if shape is not None:
         check_shape(shape, rep, advisory)
     if install is not None:
@@ -1517,7 +1547,9 @@ SHAPE = ".github/workflows/release-shape.yml"
 DOCKER = "Dockerfile"
 INSTALL = "docs/INSTALL.md"
 DECL = "scripts/release-features.sh"
-INPUT_FILES = (REL, SHAPE, DOCKER, INSTALL, DECL)
+C8 = ".github/workflows/c8-precheck.yml"
+PUBLISH = ".github/workflows/publish-ci-image.yml"
+INPUT_FILES = (REL, SHAPE, C8, PUBLISH, DOCKER, INSTALL, DECL)
 
 
 def mutate_file(path: Path, old: str, new: Union[str, None, Transform], every: bool = False) -> None:
@@ -1741,6 +1773,35 @@ def _docker_steps_scalar(text: str) -> str:
     a, c = text.index("\n  docker:\n"), text.index("\n  copr:\n")
     s = text.index("    steps:\n", a)
     return text[:s] + "    steps: none\n" + text[c:]
+
+
+def _job_edit(job: str, fn: Callable[[str], str]) -> Transform:
+    """A Transform that rewrites only the body of workflow job ``job`` (#8023 cells)."""
+    def go(text: str) -> str:
+        m = re.search(r"(?m)^  " + re.escape(job) + r":\n(?:(?!^  [A-Za-z0-9_-]+:\n).*\n?)*", text)
+        if m is None:
+            raise InputError(f"self-test: job {job} not found")
+        return text[:m.start()] + fn(m.group(0)) + text[m.end():]
+    return go
+
+
+_SHA_USES_RE = re.compile(r"(uses:\s*[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+@)[0-9a-f]{40}")
+
+
+def _first_use_to_tag(text: str) -> str:
+    """Repoint the first pinned `uses:` of a workflow to the mutable tag v4 (#6904)."""
+    return _SHA_USES_RE.sub(r"\g<1>v4", text, count=1)
+
+
+def _shape_scalar_step(text: str) -> str:
+    return text.rstrip("\n") + "\n      - just-a-scalar\n"
+
+
+def _shape_swap_guard_build(text: str) -> str:
+    a = text.index("      - name: Release feature declaration guard\n")
+    b = text.index("      - name: Build release binary")
+    c = text.index("      - name: No OpenSSL")
+    return text[:a] + text[b:c] + text[a:b] + text[c:]
 
 
 def _shape(old: str, new: Union[str, Transform]) -> Edit:
@@ -1972,6 +2033,23 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "L1 Dockerfile is missing": ("fail", [(DOCKER, "", None, False)]),
     "L1 release-shape.yml is missing": ("fail", [(SHAPE, "", None, False)]),
     "L1 docs/INSTALL.md is missing": ("fail", [(INSTALL, "", None, False)]),
+    "L1 c8-precheck.yml is missing": ("fail", [(C8, "", None, False)]),
+    "L1 publish-ci-image.yml is missing": ("fail", [(PUBLISH, "", None, False)]),
+    # Round-2 cells (#8023): one per refusal site the #6289 / #6290 / #6904 / #8002 / #8020 fixes add.
+    "N1 root job preflight gains needs is refused": ("fail", [
+        _rel("", _job_edit("preflight", lambda b: b.replace("  preflight:\n", "  preflight:\n    needs: qualify\n", 1)))]),
+    "N2 homebrew needs drops release is refused": ("fail", [
+        _rel("", _job_edit("homebrew", lambda b: b.replace("needs: [preflight, qualify, release]", "needs: [preflight, qualify]", 1)))]),
+    "N3 release.yml uses repointed to a tag is refused": ("fail", [_rel("", _first_use_to_tag)]),
+    "N4 release-shape.yml uses repointed to a tag is refused": ("fail", [(SHAPE, "", _first_use_to_tag, False)]),
+    "N5 c8-precheck.yml uses repointed to a tag is refused": ("fail", [(C8, "", _first_use_to_tag, False)]),
+    "N6 publish-ci-image.yml uses repointed to a tag is refused": ("fail", [(PUBLISH, "", _first_use_to_tag, False)]),
+    "N7 release-shape holds a non-mapping step is refused": ("fail", [(SHAPE, "", _shape_scalar_step, False)]),
+    "N8 release-shape step appended is refused": ("fail", [
+        (SHAPE, "", lambda x: x.rstrip("\n") + "\n\n      - name: x\n        run: echo\n", False)]),
+    "N10 release-shape guard step gains if: false is refused": ("fail", [
+        _shape("      - name: Release feature declaration guard\n",
+               "      - name: Release feature declaration guard\n        if: false\n")]),
     # --- control characters: Python and bash disagree on what a line is
     "control character: CR line ends in release.yml": ("fail", [_rel(REL_ASSERT, REL_ASSERT + "\r")]),
     "control character: form feed in the Dockerfile": ("fail", [(DOCKER, DOCKER_ASSERT, DOCKER_ASSERT + "\x0c# x", False)]),
@@ -2236,6 +2314,12 @@ MESSAGE_CASES: Dict[str, Tuple[List[Edit], int, str]] = {
                                            "update IMAGE_BUILD_USES in scripts/check_release_features.py"),
     "message: a tag added names DOCKER_STEPS": ([_rel(PUSH_TAGS, PUSH_TAGS + "            ghcr.io/o/ai-memory:x\n")], 1,
                                                 "update DOCKER_STEPS in scripts/check_release_features.py"),
+    "message: swapped guard and build steps name the unit slot": ([(SHAPE, "", _shape_swap_guard_build, False)], 2,
+                                                                  "keys differ from the pinned set"),
+    "message: a non-mapping step is refused twice (kind, then the pinned list)": ([(SHAPE, "", _shape_scalar_step, False)], 2,
+                                                                                  "must be a mapping"),
+    "message: tag-pinned uses names the job and step": ([(PUBLISH, "", _first_use_to_tag, False)], 1,
+                                                        "job `publish-ci-image` step 0"),
     "message: build unit drift names WF_BUILD": ([_rel(REL_BUILD_CMD, REL_BUILD_CMD + " --verbose")], 2,
                                                  "update WF_BUILD in scripts/check_release_features.py"),
 }
@@ -2278,6 +2362,8 @@ ENTRY_CASES: Dict[str, Tuple[Callable[[Path], None], int]] = {
     "entry: release-shape.yml is a directory exits 2": (_entry_dir(SHAPE), 2),
     "entry: INSTALL.md is a directory exits 2": (_entry_dir(INSTALL), 2),
     "entry: release-features.sh is a directory exits 2": (_entry_dir(DECL), 2),
+    "entry: c8-precheck.yml is a directory exits 2": (_entry_dir(C8), 2),
+    "entry: publish-ci-image.yml is a directory exits 2": (_entry_dir(PUBLISH), 2),
     "entry: dangling release.yml symlink is a guard failure (1)": (_entry_dangling(REL), 1),
 }
 

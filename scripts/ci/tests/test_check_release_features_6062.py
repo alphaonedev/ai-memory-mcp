@@ -394,7 +394,7 @@ NEW_CELLS = (
     "N4 release-shape.yml uses repointed to a tag is refused",
     "N5 c8-precheck.yml uses repointed to a tag is refused",
     "N6 publish-ci-image.yml uses repointed to a tag is refused",
-    "N7 release-shape steps is a scalar is refused",
+    "N7 release-shape holds a non-mapping step is refused",
     "N8 release-shape step appended is refused",
     "N10 release-shape guard step gains if: false is refused",
 )
