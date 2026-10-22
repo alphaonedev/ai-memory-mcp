@@ -133,6 +133,7 @@ ENV_SHA_RE = re.compile(r"[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?")
 # merge-base, diff, show and rev-list had it since 2.24. The floor is the
 # newest of those, because the gate calls `rev-parse --verify` throughout.
 MIN_GIT_VERSION = (2, 30)
+REGULAR_FILE_MODES = ("100644", "100755")  # ls-tree modes read_blob accepts as a file
 
 # POSIX [[:space:]] spelled out so a Unicode space cannot widen the match.
 _S = r"[ \t\r\n\f\v]"
@@ -290,6 +291,35 @@ def wire_drift(repo, frm, to):
     return out
 
 
+def read_blob(repo, tree, path):
+    """The bytes of the regular file PATH at TREE, or None when PATH is provably absent
+    there (#6977). Fail-closed: `git ls-tree` exiting 0 with empty output is the ONLY
+    proof of absence. Any git failure (unresolvable tree, missing or corrupt object,
+    timeout), a non-file entry (directory, symlink, submodule) or an unreadable blob
+    raises GateError, so a read error can never be mistaken for a missing file."""
+    listed = run_git(repo, "ls-tree", "-z", "--full-tree", "--end-of-options", tree, path)
+    if listed.returncode != 0:
+        err = listed.stderr.decode("utf-8", "replace").strip()
+        raise GateError(f"git ls-tree {tree} {path} exited {listed.returncode}: {err}")
+    entries = [e for e in listed.stdout.split(b"\0") if e]
+    if not entries:
+        return None
+    if len(entries) != 1:
+        raise GateError(f"git ls-tree {tree} {path} listed {len(entries)} entries, expected one")
+    meta, _, name = entries[0].partition(b"\t")
+    fields = meta.decode("ascii", "replace").split(" ")
+    if len(fields) != 3 or name.decode("utf-8", "replace") != path:
+        raise GateError(f"git ls-tree {tree} {path} returned an unparseable entry")
+    mode, kind, sha = fields
+    if kind != "blob" or mode not in REGULAR_FILE_MODES:
+        raise GateError(f"{path} at {tree} is a {kind} (mode {mode}), not a regular file")
+    blob = run_git(repo, "cat-file", "blob", sha)
+    if blob.returncode != 0:
+        err = blob.stderr.decode("utf-8", "replace").strip()
+        raise GateError(f"git cat-file blob {sha} ({path} at {tree}) exited {blob.returncode}: {err}")
+    return blob.stdout
+
+
 def cert_banner(repo, tree):
     """(STATUS, BINDS) of the cert doc at TREE.
 
@@ -299,10 +329,10 @@ def cert_banner(repo, tree):
     BINDS: the lowercase 40-hex bound SHA, "-" when no Binds-to line matches,
     "DUPLICATE" when two or more do.
     """
-    proc = run_git(repo, "show", "--end-of-options", f"{tree}:{CERT_DOC}")
-    if proc.returncode != 0:
+    blob = read_blob(repo, tree, CERT_DOC)
+    if blob is None:
         return ("ABSENT", "-")
-    lines = proc.stdout.decode("utf-8", "replace").split("\n")
+    lines = blob.decode("utf-8", "replace").split("\n")
     statuses = [m for m in (STATUS_LINE_RE.match(ln) for ln in lines) if m]
     binds = [m for m in (BINDS_LINE_RE.match(ln) for ln in lines) if m]
     if not statuses:
