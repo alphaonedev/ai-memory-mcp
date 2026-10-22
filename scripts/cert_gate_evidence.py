@@ -18,6 +18,7 @@ Exit codes: 0 done, 2 usage or unreadable evidence directory (the offending
 argument is never echoed).
 """
 import argparse
+import contextlib
 import json
 import re
 import shutil
@@ -344,7 +345,7 @@ def finalize(state_dir: Path, evidence_dir: Path, tail_lines: int, stream: IO[st
     shell trap keeps the gate's own exit status.
     """
     rows = state_dir / "fail-rows"
-    try:
+    with contextlib.suppress(OSError):
         leg_b = rows.is_file() and any(
             ln.split("\t", 1)[0] == "B"
             for ln in rows.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -352,18 +353,14 @@ def finalize(state_dir: Path, evidence_dir: Path, tail_lines: int, stream: IO[st
         if leg_b and evidence_dir.is_dir():
             stream.write("\n== LEG B evidence (redacted, last %d lines per file; #7181) ==\n" % tail_lines)
             print_evidence(evidence_dir, evidence_names(evidence_dir, DEFAULT_NAMES), tail_lines, stream)
-    except OSError:
-        pass
     listing = state_dir / "cleanup-list"
     try:
         paths = listing.read_text(encoding="utf-8", errors="replace").splitlines() if listing.is_file() else []
     except OSError:
         paths = []
     for raw in paths:
-        try:
+        with contextlib.suppress(OSError):
             _safe_remove(raw.strip())
-        except OSError:
-            pass
     shutil.rmtree(str(state_dir), ignore_errors=True)
     return 0
 
