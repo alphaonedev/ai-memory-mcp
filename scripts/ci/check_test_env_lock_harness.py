@@ -122,21 +122,25 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("command", choices=("census", "selftest", "interrupt"))
     ap.add_argument("--root", default=str(Path(__file__).resolve().parents[2]))
+    ap.add_argument("--gate", default=GATE,
+                    help="gate script relative to --root (the workflow names it so "
+                         "check-required-contexts rule (g) sees it wired)")
     ap.add_argument("--harness-self-test", action="store_true",
                     help="interrupt only: run the harness's own self-test")
     args = ap.parse_args(argv)
     root = Path(args.root).resolve()
-    if not (root / GATE).is_file():
-        print("ERROR: %s not found under %s" % (GATE, root), file=sys.stderr)
+    gate = args.gate
+    if not (root / gate).is_file():
+        print("ERROR: %s not found under %s" % (gate, root), file=sys.stderr)
         return EXIT_ENV
     try:
         if args.command == "census":
             rc = precheck(root)
             if rc != EXIT_OK:
                 return rc
-            return subprocess.run(["bash", GATE], cwd=str(root), check=False).returncode
+            return subprocess.run(["bash", gate], cwd=str(root), check=False).returncode
         if args.command == "selftest":
-            return run_isolated(root, lambda c: ["bash", GATE, "--self-test"], "selftest")
+            return run_isolated(root, lambda c: ["bash", gate, "--self-test"], "selftest")
         extra = ["--harness-self-test"] if args.harness_self_test else []
         return run_isolated(
             root, lambda c: ["bash", INTERRUPT_HARNESS] + extra, "interrupt")

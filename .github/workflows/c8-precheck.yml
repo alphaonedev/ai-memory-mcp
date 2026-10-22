@@ -764,14 +764,14 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run test-env-lock gate
-        run: python3 scripts/ci/check_test_env_lock_harness.py census
+        run: python3 scripts/ci/check_test_env_lock_harness.py census --gate scripts/check-test-env-lock.sh
       - name: Self-test the gate (regression evidence)
         # --self-test stages a $HOME-mutating fixture with no
         # test_env_lock reference (the plain-omission shape) and a
         # second fixture that hand-rolls its own local lock instead of
         # the shared one (the #1998/#2115/#2127 recurrent shape); the
         # gate must reject both and spare a compliant control fixture.
-        run: python3 scripts/ci/check_test_env_lock_harness.py selftest
+        run: python3 scripts/ci/check_test_env_lock_harness.py selftest --gate scripts/check-test-env-lock.sh
       - name: Interrupted gate self-tests leave no probe behind (#4292)
         # This gate's self-test, like five others, must plant probe files
         # INSIDE the tree (the gate scans src/ and tests/). One interrupted
