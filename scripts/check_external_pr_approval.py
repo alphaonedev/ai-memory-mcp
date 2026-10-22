@@ -30,7 +30,16 @@ FAIL (fail closed). Mirrors the pull_request arm (the event names the PR).
 PARENT (merge_group.head_sha is the queue commit itself). It must be a full lowercase
 commit sha equal to merge_group.base_sha, which GitHub sets; otherwise FAIL.
 
-Exit 0: pass. Exit 1: approval missing, or the verdict cannot be established.
+#6229: a merge group larger than one PR names only its last PR in head_ref, so the other
+PRs would go unjudged. The merge_group arm reads the base branch's merge_queue rule
+(GET repos/<repo>/rules/branches/<base>) and passes only when exactly one merge_queue rule
+exists and its max_entries_to_merge is the integer 1 (group size 1); a missing, duplicated
+or malformed rule, or an API error, is undecidable.
+
+Exit 0: pass. Exit 1: approval missing (a finding). Exit 2: the verdict cannot be
+established (undecidable input, API error, malformed payload, internal error); the gate
+fails closed on both. An interrupt (SIGINT, SIGTERM, SIGHUP) kills the in-flight gh child,
+then the gate dies of the delivered signal. No traceback is ever a pass.
 Standard library only; Python 3.9+.
 """
 
@@ -38,6 +47,7 @@ import argparse
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import urllib.parse
@@ -68,8 +78,20 @@ REVIEW_TIME_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]
 QUEUE_REF_RE = re.compile(r"refs/heads/gh-readonly-queue/.+/pr-([0-9]{1,9})-([^/]*)")
 
 
+EXIT_PASS, EXIT_FINDING, EXIT_UNDECIDABLE = 0, 1, 2
+INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
 class GateError(Exception):
-    """The verdict cannot be established; the gate fails closed."""
+    """The verdict cannot be established; the gate fails closed (exit 2)."""
+
+
+class Interrupted(BaseException):
+    """A delivered signal; BaseException so no ``except Exception`` swallows it."""
+
+    def __init__(self, signum):
+        super().__init__(signum)
+        self.signum = signum
 
 
 def redact(message):
@@ -132,15 +154,36 @@ def parse_pages(raw):
 def gh_api(path):
     """GET one paginated REST path through the gh CLI; any failure raises GateError."""
     try:
-        proc = subprocess.run(["gh", "api", "--paginate", path],
-                              capture_output=True, text=True, timeout=120, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        child = subprocess.Popen(["gh", "api", "--paginate", path], stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
+    except OSError as exc:
         raise GateError(f"gh api {path}: {exc}") from exc
-    if proc.returncode != 0:
-        first = (proc.stderr.strip().splitlines() or [""])[0]
+    try:
+        stdout, stderr = child.communicate(timeout=120)
+    except subprocess.TimeoutExpired as exc:
+        _kill_group(child)
+        raise GateError(f"gh api {path}: {exc}") from exc
+    except BaseException:
+        # An interrupt (or any other escape) must not leave gh running (orphan).
+        _kill_group(child)
+        raise
+    if child.returncode != 0:
+        first = (stderr.strip().splitlines() or [""])[0]
         first = redact(first)[:300]
-        raise GateError(f"gh api {path} exited {proc.returncode}: {first}")
-    return parse_pages(proc.stdout)
+        raise GateError(f"gh api {path} exited {child.returncode}: {first}")
+    return parse_pages(stdout)
+
+
+def _kill_group(child):
+    """SIGKILL the child's process group and reap it; never raises."""
+    try:
+        os.killpg(child.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    try:
+        child.communicate(timeout=10)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
 
 
 def _head(pr):
@@ -249,6 +292,40 @@ def merge_group_pr_number(event):
     return number
 
 
+def merge_queue_group_size_one(rules, branch):
+    """GateError unless ``rules`` holds exactly one merge_queue rule with max_entries_to_merge == 1 (#6229)."""
+    if not isinstance(rules, list):
+        raise GateError(f"the rules of branch {branch!r} are not a list")
+    queue_rules = []
+    for rule in rules:
+        if not isinstance(rule, dict):
+            raise GateError(f"a rule of branch {branch!r} is not an object")
+        if rule.get("type") == "merge_queue":
+            queue_rules.append(rule)
+    if len(queue_rules) != 1:
+        raise GateError(f"branch {branch!r} has {len(queue_rules)} merge_queue rules, expected exactly 1")
+    params = queue_rules[0].get("parameters")
+    size = params.get("max_entries_to_merge") if isinstance(params, dict) else None
+    if not isinstance(size, int) or isinstance(size, bool) or size < 1:
+        raise GateError(f"the merge_queue rule of {branch!r} has no valid max_entries_to_merge")
+    if size != 1:
+        raise GateError(f"the merge queue of {branch!r} groups up to {size} PRs, but only the PR "
+                        "named by head_ref is judged, so the group size must be 1 (#6229)")
+
+
+def merge_group_base_branch(event):
+    """The base branch name from merge_group.base_ref (refs/heads/<branch>); GateError if unusable."""
+    group = event.get("merge_group") if isinstance(event, dict) else None
+    ref = group.get("base_ref") if isinstance(group, dict) else None
+    prefix = "refs/heads/"
+    if not isinstance(ref, str) or not ref.startswith(prefix) or not 0 < len(ref) - len(prefix) <= 255:
+        raise GateError("merge_group.base_ref does not name a branch")
+    branch = ref[len(prefix):]
+    if any(ch.isspace() or ord(ch) < 32 or ch in "?#\\" for ch in branch) or ".." in branch:
+        raise GateError("merge_group.base_ref holds an unusable character")
+    return branch
+
+
 def run_gate(event_name, event, repo, sha, operator, api):
     """Return (exit code, output lines). Never raises on a malformed input: fails closed."""
     lines = []
@@ -265,6 +342,9 @@ def run_gate(event_name, event, repo, sha, operator, api):
             lines.append("event=pull_request: judging the event's pull request")
         elif event_name == "merge_group":
             number = merge_group_pr_number(event)
+            branch = merge_group_base_branch(event)
+            merge_queue_group_size_one(
+                api(f"repos/{repo}/rules/branches/{urllib.parse.quote(branch, safe='/')}"), branch)
             open_prs = api(f"repos/{repo}/pulls?state=open&per_page=100")
             prs = [pr for pr in open_prs if _head(pr)[0] == number]
             if not prs:
@@ -282,17 +362,17 @@ def run_gate(event_name, event, repo, sha, operator, api):
             lines.append(f"event={event_name}: {len(prs)} open PR(s) of {len(open_prs)} head {sha}")
             if not prs:
                 lines.append("no open pull request heads this sha; nothing to approve (pass)")
-                return 0, lines
+                return EXIT_PASS, lines
         failed = False
         for pr in prs:
             passed, line = pr_verdict(pr, repo, operator, api)
             lines.append(line)
             failed = failed or not passed
-        return (1 if failed else 0), lines
+        return (EXIT_FINDING if failed else EXIT_PASS), lines
     except GateError as exc:
         lines.append(workflow_error(f"External-PR operator-approval gate cannot establish its verdict "
                                     f"(event={event_name}): {exc}. Failing closed."))
-        return 1, lines
+        return EXIT_UNDECIDABLE, lines
 
 
 def self_test():
@@ -303,13 +383,15 @@ def self_test():
         return {"number": n, "author_association": assoc, "user": {"login": "x"},
                 "head": {"sha": sha, "repo": {"full_name": head_repo} if head_repo else None}}
 
-    def api_for(pulls, reviews=None, fail=False):
+    def api_for(pulls, reviews=None, fail=False, rules=None):
         def api(path):
             if fail:
                 raise GateError("HTTP 502")
             m = re.search(r"/pulls/(\d+)/reviews", path)
             if m:
                 return (reviews or {}).get(int(m.group(1)), [])
+            if "/rules/branches/" in path:
+                return [{"type": "merge_queue", "parameters": {"max_entries_to_merge": 1}}] if rules is None else rules
             return pulls
         return api
 
@@ -324,16 +406,19 @@ def self_test():
         ("push-team-same-repo", 0, "push", a, api_for([pr(2, a, "MEMBER", repo)])),
         ("push-contributor-same-repo-unapproved", 1, "push", a, api_for([pr(2, a, "CONTRIBUTOR", repo)])),
         ("push-no-pr-heads-sha", 0, "push", a, api_for([pr(1, b)])),
-        ("push-api-error", 1, "push", a, api_for([], fail=True)),
+        ("push-api-error", 2, "push", a, api_for([], fail=True)),
         ("merge-group-unapproved", 1, "merge_group", c, api_for([pr(1, a)])),
         ("merge-group-approved", 0, "merge_group", c, api_for([pr(1, a)], {1: [approved]})),
         ("merge-group-release-base-approved", 0, "merge_group", c, api_for([pr(1, a)], {1: [approved]})),
         ("merge-group-release-base-unapproved", 1, "merge_group", c, api_for([pr(1, a)])),
-        ("merge-group-no-pr-in-ref", 1, "merge_group", c, api_for([pr(1, a)])),
-        ("merge-group-ref-sha-is-head-sha-not-base-sha", 1, "merge_group", c,
+        ("merge-group-no-pr-in-ref", 2, "merge_group", c, api_for([pr(1, a)])),
+        ("merge-group-ref-sha-is-head-sha-not-base-sha", 2, "merge_group", c,
          api_for([pr(1, a)], {1: [approved]})),
-        ("merge-group-missing-base-sha", 1, "merge_group", c, api_for([pr(1, a)], {1: [approved]})),
-        ("merge-group-duplicate-listing", 1, "merge_group", c, api_for([pr(1, a), pr(1, a)], {1: [approved]})),
+        ("merge-group-missing-base-sha", 2, "merge_group", c, api_for([pr(1, a)], {1: [approved]})),
+        ("merge-group-duplicate-listing", 2, "merge_group", c, api_for([pr(1, a), pr(1, a)], {1: [approved]})),
+        ("merge-group-group-size-5", 2, "merge_group", c,
+         api_for([pr(1, a)], {1: [approved]}, rules=[{"type": "merge_queue", "parameters": {"max_entries_to_merge": 5}}])),
+        ("merge-group-no-queue-rule", 2, "merge_group", c, api_for([pr(1, a)], {1: [approved]}, rules=[])),
     ]
     failures = 0
 
@@ -369,10 +454,10 @@ def self_test():
     return 1 if failures else 0
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--self-test", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.self_test:
         return self_test()
     event_name = os.environ.get("GITHUB_EVENT_NAME", "")
@@ -384,7 +469,7 @@ def main():
                 event = json.load(fh)
         except (OSError, ValueError) as exc:
             print(workflow_error(f"cannot read the {event_name} event payload ({exc}); failing closed"))
-            return 1
+            return EXIT_UNDECIDABLE
     rc, lines = run_gate(event_name, event, os.environ.get("GITHUB_REPOSITORY", ""),
                          os.environ.get("GITHUB_SHA", ""),
                          os.environ.get("OPERATOR_LOGIN", ""), gh_api)
@@ -393,5 +478,44 @@ def main():
     return rc
 
 
+def _raise_interrupted(signum, _frame):
+    raise Interrupted(signum)
+
+
+def entry():
+    """Run main() under the exit contract; return the exit code (never raises, except Interrupted).
+
+    An uncaught Exception, including one raised by the output path, is exit 2 with one stderr
+    line, never a traceback and never a pass. The FIRST non-zero status is latched: a failing
+    verdict is returned as-is even when printing it fails.
+    """
+    for signum in INTERRUPT_SIGNALS:
+        signal.signal(signum, _raise_interrupted)
+    try:
+        return main()
+    except Exception as exc:  # noqa: BLE001 - the gate must turn every failure into exit 2
+        try:
+            sys.stderr.write(redact(f"external-pr-approval: internal error ({type(exc).__name__}: {exc})") + "\n")
+        except Exception:  # noqa: BLE001 - the diagnostic is best effort
+            pass
+        return EXIT_UNDECIDABLE
+
+
+def run_entry():
+    """Process exit: the entry() code, or death by the delivered signal after cleanup."""
+    try:
+        code = entry()
+    except Interrupted as stop:
+        # gh_api already killed its child group while the exception unwound.
+        signal.signal(stop.signum, signal.SIG_DFL)
+        os.kill(os.getpid(), stop.signum)
+        return 128 + stop.signum
+    try:
+        sys.stdout.flush()
+    except Exception:  # noqa: BLE001 - a broken stdout cannot turn a failure into a pass
+        return code if code else EXIT_UNDECIDABLE
+    return code
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_entry())
