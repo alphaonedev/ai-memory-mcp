@@ -219,6 +219,8 @@ LOCK_TYPE_NAMES = frozenset((
     "PoisonError"))
 PATH_SELF = ("self", "super", "crate")
 MACRO_RULES = re.compile(r"\bmacro_rules\s*!\s*([A-Za-z_]\w*)\s*\{")
+# #8033: `let [mut] <name> [: T] = [async] [move] |..| ..` / `async [move] { .. }`: the initialiser starts at the match end
+CLOSURE_LET = r"\blet\s+(?:mut\s+)?%s\b[^=;]*=\s*(?:async\b\s*(?:move\b\s*)?|move\b\s*)?(?=\||\{)"
 FN_VALUE = re.compile(r"\s*((?:[A-Za-z_]\w*\s*::\s*)*)([A-Za-z_]\w*)\s*,?\s*")
 MACRO_CALL = re.compile(r"\b([A-Za-z_]\w*)\s*!\s*[({\[]")
 META_CALL = re.compile(r"\$([A-Za-z_]\w*)\s*\(")
@@ -358,6 +360,22 @@ def match_brace(text, open_idx):
             depth -= 1
             if depth == 0:
                 return j + 1
+    return len(text)
+
+
+def stmt_end(text, start):
+    """Index of the `;` that ends the expression starting at `start` (depth 0), or of its enclosing close."""
+    depth = 0
+    for j in range(start, len(text)):
+        ch = text[j]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                return j
+            depth -= 1
+        elif ch == ";" and depth == 0:
+            return j
     return len(text)
 
 
@@ -1357,6 +1375,12 @@ class FileModel:
         for m in MACRO_CALL.finditer(body):
             if m.group(1) in self.detach_macros:
                 spans.append((m.end(), match_paren(body, m.end() - 1) - 1))
+        for a, b in list(spans):
+            # #8033: `let work = move || { .. }; spawn(work)` -- the closure the variable holds runs detached
+            v = FN_VALUE.fullmatch(body, a, b)
+            if v and not v.group(1):
+                for lm in re.compile(CLOSURE_LET % re.escape(v.group(2))).finditer(body, 0, a):
+                    spans.append((lm.end(), stmt_end(body, lm.end())))
         return spans
 
     def detached(self, fn, r):

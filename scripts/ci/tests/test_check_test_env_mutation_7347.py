@@ -1496,6 +1496,35 @@ class Issue8038(Fixture):
         self.assertEqual(self.flagged(text), set())
 
 
+class Issue8033(Fixture):
+    """#8033: "when a spawn argument is a bare identifier, resolve it to its `let` closure initialiser in the
+    same fn and treat that closure span as detached" -- `let work = move || { .. }; spawn(work);` runs the
+    closure outside the guard of the enclosing fn."""
+
+    OPEN = 'let _c = db::open(":memory:");'
+    LOCKED = "#[test]\nfn reader() {\n    let _l = ENV_LOCK.blocking_lock();\n    %s\n}\n"
+
+    BOUND = {
+        "move_closure": "let work = move || { %s };\n    std::thread::spawn(work).join().unwrap();",
+        "plain_closure": "let work = || { %s };\n    std::thread::scope(|s| { s.spawn(work); });",
+        "async_block": "let work = async move { %s };\n    tokio::spawn(work);",
+    }
+
+    def test_a_closure_bound_to_a_variable_and_spawned_runs_detached(self):
+        for name in ("move_closure", "plain_closure", "async_block"):
+            with self.subTest(shape=name):
+                text = WRITER + self.LOCKED % (self.BOUND[name] % self.OPEN)
+                self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_the_bound_closure_called_directly_keeps_the_lock(self):
+        text = WRITER + self.LOCKED % ("let work = move || { %s };\n    work();" % self.OPEN)
+        self.assertEqual(self.flagged(text), set())
+
+    def test_an_identifier_that_is_no_closure_changes_nothing(self):
+        text = WRITER + self.LOCKED % ("let work = make_task();\n    std::thread::spawn(work);\n    %s" % self.OPEN)
+        self.assertEqual(self.flagged(text), set())
+
+
 class RealTree(unittest.TestCase):
     def test_repo_matches_its_baseline(self):
         found = gate.scan_tree(REPO)
