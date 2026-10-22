@@ -241,10 +241,10 @@ impl PostgresStore {
                 });
             }
         }
-        let rows = pg_hard_delete_in_tx(&mut tx, id)
+        let (rows, anchor) = pg_hard_delete_in_tx(&mut tx, id)
             .await
             .map_err(|e| to_store_err("apply_remote_deletion", e))?;
-        tx.commit()
+        crate::store::postgres::pg_commit_and_emit(tx, anchor)
             .await
             .map_err(|e| to_store_err("apply_remote_deletion commit tx", e))?;
         if rows > 0 {
@@ -303,6 +303,8 @@ impl PostgresStore {
                 let mut ordered: Vec<&str> = ids.iter().map(String::as_str).collect();
                 ordered.sort_unstable();
 
+                // #7241 - the audit anchors are emitted only after the COMMIT.
+                let mut anchor = crate::governance::audit::PendingAuditAnchor::none();
                 for id in ordered {
                     // #3193 (SECURITY-high, 2026-08-22) — SAL-side caller-owns gate,
                     // the archive-verb sibling of the #1412/#1628 gates on the trait
@@ -447,9 +449,10 @@ impl PostgresStore {
                     // (`archive_memory_no_tx` / `archive_memory_for_caller`, which both
                     // call `sever_namespace_standards`) — previously a bare, silent
                     // UPDATE.
-                    pg_sever_namespace_standards_in_tx(&mut tx, id)
+                    let (_, severed) = pg_sever_namespace_standards_in_tx(&mut tx, id)
                         .await
                         .map_err(|e| to_store_err("archive_by_ids: namespace_meta sever", e))?;
+                    anchor = anchor.merge(severed);
                     // APPEND-ONLY-SANCTIONED (#1823 G6) — capture-then-compact:
                     // append ONE identity-only ARCHIVE leaf IN THIS tx BEFORE the
                     // delete (the cold-storage copy already landed above). Gated →
@@ -499,7 +502,7 @@ impl PostgresStore {
                     moved += 1;
                 }
 
-                tx.commit()
+                crate::store::postgres::pg_commit_and_emit(tx, anchor)
                     .await
                     .map_err(|e| to_store_err("archive_by_ids commit", e))?;
                 Ok(moved)

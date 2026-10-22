@@ -144,6 +144,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # #7160 - size cap for the persistent self-hosted target/debug build state
+  # (40 GiB); scripts/ci-sweep-target.py reads it via the sweep step below.
+  SELF_HOSTED_TARGET_CAP_BYTES: 42949672960
   # #3128 — EXPLICIT, not inherited. `Swatinem/rust-cache` is what used to export
   # CARGO_INCREMENTAL=0, and it is now skipped on the self-hosted fleet (see the
   # rust-cache guards below), so the value must be declared here. Incremental
@@ -232,6 +235,11 @@ jobs:
         run: python3 scripts/test/test_workflow_concurrency_6340.py
       - name: Shard partition and wiring unit tests (#6344)
         run: python3 -m unittest discover -s scripts/ci/tests
+      # #7160 - scripts/test/ is outside the discovery root above; run the
+      # sweep script tests (including the Linux-only O_PATH test, which this
+      # ubuntu-latest job is where it executes) and the sweep workflow pin.
+      - name: Target sweep unit tests (#7160)
+        run: python3 -m unittest scripts/test/test_ci_sweep_target.py scripts/test/test_workflow_sweep_7160.py
       - id: cls
         shell: bash
         env:
@@ -703,6 +711,17 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     strategy:
       fail-fast: false
+      # #7188 - concurrency cap: at most 3 of this job's 4 legs run at once per
+      # workflow run, so the self-hosted linux-fed leg and the two macOS legs
+      # never wait on each other while a fourth leg cannot pile on. N = 3 and
+      # not lower because a lower cap would serialise the macOS legs behind the
+      # hosted sqlite leg (~75 min) with no benefit to the f2 disk. The host-level
+      # bound lives elsewhere: every linux-fed enterprise-fed job builds into the
+      # PER-RUNNER CARGO_TARGET_DIR of the runner it runs on (below), so a target
+      # has exactly one writer and compiles once across that runner's jobs.
+      # A cross-run `concurrency` group is deliberately NOT used: GitHub replaces
+      # a PENDING run in a group, which would silently cancel a required check.
+      max-parallel: 3
       matrix:
         # 2x2 via `include:` so the single name variable `leg` co-varies with
         # `runner` (runs-on labels), `node` (a descriptive tag used by the
@@ -779,6 +798,12 @@ jobs:
             runner: '["self-hosted","linux-fed"]'
             node: linux-fed
             tier: enterprise-fed
+            # #7188 - opt in to the shared per-host cargo target (see the
+            # "Shared per-host cargo target" step). An explicit flag, not a
+            # `matrix.node ==` comparison, so a rename cannot silently drop it;
+            # the hosted and macOS legs do not set it and keep their default
+            # workspace `target/`.
+            shared_target: true
             # #3525/#3976/#6202/#6344: compile (~6-12 min) + the 7800 s
             # per-shard watchdog + the ephemeral-db setup/teardown must fit
             # inside this outer bound. 160 = 130 min watchdog + 28 min of
@@ -839,6 +864,38 @@ jobs:
       - name: docs-only short-circuit
         if: needs.classify.outputs.docs_only == 'true'
         run: echo "::notice::docs-only PR — ${{ matrix.leg }} matrix leg is a no-op"
+
+      # #7188 - PER-RUNNER CARGO_TARGET_DIR for the self-hosted linux-fed
+      # enterprise-fed job: ~/.cache/ai-memory-ci/cargo-target/<runner name>,
+      # outside the checkout (checkout cleaning cannot wipe it), under the runner
+      # user's home, never a tmp path. A target with exactly one writer cannot
+      # have one PR's test binary replaced by another PR's build (cargo releases
+      # its build lock before it runs test binaries), and the cache stays warm
+      # for that runner's later jobs. runner.name is assigned by the runner, not
+      # by the PR; the helper fails closed on a missing or unsafe name. The path
+      # root is defined once, in scripts/ci/shared_cargo_target.py.
+      # Self-hosted legs only (matrix.shared_target).
+      - name: Per-runner cargo target (#7188)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.shared_target
+        env:
+          RUNNER_NAME_ARG: ${{ runner.name }}
+        run: python3 scripts/ci/shared_cargo_target.py --github-env "$GITHUB_ENV" --runner-name "$RUNNER_NAME_ARG"
+
+      # #7199 - sccache for the self-hosted Linux enterprise-fed leg. Each runner
+      # compiles into its own ~160 GiB target (#7188), so a cross-runner compile
+      # cache (ONE dedicated CI sccache server per host user on its own port,
+      # SCCACHE_SERVER_PORT, never the dev lanes' default-port server; SCCACHE_DIR
+      # under the same ~/.cache/ai-memory-ci root, capped by SCCACHE_CACHE_SIZE)
+      # removes most of the cold-build cost of a second runner. sccache cannot
+      # cache incremental artifacts: CARGO_INCREMENTAL=0 is set in this workflow
+      # env and in the runner .env on f2. The helper FAILS CLOSED when sccache is
+      # not on PATH or when the server reports any cache location other than
+      # SCCACHE_DIR (the job reds instead of silently building cold or into the
+      # wrong disk). Linux self-hosted legs only: the macOS fleet hosts may lack
+      # sccache.
+      - name: sccache build cache (#7199)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.shared_target && runner.os == 'Linux'
+        run: python3 scripts/ci/sccache_env.py --github-env "$GITHUB_ENV"
 
       # #2452 — tests/conformance_readers.rs is FAIL-CLOSED: an absent
       # python3/node is a test FAILURE, not a silent pass. This job now spans
@@ -1095,12 +1152,14 @@ jobs:
             exit 1
           fi
           base_url="$(cat "$url_file")"
-          # Unique db name: valid pg identifier (lowercase, [a-z0-9_], <=63
-          # chars). run_id+attempt make it unique across concurrent runs; the
+          # Unique db name: valid pg identifier (lowercase, [a-z0-9_], <=59
+          # bytes: 63 minus the `_tpl` suffix, i.e. IDENT_MAX - len(TEMPLATE_SUFFIX)
+          # in scripts/test/pg_isolated_binary.py, which refuses longer names).
+          # run_id+attempt make it unique across concurrent runs; the
           # sanitised matrix leg keeps the two enterprise-fed legs distinct and
           # never sharing a name with the cert-postgres-age job.
           leg_sanitized="$(printf '%s' "$LEG" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9' '_')"
-          CI_FED_DB="$(printf '%s' "ai_memory_test_ci_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${leg_sanitized}" | cut -c1-63)"
+          CI_FED_DB="$(printf '%s' "ai_memory_test_ci_${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}_${leg_sanitized}" | cut -c1-59)"
           # Compute-once, pass to the cleanup step via $GITHUB_ENV so create
           # and drop use the byte-identical name.
           echo "CI_FED_DB=$CI_FED_DB" >> "$GITHUB_ENV"
@@ -1143,6 +1202,19 @@ jobs:
             AI_MEMORY_TEST_POSTGRES_URL="$new_url" python3 scripts/test/pg_isolated_binary.py setup --db "$CI_FED_DB" --jobs 8 --emit-env >> "$GITHUB_ENV"
             echo "::notice::[#6383] per-binary Postgres isolation ON: template ${CI_FED_DB}_tpl"
           fi
+
+      # #7485 / #7457 — the LiveEndToEnd cells of the Postgres isolation wrapper need a real server, and
+      # this leg is the one that has AI_MEMORY_TEST_POSTGRES_URL (minted above). The flag turns a missing
+      # URL or psql into a failure instead of a silent skip.
+      - name: Run the pg_isolated_binary live cells (enterprise-fed legs only)
+        if: needs.classify.outputs.docs_only != 'true' && matrix.tier == 'enterprise-fed'
+        shell: bash
+        env:
+          AI_MEMORY_TEST_PG_LIVE_REQUIRED: "1"
+        run: |
+          set -euo pipefail
+          cd scripts/ci/tests
+          python3 -m unittest -v test_pg_isolated_binary.LiveEndToEnd
 
       # Isolation shot after e380ca5d: mold + debuginfo=0 linked and RAN
       # the sqlite suite, then `hot_swap_llm_2166` SIGSEGV'd. That binary
@@ -1841,6 +1913,7 @@ jobs:
         if: needs.classify.outputs.docs_only != 'true' && matrix.once
         run: |
           cargo install cargo-audit --locked
+          python3 scripts/check-zip-extract-unreachable.py
           cargo audit
 
       # CI-speed: the release build here is only a release-PROFILE compile
@@ -1928,6 +2001,57 @@ jobs:
           else
             echo "::warning::failed to drop ephemeral db $CI_FED_DB on $RUNNER_NAME (leaked)"
           fi
+
+      # #7199 - hit rate of the CI sccache server, then stop that server (same
+      # SCCACHE_SERVER_PORT) unless a sibling runner's in-use marker is fresh.
+      - name: sccache hit-rate summary (#7199)
+        if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        run: python3 scripts/ci/sccache_env.py --stats
+
+      - name: sccache stop CI server (#7199)
+        if: always() && matrix.shared_target && runner.os == 'Linux' && needs.classify.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          RUNNER_NAME_ARG: ${{ runner.name }}
+        run: python3 scripts/ci/sccache_env.py --stop --runner-name "$RUNNER_NAME_ARG"
+
+      # #7188 - post-job cleanup on the self-hosted legs: prune stale per-job
+      # artifacts (leftover .tmp* dirs, workspace incremental state, old
+      # runner _temp entries) so an idle runner holds no stale scratch. The
+      # prune pass NEVER touches the per-runner cargo target root (the helper
+      # refuses any path in, at or above it) and a failed removal exits 0. Skipped
+      # for fork PRs (refused above, no checkout ran). always()
+      # so a failed or cancelled run is pruned too.
+      # #7199 - after the prune, this runner clears its in-use marker and evicts
+      # OTHER runners' targets only when idle: no fresh in-use marker, no write
+      # within BUSY_MTIME_MINUTES, and either idle over IDLE_TARGET_DAYS or,
+      # oldest first, while the cache filesystem is under FREE_FLOOR_GIB free.
+      # Never this runner's target, never outside the root shared_cargo_target.py
+      # computes, never through a symlink. Bad arguments are refused with exit 2.
+      - name: Prune stale runner artifacts (#7188)
+        if: always() && matrix.shared_target && needs.classify.outputs.docs_only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          RUNNER_NAME_ARG: ${{ runner.name }}
+        run: python3 scripts/ci/prune_runner_artifacts.py --work-root "$RUNNER_WORKSPACE/.." --workspace "$GITHUB_WORKSPACE" --protected-root "$AI_MEMORY_CI_TARGET_ROOT" --evict-root "$AI_MEMORY_CI_TARGET_ROOT" --runner-name "$RUNNER_NAME_ARG"
+
+      # #7160 - cap the persistent self-hosted target/debug (oldest-mtime
+      # first). Last steps so they never race a running build. Two shapes,
+      # exactly one runs per self-hosted leg: legs that build in the workspace
+      # sweep the workspace `target`; the shared_target leg (#7188) builds into
+      # its own per-runner CARGO_TARGET_DIR outside the workspace, so it sweeps
+      # that one directory (never the whole cache root holding the sibling
+      # runners' targets) with --allow-root --within <cache root>: the script
+      # resolves both paths and requires the target strictly inside the root
+      # (the root may be a symlink to another disk, as on f2; #7297 S11). The
+      # prune step above never touches that directory, so this is its only cap.
+      # --lock takes <root>/.evict.lock (the flock of the idle-target eviction)
+      # for the sweep, waits at most 20 s and then skips with one warning and exit 0.
+      - name: Sweep target/debug to the size cap (self-hosted)
+        if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted' && !matrix.shared_target
+        run: python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
+
+      - name: Sweep per-runner cargo target to the size cap (self-hosted, #7160)
+        if: always() && needs.classify.outputs.docs_only != 'true' && runner.environment == 'self-hosted' && matrix.shared_target
+        run: python3 scripts/ci-sweep-target.py --target "${CARGO_TARGET_DIR:?per-runner cargo target not set}" --allow-root --within "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}" --lock "${AI_MEMORY_CI_TARGET_ROOT:?per-runner cache root not set}/.evict.lock" --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}
 
   # Postgres feature gate — the `sal-postgres` CLIPPY-parity leg.
   #

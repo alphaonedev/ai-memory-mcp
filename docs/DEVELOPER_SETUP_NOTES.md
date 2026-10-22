@@ -113,6 +113,17 @@ safeguard (added to the C1–C7 set in §"Enforceable Orchestrator
 Safeguards"); HARD-BLOCK on any violation.
 
 
+## Checkout permissions: use umask 022 (#7281)
+
+The deferred-audit spool guard (#2271) rejects any spool ancestor that is
+group- or world-writable and not sticky, and the checkout root is an ancestor
+of every `deferred_audit` test fixture. A checkout or `git worktree add` made
+under umask 002 is mode 775, so `cargo test --features sal --lib deferred_audit`
+cannot pass there. The fixtures now fail once with a message naming the path
+and its mode instead of 34 opaque failures. Create checkouts under umask 022,
+or run `chmod g-w <dir>` on the named directory. The production guard is
+never relaxed for tests.
+
 ## Local coverage (matching CI's `coverage.yml`)
 
 ```bash
@@ -134,6 +145,11 @@ flag. Point `AI_MEMORY_TEST_POSTGRES_URL` at a live PG16 instance (+ `age`
 + `vector` extensions) to exercise the postgres backend instead of having
 those tests self-skip; pass `--no-threshold-check` to generate
 `coverage/current.json` only.
+
+
+## Self-hosted runner disk cap (#7160)
+
+Self-hosted jobs reuse the checkout's persistent `target/`, so `target/debug/deps` grows without bound. The `check` job of `ci.yml` (every self-hosted leg: linux-fed and both macos-fed legs), `cert-postgres-age.yml` and `postgres-ignored.yml` therefore end with a step guarded by `if: always() && runner.environment == 'self-hosted'` (in `ci.yml` also `needs.classify.outputs.docs_only != 'true'`, so docs-only changes skip it) that runs `python3 scripts/ci-sweep-target.py --target target --max-bytes ${{ env.SELF_HOSTED_TARGET_CAP_BYTES }}`. The `shared_target` leg of `check` (linux-fed enterprise-fed, #7188) builds into its own per-runner `CARGO_TARGET_DIR` (`~/.cache/ai-memory-ci/cargo-target/<runner>`, outside the workspace, never touched by the #7188 prune step), so it runs `python3 scripts/ci-sweep-target.py --target "$CARGO_TARGET_DIR" --allow-root --within "$AI_MEMORY_CI_TARGET_ROOT" --lock "$AI_MEMORY_CI_TARGET_ROOT/.evict.lock" --max-bytes ...` instead (the leg's own directory, never the whole cache root, which is only the `--within` containment root; the step fails closed when either variable is unset). The leg sweeps its RESOLVED per-runner directory inside the RESOLVED cache root: the script resolves both with `realpath`, so a symlinked cache parent (on f2 `~/.cache/ai-memory-ci` is a symlink to `/mnt/t9/ai-memory-ci`) is accepted by containment alone; the workspace `target` step runs on the legs that build in the workspace. `scripts/test/test_workflow_sweep_7160.py` pins both shapes, and the `classify` job of `ci.yml` runs it together with `scripts/test/test_ci_sweep_target.py` (step `Target sweep unit tests (#7160)`, ubuntu-latest, so the Linux-only `O_PATH` test executes). The script deletes the oldest-mtime top-level entries of `target/debug/{deps,incremental,build,.fingerprint}` until they total under the cap, refuses a target outside `$GITHUB_WORKSPACE` (exit 2, unless `--allow-root` for a node cron), and never follows symlinks. The cap is the workflow-level `env: SELF_HOSTED_TARGET_CAP_BYTES` (40 GiB = `42949672960`) at the top of each of the three workflows; raise or lower it there, in all three. The target is opened by one descriptor walk from `/` (each component, `debug` and each swept directory with `O_NOFOLLOW | O_DIRECTORY`, relative to its parent) and every scan and delete is relative to those handles, so a component swapped for a symlink before the open, after the scan or during removal is refused, not followed; every parent of the target must be searchable by the sweeping account (on Linux the parents are opened with `O_PATH`, so no read permission is needed; on macOS, which has no `O_PATH`, every parent of the target must also be readable, else nothing is swept and the exit is 4); `--allow-root` requires `--within <root>` (exit 5 without it, and `--within` alone is exit 5): the script resolves the target and the root and refuses (exit 2, naming both resolved paths) unless the resolved target is strictly inside the resolved root (not equal to it, never `/`), then walks the RESOLVED path with the descriptor walk above, so a symlink swapped in after the resolution still fails closed and a target that resolves outside the root (for example a symlink to a sibling directory) is refused. `--lock <file>` (only with `--allow-root`; the file must sit directly in the resolved `--within` root and is opened `O_NOFOLLOW`) takes the exclusive `flock` that the idle-target eviction of the per-runner cache root also uses (`<root>/.evict.lock`, #7219) for the duration of the sweep, so an eviction cannot move the target while it is swept; `--lock-timeout` is a finite number of seconds >= 0 (default 20; `0` is one attempt; `nan`, `inf` and negatives are exit 5). If the lock is not taken in time, or the lock file cannot be opened, the sweep is skipped and the exit is 0 (the always-run step stays green, the next job sweeps): one `::warning::` annotation on stdout (so the job page flags it) names the real cause: the contention timeout (`lock <path> not taken within <S> s (held by another process)`) carries no errno; an open failure carries `: <path> [Errno N] <strerror>` after one of `lock path is a symlink (not followed)`, `lock path is a directory`, `lock root is missing`, `lock root or file is not writable` or the fallback `lock file cannot be opened`; a failing flock reads `lock <path> cannot be taken: [Errno N] <strerror>`; the summary line then reads `sweep skipped (<reason>)`. A sweep that ran reports `lock_wait=<s> lock_held=<s>` on the summary line (0.00 without `--lock`; the lock is held for the walk and delete only), so the hold time can be compared with #7219's 60 s job-start wait. Paths with non-UTF-8 bytes print as backslash escapes, never a traceback. Also every printed path and reason is escaped for GitHub Actions command syntax (`%` prints as `%25`, CR as `%0D`, LF as `%0A`, in that order, so a name can never split a line or start a workflow command; ordinary names print unchanged): this covers the summary, the skip line, every refusal and warning on stdout and stderr, and the usage-error message. The sweep only ever reads or deletes top-level entries of `<target>/debug/{deps,incremental,build,.fingerprint}`, so the in-use marker (`<target>/.in-use`, beside `debug`), `<root>/.evict.lock` and the `<root>/.evicting-*` directories are never sweep entries. An unreadable directory or entry at any depth prints `warning: cannot read <path>` (or `cannot size` / `cannot remove`) on stderr and is skipped; the sweep continues and exits 0. A top-level entry that holds a directory the account cannot empty (unreadable, or read-only so its files cannot be unlinked) is detected during the sizing walk, before anything is deleted: it is kept whole, one `warning: cannot remove <entry>: ... entry kept whole` names it, and its bytes stay in `before=` and `after=`. The summary line is `before= after= removed= freed=` with `removed` the entries fully deleted and `freed` the bytes really unlinked (also when a removal fails midway). A top-level entry whose tree is deeper than 300 levels (`MAX_TREE_DEPTH`) is skipped whole: one `warning: cannot size <entry>: too deep to walk ... entry skipped` names it, it is never on the delete list, and none of it is deleted (a partly deleted cargo output is worse than an oversized one). Exit codes: 0 success, 2 refused path (target outside the workspace, symlinked `debug` or swept directory, a swept directory or any parent of it replaced before or after the scan, a target path component that is not a directory (`refused: <path> is not a directory`), an `--allow-root` target not strictly inside `--within`, or a `--lock` not directly inside the resolved `--within` root), 3 `--max-bytes` zero or negative, 4 nothing could be sized because every swept directory or entry was unreadable (this turns the always-run step red), 5 usage error (`EXIT_USAGE`: a missing, unknown or unparsable argument such as `--max-bytes abc` or an empty `--max-bytes`, `--allow-root` without `--within`, `--lock` without `--allow-root`, or a negative or non-finite `--lock-timeout`), distinct from the exit-2 refusal. Preview a sweep with `--dry-run`.
 
 
 ## Dogfooding release branches
@@ -179,3 +195,57 @@ scripts/reproduce-recursive-learning.sh
 The full conceptual primer lives at `docs/RECURSIVE_LEARNING.md`; the
 release-notes intro lives under `docs/v0.7.0/release-notes.md`
 §"Substrate-native recursive refinement".
+
+## Self-hosted runner host budget (#7188)
+
+The `Check (linux-fed,enterprise-fed)` job compiles every integration test binary with
+`--features sal-postgres`; an unshared per-checkout `target/` measured ~166 GiB. Each
+labelled linux-fed runner now builds into its OWN `CARGO_TARGET_DIR`,
+`~/.cache/ai-memory-ci/cargo-target/<runner name>` (root defined once in
+`scripts/ci/shared_cargo_target.py`, which takes the name from `runner.name` and fails
+closed on a missing or unsafe name). A target has exactly one writer, so one PR's build
+can never replace a test binary another PR's job is about to run (cargo releases its
+build lock before it executes test binaries; decided by 3-agent vote 6def5ab6, memory
+023ed7e7-8650-424b-a5f7-2eb48573aa5f), and the runner reuses its target for its later
+jobs, capped (#7160): the last step of the leg (`Sweep per-runner cargo target to the size
+cap`) runs `scripts/ci-sweep-target.py` on that runner's directory after each job and
+deletes the oldest-mtime build state until the target is under
+`SELF_HOSTED_TARGET_CAP_BYTES` (40 GiB = `42949672960`, the workflow-level `env:` literal
+of `ci.yml`), so later jobs rebuild whatever the sweep removed. The sweep targets the
+RESOLVED per-runner directory and requires it strictly inside the RESOLVED cache root
+(`--within "$AI_MEMORY_CI_TARGET_ROOT"`); this matters on f2, where `~/.cache/ai-memory-ci`
+is a symlink to `/mnt/t9/ai-memory-ci`. Jobs on different runners do not share compiled
+output: each runner pays one cold build, and two runners hold two targets.
+
+Size the host with:
+
+    footprint = labelled-runners x (cap + one build's peak above the cap)
+    labelled runners per host = floor((disk - fixed - lanes - headroom) / that per-runner footprint)
+
+where `disk` is the root disk, `fixed` the non-CI usage (databases, services), `lanes`
+the agent-lane cargo targets and `headroom` the free-space floor. The cap is 40 GiB; one
+build can exceed it while it runs (~158 GiB measured after the debuginfo strip, a lower
+bound: the unstripped comparison build was stopped past 215 GiB before it finished), and
+the sweep brings the target back under the cap after the job.
+Example, f2: 912 GiB disk - ~400 GiB fixed leaves ~512 GiB before lanes and headroom,
+which holds about two per-runner targets; runners 3 and 4 stay unlabelled for that reason
+(tracked in #7199, which also covers sccache or a larger disk). After each job
+`scripts/ci/prune_runner_artifacts.py --protected-root` prunes stale scratch and never
+touches the target root. Its separate eviction pass (#7199, below) removes a sibling
+runner's target only when that target is idle: no fresh in-use marker, no recent write,
+and, below the free-space floor, oldest first.
+
+### linux-fed runner capacity budget (#7199)
+
+decision: Option 1 (sccache) + Option 4 (idle-target eviction) over buying disk, because sccache is already installed and the external SSD already exists (operator directive fb58a3c8).
+
+The cache filesystem must hold, with headroom:
+
+    labelled_runners x per_runner_target (~165 GiB) + SCCACHE_CACHE_SIZE (50G) + FREE_FLOOR_GIB (200) <= cache filesystem size
+
+Constants (named in code, change them there): `SCCACHE_CACHE_SIZE = "50G"` in `scripts/ci/sccache_env.py`; `IDLE_TARGET_DAYS = 7` and `FREE_FLOOR_GIB = 200` in `scripts/ci/prune_runner_artifacts.py`.
+
+- sccache: on the Linux self-hosted legs the step `sccache build cache (#7199)` runs `scripts/ci/sccache_env.py`, which starts a dedicated CI sccache server on its own port (`SCCACHE_SERVER_PORT = 4227`, never the dev lanes' default-port server), exports `RUSTC_WRAPPER`, `SCCACHE_DIR` (`~/.cache/ai-memory-ci/sccache`), `SCCACHE_CACHE_SIZE`, `SCCACHE_ERROR_LOG` and `SCCACHE_SERVER_PORT`, and fails the job when `sccache` is not on PATH or the server reports any other cache location. A job-end step stops that server unless a sibling runner's job is still running. It needs `CARGO_INCREMENTAL=0` (set in the workflow env and in the runner `.env`). The hit rate is printed at the end of the job (`sccache hit-rate summary`).
+- Eviction: after the post-job prune, `prune_runner_artifacts.py --evict-root` deletes other runners' target directories idle for more than `IDLE_TARGET_DAYS` and, while the filesystem has less than `FREE_FLOOR_GIB` free, the oldest remaining other targets. A target is evicted only when idle: the per-runner target step writes an in-use marker (`.in-use`, expires after `IN_USE_MARKER_MAX_AGE_SECS` = 6 h so a crashed job cannot pin it) that the post-job prune clears, and a target written within `BUSY_MTIME_MINUTES` (30) is also kept. It never touches the running runner's target, a symlink, or any root other than `~/.cache/ai-memory-ci/cargo-target`; an unmet floor prints a `::warning::` line.
+- f2 layout: `~/.cache/ai-memory-ci` is a symlink to a directory on the 1.8 TB external SSD mount (1.2 TB free when moved), so the cargo targets and the sccache directory share that disk: four labelled runners need about 4 x 165 + 50 + 200 = 910 GiB.
+- Relabel a runner once the budget allows: re-add the `linux-fed` label to the next unlabelled runner (f2-linux-fed-3, then -4) only when `df -BG ~/.cache/ai-memory-ci/` shows free space of at least `FREE_FLOOR_GIB` plus one more per-runner target after the new runner's first cold build; relabel one runner at a time and watch the first job's sccache hit rate and free space before the next.

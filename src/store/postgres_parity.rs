@@ -230,9 +230,11 @@ pub(crate) async fn evict_tombstone_and_erase_in_tx(
     tx: &mut PgTx<'_>,
     victims: &[(String, String, Option<String>)],
     now: chrono::DateTime<chrono::Utc>,
-) -> StoreResult<()> {
+) -> StoreResult<crate::governance::audit::PendingAuditAnchor> {
+    // #7241 - the returned anchor is emitted by the caller after its COMMIT.
+    let mut anchor = crate::governance::audit::PendingAuditAnchor::none();
     if victims.is_empty() {
-        return Ok(());
+        return Ok(anchor);
     }
     let ids: Vec<String> = victims.iter().map(|(id, _, _)| id.clone()).collect();
 
@@ -293,7 +295,7 @@ pub(crate) async fn evict_tombstone_and_erase_in_tx(
             ts.clone(),
             None,
         );
-        pg_append_signed_event_with_chain_in_tx(
+        let appended = pg_append_signed_event_with_chain_in_tx(
             tx,
             PgSignedEventInsert {
                 id: &event.id,
@@ -308,6 +310,7 @@ pub(crate) async fn evict_tombstone_and_erase_in_tx(
         )
         .await
         .map_err(|e| to_store_err("evict crypto_erase attestation", e))?;
+        anchor = anchor.merge(appended);
     }
 
     // (4) Mandatory signed tombstone — identity + time + owner ONLY, never
@@ -337,7 +340,7 @@ pub(crate) async fn evict_tombstone_and_erase_in_tx(
     .await
     .map_err(|e| to_store_err("evict record tombstones", e))?;
 
-    Ok(())
+    Ok(anchor)
 }
 
 /// #3177 / #1771 — postgres twin of
@@ -404,13 +407,14 @@ pub(crate) async fn archive_links_for_memory_in_tx(tx: &mut PgTx<'_>, id: &str) 
 /// # Errors
 ///
 /// Returns [`StoreError::IntegrityFailed`] if the canonical CBOR cannot be
-/// encoded, else propagates the chain-append error.
+/// encoded, else propagates the chain-append error. The returned audit anchor
+/// is emitted by the caller after its COMMIT (#7241).
 pub(crate) async fn emit_pending_action_event_in_tx(
     tx: &mut PgTx<'_>,
     pa: &crate::models::PendingAction,
     event_type: &str,
     decided_by_override: Option<&str>,
-) -> StoreResult<()> {
+) -> StoreResult<crate::governance::audit::PendingAuditAnchor> {
     use crate::models::field_names;
     use std::collections::BTreeMap;
 
@@ -475,8 +479,7 @@ pub(crate) async fn emit_pending_action_event_in_tx(
         },
     )
     .await
-    .map_err(|e| to_store_err("append pending_action audit row", e))?;
-    Ok(())
+    .map_err(|e| to_store_err("append pending_action audit row", e))
 }
 
 /// #3064 batch D — postgres twin of sqlite

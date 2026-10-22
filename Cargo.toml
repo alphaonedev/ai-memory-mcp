@@ -638,6 +638,18 @@ lto = false
 codegen-units = 16
 incremental = false
 
+# #7188 - shrink the dev/test target. The linux-fed enterprise-fed CI leg builds
+# every integration test binary with `--features sal-postgres` and its
+# per-runner `target/` reached ~166 GiB. Dependencies are never debugged in CI
+# (the workspace crate keeps the line tables the CARGO_PROFILE_DEV_DEBUG
+# workflow env asks for), so drop their debuginfo and strip it from linked
+# artifacts. A per-package override beats the profile-wide env value. Profile
+# sections only: no dependency edit, Cargo.lock unchanged; `[profile.release]`
+# is untouched.
+[profile.dev.package."*"]
+debug = 0
+strip = "debuginfo"
+
 # v0.7.0 #873 — codify the per-function size budget so future PRs cannot
 # silently grow new god-functions past the threshold. 250 lines is the
 # discipline anchor (any tool body that needs more than 250 lines is
