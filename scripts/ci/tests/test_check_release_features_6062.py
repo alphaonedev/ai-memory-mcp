@@ -1,4 +1,4 @@
-"""Release-feature guard residue of umbrella #6062: #6289, #6290 and #6904.
+"""Release-feature guard residue of umbrella #6062: #6289, #6290, #6904, #8002, #8020, #8021 and #8023.
 
 Each test mutates the release workflows of the tree this module runs in (never
 a hard-coded copy) and requires scripts/check_release_features.py to refuse the
@@ -18,10 +18,12 @@ ROOT = Path(__file__).resolve().parents[3]
 SCRIPT = ROOT / "scripts" / "check_release_features.py"
 REL = ROOT / ".github" / "workflows" / "release.yml"
 SHAPE = ROOT / ".github" / "workflows" / "release-shape.yml"
+C8 = ROOT / ".github" / "workflows" / "c8-precheck.yml"
+PUBLISH = ROOT / ".github" / "workflows" / "publish-ci-image.yml"
 
 # One entry per issue this PR closes. SELF_CHECK below requires every issue to
 # have at least one pinned case and the count to equal this list.
-CLOSES = (6289, 6290, 6904)
+CLOSES = (6289, 6290, 6904, 8002, 8020, 8021, 8023)
 PINNED_CASES = {}  # issue number -> list of test method names, filled by pins()
 
 
@@ -89,8 +91,8 @@ class Controls(unittest.TestCase):
         self.assertEqual(errors_shape(read(SHAPE)), [])
 
     def test_self_check_pinned_case_count_equals_closes(self):
-        """The pinned-case count equals the Closes count (3)."""
-        self.assertEqual(len(CLOSES), 3)
+        """The pinned-case count equals the Closes count (7)."""
+        self.assertEqual(len(CLOSES), 7)
         self.assertEqual(sorted(PINNED_CASES), sorted(CLOSES))
         for issue in CLOSES:
             self.assertTrue(PINNED_CASES[issue], "no pinned case for #%d" % issue)
@@ -254,7 +256,8 @@ class FailClosed(unittest.TestCase):
 
     def make_tree(self, tmp, drop=None):
         for rel in ("scripts/release-features.sh", ".github/workflows/release.yml",
-                    ".github/workflows/release-shape.yml", "Dockerfile", "docs/INSTALL.md"):
+                    ".github/workflows/release-shape.yml", ".github/workflows/c8-precheck.yml",
+                    ".github/workflows/publish-ci-image.yml", "Dockerfile", "docs/INSTALL.md"):
             if rel == drop:
                 continue
             dst = Path(tmp) / rel
@@ -280,6 +283,137 @@ class FailClosed(unittest.TestCase):
         with tempfile.TemporaryDirectory(dir=scratch()) as tmp:
             root = self.make_tree(tmp)
             self.assertEqual(G.main([str(root)]), 0)
+
+
+SHA_USES = re.compile(r"(uses:\s*)([A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+)@([0-9a-f]{40})")
+
+
+def first_use_to_tag(text):
+    m = SHA_USES.search(text)
+    assert m is not None
+    return text[:m.start(3)] + "v4" + text[m.end(3):]
+
+
+def tree_with(tmp, rel, text):
+    root = FailClosed().make_tree(tmp)
+    (root / rel).write_bytes(text.encode("utf-8"))
+    return root
+
+
+class Walked8002(unittest.TestCase):
+    """#8002 / #8020 (part of #6904): the `uses:` walk covers c8-precheck.yml and the publish-ci path."""
+
+    def every_use(self, path, label):
+        text = read(path)
+        found = list(SHA_USES.finditer(text))
+        self.assertGreater(len(found), 3, label)
+        survivors = []
+        for m in found:
+            mut = text[:m.start(3)] + "v4" + text[m.end(3):]
+            rep = G.Report()
+            doc = G.parse_yaml(mut, label, rep)
+            G.check_uses_pinned(doc, label, rep)
+            if not rep.errors:
+                survivors.append(text.count("\n", 0, m.start()) + 1)
+        self.assertEqual(survivors, [], label)
+
+    @pins(8002)
+    def test_c8_precheck_every_use_refused_by_the_walk(self):
+        """#8002: every `uses:` of c8-precheck.yml repointed to a tag is refused by check_uses_pinned."""
+        self.every_use(C8, "c8-precheck.yml")
+
+    @pins(8002)
+    def test_c8_precheck_tag_is_refused_by_the_guard(self):
+        """#8002: run_guard refuses a c8-precheck.yml whose first `uses:` is @v4."""
+        with tempfile.TemporaryDirectory(dir=scratch()) as tmp:
+            root = tree_with(tmp, ".github/workflows/c8-precheck.yml", first_use_to_tag(read(C8)))
+            errors, _ = G.run_guard(root)
+            self.assertTrue(any("c8-precheck.yml" in e and "#6904" in e for e in errors), errors)
+
+    @pins(8020)
+    def test_publish_ci_every_use_refused_by_the_walk(self):
+        """#8020: every `uses:` of publish-ci-image.yml repointed to a tag is refused by check_uses_pinned."""
+        self.every_use(PUBLISH, "publish-ci-image.yml")
+
+    @pins(8020)
+    def test_publish_ci_tag_is_refused_by_the_guard(self):
+        """#8020: run_guard refuses a publish-ci-image.yml whose first `uses:` is @v4."""
+        with tempfile.TemporaryDirectory(dir=scratch()) as tmp:
+            root = tree_with(tmp, ".github/workflows/publish-ci-image.yml", first_use_to_tag(read(PUBLISH)))
+            errors, _ = G.run_guard(root)
+            self.assertTrue(any("publish-ci-image.yml" in e and "#6904" in e for e in errors), errors)
+
+    @pins(8020)
+    def test_missing_publish_or_c8_workflow_is_not_green(self):
+        """#8020: a missing c8-precheck.yml or publish-ci-image.yml is a failure, never OK."""
+        for rel in (".github/workflows/c8-precheck.yml", ".github/workflows/publish-ci-image.yml"):
+            with tempfile.TemporaryDirectory(dir=scratch()) as tmp:
+                root = FailClosed().make_tree(tmp, drop=rel)
+                errors, _ = G.run_guard(root)
+                self.assertTrue(errors, rel)
+
+    @pins(8020)
+    def test_undecodable_publish_or_c8_workflow_is_exit_2(self):
+        """#8020: a non-UTF-8 c8-precheck.yml or publish-ci-image.yml is undecidable: exit 2."""
+        for rel in (".github/workflows/c8-precheck.yml", ".github/workflows/publish-ci-image.yml"):
+            with tempfile.TemporaryDirectory(dir=scratch()) as tmp:
+                root = FailClosed().make_tree(tmp)
+                (root / rel).write_bytes(b"\xff\xfe\x00bad")
+                self.assertEqual(G.main([str(root)]), 2, rel)
+
+
+class Named8021(unittest.TestCase):
+    """#8021: the `uses:` refusal names the job and the step, not only a line number."""
+
+    @pins(8021)
+    def test_error_names_job_and_step(self):
+        """#8021: a tag-pinned crates-io step is reported with its job and step."""
+        text = read(REL)
+        a, b = job_span(text, "crates-io")
+        mut = text[:a] + first_use_to_tag(text[a:b]) + text[b:]
+        errs = [e for e in errors_release(mut) if "#6904" in e]
+        self.assertEqual(len(errs), 1, errs)
+        self.assertIn("job `crates-io`", errs[0])
+        self.assertIn("step ", errs[0])
+        self.assertIn("release.yml", errs[0])
+
+    @pins(8021)
+    def test_error_names_the_job_in_another_workflow(self):
+        """#8021: the same naming for c8-precheck.yml."""
+        rep = G.Report()
+        doc = G.parse_yaml(first_use_to_tag(read(C8)), "c8-precheck.yml", rep)
+        G.check_uses_pinned(doc, "c8-precheck.yml", rep)
+        self.assertEqual(len(rep.errors), 1, rep.errors)
+        self.assertIn("job `c8-precheck`", rep.errors[0])
+
+
+NEW_CELLS = (
+    "N1 root job preflight gains needs is refused",
+    "N2 homebrew needs drops release is refused",
+    "N3 release.yml uses repointed to a tag is refused",
+    "N4 release-shape.yml uses repointed to a tag is refused",
+    "N5 c8-precheck.yml uses repointed to a tag is refused",
+    "N6 publish-ci-image.yml uses repointed to a tag is refused",
+    "N7 release-shape steps is a scalar is refused",
+    "N8 release-shape step appended is refused",
+    "N10 release-shape guard step gains if: false is refused",
+)
+
+
+class SelfTest8023(unittest.TestCase):
+    """#8023: --self-test (run by c8-precheck) carries a cell for each new refusal site."""
+
+    @pins(8023)
+    def test_self_test_has_a_cell_per_new_site(self):
+        """#8023: every new refusal has a named cell and the guard-case count rises above 355."""
+        missing = [n for n in NEW_CELLS if n not in G.CASES]
+        self.assertEqual(missing, [])
+        self.assertGreater(len(G.CASES), 355)
+
+    @pins(8023)
+    def test_unit_slot_swap_is_a_message_cell(self):
+        """#8023: swapping the guard and build steps is proven by a message cell (exact count)."""
+        self.assertIn("message: swapped guard and build steps name the unit slot", G.MESSAGE_CASES)
 
 
 if __name__ == "__main__":
