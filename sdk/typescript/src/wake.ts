@@ -77,6 +77,7 @@ import {
   lstatSync,
   openSync,
   readFileSync,
+  type BigIntStats,
   type Stats,
 } from "node:fs";
 import { connect as netConnect, type Socket } from "node:net";
@@ -480,27 +481,28 @@ export interface BundleFile {
  * path-based fallback refuse with the SAME words. `path` is only ever used to
  * word the message; nothing here resolves it again.
  */
-function checkBundleStat(path: string, st: Stats): void {
+function checkBundleStat(path: string, st: Stats | BigIntStats): void {
   if (!st.isFile()) throw new WakeError(`${path} is not a regular file`);
-  if ((st.mode & 0o077) !== 0) {
+  const mode = Number(st.mode);
+  const uid = Number(st.uid);
+  if ((mode & 0o077) !== 0) {
     throw new WakeError(
-      `${path} is mode ${(st.mode & 0o7777).toString(8).padStart(4, "0")}; a bundle ` +
+      `${path} is mode ${(mode & 0o7777).toString(8).padStart(4, "0")}; a bundle ` +
         "holding a private key must be 0600, or another local user can join the hub " +
         "as this agent",
     );
   }
-  if (typeof process.geteuid === "function" && st.uid !== process.geteuid()) {
-    throw new WakeError(`${path} is owned by uid ${st.uid}, not by the caller`);
+  if (typeof process.geteuid === "function" && uid !== process.geteuid()) {
+    throw new WakeError(`${path} is owned by uid ${uid}, not by the caller`);
   }
 }
 
 /**
- * Test seam for {@link readOwnerOnlyWindows}: `betweenCheckAndRead` runs after
- * the permission check and before the read, so a test can swap the path the
+ * Test seam for {@link readOwnerOnlyWindows}: `afterOpen` runs after the
+ * descriptor is checked and before the path is re-examined, so a test can swap the path the
  * way a local attacker would.
  */
 export interface WindowsReadHooks {
-  betweenCheckAndRead?: () => void;
   afterOpen?: () => void;
 }
 
@@ -509,16 +511,37 @@ export interface WindowsReadHooks {
  * platform (it uses only `node:fs` calls that exist everywhere).
  */
 export function readOwnerOnlyWindows(path: string, hooks: WindowsReadHooks = {}): string {
-  const st = lstatSync(path);
-  if (st.isSymbolicLink()) {
-    throw new WakeError(
-      `${path} is a symlink: a credential reached through a link is one whose ` +
-        "permissions were checked on the wrong file",
-    );
+  let fd: number;
+  try {
+    fd = openSync(path, fsConstants.O_RDONLY);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new WakeError(`${path} does not exist: the credential file is missing`);
+    }
+    throw err;
   }
-  checkBundleStat(path, st);
-  hooks.betweenCheckAndRead?.();
-  return readFileSync(path, "utf8");
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    checkBundleStat(path, opened);
+    hooks.afterOpen?.();
+    // Re-look at the path: a link, or a different file, now living there means
+    // the descriptor is not the credential the caller named.
+    const current = lstatSync(path, { bigint: true });
+    if (current.isSymbolicLink()) {
+      throw new WakeError(
+        `${path} is a symlink: a credential reached through a link is one whose ` +
+          "permissions were checked on the wrong file",
+      );
+    }
+    if (current.dev !== opened.dev || current.ino !== opened.ino) {
+      throw new WakeError(
+        `${path} was replaced while it was being read: the file opened is no longer the file at the path`,
+      );
+    }
+    return readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**
@@ -540,11 +563,13 @@ export function readOwnerOnlyWindows(path: string, hooks: WindowsReadHooks = {})
  * `src/wake_client/bundle.rs` (`open_owner_only`), modelled in turn on
  * `AllowlistCache::open_checked` (#3504).
  *
- * **Platform caveat:** Windows has no `O_NOFOLLOW` and no `O_NONBLOCK`, so
- * there is no way to bind the check to the descriptor with `node:fs` there.
- * That leg keeps the historical path-based check-then-read, unchanged and
- * still racy, and says so rather than pretending otherwise. The hub socket and
- * the key directory this loader serves are POSIX-only surfaces today.
+ * **Platform caveat:** Windows has no `O_NOFOLLOW` and no `O_NONBLOCK`, so the
+ * open cannot refuse a link by itself. That leg ({@link readOwnerOnlyWindows})
+ * is bound after the fact instead: it opens ONCE, checks the descriptor with
+ * `fstat`, then `lstat`s the path and refuses a symlink or any `dev`/`ino`
+ * that differs from the descriptor's, and reads from the descriptor. A swap
+ * between the open and the `lstat` is refused; a swap after the `lstat` cannot
+ * change the bytes, because the read is from the descriptor already opened.
  */
 function readOwnerOnly(path: string): string {
   const noFollow = fsConstants.O_NOFOLLOW;

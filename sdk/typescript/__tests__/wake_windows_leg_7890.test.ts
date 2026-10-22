@@ -4,7 +4,7 @@
 /**
  * #7890: the Windows leg of `readOwnerOnly` must bind its check to the bytes it
  * reads. The leg is exercised on any platform through `readOwnerOnlyWindows`.
- * The race is simulated with the `betweenCheckAndRead` / `afterOpen` hooks: the
+ * The race is simulated with the `afterOpen` hook: the
  * hook swaps the path exactly where a local attacker would.
  */
 
@@ -51,7 +51,7 @@ describe("readOwnerOnlyWindows (#7890)", () => {
     writeFileSync(evil, SWAPPED, { mode: 0o600 });
     const swap = (): void => renameSync(evil, p);
     expect(() =>
-      readOwnerOnlyWindows(p, { betweenCheckAndRead: swap, afterOpen: swap }),
+      readOwnerOnlyWindows(p, { afterOpen: swap }),
     ).toThrow(WakeError);
   });
 
@@ -63,7 +63,7 @@ describe("readOwnerOnlyWindows (#7890)", () => {
     symlinkSync(other, link);
     const swap = (): void => renameSync(link, p);
     expect(() =>
-      readOwnerOnlyWindows(p, { betweenCheckAndRead: swap, afterOpen: swap }),
+      readOwnerOnlyWindows(p, { afterOpen: swap }),
     ).toThrow(WakeError);
   });
 
