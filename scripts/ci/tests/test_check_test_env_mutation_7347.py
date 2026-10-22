@@ -1358,6 +1358,44 @@ class Issue8034(Fixture):
         self.assertEqual(self.flagged(text), set())
 
 
+class Issue8035(Fixture):
+    """#8035: "resolve the placeholder by scope: the binding must be the one visible at the use site;
+    a same-named parameter, `for` variable or closure parameter shadows the check; undecidable keeps the
+    reader (fail closed)". A `let` of another fn, or one that follows the use, is no evidence either."""
+
+    GET = 'let c = reqwest::Client::new();\n    let _r = c.get(format!("http://{}/x", host));'
+
+    SHADOWED = {
+        "helper_parameter": ('fn helper(host: &str) {\n    %s\n}\n' % GET
+                             + test_fn("reader", 'let host = "127.0.0.1";\n    let _u = host;\n    helper("peer.example");')),
+        "for_variable": test_fn("reader", 'let host = "127.0.0.1";\n    let c = reqwest::Client::new();\n'
+                                '    for host in ["peer.example"] {\n        let _r = c.get(format!("http://{}/x", host));\n    }'),
+        "closure_parameter": test_fn("reader", 'let host = "127.0.0.1";\n    let c = reqwest::Client::new();\n'
+                                     '    let f = |host: &str| c.get(format!("http://{}/x", host));\n    f("peer.example");'),
+        "pattern_binding": test_fn("reader", 'let host = "127.0.0.1";\n    let c = reqwest::Client::new();\n'
+                                   '    if let Some(host) = peer() {\n        let _r = c.get(format!("http://{}/x", host));\n    }'),
+        "let_follows_the_use": test_fn("reader", 'let c = reqwest::Client::new();\n'
+                                       '    let _r = c.get(format!("http://{}/x", host));\n    let host = "127.0.0.1";'),
+        "let_of_another_fn": ('fn helper() {\n    let c = reqwest::Client::new();\n'
+                              '    let _r = c.get(format!("http://{}/x", host));\n}\n'
+                              + test_fn("reader", 'let host = "127.0.0.1";\n    helper();')),
+    }
+
+    def test_a_shadowed_or_foreign_binding_keeps_the_reader(self):
+        for name, body in self.SHADOWED.items():
+            with self.subTest(shape=name):
+                self.assertEqual(self.flagged(WRITER + body), FLAGGED)
+
+    def test_the_plain_let_in_the_same_fn_is_still_ip_only(self):
+        body = test_fn("reader", 'let host = "127.0.0.1";\n    ' + self.GET)
+        self.assertEqual(self.flagged(WRITER + body), set())
+
+    def test_ip_only_text_resolves_by_scope(self):
+        text = 'let host = "127.0.0.1"; get(format!("http://{}/x", host))'
+        self.assertTrue(gate.ip_only_text(text))
+        self.assertFalse(gate.ip_only_text(text, "fn helper(host: &str) "))
+
+
 class RealTree(unittest.TestCase):
     def test_repo_matches_its_baseline(self):
         found = gate.scan_tree(REPO)

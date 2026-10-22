@@ -602,20 +602,42 @@ def format_args(text, end):
     return [a for a in out if a]
 
 
-def ip_expr(expr, text, depth=0):
-    """True when expr is an IP literal, a `local_addr()` call, or a same-text `let` bound to one (#7997)."""
+def rebound(text, name, sig):
+    """True when `name` is bound by anything other than a plain `let` of the fn body (#8035).
+
+    A parameter of the fn (sig), a `for` variable, a closure parameter, a `let` or `match` pattern or an
+    `@` binding shadows or replaces the plain `let`, so which value reaches the use site is undecidable
+    here and the caller fails closed.
+    """
+    n = re.escape(name)
+    shapes = (
+        r"\bfor\s+[^{;]*?\b%s\b[^{;]*?\bin\b" % n,
+        r"\|[^|{};]*\b%s\b[^|{};]*\|" % n,
+        r"\blet\s+(?!(?:mut\s+)?%s\s*[:=])[^=;]*?\b%s\b" % (n, n),
+        r"\(\s*[^()]*\b%s\b[^()]*\)\s*(?:if\b[^=]*)?=>" % n,
+        r"\b%s\s*(?:@|=>)" % n,
+    )
+    return bool(re.search(r"(?<![\w.])%s\b" % n, sig)) or any(re.search(x, text) for x in shapes)
+
+
+def ip_expr(expr, text, at=0, sig="", depth=0):
+    """True when expr is an IP literal, the canonical `local_addr()` call, or a `let` of the same fn that
+    precedes the use at `at` and is bound to one (#7997, #8035, #8036). Anything else fails closed."""
     expr = expr.strip().lstrip("&").strip()
     if LOCAL_ADDR.search(expr) or IP_STR.fullmatch(expr):
         return True
     if depth < 4 and re.fullmatch(r"[A-Za-z_]\w*", expr):
-        inits = re.findall(LET_INIT % re.escape(expr), text)
-        return bool(inits) and all(ip_expr(i, text, depth + 1) for i in inits)
+        if rebound(text, expr, sig):
+            return False
+        inits = [mm for mm in re.finditer(LET_INIT % re.escape(expr), text) if mm.start() < at]
+        return bool(inits) and all(ip_expr(mm.group(1), text, mm.start(), sig, depth + 1) for mm in inits)
     return False
 
 
-def url_host_is_ip(text, m):
+def url_host_is_ip(text, m, sig=""):
     """True when the URL literal matched at m names an IP host: an IP literal, or one placeholder that data
-    flows from `local_addr()` or an IP literal (#7997). Anything else fails closed."""
+    flows from `local_addr()` or an IP literal (#7997). `sig` is the signature of the fn holding `text`.
+    Anything else fails closed."""
     host = m.group(1).rsplit("@", 1)[-1]
     bare = re.sub(r"(?<=\]|\d|\}):\d+$", "", host)
     if IP_HOST.fullmatch(bare):
@@ -636,15 +658,15 @@ def url_host_is_ip(text, m):
         else:
             before = literal[:m.start() - (open_q + 1)]
             index = len([p for p in PLACEHOLDER.finditer(before) if p.group(1).strip() == ""])
-        return index < len(args) and ip_expr(args[index], text)
+        return index < len(args) and ip_expr(args[index], text, m.start(), sig)
     for arg in args:
         named = re.fullmatch(r"%s\s*=\s*(.*)" % re.escape(name), arg, re.DOTALL)
         if named:
-            return ip_expr(named.group(1), text)
-    return ip_expr(name, text)
+            return ip_expr(named.group(1), text, m.start(), sig)
+    return ip_expr(name, text, m.start(), sig)
 
 
-def ip_only_text(raw):
+def ip_only_text(raw, sig=""):
     """True when raw source text (one fn) reaches the network only through IP hosts (#7526, #7997).
 
     A reqwest client with rustls reads Rust-side env only, and a request to an IP literal never calls
@@ -654,10 +676,21 @@ def ip_only_text(raw):
     literal at all, a hostname, `localhost`, a resolver word, a scheme placeholder or any other host shape
     keeps the reader.
     """
-    if raw is None or RESOLVER_WORDS.search(raw):
-        return False
-    urls = list(URL_LIT.finditer(raw))
-    return bool(urls) and all(url_host_is_ip(raw, m) for m in urls)
+    return ip_only_parts([(raw, sig)])
+
+
+def ip_only_parts(parts):
+    """ip_only_text over [(raw, signature)] of several fns: each URL literal is judged inside its own fn (#8035),
+    so a binding of another fn is no evidence. At least one URL literal must exist in all the parts together."""
+    total = 0
+    for raw, sig in parts:
+        if raw is None or RESOLVER_WORDS.search(raw):
+            return False
+        for m in URL_LIT.finditer(raw):
+            total += 1
+            if not url_host_is_ip(raw, m, sig):
+                return False
+    return total > 0
 
 
 AWAIT_OR_UNWRAP = frozenset(("await", "unwrap", "expect", "unwrap_or_else"))
@@ -1549,6 +1582,15 @@ class FileModel:
                 out.append((m.start(), None))
         return out
 
+    def fn_sig(self, fn):
+        """Raw signature text of fn (from its `fn name` to its `{`): the parameters bind names too (#8035)."""
+        raw = self.src.raw
+        if raw is None:
+            return ""
+        head = raw[max(0, fn.offset - 4000):fn.offset]
+        starts = [m.start() for m in re.finditer(r"\bfn\s+%s\b" % re.escape(fn.name), head)]
+        return head[starts[-1]:] if starts else head
+
     def fn_raw(self, fn):
         """Raw text of fn with its `//` comments blanked (length preserved)."""
         raw = self.src.raw
@@ -1579,8 +1621,7 @@ class FileModel:
         hosts. The verdict is per root test fn, so a `local_addr()` in an unrelated fn is no evidence."""
         key = id(root)
         if key not in self._ip_only:
-            texts = [self.fn_raw(f) for f in self.tree_fns(root)]
-            self._ip_only[key] = None not in texts and ip_only_text(chr(10).join(texts))
+            self._ip_only[key] = ip_only_parts([(self.fn_raw(f), self.fn_sig(f)) for f in self.tree_fns(root)])
         return self._ip_only[key]
 
     def satisfied(self, held, site, root):
