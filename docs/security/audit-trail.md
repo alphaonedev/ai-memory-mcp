@@ -609,8 +609,11 @@ ai-memory audit re-anchor
 Tail and (optionally) stream operational logs. `--follow` prints every
 line appended after the tail pass exactly once and survives log rotation:
 when a newer log file appears it drains the old one and continues with the
-new one, and a truncated or replaced (new inode) file is re-read from the
-start with a note on stderr. Accepts the global
+new one, and a truncated file (shrunk, or rewritten so the bytes before the
+read position changed) or a replaced file (new inode, detected on unix only)
+is re-read from the start with a note on stderr. On platforms without inode
+identity a rename-and-recreate that is larger than the read position is
+detected by the same bytes-before-the-position check. Accepts the global
 `--log-dir <PATH>` override. See the **Log directory resolution**
 section above for the full precedence ladder.
 

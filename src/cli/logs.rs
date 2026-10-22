@@ -293,6 +293,66 @@ struct FollowState {
     id: Option<u64>,
     /// Open handle on the followed inode (kept so a renamed file can be drained).
     file: Option<fs::File>,
+    /// Up to [`FOLLOW_FINGERPRINT_LEN`] bytes that ended at `offset` when it was
+    /// last advanced; empty means unknown. A same-inode truncate that regrows
+    /// past `offset` between two polls leaves the length looking like growth,
+    /// but these bytes no longer match (#7965).
+    fingerprint: Vec<u8>,
+}
+
+/// How many bytes before the cursor are kept to tell a truncate-then-regrow
+/// from plain growth. A log line is longer than this in practice, so a
+/// rewritten file differs inside the window.
+const FOLLOW_FINGERPRINT_LEN: u64 = 64;
+
+impl FollowState {
+    /// Cursor at `offset` of the open handle `file`, with the fingerprint of
+    /// the bytes just before the cursor.
+    fn new(path: PathBuf, offset: u64, id: Option<u64>, file: fs::File) -> Self {
+        let fingerprint = read_fingerprint(&file, offset);
+        Self {
+            path,
+            offset,
+            id,
+            file: Some(file),
+            fingerprint,
+        }
+    }
+
+    /// True while the bytes before the cursor are the ones last seen there.
+    fn fingerprint_holds(&self) -> bool {
+        match self.file.as_ref() {
+            Some(file) if !self.fingerprint.is_empty() => {
+                read_fingerprint(file, self.offset) == self.fingerprint
+            }
+            _ => true,
+        }
+    }
+}
+
+/// The up-to-[`FOLLOW_FINGERPRINT_LEN`] bytes of `file` that end at `offset`;
+/// empty when the cursor is at the start or the read fails (a short read then
+/// compares unequal to a stored fingerprint, which reads as truncation).
+fn read_fingerprint(file: &fs::File, offset: u64) -> Vec<u8> {
+    use std::io::Read as _;
+    use std::io::Seek as _;
+    use std::io::SeekFrom;
+    let len = offset.min(FOLLOW_FINGERPRINT_LEN);
+    let mut buf = Vec::new();
+    if len == 0 {
+        return buf;
+    }
+    let mut handle = file;
+    if handle
+        .seek(SeekFrom::Start(offset.saturating_sub(len)))
+        .is_err()
+    {
+        return buf;
+    }
+    if (&mut handle).take(len).read_to_end(&mut buf).is_err() {
+        buf.clear();
+    }
+    buf
 }
 
 /// Stable identity of the file behind `meta`: the inode on unix, `None` where
@@ -431,6 +491,9 @@ fn drain_followed(
         }
     }
     state.offset = end;
+    if let Some(file) = state.file.as_ref() {
+        state.fingerprint = read_fingerprint(file, end);
+    }
     Ok(())
 }
 
@@ -445,6 +508,7 @@ fn switch_to(state: &mut FollowState, path: PathBuf) {
     state.file = file;
     state.path = path;
     state.offset = 0;
+    state.fingerprint.clear();
 }
 
 /// One poll of `logs tail --follow`: handle rotation (a newer-named file, a
@@ -482,13 +546,20 @@ fn follow_poll(
             )?;
             let path = state.path.clone();
             switch_to(state, path);
-        } else if meta.len() < state.offset {
+        } else if meta.len() < state.offset || !state.fingerprint_holds() {
+            // decision: a short prefix fingerprint of the bytes before the
+            // cursor over mtime+len or a content hash, because it costs one
+            // 64-byte read per poll, needs no clock, and sees a same-inode
+            // truncate that regrows past the old offset within one poll
+            // (#7965). It misses only a rewrite whose last 64 bytes before
+            // the cursor are byte-identical to the old ones.
             writeln!(
                 out.stderr,
                 "logs: {} was rotated or truncated; following from the start",
                 state.path.display()
             )?;
             state.offset = 0;
+            state.fingerprint.clear();
         }
         if state.id.is_none() {
             state.id = id;
@@ -528,12 +599,7 @@ fn run_tail(dir: &Path, filters: &Filters, args: &TailArgs, out: &mut CliOutput<
     if !args.follow {
         return Ok(());
     }
-    let mut state = FollowState {
-        path: latest,
-        offset,
-        id,
-        file: Some(file),
-    };
+    let mut state = FollowState::new(latest, offset, id, file);
     follow_from(dir, &mut state, filters, args, out)
 }
 
@@ -813,6 +879,7 @@ mod tests {
             offset,
             id,
             file: Some(file),
+            fingerprint: Vec::new(),
         };
         let s = follow_to_string(dir.path(), &mut state, 2);
         assert_eq!(s.matches("second").count(), 1, "got: {s:?}");
@@ -830,6 +897,7 @@ mod tests {
             offset: 6,
             id: None,
             file: None,
+            fingerprint: Vec::new(),
         };
         append(&a, "late-a\n");
         let dir_path = dir.path().to_path_buf();
@@ -853,6 +921,7 @@ mod tests {
             offset: 10,
             id: None,
             file: None,
+            fingerprint: Vec::new(),
         };
         let a2 = a.clone();
         let h = std::thread::spawn(move || {
@@ -875,6 +944,7 @@ mod tests {
             offset: 13,
             id: None,
             file: None,
+            fingerprint: Vec::new(),
         };
         let dir_path = dir.path().to_path_buf();
         let h = std::thread::spawn(move || {
@@ -902,6 +972,7 @@ mod tests {
             offset: 6,
             id: Some(ino),
             file: Some(handle),
+            fingerprint: Vec::new(),
         };
         let dir_path = dir.path().to_path_buf();
         let h = std::thread::spawn(move || {
@@ -948,6 +1019,7 @@ mod tests {
             offset,
             id,
             file: Some(file),
+            fingerprint: Vec::new(),
         };
         append(&path, "ial\n");
         let (s, _) = poll_once(dir.path(), &mut state);
@@ -975,6 +1047,7 @@ mod tests {
             offset: 2,
             id: file.metadata().ok().as_ref().and_then(file_id),
             file: Some(file),
+            fingerprint: Vec::new(),
         };
         let moved = dir.path().join("ai-memory.log.2026-04-30.zst");
         fs::rename(&newest, &moved).unwrap();
@@ -982,6 +1055,26 @@ mod tests {
         let (s, _) = poll_once(dir.path(), &mut state);
         assert_eq!(s, "late\n", "old handle drained, older file not reprinted");
         assert_eq!(state.path, newest, "still following the renamed file");
+    }
+
+    /// #7965 - truncate then regrow past the old offset between two polls on
+    /// the same inode: the new head must not be lost.
+    #[test]
+    fn logs_tail_follow_detects_truncate_then_regrow_7965() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-04-30", "aaaa\nbbbb\n");
+        let file = fs::File::open(&a).unwrap();
+        let id = file.metadata().ok().as_ref().and_then(file_id);
+        let mut state = FollowState::new(a.clone(), 10, id, file);
+        fs::write(&a, "cc\ndd\nee\nffffff\n").unwrap();
+        let (s, e) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "cc\ndd\nee\nffffff\n", "re-read from the start: {s:?}");
+        assert!(e.contains("rotated or truncated"), "stderr note: {e:?}");
+        // Plain growth keeps the fingerprint valid: no note, no re-read.
+        append(&a, "gg\n");
+        let (s, e) = poll_once(dir.path(), &mut state);
+        assert_eq!(s, "gg\n", "growth printed once: {s:?}");
+        assert!(e.is_empty(), "no truncation note on growth: {e:?}");
     }
 
     #[test]
