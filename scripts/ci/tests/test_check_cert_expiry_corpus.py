@@ -714,6 +714,25 @@ def guarded(cell, *args, **kwargs):
         return f"{cell.__name__} raised {type(exc).__name__}: {exc}"
 
 
+def run_cells(t, cells):
+    """Run (tag, cell, args) self-test cells in order (#6145 R8-F1). The first violation
+    is reported through t.fail as `(<tag>, #6145): <violation>` and returns 2; None when
+    every cell passes. A path-max-restore violation that is not a leak is tagged
+    path-max-fallback, since the fallback check runs inside that cell."""
+    for tag, cell, cell_args in cells:
+        try:
+            res = guarded(cell, *cell_args)
+        except Exception as exc:  # noqa: BLE001 - guarded itself must never leak a crash
+            res = f"{cell.__name__} escaped guarded: {type(exc).__name__}: {exc}"
+        if res is not None:
+            if tag == "path-max-restore" and not res.startswith(PATH_MAX_LEAK_PREFIX):
+                tag = "path-max-fallback"  # the fallback check runs inside the restore cell
+            t.fail(f"({tag}, #6145): {res}")
+            print("check-cert-expiry self-test: FAIL", file=sys.stderr)
+            return 2
+    return None
+
+
 def shim_unexecutable_violation(tmp):
     """None when a shim whose interpreter does not exist is reported as 'the shim could
     not be executed', else a description (#6145 R10-F1). The interpreter line is 251
