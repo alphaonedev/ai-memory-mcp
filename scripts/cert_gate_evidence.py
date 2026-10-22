@@ -337,6 +337,14 @@ def _safe_remove(raw: str) -> None:
         target.unlink()
 
 
+def _note_unavailable(stream: IO[str], exc: OSError) -> None:
+    """Best-effort ``LEG B evidence unavailable`` line; a broken stream cannot raise (#7893)."""
+    try:
+        stream.write("\n== LEG B evidence unavailable: %s ==\n" % (exc.strerror or exc.__class__.__name__))
+    except (OSError, ValueError):
+        return  # the stream itself is gone: the trap must still keep the gate's exit status
+
+
 def finalize(state_dir: Path, evidence_dir: Path, tail_lines: int, stream: IO[str]) -> int:
     """EXIT-trap body of the gate: report LEG B evidence on a LEG B failure, then clean up.
 
@@ -345,7 +353,7 @@ def finalize(state_dir: Path, evidence_dir: Path, tail_lines: int, stream: IO[st
     shell trap keeps the gate's own exit status.
     """
     rows = state_dir / "fail-rows"
-    with contextlib.suppress(OSError):
+    try:
         leg_b = rows.is_file() and any(
             ln.split("\t", 1)[0] == "B"
             for ln in rows.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -353,6 +361,9 @@ def finalize(state_dir: Path, evidence_dir: Path, tail_lines: int, stream: IO[st
         if leg_b and evidence_dir.is_dir():
             stream.write("\n== LEG B evidence (redacted, last %d lines per file; #7181) ==\n" % tail_lines)
             print_evidence(evidence_dir, evidence_names(evidence_dir, DEFAULT_NAMES), tail_lines, stream)
+    except OSError as exc:
+        # The failure artifact must say its LEG B section is missing (#7893).
+        _note_unavailable(stream, exc)
     listing = state_dir / "cleanup-list"
     try:
         paths = listing.read_text(encoding="utf-8", errors="replace").splitlines() if listing.is_file() else []

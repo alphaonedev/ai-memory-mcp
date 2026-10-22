@@ -19,6 +19,7 @@
 
 Stdlib only. Run: ``python3 -I scripts/test/test_cert_gate_evidence_7181.py``
 """
+import contextlib
 import importlib.util
 import io
 import os
@@ -221,6 +222,42 @@ class HelperRedactsAndBounds(unittest.TestCase):
             buf = io.StringIO()
             mod.finalize(state, ev, TAIL_LINES, buf)
             self.assertEqual(buf.getvalue(), "")
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root reads any file")
+    def test_finalize_unreadable_rows_writes_unavailable_line_7893(self):
+        mod = _load_helper()
+        with _scratch() as td:
+            td = Path(td)
+            ev, state = td / "ev", td / "state"
+            ev.mkdir()
+            state.mkdir()
+            rows = state / "fail-rows"
+            rows.write_text("B\tleg b row\n", encoding="utf-8")
+            rows.chmod(0)
+            buf = io.StringIO()
+            try:
+                rc = mod.finalize(state, ev, TAIL_LINES, buf)
+            finally:
+                if rows.exists():
+                    rows.chmod(0o600)
+        self.assertEqual(rc, 0)
+        self.assertRegex(buf.getvalue(), r"== LEG B evidence unavailable: .+ ==")
+
+    def test_finalize_unavailable_line_write_failure_never_raises_7893(self):
+        mod = _load_helper()
+
+        class Broken(io.StringIO):
+            def write(self, _s):
+                raise OSError("stream closed")
+
+        with _scratch() as td:
+            td = Path(td)
+            ev, state = td / "ev", td / "state"
+            ev.mkdir()
+            state.mkdir()
+            (state / "fail-rows").write_text("B\tleg b row\n", encoding="utf-8")
+            (ev / "bring-up.out").write_text("hello\n", encoding="utf-8")
+            self.assertEqual(mod.finalize(state, ev, TAIL_LINES, Broken()), 0)
 
     def test_tail_is_bounded_with_header(self):
         mod = _load_helper()
