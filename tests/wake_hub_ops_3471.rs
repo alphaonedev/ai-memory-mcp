@@ -406,3 +406,50 @@ async fn an_overflowing_recipient_names_the_bound_that_refused_it() {
     deaf.shutdown_write().await;
     hub.stop().await;
 }
+
+/// Upper bound on the wakes the no-drain regression sends. The hub drains the
+/// sender's refusals into the kernel socket buffer (~200 KB on Linux) before
+/// its own 8 KiB egress queue can fill, and a refusal is ~500 B, so the close
+/// needs well under a thousand unread refusals; four thousand is a wide margin.
+const NO_DRAIN_WAKE_BOUND: usize = 4_000;
+
+/// #7951 — a sender that never reads its own `error/507` refusals is
+/// disconnected by design (`conn.rs` `send_error` -> `send` ->
+/// `try_enqueue` returns `false` once the sender's own egress queue is full).
+/// The harness must report that closed session as an `Err`, not panic inside
+/// `write_raw_framed`.
+#[tokio::test]
+async fn a_sender_that_never_reads_its_refusals_is_disconnected_not_a_panic_7951() {
+    let sender_id = "s".repeat(120);
+    let deaf_id = "d".repeat(120);
+    let key_sender = key(23);
+    let key_deaf = key(24);
+    let hub = Harness::start(
+        |cfg: &mut HubConfig| {
+            cfg.rate_per_sec = 1_000_000;
+            cfg.rate_burst = 1_000_000;
+            cfg.queue_bytes = 8 * 1_024;
+            cfg.global_egress_bytes = 32 * 1_024;
+        },
+        Arc::new(verifier_allowing(&[
+            (sender_id.as_str(), &key_sender),
+            (deaf_id.as_str(), &key_deaf),
+        ])),
+        Arc::new(SameUidAuthorizer::for_current_process()),
+    );
+
+    let mut deaf = hub.connect().await;
+    deaf.hello(&deaf_id, &key_deaf, &[]).await;
+    assert_eq!(deaf.expect_frame().await.kind, Kind::Welcome);
+
+    let mut sender = hub.connect().await;
+    sender.hello(&sender_id, &key_sender, &[]).await;
+    assert_eq!(sender.expect_frame().await.kind, Kind::Welcome);
+
+    let big_row = "r".repeat(80);
+    for _ in 0..NO_DRAIN_WAKE_BOUND {
+        sender.wake(&deaf_id, &big_row).await;
+    }
+
+    hub.stop().await;
+}
