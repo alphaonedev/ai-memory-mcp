@@ -969,13 +969,17 @@ written against a documented contract:
 Every frame the hub sends a peer, whether an `error` reply or a non-error hub
 frame such as a `welcome` or `pong`, goes through the same enqueue as a routed
 wake and is charged to that peer's own egress queue. If any of the three bounds
-refuses it (the peer's per-recipient byte cap, the hub-wide egress budget, or
-the depth of the peer's frame channel), the hub closes that peer's session
-rather than continue to speak to a peer that is not listening. A refused wake is
-answered with a per-message `error/507`, which on its own keeps the session open
-(Rule s), but a sender that floods refused wakes and never reads those replies
-fills its own queue until a reply no longer fits, and is then disconnected
-(#7951).
+(the peer's per-recipient byte cap, the hub-wide egress budget, or the depth of
+the peer's frame channel) refuses the `welcome`, a `pong` or an `error` reply,
+the hub closes that peer's session rather than continue to speak to a peer that
+is not listening. The wakes the hub replays right after the `welcome` for the ids that coalesced while the
+peer was offline are best-effort: the `welcome` already carries the
+authoritative pending count and the `lagged` marker, so when one of those replay
+wakes is refused the hub stops the replay and keeps the session. A refused
+routed wake is answered with a per-message `error/507`, which on its own keeps
+the session open (Rule s), but a sender that floods refused wakes and never
+reads those replies fills its own queue until a reply no longer fits, and is
+then disconnected (#7951).
 
 Two properties are load-bearing. The histograms are **fixed-bucket and
 allocation-free** — an observability surface the hub can be made to allocate
