@@ -291,6 +291,8 @@ struct FollowState {
     path: PathBuf,
     offset: u64,
     id: Option<u64>,
+    /// Open handle on the followed inode (kept so a renamed file can be drained).
+    file: Option<fs::File>,
 }
 
 /// Stable identity of the file behind `meta`: the inode on unix, `None` where
@@ -474,6 +476,7 @@ fn run_tail(dir: &Path, filters: &Filters, args: &TailArgs, out: &mut CliOutput<
         path: latest,
         offset,
         id,
+        file: None,
     };
     follow_from(dir, &mut state, filters, args, out)
 }
@@ -753,6 +756,7 @@ mod tests {
             path: path.clone(),
             offset,
             id,
+            file: None,
         };
         let s = follow_to_string(dir.path(), &mut state, 2);
         assert_eq!(s.matches("second").count(), 1, "got: {s:?}");
@@ -769,6 +773,7 @@ mod tests {
             path: a.clone(),
             offset: 6,
             id: None,
+            file: None,
         };
         append(&a, "late-a\n");
         let dir_path = dir.path().to_path_buf();
@@ -791,6 +796,7 @@ mod tests {
             path: a.clone(),
             offset: 10,
             id: None,
+            file: None,
         };
         let a2 = a.clone();
         let h = std::thread::spawn(move || {
@@ -812,6 +818,7 @@ mod tests {
             path: a.clone(),
             offset: 13,
             id: None,
+            file: None,
         };
         let dir_path = dir.path().to_path_buf();
         let h = std::thread::spawn(move || {
@@ -822,6 +829,38 @@ mod tests {
         let s = follow_to_string(dir.path(), &mut state, 8);
         h.join().unwrap();
         assert_eq!(s.matches("longer-new-line").count(), 1, "got: {s:?}");
+    }
+
+    /// #7950 - the writer appends to the RENAMED old file before it reopens the
+    /// path; those bytes must be printed before the new file's first line.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_drains_renamed_old_file_before_switch_7950() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "first\n");
+        let handle = fs::File::open(&a).unwrap();
+        let ino = handle.metadata().unwrap().ino();
+        let mut state = FollowState {
+            path: a.clone(),
+            offset: 6,
+            id: Some(ino),
+            file: Some(handle),
+        };
+        let dir_path = dir.path().to_path_buf();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let old = dir_path.join("old.zst");
+            fs::rename(dir_path.join("ai-memory.log"), &old).unwrap();
+            append(&old, "late-old\n");
+            fs::write(dir_path.join("ai-memory.log"), "fresh-new\n").unwrap();
+        });
+        let s = follow_to_string(dir.path(), &mut state, 8);
+        h.join().unwrap();
+        let late = s.find("late-old").expect("renamed-file line printed");
+        let fresh = s.find("fresh-new").expect("new-file line printed");
+        assert!(late < fresh, "old tail must precede new file: {s:?}");
+        assert_eq!(s.matches("late-old").count(), 1, "got: {s:?}");
     }
 
     #[test]
