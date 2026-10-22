@@ -2,6 +2,7 @@
 """#7913: the Test-env HOME-lock gate census is isolated from its self-tests."""
 
 import importlib.util
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -118,6 +119,38 @@ class IsolationTest(TreeCase):
         (self.root / PROBE).write_text(PROBE_BODY)
         copy = self.h.make_copy(self.root, self.tmp / "copy")
         self.assertFalse((copy / PROBE).exists())
+
+
+class PrecheckGlobTest(TreeCase):
+    """#7921: the exit-3 pre-check matches exactly the probes the census counts."""
+
+    DOT_PROBES = (
+        "src/.check_home_lock_violation_probe.rs",
+        "src/.check_passphrase_window_probe_3539.rs",
+    )
+
+    def test_dot_prefixed_probe_exits_3_with_exact_message(self):
+        for probe in self.DOT_PROBES:
+            with self.subTest(probe=probe):
+                (self.root / probe).write_text(PROBE_BODY)
+                res = subprocess.run(
+                    ["python3", str(HELPER), "census", "--root", str(self.root)],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+                (self.root / probe).unlink()
+                self.assertEqual(res.returncode, 3)
+                self.assertEqual(res.stderr.decode().strip(),
+                                 "self-test fixture present: " + probe)
+
+    def test_every_probe_the_gate_plants_is_matched(self):
+        text = (ROOT / "scripts/check-test-env-lock.sh").read_text()
+        names = re.findall(r'^\s*probe_\w+="\$\{ROOT\}/src/([^"]+\.rs)"', text, re.M)
+        self.assertGreaterEqual(len(names), 16, names)
+        for name in names:
+            with self.subTest(name=name):
+                self.assertTrue(self.h.is_fixture_name(name), name)
+        # Product files that merely look similar must not be treated as fixtures.
+        for name in ("config.rs", "check_test_env_lock.rs", "lib.rs"):
+            self.assertFalse(self.h.is_fixture_name(name), name)
 
 
 FAKE_GATE = "scripts/fake-selftest-gate.sh"

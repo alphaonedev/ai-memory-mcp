@@ -41,7 +41,14 @@ EXIT_FIXTURE = 3
 GATE = "scripts/check-test-env-lock.sh"
 INTERRUPT_HARNESS = "scripts/test/test-gate-selftest-interrupt-cleanup.sh"
 SELFTEST_DIR = Path(".local-runs") / "test-env-lock-selftest"
-FIXTURE_GLOB = "check_test_env_arm_*_probe_*.rs"
+# Every probe file the gate --self-test plants under src/ and the census then
+# counts: the plain arm (d)-(h) fixtures AND the dot-prefixed arm (a)-(c) and
+# arm (f) fixtures (the `probe_*=` assignments in the gate script).
+FIXTURE_GLOBS = (
+    "check_test_env_arm_*_probe_*.rs",
+    ".check_home_lock_*_probe.rs",
+    ".check_passphrase_window_*probe_*.rs",
+)
 IDENT = ("-c", "user.name=selftest", "-c", "user.email=selftest@invalid",
          "-c", "commit.gpgsign=false")
 
@@ -51,7 +58,15 @@ def find_fixtures(root):
     src = Path(root) / "src"
     if not src.is_dir():
         return []
-    return sorted(p for p in src.glob(FIXTURE_GLOB) if p.is_file())
+    found = set()
+    for pattern in FIXTURE_GLOBS:
+        found.update(p for p in src.glob(pattern) if p.is_file())
+    return sorted(found)
+
+
+def is_fixture_name(name):
+    """True when ``name`` is a file name the census would count as a fixture."""
+    return any(fnmatch.fnmatchcase(name, pat) for pat in FIXTURE_GLOBS)
 
 
 def precheck(root, out=sys.stderr):
@@ -82,7 +97,7 @@ def make_copy(root, dest):
     dest.mkdir(parents=True)
     for rel in _tracked_paths(root):
         # A fixture in the source tree must not leak into the copy.
-        if fnmatch.fnmatch(Path(rel).name, FIXTURE_GLOB) and Path(rel).parent.name == "src":
+        if is_fixture_name(Path(rel).name) and Path(rel).parent.name == "src":
             continue
         src = root / rel
         if not src.is_file() and not src.is_symlink():
