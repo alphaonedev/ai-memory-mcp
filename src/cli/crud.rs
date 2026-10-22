@@ -168,7 +168,7 @@ pub fn cmd_list(
     let db_path = crate::cli::backup::refuse_pg_store(db_path, "list", out)?;
     let db_path = db_path.as_path();
     let conn = db::open(db_path)?;
-    let _ = db::gc_if_needed(&conn, app_config.effective_archive_on_gc());
+    crate::cli::helpers::opportunistic_gc(&conn, app_config.effective_archive_on_gc());
     let results = db::list(
         &conn,
         args.namespace.as_deref(),
