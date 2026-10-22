@@ -86,8 +86,12 @@ principal is the `X-Agent-Id` header — a **self-asserted** value, while the
 closing the last two members of the class) shipped the control that binds them:
 an enrolled per-agent API key (schema v83 `agent_api_keys`, `sha256(token) →
 agent_id`) binds the header, and the IDOR-sensitive single-row read/mutate
-routes, the bulk read surfaces, the approvals SSE stream, and `require_admin`
-refuse a merely-*claimed* named principal with `403 attested_identity_required`.
+routes, the bulk read surfaces, the approvals SSE stream
+refuse a merely-*claimed* named principal with `403 attested_identity_required`,
+and `require_admin` refuses every non-attested admin elevation (unknown id or
+allowlisted but unkeyed) with the generic `403 admin role required` in every
+identity mode once keys are enrolled; the reason lives in the audit row and the
+operator warning, never on the wire.
 That control is real, it is tested, and it closes the concern —
 **under `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce` with per-agent keys
 enrolled.**
@@ -102,7 +106,7 @@ shared-key deployment (the #1985 trap) — but a procurement reviewer must be
 told which posture the coverage claim describes. **A multi-principal deployment
 that leaves the default in place is running the posture this project rates
 finding H1 (High, OWASP A01/A07).** Closing it is two steps:
-`ai-memory agents bind-api-key --agent-id <a> --token <t>` per principal, then
+`ai-memory agents bind-api-key --agent-id <a> --token-file <0600 path>` per principal, then
 `AI_MEMORY_HTTP_REQUIRE_ATTESTED_IDENTITY=enforce`. As of v1.0.0 #3418 the
 enrolled key map is a LIVE registry, not a boot snapshot: a running `serve`
 re-reads it from the configured backend (sqlite or postgres) every
