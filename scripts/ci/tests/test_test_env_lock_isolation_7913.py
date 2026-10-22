@@ -5,8 +5,10 @@ import importlib.util
 import re
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -151,6 +153,44 @@ class PrecheckGlobTest(TreeCase):
         # Product files that merely look similar must not be treated as fixtures.
         for name in ("config.rs", "check_test_env_lock.rs", "lib.rs"):
             self.assertFalse(self.h.is_fixture_name(name), name)
+
+
+SLEEP_GATE = "scripts/sleep-selftest-gate.sh"
+
+
+class SignalCleanupTest(TreeCase):
+    """#7922: SIGTERM and SIGINT mid-selftest still remove the private copy."""
+
+    def _interrupt(self, sig):
+        marker = self.tmp / "started"
+        gate = self.root / SLEEP_GATE
+        gate.write_text('#!/usr/bin/env bash\necho "$$" > "%s"\nsleep 60\n' % marker)
+        git(self.root, "add", "-A")
+        git(self.root, "commit", "-q", "-m", "sleep gate")
+        proc = subprocess.Popen(
+            ["python3", str(HELPER), "selftest", "--root", str(self.root),
+             "--gate", SLEEP_GATE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.time() + 60
+            while not marker.exists() and time.time() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(marker.exists(), "self-test never started")
+            parent = self.root / self.h.SELFTEST_DIR
+            self.assertTrue(parent.is_dir(), "private copy was not created")
+            proc.send_signal(sig)
+            rc = proc.wait(timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.assertEqual(rc, 128 + int(sig))
+        self.assertFalse(parent.exists(), "private copy left behind after %s" % sig)
+
+    def test_sigterm_mid_selftest_removes_the_copy(self):
+        self._interrupt(signal.SIGTERM)
+
+    def test_sigint_mid_selftest_removes_the_copy(self):
+        self._interrupt(signal.SIGINT)
 
 
 FAKE_GATE = "scripts/fake-selftest-gate.sh"

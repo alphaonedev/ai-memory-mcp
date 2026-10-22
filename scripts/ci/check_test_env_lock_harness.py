@@ -20,8 +20,9 @@ Sub-commands:
                probe cases and its ``git status`` guard never touch the census
                tree.
 
-The private copy is removed on every exit path (``finally``), including a
-failing run.  Exit codes: 0 pass, 1 a check failed, 2 usage or environment
+The private copy is removed on every exit path ``finally`` can reach: a pass,
+a failing run, an exception, SIGTERM and SIGINT.  SIGKILL cannot be caught and
+still strands the copy.  Exit codes: 0 pass, 1 a check failed, 2 usage or environment
 error, 3 a self-test fixture is present in the census tree.
 """
 
@@ -30,6 +31,7 @@ import fnmatch
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 
@@ -117,15 +119,49 @@ def make_copy(root, dest):
     return dest
 
 
+class Interrupted(SystemExit):
+    """Raised by the signal handlers so ``finally`` cleanup runs (#7922)."""
+
+
+def _raise_interrupted(signum, _frame):
+    raise Interrupted(128 + signum)
+
+
+def _run_child(argv, cwd):
+    """Run ``argv`` in its own process group; kill the whole group on any raise."""
+    proc = subprocess.Popen(argv, cwd=cwd, start_new_session=True)
+    try:
+        return proc.wait()
+    except BaseException:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+        raise
+
+
 def run_isolated(root, argv_for, tag):
-    """Run ``argv_for(copy)`` in a private tree copy; always remove the copy."""
+    """Run ``argv_for(copy)`` in a private tree copy; always remove the copy.
+
+    SIGTERM and SIGINT become an exception while the copy exists so the
+    ``finally`` cleanup runs.  SIGKILL cannot be caught and strands the copy.
+    """
     root = Path(root)
     parent = root / SELFTEST_DIR
     copy = parent / ("%s-%d" % (tag, os.getpid()))
+    previous = {}
     try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                previous[sig] = signal.signal(sig, _raise_interrupted)
+            except ValueError:  # not the main thread: handlers cannot be set
+                break
         make_copy(root, copy)
-        return subprocess.run(argv_for(copy), cwd=str(copy), check=False).returncode
+        return _run_child(argv_for(copy), str(copy))
     finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
         shutil.rmtree(str(copy), ignore_errors=True)
         try:
             parent.rmdir()  # only when no sibling run still uses it
