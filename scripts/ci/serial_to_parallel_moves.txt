@@ -1,0 +1,58 @@
+# Binaries moved out of the enterprise-fed serial shard into the parallel shards (#7343).
+# Format: <kind:name><TAB><reason>, sorted. Machine-checked by scripts/ci/tests/test_serial_moves_7343.py.
+# Regenerate: python3 scripts/ci/partition_test_binaries.py --print-moves --build-json <cargo json> --repo-root <repo>
+# pg-mention-only: the source names Postgres but never the per-job database URL variable or a helper reading it.
+# name-federat-only: only the word federat in the target name; no database use, no #[serial].
+# A fixed port or shared path keeps the binary in the same half as its group.
+test:append_only_spine_guard_g6	pg-mention-only
+test:attestation_funnel_ceiling_3014	pg-mention-only
+test:backup_fail_closed_2444	pg-mention-only
+test:cid_migration_v74	pg-mention-only
+test:cli_sync_attestation_3457	pg-mention-only
+test:cov_curator_store_backed_3521	pg-mention-only
+test:cov_ga2_handlers_a	pg-mention-only
+test:export_import_false_success_2490	pg-mention-only
+test:federation_1566_embed_ship	name-federat-only
+test:federation_2168_embed_fingerprint	name-federat-only
+test:federation_b2_hardening	name-federat-only
+test:federation_by_id_unchecked_ceiling_4447	name-federat-only
+test:federation_delete_ns_scope_2488	name-federat-only
+test:federation_identity_e2e	name-federat-only
+test:federation_inbound_verify	name-federat-only
+test:federation_namespace_gate_3582	name-federat-only
+test:federation_namespace_meta_descendant_2536	name-federat-only
+test:federation_nonce_replay_922	name-federat-only
+test:federation_ns_meta_scope_2479	name-federat-only
+test:federation_peer_enrolled_2912	name-federat-only
+test:federation_peer_posture_3582	name-federat-only
+test:federation_pending_ns_scope_2478	name-federat-only
+test:federation_pending_reject_ns_2532	name-federat-only
+test:federation_pending_resurrection_2529	name-federat-only
+test:federation_plaintext_peer_2477	name-federat-only
+test:federation_receive_coord_screen_3049	name-federat-only
+test:federation_reflection_replication	name-federat-only
+test:federation_signal_authorship_1843	name-federat-only
+test:federation_signing	name-federat-only
+test:federation_sync_push_tofu_1056	name-federat-only
+test:federation_sync_since_sig_1031	name-federat-only
+test:federation_sync_since_watermark_2441	name-federat-only
+test:federation_sync_state_merge_1709	name-federat-only
+test:federation_wire_notes_3204	name-federat-only
+test:federation_write_ns_scope_2447	name-federat-only
+test:federation_write_sig_emit_1801	name-federat-only
+test:forensic_tail_4199	pg-mention-only
+test:handler_postgres_branches_fake_pg	pg-mention-only
+test:inbox_notify_cli_pg_refusal_3730	pg-mention-only
+test:issue_318_mcp_federation_forward	name-federat-only
+test:memory_find_paths	pg-mention-only
+test:migration_ladder_integrity	pg-mention-only
+test:pg_migration_arm_literal_stamp_3464	pg-mention-only
+test:pg_projection_column_fidelity_2585	pg-mention-only
+test:pg_supported_route_inventory_gate_2799	pg-mention-only
+test:qual_10_module_size_ceiling	pg-mention-only
+test:qual_wake_hub_zero_authority_3578	pg-mention-only
+test:record_stop_structural_b7	pg-mention-only
+test:sqlite_list_limit_clamp_1877	pg-mention-only
+test:store_url_ambiguous_userinfo_6096	pg-mention-only
+test:transit_floor_unverifiable_4434	pg-mention-only
+test:watch_line_file_3587	pg-mention-only

@@ -71,7 +71,7 @@ once and runs three concurrent shards inside the same `Run tests
 
 | Shard | Holds | Threads |
 |---|---|---|
-| serial | class (a): Postgres, `#[serial]`, `federat*` names, binaries with unknown source, the lib tests matching `scripts/ci/lib_pg_prefixes.txt`, doc tests | 1 |
+| serial | class (a): Postgres use (`AI_MEMORY_TEST_POSTGRES_URL`, `AI_MEMORY_TEST_AGE_URL` or a `tests/common` helper that reads them), `#[serial]`, binaries with unknown source, the lib tests matching `scripts/ci/lib_pg_prefixes.txt`, doc tests | 1 |
 | parallel_1 | lib tests with `--skip` of those prefixes, plus a balanced share of self-contained binaries | 3 |
 | parallel_2 | the remaining self-contained binaries | 3 |
 
@@ -105,8 +105,27 @@ Estimated wall time (from the measured weights, 1,006 executables): serial
 parallel about 1,620 s and 1,812 s. The parallel figures divide each binary's
 seconds by min(its test count, 3) threads; the ideal at a flat
 `--test-threads=3` is 1,620 s and 1,515 s, and a single-test binary gets no
-speedup, so the true figure lies between the two. The federation-name rule keeps
-47 binaries (about 437 s) in the serial shard on purpose.
+speedup, so the true figure lies between the two. Since #7343 the federation-name
+rule alone no longer keeps a binary serial, and neither does a source that only
+names Postgres (a type, a cfg gate, a `postgres://` literal) without reading
+`AI_MEMORY_TEST_POSTGRES_URL`, `AI_MEMORY_TEST_AGE_URL` or a `tests/common`
+helper that does: 52 binaries (29 `name-federat-only`, 23 `pg-mention-only`)
+moved to the parallel shards. They are listed with a reason in
+`scripts/ci/serial_to_parallel_moves.txt`, which
+`scripts/ci/tests/test_serial_moves_7343.py` checks against the partitioner.
+On the 1,010 executables of run 39063295132 the serial raw estimate fell from
+6,274 s to 5,334 s (the run's measured scale of 0.66 gives 4,141 s to 3,520 s
+against a 4,099 s budget). Reaching 60 % of the serial budget needs the
+per-binary Postgres isolation lane (`PG_ISO_LANE`, #6383), which is opt-in and
+gated by a vote; it is not enabled here.
+
+Budget gate and ratchet (#7343): `scripts/ci/shard_budget.py gate` runs after
+the partition and fails the step at once, naming the shard, the calibrated
+estimate and the budget, when a shard cannot fit; the calibration scales
+(serial 0.66, parallel 1.76 and 2.63) are the measured ratios of run
+39063295132. `shard_budget.py ratchet` runs after the shards: a green shard
+above 85 % of its budget warns, above 95 % fails. Budgets are not raised and
+the #1492 watchdog is unchanged.
 
 Budget: `WATCHDOG_SECS` = 7800 s (130 min) per shard and job `timeout-minutes` =
 160 min on both `enterprise-fed` legs (the watchdog plus 28 min of pre-watchdog
