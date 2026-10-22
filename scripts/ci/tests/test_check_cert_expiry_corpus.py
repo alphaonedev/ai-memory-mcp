@@ -1990,9 +1990,70 @@ class Corpus(CorpusBase):
 # Loader and entry point
 # ---------------------------------------------------------------------------
 
+def read_manifest(path):
+    """{name: verdict} from the committed manifest file; '#' lines and blanks skipped."""
+    out = {}
+    for raw in Path(path).read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split()
+        if len(fields) != 2 or fields[1] not in (GREEN, RED):
+            raise ValueError(f"malformed manifest line: {raw!r}")
+        if fields[0] in out:
+            raise ValueError(f"duplicate manifest entry: {fields[0]}")
+        out[fields[0]] = fields[1]
+    return out
+
+
+def ratchet_problems(committed, current):
+    """The V6 ratchet. Problems (empty = ok) between the committed manifest and the
+    corpus: a committed name missing from the corpus (deleted), a committed GREEN
+    that the corpus now registers RED (weakened), a RED/GREEN change that the
+    committed file does not record, and a corpus name the committed file lacks."""
+    problems = []
+    for name in sorted(committed):
+        if name not in current:
+            problems.append(f"{name}: deleted from the corpus (the manifest never shrinks)")
+        elif committed[name] == GREEN and current[name] == RED:
+            problems.append(f"{name}: flipped GREEN -> RED (a passing case is never weakened)")
+        elif committed[name] != current[name]:
+            problems.append(f"{name}: now {current[name]}, manifest records {committed[name]}")
+    for name in sorted(set(current) - set(committed)):
+        problems.append(f"{name}: new case not recorded in the manifest")
+    return problems
+
+
+class Ratchet(unittest.TestCase):
+    """The V6 guard: the corpus can grow and RED can become GREEN, nothing else."""
+
+    def test_manifest_ratchet(self):
+        problems = ratchet_problems(read_manifest(MANIFEST_FILE), MANIFEST)
+        self.assertEqual(problems, [], "\n".join(problems))
+
+    def test_every_case_is_registered(self):
+        found = set()
+        for cls in (Cells, Corpus):
+            found.update(n for n in dir(cls) if n.startswith(("case_", "cell_"))
+                         and callable(getattr(cls, n)))
+        self.assertEqual(sorted(found ^ set(MANIFEST)), [], "a case is missing @expect or its body")
+
+    def test_ratchet_detects_each_regression(self):
+        committed = {"cell_x": GREEN, "case_1_y": RED, "case_2_z": GREEN}
+        self.assertEqual(ratchet_problems(committed, dict(committed)), [])
+        deleted = {k: v for k, v in committed.items() if k != "cell_x"}
+        self.assertIn("deleted", " ".join(ratchet_problems(committed, deleted)))
+        weakened = dict(committed, case_2_z=RED)
+        self.assertIn("GREEN -> RED", " ".join(ratchet_problems(committed, weakened)))
+        unrecorded = dict(committed, case_1_y=GREEN)
+        self.assertIn("manifest records RED", " ".join(ratchet_problems(committed, unrecorded)))
+        grown = dict(committed, case_3_new=RED)
+        self.assertIn("not recorded", " ".join(ratchet_problems(committed, grown)))
+
+
 FILTER_ENV = "CERT_CORPUS_FILTER"  # comma-separated name prefixes; a debugging and nesting knob
 CASE_PREFIXES = ("case_", "cell_", "test_")
-CASE_CLASSES = (Cells, Corpus)
+CASE_CLASSES = (Cells, Corpus, Ratchet)
 
 
 def case_names(cls):
