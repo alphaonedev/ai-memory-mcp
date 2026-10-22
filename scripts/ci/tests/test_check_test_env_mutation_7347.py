@@ -1430,6 +1430,35 @@ class Issue8036(Fixture):
                 self.assertEqual(self.flagged(self.reader_with(host)), set())
 
 
+class Issue8037(Fixture):
+    """#8037: "An alias of an alias writer (`use a1 as b1`) is not a write site" -- the alias set must be
+    closed under `as` renames, in any order of the `use` items."""
+
+    def writer_via(self, uses):
+        return (WRITER_HEAD + uses
+                + '#[tokio::test]\nasync fn writer() {\n    let _lock = ENV_LOCK.lock().await;\n'
+                + '    unsafe { b1("A", "1") };\n}\n' + test_fn("reader", 'let _c = db::open(":memory:");'))
+
+    def test_an_alias_of_an_alias_writer_is_a_write_site(self):
+        text = self.writer_via("use std::env::set_var as a1;\nuse a1 as b1;\n")
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_the_use_items_may_come_in_any_order(self):
+        text = self.writer_via("use a1 as b1;\nuse std::env::set_var as a1;\n")
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_a_three_step_alias_chain_is_a_write_site(self):
+        text = self.writer_via("use std::env::set_var as a0;\nuse a0 as a1;\nuse a1 as b1;\n")
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_use_aliases_is_closed_under_renames(self):
+        got = gate.use_aliases("use std::env::set_var as a1; use a1 as b1; use other as c1;")
+        self.assertEqual(got, {"a1", "b1"})
+
+
+WRITER_HEAD = "use tokio::sync::Mutex;\nstatic ENV_LOCK: Mutex<()> = Mutex::const_new(());\n"
+
+
 class RealTree(unittest.TestCase):
     def test_repo_matches_its_baseline(self):
         found = gate.scan_tree(REPO)

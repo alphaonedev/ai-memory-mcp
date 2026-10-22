@@ -147,14 +147,22 @@ def mutation_re(aliases=()):
 
 
 def use_aliases(scrubbed):
-    """Names a file imports a writer under: `use std::env::set_var as sv;` / `{remove_var as rv, ..}`."""
+    """Names a file imports a writer under: `use std::env::set_var as sv;` / `{remove_var as rv, ..}`.
+
+    An alias of an alias (`use sv as sv2;`, #8037) is a writer too, in any order of the `use` items:
+    the set grows until no `use` item adds a name.
+    """
+    items = [item.group(0) for item in USE_ITEM.finditer(scrubbed)]
     out = set()
-    for item in USE_ITEM.finditer(scrubbed):
-        out.update(m.group(1) for m in MUTATION_ALIAS.finditer(item.group(0)))
-    return out
+    while True:
+        known = "|".join(re.escape(n) for n in MUTATION_NAMES + tuple(sorted(out)))
+        found = {m.group(1) for item in items for m in re.finditer(MUTATION_ALIAS % known, item)}
+        if found <= out:
+            return out
+        out |= found
 
 
-MUTATION_ALIAS = re.compile(r"\b(?:%s)\s+as\s+([A-Za-z_]\w*)" % "|".join(MUTATION_NAMES))
+MUTATION_ALIAS = r"\b(?:%s)\s+as\s+([A-Za-z_]\w*)"
 DIRECT_MUTATION = mutation_re()
 # #7994: a call that hands its argument to another thread or task. The closure or async block it takes
 # runs outside the spawner's guard scope (the handle may outlive the guard), so it never inherits a lock.
