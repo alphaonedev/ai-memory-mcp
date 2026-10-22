@@ -30,7 +30,7 @@ re-run on the host.
 | `bootstrap-cert-gate.log` | `scripts/check-bootstrap-cert-gate.sh` on its SELF-BUILD path (it built both a `sal,sal-postgres` and a driverless debug binary itself): legs A-pg, A-driverless and B all `[PASS]`, `CERT-BOOTSTRAP GATE: PASS`, rc 0. The two binary paths are rewritten to `<repo-root>/…` (the only edit). |
 | `removal-proof-full.log` | The §5.4(5) removal proof over all 15 controls: `overall: PASS`, 15 `[PROVEN]` (each `broken→RED (rc=101), restored→GREEN (rc=0)`), 0 `[CERT-RED]`, rc 0. |
 | `peer-fingerprints.txt`, `peer-attestation.json` | The throwaway fixture peer map used by the hardened legs (placeholder fingerprint, placeholder peer) — byte-identical to the `cert-eba96b307` and `cert-4d301e051` fixtures. |
-| `recapture-posture.sh` | The script that produced the four legs: `scripts/recapture-cert-3607-posture.sh` with only `ROOT` (re-derived for this directory), `OUT` and `FIX` retargeted. Kept INSIDE this bundle rather than under `scripts/` so the re-issue commit is docs-only. |
+| `recapture-posture.sh` | The script that produced the four legs: `scripts/recapture-cert-3607-posture.sh` (since ported to `scripts/recapture-cert-3607-posture.py`, PR #7378) with only `ROOT` (re-derived for this directory), `OUT` and `FIX` retargeted. Kept INSIDE this bundle rather than under `scripts/` so the re-issue commit is docs-only. |
 | `MANIFEST.sha256` | sha256 of every file above; generated LAST, after every attested file was final. |
 
 ## Why two battery counts are lower than at `eba96b307`
@@ -82,6 +82,7 @@ No secret material is recorded here.
   the bundle: zero hits in every captured file. The ONLY hits are in
   `recapture-posture.sh`, whose `DEFAULT_BIN` / `SQLCIPHER_BIN` fallback paths
   are copied verbatim from the shipped `scripts/recapture-cert-3607-posture.sh`
+  (since ported to `scripts/recapture-cert-3607-posture.py`, PR #7378)
   (repository content, not run output; the run passed both binaries
   explicitly). The `cert-4d301e051` bundle carried the same two lines without
   saying so.
