@@ -2458,7 +2458,7 @@ class Ratchet(unittest.TestCase):
             (repo / rel.parent).mkdir(parents=True)
             base_names = {"cell_x": GREEN, "case_1_y": RED, "case_2_z": GREEN}
             (repo / rel).write_text("".join(f"{n} {v}\n" for n, v in sorted(base_names.items())), encoding="utf-8")
-            git = ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid", "-c", "commit.gpgsign=false"]
+            git = ["git", "-c", "user.name=t", "-c", "user.email=selftest@localhost", "-c", "commit.gpgsign=false"]
             for argv in (["init", "-q"], ["add", str(rel)], ["commit", "-q", "-m", "base"],
                          ["update-ref", "refs/remotes/origin/basecand", "HEAD"]):
                 subprocess.run(git + argv, cwd=str(repo), check=True, capture_output=True)
