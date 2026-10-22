@@ -53,10 +53,9 @@
 //! A substrate wake is addressed DIRECTLY to the recipient agent id and never
 //! to a `#topic`. The hub's route table is keyed by the identity a hello
 //! authenticated, so a wake for `X` can only ever land on a session that
-//! authenticated AS `X` — own-inbox only, which is exactly the scope
-//! [#3468](https://github.com/alphaonedev/ai-memory-mcp/issues/3468)'s
-//! delegation verifier grants until
-//! [#3505](https://github.com/alphaonedev/ai-memory-mcp/issues/3505) widens it.
+//! authenticated AS `X` — the recipient's own inbox, which the delegation
+//! verifier (#3468) always grants; the namespace topics #3505 added are never
+//! used by the sink.
 //! A topic-shaped, reserved, empty or over-long recipient is REFUSED and
 //! counted, never coerced into something routable.
 //!
@@ -251,8 +250,8 @@ pub fn build_substrate_wake(event: &InboxEvent) -> Result<SubstrateWake, SinkRef
     }
     // A substrate wake is ALWAYS direct. Routing one through the topic table
     // would make delivery depend on a mutable subscription set instead of on
-    // the identity a hello authenticated, which is the whole own-inbox-only
-    // property (#3468, until #3505).
+    // the identity a hello authenticated, which is the whole own-inbox
+    // addressing rule of the sink (#3468).
     if is_topic(recipient) {
         return Err(SinkRefusal::Unaddressable(
             "recipient is a topic; substrate wakes are direct only",
