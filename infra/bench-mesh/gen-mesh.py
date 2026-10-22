@@ -407,11 +407,12 @@ def self_test() -> int:
         sidecar = write_key_sidecar(scratch, SIDECAR_TEST_KEY)
         check(os.stat(sidecar).st_mode & FILE_MODE_MASK == KEY_SIDECAR_MODE,
               "key sidecar must be mode 0600")
+        refused = False
         try:
             write_key_sidecar(scratch, SIDECAR_TEST_KEY)
-            check(False, "second sidecar create must raise FileExistsError")
         except FileExistsError:
-            pass
+            refused = True
+        check(refused, "second sidecar create must raise FileExistsError")
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
