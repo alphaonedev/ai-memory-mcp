@@ -113,6 +113,7 @@ Exit codes: 0 clean / N/A-skip, 1 violation, 2 usage / self-test failure.
 """
 
 import argparse
+import ast
 import contextlib
 import errno
 import os
@@ -807,7 +808,8 @@ SELF_TEST_OK = "check-cert-expiry self-test OK: {summary}; corpus {harness}"
 CORPUS_ENV_PREFIX = "CERT_CORPUS_"  # the harness's debugging knobs; never inherited by the self-test
 CORPUS_FILTER_ENV = "CERT_CORPUS_FILTER"
 CORPUS_NESTED_ENV = "CERT_CORPUS_NESTED"
-CORPUS_MIN_CASES = 130  # a full run executes at least this many cases (127 corpus cases + 3 ratchet tests)
+CORPUS_MANIFEST = Path("scripts") / "qc-allowlists" / "cert-expiry-corpus-manifest.txt"
+CORPUS_TEST_PREFIX = "test_"  # the harness runs each manifest entry plus every test_ method of its classes
 SUBSET_MIN_CASES = 1
 SUMMARY_RAN_RE = re.compile(r"\bran=(\d+)\b")
 SUMMARY_FAILED_RE = re.compile(r"\bfailed=(\d+)\b")
@@ -824,17 +826,38 @@ def corpus_child_env(environ, subset=""):
     return env
 
 
-def corpus_size_problem(summary, subset=""):
-    """None when the corpus summary shows enough executed cases and zero failures, else
-    the reason. A full run must execute at least CORPUS_MIN_CASES cases; a subset run
-    at least SUBSET_MIN_CASES; ran=0 is never a pass (#7975)."""
+def expected_corpus_cases(repo):
+    """(count, problem): the size of a full corpus run, derived from the tree under test as
+    the manifest entries plus the test_ methods of the harness classes, so it is never a
+    hand-typed floor (#7991). `problem` is set and `count` is None when either file is unreadable."""
+    try:
+        manifest = (Path(repo) / CORPUS_MANIFEST).read_text(encoding="utf-8").splitlines()
+        tree = ast.parse((Path(repo) / CORPUS_HARNESS).read_text(encoding="utf-8"))
+    except (OSError, SyntaxError, ValueError) as exc:
+        return None, f"expected corpus size cannot be derived ({type(exc).__name__}: {exc})"
+    entries = sum(1 for ln in manifest if ln.strip() and not ln.lstrip().startswith("#"))
+    tests = sum(1 for cls in tree.body if isinstance(cls, ast.ClassDef)
+                for fn in cls.body
+                if isinstance(fn, ast.FunctionDef) and fn.name.startswith(CORPUS_TEST_PREFIX))
+    return entries + tests, None
+
+
+def corpus_size_problem(summary, subset="", expected=None):
+    """None when the corpus summary shows the right number of executed cases and zero failures,
+    else the reason. A full run must execute exactly `expected` cases (manifest entries plus
+    test_ methods); a subset run at least SUBSET_MIN_CASES; ran=0 is never a pass (#7975, #7991)."""
     ran = SUMMARY_RAN_RE.search(summary)
     failed = SUMMARY_FAILED_RE.search(summary)
     if ran is None or failed is None:
         return f"unreadable corpus summary {summary!r}"
-    needed = SUBSET_MIN_CASES if subset else CORPUS_MIN_CASES
-    if int(ran.group(1)) < needed:
-        return f"only {ran.group(1)} corpus cases ran, expected at least {needed}"
+    if subset:
+        if int(ran.group(1)) < SUBSET_MIN_CASES:
+            return f"only {ran.group(1)} corpus cases ran, expected at least {SUBSET_MIN_CASES}"
+        return None
+    if expected is None:
+        return "expected corpus size cannot be derived"
+    if int(ran.group(1)) != expected:
+        return f"{ran.group(1)} corpus cases ran, expected exactly {expected}"
     return None
 
 
@@ -843,7 +866,7 @@ def self_test(subset=""):
     in a child interpreter, one scratch repository per case, and report each failing
     case by name. rc 0 when every case holds, 2 otherwise. The child's traceback is
     never relayed: a crashing case is a named failure and the rest still run. The
-    run is fail-closed on size: fewer cases than CORPUS_MIN_CASES (or none) is a
+    run is fail-closed on size: any count but the derived manifest-plus-tests total is a
     failure, and inherited CERT_CORPUS_* variables are ignored (#7975)."""
     harness = Path(__file__).resolve().parent.parent / CORPUS_HARNESS
     if not harness.is_file():
@@ -864,7 +887,8 @@ def self_test(subset=""):
     failed = [ln[len(CORPUS_FAIL_PREFIX):] for ln in lines if ln.startswith(CORPUS_FAIL_PREFIX)]
     summary = [ln[len(CORPUS_SUMMARY_PREFIX):] for ln in lines
                if ln.startswith(CORPUS_SUMMARY_PREFIX)]
-    size_problem = corpus_size_problem(summary[-1], subset) if summary else None
+    expected, derive_problem = (None, None) if subset else expected_corpus_cases(harness.parent.parent.parent.parent)
+    size_problem = derive_problem or (corpus_size_problem(summary[-1], subset, expected) if summary else None)
     if failed or proc.returncode != 0 or not summary or size_problem:
         if size_problem:
             print(f"self-test FAILED ({size_problem})", file=sys.stderr)

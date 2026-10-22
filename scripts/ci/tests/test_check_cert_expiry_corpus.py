@@ -2092,13 +2092,20 @@ class Corpus(CorpusBase):
         self.assertNotIn("Traceback", out, "a missing production helper crashed the runner")
         self.assertIn("self-test FAILED", out)
 
-    def stub_gate_tree(self, stub_body):
-        """A scratch tree holding the real gate and a stub corpus harness."""
+    def stub_gate_tree(self, stub_body, entries=0, tests=0, manifest=True):
+        """A scratch tree holding the real gate, a stub corpus harness with `tests` test_ methods and
+        a manifest of `entries` cases: the gate must expect exactly entries + tests cases (#7991)."""
         self.stub_count = getattr(self, "stub_count", 0) + 1
         copy = self.tmp / f"stub{self.stub_count}"
         (copy / "scripts" / "ci" / "tests").mkdir(parents=True)
         shutil.copy(str(GATE_PATH), str(copy / "scripts" / "check_cert_expiry.py"))
-        (copy / "scripts" / "ci" / "tests" / Path(__file__).name).write_text(stub_body, encoding="utf-8")
+        body = stub_body + "\nclass Ratchet:\n    pass\n" + "".join(
+            f"    def test_{i}(self):\n        pass\n" for i in range(tests))
+        (copy / "scripts" / "ci" / "tests" / Path(__file__).name).write_text(body, encoding="utf-8")
+        if manifest:
+            (copy / "scripts" / "qc-allowlists").mkdir(parents=True)
+            (copy / "scripts" / "qc-allowlists" / "cert-expiry-corpus-manifest.txt").write_text(
+                "# header\n" + "".join(f"case_{i}_x GREEN\n" for i in range(entries)), encoding="utf-8")
         return copy
 
     def run_stub_self_test(self, copy, extra_args=(), **env_extra):
@@ -2113,19 +2120,38 @@ class Corpus(CorpusBase):
         env_aware = ("import os\n"
                      "ran = 0 if os.environ.get('CERT_CORPUS_FILTER') or os.environ.get('CERT_CORPUS_NESTED') else 1000\n"
                      "print('CORPUS-SUMMARY ran=%d failed=0' % ran)\n")
-        rc, out = self.run_stub_self_test(self.stub_gate_tree(env_aware),
+        rc, out = self.run_stub_self_test(self.stub_gate_tree(env_aware, entries=998, tests=2),
                                           CERT_CORPUS_FILTER="zzz_nothing", CERT_CORPUS_NESTED="1")
         self.assertEqual(rc, 0, "an inherited CERT_CORPUS_* knob changed the self-test: " + out[-300:])
         self.assertIn("ran=1000", out, "the self-test ran with the inherited filter")
         zero = "print('CORPUS-SUMMARY ran=0 failed=0')\n"
-        rc, out = self.run_stub_self_test(self.stub_gate_tree(zero))
+        rc, out = self.run_stub_self_test(self.stub_gate_tree(zero, entries=5, tests=2))
         self.assertEqual(rc, SELF_TEST_FAIL_RC, "a corpus that ran zero cases reported OK: " + out[-300:])
         self.assertIn("self-test FAILED", out)
         few = "print('CORPUS-SUMMARY ran=3 failed=0')\n"
-        rc, out = self.run_stub_self_test(self.stub_gate_tree(few))
+        rc, out = self.run_stub_self_test(self.stub_gate_tree(few, entries=5, tests=2))
         self.assertEqual(rc, SELF_TEST_FAIL_RC, "a corpus below the expected size reported OK: " + out[-300:])
-        rc, out = self.run_stub_self_test(self.stub_gate_tree(few), extra_args=("--self-test-subset", "cell_a_"))
+        rc, out = self.run_stub_self_test(self.stub_gate_tree(few, entries=5, tests=2),
+                                          extra_args=("--self-test-subset", "cell_a_"))
         self.assertEqual(rc, 0, "an explicit subset run needs only one case: " + out[-300:])
+
+    @expect(GREEN)
+    def case_7991_exact_corpus_size(self):
+        """#7991: a full self-test run must execute exactly the manifest entries plus the test_ methods,
+        derived from the tree and never a typed floor, so dropping cases below a floor cannot pass."""
+        expected = self.need(cert, "expected_corpus_cases", "derive the full-run size from the manifest and the harness")
+        want = len(MANIFEST) + len([n for n in dir(Ratchet) if n.startswith("test_")])
+        self.assertEqual(expected(HARNESS_ROOT), (want, None))
+        for ran, rc_want in ((6, 0), (7, SELF_TEST_FAIL_RC), (5, SELF_TEST_FAIL_RC), (0, SELF_TEST_FAIL_RC)):
+            stub = f"print('CORPUS-SUMMARY ran={ran} failed=0')\n"
+            rc, out = self.run_stub_self_test(self.stub_gate_tree(stub, entries=4, tests=2))
+            self.assertEqual(rc, rc_want, f"ran={ran} against an expected 6: {out[-300:]}")
+            if rc_want:
+                self.assertIn("expected exactly 6", out)
+        stub = "print('CORPUS-SUMMARY ran=6 failed=0')\n"
+        rc, out = self.run_stub_self_test(self.stub_gate_tree(stub, entries=4, tests=2, manifest=False))
+        self.assertEqual(rc, SELF_TEST_FAIL_RC, "a tree with no manifest could not derive a size yet passed: " + out[-300:])
+        self.assertIn("expected corpus size", out)
 
     @expect(GREEN)
     def case_7977_probe_mutants(self):
