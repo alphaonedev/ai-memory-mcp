@@ -152,7 +152,11 @@ fn main() -> Result<()> {
             }
         }
     };
-    config::AppConfig::write_default_if_missing();
+    // #7192 (regression of #3606) — under `AI_MEMORY_NO_CONFIG` no config
+    // file is consulted, so none is created either (mirrors `AppConfig::load`).
+    if !config::skip_config() {
+        config::AppConfig::write_default_if_missing();
+    }
 
     // #1889 — ALL env mutation (passphrase-file export + anonymize seeding)
     // happens HERE, synchronously, before any thread (tracing appender worker,

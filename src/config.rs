@@ -10394,15 +10394,42 @@ impl AppConfig {
     }
 
     /// Write a default config file if one doesn't exist yet.
+    ///
+    /// The caller (`main`) guards this with [`skip_config`] (#7192): under
+    /// `AI_MEMORY_NO_CONFIG` no config file is consulted, so none is created.
+    /// A failure to create the directory or the file is reported on stderr
+    /// (the boot stage runs before tracing is initialised) instead of being
+    /// discarded (per ERRORS-19); the boot continues on compiled defaults.
     pub fn write_default_if_missing() {
         let Some(path) = Self::config_path() else {
             return;
         };
+        if let Err(e) = Self::write_default_to(&path) {
+            eprintln!(
+                "ai-memory: could not write the default config at {}: {e}",
+                path.display()
+            );
+        }
+    }
+
+    /// Path-taking core of [`Self::write_default_if_missing`]: a no-op when
+    /// `path` exists, otherwise create its parent directory and write the
+    /// commented default file.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `create_dir_all` or `write` I/O error (#7192).
+    fn write_default_to(path: &Path) -> std::io::Result<()> {
         if path.exists() {
-            return;
+            return Ok(());
         }
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            std::fs::create_dir_all(parent).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("create config dir {}: {e}", parent.display()),
+                )
+            })?;
         }
         let default_toml = r#"# ai-memory configuration
 # See: https://github.com/alphaonedev/ai-memory-mcp
@@ -10543,7 +10570,7 @@ impl AppConfig {
 # enabled = true
 # redact_titles = false
 "#;
-        let _ = std::fs::write(&path, default_toml);
+        std::fs::write(path, default_toml)
     }
 }
 
@@ -11758,6 +11785,28 @@ legacy_scoring = false
         AppConfig::write_default_if_missing();
         let after = std::fs::read_to_string(&expected).unwrap();
         assert_eq!(after, "# user-edited\n");
+    }
+
+    /// #7192 — a `create_dir_all` failure is returned, not discarded.
+    #[test]
+    fn write_default_to_reports_create_dir_failure_7192() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The would-be parent directory is a regular file, so
+        // `create_dir_all` must fail.
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"file").unwrap();
+        let path = blocker.join("ai-memory").join("config.toml");
+        let err = AppConfig::write_default_to(&path).expect_err("must report the failure");
+        assert!(!path.exists(), "no config may exist after a failure: {err}");
+        assert!(
+            err.to_string().contains("create config dir"),
+            "the create_dir_all failure must carry its own context: {err}"
+        );
+        // The happy path still writes and a second call is a no-op.
+        let ok = tmp.path().join("ok").join("config.toml");
+        AppConfig::write_default_to(&ok).unwrap();
+        assert!(ok.exists());
+        AppConfig::write_default_to(&ok).unwrap();
     }
 
     #[test]
