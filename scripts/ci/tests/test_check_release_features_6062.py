@@ -10,8 +10,11 @@ Stdlib only, Python 3.9+.
 """
 import importlib.util
 import re
+import subprocess
+import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -23,7 +26,7 @@ PUBLISH = ROOT / ".github" / "workflows" / "publish-ci-image.yml"
 
 # One entry per issue this PR closes. SELF_CHECK below requires every issue to
 # have at least one pinned case and the count to equal this list.
-CLOSES = (6289, 6290, 6904, 8002, 8020, 8021, 8023, 8030)
+CLOSES = (6289, 6290, 6904, 8002, 8020, 8021, 8023, 8030, 8039)
 PINNED_CASES = {}  # issue number -> list of test method names, filled by pins()
 
 
@@ -91,8 +94,8 @@ class Controls(unittest.TestCase):
         self.assertEqual(errors_shape(read(SHAPE)), [])
 
     def test_self_check_pinned_case_count_equals_closes(self):
-        """The pinned-case count equals the Closes count (8)."""
-        self.assertEqual(len(CLOSES), 8)
+        """The pinned-case count equals the Closes count (9)."""
+        self.assertEqual(len(CLOSES), 9)
         self.assertEqual(sorted(PINNED_CASES), sorted(CLOSES))
         for issue in CLOSES:
             self.assertTrue(PINNED_CASES[issue], "no pinned case for #%d" % issue)
@@ -424,6 +427,43 @@ class PerAction8030(unittest.TestCase):
             G.check_uses_pinned(G.parse_yaml(mut, "publish-ci-image.yml", rep), "publish-ci-image.yml", rep)
             self.assertTrue(any("job `" in e and "step " in e and G.USES_CONSTANTS[const] in e for e in rep.errors),
                             (const, rep.errors))
+
+
+class Survivors8039(unittest.TestCase):
+    """#8039: the four mutants the round-2 sweep reported as survivors (refusal lines 753, 1399, 1463 and
+    condition 11) are killed by --self-test again."""
+
+    PHRASES = ("value outside the subset grammar", "inline use of the declaration", "the pg proof must run after")
+
+    def self_test_rc(self, tmp, name, source):
+        mutant = Path(tmp) / name
+        mutant.write_text(source, encoding="utf-8")
+        res = subprocess.run([sys.executable, "-I", str(mutant), "--self-test", str(ROOT)],
+                             capture_output=True, text=True)
+        return res.returncode
+
+    @pins(8039)
+    def test_the_four_survivors_are_killed_by_the_self_test(self):
+        """#8039: neutralising each of the 3 refusals, or the proof-order condition, makes --self-test fail."""
+        src = SCRIPT.read_bytes()
+        sites = G._refusal_sites(src)
+        mutants = []
+        for phrase in self.PHRASES:
+            # the call whose own message holds the phrase: the nearest site at or before it
+            at = src.index(phrase.encode())
+            _, s, e = max((site for site in sites if site[1] <= at), key=lambda site: site[1])
+            mutants.append((phrase, src[:s] + b"(lambda *_a, **_k: None)" + src[e:]))
+        text = src.decode("utf-8")
+        cond = [m for m in G.CONDITION_MUTANTS if m[0] == "proof order against the build not compared"]
+        self.assertEqual(len(cond), 1)
+        cut = text.index(G.CONDITION_MARKER + "\n")  # the anchor is counted above the table, as the sweep does
+        self.assertEqual(text[:cut].count(cond[0][1]), 1)
+        mutants.append((cond[0][0], (text[:cut].replace(cond[0][1], cond[0][2], 1) + text[cut:]).encode("utf-8")))
+        with tempfile.TemporaryDirectory(dir=scratch()) as tmp:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                rcs = list(pool.map(lambda m: (m[0], self.self_test_rc(tmp, "m%d.py" % abs(hash(m[0])), m[1].decode("utf-8"))),
+                                    mutants))
+        self.assertEqual([name for name, rc in rcs if rc == 0], [], "mutants the self-test accepts")
 
 
 class Named8021(unittest.TestCase):

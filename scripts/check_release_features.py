@@ -2081,6 +2081,8 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
         (C8, "", _first_checkout_to_other_sha, False)]),
     "N16 publish-ci-image.yml checkout repinned to another sha is refused": ("fail", [
         (PUBLISH, "", _first_checkout_to_other_sha, False)]),
+    "N17 c8-precheck.yml holds a value outside the subset grammar is refused": ("fail", [
+        (C8, "", lambda x: x.rstrip("\n") + '\n\nx-extra: "abc\n', False)]),
     # --- control characters: Python and bash disagree on what a line is
     "control character: CR line ends in release.yml": ("fail", [_rel(REL_ASSERT, REL_ASSERT + "\r")]),
     "control character: form feed in the Dockerfile": ("fail", [(DOCKER, DOCKER_ASSERT, DOCKER_ASSERT + "\x0c# x", False)]),
@@ -2345,6 +2347,13 @@ MESSAGE_CASES: Dict[str, Tuple[List[Edit], int, str]] = {
                                            "update IMAGE_BUILD_USES in scripts/check_release_features.py"),
     "message: a checkout repin names the constant": ([_rel("", _job_edit("crates-io", _first_checkout_to_other_sha))], 1,
                                                      "differs from CHECKOUT_USES"),
+    # Round-3 cells (#8039): the SHAPE_STEPS and uses: pins now refuse the inputs that once reached ONLY the
+    # refusals below, so each is proven by an exact message count (a neutralised refusal drops the count).
+    "message: an inline use in the release-shape tree step is refused on its own": (
+        [(SHAPE, '--features "$FEATURES")"', '--features "$(bash scripts/release-features.sh)")"', False)], 2,
+        "inline use of the declaration"),
+    "message: a proof before the build is refused on its own": (
+        [(SHAPE, PROOF_NAME, _proof_before_build, False)], 5, "the pg proof must run after the release-shaped build"),
     "message: a tag added names DOCKER_STEPS": ([_rel(PUSH_TAGS, PUSH_TAGS + "            ghcr.io/o/ai-memory:x\n")], 1,
                                                 "update DOCKER_STEPS in scripts/check_release_features.py"),
     "message: swapped guard and build steps name the unit slot": ([(SHAPE, "", _shape_swap_guard_build, False)], 2,
