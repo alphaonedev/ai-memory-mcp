@@ -1150,6 +1150,24 @@ def check_run_continuations(doc: Node, label: str, rep: Report) -> None:
                         f"guard refuses continuations in run text): {text.strip()[:70]}")
 
 
+# #6904: a `uses:` names an action by a full 40-hex commit sha (a tag, a branch
+# or a short ref can be re-pointed); a local `./` action and a docker image by
+# sha256 digest are the only other forms.
+USES_PINNED_RE = re.compile(r"\./[A-Za-z0-9_./-]+|docker://[a-z0-9][a-z0-9_./:-]*@sha256:[0-9a-f]{64}"
+                            r"|[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_./-]+@[0-9a-f]{40}")
+
+
+def check_uses_pinned(doc: Node, name: str, rep: Report) -> None:
+    """#6904: every `uses:` of every job and step is pinned (USES_PINNED_RE)."""
+    for path, node in walk(doc):
+        if not path or path[-1] != "uses":
+            continue
+        ref = node.text().strip()
+        if node.kind != "scalar" or not USES_PINNED_RE.fullmatch(ref):
+            rep.bad(f"{name}: line {node.line + 1}: `uses: {ref[:70]}` is not pinned to a full 40-hex commit sha "
+                    "(#6904: a tag, branch or short ref can be re-pointed)" + pin_hint("USES_PINNED_RE"))
+
+
 def check_release_yml(text: str, rep: Report) -> None:
     check_no_bash_env("release.yml", text, rep)
     check_text_counts(text, rep)
@@ -1158,6 +1176,7 @@ def check_release_yml(text: str, rep: Report) -> None:
         return
     check_blocks(doc, "release.yml", rep)
     check_run_continuations(doc, "release.yml", rep)
+    check_uses_pinned(doc, "release.yml", rep)
     check_secrets_and_registry(doc, rep)
     for key in doc.keys():
         if key not in TOP_KEYS:
@@ -1306,6 +1325,7 @@ def check_shape(text: str, rep: Report, advisory: Optional[bool] = None) -> None
         return
     check_blocks(doc, "release-shape.yml", rep)
     check_run_continuations(doc, "release-shape.yml", rep)
+    check_uses_pinned(doc, "release-shape.yml", rep)
     if doc.keys() != list(SHAPE_TOP_KEYS):
         rep.bad(pin_message("release-shape.yml", f"top-level keys {doc.keys()} differ from the pinned "
                             f"{list(SHAPE_TOP_KEYS)} (a top-level `defaults:` or `env:` change redirects every step)",
