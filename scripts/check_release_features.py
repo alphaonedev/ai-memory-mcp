@@ -2040,7 +2040,10 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
         _rel("", _job_edit("preflight", lambda b: b.replace("  preflight:\n", "  preflight:\n    needs: qualify\n", 1)))]),
     "N2 homebrew needs drops release is refused": ("fail", [
         _rel("", _job_edit("homebrew", lambda b: b.replace("needs: [preflight, qualify, release]", "needs: [preflight, qualify]", 1)))]),
-    "N3 release.yml uses repointed to a tag is refused": ("fail", [_rel("", _first_use_to_tag)]),
+    "N3 release.yml preflight uses repointed to a tag is refused": ("fail", [
+        _rel("", _job_edit("preflight", _first_use_to_tag))]),
+    "N11 release.yml crates-io uses repointed to a tag is refused": ("fail", [
+        _rel("", _job_edit("crates-io", _first_use_to_tag))]),
     "N4 release-shape.yml uses repointed to a tag is refused": ("fail", [(SHAPE, "", _first_use_to_tag, False)]),
     "N5 c8-precheck.yml uses repointed to a tag is refused": ("fail", [(C8, "", _first_use_to_tag, False)]),
     "N6 publish-ci-image.yml uses repointed to a tag is refused": ("fail", [(PUBLISH, "", _first_use_to_tag, False)]),

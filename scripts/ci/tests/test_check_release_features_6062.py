@@ -390,7 +390,8 @@ class Named8021(unittest.TestCase):
 NEW_CELLS = (
     "N1 root job preflight gains needs is refused",
     "N2 homebrew needs drops release is refused",
-    "N3 release.yml uses repointed to a tag is refused",
+    "N3 release.yml preflight uses repointed to a tag is refused",
+    "N11 release.yml crates-io uses repointed to a tag is refused",
     "N4 release-shape.yml uses repointed to a tag is refused",
     "N5 c8-precheck.yml uses repointed to a tag is refused",
     "N6 publish-ci-image.yml uses repointed to a tag is refused",
