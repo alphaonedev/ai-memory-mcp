@@ -1218,7 +1218,7 @@ jobs:
         run: |
           set -euo pipefail
           cd scripts/ci/tests
-          python3 -m unittest -v test_pg_isolated_binary.LiveEndToEnd
+          python3 -m unittest -v test_pg_isolated_binary.LiveEndToEnd test_pg_isolated_binary.LiveLineagePrecheck7031
 
       # Isolation shot after e380ca5d: mold + debuginfo=0 linked and RAN
       # the sqlite suite, then `hot_swap_llm_2166` SIGSEGV'd. That binary

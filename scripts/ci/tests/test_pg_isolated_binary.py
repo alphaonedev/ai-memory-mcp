@@ -2504,7 +2504,7 @@ class TemplateOwnership7124(unittest.TestCase):
         with Patched(Recorder(answer)), unittest.mock.patch.object(pib, 'log', side_effect=log) as logger:
             try:
                 result = pib.setup(BASE, self.DB, jobs=1)
-            except BaseException as error:
+            except (Exception, KeyboardInterrupt) as error:
                 caught = error
         return resources, calls, logger, caught, result
 
@@ -3041,7 +3041,7 @@ class Review7088R1(unittest.TestCase):
         self.assertNotIn(clone, dropped, 'the ACTIVE family clone is not owned by the sweep')
         self.assertIn(clone, rec.dbs)
         self.assertIn(old, rec.dbs, 'the TERMINAL base is kept while that clone exists')
-        self.assertTrue({act, act + '_tpl'} <= rec.dbs)
+        self.assertLessEqual({act, act + '_tpl'}, rec.dbs)
 
     def test_7156_terminal_family_without_a_shared_run_is_still_reaped(self):
         old = 'ci_base_1_1700000000_dddddddd'
@@ -3738,8 +3738,8 @@ class LiveLineagePrecheck7031(unittest.TestCase):
         pib.psql(admin, 'CREATE DATABASE "%s"' % name)
         base = pib.with_database(admin, name)
         try:
-            pib.psql(base, 'CREATE TABLE agent_lineage (agent_id text, epoch int); '
-                           'CREATE TABLE lineage_integrity_watermark (relation text PRIMARY KEY, high_water bigint)')
+            pib.psql(base, 'CREATE TABLE agent_lineage (agent_id text, epoch int)')
+            pib.psql(base, 'CREATE TABLE lineage_integrity_watermark (relation text PRIMARY KEY, high_water bigint)')
             pib.lineage_precheck(base, name)  # no watermark row: passes
             pib.psql(base, "INSERT INTO lineage_integrity_watermark VALUES ('agent_lineage', 6)")
             with self.assertRaises(pib.WrapperError) as ctx:
