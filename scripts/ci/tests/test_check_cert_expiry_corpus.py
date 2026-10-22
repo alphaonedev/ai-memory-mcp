@@ -2643,15 +2643,20 @@ def base_manifest(repo, refs):
 
     The path read from the base tree is CANONICAL_MANIFEST_PATH, never the path of the tree under review, so moving
     the manifest in a change cannot hide it from the base lookup (#7987). BASE_OK carries {name: verdict};
-    BASE_NONE means no ref resolved; BASE_ABSENT means the base predates both the harness and the manifest (the
+    BASE_NONE means no ref resolved; a ref that resolves but has no merge-base with HEAD is BASE_ERROR
+    naming the ref, and the later refs are not tried; BASE_ABSENT means the base predates both the harness and the manifest (the
     first introduction); BASE_ERROR carries a message naming the path, and covers every git failure and the case
     of a base that holds the harness but not the manifest."""
     mb = ""
     for ref in refs:
+        if git_query(repo, ["rev-parse", "--verify", "--quiet", ref + "^{commit}"])[0] != 0:
+            continue
         rc, out = git_query(repo, ["merge-base", "HEAD", ref])
-        if rc == 0 and out.strip():
-            mb = out.strip()
-            break
+        if rc != 0 or not out.strip():
+            return BASE_ERROR, (f"base ref {ref} resolves but git merge-base HEAD {ref} failed "
+                                f"(rc {rc}): {out.strip() or 'no merge-base'}; the ratchet cannot be decided")
+        mb = out.strip()
+        break
     if not mb:
         return BASE_NONE, None
     rc, listing = git_query(repo, ["ls-tree", "-r", "--name-only", mb, "--",
@@ -2843,6 +2848,27 @@ class Ratchet(unittest.TestCase):
         status, payload = base_manifest(repo, ["origin/basecand"])
         self.assertIn(status, (BASE_ERROR, BASE_NONE))
         self.assertNotEqual(status, BASE_OK)
+
+    def test_resolving_ref_with_failing_merge_base_is_undecidable(self):
+        """#8025: a ref that resolves but shares no history with HEAD (rev-parse rc 0, merge-base rc 1) is its own
+        refusal naming the ref and the git error; it never falls through to the next ref or to "no base ref"."""
+        repo, environ = self.scene(self.scratch_dir())
+        tree = subprocess.run(["git", "hash-object", "-t", "tree", "-w", "--stdin"], cwd=str(repo), input="",
+                              capture_output=True, text=True, check=True).stdout.strip()
+        orphan = subprocess.run(self.SCENE_GIT + ["commit-tree", tree, "-m", "disjoint"], cwd=str(repo),
+                                capture_output=True, text=True, check=True).stdout.strip()
+        subprocess.run(["git", "update-ref", "refs/remotes/origin/disjoint", orphan], cwd=str(repo), check=True)
+        self.assertEqual(git_query(repo, ["rev-parse", "--verify", "origin/disjoint"])[0], 0)
+        self.assertEqual(git_query(repo, ["merge-base", "HEAD", "origin/disjoint"])[0], 1)
+        status, payload = base_manifest(repo, ["origin/disjoint", "origin/basecand"])
+        self.assertEqual(status, BASE_ERROR, "the failing ref fell through to the next ref")
+        self.assertIn("origin/disjoint", payload)
+        self.assertIn("merge-base", payload)
+        problems, _notes = ratchet_decision(repo, dict(self.BASE_NAMES), dict(self.BASE_NAMES),
+                                            {BASE_REF_ENV: "origin/disjoint"})
+        joined = " ".join(problems)
+        self.assertIn("origin/disjoint", joined)
+        self.assertNotIn("no base ref resolves", joined)
 
     def test_no_base_ref_needs_the_explicit_opt_in(self):
         """#7987: with no base ref the in-tree-only check runs only when ALLOW_INTREE_ENV is set, with a loud note."""
