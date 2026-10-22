@@ -257,7 +257,17 @@ def load_module():
     return mod
 
 
+TLS_TAIL = "sslmode=verify-full&sslrootcert=%2Fr"
+TLS_ROOT_CERT = "%2Fetc%2Fci%2Froot.crt"  # a path-valued, non-secret sslrootcert (#7982)
 TEST_UMASK = 0o022  # the fixtures' file modes must not depend on the caller's umask (#7981, #7984)
+
+
+def tls_text(text):
+    """Return a URL-file text with the verify-full TLS tail the helper requires (#7982) added when it has no sslmode."""
+    url = text.rstrip("\n")
+    if "sslmode=" in url:
+        return text
+    return url + ("&" if "?" in url else "?") + TLS_TAIL + "\n"
 
 
 class TestEnsureAgeExtension6161(unittest.TestCase):
@@ -289,7 +299,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         write_exe(self.pg_config, FAKE_PG_CONFIG.format(py=sys.executable, base=str(self.base)))
         write_exe(self.psql, FAKE_PSQL.format(py=sys.executable, base=str(self.base), marker=PW_MARKER))
         self.url_file = self.base / "url"
-        self.url_file.write_text(f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb?sslmode=disable\n")
+        self.url_file.write_text(f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr\n")
         self.harness = self.base / "harness.py"
         self.harness.write_text(HARNESS)
         self.uid = None
@@ -450,7 +460,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         for call in calls:
             argv = " ".join(call["argv"])
             self.assertNotIn(PW_MARKER, argv)
-            self.assertIn("postgres://ciuser@127.0.0.1:5445?sslmode=disable", call["argv"])
+            self.assertIn("postgres://ciuser@127.0.0.1:5445?sslmode=verify-full&sslrootcert=%2Fr", call["argv"])
             self.assertNotIn("cidb", argv, "#6181: the database name must not be on psql's argv")
             self.assertEqual(call["pgdatabase"], "cidb")
             self.assertTrue(call["env_marker_ok"], "PGPASSWORD must carry the password")
@@ -464,7 +474,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertTrue(calls)
         for call in calls:
             self.assertEqual(call["argv"][1:], [
-                "postgres://ciuser@127.0.0.1:5445?sslmode=disable", "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1",
+                "postgres://ciuser@127.0.0.1:5445?sslmode=verify-full&sslrootcert=%2Fr", "-X", "-A", "-t", "-v", "ON_ERROR_STOP=1",
                 "-c", "SELECT count(*) FROM pg_available_extensions WHERE name = 'age'"])
 
     def test_the_probe_sql_is_the_reviewed_catalog_read_6896(self):
@@ -476,7 +486,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         # #6897: real psql error text names the host, address, user and database; the helper keeps all of it
         # out of the CI log and prints only psql's exit code.
         write_exe(self.psql, STDERR_PSQL.format(py=sys.executable))
-        self.url_file.write_text(f"postgres://leakuser6897:{PW_MARKER}@leakhost6897:5445/leakdb6897?sslmode=disable\n")
+        self.url_file.write_text(f"postgres://leakuser6897:{PW_MARKER}@leakhost6897:5445/leakdb6897?sslmode=verify-full&sslrootcert=%2Fr\n")
         r = self.run_script()
         self.assert_fails(r, load_module().EXIT_UNAVAILABLE, "age probe failed: psql exited 2")
         for needle in ("leakhost6897", "192.0.2.97", "leakuser6897", "leakdb6897", "marker-6897-stderr", "FATAL",
@@ -487,11 +497,11 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         # #6181: a database name equal to a secret would show on every psql argv; the name travels in PGDATABASE.
         mod = load_module()
         cases = {
-            "postgres://u@h:5445/cidb?sslmode=require": ("postgres://u@h:5445?sslmode=require", "cidb"),
+            "postgres://u@h:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr": ("postgres://u@h:5445?sslmode=verify-full&sslrootcert=%2Fr", "cidb"),
             "postgres://u@h:5445/cidb": ("postgres://u@h:5445", "cidb"),
             "postgres://u@h:5445/": ("postgres://u@h:5445", None),
             "postgres://u@h:5445": ("postgres://u@h:5445", None),
-            "postgres://u@h/ci%20db?x=1&sslmode=disable": ("postgres://u@h?x=1&sslmode=disable", "ci db"),
+            "postgres://u@h/ci%20db?x=1&sslmode=verify-full&sslrootcert=%2Fr": ("postgres://u@h?x=1&sslmode=verify-full&sslrootcert=%2Fr", "ci db"),
             "postgres://:@/d?host=%2Fdir": ("postgres://:@?host=%2Fdir", "d"),
         }
         for url, (want_target, want_db) in cases.items():
@@ -501,7 +511,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
             mod.split_database("postgres://u@h/a%00b")
 
     def test_password_in_query_moves_to_env(self):
-        self.url_file.write_text(f"postgres://ciuser@127.0.0.1:5445/cidb?password={PW_MARKER}&sslmode=disable\n")
+        self.url_file.write_text(f"postgres://ciuser@127.0.0.1:5445/cidb?password={PW_MARKER}&sslmode=verify-full&sslrootcert=%2Fr\n")
         r = self.run_script()
         self.assertEqual(r.returncode, 0, r.stderr)
         for line in (self.base / "psql.log").read_text().splitlines():
@@ -534,6 +544,31 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                 self.assertFalse((self.base / "psql.log").exists(), "psql must never be called")
 
     # ---- URL shapes libpq parses differently from urllib (R3-F1, F-R3-1) --
+    # ---- TLS: verify-full is required (#7982) -----------------------------
+    def test_tls_url_must_be_verify_full_with_a_root_cert_7982(self):
+        base = "postgres://ciuser:" + PW_MARKER + "@127.0.0.1:5445/cidb"
+        refused = {
+            "missing sslmode": f"{base}?sslrootcert={TLS_ROOT_CERT}",
+            "no query at all": base,
+            "sslmode=disable": f"{base}?sslmode=disable&sslrootcert={TLS_ROOT_CERT}",
+            "sslmode=allow": f"{base}?sslmode=allow&sslrootcert={TLS_ROOT_CERT}",
+            "sslmode=prefer": f"{base}?sslmode=prefer&sslrootcert={TLS_ROOT_CERT}",
+            "sslmode=require": f"{base}?sslmode=require&sslrootcert={TLS_ROOT_CERT}",
+            "sslmode=verify-ca": f"{base}?sslmode=verify-ca&sslrootcert={TLS_ROOT_CERT}",
+            "empty sslmode": f"{base}?sslmode=&sslrootcert={TLS_ROOT_CERT}",
+            "duplicated sslmode": f"{base}?sslmode=disable&sslmode=verify-full&sslrootcert={TLS_ROOT_CERT}",
+            "verify-full without sslrootcert": f"{base}?sslmode=verify-full",
+            "verify-full with an empty sslrootcert": f"{base}?sslmode=verify-full&sslrootcert=",
+        }
+        for label, url in refused.items():
+            with self.subTest(label):
+                self.assert_url_refused(url)
+                self.assertNotIn("postgres://", self.last_stderr)
+        self.install_good()
+        self.url_file.write_text(f"{base}?sslmode=verify-full&sslrootcert={TLS_ROOT_CERT}\n")
+        r = self.run_script()
+        self.assertEqual(r.returncode, 0, r.stderr)
+
     def assert_url_refused(self, url, names=(), absent=()):
         """The URL is refused with exit 2 before psql runs, and the value never prints.
 
@@ -544,6 +579,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         (self.base / "psql.log").unlink(missing_ok=True)  # each subTest starts without a psql call
         self.url_file.write_text(url + "\n")
         r = self.run_script()
+        self.last_stderr = r.stderr
         log = self.base / "psql.log"
         self.assertNotIn(PW_MARKER, log.read_text() if log.exists() else "", "marker reached psql's argv")
         self.assert_fails(r, 2, "tier URL file ")
@@ -563,8 +599,8 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
     def test_fragment_credentials_are_rejected(self):
         # libpq has no fragment: it reads keys after a '#' as query parameters.
         for url in (
-            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require#&password={PW_MARKER}",
-            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require#&sslpassword={PW_MARKER}",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr#&password={PW_MARKER}",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr#&sslpassword={PW_MARKER}",
             f"postgres://ciuser@127.0.0.1:5445/cidb#sslpassword={PW_MARKER}",
         ):
             with self.subTest(url=url.replace(PW_MARKER, "<M>")):
@@ -578,7 +614,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         # R4-F3: only the '@'-after-host guard refuses these two (no '#', one '=').
         for url in (
             f"postgres://ciuser:{PW_MARKER}/z@127.0.0.1:5445/cidb",
-            f"postgres://ciuser:{PW_MARKER}?sslmode=require@127.0.0.1/cidb",
+            f"postgres://ciuser:{PW_MARKER}?sslmode=verify-full&sslrootcert=%2Fr@127.0.0.1/cidb",
         ):
             with self.subTest(url=url.replace(PW_MARKER, "<M>")):
                 self.assert_url_refused(url)
@@ -587,7 +623,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         for key in ("oauth_client_secret", "scram_client_key", "scram_server_key"):
             with self.subTest(key=key):
                 self.assert_url_refused(
-                    f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require&{key}={PW_MARKER}", (key,))
+                    f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&{key}={PW_MARKER}", (key,))
 
     def test_unknown_query_key_is_rejected_without_its_value(self):
         # R5-F1: an unlisted key may be a password tail, so it is never named.
@@ -599,7 +635,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         tail = "Ident6161tail"
         for url in (
             f"postgres://ciuser@127.0.0.1:5445/cidb?password=Tr0ub&{tail}or3=x",
-            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require&password=Tr0ub&{tail}=x",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&password=Tr0ub&{tail}=x",
         ):
             with self.subTest(url=url.replace(tail, "<T>")):
                 self.assert_url_refused(url, ("unlisted query key",), (tail,))
@@ -612,12 +648,12 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
     def test_query_segment_without_equals_is_rejected_unnamed(self):
         # A bare segment is a value, not a key: it must never be printed as a key name.
         bare = "marker_6161_bare"
-        self.assert_url_refused(f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require&{bare}")
+        self.assert_url_refused(f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&{bare}")
         self.assertFalse((self.base / "psql.log").exists())
 
     def test_allowlisted_query_keys_are_accepted(self):
         self.install_good()
-        url = ("postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require&application_name=ci"
+        url = ("postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&application_name=ci"
                "&connect_timeout=10&target_session_attrs=any")
         self.url_file.write_text(url + "\n")
         r = self.run_script()
@@ -634,12 +670,12 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         # R4-F2: parse_qsl reads the remainder as the value of an allowlisted key, so the
         # password would stay on argv; libpq refuses these only after psql has started.
         for url in (
-            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require;password={PW_MARKER}",
-            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require?password={PW_MARKER}",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr;password={PW_MARKER}",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr?password={PW_MARKER}",
             f"postgres://ciuser@127.0.0.1:5445/cidb?application_name=ci=password={PW_MARKER}",
             # R5-F3: the extra '=' sits in a later segment (a first-segment-only check misses it).
-            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require&application_name=ci;password={PW_MARKER}",
-            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require&connect_timeout=5&application_name=ci=x=y",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&application_name=ci;password={PW_MARKER}",
+            f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&connect_timeout=5&application_name=ci=x=y",
         ):
             with self.subTest(url=url.replace(PW_MARKER, "<M>")):
                 self.assert_url_refused(url)
@@ -648,8 +684,8 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         # R4-F2 / F-R4-2: urlsplit silently drops TAB/CR/LF (joining a two-line URL file),
         # and a NUL makes subprocess raise; both are refused before parsing.
         for label, url in (
-            ("two-line file", f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require\npassword={PW_MARKER}"),
-            ("CR", f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require\rpassword={PW_MARKER}"),
+            ("two-line file", f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr\npassword={PW_MARKER}"),
+            ("CR", f"postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr\rpassword={PW_MARKER}"),
             ("TAB", f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/cidb?application_name=c\ti"),
             ("NUL in password", f"postgres://ciuser:{PW_MARKER}\x00@127.0.0.1:5445/cidb"),
             ("NUL in host", f"postgres://ciuser:{PW_MARKER}@127.0.0.1\x00:5445/cidb"),
@@ -724,7 +760,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
     def test_plus_in_query_password_reaches_pgpassword_unchanged(self):
         self.install_good()
         pw = PW_MARKER + "+x"
-        self.url_file.write_text(f"postgres://ciuser@127.0.0.1:5445/cidb?password={pw}\n")
+        self.url_file.write_text(tls_text(f"postgres://ciuser@127.0.0.1:5445/cidb?password={pw}\n"))
         r = self.run_script()
         self.assertEqual(r.returncode, 0, r.stderr)
         calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
@@ -781,10 +817,10 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         for label, url in (
             ("leading &&", f"postgres://ciuser@{host}?&&password={PW_MARKER}"),
             ("leading &", f"postgres://ciuser@{host}?&password={PW_MARKER}"),
-            ("middle &&", f"postgres://ciuser@{host}?password={PW_MARKER}&&sslmode=require"),
-            ("double trailing &&", f"postgres://ciuser@{host}?password={PW_MARKER}&sslmode=require&&"),
+            ("middle &&", f"postgres://ciuser@{host}?password={PW_MARKER}&&sslmode=verify-full&sslrootcert=%2Fr"),
+            ("double trailing &&", f"postgres://ciuser@{host}?password={PW_MARKER}&sslmode=verify-full&sslrootcert=%2Fr&&"),
             ("only &", f"postgres://ciuser:{PW_MARKER}@{host}?&"),
-            ("no password &&", f"postgres://ciuser@{host}?application_name=a&&sslmode=require"),
+            ("no password &&", f"postgres://ciuser@{host}?application_name=a&&sslmode=verify-full&sslrootcert=%2Fr"),
         ):
             with self.subTest(shape=label):
                 self.assert_url_refused(url, ("empty query segment",))
@@ -795,8 +831,8 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         host = "127.0.0.1:5445/cidb"
         target, password = mod.psql_target(f"postgres://ciuser@{host}?password=pw&")
         self.assertEqual((target, password), (f"postgres://ciuser@{host}", "pw"))
-        target, password = mod.psql_target(f"postgres://ciuser@{host}?password=pw&sslmode=require&")
-        self.assertEqual((target, password), (f"postgres://ciuser@{host}?sslmode=require", "pw"))
+        target, password = mod.psql_target(f"postgres://ciuser@{host}?password=pw&sslmode=verify-full&sslrootcert=%2Fr&")
+        self.assertEqual((target, password), (f"postgres://ciuser@{host}?sslmode=verify-full&sslrootcert=%2Fr", "pw"))
         url = f"postgres://ciuser@{host}?"
         self.assertEqual(mod.psql_target(url), (url, None))
 
@@ -812,7 +848,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                 _, password = mod.psql_target(url)
                 self.assertEqual(os.fsencode(password), b"a\xffb")
         self.install_good()
-        self.url_file.write_text("postgres://ciuser@127.0.0.1:5445/cidb?password=a%FFb\n")
+        self.url_file.write_text(tls_text("postgres://ciuser@127.0.0.1:5445/cidb?password=a%FFb\n"))
         r = self.run_script()
         self.assertEqual(r.returncode, 0, r.stderr)
         calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
@@ -826,8 +862,8 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         mod = load_module()
         for key in ("%70assword", "pass%77ord", "p%61ssword"):
             with self.subTest(key=key):
-                target, password = mod.psql_target(f"postgres://ciuser@127.0.0.1:5445/cidb?{key}=pw&sslmode=require")
-                self.assertEqual((target, password), ("postgres://ciuser@127.0.0.1:5445/cidb?sslmode=require", "pw"))
+                target, password = mod.psql_target(f"postgres://ciuser@127.0.0.1:5445/cidb?{key}=pw&sslmode=verify-full&sslrootcert=%2Fr")
+                self.assertEqual((target, password), ("postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr", "pw"))
         # an encoded allowlisted key is kept as written
         url = "postgres://ciuser@127.0.0.1:5445/cidb?%73slmode=require"
         self.assertEqual(mod.psql_target(url), (url, None))
@@ -837,13 +873,13 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
     def test_plus_in_userinfo_password_is_literal(self):
         # R6-F2: the CI form is user:pass@host; '+' stays a plus there too.
         mod = load_module()
-        target, password = mod.psql_target("postgres://ciuser:ab+cd@127.0.0.1:5445/cidb?sslmode=disable")
+        target, password = mod.psql_target("postgres://ciuser:ab+cd@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr")
         self.assertEqual(password, "ab+cd")
-        self.assertEqual(target, "postgres://ciuser@127.0.0.1:5445/cidb?sslmode=disable")
+        self.assertEqual(target, "postgres://ciuser@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr")
         _, password = mod.psql_target("postgres://ciuser:a%20b+c%2Bd@127.0.0.1:5445/cidb")
         self.assertEqual(password, "a b+c+d")
         self.install_good()
-        self.url_file.write_text(f"postgres://ciuser:{PW_MARKER}+x@127.0.0.1:5445/cidb\n")
+        self.url_file.write_text(tls_text(f"postgres://ciuser:{PW_MARKER}+x@127.0.0.1:5445/cidb\n"))
         r = self.run_script()
         self.assertEqual(r.returncode, 0, r.stderr)
         calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
@@ -900,12 +936,12 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                       PGSSLROOTCERT=str(self.base / "decoy.crt"), PGLOADBALANCEHOSTS="random",
                       PGMINPROTOCOLVERSION="3.0", PGSSLNEGOTIATION="postgres", CALLER_SECRET_6676="caller",
                       LANG="C", LC_ALL="C", TZ="UTC")
-        cases = ((f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/urldb?sslmode=disable", "urldb"),
-                 (f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445?dbname=qdb&sslmode=disable", None))
+        cases = ((f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445/urldb?sslmode=verify-full&sslrootcert=%2Fr", "urldb"),
+                 (f"postgres://ciuser:{PW_MARKER}@127.0.0.1:5445?dbname=qdb&sslmode=verify-full&sslrootcert=%2Fr", None))
         for text, want in cases:
             with self.subTest(url=text.split("@", 1)[1]):
                 (self.base / "psql.log").unlink(missing_ok=True)
-                self.url_file.write_text(text + "\n")
+                self.url_file.write_text(tls_text(text + "\n"))
                 r = self.run_script(env=caller)
                 self.assertEqual(r.returncode, 0, r.stderr)
                 calls = self.psql_calls()
@@ -934,9 +970,9 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         # 3-agent vote (6def5ab6) on #6676, option C (supersedes the #6577 M13 pin): with no database libpq
         # falls back to the user name or a caller's PGDATABASE, so the URL is refused before any restore or psql.
         for good in (True, False):
-            for text in ("postgres://ciuser:pw-6676@127.0.0.1:5445?sslmode=disable", "postgres://ciuser@127.0.0.1:5445/",
+            for text in ("postgres://ciuser:pw-6676@127.0.0.1:5445?sslmode=verify-full&sslrootcert=%2Fr", "postgres://ciuser@127.0.0.1:5445/",
                          "postgres://ciuser@127.0.0.1:5445", "postgresql://ciuser@127.0.0.1:5445/?dbname=",
-                         "postgres://ciuser@127.0.0.1:5445?sslmode=disable&%64bname="):
+                         "postgres://ciuser@127.0.0.1:5445?sslmode=verify-full&sslrootcert=%2Fr&%64bname="):
                 with self.subTest(installed=good, url=text.split("@", 1)[1]):
                     for d in (self.lib, self.ext):
                         for f in d.iterdir():
@@ -944,7 +980,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                     if good:
                         self.install_good()
                     (self.base / "psql.log").unlink(missing_ok=True)
-                    self.url_file.write_text(text + "\n")
+                    self.url_file.write_text(tls_text(text + "\n"))
                     r = self.run_script(env=dict(os.environ, PGDATABASE="callerdb"))
                     self.assert_fails(r, 2, "tier URL file names no database")
                     self.assertNotIn("pw-6676", r.stderr)
@@ -959,10 +995,10 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         for text in ("postgres://ciuser@127.0.0.1:5445/?dbname=cidb&dbname=",
                      "postgres://ciuser@127.0.0.1:5445/cidb?dbname=",
                      "postgres://ciuser@127.0.0.1:5445/cidb?dbname=other&%64bname=",
-                     "postgres://ciuser:pw-6871@127.0.0.1:5445/cidb?sslmode=disable&dbname=&application_name=a"):
+                     "postgres://ciuser:pw-6871@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&dbname=&application_name=a"):
             with self.subTest(url=text.split("@", 1)[1]):
                 (self.base / "psql.log").unlink(missing_ok=True)
-                self.url_file.write_text(text + "\n")
+                self.url_file.write_text(tls_text(text + "\n"))
                 r = self.run_script(env=dict(os.environ, PGDATABASE="callerdb"))
                 self.assert_fails(r, 2, "tier URL file names no database")
                 self.assertNotIn("pw-6871", r.stdout + r.stderr)
@@ -973,19 +1009,19 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
                      "postgres://ciuser@127.0.0.1:5445/other?dbname=cidb"):
             with self.subTest(accepted=text.split("@", 1)[1]):
                 (self.base / "psql.log").unlink(missing_ok=True)
-                self.url_file.write_text(text + "\n")
+                self.url_file.write_text(tls_text(text + "\n"))
                 r = self.run_script()
                 self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
                 calls = [json.loads(line) for line in (self.base / "psql.log").read_text().splitlines()]
                 self.assertTrue(calls)
-                self.assertTrue(all(call["argv"][1].endswith("dbname=cidb") for call in calls), calls)
+                self.assertTrue(all("dbname=cidb" in call["argv"][1].split("?", 1)[1].split("&") for call in calls), calls)
 
     def test_service_key_in_url_is_refused_by_name(self):
         # libpq fills unset options from the service file BEFORE it reads PGPASSWORD, so a service
         # entry carrying a password beats the moved password (the URL password beat it originally).
         for url in ("postgres://ciuser:pw@127.0.0.1:5445/cidb?service=svc",
                     "postgres://ciuser@127.0.0.1:5445/cidb?service=svc",
-                    "postgres://ciuser:pw@127.0.0.1:5445/cidb?sslmode=disable&%73ervice=svc"):
+                    "postgres://ciuser:pw@127.0.0.1:5445/cidb?sslmode=verify-full&sslrootcert=%2Fr&%73ervice=svc"):
             with self.subTest(url=url.split("@", 1)[1]):
                 self.assert_url_refused(url, ("query key service",))
 
@@ -1042,7 +1078,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         for stale in ("sleep.pid", "sleep.ppid"):  # a previous subTest's pid must not be read as this one's
             if (self.base / stale).exists():
                 (self.base / stale).unlink()
-        self.url_file.write_text(f"postgres://ciuser:{PW_MARKER}@{hosts}/cidb\n")
+        self.url_file.write_text(tls_text(f"postgres://ciuser:{PW_MARKER}@{hosts}/cidb\n"))
         proc = subprocess.Popen(self.cmd(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         pid_file = self.base / "sleep.pid"
         deadline = time.monotonic() + 15
@@ -1555,11 +1591,11 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
     def test_kept_query_segments_are_not_re_encoded(self):
         mod = load_module()
         url = ("postgres://ciuser@127.0.0.1:5445/cidb?options=-c%20statement_timeout%3D5"
-               "&password=pw&application_name=a+b&sslmode=require")
+               "&password=pw&application_name=a+b&sslmode=verify-full&sslrootcert=%2Fr")
         target, password = mod.psql_target(url)
         self.assertEqual(password, "pw")
         self.assertEqual(target, "postgres://ciuser@127.0.0.1:5445/cidb"
-                                 "?options=-c%20statement_timeout%3D5&application_name=a+b&sslmode=require")
+                                 "?options=-c%20statement_timeout%3D5&application_name=a+b&sslmode=verify-full&sslrootcert=%2Fr")
 
     def test_query_without_password_is_passed_through_as_written(self):
         mod = load_module()
@@ -1568,7 +1604,7 @@ class TestEnsureAgeExtension6161(unittest.TestCase):
         self.assertEqual(password, "pw")
         self.assertEqual(target, "postgres://ciuser@127.0.0.1:5445/cidb?options=-c%20x&application_name=a+b")
         # Segments (even libpq's single trailing '&') are never rebuilt when no password was removed.
-        url = "postgres://ciuser@127.0.0.1:5445/cidb?application_name=a&sslmode=require&"
+        url = "postgres://ciuser@127.0.0.1:5445/cidb?application_name=a&sslmode=verify-full&sslrootcert=%2Fr&"
         self.assertEqual(mod.psql_target(url), (url, None))
 
     def test_allowlist_excludes_every_libpq_secret_key(self):
@@ -1941,7 +1977,7 @@ def oracle_divergences(lib, psql_target, helper_error, url):
 
 
 ORACLE_URLS = (
-    "postgres://u:Fk3Pw0rd@h:5432/db?sslmode=require",
+    "postgres://u:Fk3Pw0rd@h:5432/db?sslmode=verify-full&sslrootcert=%2Fr",
     "postgres://:Fk3Pw0rd@/db?host=%2Fvar%2Frun",
     "postgres://u:Fk3:Pw0rd@h/db",
     "postgres://u:Fk3%40Pw0rd@h/db",
@@ -1957,7 +1993,7 @@ ORACLE_URLS = (
     "postgres://u:Fk3\x0cPw0rd@h/db",
     "postgres://u:Fk3\x7fPw0rd@h/db",
     "postgres://u:Fk3 Pw0rd@h/db",
-    "postgres://u@h/db?password=Fk3Pw0rd&sslmode=disable",
+    "postgres://u@h/db?password=Fk3Pw0rd&sslmode=verify-full&sslrootcert=%2Fr",
     "postgres://u@h/db?password=Fk3%0D%0APw0rd",
     "postgres://u@h/db?pass%77ord=Fk3Pw0rd",
     "postgres://u@h/db?PASSWORD=Fk3Pw0rd",

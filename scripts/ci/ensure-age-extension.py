@@ -28,7 +28,8 @@ Behaviour:
      another runner has verified.
   4. Re-check health; exit 0 when healthy, else one stderr line and non-zero.
 
-The tier URL is read from a file.  Its password is passed to psql through the
+The tier URL is read from a file.  It must carry exactly one ``sslmode=verify-full`` and a non-empty
+``sslrootcert`` (#7982): any other TLS shape is refused with exit 2 before any restore or psql call.  Its password is passed to psql through the
 ``PGPASSWORD`` environment variable and removed from the URL psql receives, so
 the password never appears on a process argv.  ONLY the password is moved off
 argv: path- and name-valued keys that are allowed (``sslrootcert``, ``sslcert``,
@@ -188,6 +189,9 @@ KNOWN_KEY_NAMES = ALLOWED_QUERY_KEYS | REFUSED_KNOWN_KEYS
 # #6676: the only caller variables copied into psql's environment (plus every LC_* variable).  Everything else,
 # every PG* variable included (PGSERVICE/PGSERVICEFILE, #6345), is dropped; the helper then sets PGPASSWORD,
 # PGDATABASE and PGCONNECT_TIMEOUT itself.
+TLS_MODE_KEY = "sslmode"
+TLS_REQUIRED_MODE = "verify-full"  # the tier is documented verify-full (#7982)
+TLS_ROOT_KEY = "sslrootcert"
 PSQL_ENV_KEEP = ("PATH", "HOME", "TMPDIR", "LANG", "TZ")
 TEMP_SUFFIX = ".age-restore"
 
@@ -699,6 +703,25 @@ def parse_args(argv):
     return p.parse_args(argv)
 
 
+def require_verified_tls(target):
+    """Refuse a tier URL that does not pin TLS ``verify-full`` with a root certificate (#7982).
+
+    The enterprise-fed tier is TLS ``verify-full``; a URL with no ``sslmode``, a repeated one or any other value
+    (``prefer`` is libpq's default) would send the tier password without certificate and hostname verification, and
+    ``verify-full`` without an ``sslrootcert`` leaves the trust anchor to a caller-controlled default.  Messages name
+    keys only, never a value and never the URL.
+    """
+    query = target.split("?", 1)[1] if "?" in target else ""
+    pairs = [(unquote(key, errors="surrogateescape"), unquote(value, errors="surrogateescape"))
+             for key, _, value in (seg.partition("=") for seg in query.split("&") if seg)]
+    modes = [value for key, value in pairs if key == TLS_MODE_KEY]
+    if modes != [TLS_REQUIRED_MODE]:
+        raise HelperError(f"tier URL file must set exactly one {TLS_MODE_KEY}={TLS_REQUIRED_MODE}", EXIT_BAD_INPUT)
+    if not any(key == TLS_ROOT_KEY and value for key, value in pairs):
+        raise HelperError(f"tier URL file must set a non-empty {TLS_ROOT_KEY} with {TLS_MODE_KEY}={TLS_REQUIRED_MODE}",
+                          EXIT_BAD_INPUT)
+
+
 def read_url(url_file):
     try:
         url = url_file.read_text(encoding="utf-8").strip()
@@ -706,7 +729,9 @@ def read_url(url_file):
         raise HelperError(f"tier URL file {url_file} is unreadable", EXIT_BAD_INPUT)
     if not url:
         raise HelperError(f"tier URL file {url_file} is empty", EXIT_BAD_INPUT)
-    probe_target(url)  # validate the shape, and that it names a database, before any restore or psql call
+    # validate the shape, and that it names a database, before any restore or psql call
+    target, _, _ = probe_target(url)
+    require_verified_tls(target)  # #7982: never send the tier password without verify-full
     return url
 
 
