@@ -1569,10 +1569,6 @@ def repo_text(rel):
 # file; a leading ! means the pattern must NOT match. Each tuple was chosen to FAIL on the real pre-fix file of the
 # fix commit and to PASS on the fixed file (PREFIX_REPLAY below replays that), so a probe is no longer a bare
 # token that an unfixed generator also carries.
-# #7988: every entry is a tuple of regular expressions searched (re.MULTILINE) in the comment-stripped text of the
-# file; a leading ! means the pattern must NOT match. Each tuple was chosen to FAIL on the real pre-fix file of the
-# fix commit and to PASS on the fixed file (PREFIX_REPLAY below replays that), so a probe is no longer a bare
-# token that an unfixed generator also carries.
 GENERATOR_NEEDLES = {
     (r"../ci/tests/test_evidence_fixture_identity.py", r"the fixture byte-identity test the cert procedure cites"):
         (r"def test_", r"identity", r"read_bytes\(\)|sha256|hashlib",),
