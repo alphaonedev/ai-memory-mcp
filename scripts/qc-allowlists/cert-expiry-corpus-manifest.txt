@@ -79,6 +79,7 @@ case_7793_sidecar_clean_rebind RED
 case_7975_selftest_fail_closed GREEN
 case_7977_probe_mutants GREEN
 case_7988_prefix_replay GREEN
+case_7989_unreadable_escaper_source GREEN
 cell_a_watched_path_red GREEN
 cell_b_watched_path_with_reissue_green GREEN
 cell_c_identifier_add_red GREEN

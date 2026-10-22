@@ -1913,8 +1913,8 @@ def log_safe_problems(fn, aspects=None):
             try:
                 if "unicodedata" in inspect.getsource(fn):
                     problems.append("unassigned: escaping depends on unicodedata tables")
-            except (OSError, TypeError):
-                pass
+            except (OSError, TypeError) as exc:
+                problems.append(f"unassigned: the escaper source cannot be read to check unicodedata use ({type(exc).__name__})")
     if aspects is None or "backslash" in aspects:
         if fn("a\\b") != "a\\\\b":
             problems.append("backslash is not doubled")
@@ -2148,6 +2148,17 @@ class Corpus(CorpusBase):
         self.assertTrue(rebind_problems("# rebind\n"))
         self.assertTrue(sidecar_problems("std::mem::forget(tmp);\n"))
         self.assertTrue(ladder_problems("ladder\n", "# ladder\n"))
+
+    @expect(GREEN)
+    def case_7989_unreadable_escaper_source(self):
+        """#7989: log_safe_problems must not wave an escaper whose source it cannot read. An escaper
+        built with exec has no source (OSError) and a builtin has none (TypeError); both are reported."""
+        scope = {}
+        exec("def esc(text):\n    import unicodedata\n    return ''.join(c if 0x20 <= ord(c) <= 0x7e else chr(92) + 'u%04x' % ord(c) for c in text)\n", scope)
+        for fn in (scope["esc"], repr):
+            problems = log_safe_problems(fn, ("unassigned",))
+            self.assertTrue(any("source" in p and "cannot be read" in p for p in problems),
+                            f"an escaper with no readable source passed the unicodedata check: {problems}")
 
     @expect(GREEN)
     def case_7988_prefix_replay(self):
