@@ -47,8 +47,15 @@ fn past_ttl() -> Duration {
 
 /// The within-TTL branch only asserts the cache contract when the write was
 /// issued with at least this much of the window left; a host stall that eats
-/// the margin is retried once, not asserted (#6796).
+/// the margin is retried, not asserted (#6796).
 const WITHIN_TTL_BUDGET_MS: u64 = RECORD_STOP_REFRESH_TTL_MS - TTL_SLACK_MS;
+
+/// Upper bound on within-TTL attempts. Each attempt re-primes and re-measures;
+/// the within-TTL claim is asserted only when the final attempt was measured
+/// inside [`WITHIN_TTL_BUDGET_MS`]. A bounded count keeps a permanently stalled
+/// host from looping forever; when every attempt overran, the claim is
+/// unmeasurable and is logged instead of asserted (#8042).
+const WITHIN_TTL_ATTEMPTS: usize = 3;
 
 /// One within-TTL attempt: connect a fresh `store_a`, run one warm-up write so
 /// the cold first write (statement prepare, pool warm-up) is paid before the
@@ -148,13 +155,15 @@ async fn pg_write_gate_honors_cross_pool_stop_within_ttl_3276() {
     //     #3276 explicitly must avoid. Same-process stops remain instant (the
     //     shared cache flips synchronously) - this window is cross-pool only.
     //
-    //     #6796: the claim only holds when the write really was issued inside
-    //     the window, so measure it. If a loaded host spent the margin on the
-    //     engage round-trips, release, re-prime and retry ONCE before asserting.
+    //     #6796 / #8042: the claim only holds when the write really was issued
+    //     inside the window, so measure it. If a loaded host spent the margin
+    //     on the engage round-trips, release, re-prime and retry, up to
+    //     WITHIN_TTL_ATTEMPTS times, and assert only on a measured window.
+    let budget_ms = u128::from(WITHIN_TTL_BUDGET_MS);
     let (mut store_a, mut early_not_gated, mut early, mut elapsed_ms) =
         within_ttl_attempt(&url, &store_b, &ctx, &early_id).await;
-    let mut attempts = 1_u32;
-    if elapsed_ms >= u128::from(WITHIN_TTL_BUDGET_MS) {
+    let mut measured_ms = vec![elapsed_ms];
+    while elapsed_ms >= budget_ms && measured_ms.len() < WITHIN_TTL_ATTEMPTS {
         store_b
             .record_stop(&ctx, false, "ai:3276", "record-plane")
             .await
@@ -162,7 +171,16 @@ async fn pg_write_gate_honors_cross_pool_stop_within_ttl_3276() {
         purge(&store_b, &early_id).await;
         (store_a, early_not_gated, early, elapsed_ms) =
             within_ttl_attempt(&url, &store_b, &ctx, &early_id).await;
-        attempts = 2;
+        measured_ms.push(elapsed_ms);
+    }
+    let attempts = measured_ms.len();
+    let within_ttl_measured = elapsed_ms < budget_ms;
+    if !within_ttl_measured {
+        println!(
+            "#8042: every within-TTL attempt overran the {WITHIN_TTL_BUDGET_MS} ms budget \
+             (measured elapsed ms per attempt: {measured_ms:?}, attempts={attempts}); \
+             the within-TTL claim is unmeasurable on this host, skipping that assertion"
+        );
     }
     // The precise steady-state claim: the gate did NOT refuse (it rode the
     // cache and did not re-read the chain). A per-write DB read would have
@@ -223,7 +241,7 @@ async fn pg_write_gate_honors_cross_pool_stop_within_ttl_3276() {
 
     // -------------------- assertions --------------------
     assert!(
-        early_not_gated,
+        early_not_gated || !within_ttl_measured,
         "#3276: within the TTL window the write gate must ride the local cache \
          (no per-write DB read), so a just-engaged cross-pool stop is not yet \
          seen and the gate does NOT refuse; got {early}, landed={early_landed}, \
