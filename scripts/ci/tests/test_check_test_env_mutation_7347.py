@@ -1123,6 +1123,59 @@ class Issue7993(Fixture):
         self.assertEqual(self.flagged(WRITER + helper + reader("let _e = Env::plain();")), set())
 
 
+class Issue7994(Fixture):
+    """#7994: "A reader inside the closure or async block passed to `std::thread::spawn`, `tokio::spawn` or
+    `tokio::task::spawn_blocking` runs on another thread or task that is not bound to the guard's scope ...
+    The same holds for a writer: `std::thread::spawn(|| set_var(..))` under the lock is counted as a locked
+    write. This fails open." / "a detached site is never covered by a guard of the enclosing fn (fail closed)".
+    """
+
+    HOLD = "let _g = ENV_LOCK.blocking_lock();\n    "
+    SPAWNS = {
+        "thread_spawn": "std::thread::spawn(|| { %s });",
+        "thread_spawn_move": "std::thread::spawn(move || { %s });",
+        "tokio_spawn_async": "tokio::spawn(async { %s });",
+        "tokio_spawn_async_move": "tokio::spawn(async move { %s });",
+        "spawn_blocking": "tokio::task::spawn_blocking(move || { %s });",
+        "spawn_local": "tokio::task::spawn_local(async { %s });",
+        "bare_imported_spawn": "spawn(|| { %s });",
+        "thread_builder": "std::thread::Builder::new().spawn(move || { %s }).unwrap();",
+        "turbofish": "tokio::spawn::<()>(async { %s });",
+    }
+
+    def test_a_reader_in_a_detached_spawn_is_not_covered_by_the_enclosing_lock(self):
+        for name, form in self.SPAWNS.items():
+            with self.subTest(spawn=name):
+                self.assertEqual(self.flagged(WRITER + reader(self.HOLD + form % OPEN, "")), FLAGGED)
+
+    def test_a_helper_called_inside_a_spawn_does_not_inherit_the_lock(self):
+        helper = "fn peek() { let _c = db::open(\":memory:\"); }\n"
+        spawned = reader(self.HOLD + "std::thread::spawn(|| { peek(); });", "")
+        direct = reader(self.HOLD + "peek();", "")
+        self.assertEqual(self.flagged(WRITER + helper + spawned), FLAGGED)
+        self.assertEqual(self.flagged(WRITER + helper + direct), set())  # control: the same call, not detached
+
+    def test_a_writer_in_a_detached_spawn_is_not_a_locked_write(self):
+        writer = ("#[test]\nfn w2() {\n    %sstd::thread::spawn(|| { unsafe { std::env::set_var(\"B\", \"1\") }; });\n}\n"
+                  % self.HOLD)
+        flagged = self.flagged(WRITER + LOCKED_READER + writer)
+        self.assertIn("tests/a.rs::w2", flagged)
+
+    def test_a_lock_taken_inside_the_spawn_is_not_modelled_and_stays_flagged(self):
+        # the canonical shape is a top-level statement of the test fn; a guard made inside a closure
+        # is not credited to anything (fail closed), so the gate asks for the lock in the test fn itself
+        inner = "let _h = ENV_LOCK.blocking_lock(); %s" % OPEN
+        self.assertEqual(self.flagged(WRITER + reader("std::thread::spawn(|| { %s });" % inner, "")), FLAGGED)
+
+    def test_the_outer_lock_still_covers_a_reader_outside_the_spawn(self):
+        text = WRITER + reader(self.HOLD + "std::thread::spawn(|| {});", OPEN)
+        self.assertEqual(self.flagged(text), set())
+
+    def test_a_spawn_method_on_a_process_is_not_a_detach_site(self):
+        text = WRITER + reader(self.HOLD + "let _p = std::process::Command::new(\"true\").spawn();", OPEN)
+        self.assertEqual(self.flagged(text), set())
+
+
 class Issue7999(unittest.TestCase):
     """#7628: "The `let_names` docstring at scripts/check-test-env-mutation.py:612-614 also states that
     `let _ = guard;` drops the guard. That is wrong for a named place: `let _ = g;` does not move g

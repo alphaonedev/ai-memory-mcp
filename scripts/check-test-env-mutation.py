@@ -76,7 +76,12 @@ Two named exceptions exist and nothing else: the tuple helper `let (<key>, <guar
 install_test_operator_key();` (TUPLE_GUARD_SLOTS, judged on the guard slot) and the HELPER shape: a
 non-test fn that does `let <lock> = <KNOWN_LOCK_EXPR>;` at its top level and mentions <lock> exactly
 once more, as a field initialiser of the struct literal that is its tail expression (`Self { prev,
-_lock: lock }`); the caller is credited only through its own canonical `let _g = helper();`.
+_lock: lock }`) or, as the second named helper shape (#7993), a non-test fn whose whole top-level tail or
+`return` value IS the lock expression (`fn env_lock() -> MutexGuard<..> { LOCK.get_or_init(..).lock()
+.unwrap_or_else(..) }`); the caller is credited only through its own canonical `let _g = helper();`.
+A closure or async block handed to `spawn` / `spawn_blocking` (#7994) runs detached: it inherits no
+lock of the spawner, of its callers or of `#[serial]`. Open the connection or read the env before the
+spawn, on the test thread, and move the result into the closure.
 In a `macro_rules!` body (a template, not a fn) the statement may sit in any block that encloses the
 macro's first env write.
 
@@ -129,6 +134,10 @@ ISOLATED_MARKER = re.compile(r"//[ \t]*env-mutation-gate:[ \t]*process-isolated[
 RAW_STR_OPEN = re.compile(r'(?:[bc]?r)(#*)"')
 # Direct writers: env::set_var / remove_var, qualified or imported bare (not `fn set_var`, not `.set_var`).
 DIRECT_MUTATION = re.compile(r"(?<![\w.])(?:(?:std::)?env::)?(?:set_var|remove_var)\s*\(")
+# #7994: a call that hands its argument to another thread or task. The closure or async block it takes
+# runs outside the spawner's guard scope (the handle may outlive the guard), so it never inherits a lock.
+DETACH = re.compile(r"(?<![\w])(?<!fn )(?:spawn|spawn_blocking|spawn_local|spawn_on|spawn_pinned|"
+                    r"spawn_unchecked|spawn_scoped)\s*(?:::\s*<[^;{}]*?>\s*)?\(")
 ONCE_SETTERS = ("ensure_no_config_env", "permissive_attestation_for_tests")
 # tests/common guards: each takes tests/common/mod.rs ENV_LOCK and holds it for its lifetime.
 COMMON_GUARD_METHODS = {"EnvVarGuard": ("set", "remove"), "MultiEnvVarGuard": ("apply",)}
@@ -907,6 +916,7 @@ class FileModel:
         self.once_fns = {id(f) for f in self.fns
                          if not f.is_test and ONCE_BODY.search(f.body) and DIRECT_MUTATION.search(f.body)}
         self._calls, self._acq, self._summary, self._ctx, self._live = {}, {}, {}, {}, {}
+        self._detached = {}
         self._encl, self._viol, self._file_ip_only = {}, {}, None
         self.blamed = set()
         self.callers = {id(f): [] for f in self.fns}
@@ -1161,11 +1171,30 @@ class FileModel:
             self._encl[key] = match_brace(fn.body, scope_open(fn.body, a))
         return r < self._encl[key]
 
+    def detached(self, fn, r):
+        """(start, end) of the innermost spawn argument of fn that contains body position r, else None (#7994)."""
+        spans = self._detached.get(id(fn))
+        if spans is None:
+            spans = []
+            for m in DETACH.finditer(fn.body):
+                spans.append((m.end(), match_paren(fn.body, m.end() - 1) - 1))
+            self._detached[id(fn)] = spans
+        inside = [s for s in spans if s[0] <= r < s[1]]
+        return min(inside, key=lambda s: s[1] - s[0]) if inside else None
+
+    def inherit(self, fn, r, ctx):
+        """The caller-supplied lock context that still holds at body position r: none inside a detached spawn."""
+        return EMPTY if self.detached(fn, r) else ctx
+
     def held_own(self, fn, r, acqs=None):
-        """Tokens fn itself holds at body position r."""
+        """Tokens fn itself holds at body position r. Inside a detached spawn argument (#7994) only the
+        acquisitions made inside that same argument count: not the spawner's guards, not #[serial]."""
         acqs = self.acquisitions(fn) if acqs is None else acqs
+        span = self.detached(fn, r)
         held = set()
         for a in acqs:
+            if span and not span[0] <= a.pos < span[1]:
+                continue
             if a.kind == "cover":
                 if a.pos <= r < a.end:
                     held |= a.tokens
@@ -1176,7 +1205,8 @@ class FileModel:
                 held |= a.tokens
             elif a.bound:
                 held |= a.tokens
-        held |= fn.serial_tokens
+        if not span:
+            held |= fn.serial_tokens
         return held
 
     # ---- env var names ----------------------------------------------------------------------
@@ -1307,7 +1337,7 @@ class FileModel:
             c = self.ctx(caller, stack + (id(fn),))
             if c is None:
                 continue
-            held = frozenset(self.held_own(caller, pos)) | c
+            held = frozenset(self.held_own(caller, pos)) | self.inherit(caller, pos, c)
             res = held if res is None else res & held
         res = res if res is not None else EMPTY
         if not stack:
@@ -1342,7 +1372,7 @@ class FileModel:
         def add(fn, pos, base, names):
             # A Once token protects only against its own setter's write: holding once:X says
             # nothing about a write that another setter (or an unlocked caller) makes.
-            held = frozenset(self.held_own(fn, pos)) | self.ctx(fn)
+            held = frozenset(self.held_own(fn, pos)) | self.inherit(fn, pos, self.ctx(fn))
             protect = frozenset(t for t in held if not t.startswith(ONCE_PREFIX)) | base
             sites.append(Site(len(sites), fn, pos, base, protect, frozenset(names)))
 
@@ -1424,7 +1454,7 @@ class FileModel:
             return self._viol[key]
         res = False
         for pos, site in self.readers(fn):
-            held = set(ctx) | self.held_own(fn, pos) | (site.base if site else EMPTY)
+            held = set(self.inherit(fn, pos, ctx)) | self.held_own(fn, pos) | (site.base if site else EMPTY)
             if not self.satisfied(held, site, root):
                 res = True
                 break
@@ -1432,7 +1462,7 @@ class FileModel:
             for pos, callee, _, _ in self.calls(fn):
                 if id(callee) in stack:
                     continue
-                held = frozenset(set(ctx) | self.held_own(fn, pos))
+                held = frozenset(set(self.inherit(fn, pos, ctx)) | self.held_own(fn, pos))
                 if self.violates(callee, held, depth - 1, stack + (id(fn),), root):
                     res = True
                     break
