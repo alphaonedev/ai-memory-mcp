@@ -501,6 +501,9 @@ function checkBundleStat(path: string, st: Stats | BigIntStats): void {
  * Test seam for {@link readOwnerOnlyWindows}: `afterOpen` runs after the
  * descriptor is checked and before the path is re-examined, so a test can swap the path the
  * way a local attacker would.
+ *
+ * @internal Exposed for unit tests only; consumers load credentials through
+ *           `DelegationBundle.load`.
  */
 export interface WindowsReadHooks {
   afterOpen?: () => void;
@@ -509,6 +512,11 @@ export interface WindowsReadHooks {
 /**
  * The Windows leg of {@link readOwnerOnly}, split out so it is testable on any
  * platform (it uses only `node:fs` calls that exist everywhere).
+ *
+ * @internal Exposed for unit tests only; consumers load credentials through
+ *           `DelegationBundle.load`. This is the Windows leg only: a POSIX
+ *           caller must not use it, because it skips the `O_NOFOLLOW` and
+ *           `O_NONBLOCK` protections of the POSIX leg of `readOwnerOnly`.
  */
 export function readOwnerOnlyWindows(path: string, hooks: WindowsReadHooks = {}): string {
   let fd: number;
@@ -570,6 +578,12 @@ export function readOwnerOnlyWindows(path: string, hooks: WindowsReadHooks = {})
  * that differs from the descriptor's, and reads from the descriptor. A swap
  * between the open and the `lstat` is refused; a swap after the `lstat` cannot
  * change the bytes, because the read is from the descriptor already opened.
+ *
+ * The hub socket and the key directory this loader serves are POSIX-only
+ * surfaces today. On Windows `checkBundleStat` refuses every file today,
+ * because Node synthesizes the group/other mode bits there (#6318), so the
+ * bound leg is defence in depth that becomes live when #6318 lands. This does
+ * not make the loader work on Windows.
  */
 function readOwnerOnly(path: string): string {
   const noFollow = fsConstants.O_NOFOLLOW;
