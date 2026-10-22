@@ -966,6 +966,12 @@ written against a documented contract:
 | `denied.*` | peer credential, connection ceiling, hello, malformed, forged `from`, rate limit |
 | `fanout_latency_us`, `wake_latency_us` | `count` / `mean` / `max` / `p50` / `p99` — fan-out is the hub-internal hand-off span, wake latency is mint-to-delivery |
 
+A peer whose OWN egress queue is full is disconnected: every refusal the hub
+sends a peer (an `error` frame) is charged to that peer's own per-recipient
+byte cap, so a sender that floods refused wakes and never reads its `error`
+replies fills its queue, and the hub closes its session rather than continue
+to speak to a peer that is not listening (#7951).
+
 Two properties are load-bearing. The histograms are **fixed-bucket and
 allocation-free** — an observability surface the hub can be made to allocate
 would be a denial-of-service surface, not observability — so a bucketed
