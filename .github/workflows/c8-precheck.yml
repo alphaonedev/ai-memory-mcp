@@ -764,14 +764,14 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Run test-env-lock gate
-        run: bash scripts/check-test-env-lock.sh
+        run: python3 scripts/ci/check_test_env_lock_harness.py census
       - name: Self-test the gate (regression evidence)
         # --self-test stages a $HOME-mutating fixture with no
         # test_env_lock reference (the plain-omission shape) and a
         # second fixture that hand-rolls its own local lock instead of
         # the shared one (the #1998/#2115/#2127 recurrent shape); the
         # gate must reject both and spare a compliant control fixture.
-        run: bash scripts/check-test-env-lock.sh --self-test
+        run: python3 scripts/ci/check_test_env_lock_harness.py selftest
       - name: Interrupted gate self-tests leave no probe behind (#4292)
         # This gate's self-test, like five others, must plant probe files
         # INSIDE the tree (the gate scans src/ and tests/). One interrupted
@@ -783,13 +783,13 @@ jobs:
         # appears; git status must be unchanged and the run must not exit 0.
         # A file already at any declared probe path must make the self-test
         # refuse (exit 2) and survive byte-identical.
-        run: bash scripts/test/test-gate-selftest-interrupt-cleanup.sh
+        run: python3 scripts/ci/check_test_env_lock_harness.py interrupt
       - name: The interrupt harness itself never deletes or strands (#4292 r9)
         # The harness must hold itself to the same rule: a file someone
         # else creates in the tree mid-run is reported, never deleted, and
         # a harness killed by SIGTERM in its sentinel phase removes the
         # sentinel it planted instead of stranding it at a real probe path.
-        run: bash scripts/test/test-gate-selftest-interrupt-cleanup.sh --harness-self-test
+        run: python3 scripts/ci/check_test_env_lock_harness.py interrupt --harness-self-test
 
   required-contexts-gate:
     # Issues #2494 / #2496 — required-status-check SOUNDNESS. The required set
