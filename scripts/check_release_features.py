@@ -253,6 +253,8 @@ USES_CONSTANTS = {
     IMAGE_BUILD_USES: "IMAGE_BUILD_USES",
     ATTEST_USES: "ATTEST_USES",
 }
+# #8030: the action each constant pins, so every `uses:` of that action is compared to it.
+USES_BY_ACTION = {const.split("@", 1)[0]: const for const in USES_CONSTANTS}
 DOCKER_JOB: Dict[str, Spec] = {
     "name": "Docker (GHCR)",
     "needs": Flow("preflight, qualify, supply-chain"),
@@ -1259,6 +1261,16 @@ def check_uses_pinned(doc: Node, name: str, rep: Report) -> None:
             rep.bad(f"{name}: {uses_where(doc, path)}: line {node.line + 1}: `uses: {ref[:70]}` is not pinned to a "
                     "full 40-hex commit sha (#6904: a tag, branch or short ref can be re-pointed)"
                     + pin_hint("USES_PINNED_RE"))
+            continue
+        # #8030 (the #6904 acceptance): where a *_USES constant exists for the action, the ref must
+        # equal it exactly; another 40-hex sha is an unreviewed commit. release.yml's docker job is
+        # pinned whole by DOCKER_STEPS, which already names the constant, so it is not reported twice.
+        action = ref.split("@", 1)[0]
+        want = USES_BY_ACTION.get(action)
+        if want is not None and ref != want and not (name == "release.yml" and path[:2] == ("jobs", "docker")):
+            rep.bad(f"{name}: {uses_where(doc, path)}: line {node.line + 1}: `uses: {ref[:70]}` differs from "
+                    f"{USES_CONSTANTS[want]} (`{want}`; #6904: a per-action constant comparison)"
+                    + pin_hint(USES_CONSTANTS[want]))
 
 
 def check_release_yml(text: str, rep: Report) -> None:
@@ -1793,6 +1805,11 @@ def _first_use_to_tag(text: str) -> str:
     return _SHA_USES_RE.sub(r"\g<1>v4", text, count=1)
 
 
+def _first_checkout_to_other_sha(text: str) -> str:
+    """Repin the first actions/checkout to another valid 40-hex sha (#8030)."""
+    return re.sub(r"(uses:\s*actions/checkout@)[0-9a-f]{40}", r"\g<1>" + "0" * 40, text, count=1)
+
+
 def _shape_scalar_step(text: str) -> str:
     return text.rstrip("\n") + "\n      - just-a-scalar\n"
 
@@ -2053,6 +2070,17 @@ CASES: Dict[str, Tuple[str, List[Edit]]] = {
     "N10 release-shape guard step gains if: false is refused": ("fail", [
         _shape("      - name: Release feature declaration guard\n",
                "      - name: Release feature declaration guard\n        if: false\n")]),
+    # Round-3 cells (#8030): the per-action *_USES comparison, one cell per workflow.
+    "N12 release.yml preflight checkout repinned to another sha is refused": ("fail", [
+        _rel("", _job_edit("preflight", _first_checkout_to_other_sha))]),
+    "N13 release.yml crates-io checkout repinned to another sha is refused": ("fail", [
+        _rel("", _job_edit("crates-io", _first_checkout_to_other_sha))]),
+    "N14 release-shape.yml checkout repinned to another sha is refused": ("fail", [
+        (SHAPE, "", _first_checkout_to_other_sha, False)]),
+    "N15 c8-precheck.yml checkout repinned to another sha is refused": ("fail", [
+        (C8, "", _first_checkout_to_other_sha, False)]),
+    "N16 publish-ci-image.yml checkout repinned to another sha is refused": ("fail", [
+        (PUBLISH, "", _first_checkout_to_other_sha, False)]),
     # --- control characters: Python and bash disagree on what a line is
     "control character: CR line ends in release.yml": ("fail", [_rel(REL_ASSERT, REL_ASSERT + "\r")]),
     "control character: form feed in the Dockerfile": ("fail", [(DOCKER, DOCKER_ASSERT, DOCKER_ASSERT + "\x0c# x", False)]),
@@ -2315,6 +2343,8 @@ MESSAGE_CASES: Dict[str, Tuple[List[Edit], int, str]] = {
                                                         "update LOGIN_USES in scripts/check_release_features.py"),
     "message: IMAGE_BUILD_USES SHA bump": ([_rel(IMAGE_BUILD_USES, IMAGE_BUILD_USES[:-1] + "0")], 1,
                                            "update IMAGE_BUILD_USES in scripts/check_release_features.py"),
+    "message: a checkout repin names the constant": ([_rel("", _job_edit("crates-io", _first_checkout_to_other_sha))], 1,
+                                                     "differs from CHECKOUT_USES"),
     "message: a tag added names DOCKER_STEPS": ([_rel(PUSH_TAGS, PUSH_TAGS + "            ghcr.io/o/ai-memory:x\n")], 1,
                                                 "update DOCKER_STEPS in scripts/check_release_features.py"),
     "message: swapped guard and build steps name the unit slot": ([(SHAPE, "", _shape_swap_guard_build, False)], 2,

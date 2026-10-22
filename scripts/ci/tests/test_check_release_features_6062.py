@@ -23,7 +23,7 @@ PUBLISH = ROOT / ".github" / "workflows" / "publish-ci-image.yml"
 
 # One entry per issue this PR closes. SELF_CHECK below requires every issue to
 # have at least one pinned case and the count to equal this list.
-CLOSES = (6289, 6290, 6904, 8002, 8020, 8021, 8023)
+CLOSES = (6289, 6290, 6904, 8002, 8020, 8021, 8023, 8030)
 PINNED_CASES = {}  # issue number -> list of test method names, filled by pins()
 
 
@@ -91,8 +91,8 @@ class Controls(unittest.TestCase):
         self.assertEqual(errors_shape(read(SHAPE)), [])
 
     def test_self_check_pinned_case_count_equals_closes(self):
-        """The pinned-case count equals the Closes count (7)."""
-        self.assertEqual(len(CLOSES), 7)
+        """The pinned-case count equals the Closes count (8)."""
+        self.assertEqual(len(CLOSES), 8)
         self.assertEqual(sorted(PINNED_CASES), sorted(CLOSES))
         for issue in CLOSES:
             self.assertTrue(PINNED_CASES[issue], "no pinned case for #%d" % issue)
@@ -360,6 +360,70 @@ class Walked8002(unittest.TestCase):
                 root = FailClosed().make_tree(tmp)
                 (root / rel).write_bytes(b"\xff\xfe\x00bad")
                 self.assertEqual(G.main([str(root)]), 2, rel)
+
+
+REPIN = "0" * 40  # a valid 40-hex sha that is not the pinned one
+
+
+class PerAction8030(unittest.TestCase):
+    """#8030 (the #6904 acceptance): "a per-action `*_USES` constant comparison where one exists"."""
+
+    def repin_checkout(self, text, job):
+        """Repin the first actions/checkout of ``job`` to another 40-hex sha."""
+        a, b = job_span(text, job)
+        m = re.search(r"uses:\s*actions/checkout@([0-9a-f]{40})", text[a:b])
+        self.assertIsNotNone(m, job)
+        s, e = a + m.start(1), a + m.end(1)
+        return text[:s] + REPIN + text[e:]
+
+    @pins(8030)
+    def test_preflight_and_crates_io_checkout_repin_refused_by_the_guard(self):
+        """#8030: the reviewer's two real-CLI mutants (rc=0 at 19e2cc8ee) are refused with job, step and constant."""
+        for job in ("preflight", "crates-io"):
+            with tempfile.TemporaryDirectory(dir=scratch()) as tmp:
+                root = tree_with(tmp, ".github/workflows/release.yml", self.repin_checkout(read(REL), job))
+                errors, _ = G.run_guard(root)
+                hits = [e for e in errors if "CHECKOUT_USES" in e]
+                self.assertEqual(len(hits), 1, (job, errors))
+                self.assertIn("release.yml", hits[0])
+                self.assertIn("job `%s`" % job, hits[0])
+                self.assertIn("step ", hits[0])
+                self.assertIn(G.CHECKOUT_USES, hits[0])
+                self.assertEqual(G.main([str(root)]), 1, job)
+
+    @pins(8030)
+    def test_every_checkout_repin_refused_in_all_four_workflows(self):
+        """#8030: each of the 48 actions/checkout refs repinned to another sha is refused, one at a time."""
+        survivors, total = [], 0
+        for path, label in ((REL, "release.yml"), (SHAPE, "release-shape.yml"), (C8, "c8-precheck.yml"),
+                            (PUBLISH, "publish-ci-image.yml")):
+            text = read(path)
+            for m in re.finditer(r"uses:\s*actions/checkout@([0-9a-f]{40})", text):
+                total += 1
+                mut = text[:m.start(1)] + REPIN + text[m.end(1):]
+                if label == "release.yml":
+                    errs = errors_release(mut)
+                else:
+                    rep = G.Report()
+                    G.check_uses_pinned(G.parse_yaml(mut, label, rep), label, rep)
+                    errs = rep.errors
+                if not errs:
+                    survivors.append((label, text.count("\n", 0, m.start()) + 1))
+        self.assertEqual(total, 48)
+        self.assertEqual(survivors, [])
+
+    @pins(8030)
+    def test_other_actions_with_a_constant_are_compared(self):
+        """#8030: the other *_USES constants (publish-ci-image.yml buildx/login/build) are compared as well."""
+        text = read(PUBLISH)
+        for const in (G.BUILDX_USES, G.LOGIN_USES, G.IMAGE_BUILD_USES):
+            action = const.split("@")[0]
+            mut = text.replace(const, action + "@" + REPIN, 1)
+            self.assertNotEqual(mut, text, const)
+            rep = G.Report()
+            G.check_uses_pinned(G.parse_yaml(mut, "publish-ci-image.yml", rep), "publish-ci-image.yml", rep)
+            self.assertTrue(any("job `" in e and "step " in e and G.USES_CONSTANTS[const] in e for e in rep.errors),
+                            (const, rep.errors))
 
 
 class Named8021(unittest.TestCase):
