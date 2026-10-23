@@ -3516,6 +3516,16 @@ mod tests {
 
     use tempfile::NamedTempFile;
 
+    /// #8119 — wall-clock deadline for a detached dispatcher thread to reach
+    /// its observable effect (ack row, receiver POST, DLQ row). The bound is
+    /// the dispatcher never acting, not a tight timing guess: a load-starved
+    /// runner can take many seconds for the thread, TLS round trip and
+    /// sqlite write.
+    const K6_ACK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// #8119 — interval between polls of the dispatcher's observable effect.
+    const DISPATCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
     /// Stand up a fresh on-disk SQLite at a tempfile path with the
     /// production schema applied. Returns the path and keeps the file
     /// alive via the returned `NamedTempFile` (drop deletes it).
@@ -4540,7 +4550,8 @@ mod tests {
         // Wait for the dispatch thread to fire & the receiver to record.
         // We poll the receiver instead of the DB so the assertion stays
         // specific to "signature header present".
-        for _ in 0..50 {
+        let started = std::time::Instant::now();
+        while started.elapsed() < K6_ACK_DEADLINE {
             let received = receiver.received();
             if !received.is_empty() {
                 let req = &received[0];
@@ -4554,9 +4565,12 @@ mod tests {
                 );
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(DISPATCH_POLL_INTERVAL).await;
         }
-        panic!("dispatch thread never reached the TLS receiver");
+        panic!(
+            "dispatch thread never reached the TLS receiver after {:?}",
+            started.elapsed()
+        );
     }
 
     // ----------------------------------------------------------------
@@ -4699,15 +4713,15 @@ mod tests {
         }
 
         // Poll the receiver for the dispatch — std::thread::spawn is
-        // detached so we cannot join. ~5s budget mirrors the existing
-        // dispatch_event_e2e_* tests.
+        // detached so we cannot join. Polls to K6_ACK_DEADLINE (#8128).
         let mut received = Vec::new();
-        for _ in 0..50 {
+        let started = std::time::Instant::now();
+        while started.elapsed() < K6_ACK_DEADLINE {
             received = receiver.received();
             if !received.is_empty() {
                 break;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(DISPATCH_POLL_INTERVAL).await;
         }
         assert_eq!(
             received.len(),
@@ -4893,7 +4907,9 @@ mod tests {
         let path_for_poll = db_path.clone();
         let sub_for_poll = sub_id.clone();
         let row = tokio::task::spawn_blocking(move || {
-            for _ in 0..50 {
+            let started = std::time::Instant::now();
+            let mut last_status = String::from("<no row>");
+            while started.elapsed() < K6_ACK_DEADLINE {
                 let conn = Connection::open(&path_for_poll).unwrap();
                 let r: Option<(String, String, String)> = conn
                     .query_row(
@@ -4903,18 +4919,23 @@ mod tests {
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .ok();
-                if let Some(r) = r
-                    && r.2 == "ack"
-                {
-                    return Some(r);
+                if let Some(r) = r {
+                    if r.2 == "ack" {
+                        return Ok(r);
+                    }
+                    last_status = r.2;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(DISPATCH_POLL_INTERVAL);
             }
-            None
+            Err(format!(
+                "no ack after {:?}; last delivery_status = {last_status}",
+                started.elapsed()
+            ))
         })
         .await
         .unwrap();
-        let (corr, body, status) = row.expect("audit row must reach ack status");
+        let (corr, body, status) =
+            row.unwrap_or_else(|e| panic!("audit row must reach ack status: {e}"));
         assert_eq!(status, "ack");
         // UUIDv7 — parses + version 7.
         let parsed = uuid::Uuid::parse_str(&corr).expect("UUIDv7 string");
@@ -4960,17 +4981,18 @@ mod tests {
         }
 
         // Backoff ladder is 200ms + 1s + 5s ≈ 6.2s of sleeps + per-
-        // attempt network time. Poll for up to 12s for the DLQ row.
+        // attempt network time. Poll to K6_ACK_DEADLINE (#8130) for the DLQ row.
         let path_for_poll = db_path.clone();
         let sub_for_poll = sub_id.clone();
         let dlq_row = tokio::task::spawn_blocking(move || {
-            for _ in 0..120 {
+            let started = std::time::Instant::now();
+            while started.elapsed() < K6_ACK_DEADLINE {
                 let conn = Connection::open(&path_for_poll).unwrap();
                 let entries = list_dlq(&conn, Some(&sub_for_poll)).unwrap();
                 if !entries.is_empty() {
                     return Some(entries);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(DISPATCH_POLL_INTERVAL);
             }
             None
         })
