@@ -1352,22 +1352,102 @@ mod tests {
         &rest[..rest.find(to).unwrap_or(rest.len())]
     }
 
-    /// Opens of a file by path in the production half: the two one-shot reads
-    /// of the tail pass plus the single `open_followed`.
-    const PROD_PATH_OPENS: usize = 3;
+    /// The production half with `//` comments removed, so a guard never
+    /// matches prose.
+    fn prod_code() -> String {
+        prod_source()
+            .lines()
+            .map(|l| l.find("//").map_or(l, |i| &l[..i]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The body of `fn name(` in `code`, brace-matched.
+    fn fn_body(code: &str, name: &str) -> String {
+        let start = code.find(&format!("fn {name}(")).unwrap();
+        let rest = &code[start..];
+        let open = rest.find('{').unwrap();
+        let mut depth = 0usize;
+        for (i, c) in rest[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return rest[..=open + i].to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced fn {name}");
+    }
+
+    /// The functions on the poll and switch path: none may stat or open a
+    /// path itself.
+    const POLL_PATH_FNS: [&str; 5] = [
+        "follow_poll",
+        "probe_path",
+        "switch_to",
+        "drain_followed",
+        "open_followed",
+    ];
+
+    /// Every `metadata(` call in `body` whose receiver is not a held handle
+    /// (`file`, `state.file`): a path method (`path.metadata()`), a free
+    /// function (`fs::metadata(`, `fs::symlink_metadata(`, `metadata(`) or a
+    /// path predicate. Semantic over spelling: any receiver but the handle
+    /// fails.
+    fn path_stat_calls(body: &str) -> Vec<String> {
+        let mut bad = Vec::new();
+        for (at, _) in body.match_indices("metadata(") {
+            let before = body[..at].trim_end();
+            let Some(head) = before.strip_suffix('.') else {
+                bad.push(format!("free call at {at}"));
+                continue;
+            };
+            let recv: String = head
+                .trim_end()
+                .chars()
+                .rev()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            if recv.rsplit('.').next() != Some("file") {
+                bad.push(format!("receiver `{recv}` at {at}"));
+            }
+        }
+        for banned in [".exists()", ".is_file()", ".is_dir()", ".try_exists()"] {
+            if body.contains(banned) {
+                bad.push(format!("path predicate {banned}"));
+            }
+        }
+        bad
+    }
 
     /// #8140 #8141 - the poll path takes the identity and the length from the
-    /// OPENED handle: no `fs::metadata` of the path before the open.
+    /// OPENED handle: no stat of a path anywhere on it, whatever the spelling.
     #[test]
     fn logs_tail_follow_poll_has_no_path_stat_before_open_8141() {
-        let poll = between(prod_source(), "fn follow_poll(", "/// Poll loop of");
-        assert!(!poll.contains("fs::metadata("), "path stat in follow_poll");
-        let probe = between(prod_source(), "fn probe_path(", "/// Stable identity");
-        assert!(!probe.contains("fs::metadata("), "path stat in probe_path");
+        let code = prod_code();
+        for name in POLL_PATH_FNS {
+            let bad = path_stat_calls(&fn_body(&code, name));
+            assert!(bad.is_empty(), "path stat in {name}: {bad:?}");
+        }
+        let probe = fn_body(&code, "probe_path");
         assert!(
             !probe.contains("id: Option<u64>"),
             "probe_path must not take a pre-open identity"
         );
+        // The scan itself: handle receivers pass, path receivers and free
+        // calls fail (the m4 and original #8141 shapes).
+        assert!(path_stat_calls("let m = state.file.metadata();").is_empty());
+        assert!(path_stat_calls("file\n  .metadata()").is_empty());
+        assert!(!path_stat_calls("path.metadata().ok().as_ref()").is_empty());
+        assert!(!path_stat_calls("fs::metadata(&path)").is_empty());
+        assert!(!path_stat_calls("std::fs::symlink_metadata(&p)").is_empty());
     }
 
     /// #8141 - a removed followed path is no evidence of anything: quiet poll,
@@ -1425,14 +1505,99 @@ mod tests {
         );
     }
 
+    /// Opens of a path in the production half: the two one-shot reads of the
+    /// tail pass plus the single `open_followed`, counted over EVERY spelling
+    /// (`File::open`, `OpenOptions::new()...open`, `File::options()...open`,
+    /// `fs::OpenOptions`).
+    const PROD_PATH_OPENS: usize = 3;
+
+    /// Count of path-open spellings in `code`.
+    fn open_spellings(code: &str) -> usize {
+        code.matches("File::open(").count() + code.matches(".open(").count()
+    }
+
     /// #8145 - one open per poll: any extra raw open of a path in the
-    /// production half (invisible to the `open_followed` counter) fails this.
+    /// production half, in any spelling (invisible to the `open_followed`
+    /// counter), fails this.
     #[test]
     fn logs_tail_follow_no_raw_open_besides_open_followed_8145() {
-        let src = prod_source();
-        assert_eq!(src.matches("File::open(").count(), PROD_PATH_OPENS);
-        assert_eq!(src.matches("OpenOptions").count(), 0, "no other open path");
-        assert_eq!(src.matches("open_followed(").count(), 3, "def + 2 uses");
+        let code = prod_code();
+        assert_eq!(open_spellings(&code), PROD_PATH_OPENS, "open sites");
+        assert_eq!(open_spellings(&fn_body(&code, "open_followed")), 1);
+        for name in ["follow_poll", "probe_path", "switch_to", "drain_followed"] {
+            assert_eq!(open_spellings(&fn_body(&code, name)), 0, "open in {name}");
+            let body = fn_body(&code, name);
+            assert!(
+                !body.contains("fs::read(") && !body.contains("read_to_string("),
+                "whole-file read in {name}"
+            );
+        }
+        assert_eq!(code.matches("open_followed(").count(), 3, "def + 2 uses");
+        // The count sees every spelling (the m3 and original second-open
+        // shapes).
+        assert_eq!(open_spellings("fs::File::options().read(true).open(&p)"), 1);
+        assert_eq!(
+            open_spellings("fs::OpenOptions::new().read(true).open(&p)"),
+            1
+        );
+        assert_eq!(open_spellings("let f = fs::File::open(&p)?;"), 1);
+    }
+
+    /// Make a FIFO at `path` (no shell, no subprocess).
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c` is a valid NUL-terminated path that outlives the call.
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+        assert_eq!(rc, 0, "mkfifo failed");
+    }
+
+    /// One poll on a worker thread, bounded: `None` when it did not return in
+    /// time (a blocking open of a FIFO).
+    #[cfg(unix)]
+    fn bounded_poll(dir: &Path, mut state: FollowState) -> Option<(String, String)> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = dir.to_path_buf();
+        std::thread::spawn(move || {
+            let _ = tx.send(poll_once(&dir, &mut state));
+        });
+        rx.recv_timeout(Duration::from_secs(3)).ok()
+    }
+
+    /// #8221 - a FIFO at the followed path must not hang the poll: the open uses
+    /// O_NONBLOCK and the handle's type is checked, so it is the same
+    /// unopenable posture as a failed open (one note, the held handle keeps
+    /// draining).
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_fifo_at_followed_path_does_not_hang_8221() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "one\n");
+        let state = open_state(&a, 4);
+        fs::rename(&a, dir.path().join("old.zst")).unwrap();
+        append(&dir.path().join("old.zst"), "late\n");
+        make_fifo(&a);
+        let (s, e) = bounded_poll(dir.path(), state).expect("poll hung on a FIFO");
+        assert_eq!(s, "late\n", "held handle drained: {s:?}");
+        assert_eq!(e.matches("cannot open").count(), 1, "one note: {e:?}");
+        assert!(e.ends_with("; still following the open file\n"), "{e:?}");
+    }
+
+    /// #8221 - a FIFO that appears as the newer file is not adopted and does
+    /// not hang the poll; the old file keeps being followed.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_fifo_as_newer_file_is_not_adopted_8221() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log.2026-04-30", "one\n");
+        let state = open_state(&a, 4);
+        make_fifo(&dir.path().join("ai-memory.log.2026-05-01"));
+        append(&a, "two\n");
+        let (s, e) = bounded_poll(dir.path(), state).expect("poll hung on a FIFO");
+        assert_eq!(s, "two\n", "old file still followed: {s:?}");
+        assert_eq!(e.matches("cannot open").count(), 1, "one note: {e:?}");
+        assert!(e.contains("still following"), "{e:?}");
     }
 
     /// #8148 - the note tail on a failed open: with an inode an unopenable
