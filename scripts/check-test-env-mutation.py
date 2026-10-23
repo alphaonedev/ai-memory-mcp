@@ -112,8 +112,13 @@ that is inline-only in turn; a store, a return, a use inside another closure or 
 never a callee that merely does not spawn it (#8065); or an unresolved runner named by its FULL path
 (INLINE_ROOTS: std, core, alloc, tokio, futures; WRAPPER_CALLEES such as AssertUnwindSafe recurse), or an
 iterator/Option/Once adaptor of SAME_THREAD_CALLEES whose receiver chain roots in a local, a literal, a
-std type or a callee that builds no parallel iterator (#8068, #8069); a root that is a local `let` binding
-inherits the classification of its initialiser, the latest binding winning (#8089). PARALLEL_ITER (every
+std type or a callee that builds no parallel iterator (#8068, #8069); a receiver is credited only when
+the gate can positively PROVE its provenance (#8093): every token of the chain, of each `let` initialiser it leads
+to and of each wrapper or aggregate (Some, Box::new, vec!, an array, a tuple, a struct literal) must be a literal, a
+std path, a callee that builds no parallel iterator or a local whose initialiser is proven in turn, so a wrapper is
+transparent only when everything inside it is. A name resolves to the innermost binding in a block still OPEN at the
+use (ScopeMap, #8095), and a name bound by a `for` pattern, a match arm, `if let`, `while let`, a closure parameter
+or a destructuring `let` is DETACHED (#8094). PARALLEL_ITER (every
 rayon par_* adapter, PARALLEL_METHODS, #8090) is judged through a fixpoint over callee bodies, so a helper
 that builds a rayon-style iterator taints its callers (#8069).
 `&|| ..` and `&mut || ..` are closure literals (#8067). Anything else (inside Box::new, Some, a struct
@@ -313,8 +318,16 @@ PARALLEL_METHODS = (
     "par_bytes", "par_char_indices", "par_matches", "par_encode_utf16",
 )
 PARALLEL_ITER = re.compile(r"\brayon\b|\b(?:%s|par_sort\w*)\b" % "|".join(PARALLEL_METHODS))
-LET_SIMPLE = r"\blet\s+(?:mut\s+)?%s\s*(?::[^=;]*)?=(?!=)"  # #8089: `let [mut] name [: T] =` (any other pattern is opaque)
-BINDING_ROOT_PREFIX = re.compile(r"[&*\s]*(?:mut\s+)?")  # #8089: what may sit between a `let` initialiser's `=` and its root
+KEYWORDS = frozenset((
+    "as", "async", "await", "break", "continue", "const", "crate", "dyn", "else", "false", "fn", "for", "if", "impl",
+    "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return", "static", "struct", "super", "true",
+    "unsafe", "use", "where", "while"))  # #8093: words that are never a value token
+PRIMS = frozenset((
+    "bool", "char", "str", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
+    "f32", "f64"))  # #8093: primitive type names (casts, turbofish) are not values
+VALUE_MACROS = frozenset((
+    "format", "concat", "stringify", "matches", "json", "include_str", "include_bytes", "env", "option_env", "line",
+    "file", "column", "module_path"))  # #8093: macros that build a plain value on the calling thread (vec! is judged inside)
 CLOSURE_LET_HEAD = re.compile(r"\s*let\s+(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=;]*)?=\s*")
 CALLEE_TAIL = re.compile(r"((?:[A-Za-z_]\w*\s*::\s*)*)([A-Za-z_]\w*)\s*$")
 LOOP_HEADER = re.compile(r"\b(?:for|while|loop)\b")
@@ -615,6 +628,250 @@ def loop_end(body, pos):
     return end
 
 
+IDENT_END = re.compile(r"([A-Za-z_]\w*)\s*$")
+IDPATH = re.compile(r"(?<![\w$'])[A-Za-z_]\w*(?:\s*::\s*[A-Za-z_]\w*)*")
+FOR_HEAD = re.compile(r"\bfor\b([^{};=]*?)\bin\b")
+COND_LET = re.compile(r"(?:\bif|\bwhile|&&|\|\|)$")
+PATTERN_NAME = re.compile(r"(?<![\w:.$'])([a-z_]\w*)\b(?!\s*(?:::|\(|!))")
+PATTERN_SKIP = frozenset(("mut", "ref", "box", "in", "if", "as", "true", "false", "let", "else", "move", "dyn", "impl",
+                          "for", "_"))
+Binding = collections.namedtuple("Binding", "name lo hi init")  # init: (start, end) of a plain `let` initialiser, else None
+
+
+def callee_path(text):
+    """(start, prefix, name) of the callee path that ends text (`a::b::name`, prefix `a::b::`), a turbofish anywhere
+    in it (`std::vec::Vec::<u8>::new`, `x.collect::<T>`) skipped; start indexes text. None when text ends in no
+    name (#8093: a std path with a generic argument is a positive match, not a doubt)."""
+    s = strip_turbofish(text.rstrip())
+    m = IDENT_END.search(s)
+    if m is None:
+        return None
+    name, segs, start = m.group(1), [], m.start(1)
+    while True:
+        before = s[:start].rstrip()
+        if not before.endswith("::"):
+            break
+        before = strip_turbofish(before[:-2].rstrip())
+        pm = IDENT_END.search(before)
+        if pm is None:
+            break
+        segs.insert(0, pm.group(1))
+        start = pm.start(1)
+    return start, "".join(g + "::" for g in segs), name
+
+
+def chain_start(body, end):
+    """Index where the postfix chain (root, `.field`, `.method(..)`, `[i]`, `?`) that ends at body[:end] begins, or
+    None when its root is a block or a struct literal (`}`) or the walk cannot be followed (#8093). A blank root
+    (a string or char literal, which the scrubber blanks) starts where the text before it ends."""
+    for _ in range(MAX_CHAIN_STEPS):
+        head = body[:end].rstrip()
+        if not head:
+            return 0
+        ch = head[-1]
+        if ch == "?":
+            end = len(head) - 1
+            continue
+        if ch == "}":
+            return None
+        if ch in ")]":
+            op = open_group(head, len(head) - 1)
+            if op < 0:
+                return None
+            before = head[:op].rstrip()
+            if before.endswith("!") and IDENT_END.search(before[:-1]):  # a macro call: vec![..], format!(..)
+                start = callee_path(before[:-1])[0]
+            elif ch == "]":
+                if not before or not (before[-1] in "_)]?" or before[-1].isalnum()):
+                    return op  # an array literal
+                end = len(before)  # an index `x[i]`
+                continue
+            else:
+                cp = callee_path(before)
+                if cp is None or cp[2] in KEYWORDS:
+                    if before and before[-1] in ")]?":  # a call on a call result
+                        end = len(before)
+                        continue
+                    return op  # a parenthesised expression or a tuple
+                start = cp[0]
+            pre = body[:start].rstrip()
+            if pre.endswith(".") and not pre.endswith(".."):
+                end = len(pre) - 1
+                continue
+            return start
+        m = re.search(r"\w+$", head)
+        if m is None:
+            return len(head)  # a blank literal
+        pre = head[:m.start()].rstrip()
+        if m.group(0)[0].isdigit():
+            if pre.endswith("."):
+                fm = re.search(r"(?<![\w.])\d\w*$", pre[:-1])
+                if fm is None:  # a tuple field `.0`
+                    end = len(pre) - 1
+                    continue
+                return fm.start()  # a float literal
+            return m.start()
+        start = callee_path(head)[0]
+        pre = head[:start].rstrip()
+        if pre.endswith(".") and not pre.endswith(".."):
+            end = len(pre) - 1
+            continue
+        return start
+    return None
+
+
+def blank_generics(text):
+    """text with every turbofish generic-argument list `::<..>` replaced by spaces of the same length (#8093)."""
+    out = list(text)
+    for m in re.finditer(r"::\s*<", text):
+        depth = 0
+        for j in range(m.end() - 1, len(text)):
+            ch = text[j]
+            if ch == "<":
+                depth += 1
+            elif ch == ">" and text[j - 1:j] != "-":
+                depth -= 1
+                if depth == 0:
+                    out[m.start():j + 1] = " " * (j + 1 - m.start())
+                    break
+            elif ch in ";{}":
+                break
+    return "".join(out)
+
+
+def pattern_names(text):
+    """The lowercase names a pattern may bind (an over-approximation: a field label counts too, which only makes
+    a binding opaque, never trusted)."""
+    return [n for n in PATTERN_NAME.findall(text) if n not in PATTERN_SKIP]
+
+
+def block_after(body, pos):
+    """Index of the first `{` at bracket depth 0 at or after pos, or -1 when a `;` or a closer comes first."""
+    depth = 0
+    for j in range(pos, len(body)):
+        ch = body[j]
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+            if depth < 0:
+                return -1
+        elif ch == "{" and depth == 0:
+            return j
+        elif ch == ";" and depth == 0:
+            return -1
+    return -1
+
+
+def arm_arrow(body, pos, end):
+    """Index of the `=>` at bracket depth 0 in body[pos:end], or -1."""
+    depth = 0
+    for j in range(pos, end):
+        ch = body[j]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth < 0:
+                return -1
+        elif ch == "=" and depth == 0 and body[j + 1:j + 2] == ">":
+            return j
+    return -1
+
+
+class ScopeMap:
+    """Every name a fn body binds, with the span in which the binding is visible (#8094, #8095). A plain
+    `let [mut] name [: T] = init;` carries its initialiser and is visible from the end of its statement to the
+    end of the block that is open there, so an inner block's `let` stops hiding an outer one once the block
+    closes; `for name in <iterable>` binds name like a `let` of the iterable (an item is as safe as its
+    collection). Every other binder (a destructuring `let`, a destructuring `for` pattern, a match arm,
+    `if let` / `while let`, a closure parameter) is opaque: it shadows an outer name and is never trusted."""
+
+    def __init__(self, body):
+        self.items = []
+        self._lets(body)
+        for m in FOR_HEAD.finditer(body):
+            brace = block_after(body, m.end())
+            if brace < 0 or m.group(1).lstrip().startswith("<"):
+                continue
+            hi = match_brace(body, brace)
+            sm = re.fullmatch(r"\s*(?:mut\s+)?([A-Za-z_]\w*)\s*", m.group(1))
+            if sm and sm.group(1) != "_":  # `for name in <iterable>`: an item is as safe as the iterable it comes from
+                self.items.append(Binding(sm.group(1), brace, hi, (m.end(), brace)))
+            else:
+                self._opaque(pattern_names(m.group(1)), brace, hi)
+        for m in re.finditer(r"\bmatch\b", body):
+            brace = block_after(body, m.end())
+            if brace >= 0:
+                self._arms(body, brace)
+        for s, e in closure_literals(body):
+            cm = re.match(r"(?:async\s+)?(?:move\s+)?\|([^|]*)\|", body[s:e])
+            if cm:
+                self._opaque(pattern_names(cm.group(1)), s, e)
+
+    def _opaque(self, names, lo, hi):
+        self.items.extend(Binding(n, lo, hi, None) for n in names)
+
+    def _lets(self, body):
+        for m in re.finditer(r"\blet\b", body):
+            eq, depth = -1, 0
+            for j in range(m.end(), len(body)):
+                ch = body[j]
+                if ch in "([{":
+                    depth += 1
+                elif ch in ")]}":
+                    depth -= 1
+                    if depth < 0:
+                        break
+                elif ch == ";" and depth == 0:
+                    break
+                elif ch == "=" and depth == 0 and body[j + 1:j + 2] not in ("=", ">") and body[j - 1:j] not in "=!<>":
+                    eq = j
+                    break
+            if eq < 0:
+                continue
+            pat = body[m.end():eq]
+            if COND_LET.search(body[:m.start()].rstrip()):  # `if let` / `while let`: bound in the block that follows
+                brace = block_after(body, eq + 1)
+                if brace >= 0:
+                    self._opaque(pattern_names(pat), brace, match_brace(body, brace))
+                continue
+            end = stmt_end(body, eq + 1)
+            hi = match_brace(body, scope_open(body, m.start()))
+            sm = re.fullmatch(r"\s*(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=]*)?", pat)
+            if sm:
+                if sm.group(1) != "_":
+                    self.items.append(Binding(sm.group(1), end, hi, (eq + 1, end)))
+            else:
+                self._opaque(pattern_names(pat), end, hi)
+
+    def _arms(self, body, brace):
+        end = match_brace(body, brace) - 1
+        pos = brace + 1
+        while pos < end:
+            arrow = arm_arrow(body, pos, end)
+            if arrow < 0:
+                return
+            bs = arrow + 2
+            while bs < end and body[bs].isspace():
+                bs += 1
+            be = match_brace(body, bs) if body[bs:bs + 1] == "{" else min(expr_end(body, bs), end)
+            self._opaque(pattern_names(re.split(r"\bif\b", body[pos:arrow], 1)[0]), pos, be)
+            pos = be
+            while pos < end and (body[pos].isspace() or body[pos] == ","):
+                pos += 1
+
+    def visible(self, name, pos):
+        """The binding of name in force at pos: the innermost one in an open block (the greatest start), an opaque one
+        winning a tie; None when nothing binds it."""
+        best = None
+        for b in self.items:
+            if b.name == name and b.lo <= pos < b.hi \
+                    and (best is None or b.lo > best.lo or (b.lo == best.lo and b.init is None)):
+                best = b
+        return best
+
+
 def arg_slot(body, a, b):
     """(open paren index, argument index) when body[a:b] is exactly one whole argument of a call, else None."""
     depth, commas, sep = 0, 0, None
@@ -766,19 +1023,6 @@ def strip_turbofish(text):
             if depth == 0:
                 return s[:j].rstrip()[:-2].rstrip() if s[:j].rstrip().endswith("::") else text
     return text
-
-
-def has_top_range(text):
-    """True when text holds a `..` / `..=` range operator at bracket depth 0 (a range is never a parallel iterator)."""
-    depth = 0
-    for j, ch in enumerate(text):
-        if ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            depth -= 1
-        elif ch == "." and depth == 0 and text[j + 1:j + 2] == "." and text[j - 1:j] != ".":
-            return True
-    return False
 
 
 def parse_fns(scrubbed):
@@ -1921,89 +2165,80 @@ class FileModel:
             return False
         return self.receiver_ok(fn, len(before) - 1) if method else self.rooted(segs, name)
 
+    def scopes(self, fn):
+        """ScopeMap of fn, cached."""
+        cache = self.__dict__.setdefault("_scope_maps", {})
+        if id(fn) not in cache:
+            cache[id(fn)] = ScopeMap(fn.body)
+        return cache[id(fn)]
+
     def receiver_ok(self, fn, dot, floor=None, hops=0):
-        """True when the method chain that ends at the `.` at index dot roots in a literal, a macro, a std path, a
-        callee that builds no parallel iterator, or a LOCAL BINDING whose initialiser is itself ok (#8069, #8089). The
-        chain is walked back link by link (MAX_CHAIN_STEPS); a root call to an unresolved callee, or to one that
-        reaches rayon, is not ok, and a `let`-bound root inherits the classification of its initialiser (binding_ok).
-        With floor set the walk judges a whole `let` initialiser that starts at floor: it must reach a root there
-        (`&`, `&mut`, `*` allowed before it), and a block, a tuple or any other shape is not ok (doubt: detached)."""
-        body, end = fn.body, dot
-        strict = floor is not None
+        """True when the receiver whose method chain ends at index dot has a PROVEN provenance (#8069, #8089,
+        #8093). The chain's start is found by walking it back (chain_start; with floor set it is floor, a whole
+        `let` initialiser). Then EVERY token of the span must be safe (span_safe): a literal, a std path, a callee
+        that builds no parallel iterator, a local whose initialiser is proven in turn (binding_ok), or a wrapper
+        (Some, Box::new, vec!, an array, a tuple, a struct literal) whose contents are all safe. A block or a
+        struct literal as the chain root, or anything unclassifiable, is not ok (doubt: detached)."""
+        start = floor if floor is not None else chain_start(fn.body, dot)
+        return start is not None and self.span_safe(fn, start, dot, hops)
 
-        def at_root(pos):
-            return not strict or bool(BINDING_ROOT_PREFIX.fullmatch(body[floor:pos]))
-
-        for _ in range(MAX_CHAIN_STEPS):
-            head = body[:end].rstrip()
-            if not head or (strict and len(head) <= floor):
-                return not strict
-            ch = head[-1]
-            if ch == "?":
-                end = len(head) - 1
-                continue
-            if ch in ")]":
-                op = open_group(head, len(head) - 1)
-                if op < 0 or (strict and op < floor):
+    def span_safe(self, fn, a, b, hops):
+        """True when every value token of fn.body[a:b] is safe (#8093): a call is a ctor (`Some(..)`, a tuple
+        struct), a root_call_ok callee, or a method that is no parallel adapter; a bare name is a literal,
+        a constant, a fn item that builds no parallel iterator, or a local that binding_ok proves; a closure
+        literal must build no parallel iterator; a macro is vec! or a known value macro."""
+        body = fn.body
+        text = list(body[a:b])
+        for s, e in self.lits(fn):
+            if s >= a and e <= b and "".join(text[s - a:e - a]).strip():
+                if self.builds_parallel(fn, body[s:e]):
                     return False
-                before = head[:op].rstrip()
-                if before.endswith("!"):  # a macro call or `vec![..]`: a literal root
-                    mt = CALLEE_TAIL.search(before[:-1])
-                    return at_root(mt.start() if mt else op)
-                if ch == "]":
-                    if not before or (before[-1] not in "_)]?" and not before[-1].isalnum()):
-                        return at_root(op)  # an array literal root
-                    end = len(before)
-                    continue
-                stripped = strip_turbofish(before)
-                tail = CALLEE_TAIL.search(stripped)
-                if tail is None:  # a parenthesised expression: a range, else judged inside
-                    if has_top_range(head[op + 1:-1]):
-                        return at_root(op)
-                    return at_root(op) and self.receiver_ok(fn, len(head) - 1, op + 1, hops)
-                pre = stripped[:tail.start()].rstrip()
-                if pre.endswith("."):
-                    if any(id(c) in self.parallel for c in self.by_method.get(tail.group(2), [])):
-                        return False
-                    end = len(pre) - 1
-                    continue
-                return at_root(tail.start()) and self.root_call_ok(fn, tail.group(1), tail.group(2))
-            if ch == "}":
-                return not strict
-            tail = CALLEE_TAIL.search(head)
-            if tail is None:
-                return True  # a numeric or string literal
-            pre = head[:tail.start()].rstrip()
-            if pre.endswith("."):
-                end = len(pre) - 1
+                text[s - a:e - a] = " " * (e - s)
+        text = blank_generics("".join(text))
+        for m in IDPATH.finditer(text):
+            segs = re.split(r"\s*::\s*", m.group(0))
+            name, prefix = segs[-1], "".join(g + "::" for g in segs[:-1])
+            pre, rest = text[:m.start()].rstrip(), text[m.end():]
+            call = rest.lstrip().startswith("(")
+            if re.match(r"\s*!(?!=)", rest):
+                if name != "vec" and name not in VALUE_MACROS:
+                    return False
+            elif pre.endswith(".") and not pre.endswith(".."):  # a method or a field
+                if call and (PARALLEL_ITER.search(name)
+                             or any(id(c) in self.parallel for c in self.by_method.get(name, []))):
+                    return False
+            elif name in KEYWORDS or name in PRIMS:
                 continue
-            if not at_root(tail.start()):
+            elif call:
+                if not (not prefix and name[:1].isupper()) and not self.root_call_ok(fn, prefix, name):
+                    return False
+            elif (re.match(r"\s*:(?!:)", rest) and not prefix) or re.search(r"\b(?:let|mut|ref)$", pre) \
+                    or (name[:1].isupper() and not prefix):
+                continue  # a struct-literal label, a binder, a constant or a variant
+            elif prefix:
+                if not name[:1].isupper() and not self.root_call_ok(fn, prefix, name):
+                    return False
+            elif not self.binding_ok(fn, name, a + m.start(), hops):
                 return False
-            if tail.group(1):  # a path constant `Type::NAME`
-                return not strict or self.rooted(path_segments(tail.group(1)), tail.group(2))
-            return self.binding_ok(fn, tail.group(2), tail.start(), hops)
-        return False
+        return True
 
     def binding_ok(self, fn, name, use, hops):
-        """True when the local `name` used at index use inherits an ok classification (#8089): the LATEST `let` of it
-        before use wins (shadowing); its initialiser is judged by receiver_ok, so a `let it = par(..);`, a
-        `let pool = ai_memory::pool::Pool::new();` or a chain rooted in one stays detached through any number of
-        hops (`let b = a.filter(..);`, `&a`, `a.iter()`). A pattern binding (`let (a, b) = ..`) is opaque and not
-        ok. A name no `let` binds (a parameter, a loop variable, a field) keeps the plain-local treatment."""
+        """True when the name used at index use is PROVEN safe (#8089, #8094, #8095): the innermost binding in a
+        block still open at use wins (ScopeMap); a plain `let` is judged by its initialiser (receiver_ok, through at
+        most MAX_REBIND_HOPS names), and every other binder (a `for` pattern, a match arm, `if let`, `while let`,
+        a closure parameter, a destructuring `let`) is opaque and not ok. A name nothing binds is ok only as a
+        parameter, `self`, a constant or a fn item that builds no parallel iterator."""
         if hops >= MAX_REBIND_HOPS:
             return False
-        body, esc = fn.body, re.escape(name)
-        last = None
-        for lm in re.finditer(SHADOW_BINDS[0] % esc, body[:use]):
-            last = lm
-        if last is None:
-            return True
-        simple = re.compile(LET_SIMPLE % esc).match(body, last.start())
-        if simple is None:
+        bound = self.scopes(fn).visible(name, use)
+        if bound is None:
+            if name == "self" or name in fn.params or name in self.inline_imports:
+                return True
+            hit = self.resolve(fn.owner, "", name)
+            return hit is not None and id(hit) not in self.parallel
+        if bound.init is None:
             return False
-        if any(re.search(pat % esc, body[simple.end():use]) for pat in SHADOW_BINDS[1:]):
-            return True  # a later `for` / match-arm binding of the name is the one in force
-        return self.receiver_ok(fn, stmt_end(body, simple.end()), simple.end(), hops + 1)
+        return self.receiver_ok(fn, bound.init[1], floor=bound.init[0], hops=hops + 1)
 
     def root_call_ok(self, fn, prefix, name):
         """True when a call `prefix::name(..)` that roots a receiver chain is known to build no parallel iterator (#8069)."""
@@ -2062,12 +2297,14 @@ class FileModel:
                     self.parallel.add(id(f))
                     changed = True
 
-    def builds_parallel(self, fn):
-        """True when fn mentions a parallel iterator or calls a same-file or external fn that does (#8069)."""
-        if PARALLEL_ITER.search(fn.body):
+    def builds_parallel(self, fn, text=None):
+        """True when fn (or just the source text given, such as a closure literal) mentions a parallel iterator or
+        calls a same-file or external fn that does (#8069, #8093)."""
+        src = fn.body if text is None else text
+        if PARALLEL_ITER.search(src):
             return True
-        for m in CALL.finditer(fn.body):
-            before = fn.body[max(0, m.start() - CALL_WINDOW):m.start()].rstrip()
+        for m in CALL.finditer(src):
+            before = src[max(0, m.start() - CALL_WINDOW):m.start()].rstrip()
             if re.search(r"\bfn$", before):
                 continue
             if before.endswith("."):

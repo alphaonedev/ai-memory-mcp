@@ -2132,6 +2132,131 @@ class Issue8091(Positive):
         self.check("let _a = run(move || { %s });" % self.OPEN, set(), head=head)
 
 
+class Issue8093(Positive):
+    """#8093: a value is safe only when its provenance is proven; a wrapper (Some, Box::new, vec!, an array, a tuple, a
+    struct literal) is transparent only when everything inside it is safe."""
+
+    PAR = "fn par() -> impl Sized { (0..3u32).into_par_iter() }\nstruct S<T> { it: T }\n"
+    POOL = "ai_memory::pool::Pool::new()"
+    CL = "|_| { %s }" % Positive.OPEN
+
+    def shapes(self, root):
+        return [
+            "Some(%s).unwrap().for_each(%s);" % (root, self.CL),
+            "Box::new(%s).for_each(%s);" % (root, self.CL),
+            "(%s, 1).0.for_each(%s);" % (root, self.CL),
+            "S { it: %s }.it.for_each(%s);" % (root, self.CL),
+            "[%s].into_iter().next().unwrap().for_each(%s);" % (root, self.CL),
+            "vec![%s].into_iter().next().unwrap().for_each(%s);" % (root, self.CL),
+            "let x = Some(%s).unwrap();\n    x.for_each(%s);" % (root, self.CL),
+            "let a = [%s];\n    a.into_iter().next().unwrap().for_each(%s);" % (root, self.CL),
+            "let t = (%s, 1);\n    t.0.for_each(%s);" % (root, self.CL),
+            "let s = S { it: %s };\n    s.it.for_each(%s);" % (root, self.CL),
+            "let b = Box::new(%s);\n    b.for_each(%s);" % (root, self.CL),
+            "let v = vec![%s];\n    v.into_iter().next().unwrap().for_each(%s);" % (root, self.CL),
+        ]
+
+    def test_wrapped_parallel_helper_is_detached(self):
+        for body in self.shapes("par()"):
+            with self.subTest(body=body):
+                self.check(body, head=self.PAR)
+
+    def test_wrapped_unresolved_constructor_is_detached(self):
+        for body in self.shapes(self.POOL):
+            with self.subTest(body=body):
+                self.check(body, head=self.PAR)
+
+    def test_control_wrappers_of_safe_values(self):
+        for body in (
+            "let v = vec![1, 2];\n    v.iter().for_each(%s);" % self.CL,
+            "let s = Some(1);\n    s.map(%s);" % self.CL,
+            "let b = Box::new(\"x\");\n    b.chars().for_each(%s);" % self.CL,
+            "Some(1).map(%s);" % self.CL,
+            "vec![1u8].iter().for_each(%s);" % self.CL,
+            "let keys = [\"A\", \"B\"];\n    keys.map(%s);" % self.CL,
+            "let t = (1, \"a\");\n    t.1.chars().for_each(%s);" % self.CL,
+            "let n = std::vec::Vec::<u8>::new();\n    n.iter().for_each(%s);" % self.CL,
+            "std::vec::Vec::<u8>::new().iter().for_each(%s);" % self.CL,
+        ):
+            with self.subTest(body=body):
+                self.check(body, set())
+
+
+class Issue8094(Positive):
+    """#8094: a name bound by a `for` pattern, a match arm, `if let`, `while let` or a closure parameter is detached."""
+
+    PAR = "fn par() -> impl Sized { (0..3u32).into_par_iter() }\n"
+    CL = "|_| { %s }" % Positive.OPEN
+
+    def test_for_pattern_binding(self):
+        self.check("for it in [par()] {\n        it.for_each(%s);\n    }" % self.CL, head=self.PAR)
+        self.check("for pool in [ai_memory::pool::Pool::new()] {\n        pool.for_each(%s);\n    }" % self.CL)
+
+    def test_match_arm_binding(self):
+        self.check("match ai_memory::pool::Pool::new() { pool => pool.for_each(%s) }" % self.CL)
+
+    def test_if_let_while_let_closure_param_bindings(self):
+        for body in (
+            "if let Some(it) = Some(par()) {\n        it.for_each(%s);\n    }" % self.CL,
+            "while let Some(it) = Some(par()) {\n        it.for_each(%s);\n        break;\n    }" % self.CL,
+            "let mk = |it| { it.for_each(%s); };\n    mk(par());" % self.CL,
+        ):
+            with self.subTest(body=body):
+                self.check(body, head=self.PAR)
+
+    def test_for_binding_shadows_an_outer_safe_let(self):
+        body = "let it = vec![1];\n    for it in [par()] {\n        it.for_each(%s);\n    }" % self.CL
+        self.check(body, head=self.PAR)
+
+    def test_control_for_loop_closure_runs_on_a_safe_local_outside(self):
+        body = "let v = vec![1, 2];\n    for _k in [1, 2] {\n        v.iter().for_each(%s);\n    }" % self.CL
+        self.check(body, set())
+
+    def test_control_for_item_of_a_literal_collection_is_safe(self):
+        for body in (
+            "for k in [\"A\", \"B\"] {\n        k.chars().for_each(%s);\n    }" % self.CL,
+            "let keys = vec![\"A\", \"B\"];\n    for k in keys.iter() {\n        k.chars().for_each(%s);\n    }" % self.CL,
+        ):
+            with self.subTest(body=body):
+                self.check(body, set())
+
+    def test_destructuring_for_pattern_is_detached(self):
+        self.check("for (it, _n) in [(par(), 1)] {\n        it.for_each(%s);\n    }" % self.CL, head=self.PAR)
+
+    def test_control_literal_loop_item_methods_are_not_a_receiver_hole(self):
+        self.check("let v = vec![1];\n    for _k in [\"A\", \"B\"] {\n        v.iter().for_each(%s);\n    }" % self.CL,
+                   set())
+
+
+class Issue8095(Positive):
+    """#8095: a binding is visible only in a block that is still open at the use; an inner `let` of a closed block
+    does not hide an outer one."""
+
+    PAR = "fn par() -> impl Sized { (0..3u32).into_par_iter() }\n"
+    CL = "|_| { %s }" % Positive.OPEN
+
+    def test_closed_inner_block_does_not_hide_outer_parallel_binding(self):
+        body = "let it = par();\n    { let it = vec![1u8]; let _ = it; }\n    it.for_each(%s);" % self.CL
+        self.check(body, head=self.PAR)
+
+    def test_closed_inner_block_does_not_hide_outer_unresolved_binding(self):
+        body = ("let pool = ai_memory::pool::Pool::new();\n    { let pool = vec![1u8]; let _ = pool; }\n"
+                "    pool.for_each(%s);" % self.CL)
+        self.check(body)
+
+    def test_inner_binding_still_in_force_inside_its_block(self):
+        body = "let it = par();\n    { let it = vec![1u8]; it.iter().for_each(%s); }" % self.CL
+        self.check(body, set(), head=self.PAR)
+
+    def test_control_inner_block_let_then_outer_safe_use(self):
+        body = "let v = vec![1u8];\n    { let v = par(); let _ = v; }\n    v.iter().for_each(%s);" % self.CL
+        self.check(body, set(), head=self.PAR)
+
+    def test_control_same_block_rebinding(self):
+        body = "let x = par();\n    let x = vec![1];\n    x.iter().for_each(%s);" % self.CL
+        self.check(body, set(), head=self.PAR)
+
+
 class RealTree(unittest.TestCase):
     def test_repo_matches_its_baseline(self):
         found = gate.scan_tree(REPO)
