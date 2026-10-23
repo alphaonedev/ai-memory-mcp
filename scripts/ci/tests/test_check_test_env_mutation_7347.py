@@ -3041,7 +3041,7 @@ R18_MUTANTS = (  # (issue, FileModel method, original text, mutated text): the m
     (8136, "await_macro_arg", "self.callee_origin(path_segments(m.group(1)), m.group(2), CALLEE_MACRO) == STD",
      'm.group(2) in ("join", "try_join", "select")'),
     (8137, "callee_origin", "full = self.method_path(name)", "full = (STD_METHOD_ROOT, name)"),
-    (8138, "provider", "self.type_use(name, text)", "re.search(r\"(?<![\\w$'])%s\\b\" % re.escape(name), text)"),
+    (8138, "_provider", "self.type_use(name, text)", "re.search(r\"(?<![\\w$'])%s\\b\" % re.escape(name), text)"),
     (8139, "same_thread", "if ASYNC_CLOSURE.match(body, s):", "if False:"),
 )
 
@@ -3941,7 +3941,8 @@ R24_MUTANTS = (  # (name, original text, mutated text): each must turn a probe o
     ("attr_scan_first_only", "            pos = j - 1\n            continue\n", "            return out[::-1]\n"),
     ("inline_path_ignored", "            if e.rel is not None:\n                children = pbase = pbase / e.rel",
      "            if False:\n                children = pbase = pbase / e.rel"),
-    ("local_mods_off", "if path[0] in FILE_ROOTS or path[0] in self.local_mods:", "if path[0] in FILE_ROOTS:"),
+    ("local_mods_off", "if path[0] in FILE_ROOTS or (path[0] in self.local_mods and not extern):",
+     "if path[0] in FILE_ROOTS:"),
     ("mod_catch_all_off", 'problems.append(REASONS["mod_unclassified"] % snippet(text, m.start()))\n            continue',
      "continue"),
     ("unparsable_attribute_off", 'bad.append(REASONS["attr_unparsable"] % name)\n            attrs = []', "attrs = []"),
@@ -4092,7 +4093,6 @@ R25_MUTANTS = (  # (name, original text, mutated text): each must turn a row of 
     ("alias_closure_off", "alias_closure([scrubbed] + self.module_texts, self.local_mods) - {\"common\"}", "self.local_mods"),
     ("alias_single_pass", "        if found <= mods:\n            return mods\n", "        return mods | found\n"),
     ("alias_prefix_kept", "        while p and p[0] in FILE_ROOTS:", "        while False:"),
-    ("std_root_shadow_off", "if path[0] in STD_ROOTS and path[0] not in self.local_mods:", "if path[0] in STD_ROOTS:"),
     ("alias_any_segment", "and all(seg in mods for seg in p)", "and any(seg in mods for seg in p)"),
 )
 
@@ -4107,6 +4107,141 @@ class ReviewR25Mutants(unittest.TestCase):
             with self.subTest(mutant=name):
                 self.assertEqual(src.count(old), 1, old)
                 mod = types.ModuleType("r25_mutant_" + name)
+                mod.__file__ = str(GATE)
+                sys.modules[mod.__name__] = mod
+                exec(compile(src.replace(old, new), str(GATE), "exec"), mod.__dict__)
+                try:
+                    red = False
+                    for row in rows:
+                        r20_write(row)
+                        if bool(mod.scan_tree(SCRATCH)) != row[2]:
+                            red = True
+                            break
+                    self.assertTrue(red, "the %s mutant stays GREEN" % name)
+                finally:
+                    shutil.rmtree(SCRATCH, ignore_errors=True)
+
+
+# REVIEW-7349 code r25 (umbrella #8168, R25-1, R25-2). R25-1: a `use` alias is scoped to its block, so the name may
+# mean the extern crate of that name anywhere else; the gate answers for both meanings. R25-2: a module aliased
+# `as std` / `core` / `alloc` is no std path.
+R26_LIB_TRAIT = "pub trait Fan { fn map(self, f: u8); }\n"
+R26_LIB_STRUCT = "pub struct Fan;\n"
+R26_ALIAS_SCOPES = (  # (name, head with {A} for the alias item, the import that reads it)
+    ("same_block_before", "mod m;\n{A}\n", "use ai_memory::Fan;\n"),
+    ("sibling_mod", "mod m;\nmod w { {A} }\n", "use ai_memory::Fan;\n"),
+    ("sibling_mod_import_in_mod", "mod m;\nmod w { {A} }\nmod v { use ai_memory::Fan; }\n", ""),
+    ("fn_body_block", "mod m;\nfn g() { {A} }\n", "use ai_memory::Fan;\n"),
+    ("nested_mod", "mod m;\nmod w { mod x { {A} } }\n", "use ai_memory::Fan;\n"),
+    ("block_in_mod_fn", "mod m;\nmod w { fn g() { if true { {A} } } }\n", "use ai_memory::Fan;\n"),
+)
+R26_ALIAS_ITEMS = ("use crate::m as ai_memory;", "use super::m as ai_memory;", "pub use crate::m as ai_memory;",
+                   "use crate::m::{self as ai_memory};")
+
+
+def r26_src_rows():
+    """Probes of R25-1 plus the scope sweep: the extern crate has a trait `Fan`; the local module a struct of that
+    name (or nothing): the real import must be found. Controls: the crate has no trait."""
+    rows = []
+    for _name, head, last in R26_ALIAS_SCOPES:
+        for alias in R26_ALIAS_ITEMS:
+            if "super" in alias and head.startswith("mod m;\n{A}"):
+                continue  # `super` from the crate root names no module
+            # the local module holds a struct of that name or nothing (an unresolved leaf stays open); the control is
+            # a crate without the trait and a local struct: both meanings are structs, nothing may flag
+            for local, lib, flagged in ((R26_LIB_STRUCT, R26_LIB_TRAIT, True), ("", R26_LIB_TRAIT, True),
+                                        (R26_LIB_STRUCT, R26_LIB_STRUCT, False)):
+                files = {"Cargo.toml": R20_CARGO, "src/lib.rs": lib, "tests/m/mod.rs": local}
+                rows.append((head.replace("{A}", alias) + last, R20_MAP, flagged, files))
+    return rows
+
+
+R26_REVIEWER_PROBES = (  # the three probes of REVIEW-7349-code-r25 (S2, S2b, S2d)
+    ("S2", "mod m;\nmod w { use crate::m as ai_memory; }\nuse ai_memory::Fan;\n", R26_LIB_STRUCT, R26_LIB_TRAIT),
+    ("S2b", "mod m;\nmod w { use crate::m as ai_memory; }\nuse ai_memory::fan;\n", "", R26_LIB_TRAIT.replace("Fan", "fan")),
+    ("S2d", "mod m;\nmod w { use super::m as ai_memory; }\nmod v { use ai_memory::Fan; }\n", R26_LIB_STRUCT,
+     R26_LIB_TRAIT),
+)
+R26_FAKE_UNWIND = ("pub fn catch_unwind<F: FnOnce() + Send + 'static>(f: F) { let _ = ::std::thread::spawn(f); }\n")
+R26_UNWIND_BODY = "let _ = catch_unwind(move || { %s });" % Positive.OPEN
+R26_UNWIND_FILES = {"tests/m/mod.rs": "pub mod panic;\n", "tests/m/panic.rs": R26_FAKE_UNWIND}
+
+
+def r26_std_rows():
+    """R25-2: `mod m;` with a fake catch_unwind, aliased to std / core / alloc at any scope, is the fake, not std."""
+    rows = []
+    for root in ("std", "core", "alloc"):
+        for alias in ("use m as %s;", "use m::{self as %s};", "pub use m as %s;", "use crate::m as %s;",
+                      "use self::m as %s;"):
+            rows.append(("mod m;\n" + alias % root + "\nuse %s::panic::catch_unwind;\n" % root, R26_UNWIND_BODY, True,
+                         R26_UNWIND_FILES))
+    # nested: the alias and the import in an inline module, the function re-exported to the crate root
+    rows += [
+        ("mod m;\nmod w { use super::m as std; pub use std::panic::catch_unwind; }\nuse w::catch_unwind;\n",
+         R26_UNWIND_BODY, True, R26_UNWIND_FILES),
+        ("mod m;\nmod w { mod x { use crate::m as core; pub use core::panic::catch_unwind; } pub use x::catch_unwind; }\n"
+         "use w::catch_unwind;\n", R26_UNWIND_BODY, True, R26_UNWIND_FILES),
+        ("mod m;\nuse m as std;\nuse std::panic;\n", "let _ = panic::catch_unwind(move || { %s });" % Positive.OPEN,
+         True, R26_UNWIND_FILES),
+        # controls: the real std stays std, with or without the module, and an unrelated alias
+        ("mod m;\nuse std::panic::catch_unwind;\n", R26_UNWIND_BODY, False, R26_UNWIND_FILES),
+        ("use std::panic::catch_unwind;\n", R26_UNWIND_BODY, False, {}),
+        ("mod m;\nuse m as n;\nuse std::panic::catch_unwind;\n", R26_UNWIND_BODY, False, R26_UNWIND_FILES),
+    ]
+    return rows
+
+
+class ReviewR26(Positive):
+    """REVIEW-7349 code r25 (umbrella #8168, R25-1, R25-2)."""
+
+    def run_rows(self, rows):
+        self.assertTrue(rows)
+        for row in rows:
+            with self.subTest(head=row[0], body=row[1][:40], files=dict(sorted(row[3].items()))):
+                r20_write(row)
+                self.assertEqual(self.scan(), FLAGGED if row[2] else set())
+
+    def test_the_three_reviewer_probes_of_r25_1(self):
+        for name, head, local, lib in R26_REVIEWER_PROBES:
+            with self.subTest(probe=name):
+                r20_write((head, R20_MAP, True, {"Cargo.toml": R20_CARGO, "src/lib.rs": lib, "tests/m/mod.rs": local}))
+                self.assertEqual(self.scan(), FLAGGED)
+                self.assertEqual(gate.main(["--root", str(SCRATCH)]), 1)
+
+    def test_an_alias_is_scoped_to_its_block_so_the_real_crate_import_is_still_found(self):
+        rows = r26_src_rows()
+        self.assertGreater(len(rows), 60)
+        self.run_rows(rows)
+
+    def test_a_module_aliased_as_std_core_or_alloc_is_no_std_path(self):
+        self.run_rows(r26_std_rows())
+
+    def test_the_reviewer_probe_of_r25_2(self):
+        r20_write(("mod m;\nuse m as std;\nuse std::panic::catch_unwind;\n", R26_UNWIND_BODY, True, R26_UNWIND_FILES))
+        self.assertEqual(self.scan(), FLAGGED)
+        self.assertEqual(gate.main(["--root", str(SCRATCH)]), 1)
+
+
+R26_MUTANTS = (  # (name, original text, mutated text): each must turn a row of ReviewR26 RED
+    ("alias_union_off", "        return ANY_METHOD if local is ANY_METHOD or other is ANY_METHOD else local | other\n",
+     "        return local\n"),
+    ("alias_roots_empty", "        self.alias_roots = self.local_mods - declared\n", "        self.alias_roots = set()\n"),
+    ("extern_meaning_local", "(path[0] in self.local_mods and not extern)", "(path[0] in self.local_mods)"),
+    ("std_head_rewrite_off", '                    path = ("crate",) + tuple(path)  # r26 (R25-2): a module aliased `as std` is no std path\n',
+     "                    pass\n"),
+)
+
+
+class ReviewR26Mutants(unittest.TestCase):
+    """Each named mutant of the round 26 rules is applied to the whole gate source and turns a row of ReviewR26 RED."""
+
+    def test_each_named_mutant_turns_a_row_red(self):
+        src = GATE.read_text()
+        rows = r26_src_rows() + r26_std_rows()
+        for name, old, new in R26_MUTANTS:
+            with self.subTest(mutant=name):
+                self.assertEqual(src.count(old), 1, old)
+                mod = types.ModuleType("r26_mutant_" + name)
                 mod.__file__ = str(GATE)
                 sys.modules[mod.__name__] = mod
                 exec(compile(src.replace(old, new), str(GATE), "exec"), mod.__dict__)
