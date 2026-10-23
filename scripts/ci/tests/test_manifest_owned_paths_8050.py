@@ -12,7 +12,7 @@ import unittest
 
 GATE = Path(__file__).resolve().parents[1] / "manifest_owned_paths.py"
 REPO = Path(__file__).resolve().parents[3]
-SCRATCH =Path(__file__).resolve().parents[3] / ".local-runs"
+SCRATCH = Path(__file__).resolve().parents[3] / ".local-runs"
 SDK_PATH = "sdk/typescript/src/wake.ts"
 OTHER_PATH = "sdk/python/ai_memory/wake.py"
 EXIT_OK = 0
@@ -167,6 +167,55 @@ class ManifestOwnedPathsTest(unittest.TestCase):
         doc = (REPO / "docs/ci/CARRIER-BRANCH-GATES.md").read_text(encoding="utf-8")
         section = doc[doc.index("### Manifest-inventoried paths"):]
         for needle in ("tests/fixtures/**/*.json", "every string", "directory", "deleted", "exit 2"):
+            self.assertIn(needle, section)
+
+    def test_object_keys_are_inventoried_8084(self):
+        write(self.root / "tests/fixtures/m8.json", '{"sdk/keyed/a.ts": "x", "n": {"b/c.ts": 1}}')
+        write(self.root / "tests/qual_m8.rs", 'include_str!("fixtures/m8.json");\n')
+        for diff in ("sdk/keyed/a.ts\n", "b/c.ts\n"):
+            res = self.run_gate(diff)
+            self.assertEqual(res.returncode, EXIT_MATCH, (diff, res.stdout, res.stderr))
+            self.assertIn("qual_m8", res.stdout)
+
+    def test_symlinked_fixture_folder_is_read_8085(self):
+        write(self.root / "extern/sub/m9.json", '["sdk/linked/a.ts"]')
+        try:
+            os.symlink(str(self.root / "extern/sub"), str(self.root / "tests/fixtures/linksub"))
+        except (OSError, NotImplementedError) as err:
+            self.skipTest("symlinks unavailable: %s" % err)
+        write(self.root / "tests/qual_m9.rs", 'include_str!("fixtures/linksub/m9.json");\n')
+        res = self.run_gate("sdk/linked/a.ts\n")
+        self.assertEqual(res.returncode, EXIT_MATCH, (res.stdout, res.stderr))
+        self.assertIn("qual_m9", res.stdout)
+
+    def test_included_fixture_never_read_fails_closed_8085(self):
+        write(self.root / "tests/qual_gone.rs", 'include_str!("fixtures/missing.json");\n')
+        res = self.run_gate("README.md\n")
+        self.assertEqual(res.returncode, EXIT_DEFECT, (res.stdout, res.stderr))
+        self.assertIn("gate defect: ", res.stderr)
+        self.assertIn("missing.json", res.stderr)
+
+    def test_non_json_include_is_ignored_8085(self):
+        write(self.root / "tests/qual_txt.rs", 'include_str!("fixtures/decoder.txt");\n')
+        res = self.run_gate("README.md\n")
+        self.assertEqual(res.returncode, EXIT_OK, (res.stdout, res.stderr))
+
+    def test_dot_prefixed_names_and_dotdot_segments_8086(self):
+        write(
+            self.root / "tests/fixtures/m10.json",
+            '["..foo/x", "...rc", "a/../b", "../outside.txt"]',
+        )
+        write(self.root / "tests/qual_m10.rs", 'include_str!("fixtures/m10.json");\n')
+        for diff in ("..foo/x\n", "...rc\n", "b\n"):
+            res = self.run_gate(diff)
+            self.assertEqual(res.returncode, EXIT_MATCH, (diff, res.stdout, res.stderr))
+        res = self.run_gate("outside.txt\n")
+        self.assertEqual(res.returncode, EXIT_OK, res.stdout)
+
+    def test_doc_states_normalisation_8087(self):
+        doc = (REPO / "docs/ci/CARRIER-BRANCH-GATES.md").read_text(encoding="utf-8")
+        section = doc[doc.index("### Manifest-inventoried paths"):]
+        for needle in ("backslash", "whitespace", "`..`", "case-sensitive", "object keys"):
             self.assertIn(needle, section)
 
     def test_no_stale_path_shape_names_8083(self):

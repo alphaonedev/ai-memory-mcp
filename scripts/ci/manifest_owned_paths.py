@@ -11,8 +11,16 @@ inventoried path must run that test; this gate names it.
 decision: inventory every manifest string over a path-shape filter because r1
 and r2 each found paths the filter let through (52e10527).
 
-Every string value found anywhere in a manifest is inventoried, normalised (a
-leading ./ or / and a trailing / are stripped, // collapses), whether or not the
+decision: fail closed when an included fixture was not read over trusting the
+walk because a symlink or missing target must never pass silently. Every
+include_str!/include_bytes! target under tests/fixtures that ends in .json must
+be read by the manifest walk, else exit 2; non-JSON includes are ignored. The
+walk follows symlinked folders (a visited-realpath set stops loops).
+
+Every string found anywhere in a manifest, object keys included, is inventoried,
+normalised (backslashes become /, whitespace is trimmed, // collapses, a leading
+./ or / and a trailing / are stripped, literal .. segments are resolved,
+case-sensitive; strings that leave the repo root are ignored), whether or not the
 path exists today. A changed path matches an inventoried string when it equals
 it or starts with it plus "/" (so a folder entry covers its children, with or
 without a trailing slash and even after the folder is deleted). Matching is
@@ -47,14 +55,15 @@ def norm(path):
 
 
 def walk_strings(node):
-    """Yield every string value in a parsed JSON document."""
+    """Yield every string in a parsed JSON document: values and object keys."""
     if isinstance(node, str):
         yield node
     elif isinstance(node, list):
         for item in node:
             yield from walk_strings(item)
     elif isinstance(node, dict):
-        for item in node.values():
+        for key, item in node.items():
+            yield key
             yield from walk_strings(item)
 
 
@@ -101,7 +110,13 @@ def find_files(root, pattern):
         return []
     regex = glob_regex(pattern)
     found = []
-    for folder, _dirs, names in os.walk(str(base), onerror=raise_walk_error):
+    seen = set()
+    for folder, dirs, names in os.walk(str(base), onerror=raise_walk_error, followlinks=True):
+        real = os.path.realpath(folder)
+        if real in seen:
+            dirs[:] = []  # symlink loop: this folder was already read
+            continue
+        seen.add(real)
         for name in names:
             path = Path(folder) / name
             if regex.match(path.relative_to(root).as_posix()):
@@ -117,6 +132,7 @@ def load_inventory(root, manifests_glob, tests_glob):
             owners.setdefault(name, []).append(test.stem)
     fixtures = root / FIXTURES_DIR
     inventory = {}
+    read_keys = set()
     for manifest in find_files(root, manifests_glob):
         try:
             key = manifest.relative_to(fixtures).as_posix()
@@ -126,15 +142,19 @@ def load_inventory(root, manifests_glob, tests_glob):
             doc = json.loads(manifest.read_text(encoding="utf-8"))
         except (OSError, ValueError) as err:
             raise ValueError("unparseable manifest %s: %s" % (key, err))
+        read_keys.add(key)
         if key not in owners:
             raise ValueError("manifest %s has no owning qual test" % key)
         for stem in owners[key]:
             add_entry(inventory, manifest.relative_to(root).as_posix(), (key, stem))
         for value in walk_strings(doc):
             rel = norm(value)
-            if rel and rel != "." and not rel.startswith(".."):
+            if rel and rel != "." and rel != ".." and not rel.startswith("../"):
                 for stem in owners[key]:
                     add_entry(inventory, rel, (key, stem))
+    for key in sorted(owners):
+        if key.endswith(".json") and key not in read_keys:
+            raise ValueError("included fixture %s was not read (missing, unreadable or unmatched)" % key)
     return inventory
 
 
