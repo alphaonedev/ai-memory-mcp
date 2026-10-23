@@ -13,10 +13,10 @@
 # independently hosts ic_peer_1..K for its own K peers.
 #
 # Install vector (verified against the live pgdg noble repo — see lib.sh):
-#   * postgresql-18          18.4   exact pgdg .deb
+#   * postgresql-18          18.6   exact pgdg .deb
 #   * postgresql-18-pgvector 0.8.7  exact pgdg .deb
-#   * postgresql-18-age      age.control default_version='1.7.0' (extversion
-#     1.7.0) — same commit as the apache/age:release_PG18_1.7.0 image; the
+#   * postgresql-18-age      age.control default_version='1.8.0' (extversion
+#     1.8.0) — same commit as the apache/age:release_PG18_1.8.0 image; the
 #     pgdg "~rc0" is only a Debian revision label. No source build.
 #
 # Native specifics vs. the old container model:
@@ -33,7 +33,7 @@
 #   * pg_hba.conf is hostssl-ONLY: a non-TLS TCP connection is rejected
 #     pre-auth. The local unix socket stays `trust` for the postgres probes.
 #
-# Benchmark-matrix knobs (#172) are EMPTY by default → stock PG18.4 = the B0
+# Benchmark-matrix knobs (#172) are EMPTY by default → stock PG18.6 = the B0
 # control. A matrix arm re-provisions with exactly ONE knob set (lib.sh).
 #
 # Secret handling: a SINGLE fleet PG password is generated once into the
@@ -319,7 +319,7 @@ EOS
       die "[$pg_host] FAIL-CLOSED (#2658): hostssl is NOT provably armed -- a plaintext (sslmode=disable) TCP connection to $pg_priv:$PG_PORT was NOT refused pre-auth. REFUSING to declare this pg substrate ready (a cleartext-accepting postgres reporting healthy is the silent disarm this gate exists to prevent). probe: ${plain_out}" ;;
   esac
 
-  log "region $region PG18.4/AGE1.7.0/pgvector substrate ready ($pg_host @ $pg_priv:$PG_PORT, $peer_n peer schemas, NATIVE/no-docker)"
+  log "region $region PG18.6/AGE1.8.0/pgvector substrate ready ($pg_host @ $pg_priv:$PG_PORT, $peer_n peer schemas, NATIVE/no-docker)"
 }
 
 # Drive each region's pg node. bash-3.2: feed the hostname list via a here-doc
@@ -331,4 +331,4 @@ done <<EOF
 $PG_HOSTS
 EOF
 
-log "all regional PG18.4/AGE1.7.0/pgvector substrates ready ($(inv_regions | tr '\n' ' ')— one pg per region, NATIVE/no-docker)"
+log "all regional PG18.6/AGE1.8.0/pgvector substrates ready ($(inv_regions | tr '\n' ' ')— one pg per region, NATIVE/no-docker)"

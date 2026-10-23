@@ -194,7 +194,7 @@ CURATOR_HEALTH_MAX_RESTARTS="${CURATOR_HEALTH_MAX_RESTARTS:-3}"
 # Assessment (verified against the live pgdg noble repo): apt is a complete,
 # pinned install vector for all three —
 #   * postgresql-18         18.6   (exact)
-#   * postgresql-18-pgvector 0.8.7 (exact, unchanged — already current-stable)
+#   * postgresql-18-pgvector 0.8.7 (exact; advanced from 0.8.6, current-stable)
 #   * postgresql-18-age      ships age.control default_version='1.8.0' and
 #     age--1.8.0.sql. AGE 1.8.0 is the NEWEST released AGE for PostgreSQL 18
 #     per github.com/apache/age/releases (PG18/v1.8.0-rc0, 2026-07-09).
