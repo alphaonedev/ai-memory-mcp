@@ -183,6 +183,9 @@ jobs:
             if [ -d "$d" ]; then
               echo "$d" >> "$GITHUB_PATH"
               PATH="$d:$PATH"
+              # #7130/#7324: the AGE lock-leak cell races on a private
+              # postmaster built from THIS install, never on the shared tier.
+              echo "AI_MEMORY_TEST_PG_BINDIR=$d" >> "$GITHUB_ENV"
             fi
           done
           export PATH
@@ -370,6 +373,7 @@ jobs:
             --test g5_find_paths_cte_served_on_age
             --test kg_age_fallback
             --test kg_age_orphan_graph_3883
+            --test age_rollback_lock_leak_7130
             --test age_cte_equivalence
             --test issue_1482_age_cypher_persistent
             --test pillar4_4c_deferred_age_cold_path_1735
