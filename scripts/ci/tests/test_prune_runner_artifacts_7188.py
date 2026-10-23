@@ -183,8 +183,9 @@ class Arguments(Fixture):
         self.assert_refused(rc)
 
     def test_work_root_with_fewer_than_two_components_is_refused(self):
-        rc, _ = self.run_with(work=SINGLE_COMPONENT_ROOT, workspace=SINGLE_COMPONENT_ROOT + "/x", shared="/opt/ci-cargo-target")
+        rc, err = self.run_with(work=SINGLE_COMPONENT_ROOT, workspace=SINGLE_COMPONENT_ROOT + "/x", shared="/opt/ci-cargo-target")
         self.assertEqual(rc, prune.EXIT_USAGE)
+        self.assertIn("fewer than %d path components" % prune.MIN_WORK_ROOT_COMPONENTS, err)
         self.assertTrue(self.old_tmp.exists())
 
     def test_relative_shared_target_is_refused(self):

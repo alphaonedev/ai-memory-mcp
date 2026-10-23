@@ -402,19 +402,30 @@ class ComparisonTests(unittest.TestCase):
 class GitLimitsTests(unittest.TestCase):
     """#8146: a kernel-refused rlimit must not abort the git child hook."""
 
-    def test_refused_address_space_limit_is_skipped_and_file_limit_still_applied(self):
+    def run_git_limits(self, refused):
         compare = module('compare_8146', 'scripts/claude-md-rule-compare.py')
         calls = []
 
         def fake_setrlimit(which, limits):
-            calls.append(which)
-            if which == compare.resource.RLIMIT_AS:
+            calls.append((which, tuple(limits)))
+            if which == refused(compare):
                 raise ValueError('current limit exceeds maximum limit')
 
         with unittest.mock.patch.object(compare.resource, 'setrlimit', fake_setrlimit):
             compare.git_limits()
-        self.assertIn(compare.resource.RLIMIT_FSIZE, calls)
-        self.assertIn(compare.resource.RLIMIT_AS, calls)
+        return compare, calls
+
+    def assert_full_sequence(self, compare, calls):
+        fsize, mem = compare.MAX_GIT_FILE_BYTES, compare.MAX_GIT_MEMORY_BYTES
+        self.assertEqual(calls, [(compare.resource.RLIMIT_FSIZE, (fsize, fsize)),
+                                 (compare.resource.RLIMIT_AS, (mem, mem))])
+
+    def test_refused_leading_limit_is_skipped_and_later_limit_still_applied(self):
+        """A break instead of continue would drop the address-space bound after the refused file bound."""
+        self.assert_full_sequence(*self.run_git_limits(lambda c: c.resource.RLIMIT_FSIZE))
+
+    def test_refused_address_space_limit_is_skipped_and_file_limit_applied_exactly(self):
+        self.assert_full_sequence(*self.run_git_limits(lambda c: c.resource.RLIMIT_AS))
 
 
 class ResourceTests(unittest.TestCase):
