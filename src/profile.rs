@@ -5,9 +5,10 @@
 //!
 //! A profile is a set of tool *families* (`Family`) that the MCP server
 //! advertises in its `tools/list` response. v0.6.4 collapses the default
-//! surface from 43 tools (full) to 5 (core) so eager-loading harnesses
+//! surface from the `full` profile to `core` (`Family::Core.tool_names()`,
+//! 7 tools at v1.0.0) so eager-loading harnesses
 //! stop pre-paying ~6,000 input tokens of tool schemas per request. The
-//! 38 tools outside `core` remain reachable via runtime expansion through
+//! tools outside `core` remain reachable via runtime expansion through
 //! `memory_capabilities --include-schema family=<name>` (Track C —
 //! v0.6.4-006), so no functionality is lost; only the eager prefix cost
 //! goes away.
@@ -1311,5 +1312,66 @@ mod tests {
                 assert!(p.loads(name), "{name} must load in every profile");
             }
         }
+    }
+
+    /// #7276 — SSOT gate: a `N tools` total written in a doc comment of
+    /// this file must equal a count the code itself computes (a family's
+    /// `tool_names().len()` or a profile's `expected_tool_count()`), so
+    /// prose such as "from 43 tools (full) to 5 (core)" cannot rot.
+    #[test]
+    fn doc_comment_tool_totals_match_ssot_7276() {
+        let mut allowed: Vec<usize> = Family::all().iter().map(|f| f.tool_names().len()).collect();
+        for p in [
+            Profile::core(),
+            Profile::graph(),
+            Profile::admin(),
+            Profile::power(),
+            Profile::full(),
+        ] {
+            allowed.push(p.expected_tool_count());
+        }
+        // Production half of the file only: the tests below quote stale
+        // totals on purpose.
+        let src = include_str!("profile.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let mut stale: Vec<String> = Vec::new();
+        let profile_names = ["core", "graph", "admin", "power", "full"];
+        for (idx, line) in prod.lines().enumerate() {
+            let t = line.trim_start();
+            if !(t.starts_with("//!") || t.starts_with("///")) {
+                continue;
+            }
+            let words: Vec<&str> = t.split_whitespace().collect();
+            let bare = |w: &str| {
+                w.trim_matches(|c: char| !c.is_ascii_alphanumeric())
+                    .to_owned()
+            };
+            for (i, word) in words.iter().enumerate() {
+                // A total is `N tools`, or a number tied to a profile name:
+                // `N (core)` (the #7276 drifted form) or `**N** at core`.
+                let next = words.get(i + 1).map_or_else(String::new, |w| bare(w));
+                let after = words.get(i + 2).map_or_else(String::new, |w| bare(w));
+                let tied = words.get(i + 1).is_some_and(|w| w.starts_with("tools"))
+                    || profile_names.contains(&next.as_str())
+                    || (next == "at" && profile_names.contains(&after.as_str()));
+                let num = bare(word);
+                if !tied || num.is_empty() || !num.bytes().all(|b| b.is_ascii_digit()) {
+                    continue;
+                }
+                if let Ok(n) = num.parse::<usize>()
+                    && !allowed.contains(&n)
+                {
+                    let profile = if next == "at" { &after } else { &next };
+                    stale.push(format!(
+                        "src/profile.rs:{}: `{n}` tied to `{profile}`",
+                        idx + 1
+                    ));
+                }
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "doc comments carry tool totals that match no Family/Profile count {allowed:?}: {stale:?}"
+        );
     }
 }

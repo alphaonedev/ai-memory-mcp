@@ -916,7 +916,7 @@ fn insert_create_with_quota(
 ///
 /// Per ADR-0001 the substrate does NOT roll back on quorum failure:
 /// the local commit has already landed when we reach this stage. A
-/// quorum miss surfaces 503 + `Retry-After: 2` and the sync-daemon's
+/// quorum miss surfaces `202 Accepted` + `quorum_met:false` and the sync-daemon's
 /// eventual-consistency loop catches stragglers up. A `Some(fed)` +
 /// `Ok(got)` path includes `quorum_acks: <count>` on the response.
 async fn fanout_and_assemble_create_response(
@@ -1038,8 +1038,8 @@ async fn fanout_and_assemble_create_response(
     }
 
     // v0.7 federation: fan out to peers when --quorum-writes is
-    // configured. Per ADR-0001 a failed quorum returns 503 but does
-    // NOT roll back the local write.
+    // configured. Per ADR-0001 a failed quorum returns `202 Accepted` +
+    // `quorum_met:false` and does NOT roll back the local write.
     if let Some(fed) = app.federation.as_ref() {
         let mut mem_echo = mem.clone();
         mem_echo.id = actual_id.to_string();
@@ -1562,7 +1562,8 @@ async fn create_memory_postgres(
 
     // #1480 — evaluate the pipelined quorum result now that the local
     // write is durable and audit/dispatch have fired. A failed quorum
-    // returns 503 but never rolls back the local write (ADR-0001).
+    // returns `202 Accepted` + `quorum_met:false` and never rolls back the
+    // local write (ADR-0001).
     let mut receipt_quorum = None;
     if let Some(quorum_res) = quorum_outcome {
         match quorum_res {

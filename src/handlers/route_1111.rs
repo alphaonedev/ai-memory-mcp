@@ -255,8 +255,8 @@ async fn reflect_depth_approval_gate_pg(
 /// where receivers land it unsigned until `export_links` reconciliation pulls
 /// the signed row).
 ///
-/// Returns `Some(response)` when the memory quorum is NOT met (a typed 503 the
-/// caller must return verbatim), or `None` on success / when federation is
+/// Returns `Some(response)` when the memory quorum is NOT met (a `202 Accepted` +
+/// `quorum_met:false` the caller must return verbatim), or `None` on success / when federation is
 /// disabled (the single-node no-op path) so the caller proceeds to its 200
 /// envelope.
 async fn reflect_fanout(

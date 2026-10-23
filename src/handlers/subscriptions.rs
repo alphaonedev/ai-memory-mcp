@@ -294,8 +294,9 @@ pub async fn notify(
     // node-1 only — when bob polls `/api/v1/inbox` against node-2 he sees
     // nothing. The HTTP wrapper bypassed the `create_memory` fanout path
     // that every other `db::insert` write uses, so we wire it here with the
-    // same posture as `fanout_or_pending`: on quorum miss return 503; on a
-    // network error, swallow (local commit landed, sync-daemon catches up).
+    // same posture as `fanout_or_pending`: on quorum miss return `202 Accepted` +
+    // `quorum_met:false`; on a network error, swallow (local commit landed,
+    // sync-daemon catches up).
     let fanout_mem = match &result {
         Ok(v) => v
             .get("id")
@@ -569,7 +570,7 @@ pub async fn subscribe(
         };
         // Fan the freshly-persisted subscription memory out to peers
         // using the same quorum-write contract as `_agents` /
-        // `_inbox` rows. On quorum miss return 503; on a network
+        // `_inbox` rows. On quorum miss return `202 Accepted` + `quorum_met:false`; on a network
         // error, swallow (local commit landed). Mirrors the sqlite
         // branch's `fanout_or_pending` call below.
         if let Some(resp) = fanout_or_pending(&app, &mem).await {
