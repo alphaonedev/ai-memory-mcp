@@ -5,6 +5,7 @@ The partition, evict-r5, sccache, per-runner, sync and prune suites used fixed
 concurrent discover runs in one checkout destroyed each other's fixtures.
 """
 
+import importlib
 import re
 import subprocess
 import sys
@@ -28,6 +29,39 @@ KILL_WAIT_SECS = 30
 MIN_TESTS_PER_CHILD = 5  # a child that matched no suite runs 0 tests (#8161)
 RAN_RE = re.compile(r"^Ran (\d+) tests? in ", re.MULTILINE)
 OK_RE = re.compile(r"^OK(?: \(.*\))?$", re.MULTILINE)
+
+
+class PerRunScratch8024(unittest.TestCase):
+    """Deterministic guard: each suite's setUpModule must mint a fresh scratch dir (F1 of r2).
+
+    The concurrent test below can miss a suite that finishes before its sibling
+    children start (sync-r4 runs in 0.036 s), so this one needs no timing.
+    """
+
+    def test_every_suite_mints_a_distinct_dir_under_local_runs(self):
+        sys.path.insert(0, str(TESTS_DIR))
+        self.addCleanup(sys.path.remove, str(TESTS_DIR))
+        parent = (REPO / ".local-runs").resolve()
+        for pattern in PATTERNS:
+            with self.subTest(pattern=pattern):
+                mod = importlib.import_module(pattern[:-len(".py")])
+                self.assertTrue(hasattr(mod, "setUpModule"), "no setUpModule: fixed scratch")
+                made = []
+                try:
+                    for _ in range(2):
+                        mod.setUpModule()
+                        made.append(mod.SCRATCH)
+                    self.assertNotEqual(made[0], made[1])
+                    for path in made:
+                        self.assertTrue(Path(path).is_dir(), path)
+                        self.assertEqual(Path(path).resolve().parent, parent)
+                finally:
+                    for path in made:
+                        mod.SCRATCH = path
+                        mod.tearDownModule()
+                    mod.SCRATCH = None
+                for path in made:
+                    self.assertFalse(Path(path).exists(), path)
 
 
 class ConcurrentScratch8024(unittest.TestCase):
