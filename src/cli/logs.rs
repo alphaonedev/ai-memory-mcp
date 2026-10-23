@@ -590,14 +590,33 @@ fn follow_poll(
         if replaced {
             // Rename-and-recreate: the writer may still have appended to the
             // renamed file, which only the old handle can reach.
-            drain_followed(state, filters, out, true)?;
-            writeln!(
-                out.stderr,
-                "logs: {} was rotated or truncated; following from the start",
-                state.path.display()
-            )?;
+            // decision: open the recreated path BEFORE leaving the old handle,
+            // reusing the #8005 bounded retry shape (one stderr note through
+            // `state.unreadable`, retried every poll while the replacement is
+            // still detected) over a new retry state, because a precedent
+            // exists (#8062, #8063, ERRORS-02).
             let path = state.path.clone();
-            switch_to(state, path, None);
+            match open_followed(&path) {
+                Ok(file) => {
+                    drain_followed(state, filters, out, true)?;
+                    writeln!(
+                        out.stderr,
+                        "logs: {} was rotated or truncated; following from the start",
+                        path.display()
+                    )?;
+                    switch_to(state, path, Some(file));
+                }
+                Err(err) => {
+                    if state.unreadable.as_ref() != Some(&path) {
+                        writeln!(
+                            out.stderr,
+                            "logs: cannot open {}: {err:#}; still draining the renamed file",
+                            path.display()
+                        )?;
+                        state.unreadable = Some(path);
+                    }
+                }
+            }
         } else if meta.len() < state.offset || !state.fingerprint_holds() {
             // decision: a short prefix fingerprint of the bytes before the
             // cursor over mtime+len or a content hash, because it costs one
@@ -1040,6 +1059,41 @@ mod tests {
         let (s3, _) = poll_once(dir.path(), &mut state);
         assert_eq!(s3, "a4\nnew-b\n", "drained old, switched: {s3:?}");
         assert_eq!(state.path, b);
+    }
+
+    /// #8062 (= #8063) - a rename-and-recreate whose new file cannot be opened
+    /// yet is reported once, the renamed-away file keeps being drained, and the
+    /// new file prints from its start exactly once when it becomes readable.
+    #[cfg(unix)]
+    #[test]
+    fn logs_tail_follow_resumes_after_recreated_unopenable_file_8062() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let a = make_log(dir.path(), "ai-memory.log", "first\n");
+        let mut state = open_state(&a, 6);
+        let old = dir.path().join("old.zst");
+        fs::rename(&a, &old).unwrap();
+        append(&old, "late-old\n");
+        fs::write(&a, "new-1\nnew-2\n").unwrap();
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::File::open(&a).is_ok() {
+            return; // privileged user: the permission bits do not bite.
+        }
+        let (s1, e1) = poll_once(dir.path(), &mut state);
+        assert_eq!(s1, "late-old\n", "renamed file still drained: {s1:?}");
+        assert!(e1.contains("cannot open"), "reported: {e1:?}");
+        assert!(
+            !e1.contains("following from the start"),
+            "no false note: {e1:?}"
+        );
+        let (s2, e2) = poll_once(dir.path(), &mut state);
+        assert_eq!((s2.as_str(), e2.as_str()), ("", ""), "quiet and once");
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o644)).unwrap();
+        let (s3, e3) = poll_once(dir.path(), &mut state);
+        assert_eq!(s3, "new-1\nnew-2\n", "resumed from the start: {s3:?}");
+        assert!(e3.contains("rotated or truncated"), "note: {e3:?}");
+        let (s4, _) = poll_once(dir.path(), &mut state);
+        assert_eq!(s4, "", "no duplicate: {s4:?}");
     }
 
     /// #8006 - a fragment that ends inside a multi-byte character is held,
