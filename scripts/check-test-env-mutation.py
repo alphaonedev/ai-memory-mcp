@@ -98,18 +98,27 @@ import, or as `Type::f`, and one in a `#[path = ".."] mod m;` or `mod m;` file o
 resolved to the helper it names; #8060 a nested `common::a::b::f` path reaches the fn of a submodule
 file, and one fixpoint runs over every tests/common file together, so a common helper that calls a
 detacher of another common file detaches too.
-General rule (#8056 #8057 #8058; fail closed, decision 27ef27dc): every closure or async-block literal
-in a fn body is DETACHED unless one of these same-thread shapes is proven: (1) it is invoked in place,
-`(|| ..)()`; (2) it is bound by a plain `let name = <closure>;` and every use of `name` in its scope is
-a direct call `name(..)` outside any other closure literal; (3) it is the value a same-thread closure
-returns (an `async move { .. }` tail of a closure that is itself on the thread); (4) it is the whole
-argument of a known callee that does not spawn that parameter (a same-file fn, a tests/common or module
-fn, alias and nested path resolved) or of an inline runner named in SAME_THREAD_CALLEES (iterator,
-Option, Once and block_on adaptors), unless a rayon-style parallel iterator is in the fn
-(PARALLEL_ITER). Anything else (inside Box::new, Some, a struct field, vec!, a tuple, a method receiver,
-an assignment, a return, a loop, another closure, an unresolved callee) is detached. A spawn used as a
-fn value (`.map(std::thread::spawn)`, VALUE_DETACH) detaches every closure of the fn, and a carrier
-re-assigned later in an enclosing loop is followed through that later binding (loop_end).
+General rule (#8056 #8057 #8058 #8065-#8069; fail closed, decision 27ef27dc): a closure or async-block
+literal is credited only when provably invoked on this thread before the fn returns. Every literal is
+DETACHED unless one of these shapes is proven: (1) it is invoked in place, `(|| ..)()`; (2) it is bound by
+a plain `let name = <closure>;` and every use of `name` in its scope is a direct call `name(..)` outside
+any other closure literal; (3) it is the value a same-thread closure returns and that value is consumed in
+place, `mk()()`, or by a `let v = mk();` whose every use is a call (an async block: `.await`ed in place);
+a returned closure that is stored, passed on or returned again is detached (#8066); (4) it is the whole
+argument of a callee that PROVABLY runs that parameter inline: a same-file, tests/common or module fn
+(alias and nested path resolved) whose parameter is in the positive inline-only fixpoint (every use of the
+parameter is a direct call, a `let q = p;` alias that is itself inline-only, or an argument of a callee
+that is inline-only in turn; a store, a return, a use inside another closure or a re-binding is not),
+never a callee that merely does not spawn it (#8065); or an unresolved runner named by its FULL path
+(INLINE_ROOTS: std, core, alloc, tokio, futures; WRAPPER_CALLEES such as AssertUnwindSafe recurse), or an
+iterator/Option/Once adaptor of SAME_THREAD_CALLEES whose receiver chain roots in a local, a literal, a
+std type or a callee that builds no parallel iterator (#8068, #8069). PARALLEL_ITER is judged through a
+fixpoint over callee bodies, so a helper that builds a rayon-style iterator taints its callers (#8069).
+`&|| ..` and `&mut || ..` are closure literals (#8067). Anything else (inside Box::new, Some, a struct
+field, vec!, a tuple, a method receiver, an assignment, a return, a loop, another closure, an unresolved
+free function or crate path) is detached. A spawn used as a fn value (`.map(std::thread::spawn)`,
+VALUE_DETACH) detaches every closure of the fn, and a carrier re-assigned later in an enclosing loop is
+followed through that later binding (loop_end).
 A macro_rules! whose body invokes a spawning macro, or a detaching helper, detaches too (#8046): the
 forwarding is closed transitively.
 In a `macro_rules!` body (a template, not a fn) the statement may sit in any block that encloses the
@@ -267,11 +276,22 @@ MOD_DECL = re.compile(r'(?:#\[\s*path\s*=\s*"([^"]+)"\s*\]\s*)?(?:pub(?:\([^)]*\
 LOOP_BIND = r"\bfor\b[^{};]*\b%s\b[^{};]*\bin\b"  # `for g in <expr> {`
 ARM_BIND = r"(?<![\w.])%s\b\s*(?:[,)|]\s*)*=>"  # a match-arm pattern naming the variable
 PARAM_BIND = r"\|[^|;{}]*\b%s\b[^|;{}]*\|"  # a closure parameter list naming the variable
+SHADOW_BINDS = (r"\blet\b[^=;]*\b%s\b[^=;]*=(?!=)", LOOP_BIND, ARM_BIND)  # #8065: a re-binding of a parameter name
 ANY_CLOSURE_LET = CLOSURE_LET % r"[A-Za-z_]\w*"  # every closure or async-block `let` initialiser of a fn
 # #8056: a closure or async-block LITERAL: `[async] [move] |params|` / `||` or `async [move] {`. A bare `|` opens
 # a closure only after one of CLOSURE_PREV (or `=>` / `return`); after an operand it is a bit-or or an or-pattern.
 CLOSURE_OPEN = re.compile(r"(?<![\w$])(?:async\s+(?:move\s+)?\{|(?:(?:async\s+)?move\s+|async\s+)?\|\|?)")
-CLOSURE_PREV = "(,={;[:"
+CLOSURE_PREV = "(,={;[:&"  # #8067: `&` and `&mut` borrow a closure literal; a bit-and never precedes one
+BORROW_MUT = re.compile(r"&\s*mut$")
+INLINE_ROOTS = frozenset(("std", "core", "alloc", "tokio", "futures"))  # #8068: path roots of the known inline runners
+# (rayon is left out on purpose: its pool runs a closure on another thread, so a rayon-qualified path is detached)
+WRAPPER_CALLEES = frozenset(("AssertUnwindSafe",))  # #8065: a pass-through wrapper, judged by where its value goes
+RECEIVER_CTORS = frozenset(("Some", "Ok", "Err"))  # #8069: prelude constructors that root an iterator chain
+RECEIVER_STD_TYPES = frozenset((
+    "String", "Vec", "VecDeque", "Option", "Result", "HashMap", "HashSet", "BTreeMap", "BTreeSet", "Box", "Arc",
+    "Rc", "Cell", "RefCell", "Mutex", "RwLock", "Path", "PathBuf", "Duration", "Instant"))  # #8069: std value types
+MAX_CHAIN_STEPS = 64  # #8069: method-chain links followed from a closure's receiver back to its root; more is unresolved
+Detacher = collections.namedtuple("Detacher", "idxs has_self inline parallel")  # one fn of a file outside the test file
 # #8056: library calls that run their closure argument inline on the calling thread (Option / Result / Iterator /
 # slice adaptors, the rusqlite row mappers, a runtime's block_on, timeout, catch_unwind). A same-file or tests/common
 # fn of the same name is judged by its own body first; with rayon in the fn none of these is trusted.
@@ -287,6 +307,7 @@ PARALLEL_ITER = re.compile(r"\brayon\b|\bpar_iter\b|\binto_par_iter\b|\bpar_brid
 CLOSURE_LET_HEAD = re.compile(r"\s*let\s+(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=;]*)?=\s*")
 CALLEE_TAIL = re.compile(r"((?:[A-Za-z_]\w*\s*::\s*)*)([A-Za-z_]\w*)\s*$")
 LOOP_HEADER = re.compile(r"\b(?:for|while|loop)\b")
+LET_BINDER = re.compile(r"\blet\s+(?:mut\s+)?$")  # text that ends right before a let-bound name
 CLOSURE_TAIL_HEAD = re.compile(r"(?:async\s+)?(?:move\s+)?\|[^|]*\|")  # a closure head: its tail value is what it returns
 CALL_OPENER = re.compile(r"\s*\)\s*\(")
 USE_ALIAS = re.compile(r"\b([A-Za-z_]\w*)\s+as\s+([A-Za-z_]\w*)")
@@ -530,8 +551,9 @@ def closure_literals(body):
         else:
             if tok in ("|", "||"):
                 prev = body[:m.start()].rstrip()
-                if prev and (prev[-1] not in CLOSURE_PREV or prev[-2:] in ("==", "!=", "<=", ">=")) \
-                        and not prev.endswith("=>") and not re.search(r"\breturn$", prev):
+                if prev and (prev[-1] not in CLOSURE_PREV or prev[-2:] in ("==", "!=", "<=", ">=", "&&")) \
+                        and not prev.endswith("=>") and not re.search(r"\breturn$", prev) \
+                        and not BORROW_MUT.search(prev):
                     continue
             pend = m.end() if tok.endswith("||") else body.find("|", m.end()) + 1
             if pend <= 0:
@@ -544,6 +566,31 @@ def closure_literals(body):
         end = match_brace(body, bstart) if body[bstart:bstart + 1] == "{" else expr_end(body, bstart)
         out.append((m.start(), end))
     return out
+
+
+def open_group(body, close_idx):
+    """Index of the `(` / `[` matched by the `)` / `]` at close_idx, or -1 (#8069)."""
+    depth = 0
+    for j in range(close_idx, -1, -1):
+        if body[j] in ")]":
+            depth += 1
+        elif body[j] in "([":
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
+
+
+def scope_uses(body, name, start):
+    """Matches of the identifier `name` after body[start] within the scope of a value bound at start: up to the end
+    of the enclosing block, or of the statement that re-binds the name (#8056, #8066). Paths and fields excluded."""
+    esc = re.escape(name)
+    limit = match_brace(body, scope_open(body, start))
+    shadow = re.compile(r"\blet\s+(?:mut\s+)?%s\b" % esc).search(body, start, limit)
+    if shadow:
+        limit = stmt_end(body, shadow.end())
+    return [um for um in re.finditer(r"(?<![\w.:])%s\b(?!\s*::)" % esc, body[:limit])
+            if um.start() >= start and not (shadow and um.start() == shadow.end() - len(name))]
 
 
 def loop_end(body, pos):
@@ -662,6 +709,24 @@ def impl_type(header):
     return m.group(0) if m else None
 
 
+def fn_body_open(text, pos):
+    """Index of the `{` that opens the body of the fn whose name ends at pos, or -1 for a declaration without a body
+    (a trait item ending in `;`). A `;` inside `[..]` / `(..)`, as in a `-> [T; 5]` return type, does not end the
+    signature (#8065: such a helper was invisible to the gate, so its callers' closures could not be proven inline)."""
+    depth = 0
+    for j in range(pos, len(text)):
+        ch = text[j]
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif depth <= 0 and ch == "{":
+            return j
+        elif depth <= 0 and ch == ";":
+            return -1
+    return -1
+
+
 def parse_fns(scrubbed):
     """Return every fn item of scrubbed source with its enclosing mods and impl type."""
     blocks = []
@@ -681,9 +746,8 @@ def parse_fns(scrubbed):
         start = max(scrubbed.rfind(";", 0, m.start()), scrubbed.rfind("}", 0, m.start()),
                     scrubbed.rfind("{", 0, m.start())) + 1
         attrs = scrubbed[start:m.start()]
-        brace = scrubbed.find("{", m.end())
-        semi = scrubbed.find(";", m.end())
-        if brace < 0 or (0 <= semi < brace):
+        brace = fn_body_open(scrubbed, m.end())
+        if brace < 0:
             continue
         mods = [b[3] for b in blocks if b[2] == "mod" and b[0] < m.start() < b[1]]
         owners = [b[3] for b in blocks if b[2] == "impl" and b[0] < m.start() < b[1]]
@@ -1310,6 +1374,11 @@ class FileModel:
         for um in USE_ITEM.finditer(scrubbed):
             for orig, alias in USE_ALIAS.findall(um.group(0)):
                 self.aliases.setdefault(alias, orig)
+        self.inline_imports = set()  # #8068: names imported from a known inline-runner root (`use std::panic::catch_unwind`)
+        for um in USE_ITEM.finditer(scrubbed):
+            words = IDENT.findall(um.group(0))
+            if len(words) > 1 and words[1] in INLINE_ROOTS:
+                self.inline_imports.update(words[1:])
         self.dm = mutation_re(use_aliases(scrubbed))
         scrubbed = blank_use_items(scrubbed)
         self.src = (Source(raw, self.common.src_consts) if raw is not None and len(raw) == len(scrubbed)
@@ -1336,6 +1405,10 @@ class FileModel:
         self._detached, self._lits = {}, {}
         self._encl, self._viol, self._ip_only = {}, {}, {}
         self._close_detachers(macro_bodies)
+        self.inline = {}  # #8065: id(fn) -> indices of the parameters the fn PROVABLY only calls on its own thread
+        self.parallel = set()  # #8069: id(fn) of the fns whose body (or a callee's) builds a parallel iterator
+        self._fn_lits = {}
+        self._close_inline()
         self.blamed = set()
         self.callers = {id(f): [] for f in self.fns}
         for f in self.fns:
@@ -1636,7 +1709,7 @@ class FileModel:
             args = None
             hits = [(self.helpers.get(id(c), ()), c.has_self) for c in cands]
             if not cands:
-                hits += self.external_helpers(m.group(1), m.group(2), method)
+                hits += [(h.idxs, h.has_self) for h in self.external_helpers(m.group(1), m.group(2), method)]
             for idxs, has_self in hits:
                 for i in idxs:
                     args = split_top_level(body, m.end(), match_paren(body, m.end() - 1) - 1) if args is None else args
@@ -1671,8 +1744,8 @@ class FileModel:
 
     def literal_spans(self, fn):
         """[(start, end)] of every closure or async-block literal of fn that runs detached (#8056): ALL of them
-        unless one is provably on the same thread, which only two canonical shapes (plus a known callee that
-        does not spawn that argument) prove. Never credits."""
+        unless one is PROVEN to run on this thread (see same_thread): credit is positive proof, never the mere
+        absence of a spawn. Never credits otherwise."""
         if id(fn) in self._lits:
             return self._lits[id(fn)]
         body = fn.body
@@ -1685,61 +1758,231 @@ class FileModel:
         self._lits[id(fn)] = out
         return out
 
+    def lits(self, fn):
+        """closure_literals of fn, cached."""
+        if id(fn) not in self._fn_lits:
+            self._fn_lits[id(fn)] = closure_literals(fn.body)
+        return self._fn_lits[id(fn)]
+
     def same_thread(self, fn, lits, n):
-        """True when literal lits[n] of fn is a canonical same-thread closure (#8056): (1) invoked in place,
-        `(|| ..)()`; (2) `let name = <literal>;` whose every later use in its scope is a direct call `name(..)`
-        outside every other closure literal; (3) the whole argument of a known callee (same-file fn,
-        tests/common fn or module fn, alias or nested path resolved) that does not hand that argument to a
-        spawn. Anything else (Box::new, Some, a struct field, vec!, a method call, an unknown callee, an
-        assignment, a loop, a return, another closure) is detached."""
+        """True when literal lits[n] of fn is PROVEN to run on this thread before fn returns (#8056, #8065, #8066).
+        Exactly these shapes: (1) invoked in place, `(|| ..)()`; (2) `let name = <literal>;` whose every later use in
+        its scope is a direct call `name(..)` outside every other closure literal; (3) the tail value of a
+        same-thread closure whose own value is consumed in place (`mk()()`, or `let v = mk();` that is only
+        called; an async block only when awaited); (4) the whole argument of a callee that provably runs it inline
+        (arg_inline). Anything else is detached."""
         body, (s, e) = fn.body, lits[n]
         if body[:s].rstrip().endswith("(") and CALL_OPENER.match(body, e):
             return True
-        prefix = stmt_prefix(body, s)
-        head = CLOSURE_LET_HEAD.fullmatch(prefix)
+        head = CLOSURE_LET_HEAD.fullmatch(stmt_prefix(body, s))
         if head and body[e:].lstrip().startswith(";"):
-            name, esc = head.group(1), re.escape(head.group(1))
-            limit = match_brace(body, scope_open(body, s))
-            shadow = re.compile(r"\blet\s+(?:mut\s+)?%s\b" % esc).search(body, e, limit)
-            if shadow:
-                limit = stmt_end(body, shadow.end())
-            for um in re.finditer(r"(?<![\w.:])%s\b(?!\s*::)" % esc, body[:limit]):
-                if um.start() < e or (shadow and um.start() == shadow.end() - len(name)):
-                    continue
-                if not re.match(r"\s*\(", body[um.end():]):
-                    return False
-                if any(x <= um.start() < y for k, (x, y) in enumerate(lits) if k != n and not (x <= s and e <= y)):
-                    return False
-            return True
+            return self.only_called(body, lits, head.group(1), e, (s, e))
         for k, (ks, ke) in enumerate(lits):
             if k != n and ks < s and e <= ke and body[e:ke].strip() in ("", "}") and CLOSURE_TAIL_HEAD.match(body, ks):
-                return self.same_thread(fn, lits, k)  # #8056: the value a same-thread closure returns
-        return self.known_callee_arg(fn, s, e)
+                return self.same_thread(fn, lits, k) and self.value_inline(fn, lits, k, body.startswith("async", s))
+        return self.arg_inline(fn, s, e)
 
-    def known_callee_arg(self, fn, a, b):
-        """True when body[a:b] is a whole argument of a call whose callee is known and does not spawn it (#8056,
-        #8059, #8060): a same-file fn, or one in tests/common or a module file, found by name, alias or path."""
-        slot = arg_slot(fn.body, a, b)
-        tail = CALLEE_TAIL.search(fn.body, 0, slot[0]) if slot else None
+    @staticmethod
+    def only_called(body, lits, name, start, anchor, awaited=False):
+        """True when every use of `name` after start in its scope is a direct call `name(..)` (`name.await` when
+        awaited) outside every closure literal that does not enclose anchor (#8056, #8066)."""
+        for um in scope_uses(body, name, start):
+            if not re.match(r"\s*\.\s*await\b" if awaited else r"\s*\(", body[um.end():]):
+                return False
+            if any(x <= um.start() < y for x, y in lits if not (x <= anchor[0] and anchor[1] <= y)):
+                return False
+        return True
+
+    def value_inline(self, fn, lits, k, is_async):
+        """True when the value that closure lits[k] returns is consumed in place at every call of lits[k] (#8066):
+        `mk()()` or `let v = mk(); v();`, or `.await` for an async block. lits[k] must itself be invoked in place or
+        be a plain `let` that is only called; a value passed on in any other way is detached."""
+        body, (ks, ke) = fn.body, lits[k]
+        calls, opener = [], CALL_OPENER.match(body, ke)
+        if body[:ks].rstrip().endswith("(") and opener:
+            calls.append((len(body[:ks].rstrip()) - 1, match_paren(body, opener.end() - 1)))
+        else:
+            head = CLOSURE_LET_HEAD.fullmatch(stmt_prefix(body, ks))
+            if not (head and body[ke:].lstrip().startswith(";")):
+                return False
+            for um in scope_uses(body, head.group(1), ke):
+                op = body.find("(", um.end())
+                if not re.match(r"\s*\(", body[um.end():]) or op < 0:
+                    return False
+                calls.append((um.start(), match_paren(body, op)))
+        return all(self.value_consumed(fn, lits, call, is_async) for call in calls)
+
+    def value_consumed(self, fn, lits, call, is_async):
+        """True when the call expression body[call[0]:call[1]] yields a closure that is invoked (an async block:
+        awaited) right there, or bound by a plain `let v = <call>;` that is only ever called (awaited)."""
+        body, (cs, ce) = fn.body, call
+        rest = body[ce:]
+        if re.match(r"\s*\.\s*await\b" if is_async else r"\s*\(", rest):
+            return True
+        head = CLOSURE_LET_HEAD.fullmatch(stmt_prefix(body, cs))
+        return bool(head and rest.lstrip().startswith(";")
+                    and self.only_called(body, lits, head.group(1), ce, call, is_async))
+
+    def rooted(self, segs, name):
+        """True when the path segs + name is rooted at a known inline-runner crate or a name imported from one (#8068)."""
+        if segs:
+            first = self.aliases.get(segs[0], segs[0])
+            return first in INLINE_ROOTS or first in self.inline_imports
+        return name in self.inline_imports
+
+    def arg_inline(self, fn, a, b):
+        """True when body[a:b] is a whole call argument that the callee PROVABLY runs on this thread (#8065, #8068,
+        #8069). A resolved callee (same file, tests/common, module, alias or nested path) must have that parameter
+        in its inline-only set (see param_inline); an unresolved one is trusted only as a known inline runner named
+        by its FULL path (INLINE_ROOTS) or as a method of a receiver whose chain roots in a local, a literal, a std
+        path or a callee that builds no parallel iterator. An unresolved free function is detached."""
+        body = fn.body
+        slot = arg_slot(body, a, b)
+        tail = CALLEE_TAIL.search(body, 0, slot[0]) if slot else None
         if tail is None or tail.group(2) in ("if", "while", "match", "for", "return"):
             return False
-        before = fn.body[:tail.start()].rstrip()
+        before = body[:tail.start()].rstrip()
         if re.search(r"\bfn$", before) or before.endswith("!"):
             return False
+        prefix, name = tail.group(1), tail.group(2)
         method = before.endswith(".")
         if method:
-            cands = self.by_method.get(tail.group(2), [])
+            cands = self.by_method.get(name, [])
         else:
-            hit = self.resolve(fn.owner, tail.group(1), tail.group(2))
+            hit = self.resolve(fn.owner, prefix, name)
             cands = [hit] if hit is not None else []
-        hits = [(self.helpers.get(id(c), ()), c.has_self) for c in cands]
+        facts = [(self.inline.get(id(c), EMPTY), c.has_self) for c in cands]
         if not cands:
-            hits = self.external_helpers(tail.group(1), tail.group(2), method)
-        if not hits:
-            return tail.group(2) in SAME_THREAD_CALLEES and not PARALLEL_ITER.search(fn.body)
-        return all(
-            slot[1] - (0 if method or not has_self else 1) >= 0
-            and slot[1] - (0 if method or not has_self else 1) not in idxs for idxs, has_self in hits)
+            facts = [(h.inline, h.has_self) for h in self.external_helpers(prefix, name, method)]
+        if facts:
+            return all(
+                slot[1] - (0 if method or not has_self else 1) >= 0
+                and slot[1] - (0 if method or not has_self else 1) in idxs for idxs, has_self in facts)
+        if PARALLEL_ITER.search(body):
+            return False
+        segs = path_segments(prefix)
+        if name in WRAPPER_CALLEES and not method:
+            return self.rooted(segs, name) and self.arg_inline(fn, tail.start(), match_paren(body, slot[0]))
+        if self.aliases.get(name, name) not in SAME_THREAD_CALLEES:
+            return False
+        return self.receiver_ok(fn, len(before) - 1) if method else self.rooted(segs, name)
+
+    def receiver_ok(self, fn, dot):
+        """True when the method chain that ends at the `.` at index dot roots in a local binding, a literal, a
+        macro, a std path or a callee that builds no parallel iterator (#8069). The chain is walked back link by
+        link (MAX_CHAIN_STEPS); a root call to an unresolved callee, or to one that reaches rayon, is not ok."""
+        body, end = fn.body, dot
+        for _ in range(MAX_CHAIN_STEPS):
+            head = body[:end].rstrip()
+            if not head:
+                return True
+            ch = head[-1]
+            if ch == "?":
+                end = len(head) - 1
+                continue
+            if ch in ")]":
+                op = open_group(head, len(head) - 1)
+                if op < 0:
+                    return False
+                before = head[:op].rstrip()
+                if ch == "]":
+                    if before.endswith("!"):
+                        return True
+                    end = len(before)
+                    continue
+                tail = CALLEE_TAIL.search(before)
+                if tail is None:
+                    return True
+                pre = before[:tail.start()].rstrip()
+                if pre.endswith("."):
+                    end = len(pre) - 1
+                    continue
+                return self.root_call_ok(fn, tail.group(1), tail.group(2))
+            if ch == "}":
+                return True
+            tail = CALLEE_TAIL.search(head)
+            pre = head[:tail.start()].rstrip() if tail else ""
+            if not pre.endswith("."):
+                return True
+            end = len(pre) - 1
+        return False
+
+    def root_call_ok(self, fn, prefix, name):
+        """True when a call `prefix::name(..)` that roots a receiver chain is known to build no parallel iterator (#8069)."""
+        segs = path_segments(prefix)
+        if (not segs and name in RECEIVER_CTORS) or (segs and segs[-1] in RECEIVER_STD_TYPES) \
+                or (segs and self.rooted(segs, name)) or (not segs and name in self.inline_imports):
+            return True
+        hit = self.resolve(fn.owner, prefix, name)
+        if hit is not None:
+            return id(hit) not in self.parallel
+        ext = self.external_helpers(prefix, name, False)
+        return bool(ext) and not any(h.parallel for h in ext)
+
+    def param_inline(self, fn, name, depth=0):
+        """True when EVERY use of parameter `name` in fn is a direct call `name(..)` / `(name)(..)`, a plain
+        `let q = name;` whose q is itself only used so, or a whole argument that arg_inline proves is run inline
+        (#8065). A use inside a closure literal, a shadowing binding, a return, a store or anything unclassified
+        is not inline-only: positive proof, never an absence-of-spawn guess."""
+        body, esc = fn.body, re.escape(name)
+        binds = sum(len(re.findall(pat % esc, body)) for pat in SHADOW_BINDS)
+        if depth > MAX_REBIND_HOPS or binds > (1 if depth else 0):  # an alias is bound once, by its own `let`
+            return False
+        lits = self.lits(fn)
+        for um in re.finditer(r"(?<![\w.$])(?<!::)%s\b" % esc, body):
+            u, e = um.start(), um.end()
+            rest, before = body[e:], body[:u].rstrip()
+            if depth and LET_BINDER.search(body[:u]):
+                continue  # the alias's own `let g =`
+            if re.match(r"\s*::", rest) or any(x <= u < y for x, y in lits) or before.endswith("."):
+                return False
+            if re.match(r"\s*\(", rest) or (before.endswith("(") and CALL_OPENER.match(rest)):
+                continue
+            head = CLOSURE_LET_HEAD.fullmatch(stmt_prefix(body, u))
+            if head and rest.lstrip().startswith(";") and self.param_inline(fn, head.group(1), depth + 1):
+                continue
+            if not self.arg_inline(fn, u, e):
+                return False
+        return True
+
+    def _close_inline(self):
+        """Least fixpoint of the inline-only parameter sets and the parallel-iterator set over every non-test fn of
+        the file (#8065, #8069). The sets only grow, so the loop ends; a parameter that is never proven is never
+        credited."""
+        changed = True
+        while changed:
+            changed = False
+            for f in self.fns:
+                if f.is_test:
+                    continue
+                done = self.inline.setdefault(id(f), set())
+                for i, pn in enumerate(f.params):
+                    if i not in done and pn is not None and self.param_inline(f, pn):
+                        done.add(i)
+                        changed = True
+                if id(f) not in self.parallel and self.builds_parallel(f):
+                    self.parallel.add(id(f))
+                    changed = True
+
+    def builds_parallel(self, fn):
+        """True when fn mentions a parallel iterator or calls a same-file or external fn that does (#8069)."""
+        if PARALLEL_ITER.search(fn.body):
+            return True
+        for m in CALL.finditer(fn.body):
+            before = fn.body[max(0, m.start() - CALL_WINDOW):m.start()].rstrip()
+            if re.search(r"\bfn$", before):
+                continue
+            if before.endswith("."):
+                if any(id(c) in self.parallel for c in self.by_method.get(m.group(2), [])):
+                    return True
+                continue
+            hit = self.resolve(fn.owner, m.group(1), m.group(2))
+            if hit is not None:
+                if id(hit) in self.parallel:
+                    return True
+            elif any(h.parallel for h in self.external_helpers(m.group(1), m.group(2), False)):
+                return True
+        return False
 
     def carried(self, body, a, b):
         """(spans, texts, over) for the spawn argument body[a:b] (#8051): every identifier in the argument,
@@ -2198,8 +2441,13 @@ def detaching_fns(scrubbed):
     out = {}
     for f in model.fns:
         if not f.is_test:
-            idxs, has_self = out.get(f.key, (frozenset(), False))
-            out[f.key] = (idxs | frozenset(model.helpers.get(id(f), ())), has_self or f.has_self)
+            inline = frozenset(model.inline.get(id(f), ()))
+            prev = out.get(f.key)
+            if prev is None:
+                out[f.key] = Detacher(frozenset(model.helpers.get(id(f), ())), f.has_self, inline, id(f) in model.parallel)
+            else:  # same name twice: detach if either does, credit inline only if both prove it (fail closed)
+                out[f.key] = Detacher(prev.idxs | frozenset(model.helpers.get(id(f), ())), prev.has_self or f.has_self,
+                                      prev.inline & inline, prev.parallel or id(f) in model.parallel)
     return out
 
 

@@ -1859,6 +1859,95 @@ class Issue8046(Fixture):
         self.assertEqual(self.flagged(text), set())
 
 
+class Positive(Fixture):
+    """Shared helpers of the r13 classes: a locked reader whose body is spliced in, plus tests/common files."""
+
+    OPEN = 'let _c = db::open(":memory:");'
+    LOCKED = "#[test]\nfn reader() {\n    let _l = ENV_LOCK.blocking_lock();\n    %s\n}\n"
+    DRAIN = "for g in q {\n        std::thread::spawn(g).join().unwrap();\n    }"
+
+    def check(self, body, expect=FLAGGED, head=""):
+        self.assertEqual(self.flagged(WRITER + head + self.LOCKED % body), expect)
+
+    def put_cf(self, name, text):
+        (SCRATCH / "tests" / "common").mkdir(exist_ok=True)
+        (SCRATCH / "tests" / "common" / name).write_text(text)
+
+
+class Issue8065(Positive):
+    """#8065: a callee credits a closure argument only when it provably calls it inline; one that stores or
+    returns the parameter (stash, id) hands the closure on, so it is detached."""
+
+    STASH = ("fn stash(q: &mut Vec<Box<dyn FnOnce() + Send>>, f: impl FnOnce() + Send + 'static) {\n"
+             "    q.push(Box::new(f));\n}\n")
+    ID = "fn id<F>(f: F) -> F { f }\n"
+    RUN = "fn run<F: FnOnce()>(f: F) { f() }\n"
+
+    def test_stash_then_drain_and_spawn(self):
+        self.check("let mut q = Vec::new();\n    stash(&mut q, move || { %s });\n    %s" % (self.OPEN, self.DRAIN),
+                   head=self.STASH)
+
+    def test_id_pushed_then_drained(self):
+        self.check("let mut q = Vec::new();\n    q.push(Box::new(id(move || { %s })));\n    %s" % (self.OPEN, self.DRAIN),
+                   head=self.ID)
+
+    def test_id_sent_over_a_channel_then_spawned(self):
+        self.check("let (tx, rx) = std::sync::mpsc::channel();\n    tx.send(id(move || { %s })).unwrap();\n"
+                   "    std::thread::spawn(rx.recv().unwrap()).join().unwrap();" % self.OPEN, head=self.ID)
+
+    def test_a_tests_common_helper_that_returns_its_parameter_is_detached(self):
+        self.put_cf("mod.rs", "pub fn hold<F: FnOnce() + Send>(f: F) -> F { f }\n")
+        self.check("let g = common::hold(move || { %s });\n    std::thread::spawn(g).join().unwrap();" % self.OPEN)
+
+    def test_control_helper_that_only_calls_its_parameter(self):
+        self.check("run(move || { %s });" % self.OPEN, set(), head=self.RUN)
+
+    def test_control_helper_chain_that_only_calls_its_parameter(self):
+        head = self.RUN + "fn outer<F: FnOnce()>(f: F) { run(f) }\n"
+        self.check("outer(move || { %s });" % self.OPEN, set(), head=head)
+
+    def test_control_helper_that_rebinds_and_calls(self):
+        head = "fn run<F: FnOnce()>(f: F) { let g = f; g() }\n"
+        self.check("run(move || { %s });" % self.OPEN, set(), head=head)
+
+    def test_control_plain_let_only_called(self):
+        self.check("let f = move || { %s };\n    f();" % self.OPEN, set())
+
+    def test_control_immediately_invoked(self):
+        self.check("(move || { %s })();" % self.OPEN, set())
+
+
+class Issue8066(Positive):
+    """#8066: the value a same-thread closure returns is itself a closure value: credited only when called in
+    place (`mk()()`) or bound by a plain `let v = mk();` that is only called; an async block only when awaited."""
+
+    def test_pushed_box_of_mk_then_drained(self):
+        self.check("let mk = || move || { %s };\n    let mut q = Vec::new();\n    q.push(Box::new(mk()));\n    %s"
+                   % (self.OPEN, self.DRAIN))
+
+    def test_mk_sent_over_a_channel(self):
+        self.check("let mk = || move || { %s };\n    let (tx, rx) = std::sync::mpsc::channel();\n"
+                   "    tx.send(mk()).unwrap();\n    std::thread::spawn(rx.recv().unwrap()).join().unwrap();" % self.OPEN)
+
+    def test_async_mk_pushed_then_spawned(self):
+        self.check("let mk = || async move { %s };\n    let mut q = Vec::new();\n    q.push(Box::new(mk()));\n"
+                   "    for g in q {\n        tokio::spawn(g);\n    }" % self.OPEN)
+
+    def test_option_map_closure_value_pushed(self):
+        self.check("let mut q = Vec::new();\n    q.push(Some(1).map(|_| move || { %s }).unwrap());\n    %s"
+                   % (self.OPEN, self.DRAIN))
+
+    def test_mk_value_bound_and_then_stored(self):
+        self.check("let mk = || move || { %s };\n    let v = mk();\n    let mut q = Vec::new();\n    q.push(v);\n    %s"
+                   % (self.OPEN, self.DRAIN))
+
+    def test_control_mk_invoked_in_place(self):
+        self.check("let mk = || move || { %s };\n    mk()();" % self.OPEN, set())
+
+    def test_control_mk_value_bound_and_only_called(self):
+        self.check("let mk = || move || { %s };\n    let v = mk();\n    v();" % self.OPEN, set())
+
+
 class RealTree(unittest.TestCase):
     def test_repo_matches_its_baseline(self):
         found = gate.scan_tree(REPO)
