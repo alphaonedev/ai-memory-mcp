@@ -1781,6 +1781,59 @@ class Issue8058(Fixture):
         self.check("let f0 = move || { %s };\n    for _ in 0..2 {\n        f0();\n    }" % self.OPEN, set())
 
 
+class Issue8059(Fixture):
+    """#8059: `use common::bg as detach;` resolves to the helper it names."""
+
+    OPEN = 'let _c = db::open(":memory:");'
+    BG = "pub fn bg<F: FnOnce() + Send + 'static>(f: F) { std::thread::spawn(f); }\n"
+    INLINE = "pub fn bg<F: FnOnce()>(f: F) { f() }\n"
+    LOCKED = "#[test]\nfn reader() {\n    let _l = ENV_LOCK.blocking_lock();\n    %s\n}\n"
+
+    def put_common(self, text):
+        (SCRATCH / "tests" / "common").mkdir(exist_ok=True)
+        (SCRATCH / "tests" / "common" / "mod.rs").write_text(text)
+
+    def test_aliased_detaching_helper(self):
+        self.put_common(self.BG)
+        text = "use common::bg as detach;\n" + WRITER + self.LOCKED % ("detach(move || { %s });" % self.OPEN)
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_control_aliased_inline_helper_keeps_the_lock(self):
+        self.put_common(self.INLINE)
+        text = "use common::bg as detach;\n" + WRITER + self.LOCKED % ("detach(move || { %s });" % self.OPEN)
+        self.assertEqual(self.flagged(text), set())
+
+
+class Issue8060(Fixture):
+    """#8060: nested `common::spawn::bg` paths and a common helper that calls a detacher in another common file."""
+
+    OPEN = 'let _c = db::open(":memory:");'
+    BG = "pub fn bg<F: FnOnce() + Send + 'static>(f: F) { std::thread::spawn(f); }\n"
+    INLINE = "pub fn bg<F: FnOnce()>(f: F) { f() }\n"
+    OUTER = "pub fn outer<F: FnOnce() + Send + 'static>(f: F) { super::spawn::bg(f) }\n"
+    LOCKED = "#[test]\nfn reader() {\n    let _l = ENV_LOCK.blocking_lock();\n    %s\n}\n"
+
+    def put_cf(self, name, text):
+        (SCRATCH / "tests" / "common").mkdir(exist_ok=True)
+        (SCRATCH / "tests" / "common" / name).write_text(text)
+
+    def test_nested_common_submodule_path(self):
+        self.put_cf("spawn.rs", self.BG)
+        text = WRITER + self.LOCKED % ("common::spawn::bg(move || { %s });" % self.OPEN)
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_helper_calling_a_detacher_in_another_common_file(self):
+        self.put_cf("spawn.rs", self.BG)
+        self.put_cf("outer.rs", self.OUTER)
+        text = WRITER + self.LOCKED % ("common::outer::outer(move || { %s });" % self.OPEN)
+        self.assertEqual(self.flagged(text), FLAGGED)
+
+    def test_control_nested_inline_helper_keeps_the_lock(self):
+        self.put_cf("spawn.rs", self.INLINE)
+        text = WRITER + self.LOCKED % ("common::spawn::bg(move || { %s });" % self.OPEN)
+        self.assertEqual(self.flagged(text), set())
+
+
 class Issue8046(Fixture):
     """#8046: a macro whose body invokes a detaching macro detaches the arguments of its own invocations."""
 
