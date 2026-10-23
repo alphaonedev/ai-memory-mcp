@@ -3422,7 +3422,7 @@ R20_PROBES = {
          {"tests/rt.rs": "#[macro_use]\nmod a;\n", "tests/rt/a.rs": "#[macro_use]\nmod b;\n",
           "tests/rt/a/b.rs": R19_SHADOW % "join"}),
         (R20_NEST, R20_JOIN, True,
-         {"tests/rt.rs": "#[macro_use]\nmod x { #[macro_use] mod inner; }\n", "tests/rt/inner.rs": R19_SHADOW % "join"}),
+         {"tests/rt.rs": "#[macro_use]\nmod x { #[macro_use] mod inner; }\n", "tests/rt/x/inner.rs": R19_SHADOW % "join"}),
         # controls: a nested module without a shadow, and a module file that declares itself (a cycle that terminates)
         (R20_NEST, R20_JOIN, False,
          {"tests/rt.rs": "#[macro_use]\nmod inner;\n", "tests/rt/inner.rs": "pub fn f() {}\n"}),
@@ -3491,6 +3491,26 @@ class TrustTablePins(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertIn(path, PINNED_FN_PATHS)
                 self.assertIn(path, gate.TRUSTED_FN_PATHS)
+
+
+class DepRootsParse(unittest.TestCase):
+    """REVIEW-7349-r20 G2: the line-based Cargo.toml reader maps every rename form and marks a contested name."""
+
+    def test_rename_forms_and_ambiguity(self):
+        manifest = SCRATCH / "dep-roots"
+        manifest.mkdir(parents=True, exist_ok=True)
+        (manifest / "Cargo.toml").write_text(
+            '[package]\nname = "x"\n[dependencies]\ntk = { package = "tokio", version = "1" }\n'
+            'fu.package = "other-crate"\nplain = "1"\nsame = { version = "1" }\n'
+            '[dev-dependencies.tk2]\npackage = "tokio"\n'
+            '[build-dependencies]\ntk = { package = "tokio-util" }\n'
+        )
+        roots = gate.CommonModel._dep_roots(manifest)
+        self.assertEqual(roots["fu"], "other_crate")
+        self.assertEqual(roots["tk2"], "tokio")
+        self.assertEqual(roots["tk"], gate.DEP_AMBIGUOUS)
+        for name in ("plain", "same"):
+            self.assertNotIn(name, roots)
 
 
 class RuleProbes(Positive):

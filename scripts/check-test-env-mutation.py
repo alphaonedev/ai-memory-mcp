@@ -465,6 +465,13 @@ FILE_ROOTS = frozenset(("crate", "self", "super"))  # import roots inside the te
 ANY_METHOD = None  # a method provider whose method set is unknown: it may supply any method name
 CARGO_MANIFEST = "Cargo.toml"  # the manifest whose [package] name is the crate the tests import as a path root
 PACKAGE_NAME = re.compile(r'(?ms)^\[package\][^\[]*?^name\s*=\s*"([^"]+)"')
+DEP_HEADER = re.compile(r"""^\[\s*(?:.*\.)?(?:dev-|build-)?dependencies(?:\.([\w'"-]+))?\s*\]""")  # r14 (G2): a dependency table
+DEP_ENTRY = re.compile(r"""^["']?([\w-]+)["']?\s*=\s*(.*)$""")  # `name = <value>` of a dependency table
+DEP_DOTTED_PACKAGE = re.compile(r"""^["']?([\w-]+)["']?\.package\s*=\s*"([^"]+)\"""")  # `name.package = "x"`
+DEP_PACKAGE = re.compile(r'\bpackage\s*=\s*"([^"]+)"')  # the `package = "x"` key of an inline table or a [dependencies.name] table
+DEP_QUOTES = "'\""  # the quote characters TOML allows around a dependency name
+DEP_AMBIGUOUS = "?"  # r14 (G2): the real crate of a dependency name that two tables point at different crates; trusted by no table
+INLINE_MOD = re.compile(r"(?<![\w$])mod\s+([A-Za-z_]\w*)\s*\{")  # r14 (G3): an inline module and its opening brace
 SRC_TRAIT = re.compile(r"(?<![\w$])trait\s+([A-Za-z_]\w*)[^{;]*\{")  # a trait declaration of src/ and its body
 SRC_TYPE = re.compile(r"(?<![\w$])(?:struct|enum|union|type)\s+([A-Za-z_]\w*)")  # a src/ type that is not a trait
 FN_NAME = re.compile(r"(?<![\w$])fn\s+([A-Za-z_]\w*)")  # every fn a trait body declares (nested ones included)
@@ -1962,6 +1969,72 @@ class Source:
         return set(STR_LIT.findall(self.raw[fn.offset + open_idx:fn.offset + end])) or {ANY_VAR}
 
 
+TRAIT_WORD = re.compile(r"(?<![\w$])trait\b")  # r14 (G1): a macro_rules! body that declares a trait
+MAX_ALIAS_PASSES = 16  # r14 (G1): re-export alias levels followed from a trait name; a longer chain stays unresolved
+
+
+def merge_methods(a, b):
+    """The union of two method-name sets where ANY_METHOD (unknown, may be any method) absorbs the other (r14, G1)."""
+    return ANY_METHOD if a is ANY_METHOD or b is ANY_METHOD else a | b
+
+
+def trait_fns(body):
+    """The method names a trait body declares, ANY_METHOD when an item-level macro invocation (`mk_fn!();`) can generate
+    fns the text does not show (r14, G1). A macro call inside a default method body generates no trait item."""
+    top, depth = [], 0
+    for ch in body:
+        if ch == "}":
+            depth -= 1
+        top.append(ch if depth <= 0 else " ")
+        if ch == "{":
+            depth += 1
+    return ANY_METHOD if MACRO_CALL.search("".join(top)) else frozenset(FN_NAME.findall(body))
+
+
+def trait_generators(text):
+    """The macro_rules! names whose body declares a trait (r14, G1): each invocation names the traits it generates."""
+    return {m.group(1) for m in MACRO_RULES.finditer(text) if TRAIT_WORD.search(text[m.end():match_brace(text, m.end() - 1)])}
+
+
+class ItemIndex:
+    """What the crate's source texts define, decided from the definitions and never from a name's spelling (r14, G1):
+    `traits` maps a trait name to the methods it may supply (ANY_METHOD when unknown) and `types` holds the struct /
+    enum / union / type names. A name counts as a trait when a `trait` item declares it, when a macro_rules! that
+    declares a trait is invoked with it, or when a re-export alias (`pub use path::Real as Name;`) renames a trait,
+    whatever else shares the name (a struct of another module never hides it)."""
+
+    def __init__(self, generators=()):
+        self.generators = set(generators)  # macro_rules! names, from the whole crate, that declare a trait
+        self.traits, self.types, self.aliases = {}, set(), []
+
+    def add_trait(self, name, methods):
+        self.traits[name] = merge_methods(self.traits[name], methods) if name in self.traits else methods
+
+    def add(self, text):
+        """Index one scrubbed source text."""
+        for m in SRC_TRAIT.finditer(text):
+            self.add_trait(m.group(1), trait_fns(text[m.end():match_brace(text, m.end() - 1)]))
+        self.types.update(SRC_TYPE.findall(text))
+        for gen in self.generators | trait_generators(text):
+            for m in re.finditer(r"(?<![\w$])%s\s*!\s*[({\[]" % re.escape(gen), text):
+                for ident in IDENT.findall(text[m.end():match_paren(text, m.end() - 1)]):
+                    self.add_trait(ident, ANY_METHOD)
+        for um in USE_ITEM.finditer(text):
+            self.aliases.extend((name, path[-1]) for path, name in use_leaves(um.group(0))
+                                if name not in (None, "_") and name != path[-1])
+
+    def close(self):
+        """Resolve the aliases to a fixpoint (bounded by MAX_ALIAS_PASSES); returns self."""
+        for _ in range(MAX_ALIAS_PASSES):
+            before = {k: v for k, v in self.traits.items()}
+            for name, target in self.aliases:
+                if target in self.traits:
+                    self.add_trait(name, self.traits[target])
+            if before == self.traits:
+                break
+        return self
+
+
 class CommonModel:
     """tests/common census: free fns that reach a strong reader, and the vars each helper writes."""
 
@@ -1979,6 +2052,7 @@ class CommonModel:
         # r13 (#8155, #8157): the crate the tests import (its [package] name), and per src/ trait name the methods it
         # declares; src_types holds the struct / enum / union / type names, which never supply a method
         self.crate_name, self.src_traits, self.src_types = self._src_items(root)
+        self.dep_roots = self._dep_roots(root)  # r14 (G2): Cargo.toml `package =` renames: dependency name -> crate
         base = pathlib.Path(root) / COMMON_REL if root is not None else None
         if base is None or not base.is_dir():
             return
@@ -2028,39 +2102,111 @@ class CommonModel:
             crate_name = m.group(1).replace("-", "_") if m else None
         except OSError:
             crate_name = None
-        traits, types = {}, set()
         base = root / SRC_REL
         if not base.is_dir():
-            return crate_name, traits, types
-        for path in sorted(base.rglob("*.rs")):
-            text = scrub(path.read_text(encoding="utf-8", errors="replace"))
-            for m in SRC_TRAIT.finditer(text):
-                body = text[m.end():match_brace(text, m.end() - 1)]
-                traits.setdefault(m.group(1), set()).update(FN_NAME.findall(body))
-            types.update(SRC_TYPE.findall(text))
-        return crate_name, {name: frozenset(names) for name, names in traits.items()}, types
+            return crate_name, {}, set()
+        files = sorted(base.rglob("*.rs"))
+        generators = set()  # first pass: every macro_rules! of the crate that declares a trait
+        for path in files:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+            if "macro_rules" in raw and "trait" in raw:
+                generators |= trait_generators(scrub(raw))
+        index = ItemIndex(generators)
+        for path in files:
+            index.add(scrub(path.read_text(encoding="utf-8", errors="replace")))
+        index.close()
+        return crate_name, dict(index.traits), index.types
+
+    @staticmethod
+    def _dep_roots(root):
+        """{dependency name: the crate it really is} for the renamed dependencies of Cargo.toml (r14, G2). Stdlib
+        `tomllib` is not in Python 3.9, so this reads the manifest line by line: a `[dependencies]`,
+        `[dev-dependencies]`, `[build-dependencies]`, `[workspace.dependencies]` or `[target.<cfg>.dependencies]` table
+        holding `name = { package = "x", .. }` or `name.package = "x"`, and a `[dependencies.name]` table holding
+        `package = "x"`. Names read `-` as `_`. A name that two tables point at different crates maps to DEP_AMBIGUOUS,
+        which no trust table lists; a name that every entry leaves as itself is not renamed and is left out."""
+        if root is None:
+            return {}
+        try:
+            lines = (pathlib.Path(root) / CARGO_MANIFEST).read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return {}
+        seen, table, entry = {}, False, None  # name -> set of real crates; in a dependency table; in [dependencies.name]
+        for line in lines:
+            line = line.strip()
+            if line.startswith("["):
+                m = DEP_HEADER.match(line)
+                table = bool(m) and not m.group(1)
+                entry = m.group(1).strip(DEP_QUOTES).replace("-", "_") if m and m.group(1) else None
+                if entry:
+                    seen.setdefault(entry, set()).add(entry)
+                continue
+            if entry:
+                m = DEP_PACKAGE.match(line)
+                if m:
+                    seen[entry].discard(entry)
+                    seen[entry].add(m.group(1).replace("-", "_"))
+            elif table:
+                dotted = DEP_DOTTED_PACKAGE.match(line)
+                if dotted:
+                    name = dotted.group(1).replace("-", "_")
+                    seen.setdefault(name, set()).add(dotted.group(2).replace("-", "_"))
+                    continue
+                m = DEP_ENTRY.match(line)
+                if m:
+                    name = m.group(1).replace("-", "_")
+                    pkg = DEP_PACKAGE.search(m.group(2))
+                    seen.setdefault(name, set()).add(pkg.group(1).replace("-", "_") if pkg else name)
+        return {name: (next(iter(real)) if len(real) == 1 else DEP_AMBIGUOUS)
+                for name, real in seen.items() if real != {name}}
 
     def module_macros(self, path, raw):
         """The macro_rules! names that the `#[path = ".."] mod m;` / `mod m;` files a test file declares define, plus
         those of tests/common (r13, #8154). A `#[macro_use]` module puts them in textual scope ahead of a `use`d
-        macro of the same name; the gate does not track which module carries the attribute, so every one counts."""
-        out, here = set(self.macro_names), pathlib.Path(path).parent
-        for m in MOD_DECL.finditer(raw):
-            if m.group(2) == "common":
-                continue
-            name = m.group(2)
-            cands = [here / m.group(1)] if m.group(1) else [here / (name + ".rs"), here / name / "mod.rs"]
-            for cand in cands:
-                if cand not in self._mod_macros:
-                    try:
-                        text = scrub(cand.read_text(encoding="utf-8", errors="replace"))
-                        self._mod_macros[cand] = set(MACRO_RULES_NAME.findall(text))
-                    except OSError:
-                        self._mod_macros[cand] = None
-                if self._mod_macros[cand] is not None:
-                    out |= self._mod_macros[cand]
-                    break
+        macro of the same name; the gate does not track which module carries the attribute, so every one counts. The
+        walk is transitive (r14, G3): every `mod x;` that a module file declares, at any depth and inside any inline
+        `mod y { .. }`, is read in turn; a file read once is not read again, so a cycle ends."""
+        out, seen = set(self.macro_names), set()
+        for rel, name, base in self._mod_decls(raw, pathlib.Path(path).parent, pathlib.Path(path).parent):
+            if name != "common":
+                out |= self._mod_file_macros(rel, name, base, seen)
         return out
+
+    @staticmethod
+    def _mod_decls(raw, base, path_base):
+        """[(path attribute or None, module name, directory it is declared relative to)] for each `mod m;` of raw. The
+        directory is base (or path_base for a `#[path]` attribute) plus the name of every inline `mod y { .. }` that
+        encloses the declaration (r14, G3)."""
+        scrubbed, out = scrub(raw), []
+        for m in MOD_DECL.finditer(raw):
+            here = path_base if m.group(1) else base
+            for inline in INLINE_MOD.finditer(scrubbed, 0, m.start()):
+                if match_brace(scrubbed, inline.end() - 1) > m.start():
+                    here = here / inline.group(1)
+            out.append((m.group(1), m.group(2), here))
+        return out
+
+    def _mod_file_macros(self, rel, name, base, seen):
+        """The macro_rules! names of the module file that `mod name;` declares and of every module file below it."""
+        cands = [base / rel] if rel else [base / (name + ".rs"), base / name / "mod.rs"]
+        for cand in cands:
+            if cand not in self._mod_macros:
+                try:
+                    text = cand.read_text(encoding="utf-8", errors="replace")
+                    self._mod_macros[cand] = (set(MACRO_RULES_NAME.findall(scrub(text))), text)
+                except OSError:
+                    self._mod_macros[cand] = None
+            if self._mod_macros[cand] is None:
+                continue
+            if cand in seen:
+                return set()
+            seen.add(cand)
+            out, text = set(self._mod_macros[cand][0]), self._mod_macros[cand][1]
+            below = cand.parent if cand.name == "mod.rs" else cand.parent / cand.stem
+            for crel, cname, cbase in self._mod_decls(text, below, cand.parent):
+                out |= self._mod_file_macros(crel, cname, cbase, seen)
+            return out
+        return set()
 
     def path_modules(self, path, raw):
         """{module name: detaching_fns} for the `#[path = ".."] mod m;` and `mod m;` files a test file declares
@@ -2736,8 +2882,16 @@ class FileModel:
             return self.resolve_extern(tuple(self.import_paths[first]) + tuple(segs[1:]))
         if kind is not None:
             return None
-        full = tuple(segs)
+        full = self.rename_root(segs)
         return full if full[0] in INLINE_ROOTS else None
+
+    def rename_root(self, path):
+        """path with its first segment replaced by the crate Cargo.toml says that dependency name is (r14, G2): a
+        `tk = { package = "tokio" }` root is tokio, a `futures = { package = "other" }` root is NOT futures. Every
+        root is mapped before any INLINE_ROOTS or allowlist test, so a name never vouches for a crate."""
+        path = tuple(path)
+        real = self.common.dep_roots.get(path[0]) if path else None
+        return (real,) + path[1:] if real else path
 
     @origin_rule
     def type_runtime(self, text):
@@ -2980,6 +3134,7 @@ class FileModel:
         traits = trait_positions(text)  # an imported name used as a bound / impl target keeps its methods in scope
         # r13 (#8155): every in-scope non-std method provider: a glob (ANY_METHOD) or an import that may be a trait,
         # with the method names it may supply (method_path); trait_risk is "some provider exists"
+        self._with_uses, self._local_index = with_uses, None  # r14 (G1): the text local_index reads, and its cache
         self.providers = [ANY_METHOD] * len(self.foreign_globs)
         for path, name in imported:
             supplied = self.provider(self.resolve_extern(path), name, text, traits)
@@ -2988,40 +3143,55 @@ class FileModel:
         self.trait_risk = bool(self.providers)
 
     def resolve_extern(self, path):
-        """path with an `extern crate X as A;` alias at its head replaced by X (r13, #8156)."""
+        """path with an `extern crate X as A;` alias at its head replaced by X (r13, #8156) and its root mapped through the
+        Cargo.toml renames (r14, G2)."""
         path = tuple(path)
         if path and path[0] in self.extern_paths:
-            return tuple(self.extern_paths[path[0]]) + path[1:]
-        return path
+            path = tuple(self.extern_paths[path[0]]) + path[1:]
+        return self.rename_root(path)
 
     def provider(self, path, name, text, traits):
         """The method names the non-std import `path` (bound as name) may supply on a receiver of another crate
-        (r13, #8155, #8157): frozenset() when it supplies none, ANY_METHOD when it may supply any. A trait of
-        KNOWN_TRAIT_METHODS supplies its listed methods; a lowercase leaf is a module or a fn (rustc's
-        non_camel_case_types, denied by -D warnings) and supplies none; a trait of this crate's src/ supplies the
-        methods it declares, a src/ type that is no trait supplies none; any other name supplies none only when the
+        (r13, #8155, #8157; r14, G1): frozenset() when it supplies none, ANY_METHOD when it may supply any. A trait of
+        KNOWN_TRAIT_METHODS supplies its listed methods. A path into the test crate or into this crate's src/ is
+        decided from the RESOLVED definition (ItemIndex): a `trait` item, a macro-generated trait or a re-export alias
+        of a trait supplies the methods it may declare (ANY_METHOD when a macro generates some), whatever its spelling
+        and whatever struct shares the name; a src/ type that is no trait supplies none. Only a path that no index
+        can resolve falls back to the spelling: a lowercase leaf of another crate is a module or a fn (rustc's
+        non_camel_case_types, denied by -D warnings) and supplies none; any other name supplies none only when the
         file uses it as a value, a plain type or a constructor, never names it as a bound or an impl target, and did
         not import it `as _`. A `Name::f` path root proves no type use (a UFCS trait call is spelled the same)."""
         if path in KNOWN_TRAIT_METHODS:
             return KNOWN_TRAIT_METHODS[path]
-        leaf = path[-1]
-        if leaf[:1].islower() or path in KNOWN_FOREIGN_TYPES:
-            return frozenset()
-        common = self.common
+        leaf, common = path[-1], self.common
         if path[0] in FILE_ROOTS:  # an item of the test crate: a trait of the file supplies the fns it declares
-            own = [m for m in SRC_TRAIT.finditer(text) if m.group(1) == leaf]
-            if own:
-                return frozenset(n for m in own for n in FN_NAME.findall(text[m.end():match_brace(text, m.end() - 1)]))
-            if leaf in SRC_TYPE.findall(text):
-                return frozenset()
+            own = self.local_index()
         elif common.crate_name is not None and path[0] == common.crate_name:
+            own = None
             if leaf in common.src_traits:
                 return common.src_traits[leaf]
             if leaf in common.src_types:
                 return frozenset()
+        else:
+            own = None
+        if own is not None:
+            if leaf in own.traits:
+                return own.traits[leaf]
+            if leaf in own.types:
+                return frozenset()
+        if leaf[:1].islower() or path in KNOWN_FOREIGN_TYPES:
+            return frozenset()
         if name != "_" and name not in traits and self.type_use(name, text):
             return frozenset()
         return ANY_METHOD
+
+    def local_index(self):
+        """The ItemIndex of this file's own text, its `use` items included (r14, G1), built once."""
+        if self._local_index is None:
+            index = ItemIndex(trait_generators(self._with_uses))
+            index.add(self._with_uses)
+            self._local_index = index.close()
+        return self._local_index
 
     @staticmethod
     def type_use(name, text):
