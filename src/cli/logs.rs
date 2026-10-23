@@ -446,18 +446,20 @@ fn tail_then_offset_with(
 /// Read the lines at or after `offset` from an open handle. A trailing
 /// fragment without its newline is left for the next poll so no line is printed
 /// in two halves, unless `flush_tail` is set (the file is being abandoned, so
-/// no newline will ever follow). Returns the lines and the offset just past the
-/// last byte consumed.
+/// no newline will ever follow). Each decoded line goes to `sink` as it is
+/// read, so memory stays constant however much is unread (#8064); a sink error
+/// ends the read and is returned. Returns the offset just past the last byte
+/// consumed.
 fn read_lines_from_handle(
     file: &mut fs::File,
     offset: u64,
     flush_tail: bool,
-) -> Result<(Vec<String>, u64)> {
+    sink: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<u64> {
     use std::io::Seek as _;
     use std::io::SeekFrom;
     file.seek(SeekFrom::Start(offset))?;
     let mut reader = BufReader::new(file);
-    let mut lines = Vec::new();
     let mut end = offset;
     let mut raw: Vec<u8> = Vec::new();
     loop {
@@ -471,9 +473,9 @@ fn read_lines_from_handle(
         // `read_line` validates UTF-8 before the held-fragment check and a
         // fragment ending inside a multi-byte character would abort the
         // command (#8006); bytes are decoded only once the newline is in.
-        lines.push(strip_line_end(&String::from_utf8_lossy(&raw)).to_string());
+        sink(strip_line_end(&String::from_utf8_lossy(&raw)))?;
     }
-    Ok((lines, end))
+    Ok(end)
 }
 
 /// Open `path` as the followed handle.
@@ -505,12 +507,12 @@ fn drain_followed(
     if meta.len() <= state.offset {
         return Ok(());
     }
-    let (lines, end) = read_lines_from_handle(file, state.offset, flush_tail)?;
-    for line in lines {
-        if line_matches(&line, filters) {
-            emit_line(&line, filters, out)?;
+    let end = read_lines_from_handle(file, state.offset, flush_tail, &mut |line| {
+        if line_matches(line, filters) {
+            emit_line(line, filters, out)?;
         }
-    }
+        Ok(())
+    })?;
     state.offset = end;
     if let Some(file) = state.file.as_ref() {
         state.fingerprint = read_fingerprint(file, end);
@@ -1094,6 +1096,35 @@ mod tests {
         assert!(e3.contains("rotated or truncated"), "note: {e3:?}");
         let (s4, _) = poll_once(dir.path(), &mut state);
         assert_eq!(s4, "", "no duplicate: {s4:?}");
+    }
+
+    /// #8064 - `read_lines_from_handle` hands each decoded line to the sink as
+    /// it is read (constant memory), returns only the end offset, and stops at
+    /// the first sink error without reading on.
+    #[test]
+    fn read_lines_from_handle_streams_each_line_to_sink_8064() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = make_log(dir.path(), "ai-memory.log", "l1\nl2\nl3\nl4\nfrag");
+        let mut file = fs::File::open(&path).unwrap();
+        let mut seen: Vec<String> = Vec::new();
+        let end = read_lines_from_handle(&mut file, 0, false, &mut |line| {
+            seen.push(line.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec!["l1", "l2", "l3", "l4"]);
+        assert_eq!(end, 12, "fragment held, offset past the last newline");
+        let mut calls = 0_u32;
+        let err = read_lines_from_handle(&mut file, 0, false, &mut |_| {
+            calls += 1;
+            if calls == 2 {
+                anyhow::bail!("sink closed");
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("sink closed"), "{err:#}");
+        assert_eq!(calls, 2, "no line is read after the sink failed");
     }
 
     /// #8006 - a fragment that ends inside a multi-byte character is held,
