@@ -152,6 +152,17 @@ same-file fn, parameter or local; futures::executor::block_on); everything else 
 origin predicate is registered with @origin_rule (ORIGIN_RULES); the unit tests derive the rule set from the
 module's own AST, require a RED probe for each, and run a mutant of each rule (always credits, credits UNKNOWN too).
 
+Callee origin (r12, #8136 #8137 #8138 #8139). The credit side has ONE predicate too, callee_origin(segs, name, kind) ->
+STD | CRATE | UNKNOWN, used by the rules arg_inline and await_macro_arg. A macro or a free fn is trusted by its
+RESOLVED path (resolve_path: `use` items, renames, an unshadowed crate root), never by its last name segment: a join!
+or select! counts only as tokio:: / futures:: (AWAIT_MACROS holds resolved paths), a crate macro of the same name, a
+`macro_rules!` of the file and an unresolvable name are detached. A closure-taking method called directly on a root
+literal container (`vec![..].for_each(..)`, `let v = vec![..]; v.for_each(..)`) is detached while an imported non-std
+trait or glob could supply it (the container has no such inherent method). An UpperCamel name imported from a crate
+that is only ever called as a UFCS path root with one borrowed argument (`PoolExt::name(&x)`) is still a possible
+trait, so it keeps trait_risk. An async closure (`async || ..`, `|| async ..`) yields a future per CALL: it is credited
+only when every call is awaited in place or handed whole to a resolved runner (future_credited), as for an async fn.
+
 Form inventory (#8098, #8099, #8100). span_safe is a CLOSED whitelist and the ONLY decision point for a receiver:
 each expression form the tokenizer can yield has exactly one rule, a form with no rule is DETACHED, and every
 branch records its form through form() (SPAN_FORMS; the FormInventory test pins this table, the tuple, the
@@ -195,6 +206,8 @@ branches and one probe per form). Doubt is detached.
   `async_block`        an `async` block: DETACHED
   `turbofish_std`      every turbofish type is STD by type_origin (`_` allowed inside a std type)
   `turbofish_other`    a turbofish type of another crate or file (`collect::<Pool>()`): DETACHED
+  `container_trait`    a trusted closure-taking method called on a root literal container itself while an imported
+                       non-std trait or glob could supply it (`vec![1u8].for_each(..)`, r12 #8137): DETACHED
   `block_root`         a chain rooted in a block or a struct literal: DETACHED
 `&|| ..` and `&mut || ..` are closure literals (#8067). Anything else (inside Box::new, Some, a struct
 field, vec!, a tuple, a method receiver, an assignment, a return, a loop, another closure, an unresolved
@@ -389,12 +402,22 @@ RUNTIME_ROOTS = frozenset((
 RUNTIME_LINKS = frozenset((
     "new", "new_current_thread", "new_multi_thread", "build", "unwrap", "expect", "enable_all", "enable_io",
     "enable_time", "worker_threads", "thread_name", "current", "try_current", "handle", "clone"))
-RUNTIME_CRATES = frozenset(("tokio", "futures"))  # crate roots a runner path may start at when nothing shadows them
-# r11: macros that poll their future arguments on the calling task; their arguments run in place.
-AWAIT_MACROS = frozenset(("join", "try_join", "select"))
+# r12 (#8136): macros that poll their future arguments on the calling task, as RESOLVED paths. A macro is trusted only
+# when its path resolves (resolve_path: `use` items, renames, an unshadowed crate root) to one of these; a name that
+# resolves anywhere else, or that nothing resolves, is detached.
+AWAIT_MACROS = frozenset((
+    ("tokio", "join"), ("tokio", "try_join"), ("tokio", "select"),
+    ("futures", "join"), ("futures", "try_join"), ("futures", "select")))
+# r12 (#8136, #8137): the kinds of callee that callee_origin judges.
+CALLEE_MACRO, CALLEE_FN, CALLEE_METHOD = "macro", "fn", "method"
 # r11 (#8123): library fns that return a future built around their argument; a future argument is credited when
 # the wrapper call is itself driven in place. Resolved path -> index of the future argument.
 FUTURE_WRAPPERS = {("tokio", "time", "timeout"): 1}
+# r12 (#8138): `Name::lower_snake(` / `Name::lower_snake::<T>(`: a path root that calls a function. For an UpperCamel
+# imported name this is a UFCS trait call (`PoolExt::name(&x)`) as much as an associated fn, so it proves no type use.
+UFCS_ROOT = re.compile(r"\s*::\s*[a-z_]\w*\s*(?:::\s*<[^<>]*>\s*)?\(\s*&\s*(?:mut\s+)?[^(),]*\)")
+# r12 (#8139): `async [move] |..|`: an async closure, whose call yields a future that runs the body when polled.
+ASYNC_CLOSURE = re.compile(r"async\s+(?:move\s+)?\|")
 FUTURE_RET = re.compile(r"Future")  # a declared return type that names a future (impl Future, BoxFuture, Pin<Box<dyn Future>>)
 GENERIC_OWNER = re.compile(r"\b(?:(?:fn|trait|struct|enum|union|type)\s+[A-Za-z_]\w*|impl)\s*<")  # an item that declares generics
 TRAIT_RUN = re.compile(r"\b(?:impl|dyn)\b([^{};,=)]*)")  # text after impl / dyn that can name a trait
@@ -473,7 +496,7 @@ SPAN_FORMS = (
     "method_resolved", "method_other", "label_binder", "call_std", "call_resolved", "call_adt", "call_other",
     "name_local", "name_closure_param", "name_opaque", "name_param", "name_std", "name_const", "name_fn_item",
     "name_adt", "name_other", "path_std", "path_const", "path_variant", "path_other", "closure_iife", "closure_arg",
-    "closure_other", "async_block", "turbofish_std", "turbofish_other", "block_root")
+    "closure_other", "async_block", "turbofish_std", "turbofish_other", "block_root", "container_trait")
 FORM_TRACE = None  # a list while a test records the (form, ok) of every decision, else None
 
 
@@ -2018,11 +2041,6 @@ class FileModel:
         for um in USE_ITEM.finditer(scrubbed):
             for orig, alias in USE_ALIAS.findall(um.group(0)):
                 self.aliases.setdefault(alias, orig)
-        self.inline_imports = set()  # #8068: names imported from a known inline-runner root (`use std::panic::catch_unwind`)
-        for um in USE_ITEM.finditer(scrubbed):
-            words = IDENT.findall(um.group(0))
-            if len(words) > 1 and words[1] in INLINE_ROOTS:
-                self.inline_imports.update(words[1:])
         self.dm = mutation_re(use_aliases(scrubbed))
         with_uses = scrubbed  # r10: the import table is read from the text that still holds the `use` items
         scrubbed = blank_use_items(scrubbed)
@@ -2425,6 +2443,8 @@ class FileModel:
         (arg_inline). Anything else is detached."""
         body, (s, e) = fn.body, lits[n]
         is_async = bool(re.match(r"async\b", body[s:]))
+        if ASYNC_CLOSURE.match(body, s):  # r12 (#8139): `async |..| ..` yields a future per call, it is not a future itself
+            return self.async_closure_same_thread(fn, lits, (s, e))
         if body[:s].rstrip().endswith("(") and CALL_OPENER.match(body, e):
             return True
         if is_async and AWAITED.match(body, e):  # r11: an async block awaited in place
@@ -2436,6 +2456,35 @@ class FileModel:
             if k != n and ks < s and e <= ke and body[e:ke].strip() in ("", "}") and CLOSURE_TAIL_HEAD.match(body, ks):
                 return self.same_thread(fn, lits, k) and self.value_inline(fn, lits, k, body.startswith("async", s))
         return self.arg_inline(fn, s, e, is_async)
+
+    def async_closure_same_thread(self, fn, lits, span):
+        """True when the async closure literal body[span] only ever yields futures that are driven in place (r12,
+        #8139): it is invoked in place, `(async || ..)()`, or bound by a plain `let f = async || ..;` whose every use is
+        a call `f(..)`; each call yields a future that must be credited like an async fn call (future_credited). Handed
+        whole to a callee instead, it runs wherever that callee decides: arg_inline decides, as for any closure."""
+        body, (s, e) = fn.body, span
+        opener = CALL_OPENER.match(body, e)
+        if body[:s].rstrip().endswith("(") and opener:
+            return self.future_credited(fn, lits, (len(body[:s].rstrip()) - 1, match_paren(body, opener.end() - 1)))
+        head = CLOSURE_LET_HEAD.fullmatch(stmt_prefix(body, s))
+        if not (head and body[e:].lstrip().startswith(";")):
+            return self.arg_inline(fn, s, e, True)
+        for um in scope_uses(body, head.group(1), e):
+            op = body.find("(", um.end())
+            if not re.match(r"\s*\(", body[um.end():]) or op < 0:
+                return False
+            if any(x <= um.start() < y for x, y in lits if not (x <= s and e <= y)):
+                return False
+            if not self.future_credited(fn, lits, (um.start(), match_paren(body, op))):
+                return False
+        return True
+
+    def future_credited(self, fn, lits, call):
+        """True when the future that the call expression body[call[0]:call[1]] yields is driven in place: awaited, bound
+        by a `let` that is only awaited (value_consumed), the whole argument of a resolved runner or wrapper
+        (arg_inline), or an argument of a resolved join / select macro (await_macro_arg)."""
+        return (self.value_consumed(fn, lits, call, True) or self.arg_inline(fn, call[0], call[1], True)
+                or self.await_macro_arg(fn, call))
 
     @staticmethod
     def only_called(body, lits, name, start, anchor, awaited=False):
@@ -2465,6 +2514,8 @@ class FileModel:
                 if not re.match(r"\s*\(", body[um.end():]) or op < 0:
                     return False
                 calls.append((um.start(), match_paren(body, op)))
+        if is_async:  # r12 (#8139): `|| async {..}` called as `block_on(f())`: the call's future goes to a runner
+            return all(self.future_credited(fn, lits, call) for call in calls)
         return all(self.value_consumed(fn, lits, call, is_async) for call in calls)
 
     def value_consumed(self, fn, lits, call, is_async):
@@ -2478,13 +2529,27 @@ class FileModel:
         return bool(head and rest.lstrip().startswith(";")
                     and self.only_called(body, lits, head.group(1), ce, call, is_async))
 
-    def rooted(self, segs, name):
-        """True when the path segs + name is rooted at a known inline-runner crate or a name imported from one (#8068)."""
-        if segs:
-            first = self.aliases.get(segs[0], segs[0])
-            return first in INLINE_ROOTS or first in self.inline_imports
-        return name in self.inline_imports
+    def callee_origin(self, segs, name, kind):
+        """STD, CRATE or UNKNOWN for a callee that the gate would trust to run its argument on this thread (r12, #8136,
+        #8137): the ONE predicate of the credit side, as type_origin is of the classification side. A macro or a free
+        fn is judged by its RESOLVED path (resolve_path: a `use` item, a rename or an unshadowed crate root): STD when
+        it resolves into AWAIT_MACROS (macro) or under an INLINE_ROOTS crate with a SAME_THREAD_CALLEES name (fn), CRATE
+        when it resolves anywhere else, UNKNOWN when nothing resolves (a glob, a `macro_rules!` or item of the file, a
+        generic). A method is STD only when it is a SAME_THREAD_CALLEES method and no imported non-std trait or glob
+        can supply a method of that name (trait_risk, as method_origin); else UNKNOWN. Both CRATE and UNKNOWN are
+        DETACHED, so a shadow of a trusted name is never trusted."""
+        if kind == CALLEE_METHOD:
+            if name in SAME_THREAD_CALLEES and not PARALLEL_ITER.search(name):
+                return STD
+            return UNKNOWN
+        full = self.resolve_path(list(segs) + [name])
+        if full is None:
+            return UNKNOWN
+        if kind == CALLEE_MACRO:
+            return STD if full in AWAIT_MACROS else CRATE
+        return STD if full[0] in INLINE_ROOTS and full[-1] in SAME_THREAD_CALLEES else CRATE
 
+    @origin_rule
     def arg_inline(self, fn, a, b, future=False):
         """True when body[a:b] is a whole call argument that the callee PROVABLY runs on this thread (#8065, #8068,
         #8069). A resolved callee (same file, tests/common, module, alias or nested path) must have that parameter
@@ -2520,22 +2585,25 @@ class FileModel:
         if id(fn) in self.parallel or PARALLEL_ITER.search(body):  # a test fn is outside the fixpoint (#8089)
             return False
         segs = path_segments(prefix)
-        if name in WRAPPER_CALLEES and not method:
-            return self.rooted(segs, name) and self.arg_inline(fn, tail.start(), match_paren(body, slot[0]))
-        if self.aliases.get(name, name) not in SAME_THREAD_CALLEES:
-            return False
-        return self.receiver_ok(fn, len(before) - 1, elements=False) if method else self.rooted(segs, name)
+        if self.callee_origin(segs, name, CALLEE_METHOD if method else CALLEE_FN) != STD:
+            return False  # r12: the callee is trusted by its resolved path (a method: by trait_risk), never by name
+        if method:
+            return self.receiver_ok(fn, len(before) - 1, elements=False, direct=True)
+        full = self.resolve_path(segs + [name])
+        if full and full[-1] in WRAPPER_CALLEES:
+            return self.arg_inline(fn, tail.start(), match_paren(body, slot[0]))
+        return True
 
     def resolve_path(self, segs):
         """The full path that the path segs stands for (r11, #8124): a first segment imported by a `use` item
         (std or not, renames included) is replaced by the path it is imported from; a first segment that nothing in
-        the file shadows and that names a runtime crate (RUNTIME_CRATES) is itself the full path; else None."""
+        the file shadows and that names an inline-runner crate (INLINE_ROOTS) is itself the full path; else None."""
         if not segs:
             return None
         first, kind = segs[0], self.symbols.get(segs[0])
         if kind in (SYM_STD, SYM_FOREIGN) and first in self.import_paths:
             return tuple(self.import_paths[first]) + tuple(segs[1:])
-        if kind is None and first in RUNTIME_CRATES:
+        if kind is None and first in INLINE_ROOTS:
             return tuple(segs)
         return None
 
@@ -2664,18 +2732,20 @@ class FileModel:
                 continue
             start = chain_start(body, len(head) - 1) if method else m.start()
             call = (m.start() if start is None else start, match_paren(body, m.end() - 1))
-            if not (self.value_consumed(fn, self.lits(fn), call, True)
-                    or self.arg_inline(fn, call[0], call[1], True) or self.await_macro_arg(fn, call)):
+            if not self.future_credited(fn, self.lits(fn), call):
                 out.append(call)
         return out
 
+    @origin_rule
     def await_macro_arg(self, fn, call):
-        """True when body[call[0]:call[1]] is a whole argument of an AWAIT_MACROS macro (`tokio::join!`), which polls
-        it on the calling task (r11, #8123); a macro the file defines itself is not trusted."""
+        """True when body[call[0]:call[1]] is a whole argument of a macro that RESOLVES into AWAIT_MACROS
+        (`tokio::join!`, `use futures::join; join!`), which polls it on the calling task (r11, #8123; r12, #8136): the
+        macro path is resolved like a runner's, so a crate macro of the same name, a `macro_rules!` of the file and a
+        bare name nothing imports are all detached."""
         slot = arg_slot(fn.body, call[0], call[1])
         before = fn.body[:slot[0]].rstrip() if slot else ""
-        m = IDENT_END.search(before[:-1]) if before.endswith("!") else None
-        return bool(m and m.group(1) in AWAIT_MACROS and m.group(1) not in self.macro_defs)
+        m = CALLEE_TAIL.search(before[:-1]) if before.endswith("!") else None
+        return bool(m) and self.callee_origin(path_segments(m.group(1)), m.group(2), CALLEE_MACRO) == STD
 
     def scopes(self, fn):
         """ScopeMap of fn, cached."""
@@ -2766,7 +2836,19 @@ class FileModel:
         self.symbols.update({n: SYM_GENERIC for n in self.generics})
         traits = trait_positions(text)  # an imported name used as a bound / impl target keeps its methods in scope
         self.trait_risk = bool(self.foreign_globs) or any(
-            n == "_" or n in traits or not re.search(r"(?<![\w$'])%s\b" % re.escape(n), text) for n in imported)
+            n == "_" or n in traits or not self.type_use(n, text) for n in imported)
+
+    @staticmethod
+    def type_use(name, text):
+        """True when the imported name is used in text as a value, a plain type or a constructor (r12, #8138). A use
+        that only calls a function through the name as a path root (`Name::lower_snake(..)`) proves nothing for an
+        UpperCamel name: it is a UFCS call of a trait as much as an associated fn of a type, and the trait stays in scope
+        as a method provider. A lowercase name (a module, a fn) is never a trait (rustc's non_camel_case_types, denied
+        by -D warnings), so any use of it is a use."""
+        uses = [m for m in re.finditer(r"(?<![\w$'])%s\b" % re.escape(name), text)]
+        if name[:1].islower():
+            return bool(uses)
+        return any(not UFCS_ROOT.match(text, m.end()) for m in uses)
 
     def path_origin(self, segs, name=None):
         """STD, CRATE or UNKNOWN for the path segs + name, decided by its FIRST segment (r10, #8103): a name the
@@ -2857,7 +2939,7 @@ class FileModel:
             return False
         return all(n in CONTAINER_METHODS for n in re.findall(r"\.\s*([A-Za-z_]\w*)", tail))
 
-    def receiver_ok(self, fn, dot, floor=None, hops=0, elements=True):
+    def receiver_ok(self, fn, dot, floor=None, hops=0, elements=True, direct=False):
         """True when the receiver whose method chain ends at index dot has a PROVEN provenance (#8069, #8089,
         #8093, #8098-#8100). The chain's start is found by walking it back (chain_start; with floor set it is floor,
         a whole `let` initialiser). A block or a struct literal as the chain root is detached (block_root). Every
@@ -2868,10 +2950,10 @@ class FileModel:
         start = floor if floor is not None else chain_start(fn.body, dot)
         if start is None:
             return form("block_root", False)
-        return self.span_safe(fn, start, dot, hops, elements)
+        return self.span_safe(fn, start, dot, hops, elements, direct)
 
     @origin_rule
-    def span_safe(self, fn, a, b, hops, elements=True):
+    def span_safe(self, fn, a, b, hops, elements=True, direct=False):
         """True when EVERY expression form of fn.body[a:b] is whitelisted (#8093, #8098, #8099, #8100). Each token
         the tokenizer yields gets exactly one rule (a SPAN_FORMS label, recorded through form()); a form with no
         rule cannot exist, because form() refuses a label outside SPAN_FORMS. A closure literal inside the span is
@@ -2898,6 +2980,11 @@ class FileModel:
         if not elements:  # #8107: the caller needs the container only; its elements matter once the chain extracts one
             if self.container_links(text):
                 lit = self.literal_span(text)
+                if lit and self.trait_risk and direct and not re.search(r"\.\s*[A-Za-z_]", text[lit[1] + 1:]):
+                    # r12 (#8137): the callee is a method on the CONTAINER itself (`vec![..].for_each(..)`, or a plain
+                    # local that holds one), which has no such inherent method, so an imported crate trait could be the
+                    # one that runs: detached.
+                    return form("container_trait", False)
                 if lit:
                     text = text[:lit[0] + 1] + " " * (lit[1] - lit[0] - 1) + text[lit[1]:]
             else:
@@ -2923,7 +3010,8 @@ class FileModel:
             elif prefix:
                 ok = self.path_ok(fn, prefix, name)
             else:
-                ok = self.name_ok(fn, name, a + m.start(), hops, elements or m.start() != root_pos)
+                ok = self.name_ok(fn, name, a + m.start(), hops, elements or m.start() != root_pos,
+                                  direct and m.start() == root_pos and not text[m.end():].strip())
             if not ok:
                 return False
         return True
@@ -2990,7 +3078,7 @@ class FileModel:
         return form("path_other", False)
 
     @origin_rule
-    def name_ok(self, fn, name, use, hops, elements=True):
+    def name_ok(self, fn, name, use, hops, elements=True, direct=False):
         """A bare name is PROVEN safe or detached, whatever its casing (#8094, #8095, #8098): the innermost binding
         in a block still open at use wins (ScopeMap). A plain `let` is judged by its initialiser (receiver_ok, through
         at most MAX_REBIND_HOPS names); a closure parameter is safe when its closure is a whitelisted form; every other
@@ -3007,7 +3095,8 @@ class FileModel:
                 if typed is not None:  # a declared type decides: std only is the proof, anything else is detached
                     return form("name_local", typed)
                 return form("name_local", self.receiver_ok(
-                    fn, bound.init[1], floor=bound.init[0], hops=hops + 1, elements=elements or bound.per_item))
+                    fn, bound.init[1], floor=bound.init[0], hops=hops + 1, elements=elements or bound.per_item,
+                    direct=direct))
             if (bound.lo, bound.hi) in self.lit_set(fn):
                 return form("name_closure_param", self.closure_ok(fn, bound.lo, bound.hi, hops, True))
             return form("name_opaque", False)
