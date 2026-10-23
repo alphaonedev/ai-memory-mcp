@@ -9,6 +9,12 @@ use super::*;
 /// archive — gc handler not-dry-run path runs db::gc.
 #[test]
 fn chunkc_archive_gc_real_run_invokes_db_gc() {
+    chunkc_archive_gc_real_run_body();
+}
+
+/// Body of `chunkc_archive_gc_real_run_invokes_db_gc`, callable from the
+/// #8151 / #8163 isolation test on another thread.
+fn chunkc_archive_gc_real_run_body() {
     // #7321: serialise with the tests that latch the process-global audit gate.
     let _sink = crate::audit::sink_test_lock();
     let conn = db::open(std::path::Path::new(":memory:")).unwrap();
@@ -110,19 +116,19 @@ fn chunkc_archive_gc_dry_run_body() {
     assert!(payload["collected"].as_u64().unwrap() >= 1);
 }
 
-/// #7321 / #7379 / #7382 - the gc dry-run test must serialise with the
-/// tests that latch the process-global audit gate. The proof is structural
-/// and involves no latch and no wall-clock hold: this thread holds
-/// `sink_test_lock`, the gc test runs on a worker, and the worker must be
-/// seen blocked on that lock (observed through the lock's waiter registry)
-/// before it has finished. A gc test that skips the lock finishes without
-/// waiting, which fails the assertion (rust-1-98 TEST-01/TEST-02).
-#[test]
-fn chunkc_archive_gc_dry_run_ignores_sibling_latch_7321() {
+/// Shared proof (#7321 / #7379 / #7382, extended by #8151 / #8163): the gc
+/// test `body` must serialise with the tests that latch the process-global
+/// audit gate. The proof is structural and involves no latch and no
+/// wall-clock hold: this thread holds `sink_test_lock`, `body` runs on a
+/// worker, and the worker must be seen blocked on that lock (observed
+/// through the lock's waiter registry) before it has finished. A gc test
+/// that skips the lock finishes without waiting, which fails the assertion
+/// (rust-1-98 TEST-01/TEST-02).
+fn assert_gc_body_takes_sink_test_lock(name: &'static str, body: fn()) {
     let sink = crate::audit::sink_test_lock();
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let worker = std::thread::spawn(move || {
-        let outcome = std::panic::catch_unwind(chunkc_archive_gc_dry_run_returns_count);
+        let outcome = std::panic::catch_unwind(body);
         let _ = done_tx.send(());
         outcome
     });
@@ -142,10 +148,20 @@ fn chunkc_archive_gc_dry_run_ignores_sibling_latch_7321() {
     let outcome = worker.join().expect("worker thread joins");
     assert!(
         !finished_without_waiting,
-        "gc dry-run test ran to completion without taking sink_test_lock"
+        "{name} ran to completion without taking sink_test_lock"
     );
-    assert!(
-        outcome.is_ok(),
-        "gc dry-run test failed once it obtained the lock"
-    );
+    assert!(outcome.is_ok(), "{name} failed once it obtained the lock");
+}
+
+/// The gc dry-run test takes `sink_test_lock` (#7321 / #7379 / #7382).
+#[test]
+fn chunkc_archive_gc_dry_run_ignores_sibling_latch_7321() {
+    assert_gc_body_takes_sink_test_lock("gc dry-run test", chunkc_archive_gc_dry_run_body);
+}
+
+/// The gc real-run test (the one that flaked in #7380) takes
+/// `sink_test_lock` (#8151 / #8163).
+#[test]
+fn chunkc_archive_gc_real_run_ignores_sibling_latch_8151() {
+    assert_gc_body_takes_sink_test_lock("gc real-run test", chunkc_archive_gc_real_run_body);
 }
