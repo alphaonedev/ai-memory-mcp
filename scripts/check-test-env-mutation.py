@@ -264,6 +264,7 @@ Cargo-free, stdlib python3 only. Fixtures for the tests live under .local-runs/,
 """
 import argparse
 import collections
+import os
 import pathlib
 import re
 import sys
@@ -464,17 +465,18 @@ KNOWN_FOREIGN_TYPES = frozenset((
 FILE_ROOTS = frozenset(("crate", "self", "super"))  # import roots inside the test crate itself (the file, its mods)
 ANY_METHOD = None  # a method provider whose method set is unknown: it may supply any method name
 CARGO_MANIFEST = "Cargo.toml"  # the manifest whose [package] name is the crate the tests import as a path root
-PACKAGE_NAME = re.compile(r'(?ms)^\[package\][^\[]*?^name\s*=\s*"([^"]+)"')
+PACKAGE_NAME = re.compile(r"""(?ms)^\[package\][^\[]*?^name\s*=\s*["']([^"']+)["']""")  # r15 (N1): a TOML literal string counts
 DEP_HEADER = re.compile(r"""^\[\s*(?:.*\.)?(?:dev-|build-)?dependencies(?:\.([\w'"-]+))?\s*\]""")  # r14 (G2): a dependency table
 DEP_ENTRY = re.compile(r"""^["']?([\w-]+)["']?\s*=\s*(.*)$""")  # `name = <value>` of a dependency table
-DEP_DOTTED_PACKAGE = re.compile(r"""^["']?([\w-]+)["']?\.package\s*=\s*"([^"]+)\"""")  # `name.package = "x"`
-DEP_PACKAGE = re.compile(r'\bpackage\s*=\s*"([^"]+)"')  # the `package = "x"` key of an inline table or a [dependencies.name] table
+DEP_DOTTED_PACKAGE = re.compile(r"""^["']?([\w-]+)["']?\.package\s*=\s*["']([^"']+)["']""")  # `name.package = "x"` / `'x'` (r15, N1)
+DEP_PACKAGE = re.compile(r"""\bpackage\s*=\s*["']([^"']+)["']""")  # r15 (N1): basic or literal string; the `package = "x"` key of an inline table or a [dependencies.name] table
 DEP_QUOTES = "'\""  # the quote characters TOML allows around a dependency name
 DEP_AMBIGUOUS = "?"  # r14 (G2): the real crate of a dependency name that two tables point at different crates; trusted by no table
 INLINE_MOD = re.compile(r"(?<![\w$])mod\s+([A-Za-z_]\w*)\s*\{")  # r14 (G3): an inline module and its opening brace
 SRC_TRAIT = re.compile(r"(?<![\w$])trait\s+([A-Za-z_]\w*)[^{;]*\{")  # a trait declaration of src/ and its body
 SRC_TYPE = re.compile(r"(?<![\w$])(?:struct|enum|union|type)\s+([A-Za-z_]\w*)")  # a src/ type that is not a trait
 FN_NAME = re.compile(r"(?<![\w$])fn\s+([A-Za-z_]\w*)")  # every fn a trait body declares (nested ones included)
+INCLUDE_MACRO = re.compile(r'(?<![\w$])include\s*!\s*\(\s*"([^"]+)"\s*\)')  # r15 (N2, N3): `include!("file.rs")`, a file read as if pasted here
 MACRO_RULES_NAME = re.compile(r"(?<![\w$])macro_rules\s*!\s*([A-Za-z_]\w*)")  # a macro_rules! definition
 # r12 (#8139): `async [move] |..|`: an async closure, whose call yields a future that runs the body when polled.
 ASYNC_CLOSURE = re.compile(r"async\s+(?:move\s+)?\|")
@@ -2105,7 +2107,7 @@ class CommonModel:
         base = root / SRC_REL
         if not base.is_dir():
             return crate_name, {}, set()
-        files = sorted(base.rglob("*.rs"))
+        files = CommonModel._src_files(base)
         generators = set()  # first pass: every macro_rules! of the crate that declares a trait
         for path in files:
             raw = path.read_text(encoding="utf-8", errors="replace")
@@ -2116,6 +2118,37 @@ class CommonModel:
             index.add(scrub(path.read_text(encoding="utf-8", errors="replace")))
         index.close()
         return crate_name, dict(index.traits), index.types
+
+    @staticmethod
+    def _src_files(base):
+        """Every file of the crate's module tree (r15, N2): src/**/*.rs plus each file that a `#[path = ".."] mod m;`
+        or an `include!("..")` of one of them names, wherever it lives (`../gen/fan.rs` is outside src/), read once."""
+        files, seen, work = [], set(), sorted(base.rglob("*.rs"))
+        while work:
+            path = pathlib.Path(os.path.normpath(work.pop()))
+            if path in seen:
+                continue
+            seen.add(path)
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            files.append(path)
+            for follow in CommonModel._src_follow(text, path):
+                work.append(follow)
+        return files
+
+    @staticmethod
+    def _src_follow(text, path):
+        """The files that path pulls into the module tree with `#[path]` modules and `include!` (r15, N2)."""
+        below = path.parent if path.name in ("mod.rs", "lib.rs", "main.rs") else path.parent / path.stem
+        out = [here / rel for rel, _name, here in CommonModel._mod_decls(text, below, path.parent) if rel]
+        return out + [path.parent / rel for rel in CommonModel._includes(text)]
+
+    @staticmethod
+    def _includes(text):
+        """The file names of the `include!("..")` calls of text (r15, N2, N3)."""
+        return INCLUDE_MACRO.findall(text) if "include" in text else []
 
     @staticmethod
     def _dep_roots(root):
@@ -2170,6 +2203,8 @@ class CommonModel:
         for rel, name, base in self._mod_decls(raw, pathlib.Path(path).parent, pathlib.Path(path).parent):
             if name != "common":
                 out |= self._mod_file_macros(rel, name, base, seen)
+        for irel in self._includes(raw):  # r15 (N3): an include!d file defines its macros in this file's textual scope
+            out |= self._mod_file_macros(irel, None, pathlib.Path(path).parent, seen)
         return out
 
     @staticmethod
@@ -2205,6 +2240,8 @@ class CommonModel:
             below = cand.parent if cand.name == "mod.rs" else cand.parent / cand.stem
             for crel, cname, cbase in self._mod_decls(text, below, cand.parent):
                 out |= self._mod_file_macros(crel, cname, cbase, seen)
+            for irel in self._includes(text):
+                out |= self._mod_file_macros(irel, None, cand.parent, seen)
             return out
         return set()
 
